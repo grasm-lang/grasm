@@ -46,6 +46,12 @@ enum NlMode {
 
 type PResult<T> = Result<T, ()>;
 
+/// Hard recursion cap: keeps deeply nested (possibly adversarial) input from
+/// overflowing the native stack (each level costs ~13 recursive-descent
+/// frames). 64 levels is far beyond any reasonable program. Applied to both
+/// expressions and blocks.
+const MAX_NESTING: u32 = 64;
+
 struct Parser {
     toks: Vec<Token>,
     i: usize,
@@ -53,6 +59,7 @@ struct Parser {
     diags: Vec<Diagnostic>,
     /// When true, `Ident {` is NOT a struct literal (condition positions).
     no_struct_lit: bool,
+    depth: u32,
 }
 
 impl Parser {
@@ -63,7 +70,23 @@ impl Parser {
             modes: vec![NlMode::Keep],
             diags: Vec::new(),
             no_struct_lit: false,
+            depth: 0,
         }
+    }
+
+    fn enter_nested(&mut self) -> PResult<()> {
+        if self.depth >= MAX_NESTING {
+            self.error_here(format!(
+                "code is nested too deeply (more than {MAX_NESTING} levels)"
+            ));
+            // Skip to EOF: no useful recovery from pathological nesting.
+            while !matches!(self.toks[self.i].kind, TokenKind::Eof) {
+                self.i += 1;
+            }
+            return Err(());
+        }
+        self.depth += 1;
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -310,6 +333,7 @@ impl Parser {
     }
 
     /// `-> Ret ! Err / {effects}` — every piece optional.
+    #[allow(clippy::type_complexity)]
     fn parse_fn_tail(&mut self) -> PResult<(Option<TypeExpr>, Option<TypeExpr>, Option<Vec<Path>>)> {
         let mut ret = None;
         let mut err = None;
@@ -587,6 +611,13 @@ impl Parser {
     // ------------------------------------------------------------------
 
     fn parse_block(&mut self) -> PResult<Block> {
+        self.enter_nested()?;
+        let r = self.parse_block_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn parse_block_inner(&mut self) -> PResult<Block> {
         let start = self.cur_span();
         self.expect(&TokenKind::LBrace)?;
         let mut stmts = Vec::new();
@@ -755,7 +786,10 @@ impl Parser {
     // ------------------------------------------------------------------
 
     pub(crate) fn parse_expr(&mut self) -> PResult<Expr> {
-        self.parse_or()
+        self.enter_nested()?;
+        let r = self.parse_or();
+        self.depth -= 1;
+        r
     }
 
     fn parse_or(&mut self) -> PResult<Expr> {

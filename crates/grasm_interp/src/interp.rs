@@ -310,6 +310,7 @@ impl<'a, W: Write> Interp<'a, W> {
             Stmt::Break(_) => Err(Flow::Break),
             Stmt::Continue(_) => Err(Flow::Continue),
             Stmt::While { cond, body, .. } => {
+                #[allow(clippy::while_let_loop)]
                 loop {
                     match self.eval_expr(cond)? {
                         Value::Bool(true) => {}
@@ -947,6 +948,42 @@ impl<'a, W: Write> Interp<'a, W> {
         if !is_place {
             return Ok(None);
         }
+        // Fast path: bare variable receiver — mutate the slot in place via
+        // copy-on-write (no clone when the list is uniquely owned). This is
+        // what makes `xs.push(v)` in a loop O(1) amortized instead of O(n).
+        if let Expr::Ident(id) = recv {
+            let arg_val = if name.name.as_str() == "push" {
+                Some(self.eval_expr(&args[0])?)
+            } else {
+                None
+            };
+            let slot = self
+                .scopes
+                .iter_mut()
+                .rev()
+                .find_map(|s| s.get_mut(&id.name));
+            if let Some(Value::List(items)) = slot {
+                let items = Rc::make_mut(items);
+                let result = match name.name.as_str() {
+                    "push" => {
+                        items.push(arg_val.unwrap());
+                        Value::Unit
+                    }
+                    "pop" => match items.pop() {
+                        Some(v) => Value::some(v),
+                        None => Value::none(),
+                    },
+                    "sort" => {
+                        items.sort_by(compare_values);
+                        Value::Unit
+                    }
+                    _ => unreachable!(),
+                };
+                return Ok(Some(result));
+            }
+            return Ok(None);
+        }
+        // Nested place (`bag.items.push(v)`): clone + write back.
         let current = self.eval_expr(recv)?;
         let Value::List(items) = current else {
             return Ok(None);
@@ -963,7 +1000,7 @@ impl<'a, W: Write> Interp<'a, W> {
                 None => Value::none(),
             },
             "sort" => {
-                items_vec.sort_by(|a, b| compare_values(a, b));
+                items_vec.sort_by(compare_values);
                 Value::Unit
             }
             _ => return Ok(None),

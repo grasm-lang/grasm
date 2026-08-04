@@ -420,7 +420,7 @@ impl Checker {
                 .body
                 .stmts
                 .last()
-                .map(|s| stmt_span(s))
+                .map(stmt_span)
                 .unwrap_or(f.body.span);
             let want = self.show(&ret);
             let got = self.show(&body_ty);
@@ -672,11 +672,8 @@ impl Checker {
     /// Assignment target must be a place rooted in a mutable binding.
     fn check_assign_target(&mut self, target: &Expr) {
         let mut root = target;
-        loop {
-            match root {
-                Expr::Field { recv, .. } | Expr::Index { recv, .. } => root = recv,
-                _ => break,
-            }
+        while let Expr::Field { recv, .. } | Expr::Index { recv, .. } = root {
+            root = recv;
         }
         match root {
             Expr::Ident(id) => match self.lookup(&id.name) {
@@ -1643,11 +1640,8 @@ impl Checker {
     /// Mutating methods need a mutable receiver root.
     fn require_mutable(&mut self, recv: &Expr) {
         let mut root = recv;
-        loop {
-            match root {
-                Expr::Field { recv, .. } | Expr::Index { recv, .. } => root = recv,
-                _ => break,
-            }
+        while let Expr::Field { recv, .. } | Expr::Index { recv, .. } = root {
+            root = recv;
         }
         if let Expr::Ident(id) = root {
             if let Some(b) = self.lookup(&id.name) {
@@ -1784,7 +1778,9 @@ impl Checker {
         let e = self.uni.resolve(e);
         let d = self.uni.resolve(declared);
         if let Type::Var(_) = d {
-            return self.uni.unify(&e, &d) || true;
+            // Open error slot (main/tests): bind it and accept.
+            let _ = self.uni.unify(&e, &d);
+            return true;
         }
         let members = |t: &Type| -> Vec<Type> {
             match t {
