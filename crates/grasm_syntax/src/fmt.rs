@@ -10,7 +10,9 @@ const INDENT: &str = "    ";
 enum Mode {
     Code,
     Str,
-    Interp,
+    /// Inside `"...{expr}"` — tracks its own brace nesting; interpolation
+    /// braces never affect code indentation depth.
+    Interp(u32),
     LineComment,
     BlockComment(u32),
 }
@@ -49,7 +51,10 @@ pub fn format_src(src: &str) -> String {
             out.push_str(content);
             out.push_str(newline);
         } else {
-            let this_indent = (depth - lead_closers).max(0) as usize;
+            // Continuation lines starting with `|` (sum-type variants, or a
+            // leading pipeline op) sit one level deeper than their declaration.
+            let pipe_extra = i32::from(trimmed.starts_with('|'));
+            let this_indent = (depth - lead_closers + pipe_extra).max(0) as usize;
             for _ in 0..this_indent {
                 out.push_str(INDENT);
             }
@@ -63,7 +68,7 @@ pub fn format_src(src: &str) -> String {
         while let Some(ch) = chars.next() {
             let mode = *stack.last().unwrap();
             match mode {
-                Mode::Code | Mode::Interp => match ch {
+                Mode::Code => match ch {
                     '"' => stack.push(Mode::Str),
                     '/' if chars.peek() == Some(&'/') => {
                         stack.push(Mode::LineComment);
@@ -74,14 +79,18 @@ pub fn format_src(src: &str) -> String {
                         chars.next();
                     }
                     '{' | '(' | '[' => depth += 1,
-                    '}' | ')' | ']' => {
-                        if mode == Mode::Interp && ch == '}' {
-                            // Ambiguity: interp close vs code brace. Interp mode
-                            // tracks its own nesting below via depth too; treat
-                            // a `}` at interp level as closing the interp when
-                            // no code openers are pending inside it.
+                    '}' | ')' | ']' => depth -= 1,
+                    _ => {}
+                },
+                Mode::Interp(n) => match ch {
+                    '"' => stack.push(Mode::Str),
+                    '{' => *stack.last_mut().unwrap() = Mode::Interp(n + 1),
+                    '}' => {
+                        if n == 0 {
+                            stack.pop(); // back to the enclosing string
+                        } else {
+                            *stack.last_mut().unwrap() = Mode::Interp(n - 1);
                         }
-                        depth -= 1;
                     }
                     _ => {}
                 },
@@ -92,7 +101,7 @@ pub fn format_src(src: &str) -> String {
                     '"' => {
                         stack.pop();
                     }
-                    '{' => stack.push(Mode::Interp),
+                    '{' => stack.push(Mode::Interp(0)),
                     _ => {}
                 },
                 Mode::LineComment => {}
@@ -115,7 +124,7 @@ pub fn format_src(src: &str) -> String {
         // lines either (it lives inside a string).
         while matches!(
             stack.last(),
-            Some(Mode::LineComment | Mode::Str | Mode::Interp)
+            Some(Mode::LineComment | Mode::Str | Mode::Interp(_))
         ) {
             stack.pop();
         }
@@ -181,5 +190,34 @@ mod tests {
         let got = format_src(src);
         assert!(got.contains("    let z = 2"));
         assert!(got.trim_end().ends_with('}'));
+    }
+}
+
+#[cfg(test)]
+mod interp_regression {
+    use super::format_src;
+
+    #[test]
+    fn interpolation_braces_do_not_affect_depth() {
+        // Regression: `"{n}"` used to eat one indent level.
+        let src = "fn f(n: i64) -> str {\n    match n {\n        0 -> \"{n}\"\n        _ -> \"x\"\n    }\n}\n";
+        assert_eq!(format_src(src), src, "already-canonical file must be unchanged");
+    }
+
+    #[test]
+    fn nested_interp_braces() {
+        let src = "fn f() {\n    print(\"{ if x { 1 } else { 2 } }\")\n    let y = 1\n}\n";
+        assert_eq!(format_src(src), src);
+    }
+}
+
+#[cfg(test)]
+mod variant_indent_regression {
+    use super::format_src;
+
+    #[test]
+    fn sum_type_variants_keep_one_indent() {
+        let src = "type Shape =\n    | Circle(r: f64)\n    | Rect(w: f64, h: f64)\n\nfn f() {\n}\n";
+        assert_eq!(format_src(src), src);
     }
 }
