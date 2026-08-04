@@ -92,6 +92,8 @@ impl VType {
 
 struct FnSig {
     params: Vec<VType>,
+    /// `inout` params are passed as pointers to the caller's slot.
+    modes: Vec<ParamMode>,
     ret: VType,
     id: FuncId,
 }
@@ -100,10 +102,6 @@ pub fn compile_object(
     program: &grasm_sema::loader::Program,
     obj_out: &std::path::Path,
 ) -> Result<(), String> {
-    if program.files.len() > 1 {
-        return Err("native backend does not yet support modules (imports)".into());
-    }
-    let module_ast = &program.files[0].module;
 
     let mut flags = settings::builder();
     flags.set("is_pic", "true").map_err(|e| e.to_string())?;
@@ -118,10 +116,16 @@ pub fn compile_object(
 
     let mut cg = Codegen::new(&mut module);
     cg.declare_runtime()?;
-    match cg.compile(module_ast) {
+    let views: Vec<(String, &AstModule, std::collections::HashMap<String, String>)> = program
+        .files
+        .iter()
+        .map(|f| (f.name.clone(), &f.module, f.imports.clone()))
+        .collect();
+    match cg.compile_program(&views) {
         Ok(()) => {}
         Err(u) => {
-            let f = &program.files[0];
+            let idx = program.file_of(u.span);
+            let f = &program.files[idx];
             let index = grasm_syntax::LineIndex::new(&f.src);
             let local = Span::new(
                 u.span.start.saturating_sub(f.base),
@@ -152,6 +156,23 @@ struct Codegen<'m> {
     sums: HashMap<String, Vec<(String, Vec<VType>)>>,
     /// variant name → (parent sum, arity) — unambiguous per checker
     variant_index: HashMap<String, (String, usize)>,
+    /// effect name → ops (op name, param types, return type)
+    effects: HashMap<String, Vec<(String, Vec<VType>, VType)>>,
+    /// `with` site (by span start) → op name → lifted handler FuncId
+    handler_sites: HashMap<u32, Vec<(String, FuncId)>>,
+    /// Lifted handler bodies to compile after the main functions.
+    pending_handlers: Vec<PendingHandler>,
+    current_module: String,
+    /// module → (alias → target module)
+    module_imports: HashMap<String, HashMap<String, String>>,
+}
+
+struct PendingHandler {
+    id: FuncId,
+    module: String,
+    params: Vec<(String, VType)>,
+    ret: VType,
+    body: Expr,
 }
 
 impl<'m> Codegen<'m> {
@@ -164,6 +185,11 @@ impl<'m> Codegen<'m> {
             structs: HashMap::new(),
             sums: HashMap::new(),
             variant_index: HashMap::new(),
+            effects: HashMap::new(),
+            handler_sites: HashMap::new(),
+            pending_handlers: Vec::new(),
+            current_module: "main".to_string(),
+            module_imports: HashMap::new(),
         }
     }
 
@@ -269,6 +295,16 @@ impl<'m> Codegen<'m> {
             ("grasm_f64_round", vec![f64t], Some(f64t)),
             ("grasm_f64_min", vec![f64t, f64t], Some(f64t)),
             ("grasm_f64_max", vec![f64t, f64t], Some(f64t)),
+            ("grasm_handler_push", vec![ptr, i64t], None),
+            ("grasm_handler_op", vec![ptr, i64t, ptr], None),
+            ("grasm_handler_pop", vec![], None),
+            ("grasm_handler_lookup", vec![ptr, i64t, ptr, i64t], Some(ptr)),
+            ("grasm_args", vec![], Some(i64t)),
+            ("grasm_input", vec![], Some(i64t)),
+            ("grasm_read_file", vec![i64t], Some(i64t)),
+            ("grasm_write_file", vec![i64t, i64t], Some(i64t)),
+            ("grasm_file_exists", vec![i64t], Some(i8t)),
+            ("grasm_set_args", vec![i64t, ptr], None),
         ];
         for (name, params, ret) in decls {
             let mut sig = self.module.make_signature();
@@ -326,7 +362,50 @@ impl<'m> Codegen<'m> {
         }
     }
 
-    fn compile(&mut self, module_ast: &AstModule) -> CResult<()> {
+    /// Compiles every module of a program. Types/effects share one global
+    /// namespace (as in the checker); functions are per-module symbols.
+    fn compile_program(
+        &mut self,
+        views: &[(String, &AstModule, std::collections::HashMap<String, String>)],
+    ) -> CResult<()> {
+        for (name, m, imports) in views {
+            self.module_imports.insert(name.clone(), imports.clone());
+            self.collect_types(m)?;
+            let _ = name;
+        }
+        for (name, m, _) in views {
+            self.current_module = name.clone();
+            self.declare_fns(m)?;
+        }
+        if !self.fns.contains_key("main::main") {
+            return nope(Span::new(0, 1), "programs without a `main` function");
+        }
+        for (name, m, _) in views {
+            self.current_module = name.clone();
+            for decl in &m.decls {
+                if let Decl::Fn(f) = decl {
+                    self.collect_handlers_block(&f.body)?;
+                }
+            }
+        }
+        for (name, m, _) in views {
+            self.current_module = name.clone();
+            for decl in &m.decls {
+                if let Decl::Fn(f) = decl {
+                    self.compile_fn(f)?;
+                }
+            }
+        }
+        let pending = std::mem::take(&mut self.pending_handlers);
+        for h in pending {
+            self.current_module = h.module.clone();
+            self.compile_handler(h)?;
+        }
+        self.emit_c_main()?;
+        Ok(())
+    }
+
+    fn collect_types(&mut self, module_ast: &AstModule) -> CResult<()> {
         // Pass 0: type declarations (structs + sums; aliases unsupported).
         for decl in &module_ast.decls {
             if let Decl::Type(t) = decl {
@@ -373,6 +452,28 @@ impl<'m> Codegen<'m> {
                 }
             }
         }
+        // Effect declarations: op signatures drive handler lowering.
+        for decl in &module_ast.decls {
+            if let Decl::Effect(e) = decl {
+                let mut ops = Vec::new();
+                for op in &e.ops {
+                    let mut pts = Vec::new();
+                    for p in &op.params {
+                        pts.push(self.vtype_of(&p.ty)?);
+                    }
+                    let rt = match &op.ret {
+                        Some(t) => self.vtype_of(t)?,
+                        None => VType::Unit,
+                    };
+                    ops.push((op.name.name.clone(), pts, rt));
+                }
+                self.effects.insert(e.name.name.clone(), ops);
+            }
+        }
+        Ok(())
+    }
+
+    fn declare_fns(&mut self, module_ast: &AstModule) -> CResult<()> {
         for decl in &module_ast.decls {
             match decl {
                 Decl::Fn(f) => {
@@ -380,11 +481,14 @@ impl<'m> Codegen<'m> {
                         return nope(f.span, "generic functions");
                     }
                     let mut params = Vec::new();
+                    let mut modes = Vec::new();
                     for p in &f.params {
-                        if p.mode != ParamMode::Let {
-                            return nope(p.span, "`inout`/`own` parameters");
-                        }
+                        // `own` and `let` share one native ABI: the caller's
+                        // +1 transfers to the callee, which releases at exit.
+                        // The distinction is purely static (use-after-move is
+                        // a checker error).
                         params.push(self.vtype_of(&p.ty)?);
+                        modes.push(p.mode);
                     }
                     let mut ret = match &f.ret {
                         Some(t) => self.vtype_of(t)?,
@@ -393,41 +497,52 @@ impl<'m> Codegen<'m> {
                     if f.err.is_some() {
                         ret = VType::Fallible(Box::new(ret));
                     }
+                    let ptr_ty = self.module.target_config().pointer_type();
                     let mut sig = self.module.make_signature();
-                    for p in &params {
-                        sig.params.push(AbiParam::new(p.cl()));
+                    for (p, m) in params.iter().zip(&modes) {
+                        sig.params.push(AbiParam::new(if *m == ParamMode::Inout {
+                            ptr_ty
+                        } else {
+                            p.cl()
+                        }));
                     }
                     if ret != VType::Unit {
                         sig.returns.push(AbiParam::new(ret.cl()));
                     }
+                    let sym = format!(
+                        "g_{}_{}",
+                        self.current_module.replace('.', "_"),
+                        f.name.name
+                    );
                     let id = self
                         .module
-                        .declare_function(&format!("g_{}", f.name.name), Linkage::Local, &sig)
+                        .declare_function(&sym, Linkage::Local, &sig)
                         .map_err(|e| Unsupported {
                             span: f.span,
                             what: format!("(module error: {e})"),
                         })?;
-                    self.fns
-                        .insert(f.name.name.clone(), FnSig { params, ret, id });
+                    let key = format!("{}::{}", self.current_module, f.name.name);
+                    self.fns.insert(
+                        key,
+                        FnSig {
+                            params,
+                            modes,
+                            ret,
+                            id,
+                        },
+                    );
                 }
-                Decl::Test(_) | Decl::Import(_) | Decl::Type(_) => {}
-                Decl::Effect(e) => return nope(e.span, "effects"),
+                Decl::Test(_) | Decl::Import(_) | Decl::Type(_) | Decl::Effect(_) => {}
             }
         }
-        if !self.fns.contains_key("main") {
-            return nope(Span::new(0, 1), "programs without a `main` function");
-        }
-        for decl in &module_ast.decls {
-            if let Decl::Fn(f) = decl {
-                self.compile_fn(f)?;
-            }
-        }
-        self.emit_c_main()?;
         Ok(())
     }
 
     fn emit_c_main(&mut self) -> CResult<()> {
+        let ptr_ty = self.module.target_config().pointer_type();
         let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I32));
+        sig.params.push(AbiParam::new(ptr_ty));
         sig.returns.push(AbiParam::new(types::I32));
         let main_id = self
             .module
@@ -441,9 +556,20 @@ impl<'m> Codegen<'m> {
         let mut fbcx = FunctionBuilderContext::new();
         let mut b = FunctionBuilder::new(&mut ctx.func, &mut fbcx);
         let entry = b.create_block();
+        b.append_block_params_for_function_params(entry);
         b.switch_to_block(entry);
-        let g_main = self.fns["main"].id;
-        let main_fallible = matches!(self.fns["main"].ret, VType::Fallible(_));
+        // Publish argv (skipping argv[0]) for the `args()` builtin.
+        let params: Vec<Value> = b.block_params(entry).to_vec();
+        let argc = b.ins().sextend(types::I64, params[0]);
+        let one = b.ins().iconst(types::I64, 1);
+        let user_argc = b.ins().isub(argc, one);
+        let eight = b.ins().iconst(types::I64, 8);
+        let argv_shift = b.ins().iadd(params[1], eight);
+        let set_args = self.runtime["grasm_set_args"];
+        let sa_ref = self.module.declare_func_in_func(set_args, b.func);
+        b.ins().call(sa_ref, &[user_argc, argv_shift]);
+        let g_main = self.fns["main::main"].id;
+        let main_fallible = matches!(self.fns["main::main"].ret, VType::Fallible(_));
         let fref = self.module.declare_func_in_func(g_main, b.func);
         let inst = b.ins().call(fref, &[]);
         if main_fallible {
@@ -476,13 +602,18 @@ impl<'m> Codegen<'m> {
     }
 
     fn compile_fn(&mut self, f: &FnDecl) -> CResult<()> {
-        let sig_params = self.fns[&f.name.name].params.clone();
-        let sig_ret = self.fns[&f.name.name].ret.clone();
-        let func_id = self.fns[&f.name.name].id;
+        let key = format!("{}::{}", self.current_module, f.name.name);
+        let sig_params = self.fns[&key].params.clone();
+        let sig_modes = self.fns[&key].modes.clone();
+        let sig_ret = self.fns[&key].ret.clone();
+        let func_id = self.fns[&key].id;
+        let ptr_ty = self.module.target_config().pointer_type();
 
         let mut ctx = self.module.make_context();
-        for p in &sig_params {
-            ctx.func.signature.params.push(AbiParam::new(p.cl()));
+        for (p, m) in sig_params.iter().zip(&sig_modes) {
+            ctx.func.signature.params.push(AbiParam::new(
+                if *m == ParamMode::Inout { ptr_ty } else { p.cl() },
+            ));
         }
         if sig_ret != VType::Unit {
             ctx.func.signature.returns.push(AbiParam::new(sig_ret.cl()));
@@ -497,6 +628,7 @@ impl<'m> Codegen<'m> {
             var_count: 0,
             loops: Vec::new(),
             ret: sig_ret.clone(),
+            inout_slots: Vec::new(),
         };
 
         let entry = fcx.b.create_block();
@@ -506,9 +638,23 @@ impl<'m> Codegen<'m> {
         let entry_params: Vec<Value> = fcx.b.block_params(entry).to_vec();
         for (i, p) in f.params.iter().enumerate() {
             let vt = sig_params[i].clone();
-            let var = fcx.new_var(&vt);
-            fcx.b.def_var(var, entry_params[i]);
-            fcx.bind(&p.name.name, var, vt);
+            if sig_modes[i] == ParamMode::Inout {
+                // Load through the caller's pointer; store back at exit.
+                let loaded = fcx.b.ins().load(
+                    vt.cl(),
+                    cranelift_codegen::ir::MemFlags::new(),
+                    entry_params[i],
+                    0,
+                );
+                let var = fcx.new_var(&vt);
+                fcx.b.def_var(var, loaded);
+                fcx.bind(&p.name.name, var, vt.clone());
+                fcx.inout_slots.push((entry_params[i], var, vt));
+            } else {
+                let var = fcx.new_var(&vt);
+                fcx.b.def_var(var, entry_params[i]);
+                fcx.bind(&p.name.name, var, vt);
+            }
         }
 
         let (last, terminated) = fcx.eval_block_inner(&f.body)?;
@@ -563,6 +709,181 @@ impl<'m> Codegen<'m> {
         Ok(())
     }
 
+    // ------------------------------------------------------------------
+    // N5: effect handler lifting
+    // ------------------------------------------------------------------
+
+    fn collect_handlers_block(&mut self, b: &grasm_syntax::ast::Block) -> CResult<()> {
+        for st in &b.stmts {
+            self.collect_handlers_stmt(st)?;
+        }
+        Ok(())
+    }
+
+    fn collect_handlers_stmt(&mut self, st: &Stmt) -> CResult<()> {
+        match st {
+            Stmt::With {
+                effect,
+                handler,
+                body,
+                span,
+            } => {
+                let ename = effect.dotted();
+                let Some(ops) = self.effects.get(&ename).cloned() else {
+                    return nope(*span, format!("the effect `{ename}`"));
+                };
+                let Expr::StructLit { fields, .. } = handler else {
+                    return nope(handler.span(), "handlers that aren't struct literals");
+                };
+                let mut site = Vec::new();
+                for (fname, fexpr) in fields {
+                    let Some((_, param_ts, ret_t)) =
+                        ops.iter().find(|(o, _, _)| *o == fname.name).cloned()
+                    else {
+                        return nope(fname.span, format!("the operation `{}`", fname.name));
+                    };
+                    let Expr::Closure {
+                        params: cparams,
+                        body: cbody,
+                        ..
+                    } = fexpr
+                    else {
+                        return nope(fexpr.span(), "handler ops that aren't closures");
+                    };
+                    if cparams.len() != param_ts.len() {
+                        return nope(fexpr.span(), "a handler op with the wrong arity");
+                    }
+                    let mut sig = self.module.make_signature();
+                    for p in &param_ts {
+                        sig.params.push(AbiParam::new(p.cl()));
+                    }
+                    if ret_t != VType::Unit {
+                        sig.returns.push(AbiParam::new(ret_t.cl()));
+                    }
+                    let sym = format!(
+                        "g_h_{}_{}_{}",
+                        ename.replace('.', "_"),
+                        fname.name,
+                        self.pending_handlers.len()
+                    );
+                    let id = self
+                        .module
+                        .declare_function(&sym, Linkage::Local, &sig)
+                        .map_err(|e| Unsupported {
+                            span: *span,
+                            what: format!("(module error: {e})"),
+                        })?;
+                    let named_params: Vec<(String, VType)> = cparams
+                        .iter()
+                        .map(|p| p.name.clone())
+                        .zip(param_ts.iter().cloned())
+                        .collect();
+                    self.pending_handlers.push(PendingHandler {
+                        id,
+                        module: self.current_module.clone(),
+                        params: named_params,
+                        ret: ret_t,
+                        body: (**cbody).clone(),
+                    });
+                    site.push((fname.name.clone(), id));
+                }
+                self.handler_sites.insert(span.start, site);
+                self.collect_handlers_block(body)?;
+                Ok(())
+            }
+            Stmt::While { body, .. } | Stmt::For { body, .. } => self.collect_handlers_block(body),
+            Stmt::Expr(e) | Stmt::Let { init: e, .. } => self.collect_handlers_expr(e),
+            Stmt::Assign { value, .. } => self.collect_handlers_expr(value),
+            Stmt::Return(Some(e), _) => self.collect_handlers_expr(e),
+            _ => Ok(()),
+        }
+    }
+
+    fn collect_handlers_expr(&mut self, e: &Expr) -> CResult<()> {
+        match e {
+            Expr::Block(b) => self.collect_handlers_block(b),
+            Expr::If {
+                then_block,
+                else_branch,
+                ..
+            } => {
+                self.collect_handlers_block(then_block)?;
+                match else_branch.as_deref() {
+                    Some(ElseBranch::Else(b)) => self.collect_handlers_block(b),
+                    Some(ElseBranch::ElseIf(e)) => self.collect_handlers_expr(e),
+                    None => Ok(()),
+                }
+            }
+            Expr::Match { arms, .. } => {
+                for a in arms {
+                    self.collect_handlers_expr(&a.body)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn compile_handler(&mut self, h: PendingHandler) -> CResult<()> {
+        let mut ctx = self.module.make_context();
+        for (_, t) in &h.params {
+            ctx.func.signature.params.push(AbiParam::new(t.cl()));
+        }
+        if h.ret != VType::Unit {
+            ctx.func.signature.returns.push(AbiParam::new(h.ret.cl()));
+        }
+        let mut fbcx = FunctionBuilderContext::new();
+        let builder = FunctionBuilder::new(&mut ctx.func, &mut fbcx);
+        let mut fcx = FnCx {
+            cg: self,
+            b: builder,
+            vars: Vec::new(),
+            var_count: 0,
+            loops: Vec::new(),
+            ret: h.ret.clone(),
+            inout_slots: Vec::new(),
+        };
+        let entry = fcx.b.create_block();
+        fcx.b.append_block_params_for_function_params(entry);
+        fcx.b.switch_to_block(entry);
+        fcx.push_scope();
+        let ps: Vec<Value> = fcx.b.block_params(entry).to_vec();
+        for (i, (pname, pt)) in h.params.iter().enumerate() {
+            let var = fcx.new_var(pt);
+            fcx.b.def_var(var, ps[i]);
+            fcx.bind(pname, var, pt.clone());
+        }
+        let val = fcx.eval_expr(&h.body)?;
+        match (&h.ret, val) {
+            (VType::Unit, v) => {
+                if let Some((x, xt)) = v {
+                    fcx.dec_if_boxed(x, &xt);
+                }
+                fcx.emit_scope_decs_all();
+                fcx.b.ins().return_(&[]);
+            }
+            (want, Some((mut x, xt))) => {
+                if *want == VType::F64 && xt == VType::I64 {
+                    x = fcx.b.ins().fcvt_from_sint(types::F64, x);
+                }
+                fcx.emit_scope_decs_all();
+                fcx.b.ins().return_(&[x]);
+            }
+            (_, None) => {
+                return nope(h.body.span(), "a handler op with no value");
+            }
+        }
+        fcx.b.seal_all_blocks();
+        fcx.b.finalize();
+        self.module
+            .define_function(h.id, &mut ctx)
+            .map_err(|e| Unsupported {
+                span: h.body.span(),
+                what: format!("(define error: {e})"),
+            })?;
+        Ok(())
+    }
+
     fn intern_string(&mut self, s: &str) -> cranelift_module::DataId {
         if let Some(id) = self.strings.get(s) {
             return *id;
@@ -586,6 +907,9 @@ struct FnCx<'a, 'm> {
     var_count: usize,
     loops: Vec<(Block, Block)>,
     ret: VType,
+    /// (caller pointer, local var, type) for `inout` params — stored back
+    /// through the pointer before every return.
+    inout_slots: Vec<(Value, Variable, VType)>,
 }
 
 enum StmtOut {
@@ -614,14 +938,30 @@ impl FnCx<'_, '_> {
         self.vars.pop();
     }
 
+    /// Stores `inout` locals back through the caller's pointers.
+    fn emit_inout_writeback(&mut self) {
+        let slots = self.inout_slots.clone();
+        for (ptr, var, _) in slots {
+            let v = self.b.use_var(var);
+            self.b
+                .ins()
+                .store(cranelift_codegen::ir::MemFlags::new(), v, ptr, 0);
+        }
+    }
+
     /// Before a `return`: release every boxed local in every scope.
     fn emit_scope_decs_all(&mut self) {
+        self.emit_inout_writeback();
         let all: Vec<(Variable, VType)> = self
             .vars
             .iter()
             .flat_map(|s| s.values().cloned())
             .collect();
+        let inout_vars: Vec<Variable> = self.inout_slots.iter().map(|(_, v, _)| *v).collect();
         for (var, vt) in all {
+            if inout_vars.contains(&var) {
+                continue;
+            }
             if vt.boxed() {
                 let v = self.b.use_var(var);
                 self.call_rt("grasm_val_dec", &[v]);
@@ -660,6 +1000,13 @@ impl FnCx<'_, '_> {
             }
         }
         None
+    }
+
+    /// Function lookup in the module currently being compiled.
+    fn lookup_fn(&self, name: &str) -> Option<&FnSig> {
+        self.cg
+            .fns
+            .get(&format!("{}::{}", self.cg.current_module, name))
     }
 
     fn call_rt(&mut self, name: &'static str, args: &[Value]) -> Option<Value> {
@@ -894,7 +1241,31 @@ impl FnCx<'_, '_> {
                 body,
                 span,
             } => self.eval_for(loop_var, iter, body, *span),
-            Stmt::With { span, .. } => nope(*span, "effect handlers"),
+            Stmt::With {
+                effect,
+                body,
+                span,
+                ..
+            } => {
+                let ename = effect.dotted();
+                let Some(site) = self.cg.handler_sites.get(&span.start).cloned() else {
+                    return nope(*span, "this handler block");
+                };
+                let (ep, el) = self.str_ptr_len(&ename);
+                self.call_rt("grasm_handler_push", &[ep, el]);
+                let ptr_ty = self.cg.module.target_config().pointer_type();
+                for (opname, fid) in site {
+                    let (op_p, op_l) = self.str_ptr_len(&opname);
+                    let fref = self.cg.module.declare_func_in_func(fid, self.b.func);
+                    let addr = self.b.ins().func_addr(ptr_ty, fref);
+                    self.call_rt("grasm_handler_op", &[op_p, op_l, addr]);
+                }
+                let (_, terminated) = self.eval_block_inner(body)?;
+                if !terminated {
+                    self.call_rt("grasm_handler_pop", &[]);
+                }
+                Ok(StmtOut::Value(None))
+            }
         }
     }
 
@@ -1365,6 +1736,94 @@ impl FnCx<'_, '_> {
             self.b.def_var(var, newp);
             return Ok(None);
         }
+        // Cross-module call: `utils.helper(...)`.
+        if let Expr::Ident(tid) = recv {
+            if self.lookup(&tid.name).is_none() {
+                let target = self
+                    .cg
+                    .module_imports
+                    .get(&self.cg.current_module)
+                    .and_then(|m| m.get(&tid.name))
+                    .cloned();
+                if let Some(target_mod) = target {
+                    let qual = format!("{target_mod}::{}", name.name);
+                    if let Some(sig) = self.cg.fns.get(&qual) {
+                        let (fid, params, modes, ret) = (
+                            sig.id,
+                            sig.params.clone(),
+                            sig.modes.clone(),
+                            sig.ret.clone(),
+                        );
+                        if modes.contains(&ParamMode::Inout) {
+                            return nope(span, "`inout` across module boundaries");
+                        }
+                        let mut vals = Vec::with_capacity(args.len());
+                        for (a, want) in args.iter().zip(&params) {
+                            let (mut v, vt) = self.eval_expr_val(a)?;
+                            if *want == VType::F64 && vt == VType::I64 {
+                                v = self.b.ins().fcvt_from_sint(types::F64, v);
+                            }
+                            vals.push(v);
+                        }
+                        let fref = self.cg.module.declare_func_in_func(fid, self.b.func);
+                        let inst = self.b.ins().call(fref, &vals);
+                        let results: Vec<Value> = self.b.inst_results(inst).to_vec();
+                        return Ok(if ret == VType::Unit {
+                            None
+                        } else {
+                            Some((results[0], ret))
+                        });
+                    }
+                    // Variant constructor through the module alias.
+                    if let Some((parent, _)) = self.cg.variant_index.get(&name.name).cloned() {
+                        let v = self.build_variant_call(&parent, &name.name, args)?;
+                        let vt = self.sum_vtype(&parent);
+                        return Ok(Some((v, vt)));
+                    }
+                    return nope(span, format!("`{}` in module `{target_mod}`", name.name));
+                }
+            }
+        }
+        // Effect operation: `Clock.now(...)` — innermost handler wins.
+        if let Expr::Ident(tid) = recv {
+            if self.lookup(&tid.name).is_none() {
+                if let Some(ops) = self.cg.effects.get(&tid.name).cloned() {
+                    let Some((_, param_ts, ret_t)) =
+                        ops.iter().find(|(o, _, _)| *o == name.name).cloned()
+                    else {
+                        return nope(name.span, format!("the operation `{}`", name.name));
+                    };
+                    let (ep, el) = self.str_ptr_len(&tid.name);
+                    let (op_p, op_l) = self.str_ptr_len(&name.name);
+                    let code = self
+                        .call_rt("grasm_handler_lookup", &[ep, el, op_p, op_l])
+                        .unwrap();
+                    let mut sig = self.cg.module.make_signature();
+                    for p in &param_ts {
+                        sig.params.push(AbiParam::new(p.cl()));
+                    }
+                    if ret_t != VType::Unit {
+                        sig.returns.push(AbiParam::new(ret_t.cl()));
+                    }
+                    let sig_ref = self.b.import_signature(sig);
+                    let mut vals = Vec::with_capacity(args.len());
+                    for (a, want) in args.iter().zip(&param_ts) {
+                        let (mut v, vt) = self.eval_expr_val(a)?;
+                        if *want == VType::F64 && vt == VType::I64 {
+                            v = self.b.ins().fcvt_from_sint(types::F64, v);
+                        }
+                        vals.push(v);
+                    }
+                    let inst = self.b.ins().call_indirect(sig_ref, code, &vals);
+                    let results = self.b.inst_results(inst);
+                    return Ok(if ret_t == VType::Unit {
+                        None
+                    } else {
+                        Some((results[0], ret_t))
+                    });
+                }
+            }
+        }
         // Qualified variant: `Shape.Circle(...)` / `Color.Red`.
         if let Expr::Ident(tid) = recv {
             if self.lookup(&tid.name).is_none()
@@ -1672,7 +2131,7 @@ impl FnCx<'_, '_> {
             }
             _ => {
                 // UFCS: x.f(a) → f(x, a).
-                if let Some(sig) = self.cg.fns.get(&name.name) {
+                if let Some(sig) = self.lookup_fn(&name.name) {
                     let (fid, params, ret) = (sig.id, sig.params.clone(), sig.ret.clone());
                     let mut vals = vec![rv];
                     for (a, want) in args.iter().zip(params.iter().skip(1)) {
@@ -2014,6 +2473,34 @@ impl FnCx<'_, '_> {
                 }
                 return nope(span, "panic with a non-literal message");
             }
+            "args" => {
+                let v = self.call_rt("grasm_args", &[]).unwrap();
+                return Ok(Some((v, VType::List(Box::new(VType::Str)))));
+            }
+            "input" => {
+                let v = self.call_rt("grasm_input", &[]).unwrap();
+                return Ok(Some((v, VType::Str)));
+            }
+            "read_file" => {
+                let (pv, _) = self.eval_expr_val(&args[0])?;
+                let v = self.call_rt("grasm_read_file", &[pv]).unwrap();
+                self.call_rt("grasm_val_dec", &[pv]);
+                return Ok(Some((v, VType::Fallible(Box::new(VType::Str)))));
+            }
+            "write_file" => {
+                let (pv, _) = self.eval_expr_val(&args[0])?;
+                let (cv, _) = self.eval_expr_val(&args[1])?;
+                let v = self.call_rt("grasm_write_file", &[pv, cv]).unwrap();
+                self.call_rt("grasm_val_dec", &[pv]);
+                self.call_rt("grasm_val_dec", &[cv]);
+                return Ok(Some((v, VType::Fallible(Box::new(VType::Unit)))));
+            }
+            "file_exists" => {
+                let (pv, _) = self.eval_expr_val(&args[0])?;
+                let v = self.call_rt("grasm_file_exists", &[pv]).unwrap();
+                self.call_rt("grasm_val_dec", &[pv]);
+                return Ok(Some((v, VType::Bool)));
+            }
             "map" => {
                 let m = self.call_rt("grasm_map_new", &[]).unwrap();
                 return Ok(Some((
@@ -2050,12 +2537,42 @@ impl FnCx<'_, '_> {
             let v = self.make_variant("Option", "Some", &[boxed])?;
             return Ok(Some((v, VType::Option(Box::new(avt)))));
         }
-        let Some(sig) = self.cg.fns.get(&id.name) else {
+        let Some(sig) = self.lookup_fn(&id.name) else {
             return nope(id.span, format!("the function `{}` here", id.name));
         };
-        let (fid, params, ret) = (sig.id, sig.params.clone(), sig.ret.clone());
+        let (fid, params, modes, ret) = (
+            sig.id,
+            sig.params.clone(),
+            sig.modes.clone(),
+            sig.ret.clone(),
+        );
+        let ptr_ty = self.cg.module.target_config().pointer_type();
         let mut vals = Vec::with_capacity(args.len());
-        for (a, want) in args.iter().zip(&params) {
+        // (arg index, stack slot, variable to refresh) for inout write-back.
+        let mut inout_args: Vec<(usize, cranelift_codegen::ir::StackSlot, Variable, VType)> =
+            Vec::new();
+        for (i, (a, want)) in args.iter().zip(&params).enumerate() {
+            if modes.get(i).copied() == Some(ParamMode::Inout) {
+                let Expr::Ident(id) = a else {
+                    return nope(a.span(), "`inout` arguments that aren't plain variables");
+                };
+                let Some((var, vt)) = self.lookup(&id.name) else {
+                    return nope(id.span, "an unknown `inout` argument");
+                };
+                let slot = self.b.create_sized_stack_slot(
+                    cranelift_codegen::ir::StackSlotData::new(
+                        cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                        8,
+                        3,
+                    ),
+                );
+                let cur = self.b.use_var(var);
+                self.b.ins().stack_store(cur, slot, 0);
+                let addr = self.b.ins().stack_addr(ptr_ty, slot, 0);
+                vals.push(addr);
+                inout_args.push((i, slot, var, vt));
+                continue;
+            }
             let (mut v, vt) = self.eval_expr_val(a)?;
             if *want == VType::F64 && vt == VType::I64 {
                 v = self.b.ins().fcvt_from_sint(types::F64, v);
@@ -2065,7 +2582,11 @@ impl FnCx<'_, '_> {
         }
         let fref = self.cg.module.declare_func_in_func(fid, self.b.func);
         let inst = self.b.ins().call(fref, &vals);
-        let results = self.b.inst_results(inst);
+        let results: Vec<Value> = self.b.inst_results(inst).to_vec();
+        for (_, slot, var, vt) in inout_args {
+            let updated = self.b.ins().stack_load(vt.cl(), slot, 0);
+            self.b.def_var(var, updated);
+        }
         if ret == VType::Unit {
             Ok(None)
         } else {
@@ -2294,6 +2815,12 @@ impl FnCx<'_, '_> {
         let zero2 = self.b.ins().iconst(types::I64, 0);
         let payload = self.call_rt("grasm_variant_field", &[fv, zero2]).unwrap();
         self.call_rt("grasm_val_dec", &[fv]);
+        if *ok_t == VType::Unit {
+            // `try write_file(..)` — nothing to unwrap.
+            self.call_rt("grasm_val_dec", &[payload]);
+            let dummy = self.b.ins().iconst(types::I8, 0);
+            return Ok((dummy, VType::Unit));
+        }
         let (v, vt) = self.unbox(payload, &ok_t)?;
         Ok((v, vt))
     }
@@ -2403,7 +2930,7 @@ impl FnCx<'_, '_> {
             },
             Expr::Call { callee, args, .. } => {
                 if let Expr::Ident(id) = &**callee {
-                    if let Some(sig) = self.cg.fns.get(&id.name) {
+                    if let Some(sig) = self.lookup_fn(&id.name) {
                         return Ok(sig.ret.clone());
                     }
                     if let Some((parent, _)) = self.cg.variant_index.get(&id.name).cloned() {
@@ -2466,7 +2993,28 @@ impl FnCx<'_, '_> {
                     }
                 }
                 _ => {
-                    if let Some(sig) = self.cg.fns.get(&name.name) {
+                    if let Expr::Ident(tid) = &**recv {
+                        if let Some(target) = self
+                            .cg
+                            .module_imports
+                            .get(&self.cg.current_module)
+                            .and_then(|m| m.get(&tid.name))
+                            .cloned()
+                        {
+                            if let Some(sig) =
+                                self.cg.fns.get(&format!("{target}::{}", name.name))
+                            {
+                                return Ok(sig.ret.clone());
+                            }
+                            // `shapes.Circle(..)` — a variant through the alias.
+                            if let Some((parent, _)) =
+                                self.cg.variant_index.get(&name.name).cloned()
+                            {
+                                return Ok(self.sum_vtype(&parent));
+                            }
+                        }
+                    }
+                    if let Some(sig) = self.lookup_fn(&name.name) {
                         sig.ret.clone()
                     } else if let Expr::Ident(tid) = &**recv {
                         if self.cg.sums.contains_key(&tid.name) {

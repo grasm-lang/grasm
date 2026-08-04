@@ -1267,3 +1267,159 @@ pub extern "C" fn grasm_f64_min(a: f64, b: f64) -> f64 {
 pub extern "C" fn grasm_f64_max(a: f64, b: f64) -> f64 {
     a.max(b)
 }
+
+// ---------------------------------------------------------------------------
+// N5: effect handler stack + fs/args/env builtins
+// ---------------------------------------------------------------------------
+
+use std::cell::RefCell;
+
+/// One installed effect handler: its ops as (op name, code pointer).
+type HandlerFrame = (String, Vec<(String, *const u8)>);
+
+thread_local! {
+    /// Innermost-last stack of installed handlers.
+    static HANDLERS: RefCell<Vec<HandlerFrame>> = const { RefCell::new(Vec::new()) };
+    static PROGRAM_ARGS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn grasm_handler_push(name: *const u8, len: u64) {
+    let n = take_str(name, len);
+    HANDLERS.with(|h| h.borrow_mut().push((n, Vec::new())));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn grasm_handler_op(name: *const u8, len: u64, code: *const u8) {
+    let n = take_str(name, len);
+    HANDLERS.with(|h| {
+        if let Some((_, ops)) = h.borrow_mut().last_mut() {
+            ops.push((n, code));
+        }
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn grasm_handler_pop() {
+    HANDLERS.with(|h| {
+        h.borrow_mut().pop();
+    });
+}
+
+/// Resolves an effect operation to its handler code pointer (innermost wins).
+#[no_mangle]
+pub unsafe extern "C" fn grasm_handler_lookup(
+    ep: *const u8,
+    el: u64,
+    op: *const u8,
+    ol: u64,
+) -> *const u8 {
+    let effect = take_str(ep, el);
+    let opname = take_str(op, ol);
+    let found = HANDLERS.with(|h| {
+        h.borrow()
+            .iter()
+            .rev()
+            .find(|(e, _)| *e == effect)
+            .and_then(|(_, ops)| {
+                ops.iter()
+                    .find(|(o, _)| *o == opname)
+                    .map(|(_, c)| *c)
+            })
+    });
+    match found {
+        Some(c) => c,
+        None => rt_panic(&format!(
+            "unhandled effect `{effect}.{opname}` — no handler installed"
+        )),
+    }
+}
+
+// --- program args / stdin ---
+
+#[no_mangle]
+pub unsafe extern "C" fn grasm_set_args(argc: i64, argv: *const *const u8) {
+    let mut out = Vec::new();
+    for i in 0..argc.max(0) {
+        let p = *argv.offset(i as isize);
+        let mut len = 0usize;
+        while *p.add(len) != 0 {
+            len += 1;
+        }
+        out.push(take_str(p, len as u64));
+    }
+    PROGRAM_ARGS.with(|a| *a.borrow_mut() = out);
+}
+
+#[no_mangle]
+pub extern "C" fn grasm_args() -> *mut RtVal {
+    let items: Vec<*mut RtVal> = PROGRAM_ARGS.with(|a| {
+        a.borrow()
+            .iter()
+            .map(|s| alloc(RtPayload::Str(s.clone())))
+            .collect()
+    });
+    alloc(RtPayload::List(items))
+}
+
+#[no_mangle]
+pub extern "C" fn grasm_input() -> *mut RtVal {
+    let mut line = String::new();
+    let _ = std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line);
+    while line.ends_with('\n') || line.ends_with('\r') {
+        line.pop();
+    }
+    alloc(RtPayload::Str(line))
+}
+
+// --- filesystem (fallible: returns Ok/Err variants) ---
+
+fn io_err(variant: &str, payload: String) -> *mut RtVal {
+    let inner = alloc(RtPayload::Str(payload));
+    alloc(RtPayload::Variant {
+        type_name: "IoError".into(),
+        name: variant.into(),
+        fields: vec![inner],
+    })
+}
+
+fn err_of(v: *mut RtVal) -> *mut RtVal {
+    alloc(RtPayload::Variant {
+        type_name: "!".into(),
+        name: "Err".into(),
+        fields: vec![v],
+    })
+}
+
+fn ok_of(v: *mut RtVal) -> *mut RtVal {
+    alloc(RtPayload::Variant {
+        type_name: "!".into(),
+        name: "Ok".into(),
+        fields: vec![v],
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn grasm_read_file(path: *mut RtVal) -> *mut RtVal {
+    let p = as_str(path).to_string();
+    match std::fs::read_to_string(&p) {
+        Ok(s) => ok_of(alloc(RtPayload::Str(s))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => err_of(io_err("NotFound", p)),
+        Err(e) => err_of(io_err("IoFailed", e.to_string())),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn grasm_write_file(path: *mut RtVal, content: *mut RtVal) -> *mut RtVal {
+    let p = as_str(path).to_string();
+    let c = as_str(content).to_string();
+    match std::fs::write(&p, c) {
+        Ok(()) => ok_of(alloc(RtPayload::I64(0))),
+        Err(e) => err_of(io_err("IoFailed", e.to_string())),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn grasm_file_exists(path: *mut RtVal) -> i8 {
+    i8::from(std::path::Path::new(as_str(path)).exists())
+}

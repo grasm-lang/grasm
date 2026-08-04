@@ -116,3 +116,27 @@ fn n4_annotated_empty_literals_compile() {
     )
     .expect("should compile");
 }
+
+#[test]
+fn n5_effects_compile() {
+    compile(
+        "effect Clock {\n    fn now() -> i64\n}\n\nfn late(t: i64) -> bool {\n    Clock.now() > t\n}\n\nfn main() {\n    with Clock handled_by ClockHandler{ now: || 100 } {\n        print(\"{late(50)}\")\n    }\n}\n",
+    )
+    .expect("should compile");
+}
+
+#[test]
+fn n5_inout_and_own_compile() {
+    compile(
+        "fn bump(inout n: i64) {\n    n += 1\n}\n\nfn add(inout xs: [i64], v: i64) {\n    xs.push(v)\n}\n\nfn eat(own s: str) -> i64 {\n    s.len()\n}\n\nfn main() {\n    var n = 0\n    bump(n)\n    var xs = [1]\n    add(xs, 2)\n    print(\"{n} {xs.len()} {eat(\"abc\")}\")\n}\n",
+    )
+    .expect("should compile");
+}
+
+#[test]
+fn n5_fs_and_args_compile() {
+    compile(
+        "fn main() ! IoError {\n    let p = \"/tmp/grasm_cg.txt\"\n    try write_file(p, \"x\")\n    let c = try read_file(p)\n    print(\"{c.len()} {file_exists(p)} {args().len()}\")\n}\n",
+    )
+    .expect("should compile");
+}
