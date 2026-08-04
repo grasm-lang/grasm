@@ -41,8 +41,8 @@ fn unsupported_features_reported_cleanly() {
     let e = compile("fn main() {\n    let f = |x| x\n    print(\"{f(1)}\")\n}\n")
         .expect_err("closures unsupported yet");
     assert!(e.contains("does not yet support"), "got: {e}");
-    let e2 = compile("type T = { x: i64 }\n\nfn main() {\n}\n")
-        .expect_err("types unsupported yet");
+    let e2 = compile("fn main() {\n    let t = (1, 2)\n    print(\"{t}\")\n}\n")
+        .expect_err("tuples unsupported yet");
     assert!(e2.contains("does not yet support"), "got: {e2}");
 }
 

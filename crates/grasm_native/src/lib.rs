@@ -2050,10 +2050,25 @@ impl FnCx<'_, '_> {
         // decide after lowering first arm — but block params must exist before
         // jumps. Strategy: lower arms into (blocks, value) then wire jumps.
         // Pragmatic approach: probe the first arm body type.
-        let out_t: Option<VType> = match self.probe_type(&arms[0].body) {
-            Ok(t) if t != VType::Unit => Some(t),
-            _ => None,
-        };
+        // Probe the result type. Pattern binds aren't live yet, so bind their
+        // *types* in a scratch scope first, and try each arm until one probes.
+        let mut out_t: Option<VType> = None;
+        for arm in arms {
+            self.push_scope();
+            let bound = self.bind_pattern_types(&arm.pattern, &st).is_ok();
+            let probed = if bound {
+                self.probe_type(&arm.body).ok()
+            } else {
+                None
+            };
+            self.pop_scope_no_decs();
+            if let Some(t) = probed {
+                if t != VType::Unit {
+                    out_t = Some(t);
+                }
+                break;
+            }
+        }
         if let Some(t) = &out_t {
             self.b.append_block_param(merge, t.cl());
         }
@@ -2149,6 +2164,55 @@ impl FnCx<'_, '_> {
                 let v = self.b.use_var(var);
                 self.call_rt("grasm_val_dec", &[v]);
             }
+        }
+    }
+
+    /// Declares the *types* a pattern would bind, without emitting any code.
+    /// Used to type-probe match arm bodies before lowering.
+    fn bind_pattern_types(&mut self, pat: &Pattern, st: &VType) -> CResult<()> {
+        match pat {
+            Pattern::Wildcard(_) | Pattern::Int(..) | Pattern::Bool(..) | Pattern::Str(..) => {
+                Ok(())
+            }
+            Pattern::Bind(id) => {
+                let is_variant = matches!(self.cg.variant_index.get(&id.name), Some((_, 0)))
+                    || id.name == "None";
+                if !is_variant {
+                    let var = self.new_var(st);
+                    self.bind(&id.name, var, st.clone());
+                }
+                Ok(())
+            }
+            Pattern::Variant { path, fields, span } => {
+                let vname = path.segments.last().unwrap().name.clone();
+                let field_ts: Vec<VType> = match st {
+                    VType::Option(p) => {
+                        if vname == "Some" {
+                            vec![(**p).clone()]
+                        } else {
+                            vec![]
+                        }
+                    }
+                    VType::Sum(parent) => {
+                        let parent = parent.clone();
+                        self.variant_field_types(&parent, &vname, *span)?
+                    }
+                    VType::Fallible(ok_t) => {
+                        if vname == "Ok" {
+                            vec![(**ok_t).clone()]
+                        } else {
+                            vec![VType::Any]
+                        }
+                    }
+                    VType::Any => fields.iter().map(|_| VType::Any).collect(),
+                    _ => return nope(*span, "variant patterns on this type"),
+                };
+                for (fpat, ft) in fields.iter().zip(&field_ts) {
+                    self.bind_pattern_types(fpat, ft)?;
+                }
+                Ok(())
+            }
+            Pattern::Tuple(_, span) => nope(*span, "tuple patterns"),
         }
     }
 
