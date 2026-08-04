@@ -240,7 +240,11 @@ fn walk_expr(
         }
         Expr::Call { callee, args, .. } => {
             if let Expr::Ident(id) = &**callee {
-                if id.name == "print" && !active.iter().any(|a| a == IO) {
+                let io_builtin = matches!(
+                    id.name.as_str(),
+                    "print" | "read_file" | "write_file" | "file_exists" | "input" | "args"
+                );
+                if io_builtin && !active.iter().any(|a| a == IO) {
                     out.insert(IO.to_string());
                 }
                 if fns.contains_key(id.name.as_str()) {

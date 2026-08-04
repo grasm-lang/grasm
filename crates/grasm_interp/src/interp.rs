@@ -38,6 +38,8 @@ pub struct Interp<'a, W: Write> {
     depth: u32,
     /// `inout` copy-out values from the last `call_decl` (param index → value).
     pending_writebacks: Vec<(usize, Value)>,
+    /// Program arguments exposed via the `args()` builtin.
+    pub program_args: Vec<String>,
 }
 
 const MAX_DEPTH: u32 = 2_000;
@@ -47,13 +49,19 @@ impl<'a, W: Write> Interp<'a, W> {
         let mut fns = HashMap::new();
         let mut sums: HashMap<String, Vec<(String, usize)>> = HashMap::new();
         let mut variants: HashMap<String, Option<(String, usize)>> = HashMap::new();
-        // Prelude Option.
+        // Prelude Option + IoError.
         sums.insert(
             "Option".into(),
             vec![("Some".into(), 1), ("None".into(), 0)],
         );
         variants.insert("Some".into(), Some(("Option".into(), 1)));
         variants.insert("None".into(), Some(("Option".into(), 0)));
+        sums.insert(
+            "IoError".into(),
+            vec![("NotFound".into(), 1), ("IoFailed".into(), 1)],
+        );
+        variants.insert("NotFound".into(), Some(("IoError".into(), 1)));
+        variants.insert("IoFailed".into(), Some(("IoError".into(), 1)));
         for decl in &module.decls {
             match decl {
                 Decl::Fn(f) => {
@@ -93,6 +101,7 @@ impl<'a, W: Write> Interp<'a, W> {
             out,
             depth: 0,
             pending_writebacks: Vec::new(),
+            program_args: Vec::new(),
         }
     }
 
@@ -743,6 +752,44 @@ impl<'a, W: Write> Interp<'a, W> {
                         let v = self.eval_expr(&args[0])?;
                         return Err(Flow::Err(v));
                     }
+                    "read_file" => {
+                        let p = self.eval_expr(&args[0])?.to_string();
+                        return Ok(match std::fs::read_to_string(&p) {
+                            Ok(s) => Value::Ok(Rc::new(Value::str(s))),
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                Value::Err(Rc::new(io_error("NotFound", p)))
+                            }
+                            Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
+                        });
+                    }
+                    "write_file" => {
+                        let p = self.eval_expr(&args[0])?.to_string();
+                        let content = self.eval_expr(&args[1])?.to_string();
+                        return Ok(match std::fs::write(&p, content) {
+                            Ok(()) => Value::Ok(Rc::new(Value::Unit)),
+                            Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
+                        });
+                    }
+                    "file_exists" => {
+                        let p = self.eval_expr(&args[0])?.to_string();
+                        return Ok(Value::Bool(std::path::Path::new(&p).exists()));
+                    }
+                    "args" => {
+                        let vs: Vec<Value> =
+                            self.program_args.iter().map(|a| Value::str(a.clone())).collect();
+                        return Ok(Value::List(Rc::new(vs)));
+                    }
+                    "input" => {
+                        let mut line = String::new();
+                        let _ = std::io::BufRead::read_line(
+                            &mut std::io::stdin().lock(),
+                            &mut line,
+                        );
+                        while line.ends_with('\n') || line.ends_with('\r') {
+                            line.pop();
+                        }
+                        return Ok(Value::str(line));
+                    }
                     _ => {}
                 }
                 // Variant constructor.
@@ -998,6 +1045,29 @@ impl<'a, W: Write> Interp<'a, W> {
                 v.reverse();
                 Value::List(Rc::new(v))
             }
+            (Value::List(items), "slice") => {
+                let a = self.eval_expr(&args[0])?;
+                let b = self.eval_expr(&args[1])?;
+                match (a, b) {
+                    (Value::Int(s), Value::Int(e)) => {
+                        let len = items.len() as i64;
+                        let s = s.clamp(0, len) as usize;
+                        let e = e.clamp(0, len) as usize;
+                        let v: Vec<Value> =
+                            if s <= e { items[s..e].to_vec() } else { Vec::new() };
+                        Value::List(Rc::new(v))
+                    }
+                    _ => return Err(Flow::Panic("slice bounds must be ints".into())),
+                }
+            }
+            (Value::List(items), "first") => match items.first() {
+                Some(v) => Value::some(v.clone()),
+                None => Value::none(),
+            },
+            (Value::List(items), "last") => match items.last() {
+                Some(v) => Value::some(v.clone()),
+                None => Value::none(),
+            },
             (Value::Str(s), "len") => Value::Int(s.chars().count() as i64),
             (Value::Str(s), "contains") => {
                 let n = self.eval_expr(&args[0])?;
@@ -1031,6 +1101,36 @@ impl<'a, W: Write> Interp<'a, W> {
                 match n {
                     Value::Int(k) if k >= 0 => Value::str(s.repeat(k as usize)),
                     _ => return Err(Flow::Panic("repeat count must be a non-negative int".into())),
+                }
+            }
+            (Value::Str(s), "replace") => {
+                let from = self.eval_expr(&args[0])?.to_string();
+                let to = self.eval_expr(&args[1])?.to_string();
+                Value::str(s.replace(&from, &to))
+            }
+            (Value::Str(s), "substr") => {
+                let a = self.eval_expr(&args[0])?;
+                let b = self.eval_expr(&args[1])?;
+                match (a, b) {
+                    (Value::Int(start), Value::Int(len)) => {
+                        let chars: Vec<char> = s.chars().collect();
+                        let n = chars.len() as i64;
+                        let start = start.clamp(0, n) as usize;
+                        let end = (start as i64 + len.max(0)).clamp(0, n) as usize;
+                        Value::str(chars[start..end].iter().collect::<String>())
+                    }
+                    _ => return Err(Flow::Panic("substr takes (start, len) ints".into())),
+                }
+            }
+            (Value::Str(s), "index_of") => {
+                let needle = self.eval_expr(&args[0])?.to_string();
+                match s.find(&needle) {
+                    // Char index, not byte index, to match len()/substr().
+                    Some(byte_idx) => {
+                        let char_idx = s[..byte_idx].chars().count() as i64;
+                        Value::some(Value::Int(char_idx))
+                    }
+                    None => Value::none(),
                 }
             }
             (Value::Str(s), "parse_int") => match s.trim().parse::<i64>() {
@@ -1250,6 +1350,14 @@ impl<'a, W: Write> Interp<'a, W> {
                 _ => false,
             },
         }
+    }
+}
+
+fn io_error(variant: &str, payload: impl Into<String>) -> Value {
+    Value::Variant {
+        type_name: Rc::new("IoError".into()),
+        variant: Rc::new(variant.into()),
+        fields: Rc::new(vec![Value::str(payload.into())]),
     }
 }
 

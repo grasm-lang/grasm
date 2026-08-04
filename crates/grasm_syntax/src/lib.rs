@@ -2,6 +2,7 @@
 
 pub mod ast;
 pub mod diag;
+pub mod fmt;
 pub mod lexer;
 pub mod parser;
 pub mod span;

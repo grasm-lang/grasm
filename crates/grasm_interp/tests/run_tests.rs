@@ -460,3 +460,77 @@ fn let_params_still_copy() {
         "2 2\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Phase 7: stdlib — fs, args, new str/list methods
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fs_roundtrip_with_args() {
+    let dir = std::env::temp_dir().join("grasm_test_fs");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("note.txt");
+    let path_str = path.to_string_lossy().to_string();
+    let src = r#"fn main() ! IoError {
+    let path = args().get(0) ?? "missing"
+    try write_file(path, "line one\nline two")
+    let content = try read_file(path)
+    print("{content.split("\n").len()} lines")
+    print("{file_exists(path)} {file_exists(path + ".nope")}")
+}
+"#;
+    let mut out = Vec::new();
+    let (code, diags) =
+        grasm_interp::run_src_with_args(src, &[path_str], &mut out);
+    assert!(diags.is_empty(), "{diags:#?}");
+    assert_eq!(code, 0, "output: {}", String::from_utf8_lossy(&out));
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "2 lines\ntrue false\n"
+    );
+}
+
+#[test]
+fn read_missing_file_is_notfound() {
+    run_expect(
+        r#"fn main() {
+    match read_file("/definitely/not/here.txt") {
+        Ok(c) -> print("found?")
+        Err(NotFound(p)) -> print("not found")
+        Err(IoFailed(m)) -> print("io failed")
+    }
+}
+"#,
+        "not found\n",
+    );
+}
+
+#[test]
+fn new_string_methods() {
+    run_expect(
+        r#"fn main() {
+    let s = "hello world"
+    print(s.replace("world", "grasm"))
+    print(s.substr(0, 5))
+    print("{s.index_of("world") ?? 0 - 1}")
+    print("{s.index_of("zzz").is_none()}")
+}
+"#,
+        "hello grasm\nhello\n6\ntrue\n",
+    );
+}
+
+#[test]
+fn new_list_methods() {
+    run_expect(
+        r#"fn main() {
+    let xs = [10, 20, 30, 40]
+    print("{xs.slice(1, 3)}")
+    print("{xs.first() ?? 0} {xs.last() ?? 0}")
+    let empty: [i64] = []
+    print("{empty.first().is_none()}")
+}
+"#,
+        "[20, 30]\n10 40\ntrue\n",
+    );
+}

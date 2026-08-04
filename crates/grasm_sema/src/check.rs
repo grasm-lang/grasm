@@ -74,9 +74,11 @@ impl Checker {
     fn new() -> Self {
         let defs = TypeDefs::new();
         let mut variants = HashMap::new();
-        // Prelude Option variants.
+        // Prelude Option + IoError variants.
         variants.insert("Some".to_string(), vec![(defs.option_id, 0)]);
         variants.insert("None".to_string(), vec![(defs.option_id, 1)]);
+        variants.insert("NotFound".to_string(), vec![(defs.io_error_id, 0)]);
+        variants.insert("IoFailed".to_string(), vec![(defs.io_error_id, 1)]);
         Checker {
             defs,
             aliases: HashMap::new(),
@@ -121,9 +123,19 @@ impl Checker {
         let mut ids: Vec<(usize, TypeDefId)> = Vec::new();
         for (di, decl) in module.decls.iter().enumerate() {
             if let Decl::Type(t) = decl {
-                if self.defs.by_name.contains_key(&t.name.name)
-                    || self.aliases.contains_key(&t.name.name)
-                {
+                if let Some(&existing) = self.defs.by_name.get(&t.name.name) {
+                    if existing == self.defs.option_id || existing == self.defs.io_error_id {
+                        self.error_help(
+                            t.name.span,
+                            format!("type name `{}` is reserved by the prelude", t.name.name),
+                            "pick a different name (e.g. `AppError`)",
+                        );
+                    } else {
+                        self.error(t.name.span, format!("duplicate type name `{}`", t.name.name));
+                    }
+                    continue;
+                }
+                if self.aliases.contains_key(&t.name.name) {
                     self.error(t.name.span, format!("duplicate type name `{}`", t.name.name));
                     continue;
                 }
@@ -1037,6 +1049,48 @@ impl Checker {
                         self.check_expr(&args[0], &Type::Str);
                         return self.uni.fresh(); // bottom: fits anywhere
                     }
+                    "read_file" => {
+                        if args.len() != 1 {
+                            return self.error(span, "read_file takes exactly 1 argument (path)");
+                        }
+                        self.check_expr(&args[0], &Type::Str);
+                        let io_err = Type::Named {
+                            id: self.defs.io_error_id,
+                            args: vec![],
+                        };
+                        return Type::Fallible(Box::new(Type::Str), Box::new(io_err));
+                    }
+                    "write_file" => {
+                        if args.len() != 2 {
+                            return self.error(span, "write_file takes 2 arguments (path, content)");
+                        }
+                        self.check_expr(&args[0], &Type::Str);
+                        self.check_expr(&args[1], &Type::Str);
+                        let io_err = Type::Named {
+                            id: self.defs.io_error_id,
+                            args: vec![],
+                        };
+                        return Type::Fallible(Box::new(Type::Unit), Box::new(io_err));
+                    }
+                    "file_exists" => {
+                        if args.len() != 1 {
+                            return self.error(span, "file_exists takes exactly 1 argument (path)");
+                        }
+                        self.check_expr(&args[0], &Type::Str);
+                        return Type::Bool;
+                    }
+                    "args" => {
+                        if !args.is_empty() {
+                            return self.error(span, "args takes no arguments");
+                        }
+                        return Type::List(Box::new(Type::Str));
+                    }
+                    "input" => {
+                        if !args.is_empty() {
+                            return self.error(span, "input takes no arguments");
+                        }
+                        return Type::Str;
+                    }
                     "fail" => {
                         if args.len() != 1 {
                             return self.error(span, "fail takes exactly 1 argument (the error value)");
@@ -1443,6 +1497,17 @@ impl Checker {
                         check_arity(self, 0);
                         Type::List(Box::new(elem))
                     }
+                    "slice" => {
+                        if check_arity(self, 2) {
+                            self.check_expr(&args[0], &Type::I64);
+                            self.check_expr(&args[1], &Type::I64);
+                        }
+                        Type::List(Box::new(elem))
+                    }
+                    "first" | "last" => {
+                        check_arity(self, 0);
+                        self.defs.option_some(elem)
+                    }
                     "sort" => {
                         self.require_mutable(recv);
                         check_arity(self, 0);
@@ -1481,6 +1546,26 @@ impl Checker {
                         self.check_expr(&args[0], &Type::I64);
                     }
                     Type::Str
+                }
+                "replace" => {
+                    if check_arity(self, 2) {
+                        self.check_expr(&args[0], &Type::Str);
+                        self.check_expr(&args[1], &Type::Str);
+                    }
+                    Type::Str
+                }
+                "substr" => {
+                    if check_arity(self, 2) {
+                        self.check_expr(&args[0], &Type::I64);
+                        self.check_expr(&args[1], &Type::I64);
+                    }
+                    Type::Str
+                }
+                "index_of" => {
+                    if check_arity(self, 1) {
+                        self.check_expr(&args[0], &Type::Str);
+                    }
+                    self.defs.option_some(Type::I64)
                 }
                 "parse_int" => {
                     check_arity(self, 0);

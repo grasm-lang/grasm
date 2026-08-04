@@ -14,11 +14,22 @@ pub fn run_src(
     src: &str,
     out: &mut impl Write,
 ) -> (i32, Vec<grasm_syntax::Diagnostic>) {
+    run_src_with_args(src, &[], out)
+}
+
+/// Like `run_src`, with program arguments for the `args()` builtin.
+pub fn run_src_with_args(
+    src: &str,
+    program_args: &[String],
+    out: &mut impl Write,
+) -> (i32, Vec<grasm_syntax::Diagnostic>) {
     let (module, diags) = grasm_sema::analyze(src);
     if !diags.is_empty() {
         return (1, diags);
     }
-    let code = run_module(&module, out);
+    let mut interp = Interp::new(&module, out);
+    interp.program_args = program_args.to_vec();
+    let code = interp.run_main();
     (code, vec![])
 }
 

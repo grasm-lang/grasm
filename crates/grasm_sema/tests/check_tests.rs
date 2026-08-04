@@ -176,10 +176,10 @@ fn option_prelude() {
 
 #[test]
 fn fallible_functions_and_try() {
-    let prefix = "type IoError = | NotFound | Denied\n\nfn load(p: str) -> str ! IoError {\n    if p == \"\" {\n        return \"x\"\n    }\n    \"data\"\n}\n";
+    let prefix = "type LoadError = | Missing | Denied\n\nfn load(p: str) -> str ! LoadError {\n    if p == \"\" {\n        return \"x\"\n    }\n    \"data\"\n}\n";
     // try propagates when declared.
     check_ok(&format!(
-        "{prefix}fn use_it() -> str ! IoError {{\n    let d = try load(\"a\")\n    d\n}}\n"
+        "{prefix}fn use_it() -> str ! LoadError {{\n    let d = try load(\"a\")\n    d\n}}\n"
     ));
     // try without declaring the error.
     check_err(

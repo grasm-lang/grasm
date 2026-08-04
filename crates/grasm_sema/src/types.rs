@@ -58,6 +58,7 @@ pub struct TypeDefs {
     pub defs: Vec<TypeDef>,
     pub by_name: HashMap<String, TypeDefId>,
     pub option_id: TypeDefId,
+    pub io_error_id: TypeDefId,
 }
 
 impl TypeDefs {
@@ -66,6 +67,7 @@ impl TypeDefs {
             defs: Vec::new(),
             by_name: HashMap::new(),
             option_id: 0,
+            io_error_id: 0,
         };
         // Prelude: type Option[T] = | Some(v: T) | None
         td.option_id = td.insert(TypeDef {
@@ -80,6 +82,23 @@ impl TypeDefs {
                     Variant {
                         name: "None".into(),
                         fields: vec![],
+                    },
+                ],
+            },
+        });
+        // Prelude: type IoError = | NotFound(path: str) | IoFailed(msg: str)
+        td.io_error_id = td.insert(TypeDef {
+            name: "IoError".into(),
+            generics: vec![],
+            kind: TypeDefKind::Sum {
+                variants: vec![
+                    Variant {
+                        name: "NotFound".into(),
+                        fields: vec![("path".into(), Type::Str)],
+                    },
+                    Variant {
+                        name: "IoFailed".into(),
+                        fields: vec![("msg".into(), Type::Str)],
                     },
                 ],
             },

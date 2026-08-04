@@ -19,9 +19,49 @@ fn main() -> ExitCode {
                 }
             };
             let mut stdout = std::io::stdout();
-            let (code, diags) = grasm_interp::run_src(&src, &mut stdout);
+            // Everything after `--` becomes the program's args().
+            let prog_args: Vec<String> = args
+                .iter()
+                .skip_while(|a| *a != "--")
+                .skip(1)
+                .cloned()
+                .collect();
+            let (code, diags) = grasm_interp::run_src_with_args(&src, &prog_args, &mut stdout);
             report(path, &src, &diags);
             ExitCode::from(code.clamp(0, 255) as u8)
+        }
+        Some("fmt") => {
+            let Some(path) = args.get(1) else {
+                eprintln!("usage: grasm fmt <file.gr> [--check]");
+                return ExitCode::FAILURE;
+            };
+            let src = match std::fs::read_to_string(path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: cannot read `{path}`: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let formatted = grasm_syntax::fmt::format_src(&src);
+            if args.iter().any(|a| a == "--check") {
+                if formatted == src {
+                    println!("ok: `{path}` is formatted");
+                    ExitCode::SUCCESS
+                } else {
+                    eprintln!("`{path}` is not canonically formatted (run `grasm fmt {path}`)");
+                    ExitCode::FAILURE
+                }
+            } else if formatted != src {
+                if let Err(e) = std::fs::write(path, &formatted) {
+                    eprintln!("error: cannot write `{path}`: {e}");
+                    return ExitCode::FAILURE;
+                }
+                println!("formatted `{path}`");
+                ExitCode::SUCCESS
+            } else {
+                println!("`{path}` already formatted");
+                ExitCode::SUCCESS
+            }
         }
         Some("test") => {
             let Some(path) = args.get(1) else {
@@ -107,9 +147,12 @@ fn main() -> ExitCode {
             eprintln!("usage: grasm <command>");
             eprintln!();
             eprintln!("commands:");
-            eprintln!("  check <file.gr>    parse + typecheck");
-            eprintln!("  tokens <file.gr>   dump lexer output (debug)");
-            eprintln!("  version            print version");
+            eprintln!("  run <file.gr> [-- args...]   check + execute main");
+            eprintln!("  test <file.gr>               run test blocks");
+            eprintln!("  check <file.gr>              parse + typecheck");
+            eprintln!("  fmt <file.gr> [--check]      canonical formatting");
+            eprintln!("  tokens <file.gr>             dump lexer output (debug)");
+            eprintln!("  version                      print version");
             ExitCode::FAILURE
         }
     }
