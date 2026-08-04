@@ -45,6 +45,13 @@ enum VType {
     Unit,
     Str,
     List(Box<VType>),
+    Struct(String),
+    Sum(String),
+    Option(Box<VType>),
+    /// `T ! E` — boxed Ok/Err variant wrapper around T.
+    Fallible(Box<VType>),
+    /// Dynamically-typed boxed value (error payloads); printable + variant-matchable.
+    Any,
 }
 
 impl VType {
@@ -55,12 +62,27 @@ impl VType {
             VType::Bool => types::I8,
             VType::Unit => types::I8,
             // Boxed values travel as 64-bit pointers.
-            VType::Str | VType::List(_) => types::I64,
+            VType::Str
+            | VType::List(_)
+            | VType::Struct(_)
+            | VType::Sum(_)
+            | VType::Option(_)
+            | VType::Fallible(_)
+            | VType::Any => types::I64,
         }
     }
 
     fn boxed(&self) -> bool {
-        matches!(self, VType::Str | VType::List(_))
+        matches!(
+            self,
+            VType::Str
+                | VType::List(_)
+                | VType::Struct(_)
+                | VType::Sum(_)
+                | VType::Option(_)
+                | VType::Fallible(_)
+                | VType::Any
+        )
     }
 }
 
@@ -120,6 +142,12 @@ struct Codegen<'m> {
     fns: HashMap<String, FnSig>,
     runtime: HashMap<&'static str, FuncId>,
     strings: HashMap<String, cranelift_module::DataId>,
+    /// struct name → ordered fields (name, type)
+    structs: HashMap<String, Vec<(String, VType)>>,
+    /// sum name → variants (name, field types)
+    sums: HashMap<String, Vec<(String, Vec<VType>)>>,
+    /// variant name → (parent sum, arity) — unambiguous per checker
+    variant_index: HashMap<String, (String, usize)>,
 }
 
 impl<'m> Codegen<'m> {
@@ -129,6 +157,9 @@ impl<'m> Codegen<'m> {
             fns: HashMap::new(),
             runtime: HashMap::new(),
             strings: HashMap::new(),
+            structs: HashMap::new(),
+            sums: HashMap::new(),
+            variant_index: HashMap::new(),
         }
     }
 
@@ -171,6 +202,21 @@ impl<'m> Codegen<'m> {
             ("grasm_unbox_i64", vec![i64t], Some(i64t)),
             ("grasm_unbox_f64", vec![i64t], Some(f64t)),
             ("grasm_unbox_bool", vec![i64t], Some(i8t)),
+            ("grasm_struct_new", vec![ptr, i64t], Some(i64t)),
+            ("grasm_struct_push_field", vec![i64t, ptr, i64t, i64t], None),
+            ("grasm_struct_get", vec![i64t, ptr, i64t], Some(i64t)),
+            ("grasm_struct_set_field", vec![i64t, ptr, i64t, i64t], Some(i64t)),
+            ("grasm_variant_new", vec![ptr, i64t, ptr, i64t], Some(i64t)),
+            ("grasm_variant_push", vec![i64t, i64t], None),
+            ("grasm_variant_is", vec![i64t, ptr, i64t], Some(i8t)),
+            ("grasm_variant_field", vec![i64t, i64t], Some(i64t)),
+            ("grasm_ok_new", vec![i64t], Some(i64t)),
+            ("grasm_err_new", vec![i64t], Some(i64t)),
+            ("grasm_is_ok", vec![i64t], Some(i8t)),
+            ("grasm_report_main_err", vec![i64t], None),
+            ("grasm_val_eq", vec![i64t, i64t], Some(i8t)),
+            ("grasm_list_get_opt", vec![i64t, i64t], Some(i64t)),
+            ("grasm_str_from_val", vec![i64t], Some(i64t)),
         ];
         for (name, params, ret) in decls {
             let mut sig = self.module.make_signature();
@@ -192,14 +238,26 @@ impl<'m> Codegen<'m> {
     fn vtype_of(&self, te: &TypeExpr) -> CResult<VType> {
         match te {
             TypeExpr::Name { path, args, span } => {
-                if path.segments.len() == 1 && args.is_empty() {
-                    match path.segments[0].name.as_str() {
-                        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "usize"
-                        | "int" => return Ok(VType::I64),
-                        "f32" | "f64" | "float" => return Ok(VType::F64),
-                        "bool" => return Ok(VType::Bool),
-                        "str" => return Ok(VType::Str),
-                        _ => {}
+                if path.segments.len() == 1 {
+                    let n = path.segments[0].name.as_str();
+                    if args.is_empty() {
+                        match n {
+                            "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64"
+                            | "usize" | "int" => return Ok(VType::I64),
+                            "f32" | "f64" | "float" => return Ok(VType::F64),
+                            "bool" => return Ok(VType::Bool),
+                            "str" => return Ok(VType::Str),
+                            _ => {}
+                        }
+                        if self.structs.contains_key(n) {
+                            return Ok(VType::Struct(n.to_string()));
+                        }
+                        if self.sums.contains_key(n) {
+                            return Ok(VType::Sum(n.to_string()));
+                        }
+                    }
+                    if n == "Option" && args.len() == 1 {
+                        return Ok(VType::Option(Box::new(self.vtype_of(&args[0])?)));
                     }
                 }
                 nope(*span, format!("the type `{}`", path.dotted()))
@@ -211,14 +269,57 @@ impl<'m> Codegen<'m> {
     }
 
     fn compile(&mut self, module_ast: &AstModule) -> CResult<()> {
+        // Pass 0: type declarations (structs + sums; aliases unsupported).
+        for decl in &module_ast.decls {
+            if let Decl::Type(t) = decl {
+                if !t.generics.is_empty() {
+                    return nope(t.span, "generic types");
+                }
+                match &t.body {
+                    TypeBody::Struct(_) => {
+                        self.structs.insert(t.name.name.clone(), Vec::new());
+                    }
+                    TypeBody::Sum(_) => {
+                        self.sums.insert(t.name.name.clone(), Vec::new());
+                    }
+                    TypeBody::Alias(_) => return nope(t.span, "type aliases"),
+                }
+            }
+        }
+        for decl in &module_ast.decls {
+            if let Decl::Type(t) = decl {
+                match &t.body {
+                    TypeBody::Struct(fields) => {
+                        let mut fs = Vec::new();
+                        for f in fields {
+                            fs.push((f.name.name.clone(), self.vtype_of(&f.ty)?));
+                        }
+                        self.structs.insert(t.name.name.clone(), fs);
+                    }
+                    TypeBody::Sum(variants) => {
+                        let mut vs = Vec::new();
+                        for v in variants {
+                            let mut fts = Vec::new();
+                            for f in &v.fields {
+                                fts.push(self.vtype_of(&f.ty)?);
+                            }
+                            self.variant_index.insert(
+                                v.name.name.clone(),
+                                (t.name.name.clone(), v.fields.len()),
+                            );
+                            vs.push((v.name.name.clone(), fts));
+                        }
+                        self.sums.insert(t.name.name.clone(), vs);
+                    }
+                    TypeBody::Alias(_) => {}
+                }
+            }
+        }
         for decl in &module_ast.decls {
             match decl {
                 Decl::Fn(f) => {
                     if !f.generics.is_empty() {
                         return nope(f.span, "generic functions");
-                    }
-                    if f.err.is_some() {
-                        return nope(f.span, "fallible functions (`! E`)");
                     }
                     let mut params = Vec::new();
                     for p in &f.params {
@@ -227,10 +328,13 @@ impl<'m> Codegen<'m> {
                         }
                         params.push(self.vtype_of(&p.ty)?);
                     }
-                    let ret = match &f.ret {
+                    let mut ret = match &f.ret {
                         Some(t) => self.vtype_of(t)?,
                         None => VType::Unit,
                     };
+                    if f.err.is_some() {
+                        ret = VType::Fallible(Box::new(ret));
+                    }
                     let mut sig = self.module.make_signature();
                     for p in &params {
                         sig.params.push(AbiParam::new(p.cl()));
@@ -248,8 +352,7 @@ impl<'m> Codegen<'m> {
                     self.fns
                         .insert(f.name.name.clone(), FnSig { params, ret, id });
                 }
-                Decl::Test(_) | Decl::Import(_) => {}
-                Decl::Type(t) => return nope(t.span, "type declarations"),
+                Decl::Test(_) | Decl::Import(_) | Decl::Type(_) => {}
                 Decl::Effect(e) => return nope(e.span, "effects"),
             }
         }
@@ -282,8 +385,25 @@ impl<'m> Codegen<'m> {
         let entry = b.create_block();
         b.switch_to_block(entry);
         let g_main = self.fns["main"].id;
+        let main_fallible = matches!(self.fns["main"].ret, VType::Fallible(_));
         let fref = self.module.declare_func_in_func(g_main, b.func);
-        b.ins().call(fref, &[]);
+        let inst = b.ins().call(fref, &[]);
+        if main_fallible {
+            let res = b.inst_results(inst)[0];
+            let ok_blk = b.create_block();
+            let err_blk = b.create_block();
+            let is_ok_id = self.runtime["grasm_is_ok"];
+            let is_ok_ref = self.module.declare_func_in_func(is_ok_id, b.func);
+            let c_inst = b.ins().call(is_ok_ref, &[res]);
+            let c = b.inst_results(c_inst)[0];
+            b.ins().brif(c, ok_blk, &[], err_blk, &[]);
+            b.switch_to_block(err_blk);
+            let rep_id = self.runtime["grasm_report_main_err"];
+            let rep_ref = self.module.declare_func_in_func(rep_id, b.func);
+            b.ins().call(rep_ref, &[res]);
+            b.ins().trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
+            b.switch_to_block(ok_blk);
+        }
         let zero = b.ins().iconst(types::I32, 0);
         b.ins().return_(&[zero]);
         b.seal_all_blocks();
@@ -347,9 +467,24 @@ impl<'m> Codegen<'m> {
                     fcx.b.ins().return_(&[]);
                 }
                 (want, Some((mut v, vt))) => {
-                    if *want == VType::F64 && vt == VType::I64 {
+                    if let VType::Fallible(ok_t) = want.clone() {
+                        let mut inner = v;
+                        if *ok_t == VType::F64 && vt == VType::I64 {
+                            inner = fcx.b.ins().fcvt_from_sint(types::F64, inner);
+                        }
+                        let boxed = fcx.box_value(inner, &ok_t);
+                        v = fcx.call_rt("grasm_ok_new", &[boxed]).unwrap();
+                    } else if *want == VType::F64 && vt == VType::I64 {
                         v = fcx.b.ins().fcvt_from_sint(types::F64, v);
                     }
+                    fcx.emit_scope_decs_all();
+                    fcx.b.ins().return_(&[v]);
+                }
+                (VType::Fallible(_), None) => {
+                    // Unit-valued fallible function: Ok(()).
+                    let z = fcx.b.ins().iconst(types::I64, 0);
+                    let boxed = fcx.call_rt("grasm_box_i64", &[z]).unwrap();
+                    let v = fcx.call_rt("grasm_ok_new", &[boxed]).unwrap();
                     fcx.emit_scope_decs_all();
                     fcx.b.ins().return_(&[v]);
                 }
@@ -541,6 +676,34 @@ impl FnCx<'_, '_> {
             Stmt::Assign {
                 target, op, value, ..
             } => {
+                // Single-level field assignment on a variable: `p.x = v`.
+                if let Expr::Field { recv, name, .. } = target {
+                    if *op != AssignOp::Assign {
+                        return nope(target.span(), "compound assignment to fields");
+                    }
+                    let Expr::Ident(root) = &**recv else {
+                        return nope(target.span(), "nested field assignment");
+                    };
+                    let Some((var, vt)) = self.lookup(&root.name) else {
+                        return nope(root.span, "assignment to unknown variable");
+                    };
+                    let VType::Struct(sname) = vt.clone() else {
+                        return nope(target.span(), "field assignment on non-structs");
+                    };
+                    let field_t = self.struct_field_type(&sname, &name.name, target.span())?;
+                    let (mut fv, fvt) = self.eval_expr_val(value)?;
+                    if field_t == VType::F64 && fvt == VType::I64 {
+                        fv = self.b.ins().fcvt_from_sint(types::F64, fv);
+                    }
+                    let boxed = self.box_value(fv, &field_t);
+                    let cur = self.b.use_var(var);
+                    let (np, nl) = self.str_ptr_len(&name.name);
+                    let newp = self
+                        .call_rt("grasm_struct_set_field", &[cur, np, nl, boxed])
+                        .unwrap();
+                    self.b.def_var(var, newp);
+                    return Ok(StmtOut::Value(None));
+                }
                 let Expr::Ident(id) = target else {
                     return nope(target.span(), "assignment to fields/indexes");
                 };
@@ -595,6 +758,14 @@ impl FnCx<'_, '_> {
                         let (mut val, vt) = self.eval_expr_val(e)?;
                         if self.ret == VType::F64 && vt == VType::I64 {
                             val = self.b.ins().fcvt_from_sint(types::F64, val);
+                        }
+                        if let VType::Fallible(ok_t) = self.ret.clone() {
+                            let mut inner = val;
+                            if *ok_t == VType::F64 && vt == VType::I64 {
+                                inner = self.b.ins().fcvt_from_sint(types::F64, inner);
+                            }
+                            let boxed = self.box_value(inner, &ok_t);
+                            val = self.call_rt("grasm_ok_new", &[boxed]).unwrap();
                         }
                         // Returned value stays owned; release the rest.
                         // (Locals holding the same box are fine: their dec is
@@ -790,8 +961,9 @@ impl FnCx<'_, '_> {
                 self.call_rt("grasm_val_dec", &[boxed]);
                 Ok((v, VType::Bool))
             }
-            VType::Str | VType::List(_) => Ok((boxed, want.clone())),
-            VType::Unit => nope(Span::new(0, 1), "unit list elements"),
+            VType::Unit => nope(Span::new(0, 1), "unit values in boxes"),
+            // All other boxed kinds pass through, keeping the +1.
+            other => Ok((boxed, other.clone())),
         }
     }
 
@@ -832,7 +1004,19 @@ impl FnCx<'_, '_> {
                     }
                     Ok(Some((v, vt)))
                 }
-                None => nope(id.span, format!("the name `{}` here", id.name)),
+                None => {
+                    // Nullary variant as a value (None, Dot, Red, ...).
+                    if let Some((parent, 0)) = self.cg.variant_index.get(&id.name).cloned() {
+                        let v = self.make_variant(&parent, &id.name, &[])?;
+                        let vt = self.sum_vtype(&parent);
+                        return Ok(Some((v, vt)));
+                    }
+                    if id.name == "None" {
+                        let v = self.make_variant("Option", "None", &[])?;
+                        return Ok(Some((v, VType::Option(Box::new(VType::Any)))));
+                    }
+                    nope(id.span, format!("the name `{}` here", id.name))
+                }
             },
             Expr::Str(pieces, _) => Ok(Some(self.build_string(pieces)?)),
             Expr::List(items, span) => {
@@ -883,6 +1067,9 @@ impl FnCx<'_, '_> {
                 if matches!(op, BinaryOp::And | BinaryOp::Or) {
                     return self.short_circuit(*op, lhs, rhs);
                 }
+                if *op == BinaryOp::Coalesce {
+                    return self.eval_coalesce(lhs, rhs, *span).map(Some);
+                }
                 let (lv, lt) = self.eval_expr_val(lhs)?;
                 let (rv, rt) = self.eval_expr_val(rhs)?;
                 Ok(Some(self.binop_values(*op, lv, lt, rv, rt, *span)?))
@@ -902,15 +1089,19 @@ impl FnCx<'_, '_> {
                     Ok(last)
                 }
             }
+            Expr::StructLit { name, fields, span } => {
+                self.eval_struct_lit(name, fields, *span).map(Some)
+            }
+            Expr::Field { recv, name, span } => self.eval_field(recv, name, *span),
+            Expr::Match {
+                scrutinee, arms, span,
+            } => self.eval_match(scrutinee, arms, *span),
+            Expr::Try { expr, span } => self.eval_try(expr, *span).map(Some),
             other => nope(
                 other.span(),
                 match other {
                     Expr::Tuple(..) => "tuples",
-                    Expr::StructLit { .. } => "structs",
-                    Expr::Field { .. } => "field access",
-                    Expr::Match { .. } => "match",
                     Expr::Range { .. } => "range values outside for",
-                    Expr::Try { .. } => "try",
                     Expr::Closure { .. } => "closures",
                     _ => "this construct",
                 },
@@ -919,23 +1110,10 @@ impl FnCx<'_, '_> {
     }
 
     fn list_elem_type(&mut self, items: &[Expr], span: Span) -> CResult<VType> {
-        // Peek the first element's static shape; empty lists need context we
-        // don't track yet.
         let Some(first) = items.first() else {
             return nope(span, "empty list literals (annotate via a function param for now)");
         };
-        // Cheap structural probe: literals and idents cover the N2 tests.
-        Ok(match first {
-            Expr::Int(..) => VType::I64,
-            Expr::Float(..) => VType::F64,
-            Expr::Bool(..) => VType::Bool,
-            Expr::Str(..) => VType::Str,
-            Expr::Ident(id) => match self.lookup(&id.name) {
-                Some((_, vt)) => vt,
-                None => return nope(span, "this list literal's element type"),
-            },
-            _ => return nope(span, "complex list literal elements (bind them to a variable first)"),
-        })
+        self.probe_type(first)
     }
 
     /// Interpolated string as a value: fold pieces with concat.
@@ -954,12 +1132,13 @@ impl FnCx<'_, '_> {
                         VType::F64 => self.call_rt("grasm_str_from_f64", &[v]).unwrap(),
                         VType::Bool => self.call_rt("grasm_str_from_bool", &[v]).unwrap(),
                         VType::Str => v,
-                        VType::List(_) => {
-                            // Stringify via display: reuse out path? Build str
-                            // from list display not exposed; N2: unsupported.
-                            return nope(inner.span(), "interpolating lists");
+                        ref vt if vt.boxed() => {
+                            let sv = self.call_rt("grasm_str_from_val", &[v]).unwrap();
+                            self.call_rt("grasm_val_dec", &[v]);
+                            sv
                         }
                         VType::Unit => return nope(inner.span(), "interpolating unit"),
+                        _ => unreachable!(),
                     }
                 }
             };
@@ -1012,7 +1191,54 @@ impl FnCx<'_, '_> {
             self.b.def_var(var, newp);
             return Ok(None);
         }
+        // Qualified variant: `Shape.Circle(...)` / `Color.Red`.
+        if let Expr::Ident(tid) = recv {
+            if self.lookup(&tid.name).is_none()
+                && (self.cg.sums.contains_key(&tid.name) || tid.name == "Option")
+            {
+                let parent = tid.name.clone();
+                let v = self.build_variant_call(&parent, &name.name, args)?;
+                let vt = self.sum_vtype(&parent);
+                return Ok(Some((v, vt)));
+            }
+        }
         let (rv, rt) = self.eval_expr_val(recv)?;
+        // list.get(i) -> Option[elem]
+        if let (VType::List(elem_t), "get") = (&rt, name.name.as_str()) {
+            let elem_t = elem_t.clone();
+            let (iv, it) = self.eval_expr_val(&args[0])?;
+            if it != VType::I64 {
+                return nope(args[0].span(), "non-integer index");
+            }
+            let opt = self.call_rt("grasm_list_get_opt", &[rv, iv]).unwrap();
+            self.call_rt("grasm_val_dec", &[rv]);
+            return Ok(Some((opt, VType::Option(elem_t))));
+        }
+        // Option methods.
+        if let VType::Option(payload_t) = rt.clone() {
+            match name.name.as_str() {
+                "is_some" | "is_none" => {
+                    let (sp, sl) = self.str_ptr_len("Some");
+                    let is_some = self.call_rt("grasm_variant_is", &[rv, sp, sl]).unwrap();
+                    self.call_rt("grasm_val_dec", &[rv]);
+                    let out = if name.name == "is_none" {
+                        let one = self.b.ins().iconst(types::I8, 1);
+                        self.b.ins().bxor(is_some, one)
+                    } else {
+                        is_some
+                    };
+                    return Ok(Some((out, VType::Bool)));
+                }
+                "unwrap_or" => {
+                    let fake_lhs_span = span;
+                    let _ = fake_lhs_span;
+                    return self
+                        .coalesce_values(rv, &payload_t, &args[0], span)
+                        .map(Some);
+                }
+                _ => {}
+            }
+        }
         match (&rt, name.name.as_str()) {
             (VType::Str, "len") => {
                 let v = self.call_rt("grasm_str_len", &[rv]).unwrap();
@@ -1118,7 +1344,20 @@ impl FnCx<'_, '_> {
             return Ok(out);
         }
         if lt.boxed() {
-            return nope(span, "operators on lists");
+            // Structural equality for any boxed values.
+            if matches!(op, Eq | NotEq) {
+                let e = self.call_rt("grasm_val_eq", &[lv, rv]).unwrap();
+                let v = if op == NotEq {
+                    let one = self.b.ins().iconst(types::I8, 1);
+                    self.b.ins().bxor(e, one)
+                } else {
+                    e
+                };
+                self.call_rt("grasm_val_dec", &[lv]);
+                self.call_rt("grasm_val_dec", &[rv]);
+                return Ok((v, VType::Bool));
+            }
+            return nope(span, "this operator on boxed values");
         }
         let out = match (&lt, op) {
             (VType::I64, Add) => (self.b.ins().iadd(lv, rv), VType::I64),
@@ -1332,7 +1571,34 @@ impl FnCx<'_, '_> {
                 }
                 return nope(span, "panic with a non-literal message");
             }
+            "fail" => {
+                let (ev, evt) = self.eval_expr_val(&args[0])?;
+                if !evt.boxed() {
+                    return nope(args[0].span(), "failing with unboxed values");
+                }
+                let wrapped = self.call_rt("grasm_err_new", &[ev]).unwrap();
+                self.emit_scope_decs_all();
+                self.b.ins().return_(&[wrapped]);
+                let dead = self.b.create_block();
+                self.b.switch_to_block(dead);
+                // fail() has bottom type; produce a dummy unit.
+                return Ok(None);
+            }
             _ => {}
+        }
+        // Variant constructor call.
+        if let Some((parent, arity)) = self.cg.variant_index.get(&id.name).cloned() {
+            if args.len() == arity {
+                let v = self.build_variant_call(&parent, &id.name, args)?;
+                let vt = self.sum_vtype(&parent);
+                return Ok(Some((v, vt)));
+            }
+        }
+        if id.name == "Some" && args.len() == 1 {
+            let (av, avt) = self.eval_expr_val(&args[0])?;
+            let boxed = self.box_value(av, &avt);
+            let v = self.make_variant("Option", "Some", &[boxed])?;
+            return Ok(Some((v, VType::Option(Box::new(avt)))));
         }
         let Some(sig) = self.cg.fns.get(&id.name) else {
             return nope(id.span, format!("the function `{}` here", id.name));
@@ -1390,11 +1656,12 @@ impl FnCx<'_, '_> {
                                 VType::Bool => {
                                     self.call_rt("grasm_out_bool", &[v]);
                                 }
-                                VType::Str | VType::List(_) => {
+                                ref vt2 if vt2.boxed() => {
                                     self.call_rt("grasm_out_val", &[v]);
                                     self.call_rt("grasm_val_dec", &[v]);
                                 }
                                 VType::Unit => return nope(inner.span(), "printing unit"),
+                                _ => unreachable!(),
                             }
                         }
                     }
@@ -1412,15 +1679,610 @@ impl FnCx<'_, '_> {
                     VType::Bool => {
                         self.call_rt("grasm_out_bool", &[v]);
                     }
-                    VType::Str | VType::List(_) => {
+                    ref vt2 if vt2.boxed() => {
                         self.call_rt("grasm_out_val", &[v]);
                         self.call_rt("grasm_val_dec", &[v]);
                     }
                     VType::Unit => return nope(other.span(), "printing unit"),
+                    _ => unreachable!(),
                 }
             }
         }
         self.call_rt("grasm_out_nl", &[]);
         Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // N3: variants, structs, match, fallibles
+    // ------------------------------------------------------------------
+
+    fn sum_vtype(&self, parent: &str) -> VType {
+        if parent == "Option" {
+            VType::Option(Box::new(VType::Any))
+        } else {
+            VType::Sum(parent.to_string())
+        }
+    }
+
+    fn struct_field_type(&mut self, sname: &str, fname: &str, span: Span) -> CResult<VType> {
+        let Some(fields) = self.cg.structs.get(sname) else {
+            return nope(span, format!("the struct `{sname}`"));
+        };
+        for (n, t) in fields {
+            if n == fname {
+                return Ok(t.clone());
+            }
+        }
+        nope(span, format!("the field `{fname}`"))
+    }
+
+    fn variant_field_types(&mut self, parent: &str, vname: &str, span: Span) -> CResult<Vec<VType>> {
+        if parent == "Option" {
+            return Ok(if vname == "Some" {
+                vec![VType::Any]
+            } else {
+                vec![]
+            });
+        }
+        let Some(variants) = self.cg.sums.get(parent) else {
+            return nope(span, format!("the sum type `{parent}`"));
+        };
+        for (n, ts) in variants {
+            if n == vname {
+                return Ok(ts.clone());
+            }
+        }
+        nope(span, format!("the variant `{vname}`"))
+    }
+
+    /// Builds a variant from already-boxed field values (ownership transfers).
+    fn make_variant(&mut self, parent: &str, vname: &str, fields: &[Value]) -> CResult<Value> {
+        let (tp, tl) = self.str_ptr_len(parent);
+        let (vp, vl) = self.str_ptr_len(vname);
+        let v = self.call_rt("grasm_variant_new", &[tp, tl, vp, vl]).unwrap();
+        for f in fields {
+            self.call_rt("grasm_variant_push", &[v, *f]);
+        }
+        Ok(v)
+    }
+
+    fn build_variant_call(&mut self, parent: &str, vname: &str, args: &[Expr]) -> CResult<Value> {
+        let span = args.first().map(|a| a.span()).unwrap_or(Span::new(0, 1));
+        let field_ts = self.variant_field_types(parent, vname, span)?;
+        let mut boxed_fields = Vec::with_capacity(args.len());
+        for (a, ft) in args.iter().zip(&field_ts) {
+            let (mut av, avt) = self.eval_expr_val(a)?;
+            if *ft == VType::F64 && avt == VType::I64 {
+                av = self.b.ins().fcvt_from_sint(types::F64, av);
+            }
+            let bx = if *ft == VType::Any {
+                self.box_value(av, &avt)
+            } else {
+                self.box_value(av, ft)
+            };
+            boxed_fields.push(bx);
+        }
+        self.make_variant(parent, vname, &boxed_fields)
+    }
+
+    fn eval_struct_lit(
+        &mut self,
+        name: &Path,
+        fields: &[(Ident, Expr)],
+        span: Span,
+    ) -> CResult<(Value, VType)> {
+        let sname = name.segments[0].name.clone();
+        let (np, nl) = self.str_ptr_len(&sname);
+        let sv = self.call_rt("grasm_struct_new", &[np, nl]).unwrap();
+        for (fname, fexpr) in fields {
+            let ft = self.struct_field_type(&sname, &fname.name, span)?;
+            let (mut fv, fvt) = self.eval_expr_val(fexpr)?;
+            if ft == VType::F64 && fvt == VType::I64 {
+                fv = self.b.ins().fcvt_from_sint(types::F64, fv);
+            }
+            let boxed = self.box_value(fv, &ft);
+            let (fp, fl) = self.str_ptr_len(&fname.name);
+            self.call_rt("grasm_struct_push_field", &[sv, fp, fl, boxed]);
+        }
+        Ok((sv, VType::Struct(sname)))
+    }
+
+    fn eval_field(
+        &mut self,
+        recv: &Expr,
+        name: &Ident,
+        span: Span,
+    ) -> CResult<Option<(Value, VType)>> {
+        // `Type.Variant` nullary through the field path.
+        if let Expr::Ident(tid) = recv {
+            if self.lookup(&tid.name).is_none()
+                && (self.cg.sums.contains_key(&tid.name) || tid.name == "Option")
+            {
+                let parent = tid.name.clone();
+                let v = self.build_variant_call(&parent, &name.name, &[])?;
+                let vt = self.sum_vtype(&parent);
+                return Ok(Some((v, vt)));
+            }
+        }
+        let (rv, rt) = self.eval_expr_val(recv)?;
+        let VType::Struct(sname) = rt else {
+            return nope(span, "field access on non-structs");
+        };
+        let ft = self.struct_field_type(&sname, &name.name, span)?;
+        let (fp, fl) = self.str_ptr_len(&name.name);
+        let boxed = self.call_rt("grasm_struct_get", &[rv, fp, fl]).unwrap();
+        self.call_rt("grasm_val_dec", &[rv]);
+        let (v, vt) = self.unbox(boxed, &ft)?;
+        Ok(Some((v, vt)))
+    }
+
+    fn eval_try(&mut self, inner: &Expr, span: Span) -> CResult<(Value, VType)> {
+        let (fv, ft) = self.eval_expr_val(inner)?;
+        let VType::Fallible(ok_t) = ft else {
+            return nope(span, "try on non-fallible values");
+        };
+        let ok_blk = self.b.create_block();
+        let err_blk = self.b.create_block();
+        let c = self.call_rt("grasm_is_ok", &[fv]).unwrap();
+        self.b.ins().brif(c, ok_blk, &[], err_blk, &[]);
+
+        self.b.switch_to_block(err_blk);
+        let zero = self.b.ins().iconst(types::I64, 0);
+        let epay = self.call_rt("grasm_variant_field", &[fv, zero]).unwrap();
+        self.call_rt("grasm_val_dec", &[fv]);
+        let wrapped = self.call_rt("grasm_err_new", &[epay]).unwrap();
+        self.emit_scope_decs_all();
+        if matches!(self.ret, VType::Fallible(_)) {
+            self.b.ins().return_(&[wrapped]);
+        } else {
+            // Checker prevents this; guard anyway.
+            self.call_rt("grasm_report_main_err", &[wrapped]);
+            self.trap_here();
+        }
+
+        self.b.switch_to_block(ok_blk);
+        let zero2 = self.b.ins().iconst(types::I64, 0);
+        let payload = self.call_rt("grasm_variant_field", &[fv, zero2]).unwrap();
+        self.call_rt("grasm_val_dec", &[fv]);
+        let (v, vt) = self.unbox(payload, &ok_t)?;
+        Ok((v, vt))
+    }
+
+    fn eval_coalesce(&mut self, lhs: &Expr, rhs: &Expr, span: Span) -> CResult<(Value, VType)> {
+        let (lv, lt) = self.eval_expr_val(lhs)?;
+        let VType::Option(payload_t) = lt else {
+            return nope(span, "?? on non-Option values");
+        };
+        self.coalesce_values(lv, &payload_t, rhs, span)
+    }
+
+    /// Shared by `??` and `unwrap_or`: consumes the owned Option `lv`.
+    fn coalesce_values(
+        &mut self,
+        lv: Value,
+        payload_t: &VType,
+        rhs: &Expr,
+        _span: Span,
+    ) -> CResult<(Value, VType)> {
+        // Determine result type: payload type, or the rhs type if unknown.
+        let mut out_t = payload_t.clone();
+        if out_t == VType::Any {
+            // Probe rhs type cheaply by lowering it in the else branch only;
+            // we need the type NOW for the merge param. Structural probe:
+            out_t = self.probe_type(rhs)?;
+        }
+        let some_blk = self.b.create_block();
+        let none_blk = self.b.create_block();
+        let merge = self.b.create_block();
+        self.b.append_block_param(merge, out_t.cl());
+        let (sp, sl) = self.str_ptr_len("Some");
+        let c = self.call_rt("grasm_variant_is", &[lv, sp, sl]).unwrap();
+        self.b.ins().brif(c, some_blk, &[], none_blk, &[]);
+
+        self.b.switch_to_block(some_blk);
+        let zero = self.b.ins().iconst(types::I64, 0);
+        let payload = self.call_rt("grasm_variant_field", &[lv, zero]).unwrap();
+        self.call_rt("grasm_val_dec", &[lv]);
+        let (v, _) = self.unbox(payload, &out_t)?;
+        self.b.ins().jump(merge, &[v]);
+
+        self.b.switch_to_block(none_blk);
+        self.call_rt("grasm_val_dec", &[lv]);
+        let (mut rv, rvt) = self.eval_expr_val(rhs)?;
+        if out_t == VType::F64 && rvt == VType::I64 {
+            rv = self.b.ins().fcvt_from_sint(types::F64, rv);
+        }
+        self.b.ins().jump(merge, &[rv]);
+
+        self.b.switch_to_block(merge);
+        let out = self.b.block_params(merge)[0];
+        Ok((out, out_t))
+    }
+
+    /// Static type probe without emitting code. Best-effort but covers the
+    /// realistic expression shapes; used for merge-block param types.
+    fn probe_type(&mut self, e: &Expr) -> CResult<VType> {
+        use BinaryOp::*;
+        Ok(match e {
+            Expr::Int(..) => VType::I64,
+            Expr::Float(..) => VType::F64,
+            Expr::Bool(..) => VType::Bool,
+            Expr::Str(..) => VType::Str,
+            Expr::Unary { op, expr, .. } => match op {
+                UnaryOp::Not => VType::Bool,
+                UnaryOp::Neg => self.probe_type(expr)?,
+            },
+            Expr::Binary { op, lhs, rhs, .. } => match op {
+                Eq | NotEq | Lt | LtEq | Gt | GtEq | And | Or => VType::Bool,
+                Coalesce => {
+                    let lt = self.probe_type(lhs)?;
+                    if let VType::Option(p) = lt {
+                        if *p != VType::Any {
+                            *p
+                        } else {
+                            self.probe_type(rhs)?
+                        }
+                    } else {
+                        self.probe_type(rhs)?
+                    }
+                }
+                _ => {
+                    // Arithmetic: float wins the promotion.
+                    let lt = self.probe_type(lhs)?;
+                    if lt == VType::I64 {
+                        if let Ok(rt) = self.probe_type(rhs) {
+                            if rt == VType::F64 {
+                                return Ok(VType::F64);
+                            }
+                        }
+                    }
+                    lt
+                }
+            },
+            Expr::Ident(id) => match self.lookup(&id.name) {
+                Some((_, vt)) => vt,
+                None => {
+                    if let Some((parent, 0)) = self.cg.variant_index.get(&id.name).cloned() {
+                        self.sum_vtype(&parent)
+                    } else if id.name == "None" {
+                        VType::Option(Box::new(VType::Any))
+                    } else {
+                        return nope(id.span, "inferring this type");
+                    }
+                }
+            },
+            Expr::Call { callee, args, .. } => {
+                if let Expr::Ident(id) = &**callee {
+                    if let Some(sig) = self.cg.fns.get(&id.name) {
+                        return Ok(sig.ret.clone());
+                    }
+                    if let Some((parent, _)) = self.cg.variant_index.get(&id.name).cloned() {
+                        return Ok(self.sum_vtype(&parent));
+                    }
+                    if id.name == "Some" && args.len() == 1 {
+                        let inner = self.probe_type(&args[0])?;
+                        return Ok(VType::Option(Box::new(inner)));
+                    }
+                }
+                return nope(e.span(), "inferring this type");
+            }
+            Expr::StructLit { name, .. } => VType::Struct(name.segments[0].name.clone()),
+            Expr::Field { recv, name, span } => {
+                let rt = self.probe_type(recv)?;
+                match rt {
+                    VType::Struct(sname) => self.struct_field_type(&sname, &name.name, *span)?,
+                    _ => {
+                        // `Type.Variant` value probe.
+                        if let Expr::Ident(tid) = &**recv {
+                            if self.cg.sums.contains_key(&tid.name) {
+                                return Ok(self.sum_vtype(&tid.name));
+                            }
+                        }
+                        return nope(*span, "inferring this type");
+                    }
+                }
+            }
+            Expr::If { then_block, .. } => {
+                match then_block.stmts.last() {
+                    Some(Stmt::Expr(inner)) => self.probe_type(inner)?,
+                    _ => return nope(e.span(), "inferring this type"),
+                }
+            }
+            Expr::Match { arms, .. } => {
+                let mut found: Option<VType> = None;
+                for arm in arms {
+                    if let Ok(t) = self.probe_type(&arm.body) {
+                        found = Some(t);
+                        break;
+                    }
+                }
+                match found {
+                    Some(t) => t,
+                    None => return nope(e.span(), "inferring this type"),
+                }
+            }
+            Expr::Block(b) => match b.stmts.last() {
+                Some(Stmt::Expr(inner)) => self.probe_type(inner)?,
+                _ => VType::Unit,
+            },
+            Expr::MethodCall { recv, name, .. } => match name.name.as_str() {
+                "len" => VType::I64,
+                "is_some" | "is_none" | "contains" => VType::Bool,
+                "get" => {
+                    let rt = self.probe_type(recv)?;
+                    match rt {
+                        VType::List(elem) => VType::Option(elem),
+                        _ => return nope(e.span(), "inferring this type"),
+                    }
+                }
+                _ => {
+                    if let Some(sig) = self.cg.fns.get(&name.name) {
+                        sig.ret.clone()
+                    } else if let Expr::Ident(tid) = &**recv {
+                        if self.cg.sums.contains_key(&tid.name) {
+                            self.sum_vtype(&tid.name)
+                        } else {
+                            return nope(e.span(), "inferring this type");
+                        }
+                    } else {
+                        return nope(e.span(), "inferring this type");
+                    }
+                }
+            },
+            _ => return nope(e.span(), "inferring this type"),
+        })
+    }
+
+    fn eval_match(
+        &mut self,
+        scrutinee: &Expr,
+        arms: &[Arm],
+        span: Span,
+    ) -> CResult<Option<(Value, VType)>> {
+        let (sv, st) = self.eval_expr_val(scrutinee)?;
+        // Hold the scrutinee in a variable for repeated tests.
+        let svar = self.new_var(&st);
+        self.b.def_var(svar, sv);
+
+        let merge = self.b.create_block();
+        // Merge param type discovered from the first value-producing arm; we
+        // pre-scan arm bodies structurally via probe where possible. Simpler:
+        // decide after lowering first arm — but block params must exist before
+        // jumps. Strategy: lower arms into (blocks, value) then wire jumps.
+        // Pragmatic approach: probe the first arm body type.
+        let out_t: Option<VType> = match self.probe_type(&arms[0].body) {
+            Ok(t) if t != VType::Unit => Some(t),
+            _ => None,
+        };
+        if let Some(t) = &out_t {
+            self.b.append_block_param(merge, t.cl());
+        }
+
+        let mut next_test = self.b.create_block();
+        self.b.ins().jump(next_test, &[]);
+
+        for (ai, arm) in arms.iter().enumerate() {
+            self.b.switch_to_block(next_test);
+            next_test = self.b.create_block();
+            let body_blk = self.b.create_block();
+            let is_last = ai + 1 == arms.len();
+
+            self.push_scope();
+            // Pattern test + binds.
+            let matched = self.lower_pattern_test(&arm.pattern, svar, &st, body_blk, next_test)?;
+            let _ = matched;
+
+            self.b.switch_to_block(body_blk);
+            if let Some(guard) = &arm.guard {
+                let (gv, gt) = self.eval_expr_val(guard)?;
+                if gt != VType::Bool {
+                    return nope(guard.span(), "non-bool guards");
+                }
+                let cont_blk = self.b.create_block();
+                // Guard false: release binds, try next arm.
+                let cleanup = self.b.create_block();
+                self.b.ins().brif(gv, cont_blk, &[], cleanup, &[]);
+                self.b.switch_to_block(cleanup);
+                self.release_current_scope_binds();
+                self.b.ins().jump(next_test, &[]);
+                self.b.switch_to_block(cont_blk);
+            }
+            let (bv, bterm) = match self.eval_expr(&arm.body)? {
+                Some(v) => (Some(v), false),
+                None => (None, false),
+            };
+            if !bterm {
+                match (&out_t, bv) {
+                    (Some(want), Some((mut v, vt))) => {
+                        if *want == VType::F64 && vt == VType::I64 {
+                            v = self.b.ins().fcvt_from_sint(types::F64, v);
+                        }
+                        self.pop_scope_with_decs();
+                        self.b.ins().jump(merge, &[v]);
+                    }
+                    (None, maybe) => {
+                        if let Some((v, vt)) = maybe {
+                            self.dec_if_boxed(v, &vt);
+                        }
+                        self.pop_scope_with_decs();
+                        self.b.ins().jump(merge, &[]);
+                    }
+                    (Some(_), None) => {
+                        return nope(arm.span, "this arm producing no value");
+                    }
+                }
+            } else {
+                self.pop_scope_no_decs();
+            }
+
+            if is_last {
+                // Exhaustive per checker: the final next_test is unreachable.
+                self.b.switch_to_block(next_test);
+                self.call_rt("grasm_panic_assert", &[]);
+                self.trap_here();
+            }
+        }
+
+        self.b.switch_to_block(merge);
+        // Release the scrutinee.
+        if st.boxed() {
+            let sv2 = self.b.use_var(svar);
+            self.call_rt("grasm_val_dec", &[sv2]);
+        }
+        if let Some(t) = out_t {
+            let out = self.b.block_params(merge)[0];
+            let _ = span;
+            Ok(Some((out, t)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn release_current_scope_binds(&mut self) {
+        let binds: Vec<(Variable, VType)> = self
+            .vars
+            .last()
+            .map(|s| s.values().cloned().collect())
+            .unwrap_or_default();
+        for (var, vt) in binds {
+            if vt.boxed() {
+                let v = self.b.use_var(var);
+                self.call_rt("grasm_val_dec", &[v]);
+            }
+        }
+    }
+
+    /// Emits the test for one pattern; on match falls into `body_blk` (with
+    /// binds defined), otherwise jumps to `next_test`.
+    fn lower_pattern_test(
+        &mut self,
+        pat: &Pattern,
+        svar: Variable,
+        st: &VType,
+        body_blk: Block,
+        next_test: Block,
+    ) -> CResult<bool> {
+        match pat {
+            Pattern::Wildcard(_) => {
+                self.b.ins().jump(body_blk, &[]);
+                Ok(true)
+            }
+            Pattern::Bind(id) => {
+                // Nullary-variant name check.
+                if let Some((_, 0)) = self.cg.variant_index.get(&id.name).cloned() {
+                    let sv = self.b.use_var(svar);
+                    let (vp, vl) = self.str_ptr_len(&id.name);
+                    let c = self.call_rt("grasm_variant_is", &[sv, vp, vl]).unwrap();
+                    self.b.ins().brif(c, body_blk, &[], next_test, &[]);
+                    return Ok(true);
+                }
+                if id.name == "None" {
+                    let sv = self.b.use_var(svar);
+                    let (vp, vl) = self.str_ptr_len("None");
+                    let c = self.call_rt("grasm_variant_is", &[sv, vp, vl]).unwrap();
+                    self.b.ins().brif(c, body_blk, &[], next_test, &[]);
+                    return Ok(true);
+                }
+                let sv = self.b.use_var(svar);
+                if st.boxed() {
+                    self.call_rt("grasm_val_inc", &[sv]);
+                }
+                let var = self.new_var(st);
+                self.b.def_var(var, sv);
+                self.bind(&id.name, var, st.clone());
+                self.b.ins().jump(body_blk, &[]);
+                Ok(true)
+            }
+            Pattern::Int(want, _) => {
+                let sv = self.b.use_var(svar);
+                let w = self.b.ins().iconst(types::I64, *want);
+                let c = self.b.ins().icmp(IntCC::Equal, sv, w);
+                self.b.ins().brif(c, body_blk, &[], next_test, &[]);
+                Ok(true)
+            }
+            Pattern::Bool(want, _) => {
+                let sv = self.b.use_var(svar);
+                let w = self.b.ins().iconst(types::I8, i64::from(*want));
+                let c = self.b.ins().icmp(IntCC::Equal, sv, w);
+                self.b.ins().brif(c, body_blk, &[], next_test, &[]);
+                Ok(true)
+            }
+            Pattern::Str(want, _) => {
+                let sv = self.b.use_var(svar);
+                let (p, l) = self.str_ptr_len(want);
+                let lit = self.call_rt("grasm_str_lit", &[p, l]).unwrap();
+                let c = self.call_rt("grasm_str_eq", &[sv, lit]).unwrap();
+                self.call_rt("grasm_val_dec", &[lit]);
+                self.b.ins().brif(c, body_blk, &[], next_test, &[]);
+                Ok(true)
+            }
+            Pattern::Variant { path, fields, span } => {
+                let vname = path.segments.last().unwrap().name.clone();
+                let sv = self.b.use_var(svar);
+                let (vp, vl) = self.str_ptr_len(&vname);
+                let c = self.call_rt("grasm_variant_is", &[sv, vp, vl]).unwrap();
+                let bind_blk = self.b.create_block();
+                self.b.ins().brif(c, bind_blk, &[], next_test, &[]);
+                self.b.switch_to_block(bind_blk);
+                // Field types by scrutinee static type.
+                let field_ts: Vec<VType> = match st {
+                    VType::Option(p) => {
+                        if vname == "Some" {
+                            vec![(**p).clone()]
+                        } else {
+                            vec![]
+                        }
+                    }
+                    VType::Sum(parent) => {
+                        let parent = parent.clone();
+                        self.variant_field_types(&parent, &vname, *span)?
+                    }
+                    VType::Fallible(ok_t) => {
+                        if vname == "Ok" {
+                            vec![(**ok_t).clone()]
+                        } else {
+                            vec![VType::Any]
+                        }
+                    }
+                    VType::Any => fields.iter().map(|_| VType::Any).collect(),
+                    _ => return nope(*span, "variant patterns on this type"),
+                };
+                for (i, (fpat, ft)) in fields.iter().zip(&field_ts).enumerate() {
+                    let sv2 = self.b.use_var(svar);
+                    let idx = self.b.ins().iconst(types::I64, i as i64);
+                    let boxed = self.call_rt("grasm_variant_field", &[sv2, idx]).unwrap();
+                    match fpat {
+                        Pattern::Bind(fid)
+                            if !matches!(
+                                self.cg.variant_index.get(&fid.name),
+                                Some((_, 0))
+                            ) && fid.name != "None" =>
+                        {
+                            let (v, vt) = self.unbox(boxed, ft)?;
+                            let var = self.new_var(&vt);
+                            self.b.def_var(var, v);
+                            self.bind(&fid.name, var, vt);
+                        }
+                        Pattern::Wildcard(_) => {
+                            self.call_rt("grasm_val_dec", &[boxed]);
+                        }
+                        nested => {
+                            // Recursive sub-pattern on the (boxed) field. Held
+                            // as a typed temp var; failure path may leak the
+                            // temp (hardened later).
+                            let (fv, fvt) = self.unbox(boxed, ft)?;
+                            let fvar = self.new_var(&fvt);
+                            self.b.def_var(fvar, fv);
+                            let cont = self.b.create_block();
+                            self.lower_pattern_test(nested, fvar, &fvt, cont, next_test)?;
+                            self.b.switch_to_block(cont);
+                        }
+                    }
+                }
+                self.b.ins().jump(body_blk, &[]);
+                Ok(true)
+            }
+            Pattern::Tuple(_, span) => nope(*span, "tuple patterns"),
+        }
     }
 }

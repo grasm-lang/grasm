@@ -116,6 +116,15 @@ pub enum RtPayload {
     Bool(bool),
     Str(String),
     List(Vec<*mut RtVal>),
+    Struct {
+        name: String,
+        fields: Vec<(String, *mut RtVal)>,
+    },
+    Variant {
+        type_name: String,
+        name: String,
+        fields: Vec<*mut RtVal>,
+    },
 }
 
 pub struct RtVal {
@@ -149,10 +158,23 @@ unsafe fn dec(v: *mut RtVal) {
     rc.set(rc.get() - 1);
     if rc.get() <= 0 {
         let boxed = Box::from_raw(v);
-        if let RtPayload::List(items) = &boxed.payload {
-            for &it in items {
-                dec(it);
+        match &boxed.payload {
+            RtPayload::List(items) => {
+                for &it in items {
+                    dec(it);
+                }
             }
+            RtPayload::Struct { fields, .. } => {
+                for (_, fv) in fields {
+                    dec(*fv);
+                }
+            }
+            RtPayload::Variant { fields, .. } => {
+                for &fv in fields {
+                    dec(fv);
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -356,6 +378,21 @@ pub unsafe extern "C" fn grasm_out_val(v: *mut RtVal) {
 
 unsafe fn display(v: *mut RtVal) -> String {
     match &(*v).payload {
+        RtPayload::Struct { name, fields } => {
+            let parts: Vec<String> = fields
+                .iter()
+                .map(|(k, fv)| format!("{k}: {}", display(*fv)))
+                .collect();
+            format!("{name}{{{}}}", parts.join(", "))
+        }
+        RtPayload::Variant { name, fields, .. } => {
+            if fields.is_empty() {
+                name.clone()
+            } else {
+                let parts: Vec<String> = fields.iter().map(|&f| display(f)).collect();
+                format!("{name}({})", parts.join(", "))
+            }
+        }
         RtPayload::I64(x) => x.to_string(),
         RtPayload::F64(x) => {
             if x.fract() == 0.0 && x.is_finite() && x.abs() < 1e15 {
@@ -371,4 +408,259 @@ unsafe fn display(v: *mut RtVal) -> String {
             format!("[{}]", parts.join(", "))
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// N3: structs, variants, fallibles, structural equality
+// ---------------------------------------------------------------------------
+
+unsafe fn take_str(ptr: *const u8, len: u64) -> String {
+    let bytes = std::slice::from_raw_parts(ptr, len as usize);
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// # Safety: compiler-generated calls with interned name data.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_struct_new(name: *const u8, len: u64) -> *mut RtVal {
+    alloc(RtPayload::Struct {
+        name: take_str(name, len),
+        fields: Vec::new(),
+    })
+}
+
+/// # Safety: as above; `val` ownership transfers into the struct.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_struct_push_field(
+    s: *mut RtVal,
+    name: *const u8,
+    len: u64,
+    val: *mut RtVal,
+) {
+    let RtPayload::Struct { fields, .. } = &mut (*s).payload else {
+        grasm_panic_msg_str("push_field on non-struct");
+    };
+    fields.push((take_str(name, len), val));
+}
+
+/// # Safety: as above; returns +1.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_struct_get(
+    s: *mut RtVal,
+    name: *const u8,
+    len: u64,
+) -> *mut RtVal {
+    let RtPayload::Struct { fields, .. } = &(*s).payload else {
+        grasm_panic_msg_str("field access on non-struct");
+    };
+    let key = take_str(name, len);
+    for (k, v) in fields {
+        if *k == key {
+            inc(*v);
+            return *v;
+        }
+    }
+    grasm_panic_msg_str("no such field");
+}
+
+/// CoW field update: returns the (possibly new) struct pointer.
+/// # Safety: as above; `val` ownership transfers.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_struct_set_field(
+    s: *mut RtVal,
+    name: *const u8,
+    len: u64,
+    val: *mut RtVal,
+) -> *mut RtVal {
+    let target = if (*s).rc.get() == 1 {
+        s
+    } else {
+        let RtPayload::Struct { name: sn, fields } = &(*s).payload else {
+            grasm_panic_msg_str("set_field on non-struct");
+        };
+        let cloned: Vec<(String, *mut RtVal)> = fields
+            .iter()
+            .map(|(k, v)| {
+                inc(*v);
+                (k.clone(), *v)
+            })
+            .collect();
+        let nv = alloc(RtPayload::Struct {
+            name: sn.clone(),
+            fields: cloned,
+        });
+        dec(s);
+        nv
+    };
+    let RtPayload::Struct { fields, .. } = &mut (*target).payload else {
+        unreachable!()
+    };
+    let key = take_str(name, len);
+    for (k, v) in fields.iter_mut() {
+        if *k == key {
+            dec(*v);
+            *v = val;
+            return target;
+        }
+    }
+    grasm_panic_msg_str("no such field");
+}
+
+/// # Safety: interned names.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_variant_new(
+    tp: *const u8,
+    tl: u64,
+    vp: *const u8,
+    vl: u64,
+) -> *mut RtVal {
+    alloc(RtPayload::Variant {
+        type_name: take_str(tp, tl),
+        name: take_str(vp, vl),
+        fields: Vec::new(),
+    })
+}
+
+/// # Safety: `val` ownership transfers.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_variant_push(v: *mut RtVal, val: *mut RtVal) {
+    let RtPayload::Variant { fields, .. } = &mut (*v).payload else {
+        grasm_panic_msg_str("variant_push on non-variant");
+    };
+    fields.push(val);
+}
+
+/// # Safety: live pointers.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_variant_is(v: *mut RtVal, p: *const u8, l: u64) -> i8 {
+    match &(*v).payload {
+        RtPayload::Variant { name, .. } => i8::from(*name == take_str(p, l)),
+        _ => 0,
+    }
+}
+
+/// # Safety: live pointers; returns +1.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_variant_field(v: *mut RtVal, i: i64) -> *mut RtVal {
+    let RtPayload::Variant { fields, .. } = &(*v).payload else {
+        grasm_panic_msg_str("variant_field on non-variant");
+    };
+    let f = fields[i as usize];
+    inc(f);
+    f
+}
+
+// Fallibles: Variant with type_name "!".
+
+/// # Safety: `val` ownership transfers.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_ok_new(val: *mut RtVal) -> *mut RtVal {
+    alloc(RtPayload::Variant {
+        type_name: "!".into(),
+        name: "Ok".into(),
+        fields: vec![val],
+    })
+}
+
+/// # Safety: `val` ownership transfers.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_err_new(val: *mut RtVal) -> *mut RtVal {
+    alloc(RtPayload::Variant {
+        type_name: "!".into(),
+        name: "Err".into(),
+        fields: vec![val],
+    })
+}
+
+/// # Safety: live pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_is_ok(v: *mut RtVal) -> i8 {
+    match &(*v).payload {
+        RtPayload::Variant { name, .. } => i8::from(name == "Ok"),
+        _ => 0,
+    }
+}
+
+/// # Safety: live pointer; prints the interpreter-identical line, exits 1.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_report_main_err(v: *mut RtVal) {
+    let RtPayload::Variant { fields, .. } = &(*v).payload else {
+        rt_panic("bad main error value");
+    };
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "error: unhandled error from main: {}", display(fields[0]));
+    let _ = out.flush();
+    std::process::exit(1);
+}
+
+/// Structural equality across all payloads.
+/// # Safety: live pointers.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_val_eq(a: *mut RtVal, b: *mut RtVal) -> i8 {
+    i8::from(val_eq(a, b))
+}
+
+unsafe fn val_eq(a: *mut RtVal, b: *mut RtVal) -> bool {
+    match (&(*a).payload, &(*b).payload) {
+        (RtPayload::I64(x), RtPayload::I64(y)) => x == y,
+        (RtPayload::F64(x), RtPayload::F64(y)) => x == y,
+        (RtPayload::Bool(x), RtPayload::Bool(y)) => x == y,
+        (RtPayload::Str(x), RtPayload::Str(y)) => x == y,
+        (RtPayload::List(x), RtPayload::List(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(&i, &j)| val_eq(i, j))
+        }
+        (
+            RtPayload::Struct { name: n1, fields: f1 },
+            RtPayload::Struct { name: n2, fields: f2 },
+        ) => {
+            n1 == n2
+                && f1.len() == f2.len()
+                && f1
+                    .iter()
+                    .zip(f2)
+                    .all(|((k1, v1), (k2, v2))| k1 == k2 && val_eq(*v1, *v2))
+        }
+        (
+            RtPayload::Variant { type_name: t1, name: n1, fields: f1 },
+            RtPayload::Variant { type_name: t2, name: n2, fields: f2 },
+        ) => {
+            t1 == t2
+                && n1 == n2
+                && f1.len() == f2.len()
+                && f1.iter().zip(f2).all(|(&i, &j)| val_eq(i, j))
+        }
+        _ => false,
+    }
+}
+
+/// list.get(i) → Option variant (None on OOB).
+/// # Safety: live pointers.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_list_get_opt(v: *mut RtVal, i: i64) -> *mut RtVal {
+    match &(*v).payload {
+        RtPayload::List(items) => {
+            if i < 0 || i as usize >= items.len() {
+                alloc(RtPayload::Variant {
+                    type_name: "Option".into(),
+                    name: "None".into(),
+                    fields: vec![],
+                })
+            } else {
+                let e = items[i as usize];
+                inc(e);
+                alloc(RtPayload::Variant {
+                    type_name: "Option".into(),
+                    name: "Some".into(),
+                    fields: vec![e],
+                })
+            }
+        }
+        _ => grasm_panic_msg_str("get on non-list"),
+    }
+}
+
+/// Display any boxed value as a string value (for interpolation).
+/// # Safety: live pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_from_val(v: *mut RtVal) -> *mut RtVal {
+    alloc(RtPayload::Str(display(v)))
 }

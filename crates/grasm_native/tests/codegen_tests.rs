@@ -61,3 +61,27 @@ fn n2_list_of_strings_compiles() {
     )
     .expect("should compile");
 }
+
+#[test]
+fn n3_structs_sums_match_compile() {
+    compile(
+        "type P = { x: i64, y: i64 }\n\ntype S = | A(v: i64) | B\n\nfn pick(s: S) -> i64 {\n    match s {\n        A(v) -> v\n        B -> 0\n    }\n}\n\nfn main() {\n    var p = P{ x: 1, y: 2 }\n    p.x = 5\n    print(\"{p.x} {pick(A(3))} {pick(B)} {p}\")\n}\n",
+    )
+    .expect("should compile");
+}
+
+#[test]
+fn n3_fallibles_and_option_compile() {
+    compile(
+        "type E = | Bad(n: i64)\n\nfn f(b: i64) -> i64 ! E {\n    if b == 0 {\n        fail(Bad(b))\n    }\n    b\n}\n\nfn g(b: i64) -> i64 ! E {\n    let v = try f(b)\n    v + 1\n}\n\nfn main() {\n    match g(2) {\n        Ok(v) -> print(\"ok {v}\")\n        Err(Bad(n)) -> print(\"bad {n}\")\n        Err(e) -> print(\"other\")\n    }\n    let xs = [1, 2]\n    print(\"{xs.get(0) ?? 0} {Some(3).unwrap_or(0)}\")\n}\n",
+    )
+    .expect("should compile");
+}
+
+#[test]
+fn n3_guards_and_literal_patterns_compile() {
+    compile(
+        "fn label(n: i64) -> str {\n    match n {\n        0 -> \"zero\"\n        x if x < 0 -> \"neg\"\n        _ -> \"pos\"\n    }\n}\n\nfn main() {\n    print(label(0) + label(1))\n}\n",
+    )
+    .expect("should compile");
+}
