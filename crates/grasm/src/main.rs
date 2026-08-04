@@ -6,6 +6,48 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("run") => {
+            let Some(path) = args.get(1) else {
+                eprintln!("usage: grasm run <file.gr>");
+                return ExitCode::FAILURE;
+            };
+            let src = match std::fs::read_to_string(path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: cannot read `{path}`: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let mut stdout = std::io::stdout();
+            let (code, diags) = grasm_interp::run_src(&src, &mut stdout);
+            report(path, &src, &diags);
+            ExitCode::from(code.clamp(0, 255) as u8)
+        }
+        Some("test") => {
+            let Some(path) = args.get(1) else {
+                eprintln!("usage: grasm test <file.gr>");
+                return ExitCode::FAILURE;
+            };
+            let src = match std::fs::read_to_string(path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: cannot read `{path}`: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let mut stdout = std::io::stdout();
+            let (passed, failed, diags) = grasm_interp::test_src(&src, &mut stdout);
+            report(path, &src, &diags);
+            if !diags.is_empty() {
+                return ExitCode::FAILURE;
+            }
+            println!("{passed} passed, {failed} failed");
+            if failed > 0 {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
         Some("check") => {
             let Some(path) = args.get(1) else {
                 eprintln!("usage: grasm check <file.gr>");

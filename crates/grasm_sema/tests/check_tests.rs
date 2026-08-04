@@ -315,3 +315,16 @@ test "grading" {
 "#;
     check_ok(src);
 }
+
+#[test]
+fn fail_builtin() {
+    check_ok("type E = | Boom\n\nfn f(x: i64) -> i64 ! E {\n    if x < 0 {\n        fail(Boom)\n    }\n    x\n}\n");
+    check_err(
+        "type E = | Boom\n\nfn f(x: i64) -> i64 {\n    fail(Boom)\n}\n",
+        "declares no error type",
+    );
+    check_err(
+        "type E = | Boom\ntype F = | Bang\n\nfn f(x: i64) -> i64 ! E {\n    fail(Bang)\n}\n",
+        "declares",
+    );
+}

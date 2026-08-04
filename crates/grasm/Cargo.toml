@@ -11,3 +11,4 @@ path = "src/main.rs"
 [dependencies]
 grasm_syntax = { path = "../grasm_syntax" }
 grasm_sema = { path = "../grasm_sema" }
+grasm_interp = { path = "../grasm_interp" }

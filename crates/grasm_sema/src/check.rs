@@ -886,6 +886,33 @@ impl Checker {
                         self.check_expr(&args[0], &Type::Str);
                         return self.uni.fresh(); // bottom: fits anywhere
                     }
+                    "fail" => {
+                        if args.len() != 1 {
+                            return self.error(span, "fail takes exactly 1 argument (the error value)");
+                        }
+                        let e_ty = self.infer_expr(&args[0]);
+                        match self.fn_err.clone() {
+                            Some(declared) => {
+                                if !self.err_fits(&e_ty, &declared) {
+                                    let e = self.show(&e_ty);
+                                    let d = self.show(&declared);
+                                    self.error_help(
+                                        span,
+                                        format!("`fail` raises `{e}` but this function declares `{d}`"),
+                                        "add the error type to the function's `!` clause",
+                                    );
+                                }
+                            }
+                            None => {
+                                self.error_help(
+                                    span,
+                                    "`fail` used in a function that declares no error type",
+                                    "add `! ErrorType` to the function signature",
+                                );
+                            }
+                        }
+                        return self.uni.fresh(); // bottom: fits anywhere
+                    }
                     _ => {}
                 }
                 // Variant constructor.

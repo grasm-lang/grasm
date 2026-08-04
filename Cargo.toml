@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/grasm_syntax", "crates/grasm_sema", "crates/grasm"]
+members = ["crates/grasm_syntax", "crates/grasm_sema", "crates/grasm_interp", "crates/grasm"]
 
 [workspace.package]
 version = "0.1.0"

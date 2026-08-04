@@ -1,0 +1,21 @@
+// Fallible functions demo.
+type MathError = | DivByZero
+
+fn safe_div(a: i64, b: i64) -> i64 ! MathError {
+    if b == 0 {
+        fail(DivByZero)
+    }
+    a / b
+}
+
+fn main() {
+    match safe_div(10, 0) {
+        Ok(v) -> print("{v}")
+        Err(e) -> print("caught: {e}")
+    }
+}
+
+test "division works" {
+    let v = try safe_div(10, 2)
+    assert_eq(v, 5)
+}
