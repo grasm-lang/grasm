@@ -38,6 +38,36 @@ pub fn run_module(module: &Module, out: &mut impl Write) -> i32 {
     interp.run_main()
 }
 
+/// Run a loaded multi-file program. Assumes it already checked clean.
+pub fn run_program(
+    program: &grasm_sema::loader::Program,
+    program_args: &[String],
+    out: &mut impl Write,
+) -> i32 {
+    let files: Vec<(String, &Module, std::collections::HashMap<String, String>)> = program
+        .files
+        .iter()
+        .map(|f| (f.name.clone(), &f.module, f.imports.clone()))
+        .collect();
+    let mut interp = Interp::new_program(&files, out);
+    interp.program_args = program_args.to_vec();
+    interp.run_main()
+}
+
+/// Run the entry module's test blocks of a loaded program.
+pub fn test_program(
+    program: &grasm_sema::loader::Program,
+    out: &mut impl Write,
+) -> (u32, u32) {
+    let files: Vec<(String, &Module, std::collections::HashMap<String, String>)> = program
+        .files
+        .iter()
+        .map(|f| (f.name.clone(), &f.module, f.imports.clone()))
+        .collect();
+    let mut interp = Interp::new_program(&files, out);
+    interp.run_tests(&program.files[0].module)
+}
+
 /// Check + run all `test` blocks. Returns (passed, failed, diagnostics).
 pub fn test_src(
     src: &str,

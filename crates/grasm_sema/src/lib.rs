@@ -2,6 +2,7 @@
 
 pub mod check;
 pub mod effects;
+pub mod loader;
 pub mod types;
 
 pub use check::{check, Analysis};

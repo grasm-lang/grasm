@@ -15,12 +15,55 @@ pub struct Analysis {
 }
 
 pub fn check(module: &Module) -> Analysis {
+    let files = vec![ModuleView {
+        name: "main".to_string(),
+        module,
+        imports: std::collections::HashMap::new(),
+    }];
+    check_modules(&files)
+}
+
+/// A module as the checker sees it (decoupled from the loader).
+pub struct ModuleView<'a> {
+    pub name: String,
+    pub module: &'a Module,
+    /// alias → full target module name
+    pub imports: std::collections::HashMap<String, String>,
+}
+
+pub fn check_program(program: &crate::loader::Program) -> Analysis {
+    let files: Vec<ModuleView> = program
+        .files
+        .iter()
+        .map(|f| ModuleView {
+            name: f.name.clone(),
+            module: &f.module,
+            imports: f.imports.clone(),
+        })
+        .collect();
+    check_modules(&files)
+}
+
+fn check_modules(files: &[ModuleView]) -> Analysis {
     let mut c = Checker::new();
-    c.collect_types(module);
-    c.collect_fns(module);
-    c.check_module(module);
+    for f in files {
+        c.module_imports
+            .insert(f.name.clone(), f.imports.clone());
+    }
+    for f in files {
+        c.current_module = f.name.clone();
+        c.collect_types(f.module);
+    }
+    for f in files {
+        c.current_module = f.name.clone();
+        c.collect_fns(f.module);
+    }
+    for f in files {
+        c.current_module = f.name.clone();
+        c.check_module(f.module);
+    }
     let mut diagnostics = c.diags;
-    diagnostics.extend(crate::effects::check_effects(module));
+    diagnostics.extend(crate::effects::check_effects_multi(files));
     Analysis {
         defs: c.defs,
         diagnostics,
@@ -39,6 +82,7 @@ struct Binding {
 
 #[derive(Clone)]
 struct FnInfo {
+    is_pub: bool,
     generics: usize,
     params: Vec<Type>,
     modes: Vec<ParamMode>,
@@ -63,6 +107,9 @@ struct Checker {
     variants: HashMap<String, Vec<(TypeDefId, usize)>>,
     uni: Unifier,
     diags: Vec<Diagnostic>,
+    current_module: String,
+    /// module → (alias → full target module name)
+    module_imports: HashMap<String, HashMap<String, String>>,
     scopes: Vec<HashMap<String, Binding>>,
     /// (ret, err) of the function being checked.
     fn_ret: Type,
@@ -89,6 +136,8 @@ impl Checker {
             variants,
             uni: Unifier::new(),
             diags: Vec::new(),
+            current_module: "main".to_string(),
+            module_imports: HashMap::new(),
             scopes: Vec::new(),
             fn_ret: Type::Unit,
             fn_err: None,
@@ -258,7 +307,8 @@ impl Checker {
     fn collect_fns(&mut self, module: &Module) {
         for decl in &module.decls {
             if let Decl::Fn(f) = decl {
-                if self.fns.contains_key(&f.name.name) {
+                let key = format!("{}::{}", self.current_module, f.name.name);
+                if self.fns.contains_key(&key) {
                     self.error(
                         f.name.span,
                         format!("duplicate function name `{}`", f.name.name),
@@ -278,8 +328,9 @@ impl Checker {
                     .unwrap_or(Type::Unit);
                 let err = f.err.as_ref().map(|t| self.resolve_type(t, &generics));
                 self.fns.insert(
-                    f.name.name.clone(),
+                    key,
                     FnInfo {
+                        is_pub: f.is_pub,
                         generics: generics.len(),
                         params,
                         modes: f.params.iter().map(|p| p.mode).collect(),
@@ -406,8 +457,8 @@ impl Checker {
     }
 
     fn check_fn(&mut self, f: &FnDecl) {
-        let info = match self.fns.get(&f.name.name) {
-            Some(i) => i.clone(),
+        let info = match self.lookup_fn(&f.name.name) {
+            Some(i) => i,
             None => return,
         };
         // Generic params stay opaque (`Generic(i)`) while checking the body.
@@ -679,6 +730,13 @@ impl Checker {
         )
     }
 
+    /// Function lookup in the current module's namespace.
+    fn lookup_fn(&self, name: &str) -> Option<FnInfo> {
+        self.fns
+            .get(&format!("{}::{}", self.current_module, name))
+            .cloned()
+    }
+
     fn lookup(&self, name: &str) -> Option<Binding> {
         for scope in self.scopes.iter().rev() {
             if let Some(b) = scope.get(name) {
@@ -907,7 +965,7 @@ impl Checker {
             }
         }
         // Function referenced as a value.
-        if let Some(info) = self.fns.get(&id.name).cloned() {
+        if let Some(info) = self.lookup_fn(&id.name) {
             if info.generics > 0 {
                 let fresh: Vec<Type> = (0..info.generics).map(|_| self.uni.fresh()).collect();
                 return Type::Fn {
@@ -1158,7 +1216,7 @@ impl Checker {
                     }
                 }
                 // Named function.
-                if let Some(info) = self.fns.get(&id.name).cloned() {
+                if let Some(info) = self.lookup_fn(&id.name) {
                     return self.check_fn_call(&id.name, &info, args, span);
                 }
             }
@@ -1351,6 +1409,52 @@ impl Checker {
         args: &[Expr],
         span: Span,
     ) -> Type {
+        // Cross-module qualified call `utils.helper(...)`.
+        if let Expr::Ident(tid) = recv {
+            if self.lookup(&tid.name).is_none() {
+                let target = self
+                    .module_imports
+                    .get(&self.current_module)
+                    .and_then(|m| m.get(&tid.name))
+                    .cloned();
+                if let Some(target_mod) = target {
+                    let qual = format!("{target_mod}::{}", name.name);
+                    match self.fns.get(&qual).cloned() {
+                        Some(info) if info.is_pub => {
+                            return self.check_fn_call(&name.name, &info, args, span);
+                        }
+                        Some(_) => {
+                            return self.error_help(
+                                name.span,
+                                format!(
+                                    "function `{}` in module `{target_mod}` is private",
+                                    name.name
+                                ),
+                                "mark it `pub fn` to allow cross-module calls",
+                            );
+                        }
+                        None => {
+                            // Fall through: `shapes.Circle(...)` — a variant
+                            // constructor referenced through the module alias
+                            // (type namespaces are global).
+                            if let Some(cands) = self.variants.get(&name.name).cloned() {
+                                if cands.len() == 1 {
+                                    let (def_id, vi) = cands[0];
+                                    return self.instantiate_variant(def_id, vi, args, span);
+                                }
+                            }
+                            return self.error(
+                                name.span,
+                                format!(
+                                    "module `{target_mod}` has no function `{}`",
+                                    name.name
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+        }
         // Effect operation call `Clock.now(...)`.
         if let Expr::Ident(tid) = recv {
             if self.lookup(&tid.name).is_none() {
@@ -1408,7 +1512,7 @@ impl Checker {
             return result;
         }
         // UFCS: `x.f(a)` → `f(x, a)`.
-        if let Some(info) = self.fns.get(&name.name).cloned() {
+        if let Some(info) = self.lookup_fn(&name.name) {
             let mut full_args: Vec<Expr> = Vec::with_capacity(args.len() + 1);
             full_args.push(recv.clone());
             full_args.extend(args.iter().cloned());

@@ -1,0 +1,135 @@
+//! Multi-file program loader.
+//!
+//! `import utils` loads `utils.gr` next to the entry file; `import lib.math`
+//! loads `lib/math.gr`. Each file's spans are shifted into one virtual span
+//! space (per-file base offsets), so every later stage keeps a single flat
+//! diagnostic list; the CLI maps spans back to files for rendering.
+
+use std::collections::HashMap;
+
+use grasm_syntax::ast::Module;
+use grasm_syntax::diag::Diagnostic;
+use grasm_syntax::span::Span;
+
+pub struct LoadedFile {
+    /// Full dotted module name; the entry file is always `"main"`.
+    pub name: String,
+    /// Short name used for qualified access (`math` for `lib.math`).
+    pub alias: String,
+    /// Display path for diagnostics.
+    pub path: String,
+    pub src: String,
+    /// Base of this file's span range in the virtual span space.
+    pub base: u32,
+    pub module: Module,
+    /// Aliases this module imported: alias → full module name.
+    pub imports: HashMap<String, String>,
+}
+
+pub struct Program {
+    /// files[0] is the entry module.
+    pub files: Vec<LoadedFile>,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+impl Program {
+    /// Which file owns a span, for diagnostic rendering.
+    pub fn file_of(&self, span: Span) -> usize {
+        self.files
+            .iter()
+            .rposition(|f| span.start >= f.base)
+            .unwrap_or(0)
+    }
+}
+
+/// Loads from an arbitrary source provider (module name → source).
+/// Used both by the disk path and by bundled executables.
+pub fn load_with(
+    entry_name: &str,
+    entry_display_path: &str,
+    provider: &dyn Fn(&str) -> Option<String>,
+) -> Program {
+    let mut files: Vec<LoadedFile> = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut loaded: HashMap<String, ()> = HashMap::new();
+    let mut queue: Vec<(String, String)> = vec![(entry_name.to_string(), entry_display_path.to_string())];
+    let mut base = 0u32;
+
+    while let Some((name, display)) = queue.pop() {
+        if loaded.contains_key(&name) {
+            continue;
+        }
+        loaded.insert(name.clone(), ());
+        let Some(src) = provider(&name) else {
+            diagnostics.push(Diagnostic::error(
+                Span::new(0, 1),
+                format!("cannot load module `{name}` (looked for `{display}`)"),
+            ));
+            continue;
+        };
+        let out = grasm_syntax::parser::parse_with_offset(&src, base);
+        diagnostics.extend(out.diagnostics);
+        let mut imports = HashMap::new();
+        for decl in &out.module.decls {
+            if let grasm_syntax::ast::Decl::Import(imp) = decl {
+                let full = imp.path.dotted();
+                let alias = imp
+                    .path
+                    .segments
+                    .last()
+                    .map(|s| s.name.clone())
+                    .unwrap_or_default();
+                if imports.contains_key(&alias) {
+                    diagnostics.push(Diagnostic::error(
+                        imp.span,
+                        format!("duplicate import alias `{alias}` in module `{name}`"),
+                    ));
+                }
+                imports.insert(alias, full.clone());
+                let disp = format!("{}.gr", full.replace('.', "/"));
+                queue.push((full, disp));
+            }
+        }
+        let alias = name
+            .rsplit('.')
+            .next()
+            .unwrap_or(&name)
+            .to_string();
+        let len = src.len() as u32;
+        files.push(LoadedFile {
+            name,
+            alias,
+            path: display,
+            src,
+            base,
+            module: out.module,
+            imports,
+        });
+        base += len + 1; // +1 keeps ranges disjoint
+    }
+
+    Program {
+        files,
+        diagnostics,
+    }
+}
+
+/// Disk loader: resolves module names relative to the entry file's directory.
+pub fn load_from_disk(entry_path: &std::path::Path) -> Result<Program, String> {
+    let entry_src_dir = entry_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default();
+    let entry_display = entry_path.display().to_string();
+    let entry_src = std::fs::read_to_string(entry_path)
+        .map_err(|e| format!("cannot read `{entry_display}`: {e}"))?;
+
+    let provider = move |name: &str| -> Option<String> {
+        if name == "main" {
+            return Some(entry_src.clone());
+        }
+        let rel = format!("{}.gr", name.replace('.', "/"));
+        std::fs::read_to_string(entry_src_dir.join(rel)).ok()
+    };
+    Ok(load_with("main", &entry_display, &provider))
+}

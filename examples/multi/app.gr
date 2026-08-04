@@ -1,0 +1,14 @@
+import shapes
+import geometry.stats
+
+fn main() {
+    let all = [shapes.Circle(1.0), shapes.Rect(2.0, 3.0), shapes.Circle(2.0)]
+    let areas = all.map(|s| shapes.area(s))
+    print("areas: {areas}")
+    print("mean: {stats.mean(areas)}")
+}
+
+test "cross module" {
+    assert_eq(shapes.area(shapes.Rect(4.0, 5.0)), 20.0)
+    assert_eq(stats.mean([2.0, 4.0]), 3.0)
+}

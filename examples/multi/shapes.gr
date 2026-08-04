@@ -1,0 +1,15 @@
+// Shared shape library.
+pub type Shape =
+    | Circle(r: f64)
+    | Rect(w: f64, h: f64)
+
+pub fn area(s: Shape) -> f64 {
+    match s {
+        Circle(r) -> 3.14159 * r ^ 2
+        Rect(w, h) -> w * h
+    }
+}
+
+fn private_helper() -> i64 {
+    42
+}

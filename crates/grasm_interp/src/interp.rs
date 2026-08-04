@@ -23,7 +23,11 @@ pub enum Flow {
 type EResult = Result<Value, Flow>;
 
 pub struct Interp<'a, W: Write> {
+    /// qualified `mod::fn` → decl
     fns: HashMap<String, &'a FnDecl>,
+    current_module: String,
+    /// module → (alias → target module)
+    imports: HashMap<String, HashMap<String, String>>,
     /// sum type name → variant names (arity implied by decl).
     sums: HashMap<String, Vec<(String, usize)>>,
     /// variant name → (owning type, arity); only unambiguous entries.
@@ -46,7 +50,71 @@ const MAX_DEPTH: u32 = 2_000;
 
 impl<'a, W: Write> Interp<'a, W> {
     pub fn new(module: &'a Module, out: &'a mut W) -> Self {
-        let mut fns = HashMap::new();
+        let mut me = Self::raw_new(out);
+        me.register_module("main", module);
+        me
+    }
+
+    /// files: (module name, module, alias→target imports); files[0] is entry.
+    pub fn new_program(
+        files: &'a [(String, &'a Module, HashMap<String, String>)],
+        out: &'a mut W,
+    ) -> Self {
+        Self::build(files, out)
+    }
+
+    fn build(
+        files: &'a [(String, &'a Module, HashMap<String, String>)],
+        out: &'a mut W,
+    ) -> Self {
+        let mut imports_map = HashMap::new();
+        for (name, _, imps) in files {
+            imports_map.insert(name.clone(), imps.clone());
+        }
+        let mut me = Self::new_empty(out);
+        me.imports = imports_map;
+        for (name, module, _) in files {
+            me.register_module(name, module);
+        }
+        me
+    }
+
+    fn new_empty(out: &'a mut W) -> Self {
+        Self::raw_new(out)
+    }
+
+    fn register_module(&mut self, mod_name: &str, module: &'a Module) {
+        for decl in &module.decls {
+            match decl {
+                Decl::Fn(f) => {
+                    self.fns
+                        .insert(format!("{mod_name}::{}", f.name.name), f);
+                }
+                Decl::Type(t) => {
+                    if let TypeBody::Sum(vs) = &t.body {
+                        let list: Vec<(String, usize)> = vs
+                            .iter()
+                            .map(|v| (v.name.name.clone(), v.fields.len()))
+                            .collect();
+                        for v in vs {
+                            self.variants
+                                .entry(v.name.name.clone())
+                                .and_modify(|e| *e = None)
+                                .or_insert(Some((t.name.name.clone(), v.fields.len())));
+                        }
+                        self.sums.insert(t.name.name.clone(), list);
+                    }
+                }
+                Decl::Effect(e) => {
+                    self.effect_names.insert(e.name.name.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn raw_new(out: &'a mut W) -> Self {
+        let fns = HashMap::new();
         let mut sums: HashMap<String, Vec<(String, usize)>> = HashMap::new();
         let mut variants: HashMap<String, Option<(String, usize)>> = HashMap::new();
         // Prelude Option + IoError.
@@ -62,37 +130,11 @@ impl<'a, W: Write> Interp<'a, W> {
         );
         variants.insert("NotFound".into(), Some(("IoError".into(), 1)));
         variants.insert("IoFailed".into(), Some(("IoError".into(), 1)));
-        for decl in &module.decls {
-            match decl {
-                Decl::Fn(f) => {
-                    fns.insert(f.name.name.clone(), f);
-                }
-                Decl::Type(t) => {
-                    if let TypeBody::Sum(vs) = &t.body {
-                        let list: Vec<(String, usize)> = vs
-                            .iter()
-                            .map(|v| (v.name.name.clone(), v.fields.len()))
-                            .collect();
-                        for v in vs {
-                            variants
-                                .entry(v.name.name.clone())
-                                .and_modify(|e| *e = None) // ambiguous
-                                .or_insert(Some((t.name.name.clone(), v.fields.len())));
-                        }
-                        sums.insert(t.name.name.clone(), list);
-                    }
-                }
-                _ => {}
-            }
-        }
-        let mut effect_names = std::collections::HashSet::new();
-        for decl in &module.decls {
-            if let Decl::Effect(e) = decl {
-                effect_names.insert(e.name.name.clone());
-            }
-        }
+        let effect_names = std::collections::HashSet::new();
         Interp {
             fns,
+            current_module: "main".to_string(),
+            imports: HashMap::new(),
             sums,
             variants,
             scopes: Vec::new(),
@@ -111,11 +153,11 @@ impl<'a, W: Write> Interp<'a, W> {
 
     /// Runs `main`. Returns process exit code.
     pub fn run_main(&mut self) -> i32 {
-        let Some(main) = self.fns.get("main").copied() else {
+        let Some(main) = self.fns.get("main::main").copied() else {
             let _ = writeln!(self.out, "error: no `main` function");
             return 1;
         };
-        match self.call_decl(main, vec![]) {
+        match self.call_decl(main, "main", vec![]) {
             Ok(_) => 0,
             Err(Flow::Err(e)) => {
                 let _ = writeln!(self.out, "error: unhandled error from main: {e}");
@@ -165,7 +207,7 @@ impl<'a, W: Write> Interp<'a, W> {
     // Calls
     // ------------------------------------------------------------------
 
-    fn call_decl(&mut self, f: &'a FnDecl, args: Vec<Value>) -> EResult {
+    fn call_decl(&mut self, f: &'a FnDecl, module: &str, args: Vec<Value>) -> EResult {
         if self.depth >= MAX_DEPTH {
             return Err(Flow::Panic(format!(
                 "stack overflow: recursion deeper than {MAX_DEPTH} calls"
@@ -178,8 +220,10 @@ impl<'a, W: Write> Interp<'a, W> {
         }
         // Fresh frame: callee can't see caller locals.
         let saved = std::mem::take(&mut self.scopes);
+        let saved_module = std::mem::replace(&mut self.current_module, module.to_string());
         self.scopes.push(scope);
         let result = self.eval_block(&f.body);
+        self.current_module = saved_module;
         // Copy-out for `inout` params (applied by the caller to its places).
         self.pending_writebacks.clear();
         if result.is_ok() || matches!(result, Err(Flow::Return(_))) {
@@ -239,7 +283,11 @@ impl<'a, W: Write> Interp<'a, W> {
                 let Some(f) = self.fns.get(name.as_str()).copied() else {
                     return Err(Flow::Panic(format!("unknown function `{name}`")));
                 };
-                self.call_decl(f, args)
+                let module = name
+                    .rsplit_once("::")
+                    .map(|(m, _)| m.to_string())
+                    .unwrap_or_else(|| "main".to_string());
+                self.call_decl(f, &module, args)
             }
             other => Err(Flow::Panic(format!(
                 "`{other}` is not callable ({span_hint})"
@@ -710,8 +758,9 @@ impl<'a, W: Write> Interp<'a, W> {
                 fields: Rc::new(vec![]),
             });
         }
-        if self.fns.contains_key(&id.name) {
-            return Ok(Value::FnRef(Rc::new(id.name.clone())));
+        let qual = format!("{}::{}", self.current_module, id.name);
+        if self.fns.contains_key(&qual) {
+            return Ok(Value::FnRef(Rc::new(qual)));
         }
         Err(Flow::Panic(format!("unknown name `{}`", id.name)))
     }
@@ -808,13 +857,15 @@ impl<'a, W: Write> Interp<'a, W> {
                         fields: Rc::new(vs),
                     });
                 }
-                // Named function.
-                if let Some(f) = self.fns.get(&id.name).copied() {
+                // Named function (current module's namespace).
+                let qual = format!("{}::{}", self.current_module, id.name);
+                if let Some(f) = self.fns.get(&qual).copied() {
+                    let module = self.current_module.clone();
                     let mut vs = Vec::with_capacity(args.len());
                     for a in args {
                         vs.push(self.eval_expr(a)?);
                     }
-                    let r = self.call_decl(f, vs)?;
+                    let r = self.call_decl(f, &module, vs)?;
                     let arg_refs: Vec<&Expr> = args.iter().collect();
                     self.apply_writebacks(&arg_refs)?;
                     return Ok(r);
@@ -859,8 +910,48 @@ impl<'a, W: Write> Interp<'a, W> {
         }
     }
 
-    /// Effect op / qualified variant call / builtin / UFCS method.
+    /// Effect op / cross-module / qualified variant / builtin / UFCS method.
     fn eval_method_call(&mut self, recv: &Expr, name: &Ident, args: &[Expr]) -> EResult {
+        // Cross-module qualified call `utils.helper(...)`.
+        if let Expr::Ident(tid) = recv {
+            let is_local = self.scopes.iter().rev().any(|s| s.contains_key(&tid.name));
+            if !is_local {
+                let target = self
+                    .imports
+                    .get(&self.current_module)
+                    .and_then(|m| m.get(&tid.name))
+                    .cloned();
+                if let Some(target_mod) = target {
+                    let qual = format!("{target_mod}::{}", name.name);
+                    if let Some(f) = self.fns.get(&qual).copied() {
+                        let mut vs = Vec::with_capacity(args.len());
+                        for a in args {
+                            vs.push(self.eval_expr(a)?);
+                        }
+                        let r = self.call_decl(f, &target_mod, vs)?;
+                        let arg_refs: Vec<&Expr> = args.iter().collect();
+                        self.apply_writebacks(&arg_refs)?;
+                        return Ok(r);
+                    }
+                    // Variant constructor through the module alias.
+                    if let Some(Some((tname, _))) = self.variants.get(&name.name).cloned() {
+                        let mut vs = Vec::with_capacity(args.len());
+                        for a in args {
+                            vs.push(self.eval_expr(a)?);
+                        }
+                        return Ok(Value::Variant {
+                            type_name: Rc::new(tname),
+                            variant: Rc::new(name.name.clone()),
+                            fields: Rc::new(vs),
+                        });
+                    }
+                    return Err(Flow::Panic(format!(
+                        "module `{target_mod}` has no function `{}`",
+                        name.name
+                    )));
+                }
+            }
+        }
         // Effect operation dispatch: innermost handler wins.
         if let Expr::Ident(tid) = recv {
             let is_local = self.scopes.iter().rev().any(|s| s.contains_key(&tid.name));
@@ -910,13 +1001,15 @@ impl<'a, W: Write> Interp<'a, W> {
             return Ok(r);
         }
         // UFCS: x.f(a) → f(x, a).
-        if let Some(f) = self.fns.get(&name.name).copied() {
+        let ufcs_qual = format!("{}::{}", self.current_module, name.name);
+        if let Some(f) = self.fns.get(&ufcs_qual).copied() {
+            let module = self.current_module.clone();
             let mut vs = Vec::with_capacity(args.len() + 1);
             vs.push(recv_v);
             for a in args {
                 vs.push(self.eval_expr(a)?);
             }
-            let r = self.call_decl(f, vs)?;
+            let r = self.call_decl(f, &module, vs)?;
             let mut arg_refs: Vec<&Expr> = Vec::with_capacity(args.len() + 1);
             arg_refs.push(recv);
             arg_refs.extend(args.iter());

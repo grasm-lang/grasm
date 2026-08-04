@@ -36,12 +36,18 @@ fn main() {
 
 ```
 cargo build --release            # builds ./target/release/grasm
-grasm run <file.gr> [-- args]    # typecheck + execute
+grasm run <file.gr> [-- args]    # typecheck + execute (follows imports)
 grasm test <file.gr>             # run `test "name" { }` blocks
 grasm check <file.gr>            # diagnostics only (caret + help lines)
+grasm build <file.gr> [-o out]   # self-contained single-file executable
 grasm fmt <file.gr> [--check]    # canonical indentation (comment-safe)
 grasm tokens <file.gr>           # lexer debug dump
 ```
+
+Phase 2 additions: **modules** (`import utils` / `import lib.math`, qualified
+`utils.fn()` access, `pub` enforced cross-module), **`Map[K, V]`** (typed,
+deterministic iteration), and **`grasm build`** (bundles all modules with the
+runtime into one distributable executable).
 
 ## What the language guarantees today
 
@@ -74,7 +80,8 @@ grasm tokens <file.gr>           # lexer debug dump
 
 ## Status
 
-Grasm-Core milestone (the master plan's §19 kernel language): **complete and
-validated** — 143 Rust tests + 39 in-language test blocks across 16 programs,
-adversarial fuzz/stress suite, zero clippy warnings. Tree-walking interpreter
-only (native backends, LSP, package manager: see the roadmap in MASTERPLAN §13).
+Grasm-Core milestone (the master plan's §19 kernel language) plus Phase-2
+features (modules, maps, self-contained builds): **complete and validated** —
+160 Rust tests + 40+ in-language test blocks across 17 programs, adversarial
+fuzz/stress suite, zero clippy warnings. Tree-walking interpreter (native
+codegen via Cranelift, LSP, package manager: next milestones — MASTERPLAN §13).

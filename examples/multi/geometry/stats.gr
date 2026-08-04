@@ -1,0 +1,7 @@
+// Nested module: dotted import path.
+pub fn mean(xs: [f64]) -> f64 {
+    if xs.len() == 0 {
+        return 0.0
+    }
+    xs.sum() / xs.len().as_f64()
+}

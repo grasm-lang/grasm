@@ -26,6 +26,32 @@ pub fn parse(src: &str) -> ParseOutput {
     }
 }
 
+/// Parse a whole file with all spans shifted by `offset` — modules live in
+/// one virtual span space so diagnostics stay a single flat list.
+pub fn parse_with_offset(src: &str, offset: u32) -> ParseOutput {
+    let mut tokens = lex(src);
+    for t in &mut tokens {
+        t.span = Span::new(t.span.start + offset, t.span.end + offset);
+    }
+    // Interpolation sub-parses re-lex from stored offsets; shift those too by
+    // patching StrPart offsets.
+    for t in &mut tokens {
+        if let TokenKind::Str(parts) = &mut t.kind {
+            for p in parts {
+                if let crate::token::StrPart::Interp { offset: o, .. } = p {
+                    *o += offset;
+                }
+            }
+        }
+    }
+    let mut p = Parser::new(tokens);
+    let module = p.parse_module();
+    ParseOutput {
+        module,
+        diagnostics: p.diags,
+    }
+}
+
 /// Parse a single expression (used by the REPL and interpolation).
 pub fn parse_expr_src(src: &str, offset: u32) -> (Option<Expr>, Vec<Diagnostic>) {
     let mut tokens = lex(src);
