@@ -188,3 +188,103 @@ fn unknown_target_is_reported_clearly() {
         .expect_err("bogus target must fail");
     assert!(e.contains("unsupported target"), "got: {e}");
 }
+
+// ---------------------------------------------------------------------------
+// Structured concurrency
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parallel_and_spawn_compile() {
+    compile(
+        "fn main() {\n    var log: [str] = []\n    parallel {\n        spawn {\n            log.push(\"a\")\n        }\n        spawn {\n            log.push(\"b\")\n        }\n    }\n    print(log.join(\" \"))\n}\n",
+    )
+    .expect("structured concurrency should compile");
+}
+
+#[test]
+fn a_spawn_site_inside_a_loop_compiles() {
+    // The site is lowered once but may fire many times, so the emitted code
+    // records indices rather than unrolling.
+    compile(
+        "fn main() {\n    var hits: [str] = []\n    var i = 0\n    parallel {\n        while i < 3 {\n            spawn {\n                hits.push(\"x\")\n            }\n            i = i + 1\n        }\n    }\n    print(\"{hits.len()}\")\n}\n",
+    )
+    .expect("a dynamic spawn count should compile");
+}
+
+#[test]
+fn nested_parallel_scopes_compile() {
+    compile(
+        "fn main() {\n    var log: [str] = []\n    parallel {\n        spawn {\n            log.push(\"outer\")\n            parallel {\n                spawn {\n                    log.push(\"inner\")\n                }\n            }\n        }\n    }\n    print(log.join(\" \"))\n}\n",
+    )
+    .expect("nested scopes should compile");
+}
+
+#[test]
+fn an_empty_parallel_scope_compiles() {
+    // No spawn sites means no dispatch loop to emit; the block still has to
+    // produce valid code.
+    compile("fn main() {\n    parallel {\n    }\n    print(\"done\")\n}\n")
+        .expect("an empty scope should compile");
+}
+
+#[test]
+fn a_return_inside_a_task_compiles() {
+    compile(
+        "fn pick() -> i64 {\n    parallel {\n        spawn {\n            return 7\n        }\n    }\n    0\n}\n\nfn main() {\n    print(\"{pick()}\")\n}\n",
+    )
+    .expect("a task body may return from its function");
+}
+
+// ---------------------------------------------------------------------------
+// Generic functions (monomorphized)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_generic_function_compiles_per_instantiation() {
+    compile(
+        "fn first[T](xs: [T]) -> Option[T] {\n    xs.get(0)\n}\n\nfn main() {\n    print(\"{first([1, 2]) ?? 0} {first([\"a\"]) ?? \"none\"}\")\n}\n",
+    )
+    .expect("two instantiations of one generic should compile");
+}
+
+#[test]
+fn a_generic_with_several_parameters_compiles() {
+    compile(
+        "fn pair[A, B](a: A, b: B) -> str {\n    \"{a}/{b}\"\n}\n\nfn main() {\n    print(pair(1, \"x\"))\n    print(pair(true, 2.5))\n}\n",
+    )
+    .expect("multiple type parameters should compile");
+}
+
+#[test]
+fn a_generic_calling_a_generic_compiles() {
+    // Instantiating `twice` discovers `wrap`, so the worklist has to keep
+    // draining rather than being walked once.
+    compile(
+        "fn wrap[T](x: T) -> [T] {\n    [x]\n}\n\nfn twice[T](x: T) -> [T] {\n    let a = wrap(x)\n    [a[0], a[0]]\n}\n\nfn main() {\n    print(\"{twice(4)}\")\n}\n",
+    )
+    .expect("a generic reached only through another generic should compile");
+}
+
+#[test]
+fn an_unused_generic_needs_no_instantiation() {
+    // A generic that is never called has no concrete types, so there is
+    // nothing to emit — and that must not be an error.
+    compile(
+        "fn unused[T](x: T) -> T {\n    x\n}\n\nfn main() {\n    print(\"fine\")\n}\n",
+    )
+    .expect("an uncalled generic should not need a symbol");
+}
+
+#[test]
+fn a_type_parameter_the_arguments_do_not_determine_is_reported() {
+    // `T` appears only in the return type, so there is nothing to infer from
+    // the call. Guessing would emit the wrong function.
+    let err = compile(
+        "fn make[T]() -> Option[T] {\n    None\n}\n\nfn main() {\n    print(\"{make().is_none()}\")\n}\n",
+    )
+    .expect_err("should be reported, not guessed");
+    assert!(
+        err.contains("not determined by the arguments"),
+        "expected a clear reason, got: {err}"
+    );
+}

@@ -716,3 +716,52 @@ fn bench_bodies_carry_effects_like_tests() {
         "unhandled effect",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Task capture
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_task_may_use_bindings_from_outside_the_parallel_block() {
+    check_ok(
+        "fn main() {\n    var log: [str] = []\n    let n = 7\n    parallel {\n        spawn {\n            log.push(\"{n}\")\n        }\n    }\n    print(log.join(\",\"))\n}\n",
+    );
+}
+
+#[test]
+fn a_task_cannot_use_a_binding_declared_inside_the_block() {
+    // Tasks run after the block finishes, so `shared` is gone. The
+    // interpreter used to panic at run time with "unknown name".
+    check_err(
+        "fn main() {\n    var log: [str] = []\n    parallel {\n        let shared = 1\n        spawn {\n            log.push(\"{shared}\")\n        }\n    }\n    print(log.join(\",\"))\n}\n",
+        "declared inside the `parallel` block",
+    );
+}
+
+#[test]
+fn a_task_cannot_use_a_loop_variable_from_the_block() {
+    check_err(
+        "fn main() {\n    var log: [str] = []\n    parallel {\n        for i in 0..3 {\n            spawn {\n                log.push(\"{i}\")\n            }\n        }\n    }\n    print(log.join(\",\"))\n}\n",
+        "declared inside the `parallel` block",
+    );
+}
+
+#[test]
+fn a_task_may_use_its_own_locals() {
+    check_ok(
+        "fn main() {\n    var log: [str] = []\n    parallel {\n        spawn {\n            let mine = 3\n            log.push(\"{mine}\")\n        }\n    }\n    print(log.join(\",\"))\n}\n",
+    );
+}
+
+#[test]
+fn the_capture_rule_does_not_leak_past_the_parallel_block() {
+    // A binding declared inside the block is still perfectly usable by the
+    // block's own statements — only tasks run too late to see it.
+    check_ok(
+        "fn main() {\n    parallel {\n        let shared = 1\n        print(\"{shared}\")\n    }\n}\n",
+    );
+    // And a later, unrelated block is unaffected.
+    check_ok(
+        "fn main() {\n    parallel {\n        spawn {\n            print(\"a\")\n        }\n    }\n    let after = 1\n    print(\"{after}\")\n}\n",
+    );
+}

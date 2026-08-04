@@ -130,6 +130,12 @@ the runtime at `main` and in tests.
 **[T-EFFECT-DISCHARGE]** `with E handled_by h { … }` discharges `E` inside the
 block. Any user effect still outstanding at `main` or in a test is an error.
 
+**[T-TASK-CAPTURE]** A `spawn` body may only use bindings that already existed
+when the enclosing `parallel` block began, plus the ones it declares itself.
+Tasks run *after* the block finishes, so a binding declared inside it — a loop
+variable included — no longer exists by then. This is a compile error rather
+than a runtime failure.
+
 ## 10. Modules
 
 **[T-MODULE-NS]** Functions are per-module; types and effects share one global

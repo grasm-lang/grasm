@@ -877,3 +877,70 @@ fn exit_stops_the_program_with_a_status() {
     assert_eq!(code, 3);
     assert_eq!(out, "before\n");
 }
+
+#[test]
+fn tasks_run_after_the_block_in_spawn_order() {
+    run_expect(
+        r#"fn main() {
+    var log: [str] = []
+    parallel {
+        log.push("body-a")
+        spawn {
+            log.push("task-1")
+        }
+        log.push("body-b")
+        spawn {
+            log.push("task-2")
+        }
+    }
+    print(log.join(" "))
+}
+"#,
+        "body-a body-b task-1 task-2\n",
+    );
+}
+
+#[test]
+fn a_spawn_site_in_a_loop_fires_once_per_iteration() {
+    run_expect(
+        r#"fn main() {
+    var hits: [str] = []
+    var i = 0
+    parallel {
+        while i < 3 {
+            spawn {
+                hits.push("x")
+            }
+            i = i + 1
+        }
+    }
+    print("{hits.len()}")
+}
+"#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_conditional_spawn_only_fires_when_taken() {
+    run_expect(
+        r#"fn main() {
+    var picked: [str] = []
+    parallel {
+        if 1 < 2 {
+            spawn {
+                picked.push("yes")
+            }
+        }
+        if 2 < 1 {
+            spawn {
+                picked.push("no")
+            }
+        }
+    }
+    print(picked.join(","))
+}
+"#,
+        "yes\n",
+    );
+}

@@ -192,7 +192,12 @@ Measured on this machine (user CPU time, release builds):
 `parallel { spawn { ... } spawn { ... } }` is a **structured concurrency**
 scope: every task spawned inside is joined before the scope exits, task bodies
 are typechecked, `break`/`continue` cannot cross a task boundary, and spawning
-is tracked as the `async` effect. Scopes nest.
+is tracked as the `async` effect. Scopes nest, and both engines compile it.
+
+A task body may only use bindings that existed before the `parallel` block
+began, plus its own locals. Tasks run *after* the block finishes, so anything
+the block declared — a loop variable included — is already gone; that is a
+compile error ([T-TASK-CAPTURE]) rather than a runtime failure.
 
 ```grasm
 var results: [i64] = []

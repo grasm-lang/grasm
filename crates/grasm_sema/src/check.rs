@@ -118,6 +118,12 @@ struct Checker {
     err_open: bool,
     /// Nesting depth of `parallel` scopes — `spawn` requires one.
     parallel_depth: u32,
+    /// Scope depth where the innermost enclosing `parallel` block began.
+    parallel_floor: Option<usize>,
+    /// While checking a task body: (parallel floor, depth where this task body
+    /// began). A name resolved between those two was declared *inside* the
+    /// parallel block, and is gone by the time the task runs.
+    task_capture: Option<(usize, usize)>,
     loop_depth: u32,
 }
 
@@ -145,6 +151,8 @@ impl Checker {
             fn_err: None,
             err_open: false,
             parallel_depth: 0,
+            parallel_floor: None,
+            task_capture: None,
             loop_depth: 0,
         }
     }
@@ -660,7 +668,12 @@ impl Checker {
             }
             Stmt::Parallel { body, .. } => {
                 self.parallel_depth += 1;
+                let saved_floor = self.parallel_floor;
+                // Bindings from here down live only for the collection pass;
+                // tasks run after this block's scope is gone.
+                self.parallel_floor = Some(self.scopes.len());
                 self.check_block(body);
+                self.parallel_floor = saved_floor;
                 self.parallel_depth -= 1;
                 Type::Unit
             }
@@ -675,8 +688,13 @@ impl Checker {
                 // A task body is checked in its own scope; `break`/`continue`
                 // cannot cross the task boundary.
                 let saved_loop = self.loop_depth;
+                let saved_capture = self.task_capture;
                 self.loop_depth = 0;
+                if let Some(floor) = self.parallel_floor {
+                    self.task_capture = Some((floor, self.scopes.len()));
+                }
                 self.check_block(body);
+                self.task_capture = saved_capture;
                 self.loop_depth = saved_loop;
                 Type::Unit
             }
@@ -799,6 +817,37 @@ impl Checker {
         self.fns
             .get(&format!("{}::{}", self.current_module, name))
             .cloned()
+    }
+
+    /// Rejects a task body's reference to a binding that will not exist when
+    /// the task runs.
+    ///
+    /// Tasks are collected during the `parallel` body and executed after it,
+    /// so anything the body declared — including a loop variable — is already
+    /// gone. The interpreter used to panic with "unknown name" at run time;
+    /// this makes it a compile error instead ([T-TASK-CAPTURE]).
+    fn reject_dead_capture(&mut self, id: &Ident) {
+        let Some((floor, task_base)) = self.task_capture else {
+            return;
+        };
+        let Some(at) = self
+            .scopes
+            .iter()
+            .rposition(|scope| scope.contains_key(&id.name))
+        else {
+            return;
+        };
+        if at >= floor && at < task_base {
+            self.error_help(
+                id.span,
+                format!(
+                    "task body uses `{}`, which is declared inside the `parallel` block",
+                    id.name
+                ),
+                "tasks run after the block finishes, so that binding is gone — \
+declare it before `parallel`",
+            );
+        }
     }
 
     fn lookup(&self, name: &str) -> Option<Binding> {
@@ -1006,6 +1055,7 @@ impl Checker {
 
     fn infer_ident(&mut self, id: &Ident) -> Type {
         if let Some(b) = self.lookup(&id.name) {
+            self.reject_dead_capture(id);
             if b.moved {
                 return self.error_help(
                     id.span,

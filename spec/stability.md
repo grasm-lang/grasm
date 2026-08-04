@@ -129,3 +129,4 @@ May change or be removed in any release. New surface starts here.
 - `G-BENCH-CONTEXTUAL` — experimental
 - `G-TEST-PARAMS` — experimental
 - `T-EFFECT-BUILTIN` — experimental
+- `T-TASK-CAPTURE` — experimental

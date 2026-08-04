@@ -1,0 +1,14 @@
+//! tag: T-TASK-CAPTURE
+//! expect: error
+//! declared inside the `parallel` block
+fn main() {
+    var log: [str] = []
+    parallel {
+        for i in 0..3 {
+            spawn {
+                log.push("{i}")
+            }
+        }
+    }
+    print(log.join(","))
+}

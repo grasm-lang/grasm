@@ -37,7 +37,7 @@ If a change alters what a program prints, exits with, or refuses to compile:
    repository and compares native output against the interpreter byte for byte.
 
 If the native backend cannot compile something yet, it must say so by name —
-`nope(span, "generic functions")` — so difftest reports it as unsupported rather
+`nope(span, "function values")` — so difftest reports it as unsupported rather
 than passing silently. A skipped program is never counted as a pass.
 
 ## Tests

@@ -60,9 +60,9 @@ exists to prevent.
 1.0 is not a date, it is a checklist:
 
 1. Every clause in `spec/` is `stable` or deliberately, documentedly not.
-2. The native backend compiles every program the interpreter runs — today it
-   cannot compile structured concurrency or generic functions, and
-   `scripts/difftest.sh` reports each gap by name rather than skipping quietly.
+2. The native backend compiles every program the interpreter runs — the one
+   remaining gap is function values (passing a function as data), and
+   `scripts/difftest.sh` reports it by name rather than skipping quietly.
 3. `parallel` runs on multiple cores. Today it is deterministic and
    single-threaded, which is stated in `[E-NOT-PARALLEL]` and is a
    specification of the current implementation, not a design goal.

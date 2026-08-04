@@ -29,6 +29,13 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   including a widened capability ceiling, which is reported separately from a
   content change.
 
+- **The native backend compiles structured concurrency and generic functions.**
+  `parallel`/`spawn` lower to a recorded list of spawn-site indices dispatched
+  after the block, so ordering and joining match the interpreter without
+  closures or environment capture. Generic functions are monomorphized per
+  instantiation, including across module boundaries. Native coverage goes from
+  103 programs to 112, with one gap left: function values.
+
 ### Fixed
 
 - `exit(n)` called `std::process::exit` from inside the interpreter, killing any
@@ -44,6 +51,10 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   character, and substituted a space for an empty fill.
 - The lockfile reader collapsed `[[package]]` into a single table, so
   verification compared one package and ignored the rest.
+- A task body could reference a binding declared inside its `parallel` block —
+  a loop variable, say. The checker accepted it and the interpreter panicked at
+  run time with "unknown name", because tasks run after the block's scope is
+  gone. It is now a compile error ([T-TASK-CAPTURE]).
 
 ### Changed
 

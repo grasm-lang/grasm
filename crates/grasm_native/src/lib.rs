@@ -57,6 +57,27 @@ enum VType {
 }
 
 impl VType {
+    /// A symbol-safe name, for monomorphized function symbols.
+    fn mangle(&self) -> String {
+        match self {
+            VType::I64 => "i64".into(),
+            VType::F64 => "f64".into(),
+            VType::Bool => "bool".into(),
+            VType::Unit => "unit".into(),
+            VType::Str => "str".into(),
+            VType::Any => "any".into(),
+            VType::List(e) => format!("l{}", e.mangle()),
+            VType::Option(e) => format!("o{}", e.mangle()),
+            VType::Fallible(e) => format!("f{}", e.mangle()),
+            VType::Struct(n) | VType::Sum(n) => format!("n{n}"),
+            VType::Map(k, v) => format!("m{}_{}", k.mangle(), v.mangle()),
+            VType::Tuple(ts) => format!(
+                "t{}",
+                ts.iter().map(VType::mangle).collect::<Vec<_>>().join("_")
+            ),
+        }
+    }
+
     fn cl(&self) -> types::Type {
         match self {
             VType::I64 => types::I64,
@@ -192,6 +213,24 @@ struct Codegen<'m> {
     current_module: String,
     /// module → (alias → target module)
     module_imports: HashMap<String, HashMap<String, String>>,
+    /// Generic functions, kept aside rather than declared. There is no such
+    /// thing as a generic machine-code symbol, so each *instantiation* becomes
+    /// its own concrete function.
+    generic_fns: HashMap<String, FnDecl>,
+    /// Instantiations discovered at call sites and not yet compiled.
+    pending_generics: Vec<PendingGeneric>,
+    /// Bindings for the generic parameters of the function being compiled.
+    /// Consulted by `vtype_of`, so a `T` in a signature resolves like any
+    /// other type name while that instantiation is being emitted.
+    generic_subst: HashMap<String, VType>,
+}
+
+/// One monomorphized copy of a generic function.
+struct PendingGeneric {
+    key: String,
+    module: String,
+    decl: FnDecl,
+    subst: HashMap<String, VType>,
 }
 
 struct PendingHandler {
@@ -217,6 +256,9 @@ impl<'m> Codegen<'m> {
             pending_handlers: Vec::new(),
             current_module: "main".to_string(),
             module_imports: HashMap::new(),
+            generic_fns: HashMap::new(),
+            pending_generics: Vec::new(),
+            generic_subst: HashMap::new(),
         }
     }
 
@@ -366,6 +408,11 @@ impl<'m> Codegen<'m> {
                 if path.segments.len() == 1 {
                     let n = path.segments[0].name.as_str();
                     if args.is_empty() {
+                        // A generic parameter of the instantiation being
+                        // emitted resolves to whatever it was bound to.
+                        if let Some(bound) = self.generic_subst.get(n) {
+                            return Ok(bound.clone());
+                        }
                         match n {
                             "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64"
                             | "usize" | "int" => return Ok(VType::I64),
@@ -440,6 +487,16 @@ impl<'m> Codegen<'m> {
                 }
             }
         }
+        // Instantiating a generic can discover another one, so drain until
+        // the worklist is empty rather than iterating it once.
+        while let Some(g) = self.pending_generics.pop() {
+            self.current_module = g.module.clone();
+            let saved = std::mem::replace(&mut self.generic_subst, g.subst);
+            let result = self.compile_fn_as(&g.decl, &g.key);
+            self.generic_subst = saved;
+            result?;
+        }
+
         let pending = std::mem::take(&mut self.pending_handlers);
         for h in pending {
             self.current_module = h.module.clone();
@@ -517,12 +574,143 @@ impl<'m> Codegen<'m> {
         Ok(())
     }
 
+    /// Binds a generic function's type parameters by matching its declared
+    /// parameter types against the concrete types of the arguments at a call
+    /// site.
+    ///
+    /// Only what the arguments determine can be inferred, which is exactly the
+    /// checker's rule too; a parameter that appears solely in the return type
+    /// leaves nothing to instantiate and is reported rather than guessed.
+    fn infer_generic_subst(
+        &self,
+        decl: &FnDecl,
+        arg_types: &[VType],
+        span: Span,
+    ) -> CResult<HashMap<String, VType>> {
+        let names: std::collections::HashSet<&str> =
+            decl.generics.iter().map(|g| g.name.as_str()).collect();
+        let mut subst = HashMap::new();
+        for (p, actual) in decl.params.iter().zip(arg_types) {
+            unify_generic(&p.ty, actual, &names, &mut subst);
+        }
+        for g in &decl.generics {
+            if !subst.contains_key(&g.name) {
+                return nope(
+                    span,
+                    format!(
+                        "calling `{}` — `{}` is not determined by the arguments",
+                        decl.name.name, g.name
+                    ),
+                );
+            }
+        }
+        Ok(subst)
+    }
+
+    /// Declares (once) the instantiation of `name` for `arg_types` and returns
+    /// its key in `self.fns`.
+    fn instantiate_generic(
+        &mut self,
+        module: &str,
+        name: &str,
+        arg_types: &[VType],
+        span: Span,
+    ) -> CResult<String> {
+        let generic_key = format!("{module}::{name}");
+        let Some(decl) = self.generic_fns.get(&generic_key).cloned() else {
+            return nope(span, format!("the function `{name}` here"));
+        };
+        if decl.params.len() != arg_types.len() {
+            return nope(span, format!("calling `{name}` with a different arity"));
+        }
+        let subst = self.infer_generic_subst(&decl, arg_types, span)?;
+
+        let suffix: Vec<String> = decl
+            .generics
+            .iter()
+            .map(|g| subst[&g.name].mangle())
+            .collect();
+        let key = format!("{generic_key}[{}]", suffix.join(","));
+        if self.fns.contains_key(&key) {
+            return Ok(key);
+        }
+
+        // Resolve the signature with the type parameters bound.
+        let saved = std::mem::replace(&mut self.generic_subst, subst.clone());
+        let signature = (|| -> CResult<(Vec<VType>, Vec<ParamMode>, VType)> {
+            let mut params = Vec::new();
+            let mut modes = Vec::new();
+            for p in &decl.params {
+                params.push(self.vtype_of(&p.ty)?);
+                modes.push(p.mode);
+            }
+            let mut ret = match &decl.ret {
+                Some(t) => self.vtype_of(t)?,
+                None => VType::Unit,
+            };
+            if decl.err.is_some() {
+                ret = VType::Fallible(Box::new(ret));
+            }
+            Ok((params, modes, ret))
+        })();
+        self.generic_subst = saved;
+        let (params, modes, ret) = signature?;
+
+        let ptr_ty = self.module.target_config().pointer_type();
+        let mut sig = self.module.make_signature();
+        for (p, m) in params.iter().zip(&modes) {
+            sig.params.push(AbiParam::new(if *m == ParamMode::Inout {
+                ptr_ty
+            } else {
+                p.cl()
+            }));
+        }
+        if ret != VType::Unit {
+            sig.returns.push(AbiParam::new(ret.cl()));
+        }
+        let sym = format!(
+            "g_{}_{}__{}",
+            module.replace('.', "_"),
+            name,
+            suffix.join("_")
+        );
+        let id = self
+            .module
+            .declare_function(&sym, Linkage::Local, &sig)
+            .map_err(|e| Unsupported {
+                span,
+                what: format!("(module error: {e})"),
+            })?;
+        self.fns.insert(
+            key.clone(),
+            FnSig {
+                params,
+                modes,
+                ret,
+                id,
+            },
+        );
+        self.pending_generics.push(PendingGeneric {
+            key: key.clone(),
+            module: module.to_string(),
+            decl,
+            subst,
+        });
+        Ok(key)
+    }
+
     fn declare_fns(&mut self, module_ast: &AstModule) -> CResult<()> {
         for decl in &module_ast.decls {
             match decl {
                 Decl::Fn(f) => {
                     if !f.generics.is_empty() {
-                        return nope(f.span, "generic functions");
+                        // No signature until a call site says what the type
+                        // parameters are.
+                        self.generic_fns.insert(
+                            format!("{}::{}", self.current_module, f.name.name),
+                            f.clone(),
+                        );
+                        continue;
                     }
                     let mut params = Vec::new();
                     let mut modes = Vec::new();
@@ -646,7 +834,17 @@ impl<'m> Codegen<'m> {
     }
 
     fn compile_fn(&mut self, f: &FnDecl) -> CResult<()> {
+        // Generic declarations have no signature of their own; their
+        // instantiations are compiled from the worklist.
+        if !f.generics.is_empty() {
+            return Ok(());
+        }
         let key = format!("{}::{}", self.current_module, f.name.name);
+        self.compile_fn_as(f, &key)
+    }
+
+    fn compile_fn_as(&mut self, f: &FnDecl, key: &str) -> CResult<()> {
+        let key = key.to_string();
         let sig_params = self.fns[&key].params.clone();
         let sig_modes = self.fns[&key].modes.clone();
         let sig_ret = self.fns[&key].ret.clone();
@@ -674,6 +872,7 @@ impl<'m> Codegen<'m> {
             ret: sig_ret.clone(),
             inout_slots: Vec::new(),
             filled: false,
+            task_scopes: Vec::new(),
         };
 
         let entry = fcx.b.create_block();
@@ -896,6 +1095,7 @@ impl<'m> Codegen<'m> {
             ret: h.ret.clone(),
             inout_slots: Vec::new(),
             filled: false,
+            task_scopes: Vec::new(),
         };
         let entry = fcx.b.create_block();
         fcx.b.append_block_params_for_function_params(entry);
@@ -968,6 +1168,116 @@ struct FnCx<'a, 'm> {
     /// `continue`, `return`, or `fail` was just emitted). Cleared whenever we
     /// switch to a fresh block.
     filled: bool,
+    /// One entry per enclosing `parallel` block: the runtime list that records
+    /// which spawn sites fired, and how many sites have been lowered so far.
+    ///
+    /// Tasks are collected during the block and run in spawn order after it,
+    /// so the list holds *site indices* rather than closures — the bodies are
+    /// lexically known, and [T-TASK-CAPTURE] guarantees they only touch
+    /// bindings that outlive the block.
+    task_scopes: Vec<(Variable, usize)>,
+}
+
+/// Every `spawn` body inside a `parallel` block, in source order.
+///
+/// The walk mirrors codegen exactly — each `spawn` *statement* is lowered
+/// once, however many times it runs — so the index assigned here is the index
+/// the emitted code records. A nested `parallel` owns its own sites, so the
+/// walk stops there.
+fn collect_spawn_sites(block: &grasm_syntax::ast::Block) -> Vec<&grasm_syntax::ast::Block> {
+    let mut out = Vec::new();
+    walk_spawns(block, &mut out);
+    out
+}
+
+fn walk_spawns<'b>(
+    block: &'b grasm_syntax::ast::Block,
+    out: &mut Vec<&'b grasm_syntax::ast::Block>,
+) {
+    for stmt in &block.stmts {
+        match stmt {
+            Stmt::Spawn { body, .. } => out.push(body),
+            Stmt::While { body, .. } | Stmt::For { body, .. } | Stmt::With { body, .. } => {
+                walk_spawns(body, out)
+            }
+            // A nested `parallel` collects and joins its own tasks.
+            Stmt::Parallel { .. } => {}
+            Stmt::Let { init, .. } => walk_spawns_expr(init, out),
+            Stmt::Assign { value, .. } => walk_spawns_expr(value, out),
+            Stmt::Return(Some(e), _) | Stmt::Expr(e) => walk_spawns_expr(e, out),
+            _ => {}
+        }
+    }
+}
+
+fn walk_spawns_expr<'b>(e: &'b Expr, out: &mut Vec<&'b grasm_syntax::ast::Block>) {
+    use grasm_syntax::ast::ElseBranch;
+    match e {
+        Expr::If {
+            then_block,
+            else_branch,
+            ..
+        } => {
+            walk_spawns(then_block, out);
+            match else_branch.as_deref() {
+                Some(ElseBranch::Else(b)) => walk_spawns(b, out),
+                Some(ElseBranch::ElseIf(inner)) => walk_spawns_expr(inner, out),
+                None => {}
+            }
+        }
+        Expr::Match { arms, .. } => {
+            for arm in arms {
+                walk_spawns_expr(&arm.body, out);
+            }
+        }
+        Expr::Block(b) => walk_spawns(b, out),
+        _ => {}
+    }
+}
+
+/// Matches a declared type against a concrete one, binding generic names.
+///
+/// Structural and best-effort: a mismatch simply binds nothing, and the caller
+/// reports any parameter left undetermined. The checker has already accepted
+/// the call, so this is inference, not validation.
+fn unify_generic(
+    declared: &TypeExpr,
+    actual: &VType,
+    names: &std::collections::HashSet<&str>,
+    subst: &mut HashMap<String, VType>,
+) {
+    match declared {
+        TypeExpr::Name { path, args, .. } if path.segments.len() == 1 => {
+            let n = path.segments[0].name.as_str();
+            if args.is_empty() && names.contains(n) {
+                subst.entry(n.to_string()).or_insert_with(|| actual.clone());
+                return;
+            }
+            match (n, actual) {
+                ("Option", VType::Option(inner)) if args.len() == 1 => {
+                    unify_generic(&args[0], inner, names, subst)
+                }
+                ("Map", VType::Map(k, v)) if args.len() == 2 => {
+                    unify_generic(&args[0], k, names, subst);
+                    unify_generic(&args[1], v, names, subst);
+                }
+                _ => {}
+            }
+        }
+        TypeExpr::List(inner, _) => {
+            if let VType::List(e) = actual {
+                unify_generic(inner, e, names, subst);
+            }
+        }
+        TypeExpr::Tuple(items, _) => {
+            if let VType::Tuple(ts) = actual {
+                for (d, a) in items.iter().zip(ts) {
+                    unify_generic(d, a, names, subst);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// One step of a place path (`p.field`, `xs[i]`).
@@ -1352,10 +1662,26 @@ impl FnCx<'_, '_> {
                 body,
                 span,
             } => self.eval_for(loop_var, iter, body, *span),
-            Stmt::Parallel { span, .. } | Stmt::Spawn { span, .. } => nope(
-                *span,
-                "structured concurrency (`parallel`/`spawn`) — the interpreter runs these",
-            ),
+            Stmt::Parallel { body, .. } => {
+                self.emit_parallel(body)?;
+                Ok(StmtOut::Value(None))
+            }
+            Stmt::Spawn { body: _, span } => {
+                // Records that this site fired. The body itself is lowered by
+                // the enclosing `parallel`, after the block finishes.
+                let Some((list_var, next_index)) = self.task_scopes.last_mut() else {
+                    // The checker rejects this; a backstop, not a path.
+                    return nope(*span, "`spawn` outside a `parallel` block");
+                };
+                let (list_var, index) = (*list_var, *next_index);
+                self.task_scopes.last_mut().expect("checked above").1 += 1;
+                let idx = self.b.ins().iconst(types::I64, index as i64);
+                let boxed = self.call_rt("grasm_box_i64", &[idx]).unwrap();
+                let cur = self.b.use_var(list_var);
+                let next = self.call_rt("grasm_list_push", &[cur, boxed]).unwrap();
+                self.b.def_var(list_var, next);
+                Ok(StmtOut::Value(None))
+            }
             Stmt::With {
                 effect,
                 body,
@@ -1917,7 +2243,23 @@ impl FnCx<'_, '_> {
                     .and_then(|m| m.get(&tid.name))
                     .cloned();
                 if let Some(target_mod) = target {
-                    let qual = format!("{target_mod}::{}", name.name);
+                    let mut qual = format!("{target_mod}::{}", name.name);
+                    // A generic in another module instantiates the same way,
+                    // just under that module's namespace.
+                    if !self.cg.fns.contains_key(&qual)
+                        && self.cg.generic_fns.contains_key(&qual)
+                    {
+                        let mut arg_types = Vec::with_capacity(args.len());
+                        for a in args {
+                            arg_types.push(self.probe_type(a)?);
+                        }
+                        qual = self.cg.instantiate_generic(
+                            &target_mod,
+                            &name.name,
+                            &arg_types,
+                            span,
+                        )?;
+                    }
                     if let Some(sig) = self.cg.fns.get(&qual) {
                         let (fid, params, modes, ret) = (
                             sig.id,
@@ -2876,7 +3218,28 @@ impl FnCx<'_, '_> {
             let v = self.make_variant("Option", "Some", &[boxed])?;
             return Ok(Some((v, VType::Option(Box::new(avt)))));
         }
-        let Some(sig) = self.lookup_fn(&id.name) else {
+        // A generic function has no symbol until a call site fixes its type
+        // parameters, so probe the arguments and instantiate on demand.
+        let sig_key = if self.lookup_fn(&id.name).is_none() {
+            let generic_key = format!("{}::{}", self.cg.current_module, id.name);
+            if self.cg.generic_fns.contains_key(&generic_key) {
+                let mut arg_types = Vec::with_capacity(args.len());
+                for a in args {
+                    arg_types.push(self.probe_type(a)?);
+                }
+                let module = self.cg.current_module.clone();
+                Some(self.cg.instantiate_generic(&module, &id.name, &arg_types, id.span)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let sig = match &sig_key {
+            Some(k) => self.cg.fns.get(k),
+            None => self.lookup_fn(&id.name),
+        };
+        let Some(sig) = sig else {
             return nope(id.span, format!("the function `{}` here", id.name));
         };
         let (fid, params, modes, ret) = (
@@ -3231,6 +3594,14 @@ impl FnCx<'_, '_> {
             Expr::Float(..) => VType::F64,
             Expr::Bool(..) => VType::Bool,
             Expr::Str(..) => VType::Str,
+            Expr::List(items, span) => VType::List(Box::new(self.list_elem_type(items, *span)?)),
+            Expr::Index { recv, span, .. } => match self.probe_type(recv)? {
+                VType::List(e) => *e,
+                VType::Map(_, v) => VType::Option(v),
+                VType::Str => VType::Str,
+                VType::Tuple(ts) => ts.first().cloned().unwrap_or(VType::Any),
+                _ => return nope(*span, "inferring this type"),
+            },
             Expr::Unary { op, expr, .. } => match op {
                 UnaryOp::Not => VType::Bool,
                 UnaryOp::Neg => self.probe_type(expr)?,
@@ -3283,6 +3654,20 @@ impl FnCx<'_, '_> {
                 if let Expr::Ident(id) = &**callee {
                     if let Some(sig) = self.lookup_fn(&id.name) {
                         return Ok(sig.ret.clone());
+                    }
+                    // A generic call's type is its instantiation's return type,
+                    // which means resolving the instantiation here too.
+                    let generic_key = format!("{}::{}", self.cg.current_module, id.name);
+                    if self.cg.generic_fns.contains_key(&generic_key) {
+                        let mut arg_types = Vec::with_capacity(args.len());
+                        for a in args {
+                            arg_types.push(self.probe_type(a)?);
+                        }
+                        let module = self.cg.current_module.clone();
+                        let key =
+                            self.cg
+                                .instantiate_generic(&module, &id.name, &arg_types, id.span)?;
+                        return Ok(self.cg.fns[&key].ret.clone());
                     }
                     if let Some((parent, _)) = self.cg.variant_index.get(&id.name).cloned() {
                         return Ok(self.sum_vtype(&parent));
@@ -3731,6 +4116,102 @@ impl FnCx<'_, '_> {
                 }
             }
         }
+    }
+
+    /// Lowers `parallel { … }`.
+    ///
+    /// The block runs first and only *records* which `spawn` sites fired, in
+    /// order; the task bodies run afterwards, which is what makes the order
+    /// deterministic ([E-SPAWN-ORDER]) and the scope joined ([E-PARALLEL-JOIN]).
+    /// Since the bodies are lexically known, the runtime list holds site
+    /// indices and the dispatch is a switch — no closures, no environment
+    /// capture, and no allocation per task beyond an interned index.
+    fn emit_parallel(&mut self, body: &grasm_syntax::ast::Block) -> CResult<()> {
+        let sites = collect_spawn_sites(body);
+
+        let list_var = self.new_var(&VType::List(Box::new(VType::I64)));
+        let empty = self.call_rt("grasm_list_new", &[]).unwrap();
+        self.b.def_var(list_var, empty);
+        self.task_scopes.push((list_var, 0));
+
+        let (_, collect_terminated) = self.eval_block_inner(body)?;
+        let assigned = self.task_scopes.pop().expect("pushed above").1;
+        debug_assert_eq!(assigned, sites.len(), "spawn sites must be visited once");
+
+        // A `return` inside the collection pass leaves the scope before any
+        // task could run, exactly as the interpreter does.
+        if collect_terminated || sites.is_empty() {
+            if !self.is_filled() {
+                let lv = self.b.use_var(list_var);
+                self.call_rt("grasm_val_dec", &[lv]);
+            }
+            return Ok(());
+        }
+
+        let header = self.b.create_block();
+        let dispatch = self.b.create_block();
+        let step = self.b.create_block();
+        let exit = self.b.create_block();
+        let ivar = self.new_var(&VType::I64);
+        let zero = self.b.ins().iconst(types::I64, 0);
+        self.b.def_var(ivar, zero);
+        self.b.ins().jump(header, &[]);
+        self.filled = true;
+
+        self.goto_block(header);
+        let lv = self.b.use_var(list_var);
+        let len = self.call_rt("grasm_list_len", &[lv]).unwrap();
+        let iv = self.b.use_var(ivar);
+        let more = self.b.ins().icmp(IntCC::SignedLessThan, iv, len);
+        self.b.ins().brif(more, dispatch, &[], exit, &[]);
+        self.filled = true;
+
+        self.goto_block(dispatch);
+        let lv2 = self.b.use_var(list_var);
+        let iv2 = self.b.use_var(ivar);
+        let boxed = self.call_rt("grasm_list_get", &[lv2, iv2]).unwrap();
+        let (site, _) = self.unbox(boxed, &VType::I64)?;
+
+        // One block per site, chained on equality. The count is the number of
+        // `spawn` statements in the source, so this stays small.
+        let task_blocks: Vec<Block> = sites.iter().map(|_| self.b.create_block()).collect();
+        for (k, target) in task_blocks.iter().enumerate() {
+            let want = self.b.ins().iconst(types::I64, k as i64);
+            let hit = self.b.ins().icmp(IntCC::Equal, site, want);
+            if k + 1 == task_blocks.len() {
+                // The last site is the only remaining possibility; a mismatch
+                // would mean the recorded index came from nowhere.
+                self.b.ins().brif(hit, *target, &[], step, &[]);
+            } else {
+                let next_test = self.b.create_block();
+                self.b.ins().brif(hit, *target, &[], next_test, &[]);
+                self.filled = true;
+                self.goto_block(next_test);
+            }
+        }
+        self.filled = true;
+
+        for (task_body, block) in sites.iter().zip(&task_blocks) {
+            self.goto_block(*block);
+            let (_, terminated) = self.eval_block_inner(task_body)?;
+            if !terminated && !self.is_filled() {
+                self.b.ins().jump(step, &[]);
+                self.filled = true;
+            }
+        }
+
+        self.goto_block(step);
+        let iv3 = self.b.use_var(ivar);
+        let one = self.b.ins().iconst(types::I64, 1);
+        let next = self.b.ins().iadd(iv3, one);
+        self.b.def_var(ivar, next);
+        self.b.ins().jump(header, &[]);
+        self.filled = true;
+
+        self.goto_block(exit);
+        let lv3 = self.b.use_var(list_var);
+        self.call_rt("grasm_val_dec", &[lv3]);
+        Ok(())
     }
 
     /// Inlines `list.any/all/find(|x| pred)` as a loop with early exit.
