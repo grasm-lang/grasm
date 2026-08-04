@@ -67,6 +67,8 @@ struct Checker {
     /// (ret, err) of the function being checked.
     fn_ret: Type,
     fn_err: Option<Type>,
+    /// True for main/tests: any error type may propagate (runtime reports).
+    err_open: bool,
     loop_depth: u32,
 }
 
@@ -90,6 +92,7 @@ impl Checker {
             scopes: Vec::new(),
             fn_ret: Type::Unit,
             fn_err: None,
+            err_open: false,
             loop_depth: 0,
         }
     }
@@ -378,6 +381,7 @@ impl Checker {
                 Decl::Test(t) => {
                     self.fn_ret = Type::Unit;
                     self.fn_err = Some(self.uni.fresh()); // tests may propagate any error
+                    self.err_open = true;
                     self.scopes.push(HashMap::new());
                     self.check_block(&t.body);
                     self.scopes.pop();
@@ -394,6 +398,7 @@ impl Checker {
         };
         // Generic params stay opaque (`Generic(i)`) while checking the body.
         self.fn_ret = info.ret.clone();
+        self.err_open = f.name.name == "main" && info.err.is_none();
         self.fn_err = if f.name.name == "main" && info.err.is_none() {
             Some(self.uni.fresh()) // main may propagate; runtime reports
         } else {
@@ -1775,6 +1780,9 @@ impl Checker {
 
     /// Is error type `e` acceptable where `declared` is the fn's error clause?
     fn err_fits(&mut self, e: &Type, declared: &Type) -> bool {
+        if self.err_open {
+            return true;
+        }
         let e = self.uni.resolve(e);
         let d = self.uni.resolve(declared);
         if let Type::Var(_) = d {

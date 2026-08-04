@@ -251,7 +251,10 @@ impl<'a> Lexer<'a> {
                     while depth > 0 {
                         if self.pos >= self.bytes.len() || self.peek() == b'\n' {
                             return self.tok(
-                                TokenKind::Error("unterminated interpolation in string".into()),
+                                TokenKind::Error(
+                                    "unterminated `{...}` interpolation in string — for a literal `{` write `\\{`"
+                                        .into(),
+                                ),
                                 start,
                             );
                         }

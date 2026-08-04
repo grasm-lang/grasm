@@ -1,0 +1,237 @@
+// Intermediate project 4: expression calculator — a language inside the language.
+// Validates: tokenizer + recursive-descent parser + evaluator, precedence, variables.
+
+type Tok =
+    | TNum(v: f64)
+    | TIdent(name: str)
+    | TOp(op: str)
+    | TLParen
+    | TRParen
+
+type CalcError =
+    | BadChar(c: str)
+    | UnexpectedEnd
+    | UnexpectedTok(desc: str)
+    | UnknownVar(name: str)
+    | DivByZero
+
+fn tokenize(src: str) -> [Tok] ! CalcError {
+    let chars = src.chars()
+    var toks: [Tok] = []
+    var i = 0
+    while i < chars.len() {
+        let c = chars[i]
+        if c == " " {
+            i += 1
+            continue
+        }
+        if c == "(" {
+            toks.push(TLParen)
+            i += 1
+            continue
+        }
+        if c == ")" {
+            toks.push(TRParen)
+            i += 1
+            continue
+        }
+        if c == "+" or c == "-" or c == "*" or c == "/" or c == "^" {
+            toks.push(TOp(c))
+            i += 1
+            continue
+        }
+        if (c >= "0" and c <= "9") or c == "." {
+            var text = ""
+            while i < chars.len() and ((chars[i] >= "0" and chars[i] <= "9") or chars[i] == ".") {
+                text += chars[i]
+                i += 1
+            }
+            match text.parse_float() {
+                Some(v) -> toks.push(TNum(v))
+                None -> fail(BadChar(text))
+            }
+            continue
+        }
+        if c >= "a" and c <= "z" {
+            var name = ""
+            while i < chars.len() and chars[i] >= "a" and chars[i] <= "z" {
+                name += chars[i]
+                i += 1
+            }
+            toks.push(TIdent(name))
+            continue
+        }
+        fail(BadChar(c))
+    }
+    toks
+}
+
+type Ctx = { toks: [Tok], pos: i64, var_names: [str], var_vals: [f64] }
+
+fn peek_tok(c: Ctx) -> Option[Tok] {
+    c.toks.get(c.pos)
+}
+
+// expr := term (('+' | '-') term)*
+fn parse_expr(inout c: Ctx) -> f64 ! CalcError {
+    var left = try parse_term(c)
+    while true {
+        match peek_tok(c) {
+            Some(TOp(op)) -> {
+                if op == "+" or op == "-" {
+                    c.pos += 1
+                    let right = try parse_term(c)
+                    if op == "+" {
+                        left += right
+                    } else {
+                        left -= right
+                    }
+                } else {
+                    break
+                }
+            }
+            _ -> break
+        }
+    }
+    left
+}
+
+// term := power (('*' | '/') power)*
+fn parse_term(inout c: Ctx) -> f64 ! CalcError {
+    var left = try parse_power(c)
+    while true {
+        match peek_tok(c) {
+            Some(TOp(op)) -> {
+                if op == "*" or op == "/" {
+                    c.pos += 1
+                    let right = try parse_power(c)
+                    if op == "*" {
+                        left *= right
+                    } else {
+                        if right == 0.0 {
+                            fail(DivByZero)
+                        }
+                        left /= right
+                    }
+                } else {
+                    break
+                }
+            }
+            _ -> break
+        }
+    }
+    left
+}
+
+// power := unary ('^' power)?   (right-assoc)
+fn parse_power(inout c: Ctx) -> f64 ! CalcError {
+    let base = try parse_unary(c)
+    match peek_tok(c) {
+        Some(TOp(op)) -> {
+            if op == "^" {
+                c.pos += 1
+                let exp = try parse_power(c)
+                base ^ exp
+            } else {
+                base
+            }
+        }
+        _ -> base
+    }
+}
+
+fn parse_unary(inout c: Ctx) -> f64 ! CalcError {
+    match peek_tok(c) {
+        Some(TOp(op)) -> {
+            if op == "-" {
+                c.pos += 1
+                let v = try parse_unary(c)
+                0.0 - v
+            } else {
+                fail(UnexpectedTok("operator {op}"))
+            }
+        }
+        _ -> try parse_atom(c)
+    }
+}
+
+fn parse_atom(inout c: Ctx) -> f64 ! CalcError {
+    match peek_tok(c) {
+        None -> fail(UnexpectedEnd)
+        Some(TNum(v)) -> {
+            c.pos += 1
+            v
+        }
+        Some(TIdent(name)) -> {
+            c.pos += 1
+            var i = 0
+            while i < c.var_names.len() {
+                if c.var_names[i] == name {
+                    return c.var_vals[i]
+                }
+                i += 1
+            }
+            fail(UnknownVar(name))
+        }
+        Some(TLParen) -> {
+            c.pos += 1
+            let v = try parse_expr(c)
+            match peek_tok(c) {
+                Some(TRParen) -> {
+                    c.pos += 1
+                    v
+                }
+                _ -> fail(UnexpectedTok("expected )"))
+            }
+        }
+        Some(TRParen) -> fail(UnexpectedTok("unexpected )"))
+        Some(TOp(op)) -> fail(UnexpectedTok("unexpected {op}"))
+    }
+}
+
+fn eval(src: str, var_names: [str], var_vals: [f64]) -> f64 ! CalcError {
+    let toks = try tokenize(src)
+    var c = Ctx{ toks: toks, pos: 0, var_names: var_names, var_vals: var_vals }
+    let v = try parse_expr(c)
+    if c.pos < c.toks.len() {
+        fail(UnexpectedTok("trailing input"))
+    }
+    v
+}
+
+fn main() {
+    let exprs = ["1 + 2 * 3", "(1 + 2) * 3", "2 ^ 10", "-4 + 10", "x * y + 1", "10 / 0", "1 + &"]
+    for e in exprs {
+        match eval(e, ["x", "y"], [3.0, 4.0]) {
+            Ok(v) -> print("{e} = {v}")
+            Err(err) -> print("{e} -> error: {err}")
+        }
+    }
+}
+
+test "precedence" {
+    assert_eq(try eval("1 + 2 * 3", [], []), 7.0)
+    assert_eq(try eval("(1 + 2) * 3", [], []), 9.0)
+    assert_eq(try eval("2 ^ 3 ^ 2", [], []), 512.0)
+    // Note: unary minus binds tighter than ^ in this calculator: (-2)^2.
+    assert_eq(try eval("-2 ^ 2", [], []), 4.0)
+}
+
+test "variables" {
+    assert_eq(try eval("x * x", ["x"], [5.0]), 25.0)
+    match eval("z + 1", [], []) {
+        Err(UnknownVar(n)) -> assert_eq(n, "z")
+        _ -> panic("should be unknown var")
+    }
+}
+
+test "errors" {
+    match eval("10 / 0", [], []) {
+        Err(DivByZero) -> assert(true)
+        _ -> panic("expected div by zero")
+    }
+    match eval("(1 + 2", [], []) {
+        Err(e) -> assert(true)
+        Ok(v) -> panic("expected error")
+    }
+}

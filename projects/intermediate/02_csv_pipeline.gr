@@ -1,0 +1,151 @@
+// Intermediate project 2: CSV data pipeline with typed records.
+// Validates: error handling per-row, aggregation, architecture (parse → validate → aggregate → report).
+
+type Sale = { region: str, product: str, units: i64, price: f64 }
+
+type RowError =
+    | WrongColumnCount(line: i64, got: i64)
+    | BadInt(line: i64, text: str)
+    | BadFloat(line: i64, text: str)
+
+fn parse_row(line_no: i64, line: str) -> Sale ! RowError {
+    let cols = line.split(",").map(|c| c.trim())
+    if cols.len() != 4 {
+        fail(WrongColumnCount(line_no, cols.len()))
+    }
+    let units = match (cols.get(2) ?? "").parse_int() {
+        Some(v) -> v
+        None -> fail(BadInt(line_no, cols.get(2) ?? ""))
+    }
+    let price = match (cols.get(3) ?? "").parse_float() {
+        Some(v) -> v
+        None -> fail(BadFloat(line_no, cols.get(3) ?? ""))
+    }
+    Sale{
+        region: cols.get(0) ?? ""
+        product: cols.get(1) ?? ""
+        units: units
+        price: price
+    }
+}
+
+type ParseResult = { sales: [Sale], errors: [str] }
+
+fn parse_csv(text: str) -> ParseResult {
+    var sales: [Sale] = []
+    var errors: [str] = []
+    var line_no = 0
+    for line in text.split("\n") {
+        line_no += 1
+        if line.trim() == "" or line.starts_with("#") {
+            continue
+        }
+        match parse_row(line_no, line) {
+            Ok(s) -> sales.push(s)
+            Err(e) -> errors.push("line {line_no}: {e}")
+        }
+    }
+    ParseResult{ sales: sales, errors: errors }
+}
+
+fn revenue(s: Sale) -> f64 {
+    s.units.as_f64() * s.price
+}
+
+fn total_revenue(sales: [Sale]) -> f64 {
+    sales.map(|s| revenue(s)).sum()
+}
+
+fn revenue_by_region(sales: [Sale]) -> [str] {
+    var regions: [str] = []
+    var totals: [f64] = []
+    for s in sales {
+        var i = 0
+        var found = false
+        while i < regions.len() {
+            if regions[i] == s.region {
+                totals[i] += revenue(s)
+                found = true
+                break
+            }
+            i += 1
+        }
+        if not found {
+            regions.push(s.region)
+            totals.push(revenue(s))
+        }
+    }
+    var out: [str] = []
+    var k = 0
+    while k < regions.len() {
+        out.push("{regions[k]}: {totals[k]}")
+        k += 1
+    }
+    out
+}
+
+fn best_seller(sales: [Sale]) -> Option[Sale] {
+    var best: Option[Sale] = None
+    for s in sales {
+        best = match best {
+            None -> Some(s)
+            Some(b) -> {
+                if revenue(s) > revenue(b) {
+                    Some(s)
+                } else {
+                    Some(b)
+                }
+            }
+        }
+    }
+    best
+}
+
+fn sample_data() -> str {
+    "# region, product, units, price\nnorth, widget, 10, 2.5\nsouth, gadget, 5, 10.0\nnorth, gadget, 3, 10.0\neast, widget, twenty, 2.5\nwest, doohickey, 7"
+}
+
+fn main() {
+    let result = parse_csv(sample_data())
+    print("parsed {result.sales.len()} rows, {result.errors.len()} errors")
+    for e in result.errors {
+        print("  skipped {e}")
+    }
+    print("total revenue: {total_revenue(result.sales)}")
+    for line in revenue_by_region(result.sales) {
+        print("  {line}")
+    }
+    match best_seller(result.sales) {
+        Some(s) -> print("best: {s.product} in {s.region} ({revenue(s)})")
+        None -> print("no sales")
+    }
+}
+
+test "good rows parse" {
+    let s = try parse_row(1, "north, widget, 10, 2.5")
+    assert_eq(s.region, "north")
+    assert_eq(s.units, 10)
+    assert_eq(revenue(s), 25.0)
+}
+
+test "bad rows produce typed errors" {
+    match parse_row(3, "a, b, xx, 1.0") {
+        Ok(s) -> panic("should fail")
+        Err(BadInt(line, text)) -> {
+            assert_eq(line, 3)
+            assert_eq(text, "xx")
+        }
+        Err(e) -> panic("wrong error")
+    }
+    match parse_row(4, "a, b") {
+        Err(WrongColumnCount(line, got)) -> assert_eq(got, 2)
+        _ -> panic("wrong result")
+    }
+}
+
+test "pipeline aggregates and skips bad rows" {
+    let r = parse_csv(sample_data())
+    assert_eq(r.sales.len(), 3)
+    assert_eq(r.errors.len(), 2)
+    assert_eq(total_revenue(r.sales), 105.0)
+}

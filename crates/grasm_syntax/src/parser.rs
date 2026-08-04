@@ -1337,7 +1337,19 @@ impl Parser {
             };
             self.expect(&TokenKind::Arrow)?;
             self.skip_newlines();
-            let body = self.parse_expr()?;
+            // Control-flow statements are allowed directly as arm bodies:
+            // `_ -> break` desugars to `_ -> { break }`.
+            let body = match self.cur() {
+                TokenKind::KwBreak | TokenKind::KwContinue | TokenKind::KwReturn => {
+                    let stmt = self.parse_stmt()?;
+                    let span = crate::parser::stmt_span_of(&stmt);
+                    Expr::Block(Block {
+                        stmts: vec![stmt],
+                        span,
+                    })
+                }
+                _ => self.parse_expr()?,
+            };
             let span = pat.span().merge(body.span());
             arms.push(Arm {
                 pattern: pat,
@@ -1481,6 +1493,20 @@ impl Parser {
                 Err(())
             }
         }
+    }
+}
+
+pub(crate) fn stmt_span_of(s: &Stmt) -> Span {
+    match s {
+        Stmt::Let { span, .. }
+        | Stmt::Assign { span, .. }
+        | Stmt::Return(_, span)
+        | Stmt::Break(span)
+        | Stmt::Continue(span)
+        | Stmt::While { span, .. }
+        | Stmt::For { span, .. }
+        | Stmt::With { span, .. } => *span,
+        Stmt::Expr(e) => e.span(),
     }
 }
 

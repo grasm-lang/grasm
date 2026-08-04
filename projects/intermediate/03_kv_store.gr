@@ -1,0 +1,128 @@
+// Intermediate project 3: key-value store with file persistence.
+// Validates: fs effects, serialization, fallible I/O chains, CRUD architecture.
+
+type Store = { keys: [str], vals: [str], path: str }
+
+type StoreError =
+    | BadLine(text: str)
+
+fn open_store(path: str) -> Store ! (IoError | StoreError) {
+    if not file_exists(path) {
+        return Store{ keys: [], vals: [], path: path }
+    }
+    let content = try read_file(path)
+    var keys: [str] = []
+    var vals: [str] = []
+    for line in content.split("\n") {
+        if line.trim() == "" {
+            continue
+        }
+        match line.index_of("=") {
+            Some(i) -> {
+                keys.push(line.substr(0, i))
+                vals.push(line.substr(i + 1, line.len() - i - 1))
+            }
+            None -> fail(BadLine(line))
+        }
+    }
+    Store{ keys: keys, vals: vals, path: path }
+}
+
+fn save(store: Store) ! IoError {
+    var lines: [str] = []
+    var i = 0
+    while i < store.keys.len() {
+        lines.push("{store.keys[i]}={store.vals[i]}")
+        i += 1
+    }
+    try write_file(store.path, lines.join("\n"))
+}
+
+fn set(inout store: Store, key: str, value: str) {
+    var i = 0
+    while i < store.keys.len() {
+        if store.keys[i] == key {
+            store.vals[i] = value
+            return
+        }
+        i += 1
+    }
+    store.keys.push(key)
+    store.vals.push(value)
+}
+
+fn get(store: Store, key: str) -> Option[str] {
+    var i = 0
+    while i < store.keys.len() {
+        if store.keys[i] == key {
+            return store.vals.get(i)
+        }
+        i += 1
+    }
+    None
+}
+
+fn delete(inout store: Store, key: str) -> bool {
+    var i = 0
+    while i < store.keys.len() {
+        if store.keys[i] == key {
+            // No remove-at builtin: rebuild without index i.
+            var new_keys: [str] = []
+            var new_vals: [str] = []
+            var k = 0
+            while k < store.keys.len() {
+                if k != i {
+                    new_keys.push(store.keys[k])
+                    new_vals.push(store.vals[k])
+                }
+                k += 1
+            }
+            store.keys = new_keys
+            store.vals = new_vals
+            return true
+        }
+        i += 1
+    }
+    false
+}
+
+fn main() ! (IoError | StoreError) {
+    let path = (args().get(0)) ?? "/tmp/grasm_kv_demo.db"
+    var store = try open_store(path)
+    store.set("language", "grasm")
+    store.set("phase", "validation")
+    store.set("language", "grasm-core")
+    try save(store)
+
+    var reloaded = try open_store(path)
+    print("language = {reloaded.get("language") ?? "?"}")
+    print("phase = {reloaded.get("phase") ?? "?"}")
+    print("missing = {reloaded.get("nope") ?? "(default)"}")
+    reloaded.delete("phase")
+    try save(reloaded)
+    let final_store = try open_store(path)
+    print("after delete: {final_store.keys.len()} keys")
+}
+
+test "set get delete in memory" {
+    var s = Store{ keys: [], vals: [], path: "" }
+    s.set("a", "1")
+    s.set("b", "2")
+    s.set("a", "updated")
+    assert_eq(s.get("a") ?? "", "updated")
+    assert_eq(s.keys.len(), 2)
+    assert(s.delete("a"))
+    assert(not s.delete("zzz"))
+    assert(s.get("a").is_none())
+}
+
+test "persistence round trip" {
+    let path = "/tmp/grasm_kv_test.db"
+    var s = Store{ keys: [], vals: [], path: path }
+    s.set("k1", "v1")
+    s.set("k2", "v = 2")
+    try save(s)
+    let loaded = try open_store(path)
+    assert_eq(loaded.get("k1") ?? "", "v1")
+    assert_eq(loaded.get("k2") ?? "", "v = 2")
+}

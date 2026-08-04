@@ -1,0 +1,271 @@
+// Intermediate project 1: JSON parser + serializer library.
+// Validates: recursive sum types, inout state threading, fallible recursion.
+
+type Json =
+    | JNull
+    | JBool(b: bool)
+    | JNum(n: f64)
+    | JStr(s: str)
+    | JArr(items: [Json])
+    | JObj(keys: [str], vals: [Json])
+
+type JsonError =
+    | Unexpected(at: i64, found: str)
+    | Eof
+
+type P = { chars: [str], pos: i64 }
+
+fn peek(p: P) -> str {
+    p.chars.get(p.pos) ?? ""
+}
+
+fn advance(inout p: P) {
+    p.pos += 1
+}
+
+fn skip_ws(inout p: P) {
+    while peek(p) == " " or peek(p) == "\n" or peek(p) == "\t" or peek(p) == "\r" {
+        p.pos += 1
+    }
+}
+
+fn expect_char(inout p: P, c: str) ! JsonError {
+    if peek(p) != c {
+        fail(Unexpected(p.pos, peek(p)))
+    }
+    p.pos += 1
+}
+
+fn parse(text: str) -> Json ! JsonError {
+    var p = P{ chars: text.chars(), pos: 0 }
+    let v = try parse_value(p)
+    skip_ws(p)
+    if p.pos < p.chars.len() {
+        fail(Unexpected(p.pos, peek(p)))
+    }
+    v
+}
+
+fn parse_value(inout p: P) -> Json ! JsonError {
+    skip_ws(p)
+    let c = peek(p)
+    if c == "" {
+        fail(Eof)
+    }
+    if c == "n" {
+        try parse_keyword(p, "null")
+        return JNull
+    }
+    if c == "t" {
+        try parse_keyword(p, "true")
+        return JBool(true)
+    }
+    if c == "f" {
+        try parse_keyword(p, "false")
+        return JBool(false)
+    }
+    if c == "\"" {
+        let s = try parse_string(p)
+        return JStr(s)
+    }
+    if c == "[" {
+        return try parse_array(p)
+    }
+    if c == "\{" {
+        return try parse_object(p)
+    }
+    try parse_number(p)
+}
+
+fn parse_keyword(inout p: P, word: str) ! JsonError {
+    for ch in word.chars() {
+        try expect_char(p, ch)
+    }
+}
+
+fn parse_string(inout p: P) -> str ! JsonError {
+    try expect_char(p, "\"")
+    var out = ""
+    while true {
+        let c = peek(p)
+        if c == "" {
+            fail(Eof)
+        }
+        if c == "\"" {
+            p.pos += 1
+            break
+        }
+        if c == "\\" {
+            p.pos += 1
+            let esc = peek(p)
+            if esc == "n" {
+                out += "\n"
+            } else if esc == "t" {
+                out += "\t"
+            } else {
+                out += esc
+            }
+            p.pos += 1
+        } else {
+            out += c
+            p.pos += 1
+        }
+    }
+    out
+}
+
+fn parse_number(inout p: P) -> Json ! JsonError {
+    var text = ""
+    var c = peek(p)
+    if c == "-" {
+        text += c
+        p.pos += 1
+        c = peek(p)
+    }
+    while c != "" and (c == "." or (c >= "0" and c <= "9")) {
+        text += c
+        p.pos += 1
+        c = peek(p)
+    }
+    match text.parse_float() {
+        Some(n) -> JNum(n)
+        None -> fail(Unexpected(p.pos, c))
+    }
+}
+
+fn parse_array(inout p: P) -> Json ! JsonError {
+    try expect_char(p, "[")
+    var items: [Json] = []
+    skip_ws(p)
+    if peek(p) == "]" {
+        p.pos += 1
+        return JArr(items)
+    }
+    while true {
+        let v = try parse_value(p)
+        items.push(v)
+        skip_ws(p)
+        if peek(p) == "," {
+            p.pos += 1
+        } else {
+            try expect_char(p, "]")
+            break
+        }
+    }
+    JArr(items)
+}
+
+fn parse_object(inout p: P) -> Json ! JsonError {
+    try expect_char(p, "\{")
+    var keys: [str] = []
+    var vals: [Json] = []
+    skip_ws(p)
+    if peek(p) == "}" {
+        p.pos += 1
+        return JObj(keys, vals)
+    }
+    while true {
+        skip_ws(p)
+        let k = try parse_string(p)
+        skip_ws(p)
+        try expect_char(p, ":")
+        let v = try parse_value(p)
+        keys.push(k)
+        vals.push(v)
+        skip_ws(p)
+        if peek(p) == "," {
+            p.pos += 1
+        } else {
+            try expect_char(p, "}")
+            break
+        }
+    }
+    JObj(keys, vals)
+}
+
+fn to_text(j: Json) -> str {
+    match j {
+        JNull -> "null"
+        JBool(b) -> "{b}"
+        JNum(n) -> "{n}"
+        JStr(s) -> "\"{s}\""
+        JArr(items) -> "[" + items.map(|i| to_text(i)).join(",") + "]"
+        JObj(keys, vals) -> {
+            var parts: [str] = []
+            var i = 0
+            while i < keys.len() {
+                parts.push("\"{keys[i]}\":" + to_text(vals[i]))
+                i += 1
+            }
+            "\{" + parts.join(",") + "}"
+        }
+    }
+}
+
+fn get_field(j: Json, key: str) -> Option[Json] {
+    match j {
+        JObj(keys, vals) -> {
+            var i = 0
+            while i < keys.len() {
+                if keys[i] == key {
+                    return vals.get(i)
+                }
+                i += 1
+            }
+            None
+        }
+        _ -> None
+    }
+}
+
+fn main() {
+    let src = "\{\"name\": \"grasm\", \"version\": 0.1, \"tags\": [\"fast\", \"safe\"], \"stable\": false}"
+    match parse(src) {
+        Ok(doc) -> {
+            print(to_text(doc))
+            match get_field(doc, "name") {
+                Some(JStr(s)) -> print("name = {s}")
+                _ -> print("no name")
+            }
+        }
+        Err(e) -> print("parse error: {e}")
+    }
+}
+
+test "round trip" {
+    let doc = try parse("[1, 2.5, true, null, \"hi\"]")
+    assert_eq(to_text(doc), "[1.0,2.5,true,null,\"hi\"]")
+}
+
+test "nested objects" {
+    let doc = try parse("\{\"a\": \{\"b\": [1, 2]}}")
+    match get_field(doc, "a") {
+        Some(inner) -> {
+            match get_field(inner, "b") {
+                Some(JArr(items)) -> assert_eq(items.len(), 2)
+                _ -> panic("b missing")
+            }
+        }
+        None -> panic("a missing")
+    }
+}
+
+test "errors are reported" {
+    match parse("[1, 2") {
+        Ok(v) -> panic("should fail")
+        Err(e) -> assert(true)
+    }
+    match parse("\{\"k\" 1}") {
+        Ok(v) -> panic("should fail")
+        Err(Unexpected(at, found)) -> assert(at > 0)
+        Err(e) -> panic("wrong error kind")
+    }
+}
+
+test "string escapes" {
+    let doc = try parse("\"line\\none\"")
+    match doc {
+        JStr(s) -> assert(s.contains("\n"))
+        _ -> panic("not a string")
+    }
+}
