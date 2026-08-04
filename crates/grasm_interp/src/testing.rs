@@ -660,6 +660,11 @@ fn expr_lines(
 }
 
 pub(crate) fn stmt_start(s: &grasm_syntax::ast::Stmt) -> u32 {
+    stmt_span(s).start
+}
+
+/// The span of a whole statement.
+pub(crate) fn stmt_span(s: &grasm_syntax::ast::Stmt) -> grasm_syntax::span::Span {
     use grasm_syntax::ast::Stmt;
     match s {
         Stmt::Let { span, .. }
@@ -671,8 +676,8 @@ pub(crate) fn stmt_start(s: &grasm_syntax::ast::Stmt) -> u32 {
         | Stmt::For { span, .. }
         | Stmt::Parallel { span, .. }
         | Stmt::Spawn { span, .. }
-        | Stmt::With { span, .. } => span.start,
-        Stmt::Expr(e) => e.span().start,
+        | Stmt::With { span, .. } => *span,
+        Stmt::Expr(e) => e.span(),
     }
 }
 

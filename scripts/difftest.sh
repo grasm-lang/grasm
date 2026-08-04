@@ -47,18 +47,30 @@ for src in $programs; do
         continue
     fi
 
-    interp_out=$("$GRASM" run "$src" 2>&1)
+    # stdout and the exit code are what a program *produces*, and they must
+    # match exactly. stderr carries diagnostics, and the interpreter's panic
+    # stack trace has no native counterpart yet (see README, "Native gaps"),
+    # so that block is stripped before stderr is compared.
+    interp_err=$(mktemp)
+    native_err=$(mktemp)
+    interp_out=$("$GRASM" run "$src" 2>"$interp_err")
     interp_code=$?
-    native_out=$("$bin" 2>&1)
+    native_out=$("$bin" 2>"$native_err")
     native_code=$?
+    interp_diag=$(grep -v -e '^stack trace (innermost first):$' -e '^  [A-Za-z_][A-Za-z0-9_:]* at ' "$interp_err")
+    native_diag=$(cat "$native_err")
+    rm -f "$interp_err" "$native_err"
 
-    if [ "$interp_out" == "$native_out" ] && [ "$interp_code" == "$native_code" ]; then
+    if [ "$interp_out" == "$native_out" ] \
+        && [ "$interp_code" == "$native_code" ] \
+        && [ "$interp_diag" == "$native_diag" ]; then
         pass=$((pass + 1))
     else
         fail=$((fail + 1))
         FAILED+=("$src")
         echo "MISMATCH: $src (exit $interp_code vs $native_code)"
         diff <(echo "$interp_out") <(echo "$native_out") | head -12
+        diff <(echo "$interp_diag") <(echo "$native_diag") | head -6
     fi
 done
 

@@ -37,7 +37,10 @@ fn main() -> ExitCode {
                 Err(code) => return code,
             };
             let mut stdout = std::io::stdout();
-            let code = grasm_interp::run_program(&program, &prog_args, &mut stdout);
+            let (code, trace) =
+                grasm_interp::run_program_traced(&program, &prog_args, &mut stdout);
+            let _ = stdout.flush();
+            print_trace(&program, &trace);
             ExitCode::from(code.clamp(0, 255) as u8)
         }
         Some("test") => {
@@ -283,6 +286,28 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Some("dap") => {
+            let stdin = std::io::stdin();
+            let input = std::io::BufReader::new(stdin);
+            let output = std::io::stdout();
+            let result = grasm_dap::serve(input, output, |path| {
+                let program = grasm_sema::loader::load_from_disk(std::path::Path::new(path))
+                    .map_err(|e| format!("cannot load `{path}`: {e}"))?;
+                let mut diags = program.diagnostics.clone();
+                diags.extend(grasm_sema::check::check_program(&program).diagnostics);
+                if let Some(first) = diags.first() {
+                    return Err(format!("`{path}` has errors: {}", first.message));
+                }
+                Ok(program)
+            });
+            match result {
+                Ok(_) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("dap error: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Some("tokens") => {
             let Some(path) = args.get(1) else {
                 eprintln!("usage: grasm tokens <file.gr>");
@@ -336,6 +361,7 @@ fn main() -> ExitCode {
             eprintln!("  doc <file.gr> [-o out.md]    API documentation from `///` comments");
             eprintln!("  fmt <file.gr> [--check]      canonical formatting");
             eprintln!("  lsp                          language server (stdio)");
+            eprintln!("  dap                          debug adapter (stdio) — breakpoints, stepping");
             eprintln!("  deps [dir]                   resolve dependencies, check capabilities, write grasm.lock");
             eprintln!("  tokens <file.gr>             dump lexer output (debug)");
             eprintln!("  version                      print version");
@@ -535,9 +561,31 @@ fn run_bundle(bundle: &Bundle, program_args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
     let mut stdout = std::io::stdout();
-    let code = grasm_interp::run_program(&program, program_args, &mut stdout);
+    let (code, trace) = grasm_interp::run_program_traced(&program, program_args, &mut stdout);
     let _ = stdout.flush();
+    print_trace(&program, &trace);
     ExitCode::from(code.clamp(0, 255) as u8)
+}
+
+/// Prints a panic's call stack, innermost frame first.
+///
+/// Goes to stderr so a panicking program's stdout stays exactly what the
+/// program produced — differential testing compares that byte for byte.
+fn print_trace(program: &Program, trace: &[grasm_interp::Frame]) {
+    if trace.is_empty() {
+        return;
+    }
+    eprintln!("stack trace (innermost first):");
+    for frame in trace {
+        let i = program.file_of(frame.at);
+        let file = &program.files[i];
+        let index = grasm_syntax::span::LineIndex::new(&file.src);
+        let lc = index.line_col(frame.at.start.saturating_sub(file.base));
+        eprintln!(
+            "  {} at {}:{}:{}",
+            frame.function, file.path, lc.line, lc.col
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

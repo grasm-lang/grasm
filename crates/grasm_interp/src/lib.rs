@@ -4,7 +4,7 @@ pub mod interp;
 pub mod testing;
 pub mod value;
 
-pub use interp::{Flow, Interp};
+pub use interp::{DebugHook, Flow, Frame, Interp};
 pub use value::Value;
 
 use grasm_syntax::ast::Module;
@@ -37,6 +37,24 @@ pub fn run_src_with_args(
 pub fn run_module(module: &Module, out: &mut impl Write) -> i32 {
     let mut interp = Interp::new(module, out);
     interp.run_main()
+}
+
+/// Run a loaded program, also returning the call stack if it panicked.
+pub fn run_program_traced(
+    program: &grasm_sema::loader::Program,
+    program_args: &[String],
+    out: &mut impl Write,
+) -> (i32, Vec<Frame>) {
+    let files: Vec<(String, &Module, std::collections::HashMap<String, String>)> = program
+        .files
+        .iter()
+        .map(|f| (f.name.clone(), &f.module, f.imports.clone()))
+        .collect();
+    let mut interp = Interp::new_program(&files, out);
+    interp.program_args = program_args.to_vec();
+    let code = interp.run_main();
+    let trace = interp.panic_trace().unwrap_or_default().to_vec();
+    (code, trace)
 }
 
 /// Run a loaded multi-file program. Assumes it already checked clean.

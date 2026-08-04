@@ -1,0 +1,10 @@
+[package]
+name = "grasm_dap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+grasm_syntax = { path = "../grasm_syntax" }
+grasm_sema = { path = "../grasm_sema" }
+grasm_interp = { path = "../grasm_interp" }

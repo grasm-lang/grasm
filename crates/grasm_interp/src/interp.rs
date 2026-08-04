@@ -26,6 +26,25 @@ pub enum Flow {
 
 type EResult = Result<Value, Flow>;
 
+/// Called before every statement, so a debugger can stop, inspect, and step.
+///
+/// The interpreter hands itself back to the hook, which is why the hook is
+/// taken out of the interpreter for the duration of the call: a debugger needs
+/// to read the very state it is suspending.
+pub trait DebugHook<W: Write> {
+    fn before_stmt(&mut self, interp: &mut Interp<'_, W>, at: grasm_syntax::span::Span);
+}
+
+/// One entry of a call stack, captured when a panic first escapes.
+#[derive(Debug, Clone)]
+pub struct Frame {
+    /// Qualified `module::function`.
+    pub function: String,
+    /// Where execution was inside this frame — the statement being run for the
+    /// innermost frame, the call site for every frame above it.
+    pub at: grasm_syntax::span::Span,
+}
+
 pub struct Interp<'a, W: Write> {
     /// qualified `mod::fn` → decl
     fns: HashMap<String, &'a FnDecl>,
@@ -47,6 +66,16 @@ pub struct Interp<'a, W: Write> {
     pub out: &'a mut W,
     /// Recursion guard.
     depth: u32,
+    /// Active calls, innermost last: (qualified name, call site).
+    call_stack: Vec<(String, grasm_syntax::span::Span)>,
+    /// Where the statement currently executing begins.
+    cur_span: grasm_syntax::span::Span,
+    /// Frames captured the first time a panic escaped a statement. Later
+    /// panics do not overwrite it: the first one is the one that explains
+    /// what went wrong.
+    panic_trace: Option<Vec<Frame>>,
+    /// Debugger, if one is attached.
+    debug: Option<Box<dyn DebugHook<W>>>,
     /// `inout` copy-out values from the last `call_decl` (param index → value).
     pending_writebacks: Vec<(usize, Value)>,
     /// Program arguments exposed via the `args()` builtin.
@@ -154,6 +183,10 @@ impl<'a, W: Write> Interp<'a, W> {
             handlers: Vec::new(),
             out,
             depth: 0,
+            call_stack: Vec::new(),
+            cur_span: grasm_syntax::span::Span::new(0, 0),
+            panic_trace: None,
+            debug: None,
             pending_writebacks: Vec::new(),
             program_args: Vec::new(),
             task_scopes: Vec::new(),
@@ -170,7 +203,7 @@ impl<'a, W: Write> Interp<'a, W> {
             let _ = writeln!(self.out, "error: no `main` function");
             return 1;
         };
-        match self.call_decl(main, "main", vec![]) {
+        match self.call_decl_at(main, "main", vec![], main.span) {
             // A fallible `main` returns Err as a *value*; report it rather
             // than exiting 0 as if nothing happened.
             Ok(Value::Err(e)) => {
@@ -189,6 +222,36 @@ impl<'a, W: Write> Interp<'a, W> {
             Err(Flow::Exit(code)) => code,
             Err(_) => 1,
         }
+    }
+
+    /// Frames captured when a panic first escaped, innermost first.
+    pub fn panic_trace(&self) -> Option<&[Frame]> {
+        self.panic_trace.as_deref()
+    }
+
+    /// Attaches a debugger. It is consulted before every statement.
+    pub fn attach_debugger(&mut self, hook: Box<dyn DebugHook<W>>) {
+        self.debug = Some(hook);
+    }
+
+    /// The live call stack, outermost first: (qualified name, call site).
+    pub fn debug_call_stack(&self) -> &[(String, grasm_syntax::span::Span)] {
+        &self.call_stack
+    }
+
+    /// Where execution currently is.
+    pub fn debug_cur_span(&self) -> grasm_syntax::span::Span {
+        self.cur_span
+    }
+
+    /// Locals of the innermost frame, innermost scope last.
+    pub fn debug_scopes(&self) -> &[HashMap<String, Value>] {
+        &self.scopes
+    }
+
+    /// Looks a name up the way the running code would.
+    pub fn debug_lookup(&self, name: &str) -> Option<&Value> {
+        self.scopes.iter().rev().find_map(|s| s.get(name))
     }
 
     /// Runs every `test` declaration. Returns (passed, failed).
@@ -236,12 +299,26 @@ impl<'a, W: Write> Interp<'a, W> {
     // ------------------------------------------------------------------
 
     fn call_decl(&mut self, f: &'a FnDecl, module: &str, args: Vec<Value>) -> EResult {
+        let site = self.cur_span;
+        self.call_decl_at(f, module, args, site)
+    }
+
+    fn call_decl_at(
+        &mut self,
+        f: &'a FnDecl,
+        module: &str,
+        args: Vec<Value>,
+        call_site: grasm_syntax::span::Span,
+    ) -> EResult {
         if self.depth >= MAX_DEPTH {
             return Err(Flow::Panic(format!(
                 "stack overflow: recursion deeper than {MAX_DEPTH} calls"
             )));
         }
         self.depth += 1;
+        self.call_stack
+            .push((format!("{module}::{}", f.name.name), call_site));
+        let saved_span = self.cur_span;
         let mut scope = HashMap::new();
         for (p, v) in f.params.iter().zip(args) {
             scope.insert(p.name.name.clone(), v);
@@ -265,6 +342,8 @@ impl<'a, W: Write> Interp<'a, W> {
         }
         self.scopes = saved;
         self.depth -= 1;
+        self.call_stack.pop();
+        self.cur_span = saved_span;
 
         let fallible = f.err.is_some();
         match result {
@@ -349,6 +428,39 @@ impl<'a, W: Write> Interp<'a, W> {
         if let Some(seen) = &mut self.coverage {
             seen.insert(crate::testing::stmt_start(s));
         }
+        self.cur_span = crate::testing::stmt_span(s);
+        if self.debug.is_some() {
+            // Take the hook so it can borrow the interpreter it is inspecting,
+            // then put it back.
+            let mut hook = self.debug.take().expect("checked just above");
+            let at = self.cur_span;
+            hook.before_stmt(self, at);
+            self.debug = Some(hook);
+        }
+        let result = self.eval_stmt_inner(s);
+        if matches!(result, Err(Flow::Panic(_))) && self.panic_trace.is_none() {
+            self.panic_trace = Some(self.capture_trace());
+        }
+        result
+    }
+
+    /// The call stack as frames, innermost first. Each frame reports where
+    /// execution was *inside* it, so the innermost frame points at the failing
+    /// statement and the rest point at their call sites.
+    fn capture_trace(&self) -> Vec<Frame> {
+        let mut frames = Vec::new();
+        let mut at = self.cur_span;
+        for (name, call_site) in self.call_stack.iter().rev() {
+            frames.push(Frame {
+                function: name.clone(),
+                at,
+            });
+            at = *call_site;
+        }
+        frames
+    }
+
+    fn eval_stmt_inner(&mut self, s: &Stmt) -> EResult {
         match s {
             Stmt::Let {
                 name, ty, init, ..

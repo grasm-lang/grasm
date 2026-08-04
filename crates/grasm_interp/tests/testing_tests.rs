@@ -363,3 +363,70 @@ fn property_outcome_reports_the_case_that_failed() {
         PropertyOutcome::Passed(_) => panic!("this property cannot hold"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Stack traces
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_panic_records_the_call_stack() {
+    let fx = Fixture::new(
+        "trace",
+        "fn inner(xs: [i64]) -> i64 {\n    xs[10]\n}\n\nfn outer() -> i64 {\n    inner([1, 2])\n}\n\nfn main() {\n    print(\"{outer()}\")\n}\n",
+    );
+    let program = fx.program();
+    let mut out = Vec::new();
+    let (code, trace) = grasm_interp::run_program_traced(&program, &[], &mut out);
+    assert_eq!(code, 101);
+    let names: Vec<&str> = trace.iter().map(|f| f.function.as_str()).collect();
+    assert_eq!(names, vec!["main::inner", "main::outer", "main::main"]);
+
+    // The innermost frame points at the failing statement, the others at their
+    // call sites, so every line in the trace is somewhere execution actually was.
+    let index = grasm_syntax::span::LineIndex::new(&program.files[0].src);
+    let lines: Vec<u32> = trace
+        .iter()
+        .map(|f| index.line_col(f.at.start).line)
+        .collect();
+    assert_eq!(lines, vec![2, 6, 10]);
+}
+
+#[test]
+fn a_clean_run_records_no_trace() {
+    let fx = Fixture::new("notrace", "fn main() {\n    print(\"fine\")\n}\n");
+    let mut out = Vec::new();
+    let (code, trace) = grasm_interp::run_program_traced(&fx.program(), &[], &mut out);
+    assert_eq!(code, 0);
+    assert!(trace.is_empty());
+}
+
+#[test]
+fn the_first_panic_is_the_one_reported() {
+    // A later panic while unwinding must not overwrite the original cause.
+    let fx = Fixture::new(
+        "firstpanic",
+        "fn boom() -> i64 {\n    panic(\"original\")\n}\n\nfn main() {\n    print(\"{boom()}\")\n}\n",
+    );
+    let mut out = Vec::new();
+    let (_, trace) = grasm_interp::run_program_traced(&fx.program(), &[], &mut out);
+    assert_eq!(trace[0].function, "main::boom");
+    assert!(
+        String::from_utf8_lossy(&out).contains("original"),
+        "output: {}",
+        String::from_utf8_lossy(&out)
+    );
+}
+
+#[test]
+fn a_trace_spans_recursion_without_unbounded_growth() {
+    let fx = Fixture::new(
+        "recurse",
+        "fn down(n: i64) -> i64 {\n    if n == 0 {\n        panic(\"bottom\")\n    }\n    down(n - 1)\n}\n\nfn main() {\n    print(\"{down(3)}\")\n}\n",
+    );
+    let mut out = Vec::new();
+    let (_, trace) = grasm_interp::run_program_traced(&fx.program(), &[], &mut out);
+    // 4 `down` frames (3, 2, 1, 0) plus `main`.
+    assert_eq!(trace.len(), 5, "frames: {trace:?}");
+    assert_eq!(trace[0].function, "main::down");
+    assert_eq!(trace[4].function, "main::main");
+}

@@ -43,7 +43,11 @@ grasm test <file.gr>             # run `test "name" { }` blocks
 grasm bench <file.gr>            # run `bench "name" { }` blocks, ns/op
 grasm check <file.gr>            # diagnostics only (caret + help lines)
 grasm build <file.gr> [-o out]   # self-contained single-file executable
+grasm doc <file.gr> [-o out.md]  # API docs from `///` comments
 grasm fmt <file.gr> [--check]    # canonical indentation (comment-safe)
+grasm lsp                        # language server (stdio)
+grasm dap                        # debug adapter (stdio) — breakpoints, stepping
+grasm deps [dir]                 # resolve deps, check capabilities, write grasm.lock
 grasm tokens <file.gr>           # lexer debug dump
 ```
 
@@ -51,6 +55,31 @@ Phase 2 additions: **modules** (`import utils` / `import lib.math`, qualified
 `utils.fn()` access, `pub` enforced cross-module), **`Map[K, V]`** (typed,
 deterministic iteration), and **`grasm build`** (bundles all modules with the
 runtime into one distributable executable).
+
+### Debugging
+
+A panic prints a stack trace to stderr, innermost frame first:
+
+```text
+panic: index 10 out of bounds (len 3)
+stack trace (innermost first):
+  main::level_three at trace.gr:2:5
+  main::level_two   at trace.gr:6:5
+  main::level_one   at trace.gr:11:5
+  main::main        at trace.gr:16:5
+```
+
+`grasm dap` is a Debug Adapter Protocol server over stdio: breakpoints,
+step in/over/out, stack frames, locals, and variable lookup. It drives the
+reference interpreter through a hook, so what you see while stepping is exactly
+what `grasm run` does — there is no separate debug evaluator that can disagree
+with the real one.
+
+**Native gap:** stack traces are an interpreter feature. A natively compiled
+binary prints the panic message and exits 101 without a trace, because frame
+tracking would cost a store per statement in released code.
+`scripts/difftest.sh` compares stdout and exit codes strictly and excludes only
+this trace block from its stderr comparison.
 
 ### Testing
 

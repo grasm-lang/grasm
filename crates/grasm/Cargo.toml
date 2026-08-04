@@ -14,4 +14,5 @@ grasm_sema = { path = "../grasm_sema" }
 grasm_interp = { path = "../grasm_interp" }
 grasm_native = { path = "../grasm_native" }
 grasm_lsp = { path = "../grasm_lsp" }
+grasm_dap = { path = "../grasm_dap" }
 grasm_pkg = { path = "../grasm_pkg" }
