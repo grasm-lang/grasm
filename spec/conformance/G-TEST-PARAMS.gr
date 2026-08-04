@@ -1,0 +1,8 @@
+//! tag: G-TEST-PARAMS
+//! expect: error
+//! supplied by the runner
+test "the runner owns its inputs" (inout n: i64) {
+    n = n + 1
+}
+fn main() {
+}

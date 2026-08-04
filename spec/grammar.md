@@ -81,7 +81,8 @@ literal brace is written `\{`.
 
 ```
 module      = declaration*
-declaration = fn_decl | type_decl | effect_decl | test_decl | import_decl
+declaration = fn_decl | type_decl | effect_decl | test_decl | bench_decl
+            | import_decl
 
 fn_decl     = "pub"? "fn" identifier generics? params ret? err? effects? block
 generics    = "[" identifier ( "," identifier )* "]"
@@ -101,13 +102,22 @@ variant     = identifier ( "(" ( field ( "," field )* )? ")" )?
 effect_decl = "effect" identifier "{" fn_sig* "}"
 fn_sig      = "fn" identifier params ret? err?
 
-test_decl   = "test" string block
+test_decl   = "test" string params? block
+bench_decl  = "bench" string block
 import_decl = "import" path
 path        = identifier ( "." identifier )*
 ```
 
 **[G-DECL-ORDER]** Declarations may appear in any order; forward references
 are permitted.
+
+**[G-TEST-PARAMS]** A `test` with a parameter list is a *property* test: the
+runner supplies the values, so the parameters may not be `inout` or `own` and
+are immutable in the body. A `test` without one is an ordinary unit test.
+
+**[G-BENCH-CONTEXTUAL]** `bench` is a keyword only immediately before a string
+literal at declaration position. Everywhere else it is an ordinary identifier,
+so existing code that uses `bench` as a name keeps working.
 
 ## 7. Types
 

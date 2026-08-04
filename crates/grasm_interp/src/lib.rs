@@ -1,6 +1,7 @@
 //! grasm_interp — the definitional tree-walking interpreter.
 
 pub mod interp;
+pub mod testing;
 pub mod value;
 
 pub use interp::{Flow, Interp};
@@ -59,13 +60,130 @@ pub fn test_program(
     program: &grasm_sema::loader::Program,
     out: &mut impl Write,
 ) -> (u32, u32) {
+    let summary = test_program_with(program, &testing::TestOptions::default(), out);
+    (summary.passed, summary.failed)
+}
+
+/// Run every `test` declaration in the entry module: unit tests directly,
+/// property tests over generated inputs, with optional line coverage.
+pub fn test_program_with(
+    program: &grasm_sema::loader::Program,
+    opts: &testing::TestOptions,
+    out: &mut impl Write,
+) -> testing::TestSummary {
+    use grasm_syntax::ast::Decl;
+
     let files: Vec<(String, &Module, std::collections::HashMap<String, String>)> = program
         .files
         .iter()
         .map(|f| (f.name.clone(), &f.module, f.imports.clone()))
         .collect();
     let mut interp = Interp::new_program(&files, out);
-    interp.run_tests(&program.files[0].module)
+    if opts.coverage {
+        interp.enable_coverage();
+    }
+
+    let mut passed = 0;
+    let mut failed = 0;
+    for decl in &program.files[0].module.decls {
+        let Decl::Test(t) = decl else { continue };
+        if !opts.filter.is_empty() && !t.name.contains(&opts.filter) {
+            continue;
+        }
+        if t.params.is_empty() {
+            if interp.run_unit_test(t) {
+                passed += 1;
+            } else {
+                failed += 1;
+            }
+            continue;
+        }
+        match interp.run_property(&t.params, &t.body, opts) {
+            testing::PropertyOutcome::Passed(cases) => {
+                interp.report(&format!("test \"{}\" ... ok ({cases} cases)", t.name));
+                passed += 1;
+            }
+            testing::PropertyOutcome::Failed {
+                inputs,
+                message,
+                case,
+            } => {
+                // The seed makes the failure replayable: the whole point of a
+                // property failure is being able to get back to it.
+                interp.report(&format!(
+                    "test \"{}\" ... FAILED on case {case} of {}\n  {}\n  counterexample: {}\n  replay: --seed {} --cases {}",
+                    t.name,
+                    opts.cases,
+                    message,
+                    testing::render_inputs(&inputs),
+                    opts.seed,
+                    opts.cases,
+                ));
+                failed += 1;
+            }
+        }
+    }
+
+    let coverage = interp
+        .take_coverage()
+        .map(|hits| build_coverage(program, &hits));
+    testing::TestSummary {
+        passed,
+        failed,
+        coverage,
+    }
+}
+
+/// Maps executed span offsets back to (file, line), against every line that
+/// could have executed.
+fn build_coverage(
+    program: &grasm_sema::loader::Program,
+    hits: &std::collections::BTreeSet<u32>,
+) -> testing::Coverage {
+    let mut cov = testing::Coverage::default();
+    let indexes: Vec<grasm_syntax::span::LineIndex> = program
+        .files
+        .iter()
+        .map(|f| grasm_syntax::span::LineIndex::new(&f.src))
+        .collect();
+    for (i, f) in program.files.iter().enumerate() {
+        testing::executable_lines(&f.path, &f.module, f.base, &indexes[i], &mut cov.executable);
+    }
+    for &offset in hits {
+        let i = program
+            .files
+            .iter()
+            .rposition(|f| offset >= f.base)
+            .unwrap_or(0);
+        let f = &program.files[i];
+        let line = indexes[i].line_col(offset - f.base).line;
+        cov.covered.insert((f.path.clone(), line));
+    }
+    cov
+}
+
+/// Run every `bench` declaration in the entry module.
+pub fn bench_program(
+    program: &grasm_sema::loader::Program,
+    filter: &str,
+    out: &mut impl Write,
+) -> Vec<testing::BenchResult> {
+    use grasm_syntax::ast::Decl;
+    let files: Vec<(String, &Module, std::collections::HashMap<String, String>)> = program
+        .files
+        .iter()
+        .map(|f| (f.name.clone(), &f.module, f.imports.clone()))
+        .collect();
+    let mut interp = Interp::new_program(&files, out);
+    let mut results = Vec::new();
+    for decl in &program.files[0].module.decls {
+        let Decl::Bench(b) = decl else { continue };
+        if !filter.is_empty() && !b.name.contains(filter) {
+            continue;
+        }
+        results.push(interp.run_bench(&b.name, &b.body));
+    }
+    results
 }
 
 /// Check + run all `test` blocks. Returns (passed, failed, diagnostics).

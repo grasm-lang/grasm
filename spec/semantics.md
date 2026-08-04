@@ -130,7 +130,24 @@ caller when the function returns.
 **[E-OWN-RUNTIME]** `own` has no runtime effect beyond an ordinary pass; the
 guarantee it provides is entirely static.
 
-## 10. Program startup
+## 10. Testing
+
+**[E-TEST-PROPERTY]** A property test runs its body once per generated case.
+It passes only if every case holds; the first failing case ends the run.
+
+**[E-TEST-SHRINK]** A failing property is reported with a *shrunk*
+counterexample: the runner repeatedly substitutes smaller inputs and keeps any
+that still fail, so the reported values are minimal rather than whatever the
+generator happened to produce.
+
+**[E-TEST-SEED]** Generation is driven entirely by a seed. The same seed and
+case count reproduce the same run exactly, and a failure reports the seed that
+found it.
+
+**[E-BENCH-WARMUP]** A benchmark body runs once before timing starts. A body
+that panics is reported as a failure instead of a measurement.
+
+## 11. Program startup
 
 **[E-ENTRY]** Execution begins at `main` in the entry module. A program
 without `main` is an error.

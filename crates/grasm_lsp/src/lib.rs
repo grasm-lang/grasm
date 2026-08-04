@@ -385,6 +385,7 @@ impl Server {
                 Decl::Type(t) => (t.name.name.clone(), 23, t.span), // Struct
                 Decl::Effect(e) => (e.name.name.clone(), 11, e.span), // Interface
                 Decl::Test(t) => (format!("test {:?}", t.name), 12, t.span),
+                Decl::Bench(b) => (format!("bench {:?}", b.name), 12, b.span),
                 Decl::Import(i) => (format!("import {}", i.path.dotted()), 2, i.span),
             };
             out.push(Json::obj(vec![

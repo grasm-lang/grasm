@@ -28,6 +28,10 @@ enum Expect {
     Error(Vec<String>),
     /// Program compiles then panics; the panic contains these substrings.
     Panic(Vec<String>),
+    /// Program is run through the *test* runner (`grasm test`) rather than
+    /// `main`; its report contains these substrings. Clauses about property
+    /// testing and benchmarks are only observable this way.
+    TestOutput(Vec<String>),
 }
 
 struct Case {
@@ -70,6 +74,7 @@ fn parse_case(path: &Path) -> Case {
         "output-failing" => Expect::OutputFailing(lines),
         "error" => Expect::Error(lines),
         "panic" => Expect::Panic(lines),
+        "test-output" => Expect::TestOutput(lines),
         other => panic!("{name}: unknown expectation `{other}`"),
     };
 
@@ -119,6 +124,58 @@ fn declared_tags() -> BTreeSet<String> {
     tags
 }
 
+/// Runs a program's `test` declarations with a fixed seed and case count, so
+/// the report is reproducible from run to run.
+fn run_test_suite(source: &str) -> (u32, u32, String, Vec<String>) {
+    let (module, diags) = grasm_sema::analyze(source);
+    if !diags.is_empty() {
+        let messages = diags.iter().map(|d| d.message.clone()).collect();
+        return (0, 0, String::new(), messages);
+    }
+    let mut out = Vec::new();
+    let mut interp = grasm_interp::Interp::new(&module, &mut out);
+    let mut passed = 0;
+    let mut failed = 0;
+    let opts = grasm_interp::testing::TestOptions {
+        seed: 1234,
+        cases: 500,
+        ..Default::default()
+    };
+    for decl in &module.decls {
+        let grasm_syntax::ast::Decl::Test(t) = decl else {
+            continue;
+        };
+        if t.params.is_empty() {
+            if interp.run_unit_test(t) {
+                passed += 1;
+            } else {
+                failed += 1;
+            }
+            continue;
+        }
+        match interp.run_property(&t.params, &t.body, &opts) {
+            grasm_interp::testing::PropertyOutcome::Passed(n) => {
+                interp.report(&format!("test \"{}\" ... ok ({n} cases)", t.name));
+                passed += 1;
+            }
+            grasm_interp::testing::PropertyOutcome::Failed { inputs, .. } => {
+                interp.report(&format!(
+                    "test \"{}\" ... FAILED counterexample: {}",
+                    t.name,
+                    grasm_interp::testing::render_inputs(&inputs)
+                ));
+                failed += 1;
+            }
+        }
+    }
+    (
+        passed,
+        failed,
+        String::from_utf8_lossy(&out).into_owned(),
+        Vec::new(),
+    )
+}
+
 fn run_program(source: &str) -> (i32, String, Vec<String>) {
     let mut out = Vec::new();
     let (code, diags) = grasm_interp::run_src(source, &mut out);
@@ -141,6 +198,26 @@ fn every_conformance_program_behaves_as_specified() {
     let mut failures: Vec<String> = Vec::new();
 
     for case in all_cases() {
+        if let Expect::TestOutput(expected) = &case.expect {
+            let (_, _, report, diags) = run_test_suite(&case.source);
+            if !diags.is_empty() {
+                failures.push(format!(
+                    "{}: expected it to compile, but got diagnostics: {diags:?}",
+                    case.name
+                ));
+                continue;
+            }
+            for needle in expected {
+                if !report.contains(needle.trim()) {
+                    failures.push(format!(
+                        "{}: test report missing {:?}\n  actual: {report}",
+                        case.name,
+                        needle.trim()
+                    ));
+                }
+            }
+            continue;
+        }
         let (code, stdout, diags) = run_program(&case.source);
         match &case.expect {
             Expect::Output(expected) => {
@@ -204,6 +281,7 @@ fn every_conformance_program_behaves_as_specified() {
                     }
                 }
             }
+            Expect::TestOutput(_) => unreachable!("handled before this match"),
             Expect::Panic(needles) => {
                 if !diags.is_empty() {
                     failures.push(format!(

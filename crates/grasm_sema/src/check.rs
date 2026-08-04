@@ -450,8 +450,47 @@ impl Checker {
                     self.fn_ret = Type::Unit;
                     self.fn_err = Some(self.uni.fresh()); // tests may propagate any error
                     self.err_open = true;
-                    self.scopes.push(HashMap::new());
+                    let mut scope = HashMap::new();
+                    // A parameter list makes this a property test: the runner
+                    // supplies the values, so each type must be generatable.
+                    for p in &t.params {
+                        let ty = self.resolve_type(&p.ty, &[]);
+                        if p.mode != ParamMode::Let {
+                            self.error(
+                                p.span,
+                                "a property test parameter is supplied by the runner, so it \
+                                 cannot be `inout` or `own`",
+                            );
+                        }
+                        if !self.generatable(&ty) {
+                            let shown = self.show(&ty);
+                            self.error_help(
+                                p.span,
+                                format!("cannot generate values of type `{shown}`"),
+                                "property tests generate `i64`, `f64`, `bool`, `str`, lists of \
+                                 those, and `Option` of those",
+                            );
+                        }
+                        scope.insert(
+                            p.name.name.clone(),
+                            Binding {
+                                ty,
+                                mutable: false,
+                                moved: false,
+                                decl_loop_depth: 0,
+                            },
+                        );
+                    }
+                    self.scopes.push(scope);
                     self.check_block(&t.body);
+                    self.scopes.pop();
+                }
+                Decl::Bench(b) => {
+                    self.fn_ret = Type::Unit;
+                    self.fn_err = Some(self.uni.fresh());
+                    self.err_open = true;
+                    self.scopes.push(HashMap::new());
+                    self.check_block(&b.body);
                     self.scopes.pop();
                 }
                 _ => {}
@@ -2406,6 +2445,21 @@ impl Checker {
 }
 
 /// Root identifier of a place expression (`x`, `x.f`, `x[i].g`), if any.
+/// Types a property test's generator can produce values of.
+impl Checker {
+    fn generatable(&self, ty: &Type) -> bool {
+        match ty {
+            Type::I64 | Type::F64 | Type::Bool | Type::Str => true,
+            Type::List(e) => self.generatable(e),
+            Type::Tuple(items) => items.iter().all(|t| self.generatable(t)),
+            Type::Named { id, args } if *id == self.defs.option_id => {
+                args.iter().all(|t| self.generatable(t))
+            }
+            _ => false,
+        }
+    }
+}
+
 fn place_root(e: &Expr) -> Option<&Ident> {
     match e {
         Expr::Ident(id) => Some(id),

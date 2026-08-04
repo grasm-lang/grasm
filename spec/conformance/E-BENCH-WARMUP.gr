@@ -1,0 +1,13 @@
+//! tag: E-BENCH-WARMUP
+//! expect: output
+//! 4
+// A `bench` declaration is checked like any other body but is only executed by
+// `grasm bench`, so running this program prints only what `main` prints.
+bench "doubling" {
+    let x = 2 * 2
+    assert(x == 4)
+}
+
+fn main() {
+    print("{2 * 2}")
+}

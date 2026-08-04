@@ -1,0 +1,18 @@
+//! tag: E-TEST-SHRINK
+//! expect: test-output
+//! counterexample: n = 3
+//! counterexample: xs = [0, 0]
+// The generator produces large values, but the reported counterexample is the
+// smallest one that still fails.
+test "under three" (n: i64) {
+    if n > 0 {
+        assert(n < 3)
+    }
+}
+
+test "at most one element" (xs: [i64]) {
+    assert(xs.len() < 2)
+}
+
+fn main() {
+}

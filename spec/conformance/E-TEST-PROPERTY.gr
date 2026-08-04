@@ -1,0 +1,15 @@
+//! tag: E-TEST-PROPERTY
+//! expect: test-output
+//! test "addition commutes" ... ok (500 cases)
+//! test "every int is tiny" ... FAILED
+test "addition commutes" (a: i64, b: i64) {
+    assert(a + b == b + a)
+}
+
+// A property passes only if *every* generated case holds.
+test "every int is tiny" (n: i64) {
+    assert(n < 3)
+}
+
+fn main() {
+}

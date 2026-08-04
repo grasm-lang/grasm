@@ -235,6 +235,15 @@ impl Parser {
                 | TokenKind::KwEffect
                 | TokenKind::KwTest
                 | TokenKind::KwImport => break,
+                // Only a real `bench "..."` header ends recovery. A bare
+                // `bench` is an ordinary identifier, and breaking on it would
+                // hand the same token back to parse_decl and spin forever.
+                TokenKind::Ident(n)
+                    if n == "bench"
+                        && matches!(&self.toks[self.i + 1].kind, TokenKind::Str(_)) =>
+                {
+                    break
+                }
                 _ => {
                     self.i += 1;
                 }
@@ -270,9 +279,18 @@ impl Parser {
             if matches!(self.cur(), TokenKind::Eof) {
                 break;
             }
+            let before = self.i;
             match self.parse_decl() {
                 Ok(d) => module.decls.push(d),
-                Err(()) => self.sync_decl(),
+                Err(()) => {
+                    self.sync_decl();
+                    // Recovery must consume something. If it did not, the same
+                    // token would come back around forever — a hang is a worse
+                    // failure than a second diagnostic.
+                    if self.i == before {
+                        self.i += 1;
+                    }
+                }
             }
         }
         module
@@ -280,6 +298,9 @@ impl Parser {
 
     fn parse_decl(&mut self) -> PResult<Decl> {
         let is_pub = self.eat(&TokenKind::KwPub);
+        if self.at_bench_decl() {
+            return Ok(Decl::Bench(self.parse_bench_decl()?));
+        }
         match self.cur() {
             TokenKind::KwFn => Ok(Decl::Fn(self.parse_fn(is_pub)?)),
             TokenKind::KwType => Ok(Decl::Type(self.parse_type_decl(is_pub)?)),
@@ -289,7 +310,7 @@ impl Parser {
             _ => {
                 let found = self.cur().describe();
                 self.error_here(format!(
-                    "expected a declaration (`fn`, `type`, `effect`, `test`, `import`) but found {found}"
+                    "expected a declaration (`fn`, `type`, `effect`, `test`, `bench`, `import`) but found {found}"
                 ));
                 Err(())
             }
@@ -557,9 +578,53 @@ impl Parser {
                 return Err(());
             }
         };
+        // A parameter list turns a unit test into a property test.
+        let params = if matches!(self.cur(), TokenKind::LParen) {
+            self.parse_params()?
+        } else {
+            Vec::new()
+        };
         let body = self.parse_block()?;
         let span = start.merge(body.span);
-        Ok(TestDecl { name, body, span })
+        Ok(TestDecl {
+            name,
+            params,
+            body,
+            span,
+        })
+    }
+
+    /// `bench "name" { ... }`. `bench` is contextual: it is only a keyword
+    /// directly before a string literal at declaration position, so ordinary
+    /// code may still use `bench` as a name.
+    fn parse_bench_decl(&mut self) -> PResult<BenchDecl> {
+        let start = self.cur_span();
+        self.bump(); // `bench`
+        let name = match self.cur().clone() {
+            TokenKind::Str(parts) => {
+                self.bump();
+                match parts.as_slice() {
+                    [StrPart::Text(t)] => t.clone(),
+                    _ => {
+                        self.error_here("benchmark names cannot contain interpolation");
+                        return Err(());
+                    }
+                }
+            }
+            _ => {
+                self.error_here("expected a string name after `bench`");
+                return Err(());
+            }
+        };
+        let body = self.parse_block()?;
+        let span = start.merge(body.span);
+        Ok(BenchDecl { name, body, span })
+    }
+
+    /// True when the cursor sits on a `bench "..."` declaration header.
+    fn at_bench_decl(&mut self) -> bool {
+        matches!(self.cur(), TokenKind::Ident(n) if n == "bench")
+            && matches!(&self.toks[self.i + 1].kind, TokenKind::Str(_))
     }
 
     fn parse_import(&mut self) -> PResult<ImportDecl> {

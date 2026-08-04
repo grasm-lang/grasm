@@ -1,0 +1,16 @@
+//! tag: G-BENCH-CONTEXTUAL
+//! expect: output
+//! 42
+fn bench(n: i64) -> i64 {
+    n * 2
+}
+
+bench "doubling" {
+    let x = bench(1)
+    assert(x == 2)
+}
+
+fn main() {
+    // `bench` is only a keyword before a string at declaration position.
+    print("{bench(21)}")
+}

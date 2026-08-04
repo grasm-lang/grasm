@@ -1,0 +1,365 @@
+//! End-to-end tests for the test runner itself: unit tests, property tests
+//! (including shrinking), benchmarks, and coverage.
+
+use grasm_interp::testing::{PropertyOutcome, TestOptions};
+use std::io::Write;
+
+/// Loads a program from a temporary file so the multi-file loader — and with
+/// it the span-offset space coverage depends on — is exercised for real.
+struct Fixture {
+    dir: std::path::PathBuf,
+    entry: std::path::PathBuf,
+}
+
+impl Fixture {
+    fn new(name: &str, src: &str) -> Fixture {
+        let dir = std::env::temp_dir().join(format!(
+            "grasm_testing_{}_{}",
+            name,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let entry = dir.join("main.gr");
+        let mut f = std::fs::File::create(&entry).unwrap();
+        f.write_all(src.as_bytes()).unwrap();
+        Fixture { dir, entry }
+    }
+
+    fn program(&self) -> grasm_sema::loader::Program {
+        let program = grasm_sema::loader::load_from_disk(&self.entry).expect("loads");
+        // Parse errors live on the program; type errors come from the check.
+        // Missing either lets a malformed fixture pass vacuously.
+        assert!(
+            program.diagnostics.is_empty(),
+            "fixture failed to parse: {:#?}",
+            program.diagnostics
+        );
+        let diags = grasm_sema::check::check_program(&program).diagnostics;
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:#?}");
+        program
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn run_tests(name: &str, src: &str, opts: &TestOptions) -> (u32, u32, String) {
+    let fx = Fixture::new(name, src);
+    let program = fx.program();
+    let mut out = Vec::new();
+    let summary = grasm_interp::test_program_with(&program, opts, &mut out);
+    (
+        summary.passed,
+        summary.failed,
+        String::from_utf8(out).unwrap(),
+    )
+}
+
+#[test]
+fn unit_tests_still_run_without_parameters() {
+    let (passed, failed, out) = run_tests(
+        "unit",
+        "test \"arithmetic\" {\n    assert(2 + 2 == 4)\n}\n\ntest \"broken\" {\n    assert(1 == 2)\n}\n\nfn main() {\n}\n",
+        &TestOptions::default(),
+    );
+    assert_eq!((passed, failed), (1, 1));
+    assert!(out.contains("\"arithmetic\" ... ok"), "output: {out}");
+    assert!(out.contains("\"broken\" ... FAILED"), "output: {out}");
+}
+
+#[test]
+fn a_property_that_holds_reports_its_case_count() {
+    let (passed, failed, out) = run_tests(
+        "holds",
+        "test \"addition commutes\" (a: i64, b: i64) {\n    assert(a + b == b + a)\n}\n\nfn main() {\n}\n",
+        &TestOptions {
+            cases: 25,
+            ..Default::default()
+        },
+    );
+    assert_eq!((passed, failed), (1, 0));
+    assert!(out.contains("ok (25 cases)"), "output: {out}");
+}
+
+#[test]
+fn a_false_property_fails_with_a_replayable_seed() {
+    let opts = TestOptions {
+        seed: 42,
+        cases: 200,
+        ..Default::default()
+    };
+    let src = "test \"every int is small\" (n: i64) {\n    assert(n < 5)\n}\n\nfn main() {\n}\n";
+    let (passed, failed, out) = run_tests("false_prop", src, &opts);
+    assert_eq!((passed, failed), (0, 1));
+    assert!(out.contains("--seed 42"), "must report the seed: {out}");
+    assert!(out.contains("counterexample: n ="), "output: {out}");
+
+    // Same seed, same counterexample — a red property has to be reproducible.
+    let (_, _, again) = run_tests("false_prop2", src, &opts);
+    let line = |s: &str| {
+        s.lines()
+            .find(|l| l.contains("counterexample"))
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(line(&out), line(&again));
+}
+
+#[test]
+fn shrinking_reports_the_minimal_counterexample() {
+    // The smallest failing `n` is exactly 5; a run without shrinking would
+    // report whatever large value the generator happened to produce.
+    let (_, failed, out) = run_tests(
+        "shrink_int",
+        "test \"under five\" (n: i64) {\n    if n > 0 {\n        assert(n < 5)\n    }\n}\n\nfn main() {\n}\n",
+        &TestOptions {
+            cases: 300,
+            ..Default::default()
+        },
+    );
+    assert_eq!(failed, 1);
+    assert!(
+        out.contains("counterexample: n = 5"),
+        "expected the minimal counterexample, got: {out}"
+    );
+}
+
+#[test]
+fn shrinking_minimizes_lists_and_strings() {
+    let (_, failed, out) = run_tests(
+        "shrink_list",
+        "test \"no long lists\" (xs: [i64]) {\n    assert(xs.len() < 2)\n}\n\nfn main() {\n}\n",
+        &TestOptions {
+            cases: 300,
+            ..Default::default()
+        },
+    );
+    assert_eq!(failed, 1);
+    // Two elements is the shortest failing list, and each shrinks to 0.
+    assert!(
+        out.contains("counterexample: xs = [0, 0]"),
+        "expected a minimal list, got: {out}"
+    );
+}
+
+#[test]
+fn a_panicking_property_is_a_failure_not_a_crash() {
+    let (passed, failed, out) = run_tests(
+        "panic_prop",
+        "test \"divides\" (n: i64) {\n    assert(10 / n != 999)\n}\n\nfn main() {\n}\n",
+        &TestOptions {
+            cases: 100,
+            ..Default::default()
+        },
+    );
+    assert_eq!((passed, failed), (0, 1));
+    assert!(out.contains("division by zero"), "output: {out}");
+    assert!(
+        out.contains("counterexample: n = 0"),
+        "the zero case is minimal: {out}"
+    );
+}
+
+#[test]
+fn the_filter_selects_tests_by_name() {
+    let src = "test \"alpha\" {\n    assert(true)\n}\n\ntest \"beta\" {\n    assert(true)\n}\n\nfn main() {\n}\n";
+    let (passed, _, out) = run_tests(
+        "filter",
+        src,
+        &TestOptions {
+            filter: "alph".to_string(),
+            ..Default::default()
+        },
+    );
+    assert_eq!(passed, 1);
+    assert!(out.contains("alpha"), "output: {out}");
+    assert!(!out.contains("beta"), "beta should be filtered out: {out}");
+}
+
+#[test]
+fn coverage_reports_lines_the_tests_never_reached() {
+    let src = "fn used() -> i64 {\n    1\n}\n\nfn unused() -> i64 {\n    2\n}\n\ntest \"only touches used\" {\n    assert(used() == 1)\n}\n\nfn main() {\n}\n";
+    let fx = Fixture::new("coverage", src);
+    let program = fx.program();
+    let mut out = Vec::new();
+    let summary = grasm_interp::test_program_with(
+        &program,
+        &TestOptions {
+            coverage: true,
+            ..Default::default()
+        },
+        &mut out,
+    );
+    let cov = summary.coverage.expect("coverage was requested");
+    assert!(cov.percent() < 100.0, "unused() must show as uncovered");
+    let misses = cov.misses();
+    assert_eq!(misses.len(), 1, "one file: {misses:?}");
+    assert!(
+        misses[0].1.contains(&6),
+        "line 6 is `unused`'s body: {misses:?}"
+    );
+    assert!(
+        !misses[0].1.contains(&2),
+        "line 2 is `used`'s body and did run: {misses:?}"
+    );
+}
+
+#[test]
+fn coverage_is_off_by_default() {
+    let (_, _, _) = run_tests(
+        "nocov",
+        "test \"t\" {\n    assert(true)\n}\n\nfn main() {\n}\n",
+        &TestOptions::default(),
+    );
+    let fx = Fixture::new("nocov2", "test \"t\" {\n    assert(true)\n}\n\nfn main() {\n}\n");
+    let mut out = Vec::new();
+    let summary =
+        grasm_interp::test_program_with(&fx.program(), &TestOptions::default(), &mut out);
+    assert!(summary.coverage.is_none());
+}
+
+#[test]
+fn benchmarks_run_and_report_iterations() {
+    let fx = Fixture::new(
+        "bench",
+        "bench \"trivial\" {\n    let x = 1 + 1\n    assert(x == 2)\n}\n\nfn main() {\n}\n",
+    );
+    let mut out = Vec::new();
+    let results = grasm_interp::bench_program(&fx.program(), "", &mut out);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].name, "trivial");
+    assert!(results[0].error.is_none(), "{:?}", results[0].error);
+    assert!(results[0].iterations > 0);
+    assert!(
+        results[0].ns_per_op > 0.0,
+        "a measured body must take some time"
+    );
+}
+
+#[test]
+fn a_broken_benchmark_reports_instead_of_timing_noise() {
+    let fx = Fixture::new(
+        "bench_bad",
+        "bench \"divides by zero\" {\n    let zero = 0\n    let x = 1 / zero\n    assert(x == 0)\n}\n\nfn main() {\n}\n",
+    );
+    let mut out = Vec::new();
+    let results = grasm_interp::bench_program(&fx.program(), "", &mut out);
+    assert_eq!(results.len(), 1);
+    assert!(
+        results[0]
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("division by zero")),
+        "expected the panic to be reported: {:?}",
+        results[0].error
+    );
+    assert_eq!(results[0].iterations, 0, "a failed bench has no timing");
+}
+
+#[test]
+fn generated_values_cover_the_declared_types() {
+    // A weak generator would silently make properties vacuous, so check that
+    // the interesting shapes actually appear across a run.
+    use grasm_interp::testing::{generate, Rng};
+    let (module, diags) = grasm_sema::analyze(
+        "test \"t\" (n: i64, s: str, xs: [i64], b: bool, o: Option[i64]) {\n    assert(true)\n}\n\nfn main() {\n}\n",
+    );
+    assert!(diags.is_empty(), "{diags:#?}");
+    let grasm_syntax::ast::Decl::Test(t) = &module.decls[0] else {
+        panic!("expected the test declaration first");
+    };
+
+    let mut rng = Rng::new(7);
+    let mut saw_negative = false;
+    let mut saw_zero = false;
+    let mut saw_nonempty_str = false;
+    let mut saw_nonempty_list = false;
+    let mut saw_both_bools = (false, false);
+    let mut saw_none = false;
+    let mut saw_some = false;
+    for case in 0..200u32 {
+        let size = 1 + case / 2;
+        let vals: Vec<_> = t
+            .params
+            .iter()
+            .map(|p| generate(&mut rng, &p.ty, size))
+            .collect();
+        match &vals[0] {
+            grasm_interp::Value::Int(0) => saw_zero = true,
+            grasm_interp::Value::Int(n) if *n < 0 => saw_negative = true,
+            _ => {}
+        }
+        if let grasm_interp::Value::Str(s) = &vals[1] {
+            saw_nonempty_str |= !s.is_empty();
+        }
+        if let grasm_interp::Value::List(xs) = &vals[2] {
+            saw_nonempty_list |= !xs.is_empty();
+        }
+        if let grasm_interp::Value::Bool(b) = &vals[3] {
+            if *b {
+                saw_both_bools.0 = true;
+            } else {
+                saw_both_bools.1 = true;
+            }
+        }
+        if let grasm_interp::Value::Variant { variant, .. } = &vals[4] {
+            match variant.as_str() {
+                "None" => saw_none = true,
+                "Some" => saw_some = true,
+                _ => {}
+            }
+        }
+    }
+    assert!(saw_zero, "generator never produced 0");
+    assert!(saw_negative, "generator never produced a negative int");
+    assert!(saw_nonempty_str, "generator never produced a non-empty str");
+    assert!(saw_nonempty_list, "generator never produced a non-empty list");
+    assert!(saw_both_bools.0 && saw_both_bools.1, "bools were not varied");
+    assert!(saw_none && saw_some, "Option was not varied");
+}
+
+#[test]
+fn a_property_over_two_arguments_shrinks_both() {
+    let (_, failed, out) = run_tests(
+        "two_args",
+        "test \"never both\" (a: i64, b: i64) {\n    assert(not (a > 0 and b > 0))\n}\n\nfn main() {\n}\n",
+        &TestOptions {
+            cases: 300,
+            ..Default::default()
+        },
+    );
+    assert_eq!(failed, 1);
+    assert!(
+        out.contains("counterexample: a = 1, b = 1"),
+        "both arguments should shrink to 1: {out}"
+    );
+}
+
+#[test]
+fn property_outcome_reports_the_case_that_failed() {
+    let fx = Fixture::new(
+        "case_no",
+        "test \"p\" (n: i64) {\n    assert(n != n)\n}\n\nfn main() {\n}\n",
+    );
+    let program = fx.program();
+    let files: Vec<_> = program
+        .files
+        .iter()
+        .map(|f| (f.name.clone(), &f.module, f.imports.clone()))
+        .collect();
+    let mut out = Vec::new();
+    let mut interp = grasm_interp::Interp::new_program(&files, &mut out);
+    let grasm_syntax::ast::Decl::Test(t) = &program.files[0].module.decls[0] else {
+        panic!("expected a test");
+    };
+    match interp.run_property(&t.params, &t.body, &TestOptions::default()) {
+        PropertyOutcome::Failed { case, .. } => {
+            assert_eq!(case, 1, "an always-false property fails on the first case")
+        }
+        PropertyOutcome::Passed(_) => panic!("this property cannot hold"),
+    }
+}

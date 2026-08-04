@@ -576,7 +576,7 @@ impl<'m> Codegen<'m> {
                         },
                     );
                 }
-                Decl::Test(_) | Decl::Import(_) | Decl::Type(_) | Decl::Effect(_) => {}
+                Decl::Test(_) | Decl::Bench(_) | Decl::Import(_) | Decl::Type(_) | Decl::Effect(_) => {}
             }
         }
         Ok(())

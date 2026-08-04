@@ -1,0 +1,84 @@
+// Unit tests, property tests, and benchmarks — one declaration form.
+//
+//   grasm test  examples/testing_tour.gr --coverage
+//   grasm bench examples/testing_tour.gr
+//
+// A `test` with no parameters is a unit test. Give it parameters and the
+// runner generates the values, so the same syntax covers property testing and
+// fuzzing. A failing property is reported with a *shrunk* counterexample and
+// the seed that found it, so it replays exactly.
+
+fn reverse(xs: [i64]) -> [i64] {
+    var out: [i64] = []
+    var i = xs.len() - 1
+    while i >= 0 {
+        out.push(xs[i])
+        i = i - 1
+    }
+    out
+}
+
+fn clamp(n: i64, low: i64, high: i64) -> i64 {
+    if n < low {
+        low
+    } else if n > high {
+        high
+    } else {
+        n
+    }
+}
+
+test "reverse of a known list" {
+    assert(reverse([1, 2, 3]) == [3, 2, 1])
+}
+
+// Properties hold for every generated input, not just the cases you thought of.
+test "reversing twice is the identity" (xs: [i64]) {
+    assert(reverse(reverse(xs)) == xs)
+}
+
+test "reverse preserves length" (xs: [i64]) {
+    assert(reverse(xs).len() == xs.len())
+}
+
+test "clamp lands inside its bounds" (n: i64) {
+    let c = clamp(n, -10, 10)
+    assert(c >= -10 and c <= 10)
+}
+
+test "clamp leaves in-range values alone" (n: i64) {
+    if n >= -10 and n <= 10 {
+        assert(clamp(n, -10, 10) == n)
+    }
+}
+
+// Pointing a property at `str` is fuzzing: the generator includes tabs,
+// newlines, quotes, backslashes, and multi-byte characters.
+test "splitting on a separator round-trips" (s: str) {
+    assert(s.split(",").join(",") == s)
+}
+
+test "character count survives a round trip" (s: str) {
+    assert(s.chars().len() == s.len())
+}
+
+bench "reverse 200 elements" {
+    var xs: [i64] = []
+    for i in 0..200 {
+        xs.push(i)
+    }
+    reverse(xs)
+}
+
+bench "clamp in a tight loop" {
+    var total = 0
+    for i in 0..1000 {
+        total += clamp(i, 0, 500)
+    }
+    assert(total > 0)
+}
+
+fn main() {
+    print("{reverse([1, 2, 3])}")
+    print("{clamp(99, 0, 10)}")
+}

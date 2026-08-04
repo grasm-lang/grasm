@@ -1,0 +1,11 @@
+//! tag: E-TEST-SEED
+//! expect: test-output
+//! counterexample: n = 1
+// Generation is a pure function of the seed, so this report is identical on
+// every run and every machine.
+test "no positive ints" (n: i64) {
+    assert(n <= 0)
+}
+
+fn main() {
+}

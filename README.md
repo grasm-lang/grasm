@@ -38,6 +38,9 @@ fn main() {
 cargo build --release            # builds ./target/release/grasm
 grasm run <file.gr> [-- args]    # typecheck + execute (follows imports)
 grasm test <file.gr>             # run `test "name" { }` blocks
+        --coverage               # report the statement lines tests reached
+        --seed N --cases N       # property generation (replayable)
+grasm bench <file.gr>            # run `bench "name" { }` blocks, ns/op
 grasm check <file.gr>            # diagnostics only (caret + help lines)
 grasm build <file.gr> [-o out]   # self-contained single-file executable
 grasm fmt <file.gr> [--check]    # canonical indentation (comment-safe)
@@ -48,6 +51,25 @@ Phase 2 additions: **modules** (`import utils` / `import lib.math`, qualified
 `utils.fn()` access, `pub` enforced cross-module), **`Map[K, V]`** (typed,
 deterministic iteration), and **`grasm build`** (bundles all modules with the
 runtime into one distributable executable).
+
+### Testing
+
+One declaration form covers three kinds of test. `test "name" { ... }` is a
+unit test; adding parameters makes it a **property** test, and the runner
+generates the inputs:
+
+```
+test "reversing twice is the identity" (xs: [i64]) {
+    assert(reverse(reverse(xs)) == xs)
+}
+```
+
+Pointing a property at `str` is fuzzing — the generator emits tabs, newlines,
+quotes, backslashes, and multi-byte characters. A failure is reported with a
+*shrunk* counterexample (the smallest input that still fails) plus the seed
+that found it, so `--seed N --cases N` replays it exactly. `bench "name"
+{ ... }` bodies are warmed up, then sampled and reported in ns/op.
+See `examples/testing_tour.gr`.
 
 ### Native compilation
 

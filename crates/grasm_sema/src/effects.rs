@@ -127,15 +127,18 @@ pub fn effects_of_program(program: &crate::loader::Program) -> BTreeSet<String> 
     for row in ctx.rows.values() {
         all.extend(row.iter().cloned());
     }
-    // Tests may perform effects too.
+    // Tests and benchmarks may perform effects too.
     for f in &views {
         for d in &f.module.decls {
-            if let Decl::Test(t) = d {
-                let mut row = BTreeSet::new();
-                let mut active = Vec::new();
-                walk_block(&t.body, &f.name, &mut active, &ctx, &mut row);
-                all.extend(row);
-            }
+            let body = match d {
+                Decl::Test(t) => &t.body,
+                Decl::Bench(b) => &b.body,
+                _ => continue,
+            };
+            let mut row = BTreeSet::new();
+            let mut active = Vec::new();
+            walk_block(body, &f.name, &mut active, &ctx, &mut row);
+            all.extend(row);
         }
     }
     all
@@ -254,13 +257,18 @@ pub fn check_effects_multi(files: &[ModuleView]) -> Vec<Diagnostic> {
         }
     }
 
-    // Tests: same rule as main.
+    // Tests and benchmarks: same rule as main.
     for f in files {
         for d in &f.module.decls {
-            if let Decl::Test(t) = d {
+            if let Decl::Test(_) | Decl::Bench(_) = d {
+                let (kind, name, body, span) = match d {
+                    Decl::Test(t) => ("test", &t.name, &t.body, t.span),
+                    Decl::Bench(b) => ("bench", &b.name, &b.body, b.span),
+                    _ => unreachable!(),
+                };
                 let mut row = BTreeSet::new();
                 let mut active = Vec::new();
-                walk_block(&t.body, &f.name, &mut active, &ctx, &mut row);
+                walk_block(body, &f.name, &mut active, &ctx, &mut row);
                 let leftover: Vec<&String> =
                     row.iter().filter(|e| *e != IO && *e != ASYNC).collect();
                 if !leftover.is_empty() {
@@ -271,8 +279,8 @@ pub fn check_effects_multi(files: &[ModuleView]) -> Vec<Diagnostic> {
                         .join(", ");
                     diags.push(
                         Diagnostic::error(
-                            t.span,
-                            format!("test \"{}\" has unhandled effect(s) {list}", t.name),
+                            span,
+                            format!("{kind} \"{name}\" has unhandled effect(s) {list}"),
                         )
                         .with_help("install a test handler with `with <Effect> handled_by ...`"),
                     );

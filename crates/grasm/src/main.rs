@@ -41,18 +41,69 @@ fn main() -> ExitCode {
             ExitCode::from(code.clamp(0, 255) as u8)
         }
         Some("test") => {
-            let Some(path) = args.get(1) else {
-                eprintln!("usage: grasm test <file.gr>");
+            let Some(path) = args.get(1).filter(|a| !a.starts_with("--")) else {
+                eprintln!("usage: grasm test <file.gr> [--coverage] [--seed N] [--cases N] [--filter TEXT]");
                 return ExitCode::FAILURE;
             };
-            let program = match load_and_check(path) {
+            let path = path.clone();
+            let opts = match parse_test_opts(&args[2..]) {
+                Ok(o) => o,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let program = match load_and_check(&path) {
                 Ok(p) => p,
                 Err(code) => return code,
             };
             let mut stdout = std::io::stdout();
-            let (passed, failed) = grasm_interp::test_program(&program, &mut stdout);
-            println!("{passed} passed, {failed} failed");
-            if failed > 0 {
+            let summary = grasm_interp::test_program_with(&program, &opts, &mut stdout);
+            println!("{} passed, {} failed", summary.passed, summary.failed);
+            if let Some(cov) = &summary.coverage {
+                print_coverage(cov);
+            }
+            if summary.failed > 0 {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        Some("bench") => {
+            let Some(path) = args.get(1).filter(|a| !a.starts_with("--")) else {
+                eprintln!("usage: grasm bench <file.gr> [--filter TEXT]");
+                return ExitCode::FAILURE;
+            };
+            let path = path.clone();
+            let filter = flag_value(&args[2..], "--filter").unwrap_or_default();
+            let program = match load_and_check(&path) {
+                Ok(p) => p,
+                Err(code) => return code,
+            };
+            let mut stdout = std::io::stdout();
+            let results = grasm_interp::bench_program(&program, &filter, &mut stdout);
+            if results.is_empty() {
+                println!("no benchmarks found (declare one with `bench \"name\" {{ ... }}`)");
+                return ExitCode::SUCCESS;
+            }
+            let width = results.iter().map(|r| r.name.len()).max().unwrap_or(0);
+            let mut failed = false;
+            for r in &results {
+                match &r.error {
+                    Some(e) => {
+                        println!("{:<width$}  FAILED: {e}", r.name, width = width);
+                        failed = true;
+                    }
+                    None => println!(
+                        "{:<width$}  {:>12}  ({} iterations)",
+                        r.name,
+                        format_duration(r.ns_per_op),
+                        r.iterations,
+                        width = width
+                    ),
+                }
+            }
+            if failed {
                 ExitCode::FAILURE
             } else {
                 ExitCode::SUCCESS
@@ -237,7 +288,13 @@ fn main() -> ExitCode {
             eprintln!();
             eprintln!("commands:");
             eprintln!("  run <file.gr> [-- args...]   check + execute main (follows imports)");
-            eprintln!("  test <file.gr>               run test blocks");
+            eprintln!("  test <file.gr>               run test blocks (unit and property)");
+            eprintln!("      --coverage               report which lines the tests reached");
+            eprintln!("      --seed N                 seed for property generation");
+            eprintln!("      --cases N                property cases per test (default 100)");
+            eprintln!("      --filter TEXT            only tests whose name contains TEXT");
+            eprintln!("  bench <file.gr>              run bench blocks, report ns/op");
+            eprintln!("      --filter TEXT            only benchmarks whose name contains TEXT");
             eprintln!("  check <file.gr>              parse + typecheck");
             eprintln!("  build <file.gr> [-o out]     self-contained executable");
             eprintln!("      --native                 compile to machine code (Cranelift)");
@@ -249,6 +306,58 @@ fn main() -> ExitCode {
             eprintln!("  version                      print version");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// `--flag value` lookup.
+fn flag_value(args: &[String], flag: &str) -> Option<String> {
+    let i = args.iter().position(|a| a == flag)?;
+    args.get(i + 1).cloned()
+}
+
+fn parse_test_opts(args: &[String]) -> Result<grasm_interp::testing::TestOptions, String> {
+    let mut opts = grasm_interp::testing::TestOptions {
+        coverage: args.iter().any(|a| a == "--coverage"),
+        filter: flag_value(args, "--filter").unwrap_or_default(),
+        ..Default::default()
+    };
+    if let Some(v) = flag_value(args, "--seed") {
+        opts.seed = v
+            .parse()
+            .map_err(|_| format!("--seed expects a number, got `{v}`"))?;
+    }
+    if let Some(v) = flag_value(args, "--cases") {
+        let n: u32 = v
+            .parse()
+            .map_err(|_| format!("--cases expects a number, got `{v}`"))?;
+        if n == 0 {
+            return Err("--cases must be at least 1".to_string());
+        }
+        opts.cases = n;
+    }
+    Ok(opts)
+}
+
+fn print_coverage(cov: &grasm_interp::testing::Coverage) {
+    println!();
+    println!("coverage: {:.1}% of statement lines", cov.percent());
+    for (file, lines) in cov.misses() {
+        println!(
+            "  {file}: {} uncovered — {}",
+            lines.len(),
+            grasm_interp::testing::format_ranges(&lines)
+        );
+    }
+}
+
+/// Human-readable ns/op: picks the unit that keeps 3-4 significant digits.
+fn format_duration(ns: f64) -> String {
+    if ns < 1_000.0 {
+        format!("{ns:.1} ns/op")
+    } else if ns < 1_000_000.0 {
+        format!("{:.2} µs/op", ns / 1_000.0)
+    } else {
+        format!("{:.2} ms/op", ns / 1_000_000.0)
     }
 }
 

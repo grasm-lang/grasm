@@ -659,3 +659,60 @@ fn is_empty_works_on_every_container() {
         "no method",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Property tests and benchmarks
+// ---------------------------------------------------------------------------
+
+#[test]
+fn property_parameters_are_bound_in_the_body() {
+    check_ok("test \"p\" (n: i64, s: str) {\n    assert(n == n)\n    assert(s.len() >= 0)\n}\n");
+    check_err(
+        "test \"p\" (n: i64) {\n    assert(m == 0)\n}\n",
+        "unknown",
+    );
+}
+
+#[test]
+fn property_parameters_must_be_generatable() {
+    check_ok("test \"p\" (a: i64, b: f64, c: bool, d: str, e: [i64], f: Option[str]) {\n    assert(true)\n}\n");
+    check_err(
+        "type Point = { x: i64, y: i64 }\n\ntest \"p\" (p: Point) {\n    assert(true)\n}\n",
+        "cannot generate values of type",
+    );
+}
+
+#[test]
+fn a_property_parameter_cannot_be_inout_or_own() {
+    check_err(
+        "test \"p\" (inout n: i64) {\n    assert(true)\n}\n",
+        "supplied by the runner",
+    );
+}
+
+#[test]
+fn property_parameters_are_immutable() {
+    // The runner owns the value; reassigning it would silently discard the
+    // input the failure will be reported with.
+    check_err(
+        "test \"p\" (n: i64) {\n    n = 1\n}\n",
+        "immutable",
+    );
+}
+
+#[test]
+fn bench_bodies_are_typechecked() {
+    check_ok("bench \"b\" {\n    let x = 1 + 1\n    assert(x == 2)\n}\n");
+    check_err(
+        "bench \"b\" {\n    let x: i64 = \"text\"\n    assert(x == 2)\n}\n",
+        "type mismatch",
+    );
+}
+
+#[test]
+fn bench_bodies_carry_effects_like_tests() {
+    check_err(
+        "effect Clock {\n    fn now() -> i64\n}\n\nbench \"b\" {\n    let t = Clock.now()\n    assert(t >= 0)\n}\n",
+        "unhandled effect",
+    );
+}

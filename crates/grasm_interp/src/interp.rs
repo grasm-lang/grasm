@@ -36,7 +36,10 @@ pub struct Interp<'a, W: Write> {
     sums: HashMap<String, Vec<(String, usize)>>,
     /// variant name → (owning type, arity); only unambiguous entries.
     variants: HashMap<String, Option<(String, usize)>>,
-    scopes: Vec<HashMap<String, Value>>,
+    /// Span offsets of statements that executed, when coverage is on.
+    /// `None` keeps the hot path free of the bookkeeping entirely.
+    pub(crate) coverage: Option<std::collections::BTreeSet<u32>>,
+    pub(crate) scopes: Vec<HashMap<String, Value>>,
     /// Declared effect names (for op-call dispatch).
     effect_names: std::collections::HashSet<String>,
     /// Innermost-last handler stack: (effect name, op name → closure).
@@ -145,6 +148,7 @@ impl<'a, W: Write> Interp<'a, W> {
             imports: HashMap::new(),
             sums,
             variants,
+            coverage: None,
             scopes: Vec::new(),
             effect_names,
             handlers: Vec::new(),
@@ -323,7 +327,7 @@ impl<'a, W: Write> Interp<'a, W> {
     // Blocks & statements
     // ------------------------------------------------------------------
 
-    fn eval_block(&mut self, b: &Block) -> EResult {
+    pub(crate) fn eval_block(&mut self, b: &Block) -> EResult {
         self.scopes.push(HashMap::new());
         let mut last = Value::Unit;
         for (i, stmt) in b.stmts.iter().enumerate() {
@@ -342,6 +346,9 @@ impl<'a, W: Write> Interp<'a, W> {
     }
 
     fn eval_stmt(&mut self, s: &Stmt) -> EResult {
+        if let Some(seen) = &mut self.coverage {
+            seen.insert(crate::testing::stmt_start(s));
+        }
         match s {
             Stmt::Let {
                 name, ty, init, ..

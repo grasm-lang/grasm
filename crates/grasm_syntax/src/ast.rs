@@ -40,6 +40,7 @@ pub enum Decl {
     Type(TypeDecl),
     Effect(EffectDecl),
     Test(TestDecl),
+    Bench(BenchDecl),
     Import(ImportDecl),
 }
 
@@ -126,9 +127,22 @@ pub struct FnSig {
     pub span: Span,
 }
 
-/// `test "name" { ... }`
+/// `test "name" { ... }`, or `test "name" (x: i64) { ... }` — a *property*
+/// test, whose parameters are filled with generated values and whose body must
+/// hold for all of them. One declaration form covers unit, property, and fuzz
+/// testing; the parameter list is the only difference.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TestDecl {
+    pub name: String,
+    /// Empty for a unit test; non-empty makes it a property test.
+    pub params: Vec<Param>,
+    pub body: Block,
+    pub span: Span,
+}
+
+/// `bench "name" { ... }` — timed repeatedly, reported in ns/op.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BenchDecl {
     pub name: String,
     pub body: Block,
     pub span: Span,

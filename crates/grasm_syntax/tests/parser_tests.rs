@@ -566,3 +566,92 @@ fn parallel_and_spawn_are_contextual_keywords() {
     );
     assert!(matches!(&m.decls[0], Decl::Fn(f) if f.name.name == "spawn"));
 }
+
+// ---------------------------------------------------------------------------
+// Property tests and benchmarks
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_test_without_parameters_is_a_unit_test() {
+    let m = parse_ok("test \"plain\" {\n    assert(true)\n}\n");
+    let Decl::Test(t) = &m.decls[0] else {
+        panic!("expected a test declaration");
+    };
+    assert_eq!(t.name, "plain");
+    assert!(t.params.is_empty());
+}
+
+#[test]
+fn parameters_turn_a_test_into_a_property() {
+    let m = parse_ok("test \"prop\" (n: i64, xs: [str]) {\n    assert(true)\n}\n");
+    let Decl::Test(t) = &m.decls[0] else {
+        panic!("expected a test declaration");
+    };
+    assert_eq!(t.params.len(), 2);
+    assert_eq!(t.params[0].name.name, "n");
+    assert_eq!(t.params[1].name.name, "xs");
+}
+
+#[test]
+fn bench_declarations_parse() {
+    let m = parse_ok("bench \"hot loop\" {\n    let x = 1\n    assert(x == 1)\n}\n");
+    let Decl::Bench(b) = &m.decls[0] else {
+        panic!("expected a bench declaration");
+    };
+    assert_eq!(b.name, "hot loop");
+    assert_eq!(b.body.stmts.len(), 2);
+}
+
+#[test]
+fn bench_is_contextual_and_still_usable_as_a_name() {
+    // Only `bench "..."` at declaration position is the keyword; everywhere
+    // else `bench` is an ordinary identifier.
+    let m = parse_ok(
+        "fn bench(n: i64) -> i64 {\n    n\n}\n\nbench \"b\" {\n    let bench = 1\n    assert(bench == 1)\n}\n",
+    );
+    assert!(matches!(&m.decls[0], Decl::Fn(f) if f.name.name == "bench"));
+    assert!(matches!(&m.decls[1], Decl::Bench(_)));
+}
+
+#[test]
+fn a_bench_without_a_name_is_an_error() {
+    // `bench` alone is an identifier, so this fails as a bad declaration
+    // rather than silently parsing as something else.
+    let (_, diags) = parse_err("bench {\n}\n");
+    assert!(
+        diags[0].message.contains("expected a declaration"),
+        "got: {}",
+        diags[0].message
+    );
+}
+
+#[test]
+fn declaration_recovery_always_makes_progress() {
+    // Every one of these fails at declaration position. If recovery ever
+    // stops consuming tokens the parser spins forever, so this test is a
+    // liveness check as much as a diagnostics check.
+    for src in [
+        "bench {\n}\n",
+        "bench\n",
+        "bench bench\n",
+        "42\n",
+        "let x = 1\n",
+        "]\n",
+        "bench {\n}\nfn main() {\n}\n",
+    ] {
+        let out = grasm_syntax::parse(src);
+        assert!(
+            !out.diagnostics.is_empty(),
+            "expected diagnostics for: {src:?}"
+        );
+    }
+    // Recovery still finds the declaration after the bad one.
+    let out = grasm_syntax::parse("bench {\n}\n\nfn after() {\n}\n");
+    assert!(
+        out.module
+            .decls
+            .iter()
+            .any(|d| matches!(d, Decl::Fn(f) if f.name.name == "after")),
+        "recovery should resume at the next declaration"
+    );
+}
