@@ -1,0 +1,108 @@
+// Documentation that cannot rot.
+//
+//   grasm doc  examples/documented.gr        # render the API as Markdown
+//   grasm test examples/documented.gr        # run the examples in the docs
+//
+// Signatures in the rendered output come from the AST, so an effect row or
+// error type cannot drift from the declaration. The fenced blocks inside
+// `///` comments are executed by `grasm test`, so an example that stops being
+// true fails the suite instead of quietly misleading the next reader.
+
+/// A closed interval on the number line.
+///
+/// Both ends are inclusive, so an interval always holds at least one value.
+type Span = { low: i64, high: i64 }
+
+/// Whether `n` falls inside the span.
+///
+/// ```
+/// let s = Span{ low: 1, high: 5 }
+/// assert(contains(s, 1))
+/// assert(contains(s, 5))
+/// assert(not contains(s, 6))
+/// ```
+fn contains(s: Span, n: i64) -> bool {
+    n >= s.low and n <= s.high
+}
+
+/// The number of values the span covers.
+///
+/// ```
+/// assert(width(Span{ low: 3, high: 3 }) == 1)
+/// assert(width(Span{ low: 0, high: 9 }) == 10)
+/// ```
+fn width(s: Span) -> i64 {
+    s.high - s.low + 1
+}
+
+/// The overlap of two spans, or `None` when they are disjoint.
+///
+/// ```
+/// # let a = Span{ low: 0, high: 10 }
+/// # let b = Span{ low: 5, high: 20 }
+/// let both = overlap(a, b) ?? Span{ low: 0, high: 0 }
+/// assert(both.low == 5 and both.high == 10)
+/// assert(overlap(a, Span{ low: 50, high: 60 }).is_none())
+/// ```
+fn overlap(a: Span, b: Span) -> Option[Span] {
+    let low = if a.low > b.low { a.low } else { b.low }
+    let high = if a.high < b.high { a.high } else { b.high }
+    if low > high {
+        None
+    } else {
+        Some(Span{ low: low, high: high })
+    }
+}
+
+/// Parses `"lo..hi"`, reporting the malformed input rather than panicking.
+///
+/// ```
+/// let s = try parse("2..7")
+/// assert(s.low == 2 and s.high == 7)
+/// ```
+///
+/// A second block documents the failure path:
+///
+/// ```
+/// match parse("nonsense") {
+///     Ok(_) -> assert(false)
+///     Err(e) -> assert(e.contains("expected"))
+/// }
+/// ```
+fn parse(text: str) -> Span ! str {
+    let parts = text.split("..")
+    if parts.len() != 2 {
+        fail("expected `lo..hi`, got `{text}`")
+    }
+    match parts[0].parse_int() {
+        None -> fail("expected a number, got `{parts[0]}`")
+        Some(low) -> match parts[1].parse_int() {
+            None -> fail("expected a number, got `{parts[1]}`")
+            Some(high) -> Span{ low: low, high: high }
+        }
+    }
+}
+
+test "parse round-trips through contains" {
+    let s = try parse("10..20")
+    assert(contains(s, 15))
+    assert(width(s) == 11)
+}
+
+test "overlap is commutative" (a: i64, b: i64) {
+    let x = Span{ low: a, high: a + 5 }
+    let y = Span{ low: b, high: b + 5 }
+    let l = overlap(x, y).is_some()
+    let r = overlap(y, x).is_some()
+    assert(l == r)
+}
+
+fn main() {
+    let a = Span{ low: 0, high: 10 }
+    let b = Span{ low: 5, high: 20 }
+    print("{width(a)} {contains(a, 3)}")
+    match overlap(a, b) {
+        Some(s) -> print("overlap {s.low}..{s.high}")
+        None -> print("disjoint")
+    }
+}

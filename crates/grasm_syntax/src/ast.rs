@@ -32,6 +32,29 @@ impl Path {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Module {
     pub decls: Vec<Decl>,
+    /// `///` blocks keyed by the span start of the declaration they precede.
+    /// Kept beside the tree rather than on every node so adding documentation
+    /// never changes how anything compiles.
+    pub docs: std::collections::BTreeMap<u32, String>,
+}
+
+impl Module {
+    /// Documentation attached to a declaration, if any.
+    pub fn doc_for(&self, decl: &Decl) -> Option<&str> {
+        self.docs.get(&decl_span(decl).start).map(String::as_str)
+    }
+}
+
+/// Where a declaration begins — the key documentation is filed under.
+pub fn decl_span(d: &Decl) -> Span {
+    match d {
+        Decl::Fn(f) => f.span,
+        Decl::Type(t) => t.span,
+        Decl::Effect(e) => e.span,
+        Decl::Test(t) => t.span,
+        Decl::Bench(b) => b.span,
+        Decl::Import(i) => i.span,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -17,19 +17,61 @@ pub struct ParseOutput {
 }
 
 pub fn parse(src: &str) -> ParseOutput {
-    let tokens = lex(src);
+    let (tokens, docs) = crate::lexer::lex_with_docs(src);
     let mut p = Parser::new(tokens);
-    let module = p.parse_module();
+    let mut module = p.parse_module();
+    attach_docs(&mut module, src, 0, &docs);
     ParseOutput {
         module,
         diagnostics: p.diags,
     }
 }
 
+/// Files each run of consecutive `///` lines under the declaration that
+/// follows it. A run not followed by a declaration is dropped, so a trailing
+/// comment at the end of a file is never silently attached to something.
+fn attach_docs(module: &mut Module, src: &str, offset: u32, docs: &[(Span, String)]) {
+    if docs.is_empty() {
+        return;
+    }
+    let mut starts: Vec<u32> = module.decls.iter().map(|d| decl_span(d).start).collect();
+    starts.sort_unstable();
+
+    // Two doc lines belong to the same block when only whitespace separates
+    // them — a blank line or any code in between starts a new block.
+    let adjacent = |prev_end: u32, next_start: u32| -> bool {
+        let (a, b) = ((prev_end - offset) as usize, (next_start - offset) as usize);
+        let between = src.get(a..b).unwrap_or("");
+        between.chars().all(char::is_whitespace)
+            && between.chars().filter(|c| *c == '\n').count() == 1
+    };
+
+    let mut i = 0;
+    while i < docs.len() {
+        let mut j = i + 1;
+        while j < docs.len() && adjacent(docs[j - 1].0.end, docs[j].0.start) {
+            j += 1;
+        }
+        let end = docs[j - 1].0.end;
+        if let Some(start) = starts.iter().copied().find(|s| *s >= end) {
+            let text = docs[i..j]
+                .iter()
+                .map(|(_, t)| t.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            module.docs.insert(start, text);
+        }
+        i = j;
+    }
+}
+
 /// Parse a whole file with all spans shifted by `offset` — modules live in
 /// one virtual span space so diagnostics stay a single flat list.
 pub fn parse_with_offset(src: &str, offset: u32) -> ParseOutput {
-    let mut tokens = lex(src);
+    let (mut tokens, mut docs) = crate::lexer::lex_with_docs(src);
+    for d in &mut docs {
+        d.0 = Span::new(d.0.start + offset, d.0.end + offset);
+    }
     for t in &mut tokens {
         t.span = Span::new(t.span.start + offset, t.span.end + offset);
     }
@@ -45,7 +87,8 @@ pub fn parse_with_offset(src: &str, offset: u32) -> ParseOutput {
         }
     }
     let mut p = Parser::new(tokens);
-    let module = p.parse_module();
+    let mut module = p.parse_module();
+    attach_docs(&mut module, src, offset, &docs);
     ParseOutput {
         module,
         diagnostics: p.diags,

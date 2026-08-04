@@ -655,3 +655,62 @@ fn declaration_recovery_always_makes_progress() {
         "recovery should resume at the next declaration"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Documentation comments
+// ---------------------------------------------------------------------------
+
+#[test]
+fn doc_comments_attach_to_the_following_declaration() {
+    let m = parse_ok(
+        "/// Adds two numbers.\n/// Wraps on overflow.\nfn add(a: i64, b: i64) -> i64 {\n    a + b\n}\n",
+    );
+    assert_eq!(
+        m.doc_for(&m.decls[0]),
+        Some("Adds two numbers.\nWraps on overflow.")
+    );
+}
+
+#[test]
+fn a_blank_line_ends_a_doc_block() {
+    // The first block documents nothing that follows it directly, so only the
+    // adjacent block reaches the declaration.
+    let m = parse_ok("/// Stray note.\n\n/// The real doc.\nfn f() {\n}\n");
+    assert_eq!(m.doc_for(&m.decls[0]), Some("The real doc."));
+}
+
+#[test]
+fn plain_comments_are_not_documentation() {
+    let m = parse_ok("// Just a comment.\n//// Also just a comment.\nfn f() {\n}\n");
+    assert_eq!(m.doc_for(&m.decls[0]), None);
+}
+
+#[test]
+fn doc_comments_work_on_every_declaration_kind() {
+    let m = parse_ok(
+        "/// A type.\ntype T = { x: i64 }\n\n/// An effect.\neffect E {\n    fn op() -> i64\n}\n\n/// A test.\ntest \"t\" {\n    assert(true)\n}\n\n/// A benchmark.\nbench \"b\" {\n    assert(true)\n}\n",
+    );
+    let docs: Vec<Option<&str>> = m.decls.iter().map(|d| m.doc_for(d)).collect();
+    assert_eq!(
+        docs,
+        vec![
+            Some("A type."),
+            Some("An effect."),
+            Some("A test."),
+            Some("A benchmark."),
+        ]
+    );
+}
+
+#[test]
+fn a_trailing_doc_comment_is_dropped_not_misattached() {
+    let m = parse_ok("fn f() {\n}\n\n/// Documents nothing.\n");
+    assert_eq!(m.doc_for(&m.decls[0]), None);
+}
+
+#[test]
+fn slashes_inside_a_string_are_not_documentation() {
+    let m = parse_ok("fn f() -> str {\n    \"/// not a doc\"\n}\n");
+    assert_eq!(m.doc_for(&m.decls[0]), None);
+    assert!(m.docs.is_empty());
+}

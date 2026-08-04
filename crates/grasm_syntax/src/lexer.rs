@@ -8,9 +8,17 @@ pub struct Lexer<'a> {
     src: &'a str,
     bytes: &'a [u8],
     pos: usize,
+    /// `///` lines, in source order: (span of the line, text after the slashes).
+    docs: Vec<(Span, String)>,
 }
 
 pub fn lex(src: &str) -> Vec<Token> {
+    Lexer::new(src).run().0
+}
+
+/// Tokens plus the `///` documentation lines, which the parser attaches to
+/// whichever declaration follows them.
+pub fn lex_with_docs(src: &str) -> (Vec<Token>, Vec<(Span, String)>) {
     Lexer::new(src).run()
 }
 
@@ -20,10 +28,11 @@ impl<'a> Lexer<'a> {
             src,
             bytes: src.as_bytes(),
             pos: 0,
+            docs: Vec::new(),
         }
     }
 
-    fn run(mut self) -> Vec<Token> {
+    fn run(mut self) -> (Vec<Token>, Vec<(Span, String)>) {
         let mut out = Vec::new();
         loop {
             let tok = self.next_token();
@@ -42,7 +51,7 @@ impl<'a> Lexer<'a> {
                 break;
             }
         }
-        out
+        (out, self.docs)
     }
 
     fn peek(&self) -> u8 {
@@ -102,8 +111,21 @@ impl<'a> Lexer<'a> {
                     self.bump();
                 }
                 b'/' if self.peek2() == b'/' => {
+                    let start = self.pos;
+                    // `///` is documentation; `//` and `////` are ordinary
+                    // comments, matching the usual convention.
+                    let is_doc = *self.bytes.get(self.pos + 2).unwrap_or(&0) == b'/'
+                        && *self.bytes.get(self.pos + 3).unwrap_or(&0) != b'/';
                     while self.pos < self.bytes.len() && self.peek() != b'\n' {
                         self.bump();
+                    }
+                    if is_doc {
+                        let text = self.src[start + 3..self.pos]
+                            .strip_prefix(' ')
+                            .unwrap_or(&self.src[start + 3..self.pos])
+                            .to_string();
+                        self.docs
+                            .push((Span::new(start as u32, self.pos as u32), text));
                     }
                 }
                 b'/' if self.peek2() == b'*' => {

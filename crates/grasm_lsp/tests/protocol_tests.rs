@@ -299,3 +299,31 @@ fn requests_for_unknown_documents_are_safe() {
     )]);
     assert_eq!(out[0].get("result"), Some(&Json::Null));
 }
+
+#[test]
+fn hover_includes_the_doc_comment() {
+    let src = "/// Adds two integers.\n/// Wraps on overflow.\nfn add(a: i64, b: i64) -> i64 {\n    a + b\n}\n";
+    let out = run(&[
+        &open_doc("file:///d.gr", src),
+        // "add" on line 2 (0-based), column 3.
+        &request(2, "textDocument/hover", position_params("file:///d.gr", 2, 4)),
+    ]);
+    let hover = out.iter().find(|m| m.get("id").is_some()).unwrap();
+    let text = hover.path("result.contents.value").unwrap().as_str().unwrap();
+    assert!(text.contains("fn add(a: i64, b: i64) -> i64"), "got: {text}");
+    assert!(text.contains("Adds two integers."), "got: {text}");
+    assert!(text.contains("Wraps on overflow."), "got: {text}");
+}
+
+#[test]
+fn hover_without_a_doc_comment_shows_only_the_signature() {
+    let src = "fn add(a: i64, b: i64) -> i64 {\n    a + b\n}\n";
+    let out = run(&[
+        &open_doc("file:///nd.gr", src),
+        &request(2, "textDocument/hover", position_params("file:///nd.gr", 0, 4)),
+    ]);
+    let hover = out.iter().find(|m| m.get("id").is_some()).unwrap();
+    let text = hover.path("result.contents.value").unwrap().as_str().unwrap();
+    assert!(text.contains("fn add"), "got: {text}");
+    assert!(!text.contains("---"), "no separator without a doc: {text}");
+}

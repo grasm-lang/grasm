@@ -366,3 +366,99 @@ fn conformance_file_names_match_their_tags() {
         mismatched.join("\n  ")
     );
 }
+
+/// Fenced code blocks in `docs/tutorial.md` that look like whole programs.
+///
+/// A tutorial whose code no longer compiles is worse than no tutorial, and
+/// prose is exactly where drift hides, so the suite compiles it.
+fn tutorial_programs() -> Vec<(usize, String)> {
+    let path = spec_dir().parent().unwrap().join("docs/tutorial.md");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{} should be readable: {e}", path.display()));
+
+    let mut out = Vec::new();
+    // (start line, fence width, lines, is_grasm). Width matters: a ```` block
+    // wraps an example that itself contains ``` fences, and only a fence at
+    // least as wide as the opener closes it.
+    let mut current: Option<(usize, usize, Vec<String>, bool)> = None;
+    for (i, line) in text.lines().enumerate() {
+        let width = line.chars().take_while(|c| *c == '`').count();
+        let is_fence = width >= 3;
+        match (&mut current, is_fence) {
+            (Some((start, open_width, lines, is_grasm)), true) if width >= *open_width => {
+                if *is_grasm {
+                    out.push((*start, lines.join("\n")));
+                }
+                current = None;
+            }
+            (None, true) => {
+                let info = line[width..].trim();
+                current = Some((
+                    i + 2,
+                    width,
+                    Vec::new(),
+                    info.is_empty() || info == "grasm",
+                ));
+            }
+            (Some((_, _, lines, _)), _) => lines.push(line.to_string()),
+            (None, false) => {}
+        }
+    }
+    // Blocks with `import` need sibling files a single-source run cannot
+    // provide, and a TOML manifest is not Grasm at all. Everything else with a
+    // declaration in it should compile; a block of only `test`/`bench` gets an
+    // empty `main` so it is a complete program.
+    out.retain(|(_, src)| !src.contains("import ") && !src.contains("[package]"));
+    out.retain(|(_, src)| {
+        src.contains("fn ") || src.contains("test \"") || src.contains("bench \"")
+    });
+    for (_, src) in &mut out {
+        if !src.contains("fn main(") {
+            src.push_str("\n\nfn main() {\n}\n");
+        }
+    }
+    out
+}
+
+#[test]
+fn every_tutorial_program_compiles_and_runs() {
+    let programs = tutorial_programs();
+    assert!(
+        programs.len() >= 12,
+        "expected the tutorial to contain runnable programs, found {}",
+        programs.len()
+    );
+
+    let mut failures = Vec::new();
+    for (line, src) in programs {
+        // A block declaring tests is checked through the test runner so its
+        // `test` declarations are actually executed, not merely parsed.
+        if src.contains("test \"") || src.contains("bench \"") {
+            let (_, failed, _, diags) = run_test_suite(&src);
+            if !diags.is_empty() {
+                failures.push(format!(
+                    "docs/tutorial.md:{line}: does not compile: {diags:?}\n{src}"
+                ));
+            } else if failed > 0 {
+                failures.push(format!("docs/tutorial.md:{line}: {failed} test(s) failed\n{src}"));
+            }
+            continue;
+        }
+        let (code, _stdout, diags) = run_program(&src);
+        if !diags.is_empty() {
+            failures.push(format!(
+                "docs/tutorial.md:{line}: does not compile: {diags:?}\n{src}"
+            ));
+            continue;
+        }
+        if code != 0 {
+            failures.push(format!("docs/tutorial.md:{line}: exited {code}\n{src}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} tutorial program(s) are broken:\n\n{}",
+        failures.len(),
+        failures.join("\n\n")
+    );
+}

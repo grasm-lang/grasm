@@ -246,22 +246,33 @@ impl Server {
         let Some(word) = word_at(&doc.text, off) else {
             return Json::Null;
         };
+        // A declaration's `///` block, shown under its signature on hover.
+        let with_doc = |decl: &Decl, signature: String| -> Json {
+            match module.doc_for(decl) {
+                Some(d) => hover_markdown(&format!("{signature}\n\n---\n\n{d}")),
+                None => hover_markdown(&signature),
+            }
+        };
+
         // Look for a declaration with this name and render its signature.
         for decl in &module.decls {
             match decl {
                 Decl::Fn(f) if f.name.name == word => {
-                    return hover_markdown(&render_fn_signature(f));
+                    return with_doc(decl, render_fn_signature(f));
                 }
                 Decl::Type(t) if t.name.name == word => {
-                    return hover_markdown(&render_type_decl(t));
+                    return with_doc(decl, render_type_decl(t));
                 }
                 Decl::Effect(e) if e.name.name == word => {
-                    return hover_markdown(&format!(
-                        "effect {} ({} operation{})",
-                        e.name.name,
-                        e.ops.len(),
-                        if e.ops.len() == 1 { "" } else { "s" }
-                    ));
+                    return with_doc(
+                        decl,
+                        format!(
+                            "effect {} ({} operation{})",
+                            e.name.name,
+                            e.ops.len(),
+                            if e.ops.len() == 1 { "" } else { "s" }
+                        ),
+                    );
                 }
                 Decl::Type(t) => {
                     // Variant of a sum type?

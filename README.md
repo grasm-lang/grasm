@@ -71,6 +71,31 @@ that found it, so `--seed N --cases N` replays it exactly. `bench "name"
 { ... }` bodies are warmed up, then sampled and reported in ns/op.
 See `examples/testing_tour.gr`.
 
+### Documentation
+
+`///` comments document the declaration that follows. `grasm doc` renders them
+as Markdown with signatures taken from the AST, so a documented effect row or
+error type cannot drift from the real one.
+
+````
+/// Adds two integers.
+///
+/// ```
+/// assert(add(2, 3) == 5)
+/// ```
+fn add(a: i64, b: i64) -> i64 {
+    a + b
+}
+````
+
+The fenced block is **executable** — `grasm test` runs it in a program that
+keeps the real module structure, so an example may write `mathlib.square(4)`
+exactly as a consumer would. Documentation that stops being true fails the
+suite. Lines beginning `# ` are hidden setup: they run but are not shown.
+
+`docs/tutorial.md` is a guided tour whose code blocks are compiled and run by
+the test suite. See `examples/documented.gr`.
+
 ### Native compilation
 
 `grasm build <file.gr> --native` compiles to machine code through Cranelift and

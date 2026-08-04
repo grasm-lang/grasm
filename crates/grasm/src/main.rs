@@ -109,6 +109,40 @@ fn main() -> ExitCode {
                 ExitCode::SUCCESS
             }
         }
+        Some("doc") => {
+            let Some(path) = args.get(1).filter(|a| !a.starts_with("--")) else {
+                eprintln!("usage: grasm doc <file.gr> [-o out.md]");
+                return ExitCode::FAILURE;
+            };
+            let path = path.clone();
+            let program = match load_and_check(&path) {
+                Ok(p) => p,
+                Err(code) => return code,
+            };
+            let modules = grasm_sema::docs::collect(&program);
+            let title = std::path::Path::new(&path)
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "API".to_string());
+            let text = grasm_sema::docs::render_markdown(&title, &modules);
+            match flag_value(&args[2..], "-o") {
+                Some(out) => match std::fs::write(&out, &text) {
+                    Ok(()) => {
+                        let items: usize = modules.iter().map(|m| m.items.len()).sum();
+                        println!("wrote {out} ({items} item(s))");
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("error: cannot write {out}: {e}");
+                        ExitCode::FAILURE
+                    }
+                },
+                None => {
+                    print!("{text}");
+                    ExitCode::SUCCESS
+                }
+            }
+        }
         Some("check") => {
             let Some(path) = args.get(1) else {
                 eprintln!("usage: grasm check <file.gr>");
@@ -299,6 +333,7 @@ fn main() -> ExitCode {
             eprintln!("  build <file.gr> [-o out]     self-contained executable");
             eprintln!("      --native                 compile to machine code (Cranelift)");
             eprintln!("      --target <triple>        emit a cross-target object file");
+            eprintln!("  doc <file.gr> [-o out.md]    API documentation from `///` comments");
             eprintln!("  fmt <file.gr> [--check]      canonical formatting");
             eprintln!("  lsp                          language server (stdio)");
             eprintln!("  deps [dir]                   resolve dependencies, check capabilities, write grasm.lock");

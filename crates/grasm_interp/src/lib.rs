@@ -127,11 +127,80 @@ pub fn test_program_with(
     let coverage = interp
         .take_coverage()
         .map(|hits| build_coverage(program, &hits));
+
+    // Examples in `///` comments are tests. Documentation that stops being
+    // true should fail the suite, not quietly mislead the next reader.
+    let (doc_passed, doc_failed) = run_doc_examples(program, &opts.filter, out);
     testing::TestSummary {
-        passed,
-        failed,
+        passed: passed + doc_passed,
+        failed: failed + doc_failed,
         coverage,
     }
+}
+
+/// Runs every fenced example found in the program's doc comments.
+///
+/// Each example is compiled as its own program with the module's declarations
+/// in scope, so it can call the thing it documents.
+fn run_doc_examples(
+    program: &grasm_sema::loader::Program,
+    filter: &str,
+    out: &mut impl Write,
+) -> (u32, u32) {
+    let mut passed = 0;
+    let mut failed = 0;
+    for example in grasm_sema::docs::examples(program) {
+        if !filter.is_empty() && !example.owner.contains(filter) {
+            continue;
+        }
+        let ex_program = grasm_sema::docs::example_program(program, &example);
+        let mut diags = ex_program.diagnostics.clone();
+        diags.extend(grasm_sema::check::check_program(&ex_program).diagnostics);
+        if !diags.is_empty() {
+            let _ = writeln!(
+                out,
+                "doc example {} ... FAILED to compile: {}",
+                example.owner, diags[0].message
+            );
+            failed += 1;
+            continue;
+        }
+        let entry = &ex_program.files[0].module;
+        let files: Vec<(String, &Module, std::collections::HashMap<String, String>)> = ex_program
+            .files
+            .iter()
+            .map(|f| (f.name.clone(), &f.module, f.imports.clone()))
+            .collect();
+        let mut buf = Vec::new();
+        let ok = {
+            let mut interp = Interp::new_program(&files, &mut buf);
+            let Some(grasm_syntax::ast::Decl::Test(t)) = entry
+                .decls
+                .iter()
+                .find(|d| matches!(d, grasm_syntax::ast::Decl::Test(_)))
+            else {
+                // example_program always appends one, so this cannot happen.
+                let _ = writeln!(out, "doc example {} ... FAILED: no test", example.owner);
+                failed += 1;
+                continue;
+            };
+            interp.run_unit_test(t)
+        };
+        // The example's own report names it as a test; relabel so a reader can
+        // tell a doc example from a declared one.
+        let report = String::from_utf8_lossy(&buf);
+        let detail = report
+            .split_once("... ")
+            .map(|(_, rest)| rest.trim_end().to_string())
+            .unwrap_or_default();
+        let _ = writeln!(out, "doc example {} ... {detail}", example.owner);
+        if ok {
+            passed += 1;
+        } else {
+            failed += 1;
+        }
+    }
+    (passed, failed)
 }
 
 /// Maps executed span offsets back to (file, line), against every line that
