@@ -57,12 +57,31 @@ tuples, structs, sum types, `match` (guards + nested patterns), `Option`,
 `T ! E` fallibles with `try`/`fail`, effects with handlers, `inout`/`own`
 params, `map`/`filter` (lowered as inline loops), and multi-module programs.
 
+**Targets.** `--target <triple>` emits an object for any supported
+architecture — verified for `x86_64` (Linux + macOS), `aarch64` (Linux +
+macOS), `riscv64gc`, and big-endian `s390x`. Host builds link automatically;
+cross builds emit the object for you to link with that target's toolchain and
+a `libgrasm_rt.a` built for it:
+
+```
+rustup target add x86_64-apple-darwin
+cargo build --release -p grasm_rt --target x86_64-apple-darwin
+grasm build app.gr --native --target x86_64-apple-darwin -o app
+cc -arch x86_64 app.o target/x86_64-apple-darwin/release/libgrasm_rt.a -o app
+```
+
 `scripts/difftest.sh` is the correctness gate: every program in `examples/` and
 `projects/` is run through both backends and the outputs must match byte for
 byte. Current status — **16 identical, 0 mismatched, 1 unsupported** (the router
 project needs first-class function values). Anything the backend can't compile
 names the missing feature and points at the interpreter; it never silently
 miscompiles.
+
+`scripts/crosstest.sh` runs the same gate against a *cross-compiled* target to
+prove the backend isn't accidentally host-specific — currently **16 identical,
+0 mismatched** for x86_64 built on arm64. CI (`.github/workflows/ci.yml`) runs
+build + tests + clippy + the differential gate on linux-x86_64, macos-arm64,
+and macos-x86_64, plus object emission for all five architectures.
 
 Measured on this machine (user CPU time, release builds):
 
@@ -109,6 +128,7 @@ Grasm-Core (the master plan's §19 kernel language), Phase-2 features (modules,
 maps, self-contained builds), and the **Cranelift native backend** are complete
 and validated: 175 Rust tests + 40+ in-language test blocks across 17 programs,
 an adversarial fuzz/stress suite, a native-vs-interpreter differential gate, and
-zero clippy warnings. The interpreter remains the reference semantics; the
-native backend is checked against it on every program. Next milestones (see
-MASTERPLAN §13): LSP, package manager, first-class function values.
+zero clippy warnings, and a 3-platform CI matrix. The interpreter remains the
+reference semantics; the native backend is checked against it on every program,
+on both the host and a cross-compiled target. Next milestones (see MASTERPLAN
+§13): LSP, concurrency runtime, package manager, first-class function values.

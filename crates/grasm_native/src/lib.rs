@@ -105,12 +105,36 @@ pub fn compile_object(
     program: &grasm_sema::loader::Program,
     obj_out: &std::path::Path,
 ) -> Result<(), String> {
+    compile_object_for(program, obj_out, None)
+}
+
+/// Compiles to an object file for `target` (a triple such as
+/// `x86_64-unknown-linux-gnu`), or for the host when `None`.
+///
+/// Note: emitting a cross-target object works anywhere; *linking* it still
+/// needs a cross-linker and a `libgrasm_rt.a` built for that target.
+pub fn compile_object_for(
+    program: &grasm_sema::loader::Program,
+    obj_out: &std::path::Path,
+    target: Option<&str>,
+) -> Result<(), String> {
 
     let mut flags = settings::builder();
     flags.set("is_pic", "true").map_err(|e| e.to_string())?;
     flags.set("opt_level", "speed").map_err(|e| e.to_string())?;
-    let isa = cranelift_native::builder()
-        .map_err(|e| e.to_string())?
+    let isa_builder = match target {
+        Some(name) => {
+            // Parse first: `lookup_by_name` panics on a malformed triple, so a
+            // user typo must never reach it.
+            let parsed: target_lexicon::Triple = name
+                .parse()
+                .map_err(|e| format!("unsupported target `{name}`: {e}"))?;
+            cranelift_codegen::isa::lookup(parsed)
+                .map_err(|e| format!("unsupported target `{name}`: {e}"))?
+        }
+        None => cranelift_native::builder().map_err(|e| e.to_string())?,
+    };
+    let isa = isa_builder
         .finish(settings::Flags::new(flags))
         .map_err(|e| e.to_string())?;
     let builder = ObjectBuilder::new(isa, "grasm", cranelift_module::default_libcall_names())

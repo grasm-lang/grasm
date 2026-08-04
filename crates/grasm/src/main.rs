@@ -91,6 +91,30 @@ fn main() -> ExitCode {
                 Err(code) => return code,
             };
             if args.iter().any(|a| a == "--native") {
+                let target = args
+                    .iter()
+                    .position(|a| a == "--target")
+                    .and_then(|i| args.get(i + 1))
+                    .cloned();
+                if let Some(t) = &target {
+                    // Cross-target: emit the object only — linking needs a
+                    // cross-linker and a runtime built for that target.
+                    let obj = format!("{out_path}.o");
+                    return match grasm_native::compile_object_for(
+                        &program,
+                        std::path::Path::new(&obj),
+                        Some(t),
+                    ) {
+                        Ok(()) => {
+                            println!("emitted `{obj}` for {t} (link it with a {t} toolchain + libgrasm_rt.a)");
+                            ExitCode::SUCCESS
+                        }
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            ExitCode::FAILURE
+                        }
+                    };
+                }
                 return match build_native(&program, &out_path) {
                     Ok(size) => {
                         println!(
@@ -189,7 +213,9 @@ fn main() -> ExitCode {
             eprintln!("  run <file.gr> [-- args...]   check + execute main (follows imports)");
             eprintln!("  test <file.gr>               run test blocks");
             eprintln!("  check <file.gr>              parse + typecheck");
-            eprintln!("  build <file.gr> [-o out]     self-contained executable (--native: Cranelift AOT)");
+            eprintln!("  build <file.gr> [-o out]     self-contained executable");
+            eprintln!("      --native                 compile to machine code (Cranelift)");
+            eprintln!("      --target <triple>        emit a cross-target object file");
             eprintln!("  fmt <file.gr> [--check]      canonical formatting");
             eprintln!("  tokens <file.gr>             dump lexer output (debug)");
             eprintln!("  version                      print version");

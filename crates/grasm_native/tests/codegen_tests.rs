@@ -142,3 +142,49 @@ fn n5_fs_and_args_compile() {
     )
     .expect("should compile");
 }
+
+/// Cross-target object emission must work for every architecture we claim.
+/// (Linking needs a target toolchain; see scripts/crosstest.sh for that.)
+#[test]
+fn emits_objects_for_all_supported_targets() {
+    use std::collections::HashMap;
+    let src = "fn main() {\n    print(\"portable\")\n}\n";
+    let map: HashMap<String, String> = [("main".to_string(), src.to_string())].into();
+    let provider = move |name: &str| map.get(name).cloned();
+    let program = grasm_sema::loader::load_with("main", "t.gr", &provider);
+    assert!(grasm_sema::check::check_program(&program)
+        .diagnostics
+        .is_empty());
+
+    for target in [
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
+        "riscv64gc-unknown-linux-gnu",
+        "s390x-unknown-linux-gnu",
+        "x86_64-apple-darwin",
+    ] {
+        let tmp = std::env::temp_dir().join(format!(
+            "grasm_xtarget_{}_{}.o",
+            std::process::id(),
+            target
+        ));
+        let r = grasm_native::compile_object_for(&program, &tmp, Some(target));
+        assert!(r.is_ok(), "target {target} failed: {:?}", r.err());
+        let bytes = std::fs::read(&tmp).unwrap();
+        assert!(bytes.len() > 100, "{target} produced a tiny object");
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+#[test]
+fn unknown_target_is_reported_clearly() {
+    use std::collections::HashMap;
+    let map: HashMap<String, String> =
+        [("main".to_string(), "fn main() {\n}\n".to_string())].into();
+    let provider = move |name: &str| map.get(name).cloned();
+    let program = grasm_sema::loader::load_with("main", "t.gr", &provider);
+    let tmp = std::env::temp_dir().join("grasm_bad_target.o");
+    let e = grasm_native::compile_object_for(&program, &tmp, Some("banana-unknown-none"))
+        .expect_err("bogus target must fail");
+    assert!(e.contains("unsupported target"), "got: {e}");
+}
