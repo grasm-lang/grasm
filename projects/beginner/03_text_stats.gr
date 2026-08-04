@@ -1,0 +1,75 @@
+// Beginner project 3: text statistics tool.
+// Validates: string methods, pipelines, closures, sorting, files (io effect).
+
+type Stats = { lines: i64, words: i64, chars: i64, longest: str }
+
+fn analyze(text: str) -> Stats {
+    let lines = text.split("\n")
+    var words = 0
+    var longest = ""
+    for line in lines {
+        for w in line.split(" ").filter(|w| w.len() > 0) {
+            words += 1
+            if w.len() > longest.len() {
+                longest = w
+            }
+        }
+    }
+    Stats{
+        lines: lines.len()
+        words: words
+        chars: text.len()
+        longest: longest
+    }
+}
+
+fn word_frequencies(text: str) -> [str] {
+    // Unique words, most frequent first — no map type yet, so O(n^2) counting.
+    let words = text.to_lower().replace("\n", " ").split(" ").filter(|w| w.len() > 0)
+    var seen: [str] = []
+    var counts: [i64] = []
+    for w in words {
+        var i = 0
+        var found = false
+        while i < seen.len() {
+            if seen[i] == w {
+                counts[i] += 1
+                found = true
+                break
+            }
+            i += 1
+        }
+        if not found {
+            seen.push(w)
+            counts.push(1)
+        }
+    }
+    var out: [str] = []
+    var k = 0
+    while k < seen.len() {
+        out.push("{seen[k]}:{counts[k]}")
+        k += 1
+    }
+    out
+}
+
+fn main() ! IoError {
+    let sample = "the quick brown fox\njumps over the lazy dog\nthe fox runs"
+    let s = analyze(sample)
+    print("lines={s.lines} words={s.words} chars={s.chars} longest={s.longest}")
+    print(word_frequencies(sample).join(" "))
+}
+
+test "analyze counts" {
+    let s = analyze("one two\nthree")
+    assert_eq(s.lines, 2)
+    assert_eq(s.words, 3)
+    assert_eq(s.longest, "three")
+}
+
+test "frequencies" {
+    let f = word_frequencies("a b a c a b")
+    assert_eq(f[0], "a:3")
+    assert_eq(f[1], "b:2")
+    assert_eq(f[2], "c:1")
+}

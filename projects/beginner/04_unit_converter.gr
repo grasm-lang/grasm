@@ -1,0 +1,85 @@
+// Beginner project 4: unit converter CLI.
+// Validates: sum types, fallible parsing, match, args(), floats.
+
+type ConvError =
+    | UnknownUnit(unit: str)
+    | BadNumber(text: str)
+
+fn to_meters(value: f64, unit: str) -> f64 ! ConvError {
+    match unit {
+        "m" -> value
+        "km" -> value * 1000.0
+        "cm" -> value / 100.0
+        "mi" -> value * 1609.344
+        "ft" -> value * 0.3048
+        "in" -> value * 0.0254
+        _ -> fail(UnknownUnit(unit))
+    }
+}
+
+fn convert(value: f64, from_unit: str, to_unit: str) -> f64 ! ConvError {
+    let meters = try to_meters(value, from_unit)
+    let per_target = try to_meters(1.0, to_unit)
+    meters / per_target
+}
+
+fn parse_value(text: str) -> f64 ! ConvError {
+    match text.parse_float() {
+        Some(v) -> v
+        None -> fail(BadNumber(text))
+    }
+}
+
+fn run_conversion(input: [str]) -> str {
+    if input.len() != 3 {
+        return "usage: convert <value> <from> <to>   (units: m km cm mi ft in)"
+    }
+    let raw = input.get(0) ?? ""
+    let from_unit = input.get(1) ?? ""
+    let to_unit = input.get(2) ?? ""
+    match parse_value(raw) {
+        Err(BadNumber(t)) -> "not a number: {t}"
+        Err(e) -> "error: {e}"
+        Ok(v) -> {
+            match convert(v, from_unit, to_unit) {
+                Ok(result) -> "{v} {from_unit} = {result} {to_unit}"
+                Err(UnknownUnit(u)) -> "unknown unit: {u}"
+                Err(e) -> "error: {e}"
+            }
+        }
+    }
+}
+
+fn main() {
+    let a = args()
+    if a.len() == 3 {
+        print(run_conversion(a))
+    } else {
+        // Demo mode.
+        print(run_conversion(["5", "km", "mi"]))
+        print(run_conversion(["100", "ft", "m"]))
+        print(run_conversion(["1", "furlong", "m"]))
+        print(run_conversion(["abc", "m", "km"]))
+    }
+}
+
+test "known conversions" {
+    let r = try convert(1.0, "km", "m")
+    assert_eq(r, 1000.0)
+    let ft = try convert(1.0, "ft", "in")
+    assert(ft > 11.99 and ft < 12.01)
+}
+
+test "unknown unit fails" {
+    match convert(1.0, "parsec", "m") {
+        Ok(v) -> panic("should have failed")
+        Err(UnknownUnit(u)) -> assert_eq(u, "parsec")
+        Err(e) -> panic("wrong error")
+    }
+}
+
+test "cli wrapper" {
+    assert(run_conversion(["5", "km", "mi"]).starts_with("5"))
+    assert_eq(run_conversion(["abc", "m", "km"]), "not a number: abc")
+    assert(run_conversion([]).starts_with("usage"))
+}

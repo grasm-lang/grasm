@@ -1,0 +1,73 @@
+// Beginner project 2: todo list manager.
+// Validates: structs, mutation, list ops, Option, match on state.
+
+type Todo = { id: i64, title: str, done: bool }
+
+type TodoList = { items: [Todo], next_id: i64 }
+
+fn empty_list() -> TodoList {
+    TodoList{ items: [], next_id: 1 }
+}
+
+fn add(inout list: TodoList, title: str) -> i64 {
+    let id = list.next_id
+    list.items.push(Todo{ id: id, title: title, done: false })
+    list.next_id += 1
+    id
+}
+
+fn complete(inout list: TodoList, id: i64) -> bool {
+    var i = 0
+    while i < list.items.len() {
+        if list.items[i].id == id {
+            list.items[i].done = true
+            return true
+        }
+        i += 1
+    }
+    false
+}
+
+fn pending(list: TodoList) -> [Todo] {
+    list.items.filter(|t| not t.done)
+}
+
+fn render(list: TodoList) -> str {
+    var lines: [str] = []
+    for t in list.items {
+        let mark = if t.done { "x" } else { " " }
+        lines.push("[{mark}] #{t.id} {t.title}")
+    }
+    lines.join("\n")
+}
+
+fn main() {
+    var todos = empty_list()
+    let a = todos.add("design the language")
+    let b = todos.add("build the compiler")
+    let c = todos.add("write real programs")
+    todos.complete(a)
+    todos.complete(b)
+    print(render(todos))
+    print("pending: {pending(todos).len()}")
+}
+
+test "add and complete" {
+    var list = empty_list()
+    let id = list.add("task one")
+    assert_eq(id, 1)
+    assert_eq(list.items.len(), 1)
+    assert(list.complete(id))
+    assert(not list.complete(999))
+    assert_eq(pending(list).len(), 0)
+}
+
+test "pending filters done" {
+    var list = empty_list()
+    let x = list.add("a")
+    let y = list.add("b")
+    list.complete(x)
+    let p = pending(list)
+    assert_eq(p.len(), 1)
+    assert_eq(p[0].title, "b")
+}
