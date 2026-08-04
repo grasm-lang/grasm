@@ -5,6 +5,7 @@
 //! bundle magic and, if present, run it directly.
 
 use std::io::Write as _;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use grasm_sema::loader::{self, Program};
@@ -172,6 +173,19 @@ fn main() -> ExitCode {
                 ExitCode::SUCCESS
             }
         }
+        Some("deps") => {
+            let dir = args
+                .get(1)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."));
+            match cmd_deps(&dir) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Some("lsp") => {
             let stdin = std::io::stdin();
             let mut input = stdin.lock();
@@ -230,6 +244,7 @@ fn main() -> ExitCode {
             eprintln!("      --target <triple>        emit a cross-target object file");
             eprintln!("  fmt <file.gr> [--check]      canonical formatting");
             eprintln!("  lsp                          language server (stdio)");
+            eprintln!("  deps [dir]                   resolve dependencies, check capabilities, write grasm.lock");
             eprintln!("  tokens <file.gr>             dump lexer output (debug)");
             eprintln!("  version                      print version");
             ExitCode::FAILURE
@@ -413,4 +428,75 @@ fn build_native(program: &Program, out_path: &str) -> Result<u64, String> {
     }
     let size = std::fs::metadata(out_path).map_err(|e| e.to_string())?.len();
     Ok(size)
+}
+
+// ---------------------------------------------------------------------------
+// Package management (`grasm deps`)
+// ---------------------------------------------------------------------------
+
+/// Resolves the dependency graph, enforces each package's capability ceiling,
+/// and writes the lockfile.
+fn cmd_deps(dir: &std::path::Path) -> Result<(), String> {
+    let resolution = grasm_pkg::resolve(dir)?;
+    let root = resolution.root();
+
+    println!(
+        "{} {} — {} package(s) in the graph",
+        root.name,
+        root.version,
+        resolution.packages.len()
+    );
+
+    // Capability enforcement: a package that performs more than its manifest
+    // permits fails the build for everyone who depends on it.
+    let mut violations = Vec::new();
+    for pkg in &resolution.packages {
+        let performed = match grasm_pkg::effects_of_package(pkg) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("warning: cannot analyze `{}`: {e}", pkg.name);
+                continue;
+            }
+        };
+        let shown: Vec<&str> = performed.iter().map(|s| s.as_str()).collect();
+        let declared = match &pkg.capabilities {
+            Some(c) => c.iter().cloned().collect::<Vec<_>>().join(", "),
+            None => "(unrestricted)".to_string(),
+        };
+        println!(
+            "  {:<16} performs [{}]  permits [{}]",
+            pkg.name,
+            shown.join(", "),
+            declared
+        );
+        if let Some(v) = grasm_pkg::check_capabilities(pkg, &performed) {
+            violations.push(v);
+        }
+    }
+
+    if !violations.is_empty() {
+        for v in &violations {
+            eprintln!("error: {v}");
+            eprintln!(
+                "  help: either add the capability to that package's manifest, \
+or stop it from performing the effect"
+            );
+        }
+        return Err(format!(
+            "{} package(s) exceed their declared capabilities",
+            violations.len()
+        ));
+    }
+
+    let entries = grasm_pkg::build_lock(&resolution)?;
+    let lock_path = dir.join(grasm_pkg::LOCKFILE_NAME);
+    if let Ok(previous) = std::fs::read_to_string(&lock_path) {
+        for change in grasm_pkg::diff_lock(&previous, &entries) {
+            println!("  note: {change}");
+        }
+    }
+    std::fs::write(&lock_path, grasm_pkg::render_lock(&entries))
+        .map_err(|e| format!("cannot write {}: {e}", lock_path.display()))?;
+    println!("wrote {}", lock_path.display());
+    Ok(())
 }

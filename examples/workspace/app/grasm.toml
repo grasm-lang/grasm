@@ -1,0 +1,10 @@
+[package]
+name = "app"
+version = "1.0.0"
+entry = "src/main.gr"
+
+# The application is allowed to print.
+capabilities = ["io"]
+
+[dependencies.mathlib]
+path = "../mathlib"

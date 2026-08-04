@@ -64,6 +64,81 @@ pub fn check_effects(module: &Module) -> Vec<Diagnostic> {
     check_effects_multi(&files)
 }
 
+/// The union of every effect performed by a program's functions, ignoring
+/// declared rows. Used by the package manager to check a dependency against
+/// its manifest's capability ceiling.
+pub fn effects_of_program(program: &crate::loader::Program) -> BTreeSet<String> {
+    let views: Vec<ModuleView> = program
+        .files
+        .iter()
+        .map(|f| ModuleView {
+            name: f.name.clone(),
+            module: &f.module,
+            imports: f.imports.clone(),
+        })
+        .collect();
+    let mut ctx = Ctx {
+        fns: HashMap::new(),
+        effect_names: HashSet::new(),
+        rows: HashMap::new(),
+        imports: HashMap::new(),
+    };
+    for f in &views {
+        ctx.imports.insert(f.name.clone(), f.imports.clone());
+        for d in &f.module.decls {
+            match d {
+                Decl::Fn(fd) => {
+                    ctx.fns.insert(format!("{}::{}", f.name, fd.name.name), fd);
+                }
+                Decl::Effect(e) => {
+                    ctx.effect_names.insert(e.name.name.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+    ctx.rows = ctx.fns.keys().map(|k| (k.clone(), BTreeSet::new())).collect();
+    loop {
+        let mut changed = false;
+        let keys: Vec<String> = ctx.fns.keys().cloned().collect();
+        for key in keys {
+            let f = ctx.fns[&key];
+            let current = key
+                .rsplit_once("::")
+                .map(|(m, _)| m)
+                .unwrap_or("main")
+                .to_string();
+            let mut row = BTreeSet::new();
+            let mut active = Vec::new();
+            walk_block(&f.body, &current, &mut active, &ctx, &mut row);
+            let entry = ctx.rows.get_mut(&key).unwrap();
+            if &row != entry {
+                *entry = row;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut all = BTreeSet::new();
+    for row in ctx.rows.values() {
+        all.extend(row.iter().cloned());
+    }
+    // Tests may perform effects too.
+    for f in &views {
+        for d in &f.module.decls {
+            if let Decl::Test(t) = d {
+                let mut row = BTreeSet::new();
+                let mut active = Vec::new();
+                walk_block(&t.body, &f.name, &mut active, &ctx, &mut row);
+                all.extend(row);
+            }
+        }
+    }
+    all
+}
+
 pub fn check_effects_multi(files: &[ModuleView]) -> Vec<Diagnostic> {
     let mut ctx = Ctx {
         fns: HashMap::new(),

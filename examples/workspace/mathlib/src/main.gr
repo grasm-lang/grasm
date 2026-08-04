@@ -1,0 +1,17 @@
+// A pure computation library: no effects at all.
+pub fn square(n: i64) -> i64 {
+    n * n
+}
+
+pub fn sum_squares(xs: [i64]) -> i64 {
+    xs.map(|x| square(x)).sum()
+}
+
+fn main() {
+    // Libraries carry a main so they can be run standalone for testing.
+}
+
+test "squares" {
+    assert_eq(square(4), 16)
+    assert_eq(sum_squares([1, 2, 3]), 14)
+}

@@ -135,6 +135,35 @@ variable names keeps compiling.
 - **Exhaustive matching** — sums, bools, Ok/Err, and bool-tuple products are
   coverage-checked with precise missing-case messages.
 
+## Packages and capabilities
+
+A package carries a `grasm.toml` manifest declaring its version, path
+dependencies, and — the interesting part — the effects it is permitted to
+perform:
+
+```toml
+[package]
+name = "mathlib"
+version = "0.2.0"
+capabilities = []          # computes; touches nothing
+
+[dependencies.utils]
+path = "../utils"
+```
+
+`grasm deps` resolves the graph (dependencies before dependents, cycles and
+name mismatches reported), infers what each package actually does from its
+source, and **fails the build if any package exceeds its declared ceiling** —
+in every consumer, at compile time. A dependency that quietly starts reading
+files in a patch release breaks the build rather than shipping. See
+[`examples/workspace/`](examples/workspace/) for a runnable demonstration.
+
+The lockfile records a SHA-256 over each package's sorted sources, so a change
+to a dependency's contents is detectable.
+
+Registries and version-range resolution are not implemented; dependencies are
+path-based today.
+
 ## Specification
 
 [`spec/`](spec/) is the normative description of the language: lexical rules and
@@ -155,6 +184,9 @@ Currently **65 normative clauses, 65 conformance programs**.
 | `crates/grasm_interp` | definitional tree-walking interpreter + test runner |
 | `crates/grasm_native` | Cranelift AOT backend (`grasm build --native`) |
 | `crates/grasm_rt` | C-ABI runtime linked into native executables |
+| `crates/grasm_lsp` | language server (`grasm lsp`) |
+| `crates/grasm_pkg` | manifests, resolution, capability ceilings, lockfiles |
+| `crates/grasm_spec` | specification conformance harness |
 | `crates/grasm` | the `grasm` CLI |
 | `examples/` | small demos (hello, errors, effects, ownership) |
 | `projects/beginner` | validation: games, todo, text stats, unit converter |

@@ -1,0 +1,9 @@
+[package]
+name = "mathlib"
+version = "0.2.0"
+entry = "src/main.gr"
+
+# This library computes. It never touches the filesystem, network, or clock,
+# and says so. If a future version starts doing so, every consumer's build
+# breaks — the ceiling is enforced, not documentation.
+capabilities = []

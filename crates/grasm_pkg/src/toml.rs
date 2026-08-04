@@ -1,0 +1,252 @@
+//! A small TOML reader — enough for manifests and lockfiles, no dependency.
+//!
+//! Supports: comments, `[table]` and `[table.sub]` headers, string / integer /
+//! boolean / array-of-string values, and basic escapes. Anything outside that
+//! is a clear error rather than a silent misparse.
+
+use std::collections::BTreeMap;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Value {
+    Str(String),
+    Int(i64),
+    Bool(bool),
+    Arr(Vec<Value>),
+}
+
+impl Value {
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Value::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub fn as_str_array(&self) -> Option<Vec<&str>> {
+        match self {
+            Value::Arr(items) => items.iter().map(|i| i.as_str()).collect(),
+            _ => None,
+        }
+    }
+}
+
+/// A parsed document: table path (dotted) → key → value.
+#[derive(Debug, Default, Clone)]
+pub struct Doc {
+    pub tables: BTreeMap<String, BTreeMap<String, Value>>,
+}
+
+impl Doc {
+    pub fn get(&self, table: &str, key: &str) -> Option<&Value> {
+        self.tables.get(table)?.get(key)
+    }
+
+    pub fn table(&self, name: &str) -> Option<&BTreeMap<String, Value>> {
+        self.tables.get(name)
+    }
+
+    /// Sub-tables of `prefix`, as (leaf name, entries).
+    pub fn subtables(&self, prefix: &str) -> Vec<(String, &BTreeMap<String, Value>)> {
+        let want = format!("{prefix}.");
+        self.tables
+            .iter()
+            .filter_map(|(k, v)| k.strip_prefix(&want).map(|leaf| (leaf.to_string(), v)))
+            .collect()
+    }
+}
+
+pub fn parse(src: &str) -> Result<Doc, String> {
+    let mut doc = Doc::default();
+    let mut current = String::new();
+    doc.tables.insert(current.clone(), BTreeMap::new());
+
+    for (lineno, raw) in src.lines().enumerate() {
+        let line = strip_comment(raw).trim();
+        if line.is_empty() {
+            continue;
+        }
+        let at = || format!("line {}", lineno + 1);
+
+        if let Some(rest) = line.strip_prefix('[') {
+            let name = rest
+                .strip_suffix(']')
+                .ok_or_else(|| format!("{}: unclosed table header", at()))?
+                .trim();
+            if name.is_empty() {
+                return Err(format!("{}: empty table name", at()));
+            }
+            current = name.to_string();
+            doc.tables.entry(current.clone()).or_default();
+            continue;
+        }
+
+        let (key, value) = line
+            .split_once('=')
+            .ok_or_else(|| format!("{}: expected `key = value`", at()))?;
+        let key = key.trim().trim_matches('"').to_string();
+        if key.is_empty() {
+            return Err(format!("{}: empty key", at()));
+        }
+        let value = parse_value(value.trim()).map_err(|e| format!("{}: {e}", at()))?;
+        doc.tables
+            .entry(current.clone())
+            .or_default()
+            .insert(key, value);
+    }
+    Ok(doc)
+}
+
+fn strip_comment(line: &str) -> &str {
+    let mut in_string = false;
+    for (i, c) in line.char_indices() {
+        match c {
+            '"' => in_string = !in_string,
+            '#' if !in_string => return &line[..i],
+            _ => {}
+        }
+    }
+    line
+}
+
+fn parse_value(text: &str) -> Result<Value, String> {
+    if text == "true" {
+        return Ok(Value::Bool(true));
+    }
+    if text == "false" {
+        return Ok(Value::Bool(false));
+    }
+    if let Some(rest) = text.strip_prefix('"') {
+        let body = rest
+            .strip_suffix('"')
+            .ok_or("unterminated string value")?;
+        return Ok(Value::Str(unescape(body)));
+    }
+    if let Some(rest) = text.strip_prefix('[') {
+        let body = rest.strip_suffix(']').ok_or("unterminated array")?;
+        let mut items = Vec::new();
+        for part in split_top_level(body) {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            items.push(parse_value(part)?);
+        }
+        return Ok(Value::Arr(items));
+    }
+    text.parse::<i64>()
+        .map(Value::Int)
+        .map_err(|_| format!("cannot parse value `{text}`"))
+}
+
+fn split_top_level(body: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut in_string = false;
+    for (i, c) in body.char_indices() {
+        match c {
+            '"' => in_string = !in_string,
+            ',' if !in_string => {
+                out.push(&body[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&body[start..]);
+    out
+}
+
+fn unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// Quotes a string for writing back out.
+pub fn quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_a_manifest_shape() {
+        let doc = parse(
+            r#"
+# a comment
+[package]
+name = "demo"
+version = "1.2.3"
+capabilities = ["io", "Clock"]
+
+[dependencies.utils]
+path = "../utils"
+"#,
+        )
+        .unwrap();
+        assert_eq!(doc.get("package", "name").unwrap().as_str(), Some("demo"));
+        assert_eq!(
+            doc.get("package", "capabilities").unwrap().as_str_array(),
+            Some(vec!["io", "Clock"])
+        );
+        let deps = doc.subtables("dependencies");
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].0, "utils");
+    }
+
+    #[test]
+    fn handles_comments_hashes_in_strings_and_escapes() {
+        let doc = parse("[p]\nk = \"has # hash\" # trailing\ne = \"tab\\there\"\n").unwrap();
+        assert_eq!(doc.get("p", "k").unwrap().as_str(), Some("has # hash"));
+        assert_eq!(doc.get("p", "e").unwrap().as_str(), Some("tab\there"));
+    }
+
+    #[test]
+    fn reports_malformed_input_with_line_numbers() {
+        for bad in ["[unclosed\n", "novalue\n", "[t]\nk = \"open\n", "[t]\nk = ?\n"] {
+            let e = parse(bad).expect_err("should fail");
+            assert!(e.starts_with("line "), "expected a located error, got: {e}");
+        }
+    }
+
+    #[test]
+    fn ints_bools_and_arrays() {
+        let doc = parse("[t]\nn = 42\nb = true\na = [\"x\", \"y\"]\n").unwrap();
+        assert_eq!(doc.get("t", "n"), Some(&Value::Int(42)));
+        assert_eq!(doc.get("t", "b"), Some(&Value::Bool(true)));
+        assert_eq!(
+            doc.get("t", "a").unwrap().as_str_array(),
+            Some(vec!["x", "y"])
+        );
+    }
+}

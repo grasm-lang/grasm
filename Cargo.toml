@@ -7,6 +7,7 @@ members = [
     "crates/grasm_native",
     "crates/grasm_lsp",
     "crates/grasm_spec",
+    "crates/grasm_pkg",
     "crates/grasm_rt",
     "crates/grasm",
 ]
