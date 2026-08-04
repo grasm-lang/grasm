@@ -1,0 +1,39 @@
+// A tour of the standard library's collection, string, and OS builtins.
+// Everything here is deterministic so the native build and the interpreter
+// agree byte-for-byte (see scripts/difftest.sh).
+
+fn main() {
+    let xs = [3, 1, 4, 1, 5, 9, 2, 6]
+
+    // Searching: any/all short-circuit, find returns the first match.
+    print("any>8: {xs.any(|x| x > 8)}  all>0: {xs.all(|x| x > 0)}  all>3: {xs.all(|x| x > 3)}")
+    print("first>3: {xs.find(|x| x > 3) ?? -1}  first>99: {xs.find(|x| x > 99) ?? -1}")
+
+    // Extremes and emptiness.
+    print("min: {xs.min() ?? 0}  max: {xs.max() ?? 0}  empty: {xs.is_empty()}")
+    let none: [i64] = []
+    print("empty list -> min is none: {none.min().is_none()}  is_empty: {none.is_empty()}")
+
+    let words = ["pear", "fig", "apple"]
+    print("min word: {words.min() ?? "?"}  max word: {words.max() ?? "?"}")
+
+    // Strings: splitting on newlines and padding to a fixed width.
+    let doc = "alpha\nbeta\ngamma"
+    print("lines: {doc.lines().len()}  second: {doc.lines()[1]}")
+    for n in [7, 42, 300] {
+        print("| {"{n}".pad_start(5, " ")} | {"{n}".pad_end(5, ".")} |")
+    }
+    print("blank is_empty: {"".is_empty()}  text is_empty: {"x".is_empty()}")
+
+    // Maps.
+    var counts = map()
+    print("fresh map is_empty: {counts.is_empty()}")
+    for w in words {
+        counts.set(w, w.len())
+    }
+    print("after {counts.len()} inserts, is_empty: {counts.is_empty()}")
+
+    // The clock is an io effect; only its monotonicity is deterministic.
+    let t = now_millis()
+    print("clock past 2020: {t > 1577836800000}")
+}

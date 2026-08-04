@@ -58,6 +58,17 @@ lexicographically — so program output is deterministic.
 **[E-STR-CHARS]** String length and indexing operate on Unicode characters,
 not bytes.
 
+**[E-PAD-CYCLE]** `pad_start` / `pad_end` widen a string to a character count
+using a fill that repeats cyclically and is cut to the exact width. A string
+already at or over the width is returned unchanged; an empty fill panics.
+
+**[E-SEARCH-SHORTCIRCUIT]** `any` and `find` stop at the first element whose
+predicate holds; `all` stops at the first that fails. Elements after the
+deciding one are never passed to the predicate.
+
+**[E-MINMAX-OPTION]** `min` / `max` return `Option`: `None` on an empty list,
+so an empty list is not a panic and not a sentinel value.
+
 ## 5. Control flow
 
 **[E-IF-VALUE]** `if` is an expression when both branches yield the same type;

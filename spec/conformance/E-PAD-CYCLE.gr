@@ -1,0 +1,14 @@
+//! tag: E-PAD-CYCLE
+//! expect: output
+//! [007]
+//! [ababx]
+//! [x-=-=-]
+//! [wide]
+fn main() {
+    print("[{"7".pad_start(3, "0")}]")
+    // A multi-character fill repeats and is cut to the exact width.
+    print("[{"x".pad_start(5, "ab")}]")
+    print("[{"x".pad_end(6, "-=")}]")
+    // Already wide enough: unchanged.
+    print("[{"wide".pad_start(2, "-")}]")
+}

@@ -606,3 +606,56 @@ fn nested_parallel_scopes_are_allowed() {
         "fn main() {\n    parallel {\n        spawn {\n            parallel {\n                spawn {\n                    print(\"deep\")\n                }\n            }\n        }\n    }\n}\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Standard library typing
+// ---------------------------------------------------------------------------
+
+#[test]
+fn search_methods_require_a_bool_predicate() {
+    check_ok("fn main() {\n    print(\"{[1].any(|x| x > 0)}\")\n}\n");
+    check_err(
+        "fn main() {\n    print(\"{[1].all(|x| x + 1)}\")\n}\n",
+        "bool",
+    );
+}
+
+#[test]
+fn find_min_and_max_yield_options() {
+    check_ok("fn main() {\n    let x: i64 = [1, 2].find(|v| v > 1) ?? 0\n    let y: i64 = [1, 2].min() ?? 0\n    let z: i64 = [1, 2].max() ?? 0\n    print(\"{x}{y}{z}\")\n}\n");
+    check_err(
+        "fn main() {\n    let x: i64 = [1, 2].min()\n    print(\"{x}\")\n}\n",
+        "type mismatch",
+    );
+}
+
+#[test]
+fn env_returns_an_optional_string() {
+    check_ok("fn main() {\n    let home: str = env(\"HOME\") ?? \"\"\n    print(home)\n}\n");
+    check_err(
+        "fn main() {\n    let home: str = env(\"HOME\")\n    print(home)\n}\n",
+        "type mismatch",
+    );
+}
+
+#[test]
+fn the_clock_and_the_environment_are_io_effects() {
+    check_err(
+        "fn stamp() -> i64 / {} {\n    now_millis()\n}\n\nfn main() {\n    print(\"{stamp()}\")\n}\n",
+        "not in its declared row",
+    );
+    check_ok(
+        "fn stamp() -> i64 / {io} {\n    now_millis()\n}\n\nfn main() {\n    print(\"{stamp()}\")\n}\n",
+    );
+}
+
+#[test]
+fn is_empty_works_on_every_container() {
+    check_ok(
+        "fn main() {\n    var m = map()\n    m.set(\"k\", 1)\n    print(\"{[1].is_empty()} {\"s\".is_empty()} {m.is_empty()}\")\n}\n",
+    );
+    check_err(
+        "fn main() {\n    print(\"{(1).is_empty()}\")\n}\n",
+        "no method",
+    );
+}

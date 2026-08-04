@@ -1,0 +1,11 @@
+//! tag: E-MINMAX-OPTION
+//! expect: output
+//! 1 9
+//! fig pear
+//! true true
+fn main() {
+    print("{[3, 1, 9].min() ?? 0} {[3, 1, 9].max() ?? 0}")
+    print("{["pear", "fig"].min() ?? "?"} {["pear", "fig"].max() ?? "?"}")
+    let none: [i64] = []
+    print("{none.min().is_none()} {none.max().is_none()}")
+}

@@ -1192,6 +1192,26 @@ impl Checker {
                         let v = self.uni.fresh();
                         return Type::Map(Box::new(k), Box::new(v));
                     }
+                    "now_millis" => {
+                        if !args.is_empty() {
+                            return self.error(span, "now_millis takes no arguments");
+                        }
+                        return Type::I64;
+                    }
+                    "env" => {
+                        if args.len() != 1 {
+                            return self.error(span, "env takes exactly 1 argument (the variable name)");
+                        }
+                        self.check_expr(&args[0], &Type::Str);
+                        return self.defs.option_some(Type::Str);
+                    }
+                    "exit" => {
+                        if args.len() != 1 {
+                            return self.error(span, "exit takes exactly 1 argument (the status code)");
+                        }
+                        self.check_expr(&args[0], &Type::I64);
+                        return self.uni.fresh(); // diverges
+                    }
                     "input" => {
                         if !args.is_empty() {
                             return self.error(span, "input takes no arguments");
@@ -1623,6 +1643,39 @@ impl Checker {
                         }
                         Type::List(Box::new(elem))
                     }
+                    "any" | "all" => {
+                        if check_arity(self, 1) {
+                            let f = Type::Fn {
+                                params: vec![elem.clone()],
+                                ret: Box::new(Type::Bool),
+                            };
+                            self.check_expr(&args[0], &f);
+                        }
+                        Type::Bool
+                    }
+                    "find" => {
+                        if check_arity(self, 1) {
+                            let f = Type::Fn {
+                                params: vec![elem.clone()],
+                                ret: Box::new(Type::Bool),
+                            };
+                            self.check_expr(&args[0], &f);
+                        }
+                        self.defs.option_some(elem)
+                    }
+                    "min" | "max" => {
+                        check_arity(self, 0);
+                        let r = self.uni.shallow_resolve(&elem);
+                        if !matches!(r, Type::I64 | Type::F64 | Type::Str | Type::Var(_) | Type::Error) {
+                            let shown = self.show(&elem);
+                            self.error(span, format!("cannot take min/max of `{shown}` values"));
+                        }
+                        self.defs.option_some(elem)
+                    }
+                    "is_empty" => {
+                        check_arity(self, 0);
+                        Type::Bool
+                    }
                     "sum" => {
                         check_arity(self, 0);
                         let r = self.uni.shallow_resolve(&elem);
@@ -1686,9 +1739,20 @@ impl Checker {
                     }
                     Type::List(Box::new(Type::Str))
                 }
-                "chars" => {
+                "chars" | "lines" => {
                     check_arity(self, 0);
                     Type::List(Box::new(Type::Str))
+                }
+                "pad_start" | "pad_end" => {
+                    if check_arity(self, 2) {
+                        self.check_expr(&args[0], &Type::I64);
+                        self.check_expr(&args[1], &Type::Str);
+                    }
+                    Type::Str
+                }
+                "is_empty" => {
+                    check_arity(self, 0);
+                    Type::Bool
                 }
                 "trim" | "to_upper" | "to_lower" => {
                     check_arity(self, 0);
@@ -1808,6 +1872,10 @@ impl Checker {
                     "len" => {
                         check_arity(self, 0);
                         Type::I64
+                    }
+                    "is_empty" => {
+                        check_arity(self, 0);
+                        Type::Bool
                     }
                     "keys" => {
                         check_arity(self, 0);

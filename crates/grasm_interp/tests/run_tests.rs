@@ -741,3 +741,139 @@ fn empty_parallel_scope_is_a_no_op() {
         "done\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Standard library: searching, extremes, string shaping, OS access
+// ---------------------------------------------------------------------------
+
+#[test]
+fn any_all_and_find_search_a_list() {
+    run_expect(
+        r#"fn main() {
+    let xs = [3, 1, 4, 1, 5]
+    print("{xs.any(|x| x > 4)} {xs.any(|x| x > 9)}")
+    print("{xs.all(|x| x > 0)} {xs.all(|x| x > 3)}")
+    print("{xs.find(|x| x > 3) ?? -1} {xs.find(|x| x > 99) ?? -1}")
+}
+"#,
+        "true false\ntrue false\n4 -1\n",
+    );
+}
+
+#[test]
+fn any_and_all_short_circuit() {
+    // The predicate stops running once the answer is settled, so `any` prints
+    // only up to its first hit and `all` only up to its first miss.
+    run_expect(
+        r#"fn main() {
+    let xs = [1, 2, 3, 4]
+    let hit = xs.any(|x| {
+        print("any saw {x}")
+        x == 2
+    })
+    print("{hit}")
+    let ok = xs.all(|x| {
+        print("all saw {x}")
+        x < 3
+    })
+    print("{ok}")
+}
+"#,
+        "any saw 1\nany saw 2\ntrue\nall saw 1\nall saw 2\nall saw 3\nfalse\n",
+    );
+}
+
+#[test]
+fn find_on_an_empty_list_is_none() {
+    run_expect(
+        "fn main() {\n    let xs: [i64] = []\n    print(\"{xs.find(|x| x > 0).is_none()} {xs.any(|x| x > 0)} {xs.all(|x| x > 0)}\")\n}\n",
+        "true false true\n",
+    );
+}
+
+#[test]
+fn min_and_max_return_option() {
+    run_expect(
+        r#"fn main() {
+    print("{[3, 1, 4].min() ?? 0} {[3, 1, 4].max() ?? 0}")
+    print("{["pear", "fig"].min() ?? "?"} {["pear", "fig"].max() ?? "?"}")
+    let none: [i64] = []
+    print("{none.min().is_none()} {none.max().is_none()}")
+}
+"#,
+        "1 4\nfig pear\ntrue true\n",
+    );
+}
+
+#[test]
+fn is_empty_on_lists_strings_and_maps() {
+    run_expect(
+        r#"fn main() {
+    let none: [i64] = []
+    print("{none.is_empty()} {[1].is_empty()}")
+    print("{"".is_empty()} {"x".is_empty()}")
+    var m = map()
+    print("{m.is_empty()}")
+    m.set("k", 1)
+    print("{m.is_empty()}")
+}
+"#,
+        "true false\ntrue false\ntrue\nfalse\n",
+    );
+}
+
+#[test]
+fn lines_splits_on_newlines() {
+    run_expect(
+        r#"fn main() {
+    let doc = "alpha\nbeta\ngamma"
+    print("{doc.lines().len()} {doc.lines()[1]}")
+    print("{"solo".lines().len()} {"".lines().len()}")
+    // A trailing newline does not produce a phantom final line.
+    print("{"a\nb\n".lines().len()}")
+}
+"#,
+        "3 beta\n1 0\n2\n",
+    );
+}
+
+#[test]
+fn padding_widens_to_a_target_length() {
+    run_expect(
+        r#"fn main() {
+    print("[{"7".pad_start(3, "0")}] [{"ab".pad_end(5, ".")}]")
+    // Already at or over the width, the string is returned unchanged.
+    print("[{"wide".pad_start(2, "-")}] [{"four".pad_end(4, "-")}]")
+    // Multi-character fill repeats and is cut to fit.
+    print("[{"x".pad_start(5, "ab")}]")
+}
+"#,
+        "[007] [ab...]\n[wide] [four]\n[ababx]\n",
+    );
+}
+
+#[test]
+fn now_millis_moves_forward() {
+    run_expect(
+        "fn main() {\n    let a = now_millis()\n    print(\"{a > 1577836800000}\")\n}\n",
+        "true\n",
+    );
+}
+
+#[test]
+fn env_reads_the_process_environment() {
+    // Only the absent case is deterministic without touching the harness's env.
+    run_expect(
+        "fn main() {\n    print(\"{env(\"GRASM_DEFINITELY_UNSET_VAR\") ?? \"unset\"}\")\n}\n",
+        "unset\n",
+    );
+}
+
+#[test]
+fn exit_stops_the_program_with_a_status() {
+    let (code, out) = run(
+        "fn main() {\n    print(\"before\")\n    exit(3)\n    print(\"after\")\n}\n",
+    );
+    assert_eq!(code, 3);
+    assert_eq!(out, "before\n");
+}

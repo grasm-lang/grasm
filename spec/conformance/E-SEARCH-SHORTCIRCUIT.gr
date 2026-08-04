@@ -1,0 +1,22 @@
+//! tag: E-SEARCH-SHORTCIRCUIT
+//! expect: output
+//! any saw 1
+//! any saw 2
+//! true
+//! all saw 1
+//! all saw 2
+//! all saw 3
+//! false
+fn main() {
+    let xs = [1, 2, 3, 4]
+    let hit = xs.any(|x| {
+        print("any saw {x}")
+        x == 2
+    })
+    print("{hit}")
+    let ok = xs.all(|x| {
+        print("all saw {x}")
+        x < 3
+    })
+    print("{ok}")
+}

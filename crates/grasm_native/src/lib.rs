@@ -333,6 +333,15 @@ impl<'m> Codegen<'m> {
             ("grasm_write_file", vec![i64t, i64t], Some(i64t)),
             ("grasm_file_exists", vec![i64t], Some(i8t)),
             ("grasm_set_args", vec![i64t, ptr], None),
+            ("grasm_now_millis", vec![], Some(i64t)),
+            ("grasm_env", vec![i64t], Some(i64t)),
+            ("grasm_exit", vec![i64t], None),
+            ("grasm_str_lines", vec![i64t], Some(i64t)),
+            ("grasm_str_pad", vec![i64t, i64t, i64t, i8t], Some(i64t)),
+            ("grasm_str_is_empty", vec![i64t], Some(i8t)),
+            ("grasm_list_is_empty", vec![i64t], Some(i8t)),
+            ("grasm_map_is_empty", vec![i64t], Some(i8t)),
+            ("grasm_list_min_max", vec![i64t, i8t], Some(i64t)),
         ];
         for (name, params, ret) in decls {
             let mut sig = self.module.make_signature();
@@ -2088,10 +2097,30 @@ impl FnCx<'_, '_> {
                 self.call_rt("grasm_val_dec", &[a]);
                 (v, VType::List(Box::new(VType::Str)))
             }
-            (VType::Str, "chars") => {
-                let v = self.call_rt("grasm_str_chars", &[rv]).unwrap();
+            (VType::Str, "chars" | "lines") => {
+                let f = if m == "chars" {
+                    "grasm_str_chars"
+                } else {
+                    "grasm_str_lines"
+                };
+                let v = self.call_rt(f, &[rv]).unwrap();
                 self.call_rt("grasm_val_dec", &[rv]);
                 (v, VType::List(Box::new(VType::Str)))
+            }
+            (VType::Str, "is_empty") => {
+                let v = self.call_rt("grasm_str_is_empty", &[rv]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                (v, VType::Bool)
+            }
+            (VType::Str, "pad_start" | "pad_end") => {
+                let at_start = i64::from(m == "pad_start");
+                let w = arg_scalar!(0, VType::I64);
+                let fill = arg_boxed!(1);
+                let flag = self.b.ins().iconst(types::I8, at_start);
+                let v = self.call_rt("grasm_str_pad", &[rv, w, fill, flag]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                self.call_rt("grasm_val_dec", &[fill]);
+                (v, VType::Str)
             }
             (VType::Str, "trim" | "to_upper" | "to_lower") => {
                 let f = match m {
@@ -2148,6 +2177,18 @@ impl FnCx<'_, '_> {
                 self.call_rt("grasm_val_dec", &[rv]);
                 (v, VType::I64)
             }
+            (VType::List(_), "is_empty") => {
+                let v = self.call_rt("grasm_list_is_empty", &[rv]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                (v, VType::Bool)
+            }
+            (VType::List(e), "min" | "max") => {
+                let et = e.clone();
+                let flag = self.b.ins().iconst(types::I8, i64::from(m == "max"));
+                let v = self.call_rt("grasm_list_min_max", &[rv, flag]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                (v, VType::Option(et))
+            }
             (VType::List(e), "join") => {
                 let _ = e;
                 let a = arg_boxed!(0);
@@ -2199,6 +2240,21 @@ impl FnCx<'_, '_> {
                 self.call_rt("grasm_val_dec", &[rv]);
                 (v, if is_float { VType::F64 } else { VType::I64 })
             }
+            (VType::List(e), "any" | "all" | "find") => {
+                let elem_t = (**e).clone();
+                let Expr::Closure {
+                    params: cparams,
+                    body: cbody,
+                    ..
+                } = &args[0]
+                else {
+                    return nope(args[0].span(), "any/all/find with a non-literal closure");
+                };
+                if cparams.len() != 1 {
+                    return nope(args[0].span(), "predicates with multiple params");
+                }
+                self.emit_list_search(rv, &elem_t, &cparams[0], cbody, m)?
+            }
             (VType::List(e), "map" | "filter") => {
                 let elem_t = (**e).clone();
                 let Expr::Closure {
@@ -2235,6 +2291,11 @@ impl FnCx<'_, '_> {
                 let v = self.call_rt("grasm_map_len", &[rv]).unwrap();
                 self.call_rt("grasm_val_dec", &[rv]);
                 (v, VType::I64)
+            }
+            (VType::Map(_, _), "is_empty") => {
+                let v = self.call_rt("grasm_map_is_empty", &[rv]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                (v, VType::Bool)
             }
             (VType::Map(k_t, _), "keys") => {
                 let kt = k_t.clone();
@@ -2739,6 +2800,24 @@ impl FnCx<'_, '_> {
             "input" => {
                 let v = self.call_rt("grasm_input", &[]).unwrap();
                 return Ok(Some((v, VType::Str)));
+            }
+            "now_millis" => {
+                let v = self.call_rt("grasm_now_millis", &[]).unwrap();
+                return Ok(Some((v, VType::I64)));
+            }
+            "env" => {
+                let (nv, _) = self.eval_expr_val(&args[0])?;
+                let v = self.call_rt("grasm_env", &[nv]).unwrap();
+                self.call_rt("grasm_val_dec", &[nv]);
+                return Ok(Some((v, VType::Option(Box::new(VType::Str)))));
+            }
+            "exit" => {
+                let (cv, _) = self.eval_expr_val(&args[0])?;
+                self.call_rt("grasm_exit", &[cv]);
+                self.trap_here();
+                let dead = self.b.create_block();
+                self.goto_block(dead);
+                return Ok(None);
             }
             "read_file" => {
                 let (pv, _) = self.eval_expr_val(&args[0])?;
@@ -3652,6 +3731,122 @@ impl FnCx<'_, '_> {
                 }
             }
         }
+    }
+
+    /// Inlines `list.any/all/find(|x| pred)` as a loop with early exit.
+    /// Consumes the owned `list`; returns (value, type).
+    fn emit_list_search(
+        &mut self,
+        list: Value,
+        elem_t: &VType,
+        param: &Ident,
+        body: &Expr,
+        mode: &str,
+    ) -> CResult<(Value, VType)> {
+        let is_find = mode == "find";
+        let is_all = mode == "all";
+        let out_t = if is_find {
+            VType::Option(Box::new(elem_t.clone()))
+        } else {
+            VType::Bool
+        };
+
+        let list_var = self.new_var(&VType::List(Box::new(elem_t.clone())));
+        self.b.def_var(list_var, list);
+        let out_var = self.new_var(&out_t);
+        // `all` starts true, `any` false, `find` None.
+        if is_find {
+            let none = self.make_variant("Option", "None", &[])?;
+            self.b.def_var(out_var, none);
+        } else {
+            let init = self.b.ins().iconst(types::I8, i64::from(is_all));
+            self.b.def_var(out_var, init);
+        }
+        let done_var = self.new_var(&VType::Bool);
+        let no = self.b.ins().iconst(types::I8, 0);
+        self.b.def_var(done_var, no);
+        let ivar = self.new_var(&VType::I64);
+        let zero = self.b.ins().iconst(types::I64, 0);
+        self.b.def_var(ivar, zero);
+
+        let header = self.b.create_block();
+        let body_blk = self.b.create_block();
+        let join = self.b.create_block();
+        let step = self.b.create_block();
+        let exit = self.b.create_block();
+        self.b.ins().jump(header, &[]);
+        self.filled = true;
+
+        self.goto_block(header);
+        let lv = self.b.use_var(list_var);
+        let len = self.call_rt("grasm_list_len", &[lv]).unwrap();
+        let iv = self.b.use_var(ivar);
+        let c = self.b.ins().icmp(IntCC::SignedLessThan, iv, len);
+        self.b.ins().brif(c, body_blk, &[], exit, &[]);
+        self.filled = true;
+
+        self.goto_block(body_blk);
+        let lv2 = self.b.use_var(list_var);
+        let iv2 = self.b.use_var(ivar);
+        let boxed = self.call_rt("grasm_list_get", &[lv2, iv2]).unwrap();
+        let (ev, evt) = self.unbox(boxed, elem_t)?;
+        let evar = self.new_var(&evt);
+        self.b.def_var(evar, ev);
+        self.push_scope();
+        self.bind(&param.name, evar, evt.clone());
+        let (pred, pred_t) = self.eval_expr_val(body)?;
+        if pred_t != VType::Bool {
+            return nope(body.span(), "a non-bool predicate");
+        }
+
+        let hit = self.b.create_block();
+        // `all` stops early on a FALSE predicate; `any`/`find` on a true one.
+        if is_all {
+            self.b.ins().brif(pred, join, &[], hit, &[]);
+        } else {
+            self.b.ins().brif(pred, hit, &[], join, &[]);
+        }
+        self.filled = true;
+
+        self.goto_block(hit);
+        if is_find {
+            let e2 = self.b.use_var(evar);
+            if evt.boxed() {
+                self.call_rt("grasm_val_inc", &[e2]);
+            }
+            let bx = self.box_value(e2, &evt);
+            let some = self.make_variant("Option", "Some", &[bx])?;
+            self.b.def_var(out_var, some);
+        } else {
+            // `any` found a match (true); `all` found a counterexample (false).
+            let v = self.b.ins().iconst(types::I8, i64::from(!is_all));
+            self.b.def_var(out_var, v);
+        }
+        let yes = self.b.ins().iconst(types::I8, 1);
+        self.b.def_var(done_var, yes);
+        self.b.ins().jump(join, &[]);
+        self.filled = true;
+
+        // One scope pop for one push, on the path both branches share.
+        self.goto_block(join);
+        self.pop_scope_with_decs();
+        let d = self.b.use_var(done_var);
+        self.b.ins().brif(d, exit, &[], step, &[]);
+        self.filled = true;
+
+        self.goto_block(step);
+        let iv3 = self.b.use_var(ivar);
+        let one = self.b.ins().iconst(types::I64, 1);
+        let next = self.b.ins().iadd(iv3, one);
+        self.b.def_var(ivar, next);
+        self.b.ins().jump(header, &[]);
+        self.filled = true;
+
+        self.goto_block(exit);
+        let lv3 = self.b.use_var(list_var);
+        self.call_rt("grasm_val_dec", &[lv3]);
+        let out = self.b.use_var(out_var);
+        Ok((out, out_t))
     }
 
     /// Inlines `list.map(|x| body)` / `list.filter(|x| body)` as a loop.

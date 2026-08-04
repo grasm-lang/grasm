@@ -479,11 +479,11 @@ mod tests {
     #[test]
     fn numbers() {
         assert_eq!(
-            kinds("42 1_000 3.14 1e9 2.5e-3 0xFF 0b1010"),
+            kinds("42 1_000 3.25 1e9 2.5e-3 0xFF 0b1010"),
             vec![
                 Int(42),
                 Int(1000),
-                Float(3.14),
+                Float(3.25),
                 Float(1e9),
                 Float(2.5e-3),
                 Int(255),

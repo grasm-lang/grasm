@@ -23,11 +23,16 @@ skip=0
 declare -a FAILED=()
 declare -a SKIPPED=()
 
-programs=$(find examples projects -name '*.gr' | sort)
+programs=$(find examples projects spec/conformance -name '*.gr' | sort)
 
 for src in $programs; do
     # Library modules (no `main`) are not standalone programs.
     if ! grep -qE '^\s*(pub )?fn main\(' "$src"; then
+        continue
+    fi
+    # Conformance programs tagged `expect: error` are meant not to compile;
+    # there is no runtime behaviour for the two engines to disagree about.
+    if grep -q '^//! expect: error$' "$src"; then
         continue
     fi
     name=$(echo "$src" | tr '/.' '__')

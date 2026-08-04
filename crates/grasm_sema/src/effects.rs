@@ -22,6 +22,8 @@ const IO_BUILTINS: &[&str] = &[
     "file_exists",
     "input",
     "args",
+    "now_millis",
+    "env",
 ];
 
 struct Ctx<'a> {

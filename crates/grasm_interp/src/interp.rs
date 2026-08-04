@@ -18,6 +18,10 @@ pub enum Flow {
     Err(Value),
     /// Program bug: assert/panic/index-out-of-bounds/…
     Panic(String),
+    /// `exit(n)` — unwinds to the entry point rather than killing the host
+    /// process, so embedders (the test harness, `grasm test`, tooling) stay
+    /// in control of their own exit.
+    Exit(i32),
 }
 
 type EResult = Result<Value, Flow>;
@@ -178,6 +182,7 @@ impl<'a, W: Write> Interp<'a, W> {
                 let _ = writeln!(self.out, "panic: {msg}");
                 101
             }
+            Err(Flow::Exit(code)) => code,
             Err(_) => 1,
         }
     }
@@ -202,6 +207,14 @@ impl<'a, W: Write> Interp<'a, W> {
                     }
                     Err(Flow::Err(e)) => {
                         let _ = writeln!(self.out, "test \"{}\" ... FAILED: error: {e}", t.name);
+                        failed += 1;
+                    }
+                    Err(Flow::Exit(code)) => {
+                        let _ = writeln!(
+                            self.out,
+                            "test \"{}\" ... FAILED: exit({code}) inside a test",
+                            t.name
+                        );
                         failed += 1;
                     }
                     Err(_) => {
@@ -878,6 +891,32 @@ impl<'a, W: Write> Interp<'a, W> {
                     "map" => {
                         return Ok(Value::Map(Rc::new(std::collections::BTreeMap::new())));
                     }
+                    "now_millis" => {
+                        let ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as i64)
+                            .unwrap_or(0);
+                        return Ok(Value::Int(ms));
+                    }
+                    "env" => {
+                        let name = self.eval_expr(&args[0])?.to_string();
+                        return Ok(match std::env::var(&name) {
+                            Ok(v) => Value::some(Value::str(v)),
+                            Err(_) => Value::none(),
+                        });
+                    }
+                    "exit" => {
+                        let code = match self.eval_expr(&args[0])? {
+                            Value::Int(i) => i,
+                            other => {
+                                return Err(Flow::Panic(format!(
+                                    "exit status must be an int, got `{other}`"
+                                )))
+                            }
+                        };
+                        let _ = self.out.flush();
+                        return Err(Flow::Exit(code.clamp(0, 255) as i32));
+                    }
                     "input" => {
                         let mut line = String::new();
                         let _ = std::io::BufRead::read_line(
@@ -1273,6 +1312,66 @@ impl<'a, W: Write> Interp<'a, W> {
                 let parts: Vec<String> = items.iter().map(|v| v.to_string()).collect();
                 Value::str(parts.join(&sep.to_string()))
             }
+            (Value::List(items), "is_empty") => Value::Bool(items.is_empty()),
+            (Value::List(items), "any" | "all") => {
+                let want_all = name.name == "all";
+                let f = self.eval_expr(&args[0])?;
+                let mut result = want_all;
+                for item in items.iter() {
+                    let hit = matches!(
+                        self.call_value(f.clone(), vec![item.clone()], "any/all")?,
+                        Value::Bool(true)
+                    );
+                    if want_all && !hit {
+                        result = false;
+                        break;
+                    }
+                    if !want_all && hit {
+                        result = true;
+                        break;
+                    }
+                }
+                Value::Bool(result)
+            }
+            (Value::List(items), "find") => {
+                let f = self.eval_expr(&args[0])?;
+                let mut found = Value::none();
+                for item in items.iter() {
+                    if let Value::Bool(true) =
+                        self.call_value(f.clone(), vec![item.clone()], "find")?
+                    {
+                        found = Value::some(item.clone());
+                        break;
+                    }
+                }
+                found
+            }
+            (Value::List(items), "min" | "max") => {
+                let want_max = name.name == "max";
+                let mut best: Option<Value> = None;
+                for item in items.iter() {
+                    best = Some(match best {
+                        None => item.clone(),
+                        Some(cur) => {
+                            let ord = compare_values(item, &cur);
+                            let take = if want_max {
+                                ord == std::cmp::Ordering::Greater
+                            } else {
+                                ord == std::cmp::Ordering::Less
+                            };
+                            if take {
+                                item.clone()
+                            } else {
+                                cur
+                            }
+                        }
+                    });
+                }
+                match best {
+                    Some(v) => Value::some(v),
+                    None => Value::none(),
+                }
+            }
             (Value::List(items), "rev") => {
                 let mut v: Vec<Value> = items.as_ref().clone();
                 v.reverse();
@@ -1326,6 +1425,34 @@ impl<'a, W: Write> Interp<'a, W> {
             (Value::Str(s), "chars") => Value::List(Rc::new(
                 s.chars().map(|c| Value::str(c.to_string())).collect(),
             )),
+            (Value::Str(s), "lines") => Value::List(Rc::new(
+                s.lines().map(Value::str).collect(),
+            )),
+            (Value::Str(s), "is_empty") => Value::Bool(s.is_empty()),
+            (Value::Str(s), "pad_start" | "pad_end") => {
+                let at_start = name.name == "pad_start";
+                let width = match self.eval_expr(&args[0])? {
+                    Value::Int(i) => i.max(0) as usize,
+                    _ => return Err(Flow::Panic("pad width must be an int".into())),
+                };
+                let fill = self.eval_expr(&args[1])?.to_string();
+                if fill.is_empty() {
+                    return Err(Flow::Panic("pad fill must not be empty".into()));
+                }
+                let len = s.chars().count();
+                // A multi-character fill repeats and is cut to the exact width,
+                // rather than silently using only its first character.
+                let pad: String = fill
+                    .chars()
+                    .cycle()
+                    .take(width.saturating_sub(len))
+                    .collect();
+                if at_start {
+                    Value::str(format!("{pad}{s}"))
+                } else {
+                    Value::str(format!("{s}{pad}"))
+                }
+            }
             (Value::Str(s), "trim") => Value::str(s.trim()),
             (Value::Str(s), "to_upper") => Value::str(s.to_uppercase()),
             (Value::Str(s), "to_lower") => Value::str(s.to_lowercase()),
@@ -1430,6 +1557,7 @@ impl<'a, W: Write> Interp<'a, W> {
                 }
             }
             (Value::Map(entries), "len") => Value::Int(entries.len() as i64),
+            (Value::Map(entries), "is_empty") => Value::Bool(entries.is_empty()),
             (Value::Map(entries), "keys") => Value::List(Rc::new(
                 entries.keys().map(|k| k.to_value()).collect(),
             )),

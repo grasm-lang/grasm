@@ -1439,3 +1439,123 @@ pub unsafe extern "C" fn grasm_list_set(v: *mut RtVal, i: i64, val: *mut RtVal) 
     items[i as usize] = val;
     target
 }
+
+// --- C6: time, environment, process, and the extended collection surface ---
+
+#[no_mangle]
+pub extern "C" fn grasm_now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Returns `Option[str]` for an environment variable.
+/// # Safety: live runtime pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_env(name: *mut RtVal) -> *mut RtVal {
+    match std::env::var(as_str(name)) {
+        Ok(v) => some_of(alloc(RtPayload::Str(v))),
+        Err(_) => none_val(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn grasm_exit(code: i64) {
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
+    std::process::exit(code.clamp(0, 255) as i32);
+}
+
+/// # Safety: live runtime pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_lines(s: *mut RtVal) -> *mut RtVal {
+    let items: Vec<*mut RtVal> = as_str(s)
+        .lines()
+        .map(|l| alloc(RtPayload::Str(l.to_string())))
+        .collect();
+    alloc(RtPayload::List(items))
+}
+
+/// # Safety: live runtime pointers.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_pad(
+    s: *mut RtVal,
+    width: i64,
+    fill: *mut RtVal,
+    at_start: i8,
+) -> *mut RtVal {
+    let text = as_str(s);
+    let fill = as_str(fill);
+    if fill.is_empty() {
+        grasm_panic_msg_str("pad fill must not be empty");
+    }
+    let len = text.chars().count();
+    // A multi-character fill repeats and is cut to the exact width, matching
+    // the interpreter (spec [E-PAD-CYCLE]).
+    let pad: String = fill
+        .chars()
+        .cycle()
+        .take((width.max(0) as usize).saturating_sub(len))
+        .collect();
+    let out = if at_start != 0 {
+        format!("{pad}{text}")
+    } else {
+        format!("{text}{pad}")
+    };
+    alloc(RtPayload::Str(out))
+}
+
+/// # Safety: live runtime pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_is_empty(s: *mut RtVal) -> i8 {
+    i8::from(as_str(s).is_empty())
+}
+
+/// # Safety: live runtime pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_list_is_empty(v: *mut RtVal) -> i8 {
+    i8::from(list_items(v).is_empty())
+}
+
+/// # Safety: live runtime pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_map_is_empty(v: *mut RtVal) -> i8 {
+    match &(*v).payload {
+        RtPayload::Map(entries) => i8::from(entries.is_empty()),
+        _ => grasm_panic_msg_str("is_empty on non-map"),
+    }
+}
+
+/// Minimum (`want_max` = 0) or maximum element as an `Option`.
+/// # Safety: live runtime pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_list_min_max(v: *mut RtVal, want_max: i8) -> *mut RtVal {
+    let items = list_items(v);
+    let mut best: Option<*mut RtVal> = None;
+    for &item in items {
+        best = Some(match best {
+            None => item,
+            Some(cur) => {
+                let ord = cmp_vals(item, cur);
+                let take = if want_max != 0 {
+                    ord == std::cmp::Ordering::Greater
+                } else {
+                    ord == std::cmp::Ordering::Less
+                };
+                if take {
+                    item
+                } else {
+                    cur
+                }
+            }
+        });
+    }
+    match best {
+        Some(b) => {
+            inc(b);
+            some_of(b)
+        }
+        None => none_val(),
+    }
+}
