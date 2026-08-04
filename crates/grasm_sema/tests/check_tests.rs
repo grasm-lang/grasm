@@ -408,3 +408,100 @@ fn effect_op_arity_and_types() {
         "no operation `warn`",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Phase 6: ownership Tier-0
+// ---------------------------------------------------------------------------
+
+const SINK: &str = "fn consume(own s: str) -> i64 {\n    s.len()\n}\n";
+
+#[test]
+fn use_after_move_rejected() {
+    check_err(
+        &format!("{SINK}\nfn main() {{\n    let name = \"ada\"\n    let n = consume(name)\n    print(name)\n}}\n"),
+        "use of moved value `name`",
+    );
+}
+
+#[test]
+fn double_move_rejected() {
+    check_err(
+        &format!("{SINK}\nfn main() {{\n    let name = \"ada\"\n    let a = consume(name)\n    let b = consume(name)\n}}\n"),
+        "use of moved value `name`",
+    );
+}
+
+#[test]
+fn copy_types_do_not_move() {
+    check_ok(
+        "fn consume_int(own x: i64) -> i64 {\n    x + 1\n}\n\nfn main() {\n    let n = 5\n    let a = consume_int(n)\n    let b = consume_int(n)\n    print(\"{a} {b}\")\n}\n",
+    );
+}
+
+#[test]
+fn move_in_loop_rejected() {
+    check_err(
+        &format!("{SINK}\nfn main() {{\n    let name = \"ada\"\n    for i in 0..3 {{\n        let n = consume(name)\n    }}\n}}\n"),
+        "next loop iteration",
+    );
+}
+
+#[test]
+fn move_of_loop_local_ok() {
+    check_ok(&format!(
+        "{SINK}\nfn main() {{\n    for i in 0..3 {{\n        let name = \"a\".repeat(i)\n        let n = consume(name)\n    }}\n}}\n"
+    ));
+}
+
+#[test]
+fn conditional_move_is_conservative() {
+    check_err(
+        &format!("{SINK}\nfn main() {{\n    let name = \"ada\"\n    if name.len() > 2 {{\n        let n = consume(name)\n    }}\n    print(name)\n}}\n"),
+        "use of moved value `name`",
+    );
+}
+
+#[test]
+fn reassignment_revives_moved_var() {
+    check_ok(&format!(
+        "{SINK}\nfn main() {{\n    var name = \"ada\"\n    let n = consume(name)\n    name = \"lovelace\"\n    print(name)\n}}\n"
+    ));
+}
+
+#[test]
+fn inout_arg_must_be_mutable_place() {
+    let bump = "fn bump(inout x: i64) {\n    x += 1\n}\n";
+    check_ok(&format!("{bump}\nfn main() {{\n    var n = 0\n    bump(n)\n    print(\"{{n}}\")\n}}\n"));
+    check_err(
+        &format!("{bump}\nfn main() {{\n    let n = 0\n    bump(n)\n}}\n"),
+        "it is immutable",
+    );
+    check_err(
+        &format!("{bump}\nfn main() {{\n    bump(41)\n}}\n"),
+        "must be a variable",
+    );
+    check_err(
+        &format!("{bump}\nfn main() {{\n    var n = 1\n    bump(n + 1)\n}}\n"),
+        "must be a variable",
+    );
+}
+
+#[test]
+fn inout_exclusivity() {
+    let swapish = "fn combine(inout a: [i64], inout b: [i64]) {\n    a.push(1)\n    b.push(2)\n}\n";
+    check_ok(&format!(
+        "{swapish}\nfn main() {{\n    var xs = [1]\n    var ys = [2]\n    combine(xs, ys)\n}}\n"
+    ));
+    check_err(
+        &format!("{swapish}\nfn main() {{\n    var xs = [1]\n    combine(xs, xs)\n}}\n"),
+        "passed as `inout` twice",
+    );
+}
+
+#[test]
+fn own_plus_inout_same_var_rejected() {
+    check_err(
+        "fn weird(own a: [i64], inout b: [i64]) {\n    b.push(1)\n}\n\nfn main() {\n    var xs = [1]\n    weird(xs, xs)\n}\n",
+        "moved (`own`) and mutated (`inout`)",
+    );
+}

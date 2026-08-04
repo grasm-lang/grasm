@@ -31,12 +31,17 @@ pub fn check(module: &Module) -> Analysis {
 struct Binding {
     ty: Type,
     mutable: bool,
+    /// Ownership was transferred with `own` — further use is an error.
+    moved: bool,
+    /// Loop nesting depth at declaration (for move-in-loop detection).
+    decl_loop_depth: u32,
 }
 
 #[derive(Clone)]
 struct FnInfo {
     generics: usize,
     params: Vec<Type>,
+    modes: Vec<ParamMode>,
     ret: Type,
     err: Option<Type>,
 }
@@ -262,6 +267,7 @@ impl Checker {
                     FnInfo {
                         generics: generics.len(),
                         params,
+                        modes: f.params.iter().map(|p| p.mode).collect(),
                         ret,
                         err,
                     },
@@ -388,6 +394,8 @@ impl Checker {
                 Binding {
                     ty: ty.clone(),
                     mutable: p.mode == ParamMode::Inout,
+                    moved: false,
+                    decl_loop_depth: 0,
                 },
             );
         }
@@ -463,6 +471,15 @@ impl Checker {
             Stmt::Assign {
                 target, op, value, ..
             } => {
+                // Re-initializing a moved variable revives it.
+                if *op == AssignOp::Assign {
+                    if let Expr::Ident(id) = target {
+                        let name = id.name.clone();
+                        if let Some(b) = self.lookup_mut(&name) {
+                            b.moved = false;
+                        }
+                    }
+                }
                 self.check_assign_target(target);
                 let target_ty = self.infer_expr(target);
                 if *op == AssignOp::Assign {
@@ -578,10 +595,57 @@ impl Checker {
     }
 
     fn bind(&mut self, name: &Ident, ty: Type, mutable: bool) {
-        self.scopes
-            .last_mut()
-            .unwrap()
-            .insert(name.name.clone(), Binding { ty, mutable });
+        let decl_loop_depth = self.loop_depth;
+        self.scopes.last_mut().unwrap().insert(
+            name.name.clone(),
+            Binding {
+                ty,
+                mutable,
+                moved: false,
+                decl_loop_depth,
+            },
+        );
+    }
+
+    fn lookup_mut(&mut self, name: &str) -> Option<&mut Binding> {
+        for scope in self.scopes.iter_mut().rev() {
+            if scope.contains_key(name) {
+                return scope.get_mut(name);
+            }
+        }
+        None
+    }
+
+    /// Marks `name` as moved (`own` transfer). Errors for loop-crossing moves.
+    fn mark_moved(&mut self, id: &Ident) {
+        let loop_depth = self.loop_depth;
+        let mut err: Option<Diagnostic> = None;
+        if let Some(b) = self.lookup_mut(&id.name) {
+            if b.decl_loop_depth < loop_depth {
+                err = Some(
+                    Diagnostic::error(
+                        id.span,
+                        format!(
+                            "cannot move `{}` here — it would be gone in the next loop iteration",
+                            id.name
+                        ),
+                    )
+                    .with_help("move a copy instead, or restructure so the move happens outside the loop"),
+                );
+            } else {
+                b.moved = true;
+            }
+        }
+        if let Some(d) = err {
+            self.diags.push(d);
+        }
+    }
+
+    fn is_copy_type(&self, ty: &Type) -> bool {
+        matches!(
+            self.uni.resolve(ty),
+            Type::I64 | Type::F64 | Type::Bool | Type::Unit | Type::Range
+        )
     }
 
     fn lookup(&self, name: &str) -> Option<Binding> {
@@ -792,6 +856,13 @@ impl Checker {
 
     fn infer_ident(&mut self, id: &Ident) -> Type {
         if let Some(b) = self.lookup(&id.name) {
+            if b.moved {
+                return self.error_help(
+                    id.span,
+                    format!("use of moved value `{}`", id.name),
+                    "ownership was transferred with `own` — the value is gone here",
+                );
+            }
             return b.ty;
         }
         // Nullary variant used as a value (e.g. `None`).
@@ -1057,6 +1128,74 @@ impl Checker {
         for (a, p) in args.iter().zip(&info.params) {
             let want = substitute_generics(p, &fresh);
             self.check_expr(a, &want);
+        }
+        // Ownership Tier-0: `own` moves, `inout` needs an exclusive mutable place.
+        let mut inout_roots: Vec<(String, Span)> = Vec::new();
+        let mut own_roots: Vec<String> = Vec::new();
+        for ((a, p), mode) in args.iter().zip(&info.params).zip(&info.modes) {
+            match mode {
+                ParamMode::Own => {
+                    if let Expr::Ident(id) = a {
+                        if !self.is_copy_type(p) && self.lookup(&id.name).is_some() {
+                            self.mark_moved(id);
+                            own_roots.push(id.name.clone());
+                        }
+                    }
+                }
+                ParamMode::Inout => {
+                    let root = place_root(a);
+                    match root {
+                        Some(id) => {
+                            match self.lookup(&id.name) {
+                                Some(b) if !b.mutable => {
+                                    self.error_help(
+                                        id.span,
+                                        format!(
+                                            "cannot pass `{}` as `inout` — it is immutable",
+                                            id.name
+                                        ),
+                                        format!("declare it with `var {}`", id.name),
+                                    );
+                                }
+                                Some(_) => {}
+                                None => {} // unknown-name error already reported
+                            }
+                            if let Some((first, _)) =
+                                inout_roots.iter().find(|(n, _)| n == &id.name)
+                            {
+                                let first = first.clone();
+                                self.error_help(
+                                    id.span,
+                                    format!(
+                                        "`{first}` is passed as `inout` twice in one call"
+                                    ),
+                                    "two exclusive references to the same value cannot coexist",
+                                );
+                            }
+                            inout_roots.push((id.name.clone(), id.span));
+                        }
+                        None => {
+                            self.error_help(
+                                a.span(),
+                                "`inout` argument must be a variable, field, or index expression",
+                                "temporaries cannot be mutated in place",
+                            );
+                        }
+                    }
+                }
+                ParamMode::Let => {}
+            }
+        }
+        for (n, s) in &inout_roots {
+            if own_roots.contains(n) {
+                self.diags.push(
+                    Diagnostic::error(
+                        *s,
+                        format!("`{n}` is both moved (`own`) and mutated (`inout`) in one call"),
+                    )
+                    .with_help("a value cannot be transferred and borrowed at the same time"),
+                );
+            }
         }
         let ret = substitute_generics(&info.ret, &fresh);
         match &info.err {
@@ -1836,6 +1975,15 @@ impl Checker {
             params: param_tys,
             ret: Box::new(ret),
         }
+    }
+}
+
+/// Root identifier of a place expression (`x`, `x.f`, `x[i].g`), if any.
+fn place_root(e: &Expr) -> Option<&Ident> {
+    match e {
+        Expr::Ident(id) => Some(id),
+        Expr::Field { recv, .. } | Expr::Index { recv, .. } => place_root(recv),
+        _ => None,
     }
 }
 

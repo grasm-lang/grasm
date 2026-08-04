@@ -411,3 +411,52 @@ fn main() {
         "4\n5\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Phase 6: ownership at runtime — inout copy-in/copy-out
+// ---------------------------------------------------------------------------
+
+#[test]
+fn inout_writeback_scalar() {
+    run_expect(
+        "fn bump(inout x: i64) {\n    x += 1\n}\n\nfn main() {\n    var n = 41\n    bump(n)\n    print(\"{n}\")\n}\n",
+        "42\n",
+    );
+}
+
+#[test]
+fn inout_writeback_list_and_field() {
+    run_expect(
+        r#"type Bag = { items: [i64] }
+
+fn add_item(inout xs: [i64], v: i64) {
+    xs.push(v)
+}
+
+fn main() {
+    var bag = Bag{ items: [1] }
+    add_item(bag.items, 2)
+    add_item(bag.items, 3)
+    print("{bag.items}")
+}
+"#,
+        "[1, 2, 3]\n",
+    );
+}
+
+#[test]
+fn inout_ufcs_receiver() {
+    run_expect(
+        "fn double_all(inout xs: [i64]) {\n    var i = 0\n    while i < xs.len() {\n        xs[i] *= 2\n        i += 1\n    }\n}\n\nfn main() {\n    var xs = [1, 2, 3]\n    xs.double_all()\n    print(\"{xs}\")\n}\n",
+        "[2, 4, 6]\n",
+    );
+}
+
+#[test]
+fn let_params_still_copy() {
+    // Non-inout param mutations must NOT leak to the caller.
+    run_expect(
+        "fn tweak(xs: [i64]) -> i64 {\n    xs.len()\n}\n\nfn main() {\n    var a = [1, 2]\n    let n = tweak(a)\n    print(\"{a.len()} {n}\")\n}\n",
+        "2 2\n",
+    );
+}

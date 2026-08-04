@@ -1,0 +1,21 @@
+// Tier-0 ownership: own transfers, inout mutates in place, default copies.
+fn consume(own secret: str) -> i64 {
+    secret.len()
+}
+
+fn bump(inout counter: i64) {
+    counter += 1
+}
+
+fn main() {
+    // own: the value is gone after transfer (uncomment to see the error)
+    let token = "abc123"
+    let n = consume(token)
+    // print(token)   // error: use of moved value `token`
+
+    // inout: caller sees the mutation
+    var hits = 0
+    bump(hits)
+    bump(hits)
+    print("len={n} hits={hits}")
+}

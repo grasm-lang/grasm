@@ -36,6 +36,8 @@ pub struct Interp<'a, W: Write> {
     pub out: &'a mut W,
     /// Recursion guard.
     depth: u32,
+    /// `inout` copy-out values from the last `call_decl` (param index → value).
+    pending_writebacks: Vec<(usize, Value)>,
 }
 
 const MAX_DEPTH: u32 = 2_000;
@@ -90,6 +92,7 @@ impl<'a, W: Write> Interp<'a, W> {
             handlers: Vec::new(),
             out,
             depth: 0,
+            pending_writebacks: Vec::new(),
         }
     }
 
@@ -168,6 +171,17 @@ impl<'a, W: Write> Interp<'a, W> {
         let saved = std::mem::take(&mut self.scopes);
         self.scopes.push(scope);
         let result = self.eval_block(&f.body);
+        // Copy-out for `inout` params (applied by the caller to its places).
+        self.pending_writebacks.clear();
+        if result.is_ok() || matches!(result, Err(Flow::Return(_))) {
+            for (i, p) in f.params.iter().enumerate() {
+                if p.mode == ParamMode::Inout {
+                    if let Some(v) = self.scopes[0].get(&p.name.name) {
+                        self.pending_writebacks.push((i, v.clone()));
+                    }
+                }
+            }
+        }
         self.scopes = saved;
         self.depth -= 1;
 
@@ -358,6 +372,23 @@ impl<'a, W: Write> Interp<'a, W> {
                 Ok(Value::Unit)
             }
         }
+    }
+
+    /// Applies `inout` copy-out values to the caller's argument places.
+    fn apply_writebacks(&mut self, arg_exprs: &[&Expr]) -> Result<(), Flow> {
+        let wbs = std::mem::take(&mut self.pending_writebacks);
+        for (i, v) in wbs {
+            if let Some(e) = arg_exprs.get(i) {
+                let is_place = matches!(
+                    e,
+                    Expr::Ident(_) | Expr::Field { .. } | Expr::Index { .. }
+                );
+                if is_place {
+                    self.assign_place(e, v)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -732,7 +763,10 @@ impl<'a, W: Write> Interp<'a, W> {
                     for a in args {
                         vs.push(self.eval_expr(a)?);
                     }
-                    return self.call_decl(f, vs);
+                    let r = self.call_decl(f, vs)?;
+                    let arg_refs: Vec<&Expr> = args.iter().collect();
+                    self.apply_writebacks(&arg_refs)?;
+                    return Ok(r);
                 }
             }
         }
@@ -831,7 +865,12 @@ impl<'a, W: Write> Interp<'a, W> {
             for a in args {
                 vs.push(self.eval_expr(a)?);
             }
-            return self.call_decl(f, vs);
+            let r = self.call_decl(f, vs)?;
+            let mut arg_refs: Vec<&Expr> = Vec::with_capacity(args.len() + 1);
+            arg_refs.push(recv);
+            arg_refs.extend(args.iter());
+            self.apply_writebacks(&arg_refs)?;
+            return Ok(r);
         }
         Err(Flow::Panic(format!(
             "no method `{}` on `{recv_v}`",
