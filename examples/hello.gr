@@ -1,0 +1,12 @@
+// First Grasm program — exercises most Phase-1 lexemes.
+pub fn main() {
+    let name = "world"
+    let xs = [1, 2, 3, 4, 5]
+    var total = 0
+    for x in xs {
+        if x % 2 == 0 {
+            total += x
+        }
+    }
+    print("hello, {name}! even sum: {total}")
+}
