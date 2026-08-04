@@ -23,7 +23,7 @@ skip=0
 declare -a FAILED=()
 declare -a SKIPPED=()
 
-programs=$(find examples projects spec/conformance -name '*.gr' | sort)
+programs=$(find examples projects spec/conformance benchmarks/grasm -name '*.gr' | sort)
 
 for src in $programs; do
     # Library modules (no `main`) are not standalone programs.

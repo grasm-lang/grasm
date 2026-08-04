@@ -1,0 +1,21 @@
+fn main() {
+    let limit = 2000000
+    var flags: [bool] = []
+    for _slot in 0..=limit {
+        flags.push(true)
+    }
+    var count = 0
+    var i = 2
+    while i <= limit {
+        if flags[i] {
+            count = count + 1
+            var j = i * i
+            while j <= limit {
+                flags[j] = false
+                j = j + i
+            }
+        }
+        i = i + 1
+    }
+    print("{count}")
+}

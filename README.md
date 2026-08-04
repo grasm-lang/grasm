@@ -56,6 +56,25 @@ Phase 2 additions: **modules** (`import utils` / `import lib.math`, qualified
 deterministic iteration), and **`grasm build`** (bundles all modules with the
 runtime into one distributable executable).
 
+### Performance
+
+Five programs written the same way in Grasm, C, Rust, Go, and Python. Best of
+3, milliseconds, Apple M-series:
+
+| program  |   C |  Rust |  Go | grasm-native | Python |
+|----------|----:|------:|----:|-------------:|-------:|
+| fib      |  26 |    27 |  29 |       **28** |    154 |
+| sieve    |  29 |    28 |  30 |           84 |    399 |
+| matmul   |  26 |    26 |  29 |          184 |    990 |
+| wordfreq |  53 |    48 |  40 |          183 |    152 |
+| sort     |  59 |    35 |  70 |          102 |    241 |
+
+`./scripts/bench.sh` builds every implementation, checks each one against the
+interpreter's answer, and refuses to report a timing for a wrong one. Native
+Grasm matches C on call-and-arithmetic work; the remaining gap is that values
+inside collections are boxed, so an inner loop writing to a list allocates.
+See `benchmarks/README.md`.
+
 ### Debugging
 
 A panic prints a stack trace to stderr, innermost frame first:

@@ -147,12 +147,58 @@ fn alloc(payload: RtPayload) -> *mut RtVal {
     }))
 }
 
+/// Refcount marking a value that is shared forever and never freed.
+///
+/// Boxing a `bool` or a small `i64` used to allocate, so a loop writing into a
+/// list allocated once per element. These values are immutable and tiny, so a
+/// single instance can be shared by everyone; the sentinel keeps `inc`/`dec`
+/// from ever freeing one.
+const IMMORTAL: i64 = i64::MAX;
+
+/// Small integers worth interning. Covers loop counters, indices, flags, and
+/// the small constants that dominate real programs.
+const SMALL_MIN: i64 = -128;
+const SMALL_MAX: i64 = 1024;
+
+thread_local! {
+    static INTERNED: Vec<*mut RtVal> = {
+        let mut table = Vec::with_capacity((SMALL_MAX - SMALL_MIN + 3) as usize);
+        for v in [false, true] {
+            table.push(Box::into_raw(Box::new(RtVal {
+                rc: Cell::new(IMMORTAL),
+                payload: RtPayload::Bool(v),
+            })));
+        }
+        for n in SMALL_MIN..=SMALL_MAX {
+            table.push(Box::into_raw(Box::new(RtVal {
+                rc: Cell::new(IMMORTAL),
+                payload: RtPayload::I64(n),
+            })));
+        }
+        table
+    };
+}
+
+fn interned_bool(v: bool) -> *mut RtVal {
+    INTERNED.with(|t| t[usize::from(v)])
+}
+
+/// The shared box for `n`, or null when `n` is outside the interned range.
+fn interned_int(n: i64) -> *mut RtVal {
+    if !(SMALL_MIN..=SMALL_MAX).contains(&n) {
+        return std::ptr::null_mut();
+    }
+    INTERNED.with(|t| t[(n - SMALL_MIN) as usize + 2])
+}
+
 /// # Safety
 /// `v` must be a live pointer produced by this runtime.
 unsafe fn inc(v: *mut RtVal) {
     if !v.is_null() {
         let rc = &(*v).rc;
-        rc.set(rc.get() + 1);
+        if rc.get() != IMMORTAL {
+            rc.set(rc.get() + 1);
+        }
     }
 }
 
@@ -163,6 +209,9 @@ unsafe fn dec(v: *mut RtVal) {
         return;
     }
     let rc = &(*v).rc;
+    if rc.get() == IMMORTAL {
+        return;
+    }
     rc.set(rc.get() - 1);
     if rc.get() <= 0 {
         let boxed = Box::from_raw(v);
@@ -337,7 +386,12 @@ pub unsafe extern "C" fn grasm_list_get(v: *mut RtVal, i: i64) -> *mut RtVal {
 
 #[no_mangle]
 pub extern "C" fn grasm_box_i64(v: i64) -> *mut RtVal {
-    alloc(RtPayload::I64(v))
+    let shared = interned_int(v);
+    if shared.is_null() {
+        alloc(RtPayload::I64(v))
+    } else {
+        shared
+    }
 }
 
 #[no_mangle]
@@ -347,7 +401,7 @@ pub extern "C" fn grasm_box_f64(v: f64) -> *mut RtVal {
 
 #[no_mangle]
 pub extern "C" fn grasm_box_bool(v: i8) -> *mut RtVal {
-    alloc(RtPayload::Bool(v != 0))
+    interned_bool(v != 0)
 }
 
 /// # Safety
@@ -808,6 +862,22 @@ unsafe fn cow_map(m: *mut RtVal) -> *mut RtVal {
 
 /// # Safety: key/val ownership transfers; returns the (possibly new) map.
 #[no_mangle]
+/// Position of `k` in a map's sorted entries.
+///
+/// Entries are kept in key order so iteration is deterministic ([E-MAP-ORDER]),
+/// which means lookups can binary search. A linear scan here made every map
+/// operation O(n) and whole programs O(n^2).
+///
+/// # Safety: live pointers into a map's entry vector.
+unsafe fn map_find(
+    entries: &[(*mut RtVal, *mut RtVal)],
+    k: *mut RtVal,
+) -> Result<usize, usize> {
+    entries.binary_search_by(|(ek, _)| map_key_ord(&**ek, &*k))
+}
+
+/// # Safety: live pointers.
+#[no_mangle]
 pub unsafe extern "C" fn grasm_map_set(
     m: *mut RtVal,
     k: *mut RtVal,
@@ -817,19 +887,14 @@ pub unsafe extern "C" fn grasm_map_set(
     let RtPayload::Map(entries) = &mut (*target).payload else {
         unreachable!()
     };
-    for (ek, ev) in entries.iter_mut() {
-        if map_key_ord(&**ek, &*k) == std::cmp::Ordering::Equal {
-            dec(*ev);
-            *ev = v;
+    match map_find(entries, k) {
+        Ok(i) => {
+            dec(entries[i].1);
+            entries[i].1 = v;
             dec(k);
-            return target;
         }
+        Err(pos) => entries.insert(pos, (k, v)),
     }
-    let pos = entries
-        .iter()
-        .position(|(ek, _)| map_key_ord(&**ek, &*k) == std::cmp::Ordering::Greater)
-        .unwrap_or(entries.len());
-    entries.insert(pos, (k, v));
     target
 }
 
@@ -839,15 +904,14 @@ pub unsafe extern "C" fn grasm_map_get(m: *mut RtVal, k: *mut RtVal) -> *mut RtV
     let RtPayload::Map(entries) = &(*m).payload else {
         grasm_panic_msg_str("get on non-map");
     };
-    for (ek, ev) in entries {
-        if map_key_ord(&**ek, &*k) == std::cmp::Ordering::Equal {
-            inc(*ev);
-            return alloc(RtPayload::Variant {
-                type_name: "Option".into(),
-                name: "Some".into(),
-                fields: vec![*ev],
-            });
-        }
+    if let Ok(i) = map_find(entries, k) {
+        let ev = entries[i].1;
+        inc(ev);
+        return alloc(RtPayload::Variant {
+            type_name: "Option".into(),
+            name: "Some".into(),
+            fields: vec![ev],
+        });
     }
     alloc(RtPayload::Variant {
         type_name: "Option".into(),
@@ -862,11 +926,7 @@ pub unsafe extern "C" fn grasm_map_has(m: *mut RtVal, k: *mut RtVal) -> i8 {
     let RtPayload::Map(entries) = &(*m).payload else {
         grasm_panic_msg_str("has on non-map");
     };
-    i8::from(
-        entries
-            .iter()
-            .any(|(ek, _)| map_key_ord(&**ek, &*k) == std::cmp::Ordering::Equal),
-    )
+    i8::from(map_find(entries, k).is_ok())
 }
 
 /// # Safety: live pointers; returns (map, removed?) via out-param style: the
@@ -881,10 +941,7 @@ pub unsafe extern "C" fn grasm_map_delete(
     let RtPayload::Map(entries) = &mut (*target).payload else {
         unreachable!()
     };
-    let pos = entries
-        .iter()
-        .position(|(ek, _)| map_key_ord(&**ek, &*k) == std::cmp::Ordering::Equal);
-    match pos {
+    match map_find(entries, k).ok() {
         Some(i) => {
             let (ek, ev) = entries.remove(i);
             dec(ek);
