@@ -1,0 +1,21 @@
+Grasm
+Copyright 2026 The Grasm Authors
+
+This product includes software developed by the Grasm Authors.
+
+Licensed under the Apache License, Version 2.0. See LICENSE for the full text.
+
+Third-party components:
+
+  Cranelift (cranelift-codegen, cranelift-frontend, cranelift-module,
+  cranelift-object) — Apache License 2.0 with LLVM Exception.
+  https://github.com/bytecodealliance/wasmtime
+
+  target-lexicon — Apache License 2.0 with LLVM Exception.
+  https://github.com/bytecodealliance/target-lexicon
+
+  Every other dependency of the native backend is a transitive dependency of
+  those two. The rest of the toolchain — lexer, parser, typechecker, effect
+  system, interpreter, package manager, language server, debug adapter, and
+  the SHA-256 and TOML and JSON readers they use — has no third-party
+  dependencies.

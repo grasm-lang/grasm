@@ -462,3 +462,83 @@ fn every_tutorial_program_compiles_and_runs() {
         failures.join("\n\n")
     );
 }
+
+/// Every clause's stability level, from `spec/stability.md`.
+fn stability_levels() -> std::collections::BTreeMap<String, String> {
+    let path = spec_dir().join("stability.md");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{} should be readable: {e}", path.display()));
+    let mut out = std::collections::BTreeMap::new();
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("- `") else {
+            continue;
+        };
+        let Some((tag, tail)) = rest.split_once('`') else {
+            panic!("malformed stability entry: {line}");
+        };
+        let level = tail.trim_start_matches(" — ").trim().to_string();
+        if let Some(previous) = out.insert(tag.to_string(), level) {
+            panic!("`{tag}` is listed twice in spec/stability.md (first as {previous})");
+        }
+    }
+    out
+}
+
+#[test]
+fn every_clause_has_a_stability_level() {
+    // A clause with no level would make docs/stability.md a claim about
+    // nothing in particular; an entry with no clause would be a promise about
+    // a rule that no longer exists.
+    let declared = declared_tags();
+    let levels = stability_levels();
+    let known = ["stable", "provisional", "experimental"];
+
+    let missing: Vec<&String> = declared.iter().filter(|t| !levels.contains_key(*t)).collect();
+    assert!(
+        missing.is_empty(),
+        "{} clause(s) have no stability level — add them to spec/stability.md:\n  {}",
+        missing.len(),
+        missing
+            .iter()
+            .map(|t| t.as_str())
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    );
+
+    let orphaned: Vec<&String> = levels.keys().filter(|t| !declared.contains(*t)).collect();
+    assert!(
+        orphaned.is_empty(),
+        "{} stability entr(ies) name a clause that does not exist:\n  {}",
+        orphaned.len(),
+        orphaned
+            .iter()
+            .map(|t| t.as_str())
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    );
+
+    let bad: Vec<String> = levels
+        .iter()
+        .filter(|(_, v)| !known.contains(&v.as_str()))
+        .map(|(k, v)| format!("{k} = {v:?}"))
+        .collect();
+    assert!(
+        bad.is_empty(),
+        "unknown stability level(s); expected one of {known:?}:\n  {}",
+        bad.join("\n  ")
+    );
+}
+
+#[test]
+fn the_stability_policy_and_the_table_agree_on_the_levels() {
+    // The prose names three levels. If it ever names a fourth, or renames one,
+    // the table would silently keep using the old vocabulary.
+    let policy = std::fs::read_to_string(spec_dir().parent().unwrap().join("docs/stability.md"))
+        .expect("docs/stability.md should be readable");
+    for level in ["stable", "provisional", "experimental"] {
+        assert!(
+            policy.contains(&format!("**`{level}`**")),
+            "docs/stability.md does not define the `{level}` level"
+        );
+    }
+}

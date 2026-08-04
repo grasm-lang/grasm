@@ -302,3 +302,15 @@ zero clippy warnings, and a 3-platform CI matrix. The interpreter remains the
 reference semantics; the native backend is checked against it on every program,
 on both the host and a cross-compiled target. Next milestones (see MASTERPLAN
 §13): LSP, concurrency runtime, package manager, first-class function values.
+
+## Project
+
+Apache-2.0 (`LICENSE`, `NOTICE`). Pre-1.0 — `docs/stability.md` says exactly
+what that means, and `spec/stability.md` records the level of every normative
+clause. A clause with no recorded level fails the test suite, so the policy
+cannot drift away from the specification.
+
+- `CONTRIBUTING.md` — the gates, and the one rule the rest follows from
+- `GOVERNANCE.md` — how decisions get made today, without pretending otherwise
+- `SECURITY.md` — the threat model, and what it does not cover
+- `CODE_OF_CONDUCT.md`, `CHANGELOG.md`
