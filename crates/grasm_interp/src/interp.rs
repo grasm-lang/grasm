@@ -29,6 +29,10 @@ pub struct Interp<'a, W: Write> {
     /// variant name → (owning type, arity); only unambiguous entries.
     variants: HashMap<String, Option<(String, usize)>>,
     scopes: Vec<HashMap<String, Value>>,
+    /// Declared effect names (for op-call dispatch).
+    effect_names: std::collections::HashSet<String>,
+    /// Innermost-last handler stack: (effect name, op name → closure).
+    handlers: Vec<(String, HashMap<String, Value>)>,
     pub out: &'a mut W,
     /// Recursion guard.
     depth: u32,
@@ -71,11 +75,19 @@ impl<'a, W: Write> Interp<'a, W> {
                 _ => {}
             }
         }
+        let mut effect_names = std::collections::HashSet::new();
+        for decl in &module.decls {
+            if let Decl::Effect(e) = decl {
+                effect_names.insert(e.name.name.clone());
+            }
+        }
         Interp {
             fns,
             sums,
             variants,
             scopes: Vec::new(),
+            effect_names,
+            handlers: Vec::new(),
             out,
             depth: 0,
         }
@@ -287,6 +299,27 @@ impl<'a, W: Write> Interp<'a, W> {
                         Err(other) => return Err(other),
                     }
                 }
+                Ok(Value::Unit)
+            }
+            Stmt::With {
+                effect,
+                handler,
+                body,
+                ..
+            } => {
+                let h = self.eval_expr(handler)?;
+                let Value::Struct { fields, .. } = h else {
+                    return Err(Flow::Panic(format!(
+                        "handler for effect `{}` must be a handler struct",
+                        effect.dotted()
+                    )));
+                };
+                let ops: HashMap<String, Value> =
+                    fields.iter().cloned().collect();
+                self.handlers.push((effect.dotted(), ops));
+                let r = self.eval_block(body);
+                self.handlers.pop();
+                r?;
                 Ok(Value::Unit)
             }
             Stmt::For {
@@ -741,8 +774,31 @@ impl<'a, W: Write> Interp<'a, W> {
         }
     }
 
-    /// Qualified variant call `Type.Variant(args)` or builtin/UFCS method.
+    /// Effect op / qualified variant call / builtin / UFCS method.
     fn eval_method_call(&mut self, recv: &Expr, name: &Ident, args: &[Expr]) -> EResult {
+        // Effect operation dispatch: innermost handler wins.
+        if let Expr::Ident(tid) = recv {
+            let is_local = self.scopes.iter().rev().any(|s| s.contains_key(&tid.name));
+            if !is_local && self.effect_names.contains(&tid.name) {
+                let handler_fn = self
+                    .handlers
+                    .iter()
+                    .rev()
+                    .find(|(e, _)| e == &tid.name)
+                    .and_then(|(_, ops)| ops.get(&name.name).cloned());
+                let Some(f) = handler_fn else {
+                    return Err(Flow::Panic(format!(
+                        "unhandled effect `{}.{}` — no handler installed",
+                        tid.name, name.name
+                    )));
+                };
+                let mut vs = Vec::with_capacity(args.len());
+                for a in args {
+                    vs.push(self.eval_expr(a)?);
+                }
+                return self.call_value(f, vs, "effect op");
+            }
+        }
         if let Expr::Ident(tid) = recv {
             let is_local = self.scopes.iter().rev().any(|s| s.contains_key(&tid.name));
             if !is_local && self.sums.contains_key(&tid.name) {

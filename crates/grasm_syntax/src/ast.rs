@@ -220,6 +220,13 @@ pub enum Stmt {
         body: Block,
         span: Span,
     },
+    /// `with Clock handled_by ClockHandler{ now: || 0 } { ... }`
+    With {
+        effect: Path,
+        handler: Expr,
+        body: Block,
+        span: Span,
+    },
 }
 
 // ---------------------------------------------------------------------------

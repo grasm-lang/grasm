@@ -688,6 +688,20 @@ impl Parser {
                     span,
                 })
             }
+            TokenKind::KwWith => {
+                self.bump();
+                let effect = self.parse_path()?;
+                self.expect(&TokenKind::KwHandledBy)?;
+                let handler = self.parse_expr()?;
+                let body = self.parse_block()?;
+                let span = start.merge(body.span);
+                Ok(Stmt::With {
+                    effect,
+                    handler,
+                    body,
+                    span,
+                })
+            }
             _ => {
                 let expr = self.parse_expr()?;
                 let op = match self.cur() {
@@ -1105,7 +1119,7 @@ impl Parser {
                 };
                 // Struct literal: `Name{ ... }` — only when allowed here.
                 if !self.no_struct_lit && self.at(&TokenKind::LBrace) {
-                    return self.parse_struct_lit(ident);
+                    return self.parse_struct_lit_or_ident(ident);
                 }
                 Ok(Expr::Ident(ident))
             }
@@ -1164,6 +1178,39 @@ impl Parser {
                 ));
                 Err(())
             }
+        }
+    }
+
+    /// Attempts `Name{ field: v, ... }`. If the braces turn out not to be a
+    /// struct literal (e.g. a following block), rolls back and returns the
+    /// plain identifier — this keeps `handled_by h { ... }` unambiguous.
+    fn parse_struct_lit_or_ident(&mut self, name: Ident) -> PResult<Expr> {
+        let save_i = self.i;
+        let save_modes = self.modes.len();
+        let save_diags = self.diags.len();
+        // Lookahead after `{`: struct literal iff `ident :` follows.
+        // (Empty `{}` counts as a block, so `handled_by h { }` parses.)
+        self.bump(); // LBrace
+        self.skip_newlines();
+        let is_struct = match self.cur().clone() {
+            TokenKind::Ident(_) => {
+                // Peek one past the ident for a `:` (raw scan, skipping nothing).
+                let mut j = self.i + 1;
+                while matches!(self.toks[j].kind, TokenKind::Newline) {
+                    j += 1;
+                }
+                matches!(self.toks[j].kind, TokenKind::Colon)
+            }
+            _ => false,
+        };
+        // Roll back to before the `{` either way; parse_struct_lit re-consumes.
+        self.i = save_i;
+        self.modes.truncate(save_modes);
+        self.diags.truncate(save_diags);
+        if is_struct {
+            self.parse_struct_lit(name)
+        } else {
+            Ok(Expr::Ident(name))
         }
     }
 

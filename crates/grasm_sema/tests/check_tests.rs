@@ -328,3 +328,83 @@ fn fail_builtin() {
         "declares",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Phase 5: effects
+// ---------------------------------------------------------------------------
+
+const CLOCK: &str = "effect Clock {\n    fn now() -> i64\n}\n\nfn is_late(t: i64) -> bool {\n    Clock.now() > t\n}\n";
+
+#[test]
+fn effect_handled_in_main_ok() {
+    check_ok(&format!(
+        "{CLOCK}\nfn main() {{\n    with Clock handled_by ClockHandler{{ now: || 100 }} {{\n        print(\"{{is_late(50)}}\")\n    }}\n}}\n"
+    ));
+}
+
+#[test]
+fn unhandled_effect_in_main_rejected() {
+    check_err(
+        &format!("{CLOCK}\nfn main() {{\n    print(\"{{is_late(50)}}\")\n}}\n"),
+        "unhandled effect",
+    );
+}
+
+#[test]
+fn declared_row_is_upper_bound() {
+    // Declares only io but performs Clock → error.
+    check_err(
+        &format!(
+            "{CLOCK}\nfn f() / {{io}} {{\n    let x = is_late(1)\n    print(\"{{x}}\")\n}}\n\nfn main() {{\n    with Clock handled_by ClockHandler{{ now: || 1 }} {{\n        f()\n    }}\n}}\n"
+        ),
+        "not in its declared row",
+    );
+    // Declaring both is fine.
+    check_ok(&format!(
+        "{CLOCK}\nfn f() / {{io, Clock}} {{\n    let x = is_late(1)\n    print(\"{{x}}\")\n}}\n\nfn main() {{\n    with Clock handled_by ClockHandler{{ now: || 1 }} {{\n        f()\n    }}\n}}\n"
+    ));
+}
+
+#[test]
+fn unknown_effect_in_with() {
+    check_err(
+        "fn main() {\n    with Nope handled_by x {\n    }\n}\n",
+        "unknown effect",
+    );
+}
+
+#[test]
+fn unknown_effect_in_declared_row() {
+    check_err(
+        "fn f() / {Bogus} {\n}\n",
+        "unknown effect `Bogus`",
+    );
+}
+
+#[test]
+fn handler_type_checked() {
+    // Handler op closure with wrong return type.
+    check_err(
+        &format!(
+            "{CLOCK}\nfn main() {{\n    with Clock handled_by ClockHandler{{ now: || \"soon\" }} {{\n        print(\"{{is_late(1)}}\")\n    }}\n}}\n"
+        ),
+        "type mismatch",
+    );
+}
+
+#[test]
+fn effect_op_arity_and_types() {
+    let logger = "effect Logger {\n    fn log(msg: str)\n}\n";
+    check_err(
+        &format!("{logger}\nfn f() {{\n    Logger.log()\n}}\n"),
+        "takes 1 argument(s)",
+    );
+    check_err(
+        &format!("{logger}\nfn f() {{\n    Logger.log(42)\n}}\n"),
+        "type mismatch",
+    );
+    check_err(
+        &format!("{logger}\nfn f() {{\n    Logger.warn(\"x\")\n}}\n"),
+        "no operation `warn`",
+    );
+}

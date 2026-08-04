@@ -316,3 +316,98 @@ fn main() {
 "#;
     run_expect(src, "excellent\npassed with 72\nfailed: too low\n");
 }
+
+// ---------------------------------------------------------------------------
+// Phase 5: effects at runtime
+// ---------------------------------------------------------------------------
+
+#[test]
+fn effect_handler_dispatch() {
+    run_expect(
+        r#"effect Clock {
+    fn now() -> i64
+}
+
+fn is_late(t: i64) -> bool {
+    Clock.now() > t
+}
+
+fn main() {
+    with Clock handled_by ClockHandler{ now: || 100 } {
+        print("{is_late(50)} {is_late(200)}")
+    }
+}
+"#,
+        "true false\n",
+    );
+}
+
+#[test]
+fn innermost_handler_wins() {
+    run_expect(
+        r#"effect Clock {
+    fn now() -> i64
+}
+
+fn main() {
+    with Clock handled_by ClockHandler{ now: || 1 } {
+        print("{Clock.now()}")
+        with Clock handled_by ClockHandler{ now: || 2 } {
+            print("{Clock.now()}")
+        }
+        print("{Clock.now()}")
+    }
+}
+"#,
+        "1\n2\n1\n",
+    );
+}
+
+#[test]
+fn effect_ops_with_params() {
+    run_expect(
+        r#"effect Greeter {
+    fn greet(name: str) -> str
+}
+
+fn welcome(who: str) -> str {
+    Greeter.greet(who)
+}
+
+fn main() {
+    with Greeter handled_by GreeterHandler{ greet: |n| "hello, " + n } {
+        print(welcome("ada"))
+    }
+    with Greeter handled_by GreeterHandler{ greet: |n| n.to_upper() + "!" } {
+        print(welcome("ada"))
+    }
+}
+"#,
+        "hello, ada\nADA!\n",
+    );
+}
+
+#[test]
+fn handler_swapping_enables_testing_pattern() {
+    // The DI-without-frameworks pattern from the master plan.
+    run_expect(
+        r#"effect Rand {
+    fn next() -> i64
+}
+
+fn roll() -> i64 {
+    Rand.next() % 6 + 1
+}
+
+fn main() {
+    with Rand handled_by RandHandler{ next: || 3 } {
+        print("{roll()}")
+    }
+    with Rand handled_by RandHandler{ next: || 10 } {
+        print("{roll()}")
+    }
+}
+"#,
+        "4\n5\n",
+    );
+}

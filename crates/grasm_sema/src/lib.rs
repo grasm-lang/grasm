@@ -1,6 +1,7 @@
 //! grasm_sema — name resolution, type inference, and static checks.
 
 pub mod check;
+pub mod effects;
 pub mod types;
 
 pub use check::{check, Analysis};

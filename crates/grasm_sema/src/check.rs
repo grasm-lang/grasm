@@ -19,9 +19,11 @@ pub fn check(module: &Module) -> Analysis {
     c.collect_types(module);
     c.collect_fns(module);
     c.check_module(module);
+    let mut diagnostics = c.diags;
+    diagnostics.extend(crate::effects::check_effects(module));
     Analysis {
         defs: c.defs,
-        diagnostics: c.diags,
+        diagnostics,
     }
 }
 
@@ -39,10 +41,19 @@ struct FnInfo {
     err: Option<Type>,
 }
 
+#[derive(Clone)]
+struct EffectOp {
+    name: String,
+    params: Vec<Type>,
+    ret: Type,
+}
+
 struct Checker {
     defs: TypeDefs,
     aliases: HashMap<String, Type>,
     fns: HashMap<String, FnInfo>,
+    /// effect name → (ops, handler struct TypeDefId).
+    effects: HashMap<String, (Vec<EffectOp>, TypeDefId)>,
     /// variant name → (typedef, variant index); ambiguous names keep all.
     variants: HashMap<String, Vec<(TypeDefId, usize)>>,
     uni: Unifier,
@@ -65,6 +76,7 @@ impl Checker {
             defs,
             aliases: HashMap::new(),
             fns: HashMap::new(),
+            effects: HashMap::new(),
             variants,
             uni: Unifier::new(),
             diags: Vec::new(),
@@ -137,6 +149,47 @@ impl Checker {
                     }
                     self.aliases.insert(t.name.name.clone(), ty);
                 }
+            }
+        }
+        // Effects: register ops + auto-generate `<Name>Handler` struct types.
+        for decl in &module.decls {
+            if let Decl::Effect(e) = decl {
+                if self.effects.contains_key(&e.name.name) {
+                    self.error(e.name.span, format!("duplicate effect `{}`", e.name.name));
+                    continue;
+                }
+                let mut ops = Vec::new();
+                let mut handler_fields = Vec::new();
+                for op in &e.ops {
+                    let params: Vec<Type> =
+                        op.params.iter().map(|p| self.resolve_type(&p.ty, &[])).collect();
+                    let ret = op
+                        .ret
+                        .as_ref()
+                        .map(|t| self.resolve_type(t, &[]))
+                        .unwrap_or(Type::Unit);
+                    handler_fields.push((
+                        op.name.name.clone(),
+                        Type::Fn {
+                            params: params.clone(),
+                            ret: Box::new(ret.clone()),
+                        },
+                    ));
+                    ops.push(EffectOp {
+                        name: op.name.name.clone(),
+                        params,
+                        ret,
+                    });
+                }
+                let handler_name = format!("{}Handler", e.name.name);
+                let handler_id = self.defs.insert(TypeDef {
+                    name: handler_name,
+                    generics: vec![],
+                    kind: TypeDefKind::Struct {
+                        fields: handler_fields,
+                    },
+                });
+                self.effects.insert(e.name.name.clone(), (ops, handler_id));
             }
         }
         for (di, id) in ids {
@@ -462,6 +515,33 @@ impl Checker {
                 self.loop_depth += 1;
                 self.check_block(body);
                 self.loop_depth -= 1;
+                Type::Unit
+            }
+            Stmt::With {
+                effect,
+                handler,
+                body,
+                span,
+            } => {
+                let ename = effect.dotted();
+                match self.effects.get(&ename).cloned() {
+                    Some((_, handler_id)) => {
+                        let want = Type::Named {
+                            id: handler_id,
+                            args: vec![],
+                        };
+                        self.check_expr(handler, &want);
+                    }
+                    None => {
+                        self.error_help(
+                            *span,
+                            format!("unknown effect `{ename}`"),
+                            "declare it with `effect Name { fn op(...) -> T }`",
+                        );
+                        self.infer_expr(handler);
+                    }
+                }
+                self.check_block(body);
                 Type::Unit
             }
             Stmt::For {
@@ -1054,6 +1134,41 @@ impl Checker {
         args: &[Expr],
         span: Span,
     ) -> Type {
+        // Effect operation call `Clock.now(...)`.
+        if let Expr::Ident(tid) = recv {
+            if self.lookup(&tid.name).is_none() {
+                if let Some((ops, _)) = self.effects.get(&tid.name).cloned() {
+                    match ops.iter().find(|o| o.name == name.name) {
+                        Some(op) => {
+                            if args.len() != op.params.len() {
+                                return self.error(
+                                    span,
+                                    format!(
+                                        "effect operation `{}.{}` takes {} argument(s), got {}",
+                                        tid.name,
+                                        name.name,
+                                        op.params.len(),
+                                        args.len()
+                                    ),
+                                );
+                            }
+                            let params = op.params.clone();
+                            let ret = op.ret.clone();
+                            for (a, p) in args.iter().zip(&params) {
+                                self.check_expr(a, p);
+                            }
+                            return ret;
+                        }
+                        None => {
+                            return self.error(
+                                name.span,
+                                format!("effect `{}` has no operation `{}`", tid.name, name.name),
+                            );
+                        }
+                    }
+                }
+            }
+        }
         // Qualified variant constructor `Shape.Circle(...)`.
         if let Expr::Ident(tid) = recv {
             if self.lookup(&tid.name).is_none() {
@@ -1732,7 +1847,8 @@ fn stmt_span(s: &Stmt) -> Span {
         | Stmt::Break(span)
         | Stmt::Continue(span)
         | Stmt::While { span, .. }
-        | Stmt::For { span, .. } => *span,
+        | Stmt::For { span, .. }
+        | Stmt::With { span, .. } => *span,
         Stmt::Expr(e) => e.span(),
     }
 }

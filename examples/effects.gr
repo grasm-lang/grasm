@@ -1,0 +1,29 @@
+// Effects demo: capability-style DI without frameworks.
+effect Clock {
+    fn now() -> i64
+}
+
+effect Greeter {
+    fn greet(name: str) -> str
+}
+
+fn timestamped_hello(name: str, start: i64) -> str {
+    let elapsed = Clock.now() - start
+    Greeter.greet(name) + " (t+{elapsed})"
+}
+
+fn main() {
+    with Clock handled_by ClockHandler{ now: || 1000 } {
+        with Greeter handled_by GreeterHandler{ greet: |n| "hello, " + n } {
+            print(timestamped_hello("world", 990))
+        }
+    }
+}
+
+test "handlers are swappable" {
+    with Clock handled_by ClockHandler{ now: || 5 } {
+        with Greeter handled_by GreeterHandler{ greet: |n| n.to_upper() } {
+            assert_eq(timestamped_hello("ada", 0), "ADA (t+5)")
+        }
+    }
+}
