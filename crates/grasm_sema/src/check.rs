@@ -116,6 +116,8 @@ struct Checker {
     fn_err: Option<Type>,
     /// True for main/tests: any error type may propagate (runtime reports).
     err_open: bool,
+    /// Nesting depth of `parallel` scopes — `spawn` requires one.
+    parallel_depth: u32,
     loop_depth: u32,
 }
 
@@ -142,6 +144,7 @@ impl Checker {
             fn_ret: Type::Unit,
             fn_err: None,
             err_open: false,
+            parallel_depth: 0,
             loop_depth: 0,
         }
     }
@@ -614,6 +617,28 @@ impl Checker {
                 self.loop_depth += 1;
                 self.check_block(body);
                 self.loop_depth -= 1;
+                Type::Unit
+            }
+            Stmt::Parallel { body, .. } => {
+                self.parallel_depth += 1;
+                self.check_block(body);
+                self.parallel_depth -= 1;
+                Type::Unit
+            }
+            Stmt::Spawn { body, span } => {
+                if self.parallel_depth == 0 {
+                    self.error_help(
+                        *span,
+                        "`spawn` outside a `parallel` block",
+                        "wrap it in `parallel { ... }` so the task is joined before the scope exits",
+                    );
+                }
+                // A task body is checked in its own scope; `break`/`continue`
+                // cannot cross the task boundary.
+                let saved_loop = self.loop_depth;
+                self.loop_depth = 0;
+                self.check_block(body);
+                self.loop_depth = saved_loop;
                 Type::Unit
             }
             Stmt::With {
@@ -2320,7 +2345,9 @@ fn stmt_span(s: &Stmt) -> Span {
         | Stmt::Continue(span)
         | Stmt::While { span, .. }
         | Stmt::For { span, .. }
-        | Stmt::With { span, .. } => *span,
+        | Stmt::With { span, .. }
+        | Stmt::Parallel { span, .. }
+        | Stmt::Spawn { span, .. } => *span,
         Stmt::Expr(e) => e.span(),
     }
 }

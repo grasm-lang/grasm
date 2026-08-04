@@ -1343,6 +1343,10 @@ impl FnCx<'_, '_> {
                 body,
                 span,
             } => self.eval_for(loop_var, iter, body, *span),
+            Stmt::Parallel { span, .. } | Stmt::Spawn { span, .. } => nope(
+                *span,
+                "structured concurrency (`parallel`/`spawn`) — the interpreter runs these",
+            ),
             Stmt::With {
                 effect,
                 body,

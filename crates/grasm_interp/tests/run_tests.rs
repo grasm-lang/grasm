@@ -628,3 +628,116 @@ fn main() {
         "10 2\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// C3: structured concurrency (deterministic scheduling, not parallelism)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parallel_joins_every_spawned_task() {
+    run_expect(
+        r#"fn main() {
+    var xs: [i64] = []
+    parallel {
+        spawn {
+            xs.push(1)
+        }
+        spawn {
+            xs.push(2)
+        }
+        spawn {
+            xs.push(3)
+        }
+    }
+    print("{xs} {xs.len()}")
+}
+"#,
+        "[1, 2, 3] 3\n",
+    );
+}
+
+#[test]
+fn tasks_run_in_spawn_order_deterministically() {
+    // Same program, same output, every run — the scheduler is deterministic.
+    let src = r#"fn main() {
+    var log: [str] = []
+    parallel {
+        spawn {
+            log.push("a")
+        }
+        spawn {
+            log.push("b")
+        }
+        spawn {
+            log.push("c")
+        }
+    }
+    print(log.join(""))
+}
+"#;
+    for _ in 0..5 {
+        run_expect(src, "abc\n");
+    }
+}
+
+#[test]
+fn spawned_tasks_see_enclosing_state() {
+    run_expect(
+        r#"fn main() {
+    let base = 10
+    var total = 0
+    parallel {
+        spawn {
+            total += base
+        }
+        spawn {
+            total += base * 2
+        }
+    }
+    print("{total}")
+}
+"#,
+        "30\n",
+    );
+}
+
+#[test]
+fn nested_parallel_scopes_join_inside_out() {
+    run_expect(
+        r#"fn main() {
+    var log: [str] = []
+    parallel {
+        spawn {
+            log.push("outer-start")
+            parallel {
+                spawn {
+                    log.push("inner")
+                }
+            }
+            log.push("outer-end")
+        }
+    }
+    print(log.join(" "))
+}
+"#,
+        "outer-start inner outer-end\n",
+    );
+}
+
+#[test]
+fn a_panicking_task_aborts_the_scope() {
+    let (code, out) = run(
+        "fn main() {\n    parallel {\n        spawn {\n            panic(\"task failed\")\n        }\n        spawn {\n            print(\"never runs\")\n        }\n    }\n}\n",
+    );
+    assert_eq!(code, 101);
+    assert!(out.contains("task failed"), "output: {out}");
+    assert!(!out.contains("never runs"), "later tasks must not run");
+}
+
+#[test]
+fn empty_parallel_scope_is_a_no_op() {
+    run_expect(
+        "fn main() {\n    parallel {\n    }\n    print(\"done\")\n}\n",
+        "done\n",
+    );
+}

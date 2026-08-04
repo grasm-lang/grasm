@@ -44,6 +44,10 @@ pub struct Interp<'a, W: Write> {
     pending_writebacks: Vec<(usize, Value)>,
     /// Program arguments exposed via the `args()` builtin.
     pub program_args: Vec<String>,
+    /// Stack of `parallel` scopes, each holding the task bodies spawned in it.
+    /// Bodies are cloned: spawns are rare and this keeps the evaluator free of
+    /// AST lifetimes (closures own their bodies, so borrows can't be uniform).
+    task_scopes: Vec<Vec<Block>>,
 }
 
 const MAX_DEPTH: u32 = 2_000;
@@ -144,6 +148,7 @@ impl<'a, W: Write> Interp<'a, W> {
             depth: 0,
             pending_writebacks: Vec::new(),
             program_args: Vec::new(),
+            task_scopes: Vec::new(),
         }
     }
 
@@ -372,6 +377,32 @@ impl<'a, W: Write> Interp<'a, W> {
                     }
                 }
                 Ok(Value::Unit)
+            }
+            Stmt::Parallel { body, .. } => {
+                // Collect spawned tasks, then run them to completion in spawn
+                // order before the scope exits (structured concurrency).
+                self.task_scopes.push(Vec::new());
+                let collect = self.eval_block(body);
+                let tasks = self.task_scopes.pop().unwrap_or_default();
+                collect?;
+                for task in &tasks {
+                    // Each task sees the enclosing scope (shared state is how
+                    // tasks communicate) but gets its own frame for locals.
+                    self.eval_block(task)?;
+                }
+                Ok(Value::Unit)
+            }
+            Stmt::Spawn { body, span } => {
+                match self.task_scopes.last_mut() {
+                    Some(scope) => {
+                        scope.push(body.clone());
+                        Ok(Value::Unit)
+                    }
+                    None => Err(Flow::Panic(format!(
+                        "`spawn` outside a `parallel` block (at offset {})",
+                        span.start
+                    ))),
+                }
             }
             Stmt::With {
                 effect,

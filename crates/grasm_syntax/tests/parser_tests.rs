@@ -547,3 +547,22 @@ fn recovery_from_unbalanced_parens_resets_newline_mode() {
     let good = good.expect("`good` fn should have been parsed after recovery");
     assert_eq!(good.body.stmts.len(), 2);
 }
+
+#[test]
+fn parallel_and_spawn_are_contextual_keywords() {
+    // As concurrency scopes when a block follows...
+    let m = parse_ok(
+        "fn main() {\n    parallel {\n        spawn {\n            f()\n        }\n    }\n}\n",
+    );
+    let f = first_fn(&m);
+    let Stmt::Parallel { body, .. } = &f.body.stmts[0] else {
+        panic!("expected a parallel scope, got {:?}", f.body.stmts[0])
+    };
+    assert!(matches!(body.stmts[0], Stmt::Spawn { .. }));
+
+    // ...and as ordinary names everywhere else — existing code must not break.
+    let m = parse_ok(
+        "fn spawn(n: i64) -> i64 {\n    n\n}\n\nfn main() {\n    let parallel = 1\n    let x = spawn(parallel)\n    let y = obj.spawn(2)\n}\n",
+    );
+    assert!(matches!(&m.decls[0], Decl::Fn(f) if f.name.name == "spawn"));
+}

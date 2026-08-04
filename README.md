@@ -91,6 +91,35 @@ Measured on this machine (user CPU time, release builds):
 | 200k list pushes + sum | 0.00s | 0.08s |
 | 300k filter + map pipeline | 0.01s | 0.15s |
 
+## Concurrency
+
+`parallel { spawn { ... } spawn { ... } }` is a **structured concurrency**
+scope: every task spawned inside is joined before the scope exits, task bodies
+are typechecked, `break`/`continue` cannot cross a task boundary, and spawning
+is tracked as the `async` effect. Scopes nest.
+
+```grasm
+var results: [i64] = []
+parallel {
+    spawn { results.push(work(10)) }
+    spawn { results.push(work(100)) }
+}
+// both tasks are guaranteed complete here
+```
+
+**Honest limitation: this is concurrency and determinism, not parallelism.**
+Tasks run cooperatively on one thread in spawn order, so the same program
+always produces the same output (which is what MASTERPLAN §8.6 wants for
+reproducible tests) but nothing runs on a second core. Real parallelism needs
+the runtime's `Rc`-based values replaced with `Arc` + `Send`/`Sync`, which
+would slow down all single-threaded code — that trade is a deliberate later
+milestone, not an oversight. The native backend reports `parallel`/`spawn` as
+unsupported and defers to the interpreter.
+
+`parallel` and `spawn` are *contextual* keywords — they only introduce a scope
+when a block follows, so code that already uses those words as function or
+variable names keeps compiling.
+
 ## What the language guarantees today
 
 - **No nulls** — `Option[T]` + `??` / `?.`-style access via `.get()`.

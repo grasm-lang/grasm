@@ -13,6 +13,7 @@ use grasm_syntax::diag::Diagnostic;
 use crate::check::ModuleView;
 
 pub const IO: &str = "io";
+pub const ASYNC: &str = "async";
 
 const IO_BUILTINS: &[&str] = &[
     "print",
@@ -120,7 +121,7 @@ pub fn check_effects_multi(files: &[ModuleView]) -> Vec<Diagnostic> {
             let declared_set: BTreeSet<String> = declared.iter().map(|p| p.dotted()).collect();
             for d in &declared_set {
                 let base = d.split('.').next().unwrap_or(d);
-                if base != IO && !ctx.effect_names.contains(base) {
+                if base != IO && base != ASYNC && !ctx.effect_names.contains(base) {
                     diags.push(Diagnostic::error(
                         f.name.span,
                         format!("function `{}` declares unknown effect `{d}`", f.name.name),
@@ -159,7 +160,10 @@ pub fn check_effects_multi(files: &[ModuleView]) -> Vec<Diagnostic> {
 
     // main (entry module only): only `io` may remain unhandled.
     if let Some(main) = ctx.fns.get("main::main") {
-        let leftover: Vec<&String> = ctx.rows["main::main"].iter().filter(|e| *e != IO).collect();
+        let leftover: Vec<&String> = ctx.rows["main::main"]
+            .iter()
+            .filter(|e| *e != IO && *e != ASYNC)
+            .collect();
         if !leftover.is_empty() {
             let list = leftover
                 .iter()
@@ -180,7 +184,8 @@ pub fn check_effects_multi(files: &[ModuleView]) -> Vec<Diagnostic> {
                 let mut row = BTreeSet::new();
                 let mut active = Vec::new();
                 walk_block(&t.body, &f.name, &mut active, &ctx, &mut row);
-                let leftover: Vec<&String> = row.iter().filter(|e| *e != IO).collect();
+                let leftover: Vec<&String> =
+                    row.iter().filter(|e| *e != IO && *e != ASYNC).collect();
                 if !leftover.is_empty() {
                     let list = leftover
                         .iter()
@@ -250,6 +255,19 @@ fn walk_stmt(
         }
         Stmt::For { iter, body, .. } => {
             walk_expr(iter, current, active, ctx, out);
+            walk_block(body, current, active, ctx, out);
+        }
+        Stmt::Parallel { body, .. } => {
+            // Structured concurrency is the `async` effect.
+            if !active.iter().any(|a| a == ASYNC) {
+                out.insert(ASYNC.to_string());
+            }
+            walk_block(body, current, active, ctx, out);
+        }
+        Stmt::Spawn { body, .. } => {
+            if !active.iter().any(|a| a == ASYNC) {
+                out.insert(ASYNC.to_string());
+            }
             walk_block(body, current, active, ctx, out);
         }
         Stmt::With {

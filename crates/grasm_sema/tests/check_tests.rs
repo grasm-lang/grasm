@@ -556,3 +556,53 @@ fn map_key_restriction() {
     );
     check_ok("fn f() {\n    var a: Map[i64, str] = map()\n    var b: Map[bool, i64] = map()\n}\n");
 }
+
+// ---------------------------------------------------------------------------
+// C3: structured concurrency
+// ---------------------------------------------------------------------------
+
+#[test]
+fn spawn_requires_a_parallel_scope() {
+    check_err(
+        "fn main() {\n    spawn {\n        print(\"nope\")\n    }\n}\n",
+        "`spawn` outside a `parallel` block",
+    );
+    check_ok(
+        "fn main() {\n    parallel {\n        spawn {\n            print(\"ok\")\n        }\n    }\n}\n",
+    );
+}
+
+#[test]
+fn task_bodies_are_typechecked() {
+    check_err(
+        "fn main() {\n    parallel {\n        spawn {\n            let x: i64 = \"wrong\"\n        }\n    }\n}\n",
+        "type mismatch",
+    );
+}
+
+#[test]
+fn break_cannot_cross_a_task_boundary() {
+    check_err(
+        "fn main() {\n    for i in 0..3 {\n        parallel {\n            spawn {\n                break\n            }\n        }\n    }\n}\n",
+        "outside of a loop",
+    );
+}
+
+#[test]
+fn concurrency_is_the_async_effect() {
+    // A function that spawns performs `async`; declaring only `io` is an error.
+    check_err(
+        "fn worker() / {io} {\n    parallel {\n        spawn {\n            print(\"x\")\n        }\n    }\n}\n\nfn main() {\n    worker()\n}\n",
+        "not in its declared row",
+    );
+    check_ok(
+        "fn worker() / {io, async} {\n    parallel {\n        spawn {\n            print(\"x\")\n        }\n    }\n}\n\nfn main() {\n    worker()\n}\n",
+    );
+}
+
+#[test]
+fn nested_parallel_scopes_are_allowed() {
+    check_ok(
+        "fn main() {\n    parallel {\n        spawn {\n            parallel {\n                spawn {\n                    print(\"deep\")\n                }\n            }\n        }\n    }\n}\n",
+    );
+}

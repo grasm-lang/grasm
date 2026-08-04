@@ -188,6 +188,16 @@ impl Parser {
         }
     }
 
+    /// True when the token after the current one is `{` — used to decide
+    /// whether a contextual keyword introduces a block.
+    fn block_follows(&self) -> bool {
+        let mut j = self.i + 1;
+        while matches!(self.toks.get(j).map(|t| &t.kind), Some(TokenKind::Newline)) {
+            j += 1;
+        }
+        matches!(self.toks.get(j).map(|t| &t.kind), Some(TokenKind::LBrace))
+    }
+
     fn skip_newlines(&mut self) {
         while matches!(self.toks[self.i].kind, TokenKind::Newline) {
             self.i += 1;
@@ -679,6 +689,23 @@ impl Parser {
 
     fn parse_stmt(&mut self) -> PResult<Stmt> {
         let start = self.cur_span();
+        // `parallel {` and `spawn {` are contextual keywords: they introduce a
+        // concurrency scope only when a block follows, so existing code using
+        // those words as ordinary names keeps compiling.
+        if let TokenKind::Ident(name) = self.cur() {
+            let is_parallel = name == "parallel";
+            let is_spawn = name == "spawn";
+            if (is_parallel || is_spawn) && self.block_follows() {
+                self.bump();
+                let body = self.parse_block()?;
+                let span = start.merge(body.span);
+                return Ok(if is_parallel {
+                    Stmt::Parallel { body, span }
+                } else {
+                    Stmt::Spawn { body, span }
+                });
+            }
+        }
         match self.cur() {
             TokenKind::KwLet | TokenKind::KwVar => {
                 let mutable = matches!(self.cur(), TokenKind::KwVar);
@@ -1566,7 +1593,9 @@ pub(crate) fn stmt_span_of(s: &Stmt) -> Span {
         | Stmt::Continue(span)
         | Stmt::While { span, .. }
         | Stmt::For { span, .. }
-        | Stmt::With { span, .. } => *span,
+        | Stmt::With { span, .. }
+        | Stmt::Parallel { span, .. }
+        | Stmt::Spawn { span, .. } => *span,
         Stmt::Expr(e) => e.span(),
     }
 }

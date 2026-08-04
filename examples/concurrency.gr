@@ -1,0 +1,57 @@
+// Structured concurrency: every task spawned inside a `parallel` block is
+// joined before the block exits, and tasks run in a deterministic order.
+//
+// This gives concurrency *structure* and reproducibility, not multi-core
+// parallelism — see README for why, and what would change that.
+
+fn slow_square(n: i64) -> i64 {
+    var acc = 0
+    for _i in 0..1000 {
+        acc = n * n
+    }
+    acc
+}
+
+fn main() {
+    var squares: [i64] = []
+    parallel {
+        spawn {
+            squares.push(slow_square(3))
+        }
+        spawn {
+            squares.push(slow_square(4))
+        }
+        spawn {
+            squares.push(slow_square(5))
+        }
+    }
+    // Guaranteed: all three tasks finished before this line.
+    print("squares: {squares}")
+    print("sum: {squares.sum()}")
+}
+
+test "the scope joins every task" {
+    var seen: [i64] = []
+    parallel {
+        spawn {
+            seen.push(1)
+        }
+        spawn {
+            seen.push(2)
+        }
+    }
+    assert_eq(seen.len(), 2)
+}
+
+test "ordering is deterministic" {
+    var log: [str] = []
+    parallel {
+        spawn {
+            log.push("first")
+        }
+        spawn {
+            log.push("second")
+        }
+    }
+    assert_eq(log.join(","), "first,second")
+}
