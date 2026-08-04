@@ -1,0 +1,1411 @@
+//! Recursive-descent parser with error recovery.
+//!
+//! Newline discipline: newlines are statement terminators. Inside `(` and `[`
+//! groupings they are insignificant (auto-skipped); inside `{` they matter
+//! again. A mode stack tracks this. Binary operators at end-of-line continue
+//! the expression.
+
+use crate::ast::*;
+use crate::diag::Diagnostic;
+use crate::lexer::lex;
+use crate::span::Span;
+use crate::token::{StrPart, Token, TokenKind};
+
+pub struct ParseOutput {
+    pub module: Module,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+pub fn parse(src: &str) -> ParseOutput {
+    let tokens = lex(src);
+    let mut p = Parser::new(tokens);
+    let module = p.parse_module();
+    ParseOutput {
+        module,
+        diagnostics: p.diags,
+    }
+}
+
+/// Parse a single expression (used by the REPL and interpolation).
+pub fn parse_expr_src(src: &str, offset: u32) -> (Option<Expr>, Vec<Diagnostic>) {
+    let mut tokens = lex(src);
+    for t in &mut tokens {
+        t.span = Span::new(t.span.start + offset, t.span.end + offset);
+    }
+    let mut p = Parser::new(tokens);
+    p.skip_newlines();
+    let expr = p.parse_expr().ok();
+    (expr, p.diags)
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum NlMode {
+    Keep,
+    Skip,
+}
+
+type PResult<T> = Result<T, ()>;
+
+struct Parser {
+    toks: Vec<Token>,
+    i: usize,
+    modes: Vec<NlMode>,
+    diags: Vec<Diagnostic>,
+    /// When true, `Ident {` is NOT a struct literal (condition positions).
+    no_struct_lit: bool,
+}
+
+impl Parser {
+    fn new(toks: Vec<Token>) -> Self {
+        Parser {
+            toks,
+            i: 0,
+            modes: vec![NlMode::Keep],
+            diags: Vec::new(),
+            no_struct_lit: false,
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Token stream helpers
+    // ------------------------------------------------------------------
+
+    fn mode(&self) -> NlMode {
+        *self.modes.last().unwrap()
+    }
+
+    /// Advances past newlines when the current mode ignores them.
+    fn normalize(&mut self) {
+        if self.mode() == NlMode::Skip {
+            while matches!(self.toks[self.i].kind, TokenKind::Newline) {
+                self.i += 1;
+            }
+        }
+    }
+
+    fn cur(&mut self) -> &TokenKind {
+        self.normalize();
+        &self.toks[self.i].kind
+    }
+
+    fn cur_span(&mut self) -> Span {
+        self.normalize();
+        self.toks[self.i].span
+    }
+
+    fn bump(&mut self) -> Token {
+        self.normalize();
+        let tok = self.toks[self.i].clone();
+        if !matches!(tok.kind, TokenKind::Eof) {
+            self.i += 1;
+        }
+        match tok.kind {
+            TokenKind::LParen | TokenKind::LBracket => self.modes.push(NlMode::Skip),
+            TokenKind::LBrace => self.modes.push(NlMode::Keep),
+            TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
+                if self.modes.len() > 1 {
+                    self.modes.pop();
+                }
+            }
+            _ => {}
+        }
+        tok
+    }
+
+    fn at(&mut self, kind: &TokenKind) -> bool {
+        self.cur() == kind
+    }
+
+    fn eat(&mut self, kind: &TokenKind) -> bool {
+        if self.at(kind) {
+            self.bump();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn expect(&mut self, kind: &TokenKind) -> PResult<Token> {
+        if self.at(kind) {
+            Ok(self.bump())
+        } else {
+            let span = self.cur_span();
+            let found = self.cur().describe();
+            self.diags.push(Diagnostic::error(
+                span,
+                format!("expected {} but found {}", kind.describe(), found),
+            ));
+            Err(())
+        }
+    }
+
+    fn skip_newlines(&mut self) {
+        while matches!(self.toks[self.i].kind, TokenKind::Newline) {
+            self.i += 1;
+        }
+    }
+
+    fn error_here(&mut self, msg: impl Into<String>) {
+        let span = self.cur_span();
+        self.diags.push(Diagnostic::error(span, msg));
+    }
+
+    /// Panic-mode recovery: skip to the next statement boundary.
+    fn sync_stmt(&mut self) {
+        loop {
+            match &self.toks[self.i].kind {
+                TokenKind::Newline | TokenKind::Eof => break,
+                TokenKind::RBrace => break,
+                _ => {
+                    self.bump();
+                }
+            }
+        }
+    }
+
+    /// Recovery at declaration level: skip to next top-level keyword.
+    /// Resets the newline-mode stack — recovery may have jumped out of
+    /// unbalanced delimiters.
+    fn sync_decl(&mut self) {
+        loop {
+            match &self.toks[self.i].kind {
+                TokenKind::Eof
+                | TokenKind::KwFn
+                | TokenKind::KwPub
+                | TokenKind::KwType
+                | TokenKind::KwEffect
+                | TokenKind::KwTest
+                | TokenKind::KwImport => break,
+                _ => {
+                    self.i += 1;
+                }
+            }
+        }
+        self.modes.clear();
+        self.modes.push(NlMode::Keep);
+    }
+
+    fn ident(&mut self) -> PResult<Ident> {
+        let span = self.cur_span();
+        if let TokenKind::Ident(name) = self.cur().clone() {
+            self.bump();
+            Ok(Ident { name, span })
+        } else {
+            let found = self.cur().describe();
+            self.diags.push(Diagnostic::error(
+                span,
+                format!("expected an identifier but found {found}"),
+            ));
+            Err(())
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Module & declarations
+    // ------------------------------------------------------------------
+
+    fn parse_module(&mut self) -> Module {
+        let mut module = Module::default();
+        loop {
+            self.skip_newlines();
+            if matches!(self.cur(), TokenKind::Eof) {
+                break;
+            }
+            match self.parse_decl() {
+                Ok(d) => module.decls.push(d),
+                Err(()) => self.sync_decl(),
+            }
+        }
+        module
+    }
+
+    fn parse_decl(&mut self) -> PResult<Decl> {
+        let is_pub = self.eat(&TokenKind::KwPub);
+        match self.cur() {
+            TokenKind::KwFn => Ok(Decl::Fn(self.parse_fn(is_pub)?)),
+            TokenKind::KwType => Ok(Decl::Type(self.parse_type_decl(is_pub)?)),
+            TokenKind::KwEffect => Ok(Decl::Effect(self.parse_effect_decl()?)),
+            TokenKind::KwTest => Ok(Decl::Test(self.parse_test_decl()?)),
+            TokenKind::KwImport => Ok(Decl::Import(self.parse_import()?)),
+            _ => {
+                let found = self.cur().describe();
+                self.error_here(format!(
+                    "expected a declaration (`fn`, `type`, `effect`, `test`, `import`) but found {found}"
+                ));
+                Err(())
+            }
+        }
+    }
+
+    fn parse_fn(&mut self, is_pub: bool) -> PResult<FnDecl> {
+        let start = self.cur_span();
+        self.expect(&TokenKind::KwFn)?;
+        let name = self.ident()?;
+        let generics = self.parse_generics()?;
+        let params = self.parse_params()?;
+        let (ret, err, effects) = self.parse_fn_tail()?;
+        let body = self.parse_block()?;
+        let span = start.merge(body.span);
+        Ok(FnDecl {
+            is_pub,
+            name,
+            generics,
+            params,
+            ret,
+            err,
+            effects,
+            body,
+            span,
+        })
+    }
+
+    fn parse_generics(&mut self) -> PResult<Vec<Ident>> {
+        let mut generics = Vec::new();
+        if self.eat(&TokenKind::LBracket) {
+            loop {
+                if self.at(&TokenKind::RBracket) {
+                    break;
+                }
+                generics.push(self.ident()?);
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(&TokenKind::RBracket)?;
+        }
+        Ok(generics)
+    }
+
+    fn parse_params(&mut self) -> PResult<Vec<Param>> {
+        self.expect(&TokenKind::LParen)?;
+        let mut params = Vec::new();
+        loop {
+            if self.at(&TokenKind::RParen) {
+                break;
+            }
+            let start = self.cur_span();
+            let mode = if self.eat(&TokenKind::KwInout) {
+                ParamMode::Inout
+            } else if self.eat(&TokenKind::KwOwn) {
+                ParamMode::Own
+            } else {
+                ParamMode::Let
+            };
+            let name = self.ident()?;
+            self.expect(&TokenKind::Colon)?;
+            let ty = self.parse_type()?;
+            let span = start.merge(ty.span());
+            params.push(Param {
+                mode,
+                name,
+                ty,
+                span,
+            });
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(&TokenKind::RParen)?;
+        Ok(params)
+    }
+
+    /// `-> Ret ! Err / {effects}` — every piece optional.
+    fn parse_fn_tail(&mut self) -> PResult<(Option<TypeExpr>, Option<TypeExpr>, Option<Vec<Path>>)> {
+        let mut ret = None;
+        let mut err = None;
+        let mut effects = None;
+        if self.eat(&TokenKind::Arrow) {
+            ret = Some(self.parse_type()?);
+        }
+        if self.eat(&TokenKind::Bang) {
+            err = Some(self.parse_type()?);
+        }
+        if self.eat(&TokenKind::Slash) {
+            self.expect(&TokenKind::LBrace)?;
+            let mut paths = Vec::new();
+            loop {
+                self.skip_newlines();
+                if self.at(&TokenKind::RBrace) {
+                    break;
+                }
+                paths.push(self.parse_path()?);
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.skip_newlines();
+            self.expect(&TokenKind::RBrace)?;
+            effects = Some(paths);
+        }
+        Ok((ret, err, effects))
+    }
+
+    fn parse_path(&mut self) -> PResult<Path> {
+        let first = self.ident()?;
+        let mut span = first.span;
+        let mut segments = vec![first];
+        while self.at(&TokenKind::Dot) {
+            self.bump();
+            let seg = self.ident()?;
+            span = span.merge(seg.span);
+            segments.push(seg);
+        }
+        Ok(Path { segments, span })
+    }
+
+    fn parse_type_decl(&mut self, is_pub: bool) -> PResult<TypeDecl> {
+        let start = self.cur_span();
+        self.expect(&TokenKind::KwType)?;
+        let name = self.ident()?;
+        let generics = self.parse_generics()?;
+        self.expect(&TokenKind::Eq)?;
+        self.skip_newlines();
+        let (body, end_span) = if self.at(&TokenKind::LBrace) {
+            let fields = self.parse_field_block()?;
+            let end = self.toks[self.i - 1].span;
+            (TypeBody::Struct(fields), end)
+        } else if self.at(&TokenKind::Pipe) {
+            let mut variants = Vec::new();
+            while self.eat(&TokenKind::Pipe) {
+                let vname = self.ident()?;
+                let mut vspan = vname.span;
+                let mut fields = Vec::new();
+                if self.eat(&TokenKind::LParen) {
+                    loop {
+                        if self.at(&TokenKind::RParen) {
+                            break;
+                        }
+                        let fname = self.ident()?;
+                        self.expect(&TokenKind::Colon)?;
+                        let fty = self.parse_type()?;
+                        let fspan = fname.span.merge(fty.span());
+                        fields.push(FieldDef {
+                            name: fname,
+                            ty: fty,
+                            span: fspan,
+                        });
+                        if !self.eat(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                    let rp = self.expect(&TokenKind::RParen)?;
+                    vspan = vspan.merge(rp.span);
+                }
+                variants.push(VariantDef {
+                    name: vname,
+                    fields,
+                    span: vspan,
+                });
+                // Allow newline(s) before the next `|`.
+                let save = self.i;
+                self.skip_newlines();
+                if !self.at(&TokenKind::Pipe) {
+                    self.i = save;
+                    break;
+                }
+            }
+            let end = self.toks[self.i - 1].span;
+            (TypeBody::Sum(variants), end)
+        } else {
+            let ty = self.parse_type()?;
+            let end = ty.span();
+            (TypeBody::Alias(ty), end)
+        };
+        Ok(TypeDecl {
+            is_pub,
+            name,
+            generics,
+            body,
+            span: start.merge(end_span),
+        })
+    }
+
+    /// `{ field: T, other: U }` — commas and/or newlines separate.
+    fn parse_field_block(&mut self) -> PResult<Vec<FieldDef>> {
+        self.expect(&TokenKind::LBrace)?;
+        let mut fields = Vec::new();
+        loop {
+            self.skip_newlines();
+            if self.at(&TokenKind::RBrace) {
+                break;
+            }
+            let name = self.ident()?;
+            self.expect(&TokenKind::Colon)?;
+            let ty = self.parse_type()?;
+            let span = name.span.merge(ty.span());
+            fields.push(FieldDef { name, ty, span });
+            let had_sep = self.eat(&TokenKind::Comma);
+            let at_nl = matches!(self.toks[self.i].kind, TokenKind::Newline);
+            if !had_sep && !at_nl {
+                break;
+            }
+        }
+        self.skip_newlines();
+        self.expect(&TokenKind::RBrace)?;
+        Ok(fields)
+    }
+
+    fn parse_effect_decl(&mut self) -> PResult<EffectDecl> {
+        let start = self.cur_span();
+        self.expect(&TokenKind::KwEffect)?;
+        let name = self.ident()?;
+        self.expect(&TokenKind::LBrace)?;
+        let mut ops = Vec::new();
+        loop {
+            self.skip_newlines();
+            if self.at(&TokenKind::RBrace) {
+                break;
+            }
+            let op_start = self.cur_span();
+            self.expect(&TokenKind::KwFn)?;
+            let op_name = self.ident()?;
+            let params = self.parse_params()?;
+            let (ret, err, _fx) = self.parse_fn_tail()?;
+            let span = op_start.merge(self.toks[self.i - 1].span);
+            ops.push(FnSig {
+                name: op_name,
+                params,
+                ret,
+                err,
+                span,
+            });
+        }
+        let rb = self.expect(&TokenKind::RBrace)?;
+        Ok(EffectDecl {
+            name,
+            ops,
+            span: start.merge(rb.span),
+        })
+    }
+
+    fn parse_test_decl(&mut self) -> PResult<TestDecl> {
+        let start = self.cur_span();
+        self.expect(&TokenKind::KwTest)?;
+        let name = match self.cur().clone() {
+            TokenKind::Str(parts) => {
+                self.bump();
+                match parts.as_slice() {
+                    [StrPart::Text(t)] => t.clone(),
+                    _ => {
+                        self.error_here("test names cannot contain interpolation");
+                        return Err(());
+                    }
+                }
+            }
+            _ => {
+                self.error_here("expected a string name after `test`");
+                return Err(());
+            }
+        };
+        let body = self.parse_block()?;
+        let span = start.merge(body.span);
+        Ok(TestDecl { name, body, span })
+    }
+
+    fn parse_import(&mut self) -> PResult<ImportDecl> {
+        let start = self.cur_span();
+        self.expect(&TokenKind::KwImport)?;
+        let path = self.parse_path()?;
+        let span = start.merge(path.span);
+        Ok(ImportDecl { path, span })
+    }
+
+    // ------------------------------------------------------------------
+    // Types
+    // ------------------------------------------------------------------
+
+    fn parse_type(&mut self) -> PResult<TypeExpr> {
+        let start = self.cur_span();
+        match self.cur().clone() {
+            TokenKind::Ident(_) => {
+                let path = self.parse_path()?;
+                let mut args = Vec::new();
+                let mut span = path.span;
+                if self.at(&TokenKind::LBracket) {
+                    self.bump();
+                    loop {
+                        if self.at(&TokenKind::RBracket) {
+                            break;
+                        }
+                        args.push(self.parse_type()?);
+                        if !self.eat(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                    let rb = self.expect(&TokenKind::RBracket)?;
+                    span = span.merge(rb.span);
+                }
+                Ok(TypeExpr::Name { path, args, span })
+            }
+            TokenKind::LBracket => {
+                self.bump();
+                let inner = self.parse_type()?;
+                let rb = self.expect(&TokenKind::RBracket)?;
+                Ok(TypeExpr::List(Box::new(inner), start.merge(rb.span)))
+            }
+            TokenKind::LParen => {
+                self.bump();
+                if self.at(&TokenKind::RParen) {
+                    let rp = self.bump();
+                    return Ok(TypeExpr::Tuple(Vec::new(), start.merge(rp.span)));
+                }
+                let first = self.parse_type()?;
+                if self.at(&TokenKind::Pipe) {
+                    let mut members = vec![first];
+                    while self.eat(&TokenKind::Pipe) {
+                        members.push(self.parse_type()?);
+                    }
+                    let rp = self.expect(&TokenKind::RParen)?;
+                    Ok(TypeExpr::Union(members, start.merge(rp.span)))
+                } else if self.at(&TokenKind::Comma) {
+                    let mut members = vec![first];
+                    while self.eat(&TokenKind::Comma) {
+                        if self.at(&TokenKind::RParen) {
+                            break;
+                        }
+                        members.push(self.parse_type()?);
+                    }
+                    let rp = self.expect(&TokenKind::RParen)?;
+                    Ok(TypeExpr::Tuple(members, start.merge(rp.span)))
+                } else {
+                    self.expect(&TokenKind::RParen)?;
+                    Ok(first)
+                }
+            }
+            other => {
+                self.diags.push(Diagnostic::error(
+                    start,
+                    format!("expected a type but found {}", other.describe()),
+                ));
+                Err(())
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Blocks & statements
+    // ------------------------------------------------------------------
+
+    fn parse_block(&mut self) -> PResult<Block> {
+        let start = self.cur_span();
+        self.expect(&TokenKind::LBrace)?;
+        let mut stmts = Vec::new();
+        loop {
+            self.skip_newlines();
+            if self.at(&TokenKind::RBrace) || matches!(self.cur(), TokenKind::Eof) {
+                break;
+            }
+            match self.parse_stmt() {
+                Ok(s) => {
+                    stmts.push(s);
+                    // Terminator: newline, `}` next, or EOF.
+                    if !matches!(self.toks[self.i].kind, TokenKind::Newline)
+                        && !self.at(&TokenKind::RBrace)
+                        && !matches!(self.cur(), TokenKind::Eof)
+                    {
+                        let found = self.cur().describe();
+                        self.error_here(format!(
+                            "expected end of line after statement but found {found}"
+                        ));
+                        self.sync_stmt();
+                    }
+                }
+                Err(()) => self.sync_stmt(),
+            }
+        }
+        let rb = self.expect(&TokenKind::RBrace)?;
+        Ok(Block {
+            stmts,
+            span: start.merge(rb.span),
+        })
+    }
+
+    fn parse_stmt(&mut self) -> PResult<Stmt> {
+        let start = self.cur_span();
+        match self.cur() {
+            TokenKind::KwLet | TokenKind::KwVar => {
+                let mutable = matches!(self.cur(), TokenKind::KwVar);
+                self.bump();
+                let name = self.ident()?;
+                let ty = if self.eat(&TokenKind::Colon) {
+                    Some(self.parse_type()?)
+                } else {
+                    None
+                };
+                self.expect(&TokenKind::Eq)?;
+                self.skip_newlines_if_continuation();
+                let init = self.parse_expr()?;
+                let span = start.merge(init.span());
+                Ok(Stmt::Let {
+                    mutable,
+                    name,
+                    ty,
+                    init,
+                    span,
+                })
+            }
+            TokenKind::KwReturn => {
+                self.bump();
+                let value = if matches!(self.toks[self.i].kind, TokenKind::Newline)
+                    || self.at(&TokenKind::RBrace)
+                {
+                    None
+                } else {
+                    Some(self.parse_expr()?)
+                };
+                let span = match &value {
+                    Some(e) => start.merge(e.span()),
+                    None => start,
+                };
+                Ok(Stmt::Return(value, span))
+            }
+            TokenKind::KwBreak => {
+                self.bump();
+                Ok(Stmt::Break(start))
+            }
+            TokenKind::KwContinue => {
+                self.bump();
+                Ok(Stmt::Continue(start))
+            }
+            TokenKind::KwWhile => {
+                self.bump();
+                let cond = self.parse_cond_expr()?;
+                let body = self.parse_block()?;
+                let span = start.merge(body.span);
+                Ok(Stmt::While { cond, body, span })
+            }
+            TokenKind::KwFor => {
+                self.bump();
+                let var = self.ident()?;
+                self.expect(&TokenKind::KwIn)?;
+                let iter = self.parse_cond_expr()?;
+                let body = self.parse_block()?;
+                let span = start.merge(body.span);
+                Ok(Stmt::For {
+                    var,
+                    iter,
+                    body,
+                    span,
+                })
+            }
+            _ => {
+                let expr = self.parse_expr()?;
+                let op = match self.cur() {
+                    TokenKind::Eq => Some(AssignOp::Assign),
+                    TokenKind::PlusEq => Some(AssignOp::Add),
+                    TokenKind::MinusEq => Some(AssignOp::Sub),
+                    TokenKind::StarEq => Some(AssignOp::Mul),
+                    TokenKind::SlashEq => Some(AssignOp::Div),
+                    _ => None,
+                };
+                if let Some(op) = op {
+                    self.bump();
+                    self.skip_newlines_if_continuation();
+                    let value = self.parse_expr()?;
+                    let span = expr.span().merge(value.span());
+                    if !is_place_expr(&expr) {
+                        self.diags.push(
+                            Diagnostic::error(expr.span(), "invalid assignment target")
+                                .with_help("only variables, fields, and index expressions can be assigned to"),
+                        );
+                    }
+                    Ok(Stmt::Assign {
+                        target: expr,
+                        op,
+                        value,
+                        span,
+                    })
+                } else {
+                    Ok(Stmt::Expr(expr))
+                }
+            }
+        }
+    }
+
+    /// After `=` or a binary operator at end of line, the expression continues.
+    fn skip_newlines_if_continuation(&mut self) {
+        self.skip_newlines();
+    }
+
+    /// Condition position: struct literals need parens (`if (User{..}).ok {}`).
+    fn parse_cond_expr(&mut self) -> PResult<Expr> {
+        let saved = self.no_struct_lit;
+        self.no_struct_lit = true;
+        let r = self.parse_expr();
+        self.no_struct_lit = saved;
+        r
+    }
+
+    // ------------------------------------------------------------------
+    // Expressions (precedence climbing)
+    // ------------------------------------------------------------------
+
+    pub(crate) fn parse_expr(&mut self) -> PResult<Expr> {
+        self.parse_or()
+    }
+
+    fn parse_or(&mut self) -> PResult<Expr> {
+        let mut lhs = self.parse_and()?;
+        while self.at(&TokenKind::KwOr) {
+            self.bump();
+            self.skip_newlines_if_continuation();
+            let rhs = self.parse_and()?;
+            let span = lhs.span().merge(rhs.span());
+            lhs = Expr::Binary {
+                op: BinaryOp::Or,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+                span,
+            };
+        }
+        Ok(lhs)
+    }
+
+    fn parse_and(&mut self) -> PResult<Expr> {
+        let mut lhs = self.parse_comparison()?;
+        while self.at(&TokenKind::KwAnd) {
+            self.bump();
+            self.skip_newlines_if_continuation();
+            let rhs = self.parse_comparison()?;
+            let span = lhs.span().merge(rhs.span());
+            lhs = Expr::Binary {
+                op: BinaryOp::And,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+                span,
+            };
+        }
+        Ok(lhs)
+    }
+
+    fn parse_comparison(&mut self) -> PResult<Expr> {
+        let mut lhs = self.parse_range()?;
+        loop {
+            let op = match self.cur() {
+                TokenKind::EqEq => BinaryOp::Eq,
+                TokenKind::NotEq => BinaryOp::NotEq,
+                TokenKind::Lt => BinaryOp::Lt,
+                TokenKind::LtEq => BinaryOp::LtEq,
+                TokenKind::Gt => BinaryOp::Gt,
+                TokenKind::GtEq => BinaryOp::GtEq,
+                _ => break,
+            };
+            self.bump();
+            self.skip_newlines_if_continuation();
+            let rhs = self.parse_range()?;
+            let span = lhs.span().merge(rhs.span());
+            lhs = Expr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+                span,
+            };
+        }
+        Ok(lhs)
+    }
+
+    fn parse_range(&mut self) -> PResult<Expr> {
+        let lhs = self.parse_coalesce()?;
+        let inclusive = match self.cur() {
+            TokenKind::DotDot => false,
+            TokenKind::DotDotEq => true,
+            _ => return Ok(lhs),
+        };
+        self.bump();
+        let rhs = self.parse_coalesce()?;
+        let span = lhs.span().merge(rhs.span());
+        Ok(Expr::Range {
+            start: Box::new(lhs),
+            end: Box::new(rhs),
+            inclusive,
+            span,
+        })
+    }
+
+    fn parse_coalesce(&mut self) -> PResult<Expr> {
+        let mut lhs = self.parse_pipeline()?;
+        while self.at(&TokenKind::QuestionQuestion) {
+            self.bump();
+            self.skip_newlines_if_continuation();
+            let rhs = self.parse_pipeline()?;
+            let span = lhs.span().merge(rhs.span());
+            lhs = Expr::Binary {
+                op: BinaryOp::Coalesce,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+                span,
+            };
+        }
+        Ok(lhs)
+    }
+
+    /// `x |> f(a)` desugars to `f(x, a)`; `x |> obj.m(a)` to `obj.m(x, a)`.
+    fn parse_pipeline(&mut self) -> PResult<Expr> {
+        let mut lhs = self.parse_additive()?;
+        while self.at(&TokenKind::PipeGt) {
+            self.bump();
+            self.skip_newlines_if_continuation();
+            let rhs = self.parse_additive()?;
+            let span = lhs.span().merge(rhs.span());
+            lhs = match rhs {
+                Expr::Call { callee, mut args, .. } => {
+                    args.insert(0, lhs);
+                    Expr::Call { callee, args, span }
+                }
+                Expr::MethodCall {
+                    recv,
+                    name,
+                    mut args,
+                    ..
+                } => {
+                    args.insert(0, lhs);
+                    Expr::MethodCall {
+                        recv,
+                        name,
+                        args,
+                        span,
+                    }
+                }
+                callee @ (Expr::Ident(_) | Expr::Field { .. }) => Expr::Call {
+                    callee: Box::new(callee),
+                    args: vec![lhs],
+                    span,
+                },
+                other => {
+                    self.diags.push(
+                        Diagnostic::error(other.span(), "right side of `|>` must be a function or call")
+                            .with_help("write `value |> f` or `value |> f(more, args)`"),
+                    );
+                    other
+                }
+            };
+        }
+        Ok(lhs)
+    }
+
+    fn parse_additive(&mut self) -> PResult<Expr> {
+        let mut lhs = self.parse_multiplicative()?;
+        loop {
+            let op = match self.cur() {
+                TokenKind::Plus => BinaryOp::Add,
+                TokenKind::Minus => BinaryOp::Sub,
+                _ => break,
+            };
+            self.bump();
+            self.skip_newlines_if_continuation();
+            let rhs = self.parse_multiplicative()?;
+            let span = lhs.span().merge(rhs.span());
+            lhs = Expr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+                span,
+            };
+        }
+        Ok(lhs)
+    }
+
+    fn parse_multiplicative(&mut self) -> PResult<Expr> {
+        let mut lhs = self.parse_power()?;
+        loop {
+            let op = match self.cur() {
+                TokenKind::Star => BinaryOp::Mul,
+                TokenKind::Slash => BinaryOp::Div,
+                TokenKind::Percent => BinaryOp::Rem,
+                _ => break,
+            };
+            self.bump();
+            self.skip_newlines_if_continuation();
+            let rhs = self.parse_power()?;
+            let span = lhs.span().merge(rhs.span());
+            lhs = Expr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+                span,
+            };
+        }
+        Ok(lhs)
+    }
+
+    /// Right-associative: `2^3^2` = `2^(3^2)`.
+    fn parse_power(&mut self) -> PResult<Expr> {
+        let lhs = self.parse_unary()?;
+        if self.at(&TokenKind::Caret) {
+            self.bump();
+            self.skip_newlines_if_continuation();
+            let rhs = self.parse_power()?;
+            let span = lhs.span().merge(rhs.span());
+            return Ok(Expr::Binary {
+                op: BinaryOp::Pow,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+                span,
+            });
+        }
+        Ok(lhs)
+    }
+
+    fn parse_unary(&mut self) -> PResult<Expr> {
+        let start = self.cur_span();
+        match self.cur() {
+            TokenKind::Minus => {
+                self.bump();
+                let expr = self.parse_unary()?;
+                let span = start.merge(expr.span());
+                Ok(Expr::Unary {
+                    op: UnaryOp::Neg,
+                    expr: Box::new(expr),
+                    span,
+                })
+            }
+            TokenKind::KwNot => {
+                self.bump();
+                let expr = self.parse_unary()?;
+                let span = start.merge(expr.span());
+                Ok(Expr::Unary {
+                    op: UnaryOp::Not,
+                    expr: Box::new(expr),
+                    span,
+                })
+            }
+            TokenKind::KwTry => {
+                self.bump();
+                let expr = self.parse_unary()?;
+                let span = start.merge(expr.span());
+                Ok(Expr::Try {
+                    expr: Box::new(expr),
+                    span,
+                })
+            }
+            _ => self.parse_postfix(),
+        }
+    }
+
+    fn parse_postfix(&mut self) -> PResult<Expr> {
+        let mut expr = self.parse_primary()?;
+        loop {
+            match self.cur() {
+                TokenKind::LParen => {
+                    self.bump();
+                    let args = self.parse_call_args()?;
+                    let rp = self.expect(&TokenKind::RParen)?;
+                    let span = expr.span().merge(rp.span);
+                    expr = match expr {
+                        Expr::Field { recv, name, .. } => Expr::MethodCall {
+                            recv,
+                            name,
+                            args,
+                            span,
+                        },
+                        other => Expr::Call {
+                            callee: Box::new(other),
+                            args,
+                            span,
+                        },
+                    };
+                }
+                TokenKind::LBracket => {
+                    self.bump();
+                    let index = self.parse_expr()?;
+                    let rb = self.expect(&TokenKind::RBracket)?;
+                    let span = expr.span().merge(rb.span);
+                    expr = Expr::Index {
+                        recv: Box::new(expr),
+                        index: Box::new(index),
+                        span,
+                    };
+                }
+                TokenKind::Dot => {
+                    self.bump();
+                    let name = self.ident()?;
+                    let span = expr.span().merge(name.span);
+                    expr = Expr::Field {
+                        recv: Box::new(expr),
+                        name,
+                        span,
+                    };
+                }
+                _ => break,
+            }
+        }
+        Ok(expr)
+    }
+
+    fn parse_call_args(&mut self) -> PResult<Vec<Expr>> {
+        let saved = self.no_struct_lit;
+        self.no_struct_lit = false;
+        let mut args = Vec::new();
+        loop {
+            if self.at(&TokenKind::RParen) {
+                break;
+            }
+            match self.parse_expr() {
+                Ok(e) => args.push(e),
+                Err(()) => {
+                    self.no_struct_lit = saved;
+                    return Err(());
+                }
+            }
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        self.no_struct_lit = saved;
+        Ok(args)
+    }
+
+    fn parse_primary(&mut self) -> PResult<Expr> {
+        let start = self.cur_span();
+        match self.cur().clone() {
+            TokenKind::Int(v) => {
+                self.bump();
+                Ok(Expr::Int(v, start))
+            }
+            TokenKind::Float(v) => {
+                self.bump();
+                Ok(Expr::Float(v, start))
+            }
+            TokenKind::KwTrue => {
+                self.bump();
+                Ok(Expr::Bool(true, start))
+            }
+            TokenKind::KwFalse => {
+                self.bump();
+                Ok(Expr::Bool(false, start))
+            }
+            TokenKind::Str(parts) => {
+                self.bump();
+                let mut pieces = Vec::new();
+                for part in parts {
+                    match part {
+                        StrPart::Text(t) => pieces.push(StrPiece::Text(t)),
+                        StrPart::Interp { src, offset } => {
+                            let (expr, mut diags) = parse_expr_src(&src, offset);
+                            self.diags.append(&mut diags);
+                            match expr {
+                                Some(e) => pieces.push(StrPiece::Expr(e)),
+                                None => {
+                                    self.diags.push(Diagnostic::error(
+                                        start,
+                                        "invalid expression inside string interpolation",
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(Expr::Str(pieces, start))
+            }
+            TokenKind::Ident(name) => {
+                self.bump();
+                let ident = Ident {
+                    name,
+                    span: start,
+                };
+                // Struct literal: `Name{ ... }` — only when allowed here.
+                if !self.no_struct_lit && self.at(&TokenKind::LBrace) {
+                    return self.parse_struct_lit(ident);
+                }
+                Ok(Expr::Ident(ident))
+            }
+            TokenKind::LParen => {
+                self.bump();
+                if self.at(&TokenKind::RParen) {
+                    let rp = self.bump();
+                    return Ok(Expr::Tuple(Vec::new(), start.merge(rp.span)));
+                }
+                let saved = self.no_struct_lit;
+                self.no_struct_lit = false;
+                let first = self.parse_expr()?;
+                if self.at(&TokenKind::Comma) {
+                    let mut items = vec![first];
+                    while self.eat(&TokenKind::Comma) {
+                        if self.at(&TokenKind::RParen) {
+                            break;
+                        }
+                        items.push(self.parse_expr()?);
+                    }
+                    let rp = self.expect(&TokenKind::RParen)?;
+                    self.no_struct_lit = saved;
+                    Ok(Expr::Tuple(items, start.merge(rp.span)))
+                } else {
+                    self.expect(&TokenKind::RParen)?;
+                    self.no_struct_lit = saved;
+                    Ok(first)
+                }
+            }
+            TokenKind::LBracket => {
+                self.bump();
+                let saved = self.no_struct_lit;
+                self.no_struct_lit = false;
+                let mut items = Vec::new();
+                loop {
+                    if self.at(&TokenKind::RBracket) {
+                        break;
+                    }
+                    items.push(self.parse_expr()?);
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                let rb = self.expect(&TokenKind::RBracket)?;
+                self.no_struct_lit = saved;
+                Ok(Expr::List(items, start.merge(rb.span)))
+            }
+            TokenKind::KwIf => self.parse_if(),
+            TokenKind::KwMatch => self.parse_match(),
+            TokenKind::LBrace => Ok(Expr::Block(self.parse_block()?)),
+            TokenKind::Pipe => self.parse_closure(),
+            other => {
+                self.diags.push(Diagnostic::error(
+                    start,
+                    format!("expected an expression but found {}", other.describe()),
+                ));
+                Err(())
+            }
+        }
+    }
+
+    fn parse_struct_lit(&mut self, name: Ident) -> PResult<Expr> {
+        let start = name.span;
+        self.expect(&TokenKind::LBrace)?;
+        let mut fields = Vec::new();
+        loop {
+            self.skip_newlines();
+            if self.at(&TokenKind::RBrace) {
+                break;
+            }
+            let fname = self.ident()?;
+            self.expect(&TokenKind::Colon)?;
+            self.skip_newlines();
+            let saved = self.no_struct_lit;
+            self.no_struct_lit = false;
+            let value = self.parse_expr()?;
+            self.no_struct_lit = saved;
+            fields.push((fname, value));
+            let had_sep = self.eat(&TokenKind::Comma);
+            let at_nl = matches!(self.toks[self.i].kind, TokenKind::Newline);
+            if !had_sep && !at_nl {
+                break;
+            }
+        }
+        self.skip_newlines();
+        let rb = self.expect(&TokenKind::RBrace)?;
+        let path = Path {
+            segments: vec![name.clone()],
+            span: name.span,
+        };
+        Ok(Expr::StructLit {
+            name: path,
+            fields,
+            span: start.merge(rb.span),
+        })
+    }
+
+    fn parse_if(&mut self) -> PResult<Expr> {
+        let start = self.cur_span();
+        self.expect(&TokenKind::KwIf)?;
+        let cond = self.parse_cond_expr()?;
+        let then_block = self.parse_block()?;
+        let mut span = start.merge(then_block.span);
+
+        // `else` may appear after a newline.
+        let save = self.i;
+        self.skip_newlines();
+        let else_branch = if self.at(&TokenKind::KwElse) {
+            self.bump();
+            if self.at(&TokenKind::KwIf) {
+                let nested = self.parse_if()?;
+                span = span.merge(nested.span());
+                Some(Box::new(ElseBranch::ElseIf(nested)))
+            } else {
+                let block = self.parse_block()?;
+                span = span.merge(block.span);
+                Some(Box::new(ElseBranch::Else(block)))
+            }
+        } else {
+            self.i = save;
+            None
+        };
+
+        Ok(Expr::If {
+            cond: Box::new(cond),
+            then_block,
+            else_branch,
+            span,
+        })
+    }
+
+    fn parse_match(&mut self) -> PResult<Expr> {
+        let start = self.cur_span();
+        self.expect(&TokenKind::KwMatch)?;
+        let scrutinee = self.parse_cond_expr()?;
+        self.expect(&TokenKind::LBrace)?;
+        let mut arms = Vec::new();
+        loop {
+            self.skip_newlines();
+            if self.at(&TokenKind::RBrace) {
+                break;
+            }
+            let pat = self.parse_pattern()?;
+            let guard = if self.eat(&TokenKind::KwIf) {
+                Some(self.parse_cond_expr()?)
+            } else {
+                None
+            };
+            self.expect(&TokenKind::Arrow)?;
+            self.skip_newlines();
+            let body = self.parse_expr()?;
+            let span = pat.span().merge(body.span());
+            arms.push(Arm {
+                pattern: pat,
+                guard,
+                body,
+                span,
+            });
+        }
+        let rb = self.expect(&TokenKind::RBrace)?;
+        Ok(Expr::Match {
+            scrutinee: Box::new(scrutinee),
+            arms,
+            span: start.merge(rb.span),
+        })
+    }
+
+    fn parse_closure(&mut self) -> PResult<Expr> {
+        let start = self.cur_span();
+        self.expect(&TokenKind::Pipe)?;
+        let mut params = Vec::new();
+        if !self.at(&TokenKind::Pipe) {
+            loop {
+                params.push(self.ident()?);
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect(&TokenKind::Pipe)?;
+        let body = if self.at(&TokenKind::LBrace) {
+            Expr::Block(self.parse_block()?)
+        } else {
+            self.parse_expr()?
+        };
+        let span = start.merge(body.span());
+        Ok(Expr::Closure {
+            params,
+            body: Box::new(body),
+            span,
+        })
+    }
+
+    // ------------------------------------------------------------------
+    // Patterns
+    // ------------------------------------------------------------------
+
+    fn parse_pattern(&mut self) -> PResult<Pattern> {
+        let start = self.cur_span();
+        match self.cur().clone() {
+            TokenKind::Underscore => {
+                self.bump();
+                Ok(Pattern::Wildcard(start))
+            }
+            TokenKind::Int(v) => {
+                self.bump();
+                Ok(Pattern::Int(v, start))
+            }
+            TokenKind::Minus => {
+                self.bump();
+                let span = self.cur_span();
+                if let TokenKind::Int(v) = self.cur().clone() {
+                    self.bump();
+                    Ok(Pattern::Int(-v, start.merge(span)))
+                } else {
+                    self.error_here("expected an integer after `-` in pattern");
+                    Err(())
+                }
+            }
+            TokenKind::KwTrue => {
+                self.bump();
+                Ok(Pattern::Bool(true, start))
+            }
+            TokenKind::KwFalse => {
+                self.bump();
+                Ok(Pattern::Bool(false, start))
+            }
+            TokenKind::Str(parts) => {
+                self.bump();
+                match parts.as_slice() {
+                    [StrPart::Text(t)] => Ok(Pattern::Str(t.clone(), start)),
+                    [] => Ok(Pattern::Str(String::new(), start)),
+                    _ => {
+                        self.diags.push(Diagnostic::error(
+                            start,
+                            "string patterns cannot contain interpolation",
+                        ));
+                        Err(())
+                    }
+                }
+            }
+            TokenKind::Ident(_) => {
+                let path = self.parse_path()?;
+                if self.at(&TokenKind::LParen) {
+                    self.bump();
+                    let mut fields = Vec::new();
+                    loop {
+                        if self.at(&TokenKind::RParen) {
+                            break;
+                        }
+                        fields.push(self.parse_pattern()?);
+                        if !self.eat(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                    let rp = self.expect(&TokenKind::RParen)?;
+                    Ok(Pattern::Variant {
+                        span: path.span.merge(rp.span),
+                        path,
+                        fields,
+                    })
+                } else if path.segments.len() > 1 {
+                    Ok(Pattern::Variant {
+                        span: path.span,
+                        path,
+                        fields: Vec::new(),
+                    })
+                } else {
+                    Ok(Pattern::Bind(path.segments.into_iter().next().unwrap()))
+                }
+            }
+            TokenKind::LParen => {
+                self.bump();
+                let mut items = Vec::new();
+                loop {
+                    if self.at(&TokenKind::RParen) {
+                        break;
+                    }
+                    items.push(self.parse_pattern()?);
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                let rp = self.expect(&TokenKind::RParen)?;
+                Ok(Pattern::Tuple(items, start.merge(rp.span)))
+            }
+            other => {
+                self.diags.push(Diagnostic::error(
+                    start,
+                    format!("expected a pattern but found {}", other.describe()),
+                ));
+                Err(())
+            }
+        }
+    }
+}
+
+fn is_place_expr(e: &Expr) -> bool {
+    matches!(
+        e,
+        Expr::Ident(_) | Expr::Field { .. } | Expr::Index { .. }
+    )
+}

@@ -265,7 +265,10 @@ impl<'a> Lexer<'a> {
                     if !cur.is_empty() {
                         parts.push(StrPart::Text(std::mem::take(&mut cur)));
                     }
-                    parts.push(StrPart::Interp(expr_src.to_string()));
+                    parts.push(StrPart::Interp {
+                        src: expr_src.to_string(),
+                        offset: expr_start as u32,
+                    });
                 }
                 _ => {
                     // Copy one UTF-8 char (may be multi-byte) without splitting it.
@@ -518,9 +521,9 @@ mod tests {
             vec![
                 Str(vec![
                     StrPart::Text("hi ".into()),
-                    StrPart::Interp("name".into()),
+                    StrPart::Interp { src: "name".into(), offset: 5 },
                     StrPart::Text(", you are ".into()),
-                    StrPart::Interp("age + 1".into()),
+                    StrPart::Interp { src: "age + 1".into(), offset: 21 },
                 ]),
                 Eof
             ]
@@ -529,7 +532,10 @@ mod tests {
         assert_eq!(
             kinds(r#""{ if x { 1 } else { 2 } }""#),
             vec![
-                Str(vec![StrPart::Interp(" if x { 1 } else { 2 } ".into())]),
+                Str(vec![StrPart::Interp {
+                    src: " if x { 1 } else { 2 } ".into(),
+                    offset: 2
+                }]),
                 Eof
             ]
         );

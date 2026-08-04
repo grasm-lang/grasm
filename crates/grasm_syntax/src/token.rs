@@ -96,8 +96,9 @@ pub enum TokenKind {
 pub enum StrPart {
     Text(String),
     /// Raw source of an interpolated expression: `"hi {name}"`.
-    /// Parsed into an expression by the parser.
-    Interp(String),
+    /// Parsed into an expression by the parser. `offset` is the byte offset of
+    /// `src` within the file, so sub-expression spans stay accurate.
+    Interp { src: String, offset: u32 },
 }
 
 #[derive(Debug, Clone, PartialEq)]
