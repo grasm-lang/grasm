@@ -1846,6 +1846,40 @@ impl Checker {
                     .map(|s| s.to_string())
                     .filter(|n| !covered.contains(n))
                     .collect(),
+                // All-bool tuples: check the full cartesian product of
+                // combinations (up to 2^8) against the covered combo tags.
+                Type::Tuple(members)
+                    if !members.is_empty()
+                        && members.len() <= 8
+                        && members
+                            .iter()
+                            .all(|m| self.uni.resolve(m) == Type::Bool) =>
+                {
+                    let n = members.len();
+                    let mut missing = Vec::new();
+                    for bits in 0..(1u32 << n) {
+                        let combo: Vec<&str> = (0..n)
+                            .map(|i| if bits & (1 << i) != 0 { "true" } else { "false" })
+                            .collect();
+                        let is_covered = covered.iter().any(|tag| {
+                            tag.strip_prefix('(')
+                                .and_then(|t| t.strip_suffix(')'))
+                                .map(|inner| {
+                                    let parts: Vec<&str> =
+                                        inner.split(", ").collect();
+                                    parts.len() == n
+                                        && parts.iter().zip(&combo).all(
+                                            |(p, want)| *p == "_" || p == want,
+                                        )
+                                })
+                                .unwrap_or(false)
+                        });
+                        if !is_covered {
+                            missing.push(format!("({})", combo.join(", ")));
+                        }
+                    }
+                    missing
+                }
                 Type::Error => vec![],
                 _ => vec!["_".into()], // ints, strings, … need a catch-all
             };
@@ -1996,6 +2030,7 @@ impl Checker {
                 Some(vname.clone())
             }
             Pattern::Tuple(items, span) => {
+                let mut sub_tags: Vec<Option<String>> = Vec::new();
                 match self.uni.resolve(expected) {
                     Type::Tuple(member_tys) => {
                         if items.len() != member_tys.len() {
@@ -2009,7 +2044,7 @@ impl Checker {
                             );
                         }
                         for (p, t) in items.iter().zip(&member_tys) {
-                            self.check_pattern(p, t);
+                            sub_tags.push(self.check_pattern(p, t));
                         }
                     }
                     Type::Error => {}
@@ -2022,7 +2057,17 @@ impl Checker {
                         self.error(*span, format!("tuple pattern cannot match `{shown}`"));
                     }
                 }
-                None // tuples have one constructor — irrefutable if subpatterns are
+                // Irrefutable only if every sub-pattern is; otherwise it covers
+                // one combination and the match needs a catch-all.
+                if sub_tags.iter().all(|t| t.is_none()) {
+                    None
+                } else {
+                    let combo: Vec<String> = sub_tags
+                        .into_iter()
+                        .map(|t| t.unwrap_or_else(|| "_".into()))
+                        .collect();
+                    Some(format!("({})", combo.join(", ")))
+                }
             }
         }
     }

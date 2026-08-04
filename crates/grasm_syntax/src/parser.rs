@@ -1348,7 +1348,42 @@ impl Parser {
                         span,
                     })
                 }
-                _ => self.parse_expr()?,
+                _ => {
+                    let e = self.parse_expr()?;
+                    // Assignments too: `Some(i) -> xs[i] = v`.
+                    let op = match self.cur() {
+                        TokenKind::Eq => Some(AssignOp::Assign),
+                        TokenKind::PlusEq => Some(AssignOp::Add),
+                        TokenKind::MinusEq => Some(AssignOp::Sub),
+                        TokenKind::StarEq => Some(AssignOp::Mul),
+                        TokenKind::SlashEq => Some(AssignOp::Div),
+                        _ => None,
+                    };
+                    match op {
+                        Some(op) => {
+                            self.bump();
+                            self.skip_newlines_if_continuation();
+                            let value = self.parse_expr()?;
+                            let span = e.span().merge(value.span());
+                            if !is_place_expr(&e) {
+                                self.diags.push(
+                                    Diagnostic::error(e.span(), "invalid assignment target")
+                                        .with_help("only variables, fields, and index expressions can be assigned to"),
+                                );
+                            }
+                            Expr::Block(Block {
+                                stmts: vec![Stmt::Assign {
+                                    target: e,
+                                    op,
+                                    value,
+                                    span,
+                                }],
+                                span,
+                            })
+                        }
+                        None => e,
+                    }
+                }
             };
             let span = pat.span().merge(body.span());
             arms.push(Arm {

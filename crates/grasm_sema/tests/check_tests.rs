@@ -505,3 +505,20 @@ fn own_plus_inout_same_var_rejected() {
         "moved (`own`) and mutated (`inout`)",
     );
 }
+
+#[test]
+fn tuple_patterns_with_literals_are_refutable() {
+    // Regression: `("GET", x)` must not count as a catch-all.
+    check_err(
+        "fn f(m: str, p: str) -> i64 {\n    match (m, p) {\n        (\"GET\", x) -> 1\n    }\n}\n",
+        "not exhaustive",
+    );
+    // All-binding tuple pattern still irrefutable.
+    check_ok(
+        "fn f(m: str, p: str) -> str {\n    match (m, p) {\n        (a, b) -> a + b\n    }\n}\n",
+    );
+    // Literal combos + catch-all is fine.
+    check_ok(
+        "fn f(m: str, p: str) -> i64 {\n    match (m, p) {\n        (\"GET\", \"x\") -> 1\n        _ -> 0\n    }\n}\n",
+    );
+}

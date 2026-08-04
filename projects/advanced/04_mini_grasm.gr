@@ -1,0 +1,443 @@
+// Advanced project 4: an interpreter for Mini-Grasm, written in Grasm.
+// The self-hosting seed: tokenizer -> parser -> AST -> evaluator, all in Grasm.
+// Mini-Grasm supports: let/assign, integers, + - * / comparisons, if/else,
+// while, print. Programs are semicolon-separated statements.
+
+type MTok =
+    | MNum(v: i64)
+    | MIdent(name: str)
+    | MSym(s: str)
+    | MKw(k: str)
+
+type MExpr =
+    | ENum(v: i64)
+    | EVar(name: str)
+    | EBin(op: str, lhs: MExpr, rhs: MExpr)
+
+type MStmt =
+    | SLet(name: str, value: MExpr)
+    | SAssign(name: str, value: MExpr)
+    | SPrint(value: MExpr)
+    | SIf(cond: MExpr, then_body: [MStmt], else_body: [MStmt])
+    | SWhile(cond: MExpr, body: [MStmt])
+
+type MiniError =
+    | LexError(c: str)
+    | ParseError(msg: str)
+    | NameError(name: str)
+    | MathError(msg: str)
+
+// ---------------- tokenizer ----------------
+
+fn m_tokenize(src: str) -> [MTok] ! MiniError {
+    let chars = src.chars()
+    var toks: [MTok] = []
+    var i = 0
+    while i < chars.len() {
+        let c = chars[i]
+        if c == " " or c == "\n" or c == "\t" {
+            i += 1
+            continue
+        }
+        if c >= "0" and c <= "9" {
+            var text = ""
+            while i < chars.len() and chars[i] >= "0" and chars[i] <= "9" {
+                text += chars[i]
+                i += 1
+            }
+            toks.push(MNum(text.parse_int() ?? 0))
+            continue
+        }
+        if (c >= "a" and c <= "z") or c == "_" {
+            var name = ""
+            while i < chars.len() and ((chars[i] >= "a" and chars[i] <= "z") or chars[i] == "_") {
+                name += chars[i]
+                i += 1
+            }
+            if name == "let" or name == "if" or name == "else" or name == "while" or name == "print" {
+                toks.push(MKw(name))
+            } else {
+                toks.push(MIdent(name))
+            }
+            continue
+        }
+        // Two-char operators first.
+        let two = if i + 1 < chars.len() { c + chars[i + 1] } else { "" }
+        if two == "==" or two == "!=" or two == "<=" or two == ">=" {
+            toks.push(MSym(two))
+            i += 2
+            continue
+        }
+        if c == "+" or c == "-" or c == "*" or c == "/" or c == "=" or c == "<" or c == ">" or c == "(" or c == ")" or c == ";" or c == "\{" or c == "}" {
+            toks.push(MSym(c))
+            i += 1
+            continue
+        }
+        fail(LexError(c))
+    }
+    toks
+}
+
+// ---------------- parser ----------------
+
+type MP = { toks: [MTok], pos: i64 }
+
+fn m_peek(p: MP) -> Option[MTok] {
+    p.toks.get(p.pos)
+}
+
+fn m_eat_sym(inout p: MP, s: str) -> bool {
+    match m_peek(p) {
+        Some(MSym(x)) -> {
+            if x == s {
+                p.pos += 1
+                true
+            } else {
+                false
+            }
+        }
+        _ -> false
+    }
+}
+
+fn m_expect_sym(inout p: MP, s: str) ! MiniError {
+    if not m_eat_sym(p, s) {
+        fail(ParseError("expected {s} at token {p.pos}"))
+    }
+}
+
+fn m_parse_program(inout p: MP) -> [MStmt] ! MiniError {
+    var stmts: [MStmt] = []
+    while p.pos < p.toks.len() {
+        match m_peek(p) {
+            Some(MSym(s)) -> {
+                if s == "}" {
+                    break
+                }
+            }
+            _ -> ()
+        }
+        let s = try m_parse_stmt(p)
+        stmts.push(s)
+    }
+    stmts
+}
+
+fn m_parse_block(inout p: MP) -> [MStmt] ! MiniError {
+    try m_expect_sym(p, "\{")
+    let body = try m_parse_program(p)
+    try m_expect_sym(p, "}")
+    body
+}
+
+fn m_parse_stmt(inout p: MP) -> MStmt ! MiniError {
+    match m_peek(p) {
+        Some(MKw(k)) -> {
+            if k == "let" {
+                p.pos += 1
+                let name = try m_ident(p)
+                try m_expect_sym(p, "=")
+                let v = try m_parse_expr(p)
+                try m_expect_sym(p, ";")
+                return SLet(name, v)
+            }
+            if k == "print" {
+                p.pos += 1
+                let v = try m_parse_expr(p)
+                try m_expect_sym(p, ";")
+                return SPrint(v)
+            }
+            if k == "if" {
+                p.pos += 1
+                let cond = try m_parse_expr(p)
+                let then_body = try m_parse_block(p)
+                var else_body: [MStmt] = []
+                match m_peek(p) {
+                    Some(MKw(e)) -> {
+                        if e == "else" {
+                            p.pos += 1
+                            else_body = try m_parse_block(p)
+                        }
+                    }
+                    _ -> ()
+                }
+                return SIf(cond, then_body, else_body)
+            }
+            if k == "while" {
+                p.pos += 1
+                let cond = try m_parse_expr(p)
+                let body = try m_parse_block(p)
+                return SWhile(cond, body)
+            }
+            fail(ParseError("unexpected keyword {k}"))
+        }
+        Some(MIdent(name)) -> {
+            p.pos += 1
+            try m_expect_sym(p, "=")
+            let v = try m_parse_expr(p)
+            try m_expect_sym(p, ";")
+            SAssign(name, v)
+        }
+        _ -> fail(ParseError("unexpected token at {p.pos}"))
+    }
+}
+
+fn m_ident(inout p: MP) -> str ! MiniError {
+    match m_peek(p) {
+        Some(MIdent(n)) -> {
+            p.pos += 1
+            n
+        }
+        _ -> fail(ParseError("expected identifier at {p.pos}"))
+    }
+}
+
+// expr := add (cmp add)?
+fn m_parse_expr(inout p: MP) -> MExpr ! MiniError {
+    let lhs = try m_parse_add(p)
+    match m_peek(p) {
+        Some(MSym(s)) -> {
+            if s == "==" or s == "!=" or s == "<" or s == ">" or s == "<=" or s == ">=" {
+                p.pos += 1
+                let rhs = try m_parse_add(p)
+                EBin(s, lhs, rhs)
+            } else {
+                lhs
+            }
+        }
+        _ -> lhs
+    }
+}
+
+fn m_parse_add(inout p: MP) -> MExpr ! MiniError {
+    var lhs = try m_parse_mul(p)
+    while true {
+        match m_peek(p) {
+            Some(MSym(s)) -> {
+                if s == "+" or s == "-" {
+                    p.pos += 1
+                    let rhs = try m_parse_mul(p)
+                    lhs = EBin(s, lhs, rhs)
+                } else {
+                    break
+                }
+            }
+            _ -> break
+        }
+    }
+    lhs
+}
+
+fn m_parse_mul(inout p: MP) -> MExpr ! MiniError {
+    var lhs = try m_parse_atom(p)
+    while true {
+        match m_peek(p) {
+            Some(MSym(s)) -> {
+                if s == "*" or s == "/" {
+                    p.pos += 1
+                    let rhs = try m_parse_atom(p)
+                    lhs = EBin(s, lhs, rhs)
+                } else {
+                    break
+                }
+            }
+            _ -> break
+        }
+    }
+    lhs
+}
+
+fn m_parse_atom(inout p: MP) -> MExpr ! MiniError {
+    match m_peek(p) {
+        Some(MNum(v)) -> {
+            p.pos += 1
+            ENum(v)
+        }
+        Some(MIdent(n)) -> {
+            p.pos += 1
+            EVar(n)
+        }
+        Some(MSym(s)) -> {
+            if s == "(" {
+                p.pos += 1
+                let e = try m_parse_expr(p)
+                try m_expect_sym(p, ")")
+                e
+            } else {
+                fail(ParseError("unexpected symbol {s}"))
+            }
+        }
+        _ -> fail(ParseError("unexpected end of input"))
+    }
+}
+
+// ---------------- evaluator ----------------
+
+type Env = { names: [str], vals: [i64], output: [str] }
+
+fn env_get(e: Env, name: str) -> Option[i64] {
+    var i = 0
+    while i < e.names.len() {
+        if e.names[i] == name {
+            return e.vals.get(i)
+        }
+        i += 1
+    }
+    None
+}
+
+fn env_set(inout e: Env, name: str, v: i64) {
+    var i = 0
+    while i < e.names.len() {
+        if e.names[i] == name {
+            e.vals[i] = v
+            return
+        }
+        i += 1
+    }
+    e.names.push(name)
+    e.vals.push(v)
+}
+
+fn m_eval_expr(e: MExpr, env: Env) -> i64 ! MiniError {
+    match e {
+        ENum(v) -> v
+        EVar(name) -> {
+            match env_get(env, name) {
+                Some(v) -> v
+                None -> fail(NameError(name))
+            }
+        }
+        EBin(op, lhs, rhs) -> {
+            let a = try m_eval_expr(lhs, env)
+            let b = try m_eval_expr(rhs, env)
+            match op {
+                "+" -> a + b
+                "-" -> a - b
+                "*" -> a * b
+                "/" -> {
+                    if b == 0 {
+                        fail(MathError("division by zero"))
+                    }
+                    a / b
+                }
+                "==" -> {
+                    if a == b { 1 } else { 0 }
+                }
+                "!=" -> {
+                    if a != b { 1 } else { 0 }
+                }
+                "<" -> {
+                    if a < b { 1 } else { 0 }
+                }
+                ">" -> {
+                    if a > b { 1 } else { 0 }
+                }
+                "<=" -> {
+                    if a <= b { 1 } else { 0 }
+                }
+                ">=" -> {
+                    if a >= b { 1 } else { 0 }
+                }
+                _ -> fail(MathError("unknown operator {op}"))
+            }
+        }
+    }
+}
+
+fn m_exec(stmts: [MStmt], inout env: Env) ! MiniError {
+    for s in stmts {
+        match s {
+            SLet(name, value) -> {
+                let v = try m_eval_expr(value, env)
+                env_set(env, name, v)
+            }
+            SAssign(name, value) -> {
+                if env_get(env, name).is_none() {
+                    fail(NameError(name))
+                }
+                let v = try m_eval_expr(value, env)
+                env_set(env, name, v)
+            }
+            SPrint(value) -> {
+                let v = try m_eval_expr(value, env)
+                env.output.push("{v}")
+            }
+            SIf(cond, then_body, else_body) -> {
+                let c = try m_eval_expr(cond, env)
+                if c != 0 {
+                    try m_exec(then_body, env)
+                } else {
+                    try m_exec(else_body, env)
+                }
+            }
+            SWhile(cond, body) -> {
+                while true {
+                    let c = try m_eval_expr(cond, env)
+                    if c == 0 {
+                        break
+                    }
+                    try m_exec(body, env)
+                }
+            }
+        }
+    }
+}
+
+fn m_run(src: str) -> [str] ! MiniError {
+    let toks = try m_tokenize(src)
+    var p = MP{ toks: toks, pos: 0 }
+    let program = try m_parse_program(p)
+    var env = Env{ names: [], vals: [], output: [] }
+    try m_exec(program, env)
+    env.output
+}
+
+fn main() {
+    // Mini-Grasm computing fibonacci and fizz-ish counting.
+    let program = "let a = 0; let b = 1; let n = 10; while n > 0 \{ let t = a + b; a = b; b = t; n = n - 1; } print a; if a == 55 \{ print 1; } else \{ print 0; }"
+    match m_run(program) {
+        Ok(output) -> {
+            for line in output {
+                print("mini> {line}")
+            }
+        }
+        Err(e) -> print("mini-grasm error: {e}")
+    }
+}
+
+test "arithmetic and precedence" {
+    let out = try m_run("print 1 + 2 * 3; print (1 + 2) * 3;")
+    assert_eq(out[0], "7")
+    assert_eq(out[1], "9")
+}
+
+test "variables and loops" {
+    let out = try m_run("let x = 0; let i = 5; while i > 0 \{ x = x + i; i = i - 1; } print x;")
+    assert_eq(out[0], "15")
+}
+
+test "fibonacci in mini-grasm" {
+    let out = try m_run("let a = 0; let b = 1; let n = 10; while n > 0 \{ let t = a + b; a = b; b = t; n = n - 1; } print a;")
+    assert_eq(out[0], "55")
+}
+
+test "if else branches" {
+    let out = try m_run("let x = 3; if x > 2 \{ print 100; } else \{ print 200; }")
+    assert_eq(out[0], "100")
+}
+
+test "errors surface" {
+    match m_run("print y;") {
+        Err(NameError(n)) -> assert_eq(n, "y")
+        _ -> panic("expected name error")
+    }
+    match m_run("print 1 / 0;") {
+        Err(MathError(m)) -> assert(true)
+        _ -> panic("expected math error")
+    }
+    match m_run("let 5 = 3;") {
+        Err(ParseError(m)) -> assert(true)
+        _ -> panic("expected parse error")
+    }
+}

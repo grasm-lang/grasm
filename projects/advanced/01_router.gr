@@ -1,0 +1,117 @@
+// Advanced project 1: HTTP-style request router with middleware.
+// Validates: effects as capabilities (Log swapped in tests), first-class
+// functions in lists, tuple-pattern dispatch, security-style middleware.
+
+effect Log {
+    fn log(msg: str)
+}
+
+type Request = { method: str, path: str, body: str, auth: str }
+type Response = { status: i64, body: str }
+
+fn parts_of(path: str) -> [str] {
+    path.split("/").filter(|p| p.len() > 0)
+}
+
+// --- middleware: each returns Some(response) to short-circuit ---
+
+fn require_auth(req: Request) -> Option[Response] / {Log} {
+    let protected = req.path.starts_with("/admin")
+    if protected and req.auth != "secret-token" {
+        Log.log("DENY {req.path} (bad auth)")
+        return Some(Response{ status: 401, body: "unauthorized" })
+    }
+    None
+}
+
+fn reject_huge_bodies(req: Request) -> Option[Response] / {Log} {
+    if req.body.len() > 100 {
+        Log.log("DENY {req.path} (body too large)")
+        return Some(Response{ status: 413, body: "payload too large" })
+    }
+    None
+}
+
+fn run_middleware(req: Request) -> Option[Response] / {Log} {
+    // First-class functions in a list.
+    let chain = [require_auth, reject_huge_bodies]
+    for mw in chain {
+        match mw(req) {
+            Some(resp) -> return Some(resp)
+            None -> continue
+        }
+    }
+    None
+}
+
+// --- routes ---
+
+fn dispatch(req: Request) -> Response / {Log} {
+    let parts = parts_of(req.path)
+    let head = parts.first() ?? ""
+    match (req.method, head) {
+        ("GET", "health") -> Response{ status: 200, body: "ok" }
+        ("GET", "users") -> {
+            match parts.get(1) {
+                Some(id) -> Response{ status: 200, body: "user {id}" }
+                None -> Response{ status: 200, body: "3 users" }
+            }
+        }
+        ("POST", "users") -> Response{ status: 201, body: "created {req.body}" }
+        ("GET", "admin") -> Response{ status: 200, body: "admin panel" }
+        _ -> Response{ status: 404, body: "no route for {req.method} {req.path}" }
+    }
+}
+
+fn handle(req: Request) -> Response / {Log} {
+    Log.log("{req.method} {req.path}")
+    let early = run_middleware(req)
+    let resp = match early {
+        Some(r) -> r
+        None -> dispatch(req)
+    }
+    Log.log("-> {resp.status}")
+    resp
+}
+
+fn main() {
+    with Log handled_by LogHandler{ log: |m| print("  [log] {m}") } {
+        let reqs = [
+            Request{ method: "GET", path: "/health", body: "", auth: "" },
+            Request{ method: "GET", path: "/users/42", body: "", auth: "" },
+            Request{ method: "POST", path: "/users", body: "ada", auth: "" },
+            Request{ method: "GET", path: "/admin/panel", body: "", auth: "" },
+            Request{ method: "GET", path: "/admin/panel", body: "", auth: "secret-token" },
+            Request{ method: "DELETE", path: "/things", body: "", auth: "" },
+        ]
+        for r in reqs {
+            let resp = handle(r)
+            print("{r.method} {r.path} => {resp.status} {resp.body}")
+        }
+    }
+}
+
+test "routing and params" {
+    with Log handled_by LogHandler{ log: |m| () } {
+        assert_eq(handle(Request{ method: "GET", path: "/health", body: "", auth: "" }).status, 200)
+        assert_eq(handle(Request{ method: "GET", path: "/users/7", body: "", auth: "" }).body, "user 7")
+        assert_eq(handle(Request{ method: "PUT", path: "/x", body: "", auth: "" }).status, 404)
+    }
+}
+
+test "auth middleware blocks and allows" {
+    with Log handled_by LogHandler{ log: |m| () } {
+        let denied = handle(Request{ method: "GET", path: "/admin", body: "", auth: "wrong" })
+        assert_eq(denied.status, 401)
+        let allowed = handle(Request{ method: "GET", path: "/admin", body: "", auth: "secret-token" })
+        assert_eq(allowed.status, 200)
+    }
+}
+
+test "body size middleware" {
+    with Log handled_by LogHandler{ log: |m| () } {
+        let big = "x".repeat(200)
+        let resp = handle(Request{ method: "POST", path: "/users", body: big, auth: "" })
+        assert_eq(resp.status, 413)
+    }
+}

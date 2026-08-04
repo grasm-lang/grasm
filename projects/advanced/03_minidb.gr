@@ -1,0 +1,245 @@
+// Advanced project 3: mini database — WAL, transactions, crash recovery.
+// Validates: data integrity patterns, fs effects, fallible chains, real-world architecture.
+
+type Row = { id: i64, name: str, balance: i64 }
+
+type Op =
+    | Insert(id: i64, name: str, balance: i64)
+    | Update(id: i64, balance: i64)
+    | Delete(id: i64)
+
+type DbError =
+    | DuplicateId(id: i64)
+    | NoSuchRow(id: i64)
+    | CorruptWal(line: str)
+
+type Db = { rows: [Row], wal_path: str, in_tx: bool, tx_buffer: [Op] }
+
+fn open_db(wal_path: str) -> Db ! (IoError | DbError) {
+    var db = Db{ rows: [], wal_path: wal_path, in_tx: false, tx_buffer: [] }
+    if file_exists(wal_path) {
+        let content = try read_file(wal_path)
+        for line in content.split("\n") {
+            if line.trim() == "" {
+                continue
+            }
+            let op = try decode_op(line)
+            try apply_op(db, op)
+        }
+    }
+    db
+}
+
+fn encode_op(op: Op) -> str {
+    match op {
+        Insert(id, name, balance) -> "I|{id}|{name}|{balance}"
+        Update(id, balance) -> "U|{id}|{balance}"
+        Delete(id) -> "D|{id}"
+    }
+}
+
+fn decode_op(line: str) -> Op ! DbError {
+    let f = line.split("|")
+    let kind = f.get(0) ?? ""
+    if kind == "I" and f.len() == 4 {
+        match ((f.get(1) ?? "").parse_int(), (f.get(3) ?? "").parse_int()) {
+            (Some(id), Some(bal)) -> return Insert(id, f.get(2) ?? "", bal)
+            _ -> fail(CorruptWal(line))
+        }
+    }
+    if kind == "U" and f.len() == 3 {
+        match ((f.get(1) ?? "").parse_int(), (f.get(2) ?? "").parse_int()) {
+            (Some(id), Some(bal)) -> return Update(id, bal)
+            _ -> fail(CorruptWal(line))
+        }
+    }
+    if kind == "D" and f.len() == 2 {
+        match (f.get(1) ?? "").parse_int() {
+            Some(id) -> return Delete(id)
+            None -> fail(CorruptWal(line))
+        }
+    }
+    fail(CorruptWal(line))
+}
+
+fn find_row(db: Db, id: i64) -> Option[i64] {
+    var i = 0
+    while i < db.rows.len() {
+        if db.rows[i].id == id {
+            return Some(i)
+        }
+        i += 1
+    }
+    None
+}
+
+fn apply_op(inout db: Db, op: Op) ! DbError {
+    match op {
+        Insert(id, name, balance) -> {
+            if find_row(db, id).is_some() {
+                fail(DuplicateId(id))
+            }
+            db.rows.push(Row{ id: id, name: name, balance: balance })
+        }
+        Update(id, balance) -> {
+            match find_row(db, id) {
+                Some(i) -> db.rows[i].balance = balance
+                None -> fail(NoSuchRow(id))
+            }
+        }
+        Delete(id) -> {
+            match find_row(db, id) {
+                Some(i) -> {
+                    var kept: [Row] = []
+                    var k = 0
+                    while k < db.rows.len() {
+                        if k != i {
+                            kept.push(db.rows[k])
+                        }
+                        k += 1
+                    }
+                    db.rows = kept
+                }
+                None -> fail(NoSuchRow(id))
+            }
+        }
+    }
+}
+
+/// WAL discipline: append to the log FIRST, then apply in memory.
+fn execute(inout db: Db, op: Op) ! (IoError | DbError) {
+    if db.in_tx {
+        // Buffered: validated + logged at commit.
+        db.tx_buffer.push(op)
+        return
+    }
+    try append_wal(db, op)
+    try apply_op(db, op)
+}
+
+fn append_wal(db: Db, op: Op) ! IoError {
+    let existing = if file_exists(db.wal_path) {
+        match read_file(db.wal_path) {
+            Ok(c) -> c
+            Err(e) -> ""
+        }
+    } else {
+        ""
+    }
+    try write_file(db.wal_path, existing + encode_op(op) + "\n")
+}
+
+fn begin(inout db: Db) {
+    db.in_tx = true
+    db.tx_buffer = []
+}
+
+fn commit(inout db: Db) ! (IoError | DbError) {
+    // Validate the whole batch against a scratch copy first — all or nothing.
+    var scratch = db
+    scratch.in_tx = false
+    for op in db.tx_buffer {
+        try apply_op(scratch, op)
+    }
+    // Validated: log + apply for real.
+    for op in db.tx_buffer {
+        try append_wal(db, op)
+        try apply_op(db, op)
+    }
+    db.in_tx = false
+    db.tx_buffer = []
+}
+
+fn rollback(inout db: Db) {
+    db.in_tx = false
+    db.tx_buffer = []
+}
+
+fn total_balance(db: Db) -> i64 {
+    db.rows.map(|r| r.balance).sum()
+}
+
+fn main() ! (IoError | DbError) {
+    let wal = "/tmp/grasm_minidb.wal"
+    if file_exists(wal) {
+        try write_file(wal, "")
+    }
+
+    var db = try open_db(wal)
+    try db.execute(Insert(1, "ada", 100))
+    try db.execute(Insert(2, "alan", 50))
+
+    // Transaction: transfer 30 ada -> alan, atomically.
+    db.begin()
+    try db.execute(Update(1, 70))
+    try db.execute(Update(2, 80))
+    try db.commit()
+
+    // Failed transaction: second op invalid -> nothing applies.
+    db.begin()
+    try db.execute(Update(1, 0))
+    try db.execute(Delete(999))
+    match db.commit() {
+        Ok(u) -> print("should not commit")
+        Err(e) -> {
+            print("tx rejected: {e}")
+            db.rollback()
+        }
+    }
+
+    print("rows: {db.rows.len()}, total: {total_balance(db)}")
+
+    // Crash recovery: reopen from WAL alone.
+    let recovered = try open_db(wal)
+    print("recovered: {recovered.rows.len()} rows, total {total_balance(recovered)}")
+    for r in recovered.rows {
+        print("  {r.id} {r.name} {r.balance}")
+    }
+}
+
+test "wal round trip" {
+    for op in [Insert(5, "x", 9), Update(5, 10), Delete(5)] {
+        let decoded = try decode_op(encode_op(op))
+        assert_eq(encode_op(decoded), encode_op(op))
+    }
+}
+
+test "corrupt wal rejected" {
+    match decode_op("garbage line") {
+        Err(CorruptWal(l)) -> assert(true)
+        _ -> panic("should be corrupt")
+    }
+}
+
+test "transactions are atomic" {
+    let wal = "/tmp/grasm_minidb_test.wal"
+    try write_file(wal, "")
+    var db = try open_db(wal)
+    try db.execute(Insert(1, "a", 10))
+    db.begin()
+    try db.execute(Update(1, 99))
+    try db.execute(Update(42, 1))
+    match db.commit() {
+        Ok(u) -> panic("must fail")
+        Err(e) -> db.rollback()
+    }
+    // Balance unchanged — failed tx applied nothing.
+    assert_eq(total_balance(db), 10)
+    // And the WAL replays to the same state.
+    let re = try open_db(wal)
+    assert_eq(total_balance(re), 10)
+}
+
+test "recovery equals live state" {
+    let wal = "/tmp/grasm_minidb_test2.wal"
+    try write_file(wal, "")
+    var db = try open_db(wal)
+    try db.execute(Insert(1, "a", 5))
+    try db.execute(Insert(2, "b", 7))
+    try db.execute(Update(2, 8))
+    try db.execute(Delete(1))
+    let re = try open_db(wal)
+    assert_eq(re.rows.len(), db.rows.len())
+    assert_eq(total_balance(re), total_balance(db))
+    assert_eq(total_balance(re), 8)
+}
