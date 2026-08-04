@@ -1,0 +1,34 @@
+{
+  "name": "grasm",
+  "displayName": "Grasm",
+  "description": "Grasm language support: syntax highlighting and language server",
+  "version": "0.1.0",
+  "publisher": "grasm",
+  "engines": { "vscode": "^1.75.0" },
+  "categories": ["Programming Languages"],
+  "activationEvents": ["onLanguage:grasm"],
+  "main": "./extension.js",
+  "contributes": {
+    "languages": [{
+      "id": "grasm",
+      "aliases": ["Grasm", "grasm"],
+      "extensions": [".gr"],
+      "configuration": "./language-configuration.json"
+    }],
+    "grammars": [{
+      "language": "grasm",
+      "scopeName": "source.grasm",
+      "path": "./syntaxes/grasm.tmLanguage.json"
+    }],
+    "configuration": {
+      "title": "Grasm",
+      "properties": {
+        "grasm.serverPath": {
+          "type": "string",
+          "default": "grasm",
+          "description": "Path to the grasm executable (must support `grasm lsp`)."
+        }
+      }
+    }
+  }
+}

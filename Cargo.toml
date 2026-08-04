@@ -5,6 +5,7 @@ members = [
     "crates/grasm_sema",
     "crates/grasm_interp",
     "crates/grasm_native",
+    "crates/grasm_lsp",
     "crates/grasm_rt",
     "crates/grasm",
 ]

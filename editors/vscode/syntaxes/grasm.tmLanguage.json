@@ -1,0 +1,112 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Grasm",
+  "scopeName": "source.grasm",
+  "patterns": [
+    {
+      "include": "#comments"
+    },
+    {
+      "include": "#strings"
+    },
+    {
+      "include": "#keywords"
+    },
+    {
+      "include": "#constants"
+    },
+    {
+      "include": "#types"
+    },
+    {
+      "include": "#functions"
+    },
+    {
+      "include": "#numbers"
+    }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.grasm",
+          "match": "//.*$"
+        },
+        {
+          "name": "comment.block.grasm",
+          "begin": "/\\*",
+          "end": "\\*/"
+        }
+      ]
+    },
+    "strings": {
+      "name": "string.quoted.double.grasm",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "name": "constant.character.escape.grasm",
+          "match": "\\\\."
+        },
+        {
+          "name": "meta.embedded.grasm",
+          "begin": "(?<!\\\\)\\{",
+          "end": "\\}",
+          "patterns": [
+            {
+              "include": "$self"
+            }
+          ]
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.grasm",
+          "match": "\\b(fn|pub|let|var|own|inout|type|effect|with|handled_by|match|if|else|for|while|in|return|try|break|continue|and|or|not|import|test)\\b"
+        }
+      ]
+    },
+    "constants": {
+      "patterns": [
+        {
+          "name": "constant.language.grasm",
+          "match": "\\b(true|false|None|Some|Ok|Err)\\b"
+        }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "name": "support.type.grasm",
+          "match": "\\b(i8|i16|i32|i64|u8|u16|u32|u64|usize|int|f32|f64|float|bool|str|Option|Map|IoError)\\b"
+        },
+        {
+          "name": "entity.name.type.grasm",
+          "match": "\\b[A-Z][A-Za-z0-9_]*\\b"
+        }
+      ]
+    },
+    "functions": {
+      "patterns": [
+        {
+          "name": "entity.name.function.grasm",
+          "match": "(?<=\\bfn\\s)[a-z_][A-Za-z0-9_]*"
+        },
+        {
+          "name": "support.function.grasm",
+          "match": "\\b(print|assert|assert_eq|panic|fail|map|args|input|read_file|write_file|file_exists)\\b(?=\\s*\\()"
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.grasm",
+          "match": "\\b(0x[0-9a-fA-F_]+|0b[01_]+|[0-9][0-9_]*(\\.[0-9_]+)?([eE][+-]?[0-9]+)?)\\b"
+        }
+      ]
+    }
+  }
+}

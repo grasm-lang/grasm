@@ -1,0 +1,9 @@
+[package]
+name = "grasm_lsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+grasm_syntax = { path = "../grasm_syntax" }
+grasm_sema = { path = "../grasm_sema" }

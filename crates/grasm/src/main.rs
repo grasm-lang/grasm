@@ -172,6 +172,18 @@ fn main() -> ExitCode {
                 ExitCode::SUCCESS
             }
         }
+        Some("lsp") => {
+            let stdin = std::io::stdin();
+            let mut input = stdin.lock();
+            let mut output = std::io::stdout();
+            match grasm_lsp::Server::new().run(&mut input, &mut output) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("lsp error: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Some("tokens") => {
             let Some(path) = args.get(1) else {
                 eprintln!("usage: grasm tokens <file.gr>");
@@ -217,6 +229,7 @@ fn main() -> ExitCode {
             eprintln!("      --native                 compile to machine code (Cranelift)");
             eprintln!("      --target <triple>        emit a cross-target object file");
             eprintln!("  fmt <file.gr> [--check]      canonical formatting");
+            eprintln!("  lsp                          language server (stdio)");
             eprintln!("  tokens <file.gr>             dump lexer output (debug)");
             eprintln!("  version                      print version");
             ExitCode::FAILURE
