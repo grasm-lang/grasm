@@ -38,10 +38,26 @@ fn loops_and_floats_compile() {
 
 #[test]
 fn unsupported_features_reported_cleanly() {
-    let e = compile("fn main() {\n    let xs = [1, 2]\n    print(\"{xs.len()}\")\n}\n")
-        .expect_err("lists unsupported in N1");
+    let e = compile("fn main() {\n    let f = |x| x\n    print(\"{f(1)}\")\n}\n")
+        .expect_err("closures unsupported yet");
     assert!(e.contains("does not yet support"), "got: {e}");
     let e2 = compile("type T = { x: i64 }\n\nfn main() {\n}\n")
-        .expect_err("types unsupported in N1");
+        .expect_err("types unsupported yet");
     assert!(e2.contains("does not yet support"), "got: {e2}");
+}
+
+#[test]
+fn n2_strings_and_lists_compile() {
+    compile(
+        "fn shout(s: str) -> str {\n    s + \"!\"\n}\n\nfn main() {\n    let g = \"hi \" + \"there\"\n    print(shout(g))\n    var xs = [1, 2]\n    xs.push(3)\n    for x in xs {\n        print(\"{x}\")\n    }\n    print(\"{xs.len()} {xs[0]} {g.len()} {g == \"hi there\"}\")\n}\n",
+    )
+    .expect("should compile");
+}
+
+#[test]
+fn n2_list_of_strings_compiles() {
+    compile(
+        "fn main() {\n    var ws = [\"a\", \"b\"]\n    ws.push(\"c\")\n    print(ws)\n}\n",
+    )
+    .expect("should compile");
 }

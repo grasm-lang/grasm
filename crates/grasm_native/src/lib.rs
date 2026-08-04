@@ -1,11 +1,14 @@
 //! grasm_native — Cranelift AOT backend.
 //!
-//! Milestone N1: the scalar subset — i64/f64/bool locals and params,
-//! arithmetic, comparisons, short-circuit logic, if/while/for-range,
-//! functions + recursion, `print` with interpolation over scalars,
-//! assert/assert_eq/panic. Unsupported constructs produce a clear
-//! diagnostic naming the feature (the interpreter remains the reference
-//! semantics for the full language).
+//! N1: scalar subset (i64/f64/bool, control flow, functions, print).
+//! N2: strings + lists as refcounted boxed values (`*mut RtVal`) with
+//! copy-on-write, matching interpreter value semantics.
+//!
+//! Ownership discipline in generated code: every expression producing a boxed
+//! value yields an OWNED reference (+1). Consumers either transfer ownership
+//! (stores, calls, list pushes) or call `grasm_val_dec` after use. Scope exits
+//! dec their boxed locals; early `return` skips sibling decs (bounded leak,
+//! hardened later). Unsupported constructs produce file:line diagnostics.
 
 use std::collections::HashMap;
 
@@ -16,8 +19,8 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{DataDescription, FuncId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 
-use grasm_syntax::ast::*;
 use grasm_syntax::ast::Module as AstModule;
+use grasm_syntax::ast::*;
 use grasm_syntax::span::Span;
 
 pub struct Unsupported {
@@ -34,22 +37,30 @@ fn nope<T>(span: Span, what: impl Into<String>) -> CResult<T> {
     })
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 enum VType {
     I64,
     F64,
     Bool,
     Unit,
+    Str,
+    List(Box<VType>),
 }
 
 impl VType {
-    fn cl(self) -> types::Type {
+    fn cl(&self) -> types::Type {
         match self {
             VType::I64 => types::I64,
             VType::F64 => types::F64,
             VType::Bool => types::I8,
-            VType::Unit => types::I8, // never materialized
+            VType::Unit => types::I8,
+            // Boxed values travel as 64-bit pointers.
+            VType::Str | VType::List(_) => types::I64,
         }
+    }
+
+    fn boxed(&self) -> bool {
+        matches!(self, VType::Str | VType::List(_))
     }
 }
 
@@ -59,8 +70,6 @@ struct FnSig {
     id: FuncId,
 }
 
-/// Compiles the entry module of `program` to a native object file.
-/// N1: single-module scalar subset.
 pub fn compile_object(
     program: &grasm_sema::loader::Program,
     obj_out: &std::path::Path,
@@ -82,7 +91,7 @@ pub fn compile_object(
     let mut module = ObjectModule::new(builder);
 
     let mut cg = Codegen::new(&mut module);
-    cg.declare_runtime().map_err(|e| e)?;
+    cg.declare_runtime()?;
     match cg.compile(module_ast) {
         Ok(()) => {}
         Err(u) => {
@@ -125,22 +134,47 @@ impl<'m> Codegen<'m> {
 
     fn declare_runtime(&mut self) -> Result<(), String> {
         let ptr = self.module.target_config().pointer_type();
-        let decls: &[(&str, &[types::Type], Option<types::Type>)] = &[
-            ("grasm_out_text", &[ptr, types::I64], None),
-            ("grasm_out_i64", &[types::I64], None),
-            ("grasm_out_f64", &[types::F64], None),
-            ("grasm_out_bool", &[types::I8], None),
-            ("grasm_out_nl", &[], None),
-            ("grasm_panic_div_zero", &[], None),
-            ("grasm_panic_rem_zero", &[], None),
-            ("grasm_panic_assert", &[], None),
-            ("grasm_panic_msg", &[ptr, types::I64], None),
-            ("grasm_pow_i64", &[types::I64, types::I64], Some(types::I64)),
-            ("grasm_pow_f64", &[types::F64, types::F64], Some(types::F64)),
+        let i64t = types::I64;
+        let i8t = types::I8;
+        let f64t = types::F64;
+        // (name, params, ret)
+        let decls: &[(&str, Vec<types::Type>, Option<types::Type>)] = &[
+            ("grasm_out_text", vec![ptr, i64t], None),
+            ("grasm_out_i64", vec![i64t], None),
+            ("grasm_out_f64", vec![f64t], None),
+            ("grasm_out_bool", vec![i8t], None),
+            ("grasm_out_val", vec![i64t], None),
+            ("grasm_out_nl", vec![], None),
+            ("grasm_panic_div_zero", vec![], None),
+            ("grasm_panic_rem_zero", vec![], None),
+            ("grasm_panic_assert", vec![], None),
+            ("grasm_panic_msg", vec![ptr, i64t], None),
+            ("grasm_pow_i64", vec![i64t, i64t], Some(i64t)),
+            ("grasm_pow_f64", vec![f64t, f64t], Some(f64t)),
+            ("grasm_val_inc", vec![i64t], None),
+            ("grasm_val_dec", vec![i64t], None),
+            ("grasm_str_lit", vec![ptr, i64t], Some(i64t)),
+            ("grasm_str_concat", vec![i64t, i64t], Some(i64t)),
+            ("grasm_str_from_i64", vec![i64t], Some(i64t)),
+            ("grasm_str_from_f64", vec![f64t], Some(i64t)),
+            ("grasm_str_from_bool", vec![i8t], Some(i64t)),
+            ("grasm_str_len", vec![i64t], Some(i64t)),
+            ("grasm_str_eq", vec![i64t, i64t], Some(i8t)),
+            ("grasm_str_cmp", vec![i64t, i64t], Some(i64t)),
+            ("grasm_list_new", vec![], Some(i64t)),
+            ("grasm_list_push", vec![i64t, i64t], Some(i64t)),
+            ("grasm_list_len", vec![i64t], Some(i64t)),
+            ("grasm_list_get", vec![i64t, i64t], Some(i64t)),
+            ("grasm_box_i64", vec![i64t], Some(i64t)),
+            ("grasm_box_f64", vec![f64t], Some(i64t)),
+            ("grasm_box_bool", vec![i8t], Some(i64t)),
+            ("grasm_unbox_i64", vec![i64t], Some(i64t)),
+            ("grasm_unbox_f64", vec![i64t], Some(f64t)),
+            ("grasm_unbox_bool", vec![i64t], Some(i8t)),
         ];
         for (name, params, ret) in decls {
             let mut sig = self.module.make_signature();
-            for p in *params {
+            for p in params {
                 sig.params.push(AbiParam::new(*p));
             }
             if let Some(r) = ret {
@@ -160,22 +194,23 @@ impl<'m> Codegen<'m> {
             TypeExpr::Name { path, args, span } => {
                 if path.segments.len() == 1 && args.is_empty() {
                     match path.segments[0].name.as_str() {
-                        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64"
-                        | "usize" | "int" => return Ok(VType::I64),
+                        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "usize"
+                        | "int" => return Ok(VType::I64),
                         "f32" | "f64" | "float" => return Ok(VType::F64),
                         "bool" => return Ok(VType::Bool),
+                        "str" => return Ok(VType::Str),
                         _ => {}
                     }
                 }
                 nope(*span, format!("the type `{}`", path.dotted()))
             }
+            TypeExpr::List(inner, _) => Ok(VType::List(Box::new(self.vtype_of(inner)?))),
             TypeExpr::Tuple(items, _) if items.is_empty() => Ok(VType::Unit),
             other => nope(other.span(), "non-scalar types"),
         }
     }
 
     fn compile(&mut self, module_ast: &AstModule) -> CResult<()> {
-        // Pass 1: declare all functions.
         for decl in &module_ast.decls {
             match decl {
                 Decl::Fn(f) => {
@@ -210,10 +245,8 @@ impl<'m> Codegen<'m> {
                             span: f.span,
                             what: format!("(module error: {e})"),
                         })?;
-                    self.fns.insert(
-                        f.name.name.clone(),
-                        FnSig { params, ret, id },
-                    );
+                    self.fns
+                        .insert(f.name.name.clone(), FnSig { params, ret, id });
                 }
                 Decl::Test(_) | Decl::Import(_) => {}
                 Decl::Type(t) => return nope(t.span, "type declarations"),
@@ -223,15 +256,11 @@ impl<'m> Codegen<'m> {
         if !self.fns.contains_key("main") {
             return nope(Span::new(0, 1), "programs without a `main` function");
         }
-
-        // Pass 2: bodies.
         for decl in &module_ast.decls {
             if let Decl::Fn(f) = decl {
                 self.compile_fn(f)?;
             }
         }
-
-        // C entry point: main() calls g_main.
         self.emit_c_main()?;
         Ok(())
     }
@@ -269,12 +298,12 @@ impl<'m> Codegen<'m> {
     }
 
     fn compile_fn(&mut self, f: &FnDecl) -> CResult<()> {
-        let sig_info_params = self.fns[&f.name.name].params.clone();
-        let sig_ret = self.fns[&f.name.name].ret;
+        let sig_params = self.fns[&f.name.name].params.clone();
+        let sig_ret = self.fns[&f.name.name].ret.clone();
         let func_id = self.fns[&f.name.name].id;
 
         let mut ctx = self.module.make_context();
-        for p in &sig_info_params {
+        for p in &sig_params {
             ctx.func.signature.params.push(AbiParam::new(p.cl()));
         }
         if sig_ret != VType::Unit {
@@ -289,7 +318,7 @@ impl<'m> Codegen<'m> {
             vars: Vec::new(),
             var_count: 0,
             loops: Vec::new(),
-            ret: sig_ret,
+            ret: sig_ret.clone(),
         };
 
         let entry = fcx.b.create_block();
@@ -298,28 +327,37 @@ impl<'m> Codegen<'m> {
         fcx.push_scope();
         let entry_params: Vec<Value> = fcx.b.block_params(entry).to_vec();
         for (i, p) in f.params.iter().enumerate() {
-            let vt = sig_info_params[i];
-            let var = fcx.new_var(vt);
+            let vt = sig_params[i].clone();
+            let var = fcx.new_var(&vt);
             fcx.b.def_var(var, entry_params[i]);
             fcx.bind(&p.name.name, var, vt);
         }
 
         let (last, terminated) = fcx.eval_block_inner(&f.body)?;
         if !terminated {
-            match (sig_ret, last) {
-                (VType::Unit, _) => {
+            match (&sig_ret, last) {
+                (VType::Unit, last) => {
+                    // Unused trailing boxed value must be released.
+                    if let Some((v, vt)) = last {
+                        if vt.boxed() {
+                            fcx.call_rt("grasm_val_dec", &[v]);
+                        }
+                    }
+                    fcx.emit_scope_decs_all();
                     fcx.b.ins().return_(&[]);
                 }
-                (_, Some((v, vt))) if vt == sig_ret => {
+                (want, Some((mut v, vt))) => {
+                    if *want == VType::F64 && vt == VType::I64 {
+                        v = fcx.b.ins().fcvt_from_sint(types::F64, v);
+                    }
+                    fcx.emit_scope_decs_all();
                     fcx.b.ins().return_(&[v]);
                 }
-                (want, _) => {
-                    // Checker guarantees this doesn't happen; keep a guard.
-                    return nope(f.span, format!("implicit return of non-{want:?}"));
+                (_, None) => {
+                    return nope(f.span, "a missing return value here");
                 }
             }
         }
-        fcx.pop_scope();
         fcx.b.seal_all_blocks();
         fcx.b.finalize();
 
@@ -348,16 +386,18 @@ impl<'m> Codegen<'m> {
     }
 }
 
-/// Per-function compilation context.
 struct FnCx<'a, 'm> {
     cg: &'a mut Codegen<'m>,
     b: FunctionBuilder<'a>,
-    /// Scope stack: name → (variable, type).
     vars: Vec<HashMap<String, (Variable, VType)>>,
     var_count: usize,
-    /// (continue_target, break_target)
     loops: Vec<(Block, Block)>,
     ret: VType,
+}
+
+enum StmtOut {
+    Value(Option<(Value, VType)>),
+    Terminated,
 }
 
 impl FnCx<'_, '_> {
@@ -365,11 +405,38 @@ impl FnCx<'_, '_> {
         self.vars.push(HashMap::new());
     }
 
-    fn pop_scope(&mut self) {
+    /// Emits rc-decs for the current scope's boxed locals, then pops it.
+    /// Call only on non-terminated paths.
+    fn pop_scope_with_decs(&mut self) {
+        let scope = self.vars.pop().unwrap();
+        for (_, (var, vt)) in scope {
+            if vt.boxed() {
+                let v = self.b.use_var(var);
+                self.call_rt("grasm_val_dec", &[v]);
+            }
+        }
+    }
+
+    fn pop_scope_no_decs(&mut self) {
         self.vars.pop();
     }
 
-    fn new_var(&mut self, vt: VType) -> Variable {
+    /// Before a `return`: release every boxed local in every scope.
+    fn emit_scope_decs_all(&mut self) {
+        let all: Vec<(Variable, VType)> = self
+            .vars
+            .iter()
+            .flat_map(|s| s.values().cloned())
+            .collect();
+        for (var, vt) in all {
+            if vt.boxed() {
+                let v = self.b.use_var(var);
+                self.call_rt("grasm_val_dec", &[v]);
+            }
+        }
+    }
+
+    fn new_var(&mut self, vt: &VType) -> Variable {
         let var = Variable::from_u32(self.var_count as u32);
         self.var_count += 1;
         self.b.declare_var(var, vt.cl());
@@ -386,7 +453,7 @@ impl FnCx<'_, '_> {
     fn lookup(&self, name: &str) -> Option<(Variable, VType)> {
         for scope in self.vars.iter().rev() {
             if let Some(v) = scope.get(name) {
-                return Some(*v);
+                return Some(v.clone());
             }
         }
         None
@@ -399,6 +466,12 @@ impl FnCx<'_, '_> {
         self.b.inst_results(inst).first().copied()
     }
 
+    fn dec_if_boxed(&mut self, v: Value, vt: &VType) {
+        if vt.boxed() {
+            self.call_rt("grasm_val_dec", &[v]);
+        }
+    }
+
     fn str_ptr_len(&mut self, s: &str) -> (Value, Value) {
         let data_id = self.cg.intern_string(s);
         let gv = self.cg.module.declare_data_in_func(data_id, self.b.func);
@@ -408,53 +481,59 @@ impl FnCx<'_, '_> {
         (ptr, len)
     }
 
+    fn trap_here(&mut self) {
+        self.b
+            .ins()
+            .trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
+    }
+
     // ------------------------------------------------------------------
-    // Blocks & statements. Returns (last expr value, terminated?).
+    // Blocks & statements
     // ------------------------------------------------------------------
 
-    fn eval_block_inner(&mut self, blk: &Block2) -> CResult<(Option<(Value, VType)>, bool)> {
+    fn eval_block_inner(
+        &mut self,
+        blk: &grasm_syntax::ast::Block,
+    ) -> CResult<(Option<(Value, VType)>, bool)> {
         self.push_scope();
         let mut last: Option<(Value, VType)> = None;
         let mut terminated = false;
         for (i, stmt) in blk.stmts.iter().enumerate() {
             if terminated {
-                break; // unreachable code after return/break — skip
+                break;
             }
             let is_last = i + 1 == blk.stmts.len();
             match self.eval_stmt(stmt, is_last)? {
-                StmtOut::Value(v) => last = v,
-                StmtOut::Terminated => {
-                    terminated = true;
+                StmtOut::Value(v) => {
+                    // Non-final boxed temporaries were already released inside
+                    // eval_stmt; only the final value flows out.
+                    last = v;
                 }
+                StmtOut::Terminated => terminated = true,
             }
         }
-        self.pop_scope();
+        if terminated {
+            self.pop_scope_no_decs();
+        } else {
+            self.pop_scope_with_decs();
+        }
         Ok((last, terminated))
     }
 
     fn eval_stmt(&mut self, s: &Stmt, is_last: bool) -> CResult<StmtOut> {
         match s {
             Stmt::Let {
-                mutable: _,
-                name,
-                ty,
-                init,
-                ..
+                name, ty, init, ..
             } => {
-                let (v, vt) = self.eval_expr_val(init)?;
-                let vt = match ty {
-                    Some(t) => {
-                        let want = self.cg.vtype_of(t)?;
-                        // int literal → float adaptation
-                        if want == VType::F64 && vt == VType::I64 {
-                            // re-emit as float if it was a literal; general case: convert
-                        }
-                        want
+                let (mut v, mut vt) = self.eval_expr_val(init)?;
+                if let Some(te) = ty {
+                    let want = self.cg.vtype_of(te)?;
+                    if want == VType::F64 && vt == VType::I64 {
+                        v = self.b.ins().fcvt_from_sint(types::F64, v);
                     }
-                    None => vt,
-                };
-                let (v, vt) = self.coerce(v, vt, init)?;
-                let var = self.new_var(vt);
+                    vt = want;
+                }
+                let var = self.new_var(&vt);
                 self.b.def_var(var, v);
                 self.bind(&name.name, var, vt);
                 Ok(StmtOut::Value(None))
@@ -473,6 +552,11 @@ impl FnCx<'_, '_> {
                     val = self.b.ins().fcvt_from_sint(types::F64, val);
                 }
                 let final_v = if *op == AssignOp::Assign {
+                    // Release the previous boxed value in the slot.
+                    if vt.boxed() {
+                        let old = self.b.use_var(var);
+                        self.call_rt("grasm_val_dec", &[old]);
+                    }
                     val
                 } else {
                     let old = self.b.use_var(var);
@@ -483,14 +567,27 @@ impl FnCx<'_, '_> {
                         AssignOp::Div => BinaryOp::Div,
                         AssignOp::Assign => unreachable!(),
                     };
-                    self.binop_values(bop, old, vt, val, vt, target.span())?.0
+                    // For str += : concat then release old.
+                    let (nv, _) =
+                        self.binop_values(bop, old, vt.clone(), val, val_t, target.span())?;
+                    if vt.boxed() {
+                        // binop released operands (incl. old use) appropriately.
+                    }
+                    nv
                 };
                 self.b.def_var(var, final_v);
                 Ok(StmtOut::Value(None))
             }
             Stmt::Expr(e) => {
                 let v = self.eval_expr(e)?;
-                Ok(StmtOut::Value(if is_last { v } else { None }))
+                if is_last {
+                    Ok(StmtOut::Value(v))
+                } else {
+                    if let Some((val, vt)) = v {
+                        self.dec_if_boxed(val, &vt);
+                    }
+                    Ok(StmtOut::Value(None))
+                }
             }
             Stmt::Return(v, _) => {
                 match v {
@@ -499,9 +596,14 @@ impl FnCx<'_, '_> {
                         if self.ret == VType::F64 && vt == VType::I64 {
                             val = self.b.ins().fcvt_from_sint(types::F64, val);
                         }
+                        // Returned value stays owned; release the rest.
+                        // (Locals holding the same box are fine: their dec is
+                        // balanced by the +1 the Ident eval added.)
+                        self.emit_scope_decs_all();
                         self.b.ins().return_(&[val]);
                     }
                     None => {
+                        self.emit_scope_decs_all();
                         self.b.ins().return_(&[]);
                     }
                 }
@@ -546,63 +648,160 @@ impl FnCx<'_, '_> {
                 var: loop_var,
                 iter,
                 body,
-                ..
-            } => {
-                let Expr::Range {
-                    start,
-                    end,
-                    inclusive,
-                    ..
-                } = iter
-                else {
-                    return nope(iter.span(), "for over non-range iterables");
-                };
-                let (s, st) = self.eval_expr_val(start)?;
-                let (e, et) = self.eval_expr_val(end)?;
-                if st != VType::I64 || et != VType::I64 {
-                    return nope(iter.span(), "non-integer ranges");
-                }
-                let ivar = self.new_var(VType::I64);
-                self.b.def_var(ivar, s);
-                let end_var = self.new_var(VType::I64);
-                self.b.def_var(end_var, e);
-
-                let header = self.b.create_block();
-                let body_blk = self.b.create_block();
-                let step = self.b.create_block();
-                let exit = self.b.create_block();
-                self.b.ins().jump(header, &[]);
-                self.b.switch_to_block(header);
-                let iv = self.b.use_var(ivar);
-                let ev = self.b.use_var(end_var);
-                let cc = if *inclusive {
-                    IntCC::SignedLessThanOrEqual
-                } else {
-                    IntCC::SignedLessThan
-                };
-                let c = self.b.ins().icmp(cc, iv, ev);
-                self.b.ins().brif(c, body_blk, &[], exit, &[]);
-
-                self.b.switch_to_block(body_blk);
-                self.push_scope();
-                self.bind(&loop_var.name, ivar, VType::I64);
-                self.loops.push((step, exit));
-                let (_, terminated) = self.eval_block_inner(body)?;
-                self.loops.pop();
-                self.pop_scope();
-                if !terminated {
-                    self.b.ins().jump(step, &[]);
-                }
-                self.b.switch_to_block(step);
-                let iv2 = self.b.use_var(ivar);
-                let one = self.b.ins().iconst(types::I64, 1);
-                let next = self.b.ins().iadd(iv2, one);
-                self.b.def_var(ivar, next);
-                self.b.ins().jump(header, &[]);
-                self.b.switch_to_block(exit);
-                Ok(StmtOut::Value(None))
-            }
+                span,
+            } => self.eval_for(loop_var, iter, body, *span),
             Stmt::With { span, .. } => nope(*span, "effect handlers"),
+        }
+    }
+
+    fn eval_for(
+        &mut self,
+        loop_var: &Ident,
+        iter: &Expr,
+        body: &grasm_syntax::ast::Block,
+        _span: Span,
+    ) -> CResult<StmtOut> {
+        // Range iteration.
+        if let Expr::Range {
+            start,
+            end,
+            inclusive,
+            ..
+        } = iter
+        {
+            let (s, st) = self.eval_expr_val(start)?;
+            let (e, et) = self.eval_expr_val(end)?;
+            if st != VType::I64 || et != VType::I64 {
+                return nope(iter.span(), "non-integer ranges");
+            }
+            let ivar = self.new_var(&VType::I64);
+            self.b.def_var(ivar, s);
+            let end_var = self.new_var(&VType::I64);
+            self.b.def_var(end_var, e);
+
+            let header = self.b.create_block();
+            let body_blk = self.b.create_block();
+            let step = self.b.create_block();
+            let exit = self.b.create_block();
+            self.b.ins().jump(header, &[]);
+            self.b.switch_to_block(header);
+            let iv = self.b.use_var(ivar);
+            let ev = self.b.use_var(end_var);
+            let cc = if *inclusive {
+                IntCC::SignedLessThanOrEqual
+            } else {
+                IntCC::SignedLessThan
+            };
+            let c = self.b.ins().icmp(cc, iv, ev);
+            self.b.ins().brif(c, body_blk, &[], exit, &[]);
+
+            self.b.switch_to_block(body_blk);
+            self.push_scope();
+            self.bind(&loop_var.name, ivar, VType::I64);
+            self.loops.push((step, exit));
+            let (_, terminated) = self.eval_block_inner(body)?;
+            self.loops.pop();
+            self.pop_scope_no_decs(); // loop var is scalar
+            if !terminated {
+                self.b.ins().jump(step, &[]);
+            }
+            self.b.switch_to_block(step);
+            let iv2 = self.b.use_var(ivar);
+            let one = self.b.ins().iconst(types::I64, 1);
+            let next = self.b.ins().iadd(iv2, one);
+            self.b.def_var(ivar, next);
+            self.b.ins().jump(header, &[]);
+            self.b.switch_to_block(exit);
+            return Ok(StmtOut::Value(None));
+        }
+
+        // List iteration: index-based over an owned temp.
+        let (list_v, list_t) = self.eval_expr_val(iter)?;
+        let VType::List(elem_t) = list_t.clone() else {
+            return nope(iter.span(), "for over non-range, non-list iterables");
+        };
+        let list_var = self.new_var(&list_t);
+        self.b.def_var(list_var, list_v);
+        let ivar = self.new_var(&VType::I64);
+        let zero = self.b.ins().iconst(types::I64, 0);
+        self.b.def_var(ivar, zero);
+
+        let header = self.b.create_block();
+        let body_blk = self.b.create_block();
+        let step = self.b.create_block();
+        let exit = self.b.create_block();
+        self.b.ins().jump(header, &[]);
+        self.b.switch_to_block(header);
+        let lv = self.b.use_var(list_var);
+        let len = self.call_rt("grasm_list_len", &[lv]).unwrap();
+        let iv = self.b.use_var(ivar);
+        let c = self.b.ins().icmp(IntCC::SignedLessThan, iv, len);
+        self.b.ins().brif(c, body_blk, &[], exit, &[]);
+
+        self.b.switch_to_block(body_blk);
+        let lv2 = self.b.use_var(list_var);
+        let iv2 = self.b.use_var(ivar);
+        let boxed_elem = self.call_rt("grasm_list_get", &[lv2, iv2]).unwrap();
+        let (elem_val, elem_vt) = self.unbox(boxed_elem, &elem_t)?;
+        let evar = self.new_var(&elem_vt);
+        self.b.def_var(evar, elem_val);
+        self.push_scope();
+        self.bind(&loop_var.name, evar, elem_vt.clone());
+        self.loops.push((step, exit));
+        let (_, terminated) = self.eval_block_inner(body)?;
+        self.loops.pop();
+        if terminated {
+            self.pop_scope_no_decs();
+        } else {
+            self.pop_scope_with_decs();
+        }
+        if !terminated {
+            self.b.ins().jump(step, &[]);
+        }
+        self.b.switch_to_block(step);
+        let iv3 = self.b.use_var(ivar);
+        let one = self.b.ins().iconst(types::I64, 1);
+        let next = self.b.ins().iadd(iv3, one);
+        self.b.def_var(ivar, next);
+        self.b.ins().jump(header, &[]);
+        self.b.switch_to_block(exit);
+        // Release the list temp.
+        let lv3 = self.b.use_var(list_var);
+        self.call_rt("grasm_val_dec", &[lv3]);
+        Ok(StmtOut::Value(None))
+    }
+
+    /// Unbox a list element into its unboxed form (scalars) or pass through
+    /// (boxed types keep the +1 from list_get).
+    fn unbox(&mut self, boxed: Value, want: &VType) -> CResult<(Value, VType)> {
+        match want {
+            VType::I64 => {
+                let v = self.call_rt("grasm_unbox_i64", &[boxed]).unwrap();
+                self.call_rt("grasm_val_dec", &[boxed]);
+                Ok((v, VType::I64))
+            }
+            VType::F64 => {
+                let v = self.call_rt("grasm_unbox_f64", &[boxed]).unwrap();
+                self.call_rt("grasm_val_dec", &[boxed]);
+                Ok((v, VType::F64))
+            }
+            VType::Bool => {
+                let v = self.call_rt("grasm_unbox_bool", &[boxed]).unwrap();
+                self.call_rt("grasm_val_dec", &[boxed]);
+                Ok((v, VType::Bool))
+            }
+            VType::Str | VType::List(_) => Ok((boxed, want.clone())),
+            VType::Unit => nope(Span::new(0, 1), "unit list elements"),
+        }
+    }
+
+    fn box_value(&mut self, v: Value, vt: &VType) -> Value {
+        match vt {
+            VType::I64 => self.call_rt("grasm_box_i64", &[v]).unwrap(),
+            VType::F64 => self.call_rt("grasm_box_f64", &[v]).unwrap(),
+            VType::Bool => self.call_rt("grasm_box_bool", &[v]).unwrap(),
+            // Already boxed: ownership transfers into the container.
+            _ => v,
         }
     }
 
@@ -617,12 +816,6 @@ impl FnCx<'_, '_> {
         }
     }
 
-    fn coerce(&mut self, v: Value, want: VType, from: &Expr) -> CResult<(Value, VType)> {
-        // Int-literal-shaped values adapt to f64 (checker validated).
-        let _ = from;
-        Ok((v, want))
-    }
-
     fn eval_expr(&mut self, e: &Expr) -> CResult<Option<(Value, VType)>> {
         match e {
             Expr::Int(v, _) => Ok(Some((self.b.ins().iconst(types::I64, *v), VType::I64))),
@@ -632,12 +825,51 @@ impl FnCx<'_, '_> {
                 VType::Bool,
             ))),
             Expr::Ident(id) => match self.lookup(&id.name) {
-                Some((var, vt)) => Ok(Some((self.b.use_var(var), vt))),
+                Some((var, vt)) => {
+                    let v = self.b.use_var(var);
+                    if vt.boxed() {
+                        self.call_rt("grasm_val_inc", &[v]);
+                    }
+                    Ok(Some((v, vt)))
+                }
                 None => nope(id.span, format!("the name `{}` here", id.name)),
             },
+            Expr::Str(pieces, _) => Ok(Some(self.build_string(pieces)?)),
+            Expr::List(items, span) => {
+                let elem_t = self.list_elem_type(items, *span)?;
+                let mut list = self.call_rt("grasm_list_new", &[]).unwrap();
+                for item in items {
+                    let (v, vt) = self.eval_expr_val(item)?;
+                    let mut bv = self.box_value(v, &vt);
+                    // Int-literal → f64 adaptation inside float lists.
+                    if elem_t == VType::F64 && vt == VType::I64 {
+                        let f = self.b.ins().fcvt_from_sint(types::F64, v);
+                        bv = self.call_rt("grasm_box_f64", &[f]).unwrap();
+                    }
+                    list = self.call_rt("grasm_list_push", &[list, bv]).unwrap();
+                }
+                Ok(Some((list, VType::List(Box::new(elem_t)))))
+            }
+            Expr::Index { recv, index, span } => {
+                let (rv, rt) = self.eval_expr_val(recv)?;
+                let VType::List(elem_t) = rt else {
+                    return nope(*span, "indexing non-lists");
+                };
+                let (iv, it) = self.eval_expr_val(index)?;
+                if it != VType::I64 {
+                    return nope(index.span(), "non-integer index");
+                }
+                let boxed = self.call_rt("grasm_list_get", &[rv, iv]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                let (v, vt) = self.unbox(boxed, &elem_t)?;
+                Ok(Some((v, vt)))
+            }
+            Expr::MethodCall {
+                recv, name, args, span,
+            } => self.eval_method(recv, name, args, *span),
             Expr::Unary { op, expr, span } => {
                 let (v, vt) = self.eval_expr_val(expr)?;
-                match (op, vt) {
+                match (op, &vt) {
                     (UnaryOp::Neg, VType::I64) => Ok(Some((self.b.ins().ineg(v), VType::I64))),
                     (UnaryOp::Neg, VType::F64) => Ok(Some((self.b.ins().fneg(v), VType::F64))),
                     (UnaryOp::Not, VType::Bool) => {
@@ -648,7 +880,6 @@ impl FnCx<'_, '_> {
                 }
             }
             Expr::Binary { op, lhs, rhs, span } => {
-                // Short-circuit and/or.
                 if matches!(op, BinaryOp::And | BinaryOp::Or) {
                     return self.short_circuit(*op, lhs, rhs);
                 }
@@ -666,33 +897,134 @@ impl FnCx<'_, '_> {
             Expr::Block(b) => {
                 let (last, terminated) = self.eval_block_inner(b)?;
                 if terminated {
-                    // Value never used past a terminator.
                     Ok(None)
                 } else {
                     Ok(last)
                 }
             }
-            Expr::Str(pieces, span) => {
-                // Only valid directly under print(); reaching here = unsupported.
-                let _ = pieces;
-                nope(*span, "string values (beyond print)")
-            }
             other => nope(
                 other.span(),
                 match other {
-                    Expr::List(..) => "lists",
                     Expr::Tuple(..) => "tuples",
                     Expr::StructLit { .. } => "structs",
-                    Expr::MethodCall { .. } => "method calls",
                     Expr::Field { .. } => "field access",
-                    Expr::Index { .. } => "indexing",
                     Expr::Match { .. } => "match",
-                    Expr::Range { .. } => "range values",
+                    Expr::Range { .. } => "range values outside for",
                     Expr::Try { .. } => "try",
                     Expr::Closure { .. } => "closures",
                     _ => "this construct",
                 },
             ),
+        }
+    }
+
+    fn list_elem_type(&mut self, items: &[Expr], span: Span) -> CResult<VType> {
+        // Peek the first element's static shape; empty lists need context we
+        // don't track yet.
+        let Some(first) = items.first() else {
+            return nope(span, "empty list literals (annotate via a function param for now)");
+        };
+        // Cheap structural probe: literals and idents cover the N2 tests.
+        Ok(match first {
+            Expr::Int(..) => VType::I64,
+            Expr::Float(..) => VType::F64,
+            Expr::Bool(..) => VType::Bool,
+            Expr::Str(..) => VType::Str,
+            Expr::Ident(id) => match self.lookup(&id.name) {
+                Some((_, vt)) => vt,
+                None => return nope(span, "this list literal's element type"),
+            },
+            _ => return nope(span, "complex list literal elements (bind them to a variable first)"),
+        })
+    }
+
+    /// Interpolated string as a value: fold pieces with concat.
+    fn build_string(&mut self, pieces: &[StrPiece]) -> CResult<(Value, VType)> {
+        let mut acc: Option<Value> = None;
+        for piece in pieces {
+            let part: Value = match piece {
+                StrPiece::Text(t) => {
+                    let (p, l) = self.str_ptr_len(t);
+                    self.call_rt("grasm_str_lit", &[p, l]).unwrap()
+                }
+                StrPiece::Expr(inner) => {
+                    let (v, vt) = self.eval_expr_val(inner)?;
+                    match vt {
+                        VType::I64 => self.call_rt("grasm_str_from_i64", &[v]).unwrap(),
+                        VType::F64 => self.call_rt("grasm_str_from_f64", &[v]).unwrap(),
+                        VType::Bool => self.call_rt("grasm_str_from_bool", &[v]).unwrap(),
+                        VType::Str => v,
+                        VType::List(_) => {
+                            // Stringify via display: reuse out path? Build str
+                            // from list display not exposed; N2: unsupported.
+                            return nope(inner.span(), "interpolating lists");
+                        }
+                        VType::Unit => return nope(inner.span(), "interpolating unit"),
+                    }
+                }
+            };
+            acc = Some(match acc {
+                None => part,
+                Some(prev) => {
+                    let joined = self.call_rt("grasm_str_concat", &[prev, part]).unwrap();
+                    self.call_rt("grasm_val_dec", &[prev]);
+                    self.call_rt("grasm_val_dec", &[part]);
+                    joined
+                }
+            });
+        }
+        let v = match acc {
+            Some(v) => v,
+            None => {
+                let (p, l) = self.str_ptr_len("");
+                self.call_rt("grasm_str_lit", &[p, l]).unwrap()
+            }
+        };
+        Ok((v, VType::Str))
+    }
+
+    fn eval_method(
+        &mut self,
+        recv: &Expr,
+        name: &Ident,
+        args: &[Expr],
+        span: Span,
+    ) -> CResult<Option<(Value, VType)>> {
+        // Mutating list push on a variable.
+        if name.name == "push" {
+            let Expr::Ident(id) = recv else {
+                return nope(span, "push on non-variable receivers");
+            };
+            let Some((var, vt)) = self.lookup(&id.name) else {
+                return nope(id.span, "push on unknown variable");
+            };
+            let VType::List(elem_t) = vt else {
+                return nope(span, "push on non-lists");
+            };
+            let (av, avt) = self.eval_expr_val(&args[0])?;
+            let mut boxed = self.box_value(av, &avt);
+            if *elem_t == VType::F64 && avt == VType::I64 {
+                let f = self.b.ins().fcvt_from_sint(types::F64, av);
+                boxed = self.call_rt("grasm_box_f64", &[f]).unwrap();
+            }
+            let cur = self.b.use_var(var);
+            let newp = self.call_rt("grasm_list_push", &[cur, boxed]).unwrap();
+            self.b.def_var(var, newp);
+            return Ok(None);
+        }
+        let (rv, rt) = self.eval_expr_val(recv)?;
+        match (&rt, name.name.as_str()) {
+            (VType::Str, "len") => {
+                let v = self.call_rt("grasm_str_len", &[rv]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                Ok(Some((v, VType::I64)))
+            }
+            (VType::List(_), "len") => {
+                let v = self.call_rt("grasm_list_len", &[rv]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                Ok(Some((v, VType::I64)))
+            }
+            _ => nope(span, format!("the method `{}`", name.name)),
         }
     }
 
@@ -738,7 +1070,6 @@ impl FnCx<'_, '_> {
         mut rt: VType,
         span: Span,
     ) -> CResult<(Value, VType)> {
-        // Numeric promotion (checker allows int literals in float positions).
         if lt == VType::I64 && rt == VType::F64 {
             lv = self.b.ins().fcvt_from_sint(types::F64, lv);
             lt = VType::F64;
@@ -751,7 +1082,45 @@ impl FnCx<'_, '_> {
             return nope(span, "mixed-type operation");
         }
         use BinaryOp::*;
-        let out = match (lt, op) {
+        // Strings.
+        if lt == VType::Str {
+            let out = match op {
+                Add => {
+                    let v = self.call_rt("grasm_str_concat", &[lv, rv]).unwrap();
+                    (v, VType::Str)
+                }
+                Eq | NotEq => {
+                    let e = self.call_rt("grasm_str_eq", &[lv, rv]).unwrap();
+                    let v = if op == NotEq {
+                        let one = self.b.ins().iconst(types::I8, 1);
+                        self.b.ins().bxor(e, one)
+                    } else {
+                        e
+                    };
+                    (v, VType::Bool)
+                }
+                Lt | LtEq | Gt | GtEq => {
+                    let c = self.call_rt("grasm_str_cmp", &[lv, rv]).unwrap();
+                    let zero = self.b.ins().iconst(types::I64, 0);
+                    let cc = match op {
+                        Lt => IntCC::SignedLessThan,
+                        LtEq => IntCC::SignedLessThanOrEqual,
+                        Gt => IntCC::SignedGreaterThan,
+                        GtEq => IntCC::SignedGreaterThanOrEqual,
+                        _ => unreachable!(),
+                    };
+                    (self.b.ins().icmp(cc, c, zero), VType::Bool)
+                }
+                _ => return nope(span, "this operator on strings"),
+            };
+            self.call_rt("grasm_val_dec", &[lv]);
+            self.call_rt("grasm_val_dec", &[rv]);
+            return Ok(out);
+        }
+        if lt.boxed() {
+            return nope(span, "operators on lists");
+        }
+        let out = match (&lt, op) {
             (VType::I64, Add) => (self.b.ins().iadd(lv, rv), VType::I64),
             (VType::I64, Sub) => (self.b.ins().isub(lv, rv), VType::I64),
             (VType::I64, Mul) => (self.b.ins().imul(lv, rv), VType::I64),
@@ -763,18 +1132,18 @@ impl FnCx<'_, '_> {
                 self.guard_zero(rv, "grasm_panic_rem_zero");
                 (self.b.ins().srem(lv, rv), VType::I64)
             }
-            (VType::I64, Pow) => {
-                let v = self.call_rt("grasm_pow_i64", &[lv, rv]).unwrap();
-                (v, VType::I64)
-            }
+            (VType::I64, Pow) => (
+                self.call_rt("grasm_pow_i64", &[lv, rv]).unwrap(),
+                VType::I64,
+            ),
             (VType::F64, Add) => (self.b.ins().fadd(lv, rv), VType::F64),
             (VType::F64, Sub) => (self.b.ins().fsub(lv, rv), VType::F64),
             (VType::F64, Mul) => (self.b.ins().fmul(lv, rv), VType::F64),
             (VType::F64, Div) => (self.b.ins().fdiv(lv, rv), VType::F64),
-            (VType::F64, Pow) => {
-                let v = self.call_rt("grasm_pow_f64", &[lv, rv]).unwrap();
-                (v, VType::F64)
-            }
+            (VType::F64, Pow) => (
+                self.call_rt("grasm_pow_f64", &[lv, rv]).unwrap(),
+                VType::F64,
+            ),
             (VType::I64, Eq) => (self.b.ins().icmp(IntCC::Equal, lv, rv), VType::Bool),
             (VType::I64, NotEq) => (self.b.ins().icmp(IntCC::NotEqual, lv, rv), VType::Bool),
             (VType::I64, Lt) => (
@@ -818,16 +1187,14 @@ impl FnCx<'_, '_> {
         self.b.ins().brif(divisor, ok_blk, &[], bad_blk, &[]);
         self.b.switch_to_block(bad_blk);
         self.call_rt(panic_fn, &[]);
-        self.b
-            .ins()
-            .trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
+        self.trap_here();
         self.b.switch_to_block(ok_blk);
     }
 
     fn eval_if(
         &mut self,
         cond: &Expr,
-        then_block: &Block2,
+        then_block: &grasm_syntax::ast::Block,
         else_branch: Option<&ElseBranch>,
         span: Span,
     ) -> CResult<Option<(Value, VType)>> {
@@ -840,34 +1207,38 @@ impl FnCx<'_, '_> {
         let merge = self.b.create_block();
         self.b.ins().brif(c, then_blk, &[], else_blk, &[]);
 
-        // Then branch.
         self.b.switch_to_block(then_blk);
         let (then_val, then_term) = self.eval_block_inner(then_block)?;
 
-        // We only know whether this is a value-if after seeing both branches;
-        // handle the common cases: both yield same-type scalars → merge param.
         let mut merge_ty: Option<VType> = None;
         if let (Some((_, vt)), Some(_)) = (&then_val, &else_branch) {
             if *vt != VType::Unit {
-                merge_ty = Some(*vt);
+                merge_ty = Some(vt.clone());
             }
         }
-        if let Some(vt) = merge_ty {
+        if let Some(vt) = &merge_ty {
             self.b.append_block_param(merge, vt.cl());
         }
         if !then_term {
-            match (merge_ty, &then_val) {
+            match (&merge_ty, &then_val) {
                 (Some(_), Some((v, _))) => {
                     let v = *v;
                     self.b.ins().jump(merge, &[v]);
                 }
                 _ => {
+                    // Unused boxed then-value must be released.
+                    if let Some((v, vt)) = &then_val {
+                        if vt.boxed() && merge_ty.is_none() {
+                            let v = *v;
+                            let vt = vt.clone();
+                            self.dec_if_boxed(v, &vt);
+                        }
+                    }
                     self.b.ins().jump(merge, &[]);
                 }
             }
         }
 
-        // Else branch.
         self.b.switch_to_block(else_blk);
         let mut else_term = false;
         let mut else_val: Option<(Value, VType)> = None;
@@ -883,18 +1254,25 @@ impl FnCx<'_, '_> {
             None => {}
         }
         if !else_term {
-            match (merge_ty, &else_val) {
+            match (&merge_ty, &else_val) {
                 (Some(want), Some((v, vt))) => {
                     let mut v = *v;
-                    if want == VType::F64 && *vt == VType::I64 {
+                    if *want == VType::F64 && *vt == VType::I64 {
                         v = self.b.ins().fcvt_from_sint(types::F64, v);
                     }
                     self.b.ins().jump(merge, &[v]);
                 }
                 (Some(_), None) => {
-                    return nope(span, "if-expression with a valueless else branch");
+                    return nope(span, "if-expressions with a valueless else branch");
                 }
                 _ => {
+                    if let Some((v, vt)) = &else_val {
+                        if vt.boxed() {
+                            let v = *v;
+                            let vt = vt.clone();
+                            self.dec_if_boxed(v, &vt);
+                        }
+                    }
                     self.b.ins().jump(merge, &[]);
                 }
             }
@@ -931,30 +1309,14 @@ impl FnCx<'_, '_> {
                 if ct != VType::Bool {
                     return nope(args[0].span(), "non-bool assert");
                 }
-                let ok_blk = self.b.create_block();
-                let bad_blk = self.b.create_block();
-                self.b.ins().brif(c, ok_blk, &[], bad_blk, &[]);
-                self.b.switch_to_block(bad_blk);
-                self.call_rt("grasm_panic_assert", &[]);
-                self.b
-                    .ins()
-                    .trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
-                self.b.switch_to_block(ok_blk);
+                self.assert_true(c);
                 return Ok(None);
             }
             "assert_eq" => {
                 let (a, at) = self.eval_expr_val(&args[0])?;
                 let (bv, bt) = self.eval_expr_val(&args[1])?;
                 let (eq, _) = self.binop_values(BinaryOp::Eq, a, at, bv, bt, span)?;
-                let ok_blk = self.b.create_block();
-                let bad_blk = self.b.create_block();
-                self.b.ins().brif(eq, ok_blk, &[], bad_blk, &[]);
-                self.b.switch_to_block(bad_blk);
-                self.call_rt("grasm_panic_assert", &[]);
-                self.b
-                    .ins()
-                    .trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
-                self.b.switch_to_block(ok_blk);
+                self.assert_true(eq);
                 return Ok(None);
             }
             "panic" => {
@@ -962,10 +1324,7 @@ impl FnCx<'_, '_> {
                     if let [StrPiece::Text(t)] = pieces.as_slice() {
                         let (p, l) = self.str_ptr_len(t);
                         self.call_rt("grasm_panic_msg", &[p, l]);
-                        self.b
-                            .ins()
-                            .trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
-                        // Continue in a fresh dead block so later code has a home.
+                        self.trap_here();
                         let dead = self.b.create_block();
                         self.b.switch_to_block(dead);
                         return Ok(None);
@@ -978,13 +1337,14 @@ impl FnCx<'_, '_> {
         let Some(sig) = self.cg.fns.get(&id.name) else {
             return nope(id.span, format!("the function `{}` here", id.name));
         };
-        let (fid, params, ret) = (sig.id, sig.params.clone(), sig.ret);
+        let (fid, params, ret) = (sig.id, sig.params.clone(), sig.ret.clone());
         let mut vals = Vec::with_capacity(args.len());
         for (a, want) in args.iter().zip(&params) {
             let (mut v, vt) = self.eval_expr_val(a)?;
             if *want == VType::F64 && vt == VType::I64 {
                 v = self.b.ins().fcvt_from_sint(types::F64, v);
             }
+            // Boxed args transfer ownership to the callee (it decs at exit).
             vals.push(v);
         }
         let fref = self.cg.module.declare_func_in_func(fid, self.b.func);
@@ -995,6 +1355,16 @@ impl FnCx<'_, '_> {
         } else {
             Ok(Some((results[0], ret)))
         }
+    }
+
+    fn assert_true(&mut self, c: Value) {
+        let ok_blk = self.b.create_block();
+        let bad_blk = self.b.create_block();
+        self.b.ins().brif(c, ok_blk, &[], bad_blk, &[]);
+        self.b.switch_to_block(bad_blk);
+        self.call_rt("grasm_panic_assert", &[]);
+        self.trap_here();
+        self.b.switch_to_block(ok_blk);
     }
 
     fn lower_print(&mut self, arg: &Expr) -> CResult<()> {
@@ -1020,9 +1390,11 @@ impl FnCx<'_, '_> {
                                 VType::Bool => {
                                     self.call_rt("grasm_out_bool", &[v]);
                                 }
-                                VType::Unit => {
-                                    return nope(inner.span(), "printing unit")
+                                VType::Str | VType::List(_) => {
+                                    self.call_rt("grasm_out_val", &[v]);
+                                    self.call_rt("grasm_val_dec", &[v]);
                                 }
+                                VType::Unit => return nope(inner.span(), "printing unit"),
                             }
                         }
                     }
@@ -1040,6 +1412,10 @@ impl FnCx<'_, '_> {
                     VType::Bool => {
                         self.call_rt("grasm_out_bool", &[v]);
                     }
+                    VType::Str | VType::List(_) => {
+                        self.call_rt("grasm_out_val", &[v]);
+                        self.call_rt("grasm_val_dec", &[v]);
+                    }
                     VType::Unit => return nope(other.span(), "printing unit"),
                 }
             }
@@ -1048,11 +1424,3 @@ impl FnCx<'_, '_> {
         Ok(())
     }
 }
-
-enum StmtOut {
-    Value(Option<(Value, VType)>),
-    Terminated,
-}
-
-/// The AST block type (renamed to avoid clashing with Cranelift's `Block`).
-use grasm_syntax::ast::Block as Block2;
