@@ -90,6 +90,20 @@ fn main() -> ExitCode {
                 Ok(p) => p,
                 Err(code) => return code,
             };
+            if args.iter().any(|a| a == "--native") {
+                return match build_native(&program, &out_path) {
+                    Ok(size) => {
+                        println!(
+                            "built `{out_path}` natively ({size} bytes, Cranelift)",
+                        );
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        ExitCode::FAILURE
+                    }
+                };
+            }
             match write_bundle(&program, &out_path) {
                 Ok(size) => {
                     println!("built `{out_path}` ({size} bytes, {} module(s))", program.files.len());
@@ -175,7 +189,7 @@ fn main() -> ExitCode {
             eprintln!("  run <file.gr> [-- args...]   check + execute main (follows imports)");
             eprintln!("  test <file.gr>               run test blocks");
             eprintln!("  check <file.gr>              parse + typecheck");
-            eprintln!("  build <file.gr> [-o out]     self-contained executable");
+            eprintln!("  build <file.gr> [-o out]     self-contained executable (--native: Cranelift AOT)");
             eprintln!("  fmt <file.gr> [--check]      canonical formatting");
             eprintln!("  tokens <file.gr>             dump lexer output (debug)");
             eprintln!("  version                      print version");
@@ -326,4 +340,38 @@ fn run_bundle(bundle: &Bundle, program_args: &[String]) -> ExitCode {
     let code = grasm_interp::run_program(&program, program_args, &mut stdout);
     let _ = stdout.flush();
     ExitCode::from(code.clamp(0, 255) as u8)
+}
+
+// ---------------------------------------------------------------------------
+// Native builds (`grasm build --native`)
+// ---------------------------------------------------------------------------
+
+fn build_native(program: &Program, out_path: &str) -> Result<u64, String> {
+    let scratch = std::env::temp_dir().join(format!("grasm_native_{}", std::process::id()));
+    std::fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
+    let obj = scratch.join("out.o");
+    grasm_native::compile_object(program, &obj)?;
+
+    // libgrasm_rt.a sits next to the grasm binary (cargo target dir).
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe_dir = exe.parent().ok_or("no exe dir")?;
+    let rt = exe_dir.join("libgrasm_rt.a");
+    if !rt.exists() {
+        return Err(format!(
+            "runtime library not found at `{}` — build it with `cargo build -p grasm_rt`",
+            rt.display()
+        ));
+    }
+    let status = std::process::Command::new("cc")
+        .arg(&obj)
+        .arg(&rt)
+        .arg("-o")
+        .arg(out_path)
+        .status()
+        .map_err(|e| format!("failed to run `cc`: {e}"))?;
+    if !status.success() {
+        return Err("linking failed".into());
+    }
+    let size = std::fs::metadata(out_path).map_err(|e| e.to_string())?.len();
+    Ok(size)
 }
