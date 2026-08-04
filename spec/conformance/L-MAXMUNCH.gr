@@ -1,0 +1,10 @@
+//! tag: L-MAXMUNCH
+//! expect: output
+//! true
+fn f() -> i64 {
+    1
+}
+fn main() {
+    // `->` is one token; `<=` is one token.
+    print("{f() <= 1}")
+}

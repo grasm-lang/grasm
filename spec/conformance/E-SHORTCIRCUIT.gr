@@ -1,0 +1,15 @@
+//! tag: E-SHORTCIRCUIT
+//! expect: output
+//! false
+//! true
+fn boom(inout hit: bool) -> bool {
+    hit = true
+    true
+}
+fn main() {
+    var hit = false
+    let r = false and boom(hit)
+    print("{hit}")
+    let r2 = true or boom(hit)
+    print("{r2}")
+}

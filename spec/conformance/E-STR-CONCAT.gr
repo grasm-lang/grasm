@@ -1,0 +1,6 @@
+//! tag: E-STR-CONCAT
+//! expect: output
+//! hello, world
+fn main() {
+    print("hello, " + "world")
+}

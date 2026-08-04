@@ -1,0 +1,10 @@
+//! tag: T-PARAM-OWN
+//! expect: output
+//! 3
+fn consume(own s: str) -> i64 {
+    s.len()
+}
+fn main() {
+    let name = "ada"
+    print("{consume(name)}")
+}

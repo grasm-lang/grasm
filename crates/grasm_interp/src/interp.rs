@@ -163,6 +163,12 @@ impl<'a, W: Write> Interp<'a, W> {
             return 1;
         };
         match self.call_decl(main, "main", vec![]) {
+            // A fallible `main` returns Err as a *value*; report it rather
+            // than exiting 0 as if nothing happened.
+            Ok(Value::Err(e)) => {
+                let _ = writeln!(self.out, "error: unhandled error from main: {e}");
+                1
+            }
             Ok(_) => 0,
             Err(Flow::Err(e)) => {
                 let _ = writeln!(self.out, "error: unhandled error from main: {e}");
@@ -324,8 +330,17 @@ impl<'a, W: Write> Interp<'a, W> {
 
     fn eval_stmt(&mut self, s: &Stmt) -> EResult {
         match s {
-            Stmt::Let { name, init, .. } => {
-                let v = self.eval_expr(init)?;
+            Stmt::Let {
+                name, ty, init, ..
+            } => {
+                let mut v = self.eval_expr(init)?;
+                // An annotation of `f64` makes an integer literal a float, so
+                // the value matches the type the checker assigned it.
+                if let (Some(t), Value::Int(i)) = (ty, &v) {
+                    if is_float_type(t) {
+                        v = Value::Float(*i as f64);
+                    }
+                }
                 self.scopes
                     .last_mut()
                     .unwrap()
@@ -1593,6 +1608,16 @@ impl<'a, W: Write> Interp<'a, W> {
             },
         }
     }
+}
+
+/// True for the surface types that mean `f64`.
+fn is_float_type(t: &TypeExpr) -> bool {
+    matches!(t, TypeExpr::Name { path, args, .. }
+        if args.is_empty()
+            && matches!(
+                path.segments.last().map(|s| s.name.as_str()),
+                Some("f64") | Some("f32") | Some("float")
+            ))
 }
 
 fn io_error(variant: &str, payload: impl Into<String>) -> Value {

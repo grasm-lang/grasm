@@ -1,0 +1,7 @@
+//! tag: L-KEYWORD
+//! expect: error
+//! expected an identifier
+fn main() {
+    // `type` is reserved and cannot name a variable.
+    let type = 1
+}

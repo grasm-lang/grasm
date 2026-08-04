@@ -1,0 +1,11 @@
+//! tag: T-INFER-LOCAL
+//! expect: output
+//! 3 2.5 hi true
+fn main() {
+    // No annotations: each type comes from the initializer.
+    let i = 3
+    let f = 2.5
+    let s = "hi"
+    let b = i > 1
+    print("{i} {f} {s} {b}")
+}

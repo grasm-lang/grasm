@@ -1,0 +1,12 @@
+//! tag: G-PIPE
+//! expect: output
+//! 12
+fn double_all(xs: [i64]) -> [i64] {
+    xs.map(|x| x * 2)
+}
+fn total(xs: [i64]) -> i64 {
+    xs.sum()
+}
+fn main() {
+    print("{[1, 2, 3] |> double_all |> total}")
+}

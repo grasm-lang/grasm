@@ -1,0 +1,7 @@
+//! tag: L-COMMENT-BLOCK
+//! expect: output
+//! 1
+fn main() {
+    /* outer /* nested */ still a comment */
+    print("1")
+}

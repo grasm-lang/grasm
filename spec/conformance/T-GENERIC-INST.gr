@@ -1,0 +1,10 @@
+//! tag: T-GENERIC-INST
+//! expect: output
+//! 2 2
+fn count[T](xs: [T]) -> i64 {
+    xs.len()
+}
+fn main() {
+    // One generic body, two instantiations.
+    print("{count([1, 2])} {count(["a", "b"])}")
+}

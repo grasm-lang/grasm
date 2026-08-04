@@ -1,0 +1,12 @@
+//! tag: G-DECL-ORDER
+//! expect: output
+//! 20
+// `main` calls a function declared after it, and uses a type declared later.
+fn main() {
+    let b = Box{ n: 10 }
+    print("{double(b)}")
+}
+fn double(b: Box) -> i64 {
+    b.n * 2
+}
+type Box = { n: i64 }

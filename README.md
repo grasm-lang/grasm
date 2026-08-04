@@ -135,6 +135,17 @@ variable names keeps compiling.
 - **Exhaustive matching** — sums, bools, Ok/Err, and bool-tuple products are
   coverage-checked with precise missing-case messages.
 
+## Specification
+
+[`spec/`](spec/) is the normative description of the language: lexical rules and
+grammar, the type system, and evaluation semantics. Every rule carries a stable
+tag such as **[E-ARITH-INT]**, and `cargo test -p grasm_spec` fails if a tagged
+rule has no conformance program, if a program names a rule that no longer
+exists, or if any program's behavior differs from what it declares. The
+specification therefore cannot drift from the implementation without a red test.
+
+Currently **65 normative clauses, 65 conformance programs**.
+
 ## Layout
 
 | Path | What |
@@ -149,6 +160,9 @@ variable names keeps compiling.
 | `projects/beginner` | validation: games, todo, text stats, unit converter |
 | `projects/intermediate` | validation: JSON parser, CSV pipeline, KV store, calculator |
 | `projects/advanced` | validation: router+middleware, scheduler, WAL mini-DB, **Mini-Grasm interpreter written in Grasm** |
+| `spec/` | normative specification + one conformance program per clause |
+| `editors/` | VS Code extension and LSP setup for other editors |
+| `scripts/` | `difftest.sh` (native vs interpreter), `crosstest.sh` (cross-target) |
 | `MASTERPLAN.md` | the full v0.3 strategic blueprint this implements Phase 0–1 of |
 
 ## Status

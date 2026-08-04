@@ -1,0 +1,9 @@
+//! tag: T-INOUT-PLACE
+//! expect: error
+//! must be a variable
+fn bump(inout n: i64) {
+    n += 1
+}
+fn main() {
+    bump(41)
+}

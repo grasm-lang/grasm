@@ -1,0 +1,10 @@
+//! tag: T-PRIM
+//! expect: output
+//! 42 2.5 true text
+fn main() {
+    let i: i64 = 42
+    let f: f64 = 2.5
+    let b: bool = true
+    let s: str = "text"
+    print("{i} {f} {b} {s}")
+}

@@ -1921,7 +1921,17 @@ impl Checker {
                 }
             }
             Add | Sub | Mul | Div | Rem | Pow => {
-                let lhs_ty = self.infer_expr(lhs);
+                let mut lhs_ty = self.infer_expr(lhs);
+                // An integer literal on the left adopts a float right-hand
+                // side, so `3 * f` and `f * 3` behave the same.
+                if matches!(lhs, Expr::Int(..))
+                    && self.uni.shallow_resolve(&lhs_ty) == Type::I64
+                {
+                    let probe = self.infer_expr(rhs);
+                    if self.uni.shallow_resolve(&probe) == Type::F64 {
+                        lhs_ty = Type::F64;
+                    }
+                }
                 self.check_expr(rhs, &lhs_ty);
                 let r = self.uni.shallow_resolve(&lhs_ty);
                 match r {

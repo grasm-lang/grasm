@@ -1,0 +1,21 @@
+//! tag: T-FALLIBLE
+//! expect: output
+//! ok 5
+//! err Bad
+type E = | Bad
+fn maybe(fail_it: bool) -> i64 ! E {
+    if fail_it {
+        fail(Bad)
+    }
+    5
+}
+fn main() {
+    match maybe(false) {
+        Ok(v) -> print("ok {v}")
+        Err(e) -> print("err {e}")
+    }
+    match maybe(true) {
+        Ok(v) -> print("ok {v}")
+        Err(e) -> print("err {e}")
+    }
+}

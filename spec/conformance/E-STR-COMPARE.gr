@@ -1,0 +1,6 @@
+//! tag: E-STR-COMPARE
+//! expect: output
+//! true false
+fn main() {
+    print("{"abc" < "abd"} {"b" < "a"}")
+}

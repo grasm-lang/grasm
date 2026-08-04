@@ -1,0 +1,8 @@
+//! tag: T-NO-NULL
+//! expect: output
+//! 10 -1
+fn main() {
+    let xs = [10]
+    // Absence is Option, never null.
+    print("{xs.get(0) ?? 0} {xs.get(9) ?? 0 - 1}")
+}

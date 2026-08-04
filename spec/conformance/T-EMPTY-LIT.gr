@@ -1,0 +1,10 @@
+//! tag: T-EMPTY-LIT
+//! expect: output
+//! 1 0
+type Bag = { items: [str] }
+fn main() {
+    var xs: [i64] = []
+    xs.push(1)
+    let b = Bag{ items: [] }
+    print("{xs.len()} {b.items.len()}")
+}

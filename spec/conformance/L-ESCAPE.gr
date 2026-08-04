@@ -1,0 +1,8 @@
+//! tag: L-ESCAPE
+//! expect: output
+//! a	b
+//! quote" brace{ close}
+fn main() {
+    print("a\tb")
+    print("quote\" brace\{ close\}")
+}

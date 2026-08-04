@@ -1,0 +1,128 @@
+# Evaluation Semantics
+
+The tree-walking interpreter in `grasm_interp` is the **reference
+implementation**: where the native backend and the interpreter disagree, the
+interpreter is right and the backend has a bug. `scripts/difftest.sh` enforces
+this on every program in the repository.
+
+## 1. Values
+
+**[E-VALUE-SEMANTICS]** All values have value semantics. Assigning, passing,
+or storing a value never creates an alias: mutating one binding cannot be
+observed through another.
+
+**[E-COW]** Value semantics are implemented with copy-on-write, so a copy costs
+a reference-count bump and an actual copy happens only on mutation of a shared
+value. This is an optimization and never observable.
+
+## 2. Evaluation order
+
+**[E-ORDER-LTR]** Subexpressions evaluate left to right. Function arguments
+evaluate left to right before the call.
+
+**[E-SHORTCIRCUIT]** `and` does not evaluate its right operand when the left is
+`false`; `or` does not when the left is `true`.
+
+**[E-COALESCE-LAZY]** `a ?? b` evaluates `b` only when `a` is `None`.
+
+## 3. Arithmetic
+
+**[E-ARITH-INT]** `+ - *` on `i64` wrap on overflow (two's complement).
+
+**[E-DIV-ZERO]** Integer `/` or `%` by zero panics.
+
+**[E-POW-NEG]** A negative integer exponent panics; use floats.
+
+**[E-ARITH-FLOAT]** Float arithmetic follows IEEE-754, including infinities and
+NaN. Division by zero yields an infinity rather than panicking.
+
+**[E-NUM-PROMOTE]** Mixing `i64` and `f64` in one operation promotes to `f64`.
+
+**[E-STR-CONCAT]** `+` on two `str` values concatenates them.
+
+**[E-STR-COMPARE]** `< <= > >=` on `str` compare lexicographically by code
+point.
+
+**[E-EQ-STRUCTURAL]** `==` compares structurally and recursively; two values of
+the same shape and contents are equal.
+
+## 4. Collections
+
+**[E-INDEX-BOUNDS]** Indexing a list out of bounds panics with the index and
+the length. `list.get(i)` returns `Option` instead of panicking.
+
+**[E-MAP-ORDER]** Map iteration (`keys`, `values`, printing) is in sorted key
+order — `false` before `true`, then integers ascending, then strings
+lexicographically — so program output is deterministic.
+
+**[E-STR-CHARS]** String length and indexing operate on Unicode characters,
+not bytes.
+
+## 5. Control flow
+
+**[E-IF-VALUE]** `if` is an expression when both branches yield the same type;
+otherwise it is a statement of type `()`.
+
+**[E-MATCH-ORDER]** Match arms are tried top to bottom; the first whose pattern
+matches and whose guard passes is taken.
+
+**[E-LOOP-RANGE]** `for i in a..b` iterates `a` up to but excluding `b`;
+`a..=b` includes `b`. An empty range runs zero times.
+
+## 6. Errors and panics
+
+**[E-ERR-PROPAGATE]** `try` on `Err(e)` returns `Err(e)` from the enclosing
+function immediately, skipping the rest of its body.
+
+**[E-PANIC-EXIT]** A panic prints `panic: <message>` and exits with status
+101. It is a program bug, not a recoverable condition.
+
+**[E-MAIN-ERR]** An error reaching `main` prints
+`error: unhandled error from main: <value>` and exits with status 1.
+
+## 7. Effects
+
+**[E-HANDLER-INNERMOST]** An effect operation dispatches to the innermost
+enclosing handler for that effect.
+
+**[E-HANDLER-SCOPE]** A handler is installed for the dynamic extent of its
+`with` block, including calls made from inside it.
+
+**[E-HANDLER-MISSING]** A user effect that reaches `main` or a test without a
+handler is rejected *at compile time*, so the runtime's missing-handler panic is
+a defensive backstop that well-typed programs never reach.
+
+## 8. Concurrency
+
+**[E-PARALLEL-JOIN]** A `parallel` block does not exit until every task spawned
+inside it has completed.
+
+**[E-SPAWN-ORDER]** Tasks run to completion in the order they were spawned.
+This is deterministic: the same program always produces the same output.
+
+**[E-SPAWN-SHARED]** A task body sees the enclosing scope, which is how tasks
+share results.
+
+**[E-TASK-PANIC]** A panicking task aborts the whole scope; tasks spawned after
+it do not run.
+
+**[E-NOT-PARALLEL]** Tasks are *not* executed on multiple cores. `parallel`
+provides structure and determinism, not speedup. Multi-core execution is a
+planned change to the value representation, not a property of this
+specification.
+
+## 9. Ownership at runtime
+
+**[E-INOUT-WRITEBACK]** Mutations to an `inout` parameter are visible to the
+caller when the function returns.
+
+**[E-OWN-RUNTIME]** `own` has no runtime effect beyond an ordinary pass; the
+guarantee it provides is entirely static.
+
+## 10. Program startup
+
+**[E-ENTRY]** Execution begins at `main` in the entry module. A program
+without `main` is an error.
+
+**[E-ARGS]** `args()` returns the arguments after `--`, excluding the program
+name.

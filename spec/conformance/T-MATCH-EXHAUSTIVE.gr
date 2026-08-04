@@ -1,0 +1,13 @@
+//! tag: T-MATCH-EXHAUSTIVE
+//! expect: error
+//! not exhaustive
+type S = | A | B | C
+fn f(s: S) -> i64 {
+    match s {
+        A -> 1
+        B -> 2
+    }
+}
+fn main() {
+    print("{f(A)}")
+}

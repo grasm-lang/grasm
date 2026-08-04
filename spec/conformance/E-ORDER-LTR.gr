@@ -1,0 +1,12 @@
+//! tag: E-ORDER-LTR
+//! expect: output
+//! a
+//! b
+//! 3
+fn note(s: str, v: i64) -> i64 {
+    print(s)
+    v
+}
+fn main() {
+    print("{note("a", 1) + note("b", 2)}")
+}

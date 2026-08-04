@@ -1,0 +1,6 @@
+//! tag: G-STMT-TERM
+//! expect: error
+//! expected end of line after statement
+fn main() {
+    let a = 1 let b = 2
+}

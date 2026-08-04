@@ -1,0 +1,11 @@
+//! tag: L-CONTEXTUAL
+//! expect: output
+//! 5 7
+fn spawn(n: i64) -> i64 {
+    n + 2
+}
+fn main() {
+    // `spawn`/`parallel` are ordinary names when no block follows.
+    let parallel = 5
+    print("{parallel} {spawn(parallel)}")
+}

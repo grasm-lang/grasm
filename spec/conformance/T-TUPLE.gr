@@ -1,0 +1,9 @@
+//! tag: T-TUPLE
+//! expect: output
+//! 1 is one
+fn main() {
+    let pair = (1, "one")
+    match pair {
+        (n, name) -> print("{n} is {name}")
+    }
+}

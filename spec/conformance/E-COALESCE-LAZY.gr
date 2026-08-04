@@ -1,0 +1,10 @@
+//! tag: E-COALESCE-LAZY
+//! expect: output
+//! 5
+//! 7
+fn main() {
+    let some = Some(5)
+    print("{some ?? 0}")
+    let none: Option[i64] = None
+    print("{none ?? 7}")
+}

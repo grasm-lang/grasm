@@ -1,0 +1,14 @@
+//! tag: T-EFFECT-ROW
+//! expect: error
+//! not in its declared row
+effect Clock {
+    fn now() -> i64
+}
+fn quiet() / {} {
+    let t = Clock.now()
+}
+fn main() {
+    with Clock handled_by ClockHandler{ now: || 1 } {
+        quiet()
+    }
+}

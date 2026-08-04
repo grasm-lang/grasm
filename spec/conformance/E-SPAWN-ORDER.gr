@@ -1,0 +1,18 @@
+//! tag: E-SPAWN-ORDER
+//! expect: output
+//! abc
+fn main() {
+    var log = ""
+    parallel {
+        spawn {
+            log += "a"
+        }
+        spawn {
+            log += "b"
+        }
+        spawn {
+            log += "c"
+        }
+    }
+    print(log)
+}

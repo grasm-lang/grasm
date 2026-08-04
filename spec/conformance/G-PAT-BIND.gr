@@ -1,0 +1,13 @@
+//! tag: G-PAT-BIND
+//! expect: output
+//! none-case bound-42
+type S = | Empty | Full(v: i64)
+fn describe(s: S) -> str {
+    match s {
+        Empty -> "none-case"
+        Full(v) -> "bound-{v}"
+    }
+}
+fn main() {
+    print("{describe(Empty)} {describe(Full(42))}")
+}

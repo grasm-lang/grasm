@@ -1,0 +1,6 @@
+//! tag: T-MAP-KEY
+//! expect: error
+//! map keys must be
+fn main() {
+    var m: Map[[i64], str] = map()
+}

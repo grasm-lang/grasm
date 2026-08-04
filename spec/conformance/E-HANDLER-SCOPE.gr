@@ -1,0 +1,17 @@
+//! tag: E-HANDLER-SCOPE
+//! expect: output
+//! 42
+effect Cfg {
+    fn value() -> i64
+}
+fn deep() -> i64 {
+    Cfg.value()
+}
+fn middle() -> i64 {
+    deep()
+}
+fn main() {
+    with Cfg handled_by CfgHandler{ value: || 42 } {
+        print("{middle()}")
+    }
+}

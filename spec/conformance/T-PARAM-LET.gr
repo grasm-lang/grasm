@@ -1,0 +1,11 @@
+//! tag: T-PARAM-LET
+//! expect: output
+//! 2 2
+fn size(xs: [i64]) -> i64 {
+    xs.len()
+}
+fn main() {
+    let xs = [1, 2]
+    // A plain parameter does not consume the caller's binding.
+    print("{size(xs)} {size(xs)}")
+}

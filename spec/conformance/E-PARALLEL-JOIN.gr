@@ -1,0 +1,18 @@
+//! tag: E-PARALLEL-JOIN
+//! expect: output
+//! 3
+fn main() {
+    var done: [i64] = []
+    parallel {
+        spawn {
+            done.push(1)
+        }
+        spawn {
+            done.push(2)
+        }
+        spawn {
+            done.push(3)
+        }
+    }
+    print("{done.len()}")
+}

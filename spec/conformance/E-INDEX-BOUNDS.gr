@@ -1,0 +1,7 @@
+//! tag: E-INDEX-BOUNDS
+//! expect: panic
+//! index 5 out of bounds (len 2)
+fn main() {
+    let xs = [1, 2]
+    print("{xs[5]}")
+}

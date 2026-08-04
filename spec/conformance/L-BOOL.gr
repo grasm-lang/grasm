@@ -1,0 +1,6 @@
+//! tag: L-BOOL
+//! expect: output
+//! true false
+fn main() {
+    print("{true} {false}")
+}

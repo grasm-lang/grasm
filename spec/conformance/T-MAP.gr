@@ -1,0 +1,9 @@
+//! tag: T-MAP
+//! expect: output
+//! 2 7 true
+fn main() {
+    var m: Map[str, i64] = map()
+    m.set("a", 7)
+    m.set("b", 8)
+    print("{m.len()} {m.get("a") ?? 0} {m.has("b")}")
+}

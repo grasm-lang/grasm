@@ -1,0 +1,12 @@
+//! tag: E-MATCH-ORDER
+//! expect: output
+//! first
+fn main() {
+    let n = 5
+    let r = match n {
+        x if x > 0 -> "first"
+        5 -> "second"
+        _ -> "third"
+    }
+    print(r)
+}

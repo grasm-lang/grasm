@@ -1,0 +1,12 @@
+//! tag: T-ARM-TYPES
+//! expect: error
+//! type mismatch
+fn f(n: i64) -> i64 {
+    match n {
+        0 -> 1
+        _ -> "not a number"
+    }
+}
+fn main() {
+    print("{f(0)}")
+}

@@ -1,0 +1,11 @@
+//! tag: T-COPY
+//! expect: output
+//! 6 6
+fn consume(own n: i64) -> i64 {
+    n * 2
+}
+fn main() {
+    let n = 3
+    // Scalars copy, so `n` is still usable after an `own` call.
+    print("{consume(n)} {consume(n)}")
+}

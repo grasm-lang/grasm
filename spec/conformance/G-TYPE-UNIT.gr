@@ -1,0 +1,9 @@
+//! tag: G-TYPE-UNIT
+//! expect: output
+//! done
+fn noop() -> () {
+}
+fn main() {
+    noop()
+    print("done")
+}

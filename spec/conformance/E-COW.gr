@@ -1,0 +1,10 @@
+//! tag: E-COW
+//! expect: output
+//! 3 4
+fn main() {
+    // Copy-on-write is never observable: the copy is independent.
+    var xs = [1, 2, 3]
+    var ys = xs
+    ys.push(4)
+    print("{xs.len()} {ys.len()}")
+}

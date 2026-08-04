@@ -1,0 +1,16 @@
+//! tag: E-VALUE-SEMANTICS
+//! expect: output
+//! 2 3
+//! 1 99
+type Box = { n: i64 }
+fn main() {
+    var a = [1, 2]
+    var b = a
+    b.push(3)
+    print("{a.len()} {b.len()}")
+
+    var p = Box{ n: 1 }
+    var q = p
+    q.n = 99
+    print("{p.n} {q.n}")
+}

@@ -1,0 +1,10 @@
+//! tag: E-ARITH-INT
+//! expect: output
+//! 14
+//! -9223372036854775808
+fn main() {
+    print("{2 + 3 * 4}")
+    // Wrapping on overflow, two's complement.
+    var max = 9223372036854775807
+    print("{max + 1}")
+}

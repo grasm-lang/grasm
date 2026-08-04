@@ -1,0 +1,6 @@
+//! tag: E-PANIC-EXIT
+//! expect: panic
+//! deliberate
+fn main() {
+    panic("deliberate")
+}

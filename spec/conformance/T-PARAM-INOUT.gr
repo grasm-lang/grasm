@@ -1,0 +1,11 @@
+//! tag: T-PARAM-INOUT
+//! expect: output
+//! 2
+fn bump(inout n: i64) {
+    n += 1
+}
+fn main() {
+    var n = 1
+    bump(n)
+    print("{n}")
+}

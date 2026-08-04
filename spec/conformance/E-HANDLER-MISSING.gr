@@ -1,0 +1,14 @@
+//! tag: E-HANDLER-MISSING
+//! expect: error
+//! unhandled effect
+effect Cfg {
+    fn value() -> i64
+}
+fn reader() -> i64 {
+    Cfg.value()
+}
+fn main() {
+    // No `with Cfg handled_by ...` anywhere: the checker rejects this before
+    // the program can run, so the runtime panic is unreachable here.
+    print("{reader()}")
+}

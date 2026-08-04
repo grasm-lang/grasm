@@ -1,0 +1,10 @@
+//! tag: T-VAR-MUTABLE
+//! expect: output
+//! 3 [1, 2]
+fn main() {
+    var n = 1
+    n = 3
+    var xs = [1]
+    xs.push(2)
+    print("{n} {xs}")
+}

@@ -1,0 +1,16 @@
+//! tag: E-INOUT-WRITEBACK
+//! expect: output
+//! 3 [1, 2]
+fn bump(inout n: i64) {
+    n += 1
+}
+fn add(inout xs: [i64], v: i64) {
+    xs.push(v)
+}
+fn main() {
+    var n = 2
+    bump(n)
+    var xs = [1]
+    add(xs, 2)
+    print("{n} {xs}")
+}

@@ -1,0 +1,7 @@
+//! tag: T-MODULE-NS
+//! expect: error
+//! duplicate type name
+type Thing = { a: i64 }
+type Thing = { b: i64 }
+fn main() {
+}

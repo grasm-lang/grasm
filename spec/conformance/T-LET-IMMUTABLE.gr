@@ -1,0 +1,7 @@
+//! tag: T-LET-IMMUTABLE
+//! expect: error
+//! it is immutable
+fn main() {
+    let x = 1
+    x = 2
+}

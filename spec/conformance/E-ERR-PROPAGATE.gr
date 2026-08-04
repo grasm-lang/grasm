@@ -1,0 +1,23 @@
+//! tag: E-ERR-PROPAGATE
+//! expect: output
+//! caught Bad
+//! skipped rest
+type E = | Bad
+fn failing() -> i64 ! E {
+    fail(Bad)
+}
+fn caller(inout reached: bool) -> i64 ! E {
+    let v = try failing()
+    reached = true
+    v
+}
+fn main() {
+    var reached = false
+    match caller(reached) {
+        Ok(v) -> print("ok {v}")
+        Err(e) -> print("caught {e}")
+    }
+    if not reached {
+        print("skipped rest")
+    }
+}

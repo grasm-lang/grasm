@@ -1,0 +1,17 @@
+//! tag: T-EFFECT-BUILTIN
+//! expect: output
+//! io and async are built in
+fn writes() / {io} {
+    print("io and async are built in")
+}
+fn concurrent() / {async} {
+    parallel {
+        spawn {
+            let x = 1
+        }
+    }
+}
+fn main() {
+    writes()
+    concurrent()
+}

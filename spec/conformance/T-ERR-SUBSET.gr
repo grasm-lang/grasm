@@ -1,0 +1,17 @@
+//! tag: T-ERR-SUBSET
+//! expect: error
+//! only declares
+type A = | AErr
+type B = | BErr
+fn wide() -> i64 ! (A | B) {
+    1
+}
+fn narrow() -> i64 ! A {
+    try wide()
+}
+fn main() {
+    match narrow() {
+        Ok(v) -> print("{v}")
+        Err(e) -> print("err")
+    }
+}

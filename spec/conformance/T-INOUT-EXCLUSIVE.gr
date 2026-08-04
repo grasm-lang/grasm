@@ -1,0 +1,10 @@
+//! tag: T-INOUT-EXCLUSIVE
+//! expect: error
+//! passed as `inout` twice
+fn both(inout a: [i64], inout b: [i64]) {
+    a.push(1)
+}
+fn main() {
+    var xs = [1]
+    both(xs, xs)
+}

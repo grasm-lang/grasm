@@ -1,0 +1,9 @@
+//! tag: T-MODULE-PUB
+//! expect: output
+//! 4
+fn double(n: i64) -> i64 {
+    n * 2
+}
+fn main() {
+    print("{double(2)}")
+}

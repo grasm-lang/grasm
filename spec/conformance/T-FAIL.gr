@@ -1,0 +1,10 @@
+//! tag: T-FAIL
+//! expect: error
+//! declares no error type
+type E = | Bad
+fn no_error_clause() -> i64 {
+    fail(Bad)
+}
+fn main() {
+    print("{no_error_clause()}")
+}

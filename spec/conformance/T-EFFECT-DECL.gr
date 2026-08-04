@@ -1,0 +1,12 @@
+//! tag: T-EFFECT-DECL
+//! expect: output
+//! 99
+effect Cfg {
+    fn value() -> i64
+}
+fn main() {
+    // Declaring `Cfg` also declares the handler type `CfgHandler`.
+    with Cfg handled_by CfgHandler{ value: || 99 } {
+        print("{Cfg.value()}")
+    }
+}

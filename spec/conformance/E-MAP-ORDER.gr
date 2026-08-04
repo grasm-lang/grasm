@@ -1,0 +1,12 @@
+//! tag: E-MAP-ORDER
+//! expect: output
+//! [alpha, beta, zulu]
+//! {alpha: 1, beta: 2, zulu: 3}
+fn main() {
+    var m = map()
+    m.set("zulu", 3)
+    m.set("alpha", 1)
+    m.set("beta", 2)
+    print("{m.keys()}")
+    print("{m}")
+}

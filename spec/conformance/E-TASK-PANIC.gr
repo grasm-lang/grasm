@@ -1,0 +1,13 @@
+//! tag: E-TASK-PANIC
+//! expect: panic
+//! task exploded
+fn main() {
+    parallel {
+        spawn {
+            panic("task exploded")
+        }
+        spawn {
+            print("must not run")
+        }
+    }
+}

@@ -1,0 +1,7 @@
+//! tag: E-NUM-PROMOTE
+//! expect: output
+//! 7.5
+fn main() {
+    let f = 2.5
+    print("{3 * f}")
+}

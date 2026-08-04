@@ -1,0 +1,15 @@
+//! tag: E-OWN-RUNTIME
+//! expect: output
+//! 3 3
+fn consume(own xs: [i64]) -> i64 {
+    xs.len()
+}
+fn plain(xs: [i64]) -> i64 {
+    xs.len()
+}
+fn main() {
+    let a = [1, 2, 3]
+    let b = [1, 2, 3]
+    // `own` and a plain parameter behave identically at runtime.
+    print("{consume(a)} {plain(b)}")
+}

@@ -1,0 +1,7 @@
+//! tag: L-INTERP
+//! expect: output
+//! n=3 sum=7 nested=YES
+fn main() {
+    let n = 3
+    print("n={n} sum={3 + 4} nested={if n > 1 { "YES" } else { "no" }}")
+}

@@ -1,0 +1,17 @@
+//! tag: E-NOT-PARALLEL
+//! expect: output
+//! sequential
+fn main() {
+    // Tasks run one at a time, so a task always observes the previous
+    // task's completed writes — never a partial interleaving.
+    var log = ""
+    parallel {
+        spawn {
+            log += "seq"
+        }
+        spawn {
+            log += "uential"
+        }
+    }
+    print(log)
+}

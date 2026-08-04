@@ -1,0 +1,7 @@
+//! tag: L-COMMENT-LINE
+//! expect: output
+//! 1
+fn main() {
+    // a whole-line comment
+    print("1") // and a trailing one
+}

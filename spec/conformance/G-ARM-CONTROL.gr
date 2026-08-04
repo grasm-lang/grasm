@@ -1,0 +1,13 @@
+//! tag: G-ARM-CONTROL
+//! expect: output
+//! 3
+fn main() {
+    var n = 0
+    for i in 0..10 {
+        match i {
+            3 -> break
+            _ -> n = i
+        }
+    }
+    print("{n + 1}")
+}

@@ -1,0 +1,17 @@
+//! tag: E-HANDLER-INNERMOST
+//! expect: output
+//! 1
+//! 2
+//! 1
+effect Clock {
+    fn now() -> i64
+}
+fn main() {
+    with Clock handled_by ClockHandler{ now: || 1 } {
+        print("{Clock.now()}")
+        with Clock handled_by ClockHandler{ now: || 2 } {
+            print("{Clock.now()}")
+        }
+        print("{Clock.now()}")
+    }
+}

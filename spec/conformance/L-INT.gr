@@ -1,0 +1,6 @@
+//! tag: L-INT
+//! expect: output
+//! 255 10 1000000
+fn main() {
+    print("{0xFF} {0b1010} {1_000_000}")
+}

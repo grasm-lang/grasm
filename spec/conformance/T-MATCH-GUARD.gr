@@ -1,0 +1,12 @@
+//! tag: T-MATCH-GUARD
+//! expect: error
+//! not exhaustive
+fn f(b: bool) -> i64 {
+    match b {
+        true -> 1
+        false if b -> 0
+    }
+}
+fn main() {
+    print("{f(true)}")
+}

@@ -1,0 +1,24 @@
+//! tag: E-LOOP-RANGE
+//! expect: output
+//! 0123
+//! 01234
+//! empty
+fn main() {
+    var a = ""
+    for i in 0..4 {
+        a += "{i}"
+    }
+    print(a)
+    var b = ""
+    for i in 0..=4 {
+        b += "{i}"
+    }
+    print(b)
+    var n = 0
+    for _i in 5..5 {
+        n += 1
+    }
+    if n == 0 {
+        print("empty")
+    }
+}

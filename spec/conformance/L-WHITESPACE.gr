@@ -1,0 +1,8 @@
+//! tag: L-WHITESPACE
+//! expect: output
+//! 3
+fn main() {
+	let    a	=	1
+	let  b  =  2
+	print("{a+b}")
+}

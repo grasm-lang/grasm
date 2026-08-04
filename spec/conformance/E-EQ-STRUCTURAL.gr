@@ -1,0 +1,10 @@
+//! tag: E-EQ-STRUCTURAL
+//! expect: output
+//! true true false
+type P = { x: i64, y: [str] }
+fn main() {
+    let a = P{ x: 1, y: ["k"] }
+    let b = P{ x: 1, y: ["k"] }
+    let c = P{ x: 2, y: ["k"] }
+    print("{a == b} {[1, 2] == [1, 2]} {a == c}")
+}

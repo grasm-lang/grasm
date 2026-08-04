@@ -1,0 +1,6 @@
+//! tag: E-ENTRY
+//! expect: output
+//! started
+fn main() {
+    print("started")
+}

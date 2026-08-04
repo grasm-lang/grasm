@@ -1,0 +1,9 @@
+//! tag: L-IDENT
+//! expect: output
+//! 6
+fn main() {
+    let snake_case = 1
+    let _leading = 2
+    let with2digits = 3
+    print("{snake_case + _leading + with2digits}")
+}

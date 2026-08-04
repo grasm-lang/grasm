@@ -1,0 +1,16 @@
+//! tag: L-NEWLINE
+//! expect: output
+//! 6
+fn main() {
+    let a = 1
+
+
+    let b = 2
+    // Newlines are insignificant inside ( ) and [ ].
+    let xs = [
+        a,
+        b,
+        3,
+    ]
+    print("{xs.sum()}")
+}

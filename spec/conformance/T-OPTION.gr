@@ -1,0 +1,12 @@
+//! tag: T-OPTION
+//! expect: output
+//! 5 none
+fn describe(o: Option[i64]) -> str {
+    match o {
+        Some(v) -> "{v}"
+        None -> "none"
+    }
+}
+fn main() {
+    print("{describe(Some(5))} {describe(None)}")
+}

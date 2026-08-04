@@ -1,0 +1,6 @@
+//! tag: L-STRING
+//! expect: error
+//! unterminated string
+fn main() {
+    let s = "no closing quote
+}

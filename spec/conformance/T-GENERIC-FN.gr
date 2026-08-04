@@ -1,0 +1,9 @@
+//! tag: T-GENERIC-FN
+//! expect: output
+//! 1 a
+fn first[T](xs: [T]) -> Option[T] {
+    xs.get(0)
+}
+fn main() {
+    print("{first([1, 2]) ?? 0} {first(["a"]) ?? "none"}")
+}

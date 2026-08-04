@@ -1,0 +1,9 @@
+//! tag: T-EFFECT-DISCHARGE
+//! expect: error
+//! unhandled effect
+effect Clock {
+    fn now() -> i64
+}
+fn main() {
+    print("{Clock.now()}")
+}

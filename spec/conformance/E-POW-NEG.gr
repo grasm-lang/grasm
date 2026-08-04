@@ -1,0 +1,7 @@
+//! tag: E-POW-NEG
+//! expect: panic
+//! negative integer exponent
+fn main() {
+    let e = 0 - 1
+    print("{2 ^ e}")
+}

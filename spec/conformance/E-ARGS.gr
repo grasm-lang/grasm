@@ -1,0 +1,7 @@
+//! tag: E-ARGS
+//! expect: output
+//! 0
+fn main() {
+    // No arguments were passed after `--`.
+    print("{args().len()}")
+}

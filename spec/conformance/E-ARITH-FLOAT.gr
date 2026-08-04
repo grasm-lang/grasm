@@ -1,0 +1,8 @@
+//! tag: E-ARITH-FLOAT
+//! expect: output
+//! 0.30000000000000004
+//! inf
+fn main() {
+    print("{0.1 + 0.2}")
+    print("{1.0 / 0.0}")
+}

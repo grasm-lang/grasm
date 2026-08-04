@@ -1,0 +1,14 @@
+//! tag: T-TRY
+//! expect: error
+//! declares no error type
+type E = | Bad
+fn risky() -> i64 ! E {
+    1
+}
+// `main` and tests have an open error slot; an ordinary function does not.
+fn caller() -> i64 {
+    try risky()
+}
+fn main() {
+    print("{caller()}")
+}

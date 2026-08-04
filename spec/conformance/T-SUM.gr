@@ -1,0 +1,13 @@
+//! tag: T-SUM
+//! expect: output
+//! circle-2.0 dot
+type Shape = | Circle(r: f64) | Dot
+fn name(s: Shape) -> str {
+    match s {
+        Circle(r) -> "circle-{r}"
+        Dot -> "dot"
+    }
+}
+fn main() {
+    print("{name(Circle(2.0))} {name(Dot)}")
+}

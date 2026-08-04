@@ -1,0 +1,7 @@
+//! tag: L-ENCODING
+//! expect: output
+//! héllo ✓ 日本語
+fn main() {
+    // Source is UTF-8; strings and comments may hold any Unicode: ✓ 日本語
+    print("héllo ✓ 日本語")
+}

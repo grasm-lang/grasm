@@ -1,0 +1,11 @@
+//! tag: T-USE-AFTER-MOVE
+//! expect: error
+//! use of moved value
+fn consume(own s: str) -> i64 {
+    s.len()
+}
+fn main() {
+    let name = "ada"
+    let n = consume(name)
+    print(name)
+}

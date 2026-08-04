@@ -1,0 +1,8 @@
+//! tag: E-DIV-ZERO
+//! expect: panic
+//! division by zero
+fn main() {
+    let a = 1
+    let b = 0
+    print("{a / b}")
+}

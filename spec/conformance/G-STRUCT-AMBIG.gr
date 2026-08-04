@@ -1,0 +1,15 @@
+//! tag: G-STRUCT-AMBIG
+//! expect: output
+//! taken
+type P = { ok: bool }
+fn main() {
+    let flag = true
+    // `flag {` is a condition + block, not a struct literal.
+    if flag {
+        print("taken")
+    }
+    // Parenthesize to build a struct in that position.
+    if (P{ ok: true }).ok {
+        // reachable
+    }
+}

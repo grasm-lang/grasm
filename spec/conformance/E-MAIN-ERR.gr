@@ -1,0 +1,7 @@
+//! tag: E-MAIN-ERR
+//! expect: output-failing
+//! error: unhandled error from main: Bad
+type E = | Bad
+fn main() ! E {
+    fail(Bad)
+}

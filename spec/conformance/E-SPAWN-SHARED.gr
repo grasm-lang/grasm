@@ -1,0 +1,16 @@
+//! tag: E-SPAWN-SHARED
+//! expect: output
+//! 30
+fn main() {
+    let base = 10
+    var total = 0
+    parallel {
+        spawn {
+            total += base
+        }
+        spawn {
+            total += base * 2
+        }
+    }
+    print("{total}")
+}

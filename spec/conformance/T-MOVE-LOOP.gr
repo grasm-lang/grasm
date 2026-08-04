@@ -1,0 +1,12 @@
+//! tag: T-MOVE-LOOP
+//! expect: error
+//! next loop iteration
+fn consume(own s: str) -> i64 {
+    s.len()
+}
+fn main() {
+    let name = "ada"
+    for _i in 0..3 {
+        let n = consume(name)
+    }
+}

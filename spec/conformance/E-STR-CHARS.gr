@@ -1,0 +1,8 @@
+//! tag: E-STR-CHARS
+//! expect: output
+//! 3 3
+fn main() {
+    // Characters, not bytes: each of these is multi-byte in UTF-8.
+    let s = "héllo"
+    print("{"abc".len()} {s.substr(0, 3).len()}")
+}

@@ -1,0 +1,6 @@
+//! tag: L-FLOAT
+//! expect: output
+//! 3.14 1000000000.0 0.0025
+fn main() {
+    print("{3.14} {1e9} {2.5e-3}")
+}

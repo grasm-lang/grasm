@@ -1,0 +1,10 @@
+//! tag: G-NEST-LIMIT
+//! expect: output
+//! ok
+fn main() {
+    // Deep but within the 64-level cap.
+    let x = ((((((((((1))))))))))
+    if x == 1 {
+        print("ok")
+    }
+}
