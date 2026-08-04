@@ -49,6 +49,29 @@ Phase 2 additions: **modules** (`import utils` / `import lib.math`, qualified
 deterministic iteration), and **`grasm build`** (bundles all modules with the
 runtime into one distributable executable).
 
+### Native compilation
+
+`grasm build <file.gr> --native` compiles to machine code through Cranelift and
+links against `libgrasm_rt.a`. The backend covers scalars, strings, lists, maps,
+tuples, structs, sum types, `match` (guards + nested patterns), `Option`,
+`T ! E` fallibles with `try`/`fail`, effects with handlers, `inout`/`own`
+params, `map`/`filter` (lowered as inline loops), and multi-module programs.
+
+`scripts/difftest.sh` is the correctness gate: every program in `examples/` and
+`projects/` is run through both backends and the outputs must match byte for
+byte. Current status — **16 identical, 0 mismatched, 1 unsupported** (the router
+project needs first-class function values). Anything the backend can't compile
+names the missing feature and points at the interpreter; it never silently
+miscompiles.
+
+Measured on this machine (user CPU time, release builds):
+
+| benchmark | native | interpreter |
+|---|---|---|
+| `fib(32)` | 0.01s | 2.72s |
+| 200k list pushes + sum | 0.00s | 0.08s |
+| 300k filter + map pipeline | 0.01s | 0.15s |
+
 ## What the language guarantees today
 
 - **No nulls** — `Option[T]` + `??` / `?.`-style access via `.get()`.
@@ -71,6 +94,8 @@ runtime into one distributable executable).
 | `crates/grasm_syntax` | lexer, parser, AST, diagnostics, formatter |
 | `crates/grasm_sema` | typechecker (inference, generics, effects rows, ownership) |
 | `crates/grasm_interp` | definitional tree-walking interpreter + test runner |
+| `crates/grasm_native` | Cranelift AOT backend (`grasm build --native`) |
+| `crates/grasm_rt` | C-ABI runtime linked into native executables |
 | `crates/grasm` | the `grasm` CLI |
 | `examples/` | small demos (hello, errors, effects, ownership) |
 | `projects/beginner` | validation: games, todo, text stats, unit converter |
@@ -80,8 +105,10 @@ runtime into one distributable executable).
 
 ## Status
 
-Grasm-Core milestone (the master plan's §19 kernel language) plus Phase-2
-features (modules, maps, self-contained builds): **complete and validated** —
-160 Rust tests + 40+ in-language test blocks across 17 programs, adversarial
-fuzz/stress suite, zero clippy warnings. Tree-walking interpreter (native
-codegen via Cranelift, LSP, package manager: next milestones — MASTERPLAN §13).
+Grasm-Core (the master plan's §19 kernel language), Phase-2 features (modules,
+maps, self-contained builds), and the **Cranelift native backend** are complete
+and validated: 175 Rust tests + 40+ in-language test blocks across 17 programs,
+an adversarial fuzz/stress suite, a native-vs-interpreter differential gate, and
+zero clippy warnings. The interpreter remains the reference semantics; the
+native backend is checked against it on every program. Next milestones (see
+MASTERPLAN §13): LSP, package manager, first-class function values.

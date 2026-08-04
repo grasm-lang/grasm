@@ -51,6 +51,7 @@ enum VType {
     /// `T ! E` — boxed Ok/Err variant wrapper around T.
     Fallible(Box<VType>),
     Map(Box<VType>, Box<VType>),
+    Tuple(Vec<VType>),
     /// Dynamically-typed boxed value (error payloads); printable + variant-matchable.
     Any,
 }
@@ -70,6 +71,7 @@ impl VType {
             | VType::Option(_)
             | VType::Fallible(_)
             | VType::Map(_, _)
+            | VType::Tuple(_)
             | VType::Any => types::I64,
         }
     }
@@ -84,6 +86,7 @@ impl VType {
                 | VType::Option(_)
                 | VType::Fallible(_)
                 | VType::Map(_, _)
+                | VType::Tuple(_)
                 | VType::Any
         )
     }
@@ -283,6 +286,7 @@ impl<'m> Codegen<'m> {
             ("grasm_list_pop", vec![i64t, ptr], Some(i64t)),
             ("grasm_list_first", vec![i64t], Some(i64t)),
             ("grasm_list_last", vec![i64t], Some(i64t)),
+            ("grasm_list_set", vec![i64t, i64t, i64t], Some(i64t)),
             ("grasm_list_sum_i64", vec![i64t], Some(i64t)),
             ("grasm_list_sum_f64", vec![i64t], Some(f64t)),
             ("grasm_i64_abs", vec![i64t], Some(i64t)),
@@ -358,6 +362,13 @@ impl<'m> Codegen<'m> {
             }
             TypeExpr::List(inner, _) => Ok(VType::List(Box::new(self.vtype_of(inner)?))),
             TypeExpr::Tuple(items, _) if items.is_empty() => Ok(VType::Unit),
+            TypeExpr::Tuple(items, _) => {
+                let mut ts = Vec::with_capacity(items.len());
+                for i in items {
+                    ts.push(self.vtype_of(i)?);
+                }
+                Ok(VType::Tuple(ts))
+            }
             other => nope(other.span(), "non-scalar types"),
         }
     }
@@ -629,6 +640,7 @@ impl<'m> Codegen<'m> {
             loops: Vec::new(),
             ret: sig_ret.clone(),
             inout_slots: Vec::new(),
+            filled: false,
         };
 
         let entry = fcx.b.create_block();
@@ -704,7 +716,15 @@ impl<'m> Codegen<'m> {
             .define_function(func_id, &mut ctx)
             .map_err(|e| Unsupported {
                 span: f.span,
-                what: format!("(define error: {e})"),
+                what: {
+                    if std::env::var("GRASM_DUMP_IR").is_ok() {
+                        eprintln!(
+                            "--- verifier detail for `{}` ---\n{:?}\n--- IR ---\n{}",
+                            f.name.name, e, ctx.func
+                        );
+                    }
+                    format!("(codegen bug in `{}`: {e})", f.name.name)
+                },
             })?;
         Ok(())
     }
@@ -842,6 +862,7 @@ impl<'m> Codegen<'m> {
             loops: Vec::new(),
             ret: h.ret.clone(),
             inout_slots: Vec::new(),
+            filled: false,
         };
         let entry = fcx.b.create_block();
         fcx.b.append_block_params_for_function_params(entry);
@@ -910,6 +931,17 @@ struct FnCx<'a, 'm> {
     /// (caller pointer, local var, type) for `inout` params — stored back
     /// through the pointer before every return.
     inout_slots: Vec<(Value, Variable, VType)>,
+    /// True when the current block already ends in a terminator (a `break`,
+    /// `continue`, `return`, or `fail` was just emitted). Cleared whenever we
+    /// switch to a fresh block.
+    filled: bool,
+}
+
+/// One step of a place path (`p.field`, `xs[i]`).
+#[derive(Clone, Copy)]
+enum PlaceSeg<'e> {
+    Field(&'e str),
+    Index(&'e Expr),
 }
 
 enum StmtOut {
@@ -1009,6 +1041,16 @@ impl FnCx<'_, '_> {
             .get(&format!("{}::{}", self.cg.current_module, name))
     }
 
+    /// Switches to `blk`, resetting the terminator flag.
+    fn goto_block(&mut self, blk: Block) {
+        self.b.switch_to_block(blk);
+        self.filled = false;
+    }
+
+    fn is_filled(&self) -> bool {
+        self.filled
+    }
+
     fn call_rt(&mut self, name: &'static str, args: &[Value]) -> Option<Value> {
         let id = self.cg.runtime[name];
         let fref = self.cg.module.declare_func_in_func(id, self.b.func);
@@ -1096,32 +1138,43 @@ impl FnCx<'_, '_> {
             Stmt::Assign {
                 target, op, value, ..
             } => {
-                // Single-level field assignment on a variable: `p.x = v`.
-                if let Expr::Field { recv, name, .. } = target {
-                    if *op != AssignOp::Assign {
-                        return nope(target.span(), "compound assignment to fields");
-                    }
-                    let Expr::Ident(root) = &**recv else {
-                        return nope(target.span(), "nested field assignment");
-                    };
-                    let Some((var, vt)) = self.lookup(&root.name) else {
+                // Field/index places (any depth, plain or compound).
+                if matches!(target, Expr::Field { .. } | Expr::Index { .. }) {
+                    let (root, path) = self.place_path(target)?;
+                    let Some((var, root_t)) = self.lookup(&root.name) else {
                         return nope(root.span, "assignment to unknown variable");
                     };
-                    let VType::Struct(sname) = vt.clone() else {
-                        return nope(target.span(), "field assignment on non-structs");
-                    };
-                    let field_t = self.struct_field_type(&sname, &name.name, target.span())?;
-                    let (mut fv, fvt) = self.eval_expr_val(value)?;
-                    if field_t == VType::F64 && fvt == VType::I64 {
-                        fv = self.b.ins().fcvt_from_sint(types::F64, fv);
+                    let elem_t = self.place_type(&root_t, &path, target.span())?;
+                    let (mut val, val_t) = self.eval_expr_expecting(value, Some(&elem_t))?;
+                    if elem_t == VType::F64 && val_t == VType::I64 {
+                        val = self.b.ins().fcvt_from_sint(types::F64, val);
                     }
-                    let boxed = self.box_value(fv, &field_t);
+                    let final_v = if *op == AssignOp::Assign {
+                        val
+                    } else {
+                        let cur = self.b.use_var(var);
+                        let old = self.read_place(cur, &path, &root_t, &elem_t)?;
+                        let bop = match op {
+                            AssignOp::Add => BinaryOp::Add,
+                            AssignOp::Sub => BinaryOp::Sub,
+                            AssignOp::Mul => BinaryOp::Mul,
+                            AssignOp::Div => BinaryOp::Div,
+                            AssignOp::Assign => unreachable!(),
+                        };
+                        self.binop_values(
+                            bop,
+                            old,
+                            elem_t.clone(),
+                            val,
+                            val_t,
+                            target.span(),
+                        )?
+                        .0
+                    };
+                    let boxed = self.box_value(final_v, &elem_t);
                     let cur = self.b.use_var(var);
-                    let (np, nl) = self.str_ptr_len(&name.name);
-                    let newp = self
-                        .call_rt("grasm_struct_set_field", &[cur, np, nl, boxed])
-                        .unwrap();
-                    self.b.def_var(var, newp);
+                    let updated = self.write_place(cur, &path, &root_t, boxed)?;
+                    self.b.def_var(var, updated);
                     return Ok(StmtOut::Value(None));
                 }
                 let Expr::Ident(id) = target else {
@@ -1175,7 +1228,11 @@ impl FnCx<'_, '_> {
             Stmt::Return(v, _) => {
                 match v {
                     Some(e) => {
-                        let (mut val, vt) = self.eval_expr_val(e)?;
+                        let expect = match &self.ret {
+                            VType::Fallible(ok) => (**ok).clone(),
+                            other => other.clone(),
+                        };
+                        let (mut val, vt) = self.eval_expr_expecting(e, Some(&expect))?;
                         if self.ret == VType::F64 && vt == VType::I64 {
                             val = self.b.ins().fcvt_from_sint(types::F64, val);
                         }
@@ -1192,10 +1249,25 @@ impl FnCx<'_, '_> {
                         // balanced by the +1 the Ident eval added.)
                         self.emit_scope_decs_all();
                         self.b.ins().return_(&[val]);
+                self.filled = true;
                     }
                     None => {
-                        self.emit_scope_decs_all();
-                        self.b.ins().return_(&[]);
+                        if let VType::Fallible(ok_t) = self.ret.clone() {
+                            // Bare `return` in a fallible function is `Ok(())`.
+                            let z = self.b.ins().iconst(types::I64, 0);
+                            let inner = if *ok_t == VType::Unit {
+                                self.call_rt("grasm_box_i64", &[z]).unwrap()
+                            } else {
+                                self.box_value(z, &ok_t)
+                            };
+                            let wrapped = self.call_rt("grasm_ok_new", &[inner]).unwrap();
+                            self.emit_scope_decs_all();
+                            self.b.ins().return_(&[wrapped]);
+                        } else {
+                            self.emit_scope_decs_all();
+                            self.b.ins().return_(&[]);
+                        }
+                        self.filled = true;
                     }
                 }
                 Ok(StmtOut::Terminated)
@@ -1205,6 +1277,7 @@ impl FnCx<'_, '_> {
                     return nope(*span, "break outside loop");
                 };
                 self.b.ins().jump(break_blk, &[]);
+                self.filled = true;
                 Ok(StmtOut::Terminated)
             }
             Stmt::Continue(span) => {
@@ -1212,6 +1285,7 @@ impl FnCx<'_, '_> {
                     return nope(*span, "continue outside loop");
                 };
                 self.b.ins().jump(cont_blk, &[]);
+                self.filled = true;
                 Ok(StmtOut::Terminated)
             }
             Stmt::While { cond, body, .. } => {
@@ -1219,20 +1293,24 @@ impl FnCx<'_, '_> {
                 let body_blk = self.b.create_block();
                 let exit = self.b.create_block();
                 self.b.ins().jump(header, &[]);
-                self.b.switch_to_block(header);
+                self.filled = true;
+                self.goto_block(header);
                 let (c, ct) = self.eval_expr_val(cond)?;
                 if ct != VType::Bool {
                     return nope(cond.span(), "non-bool while condition");
                 }
                 self.b.ins().brif(c, body_blk, &[], exit, &[]);
-                self.b.switch_to_block(body_blk);
+                self.filled = true;
+                self.goto_block(body_blk);
                 self.loops.push((header, exit));
-                let (_, terminated) = self.eval_block_inner(body)?;
+                let (_, mut terminated) = self.eval_block_inner(body)?;
                 self.loops.pop();
+                terminated |= self.is_filled();
                 if !terminated {
                     self.b.ins().jump(header, &[]);
+                    self.filled = true;
                 }
-                self.b.switch_to_block(exit);
+                self.goto_block(exit);
                 Ok(StmtOut::Value(None))
             }
             Stmt::For {
@@ -1260,7 +1338,8 @@ impl FnCx<'_, '_> {
                     let addr = self.b.ins().func_addr(ptr_ty, fref);
                     self.call_rt("grasm_handler_op", &[op_p, op_l, addr]);
                 }
-                let (_, terminated) = self.eval_block_inner(body)?;
+                let (_, mut terminated) = self.eval_block_inner(body)?;
+                terminated |= self.is_filled();
                 if !terminated {
                     self.call_rt("grasm_handler_pop", &[]);
                 }
@@ -1299,7 +1378,8 @@ impl FnCx<'_, '_> {
             let step = self.b.create_block();
             let exit = self.b.create_block();
             self.b.ins().jump(header, &[]);
-            self.b.switch_to_block(header);
+            self.filled = true;
+            self.goto_block(header);
             let iv = self.b.use_var(ivar);
             let ev = self.b.use_var(end_var);
             let cc = if *inclusive {
@@ -1309,24 +1389,28 @@ impl FnCx<'_, '_> {
             };
             let c = self.b.ins().icmp(cc, iv, ev);
             self.b.ins().brif(c, body_blk, &[], exit, &[]);
+            self.filled = true;
 
-            self.b.switch_to_block(body_blk);
+            self.goto_block(body_blk);
             self.push_scope();
             self.bind(&loop_var.name, ivar, VType::I64);
             self.loops.push((step, exit));
-            let (_, terminated) = self.eval_block_inner(body)?;
+            let (_, mut terminated) = self.eval_block_inner(body)?;
             self.loops.pop();
+            terminated |= self.is_filled();
             self.pop_scope_no_decs(); // loop var is scalar
             if !terminated {
                 self.b.ins().jump(step, &[]);
+                self.filled = true;
             }
-            self.b.switch_to_block(step);
+            self.goto_block(step);
             let iv2 = self.b.use_var(ivar);
             let one = self.b.ins().iconst(types::I64, 1);
             let next = self.b.ins().iadd(iv2, one);
             self.b.def_var(ivar, next);
             self.b.ins().jump(header, &[]);
-            self.b.switch_to_block(exit);
+            self.filled = true;
+            self.goto_block(exit);
             return Ok(StmtOut::Value(None));
         }
 
@@ -1346,14 +1430,16 @@ impl FnCx<'_, '_> {
         let step = self.b.create_block();
         let exit = self.b.create_block();
         self.b.ins().jump(header, &[]);
-        self.b.switch_to_block(header);
+        self.filled = true;
+        self.goto_block(header);
         let lv = self.b.use_var(list_var);
         let len = self.call_rt("grasm_list_len", &[lv]).unwrap();
         let iv = self.b.use_var(ivar);
         let c = self.b.ins().icmp(IntCC::SignedLessThan, iv, len);
         self.b.ins().brif(c, body_blk, &[], exit, &[]);
+        self.filled = true;
 
-        self.b.switch_to_block(body_blk);
+        self.goto_block(body_blk);
         let lv2 = self.b.use_var(list_var);
         let iv2 = self.b.use_var(ivar);
         let boxed_elem = self.call_rt("grasm_list_get", &[lv2, iv2]).unwrap();
@@ -1363,8 +1449,9 @@ impl FnCx<'_, '_> {
         self.push_scope();
         self.bind(&loop_var.name, evar, elem_vt.clone());
         self.loops.push((step, exit));
-        let (_, terminated) = self.eval_block_inner(body)?;
+        let (_, mut terminated) = self.eval_block_inner(body)?;
         self.loops.pop();
+        terminated |= self.is_filled();
         if terminated {
             self.pop_scope_no_decs();
         } else {
@@ -1372,14 +1459,16 @@ impl FnCx<'_, '_> {
         }
         if !terminated {
             self.b.ins().jump(step, &[]);
+            self.filled = true;
         }
-        self.b.switch_to_block(step);
+        self.goto_block(step);
         let iv3 = self.b.use_var(ivar);
         let one = self.b.ins().iconst(types::I64, 1);
         let next = self.b.ins().iadd(iv3, one);
         self.b.def_var(ivar, next);
         self.b.ins().jump(header, &[]);
-        self.b.switch_to_block(exit);
+        self.filled = true;
+        self.goto_block(exit);
         // Release the list temp.
         let lv3 = self.b.use_var(list_var);
         self.call_rt("grasm_val_dec", &[lv3]);
@@ -1405,7 +1494,12 @@ impl FnCx<'_, '_> {
                 self.call_rt("grasm_val_dec", &[boxed]);
                 Ok((v, VType::Bool))
             }
-            VType::Unit => nope(Span::new(0, 1), "unit values in boxes"),
+            VType::Unit => {
+                // Unit has no payload; release the placeholder box.
+                self.call_rt("grasm_val_dec", &[boxed]);
+                let dummy = self.b.ins().iconst(types::I8, 0);
+                Ok((dummy, VType::Unit))
+            }
             // All other boxed kinds pass through, keeping the +1.
             other => Ok((boxed, other.clone())),
         }
@@ -1413,6 +1507,12 @@ impl FnCx<'_, '_> {
 
     fn box_value(&mut self, v: Value, vt: &VType) -> Value {
         match vt {
+            // Unit has no runtime payload; box a placeholder so `Ok(())` and
+            // unit-typed containers still hold a valid pointer.
+            VType::Unit => {
+                let z = self.b.ins().iconst(types::I64, 0);
+                self.call_rt("grasm_box_i64", &[z]).unwrap()
+            }
             VType::I64 => self.call_rt("grasm_box_i64", &[v]).unwrap(),
             VType::F64 => self.call_rt("grasm_box_f64", &[v]).unwrap(),
             VType::Bool => self.call_rt("grasm_box_bool", &[v]).unwrap(),
@@ -1474,6 +1574,10 @@ impl FnCx<'_, '_> {
                     }
                     Ok(Some((v, vt)))
                 }
+                None if self.lookup_fn(&id.name).is_some() => nope(
+                    id.span,
+                    "function values (passing a function as data)",
+                ),
                 None => {
                     // Nullary variant as a value (None, Dot, Red, ...).
                     if let Some((parent, 0)) = self.cg.variant_index.get(&id.name).cloned() {
@@ -1548,8 +1652,8 @@ impl FnCx<'_, '_> {
                 cond,
                 then_block,
                 else_branch,
-                span,
-            } => self.eval_if(cond, then_block, else_branch.as_deref(), *span),
+                ..
+            } => self.eval_if(cond, then_block, else_branch.as_deref()),
             Expr::Call { callee, args, span } => self.eval_call(callee, args, *span),
             Expr::Block(b) => {
                 let (last, terminated) = self.eval_block_inner(b)?;
@@ -1558,6 +1662,17 @@ impl FnCx<'_, '_> {
                 } else {
                     Ok(last)
                 }
+            }
+            Expr::Tuple(items, _) => {
+                let mut list = self.call_rt("grasm_list_new", &[]).unwrap();
+                let mut ts = Vec::with_capacity(items.len());
+                for item in items {
+                    let (v, vt) = self.eval_expr_val(item)?;
+                    let bx = self.box_value(v, &vt);
+                    list = self.call_rt("grasm_list_push", &[list, bx]).unwrap();
+                    ts.push(vt);
+                }
+                Ok(Some((list, VType::Tuple(ts))))
             }
             Expr::StructLit { name, fields, span } => {
                 self.eval_struct_lit(name, fields, *span).map(Some)
@@ -1574,7 +1689,6 @@ impl FnCx<'_, '_> {
             other => nope(
                 other.span(),
                 match other {
-                    Expr::Tuple(..) => "tuples",
                     Expr::Range { .. } => "range values outside for",
                     Expr::Closure { .. } => "closures",
                     _ => "this construct",
@@ -1713,6 +1827,26 @@ impl FnCx<'_, '_> {
                     }
                 }
             }
+        }
+        // Mutating list push on a nested place: `bag.items.push(v)`.
+        if name.name == "push" && matches!(recv, Expr::Field { .. } | Expr::Index { .. }) {
+            let (root, path) = self.place_path(recv)?;
+            let Some((var, root_t)) = self.lookup(&root.name) else {
+                return nope(root.span, "push on an unknown variable");
+            };
+            let list_t = self.place_type(&root_t, &path, span)?;
+            let VType::List(elem_t) = list_t.clone() else {
+                return nope(span, "push on non-lists");
+            };
+            let (av, _) = self.eval_expr_expecting(&args[0], Some(&elem_t))?;
+            let boxed = self.box_value(av, &elem_t);
+            let cur = self.b.use_var(var);
+            let list_val = self.read_place_boxed(cur, &path, &root_t)?;
+            let newlist = self.call_rt("grasm_list_push", &[list_val, boxed]).unwrap();
+            let cur2 = self.b.use_var(var);
+            let updated = self.write_place(cur2, &path, &root_t, newlist)?;
+            self.b.def_var(var, updated);
+            return Ok(None);
         }
         // Mutating list push on a variable.
         if name.name == "push" {
@@ -1863,23 +1997,22 @@ impl FnCx<'_, '_> {
                     return Ok(Some((out, VType::Bool)));
                 }
                 "unwrap_or" => {
-                    let fake_lhs_span = span;
-                    let _ = fake_lhs_span;
-                    return self
-                        .coalesce_values(rv, &payload_t, &args[0], span)
-                        .map(Some);
+                    return self.coalesce_values(rv, &payload_t, &args[0]).map(Some);
                 }
                 _ => {}
             }
         }
-        self.dispatch_method(rv, rt, name, args, span)
+        self.dispatch_method(rv, rt, recv, name, args, span)
     }
 
-    /// Full builtin-method surface over an owned receiver value.
+    /// Full builtin-method surface over an owned receiver value. `recv` is the
+    /// receiver *expression* (needed for `inout` UFCS calls).
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_method(
         &mut self,
         rv: Value,
         rt: VType,
+        recv: &Expr,
         name: &Ident,
         args: &[Expr],
         span: Span,
@@ -2132,10 +2265,70 @@ impl FnCx<'_, '_> {
             _ => {
                 // UFCS: x.f(a) → f(x, a).
                 if let Some(sig) = self.lookup_fn(&name.name) {
-                    let (fid, params, ret) = (sig.id, sig.params.clone(), sig.ret.clone());
-                    let mut vals = vec![rv];
-                    for (a, want) in args.iter().zip(params.iter().skip(1)) {
-                        let (mut v, vt) = self.eval_expr_val(a)?;
+                    let (fid, params, modes, ret) = (
+                        sig.id,
+                        sig.params.clone(),
+                        sig.modes.clone(),
+                        sig.ret.clone(),
+                    );
+                    let ptr_ty = self.cg.module.target_config().pointer_type();
+                    let mut vals: Vec<Value> = Vec::with_capacity(args.len() + 1);
+                    // The receiver is the first parameter; honor `inout` by
+                    // passing a pointer to the caller's slot.
+                    let mut recv_slot: Option<(cranelift_codegen::ir::StackSlot, Variable, VType)> =
+                        None;
+                    if modes.first().copied() == Some(ParamMode::Inout) {
+                        let Expr::Ident(rid) = recv else {
+                            return nope(span, "`inout` receivers that aren't plain variables");
+                        };
+                        let Some((rvar, rvt)) = self.lookup(&rid.name) else {
+                            return nope(rid.span, "an unknown `inout` receiver");
+                        };
+                        // `rv` was an owned +1 read of the same value; release it.
+                        self.dec_if_boxed(rv, &rvt);
+                        let slot = self.b.create_sized_stack_slot(
+                            cranelift_codegen::ir::StackSlotData::new(
+                                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                                8,
+                                3,
+                            ),
+                        );
+                        let cur = self.b.use_var(rvar);
+                        self.b.ins().stack_store(cur, slot, 0);
+                        let addr = self.b.ins().stack_addr(ptr_ty, slot, 0);
+                        vals.push(addr);
+                        recv_slot = Some((slot, rvar, rvt));
+                    } else {
+                        vals.push(rv);
+                    }
+                    let mut arg_slots: Vec<(cranelift_codegen::ir::StackSlot, Variable, VType)> =
+                        Vec::new();
+                    for (i, (a, want)) in args.iter().zip(params.iter().skip(1)).enumerate() {
+                        if modes.get(i + 1).copied() == Some(ParamMode::Inout) {
+                            let Expr::Ident(aid) = a else {
+                                return nope(
+                                    a.span(),
+                                    "`inout` arguments that aren't plain variables",
+                                );
+                            };
+                            let Some((avar, avt)) = self.lookup(&aid.name) else {
+                                return nope(aid.span, "an unknown `inout` argument");
+                            };
+                            let slot = self.b.create_sized_stack_slot(
+                                cranelift_codegen::ir::StackSlotData::new(
+                                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                                    8,
+                                    3,
+                                ),
+                            );
+                            let cur = self.b.use_var(avar);
+                            self.b.ins().stack_store(cur, slot, 0);
+                            let addr = self.b.ins().stack_addr(ptr_ty, slot, 0);
+                            vals.push(addr);
+                            arg_slots.push((slot, avar, avt));
+                            continue;
+                        }
+                        let (mut v, vt) = self.eval_expr_expecting(a, Some(want))?;
                         if *want == VType::F64 && vt == VType::I64 {
                             v = self.b.ins().fcvt_from_sint(types::F64, v);
                         }
@@ -2143,7 +2336,15 @@ impl FnCx<'_, '_> {
                     }
                     let fref = self.cg.module.declare_func_in_func(fid, self.b.func);
                     let inst = self.b.ins().call(fref, &vals);
-                    let results = self.b.inst_results(inst);
+                    let results: Vec<Value> = self.b.inst_results(inst).to_vec();
+                    if let Some((slot, rvar, rvt)) = recv_slot {
+                        let updated = self.b.ins().stack_load(rvt.cl(), slot, 0);
+                        self.b.def_var(rvar, updated);
+                    }
+                    for (slot, avar, avt) in arg_slots {
+                        let updated = self.b.ins().stack_load(avt.cl(), slot, 0);
+                        self.b.def_var(avar, updated);
+                    }
                     return Ok(if ret == VType::Unit {
                         None
                     } else {
@@ -2172,19 +2373,22 @@ impl FnCx<'_, '_> {
         match op {
             BinaryOp::And => {
                 self.b.ins().brif(lv, rhs_blk, &[], merge, &[lv]);
+                self.filled = true;
             }
             BinaryOp::Or => {
                 self.b.ins().brif(lv, merge, &[lv], rhs_blk, &[]);
+                self.filled = true;
             }
             _ => unreachable!(),
         }
-        self.b.switch_to_block(rhs_blk);
+        self.goto_block(rhs_blk);
         let (rv, rt) = self.eval_expr_val(rhs)?;
         if rt != VType::Bool {
             return nope(rhs.span(), "non-bool logic operand");
         }
         self.b.ins().jump(merge, &[rv]);
-        self.b.switch_to_block(merge);
+        self.filled = true;
+        self.goto_block(merge);
         let out = self.b.block_params(merge)[0];
         Ok(Some((out, VType::Bool)))
     }
@@ -2326,10 +2530,12 @@ impl FnCx<'_, '_> {
         let ok_blk = self.b.create_block();
         let bad_blk = self.b.create_block();
         self.b.ins().brif(divisor, ok_blk, &[], bad_blk, &[]);
-        self.b.switch_to_block(bad_blk);
+        self.filled = true;
+        self.goto_block(bad_blk);
         self.call_rt(panic_fn, &[]);
         self.trap_here();
-        self.b.switch_to_block(ok_blk);
+        self.filled = true;
+        self.goto_block(ok_blk);
     }
 
     fn eval_if(
@@ -2337,7 +2543,6 @@ impl FnCx<'_, '_> {
         cond: &Expr,
         then_block: &grasm_syntax::ast::Block,
         else_branch: Option<&ElseBranch>,
-        span: Span,
     ) -> CResult<Option<(Value, VType)>> {
         let (c, ct) = self.eval_expr_val(cond)?;
         if ct != VType::Bool {
@@ -2347,9 +2552,11 @@ impl FnCx<'_, '_> {
         let else_blk = self.b.create_block();
         let merge = self.b.create_block();
         self.b.ins().brif(c, then_blk, &[], else_blk, &[]);
+        self.filled = true;
 
-        self.b.switch_to_block(then_blk);
-        let (then_val, then_term) = self.eval_block_inner(then_block)?;
+        self.goto_block(then_blk);
+        let (then_val, mut then_term) = self.eval_block_inner(then_block)?;
+        then_term |= self.is_filled();
 
         let mut merge_ty: Option<VType> = None;
         if let (Some((_, vt)), Some(_)) = (&then_val, &else_branch) {
@@ -2365,6 +2572,16 @@ impl FnCx<'_, '_> {
                 (Some(_), Some((v, _))) => {
                     let v = *v;
                     self.b.ins().jump(merge, &[v]);
+                    self.filled = true;
+                }
+                (Some(want), None) => {
+                    let z = match want {
+                        VType::F64 => self.b.ins().f64const(0.0),
+                        VType::Bool => self.b.ins().iconst(types::I8, 0),
+                        other => self.b.ins().iconst(other.cl(), 0),
+                    };
+                    self.b.ins().jump(merge, &[z]);
+                    self.filled = true;
                 }
                 _ => {
                     // Unused boxed then-value must be released.
@@ -2376,11 +2593,12 @@ impl FnCx<'_, '_> {
                         }
                     }
                     self.b.ins().jump(merge, &[]);
+                    self.filled = true;
                 }
             }
         }
 
-        self.b.switch_to_block(else_blk);
+        self.goto_block(else_blk);
         let mut else_term = false;
         let mut else_val: Option<(Value, VType)> = None;
         match else_branch {
@@ -2394,6 +2612,7 @@ impl FnCx<'_, '_> {
             }
             None => {}
         }
+        else_term |= self.is_filled();
         if !else_term {
             match (&merge_ty, &else_val) {
                 (Some(want), Some((v, vt))) => {
@@ -2402,9 +2621,19 @@ impl FnCx<'_, '_> {
                         v = self.b.ins().fcvt_from_sint(types::F64, v);
                     }
                     self.b.ins().jump(merge, &[v]);
+                    self.filled = true;
                 }
-                (Some(_), None) => {
-                    return nope(span, "if-expressions with a valueless else branch");
+                (Some(want), None) => {
+                    // The branch diverged (`fail(..)`, `panic(..)`). Feed the
+                    // merge a placeholder so the CFG stays well-formed; the
+                    // value is unreachable.
+                    let z = match want {
+                        VType::F64 => self.b.ins().f64const(0.0),
+                        VType::Bool => self.b.ins().iconst(types::I8, 0),
+                        other => self.b.ins().iconst(other.cl(), 0),
+                    };
+                    self.b.ins().jump(merge, &[z]);
+                    self.filled = true;
                 }
                 _ => {
                     if let Some((v, vt)) = &else_val {
@@ -2415,11 +2644,12 @@ impl FnCx<'_, '_> {
                         }
                     }
                     self.b.ins().jump(merge, &[]);
+                    self.filled = true;
                 }
             }
         }
 
-        self.b.switch_to_block(merge);
+        self.goto_block(merge);
         if let Some(vt) = merge_ty {
             let out = self.b.block_params(merge)[0];
             Ok(Some((out, vt)))
@@ -2466,8 +2696,9 @@ impl FnCx<'_, '_> {
                         let (p, l) = self.str_ptr_len(t);
                         self.call_rt("grasm_panic_msg", &[p, l]);
                         self.trap_here();
+                        self.filled = true;
                         let dead = self.b.create_block();
-                        self.b.switch_to_block(dead);
+                        self.goto_block(dead);
                         return Ok(None);
                     }
                 }
@@ -2516,8 +2747,9 @@ impl FnCx<'_, '_> {
                 let wrapped = self.call_rt("grasm_err_new", &[ev]).unwrap();
                 self.emit_scope_decs_all();
                 self.b.ins().return_(&[wrapped]);
+                self.filled = true;
                 let dead = self.b.create_block();
-                self.b.switch_to_block(dead);
+                self.goto_block(dead);
                 // fail() has bottom type; produce a dummy unit.
                 return Ok(None);
             }
@@ -2573,7 +2805,7 @@ impl FnCx<'_, '_> {
                 inout_args.push((i, slot, var, vt));
                 continue;
             }
-            let (mut v, vt) = self.eval_expr_val(a)?;
+            let (mut v, vt) = self.eval_expr_expecting(a, Some(want))?;
             if *want == VType::F64 && vt == VType::I64 {
                 v = self.b.ins().fcvt_from_sint(types::F64, v);
             }
@@ -2598,10 +2830,12 @@ impl FnCx<'_, '_> {
         let ok_blk = self.b.create_block();
         let bad_blk = self.b.create_block();
         self.b.ins().brif(c, ok_blk, &[], bad_blk, &[]);
-        self.b.switch_to_block(bad_blk);
+        self.filled = true;
+        self.goto_block(bad_blk);
         self.call_rt("grasm_panic_assert", &[]);
         self.trap_here();
-        self.b.switch_to_block(ok_blk);
+        self.filled = true;
+        self.goto_block(ok_blk);
     }
 
     fn lower_print(&mut self, arg: &Expr) -> CResult<()> {
@@ -2722,7 +2956,7 @@ impl FnCx<'_, '_> {
         let field_ts = self.variant_field_types(parent, vname, span)?;
         let mut boxed_fields = Vec::with_capacity(args.len());
         for (a, ft) in args.iter().zip(&field_ts) {
-            let (mut av, avt) = self.eval_expr_val(a)?;
+            let (mut av, avt) = self.eval_expr_expecting(a, Some(ft))?;
             if *ft == VType::F64 && avt == VType::I64 {
                 av = self.b.ins().fcvt_from_sint(types::F64, av);
             }
@@ -2747,7 +2981,7 @@ impl FnCx<'_, '_> {
         let sv = self.call_rt("grasm_struct_new", &[np, nl]).unwrap();
         for (fname, fexpr) in fields {
             let ft = self.struct_field_type(&sname, &fname.name, span)?;
-            let (mut fv, fvt) = self.eval_expr_val(fexpr)?;
+            let (mut fv, fvt) = self.eval_expr_expecting(fexpr, Some(&ft))?;
             if ft == VType::F64 && fvt == VType::I64 {
                 fv = self.b.ins().fcvt_from_sint(types::F64, fv);
             }
@@ -2796,8 +3030,9 @@ impl FnCx<'_, '_> {
         let err_blk = self.b.create_block();
         let c = self.call_rt("grasm_is_ok", &[fv]).unwrap();
         self.b.ins().brif(c, ok_blk, &[], err_blk, &[]);
+        self.filled = true;
 
-        self.b.switch_to_block(err_blk);
+        self.goto_block(err_blk);
         let zero = self.b.ins().iconst(types::I64, 0);
         let epay = self.call_rt("grasm_variant_field", &[fv, zero]).unwrap();
         self.call_rt("grasm_val_dec", &[fv]);
@@ -2805,13 +3040,15 @@ impl FnCx<'_, '_> {
         self.emit_scope_decs_all();
         if matches!(self.ret, VType::Fallible(_)) {
             self.b.ins().return_(&[wrapped]);
+                self.filled = true;
         } else {
             // Checker prevents this; guard anyway.
             self.call_rt("grasm_report_main_err", &[wrapped]);
             self.trap_here();
+            self.filled = true;
         }
 
-        self.b.switch_to_block(ok_blk);
+        self.goto_block(ok_blk);
         let zero2 = self.b.ins().iconst(types::I64, 0);
         let payload = self.call_rt("grasm_variant_field", &[fv, zero2]).unwrap();
         self.call_rt("grasm_val_dec", &[fv]);
@@ -2830,7 +3067,7 @@ impl FnCx<'_, '_> {
         let VType::Option(payload_t) = lt else {
             return nope(span, "?? on non-Option values");
         };
-        self.coalesce_values(lv, &payload_t, rhs, span)
+        self.coalesce_values(lv, &payload_t, rhs)
     }
 
     /// Shared by `??` and `unwrap_or`: consumes the owned Option `lv`.
@@ -2839,7 +3076,6 @@ impl FnCx<'_, '_> {
         lv: Value,
         payload_t: &VType,
         rhs: &Expr,
-        _span: Span,
     ) -> CResult<(Value, VType)> {
         // Determine result type: payload type, or the rhs type if unknown.
         let mut out_t = payload_t.clone();
@@ -2855,23 +3091,26 @@ impl FnCx<'_, '_> {
         let (sp, sl) = self.str_ptr_len("Some");
         let c = self.call_rt("grasm_variant_is", &[lv, sp, sl]).unwrap();
         self.b.ins().brif(c, some_blk, &[], none_blk, &[]);
+        self.filled = true;
 
-        self.b.switch_to_block(some_blk);
+        self.goto_block(some_blk);
         let zero = self.b.ins().iconst(types::I64, 0);
         let payload = self.call_rt("grasm_variant_field", &[lv, zero]).unwrap();
         self.call_rt("grasm_val_dec", &[lv]);
         let (v, _) = self.unbox(payload, &out_t)?;
         self.b.ins().jump(merge, &[v]);
+        self.filled = true;
 
-        self.b.switch_to_block(none_blk);
+        self.goto_block(none_blk);
         self.call_rt("grasm_val_dec", &[lv]);
         let (mut rv, rvt) = self.eval_expr_val(rhs)?;
         if out_t == VType::F64 && rvt == VType::I64 {
             rv = self.b.ins().fcvt_from_sint(types::F64, rv);
         }
         self.b.ins().jump(merge, &[rv]);
+        self.filled = true;
 
-        self.b.switch_to_block(merge);
+        self.goto_block(merge);
         let out = self.b.block_params(merge)[0];
         Ok((out, out_t))
     }
@@ -2923,6 +3162,11 @@ impl FnCx<'_, '_> {
                         self.sum_vtype(&parent)
                     } else if id.name == "None" {
                         VType::Option(Box::new(VType::Any))
+                    } else if self.lookup_fn(&id.name).is_some() {
+                        return nope(
+                            id.span,
+                            "function values (passing a function as data)",
+                        );
                     } else {
                         return nope(id.span, "inferring this type");
                     }
@@ -2942,6 +3186,13 @@ impl FnCx<'_, '_> {
                     }
                 }
                 return nope(e.span(), "inferring this type");
+            }
+            Expr::Tuple(items, _) => {
+                let mut ts = Vec::with_capacity(items.len());
+                for i in items {
+                    ts.push(self.probe_type(i)?);
+                }
+                VType::Tuple(ts)
             }
             Expr::StructLit { name, .. } => VType::Struct(name.segments[0].name.clone()),
             Expr::Field { recv, name, span } => {
@@ -3060,11 +3311,32 @@ impl FnCx<'_, '_> {
                 None
             };
             self.pop_scope_no_decs();
-            if let Some(t) = probed {
-                if t != VType::Unit {
+            match probed {
+                Some(t) if t != VType::Unit => {
                     out_t = Some(t);
+                    break;
                 }
-                break;
+                // An arm that yields nothing (e.g. `-> print(..)`) makes this
+                // a statement match: no merge parameter, no value.
+                Some(_) => {
+                    out_t = None;
+                    break;
+                }
+                None => continue,
+            }
+        }
+        // A value-match needs EVERY arm to yield a value; if any arm is a bare
+        // statement call, fall back to statement form.
+        if out_t.is_some() {
+            for arm in arms {
+                if matches!(&arm.body, Expr::Call { callee, .. }
+                    if matches!(&**callee, Expr::Ident(id)
+                        if id.name == "print" || id.name == "assert"
+                            || id.name == "assert_eq"))
+                {
+                    out_t = None;
+                    break;
+                }
             }
         }
         if let Some(t) = &out_t {
@@ -3073,9 +3345,10 @@ impl FnCx<'_, '_> {
 
         let mut next_test = self.b.create_block();
         self.b.ins().jump(next_test, &[]);
+        self.filled = true;
 
         for (ai, arm) in arms.iter().enumerate() {
-            self.b.switch_to_block(next_test);
+            self.goto_block(next_test);
             next_test = self.b.create_block();
             let body_blk = self.b.create_block();
             let is_last = ai + 1 == arms.len();
@@ -3085,7 +3358,7 @@ impl FnCx<'_, '_> {
             let matched = self.lower_pattern_test(&arm.pattern, svar, &st, body_blk, next_test)?;
             let _ = matched;
 
-            self.b.switch_to_block(body_blk);
+            self.goto_block(body_blk);
             if let Some(guard) = &arm.guard {
                 let (gv, gt) = self.eval_expr_val(guard)?;
                 if gt != VType::Bool {
@@ -3095,15 +3368,16 @@ impl FnCx<'_, '_> {
                 // Guard false: release binds, try next arm.
                 let cleanup = self.b.create_block();
                 self.b.ins().brif(gv, cont_blk, &[], cleanup, &[]);
-                self.b.switch_to_block(cleanup);
+                self.filled = true;
+                self.goto_block(cleanup);
                 self.release_current_scope_binds();
                 self.b.ins().jump(next_test, &[]);
-                self.b.switch_to_block(cont_blk);
+                self.filled = true;
+                self.goto_block(cont_blk);
             }
-            let (bv, bterm) = match self.eval_expr(&arm.body)? {
-                Some(v) => (Some(v), false),
-                None => (None, false),
-            };
+            let bv = self.eval_expr(&arm.body)?;
+            // An arm body may itself terminate (`-> break`, `-> return x`).
+            let bterm = self.is_filled();
             if !bterm {
                 match (&out_t, bv) {
                     (Some(want), Some((mut v, vt))) => {
@@ -3112,6 +3386,7 @@ impl FnCx<'_, '_> {
                         }
                         self.pop_scope_with_decs();
                         self.b.ins().jump(merge, &[v]);
+                        self.filled = true;
                     }
                     (None, maybe) => {
                         if let Some((v, vt)) = maybe {
@@ -3119,9 +3394,19 @@ impl FnCx<'_, '_> {
                         }
                         self.pop_scope_with_decs();
                         self.b.ins().jump(merge, &[]);
+                        self.filled = true;
                     }
-                    (Some(_), None) => {
-                        return nope(arm.span, "this arm producing no value");
+                    (Some(want), None) => {
+                        // Defensive: emit a zero of the merge type so the CFG
+                        // stays well-formed (checker rejects real mismatches).
+                        let z = match want {
+                            VType::F64 => self.b.ins().f64const(0.0),
+                            VType::Bool => self.b.ins().iconst(types::I8, 0),
+                            other => self.b.ins().iconst(other.cl(), 0),
+                        };
+                        self.pop_scope_with_decs();
+                        self.b.ins().jump(merge, &[z]);
+                        self.filled = true;
                     }
                 }
             } else {
@@ -3130,13 +3415,14 @@ impl FnCx<'_, '_> {
 
             if is_last {
                 // Exhaustive per checker: the final next_test is unreachable.
-                self.b.switch_to_block(next_test);
+                self.goto_block(next_test);
                 self.call_rt("grasm_panic_assert", &[]);
                 self.trap_here();
+                self.filled = true;
             }
         }
 
-        self.b.switch_to_block(merge);
+        self.goto_block(merge);
         // Release the scrutinee.
         if st.boxed() {
             let sv2 = self.b.use_var(svar);
@@ -3165,6 +3451,181 @@ impl FnCx<'_, '_> {
         }
     }
 
+    /// Splits a place expression into its root variable and access path.
+    fn place_path<'e>(&mut self, e: &'e Expr) -> CResult<(&'e Ident, Vec<PlaceSeg<'e>>)> {
+        let mut segs: Vec<PlaceSeg<'e>> = Vec::new();
+        let mut cur = e;
+        loop {
+            match cur {
+                Expr::Field { recv, name, .. } => {
+                    segs.push(PlaceSeg::Field(&name.name));
+                    cur = recv;
+                }
+                Expr::Index { recv, index, .. } => {
+                    segs.push(PlaceSeg::Index(index));
+                    cur = recv;
+                }
+                Expr::Ident(id) => {
+                    segs.reverse();
+                    return Ok((id, segs));
+                }
+                other => return nope(other.span(), "this assignment target"),
+            }
+        }
+    }
+
+    /// Static type of the value a place path designates.
+    fn place_type(&mut self, root_t: &VType, path: &[PlaceSeg<'_>], span: Span) -> CResult<VType> {
+        let mut t = root_t.clone();
+        for seg in path {
+            t = match (&t, seg) {
+                (VType::Struct(sname), PlaceSeg::Field(f)) => {
+                    let sname = sname.clone();
+                    self.struct_field_type(&sname, f, span)?
+                }
+                (VType::List(e), PlaceSeg::Index(_)) => (**e).clone(),
+                _ => return nope(span, "this assignment target's shape"),
+            };
+        }
+        Ok(t)
+    }
+
+    /// Reads the (boxed-then-unboxed) value at a place, for compound assigns.
+    fn read_place(
+        &mut self,
+        root: Value,
+        path: &[PlaceSeg<'_>],
+        root_t: &VType,
+        elem_t: &VType,
+    ) -> CResult<Value> {
+        let mut cur = root;
+        let mut cur_t = root_t.clone();
+        // Intermediate reads borrow; only the final read is unboxed.
+        for (i, seg) in path.iter().enumerate() {
+            let is_last = i + 1 == path.len();
+            let boxed = match (&cur_t, seg) {
+                (VType::Struct(sname), PlaceSeg::Field(f)) => {
+                    let sname = sname.clone();
+                    let ft = self.struct_field_type(&sname, f, Span::new(0, 1))?;
+                    let (fp, fl) = self.str_ptr_len(f);
+                    let v = self.call_rt("grasm_struct_get", &[cur, fp, fl]).unwrap();
+                    cur_t = ft;
+                    v
+                }
+                (VType::List(e), PlaceSeg::Index(ix)) => {
+                    let et = (**e).clone();
+                    let (iv, _) = self.eval_expr_val(ix)?;
+                    let v = self.call_rt("grasm_list_get", &[cur, iv]).unwrap();
+                    cur_t = et;
+                    v
+                }
+                _ => return nope(Span::new(0, 1), "this assignment target's shape"),
+            };
+            if is_last {
+                let (v, _) = self.unbox(boxed, elem_t)?;
+                return Ok(v);
+            }
+            cur = boxed;
+        }
+        nope(Span::new(0, 1), "an empty assignment path")
+    }
+
+    /// Reads a place without unboxing the final value (for container places).
+    fn read_place_boxed(
+        &mut self,
+        root: Value,
+        path: &[PlaceSeg<'_>],
+        root_t: &VType,
+    ) -> CResult<Value> {
+        let mut cur = root;
+        let mut cur_t = root_t.clone();
+        for seg in path {
+            match (&cur_t, seg) {
+                (VType::Struct(sname), PlaceSeg::Field(f)) => {
+                    let sname = sname.clone();
+                    let ft = self.struct_field_type(&sname, f, Span::new(0, 1))?;
+                    let (fp, fl) = self.str_ptr_len(f);
+                    cur = self.call_rt("grasm_struct_get", &[cur, fp, fl]).unwrap();
+                    cur_t = ft;
+                }
+                (VType::List(e), PlaceSeg::Index(ix)) => {
+                    let et = (**e).clone();
+                    let (iv, _) = self.eval_expr_val(ix)?;
+                    cur = self.call_rt("grasm_list_get", &[cur, iv]).unwrap();
+                    cur_t = et;
+                }
+                _ => return nope(Span::new(0, 1), "this place's shape"),
+            }
+        }
+        Ok(cur)
+    }
+
+    /// Writes `boxed_val` at the place, rebuilding containers copy-on-write.
+    /// Returns the (possibly new) root value.
+    fn write_place(
+        &mut self,
+        root: Value,
+        path: &[PlaceSeg<'_>],
+        root_t: &VType,
+        boxed_val: Value,
+    ) -> CResult<Value> {
+        match path.split_first() {
+            None => Ok(boxed_val),
+            Some((seg, [])) => match (root_t, seg) {
+                (VType::Struct(_), PlaceSeg::Field(f)) => {
+                    let (fp, fl) = self.str_ptr_len(f);
+                    Ok(self
+                        .call_rt("grasm_struct_set_field", &[root, fp, fl, boxed_val])
+                        .unwrap())
+                }
+                (VType::List(_), PlaceSeg::Index(ix)) => {
+                    let (iv, _) = self.eval_expr_val(ix)?;
+                    Ok(self
+                        .call_rt("grasm_list_set", &[root, iv, boxed_val])
+                        .unwrap())
+                }
+                _ => nope(Span::new(0, 1), "this assignment target's shape"),
+            },
+            Some((seg, rest)) => {
+                // Descend: read the child, recurse, then write it back.
+                let (child, child_t, writeback): (Value, VType, PlaceSeg<'_>) =
+                    match (root_t, seg) {
+                        (VType::Struct(sname), PlaceSeg::Field(f)) => {
+                            let sname = sname.clone();
+                            let ft = self.struct_field_type(&sname, f, Span::new(0, 1))?;
+                            let (fp, fl) = self.str_ptr_len(f);
+                            let c = self.call_rt("grasm_struct_get", &[root, fp, fl]).unwrap();
+                            (c, ft, PlaceSeg::Field(f))
+                        }
+                        (VType::List(e), PlaceSeg::Index(ix)) => {
+                            let et = (**e).clone();
+                            let (iv, _) = self.eval_expr_val(ix)?;
+                            let c = self.call_rt("grasm_list_get", &[root, iv]).unwrap();
+                            let _ = iv;
+                            (c, et, PlaceSeg::Index(ix))
+                        }
+                        _ => return nope(Span::new(0, 1), "this assignment target's shape"),
+                    };
+                let new_child = self.write_place(child, rest, &child_t, boxed_val)?;
+                match (root_t, writeback) {
+                    (VType::Struct(_), PlaceSeg::Field(f)) => {
+                        let (fp, fl) = self.str_ptr_len(f);
+                        Ok(self
+                            .call_rt("grasm_struct_set_field", &[root, fp, fl, new_child])
+                            .unwrap())
+                    }
+                    (VType::List(_), PlaceSeg::Index(ix)) => {
+                        let (iv, _) = self.eval_expr_val(ix)?;
+                        Ok(self
+                            .call_rt("grasm_list_set", &[root, iv, new_child])
+                            .unwrap())
+                    }
+                    _ => nope(Span::new(0, 1), "this assignment target's shape"),
+                }
+            }
+        }
+    }
+
     /// Inlines `list.map(|x| body)` / `list.filter(|x| body)` as a loop.
     /// Consumes the owned `list`; returns (new list value, its type).
     fn emit_list_transform(
@@ -3189,15 +3650,17 @@ impl FnCx<'_, '_> {
         let step = self.b.create_block();
         let exit = self.b.create_block();
         self.b.ins().jump(header, &[]);
+        self.filled = true;
 
-        self.b.switch_to_block(header);
+        self.goto_block(header);
         let lv = self.b.use_var(list_var);
         let len = self.call_rt("grasm_list_len", &[lv]).unwrap();
         let iv = self.b.use_var(ivar);
         let c = self.b.ins().icmp(IntCC::SignedLessThan, iv, len);
         self.b.ins().brif(c, body_blk, &[], exit, &[]);
+        self.filled = true;
 
-        self.b.switch_to_block(body_blk);
+        self.goto_block(body_blk);
         let lv2 = self.b.use_var(list_var);
         let iv2 = self.b.use_var(ivar);
         let boxed = self.call_rt("grasm_list_get", &[lv2, iv2]).unwrap();
@@ -3215,6 +3678,7 @@ impl FnCx<'_, '_> {
             self.b.def_var(out_var, np);
             self.pop_scope_with_decs();
             self.b.ins().jump(step, &[]);
+            self.filled = true;
         } else {
             if bvt != VType::Bool {
                 return nope(body.span(), "a non-bool filter predicate");
@@ -3222,7 +3686,8 @@ impl FnCx<'_, '_> {
             let keep = self.b.create_block();
             let skip = self.b.create_block();
             self.b.ins().brif(bv, keep, &[], skip, &[]);
-            self.b.switch_to_block(keep);
+            self.filled = true;
+            self.goto_block(keep);
             let e2 = self.b.use_var(evar);
             if evt.boxed() {
                 self.call_rt("grasm_val_inc", &[e2]);
@@ -3232,19 +3697,22 @@ impl FnCx<'_, '_> {
             let np = self.call_rt("grasm_list_push", &[cur, bx]).unwrap();
             self.b.def_var(out_var, np);
             self.b.ins().jump(skip, &[]);
-            self.b.switch_to_block(skip);
+            self.filled = true;
+            self.goto_block(skip);
             self.pop_scope_with_decs();
             self.b.ins().jump(step, &[]);
+            self.filled = true;
         }
 
-        self.b.switch_to_block(step);
+        self.goto_block(step);
         let iv3 = self.b.use_var(ivar);
         let one = self.b.ins().iconst(types::I64, 1);
         let next = self.b.ins().iadd(iv3, one);
         self.b.def_var(ivar, next);
         self.b.ins().jump(header, &[]);
+        self.filled = true;
 
-        self.b.switch_to_block(exit);
+        self.goto_block(exit);
         let lv3 = self.b.use_var(list_var);
         self.call_rt("grasm_val_dec", &[lv3]);
         let out = self.b.use_var(out_var);
@@ -3296,7 +3764,15 @@ impl FnCx<'_, '_> {
                 }
                 Ok(())
             }
-            Pattern::Tuple(_, span) => nope(*span, "tuple patterns"),
+            Pattern::Tuple(items, span) => {
+                let VType::Tuple(elem_ts) = st.clone() else {
+                    return nope(*span, "tuple patterns on this type");
+                };
+                for (p, t) in items.iter().zip(&elem_ts) {
+                    self.bind_pattern_types(p, t)?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -3313,6 +3789,7 @@ impl FnCx<'_, '_> {
         match pat {
             Pattern::Wildcard(_) => {
                 self.b.ins().jump(body_blk, &[]);
+                self.filled = true;
                 Ok(true)
             }
             Pattern::Bind(id) => {
@@ -3322,6 +3799,7 @@ impl FnCx<'_, '_> {
                     let (vp, vl) = self.str_ptr_len(&id.name);
                     let c = self.call_rt("grasm_variant_is", &[sv, vp, vl]).unwrap();
                     self.b.ins().brif(c, body_blk, &[], next_test, &[]);
+                    self.filled = true;
                     return Ok(true);
                 }
                 if id.name == "None" {
@@ -3329,6 +3807,7 @@ impl FnCx<'_, '_> {
                     let (vp, vl) = self.str_ptr_len("None");
                     let c = self.call_rt("grasm_variant_is", &[sv, vp, vl]).unwrap();
                     self.b.ins().brif(c, body_blk, &[], next_test, &[]);
+                    self.filled = true;
                     return Ok(true);
                 }
                 let sv = self.b.use_var(svar);
@@ -3339,6 +3818,7 @@ impl FnCx<'_, '_> {
                 self.b.def_var(var, sv);
                 self.bind(&id.name, var, st.clone());
                 self.b.ins().jump(body_blk, &[]);
+                self.filled = true;
                 Ok(true)
             }
             Pattern::Int(want, _) => {
@@ -3346,6 +3826,7 @@ impl FnCx<'_, '_> {
                 let w = self.b.ins().iconst(types::I64, *want);
                 let c = self.b.ins().icmp(IntCC::Equal, sv, w);
                 self.b.ins().brif(c, body_blk, &[], next_test, &[]);
+                self.filled = true;
                 Ok(true)
             }
             Pattern::Bool(want, _) => {
@@ -3353,6 +3834,7 @@ impl FnCx<'_, '_> {
                 let w = self.b.ins().iconst(types::I8, i64::from(*want));
                 let c = self.b.ins().icmp(IntCC::Equal, sv, w);
                 self.b.ins().brif(c, body_blk, &[], next_test, &[]);
+                self.filled = true;
                 Ok(true)
             }
             Pattern::Str(want, _) => {
@@ -3362,6 +3844,7 @@ impl FnCx<'_, '_> {
                 let c = self.call_rt("grasm_str_eq", &[sv, lit]).unwrap();
                 self.call_rt("grasm_val_dec", &[lit]);
                 self.b.ins().brif(c, body_blk, &[], next_test, &[]);
+                self.filled = true;
                 Ok(true)
             }
             Pattern::Variant { path, fields, span } => {
@@ -3371,7 +3854,8 @@ impl FnCx<'_, '_> {
                 let c = self.call_rt("grasm_variant_is", &[sv, vp, vl]).unwrap();
                 let bind_blk = self.b.create_block();
                 self.b.ins().brif(c, bind_blk, &[], next_test, &[]);
-                self.b.switch_to_block(bind_blk);
+                self.filled = true;
+                self.goto_block(bind_blk);
                 // Field types by scrutinee static type.
                 let field_ts: Vec<VType> = match st {
                     VType::Option(p) => {
@@ -3423,14 +3907,51 @@ impl FnCx<'_, '_> {
                             self.b.def_var(fvar, fv);
                             let cont = self.b.create_block();
                             self.lower_pattern_test(nested, fvar, &fvt, cont, next_test)?;
-                            self.b.switch_to_block(cont);
+                            self.goto_block(cont);
                         }
                     }
                 }
                 self.b.ins().jump(body_blk, &[]);
+                self.filled = true;
                 Ok(true)
             }
-            Pattern::Tuple(_, span) => nope(*span, "tuple patterns"),
+            Pattern::Tuple(items, span) => {
+                let VType::Tuple(elem_ts) = st.clone() else {
+                    return nope(*span, "tuple patterns on this type");
+                };
+                if items.len() != elem_ts.len() {
+                    return nope(*span, "a tuple pattern of the wrong arity");
+                }
+                if items.is_empty() {
+                    self.b.ins().jump(body_blk, &[]);
+                    self.filled = true;
+                    return Ok(true);
+                }
+                // Bind each element to a temp, then chain the sub-tests.
+                let mut chain: Vec<(Variable, VType, &Pattern)> = Vec::new();
+                for (i, (pat_i, t_i)) in items.iter().zip(&elem_ts).enumerate() {
+                    let sv = self.b.use_var(svar);
+                    let idx = self.b.ins().iconst(types::I64, i as i64);
+                    let boxed = self.call_rt("grasm_list_get", &[sv, idx]).unwrap();
+                    let (v, vt) = self.unbox(boxed, t_i)?;
+                    let var = self.new_var(&vt);
+                    self.b.def_var(var, v);
+                    chain.push((var, vt, pat_i));
+                }
+                let n = chain.len();
+                for (k, (var, vt, pat_i)) in chain.into_iter().enumerate() {
+                    let cont = if k + 1 == n {
+                        body_blk
+                    } else {
+                        self.b.create_block()
+                    };
+                    self.lower_pattern_test(pat_i, var, &vt, cont, next_test)?;
+                    if k + 1 < n {
+                        self.goto_block(cont);
+                    }
+                }
+                Ok(true)
+            }
         }
     }
 }

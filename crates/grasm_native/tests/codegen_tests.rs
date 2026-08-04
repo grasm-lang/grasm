@@ -41,9 +41,11 @@ fn unsupported_features_reported_cleanly() {
     let e = compile("fn main() {\n    let f = |x| x\n    print(\"{f(1)}\")\n}\n")
         .expect_err("closures unsupported yet");
     assert!(e.contains("does not yet support"), "got: {e}");
-    let e2 = compile("fn main() {\n    let t = (1, 2)\n    print(\"{t}\")\n}\n")
-        .expect_err("tuples unsupported yet");
-    assert!(e2.contains("does not yet support"), "got: {e2}");
+    let e2 = compile(
+        "fn twice(x: i64) -> i64 {\n    x * 2\n}\n\nfn main() {\n    let fs = [twice]\n    print(\"{fs.len()}\")\n}\n",
+    )
+    .expect_err("function values unsupported yet");
+    assert!(e2.contains("function values"), "got: {e2}");
 }
 
 #[test]

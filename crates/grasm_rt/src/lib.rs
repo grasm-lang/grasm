@@ -1423,3 +1423,19 @@ pub unsafe extern "C" fn grasm_write_file(path: *mut RtVal, content: *mut RtVal)
 pub unsafe extern "C" fn grasm_file_exists(path: *mut RtVal) -> i8 {
     i8::from(std::path::Path::new(as_str(path)).exists())
 }
+
+/// `xs[i] = v` honoring copy-on-write; `val` ownership transfers.
+/// Returns the (possibly new) list.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_list_set(v: *mut RtVal, i: i64, val: *mut RtVal) -> *mut RtVal {
+    let target = cow_list(v);
+    let RtPayload::List(items) = &mut (*target).payload else {
+        unreachable!()
+    };
+    if i < 0 || i as usize >= items.len() {
+        rt_panic(&format!("index {i} out of bounds (len {})", items.len()));
+    }
+    dec(items[i as usize]);
+    items[i as usize] = val;
+    target
+}
