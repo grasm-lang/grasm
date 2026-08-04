@@ -25,6 +25,9 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   harness that verifies answers before reporting timings.
 - **Project documents.** LICENSE (Apache-2.0), NOTICE, CONTRIBUTING,
   GOVERNANCE, SECURITY, CODE_OF_CONDUCT, and this file.
+- **`grasm deps --locked`** fails when anything differs from `grasm.lock`,
+  including a widened capability ceiling, which is reported separately from a
+  content change.
 
 ### Fixed
 
@@ -39,6 +42,8 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   token `parse_decl` had rejected. Recovery now always consumes something.
 - `pad_start` / `pad_end` silently used only a multi-character fill's first
   character, and substituted a space for an empty fill.
+- The lockfile reader collapsed `[[package]]` into a single table, so
+  verification compared one package and ignored the rest.
 
 ### Changed
 

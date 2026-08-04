@@ -48,6 +48,7 @@ grasm fmt <file.gr> [--check]    # canonical indentation (comment-safe)
 grasm lsp                        # language server (stdio)
 grasm dap                        # debug adapter (stdio) — breakpoints, stepping
 grasm deps [dir]                 # resolve deps, check capabilities, write grasm.lock
+        --locked                 # fail if anything changed since grasm.lock (CI)
 grasm tokens <file.gr>           # lexer debug dump
 ```
 

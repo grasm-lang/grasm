@@ -352,29 +352,112 @@ pub fn render_lock(entries: &[LockEntry]) -> String {
     out
 }
 
-/// Compares a fresh lock against one on disk, reporting packages whose
-/// contents changed since it was written.
-pub fn diff_lock(previous: &str, current: &[LockEntry]) -> Vec<String> {
-    let Ok(doc) = toml::parse(previous) else {
-        return vec!["existing lockfile is unreadable and will be rewritten".into()];
-    };
-    // `[[package]]` arrays collapse into one table with our simple reader, so
-    // compare on the set of checksums we can recover instead.
-    let mut recorded: BTreeMap<String, String> = BTreeMap::new();
-    if let Some(t) = doc.table("[package]") {
-        if let (Some(n), Some(c)) = (
-            t.get("name").and_then(|v| v.as_str()),
-            t.get("checksum").and_then(|v| v.as_str()),
-        ) {
-            recorded.insert(n.to_string(), c.to_string());
+/// How a lockfile on disk differs from what the source tree now hashes to.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LockChange {
+    /// A package's sources changed since the lockfile was written. This is the
+    /// case a lockfile exists to catch: a dependency that is not what it was.
+    Changed { name: String, was: String, now: String },
+    /// A package the lockfile does not mention.
+    Added(String),
+    /// A package the lockfile mentions that is no longer in the graph.
+    Removed(String),
+    /// A package's declared capability ceiling changed — the security-relevant
+    /// change, reported separately from a content change.
+    CapabilitiesChanged {
+        name: String,
+        was: Vec<String>,
+        now: Vec<String>,
+    },
+    Unreadable,
+}
+
+impl std::fmt::Display for LockChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LockChange::Changed { name, was, now } => write!(
+                f,
+                "`{name}` contents changed since the lockfile ({}… → {}…)",
+                &was[..was.len().min(12)],
+                &now[..now.len().min(12)]
+            ),
+            LockChange::Added(name) => write!(f, "`{name}` is not in the lockfile"),
+            LockChange::Removed(name) => {
+                write!(f, "`{name}` is in the lockfile but no longer a dependency")
+            }
+            LockChange::CapabilitiesChanged { name, was, now } => write!(
+                f,
+                "`{name}` now declares [{}] where the lockfile recorded [{}]",
+                now.join(", "),
+                was.join(", ")
+            ),
+            LockChange::Unreadable => {
+                write!(f, "the existing lockfile is unreadable and will be rewritten")
+            }
         }
     }
+}
+
+/// Parses a lockfile into its recorded entries.
+pub fn parse_lock(text: &str) -> Result<Vec<LockEntry>, String> {
+    let doc = toml::parse(text)?;
+    let mut out = Vec::new();
+    for t in doc.array("package") {
+        let get = |k: &str| t.get(k).and_then(|v| v.as_str()).map(str::to_string);
+        let (Some(name), Some(version), Some(checksum)) =
+            (get("name"), get("version"), get("checksum"))
+        else {
+            return Err("a [[package]] entry is missing name, version, or checksum".into());
+        };
+        let capabilities = t
+            .get("capabilities")
+            .and_then(|v| v.as_str_array())
+            .map(|c| c.into_iter().map(str::to_string).collect())
+            .unwrap_or_default();
+        out.push(LockEntry {
+            name,
+            version,
+            checksum,
+            capabilities,
+        });
+    }
+    Ok(out)
+}
+
+/// Compares a fresh lock against one on disk, reporting packages whose
+pub fn diff_lock(previous: &str, current: &[LockEntry]) -> Vec<LockChange> {
+    let Ok(recorded) = parse_lock(previous) else {
+        return vec![LockChange::Unreadable];
+    };
+    let by_name: BTreeMap<&str, &LockEntry> =
+        recorded.iter().map(|e| (e.name.as_str(), e)).collect();
+
     let mut changes = Vec::new();
     for e in current {
-        if let Some(old) = recorded.get(&e.name) {
-            if old != &e.checksum {
-                changes.push(format!("`{}` contents changed since the lockfile", e.name));
+        match by_name.get(e.name.as_str()) {
+            None => changes.push(LockChange::Added(e.name.clone())),
+            Some(old) => {
+                if old.checksum != e.checksum {
+                    changes.push(LockChange::Changed {
+                        name: e.name.clone(),
+                        was: old.checksum.clone(),
+                        now: e.checksum.clone(),
+                    });
+                }
+                if old.capabilities != e.capabilities {
+                    changes.push(LockChange::CapabilitiesChanged {
+                        name: e.name.clone(),
+                        was: old.capabilities.clone(),
+                        now: e.capabilities.clone(),
+                    });
+                }
             }
+        }
+    }
+    let present: BTreeMap<&str, ()> = current.iter().map(|e| (e.name.as_str(), ())).collect();
+    for e in &recorded {
+        if !present.contains_key(e.name.as_str()) {
+            changes.push(LockChange::Removed(e.name.clone()));
         }
     }
     changes

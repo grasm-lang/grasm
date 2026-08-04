@@ -34,6 +34,11 @@ impl Value {
 #[derive(Debug, Default, Clone)]
 pub struct Doc {
     pub tables: BTreeMap<String, BTreeMap<String, Value>>,
+    /// `[[name]]` arrays of tables, in document order. Kept separate from
+    /// `tables` because each occurrence is its own table — collapsing them
+    /// would silently keep only the last one, which for a lockfile means
+    /// verifying one package and ignoring the rest.
+    pub arrays: BTreeMap<String, Vec<BTreeMap<String, Value>>>,
 }
 
 impl Doc {
@@ -43,6 +48,11 @@ impl Doc {
 
     pub fn table(&self, name: &str) -> Option<&BTreeMap<String, Value>> {
         self.tables.get(name)
+    }
+
+    /// Every occurrence of `[[name]]`, in document order.
+    pub fn array(&self, name: &str) -> &[BTreeMap<String, Value>] {
+        self.arrays.get(name).map(Vec::as_slice).unwrap_or(&[])
     }
 
     /// Sub-tables of `prefix`, as (leaf name, entries).
@@ -55,10 +65,17 @@ impl Doc {
     }
 }
 
+/// Where subsequent `key = value` lines are being collected.
+enum Target {
+    Table(String),
+    /// Index into `Doc::arrays[name]`.
+    ArrayEntry(String, usize),
+}
+
 pub fn parse(src: &str) -> Result<Doc, String> {
     let mut doc = Doc::default();
-    let mut current = String::new();
-    doc.tables.insert(current.clone(), BTreeMap::new());
+    let mut current = Target::Table(String::new());
+    doc.tables.insert(String::new(), BTreeMap::new());
 
     for (lineno, raw) in src.lines().enumerate() {
         let line = strip_comment(raw).trim();
@@ -67,6 +84,21 @@ pub fn parse(src: &str) -> Result<Doc, String> {
         }
         let at = || format!("line {}", lineno + 1);
 
+        // `[[name]]` starts a new entry in an array of tables; `[name]`
+        // starts (or reopens) an ordinary table.
+        if let Some(rest) = line.strip_prefix("[[") {
+            let name = rest
+                .strip_suffix("]]")
+                .ok_or_else(|| format!("{}: unclosed array-of-tables header", at()))?
+                .trim();
+            if name.is_empty() {
+                return Err(format!("{}: empty table name", at()));
+            }
+            let entries = doc.arrays.entry(name.to_string()).or_default();
+            entries.push(BTreeMap::new());
+            current = Target::ArrayEntry(name.to_string(), entries.len() - 1);
+            continue;
+        }
         if let Some(rest) = line.strip_prefix('[') {
             let name = rest
                 .strip_suffix(']')
@@ -75,8 +107,8 @@ pub fn parse(src: &str) -> Result<Doc, String> {
             if name.is_empty() {
                 return Err(format!("{}: empty table name", at()));
             }
-            current = name.to_string();
-            doc.tables.entry(current.clone()).or_default();
+            current = Target::Table(name.to_string());
+            doc.tables.entry(name.to_string()).or_default();
             continue;
         }
 
@@ -88,10 +120,17 @@ pub fn parse(src: &str) -> Result<Doc, String> {
             return Err(format!("{}: empty key", at()));
         }
         let value = parse_value(value.trim()).map_err(|e| format!("{}: {e}", at()))?;
-        doc.tables
-            .entry(current.clone())
-            .or_default()
-            .insert(key, value);
+        match &current {
+            Target::Table(name) => {
+                doc.tables.entry(name.clone()).or_default().insert(key, value);
+            }
+            Target::ArrayEntry(name, i) => {
+                doc.arrays
+                    .get_mut(name)
+                    .expect("array exists once its header was seen")[*i]
+                    .insert(key, value);
+            }
+        }
     }
     Ok(doc)
 }

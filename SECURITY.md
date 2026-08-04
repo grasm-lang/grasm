@@ -20,6 +20,12 @@ the filesystem or opening sockets exceeds its ceiling and fails to build **in
 every consumer** — a compile error, not a runtime surprise, and not something a
 reviewer has to happen to notice.
 
+The claim is tested adversarially rather than asserted: `crates/grasm_pkg`
+hides an `io` effect behind a call chain, inside a closure, behind UFCS, in a
+`test` or `bench` body, inside an effect handler, and inside a spawned task,
+and requires every one to be caught — alongside a genuinely pure package that
+must report nothing, so the suite cannot pass by calling everything `io`.
+
 In scope:
 
 - Any way to perform an effect that the capability check does not see.
@@ -57,6 +63,12 @@ implied:
   compromised toolchain can lie about anything. Lockfile checksums (SHA-256 over
   each package's sorted sources) detect changed dependencies, not a changed
   compiler.
+
+`grasm deps --locked` fails when anything differs from `grasm.lock` — a changed
+checksum, an added or removed package, or a **widened capability ceiling**,
+which is reported separately from a content change because it is the
+security-relevant one. Use it in CI; without it, `grasm deps` accepts the
+changes and rewrites the lockfile.
 
 ## Unsafe code
 

@@ -262,11 +262,13 @@ fn main() -> ExitCode {
             }
         }
         Some("deps") => {
+            let locked = args.iter().any(|a| a == "--locked");
             let dir = args
                 .get(1)
+                .filter(|a| !a.starts_with("--"))
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("."));
-            match cmd_deps(&dir) {
+            match cmd_deps(&dir, locked) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("error: {e}");
@@ -363,6 +365,7 @@ fn main() -> ExitCode {
             eprintln!("  lsp                          language server (stdio)");
             eprintln!("  dap                          debug adapter (stdio) — breakpoints, stepping");
             eprintln!("  deps [dir]                   resolve dependencies, check capabilities, write grasm.lock");
+            eprintln!("      --locked                 fail if anything changed since grasm.lock (CI)");
             eprintln!("  tokens <file.gr>             dump lexer output (debug)");
             eprintln!("  version                      print version");
             ExitCode::FAILURE
@@ -628,7 +631,7 @@ fn build_native(program: &Program, out_path: &str) -> Result<u64, String> {
 
 /// Resolves the dependency graph, enforces each package's capability ceiling,
 /// and writes the lockfile.
-fn cmd_deps(dir: &std::path::Path) -> Result<(), String> {
+fn cmd_deps(dir: &std::path::Path, locked: bool) -> Result<(), String> {
     let resolution = grasm_pkg::resolve(dir)?;
     let root = resolution.root();
 
@@ -682,10 +685,36 @@ or stop it from performing the effect"
 
     let entries = grasm_pkg::build_lock(&resolution)?;
     let lock_path = dir.join(grasm_pkg::LOCKFILE_NAME);
-    if let Ok(previous) = std::fs::read_to_string(&lock_path) {
-        for change in grasm_pkg::diff_lock(&previous, &entries) {
-            println!("  note: {change}");
+    let changes = match std::fs::read_to_string(&lock_path) {
+        Ok(previous) => grasm_pkg::diff_lock(&previous, &entries),
+        Err(_) => Vec::new(),
+    };
+
+    if locked {
+        // CI mode: a dependency that is not what the lockfile recorded is the
+        // case the lockfile exists to catch, so it fails rather than being
+        // silently rewritten into agreement.
+        if !changes.is_empty() {
+            for c in &changes {
+                eprintln!("error: {c}");
+            }
+            eprintln!(
+                "  help: run `grasm deps` without --locked to accept these and \
+update {}",
+                grasm_pkg::LOCKFILE_NAME
+            );
+            return Err(format!(
+                "{} change(s) since {}",
+                changes.len(),
+                grasm_pkg::LOCKFILE_NAME
+            ));
         }
+        println!("{} is up to date", grasm_pkg::LOCKFILE_NAME);
+        return Ok(());
+    }
+
+    for c in &changes {
+        println!("  note: {c}");
     }
     std::fs::write(&lock_path, grasm_pkg::render_lock(&entries))
         .map_err(|e| format!("cannot write {}: {e}", lock_path.display()))?;
