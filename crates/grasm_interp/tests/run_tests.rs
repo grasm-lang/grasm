@@ -534,3 +534,97 @@ fn new_list_methods() {
         "[20, 30]\n10 40\ntrue\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Phase 2a: maps
+// ---------------------------------------------------------------------------
+
+#[test]
+fn map_basics() {
+    run_expect(
+        r#"fn main() {
+    var ages = map()
+    ages.set("ada", 36)
+    ages.set("alan", 41)
+    ages.set("ada", 37)
+    print("{ages.len()} {ages.get("ada") ?? 0} {ages.get("zzz") ?? -1}")
+    print("{ages.has("alan")} {ages.delete("alan")} {ages.has("alan")}")
+    print("{ages}")
+}
+"#,
+        "2 37 -1\ntrue true false\n{ada: 37}\n",
+    );
+}
+
+#[test]
+fn map_keys_values_and_iteration() {
+    run_expect(
+        r#"fn main() {
+    var m = map()
+    m.set(3, "three")
+    m.set(1, "one")
+    m.set(2, "two")
+    print(m.keys().map(|k| k.to_str()).join(","))
+    print(m.values().join(","))
+    var total = 0
+    for k in m.keys() {
+        total += k
+    }
+    print("{total}")
+}
+"#,
+        "1,2,3\none,two,three\n6\n",
+    );
+}
+
+#[test]
+fn map_typed_annotation_and_word_count() {
+    // The validation-round pain point, now idiomatic.
+    run_expect(
+        r#"fn word_counts(text: str) -> Map[str, i64] {
+    var counts: Map[str, i64] = map()
+    for w in text.split(" ").filter(|w| w.len() > 0) {
+        counts.set(w, (counts.get(w) ?? 0) + 1)
+    }
+    counts
+}
+
+fn main() {
+    let c = word_counts("a b a c a b")
+    print("{c.get("a") ?? 0} {c.get("b") ?? 0} {c.get("c") ?? 0}")
+}
+"#,
+        "3 2 1\n",
+    );
+}
+
+#[test]
+fn map_value_semantics() {
+    run_expect(
+        r#"fn main() {
+    var a = map()
+    a.set("k", 1)
+    var b = a
+    b.set("k", 2)
+    print("{a.get("k") ?? 0} {b.get("k") ?? 0}")
+}
+"#,
+        "1 2\n",
+    );
+}
+
+#[test]
+fn map_nested_in_struct() {
+    run_expect(
+        r#"type Cache = { entries: Map[str, i64] }
+
+fn main() {
+    var c = Cache{ entries: map() }
+    c.entries.set("hits", 10)
+    c.entries.set("misses", 2)
+    print("{c.entries.get("hits") ?? 0} {c.entries.len()}")
+}
+"#,
+        "10 2\n",
+    );
+}

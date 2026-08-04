@@ -16,6 +16,8 @@ pub enum Value {
     Unit,
     Range(i64, i64, bool),
     List(Rc<Vec<Value>>),
+    /// Sorted map — deterministic iteration order.
+    Map(Rc<std::collections::BTreeMap<MapKey, Value>>),
     Tuple(Rc<Vec<Value>>),
     /// Ordered fields, as declared.
     Struct {
@@ -44,6 +46,33 @@ pub enum Value {
 pub enum ClosureBody {
     Expr(grasm_syntax::ast::Expr),
     Block(Block),
+}
+
+/// Orderable map key (checker restricts keys to these).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MapKey {
+    Bool(bool),
+    Int(i64),
+    Str(String),
+}
+
+impl MapKey {
+    pub fn from_value(v: &Value) -> Option<MapKey> {
+        match v {
+            Value::Int(i) => Some(MapKey::Int(*i)),
+            Value::Bool(b) => Some(MapKey::Bool(*b)),
+            Value::Str(s) => Some(MapKey::Str(s.as_ref().clone())),
+            _ => None,
+        }
+    }
+
+    pub fn to_value(&self) -> Value {
+        match self {
+            MapKey::Int(i) => Value::Int(*i),
+            MapKey::Bool(b) => Value::Bool(*b),
+            MapKey::Str(s) => Value::str(s.clone()),
+        }
+    }
 }
 
 impl Value {
@@ -84,6 +113,12 @@ impl Value {
             }
             (Value::List(a), Value::List(b)) | (Value::Tuple(a), Value::Tuple(b)) => {
                 a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.eq_value(y))
+            }
+            (Value::Map(a), Value::Map(b)) => {
+                a.len() == b.len()
+                    && a.iter()
+                        .zip(b.iter())
+                        .all(|((k1, v1), (k2, v2))| k1 == k2 && v1.eq_value(v2))
             }
             (
                 Value::Struct {
@@ -152,6 +187,16 @@ impl fmt::Display for Value {
                     write!(f, "{v}")?;
                 }
                 write!(f, "]")
+            }
+            Value::Map(entries) => {
+                write!(f, "{{")?;
+                for (i, (k, v)) in entries.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}: {v}", k.to_value())?;
+                }
+                write!(f, "}}")
             }
             Value::Tuple(items) => {
                 write!(f, "(")?;

@@ -17,6 +17,8 @@ pub enum Type {
     Range,
     Tuple(Vec<Type>),
     List(Box<Type>),
+    /// `Map[K, V]` — keys restricted to i64/str/bool.
+    Map(Box<Type>, Box<Type>),
     /// Struct or sum type instance, e.g. `Option[i64]`.
     Named { id: TypeDefId, args: Vec<Type> },
     /// Closure / function value.
@@ -169,6 +171,10 @@ impl Unifier {
         match t {
             Type::Tuple(items) => Type::Tuple(items.iter().map(|i| self.resolve(i)).collect()),
             Type::List(inner) => Type::List(Box::new(self.resolve(&inner))),
+            Type::Map(k, v) => Type::Map(
+                Box::new(self.resolve(&k)),
+                Box::new(self.resolve(&v)),
+            ),
             Type::Named { id, args } => Type::Named {
                 id,
                 args: args.iter().map(|a| self.resolve(a)).collect(),
@@ -190,6 +196,7 @@ impl Unifier {
             Type::Var(w) => w == v,
             Type::Tuple(items) => items.iter().any(|i| self.occurs(v, i)),
             Type::List(inner) => self.occurs(v, &inner),
+            Type::Map(mk, mv) => self.occurs(v, &mk) || self.occurs(v, &mv),
             Type::Named { args, .. } => args.iter().any(|a| self.occurs(v, a)),
             Type::Fn { params, ret } => {
                 params.iter().any(|p| self.occurs(v, p)) || self.occurs(v, &ret)
@@ -230,6 +237,9 @@ impl Unifier {
                 xs.len() == ys.len() && xs.iter().zip(ys).all(|(x, y)| self.unify(x, y))
             }
             (Type::List(x), Type::List(y)) => self.unify(x, y),
+            (Type::Map(k1, v1), Type::Map(k2, v2)) => {
+                self.unify(k1, k2) && self.unify(v1, v2)
+            }
             (Type::Named { id: i1, args: a1 }, Type::Named { id: i2, args: a2 }) => {
                 i1 == i2 && a1.len() == a2.len() && a1.iter().zip(a2).all(|(x, y)| self.unify(x, y))
             }
@@ -276,6 +286,10 @@ pub fn substitute_generics(ty: &Type, args: &[Type]) -> Type {
             Type::Tuple(items.iter().map(|t| substitute_generics(t, args)).collect())
         }
         Type::List(inner) => Type::List(Box::new(substitute_generics(inner, args))),
+        Type::Map(k, v) => Type::Map(
+            Box::new(substitute_generics(k, args)),
+            Box::new(substitute_generics(v, args)),
+        ),
         Type::Named { id, args: targs } => Type::Named {
             id: *id,
             args: targs.iter().map(|t| substitute_generics(t, args)).collect(),
@@ -328,6 +342,13 @@ fn write_type(f: &mut fmt::Formatter<'_>, ty: &Type, defs: &TypeDefs) -> fmt::Re
         Type::List(inner) => {
             write!(f, "[")?;
             write_type(f, inner, defs)?;
+            write!(f, "]")
+        }
+        Type::Map(k, v) => {
+            write!(f, "Map[")?;
+            write_type(f, k, defs)?;
+            write!(f, ", ")?;
+            write_type(f, v, defs)?;
             write!(f, "]")
         }
         Type::Named { id, args } => {

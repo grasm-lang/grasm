@@ -780,6 +780,9 @@ impl<'a, W: Write> Interp<'a, W> {
                             self.program_args.iter().map(|a| Value::str(a.clone())).collect();
                         return Ok(Value::List(Rc::new(vs)));
                     }
+                    "map" => {
+                        return Ok(Value::Map(Rc::new(std::collections::BTreeMap::new())));
+                    }
                     "input" => {
                         let mut line = String::new();
                         let _ = std::io::BufRead::read_line(
@@ -895,8 +898,8 @@ impl<'a, W: Write> Interp<'a, W> {
                 });
             }
         }
-        // Mutating list methods need place semantics.
-        if matches!(name.name.as_str(), "push" | "pop" | "sort") {
+        // Mutating list/map methods need place semantics.
+        if matches!(name.name.as_str(), "push" | "pop" | "sort" | "set" | "delete") {
             if let Some(r) = self.try_mutating_method(recv, name, args)? {
                 return Ok(r);
             }
@@ -949,42 +952,96 @@ impl<'a, W: Write> Interp<'a, W> {
             return Ok(None);
         }
         // Fast path: bare variable receiver — mutate the slot in place via
-        // copy-on-write (no clone when the list is uniquely owned). This is
+        // copy-on-write (no clone when the value is uniquely owned). This is
         // what makes `xs.push(v)` in a loop O(1) amortized instead of O(n).
         if let Expr::Ident(id) = recv {
-            let arg_val = if name.name.as_str() == "push" {
-                Some(self.eval_expr(&args[0])?)
-            } else {
-                None
-            };
+            // Evaluate args first (needs &mut self before borrowing the slot).
+            let mut arg_vals = Vec::with_capacity(args.len());
+            for a in args {
+                arg_vals.push(self.eval_expr(a)?);
+            }
             let slot = self
                 .scopes
                 .iter_mut()
                 .rev()
                 .find_map(|s| s.get_mut(&id.name));
-            if let Some(Value::List(items)) = slot {
-                let items = Rc::make_mut(items);
-                let result = match name.name.as_str() {
-                    "push" => {
-                        items.push(arg_val.unwrap());
-                        Value::Unit
-                    }
-                    "pop" => match items.pop() {
-                        Some(v) => Value::some(v),
-                        None => Value::none(),
-                    },
-                    "sort" => {
-                        items.sort_by(compare_values);
-                        Value::Unit
-                    }
-                    _ => unreachable!(),
-                };
-                return Ok(Some(result));
+            match slot {
+                Some(Value::List(items)) => {
+                    let items = Rc::make_mut(items);
+                    let result = match name.name.as_str() {
+                        "push" => {
+                            items.push(arg_vals.remove(0));
+                            Value::Unit
+                        }
+                        "pop" => match items.pop() {
+                            Some(v) => Value::some(v),
+                            None => Value::none(),
+                        },
+                        "sort" => {
+                            items.sort_by(compare_values);
+                            Value::Unit
+                        }
+                        _ => return Ok(None),
+                    };
+                    return Ok(Some(result));
+                }
+                Some(Value::Map(entries)) => {
+                    let entries = Rc::make_mut(entries);
+                    let result = match name.name.as_str() {
+                        "set" => {
+                            let v = arg_vals.pop().unwrap();
+                            let k = arg_vals.pop().unwrap();
+                            let Some(key) = crate::value::MapKey::from_value(&k) else {
+                                return Err(Flow::Panic(format!(
+                                    "invalid map key `{k}`"
+                                )));
+                            };
+                            entries.insert(key, v);
+                            Value::Unit
+                        }
+                        "delete" => {
+                            let k = arg_vals.pop().unwrap();
+                            let Some(key) = crate::value::MapKey::from_value(&k) else {
+                                return Err(Flow::Panic(format!(
+                                    "invalid map key `{k}`"
+                                )));
+                            };
+                            Value::Bool(entries.remove(&key).is_some())
+                        }
+                        _ => return Ok(None),
+                    };
+                    return Ok(Some(result));
+                }
+                _ => return Ok(None),
             }
-            return Ok(None);
         }
-        // Nested place (`bag.items.push(v)`): clone + write back.
+        // Nested place (`bag.items.push(v)` / `obj.cache.set(k, v)`): clone +
+        // write back.
         let current = self.eval_expr(recv)?;
+        if let Value::Map(entries) = &current {
+            let mut m = entries.as_ref().clone();
+            let result = match name.name.as_str() {
+                "set" => {
+                    let k = self.eval_expr(&args[0])?;
+                    let v = self.eval_expr(&args[1])?;
+                    let Some(key) = crate::value::MapKey::from_value(&k) else {
+                        return Err(Flow::Panic(format!("invalid map key `{k}`")));
+                    };
+                    m.insert(key, v);
+                    Value::Unit
+                }
+                "delete" => {
+                    let k = self.eval_expr(&args[0])?;
+                    let Some(key) = crate::value::MapKey::from_value(&k) else {
+                        return Err(Flow::Panic(format!("invalid map key `{k}`")));
+                    };
+                    Value::Bool(m.remove(&key).is_some())
+                }
+                _ => return Ok(None),
+            };
+            self.assign_place(recv, Value::Map(Rc::new(m)))?;
+            return Ok(Some(result));
+        }
         let Value::List(items) = current else {
             return Ok(None);
         };
@@ -1215,6 +1272,30 @@ impl<'a, W: Write> Interp<'a, W> {
                     Value::Float(y) => Value::Float(x.max(y)),
                     _ => return Err(Flow::Panic("max expects a float".into())),
                 }
+            }
+            (Value::Map(entries), "get") => {
+                let k = self.eval_expr(&args[0])?;
+                match crate::value::MapKey::from_value(&k) {
+                    Some(key) => match entries.get(&key) {
+                        Some(v) => Value::some(v.clone()),
+                        None => Value::none(),
+                    },
+                    None => return Err(Flow::Panic(format!("invalid map key `{k}`"))),
+                }
+            }
+            (Value::Map(entries), "has") => {
+                let k = self.eval_expr(&args[0])?;
+                match crate::value::MapKey::from_value(&k) {
+                    Some(key) => Value::Bool(entries.contains_key(&key)),
+                    None => return Err(Flow::Panic(format!("invalid map key `{k}`"))),
+                }
+            }
+            (Value::Map(entries), "len") => Value::Int(entries.len() as i64),
+            (Value::Map(entries), "keys") => Value::List(Rc::new(
+                entries.keys().map(|k| k.to_value()).collect(),
+            )),
+            (Value::Map(entries), "values") => {
+                Value::List(Rc::new(entries.values().cloned().collect()))
             }
             (Value::Variant { variant, .. }, "is_some") => {
                 Value::Bool(variant.as_str() == "Some")

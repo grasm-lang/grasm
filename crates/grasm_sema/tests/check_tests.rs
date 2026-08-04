@@ -522,3 +522,37 @@ fn tuple_patterns_with_literals_are_refutable() {
         "fn f(m: str, p: str) -> i64 {\n    match (m, p) {\n        (\"GET\", \"x\") -> 1\n        _ -> 0\n    }\n}\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Phase 2a: maps (static)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn map_type_checking() {
+    check_ok("fn f() {\n    var m: Map[str, i64] = map()\n    m.set(\"a\", 1)\n    let v = m.get(\"a\") ?? 0\n    let n: i64 = m.len()\n}\n");
+    check_err(
+        "fn f() {\n    var m: Map[str, i64] = map()\n    m.set(1, 1)\n}\n",
+        "type mismatch",
+    );
+    check_err(
+        "fn f() {\n    var m: Map[str, i64] = map()\n    let v: str = m.get(\"a\") ?? 0\n}\n",
+        "type mismatch",
+    );
+    check_err(
+        "fn f() {\n    let m = map()\n    m.set(\"a\", 1)\n}\n",
+        "cannot mutate",
+    );
+}
+
+#[test]
+fn map_key_restriction() {
+    check_err(
+        "fn f() {\n    var m: Map[[i64], str] = map()\n}\n",
+        "map keys must be",
+    );
+    check_err(
+        "fn f() {\n    var m = map()\n    m.set([1], \"x\")\n}\n",
+        "map keys must be",
+    );
+    check_ok("fn f() {\n    var a: Map[i64, str] = map()\n    var b: Map[bool, i64] = map()\n}\n");
+}

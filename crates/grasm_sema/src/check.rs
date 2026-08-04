@@ -319,6 +319,20 @@ impl Checker {
                     }
                     return p;
                 }
+                if name == "Map" {
+                    let resolved_args: Vec<Type> = args
+                        .iter()
+                        .map(|a| self.resolve_type(a, generics))
+                        .collect();
+                    if resolved_args.len() != 2 {
+                        return self.error(*span, "`Map` takes exactly 2 type arguments: Map[K, V]");
+                    }
+                    self.require_map_key(&resolved_args[0], *span);
+                    return Type::Map(
+                        Box::new(resolved_args[0].clone()),
+                        Box::new(resolved_args[1].clone()),
+                    );
+                }
                 if let Some(alias) = self.aliases.get(name) {
                     return alias.clone();
                 }
@@ -1087,6 +1101,14 @@ impl Checker {
                         }
                         return Type::List(Box::new(Type::Str));
                     }
+                    "map" => {
+                        if !args.is_empty() {
+                            return self.error(span, "map() takes no arguments — add entries with .set(k, v)");
+                        }
+                        let k = self.uni.fresh();
+                        let v = self.uni.fresh();
+                        return Type::Map(Box::new(k), Box::new(v));
+                    }
                     "input" => {
                         if !args.is_empty() {
                             return self.error(span, "input takes no arguments");
@@ -1621,6 +1643,54 @@ impl Checker {
                 }
                 _ => return None,
             },
+            Type::Map(k, v) => {
+                let k = (**k).clone();
+                let v = (**v).clone();
+                match name.name.as_str() {
+                    "set" => {
+                        self.require_mutable(recv);
+                        if check_arity(self, 2) {
+                            self.check_expr(&args[0], &k);
+                            self.check_expr(&args[1], &v);
+                            self.require_map_key(&k, span);
+                        }
+                        Type::Unit
+                    }
+                    "get" => {
+                        if check_arity(self, 1) {
+                            self.check_expr(&args[0], &k);
+                            self.require_map_key(&k, span);
+                        }
+                        self.defs.option_some(v)
+                    }
+                    "has" => {
+                        if check_arity(self, 1) {
+                            self.check_expr(&args[0], &k);
+                        }
+                        Type::Bool
+                    }
+                    "delete" => {
+                        self.require_mutable(recv);
+                        if check_arity(self, 1) {
+                            self.check_expr(&args[0], &k);
+                        }
+                        Type::Bool
+                    }
+                    "len" => {
+                        check_arity(self, 0);
+                        Type::I64
+                    }
+                    "keys" => {
+                        check_arity(self, 0);
+                        Type::List(Box::new(k))
+                    }
+                    "values" => {
+                        check_arity(self, 0);
+                        Type::List(Box::new(v))
+                    }
+                    _ => return None,
+                }
+            }
             Type::Named { id, args: targs } if *id == self.defs.option_id => {
                 let inner = targs[0].clone();
                 match name.name.as_str() {
@@ -1640,6 +1710,22 @@ impl Checker {
             _ => return None,
         };
         Some(t)
+    }
+
+    /// Map keys must be orderable primitives.
+    fn require_map_key(&mut self, k: &Type, span: Span) {
+        let r = self.uni.resolve(k);
+        if !matches!(
+            r,
+            Type::I64 | Type::Str | Type::Bool | Type::Var(_) | Type::Error
+        ) {
+            let shown = self.show(k);
+            self.error_help(
+                span,
+                format!("map keys must be `i64`, `str`, or `bool`, not `{shown}`"),
+                "use a primitive key, or serialize the value to a string key",
+            );
+        }
     }
 
     /// Mutating methods need a mutable receiver root.
