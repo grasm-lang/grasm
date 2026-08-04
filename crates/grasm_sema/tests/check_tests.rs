@@ -765,3 +765,27 @@ fn the_capture_rule_does_not_leak_past_the_parallel_block() {
         "fn main() {\n    parallel {\n        spawn {\n            print(\"a\")\n        }\n    }\n    let after = 1\n    print(\"{after}\")\n}\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Function values
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_function_can_be_used_as_a_value() {
+    check_ok("fn inc(n: i64) -> i64 {\n    n + 1\n}\n\nfn main() {\n    let f = inc\n    print(\"{f(3)}\")\n}\n");
+}
+
+#[test]
+fn a_value_that_is_not_a_function_is_not_callable() {
+    check_err(
+        "fn main() {\n    let x = 5\n    print(\"{x(1)}\")\n}\n",
+        "not callable",
+    );
+}
+
+#[test]
+fn a_list_may_hold_functions_of_the_same_shape() {
+    check_ok(
+        "fn inc(n: i64) -> i64 {\n    n + 1\n}\n\nfn dbl(n: i64) -> i64 {\n    n * 2\n}\n\nfn main() {\n    let fs = [inc, dbl]\n    for g in fs {\n        print(\"{g(1)}\")\n    }\n}\n",
+    );
+}

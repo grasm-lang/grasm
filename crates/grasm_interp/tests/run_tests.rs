@@ -944,3 +944,21 @@ fn a_conditional_spawn_only_fires_when_taken() {
         "yes\n",
     );
 }
+
+#[test]
+fn a_closure_captures_by_value_at_creation() {
+    // A later change to the captured binding is not visible to the closure:
+    // capture is a copy, like every other binding ([E-VALUE-SEMANTICS]).
+    run_expect(
+        "fn main() {\n    var n = 1\n    let f = |x| x + n\n    n = 100\n    print(\"{f(1)} {n}\")\n}\n",
+        "2 100\n",
+    );
+}
+
+#[test]
+fn function_values_print_as_what_they_are() {
+    run_expect(
+        "fn inc(n: i64) -> i64 {\n    n + 1\n}\n\nfn main() {\n    let f = inc\n    let c = |x| x\n    print(\"{f}\")\n    print(\"{c(1)}\")\n}\n",
+        "<fn main::inc>\n1\n",
+    );
+}

@@ -1,0 +1,67 @@
+// Functions as data — and every line here compiles natively as well as
+// running in the interpreter, which is the point.
+//
+//   grasm run   examples/function_values.gr
+//   grasm build examples/function_values.gr --native -o fv && ./fv
+//
+// A named function and a closure share one representation: a code pointer
+// plus a captured environment. That is why a list can hold either, and why
+// calling one is the same indirect call in both cases.
+
+fn inc(n: i64) -> i64 {
+    n + 1
+}
+
+fn double(n: i64) -> i64 {
+    n * 2
+}
+
+fn square(n: i64) -> i64 {
+    n * n
+}
+
+/// Applies every function in `pipeline` to `seed`, in order.
+fn run_pipeline(seed: i64, stages: [i64]) -> i64 {
+    var acc = seed
+    for s in stages {
+        acc = acc + s
+    }
+    acc
+}
+
+fn main() {
+    // A named function bound to a variable, then called through it.
+    let f = inc
+    print("{f(41)}")
+
+    // Functions in a list, iterated and called indirectly.
+    let stages = [inc, double, square]
+    var acc = 3
+    for stage in stages {
+        acc = stage(acc)
+    }
+    print("3 -> {acc}")
+
+    // A closure bound to a name.
+    let halve = |n| n / 2
+    print("{halve(84)}")
+
+    // Closures capture by value at the moment they are created, so a later
+    // change to the captured binding is not visible inside.
+    var offset = 10
+    let shift = |n| n + offset
+    offset = 1000
+    print("{shift(5)} offset={offset}")
+
+    // Captures may be boxed values, and outlive the scope they came from.
+    let label = "result"
+    let describe = |n| "{label}: {n}"
+    print(describe(7))
+
+    // Printing a function value says which one it is.
+    print("{f}")
+    print("{halve}")
+
+    let totals = [1, 2, 3]
+    print("{run_pipeline(0, totals)}")
+}

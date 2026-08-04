@@ -36,9 +36,10 @@ If a change alters what a program prints, exits with, or refuses to compile:
 4. **Check both engines.** `./scripts/difftest.sh` compiles every program in the
    repository and compares native output against the interpreter byte for byte.
 
-If the native backend cannot compile something yet, it must say so by name —
-`nope(span, "function values")` — so difftest reports it as unsupported rather
-than passing silently. A skipped program is never counted as a pass.
+The native backend currently compiles every program in the repository. If you
+add something it cannot compile yet, it must say so by name —
+`nope(span, "what it is")` — so difftest reports it as unsupported rather than
+passing silently. A skipped program is never counted as a pass.
 
 ## Tests
 

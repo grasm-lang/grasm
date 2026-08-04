@@ -38,14 +38,18 @@ fn loops_and_floats_compile() {
 
 #[test]
 fn unsupported_features_reported_cleanly() {
-    let e = compile("fn main() {\n    let f = |x| x\n    print(\"{f(1)}\")\n}\n")
-        .expect_err("closures unsupported yet");
-    assert!(e.contains("does not yet support"), "got: {e}");
-    let e2 = compile(
+    // Both of these used to be rejected and now compile; what is still worth
+    // checking is that a genuine gap is reported as one rather than crashing.
+    compile("fn main() {\n    let f = |x| x\n    print(\"{f(1)}\")\n}\n")
+        .expect("first-class closures compile");
+    compile(
         "fn twice(x: i64) -> i64 {\n    x * 2\n}\n\nfn main() {\n    let fs = [twice]\n    print(\"{fs.len()}\")\n}\n",
     )
-    .expect_err("function values unsupported yet");
-    assert!(e2.contains("function values"), "got: {e2}");
+    .expect("function values compile");
+
+    let e = compile("fn main() {\n    var xs = []\n    print(\"{xs.len()}\")\n}\n")
+        .expect_err("an unannotated empty literal has no element type");
+    assert!(e.contains("does not yet support"), "got: {e}");
 }
 
 #[test]
@@ -105,10 +109,11 @@ fn n4_map_filter_inline_closures_compile() {
 }
 
 #[test]
-fn n4_closure_outside_map_filter_reported() {
-    let e = compile("fn main() {\n    let f = |x| x + 1\n    print(\"{f(1)}\")\n}\n")
-        .expect_err("first-class closures not supported yet");
-    assert!(e.contains("closures outside"), "got: {e}");
+fn a_closure_outside_map_and_filter_compiles() {
+    // This used to be rejected: closures were only ever inlined into the
+    // methods that take one. They are now lifted to real functions.
+    compile("fn main() {\n    let f = |x| x + 1\n    print(\"{f(1)}\")\n}\n")
+        .expect("a first-class closure should compile");
 }
 
 #[test]
@@ -285,6 +290,74 @@ fn a_type_parameter_the_arguments_do_not_determine_is_reported() {
     .expect_err("should be reported, not guessed");
     assert!(
         err.contains("not determined by the arguments"),
+        "expected a clear reason, got: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Function values
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_named_function_used_as_a_value_compiles() {
+    compile(
+        "fn inc(n: i64) -> i64 {\n    n + 1\n}\n\nfn main() {\n    let f = inc\n    print(\"{f(3)}\")\n}\n",
+    )
+    .expect("a named function should be usable as a value");
+}
+
+#[test]
+fn a_list_of_functions_compiles() {
+    // What the router needs: functions in a list, iterated, called indirectly.
+    compile(
+        "fn inc(n: i64) -> i64 {\n    n + 1\n}\n\nfn dbl(n: i64) -> i64 {\n    n * 2\n}\n\nfn main() {\n    let fs = [inc, dbl]\n    for g in fs {\n        print(\"{g(10)}\")\n    }\n}\n",
+    )
+    .expect("a list of function values should compile");
+}
+
+#[test]
+fn a_closure_bound_to_a_name_compiles() {
+    compile("fn main() {\n    let c = |x| x + 100\n    print(\"{c(1)}\")\n}\n")
+        .expect("a closure used as a value should compile");
+}
+
+#[test]
+fn a_closure_capturing_its_environment_compiles() {
+    compile(
+        "fn main() {\n    let base = 10\n    let add = |n| n + base\n    print(\"{add(5)}\")\n}\n",
+    )
+    .expect("captures should compile");
+}
+
+#[test]
+fn a_closure_argument_declared_after_it_still_types() {
+    // The call names `i`, which is declared *after* the closure. The closure
+    // is lowered first, so its parameter type has to come from the binding's
+    // initializer rather than the binding itself.
+    compile(
+        "fn main() {\n    let f = |x| x + 1\n    var i = 0\n    print(\"{f(i)}\")\n}\n",
+    )
+    .expect("a later binding should still give the parameter its type");
+}
+
+#[test]
+fn a_function_value_printed_shows_what_it_is() {
+    compile(
+        "fn inc(n: i64) -> i64 {\n    n + 1\n}\n\nfn main() {\n    let f = inc\n    print(\"{f}\")\n}\n",
+    )
+    .expect("printing a function value should compile");
+}
+
+#[test]
+fn an_uncalled_closure_with_parameters_is_reported() {
+    // Nothing says what `x` is, so the parameter type has nowhere to come
+    // from. Guessing would compile the wrong function.
+    let err = compile(
+        "fn main() {\n    let f = |x| x + 1\n    print(\"{f}\")\n}\n",
+    )
+    .expect_err("should be reported, not guessed");
+    assert!(
+        err.contains("nothing to come from") || err.contains("parameter types"),
         "expected a clear reason, got: {err}"
     );
 }

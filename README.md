@@ -166,12 +166,17 @@ grasm build app.gr --native --target x86_64-apple-darwin -o app
 cc -arch x86_64 app.o target/x86_64-apple-darwin/release/libgrasm_rt.a -o app
 ```
 
-`scripts/difftest.sh` is the correctness gate: every program in `examples/` and
-`projects/` is run through both backends and the outputs must match byte for
-byte. Current status — **16 identical, 0 mismatched, 1 unsupported** (the router
-project needs first-class function values). Anything the backend can't compile
-names the missing feature and points at the interpreter; it never silently
-miscompiles.
+The backend also compiles structured concurrency, generic functions
+(monomorphized per instantiation), and function values — a named function used
+as data, a closure bound to a name, and lists of either, dispatched through an
+indirect call.
+
+`scripts/difftest.sh` is the correctness gate: every program in `examples/`,
+`projects/`, `spec/conformance/`, and `benchmarks/` is run through both engines
+and the outputs must match byte for byte. Current status — **113 identical, 0
+mismatched, 0 unsupported**: nothing in the repository is left to the
+interpreter. Anything the backend cannot compile names the missing feature and
+points at the interpreter; it never silently miscompiles.
 
 `scripts/crosstest.sh` runs the same gate against a *cross-compiled* target to
 prove the backend isn't accidentally host-specific — currently **16 identical,
@@ -214,8 +219,8 @@ always produces the same output (which is what MASTERPLAN §8.6 wants for
 reproducible tests) but nothing runs on a second core. Real parallelism needs
 the runtime's `Rc`-based values replaced with `Arc` + `Send`/`Sync`, which
 would slow down all single-threaded code — that trade is a deliberate later
-milestone, not an oversight. The native backend reports `parallel`/`spawn` as
-unsupported and defers to the interpreter.
+milestone, not an oversight. Both engines compile `parallel`/`spawn`; what is
+missing is multi-core execution, not the construct.
 
 `parallel` and `spawn` are *contextual* keywords — they only introduce a scope
 when a block follows, so code that already uses those words as function or

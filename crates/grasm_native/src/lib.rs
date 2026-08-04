@@ -54,6 +54,10 @@ enum VType {
     Tuple(Vec<VType>),
     /// Dynamically-typed boxed value (error payloads); printable + variant-matchable.
     Any,
+    /// A function value: a code pointer plus its captured environment.
+    /// Named functions and closures share one representation, so a list can
+    /// hold both.
+    Fn(Vec<VType>, Box<VType>),
 }
 
 impl VType {
@@ -71,6 +75,11 @@ impl VType {
             VType::Fallible(e) => format!("f{}", e.mangle()),
             VType::Struct(n) | VType::Sum(n) => format!("n{n}"),
             VType::Map(k, v) => format!("m{}_{}", k.mangle(), v.mangle()),
+            VType::Fn(ps, r) => format!(
+                "fn{}_{}",
+                ps.iter().map(VType::mangle).collect::<Vec<_>>().join("_"),
+                r.mangle()
+            ),
             VType::Tuple(ts) => format!(
                 "t{}",
                 ts.iter().map(VType::mangle).collect::<Vec<_>>().join("_")
@@ -93,6 +102,7 @@ impl VType {
             | VType::Fallible(_)
             | VType::Map(_, _)
             | VType::Tuple(_)
+            | VType::Fn(_, _)
             | VType::Any => types::I64,
         }
     }
@@ -108,12 +118,14 @@ impl VType {
                 | VType::Fallible(_)
                 | VType::Map(_, _)
                 | VType::Tuple(_)
+                | VType::Fn(_, _)
                 | VType::Any
         )
     }
 
 }
 
+#[derive(Clone)]
 struct FnSig {
     params: Vec<VType>,
     /// `inout` params are passed as pointers to the caller's slot.
@@ -210,6 +222,11 @@ struct Codegen<'m> {
     handler_sites: HashMap<u32, Vec<(String, FuncId)>>,
     /// Lifted handler bodies to compile after the main functions.
     pending_handlers: Vec<PendingHandler>,
+    /// Lifted closure bodies, likewise.
+    pending_closures: Vec<PendingClosure>,
+    /// Named function → the wrapper that gives it the function-value ABI.
+    /// One wrapper per function, however many times it is used as a value.
+    fn_wrappers: HashMap<String, FuncId>,
     current_module: String,
     /// module → (alias → target module)
     module_imports: HashMap<String, HashMap<String, String>>,
@@ -233,6 +250,22 @@ struct PendingGeneric {
     subst: HashMap<String, VType>,
 }
 
+/// A closure body lifted to a real function.
+///
+/// Its first parameter is the captured environment (a boxed list, or null when
+/// nothing was captured); the rest are the closure's own parameters. Named
+/// functions used as values get the same shape through a thin wrapper, so one
+/// calling convention covers both and a list can hold either.
+struct PendingClosure {
+    id: FuncId,
+    module: String,
+    /// Captured names, in the order they occupy the environment list.
+    captures: Vec<(String, VType)>,
+    params: Vec<(String, VType)>,
+    ret: VType,
+    body: Expr,
+}
+
 struct PendingHandler {
     id: FuncId,
     module: String,
@@ -254,6 +287,8 @@ impl<'m> Codegen<'m> {
             effects: HashMap::new(),
             handler_sites: HashMap::new(),
             pending_handlers: Vec::new(),
+            pending_closures: Vec::new(),
+            fn_wrappers: HashMap::new(),
             current_module: "main".to_string(),
             module_imports: HashMap::new(),
             generic_fns: HashMap::new(),
@@ -316,12 +351,6 @@ impl<'m> Codegen<'m> {
             ("grasm_val_eq", vec![i64t, i64t], Some(i8t)),
             ("grasm_list_get_opt", vec![i64t, i64t], Some(i64t)),
             ("grasm_str_from_val", vec![i64t], Some(i64t)),
-            ("grasm_closure_new", vec![ptr, i64t], Some(i64t)),
-            ("grasm_closure_push", vec![i64t, i64t], None),
-            ("grasm_closure_code", vec![i64t], Some(ptr)),
-            ("grasm_closure_env", vec![i64t, i64t], Some(i64t)),
-            ("grasm_closure_inc", vec![i64t], None),
-            ("grasm_closure_dec", vec![i64t], None),
             ("grasm_map_new", vec![], Some(i64t)),
             ("grasm_map_set", vec![i64t, i64t, i64t], Some(i64t)),
             ("grasm_map_get", vec![i64t, i64t], Some(i64t)),
@@ -368,6 +397,9 @@ impl<'m> Codegen<'m> {
             ("grasm_handler_push", vec![ptr, i64t], None),
             ("grasm_handler_op", vec![ptr, i64t, ptr], None),
             ("grasm_handler_pop", vec![], None),
+            ("grasm_fn_new", vec![i64t, i64t, ptr, i64t], Some(i64t)),
+            ("grasm_fn_code", vec![i64t], Some(i64t)),
+            ("grasm_fn_env", vec![i64t], Some(i64t)),
             ("grasm_handler_lookup", vec![ptr, i64t, ptr, i64t], Some(ptr)),
             ("grasm_args", vec![], Some(i64t)),
             ("grasm_input", vec![], Some(i64t)),
@@ -495,6 +527,12 @@ impl<'m> Codegen<'m> {
             let result = self.compile_fn_as(&g.decl, &g.key);
             self.generic_subst = saved;
             result?;
+        }
+
+        // A lifted closure can itself create another, so drain the worklist.
+        while let Some(c) = self.pending_closures.pop() {
+            self.current_module = c.module.clone();
+            self.compile_closure(c)?;
         }
 
         let pending = std::mem::take(&mut self.pending_handlers);
@@ -872,6 +910,7 @@ impl<'m> Codegen<'m> {
             ret: sig_ret.clone(),
             inout_slots: Vec::new(),
             filled: false,
+            closure_hints: Vec::new(),
             task_scopes: Vec::new(),
         };
 
@@ -1076,6 +1115,156 @@ impl<'m> Codegen<'m> {
         }
     }
 
+    /// Emits the wrapper that lets a named function be used as a value.
+    ///
+    /// Function values all share one shape — `(env, params…)` — so a wrapper
+    /// takes the environment it will never use and forwards the rest. One per
+    /// function, cached, so `[inc, inc]` does not emit two.
+    fn fn_value_wrapper(&mut self, key: &str, span: Span) -> CResult<FuncId> {
+        if let Some(id) = self.fn_wrappers.get(key) {
+            return Ok(*id);
+        }
+        let sig_info = self.fns[key].clone();
+        if sig_info.modes.contains(&ParamMode::Inout) {
+            return nope(span, "`inout` functions as values");
+        }
+        let ptr_ty = self.module.target_config().pointer_type();
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(ptr_ty)); // environment (unused)
+        for p in &sig_info.params {
+            sig.params.push(AbiParam::new(p.cl()));
+        }
+        if sig_info.ret != VType::Unit {
+            sig.returns.push(AbiParam::new(sig_info.ret.cl()));
+        }
+        let sym = format!("gv_{}", key.replace([':', '.', '[', ']', ','], "_"));
+        let id = self
+            .module
+            .declare_function(&sym, Linkage::Local, &sig)
+            .map_err(|e| Unsupported {
+                span,
+                what: format!("(module error: {e})"),
+            })?;
+
+        let mut ctx = self.module.make_context();
+        ctx.func.signature = sig;
+        let mut fbcx = FunctionBuilderContext::new();
+        let mut b = FunctionBuilder::new(&mut ctx.func, &mut fbcx);
+        let entry = b.create_block();
+        b.append_block_params_for_function_params(entry);
+        b.switch_to_block(entry);
+        let params: Vec<Value> = b.block_params(entry).to_vec();
+        let env = params[0];
+        // The wrapper owns the environment reference it was handed.
+        let dec_ref = self.module.declare_func_in_func(self.runtime["grasm_val_dec"], b.func);
+        b.ins().call(dec_ref, &[env]);
+        let target = self.module.declare_func_in_func(sig_info.id, b.func);
+        let inst = b.ins().call(target, &params[1..]);
+        let results: Vec<Value> = b.inst_results(inst).to_vec();
+        if sig_info.ret == VType::Unit {
+            b.ins().return_(&[]);
+        } else {
+            b.ins().return_(&results);
+        }
+        b.seal_all_blocks();
+        b.finalize();
+        self.module
+            .define_function(id, &mut ctx)
+            .map_err(|e| Unsupported {
+                span,
+                what: format!("(define error: {e})"),
+            })?;
+        self.fn_wrappers.insert(key.to_string(), id);
+        Ok(id)
+    }
+
+    /// Compiles a lifted closure body.
+    fn compile_closure(&mut self, c: PendingClosure) -> CResult<()> {
+        let ptr_ty = self.module.target_config().pointer_type();
+        let mut ctx = self.module.make_context();
+        ctx.func.signature.params.push(AbiParam::new(ptr_ty));
+        for (_, t) in &c.params {
+            ctx.func.signature.params.push(AbiParam::new(t.cl()));
+        }
+        if c.ret != VType::Unit {
+            ctx.func.signature.returns.push(AbiParam::new(c.ret.cl()));
+        }
+        let mut fbcx = FunctionBuilderContext::new();
+        let builder = FunctionBuilder::new(&mut ctx.func, &mut fbcx);
+        let mut fcx = FnCx {
+            cg: self,
+            b: builder,
+            vars: Vec::new(),
+            var_count: 0,
+            loops: Vec::new(),
+            ret: c.ret.clone(),
+            inout_slots: Vec::new(),
+            filled: false,
+            closure_hints: Vec::new(),
+            task_scopes: Vec::new(),
+        };
+        let entry = fcx.b.create_block();
+        fcx.b.append_block_params_for_function_params(entry);
+        fcx.b.switch_to_block(entry);
+        fcx.push_scope();
+        let ps: Vec<Value> = fcx.b.block_params(entry).to_vec();
+
+        // Unpack the captured environment, which was built in this order.
+        let env = ps[0];
+        for (i, (name, vt)) in c.captures.iter().enumerate() {
+            let idx = fcx.b.ins().iconst(types::I64, i as i64);
+            let boxed = fcx.call_rt("grasm_list_get", &[env, idx]).unwrap();
+            let (v, _) = fcx.unbox(boxed, vt)?;
+            let var = fcx.new_var(vt);
+            fcx.b.def_var(var, v);
+            fcx.bind(name, var, vt.clone());
+        }
+        fcx.call_rt("grasm_val_dec", &[env]);
+
+        for (i, (pname, pt)) in c.params.iter().enumerate() {
+            let var = fcx.new_var(pt);
+            fcx.b.def_var(var, ps[i + 1]);
+            fcx.bind(pname, var, pt.clone());
+        }
+
+        let val = fcx.eval_expr(&c.body)?;
+        match (&c.ret, val) {
+            (VType::Unit, v) => {
+                if let Some((x, xt)) = v {
+                    fcx.dec_if_boxed(x, &xt);
+                }
+                fcx.emit_scope_decs_all();
+                if !fcx.is_filled() {
+                    fcx.b.ins().return_(&[]);
+                }
+            }
+            (want, Some((mut x, xt))) => {
+                if *want == VType::F64 && xt == VType::I64 {
+                    x = fcx.b.ins().fcvt_from_sint(types::F64, x);
+                }
+                fcx.emit_scope_decs_all();
+                if !fcx.is_filled() {
+                    fcx.b.ins().return_(&[x]);
+                }
+            }
+            (_, None) => {
+                if !fcx.is_filled() {
+                    return nope(c.body.span(), "a closure body with no value");
+                }
+            }
+        }
+        fcx.b.seal_all_blocks();
+        fcx.b.finalize();
+        self.module
+            .define_function(c.id, &mut ctx)
+            .map_err(|e| Unsupported {
+                span: c.body.span(),
+                what: format!("(define error: {e})"),
+            })?;
+        let _ = c.module;
+        Ok(())
+    }
+
     fn compile_handler(&mut self, h: PendingHandler) -> CResult<()> {
         let mut ctx = self.module.make_context();
         for (_, t) in &h.params {
@@ -1095,6 +1284,7 @@ impl<'m> Codegen<'m> {
             ret: h.ret.clone(),
             inout_slots: Vec::new(),
             filled: false,
+            closure_hints: Vec::new(),
             task_scopes: Vec::new(),
         };
         let entry = fcx.b.create_block();
@@ -1168,6 +1358,13 @@ struct FnCx<'a, 'm> {
     /// `continue`, `return`, or `fail` was just emitted). Cleared whenever we
     /// switch to a fresh block.
     filled: bool,
+    /// Per enclosing block: the argument expressions seen at call sites of a
+    /// `let`-bound closure, and every binding's initializer.
+    ///
+    /// Without a function-type syntax a closure's parameter types can only
+    /// come from how it is called — and the call may name a binding declared
+    /// *after* the closure, so the initializers are needed to type it.
+    closure_hints: Vec<BlockHints>,
     /// One entry per enclosing `parallel` block: the runtime list that records
     /// which spawn sites fired, and how many sites have been lowered so far.
     ///
@@ -1176,6 +1373,202 @@ struct FnCx<'a, 'm> {
     /// lexically known, and [T-TASK-CAPTURE] guarantees they only touch
     /// bindings that outlive the block.
     task_scopes: Vec<(Variable, usize)>,
+}
+
+/// What a block knows that a closure inside it needs.
+#[derive(Default)]
+struct BlockHints {
+    /// `let f = |x| …` → the arguments of a later `f(...)` call.
+    calls: HashMap<String, Vec<Expr>>,
+    /// Every binding's initializer, so an argument naming a binding declared
+    /// after the closure can still be typed.
+    inits: HashMap<String, Expr>,
+}
+
+fn collect_block_hints(blk: &grasm_syntax::ast::Block) -> BlockHints {
+    let mut hints = BlockHints::default();
+    let mut bound: Vec<String> = Vec::new();
+    for stmt in &blk.stmts {
+        if let Stmt::Let { name, init, .. } = stmt {
+            hints
+                .inits
+                .entry(name.name.clone())
+                .or_insert_with(|| init.clone());
+            if matches!(init, Expr::Closure { params, .. } if !params.is_empty()) {
+                bound.push(name.name.clone());
+            }
+        }
+    }
+    if bound.is_empty() {
+        return hints;
+    }
+    for stmt in &blk.stmts {
+        collect_calls_stmt(stmt, &bound, &mut hints.calls);
+    }
+    hints
+}
+
+fn collect_calls_stmt(stmt: &Stmt, bound: &[String], out: &mut HashMap<String, Vec<Expr>>) {
+    match stmt {
+        Stmt::Let { init, .. } => collect_calls_expr(init, bound, out),
+        Stmt::Assign { value, .. } => collect_calls_expr(value, bound, out),
+        Stmt::Return(Some(e), _) | Stmt::Expr(e) => collect_calls_expr(e, bound, out),
+        Stmt::While { cond, body, .. } => {
+            collect_calls_expr(cond, bound, out);
+            for s in &body.stmts {
+                collect_calls_stmt(s, bound, out);
+            }
+        }
+        Stmt::For { body, .. }
+        | Stmt::Parallel { body, .. }
+        | Stmt::Spawn { body, .. }
+        | Stmt::With { body, .. } => {
+            for s in &body.stmts {
+                collect_calls_stmt(s, bound, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_calls_expr(e: &Expr, bound: &[String], out: &mut HashMap<String, Vec<Expr>>) {
+    if let Expr::Call { callee, args, .. } = e {
+        if let Expr::Ident(id) = &**callee {
+            if bound.contains(&id.name) {
+                out.entry(id.name.clone()).or_insert_with(|| args.to_vec());
+            }
+        }
+    }
+    match e {
+        Expr::Call { callee, args, .. } => {
+            collect_calls_expr(callee, bound, out);
+            for a in args {
+                collect_calls_expr(a, bound, out);
+            }
+        }
+        Expr::MethodCall { recv, args, .. } => {
+            collect_calls_expr(recv, bound, out);
+            for a in args {
+                collect_calls_expr(a, bound, out);
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_calls_expr(lhs, bound, out);
+            collect_calls_expr(rhs, bound, out);
+        }
+        Expr::Unary { expr, .. } | Expr::Try { expr, .. } => collect_calls_expr(expr, bound, out),
+        Expr::List(items, _) | Expr::Tuple(items, _) => {
+            for i in items {
+                collect_calls_expr(i, bound, out);
+            }
+        }
+        Expr::Str(pieces, _) => {
+            for p in pieces {
+                if let StrPiece::Expr(inner) = p {
+                    collect_calls_expr(inner, bound, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Every identifier appearing in an expression, in source order.
+fn collect_idents(e: &Expr, out: &mut Vec<String>) {
+    match e {
+        Expr::Ident(id) => out.push(id.name.clone()),
+        Expr::Unary { expr, .. } | Expr::Try { expr, .. } => collect_idents(expr, out),
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_idents(lhs, out);
+            collect_idents(rhs, out);
+        }
+        Expr::Call { callee, args, .. } => {
+            collect_idents(callee, out);
+            for a in args {
+                collect_idents(a, out);
+            }
+        }
+        Expr::MethodCall { recv, args, .. } => {
+            collect_idents(recv, out);
+            for a in args {
+                collect_idents(a, out);
+            }
+        }
+        Expr::Field { recv, .. } => collect_idents(recv, out),
+        Expr::Index { recv, index, .. } => {
+            collect_idents(recv, out);
+            collect_idents(index, out);
+        }
+        Expr::List(items, _) | Expr::Tuple(items, _) => {
+            for i in items {
+                collect_idents(i, out);
+            }
+        }
+        Expr::Str(pieces, _) => {
+            for p in pieces {
+                if let StrPiece::Expr(inner) = p {
+                    collect_idents(inner, out);
+                }
+            }
+        }
+        Expr::Closure { body, .. } => collect_idents(body, out),
+        Expr::Block(b) => collect_idents_block(b, out),
+        Expr::If {
+            cond,
+            then_block,
+            else_branch,
+            ..
+        } => {
+            collect_idents(cond, out);
+            collect_idents_block(then_block, out);
+            match else_branch.as_deref() {
+                Some(grasm_syntax::ast::ElseBranch::Else(b)) => collect_idents_block(b, out),
+                Some(grasm_syntax::ast::ElseBranch::ElseIf(inner)) => collect_idents(inner, out),
+                None => {}
+            }
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            collect_idents(scrutinee, out);
+            for arm in arms {
+                if let Some(g) = &arm.guard {
+                    collect_idents(g, out);
+                }
+                collect_idents(&arm.body, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_idents_block(b: &grasm_syntax::ast::Block, out: &mut Vec<String>) {
+    for stmt in &b.stmts {
+        match stmt {
+            Stmt::Let { init, .. } => collect_idents(init, out),
+            Stmt::Assign { target, value, .. } => {
+                collect_idents(target, out);
+                collect_idents(value, out);
+            }
+            Stmt::Return(Some(e), _) | Stmt::Expr(e) => collect_idents(e, out),
+            Stmt::While { cond, body, .. } => {
+                collect_idents(cond, out);
+                collect_idents_block(body, out);
+            }
+            Stmt::For { iter, body, .. } => {
+                collect_idents(iter, out);
+                collect_idents_block(body, out);
+            }
+            Stmt::Parallel { body, .. } | Stmt::Spawn { body, .. } => {
+                collect_idents_block(body, out)
+            }
+            Stmt::With { handler, body, .. } => {
+                collect_idents(handler, out);
+                collect_idents_block(body, out);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Every `spawn` body inside a `parallel` block, in source order.
@@ -1431,6 +1824,7 @@ impl FnCx<'_, '_> {
         blk: &grasm_syntax::ast::Block,
     ) -> CResult<(Option<(Value, VType)>, bool)> {
         self.push_scope();
+        self.closure_hints.push(collect_block_hints(blk));
         let mut last: Option<(Value, VType)> = None;
         let mut terminated = false;
         for (i, stmt) in blk.stmts.iter().enumerate() {
@@ -1452,6 +1846,7 @@ impl FnCx<'_, '_> {
         } else {
             self.pop_scope_with_decs();
         }
+        self.closure_hints.pop();
         Ok((last, terminated))
     }
 
@@ -1465,7 +1860,16 @@ impl FnCx<'_, '_> {
                     Some(te) => Some(self.cg.vtype_of(te)?),
                     None => None,
                 };
-                let (mut v, mut vt) = self.eval_expr_expecting(init, expected.as_ref())?;
+                // A closure needs to know what it was bound to: that name is
+                // how its parameter types are found at a call site.
+                let (mut v, mut vt) = match init {
+                    Expr::Closure {
+                        params,
+                        body,
+                        span: cspan,
+                    } => self.make_closure_value(params, body, Some(&name.name), *cspan)?,
+                    _ => self.eval_expr_expecting(init, expected.as_ref())?,
+                };
                 if let Some(te) = ty {
                     let want = self.cg.vtype_of(te)?;
                     if want == VType::F64 && vt == VType::I64 {
@@ -1937,10 +2341,11 @@ impl FnCx<'_, '_> {
                     }
                     Ok(Some((v, vt)))
                 }
-                None if self.lookup_fn(&id.name).is_some() => nope(
-                    id.span,
-                    "function values (passing a function as data)",
-                ),
+                None if self.lookup_fn(&id.name).is_some() => {
+                    let key = format!("{}::{}", self.cg.current_module, id.name);
+                    let (v, vt) = self.make_named_fn_value(&key, id.span)?;
+                    Ok(Some((v, vt)))
+                }
                 None => {
                     // Nullary variant as a value (None, Dot, Red, ...).
                     if let Some((parent, 0)) = self.cg.variant_index.get(&id.name).cloned() {
@@ -1955,6 +2360,10 @@ impl FnCx<'_, '_> {
                     nope(id.span, format!("the name `{}` here", id.name))
                 }
             },
+            Expr::Closure { params, body, span } => {
+                let (v, vt) = self.make_closure_value(params, body, None, *span)?;
+                Ok(Some((v, vt)))
+            }
             Expr::Str(pieces, _) => Ok(Some(self.build_string(pieces)?)),
             Expr::List(items, span) => {
                 let elem_t = self.list_elem_type(items, *span)?;
@@ -2045,10 +2454,6 @@ impl FnCx<'_, '_> {
                 scrutinee, arms, span,
             } => self.eval_match(scrutinee, arms, *span),
             Expr::Try { expr, span } => self.eval_try(expr, *span).map(Some),
-            Expr::Closure { span, .. } => nope(
-                *span,
-                "closures outside `map`/`filter` (those are inlined natively)",
-            ),
             other => nope(
                 other.span(),
                 match other {
@@ -3098,8 +3503,13 @@ impl FnCx<'_, '_> {
         let Expr::Ident(id) = callee else {
             return nope(callee.span(), "indirect calls");
         };
-        if self.lookup(&id.name).is_some() {
-            return nope(id.span, "calling closure values");
+        // A local of function type is called indirectly; a local of any other
+        // type is not callable at all.
+        if let Some((var, vt)) = self.lookup(&id.name) {
+            let VType::Fn(param_ts, ret_t) = vt else {
+                return nope(id.span, "calling a value that is not a function");
+            };
+            return self.call_fn_value(var, &param_ts, &ret_t, args, id.span);
         }
         match id.name.as_str() {
             "print" => {
@@ -3595,6 +4005,21 @@ impl FnCx<'_, '_> {
             Expr::Bool(..) => VType::Bool,
             Expr::Str(..) => VType::Str,
             Expr::List(items, span) => VType::List(Box::new(self.list_elem_type(items, *span)?)),
+            Expr::Closure { params, body, span } => {
+                // Probing must not lift anything; only the shape is needed.
+                let param_types = self.closure_param_types(params, None, *span)?;
+                let _ = body;
+                self.push_scope();
+                for (p, pt) in params.iter().zip(&param_types) {
+                    let var = self.new_var(pt);
+                    let zero = self.b.ins().iconst(pt.cl(), 0);
+                    self.b.def_var(var, zero);
+                    self.bind(&p.name, var, pt.clone());
+                }
+                let ret = self.probe_type(body);
+                self.pop_scope_no_decs();
+                VType::Fn(param_types, Box::new(ret?))
+            }
             Expr::Index { recv, span, .. } => match self.probe_type(recv)? {
                 VType::List(e) => *e,
                 VType::Map(_, v) => VType::Option(v),
@@ -3640,11 +4065,8 @@ impl FnCx<'_, '_> {
                         self.sum_vtype(&parent)
                     } else if id.name == "None" {
                         VType::Option(Box::new(VType::Any))
-                    } else if self.lookup_fn(&id.name).is_some() {
-                        return nope(
-                            id.span,
-                            "function values (passing a function as data)",
-                        );
+                    } else if let Some(sig) = self.lookup_fn(&id.name) {
+                        VType::Fn(sig.params.clone(), Box::new(sig.ret.clone()))
                     } else {
                         return nope(id.span, "inferring this type");
                     }
@@ -3652,6 +4074,11 @@ impl FnCx<'_, '_> {
             },
             Expr::Call { callee, args, .. } => {
                 if let Expr::Ident(id) = &**callee {
+                    // A local holding a function value shadows a function of
+                    // the same name, so it is checked first.
+                    if let Some((_, VType::Fn(_, ret))) = self.lookup(&id.name) {
+                        return Ok(*ret);
+                    }
                     if let Some(sig) = self.lookup_fn(&id.name) {
                         return Ok(sig.ret.clone());
                     }
@@ -4116,6 +4543,226 @@ impl FnCx<'_, '_> {
                 }
             }
         }
+    }
+
+    /// Calls a function value held in `var`: unpack the code pointer and the
+    /// environment, then call indirectly with the environment first.
+    fn call_fn_value(
+        &mut self,
+        var: Variable,
+        param_ts: &[VType],
+        ret_t: &VType,
+        args: &[Expr],
+        span: Span,
+    ) -> CResult<Option<(Value, VType)>> {
+        if args.len() != param_ts.len() {
+            return nope(span, "calling a function value with a different arity");
+        }
+        let fv = self.b.use_var(var);
+        let code = self.call_rt("grasm_fn_code", &[fv]).unwrap();
+        let env = self.call_rt("grasm_fn_env", &[fv]).unwrap();
+
+        let ptr_ty = self.cg.module.target_config().pointer_type();
+        let mut sig = self.cg.module.make_signature();
+        sig.params.push(AbiParam::new(ptr_ty));
+        for p in param_ts {
+            sig.params.push(AbiParam::new(p.cl()));
+        }
+        if *ret_t != VType::Unit {
+            sig.returns.push(AbiParam::new(ret_t.cl()));
+        }
+        let sig_ref = self.b.import_signature(sig);
+
+        let mut vals = vec![env];
+        for (a, want) in args.iter().zip(param_ts) {
+            let (mut v, vt) = self.eval_expr_val(a)?;
+            if *want == VType::F64 && vt == VType::I64 {
+                v = self.b.ins().fcvt_from_sint(types::F64, v);
+            }
+            vals.push(v);
+        }
+        let inst = self.b.ins().call_indirect(sig_ref, code, &vals);
+        let results: Vec<Value> = self.b.inst_results(inst).to_vec();
+        Ok(if *ret_t == VType::Unit {
+            None
+        } else {
+            Some((results[0], ret_t.clone()))
+        })
+    }
+
+    /// Builds a function value from a named function.
+    fn make_named_fn_value(&mut self, key: &str, span: Span) -> CResult<(Value, VType)> {
+        let sig_info = self.cg.fns[key].clone();
+        let wrapper = self.cg.fn_value_wrapper(key, span)?;
+        let fref = self.cg.module.declare_func_in_func(wrapper, self.b.func);
+        let ptr_ty = self.cg.module.target_config().pointer_type();
+        let code = self.b.ins().func_addr(ptr_ty, fref);
+        // No captures, so the environment is an empty list rather than null:
+        // one shape for every function value keeps the call site simple.
+        let env = self.call_rt("grasm_list_new", &[]).unwrap();
+        let (name_p, name_l) = self.str_ptr_len(key);
+        let v = self
+            .call_rt("grasm_fn_new", &[code, env, name_p, name_l])
+            .unwrap();
+        Ok((v, VType::Fn(sig_info.params, Box::new(sig_info.ret))))
+    }
+
+    /// Builds a function value from a closure literal, lifting its body.
+    ///
+    /// Free variables are captured *by value* at this point, matching the
+    /// interpreter: a closure that mutates a captured binding cannot be
+    /// observed doing so from outside ([E-VALUE-SEMANTICS]).
+    fn make_closure_value(
+        &mut self,
+        params: &[Ident],
+        body: &Expr,
+        binding: Option<&str>,
+        span: Span,
+    ) -> CResult<(Value, VType)> {
+        let param_types = self.closure_param_types(params, binding, span)?;
+        let captures = self.closure_captures(params, body);
+
+        // Probe the body's type with the parameters and captures bound, so the
+        // lifted function's return type is known before it is compiled.
+        self.push_scope();
+        for (name, vt) in &captures {
+            let var = self.new_var(vt);
+            let zero = self.b.ins().iconst(vt.cl(), 0);
+            self.b.def_var(var, zero);
+            self.bind(name, var, vt.clone());
+        }
+        for (p, pt) in params.iter().zip(&param_types) {
+            let var = self.new_var(pt);
+            let zero = self.b.ins().iconst(pt.cl(), 0);
+            self.b.def_var(var, zero);
+            self.bind(&p.name, var, pt.clone());
+        }
+        let ret = self.probe_type(body);
+        self.pop_scope_no_decs();
+        let ret = ret?;
+
+        let ptr_ty = self.cg.module.target_config().pointer_type();
+        let mut sig = self.cg.module.make_signature();
+        sig.params.push(AbiParam::new(ptr_ty));
+        for t in &param_types {
+            sig.params.push(AbiParam::new(t.cl()));
+        }
+        if ret != VType::Unit {
+            sig.returns.push(AbiParam::new(ret.cl()));
+        }
+        let sym = format!("gc_{}_{}", self.cg.current_module.replace('.', "_"), span.start);
+        let id = self
+            .cg
+            .module
+            .declare_function(&sym, Linkage::Local, &sig)
+            .map_err(|e| Unsupported {
+                span,
+                what: format!("(module error: {e})"),
+            })?;
+        self.cg.pending_closures.push(PendingClosure {
+            id,
+            module: self.cg.current_module.clone(),
+            captures: captures.clone(),
+            params: params
+                .iter()
+                .map(|p| p.name.clone())
+                .zip(param_types.iter().cloned())
+                .collect(),
+            ret: ret.clone(),
+            body: body.clone(),
+        });
+
+        // Build the environment in the same order the lifted body unpacks it.
+        let mut env = self.call_rt("grasm_list_new", &[]).unwrap();
+        for (name, vt) in &captures {
+            let (var, _) = self.lookup(name).expect("capture was resolved above");
+            let v = self.b.use_var(var);
+            if vt.boxed() {
+                self.call_rt("grasm_val_inc", &[v]);
+            }
+            let boxed = self.box_value(v, vt);
+            env = self.call_rt("grasm_list_push", &[env, boxed]).unwrap();
+        }
+        let fref = self.cg.module.declare_func_in_func(id, self.b.func);
+        let code = self.b.ins().func_addr(ptr_ty, fref);
+        let empty = self.b.ins().iconst(types::I64, 0);
+        let v = self
+            .call_rt("grasm_fn_new", &[code, env, empty, empty])
+            .unwrap();
+        Ok((v, VType::Fn(param_types, Box::new(ret))))
+    }
+
+    /// Parameter types of a closure literal, inferred from how the body uses
+    /// them. Only a few shapes are inferable without a function-type syntax,
+    /// so anything else is reported rather than assumed.
+    fn closure_param_types(
+        &mut self,
+        params: &[Ident],
+        binding: Option<&str>,
+        span: Span,
+    ) -> CResult<Vec<VType>> {
+        if params.is_empty() {
+            return Ok(Vec::new());
+        }
+        // The parameter types come from a call site of whatever the closure
+        // was bound to. Nothing else in the language says what they are.
+        let hint = binding.and_then(|name| {
+            self.closure_hints
+                .iter()
+                .rev()
+                .find_map(|scope| scope.calls.get(name).cloned())
+        });
+        let Some(args) = hint else {
+            return nope(
+                span,
+                "a closure with parameters used as a value without being called \
+(its parameter types have nothing to come from)",
+            );
+        };
+        if args.len() != params.len() {
+            return nope(span, "a closure called with a different arity");
+        }
+        let mut out = Vec::with_capacity(params.len());
+        for a in &args {
+            out.push(self.probe_arg_type(a)?);
+        }
+        Ok(out)
+    }
+
+    /// Types a call-site argument that may name a binding declared later in
+    /// the block, which is legal for the *call* even though the closure is
+    /// lowered earlier.
+    fn probe_arg_type(&mut self, a: &Expr) -> CResult<VType> {
+        if let Ok(t) = self.probe_type(a) {
+            return Ok(t);
+        }
+        if let Expr::Ident(id) = a {
+            let init = self
+                .closure_hints
+                .iter()
+                .rev()
+                .find_map(|scope| scope.inits.get(&id.name).cloned());
+            if let Some(init) = init {
+                return self.probe_type(&init);
+            }
+        }
+        self.probe_type(a)
+    }
+
+    /// Locals the closure body refers to, in a stable order.
+    fn closure_captures(&mut self, params: &[Ident], body: &Expr) -> Vec<(String, VType)> {
+        let mut names = Vec::new();
+        collect_idents(body, &mut names);
+        let mut out: Vec<(String, VType)> = Vec::new();
+        for n in names {
+            if params.iter().any(|p| p.name == n) || out.iter().any(|(o, _)| *o == n) {
+                continue;
+            }
+            if let Some((_, vt)) = self.lookup(&n) {
+                out.push((n, vt));
+            }
+        }
+        out
     }
 
     /// Lowers `parallel { … }`.

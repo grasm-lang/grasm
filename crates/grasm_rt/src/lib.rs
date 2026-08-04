@@ -133,6 +133,17 @@ pub enum RtPayload {
         name: String,
         fields: Vec<*mut RtVal>,
     },
+    /// A function value: code address plus the environment it captured.
+    ///
+    /// One representation covers both a named function and a closure. `env` is
+    /// a list of captured values (null when there are none), and `name` is the
+    /// qualified function name for a named function — closures have none, and
+    /// print as `<closure>`.
+    Fn {
+        code: i64,
+        env: *mut RtVal,
+        name: Option<String>,
+    },
 }
 
 pub struct RtVal {
@@ -232,6 +243,11 @@ unsafe fn dec(v: *mut RtVal) {
                     dec(*fv);
                 }
             }
+            RtPayload::Fn { env, .. } => {
+                if !env.is_null() {
+                    dec(*env);
+                }
+            }
             RtPayload::Variant { fields, .. } => {
                 for &fv in fields {
                     dec(fv);
@@ -316,6 +332,50 @@ pub unsafe extern "C" fn grasm_str_cmp(a: *mut RtVal, b: *mut RtVal) -> i64 {
 
 fn grasm_panic_msg_str(msg: &str) -> ! {
     rt_panic(msg);
+}
+
+// --- function values ---
+
+/// # Safety: `env` is an owned list pointer or null; `name` is a live slice.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_fn_new(
+    code: i64,
+    env: *mut RtVal,
+    name_ptr: *const u8,
+    name_len: i64,
+) -> *mut RtVal {
+    let name = if name_len > 0 {
+        let bytes = std::slice::from_raw_parts(name_ptr, name_len as usize);
+        Some(String::from_utf8_lossy(bytes).into_owned())
+    } else {
+        None
+    };
+    alloc(RtPayload::Fn { code, env, name })
+}
+
+/// # Safety: live function value.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_fn_code(v: *mut RtVal) -> i64 {
+    match &(*v).payload {
+        RtPayload::Fn { code, .. } => *code,
+        _ => grasm_panic_msg_str("call of a non-function value"),
+    }
+}
+
+/// Borrows the captured environment (+1 so the caller may hold it).
+///
+/// # Safety: live function value.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_fn_env(v: *mut RtVal) -> *mut RtVal {
+    match &(*v).payload {
+        RtPayload::Fn { env, .. } => {
+            if !env.is_null() {
+                inc(*env);
+            }
+            *env
+        }
+        _ => grasm_panic_msg_str("environment of a non-function value"),
+    }
 }
 
 // --- lists ---
@@ -461,6 +521,12 @@ unsafe fn display(v: *mut RtVal) -> String {
                 format!("{name}({})", parts.join(", "))
             }
         }
+        // Matches the interpreter: a named function shows its qualified name,
+        // a closure has none to show.
+        RtPayload::Fn { name, .. } => match name {
+            Some(n) => format!("<fn {n}>"),
+            None => "<closure>".to_string(),
+        },
         RtPayload::I64(x) => x.to_string(),
         RtPayload::F64(x) => {
             if x.fract() == 0.0 && x.is_finite() && x.abs() < 1e15 {
@@ -747,69 +813,8 @@ pub unsafe extern "C" fn grasm_str_from_val(v: *mut RtVal) -> *mut RtVal {
 }
 
 // ---------------------------------------------------------------------------
-// N4: closures, maps, builtin method surface
+// Maps and the builtin method surface
 // ---------------------------------------------------------------------------
-
-/// Closure object: code pointer + captured environment (list of boxed values).
-pub struct RtClosure {
-    pub rc: Cell<i64>,
-    pub code: *const u8,
-    pub env: Vec<*mut RtVal>,
-}
-
-/// # Safety: `code` is a compiler-emitted function pointer.
-#[no_mangle]
-pub unsafe extern "C" fn grasm_closure_new(code: *const u8, cap: i64) -> *mut RtClosure {
-    Box::into_raw(Box::new(RtClosure {
-        rc: Cell::new(1),
-        code,
-        env: Vec::with_capacity(cap.max(0) as usize),
-    }))
-}
-
-/// # Safety: `val` ownership transfers into the closure environment.
-#[no_mangle]
-pub unsafe extern "C" fn grasm_closure_push(c: *mut RtClosure, val: *mut RtVal) {
-    let env = &mut (*c).env;
-    env.push(val);
-}
-
-/// # Safety: live closure; returns the raw code pointer.
-#[no_mangle]
-pub unsafe extern "C" fn grasm_closure_code(c: *mut RtClosure) -> *const u8 {
-    (*c).code
-}
-
-/// # Safety: live closure; returns captured slot i WITHOUT an rc bump
-/// (callee treats it as borrowed for the call's duration).
-#[no_mangle]
-pub unsafe extern "C" fn grasm_closure_env(c: *mut RtClosure, i: i64) -> *mut RtVal {
-    let env = &(*c).env;
-    env[i as usize]
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn grasm_closure_inc(c: *mut RtClosure) {
-    if !c.is_null() {
-        let rc = &(*c).rc;
-        rc.set(rc.get() + 1);
-    }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn grasm_closure_dec(c: *mut RtClosure) {
-    if c.is_null() {
-        return;
-    }
-    let rc = &(*c).rc;
-    rc.set(rc.get() - 1);
-    if rc.get() <= 0 {
-        let boxed = Box::from_raw(c);
-        for &e in &boxed.env {
-            dec(e);
-        }
-    }
-}
 
 // --- maps (sorted, deterministic iteration like the interpreter) ---
 

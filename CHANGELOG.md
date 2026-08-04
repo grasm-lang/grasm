@@ -33,8 +33,12 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   `parallel`/`spawn` lower to a recorded list of spawn-site indices dispatched
   after the block, so ordering and joining match the interpreter without
   closures or environment capture. Generic functions are monomorphized per
-  instantiation, including across module boundaries. Native coverage goes from
-  103 programs to 112, with one gap left: function values.
+  instantiation, including across module boundaries.
+- **The native backend compiles function values.** A named function used as
+  data, a closure bound to a name, closures capturing their environment, and
+  lists of either — all dispatched through an indirect call. Native coverage
+  goes from 103 programs to **113 of 113: nothing in the repository is left to
+  the interpreter.**
 
 ### Fixed
 
