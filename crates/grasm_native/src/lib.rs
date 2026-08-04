@@ -50,6 +50,7 @@ enum VType {
     Option(Box<VType>),
     /// `T ! E` — boxed Ok/Err variant wrapper around T.
     Fallible(Box<VType>),
+    Map(Box<VType>, Box<VType>),
     /// Dynamically-typed boxed value (error payloads); printable + variant-matchable.
     Any,
 }
@@ -68,6 +69,7 @@ impl VType {
             | VType::Sum(_)
             | VType::Option(_)
             | VType::Fallible(_)
+            | VType::Map(_, _)
             | VType::Any => types::I64,
         }
     }
@@ -81,9 +83,11 @@ impl VType {
                 | VType::Sum(_)
                 | VType::Option(_)
                 | VType::Fallible(_)
+                | VType::Map(_, _)
                 | VType::Any
         )
     }
+
 }
 
 struct FnSig {
@@ -217,6 +221,54 @@ impl<'m> Codegen<'m> {
             ("grasm_val_eq", vec![i64t, i64t], Some(i8t)),
             ("grasm_list_get_opt", vec![i64t, i64t], Some(i64t)),
             ("grasm_str_from_val", vec![i64t], Some(i64t)),
+            ("grasm_closure_new", vec![ptr, i64t], Some(i64t)),
+            ("grasm_closure_push", vec![i64t, i64t], None),
+            ("grasm_closure_code", vec![i64t], Some(ptr)),
+            ("grasm_closure_env", vec![i64t, i64t], Some(i64t)),
+            ("grasm_closure_inc", vec![i64t], None),
+            ("grasm_closure_dec", vec![i64t], None),
+            ("grasm_map_new", vec![], Some(i64t)),
+            ("grasm_map_set", vec![i64t, i64t, i64t], Some(i64t)),
+            ("grasm_map_get", vec![i64t, i64t], Some(i64t)),
+            ("grasm_map_has", vec![i64t, i64t], Some(i8t)),
+            ("grasm_map_delete", vec![i64t, i64t, ptr], Some(i64t)),
+            ("grasm_map_len", vec![i64t], Some(i64t)),
+            ("grasm_map_keys", vec![i64t], Some(i64t)),
+            ("grasm_map_values", vec![i64t], Some(i64t)),
+            ("grasm_str_contains", vec![i64t, i64t], Some(i8t)),
+            ("grasm_str_starts_with", vec![i64t, i64t], Some(i8t)),
+            ("grasm_str_ends_with", vec![i64t, i64t], Some(i8t)),
+            ("grasm_str_split", vec![i64t, i64t], Some(i64t)),
+            ("grasm_str_chars", vec![i64t], Some(i64t)),
+            ("grasm_str_trim", vec![i64t], Some(i64t)),
+            ("grasm_str_upper", vec![i64t], Some(i64t)),
+            ("grasm_str_lower", vec![i64t], Some(i64t)),
+            ("grasm_str_repeat", vec![i64t, i64t], Some(i64t)),
+            ("grasm_str_replace", vec![i64t, i64t, i64t], Some(i64t)),
+            ("grasm_str_substr", vec![i64t, i64t, i64t], Some(i64t)),
+            ("grasm_str_index_of", vec![i64t, i64t], Some(i64t)),
+            ("grasm_str_parse_int", vec![i64t], Some(i64t)),
+            ("grasm_str_parse_float", vec![i64t], Some(i64t)),
+            ("grasm_list_join", vec![i64t, i64t], Some(i64t)),
+            ("grasm_list_rev", vec![i64t], Some(i64t)),
+            ("grasm_list_sort", vec![i64t], Some(i64t)),
+            ("grasm_list_slice", vec![i64t, i64t, i64t], Some(i64t)),
+            ("grasm_list_contains", vec![i64t, i64t], Some(i8t)),
+            ("grasm_list_pop", vec![i64t, ptr], Some(i64t)),
+            ("grasm_list_first", vec![i64t], Some(i64t)),
+            ("grasm_list_last", vec![i64t], Some(i64t)),
+            ("grasm_list_sum_i64", vec![i64t], Some(i64t)),
+            ("grasm_list_sum_f64", vec![i64t], Some(f64t)),
+            ("grasm_i64_abs", vec![i64t], Some(i64t)),
+            ("grasm_i64_min", vec![i64t, i64t], Some(i64t)),
+            ("grasm_i64_max", vec![i64t, i64t], Some(i64t)),
+            ("grasm_f64_abs", vec![f64t], Some(f64t)),
+            ("grasm_f64_sqrt", vec![f64t], Some(f64t)),
+            ("grasm_f64_floor", vec![f64t], Some(f64t)),
+            ("grasm_f64_ceil", vec![f64t], Some(f64t)),
+            ("grasm_f64_round", vec![f64t], Some(f64t)),
+            ("grasm_f64_min", vec![f64t, f64t], Some(f64t)),
+            ("grasm_f64_max", vec![f64t, f64t], Some(f64t)),
         ];
         for (name, params, ret) in decls {
             let mut sig = self.module.make_signature();
@@ -258,6 +310,12 @@ impl<'m> Codegen<'m> {
                     }
                     if n == "Option" && args.len() == 1 {
                         return Ok(VType::Option(Box::new(self.vtype_of(&args[0])?)));
+                    }
+                    if n == "Map" && args.len() == 2 {
+                        return Ok(VType::Map(
+                            Box::new(self.vtype_of(&args[0])?),
+                            Box::new(self.vtype_of(&args[1])?),
+                        ));
                     }
                 }
                 nope(*span, format!("the type `{}`", path.dotted()))
@@ -578,6 +636,16 @@ impl FnCx<'_, '_> {
         var
     }
 
+    /// Updates the recorded static type of an existing binding.
+    fn rebind(&mut self, name: &str, var: Variable, vt: VType) {
+        for scope in self.vars.iter_mut().rev() {
+            if scope.contains_key(name) {
+                scope.insert(name.to_string(), (var, vt));
+                return;
+            }
+        }
+    }
+
     fn bind(&mut self, name: &str, var: Variable, vt: VType) {
         self.vars
             .last_mut()
@@ -660,7 +728,12 @@ impl FnCx<'_, '_> {
             Stmt::Let {
                 name, ty, init, ..
             } => {
-                let (mut v, mut vt) = self.eval_expr_val(init)?;
+                // An annotation gives empty collection literals their type.
+                let expected = match ty {
+                    Some(te) => Some(self.cg.vtype_of(te)?),
+                    None => None,
+                };
+                let (mut v, mut vt) = self.eval_expr_expecting(init, expected.as_ref())?;
                 if let Some(te) = ty {
                     let want = self.cg.vtype_of(te)?;
                     if want == VType::F64 && vt == VType::I64 {
@@ -988,6 +1061,32 @@ impl FnCx<'_, '_> {
         }
     }
 
+    /// Like `eval_expr_val`, but an expected type supplies the element type
+    /// for empty collection literals (`let xs: [i64] = []`).
+    fn eval_expr_expecting(
+        &mut self,
+        e: &Expr,
+        expected: Option<&VType>,
+    ) -> CResult<(Value, VType)> {
+        if let (Expr::List(items, _), Some(VType::List(elem_t))) = (e, expected) {
+            if items.is_empty() {
+                let v = self.call_rt("grasm_list_new", &[]).unwrap();
+                return Ok((v, VType::List(elem_t.clone())));
+            }
+        }
+        if let (Expr::Call { callee, args, .. }, Some(VType::Map(k, v))) = (e, expected) {
+            if args.is_empty() {
+                if let Expr::Ident(id) = &**callee {
+                    if id.name == "map" && self.lookup("map").is_none() {
+                        let m = self.call_rt("grasm_map_new", &[]).unwrap();
+                        return Ok((m, VType::Map(k.clone(), v.clone())));
+                    }
+                }
+            }
+        }
+        self.eval_expr_val(e)
+    }
+
     fn eval_expr(&mut self, e: &Expr) -> CResult<Option<(Value, VType)>> {
         match e {
             Expr::Int(v, _) => Ok(Some((self.b.ins().iconst(types::I64, *v), VType::I64))),
@@ -1097,6 +1196,10 @@ impl FnCx<'_, '_> {
                 scrutinee, arms, span,
             } => self.eval_match(scrutinee, arms, *span),
             Expr::Try { expr, span } => self.eval_try(expr, *span).map(Some),
+            Expr::Closure { span, .. } => nope(
+                *span,
+                "closures outside `map`/`filter` (those are inlined natively)",
+            ),
             other => nope(
                 other.span(),
                 match other {
@@ -1169,6 +1272,77 @@ impl FnCx<'_, '_> {
         args: &[Expr],
         span: Span,
     ) -> CResult<Option<(Value, VType)>> {
+        // Mutating map/list methods on a variable receiver.
+        if matches!(name.name.as_str(), "set" | "delete" | "pop" | "sort") {
+            if let Expr::Ident(id) = recv {
+                if let Some((var, vt)) = self.lookup(&id.name) {
+                    match (&vt, name.name.as_str()) {
+                        (VType::Map(k_t, v_t), "set") => {
+                            let (kt, vt2) = (k_t.clone(), v_t.clone());
+                            let (kv, kvt) = self.eval_expr_val(&args[0])?;
+                            let kb = self.box_value(kv, &kvt);
+                            let (vv, vvt) = self.eval_expr_val(&args[1])?;
+                            let vb = self.box_value(vv, &vvt);
+                            let cur = self.b.use_var(var);
+                            let np = self.call_rt("grasm_map_set", &[cur, kb, vb]).unwrap();
+                            // Refine the map's element types once known.
+                            let refined = VType::Map(
+                                if *kt == VType::Any { Box::new(kvt) } else { kt },
+                                if *vt2 == VType::Any { Box::new(vvt) } else { vt2 },
+                            );
+                            self.rebind(&id.name, var, refined);
+                            self.b.def_var(var, np);
+                            return Ok(None);
+                        }
+                        (VType::Map(_, _), "delete") => {
+                            let (kv, kvt) = self.eval_expr_val(&args[0])?;
+                            let kb = self.box_value(kv, &kvt);
+                            let slot = self.b.create_sized_stack_slot(
+                                cranelift_codegen::ir::StackSlotData::new(
+                                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                                    8,
+                                    3,
+                                ),
+                            );
+                            let ptr_ty = self.cg.module.target_config().pointer_type();
+                            let addr = self.b.ins().stack_addr(ptr_ty, slot, 0);
+                            let cur = self.b.use_var(var);
+                            let np = self
+                                .call_rt("grasm_map_delete", &[cur, kb, addr])
+                                .unwrap();
+                            self.b.def_var(var, np);
+                            self.call_rt("grasm_val_dec", &[kb]);
+                            let found = self.b.ins().stack_load(types::I8, slot, 0);
+                            return Ok(Some((found, VType::Bool)));
+                        }
+                        (VType::List(e), "pop") => {
+                            let et = e.clone();
+                            let ptr_ty = self.cg.module.target_config().pointer_type();
+                            let slot = self.b.create_sized_stack_slot(
+                                cranelift_codegen::ir::StackSlotData::new(
+                                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                                    8,
+                                    3,
+                                ),
+                            );
+                            let addr = self.b.ins().stack_addr(ptr_ty, slot, 0);
+                            let cur = self.b.use_var(var);
+                            let np = self.call_rt("grasm_list_pop", &[cur, addr]).unwrap();
+                            self.b.def_var(var, np);
+                            let opt = self.b.ins().stack_load(types::I64, slot, 0);
+                            return Ok(Some((opt, VType::Option(et))));
+                        }
+                        (VType::List(_), "sort") => {
+                            let cur = self.b.use_var(var);
+                            let np = self.call_rt("grasm_list_sort", &[cur]).unwrap();
+                            self.b.def_var(var, np);
+                            return Ok(None);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
         // Mutating list push on a variable.
         if name.name == "push" {
             let Expr::Ident(id) = recv else {
@@ -1239,19 +1413,288 @@ impl FnCx<'_, '_> {
                 _ => {}
             }
         }
-        match (&rt, name.name.as_str()) {
+        self.dispatch_method(rv, rt, name, args, span)
+    }
+
+    /// Full builtin-method surface over an owned receiver value.
+    fn dispatch_method(
+        &mut self,
+        rv: Value,
+        rt: VType,
+        name: &Ident,
+        args: &[Expr],
+        span: Span,
+    ) -> CResult<Option<(Value, VType)>> {
+        let m = name.name.as_str();
+        // Helper closures can't borrow self; inline the arg evaluation.
+        macro_rules! arg_boxed {
+            ($i:expr) => {{
+                let (av, avt) = self.eval_expr_val(&args[$i])?;
+                self.box_value(av, &avt)
+            }};
+        }
+        macro_rules! arg_scalar {
+            ($i:expr, $want:expr) => {{
+                let (av, avt) = self.eval_expr_val(&args[$i])?;
+                if avt != $want {
+                    return nope(args[$i].span(), "an argument of a different type");
+                }
+                av
+            }};
+        }
+        let out: (Value, VType) = match (&rt, m) {
+            // ---- str ----
             (VType::Str, "len") => {
                 let v = self.call_rt("grasm_str_len", &[rv]).unwrap();
                 self.call_rt("grasm_val_dec", &[rv]);
-                Ok(Some((v, VType::I64)))
+                (v, VType::I64)
             }
+            (VType::Str, "contains" | "starts_with" | "ends_with") => {
+                let a = arg_boxed!(0);
+                let f = match m {
+                    "contains" => "grasm_str_contains",
+                    "starts_with" => "grasm_str_starts_with",
+                    _ => "grasm_str_ends_with",
+                };
+                let v = self.call_rt(f, &[rv, a]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                self.call_rt("grasm_val_dec", &[a]);
+                (v, VType::Bool)
+            }
+            (VType::Str, "split") => {
+                let a = arg_boxed!(0);
+                let v = self.call_rt("grasm_str_split", &[rv, a]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                self.call_rt("grasm_val_dec", &[a]);
+                (v, VType::List(Box::new(VType::Str)))
+            }
+            (VType::Str, "chars") => {
+                let v = self.call_rt("grasm_str_chars", &[rv]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                (v, VType::List(Box::new(VType::Str)))
+            }
+            (VType::Str, "trim" | "to_upper" | "to_lower") => {
+                let f = match m {
+                    "trim" => "grasm_str_trim",
+                    "to_upper" => "grasm_str_upper",
+                    _ => "grasm_str_lower",
+                };
+                let v = self.call_rt(f, &[rv]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                (v, VType::Str)
+            }
+            (VType::Str, "repeat") => {
+                let n = arg_scalar!(0, VType::I64);
+                let v = self.call_rt("grasm_str_repeat", &[rv, n]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                (v, VType::Str)
+            }
+            (VType::Str, "replace") => {
+                let a = arg_boxed!(0);
+                let b = arg_boxed!(1);
+                let v = self.call_rt("grasm_str_replace", &[rv, a, b]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                self.call_rt("grasm_val_dec", &[a]);
+                self.call_rt("grasm_val_dec", &[b]);
+                (v, VType::Str)
+            }
+            (VType::Str, "substr") => {
+                let a = arg_scalar!(0, VType::I64);
+                let b = arg_scalar!(1, VType::I64);
+                let v = self.call_rt("grasm_str_substr", &[rv, a, b]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                (v, VType::Str)
+            }
+            (VType::Str, "index_of") => {
+                let a = arg_boxed!(0);
+                let v = self.call_rt("grasm_str_index_of", &[rv, a]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                self.call_rt("grasm_val_dec", &[a]);
+                (v, VType::Option(Box::new(VType::I64)))
+            }
+            (VType::Str, "parse_int") => {
+                let v = self.call_rt("grasm_str_parse_int", &[rv]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                (v, VType::Option(Box::new(VType::I64)))
+            }
+            (VType::Str, "parse_float") => {
+                let v = self.call_rt("grasm_str_parse_float", &[rv]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                (v, VType::Option(Box::new(VType::F64)))
+            }
+            // ---- list ----
             (VType::List(_), "len") => {
                 let v = self.call_rt("grasm_list_len", &[rv]).unwrap();
                 self.call_rt("grasm_val_dec", &[rv]);
-                Ok(Some((v, VType::I64)))
+                (v, VType::I64)
             }
-            _ => nope(span, format!("the method `{}`", name.name)),
-        }
+            (VType::List(e), "join") => {
+                let _ = e;
+                let a = arg_boxed!(0);
+                let v = self.call_rt("grasm_list_join", &[rv, a]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                self.call_rt("grasm_val_dec", &[a]);
+                (v, VType::Str)
+            }
+            (VType::List(e), "rev") => {
+                let et = e.clone();
+                let v = self.call_rt("grasm_list_rev", &[rv]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                (v, VType::List(et))
+            }
+            (VType::List(e), "slice") => {
+                let et = e.clone();
+                let a = arg_scalar!(0, VType::I64);
+                let b = arg_scalar!(1, VType::I64);
+                let v = self.call_rt("grasm_list_slice", &[rv, a, b]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                (v, VType::List(et))
+            }
+            (VType::List(_), "contains") => {
+                let a = arg_boxed!(0);
+                let v = self.call_rt("grasm_list_contains", &[rv, a]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                self.call_rt("grasm_val_dec", &[a]);
+                (v, VType::Bool)
+            }
+            (VType::List(e), "first" | "last") => {
+                let et = e.clone();
+                let f = if m == "first" {
+                    "grasm_list_first"
+                } else {
+                    "grasm_list_last"
+                };
+                let v = self.call_rt(f, &[rv]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                (v, VType::Option(et))
+            }
+            (VType::List(e), "sum") => {
+                let is_float = **e == VType::F64;
+                let f = if is_float {
+                    "grasm_list_sum_f64"
+                } else {
+                    "grasm_list_sum_i64"
+                };
+                let v = self.call_rt(f, &[rv]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                (v, if is_float { VType::F64 } else { VType::I64 })
+            }
+            (VType::List(e), "map" | "filter") => {
+                let elem_t = (**e).clone();
+                let Expr::Closure {
+                    params: cparams,
+                    body: cbody,
+                    ..
+                } = &args[0]
+                else {
+                    return nope(args[0].span(), "map/filter with a non-literal closure");
+                };
+                if cparams.len() != 1 {
+                    return nope(args[0].span(), "map/filter closures with multiple params");
+                }
+                let is_map = m == "map";
+                self.emit_list_transform(rv, &elem_t, &cparams[0], cbody, is_map)?
+            }
+            // ---- map ----
+            (VType::Map(_, v_t), "get") => {
+                let vt = v_t.clone();
+                let k = arg_boxed!(0);
+                let v = self.call_rt("grasm_map_get", &[rv, k]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                self.call_rt("grasm_val_dec", &[k]);
+                (v, VType::Option(vt))
+            }
+            (VType::Map(_, _), "has") => {
+                let k = arg_boxed!(0);
+                let v = self.call_rt("grasm_map_has", &[rv, k]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                self.call_rt("grasm_val_dec", &[k]);
+                (v, VType::Bool)
+            }
+            (VType::Map(_, _), "len") => {
+                let v = self.call_rt("grasm_map_len", &[rv]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                (v, VType::I64)
+            }
+            (VType::Map(k_t, _), "keys") => {
+                let kt = k_t.clone();
+                let v = self.call_rt("grasm_map_keys", &[rv]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                (v, VType::List(kt))
+            }
+            (VType::Map(_, v_t), "values") => {
+                let vt = v_t.clone();
+                let v = self.call_rt("grasm_map_values", &[rv]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                (v, VType::List(vt))
+            }
+            // ---- numeric ----
+            (VType::I64, "as_f64") => {
+                (self.b.ins().fcvt_from_sint(types::F64, rv), VType::F64)
+            }
+            (VType::I64, "to_str") => (
+                self.call_rt("grasm_str_from_i64", &[rv]).unwrap(),
+                VType::Str,
+            ),
+            (VType::I64, "abs") => (self.call_rt("grasm_i64_abs", &[rv]).unwrap(), VType::I64),
+            (VType::I64, "min" | "max") => {
+                let a = arg_scalar!(0, VType::I64);
+                let f = if m == "min" {
+                    "grasm_i64_min"
+                } else {
+                    "grasm_i64_max"
+                };
+                (self.call_rt(f, &[rv, a]).unwrap(), VType::I64)
+            }
+            (VType::F64, "as_i64") => (self.b.ins().fcvt_to_sint(types::I64, rv), VType::I64),
+            (VType::F64, "to_str") => (
+                self.call_rt("grasm_str_from_f64", &[rv]).unwrap(),
+                VType::Str,
+            ),
+            (VType::F64, "abs" | "sqrt" | "floor" | "ceil" | "round") => {
+                let f = match m {
+                    "abs" => "grasm_f64_abs",
+                    "sqrt" => "grasm_f64_sqrt",
+                    "floor" => "grasm_f64_floor",
+                    "ceil" => "grasm_f64_ceil",
+                    _ => "grasm_f64_round",
+                };
+                (self.call_rt(f, &[rv]).unwrap(), VType::F64)
+            }
+            (VType::F64, "min" | "max") => {
+                let a = arg_scalar!(0, VType::F64);
+                let f = if m == "min" {
+                    "grasm_f64_min"
+                } else {
+                    "grasm_f64_max"
+                };
+                (self.call_rt(f, &[rv, a]).unwrap(), VType::F64)
+            }
+            _ => {
+                // UFCS: x.f(a) → f(x, a).
+                if let Some(sig) = self.cg.fns.get(&name.name) {
+                    let (fid, params, ret) = (sig.id, sig.params.clone(), sig.ret.clone());
+                    let mut vals = vec![rv];
+                    for (a, want) in args.iter().zip(params.iter().skip(1)) {
+                        let (mut v, vt) = self.eval_expr_val(a)?;
+                        if *want == VType::F64 && vt == VType::I64 {
+                            v = self.b.ins().fcvt_from_sint(types::F64, v);
+                        }
+                        vals.push(v);
+                    }
+                    let fref = self.cg.module.declare_func_in_func(fid, self.b.func);
+                    let inst = self.b.ins().call(fref, &vals);
+                    let results = self.b.inst_results(inst);
+                    return Ok(if ret == VType::Unit {
+                        None
+                    } else {
+                        Some((results[0], ret))
+                    });
+                }
+                return nope(span, format!("the method `{}`", name.name));
+            }
+        };
+        Ok(Some(out))
     }
 
     fn short_circuit(
@@ -1536,7 +1979,7 @@ impl FnCx<'_, '_> {
             return nope(callee.span(), "indirect calls");
         };
         if self.lookup(&id.name).is_some() {
-            return nope(id.span, "calling closures");
+            return nope(id.span, "calling closure values");
         }
         match id.name.as_str() {
             "print" => {
@@ -1570,6 +2013,13 @@ impl FnCx<'_, '_> {
                     }
                 }
                 return nope(span, "panic with a non-literal message");
+            }
+            "map" => {
+                let m = self.call_rt("grasm_map_new", &[]).unwrap();
+                return Ok(Some((
+                    m,
+                    VType::Map(Box::new(VType::Any), Box::new(VType::Any)),
+                )));
             }
             "fail" => {
                 let (ev, evt) = self.eval_expr_val(&args[0])?;
@@ -2165,6 +2615,92 @@ impl FnCx<'_, '_> {
                 self.call_rt("grasm_val_dec", &[v]);
             }
         }
+    }
+
+    /// Inlines `list.map(|x| body)` / `list.filter(|x| body)` as a loop.
+    /// Consumes the owned `list`; returns (new list value, its type).
+    fn emit_list_transform(
+        &mut self,
+        list: Value,
+        elem_t: &VType,
+        param: &Ident,
+        body: &Expr,
+        is_map: bool,
+    ) -> CResult<(Value, VType)> {
+        let list_var = self.new_var(&VType::List(Box::new(elem_t.clone())));
+        self.b.def_var(list_var, list);
+        let out_var = self.new_var(&VType::List(Box::new(elem_t.clone())));
+        let out0 = self.call_rt("grasm_list_new", &[]).unwrap();
+        self.b.def_var(out_var, out0);
+        let ivar = self.new_var(&VType::I64);
+        let zero = self.b.ins().iconst(types::I64, 0);
+        self.b.def_var(ivar, zero);
+
+        let header = self.b.create_block();
+        let body_blk = self.b.create_block();
+        let step = self.b.create_block();
+        let exit = self.b.create_block();
+        self.b.ins().jump(header, &[]);
+
+        self.b.switch_to_block(header);
+        let lv = self.b.use_var(list_var);
+        let len = self.call_rt("grasm_list_len", &[lv]).unwrap();
+        let iv = self.b.use_var(ivar);
+        let c = self.b.ins().icmp(IntCC::SignedLessThan, iv, len);
+        self.b.ins().brif(c, body_blk, &[], exit, &[]);
+
+        self.b.switch_to_block(body_blk);
+        let lv2 = self.b.use_var(list_var);
+        let iv2 = self.b.use_var(ivar);
+        let boxed = self.call_rt("grasm_list_get", &[lv2, iv2]).unwrap();
+        let (ev, evt) = self.unbox(boxed, elem_t)?;
+        let evar = self.new_var(&evt);
+        self.b.def_var(evar, ev);
+        self.push_scope();
+        self.bind(&param.name, evar, evt.clone());
+        let (bv, bvt) = self.eval_expr_val(body)?;
+        let out_elem_t = if is_map { bvt.clone() } else { elem_t.clone() };
+        if is_map {
+            let bx = self.box_value(bv, &bvt);
+            let cur = self.b.use_var(out_var);
+            let np = self.call_rt("grasm_list_push", &[cur, bx]).unwrap();
+            self.b.def_var(out_var, np);
+            self.pop_scope_with_decs();
+            self.b.ins().jump(step, &[]);
+        } else {
+            if bvt != VType::Bool {
+                return nope(body.span(), "a non-bool filter predicate");
+            }
+            let keep = self.b.create_block();
+            let skip = self.b.create_block();
+            self.b.ins().brif(bv, keep, &[], skip, &[]);
+            self.b.switch_to_block(keep);
+            let e2 = self.b.use_var(evar);
+            if evt.boxed() {
+                self.call_rt("grasm_val_inc", &[e2]);
+            }
+            let bx = self.box_value(e2, &evt);
+            let cur = self.b.use_var(out_var);
+            let np = self.call_rt("grasm_list_push", &[cur, bx]).unwrap();
+            self.b.def_var(out_var, np);
+            self.b.ins().jump(skip, &[]);
+            self.b.switch_to_block(skip);
+            self.pop_scope_with_decs();
+            self.b.ins().jump(step, &[]);
+        }
+
+        self.b.switch_to_block(step);
+        let iv3 = self.b.use_var(ivar);
+        let one = self.b.ins().iconst(types::I64, 1);
+        let next = self.b.ins().iadd(iv3, one);
+        self.b.def_var(ivar, next);
+        self.b.ins().jump(header, &[]);
+
+        self.b.switch_to_block(exit);
+        let lv3 = self.b.use_var(list_var);
+        self.call_rt("grasm_val_dec", &[lv3]);
+        let out = self.b.use_var(out_var);
+        Ok((out, VType::List(Box::new(out_elem_t))))
     }
 
     /// Declares the *types* a pattern would bind, without emitting any code.

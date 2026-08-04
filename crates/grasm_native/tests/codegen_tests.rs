@@ -85,3 +85,34 @@ fn n3_guards_and_literal_patterns_compile() {
     )
     .expect("should compile");
 }
+
+#[test]
+fn n4_maps_and_methods_compile() {
+    compile(
+        "fn main() {\n    var m = map()\n    m.set(\"a\", 1)\n    print(\"{m.get(\"a\") ?? 0} {m.has(\"a\")} {m.len()} {m.keys()} {m.values()}\")\n    let s = \" Hi \"\n    print(\"{s.trim().to_upper()} {s.contains(\"H\")} {\"7\".parse_int() ?? 0}\")\n    var xs = [3, 1]\n    xs.sort()\n    print(\"{xs.rev()} {xs.first() ?? 0} {(0 - 2).abs()} {(4.0).sqrt()}\")\n}\n",
+    )
+    .expect("should compile");
+}
+
+#[test]
+fn n4_map_filter_inline_closures_compile() {
+    compile(
+        "fn main() {\n    let xs = [1, 2, 3]\n    print(\"{xs.map(|x| x * 2)} {xs.filter(|x| x > 1)}\")\n}\n",
+    )
+    .expect("should compile");
+}
+
+#[test]
+fn n4_closure_outside_map_filter_reported() {
+    let e = compile("fn main() {\n    let f = |x| x + 1\n    print(\"{f(1)}\")\n}\n")
+        .expect_err("first-class closures not supported yet");
+    assert!(e.contains("closures outside"), "got: {e}");
+}
+
+#[test]
+fn n4_annotated_empty_literals_compile() {
+    compile(
+        "fn main() {\n    var xs: [i64] = []\n    xs.push(1)\n    var m: Map[str, i64] = map()\n    m.set(\"k\", 1)\n    print(\"{xs.len()} {m.len()}\")\n}\n",
+    )
+    .expect("should compile");
+}

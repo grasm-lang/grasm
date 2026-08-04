@@ -1,6 +1,13 @@
 //! grasm_rt — the native runtime library linked into `grasm build --native`
 //! executables. Everything here is `extern "C"` and callable from Cranelift-
 //! generated code.
+//!
+//! Safety contract for every `unsafe extern "C"` entry point below: the only
+//! callers are Cranelift-emitted instructions from `grasm_native`, which pass
+//! pointers this runtime itself produced (and keeps alive via refcounts) plus
+//! interned UTF-8 name/data blobs the compiler embedded. Callers outside that
+//! contract are not supported.
+#![allow(clippy::missing_safety_doc)]
 
 use std::io::Write;
 
@@ -116,6 +123,7 @@ pub enum RtPayload {
     Bool(bool),
     Str(String),
     List(Vec<*mut RtVal>),
+    Map(Vec<(*mut RtVal, *mut RtVal)>),
     Struct {
         name: String,
         fields: Vec<(String, *mut RtVal)>,
@@ -162,6 +170,12 @@ unsafe fn dec(v: *mut RtVal) {
             RtPayload::List(items) => {
                 for &it in items {
                     dec(it);
+                }
+            }
+            RtPayload::Map(entries) => {
+                for &(k, v) in entries {
+                    dec(k);
+                    dec(v);
                 }
             }
             RtPayload::Struct { fields, .. } => {
@@ -407,6 +421,13 @@ unsafe fn display(v: *mut RtVal) -> String {
             let parts: Vec<String> = items.iter().map(|&i| display(i)).collect();
             format!("[{}]", parts.join(", "))
         }
+        RtPayload::Map(entries) => {
+            let parts: Vec<String> = entries
+                .iter()
+                .map(|&(k, v)| format!("{}: {}", display(k), display(v)))
+                .collect();
+            format!("{{{}}}", parts.join(", "))
+        }
     }
 }
 
@@ -608,6 +629,12 @@ unsafe fn val_eq(a: *mut RtVal, b: *mut RtVal) -> bool {
         (RtPayload::List(x), RtPayload::List(y)) => {
             x.len() == y.len() && x.iter().zip(y).all(|(&i, &j)| val_eq(i, j))
         }
+        (RtPayload::Map(x), RtPayload::Map(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .zip(y)
+                    .all(|(&(k1, v1), &(k2, v2))| val_eq(k1, k2) && val_eq(v1, v2))
+        }
         (
             RtPayload::Struct { name: n1, fields: f1 },
             RtPayload::Struct { name: n2, fields: f2 },
@@ -663,4 +690,580 @@ pub unsafe extern "C" fn grasm_list_get_opt(v: *mut RtVal, i: i64) -> *mut RtVal
 #[no_mangle]
 pub unsafe extern "C" fn grasm_str_from_val(v: *mut RtVal) -> *mut RtVal {
     alloc(RtPayload::Str(display(v)))
+}
+
+// ---------------------------------------------------------------------------
+// N4: closures, maps, builtin method surface
+// ---------------------------------------------------------------------------
+
+/// Closure object: code pointer + captured environment (list of boxed values).
+pub struct RtClosure {
+    pub rc: Cell<i64>,
+    pub code: *const u8,
+    pub env: Vec<*mut RtVal>,
+}
+
+/// # Safety: `code` is a compiler-emitted function pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_closure_new(code: *const u8, cap: i64) -> *mut RtClosure {
+    Box::into_raw(Box::new(RtClosure {
+        rc: Cell::new(1),
+        code,
+        env: Vec::with_capacity(cap.max(0) as usize),
+    }))
+}
+
+/// # Safety: `val` ownership transfers into the closure environment.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_closure_push(c: *mut RtClosure, val: *mut RtVal) {
+    let env = &mut (*c).env;
+    env.push(val);
+}
+
+/// # Safety: live closure; returns the raw code pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_closure_code(c: *mut RtClosure) -> *const u8 {
+    (*c).code
+}
+
+/// # Safety: live closure; returns captured slot i WITHOUT an rc bump
+/// (callee treats it as borrowed for the call's duration).
+#[no_mangle]
+pub unsafe extern "C" fn grasm_closure_env(c: *mut RtClosure, i: i64) -> *mut RtVal {
+    let env = &(*c).env;
+    env[i as usize]
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn grasm_closure_inc(c: *mut RtClosure) {
+    if !c.is_null() {
+        let rc = &(*c).rc;
+        rc.set(rc.get() + 1);
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn grasm_closure_dec(c: *mut RtClosure) {
+    if c.is_null() {
+        return;
+    }
+    let rc = &(*c).rc;
+    rc.set(rc.get() - 1);
+    if rc.get() <= 0 {
+        let boxed = Box::from_raw(c);
+        for &e in &boxed.env {
+            dec(e);
+        }
+    }
+}
+
+// --- maps (sorted, deterministic iteration like the interpreter) ---
+
+#[no_mangle]
+pub extern "C" fn grasm_map_new() -> *mut RtVal {
+    alloc(RtPayload::Map(Vec::new()))
+}
+
+unsafe fn map_key_ord(a: &RtVal, b: &RtVal) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    // Interpreter's MapKey order: Bool < Int < Str.
+    fn rank(p: &RtPayload) -> u8 {
+        match p {
+            RtPayload::Bool(_) => 0,
+            RtPayload::I64(_) => 1,
+            RtPayload::Str(_) => 2,
+            _ => 3,
+        }
+    }
+    let (ra, rb) = (rank(&a.payload), rank(&b.payload));
+    if ra != rb {
+        return ra.cmp(&rb);
+    }
+    match (&a.payload, &b.payload) {
+        (RtPayload::Bool(x), RtPayload::Bool(y)) => x.cmp(y),
+        (RtPayload::I64(x), RtPayload::I64(y)) => x.cmp(y),
+        (RtPayload::Str(x), RtPayload::Str(y)) => x.cmp(y),
+        _ => Ordering::Equal,
+    }
+}
+
+unsafe fn cow_map(m: *mut RtVal) -> *mut RtVal {
+    if (*m).rc.get() == 1 {
+        return m;
+    }
+    let RtPayload::Map(entries) = &(*m).payload else {
+        grasm_panic_msg_str("map op on non-map");
+    };
+    let cloned: Vec<(*mut RtVal, *mut RtVal)> = entries
+        .iter()
+        .map(|&(k, v)| {
+            inc(k);
+            inc(v);
+            (k, v)
+        })
+        .collect();
+    dec(m);
+    alloc(RtPayload::Map(cloned))
+}
+
+/// # Safety: key/val ownership transfers; returns the (possibly new) map.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_map_set(
+    m: *mut RtVal,
+    k: *mut RtVal,
+    v: *mut RtVal,
+) -> *mut RtVal {
+    let target = cow_map(m);
+    let RtPayload::Map(entries) = &mut (*target).payload else {
+        unreachable!()
+    };
+    for (ek, ev) in entries.iter_mut() {
+        if map_key_ord(&**ek, &*k) == std::cmp::Ordering::Equal {
+            dec(*ev);
+            *ev = v;
+            dec(k);
+            return target;
+        }
+    }
+    let pos = entries
+        .iter()
+        .position(|(ek, _)| map_key_ord(&**ek, &*k) == std::cmp::Ordering::Greater)
+        .unwrap_or(entries.len());
+    entries.insert(pos, (k, v));
+    target
+}
+
+/// # Safety: live pointers; returns Option variant (+1).
+#[no_mangle]
+pub unsafe extern "C" fn grasm_map_get(m: *mut RtVal, k: *mut RtVal) -> *mut RtVal {
+    let RtPayload::Map(entries) = &(*m).payload else {
+        grasm_panic_msg_str("get on non-map");
+    };
+    for (ek, ev) in entries {
+        if map_key_ord(&**ek, &*k) == std::cmp::Ordering::Equal {
+            inc(*ev);
+            return alloc(RtPayload::Variant {
+                type_name: "Option".into(),
+                name: "Some".into(),
+                fields: vec![*ev],
+            });
+        }
+    }
+    alloc(RtPayload::Variant {
+        type_name: "Option".into(),
+        name: "None".into(),
+        fields: vec![],
+    })
+}
+
+/// # Safety: live pointers.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_map_has(m: *mut RtVal, k: *mut RtVal) -> i8 {
+    let RtPayload::Map(entries) = &(*m).payload else {
+        grasm_panic_msg_str("has on non-map");
+    };
+    i8::from(
+        entries
+            .iter()
+            .any(|(ek, _)| map_key_ord(&**ek, &*k) == std::cmp::Ordering::Equal),
+    )
+}
+
+/// # Safety: live pointers; returns (map, removed?) via out-param style: the
+/// new map pointer is returned, `found` receives 1/0.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_map_delete(
+    m: *mut RtVal,
+    k: *mut RtVal,
+    found: *mut i8,
+) -> *mut RtVal {
+    let target = cow_map(m);
+    let RtPayload::Map(entries) = &mut (*target).payload else {
+        unreachable!()
+    };
+    let pos = entries
+        .iter()
+        .position(|(ek, _)| map_key_ord(&**ek, &*k) == std::cmp::Ordering::Equal);
+    match pos {
+        Some(i) => {
+            let (ek, ev) = entries.remove(i);
+            dec(ek);
+            dec(ev);
+            *found = 1;
+        }
+        None => *found = 0,
+    }
+    target
+}
+
+/// # Safety: live pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_map_len(m: *mut RtVal) -> i64 {
+    match &(*m).payload {
+        RtPayload::Map(entries) => entries.len() as i64,
+        _ => grasm_panic_msg_str("len on non-map"),
+    }
+}
+
+/// # Safety: live pointer; returns a fresh list (+1).
+#[no_mangle]
+pub unsafe extern "C" fn grasm_map_keys(m: *mut RtVal) -> *mut RtVal {
+    let RtPayload::Map(entries) = &(*m).payload else {
+        grasm_panic_msg_str("keys on non-map");
+    };
+    let items: Vec<*mut RtVal> = entries
+        .iter()
+        .map(|&(k, _)| {
+            inc(k);
+            k
+        })
+        .collect();
+    alloc(RtPayload::List(items))
+}
+
+/// # Safety: live pointer; returns a fresh list (+1).
+#[no_mangle]
+pub unsafe extern "C" fn grasm_map_values(m: *mut RtVal) -> *mut RtVal {
+    let RtPayload::Map(entries) = &(*m).payload else {
+        grasm_panic_msg_str("values on non-map");
+    };
+    let items: Vec<*mut RtVal> = entries
+        .iter()
+        .map(|&(_, v)| {
+            inc(v);
+            v
+        })
+        .collect();
+    alloc(RtPayload::List(items))
+}
+
+// --- N4: full builtin method surface (str / list / numeric) ---
+
+unsafe fn as_str(v: *mut RtVal) -> &'static str {
+    match &(*v).payload {
+        RtPayload::Str(s) => {
+            // Lifetime is tied to the caller's borrow; safe for the call span.
+            std::mem::transmute::<&str, &'static str>(s.as_str())
+        }
+        _ => grasm_panic_msg_str("expected a string"),
+    }
+}
+
+macro_rules! str_pred {
+    ($name:ident, $m:ident) => {
+        /// # Safety: live string pointers.
+        #[no_mangle]
+        pub unsafe extern "C" fn $name(a: *mut RtVal, b: *mut RtVal) -> i8 {
+            i8::from(as_str(a).$m(as_str(b)))
+        }
+    };
+}
+str_pred!(grasm_str_contains, contains);
+str_pred!(grasm_str_starts_with, starts_with);
+str_pred!(grasm_str_ends_with, ends_with);
+
+/// # Safety: live pointers; returns a fresh list of strings.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_split(s: *mut RtVal, sep: *mut RtVal) -> *mut RtVal {
+    let text = as_str(s);
+    let sp = as_str(sep);
+    let parts: Vec<*mut RtVal> = if sp.is_empty() {
+        text.chars()
+            .map(|c| alloc(RtPayload::Str(c.to_string())))
+            .collect()
+    } else {
+        text.split(sp)
+            .map(|p| alloc(RtPayload::Str(p.to_string())))
+            .collect()
+    };
+    alloc(RtPayload::List(parts))
+}
+
+/// # Safety: live pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_chars(s: *mut RtVal) -> *mut RtVal {
+    let items: Vec<*mut RtVal> = as_str(s)
+        .chars()
+        .map(|c| alloc(RtPayload::Str(c.to_string())))
+        .collect();
+    alloc(RtPayload::List(items))
+}
+
+/// # Safety: live pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_trim(s: *mut RtVal) -> *mut RtVal {
+    alloc(RtPayload::Str(as_str(s).trim().to_string()))
+}
+
+/// # Safety: live pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_upper(s: *mut RtVal) -> *mut RtVal {
+    alloc(RtPayload::Str(as_str(s).to_uppercase()))
+}
+
+/// # Safety: live pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_lower(s: *mut RtVal) -> *mut RtVal {
+    alloc(RtPayload::Str(as_str(s).to_lowercase()))
+}
+
+/// # Safety: live pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_repeat(s: *mut RtVal, n: i64) -> *mut RtVal {
+    if n < 0 {
+        rt_panic("repeat count must be a non-negative int");
+    }
+    alloc(RtPayload::Str(as_str(s).repeat(n as usize)))
+}
+
+/// # Safety: live pointers.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_replace(
+    s: *mut RtVal,
+    from: *mut RtVal,
+    to: *mut RtVal,
+) -> *mut RtVal {
+    alloc(RtPayload::Str(as_str(s).replace(as_str(from), as_str(to))))
+}
+
+/// # Safety: live pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_substr(s: *mut RtVal, start: i64, len: i64) -> *mut RtVal {
+    let chars: Vec<char> = as_str(s).chars().collect();
+    let n = chars.len() as i64;
+    let start = start.clamp(0, n) as usize;
+    let end = (start as i64 + len.max(0)).clamp(0, n) as usize;
+    alloc(RtPayload::Str(chars[start..end].iter().collect::<String>()))
+}
+
+/// # Safety: live pointers; returns Option[i64] (char index).
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_index_of(s: *mut RtVal, needle: *mut RtVal) -> *mut RtVal {
+    let text = as_str(s);
+    match text.find(as_str(needle)) {
+        Some(byte_idx) => {
+            let char_idx = text[..byte_idx].chars().count() as i64;
+            some_of(alloc(RtPayload::I64(char_idx)))
+        }
+        None => none_val(),
+    }
+}
+
+fn none_val() -> *mut RtVal {
+    alloc(RtPayload::Variant {
+        type_name: "Option".into(),
+        name: "None".into(),
+        fields: vec![],
+    })
+}
+
+fn some_of(v: *mut RtVal) -> *mut RtVal {
+    alloc(RtPayload::Variant {
+        type_name: "Option".into(),
+        name: "Some".into(),
+        fields: vec![v],
+    })
+}
+
+/// # Safety: live pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_parse_int(s: *mut RtVal) -> *mut RtVal {
+    match as_str(s).trim().parse::<i64>() {
+        Ok(v) => some_of(alloc(RtPayload::I64(v))),
+        Err(_) => none_val(),
+    }
+}
+
+/// # Safety: live pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_parse_float(s: *mut RtVal) -> *mut RtVal {
+    match as_str(s).trim().parse::<f64>() {
+        Ok(v) => some_of(alloc(RtPayload::F64(v))),
+        Err(_) => none_val(),
+    }
+}
+
+unsafe fn list_items(v: *mut RtVal) -> &'static Vec<*mut RtVal> {
+    match &(*v).payload {
+        RtPayload::List(items) => {
+            std::mem::transmute::<&Vec<*mut RtVal>, &'static Vec<*mut RtVal>>(items)
+        }
+        _ => grasm_panic_msg_str("expected a list"),
+    }
+}
+
+/// # Safety: live pointers.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_list_join(v: *mut RtVal, sep: *mut RtVal) -> *mut RtVal {
+    let parts: Vec<String> = list_items(v).iter().map(|&i| display(i)).collect();
+    alloc(RtPayload::Str(parts.join(as_str(sep))))
+}
+
+/// # Safety: live pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_list_rev(v: *mut RtVal) -> *mut RtVal {
+    let mut items: Vec<*mut RtVal> = list_items(v)
+        .iter()
+        .map(|&i| {
+            inc(i);
+            i
+        })
+        .collect();
+    items.reverse();
+    alloc(RtPayload::List(items))
+}
+
+unsafe fn cmp_vals(a: *mut RtVal, b: *mut RtVal) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (&(*a).payload, &(*b).payload) {
+        (RtPayload::I64(x), RtPayload::I64(y)) => x.cmp(y),
+        (RtPayload::F64(x), RtPayload::F64(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+        (RtPayload::Str(x), RtPayload::Str(y)) => x.cmp(y),
+        _ => Ordering::Equal,
+    }
+}
+
+/// In-place sort honoring CoW; returns the (possibly new) list.
+/// # Safety: live pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_list_sort(v: *mut RtVal) -> *mut RtVal {
+    let target = cow_list(v);
+    let RtPayload::List(items) = &mut (*target).payload else {
+        unreachable!()
+    };
+    items.sort_by(|&a, &b| cmp_vals(a, b));
+    target
+}
+
+/// # Safety: live pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_list_slice(v: *mut RtVal, a: i64, b: i64) -> *mut RtVal {
+    let items = list_items(v);
+    let len = items.len() as i64;
+    let s = a.clamp(0, len) as usize;
+    let e = b.clamp(0, len) as usize;
+    let out: Vec<*mut RtVal> = if s <= e {
+        items[s..e]
+            .iter()
+            .map(|&i| {
+                inc(i);
+                i
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    alloc(RtPayload::List(out))
+}
+
+/// # Safety: live pointers.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_list_contains(v: *mut RtVal, needle: *mut RtVal) -> i8 {
+    i8::from(list_items(v).iter().any(|&i| val_eq(i, needle)))
+}
+
+/// Pop honoring CoW: returns the new list; `out` receives the popped Option.
+/// # Safety: live pointers.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_list_pop(v: *mut RtVal, out: *mut *mut RtVal) -> *mut RtVal {
+    let target = cow_list(v);
+    let RtPayload::List(items) = &mut (*target).payload else {
+        unreachable!()
+    };
+    *out = match items.pop() {
+        Some(e) => some_of(e),
+        None => none_val(),
+    };
+    target
+}
+
+/// # Safety: live pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_list_first(v: *mut RtVal) -> *mut RtVal {
+    match list_items(v).first() {
+        Some(&e) => {
+            inc(e);
+            some_of(e)
+        }
+        None => none_val(),
+    }
+}
+
+/// # Safety: live pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_list_last(v: *mut RtVal) -> *mut RtVal {
+    match list_items(v).last() {
+        Some(&e) => {
+            inc(e);
+            some_of(e)
+        }
+        None => none_val(),
+    }
+}
+
+/// # Safety: live pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_list_sum_i64(v: *mut RtVal) -> i64 {
+    let mut total = 0i64;
+    for &i in list_items(v) {
+        if let RtPayload::I64(x) = &(*i).payload {
+            total += x;
+        }
+    }
+    total
+}
+
+/// # Safety: live pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_list_sum_f64(v: *mut RtVal) -> f64 {
+    let mut total = 0f64;
+    for &i in list_items(v) {
+        match &(*i).payload {
+            RtPayload::F64(x) => total += x,
+            RtPayload::I64(x) => total += *x as f64,
+            _ => {}
+        }
+    }
+    total
+}
+
+#[no_mangle]
+pub extern "C" fn grasm_i64_abs(v: i64) -> i64 {
+    v.abs()
+}
+#[no_mangle]
+pub extern "C" fn grasm_i64_min(a: i64, b: i64) -> i64 {
+    a.min(b)
+}
+#[no_mangle]
+pub extern "C" fn grasm_i64_max(a: i64, b: i64) -> i64 {
+    a.max(b)
+}
+#[no_mangle]
+pub extern "C" fn grasm_f64_abs(v: f64) -> f64 {
+    v.abs()
+}
+#[no_mangle]
+pub extern "C" fn grasm_f64_sqrt(v: f64) -> f64 {
+    v.sqrt()
+}
+#[no_mangle]
+pub extern "C" fn grasm_f64_floor(v: f64) -> f64 {
+    v.floor()
+}
+#[no_mangle]
+pub extern "C" fn grasm_f64_ceil(v: f64) -> f64 {
+    v.ceil()
+}
+#[no_mangle]
+pub extern "C" fn grasm_f64_round(v: f64) -> f64 {
+    v.round()
+}
+#[no_mangle]
+pub extern "C" fn grasm_f64_min(a: f64, b: f64) -> f64 {
+    a.min(b)
+}
+#[no_mangle]
+pub extern "C" fn grasm_f64_max(a: f64, b: f64) -> f64 {
+    a.max(b)
 }
