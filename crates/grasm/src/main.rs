@@ -601,6 +601,53 @@ fn print_trace(program: &Program, trace: &[grasm_interp::Frame]) {
 // Native builds (`grasm build --native`)
 // ---------------------------------------------------------------------------
 
+/// Locates `libgrasm_rt.a`, which native builds link against.
+///
+/// Checked in the order a real installation makes sensible, so a downloaded
+/// release, a `make install` layout, and a cargo checkout all work without
+/// configuration. `grasm build --native` is the headline feature; requiring a
+/// new user to already know where the runtime lives would make it useless to
+/// exactly the people trying the language for the first time.
+fn find_runtime() -> Result<PathBuf, String> {
+    if let Ok(explicit) = std::env::var("GRASM_RUNTIME") {
+        let p = PathBuf::from(&explicit);
+        if p.exists() {
+            return Ok(p);
+        }
+        return Err(format!(
+            "GRASM_RUNTIME is set to `{explicit}`, but no file is there"
+        ));
+    }
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let dir = exe.parent().ok_or("cannot locate the grasm binary")?;
+    let candidates = [
+        dir.join("libgrasm_rt.a"),               // release archive, cargo target
+        dir.join("../lib/grasm/libgrasm_rt.a"),  // bin/ + lib/ install layout
+        dir.join("lib/libgrasm_rt.a"),
+        dir.join("../lib/libgrasm_rt.a"),
+    ];
+    for c in &candidates {
+        if c.exists() {
+            return Ok(c.clone());
+        }
+    }
+    Err(format!(
+        "cannot find the Grasm runtime (libgrasm_rt.a).\n\
+         \n\
+         Looked next to `{}` and in ../lib.\n\
+         \n\
+         If you downloaded a release, keep `grasm` and `libgrasm_rt.a` in the\n\
+         same directory. From a source checkout, run:\n\
+         \n\
+             cargo build --release --workspace\n\
+         \n\
+         Or point at it directly:  GRASM_RUNTIME=/path/to/libgrasm_rt.a\n\
+         \n\
+         `grasm run` needs none of this — only `--native` links the runtime.",
+        dir.display()
+    ))
+}
+
 /// Cache key for one module's object file.
 ///
 /// Two things can invalidate it: the module's own source (its bodies), and the
@@ -715,16 +762,7 @@ fn build_native_incremental(
         objects.push(obj);
     }
 
-    // libgrasm_rt.a sits next to the grasm binary (cargo target dir).
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let exe_dir = exe.parent().ok_or("no exe dir")?;
-    let rt = exe_dir.join("libgrasm_rt.a");
-    if !rt.exists() {
-        return Err(format!(
-            "runtime library not found at `{}` — build it with `cargo build -p grasm_rt`",
-            rt.display()
-        ));
-    }
+    let rt = find_runtime()?;
     let mut link = std::process::Command::new("cc");
     for o in &objects {
         link.arg(o);

@@ -32,6 +32,47 @@ fn main() {
 }
 ```
 
+## Install
+
+Download the archive for your platform, unpack it, and put both files
+somewhere on your `PATH` — `grasm` links `libgrasm_rt.a` for native builds and
+finds it beside itself.
+
+```
+tar -xzf grasm-macos-arm64.tar.gz
+cd grasm-macos-arm64
+./grasm run hello.gr
+```
+
+From source:
+
+```
+git clone <repo> && cd grasm
+cargo build --release --workspace     # produces target/release/grasm
+```
+
+`grasm run` needs nothing but the binary. `grasm build --native` also needs
+`libgrasm_rt.a`, which sits next to `grasm` in both layouts; set
+`GRASM_RUNTIME` to override.
+
+### Your first program
+
+```grasm
+fn main() {
+    print("hello, world")
+}
+```
+
+```
+grasm run hello.gr                    # typecheck and run
+grasm build hello.gr --native -o hello && ./hello
+```
+
+`dist/grasm-language-pack.md` is the whole language — grammar, types,
+semantics, a tutorial, and a runnable program for every rule — in about 16k
+tokens. It is small enough to hand to an AI assistant in full, which is how
+you get useful completions for a language it has never seen.
+
 ## Toolchain
 
 ```
