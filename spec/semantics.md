@@ -80,6 +80,10 @@ matches and whose guard passes is taken.
 **[E-LOOP-RANGE]** `for i in a..b` iterates `a` up to but excluding `b`;
 `a..=b` includes `b`. An empty range runs zero times.
 
+**[E-LOOP-LIST]** `for x in xs` iterates a list's elements directly, in order.
+The loop variable is the element, not its index. Iterating an empty list runs
+zero times.
+
 ## 6. Errors and panics
 
 **[E-ERR-PROPAGATE]** `try` on `Err(e)` returns `Err(e)` from the enclosing

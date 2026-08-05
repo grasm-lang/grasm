@@ -1,0 +1,35 @@
+//! tag: T-FN-VALUE
+//! expect: output
+//! 8
+//! 12
+//! 10 15
+//! -3 -1
+fn double(n: i64) -> i64 {
+    n * 2
+}
+
+fn triple(n: i64) -> i64 {
+    n * 3
+}
+
+fn main() {
+    // A function's name used as a value; called through the binding.
+    let f = double
+    print("{f(4)}")
+
+    // A closure bound to a name. Its parameter type comes from the call.
+    let times3 = |x| x * 3
+    print("{times3(4)}")
+
+    // Both kinds share one representation, so a list holds either.
+    let stages = [double, triple]
+    var out = ""
+    for stage in stages {
+        out = out + "{stage(5)} "
+    }
+    print(out.trim())
+
+    // Negative literals are written directly — no need for `0 - n`.
+    let below = -3
+    print("{below} {[1, 2].get(9) ?? -1}")
+}

@@ -130,6 +130,16 @@ the runtime at `main` and in tests.
 **[T-EFFECT-DISCHARGE]** `with E handled_by h { … }` discharges `E` inside the
 block. Any user effect still outstanding at `main` or in a test is an error.
 
+**[T-FN-VALUE]** A function's name used where a value is expected produces a
+*function value*, and a closure may be bound to a name. Both are called with
+ordinary call syntax and may be stored in a list together when their parameter
+and result types agree.
+
+There is no way to *write* a function type, so a function value's type is only
+ever inferred — from the function it names, or, for a closure bound to a name,
+from how that name is later called. A closure bound to a name and never called
+therefore has nothing to infer its parameter types from, and is an error.
+
 **[T-PAR-MAP-PURE]** The function given to `par_map` must have an empty effect
 row. Elements are processed concurrently, so an effect would interleave
 differently between runs; requiring purity is what makes the parallelism

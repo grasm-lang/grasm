@@ -1,0 +1,28 @@
+//! tag: E-LOOP-LIST
+//! expect: output
+//! alpha beta gamma
+//! 6
+//! 0
+fn main() {
+    // The loop variable is the element itself, not an index.
+    let words = ["alpha", "beta", "gamma"]
+    var joined = ""
+    for w in words {
+        joined = joined + w + " "
+    }
+    print(joined.trim())
+
+    var total = 0
+    for n in [1, 2, 3] {
+        total = total + n
+    }
+    print("{total}")
+
+    // An empty list runs the body zero times.
+    var count = 0
+    let none: [i64] = []
+    for _x in none {
+        count = count + 1
+    }
+    print("{count}")
+}

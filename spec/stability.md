@@ -26,6 +26,7 @@ Will not change incompatibly before 2.0.
 - `E-IF-VALUE` — stable
 - `E-INDEX-BOUNDS` — stable
 - `E-INOUT-WRITEBACK` — stable
+- `E-LOOP-LIST` — stable
 - `E-LOOP-RANGE` — stable
 - `E-MAIN-ERR` — stable
 - `E-MAP-ORDER` — stable
@@ -126,6 +127,7 @@ May change or be removed in any release. New surface starts here.
 - `E-BENCH-WARMUP` — experimental
 - `E-NOT-PARALLEL` — experimental
 - `E-PAR-MAP-ORDER` — experimental
+- `T-FN-VALUE` — provisional
 - `T-PAR-MAP-PURE` — experimental
 - `E-PARALLEL-JOIN` — experimental
 - `E-SPAWN-ORDER` — experimental

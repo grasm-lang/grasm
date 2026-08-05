@@ -75,6 +75,7 @@ because the text may not be a number.
 
 | method | type | notes |
 |--------|------|-------|
+| `for x in xs { … }` | | iterates elements, not indices ([E-LOOP-LIST]) |
 | `xs.len()`, `xs.is_empty()` | | |
 | `xs[i]` | `-> T` | panics when out of range |
 | `xs.get(i)` | `(i64) -> Option[T]` | |

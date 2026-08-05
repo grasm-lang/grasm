@@ -368,6 +368,16 @@ the runtime at `main` and in tests.
 **[T-EFFECT-DISCHARGE]** `with E handled_by h { … }` discharges `E` inside the
 block. Any user effect still outstanding at `main` or in a test is an error.
 
+**[T-FN-VALUE]** A function's name used where a value is expected produces a
+*function value*, and a closure may be bound to a name. Both are called with
+ordinary call syntax and may be stored in a list together when their parameter
+and result types agree.
+
+There is no way to *write* a function type, so a function value's type is only
+ever inferred — from the function it names, or, for a closure bound to a name,
+from how that name is later called. A closure bound to a name and never called
+therefore has nothing to infer its parameter types from, and is an error.
+
 **[T-PAR-MAP-PURE]** The function given to `par_map` must have an empty effect
 row. Elements are processed concurrently, so an effect would interleave
 differently between runs; requiring purity is what makes the parallelism
@@ -470,6 +480,10 @@ matches and whose guard passes is taken.
 
 **[E-LOOP-RANGE]** `for i in a..b` iterates `a` up to but excluding `b`;
 `a..=b` includes `b`. An empty range runs zero times.
+
+**[E-LOOP-LIST]** `for x in xs` iterates a list's elements directly, in order.
+The loop variable is the element, not its index. Iterating an empty list runs
+zero times.
 
 ## 6. Errors and panics
 
@@ -631,6 +645,7 @@ because the text may not be a number.
 
 | method | type | notes |
 |--------|------|-------|
+| `for x in xs { … }` | | iterates elements, not indices ([E-LOOP-LIST]) |
 | `xs.len()`, `xs.is_empty()` | | |
 | `xs[i]` | `-> T` | panics when out of range |
 | `xs.get(i)` | `(i64) -> Option[T]` | |
@@ -1304,6 +1319,39 @@ fn main() {
     var xs = [1]
     add(xs, 2)
     print("{n} {xs}")
+}
+```
+
+## `E-LOOP-LIST.gr`
+
+```grasm
+//! tag: E-LOOP-LIST
+//! expect: output
+//! alpha beta gamma
+//! 6
+//! 0
+fn main() {
+    // The loop variable is the element itself, not an index.
+    let words = ["alpha", "beta", "gamma"]
+    var joined = ""
+    for w in words {
+        joined = joined + w + " "
+    }
+    print(joined.trim())
+
+    var total = 0
+    for n in [1, 2, 3] {
+        total = total + n
+    }
+    print("{total}")
+
+    // An empty list runs the body zero times.
+    var count = 0
+    let none: [i64] = []
+    for _x in none {
+        count = count + 1
+    }
+    print("{count}")
 }
 ```
 
@@ -2458,6 +2506,46 @@ fn main() {
         Ok(v) -> print("ok {v}")
         Err(e) -> print("err {e}")
     }
+}
+```
+
+## `T-FN-VALUE.gr`
+
+```grasm
+//! tag: T-FN-VALUE
+//! expect: output
+//! 8
+//! 12
+//! 10 15
+//! -3 -1
+fn double(n: i64) -> i64 {
+    n * 2
+}
+
+fn triple(n: i64) -> i64 {
+    n * 3
+}
+
+fn main() {
+    // A function's name used as a value; called through the binding.
+    let f = double
+    print("{f(4)}")
+
+    // A closure bound to a name. Its parameter type comes from the call.
+    let times3 = |x| x * 3
+    print("{times3(4)}")
+
+    // Both kinds share one representation, so a list holds either.
+    let stages = [double, triple]
+    var out = ""
+    for stage in stages {
+        out = out + "{stage(5)} "
+    }
+    print(out.trim())
+
+    // Negative literals are written directly — no need for `0 - n`.
+    let below = -3
+    print("{below} {[1, 2].get(9) ?? -1}")
 }
 ```
 
