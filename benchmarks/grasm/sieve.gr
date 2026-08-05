@@ -5,8 +5,7 @@ fn main() {
         flags.push(true)
     }
     var count = 0
-    var i = 2
-    while i <= limit {
+    for i in 2..=limit {
         if flags[i] {
             count = count + 1
             var j = i * i
@@ -15,7 +14,6 @@ fn main() {
                 j = j + i
             }
         }
-        i = i + 1
     }
     print("{count}")
 }

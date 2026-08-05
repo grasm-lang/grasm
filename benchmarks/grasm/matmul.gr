@@ -10,21 +10,15 @@ fn main() {
     for _slot in 0..n * n {
         c.push(0)
     }
-    var i = 0
-    while i < n {
-        var k = 0
-        while k < n {
+    for i in 0..n {
+        for k in 0..n {
             let aik = a[i * n + k]
             if aik != 0 {
-                var j = 0
-                while j < n {
+                for j in 0..n {
                     c[i * n + j] = c[i * n + j] + aik * b[k * n + j]
-                    j = j + 1
                 }
             }
-            k = k + 1
         }
-        i = i + 1
     }
     var total = 0
     for v in c {

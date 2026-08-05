@@ -1,18 +1,14 @@
 fn main() {
     var xs: [i64] = []
     var seed = 12345
-    var i = 0
-    while i < 400000 {
+    for _n in 0..400000 {
         seed = (seed * 1103515245 + 12345) % 2147483648
         xs.push(seed % 1000000)
-        i = i + 1
     }
     xs.sort()
     var checksum = 0
-    var k = 0
-    while k < xs.len() {
+    for k in 0..xs.len() {
         checksum = (checksum + xs[k] * (k % 7 + 1)) % 1000000007
-        k = k + 1
     }
     print("{xs.len()} {checksum}")
 }
