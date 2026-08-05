@@ -163,6 +163,40 @@ impl Iterator for ScalarIter<'_> {
     }
 }
 
+/// A map key, owned.
+///
+/// Keys are restricted to `i64`, `str`, and `bool` ([T-MAP-KEY]), which makes
+/// them hashable — so lookup is a hash probe rather than a binary search over
+/// boxed values. The derived `Ord` puts the variants in exactly the order the
+/// specification requires for iteration ([E-MAP-ORDER]): false before true,
+/// then integers ascending, then strings lexicographically.
+#[derive(PartialEq, Eq, Hash, PartialOrd, Ord, Clone)]
+pub enum MapKey {
+    Bool(bool),
+    I64(i64),
+    Str(String),
+}
+
+impl MapKey {
+    /// # Safety: live runtime pointer.
+    unsafe fn of(v: *mut RtVal) -> MapKey {
+        match &(*v).payload {
+            RtPayload::Bool(b) => MapKey::Bool(*b),
+            RtPayload::I64(n) => MapKey::I64(*n),
+            RtPayload::Str(s) => MapKey::Str(s.clone()),
+            _ => grasm_panic_msg_str("map keys must be i64, str, or bool"),
+        }
+    }
+
+    fn boxed(&self) -> *mut RtVal {
+        match self {
+            MapKey::Bool(b) => interned_bool(*b),
+            MapKey::I64(n) => grasm_box_i64(*n),
+            MapKey::Str(s) => alloc(RtPayload::Str(s.clone())),
+        }
+    }
+}
+
 pub enum ScalarData {
     Words(Vec<i64>),
     Bytes(Vec<u8>),
@@ -294,7 +328,9 @@ pub enum RtPayload {
     /// traffic, no pointer chase. This is why `c[i] = c[i] + x` in a hot loop
     /// is a load and a store instead of an allocation.
     ListScalar { kind: ScalarKind, data: ScalarData },
-    Map(Vec<(*mut RtVal, *mut RtVal)>),
+    /// Hash table for lookup; iteration sorts, which is where the ordering
+    /// guarantee is paid for rather than on every get and set.
+    Map(std::collections::HashMap<MapKey, *mut RtVal>),
     Struct {
         name: String,
         fields: Vec<(String, *mut RtVal)>,
@@ -404,8 +440,7 @@ unsafe fn dec(v: *mut RtVal) {
                 }
             }
             RtPayload::Map(entries) => {
-                for &(k, v) in entries {
-                    dec(k);
+                for &v in entries.values() {
                     dec(v);
                 }
             }
@@ -1100,9 +1135,17 @@ unsafe fn display(v: *mut RtVal) -> String {
             format!("[{}]", parts.join(", "))
         }
         RtPayload::Map(entries) => {
-            let parts: Vec<String> = entries
-                .iter()
-                .map(|&(k, v)| format!("{}: {}", display(k), display(v)))
+            // Printing is iteration, so it sorts ([E-MAP-ORDER]).
+            let mut keys: Vec<&MapKey> = entries.keys().collect();
+            keys.sort();
+            let parts: Vec<String> = keys
+                .into_iter()
+                .map(|k| {
+                    let kb = k.boxed();
+                    let text = format!("{}: {}", display(kb), display(entries[k]));
+                    dec(kb);
+                    text
+                })
                 .collect();
             format!("{{{}}}", parts.join(", "))
         }
@@ -1335,8 +1378,7 @@ unsafe fn val_eq(a: *mut RtVal, b: *mut RtVal) -> bool {
         (RtPayload::Map(x), RtPayload::Map(y)) => {
             x.len() == y.len()
                 && x.iter()
-                    .zip(y)
-                    .all(|(&(k1, v1), &(k2, v2))| val_eq(k1, k2) && val_eq(v1, v2))
+                    .all(|(k, &v)| y.get(k).is_some_and(|&w| val_eq(v, w)))
         }
         (
             RtPayload::Struct { name: n1, fields: f1 },
@@ -1410,31 +1452,16 @@ pub unsafe extern "C" fn grasm_str_from_val(v: *mut RtVal) -> *mut RtVal {
 
 #[no_mangle]
 pub extern "C" fn grasm_map_new() -> *mut RtVal {
-    alloc(RtPayload::Map(Vec::new()))
+    alloc(RtPayload::Map(std::collections::HashMap::new()))
 }
 
-unsafe fn map_key_ord(a: &RtVal, b: &RtVal) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    // Interpreter's MapKey order: Bool < Int < Str.
-    fn rank(p: &RtPayload) -> u8 {
-        match p {
-            RtPayload::Bool(_) => 0,
-            RtPayload::I64(_) => 1,
-            RtPayload::Str(_) => 2,
-            _ => 3,
-        }
-    }
-    let (ra, rb) = (rank(&a.payload), rank(&b.payload));
-    if ra != rb {
-        return ra.cmp(&rb);
-    }
-    match (&a.payload, &b.payload) {
-        (RtPayload::Bool(x), RtPayload::Bool(y)) => x.cmp(y),
-        (RtPayload::I64(x), RtPayload::I64(y)) => x.cmp(y),
-        (RtPayload::Str(x), RtPayload::Str(y)) => x.cmp(y),
-        _ => Ordering::Equal,
-    }
+/// A map's keys in the order iteration must present them.
+fn sorted_keys(entries: &std::collections::HashMap<MapKey, *mut RtVal>) -> Vec<MapKey> {
+    let mut keys: Vec<MapKey> = entries.keys().cloned().collect();
+    keys.sort();
+    keys
 }
+
 
 unsafe fn cow_map(m: *mut RtVal) -> *mut RtVal {
     if (*m).rc.get() == 1 {
@@ -1443,35 +1470,18 @@ unsafe fn cow_map(m: *mut RtVal) -> *mut RtVal {
     let RtPayload::Map(entries) = &(*m).payload else {
         grasm_panic_msg_str("map op on non-map");
     };
-    let cloned: Vec<(*mut RtVal, *mut RtVal)> = entries
+    let cloned: std::collections::HashMap<MapKey, *mut RtVal> = entries
         .iter()
-        .map(|&(k, v)| {
-            inc(k);
+        .map(|(k, &v)| {
             inc(v);
-            (k, v)
+            (k.clone(), v)
         })
         .collect();
     dec(m);
     alloc(RtPayload::Map(cloned))
 }
 
-/// # Safety: key/val ownership transfers; returns the (possibly new) map.
-#[no_mangle]
-/// Position of `k` in a map's sorted entries.
-///
-/// Entries are kept in key order so iteration is deterministic ([E-MAP-ORDER]),
-/// which means lookups can binary search. A linear scan here made every map
-/// operation O(n) and whole programs O(n^2).
-///
-/// # Safety: live pointers into a map's entry vector.
-unsafe fn map_find(
-    entries: &[(*mut RtVal, *mut RtVal)],
-    k: *mut RtVal,
-) -> Result<usize, usize> {
-    entries.binary_search_by(|(ek, _)| map_key_ord(&**ek, &*k))
-}
-
-/// # Safety: live pointers.
+/// # Safety: key/value ownership transfers; returns the (possibly new) map.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_map_set(
     m: *mut RtVal,
@@ -1482,14 +1492,11 @@ pub unsafe extern "C" fn grasm_map_set(
     let RtPayload::Map(entries) = &mut (*target).payload else {
         unreachable!()
     };
-    match map_find(entries, k) {
-        Ok(i) => {
-            dec(entries[i].1);
-            entries[i].1 = v;
-            dec(k);
-        }
-        Err(pos) => entries.insert(pos, (k, v)),
+    if let Some(old) = entries.insert(MapKey::of(k), v) {
+        dec(old);
     }
+    // The key is owned by the caller's +1; the table holds an owned MapKey.
+    dec(k);
     target
 }
 
@@ -1499,8 +1506,7 @@ pub unsafe extern "C" fn grasm_map_get(m: *mut RtVal, k: *mut RtVal) -> *mut RtV
     let RtPayload::Map(entries) = &(*m).payload else {
         grasm_panic_msg_str("get on non-map");
     };
-    if let Ok(i) = map_find(entries, k) {
-        let ev = entries[i].1;
+    if let Some(&ev) = entries.get(&MapKey::of(k)) {
         inc(ev);
         return alloc(RtPayload::Variant {
             type_name: "Option".into(),
@@ -1521,7 +1527,7 @@ pub unsafe extern "C" fn grasm_map_has(m: *mut RtVal, k: *mut RtVal) -> i8 {
     let RtPayload::Map(entries) = &(*m).payload else {
         grasm_panic_msg_str("has on non-map");
     };
-    i8::from(map_find(entries, k).is_ok())
+    i8::from(entries.contains_key(&MapKey::of(k)))
 }
 
 /// # Safety: live pointers; returns (map, removed?) via out-param style: the
@@ -1536,10 +1542,8 @@ pub unsafe extern "C" fn grasm_map_delete(
     let RtPayload::Map(entries) = &mut (*target).payload else {
         unreachable!()
     };
-    match map_find(entries, k).ok() {
-        Some(i) => {
-            let (ek, ev) = entries.remove(i);
-            dec(ek);
+    match entries.remove(&MapKey::of(k)) {
+        Some(ev) => {
             dec(ev);
             *found = 1;
         }
@@ -1563,13 +1567,8 @@ pub unsafe extern "C" fn grasm_map_keys(m: *mut RtVal) -> *mut RtVal {
     let RtPayload::Map(entries) = &(*m).payload else {
         grasm_panic_msg_str("keys on non-map");
     };
-    let items: Vec<*mut RtVal> = entries
-        .iter()
-        .map(|&(k, _)| {
-            inc(k);
-            k
-        })
-        .collect();
+    // Iteration is where the ordering guarantee is paid for.
+    let items: Vec<*mut RtVal> = sorted_keys(entries).iter().map(MapKey::boxed).collect();
     alloc(RtPayload::List(items))
 }
 
@@ -1579,9 +1578,10 @@ pub unsafe extern "C" fn grasm_map_values(m: *mut RtVal) -> *mut RtVal {
     let RtPayload::Map(entries) = &(*m).payload else {
         grasm_panic_msg_str("values on non-map");
     };
-    let items: Vec<*mut RtVal> = entries
+    let items: Vec<*mut RtVal> = sorted_keys(entries)
         .iter()
-        .map(|&(_, v)| {
+        .map(|k| {
+            let v = entries[k];
             inc(v);
             v
         })

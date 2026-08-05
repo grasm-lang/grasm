@@ -42,12 +42,12 @@ is better. Reproduce with `./scripts/bench.sh`.
 
 | program  |   C |  Rust |  Go | grasm-native | grasm-interp | Python |
 |----------|----:|------:|----:|-------------:|-------------:|-------:|
-| fib      |  27 |    27 |  27 |       **29** |         1219 |    155 |
-| sieve    |  28 |    28 |  31 |           58 |         2288 |    400 |
-| matmul   |  26 |    26 |  31 |           94 |         5908 |    957 |
-| wordfreq |  52 |    50 |  38 |          182 |          480 |    160 |
-| sort     |  60 |    36 |  71 |       **49** |          327 |    240 |
-| parmap   |  74 |    73 | 116 |          133 |        33467 |  3,532 |
+| fib      |  26 |    28 |  30 |       **27** |         1213 |    154 |
+| sieve    |  28 |    30 |  30 |           55 |         2263 |    382 |
+| matmul   |  27 |    26 |  30 |           99 |         5866 |    990 |
+| wordfreq |  53 |    52 |  41 |          148 |          475 |    155 |
+| sort     |  61 |    33 |  73 |       **49** |          328 |    247 |
+| parmap   |  80 |    76 | 119 |          131 |        33108 |  3,659 |
 | mandelbrot |  36 |   —  |  —  |       **14** |            — |  1,457 |
 
 Native Grasm matches C on `fib`, which is the benchmark that is almost entirely
@@ -66,7 +66,8 @@ What remains of the gap is two things, stated so nobody has to guess:
 - Every element access is still a **call into the runtime** (with a
   copy-on-write check), where C compiles to a raw load. Closing that means
   teaching codegen the list's memory layout so hot loops inline the access.
-- **Map values are still boxed**, which is most of wordfreq's 3.5×.
+- `wordfreq` is 2.8× off C. Lookup is now a hash probe, but each iteration
+  still allocates a fresh key string, and CPython interns and caches hashes.
 
 ## The "faster than Python" question
 
@@ -87,9 +88,10 @@ reachable because `par_map` spreads it across cores; C's 40x is one core.
 
 The number to distrust is any single multiplier. Across the whole suite
 Grasm is **0.9x to 26x** faster than Python depending entirely on the
-workload — 26x on parallel numeric work, and *slower* on `wordfreq`, where
-CPython's dictionaries are C and ours still box their values. A language that
-quotes one number from its best benchmark is quoting marketing.
+workload — 33x on a numeric kernel, and only 1.05x on `wordfreq`, which is
+dominated by allocating a string per iteration rather than by anything the
+compiler controls. A language that quotes one number from its best benchmark
+is quoting marketing.
 
 ## Multi-core
 
