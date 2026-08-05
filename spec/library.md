@@ -92,6 +92,7 @@ because the text may not be a number.
 | `xs.map(f)` | `(T -> U) -> [U]` | |
 | `xs.par_map(f)` | `(T -> U) -> [U]` | multi-core; `f` must be effect-free ([T-PAR-MAP-PURE]) |
 | `xs.filter(f)` | `(T -> bool) -> [T]` | |
+| `xs.par_filter(f)` | `(T -> bool) -> [T]` | multi-core; `f` must be effect-free; input order kept ([E-PAR-FILTER-ORDER]) |
 | `xs.any(f)`, `xs.all(f)` | `(T -> bool) -> bool` | short-circuit ([E-SEARCH-SHORTCIRCUIT]) |
 | `xs.find(f)` | `(T -> bool) -> Option[T]` | first match |
 

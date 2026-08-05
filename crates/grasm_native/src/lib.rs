@@ -472,6 +472,7 @@ impl<'m> Codegen<'m> {
             ("grasm_list_get_scalar", vec![i64t, i64t, i64t], Some(i64t)),
             ("grasm_list_set_scalar", vec![i64t, i64t, i64t, i64t], Some(i64t)),
             ("grasm_par_map_scalar", vec![i64t, ptr, ptr, i64t, i64t], Some(i64t)),
+            ("grasm_par_filter_scalar", vec![i64t, ptr, ptr, i64t], Some(i64t)),
         ];
         for (name, params, ret) in decls {
             let mut sig = self.module.make_signature();
@@ -3298,6 +3299,21 @@ impl FnCx<'_, '_> {
                 }
                 self.emit_list_search(rv, &elem_t, &cparams[0], cbody, m)?
             }
+            (VType::List(e), "par_filter") => {
+                let elem_t = (**e).clone();
+                let Expr::Closure {
+                    params: cparams,
+                    body: cbody,
+                    ..
+                } = &args[0]
+                else {
+                    return nope(args[0].span(), "par_filter with a non-literal closure");
+                };
+                if cparams.len() != 1 {
+                    return nope(args[0].span(), "par_filter with multiple parameters");
+                }
+                self.emit_par_filter(rv, &elem_t, &cparams[0], cbody, span)?
+            }
             (VType::List(e), "par_map") => {
                 let elem_t = (**e).clone();
                 let Expr::Closure {
@@ -5179,6 +5195,82 @@ impl FnCx<'_, '_> {
             .unwrap();
         self.call_rt("grasm_val_dec", &[list]);
         Ok((out, VType::List(Box::new(out_t))))
+    }
+
+    /// Lowers `xs.par_filter(|x| pred)` onto real threads.
+    ///
+    /// The predicate runs concurrently and the surviving elements are then
+    /// compacted in input order, so the result is independent of core count.
+    /// Falls back to the sequential lowering when the elements or captures are
+    /// not scalars, for the same reason `par_map` does: nothing refcounted may
+    /// cross a thread.
+    fn emit_par_filter(
+        &mut self,
+        list: Value,
+        elem_t: &VType,
+        param: &Ident,
+        body: &Expr,
+        span: Span,
+    ) -> CResult<(Value, VType)> {
+        let captures = self.closure_captures(std::slice::from_ref(param), body);
+        let elems_inline = scalar_kind_i64(elem_t).is_some();
+        let caps_inline = captures.iter().all(|(_, t)| scalar_kind_i64(t).is_some());
+        if !(elems_inline && caps_inline) {
+            return self.emit_list_transform(list, elem_t, param, body, false);
+        }
+
+        let ptr_ty = self.cg.module.target_config().pointer_type();
+        let mut sig = self.cg.module.make_signature();
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        self.cg.par_map_seq += 1;
+        let sym = format!(
+            "gpf_{}_{}",
+            self.cg.current_module.replace('.', "_"),
+            self.cg.par_map_seq
+        );
+        let id = self
+            .cg
+            .module
+            .declare_function(&sym, Linkage::Local, &sig)
+            .map_err(|e| Unsupported {
+                span,
+                what: format!("(module error: {e})"),
+            })?;
+        // The lifted predicate returns bits like any other par_map body; the
+        // runtime only cares whether they are zero.
+        self.cg.pending_par_maps.push(PendingParMap {
+            id,
+            module: self.cg.current_module.clone(),
+            captures: captures.clone(),
+            param: param.name.clone(),
+            param_t: elem_t.clone(),
+            ret: VType::Bool,
+            body: body.clone(),
+        });
+
+        let slot_bytes = (captures.len().max(1) * 8) as u32;
+        let slot = self.b.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+            slot_bytes,
+            3,
+        ));
+        for (i, (name, vt)) in captures.iter().enumerate() {
+            let (var, _) = self.lookup(name).expect("capture resolved above");
+            let v = self.b.use_var(var);
+            let bits = self.scalar_bits_of(v, vt);
+            self.b.ins().stack_store(bits, slot, (i * 8) as i32);
+        }
+        let env_ptr = self.b.ins().stack_addr(ptr_ty, slot, 0);
+        let fref = self.cg.module.declare_func_in_func(id, self.b.func);
+        let code = self.b.ins().func_addr(ptr_ty, fref);
+        let env_len = self.b.ins().iconst(types::I64, captures.len() as i64);
+        let out = self
+            .call_rt("grasm_par_filter_scalar", &[list, code, env_ptr, env_len])
+            .unwrap();
+        self.call_rt("grasm_val_dec", &[list]);
+        Ok((out, VType::List(Box::new(elem_t.clone()))))
     }
 
     /// Lowers `parallel { … }`.

@@ -835,3 +835,20 @@ fn a_pure_par_map_is_accepted() {
         "fn double(n: i64) -> i64 {\n    n * 2\n}\n\nfn main() {\n    let xs = [1, 2]\n    print(\"{xs.par_map(|x| double(x))}\")\n}\n",
     );
 }
+
+#[test]
+fn par_filter_types_like_filter_and_demands_purity() {
+    check_ok("fn main() {\n    let xs = [1, 2, 3]\n    let ys: [i64] = xs.par_filter(|x| x > 1)\n    print(\"{ys}\")\n}\n");
+    check_err(
+        "fn main() {\n    let xs = [1, 2]\n    let ys = xs.par_filter(|x| {\n        print(\"{x}\")\n        x > 1\n    })\n    print(\"{ys}\")\n}\n",
+        "effect-free",
+    );
+}
+
+#[test]
+fn par_filter_rejects_an_effect_reached_indirectly() {
+    check_err(
+        "fn noisy(n: i64) -> bool {\n    print(\"{n}\")\n    n > 1\n}\n\nfn main() {\n    print(\"{[1, 2].par_filter(|x| noisy(x))}\")\n}\n",
+        "effect-free",
+    );
+}

@@ -126,6 +126,11 @@ cores. That scope provides structure and determinism, not speedup — tasks shar
 the enclosing scope, and running them concurrently would race. Multi-core
 execution of *data* is provided by `par_map` instead.
 
+**[E-PAR-FILTER-ORDER]** `xs.par_filter(f)` tests elements concurrently and
+keeps the survivors in **input order**. The predicate parallelises; the
+compaction that follows does not, so the result does not depend on how many
+cores ran it.
+
 **[E-PAR-MAP-ORDER]** `xs.par_map(f)` applies `f` to every element, possibly on
 several cores, and returns the results in **input order**. The result does not
 depend on how many cores ran it — including one — so a `par_map` is

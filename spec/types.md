@@ -140,8 +140,8 @@ ever inferred — from the function it names, or, for a closure bound to a name,
 from how that name is later called. A closure bound to a name and never called
 therefore has nothing to infer its parameter types from, and is an error.
 
-**[T-PAR-MAP-PURE]** The function given to `par_map` must have an empty effect
-row. Elements are processed concurrently, so an effect would interleave
+**[T-PAR-MAP-PURE]** The function given to a parallel operation — `par_map` or
+`par_filter` — must have an empty effect row. Elements are processed concurrently, so an effect would interleave
 differently between runs; requiring purity is what makes the parallelism
 deterministic. This is a compile error, not a race.
 

@@ -378,8 +378,8 @@ ever inferred — from the function it names, or, for a closure bound to a name,
 from how that name is later called. A closure bound to a name and never called
 therefore has nothing to infer its parameter types from, and is an error.
 
-**[T-PAR-MAP-PURE]** The function given to `par_map` must have an empty effect
-row. Elements are processed concurrently, so an effect would interleave
+**[T-PAR-MAP-PURE]** The function given to a parallel operation — `par_map` or
+`par_filter` — must have an empty effect row. Elements are processed concurrently, so an effect would interleave
 differently between runs; requiring purity is what makes the parallelism
 deterministic. This is a compile error, not a race.
 
@@ -545,6 +545,11 @@ cores. That scope provides structure and determinism, not speedup — tasks shar
 the enclosing scope, and running them concurrently would race. Multi-core
 execution of *data* is provided by `par_map` instead.
 
+**[E-PAR-FILTER-ORDER]** `xs.par_filter(f)` tests elements concurrently and
+keeps the survivors in **input order**. The predicate parallelises; the
+compaction that follows does not, so the result does not depend on how many
+cores ran it.
+
 **[E-PAR-MAP-ORDER]** `xs.par_map(f)` applies `f` to every element, possibly on
 several cores, and returns the results in **input order**. The result does not
 depend on how many cores ran it — including one — so a `par_map` is
@@ -680,6 +685,7 @@ because the text may not be a number.
 | `xs.map(f)` | `(T -> U) -> [U]` | |
 | `xs.par_map(f)` | `(T -> U) -> [U]` | multi-core; `f` must be effect-free ([T-PAR-MAP-PURE]) |
 | `xs.filter(f)` | `(T -> bool) -> [T]` | |
+| `xs.par_filter(f)` | `(T -> bool) -> [T]` | multi-core; `f` must be effect-free; input order kept ([E-PAR-FILTER-ORDER]) |
 | `xs.any(f)`, `xs.all(f)` | `(T -> bool) -> bool` | short-circuit ([E-SEARCH-SHORTCIRCUIT]) |
 | `xs.find(f)` | `(T -> bool) -> Option[T]` | first match |
 
@@ -1562,6 +1568,30 @@ fn main() {
 //! deliberate
 fn main() {
     panic("deliberate")
+}
+```
+
+## `E-PAR-FILTER-ORDER.gr`
+
+```grasm
+//! tag: E-PAR-FILTER-ORDER
+//! expect: output
+//! [5, 8, 9, 4]
+//! true
+//! true
+fn main() {
+    // Survivors come back in input order, not completion order.
+    print("{[5, 2, 8, 1, 9, 4].par_filter(|x| x > 3)}")
+
+    // Enough elements to cross the threshold where workers are used.
+    var xs: [i64] = []
+    for i in 0..20000 {
+        xs.push(i)
+    }
+    print("{xs.par_filter(|x| x % 7 == 3) == xs.filter(|x| x % 7 == 3)}")
+
+    let none: [i64] = []
+    print("{none.par_filter(|x| x > 0).is_empty()}")
 }
 ```
 

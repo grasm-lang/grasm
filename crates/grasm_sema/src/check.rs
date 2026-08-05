@@ -1737,7 +1737,10 @@ declare it before `parallel`",
                         }
                         Type::List(Box::new(out))
                     }
-                    "filter" => {
+                    // `par_filter` is `filter` with the predicate required to
+                    // be effect-free (checked in effects.rs), which is what
+                    // lets the elements be tested on several cores at once.
+                    "filter" | "par_filter" => {
                         if check_arity(self, 1) {
                             let f = Type::Fn {
                                 params: vec![elem.clone()],

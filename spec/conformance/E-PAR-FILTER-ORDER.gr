@@ -1,0 +1,19 @@
+//! tag: E-PAR-FILTER-ORDER
+//! expect: output
+//! [5, 8, 9, 4]
+//! true
+//! true
+fn main() {
+    // Survivors come back in input order, not completion order.
+    print("{[5, 2, 8, 1, 9, 4].par_filter(|x| x > 3)}")
+
+    // Enough elements to cross the threshold where workers are used.
+    var xs: [i64] = []
+    for i in 0..20000 {
+        xs.push(i)
+    }
+    print("{xs.par_filter(|x| x % 7 == 3) == xs.filter(|x| x % 7 == 3)}")
+
+    let none: [i64] = []
+    print("{none.par_filter(|x| x > 0).is_empty()}")
+}

@@ -128,6 +128,7 @@ May change or be removed in any release. New surface starts here.
 
 - `E-BENCH-WARMUP` — experimental
 - `E-NOT-PARALLEL` — experimental
+- `E-PAR-FILTER-ORDER` — experimental
 - `E-PAR-MAP-ORDER` — experimental
 - `T-FN-VALUE` — provisional
 - `T-PAR-MAP-PURE` — experimental

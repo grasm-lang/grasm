@@ -962,3 +962,21 @@ fn function_values_print_as_what_they_are() {
         "<fn main::inc>\n1\n",
     );
 }
+
+#[test]
+fn par_filter_keeps_input_order() {
+    // The output order is the input order, which is what makes a parallel
+    // filter interchangeable with a sequential one.
+    run_expect(
+        "fn main() {\n    let xs = [5, 2, 8, 1, 9, 4]\n    print(\"{xs.par_filter(|x| x > 3)}\")\n}\n",
+        "[5, 8, 9, 4]\n",
+    );
+}
+
+#[test]
+fn par_filter_matches_filter() {
+    run_expect(
+        "fn main() {\n    let xs = [1, 2, 3, 4, 5, 6, 7]\n    print(\"{xs.par_filter(|x| x % 3 == 1) == xs.filter(|x| x % 3 == 1)}\")\n}\n",
+        "true\n",
+    );
+}

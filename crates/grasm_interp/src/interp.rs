@@ -1397,7 +1397,10 @@ impl<'a, W: Write> Interp<'a, W> {
                 }
                 Value::List(Rc::new(out))
             }
-            (Value::List(items), "filter") => {
+            // `par_filter` tests elements on several cores natively; here it
+            // is a plain filter. The answer is order-preserving and identical
+            // either way, which is the point of requiring purity.
+            (Value::List(items), "filter" | "par_filter") => {
                 let f = self.eval_expr(&args[0])?;
                 let mut out = Vec::new();
                 for item in items.iter() {

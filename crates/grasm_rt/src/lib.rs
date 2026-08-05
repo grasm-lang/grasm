@@ -580,6 +580,93 @@ pub unsafe extern "C" fn grasm_par_map_scalar(
     })
 }
 
+/// Applies a predicate to every element in parallel, then keeps the survivors
+/// **in input order**.
+///
+/// The predicate runs concurrently; the compaction that follows is sequential
+/// and ordered, so the output does not depend on how many cores ran it. The
+/// expensive half is the part that parallelises, which is the half worth
+/// parallelising.
+///
+/// # Safety
+/// `code` is a compiler-emitted function pointer; `env` points to `env_len`
+/// readable i64s; `list` is a live scalar list.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_par_filter_scalar(
+    list: *mut RtVal,
+    code: extern "C" fn(*const i64, i64) -> i64,
+    env: *const i64,
+    env_len: i64,
+) -> *mut RtVal {
+    let RtPayload::ListScalar { kind, data } = &(*list).payload else {
+        grasm_panic_msg_str("par_filter on a non-scalar list");
+    };
+    let kind = *kind;
+    let widened: Option<Vec<i64>> = match data {
+        ScalarData::Words(_) => None,
+        ScalarData::Bytes(_) => Some(data.iter().collect()),
+    };
+    let words: &[i64] = match (data, &widened) {
+        (ScalarData::Words(v), _) => v,
+        (_, Some(v)) => v,
+        _ => unreachable!(),
+    };
+    let env_owned: Vec<i64> = if env_len > 0 {
+        std::slice::from_raw_parts(env, env_len as usize).to_vec()
+    } else {
+        Vec::new()
+    };
+
+    let n = words.len();
+    let mut keep: Vec<u8> = vec![0; n];
+    let workers = if IN_PARALLEL.with(|f| f.get()) || n < PAR_MIN_ELEMS {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1)
+            .min(n)
+    };
+
+    if workers <= 1 {
+        for (k, &x) in keep.iter_mut().zip(words.iter()) {
+            *k = u8::from(code(env_owned.as_ptr(), x) != 0);
+        }
+    } else {
+        let chunk = n.div_ceil(workers * 16).max(1);
+        let pieces: std::sync::Mutex<Vec<(usize, &mut [u8])>> =
+            std::sync::Mutex::new(keep.chunks_mut(chunk).enumerate().collect());
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                let queue = &pieces;
+                let env_ref = &env_owned;
+                scope.spawn(move || {
+                    IN_PARALLEL.with(|f| f.set(true));
+                    loop {
+                        let Some((ci, slot)) = queue.lock().expect("no panics inside").pop()
+                        else {
+                            return;
+                        };
+                        let src = &words[ci * chunk..ci * chunk + slot.len()];
+                        for (k, &x) in slot.iter_mut().zip(src.iter()) {
+                            *k = u8::from(code(env_ref.as_ptr(), x) != 0);
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    // Ordered compaction: this is what makes the result core-count independent.
+    let mut out = ScalarData::new(kind);
+    for (i, &k) in keep.iter().enumerate() {
+        if k != 0 {
+            out.push(words[i]);
+        }
+    }
+    alloc(RtPayload::ListScalar { kind, data: out })
+}
+
 // --- unboxed scalar lists ---
 
 /// Boxes one inline element, for the paths that hand a value out (Option

@@ -346,7 +346,7 @@ fn check_par_map_block(b: &Block, current: &str, ctx: &Ctx, diags: &mut Vec<Diag
         diags.push(
             Diagnostic::error(
                 span,
-                format!("`par_map` needs an effect-free function, but this one performs {list}"),
+                format!("this parallel operation needs an effect-free function, but the one given performs {list}"),
             )
             .with_help(
                 "elements are processed on several cores, so an effect would \
@@ -390,7 +390,7 @@ fn collect_par_maps_expr<'e>(e: &'e Expr, out: &mut Vec<(&'e Expr, Span)>) {
         name, args, span, ..
     } = e
     {
-        if name.name == "par_map" {
+        if name.name == "par_map" || name.name == "par_filter" {
             if let Some(f) = args.first() {
                 out.push((f, *span));
             }

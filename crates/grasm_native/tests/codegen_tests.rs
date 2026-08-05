@@ -401,3 +401,17 @@ fn chained_par_maps_get_distinct_symbols() {
     )
     .expect("chained par_maps should compile");
 }
+
+#[test]
+fn par_filter_compiles_to_the_threaded_path() {
+    compile("fn main() {\n    let xs = [1, 2, 3]\n    print(\"{xs.par_filter(|x| x > 1)}\")\n}\n")
+        .expect("scalar elements should take the parallel path");
+}
+
+#[test]
+fn par_filter_over_boxed_elements_falls_back() {
+    compile(
+        "fn main() {\n    let ws = [\"a\", \"bb\"]\n    print(\"{ws.par_filter(|w| w.len() > 1)}\")\n}\n",
+    )
+    .expect("boxed elements should fall back, not error");
+}
