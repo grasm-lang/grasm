@@ -77,9 +77,9 @@ scalar lists store elements inline, so hot loops load and store instead of
 allocating. The remaining gap is per-access runtime calls and boxed map values.
 
 Compile time is ~53 ms/program — about Go's, roughly 3× faster than Rust.
-Binary size is the weak spot at ~1.5 MB, because every executable statically
-links the whole runtime. `benchmarks/README.md` also covers concision, keyword
-surface, and — explicitly — what is *not* measured, learning curve included.
+Binaries are ~440 KB after link-time dead-stripping — Rust's size, a fifth of
+Go's. `benchmarks/README.md` also covers concision, keyword surface, and —
+explicitly — what is *not* measured, learning curve included.
 
 ### Debugging
 

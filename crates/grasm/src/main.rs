@@ -611,11 +611,17 @@ fn build_native(program: &Program, out_path: &str) -> Result<u64, String> {
             rt.display()
         ));
     }
-    let status = std::process::Command::new("cc")
-        .arg(&obj)
-        .arg(&rt)
-        .arg("-o")
-        .arg(out_path)
+    let mut link = std::process::Command::new("cc");
+    link.arg(&obj).arg(&rt).arg("-o").arg(out_path);
+    // Strip runtime code the program never calls. The archive carries the
+    // whole stdlib surface; a hello-world only needs a sliver of it, and
+    // without this every binary pays for all of it (1.5 MB -> ~0.5 MB).
+    if cfg!(target_os = "macos") {
+        link.arg("-Wl,-dead_strip");
+    } else if cfg!(target_os = "linux") {
+        link.arg("-Wl,--gc-sections");
+    }
+    let status = link
         .status()
         .map_err(|e| format!("failed to run `cc`: {e}"))?;
     if !status.success() {

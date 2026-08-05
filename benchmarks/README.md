@@ -88,7 +88,7 @@ Mean over the five programs:
 | language | compile ms/program | binary KB |
 |----------|-------------------:|----------:|
 | Go       |                 51 |     2,339 |
-| grasm    |                 53 |     1,503 |
+| grasm    |                 53 |       442 |
 | C        |                 63 |        33 |
 | Rust     |                151 |       440 |
 | Python   |                  — |         — |
@@ -97,12 +97,14 @@ Grasm compiles about as fast as Go and roughly 3× faster than Rust, which is
 what a Cranelift backend with no optimizer passes beyond `opt_level=speed`
 should look like.
 
-Binary size is the weak column. Every executable statically links the whole
-runtime — `libgrasm_rt.a` — whether the program touches maps, effects, or
-concurrency or not, so a program that prints one integer still carries all of
-it. Stripping takes 1,503 KB to about 1,080 KB. C at 33 KB is the honest
-comparison, and closing that gap means dead-code elimination across the
-runtime, which does not exist yet.
+Binary size used to be the weak column at 1,503 KB: every executable carried
+the whole statically linked runtime whether it used maps, effects, or
+concurrency or not. The linker now dead-strips it (`-dead_strip` on macOS,
+`--gc-sections` on Linux), which puts Grasm at Rust's size. What remains is
+Rust `std` infrastructure the runtime is built on — the panic hook alone pulls
+the whole backtrace stack — and going further than ~440 KB means a `no_std`
+runtime or a `build-std` toolchain, neither of which stable Rust offers today.
+C at 33 KB stays the honest floor.
 
 ### Concision
 

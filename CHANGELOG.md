@@ -46,6 +46,11 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   and Go). Representation only; `[E-COW]` says it is never observable, and
   difftest holds all 115 programs byte-identical across both engines.
 
+- **Native binaries dead-strip the runtime.** `-Wl,-dead_strip` (macOS) /
+  `--gc-sections` (Linux) at link time: 1,503 KB → ~442 KB mean, matching
+  Rust. The rest is `std` machinery; going lower needs `no_std` or
+  `build-std`.
+
 ### Fixed
 
 - `exit(n)` called `std::process::exit` from inside the interpreter, killing any
