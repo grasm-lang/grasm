@@ -542,3 +542,35 @@ fn the_stability_policy_and_the_table_agree_on_the_levels() {
         );
     }
 }
+
+#[test]
+fn the_language_pack_is_current_and_complete() {
+    // dist/grasm-language-pack.md is the whole language in one file — the
+    // answer to a new language being absent from AI training data is that it
+    // fits in a context window. It is generated, so it can go stale; this
+    // fails if it has, or if it has lost a clause.
+    let root = spec_dir().parent().unwrap().to_path_buf();
+    let pack = match std::fs::read_to_string(root.join("dist/grasm-language-pack.md")) {
+        Ok(p) => p,
+        Err(e) => panic!("dist/grasm-language-pack.md is missing ({e}) — regenerate it"),
+    };
+    for tag in declared_tags() {
+        assert!(
+            pack.contains(&format!("[{tag}]")),
+            "the language pack is missing clause `{tag}` — regenerate it"
+        );
+    }
+    for case in all_cases() {
+        assert!(
+            pack.contains(&format!("`{}`", case.name)),
+            "the language pack is missing conformance program `{}` — regenerate it",
+            case.name
+        );
+    }
+    // Small enough to hand to a model whole; the claim is load-bearing.
+    assert!(
+        pack.len() < 200_000,
+        "the language pack has grown to {} bytes — it must stay context-sized",
+        pack.len()
+    );
+}
