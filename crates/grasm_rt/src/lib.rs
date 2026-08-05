@@ -541,16 +541,32 @@ pub unsafe extern "C" fn grasm_par_map_scalar(
             *o = code(env_owned.as_ptr(), x);
         }
     } else {
-        let chunk = n.div_ceil(workers);
+        // Hand out many small pieces from a shared queue rather than giving
+        // each worker one big slice. Elements are not equally expensive — a
+        // mandelbrot row in the middle of the set costs far more than one at
+        // the edge — and splitting statically means every worker waits for
+        // whichever got the expensive half. Dynamic hand-out keeps them all
+        // busy until the work is actually gone.
+        let chunk = n.div_ceil(workers * 16).max(1);
         let input: &[i64] = words;
+        let pieces: std::sync::Mutex<Vec<(usize, &mut [i64])>> =
+            std::sync::Mutex::new(out.chunks_mut(chunk).enumerate().collect());
         std::thread::scope(|scope| {
-            for (ci, slot) in out.chunks_mut(chunk).enumerate() {
-                let src = &input[ci * chunk..ci * chunk + slot.len()];
+            for _ in 0..workers {
+                let queue = &pieces;
                 let env_ref = &env_owned;
                 scope.spawn(move || {
                     IN_PARALLEL.with(|f| f.set(true));
-                    for (o, &x) in slot.iter_mut().zip(src.iter()) {
-                        *o = code(env_ref.as_ptr(), x);
+                    loop {
+                        let Some((ci, slot)) =
+                            queue.lock().expect("no panics inside").pop()
+                        else {
+                            return;
+                        };
+                        let src = &input[ci * chunk..ci * chunk + slot.len()];
+                        for (o, &x) in slot.iter_mut().zip(src.iter()) {
+                            *o = code(env_ref.as_ptr(), x);
+                        }
                     }
                 });
             }
