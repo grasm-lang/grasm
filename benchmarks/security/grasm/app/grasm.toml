@@ -1,0 +1,8 @@
+[package]
+name = "app"
+version = "1.0.0"
+entry = "src/main.gr"
+capabilities = ["io"]
+
+[dependencies.mathlib]
+path = "../mathlib"

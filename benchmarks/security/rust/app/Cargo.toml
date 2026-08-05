@@ -1,0 +1,11 @@
+[package]
+name = "app"
+version = "1.0.0"
+edition = "2021"
+[dependencies]
+mathlib = { path = "../mathlib" }
+[[bin]]
+name = "app"
+path = "src/main.rs"
+
+[workspace]

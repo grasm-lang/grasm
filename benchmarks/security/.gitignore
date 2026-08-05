@@ -1,0 +1,3 @@
+# cargo build output, if a run is interrupted before cleanup
+rust/*/target/
+**/grasm.lock

@@ -1,0 +1,7 @@
+// v1.0.0 — a pure math library. Declares no capabilities and performs none.
+pub fn total(xs: [i64]) -> i64 {
+    xs.sum()
+}
+
+fn main() {
+}

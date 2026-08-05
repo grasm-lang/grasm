@@ -275,6 +275,25 @@ to a dependency's contents is detectable.
 Registries and version-range resolution are not implemented; dependencies are
 path-based today.
 
+### The supply-chain benchmark
+
+The one row no other language in the comparison can fill.
+`./scripts/security_bench.sh` runs the *same* tampered-dependency attack in
+four languages: a trusted pure library's next version reads `/etc/passwd`,
+keeping its signature and result.
+
+| language | toolchain says | why |
+|----------|----------------|-----|
+| **Grasm** | **COMPILE ERROR** | dependency performs `[io]`, permits `[]` |
+| Rust | builds clean | `std::fs` is ambient |
+| Go | builds clean | `os.ReadFile` importable anywhere |
+| Python | compiles clean | `open` needs no declaration |
+
+Only Grasm's build fails, because the dependency's inferred `io` exceeds its
+declared ceiling. The others put this on a different layer (runtime sandbox,
+review, `cargo-vet`); the narrow, measured claim is that Grasm's *toolchain*
+catches it and theirs do not. See `benchmarks/security/`.
+
 ## Specification
 
 [`spec/`](spec/) is the normative description of the language: lexical rules and

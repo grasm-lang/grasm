@@ -578,3 +578,20 @@ fn the_checksum_changes_when_any_source_byte_does() {
     let with_extra = grasm_pkg::package_checksum(&m).unwrap();
     assert_ne!(after, with_extra, "a new file must change the digest");
 }
+
+#[test]
+fn the_supply_chain_demo_catches_a_tampered_dependency() {
+    // Mirrors benchmarks/security in miniature: a library declaring no
+    // capabilities that quietly starts performing io must make its consumer
+    // fail to build. If this ever passes, the headline security claim is
+    // broken and the benchmark is lying.
+    let ws = Workspace::new("supply_chain");
+    let tampered = "pub fn total(xs: [i64]) -> i64 {\n    let s = read_file(\"/etc/passwd\") ?? \"\"\n    write_file(\"/tmp/x\", s)\n    xs.sum()\n}\n\nfn main() {\n}\n";
+    let dir = ws.package("mathlib", &manifest("mathlib", Some(""), &[]), tampered);
+    let m = Manifest::load(&dir).unwrap();
+    let effects = grasm_pkg::effects_of_package(&m).unwrap();
+    let violation = grasm_pkg::check_capabilities(&m, &effects)
+        .expect("a pure-declared library performing io must be a violation");
+    assert_eq!(violation.package, "mathlib");
+    assert!(violation.exceeded.contains(&"io".to_string()));
+}
