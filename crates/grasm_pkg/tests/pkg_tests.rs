@@ -657,3 +657,82 @@ fn a_dependency_is_still_capability_checked_when_actually_used() {
         .expect("a pure-declared dependency performing io must be a violation");
     assert!(violation.exceeded.contains(&"io".to_string()));
 }
+
+// ---------------------------------------------------------------------------
+// Capability names must mean something
+// ---------------------------------------------------------------------------
+
+/// The effect vocabulary a package's own sources define.
+fn vocab_of(dir: &Path) -> BTreeSet<String> {
+    let m = Manifest::load(dir).expect("manifest loads");
+    grasm_pkg::effect_vocabulary_of_package(&m).expect("vocabulary")
+}
+
+#[test]
+fn a_user_effect_is_a_capability_like_any_other() {
+    // The ceiling is not limited to io/async: any declared effect counts, so a
+    // library cannot silently start using `Network` either.
+    let ws = Workspace::new("user_effect");
+    let dir = ws.package(
+        "lib",
+        &manifest("lib", Some(""), &[]),
+        "effect Network {\n    fn fetch(u: str) -> str\n}\n\npub fn grab(u: str) -> str / {Network} {\n    Network.fetch(u)\n}\n\nfn main() {\n}\n",
+    );
+    let m = Manifest::load(&dir).unwrap();
+    let effects = grasm_pkg::effects_of_package(&m).unwrap();
+    assert!(effects.contains("Network"), "inferred: {effects:?}");
+    let v = grasm_pkg::check_capabilities(&m, &effects)
+        .expect("performing Network under an empty ceiling is a violation");
+    assert!(v.exceeded.contains(&"Network".to_string()));
+}
+
+#[test]
+fn a_declared_capability_must_name_a_real_effect() {
+    // A ceiling reads to a human as a permission. One naming nothing grants
+    // nothing while looking like it grants something.
+    let ws = Workspace::new("fictional_cap");
+    let dir = ws.package(
+        "lib",
+        &manifest("lib", Some("\"Telemetry\""), &[]),
+        "pub fn f() -> i64 {\n    1\n}\n\nfn main() {\n}\n",
+    );
+    let m = Manifest::load(&dir).unwrap();
+    let bad = grasm_pkg::check_capability_names(&m, &vocab_of(&dir));
+    assert_eq!(bad.len(), 1, "{bad:?}");
+    assert_eq!(bad[0].name, "Telemetry");
+}
+
+#[test]
+fn a_typo_in_a_capability_gets_a_suggestion() {
+    let ws = Workspace::new("typo_cap");
+    let dir = ws.package(
+        "lib",
+        &manifest("lib", Some("\"Netwrok\""), &[]),
+        "effect Network {\n    fn fetch(u: str) -> str\n}\n\npub fn f() -> i64 {\n    1\n}\n\nfn main() {\n}\n",
+    );
+    let m = Manifest::load(&dir).unwrap();
+    let bad = grasm_pkg::check_capability_names(&m, &vocab_of(&dir));
+    assert_eq!(bad.len(), 1);
+    assert_eq!(bad[0].suggestion.as_deref(), Some("Network"));
+    assert!(bad[0].to_string().contains("did you mean `Network`?"));
+}
+
+#[test]
+fn the_builtin_and_declared_effects_are_all_accepted() {
+    let ws = Workspace::new("good_caps");
+    let dir = ws.package(
+        "lib",
+        &manifest("lib", Some("\"io\", \"async\", \"Network\""), &[]),
+        "effect Network {\n    fn fetch(u: str) -> str\n}\n\npub fn f() -> i64 {\n    1\n}\n\nfn main() {\n}\n",
+    );
+    let m = Manifest::load(&dir).unwrap();
+    assert!(grasm_pkg::check_capability_names(&m, &vocab_of(&dir)).is_empty());
+}
+
+#[test]
+fn an_unrestricted_package_has_no_names_to_check() {
+    let ws = Workspace::new("unrestricted");
+    let dir = ws.package("lib", &manifest("lib", None, &[]), PURE_SRC);
+    let m = Manifest::load(&dir).unwrap();
+    assert!(grasm_pkg::check_capability_names(&m, &vocab_of(&dir)).is_empty());
+}

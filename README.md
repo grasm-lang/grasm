@@ -326,6 +326,17 @@ in every consumer, at compile time. A dependency that quietly starts reading
 files in a patch release breaks the build rather than shipping. See
 [`examples/workspace/`](examples/workspace/) for a runnable demonstration.
 
+A ceiling is written in **effects**, so it is not a fixed permission list.
+Declare `effect Network` and a package can be bounded by
+`capabilities = ["Network"]` exactly as it is by `io`. The names are checked
+against the effects the program actually defines, so a typo cannot masquerade
+as a granted permission:
+
+```
+error: package `lib` declares capability `Netwrok`, which is not an effect
+       this program defines — did you mean `Network`?
+```
+
 The lockfile records a SHA-256 over each package's sorted sources, so a change
 to a dependency's contents is detectable.
 

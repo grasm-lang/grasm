@@ -70,6 +70,24 @@ pub fn check_effects(module: &Module) -> Vec<Diagnostic> {
 /// The union of every effect performed by a program's functions, ignoring
 /// declared rows. Used by the package manager to check a dependency against
 /// its manifest's capability ceiling.
+/// Every effect name a program declares, plus the built-in rows.
+///
+/// A package manifest names capabilities as plain strings, so this is what
+/// makes them checkable: a ceiling that mentions an effect nobody declared is
+/// a typo or a fiction, and either way the manifest is claiming something the
+/// code cannot mean.
+pub fn effect_vocabulary(program: &crate::loader::Program) -> BTreeSet<String> {
+    let mut names: BTreeSet<String> = [IO.to_string(), ASYNC.to_string()].into();
+    for file in &program.files {
+        for decl in &file.module.decls {
+            if let Decl::Effect(e) = decl {
+                names.insert(e.name.name.clone());
+            }
+        }
+    }
+    names
+}
+
 pub fn effects_of_program(program: &crate::loader::Program) -> BTreeSet<String> {
     let views: Vec<ModuleView> = program
         .files

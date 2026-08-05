@@ -806,6 +806,7 @@ fn cmd_deps(dir: &std::path::Path, locked: bool) -> Result<(), String> {
     // Capability enforcement: a package that performs more than its manifest
     // permits fails the build for everyone who depends on it.
     let mut violations = Vec::new();
+    let mut unknown: Vec<grasm_pkg::UnknownCapability> = Vec::new();
     for pkg in &resolution.packages {
         let performed = match grasm_pkg::effects_of_package(pkg) {
             Ok(e) => e,
@@ -828,6 +829,26 @@ fn cmd_deps(dir: &std::path::Path, locked: bool) -> Result<(), String> {
         if let Some(v) = grasm_pkg::check_capabilities(pkg, &performed) {
             violations.push(v);
         }
+        // A ceiling only means something if its names do. A capability naming
+        // no real effect reads to a reviewer as a granted permission while
+        // granting nothing at all.
+        if let Ok(vocab) = grasm_pkg::effect_vocabulary_of_package(pkg) {
+            unknown.extend(grasm_pkg::check_capability_names(pkg, &vocab));
+        }
+    }
+
+    if !unknown.is_empty() {
+        for u in &unknown {
+            eprintln!("error: {u}");
+        }
+        eprintln!(
+            "  help: a capability must be `io`, `async`, or an effect the \
+program declares"
+        );
+        return Err(format!(
+            "{} capability name(s) do not exist",
+            unknown.len()
+        ));
     }
 
     if !violations.is_empty() {

@@ -13,7 +13,8 @@ Expect an acknowledgement within a week. Fixes ship in a PATCH release.
 
 Grasm makes one security claim, and it is the one worth attacking:
 
-**A package cannot exceed its declared capability ceiling.** A package's
+**A package cannot exceed its declared capability ceiling**, and the ceiling
+is written in effects — not a fixed list of permissions. A package's
 manifest declares the effects it may perform. Because effects are *inferred from
 source* rather than declared by hand, a dependency that quietly starts reading
 the filesystem or opening sockets exceeds its ceiling and fails to build **in
@@ -26,9 +27,23 @@ hides an `io` effect behind a call chain, inside a closure, behind UFCS, in a
 and requires every one to be caught — alongside a genuinely pure package that
 must report nothing, so the suite cannot pass by calling everything `io`.
 
+A ceiling names effects, so it covers whatever the program defines rather than
+a fixed vocabulary. `capabilities = ["io"]` bounds filesystem and console
+access; a program that declares `effect Network` can write
+`capabilities = ["Network"]` and a dependency that starts making requests
+breaks the build the same way. Capability names are themselves checked against
+the effects the program defines, because a ceiling that names nothing reads to
+a reviewer as a granted permission while granting nothing:
+
+```
+error: package `lib` declares capability `Netwrok`, which is not an effect
+       this program defines — did you mean `Network`?
+```
+
 In scope:
 
 - Any way to perform an effect that the capability check does not see.
+- A manifest that claims a capability the program cannot mean.
 - Any way to make the effect inference under-report what code does.
 - Crashes, memory unsafety, or wrong results in the native runtime
   (`crates/grasm_rt`), which is the only `unsafe` code in the toolchain.

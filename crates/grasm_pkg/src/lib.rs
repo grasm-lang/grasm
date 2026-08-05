@@ -255,6 +255,79 @@ pub fn check_capabilities(
     })
 }
 
+/// A capability a manifest declares that names no real effect.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnknownCapability {
+    pub package: String,
+    pub name: String,
+    /// The closest real effect name, when one is close enough to be a typo.
+    pub suggestion: Option<String>,
+}
+
+impl std::fmt::Display for UnknownCapability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "package `{}` declares capability `{}`, which is not an effect \
+             this program defines",
+            self.package, self.name
+        )?;
+        if let Some(s) = &self.suggestion {
+            write!(f, " — did you mean `{s}`?")?;
+        }
+        Ok(())
+    }
+}
+
+/// Checks that every declared capability names a real effect.
+///
+/// A ceiling is only meaningful if its names mean something. `capabilities =
+/// ["Netwrok"]` grants nothing and denies nothing; it silently reads to a
+/// human reviewer as network access while the compiler sees an unknown word.
+/// The manifest is a claim other people rely on, so it has to be checkable.
+pub fn check_capability_names(
+    manifest: &Manifest,
+    vocabulary: &BTreeSet<String>,
+) -> Vec<UnknownCapability> {
+    let Some(declared) = manifest.capabilities.as_ref() else {
+        return Vec::new();
+    };
+    declared
+        .iter()
+        .filter(|c| !vocabulary.contains(*c))
+        .map(|c| UnknownCapability {
+            package: manifest.name.clone(),
+            name: c.clone(),
+            suggestion: nearest(c, vocabulary),
+        })
+        .collect()
+}
+
+/// The closest vocabulary entry within a small edit distance, for a typo hint.
+fn nearest(word: &str, vocabulary: &BTreeSet<String>) -> Option<String> {
+    vocabulary
+        .iter()
+        .map(|v| (edit_distance(word, v), v))
+        .filter(|(d, v)| *d <= 2.max(v.len() / 3))
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, v)| v.clone())
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for i in 1..=a.len() {
+        cur[0] = i;
+        for j in 1..=b.len() {
+            let sub = prev[j - 1] + usize::from(a[i - 1] != b[j - 1]);
+            cur[j] = sub.min(prev[j] + 1).min(cur[j - 1] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
 /// Effects performed by a package's own source files (not its dependencies').
 pub fn effects_of_package(manifest: &Manifest) -> Result<BTreeSet<String>, String> {
     let entry = manifest.entry_path();
@@ -267,6 +340,20 @@ pub fn effects_of_package(manifest: &Manifest) -> Result<BTreeSet<String>, Strin
     }
     let program = grasm_sema::loader::load_from_disk(&entry)?;
     Ok(grasm_sema::effects::effects_of_program(&program))
+}
+
+/// The effect names a package's sources make available, for name checking.
+pub fn effect_vocabulary_of_package(manifest: &Manifest) -> Result<BTreeSet<String>, String> {
+    let entry = manifest.entry_path();
+    if !entry.exists() {
+        return Err(format!(
+            "package `{}`: entry file {} does not exist",
+            manifest.name,
+            entry.display()
+        ));
+    }
+    let program = grasm_sema::loader::load_from_disk(&entry)?;
+    Ok(grasm_sema::effects::effect_vocabulary(&program))
 }
 
 // ---------------------------------------------------------------------------
