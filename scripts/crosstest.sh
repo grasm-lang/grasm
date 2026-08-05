@@ -34,8 +34,12 @@ fail=0
 skip=0
 declare -a FAILED=()
 
-for src in $(find examples projects -name '*.gr' | sort); do
+# Same scan roots as difftest.sh: a program the host backend is held to must
+# hold on every other target too, or "portable" means only what was sampled.
+for src in $(find examples projects spec/conformance benchmarks/grasm -name '*.gr' | sort); do
     grep -qE '^[[:space:]]*(pub )?fn main\(' "$src" || continue
+    # Conformance programs tagged `expect: error` are meant not to compile.
+    grep -q '^//! expect: error$' "$src" && continue
     name=$(echo "$src" | tr '/.' '__')
 
     if ! "$GRASM" build "$src" --native --target "$TARGET" -o "$WORK/$name" >/dev/null 2>&1; then
@@ -48,12 +52,23 @@ for src in $(find examples projects -name '*.gr' | sort); do
         continue
     fi
 
-    native_out=$("$WORK/$name.exe" 2>&1)
+    # stdout and the exit code are what a program *produces* and must match
+    # exactly. stderr carries diagnostics, and the interpreter's panic stack
+    # trace has no native counterpart (see README, "Debugging"), so that block
+    # is stripped before stderr is compared — same rule as difftest.sh.
+    native_err=$(mktemp)
+    interp_err=$(mktemp)
+    native_out=$("$WORK/$name.exe" 2>"$native_err")
     native_code=$?
-    interp_out=$("$GRASM" run "$src" 2>&1)
+    interp_out=$("$GRASM" run "$src" 2>"$interp_err")
     interp_code=$?
+    interp_diag=$(grep -v -e '^stack trace (innermost first):$' -e '^  [A-Za-z_][A-Za-z0-9_:]* at ' "$interp_err")
+    native_diag=$(cat "$native_err")
+    rm -f "$native_err" "$interp_err"
 
-    if [ "$native_out" == "$interp_out" ] && [ "$native_code" == "$interp_code" ]; then
+    if [ "$native_out" == "$interp_out" ] \
+        && [ "$native_code" == "$interp_code" ] \
+        && [ "$interp_diag" == "$native_diag" ]; then
         pass=$((pass + 1))
     else
         fail=$((fail + 1))

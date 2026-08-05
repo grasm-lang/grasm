@@ -135,17 +135,125 @@ impl ScalarKind {
     }
 }
 
+/// Inline element storage. Bools get a byte each rather than a machine word:
+/// a 2M-entry sieve is 2 MB instead of 16 MB, and that is the whole reason
+/// this is not simply `Vec<i64>`.
+pub enum ScalarData {
+    Words(Vec<i64>),
+    Bytes(Vec<u8>),
+}
+
+impl ScalarData {
+    fn new(kind: ScalarKind) -> ScalarData {
+        match kind {
+            ScalarKind::Bool => ScalarData::Bytes(Vec::new()),
+            _ => ScalarData::Words(Vec::new()),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            ScalarData::Words(v) => v.len(),
+            ScalarData::Bytes(v) => v.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn get(&self, i: usize) -> i64 {
+        match self {
+            ScalarData::Words(v) => v[i],
+            ScalarData::Bytes(v) => i64::from(v[i]),
+        }
+    }
+
+    fn set(&mut self, i: usize, bits: i64) {
+        match self {
+            ScalarData::Words(v) => v[i] = bits,
+            ScalarData::Bytes(v) => v[i] = u8::from(bits != 0),
+        }
+    }
+
+    fn push(&mut self, bits: i64) {
+        match self {
+            ScalarData::Words(v) => v.push(bits),
+            ScalarData::Bytes(v) => v.push(u8::from(bits != 0)),
+        }
+    }
+
+    fn pop(&mut self) -> Option<i64> {
+        match self {
+            ScalarData::Words(v) => v.pop(),
+            ScalarData::Bytes(v) => v.pop().map(i64::from),
+        }
+    }
+
+    fn duplicate(&self) -> ScalarData {
+        match self {
+            ScalarData::Words(v) => ScalarData::Words(v.clone()),
+            ScalarData::Bytes(v) => ScalarData::Bytes(v.clone()),
+        }
+    }
+
+    fn slice(&self, s: usize, e: usize) -> ScalarData {
+        match self {
+            ScalarData::Words(v) => ScalarData::Words(v[s..e].to_vec()),
+            ScalarData::Bytes(v) => ScalarData::Bytes(v[s..e].to_vec()),
+        }
+    }
+
+    fn reversed(&self) -> ScalarData {
+        match self {
+            ScalarData::Words(v) => {
+                let mut o = v.clone();
+                o.reverse();
+                ScalarData::Words(o)
+            }
+            ScalarData::Bytes(v) => {
+                let mut o = v.clone();
+                o.reverse();
+                ScalarData::Bytes(o)
+            }
+        }
+    }
+
+    fn iter(&self) -> Box<dyn Iterator<Item = i64> + '_> {
+        match self {
+            ScalarData::Words(v) => Box::new(v.iter().copied()),
+            ScalarData::Bytes(v) => Box::new(v.iter().map(|&b| i64::from(b))),
+        }
+    }
+
+    /// Sorts in place. Bools have no ordering in `cmp_vals`, so sorting them
+    /// is a no-op in both engines — replicated here rather than "fixed".
+    fn sort(&mut self, kind: ScalarKind) {
+        if let ScalarData::Words(v) = self {
+            v.sort_by(|&a, &b| scalar_cmp(kind, a, b));
+        }
+    }
+
+    fn from_words(kind: ScalarKind, words: Vec<i64>) -> ScalarData {
+        match kind {
+            ScalarKind::Bool => ScalarData::Bytes(
+                words.into_iter().map(|b| u8::from(b != 0)).collect(),
+            ),
+            _ => ScalarData::Words(words),
+        }
+    }
+}
+
 pub enum RtPayload {
     I64(i64),
     F64(f64),
     Bool(bool),
     Str(String),
     List(Vec<*mut RtVal>),
-    /// Scalar elements stored inline: i64, f64 (as raw bits), bool (0/1).
-    /// One machine word per element — no per-element heap cell, no refcount
+    /// Scalar elements stored inline — no per-element heap cell, no refcount
     /// traffic, no pointer chase. This is why `c[i] = c[i] + x` in a hot loop
     /// is a load and a store instead of an allocation.
-    ListScalar { kind: ScalarKind, data: Vec<i64> },
+    ListScalar { kind: ScalarKind, data: ScalarData },
     Map(Vec<(*mut RtVal, *mut RtVal)>),
     Struct {
         name: String,
@@ -392,12 +500,24 @@ pub unsafe extern "C" fn grasm_par_map_scalar(
     let RtPayload::ListScalar { data, .. } = &(*list).payload else {
         grasm_panic_msg_str("par_map on a non-scalar list");
     };
+    // Workers operate on machine words. Word-backed input is used directly;
+    // only byte-backed (bool) input needs materializing, so the common case
+    // does not pay for a copy of the whole list.
+    let widened: Option<Vec<i64>> = match data {
+        ScalarData::Words(_) => None,
+        ScalarData::Bytes(_) => Some(data.iter().collect()),
+    };
+    let words: &[i64] = match (data, &widened) {
+        (ScalarData::Words(v), _) => v,
+        (_, Some(v)) => v,
+        _ => unreachable!(),
+    };
     let env_owned: Vec<i64> = if env_len > 0 {
         std::slice::from_raw_parts(env, env_len as usize).to_vec()
     } else {
         Vec::new()
     };
-    let n = data.len();
+    let n = words.len();
     let mut out: Vec<i64> = vec![0; n];
 
     let workers = if IN_PARALLEL.with(|f| f.get()) || n < PAR_MIN_ELEMS {
@@ -410,12 +530,12 @@ pub unsafe extern "C" fn grasm_par_map_scalar(
     };
 
     if workers <= 1 {
-        for (o, &x) in out.iter_mut().zip(data.iter()) {
+        for (o, &x) in out.iter_mut().zip(words.iter()) {
             *o = code(env_owned.as_ptr(), x);
         }
     } else {
         let chunk = n.div_ceil(workers);
-        let input: &[i64] = data;
+        let input: &[i64] = words;
         std::thread::scope(|scope| {
             for (ci, slot) in out.chunks_mut(chunk).enumerate() {
                 let src = &input[ci * chunk..ci * chunk + slot.len()];
@@ -430,9 +550,10 @@ pub unsafe extern "C" fn grasm_par_map_scalar(
         });
     }
 
+    let kind = ScalarKind::from_i64(out_kind);
     alloc(RtPayload::ListScalar {
-        kind: ScalarKind::from_i64(out_kind),
-        data: out,
+        kind,
+        data: ScalarData::from_words(kind, out),
     })
 }
 
@@ -503,7 +624,7 @@ fn scalar_display(kind: ScalarKind, bits: i64) -> String {
 /// A list's elements, whichever representation it has.
 enum Items<'a> {
     Boxed(&'a Vec<*mut RtVal>),
-    Scalar(ScalarKind, &'a Vec<i64>),
+    Scalar(ScalarKind, &'a ScalarData),
 }
 
 /// # Safety: live runtime pointer.
@@ -513,7 +634,7 @@ unsafe fn items_of<'a>(v: *mut RtVal) -> Items<'a> {
             Items::Boxed(std::mem::transmute::<&Vec<*mut RtVal>, &'a Vec<*mut RtVal>>(items))
         }
         RtPayload::ListScalar { kind, data } => {
-            Items::Scalar(*kind, std::mem::transmute::<&Vec<i64>, &'a Vec<i64>>(data))
+            Items::Scalar(*kind, std::mem::transmute::<&ScalarData, &'a ScalarData>(data))
         }
         _ => grasm_panic_msg_str("expected a list"),
     }
@@ -522,9 +643,10 @@ unsafe fn items_of<'a>(v: *mut RtVal) -> Items<'a> {
 /// A new empty scalar list of the given kind (0 = i64, 1 = f64, 2 = bool).
 #[no_mangle]
 pub extern "C" fn grasm_list_new_scalar(kind: i64) -> *mut RtVal {
+    let k = ScalarKind::from_i64(kind);
     alloc(RtPayload::ListScalar {
-        kind: ScalarKind::from_i64(kind),
-        data: Vec::new(),
+        kind: k,
+        data: ScalarData::new(k),
     })
 }
 
@@ -556,7 +678,7 @@ pub unsafe extern "C" fn grasm_list_get_scalar(v: *mut RtVal, i: i64, kind: i64)
             if i < 0 || i as usize >= data.len() {
                 rt_panic(&format!("index {i} out of bounds (len {})", data.len()));
             }
-            data[i as usize]
+            data.get(i as usize)
         }
         RtPayload::List(items) => {
             if i < 0 || i as usize >= items.len() {
@@ -583,7 +705,7 @@ pub unsafe extern "C" fn grasm_list_set_scalar(
             if i < 0 || i as usize >= data.len() {
                 rt_panic(&format!("index {i} out of bounds (len {})", data.len()));
             }
-            data[i as usize] = bits;
+            data.set(i as usize, bits);
         }
         RtPayload::List(items) => {
             if i < 0 || i as usize >= items.len() {
@@ -683,7 +805,7 @@ unsafe fn cow_list(list: *mut RtVal) -> *mut RtVal {
         // A scalar list clones as one memcpy: no per-element refcounts exist.
         RtPayload::ListScalar { kind, data } => alloc(RtPayload::ListScalar {
             kind: *kind,
-            data: data.clone(),
+            data: data.duplicate(),
         }),
         _ => grasm_panic_msg_str("list op on non-list"),
     };
@@ -718,7 +840,7 @@ pub unsafe extern "C" fn grasm_list_get(v: *mut RtVal, i: i64) -> *mut RtVal {
             if i < 0 || i as usize >= data.len() {
                 rt_panic(&format!("index {i} out of bounds (len {})", data.len()));
             }
-            scalar_box(*kind, data[i as usize])
+            scalar_box(*kind, data.get(i as usize))
         }
         _ => grasm_panic_msg_str("index on non-list"),
     }
@@ -824,7 +946,7 @@ unsafe fn display(v: *mut RtVal) -> String {
             format!("[{}]", parts.join(", "))
         }
         RtPayload::ListScalar { kind, data } => {
-            let parts: Vec<String> = data.iter().map(|&b| scalar_display(*kind, b)).collect();
+            let parts: Vec<String> = data.iter().map(|b| scalar_display(*kind, b)).collect();
             format!("[{}]", parts.join(", "))
         }
         RtPayload::Map(entries) => {
@@ -1041,7 +1163,7 @@ unsafe fn val_eq(a: *mut RtVal, b: *mut RtVal) -> bool {
         ) => {
             k1 == k2
                 && d1.len() == d2.len()
-                && d1.iter().zip(d2).all(|(&x, &y)| scalar_eq(*k1, x, y))
+                && d1.iter().zip(d2.iter()).all(|(x, y)| scalar_eq(*k1, x, y))
         }
         // The same logical list can arrive in either representation (a
         // literal is scalar; `keys()` is boxed), so equality must cross.
@@ -1051,7 +1173,7 @@ unsafe fn val_eq(a: *mut RtVal, b: *mut RtVal) -> bool {
                 && data
                     .iter()
                     .zip(items)
-                    .all(|(&bits, &boxed)| match (*kind, &(*boxed).payload) {
+                    .all(|(bits, &boxed)| match (*kind, &(*boxed).payload) {
                         (ScalarKind::I64, RtPayload::I64(x)) => bits == *x,
                         (ScalarKind::F64, RtPayload::F64(x)) => {
                             f64::from_bits(bits as u64) == *x
@@ -1099,7 +1221,7 @@ pub unsafe extern "C" fn grasm_list_get_opt(v: *mut RtVal, i: i64) -> *mut RtVal
             if i < 0 || i as usize >= data.len() {
                 none_val()
             } else {
-                some_of(scalar_box(*kind, data[i as usize]))
+                some_of(scalar_box(*kind, data.get(i as usize)))
             }
         }
         RtPayload::List(items) => {
@@ -1468,7 +1590,7 @@ pub unsafe extern "C" fn grasm_str_parse_float(s: *mut RtVal) -> *mut RtVal {
 pub unsafe extern "C" fn grasm_list_join(v: *mut RtVal, sep: *mut RtVal) -> *mut RtVal {
     let parts: Vec<String> = match items_of(v) {
         Items::Boxed(items) => items.iter().map(|&i| display(i)).collect(),
-        Items::Scalar(kind, data) => data.iter().map(|&b| scalar_display(kind, b)).collect(),
+        Items::Scalar(kind, data) => data.iter().map(|b| scalar_display(kind, b)).collect(),
     };
     alloc(RtPayload::Str(parts.join(as_str(sep))))
 }
@@ -1488,11 +1610,10 @@ pub unsafe extern "C" fn grasm_list_rev(v: *mut RtVal) -> *mut RtVal {
             out.reverse();
             alloc(RtPayload::List(out))
         }
-        Items::Scalar(kind, data) => {
-            let mut out = data.clone();
-            out.reverse();
-            alloc(RtPayload::ListScalar { kind, data: out })
-        }
+        Items::Scalar(kind, data) => alloc(RtPayload::ListScalar {
+            kind,
+            data: data.reversed(),
+        }),
     }
 }
 
@@ -1513,10 +1634,7 @@ pub unsafe extern "C" fn grasm_list_sort(v: *mut RtVal) -> *mut RtVal {
     let target = cow_list(v);
     match &mut (*target).payload {
         RtPayload::List(items) => items.sort_by(|&a, &b| cmp_vals(a, b)),
-        RtPayload::ListScalar { kind, data } => {
-            let k = *kind;
-            data.sort_by(|&a, &b| scalar_cmp(k, a, b));
-        }
+        RtPayload::ListScalar { kind, data } => data.sort(*kind),
         _ => unreachable!(),
     }
     target
@@ -1547,7 +1665,11 @@ pub unsafe extern "C" fn grasm_list_slice(v: *mut RtVal, a: i64, b: i64) -> *mut
             let len = data.len() as i64;
             let s = a.clamp(0, len) as usize;
             let e = b.clamp(0, len) as usize;
-            let out = if s <= e { data[s..e].to_vec() } else { Vec::new() };
+            let out = if s <= e {
+                data.slice(s, e)
+            } else {
+                ScalarData::new(kind)
+            };
             alloc(RtPayload::ListScalar { kind, data: out })
         }
     }
@@ -1559,11 +1681,13 @@ pub unsafe extern "C" fn grasm_list_contains(v: *mut RtVal, needle: *mut RtVal) 
     let hit = match items_of(v) {
         Items::Boxed(items) => items.iter().any(|&i| val_eq(i, needle)),
         Items::Scalar(kind, data) => match (kind, &(*needle).payload) {
-            (ScalarKind::I64, RtPayload::I64(x)) => data.contains(x),
+            (ScalarKind::I64, RtPayload::I64(x)) => data.iter().any(|b| b == *x),
             (ScalarKind::F64, RtPayload::F64(x)) => {
-                data.iter().any(|&b| f64::from_bits(b as u64) == *x)
+                data.iter().any(|b| f64::from_bits(b as u64) == *x)
             }
-            (ScalarKind::Bool, RtPayload::Bool(x)) => data.contains(&i64::from(*x)),
+            (ScalarKind::Bool, RtPayload::Bool(x)) => {
+                data.iter().any(|b| (b != 0) == *x)
+            }
             _ => false,
         },
     };
@@ -1604,8 +1728,8 @@ pub unsafe extern "C" fn grasm_list_first(v: *mut RtVal) -> *mut RtVal {
             }
             None => none_val(),
         },
-        Items::Scalar(kind, data) => match data.first() {
-            Some(&b) => some_of(scalar_box(kind, b)),
+        Items::Scalar(kind, data) => match data.iter().next() {
+            Some(b) => some_of(scalar_box(kind, b)),
             None => none_val(),
         },
     }
@@ -1622,8 +1746,8 @@ pub unsafe extern "C" fn grasm_list_last(v: *mut RtVal) -> *mut RtVal {
             }
             None => none_val(),
         },
-        Items::Scalar(kind, data) => match data.last() {
-            Some(&b) => some_of(scalar_box(kind, b)),
+        Items::Scalar(kind, data) => match data.iter().last() {
+            Some(b) => some_of(scalar_box(kind, b)),
             None => none_val(),
         },
     }
@@ -1663,9 +1787,9 @@ pub unsafe extern "C" fn grasm_list_sum_f64(v: *mut RtVal) -> f64 {
             total
         }
         Items::Scalar(ScalarKind::F64, data) => {
-            data.iter().map(|&b| f64::from_bits(b as u64)).sum()
+            data.iter().map(|b| f64::from_bits(b as u64)).sum()
         }
-        Items::Scalar(ScalarKind::I64, data) => data.iter().map(|&x| x as f64).sum(),
+        Items::Scalar(ScalarKind::I64, data) => data.iter().map(|x| x as f64).sum(),
         Items::Scalar(..) => 0.0,
     }
 }
@@ -1884,7 +2008,7 @@ pub unsafe extern "C" fn grasm_list_set(v: *mut RtVal, i: i64, val: *mut RtVal) 
             if i < 0 || i as usize >= data.len() {
                 rt_panic(&format!("index {i} out of bounds (len {})", data.len()));
             }
-            data[i as usize] = scalar_unbox_val(*kind, val);
+            data.set(i as usize, scalar_unbox_val(*kind, val));
             dec(val);
         }
         _ => unreachable!(),
@@ -2019,7 +2143,7 @@ pub unsafe extern "C" fn grasm_list_min_max(v: *mut RtVal, want_max: i8) -> *mut
         }
         Items::Scalar(kind, data) => {
             let mut best: Option<i64> = None;
-            for &bits in data {
+            for bits in data.iter() {
                 best = Some(match best {
                     None => bits,
                     Some(cur) => {
