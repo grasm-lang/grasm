@@ -19,6 +19,7 @@ a benchmark lies, and a wrong answer is not a fast answer.
 | `wordfreq` | hashing, string handling, map updates           |
 | `sort`     | comparison-heavy work over a large list         |
 | `parmap`   | multi-core throughput, each language's idiom    |
+| `mandelbrot` | a pure float kernel — the workload "N times faster than Python" claims come from |
 
 ## How to read the numbers
 
@@ -47,6 +48,7 @@ is better. Reproduce with `./scripts/bench.sh`.
 | wordfreq |  52 |    50 |  38 |          182 |          480 |    160 |
 | sort     |  60 |    36 |  71 |       **49** |          327 |    240 |
 | parmap   |  74 |    73 | 116 |          133 |        33467 |  3,532 |
+| mandelbrot |  36 |   —  |  —  |       **14** |            — |  1,457 |
 
 Native Grasm matches C on `fib`, which is the benchmark that is almost entirely
 function calls and integer arithmetic — the Cranelift call path and the
@@ -65,6 +67,29 @@ What remains of the gap is two things, stated so nobody has to guess:
   copy-on-write check), where C compiles to a raw load. Closing that means
   teaching codegen the list's memory layout so hot loops inline the access.
 - **Map values are still boxed**, which is most of wordfreq's 3.5×.
+
+## The "faster than Python" question
+
+Claims like "100x faster than Python" come from one workload class: tight
+numeric kernels with no allocation, where CPython is at its worst. Mandelbrot
+is the canonical example, so it is measured here rather than argued about.
+
+| implementation | time | vs Python |
+|----------------|-----:|----------:|
+| grasm `par_map` |  14 ms | **102x** |
+| C, `-O2`, one core | 36 ms | 40x |
+| grasm, one core | 39 ms | 37x |
+| Python | 1,457 ms | 1x |
+
+Two honest readings of that table. Single-core, Grasm is **1.1x off C** on
+float arithmetic — the codegen is sound. And the headline 102x is only
+reachable because `par_map` spreads it across cores; C's 40x is one core.
+
+The number to distrust is any single multiplier. Across the whole suite
+Grasm is **0.9x to 26x** faster than Python depending entirely on the
+workload — 26x on parallel numeric work, and *slower* on `wordfreq`, where
+CPython's dictionaries are C and ours still box their values. A language that
+quotes one number from its best benchmark is quoting marketing.
 
 ## Multi-core
 

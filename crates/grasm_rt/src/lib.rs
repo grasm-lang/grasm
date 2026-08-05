@@ -468,7 +468,14 @@ fn grasm_panic_msg_str(msg: &str) -> ! {
 // --- data parallelism ---
 
 /// Below this length, threading costs more than it saves.
-const PAR_MIN_ELEMS: usize = 4096;
+///
+/// Deliberately low. The runtime cannot see how expensive one element is —
+/// a 400-element `par_map` whose elements each take 100µs is very much worth
+/// splitting, and a count-based threshold of a few thousand silently refuses
+/// to. Spawning costs tens of microseconds, so over-splitting a cheap list
+/// wastes almost nothing, while under-splitting an expensive one costs the
+/// whole speedup. The user asked for parallelism by writing `par_map`.
+const PAR_MIN_ELEMS: usize = 256;
 
 thread_local! {
     /// Set while a parallel region is running. A `par_map` reached from inside
