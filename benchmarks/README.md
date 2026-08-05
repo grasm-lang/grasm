@@ -42,12 +42,12 @@ is better. Reproduce with `./scripts/bench.sh`.
 
 | program  |   C |  Rust |  Go | grasm-native | grasm-interp | Python |
 |----------|----:|------:|----:|-------------:|-------------:|-------:|
-| fib      |  26 |    28 |  30 |       **27** |         1213 |    154 |
-| sieve    |  28 |    30 |  30 |           55 |         2263 |    382 |
-| matmul   |  27 |    26 |  30 |           99 |         5866 |    990 |
-| wordfreq |  53 |    52 |  41 |          148 |          475 |    155 |
-| sort     |  61 |    33 |  73 |       **49** |          328 |    247 |
-| parmap   |  80 |    76 | 119 |          131 |        33108 |  3,659 |
+| fib      |  25 |    27 |  28 |       **27** |         1204 |    153 |
+| sieve    |  28 |    29 |  29 |           42 |         2251 |    384 |
+| matmul   |  26 |    26 |  29 |           61 |         5799 |    930 |
+| wordfreq |  52 |    47 |  39 |          147 |          472 |    154 |
+| sort     |  60 |    33 |  70 |       **47** |          324 |    234 |
+| parmap   |  75 |    74 | 115 |          130 |        32893 |  3,561 |
 | mandelbrot |  36 |   —  |  —  |       **14** |            — |  1,457 |
 
 Native Grasm matches C on `fib`, which is the benchmark that is almost entirely
@@ -63,9 +63,11 @@ comparison function through a pointer.
 
 What remains of the gap is two things, stated so nobody has to guess:
 
-- Every element access is still a **call into the runtime** (with a
-  copy-on-write check), where C compiles to a raw load. Closing that means
-  teaching codegen the list's memory layout so hot loops inline the access.
+- Element access inside a loop is now a raw load: a list the loop body *only*
+  indexes is pinned once (made unique, converted to inline storage if needed)
+  and accessed through its data pointer, so `matmul` fell from 99ms to 61ms and
+  `sieve` from 55ms to 42ms. What remains against C is the per-access bounds
+  check, which C at `-O2` does not perform at all.
 - `wordfreq` is 2.8× off C. Lookup is now a hash probe, but each iteration
   still allocates a fresh key string, and CPython interns and caches hashes.
 

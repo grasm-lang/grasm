@@ -471,6 +471,8 @@ impl<'m> Codegen<'m> {
             ("grasm_list_push_scalar", vec![i64t, i64t, i64t], Some(i64t)),
             ("grasm_list_get_scalar", vec![i64t, i64t, i64t], Some(i64t)),
             ("grasm_list_set_scalar", vec![i64t, i64t, i64t, i64t], Some(i64t)),
+            ("grasm_list_pin", vec![i64t, i64t, ptr, ptr], Some(i64t)),
+            ("grasm_panic_index", vec![i64t, i64t], None),
             ("grasm_par_map_scalar", vec![i64t, ptr, ptr, i64t, i64t], Some(i64t)),
             ("grasm_par_filter_scalar", vec![i64t, ptr, ptr, i64t], Some(i64t)),
         ];
@@ -1002,6 +1004,7 @@ impl<'m> Codegen<'m> {
             inout_slots: Vec::new(),
             filled: false,
             closure_hints: Vec::new(),
+            pinned: Vec::new(),
             task_scopes: Vec::new(),
         };
 
@@ -1290,6 +1293,7 @@ impl<'m> Codegen<'m> {
             inout_slots: Vec::new(),
             filled: false,
             closure_hints: Vec::new(),
+            pinned: Vec::new(),
             task_scopes: Vec::new(),
         };
         let entry = fcx.b.create_block();
@@ -1362,6 +1366,7 @@ impl<'m> Codegen<'m> {
             inout_slots: Vec::new(),
             filled: false,
             closure_hints: Vec::new(),
+            pinned: Vec::new(),
             task_scopes: Vec::new(),
         };
         let entry = fcx.b.create_block();
@@ -1446,6 +1451,7 @@ impl<'m> Codegen<'m> {
             inout_slots: Vec::new(),
             filled: false,
             closure_hints: Vec::new(),
+            pinned: Vec::new(),
             task_scopes: Vec::new(),
         };
         let entry = fcx.b.create_block();
@@ -1526,6 +1532,10 @@ struct FnCx<'a, 'm> {
     /// come from how it is called — and the call may name a binding declared
     /// *after* the closure, so the initializers are needed to type it.
     closure_hints: Vec<BlockHints>,
+    /// Scalar lists pinned for the enclosing loop: name → (data pointer,
+    /// length, element type). While pinned, `xs[i]` is a load rather than a
+    /// call.
+    pinned: Vec<HashMap<String, (Value, Value, VType)>>,
     /// One entry per enclosing `parallel` block: the runtime list that records
     /// which spawn sites fired, and how many sites have been lowered so far.
     ///
@@ -1834,6 +1844,152 @@ fn unify_generic(
     }
 }
 
+/// Bytes per element in a pinned scalar list: bools pack to a byte.
+fn stride_of(vt: &VType) -> i64 {
+    match vt {
+        VType::Bool => 1,
+        _ => 8,
+    }
+}
+
+/// Names of list locals that appear in `block` **only** as the receiver of an
+/// index expression.
+///
+/// Any other appearance — an argument, a method receiver, a closure capture,
+/// the target of a whole-variable assignment — can change the list's refcount
+/// or its length, either of which invalidates a raw pointer into it. So the
+/// rule is deliberately strict: index it, or it is not pinned.
+fn indexed_only_lists(block: &grasm_syntax::ast::Block) -> Vec<String> {
+    let mut indexed: Vec<String> = Vec::new();
+    let mut disqualified: Vec<String> = Vec::new();
+    scan_uses_block(block, &mut indexed, &mut disqualified);
+    indexed.sort();
+    indexed.dedup();
+    indexed.retain(|n| !disqualified.contains(n));
+    indexed
+}
+
+fn scan_uses_block(
+    b: &grasm_syntax::ast::Block,
+    indexed: &mut Vec<String>,
+    bad: &mut Vec<String>,
+) {
+    for stmt in &b.stmts {
+        match stmt {
+            Stmt::Let { init, .. } => scan_uses_expr(init, indexed, bad),
+            Stmt::Assign { target, value, .. } => {
+                // `xs[i] = v` keeps xs eligible; `xs = other` does not.
+                match target {
+                    Expr::Index { recv, index, .. } => {
+                        if let Expr::Ident(id) = &**recv {
+                            indexed.push(id.name.clone());
+                        } else {
+                            scan_uses_expr(recv, indexed, bad);
+                        }
+                        scan_uses_expr(index, indexed, bad);
+                    }
+                    other => scan_uses_expr(other, indexed, bad),
+                }
+                if let Expr::Ident(id) = target {
+                    bad.push(id.name.clone());
+                }
+                scan_uses_expr(value, indexed, bad);
+            }
+            Stmt::Return(Some(e), _) | Stmt::Expr(e) => scan_uses_expr(e, indexed, bad),
+            Stmt::While { cond, body, .. } => {
+                scan_uses_expr(cond, indexed, bad);
+                scan_uses_block(body, indexed, bad);
+            }
+            Stmt::For { iter, body, .. } => {
+                scan_uses_expr(iter, indexed, bad);
+                scan_uses_block(body, indexed, bad);
+            }
+            Stmt::Parallel { body, .. } | Stmt::Spawn { body, .. } => {
+                scan_uses_block(body, indexed, bad)
+            }
+            Stmt::With { handler, body, .. } => {
+                scan_uses_expr(handler, indexed, bad);
+                scan_uses_block(body, indexed, bad);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn scan_uses_expr(e: &Expr, indexed: &mut Vec<String>, bad: &mut Vec<String>) {
+    match e {
+        // The one shape that keeps a list eligible.
+        Expr::Index { recv, index, .. } => {
+            if let Expr::Ident(id) = &**recv {
+                indexed.push(id.name.clone());
+            } else {
+                scan_uses_expr(recv, indexed, bad);
+            }
+            scan_uses_expr(index, indexed, bad);
+        }
+        // Everything below is a use that could alias, resize, or retain.
+        Expr::Ident(id) => bad.push(id.name.clone()),
+        Expr::Unary { expr, .. } | Expr::Try { expr, .. } => scan_uses_expr(expr, indexed, bad),
+        Expr::Binary { lhs, rhs, .. } => {
+            scan_uses_expr(lhs, indexed, bad);
+            scan_uses_expr(rhs, indexed, bad);
+        }
+        Expr::Call { callee, args, .. } => {
+            scan_uses_expr(callee, indexed, bad);
+            for a in args {
+                scan_uses_expr(a, indexed, bad);
+            }
+        }
+        Expr::MethodCall { recv, args, .. } => {
+            scan_uses_expr(recv, indexed, bad);
+            for a in args {
+                scan_uses_expr(a, indexed, bad);
+            }
+        }
+        Expr::Field { recv, .. } => scan_uses_expr(recv, indexed, bad),
+        Expr::List(items, _) | Expr::Tuple(items, _) => {
+            for i in items {
+                scan_uses_expr(i, indexed, bad);
+            }
+        }
+        Expr::Str(pieces, _) => {
+            for p in pieces {
+                if let StrPiece::Expr(inner) = p {
+                    scan_uses_expr(inner, indexed, bad);
+                }
+            }
+        }
+        Expr::Closure { body, .. } => scan_uses_expr(body, indexed, bad),
+        Expr::Block(b) => scan_uses_block(b, indexed, bad),
+        Expr::If {
+            cond,
+            then_block,
+            else_branch,
+            ..
+        } => {
+            scan_uses_expr(cond, indexed, bad);
+            scan_uses_block(then_block, indexed, bad);
+            match else_branch.as_deref() {
+                Some(ElseBranch::Else(b)) => scan_uses_block(b, indexed, bad),
+                Some(ElseBranch::ElseIf(inner)) => scan_uses_expr(inner, indexed, bad),
+                None => {}
+            }
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            scan_uses_expr(scrutinee, indexed, bad);
+            for arm in arms {
+                if let Some(g) = &arm.guard {
+                    scan_uses_expr(g, indexed, bad);
+                }
+                scan_uses_expr(&arm.body, indexed, bad);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// The runtime tag for a type stored inline in a scalar list
 /// (0 = i64, 1 = f64, 2 = bool), or None when elements must be boxed.
 fn scalar_kind_i64(vt: &VType) -> Option<i64> {
@@ -1947,6 +2103,72 @@ impl FnCx<'_, '_> {
         self.cg
             .fns
             .get(&format!("{}::{}", self.cg.current_module, name))
+    }
+
+    /// Looks up a pinned list, if `name` is one in the innermost loop.
+    fn pinned_list(&self, name: &str) -> Option<(Value, Value, VType)> {
+        self.pinned.iter().rev().find_map(|s| s.get(name).cloned())
+    }
+
+    /// Pins every scalar list the loop body only ever indexes.
+    ///
+    /// Returns the names pinned, so the caller can pop them afterwards. A list
+    /// used any other way — passed to a function, pushed to, captured by a
+    /// closure — is left alone, because any of those can change its refcount
+    /// or its length and invalidate the pointer.
+    fn pin_loop_lists(&mut self, body: &grasm_syntax::ast::Block) -> CResult<()> {
+        let mut scope: HashMap<String, (Value, Value, VType)> = HashMap::new();
+        let candidates: Vec<String> = indexed_only_lists(body);
+        for name in candidates {
+            let Some((var, VType::List(elem))) = self.lookup(&name) else {
+                continue;
+            };
+            let Some(kind) = scalar_kind_i64(&elem) else {
+                continue;
+            };
+            let ptr_ty = self.cg.module.target_config().pointer_type();
+            let slot = self.b.create_sized_stack_slot(
+                cranelift_codegen::ir::StackSlotData::new(
+                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                    16,
+                    3,
+                ),
+            );
+            let data_out = self.b.ins().stack_addr(ptr_ty, slot, 0);
+            let len_out = self.b.ins().stack_addr(ptr_ty, slot, 8);
+            let cur = self.b.use_var(var);
+            let kc = self.b.ins().iconst(types::I64, kind);
+            let newlist = self
+                .call_rt("grasm_list_pin", &[cur, kc, data_out, len_out])
+                .unwrap();
+            self.b.def_var(var, newlist);
+            let flags = cranelift_codegen::ir::MemFlags::trusted();
+            let data = self.b.ins().load(types::I64, flags, data_out, 0);
+            let len = self.b.ins().load(types::I64, flags, len_out, 0);
+            scope.insert(name, (data, len, (*elem).clone()));
+        }
+        self.pinned.push(scope);
+        Ok(())
+    }
+
+    /// Inline bounds check, then a raw load or the address to store to.
+    fn pinned_address(&mut self, data: Value, len: Value, idx: Value, stride: i64) -> Value {
+        let ok = self.b.create_block();
+        let oob = self.b.create_block();
+        // Unsigned compare catches negative indices in the same test.
+        let bad = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, idx, len);
+        self.b.ins().brif(bad, oob, &[], ok, &[]);
+        self.filled = true;
+
+        self.goto_block(oob);
+        self.call_rt("grasm_panic_index", &[idx, len]);
+        self.trap_here();
+        self.filled = true;
+
+        self.goto_block(ok);
+        let w = self.b.ins().iconst(types::I64, stride);
+        let off = self.b.ins().imul(idx, w);
+        self.b.ins().iadd(data, off)
     }
 
     /// A zero value of any native type — probing binds dummies with this.
@@ -2144,6 +2366,43 @@ impl FnCx<'_, '_> {
                     // store on inline data — the box/write-back machinery
                     // below would allocate in the hot loop this exists for.
                     if let (VType::List(eb), [PlaceSeg::Index(ix)]) = (&root_t, path.as_slice()) {
+                        // Pinned: read-modify-write is a load and a store.
+                        if let Some((data, len, pt)) = self.pinned_list(&root.name) {
+                            if pt == **eb {
+                                let elem_t = (**eb).clone();
+                                let (mut val, val_t) =
+                                    self.eval_expr_expecting(value, Some(&elem_t))?;
+                                if elem_t == VType::F64 && val_t == VType::I64 {
+                                    val = self.b.ins().fcvt_from_sint(types::F64, val);
+                                }
+                                let (iv, _) = self.eval_expr_val(ix)?;
+                                let addr = self.pinned_address(data, len, iv, stride_of(&elem_t));
+                                let flags = cranelift_codegen::ir::MemFlags::trusted();
+                                let final_v = if *op == AssignOp::Assign {
+                                    val
+                                } else {
+                                    let old = self.b.ins().load(elem_t.cl(), flags, addr, 0);
+                                    let bop = match op {
+                                        AssignOp::Add => BinaryOp::Add,
+                                        AssignOp::Sub => BinaryOp::Sub,
+                                        AssignOp::Mul => BinaryOp::Mul,
+                                        AssignOp::Div => BinaryOp::Div,
+                                        AssignOp::Assign => unreachable!(),
+                                    };
+                                    self.binop_values(
+                                        bop,
+                                        old,
+                                        elem_t.clone(),
+                                        val,
+                                        val_t,
+                                        target.span(),
+                                    )?
+                                    .0
+                                };
+                                self.b.ins().store(flags, final_v, addr, 0);
+                                return Ok(StmtOut::Value(None));
+                            }
+                        }
                         if let Some(kind) = scalar_kind_i64(eb) {
                             let elem_t = (**eb).clone();
                             let (mut val, val_t) =
@@ -2334,6 +2593,11 @@ impl FnCx<'_, '_> {
                 Ok(StmtOut::Terminated)
             }
             Stmt::While { cond, body, .. } => {
+                // Pinning emits code, so it has to happen while the current
+                // block is still open — before the jump that closes it.
+                // Lists the body only indexes get a raw pointer for the whole
+                // loop, turning each access from a call into a load.
+                self.pin_loop_lists(body)?;
                 let header = self.b.create_block();
                 let body_blk = self.b.create_block();
                 let exit = self.b.create_block();
@@ -2342,14 +2606,17 @@ impl FnCx<'_, '_> {
                 self.goto_block(header);
                 let (c, ct) = self.eval_expr_val(cond)?;
                 if ct != VType::Bool {
+                    self.pinned.pop();
                     return nope(cond.span(), "non-bool while condition");
                 }
                 self.b.ins().brif(c, body_blk, &[], exit, &[]);
                 self.filled = true;
                 self.goto_block(body_blk);
                 self.loops.push((header, exit));
-                let (_, mut terminated) = self.eval_block_inner(body)?;
+                let inner = self.eval_block_inner(body);
                 self.loops.pop();
+                self.pinned.pop();
+                let (_, mut terminated) = inner?;
                 terminated |= self.is_filled();
                 if !terminated {
                     self.b.ins().jump(header, &[]);
@@ -2436,6 +2703,9 @@ impl FnCx<'_, '_> {
             self.b.def_var(ivar, s);
             let end_var = self.new_var(&VType::I64);
             self.b.def_var(end_var, e);
+            // Same as the while loop: lists the body only indexes are pinned
+            // for its whole extent so each access is a load, not a call.
+            self.pin_loop_lists(body)?;
 
             let header = self.b.create_block();
             let body_blk = self.b.create_block();
@@ -2459,8 +2729,10 @@ impl FnCx<'_, '_> {
             self.push_scope();
             self.bind(&loop_var.name, ivar, VType::I64);
             self.loops.push((step, exit));
-            let (_, mut terminated) = self.eval_block_inner(body)?;
+            let inner = self.eval_block_inner(body);
             self.loops.pop();
+            self.pinned.pop();
+            let (_, mut terminated) = inner?;
             terminated |= self.is_filled();
             self.pop_scope_no_decs(); // loop var is scalar
             if !terminated {
@@ -2685,6 +2957,19 @@ impl FnCx<'_, '_> {
                 let (iv, it) = self.eval_expr_val(index)?;
                 if it != VType::I64 {
                     return nope(index.span(), "non-integer index");
+                }
+                // A pinned list loads directly; `rv` is the same buffer, so
+                // it still needs its borrow released.
+                if let Expr::Ident(id) = &**recv {
+                    if let Some((data, len, pt)) = self.pinned_list(&id.name) {
+                        if pt == *elem_t {
+                            self.call_rt("grasm_val_dec", &[rv]);
+                            let addr = self.pinned_address(data, len, iv, stride_of(&elem_t));
+                            let flags = cranelift_codegen::ir::MemFlags::trusted();
+                            let v = self.b.ins().load(elem_t.cl(), flags, addr, 0);
+                            return Ok(Some((v, (*elem_t).clone())));
+                        }
+                    }
                 }
                 let (v, vt) = self.list_get_elem(rv, iv, &elem_t)?;
                 self.call_rt("grasm_val_dec", &[rv]);

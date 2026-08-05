@@ -105,12 +105,12 @@ Five programs written the same way in Grasm, C, Rust, Go, and Python. Best of
 
 | program  |   C |  Rust |  Go | grasm-native | Python |
 |----------|----:|------:|----:|-------------:|-------:|
-| fib      |  26 |    28 |  30 |       **27** |    154 |
-| sieve    |  28 |    30 |  30 |           55 |    382 |
-| matmul   |  27 |    26 |  30 |           99 |    990 |
-| wordfreq |  53 |    52 |  41 |          148 |    155 |
-| sort     |  61 |    33 |  73 |       **49** |    247 |
-| parmap   |  80 |    76 | 119 |          131 |  3,659 |
+| fib      |  25 |    27 |  28 |       **27** |    153 |
+| sieve    |  28 |    29 |  29 |           42 |    384 |
+| matmul   |  26 |    26 |  29 |           61 |    930 |
+| wordfreq |  52 |    47 |  39 |          147 |    154 |
+| sort     |  60 |    33 |  70 |       **47** |    234 |
+| parmap   |  75 |    74 | 115 |          130 |  3,561 |
 
 `./scripts/bench.sh` builds every implementation, checks each one against the
 interpreter's answer, and refuses to report a timing for a wrong one. Native

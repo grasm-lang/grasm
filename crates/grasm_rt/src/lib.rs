@@ -655,6 +655,75 @@ pub unsafe extern "C" fn grasm_par_map_scalar(
     })
 }
 
+/// Prepares a scalar list for raw element access inside a loop.
+///
+/// Element access normally goes through a call per element, which costs about
+/// 2ns where C compiles a load — on an 8M-iteration matmul that is the whole
+/// difference. This makes the list uniquely owned once, converts a boxed list
+/// to inline storage if needed, and hands back the raw data pointer and length
+/// so the loop can load and store directly.
+///
+/// The caller must have proved the loop cannot resize the list or share it,
+/// which is what keeps the pointer valid for the loop's whole extent.
+///
+/// Returns the (possibly new) list; writes the data pointer and length through
+/// the out-params. A data pointer of 0 means raw access is unavailable and the
+/// caller must use the ordinary element functions.
+///
+/// # Safety
+/// `list` is a live list; the out-params are writable.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_list_pin(
+    list: *mut RtVal,
+    kind: i64,
+    out_data: *mut i64,
+    out_len: *mut i64,
+) -> *mut RtVal {
+    let want = ScalarKind::from_i64(kind);
+    let target = cow_list(list);
+
+    // A list produced by a runtime builtin is boxed; converting it once here
+    // is invisible and makes every later access in the loop a raw load.
+    if let RtPayload::List(items) = &(*target).payload {
+        let mut data = ScalarData::new(want);
+        for &it in items {
+            data.push(scalar_unbox_val(want, it));
+            dec(it);
+        }
+        (*target).payload = RtPayload::ListScalar { kind: want, data };
+    }
+
+    // Bools are one byte per element, everything else one word; the caller
+    // strides accordingly.
+    match &mut (*target).payload {
+        RtPayload::ListScalar {
+            data: ScalarData::Words(v),
+            ..
+        } => {
+            *out_data = v.as_mut_ptr() as i64;
+            *out_len = v.len() as i64;
+        }
+        RtPayload::ListScalar {
+            data: ScalarData::Bytes(v),
+            ..
+        } => {
+            *out_data = v.as_mut_ptr() as i64;
+            *out_len = v.len() as i64;
+        }
+        _ => {
+            *out_data = 0;
+            *out_len = 0;
+        }
+    }
+    target
+}
+
+/// The out-of-bounds panic, called only from a failed inline bounds check.
+#[no_mangle]
+pub extern "C" fn grasm_panic_index(i: i64, len: i64) -> ! {
+    rt_panic(&format!("index {i} out of bounds (len {len})"));
+}
+
 /// Applies a predicate to every element in parallel, then keeps the survivors
 /// **in input order**.
 ///
