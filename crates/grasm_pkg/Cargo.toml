@@ -7,3 +7,7 @@ license.workspace = true
 [dependencies]
 grasm_sema = { path = "../grasm_sema" }
 grasm_syntax = { path = "../grasm_syntax" }
+
+[dev-dependencies]
+# Cross-package tests run the resulting program, not just load it.
+grasm_interp = { path = "../grasm_interp" }

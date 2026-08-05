@@ -157,3 +157,21 @@ than a runtime failure.
 namespace, so a type name may not be declared twice across a program.
 
 **[T-MODULE-PUB]** Only `pub` functions are callable from another module.
+
+**[T-MODULE-RESOLVE]** `import a.b` names the module in `a/b.gr`, relative to
+the importing package's source directory. The last segment is the qualifier
+calls use, so `import lib.math` is called as `math.f(...)`. Execution begins in
+the file passed to the toolchain, which is the only module required to define
+`main`.
+
+**[T-MODULE-DEP]** A package may also import a dependency declared in its
+`grasm.toml` by that dependency's name, which resolves to the dependency's
+entry file. `import mathlib` after
+
+```toml
+[dependencies.mathlib]
+path = "../mathlib"
+```
+
+makes its `pub` functions available as `mathlib.f(...)`. A dependency is a
+library and needs no `main`.

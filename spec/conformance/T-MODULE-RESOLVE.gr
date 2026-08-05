@@ -1,0 +1,10 @@
+//! tag: T-MODULE-RESOLVE
+//! expect: error
+//! cannot load module
+// `import a.b` resolves to `a/b.gr` beside this file. Nothing declares one
+// here, so the import fails rather than silently resolving to something else.
+import missing.helper
+
+fn main() {
+    print("{helper.value()}")
+}

@@ -1,3 +1,7 @@
 # cargo build output, if a run is interrupted before cleanup
 rust/*/target/
 **/grasm.lock
+
+# Python bytecode from the security benchmark run
+__pycache__/
+*.pyc

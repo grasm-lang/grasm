@@ -104,8 +104,10 @@ programs. May change in a minor release, with a changelog entry.
 - `T-MAP-KEY` — provisional
 - `T-MATCH-EXHAUSTIVE` — provisional
 - `T-MATCH-GUARD` — provisional
+- `T-MODULE-DEP` — provisional
 - `T-MODULE-NS` — provisional
 - `T-MODULE-PUB` — provisional
+- `T-MODULE-RESOLVE` — provisional
 - `T-MOVE-LOOP` — provisional
 - `T-NO-NULL` — provisional
 - `T-OPTION` — provisional

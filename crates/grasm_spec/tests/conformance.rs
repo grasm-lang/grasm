@@ -38,6 +38,7 @@ struct Case {
     name: String,
     tag: String,
     expect: Expect,
+    path: PathBuf,
     source: String,
 }
 
@@ -82,6 +83,7 @@ fn parse_case(path: &Path) -> Case {
         name,
         tag,
         expect,
+        path: path.to_path_buf(),
         source,
     }
 }
@@ -176,6 +178,39 @@ fn run_test_suite(source: &str) -> (u32, u32, String, Vec<String>) {
     )
 }
 
+/// Runs a conformance program.
+///
+/// A program with an `import` is loaded from disk the way a real build loads
+/// it, so module resolution is actually exercised. Without this the harness
+/// analyses one string, imports never resolve, and the specification cannot
+/// say anything about its own module system.
+fn run_case(case: &Case) -> (i32, String, Vec<String>) {
+    if !case.source.lines().any(|l| l.trim_start().starts_with("import ")) {
+        return run_program(&case.source);
+    }
+    let program = match grasm_sema::loader::load_from_disk(&case.path) {
+        Ok(p) => p,
+        Err(e) => return (1, String::new(), vec![e]),
+    };
+    let mut diags: Vec<String> = program
+        .diagnostics
+        .iter()
+        .map(|d| d.message.clone())
+        .collect();
+    diags.extend(
+        grasm_sema::check::check_program(&program)
+            .diagnostics
+            .iter()
+            .map(|d| d.message.clone()),
+    );
+    if !diags.is_empty() {
+        return (1, String::new(), diags);
+    }
+    let mut out = Vec::new();
+    let code = grasm_interp::run_program(&program, &[], &mut out);
+    (code, String::from_utf8_lossy(&out).into_owned(), Vec::new())
+}
+
 fn run_program(source: &str) -> (i32, String, Vec<String>) {
     let mut out = Vec::new();
     let (code, diags) = grasm_interp::run_src(source, &mut out);
@@ -218,7 +253,7 @@ fn every_conformance_program_behaves_as_specified() {
             }
             continue;
         }
-        let (code, stdout, diags) = run_program(&case.source);
+        let (code, stdout, diags) = run_case(&case);
         match &case.expect {
             Expect::Output(expected) => {
                 if !diags.is_empty() {

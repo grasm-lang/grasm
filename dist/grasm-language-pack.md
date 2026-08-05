@@ -396,6 +396,24 @@ namespace, so a type name may not be declared twice across a program.
 
 **[T-MODULE-PUB]** Only `pub` functions are callable from another module.
 
+**[T-MODULE-RESOLVE]** `import a.b` names the module in `a/b.gr`, relative to
+the importing package's source directory. The last segment is the qualifier
+calls use, so `import lib.math` is called as `math.f(...)`. Execution begins in
+the file passed to the toolchain, which is the only module required to define
+`main`.
+
+**[T-MODULE-DEP]** A package may also import a dependency declared in its
+`grasm.toml` by that dependency's name, which resolves to the dependency's
+entry file. `import mathlib` after
+
+```toml
+[dependencies.mathlib]
+path = "../mathlib"
+```
+
+makes its `pub` functions available as `mathlib.f(...)`. A dependency is a
+library and needs no `main`.
+
 
 <!-- ===== spec/semantics.md ===== -->
 
@@ -2749,6 +2767,21 @@ fn main() {
 }
 ```
 
+## `T-MODULE-DEP.gr`
+
+```grasm
+//! tag: T-MODULE-DEP
+//! expect: error
+//! cannot load module
+// A dependency is importable only when `grasm.toml` declares it. With no
+// manifest, a bare name is not a package and does not resolve.
+import undeclared_package
+
+fn main() {
+    print("{undeclared_package.f()}")
+}
+```
+
 ## `T-MODULE-NS.gr`
 
 ```grasm
@@ -2772,6 +2805,21 @@ fn double(n: i64) -> i64 {
 }
 fn main() {
     print("{double(2)}")
+}
+```
+
+## `T-MODULE-RESOLVE.gr`
+
+```grasm
+//! tag: T-MODULE-RESOLVE
+//! expect: error
+//! cannot load module
+// `import a.b` resolves to `a/b.gr` beside this file. Nothing declares one
+// here, so the import fails rather than silently resolving to something else.
+import missing.helper
+
+fn main() {
+    print("{helper.value()}")
 }
 ```
 

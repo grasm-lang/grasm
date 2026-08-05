@@ -123,13 +123,90 @@ pub fn load_from_disk(entry_path: &std::path::Path) -> Result<Program, String> {
     let entry_display = entry_path.display().to_string();
     let entry_src = std::fs::read_to_string(entry_path)
         .map_err(|e| format!("cannot read `{entry_display}`: {e}"))?;
+    // A file inside a package can import that package's dependencies by name,
+    // not just its own sibling files.
+    let deps = package_dependencies(&entry_src_dir);
 
     let provider = move |name: &str| -> Option<String> {
         if name == "main" {
             return Some(entry_src.clone());
         }
         let rel = format!("{}.gr", name.replace('.', "/"));
-        std::fs::read_to_string(entry_src_dir.join(rel)).ok()
+        if let Ok(src) = std::fs::read_to_string(entry_src_dir.join(&rel)) {
+            return Some(src);
+        }
+        // Then a dependency declared in grasm.toml, loaded from its entry.
+        let root = name.split('.').next().unwrap_or(name);
+        let dep_dir = deps.get(root)?;
+        let entry = package_entry(dep_dir);
+        match name.split_once('.') {
+            None => std::fs::read_to_string(entry).ok(),
+            // `import dep.sub` — a file inside the dependency's source tree.
+            Some((_, sub)) => {
+                let base = entry.parent()?.to_path_buf();
+                std::fs::read_to_string(base.join(format!("{}.gr", sub.replace('.', "/")))).ok()
+            }
+        }
     };
     Ok(load_with("main", &entry_display, &provider))
+}
+
+/// Dependencies of the package containing `dir`, as name → package directory.
+///
+/// Walks up looking for a `grasm.toml`, so any file in the package can import
+/// what the package declared. Reads only what an import needs — the dependency
+/// names and their paths — so the loader stays free of a manifest parser it
+/// would otherwise have to depend on.
+fn package_dependencies(dir: &std::path::Path) -> HashMap<String, std::path::PathBuf> {
+    let mut out = HashMap::new();
+    let Some((root, text)) = find_manifest(dir) else {
+        return out;
+    };
+    let mut current: Option<String> = None;
+    for raw in text.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if let Some(rest) = line.strip_prefix('[') {
+            let name = rest.trim_end_matches(']').trim();
+            current = name
+                .strip_prefix("dependencies.")
+                .map(|n| n.trim().to_string());
+            continue;
+        }
+        let (Some(dep), Some((key, value))) = (&current, line.split_once('=')) else {
+            continue;
+        };
+        if key.trim() == "path" {
+            let path = value.trim().trim_matches('"');
+            out.insert(dep.clone(), root.join(path));
+        }
+    }
+    out
+}
+
+fn find_manifest(dir: &std::path::Path) -> Option<(std::path::PathBuf, String)> {
+    let mut here = Some(dir.to_path_buf());
+    while let Some(d) = here {
+        let manifest = d.join("grasm.toml");
+        if let Ok(text) = std::fs::read_to_string(&manifest) {
+            return Some((d, text));
+        }
+        here = d.parent().map(|p| p.to_path_buf());
+    }
+    None
+}
+
+/// A package's entry file: its declared `entry`, or `src/main.gr`.
+fn package_entry(dir: &std::path::Path) -> std::path::PathBuf {
+    let entry = std::fs::read_to_string(dir.join("grasm.toml"))
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .map(|l| l.split('#').next().unwrap_or("").trim().to_string())
+                .find_map(|l| {
+                    let (k, v) = l.split_once('=')?;
+                    (k.trim() == "entry").then(|| v.trim().trim_matches('"').to_string())
+                })
+        })
+        .unwrap_or_else(|| "src/main.gr".to_string());
+    dir.join(entry)
 }

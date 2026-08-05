@@ -1,0 +1,10 @@
+//! tag: T-MODULE-DEP
+//! expect: error
+//! cannot load module
+// A dependency is importable only when `grasm.toml` declares it. With no
+// manifest, a bare name is not a package and does not resolve.
+import undeclared_package
+
+fn main() {
+    print("{undeclared_package.f()}")
+}

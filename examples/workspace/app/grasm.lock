@@ -10,5 +10,5 @@ capabilities = []
 [[package]]
 name = "app"
 version = "1.0.0"
-checksum = "083ef8ad8cf958e43f821a84933330c38191d9565400436571bd385b79af0328"
+checksum = "b3dab0909ce4408092ef74a23932db71bc2c6be30bbed2b59b4b7706a0e704c8"
 capabilities = ["io"]

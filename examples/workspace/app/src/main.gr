@@ -1,7 +1,9 @@
-fn square(n: i64) -> i64 {
-    n * n
-}
+// The consumer actually calls into its dependency — which is the point.
+// `mathlib` declares `capabilities = []`, so if a future version of it starts
+// touching the filesystem, this build fails rather than shipping.
+import mathlib
 
 fn main() {
-    print("{square(7)}")
+    print("{mathlib.square(7)}")
+    print("{mathlib.sum_squares([1, 2, 3])}")
 }

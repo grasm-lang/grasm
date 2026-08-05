@@ -595,3 +595,65 @@ fn the_supply_chain_demo_catches_a_tampered_dependency() {
     assert_eq!(violation.package, "mathlib");
     assert!(violation.exceeded.contains(&"io".to_string()));
 }
+
+#[test]
+fn a_consumer_can_actually_call_into_its_dependency() {
+    // Declaring and capability-checking a dependency is only half of it: the
+    // consumer has to be able to *use* it. The loader resolved imports as
+    // sibling files only, so `import mathlib` looked for `mathlib.gr` next to
+    // main and a real two-package program could not be run or built at all.
+    // The demo workspace hid this by never importing across the boundary.
+    let ws = Workspace::new("cross_pkg");
+    ws.package(
+        "mathlib",
+        &manifest("mathlib", Some(""), &[]),
+        "pub fn total(xs: [i64]) -> i64 {\n    xs.sum()\n}\n",
+    );
+    let app = ws.package(
+        "app",
+        &manifest("app", Some("\"io\""), &[("mathlib", "../mathlib")]),
+        "import mathlib\n\nfn main() {\n    print(\"{mathlib.total([1, 2, 3, 4])}\")\n}\n",
+    );
+
+    let program = grasm_sema::loader::load_from_disk(&app.join("src/main.gr"))
+        .expect("the entry file loads");
+    assert!(
+        program.diagnostics.is_empty(),
+        "a dependency named in grasm.toml must be importable: {:#?}",
+        program.diagnostics
+    );
+    assert!(
+        program.files.iter().any(|f| f.name == "mathlib"),
+        "the dependency should be part of the loaded program: {:?}",
+        program.files.iter().map(|f| &f.name).collect::<Vec<_>>()
+    );
+    let diags = grasm_sema::check::check_program(&program).diagnostics;
+    assert!(diags.is_empty(), "{diags:#?}");
+
+    let mut out = Vec::new();
+    let code = grasm_interp::run_program(&program, &[], &mut out);
+    assert_eq!(code, 0);
+    assert_eq!(String::from_utf8(out).unwrap(), "10\n");
+}
+
+#[test]
+fn a_dependency_is_still_capability_checked_when_actually_used() {
+    // The guarantee has to survive the consumer genuinely calling in.
+    let ws = Workspace::new("cross_pkg_viol");
+    ws.package(
+        "mathlib",
+        &manifest("mathlib", Some(""), &[]),
+        "pub fn total(xs: [i64]) -> i64 {\n    let _leak = read_file(\"/etc/passwd\") ?? \"\"\n    xs.sum()\n}\n",
+    );
+    let app = ws.package(
+        "app",
+        &manifest("app", Some("\"io\""), &[("mathlib", "../mathlib")]),
+        "import mathlib\n\nfn main() {\n    print(\"{mathlib.total([1])}\")\n}\n",
+    );
+    let _ = app;
+    let m = Manifest::load(&ws.path().join("mathlib")).unwrap();
+    let effects = grasm_pkg::effects_of_package(&m).unwrap();
+    let violation = grasm_pkg::check_capabilities(&m, &effects)
+        .expect("a pure-declared dependency performing io must be a violation");
+    assert!(violation.exceeded.contains(&"io".to_string()));
+}
