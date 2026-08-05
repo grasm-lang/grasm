@@ -117,12 +117,35 @@ pub extern "C" fn grasm_pow_f64(base: f64, exp: f64) -> f64 {
 
 use std::cell::Cell;
 
+/// Element type of an unboxed scalar list. Fixed at creation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ScalarKind {
+    I64,
+    F64,
+    Bool,
+}
+
+impl ScalarKind {
+    fn from_i64(k: i64) -> ScalarKind {
+        match k {
+            0 => ScalarKind::I64,
+            1 => ScalarKind::F64,
+            _ => ScalarKind::Bool,
+        }
+    }
+}
+
 pub enum RtPayload {
     I64(i64),
     F64(f64),
     Bool(bool),
     Str(String),
     List(Vec<*mut RtVal>),
+    /// Scalar elements stored inline: i64, f64 (as raw bits), bool (0/1).
+    /// One machine word per element — no per-element heap cell, no refcount
+    /// traffic, no pointer chase. This is why `c[i] = c[i] + x` in a hot loop
+    /// is a load and a store instead of an allocation.
+    ListScalar { kind: ScalarKind, data: Vec<i64> },
     Map(Vec<(*mut RtVal, *mut RtVal)>),
     Struct {
         name: String,
@@ -334,6 +357,167 @@ fn grasm_panic_msg_str(msg: &str) -> ! {
     rt_panic(msg);
 }
 
+// --- unboxed scalar lists ---
+
+/// Boxes one inline element, for the paths that hand a value out (Option
+/// results, defensive generic access). Interning keeps the common cases free.
+fn scalar_box(kind: ScalarKind, bits: i64) -> *mut RtVal {
+    match kind {
+        ScalarKind::I64 => grasm_box_i64(bits),
+        ScalarKind::F64 => alloc(RtPayload::F64(f64::from_bits(bits as u64))),
+        ScalarKind::Bool => interned_bool(bits != 0),
+    }
+}
+
+/// The inline bits of a boxed value, for defensive cross-representation ops.
+/// # Safety: live runtime pointer.
+unsafe fn scalar_unbox_val(kind: ScalarKind, v: *mut RtVal) -> i64 {
+    match (kind, &(*v).payload) {
+        (ScalarKind::I64, RtPayload::I64(x)) => *x,
+        (ScalarKind::F64, RtPayload::F64(x)) => x.to_bits() as i64,
+        (ScalarKind::F64, RtPayload::I64(x)) => (*x as f64).to_bits() as i64,
+        (ScalarKind::Bool, RtPayload::Bool(x)) => i64::from(*x),
+        _ => grasm_panic_msg_str("scalar list element of the wrong type"),
+    }
+}
+
+/// Element ordering, matching `cmp_vals` exactly — including that bools have
+/// no ordering there, so `[bool].sort()` is a no-op and `min`/`max` return
+/// the first element. The interpreter behaves the same way; changing either
+/// alone would fail the differential gate.
+fn scalar_cmp(kind: ScalarKind, a: i64, b: i64) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match kind {
+        ScalarKind::I64 => a.cmp(&b),
+        ScalarKind::F64 => f64::from_bits(a as u64)
+            .partial_cmp(&f64::from_bits(b as u64))
+            .unwrap_or(Ordering::Equal),
+        ScalarKind::Bool => Ordering::Equal,
+    }
+}
+
+/// Element equality: floats compare as floats (0.0 == -0.0, NaN != NaN),
+/// never as bits.
+fn scalar_eq(kind: ScalarKind, a: i64, b: i64) -> bool {
+    match kind {
+        ScalarKind::F64 => f64::from_bits(a as u64) == f64::from_bits(b as u64),
+        _ => a == b,
+    }
+}
+
+/// Renders one element the way `display` renders its boxed form.
+fn scalar_display(kind: ScalarKind, bits: i64) -> String {
+    match kind {
+        ScalarKind::I64 => bits.to_string(),
+        ScalarKind::F64 => {
+            let x = f64::from_bits(bits as u64);
+            if x.fract() == 0.0 && x.is_finite() && x.abs() < 1e15 {
+                format!("{x:.1}")
+            } else {
+                format!("{x}")
+            }
+        }
+        ScalarKind::Bool => (bits != 0).to_string(),
+    }
+}
+
+/// A list's elements, whichever representation it has.
+enum Items<'a> {
+    Boxed(&'a Vec<*mut RtVal>),
+    Scalar(ScalarKind, &'a Vec<i64>),
+}
+
+/// # Safety: live runtime pointer.
+unsafe fn items_of<'a>(v: *mut RtVal) -> Items<'a> {
+    match &(*v).payload {
+        RtPayload::List(items) => {
+            Items::Boxed(std::mem::transmute::<&Vec<*mut RtVal>, &'a Vec<*mut RtVal>>(items))
+        }
+        RtPayload::ListScalar { kind, data } => {
+            Items::Scalar(*kind, std::mem::transmute::<&Vec<i64>, &'a Vec<i64>>(data))
+        }
+        _ => grasm_panic_msg_str("expected a list"),
+    }
+}
+
+/// A new empty scalar list of the given kind (0 = i64, 1 = f64, 2 = bool).
+#[no_mangle]
+pub extern "C" fn grasm_list_new_scalar(kind: i64) -> *mut RtVal {
+    alloc(RtPayload::ListScalar {
+        kind: ScalarKind::from_i64(kind),
+        data: Vec::new(),
+    })
+}
+
+/// Appends inline bits. On a boxed list (one a runtime builtin produced),
+/// falls back to boxing — `kind` says how to interpret the bits.
+/// # Safety: live runtime pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_list_push_scalar(
+    list: *mut RtVal,
+    bits: i64,
+    kind: i64,
+) -> *mut RtVal {
+    let target = cow_list(list);
+    match &mut (*target).payload {
+        RtPayload::ListScalar { data, .. } => data.push(bits),
+        RtPayload::List(items) => items.push(scalar_box(ScalarKind::from_i64(kind), bits)),
+        _ => grasm_panic_msg_str("push on non-list"),
+    }
+    target
+}
+
+/// Reads inline bits; on a boxed list, unboxes. Panics on OOB like the
+/// interpreter.
+/// # Safety: live runtime pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_list_get_scalar(v: *mut RtVal, i: i64, kind: i64) -> i64 {
+    match &(*v).payload {
+        RtPayload::ListScalar { data, .. } => {
+            if i < 0 || i as usize >= data.len() {
+                rt_panic(&format!("index {i} out of bounds (len {})", data.len()));
+            }
+            data[i as usize]
+        }
+        RtPayload::List(items) => {
+            if i < 0 || i as usize >= items.len() {
+                rt_panic(&format!("index {i} out of bounds (len {})", items.len()));
+            }
+            scalar_unbox_val(ScalarKind::from_i64(kind), items[i as usize])
+        }
+        _ => grasm_panic_msg_str("index on non-list"),
+    }
+}
+
+/// `xs[i] = bits` honoring copy-on-write; returns the (possibly new) list.
+/// # Safety: live runtime pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_list_set_scalar(
+    v: *mut RtVal,
+    i: i64,
+    bits: i64,
+    kind: i64,
+) -> *mut RtVal {
+    let target = cow_list(v);
+    match &mut (*target).payload {
+        RtPayload::ListScalar { data, .. } => {
+            if i < 0 || i as usize >= data.len() {
+                rt_panic(&format!("index {i} out of bounds (len {})", data.len()));
+            }
+            data[i as usize] = bits;
+        }
+        RtPayload::List(items) => {
+            if i < 0 || i as usize >= items.len() {
+                rt_panic(&format!("index {i} out of bounds (len {})", items.len()));
+            }
+            dec(items[i as usize]);
+            items[i as usize] = scalar_box(ScalarKind::from_i64(kind), bits);
+        }
+        _ => grasm_panic_msg_str("index on non-list"),
+    }
+    target
+}
+
 // --- function values ---
 
 /// # Safety: `env` is an owned list pointer or null; `name` is a live slice.
@@ -391,10 +575,14 @@ pub extern "C" fn grasm_list_new() -> *mut RtVal {
 #[no_mangle]
 pub unsafe extern "C" fn grasm_list_push(list: *mut RtVal, elem: *mut RtVal) -> *mut RtVal {
     let target = cow_list(list);
-    let RtPayload::List(items) = &mut (*target).payload else {
-        unreachable!()
-    };
-    items.push(elem); // elem ownership transfers (caller inc'd for us)
+    match &mut (*target).payload {
+        RtPayload::List(items) => items.push(elem), // ownership transfers
+        RtPayload::ListScalar { kind, data } => {
+            data.push(scalar_unbox_val(*kind, elem));
+            dec(elem);
+        }
+        _ => unreachable!(),
+    }
     target
 }
 
@@ -402,24 +590,33 @@ unsafe fn cow_list(list: *mut RtVal) -> *mut RtVal {
     if (*list).rc.get() == 1 {
         return list;
     }
-    let RtPayload::List(items) = &(*list).payload else {
-        grasm_panic_msg_str("list op on non-list");
+    let fresh = match &(*list).payload {
+        RtPayload::List(items) => {
+            let cloned: Vec<*mut RtVal> = items
+                .iter()
+                .map(|&it| {
+                    inc(it);
+                    it
+                })
+                .collect();
+            alloc(RtPayload::List(cloned))
+        }
+        // A scalar list clones as one memcpy: no per-element refcounts exist.
+        RtPayload::ListScalar { kind, data } => alloc(RtPayload::ListScalar {
+            kind: *kind,
+            data: data.clone(),
+        }),
+        _ => grasm_panic_msg_str("list op on non-list"),
     };
-    let cloned: Vec<*mut RtVal> = items
-        .iter()
-        .map(|&it| {
-            inc(it);
-            it
-        })
-        .collect();
     dec(list);
-    alloc(RtPayload::List(cloned))
+    fresh
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn grasm_list_len(v: *mut RtVal) -> i64 {
     match &(*v).payload {
         RtPayload::List(items) => items.len() as i64,
+        RtPayload::ListScalar { data, .. } => data.len() as i64,
         _ => grasm_panic_msg_str("len on non-list"),
     }
 }
@@ -437,6 +634,12 @@ pub unsafe extern "C" fn grasm_list_get(v: *mut RtVal, i: i64) -> *mut RtVal {
             let e = items[i as usize];
             inc(e);
             e
+        }
+        RtPayload::ListScalar { kind, data } => {
+            if i < 0 || i as usize >= data.len() {
+                rt_panic(&format!("index {i} out of bounds (len {})", data.len()));
+            }
+            scalar_box(*kind, data[i as usize])
         }
         _ => grasm_panic_msg_str("index on non-list"),
     }
@@ -539,6 +742,10 @@ unsafe fn display(v: *mut RtVal) -> String {
         RtPayload::Str(s) => s.clone(),
         RtPayload::List(items) => {
             let parts: Vec<String> = items.iter().map(|&i| display(i)).collect();
+            format!("[{}]", parts.join(", "))
+        }
+        RtPayload::ListScalar { kind, data } => {
+            let parts: Vec<String> = data.iter().map(|&b| scalar_display(*kind, b)).collect();
             format!("[{}]", parts.join(", "))
         }
         RtPayload::Map(entries) => {
@@ -749,6 +956,31 @@ unsafe fn val_eq(a: *mut RtVal, b: *mut RtVal) -> bool {
         (RtPayload::List(x), RtPayload::List(y)) => {
             x.len() == y.len() && x.iter().zip(y).all(|(&i, &j)| val_eq(i, j))
         }
+        (
+            RtPayload::ListScalar { kind: k1, data: d1 },
+            RtPayload::ListScalar { kind: k2, data: d2 },
+        ) => {
+            k1 == k2
+                && d1.len() == d2.len()
+                && d1.iter().zip(d2).all(|(&x, &y)| scalar_eq(*k1, x, y))
+        }
+        // The same logical list can arrive in either representation (a
+        // literal is scalar; `keys()` is boxed), so equality must cross.
+        (RtPayload::ListScalar { kind, data }, RtPayload::List(items))
+        | (RtPayload::List(items), RtPayload::ListScalar { kind, data }) => {
+            data.len() == items.len()
+                && data
+                    .iter()
+                    .zip(items)
+                    .all(|(&bits, &boxed)| match (*kind, &(*boxed).payload) {
+                        (ScalarKind::I64, RtPayload::I64(x)) => bits == *x,
+                        (ScalarKind::F64, RtPayload::F64(x)) => {
+                            f64::from_bits(bits as u64) == *x
+                        }
+                        (ScalarKind::Bool, RtPayload::Bool(x)) => (bits != 0) == *x,
+                        _ => false,
+                    })
+        }
         (RtPayload::Map(x), RtPayload::Map(y)) => {
             x.len() == y.len()
                 && x.iter()
@@ -784,6 +1016,13 @@ unsafe fn val_eq(a: *mut RtVal, b: *mut RtVal) -> bool {
 #[no_mangle]
 pub unsafe extern "C" fn grasm_list_get_opt(v: *mut RtVal, i: i64) -> *mut RtVal {
     match &(*v).payload {
+        RtPayload::ListScalar { kind, data } => {
+            if i < 0 || i as usize >= data.len() {
+                none_val()
+            } else {
+                some_of(scalar_box(*kind, data[i as usize]))
+            }
+        }
         RtPayload::List(items) => {
             if i < 0 || i as usize >= items.len() {
                 alloc(RtPayload::Variant {
@@ -1145,34 +1384,37 @@ pub unsafe extern "C" fn grasm_str_parse_float(s: *mut RtVal) -> *mut RtVal {
     }
 }
 
-unsafe fn list_items(v: *mut RtVal) -> &'static Vec<*mut RtVal> {
-    match &(*v).payload {
-        RtPayload::List(items) => {
-            std::mem::transmute::<&Vec<*mut RtVal>, &'static Vec<*mut RtVal>>(items)
-        }
-        _ => grasm_panic_msg_str("expected a list"),
-    }
-}
-
 /// # Safety: live pointers.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_list_join(v: *mut RtVal, sep: *mut RtVal) -> *mut RtVal {
-    let parts: Vec<String> = list_items(v).iter().map(|&i| display(i)).collect();
+    let parts: Vec<String> = match items_of(v) {
+        Items::Boxed(items) => items.iter().map(|&i| display(i)).collect(),
+        Items::Scalar(kind, data) => data.iter().map(|&b| scalar_display(kind, b)).collect(),
+    };
     alloc(RtPayload::Str(parts.join(as_str(sep))))
 }
 
 /// # Safety: live pointer.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_list_rev(v: *mut RtVal) -> *mut RtVal {
-    let mut items: Vec<*mut RtVal> = list_items(v)
-        .iter()
-        .map(|&i| {
-            inc(i);
-            i
-        })
-        .collect();
-    items.reverse();
-    alloc(RtPayload::List(items))
+    match items_of(v) {
+        Items::Boxed(items) => {
+            let mut out: Vec<*mut RtVal> = items
+                .iter()
+                .map(|&i| {
+                    inc(i);
+                    i
+                })
+                .collect();
+            out.reverse();
+            alloc(RtPayload::List(out))
+        }
+        Items::Scalar(kind, data) => {
+            let mut out = data.clone();
+            out.reverse();
+            alloc(RtPayload::ListScalar { kind, data: out })
+        }
+    }
 }
 
 unsafe fn cmp_vals(a: *mut RtVal, b: *mut RtVal) -> std::cmp::Ordering {
@@ -1190,38 +1432,63 @@ unsafe fn cmp_vals(a: *mut RtVal, b: *mut RtVal) -> std::cmp::Ordering {
 #[no_mangle]
 pub unsafe extern "C" fn grasm_list_sort(v: *mut RtVal) -> *mut RtVal {
     let target = cow_list(v);
-    let RtPayload::List(items) = &mut (*target).payload else {
-        unreachable!()
-    };
-    items.sort_by(|&a, &b| cmp_vals(a, b));
+    match &mut (*target).payload {
+        RtPayload::List(items) => items.sort_by(|&a, &b| cmp_vals(a, b)),
+        RtPayload::ListScalar { kind, data } => {
+            let k = *kind;
+            data.sort_by(|&a, &b| scalar_cmp(k, a, b));
+        }
+        _ => unreachable!(),
+    }
     target
 }
 
 /// # Safety: live pointer.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_list_slice(v: *mut RtVal, a: i64, b: i64) -> *mut RtVal {
-    let items = list_items(v);
-    let len = items.len() as i64;
-    let s = a.clamp(0, len) as usize;
-    let e = b.clamp(0, len) as usize;
-    let out: Vec<*mut RtVal> = if s <= e {
-        items[s..e]
-            .iter()
-            .map(|&i| {
-                inc(i);
-                i
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-    alloc(RtPayload::List(out))
+    match items_of(v) {
+        Items::Boxed(items) => {
+            let len = items.len() as i64;
+            let s = a.clamp(0, len) as usize;
+            let e = b.clamp(0, len) as usize;
+            let out: Vec<*mut RtVal> = if s <= e {
+                items[s..e]
+                    .iter()
+                    .map(|&i| {
+                        inc(i);
+                        i
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            alloc(RtPayload::List(out))
+        }
+        Items::Scalar(kind, data) => {
+            let len = data.len() as i64;
+            let s = a.clamp(0, len) as usize;
+            let e = b.clamp(0, len) as usize;
+            let out = if s <= e { data[s..e].to_vec() } else { Vec::new() };
+            alloc(RtPayload::ListScalar { kind, data: out })
+        }
+    }
 }
 
 /// # Safety: live pointers.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_list_contains(v: *mut RtVal, needle: *mut RtVal) -> i8 {
-    i8::from(list_items(v).iter().any(|&i| val_eq(i, needle)))
+    let hit = match items_of(v) {
+        Items::Boxed(items) => items.iter().any(|&i| val_eq(i, needle)),
+        Items::Scalar(kind, data) => match (kind, &(*needle).payload) {
+            (ScalarKind::I64, RtPayload::I64(x)) => data.contains(x),
+            (ScalarKind::F64, RtPayload::F64(x)) => {
+                data.iter().any(|&b| f64::from_bits(b as u64) == *x)
+            }
+            (ScalarKind::Bool, RtPayload::Bool(x)) => data.contains(&i64::from(*x)),
+            _ => false,
+        },
+    };
+    i8::from(hit)
 }
 
 /// Pop honoring CoW: returns the new list; `out` receives the popped Option.
@@ -1229,64 +1496,99 @@ pub unsafe extern "C" fn grasm_list_contains(v: *mut RtVal, needle: *mut RtVal) 
 #[no_mangle]
 pub unsafe extern "C" fn grasm_list_pop(v: *mut RtVal, out: *mut *mut RtVal) -> *mut RtVal {
     let target = cow_list(v);
-    let RtPayload::List(items) = &mut (*target).payload else {
-        unreachable!()
-    };
-    *out = match items.pop() {
-        Some(e) => some_of(e),
-        None => none_val(),
-    };
+    match &mut (*target).payload {
+        RtPayload::List(items) => {
+            *out = match items.pop() {
+                Some(e) => some_of(e),
+                None => none_val(),
+            };
+        }
+        RtPayload::ListScalar { kind, data } => {
+            *out = match data.pop() {
+                Some(bits) => some_of(scalar_box(*kind, bits)),
+                None => none_val(),
+            };
+        }
+        _ => unreachable!(),
+    }
     target
 }
 
 /// # Safety: live pointer.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_list_first(v: *mut RtVal) -> *mut RtVal {
-    match list_items(v).first() {
-        Some(&e) => {
-            inc(e);
-            some_of(e)
-        }
-        None => none_val(),
+    match items_of(v) {
+        Items::Boxed(items) => match items.first() {
+            Some(&e) => {
+                inc(e);
+                some_of(e)
+            }
+            None => none_val(),
+        },
+        Items::Scalar(kind, data) => match data.first() {
+            Some(&b) => some_of(scalar_box(kind, b)),
+            None => none_val(),
+        },
     }
 }
 
 /// # Safety: live pointer.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_list_last(v: *mut RtVal) -> *mut RtVal {
-    match list_items(v).last() {
-        Some(&e) => {
-            inc(e);
-            some_of(e)
-        }
-        None => none_val(),
+    match items_of(v) {
+        Items::Boxed(items) => match items.last() {
+            Some(&e) => {
+                inc(e);
+                some_of(e)
+            }
+            None => none_val(),
+        },
+        Items::Scalar(kind, data) => match data.last() {
+            Some(&b) => some_of(scalar_box(kind, b)),
+            None => none_val(),
+        },
     }
 }
 
 /// # Safety: live pointer.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_list_sum_i64(v: *mut RtVal) -> i64 {
-    let mut total = 0i64;
-    for &i in list_items(v) {
-        if let RtPayload::I64(x) = &(*i).payload {
-            total += x;
+    match items_of(v) {
+        Items::Boxed(items) => {
+            let mut total = 0i64;
+            for &i in items {
+                if let RtPayload::I64(x) = &(*i).payload {
+                    total += x;
+                }
+            }
+            total
         }
+        Items::Scalar(ScalarKind::I64, data) => data.iter().sum(),
+        Items::Scalar(..) => 0,
     }
-    total
 }
 
 /// # Safety: live pointer.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_list_sum_f64(v: *mut RtVal) -> f64 {
-    let mut total = 0f64;
-    for &i in list_items(v) {
-        match &(*i).payload {
-            RtPayload::F64(x) => total += x,
-            RtPayload::I64(x) => total += *x as f64,
-            _ => {}
+    match items_of(v) {
+        Items::Boxed(items) => {
+            let mut total = 0f64;
+            for &i in items {
+                match &(*i).payload {
+                    RtPayload::F64(x) => total += x,
+                    RtPayload::I64(x) => total += *x as f64,
+                    _ => {}
+                }
+            }
+            total
         }
+        Items::Scalar(ScalarKind::F64, data) => {
+            data.iter().map(|&b| f64::from_bits(b as u64)).sum()
+        }
+        Items::Scalar(ScalarKind::I64, data) => data.iter().map(|&x| x as f64).sum(),
+        Items::Scalar(..) => 0.0,
     }
-    total
 }
 
 #[no_mangle]
@@ -1491,14 +1793,23 @@ pub unsafe extern "C" fn grasm_file_exists(path: *mut RtVal) -> i8 {
 #[no_mangle]
 pub unsafe extern "C" fn grasm_list_set(v: *mut RtVal, i: i64, val: *mut RtVal) -> *mut RtVal {
     let target = cow_list(v);
-    let RtPayload::List(items) = &mut (*target).payload else {
-        unreachable!()
-    };
-    if i < 0 || i as usize >= items.len() {
-        rt_panic(&format!("index {i} out of bounds (len {})", items.len()));
+    match &mut (*target).payload {
+        RtPayload::List(items) => {
+            if i < 0 || i as usize >= items.len() {
+                rt_panic(&format!("index {i} out of bounds (len {})", items.len()));
+            }
+            dec(items[i as usize]);
+            items[i as usize] = val;
+        }
+        RtPayload::ListScalar { kind, data } => {
+            if i < 0 || i as usize >= data.len() {
+                rt_panic(&format!("index {i} out of bounds (len {})", data.len()));
+            }
+            data[i as usize] = scalar_unbox_val(*kind, val);
+            dec(val);
+        }
+        _ => unreachable!(),
     }
-    dec(items[i as usize]);
-    items[i as usize] = val;
     target
 }
 
@@ -1577,7 +1888,11 @@ pub unsafe extern "C" fn grasm_str_is_empty(s: *mut RtVal) -> i8 {
 /// # Safety: live runtime pointer.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_list_is_empty(v: *mut RtVal) -> i8 {
-    i8::from(list_items(v).is_empty())
+    let empty = match items_of(v) {
+        Items::Boxed(items) => items.is_empty(),
+        Items::Scalar(_, data) => data.is_empty(),
+    };
+    i8::from(empty)
 }
 
 /// # Safety: live runtime pointer.
@@ -1593,31 +1908,60 @@ pub unsafe extern "C" fn grasm_map_is_empty(v: *mut RtVal) -> i8 {
 /// # Safety: live runtime pointer.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_list_min_max(v: *mut RtVal, want_max: i8) -> *mut RtVal {
-    let items = list_items(v);
-    let mut best: Option<*mut RtVal> = None;
-    for &item in items {
-        best = Some(match best {
-            None => item,
-            Some(cur) => {
-                let ord = cmp_vals(item, cur);
-                let take = if want_max != 0 {
-                    ord == std::cmp::Ordering::Greater
-                } else {
-                    ord == std::cmp::Ordering::Less
-                };
-                if take {
-                    item
-                } else {
-                    cur
-                }
+    let want_max = want_max != 0;
+    match items_of(v) {
+        Items::Boxed(items) => {
+            let mut best: Option<*mut RtVal> = None;
+            for &item in items {
+                best = Some(match best {
+                    None => item,
+                    Some(cur) => {
+                        let ord = cmp_vals(item, cur);
+                        let take = if want_max {
+                            ord == std::cmp::Ordering::Greater
+                        } else {
+                            ord == std::cmp::Ordering::Less
+                        };
+                        if take {
+                            item
+                        } else {
+                            cur
+                        }
+                    }
+                });
             }
-        });
-    }
-    match best {
-        Some(b) => {
-            inc(b);
-            some_of(b)
+            match best {
+                Some(b) => {
+                    inc(b);
+                    some_of(b)
+                }
+                None => none_val(),
+            }
         }
-        None => none_val(),
+        Items::Scalar(kind, data) => {
+            let mut best: Option<i64> = None;
+            for &bits in data {
+                best = Some(match best {
+                    None => bits,
+                    Some(cur) => {
+                        let ord = scalar_cmp(kind, bits, cur);
+                        let take = if want_max {
+                            ord == std::cmp::Ordering::Greater
+                        } else {
+                            ord == std::cmp::Ordering::Less
+                        };
+                        if take {
+                            bits
+                        } else {
+                            cur
+                        }
+                    }
+                });
+            }
+            match best {
+                Some(b) => some_of(scalar_box(kind, b)),
+                None => none_val(),
+            }
+        }
     }
 }

@@ -416,6 +416,10 @@ impl<'m> Codegen<'m> {
             ("grasm_list_is_empty", vec![i64t], Some(i8t)),
             ("grasm_map_is_empty", vec![i64t], Some(i8t)),
             ("grasm_list_min_max", vec![i64t, i8t], Some(i64t)),
+            ("grasm_list_new_scalar", vec![i64t], Some(i64t)),
+            ("grasm_list_push_scalar", vec![i64t, i64t, i64t], Some(i64t)),
+            ("grasm_list_get_scalar", vec![i64t, i64t, i64t], Some(i64t)),
+            ("grasm_list_set_scalar", vec![i64t, i64t, i64t, i64t], Some(i64t)),
         ];
         for (name, params, ret) in decls {
             let mut sig = self.module.make_signature();
@@ -1673,6 +1677,17 @@ fn unify_generic(
     }
 }
 
+/// The runtime tag for a type stored inline in a scalar list
+/// (0 = i64, 1 = f64, 2 = bool), or None when elements must be boxed.
+fn scalar_kind_i64(vt: &VType) -> Option<i64> {
+    match vt {
+        VType::I64 => Some(0),
+        VType::F64 => Some(1),
+        VType::Bool => Some(2),
+        _ => None,
+    }
+}
+
 /// One step of a place path (`p.field`, `xs[i]`).
 #[derive(Clone, Copy)]
 enum PlaceSeg<'e> {
@@ -1775,6 +1790,83 @@ impl FnCx<'_, '_> {
         self.cg
             .fns
             .get(&format!("{}::{}", self.cg.current_module, name))
+    }
+
+    /// A zero value of any native type — probing binds dummies with this.
+    /// `iconst` panics on float types, which is easy to hit and hard to trace.
+    fn zero_of(&mut self, vt: &VType) -> Value {
+        match vt.cl() {
+            types::F64 => self.b.ins().f64const(0.0),
+            t => self.b.ins().iconst(t, 0),
+        }
+    }
+
+    /// A new empty list whose elements have type `elem_t` — inline scalar
+    /// storage when the type allows it, boxed cells otherwise.
+    fn new_list_of(&mut self, elem_t: &VType) -> Value {
+        match scalar_kind_i64(elem_t) {
+            Some(k) => {
+                let kc = self.b.ins().iconst(types::I64, k);
+                self.call_rt("grasm_list_new_scalar", &[kc]).unwrap()
+            }
+            None => self.call_rt("grasm_list_new", &[]).unwrap(),
+        }
+    }
+
+    /// One element out of a list: the typed inline read when the element type
+    /// is scalar, the boxed read + unbox otherwise.
+    fn list_get_elem(&mut self, list: Value, idx: Value, elem_t: &VType) -> CResult<(Value, VType)> {
+        if let Some(k) = scalar_kind_i64(elem_t) {
+            let kc = self.b.ins().iconst(types::I64, k);
+            let bits = self
+                .call_rt("grasm_list_get_scalar", &[list, idx, kc])
+                .unwrap();
+            let v = self.scalar_of_bits(bits, elem_t);
+            return Ok((v, elem_t.clone()));
+        }
+        let boxed = self.call_rt("grasm_list_get", &[list, idx]).unwrap();
+        self.unbox(boxed, elem_t)
+    }
+
+    /// Appends `v` (a native value of type `vt`) to `list`, choosing the
+    /// inline or the boxed path. Consumes `v`'s reference either way.
+    fn list_push_elem(&mut self, list: Value, v: Value, vt: &VType) -> Value {
+        if let Some(k) = scalar_kind_i64(vt) {
+            let bits = self.scalar_bits_of(v, vt);
+            let kc = self.b.ins().iconst(types::I64, k);
+            return self
+                .call_rt("grasm_list_push_scalar", &[list, bits, kc])
+                .unwrap();
+        }
+        let bx = self.box_value(v, vt);
+        self.call_rt("grasm_list_push", &[list, bx]).unwrap()
+    }
+
+    /// A scalar as the i64 bit pattern a `ListScalar` stores.
+    fn scalar_bits_of(&mut self, v: Value, vt: &VType) -> Value {
+        match vt {
+            VType::I64 => v,
+            VType::F64 => {
+                self.b
+                    .ins()
+                    .bitcast(types::I64, cranelift_codegen::ir::MemFlags::new(), v)
+            }
+            VType::Bool => self.b.ins().uextend(types::I64, v),
+            _ => unreachable!("only scalars are stored inline"),
+        }
+    }
+
+    fn scalar_of_bits(&mut self, bits: Value, vt: &VType) -> Value {
+        match vt {
+            VType::I64 => bits,
+            VType::F64 => {
+                self.b
+                    .ins()
+                    .bitcast(types::F64, cranelift_codegen::ir::MemFlags::new(), bits)
+            }
+            VType::Bool => self.b.ins().ireduce(types::I8, bits),
+            _ => unreachable!("only scalars are stored inline"),
+        }
     }
 
     /// Switches to `blk`, resetting the terminator flag.
@@ -1891,6 +1983,55 @@ impl FnCx<'_, '_> {
                     let Some((var, root_t)) = self.lookup(&root.name) else {
                         return nope(root.span, "assignment to unknown variable");
                     };
+                    // `xs[i] = v` on a scalar-element list is a load and a
+                    // store on inline data — the box/write-back machinery
+                    // below would allocate in the hot loop this exists for.
+                    if let (VType::List(eb), [PlaceSeg::Index(ix)]) = (&root_t, path.as_slice()) {
+                        if let Some(kind) = scalar_kind_i64(eb) {
+                            let elem_t = (**eb).clone();
+                            let (mut val, val_t) =
+                                self.eval_expr_expecting(value, Some(&elem_t))?;
+                            if elem_t == VType::F64 && val_t == VType::I64 {
+                                val = self.b.ins().fcvt_from_sint(types::F64, val);
+                            }
+                            let final_v = if *op == AssignOp::Assign {
+                                val
+                            } else {
+                                let cur = self.b.use_var(var);
+                                let (iv, _) = self.eval_expr_val(ix)?;
+                                let kc = self.b.ins().iconst(types::I64, kind);
+                                let bits = self
+                                    .call_rt("grasm_list_get_scalar", &[cur, iv, kc])
+                                    .unwrap();
+                                let old = self.scalar_of_bits(bits, &elem_t);
+                                let bop = match op {
+                                    AssignOp::Add => BinaryOp::Add,
+                                    AssignOp::Sub => BinaryOp::Sub,
+                                    AssignOp::Mul => BinaryOp::Mul,
+                                    AssignOp::Div => BinaryOp::Div,
+                                    AssignOp::Assign => unreachable!(),
+                                };
+                                self.binop_values(
+                                    bop,
+                                    old,
+                                    elem_t.clone(),
+                                    val,
+                                    val_t,
+                                    target.span(),
+                                )?
+                                .0
+                            };
+                            let (iv2, _) = self.eval_expr_val(ix)?;
+                            let bits = self.scalar_bits_of(final_v, &elem_t);
+                            let kc = self.b.ins().iconst(types::I64, kind);
+                            let cur2 = self.b.use_var(var);
+                            let updated = self
+                                .call_rt("grasm_list_set_scalar", &[cur2, iv2, bits, kc])
+                                .unwrap();
+                            self.b.def_var(var, updated);
+                            return Ok(StmtOut::Value(None));
+                        }
+                    }
                     let elem_t = self.place_type(&root_t, &path, target.span())?;
                     let (mut val, val_t) = self.eval_expr_expecting(value, Some(&elem_t))?;
                     if elem_t == VType::F64 && val_t == VType::I64 {
@@ -2080,9 +2221,8 @@ impl FnCx<'_, '_> {
                 let (list_var, index) = (*list_var, *next_index);
                 self.task_scopes.last_mut().expect("checked above").1 += 1;
                 let idx = self.b.ins().iconst(types::I64, index as i64);
-                let boxed = self.call_rt("grasm_box_i64", &[idx]).unwrap();
                 let cur = self.b.use_var(list_var);
-                let next = self.call_rt("grasm_list_push", &[cur, boxed]).unwrap();
+                let next = self.list_push_elem(cur, idx, &VType::I64);
                 self.b.def_var(list_var, next);
                 Ok(StmtOut::Value(None))
             }
@@ -2209,8 +2349,7 @@ impl FnCx<'_, '_> {
         self.goto_block(body_blk);
         let lv2 = self.b.use_var(list_var);
         let iv2 = self.b.use_var(ivar);
-        let boxed_elem = self.call_rt("grasm_list_get", &[lv2, iv2]).unwrap();
-        let (elem_val, elem_vt) = self.unbox(boxed_elem, &elem_t)?;
+        let (elem_val, elem_vt) = self.list_get_elem(lv2, iv2, &elem_t)?;
         let evar = self.new_var(&elem_vt);
         self.b.def_var(evar, elem_val);
         self.push_scope();
@@ -2308,7 +2447,7 @@ impl FnCx<'_, '_> {
     ) -> CResult<(Value, VType)> {
         if let (Expr::List(items, _), Some(VType::List(elem_t))) = (e, expected) {
             if items.is_empty() {
-                let v = self.call_rt("grasm_list_new", &[]).unwrap();
+                let v = self.new_list_of(elem_t);
                 return Ok((v, VType::List(elem_t.clone())));
             }
         }
@@ -2367,16 +2506,17 @@ impl FnCx<'_, '_> {
             Expr::Str(pieces, _) => Ok(Some(self.build_string(pieces)?)),
             Expr::List(items, span) => {
                 let elem_t = self.list_elem_type(items, *span)?;
-                let mut list = self.call_rt("grasm_list_new", &[]).unwrap();
+                let mut list = self.new_list_of(&elem_t);
                 for item in items {
-                    let (v, vt) = self.eval_expr_val(item)?;
-                    let mut bv = self.box_value(v, &vt);
+                    let (mut v, vt) = self.eval_expr_val(item)?;
                     // Int-literal → f64 adaptation inside float lists.
-                    if elem_t == VType::F64 && vt == VType::I64 {
-                        let f = self.b.ins().fcvt_from_sint(types::F64, v);
-                        bv = self.call_rt("grasm_box_f64", &[f]).unwrap();
-                    }
-                    list = self.call_rt("grasm_list_push", &[list, bv]).unwrap();
+                    let vt = if elem_t == VType::F64 && vt == VType::I64 {
+                        v = self.b.ins().fcvt_from_sint(types::F64, v);
+                        VType::F64
+                    } else {
+                        vt
+                    };
+                    list = self.list_push_elem(list, v, &vt);
                 }
                 Ok(Some((list, VType::List(Box::new(elem_t)))))
             }
@@ -2389,9 +2529,8 @@ impl FnCx<'_, '_> {
                 if it != VType::I64 {
                     return nope(index.span(), "non-integer index");
                 }
-                let boxed = self.call_rt("grasm_list_get", &[rv, iv]).unwrap();
+                let (v, vt) = self.list_get_elem(rv, iv, &elem_t)?;
                 self.call_rt("grasm_val_dec", &[rv]);
-                let (v, vt) = self.unbox(boxed, &elem_t)?;
                 Ok(Some((v, vt)))
             }
             Expr::MethodCall {
@@ -2627,14 +2766,15 @@ impl FnCx<'_, '_> {
             let VType::List(elem_t) = vt else {
                 return nope(span, "push on non-lists");
             };
-            let (av, avt) = self.eval_expr_val(&args[0])?;
-            let mut boxed = self.box_value(av, &avt);
-            if *elem_t == VType::F64 && avt == VType::I64 {
-                let f = self.b.ins().fcvt_from_sint(types::F64, av);
-                boxed = self.call_rt("grasm_box_f64", &[f]).unwrap();
-            }
+            let (mut av, avt) = self.eval_expr_val(&args[0])?;
+            let avt = if *elem_t == VType::F64 && avt == VType::I64 {
+                av = self.b.ins().fcvt_from_sint(types::F64, av);
+                VType::F64
+            } else {
+                avt
+            };
             let cur = self.b.use_var(var);
-            let newp = self.call_rt("grasm_list_push", &[cur, boxed]).unwrap();
+            let newp = self.list_push_elem(cur, av, &avt);
             self.b.def_var(var, newp);
             return Ok(None);
         }
@@ -4012,7 +4152,7 @@ impl FnCx<'_, '_> {
                 self.push_scope();
                 for (p, pt) in params.iter().zip(&param_types) {
                     let var = self.new_var(pt);
-                    let zero = self.b.ins().iconst(pt.cl(), 0);
+                    let zero = self.zero_of(pt);
                     self.b.def_var(var, zero);
                     self.bind(&p.name, var, pt.clone());
                 }
@@ -4627,13 +4767,13 @@ impl FnCx<'_, '_> {
         self.push_scope();
         for (name, vt) in &captures {
             let var = self.new_var(vt);
-            let zero = self.b.ins().iconst(vt.cl(), 0);
+            let zero = self.zero_of(vt);
             self.b.def_var(var, zero);
             self.bind(name, var, vt.clone());
         }
         for (p, pt) in params.iter().zip(&param_types) {
             let var = self.new_var(pt);
-            let zero = self.b.ins().iconst(pt.cl(), 0);
+            let zero = self.zero_of(pt);
             self.b.def_var(var, zero);
             self.bind(&p.name, var, pt.clone());
         }
@@ -4777,7 +4917,7 @@ impl FnCx<'_, '_> {
         let sites = collect_spawn_sites(body);
 
         let list_var = self.new_var(&VType::List(Box::new(VType::I64)));
-        let empty = self.call_rt("grasm_list_new", &[]).unwrap();
+        let empty = self.new_list_of(&VType::I64);
         self.b.def_var(list_var, empty);
         self.task_scopes.push((list_var, 0));
 
@@ -4816,8 +4956,7 @@ impl FnCx<'_, '_> {
         self.goto_block(dispatch);
         let lv2 = self.b.use_var(list_var);
         let iv2 = self.b.use_var(ivar);
-        let boxed = self.call_rt("grasm_list_get", &[lv2, iv2]).unwrap();
-        let (site, _) = self.unbox(boxed, &VType::I64)?;
+        let (site, _) = self.list_get_elem(lv2, iv2, &VType::I64)?;
 
         // One block per site, chained on equality. The count is the number of
         // `spawn` statements in the source, so this stays small.
@@ -4916,8 +5055,7 @@ impl FnCx<'_, '_> {
         self.goto_block(body_blk);
         let lv2 = self.b.use_var(list_var);
         let iv2 = self.b.use_var(ivar);
-        let boxed = self.call_rt("grasm_list_get", &[lv2, iv2]).unwrap();
-        let (ev, evt) = self.unbox(boxed, elem_t)?;
+        let (ev, evt) = self.list_get_elem(lv2, iv2, elem_t)?;
         let evar = self.new_var(&evt);
         self.b.def_var(evar, ev);
         self.push_scope();
@@ -4990,7 +5128,26 @@ impl FnCx<'_, '_> {
         let list_var = self.new_var(&VType::List(Box::new(elem_t.clone())));
         self.b.def_var(list_var, list);
         let out_var = self.new_var(&VType::List(Box::new(elem_t.clone())));
-        let out0 = self.call_rt("grasm_list_new", &[]).unwrap();
+        // The output holds `filter`'s input type, or whatever `map`'s body
+        // produces — probed so a scalar result gets inline storage. A body the
+        // probe cannot type falls back to a boxed list rather than failing:
+        // it compiled before this optimization existed.
+        let out_hint = if is_map {
+            self.push_scope();
+            let dummy = self.new_var(elem_t);
+            let zero = self.zero_of(elem_t);
+            self.b.def_var(dummy, zero);
+            self.bind(&param.name, dummy, elem_t.clone());
+            let probed = self.probe_type(body);
+            self.pop_scope_no_decs();
+            probed.ok()
+        } else {
+            Some(elem_t.clone())
+        };
+        let out0 = match out_hint {
+            Some(t) => self.new_list_of(&t),
+            None => self.call_rt("grasm_list_new", &[]).unwrap(),
+        };
         self.b.def_var(out_var, out0);
         let ivar = self.new_var(&VType::I64);
         let zero = self.b.ins().iconst(types::I64, 0);
@@ -5014,8 +5171,7 @@ impl FnCx<'_, '_> {
         self.goto_block(body_blk);
         let lv2 = self.b.use_var(list_var);
         let iv2 = self.b.use_var(ivar);
-        let boxed = self.call_rt("grasm_list_get", &[lv2, iv2]).unwrap();
-        let (ev, evt) = self.unbox(boxed, elem_t)?;
+        let (ev, evt) = self.list_get_elem(lv2, iv2, elem_t)?;
         let evar = self.new_var(&evt);
         self.b.def_var(evar, ev);
         self.push_scope();
@@ -5023,9 +5179,8 @@ impl FnCx<'_, '_> {
         let (bv, bvt) = self.eval_expr_val(body)?;
         let out_elem_t = if is_map { bvt.clone() } else { elem_t.clone() };
         if is_map {
-            let bx = self.box_value(bv, &bvt);
             let cur = self.b.use_var(out_var);
-            let np = self.call_rt("grasm_list_push", &[cur, bx]).unwrap();
+            let np = self.list_push_elem(cur, bv, &bvt);
             self.b.def_var(out_var, np);
             self.pop_scope_with_decs();
             self.b.ins().jump(step, &[]);
@@ -5043,9 +5198,8 @@ impl FnCx<'_, '_> {
             if evt.boxed() {
                 self.call_rt("grasm_val_inc", &[e2]);
             }
-            let bx = self.box_value(e2, &evt);
             let cur = self.b.use_var(out_var);
-            let np = self.call_rt("grasm_list_push", &[cur, bx]).unwrap();
+            let np = self.list_push_elem(cur, e2, &evt);
             self.b.def_var(out_var, np);
             self.b.ins().jump(skip, &[]);
             self.filled = true;

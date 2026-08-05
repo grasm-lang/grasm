@@ -40,22 +40,29 @@ is better. Reproduce with `./scripts/bench.sh`.
 
 | program  |   C |  Rust |  Go | grasm-native | grasm-interp | Python |
 |----------|----:|------:|----:|-------------:|-------------:|-------:|
-| fib      |  27 |    26 |  28 |       **28** |         1204 |    152 |
-| sieve    |  29 |    28 |  32 |           89 |         2253 |    383 |
-| matmul   |  26 |    26 |  29 |          187 |         5804 |    948 |
-| wordfreq |  54 |    48 |  38 |          179 |          471 |    166 |
-| sort     |  58 |    33 |  71 |           97 |          322 |    241 |
+| fib      |  26 |    26 |  27 |       **28** |         1205 |    152 |
+| sieve    |  27 |    29 |  28 |           58 |         2268 |    399 |
+| matmul   |  25 |    28 |  31 |           92 |         5821 |    973 |
+| wordfreq |  52 |    48 |  39 |          181 |          475 |    152 |
+| sort     |  58 |    32 |  70 |       **49** |          324 |    243 |
 
 Native Grasm matches C on `fib`, which is the benchmark that is almost entirely
 function calls and integer arithmetic — the Cranelift call path and the
 scalar codegen are doing their job.
 
-The gap on the others is one thing: **values in collections are boxed**. A list
-element or map value is a refcounted heap cell, so `c[i] = c[i] + x` in the
-matmul inner loop allocates. C, Rust, and Go store `int64` inline and do not.
-That is a property of the current value representation, not of the codegen, and
-closing it means unboxed storage for scalar collections — a representation
-change, not an optimizer pass.
+Scalar lists (`[i64]`, `[f64]`, `[bool]`) store their elements **inline** — one
+machine word each, no per-element heap cell — so `c[i] = c[i] + x` is a load
+and a store through the runtime, not an allocation. That change halved sieve
+(89→58) and halved matmul twice (187→92), and it is why **sort beats C**
+(49 vs 58): Rust's pdqsort over a `Vec<i64>` against C's `qsort` calling a
+comparison function through a pointer.
+
+What remains of the gap is two things, stated so nobody has to guess:
+
+- Every element access is still a **call into the runtime** (with a
+  copy-on-write check), where C compiles to a raw load. Closing that means
+  teaching codegen the list's memory layout so hot loops inline the access.
+- **Map values are still boxed**, which is most of wordfreq's 3.5×.
 
 Two things the first run of these benchmarks found and fixed:
 

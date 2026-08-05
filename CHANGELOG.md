@@ -40,6 +40,12 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   goes from 103 programs to **113 of 113: nothing in the repository is left to
   the interpreter.**
 
+- **Unboxed scalar collections.** `[i64]`, `[f64]`, and `[bool]` store
+  elements inline — one word each, no per-element heap cell, no refcount
+  traffic. sieve 89→58ms, matmul 187→92ms, sort 97→49ms (now faster than C
+  and Go). Representation only; `[E-COW]` says it is never observable, and
+  difftest holds all 115 programs byte-identical across both engines.
+
 ### Fixed
 
 - `exit(n)` called `std::process::exit` from inside the interpreter, killing any

@@ -1,0 +1,63 @@
+// Exercises both list representations against each other.
+//
+// A list literal of scalars is stored inline; a list a builtin produces
+// (map.keys(), split, chars) holds boxed cells. The two must be
+// indistinguishable — equality, printing, and every method — because the
+// representation is an optimization, never a semantic ([E-COW]).
+
+fn main() {
+    // Copy-on-write across the inline representation.
+    var a = [1, 2, 3]
+    var b = a
+    b.push(4)
+    b[0] = 99
+    print("{a} {b}")
+
+    // Cross-representation equality: keys() is boxed, the literal is not.
+    var m = map()
+    m.set(1, "one")
+    m.set(2, "two")
+    print("{m.keys() == [1, 2]} {m.keys() == [1, 3]}")
+
+    // A boxed list from the runtime, then written through typed paths.
+    var ks = m.keys()
+    ks.push(3)
+    ks[0] = 7
+    print("{ks} {ks[0] + ks[2]}")
+
+    // Floats: negative zero, ordering, arithmetic through inline storage.
+    var fs = [3.5, -0.0, 1.25]
+    fs.sort()
+    print("{fs} {fs.sum()} {fs[0] == 0.0}")
+    print("{fs.min() ?? 0.0} {fs.max() ?? 0.0}")
+
+    // Bools have no ordering, so sorting them is a no-op — in both engines,
+    // whatever the storage. (min/max on bools is a compile error.)
+    var flags = [true, false, true]
+    flags.sort()
+    print("{flags}")
+    flags[1] = true
+    print("{flags.contains(false)} {flags.rev()}")
+
+    // The whole method surface over inline storage.
+    let xs = [5, 1, 4, 1, 5, 9, 2, 6]
+    print("{xs.first() ?? 0} {xs.last() ?? 0} {xs.get(3) ?? -1} {xs.get(99) ?? -1}")
+    print("{xs.slice(2, 5)} {xs.rev().slice(0, 2)}")
+    print("{xs.contains(9)} {xs.contains(3)} {xs.sum()}")
+    var ys = [10, 20]
+    let popped = ys.pop() ?? -1
+    print("{popped} {ys} {ys.is_empty()}")
+
+    // map/filter across representations: scalar in, scalar out, str out.
+    print("{xs.filter(|x| x > 3).map(|x| x * 10)}")
+    print("{xs.map(|x| "n{x}").join(",")}")
+
+    // Scalar lists nest inside boxed structures and survive round trips.
+    var grid = [[1, 2], [3, 4]]
+    grid[1][0] = 30
+    print("{grid} {grid[1][0] + grid[0][1]}")
+    var holder = map()
+    holder.set("row", [8, 9])
+    let row = holder.get("row") ?? [0]
+    print("{row} {row.sum()}")
+}

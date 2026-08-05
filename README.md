@@ -64,16 +64,17 @@ Five programs written the same way in Grasm, C, Rust, Go, and Python. Best of
 
 | program  |   C |  Rust |  Go | grasm-native | Python |
 |----------|----:|------:|----:|-------------:|-------:|
-| fib      |  27 |    26 |  28 |       **28** |    152 |
-| sieve    |  29 |    28 |  32 |           89 |    383 |
-| matmul   |  26 |    26 |  29 |          187 |    948 |
-| wordfreq |  54 |    48 |  38 |          179 |    166 |
-| sort     |  58 |    33 |  71 |           97 |    241 |
+| fib      |  26 |    26 |  27 |       **28** |    152 |
+| sieve    |  27 |    29 |  28 |           58 |    399 |
+| matmul   |  25 |    28 |  31 |           92 |    973 |
+| wordfreq |  52 |    48 |  39 |          181 |    152 |
+| sort     |  58 |    32 |  70 |       **49** |    243 |
 
 `./scripts/bench.sh` builds every implementation, checks each one against the
 interpreter's answer, and refuses to report a timing for a wrong one. Native
-Grasm matches C on call-and-arithmetic work; the remaining gap is that values
-inside collections are boxed, so an inner loop writing to a list allocates.
+Grasm matches C on call-and-arithmetic work and **beats C and Go on sort**;
+scalar lists store elements inline, so hot loops load and store instead of
+allocating. The remaining gap is per-access runtime calls and boxed map values.
 
 Compile time is ~53 ms/program — about Go's, roughly 3× faster than Rust.
 Binary size is the weak spot at ~1.5 MB, because every executable statically
