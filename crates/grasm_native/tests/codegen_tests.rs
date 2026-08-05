@@ -361,3 +361,43 @@ fn an_uncalled_closure_with_parameters_is_reported() {
         "expected a clear reason, got: {err}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// par_map
+// ---------------------------------------------------------------------------
+
+#[test]
+fn par_map_compiles_to_the_threaded_path() {
+    compile("fn main() {\n    let xs = [1, 2, 3]\n    print(\"{xs.par_map(|x| x * x)}\")\n}\n")
+        .expect("scalar elements and a scalar result should compile");
+}
+
+#[test]
+fn par_map_with_a_scalar_capture_compiles() {
+    // Captures travel as raw bits copied per worker, so nothing refcounted
+    // ever crosses a thread.
+    compile(
+        "fn main() {\n    let k = 3\n    let xs = [1, 2]\n    print(\"{xs.par_map(|x| x * k)}\")\n}\n",
+    )
+    .expect("a scalar capture should compile");
+}
+
+#[test]
+fn par_map_over_boxed_elements_falls_back_rather_than_failing() {
+    // Strings cannot cross a thread safely with this representation, so the
+    // sequential lowering is used. Slower, never wrong.
+    compile(
+        "fn main() {\n    let ws = [\"a\", \"bb\"]\n    print(\"{ws.par_map(|w| w.len())}\")\n}\n",
+    )
+    .expect("boxed elements should fall back, not error");
+}
+
+#[test]
+fn chained_par_maps_get_distinct_symbols() {
+    // Both method calls start at the same source offset, so naming the lifted
+    // functions after the span produced a duplicate-symbol link error.
+    compile(
+        "fn main() {\n    let xs = [1, 2, 3]\n    print(\"{xs.par_map(|x| x + 1).par_map(|y| y * 2)}\")\n}\n",
+    )
+    .expect("chained par_maps should compile");
+}

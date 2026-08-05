@@ -1,0 +1,20 @@
+//! tag: E-PAR-MAP-ORDER
+//! expect: output
+//! true
+//! [1, 4, 9, 16, 25]
+//! true
+fn main() {
+    // Enough elements to cross the threshold where workers are used, so this
+    // exercises the threaded path rather than the sequential fallback.
+    var xs: [i64] = []
+    for i in 0..20000 {
+        xs.push(i)
+    }
+    // Same answer as `map`, in input order, however many cores ran it.
+    print("{xs.par_map(|x| x * 2) == xs.map(|x| x * 2)}")
+
+    print("{[1, 2, 3, 4, 5].par_map(|x| x * x)}")
+
+    let none: [i64] = []
+    print("{none.par_map(|x| x + 1).is_empty()}")
+}

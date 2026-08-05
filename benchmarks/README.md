@@ -18,6 +18,7 @@ a benchmark lies, and a wrong answer is not a fast answer.
 | `matmul`   | nested indexing over a flat list                |
 | `wordfreq` | hashing, string handling, map updates           |
 | `sort`     | comparison-heavy work over a large list         |
+| `parmap`   | multi-core throughput, each language's idiom    |
 
 ## How to read the numbers
 
@@ -40,11 +41,12 @@ is better. Reproduce with `./scripts/bench.sh`.
 
 | program  |   C |  Rust |  Go | grasm-native | grasm-interp | Python |
 |----------|----:|------:|----:|-------------:|-------------:|-------:|
-| fib      |  26 |    26 |  27 |       **28** |         1205 |    152 |
-| sieve    |  27 |    29 |  28 |           58 |         2268 |    399 |
-| matmul   |  25 |    28 |  31 |           92 |         5821 |    973 |
-| wordfreq |  52 |    48 |  39 |          181 |          475 |    152 |
-| sort     |  58 |    32 |  70 |       **49** |          324 |    243 |
+| fib      |  27 |    27 |  27 |       **29** |         1219 |    155 |
+| sieve    |  28 |    28 |  31 |           58 |         2288 |    400 |
+| matmul   |  26 |    26 |  31 |           94 |         5908 |    957 |
+| wordfreq |  52 |    50 |  38 |          182 |          480 |    160 |
+| sort     |  60 |    36 |  71 |       **49** |          327 |    240 |
+| parmap   |  74 |    73 | 116 |          133 |        33467 |  3,532 |
 
 Native Grasm matches C on `fib`, which is the benchmark that is almost entirely
 function calls and integer arithmetic — the Cranelift call path and the
@@ -63,6 +65,32 @@ What remains of the gap is two things, stated so nobody has to guess:
   copy-on-write check), where C compiles to a raw load. Closing that means
   teaching codegen the list's memory layout so hot loops inline the access.
 - **Map values are still boxed**, which is most of wordfreq's 3.5×.
+
+## Multi-core
+
+`parmap` is the one row where the languages are asked for *throughput*, each
+using its natural idiom: pthreads in C, `std::thread::scope` in Rust,
+goroutines in Go, `multiprocessing.Pool` in Python (the GIL rules threads out),
+and `par_map` in Grasm.
+
+Grasm gets a **5.9× speedup on 8 cores** — measured A/B against the identical
+program with `map` in place of `par_map`: 644 ms to 108 ms, byte-identical
+output. That puts it at 133 ms against Go's 116 ms and 27× ahead of Python.
+
+The interesting part is not the number, it is what makes it *safe*:
+
+- The function must be **effect-free, and the compiler proves it**. Put a
+  `print` inside and the build fails with `par_map needs an effect-free
+  function`. No `Send`/`Sync` bounds to satisfy, no race detector to run —
+  the effect system already knew.
+- Results come back in **input order regardless of core count**
+  ([E-PAR-MAP-ORDER]), so the answer never depends on the machine. Verified
+  by running the same binary 40 times and checking exactly one distinct
+  result comes back.
+
+`parallel { spawn { … } }` deliberately stays single-core. Its tasks share the
+enclosing scope by design ([E-SPAWN-SHARED]), so running them concurrently
+would race — structure and determinism there, throughput here.
 
 Two things the first run of these benchmarks found and fixed:
 

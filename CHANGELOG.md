@@ -51,6 +51,13 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   Rust. The rest is `std` machinery; going lower needs `no_std` or
   `build-std`.
 
+- **`par_map` — multi-core, deterministic.** `xs.par_map(f)` spreads elements
+  across cores: **5.9× on 8 cores**, byte-identical output. Safety comes from
+  the effect system — `f` must be effect-free and the compiler proves it
+  ([T-PAR-MAP-PURE]) — and results are returned in input order regardless of
+  core count ([E-PAR-MAP-ORDER]). `parallel`/`spawn` stays single-core by
+  design; its tasks share scope and would race.
+
 ### Fixed
 
 - `exit(n)` called `std::process::exit` from inside the interpreter, killing any

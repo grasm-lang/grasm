@@ -224,6 +224,12 @@ struct Codegen<'m> {
     pending_handlers: Vec<PendingHandler>,
     /// Lifted closure bodies, likewise.
     pending_closures: Vec<PendingClosure>,
+    /// Lifted `par_map` bodies, compiled with the scalar-bits ABI.
+    pending_par_maps: Vec<PendingParMap>,
+    /// Serial number for lifted `par_map` symbols. A span start is not unique
+    /// enough: `xs.par_map(f).par_map(g)` gives both method calls the same
+    /// start offset, and a generic can be instantiated more than once.
+    par_map_seq: usize,
     /// Named function → the wrapper that gives it the function-value ABI.
     /// One wrapper per function, however many times it is used as a value.
     fn_wrappers: HashMap<String, FuncId>,
@@ -248,6 +254,19 @@ struct PendingGeneric {
     module: String,
     decl: FnDecl,
     subst: HashMap<String, VType>,
+}
+
+/// A `par_map` function lifted for threaded execution: it takes captured
+/// scalars as raw bits and returns raw bits, so a worker thread touches
+/// nothing refcounted.
+struct PendingParMap {
+    id: FuncId,
+    module: String,
+    captures: Vec<(String, VType)>,
+    param: String,
+    param_t: VType,
+    ret: VType,
+    body: Expr,
 }
 
 /// A closure body lifted to a real function.
@@ -288,6 +307,8 @@ impl<'m> Codegen<'m> {
             handler_sites: HashMap::new(),
             pending_handlers: Vec::new(),
             pending_closures: Vec::new(),
+            pending_par_maps: Vec::new(),
+            par_map_seq: 0,
             fn_wrappers: HashMap::new(),
             current_module: "main".to_string(),
             module_imports: HashMap::new(),
@@ -420,6 +441,7 @@ impl<'m> Codegen<'m> {
             ("grasm_list_push_scalar", vec![i64t, i64t, i64t], Some(i64t)),
             ("grasm_list_get_scalar", vec![i64t, i64t, i64t], Some(i64t)),
             ("grasm_list_set_scalar", vec![i64t, i64t, i64t, i64t], Some(i64t)),
+            ("grasm_par_map_scalar", vec![i64t, ptr, ptr, i64t, i64t], Some(i64t)),
         ];
         for (name, params, ret) in decls {
             let mut sig = self.module.make_signature();
@@ -531,6 +553,11 @@ impl<'m> Codegen<'m> {
             let result = self.compile_fn_as(&g.decl, &g.key);
             self.generic_subst = saved;
             result?;
+        }
+
+        while let Some(c) = self.pending_par_maps.pop() {
+            self.current_module = c.module.clone();
+            self.compile_par_map(c)?;
         }
 
         // A lifted closure can itself create another, so drain the worklist.
@@ -1180,6 +1207,76 @@ impl<'m> Codegen<'m> {
             })?;
         self.fn_wrappers.insert(key.to_string(), id);
         Ok(id)
+    }
+
+    /// Compiles a lifted `par_map` body: captured scalars arrive as an array
+    /// of raw bits, the element as bits, and the result leaves as bits.
+    fn compile_par_map(&mut self, c: PendingParMap) -> CResult<()> {
+        let ptr_ty = self.module.target_config().pointer_type();
+        let mut ctx = self.module.make_context();
+        ctx.func.signature.params.push(AbiParam::new(ptr_ty));
+        ctx.func.signature.params.push(AbiParam::new(types::I64));
+        ctx.func.signature.returns.push(AbiParam::new(types::I64));
+
+        let mut fbcx = FunctionBuilderContext::new();
+        let builder = FunctionBuilder::new(&mut ctx.func, &mut fbcx);
+        let mut fcx = FnCx {
+            cg: self,
+            b: builder,
+            vars: Vec::new(),
+            var_count: 0,
+            loops: Vec::new(),
+            ret: c.ret.clone(),
+            inout_slots: Vec::new(),
+            filled: false,
+            closure_hints: Vec::new(),
+            task_scopes: Vec::new(),
+        };
+        let entry = fcx.b.create_block();
+        fcx.b.append_block_params_for_function_params(entry);
+        fcx.b.switch_to_block(entry);
+        fcx.push_scope();
+        let ps: Vec<Value> = fcx.b.block_params(entry).to_vec();
+
+        for (i, (name, vt)) in c.captures.iter().enumerate() {
+            let bits = fcx.b.ins().load(
+                types::I64,
+                cranelift_codegen::ir::MemFlags::trusted(),
+                ps[0],
+                (i * 8) as i32,
+            );
+            let v = fcx.scalar_of_bits(bits, vt);
+            let var = fcx.new_var(vt);
+            fcx.b.def_var(var, v);
+            fcx.bind(name, var, vt.clone());
+        }
+        let x = fcx.scalar_of_bits(ps[1], &c.param_t);
+        let pvar = fcx.new_var(&c.param_t);
+        fcx.b.def_var(pvar, x);
+        fcx.bind(&c.param, pvar, c.param_t.clone());
+
+        let val = fcx.eval_expr(&c.body)?;
+        let Some((mut r, rt)) = val else {
+            return nope(c.body.span(), "a par_map body with no value");
+        };
+        if c.ret == VType::F64 && rt == VType::I64 {
+            r = fcx.b.ins().fcvt_from_sint(types::F64, r);
+        }
+        let bits = fcx.scalar_bits_of(r, &c.ret);
+        fcx.emit_scope_decs_all();
+        if !fcx.is_filled() {
+            fcx.b.ins().return_(&[bits]);
+        }
+        fcx.b.seal_all_blocks();
+        fcx.b.finalize();
+        self.module
+            .define_function(c.id, &mut ctx)
+            .map_err(|e| Unsupported {
+                span: c.body.span(),
+                what: format!("(define error: {e})"),
+            })?;
+        let _ = c.module;
+        Ok(())
     }
 
     /// Compiles a lifted closure body.
@@ -3142,6 +3239,21 @@ impl FnCx<'_, '_> {
                 }
                 self.emit_list_search(rv, &elem_t, &cparams[0], cbody, m)?
             }
+            (VType::List(e), "par_map") => {
+                let elem_t = (**e).clone();
+                let Expr::Closure {
+                    params: cparams,
+                    body: cbody,
+                    ..
+                } = &args[0]
+                else {
+                    return nope(args[0].span(), "par_map with a non-literal closure");
+                };
+                if cparams.len() != 1 {
+                    return nope(args[0].span(), "par_map with multiple parameters");
+                }
+                self.emit_par_map(rv, &elem_t, &cparams[0], cbody, span)?
+            }
             (VType::List(e), "map" | "filter") => {
                 let elem_t = (**e).clone();
                 let Expr::Closure {
@@ -4903,6 +5015,111 @@ impl FnCx<'_, '_> {
             }
         }
         out
+    }
+
+    /// Lowers `xs.par_map(|x| body)` onto real threads.
+    ///
+    /// Safe to run on several cores because two separate things hold: the
+    /// checker has proved the function effect-free, so there is no observable
+    /// interleaving; and both the elements and the captured values are
+    /// *scalars*, so nothing refcounted crosses a thread. Each worker writes a
+    /// disjoint index range, which is why the result does not depend on how
+    /// many cores ran it ([E-PAR-MAP-ORDER]).
+    ///
+    /// Anything outside that — boxed elements, boxed captures — falls back to
+    /// the sequential inline loop. Slower, never wrong.
+    fn emit_par_map(
+        &mut self,
+        list: Value,
+        elem_t: &VType,
+        param: &Ident,
+        body: &Expr,
+        span: Span,
+    ) -> CResult<(Value, VType)> {
+        let captures = self.closure_captures(std::slice::from_ref(param), body);
+        let out_t = {
+            self.push_scope();
+            let dummy = self.new_var(elem_t);
+            let z = self.zero_of(elem_t);
+            self.b.def_var(dummy, z);
+            self.bind(&param.name, dummy, elem_t.clone());
+            let probed = self.probe_type(body);
+            self.pop_scope_no_decs();
+            probed
+        };
+        // A body whose result type cannot be determined here is still a
+        // perfectly good sequential map; only the threading needs the type.
+        let Ok(out_t) = out_t else {
+            return self.emit_list_transform(list, elem_t, param, body, true);
+        };
+
+        let elems_inline = scalar_kind_i64(elem_t).is_some();
+        let out_inline = scalar_kind_i64(&out_t).is_some();
+        let caps_inline = captures.iter().all(|(_, t)| scalar_kind_i64(t).is_some());
+        if !(elems_inline && out_inline && caps_inline) {
+            // Not parallelizable with this representation; the sequential
+            // lowering produces the same list.
+            return self.emit_list_transform(list, elem_t, param, body, true);
+        }
+
+        // Lift the body to `extern "C" fn(*const i64 env, i64 x) -> i64`,
+        // trafficking in raw scalar bits so the worker shares nothing.
+        let ptr_ty = self.cg.module.target_config().pointer_type();
+        let mut sig = self.cg.module.make_signature();
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        self.cg.par_map_seq += 1;
+        let sym = format!(
+            "gp_{}_{}",
+            self.cg.current_module.replace('.', "_"),
+            self.cg.par_map_seq
+        );
+        let id = self
+            .cg
+            .module
+            .declare_function(&sym, Linkage::Local, &sig)
+            .map_err(|e| Unsupported {
+                span,
+                what: format!("(module error: {e})"),
+            })?;
+        self.cg.pending_par_maps.push(PendingParMap {
+            id,
+            module: self.cg.current_module.clone(),
+            captures: captures.clone(),
+            param: param.name.clone(),
+            param_t: elem_t.clone(),
+            ret: out_t.clone(),
+            body: body.clone(),
+        });
+
+        // The captured scalars go into a stack array the runtime copies per
+        // worker — no shared mutable state at all.
+        let slot_bytes = (captures.len().max(1) * 8) as u32;
+        let slot = self.b.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+            slot_bytes,
+            3,
+        ));
+        for (i, (name, vt)) in captures.iter().enumerate() {
+            let (var, _) = self.lookup(name).expect("capture resolved above");
+            let v = self.b.use_var(var);
+            let bits = self.scalar_bits_of(v, vt);
+            self.b.ins().stack_store(bits, slot, (i * 8) as i32);
+        }
+        let env_ptr = self.b.ins().stack_addr(ptr_ty, slot, 0);
+        let fref = self.cg.module.declare_func_in_func(id, self.b.func);
+        let code = self.b.ins().func_addr(ptr_ty, fref);
+        let env_len = self.b.ins().iconst(types::I64, captures.len() as i64);
+        let out_kind = self
+            .b
+            .ins()
+            .iconst(types::I64, scalar_kind_i64(&out_t).expect("checked above"));
+        let out = self
+            .call_rt("grasm_par_map_scalar", &[list, code, env_ptr, env_len, out_kind])
+            .unwrap();
+        self.call_rt("grasm_val_dec", &[list]);
+        Ok((out, VType::List(Box::new(out_t))))
     }
 
     /// Lowers `parallel { … }`.

@@ -1384,7 +1384,12 @@ impl<'a, W: Write> Interp<'a, W> {
                 let needle = self.eval_expr(&args[0])?;
                 Value::Bool(items.iter().any(|x| x.eq_value(&needle)))
             }
-            (Value::List(items), "map") => {
+            // `par_map` is a parallel map natively; here it is a plain one.
+            // The reference implementation defines the *answer*, and the
+            // answer is order-preserving and identical either way — which is
+            // the whole point of requiring the function to be effect-free
+            // ([E-PAR-MAP-ORDER]).
+            (Value::List(items), "map" | "par_map") => {
                 let f = self.eval_expr(&args[0])?;
                 let mut out = Vec::with_capacity(items.len());
                 for item in items.iter() {

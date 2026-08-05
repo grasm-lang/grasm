@@ -9,6 +9,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use grasm_syntax::ast::*;
 use grasm_syntax::diag::Diagnostic;
+use grasm_syntax::span::Span;
 
 use crate::check::ModuleView;
 
@@ -289,7 +290,160 @@ pub fn check_effects_multi(files: &[ModuleView]) -> Vec<Diagnostic> {
         }
     }
 
+    for f in files {
+        for d in &f.module.decls {
+            let body = match d {
+                Decl::Fn(fd) => &fd.body,
+                Decl::Test(t) => &t.body,
+                Decl::Bench(b) => &b.body,
+                _ => continue,
+            };
+            check_par_map_block(body, &f.name, &ctx, &mut diags);
+        }
+    }
+
     diags
+}
+
+/// `par_map` runs its function on several cores at once, so an effect inside
+/// it would interleave unpredictably between runs. Requiring the row to be
+/// empty is exactly what makes the parallelism deterministic — and because
+/// effects are inferred, this is a compile error rather than a race nobody can
+/// reproduce ([T-PAR-MAP-PURE]).
+fn check_par_map_block(b: &Block, current: &str, ctx: &Ctx, diags: &mut Vec<Diagnostic>) {
+    let mut calls = Vec::new();
+    collect_par_maps_block(b, &mut calls);
+    for (func, span) in calls {
+        let mut row = BTreeSet::new();
+        let mut active = Vec::new();
+        walk_expr(func, current, &mut active, ctx, &mut row);
+        if row.is_empty() {
+            continue;
+        }
+        let list = row
+            .iter()
+            .map(|e| format!("`{e}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        diags.push(
+            Diagnostic::error(
+                span,
+                format!("`par_map` needs an effect-free function, but this one performs {list}"),
+            )
+            .with_help(
+                "elements are processed on several cores, so an effect would \
+interleave differently between runs — use `map` for effectful work",
+            ),
+        );
+    }
+}
+
+fn collect_par_maps_block<'e>(b: &'e Block, out: &mut Vec<(&'e Expr, Span)>) {
+    for s in &b.stmts {
+        match s {
+            Stmt::Let { init, .. } => collect_par_maps_expr(init, out),
+            Stmt::Assign { target, value, .. } => {
+                collect_par_maps_expr(target, out);
+                collect_par_maps_expr(value, out);
+            }
+            Stmt::Return(Some(e), _) | Stmt::Expr(e) => collect_par_maps_expr(e, out),
+            Stmt::While { cond, body, .. } => {
+                collect_par_maps_expr(cond, out);
+                collect_par_maps_block(body, out);
+            }
+            Stmt::For { iter, body, .. } => {
+                collect_par_maps_expr(iter, out);
+                collect_par_maps_block(body, out);
+            }
+            Stmt::Parallel { body, .. } | Stmt::Spawn { body, .. } => {
+                collect_par_maps_block(body, out)
+            }
+            Stmt::With { handler, body, .. } => {
+                collect_par_maps_expr(handler, out);
+                collect_par_maps_block(body, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_par_maps_expr<'e>(e: &'e Expr, out: &mut Vec<(&'e Expr, Span)>) {
+    if let Expr::MethodCall {
+        name, args, span, ..
+    } = e
+    {
+        if name.name == "par_map" {
+            if let Some(f) = args.first() {
+                out.push((f, *span));
+            }
+        }
+    }
+    match e {
+        Expr::MethodCall { recv, args, .. } => {
+            collect_par_maps_expr(recv, out);
+            for a in args {
+                collect_par_maps_expr(a, out);
+            }
+        }
+        Expr::Call { callee, args, .. } => {
+            collect_par_maps_expr(callee, out);
+            for a in args {
+                collect_par_maps_expr(a, out);
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_par_maps_expr(lhs, out);
+            collect_par_maps_expr(rhs, out);
+        }
+        Expr::Unary { expr, .. } | Expr::Try { expr, .. } => collect_par_maps_expr(expr, out),
+        Expr::Field { recv, .. } => collect_par_maps_expr(recv, out),
+        Expr::Index { recv, index, .. } => {
+            collect_par_maps_expr(recv, out);
+            collect_par_maps_expr(index, out);
+        }
+        Expr::List(items, _) | Expr::Tuple(items, _) => {
+            for i in items {
+                collect_par_maps_expr(i, out);
+            }
+        }
+        Expr::Str(pieces, _) => {
+            for p in pieces {
+                if let StrPiece::Expr(inner) = p {
+                    collect_par_maps_expr(inner, out);
+                }
+            }
+        }
+        Expr::Closure { body, .. } => collect_par_maps_expr(body, out),
+        Expr::Block(b) => collect_par_maps_block(b, out),
+        Expr::If {
+            cond,
+            then_block,
+            else_branch,
+            ..
+        } => {
+            collect_par_maps_expr(cond, out);
+            collect_par_maps_block(then_block, out);
+            match else_branch.as_deref() {
+                Some(grasm_syntax::ast::ElseBranch::Else(b)) => collect_par_maps_block(b, out),
+                Some(grasm_syntax::ast::ElseBranch::ElseIf(inner)) => {
+                    collect_par_maps_expr(inner, out)
+                }
+                None => {}
+            }
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            collect_par_maps_expr(scrutinee, out);
+            for arm in arms {
+                if let Some(g) = &arm.guard {
+                    collect_par_maps_expr(g, out);
+                }
+                collect_par_maps_expr(&arm.body, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn contribute(qual: &str, active: &[String], ctx: &Ctx, out: &mut BTreeSet<String>) {

@@ -1,0 +1,53 @@
+// Multi-core, and deterministic — not a trade between the two.
+//
+//   grasm build examples/parallel_map.gr --native -o pm && ./pm
+//
+// `par_map` spreads the elements across cores. Two properties make that safe
+// without a race detector, a mutex, or a `Send` bound:
+//
+//   1. The function must be effect-free, and the compiler *proves* it. Try
+//      adding a `print` inside one and the build fails ([T-PAR-MAP-PURE]).
+//   2. Results come back in input order, whatever the core count — so the
+//      answer never depends on the machine it ran on ([E-PAR-MAP-ORDER]).
+//
+// `parallel { spawn { … } }` is the other tool and stays sequential on
+// purpose: its tasks share the enclosing scope, so running them concurrently
+// would race. Structure there, throughput here.
+
+fn mix(seed: i64) -> i64 {
+    var acc = seed
+    var i = 0
+    while i < 2000 {
+        acc = (acc * 1103515245 + 12345) % 2147483648
+        i = i + 1
+    }
+    acc % 1000
+}
+
+fn main() {
+    var xs: [i64] = []
+    for i in 0..100000 {
+        xs.push(i)
+    }
+
+    let mixed = xs.par_map(|x| mix(x))
+    print("{mixed.len()} elements, first={mixed[0]} last={mixed[99999]}")
+
+    // Identical to the sequential map, by construction.
+    print("matches map: {mixed == xs.map(|x| mix(x))}")
+
+    // Captured scalars are copied into each worker.
+    let scale = 3
+    let scaled = xs.par_map(|x| x * scale)
+    print("scaled[10]={scaled[10]}")
+
+    // Floats work the same way.
+    var fs: [f64] = []
+    for i in 0..50000 {
+        fs.push(0.5)
+    }
+    print("sum={fs.par_map(|v| v * 2.0).sum()}")
+
+    // Below the threading threshold this runs on one core — same answer.
+    print("{[1, 2, 3].par_map(|x| x * x)}")
+}

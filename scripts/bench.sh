@@ -17,7 +17,7 @@ mkdir -p "$WORK"
 export GOCACHE="$WORK/gocache"
 trap 'rm -rf "$WORK"' EXIT
 
-PROGRAMS="fib sieve matmul wordfreq sort"
+PROGRAMS="fib sieve matmul wordfreq sort parmap"
 LANGS="c rust go grasm-native grasm-interp python"
 # Repeats per program. Enough to smooth scheduler noise without making the
 # whole run take longer than anyone will wait for.
@@ -67,7 +67,7 @@ run_cmd() {
 echo "building..."
 for p in $PROGRAMS; do
     "$GRASM" build "$BENCH/grasm/$p.gr" --native -o "$WORK/grasm_$p" >/dev/null 2>&1
-    have cc && cc -O2 -o "$WORK/c_$p" "$BENCH/c/$p.c" >/dev/null 2>&1
+    have cc && cc -O2 -pthread -o "$WORK/c_$p" "$BENCH/c/$p.c" >/dev/null 2>&1
     have rustc && rustc -O -o "$WORK/rs_$p" "$BENCH/rust/$p.rs" >/dev/null 2>&1
     have go && go build -o "$WORK/go_$p" "$BENCH/go/$p.go" >/dev/null 2>&1
 done

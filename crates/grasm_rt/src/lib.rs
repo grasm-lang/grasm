@@ -357,6 +357,85 @@ fn grasm_panic_msg_str(msg: &str) -> ! {
     rt_panic(msg);
 }
 
+// --- data parallelism ---
+
+/// Below this length, threading costs more than it saves.
+const PAR_MIN_ELEMS: usize = 4096;
+
+thread_local! {
+    /// Set while a parallel region is running. A `par_map` reached from inside
+    /// another one runs sequentially rather than spawning threads per level.
+    static IN_PARALLEL: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Applies `code` to every element of a scalar list, in parallel.
+///
+/// Deterministic by construction: each worker writes a disjoint index range of
+/// a preallocated output, so the result is identical for any thread count —
+/// including one. The checker has already proved the function is effect-free,
+/// so there is no observable interleaving to worry about either.
+///
+/// `env` is the closure's captured scalars, copied into each worker. Nothing
+/// is shared mutably, so no refcount ever crosses a thread.
+///
+/// # Safety
+/// `code` is a compiler-emitted function pointer; `env` points to `env_len`
+/// readable i64s; `list` is a live scalar list.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_par_map_scalar(
+    list: *mut RtVal,
+    code: extern "C" fn(*const i64, i64) -> i64,
+    env: *const i64,
+    env_len: i64,
+    out_kind: i64,
+) -> *mut RtVal {
+    let RtPayload::ListScalar { data, .. } = &(*list).payload else {
+        grasm_panic_msg_str("par_map on a non-scalar list");
+    };
+    let env_owned: Vec<i64> = if env_len > 0 {
+        std::slice::from_raw_parts(env, env_len as usize).to_vec()
+    } else {
+        Vec::new()
+    };
+    let n = data.len();
+    let mut out: Vec<i64> = vec![0; n];
+
+    let workers = if IN_PARALLEL.with(|f| f.get()) || n < PAR_MIN_ELEMS {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1)
+            .min(n)
+    };
+
+    if workers <= 1 {
+        for (o, &x) in out.iter_mut().zip(data.iter()) {
+            *o = code(env_owned.as_ptr(), x);
+        }
+    } else {
+        let chunk = n.div_ceil(workers);
+        let input: &[i64] = data;
+        std::thread::scope(|scope| {
+            for (ci, slot) in out.chunks_mut(chunk).enumerate() {
+                let src = &input[ci * chunk..ci * chunk + slot.len()];
+                let env_ref = &env_owned;
+                scope.spawn(move || {
+                    IN_PARALLEL.with(|f| f.set(true));
+                    for (o, &x) in slot.iter_mut().zip(src.iter()) {
+                        *o = code(env_ref.as_ptr(), x);
+                    }
+                });
+            }
+        });
+    }
+
+    alloc(RtPayload::ListScalar {
+        kind: ScalarKind::from_i64(out_kind),
+        data: out,
+    })
+}
+
 // --- unboxed scalar lists ---
 
 /// Boxes one inline element, for the paths that hand a value out (Option

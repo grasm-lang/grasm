@@ -64,11 +64,12 @@ Five programs written the same way in Grasm, C, Rust, Go, and Python. Best of
 
 | program  |   C |  Rust |  Go | grasm-native | Python |
 |----------|----:|------:|----:|-------------:|-------:|
-| fib      |  26 |    26 |  27 |       **28** |    152 |
-| sieve    |  27 |    29 |  28 |           58 |    399 |
-| matmul   |  25 |    28 |  31 |           92 |    973 |
-| wordfreq |  52 |    48 |  39 |          181 |    152 |
-| sort     |  58 |    32 |  70 |       **49** |    243 |
+| fib      |  27 |    27 |  27 |       **29** |    155 |
+| sieve    |  28 |    28 |  31 |           58 |    400 |
+| matmul   |  26 |    26 |  31 |           94 |    957 |
+| wordfreq |  52 |    50 |  38 |          182 |    160 |
+| sort     |  60 |    36 |  71 |       **49** |    240 |
+| parmap   |  74 |    73 | 116 |          133 |  3,532 |
 
 `./scripts/bench.sh` builds every implementation, checks each one against the
 interpreter's answer, and refuses to report a timing for a wrong one. Native
@@ -218,14 +219,29 @@ parallel {
 // both tasks are guaranteed complete here
 ```
 
-**Honest limitation: this is concurrency and determinism, not parallelism.**
-Tasks run cooperatively on one thread in spawn order, so the same program
-always produces the same output (which is what MASTERPLAN §8.6 wants for
-reproducible tests) but nothing runs on a second core. Real parallelism needs
-the runtime's `Rc`-based values replaced with `Arc` + `Send`/`Sync`, which
-would slow down all single-threaded code — that trade is a deliberate later
-milestone, not an oversight. Both engines compile `parallel`/`spawn`; what is
-missing is multi-core execution, not the construct.
+**`parallel`/`spawn` is concurrency and determinism, not parallelism — on
+purpose.** Tasks run on one thread in spawn order, so the same program always
+produces the same output. That is not a missing feature: tasks share the
+enclosing scope by design ([E-SPAWN-SHARED]), so running them concurrently
+would race. Structure and reproducibility live here.
+
+Throughput lives in `par_map`:
+
+```grasm
+let out = xs.par_map(|x| expensive(x))    // 5.9x on 8 cores
+```
+
+Two properties make that safe without a `Send` bound, a mutex, or a race
+detector — and both are checked, not hoped for:
+
+- **The function must be effect-free, and the compiler proves it.** Put a
+  `print` inside and the build fails. The effect system already knows what a
+  function does, so parallel-safety is a type-level fact.
+- **Results come back in input order whatever the core count**
+  ([E-PAR-MAP-ORDER]), so the answer never depends on the machine that ran it.
+
+Anything the threaded path cannot take — boxed elements, boxed captures —
+falls back to a sequential map. Slower, never wrong.
 
 `parallel` and `spawn` are *contextual* keywords — they only introduce a scope
 when a block follows, so code that already uses those words as function or

@@ -789,3 +789,49 @@ fn a_list_may_hold_functions_of_the_same_shape() {
         "fn inc(n: i64) -> i64 {\n    n + 1\n}\n\nfn dbl(n: i64) -> i64 {\n    n * 2\n}\n\nfn main() {\n    let fs = [inc, dbl]\n    for g in fs {\n        print(\"{g(1)}\")\n    }\n}\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// par_map
+// ---------------------------------------------------------------------------
+
+#[test]
+fn par_map_types_like_map() {
+    check_ok("fn main() {\n    let xs = [1, 2, 3]\n    let ys: [i64] = xs.par_map(|x| x * 2)\n    print(\"{ys}\")\n}\n");
+    check_ok("fn main() {\n    let xs = [1, 2]\n    let ys: [bool] = xs.par_map(|x| x > 1)\n    print(\"{ys}\")\n}\n");
+}
+
+#[test]
+fn par_map_rejects_an_effectful_function() {
+    // Elements run concurrently, so an effect would interleave differently
+    // between runs. The effect system already knows, so this is a compile
+    // error rather than a race.
+    check_err(
+        "fn main() {\n    let xs = [1, 2]\n    let ys = xs.par_map(|x| {\n        print(\"{x}\")\n        x\n    })\n    print(\"{ys}\")\n}\n",
+        "effect-free",
+    );
+}
+
+#[test]
+fn par_map_rejects_an_effect_reached_indirectly() {
+    // The impurity is a call away, which is exactly the case a hand-written
+    // "does this closure print?" check would miss.
+    check_err(
+        "fn shout(n: i64) -> i64 {\n    print(\"{n}\")\n    n\n}\n\nfn main() {\n    let xs = [1, 2]\n    print(\"{xs.par_map(|x| shout(x))}\")\n}\n",
+        "effect-free",
+    );
+}
+
+#[test]
+fn par_map_rejects_a_user_effect_too() {
+    check_err(
+        "effect Clock {\n    fn now() -> i64\n}\n\nfn main() {\n    let xs = [1, 2]\n    let ys = xs.par_map(|x| x + Clock.now())\n    with Clock handled_by ClockHandler{ now: || 1 } {\n        print(\"{ys}\")\n    }\n}\n",
+        "effect-free",
+    );
+}
+
+#[test]
+fn a_pure_par_map_is_accepted() {
+    check_ok(
+        "fn double(n: i64) -> i64 {\n    n * 2\n}\n\nfn main() {\n    let xs = [1, 2]\n    print(\"{xs.par_map(|x| double(x))}\")\n}\n",
+    );
+}

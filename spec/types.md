@@ -130,6 +130,11 @@ the runtime at `main` and in tests.
 **[T-EFFECT-DISCHARGE]** `with E handled_by h { … }` discharges `E` inside the
 block. Any user effect still outstanding at `main` or in a test is an error.
 
+**[T-PAR-MAP-PURE]** The function given to `par_map` must have an empty effect
+row. Elements are processed concurrently, so an effect would interleave
+differently between runs; requiring purity is what makes the parallelism
+deterministic. This is a compile error, not a race.
+
 **[T-TASK-CAPTURE]** A `spawn` body may only use bindings that already existed
 when the enclosing `parallel` block began, plus the ones it declares itself.
 Tasks run *after* the block finishes, so a binding declared inside it — a loop

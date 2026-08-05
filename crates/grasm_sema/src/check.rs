@@ -1722,6 +1722,21 @@ declare it before `parallel`",
                         }
                         Type::List(Box::new(out))
                     }
+                    "par_map" => {
+                        // Same shape as `map`; the difference is that the
+                        // function must be effect-free (checked in effects.rs)
+                        // so the elements can be processed on several cores
+                        // without any observable interleaving.
+                        let out = self.uni.fresh();
+                        if check_arity(self, 1) {
+                            let f = Type::Fn {
+                                params: vec![elem.clone()],
+                                ret: Box::new(out.clone()),
+                            };
+                            self.check_expr(&args[0], &f);
+                        }
+                        Type::List(Box::new(out))
+                    }
                     "filter" => {
                         if check_arity(self, 1) {
                             let f = Type::Fn {

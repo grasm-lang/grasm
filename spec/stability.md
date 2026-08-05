@@ -119,6 +119,8 @@ May change or be removed in any release. New surface starts here.
 
 - `E-BENCH-WARMUP` — experimental
 - `E-NOT-PARALLEL` — experimental
+- `E-PAR-MAP-ORDER` — experimental
+- `T-PAR-MAP-PURE` — experimental
 - `E-PARALLEL-JOIN` — experimental
 - `E-SPAWN-ORDER` — experimental
 - `E-SPAWN-SHARED` — experimental

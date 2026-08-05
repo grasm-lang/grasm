@@ -1,0 +1,11 @@
+//! tag: T-PAR-MAP-PURE
+//! expect: error
+//! effect-free
+fn main() {
+    let xs = [1, 2, 3]
+    let ys = xs.par_map(|x| {
+        print("{x}")
+        x
+    })
+    print("{ys}")
+}

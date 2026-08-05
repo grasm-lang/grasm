@@ -117,10 +117,15 @@ share results.
 **[E-TASK-PANIC]** A panicking task aborts the whole scope; tasks spawned after
 it do not run.
 
-**[E-NOT-PARALLEL]** Tasks are *not* executed on multiple cores. `parallel`
-provides structure and determinism, not speedup. Multi-core execution is a
-planned change to the value representation, not a property of this
-specification.
+**[E-NOT-PARALLEL]** `parallel`/`spawn` tasks are *not* executed on multiple
+cores. That scope provides structure and determinism, not speedup — tasks share
+the enclosing scope, and running them concurrently would race. Multi-core
+execution of *data* is provided by `par_map` instead.
+
+**[E-PAR-MAP-ORDER]** `xs.par_map(f)` applies `f` to every element, possibly on
+several cores, and returns the results in **input order**. The result does not
+depend on how many cores ran it — including one — so a `par_map` is
+interchangeable with a `map` in every observable way.
 
 ## 9. Ownership at runtime
 
