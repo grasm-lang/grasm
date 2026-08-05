@@ -1,0 +1,19 @@
+//! tag: L-LIB-LIST
+//! expect: output
+//! 3 false 3 -1 3 2
+//! [1, 2, 3] 4 [3, 2, 1] [1, 2] true 1-2-3
+//! 6 1 3
+//! [2, 4, 6] [2, 3, 4] [2, 3]
+//! true true 2
+fn main() {
+    var xs = [3, 1, 2]
+    print("{xs.len()} {xs.is_empty()} {xs[0]} {xs.get(9) ?? 0 - 1} {xs.first() ?? 0} {xs.last() ?? 0}")
+    xs.push(4)
+    let popped = xs.pop() ?? 0
+    xs.sort()
+    // `join` takes [str], so numbers are mapped to text first.
+    print("{xs} {popped} {xs.rev()} {xs.slice(0, 2)} {xs.contains(2)} {xs.map(|v| v.to_str()).join("-")}")
+    print("{xs.sum()} {xs.min() ?? 0} {xs.max() ?? 0}")
+    print("{xs.map(|v| v * 2)} {xs.par_map(|v| v + 1)} {xs.filter(|v| v > 1)}")
+    print("{xs.any(|v| v > 2)} {xs.all(|v| v > 0)} {xs.find(|v| v > 1) ?? 0}")
+}

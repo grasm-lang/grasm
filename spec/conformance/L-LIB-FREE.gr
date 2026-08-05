@@ -1,0 +1,10 @@
+//! tag: L-LIB-FREE
+//! expect: output
+//! 0 true
+fn main() {
+    // `args()` is empty with no `--` arguments; a fresh map has no entries.
+    var m = map()
+    print("{args().len()} {m.is_empty()}")
+    assert(1 + 1 == 2)
+    assert_eq(2 * 2, 4)
+}

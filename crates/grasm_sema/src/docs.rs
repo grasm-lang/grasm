@@ -258,6 +258,41 @@ pub fn type_text(t: &TypeExpr) -> String {
     }
 }
 
+/// Every declaration in a module rendered without its body.
+///
+/// This is the part of a module other modules can depend on. Hashing it lets
+/// an incremental build tell "someone changed a function body" (rebuild only
+/// that module) from "someone changed a signature or a type" (rebuild
+/// everything that could see it). Types and effects share one global
+/// namespace, so they are included regardless of `pub`.
+pub fn module_signature(module: &Module) -> String {
+    let mut out = String::new();
+    for decl in &module.decls {
+        match decl {
+            Decl::Fn(f) => {
+                out.push_str(&fn_signature(f));
+                out.push('\n');
+            }
+            Decl::Type(t) => {
+                out.push_str(&type_signature(t));
+                out.push('\n');
+            }
+            Decl::Effect(e) => {
+                out.push_str(&effect_signature(e));
+                out.push('\n');
+            }
+            Decl::Import(i) => {
+                out.push_str("import ");
+                out.push_str(&i.path.dotted());
+                out.push('\n');
+            }
+            // Tests and benchmarks are not part of any other module's view.
+            Decl::Test(_) | Decl::Bench(_) => {}
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------

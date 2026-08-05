@@ -50,6 +50,12 @@ Will not change incompatibly before 2.0.
 - `L-IDENT` — stable
 - `L-INT` — stable
 - `L-INTERP` — stable
+- `L-LIB-FREE` — provisional
+- `L-LIB-NUM` — provisional
+- `L-LIB-STR` — provisional
+- `L-LIB-LIST` — provisional
+- `L-LIB-MAP` — provisional
+- `L-LIB-OPTION` — provisional
 - `L-KEYWORD` — stable
 - `L-MAXMUNCH` — stable
 - `L-NEWLINE` — stable

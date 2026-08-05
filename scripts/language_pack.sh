@@ -21,7 +21,7 @@ clause has no program, if a program names a clause that does not exist, or if
 any program behaves differently from what it declares. So the rules and the
 examples cannot disagree.
 """]
-for f in ["spec/grammar.md", "spec/types.md", "spec/semantics.md"]:
+for f in ["spec/grammar.md", "spec/types.md", "spec/semantics.md", "spec/library.md"]:
     parts.append(f"\n\n<!-- ===== {f} ===== -->\n\n" + open(f).read())
 parts.append("\n\n<!-- ===== docs/tutorial.md ===== -->\n\n" + open("docs/tutorial.md").read())
 parts.append("\n\n# Conformance programs\n\nOne per normative clause. Each header states the tag it demonstrates and the exact expected behaviour.\n")

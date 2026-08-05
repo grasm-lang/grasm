@@ -1,0 +1,16 @@
+//! tag: L-LIB-STR
+//! expect: output
+//! 11 false
+//! ell abc 2
+//! true true true 6
+//! HeLLo,WorLd x HELLO,WORLD hello,world abab
+//! 007 7.. 2 5 2.5
+fn main() {
+    let s = "Hello,World"
+    print("{s.len()} {s.is_empty()}")
+    // substr is (start, length) — not (start, end).
+    print("{s.substr(1, 3)} {"abcdef".substr(0, 3)} {s.split(",").len()}")
+    print("{s.contains("World")} {s.starts_with("He")} {s.ends_with("ld")} {s.index_of("W") ?? 0 - 1}")
+    print("{s.replace("l", "L")} {"  x ".trim()} {s.to_upper()} {s.to_lower()} {"ab".repeat(2)}")
+    print("{"7".pad_start(3, "0")} {"7".pad_end(3, ".")} {"a\nb".lines().len()} {"5".parse_int() ?? 0} {"2.5".parse_float() ?? 0.0}")
+}

@@ -188,7 +188,7 @@ struct_lit   = identifier "{" ( field_init ( ("," | newline) field_init )* )? "}
 field_init   = identifier ":" expression
 if_expr      = "if" expression block ( "else" ( if_expr | block ) )?
 match_expr   = "match" expression "{" match_arm* "}"
-match_arm    = pattern ( "if" expression )? "->" ( expression | control_stmt )
+match_arm    = pattern ( "if" expression )? "->" ( expression | statement )
 closure      = "|" ( identifier ( "," identifier )* )? "|" ( expression | block )
 ```
 
@@ -198,8 +198,8 @@ closure      = "|" ( identifier ( "," identifier )* )? "|" ( expression | block 
 and `match`, an identifier followed by `{` is *not* a struct literal — the
 brace opens the body. Parenthesize to force a struct literal there.
 
-**[G-ARM-CONTROL]** A match arm body may be `break`, `continue`, or `return`
-directly, without wrapping it in a block.
+**[G-ARM-CONTROL]** A match arm body may be any statement — an assignment or a
+bare `break`, `continue`, or `return` — without wrapping it in a block.
 
 ## 10. Patterns
 

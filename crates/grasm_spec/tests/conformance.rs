@@ -101,7 +101,7 @@ fn all_cases() -> Vec<Case> {
 /// Every tag mentioned in bold brackets in the normative documents.
 fn declared_tags() -> BTreeSet<String> {
     let mut tags = BTreeSet::new();
-    for doc in ["grammar.md", "types.md", "semantics.md"] {
+    for doc in ["grammar.md", "types.md", "semantics.md", "library.md"] {
         let text = std::fs::read_to_string(spec_dir().join(doc))
             .unwrap_or_else(|e| panic!("spec/{doc} should be readable: {e}"));
         // Tags are written as **[X-NAME]**.

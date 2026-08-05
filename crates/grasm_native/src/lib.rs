@@ -151,6 +151,29 @@ pub fn compile_object_for(
     obj_out: &std::path::Path,
     target: Option<&str>,
 ) -> Result<(), String> {
+    compile_object_scoped(program, obj_out, target, None)
+}
+
+/// Compiles just `only_module`'s functions into an object, declaring every
+/// other module's as imports for the linker to resolve.
+///
+/// This is what makes rebuilds incremental: edit one module of a large program
+/// and only that module is re-emitted.
+pub fn compile_module_object(
+    program: &grasm_sema::loader::Program,
+    module: &str,
+    obj_out: &std::path::Path,
+    target: Option<&str>,
+) -> Result<(), String> {
+    compile_object_scoped(program, obj_out, target, Some(module))
+}
+
+fn compile_object_scoped(
+    program: &grasm_sema::loader::Program,
+    obj_out: &std::path::Path,
+    target: Option<&str>,
+    only_module: Option<&str>,
+) -> Result<(), String> {
 
     let mut flags = settings::builder();
     flags.set("is_pic", "true").map_err(|e| e.to_string())?;
@@ -175,6 +198,7 @@ pub fn compile_object_for(
     let mut module = ObjectModule::new(builder);
 
     let mut cg = Codegen::new(&mut module);
+    cg.only_module = only_module.map(str::to_string);
     cg.declare_runtime()?;
     let views: Vec<(String, &AstModule, std::collections::HashMap<String, String>)> = program
         .files
@@ -236,6 +260,11 @@ struct Codegen<'m> {
     current_module: String,
     /// module → (alias → target module)
     module_imports: HashMap<String, HashMap<String, String>>,
+    /// When set, only this module's bodies are emitted; every other module's
+    /// functions are declared as imports and resolved by the linker. That is
+    /// what makes a rebuild proportional to what changed rather than to the
+    /// size of the program.
+    only_module: Option<String>,
     /// Generic functions, kept aside rather than declared. There is no such
     /// thing as a generic machine-code symbol, so each *instantiation* becomes
     /// its own concrete function.
@@ -312,6 +341,7 @@ impl<'m> Codegen<'m> {
             fn_wrappers: HashMap::new(),
             current_module: "main".to_string(),
             module_imports: HashMap::new(),
+            only_module: None,
             generic_fns: HashMap::new(),
             pending_generics: Vec::new(),
             generic_subst: HashMap::new(),
@@ -531,6 +561,9 @@ impl<'m> Codegen<'m> {
         }
         for (name, m, _) in views {
             self.current_module = name.clone();
+            if !self.emitting_current() {
+                continue;
+            }
             for decl in &m.decls {
                 if let Decl::Fn(f) = decl {
                     self.collect_handlers_block(&f.body)?;
@@ -539,6 +572,9 @@ impl<'m> Codegen<'m> {
         }
         for (name, m, _) in views {
             self.current_module = name.clone();
+            if !self.emitting_current() {
+                continue;
+            }
             for decl in &m.decls {
                 if let Decl::Fn(f) = decl {
                     self.compile_fn(f)?;
@@ -571,7 +607,10 @@ impl<'m> Codegen<'m> {
             self.current_module = h.module.clone();
             self.compile_handler(h)?;
         }
-        self.emit_c_main()?;
+        // `main` is emitted once, into the entry module's object.
+        if self.only_module.as_deref().unwrap_or("main") == "main" {
+            self.emit_c_main()?;
+        }
         Ok(())
     }
 
@@ -768,6 +807,25 @@ impl<'m> Codegen<'m> {
         Ok(key)
     }
 
+    /// Linkage for a function defined in `current_module`.
+    ///
+    /// Whole-program builds keep everything local. A per-module build exports
+    /// what it defines and imports the rest, so the objects link together.
+    fn linkage_for_current(&self) -> Linkage {
+        match &self.only_module {
+            None => Linkage::Local,
+            Some(m) if *m == self.current_module => Linkage::Export,
+            Some(_) => Linkage::Import,
+        }
+    }
+
+    fn emitting_current(&self) -> bool {
+        match &self.only_module {
+            None => true,
+            Some(m) => *m == self.current_module,
+        }
+    }
+
     fn declare_fns(&mut self, module_ast: &AstModule) -> CResult<()> {
         for decl in &module_ast.decls {
             match decl {
@@ -815,9 +873,10 @@ impl<'m> Codegen<'m> {
                         self.current_module.replace('.', "_"),
                         f.name.name
                     );
+                    let linkage = self.linkage_for_current();
                     let id = self
                         .module
-                        .declare_function(&sym, Linkage::Local, &sig)
+                        .declare_function(&sym, linkage, &sig)
                         .map_err(|e| Unsupported {
                             span: f.span,
                             what: format!("(module error: {e})"),

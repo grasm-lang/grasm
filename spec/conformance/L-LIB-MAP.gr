@@ -1,0 +1,12 @@
+//! tag: L-LIB-MAP
+//! expect: output
+//! 2 false 1 true [a, b] [1, 2]
+//! true 1
+fn main() {
+    var m = map()
+    m.set("b", 2)
+    m.set("a", 1)
+    print("{m.len()} {m.is_empty()} {m.get("a") ?? 0} {m.has("b")} {m.keys()} {m.values()}")
+    let gone = m.delete("b")
+    print("{gone} {m.len()}")
+}

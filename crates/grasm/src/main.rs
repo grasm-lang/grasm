@@ -204,7 +204,12 @@ fn main() -> ExitCode {
                         }
                     };
                 }
-                return match build_native(&program, &out_path) {
+                let whole = args.iter().any(|a| a == "--no-incremental");
+                return match if whole {
+                    build_native_whole(&program, &out_path)
+                } else {
+                    build_native(&program, &out_path)
+                } {
                     Ok(size) => {
                         println!(
                             "built `{out_path}` natively ({size} bytes, Cranelift)",
@@ -360,6 +365,7 @@ fn main() -> ExitCode {
             eprintln!("  build <file.gr> [-o out]     self-contained executable");
             eprintln!("      --native                 compile to machine code (Cranelift)");
             eprintln!("      --target <triple>        emit a cross-target object file");
+            eprintln!("      --no-incremental         one object, no cache (best for a single build)");
             eprintln!("  doc <file.gr> [-o out.md]    API documentation from `///` comments");
             eprintln!("  fmt <file.gr> [--check]      canonical formatting");
             eprintln!("  lsp                          language server (stdio)");
@@ -595,11 +601,119 @@ fn print_trace(program: &Program, trace: &[grasm_interp::Frame]) {
 // Native builds (`grasm build --native`)
 // ---------------------------------------------------------------------------
 
+/// Cache key for one module's object file.
+///
+/// Two things can invalidate it: the module's own source (its bodies), and the
+/// *signature surface* of the whole program (any function signature, type, or
+/// effect anywhere, since types share a global namespace). Editing a body in
+/// another module changes neither, which is the whole point — that rebuild
+/// reuses this object.
+fn module_cache_key(program: &Program, index: usize, world_sig: &str) -> String {
+    let f = &program.files[index];
+    let mut buf = Vec::new();
+    buf.extend(f.name.as_bytes());
+    buf.push(0);
+    buf.extend(f.src.as_bytes());
+    buf.push(0);
+    buf.extend(world_sig.as_bytes());
+    grasm_pkg::hash::sha256_hex(&buf)
+}
+
+/// The program's whole signature surface, in a stable order.
+fn world_signature(program: &Program) -> String {
+    let mut sigs: Vec<String> = program
+        .files
+        .iter()
+        .map(|f| format!("{}\n{}", f.name, grasm_sema::docs::module_signature(&f.module)))
+        .collect();
+    sigs.sort();
+    sigs.join("\n")
+}
+
 fn build_native(program: &Program, out_path: &str) -> Result<u64, String> {
+    build_native_incremental(program, out_path, true)
+}
+
+/// Whole-program build: one object, no cache. Best for a single build (CI),
+/// where there is no later rebuild to amortize the split against.
+fn build_native_whole(program: &Program, out_path: &str) -> Result<u64, String> {
+    build_native_incremental(program, out_path, false)
+}
+
+/// Compiles each module to its own object, reusing cached ones whose inputs
+/// have not changed, then links them together.
+fn build_native_incremental(
+    program: &Program,
+    out_path: &str,
+    incremental: bool,
+) -> Result<u64, String> {
     let scratch = std::env::temp_dir().join(format!("grasm_native_{}", std::process::id()));
     std::fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
-    let obj = scratch.join("out.o");
-    grasm_native::compile_object(program, &obj)?;
+
+    let mut objects: Vec<std::path::PathBuf> = Vec::new();
+    if incremental && program.files.len() > 1 {
+        // The cache lives beside the output so a clean is `rm -rf`.
+        let cache = std::path::Path::new(out_path)
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join(".grasm-cache");
+        std::fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
+        let world = world_signature(program);
+        let planned: Vec<(String, std::path::PathBuf)> = program
+            .files
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let key = module_cache_key(program, i, &world);
+                (
+                    f.name.clone(),
+                    cache.join(format!("{}-{key}.o", f.name.replace('.', "_"))),
+                )
+            })
+            .collect();
+
+        // Modules are independent once signatures are known, so compile the
+        // stale ones concurrently. Without this a cold build pays for setting
+        // up a code generator per module in series, which costs more than the
+        // whole-program path it replaces.
+        let stale: Vec<&(String, std::path::PathBuf)> =
+            planned.iter().filter(|(_, o)| !o.exists()).collect();
+        if !stale.is_empty() {
+            let workers = std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(1)
+                .min(stale.len());
+            let errors: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            std::thread::scope(|scope| {
+                for _ in 0..workers {
+                    scope.spawn(|| loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some((name, obj)) = stale.get(i) else {
+                            return;
+                        };
+                        if let Err(e) =
+                            grasm_native::compile_module_object(program, name, obj, None)
+                        {
+                            errors.lock().expect("no panics inside").push(e);
+                        }
+                    });
+                }
+            });
+            // Report the first failure deterministically rather than whichever
+            // thread happened to finish first.
+            let mut errs = errors.into_inner().expect("no panics inside");
+            if !errs.is_empty() {
+                errs.sort();
+                return Err(errs.remove(0));
+            }
+        }
+        objects.extend(planned.into_iter().map(|(_, o)| o));
+    } else {
+        let obj = scratch.join("out.o");
+        grasm_native::compile_object(program, &obj)?;
+        objects.push(obj);
+    }
 
     // libgrasm_rt.a sits next to the grasm binary (cargo target dir).
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -612,7 +726,10 @@ fn build_native(program: &Program, out_path: &str) -> Result<u64, String> {
         ));
     }
     let mut link = std::process::Command::new("cc");
-    link.arg(&obj).arg(&rt).arg("-o").arg(out_path);
+    for o in &objects {
+        link.arg(o);
+    }
+    link.arg(&rt).arg("-o").arg(out_path);
     // Strip runtime code the program never calls. The archive carries the
     // whole stdlib surface; a hello-world only needs a sliver of it, and
     // without this every binary pays for all of it (1.5 MB -> ~0.5 MB).

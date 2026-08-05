@@ -203,7 +203,7 @@ struct_lit   = identifier "{" ( field_init ( ("," | newline) field_init )* )? "}
 field_init   = identifier ":" expression
 if_expr      = "if" expression block ( "else" ( if_expr | block ) )?
 match_expr   = "match" expression "{" match_arm* "}"
-match_arm    = pattern ( "if" expression )? "->" ( expression | control_stmt )
+match_arm    = pattern ( "if" expression )? "->" ( expression | statement )
 closure      = "|" ( identifier ( "," identifier )* )? "|" ( expression | block )
 ```
 
@@ -213,8 +213,8 @@ closure      = "|" ( identifier ( "," identifier )* )? "|" ( expression | block 
 and `match`, an identifier followed by `{` is *not* a struct literal — the
 brace opens the body. Parenthesize to force a struct literal there.
 
-**[G-ARM-CONTROL]** A match arm body may be `break`, `continue`, or `return`
-directly, without wrapping it in a block.
+**[G-ARM-CONTROL]** A match arm body may be any statement — an assignment or a
+bare `break`, `continue`, or `return` — without wrapping it in a block.
 
 ## 10. Patterns
 
@@ -550,6 +550,132 @@ without `main` is an error.
 
 **[E-ARGS]** `args()` returns the arguments after `--`, excluding the program
 name.
+
+
+<!-- ===== spec/library.md ===== -->
+
+# Standard Library
+
+Every operation the language provides, by receiver type. There are no imports:
+these are always available.
+
+`spec/conformance/L-LIBRARY.gr` exercises this whole surface, so an entry here
+that stopped being true would fail the test suite.
+
+## 1. Free functions
+
+**[L-LIB-FREE]** Available without a receiver.
+
+| call | type | notes |
+|------|------|-------|
+| `print(x)` | `(T)` | writes `x` then a newline; performs `io` |
+| `input()` | `() -> str` | one line from stdin, without the newline; `io` |
+| `args()` | `() -> [str]` | arguments after `--` |
+| `panic(msg)` | `(str)` | prints `panic: msg`, exits 101 |
+| `assert(c)` | `(bool)` | panics when `c` is false |
+| `assert_eq(a, b)` | `(T, T)` | panics when `a != b` |
+| `fail(e)` | `(E)` | raises the error branch of a `T ! E` |
+| `map()` | `() -> Map[K, V]` | a new empty map |
+| `now_millis()` | `() -> i64` | milliseconds since the epoch; `io` |
+| `env(name)` | `(str) -> Option[str]` | environment variable; `io` |
+| `exit(code)` | `(i64)` | ends the program with that status |
+| `read_file(p)` | `(str) -> Option[str]` | `io` |
+| `write_file(p, s)` | `(str, str)` | `io` |
+| `file_exists(p)` | `(str) -> bool` | `io` |
+
+## 2. `i64` and `f64`
+
+**[L-LIB-NUM]**
+
+| method | type | notes |
+|--------|------|-------|
+| `n.abs()` | `-> i64` / `-> f64` | |
+| `n.min(m)`, `n.max(m)` | `(T) -> T` | |
+| `x.floor()`, `x.ceil()`, `x.round()` | `f64 -> f64` | |
+| `x.sqrt()` | `f64 -> f64` | |
+| `n.to_str()` | `-> str` | |
+| `n.as_f64()` | `i64 -> f64` | widening |
+| `x.as_i64()` | `f64 -> i64` | truncates toward zero |
+
+Conversion is by method, not by a cast or a `int(...)`-style function. A `str`
+becomes a number with `parse_int` / `parse_float`, which return `Option`
+because the text may not be a number.
+
+## 3. `str`
+
+**[L-LIB-STR]** Lengths and offsets are in **characters, not bytes**
+([E-STR-CHARS]).
+
+| method | type | notes |
+|--------|------|-------|
+| `s.len()` | `-> i64` | characters |
+| `s.is_empty()` | `-> bool` | |
+| `s.substr(start, len)` | `(i64, i64) -> str` | **start and length**, not start and end |
+| `s.chars()` | `-> [str]` | one single-character string per element |
+| `s.lines()` | `-> [str]` | splits on newlines; no trailing empty line |
+| `s.split(sep)` | `(str) -> [str]` | |
+| `s.contains(t)`, `s.starts_with(t)`, `s.ends_with(t)` | `(str) -> bool` | |
+| `s.index_of(t)` | `(str) -> Option[i64]` | `None` when absent |
+| `s.replace(from, to)` | `(str, str) -> str` | |
+| `s.trim()` | `-> str` | |
+| `s.to_upper()`, `s.to_lower()` | `-> str` | |
+| `s.repeat(n)` | `(i64) -> str` | |
+| `s.pad_start(w, fill)`, `s.pad_end(w, fill)` | `(i64, str) -> str` | fill repeats and is cut to width ([E-PAD-CYCLE]) |
+| `s.parse_int()` | `-> Option[i64]` | |
+| `s.parse_float()` | `-> Option[f64]` | |
+
+## 4. `[T]`
+
+**[L-LIB-LIST]** Indexing out of bounds panics; `get` returns `Option`
+([E-INDEX-BOUNDS]).
+
+| method | type | notes |
+|--------|------|-------|
+| `xs.len()`, `xs.is_empty()` | | |
+| `xs[i]` | `-> T` | panics when out of range |
+| `xs.get(i)` | `(i64) -> Option[T]` | |
+| `xs.first()`, `xs.last()` | `-> Option[T]` | |
+| `xs.push(v)` | `(T)` | mutates; receiver must be `var` |
+| `xs.pop()` | `-> Option[T]` | mutates |
+| `xs.sort()` | | mutates; ascending. Bools have no order, so sorting them does nothing |
+| `xs.rev()` | `-> [T]` | |
+| `xs.slice(a, b)` | `(i64, i64) -> [T]` | `a` up to but excluding `b` |
+| `xs.contains(v)` | `(T) -> bool` | |
+| `xs.join(sep)` | `(str) -> str` | `[str]` only — map to `str` first |
+| `xs.sum()` | `-> T` | numeric elements |
+| `xs.min()`, `xs.max()` | `-> Option[T]` | `None` when empty; not available for `bool` |
+| `xs.map(f)` | `(T -> U) -> [U]` | |
+| `xs.par_map(f)` | `(T -> U) -> [U]` | multi-core; `f` must be effect-free ([T-PAR-MAP-PURE]) |
+| `xs.filter(f)` | `(T -> bool) -> [T]` | |
+| `xs.any(f)`, `xs.all(f)` | `(T -> bool) -> bool` | short-circuit ([E-SEARCH-SHORTCIRCUIT]) |
+| `xs.find(f)` | `(T -> bool) -> Option[T]` | first match |
+
+## 5. `Map[K, V]`
+
+**[L-LIB-MAP]** Keys are `i64`, `str`, or `bool`. Iteration is in sorted key
+order ([E-MAP-ORDER]).
+
+| method | type | notes |
+|--------|------|-------|
+| `m.len()`, `m.is_empty()` | | |
+| `m.get(k)` | `(K) -> Option[V]` | |
+| `m.set(k, v)` | `(K, V)` | mutates; receiver must be `var` |
+| `m.has(k)` | `(K) -> bool` | |
+| `m.delete(k)` | `(K) -> bool` | mutates; whether it was present |
+| `m.keys()` | `-> [K]` | sorted |
+| `m.values()` | `-> [V]` | in key order |
+
+## 6. `Option[T]`
+
+**[L-LIB-OPTION]**
+
+| form | notes |
+|------|-------|
+| `Some(v)`, `None` | constructors |
+| `o ?? fallback` | the value, or `fallback`; the right side is evaluated only when needed ([E-COALESCE-LAZY]) |
+| `o.is_none()`, `o.is_some()` | |
+| `o.unwrap_or(d)` | same as `??` |
+| `match o { Some(v) -> … None -> … }` | exhaustive |
 
 
 <!-- ===== docs/tutorial.md ===== -->
@@ -1970,6 +2096,110 @@ fn main() {
 fn main() {
     // `type` is reserved and cannot name a variable.
     let type = 1
+}
+```
+
+## `L-LIB-FREE.gr`
+
+```grasm
+//! tag: L-LIB-FREE
+//! expect: output
+//! 0 true
+fn main() {
+    // `args()` is empty with no `--` arguments; a fresh map has no entries.
+    var m = map()
+    print("{args().len()} {m.is_empty()}")
+    assert(1 + 1 == 2)
+    assert_eq(2 * 2, 4)
+}
+```
+
+## `L-LIB-LIST.gr`
+
+```grasm
+//! tag: L-LIB-LIST
+//! expect: output
+//! 3 false 3 -1 3 2
+//! [1, 2, 3] 4 [3, 2, 1] [1, 2] true 1-2-3
+//! 6 1 3
+//! [2, 4, 6] [2, 3, 4] [2, 3]
+//! true true 2
+fn main() {
+    var xs = [3, 1, 2]
+    print("{xs.len()} {xs.is_empty()} {xs[0]} {xs.get(9) ?? 0 - 1} {xs.first() ?? 0} {xs.last() ?? 0}")
+    xs.push(4)
+    let popped = xs.pop() ?? 0
+    xs.sort()
+    // `join` takes [str], so numbers are mapped to text first.
+    print("{xs} {popped} {xs.rev()} {xs.slice(0, 2)} {xs.contains(2)} {xs.map(|v| v.to_str()).join("-")}")
+    print("{xs.sum()} {xs.min() ?? 0} {xs.max() ?? 0}")
+    print("{xs.map(|v| v * 2)} {xs.par_map(|v| v + 1)} {xs.filter(|v| v > 1)}")
+    print("{xs.any(|v| v > 2)} {xs.all(|v| v > 0)} {xs.find(|v| v > 1) ?? 0}")
+}
+```
+
+## `L-LIB-MAP.gr`
+
+```grasm
+//! tag: L-LIB-MAP
+//! expect: output
+//! 2 false 1 true [a, b] [1, 2]
+//! true 1
+fn main() {
+    var m = map()
+    m.set("b", 2)
+    m.set("a", 1)
+    print("{m.len()} {m.is_empty()} {m.get("a") ?? 0} {m.has("b")} {m.keys()} {m.values()}")
+    let gone = m.delete("b")
+    print("{gone} {m.len()}")
+}
+```
+
+## `L-LIB-NUM.gr`
+
+```grasm
+//! tag: L-LIB-NUM
+//! expect: output
+//! 4 2.0 3.0 3.0 3.0
+//! 3 5 7 3 2.0
+fn main() {
+    print("{(0 - 4).abs()} {(2.5).floor()} {(2.1).ceil()} {(2.6).round()} {(9.0).sqrt()}")
+    // Conversion is by method: as_f64 widens, as_i64 truncates.
+    print("{(3).min(5)} {(3).max(5)} {(7).to_str()} {(3.7).as_i64()} {(2).as_f64()}")
+}
+```
+
+## `L-LIB-OPTION.gr`
+
+```grasm
+//! tag: L-LIB-OPTION
+//! expect: output
+//! false 3 true 0
+fn main() {
+    let xs = [3, 1]
+    let o = xs.get(0)
+    print("{o.is_none()} {o.unwrap_or(0)} {xs.get(99).is_none()} {xs.get(99) ?? 0}")
+}
+```
+
+## `L-LIB-STR.gr`
+
+```grasm
+//! tag: L-LIB-STR
+//! expect: output
+//! 11 false
+//! ell abc 2
+//! true true true 6
+//! HeLLo,WorLd x HELLO,WORLD hello,world abab
+//! 007 7.. 2 5 2.5
+fn main() {
+    let s = "Hello,World"
+    print("{s.len()} {s.is_empty()}")
+    // substr is (start, length) — not (start, end).
+    print("{s.substr(1, 3)} {"abcdef".substr(0, 3)} {s.split(",").len()}")
+    print("{s.contains("World")} {s.starts_with("He")} {s.ends_with("ld")} {s.index_of("W") ?? 0 - 1}")
+    print("{s.replace("l", "L")} {"  x ".trim()} {s.to_upper()} {s.to_lower()} {"ab".repeat(2)}")
+    print("{"7".pad_start(3, "0")} {"7".pad_end(3, ".")} {"a\nb".lines().len()} {"5".parse_int() ?? 0} {"2.5".parse_float() ?? 0.0}")
 }
 ```
 
