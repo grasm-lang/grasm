@@ -1,0 +1,18 @@
+//! tag: T-FN-TYPE-ROW
+//! expect: error
+//! expects a function that performs nothing
+// `fn(i64) -> i64` states the empty row, so a function that prints does not
+// fit it. Without this check a function value would be a way to carry an
+// effect past a declared row — which is exactly what it used to be.
+fn shout(n: i64) -> i64 {
+    print("{n}")
+    n
+}
+
+fn apply(f: fn(i64) -> i64, x: i64) -> i64 {
+    f(x)
+}
+
+fn main() {
+    print("{apply(shout, 1)}")
+}

@@ -91,6 +91,12 @@ const INTERESTING_INTS: &[i64] = &[0, 1, -1, 2, -2, 10, 100, i64::MIN, i64::MAX,
 /// reports stay readable) while later ones stress bigger inputs.
 pub fn generate(rng: &mut Rng, te: &TypeExpr, size: u32) -> Value {
     match te {
+        // The checker rejects a property parameter whose type cannot be
+        // generated ([G-TEST-PARAMS]), and a function is one of those — there
+        // is no sensible arbitrary function to invent. This arm exists so the
+        // generator degrades rather than being the thing that panics if that
+        // gate is ever loosened.
+        TypeExpr::Fn { .. } => Value::Unit,
         TypeExpr::List(inner, _) => {
             let n = rng.below(u64::from(size).min(32) + 1) as usize;
             let items = (0..n).map(|_| generate(rng, inner, size)).collect();

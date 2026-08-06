@@ -373,10 +373,26 @@ block. Any user effect still outstanding at `main` or in a test is an error.
 ordinary call syntax and may be stored in a list together when their parameter
 and result types agree.
 
-There is no way to *write* a function type, so a function value's type is only
-ever inferred — from the function it names, or, for a closure bound to a name,
-from how that name is later called. A closure bound to a name and never called
-therefore has nothing to infer its parameter types from, and is an error.
+**[T-FN-TYPE]** `fn(A, B) -> R` is the type of a function value, and may be
+written wherever a type may be — most usefully as a parameter, which is what
+lets a program declare its own higher-order function:
+
+```
+fn apply(f: fn(i64) -> i64, x: i64) -> i64 {
+    f(x)
+}
+```
+
+A closure passed to such a parameter takes its parameter types from it. A
+closure bound to a name and never called, with no function type to take them
+from, still has nothing to infer from and is an error.
+
+**[T-FN-TYPE-ROW]** A function type carries its effect row explicitly:
+`fn(i64) -> i64 / {io}`. **No row means the empty row**, so `fn(i64) -> i64`
+accepts only functions that perform nothing, and passing one that prints is an
+error at the call site. This is the only place a row can be checked rather than
+inferred — a written type has no body to infer from — and without it a function
+value would be a way to carry an effect past a declared row.
 
 **[T-PAR-MAP-PURE]** The function given to a parallel operation — `par_map` or
 `par_filter` — must have an empty effect row. Elements are processed concurrently, so an effect would interleave
@@ -1019,6 +1035,36 @@ fn main() {
 
 The mode lives on the parameter, so the call site stays plain. No lifetimes,
 no borrow annotations on types, no `&`/`&mut` sprinkled through the code.
+
+## 6a. Functions as parameters
+
+`fn(A, B) -> R` is a type, so a program can declare its own higher-order
+function rather than being limited to the built-in ones:
+
+```
+fn apply(f: fn(i64) -> i64, x: i64) -> i64 {
+    f(x)
+}
+
+fn double(n: i64) -> i64 {
+    n * 2
+}
+
+fn main() {
+    print("{apply(double, 5)}")
+    print("{apply(|n| n + 1, 5)}")
+}
+```
+
+A closure passed to such a parameter takes its parameter types from it, so it
+needs no annotation.
+
+The type carries an effect row, and **no row means the empty row**. So
+`fn(i64) -> i64` accepts only functions that perform nothing, and passing one
+that prints is an error where you pass it — not a surprise inside. Write
+`fn(i64) -> i64 / {io}` when the caller should be allowed to hand over
+something effectful. This is the one place a row is written rather than
+inferred, because a type has no body to infer from.
 
 ## 7. Structured concurrency
 
@@ -2838,6 +2884,66 @@ fn main() {
         Ok(v) -> print("ok {v}")
         Err(e) -> print("err {e}")
     }
+}
+```
+
+## `T-FN-TYPE-ROW.gr`
+
+```grasm
+//! tag: T-FN-TYPE-ROW
+//! expect: error
+//! expects a function that performs nothing
+// `fn(i64) -> i64` states the empty row, so a function that prints does not
+// fit it. Without this check a function value would be a way to carry an
+// effect past a declared row — which is exactly what it used to be.
+fn shout(n: i64) -> i64 {
+    print("{n}")
+    n
+}
+
+fn apply(f: fn(i64) -> i64, x: i64) -> i64 {
+    f(x)
+}
+
+fn main() {
+    print("{apply(shout, 1)}")
+}
+```
+
+## `T-FN-TYPE.gr`
+
+```grasm
+//! tag: T-FN-TYPE
+//! expect: output
+//! 10
+//! 6
+//! 12
+//! [2, 4, 6]
+// A program declaring its own higher-order function, which needs a written
+// function type: there is no body to infer a parameter's type from.
+fn apply(f: fn(i64) -> i64, x: i64) -> i64 {
+    f(x)
+}
+
+fn twice(f: fn(i64) -> i64, x: i64) -> i64 {
+    f(f(x))
+}
+
+/// Takes a function and a list, which is `map` written in the language.
+fn over(f: fn(i64) -> i64, xs: [i64]) -> [i64] {
+    xs.map(f)
+}
+
+fn double(n: i64) -> i64 {
+    n * 2
+}
+
+fn main() {
+    print("{apply(double, 5)}")
+    // A closure takes its parameter types from the parameter it is passed to.
+    print("{apply(|n| n + 1, 5)}")
+    print("{twice(double, 3)}")
+    print("{over(double, [1, 2, 3])}")
 }
 ```
 

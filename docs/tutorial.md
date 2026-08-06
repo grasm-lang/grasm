@@ -222,6 +222,36 @@ fn main() {
 The mode lives on the parameter, so the call site stays plain. No lifetimes,
 no borrow annotations on types, no `&`/`&mut` sprinkled through the code.
 
+## 6a. Functions as parameters
+
+`fn(A, B) -> R` is a type, so a program can declare its own higher-order
+function rather than being limited to the built-in ones:
+
+```
+fn apply(f: fn(i64) -> i64, x: i64) -> i64 {
+    f(x)
+}
+
+fn double(n: i64) -> i64 {
+    n * 2
+}
+
+fn main() {
+    print("{apply(double, 5)}")
+    print("{apply(|n| n + 1, 5)}")
+}
+```
+
+A closure passed to such a parameter takes its parameter types from it, so it
+needs no annotation.
+
+The type carries an effect row, and **no row means the empty row**. So
+`fn(i64) -> i64` accepts only functions that perform nothing, and passing one
+that prints is an error where you pass it — not a surprise inside. Write
+`fn(i64) -> i64 / {io}` when the caller should be allowed to hand over
+something effectful. This is the one place a row is written rather than
+inferred, because a type has no body to infer from.
+
 ## 7. Structured concurrency
 
 `parallel` opens a scope; `spawn` adds a task to it. The scope does not exit

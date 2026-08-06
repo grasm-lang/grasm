@@ -135,10 +135,26 @@ block. Any user effect still outstanding at `main` or in a test is an error.
 ordinary call syntax and may be stored in a list together when their parameter
 and result types agree.
 
-There is no way to *write* a function type, so a function value's type is only
-ever inferred — from the function it names, or, for a closure bound to a name,
-from how that name is later called. A closure bound to a name and never called
-therefore has nothing to infer its parameter types from, and is an error.
+**[T-FN-TYPE]** `fn(A, B) -> R` is the type of a function value, and may be
+written wherever a type may be — most usefully as a parameter, which is what
+lets a program declare its own higher-order function:
+
+```
+fn apply(f: fn(i64) -> i64, x: i64) -> i64 {
+    f(x)
+}
+```
+
+A closure passed to such a parameter takes its parameter types from it. A
+closure bound to a name and never called, with no function type to take them
+from, still has nothing to infer from and is an error.
+
+**[T-FN-TYPE-ROW]** A function type carries its effect row explicitly:
+`fn(i64) -> i64 / {io}`. **No row means the empty row**, so `fn(i64) -> i64`
+accepts only functions that perform nothing, and passing one that prints is an
+error at the call site. This is the only place a row can be checked rather than
+inferred — a written type has no body to infer from — and without it a function
+value would be a way to carry an effect past a declared row.
 
 **[T-PAR-MAP-PURE]** The function given to a parallel operation — `par_map` or
 `par_filter` — must have an empty effect row. Elements are processed concurrently, so an effect would interleave

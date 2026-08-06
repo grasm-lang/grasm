@@ -61,6 +61,14 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   minor number carries the weight of a major, the same rule the stability
   policy states for the language.
 
+- **Function types.** `fn(A, B) -> R` may be written wherever a type may be,
+  so a program can declare its own higher-order function — `fn apply(f: fn(i64)
+  -> i64, x: i64)` — instead of being limited to the built-in combinators. A
+  closure passed to such a parameter takes its parameter types from it. The
+  type carries an effect row and **no row means the empty row**, so
+  `fn(i64) -> i64` accepts only functions that perform nothing and an effectful
+  one is rejected where it is passed. That check is what stops a function value
+  from being a way to carry an effect past a declared row.
 - **`grasm publish` and `grasm add`.** `publish` copies a package into a
   registry after checking it against its own ceiling, and **refuses to
   overwrite a version that already exists** — a published version is

@@ -132,6 +132,7 @@ pub fn effects_of_program(program: &crate::loader::Program) -> BTreeSet<String> 
             let mut row = BTreeSet::new();
             let mut active = Vec::new();
             let mut fnb = FnBindings::default();
+            seed_params(&f.params, &mut fnb);
             collect_fn_bindings(&f.body, &ctx, &current, &mut fnb);
             walk_block(&f.body, &current, &mut active, &ctx, &fnb, &mut row);
             let entry = ctx.rows.get_mut(&key).unwrap();
@@ -205,6 +206,7 @@ pub fn check_effects_multi(files: &[ModuleView]) -> Vec<Diagnostic> {
             let mut row = BTreeSet::new();
             let mut active = Vec::new();
             let mut fnb = FnBindings::default();
+            seed_params(&f.params, &mut fnb);
             collect_fn_bindings(&f.body, &ctx, &current, &mut fnb);
             walk_block(&f.body, &current, &mut active, &ctx, &fnb, &mut row);
             let entry = ctx.rows.get_mut(&key).unwrap();
@@ -318,13 +320,17 @@ pub fn check_effects_multi(files: &[ModuleView]) -> Vec<Diagnostic> {
 
     for f in files {
         for d in &f.module.decls {
-            let body = match d {
-                Decl::Fn(fd) => &fd.body,
-                Decl::Test(t) => &t.body,
-                Decl::Bench(b) => &b.body,
+            let (body, params): (&Block, &[Param]) = match d {
+                Decl::Fn(fd) => (&fd.body, &fd.params),
+                Decl::Test(t) => (&t.body, &[]),
+                Decl::Bench(b) => (&b.body, &[]),
                 _ => continue,
             };
-            check_par_map_block(body, &f.name, &ctx, &mut diags);
+            let mut fnb = FnBindings::default();
+            seed_params(params, &mut fnb);
+            collect_fn_bindings(body, &ctx, &f.name, &mut fnb);
+            check_par_map_block(body, &f.name, &ctx, &fnb, &mut diags);
+            check_fn_args_block(body, &f.name, &ctx, &fnb, &mut diags);
         }
     }
 
@@ -370,19 +376,181 @@ fn par_fn_row(
 /// empty is exactly what makes the parallelism deterministic — and because
 /// effects are inferred, this is a compile error rather than a race nobody can
 /// reproduce ([T-PAR-MAP-PURE]).
-fn check_par_map_block(b: &Block, current: &str, ctx: &Ctx, diags: &mut Vec<Diagnostic>) {
-    // The same bindings effect inference uses, so `let f = |x| ...` and
-    // `let f = named` and a function pulled out of a list are all checked the
-    // way the argument written inline is.
-    let mut fnb = FnBindings::default();
-    collect_fn_bindings(b, ctx, current, &mut fnb);
+/// A function passed where a function *type* is expected must fit that type's
+/// declared row.
+///
+/// This is the only place the row can be checked. A function type is written,
+/// not inferred, so nothing else compares what the caller hands over against
+/// what the callee promised — and without it `fn(i64) -> i64`, which says it
+/// performs nothing, would accept a function that prints.
+fn check_fn_args_block(
+    b: &Block,
+    current: &str,
+    ctx: &Ctx,
+    fnb: &FnBindings,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let mut calls = Vec::new();
+    collect_calls_block(b, &mut calls);
+    for (callee, args, _) in calls {
+        let Some(qual) = ctx.resolve_call(current, callee) else {
+            continue;
+        };
+        let decl = ctx.fns[&qual];
+        for (arg, param) in args.iter().zip(&decl.params) {
+            let Some(allowed) = declared_row(&param.ty) else {
+                continue;
+            };
+            let mut row = BTreeSet::new();
+            let mut active = Vec::new();
+            par_fn_row(arg, current, ctx, fnb, &mut active, &mut row);
+            let over: Vec<&String> = row.difference(&allowed).collect();
+            if over.is_empty() {
+                continue;
+            }
+            let list = over
+                .iter()
+                .map(|e| format!("`{e}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let shown = if allowed.is_empty() {
+                "performs nothing".to_string()
+            } else {
+                format!(
+                    "performs only {}",
+                    allowed
+                        .iter()
+                        .map(|e| format!("`{e}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            diags.push(
+                Diagnostic::error(
+                    arg.span(),
+                    format!(
+                        "`{}` expects a function that {shown}, but this one performs {list}",
+                        param.name.name
+                    ),
+                )
+                .with_help(
+                    "widen the parameter's type — `fn(..) -> .. / {io}` — or pass a function that does not perform it",
+                ),
+            );
+        }
+    }
+}
+
+/// Every direct call in a block, as (callee name, args, span).
+fn collect_calls_block<'e>(b: &'e Block, out: &mut Vec<(&'e str, &'e [Expr], Span)>) {
+    for s in &b.stmts {
+        collect_calls_stmt(s, out);
+    }
+}
+
+fn collect_calls_stmt<'e>(s: &'e Stmt, out: &mut Vec<(&'e str, &'e [Expr], Span)>) {
+    match s {
+        Stmt::Let { init, .. } => collect_calls_expr(init, out),
+        Stmt::Assign { target, value, .. } => {
+            collect_calls_expr(target, out);
+            collect_calls_expr(value, out);
+        }
+        Stmt::Return(Some(e), _) | Stmt::Expr(e) => collect_calls_expr(e, out),
+        Stmt::While { cond, body, .. } => {
+            collect_calls_expr(cond, out);
+            collect_calls_block(body, out);
+        }
+        Stmt::For { iter, body, .. } => {
+            collect_calls_expr(iter, out);
+            collect_calls_block(body, out);
+        }
+        Stmt::Parallel { body, .. } | Stmt::Spawn { body, .. } => collect_calls_block(body, out),
+        Stmt::With { handler, body, .. } => {
+            collect_calls_expr(handler, out);
+            collect_calls_block(body, out);
+        }
+        _ => {}
+    }
+}
+
+fn collect_calls_expr<'e>(e: &'e Expr, out: &mut Vec<(&'e str, &'e [Expr], Span)>) {
+    match e {
+        Expr::Call { callee, args, span } => {
+            if let Expr::Ident(id) = &**callee {
+                out.push((id.name.as_str(), args.as_slice(), *span));
+            }
+            for a in args {
+                collect_calls_expr(a, out);
+            }
+        }
+        Expr::Str(pieces, _) => {
+            for p in pieces {
+                if let StrPiece::Expr(i) = p {
+                    collect_calls_expr(i, out);
+                }
+            }
+        }
+        Expr::List(items, _) | Expr::Tuple(items, _) => {
+            for i in items {
+                collect_calls_expr(i, out);
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_calls_expr(lhs, out);
+            collect_calls_expr(rhs, out);
+        }
+        Expr::Unary { expr, .. } | Expr::Try { expr, .. } => collect_calls_expr(expr, out),
+        Expr::MethodCall { recv, args, .. } => {
+            collect_calls_expr(recv, out);
+            for a in args {
+                collect_calls_expr(a, out);
+            }
+        }
+        Expr::Index { recv, index, .. } => {
+            collect_calls_expr(recv, out);
+            collect_calls_expr(index, out);
+        }
+        Expr::Field { recv, .. } => collect_calls_expr(recv, out),
+        Expr::If {
+            cond,
+            then_block,
+            else_branch,
+            ..
+        } => {
+            collect_calls_expr(cond, out);
+            collect_calls_block(then_block, out);
+            match else_branch.as_deref() {
+                Some(ElseBranch::Else(b)) => collect_calls_block(b, out),
+                Some(ElseBranch::ElseIf(inner)) => collect_calls_expr(inner, out),
+                None => {}
+            }
+        }
+        Expr::Block(b) => collect_calls_block(b, out),
+        Expr::Match { scrutinee, arms, .. } => {
+            collect_calls_expr(scrutinee, out);
+            for a in arms {
+                collect_calls_expr(&a.body, out);
+            }
+        }
+        Expr::Closure { body, .. } => collect_calls_expr(body, out),
+        _ => {}
+    }
+}
+
+fn check_par_map_block(
+    b: &Block,
+    current: &str,
+    ctx: &Ctx,
+    fnb: &FnBindings,
+    diags: &mut Vec<Diagnostic>,
+) {
 
     let mut calls = Vec::new();
     collect_par_maps_block(b, &mut calls);
     for (func, span) in calls {
         let mut row = BTreeSet::new();
         let mut active = Vec::new();
-        par_fn_row(func, current, ctx, &fnb, &mut active, &mut row);
+        par_fn_row(func, current, ctx, fnb, &mut active, &mut row);
         if row.is_empty() {
             continue;
         }
@@ -519,6 +687,10 @@ enum FnSource<'a> {
     Named(String),
     /// A closure written in the body.
     Closure(&'a Expr),
+    /// A parameter of function type. Its row is written on the type, because
+    /// there is no body here to infer one from — that declaration is the
+    /// contract the caller is held to.
+    Declared(BTreeSet<String>),
 }
 
 /// Function values bound to names in one function body.
@@ -560,6 +732,29 @@ fn fn_sources<'a>(e: &'a Expr, ctx: &Ctx, current: &str, out: &mut Vec<FnSource<
             }
         }
         _ => {}
+    }
+}
+
+/// The effect row written on a function type, or the empty row when none is.
+///
+/// Empty is the meaningful default: `fn(i64) -> i64` accepts only functions
+/// that perform nothing, so an effectful one passed there is an error rather
+/// than a silent widening of whatever row the caller declared.
+fn declared_row(te: &TypeExpr) -> Option<BTreeSet<String>> {
+    match te {
+        TypeExpr::Fn { effects, .. } => Some(effects.iter().map(|p| p.dotted()).collect()),
+        _ => None,
+    }
+}
+
+/// Parameters of function type, so calling one is attributed to its declared
+/// row instead of to nothing.
+fn seed_params<'a>(params: &[Param], fnb: &mut FnBindings<'a>) {
+    for p in params {
+        if let Some(row) = declared_row(&p.ty) {
+            fnb.by_name
+                .insert(p.name.name.clone(), vec![FnSource::Declared(row)]);
+        }
     }
 }
 
@@ -606,6 +801,7 @@ impl<'a> FnSource<'a> {
         match self {
             FnSource::Named(n) => FnSource::Named(n.clone()),
             FnSource::Closure(e) => FnSource::Closure(e),
+            FnSource::Declared(r) => FnSource::Declared(r.clone()),
         }
     }
 }
@@ -627,6 +823,7 @@ fn indirect_row(
                     contribute(&qual, active, ctx, out);
                 }
             }
+            FnSource::Declared(row) => out.extend(row.iter().cloned()),
             FnSource::Closure(e) => {
                 // A closure has no name to guard recursion with, so its
                 // identity stands in for one.

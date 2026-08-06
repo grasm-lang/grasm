@@ -356,6 +356,13 @@ impl Checker {
     /// TypeExpr → Type. `generics` are the in-scope generic parameter names.
     fn resolve_type(&mut self, te: &TypeExpr, generics: &[String]) -> Type {
         match te {
+            TypeExpr::Fn { params, ret, .. } => {
+                let ps = params.iter().map(|p| self.resolve_type(p, generics)).collect();
+                Type::Fn {
+                    params: ps,
+                    ret: Box::new(self.resolve_type(ret, generics)),
+                }
+            }
             TypeExpr::Name { path, args, span } => {
                 if path.segments.len() > 1 {
                     return self.error(*span, "qualified type paths are not supported yet");

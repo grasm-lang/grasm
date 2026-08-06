@@ -246,6 +246,30 @@ pub fn type_text(t: &TypeExpr) -> String {
                 )
             }
         }
+        TypeExpr::Fn {
+            params,
+            ret,
+            effects,
+            ..
+        } => {
+            let row = if effects.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " / {{{}}}",
+                    effects
+                        .iter()
+                        .map(|p| p.dotted())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            format!(
+                "fn({}) -> {}{row}",
+                params.iter().map(type_text).collect::<Vec<_>>().join(", "),
+                type_text(ret)
+            )
+        }
         TypeExpr::List(inner, _) => format!("[{}]", type_text(inner)),
         TypeExpr::Tuple(items, _) => format!(
             "({})",

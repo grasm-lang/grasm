@@ -195,6 +195,19 @@ pub enum TypeExpr {
     Tuple(Vec<TypeExpr>, Span),
     /// `(E1 | E2)` — used for error unions.
     Union(Vec<TypeExpr>, Span),
+    /// `fn(A, B) -> R`, optionally `/ {io}`.
+    ///
+    /// A function *type* carries its effect row explicitly, because unlike a
+    /// declaration there is no body to infer one from. No row means the empty
+    /// row: `fn(i64) -> i64` accepts only functions that perform nothing, so
+    /// passing an effectful one where a pure one is expected stays an error
+    /// rather than becoming the hole that function values used to be.
+    Fn {
+        params: Vec<TypeExpr>,
+        ret: Box<TypeExpr>,
+        effects: Vec<Path>,
+        span: Span,
+    },
 }
 
 impl TypeExpr {
@@ -203,6 +216,7 @@ impl TypeExpr {
             TypeExpr::Name { span, .. }
             | TypeExpr::List(_, span)
             | TypeExpr::Tuple(_, span)
+            | TypeExpr::Fn { span, .. }
             | TypeExpr::Union(_, span) => *span,
         }
     }

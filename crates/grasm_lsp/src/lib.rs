@@ -544,6 +544,11 @@ pub fn type_text(t: &TypeExpr) -> String {
                 format!("{}[{}]", path.dotted(), a.join(", "))
             }
         }
+        TypeExpr::Fn { params, ret, .. } => format!(
+            "fn({}) -> {}",
+            params.iter().map(type_text).collect::<Vec<_>>().join(", "),
+            type_text(ret)
+        ),
         TypeExpr::List(inner, _) => format!("[{}]", type_text(inner)),
         TypeExpr::Tuple(items, _) => {
             let a: Vec<String> = items.iter().map(type_text).collect();

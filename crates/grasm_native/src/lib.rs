@@ -532,6 +532,13 @@ impl<'m> Codegen<'m> {
                 }
                 nope(*span, format!("the type `{}`", path.dotted()))
             }
+            TypeExpr::Fn { params, ret, .. } => {
+                let mut ps = Vec::with_capacity(params.len());
+                for p in params {
+                    ps.push(self.vtype_of(p)?);
+                }
+                Ok(VType::Fn(ps, Box::new(self.vtype_of(ret)?)))
+            }
             TypeExpr::List(inner, _) => Ok(VType::List(Box::new(self.vtype_of(inner)?))),
             TypeExpr::Tuple(items, _) if items.is_empty() => Ok(VType::Unit),
             TypeExpr::Tuple(items, _) => {
@@ -2875,6 +2882,14 @@ impl FnCx<'_, '_> {
         e: &Expr,
         expected: Option<&VType>,
     ) -> CResult<(Value, VType)> {
+        // A closure literal in argument position gets its parameter types from
+        // the parameter it is being passed to. Before function types existed
+        // there was nowhere for them to come from, and the backend said so.
+        if let (Expr::Closure { params, body, span }, Some(VType::Fn(want_ps, _))) = (e, expected) {
+            if params.len() == want_ps.len() {
+                return self.closure_value_typed(params, body, want_ps, *span);
+            }
+        }
         if let (Expr::List(items, _), Some(VType::List(elem_t))) = (e, expected) {
             if items.is_empty() {
                 let v = self.new_list_of(elem_t);
@@ -3267,7 +3282,7 @@ impl FnCx<'_, '_> {
                         }
                         let mut vals = Vec::with_capacity(args.len());
                         for (a, want) in args.iter().zip(&params) {
-                            let (mut v, vt) = self.eval_expr_val(a)?;
+                            let (mut v, vt) = self.eval_expr_expecting(a, Some(want))?;
                             if *want == VType::F64 && vt == VType::I64 {
                                 v = self.b.ins().fcvt_from_sint(types::F64, v);
                             }
@@ -3316,7 +3331,7 @@ impl FnCx<'_, '_> {
                     let sig_ref = self.b.import_signature(sig);
                     let mut vals = Vec::with_capacity(args.len());
                     for (a, want) in args.iter().zip(&param_ts) {
-                        let (mut v, vt) = self.eval_expr_val(a)?;
+                        let (mut v, vt) = self.eval_expr_expecting(a, Some(want))?;
                         if *want == VType::F64 && vt == VType::I64 {
                             v = self.b.ins().fcvt_from_sint(types::F64, v);
                         }
@@ -3579,7 +3594,7 @@ impl FnCx<'_, '_> {
             }
             (VType::List(e), "any" | "all" | "find") => {
                 let elem_t = (**e).clone();
-                if let Some((param, body)) = self.desugar_fn_arg(&args[0]) {
+                if let Some((param, body)) = self.desugar_fn_arg(&args[0], false) {
                     return self
                         .emit_list_search(rv, &elem_t, &param, &body, m)
                         .map(Some);
@@ -3599,7 +3614,7 @@ impl FnCx<'_, '_> {
             }
             (VType::List(e), "par_filter") => {
                 let elem_t = (**e).clone();
-                if let Some((param, body)) = self.desugar_fn_arg(&args[0]) {
+                if let Some((param, body)) = self.desugar_fn_arg(&args[0], true) {
                     return self
                         .emit_par_filter(rv, &elem_t, &param, &body, span)
                         .map(Some);
@@ -3619,7 +3634,7 @@ impl FnCx<'_, '_> {
             }
             (VType::List(e), "par_map") => {
                 let elem_t = (**e).clone();
-                if let Some((param, body)) = self.desugar_fn_arg(&args[0]) {
+                if let Some((param, body)) = self.desugar_fn_arg(&args[0], true) {
                     return self.emit_par_map(rv, &elem_t, &param, &body, span).map(Some);
                 }
                 let Expr::Closure {
@@ -3637,7 +3652,7 @@ impl FnCx<'_, '_> {
             }
             (VType::List(e), "map" | "filter") => {
                 let elem_t = (**e).clone();
-                if let Some((param, body)) = self.desugar_fn_arg(&args[0]) {
+                if let Some((param, body)) = self.desugar_fn_arg(&args[0], false) {
                     let is_map = m == "map";
                     return self
                         .emit_list_transform(rv, &elem_t, &param, &body, is_map)
@@ -5280,7 +5295,7 @@ impl FnCx<'_, '_> {
 
         let mut vals = vec![env];
         for (a, want) in args.iter().zip(param_ts) {
-            let (mut v, vt) = self.eval_expr_val(a)?;
+            let (mut v, vt) = self.eval_expr_expecting(a, Some(want))?;
             if *want == VType::F64 && vt == VType::I64 {
                 v = self.b.ins().fcvt_from_sint(types::F64, v);
             }
@@ -5325,6 +5340,19 @@ impl FnCx<'_, '_> {
         span: Span,
     ) -> CResult<(Value, VType)> {
         let param_types = self.closure_param_types(params, binding, span)?;
+        self.closure_value_typed(params, body, &param_types, span)
+    }
+
+    /// `make_closure_value` with the parameter types already known — from the
+    /// function type of the parameter the closure is being passed to.
+    fn closure_value_typed(
+        &mut self,
+        params: &[Ident],
+        body: &Expr,
+        param_types: &[VType],
+        span: Span,
+    ) -> CResult<(Value, VType)> {
+        let param_types = param_types.to_vec();
         let captures = self.closure_captures(params, body);
 
         // Probe the body's type with the parameters and captures bound, so the
@@ -5480,13 +5508,19 @@ impl FnCx<'_, '_> {
     /// is also exactly what the effect checker treats the two spellings as.
     ///
     /// Returns `None` when the argument is already a closure, or is neither.
-    fn desugar_fn_arg(&self, arg: &Expr) -> Option<(Ident, Expr)> {
+    fn desugar_fn_arg(&self, arg: &Expr, parallel: bool) -> Option<(Ident, Expr)> {
         let Expr::Ident(id) = arg else {
             return None;
         };
-        // Only a real function, not a local holding one: a local would need
-        // an indirect call, which the worker cannot make.
-        self.lookup_fn(&id.name)?;
+        // A top-level function works everywhere. A *value* of function type —
+        // a parameter, or a local — needs an indirect call, which the
+        // sequential loops can make and the parallel workers cannot.
+        let is_named = self.lookup_fn(&id.name).is_some();
+        let is_fn_value =
+            !parallel && matches!(self.lookup(&id.name), Some((_, VType::Fn(_, _))));
+        if !is_named && !is_fn_value {
+            return None;
+        }
         let span = id.span;
         let param = Ident {
             name: "__par_arg".to_string(),

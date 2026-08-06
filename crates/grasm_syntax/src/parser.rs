@@ -705,6 +705,54 @@ impl Parser {
                 }
                 Ok(TypeExpr::Name { path, args, span })
             }
+            // `fn(A, B) -> R / {io}` — a function type. Parameters have no
+            // names here: a caller of a function-typed parameter names nothing.
+            TokenKind::KwFn => {
+                self.bump();
+                self.expect(&TokenKind::LParen)?;
+                let mut params = Vec::new();
+                loop {
+                    if self.at(&TokenKind::RParen) {
+                        break;
+                    }
+                    params.push(self.parse_type()?);
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                let rp = self.expect(&TokenKind::RParen)?;
+                let mut span = start.merge(rp.span);
+                let ret = if self.eat(&TokenKind::Arrow) {
+                    let t = self.parse_type()?;
+                    span = span.merge(t.span());
+                    Box::new(t)
+                } else {
+                    Box::new(TypeExpr::Tuple(Vec::new(), span))
+                };
+                let mut effects = Vec::new();
+                if self.eat(&TokenKind::Slash) {
+                    self.expect(&TokenKind::LBrace)?;
+                    loop {
+                        self.skip_newlines();
+                        if self.at(&TokenKind::RBrace) {
+                            break;
+                        }
+                        effects.push(self.parse_path()?);
+                        if !self.eat(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                    self.skip_newlines();
+                    let rb = self.expect(&TokenKind::RBrace)?;
+                    span = span.merge(rb.span);
+                }
+                Ok(TypeExpr::Fn {
+                    params,
+                    ret,
+                    effects,
+                    span,
+                })
+            }
             TokenKind::LBracket => {
                 self.bump();
                 let inner = self.parse_type()?;
