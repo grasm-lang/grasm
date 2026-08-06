@@ -9,6 +9,15 @@ checksum, and the harness refuses to report a timing when the checksums
 disagree: an optimizer that deletes the work being measured is the classic way
 a benchmark lies, and a wrong answer is not a fast answer.
 
+It also refuses to run at all on a busy machine. A benchmark taken under load
+does not just come out slower, it comes out slower *unevenly*: absolute times
+inflate, and the multi-core rows collapse, because the speedup being measured
+is competing with whatever else wants the cores. Re-measuring `mandelbrot` at
+load average 5 on 8 cores gave 2.0x where an idle machine gives 5.9x, and C —
+which nobody had touched — moved from 36ms to 58ms in the same run. That reads
+as a regression and is not one, so `BENCH_IGNORE_LOAD=1` is required to record
+numbers taken that way, and they should not be published.
+
 ## What each program measures
 
 | Program    | Stresses                                       |

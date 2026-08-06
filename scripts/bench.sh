@@ -30,6 +30,36 @@ fi
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# A busy machine does not just make everything slower — it makes it slower
+# *unevenly*. Absolute times inflate, and multi-core rows collapse, because
+# the speedup a benchmark is measuring is competing with whatever else wants
+# the cores. Numbers taken that way look like a regression and are not one.
+#
+# The harness already refuses to report a timing for a wrong answer. This is
+# the same rule applied to the other way a benchmark lies.
+LOAD_OK=$(python3 - <<'PY'
+import os
+try:
+    one = os.getloadavg()[0]
+    cpus = os.cpu_count() or 1
+except OSError:
+    print("1 unknown 0 0"); raise SystemExit
+print(f"{1 if one <= cpus * 0.35 else 0} measured {one:.2f} {cpus}")
+PY
+)
+set -- $LOAD_OK
+if [ "$1" = "0" ]; then
+    echo "refusing to benchmark: load average $3 on $4 cores"
+    echo
+    echo "Something else is using this machine. Absolute times will be inflated"
+    echo "and the multi-core rows will understate the speedup, which reads as a"
+    echo "regression that is not there. Wait for the machine to be idle, or set"
+    echo "BENCH_IGNORE_LOAD=1 to record numbers you know not to publish."
+    [ -z "${BENCH_IGNORE_LOAD:-}" ] && exit 1
+    echo
+    echo "BENCH_IGNORE_LOAD set — continuing; these numbers are not publishable."
+fi
+
 # Milliseconds of wall clock for one run, or empty if it failed.
 time_ms() {
     local start end code
