@@ -958,10 +958,48 @@ impl Parser {
             }
             TokenKind::KwFor => {
                 self.bump();
-                let var = self.ident()?;
+                // `for (a, b) in pairs` — the same split `let (a, b) = p`
+                // does, done once per element. It becomes exactly that: a
+                // loop over whole elements whose body opens with the split,
+                // so nothing downstream has to know about it.
+                let mut names: Vec<Ident> = Vec::new();
+                let var = if self.at(&TokenKind::LParen) {
+                    self.bump();
+                    loop {
+                        if self.at(&TokenKind::RParen) {
+                            break;
+                        }
+                        names.push(self.ident()?);
+                        if !self.eat(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                    let rp = self.cur_span();
+                    self.expect(&TokenKind::RParen)?;
+                    Ident {
+                        // Unwritable, so it cannot shadow anything the program
+                        // named, and cannot be read by mistake.
+                        name: "\u{1}each".to_string(),
+                        span: rp,
+                    }
+                } else {
+                    self.ident()?
+                };
                 self.expect(&TokenKind::KwIn)?;
                 let iter = self.parse_cond_expr()?;
-                let body = self.parse_block()?;
+                let mut body = self.parse_block()?;
+                if !names.is_empty() {
+                    let span = var.span;
+                    body.stmts.insert(
+                        0,
+                        Stmt::LetTuple {
+                            mutable: false,
+                            names,
+                            init: Expr::Ident(var.clone()),
+                            span,
+                        },
+                    );
+                }
                 let span = start.merge(body.span);
                 Ok(Stmt::For {
                     var,

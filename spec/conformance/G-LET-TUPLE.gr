@@ -4,6 +4,11 @@
 //! fig=1
 //! pear=2
 //! 3
+//! 3
+//! 0a
+//! 1b
+//! 1x
+//! 2y
 //! 30
 // Binding a tuple's components by name.
 //
@@ -17,12 +22,29 @@ fn main() {
     m.set("pear", 2)
     m.set("fig", 1)
     var total = 0
-    for e in m.entries() {
-        let (k, v) = e
+    // `for (k, v) in …` is exactly the loop below with the split written
+    // into the header instead of the first line of the body.
+    for (k, v) in m.entries() {
         print("{k}={v}")
         total = total + v
     }
     print("{total}")
+
+    // The long form still means the same thing.
+    var again = 0
+    for e in m.entries() {
+        let (k, v) = e
+        again = again + v + k.len() - k.len()
+    }
+    print("{again}")
+
+    // It works over any list of tuples, not just `entries()`.
+    for (i, w) in ["a", "b"].enumerate() {
+        print("{i}{w}")
+    }
+    for (n, w) in [1, 2].zip(["x", "y"]) {
+        print("{n}{w}")
+    }
 
     // `var` binds them mutably.
     var (p, q) = (10, 20)

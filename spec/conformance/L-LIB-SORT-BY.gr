@@ -1,0 +1,45 @@
+//! tag: L-LIB-SORT-BY
+//! expect: output
+//! al 25
+//! cy 30
+//! bo 30
+//! [3, 2, 1]
+//! [a, bb, ccc]
+//! y
+//! z
+//! [7] []
+type P = { name: str, age: i64 }
+
+fn main() {
+    // A list of structs has no order of its own; the key does.
+    var ps = [P{ name: "cy", age: 30 }, P{ name: "al", age: 25 }, P{ name: "bo", age: 30 }]
+    ps.sort_by(|p| p.age)
+    // Stable: `cy` was written before `bo` and both are 30, so it stays first.
+    for p in ps {
+        print("{p.name} {p.age}")
+    }
+    // Any i64/f64/str key works, including a computed one.
+    var ns = [3, 1, 2]
+    ns.sort_by(|n| 0 - n)
+    print("{ns}")
+    var ws = ["ccc", "a", "bb"]
+    ws.sort_by(|w| w.len())
+    print("{ws}")
+    // A key extracted from a named function works the same as a closure.
+    var ps2 = [P{ name: "z", age: 1 }, P{ name: "y", age: 0 }]
+    ps2.sort_by(age_of)
+    for p in ps2 {
+        print("{p.name}")
+    }
+    // An empty list and a single element are both no-ops, not errors.
+    var one = [7]
+    one.sort_by(|n| n)
+    var none: [i64] = []
+    none.sort_by(|n| n)
+    print("{one} {none}")
+}
+
+fn age_of(p: P) -> i64 {
+    p.age
+}
+

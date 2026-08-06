@@ -1,0 +1,34 @@
+//! tag: L-LIB-CODES
+//! expect: output
+//! 104 233
+//! [104, 233, 108, 108, 111]
+//! hé
+//! héllo
+//! 615042
+//! non-bytes: 1 [8364]
+fn main() {
+    // Code points, counted in characters — `é` is one character, two bytes.
+    print("{"héllo".code_at(0)} {"héllo".code_at(1)}")
+    print("{"héllo".codes()}")
+    // And back again.
+    print("{104.to_char()}{233.to_char()}")
+    // A full round trip through integers.
+    var back = ""
+    for c in "héllo".codes() {
+        back = back + c.to_char()
+    }
+    print("{back}")
+    // What the pair makes possible: arithmetic over text.
+    print("{hash("grasm")}")
+    // Characters outside ASCII are one code point, not their byte count.
+    print("non-bytes: {"€".len()} {"€".codes()}")
+}
+
+/// A string hash, which cannot be written without code points at all.
+fn hash(s: str) -> i64 {
+    var h = 0
+    for c in s.codes() {
+        h = (h * 31 + c) % 1000007
+    }
+    h
+}

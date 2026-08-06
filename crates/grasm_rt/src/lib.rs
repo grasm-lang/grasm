@@ -1835,6 +1835,43 @@ pub unsafe extern "C" fn grasm_str_split(s: *mut RtVal, sep: *mut RtVal) -> *mut
 }
 
 /// # Safety: live pointer.
+/// The Unicode code point of character `i`, counting characters not bytes.
+///
+/// # Safety: live pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_code_at(s: *mut RtVal, i: i64) -> i64 {
+    let text = as_str(s);
+    let n = text.chars().count() as i64;
+    if i < 0 || i >= n {
+        rt_panic(&format!("code_at {i} out of bounds (len {n})"));
+    }
+    text.chars().nth(i as usize).expect("in bounds") as i64
+}
+
+/// Every code point, in order.
+///
+/// # Safety: live pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_codes(s: *mut RtVal) -> *mut RtVal {
+    let mut data = ScalarData::new(ScalarKind::I64);
+    for c in as_str(s).chars() {
+        data.push(c as i64);
+    }
+    alloc(RtPayload::ListScalar {
+        kind: ScalarKind::I64,
+        data,
+    })
+}
+
+/// A code point back to a one-character string.
+#[no_mangle]
+pub extern "C" fn grasm_i64_to_char(n: i64) -> *mut RtVal {
+    match u32::try_from(n).ok().and_then(char::from_u32) {
+        Some(c) => alloc(RtPayload::Str(c.to_string())),
+        None => rt_panic(&format!("{n} is not a Unicode code point")),
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn grasm_str_chars(s: *mut RtVal) -> *mut RtVal {
     let items: Vec<*mut RtVal> = as_str(s)
@@ -1993,6 +2030,72 @@ pub unsafe extern "C" fn grasm_list_sort(v: *mut RtVal) -> *mut RtVal {
     target
 }
 
+/// `[(index, element)]`, so a loop can name both.
+///
+/// # Safety: live pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_list_enumerate(v: *mut RtVal) -> *mut RtVal {
+    let n = grasm_list_len(v);
+    let items: Vec<*mut RtVal> = (0..n)
+        .map(|i| alloc(RtPayload::Tuple(vec![grasm_box_i64(i), grasm_list_get(v, i)])))
+        .collect();
+    alloc(RtPayload::List(items))
+}
+
+/// `[(a, b)]` up to the shorter of the two — pairing past the end of one
+/// would have to invent an element.
+///
+/// # Safety: live pointers.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_list_zip(a: *mut RtVal, b: *mut RtVal) -> *mut RtVal {
+    let n = grasm_list_len(a).min(grasm_list_len(b));
+    let items: Vec<*mut RtVal> = (0..n)
+        .map(|i| alloc(RtPayload::Tuple(vec![grasm_list_get(a, i), grasm_list_get(b, i)])))
+        .collect();
+    alloc(RtPayload::List(items))
+}
+
+/// Sorts `v` by a parallel list of keys, one per element, computed by the
+/// caller. Stable, so elements with equal keys keep their written order.
+///
+/// # Safety: live pointers, and `keys` is the same length as `v`.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_list_sort_by(v: *mut RtVal, keys: *mut RtVal) -> *mut RtVal {
+    let n = grasm_list_len(v) as usize;
+    if grasm_list_len(keys) as usize != n {
+        rt_panic("sort_by: one key per element");
+    }
+    // Sort the positions, then permute — the elements themselves may be
+    // unboxed, and the keys may be a different representation again.
+    let mut order: Vec<usize> = (0..n).collect();
+    let key_at = |i: usize| grasm_list_get(keys, i as i64);
+    order.sort_by(|&a, &b| {
+        let (ka, kb) = (key_at(a), key_at(b));
+        let ord = cmp_vals(ka, kb);
+        dec(ka);
+        dec(kb);
+        ord
+    });
+    let target = cow_list(v);
+    match &mut (*target).payload {
+        RtPayload::List(items) => {
+            let src = items.clone();
+            for (dst, &from) in order.iter().enumerate() {
+                items[dst] = src[from];
+            }
+        }
+        RtPayload::ListScalar { kind, data } => {
+            let src = data.slice(0, n);
+            for (dst, &from) in order.iter().enumerate() {
+                data.set(dst, src.get(from));
+            }
+            let _ = kind;
+        }
+        _ => unreachable!(),
+    }
+    target
+}
+
 /// # Safety: live pointer.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_list_slice(v: *mut RtVal, a: i64, b: i64) -> *mut RtVal {
@@ -2024,6 +2127,43 @@ pub unsafe extern "C" fn grasm_list_slice(v: *mut RtVal, a: i64, b: i64) -> *mut
                 ScalarData::new(kind)
             };
             alloc(RtPayload::ListScalar { kind, data: out })
+        }
+    }
+}
+
+/// Concatenation, `a + b`. Both operands keep their own representation, so a
+/// scalar list and a boxed one can meet; the result is boxed only if it has
+/// to be.
+///
+/// # Safety: live pointers.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_list_concat(a: *mut RtVal, b: *mut RtVal) -> *mut RtVal {
+    match (items_of(a), items_of(b)) {
+        (Items::Scalar(ka, da), Items::Scalar(kb, db)) if ka == kb => {
+            let mut out = da.slice(0, da.len());
+            for i in 0..db.len() {
+                out.push(db.get(i));
+            }
+            alloc(RtPayload::ListScalar { kind: ka, data: out })
+        }
+        (ia, ib) => {
+            let mut out: Vec<*mut RtVal> = Vec::new();
+            for items in [ia, ib] {
+                match items {
+                    Items::Boxed(v) => {
+                        for &i in v {
+                            inc(i);
+                            out.push(i);
+                        }
+                    }
+                    Items::Scalar(kind, data) => {
+                        for i in 0..data.len() {
+                            out.push(scalar_box(kind, data.get(i)));
+                        }
+                    }
+                }
+            }
+            alloc(RtPayload::List(out))
         }
     }
 }

@@ -166,8 +166,11 @@ tuple_names   = "(" identifier ( "," identifier )* ")"
 ```
 
 **[G-LET-TUPLE]** `let (a, b) = pair` binds a tuple's components by name. The
-count must match the tuple's arity. This is the only destructuring form: there
-is no `if let`, and patterns elsewhere appear only in `match`.
+count must match the tuple's arity. `for (a, b) in pairs` is the same binding
+done once per element, and means exactly `for e in pairs { let (a, b) = e … }`
+— which is what iterating `entries()`, `enumerate()` or `zip()` otherwise
+costs. Together these are the only destructuring forms: there is no `if let`,
+and patterns elsewhere appear only in `match`.
 
 ```
 assign_stmt   = place ( "=" | "+=" | "-=" | "*=" | "/=" ) expression
@@ -175,7 +178,8 @@ return_stmt   = "return" expression?
 break_stmt    = "break"
 continue_stmt = "continue"
 while_stmt    = "while" expression block
-for_stmt      = "for" identifier "in" expression block
+for_stmt      = "for" ( identifier | "(" identifier ( "," identifier )* ")" )
+                "in" expression block
 with_stmt     = "with" path "handled_by" expression block
 parallel_stmt = "parallel" block
 spawn_stmt    = "spawn" block
@@ -448,11 +452,16 @@ error at the call site. This is the only place a row can be checked rather than
 inferred — a written type has no body to infer from — and without it a function
 value would be a way to carry an effect past a declared row.
 
-**[T-CAPTURE-WRITE]** Assigning to, or calling a mutating method on, a binding
-a closure captured from outside is a compile error. The write would change the
-closure's own copy ([E-CLOSURE-CAPTURE]) and be discarded when the call
-returns, so there is no program for which it is what the author meant. A
-closure's own `var` bindings and its parameters are unaffected.
+**[T-CAPTURE-WRITE]** Assigning to, calling a mutating method on, or passing
+as `inout` a binding a closure captured from outside is a compile error. The
+write would change the closure's own copy ([E-CLOSURE-CAPTURE]) and be
+discarded when the call returns, so there is no program for which it is what
+the author meant. A closure's own `var` bindings and its parameters are
+unaffected.
+
+The `inout` case is the one worth naming separately: the call *runs*, and the
+callee's writes land in a copy the caller cannot read, so the mistake shows up
+as a counter that stays at zero rather than as anything failing.
 
 **[T-PAR-MAP-PURE]** The function given to a parallel operation — `par_map` or
 `par_filter` — must have an empty effect row. Elements are processed concurrently, so an effect would interleave
@@ -596,6 +605,10 @@ the same shape and contents are equal.
 
 **[E-INDEX-BOUNDS]** Indexing a list out of bounds panics with the index and
 the length. `list.get(i)` returns `Option` instead of panicking.
+
+**[E-LIST-CONCAT]** `xs + ys` is a new list holding `xs`'s elements then
+`ys`'s. Neither operand is changed. `+` on lists never means element-wise
+addition.
 
 **[E-MAP-LIT]** `{k: v, ...}` builds a map. Entries are evaluated left to
 right, each key before its own value, and a repeated key keeps the last value
@@ -846,6 +859,16 @@ because the text may not be a number.
 | `s.pad_start(w, fill)`, `s.pad_end(w, fill)` | `(i64, str) -> str` | fill repeats and is cut to width ([E-PAD-CYCLE]) |
 | `s.parse_int()` | `-> Option[i64]` | |
 | `s.parse_float()` | `-> Option[f64]` | |
+| `s.code_at(i)` | `(i64) -> i64` | Unicode code point of character `i`; panics out of range ([L-LIB-CODES]) |
+| `s.codes()` | `-> [i64]` | every code point, in order |
+| `n.to_char()` | `i64 -> str` | a code point back to a one-character string; panics if `n` is not one |
+
+**[L-LIB-CODES]** `s.code_at(i)` and `s.codes()` give Unicode **code points**
+(`char` scalar values), counting characters not bytes, and `n.to_char()` turns
+one back into text. `code_at` panics out of range, like indexing; `to_char`
+panics on a value that is not a code point, surrogates included. Together they
+are what lets a program compute *on* text — hash it, encode it, parse a number
+by hand — rather than only cut and compare it.
 
 ## 4. `[T]`
 
@@ -875,6 +898,21 @@ because the text may not be a number.
 | `xs.par_filter(f)` | `(T -> bool) -> [T]` | multi-core; `f` must be effect-free; input order kept ([E-PAR-FILTER-ORDER]) |
 | `xs.any(f)`, `xs.all(f)` | `(T -> bool) -> bool` | short-circuit ([E-SEARCH-SHORTCIRCUIT]) |
 | `xs.find(f)` | `(T -> bool) -> Option[T]` | first match |
+| `xs + ys` | `([T], [T]) -> [T]` | concatenation, the way `+` joins strings ([E-LIST-CONCAT]) |
+| `xs.sort_by(key)` | `(T -> K)` | mutates; sorts by an extracted `i64`/`f64`/`str` key, stably ([L-LIB-SORT-BY]) |
+| `xs.enumerate()` | `-> [(i64, T)]` | pair each element with its index |
+| `xs.zip(ys)` | `([U]) -> [(T, U)]` | pairs up to the shorter of the two |
+
+**[L-LIB-SORT-BY]** `xs.sort_by(key)` sorts by what `key` returns for each
+element, which is where a list of structs gets its order from — `sort` needs
+the *elements* ordered, and a struct is not. The key must be `i64`, `f64` or
+`str`. The sort is stable: elements with equal keys stay in the order they
+were written.
+
+**[L-LIB-PAIRS]** `xs.enumerate()` pairs each element with its index and
+`xs.zip(ys)` pairs the two lists positionally, stopping at the shorter — there
+is no element to invent past the end of one. Both give `[(A, B)]`, which
+`for (a, b) in …` binds by name ([G-LET-TUPLE]).
 
 ## 5. `Map[K, V]`
 
@@ -1004,27 +1042,75 @@ fn main() {
 `match` must be exhaustive. Adding a variant to `Shape` turns every incomplete
 match into a compile error rather than a surprise at runtime.
 
-A tuple can be split into names:
+A tuple can be split into names, in a `let` or in a loop header:
 
 ```
 fn main() {
     let (a, b) = (1, "two")
     print("{a} {b}")
+
+    for (i, w) in ["x", "y"].enumerate() {
+        print("{i}{w}")
+    }
 }
 ```
 
-That is the only destructuring form — there is no `if let`, and patterns
-elsewhere appear only in `match`. It matters most with maps, where
-`entries()` hands back pairs.
+Those are the only destructuring forms — there is no `if let`, and patterns
+elsewhere appear only in `match`. They matter most with maps, where
+`entries()` hands back pairs, and with `enumerate()` and `zip()`.
 
-Maps iterate in sorted key order, so printing one is deterministic:
+Write a map with `{key: value}`, or build one up from `{}`. Maps iterate in
+sorted key order, so printing one is deterministic — and what it prints is
+what you would type to write it back:
 
 ```
 fn main() {
-    var counts = map()
+    let ripeness = {"pear": 2, "fig": 1}
+    print("{ripeness}")          // {fig: 1, pear: 2} — sorted, every run
+
+    var counts: Map[str, i64] = {}
     counts.set("pear", 2)
-    counts.set("fig", 1)
-    print("{counts}")            // same output on every run
+    print("{counts}")
+}
+```
+
+`{}` is the empty map. Braces holding *statements* are a block, and an empty
+block has no use as an expression, so `()` is how you write unit. The braces
+of `if`, `for`, `while`, `match` and function bodies are always blocks.
+
+Lists join with `+`, and sort by a key you extract — which is how a list of
+structs gets sorted at all, since a struct has no order of its own:
+
+```
+type Run = { name: str, ms: i64 }
+
+fn main() {
+    var runs = [Run{ name: "b", ms: 30 }, Run{ name: "a", ms: 10 }]
+    runs.sort_by(|r| r.ms)
+    for r in runs {
+        print("{r.name} {r.ms}")
+    }
+
+    let all = [1, 2] + [3]
+    print("{all}")
+}
+```
+
+Text is characters, not bytes, and `code_at` / `codes` / `to_char` move
+between a character and its Unicode code point — which is what lets you
+compute on text rather than only cut and compare it:
+
+```
+fn hash(s: str) -> i64 {
+    var h = 0
+    for c in s.codes() {
+        h = (h * 31 + c) % 1000007
+    }
+    h
+}
+
+fn main() {
+    print("{hash("grasm")} {104.to_char()}")
 }
 ```
 
@@ -1710,6 +1796,41 @@ fn main() {
     var xs = [1]
     add(xs, 2)
     print("{n} {xs}")
+}
+```
+
+## `E-LIST-CONCAT.gr`
+
+```grasm
+//! tag: E-LIST-CONCAT
+//! expect: output
+//! [1, 2, 3]
+//! [a, b, c]
+//! [1.5, 2.5] [true, false]
+//! [1] [1] []
+//! [1, 2] [3] 3 kept
+//! [[1], [2], [3]]
+//! [0, 1, 4]
+fn main() {
+    print("{[1, 2] + [3]}")
+    print("{["a"] + ["b", "c"]}")
+    print("{[1.5] + [2.5]} {[true] + [false]}")
+    // An empty operand on either side, and both.
+    let e: [i64] = []
+    print("{e + [1]} {[1] + e} {e + e}")
+    // Neither operand is changed.
+    let a = [1, 2]
+    let b = [3]
+    let joined = a + b
+    print("{a} {b} {joined.len()} kept")
+    // Lists of lists concatenate as lists, not element-wise.
+    print("{[[1], [2]] + [[3]]}")
+    // Building up in a loop.
+    var acc: [i64] = []
+    for i in 0..3 {
+        acc = acc + [i * i]
+    }
+    print("{acc}")
 }
 ```
 
@@ -2404,6 +2525,11 @@ type Box = { n: i64 }
 //! fig=1
 //! pear=2
 //! 3
+//! 3
+//! 0a
+//! 1b
+//! 1x
+//! 2y
 //! 30
 // Binding a tuple's components by name.
 //
@@ -2417,12 +2543,29 @@ fn main() {
     m.set("pear", 2)
     m.set("fig", 1)
     var total = 0
-    for e in m.entries() {
-        let (k, v) = e
+    // `for (k, v) in …` is exactly the loop below with the split written
+    // into the header instead of the first line of the body.
+    for (k, v) in m.entries() {
         print("{k}={v}")
         total = total + v
     }
     print("{total}")
+
+    // The long form still means the same thing.
+    var again = 0
+    for e in m.entries() {
+        let (k, v) = e
+        again = again + v + k.len() - k.len()
+    }
+    print("{again}")
+
+    // It works over any list of tuples, not just `entries()`.
+    for (i, w) in ["a", "b"].enumerate() {
+        print("{i}{w}")
+    }
+    for (n, w) in [1, 2].zip(["x", "y"]) {
+        print("{n}{w}")
+    }
 
     // `var` binds them mutably.
     var (p, q) = (10, 20)
@@ -2816,6 +2959,45 @@ fn main() {
 }
 ```
 
+## `L-LIB-CODES.gr`
+
+```grasm
+//! tag: L-LIB-CODES
+//! expect: output
+//! 104 233
+//! [104, 233, 108, 108, 111]
+//! hé
+//! héllo
+//! 615042
+//! non-bytes: 1 [8364]
+fn main() {
+    // Code points, counted in characters — `é` is one character, two bytes.
+    print("{"héllo".code_at(0)} {"héllo".code_at(1)}")
+    print("{"héllo".codes()}")
+    // And back again.
+    print("{104.to_char()}{233.to_char()}")
+    // A full round trip through integers.
+    var back = ""
+    for c in "héllo".codes() {
+        back = back + c.to_char()
+    }
+    print("{back}")
+    // What the pair makes possible: arithmetic over text.
+    print("{hash("grasm")}")
+    // Characters outside ASCII are one code point, not their byte count.
+    print("non-bytes: {"€".len()} {"€".codes()}")
+}
+
+/// A string hash, which cannot be written without code points at all.
+fn hash(s: str) -> i64 {
+    var h = 0
+    for c in s.codes() {
+        h = (h * 31 + c) % 1000007
+    }
+    h
+}
+```
+
 ## `L-LIB-FREE.gr`
 
 ```grasm
@@ -2919,6 +3101,88 @@ fn main() {
     // For when absence is a bug rather than a case: the message is required,
     // because a panic nobody can read is not better than the `??` it replaced.
     print("{xs.first().expect("a two-element list has a first")}")
+}
+```
+
+## `L-LIB-PAIRS.gr`
+
+```grasm
+//! tag: L-LIB-PAIRS
+//! expect: output
+//! [(0, a), (1, b), (2, c)]
+//! [(1, x), (2, y)]
+//! [] []
+//! a0 b1 c2
+//! 1x 2y
+fn main() {
+    let ws = ["a", "b", "c"]
+    print("{ws.enumerate()}")
+    // `zip` stops at the shorter of the two — pairing past the end of one
+    // would have to invent an element.
+    print("{[1, 2, 3].zip(["x", "y"])}")
+    // Empty on either side gives empty.
+    let none: [i64] = []
+    print("{none.enumerate()} {none.zip(ws)}")
+    // What they are for: naming both halves in the loop header.
+    var out: [str] = []
+    for (i, w) in ws.enumerate() {
+        out.push("{w}{i}")
+    }
+    print("{out.join(" ")}")
+    var pairs: [str] = []
+    for (n, w) in [1, 2].zip(["x", "y"]) {
+        pairs.push("{n}{w}")
+    }
+    print("{pairs.join(" ")}")
+}
+```
+
+## `L-LIB-SORT-BY.gr`
+
+```grasm
+//! tag: L-LIB-SORT-BY
+//! expect: output
+//! al 25
+//! cy 30
+//! bo 30
+//! [3, 2, 1]
+//! [a, bb, ccc]
+//! y
+//! z
+//! [7] []
+type P = { name: str, age: i64 }
+
+fn main() {
+    // A list of structs has no order of its own; the key does.
+    var ps = [P{ name: "cy", age: 30 }, P{ name: "al", age: 25 }, P{ name: "bo", age: 30 }]
+    ps.sort_by(|p| p.age)
+    // Stable: `cy` was written before `bo` and both are 30, so it stays first.
+    for p in ps {
+        print("{p.name} {p.age}")
+    }
+    // Any i64/f64/str key works, including a computed one.
+    var ns = [3, 1, 2]
+    ns.sort_by(|n| 0 - n)
+    print("{ns}")
+    var ws = ["ccc", "a", "bb"]
+    ws.sort_by(|w| w.len())
+    print("{ws}")
+    // A key extracted from a named function works the same as a closure.
+    var ps2 = [P{ name: "z", age: 1 }, P{ name: "y", age: 0 }]
+    ps2.sort_by(age_of)
+    for p in ps2 {
+        print("{p.name}")
+    }
+    // An empty list and a single element are both no-ops, not errors.
+    var one = [7]
+    one.sort_by(|n| n)
+    var none: [i64] = []
+    none.sort_by(|n| n)
+    print("{one} {none}")
+}
+
+fn age_of(p: P) -> i64 {
+    p.age
 }
 ```
 

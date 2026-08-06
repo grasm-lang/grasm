@@ -1,0 +1,28 @@
+//! tag: L-LIB-PAIRS
+//! expect: output
+//! [(0, a), (1, b), (2, c)]
+//! [(1, x), (2, y)]
+//! [] []
+//! a0 b1 c2
+//! 1x 2y
+fn main() {
+    let ws = ["a", "b", "c"]
+    print("{ws.enumerate()}")
+    // `zip` stops at the shorter of the two — pairing past the end of one
+    // would have to invent an element.
+    print("{[1, 2, 3].zip(["x", "y"])}")
+    // Empty on either side gives empty.
+    let none: [i64] = []
+    print("{none.enumerate()} {none.zip(ws)}")
+    // What they are for: naming both halves in the loop header.
+    var out: [str] = []
+    for (i, w) in ws.enumerate() {
+        out.push("{w}{i}")
+    }
+    print("{out.join(" ")}")
+    var pairs: [str] = []
+    for (n, w) in [1, 2].zip(["x", "y"]) {
+        pairs.push("{n}{w}")
+    }
+    print("{pairs.join(" ")}")
+}

@@ -1231,6 +1231,22 @@ impl<'a, W: Write> Interp<'a, W> {
             }
         }
         // Mutating list/map methods need place semantics.
+        if name.name == "sort_by" {
+            let Value::List(items) = self.eval_expr(recv)? else {
+                return Err(Flow::Panic("sort_by on a non-list".into()));
+            };
+            let f = self.eval_expr(&args[0])?;
+            let mut keyed: Vec<(Value, Value)> = Vec::with_capacity(items.len());
+            for item in items.iter() {
+                let k = self.call_value(f.clone(), vec![item.clone()], "sort_by")?;
+                keyed.push((k, item.clone()));
+            }
+            // Stable, so equal keys keep their written order.
+            keyed.sort_by(|a, b| compare_values(&a.0, &b.0));
+            let sorted: Vec<Value> = keyed.into_iter().map(|(_, v)| v).collect();
+            self.assign_place(recv, Value::List(Rc::new(sorted)))?;
+            return Ok(Value::Unit);
+        }
         if matches!(name.name.as_str(), "push" | "pop" | "sort" | "set" | "delete") {
             if let Some(r) = self.try_mutating_method(recv, name, args)? {
                 return Ok(r);
@@ -1544,6 +1560,25 @@ impl<'a, W: Write> Interp<'a, W> {
                     None => Value::none(),
                 }
             }
+            (Value::List(items), "enumerate") => Value::List(Rc::new(
+                items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| Value::Tuple(Rc::new(vec![Value::Int(i as i64), v.clone()])))
+                    .collect(),
+            )),
+            (Value::List(items), "zip") => {
+                let Value::List(other) = self.eval_expr(&args[0])? else {
+                    return Err(Flow::Panic("zip expects a list".into()));
+                };
+                Value::List(Rc::new(
+                    items
+                        .iter()
+                        .zip(other.iter())
+                        .map(|(a, b)| Value::Tuple(Rc::new(vec![a.clone(), b.clone()])))
+                        .collect(),
+                ))
+            }
             (Value::List(items), "rev") => {
                 let mut v: Vec<Value> = items.as_ref().clone();
                 v.reverse();
@@ -1672,6 +1707,27 @@ impl<'a, W: Write> Interp<'a, W> {
             (Value::Str(s), "parse_float") => match s.trim().parse::<f64>() {
                 Ok(v) => Value::some(Value::Float(v)),
                 Err(_) => Value::none(),
+            },
+            (Value::Str(s), "code_at") => {
+                let Value::Int(i) = self.eval_expr(&args[0])? else {
+                    return Err(Flow::Panic("code_at expects an integer".into()));
+                };
+                let n = s.chars().count() as i64;
+                if i < 0 || i >= n {
+                    return Err(Flow::Panic(format!(
+                        "code_at {i} out of bounds (len {n})"
+                    )));
+                }
+                Value::Int(s.chars().nth(i as usize).expect("in bounds") as i64)
+            }
+            (Value::Str(s), "codes") => {
+                Value::List(Rc::new(s.chars().map(|c| Value::Int(c as i64)).collect()))
+            }
+            (Value::Int(i), "to_char") => match u32::try_from(*i).ok().and_then(char::from_u32) {
+                Some(c) => Value::str(c.to_string()),
+                None => {
+                    return Err(Flow::Panic(format!("{i} is not a Unicode code point")))
+                }
             },
             (Value::Int(i), "as_f64") => Value::Float(*i as f64),
             (Value::Int(i), "abs") => Value::Int(i.abs()),
@@ -1856,6 +1912,12 @@ impl<'a, W: Write> Interp<'a, W> {
                 GtEq => Value::Bool(a >= b),
                 _ => return Err(Flow::Panic("invalid string operation".into())),
             }),
+            (Value::List(a), Value::List(b)) if op == Add => {
+                let mut out = Vec::with_capacity(a.len() + b.len());
+                out.extend(a.iter().cloned());
+                out.extend(b.iter().cloned());
+                Ok(Value::List(Rc::new(out)))
+            }
             _ => Err(Flow::Panic(format!(
                 "invalid operands `{l}` and `{r}`"
             ))),

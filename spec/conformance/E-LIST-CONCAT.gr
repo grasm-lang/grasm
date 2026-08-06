@@ -1,0 +1,30 @@
+//! tag: E-LIST-CONCAT
+//! expect: output
+//! [1, 2, 3]
+//! [a, b, c]
+//! [1.5, 2.5] [true, false]
+//! [1] [1] []
+//! [1, 2] [3] 3 kept
+//! [[1], [2], [3]]
+//! [0, 1, 4]
+fn main() {
+    print("{[1, 2] + [3]}")
+    print("{["a"] + ["b", "c"]}")
+    print("{[1.5] + [2.5]} {[true] + [false]}")
+    // An empty operand on either side, and both.
+    let e: [i64] = []
+    print("{e + [1]} {[1] + e} {e + e}")
+    // Neither operand is changed.
+    let a = [1, 2]
+    let b = [3]
+    let joined = a + b
+    print("{a} {b} {joined.len()} kept")
+    // Lists of lists concatenate as lists, not element-wise.
+    print("{[[1], [2]] + [[3]]}")
+    // Building up in a loop.
+    var acc: [i64] = []
+    for i in 0..3 {
+        acc = acc + [i * i]
+    }
+    print("{acc}")
+}

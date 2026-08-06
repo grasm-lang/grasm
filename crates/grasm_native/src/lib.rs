@@ -400,6 +400,13 @@ impl<'m> Codegen<'m> {
             ("grasm_val_dec", vec![i64t], None),
             ("grasm_str_lit", vec![ptr, i64t], Some(i64t)),
             ("grasm_str_concat", vec![i64t, i64t], Some(i64t)),
+            ("grasm_list_concat", vec![i64t, i64t], Some(i64t)),
+            ("grasm_list_sort_by", vec![i64t, i64t], Some(i64t)),
+            ("grasm_list_enumerate", vec![i64t], Some(i64t)),
+            ("grasm_list_zip", vec![i64t, i64t], Some(i64t)),
+            ("grasm_str_code_at", vec![i64t, i64t], Some(i64t)),
+            ("grasm_str_codes", vec![i64t], Some(i64t)),
+            ("grasm_i64_to_char", vec![i64t], Some(i64t)),
             ("grasm_str_from_i64", vec![i64t], Some(i64t)),
             ("grasm_str_from_f64", vec![f64t], Some(i64t)),
             ("grasm_str_from_bool", vec![i8t], Some(i64t)),
@@ -3473,7 +3480,7 @@ impl FnCx<'_, '_> {
         span: Span,
     ) -> CResult<Option<(Value, VType)>> {
         // Mutating map/list methods on a variable receiver.
-        if matches!(name.name.as_str(), "set" | "delete" | "pop" | "sort") {
+        if matches!(name.name.as_str(), "set" | "delete" | "pop" | "sort" | "sort_by") {
             if let Expr::Ident(id) = recv {
                 if let Some((var, vt)) = self.lookup(&id.name) {
                     match (&vt, name.name.as_str()) {
@@ -3538,6 +3545,36 @@ impl FnCx<'_, '_> {
                             let cur = self.b.use_var(var);
                             let np = self.call_rt("grasm_list_sort", &[cur]).unwrap();
                             self.b.def_var(var, np);
+                            return Ok(None);
+                        }
+                        // Sorting by an extracted key: build the keys with the
+                        // same loop `map` uses, then sort by them. The
+                        // comparison stays in the runtime, so the key function
+                        // runs exactly once per element.
+                        (VType::List(e), "sort_by") => {
+                            let elem_t = (**e).clone();
+                            let (param, body) = match self.desugar_fn_arg(&args[0], false) {
+                                Some(pb) => pb,
+                                None => match &args[0] {
+                                    Expr::Closure { params, body, .. } if params.len() == 1 => {
+                                        (params[0].clone(), (**body).clone())
+                                    }
+                                    other => {
+                                        return nope(
+                                            other.span(),
+                                            "sort_by with something other than a one-argument function",
+                                        )
+                                    }
+                                },
+                            };
+                            let cur = self.b.use_var(var);
+                            self.call_rt("grasm_val_inc", &[cur]);
+                            let (keys, _) =
+                                self.emit_list_transform(cur, &elem_t, &param, &body, true)?;
+                            let cur2 = self.b.use_var(var);
+                            let np = self.call_rt("grasm_list_sort_by", &[cur2, keys]).unwrap();
+                            self.b.def_var(var, np);
+                            self.call_rt("grasm_val_dec", &[keys]);
                             return Ok(None);
                         }
                         _ => {}
@@ -3918,6 +3955,21 @@ impl FnCx<'_, '_> {
                 self.call_rt("grasm_val_dec", &[rv]);
                 (v, VType::Str)
             }
+            (VType::Str, "code_at") => {
+                let n = arg_scalar!(0, VType::I64);
+                let v = self.call_rt("grasm_str_code_at", &[rv, n]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                (v, VType::I64)
+            }
+            (VType::Str, "codes") => {
+                let v = self.call_rt("grasm_str_codes", &[rv]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                (v, VType::List(Box::new(VType::I64)))
+            }
+            (VType::I64, "to_char") => {
+                let v = self.call_rt("grasm_i64_to_char", &[rv]).unwrap();
+                (v, VType::Str)
+            }
             (VType::Str, "repeat") => {
                 let n = arg_scalar!(0, VType::I64);
                 let v = self.call_rt("grasm_str_repeat", &[rv, n]).unwrap();
@@ -4118,6 +4170,23 @@ impl FnCx<'_, '_> {
                 return self
                     .emit_list_fold(rv, &elem_t, &args[0], &ap, &ep, &fbody)
                     .map(Some);
+            }
+            (VType::List(e), "enumerate") => {
+                let pair = VType::Tuple(vec![VType::I64, (**e).clone()]);
+                let v = self.call_rt("grasm_list_enumerate", &[rv]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                (v, VType::List(Box::new(pair)))
+            }
+            (VType::List(e), "zip") => {
+                let (ov, ovt) = self.eval_expr_val(&args[0])?;
+                let VType::List(oe) = ovt.clone() else {
+                    return nope(args[0].span(), "zip with a non-list");
+                };
+                let pair = VType::Tuple(vec![(**e).clone(), (*oe).clone()]);
+                let v = self.call_rt("grasm_list_zip", &[rv, ov]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                self.call_rt("grasm_val_dec", &[ov]);
+                (v, VType::List(Box::new(pair)))
             }
             (VType::List(e), "map" | "filter") => {
                 let elem_t = (**e).clone();
@@ -4379,6 +4448,13 @@ impl FnCx<'_, '_> {
             return nope(span, "mixed-type operation");
         }
         use BinaryOp::*;
+        // Lists concatenate with `+`, the way strings do.
+        if let (VType::List(_), Add) = (&lt, op) {
+            let v = self.call_rt("grasm_list_concat", &[lv, rv]).unwrap();
+            self.call_rt("grasm_val_dec", &[lv]);
+            self.call_rt("grasm_val_dec", &[rv]);
+            return Ok((v, lt));
+        }
         // Strings.
         if lt == VType::Str {
             let out = match op {
@@ -5420,7 +5496,9 @@ impl FnCx<'_, '_> {
                 "is_some" | "is_none" | "is_empty" | "contains" | "starts_with"
                 | "ends_with" | "has" | "delete" | "any" | "all" => VType::Bool,
                 "to_str" | "join" | "trim" | "to_upper" | "to_lower" | "replace"
-                | "substr" | "repeat" | "pad_start" | "pad_end" => VType::Str,
+                | "substr" | "repeat" | "pad_start" | "pad_end" | "to_char" => VType::Str,
+                "code_at" => VType::I64,
+                "codes" => VType::List(Box::new(VType::I64)),
                 "as_f64" => VType::F64,
                 "as_i64" => VType::I64,
                 // Numeric methods. Their absence here did not merely make a

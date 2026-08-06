@@ -151,8 +151,11 @@ tuple_names   = "(" identifier ( "," identifier )* ")"
 ```
 
 **[G-LET-TUPLE]** `let (a, b) = pair` binds a tuple's components by name. The
-count must match the tuple's arity. This is the only destructuring form: there
-is no `if let`, and patterns elsewhere appear only in `match`.
+count must match the tuple's arity. `for (a, b) in pairs` is the same binding
+done once per element, and means exactly `for e in pairs { let (a, b) = e … }`
+— which is what iterating `entries()`, `enumerate()` or `zip()` otherwise
+costs. Together these are the only destructuring forms: there is no `if let`,
+and patterns elsewhere appear only in `match`.
 
 ```
 assign_stmt   = place ( "=" | "+=" | "-=" | "*=" | "/=" ) expression
@@ -160,7 +163,8 @@ return_stmt   = "return" expression?
 break_stmt    = "break"
 continue_stmt = "continue"
 while_stmt    = "while" expression block
-for_stmt      = "for" identifier "in" expression block
+for_stmt      = "for" ( identifier | "(" identifier ( "," identifier )* ")" )
+                "in" expression block
 with_stmt     = "with" path "handled_by" expression block
 parallel_stmt = "parallel" block
 spawn_stmt    = "spawn" block

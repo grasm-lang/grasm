@@ -111,6 +111,16 @@ because the text may not be a number.
 | `s.pad_start(w, fill)`, `s.pad_end(w, fill)` | `(i64, str) -> str` | fill repeats and is cut to width ([E-PAD-CYCLE]) |
 | `s.parse_int()` | `-> Option[i64]` | |
 | `s.parse_float()` | `-> Option[f64]` | |
+| `s.code_at(i)` | `(i64) -> i64` | Unicode code point of character `i`; panics out of range ([L-LIB-CODES]) |
+| `s.codes()` | `-> [i64]` | every code point, in order |
+| `n.to_char()` | `i64 -> str` | a code point back to a one-character string; panics if `n` is not one |
+
+**[L-LIB-CODES]** `s.code_at(i)` and `s.codes()` give Unicode **code points**
+(`char` scalar values), counting characters not bytes, and `n.to_char()` turns
+one back into text. `code_at` panics out of range, like indexing; `to_char`
+panics on a value that is not a code point, surrogates included. Together they
+are what lets a program compute *on* text — hash it, encode it, parse a number
+by hand — rather than only cut and compare it.
 
 ## 4. `[T]`
 
@@ -140,6 +150,21 @@ because the text may not be a number.
 | `xs.par_filter(f)` | `(T -> bool) -> [T]` | multi-core; `f` must be effect-free; input order kept ([E-PAR-FILTER-ORDER]) |
 | `xs.any(f)`, `xs.all(f)` | `(T -> bool) -> bool` | short-circuit ([E-SEARCH-SHORTCIRCUIT]) |
 | `xs.find(f)` | `(T -> bool) -> Option[T]` | first match |
+| `xs + ys` | `([T], [T]) -> [T]` | concatenation, the way `+` joins strings ([E-LIST-CONCAT]) |
+| `xs.sort_by(key)` | `(T -> K)` | mutates; sorts by an extracted `i64`/`f64`/`str` key, stably ([L-LIB-SORT-BY]) |
+| `xs.enumerate()` | `-> [(i64, T)]` | pair each element with its index |
+| `xs.zip(ys)` | `([U]) -> [(T, U)]` | pairs up to the shorter of the two |
+
+**[L-LIB-SORT-BY]** `xs.sort_by(key)` sorts by what `key` returns for each
+element, which is where a list of structs gets its order from — `sort` needs
+the *elements* ordered, and a struct is not. The key must be `i64`, `f64` or
+`str`. The sort is stable: elements with equal keys stay in the order they
+were written.
+
+**[L-LIB-PAIRS]** `xs.enumerate()` pairs each element with its index and
+`xs.zip(ys)` pairs the two lists positionally, stopping at the shorter — there
+is no element to invent past the end of one. Both give `[(A, B)]`, which
+`for (a, b) in …` binds by name ([G-LET-TUPLE]).
 
 ## 5. `Map[K, V]`
 

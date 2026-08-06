@@ -77,6 +77,10 @@ the same shape and contents are equal.
 **[E-INDEX-BOUNDS]** Indexing a list out of bounds panics with the index and
 the length. `list.get(i)` returns `Option` instead of panicking.
 
+**[E-LIST-CONCAT]** `xs + ys` is a new list holding `xs`'s elements then
+`ys`'s. Neither operand is changed. `+` on lists never means element-wise
+addition.
+
 **[E-MAP-LIT]** `{k: v, ...}` builds a map. Entries are evaluated left to
 right, each key before its own value, and a repeated key keeps the last value
 written. `{}` is the empty map: an empty block has no use as an expression and

@@ -947,7 +947,7 @@ declare it before `parallel`",
             }
         }
         if let Expr::Ident(id) = root {
-            self.reject_capture_write(id, "assign to");
+            self.reject_capture_write(id, "assign to", "");
         }
     }
 
@@ -1505,6 +1505,12 @@ declare it before `parallel`",
                                 Some(_) => {}
                                 None => {} // unknown-name error already reported
                             }
+                            // Passing a captured variable as `inout` writes to
+                            // the closure's copy, which nobody can read. It is
+                            // the same mistake as assigning to it, and used to
+                            // be the quiet one: the call ran, the write landed
+                            // somewhere invisible, and the caller saw nothing.
+                            self.reject_capture_write(id, "pass", " as `inout`");
                             if let Some((first, _)) =
                                 inout_roots.iter().find(|(n, _)| n == &id.name)
                             {
@@ -1929,8 +1935,46 @@ declare it before `parallel`",
                             self.error_help(
                                 span,
                                 format!("`{shown}` has no order, so `sort` cannot arrange it"),
-                                "only `i64`, `f64` and `str` are ordered; sort by a key you extract from each element instead",
+                                "only `i64`, `f64` and `str` are ordered; use `sort_by` with a key you extract from each element",
                             );
+                        }
+                        Type::Unit
+                    }
+                    // Sorting by an extracted key. The keys are what must be
+                    // ordered, not the elements, so this is how a list of
+                    // structs gets sorted at all.
+                    "enumerate" => {
+                        check_arity(self, 0);
+                        Type::List(Box::new(Type::Tuple(vec![Type::I64, elem.clone()])))
+                    }
+                    "zip" => {
+                        let other = self.uni.fresh();
+                        if check_arity(self, 1) {
+                            self.check_expr(&args[0], &Type::List(Box::new(other.clone())));
+                        }
+                        Type::List(Box::new(Type::Tuple(vec![elem.clone(), other])))
+                    }
+                    "sort_by" => {
+                        self.require_mutable(recv);
+                        let key = self.uni.fresh();
+                        if check_arity(self, 1) {
+                            let f = Type::Fn {
+                                params: vec![elem.clone()],
+                                ret: Box::new(key.clone()),
+                            };
+                            self.check_expr(&args[0], &f);
+                            let k = self.uni.shallow_resolve(&key);
+                            if let Type::Var(_) = k {
+                                self.uni.unify(&key, &Type::I64);
+                            } else if !matches!(k, Type::I64 | Type::F64 | Type::Str | Type::Error)
+                            {
+                                let shown = self.show(&key);
+                                self.error_help(
+                                    span,
+                                    format!("`{shown}` has no order, so `sort_by` cannot use it as a key"),
+                                    "return an `i64`, `f64` or `str` from the key function",
+                                );
+                            }
                         }
                         Type::Unit
                     }
@@ -1973,6 +2017,19 @@ declare it before `parallel`",
                     check_arity(self, 0);
                     Type::Str
                 }
+                // Code points, both ways. Without these a string can be cut
+                // up and compared but never *computed* on — no hash, no
+                // cipher, no hand-written number parser.
+                "code_at" => {
+                    if check_arity(self, 1) {
+                        self.check_expr(&args[0], &Type::I64);
+                    }
+                    Type::I64
+                }
+                "codes" => {
+                    check_arity(self, 0);
+                    Type::List(Box::new(Type::I64))
+                }
                 "repeat" => {
                     if check_arity(self, 1) {
                         self.check_expr(&args[0], &Type::I64);
@@ -2013,6 +2070,11 @@ declare it before `parallel`",
                 "as_f64" => {
                     check_arity(self, 0);
                     Type::F64
+                }
+                // The other half of `code_at`: a code point back to text.
+                "to_char" => {
+                    check_arity(self, 0);
+                    Type::Str
                 }
                 "abs" => {
                     check_arity(self, 0);
@@ -2161,7 +2223,7 @@ declare it before `parallel`",
     /// returns. It compiles, it runs, and it does nothing — which is how an
     /// effect handler that appears to accumulate state silently accumulates
     /// nothing. There is no case where this is what someone meant.
-    fn reject_capture_write(&mut self, id: &Ident, verb: &str) {
+    fn reject_capture_write(&mut self, id: &Ident, verb: &str, tail: &str) {
         let Some(floor) = self.closure_floors.last().copied() else {
             return;
         };
@@ -2174,7 +2236,7 @@ declare it before `parallel`",
                 self.error_help(
                     id.span,
                     format!(
-                        "cannot {verb} `{}` inside a closure — it was captured from outside",
+                        "cannot {verb} `{}`{tail} inside a closure — it was captured from outside",
                         id.name
                     ),
                     "a closure captures values, not bindings, so this write would change a copy nobody can see; return the new value instead, or thread the state through an `inout` parameter",
@@ -2198,7 +2260,7 @@ declare it before `parallel`",
                     );
                 }
             }
-            self.reject_capture_write(id, "mutate");
+            self.reject_capture_write(id, "mutate", "");
         }
     }
 
@@ -2273,6 +2335,9 @@ declare it before `parallel`",
                 match r {
                     Type::I64 | Type::F64 => r,
                     Type::Str if op == Add => Type::Str,
+                    // Lists concatenate. `+` already joins strings, and a
+                    // list is the other thing programs build by appending.
+                    Type::List(_) if op == Add => r,
                     Type::Var(_) => {
                         // Un-annotated (e.g. from an empty list) — default int.
                         self.uni.unify(&lhs_ty, &Type::I64);

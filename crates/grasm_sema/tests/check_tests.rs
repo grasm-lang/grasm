@@ -976,3 +976,39 @@ fn naming_an_effectful_function_without_calling_it_is_not_an_effect() {
     // Mentioning a function as a value performs nothing. Only calling does.
     check_ok("fn shout(n: i64) -> i64 {\n    print(\"{n}\")\n    n\n}\n\nfn stays_pure() -> i64 / {} {\n    let fs = [shout]\n    fs.len()\n}\n\nfn main() {\n    print(\"{stays_pure()}\")\n}\n");
 }
+
+/// Passing a captured binding as `inout` is the quiet member of the
+/// [T-CAPTURE-WRITE] family: the call runs, and the callee's writes land in a
+/// copy the caller cannot read, so it reads as a counter that never moves.
+#[test]
+fn passing_a_captured_binding_as_inout_is_rejected() {
+    check_err(
+        "fn track(inout calls: i64, n: i64) -> i64 {\n\
+         \x20   calls += 1\n\
+         \x20   n\n\
+         }\n\
+         fn main() {\n\
+         \x20   var calls = 0\n\
+         \x20   let f = |n| track(calls, n)\n\
+         \x20   print(\"{f(7)} {calls}\")\n\
+         }\n",
+        "cannot pass `calls` as `inout`",
+    );
+}
+
+/// A closure's *own* `var` is not captured, so threading it through `inout`
+/// stays legal — the rule is about the boundary, not about `inout`.
+#[test]
+fn a_closures_own_var_may_still_be_passed_as_inout() {
+    check_ok(
+        "fn track(inout c: i64, n: i64) -> i64 {\n\
+         \x20   c += 1\n\
+         \x20   n\n\
+         }\n\
+         fn main() {\n\
+         \x20   let f = |n| { var c = 0\n\
+         \x20       track(c, n) + c }\n\
+         \x20   print(\"{f(7)}\")\n\
+         }\n",
+    );
+}

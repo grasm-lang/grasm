@@ -94,18 +94,22 @@ fn main() {
 `match` must be exhaustive. Adding a variant to `Shape` turns every incomplete
 match into a compile error rather than a surprise at runtime.
 
-A tuple can be split into names:
+A tuple can be split into names, in a `let` or in a loop header:
 
 ```
 fn main() {
     let (a, b) = (1, "two")
     print("{a} {b}")
+
+    for (i, w) in ["x", "y"].enumerate() {
+        print("{i}{w}")
+    }
 }
 ```
 
-That is the only destructuring form — there is no `if let`, and patterns
-elsewhere appear only in `match`. It matters most with maps, where
-`entries()` hands back pairs.
+Those are the only destructuring forms — there is no `if let`, and patterns
+elsewhere appear only in `match`. They matter most with maps, where
+`entries()` hands back pairs, and with `enumerate()` and `zip()`.
 
 Write a map with `{key: value}`, or build one up from `{}`. Maps iterate in
 sorted key order, so printing one is deterministic — and what it prints is
@@ -125,6 +129,42 @@ fn main() {
 `{}` is the empty map. Braces holding *statements* are a block, and an empty
 block has no use as an expression, so `()` is how you write unit. The braces
 of `if`, `for`, `while`, `match` and function bodies are always blocks.
+
+Lists join with `+`, and sort by a key you extract — which is how a list of
+structs gets sorted at all, since a struct has no order of its own:
+
+```
+type Run = { name: str, ms: i64 }
+
+fn main() {
+    var runs = [Run{ name: "b", ms: 30 }, Run{ name: "a", ms: 10 }]
+    runs.sort_by(|r| r.ms)
+    for r in runs {
+        print("{r.name} {r.ms}")
+    }
+
+    let all = [1, 2] + [3]
+    print("{all}")
+}
+```
+
+Text is characters, not bytes, and `code_at` / `codes` / `to_char` move
+between a character and its Unicode code point — which is what lets you
+compute on text rather than only cut and compare it:
+
+```
+fn hash(s: str) -> i64 {
+    var h = 0
+    for c in s.codes() {
+        h = (h * 31 + c) % 1000007
+    }
+    h
+}
+
+fn main() {
+    print("{hash("grasm")} {104.to_char()}")
+}
+```
 
 ## 4. Errors are values
 
