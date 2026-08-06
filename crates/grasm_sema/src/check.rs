@@ -1999,6 +1999,10 @@ declare it before `parallel`",
                         check_arity(self, 0);
                         Type::List(Box::new(v))
                     }
+                    "entries" => {
+                        check_arity(self, 0);
+                        Type::List(Box::new(Type::Tuple(vec![k, v])))
+                    }
                     _ => return None,
                 }
             }

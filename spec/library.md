@@ -153,6 +153,7 @@ order ([E-MAP-ORDER]).
 | `m.delete(k)` | `(K) -> bool` | mutates; whether it was present |
 | `m.keys()` | `-> [K]` | sorted |
 | `m.values()` | `-> [V]` | in key order |
+| `m.entries()` | `-> [(K, V)]` | pairs, in key order — the only way to reach both at once |
 
 ## 6. `Option[T]`
 

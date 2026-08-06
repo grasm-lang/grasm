@@ -1728,6 +1728,30 @@ pub unsafe extern "C" fn grasm_map_keys(m: *mut RtVal) -> *mut RtVal {
     alloc(RtPayload::List(items))
 }
 
+/// Key/value pairs in sorted key order, as a list of two-element tuples.
+///
+/// `keys()` and `values()` are each half of this, and reaching a pair by
+/// looking one up in the other was the only way to iterate a map — which
+/// means a lookup per entry, with a `?? default` for a key that certainly
+/// exists.
+///
+/// # Safety: live pointer; returns a fresh list (+1).
+#[no_mangle]
+pub unsafe extern "C" fn grasm_map_entries(m: *mut RtVal) -> *mut RtVal {
+    let RtPayload::Map(entries) = &(*m).payload else {
+        grasm_panic_msg_str("entries on non-map");
+    };
+    let items: Vec<*mut RtVal> = sorted_keys(entries)
+        .iter()
+        .map(|k| {
+            let v = entries[k];
+            inc(v);
+            alloc(RtPayload::Tuple(vec![k.boxed(), v]))
+        })
+        .collect();
+    alloc(RtPayload::List(items))
+}
+
 /// # Safety: live pointer; returns a fresh list (+1).
 #[no_mangle]
 pub unsafe extern "C" fn grasm_map_values(m: *mut RtVal) -> *mut RtVal {

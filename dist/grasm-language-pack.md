@@ -796,6 +796,7 @@ order ([E-MAP-ORDER]).
 | `m.delete(k)` | `(K) -> bool` | mutates; whether it was present |
 | `m.keys()` | `-> [K]` | sorted |
 | `m.values()` | `-> [V]` | in key order |
+| `m.entries()` | `-> [(K, V)]` | pairs, in key order — the only way to reach both at once |
 
 ## 6. `Option[T]`
 
@@ -2531,12 +2532,26 @@ fn main() {
 //! tag: L-LIB-MAP
 //! expect: output
 //! 2 false 1 true [a, b] [1, 2]
+//! [(a, 1), (b, 2)]
+//! a=1
+//! b=2
 //! true 1
 fn main() {
     var m = map()
     m.set("b", 2)
     m.set("a", 1)
     print("{m.len()} {m.is_empty()} {m.get("a") ?? 0} {m.has("b")} {m.keys()} {m.values()}")
+
+    // Pairs, in key order. Without this the only way to walk a map was to
+    // iterate `keys()` and look each one up again — a probe per entry, and a
+    // `?? default` for a key that certainly exists.
+    print("{m.entries()}")
+    for e in m.entries() {
+        match e {
+            (k, v) -> print("{k}={v}")
+        }
+    }
+
     let gone = m.delete("b")
     print("{gone} {m.len()}")
 }

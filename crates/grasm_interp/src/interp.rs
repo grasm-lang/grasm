@@ -1691,6 +1691,12 @@ impl<'a, W: Write> Interp<'a, W> {
             (Value::Map(entries), "values") => {
                 Value::List(Rc::new(entries.values().cloned().collect()))
             }
+            (Value::Map(entries), "entries") => Value::List(Rc::new(
+                entries
+                    .iter()
+                    .map(|(k, v)| Value::Tuple(Rc::new(vec![k.to_value(), v.clone()])))
+                    .collect(),
+            )),
             (Value::Variant { variant, .. }, "is_some") => {
                 Value::Bool(variant.as_str() == "Some")
             }
