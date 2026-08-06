@@ -28,11 +28,21 @@ if [ ! -f "$RT" ]; then
     echo "  rustup target add $TARGET && cargo build --release -p grasm_rt --target $TARGET"
     exit 1
 fi
+# A runtime older than its own source links against yesterday's symbol set, so
+# every program using anything added since fails to link. That looked exactly
+# like "the backend cannot compile this" the one time it happened, and cost
+# seven programs of coverage without a word of complaint.
+if [ -n "$(find crates/grasm_rt/src -name '*.rs' -newer "$RT" 2>/dev/null)" ]; then
+    echo "error: $RT is older than crates/grasm_rt/src — rebuild it:"
+    echo "  cargo build --release -p grasm_rt --target $TARGET"
+    exit 1
+fi
 
 pass=0
 fail=0
 skip=0
 declare -a FAILED=()
+declare -a SKIPPED=()
 
 # Same scan roots as difftest.sh: a program the host backend is held to must
 # hold on every other target too, or "portable" means only what was sampled.
@@ -42,13 +52,18 @@ for src in $(find examples projects spec/conformance benchmarks/grasm -name '*.g
     grep -q '^//! expect: error$' "$src" && continue
     name=$(echo "$src" | tr '/.' '__')
 
-    if ! "$GRASM" build "$src" --native --target "$TARGET" -o "$WORK/$name" >/dev/null 2>&1; then
+    # A skip says the toolchain could not produce a binary, so it has to say
+    # which step gave up and why. Counting it silently is how a stale artifact
+    # passes for a backend limitation.
+    if ! "$GRASM" build "$src" --native --target "$TARGET" -o "$WORK/$name" >"$WORK/$name.buildlog" 2>&1; then
         skip=$((skip + 1))
+        SKIPPED+=("$src — compile: $(head -1 "$WORK/$name.buildlog")")
         continue
     fi
-    cc -arch "$ARCH" "$WORK/$name.o" "$RT" -o "$WORK/$name.exe" 2>/dev/null
+    cc -arch "$ARCH" "$WORK/$name.o" "$RT" -o "$WORK/$name.exe" 2>"$WORK/$name.linklog"
     if [ ! -x "$WORK/$name.exe" ]; then
         skip=$((skip + 1))
+        SKIPPED+=("$src — link: $(head -1 "$WORK/$name.linklog")")
         continue
     fi
 
@@ -83,6 +98,12 @@ echo "=========================================="
 echo "target: $TARGET"
 echo "identical: $pass   mismatched: $fail   unsupported: $skip"
 echo "=========================================="
+
+if [ "$skip" -gt 0 ]; then
+    echo
+    echo "UNSUPPORTED (each one is coverage this run did not get):"
+    printf '  %s\n' "${SKIPPED[@]}"
+fi
 
 if [ "$fail" -gt 0 ]; then
     printf 'FAILED: %s\n' "${FAILED[@]}"
