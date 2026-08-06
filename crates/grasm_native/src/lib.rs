@@ -2950,6 +2950,22 @@ impl FnCx<'_, '_> {
                 Ok(Some((list, VType::List(Box::new(elem_t)))))
             }
             Expr::Index { recv, index, span } => {
+                // A pinned list is read without ever producing the list value:
+                // `pin` already took the borrow for the whole loop, so
+                // evaluating the receiver here would be an inc/dec round trip
+                // per element for a value the load does not use.
+                if let Expr::Ident(id) = &**recv {
+                    if let Some((data, len, pt)) = self.pinned_list(&id.name) {
+                        let (iv, it) = self.eval_expr_val(index)?;
+                        if it != VType::I64 {
+                            return nope(index.span(), "non-integer index");
+                        }
+                        let addr = self.pinned_address(data, len, iv, stride_of(&pt));
+                        let flags = cranelift_codegen::ir::MemFlags::trusted();
+                        let v = self.b.ins().load(pt.cl(), flags, addr, 0);
+                        return Ok(Some((v, pt)));
+                    }
+                }
                 let (rv, rt) = self.eval_expr_val(recv)?;
                 let VType::List(elem_t) = rt else {
                     return nope(*span, "indexing non-lists");
@@ -2957,19 +2973,6 @@ impl FnCx<'_, '_> {
                 let (iv, it) = self.eval_expr_val(index)?;
                 if it != VType::I64 {
                     return nope(index.span(), "non-integer index");
-                }
-                // A pinned list loads directly; `rv` is the same buffer, so
-                // it still needs its borrow released.
-                if let Expr::Ident(id) = &**recv {
-                    if let Some((data, len, pt)) = self.pinned_list(&id.name) {
-                        if pt == *elem_t {
-                            self.call_rt("grasm_val_dec", &[rv]);
-                            let addr = self.pinned_address(data, len, iv, stride_of(&elem_t));
-                            let flags = cranelift_codegen::ir::MemFlags::trusted();
-                            let v = self.b.ins().load(elem_t.cl(), flags, addr, 0);
-                            return Ok(Some((v, (*elem_t).clone())));
-                        }
-                    }
                 }
                 let (v, vt) = self.list_get_elem(rv, iv, &elem_t)?;
                 self.call_rt("grasm_val_dec", &[rv]);
