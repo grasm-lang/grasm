@@ -1835,6 +1835,19 @@ pub unsafe extern "C" fn grasm_str_split(s: *mut RtVal, sep: *mut RtVal) -> *mut
 }
 
 /// # Safety: live pointer.
+/// `x` as text with exactly `places` digits after the point.
+///
+/// Both engines format through Rust, so they agree digit for digit — which is
+/// the only property that matters here and the one a hand-rolled formatter
+/// built from `round` cannot promise.
+#[no_mangle]
+pub extern "C" fn grasm_f64_to_fixed(x: f64, places: i64) -> *mut RtVal {
+    if !(0..=17).contains(&places) {
+        rt_panic(&format!("to_fixed({places}): places must be 0 to 17"));
+    }
+    alloc(RtPayload::Str(format!("{:.*}", places as usize, x)))
+}
+
 /// The Unicode code point of character `i`, counting characters not bytes.
 ///
 /// # Safety: live pointer.
@@ -2013,7 +2026,30 @@ unsafe fn cmp_vals(a: *mut RtVal, b: *mut RtVal) -> std::cmp::Ordering {
         (RtPayload::I64(x), RtPayload::I64(y)) => x.cmp(y),
         (RtPayload::F64(x), RtPayload::F64(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
         (RtPayload::Str(x), RtPayload::Str(y)) => x.cmp(y),
+        // A tuple of ordered things is ordered, component by component — this
+        // is what a multi-key sort is.
+        (RtPayload::Tuple(x), RtPayload::Tuple(y)) => {
+            for (&a, &b) in x.iter().zip(y.iter()) {
+                let ord = cmp_vals(a, b);
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+            }
+            x.len().cmp(&y.len())
+        }
         _ => Ordering::Equal,
+    }
+}
+
+/// Three-way comparison of two boxed values: -1, 0 or 1.
+///
+/// # Safety: live pointers.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_val_cmp(a: *mut RtVal, b: *mut RtVal) -> i64 {
+    match cmp_vals(a, b) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
     }
 }
 

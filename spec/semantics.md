@@ -62,7 +62,14 @@ recurses deeper than 10,000 should not assume it will run everywhere.
 **[E-ARITH-FLOAT]** Float arithmetic follows IEEE-754, including infinities and
 NaN. Division by zero yields an infinity rather than panicking.
 
-**[E-NUM-PROMOTE]** Mixing `i64` and `f64` in one operation promotes to `f64`.
+**[E-NUM-PROMOTE]** An integer *literal* meeting an `f64` becomes one, on
+either side and for arithmetic and comparison alike: `3 * f`, `f * 3`,
+`3 < f` and `f > 3` all work. A non-literal `i64` does not convert on its own
+([T-INT-TO-FLOAT]) — `n > f` is an error that says to write `n.as_f64()`.
+
+The rule used to be stated as "mixing promotes", which was not what the
+implementation did, and comparisons had a further asymmetry nothing recorded:
+`5.0 == 5` was accepted and `5 == 5.0` was not.
 
 **[E-STR-CONCAT]** `+` on two `str` values concatenates them.
 

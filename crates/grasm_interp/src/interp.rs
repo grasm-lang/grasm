@@ -1139,6 +1139,11 @@ impl<'a, W: Write> Interp<'a, W> {
         }
         let r = self.eval_expr(recv)?;
         match r {
+            // `pair.0` — components named by position.
+            Value::Tuple(parts) => match name.name.parse::<usize>() {
+                Ok(i) if i < parts.len() => Ok(parts[i].clone()),
+                _ => Err(Flow::Panic(format!("no component `.{}`", name.name))),
+            },
             Value::Struct { fields, .. } => fields
                 .iter()
                 .find(|(k, _)| k == &name.name)
@@ -1729,6 +1734,17 @@ impl<'a, W: Write> Interp<'a, W> {
                     return Err(Flow::Panic(format!("{i} is not a Unicode code point")))
                 }
             },
+            (Value::Float(f), "to_fixed") => {
+                let Value::Int(places) = self.eval_expr(&args[0])? else {
+                    return Err(Flow::Panic("to_fixed expects an integer".into()));
+                };
+                if !(0..=17).contains(&places) {
+                    return Err(Flow::Panic(format!(
+                        "to_fixed({places}): places must be 0 to 17"
+                    )));
+                }
+                Value::str(format!("{:.*}", places as usize, f))
+            }
             (Value::Int(i), "as_f64") => Value::Float(*i as f64),
             (Value::Int(i), "abs") => Value::Int(i.abs()),
             (Value::Int(i), "to_str") => Value::str(i.to_string()),
@@ -1912,6 +1928,19 @@ impl<'a, W: Write> Interp<'a, W> {
                 GtEq => Value::Bool(a >= b),
                 _ => return Err(Flow::Panic("invalid string operation".into())),
             }),
+            // Tuples compare component by component, which is what makes a
+            // multi-key sort key work with `<` too.
+            (Value::Tuple(_), Value::Tuple(_))
+                if matches!(op, Lt | LtEq | Gt | GtEq) =>
+            {
+                let ord = compare_values(&l, &r);
+                Ok(Value::Bool(match op {
+                    Lt => ord.is_lt(),
+                    LtEq => ord.is_le(),
+                    Gt => ord.is_gt(),
+                    _ => ord.is_ge(),
+                }))
+            }
             (Value::List(a), Value::List(b)) if op == Add => {
                 let mut out = Vec::with_capacity(a.len() + b.len());
                 out.extend(a.iter().cloned());
@@ -2023,6 +2052,17 @@ fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
         (Value::Int(x), Value::Int(y)) => x.cmp(y),
         (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
         (Value::Str(x), Value::Str(y)) => x.cmp(y),
+        // A tuple of ordered things is ordered, component by component — this
+        // is what a multi-key sort is.
+        (Value::Tuple(x), Value::Tuple(y)) => {
+            for (a, b) in x.iter().zip(y.iter()) {
+                let ord = compare_values(a, b);
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+            }
+            x.len().cmp(&y.len())
+        }
         _ => Ordering::Equal,
     }
 }

@@ -407,6 +407,8 @@ impl<'m> Codegen<'m> {
             ("grasm_str_code_at", vec![i64t, i64t], Some(i64t)),
             ("grasm_str_codes", vec![i64t], Some(i64t)),
             ("grasm_i64_to_char", vec![i64t], Some(i64t)),
+            ("grasm_f64_to_fixed", vec![f64t, i64t], Some(i64t)),
+            ("grasm_val_cmp", vec![i64t, i64t], Some(i64t)),
             ("grasm_str_from_i64", vec![i64t], Some(i64t)),
             ("grasm_str_from_f64", vec![f64t], Some(i64t)),
             ("grasm_str_from_bool", vec![i8t], Some(i64t)),
@@ -4022,6 +4024,11 @@ impl FnCx<'_, '_> {
                 self.call_rt("grasm_val_dec", &[rv]);
                 (v, VType::List(Box::new(VType::I64)))
             }
+            (VType::F64, "to_fixed") => {
+                let n = arg_scalar!(0, VType::I64);
+                let v = self.call_rt("grasm_f64_to_fixed", &[rv, n]).unwrap();
+                (v, VType::Str)
+            }
             (VType::I64, "to_char") => {
                 let v = self.call_rt("grasm_i64_to_char", &[rv]).unwrap();
                 (v, VType::Str)
@@ -4504,6 +4511,22 @@ impl FnCx<'_, '_> {
             return nope(span, "mixed-type operation");
         }
         use BinaryOp::*;
+        // Tuples compare component by component; the runtime already knows
+        // how, because that is what sorts a list of them.
+        if let (VType::Tuple(_), Lt | LtEq | Gt | GtEq) = (&lt, op) {
+            let ord = self.call_rt("grasm_val_cmp", &[lv, rv]).unwrap();
+            self.call_rt("grasm_val_dec", &[lv]);
+            self.call_rt("grasm_val_dec", &[rv]);
+            let zero = self.b.ins().iconst(types::I64, 0);
+            let cc = match op {
+                Lt => IntCC::SignedLessThan,
+                LtEq => IntCC::SignedLessThanOrEqual,
+                Gt => IntCC::SignedGreaterThan,
+                _ => IntCC::SignedGreaterThanOrEqual,
+            };
+            let v = self.b.ins().icmp(cc, ord, zero);
+            return Ok((v, VType::Bool));
+        }
         // Lists concatenate with `+`, the way strings do.
         if let (VType::List(_), Add) = (&lt, op) {
             let v = self.call_rt("grasm_list_concat", &[lv, rv]).unwrap();
@@ -5178,6 +5201,20 @@ impl FnCx<'_, '_> {
             }
         }
         let (rv, rt) = self.eval_expr_val(recv)?;
+        // `pair.0` — a tuple's components are named by position.
+        if let VType::Tuple(parts) = &rt {
+            let Ok(i) = name.name.parse::<usize>() else {
+                return nope(span, "a named field on a tuple");
+            };
+            let Some(pt) = parts.get(i).cloned() else {
+                return nope(span, "a tuple component past the end");
+            };
+            let idx = self.b.ins().iconst(types::I64, i as i64);
+            let boxed = self.call_rt("grasm_list_get", &[rv, idx]).unwrap();
+            let (out, out_t) = self.unbox(boxed, &pt)?;
+            self.call_rt("grasm_val_dec", &[rv]);
+            return Ok(Some((out, out_t)));
+        }
         let VType::Struct(sname) = rt else {
             return nope(span, "field access on non-structs");
         };
@@ -5585,6 +5622,10 @@ impl FnCx<'_, '_> {
                 let rt = self.probe_type(recv)?;
                 match rt {
                     VType::Struct(sname) => self.struct_field_type(&sname, &name.name, *span)?,
+                    VType::Tuple(parts) => match name.name.parse::<usize>() {
+                        Ok(i) if i < parts.len() => parts[i].clone(),
+                        _ => return nope(*span, "inferring this type"),
+                    },
                     _ => {
                         // `Type.Variant` value probe.
                         if let Expr::Ident(tid) = &**recv {
@@ -5625,7 +5666,8 @@ impl FnCx<'_, '_> {
                 "is_some" | "is_none" | "is_empty" | "contains" | "starts_with"
                 | "ends_with" | "has" | "delete" | "any" | "all" => VType::Bool,
                 "to_str" | "join" | "trim" | "to_upper" | "to_lower" | "replace"
-                | "substr" | "repeat" | "pad_start" | "pad_end" | "to_char" => VType::Str,
+                | "substr" | "repeat" | "pad_start" | "pad_end" | "to_char"
+                | "to_fixed" => VType::Str,
                 "code_at" => VType::I64,
                 "codes" => VType::List(Box::new(VType::I64)),
                 "as_f64" => VType::F64,

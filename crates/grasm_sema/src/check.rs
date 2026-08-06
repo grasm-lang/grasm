@@ -1010,6 +1010,15 @@ declare it before `parallel`",
                 } else {
                     self.error(span, format!("type mismatch: expected `{w}`, found `{g}`"));
                 }
+            } else if matches!(
+                (&got_r, self.uni.shallow_resolve(want)),
+                (Type::I64, Type::F64) | (Type::F64, Type::I64)
+            ) {
+                self.error_help(
+                    span,
+                    format!("type mismatch: expected `{w}`, found `{g}`"),
+                    "the two number types do not mix on their own — convert with `.as_f64()`, or use a literal, which does adopt the other side",
+                );
             } else {
                 self.error(span, format!("type mismatch: expected `{w}`, found `{g}`"));
             }
@@ -1609,6 +1618,22 @@ declare it before `parallel`",
         }
         let recv_ty = self.infer_expr(recv);
         match self.uni.shallow_resolve(&recv_ty) {
+            // `pair.0` — a tuple's components are named by position.
+            Type::Tuple(parts) => match name.name.parse::<usize>() {
+                Ok(i) if i < parts.len() => parts[i].clone(),
+                Ok(i) => self.error(
+                    span,
+                    format!(
+                        "this tuple has {} component(s), so there is no `.{i}`",
+                        parts.len()
+                    ),
+                ),
+                Err(_) => self.error_help(
+                    span,
+                    format!("a tuple has no field `{}`", name.name),
+                    "tuple components are named by position, as in `pair.0`",
+                ),
+            },
             Type::Named { id, args } => {
                 let def = self.defs.get(id);
                 match &def.kind {
@@ -1959,10 +1984,7 @@ declare it before `parallel`",
                         // compile error, so this is now the same error rather
                         // than the quiet one.
                         let e = self.uni.shallow_resolve(&elem);
-                        if !matches!(
-                            e,
-                            Type::I64 | Type::F64 | Type::Str | Type::Var(_) | Type::Error
-                        ) {
+                        if !self.is_ordered(&e) {
                             let shown = self.show(&elem);
                             self.error_help(
                                 span,
@@ -1998,8 +2020,7 @@ declare it before `parallel`",
                             let k = self.uni.shallow_resolve(&key);
                             if let Type::Var(_) = k {
                                 self.uni.unify(&key, &Type::I64);
-                            } else if !matches!(k, Type::I64 | Type::F64 | Type::Str | Type::Error)
-                            {
+                            } else if !self.is_ordered(&k) {
                                 let shown = self.show(&key);
                                 self.error_help(
                                     span,
@@ -2125,6 +2146,15 @@ declare it before `parallel`",
                 _ => return None,
             },
             Type::F64 => match name.name.as_str() {
+                // Fixed-point text. Without it a report that has a mean can
+                // only print `289.22222222222223`, and every program grows a
+                // hand-rolled formatter built out of `round` and `to_str`.
+                "to_fixed" => {
+                    if check_arity(self, 1) {
+                        self.check_expr(&args[0], &Type::I64);
+                    }
+                    Type::Str
+                }
                 "as_i64" => {
                     check_arity(self, 0);
                     Type::I64
@@ -2296,6 +2326,38 @@ declare it before `parallel`",
         }
     }
 
+    /// The left operand's type, except that an integer *literal* on the left
+    /// adopts a float on the right — so `3 * f` and `f * 3` agree, and so do
+    /// `3 < f` and `f > 3`. Comparisons used to skip this, which made
+    /// `5.0 == 5` legal and `5 == 5.0` an error.
+    ///
+    /// A non-literal `i64` still does not convert ([T-INT-TO-FLOAT]); that is
+    /// the rule, not an oversight, and the mismatch says how to cross it.
+    /// Whether values of this type have an order.
+    ///
+    /// `i64`, `f64` and `str` do. A tuple of them does too, compared
+    /// component by component — which is how a sort gets more than one key.
+    /// Nothing else does: a struct has no order of its own, and inventing one
+    /// would make `sort` quietly pick an arbitrary answer.
+    fn is_ordered(&mut self, t: &Type) -> bool {
+        match self.uni.shallow_resolve(t) {
+            Type::I64 | Type::F64 | Type::Str | Type::Var(_) | Type::Error => true,
+            Type::Tuple(parts) => !parts.is_empty() && parts.iter().all(|p| self.is_ordered(p)),
+            _ => false,
+        }
+    }
+
+    fn float_aware_lhs(&mut self, lhs: &Expr, rhs: &Expr) -> Type {
+        let lhs_ty = self.infer_expr(lhs);
+        if matches!(lhs, Expr::Int(..)) && self.uni.shallow_resolve(&lhs_ty) == Type::I64 {
+            let probe = self.infer_expr(rhs);
+            if self.uni.shallow_resolve(&probe) == Type::F64 {
+                return Type::F64;
+            }
+        }
+        lhs_ty
+    }
+
     fn infer_binary(&mut self, op: BinaryOp, lhs: &Expr, rhs: &Expr, span: Span) -> Type {
         use BinaryOp::*;
         match op {
@@ -2305,17 +2367,17 @@ declare it before `parallel`",
                 Type::Bool
             }
             Eq | NotEq => {
-                let t = self.infer_expr(lhs);
+                let t = self.float_aware_lhs(lhs, rhs);
                 self.check_expr(rhs, &t);
                 Type::Bool
             }
             Lt | LtEq | Gt | GtEq => {
-                let t = self.infer_expr(lhs);
+                let t = self.float_aware_lhs(lhs, rhs);
                 self.check_expr(rhs, &t);
                 let r = self.uni.shallow_resolve(&t);
                 if let Type::Var(_) = r {
                     self.uni.unify(&t, &Type::I64);
-                } else if !matches!(r, Type::I64 | Type::F64 | Type::Str | Type::Error) {
+                } else if !self.is_ordered(&r) {
                     let shown = self.show(&t);
                     self.error(span, format!("cannot compare `{shown}` values with `<`/`>`"));
                 }
@@ -2351,17 +2413,7 @@ declare it before `parallel`",
                 }
             }
             Add | Sub | Mul | Div | Rem | Pow => {
-                let mut lhs_ty = self.infer_expr(lhs);
-                // An integer literal on the left adopts a float right-hand
-                // side, so `3 * f` and `f * 3` behave the same.
-                if matches!(lhs, Expr::Int(..))
-                    && self.uni.shallow_resolve(&lhs_ty) == Type::I64
-                {
-                    let probe = self.infer_expr(rhs);
-                    if self.uni.shallow_resolve(&probe) == Type::F64 {
-                        lhs_ty = Type::F64;
-                    }
-                }
+                let lhs_ty = self.float_aware_lhs(lhs, rhs);
                 self.check_expr(rhs, &lhs_ty);
                 let r = self.uni.shallow_resolve(&lhs_ty);
                 match r {

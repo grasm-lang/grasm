@@ -1,0 +1,21 @@
+//! tag: L-LIB-FIXED
+//! expect: output
+//! 289.22 289 289.22222
+//! -1.5 0.000
+//! 0.3333
+//! [      3.50]
+//! 6.875 2.292
+fn main() {
+    let mean = 289.2222222222222
+    print("{mean.to_fixed(2)} {mean.to_fixed(0)} {mean.to_fixed(5)}")
+    // Negatives and zero keep the requested width.
+    print("{(0.0 - 1.5).to_fixed(1)} {0.0.to_fixed(3)}")
+    print("{(1.0 / 3.0).to_fixed(4)}")
+    // It composes with the padding a column needs.
+    print("[{(3.5).to_fixed(2).pad_start(10, " ")}]")
+    var total = 0.0
+    for x in [1.5, 2.25, 3.125] {
+        total = total + x
+    }
+    print("{total.to_fixed(3)} {(total / 3.0).to_fixed(3)}")
+}

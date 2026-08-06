@@ -1,7 +1,25 @@
 //! tag: E-NUM-PROMOTE
 //! expect: output
-//! 7.5
+//! 5.5 5.5
+//! true true
+//! true true true
+//! 2.5 7.5
+//! 3.5
+// An integer *literal* meeting an `f64` becomes one — on either side, and for
+// arithmetic and comparison alike. The rule used to be written as "mixing
+// promotes", which is not what happens, and comparisons had an asymmetry
+// nothing recorded: `5.0 == 5` was accepted and `5 == 5.0` was not.
 fn main() {
     let f = 2.5
-    print("{3 * f}")
+    print("{3 + f} {f + 3}")
+    // Equality, both ways round.
+    print("{5.0 == 5} {5 == 5.0}")
+    // Ordering, both ways round.
+    print("{5.5 < 6} {6 > 5.5} {6 >= 5.5}")
+    // A literal in any operand position.
+    print("{f * 1} {f * 3}")
+    // A non-literal `i64` is converted where the program says so, and only
+    // there ([T-INT-TO-FLOAT]).
+    let n = 1
+    print("{n.as_f64() + f}")
 }

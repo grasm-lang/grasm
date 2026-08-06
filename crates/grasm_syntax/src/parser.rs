@@ -1355,7 +1355,18 @@ impl Parser {
                 }
                 TokenKind::Dot => {
                     self.bump();
-                    let name = self.ident()?;
+                    // `pair.0` — a tuple's components are named by position,
+                    // and the name is the digits themselves.
+                    let name = if let TokenKind::Int(n) = self.cur().clone() {
+                        let sp = self.cur_span();
+                        self.bump();
+                        Ident {
+                            name: n.to_string(),
+                            span: sp,
+                        }
+                    } else {
+                        self.ident()?
+                    };
                     let span = expr.span().merge(name.span);
                     expr = Expr::Field {
                         recv: Box::new(expr),

@@ -81,6 +81,12 @@ declaring a function named `len` does not change what `xs.len()` means.
 
 ## 2. `i64` and `f64`
 
+**[L-LIB-FIXED]** `x.to_fixed(places)` is `f64` as text with exactly that
+many digits after the point, 0 to 17; anything else panics. Both engines
+format through the same code, so they agree digit for digit — which a
+formatter built by hand out of `round` and `to_str` cannot promise, and which
+is what every report with an average needs.
+
 **[L-LIB-NUM]**
 
 | method | type | notes |
@@ -162,6 +168,7 @@ by hand — rather than only cut and compare it.
 | `xs.sort_by(key)` | `(T -> K)` | mutates; sorts by an extracted `i64`/`f64`/`str` key, stably ([L-LIB-SORT-BY]) |
 | `xs.enumerate()` | `-> [(i64, T)]` | pair each element with its index |
 | `xs.zip(ys)` | `([U]) -> [(T, U)]` | pairs up to the shorter of the two |
+| `pair.0`, `pair.1`, … | `-> T` | a tuple's components are named by position ([L-LIB-TUPLE]) |
 
 **[L-LIB-SORT-BY]** `xs.sort_by(key)` sorts by what `key` returns for each
 element, which is where a list of structs gets its order from — `sort` needs
@@ -173,6 +180,12 @@ were written.
 `xs.zip(ys)` pairs the two lists positionally, stopping at the shorter — there
 is no element to invent past the end of one. Both give `[(A, B)]`, which
 `for (a, b) in …` binds by name ([G-LET-TUPLE]).
+
+**[L-LIB-TUPLE]** A tuple's components are read by position — `pair.0`,
+`pair.1` — and a tuple of ordered components is itself ordered, compared
+component by component. That is what `<` on tuples means, what `sort` on a
+list of them does, and what makes `xs.sort_by(|p| (p.dept, p.age, p.name))` a
+multi-key sort rather than an error.
 
 ## 5. `Map[K, V]`
 

@@ -617,7 +617,14 @@ recurses deeper than 10,000 should not assume it will run everywhere.
 **[E-ARITH-FLOAT]** Float arithmetic follows IEEE-754, including infinities and
 NaN. Division by zero yields an infinity rather than panicking.
 
-**[E-NUM-PROMOTE]** Mixing `i64` and `f64` in one operation promotes to `f64`.
+**[E-NUM-PROMOTE]** An integer *literal* meeting an `f64` becomes one, on
+either side and for arithmetic and comparison alike: `3 * f`, `f * 3`,
+`3 < f` and `f > 3` all work. A non-literal `i64` does not convert on its own
+([T-INT-TO-FLOAT]) — `n > f` is an error that says to write `n.as_f64()`.
+
+The rule used to be stated as "mixing promotes", which was not what the
+implementation did, and comparisons had a further asymmetry nothing recorded:
+`5.0 == 5` was accepted and `5 == 5.0` was not.
 
 **[E-STR-CONCAT]** `+` on two `str` values concatenates them.
 
@@ -855,6 +862,12 @@ declaring a function named `len` does not change what `xs.len()` means.
 
 ## 2. `i64` and `f64`
 
+**[L-LIB-FIXED]** `x.to_fixed(places)` is `f64` as text with exactly that
+many digits after the point, 0 to 17; anything else panics. Both engines
+format through the same code, so they agree digit for digit — which a
+formatter built by hand out of `round` and `to_str` cannot promise, and which
+is what every report with an average needs.
+
 **[L-LIB-NUM]**
 
 | method | type | notes |
@@ -936,6 +949,7 @@ by hand — rather than only cut and compare it.
 | `xs.sort_by(key)` | `(T -> K)` | mutates; sorts by an extracted `i64`/`f64`/`str` key, stably ([L-LIB-SORT-BY]) |
 | `xs.enumerate()` | `-> [(i64, T)]` | pair each element with its index |
 | `xs.zip(ys)` | `([U]) -> [(T, U)]` | pairs up to the shorter of the two |
+| `pair.0`, `pair.1`, … | `-> T` | a tuple's components are named by position ([L-LIB-TUPLE]) |
 
 **[L-LIB-SORT-BY]** `xs.sort_by(key)` sorts by what `key` returns for each
 element, which is where a list of structs gets its order from — `sort` needs
@@ -947,6 +961,12 @@ were written.
 `xs.zip(ys)` pairs the two lists positionally, stopping at the shorter — there
 is no element to invent past the end of one. Both give `[(A, B)]`, which
 `for (a, b) in …` binds by name ([G-LET-TUPLE]).
+
+**[L-LIB-TUPLE]** A tuple's components are read by position — `pair.0`,
+`pair.1` — and a tuple of ordered components is itself ordered, compared
+component by component. That is what `<` on tuples means, what `sort` on a
+list of them does, and what makes `xs.sort_by(|p| (p.dept, p.age, p.name))` a
+multi-key sort rather than an error.
 
 ## 5. `Map[K, V]`
 
@@ -2070,10 +2090,28 @@ fn main() {
 ```grasm
 //! tag: E-NUM-PROMOTE
 //! expect: output
-//! 7.5
+//! 5.5 5.5
+//! true true
+//! true true true
+//! 2.5 7.5
+//! 3.5
+// An integer *literal* meeting an `f64` becomes one — on either side, and for
+// arithmetic and comparison alike. The rule used to be written as "mixing
+// promotes", which is not what happens, and comparisons had an asymmetry
+// nothing recorded: `5.0 == 5` was accepted and `5 == 5.0` was not.
 fn main() {
     let f = 2.5
-    print("{3 * f}")
+    print("{3 + f} {f + 3}")
+    // Equality, both ways round.
+    print("{5.0 == 5} {5 == 5.0}")
+    // Ordering, both ways round.
+    print("{5.5 < 6} {6 > 5.5} {6 >= 5.5}")
+    // A literal in any operand position.
+    print("{f * 1} {f * 3}")
+    // A non-literal `i64` is converted where the program says so, and only
+    // there ([T-INT-TO-FLOAT]).
+    let n = 1
+    print("{n.as_f64() + f}")
 }
 ```
 
@@ -3047,6 +3085,32 @@ fn hash(s: str) -> i64 {
 }
 ```
 
+## `L-LIB-FIXED.gr`
+
+```grasm
+//! tag: L-LIB-FIXED
+//! expect: output
+//! 289.22 289 289.22222
+//! -1.5 0.000
+//! 0.3333
+//! [      3.50]
+//! 6.875 2.292
+fn main() {
+    let mean = 289.2222222222222
+    print("{mean.to_fixed(2)} {mean.to_fixed(0)} {mean.to_fixed(5)}")
+    // Negatives and zero keep the requested width.
+    print("{(0.0 - 1.5).to_fixed(1)} {0.0.to_fixed(3)}")
+    print("{(1.0 / 3.0).to_fixed(4)}")
+    // It composes with the padding a column needs.
+    print("[{(3.5).to_fixed(2).pad_start(10, " ")}]")
+    var total = 0.0
+    for x in [1.5, 2.25, 3.125] {
+        total = total + x
+    }
+    print("{total.to_fixed(3)} {(total / 3.0).to_fixed(3)}")
+}
+```
+
 ## `L-LIB-FREE.gr`
 
 ```grasm
@@ -3290,6 +3354,49 @@ fn main() {
     print("{s.contains("World")} {s.starts_with("He")} {s.ends_with("ld")} {s.index_of("W") ?? 0 - 1}")
     print("{s.replace("l", "L")} {"  x ".trim()} {s.to_upper()} {s.to_lower()} {"ab".repeat(2)}")
     print("{"7".pad_start(3, "0")} {"7".pad_end(3, ".")} {"a\nb".lines().len()} {"5".parse_int() ?? 0} {"2.5".parse_float() ?? 0.0}")
+}
+```
+
+## `L-LIB-TUPLE.gr`
+
+```grasm
+//! tag: L-LIB-TUPLE
+//! expect: output
+//! 1 a
+//! eng 25 bo
+//! eng 30 cy
+//! ops 25 al
+//! [(c, 5), (a, 3), (b, 3)]
+//! true false true
+//! [(1, 2), (1, 5), (2, 1)]
+type P = { name: str, dept: str, age: i64 }
+
+fn main() {
+    // Components are read by position.
+    let pair = (1, "a")
+    print("{pair.0} {pair.1}")
+
+    // A tuple key is a multi-key sort: department, then age, then name.
+    var ps = [
+        P{ name: "cy", dept: "eng", age: 30 },
+        P{ name: "al", dept: "ops", age: 25 },
+        P{ name: "bo", dept: "eng", age: 25 },
+    ]
+    ps.sort_by(|p| (p.dept, p.age, p.name))
+    for p in ps {
+        print("{p.dept} {p.age} {p.name}")
+    }
+
+    // The counting idiom: most frequent first, ties broken by key ascending.
+    var pairs = [("b", 3), ("a", 3), ("c", 5)]
+    pairs.sort_by(|e| (0 - e.1, e.0))
+    print("{pairs}")
+
+    // The same order is what `<` and `sort` use.
+    print("{(1, 2) < (1, 3)} {(2, 0) < (1, 9)} {(1, "a") < (1, "b")}")
+    var ts = [(2, 1), (1, 5), (1, 2)]
+    ts.sort()
+    print("{ts}")
 }
 ```
 
