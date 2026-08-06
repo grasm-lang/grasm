@@ -2191,7 +2191,15 @@ pub extern "C" fn grasm_f64_max(a: f64, b: f64) -> f64 {
 use std::cell::RefCell;
 
 /// One installed effect handler: its ops as (op name, code pointer).
-type HandlerFrame = (String, Vec<(String, *const u8)>);
+/// An installed handler: the effect's name, and each operation's lifted code
+/// pointer paired with the environment it captured.
+///
+/// The environment is a raw pointer into the frame that ran `with`, which is
+/// sound because that frame cannot return while a handler it installed is
+/// still reachable — the block has to exit first, and exiting pops the
+/// handler. Without it a handler operation could not read anything from its
+/// enclosing scope, which is most of what a handler is for.
+type HandlerFrame = (String, Vec<(String, *const u8, *const u8)>);
 
 thread_local! {
     /// Innermost-last stack of installed handlers.
@@ -2206,13 +2214,45 @@ pub unsafe extern "C" fn grasm_handler_push(name: *const u8, len: u64) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn grasm_handler_op(name: *const u8, len: u64, code: *const u8) {
+pub unsafe extern "C" fn grasm_handler_op(
+    name: *const u8,
+    len: u64,
+    code: *const u8,
+    env: *const u8,
+) {
     let n = take_str(name, len);
     HANDLERS.with(|h| {
         if let Some((_, ops)) = h.borrow_mut().last_mut() {
-            ops.push((n, code));
+            ops.push((n, code, env));
         }
     });
+}
+
+/// The environment of the innermost handler for `effect::op`.
+///
+/// # Safety: compiler-generated calls with interned name data.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_handler_env(
+    ep: *const u8,
+    el: u64,
+    op: *const u8,
+    ol: u64,
+) -> *const u8 {
+    let effect = take_str(ep, el);
+    let opname = take_str(op, ol);
+    HANDLERS
+        .with(|h| {
+            h.borrow()
+                .iter()
+                .rev()
+                .find(|(e, _)| *e == effect)
+                .and_then(|(_, ops)| {
+                    ops.iter()
+                        .find(|(o, _, _)| *o == opname)
+                        .map(|(_, _, env)| *env)
+                })
+        })
+        .unwrap_or(std::ptr::null())
 }
 
 #[no_mangle]
@@ -2239,8 +2279,8 @@ pub unsafe extern "C" fn grasm_handler_lookup(
             .find(|(e, _)| *e == effect)
             .and_then(|(_, ops)| {
                 ops.iter()
-                    .find(|(o, _)| *o == opname)
-                    .map(|(_, c)| *c)
+                    .find(|(o, _, _)| *o == opname)
+                    .map(|(_, c, _)| *c)
             })
     });
     match found {

@@ -245,7 +245,10 @@ struct Codegen<'m> {
     /// effect name → ops (op name, param types, return type)
     effects: HashMap<String, Vec<(String, Vec<VType>, VType)>>,
     /// `with` site (by span start) → op name → lifted handler FuncId
-    handler_sites: HashMap<u32, Vec<(String, FuncId)>>,
+    handler_sites: HashMap<u32, Vec<(String, FuncId, Vec<String>)>>,
+    /// Captures each lifted handler operation ended up with, typed at the
+    /// `with` site and read back when the operation itself is compiled.
+    handler_captures: HashMap<FuncId, Vec<(String, VType)>>,
     /// Lifted handler bodies to compile after the main functions.
     pending_handlers: Vec<PendingHandler>,
     /// Handler struct literals bound to a name, so `handled_by store` finds
@@ -323,6 +326,10 @@ struct PendingHandler {
     id: FuncId,
     module: String,
     params: Vec<(String, VType)>,
+    /// Names the operation's body reads from the scope that installed the
+    /// handler. Passed as a pointer to a slot in that frame, which is sound
+    /// because the frame cannot return while the handler is installed.
+    captures: Vec<(String, VType)>,
     ret: VType,
     body: Expr,
 }
@@ -339,6 +346,7 @@ impl<'m> Codegen<'m> {
             variant_index: HashMap::new(),
             effects: HashMap::new(),
             handler_sites: HashMap::new(),
+            handler_captures: HashMap::new(),
             pending_handlers: Vec::new(),
             handler_lits: HashMap::new(),
             pending_closures: Vec::new(),
@@ -455,12 +463,13 @@ impl<'m> Codegen<'m> {
             ("grasm_f64_min", vec![f64t, f64t], Some(f64t)),
             ("grasm_f64_max", vec![f64t, f64t], Some(f64t)),
             ("grasm_handler_push", vec![ptr, i64t], None),
-            ("grasm_handler_op", vec![ptr, i64t, ptr], None),
+            ("grasm_handler_op", vec![ptr, i64t, ptr, ptr], None),
             ("grasm_handler_pop", vec![], None),
             ("grasm_fn_new", vec![i64t, i64t, ptr, i64t], Some(i64t)),
             ("grasm_fn_code", vec![i64t], Some(i64t)),
             ("grasm_fn_env", vec![i64t], Some(i64t)),
             ("grasm_handler_lookup", vec![ptr, i64t, ptr, i64t], Some(ptr)),
+            ("grasm_handler_env", vec![ptr, i64t, ptr, i64t], Some(ptr)),
             ("grasm_args", vec![], Some(i64t)),
             ("grasm_input", vec![], Some(i64t)),
             ("grasm_read_file", vec![i64t], Some(i64t)),
@@ -1217,14 +1226,23 @@ impl<'m> Codegen<'m> {
                         .map(|p| p.name.clone())
                         .zip(param_ts.iter().cloned())
                         .collect();
+                    // Names the body reads that are neither its parameters nor
+                    // anything global. Their types are unknown at this pass —
+                    // it runs before any function body is compiled — so they
+                    // are recorded by name and typed at the `with` site.
+                    let mut free = Vec::new();
+                    collect_idents(cbody, &mut free);
+                    free.retain(|n| !cparams.iter().any(|p| p.name == *n));
+                    free.dedup();
                     self.pending_handlers.push(PendingHandler {
                         id,
                         module: self.current_module.clone(),
                         params: named_params,
+                        captures: Vec::new(),
                         ret: ret_t,
                         body: (**cbody).clone(),
                     });
-                    site.push((fname.name.clone(), id));
+                    site.push((fname.name.clone(), id, free));
                 }
                 self.handler_sites.insert(span.start, site);
                 self.collect_handlers_block(body)?;
@@ -1485,8 +1503,13 @@ impl<'m> Codegen<'m> {
         Ok(())
     }
 
-    fn compile_handler(&mut self, h: PendingHandler) -> CResult<()> {
+    fn compile_handler(&mut self, mut h: PendingHandler) -> CResult<()> {
+        h.captures = self.handler_captures.get(&h.id).cloned().unwrap_or_default();
         let mut ctx = self.module.make_context();
+        let ptr_ty = self.module.target_config().pointer_type();
+        // The environment is always the first parameter, even when empty, so
+        // every lifted operation has one signature shape.
+        ctx.func.signature.params.push(AbiParam::new(ptr_ty));
         for (_, t) in &h.params {
             ctx.func.signature.params.push(AbiParam::new(t.cl()));
         }
@@ -1513,9 +1536,24 @@ impl<'m> Codegen<'m> {
         fcx.b.switch_to_block(entry);
         fcx.push_scope();
         let ps: Vec<Value> = fcx.b.block_params(entry).to_vec();
+        let env = ps[0];
+        for (i, (cname, ct)) in h.captures.iter().enumerate() {
+            let flags = cranelift_codegen::ir::MemFlags::trusted();
+            let raw = fcx.b.ins().load(types::I64, flags, env, (i * 8) as i32);
+            let v = fcx.bits_to_value(raw, ct);
+            // The environment lends its value; leaving this scope releases
+            // whatever it holds. Without a matching reference the first call
+            // would free a capture the second call still needs — which showed
+            // up as a captured map working once and then panicking with
+            // "get on non-map".
+            fcx.inc_if_boxed(v, ct);
+            let var = fcx.new_var(ct);
+            fcx.b.def_var(var, v);
+            fcx.bind(cname, var, ct.clone());
+        }
         for (i, (pname, pt)) in h.params.iter().enumerate() {
             let var = fcx.new_var(pt);
-            fcx.b.def_var(var, ps[i]);
+            fcx.b.def_var(var, ps[i + 1]);
             fcx.bind(pname, var, pt.clone());
         }
         let val = fcx.eval_expr(&h.body)?;
@@ -2289,6 +2327,23 @@ impl FnCx<'_, '_> {
         }
     }
 
+    /// Eight bytes standing for any value: a scalar's bits, or a boxed
+    /// value's pointer. Used for a handler's captured environment, which is a
+    /// flat slot array rather than a typed structure.
+    fn value_to_bits(&mut self, v: Value, vt: &VType) -> Value {
+        match vt {
+            VType::I64 | VType::F64 | VType::Bool => self.scalar_bits_of(v, vt),
+            _ => v,
+        }
+    }
+
+    fn bits_to_value(&mut self, bits: Value, vt: &VType) -> Value {
+        match vt {
+            VType::I64 | VType::F64 | VType::Bool => self.scalar_of_bits(bits, vt),
+            _ => bits,
+        }
+    }
+
     fn scalar_of_bits(&mut self, bits: Value, vt: &VType) -> Value {
         match vt {
             VType::I64 => bits,
@@ -2730,11 +2785,40 @@ impl FnCx<'_, '_> {
                 let (ep, el) = self.str_ptr_len(&ename);
                 self.call_rt("grasm_handler_push", &[ep, el]);
                 let ptr_ty = self.cg.module.target_config().pointer_type();
-                for (opname, fid) in site {
+                for (opname, fid, free) in site {
+                    // Free names that resolve to something in scope here are
+                    // the operation's captures. They are typed now, at the
+                    // `with` site, because the pass that lifted the operation
+                    // ran before any body was compiled and had no types yet.
+                    let captures: Vec<(String, VType)> = free
+                        .iter()
+                        .filter_map(|n| self.lookup(n).map(|(_, vt)| (n.clone(), vt)))
+                        .collect();
+                    // A slot in this frame. The frame cannot return while the
+                    // handler is installed, so the pointer stays good for as
+                    // long as anything can call the operation — including from
+                    // functions several calls deep.
+                    let slot = self.b.create_sized_stack_slot(
+                        cranelift_codegen::ir::StackSlotData::new(
+                            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                            (captures.len().max(1) * 8) as u32,
+                            3,
+                        ),
+                    );
+                    for (i, (cname, cvt)) in captures.iter().enumerate() {
+                        let Some((var, _)) = self.lookup(cname) else {
+                            continue;
+                        };
+                        let v = self.b.use_var(var);
+                        let bits = self.value_to_bits(v, cvt);
+                        self.b.ins().stack_store(bits, slot, (i * 8) as i32);
+                    }
+                    let env = self.b.ins().stack_addr(ptr_ty, slot, 0);
+                    self.cg.handler_captures.insert(fid, captures);
                     let (op_p, op_l) = self.str_ptr_len(&opname);
                     let fref = self.cg.module.declare_func_in_func(fid, self.b.func);
                     let addr = self.b.ins().func_addr(ptr_ty, fref);
-                    self.call_rt("grasm_handler_op", &[op_p, op_l, addr]);
+                    self.call_rt("grasm_handler_op", &[op_p, op_l, addr, env]);
                 }
                 let (_, mut terminated) = self.eval_block_inner(body)?;
                 terminated |= self.is_filled();
@@ -3380,7 +3464,12 @@ impl FnCx<'_, '_> {
                     let code = self
                         .call_rt("grasm_handler_lookup", &[ep, el, op_p, op_l])
                         .unwrap();
+                    let env = self
+                        .call_rt("grasm_handler_env", &[ep, el, op_p, op_l])
+                        .unwrap();
+                    let ptr_ty = self.cg.module.target_config().pointer_type();
                     let mut sig = self.cg.module.make_signature();
+                    sig.params.push(AbiParam::new(ptr_ty));
                     for p in &param_ts {
                         sig.params.push(AbiParam::new(p.cl()));
                     }
@@ -3388,7 +3477,8 @@ impl FnCx<'_, '_> {
                         sig.returns.push(AbiParam::new(ret_t.cl()));
                     }
                     let sig_ref = self.b.import_signature(sig);
-                    let mut vals = Vec::with_capacity(args.len());
+                    let mut vals = Vec::with_capacity(args.len() + 1);
+                    vals.push(env);
                     for (a, want) in args.iter().zip(&param_ts) {
                         let (mut v, vt) = self.eval_expr_expecting(a, Some(want))?;
                         if *want == VType::F64 && vt == VType::I64 {

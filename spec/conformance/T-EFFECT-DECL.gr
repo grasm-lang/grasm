@@ -6,6 +6,8 @@
 //! a=1
 //! b=2
 //! 3
+//! 42 9 0
+//! 8
 // Declaring `Cfg` also declares the handler type `CfgHandler`, whose fields
 // are the operations.
 effect Cfg {
@@ -43,4 +45,25 @@ fn main() {
         Kv.put("b", 2)
         print("{Kv.size()}")
     }
+
+    // A handler that reads its enclosing scope. This is most of what a
+    // handler is for — injecting a table, a configuration, a fake clock —
+    // and it used to compile only under the interpreter.
+    var table = map()
+    table.set("x", 42)
+    table.set("y", 9)
+    with Kv handled_by KvHandler{ put: |k, v| print("{k}={v}"), size: || table.len() } {
+        print("{table.get("x") ?? 0} {table.get("y") ?? 0} {table.get("z") ?? 0}")
+    }
+
+    // The captured value is read at the moment the handler is installed, and
+    // an operation may be reached from any depth while the block is open.
+    let scale = 4
+    with Cfg handled_by CfgHandler{ value: || scale * 2 } {
+        print("{doubled()}")
+    }
+}
+
+fn doubled() -> i64 {
+    Cfg.value()
 }
