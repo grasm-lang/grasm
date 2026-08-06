@@ -37,7 +37,7 @@ codegen, and allocation, and nothing at all about how a large program behaves.
 
 ## Results
 
-Apple M-series, macOS 25.1, best of 3 runs, wall clock in milliseconds. Lower
+Apple M-series, macOS 25.1, best of 5 runs, wall clock in milliseconds. Lower
 is better. Reproduce with `./scripts/bench.sh`.
 
 | program  |   C |  Rust |  Go | grasm-native | grasm-interp | Python |
@@ -63,7 +63,7 @@ comparison function through a pointer.
 
 Element access inside a loop is a raw load: a list the loop body *only* indexes
 is pinned once (made unique, converted to inline storage if needed) and
-accessed through its data pointer. `matmul` fell 99 → 61 → 33ms across two
+accessed through its data pointer. `matmul` fell 99 → 61 → 32ms across two
 rounds of that work, and `matmul`'s innermost loop is now 17 instructions with
 no calls on the hot path.
 
@@ -80,7 +80,7 @@ measurements say otherwise:
 The actual cost was refcount traffic: the pinned load was still preceded by
 evaluating the list identifier — an increment — and followed by the matching
 decrement, for a value the load never used. Four indirect calls per iteration,
-eight million iterations. Removing them took `matmul` from 61ms to 33ms. The
+eight million iterations. Removing them took `matmul` from 61ms to 32ms. The
 lesson is filed under "read the disassembly before naming the bottleneck".
 
 What is left:
@@ -114,11 +114,11 @@ float arithmetic — the codegen is sound. And the headline 102x is only
 reachable because `par_map` spreads it across cores; C's 40x is one core.
 
 The number to distrust is any single multiplier. Across the whole suite
-Grasm is **0.9x to 26x** faster than Python depending entirely on the
-workload — 33x on a numeric kernel, and only 1.05x on `wordfreq`, which is
-dominated by allocating a string per iteration rather than by anything the
-compiler controls. A language that quotes one number from its best benchmark
-is quoting marketing.
+Grasm is **1.3x to 30x** faster than Python depending entirely on the
+workload — 30x on `matmul`, and only 1.3x on `wordfreq`, which is dominated by
+allocating strings per iteration rather than by anything the compiler
+controls. A language that quotes one number from its best benchmark is
+quoting marketing.
 
 ## Multi-core
 
