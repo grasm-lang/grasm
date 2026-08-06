@@ -74,7 +74,7 @@ fn parses_a_full_manifest() {
     let caps = m.capabilities.unwrap();
     assert!(caps.contains("io") && caps.contains("Clock"));
     assert_eq!(m.dependencies.len(), 1);
-    assert_eq!(m.dependencies[0].path, "../utils");
+    assert_eq!(m.dependencies[0].path.as_deref(), Some("../utils"));
 }
 
 #[test]
@@ -103,13 +103,26 @@ fn malformed_manifests_are_rejected_with_reasons() {
 }
 
 #[test]
-fn dependencies_without_a_path_are_rejected() {
+fn a_dependency_with_neither_a_path_nor_a_version_is_rejected() {
+    // A path says where; a version says which. With neither there is nothing
+    // to resolve the name to.
     let e = Manifest::parse(
-        "[package]\nname = \"x\"\nversion = \"1.0.0\"\n\n[dependencies.thing]\nversion = \"1\"\n",
+        "[package]\nname = \"x\"\nversion = \"1.0.0\"\n\n[dependencies.thing]\n",
         Path::new("/tmp"),
     )
-    .expect_err("registry deps are not implemented");
-    assert!(e.contains("needs a `path`"), "got: {e}");
+    .expect_err("should reject");
+    assert!(e.contains("needs a `path` or a `version`"), "got: {e}");
+}
+
+#[test]
+fn a_dependency_with_only_a_version_comes_from_the_registry() {
+    let m = Manifest::parse(
+        "[package]\nname = \"x\"\nversion = \"1.0.0\"\n\n[dependencies.thing]\nversion = \"^1.2.0\"\n",
+        Path::new("/tmp"),
+    )
+    .expect("registry dependency");
+    assert_eq!(m.dependencies[0].path, None);
+    assert_eq!(m.dependencies[0].req, Some(VersionReq::parse("^1.2.0").unwrap()));
 }
 
 // ---------------------------------------------------------------------------
@@ -926,4 +939,257 @@ fn two_directories_claiming_one_name_is_an_error_not_a_coin_flip() {
     assert!(err.contains("is 2.0.0"), "{err}");
     assert!(err.contains("`left`"), "{err}");
     assert!(err.contains("`right`"), "{err}");
+}
+
+// ---------------------------------------------------------------------------
+// Registry and minimal version selection
+// ---------------------------------------------------------------------------
+
+use grasm_pkg::Registry;
+
+impl Workspace {
+    /// Publishes `name` at `version` into the workspace's registry, with the
+    /// dependencies it in turn requires.
+    fn publish(&self, name: &str, version: &str, deps: &[(&str, &str)]) {
+        let dir = self.0.join("registry").join(name).join(version);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        let mut m = format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\ncapabilities = []\n");
+        for (dep, req) in deps {
+            m.push_str(&format!("\n[dependencies.{dep}]\nversion = \"{req}\"\n"));
+        }
+        std::fs::write(dir.join(MANIFEST_NAME), m).unwrap();
+        std::fs::write(dir.join("src/main.gr"), PURE_SRC).unwrap();
+    }
+
+    fn registry(&self) -> Registry {
+        Registry::new(self.0.join("registry"))
+    }
+}
+
+/// A root package requiring registry dependencies.
+fn app_requiring(deps: &[(&str, &str)]) -> String {
+    let mut m = String::from("[package]\nname = \"app\"\nversion = \"0.1.0\"\ncapabilities = []\n");
+    for (dep, req) in deps {
+        m.push_str(&format!("\n[dependencies.{dep}]\nversion = \"{req}\"\n"));
+    }
+    m
+}
+
+fn versions_of(r: &grasm_pkg::Resolution) -> Vec<String> {
+    let mut v: Vec<String> = r
+        .packages
+        .iter()
+        .map(|p| format!("{} {}", p.name, p.version))
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn selection_takes_the_lowest_version_that_satisfies_the_requirement() {
+    // Not the newest. Asking for ^1.0.0 when 1.0.0, 1.2.0 and 1.9.0 exist
+    // gets 1.0.0 — nothing moves unless a requirement says it must.
+    let ws = Workspace::new("mvs_lowest");
+    ws.publish("text", "1.0.0", &[]);
+    ws.publish("text", "1.2.0", &[]);
+    ws.publish("text", "1.9.0", &[]);
+    let app = ws.package("app", &app_requiring(&[("text", "^1.0.0")]), PURE_SRC);
+    let r = grasm_pkg::resolve_in(&app, Some(&ws.registry())).unwrap();
+    assert_eq!(versions_of(&r), vec!["app 0.1.0", "text 1.0.0"]);
+}
+
+#[test]
+fn the_highest_floor_anyone_states_is_the_one_that_wins() {
+    // app wants ^1.0.0, its dependency wants ^1.2.0: everyone gets 1.2.0,
+    // which is the lowest version satisfying both.
+    let ws = Workspace::new("mvs_floor");
+    ws.publish("text", "1.0.0", &[]);
+    ws.publish("text", "1.2.0", &[]);
+    ws.publish("text", "1.9.0", &[]);
+    ws.publish("parser", "1.0.0", &[("text", "^1.2.0")]);
+    let app = ws.package(
+        "app",
+        &app_requiring(&[("text", "^1.0.0"), ("parser", "^1.0.0")]),
+        PURE_SRC,
+    );
+    let r = grasm_pkg::resolve_in(&app, Some(&ws.registry())).unwrap();
+    assert_eq!(
+        versions_of(&r),
+        vec!["app 0.1.0", "parser 1.0.0", "text 1.2.0"]
+    );
+}
+
+#[test]
+fn the_result_does_not_depend_on_the_order_the_graph_is_walked() {
+    // The same two requirements, declared in the opposite order, select the
+    // same versions. This is the property that makes a lockfile an integrity
+    // check rather than the thing holding the build still.
+    let ws = Workspace::new("mvs_order");
+    ws.publish("text", "1.0.0", &[]);
+    ws.publish("text", "1.4.0", &[]);
+    ws.publish("a", "1.0.0", &[("text", "^1.4.0")]);
+    ws.publish("b", "1.0.0", &[("text", "^1.0.0")]);
+
+    let one = ws.package("one", &{
+        let mut m = app_requiring(&[("a", "^1.0.0"), ("b", "^1.0.0")]);
+        m = m.replace("name = \"app\"", "name = \"one\"");
+        m
+    }, PURE_SRC);
+    let two = ws.package("two", &{
+        let mut m = app_requiring(&[("b", "^1.0.0"), ("a", "^1.0.0")]);
+        m = m.replace("name = \"app\"", "name = \"two\"");
+        m
+    }, PURE_SRC);
+
+    let r1 = grasm_pkg::resolve_in(&one, Some(&ws.registry())).unwrap();
+    let r2 = grasm_pkg::resolve_in(&two, Some(&ws.registry())).unwrap();
+    let pick = |r: &grasm_pkg::Resolution| {
+        r.packages
+            .iter()
+            .find(|p| p.name == "text")
+            .unwrap()
+            .version
+            .clone()
+    };
+    assert_eq!(pick(&r1), "1.4.0");
+    assert_eq!(pick(&r1), pick(&r2));
+}
+
+#[test]
+fn requirements_that_cannot_both_hold_name_both_sides() {
+    let ws = Workspace::new("mvs_conflict");
+    ws.publish("text", "1.0.0", &[]);
+    ws.publish("text", "2.0.0", &[]);
+    ws.publish("old", "1.0.0", &[("text", "^1.0.0")]);
+    let app = ws.package(
+        "app",
+        &app_requiring(&[("text", "^2.0.0"), ("old", "^1.0.0")]),
+        PURE_SRC,
+    );
+    let err = grasm_pkg::resolve_in(&app, Some(&ws.registry())).unwrap_err();
+    assert!(err.contains("no version of `text`"), "{err}");
+    assert!(err.contains("`app` requires ^2.0.0"), "{err}");
+    assert!(err.contains("`old` requires ^1.0.0"), "{err}");
+}
+
+#[test]
+fn a_transitive_requirement_pulls_its_own_dependencies_in() {
+    let ws = Workspace::new("mvs_transitive");
+    ws.publish("core", "1.0.0", &[]);
+    ws.publish("mid", "1.0.0", &[("core", "^1.0.0")]);
+    ws.publish("top", "1.0.0", &[("mid", "^1.0.0")]);
+    let app = ws.package("app", &app_requiring(&[("top", "^1.0.0")]), PURE_SRC);
+    let r = grasm_pkg::resolve_in(&app, Some(&ws.registry())).unwrap();
+    assert_eq!(
+        versions_of(&r),
+        vec!["app 0.1.0", "core 1.0.0", "mid 1.0.0", "top 1.0.0"]
+    );
+    // Dependencies still come before dependents.
+    let order: Vec<&str> = r.packages.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(order, vec!["core", "mid", "top", "app"]);
+}
+
+#[test]
+fn a_missing_package_says_where_it_looked() {
+    let ws = Workspace::new("mvs_missing");
+    let app = ws.package("app", &app_requiring(&[("ghost", "^1.0.0")]), PURE_SRC);
+    let err = grasm_pkg::resolve_in(&app, Some(&ws.registry())).unwrap_err();
+    assert!(err.contains("no package named `ghost`"), "{err}");
+}
+
+#[test]
+fn a_version_below_every_available_one_lists_what_there_is() {
+    let ws = Workspace::new("mvs_toolow");
+    ws.publish("text", "1.0.0", &[]);
+    ws.publish("text", "1.2.0", &[]);
+    let app = ws.package("app", &app_requiring(&[("text", "^2.0.0")]), PURE_SRC);
+    let err = grasm_pkg::resolve_in(&app, Some(&ws.registry())).unwrap_err();
+    assert!(err.contains("no `text` at or above 2.0.0"), "{err}");
+    assert!(err.contains("1.0.0, 1.2.0"), "{err}");
+}
+
+#[test]
+fn a_registry_dependency_with_no_registry_says_how_to_set_one() {
+    let ws = Workspace::new("mvs_noreg");
+    let app = ws.package("app", &app_requiring(&[("text", "^1.0.0")]), PURE_SRC);
+    let err = grasm_pkg::resolve_in(&app, None).unwrap_err();
+    assert!(err.contains("no registry was found"), "{err}");
+    assert!(err.contains("GRASM_REGISTRY"), "{err}");
+}
+
+#[test]
+fn path_and_registry_dependencies_resolve_in_one_graph() {
+    let ws = Workspace::new("mvs_mixed");
+    ws.publish("text", "1.0.0", &[]);
+    ws.package("local", &versioned("local", "0.5.0", &[]), PURE_SRC);
+    let mut m = app_requiring(&[("text", "^1.0.0")]);
+    m.push_str("\n[dependencies.local]\npath = \"../local\"\n");
+    let app = ws.package("app", &m, PURE_SRC);
+    let r = grasm_pkg::resolve_in(&app, Some(&ws.registry())).unwrap();
+    assert_eq!(
+        versions_of(&r),
+        vec!["app 0.1.0", "local 0.5.0", "text 1.0.0"]
+    );
+}
+
+#[test]
+fn an_exact_requirement_beats_a_later_compatible_one_only_by_disagreeing() {
+    // `=1.0.0` and `^1.2.0` cannot both hold; saying so beats picking one.
+    let ws = Workspace::new("mvs_exact");
+    ws.publish("text", "1.0.0", &[]);
+    ws.publish("text", "1.2.0", &[]);
+    ws.publish("pinned", "1.0.0", &[("text", "=1.0.0")]);
+    let app = ws.package(
+        "app",
+        &app_requiring(&[("text", "^1.2.0"), ("pinned", "^1.0.0")]),
+        PURE_SRC,
+    );
+    let err = grasm_pkg::resolve_in(&app, Some(&ws.registry())).unwrap_err();
+    assert!(err.contains("no version of `text`"), "{err}");
+    assert!(err.contains("=1.0.0"), "{err}");
+}
+
+#[test]
+fn a_registry_package_is_held_to_its_ceiling_like_any_other() {
+    // The supply-chain guarantee only matters for code you did not write.
+    // A registry package that declares no capabilities and then reads a file
+    // is caught by the same inference that catches a path dependency.
+    let ws = Workspace::new("reg_caps");
+    let dir = ws.0.join("registry").join("sneaky").join("1.0.0");
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(
+        dir.join(MANIFEST_NAME),
+        "[package]\nname = \"sneaky\"\nversion = \"1.0.0\"\ncapabilities = []\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("src/main.gr"), IO_SRC).unwrap();
+
+    let app = ws.package("app", &app_requiring(&[("sneaky", "^1.0.0")]), PURE_SRC);
+    let r = grasm_pkg::resolve_in(&app, Some(&ws.registry())).unwrap();
+
+    let sneaky = r.packages.iter().find(|p| p.name == "sneaky").unwrap();
+    let performed = grasm_pkg::effects_of_package(sneaky).unwrap();
+    let violation = grasm_pkg::check_capabilities(sneaky, &performed)
+        .expect("a package that prints while permitting nothing must be caught");
+    assert_eq!(violation.package, "sneaky");
+    assert!(violation.to_string().contains("io"), "{violation}");
+}
+
+#[test]
+fn the_lockfile_records_the_versions_selection_chose() {
+    let ws = Workspace::new("reg_lock");
+    ws.publish("text", "1.0.0", &[]);
+    ws.publish("text", "1.4.0", &[]);
+    ws.publish("dep", "1.0.0", &[("text", "^1.4.0")]);
+    let app = ws.package(
+        "app",
+        &app_requiring(&[("text", "^1.0.0"), ("dep", "^1.0.0")]),
+        PURE_SRC,
+    );
+    let r = grasm_pkg::resolve_in(&app, Some(&ws.registry())).unwrap();
+    let lock = grasm_pkg::build_lock(&r).unwrap();
+    let text = lock.iter().find(|e| e.name == "text").unwrap();
+    // 1.4.0, not the 1.0.0 the root asked for and not a newest-wins pick.
+    assert_eq!(text.version, "1.4.0");
+    assert!(!text.checksum.is_empty());
 }

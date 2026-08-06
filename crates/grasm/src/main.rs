@@ -4,6 +4,7 @@
 //! bundle to a copy of this binary; at startup we check our own tail for the
 //! bundle magic and, if present, run it directly.
 
+use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -431,9 +432,44 @@ fn format_duration(ns: f64) -> String {
     }
 }
 
+/// Package directories for a file's registry dependencies, if it has any.
+///
+/// Path dependencies the loader finds on its own. A registry dependency needs
+/// the whole graph resolved before its version is known, so that happens here
+/// and the answer is handed down. Packages with no registry dependency pay
+/// nothing: there is nothing to resolve.
+fn registry_packages(path: &std::path::Path) -> Result<HashMap<String, PathBuf>, String> {
+    let mut here = path.parent().map(std::path::Path::to_path_buf);
+    let pkg_dir = loop {
+        match here {
+            Some(ref d) if d.join(grasm_pkg::MANIFEST_NAME).is_file() => break d.clone(),
+            Some(ref d) => here = d.parent().map(std::path::Path::to_path_buf),
+            None => return Ok(HashMap::new()),
+        }
+    };
+    let manifest = grasm_pkg::Manifest::load(&pkg_dir)?;
+    if manifest.dependencies.iter().all(|d| d.path.is_some()) {
+        return Ok(HashMap::new());
+    }
+    let resolution = grasm_pkg::resolve(&pkg_dir)?;
+    Ok(resolution
+        .packages
+        .iter()
+        .map(|p| (p.name.clone(), p.dir.clone()))
+        .collect())
+}
+
 /// Load (following imports), typecheck, render diagnostics per file.
 fn load_and_check(path: &str) -> Result<Program, ExitCode> {
-    let program = match loader::load_from_disk(std::path::Path::new(path)) {
+    let entry = std::path::Path::new(path);
+    let resolved = match registry_packages(entry) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return Err(ExitCode::FAILURE);
+        }
+    };
+    let program = match loader::load_from_disk_with(entry, &resolved) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("error: {e}");

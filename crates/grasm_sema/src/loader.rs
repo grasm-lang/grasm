@@ -116,6 +116,20 @@ pub fn load_with(
 
 /// Disk loader: resolves module names relative to the entry file's directory.
 pub fn load_from_disk(entry_path: &std::path::Path) -> Result<Program, String> {
+    load_from_disk_with(entry_path, &HashMap::new())
+}
+
+/// `load_from_disk`, plus package directories the caller resolved itself.
+///
+/// A path dependency is readable straight from the manifest, so the loader
+/// handles those alone. A registry dependency is not: which version to use is
+/// a decision about the whole graph, and the crate that makes it depends on
+/// this one. So the toolchain resolves first and passes the answer down,
+/// rather than this file growing a second, subtly different resolver.
+pub fn load_from_disk_with(
+    entry_path: &std::path::Path,
+    resolved: &HashMap<String, std::path::PathBuf>,
+) -> Result<Program, String> {
     let entry_src_dir = entry_path
         .parent()
         .map(|p| p.to_path_buf())
@@ -125,7 +139,11 @@ pub fn load_from_disk(entry_path: &std::path::Path) -> Result<Program, String> {
         .map_err(|e| format!("cannot read `{entry_display}`: {e}"))?;
     // A file inside a package can import that package's dependencies by name,
     // not just its own sibling files.
-    let deps = package_dependencies(&entry_src_dir);
+    let mut deps = package_dependencies(&entry_src_dir);
+    // Caller-supplied entries win: they came from real resolution.
+    for (name, dir) in resolved {
+        deps.insert(name.clone(), dir.clone());
+    }
 
     let provider = move |name: &str| -> Option<String> {
         if name == "main" {

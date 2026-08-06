@@ -22,8 +22,9 @@ pub const BUILTIN_CAPABILITIES: &[&str] = &["io", "async"];
 #[derive(Debug, Clone, PartialEq)]
 pub struct Dependency {
     pub name: String,
-    /// Filesystem path, relative to the depending package's manifest.
-    pub path: String,
+    /// Filesystem path, relative to the depending package's manifest. `None`
+    /// means the package comes from the registry, which requires a `version`.
+    pub path: Option<String>,
     /// What the depending package accepts. `None` accepts anything, which is
     /// what a manifest that names only a path is saying.
     pub req: Option<VersionReq>,
@@ -78,6 +79,15 @@ pub enum VersionReq {
 }
 
 impl VersionReq {
+    /// The lowest version this requirement admits. Selection starts here and
+    /// only ever moves up, which is what makes the result independent of the
+    /// order the graph happens to be walked in.
+    pub fn floor(&self) -> Version {
+        match self {
+            VersionReq::Exact(v) | VersionReq::Compatible(v) => *v,
+        }
+    }
+
     pub fn parse(text: &str) -> Result<VersionReq, String> {
         let t = text.trim();
         if let Some(rest) = t.strip_prefix('=') {
@@ -172,13 +182,7 @@ impl Manifest {
 
         let mut dependencies = Vec::new();
         for (dep_name, table) in doc.subtables("dependencies") {
-            let path = table
-                .get("path")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    format!("dependency `{dep_name}` needs a `path` (registries are not implemented yet)")
-                })?
-                .to_string();
+            let path = table.get("path").and_then(|v| v.as_str()).map(String::from);
             let req = match table.get("version") {
                 None => None,
                 Some(v) => {
@@ -190,6 +194,12 @@ impl Manifest {
                     })?)
                 }
             };
+            if path.is_none() && req.is_none() {
+                return Err(format!(
+                    "dependency `{dep_name}` needs a `path` or a `version`: \
+                     without either there is nothing to resolve it to"
+                ));
+            }
             dependencies.push(Dependency {
                 name: dep_name,
                 path,
@@ -237,6 +247,240 @@ impl Resolution {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Registry and version selection
+// ---------------------------------------------------------------------------
+
+/// A directory of packages, laid out as `<root>/<name>/<version>/grasm.toml`.
+///
+/// Deliberately a directory rather than a service. Fetching packages over a
+/// network is a separate problem from deciding which ones to use, and only the
+/// second one is the language's business. Point `GRASM_REGISTRY` at a mirror,
+/// a vendored tree, or a checkout, and resolution is identical.
+#[derive(Debug, Clone)]
+pub struct Registry {
+    pub root: PathBuf,
+}
+
+impl Registry {
+    pub fn new(root: PathBuf) -> Registry {
+        Registry { root }
+    }
+
+    /// `GRASM_REGISTRY` if set, otherwise the nearest `.grasm/registry`
+    /// walking up from `from`. Absent, registry dependencies are an error
+    /// naming both, rather than a silent failure to find anything.
+    pub fn discover(from: &Path) -> Option<Registry> {
+        if let Some(dir) = std::env::var_os("GRASM_REGISTRY") {
+            return Some(Registry::new(PathBuf::from(dir)));
+        }
+        let mut here = Some(from.to_path_buf());
+        while let Some(d) = here {
+            let candidate = d.join(".grasm").join("registry");
+            if candidate.is_dir() {
+                return Some(Registry::new(candidate));
+            }
+            here = d.parent().map(Path::to_path_buf);
+        }
+        None
+    }
+
+    /// Every version of `name` the registry holds, ascending. Directories that
+    /// are not versions are ignored rather than rejected, so a `README` beside
+    /// the version directories does not break resolution.
+    pub fn versions(&self, name: &str) -> Vec<Version> {
+        let mut out: Vec<Version> = Vec::new();
+        let Ok(entries) = std::fs::read_dir(self.root.join(name)) else {
+            return out;
+        };
+        for e in entries.flatten() {
+            let file = e.file_name();
+            let Some(text) = file.to_str() else { continue };
+            if let Ok(v) = Version::parse(text) {
+                if e.path().join(MANIFEST_NAME).is_file() {
+                    out.push(v);
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    pub fn dir(&self, name: &str, v: &Version) -> PathBuf {
+        self.root.join(name).join(v.to_string())
+    }
+}
+
+/// One package's stated requirement, kept so a conflict can name who asked.
+#[derive(Debug, Clone)]
+struct Requirement {
+    requirer: String,
+    on: String,
+    req: VersionReq,
+}
+
+/// Chooses a version for every registry dependency in the graph.
+///
+/// **Minimal version selection.** Each requirement names a lowest acceptable
+/// version. For each package, take the highest such floor anyone stated, then
+/// select the lowest version the registry actually holds at or above it —
+/// and then *check* that the selection satisfies every requirement, including
+/// the upper bound a `^` implies.
+///
+/// There is no search and no backtracking. Two consequences are worth stating
+/// because they are the reason for choosing this over solving:
+///
+/// - The answer does not depend on the order the graph was walked, so it is
+///   the same on every machine without a lockfile having to pin it.
+/// - Adding a dependency cannot silently upgrade one you already had. Nothing
+///   moves unless some requirement says it must.
+///
+/// When requirements genuinely disagree, that is an error naming both sides
+/// rather than a version chosen on the program's behalf.
+fn select_versions(
+    root: &Manifest,
+    registry: Option<&Registry>,
+) -> Result<BTreeMap<String, Version>, String> {
+    let mut floors: BTreeMap<String, Version> = BTreeMap::new();
+    let mut selected: BTreeMap<String, Version> = BTreeMap::new();
+
+    // Floors only rise and the registry holds finitely many versions, so this
+    // settles. The bound is a backstop against a registry that changes under
+    // us, not an expected limit.
+    for _ in 0..1000 {
+        let stated = collect_requirements(root, registry, &selected)?;
+        let mut raised = false;
+        for r in &stated {
+            let floor = r.req.floor();
+            let entry = floors.entry(r.on.clone()).or_insert(floor);
+            if floor > *entry {
+                *entry = floor;
+            }
+            if floors[&r.on] > selected.get(&r.on).copied().unwrap_or(floor) {
+                raised = true;
+            }
+        }
+        let mut next: BTreeMap<String, Version> = BTreeMap::new();
+        for (name, floor) in &floors {
+            let Some(reg) = registry else {
+                return Err(missing_registry(name, &stated));
+            };
+            let available = reg.versions(name);
+            let Some(pick) = available.iter().copied().filter(|v| v >= floor).min() else {
+                return Err(no_such_version(name, floor, &available, reg));
+            };
+            next.insert(name.clone(), pick);
+        }
+        if next == selected && !raised {
+            return verify(stated, selected);
+        }
+        selected = next;
+    }
+    Err("version selection did not settle; is the registry changing?".into())
+}
+
+/// Every requirement stated anywhere in the graph, given the versions selected
+/// so far. Path dependencies are followed on disk; registry dependencies are
+/// followed only once a version has been picked for them.
+fn collect_requirements(
+    root: &Manifest,
+    registry: Option<&Registry>,
+    selected: &BTreeMap<String, Version>,
+) -> Result<Vec<Requirement>, String> {
+    let mut out: Vec<Requirement> = Vec::new();
+    let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut queue: Vec<Manifest> = vec![root.clone()];
+
+    while let Some(m) = queue.pop() {
+        if !seen.insert(canonical(&m.dir)) {
+            continue;
+        }
+        for dep in &m.dependencies {
+            match &dep.path {
+                Some(p) => {
+                    let dir = m.dir.join(p);
+                    if dir.join(MANIFEST_NAME).is_file() {
+                        queue.push(Manifest::load(&dir)?);
+                    }
+                }
+                None => {
+                    // A registry dependency always states a version: the
+                    // manifest parser rejects one that states neither.
+                    let req = dep.req.expect("registry dependency without a version");
+                    out.push(Requirement {
+                        requirer: m.name.clone(),
+                        on: dep.name.clone(),
+                        req,
+                    });
+                    if let (Some(reg), Some(v)) = (registry, selected.get(&dep.name)) {
+                        let dir = reg.dir(&dep.name, v);
+                        if dir.join(MANIFEST_NAME).is_file() {
+                            queue.push(Manifest::load(&dir)?);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Confirms the selection satisfies everyone, and says who disagrees if not.
+fn verify(
+    stated: Vec<Requirement>,
+    selected: BTreeMap<String, Version>,
+) -> Result<BTreeMap<String, Version>, String> {
+    for r in &stated {
+        let Some(got) = selected.get(&r.on) else {
+            continue;
+        };
+        if !r.req.matches(got) {
+            let mut who: Vec<String> = stated
+                .iter()
+                .filter(|o| o.on == r.on)
+                .map(|o| format!("  `{}` requires {}", o.requirer, o.req))
+                .collect();
+            who.sort();
+            who.dedup();
+            return Err(format!(
+                "no version of `{}` satisfies every requirement:\n{}\n  \
+                 selected {got}, the lowest available at or above the highest floor\n  \
+                 nothing here can be satisfied at once — one of these has to change",
+                r.on,
+                who.join("\n")
+            ));
+        }
+    }
+    Ok(selected)
+}
+
+fn missing_registry(name: &str, stated: &[Requirement]) -> String {
+    let who: Vec<&str> = stated
+        .iter()
+        .filter(|r| r.on == name)
+        .map(|r| r.requirer.as_str())
+        .collect();
+    format!(
+        "`{}` requires `{name}` from the registry, but no registry was found.\n  \
+         set GRASM_REGISTRY, or create .grasm/registry beside the package",
+        who.first().copied().unwrap_or("this package")
+    )
+}
+
+fn no_such_version(name: &str, floor: &Version, available: &[Version], reg: &Registry) -> String {
+    if available.is_empty() {
+        return format!(
+            "the registry has no package named `{name}`\n  looked in {}",
+            reg.root.join(name).display()
+        );
+    }
+    let have: Vec<String> = available.iter().map(Version::to_string).collect();
+    format!(
+        "the registry has no `{name}` at or above {floor}\n  available: {}",
+        have.join(", ")
+    )
+}
+
 /// A package the walk has already settled on.
 struct Resolved {
     /// Canonical directory, so two routes to one package compare equal.
@@ -260,16 +504,56 @@ fn canonical(p: &Path) -> PathBuf {
 /// otherwise link whichever copy the walk happened to see first, and give the
 /// other dependent something it never asked for.
 pub fn resolve(root_dir: &Path) -> Result<Resolution, String> {
+    let registry = Registry::discover(root_dir);
+    resolve_in(root_dir, registry.as_ref())
+}
+
+/// `resolve` against an explicit registry, which is what the tests use so they
+/// do not depend on what happens to be installed.
+pub fn resolve_in(root_dir: &Path, registry: Option<&Registry>) -> Result<Resolution, String> {
+    let root = Manifest::load(root_dir)?;
+    let selected = select_versions(&root, registry)?;
     let mut ordered: Vec<Manifest> = Vec::new();
     let mut visiting: Vec<String> = Vec::new();
     let mut done: BTreeMap<String, Resolved> = BTreeMap::new();
-    visit(root_dir, None, &mut ordered, &mut visiting, &mut done)?;
+    let ctx = Selection {
+        registry: registry.cloned(),
+        versions: selected,
+    };
+    visit(root_dir, None, &ctx, &mut ordered, &mut visiting, &mut done)?;
     Ok(Resolution { packages: ordered })
+}
+
+/// The registry and what was selected from it, threaded through the walk.
+struct Selection {
+    registry: Option<Registry>,
+    versions: BTreeMap<String, Version>,
+}
+
+impl Selection {
+    /// Where a dependency's sources are: beside the manifest for a path
+    /// dependency, in the registry at the selected version otherwise.
+    fn dir_of(&self, from: &Manifest, dep: &Dependency) -> Result<PathBuf, String> {
+        match &dep.path {
+            Some(p) => Ok(from.dir.join(p)),
+            None => {
+                let reg = self
+                    .registry
+                    .as_ref()
+                    .ok_or_else(|| missing_registry(&dep.name, &[]))?;
+                let v = self.versions.get(&dep.name).ok_or_else(|| {
+                    format!("internal: no version selected for `{}`", dep.name)
+                })?;
+                Ok(reg.dir(&dep.name, v))
+            }
+        }
+    }
 }
 
 fn visit(
     dir: &Path,
     required_by: Option<&str>,
+    sel: &Selection,
     ordered: &mut Vec<Manifest>,
     visiting: &mut Vec<String>,
     done: &mut BTreeMap<String, Resolved>,
@@ -302,7 +586,7 @@ fn visit(
     visiting.push(manifest.name.clone());
 
     for dep in &manifest.dependencies {
-        let dep_dir = manifest.dir.join(&dep.path);
+        let dep_dir = sel.dir_of(&manifest, dep)?;
         if !dep_dir.join(MANIFEST_NAME).exists() {
             return Err(format!(
                 "dependency `{}` of `{}`: no {MANIFEST_NAME} at {}",
@@ -329,7 +613,7 @@ fn visit(
                 ));
             }
         }
-        visit(&dep_dir, Some(&manifest.name), ordered, visiting, done)?;
+        visit(&dep_dir, Some(&manifest.name), sel, ordered, visiting, done)?;
     }
 
     visiting.pop();
