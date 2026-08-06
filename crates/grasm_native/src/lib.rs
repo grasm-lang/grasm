@@ -4767,13 +4767,58 @@ impl FnCx<'_, '_> {
                 Some(Stmt::Expr(inner)) => self.probe_type(inner)?,
                 _ => VType::Unit,
             },
-            Expr::MethodCall { recv, name, .. } => match name.name.as_str() {
+            // The builtin methods, typed from `spec/library.md`. Anything
+            // missing here still compiles wherever the type is already known
+            // and fails only where it has to be inferred — as a list element,
+            // say — which is a hole that reads as "the backend cannot do this"
+            // while looking nothing like it.
+            Expr::MethodCall { recv, name, args, .. } => match name.name.as_str() {
                 "len" => VType::I64,
-                "is_some" | "is_none" | "contains" => VType::Bool,
+                "is_some" | "is_none" | "is_empty" | "contains" | "starts_with"
+                | "ends_with" | "has" | "delete" | "any" | "all" => VType::Bool,
+                "to_str" | "join" | "trim" | "to_upper" | "to_lower" | "replace"
+                | "substr" | "repeat" | "pad_start" | "pad_end" => VType::Str,
+                "as_f64" => VType::F64,
+                "as_i64" => VType::I64,
+                "chars" | "lines" | "split" | "keys" => VType::List(Box::new(VType::Str)),
+                "values" => match self.probe_type(recv)? {
+                    VType::Map(_, v) => VType::List(v),
+                    _ => return nope(e.span(), "inferring this type"),
+                },
+                "parse_int" => VType::Option(Box::new(VType::I64)),
+                "parse_float" => VType::Option(Box::new(VType::F64)),
+                "index_of" => VType::Option(Box::new(VType::I64)),
+                // Element-wise: the result follows the receiver's elements.
+                "sum" => match self.probe_type(recv)? {
+                    VType::List(elem) => *elem,
+                    _ => return nope(e.span(), "inferring this type"),
+                },
+                "min" | "max" | "first" | "last" | "pop" => {
+                    match self.probe_type(recv)? {
+                        VType::List(elem) => VType::Option(elem),
+                        _ => return nope(e.span(), "inferring this type"),
+                    }
+                }
+                "rev" | "slice" | "filter" | "par_filter" | "sort" => self.probe_type(recv)?,
+                "find" => match self.probe_type(recv)? {
+                    VType::List(elem) => VType::Option(elem),
+                    _ => return nope(e.span(), "inferring this type"),
+                },
+                // `map`/`par_map` change the element type, which needs the
+                // function's result — only knowable when it is a closure whose
+                // body can itself be probed.
+                "map" | "par_map" => {
+                    let inner = match args.first() {
+                        Some(Expr::Closure { body, .. }) => self.probe_type(body)?,
+                        _ => return nope(e.span(), "inferring this type"),
+                    };
+                    VType::List(Box::new(inner))
+                }
                 "get" => {
                     let rt = self.probe_type(recv)?;
                     match rt {
                         VType::List(elem) => VType::Option(elem),
+                        VType::Map(_, v) => VType::Option(v),
                         _ => return nope(e.span(), "inferring this type"),
                     }
                 }

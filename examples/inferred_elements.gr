@@ -1,0 +1,57 @@
+// Where a type has to be *inferred* rather than read off an annotation.
+//
+//   grasm run   examples/inferred_elements.gr
+//   grasm build examples/inferred_elements.gr --native -o ie && ./ie
+//
+// A list literal is the sharpest case: nothing states the element type, so it
+// comes from the first element's expression. Every builtin method has to be
+// known there, and one that is not shows up as "the backend cannot compile
+// this" — which looks nothing like the missing table entry it actually is.
+//
+// A randomized differential run found `[xs.min() ?? 0]` compiling under the
+// interpreter and not natively, while 129 hand-written programs did not, so
+// this file exists to keep every one of these on the compiled path.
+
+fn main() {
+    // Reductions over a list: the element type comes through the method.
+    print("{[[3, 1, 2].min() ?? 0]}")
+    print("{[[3, 1, 2].max() ?? 0]}")
+    print("{[[3, 1, 2].sum()]}")
+    print("{[[3, 1, 2].len()]}")
+
+    // Options unwrapped into an element position.
+    print("{["12".parse_int() ?? -1]}")
+    print("{["x".parse_float() ?? -1.0]}")
+    print("{["abc".index_of("b") ?? -1]}")
+    print("{[[1, 2, 3].first() ?? 0, [1, 2, 3].last() ?? 0]}")
+
+    // String methods.
+    print("{["ab".to_upper(), "CD".to_lower(), "  e  ".trim()]}")
+    print("{["a,b".split(",").len(), "abc".chars().len()]}")
+    print("{["ab".repeat(2), "7".pad_start(3, "0")]}")
+    print("{["ab".contains("b"), "ab".starts_with("a"), "ab".ends_with("b")]}")
+
+    // List transforms, including the ones whose element type changes.
+    print("{[[1, 2].map(|v| v * 2).len()]}")
+    print("{[[1, 2, 3].filter(|v| v > 1).len()]}")
+    print("{[[1, 2, 3].rev().len(), [1, 2, 3].slice(0, 2).len()]}")
+    print("{[[1, 2].any(|v| v > 1), [1, 2].all(|v| v > 0)]}")
+    print("{[[1, 2, 3].find(|v| v > 1) ?? 0]}")
+    print("{[[1, 2].contains(2)]}")
+    print("{[["a", "b"].join("-")]}")
+
+    // Numeric conversion.
+    print("{[3.as_f64()]}")
+    print("{[3.7.as_i64()]}")
+    print("{[7.to_str()]}")
+
+    // Maps, where the value type has to come through `get`.
+    var m = map()
+    m.set("k", 42)
+    print("{[m.get("k") ?? 0]}")
+    print("{[m.len(), m.keys().len()]}")
+    print("{[m.has("k"), m.is_empty()]}")
+
+    // Nested one level down, so the probe has to recurse.
+    print("{[[[5, 6].sum(), [7, 8].sum()].max() ?? 0]}")
+}
