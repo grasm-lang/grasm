@@ -67,6 +67,10 @@ ignored. Integers are 64-bit signed.
 parsed as an expression and whose value is converted to text. Braces nest. A
 literal brace is written `\{`.
 
+**[L-INTERP-ONE]** The text between `{` and `}` is exactly one expression.
+Anything left over after it is an error rather than being discarded, so a typo
+inside an interpolation cannot silently delete part of the output.
+
 ## 5. Operators and punctuation
 
 ```

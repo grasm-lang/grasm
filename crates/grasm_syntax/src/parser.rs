@@ -104,6 +104,23 @@ pub fn parse_expr_src(src: &str, offset: u32) -> (Option<Expr>, Vec<Diagnostic>)
     let mut p = Parser::new(tokens);
     p.skip_newlines();
     let expr = p.parse_expr().ok();
+    // Everything between the braces has to be one expression. Parsing a
+    // prefix and discarding the rest meant `"A{1 2}B"` printed `A1B` — a typo
+    // inside `{...}` silently deleted part of the output, and both engines
+    // agreed on the wrong answer so no differential test could see it.
+    p.skip_newlines();
+    if expr.is_some() && !p.at(&TokenKind::Eof) {
+        let leftover = p.cur_span();
+        p.diags.push(
+            Diagnostic::error(
+                leftover,
+                "unexpected extra input inside `{...}` — an interpolation holds one expression",
+            )
+            .with_help(
+                "close the interpolation before this, or join the parts with an operator",
+            ),
+        );
+    }
     (expr, p.diags)
 }
 

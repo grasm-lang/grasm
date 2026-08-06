@@ -31,10 +31,10 @@ fn main() {
     print("{fs} {fs.sum()} {fs[0] == 0.0}")
     print("{fs.min() ?? 0.0} {fs.max() ?? 0.0}")
 
-    // Bools have no ordering, so sorting them is a no-op — in both engines,
-    // whatever the storage. (min/max on bools is a compile error.)
+    // Bools have no ordering, so `sort` on them is a compile error — the
+    // same one `true < false` gives, rather than a quiet no-op that returns
+    // the list unchanged and says nothing.
     var flags = [true, false, true]
-    flags.sort()
     print("{flags}")
     flags[1] = true
     print("{flags.contains(false)} {flags.rev()}")

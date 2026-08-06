@@ -82,6 +82,10 @@ ignored. Integers are 64-bit signed.
 parsed as an expression and whose value is converted to text. Braces nest. A
 literal brace is written `\{`.
 
+**[L-INTERP-ONE]** The text between `{` and `}` is exactly one expression.
+Anything left over after it is an error rather than being discarded, so a typo
+inside an interpolation cannot silently delete part of the output.
+
 ## 5. Operators and punctuation
 
 ```
@@ -840,7 +844,7 @@ because the text may not be a number.
 | `xs.first()`, `xs.last()` | `-> Option[T]` | |
 | `xs.push(v)` | `(T)` | mutates; receiver must be `var` |
 | `xs.pop()` | `-> Option[T]` | mutates |
-| `xs.sort()` | | mutates; ascending. Bools have no order, so sorting them does nothing |
+| `xs.sort()` | | mutates; ascending. Only `i64`, `f64` and `str` are ordered — sorting anything else is a compile error, the same one `<` gives |
 | `xs.rev()` | `-> [T]` | |
 | `xs.slice(a, b)` | `(i64, i64) -> [T]` | `a` up to but excluding `b` |
 | `xs.contains(v)` | `(T) -> bool` | |
@@ -2656,6 +2660,24 @@ fn main() {
 //! 255 10 1000000
 fn main() {
     print("{0xFF} {0b1010} {1_000_000}")
+}
+```
+
+## `L-INTERP-ONE.gr`
+
+```grasm
+//! tag: L-INTERP-ONE
+//! expect: error
+//! an interpolation holds one expression
+// `{...}` holds exactly one expression, and anything left over is an error.
+//
+// It used to be a silent truncation: `"A{1 2}B"` printed `A1B`. The parser
+// read one expression and discarded the rest of the braces' contents without
+// a word, so a typo inside `{...}` quietly deleted part of the output. Both
+// engines agreed on the wrong answer, which is why no differential test could
+// ever have found it.
+fn main() {
+    print("A{1 2}B")
 }
 ```
 

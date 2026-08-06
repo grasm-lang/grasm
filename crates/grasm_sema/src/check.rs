@@ -1896,6 +1896,23 @@ declare it before `parallel`",
                     "sort" => {
                         self.require_mutable(recv);
                         check_arity(self, 0);
+                        // Sorting elements with no order was a silent no-op:
+                        // the list came back unchanged and nothing said why.
+                        // Comparing two of those same values with `<` is a
+                        // compile error, so this is now the same error rather
+                        // than the quiet one.
+                        let e = self.uni.shallow_resolve(&elem);
+                        if !matches!(
+                            e,
+                            Type::I64 | Type::F64 | Type::Str | Type::Var(_) | Type::Error
+                        ) {
+                            let shown = self.show(&elem);
+                            self.error_help(
+                                span,
+                                format!("`{shown}` has no order, so `sort` cannot arrange it"),
+                                "only `i64`, `f64` and `str` are ordered; sort by a key you extract from each element instead",
+                            );
+                        }
                         Type::Unit
                     }
                     _ => return None,

@@ -126,7 +126,7 @@ because the text may not be a number.
 | `xs.first()`, `xs.last()` | `-> Option[T]` | |
 | `xs.push(v)` | `(T)` | mutates; receiver must be `var` |
 | `xs.pop()` | `-> Option[T]` | mutates |
-| `xs.sort()` | | mutates; ascending. Bools have no order, so sorting them does nothing |
+| `xs.sort()` | | mutates; ascending. Only `i64`, `f64` and `str` are ordered — sorting anything else is a compile error, the same one `<` gives |
 | `xs.rev()` | `-> [T]` | |
 | `xs.slice(a, b)` | `(i64, i64) -> [T]` | `a` up to but excluding `b` |
 | `xs.contains(v)` | `(T) -> bool` | |

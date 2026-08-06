@@ -7,7 +7,7 @@ before it is listed as stable.
 `crates/grasm_spec` fails if a clause here is missing, unknown, or listed twice,
 so this file cannot drift away from the specification it describes.
 
-Today: 93 stable, 24 provisional, 16 experimental, of 133.
+Today: 94 stable, 24 provisional, 16 experimental, of 134.
 
 ## Stable
 
@@ -65,6 +65,7 @@ Will not change incompatibly before 2.0.
 - `L-IDENT` — stable
 - `L-INT` — stable
 - `L-INTERP` — stable
+- `L-INTERP-ONE` — stable
 - `L-KEYWORD` — stable
 - `L-MAXMUNCH` — stable
 - `L-NEWLINE` — stable
