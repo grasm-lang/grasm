@@ -42,12 +42,12 @@ is better. Reproduce with `./scripts/bench.sh`.
 
 | program  |   C |  Rust |  Go | grasm-native | grasm-interp | Python |
 |----------|----:|------:|----:|-------------:|-------------:|-------:|
-| fib      |  25 |    27 |  28 |       **27** |         1204 |    153 |
-| sieve    |  28 |    29 |  29 |           42 |         2251 |    384 |
-| matmul   |  26 |    26 |  29 |           61 |         5799 |    930 |
-| wordfreq |  52 |    47 |  39 |          147 |          472 |    154 |
-| sort     |  60 |    33 |  70 |       **47** |          324 |    234 |
-| parmap   |  75 |    74 | 115 |          130 |        32893 |  3,561 |
+| fib      |  26 |    26 |  27 |       **27** |         1205 |    153 |
+| sieve    |  27 |    27 |  29 |           39 |         2236 |    373 |
+| matmul   |  27 |    29 |  30 |           33 |         5803 |    934 |
+| wordfreq |  53 |    47 |  39 |          149 |          472 |    155 |
+| sort     |  59 |    32 |  71 |       **47** |          323 |    240 |
+| parmap   |  70 |    72 | 111 |          128 |        32736 |  3,581 |
 | mandelbrot |  36 |   —  |  —  |       **14** |            — |  1,457 |
 
 Native Grasm matches C on `fib`, which is the benchmark that is almost entirely
@@ -61,15 +61,35 @@ and a store through the runtime, not an allocation. That change halved sieve
 (49 vs 58): Rust's pdqsort over a `Vec<i64>` against C's `qsort` calling a
 comparison function through a pointer.
 
-What remains of the gap is two things, stated so nobody has to guess:
+Element access inside a loop is a raw load: a list the loop body *only* indexes
+is pinned once (made unique, converted to inline storage if needed) and
+accessed through its data pointer. `matmul` fell 99 → 61 → 33ms across two
+rounds of that work, and `matmul`'s innermost loop is now 17 instructions with
+no calls on the hot path.
 
-- Element access inside a loop is now a raw load: a list the loop body *only*
-  indexes is pinned once (made unique, converted to inline storage if needed)
-  and accessed through its data pointer, so `matmul` fell from 99ms to 61ms and
-  `sieve` from 55ms to 42ms. What remains against C is the per-access bounds
-  check, which C at `-O2` does not perform at all.
-- `wordfreq` is 2.8× off C. Lookup is now a hash probe, but each iteration
-  still allocates a fresh key string, and CPython interns and caches hashes.
+Both rounds are worth reporting together, because the first one's stated
+conclusion was wrong. This file used to say the remaining gap was the
+per-access bounds check "which C at `-O2` does not perform at all". Two
+measurements say otherwise:
+
+- Compiling the bounds check out entirely changed `matmul` by **0ms**. The
+  branch is perfectly predicted, so it is free.
+- Compiling the C with `-fno-vectorize -fno-slp-vectorize` also changed it by
+  **0ms**, so the absence of SIMD was not the gap either.
+
+The actual cost was refcount traffic: the pinned load was still preceded by
+evaluating the list identifier — an increment — and followed by the matching
+decrement, for a value the load never used. Four indirect calls per iteration,
+eight million iterations. Removing them took `matmul` from 61ms to 33ms. The
+lesson is filed under "read the disassembly before naming the bottleneck".
+
+What is left:
+
+- `wordfreq` is 2.8× off C and the widest remaining gap. Lookup is a hash
+  probe, but each iteration allocates a fresh key string, hashes it twice
+  (`get` then `set`), and clones it on insert. CPython interns short strings
+  and caches their hashes, which is why it is unusually competitive here.
+- `sieve` is 1.4× off C on a loop that is memory-bound at 3.4MB.
 
 ## The "faster than Python" question
 

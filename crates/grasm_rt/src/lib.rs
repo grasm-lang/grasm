@@ -335,9 +335,12 @@ pub enum RtPayload {
         name: String,
         fields: Vec<(String, *mut RtVal)>,
     },
+    /// Names are `&'static str` because every one of them is either a literal
+    /// here or a pointer into the compiled binary's read-only data. Copying
+    /// them made `Some(x)` cost two heap allocations before the payload.
     Variant {
-        type_name: String,
-        name: String,
+        type_name: &'static str,
+        name: &'static str,
         fields: Vec<*mut RtVal>,
     },
     /// A function value: code address plus the environment it captured.
@@ -1173,7 +1176,7 @@ unsafe fn display(v: *mut RtVal) -> String {
         }
         RtPayload::Variant { name, fields, .. } => {
             if fields.is_empty() {
-                name.clone()
+                (*name).to_owned()
             } else {
                 let parts: Vec<String> = fields.iter().map(|&f| display(f)).collect();
                 format!("{name}({})", parts.join(", "))
@@ -1226,8 +1229,22 @@ unsafe fn display(v: *mut RtVal) -> String {
 // ---------------------------------------------------------------------------
 
 unsafe fn take_str(ptr: *const u8, len: u64) -> String {
+    borrowed_str(ptr, len).to_owned()
+}
+
+/// A name the compiler emitted into the binary's read-only data.
+///
+/// These live for the whole program, so a variant can hold the `&'static str`
+/// rather than copying it. That copy used to happen on every construction and
+/// on every `is` test — including the `Some`/`None` that every map lookup
+/// builds, which is a heap allocation to say a six-letter word the binary
+/// already contains.
+unsafe fn borrowed_str(ptr: *const u8, len: u64) -> &'static str {
     let bytes = std::slice::from_raw_parts(ptr, len as usize);
-    String::from_utf8_lossy(bytes).into_owned()
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => grasm_panic_msg_str("compiler emitted a non-UTF-8 name"),
+    }
 }
 
 /// # Safety: compiler-generated calls with interned name data.
@@ -1325,8 +1342,8 @@ pub unsafe extern "C" fn grasm_variant_new(
     vl: u64,
 ) -> *mut RtVal {
     alloc(RtPayload::Variant {
-        type_name: take_str(tp, tl),
-        name: take_str(vp, vl),
+        type_name: borrowed_str(tp, tl),
+        name: borrowed_str(vp, vl),
         fields: Vec::new(),
     })
 }
@@ -1344,7 +1361,7 @@ pub unsafe extern "C" fn grasm_variant_push(v: *mut RtVal, val: *mut RtVal) {
 #[no_mangle]
 pub unsafe extern "C" fn grasm_variant_is(v: *mut RtVal, p: *const u8, l: u64) -> i8 {
     match &(*v).payload {
-        RtPayload::Variant { name, .. } => i8::from(*name == take_str(p, l)),
+        RtPayload::Variant { name, .. } => i8::from(*name == borrowed_str(p, l)),
         _ => 0,
     }
 }
@@ -1366,8 +1383,8 @@ pub unsafe extern "C" fn grasm_variant_field(v: *mut RtVal, i: i64) -> *mut RtVa
 #[no_mangle]
 pub unsafe extern "C" fn grasm_ok_new(val: *mut RtVal) -> *mut RtVal {
     alloc(RtPayload::Variant {
-        type_name: "!".into(),
-        name: "Ok".into(),
+        type_name: "!",
+        name: "Ok",
         fields: vec![val],
     })
 }
@@ -1376,8 +1393,8 @@ pub unsafe extern "C" fn grasm_ok_new(val: *mut RtVal) -> *mut RtVal {
 #[no_mangle]
 pub unsafe extern "C" fn grasm_err_new(val: *mut RtVal) -> *mut RtVal {
     alloc(RtPayload::Variant {
-        type_name: "!".into(),
-        name: "Err".into(),
+        type_name: "!",
+        name: "Err",
         fields: vec![val],
     })
 }
@@ -1386,7 +1403,7 @@ pub unsafe extern "C" fn grasm_err_new(val: *mut RtVal) -> *mut RtVal {
 #[no_mangle]
 pub unsafe extern "C" fn grasm_is_ok(v: *mut RtVal) -> i8 {
     match &(*v).payload {
-        RtPayload::Variant { name, .. } => i8::from(name == "Ok"),
+        RtPayload::Variant { name, .. } => i8::from(*name == "Ok"),
         _ => 0,
     }
 }
@@ -1488,16 +1505,16 @@ pub unsafe extern "C" fn grasm_list_get_opt(v: *mut RtVal, i: i64) -> *mut RtVal
         RtPayload::List(items) => {
             if i < 0 || i as usize >= items.len() {
                 alloc(RtPayload::Variant {
-                    type_name: "Option".into(),
-                    name: "None".into(),
+                    type_name: "Option",
+                    name: "None",
                     fields: vec![],
                 })
             } else {
                 let e = items[i as usize];
                 inc(e);
                 alloc(RtPayload::Variant {
-                    type_name: "Option".into(),
-                    name: "Some".into(),
+                    type_name: "Option",
+                    name: "Some",
                     fields: vec![e],
                 })
             }
@@ -1578,14 +1595,14 @@ pub unsafe extern "C" fn grasm_map_get(m: *mut RtVal, k: *mut RtVal) -> *mut RtV
     if let Some(&ev) = entries.get(&MapKey::of(k)) {
         inc(ev);
         return alloc(RtPayload::Variant {
-            type_name: "Option".into(),
-            name: "Some".into(),
+            type_name: "Option",
+            name: "Some",
             fields: vec![ev],
         });
     }
     alloc(RtPayload::Variant {
-        type_name: "Option".into(),
-        name: "None".into(),
+        type_name: "Option",
+        name: "None",
         fields: vec![],
     })
 }
@@ -1772,16 +1789,16 @@ pub unsafe extern "C" fn grasm_str_index_of(s: *mut RtVal, needle: *mut RtVal) -
 
 fn none_val() -> *mut RtVal {
     alloc(RtPayload::Variant {
-        type_name: "Option".into(),
-        name: "None".into(),
+        type_name: "Option",
+        name: "None",
         fields: vec![],
     })
 }
 
 fn some_of(v: *mut RtVal) -> *mut RtVal {
     alloc(RtPayload::Variant {
-        type_name: "Option".into(),
-        name: "Some".into(),
+        type_name: "Option",
+        name: "Some",
         fields: vec![v],
     })
 }
@@ -2164,27 +2181,27 @@ pub extern "C" fn grasm_input() -> *mut RtVal {
 
 // --- filesystem (fallible: returns Ok/Err variants) ---
 
-fn io_err(variant: &str, payload: String) -> *mut RtVal {
+fn io_err(variant: &'static str, payload: String) -> *mut RtVal {
     let inner = alloc(RtPayload::Str(payload));
     alloc(RtPayload::Variant {
-        type_name: "IoError".into(),
-        name: variant.into(),
+        type_name: "IoError",
+        name: variant,
         fields: vec![inner],
     })
 }
 
 fn err_of(v: *mut RtVal) -> *mut RtVal {
     alloc(RtPayload::Variant {
-        type_name: "!".into(),
-        name: "Err".into(),
+        type_name: "!",
+        name: "Err",
         fields: vec![v],
     })
 }
 
 fn ok_of(v: *mut RtVal) -> *mut RtVal {
     alloc(RtPayload::Variant {
-        type_name: "!".into(),
-        name: "Ok".into(),
+        type_name: "!",
+        name: "Ok",
         fields: vec![v],
     })
 }
