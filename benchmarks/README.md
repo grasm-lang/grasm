@@ -51,13 +51,43 @@ is better. Reproduce with `./scripts/bench.sh`.
 
 | program  |   C |  Rust |  Go | grasm-native | grasm-interp | Python |
 |----------|----:|------:|----:|-------------:|-------------:|-------:|
-| fib      |  25 |    26 |  28 |       **27** |         1206 |    153 |
+| fib      |  26 |    26 |  27 |       **27** |         1205 |    153 |
 | sieve    |  28 |    28 |  29 |           39 |         2229 |    370 |
 | matmul   |  25 |    26 |  29 |           32 |         5795 |    974 |
 | wordfreq |  54 |    48 |  39 |          117 |          472 |    153 |
 | sort     |  58 |    33 |  70 |       **47** |          323 |    237 |
 | parmap   |  69 |    72 | 112 |          128 |        32787 |  3,521 |
 | mandelbrot |  36 |   —  |  —  |       **14** |            — |  1,457 |
+
+### Against Nim and Zig
+
+The four programs that have implementations in every language, on one idle
+machine, best of five:
+
+| program  | grasm |   C | Zig | Nim | Rust |  Go |
+|----------|------:|----:|----:|----:|-----:|----:|
+| fib      |    31 |  26 |  29 |  29 |   29 |  29 |
+| sieve    |    43 |  30 |  31 |  33 |   30 |  29 |
+| matmul   |    31 |  25 |  27 |  31 |   25 |  32 |
+| wordfreq |   120 |  53 |  33 |  44 |   48 |  40 |
+
+On arithmetic and loops Grasm is within about 1.2× of the fastest and level
+with Go. On `wordfreq` it is 2.3–3.6× behind everyone, and Zig — with an
+arena allocator and no refcounting — is fastest of all at 33ms. That gap is
+the price of the value representation: every string is a refcounted box, and
+this benchmark allocates two per iteration. It is a design cost, not a
+missing optimisation.
+
+Binary size, release settings, KB:
+
+| program  | grasm |  C | Zig | Nim | Rust |   Go |
+|----------|------:|---:|----:|----:|-----:|-----:|
+| fib      |   433 | 33 | 369 |  71 |  433 | 2332 |
+| wordfreq |   477 | 33 | 370 |  73 |  452 | 2332 |
+
+Nim is a tenth of everyone else because it compiles to C and links almost
+nothing. Grasm matches Rust, which is the company it keeps: a runtime with a
+value representation, refcounting, and formatting.
 
 Native Grasm matches C on `fib`, which is the benchmark that is almost entirely
 function calls and integer arithmetic — the Cranelift call path and the

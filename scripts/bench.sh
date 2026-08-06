@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
-# Cross-language benchmarks: the same five programs in Grasm, C, Rust, Go, and
-# Python, built and timed the same way.
+# Cross-language benchmarks: the same programs in Grasm, C, Rust, Go, Nim, Zig
+# and Python, built and timed the same way.
+#
+# Nim and Zig implement a subset — the four programs where the comparison is
+# about the language rather than about which concurrency primitive each one
+# reaches for — so their other cells read `-`.
 #
 # Every implementation prints the same checksum, and a timing is only reported
 # once the checksum matches. An optimizer that deletes the work being measured
@@ -18,7 +22,7 @@ export GOCACHE="$WORK/gocache"
 trap 'rm -rf "$WORK"' EXIT
 
 PROGRAMS="fib sieve matmul wordfreq sort parmap"
-LANGS="c rust go grasm-native grasm-interp python"
+LANGS="c rust go nim zig grasm-native grasm-interp python"
 # Repeats per program. Enough to smooth scheduler noise without making the
 # whole run take longer than anyone will wait for.
 REPS="${BENCH_REPS:-3}"
@@ -86,6 +90,8 @@ best_ms() {
 run_cmd() {
     case "$1" in
         grasm-interp) echo "$GRASM run $BENCH/grasm/$2.gr" ;;
+        nim) [ -x "$WORK/nim_$2" ] && echo "$WORK/nim_$2" ;;
+        zig) [ -x "$WORK/zig_$2" ] && echo "$WORK/zig_$2" ;;
         python) have python3 && echo "python3 $BENCH/python/$2.py" ;;
         grasm-native) [ -x "$WORK/grasm_$2" ] && echo "$WORK/grasm_$2" ;;
         c) [ -x "$WORK/c_$2" ] && echo "$WORK/c_$2" ;;
@@ -100,6 +106,14 @@ for p in $PROGRAMS; do
     have cc && cc -O2 -pthread -o "$WORK/c_$p" "$BENCH/c/$p.c" >/dev/null 2>&1
     have rustc && rustc -O -o "$WORK/rs_$p" "$BENCH/rust/$p.rs" >/dev/null 2>&1
     have go && go build -o "$WORK/go_$p" "$BENCH/go/$p.go" >/dev/null 2>&1
+    # Nim and Zig only implement the subset that has files; the rest are
+    # reported as `-` rather than silently omitted.
+    have nim && [ -f "$BENCH/nim/$p.nim" ] && \
+        nim c -d:danger --opt:speed --hints:off --warnings:off \
+            -o:"$WORK/nim_$p" "$BENCH/nim/$p.nim" >/dev/null 2>&1
+    have zig && [ -f "$BENCH/zig/$p.zig" ] && \
+        zig build-exe -O ReleaseFast -femit-bin="$WORK/zig_$p" \
+            "$BENCH/zig/$p.zig" >/dev/null 2>&1
 done
 
 # Results are kept in files rather than an associative array so this runs on
