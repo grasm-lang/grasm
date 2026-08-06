@@ -177,6 +177,41 @@ pub enum MapKey {
     Str(String),
 }
 
+thread_local! {
+    /// Buffer reused by every map probe, so looking a string key up does not
+    /// allocate. Only its contents change; the capacity is handed back.
+    static PROBE: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// Calls `f` with `v` seen as a map key, without taking ownership of it.
+///
+/// A lookup does not need to own its key, but `HashMap::get` wants a `&MapKey`
+/// and `MapKey` owns its string — so building one used to copy the key onto
+/// the heap and drop it a few instructions later, on every get, has, and
+/// remove. Here the string is copied into a buffer that keeps its capacity
+/// between calls, so after the first probe there is no allocation at all.
+///
+/// # Safety: live runtime pointer.
+unsafe fn with_key<R>(v: *mut RtVal, f: impl FnOnce(&MapKey) -> R) -> R {
+    match &(*v).payload {
+        RtPayload::Bool(b) => f(&MapKey::Bool(*b)),
+        RtPayload::I64(n) => f(&MapKey::I64(*n)),
+        RtPayload::Str(s) => PROBE.with(|cell| {
+            let mut buf = cell.borrow_mut();
+            buf.clear();
+            buf.push_str(s);
+            let key = MapKey::Str(std::mem::take(&mut buf));
+            let out = f(&key);
+            let MapKey::Str(returned) = key else {
+                unreachable!()
+            };
+            *buf = returned;
+            out
+        }),
+        _ => grasm_panic_msg_str("map keys must be i64, str, or bool"),
+    }
+}
+
 impl MapKey {
     /// # Safety: live runtime pointer.
     unsafe fn of(v: *mut RtVal) -> MapKey {
@@ -1578,8 +1613,17 @@ pub unsafe extern "C" fn grasm_map_set(
     let RtPayload::Map(entries) = &mut (*target).payload else {
         unreachable!()
     };
-    if let Some(old) = entries.insert(MapKey::of(k), v) {
-        dec(old);
+    // Overwriting an existing entry keeps the key already in the table, so
+    // only a genuinely new key has to be built and owned. That is the rare
+    // case: a counting loop misses once per distinct word and hits every
+    // time after.
+    match with_key(k, |kk| entries.get_mut(kk).map(std::ptr::from_mut)) {
+        Some(slot) => {
+            dec(std::mem::replace(&mut *slot, v));
+        }
+        None => {
+            entries.insert(MapKey::of(k), v);
+        }
     }
     // The key is owned by the caller's +1; the table holds an owned MapKey.
     dec(k);
@@ -1592,7 +1636,7 @@ pub unsafe extern "C" fn grasm_map_get(m: *mut RtVal, k: *mut RtVal) -> *mut RtV
     let RtPayload::Map(entries) = &(*m).payload else {
         grasm_panic_msg_str("get on non-map");
     };
-    if let Some(&ev) = entries.get(&MapKey::of(k)) {
+    if let Some(ev) = with_key(k, |kk| entries.get(kk).copied()) {
         inc(ev);
         return alloc(RtPayload::Variant {
             type_name: "Option",
@@ -1613,7 +1657,7 @@ pub unsafe extern "C" fn grasm_map_has(m: *mut RtVal, k: *mut RtVal) -> i8 {
     let RtPayload::Map(entries) = &(*m).payload else {
         grasm_panic_msg_str("has on non-map");
     };
-    i8::from(entries.contains_key(&MapKey::of(k)))
+    i8::from(with_key(k, |kk| entries.contains_key(kk)))
 }
 
 /// # Safety: live pointers; returns (map, removed?) via out-param style: the
@@ -1628,7 +1672,7 @@ pub unsafe extern "C" fn grasm_map_delete(
     let RtPayload::Map(entries) = &mut (*target).payload else {
         unreachable!()
     };
-    match entries.remove(&MapKey::of(k)) {
+    match with_key(k, |kk| entries.remove(kk)) {
         Some(ev) => {
             dec(ev);
             *found = 1;
