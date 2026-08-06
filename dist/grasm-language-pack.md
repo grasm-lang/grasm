@@ -409,10 +409,18 @@ entry file. `import mathlib` after
 ```toml
 [dependencies.mathlib]
 path = "../mathlib"
+version = "^0.2.0"        # optional
 ```
 
 makes its `pub` functions available as `mathlib.f(...)`. A dependency is a
 library and needs no `main`.
+
+`version` is optional. `=X.Y.Z` accepts that version alone; `^X.Y.Z` — which a
+bare `X.Y.Z` also means — accepts it or any later version that does not change
+the leading non-zero number, so `^1.2.3` stops below `2.0.0`, `^0.2.3` stops
+below `0.3.0`, and `^0.0.3` accepts only `0.0.3`. A name resolves to exactly
+one package: reaching one name through two different directories is an error,
+not a choice the toolchain makes on the program's behalf.
 
 
 <!-- ===== spec/semantics.md ===== -->
@@ -975,7 +983,12 @@ capabilities = []          # this package performs no effects
 
 [dependencies.utils]
 path = "../utils"
+version = "^1.0.0"         # optional: 1.x, and no other line
 ```
+
+`version` accepts a compatible range with `^` (a bare `1.0.0` means the same)
+or one exact version with `=`. Before 1.0 the minor number carries the weight
+of a major, so `^0.2.0` stops below `0.3.0`.
 
 `capabilities` is a **ceiling**, and it is checked against what the code
 actually does. Because effects are inferred from source, a dependency that

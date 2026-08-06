@@ -254,7 +254,12 @@ capabilities = []          # this package performs no effects
 
 [dependencies.utils]
 path = "../utils"
+version = "^1.0.0"         # optional: 1.x, and no other line
 ```
+
+`version` accepts a compatible range with `^` (a bare `1.0.0` means the same)
+or one exact version with `=`. Before 1.0 the minor number carries the weight
+of a major, so `^0.2.0` stops below `0.3.0`.
 
 `capabilities` is a **ceiling**, and it is checked against what the code
 actually does. Because effects are inferred from source, a dependency that

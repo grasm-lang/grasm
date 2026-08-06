@@ -171,7 +171,15 @@ entry file. `import mathlib` after
 ```toml
 [dependencies.mathlib]
 path = "../mathlib"
+version = "^0.2.0"        # optional
 ```
 
 makes its `pub` functions available as `mathlib.f(...)`. A dependency is a
 library and needs no `main`.
+
+`version` is optional. `=X.Y.Z` accepts that version alone; `^X.Y.Z` — which a
+bare `X.Y.Z` also means — accepts it or any later version that does not change
+the leading non-zero number, so `^1.2.3` stops below `2.0.0`, `^0.2.3` stops
+below `0.3.0`, and `^0.0.3` accepts only `0.0.3`. A name resolves to exactly
+one package: reaching one name through two different directories is an error,
+not a choice the toolchain makes on the program's behalf.

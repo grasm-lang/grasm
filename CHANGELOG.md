@@ -37,19 +37,29 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
 - **The native backend compiles function values.** A named function used as
   data, a closure bound to a name, closures capturing their environment, and
   lists of either — all dispatched through an indirect call. Native coverage
-  goes from 103 programs to **113 of 113: nothing in the repository is left to
-  the interpreter.**
+  goes from 103 programs to **all of them: nothing in the repository is left
+  to the interpreter.**
 
 - **Unboxed scalar collections.** `[i64]`, `[f64]`, and `[bool]` store
   elements inline — one word each, no per-element heap cell, no refcount
   traffic. sieve 89→58ms, matmul 187→92ms, sort 97→49ms (now faster than C
   and Go). Representation only; `[E-COW]` says it is never observable, and
-  difftest holds all 115 programs byte-identical across both engines.
+  difftest holds every program byte-identical across both engines.
 
 - **Native binaries dead-strip the runtime.** `-Wl,-dead_strip` (macOS) /
   `--gc-sections` (Linux) at link time: 1,503 KB → ~442 KB mean, matching
   Rust. The rest is `std` machinery; going lower needs `no_std` or
   `build-std`.
+
+- **`par_filter` — the other half of effect-proven parallelism.** The predicate
+  runs across cores into a mask; compaction then walks the mask in order, so
+  the output is the same whatever the core count is ([E-PAR-FILTER-ORDER]).
+
+- **Version requirements on dependencies.** `version = "^0.3.1"` accepts that
+  version or any later one that does not change the leading non-zero number;
+  `=0.3.1` accepts exactly it; bare `0.3.1` means `^0.3.1`. Before 1.0 the
+  minor number carries the weight of a major, the same rule the stability
+  policy states for the language.
 
 - **`par_map` — multi-core, deterministic.** `xs.par_map(f)` spreads elements
   across cores: **5.9× on 8 cores**, byte-identical output. Safety comes from
@@ -78,9 +88,32 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   run time with "unknown name", because tasks run after the block's scope is
   gone. It is now a compile error ([T-TASK-CAPTURE]).
 
+- Element access in a hot loop went through the runtime on every read and
+  write. A list a loop body only ever indexes is now pinned for the loop and
+  reached through its data pointer. The first round left a refcount round trip
+  on each read — an increment and a matching decrement around a value the load
+  never used, four indirect calls per iteration of `matmul`'s inner loop.
+  `matmul` 99ms → 61ms → **30ms**, against C's 25ms.
+- Maps scanned a sorted vector; they are hash tables now, and iteration sorts,
+  so `[E-MAP-ORDER]` is paid once per iteration rather than on every lookup.
+  A lookup also no longer copies its key onto the heap to look at it.
+- `RtPayload::Variant` held its names as `String`, so every `Some(x)` — every
+  map lookup builds one — allocated a private copy of the word "Some". Names
+  are static data and are borrowed now.
+- Scalar list iteration returned a boxed trait object, so summing a list paid
+  a dynamic dispatch per element. Now 0.1ns/element.
+- Two directories claiming the same package name resolved to whichever the
+  walk reached first, silently, and the other dependent linked something it
+  never asked for. It is an error naming both directories, both versions, and
+  who required each.
+- `scripts/crosstest.sh` counted a link failure as "unsupported", so a runtime
+  archive older than its own source read as a backend limitation and cost
+  seven programs of coverage without a word. It now refuses a stale archive up
+  front and names every skip with the step that gave up.
+
 ### Changed
 
 - `scripts/difftest.sh` covers `spec/conformance/` and `benchmarks/` as well as
-  `examples/` and `projects/` — 19 programs to 103. It compares stdout and exit
+  `examples/` and `projects/` — 19 programs to 128. It compares stdout and exit
   codes strictly; stderr is compared with the interpreter-only panic trace block
   excluded, a gap recorded in the README rather than hidden.
