@@ -282,6 +282,38 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Some("publish") => {
+            let dir = args
+                .get(1)
+                .filter(|a| !a.starts_with("--"))
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."));
+            match cmd_publish(&dir, flag_value(&args[1..], "--registry")) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Some("add") => {
+            let (Some(name), Some(version)) = (args.get(1), args.get(2)) else {
+                eprintln!("usage: grasm add <name> <version> [dir]");
+                return ExitCode::FAILURE;
+            };
+            let dir = args
+                .get(3)
+                .filter(|a| !a.starts_with("--"))
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."));
+            match cmd_add(&dir, name, version) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Some("lsp") => {
             let stdin = std::io::stdin();
             let mut input = stdin.lock();
@@ -373,6 +405,9 @@ fn main() -> ExitCode {
             eprintln!("  dap                          debug adapter (stdio) — breakpoints, stepping");
             eprintln!("  deps [dir]                   resolve dependencies, check capabilities, write grasm.lock");
             eprintln!("      --locked                 fail if anything changed since grasm.lock (CI)");
+            eprintln!("  publish [dir]                copy a package into a registry (versions are immutable)");
+            eprintln!("      --registry <dir>         registry root (else GRASM_REGISTRY, else .grasm/registry)");
+            eprintln!("  add <name> <version> [dir]   add a registry dependency to grasm.toml");
             eprintln!("  tokens <file.gr>             dump lexer output (debug)");
             eprintln!("  version                      print version");
             ExitCode::FAILURE
@@ -828,6 +863,44 @@ fn build_native_incremental(
 
 /// Resolves the dependency graph, enforces each package's capability ceiling,
 /// and writes the lockfile.
+/// Where to publish to: `--registry`, else `GRASM_REGISTRY`, else the nearest
+/// `.grasm/registry`. Creating one is the publisher's decision, so a missing
+/// registry says how to make one rather than making it.
+fn publish_registry(
+    dir: &std::path::Path,
+    flag: Option<String>,
+) -> Result<grasm_pkg::Registry, String> {
+    if let Some(p) = flag {
+        return Ok(grasm_pkg::Registry::new(PathBuf::from(p)));
+    }
+    grasm_pkg::Registry::discover(dir).ok_or_else(|| {
+        "no registry found\n  \
+         pass --registry <dir>, set GRASM_REGISTRY, or create .grasm/registry"
+            .to_string()
+    })
+}
+
+fn cmd_publish(dir: &std::path::Path, registry: Option<String>) -> Result<(), String> {
+    let reg = publish_registry(dir, registry)?;
+    let out = grasm_pkg::publish(dir, &reg)?;
+    println!(
+        "published {} {} — {} file(s) to {}",
+        out.name,
+        out.version,
+        out.files,
+        out.dir.display()
+    );
+    Ok(())
+}
+
+fn cmd_add(dir: &std::path::Path, name: &str, version: &str) -> Result<(), String> {
+    let req = grasm_pkg::VersionReq::parse(version)?;
+    let into = grasm_pkg::add_dependency(dir, name, &req)?;
+    println!("added `{name}` {req} to {into}");
+    println!("  run `grasm deps` to resolve it");
+    Ok(())
+}
+
 fn cmd_deps(dir: &std::path::Path, locked: bool) -> Result<(), String> {
     let resolution = grasm_pkg::resolve(dir)?;
     let root = resolution.root();
@@ -843,11 +916,18 @@ fn cmd_deps(dir: &std::path::Path, locked: bool) -> Result<(), String> {
     // permits fails the build for everyone who depends on it.
     let mut violations = Vec::new();
     let mut unknown: Vec<grasm_pkg::UnknownCapability> = Vec::new();
+    let mut unanalyzable = Vec::new();
     for pkg in &resolution.packages {
+        // A package that cannot be analyzed used to warn and carry on, which
+        // meant the ceiling silently stopped being enforced for it while the
+        // command still exited 0 and wrote the lockfile. There is no safe
+        // reading of "I could not check this dependency": whatever the reason,
+        // the guarantee the ceiling exists to give is not being given.
         let performed = match grasm_pkg::effects_of_package(pkg) {
             Ok(e) => e,
             Err(e) => {
-                eprintln!("warning: cannot analyze `{}`: {e}", pkg.name);
+                println!("  {:<16} CANNOT ANALYZE", pkg.name);
+                unanalyzable.push(format!("`{}`: {e}", pkg.name));
                 continue;
             }
         };
@@ -871,6 +951,20 @@ fn cmd_deps(dir: &std::path::Path, locked: bool) -> Result<(), String> {
         if let Ok(vocab) = grasm_pkg::effect_vocabulary_of_package(pkg) {
             unknown.extend(grasm_pkg::check_capability_names(pkg, &vocab));
         }
+    }
+
+    if !unanalyzable.is_empty() {
+        for u in &unanalyzable {
+            eprintln!("error: cannot analyze {u}");
+        }
+        eprintln!(
+            "  help: a package whose effects cannot be inferred cannot be held \
+to its ceiling,\n        so its dependents get no guarantee at all"
+        );
+        return Err(format!(
+            "{} package(s) could not be checked",
+            unanalyzable.len()
+        ));
     }
 
     if !unknown.is_empty() {

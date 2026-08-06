@@ -323,18 +323,79 @@ pub fn check_effects_multi(files: &[ModuleView]) -> Vec<Diagnostic> {
     diags
 }
 
+/// The effect row of the function handed to a parallel operation.
+///
+/// Walking the argument as an ordinary expression is not enough, and getting
+/// this wrong is not a missed diagnostic — it is the safety claim failing
+/// silently. An identifier contributes no effects *as an expression*, because
+/// naming a value does not perform anything. But here the identifier **is** the
+/// function that is about to run on several cores, so what counts is its row,
+/// not the row of the mention.
+///
+/// Before this, only a closure written inline at the call site was checked.
+/// `xs.par_map(announce)` compiled and ran a printing function across threads —
+/// even with `/ {io}` declared on it in plain sight.
+fn par_fn_row<'a>(
+    func: &'a Expr,
+    current: &str,
+    bound: &HashMap<String, &'a Expr>,
+    ctx: &Ctx,
+    active: &mut Vec<String>,
+    out: &mut BTreeSet<String>,
+) {
+    if let Expr::Ident(id) = func {
+        if let Some(qual) = ctx.resolve_call(current, &id.name) {
+            if let Some(row) = ctx.rows.get(&qual) {
+                out.extend(row.iter().cloned());
+            }
+            return;
+        }
+        if let Some(inner) = bound.get(&id.name) {
+            walk_expr(inner, current, active, ctx, out);
+            return;
+        }
+    }
+    walk_expr(func, current, active, ctx, out);
+}
+
+/// Every `let`/`var` in the block whose initializer is a closure, by name.
+fn collect_closure_bindings<'a>(b: &'a Block, out: &mut HashMap<String, &'a Expr>) {
+    for stmt in &b.stmts {
+        match stmt {
+            Stmt::Let { name, init, .. } => {
+                if matches!(init, Expr::Closure { .. }) {
+                    out.insert(name.name.clone(), init);
+                }
+            }
+            Stmt::While { body, .. } | Stmt::For { body, .. } => {
+                collect_closure_bindings(body, out)
+            }
+            Stmt::Parallel { body, .. } | Stmt::Spawn { body, .. } => {
+                collect_closure_bindings(body, out)
+            }
+            Stmt::With { body, .. } => collect_closure_bindings(body, out),
+            _ => {}
+        }
+    }
+}
+
 /// `par_map` runs its function on several cores at once, so an effect inside
 /// it would interleave unpredictably between runs. Requiring the row to be
 /// empty is exactly what makes the parallelism deterministic — and because
 /// effects are inferred, this is a compile error rather than a race nobody can
 /// reproduce ([T-PAR-MAP-PURE]).
 fn check_par_map_block(b: &Block, current: &str, ctx: &Ctx, diags: &mut Vec<Diagnostic>) {
+    // Closures given a name first, so `let f = |x| ...` followed by
+    // `xs.par_map(f)` is checked the same as passing the closure inline.
+    let mut bound: HashMap<String, &Expr> = HashMap::new();
+    collect_closure_bindings(b, &mut bound);
+
     let mut calls = Vec::new();
     collect_par_maps_block(b, &mut calls);
     for (func, span) in calls {
         let mut row = BTreeSet::new();
         let mut active = Vec::new();
-        walk_expr(func, current, &mut active, ctx, &mut row);
+        par_fn_row(func, current, &bound, ctx, &mut active, &mut row);
         if row.is_empty() {
             continue;
         }

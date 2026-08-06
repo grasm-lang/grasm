@@ -852,3 +852,64 @@ fn par_filter_rejects_an_effect_reached_indirectly() {
         "effect-free",
     );
 }
+
+// The purity check used to fire only on a closure written inline at the call
+// site. Every other way of naming the same effectful function compiled, and
+// ran it on several cores — including with the effect row declared in plain
+// sight. A cold-model run found this; these hold the fix.
+
+#[test]
+fn par_map_rejects_a_named_effectful_function() {
+    check_err(
+        "fn announce(x: i64) -> i64 {\n    print(\"{x}\")\n    x * 2\n}\n\nfn main() {\n    print(\"{[1, 2].par_map(announce)}\")\n}\n",
+        "effect-free",
+    );
+}
+
+#[test]
+fn par_map_rejects_a_named_function_whose_row_is_declared() {
+    // The worst spelling of the three: the row is written on the function,
+    // so the compiler was being told exactly what it failed to notice.
+    check_err(
+        "fn announce(x: i64) -> i64 / {io} {\n    print(\"{x}\")\n    x * 2\n}\n\nfn main() {\n    print(\"{[1, 2].par_map(announce)}\")\n}\n",
+        "effect-free",
+    );
+}
+
+#[test]
+fn par_map_rejects_a_closure_given_a_name_first() {
+    check_err(
+        "fn main() {\n    let f = |x| {\n        print(\"{x}\")\n        x * 2\n    }\n    print(\"{[1, 2].par_map(f)}\")\n}\n",
+        "effect-free",
+    );
+}
+
+#[test]
+fn par_filter_rejects_a_named_effectful_function() {
+    check_err(
+        "fn loud(x: i64) -> bool {\n    print(\"{x}\")\n    x > 1\n}\n\nfn main() {\n    print(\"{[1, 2].par_filter(loud)}\")\n}\n",
+        "effect-free",
+    );
+}
+
+#[test]
+fn par_map_rejects_a_named_function_effectful_two_calls_down() {
+    check_err(
+        "fn inner(x: i64) -> i64 {\n    print(\"{x}\")\n    x\n}\n\nfn outer(x: i64) -> i64 {\n    inner(x) + 1\n}\n\nfn main() {\n    print(\"{[1, 2].par_map(outer)}\")\n}\n",
+        "effect-free",
+    );
+}
+
+#[test]
+fn par_map_still_accepts_pure_functions_by_name() {
+    // The fix must not make the feature unusable: a named pure function and a
+    // named pure closure are the two most natural ways to write this.
+    check_ok("fn dbl(x: i64) -> i64 {\n    x * 2\n}\n\nfn main() {\n    print(\"{[1, 2].par_map(dbl)}\")\n}\n");
+    check_ok("fn main() {\n    let f = |x| x * 2\n    print(\"{[1, 2].par_map(f)}\")\n}\n");
+}
+
+#[test]
+fn plain_map_still_allows_effects() {
+    // `map` is sequential, so an effect in it is ordinary code, not a race.
+    check_ok("fn announce(x: i64) -> i64 {\n    print(\"{x}\")\n    x\n}\n\nfn main() {\n    print(\"{[1, 2].map(announce)}\")\n}\n");
+}

@@ -311,6 +311,140 @@ impl Registry {
     }
 }
 
+/// What `publish` did, so the caller can report it without re-deriving it.
+pub struct Published {
+    pub name: String,
+    pub version: Version,
+    pub dir: PathBuf,
+    pub files: usize,
+}
+
+/// Copies a package into a registry at its declared version.
+///
+/// **A published version is immutable.** Republishing a version that already
+/// exists is refused rather than overwritten, and that refusal is the whole
+/// point: `grasm.lock` records a checksum per package, so content that changes
+/// under a fixed version number is the one supply-chain move the lockfile is
+/// there to catch. Refusing it at the source is better than catching it at
+/// every consumer.
+///
+/// Only the manifest and the source tree are copied. Build output, lockfiles,
+/// and version-control directories are a publisher's local state and have no
+/// business in a package other people resolve against.
+pub fn publish(pkg_dir: &Path, registry: &Registry) -> Result<Published, String> {
+    let manifest = Manifest::load(pkg_dir)?;
+    let version = Version::parse(&manifest.version)?;
+
+    let entry = manifest.entry_path();
+    if !entry.exists() {
+        return Err(format!(
+            "package `{}`: entry file {} does not exist",
+            manifest.name,
+            entry.display()
+        ));
+    }
+
+    // A package that already exceeds its own ceiling should not enter a
+    // registry at all: every consumer would fail, and the failure would look
+    // like their problem.
+    let performed = effects_of_package(&manifest)?;
+    if let Some(v) = check_capabilities(&manifest, &performed) {
+        return Err(format!("{v}\n  refusing to publish a package that exceeds its own ceiling"));
+    }
+
+    let dest = registry.dir(&manifest.name, &version);
+    if dest.join(MANIFEST_NAME).exists() {
+        return Err(format!(
+            "`{}` {} is already in the registry at {}\n  \
+             a published version is immutable — publish {}.{}.{} instead\n  \
+             (`grasm.lock` records a checksum per package, so content that\n  \
+             changes under a fixed version is exactly what it exists to catch)",
+            manifest.name,
+            version,
+            dest.display(),
+            version.major,
+            version.minor,
+            version.patch + 1,
+        ));
+    }
+
+    std::fs::create_dir_all(&dest)
+        .map_err(|e| format!("cannot create {}: {e}", dest.display()))?;
+    let mut files = 0;
+    copy_into(&pkg_dir.join(MANIFEST_NAME), &dest.join(MANIFEST_NAME))?;
+    files += 1;
+    let src_root = entry.parent().unwrap_or(pkg_dir);
+    let rel = src_root
+        .strip_prefix(pkg_dir)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|_| PathBuf::from("src"));
+    files += copy_sources(src_root, &dest.join(rel))?;
+
+    Ok(Published {
+        name: manifest.name,
+        version,
+        dir: dest,
+        files,
+    })
+}
+
+/// Adds a registry dependency to a manifest, in the text the author wrote.
+///
+/// Appends rather than reformats. A manifest is a file someone maintains by
+/// hand — comments, ordering, and spacing are theirs — and a tool that
+/// rewrites it to its own taste every time it touches it is a tool people stop
+/// using.
+pub fn add_dependency(pkg_dir: &Path, name: &str, req: &VersionReq) -> Result<String, String> {
+    let path = pkg_dir.join(MANIFEST_NAME);
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let manifest = Manifest::parse(&text, pkg_dir)?;
+    if let Some(existing) = manifest.dependencies.iter().find(|d| d.name == name) {
+        return Err(match &existing.req {
+            Some(r) => format!("`{name}` is already a dependency, at {r}"),
+            None => format!("`{name}` is already a dependency, by path"),
+        });
+    }
+    let mut out = text;
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&format!("\n[dependencies.{name}]\nversion = \"{req}\"\n"));
+    std::fs::write(&path, &out).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    Ok(manifest.name)
+}
+
+fn copy_into(from: &Path, to: &Path) -> Result<(), String> {
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    }
+    std::fs::copy(from, to)
+        .map(|_| ())
+        .map_err(|e| format!("cannot copy {} to {}: {e}", from.display(), to.display()))
+}
+
+/// Every `.gr` file under `from`, preserving the tree so imports still resolve.
+fn copy_sources(from: &Path, to: &Path) -> Result<usize, String> {
+    let mut n = 0;
+    let entries =
+        std::fs::read_dir(from).map_err(|e| format!("cannot read {}: {e}", from.display()))?;
+    for e in entries.flatten() {
+        let path = e.path();
+        let name = e.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with('.') {
+            continue;
+        }
+        if path.is_dir() {
+            n += copy_sources(&path, &to.join(name))?;
+        } else if path.extension().and_then(|s| s.to_str()) == Some("gr") {
+            copy_into(&path, &to.join(name))?;
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
 /// One package's stated requirement, kept so a conflict can name who asked.
 #[derive(Debug, Clone)]
 struct Requirement {
