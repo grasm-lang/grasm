@@ -7,6 +7,22 @@ use std::rc::Rc;
 
 use grasm_syntax::ast::{Block, Ident};
 
+/// A float, always distinguishable from an integer.
+///
+/// [L-DISPLAY] promises a point, and the point is the whole property: without
+/// it a large `f64` prints exactly like an `i64`, and a reader of a program's
+/// output cannot tell which they have. The rule used to be "a point below
+/// 1e15", which meant the guarantee quietly stopped holding at a boundary
+/// nobody could see — and the conformance program only tested values below it.
+pub fn float_text(v: f64) -> String {
+    let s = format!("{v}");
+    if v.is_finite() && !s.contains(['.', 'e', 'E']) {
+        format!("{s}.0")
+    } else {
+        s
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Value {
     Int(i64),
@@ -165,13 +181,7 @@ impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Value::Int(v) => write!(f, "{v}"),
-            Value::Float(v) => {
-                if v.fract() == 0.0 && v.is_finite() && v.abs() < 1e15 {
-                    write!(f, "{v:.1}")
-                } else {
-                    write!(f, "{v}")
-                }
-            }
+            Value::Float(v) => write!(f, "{}", crate::value::float_text(*v)),
             Value::Bool(v) => write!(f, "{v}"),
             Value::Str(s) => write!(f, "{s}"),
             Value::Unit => write!(f, "()"),

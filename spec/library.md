@@ -36,7 +36,8 @@ is judged on.
 | type | rendering | example |
 |------|-----------|---------|
 | `i64` | decimal | `-7` |
-| `f64` | shortest form that round-trips, always with a point | `1.5`, `1000000.0`, `-0.0` |
+| `f64` | shortest form that round-trips, **always with a point** at every magnitude | `1.5`, `1000000.0`, `1000000000000000.0`, `-0.0` |
+| `()` | `()` | |
 | `bool` | `true` / `false` | |
 | `str` | its characters, **unquoted and unescaped** | `b c` |
 | `[T]` | elements in order, `, `-separated, in brackets | `[1, 2, 3]`, `[a, b c]` |

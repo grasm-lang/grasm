@@ -22,6 +22,27 @@ with a migration note in the changelog. Most of the language is here today.
 **`experimental`** — may change or be removed in any release, without a
 deprecation period. New surface starts here.
 
+## What gets promoted, and when
+
+A clause moves from `provisional` to `stable` when all five hold. The test is
+written down so the decision is auditable rather than a matter of taste, and
+so anyone can check it against the repository:
+
+1. It has a conformance program, and that program passes under both engines.
+2. **Its meaning has never changed.** Not "has not changed lately" — the
+   program's history shows edits that added coverage, never ones that reversed
+   a behaviour.
+3. It is not the newest work. A clause written this month has been used by
+   nobody, and "we have not found a problem" is not evidence when there has
+   been no opportunity to find one.
+4. It names nothing the implementation admits is unfinished.
+5. It is not in an area with open design work. A clause is not settled because
+   *it* has not moved; it is unsettled if the thing around it is moving.
+
+Rules 3 and 5 are what keep this honest. Everything else here would promote
+the whole specification on the grounds that a single author has not yet
+contradicted himself.
+
 ## What "breaking" means
 
 A change is breaking if a program that compiled and ran correctly before now
@@ -60,7 +81,12 @@ exists to prevent.
 1.0 is not a date, it is a checklist:
 
 1. Every clause in `spec/` is `stable` or deliberately, documentedly not.
-   Today: 45 stable, 60 provisional, 16 experimental, of 121.
+   Today: **91 stable, 20 provisional, 16 experimental**, of 127. The twenty
+   are the ones that fail a promotion rule and say which — library
+   inventories that will grow, the effect system where this month's work
+   happened, generic bounds as the known next step, `T-INT-ALIAS` naming
+   types the implementation admits are unfinished, and the clauses written
+   too recently for "no problem found" to mean anything.
 2. The native backend compiles every program the interpreter runs. It does
    today — `scripts/difftest.sh` reports 130 identical and 0 unsupported — and
    staying there is the requirement: any construct the backend cannot compile

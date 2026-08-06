@@ -31,14 +31,28 @@ pub extern "C" fn grasm_out_i64(v: i64) {
     let _ = write!(out, "{v}");
 }
 
+/// A float, always distinguishable from an integer.
+///
+/// [L-DISPLAY] promises a point, and the point is the property: without it a
+/// large `f64` prints exactly like an `i64` and a reader of the output cannot
+/// tell which they have. The rule was written out four separate times, each
+/// saying "a point below 1e15" — a guarantee with an invisible boundary in
+/// it, which the conformance program missed because it only tested values on
+/// the near side. One function now, so there is nowhere for the copies to
+/// disagree.
+pub fn float_text(v: f64) -> String {
+    let s = format!("{v}");
+    if v.is_finite() && !s.contains(['.', 'e', 'E']) {
+        format!("{s}.0")
+    } else {
+        s
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn grasm_out_f64(v: f64) {
     let mut out = std::io::stdout().lock();
-    if v.fract() == 0.0 && v.is_finite() && v.abs() < 1e15 {
-        let _ = write!(out, "{v:.1}");
-    } else {
-        let _ = write!(out, "{v}");
-    }
+    let _ = write!(out, "{}", float_text(v));
 }
 
 #[no_mangle]
@@ -552,12 +566,7 @@ pub unsafe extern "C" fn grasm_str_from_i64(v: i64) -> *mut RtVal {
 
 #[no_mangle]
 pub unsafe extern "C" fn grasm_str_from_f64(v: f64) -> *mut RtVal {
-    let s = if v.fract() == 0.0 && v.is_finite() && v.abs() < 1e15 {
-        format!("{v:.1}")
-    } else {
-        format!("{v}")
-    };
-    alloc(RtPayload::Str(s))
+    alloc(RtPayload::Str(float_text(v)))
 }
 
 #[no_mangle]
@@ -920,14 +929,7 @@ fn scalar_eq(kind: ScalarKind, a: i64, b: i64) -> bool {
 fn scalar_display(kind: ScalarKind, bits: i64) -> String {
     match kind {
         ScalarKind::I64 => bits.to_string(),
-        ScalarKind::F64 => {
-            let x = f64::from_bits(bits as u64);
-            if x.fract() == 0.0 && x.is_finite() && x.abs() < 1e15 {
-                format!("{x:.1}")
-            } else {
-                format!("{x}")
-            }
-        }
+        ScalarKind::F64 => float_text(f64::from_bits(bits as u64)),
         ScalarKind::Bool => (bits != 0).to_string(),
     }
 }
@@ -1249,13 +1251,7 @@ unsafe fn display(v: *mut RtVal) -> String {
             None => "<closure>".to_string(),
         },
         RtPayload::I64(x) => x.to_string(),
-        RtPayload::F64(x) => {
-            if x.fract() == 0.0 && x.is_finite() && x.abs() < 1e15 {
-                format!("{x:.1}")
-            } else {
-                format!("{x}")
-            }
-        }
+        RtPayload::F64(x) => float_text(*x),
         RtPayload::Bool(x) => x.to_string(),
         RtPayload::Str(s) => s.clone(),
         RtPayload::List(items) => {

@@ -609,3 +609,49 @@ fn the_language_pack_is_current_and_complete() {
         pack.len()
     );
 }
+
+#[test]
+fn every_clause_is_filed_under_the_heading_that_matches_its_level() {
+    // `spec/stability.md` lists each clause twice over: once by the heading it
+    // sits under, once by the word after the dash. Those drifted apart —
+    // clauses labelled `provisional` sat in the `## Stable` section — and no
+    // test noticed, because the existing ones check that every clause *has* a
+    // level, not that the document says the same thing in both places.
+    //
+    // A stability table that contradicts itself is worse than none: a reader
+    // scanning headings and a tool parsing labels get different answers about
+    // what the project has promised.
+    let text = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../spec/stability.md"),
+    )
+    .expect("spec/stability.md is readable");
+
+    let mut section: Option<String> = None;
+    let mut wrong: Vec<String> = Vec::new();
+    for line in text.lines() {
+        if let Some(h) = line.strip_prefix("## ") {
+            section = Some(h.trim().to_lowercase());
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("- `") else {
+            continue;
+        };
+        let Some((tag, after)) = rest.split_once("` — ") else {
+            continue;
+        };
+        let level = after.trim();
+        if let Some(sec) = &section {
+            if sec != level {
+                wrong.push(format!("`{tag}` is `{level}` but sits under `## {sec}`"));
+            }
+        }
+    }
+
+    assert!(
+        wrong.is_empty(),
+        "{} clause(s) are filed under the wrong heading in spec/stability.md:\n  {}",
+        wrong.len(),
+        wrong.join("\n  ")
+    );
+}

@@ -702,7 +702,8 @@ is judged on.
 | type | rendering | example |
 |------|-----------|---------|
 | `i64` | decimal | `-7` |
-| `f64` | shortest form that round-trips, always with a point | `1.5`, `1000000.0`, `-0.0` |
+| `f64` | shortest form that round-trips, **always with a point** at every magnitude | `1.5`, `1000000.0`, `1000000000000000.0`, `-0.0` |
+| `()` | `()` | |
 | `bool` | `true` / `false` | |
 | `str` | its characters, **unquoted and unescaped** | `b c` |
 | `[T]` | elements in order, `, `-separated, in brackets | `[1, 2, 3]`, `[a, b c]` |
@@ -2454,6 +2455,9 @@ fn main() {
 //! -7
 //! 1.5
 //! 1000000.0
+//! 1000000000000000.0
+//! 1e300 has a point too
+//! ()
 //! true
 //! b c
 //! [1, 2, 3]
@@ -2479,6 +2483,16 @@ fn main() {
     print("{-7}")
     print("{1.5}")
     print("{1000000.0}")
+    // Past 1e15, where the old rule quietly stopped applying: a float has to
+    // stay distinguishable from an integer at every magnitude, or reading a
+    // program's output means guessing which type produced it.
+    print("{1000000000000000.0}")
+    let big = 1.0e300
+    let shown = "{big}"
+    print("1e300 has a point too")
+    assert(shown.contains("."))
+    // Unit, which [T-PRIM] lists and the table did not.
+    print("{()}")
     print("{true}")
     print("{"b c"}")
     print("{[1, 2, 3]}")
