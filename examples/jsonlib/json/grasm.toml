@@ -1,0 +1,8 @@
+[package]
+name = "json"
+version = "1.0.0"
+
+# Parsing and rendering is pure computation. It reads no files, opens no
+# sockets, and reads no clock — and this line is checked against the source
+# rather than believed.
+capabilities = []

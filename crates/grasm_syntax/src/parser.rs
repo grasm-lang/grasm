@@ -1415,10 +1415,21 @@ impl Parser {
             TokenKind::LBrace => Ok(Expr::Block(self.parse_block()?)),
             TokenKind::Pipe => self.parse_closure(),
             other => {
-                self.diags.push(Diagnostic::error(
+                // Operators other languages spell differently are the ones a
+                // newcomer types by reflex, and "expected an expression" says
+                // nothing about which word to reach for instead.
+                let hint = match other {
+                    TokenKind::Bang => Some("negation is `not`, as in `not done`"),
+                    _ => None,
+                };
+                let mut d = Diagnostic::error(
                     start,
                     format!("expected an expression but found {}", other.describe()),
-                ));
+                );
+                if let Some(h) = hint {
+                    d = d.with_help(h);
+                }
+                self.diags.push(d);
                 Err(())
             }
         }

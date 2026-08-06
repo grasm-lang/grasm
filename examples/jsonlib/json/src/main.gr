@@ -1,0 +1,276 @@
+/// JSON, as a value.
+///
+/// Objects hold a `Map[str, Json]` rather than parallel key and value lists:
+/// the map keeps its keys sorted, so rendering is deterministic without
+/// sorting at the end.
+pub type Json =
+    | JNull
+    | JBool(b: bool)
+    | JNum(n: f64)
+    | JStr(s: str)
+    | JArr(items: [Json])
+    | JObj(fields: Map[str, Json])
+
+pub type JsonError =
+    | Unexpected(at: i64, found: str)
+    | Truncated(at: i64)
+    | TrailingInput(at: i64)
+
+/// Cursor over the input, in characters rather than bytes.
+type Cursor = { chars: [str], pos: i64 }
+
+fn peek(c: Cursor) -> str {
+    c.chars.get(c.pos) ?? ""
+}
+
+fn at_end(c: Cursor) -> bool {
+    c.pos >= c.chars.len()
+}
+
+fn skip_space(inout c: Cursor) {
+    while peek(c) == " " or peek(c) == "\n" or peek(c) == "\t" or peek(c) == "\r" {
+        c.pos += 1
+    }
+}
+
+fn take(inout c: Cursor, want: str) ! JsonError {
+    if at_end(c) {
+        fail(Truncated(c.pos))
+    }
+    if peek(c) != want {
+        fail(Unexpected(c.pos, peek(c)))
+    }
+    c.pos += 1
+}
+
+fn is_digit(ch: str) -> bool {
+    ch >= "0" and ch <= "9"
+}
+
+fn parse_number(inout c: Cursor) -> Json ! JsonError {
+    var text = ""
+    if peek(c) == "-" {
+        text = text + "-"
+        c.pos += 1
+    }
+    while is_digit(peek(c)) {
+        text = text + peek(c)
+        c.pos += 1
+    }
+    if peek(c) == "." {
+        text = text + "."
+        c.pos += 1
+        while is_digit(peek(c)) {
+            text = text + peek(c)
+            c.pos += 1
+        }
+    }
+    if text == "" or text == "-" {
+        fail(Unexpected(c.pos, peek(c)))
+    }
+    JNum(text.parse_float() ?? 0.0)
+}
+
+fn parse_string(inout c: Cursor) -> str ! JsonError {
+    try take(c, "\"")
+    var out = ""
+    while peek(c) != "\"" {
+        if at_end(c) {
+            fail(Truncated(c.pos))
+        }
+        if peek(c) == "\\" {
+            c.pos += 1
+            let esc = peek(c)
+            c.pos += 1
+            if esc == "n" {
+                out = out + "\n"
+            } else if esc == "t" {
+                out = out + "\t"
+            } else if esc == "r" {
+                out = out + "\r"
+            } else {
+                out = out + esc
+            }
+        } else {
+            out = out + peek(c)
+            c.pos += 1
+        }
+    }
+    try take(c, "\"")
+    out
+}
+
+fn parse_array(inout c: Cursor) -> Json ! JsonError {
+    try take(c, "[")
+    var items: [Json] = []
+    skip_space(c)
+    if peek(c) == "]" {
+        c.pos += 1
+        return JArr(items)
+    }
+    var more = true
+    while more {
+        skip_space(c)
+        items.push(try parse_value(c))
+        skip_space(c)
+        if peek(c) == "," {
+            c.pos += 1
+        } else {
+            more = false
+        }
+    }
+    try take(c, "]")
+    JArr(items)
+}
+
+fn parse_object(inout c: Cursor) -> Json ! JsonError {
+    try take(c, "\{")
+    var fields: Map[str, Json] = map()
+    skip_space(c)
+    if peek(c) == "}" {
+        c.pos += 1
+        return JObj(fields)
+    }
+    var more = true
+    while more {
+        skip_space(c)
+        let key = try parse_string(c)
+        skip_space(c)
+        try take(c, ":")
+        skip_space(c)
+        fields.set(key, try parse_value(c))
+        skip_space(c)
+        if peek(c) == "," {
+            c.pos += 1
+        } else {
+            more = false
+        }
+    }
+    try take(c, "}")
+    JObj(fields)
+}
+
+fn word(inout c: Cursor, text: str) -> bool {
+    let end = c.pos + text.len()
+    if end > c.chars.len() {
+        return false
+    }
+    var i = 0
+    while i < text.len() {
+        if c.chars.get(c.pos + i) ?? "" != text.substr(i, 1) {
+            return false
+        }
+        i += 1
+    }
+    c.pos = end
+    true
+}
+
+fn parse_value(inout c: Cursor) -> Json ! JsonError {
+    skip_space(c)
+    if at_end(c) {
+        fail(Truncated(c.pos))
+    }
+    let ch = peek(c)
+    if ch == "\{" {
+        return try parse_object(c)
+    }
+    if ch == "[" {
+        return try parse_array(c)
+    }
+    if ch == "\"" {
+        return JStr(try parse_string(c))
+    }
+    if word(c, "true") {
+        return JBool(true)
+    }
+    if word(c, "false") {
+        return JBool(false)
+    }
+    if word(c, "null") {
+        return JNull
+    }
+    try parse_number(c)
+}
+
+/// Parses one JSON value, and requires it to be the whole input.
+pub fn parse(text: str) -> Json ! JsonError {
+    var c = Cursor{ chars: text.chars(), pos: 0 }
+    let v = try parse_value(c)
+    skip_space(c)
+    if not at_end(c) {
+        fail(TrailingInput(c.pos))
+    }
+    v
+}
+
+fn escape(s: str) -> str {
+    var out = ""
+    for ch in s.chars() {
+        if ch == "\"" {
+            out = out + "\\\""
+        } else if ch == "\\" {
+            out = out + "\\\\"
+        } else if ch == "\n" {
+            out = out + "\\n"
+        } else if ch == "\t" {
+            out = out + "\\t"
+        } else {
+            out = out + ch
+        }
+    }
+    out
+}
+
+fn number_text(n: f64) -> str {
+    let whole = n.as_i64()
+    if whole.as_f64() == n {
+        whole.to_str()
+    } else {
+        "{n}"
+    }
+}
+
+/// Renders a value back to JSON. Object keys come out sorted, so the same
+/// value always produces the same text.
+pub fn render(j: Json) -> str {
+    match j {
+        JNull -> "null"
+        JBool(b) -> if b { "true" } else { "false" }
+        JNum(n) -> number_text(n)
+        JStr(s) -> "\"{escape(s)}\""
+        JArr(items) -> {
+            let parts = items.map(render)
+            "[{parts.join(",")}]"
+        }
+        JObj(fields) -> {
+            var parts: [str] = []
+            for e in fields.entries() {
+                match e {
+                    (k, v) -> parts.push("\"{escape(k)}\":{render(v)}")
+                }
+            }
+            "\{" + parts.join(",") + "}"
+        }
+    }
+}
+
+/// A field of an object, or `None`.
+pub fn field(j: Json, name: str) -> Json {
+    match j {
+        JObj(fields) -> fields.get(name) ?? JNull
+        _ -> JNull
+    }
+}
+
+/// How many values a document contains, counting nested ones.
+pub fn count_values(j: Json) -> i64 {
+    match j {
+        JArr(items) -> items.fold(1, |acc, item| acc + count_values(item))
+        JObj(fields) -> fields.values().fold(1, |acc, v| acc + count_values(v))
+        _ -> 1
+    }
+}
+
+fn main() {
+}

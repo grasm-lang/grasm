@@ -1,0 +1,29 @@
+import json
+
+fn describe(text: str) {
+    match json.parse(text) {
+        Ok(v) -> print("{json.render(v)}  ({json.count_values(v)} values)")
+        Err(e) -> match e {
+            Unexpected(at, found) -> print("bad input at {at}: found \"{found}\"")
+            Truncated(at) -> print("input ended at {at}")
+            TrailingInput(at) -> print("extra input at {at}")
+        }
+    }
+}
+
+fn main() {
+    describe("null")
+    describe("[1, 2, 3]")
+    describe("\{\"b\": 2, \"a\": 1}")
+    describe("\{\"nested\": [true, false, \"hi\"], \"n\": -4.5}")
+    describe("\{\"escaped\": \"line\\nbreak\"}")
+    describe("[1, 2")
+    describe("\{\"k\": }")
+    describe("1 2")
+
+    // Reaching into a document.
+    match json.parse("\{\"user\": \{\"name\": \"ada\"}}") {
+        Ok(doc) -> print("{json.render(json.field(json.field(doc, "user"), "name"))}")
+        Err(_e) -> print("unreachable")
+    }
+}
