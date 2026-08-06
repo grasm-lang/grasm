@@ -404,7 +404,13 @@ the file passed to the toolchain, which is the only module required to define
 
 **[T-MODULE-DEP]** A package may also import a dependency declared in its
 `grasm.toml` by that dependency's name, which resolves to the dependency's
-entry file. `import mathlib` after
+entry file. A package is a directory containing the manifest and a source tree; the entry
+file is `src/main.gr` unless `[package] entry` names another path relative to
+the manifest. An import of a dependency resolves to that entry file, and a
+dotted import into a dependency (`import mathlib.helpers`) resolves relative to
+the directory containing it.
+
+`import mathlib` after
 
 ```toml
 [dependencies.mathlib]
@@ -638,6 +644,49 @@ that stopped being true would fail the test suite.
 | `read_file(p)` | `(str) -> Option[str]` | `io` |
 | `write_file(p, s)` | `(str, str)` | `io` |
 | `file_exists(p)` | `(str) -> bool` | `io` |
+
+## 1a. How values are written
+
+**[L-DISPLAY]** `print(x)` and string interpolation render every type the same
+way, and this is normative because a program's output is what its correctness
+is judged on.
+
+| type | rendering | example |
+|------|-----------|---------|
+| `i64` | decimal | `-7` |
+| `f64` | shortest form that round-trips, always with a point | `1.5`, `1000000.0`, `-0.0` |
+| `bool` | `true` / `false` | |
+| `str` | its characters, **unquoted and unescaped** | `b c` |
+| `[T]` | elements in order, `, `-separated, in brackets | `[1, 2, 3]`, `[a, b c]` |
+| `(A, B)` | components in order, `, `-separated, in parentheses | `(1, one, true)` |
+| `Map[K, V]` | `key: value` pairs in sorted key order, in braces | `{k: 1}` |
+| struct | `Name{field: value, …}` in declaration order | `P{x: 3, y: hi}` |
+| variant with fields | `Name(v, …)` | `B(7)` |
+| variant without | `Name` | `A` |
+| `Option[T]` | `Some(v)` or `None` | `Some(1)` |
+
+Strings nested inside a collection are **not** quoted, so `[a, b c]` is a
+two-element list whose second element contains a space. Rendering is for people
+reading output; it is not a serialisation format and does not round-trip.
+
+## 1b. Calling a free function as a method
+
+**[L-UFCS]** A free function whose first parameter accepts the receiver may be
+called in method position: `f(x, y)` and `x.f(y)` are the same call. This
+applies to functions a program declares, not only to the library.
+
+```
+fn double(n: i64) -> i64 { n * 2 }
+
+fn main() {
+    print("{double(5)}")     // 10
+    print("{5.double()}")    // 10 — the same call
+}
+```
+
+Method syntax is resolved against the built-in methods for the receiver's type
+first, and a free function is considered only when no built-in matches. So
+declaring a function named `len` does not change what `xs.len()` means.
 
 ## 2. `i64` and `f64`
 
@@ -929,7 +978,23 @@ Three parameter modes, and the default is the one you want:
   passes a mutable place, and the same place cannot be passed as `inout` twice
   in one call.
 - `own` — the caller gives the value up. Using it afterwards is a compile
-  error.
+  error, **for types that are not copied**. `i64`, `f64`, `bool`, and `()` are
+  copied ([T-COPY]), so `own` on one of those transfers nothing and the caller
+  keeps using its binding. `str`, lists, maps, and structs do move. Write the
+  demonstration with one of those, or it will appear to disprove the rule it
+  is demonstrating:
+
+```
+fn consume(own xs: [i64]) -> i64 {
+    xs.len()
+}
+
+fn main() {
+    let xs = [1, 2, 3, 4, 5]
+    print("{consume(xs)}")
+    // print("{xs.len()}")   // error: use of moved value `xs`
+}
+```
 
 ```
 fn bump(inout n: i64) {
@@ -968,9 +1033,24 @@ fn main() {
 
 Tasks run in spawn order, deterministically: the same program always produces
 the same output. That determinism is deliberate and is *not* multi-core
-speedup — `parallel` currently buys you structure and reproducibility, not
-throughput. Multi-core execution is a planned change to the value
-representation, not something this shape of code will have to change for.
+speedup — `parallel` buys you structure and reproducibility, not throughput,
+because its tasks share the enclosing scope and running them at once would
+race.
+
+Throughput has its own form, and the effect system is what makes it safe:
+
+```
+fn main() {
+    let xs = [1, 2, 3, 4, 5]
+    print("{xs.par_map(|x| x * x)}")
+}
+```
+
+`par_map` and `par_filter` spread the work across cores. The function must be
+effect-free and **the compiler proves it** — put a `print` inside and the
+build fails — so there are no `Send`/`Sync` bounds to satisfy and no race
+detector to run. Results come back in input order whatever the core count is,
+so the answer never depends on the machine.
 
 A panicking task aborts the whole scope; tasks spawned after it do not run.
 
@@ -984,7 +1064,23 @@ fn main() {
 }
 ```
 
-`pub` controls what crosses a module boundary. A package adds a manifest:
+`pub` controls what crosses a module boundary. `import helper` finds
+`helper.gr` beside the importing file; `import lib.math` finds `lib/math.gr`.
+No manifest is needed for either — a manifest is what turns a directory into a
+*package*, which is what dependencies and capabilities are about.
+
+A package is a directory laid out like this:
+
+```
+mathlib/
+  grasm.toml          the manifest
+  src/
+    main.gr           the entry file — what `import mathlib` resolves to
+```
+
+`src/main.gr` is the default; `entry = "src/lib.gr"` in `[package]` changes it.
+Everything a package exports lives behind that one file, so a dependency's
+other modules are reached as `import mathlib.helpers`.
 
 ```toml
 [package]
@@ -1008,7 +1104,10 @@ satisfies everybody, so adding a dependency never quietly upgrades something
 else you were already using.
 
 `capabilities` is a **ceiling**, and it is checked against what the code
-actually does. Because effects are inferred from source, a dependency that
+actually does. **Omitting the key means unrestricted**, not empty — a package
+with no `capabilities` line is not held to anything, and `grasm deps` reports
+it as `(unrestricted)`. Write `capabilities = []` to mean "performs nothing";
+leaving it out means "do not check me". Because effects are inferred from source, a dependency that
 quietly starts reading the filesystem exceeds its declared ceiling and fails
 to build **in every consumer** — a compile error, not a runtime surprise, and
 not something a reviewer has to happen to notice.
@@ -2140,6 +2239,57 @@ fn main() {
 }
 ```
 
+## `L-DISPLAY.gr`
+
+```grasm
+//! tag: L-DISPLAY
+//! expect: output
+//! -7
+//! 1.5
+//! 1000000.0
+//! true
+//! b c
+//! [1, 2, 3]
+//! [a, b c]
+//! [[1, 2], [3]]
+//! (1, one, true)
+//! {k: 1, z: 2}
+//! P{x: 3, y: hi}
+//! A
+//! B(7)
+//! Some(1)
+//! None
+// Every type's rendering, because a program's output is what its correctness
+// is judged on. Strings are unquoted even inside a collection, so `[a, b c]`
+// is two elements and the second contains a space.
+type P = { x: i64, y: str }
+
+type S =
+    | A
+    | B(n: i64)
+
+fn main() {
+    print("{-7}")
+    print("{1.5}")
+    print("{1000000.0}")
+    print("{true}")
+    print("{"b c"}")
+    print("{[1, 2, 3]}")
+    print("{["a", "b c"]}")
+    print("{[[1, 2], [3]]}")
+    print("{(1, "one", true)}")
+    var m = map()
+    m.set("z", 2)
+    m.set("k", 1)
+    print("{m}")
+    print("{P{ x: 3, y: "hi" }}")
+    print("{A}")
+    print("{B(7)}")
+    print("{[1].first()}")
+    print("{[1].get(9)}")
+}
+```
+
 ## `L-ENCODING.gr`
 
 ```grasm
@@ -2373,6 +2523,45 @@ fn main() {
 //! unterminated string
 fn main() {
     let s = "no closing quote
+}
+```
+
+## `L-UFCS.gr`
+
+```grasm
+//! tag: L-UFCS
+//! expect: output
+//! 10
+//! 10
+//! 7
+//! 6
+//! 3
+// A free function whose first parameter accepts the receiver may be called in
+// method position. The two spellings are the same call.
+fn double(n: i64) -> i64 {
+    n * 2
+}
+
+fn add(a: i64, b: i64) -> i64 {
+    a + b
+}
+
+fn total(xs: [i64]) -> i64 {
+    xs.sum()
+}
+
+/// A user function named `len` does not shadow the built-in `len` method:
+/// built-ins are resolved first.
+fn len(s: str) -> i64 {
+    999
+}
+
+fn main() {
+    print("{double(5)}")
+    print("{5.double()}")
+    print("{3.add(4)}")
+    print("{[1, 2, 3].total()}")
+    print("{"abc".len()}")
 }
 ```
 
@@ -2833,8 +3022,13 @@ fn main() {
 //! tag: T-MODULE-DEP
 //! expect: error
 //! cannot load module
-// A dependency is importable only when `grasm.toml` declares it. With no
-// manifest, a bare name is not a package and does not resolve.
+// A bare name is tried as a sibling source file first, then as a dependency
+// the manifest declares. Here it is neither: there is no `undeclared_package.gr`
+// beside this file and no `grasm.toml` naming it, so it does not resolve and
+// the error names both places it looked.
+//
+// (A bare name *does* resolve when either one exists — `import helper` finds
+// `helper.gr` next to the importing file with no manifest involved.)
 import undeclared_package
 
 fn main() {

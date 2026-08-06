@@ -52,6 +52,8 @@ Will not change incompatibly before 2.0.
 - `L-INT` — stable
 - `L-INTERP` — stable
 - `L-LIB-FREE` — provisional
+- `L-DISPLAY` — provisional
+- `L-UFCS` — provisional
 - `L-LIB-NUM` — provisional
 - `L-LIB-STR` — provisional
 - `L-LIB-LIST` — provisional

@@ -191,6 +191,18 @@ thread_local! {
 /// remove. Here the string is copied into a buffer that keeps its capacity
 /// between calls, so after the first probe there is no allocation at all.
 ///
+/// Marks a freshly built list as a tuple, so it renders with parentheses.
+///
+/// # Safety: `v` is a uniquely owned list the compiler just built.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_tuple_seal(v: *mut RtVal) -> *mut RtVal {
+    if let RtPayload::List(items) = &mut (*v).payload {
+        let taken = std::mem::take(items);
+        (*v).payload = RtPayload::Tuple(taken);
+    }
+    v
+}
+
 /// # Safety: live runtime pointer.
 unsafe fn with_key<R>(v: *mut RtVal, f: impl FnOnce(&MapKey) -> R) -> R {
     match &(*v).payload {
@@ -359,6 +371,13 @@ pub enum RtPayload {
     Bool(bool),
     Str(String),
     List(Vec<*mut RtVal>),
+    /// Same shape as a list, rendered with parentheses.
+    ///
+    /// Tuples are built as lists and sealed, because every operation on them
+    /// — refcounting, equality, reading an element out in a pattern — is a
+    /// list operation. Only `display` differs, and it differs in a way a
+    /// program's output is judged on, so it cannot be left to look the same.
+    Tuple(Vec<*mut RtVal>),
     /// Scalar elements stored inline — no per-element heap cell, no refcount
     /// traffic, no pointer chase. This is why `c[i] = c[i] + x` in a hot loop
     /// is a load and a store instead of an allocation.
@@ -472,7 +491,7 @@ unsafe fn dec(v: *mut RtVal) {
     if rc.get() <= 0 {
         let boxed = Box::from_raw(v);
         match &boxed.payload {
-            RtPayload::List(items) => {
+            RtPayload::List(items) | RtPayload::Tuple(items) => {
                 for &it in items {
                     dec(it);
                 }
@@ -972,7 +991,9 @@ pub unsafe extern "C" fn grasm_list_get_scalar(v: *mut RtVal, i: i64, kind: i64)
             }
             data.get(i as usize)
         }
-        RtPayload::List(items) => {
+        // A sealed tuple is read the same way: destructuring a pattern is an
+        // element read, and sealing changed only how the value prints.
+        RtPayload::List(items) | RtPayload::Tuple(items) => {
             if i < 0 || i as usize >= items.len() {
                 rt_panic(&format!("index {i} out of bounds (len {})", items.len()));
             }
@@ -1108,7 +1129,7 @@ unsafe fn cow_list(list: *mut RtVal) -> *mut RtVal {
 #[no_mangle]
 pub unsafe extern "C" fn grasm_list_len(v: *mut RtVal) -> i64 {
     match &(*v).payload {
-        RtPayload::List(items) => items.len() as i64,
+        RtPayload::List(items) | RtPayload::Tuple(items) => items.len() as i64,
         RtPayload::ListScalar { data, .. } => data.len() as i64,
         _ => grasm_panic_msg_str("len on non-list"),
     }
@@ -1120,7 +1141,7 @@ pub unsafe extern "C" fn grasm_list_len(v: *mut RtVal) -> i64 {
 #[no_mangle]
 pub unsafe extern "C" fn grasm_list_get(v: *mut RtVal, i: i64) -> *mut RtVal {
     match &(*v).payload {
-        RtPayload::List(items) => {
+        RtPayload::List(items) | RtPayload::Tuple(items) => {
             if i < 0 || i as usize >= items.len() {
                 rt_panic(&format!("index {i} out of bounds (len {})", items.len()));
             }
@@ -1202,6 +1223,10 @@ pub unsafe extern "C" fn grasm_out_val(v: *mut RtVal) {
 
 unsafe fn display(v: *mut RtVal) -> String {
     match &(*v).payload {
+        RtPayload::Tuple(items) => {
+            let parts: Vec<String> = items.iter().map(|&i| display(i)).collect();
+            format!("({})", parts.join(", "))
+        }
         RtPayload::Struct { name, fields } => {
             let parts: Vec<String> = fields
                 .iter()
@@ -1468,7 +1493,8 @@ unsafe fn val_eq(a: *mut RtVal, b: *mut RtVal) -> bool {
         (RtPayload::F64(x), RtPayload::F64(y)) => x == y,
         (RtPayload::Bool(x), RtPayload::Bool(y)) => x == y,
         (RtPayload::Str(x), RtPayload::Str(y)) => x == y,
-        (RtPayload::List(x), RtPayload::List(y)) => {
+        (RtPayload::Tuple(x), RtPayload::Tuple(y))
+        | (RtPayload::List(x), RtPayload::List(y)) => {
             x.len() == y.len() && x.iter().zip(y).all(|(&i, &j)| val_eq(i, j))
         }
         (

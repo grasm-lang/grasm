@@ -189,7 +189,23 @@ Three parameter modes, and the default is the one you want:
   passes a mutable place, and the same place cannot be passed as `inout` twice
   in one call.
 - `own` — the caller gives the value up. Using it afterwards is a compile
-  error.
+  error, **for types that are not copied**. `i64`, `f64`, `bool`, and `()` are
+  copied ([T-COPY]), so `own` on one of those transfers nothing and the caller
+  keeps using its binding. `str`, lists, maps, and structs do move. Write the
+  demonstration with one of those, or it will appear to disprove the rule it
+  is demonstrating:
+
+```
+fn consume(own xs: [i64]) -> i64 {
+    xs.len()
+}
+
+fn main() {
+    let xs = [1, 2, 3, 4, 5]
+    print("{consume(xs)}")
+    // print("{xs.len()}")   // error: use of moved value `xs`
+}
+```
 
 ```
 fn bump(inout n: i64) {
@@ -259,7 +275,23 @@ fn main() {
 }
 ```
 
-`pub` controls what crosses a module boundary. A package adds a manifest:
+`pub` controls what crosses a module boundary. `import helper` finds
+`helper.gr` beside the importing file; `import lib.math` finds `lib/math.gr`.
+No manifest is needed for either — a manifest is what turns a directory into a
+*package*, which is what dependencies and capabilities are about.
+
+A package is a directory laid out like this:
+
+```
+mathlib/
+  grasm.toml          the manifest
+  src/
+    main.gr           the entry file — what `import mathlib` resolves to
+```
+
+`src/main.gr` is the default; `entry = "src/lib.gr"` in `[package]` changes it.
+Everything a package exports lives behind that one file, so a dependency's
+other modules are reached as `import mathlib.helpers`.
 
 ```toml
 [package]
@@ -283,7 +315,10 @@ satisfies everybody, so adding a dependency never quietly upgrades something
 else you were already using.
 
 `capabilities` is a **ceiling**, and it is checked against what the code
-actually does. Because effects are inferred from source, a dependency that
+actually does. **Omitting the key means unrestricted**, not empty — a package
+with no `capabilities` line is not held to anything, and `grasm deps` reports
+it as `(unrestricted)`. Write `capabilities = []` to mean "performs nothing";
+leaving it out means "do not check me". Because effects are inferred from source, a dependency that
 quietly starts reading the filesystem exceeds its declared ceiling and fails
 to build **in every consumer** — a compile error, not a runtime surprise, and
 not something a reviewer has to happen to notice.

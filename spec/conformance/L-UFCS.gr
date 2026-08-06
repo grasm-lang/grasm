@@ -1,0 +1,34 @@
+//! tag: L-UFCS
+//! expect: output
+//! 10
+//! 10
+//! 7
+//! 6
+//! 3
+// A free function whose first parameter accepts the receiver may be called in
+// method position. The two spellings are the same call.
+fn double(n: i64) -> i64 {
+    n * 2
+}
+
+fn add(a: i64, b: i64) -> i64 {
+    a + b
+}
+
+fn total(xs: [i64]) -> i64 {
+    xs.sum()
+}
+
+/// A user function named `len` does not shadow the built-in `len` method:
+/// built-ins are resolved first.
+fn len(s: str) -> i64 {
+    999
+}
+
+fn main() {
+    print("{double(5)}")
+    print("{5.double()}")
+    print("{3.add(4)}")
+    print("{[1, 2, 3].total()}")
+    print("{"abc".len()}")
+}

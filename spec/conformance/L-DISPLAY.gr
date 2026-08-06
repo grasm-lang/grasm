@@ -1,0 +1,46 @@
+//! tag: L-DISPLAY
+//! expect: output
+//! -7
+//! 1.5
+//! 1000000.0
+//! true
+//! b c
+//! [1, 2, 3]
+//! [a, b c]
+//! [[1, 2], [3]]
+//! (1, one, true)
+//! {k: 1, z: 2}
+//! P{x: 3, y: hi}
+//! A
+//! B(7)
+//! Some(1)
+//! None
+// Every type's rendering, because a program's output is what its correctness
+// is judged on. Strings are unquoted even inside a collection, so `[a, b c]`
+// is two elements and the second contains a space.
+type P = { x: i64, y: str }
+
+type S =
+    | A
+    | B(n: i64)
+
+fn main() {
+    print("{-7}")
+    print("{1.5}")
+    print("{1000000.0}")
+    print("{true}")
+    print("{"b c"}")
+    print("{[1, 2, 3]}")
+    print("{["a", "b c"]}")
+    print("{[[1, 2], [3]]}")
+    print("{(1, "one", true)}")
+    var m = map()
+    m.set("z", 2)
+    m.set("k", 1)
+    print("{m}")
+    print("{P{ x: 3, y: "hi" }}")
+    print("{A}")
+    print("{B(7)}")
+    print("{[1].first()}")
+    print("{[1].get(9)}")
+}

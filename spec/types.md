@@ -166,7 +166,13 @@ the file passed to the toolchain, which is the only module required to define
 
 **[T-MODULE-DEP]** A package may also import a dependency declared in its
 `grasm.toml` by that dependency's name, which resolves to the dependency's
-entry file. `import mathlib` after
+entry file. A package is a directory containing the manifest and a source tree; the entry
+file is `src/main.gr` unless `[package] entry` names another path relative to
+the manifest. An import of a dependency resolves to that entry file, and a
+dotted import into a dependency (`import mathlib.helpers`) resolves relative to
+the directory containing it.
+
+`import mathlib` after
 
 ```toml
 [dependencies.mathlib]

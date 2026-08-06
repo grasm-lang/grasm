@@ -27,6 +27,49 @@ that stopped being true would fail the test suite.
 | `write_file(p, s)` | `(str, str)` | `io` |
 | `file_exists(p)` | `(str) -> bool` | `io` |
 
+## 1a. How values are written
+
+**[L-DISPLAY]** `print(x)` and string interpolation render every type the same
+way, and this is normative because a program's output is what its correctness
+is judged on.
+
+| type | rendering | example |
+|------|-----------|---------|
+| `i64` | decimal | `-7` |
+| `f64` | shortest form that round-trips, always with a point | `1.5`, `1000000.0`, `-0.0` |
+| `bool` | `true` / `false` | |
+| `str` | its characters, **unquoted and unescaped** | `b c` |
+| `[T]` | elements in order, `, `-separated, in brackets | `[1, 2, 3]`, `[a, b c]` |
+| `(A, B)` | components in order, `, `-separated, in parentheses | `(1, one, true)` |
+| `Map[K, V]` | `key: value` pairs in sorted key order, in braces | `{k: 1}` |
+| struct | `Name{field: value, …}` in declaration order | `P{x: 3, y: hi}` |
+| variant with fields | `Name(v, …)` | `B(7)` |
+| variant without | `Name` | `A` |
+| `Option[T]` | `Some(v)` or `None` | `Some(1)` |
+
+Strings nested inside a collection are **not** quoted, so `[a, b c]` is a
+two-element list whose second element contains a space. Rendering is for people
+reading output; it is not a serialisation format and does not round-trip.
+
+## 1b. Calling a free function as a method
+
+**[L-UFCS]** A free function whose first parameter accepts the receiver may be
+called in method position: `f(x, y)` and `x.f(y)` are the same call. This
+applies to functions a program declares, not only to the library.
+
+```
+fn double(n: i64) -> i64 { n * 2 }
+
+fn main() {
+    print("{double(5)}")     // 10
+    print("{5.double()}")    // 10 — the same call
+}
+```
+
+Method syntax is resolved against the built-in methods for the receiver's type
+first, and a free function is considered only when no built-in matches. So
+declaring a function named `len` does not change what `xs.len()` means.
+
 ## 2. `i64` and `f64`
 
 **[L-LIB-NUM]**

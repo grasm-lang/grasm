@@ -378,6 +378,7 @@ impl<'m> Codegen<'m> {
             ("grasm_str_eq", vec![i64t, i64t], Some(i8t)),
             ("grasm_str_cmp", vec![i64t, i64t], Some(i64t)),
             ("grasm_list_new", vec![], Some(i64t)),
+            ("grasm_tuple_seal", vec![i64t], Some(i64t)),
             ("grasm_list_push", vec![i64t, i64t], Some(i64t)),
             ("grasm_list_len", vec![i64t], Some(i64t)),
             ("grasm_list_get", vec![i64t, i64t], Some(i64t)),
@@ -3028,7 +3029,11 @@ impl FnCx<'_, '_> {
                     list = self.call_rt("grasm_list_push", &[list, bx]).unwrap();
                     ts.push(vt);
                 }
-                Ok(Some((list, VType::Tuple(ts))))
+                // A tuple is a list until it is sealed. The seal exists only
+                // so it renders with parentheses, which [L-DISPLAY] makes
+                // part of what the program is judged on.
+                let sealed = self.call_rt("grasm_tuple_seal", &[list]).unwrap();
+                Ok(Some((sealed, VType::Tuple(ts))))
             }
             Expr::StructLit { name, fields, span } => {
                 self.eval_struct_lit(name, fields, *span).map(Some)

@@ -1,8 +1,13 @@
 //! tag: T-MODULE-DEP
 //! expect: error
 //! cannot load module
-// A dependency is importable only when `grasm.toml` declares it. With no
-// manifest, a bare name is not a package and does not resolve.
+// A bare name is tried as a sibling source file first, then as a dependency
+// the manifest declares. Here it is neither: there is no `undeclared_package.gr`
+// beside this file and no `grasm.toml` naming it, so it does not resolve and
+// the error names both places it looked.
+//
+// (A bare name *does* resolve when either one exists — `import helper` finds
+// `helper.gr` next to the importing file with no manifest involved.)
 import undeclared_package
 
 fn main() {

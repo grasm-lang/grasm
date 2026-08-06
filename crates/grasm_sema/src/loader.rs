@@ -49,6 +49,21 @@ pub fn load_with(
     entry_display_path: &str,
     provider: &dyn Fn(&str) -> Option<String>,
 ) -> Program {
+    load_with_paths(entry_name, entry_display_path, provider, &|_| Vec::new())
+}
+
+/// `load_with`, plus a way to say where a missing module was looked for.
+///
+/// A resolution failure has to name every place that was tried. Naming one of
+/// them is worse than naming none: an import of a package resolves through the
+/// package's entry file, and reporting only the sibling-file candidate sent a
+/// reader hunting for a filename the toolchain never wanted.
+pub fn load_with_paths(
+    entry_name: &str,
+    entry_display_path: &str,
+    provider: &dyn Fn(&str) -> Option<String>,
+    tried: &dyn Fn(&str) -> Vec<String>,
+) -> Program {
     let mut files: Vec<LoadedFile> = Vec::new();
     let mut diagnostics = Vec::new();
     let mut loaded: HashMap<String, ()> = HashMap::new();
@@ -61,9 +76,15 @@ pub fn load_with(
         }
         loaded.insert(name.clone(), ());
         let Some(src) = provider(&name) else {
+            let candidates = tried(&name);
+            let where_ = if candidates.is_empty() {
+                format!("looked for `{display}`")
+            } else {
+                format!("looked in:\n  {}", candidates.join("\n  "))
+            };
             diagnostics.push(Diagnostic::error(
                 Span::new(0, 1),
-                format!("cannot load module `{name}` (looked for `{display}`)"),
+                format!("cannot load module `{name}` ({where_})"),
             ));
             continue;
         };
@@ -145,6 +166,28 @@ pub fn load_from_disk_with(
         deps.insert(name.clone(), dir.clone());
     }
 
+    let dirs = entry_src_dir.clone();
+    let dep_dirs = deps.clone();
+    // The same two candidates the provider tries, so the failure message says
+    // where it actually looked instead of naming one of the two.
+    let tried = move |name: &str| -> Vec<String> {
+        let mut out = vec![dirs
+            .join(format!("{}.gr", name.replace('.', "/")))
+            .display()
+            .to_string()];
+        let root = name.split('.').next().unwrap_or(name);
+        match dep_dirs.get(root) {
+            Some(dir) => out.push(format!(
+                "{} (entry file of dependency `{root}`)",
+                package_entry(dir).display()
+            )),
+            None => out.push(format!(
+                "no dependency named `{root}` in grasm.toml"
+            )),
+        }
+        out
+    };
+
     let provider = move |name: &str| -> Option<String> {
         if name == "main" {
             return Some(entry_src.clone());
@@ -166,7 +209,7 @@ pub fn load_from_disk_with(
             }
         }
     };
-    Ok(load_with("main", &entry_display, &provider))
+    Ok(load_with_paths("main", &entry_display, &provider, &tried))
 }
 
 /// Dependencies of the package containing `dir`, as name → package directory.
