@@ -2026,6 +2026,14 @@ fn unify_generic(
 /// Only these shapes. A hint applied more widely forces a value out of an
 /// expression that produces none — an arm that ends in `fail`, say — which is
 /// how the first version of this broke three conformance programs.
+/// Whether a list element needs its type supplied by the list's annotation.
+///
+/// A closure with parameters is the case: nothing in `|n| n + 100` says what
+/// `n` is, and inside a list there is no call site to learn it from.
+fn needs_element_hint(e: &Expr) -> bool {
+    matches!(e, Expr::Closure { params, .. } if !params.is_empty())
+}
+
 fn needs_type_hint(e: &Expr) -> bool {
     match e {
         Expr::List(items, _) => items.is_empty(),
@@ -3178,6 +3186,24 @@ impl FnCx<'_, '_> {
             if items.is_empty() {
                 let v = self.new_list_of(elem_t);
                 return Ok((v, VType::List(elem_t.clone())));
+            }
+            // A non-empty list whose element type is known passes it down.
+            // A closure among the elements has nowhere else to get its
+            // parameter types from — `[dbl, |n| n + 100]` annotated as
+            // `[fn(i64) -> i64]` names them exactly once, at the annotation.
+            if items.iter().any(needs_element_hint) {
+                let mut list = self.new_list_of(elem_t);
+                for item in items {
+                    let (mut v, vt) = self.eval_expr_expecting(item, Some(elem_t))?;
+                    let vt = if **elem_t == VType::F64 && vt == VType::I64 {
+                        v = self.b.ins().fcvt_from_sint(types::F64, v);
+                        VType::F64
+                    } else {
+                        vt
+                    };
+                    list = self.list_push_elem(list, v, &vt);
+                }
+                return Ok((list, VType::List(elem_t.clone())));
             }
         }
         if let (Expr::Call { callee, args, .. }, Some(VType::Map(k, v))) = (e, expected) {

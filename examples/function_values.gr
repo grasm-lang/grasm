@@ -76,8 +76,23 @@ fn main() {
     print("{ns.find(is_even) ?? -1}")
     print("{ns.par_map(square)}")
     print("{ns.par_filter(is_even)}")
+    print("{mixed()}")
 }
 
 fn is_even(n: i64) -> bool {
     n % 2 == 0
+}
+
+/// A list holding a named function and a closure together.
+///
+/// The annotation is doing real work: nothing in `|n| n + 100` says what `n`
+/// is, and inside a list there is no call site to learn it from. Naming the
+/// element type once is what makes both spellings usable in one place.
+fn mixed() -> i64 {
+    let fs: [fn(i64) -> i64] = [double, |n| n + 100]
+    var total = 0
+    for f in fs {
+        total = total + f(1)
+    }
+    total
 }
