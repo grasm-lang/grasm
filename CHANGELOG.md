@@ -118,6 +118,14 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   walk reached first, silently, and the other dependent linked something it
   never asked for. It is an error naming both directories, both versions, and
   who required each.
+- The native backend's static type inference — used where no annotation
+  exists, most sharply for a list literal's element type — knew four builtin
+  methods. Every other one failed there, so `[xs.min() ?? 0]` ran under the
+  interpreter and would not compile natively while `xs.min() ?? 0` alone
+  compiled fine. Found by `scripts/fuzz_differential.py`, which generates
+  well-typed programs and compares both engines; the 130-program differential
+  gate had missed it because none of those puts a reduction inside a list
+  literal.
 - `scripts/crosstest.sh` counted a link failure as "unsupported", so a runtime
   archive older than its own source read as a backend limitation and cost
   seven programs of coverage without a word. It now refuses a stale archive up

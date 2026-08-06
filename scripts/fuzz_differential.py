@@ -40,6 +40,7 @@ class Gen:
         self.scope = []          # list of (name, type)
         self.next_id = 0
         self.depth = 0
+        self.helpers = []        # (name, return type, [param types])
 
     def fresh(self, prefix="v"):
         self.next_id += 1
@@ -57,8 +58,13 @@ class Gen:
         self.depth += 1
         try:
             choices = [self.atom]
+            if self.helpers:
+                choices += [self.call_helper]
             if ty == INT:
-                choices += [self.int_arith, self.int_cond, self.int_from_list]
+                choices += [
+                    self.int_arith, self.int_cond, self.int_from_list,
+                    self.int_from_match, self.int_from_field, self.int_from_map,
+                ]
             elif ty == FLOAT:
                 choices += [self.float_arith, self.float_cond]
             elif ty == BOOL:
@@ -129,6 +135,36 @@ class Gen:
         # `a + xs.min() ?? 0` would parse as `(a + xs.min()) ?? 0`.
         return f"([{items}].{m})"
 
+    def call_helper(self, ty):
+        """A call to one of the top-level functions this program declares."""
+        candidates = [h for h in self.helpers if h[1] == ty]
+        if not candidates:
+            return self.atom(ty)
+        name, _, params = self.rng.choice(candidates)
+        args = ", ".join(self.expr(p) for p in params)
+        return f"{name}({args})"
+
+    def int_from_match(self, _):
+        """Exhaustive match over the generated sum type."""
+        v = self.rng.choice(["Small(3)", "Small(-8)", "Pair(2, 5)", "Nothing"])
+        return (
+            f"(match Shape.{v} {{ "
+            f"Small(a) -> a "
+            f"Pair(a, b) -> (a + b) "
+            f"Nothing -> {self.expr(INT)} }})"
+        )
+
+    def int_from_field(self, _):
+        f = self.rng.choice(["low", "high"])
+        return f"(Span{{ low: {self.expr(INT)}, high: {self.expr(INT)} }}.{f})"
+
+    def int_from_map(self, _):
+        live = [n for n, t in self.scope if t == "map"]
+        if not live:
+            return self.atom(INT)
+        k = self.rng.choice(['"a"', '"b"', '"missing"'])
+        return f"({self.rng.choice(live)}.get({k}) ?? {self.rng.randint(-9, 9)})"
+
     # --- statements ------------------------------------------------------
 
     def stmt(self, out):
@@ -170,6 +206,25 @@ class Gen:
             out.append(f"        {name} = {name} + {self.expr(INT)}")
             self.scope.pop()
             out.append("    }")
+        elif kind < 0.68:
+            # A while loop with a counter the body cannot make diverge.
+            n = self.fresh("w")
+            acc = self.fresh("wa")
+            limit = self.rng.randint(1, 5)
+            out.append(f"    var {n} = 0")
+            out.append(f"    var {acc} = 0")
+            self.scope.append((acc, INT))
+            out.append(f"    while {n} < {limit} {{")
+            out.append(f"        {acc} = {acc} + {self.expr(INT)}")
+            out.append(f"        {n} = {n} + 1")
+            out.append("    }")
+        elif kind < 0.76:
+            m = self.fresh("m")
+            out.append(f"    var {m} = map()")
+            out.append(f'    {m}.set("a", {self.expr(INT)})')
+            out.append(f'    {m}.set("b", {self.expr(INT)})')
+            self.scope.append((m, "map"))
+            out.append(f'    print("{{{m}}}")')
         elif kind < 0.85:
             out.append(f"    if {self.expr(BOOL)} {{")
             out.append(f"        print(\"{{{self.expr(INT)}}}\")")
@@ -180,14 +235,43 @@ class Gen:
             ty = self.rng.choice([INT, FLOAT, BOOL, STR])
             out.append(f'    print("{{{self.expr(ty)}}}")')
 
+    def declarations(self):
+        """Top-level types and functions the body may use."""
+        out = [
+            "type Span = { low: i64, high: i64 }",
+            "",
+            "type Shape =",
+            "    | Small(a: i64)",
+            "    | Pair(a: i64, b: i64)",
+            "    | Nothing",
+            "",
+        ]
+        for i in range(self.rng.randint(1, 3)):
+            name = f"helper{i}"
+            params = [self.rng.choice([INT, FLOAT, BOOL, STR])
+                      for _ in range(self.rng.randint(1, 2))]
+            ret = self.rng.choice([INT, FLOAT, BOOL, STR])
+            sig = ", ".join(f"p{j}: {t}" for j, t in enumerate(params))
+            saved = self.scope
+            self.scope = [(f"p{j}", t) for j, t in enumerate(params)]
+            out.append(f"fn {name}({sig}) -> {ret} {{")
+            out.append(f"    {self.expr(ret)}")
+            out.append("}")
+            out.append("")
+            self.scope = saved
+            self.helpers.append((name, ret, params))
+        return out
+
     def program(self):
+        head = self.declarations()
         body = []
         for _ in range(self.rng.randint(3, 9)):
             self.stmt(body)
         # Always print something, so an empty program cannot pass vacuously.
         for ty in (INT, STR, BOOL, FLOAT):
             body.append(f'    print("{{{self.expr(ty)}}}")')
-        return "fn main() {\n" + "\n".join(body) + "\n}\n"
+        return ("\n".join(head) + "\nfn main() {\n"
+                + "\n".join(body) + "\n}\n")
 
 
 def run(cmd, **kw):

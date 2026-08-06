@@ -220,14 +220,22 @@ indirect call.
 
 `scripts/difftest.sh` is the correctness gate: every program in `examples/`,
 `projects/`, `spec/conformance/`, and `benchmarks/` is run through both engines
-and the outputs must match byte for byte. Current status — **113 identical, 0
+and the outputs must match byte for byte. Current status — **130 identical, 0
 mismatched, 0 unsupported**: nothing in the repository is left to the
 interpreter. Anything the backend cannot compile names the missing feature and
 points at the interpreter; it never silently miscompiles.
 
+Those 130 programs are still a sample, and a sample only finds the
+disagreements someone thought to look for. `scripts/fuzz_differential.py`
+generates programs instead — well-typed by construction, and total by
+construction, so codegen is the only thing left to disagree about. It earned
+its place on its first run by finding a construct that ran under the
+interpreter and would not compile natively, which the 130 had all missed.
+
 `scripts/crosstest.sh` runs the same gate against a *cross-compiled* target to
-prove the backend isn't accidentally host-specific — currently **16 identical,
-0 mismatched** for x86_64 built on arm64. CI (`.github/workflows/ci.yml`) runs
+prove the backend isn't accidentally host-specific — currently **129 identical,
+0 mismatched, 0 unsupported** for x86_64 built on arm64. CI
+(`.github/workflows/ci.yml`) runs
 build + tests + clippy + the differential gate on linux-x86_64, macos-arm64,
 and macos-x86_64, plus object emission for all five architectures.
 
@@ -432,7 +440,7 @@ Currently **65 normative clauses, 65 conformance programs**.
 | `projects/advanced` | validation: router+middleware, scheduler, WAL mini-DB, **Mini-Grasm interpreter written in Grasm** |
 | `spec/` | normative specification + one conformance program per clause |
 | `editors/` | VS Code extension and LSP setup for other editors |
-| `scripts/` | `difftest.sh` (native vs interpreter), `crosstest.sh` (cross-target) |
+| `scripts/` | `difftest.sh` (native vs interpreter), `crosstest.sh` (cross-target), `fuzz_differential.py` (generated programs) |
 | `MASTERPLAN.md` | the full v0.3 strategic blueprint this implements Phase 0–1 of |
 
 ## Status
