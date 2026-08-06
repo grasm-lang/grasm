@@ -42,12 +42,12 @@ is better. Reproduce with `./scripts/bench.sh`.
 
 | program  |   C |  Rust |  Go | grasm-native | grasm-interp | Python |
 |----------|----:|------:|----:|-------------:|-------------:|-------:|
-| fib      |  26 |    26 |  27 |       **27** |         1205 |    153 |
-| sieve    |  27 |    27 |  29 |           39 |         2236 |    373 |
-| matmul   |  27 |    29 |  30 |           33 |         5803 |    934 |
-| wordfreq |  53 |    47 |  39 |          149 |          472 |    155 |
-| sort     |  59 |    32 |  71 |       **47** |          323 |    240 |
-| parmap   |  70 |    72 | 111 |          128 |        32736 |  3,581 |
+| fib      |  25 |    26 |  28 |       **27** |         1206 |    153 |
+| sieve    |  28 |    28 |  29 |           39 |         2229 |    370 |
+| matmul   |  25 |    26 |  29 |           32 |         5795 |    974 |
+| wordfreq |  54 |    48 |  39 |          117 |          472 |    153 |
+| sort     |  58 |    33 |  70 |       **47** |          323 |    237 |
+| parmap   |  69 |    72 | 112 |          128 |        32787 |  3,521 |
 | mandelbrot |  36 |   —  |  —  |       **14** |            — |  1,457 |
 
 Native Grasm matches C on `fib`, which is the benchmark that is almost entirely
@@ -85,10 +85,15 @@ lesson is filed under "read the disassembly before naming the bottleneck".
 
 What is left:
 
-- `wordfreq` is 2.8× off C and the widest remaining gap. Lookup is a hash
-  probe, but each iteration allocates a fresh key string, hashes it twice
-  (`get` then `set`), and clones it on insert. CPython interns short strings
-  and caches their hashes, which is why it is unusually competitive here.
+- `wordfreq` is 2.2× off C and the widest remaining gap. A sample profile puts
+  about 60% of self time in `malloc` and `free`, not in hashing — so the work
+  done since has been removing allocations rather than tuning the hash. Three
+  went: the copy of the word "Some" that every `Option` carried, the key copy
+  every lookup made to look at a key it did not keep, and the key copy on
+  overwriting an existing entry. 149ms to 117ms. What is left is inherent to
+  the program — it builds two strings per iteration — and to boxing every
+  value on the heap. CPython interns short strings and caches their hashes,
+  which is why it is unusually competitive here.
 - `sieve` is 1.4× off C on a loop that is memory-bound at 3.4MB.
 
 ## The "faster than Python" question
