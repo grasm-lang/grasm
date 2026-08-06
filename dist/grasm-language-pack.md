@@ -209,9 +209,12 @@ Precedence, loosest to tightest:
 
 ```
 expression   = or_expr
-primary      = literal | identifier | list_lit | tuple_lit | struct_lit
-             | if_expr | match_expr | block | closure | "(" expression ")"
+primary      = literal | identifier | list_lit | map_lit | tuple_lit
+             | struct_lit | if_expr | match_expr | block | closure
+             | "(" expression ")"
 list_lit     = "[" ( expression ( "," expression )* ","? )? "]"
+map_lit      = "{" ( map_entry ( "," map_entry )* ","? )? "}"
+map_entry    = expression ":" expression
 tuple_lit    = "(" ( expression ( "," expression )+ ","? )? ")"
 struct_lit   = identifier "{" ( field_init ( ("," | newline) field_init )* )? "}"
 field_init   = identifier ":" expression
@@ -223,6 +226,12 @@ closure      = "|" ( identifier ( "," identifier )* )? "|" ( expression | block 
 ```
 
 **[G-PIPE]** `x |> f(a)` is exactly `f(x, a)`; `x |> f` is `f(x)`.
+
+**[G-MAP-BLOCK-AMBIG]** In expression position `{` opens a map literal if
+what follows is `}` or an expression then `:`, and a block otherwise. The two
+never both fit: a statement cannot carry a `:` where a first entry's colon
+would sit. The braces of `if`, `for`, `while`, `match` and function bodies are
+not in expression position and are always blocks.
 
 **[G-STRUCT-AMBIG]** In the condition position of `if`, `while`, `for … in`,
 and `match`, an identifier followed by `{` is *not* a struct literal — the
@@ -587,6 +596,14 @@ the same shape and contents are equal.
 
 **[E-INDEX-BOUNDS]** Indexing a list out of bounds panics with the index and
 the length. `list.get(i)` returns `Option` instead of panicking.
+
+**[E-MAP-LIT]** `{k: v, ...}` builds a map. Entries are evaluated left to
+right, each key before its own value, and a repeated key keeps the last value
+written. `{}` is the empty map: an empty block has no use as an expression and
+is spelled `()`. Anything else in braces is a block, because a block cannot
+carry a `:` where the first entry's colon would sit. The braces that belong to
+`if`, `for`, `while`, `match` and function bodies are always blocks — they are
+not in expression position.
 
 **[E-MAP-ORDER]** Map iteration (`keys`, `values`, printing) is in sorted key
 order — `false` before `true`, then integers ascending, then strings
@@ -1770,6 +1787,57 @@ fn main() ! E {
 }
 ```
 
+## `E-MAP-LIT.gr`
+
+```grasm
+//! tag: E-MAP-LIT
+//! expect: output
+//! {a: 1, b: 2}
+//! {a: 9}
+//! {} 0
+//! {k: 1} 3 ()
+//! 2 entries
+//! [k1, v1, k2, v2]
+fn main() {
+    // Written order does not matter: iteration is sorted (E-MAP-ORDER).
+    let ordered = {"b": 2, "a": 1}
+    print("{ordered}")
+    // A repeated key keeps the last value written.
+    let dup = {"a": 1, "a": 9}
+    print("{dup}")
+    // `{}` is the empty map where a map is expected...
+    var empty: Map[str, i64] = {}
+    print("{empty} {empty.len()}")
+    // ...including as a struct field, which supplies the type.
+    var b = Holder{ items: {} }
+    b.items.set("k", 1)
+    // Braces holding statements are still a block; `{}` is the empty map,
+    // and the empty block — being useless as an expression — is spelled `()`.
+    let block = { let n = 2
+        n + 1 }
+    print("{b.items} {block} {()}")
+    // Each key is evaluated before its own value, and entries left to right.
+    var log: [str] = []
+    let m = {key(log, "k1"): val(log, 1), key(log, "k2"): val(log, 2)}
+    print("{m.len()} entries")
+    print("{log}")
+}
+
+/// Records that it ran, then answers with the key it was given.
+fn key(inout log: [str], k: str) -> str {
+    log.push(k)
+    k
+}
+
+/// The same, for a value.
+fn val(inout log: [str], v: i64) -> i64 {
+    log.push("v{v}")
+    v
+}
+
+type Holder = { items: Map[str, i64] }
+```
+
 ## `E-MAP-ORDER.gr`
 
 ```grasm
@@ -2360,6 +2428,49 @@ fn main() {
     var (p, q) = (10, 20)
     p = p + q
     print("{p}")
+}
+```
+
+## `G-MAP-BLOCK-AMBIG.gr`
+
+```grasm
+//! tag: G-MAP-BLOCK-AMBIG
+//! expect: output
+//! map {a: 1}
+//! block 3
+//! empty {}
+//! body ok
+//! cond ok
+type Cfg = { on: bool }
+
+fn main() {
+    // An expression then `:` — a map.
+    let m = {"a": 1}
+    print("map {m}")
+    // Statements — a block, whose value is its last expression.
+    let b = { let n = 2
+        n + 1 }
+    print("block {b}")
+    // Nothing at all — the empty map.
+    let e: Map[str, i64] = {}
+    print("empty {e}")
+    // The braces of `if`/`for`/`while`/`match` and a function body are not in
+    // expression position, so they stay blocks even when the first thing in
+    // them could start a map entry.
+    if true {
+        let a = 1
+        print("body {label(a)}")
+    }
+    // A condition's brace opens the body (G-STRUCT-AMBIG), and the body is a
+    // block, not a map, even though `on: true` would read as an entry.
+    let c = Cfg{ on: true }
+    if c.on {
+        print("cond ok")
+    }
+}
+
+fn label(n: i64) -> str {
+    if n == 1 { "ok" } else { "no" }
 }
 ```
 

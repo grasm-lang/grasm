@@ -114,6 +114,11 @@ struct Checker {
     /// Scope depth at which each enclosing closure body begins. A binding
     /// found below the innermost of these is captured, not local.
     closure_floors: Vec<usize>,
+    /// Type parameters of the function being checked, so an annotation inside
+    /// its body can name them. Without this `fn f[T](xs: [T]) { var o: [T] }`
+    /// reported "unknown type `T`" and suggested declaring it with `type`,
+    /// which is advice that cannot work.
+    current_generics: Vec<String>,
     /// (ret, err) of the function being checked.
     fn_ret: Type,
     fn_err: Option<Type>,
@@ -151,6 +156,7 @@ impl Checker {
             module_imports: HashMap::new(),
             scopes: Vec::new(),
             closure_floors: Vec::new(),
+            current_generics: Vec::new(),
             fn_ret: Type::Unit,
             fn_err: None,
             err_open: false,
@@ -534,7 +540,9 @@ impl Checker {
             Some(i) => i,
             None => return,
         };
-        // Generic params stay opaque (`Generic(i)`) while checking the body.
+        // Generic params stay opaque (`Generic(i)`) while checking the body,
+        // and are in scope for annotations written inside it.
+        self.current_generics = f.generics.iter().map(|g| g.name.clone()).collect();
         self.fn_ret = info.ret.clone();
         self.err_open = f.name.name == "main" && info.err.is_none();
         self.fn_err = if f.name.name == "main" && info.err.is_none() {
@@ -574,6 +582,7 @@ impl Checker {
             );
         }
         self.scopes.pop();
+        self.current_generics.clear();
     }
 
     // ------------------------------------------------------------------
@@ -635,7 +644,8 @@ impl Checker {
                 ..
             } => {
                 let bound_ty = if let Some(te) = ty {
-                    let want = self.resolve_type(te, &[]);
+                    let gs = self.current_generics.clone();
+                    let want = self.resolve_type(te, &gs);
                     self.check_expr(init, &want);
                     want
                 } else {
@@ -1012,6 +1022,15 @@ declare it before `parallel`",
                     self.check_expr(item, &elem);
                 }
                 Type::List(Box::new(elem))
+            }
+            Expr::Map(entries, _) => {
+                let k = self.uni.fresh();
+                let v = self.uni.fresh();
+                for (ke, ve) in entries {
+                    self.check_expr(ke, &k);
+                    self.check_expr(ve, &v);
+                }
+                Type::Map(Box::new(k), Box::new(v))
             }
             Expr::Tuple(items, _) => {
                 if items.is_empty() {

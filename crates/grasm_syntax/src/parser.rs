@@ -1454,7 +1454,7 @@ impl Parser {
             }
             TokenKind::KwIf => self.parse_if(),
             TokenKind::KwMatch => self.parse_match(),
-            TokenKind::LBrace => Ok(Expr::Block(self.parse_block()?)),
+            TokenKind::LBrace => self.parse_brace_expr(),
             TokenKind::Pipe => self.parse_closure(),
             other => {
                 // Operators other languages spell differently are the ones a
@@ -1671,6 +1671,61 @@ impl Parser {
             arms,
             span: start.merge(rb.span),
         })
+    }
+
+    /// `{` opens either a block or a map literal. Telling them apart by
+    /// lookahead would mean re-implementing expression parsing to find the
+    /// `:`, so this reads it as a map and rewinds if that does not fit. The
+    /// two never both succeed: a map entry needs a `:` where a statement
+    /// cannot have one.
+    fn parse_brace_expr(&mut self) -> PResult<Expr> {
+        let mark = (self.i, self.modes.clone(), self.diags.len());
+        if let Some(e) = self.try_parse_map() {
+            return Ok(e);
+        }
+        self.i = mark.0;
+        self.modes = mark.1;
+        self.diags.truncate(mark.2);
+        Ok(Expr::Block(self.parse_block()?))
+    }
+
+    /// The map reading of `{...}`, or None if it is not one. Rewinding is the
+    /// caller's job, so this may leave the parser mid-brace.
+    fn try_parse_map(&mut self) -> Option<Expr> {
+        let start = self.cur_span();
+        self.expect(&TokenKind::LBrace).ok()?;
+        self.skip_newlines();
+        let mut entries: Vec<(Expr, Expr)> = Vec::new();
+        if self.at(&TokenKind::RBrace) {
+            let end = self.cur_span();
+            self.bump();
+            return Some(Expr::Map(entries, start.merge(end)));
+        }
+        loop {
+            let key = self.parse_expr().ok()?;
+            self.skip_newlines();
+            self.expect(&TokenKind::Colon).ok()?;
+            self.skip_newlines();
+            let val = self.parse_expr().ok()?;
+            entries.push((key, val));
+            self.skip_newlines();
+            if self.at(&TokenKind::Comma) {
+                self.bump();
+                self.skip_newlines();
+                if self.at(&TokenKind::RBrace) {
+                    let end = self.cur_span();
+                    self.bump();
+                    return Some(Expr::Map(entries, start.merge(end)));
+                }
+                continue;
+            }
+            if self.at(&TokenKind::RBrace) {
+                let end = self.cur_span();
+                self.bump();
+                return Some(Expr::Map(entries, start.merge(end)));
+            }
+            return None;
+        }
     }
 
     fn parse_closure(&mut self) -> PResult<Expr> {

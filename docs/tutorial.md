@@ -107,16 +107,24 @@ That is the only destructuring form — there is no `if let`, and patterns
 elsewhere appear only in `match`. It matters most with maps, where
 `entries()` hands back pairs.
 
-Maps iterate in sorted key order, so printing one is deterministic:
+Write a map with `{key: value}`, or build one up from `{}`. Maps iterate in
+sorted key order, so printing one is deterministic — and what it prints is
+what you would type to write it back:
 
 ```
 fn main() {
-    var counts = map()
+    let ripeness = {"pear": 2, "fig": 1}
+    print("{ripeness}")          // {fig: 1, pear: 2} — sorted, every run
+
+    var counts: Map[str, i64] = {}
     counts.set("pear", 2)
-    counts.set("fig", 1)
-    print("{counts}")            // same output on every run
+    print("{counts}")
 }
 ```
+
+`{}` is the empty map. Braces holding *statements* are a block, and an empty
+block has no use as an expression, so `()` is how you write unit. The braces
+of `if`, `for`, `while`, `match` and function bodies are always blocks.
 
 ## 4. Errors are values
 

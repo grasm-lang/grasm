@@ -77,6 +77,14 @@ the same shape and contents are equal.
 **[E-INDEX-BOUNDS]** Indexing a list out of bounds panics with the index and
 the length. `list.get(i)` returns `Option` instead of panicking.
 
+**[E-MAP-LIT]** `{k: v, ...}` builds a map. Entries are evaluated left to
+right, each key before its own value, and a repeated key keeps the last value
+written. `{}` is the empty map: an empty block has no use as an expression and
+is spelled `()`. Anything else in braces is a block, because a block cannot
+carry a `:` where the first entry's colon would sit. The braces that belong to
+`if`, `for`, `while`, `match` and function bodies are always blocks — they are
+not in expression position.
+
 **[E-MAP-ORDER]** Map iteration (`keys`, `values`, printing) is in sorted key
 order — `false` before `true`, then integers ascending, then strings
 lexicographically — so program output is deterministic.

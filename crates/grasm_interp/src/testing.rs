@@ -661,6 +661,12 @@ fn expr_lines(
                 expr_lines(file, i, base, index, out);
             }
         }
+        Expr::Map(entries, _) => {
+            for (k, v) in entries {
+                expr_lines(file, k, base, index, out);
+                expr_lines(file, v, base, index, out);
+            }
+        }
         _ => {}
     }
 }

@@ -714,3 +714,52 @@ fn slashes_inside_a_string_are_not_documentation() {
     assert_eq!(m.doc_for(&m.decls[0]), None);
     assert!(m.docs.is_empty());
 }
+
+/// `{` in expression position is a map literal or a block, and the two are
+/// told apart by whether a `:` sits where a first entry's colon would. These
+/// pin that split, because getting it wrong silently changes what a program
+/// means rather than failing to parse.
+#[test]
+fn braces_in_expression_position_split_into_maps_and_blocks() {
+    fn body_expr(src: &str) -> Expr {
+        let m = parse_ok(src);
+        let Decl::Fn(f) = &m.decls[0] else {
+            panic!("expected a function")
+        };
+        match &f.body.stmts[0] {
+            Stmt::Let { init, .. } => init.clone(),
+            other => panic!("expected a let, got {other:?}"),
+        }
+    }
+
+    // Entries make a map, with or without a trailing comma or newlines.
+    assert!(matches!(
+        body_expr("fn f() {\n    let m = {\"a\": 1}\n}\n"),
+        Expr::Map(ref e, _) if e.len() == 1
+    ));
+    assert!(matches!(
+        body_expr("fn f() {\n    let m = {\n        \"a\": 1,\n        \"b\": 2,\n    }\n}\n"),
+        Expr::Map(ref e, _) if e.len() == 2
+    ));
+    // Nothing at all is the empty map, not an empty block.
+    assert!(matches!(
+        body_expr("fn f() {\n    let m = {}\n}\n"),
+        Expr::Map(ref e, _) if e.is_empty()
+    ));
+    // Statements make a block.
+    assert!(matches!(
+        body_expr("fn f() {\n    let b = { let n = 1\n        n }\n}\n"),
+        Expr::Block(_)
+    ));
+    // A single expression with no colon is a block, not a one-entry map.
+    assert!(matches!(
+        body_expr("fn f() {\n    let b = { 1 + 2 }\n}\n"),
+        Expr::Block(_)
+    ));
+    // An annotation's colon belongs to a statement, so this stays a block —
+    // the case where a naive scan for the first `:` reads a block as a map.
+    assert!(matches!(
+        body_expr("fn f() {\n    let b = { let n: i64 = 1\n        n }\n}\n"),
+        Expr::Block(_)
+    ));
+}

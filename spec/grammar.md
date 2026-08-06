@@ -194,9 +194,12 @@ Precedence, loosest to tightest:
 
 ```
 expression   = or_expr
-primary      = literal | identifier | list_lit | tuple_lit | struct_lit
-             | if_expr | match_expr | block | closure | "(" expression ")"
+primary      = literal | identifier | list_lit | map_lit | tuple_lit
+             | struct_lit | if_expr | match_expr | block | closure
+             | "(" expression ")"
 list_lit     = "[" ( expression ( "," expression )* ","? )? "]"
+map_lit      = "{" ( map_entry ( "," map_entry )* ","? )? "}"
+map_entry    = expression ":" expression
 tuple_lit    = "(" ( expression ( "," expression )+ ","? )? ")"
 struct_lit   = identifier "{" ( field_init ( ("," | newline) field_init )* )? "}"
 field_init   = identifier ":" expression
@@ -208,6 +211,12 @@ closure      = "|" ( identifier ( "," identifier )* )? "|" ( expression | block 
 ```
 
 **[G-PIPE]** `x |> f(a)` is exactly `f(x, a)`; `x |> f` is `f(x)`.
+
+**[G-MAP-BLOCK-AMBIG]** In expression position `{` opens a map literal if
+what follows is `}` or an expression then `:`, and a block otherwise. The two
+never both fit: a statement cannot carry a `:` where a first entry's colon
+would sit. The braces of `if`, `for`, `while`, `match` and function bodies are
+not in expression position and are always blocks.
 
 **[G-STRUCT-AMBIG]** In the condition position of `if`, `while`, `for … in`,
 and `match`, an identifier followed by `{` is *not* a struct literal — the

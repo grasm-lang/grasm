@@ -495,6 +495,12 @@ fn collect_calls_expr<'e>(e: &'e Expr, out: &mut Vec<(&'e str, &'e [Expr], Span)
                 collect_calls_expr(i, out);
             }
         }
+        Expr::Map(entries, _) => {
+            for (k, v) in entries {
+                collect_calls_expr(k, out);
+                collect_calls_expr(v, out);
+            }
+        }
         Expr::Binary { lhs, rhs, .. } => {
             collect_calls_expr(lhs, out);
             collect_calls_expr(rhs, out);
@@ -640,6 +646,12 @@ fn collect_par_maps_expr<'e>(e: &'e Expr, out: &mut Vec<(&'e Expr, Span)>) {
                 collect_par_maps_expr(i, out);
             }
         }
+        Expr::Map(entries, _) => {
+            for (k, v) in entries {
+                collect_par_maps_expr(k, out);
+                collect_par_maps_expr(v, out);
+            }
+        }
         Expr::Str(pieces, _) => {
             for p in pieces {
                 if let StrPiece::Expr(inner) = p {
@@ -729,6 +741,12 @@ fn fn_sources<'a>(e: &'a Expr, ctx: &Ctx, current: &str, out: &mut Vec<FnSource<
         Expr::List(items, _) | Expr::Tuple(items, _) => {
             for i in items {
                 fn_sources(i, ctx, current, out);
+            }
+        }
+        Expr::Map(entries, _) => {
+            for (k, v) in entries {
+                fn_sources(k, ctx, current, out);
+                fn_sources(v, ctx, current, out);
             }
         }
         _ => {}
@@ -942,6 +960,12 @@ fn walk_expr(
         Expr::List(items, _) | Expr::Tuple(items, _) => {
             for i in items {
                 walk_expr(i, current, active, ctx, fnb, out);
+            }
+        }
+        Expr::Map(entries, _) => {
+            for (k, v) in entries {
+                walk_expr(k, current, active, ctx, fnb, out);
+                walk_expr(v, current, active, ctx, fnb, out);
             }
         }
         Expr::StructLit { fields, .. } => {

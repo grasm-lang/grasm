@@ -342,6 +342,8 @@ pub enum Expr {
     Str(Vec<StrPiece>, Span),
     Ident(Ident),
     List(Vec<Expr>, Span),
+    /// `{"a": 1}` — key/value pairs in written order.
+    Map(Vec<(Expr, Expr)>, Span),
     Tuple(Vec<Expr>, Span),
     /// `User{ id: 1, name: "x" }`
     StructLit {
@@ -458,6 +460,7 @@ impl Expr {
             | Expr::Bool(_, s)
             | Expr::Str(_, s)
             | Expr::List(_, s)
+            | Expr::Map(_, s)
             | Expr::Tuple(_, s) => *s,
             Expr::Ident(id) => id.span,
             Expr::StructLit { span, .. }

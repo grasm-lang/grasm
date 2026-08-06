@@ -7,7 +7,7 @@ before it is listed as stable.
 `crates/grasm_spec` fails if a clause here is missing, unknown, or listed twice,
 so this file cannot drift away from the specification it describes.
 
-Today: 94 stable, 24 provisional, 16 experimental, of 134.
+Today: 94 stable, 26 provisional, 16 experimental, of 136.
 
 ## Stable
 
@@ -119,8 +119,10 @@ generic bounds are the known next step, `T-INT-ALIAS` names types the
 implementation admits are unfinished, and the rest were written too recently
 for "no problem found" to mean anything.
 
+- `E-MAP-LIT` — provisional
 - `E-RECURSION-DEPTH` — provisional
 - `G-LET-TUPLE` — provisional
+- `G-MAP-BLOCK-AMBIG` — provisional
 - `G-NEST-LIMIT` — provisional
 - `L-DISPLAY` — provisional
 - `L-LIB-FREE` — provisional

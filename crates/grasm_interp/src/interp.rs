@@ -775,6 +775,18 @@ impl<'a, W: Write> Interp<'a, W> {
                 }
                 Ok(Value::List(Rc::new(vs)))
             }
+            Expr::Map(entries, _) => {
+                let mut m = std::collections::BTreeMap::new();
+                for (ke, ve) in entries {
+                    let k = self.eval_expr(ke)?;
+                    let v = self.eval_expr(ve)?;
+                    let Some(key) = crate::value::MapKey::from_value(&k) else {
+                        return Err(Flow::Panic(format!("invalid map key `{k}`")));
+                    };
+                    m.insert(key, v);
+                }
+                Ok(Value::Map(Rc::new(m)))
+            }
             Expr::Tuple(items, _) => {
                 if items.is_empty() {
                     return Ok(Value::Unit);

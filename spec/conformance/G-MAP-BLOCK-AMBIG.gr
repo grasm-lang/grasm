@@ -1,0 +1,38 @@
+//! tag: G-MAP-BLOCK-AMBIG
+//! expect: output
+//! map {a: 1}
+//! block 3
+//! empty {}
+//! body ok
+//! cond ok
+type Cfg = { on: bool }
+
+fn main() {
+    // An expression then `:` — a map.
+    let m = {"a": 1}
+    print("map {m}")
+    // Statements — a block, whose value is its last expression.
+    let b = { let n = 2
+        n + 1 }
+    print("block {b}")
+    // Nothing at all — the empty map.
+    let e: Map[str, i64] = {}
+    print("empty {e}")
+    // The braces of `if`/`for`/`while`/`match` and a function body are not in
+    // expression position, so they stay blocks even when the first thing in
+    // them could start a map entry.
+    if true {
+        let a = 1
+        print("body {label(a)}")
+    }
+    // A condition's brace opens the body (G-STRUCT-AMBIG), and the body is a
+    // block, not a map, even though `on: true` would read as an entry.
+    let c = Cfg{ on: true }
+    if c.on {
+        print("cond ok")
+    }
+}
+
+fn label(n: i64) -> str {
+    if n == 1 { "ok" } else { "no" }
+}

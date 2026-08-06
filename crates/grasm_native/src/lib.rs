@@ -1809,6 +1809,12 @@ fn collect_calls_expr(e: &Expr, bound: &[String], out: &mut HashMap<String, Vec<
                 collect_calls_expr(i, bound, out);
             }
         }
+        Expr::Map(entries, _) => {
+            for (k, v) in entries {
+                collect_calls_expr(k, bound, out);
+                collect_calls_expr(v, bound, out);
+            }
+        }
         Expr::Str(pieces, _) => {
             for p in pieces {
                 if let StrPiece::Expr(inner) = p {
@@ -1849,6 +1855,12 @@ fn collect_idents(e: &Expr, out: &mut Vec<String>) {
         Expr::List(items, _) | Expr::Tuple(items, _) => {
             for i in items {
                 collect_idents(i, out);
+            }
+        }
+        Expr::Map(entries, _) => {
+            for (k, v) in entries {
+                collect_idents(k, out);
+                collect_idents(v, out);
             }
         }
         Expr::Str(pieces, _) => {
@@ -2037,6 +2049,7 @@ fn needs_element_hint(e: &Expr) -> bool {
 fn needs_type_hint(e: &Expr) -> bool {
     match e {
         Expr::List(items, _) => items.is_empty(),
+        Expr::Map(entries, _) => entries.is_empty(),
         Expr::Call { callee, args, .. } => {
             args.is_empty() && matches!(&**callee, Expr::Ident(id) if id.name == "map")
         }
@@ -3206,6 +3219,12 @@ impl FnCx<'_, '_> {
                 return Ok((list, VType::List(elem_t.clone())));
             }
         }
+        if let (Expr::Map(entries, _), Some(VType::Map(k, v))) = (e, expected) {
+            if entries.is_empty() {
+                let m = self.call_rt("grasm_map_new", &[]).unwrap();
+                return Ok((m, VType::Map(k.clone(), v.clone())));
+            }
+        }
         if let (Expr::Call { callee, args, .. }, Some(VType::Map(k, v))) = (e, expected) {
             if args.is_empty() {
                 if let Expr::Ident(id) = &**callee {
@@ -3222,6 +3241,20 @@ impl FnCx<'_, '_> {
     fn eval_expr(&mut self, e: &Expr) -> CResult<Option<(Value, VType)>> {
         match e {
             Expr::Int(v, _) => Ok(Some((self.b.ins().iconst(types::I64, *v), VType::I64))),
+            Expr::Map(entries, _) => {
+                let mut m = self.call_rt("grasm_map_new", &[]).unwrap();
+                let (mut kt, mut vt) = (VType::Any, VType::Any);
+                for (ke, ve) in entries {
+                    let (kv, kvt) = self.eval_expr_val(ke)?;
+                    let kb = self.box_value(kv, &kvt);
+                    let (vv, vvt) = self.eval_expr_val(ve)?;
+                    let vb = self.box_value(vv, &vvt);
+                    m = self.call_rt("grasm_map_set", &[m, kb, vb]).unwrap();
+                    kt = kvt;
+                    vt = vvt;
+                }
+                Ok(Some((m, VType::Map(Box::new(kt), Box::new(vt)))))
+            }
             Expr::Float(v, _) => Ok(Some((self.b.ins().f64const(*v), VType::F64))),
             Expr::Bool(v, _) => Ok(Some((
                 self.b.ins().iconst(types::I8, i64::from(*v)),
@@ -3446,9 +3479,11 @@ impl FnCx<'_, '_> {
                     match (&vt, name.name.as_str()) {
                         (VType::Map(k_t, v_t), "set") => {
                             let (kt, vt2) = (k_t.clone(), v_t.clone());
-                            let (kv, kvt) = self.eval_expr_val(&args[0])?;
+                            let want_k: Option<VType> = if **k_t == VType::Any { None } else { Some((**k_t).clone()) };
+                            let want_v: Option<VType> = if **v_t == VType::Any { None } else { Some((**v_t).clone()) };
+                            let (kv, kvt) = self.eval_expr_expecting(&args[0], want_k.as_ref())?;
                             let kb = self.box_value(kv, &kvt);
-                            let (vv, vvt) = self.eval_expr_val(&args[1])?;
+                            let (vv, vvt) = self.eval_expr_expecting(&args[1], want_v.as_ref())?;
                             let vb = self.box_value(vv, &vvt);
                             let cur = self.b.use_var(var);
                             let np = self.call_rt("grasm_map_set", &[cur, kb, vb]).unwrap();
@@ -3510,6 +3545,69 @@ impl FnCx<'_, '_> {
                 }
             }
         }
+        // The same mutating methods on a nested place: `bag.seen.set(k, v)`.
+        // Reached only when the receiver is not a plain variable, so the
+        // variable case above still takes the shorter path.
+        if matches!(name.name.as_str(), "set" | "delete" | "sort")
+            && matches!(recv, Expr::Field { .. } | Expr::Index { .. })
+        {
+            let (root, path) = self.place_path(recv)?;
+            let Some((var, root_t)) = self.lookup(&root.name) else {
+                return nope(root.span, "a mutating method on an unknown variable");
+            };
+            let inner_t = self.place_type(&root_t, &path, span)?;
+            match (&inner_t, name.name.as_str()) {
+                (VType::Map(k_t, v_t), "set") => {
+                    let want_k: Option<VType> =
+                        if **k_t == VType::Any { None } else { Some((**k_t).clone()) };
+                    let want_v: Option<VType> =
+                        if **v_t == VType::Any { None } else { Some((**v_t).clone()) };
+                    let (kv, kvt) = self.eval_expr_expecting(&args[0], want_k.as_ref())?;
+                    let kb = self.box_value(kv, &kvt);
+                    let (vv, vvt) = self.eval_expr_expecting(&args[1], want_v.as_ref())?;
+                    let vb = self.box_value(vv, &vvt);
+                    let cur = self.b.use_var(var);
+                    let mapv = self.read_place_boxed(cur, &path, &root_t)?;
+                    let newmap = self.call_rt("grasm_map_set", &[mapv, kb, vb]).unwrap();
+                    let cur2 = self.b.use_var(var);
+                    let updated = self.write_place(cur2, &path, &root_t, newmap)?;
+                    self.b.def_var(var, updated);
+                    return Ok(None);
+                }
+                (VType::Map(_, _), "delete") => {
+                    let (kv, kvt) = self.eval_expr_val(&args[0])?;
+                    let kb = self.box_value(kv, &kvt);
+                    let slot = self.b.create_sized_stack_slot(
+                        cranelift_codegen::ir::StackSlotData::new(
+                            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                            8,
+                            3,
+                        ),
+                    );
+                    let ptr_ty = self.cg.module.target_config().pointer_type();
+                    let addr = self.b.ins().stack_addr(ptr_ty, slot, 0);
+                    let cur = self.b.use_var(var);
+                    let mapv = self.read_place_boxed(cur, &path, &root_t)?;
+                    let newmap = self.call_rt("grasm_map_delete", &[mapv, kb, addr]).unwrap();
+                    let cur2 = self.b.use_var(var);
+                    let updated = self.write_place(cur2, &path, &root_t, newmap)?;
+                    self.b.def_var(var, updated);
+                    self.call_rt("grasm_val_dec", &[kb]);
+                    let found = self.b.ins().stack_load(types::I8, slot, 0);
+                    return Ok(Some((found, VType::Bool)));
+                }
+                (VType::List(_), "sort") => {
+                    let cur = self.b.use_var(var);
+                    let listv = self.read_place_boxed(cur, &path, &root_t)?;
+                    let newlist = self.call_rt("grasm_list_sort", &[listv]).unwrap();
+                    let cur2 = self.b.use_var(var);
+                    let updated = self.write_place(cur2, &path, &root_t, newlist)?;
+                    self.b.def_var(var, updated);
+                    return Ok(None);
+                }
+                _ => return nope(span, "this mutating method on this place"),
+            }
+        }
         // Mutating list push on a nested place: `bag.items.push(v)`.
         if name.name == "push" && matches!(recv, Expr::Field { .. } | Expr::Index { .. }) {
             let (root, path) = self.place_path(recv)?;
@@ -3569,10 +3667,7 @@ impl FnCx<'_, '_> {
                     if !self.cg.fns.contains_key(&qual)
                         && self.cg.generic_fns.contains_key(&qual)
                     {
-                        let mut arg_types = Vec::with_capacity(args.len());
-                        for a in args {
-                            arg_types.push(self.probe_type(a)?);
-                        }
+                        let arg_types = self.generic_arg_types(&qual, args)?;
                         qual = self.cg.instantiate_generic(
                             &target_mod,
                             &name.name,
@@ -4697,10 +4792,7 @@ impl FnCx<'_, '_> {
         let sig_key = if self.lookup_fn(&id.name).is_none() {
             let generic_key = format!("{}::{}", self.cg.current_module, id.name);
             if self.cg.generic_fns.contains_key(&generic_key) {
-                let mut arg_types = Vec::with_capacity(args.len());
-                for a in args {
-                    arg_types.push(self.probe_type(a)?);
-                }
+                let arg_types = self.generic_arg_types(&generic_key, args)?;
                 let module = self.cg.current_module.clone();
                 Some(self.cg.instantiate_generic(&module, &id.name, &arg_types, id.span)?)
             } else {
@@ -5105,6 +5197,67 @@ impl FnCx<'_, '_> {
 
     /// Static type probe without emitting code. Best-effort but covers the
     /// realistic expression shapes; used for merge-block param types.
+    /// Argument types for a call to a generic function.
+    ///
+    /// A closure argument has no type of its own: its parameter types come
+    /// from the parameter it is passed to, and for a generic function that
+    /// parameter is not known until the *other* arguments have fixed the type
+    /// parameters. So probe what can be probed, solve the type parameters from
+    /// those, and read the remaining arguments off the signature.
+    fn generic_arg_types(
+        &mut self,
+        generic_key: &str,
+        args: &[Expr],
+    ) -> CResult<Vec<VType>> {
+        let mut probed: Vec<Option<VType>> = Vec::with_capacity(args.len());
+        let mut first_err: Option<Unsupported> = None;
+        for a in args {
+            match self.probe_type(a) {
+                Ok(t) => probed.push(Some(t)),
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                    probed.push(None);
+                }
+            }
+        }
+        if probed.iter().all(Option::is_some) {
+            return Ok(probed.into_iter().flatten().collect());
+        }
+        let Some(decl) = self.cg.generic_fns.get(generic_key).cloned() else {
+            return Err(first_err.expect("a None probe recorded an error"));
+        };
+        let names: std::collections::HashSet<&str> =
+            decl.generics.iter().map(|g| g.name.as_str()).collect();
+        let mut subst = HashMap::new();
+        for (param, actual) in decl.params.iter().zip(&probed) {
+            if let Some(a) = actual {
+                unify_generic(&param.ty, a, &names, &mut subst);
+            }
+        }
+        let saved = std::mem::replace(&mut self.cg.generic_subst, subst);
+        let mut out = Vec::with_capacity(args.len());
+        let mut fill_err: Option<Unsupported> = None;
+        for (i, probe) in probed.into_iter().enumerate() {
+            match probe {
+                Some(t) => out.push(t),
+                None => match decl.params.get(i).map(|p| self.cg.vtype_of(&p.ty)) {
+                    Some(Ok(t)) => out.push(t),
+                    _ => {
+                        fill_err = Some(first_err.take().expect("recorded"));
+                        break;
+                    }
+                },
+            }
+        }
+        self.cg.generic_subst = saved;
+        match fill_err {
+            Some(e) => Err(e),
+            None => Ok(out),
+        }
+    }
+
     fn probe_type(&mut self, e: &Expr) -> CResult<VType> {
         use BinaryOp::*;
         Ok(match e {
@@ -5194,10 +5347,7 @@ impl FnCx<'_, '_> {
                     // which means resolving the instantiation here too.
                     let generic_key = format!("{}::{}", self.cg.current_module, id.name);
                     if self.cg.generic_fns.contains_key(&generic_key) {
-                        let mut arg_types = Vec::with_capacity(args.len());
-                        for a in args {
-                            arg_types.push(self.probe_type(a)?);
-                        }
+                        let arg_types = self.generic_arg_types(&generic_key, args)?;
                         let module = self.cg.current_module.clone();
                         let key =
                             self.cg
