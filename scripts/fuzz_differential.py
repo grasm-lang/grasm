@@ -41,6 +41,7 @@ class Gen:
         self.next_id = 0
         self.depth = 0
         self.helpers = []        # (name, return type, [param types])
+        self.fallibles = []      # (name, ok type) for `fn .. -> T ! Bad`
 
     def fresh(self, prefix="v"):
         self.next_id += 1
@@ -206,6 +207,27 @@ class Gen:
             out.append(f"        {name} = {name} + {self.expr(INT)}")
             self.scope.pop()
             out.append("    }")
+        elif kind < 0.60 and self.fallibles:
+            # Consuming a fallible value: both halves, and `try` inside a
+            # function that declares the same error type.
+            name, ret = self.rng.choice(self.fallibles)
+            v = self.fresh("r")
+            out.append(f"    match {name}({self.expr(INT)}) {{")
+            out.append(f'        Ok({v}) -> print("{{{v}}}")')
+            out.append(f'        Err(e{v}) -> print("{{e{v}.why}}")')
+            out.append("    }")
+        elif kind < 0.64:
+            # An effect with a handler, including one operation that takes a
+            # parameter and a handler body that itself performs `io`.
+            n = self.fresh("h")
+            out.append(f"    var {n} = {self.expr(INT)}")
+            self.scope.append((n, INT))
+            out.append(
+                f"    with Cfg handled_by CfgHandler{{ scale: || {n}, "
+                f'label: |v| "L{{v}}" }} {{'
+            )
+            out.append('        print("{Cfg.scale()} {Cfg.label(2)}")')
+            out.append("    }")
         elif kind < 0.68:
             # A while loop with a counter the body cannot make diverge.
             n = self.fresh("w")
@@ -236,7 +258,14 @@ class Gen:
             out.append(f'    print("{{{self.expr(ty)}}}")')
 
     def declarations(self):
-        """Top-level types and functions the body may use."""
+        """Top-level types and functions the body may use.
+
+        Fallible functions and an effect are here because every miscompile
+        found by a human so far lived in exactly that surface, and a generator
+        that only emits straight-line arithmetic will never reach it. The
+        `unbox: not an f64` bug needed a `match` inside a `fn ... ! E` whose
+        arms were built-in method calls — four features at once.
+        """
         out = [
             "type Span = { low: i64, high: i64 }",
             "",
@@ -245,7 +274,38 @@ class Gen:
             "    | Pair(a: i64, b: i64)",
             "    | Nothing",
             "",
+            "type Bad = { why: str }",
+            "",
+            "effect Cfg {",
+            "    fn scale() -> i64",
+            "    fn label(n: i64) -> str",
+            "}",
+            "",
         ]
+        # Fallible helpers: `try` at the call site, `fail` on a literal test.
+        for i in range(self.rng.randint(1, 2)):
+            name = f"risky{i}"
+            ret = self.rng.choice([INT, FLOAT])
+            guard = self.rng.randint(0, 4)
+            saved = self.scope
+            self.scope = [("p0", INT)]
+            out.append(f"fn {name}(p0: i64) -> {ret} ! Bad {{")
+            out.append(f"    if p0 == {guard} {{")
+            out.append(f'        fail(Bad{{ why: "p0 was {guard}" }})')
+            out.append("    }")
+            # A match whose arms are method calls — the shape that miscompiled.
+            if ret == FLOAT:
+                out.append("    match p0 % 3 {")
+                out.append(f"        0 -> {self.expr(FLOAT)}.abs()")
+                out.append(f"        1 -> {self.expr(FLOAT)}.min({self.expr(FLOAT)})")
+                out.append(f"        _ -> {self.expr(FLOAT)}.max({self.expr(FLOAT)})")
+                out.append("    }")
+            else:
+                out.append(f"    {self.expr(INT)}")
+            out.append("}")
+            out.append("")
+            self.scope = saved
+            self.fallibles.append((name, ret))
         for i in range(self.rng.randint(1, 3)):
             name = f"helper{i}"
             params = [self.rng.choice([INT, FLOAT, BOOL, STR])
@@ -267,6 +327,18 @@ class Gen:
         body = []
         for _ in range(self.rng.randint(3, 9)):
             self.stmt(body)
+        # Every fallible helper is consumed at least once, on a value that
+        # fails and one that does not. A generator that declares a shape and
+        # never runs it tests compilation only — which is how the first
+        # version of this missed the miscompile it was written for.
+        for name, _ret in self.fallibles:
+            for arg in (0, 1, 4, 7):
+                v = self.fresh("chk")
+                body.append(f"    match {name}({arg}) {{")
+                body.append(f'        Ok({v}) -> print("{{{v}}}")')
+                body.append(f'        Err(e{v}) -> print("{{e{v}.why}}")')
+                body.append("    }")
+
         # Always print something, so an empty program cannot pass vacuously.
         for ty in (INT, STR, BOOL, FLOAT):
             body.append(f'    print("{{{self.expr(ty)}}}")')
