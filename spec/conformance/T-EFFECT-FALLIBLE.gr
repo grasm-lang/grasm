@@ -1,0 +1,40 @@
+//! tag: T-EFFECT-FALLIBLE
+//! expect: output
+//! 42.0
+//! err: missing y
+// An effect operation that can fail.
+//
+// The grammar has always allowed `! E` on an operation, and the checker used
+// to drop it: an error raised in a handler crossed every function on the way
+// out while `grasm check` reported no errors, which defeats the rule that a
+// fallible value cannot be used as if it were plain. Now the operation's
+// result is fallible, so a caller must `try` it and declare an error type of
+// its own — and a handler must produce one.
+type Diag = { msg: str }
+
+effect Cfg {
+    fn get(name: str) -> f64 ! Diag
+}
+
+fn read(name: str) -> f64 ! Diag / {Cfg} {
+    let v = try Cfg.get(name)
+    v * 2.0
+}
+
+fn show(name: str) / {Cfg, io} {
+    match read(name) {
+        Ok(v) -> print("{v}")
+        Err(d) -> print("err: {d.msg}")
+    }
+}
+
+fn main() {
+    // A handler body producing a plain value is producing `Ok(value)`, the
+    // same rule a fallible function's body follows.
+    with Cfg handled_by CfgHandler{
+        get: |n| if n == "x" { 21.0 } else { fail(Diag{ msg: "missing {n}" }) },
+    } {
+        show("x")
+        show("y")
+    }
+}

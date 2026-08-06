@@ -136,6 +136,12 @@ may be written at `handled_by` or bound to a name first, and its body may
 perform effects of its own — a logger that prints performs `io`, which is the
 usual case rather than an exception.
 
+**[T-EFFECT-FALLIBLE]** An operation may declare an error type,
+`fn get(k: str) -> f64 ! Diag`. Its result is then fallible like any other, so
+a caller must consume it with `try` or a `match` and `try` requires the caller
+to declare an error type of its own. A handler's operation produces the plain
+value or `fail`s, exactly as a fallible function's body does.
+
 **[T-EFFECT-ROW]** Every function has an inferred set of effects. A declared
 row `/ {io, E}` is an upper bound: performing an effect outside it is an error.
 

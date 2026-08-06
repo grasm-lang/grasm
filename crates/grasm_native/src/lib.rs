@@ -23,6 +23,9 @@ use grasm_syntax::ast::Module as AstModule;
 use grasm_syntax::ast::*;
 use grasm_syntax::span::Span;
 
+/// Marks an `Unsupported` that is really a backend bug, not a gap.
+const INTERNAL: &str = "\u{1}internal\u{1}";
+
 pub struct Unsupported {
     pub span: Span,
     pub what: String,
@@ -218,6 +221,17 @@ fn compile_object_scoped(
                 u.span.end.saturating_sub(f.base),
             );
             let lc = index.line_col(local.start.min(f.src.len() as u32));
+            // A construct the backend has not implemented and a construct it
+            // implemented wrongly are different reports. The first names a
+            // feature and points at the interpreter; the second is a bug and
+            // should say so rather than sending the reader looking for a
+            // language limitation with no name.
+            if let Some(detail) = u.what.strip_prefix(INTERNAL) {
+                return Err(format!(
+                    "{}:{}:{}: internal compiler error — the generated code did not verify.\n  This is a bug in the backend, not a limitation of the language.\n  `grasm run` will still work. Please report it with this program.\n{}",
+                    f.path, lc.line, lc.col, detail
+                ));
+            }
             return Err(format!(
                 "{}:{}:{}: native backend does not yet support {} — use `grasm run` (interpreter) for now",
                 f.path, lc.line, lc.col, u.what
@@ -699,10 +713,18 @@ impl<'m> Codegen<'m> {
                     for p in &op.params {
                         pts.push(self.vtype_of(&p.ty)?);
                     }
-                    let rt = match &op.ret {
+                    let mut rt = match &op.ret {
                         Some(t) => self.vtype_of(t)?,
                         None => VType::Unit,
                     };
+                    // An operation may declare an error type, in which case
+                    // its result is fallible like any other — the checker
+                    // treats it that way, so the backend has to as well or
+                    // `try Cfg.get(x)` is rejected here and accepted there.
+                    if let Some(et) = &op.err {
+                        let e = self.vtype_of(et)?;
+                        rt = VType::Fallible(Box::new(rt), Box::new(e));
+                    }
                     ops.push((op.name.name.clone(), pts, rt));
                 }
                 self.effects.insert(e.name.name.clone(), ops);
@@ -987,7 +1009,11 @@ impl<'m> Codegen<'m> {
             .define_function(main_id, &mut ctx)
             .map_err(|e| Unsupported {
                 span: Span::new(0, 1),
-                what: format!("(define error: {e})"),
+                // A verifier failure is a compiler bug, not a missing
+                // feature, and reporting it through the "unsupported" channel
+                // tells a reader to use the interpreter for a construct that
+                // has no name. Say which it is.
+                what: format!("{INTERNAL}  {e}"),
             })?;
         Ok(())
     }
@@ -1339,7 +1365,11 @@ impl<'m> Codegen<'m> {
             .define_function(id, &mut ctx)
             .map_err(|e| Unsupported {
                 span,
-                what: format!("(define error: {e})"),
+                // A verifier failure is a compiler bug, not a missing
+                // feature, and reporting it through the "unsupported" channel
+                // tells a reader to use the interpreter for a construct that
+                // has no name. Say which it is.
+                what: format!("{INTERNAL}  {e}"),
             })?;
         self.fn_wrappers.insert(key.to_string(), id);
         Ok(id)
@@ -1410,7 +1440,11 @@ impl<'m> Codegen<'m> {
             .define_function(c.id, &mut ctx)
             .map_err(|e| Unsupported {
                 span: c.body.span(),
-                what: format!("(define error: {e})"),
+                // A verifier failure is a compiler bug, not a missing
+                // feature, and reporting it through the "unsupported" channel
+                // tells a reader to use the interpreter for a construct that
+                // has no name. Say which it is.
+                what: format!("{INTERNAL}  {e}"),
             })?;
         let _ = c.module;
         Ok(())
@@ -1498,7 +1532,11 @@ impl<'m> Codegen<'m> {
             .define_function(c.id, &mut ctx)
             .map_err(|e| Unsupported {
                 span: c.body.span(),
-                what: format!("(define error: {e})"),
+                // A verifier failure is a compiler bug, not a missing
+                // feature, and reporting it through the "unsupported" channel
+                // tells a reader to use the interpreter for a construct that
+                // has no name. Say which it is.
+                what: format!("{INTERNAL}  {e}"),
             })?;
         let _ = c.module;
         Ok(())
@@ -1566,6 +1604,25 @@ impl<'m> Codegen<'m> {
                 fcx.emit_scope_decs_all();
                 fcx.b.ins().return_(&[]);
             }
+            // An operation that declares `! E`: a body producing the plain
+            // value is producing `Ok(value)`, the same rule a fallible
+            // function's body follows. Without this the two halves of an
+            // `if` — one a value, one a `fail` — are different types and the
+            // generated code does not verify.
+            (VType::Fallible(ok_t, _), Some((x, xt))) => {
+                let v = if matches!(xt, VType::Fallible(_, _)) {
+                    x
+                } else {
+                    let mut inner = x;
+                    if **ok_t == VType::F64 && xt == VType::I64 {
+                        inner = fcx.b.ins().fcvt_from_sint(types::F64, inner);
+                    }
+                    let boxed = fcx.box_value(inner, ok_t);
+                    fcx.call_rt("grasm_ok_new", &[boxed]).unwrap()
+                };
+                fcx.emit_scope_decs_all();
+                fcx.b.ins().return_(&[v]);
+            }
             (want, Some((mut x, xt))) => {
                 if *want == VType::F64 && xt == VType::I64 {
                     x = fcx.b.ins().fcvt_from_sint(types::F64, x);
@@ -1583,7 +1640,11 @@ impl<'m> Codegen<'m> {
             .define_function(h.id, &mut ctx)
             .map_err(|e| Unsupported {
                 span: h.body.span(),
-                what: format!("(define error: {e})"),
+                // A verifier failure is a compiler bug, not a missing
+                // feature, and reporting it through the "unsupported" channel
+                // tells a reader to use the interpreter for a construct that
+                // has no name. Say which it is.
+                what: format!("{INTERNAL}  {e}"),
             })?;
         Ok(())
     }

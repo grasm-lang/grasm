@@ -247,11 +247,23 @@ impl Checker {
                 for op in &e.ops {
                     let params: Vec<Type> =
                         op.params.iter().map(|p| self.resolve_type(&p.ty, &[])).collect();
-                    let ret = op
+                    let mut ret = op
                         .ret
                         .as_ref()
                         .map(|t| self.resolve_type(t, &[]))
                         .unwrap_or(Type::Unit);
+                    // `fn get(k: str) -> f64 ! Diag` — an operation that can
+                    // fail. The grammar has always allowed this and the
+                    // checker used to drop the error type on the floor, so an
+                    // error raised in a handler crossed every function on the
+                    // way out while `check` reported clean. Making it part of
+                    // the operation's type is what puts it back under
+                    // [T-FALLIBLE-UNHANDLED]: the caller must `try` it, and
+                    // `try` needs a declared error type of its own.
+                    if let Some(et) = &op.err {
+                        let e = self.resolve_type(et, &[]);
+                        ret = Type::Fallible(Box::new(ret), Box::new(e));
+                    }
                     handler_fields.push((
                         op.name.name.clone(),
                         Type::Fn {
@@ -2643,7 +2655,32 @@ declare it before `parallel`",
         for (p, t) in params.iter().zip(&param_tys) {
             self.bind(p, t.clone(), false);
         }
-        let ret = self.infer_expr(body);
+        // A closure filling a fallible slot — a handler for an operation that
+        // declares `! E` — is checked the way a fallible function body is:
+        // producing a plain `T` is producing `Ok(T)`, and `fail` inside it
+        // raises `E`. Without this the operation's error type would be
+        // declarable and no handler could satisfy it.
+        let want_ret = match expected {
+            Some(Type::Fn { ret, .. }) => Some(self.uni.resolve(ret)),
+            _ => None,
+        };
+        let saved_err = self.fn_err.clone();
+        let ret = if let Some(Type::Fallible(ok, err)) = &want_ret {
+            self.fn_err = Some((**err).clone());
+            let produced = self.infer_expr(body);
+            // Either the body already yields the fallible type (it ends in a
+            // `fail`, or in something that propagates), or it yields the ok
+            // half and is wrapped.
+            if self.uni.unify(&produced, &want_ret.clone().unwrap()) {
+                want_ret.clone().unwrap()
+            } else {
+                self.check_expr(body, ok);
+                want_ret.clone().unwrap()
+            }
+        } else {
+            self.infer_expr(body)
+        };
+        self.fn_err = saved_err;
         self.closure_floors.pop();
         self.scopes.pop();
         Type::Fn {
