@@ -412,6 +412,7 @@ impl<'m> Codegen<'m> {
             ("grasm_map_keys", vec![i64t], Some(i64t)),
             ("grasm_map_values", vec![i64t], Some(i64t)),
             ("grasm_map_entries", vec![i64t], Some(i64t)),
+            ("grasm_panic_value", vec![i64t], None),
             ("grasm_str_contains", vec![i64t, i64t], Some(i8t)),
             ("grasm_str_starts_with", vec![i64t, i64t], Some(i8t)),
             ("grasm_str_ends_with", vec![i64t, i64t], Some(i8t)),
@@ -2280,6 +2281,12 @@ impl FnCx<'_, '_> {
         }
     }
 
+    fn inc_if_boxed(&mut self, v: Value, vt: &VType) {
+        if vt.boxed() {
+            self.call_rt("grasm_val_inc", &[v]);
+        }
+    }
+
     fn str_ptr_len(&mut self, s: &str) -> (Value, Value) {
         let data_id = self.cg.intern_string(s);
         let gv = self.cg.module.declare_data_in_func(data_id, self.b.func);
@@ -3389,6 +3396,29 @@ impl FnCx<'_, '_> {
                 "unwrap_or" => {
                     return self.coalesce_values(rv, &payload_t, &args[0]).map(Some);
                 }
+                "expect" => {
+                    let some_blk = self.b.create_block();
+                    let none_blk = self.b.create_block();
+                    let (sp, sl) = self.str_ptr_len("Some");
+                    let c = self.call_rt("grasm_variant_is", &[rv, sp, sl]).unwrap();
+                    self.b.ins().brif(c, some_blk, &[], none_blk, &[]);
+                    self.filled = true;
+
+                    // The message is only built on the failing path, so a
+                    // computed one costs nothing when the Option is Some.
+                    self.goto_block(none_blk);
+                    let (msg, _) = self.eval_expr_val(&args[0])?;
+                    self.call_rt("grasm_panic_value", &[msg]);
+                    self.trap_here();
+                    self.filled = true;
+
+                    self.goto_block(some_blk);
+                    let zero = self.b.ins().iconst(types::I64, 0);
+                    let payload = self.call_rt("grasm_variant_field", &[rv, zero]).unwrap();
+                    self.call_rt("grasm_val_dec", &[rv]);
+                    let (v, vt) = self.unbox(payload, &payload_t)?;
+                    return Ok(Some((v, vt)));
+                }
                 _ => {}
             }
         }
@@ -3650,6 +3680,41 @@ impl FnCx<'_, '_> {
                     return nope(args[0].span(), "par_map with multiple parameters");
                 }
                 self.emit_par_map(rv, &elem_t, &cparams[0], cbody, span)?
+            }
+            (VType::List(e), "fold") => {
+                let elem_t = (**e).clone();
+                let (ap, ep, fbody) = match &args[1] {
+                    Expr::Closure { params, body, span } => {
+                        if params.len() != 2 {
+                            return nope(*span, "a fold function that does not take two parameters");
+                        }
+                        (params[0].clone(), params[1].clone(), (**body).clone())
+                    }
+                    other => {
+                        // A named function: `xs.fold(0, add)` becomes
+                        // `xs.fold(0, |a, b| add(a, b))`.
+                        let Expr::Ident(id) = other else {
+                            return nope(other.span(), "fold with a non-literal function");
+                        };
+                        if self.lookup_fn(&id.name).is_none()
+                            && !matches!(self.lookup(&id.name), Some((_, VType::Fn(_, _))))
+                        {
+                            return nope(other.span(), "fold with a non-literal function");
+                        }
+                        let sp = id.span;
+                        let a = Ident { name: "__fold_acc".into(), span: sp };
+                        let b = Ident { name: "__fold_elem".into(), span: sp };
+                        let call = Expr::Call {
+                            callee: Box::new(Expr::Ident(id.clone())),
+                            args: vec![Expr::Ident(a.clone()), Expr::Ident(b.clone())],
+                            span: sp,
+                        };
+                        (a, b, call)
+                    }
+                };
+                return self
+                    .emit_list_fold(rv, &elem_t, &args[0], &ap, &ep, &fbody)
+                    .map(Some);
             }
             (VType::List(e), "map" | "filter") => {
                 let elem_t = (**e).clone();
@@ -4222,7 +4287,14 @@ impl FnCx<'_, '_> {
                         return Ok(None);
                     }
                 }
-                return nope(span, "panic with a non-literal message");
+                // A computed message: build the string and hand it over.
+                let (msg, _) = self.eval_expr_val(&args[0])?;
+                self.call_rt("grasm_panic_value", &[msg]);
+                self.trap_here();
+                self.filled = true;
+                let dead = self.b.create_block();
+                self.goto_block(dead);
+                return Ok(None);
             }
             "args" => {
                 let v = self.call_rt("grasm_args", &[]).unwrap();
@@ -5936,6 +6008,93 @@ impl FnCx<'_, '_> {
 
     /// Inlines `list.map(|x| body)` / `list.filter(|x| body)` as a loop.
     /// Consumes the owned `list`; returns (new list value, its type).
+    /// `xs.fold(init, f)` as an inline loop over an accumulator variable.
+    ///
+    /// The accumulator's type comes from `init`, not from the element type,
+    /// which is what makes `fold` the one combinator whose result is not a
+    /// function of the list alone — `[i64].fold("", ..)` is a `str`.
+    fn emit_list_fold(
+        &mut self,
+        list: Value,
+        elem_t: &VType,
+        init: &Expr,
+        acc_param: &Ident,
+        elem_param: &Ident,
+        body: &Expr,
+    ) -> CResult<(Value, VType)> {
+        let (init_v, acc_t) = self.eval_expr_val(init)?;
+        let acc_var = self.new_var(&acc_t);
+        self.b.def_var(acc_var, init_v);
+
+        let list_var = self.new_var(&VType::List(Box::new(elem_t.clone())));
+        self.b.def_var(list_var, list);
+        let ivar = self.new_var(&VType::I64);
+        let zero = self.b.ins().iconst(types::I64, 0);
+        self.b.def_var(ivar, zero);
+
+        let header = self.b.create_block();
+        let body_blk = self.b.create_block();
+        let step = self.b.create_block();
+        let exit = self.b.create_block();
+        self.b.ins().jump(header, &[]);
+        self.filled = true;
+
+        self.goto_block(header);
+        let lv = self.b.use_var(list_var);
+        let len = self.call_rt("grasm_list_len", &[lv]).unwrap();
+        let iv = self.b.use_var(ivar);
+        let c = self.b.ins().icmp(IntCC::SignedLessThan, iv, len);
+        self.b.ins().brif(c, body_blk, &[], exit, &[]);
+        self.filled = true;
+
+        self.goto_block(body_blk);
+        let lv2 = self.b.use_var(list_var);
+        let iv2 = self.b.use_var(ivar);
+        let (ev, evt) = self.list_get_elem(lv2, iv2, elem_t)?;
+        let evar = self.new_var(&evt);
+        self.b.def_var(evar, ev);
+        // The accumulator is rebound each round so the body reads the value
+        // from the previous one. The binding gets its own reference, because
+        // leaving the scope releases it — without that the round's explicit
+        // release below would be the second one on a single +1, which is a
+        // double free the moment the accumulator is boxed.
+        let cur_acc = self.b.use_var(acc_var);
+        self.inc_if_boxed(cur_acc, &acc_t);
+        let bound_acc = self.new_var(&acc_t);
+        self.b.def_var(bound_acc, cur_acc);
+        self.push_scope();
+        self.bind(&acc_param.name, bound_acc, acc_t.clone());
+        self.bind(&elem_param.name, evar, evt.clone());
+        let (bv, bvt) = self.eval_expr_val(body)?;
+        if bvt != acc_t {
+            return nope(
+                body.span(),
+                "a fold whose function returns a different type than the accumulator",
+            );
+        }
+        // The previous accumulator is consumed by this round.
+        let old = self.b.use_var(acc_var);
+        self.dec_if_boxed(old, &acc_t);
+        self.b.def_var(acc_var, bv);
+        self.pop_scope_with_decs();
+        self.b.ins().jump(step, &[]);
+        self.filled = true;
+
+        self.goto_block(step);
+        let iv3 = self.b.use_var(ivar);
+        let one = self.b.ins().iconst(types::I64, 1);
+        let next = self.b.ins().iadd(iv3, one);
+        self.b.def_var(ivar, next);
+        self.b.ins().jump(header, &[]);
+        self.filled = true;
+
+        self.goto_block(exit);
+        let lv3 = self.b.use_var(list_var);
+        self.call_rt("grasm_val_dec", &[lv3]);
+        let out = self.b.use_var(acc_var);
+        Ok((out, acc_t))
+    }
+
     fn emit_list_transform(
         &mut self,
         list: Value,

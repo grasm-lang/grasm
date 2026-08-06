@@ -1,8 +1,12 @@
 //! tag: L-LIB-OPTION
 //! expect: output
 //! false 3 true 0
+//! 3
 fn main() {
     let xs = [3, 1]
     let o = xs.get(0)
     print("{o.is_none()} {o.unwrap_or(0)} {xs.get(99).is_none()} {xs.get(99) ?? 0}")
+    // For when absence is a bug rather than a case: the message is required,
+    // because a panic nobody can read is not better than the `??` it replaced.
+    print("{xs.first().expect("a two-element list has a first")}")
 }

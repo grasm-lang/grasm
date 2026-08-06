@@ -775,6 +775,7 @@ because the text may not be a number.
 | `xs.join(sep)` | `(str) -> str` | `[str]` only — map to `str` first |
 | `xs.sum()` | `-> T` | numeric elements |
 | `xs.min()`, `xs.max()` | `-> Option[T]` | `None` when empty; not available for `bool` |
+| `xs.fold(init, f)` | `(B, (B, T) -> B) -> B` | left fold; the accumulator's type comes from `init`, not from `T` |
 | `xs.map(f)` | `(T -> U) -> [U]` | |
 | `xs.par_map(f)` | `(T -> U) -> [U]` | multi-core; `f` must be effect-free ([T-PAR-MAP-PURE]) |
 | `xs.filter(f)` | `(T -> bool) -> [T]` | |
@@ -808,6 +809,7 @@ order ([E-MAP-ORDER]).
 | `o ?? fallback` | the value, or `fallback`; the right side is evaluated only when needed ([E-COALESCE-LAZY]) |
 | `o.is_none()`, `o.is_some()` | |
 | `o.unwrap_or(d)` | same as `??` |
+| `o.expect(msg)` | the payload, or panics with `msg` — for when absence is a bug, not a case |
 | `match o { Some(v) -> … None -> … }` | exhaustive |
 
 
@@ -2512,6 +2514,7 @@ fn main() {
 //! 6 1 3
 //! [2, 4, 6] [2, 3, 4] [2, 3]
 //! true true 2
+//! 6 6 123
 fn main() {
     var xs = [3, 1, 2]
     print("{xs.len()} {xs.is_empty()} {xs[0]} {xs.get(9) ?? 0 - 1} {xs.first() ?? 0} {xs.last() ?? 0}")
@@ -2523,6 +2526,10 @@ fn main() {
     print("{xs.sum()} {xs.min() ?? 0} {xs.max() ?? 0}")
     print("{xs.map(|v| v * 2)} {xs.par_map(|v| v + 1)} {xs.filter(|v| v > 1)}")
     print("{xs.any(|v| v > 2)} {xs.all(|v| v > 0)} {xs.find(|v| v > 1) ?? 0}")
+
+    // A left fold, whose accumulator type comes from the initial value —
+    // `[i64].fold("", ..)` produces a `str`.
+    print("{xs.fold(0, |a, b| a + b)} {xs.fold(1, |a, b| a * b)} {xs.fold("", |a, b| a + b.to_str())}")
 }
 ```
 
@@ -2577,10 +2584,14 @@ fn main() {
 //! tag: L-LIB-OPTION
 //! expect: output
 //! false 3 true 0
+//! 3
 fn main() {
     let xs = [3, 1]
     let o = xs.get(0)
     print("{o.is_none()} {o.unwrap_or(0)} {xs.get(99).is_none()} {xs.get(99) ?? 0}")
+    // For when absence is a bug rather than a case: the message is required,
+    // because a panic nobody can read is not better than the `??` it replaced.
+    print("{xs.first().expect("a two-element list has a first")}")
 }
 ```
 

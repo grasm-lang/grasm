@@ -1728,6 +1728,25 @@ pub unsafe extern "C" fn grasm_map_keys(m: *mut RtVal) -> *mut RtVal {
     alloc(RtPayload::List(items))
 }
 
+/// Panics with a message that is a runtime string rather than a literal.
+///
+/// The native backend could only panic with a compile-time literal, so
+/// `panic(msg)` on a computed message and `expect` on an Option both had
+/// nowhere to put the text.
+///
+/// # Safety: live pointer to a `str`.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_panic_value(v: *mut RtVal) -> ! {
+    let msg = match &(*v).payload {
+        RtPayload::Str(s) => s.clone(),
+        other => {
+            let _ = other;
+            display(v)
+        }
+    };
+    rt_panic(&msg)
+}
+
 /// Key/value pairs in sorted key order, as a list of two-element tuples.
 ///
 /// `keys()` and `values()` are each half of this, and reaching a pair by

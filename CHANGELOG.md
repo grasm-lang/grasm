@@ -61,6 +61,15 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   minor number carries the weight of a major, the same rule the stability
   policy states for the language.
 
+- **`fold`, `entries`, `expect`.** The three gaps cold-model runs kept hitting.
+  `xs.fold(init, f)` is the one combinator whose result is not a function of
+  the element type — `[i64].fold("", ..)` is a `str`. `m.entries()` returns
+  `[(K, V)]` in key order, so walking a map no longer means iterating `keys()`
+  and looking each one back up. `o.expect(msg)` is the escape hatch for
+  absence being a bug rather than a case; the message is required, because a
+  panic nobody can read is not an improvement on the `??` it replaces.
+- **`panic` accepts a computed message.** Natively it took a literal only, so
+  `panic("value {n} is out of range")` did not compile.
 - **Function types.** `fn(A, B) -> R` may be written wherever a type may be,
   so a program can declare its own higher-order function — `fn apply(f: fn(i64)
   -> i64, x: i64)` — instead of being limited to the built-in combinators. A

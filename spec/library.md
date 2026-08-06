@@ -132,6 +132,7 @@ because the text may not be a number.
 | `xs.join(sep)` | `(str) -> str` | `[str]` only — map to `str` first |
 | `xs.sum()` | `-> T` | numeric elements |
 | `xs.min()`, `xs.max()` | `-> Option[T]` | `None` when empty; not available for `bool` |
+| `xs.fold(init, f)` | `(B, (B, T) -> B) -> B` | left fold; the accumulator's type comes from `init`, not from `T` |
 | `xs.map(f)` | `(T -> U) -> [U]` | |
 | `xs.par_map(f)` | `(T -> U) -> [U]` | multi-core; `f` must be effect-free ([T-PAR-MAP-PURE]) |
 | `xs.filter(f)` | `(T -> bool) -> [T]` | |
@@ -165,4 +166,5 @@ order ([E-MAP-ORDER]).
 | `o ?? fallback` | the value, or `fallback`; the right side is evaluated only when needed ([E-COALESCE-LAZY]) |
 | `o.is_none()`, `o.is_some()` | |
 | `o.unwrap_or(d)` | same as `??` |
+| `o.expect(msg)` | the payload, or panics with `msg` — for when absence is a bug, not a case |
 | `match o { Some(v) -> … None -> … }` | exhaustive |

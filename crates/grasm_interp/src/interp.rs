@@ -1440,6 +1440,14 @@ impl<'a, W: Write> Interp<'a, W> {
                 Value::str(parts.join(&sep.to_string()))
             }
             (Value::List(items), "is_empty") => Value::Bool(items.is_empty()),
+            (Value::List(items), "fold") => {
+                let mut acc = self.eval_expr(&args[0])?;
+                let f = self.eval_expr(&args[1])?;
+                for item in items.iter() {
+                    acc = self.call_value(f.clone(), vec![acc, item.clone()], "fold")?;
+                }
+                acc
+            }
             (Value::List(items), "any" | "all") => {
                 let want_all = name.name == "all";
                 let f = self.eval_expr(&args[0])?;
@@ -1713,6 +1721,19 @@ impl<'a, W: Write> Interp<'a, W> {
                     fields[0].clone()
                 } else {
                     self.eval_expr(&args[0])?
+                }
+            }
+            (
+                Value::Variant {
+                    variant, fields, ..
+                },
+                "expect",
+            ) => {
+                if variant.as_str() == "Some" {
+                    fields[0].clone()
+                } else {
+                    let msg = self.eval_expr(&args[0])?;
+                    return Err(Flow::Panic(format!("{msg}")));
                 }
             }
             _ => return Ok(None),

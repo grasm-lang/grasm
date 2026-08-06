@@ -1729,6 +1729,22 @@ declare it before `parallel`",
                         }
                         Type::List(Box::new(out))
                     }
+                    // The accumulator's type comes from the initial value, and
+                    // the function is checked against it — so `fold` is the
+                    // one builtin whose result is not a function of the
+                    // element type alone.
+                    "fold" => {
+                        let acc = self.uni.fresh();
+                        if check_arity(self, 2) {
+                            self.check_expr(&args[0], &acc);
+                            let f = Type::Fn {
+                                params: vec![acc.clone(), elem.clone()],
+                                ret: Box::new(acc.clone()),
+                            };
+                            self.check_expr(&args[1], &f);
+                        }
+                        acc
+                    }
                     "par_map" => {
                         // Same shape as `map`; the difference is that the
                         // function must be effect-free (checked in effects.rs)
@@ -2016,6 +2032,15 @@ declare it before `parallel`",
                     "unwrap_or" => {
                         if check_arity(self, 1) {
                             self.check_expr(&args[0], &inner);
+                        }
+                        inner
+                    }
+                    // The escape hatch for "this is certainly Some". It takes
+                    // a message rather than being a bare `unwrap`, because the
+                    // message is what makes the panic worth reading.
+                    "expect" => {
+                        if check_arity(self, 1) {
+                            self.check_expr(&args[0], &Type::Str);
                         }
                         inner
                     }
