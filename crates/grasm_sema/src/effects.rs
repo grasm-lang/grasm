@@ -131,7 +131,9 @@ pub fn effects_of_program(program: &crate::loader::Program) -> BTreeSet<String> 
                 .to_string();
             let mut row = BTreeSet::new();
             let mut active = Vec::new();
-            walk_block(&f.body, &current, &mut active, &ctx, &mut row);
+            let mut fnb = FnBindings::default();
+            collect_fn_bindings(&f.body, &ctx, &current, &mut fnb);
+            walk_block(&f.body, &current, &mut active, &ctx, &fnb, &mut row);
             let entry = ctx.rows.get_mut(&key).unwrap();
             if &row != entry {
                 *entry = row;
@@ -156,7 +158,9 @@ pub fn effects_of_program(program: &crate::loader::Program) -> BTreeSet<String> 
             };
             let mut row = BTreeSet::new();
             let mut active = Vec::new();
-            walk_block(body, &f.name, &mut active, &ctx, &mut row);
+            let mut fnb = FnBindings::default();
+            collect_fn_bindings(body, &ctx, &f.name, &mut fnb);
+            walk_block(body, &f.name, &mut active, &ctx, &fnb, &mut row);
             all.extend(row);
         }
     }
@@ -200,7 +204,9 @@ pub fn check_effects_multi(files: &[ModuleView]) -> Vec<Diagnostic> {
             let current = key.rsplit_once("::").map(|(m, _)| m).unwrap_or("main").to_string();
             let mut row = BTreeSet::new();
             let mut active = Vec::new();
-            walk_block(&f.body, &current, &mut active, &ctx, &mut row);
+            let mut fnb = FnBindings::default();
+            collect_fn_bindings(&f.body, &ctx, &current, &mut fnb);
+            walk_block(&f.body, &current, &mut active, &ctx, &fnb, &mut row);
             let entry = ctx.rows.get_mut(&key).unwrap();
             if &row != entry {
                 *entry = row;
@@ -287,7 +293,9 @@ pub fn check_effects_multi(files: &[ModuleView]) -> Vec<Diagnostic> {
                 };
                 let mut row = BTreeSet::new();
                 let mut active = Vec::new();
-                walk_block(body, &f.name, &mut active, &ctx, &mut row);
+                let mut fnb = FnBindings::default();
+                collect_fn_bindings(body, &ctx, &f.name, &mut fnb);
+                walk_block(body, &f.name, &mut active, &ctx, &fnb, &mut row);
                 let leftover: Vec<&String> =
                     row.iter().filter(|e| *e != IO && *e != ASYNC).collect();
                 if !leftover.is_empty() {
@@ -335,11 +343,11 @@ pub fn check_effects_multi(files: &[ModuleView]) -> Vec<Diagnostic> {
 /// Before this, only a closure written inline at the call site was checked.
 /// `xs.par_map(announce)` compiled and ran a printing function across threads —
 /// even with `/ {io}` declared on it in plain sight.
-fn par_fn_row<'a>(
-    func: &'a Expr,
+fn par_fn_row(
+    func: &Expr,
     current: &str,
-    bound: &HashMap<String, &'a Expr>,
     ctx: &Ctx,
+    fnb: &FnBindings,
     active: &mut Vec<String>,
     out: &mut BTreeSet<String>,
 ) {
@@ -350,33 +358,11 @@ fn par_fn_row<'a>(
             }
             return;
         }
-        if let Some(inner) = bound.get(&id.name) {
-            walk_expr(inner, current, active, ctx, out);
-            return;
-        }
+        // Not a top-level function: a local holding one, or holding several.
+        indirect_row(&id.name, current, active, ctx, fnb, out);
+        return;
     }
-    walk_expr(func, current, active, ctx, out);
-}
-
-/// Every `let`/`var` in the block whose initializer is a closure, by name.
-fn collect_closure_bindings<'a>(b: &'a Block, out: &mut HashMap<String, &'a Expr>) {
-    for stmt in &b.stmts {
-        match stmt {
-            Stmt::Let { name, init, .. } => {
-                if matches!(init, Expr::Closure { .. }) {
-                    out.insert(name.name.clone(), init);
-                }
-            }
-            Stmt::While { body, .. } | Stmt::For { body, .. } => {
-                collect_closure_bindings(body, out)
-            }
-            Stmt::Parallel { body, .. } | Stmt::Spawn { body, .. } => {
-                collect_closure_bindings(body, out)
-            }
-            Stmt::With { body, .. } => collect_closure_bindings(body, out),
-            _ => {}
-        }
-    }
+    walk_expr(func, current, active, ctx, fnb, out);
 }
 
 /// `par_map` runs its function on several cores at once, so an effect inside
@@ -385,17 +371,18 @@ fn collect_closure_bindings<'a>(b: &'a Block, out: &mut HashMap<String, &'a Expr
 /// effects are inferred, this is a compile error rather than a race nobody can
 /// reproduce ([T-PAR-MAP-PURE]).
 fn check_par_map_block(b: &Block, current: &str, ctx: &Ctx, diags: &mut Vec<Diagnostic>) {
-    // Closures given a name first, so `let f = |x| ...` followed by
-    // `xs.par_map(f)` is checked the same as passing the closure inline.
-    let mut bound: HashMap<String, &Expr> = HashMap::new();
-    collect_closure_bindings(b, &mut bound);
+    // The same bindings effect inference uses, so `let f = |x| ...` and
+    // `let f = named` and a function pulled out of a list are all checked the
+    // way the argument written inline is.
+    let mut fnb = FnBindings::default();
+    collect_fn_bindings(b, ctx, current, &mut fnb);
 
     let mut calls = Vec::new();
     collect_par_maps_block(b, &mut calls);
     for (func, span) in calls {
         let mut row = BTreeSet::new();
         let mut active = Vec::new();
-        par_fn_row(func, current, &bound, ctx, &mut active, &mut row);
+        par_fn_row(func, current, ctx, &fnb, &mut active, &mut row);
         if row.is_empty() {
             continue;
         }
@@ -525,6 +512,138 @@ fn collect_par_maps_expr<'e>(e: &'e Expr, out: &mut Vec<(&'e Expr, Span)>) {
     }
 }
 
+
+/// A function value a body can reach by name.
+enum FnSource<'a> {
+    /// A top-level function, by its unqualified name.
+    Named(String),
+    /// A closure written in the body.
+    Closure(&'a Expr),
+}
+
+/// Function values bound to names in one function body.
+///
+/// Effect inference was written before function values existed, so a call
+/// through a name that is not a top-level function contributed nothing —
+/// `let f = shout; f(n)` performed no effects as far as the checker knew, even
+/// inside a declared-empty row. Resolving the binding is what closes that.
+#[derive(Default)]
+struct FnBindings<'a> {
+    by_name: HashMap<String, Vec<FnSource<'a>>>,
+    /// Every function value the body mentions anywhere. Used when a callee
+    /// cannot be pinned to one binding: over-approximating there is the whole
+    /// point, since under-approximating is what let effects escape.
+    any: Vec<FnSource<'a>>,
+}
+
+impl<'a> FnBindings<'a> {
+    fn sources_for(&self, name: &str) -> &[FnSource<'a>] {
+        match self.by_name.get(name) {
+            Some(v) => v,
+            None => &self.any,
+        }
+    }
+}
+
+/// Function values reachable from an initializer expression.
+fn fn_sources<'a>(e: &'a Expr, ctx: &Ctx, current: &str, out: &mut Vec<FnSource<'a>>) {
+    match e {
+        Expr::Ident(id) => {
+            if ctx.resolve_call(current, &id.name).is_some() {
+                out.push(FnSource::Named(id.name.clone()));
+            }
+        }
+        Expr::Closure { .. } => out.push(FnSource::Closure(e)),
+        Expr::List(items, _) | Expr::Tuple(items, _) => {
+            for i in items {
+                fn_sources(i, ctx, current, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Collects, in statement order, every name a body binds to a function value.
+fn collect_fn_bindings<'a>(b: &'a Block, ctx: &Ctx, current: &str, fnb: &mut FnBindings<'a>) {
+    for stmt in &b.stmts {
+        match stmt {
+            Stmt::Let { name, init, .. } => {
+                let mut found = Vec::new();
+                fn_sources(init, ctx, current, &mut found);
+                if !found.is_empty() {
+                    fnb.any.extend(found.iter().map(FnSource::clone_of));
+                    fnb.by_name.insert(name.name.clone(), found);
+                }
+            }
+            Stmt::For { var, iter, body, .. } => {
+                // `for f in fs` where `fs` holds function values.
+                let mut found = Vec::new();
+                match iter {
+                    Expr::Ident(id) => {
+                        if let Some(src) = fnb.by_name.get(&id.name) {
+                            found.extend(src.iter().map(FnSource::clone_of));
+                        }
+                    }
+                    other => fn_sources(other, ctx, current, &mut found),
+                }
+                if !found.is_empty() {
+                    fnb.any.extend(found.iter().map(FnSource::clone_of));
+                    fnb.by_name.insert(var.name.clone(), found);
+                }
+                collect_fn_bindings(body, ctx, current, fnb);
+            }
+            Stmt::While { body, .. }
+            | Stmt::Parallel { body, .. }
+            | Stmt::Spawn { body, .. }
+            | Stmt::With { body, .. } => collect_fn_bindings(body, ctx, current, fnb),
+            _ => {}
+        }
+    }
+}
+
+impl<'a> FnSource<'a> {
+    fn clone_of(&self) -> FnSource<'a> {
+        match self {
+            FnSource::Named(n) => FnSource::Named(n.clone()),
+            FnSource::Closure(e) => FnSource::Closure(e),
+        }
+    }
+}
+
+/// The effects a call through `name` may perform, when `name` is not a
+/// top-level function but a local holding a function value.
+fn indirect_row(
+    name: &str,
+    current: &str,
+    active: &mut Vec<String>,
+    ctx: &Ctx,
+    fnb: &FnBindings,
+    out: &mut BTreeSet<String>,
+) {
+    for src in fnb.sources_for(name) {
+        match src {
+            FnSource::Named(n) => {
+                if let Some(qual) = ctx.resolve_call(current, n) {
+                    contribute(&qual, active, ctx, out);
+                }
+            }
+            FnSource::Closure(e) => {
+                // A closure has no name to guard recursion with, so its
+                // identity stands in for one.
+                let guard = format!("closure@{:p}", *e as *const Expr);
+                if active.contains(&guard) {
+                    continue;
+                }
+                active.push(guard);
+                if let Expr::Closure { body, .. } = e {
+                    walk_expr(body, current, active, ctx, fnb, out);
+                }
+                active.pop();
+            }
+        }
+    }
+}
+
 fn contribute(qual: &str, active: &[String], ctx: &Ctx, out: &mut BTreeSet<String>) {
     if let Some(row) = ctx.rows.get(qual) {
         for e in row {
@@ -540,10 +659,11 @@ fn walk_block(
     current: &str,
     active: &mut Vec<String>,
     ctx: &Ctx,
+    fnb: &FnBindings,
     out: &mut BTreeSet<String>,
 ) {
     for s in &b.stmts {
-        walk_stmt(s, current, active, ctx, out);
+        walk_stmt(s, current, active, ctx, fnb, out);
     }
 }
 
@@ -552,41 +672,42 @@ fn walk_stmt(
     current: &str,
     active: &mut Vec<String>,
     ctx: &Ctx,
+    fnb: &FnBindings,
     out: &mut BTreeSet<String>,
 ) {
     match s {
-        Stmt::Let { init, .. } => walk_expr(init, current, active, ctx, out),
+        Stmt::Let { init, .. } => walk_expr(init, current, active, ctx, fnb, out),
         Stmt::Assign { target, value, .. } => {
-            walk_expr(target, current, active, ctx, out);
-            walk_expr(value, current, active, ctx, out);
+            walk_expr(target, current, active, ctx, fnb, out);
+            walk_expr(value, current, active, ctx, fnb, out);
         }
-        Stmt::Expr(e) => walk_expr(e, current, active, ctx, out),
+        Stmt::Expr(e) => walk_expr(e, current, active, ctx, fnb, out),
         Stmt::Return(v, _) => {
             if let Some(e) = v {
-                walk_expr(e, current, active, ctx, out);
+                walk_expr(e, current, active, ctx, fnb, out);
             }
         }
         Stmt::Break(_) | Stmt::Continue(_) => {}
         Stmt::While { cond, body, .. } => {
-            walk_expr(cond, current, active, ctx, out);
-            walk_block(body, current, active, ctx, out);
+            walk_expr(cond, current, active, ctx, fnb, out);
+            walk_block(body, current, active, ctx, fnb, out);
         }
         Stmt::For { iter, body, .. } => {
-            walk_expr(iter, current, active, ctx, out);
-            walk_block(body, current, active, ctx, out);
+            walk_expr(iter, current, active, ctx, fnb, out);
+            walk_block(body, current, active, ctx, fnb, out);
         }
         Stmt::Parallel { body, .. } => {
             // Structured concurrency is the `async` effect.
             if !active.iter().any(|a| a == ASYNC) {
                 out.insert(ASYNC.to_string());
             }
-            walk_block(body, current, active, ctx, out);
+            walk_block(body, current, active, ctx, fnb, out);
         }
         Stmt::Spawn { body, .. } => {
             if !active.iter().any(|a| a == ASYNC) {
                 out.insert(ASYNC.to_string());
             }
-            walk_block(body, current, active, ctx, out);
+            walk_block(body, current, active, ctx, fnb, out);
         }
         Stmt::With {
             effect,
@@ -594,9 +715,9 @@ fn walk_stmt(
             body,
             ..
         } => {
-            walk_expr(handler, current, active, ctx, out);
+            walk_expr(handler, current, active, ctx, fnb, out);
             active.push(effect.dotted());
-            walk_block(body, current, active, ctx, out);
+            walk_block(body, current, active, ctx, fnb, out);
             active.pop();
         }
     }
@@ -607,6 +728,7 @@ fn walk_expr(
     current: &str,
     active: &mut Vec<String>,
     ctx: &Ctx,
+    fnb: &FnBindings,
     out: &mut BTreeSet<String>,
 ) {
     match e {
@@ -614,18 +736,18 @@ fn walk_expr(
         Expr::Str(pieces, _) => {
             for p in pieces {
                 if let StrPiece::Expr(inner) = p {
-                    walk_expr(inner, current, active, ctx, out);
+                    walk_expr(inner, current, active, ctx, fnb, out);
                 }
             }
         }
         Expr::List(items, _) | Expr::Tuple(items, _) => {
             for i in items {
-                walk_expr(i, current, active, ctx, out);
+                walk_expr(i, current, active, ctx, fnb, out);
             }
         }
         Expr::StructLit { fields, .. } => {
             for (_, v) in fields {
-                walk_expr(v, current, active, ctx, out);
+                walk_expr(v, current, active, ctx, fnb, out);
             }
         }
         Expr::Call { callee, args, .. } => {
@@ -635,12 +757,17 @@ fn walk_expr(
                 }
                 if let Some(qual) = ctx.resolve_call(current, &id.name) {
                     contribute(&qual, active, ctx, out);
+                } else {
+                    // A call through a name that is not a top-level function:
+                    // a local holding a function value. Whatever that value
+                    // may be, calling it performs what it performs.
+                    indirect_row(&id.name, current, active, ctx, fnb, out);
                 }
             } else {
-                walk_expr(callee, current, active, ctx, out);
+                walk_expr(callee, current, active, ctx, fnb, out);
             }
             for a in args {
-                walk_expr(a, current, active, ctx, out);
+                walk_expr(a, current, active, ctx, fnb, out);
             }
         }
         Expr::MethodCall {
@@ -656,34 +783,34 @@ fn walk_expr(
                     // Cross-module call `utils.helper(...)`.
                     contribute(&qual, active, ctx, out);
                 } else {
-                    walk_expr(recv, current, active, ctx, out);
+                    walk_expr(recv, current, active, ctx, fnb, out);
                 }
             } else {
-                walk_expr(recv, current, active, ctx, out);
+                walk_expr(recv, current, active, ctx, fnb, out);
             }
             // UFCS / callback-taking builtin: same-module named fn contributes.
             if let Some(qual) = ctx.resolve_call(current, &name.name) {
                 contribute(&qual, active, ctx, out);
             }
             for a in args {
-                walk_expr(a, current, active, ctx, out);
+                walk_expr(a, current, active, ctx, fnb, out);
             }
         }
-        Expr::Field { recv, .. } => walk_expr(recv, current, active, ctx, out),
+        Expr::Field { recv, .. } => walk_expr(recv, current, active, ctx, fnb, out),
         Expr::Index { recv, index, .. } => {
-            walk_expr(recv, current, active, ctx, out);
-            walk_expr(index, current, active, ctx, out);
+            walk_expr(recv, current, active, ctx, fnb, out);
+            walk_expr(index, current, active, ctx, fnb, out);
         }
         Expr::Unary { expr, .. } | Expr::Try { expr, .. } => {
-            walk_expr(expr, current, active, ctx, out)
+            walk_expr(expr, current, active, ctx, fnb, out)
         }
         Expr::Binary { lhs, rhs, .. } => {
-            walk_expr(lhs, current, active, ctx, out);
-            walk_expr(rhs, current, active, ctx, out);
+            walk_expr(lhs, current, active, ctx, fnb, out);
+            walk_expr(rhs, current, active, ctx, fnb, out);
         }
         Expr::Range { start, end, .. } => {
-            walk_expr(start, current, active, ctx, out);
-            walk_expr(end, current, active, ctx, out);
+            walk_expr(start, current, active, ctx, fnb, out);
+            walk_expr(end, current, active, ctx, fnb, out);
         }
         Expr::If {
             cond,
@@ -691,25 +818,25 @@ fn walk_expr(
             else_branch,
             ..
         } => {
-            walk_expr(cond, current, active, ctx, out);
-            walk_block(then_block, current, active, ctx, out);
+            walk_expr(cond, current, active, ctx, fnb, out);
+            walk_block(then_block, current, active, ctx, fnb, out);
             if let Some(eb) = else_branch {
                 match &**eb {
-                    ElseBranch::Else(b) => walk_block(b, current, active, ctx, out),
-                    ElseBranch::ElseIf(e) => walk_expr(e, current, active, ctx, out),
+                    ElseBranch::Else(b) => walk_block(b, current, active, ctx, fnb, out),
+                    ElseBranch::ElseIf(e) => walk_expr(e, current, active, ctx, fnb, out),
                 }
             }
         }
         Expr::Match { scrutinee, arms, .. } => {
-            walk_expr(scrutinee, current, active, ctx, out);
+            walk_expr(scrutinee, current, active, ctx, fnb, out);
             for arm in arms {
                 if let Some(g) = &arm.guard {
-                    walk_expr(g, current, active, ctx, out);
+                    walk_expr(g, current, active, ctx, fnb, out);
                 }
-                walk_expr(&arm.body, current, active, ctx, out);
+                walk_expr(&arm.body, current, active, ctx, fnb, out);
             }
         }
-        Expr::Block(b) => walk_block(b, current, active, ctx, out),
-        Expr::Closure { body, .. } => walk_expr(body, current, active, ctx, out),
+        Expr::Block(b) => walk_block(b, current, active, ctx, fnb, out),
+        Expr::Closure { body, .. } => walk_expr(body, current, active, ctx, fnb, out),
     }
 }

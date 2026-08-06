@@ -913,3 +913,66 @@ fn plain_map_still_allows_effects() {
     // `map` is sequential, so an effect in it is ordinary code, not a race.
     check_ok("fn announce(x: i64) -> i64 {\n    print(\"{x}\")\n    x\n}\n\nfn main() {\n    print(\"{[1, 2].map(announce)}\")\n}\n");
 }
+
+// ---------------------------------------------------------------------------
+// Adversarial: effects must not escape through a function value.
+//
+// Effect inference was written before function values existed, so every check
+// that asks "what does this expression perform?" answered "nothing" for a bare
+// name. A declared row is supposed to be an upper bound ([T-EFFECT-ROW]); these
+// are the ways it was not.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_declared_empty_row_cannot_print_through_a_bound_function_name() {
+    check_err(
+        "fn shout(n: i64) -> i64 {\n    print(\"{n}\")\n    n\n}\n\nfn claims_pure(n: i64) -> i64 / {} {\n    let f = shout\n    f(n)\n}\n\nfn main() {\n    print(\"{claims_pure(1)}\")\n}\n",
+        "io",
+    );
+}
+
+#[test]
+fn a_declared_empty_row_cannot_print_through_a_bound_closure() {
+    check_err(
+        "fn claims_pure(n: i64) -> i64 / {} {\n    let f = |x| {\n        print(\"{x}\")\n        x\n    }\n    f(n)\n}\n\nfn main() {\n    print(\"{claims_pure(1)}\")\n}\n",
+        "io",
+    );
+}
+
+#[test]
+fn a_declared_empty_row_cannot_print_through_a_list_of_functions() {
+    check_err(
+        "fn shout(n: i64) -> i64 {\n    print(\"{n}\")\n    n\n}\n\nfn claims_pure(n: i64) -> i64 / {} {\n    let fs = [shout]\n    var acc = 0\n    for f in fs {\n        acc = f(n)\n    }\n    acc\n}\n\nfn main() {\n    print(\"{claims_pure(1)}\")\n}\n",
+        "io",
+    );
+}
+
+#[test]
+fn par_map_rejects_a_function_value_taken_from_a_list() {
+    check_err(
+        "fn shout(n: i64) -> i64 {\n    print(\"{n}\")\n    n\n}\n\nfn main() {\n    let fs = [shout]\n    var out = 0\n    for f in fs {\n        out = [1, 2].par_map(f).len()\n    }\n    print(\"{out}\")\n}\n",
+        "effect-free",
+    );
+}
+
+#[test]
+fn a_user_effect_cannot_escape_through_a_function_value_either() {
+    check_err(
+        "effect Clock {\n    fn now() -> i64\n}\n\nfn stamped(n: i64) -> i64 {\n    n + Clock.now()\n}\n\nfn claims_pure(n: i64) -> i64 / {} {\n    let f = stamped\n    f(n)\n}\n\nfn main() {\n    with Clock handled_by ClockHandler{ now: || 1 } {\n        print(\"{claims_pure(1)}\")\n    }\n}\n",
+        "Clock",
+    );
+}
+
+#[test]
+fn a_function_value_that_is_pure_still_works_through_a_binding() {
+    // The fix must not reject the legitimate uses: naming a pure function and
+    // calling it through the name is ordinary code.
+    check_ok("fn dbl(n: i64) -> i64 {\n    n * 2\n}\n\nfn stays_pure(n: i64) -> i64 / {} {\n    let f = dbl\n    f(n)\n}\n\nfn main() {\n    print(\"{stays_pure(1)}\")\n}\n");
+    check_ok("fn stays_pure(n: i64) -> i64 / {} {\n    let f = |x| x * 2\n    f(n)\n}\n\nfn main() {\n    print(\"{stays_pure(1)}\")\n}\n");
+}
+
+#[test]
+fn naming_an_effectful_function_without_calling_it_is_not_an_effect() {
+    // Mentioning a function as a value performs nothing. Only calling does.
+    check_ok("fn shout(n: i64) -> i64 {\n    print(\"{n}\")\n    n\n}\n\nfn stays_pure() -> i64 / {} {\n    let fs = [shout]\n    fs.len()\n}\n\nfn main() {\n    print(\"{stays_pure()}\")\n}\n");
+}
