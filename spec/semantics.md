@@ -23,6 +23,22 @@ evaluate left to right before the call.
 **[E-SHORTCIRCUIT]** `and` does not evaluate its right operand when the left is
 `false`; `or` does not when the left is `true`.
 
+**[E-CLOSURE-CAPTURE]** A closure captures the values it uses **at the moment
+it is created**, not the bindings. Changing a captured variable afterwards is
+not visible inside, and a closure cannot write to one: an assignment inside a
+closure body changes its own copy.
+
+This is the same value semantics every other binding has ([E-COW]), applied to
+a closure's environment. It has one consequence worth stating outright, because
+it is the shape of program people reach for first: **an effect handler cannot
+hold mutable state.** A handler's operations are closures, so a `Store` whose
+`write` updates a captured list updates a copy, and the next `read` does not
+see it. Handlers are for supplying values and for accepting output; state that
+has to change belongs in the caller, threaded through `inout` or returned.
+
+Note the contrast with **[E-SPAWN-SHARED]**: a `spawn` body *does* see and
+mutate the enclosing scope. Two block-shaped constructs, two rules.
+
 **[E-COALESCE-LAZY]** `a ?? b` evaluates `b` only when `a` is `None`.
 
 ## 3. Arithmetic
@@ -125,7 +141,9 @@ inside it has completed.
 This is deterministic: the same program always produces the same output.
 
 **[E-SPAWN-SHARED]** A task body sees the enclosing scope, which is how tasks
-share results.
+share results. This is the opposite of how a closure body behaves — see
+**[E-CLOSURE-CAPTURE]** — and the two are worth reading together, because
+`spawn { … }` and `|x| { … }` look alike and do not capture alike.
 
 **[E-TASK-PANIC]** A panicking task aborts the whole scope; tasks spawned after
 it do not run.

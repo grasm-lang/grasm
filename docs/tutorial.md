@@ -245,6 +245,29 @@ fn main() {
 A closure passed to such a parameter takes its parameter types from it, so it
 needs no annotation.
 
+A closure captures the **values** it uses at the moment it is created, not the
+bindings ([E-CLOSURE-CAPTURE]). Changing a captured variable afterwards is not
+visible inside, and assigning to one inside changes only the closure's copy:
+
+```
+fn main() {
+    var n = 1
+    let plus_n = |x| x + n
+    n = 100
+    print("{plus_n(0)}")     // 1, not 100
+}
+```
+
+That has one consequence worth knowing before you design around it: **an
+effect handler cannot hold mutable state**, because a handler's operations are
+closures. A `Store` whose `write` updates a captured list updates a copy, and
+the next `read` will not see it. Handlers supply values and accept output;
+state that changes belongs in the caller. `examples/ledger/` is that lesson
+written down after getting it wrong.
+
+Note that `spawn { … }` does *not* work this way — a task body shares the
+enclosing scope ([E-SPAWN-SHARED]). Two block-shaped constructs, two rules.
+
 The type carries an effect row, and **no row means the empty row**. So
 `fn(i64) -> i64` accepts only functions that perform nothing, and passing one
 that prints is an error where you pass it — not a surprise inside. Write

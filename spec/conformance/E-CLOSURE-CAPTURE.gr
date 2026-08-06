@@ -1,0 +1,42 @@
+//! tag: E-CLOSURE-CAPTURE
+//! expect: output
+//! 1
+//! 2
+//! 7
+//! 0
+// A closure captures values, not bindings. Changing the variable afterwards
+// is not visible inside, and writing to it inside changes only a copy.
+//
+// This is worth a program because the same author who wrote the rule got it
+// wrong writing an effect handler: a `write` operation that updates a
+// captured list updates a copy, and the next `read` does not see it. The
+// counter below is that mistake in miniature.
+fn main() {
+    var n = 1
+    let plus_n = |x| x + n
+    n = 100
+    // Still 1: the closure kept the value it was built with.
+    print("{plus_n(0)}")
+
+    var xs = [1, 2]
+    let size = |_ignored| xs.len()
+    xs.push(3)
+    print("{size(0)}")
+
+    // A captured binding may be read freely.
+    let base = 7
+    let from_base = |x| base + x
+    print("{from_base(0)}")
+
+    // Writing to a captured variable inside a closure changes the copy, so
+    // the caller's binding is untouched. A handler that "stores" this way
+    // stores nothing.
+    var counter = 0
+    let bump = |x| {
+        counter = counter + 1
+        x
+    }
+    let _ignored = bump(0)
+    let _ignored2 = bump(0)
+    print("{counter}")
+}

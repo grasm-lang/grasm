@@ -16,6 +16,7 @@ Will not change incompatibly before 2.0.
 - `E-ARITH-INT` — stable
 - `E-COALESCE-LAZY` — stable
 - `E-COW` — stable
+- `E-CLOSURE-CAPTURE` — stable
 - `E-DIV-ZERO` — stable
 - `E-ENTRY` — stable
 - `E-EQ-STRUCTURAL` — stable

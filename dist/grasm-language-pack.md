@@ -488,6 +488,22 @@ evaluate left to right before the call.
 **[E-SHORTCIRCUIT]** `and` does not evaluate its right operand when the left is
 `false`; `or` does not when the left is `true`.
 
+**[E-CLOSURE-CAPTURE]** A closure captures the values it uses **at the moment
+it is created**, not the bindings. Changing a captured variable afterwards is
+not visible inside, and a closure cannot write to one: an assignment inside a
+closure body changes its own copy.
+
+This is the same value semantics every other binding has ([E-COW]), applied to
+a closure's environment. It has one consequence worth stating outright, because
+it is the shape of program people reach for first: **an effect handler cannot
+hold mutable state.** A handler's operations are closures, so a `Store` whose
+`write` updates a captured list updates a copy, and the next `read` does not
+see it. Handlers are for supplying values and for accepting output; state that
+has to change belongs in the caller, threaded through `inout` or returned.
+
+Note the contrast with **[E-SPAWN-SHARED]**: a `spawn` body *does* see and
+mutate the enclosing scope. Two block-shaped constructs, two rules.
+
 **[E-COALESCE-LAZY]** `a ?? b` evaluates `b` only when `a` is `None`.
 
 ## 3. Arithmetic
@@ -590,7 +606,9 @@ inside it has completed.
 This is deterministic: the same program always produces the same output.
 
 **[E-SPAWN-SHARED]** A task body sees the enclosing scope, which is how tasks
-share results.
+share results. This is the opposite of how a closure body behaves — see
+**[E-CLOSURE-CAPTURE]** — and the two are worth reading together, because
+`spawn { … }` and `|x| { … }` look alike and do not capture alike.
 
 **[E-TASK-PANIC]** A panicking task aborts the whole scope; tasks spawned after
 it do not run.
@@ -1067,6 +1085,29 @@ fn main() {
 A closure passed to such a parameter takes its parameter types from it, so it
 needs no annotation.
 
+A closure captures the **values** it uses at the moment it is created, not the
+bindings ([E-CLOSURE-CAPTURE]). Changing a captured variable afterwards is not
+visible inside, and assigning to one inside changes only the closure's copy:
+
+```
+fn main() {
+    var n = 1
+    let plus_n = |x| x + n
+    n = 100
+    print("{plus_n(0)}")     // 1, not 100
+}
+```
+
+That has one consequence worth knowing before you design around it: **an
+effect handler cannot hold mutable state**, because a handler's operations are
+closures. A `Store` whose `write` updates a captured list updates a copy, and
+the next `read` will not see it. Handlers supply values and accept output;
+state that changes belongs in the caller. `examples/ledger/` is that lesson
+written down after getting it wrong.
+
+Note that `spawn { … }` does *not* work this way — a task body shares the
+enclosing scope ([E-SPAWN-SHARED]). Two block-shaped constructs, two rules.
+
 The type carries an effect row, and **no row means the empty row**. So
 `fn(i64) -> i64` accepts only functions that perform nothing, and passing one
 that prints is an error where you pass it — not a surprise inside. Write
@@ -1332,6 +1373,53 @@ bench "doubling" {
 
 fn main() {
     print("{2 * 2}")
+}
+```
+
+## `E-CLOSURE-CAPTURE.gr`
+
+```grasm
+//! tag: E-CLOSURE-CAPTURE
+//! expect: output
+//! 1
+//! 2
+//! 7
+//! 0
+// A closure captures values, not bindings. Changing the variable afterwards
+// is not visible inside, and writing to it inside changes only a copy.
+//
+// This is worth a program because the same author who wrote the rule got it
+// wrong writing an effect handler: a `write` operation that updates a
+// captured list updates a copy, and the next `read` does not see it. The
+// counter below is that mistake in miniature.
+fn main() {
+    var n = 1
+    let plus_n = |x| x + n
+    n = 100
+    // Still 1: the closure kept the value it was built with.
+    print("{plus_n(0)}")
+
+    var xs = [1, 2]
+    let size = |_ignored| xs.len()
+    xs.push(3)
+    print("{size(0)}")
+
+    // A captured binding may be read freely.
+    let base = 7
+    let from_base = |x| base + x
+    print("{from_base(0)}")
+
+    // Writing to a captured variable inside a closure changes the copy, so
+    // the caller's binding is untouched. A handler that "stores" this way
+    // stores nothing.
+    var counter = 0
+    let bump = |x| {
+        counter = counter + 1
+        x
+    }
+    let _ignored = bump(0)
+    let _ignored2 = bump(0)
+    print("{counter}")
 }
 ```
 

@@ -1,0 +1,194 @@
+// A ledger whose dependencies are all effects.
+//
+//   grasm run  examples/ledger/main.gr
+//   grasm test examples/ledger/main.gr
+//
+// Nothing here reaches for a clock or an output stream directly. Each is an
+// effect, so the logic below cannot tell real dependencies from three lines
+// of test double — and the compiler will not let it pretend otherwise,
+// because an effect that reaches `main` unhandled is a compile error.
+//
+// Writing this found the rule now written down as [E-CLOSURE-CAPTURE]. The
+// first version had a `Store` effect whose `write` operation updated a
+// captured list. Handler operations are closures, closures capture values
+// rather than bindings, so every write updated a copy and every read saw the
+// original. It ran, it printed plausible numbers, and the numbers were wrong.
+//
+// So: effects supply values and accept output. State that changes lives in
+// the caller and is threaded through `inout`. That is a real constraint, and
+// pretending otherwise is how the first version got a balance wrong.
+
+effect Clock {
+    fn now() -> i64
+}
+
+/// Opening balances, and the fee schedule — read-only, which is what an
+/// effect can honestly provide.
+effect Config {
+    fn opening(account: str) -> i64
+    fn fee(amount: i64) -> i64
+}
+
+effect Audit {
+    fn record(at: i64, what: str)
+}
+
+type Entry = { from: str, to: str, amount: i64 }
+
+type LedgerError =
+    | Overdrawn(account: str, balance: i64, wanted: i64)
+    | NonPositive(amount: i64)
+    | SameAccount(account: str)
+
+/// Balances, held by the caller because they change.
+type Book = { names: [str], amounts: [i64] }
+
+fn position(b: Book, account: str) -> i64 {
+    var i = 0
+    for name in b.names {
+        if name == account {
+            return i
+        }
+        i += 1
+    }
+    0 - 1
+}
+
+fn balance(b: Book, account: str) -> i64 / {Config} {
+    let at = position(b, account)
+    if at < 0 {
+        Config.opening(account)
+    } else {
+        b.amounts.get(at) ?? 0
+    }
+}
+
+fn credit(inout b: Book, account: str, delta: i64) / {Config} {
+    let at = position(b, account)
+    if at < 0 {
+        b.names.push(account)
+        b.amounts.push(Config.opening(account) + delta)
+    } else {
+        b.amounts[at] = (b.amounts.get(at) ?? 0) + delta
+    }
+}
+
+/// Moves money, or explains why it did not.
+///
+/// The effect row is inferred from what this calls: nothing declared it.
+fn transfer(inout b: Book, e: Entry) ! LedgerError {
+    if e.amount <= 0 {
+        fail(NonPositive(e.amount))
+    }
+    if e.from == e.to {
+        fail(SameAccount(e.from))
+    }
+    let cost = e.amount + Config.fee(e.amount)
+    let available = balance(b, e.from)
+    if available < cost {
+        fail(Overdrawn(e.from, available, cost))
+    }
+    credit(b, e.from, 0 - cost)
+    credit(b, e.to, e.amount)
+    Audit.record(Clock.now(), "{e.from} -> {e.to}: {e.amount} (fee {cost - e.amount})")
+}
+
+/// Applies entries in order, stopping at the first that fails.
+fn apply_all(inout b: Book, entries: [Entry]) -> i64 ! LedgerError {
+    var done = 0
+    for entry in entries {
+        try transfer(b, entry)
+        done += 1
+    }
+    done
+}
+
+fn total(b: Book) -> i64 {
+    b.amounts.fold(0, |sum, v| sum + v)
+}
+
+fn explain(err: LedgerError) -> str {
+    match err {
+        Overdrawn(account, bal, wanted) -> "{account} has {bal}, needs {wanted}"
+        NonPositive(amount) -> "amount {amount} is not positive"
+        SameAccount(account) -> "{account} cannot pay itself"
+    }
+}
+
+fn run(inout b: Book, entries: [Entry]) {
+    match apply_all(b, entries) {
+        Ok(n) -> print("applied {n}, total {total(b)}")
+        Err(err) -> print("stopped: {explain(err)}")
+    }
+}
+
+fn main() {
+    let config = ConfigHandler{
+        opening: |account| if account == "reserve" { 1000 } else { 0 },
+        fee: |amount| amount / 100,
+    }
+
+    with Clock handled_by ClockHandler{ now: || 1700000000 } {
+        with Config handled_by config {
+            with Audit handled_by AuditHandler{ record: |at, what| print("[{at}] {what}") } {
+                var book = Book{ names: ["alice", "bob"], amounts: [100, 50] }
+
+                run(book, [Entry{ from: "alice", to: "bob", amount: 30 }])
+                run(book, [Entry{ from: "bob", to: "carol", amount: 60 }])
+                run(book, [Entry{ from: "bob", to: "carol", amount: 500 }])
+                run(book, [Entry{ from: "alice", to: "alice", amount: 1 }])
+                run(book, [Entry{ from: "alice", to: "bob", amount: 0 }])
+
+                print("final {book.names} {book.amounts}")
+            }
+        }
+    }
+}
+
+// --- tests: handlers instead of mocks --------------------------------------
+
+test "an overdraft is refused and the book is untouched" {
+    with Clock handled_by ClockHandler{ now: || 0 } {
+        with Config handled_by ConfigHandler{ opening: |_a| 0, fee: |_amount| 0 } {
+            with Audit handled_by AuditHandler{ record: |_at, _what| assert(false) } {
+                var book = Book{ names: ["a"], amounts: [5] }
+                match transfer(book, Entry{ from: "a", to: "b", amount: 9 }) {
+                    Ok(_v) -> assert(false)
+                    Err(err) -> assert_eq(explain(err), "a has 5, needs 9")
+                }
+                assert_eq(book.amounts, [5])
+            }
+        }
+    }
+}
+
+test "the fee comes from the injected config" {
+    with Clock handled_by ClockHandler{ now: || 0 } {
+        // A 50% fee, which no real schedule would have — that is the point.
+        with Config handled_by ConfigHandler{ opening: |_a| 0, fee: |amount| amount / 2 } {
+            with Audit handled_by AuditHandler{ record: |_at, _what| assert(true) } {
+                var book = Book{ names: ["a", "b"], amounts: [100, 0] }
+                match transfer(book, Entry{ from: "a", to: "b", amount: 40 }) {
+                    Ok(_v) -> assert_eq(book.amounts, [40, 40])
+                    Err(_e) -> assert(false)
+                }
+            }
+        }
+    }
+}
+
+test "the audit line carries the injected clock" {
+    with Clock handled_by ClockHandler{ now: || 42 } {
+        with Config handled_by ConfigHandler{ opening: |_a| 0, fee: |_amount| 0 } {
+            with Audit handled_by AuditHandler{
+                record: |at, what| assert_eq("{at}|{what}", "42|a -> b: 7 (fee 0)"),
+            } {
+                var book = Book{ names: ["a", "b"], amounts: [10, 0] }
+                match transfer(book, Entry{ from: "a", to: "b", amount: 7 }) {
+                    Ok(_v) -> assert(true)
+                    Err(_e) -> assert(false)
+                }
+            }
+        }
+    }
+}
