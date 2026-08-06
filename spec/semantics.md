@@ -194,5 +194,10 @@ that panics is reported as a failure instead of a measurement.
 **[E-ENTRY]** Execution begins at `main` in the entry module. A program
 without `main` is an error.
 
-**[E-ARGS]** `args()` returns the arguments after `--`, excluding the program
-name.
+**[E-ARGS]** `args()` returns the arguments the program was given, excluding
+the program's own name. How they are given depends on how the program is run,
+and the `--` in `grasm run prog.gr -- a b` belongs to the toolchain rather
+than to the program: it separates the toolchain's arguments from the
+program's. A compiled binary has no such separator, so `./prog a b` passes the
+same two arguments. In every mode `args()` sees `[a, b]`, and a literal `--`
+among a program's arguments is an ordinary argument.

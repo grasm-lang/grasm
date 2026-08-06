@@ -1059,6 +1059,7 @@ impl<'m> Codegen<'m> {
             filled: false,
             closure_hints: Vec::new(),
             pinned: Vec::new(),
+            tail_hint: None,
             task_scopes: Vec::new(),
         };
 
@@ -1088,6 +1089,13 @@ impl<'m> Codegen<'m> {
             }
         }
 
+        fcx.tail_hint = match &sig_ret {
+            // Unit produces no value, so an expectation of it would force
+            // one where there is none.
+            VType::Fallible(ok, _) if **ok != VType::Unit => Some((**ok).clone()),
+            VType::Fallible(_, _) | VType::Unit => None,
+            other => Some(other.clone()),
+        };
         let (last, terminated) = fcx.eval_block_inner(&f.body)?;
         if !terminated {
             match (&sig_ret, last) {
@@ -1397,6 +1405,7 @@ impl<'m> Codegen<'m> {
             filled: false,
             closure_hints: Vec::new(),
             pinned: Vec::new(),
+            tail_hint: None,
             task_scopes: Vec::new(),
         };
         let entry = fcx.b.create_block();
@@ -1474,6 +1483,7 @@ impl<'m> Codegen<'m> {
             filled: false,
             closure_hints: Vec::new(),
             pinned: Vec::new(),
+            tail_hint: None,
             task_scopes: Vec::new(),
         };
         let entry = fcx.b.create_block();
@@ -1568,6 +1578,7 @@ impl<'m> Codegen<'m> {
             filled: false,
             closure_hints: Vec::new(),
             pinned: Vec::new(),
+            tail_hint: None,
             task_scopes: Vec::new(),
         };
         let entry = fcx.b.create_block();
@@ -1595,6 +1606,13 @@ impl<'m> Codegen<'m> {
             fcx.b.def_var(var, ps[i + 1]);
             fcx.bind(pname, var, pt.clone());
         }
+        fcx.tail_hint = match &h.ret {
+            // Unit produces no value, so an expectation of it would force
+            // one where there is none.
+            VType::Fallible(ok, _) if **ok != VType::Unit => Some((**ok).clone()),
+            VType::Fallible(_, _) | VType::Unit => None,
+            other => Some(other.clone()),
+        };
         let val = fcx.eval_expr(&h.body)?;
         match (&h.ret, val) {
             (VType::Unit, v) => {
@@ -1690,6 +1708,10 @@ struct FnCx<'a, 'm> {
     /// length, element type). While pinned, `xs[i]` is a load rather than a
     /// call.
     pinned: Vec<HashMap<String, (Value, Value, VType)>>,
+    /// What the value of a block in tail position should be. Only consulted
+    /// for the shapes that cannot type themselves — an empty collection
+    /// literal — so a stale hint cannot change a program's meaning.
+    tail_hint: Option<VType>,
     /// One entry per enclosing `parallel` block: the runtime list that records
     /// which spawn sites fired, and how many sites have been lowered so far.
     ///
@@ -1999,6 +2021,21 @@ fn unify_generic(
 }
 
 /// Bytes per element in a pinned scalar list: bools pack to a byte.
+/// Whether an expression has no type of its own and needs one supplied.
+///
+/// Only these shapes. A hint applied more widely forces a value out of an
+/// expression that produces none — an arm that ends in `fail`, say — which is
+/// how the first version of this broke three conformance programs.
+fn needs_type_hint(e: &Expr) -> bool {
+    match e {
+        Expr::List(items, _) => items.is_empty(),
+        Expr::Call { callee, args, .. } => {
+            args.is_empty() && matches!(&**callee, Expr::Ident(id) if id.name == "map")
+        }
+        _ => false,
+    }
+}
+
 fn stride_of(vt: &VType) -> i64 {
     match vt {
         VType::Bool => 1,
@@ -2473,6 +2510,11 @@ impl FnCx<'_, '_> {
     ) -> CResult<(Option<(Value, VType)>, bool)> {
         self.push_scope();
         self.closure_hints.push(collect_block_hints(blk));
+        // The hint belongs to this block's tail and to no other. Taking it
+        // means a nested block sees nothing — a `fail` inside an `if` is not
+        // the function's return value, and typing it as one is how this first
+        // went wrong.
+        let tail_hint = self.tail_hint.take();
         let mut last: Option<(Value, VType)> = None;
         let mut terminated = false;
         for (i, stmt) in blk.stmts.iter().enumerate() {
@@ -2480,7 +2522,12 @@ impl FnCx<'_, '_> {
                 break;
             }
             let is_last = i + 1 == blk.stmts.len();
-            match self.eval_stmt(stmt, is_last)? {
+            if is_last {
+                self.tail_hint = tail_hint.clone();
+            }
+            let out = self.eval_stmt(stmt, is_last)?;
+            self.tail_hint = None;
+            match out {
                 StmtOut::Value(v) => {
                     // Non-final boxed temporaries were already released inside
                     // eval_stmt; only the final value flows out.
@@ -2725,7 +2772,17 @@ impl FnCx<'_, '_> {
                 Ok(StmtOut::Value(None))
             }
             Stmt::Expr(e) => {
-                let v = self.eval_expr(e)?;
+                // In tail position the function's return type is what an
+                // empty collection literal has to take its element type from.
+                // Nothing else says what `fn f() -> [str] { [] }` returns, and
+                // the checker has already agreed it is a `[str]` — this only
+                // tells the backend what the checker worked out.
+                let v = match self.tail_hint.clone() {
+                    Some(t) if is_last && needs_type_hint(e) => {
+                        self.eval_expr_expecting(e, Some(&t)).map(Some)?
+                    }
+                    _ => self.eval_expr(e)?,
+                };
                 if is_last {
                     Ok(StmtOut::Value(v))
                 } else {
@@ -5342,7 +5399,15 @@ impl FnCx<'_, '_> {
                 self.filled = true;
                 self.goto_block(cont_blk);
             }
-            let bv = self.eval_expr(&arm.body)?;
+            // The match's own result type is what an arm's empty collection
+            // literal takes its element type from — `match n { 0 -> [] ... }`
+            // has nothing else to go on.
+            let bv = match &out_t {
+                Some(t) if needs_type_hint(&arm.body) => {
+                    self.eval_expr_expecting(&arm.body, Some(&t.clone())).map(Some)?
+                }
+                _ => self.eval_expr(&arm.body)?,
+            };
             // An arm body may itself terminate (`-> break`, `-> return x`).
             let bterm = self.is_filled();
             if !bterm {

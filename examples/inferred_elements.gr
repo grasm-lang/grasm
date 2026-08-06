@@ -55,6 +55,10 @@ fn main() {
     // Nested one level down, so the probe has to recurse.
     print("{[[[5, 6].sum(), [7, 8].sum()].max() ?? 0]}")
 
+    // An empty literal in a position whose type is known but was not being
+    // passed down: a function's return type, and a match arm's result type.
+    print("{empty_names().len()} {pick(0)} {pick(5)}")
+
     // Numeric methods, which the inference table did not know. Their absence
     // was not merely a missing feature: inside a fallible function, a `match`
     // whose arms could not be typed compiled to code that unboxed an f64 as
@@ -69,4 +73,15 @@ fn main() {
     lists.set("k", [1, 2])
     print("{lists.get("k") ?? []}")
     print("{lists.get("absent") ?? []}")
+}
+
+fn empty_names() -> [str] {
+    []
+}
+
+fn pick(n: i64) -> [i64] {
+    match n {
+        0 -> []
+        _ -> [n]
+    }
 }
