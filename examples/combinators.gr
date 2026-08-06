@@ -1,0 +1,94 @@
+// Combinators the standard library does not provide, written in the language.
+//
+//   grasm run   examples/combinators.gr
+//   grasm build examples/combinators.gr --native -o comb && ./comb
+//
+// None of this was expressible before `fn(A, B) -> R` became a type you can
+// write. A program could use the built-in `map` and `filter` and could not
+// declare anything of that shape itself, which is why a missing `fold` was a
+// hole rather than an inconvenience.
+//
+// Every function parameter below states the empty effect row by saying
+// nothing, so passing something that prints is an error at the call site.
+
+/// Left fold. The one the library is most often asked for.
+fn fold(xs: [i64], init: i64, f: fn(i64, i64) -> i64) -> i64 {
+    var acc = init
+    for x in xs {
+        acc = f(acc, x)
+    }
+    acc
+}
+
+/// `g` after `f`.
+fn compose(f: fn(i64) -> i64, g: fn(i64) -> i64, x: i64) -> i64 {
+    g(f(x))
+}
+
+/// How many elements satisfy a predicate.
+fn count_where(xs: [i64], pred: fn(i64) -> bool) -> i64 {
+    var n = 0
+    for x in xs {
+        if pred(x) {
+            n = n + 1
+        }
+    }
+    n
+}
+
+/// Applies `f` until it stops changing the value, or `limit` runs out.
+fn fixpoint(f: fn(i64) -> i64, start: i64, limit: i64) -> i64 {
+    var cur = start
+    for _step in 0..limit {
+        let next = f(cur)
+        if next == cur {
+            return cur
+        }
+        cur = next
+    }
+    cur
+}
+
+fn add(a: i64, b: i64) -> i64 {
+    a + b
+}
+
+fn largest(a: i64, b: i64) -> i64 {
+    if a > b { a } else { b }
+}
+
+fn inc(n: i64) -> i64 {
+    n + 1
+}
+
+fn dbl(n: i64) -> i64 {
+    n * 2
+}
+
+fn halve_toward_zero(n: i64) -> i64 {
+    n / 2
+}
+
+fn main() {
+    let xs = [3, 1, 4, 1, 5, 9, 2, 6]
+
+    // A named function passed as a value.
+    print("{fold(xs, 0, add)}")
+    print("{fold(xs, 0, largest)}")
+
+    // A closure, whose parameter types come from the parameter it fills.
+    print("{fold(xs, 1, |a, b| a * b)}")
+
+    print("{compose(inc, dbl, 5)}")
+    print("{compose(dbl, inc, 5)}")
+
+    print("{count_where(xs, |x| x % 2 == 0)}")
+    print("{count_where(xs, |x| x > 3)}")
+
+    // Halving reaches zero and stays there.
+    print("{fixpoint(halve_toward_zero, 1000, 64)}")
+
+    // The built-in combinators take the same values.
+    print("{xs.map(dbl)}")
+    print("{xs.filter(|x| x > 3)}")
+}
