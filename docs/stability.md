@@ -62,7 +62,7 @@ exists to prevent.
 1. Every clause in `spec/` is `stable` or deliberately, documentedly not.
    Today: 45 stable, 60 provisional, 16 experimental, of 121.
 2. The native backend compiles every program the interpreter runs. It does
-   today — `scripts/difftest.sh` reports 128 identical and 0 unsupported — and
+   today — `scripts/difftest.sh` reports 130 identical and 0 unsupported — and
    staying there is the requirement: any construct the backend cannot compile
    must name itself so difftest reports it rather than skipping quietly.
 3. Multi-core execution, which has since been answered rather than reached.

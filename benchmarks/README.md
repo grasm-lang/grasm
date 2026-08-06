@@ -1,6 +1,6 @@
 # Benchmarks
 
-Five programs, each written the way somebody would naturally write it in that
+Six programs, each written the way somebody would naturally write it in that
 language — no hand-vectorized C competing against idiomatic Python, and no
 Grasm program tuned in ways the others were not.
 
@@ -165,19 +165,21 @@ Runtime is one axis. These are the others that can be measured honestly.
 
 ### Compile time and binary size
 
-Mean over the five programs:
+Mean over the six programs. Go is measured with a warm build cache, which is
+how it is actually used; cold it is 610 ms/program.
 
 | language | compile ms/program | binary KB |
 |----------|-------------------:|----------:|
-| Go       |                 51 |     2,339 |
-| grasm    |                 53 |       442 |
-| C        |                 63 |        33 |
-| Rust     |                151 |       440 |
+| Go       |                 52 |     2,340 |
+| grasm    |                 66 |       457 |
+| C        |                 95 |        33 |
+| Rust     |                257 |       444 |
 | Python   |                  — |         — |
 
-Grasm compiles about as fast as Go and roughly 3× faster than Rust, which is
-what a Cranelift backend with no optimizer passes beyond `opt_level=speed`
-should look like.
+Grasm compiles about as fast as Go, faster than C, and roughly 4× faster than
+Rust, which is what a Cranelift backend with no optimizer passes beyond
+`opt_level=speed` should look like. Binaries are Rust's size and a fifth of
+Go's, after link-time dead-stripping.
 
 Binary size used to be the weak column at 1,503 KB: every executable carried
 the whole statically linked runtime whether it used maps, effects, or
@@ -191,12 +193,12 @@ C at 33 KB stays the honest floor.
 ### Concision
 
 Lines of code with blanks and comments removed, and non-whitespace characters,
-for the same five programs:
+for the same six programs:
 
-| measure | grasm |   C | Rust |  Go | Python |
-|---------|------:|----:|-----:|----:|-------:|
-| SLOC    |    84 |  95 |   66 |  95 |     44 |
-| chars   | 1,020 | 2,200 | 1,193 | 1,255 |    801 |
+| measure | grasm |     C |  Rust |    Go | Python |
+|---------|------:|------:|------:|------:|-------:|
+| SLOC    |   105 |   116 |    92 |   142 |     55 |
+| chars   | 1,250 | 2,639 | 1,726 | 1,785 |  1,025 |
 
 Grasm is the second-densest by characters and third by lines. Python wins
 both, which is what a dynamically typed language with comprehensions should
@@ -237,7 +239,7 @@ honest answer there is that nobody outside this repository has tried.
 
 ### Whole-project compile time
 
-The five programs above are one file each, which says nothing about a real
+The six programs above are one file each, which says nothing about a real
 codebase. A generated project — **60 modules, 2,400 functions, ~27,000
 lines** — built from scratch in each language, all four producing the same
 answer:
@@ -257,15 +259,16 @@ language here had a warm cache.
 
 ### Memory under load
 
-Peak resident set, same five programs:
+Peak resident set in MB, same six programs:
 
 | program  | grasm |   C | Rust |  Go |
 |----------|------:|----:|-----:|----:|
-| sieve    |   3.4 | 3.2 |  3.3 | 5.7 |
-| matmul   |   2.9 | 2.2 |  2.3 | 4.6 |
-| wordfreq |   1.8 | 1.3 |  1.6 | 7.0 |
-| sort     |   9.6 | 4.3 |  7.5 | 6.9 |
-| parmap   |   4.6 | 4.4 |  4.5 | 7.2 |
+| fib      |   1.3 | 1.2 |  1.4 | 3.7 |
+| sieve    |   3.4 | 3.2 |  3.3 | 5.5 |
+| matmul   |   2.8 | 2.2 |  2.3 | 4.6 |
+| wordfreq |   1.9 | 1.3 |  1.6 | 7.1 |
+| sort     |   9.6 | 4.3 |  7.5 | 6.8 |
+| parmap   |   4.6 | 4.4 |  4.6 | 7.3 |
 
 Measuring this found a real defect: `sieve` was using **18.7 MB against C's
 3.2**, because a `[bool]` stored one machine word per element. Bools now get a
@@ -281,7 +284,7 @@ territory as Rust rather than C's fully in-place `qsort`.
 - Error-message quality. 32% of diagnostic sites attach a `help:` line; that
   is a coverage number, not a quality measurement.
 - Anything off macOS/arm64 for timing. Correctness *is* checked on a second
-  architecture (`scripts/crosstest.sh`, 118 programs on x86-64), and in CI on
+  architecture (`scripts/crosstest.sh`, 130 programs on x86-64), and in CI on
   Linux and Windows.
 
 The interpreter is 40-240× slower than the native backend, which is expected

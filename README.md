@@ -123,9 +123,10 @@ iteration and boxes every value, which is most of its remaining 2.2x.
 measurement cleared — the bounds check and the absence of SIMD, each worth
 0ms.
 
-Compile time is ~53 ms/program — about Go's, roughly 3× faster than Rust.
-Binaries are ~440 KB after link-time dead-stripping — Rust's size, a fifth of
-Go's. `benchmarks/README.md` also covers concision, keyword surface, and —
+Compile time is ~66 ms/program — about Go's with a warm cache, faster than C,
+roughly 4× faster than Rust. Binaries are ~457 KB after link-time
+dead-stripping — Rust's size, a fifth of Go's. `benchmarks/README.md` also
+covers concision, keyword surface, and —
 explicitly — what is *not* measured, learning curve included.
 
 ### Debugging
@@ -238,7 +239,7 @@ its place on its first run by finding a construct that ran under the
 interpreter and would not compile natively, which the 130 had all missed.
 
 `scripts/crosstest.sh` runs the same gate against a *cross-compiled* target to
-prove the backend isn't accidentally host-specific — currently **129 identical,
+prove the backend isn't accidentally host-specific — currently **130 identical,
 0 mismatched, 0 unsupported** for x86_64 built on arm64. CI
 (`.github/workflows/ci.yml`) runs
 build + tests + clippy + the differential gate on linux-x86_64, macos-arm64,
