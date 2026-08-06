@@ -1857,6 +1857,9 @@ impl<'a, W: Write> Interp<'a, W> {
         bindings: &mut Vec<(String, Value)>,
     ) -> bool {
         match pat {
+            // Any alternative matching is enough. None of them bind, so there
+            // is nothing to reconcile between the branches.
+            Pattern::Or(alts, _) => alts.iter().any(|a| self.match_pattern(a, v, bindings)),
             Pattern::Wildcard(_) => true,
             Pattern::Int(p, _) => matches!(v, Value::Int(x) if x == p),
             Pattern::Bool(p, _) => matches!(v, Value::Bool(x) if x == p),

@@ -7,7 +7,7 @@ before it is listed as stable.
 `crates/grasm_spec` fails if a clause here is missing, unknown, or listed twice,
 so this file cannot drift away from the specification it describes.
 
-Today: 93 stable, 21 provisional, 16 experimental, of 130.
+Today: 93 stable, 22 provisional, 16 experimental, of 131.
 
 ## Stable
 
@@ -138,6 +138,7 @@ for "no problem found" to mean anything.
 - `T-GENERIC-FN` — provisional
 - `T-GENERIC-INST` — provisional
 - `T-INT-ALIAS` — provisional
+- `T-MATCH-ALT` — provisional
 - `T-MODULE-DEP` — provisional
 
 ## Experimental

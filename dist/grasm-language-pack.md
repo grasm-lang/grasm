@@ -213,7 +213,8 @@ struct_lit   = identifier "{" ( field_init ( ("," | newline) field_init )* )? "}
 field_init   = identifier ":" expression
 if_expr      = "if" expression block ( "else" ( if_expr | block ) )?
 match_expr   = "match" expression "{" match_arm* "}"
-match_arm    = pattern ( "if" expression )? "->" ( expression | statement )
+match_arm    = alt_pattern ( "if" expression )? "->" ( expression | statement )
+alt_pattern  = pattern ( "|" pattern )*
 closure      = "|" ( identifier ( "," identifier )* )? "|" ( expression | block )
 ```
 
@@ -337,6 +338,12 @@ scrutinee types require a `_` arm.
 
 **[T-MATCH-GUARD]** A guarded arm does not contribute to coverage, because its
 guard may fail.
+
+**[T-MATCH-ALT]** An arm may list alternatives, `A | B -> …`, and covers every
+one of them. No alternative may bind a name: allowing it would require every
+alternative to bind the same names at the same types, which is a great deal of
+rule for a form people reach for to group literals and nullary variants. Give
+each alternative its own arm when it needs to bind.
 
 **[T-ARM-TYPES]** Every arm of a `match` used as a value must produce the same
 type.
@@ -3441,6 +3448,54 @@ fn main() {
     m.set("a", 7)
     m.set("b", 8)
     print("{m.len()} {m.get("a") ?? 0} {m.has("b")}")
+}
+```
+
+## `T-MATCH-ALT.gr`
+
+```grasm
+//! tag: T-MATCH-ALT
+//! expect: output
+//! 1 2 0
+//! 3 4 3
+//! true false
+// An arm listing alternatives, which covers every one of them.
+//
+// Without this, grouping a handful of literals meant an arm each — the kind
+// of tax that pushes people to match on strings and throw away the sum type
+// they were given.
+type Shape =
+    | Circle
+    | Square
+    | Tri
+
+fn arity(name: str) -> i64 {
+    match name {
+        "sqrt" | "abs" | "round" -> 1
+        "min" | "max" -> 2
+        _ -> 0
+    }
+}
+
+/// Alternatives count toward exhaustiveness: no `_` arm is needed here.
+fn sides(s: Shape) -> i64 {
+    match s {
+        Circle | Tri -> 3
+        Square -> 4
+    }
+}
+
+fn small(n: i64) -> bool {
+    match n {
+        0 | 1 | 2 -> true
+        _ -> false
+    }
+}
+
+fn main() {
+    print("{arity("abs")} {arity("min")} {arity("nope")}")
+    print("{sides(Circle)} {sides(Square)} {sides(Tri)}")
+    print("{small(1)} {small(9)}")
 }
 ```
 

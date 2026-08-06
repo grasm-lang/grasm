@@ -90,6 +90,12 @@ scrutinee types require a `_` arm.
 **[T-MATCH-GUARD]** A guarded arm does not contribute to coverage, because its
 guard may fail.
 
+**[T-MATCH-ALT]** An arm may list alternatives, `A | B -> …`, and covers every
+one of them. No alternative may bind a name: allowing it would require every
+alternative to bind the same names at the same types, which is a great deal of
+rule for a form people reach for to group literals and nullary variants. Give
+each alternative its own arm when it needs to bind.
+
 **[T-ARM-TYPES]** Every arm of a `match` used as a value must produce the same
 type.
 

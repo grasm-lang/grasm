@@ -442,6 +442,22 @@ impl<'a> Lexer<'a> {
                     self.bump();
                 }
                 let text = &self.src[start..self.pos];
+                // A backslash reaching the lexer almost always means someone
+                // escaped a quote inside a `{...}` interpolation. The
+                // interpolated expression is lexed on its own, so `\"` is not
+                // an escape there and a plain `"` is what closes the nested
+                // string. That is surprising enough to say rather than leave
+                // as "unexpected character".
+                if text == "\\" {
+                    return self.tok(
+                        Error(
+                            "unexpected character `\\` — a nested string inside a \
+`{...}` interpolation needs no escaping; write the quotes plainly"
+                                .to_string(),
+                        ),
+                        start,
+                    );
+                }
                 Error(format!("unexpected character `{text}`"))
             }
         };

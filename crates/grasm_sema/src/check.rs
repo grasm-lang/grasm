@@ -2322,7 +2322,10 @@ declare it before `parallel`",
             } else {
                 match tag {
                     None => has_irrefutable = true,
-                    Some(t) => covered.push(t),
+                    // An or-pattern reports every alternative it covers, so
+                    // `Circle | Tri` counts as both rather than as one tag
+                    // spelled with a bar in it.
+                    Some(t) => covered.extend(t.split('\u{1}').map(str::to_string)),
                 }
             }
             self.check_expr(&arm.body, &result);
@@ -2407,6 +2410,39 @@ declare it before `parallel`",
     /// Returns the covered constructor tag, or None if irrefutable.
     fn check_pattern(&mut self, pat: &Pattern, expected: &Type) -> Option<String> {
         match pat {
+            // `A | B`. Every alternative is checked against the same type.
+            // None may bind, so there is no question of which bindings the arm
+            // body can see.
+            Pattern::Or(alts, _) => {
+                let mut tags: Vec<String> = Vec::new();
+                let mut irrefutable = false;
+                for a in alts {
+                    // Whether an alternative binds is only knowable after
+                    // checking it: a bare name is a binding unless it resolves
+                    // to a nullary variant, and `A | B` over two of those is
+                    // exactly the case people want. So watch the scope rather
+                    // than guess from the shape.
+                    let before = self.scopes.last().map(|sc| sc.len()).unwrap_or(0);
+                    match self.check_pattern(a, expected) {
+                        Some(t) => tags.push(t),
+                        None => irrefutable = true,
+                    }
+                    let after = self.scopes.last().map(|sc| sc.len()).unwrap_or(0);
+                    if after > before {
+                        self.error_help(
+                            a.span(),
+                            "an alternative in `a | b` cannot bind a name",
+                            "give each alternative its own arm, or match the shape without binding",
+                        );
+                    }
+                }
+                if irrefutable {
+                    None
+                } else {
+                    // The arm covers every alternative, so report them all.
+                    Some(tags.join("\u{1}"))
+                }
+            }
             Pattern::Wildcard(_) => None,
             Pattern::Int(_, span) => {
                 self.unify_or_report(*span, &Type::I64, expected);

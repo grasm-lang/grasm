@@ -1574,7 +1574,17 @@ impl Parser {
             if self.at(&TokenKind::RBrace) {
                 break;
             }
-            let pat = self.parse_pattern()?;
+            let mut pat = self.parse_pattern()?;
+            // `A | B -> ...`. Only at arm level: a `|` inside a variant's
+            // fields would be ambiguous with a union type.
+            if self.at(&TokenKind::Pipe) {
+                let mut alts = vec![pat];
+                while self.eat(&TokenKind::Pipe) {
+                    alts.push(self.parse_pattern()?);
+                }
+                let span = alts[0].span().merge(alts[alts.len() - 1].span());
+                pat = Pattern::Or(alts, span);
+            }
             let guard = if self.eat(&TokenKind::KwIf) {
                 Some(self.parse_cond_expr()?)
             } else {

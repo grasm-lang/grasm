@@ -1,0 +1,43 @@
+//! tag: T-MATCH-ALT
+//! expect: output
+//! 1 2 0
+//! 3 4 3
+//! true false
+// An arm listing alternatives, which covers every one of them.
+//
+// Without this, grouping a handful of literals meant an arm each — the kind
+// of tax that pushes people to match on strings and throw away the sum type
+// they were given.
+type Shape =
+    | Circle
+    | Square
+    | Tri
+
+fn arity(name: str) -> i64 {
+    match name {
+        "sqrt" | "abs" | "round" -> 1
+        "min" | "max" -> 2
+        _ -> 0
+    }
+}
+
+/// Alternatives count toward exhaustiveness: no `_` arm is needed here.
+fn sides(s: Shape) -> i64 {
+    match s {
+        Circle | Tri -> 3
+        Square -> 4
+    }
+}
+
+fn small(n: i64) -> bool {
+    match n {
+        0 | 1 | 2 -> true
+        _ -> false
+    }
+}
+
+fn main() {
+    print("{arity("abs")} {arity("min")} {arity("nope")}")
+    print("{sides(Circle)} {sides(Square)} {sides(Tri)}")
+    print("{small(1)} {small(9)}")
+}

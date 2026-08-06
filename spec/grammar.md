@@ -198,7 +198,8 @@ struct_lit   = identifier "{" ( field_init ( ("," | newline) field_init )* )? "}
 field_init   = identifier ":" expression
 if_expr      = "if" expression block ( "else" ( if_expr | block ) )?
 match_expr   = "match" expression "{" match_arm* "}"
-match_arm    = pattern ( "if" expression )? "->" ( expression | statement )
+match_arm    = alt_pattern ( "if" expression )? "->" ( expression | statement )
+alt_pattern  = pattern ( "|" pattern )*
 closure      = "|" ( identifier ( "," identifier )* )? "|" ( expression | block )
 ```
 

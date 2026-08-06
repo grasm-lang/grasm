@@ -442,6 +442,12 @@ pub enum Pattern {
         span: Span,
     },
     Tuple(Vec<Pattern>, Span),
+    /// `A | B | C` — matches if any alternative does.
+    ///
+    /// Alternatives may not bind names. Allowing them would require every
+    /// alternative to bind the same set at the same types, which is a lot of
+    /// rule for a form people reach for to group literals.
+    Or(Vec<Pattern>, Span),
 }
 
 impl Expr {
@@ -480,7 +486,7 @@ impl Pattern {
             | Pattern::Str(_, s) => *s,
             Pattern::Bind(id) => id.span,
             Pattern::Variant { span, .. } => *span,
-            Pattern::Tuple(_, s) => *s,
+            Pattern::Tuple(_, s) | Pattern::Or(_, s) => *s,
         }
     }
 }

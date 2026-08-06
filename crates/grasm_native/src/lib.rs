@@ -6390,6 +6390,8 @@ impl FnCx<'_, '_> {
     /// Used to type-probe match arm bodies before lowering.
     fn bind_pattern_types(&mut self, pat: &Pattern, st: &VType) -> CResult<()> {
         match pat {
+            // Alternatives cannot bind, so there are no types to declare.
+            Pattern::Or(..) => Ok(()),
             Pattern::Wildcard(_) | Pattern::Int(..) | Pattern::Bool(..) | Pattern::Str(..) => {
                 Ok(())
             }
@@ -6457,6 +6459,27 @@ impl FnCx<'_, '_> {
         next_test: Block,
     ) -> CResult<bool> {
         match pat {
+            // Each alternative is tested in turn; the first to match jumps to
+            // the body, and only after all of them fail does control reach the
+            // next arm.
+            Pattern::Or(alts, _) => {
+                let mut all_irrefutable = true;
+                for (i, alt) in alts.iter().enumerate() {
+                    let last = i + 1 == alts.len();
+                    let fallthrough = if last {
+                        next_test
+                    } else {
+                        self.b.create_block()
+                    };
+                    let refutable =
+                        self.lower_pattern_test(alt, svar, st, body_blk, fallthrough)?;
+                    all_irrefutable &= !refutable;
+                    if !last {
+                        self.goto_block(fallthrough);
+                    }
+                }
+                Ok(!all_irrefutable)
+            }
             Pattern::Wildcard(_) => {
                 self.b.ins().jump(body_blk, &[]);
                 self.filled = true;
