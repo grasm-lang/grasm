@@ -1,0 +1,5 @@
+import greeter
+
+fn main() {
+    print(greeter.greet("world"))
+}

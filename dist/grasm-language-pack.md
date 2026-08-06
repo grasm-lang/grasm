@@ -415,12 +415,23 @@ version = "^0.2.0"        # optional
 makes its `pub` functions available as `mathlib.f(...)`. A dependency is a
 library and needs no `main`.
 
-`version` is optional. `=X.Y.Z` accepts that version alone; `^X.Y.Z` — which a
-bare `X.Y.Z` also means — accepts it or any later version that does not change
-the leading non-zero number, so `^1.2.3` stops below `2.0.0`, `^0.2.3` stops
-below `0.3.0`, and `^0.0.3` accepts only `0.0.3`. A name resolves to exactly
-one package: reaching one name through two different directories is an error,
-not a choice the toolchain makes on the program's behalf.
+`version` is optional beside a `path`, and required without one. `=X.Y.Z`
+accepts that version alone; `^X.Y.Z` — which a bare `X.Y.Z` also means —
+accepts it or any later version that does not change the leading non-zero
+number, so `^1.2.3` stops below `2.0.0`, `^0.2.3` stops below `0.3.0`, and
+`^0.0.3` accepts only `0.0.3`. A name resolves to exactly one package:
+reaching one name through two different directories is an error, not a choice
+the toolchain makes on the program's behalf.
+
+A dependency with a `version` and no `path` comes from the **registry**, a
+directory of `<name>/<version>/` packages located by `GRASM_REGISTRY` or the
+nearest enclosing `.grasm/registry`. Versions are chosen by **minimal version
+selection**: for each package, take the highest floor any requirement stated,
+select the lowest version the registry holds at or above it, and then check
+that selection against every requirement. There is no search — requirements
+that cannot all hold are an error naming each requirer, so the selected set is
+a function of the manifests alone and does not depend on the order the graph
+was walked.
 
 
 <!-- ===== spec/semantics.md ===== -->
@@ -989,6 +1000,12 @@ version = "^1.0.0"         # optional: 1.x, and no other line
 `version` accepts a compatible range with `^` (a bare `1.0.0` means the same)
 or one exact version with `=`. Before 1.0 the minor number carries the weight
 of a major, so `^0.2.0` stops below `0.3.0`.
+
+Drop the `path` and the package comes from a registry — a directory of
+`<name>/<version>/` packages, pointed at by `GRASM_REGISTRY` or found as the
+nearest `.grasm/registry`. Which version you get is the *lowest* one that
+satisfies everybody, so adding a dependency never quietly upgrades something
+else you were already using.
 
 `capabilities` is a **ceiling**, and it is checked against what the code
 actually does. Because effects are inferred from source, a dependency that

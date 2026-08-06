@@ -331,6 +331,33 @@ different directories is an error naming both, rather than the build linking
 whichever copy the walk saw first and handing the other dependent something it
 never asked for.
 
+Drop the `path` and the dependency comes from a **registry** — a directory of
+`<name>/<version>/` packages, found via `GRASM_REGISTRY` or the nearest
+`.grasm/registry`. It is a directory rather than a service on purpose:
+fetching packages is a different problem from deciding which ones to use, and
+only the second is the language's business.
+
+Versions are chosen by **minimal version selection**. Each requirement names a
+lowest acceptable version; each package gets the highest floor anyone stated,
+resolved to the lowest version the registry actually holds at or above it, and
+that choice is then checked against every requirement. No search, no
+backtracking — so the result is the same on every machine, and **adding a
+dependency cannot silently upgrade one you already had**. Requirements that
+cannot all hold are an error listing who asked for what:
+
+```
+error: no version of `text` satisfies every requirement:
+  `app` requires ^2.0.0
+  `old` requires ^1.0.0
+```
+
+This is where the capability ceiling starts earning its keep, because it now
+applies to code you did not write. A registry package that ships a patch
+release quietly reading the filesystem while still declaring
+`capabilities = []` fails **every consumer's build**; and a published version
+whose contents change under the same version number fails
+`grasm deps --locked` on its checksum.
+
 `grasm deps` resolves the graph (dependencies before dependents, cycles,
 unsatisfied version requirements, and name mismatches reported), infers what
 each package actually does from its source, and **fails the build if any

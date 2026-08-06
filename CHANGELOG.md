@@ -61,6 +61,18 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   minor number carries the weight of a major, the same rule the stability
   policy states for the language.
 
+- **A registry, and minimal version selection.** A dependency with a `version`
+  and no `path` is resolved from a directory of `<name>/<version>/` packages
+  (`GRASM_REGISTRY`, or the nearest `.grasm/registry`). Each package gets the
+  highest floor any requirement stated, resolved to the lowest version present
+  at or above it, then checked against every requirement. No search and no
+  backtracking, so the answer does not depend on walk order and adding a
+  dependency cannot silently upgrade one you already had; requirements that
+  cannot all hold are an error naming each requirer. The capability ceiling
+  now covers code you did not write: a registry package exceeding its declared
+  effects fails every consumer's build, and contents changed under a fixed
+  version number fail `grasm deps --locked`.
+
 - **`par_map` — multi-core, deterministic.** `xs.par_map(f)` spreads elements
   across cores: **5.9× on 8 cores**, byte-identical output. Safety comes from
   the effect system — `f` must be effect-free and the compiler proves it

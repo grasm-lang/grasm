@@ -1,0 +1,14 @@
+[package]
+name = "app"
+version = "0.1.0"
+capabilities = ["io"]
+
+# The application would be happy with textutil 1.0.0 ...
+[dependencies.textutil]
+version = "^1.0.0"
+
+# ... but greeter requires ^1.2.0, and one name resolves to one package.
+# Minimal version selection takes the highest floor anyone stated — 1.2.0 —
+# and not the newest version present.
+[dependencies.greeter]
+version = "^1.0.0"

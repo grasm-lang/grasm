@@ -1,0 +1,5 @@
+import textutil
+
+pub fn greet(who: str) -> str {
+    textutil.shout("hello " + who)
+}

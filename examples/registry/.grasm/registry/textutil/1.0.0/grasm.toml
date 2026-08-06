@@ -1,0 +1,4 @@
+[package]
+name = "textutil"
+version = "1.0.0"
+capabilities = []

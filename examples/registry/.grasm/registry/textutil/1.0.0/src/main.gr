@@ -1,0 +1,4 @@
+/// Shouts a phrase. The 1.0 line ends the sentence with one mark.
+pub fn shout(s: str) -> str {
+    s.to_upper() + "!"
+}

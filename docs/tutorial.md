@@ -228,9 +228,24 @@ fn main() {
 
 Tasks run in spawn order, deterministically: the same program always produces
 the same output. That determinism is deliberate and is *not* multi-core
-speedup — `parallel` currently buys you structure and reproducibility, not
-throughput. Multi-core execution is a planned change to the value
-representation, not something this shape of code will have to change for.
+speedup — `parallel` buys you structure and reproducibility, not throughput,
+because its tasks share the enclosing scope and running them at once would
+race.
+
+Throughput has its own form, and the effect system is what makes it safe:
+
+```
+fn main() {
+    let xs = [1, 2, 3, 4, 5]
+    print("{xs.par_map(|x| x * x)}")
+}
+```
+
+`par_map` and `par_filter` spread the work across cores. The function must be
+effect-free and **the compiler proves it** — put a `print` inside and the
+build fails — so there are no `Send`/`Sync` bounds to satisfy and no race
+detector to run. Results come back in input order whatever the core count is,
+so the answer never depends on the machine.
 
 A panicking task aborts the whole scope; tasks spawned after it do not run.
 
@@ -260,6 +275,12 @@ version = "^1.0.0"         # optional: 1.x, and no other line
 `version` accepts a compatible range with `^` (a bare `1.0.0` means the same)
 or one exact version with `=`. Before 1.0 the minor number carries the weight
 of a major, so `^0.2.0` stops below `0.3.0`.
+
+Drop the `path` and the package comes from a registry — a directory of
+`<name>/<version>/` packages, pointed at by `GRASM_REGISTRY` or found as the
+nearest `.grasm/registry`. Which version you get is the *lowest* one that
+satisfies everybody, so adding a dependency never quietly upgrades something
+else you were already using.
 
 `capabilities` is a **ceiling**, and it is checked against what the code
 actually does. Because effects are inferred from source, a dependency that

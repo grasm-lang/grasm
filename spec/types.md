@@ -177,9 +177,20 @@ version = "^0.2.0"        # optional
 makes its `pub` functions available as `mathlib.f(...)`. A dependency is a
 library and needs no `main`.
 
-`version` is optional. `=X.Y.Z` accepts that version alone; `^X.Y.Z` — which a
-bare `X.Y.Z` also means — accepts it or any later version that does not change
-the leading non-zero number, so `^1.2.3` stops below `2.0.0`, `^0.2.3` stops
-below `0.3.0`, and `^0.0.3` accepts only `0.0.3`. A name resolves to exactly
-one package: reaching one name through two different directories is an error,
-not a choice the toolchain makes on the program's behalf.
+`version` is optional beside a `path`, and required without one. `=X.Y.Z`
+accepts that version alone; `^X.Y.Z` — which a bare `X.Y.Z` also means —
+accepts it or any later version that does not change the leading non-zero
+number, so `^1.2.3` stops below `2.0.0`, `^0.2.3` stops below `0.3.0`, and
+`^0.0.3` accepts only `0.0.3`. A name resolves to exactly one package:
+reaching one name through two different directories is an error, not a choice
+the toolchain makes on the program's behalf.
+
+A dependency with a `version` and no `path` comes from the **registry**, a
+directory of `<name>/<version>/` packages located by `GRASM_REGISTRY` or the
+nearest enclosing `.grasm/registry`. Versions are chosen by **minimal version
+selection**: for each package, take the highest floor any requirement stated,
+select the lowest version the registry holds at or above it, and then check
+that selection against every requirement. There is no search — requirements
+that cannot all hold are an error naming each requirer, so the selected set is
+a function of the manifests alone and does not depend on the order the graph
+was walked.

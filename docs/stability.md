@@ -72,11 +72,12 @@ exists to prevent.
    Real parallelism is `par_map` and `par_filter`, where the effect system
    proves the body is pure before any thread is created. So this line is no
    longer a gap to close but a decision to keep documented.
-4. The package manager resolves versions, not just paths. Requirements are
-   written and enforced today (`^` and `=`), one name resolves to exactly one
-   package, and disagreement is an error naming both sides. What is left is
-   where versions come *from*: every dependency is still a path, so there is
-   nothing to choose between. A registry is what turns checking into solving.
+4. The package manager resolves versions, not just paths. **Done.** A registry
+   is a directory of `<name>/<version>/` packages; selection is minimal
+   version selection, so the result does not depend on walk order and adding
+   a dependency cannot silently upgrade one you already had. What remains is
+   distribution — fetching and publishing — which is infrastructure rather
+   than language design, and is deliberately outside the toolchain.
 5. A written migration story for each provisional clause that changed on the
    way there.
 

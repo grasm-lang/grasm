@@ -1,0 +1,5 @@
+/// Shouts a phrase. 1.2 added the second mark — a compatible change, so
+/// anything that asked for `^1.0.0` may be given this instead.
+pub fn shout(s: str) -> str {
+    s.to_upper() + "!!"
+}
