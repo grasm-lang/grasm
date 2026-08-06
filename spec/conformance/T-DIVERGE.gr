@@ -1,0 +1,56 @@
+//! tag: T-DIVERGE
+//! expect: output
+//! pos non-pos b c
+//! -2 0
+//! 3
+//! 7
+// `return`, `break` and `continue` leave before a value exists, so they fit
+// wherever an expression is expected. Reading a returning arm as `()` used to
+// put the type error on whichever *other* arm did produce a value.
+type S = | A(v: i64) | B | C(s: str)
+
+fn classify(s: S) -> str {
+    match s {
+        A(v) -> if v > 0 { "pos" } else { return "non-pos" }
+        B -> return "b"
+        C(t) -> t
+    }
+}
+
+/// `continue` as an arm body, inside a loop.
+fn first_negative(xs: [i64]) -> i64 {
+    for x in xs {
+        match x {
+            0 -> continue
+            _ -> if x < 0 { return x }
+        }
+    }
+    0
+}
+
+/// `break` as an arm body.
+fn sum_until_nine(xs: [i64]) -> i64 {
+    var total = 0
+    for x in xs {
+        match x {
+            9 -> break
+            _ -> total = total + x
+        }
+    }
+    total
+}
+
+/// `fail` already had this rule; the three now share it.
+fn checked(n: i64) -> i64 ! S {
+    match n {
+        0 -> fail(S.B)
+        _ -> n
+    }
+}
+
+fn main() {
+    print("{classify(S.A(1))} {classify(S.A(-1))} {classify(S.B)} {classify(S.C("c"))}")
+    print("{first_negative([0, 3, -2, 5])} {first_negative([1, 2])}")
+    print("{sum_until_nine([1, 2, 9, 100])}")
+    print("{checked(7) ?? 0}")
+}

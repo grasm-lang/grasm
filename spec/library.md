@@ -3,8 +3,10 @@
 Every operation the language provides, by receiver type. There are no imports:
 these are always available.
 
-`spec/conformance/L-LIBRARY.gr` exercises this whole surface, so an entry here
-that stopped being true would fail the test suite.
+Each `L-` clause below has a conformance program under `spec/conformance/`
+that exercises what it claims. That is per clause, not per row: a table entry
+whose clause is covered elsewhere can still drift, which is how `read_file`
+came to be documented as returning `Option[str]` when it is fallible.
 
 ## 1. Free functions
 
@@ -23,9 +25,15 @@ that stopped being true would fail the test suite.
 | `now_millis()` | `() -> i64` | milliseconds since the epoch; `io` |
 | `env(name)` | `(str) -> Option[str]` | environment variable; `io` |
 | `exit(code)` | `(i64)` | ends the program with that status |
-| `read_file(p)` | `(str) -> Option[str]` | `io` |
+| `read_file(p)` | `(str) -> str ! IoError` | fallible, not `Option`; `io` ([L-LIB-IO]) |
 | `write_file(p, s)` | `(str, str)` | `io` |
 | `file_exists(p)` | `(str) -> bool` | `io` |
+
+**[L-LIB-IO]** The three ways a library call reports "no": `read_file` is
+**fallible** (`str ! IoError`) because a failure has a reason worth reading —
+`NotFound(path)`, and so on. `env` returns `Option[str]`, because an unset
+variable has no reason to give. `file_exists` returns `bool`, because the
+question was already yes-or-no.
 
 ## 1a. How values are written
 

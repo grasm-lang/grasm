@@ -709,7 +709,11 @@ impl Checker {
                         }
                     }
                 }
-                Type::Unit
+                // Divergent: control leaves before any value is produced, so
+                // this fits wherever it is written — the same rule `fail` has
+                // ([T-FAIL]). Without it `0 -> return false` typed the arm as
+                // `()` and the error landed on the *other* arm.
+                self.uni.fresh()
             }
             Stmt::Break(span) | Stmt::Continue(span) => {
                 if self.loop_depth == 0 {
@@ -720,7 +724,7 @@ impl Checker {
                     };
                     self.error(*span, format!("`{what}` outside of a loop"));
                 }
-                Type::Unit
+                self.uni.fresh() // divergent, as `return` above
             }
             Stmt::While { cond, body, .. } => {
                 self.check_expr(cond, &Type::Bool);
@@ -987,6 +991,25 @@ declare it before `parallel`",
                     format!("this expression can fail (`{g}`) but `{w}` is required"),
                     "use `try` to propagate the error or `match` to handle it",
                 );
+            } else if let (
+                Type::Fn { ret: got_ret, .. },
+                Type::Fn { ret: want_ret, .. },
+            ) = (&got_r, &self.uni.shallow_resolve(want))
+            {
+                // A fallible function passed where a plain one is wanted. The
+                // types alone do not say what to do about it, and the answer
+                // — handle the failure at each element — is not obvious.
+                if matches!(self.uni.shallow_resolve(got_ret), Type::Fallible(..))
+                    && !matches!(self.uni.shallow_resolve(want_ret), Type::Fallible(..))
+                {
+                    self.error_help(
+                        span,
+                        format!("type mismatch: expected `{w}`, found `{g}`"),
+                        "this function can fail, and there is nowhere for the error to go once per element — wrap it in a closure that handles the failure, as in `|x| f(x) ?? fallback`",
+                    );
+                } else {
+                    self.error(span, format!("type mismatch: expected `{w}`, found `{g}`"));
+                }
             } else {
                 self.error(span, format!("type mismatch: expected `{w}`, found `{g}`"));
             }
@@ -1153,22 +1176,31 @@ declare it before `parallel`",
                 );
             }
         }
-        // Function referenced as a value.
+        // Function referenced as a value. A fallible function's `! E` is
+        // part of what it answers with, so it has to travel with the value —
+        // dropping it let `xs.filter(risky)` typecheck against
+        // `fn(T) -> bool`, then filter on `Ok(true)`, which is not `true`, and
+        // quietly return the empty list.
         if let Some(info) = self.lookup_fn(&id.name) {
+            let ret_of = |ret: &Type, err: &Option<Type>| match err {
+                Some(e) => Type::Fallible(Box::new(ret.clone()), Box::new(e.clone())),
+                None => ret.clone(),
+            };
             if info.generics > 0 {
                 let fresh: Vec<Type> = (0..info.generics).map(|_| self.uni.fresh()).collect();
+                let ret = ret_of(&info.ret, &info.err);
                 return Type::Fn {
                     params: info
                         .params
                         .iter()
                         .map(|p| substitute_generics(p, &fresh))
                         .collect(),
-                    ret: Box::new(substitute_generics(&info.ret, &fresh)),
+                    ret: Box::new(substitute_generics(&ret, &fresh)),
                 };
             }
             return Type::Fn {
                 params: info.params.clone(),
-                ret: Box::new(info.ret.clone()),
+                ret: Box::new(ret_of(&info.ret, &info.err)),
             };
         }
         self.error_help(

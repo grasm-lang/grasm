@@ -74,12 +74,17 @@ inside an interpolation cannot silently delete part of the output.
 ## 5. Operators and punctuation
 
 ```
-( ) [ ] { } , . .. ..= : :: -> => | |> + - * / % ^
-= == != < <= > >= ! ? ?. ?? += -= *= /= _ @
+( ) [ ] { } , . .. ..= : -> | |> + - * / % ^
+= == != < <= > >= ! ?? += -= *= /= _
 ```
 
 **[L-MAXMUNCH]** The lexer always takes the longest matching operator, so
 `->` is one token, never `-` followed by `>`.
+
+`!` appears only in `T ! E` (a function's error type); negation is `not`.
+There is deliberately no `::`, `=>`, `@`, postfix `?`, or `?.`: paths use `.`,
+match arms use `->`, and an `Option` is opened with `??` or `match`. Typing
+one of them is reported by name rather than as a stray token.
 
 ## 6. Declarations
 
@@ -221,6 +226,10 @@ what follows is `}` or an expression then `:`, and a block otherwise. The two
 never both fit: a statement cannot carry a `:` where a first entry's colon
 would sit. The braces of `if`, `for`, `while`, `match` and function bodies are
 not in expression position and are always blocks.
+
+A match arm's body is the one place both readings are useful, and there `{}`
+is the empty *block* — an arm that does nothing, which is what somebody
+writing `-> {}` meant. A non-empty `{k: v}` there is still a map.
 
 **[G-STRUCT-AMBIG]** In the condition position of `if`, `while`, `for … in`,
 and `match`, an identifier followed by `{` is *not* a struct literal — the

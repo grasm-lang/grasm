@@ -1649,7 +1649,16 @@ impl Parser {
             self.skip_newlines();
             // Control-flow statements are allowed directly as arm bodies:
             // `_ -> break` desugars to `_ -> { break }`.
+            let empty_brace = self.at(&TokenKind::LBrace) && self.brace_is_empty();
             let body = match self.cur() {
+                // `-> {}` is an arm that does nothing, which is what an
+                // empty *block* means. Everywhere else `{}` is the empty map
+                // ([G-MAP-BLOCK-AMBIG]); here the arm's own braces win,
+                // because "do nothing" is what somebody writing it meant. A
+                // non-empty `{k: v}` is still a map.
+                TokenKind::LBrace if empty_brace => {
+                    Expr::Block(self.parse_block()?)
+                }
                 TokenKind::KwBreak | TokenKind::KwContinue | TokenKind::KwReturn => {
                     let stmt = self.parse_stmt()?;
                     let span = crate::parser::stmt_span_of(&stmt);
@@ -1716,6 +1725,15 @@ impl Parser {
     /// `:`, so this reads it as a map and rewinds if that does not fit. The
     /// two never both succeed: a map entry needs a `:` where a statement
     /// cannot have one.
+    /// Whether the `{` at the cursor closes immediately, newlines aside.
+    fn brace_is_empty(&self) -> bool {
+        let mut j = self.i + 1;
+        while matches!(self.toks.get(j).map(|t| &t.kind), Some(TokenKind::Newline)) {
+            j += 1;
+        }
+        matches!(self.toks.get(j).map(|t| &t.kind), Some(TokenKind::RBrace))
+    }
+
     fn parse_brace_expr(&mut self) -> PResult<Expr> {
         let mark = (self.i, self.modes.clone(), self.diags.len());
         if let Some(e) = self.try_parse_map() {

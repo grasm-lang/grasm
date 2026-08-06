@@ -186,6 +186,23 @@ error at the call site. This is the only place a row can be checked rather than
 inferred — a written type has no body to infer from — and without it a function
 value would be a way to carry an effect past a declared row.
 
+**[T-FALLIBLE-VALUE]** A function's `! E` is part of what it answers with, so
+it travels with the function *as a value*: `risky` referenced by name has type
+`fn(A) -> T ! E`, not `fn(A) -> T`. Passing it where a plain function is
+wanted is a type error.
+
+This is the rule that stops [T-FALLIBLE-UNHANDLED] from being sidestepped.
+Without it `xs.filter(risky)` typechecked, and then filtered on `Ok(true)` —
+which is not `true` — so the answer was the empty list, with nothing reported
+and exit code 0. The same door made `any` always `false`, `find` always
+`None`, and `sort_by` leave the list untouched.
+
+**[T-DIVERGE]** `return`, `break` and `continue` fit wherever an expression is
+expected, the way `fail` does ([T-FAIL]): control leaves before a value is
+produced, so there is no value to disagree about. This is what makes
+`0 -> return false` legal next to an arm that yields a `bool` — reading the
+returning arm as `()` put the error on the *other* arm.
+
 **[T-CAPTURE-WRITE]** Assigning to, calling a mutating method on, or passing
 as `inout` a binding a closure captured from outside is a compile error. The
 write would change the closure's own copy ([E-CLOSURE-CAPTURE]) and be

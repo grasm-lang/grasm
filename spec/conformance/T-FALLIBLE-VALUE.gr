@@ -1,0 +1,20 @@
+//! tag: T-FALLIBLE-VALUE
+//! expect: error
+//! found `fn(i64) -> bool ! E`
+// A fallible function passed where a plain predicate is wanted.
+//
+// This used to typecheck, because a function referenced by name lost its
+// `! E`. `filter` then tested `Ok(true)`, which is not `true`, so every
+// element was dropped and the program printed `[]` and exited 0.
+type E = { m: str }
+
+fn odd(n: i64) -> bool ! E {
+    if n == 3 {
+        fail(E{ m: "three" })
+    }
+    n % 2 == 1
+}
+
+fn main() {
+    print("{[1, 2, 3, 4].filter(odd)}")
+}

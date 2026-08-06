@@ -1067,6 +1067,7 @@ impl<'m> Codegen<'m> {
             closure_hints: Vec::new(),
             pinned: Vec::new(),
             tail_hint: None,
+            probe_types: Vec::new(),
             task_scopes: Vec::new(),
         };
 
@@ -1413,6 +1414,7 @@ impl<'m> Codegen<'m> {
             closure_hints: Vec::new(),
             pinned: Vec::new(),
             tail_hint: None,
+            probe_types: Vec::new(),
             task_scopes: Vec::new(),
         };
         let entry = fcx.b.create_block();
@@ -1491,6 +1493,7 @@ impl<'m> Codegen<'m> {
             closure_hints: Vec::new(),
             pinned: Vec::new(),
             tail_hint: None,
+            probe_types: Vec::new(),
             task_scopes: Vec::new(),
         };
         let entry = fcx.b.create_block();
@@ -1586,6 +1589,7 @@ impl<'m> Codegen<'m> {
             closure_hints: Vec::new(),
             pinned: Vec::new(),
             tail_hint: None,
+            probe_types: Vec::new(),
             task_scopes: Vec::new(),
         };
         let entry = fcx.b.create_block();
@@ -1719,6 +1723,10 @@ struct FnCx<'a, 'm> {
     /// for the shapes that cannot type themselves — an empty collection
     /// literal — so a stale hint cannot change a program's meaning.
     tail_hint: Option<VType>,
+    /// Types for names a *probe* knows about, kept apart from real bindings
+    /// because a probe must not create a Cranelift variable — one declared and
+    /// never defined is read as garbage if anything later uses it.
+    probe_types: Vec<HashMap<String, VType>>,
     /// One entry per enclosing `parallel` block: the runtime list that records
     /// which spawn sites fired, and how many sites have been lowered so far.
     ///
@@ -2049,6 +2057,43 @@ fn unify_generic(
 ///
 /// A closure with parameters is the case: nothing in `|n| n + 100` says what
 /// `n` is, and inside a list there is no call site to learn it from.
+/// Whether probing this expression is known to emit nothing.
+///
+/// `probe_type` is documented as a static probe, and most of it is, but some
+/// arms create Cranelift variables as scratch — harmless where the probe was
+/// originally called from and not harmless everywhere. Rather than trust the
+/// whole of it, the block probe only looks at shapes whose probe bottoms out
+/// in literals and names.
+fn is_probe_safe(e: &Expr) -> bool {
+    match e {
+        Expr::Int(..) | Expr::Float(..) | Expr::Bool(..) | Expr::Str(..) | Expr::Ident(_) => true,
+        Expr::List(items, _) => items.first().is_some_and(is_probe_safe),
+        Expr::Tuple(items, _) => items.iter().all(is_probe_safe),
+        Expr::Map(entries, _) => entries
+            .first()
+            .is_some_and(|(k, v)| is_probe_safe(k) && is_probe_safe(v)),
+        Expr::Unary { expr, .. } => is_probe_safe(expr),
+        Expr::Binary { lhs, rhs, .. } => is_probe_safe(lhs) && is_probe_safe(rhs),
+        Expr::StructLit { .. } => true,
+        _ => false,
+    }
+}
+
+/// Whether this arm body always leaves — by returning, breaking, continuing,
+/// or failing — and so never reaches the match's merge point.
+fn arm_diverges(body: &Expr) -> bool {
+    match body {
+        Expr::Block(b) => matches!(
+            b.stmts.last(),
+            Some(Stmt::Return(..) | Stmt::Break(_) | Stmt::Continue(_))
+        ),
+        Expr::Call { callee, .. } => {
+            matches!(&**callee, Expr::Ident(id) if id.name == "fail" || id.name == "panic")
+        }
+        _ => false,
+    }
+}
+
 fn needs_element_hint(e: &Expr) -> bool {
     matches!(e, Expr::Closure { params, .. } if !params.is_empty())
 }
@@ -3366,8 +3411,19 @@ impl FnCx<'_, '_> {
                 if *op == BinaryOp::Coalesce {
                     return self.eval_coalesce(lhs, rhs, *span).map(Some);
                 }
-                let (lv, lt) = self.eval_expr_val(lhs)?;
-                let (rv, rt) = self.eval_expr_val(rhs)?;
+                // Whichever side is not an empty literal fixes the type, so
+                // `xs + []` and `[] + xs` both have somewhere to get one from.
+                // Taking the empty one second cannot be observed: a literal
+                // has no effects, so [E-ORDER-LTR] still holds.
+                let ((lv, lt), (rv, rt)) = if needs_type_hint(lhs) {
+                    let r = self.eval_expr_val(rhs)?;
+                    let l = self.eval_expr_expecting(lhs, Some(&r.1))?;
+                    (l, r)
+                } else {
+                    let l = self.eval_expr_val(lhs)?;
+                    let r = self.eval_expr_expecting(rhs, Some(&l.1))?;
+                    (l, r)
+                };
                 Ok(Some(self.binop_values(*op, lv, lt, rv, rt, *span)?))
             }
             Expr::If {
@@ -5271,8 +5327,6 @@ impl FnCx<'_, '_> {
         Ok((out, out_t))
     }
 
-    /// Static type probe without emitting code. Best-effort but covers the
-    /// realistic expression shapes; used for merge-block param types.
     /// Argument types for a call to a generic function.
     ///
     /// A closure argument has no type of its own: its parameter types come
@@ -5334,6 +5388,47 @@ impl FnCx<'_, '_> {
         }
     }
 
+    /// The type a block evaluates to, with its own `let`/`var` bindings
+    /// probed into the current scope so the tail can name them.
+    fn probe_block_tail(&mut self, b: &grasm_syntax::ast::Block) -> CResult<VType> {
+        // Only the tail decides the type, so nothing else is probed — probing
+        // intermediate statements would repeat their side effects on scope for
+        // no answer. The bindings are walked, though, because the tail may
+        // name them.
+        let Some((last, rest)) = b.stmts.split_last() else {
+            return Ok(VType::Unit);
+        };
+        let Stmt::Expr(tail) = last else {
+            return Ok(VType::Unit);
+        };
+        let mut env: HashMap<String, VType> = HashMap::new();
+        for st in rest {
+            if let Stmt::Let { name, ty, init, .. } = st {
+                let t = match ty {
+                    Some(te) => self.cg.vtype_of(te)?,
+                    // Only shapes whose probe cannot reach an emitting arm.
+                    // A probe is meant to be free of side effects and is not
+                    // yet provably so; restricting what is probed here keeps
+                    // that unproven part out of the path.
+                    None if is_probe_safe(init) => {
+                        self.probe_types.push(env.clone());
+                        let probed = self.probe_type(init);
+                        self.probe_types.pop();
+                        probed?
+                    }
+                    None => continue,
+                };
+                env.insert(name.name.clone(), t);
+            }
+        }
+        self.probe_types.push(env);
+        let out = self.probe_type(tail);
+        self.probe_types.pop();
+        out
+    }
+
+    /// Static type probe without emitting code. Best-effort but covers the
+    /// realistic expression shapes; used for merge-block param types.
     fn probe_type(&mut self, e: &Expr) -> CResult<VType> {
         use BinaryOp::*;
         Ok(match e {
@@ -5342,19 +5437,39 @@ impl FnCx<'_, '_> {
             Expr::Bool(..) => VType::Bool,
             Expr::Str(..) => VType::Str,
             Expr::List(items, span) => VType::List(Box::new(self.list_elem_type(items, *span)?)),
+            Expr::Map(entries, _) => match entries.first() {
+                Some((k, v)) => VType::Map(
+                    Box::new(self.probe_type(k)?),
+                    Box::new(self.probe_type(v)?),
+                ),
+                None => VType::Map(Box::new(VType::Any), Box::new(VType::Any)),
+            },
+            // A block's type is its tail expression's, and the tail may name
+            // the block's own bindings — so those are probed into a scope
+            // first. Nothing is emitted; the scope is dropped without decs.
+            Expr::Block(b) => {
+                self.push_scope();
+                let probed = self.probe_block_tail(b);
+                self.pop_scope_no_decs();
+                probed?
+            }
             Expr::Closure { params, body, span } => {
                 // Probing must not lift anything; only the shape is needed.
                 let param_types = self.closure_param_types(params, None, *span)?;
                 let _ = body;
-                self.push_scope();
-                for (p, pt) in params.iter().zip(&param_types) {
-                    let var = self.new_var(pt);
-                    let zero = self.zero_of(pt);
-                    self.b.def_var(var, zero);
-                    self.bind(&p.name, var, pt.clone());
-                }
+                // The parameters go into the probe's own environment rather
+                // than becoming real variables: a variable declared here and
+                // never defined is read as garbage if anything later uses it,
+                // which is how probing a `let` init changed what a program
+                // computed.
+                let env: HashMap<String, VType> = params
+                    .iter()
+                    .zip(&param_types)
+                    .map(|(p, pt)| (p.name.clone(), pt.clone()))
+                    .collect();
+                self.probe_types.push(env);
                 let ret = self.probe_type(body);
-                self.pop_scope_no_decs();
+                self.probe_types.pop();
                 VType::Fn(param_types, Box::new(ret?))
             }
             Expr::Index { recv, span, .. } => match self.probe_type(recv)? {
@@ -5383,7 +5498,12 @@ impl FnCx<'_, '_> {
                     }
                 }
                 _ => {
-                    // Arithmetic: float wins the promotion.
+                    // Arithmetic: float wins the promotion. An empty literal
+                    // on either side has no type of its own, so the other
+                    // side is what says what the whole thing is.
+                    if needs_type_hint(lhs) {
+                        return self.probe_type(rhs);
+                    }
                     let lt = self.probe_type(lhs)?;
                     if lt == VType::I64 {
                         if let Ok(rt) = self.probe_type(rhs) {
@@ -5397,6 +5517,19 @@ impl FnCx<'_, '_> {
             },
             Expr::Ident(id) => match self.lookup(&id.name) {
                 Some((_, vt)) => vt,
+                None if self
+                    .probe_types
+                    .iter()
+                    .rev()
+                    .any(|e| e.contains_key(&id.name)) =>
+                {
+                    self.probe_types
+                        .iter()
+                        .rev()
+                        .find_map(|e| e.get(&id.name))
+                        .cloned()
+                        .expect("just checked")
+                }
                 None => {
                     if let Some((parent, 0)) = self.cg.variant_index.get(&id.name).cloned() {
                         self.sum_vtype(&parent)
@@ -5482,10 +5615,6 @@ impl FnCx<'_, '_> {
                     None => return nope(e.span(), "inferring this type"),
                 }
             }
-            Expr::Block(b) => match b.stmts.last() {
-                Some(Stmt::Expr(inner)) => self.probe_type(inner)?,
-                _ => VType::Unit,
-            },
             // The builtin methods, typed from `spec/library.md`. Anything
             // missing here still compiles wherever the type is already known
             // and fails only where it has to be inferred — as a list element,
@@ -5539,7 +5668,25 @@ impl FnCx<'_, '_> {
                         _ => return nope(e.span(), "inferring this type"),
                     }
                 }
-                "rev" | "slice" | "filter" | "par_filter" | "sort" => self.probe_type(recv)?,
+                "rev" | "slice" | "filter" | "par_filter" => self.probe_type(recv)?,
+                // Mutating methods answer with nothing. `sort` used to probe
+                // as the list's own type, which is only harmless while the
+                // value is discarded.
+                "sort" => self.probe_type(recv)?,
+                "sort_by" => VType::Unit,
+                "enumerate" => match self.probe_type(recv)? {
+                    VType::List(elem) => {
+                        VType::List(Box::new(VType::Tuple(vec![VType::I64, *elem])))
+                    }
+                    _ => return nope(e.span(), "inferring this type"),
+                },
+                "zip" => match (self.probe_type(recv)?, args.first()) {
+                    (VType::List(a), Some(other)) => match self.probe_type(other)? {
+                        VType::List(b) => VType::List(Box::new(VType::Tuple(vec![*a, *b]))),
+                        _ => return nope(e.span(), "inferring this type"),
+                    },
+                    _ => return nope(e.span(), "inferring this type"),
+                },
                 "find" => match self.probe_type(recv)? {
                     VType::List(elem) => VType::Option(elem),
                     _ => return nope(e.span(), "inferring this type"),
@@ -5622,6 +5769,14 @@ impl FnCx<'_, '_> {
         // *types* in a scratch scope first, and try each arm until one probes.
         let mut out_t: Option<VType> = None;
         for arm in arms {
+            // An arm that leaves the function (or the loop) never reaches the
+            // merge, so it says nothing about what the match is worth. Reading
+            // it as "yields nothing" made `0 -> return false` turn the whole
+            // match into a statement, and the function then had no value to
+            // return.
+            if arm_diverges(&arm.body) {
+                continue;
+            }
             self.push_scope();
             let bound = self.bind_pattern_types(&arm.pattern, &st).is_ok();
             let probed = if bound {
@@ -5648,6 +5803,9 @@ impl FnCx<'_, '_> {
         // statement call, fall back to statement form.
         if out_t.is_some() {
             for arm in arms {
+                if arm_diverges(&arm.body) {
+                    continue;
+                }
                 if matches!(&arm.body, Expr::Call { callee, .. }
                     if matches!(&**callee, Expr::Ident(id)
                         if id.name == "print" || id.name == "assert"

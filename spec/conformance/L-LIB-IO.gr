@@ -1,0 +1,32 @@
+//! tag: L-LIB-IO
+//! expect: output
+//! missing: NotFound(grasm_absent_9f3c.txt)
+//! exists: false
+//! env: unset
+//! types: ok
+// The io builtins report absence in three different ways, on purpose — and
+// nothing pinned which was which, so `read_file` sat documented as returning
+// `Option[str]` while it was fallible.
+//
+// Only the failing paths are exercised, because those are the ones that need
+// no filesystem state and give the same answer on every machine. The writing
+// side is still *typechecked*, in a branch that never runs.
+fn main() {
+    // Fallible: the error says why.
+    match read_file("grasm_absent_9f3c.txt") {
+        Ok(s) -> print("missing: read {s.len()}")
+        Err(e) -> print("missing: {e}")
+    }
+    // bool: the question was already yes-or-no.
+    print("exists: {file_exists("grasm_absent_9f3c.txt")}")
+    // Option: an unset variable has no reason to give.
+    print("env: {env("GRASM_A_VARIABLE_NOBODY_SETS_9F3C") ?? "unset"}")
+    // Typechecked, never run — enough to pin the signatures.
+    if file_exists("grasm_absent_9f3c.txt") {
+        write_file("grasm_absent_9f3c.txt", "unused")
+        let line = input()
+        let ms = now_millis()
+        print("{line} {ms}")
+    }
+    print("types: ok")
+}

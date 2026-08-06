@@ -5,6 +5,7 @@
 //! empty {}
 //! body ok
 //! cond ok
+//! arm [2] {a: 1}
 type Cfg = { on: bool }
 
 fn main() {
@@ -31,6 +32,20 @@ fn main() {
     if c.on {
         print("cond ok")
     }
+    // In a match arm, `{}` is the empty block — an arm that does nothing.
+    var kept: [i64] = []
+    for n in [1, 2] {
+        match n {
+            1 -> {}
+            _ -> kept.push(n)
+        }
+    }
+    // A non-empty map literal is still a map there.
+    let picked = match 1 {
+        1 -> {"a": 1}
+        _ -> {"b": 2}
+    }
+    print("arm {kept} {picked}")
 }
 
 fn label(n: i64) -> str {

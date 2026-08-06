@@ -89,12 +89,17 @@ inside an interpolation cannot silently delete part of the output.
 ## 5. Operators and punctuation
 
 ```
-( ) [ ] { } , . .. ..= : :: -> => | |> + - * / % ^
-= == != < <= > >= ! ? ?. ?? += -= *= /= _ @
+( ) [ ] { } , . .. ..= : -> | |> + - * / % ^
+= == != < <= > >= ! ?? += -= *= /= _
 ```
 
 **[L-MAXMUNCH]** The lexer always takes the longest matching operator, so
 `->` is one token, never `-` followed by `>`.
+
+`!` appears only in `T ! E` (a function's error type); negation is `not`.
+There is deliberately no `::`, `=>`, `@`, postfix `?`, or `?.`: paths use `.`,
+match arms use `->`, and an `Option` is opened with `??` or `match`. Typing
+one of them is reported by name rather than as a stray token.
 
 ## 6. Declarations
 
@@ -236,6 +241,10 @@ what follows is `}` or an expression then `:`, and a block otherwise. The two
 never both fit: a statement cannot carry a `:` where a first entry's colon
 would sit. The braces of `if`, `for`, `while`, `match` and function bodies are
 not in expression position and are always blocks.
+
+A match arm's body is the one place both readings are useful, and there `{}`
+is the empty *block* — an arm that does nothing, which is what somebody
+writing `-> {}` meant. A non-empty `{k: v}` there is still a map.
 
 **[G-STRUCT-AMBIG]** In the condition position of `if`, `while`, `for … in`,
 and `match`, an identifier followed by `{` is *not* a struct literal — the
@@ -451,6 +460,23 @@ accepts only functions that perform nothing, and passing one that prints is an
 error at the call site. This is the only place a row can be checked rather than
 inferred — a written type has no body to infer from — and without it a function
 value would be a way to carry an effect past a declared row.
+
+**[T-FALLIBLE-VALUE]** A function's `! E` is part of what it answers with, so
+it travels with the function *as a value*: `risky` referenced by name has type
+`fn(A) -> T ! E`, not `fn(A) -> T`. Passing it where a plain function is
+wanted is a type error.
+
+This is the rule that stops [T-FALLIBLE-UNHANDLED] from being sidestepped.
+Without it `xs.filter(risky)` typechecked, and then filtered on `Ok(true)` —
+which is not `true` — so the answer was the empty list, with nothing reported
+and exit code 0. The same door made `any` always `false`, `find` always
+`None`, and `sort_by` leave the list untouched.
+
+**[T-DIVERGE]** `return`, `break` and `continue` fit wherever an expression is
+expected, the way `fail` does ([T-FAIL]): control leaves before a value is
+produced, so there is no value to disagree about. This is what makes
+`0 -> return false` legal next to an arm that yields a `bool` — reading the
+returning arm as `()` put the error on the *other* arm.
 
 **[T-CAPTURE-WRITE]** Assigning to, calling a mutating method on, or passing
 as `inout` a binding a closure captured from outside is a compile error. The
@@ -751,8 +777,10 @@ among a program's arguments is an ordinary argument.
 Every operation the language provides, by receiver type. There are no imports:
 these are always available.
 
-`spec/conformance/L-LIBRARY.gr` exercises this whole surface, so an entry here
-that stopped being true would fail the test suite.
+Each `L-` clause below has a conformance program under `spec/conformance/`
+that exercises what it claims. That is per clause, not per row: a table entry
+whose clause is covered elsewhere can still drift, which is how `read_file`
+came to be documented as returning `Option[str]` when it is fallible.
 
 ## 1. Free functions
 
@@ -771,9 +799,15 @@ that stopped being true would fail the test suite.
 | `now_millis()` | `() -> i64` | milliseconds since the epoch; `io` |
 | `env(name)` | `(str) -> Option[str]` | environment variable; `io` |
 | `exit(code)` | `(i64)` | ends the program with that status |
-| `read_file(p)` | `(str) -> Option[str]` | `io` |
+| `read_file(p)` | `(str) -> str ! IoError` | fallible, not `Option`; `io` ([L-LIB-IO]) |
 | `write_file(p, s)` | `(str, str)` | `io` |
 | `file_exists(p)` | `(str) -> bool` | `io` |
+
+**[L-LIB-IO]** The three ways a library call reports "no": `read_file` is
+**fallible** (`str ! IoError`) because a failure has a reason worth reading —
+`NotFound(path)`, and so on. `env` returns `Option[str]`, because an unset
+variable has no reason to give. `file_exists` returns `bool`, because the
+question was already yes-or-no.
 
 ## 1a. How values are written
 
@@ -2584,6 +2618,7 @@ fn main() {
 //! empty {}
 //! body ok
 //! cond ok
+//! arm [2] {a: 1}
 type Cfg = { on: bool }
 
 fn main() {
@@ -2610,6 +2645,20 @@ fn main() {
     if c.on {
         print("cond ok")
     }
+    // In a match arm, `{}` is the empty block — an arm that does nothing.
+    var kept: [i64] = []
+    for n in [1, 2] {
+        match n {
+            1 -> {}
+            _ -> kept.push(n)
+        }
+    }
+    // A non-empty map literal is still a map there.
+    let picked = match 1 {
+        1 -> {"a": 1}
+        _ -> {"b": 2}
+    }
+    print("arm {kept} {picked}")
 }
 
 fn label(n: i64) -> str {
@@ -3013,6 +3062,43 @@ fn main() {
 }
 ```
 
+## `L-LIB-IO.gr`
+
+```grasm
+//! tag: L-LIB-IO
+//! expect: output
+//! missing: NotFound(grasm_absent_9f3c.txt)
+//! exists: false
+//! env: unset
+//! types: ok
+// The io builtins report absence in three different ways, on purpose — and
+// nothing pinned which was which, so `read_file` sat documented as returning
+// `Option[str]` while it was fallible.
+//
+// Only the failing paths are exercised, because those are the ones that need
+// no filesystem state and give the same answer on every machine. The writing
+// side is still *typechecked*, in a branch that never runs.
+fn main() {
+    // Fallible: the error says why.
+    match read_file("grasm_absent_9f3c.txt") {
+        Ok(s) -> print("missing: read {s.len()}")
+        Err(e) -> print("missing: {e}")
+    }
+    // bool: the question was already yes-or-no.
+    print("exists: {file_exists("grasm_absent_9f3c.txt")}")
+    // Option: an unset variable has no reason to give.
+    print("env: {env("GRASM_A_VARIABLE_NOBODY_SETS_9F3C") ?? "unset"}")
+    // Typechecked, never run — enough to pin the signatures.
+    if file_exists("grasm_absent_9f3c.txt") {
+        write_file("grasm_absent_9f3c.txt", "unused")
+        let line = input()
+        let ms = now_millis()
+        print("{line} {ms}")
+    }
+    print("types: ok")
+}
+```
+
 ## `L-LIB-LIST.gr`
 
 ```grasm
@@ -3380,6 +3466,67 @@ fn main() {
 }
 ```
 
+## `T-DIVERGE.gr`
+
+```grasm
+//! tag: T-DIVERGE
+//! expect: output
+//! pos non-pos b c
+//! -2 0
+//! 3
+//! 7
+// `return`, `break` and `continue` leave before a value exists, so they fit
+// wherever an expression is expected. Reading a returning arm as `()` used to
+// put the type error on whichever *other* arm did produce a value.
+type S = | A(v: i64) | B | C(s: str)
+
+fn classify(s: S) -> str {
+    match s {
+        A(v) -> if v > 0 { "pos" } else { return "non-pos" }
+        B -> return "b"
+        C(t) -> t
+    }
+}
+
+/// `continue` as an arm body, inside a loop.
+fn first_negative(xs: [i64]) -> i64 {
+    for x in xs {
+        match x {
+            0 -> continue
+            _ -> if x < 0 { return x }
+        }
+    }
+    0
+}
+
+/// `break` as an arm body.
+fn sum_until_nine(xs: [i64]) -> i64 {
+    var total = 0
+    for x in xs {
+        match x {
+            9 -> break
+            _ -> total = total + x
+        }
+    }
+    total
+}
+
+/// `fail` already had this rule; the three now share it.
+fn checked(n: i64) -> i64 ! S {
+    match n {
+        0 -> fail(S.B)
+        _ -> n
+    }
+}
+
+fn main() {
+    print("{classify(S.A(1))} {classify(S.A(-1))} {classify(S.B)} {classify(S.C("c"))}")
+    print("{first_negative([0, 3, -2, 5])} {first_negative([1, 2])}")
+    print("{sum_until_nine([1, 2, 9, 100])}")
+    print("{checked(7) ?? 0}")
+}
+```
+
 ## `T-EFFECT-BUILTIN.gr`
 
 ```grasm
@@ -3659,6 +3806,31 @@ fn risky() -> i64 ! E {
 }
 fn main() {
     let v = risky()
+}
+```
+
+## `T-FALLIBLE-VALUE.gr`
+
+```grasm
+//! tag: T-FALLIBLE-VALUE
+//! expect: error
+//! found `fn(i64) -> bool ! E`
+// A fallible function passed where a plain predicate is wanted.
+//
+// This used to typecheck, because a function referenced by name lost its
+// `! E`. `filter` then tested `Ok(true)`, which is not `true`, so every
+// element was dropped and the program printed `[]` and exited 0.
+type E = { m: str }
+
+fn odd(n: i64) -> bool ! E {
+    if n == 3 {
+        fail(E{ m: "three" })
+    }
+    n % 2 == 1
+}
+
+fn main() {
+    print("{[1, 2, 3, 4].filter(odd)}")
 }
 ```
 

@@ -37,6 +37,10 @@ class Gen:
 
     def __init__(self, rng):
         self.rng = rng
+        # A `{` inside `"{...}"` ends the interpolation, so block expressions
+        # cannot be generated there. The language reports this clearly; it is
+        # the generator that has to know.
+        self.in_interp = False
         self.scope = []          # list of (name, type)
         self.next_id = 0
         self.depth = 0
@@ -65,16 +69,29 @@ class Gen:
                 choices += [
                     self.int_arith, self.int_cond, self.int_from_list,
                     self.int_from_match, self.int_from_field, self.int_from_map,
+                    self.int_from_concat, self.int_from_map_lit,
                 ]
+                if not self.in_interp:
+                    choices += [self.int_from_sort_by, self.int_from_pairs]
             elif ty == FLOAT:
                 choices += [self.float_arith, self.float_cond]
             elif ty == BOOL:
                 choices += [self.bool_cmp, self.bool_logic]
             elif ty == STR:
                 choices += [self.str_concat, self.str_method]
+                if not self.in_interp:
+                    choices += [self.str_from_codes]
             return self.rng.choice(choices)(ty)
         finally:
             self.depth -= 1
+
+    def interp_expr(self, ty):
+        """An expression safe to place inside `"{...}"`."""
+        self.in_interp = True
+        try:
+            return self.expr(ty)
+        finally:
+            self.in_interp = False
 
     def atom(self, ty):
         live = self.in_scope(ty)
@@ -135,6 +152,71 @@ class Gen:
         # `??` binds looser than arithmetic, so the whole thing is wrapped:
         # `a + xs.min() ?? 0` would parse as `(a + xs.min()) ?? 0`.
         return f"([{items}].{m})"
+
+    def int_from_concat(self, _):
+        """`+` on lists, reduced to a scalar so nothing can go out of range."""
+        a = ", ".join(self.expr(INT) for _ in range(self.rng.randint(0, 2)))
+        b = ", ".join(self.expr(INT) for _ in range(self.rng.randint(0, 2)))
+        # An empty literal needs a type, and `[] + [x]` has one from the right.
+        lhs = f"[{a}]" if a else "[]"
+        rhs = f"[{b}]" if b else "[]"
+        if not a and not b:
+            lhs = f"[{self.expr(INT)}]"
+        m = self.rng.choice(["len()", "sum()"])
+        return f"(({lhs} + {rhs}).{m})"
+
+    def int_from_sort_by(self, _):
+        """`sort_by` needs a `var`, so this builds one in a helper-free way."""
+        n = self.rng.randint(1, 4)
+        items = ", ".join(self.expr(INT) for _ in range(n))
+        key = self.rng.choice(["n", "0 - n", "n * n"])
+        name = self.fresh("s")
+        # A block expression keeps this an expression while needing a `var`.
+        return (
+            f"({{ var {name}: [i64] = [{items}]\n"
+            f"{name}.sort_by(|n| {key})\n"
+            f"{name}.get(0) ?? 0 }})"
+        )
+
+    def int_from_pairs(self, _):
+        """`enumerate`/`zip`, consumed through `for (a, b)` destructuring."""
+        n = self.rng.randint(1, 3)
+        items = ", ".join(self.expr(INT) for _ in range(n))
+        acc = self.fresh("p")
+        if self.rng.random() < 0.5:
+            src = f"[{items}].enumerate()"
+        else:
+            other = ", ".join(self.expr(INT) for _ in range(self.rng.randint(1, 4)))
+            src = f"[{items}].zip([{other}])"
+        return (
+            f"({{ var {acc}: i64 = 0\n"
+            f"for (a, b) in {src} {{ {acc} = {acc} + a + b }}\n"
+            f"{acc} }})"
+        )
+
+    def int_from_map_lit(self, _):
+        """A map literal, read back through `get`."""
+        keys = self.rng.sample(["a", "b", "c", "d"], self.rng.randint(1, 3))
+        entries = ", ".join(f'"{k}": {self.expr(INT)}' for k in keys)
+        want = self.rng.choice(keys + ["zz"])
+        m = self.rng.choice([f'get("{want}") ?? {self.rng.randint(-9, 9)}', "len()"])
+        return f"(({{{entries}}}).{m})"
+
+    def str_from_codes(self, _):
+        """Code points out and back — the round trip has to be exact."""
+        src = self.expr(STR)
+        mode = self.rng.random()
+        if mode < 0.4:
+            return f'(({src}).codes().len().to_str())'
+        if mode < 0.7:
+            acc = self.fresh("c")
+            return (
+                f'({{ var {acc}: str = ""\n'
+                f"for c in ({src}).codes() {{ {acc} = {acc} + c.to_char() }}\n"
+                f"{acc} }})"
+            )
+        # `code_at` needs an index that is definitely in range.
+        return f'(if ({src}).len() > 0 {{ ({src}).code_at(0).to_char() }} else {{ "" }})'
 
     def call_helper(self, ty):
         """A call to one of the top-level functions this program declares."""
@@ -249,13 +331,13 @@ class Gen:
             out.append(f'    print("{{{m}}}")')
         elif kind < 0.85:
             out.append(f"    if {self.expr(BOOL)} {{")
-            out.append(f"        print(\"{{{self.expr(INT)}}}\")")
+            out.append(f"        print(\"{{{self.interp_expr(INT)}}}\")")
             out.append("    } else {")
-            out.append(f"        print(\"{{{self.expr(STR)}}}\")")
+            out.append(f"        print(\"{{{self.interp_expr(STR)}}}\")")
             out.append("    }")
         else:
             ty = self.rng.choice([INT, FLOAT, BOOL, STR])
-            out.append(f'    print("{{{self.expr(ty)}}}")')
+            out.append(f'    print("{{{self.interp_expr(ty)}}}")')
 
     def declarations(self):
         """Top-level types and functions the body may use.
@@ -341,7 +423,7 @@ class Gen:
 
         # Always print something, so an empty program cannot pass vacuously.
         for ty in (INT, STR, BOOL, FLOAT):
-            body.append(f'    print("{{{self.expr(ty)}}}")')
+            body.append(f'    print("{{{self.interp_expr(ty)}}}")')
         return ("\n".join(head) + "\nfn main() {\n"
                 + "\n".join(body) + "\n}\n")
 
