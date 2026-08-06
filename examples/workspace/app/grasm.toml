@@ -8,3 +8,6 @@ capabilities = ["io"]
 
 [dependencies.mathlib]
 path = "../mathlib"
+# 0.2.x only. Before 1.0 the minor number carries the weight of a major, so
+# this stops at 0.3.0 rather than accepting it.
+version = "^0.2.0"

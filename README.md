@@ -317,11 +317,24 @@ capabilities = []          # computes; touches nothing
 
 [dependencies.utils]
 path = "../utils"
+version = "^0.3.0"         # 0.3.x, and no other line
 ```
 
-`grasm deps` resolves the graph (dependencies before dependents, cycles and
-name mismatches reported), infers what each package actually does from its
-source, and **fails the build if any package exceeds its declared ceiling** —
+`version` is optional and comes in two forms. `=0.3.1` is that version and no
+other; `^0.3.1` — also written bare as `0.3.1` — is that version or any later
+one that does not change the leading non-zero number. That is the same
+compatibility rule [the stability policy](docs/stability.md) states for the
+language, so `^0.3.1` stops at `0.4.0` and `^1.2.3` stops at `2.0.0`.
+
+A name resolves to exactly one package. Reaching one name through two
+different directories is an error naming both, rather than the build linking
+whichever copy the walk saw first and handing the other dependent something it
+never asked for.
+
+`grasm deps` resolves the graph (dependencies before dependents, cycles,
+unsatisfied version requirements, and name mismatches reported), infers what
+each package actually does from its source, and **fails the build if any
+package exceeds its declared ceiling** —
 in every consumer, at compile time. A dependency that quietly starts reading
 files in a patch release breaks the build rather than shipping. See
 [`examples/workspace/`](examples/workspace/) for a runnable demonstration.

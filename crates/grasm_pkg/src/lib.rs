@@ -24,6 +24,99 @@ pub struct Dependency {
     pub name: String,
     /// Filesystem path, relative to the depending package's manifest.
     pub path: String,
+    /// What the depending package accepts. `None` accepts anything, which is
+    /// what a manifest that names only a path is saying.
+    pub req: Option<VersionReq>,
+}
+
+/// `MAJOR.MINOR.PATCH`, ordered the obvious way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Version {
+    pub major: u64,
+    pub minor: u64,
+    pub patch: u64,
+}
+
+impl Version {
+    pub fn parse(v: &str) -> Result<Version, String> {
+        let parts: Vec<&str> = v.split('.').collect();
+        let nums: Option<Vec<u64>> = if parts.len() == 3 {
+            parts.iter().map(|p| p.parse::<u64>().ok()).collect()
+        } else {
+            None
+        };
+        match nums {
+            Some(n) => Ok(Version {
+                major: n[0],
+                minor: n[1],
+                patch: n[2],
+            }),
+            None => Err(format!(
+                "version `{v}` is not `MAJOR.MINOR.PATCH` (e.g. `0.1.0`)"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for Version {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+/// A version requirement written in a manifest.
+///
+/// Two forms, because a third would need justifying. `=1.2.3` is that version
+/// and no other. `^1.2.3` — also written bare as `1.2.3` — is that version or
+/// any later one that does not change the leading non-zero number, which is
+/// the same compatibility rule the stability policy states for the language
+/// itself: before 1.0, the minor number carries the weight of a major.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionReq {
+    Exact(Version),
+    Compatible(Version),
+}
+
+impl VersionReq {
+    pub fn parse(text: &str) -> Result<VersionReq, String> {
+        let t = text.trim();
+        if let Some(rest) = t.strip_prefix('=') {
+            return Ok(VersionReq::Exact(Version::parse(rest.trim())?));
+        }
+        let rest = t.strip_prefix('^').unwrap_or(t);
+        Ok(VersionReq::Compatible(Version::parse(rest.trim())?))
+    }
+
+    /// The upper bound is exclusive and sits at the next change of the leading
+    /// non-zero number: `^1.2.3` stops at 2.0.0, `^0.2.3` at 0.3.0, and
+    /// `^0.0.3` accepts only 0.0.3, because in a 0.0.x line every release is
+    /// allowed to break.
+    pub fn matches(&self, v: &Version) -> bool {
+        match self {
+            VersionReq::Exact(want) => v == want,
+            VersionReq::Compatible(low) => {
+                if v < low {
+                    return false;
+                }
+                if low.major > 0 {
+                    v.major == low.major
+                } else if low.minor > 0 {
+                    v.major == 0 && v.minor == low.minor
+                } else {
+                    v.major == 0 && v.minor == 0 && v.patch == low.patch
+                }
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for VersionReq {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VersionReq::Exact(v) => write!(f, "={v}"),
+            VersionReq::Compatible(v) => write!(f, "^{v}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -86,9 +179,21 @@ impl Manifest {
                     format!("dependency `{dep_name}` needs a `path` (registries are not implemented yet)")
                 })?
                 .to_string();
+            let req = match table.get("version") {
+                None => None,
+                Some(v) => {
+                    let text = v
+                        .as_str()
+                        .ok_or_else(|| format!("dependency `{dep_name}`: `version` must be a string"))?;
+                    Some(VersionReq::parse(text).map_err(|e| {
+                        format!("dependency `{dep_name}`: {e}")
+                    })?)
+                }
+            };
             dependencies.push(Dependency {
                 name: dep_name,
                 path,
+                req,
             });
         }
         dependencies.sort_by(|a, b| a.name.cmp(&b.name));
@@ -117,13 +222,7 @@ impl Manifest {
 
 /// `MAJOR.MINOR.PATCH`, each a number.
 fn validate_version(v: &str) -> Result<(), String> {
-    let parts: Vec<&str> = v.split('.').collect();
-    if parts.len() != 3 || parts.iter().any(|p| p.is_empty() || p.parse::<u64>().is_err()) {
-        return Err(format!(
-            "version `{v}` is not `MAJOR.MINOR.PATCH` (e.g. `0.1.0`)"
-        ));
-    }
-    Ok(())
+    Version::parse(v).map(|_| ())
 }
 
 /// A resolved dependency graph in topological order (dependencies first).
@@ -138,34 +237,67 @@ impl Resolution {
     }
 }
 
+/// A package the walk has already settled on.
+struct Resolved {
+    /// Canonical directory, so two routes to one package compare equal.
+    dir: PathBuf,
+    version: Version,
+    /// Who pulled it in, for the message when somebody else disagrees.
+    required_by: String,
+}
+
+/// Where a path leads with `..` and symlinks removed, so that `../text` from
+/// two different packages is recognised as the same package.
+fn canonical(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
 /// Walks the dependency graph depth-first, detecting cycles and missing
 /// packages, and returns packages with dependencies before dependents.
+///
+/// A name resolves to exactly one package. Reaching the same name through two
+/// different directories is an error rather than a coin flip: the build would
+/// otherwise link whichever copy the walk happened to see first, and give the
+/// other dependent something it never asked for.
 pub fn resolve(root_dir: &Path) -> Result<Resolution, String> {
     let mut ordered: Vec<Manifest> = Vec::new();
     let mut visiting: Vec<String> = Vec::new();
-    let mut done: BTreeMap<String, ()> = BTreeMap::new();
-    visit(root_dir, &mut ordered, &mut visiting, &mut done)?;
+    let mut done: BTreeMap<String, Resolved> = BTreeMap::new();
+    visit(root_dir, None, &mut ordered, &mut visiting, &mut done)?;
     Ok(Resolution { packages: ordered })
 }
 
 fn visit(
     dir: &Path,
+    required_by: Option<&str>,
     ordered: &mut Vec<Manifest>,
     visiting: &mut Vec<String>,
-    done: &mut BTreeMap<String, ()>,
+    done: &mut BTreeMap<String, Resolved>,
 ) -> Result<(), String> {
     let manifest = Manifest::load(dir)?;
+    let here = canonical(dir);
 
-    if done.contains_key(&manifest.name) {
+    if let Some(prev) = done.get(&manifest.name) {
+        if prev.dir != here {
+            return Err(format!(
+                "package `{}` resolves to two different directories:\n  \
+                 {} is {} (required by `{}`)\n  {} is {} (required by `{}`)\n\
+                 a name resolves to one package, so these have to be the same directory",
+                manifest.name,
+                prev.dir.display(),
+                prev.version,
+                prev.required_by,
+                here.display(),
+                manifest.version,
+                required_by.unwrap_or("the root package"),
+            ));
+        }
         return Ok(());
     }
     if visiting.contains(&manifest.name) {
         let mut cycle = visiting.clone();
         cycle.push(manifest.name.clone());
-        return Err(format!(
-            "dependency cycle: {}",
-            cycle.join(" -> ")
-        ));
+        return Err(format!("dependency cycle: {}", cycle.join(" -> ")));
     }
     visiting.push(manifest.name.clone());
 
@@ -186,11 +318,29 @@ fn visit(
                 dep.name, manifest.name, dep_manifest.name
             ));
         }
-        visit(&dep_dir, ordered, visiting, done)?;
+        if let Some(req) = &dep.req {
+            let found = Version::parse(&dep_manifest.version)?;
+            if !req.matches(&found) {
+                return Err(format!(
+                    "dependency `{}` of `{}`: requires {req}, but {} is {found}",
+                    dep.name,
+                    manifest.name,
+                    dep_dir.display()
+                ));
+            }
+        }
+        visit(&dep_dir, Some(&manifest.name), ordered, visiting, done)?;
     }
 
     visiting.pop();
-    done.insert(manifest.name.clone(), ());
+    done.insert(
+        manifest.name.clone(),
+        Resolved {
+            dir: here,
+            version: Version::parse(&manifest.version)?,
+            required_by: required_by.unwrap_or("the root package").to_string(),
+        },
+    );
     ordered.push(manifest);
     Ok(())
 }

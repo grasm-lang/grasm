@@ -60,14 +60,23 @@ exists to prevent.
 1.0 is not a date, it is a checklist:
 
 1. Every clause in `spec/` is `stable` or deliberately, documentedly not.
+   Today: 45 stable, 60 provisional, 16 experimental, of 121.
 2. The native backend compiles every program the interpreter runs. It does
-   today — `scripts/difftest.sh` reports 113 identical and 0 unsupported — and
+   today — `scripts/difftest.sh` reports 128 identical and 0 unsupported — and
    staying there is the requirement: any construct the backend cannot compile
    must name itself so difftest reports it rather than skipping quietly.
-3. `parallel` runs on multiple cores. Today it is deterministic and
-   single-threaded, which is stated in `[E-NOT-PARALLEL]` and is a
-   specification of the current implementation, not a design goal.
-4. The package manager resolves versions, not just paths.
+3. Multi-core execution, which has since been answered rather than reached.
+   `parallel` and `spawn` stay deterministic and single-threaded on purpose
+   (`[E-NOT-PARALLEL]`): they exist to structure concurrency, and replaying
+   the same interleaving every run is worth more there than throughput.
+   Real parallelism is `par_map` and `par_filter`, where the effect system
+   proves the body is pure before any thread is created. So this line is no
+   longer a gap to close but a decision to keep documented.
+4. The package manager resolves versions, not just paths. Requirements are
+   written and enforced today (`^` and `=`), one name resolves to exactly one
+   package, and disagreement is an error naming both sides. What is left is
+   where versions come *from*: every dependency is still a path, so there is
+   nothing to choose between. A registry is what turns checking into solving.
 5. A written migration story for each provisional clause that changed on the
    way there.
 

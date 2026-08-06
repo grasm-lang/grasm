@@ -736,3 +736,194 @@ fn an_unrestricted_package_has_no_names_to_check() {
     let m = Manifest::load(&dir).unwrap();
     assert!(grasm_pkg::check_capability_names(&m, &vocab_of(&dir)).is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// Version requirements
+// ---------------------------------------------------------------------------
+
+use grasm_pkg::{Version, VersionReq};
+
+/// A manifest at an explicit version, optionally requiring one of its deps.
+fn versioned(name: &str, version: &str, deps: &[(&str, &str, Option<&str>)]) -> String {
+    let mut m = format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\n");
+    for (dep, path, req) in deps {
+        m.push_str(&format!("\n[dependencies.{dep}]\npath = \"{path}\"\n"));
+        if let Some(r) = req {
+            m.push_str(&format!("version = \"{r}\"\n"));
+        }
+    }
+    m
+}
+
+fn req(s: &str) -> VersionReq {
+    VersionReq::parse(s).unwrap()
+}
+
+fn ver(s: &str) -> Version {
+    Version::parse(s).unwrap()
+}
+
+#[test]
+fn a_bare_requirement_means_compatible_not_exact() {
+    assert_eq!(req("1.2.3"), req("^1.2.3"));
+    assert!(req("1.2.3").matches(&ver("1.2.3")));
+    assert!(req("1.2.3").matches(&ver("1.9.0")));
+    assert!(!req("1.2.3").matches(&ver("1.2.2")));
+    assert!(!req("1.2.3").matches(&ver("2.0.0")));
+}
+
+#[test]
+fn an_exact_requirement_admits_one_version() {
+    assert!(req("=1.2.3").matches(&ver("1.2.3")));
+    assert!(!req("=1.2.3").matches(&ver("1.2.4")));
+    assert!(!req("=1.2.3").matches(&ver("1.3.0")));
+}
+
+#[test]
+fn before_one_zero_the_minor_number_carries_the_weight_of_a_major() {
+    // ^0.2.3 accepts 0.2.x but not 0.3.0 — the same rule the stability
+    // policy states for the language itself.
+    assert!(req("^0.2.3").matches(&ver("0.2.3")));
+    assert!(req("^0.2.3").matches(&ver("0.2.9")));
+    assert!(!req("^0.2.3").matches(&ver("0.3.0")));
+    assert!(!req("^0.2.3").matches(&ver("0.2.2")));
+    assert!(!req("^0.2.3").matches(&ver("1.0.0")));
+}
+
+#[test]
+fn in_a_zero_zero_line_every_release_may_break() {
+    assert!(req("^0.0.3").matches(&ver("0.0.3")));
+    assert!(!req("^0.0.3").matches(&ver("0.0.4")));
+    assert!(!req("^0.0.3").matches(&ver("0.1.0")));
+}
+
+#[test]
+fn versions_order_by_number_not_by_text() {
+    assert!(ver("0.2.0") < ver("0.10.0"));
+    assert!(ver("1.0.0") > ver("0.99.99"));
+}
+
+#[test]
+fn a_malformed_requirement_is_rejected_where_it_is_written() {
+    let ws = Workspace::new("bad_req");
+    ws.package("lib", &versioned("lib", "1.0.0", &[]), PURE_SRC);
+    let app = ws.package(
+        "app",
+        &versioned("app", "0.1.0", &[("lib", "../lib", Some("^1.2"))]),
+        PURE_SRC,
+    );
+    let err = Manifest::load(&app).unwrap_err();
+    assert!(err.contains("dependency `lib`"), "{err}");
+    assert!(err.contains("MAJOR.MINOR.PATCH"), "{err}");
+}
+
+#[test]
+fn a_satisfied_requirement_resolves() {
+    let ws = Workspace::new("req_ok");
+    ws.package("lib", &versioned("lib", "1.4.1", &[]), PURE_SRC);
+    let app = ws.package(
+        "app",
+        &versioned("app", "0.1.0", &[("lib", "../lib", Some("^1.2.0"))]),
+        PURE_SRC,
+    );
+    let r = grasm_pkg::resolve(&app).unwrap();
+    assert_eq!(r.packages.len(), 2);
+    assert_eq!(r.root().name, "app");
+}
+
+#[test]
+fn an_unsatisfied_requirement_names_the_requirer_and_both_versions() {
+    let ws = Workspace::new("req_bad");
+    ws.package("lib", &versioned("lib", "2.0.0", &[]), PURE_SRC);
+    let app = ws.package(
+        "app",
+        &versioned("app", "0.1.0", &[("lib", "../lib", Some("^1.2.0"))]),
+        PURE_SRC,
+    );
+    let err = grasm_pkg::resolve(&app).unwrap_err();
+    assert!(err.contains("dependency `lib` of `app`"), "{err}");
+    assert!(err.contains("requires ^1.2.0"), "{err}");
+    assert!(err.contains("is 2.0.0"), "{err}");
+}
+
+#[test]
+fn a_dependency_with_no_requirement_accepts_whatever_is_there() {
+    let ws = Workspace::new("req_none");
+    ws.package("lib", &versioned("lib", "9.9.9", &[]), PURE_SRC);
+    let app = ws.package(
+        "app",
+        &versioned("app", "0.1.0", &[("lib", "../lib", None)]),
+        PURE_SRC,
+    );
+    assert!(grasm_pkg::resolve(&app).is_ok());
+}
+
+#[test]
+fn one_package_reached_two_ways_resolves_once() {
+    // The diamond: app -> {left, right} -> lib. One lib, not two.
+    let ws = Workspace::new("diamond");
+    ws.package("lib", &versioned("lib", "1.0.0", &[]), PURE_SRC);
+    ws.package(
+        "left",
+        &versioned("left", "1.0.0", &[("lib", "../lib", Some("^1.0.0"))]),
+        PURE_SRC,
+    );
+    ws.package(
+        "right",
+        &versioned("right", "1.0.0", &[("lib", "../lib", Some("^1.0.0"))]),
+        PURE_SRC,
+    );
+    let app = ws.package(
+        "app",
+        &versioned(
+            "app",
+            "0.1.0",
+            &[("left", "../left", None), ("right", "../right", None)],
+        ),
+        PURE_SRC,
+    );
+    let r = grasm_pkg::resolve(&app).unwrap();
+    let libs = r.packages.iter().filter(|p| p.name == "lib").count();
+    assert_eq!(libs, 1, "lib should appear once, not once per dependent");
+    assert_eq!(r.packages.len(), 4);
+}
+
+#[test]
+fn two_directories_claiming_one_name_is_an_error_not_a_coin_flip() {
+    // Before versions were checked, whichever copy the walk reached first
+    // silently won and the other dependent got a package it never asked for.
+    let ws = Workspace::new("two_libs");
+    std::fs::create_dir_all(ws.path().join("vendor")).unwrap();
+    ws.package("lib", &versioned("lib", "1.0.0", &[]), PURE_SRC);
+    // A second `lib`, at a different path, at a different version.
+    let other = ws.path().join("vendor/lib");
+    std::fs::create_dir_all(other.join("src")).unwrap();
+    std::fs::write(other.join(MANIFEST_NAME), versioned("lib", "2.0.0", &[])).unwrap();
+    std::fs::write(other.join("src/main.gr"), PURE_SRC).unwrap();
+
+    ws.package(
+        "left",
+        &versioned("left", "1.0.0", &[("lib", "../lib", None)]),
+        PURE_SRC,
+    );
+    ws.package(
+        "right",
+        &versioned("right", "1.0.0", &[("lib", "../vendor/lib", None)]),
+        PURE_SRC,
+    );
+    let app = ws.package(
+        "app",
+        &versioned(
+            "app",
+            "0.1.0",
+            &[("left", "../left", None), ("right", "../right", None)],
+        ),
+        PURE_SRC,
+    );
+    let err = grasm_pkg::resolve(&app).unwrap_err();
+    assert!(err.contains("two different directories"), "{err}");
+    assert!(err.contains("is 1.0.0"), "{err}");
+    assert!(err.contains("is 2.0.0"), "{err}");
+    assert!(err.contains("`left`"), "{err}");
+    assert!(err.contains("`right`"), "{err}");
+}
