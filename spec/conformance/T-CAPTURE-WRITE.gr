@@ -1,0 +1,14 @@
+//! tag: T-CAPTURE-WRITE
+//! expect: error
+//! captured from outside
+// A closure captures values, not bindings ([E-CLOSURE-CAPTURE]), so a write
+// to a captured name changes a copy that is discarded when the call returns.
+// It used to compile and silently do nothing — which is how a handler that
+// appears to accumulate state accumulates none.
+fn main() {
+    var seen: [i64] = []
+    let remember = |v| seen.push(v)
+    remember(1)
+    remember(2)
+    print("{seen.len()}")
+}

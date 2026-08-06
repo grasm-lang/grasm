@@ -399,6 +399,12 @@ error at the call site. This is the only place a row can be checked rather than
 inferred — a written type has no body to infer from — and without it a function
 value would be a way to carry an effect past a declared row.
 
+**[T-CAPTURE-WRITE]** Assigning to, or calling a mutating method on, a binding
+a closure captured from outside is a compile error. The write would change the
+closure's own copy ([E-CLOSURE-CAPTURE]) and be discarded when the call
+returns, so there is no program for which it is what the author meant. A
+closure's own `var` bindings and its parameters are unaffected.
+
 **[T-PAR-MAP-PURE]** The function given to a parallel operation — `par_map` or
 `par_filter` — must have an empty effect row. Elements are processed concurrently, so an effect would interleave
 differently between runs; requiring purity is what makes the parallelism
@@ -490,8 +496,9 @@ evaluate left to right before the call.
 
 **[E-CLOSURE-CAPTURE]** A closure captures the values it uses **at the moment
 it is created**, not the bindings. Changing a captured variable afterwards is
-not visible inside, and a closure cannot write to one: an assignment inside a
-closure body changes its own copy.
+not visible inside, and a closure may not write to one at all — that is a
+compile error ([T-CAPTURE-WRITE]), because the write would change a copy the
+caller can never see.
 
 This is the same value semantics every other binding has ([E-COW]), applied to
 a closure's environment. It has one consequence worth stating outright, because
@@ -1385,7 +1392,6 @@ fn main() {
 //! 1
 //! 2
 //! 7
-//! 0
 // A closure captures values, not bindings. Changing the variable afterwards
 // is not visible inside, and writing to it inside changes only a copy.
 //
@@ -1410,17 +1416,8 @@ fn main() {
     let from_base = |x| base + x
     print("{from_base(0)}")
 
-    // Writing to a captured variable inside a closure changes the copy, so
-    // the caller's binding is untouched. A handler that "stores" this way
-    // stores nothing.
-    var counter = 0
-    let bump = |x| {
-        counter = counter + 1
-        x
-    }
-    let _ignored = bump(0)
-    let _ignored2 = bump(0)
-    print("{counter}")
+    // Writing to a captured variable is a compile error, because the write
+    // would change a copy nobody can observe. See T-CAPTURE-WRITE.
 }
 ```
 
@@ -2826,16 +2823,57 @@ fn main() {
 
 ```grasm
 //! tag: T-ARM-TYPES
-//! expect: error
-//! type mismatch
-fn f(n: i64) -> i64 {
-    match n {
-        0 -> 1
-        _ -> "not a number"
+//! expect: output
+//! 3.0
+//! 2.0
+//! ok
+// Every arm of a `match` used as a value produces the same type.
+//
+// This program is here because a `match` whose arms the backend could not
+// type did not fail — inside a fallible function it compiled, and then
+// panicked at run time with `unbox: not an f64` and no source location.
+// Wrong code, from arms that were perfectly well typed by the checker and
+// merely unknown to the backend's own inference table.
+type Diag = { msg: str }
+
+fn call(name: str, a: f64, b: f64) -> f64 ! Diag {
+    match name {
+        "sqrt" -> a.sqrt()
+        "min" -> a.min(b)
+        _ -> fail(Diag{ msg: "unknown function {name}" })
     }
 }
+
+fn show(name: str, a: f64, b: f64) {
+    match call(name, a, b) {
+        Ok(v) -> print("{v}")
+        Err(d) -> print("{d.msg}")
+    }
+}
+
 fn main() {
-    print("{f(0)}")
+    show("sqrt", 9.0, 0.0)
+    show("min", 9.0, 2.0)
+    print("ok")
+}
+```
+
+## `T-CAPTURE-WRITE.gr`
+
+```grasm
+//! tag: T-CAPTURE-WRITE
+//! expect: error
+//! captured from outside
+// A closure captures values, not bindings ([E-CLOSURE-CAPTURE]), so a write
+// to a captured name changes a copy that is discarded when the call returns.
+// It used to compile and silently do nothing — which is how a handler that
+// appears to accumulate state accumulates none.
+fn main() {
+    var seen: [i64] = []
+    let remember = |v| seen.push(v)
+    remember(1)
+    remember(2)
+    print("{seen.len()}")
 }
 ```
 

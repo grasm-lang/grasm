@@ -25,8 +25,9 @@ evaluate left to right before the call.
 
 **[E-CLOSURE-CAPTURE]** A closure captures the values it uses **at the moment
 it is created**, not the bindings. Changing a captured variable afterwards is
-not visible inside, and a closure cannot write to one: an assignment inside a
-closure body changes its own copy.
+not visible inside, and a closure may not write to one at all — that is a
+compile error ([T-CAPTURE-WRITE]), because the write would change a copy the
+caller can never see.
 
 This is the same value semantics every other binding has ([E-COW]), applied to
 a closure's environment. It has one consequence worth stating outright, because

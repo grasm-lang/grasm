@@ -55,6 +55,14 @@ fn main() {
     // Nested one level down, so the probe has to recurse.
     print("{[[[5, 6].sum(), [7, 8].sum()].max() ?? 0]}")
 
+    // Numeric methods, which the inference table did not know. Their absence
+    // was not merely a missing feature: inside a fallible function, a `match`
+    // whose arms could not be typed compiled to code that unboxed an f64 as
+    // if it were a pointer, and panicked at run time with no source location.
+    let a = 9.0
+    print("{[a.sqrt(), a.floor(), a.ceil(), a.round(), a.abs(), a.min(2.0), a.max(2.0)]}")
+    print("{[(0 - 3).abs(), (3).min(5), (3).max(5)]}")
+
     // An empty literal as a `??` fallback: the type comes from the Option's
     // payload, which is the only place it can come from.
     var lists = map()

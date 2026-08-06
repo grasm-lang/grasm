@@ -161,6 +161,12 @@ error at the call site. This is the only place a row can be checked rather than
 inferred — a written type has no body to infer from — and without it a function
 value would be a way to carry an effect past a declared row.
 
+**[T-CAPTURE-WRITE]** Assigning to, or calling a mutating method on, a binding
+a closure captured from outside is a compile error. The write would change the
+closure's own copy ([E-CLOSURE-CAPTURE]) and be discarded when the call
+returns, so there is no program for which it is what the author meant. A
+closure's own `var` bindings and its parameters are unaffected.
+
 **[T-PAR-MAP-PURE]** The function given to a parallel operation — `par_map` or
 `par_filter` — must have an empty effect row. Elements are processed concurrently, so an effect would interleave
 differently between runs; requiring purity is what makes the parallelism

@@ -3,7 +3,6 @@
 //! 1
 //! 2
 //! 7
-//! 0
 // A closure captures values, not bindings. Changing the variable afterwards
 // is not visible inside, and writing to it inside changes only a copy.
 //
@@ -28,15 +27,6 @@ fn main() {
     let from_base = |x| base + x
     print("{from_base(0)}")
 
-    // Writing to a captured variable inside a closure changes the copy, so
-    // the caller's binding is untouched. A handler that "stores" this way
-    // stores nothing.
-    var counter = 0
-    let bump = |x| {
-        counter = counter + 1
-        x
-    }
-    let _ignored = bump(0)
-    let _ignored2 = bump(0)
-    print("{counter}")
+    // Writing to a captured variable is a compile error, because the write
+    // would change a copy nobody can observe. See T-CAPTURE-WRITE.
 }

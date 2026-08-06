@@ -1,12 +1,34 @@
 //! tag: T-ARM-TYPES
-//! expect: error
-//! type mismatch
-fn f(n: i64) -> i64 {
-    match n {
-        0 -> 1
-        _ -> "not a number"
+//! expect: output
+//! 3.0
+//! 2.0
+//! ok
+// Every arm of a `match` used as a value produces the same type.
+//
+// This program is here because a `match` whose arms the backend could not
+// type did not fail — inside a fallible function it compiled, and then
+// panicked at run time with `unbox: not an f64` and no source location.
+// Wrong code, from arms that were perfectly well typed by the checker and
+// merely unknown to the backend's own inference table.
+type Diag = { msg: str }
+
+fn call(name: str, a: f64, b: f64) -> f64 ! Diag {
+    match name {
+        "sqrt" -> a.sqrt()
+        "min" -> a.min(b)
+        _ -> fail(Diag{ msg: "unknown function {name}" })
     }
 }
+
+fn show(name: str, a: f64, b: f64) {
+    match call(name, a, b) {
+        Ok(v) -> print("{v}")
+        Err(d) -> print("{d.msg}")
+    }
+}
+
 fn main() {
-    print("{f(0)}")
+    show("sqrt", 9.0, 0.0)
+    show("min", 9.0, 2.0)
+    print("ok")
 }

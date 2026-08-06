@@ -72,6 +72,7 @@ Will not change incompatibly before 2.0.
 - `L-WHITESPACE` — stable
 - `T-ARM-TYPES` — stable
 - `T-COPY` — stable
+- `T-CAPTURE-WRITE` — stable
 - `T-EMPTY-LIT` — stable
 - `T-ERR-SUBSET` — stable
 - `T-FAIL` — stable

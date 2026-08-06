@@ -111,6 +111,9 @@ struct Checker {
     /// module → (alias → full target module name)
     module_imports: HashMap<String, HashMap<String, String>>,
     scopes: Vec<HashMap<String, Binding>>,
+    /// Scope depth at which each enclosing closure body begins. A binding
+    /// found below the innermost of these is captured, not local.
+    closure_floors: Vec<usize>,
     /// (ret, err) of the function being checked.
     fn_ret: Type,
     fn_err: Option<Type>,
@@ -147,6 +150,7 @@ impl Checker {
             current_module: "main".to_string(),
             module_imports: HashMap::new(),
             scopes: Vec::new(),
+            closure_floors: Vec::new(),
             fn_ret: Type::Unit,
             fn_err: None,
             err_open: false,
@@ -889,6 +893,9 @@ declare it before `parallel`",
             other => {
                 self.error(other.span(), "invalid assignment target");
             }
+        }
+        if let Expr::Ident(id) = root {
+            self.reject_capture_write(id, "assign to");
         }
     }
 
@@ -2069,6 +2076,35 @@ declare it before `parallel`",
     }
 
     /// Mutating methods need a mutable receiver root.
+    /// Rejects a write to a binding the enclosing closure captured.
+    ///
+    /// A closure captures values, not bindings ([E-CLOSURE-CAPTURE]), so a
+    /// write to a captured name changes a copy that is discarded when the call
+    /// returns. It compiles, it runs, and it does nothing — which is how an
+    /// effect handler that appears to accumulate state silently accumulates
+    /// nothing. There is no case where this is what someone meant.
+    fn reject_capture_write(&mut self, id: &Ident, verb: &str) {
+        let Some(floor) = self.closure_floors.last().copied() else {
+            return;
+        };
+        let declared_at = self
+            .scopes
+            .iter()
+            .rposition(|sc| sc.contains_key(&id.name));
+        if let Some(at) = declared_at {
+            if at < floor {
+                self.error_help(
+                    id.span,
+                    format!(
+                        "cannot {verb} `{}` inside a closure — it was captured from outside",
+                        id.name
+                    ),
+                    "a closure captures values, not bindings, so this write would change a copy nobody can see; return the new value instead, or thread the state through an `inout` parameter",
+                );
+            }
+        }
+    }
+
     fn require_mutable(&mut self, recv: &Expr) {
         let mut root = recv;
         while let Expr::Field { recv, .. } | Expr::Index { recv, .. } = root {
@@ -2084,6 +2120,7 @@ declare it before `parallel`",
                     );
                 }
             }
+            self.reject_capture_write(id, "mutate");
         }
     }
 
@@ -2536,10 +2573,12 @@ declare it before `parallel`",
             }
         }
         self.scopes.push(HashMap::new());
+        self.closure_floors.push(self.scopes.len() - 1);
         for (p, t) in params.iter().zip(&param_tys) {
             self.bind(p, t.clone(), false);
         }
         let ret = self.infer_expr(body);
+        self.closure_floors.pop();
         self.scopes.pop();
         Type::Fn {
             params: param_tys,

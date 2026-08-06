@@ -48,8 +48,10 @@ enum VType {
     Struct(String),
     Sum(String),
     Option(Box<VType>),
-    /// `T ! E` — boxed Ok/Err variant wrapper around T.
-    Fallible(Box<VType>),
+    /// `T ! E` — boxed Ok/Err variant wrapper. Both halves are carried:
+    /// dropping `E` meant a `match` could bind an `Err` payload and have no
+    /// idea what it was, so reading a field off it was rejected.
+    Fallible(Box<VType>, Box<VType>),
     Map(Box<VType>, Box<VType>),
     Tuple(Vec<VType>),
     /// Dynamically-typed boxed value (error payloads); printable + variant-matchable.
@@ -72,7 +74,7 @@ impl VType {
             VType::Any => "any".into(),
             VType::List(e) => format!("l{}", e.mangle()),
             VType::Option(e) => format!("o{}", e.mangle()),
-            VType::Fallible(e) => format!("f{}", e.mangle()),
+            VType::Fallible(o, e) => format!("f{}_{}", o.mangle(), e.mangle()),
             VType::Struct(n) | VType::Sum(n) => format!("n{n}"),
             VType::Map(k, v) => format!("m{}_{}", k.mangle(), v.mangle()),
             VType::Fn(ps, r) => format!(
@@ -99,7 +101,7 @@ impl VType {
             | VType::Struct(_)
             | VType::Sum(_)
             | VType::Option(_)
-            | VType::Fallible(_)
+            | VType::Fallible(_, _)
             | VType::Map(_, _)
             | VType::Tuple(_)
             | VType::Fn(_, _)
@@ -115,7 +117,7 @@ impl VType {
                 | VType::Struct(_)
                 | VType::Sum(_)
                 | VType::Option(_)
-                | VType::Fallible(_)
+                | VType::Fallible(_, _)
                 | VType::Map(_, _)
                 | VType::Tuple(_)
                 | VType::Fn(_, _)
@@ -773,8 +775,9 @@ impl<'m> Codegen<'m> {
                 Some(t) => self.vtype_of(t)?,
                 None => VType::Unit,
             };
-            if decl.err.is_some() {
-                ret = VType::Fallible(Box::new(ret));
+            if let Some(et) = &decl.err {
+                let e = self.vtype_of(et).unwrap_or(VType::Str);
+                ret = VType::Fallible(Box::new(ret), Box::new(e));
             }
             Ok((params, modes, ret))
         })();
@@ -870,8 +873,9 @@ impl<'m> Codegen<'m> {
                         Some(t) => self.vtype_of(t)?,
                         None => VType::Unit,
                     };
-                    if f.err.is_some() {
-                        ret = VType::Fallible(Box::new(ret));
+                    if let Some(et) = &f.err {
+                        let e = self.vtype_of(et).unwrap_or(VType::Str);
+                        ret = VType::Fallible(Box::new(ret), Box::new(e));
                     }
                     let ptr_ty = self.module.target_config().pointer_type();
                     let mut sig = self.module.make_signature();
@@ -946,7 +950,7 @@ impl<'m> Codegen<'m> {
         let sa_ref = self.module.declare_func_in_func(set_args, b.func);
         b.ins().call(sa_ref, &[user_argc, argv_shift]);
         let g_main = self.fns["main::main"].id;
-        let main_fallible = matches!(self.fns["main::main"].ret, VType::Fallible(_));
+        let main_fallible = matches!(self.fns["main::main"].ret, VType::Fallible(_, _));
         let fref = self.module.declare_func_in_func(g_main, b.func);
         let inst = b.ins().call(fref, &[]);
         if main_fallible {
@@ -1062,7 +1066,7 @@ impl<'m> Codegen<'m> {
                     fcx.b.ins().return_(&[]);
                 }
                 (want, Some((mut v, vt))) => {
-                    if let VType::Fallible(ok_t) = want.clone() {
+                    if let VType::Fallible(ok_t, _) = want.clone() {
                         let mut inner = v;
                         if *ok_t == VType::F64 && vt == VType::I64 {
                             inner = fcx.b.ins().fcvt_from_sint(types::F64, inner);
@@ -1075,7 +1079,7 @@ impl<'m> Codegen<'m> {
                     fcx.emit_scope_decs_all();
                     fcx.b.ins().return_(&[v]);
                 }
-                (VType::Fallible(_), None) => {
+                (VType::Fallible(_, _), None) => {
                     // Unit-valued fallible function: Ok(()).
                     let z = fcx.b.ins().iconst(types::I64, 0);
                     let boxed = fcx.call_rt("grasm_box_i64", &[z]).unwrap();
@@ -2596,14 +2600,14 @@ impl FnCx<'_, '_> {
                 match v {
                     Some(e) => {
                         let expect = match &self.ret {
-                            VType::Fallible(ok) => (**ok).clone(),
+                            VType::Fallible(ok, _) => (**ok).clone(),
                             other => other.clone(),
                         };
                         let (mut val, vt) = self.eval_expr_expecting(e, Some(&expect))?;
                         if self.ret == VType::F64 && vt == VType::I64 {
                             val = self.b.ins().fcvt_from_sint(types::F64, val);
                         }
-                        if let VType::Fallible(ok_t) = self.ret.clone() {
+                        if let VType::Fallible(ok_t, _) = self.ret.clone() {
                             let mut inner = val;
                             if *ok_t == VType::F64 && vt == VType::I64 {
                                 inner = self.b.ins().fcvt_from_sint(types::F64, inner);
@@ -2619,7 +2623,7 @@ impl FnCx<'_, '_> {
                 self.filled = true;
                     }
                     None => {
-                        if let VType::Fallible(ok_t) = self.ret.clone() {
+                        if let VType::Fallible(ok_t, _) = self.ret.clone() {
                             // Bare `return` in a fallible function is `Ok(())`.
                             let z = self.b.ins().iconst(types::I64, 0);
                             let inner = if *ok_t == VType::Unit {
@@ -4373,7 +4377,7 @@ impl FnCx<'_, '_> {
                 let (pv, _) = self.eval_expr_val(&args[0])?;
                 let v = self.call_rt("grasm_read_file", &[pv]).unwrap();
                 self.call_rt("grasm_val_dec", &[pv]);
-                return Ok(Some((v, VType::Fallible(Box::new(VType::Str)))));
+                return Ok(Some((v, VType::Fallible(Box::new(VType::Str), Box::new(VType::Sum("IoError".into()))))));
             }
             "write_file" => {
                 let (pv, _) = self.eval_expr_val(&args[0])?;
@@ -4381,7 +4385,7 @@ impl FnCx<'_, '_> {
                 let v = self.call_rt("grasm_write_file", &[pv, cv]).unwrap();
                 self.call_rt("grasm_val_dec", &[pv]);
                 self.call_rt("grasm_val_dec", &[cv]);
-                return Ok(Some((v, VType::Fallible(Box::new(VType::Unit)))));
+                return Ok(Some((v, VType::Fallible(Box::new(VType::Unit), Box::new(VType::Sum("IoError".into()))))));
             }
             "file_exists" => {
                 let (pv, _) = self.eval_expr_val(&args[0])?;
@@ -4701,7 +4705,7 @@ impl FnCx<'_, '_> {
 
     fn eval_try(&mut self, inner: &Expr, span: Span) -> CResult<(Value, VType)> {
         let (fv, ft) = self.eval_expr_val(inner)?;
-        let VType::Fallible(ok_t) = ft else {
+        let VType::Fallible(ok_t, _) = ft else {
             return nope(span, "try on non-fallible values");
         };
         let ok_blk = self.b.create_block();
@@ -4716,7 +4720,7 @@ impl FnCx<'_, '_> {
         self.call_rt("grasm_val_dec", &[fv]);
         let wrapped = self.call_rt("grasm_err_new", &[epay]).unwrap();
         self.emit_scope_decs_all();
-        if matches!(self.ret, VType::Fallible(_)) {
+        if matches!(self.ret, VType::Fallible(_, _)) {
             self.b.ins().return_(&[wrapped]);
                 self.filled = true;
         } else {
@@ -4966,6 +4970,13 @@ impl FnCx<'_, '_> {
                 | "substr" | "repeat" | "pad_start" | "pad_end" => VType::Str,
                 "as_f64" => VType::F64,
                 "as_i64" => VType::I64,
+                // Numeric methods. Their absence here did not merely make a
+                // program unsupported: inside a fallible function it produced
+                // wrong code, because a match whose arms could not be typed
+                // fell through to a representation that then unboxed an f64
+                // as if it were a pointer.
+                "sqrt" | "floor" | "ceil" | "round" => VType::F64,
+                "abs" => self.probe_type(recv)?,
                 "chars" | "lines" | "split" | "keys" => VType::List(Box::new(VType::Str)),
                 "entries" => match self.probe_type(recv)? {
                     VType::Map(k, v) => VType::List(Box::new(VType::Tuple(vec![*k, *v]))),
@@ -4983,7 +4994,15 @@ impl FnCx<'_, '_> {
                     VType::List(elem) => *elem,
                     _ => return nope(e.span(), "inferring this type"),
                 },
-                "min" | "max" | "first" | "last" | "pop" => {
+                // `min`/`max` are two methods sharing a name: the reduction
+                // over a list yields an Option, the two-argument numeric form
+                // yields the receiver's own type.
+                "min" | "max" => match self.probe_type(recv)? {
+                    VType::List(elem) => VType::Option(elem),
+                    n @ (VType::I64 | VType::F64) => n,
+                    _ => return nope(e.span(), "inferring this type"),
+                },
+                "first" | "last" | "pop" => {
                     match self.probe_type(recv)? {
                         VType::List(elem) => VType::Option(elem),
                         _ => return nope(e.span(), "inferring this type"),
@@ -6279,11 +6298,14 @@ impl FnCx<'_, '_> {
                         let parent = parent.clone();
                         self.variant_field_types(&parent, &vname, *span)?
                     }
-                    VType::Fallible(ok_t) => {
+                    // Both halves are known, so `Err(d)` binds `d` at the
+                    // declared error type instead of `Any` — which is what
+                    // made reading a field off it "field access on non-structs".
+                    VType::Fallible(ok_t, err_t) => {
                         if vname == "Ok" {
                             vec![(**ok_t).clone()]
                         } else {
-                            vec![VType::Any]
+                            vec![(**err_t).clone()]
                         }
                     }
                     VType::Any => fields.iter().map(|_| VType::Any).collect(),
@@ -6399,11 +6421,14 @@ impl FnCx<'_, '_> {
                         let parent = parent.clone();
                         self.variant_field_types(&parent, &vname, *span)?
                     }
-                    VType::Fallible(ok_t) => {
+                    // Both halves are known, so `Err(d)` binds `d` at the
+                    // declared error type instead of `Any` — which is what
+                    // made reading a field off it "field access on non-structs".
+                    VType::Fallible(ok_t, err_t) => {
                         if vname == "Ok" {
                             vec![(**ok_t).clone()]
                         } else {
-                            vec![VType::Any]
+                            vec![(**err_t).clone()]
                         }
                     }
                     VType::Any => fields.iter().map(|_| VType::Any).collect(),
