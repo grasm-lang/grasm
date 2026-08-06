@@ -317,7 +317,15 @@ inference variables; a generic body is checked once against its parameters.
 with `E`. It is an ordinary value, not an exception.
 
 **[T-FALLIBLE-UNHANDLED]** A fallible value may not be used as if it were `T`.
-It must be consumed by `try` or by a `match` covering `Ok` and `Err`.
+It must be consumed by `try`, by a `match` covering `Ok` and `Err`, or by
+`??`.
+
+**[T-FALLIBLE-COALESCE]** `e ?? d` where `e : T ! E` yields the value or `d`,
+the same shape `??` has over an `Option` ([E-COALESCE-LAZY] applies equally:
+`d` is evaluated only on failure). Absence and failure are different things,
+but "the value, or this default" is one thing, and writing it as a `match` at
+every call site is the most repetitive shape in a program that reports errors
+as values. The error itself is discarded — reach for `match` when it matters.
 
 **[T-TRY]** `try e` where `e : T ! E` yields `T`, propagating `Err` to the
 caller. It is a compile error in a function that declares no error type —
@@ -693,8 +701,13 @@ that panics is reported as a failure instead of a measurement.
 **[E-ENTRY]** Execution begins at `main` in the entry module. A program
 without `main` is an error.
 
-**[E-ARGS]** `args()` returns the arguments after `--`, excluding the program
-name.
+**[E-ARGS]** `args()` returns the arguments the program was given, excluding
+the program's own name. How they are given depends on how the program is run,
+and the `--` in `grasm run prog.gr -- a b` belongs to the toolchain rather
+than to the program: it separates the toolchain's arguments from the
+program's. A compiled binary has no such separator, so `./prog a b` passes the
+same two arguments. In every mode `args()` sees `[a, b]`, and a literal `--`
+among a program's arguments is an ordinary argument.
 
 
 <!-- ===== spec/library.md ===== -->
@@ -3193,6 +3206,47 @@ fn no_error_clause() -> i64 {
 }
 fn main() {
     print("{no_error_clause()}")
+}
+```
+
+## `T-FALLIBLE-COALESCE.gr`
+
+```grasm
+//! tag: T-FALLIBLE-COALESCE
+//! expect: output
+//! 42
+//! 0
+//! []
+//! 101
+//! evaluated once
+// `??` over a fallible value, which used to be a four-line `match`.
+type E = { m: str }
+
+fn parse(s: str) -> i64 ! E {
+    match s.parse_int() {
+        Some(n) -> n
+        None -> fail(E{ m: "not a number: {s}" })
+    }
+}
+
+fn names() -> [str] ! E {
+    fail(E{ m: "none" })
+}
+
+/// Prints when it runs, so laziness is observable rather than asserted.
+fn fallback() -> i64 {
+    print("evaluated once")
+    -1
+}
+
+fn main() {
+    print("{parse("42") ?? 0}")
+    print("{parse("oops") ?? 0}")
+    print("{names() ?? []}")
+    print("{(parse("1") ?? 0) + (parse("x") ?? 100)}")
+    // The success path does not evaluate the fallback; the failing one does.
+    let _ok = parse("5") ?? fallback()
+    let _bad = parse("z") ?? fallback()
 }
 ```
 

@@ -4982,10 +4982,51 @@ impl FnCx<'_, '_> {
 
     fn eval_coalesce(&mut self, lhs: &Expr, rhs: &Expr, span: Span) -> CResult<(Value, VType)> {
         let (lv, lt) = self.eval_expr_val(lhs)?;
-        let VType::Option(payload_t) = lt else {
-            return nope(span, "?? on non-Option values");
-        };
-        self.coalesce_values(lv, &payload_t, rhs)
+        match lt {
+            VType::Option(payload_t) => self.coalesce_values(lv, &payload_t, rhs),
+            // `T ! E` takes the same fallback: `Ok(v)` yields `v`, `Err(_)`
+            // yields the right-hand side. The runtime tag differs from an
+            // Option's, so the test does too.
+            VType::Fallible(ok_t, _) => self.coalesce_fallible(lv, &ok_t, rhs),
+            _ => nope(span, "?? on values that are neither Option nor fallible"),
+        }
+    }
+
+    /// `e ?? d` where `e` is fallible. Consumes the owned value `lv`.
+    fn coalesce_fallible(
+        &mut self,
+        lv: Value,
+        ok_t: &VType,
+        rhs: &Expr,
+    ) -> CResult<(Value, VType)> {
+        let ok_blk = self.b.create_block();
+        let err_blk = self.b.create_block();
+        let merge = self.b.create_block();
+        self.b.append_block_param(merge, ok_t.cl());
+        let c = self.call_rt("grasm_is_ok", &[lv]).unwrap();
+        self.b.ins().brif(c, ok_blk, &[], err_blk, &[]);
+        self.filled = true;
+
+        self.goto_block(ok_blk);
+        let zero = self.b.ins().iconst(types::I64, 0);
+        let payload = self.call_rt("grasm_variant_field", &[lv, zero]).unwrap();
+        self.call_rt("grasm_val_dec", &[lv]);
+        let (v, _) = self.unbox(payload, ok_t)?;
+        self.b.ins().jump(merge, &[v]);
+        self.filled = true;
+
+        self.goto_block(err_blk);
+        self.call_rt("grasm_val_dec", &[lv]);
+        let (mut rv, rvt) = self.eval_expr_expecting(rhs, Some(ok_t))?;
+        if *ok_t == VType::F64 && rvt == VType::I64 {
+            rv = self.b.ins().fcvt_from_sint(types::F64, rv);
+        }
+        self.b.ins().jump(merge, &[rv]);
+        self.filled = true;
+
+        self.goto_block(merge);
+        let out = self.b.block_params(merge)[0];
+        Ok((out, ok_t.clone()))
     }
 
     /// Shared by `??` and `unwrap_or`: consumes the owned Option `lv`.

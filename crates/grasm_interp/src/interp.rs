@@ -845,9 +845,13 @@ impl<'a, W: Write> Interp<'a, W> {
                     BinaryOp::Coalesce => {
                         let l = self.eval_expr(lhs)?;
                         return match l {
+                            // `Some(v)` and `Ok(v)` both yield their payload;
+                            // `None` and `Err(_)` both take the fallback.
                             Value::Variant {
                                 variant, fields, ..
                             } if variant.as_str() == "Some" => Ok(fields[0].clone()),
+                            Value::Ok(inner) => Ok((*inner).clone()),
+                            Value::Err(_) => self.eval_expr(rhs),
                             v if v.is_none() => self.eval_expr(rhs),
                             v => Ok(v),
                         };

@@ -68,7 +68,15 @@ inference variables; a generic body is checked once against its parameters.
 with `E`. It is an ordinary value, not an exception.
 
 **[T-FALLIBLE-UNHANDLED]** A fallible value may not be used as if it were `T`.
-It must be consumed by `try` or by a `match` covering `Ok` and `Err`.
+It must be consumed by `try`, by a `match` covering `Ok` and `Err`, or by
+`??`.
+
+**[T-FALLIBLE-COALESCE]** `e ?? d` where `e : T ! E` yields the value or `d`,
+the same shape `??` has over an `Option` ([E-COALESCE-LAZY] applies equally:
+`d` is evaluated only on failure). Absence and failure are different things,
+but "the value, or this default" is one thing, and writing it as a `match` at
+every call site is the most repetitive shape in a program that reports errors
+as values. The error itself is discarded — reach for `match` when it matters.
 
 **[T-TRY]** `try e` where `e : T ! E` yields `T`, propagating `Err` to the
 caller. It is a compile error in a function that declares no error type —

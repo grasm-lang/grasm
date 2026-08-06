@@ -1,0 +1,36 @@
+//! tag: T-FALLIBLE-COALESCE
+//! expect: output
+//! 42
+//! 0
+//! []
+//! 101
+//! evaluated once
+// `??` over a fallible value, which used to be a four-line `match`.
+type E = { m: str }
+
+fn parse(s: str) -> i64 ! E {
+    match s.parse_int() {
+        Some(n) -> n
+        None -> fail(E{ m: "not a number: {s}" })
+    }
+}
+
+fn names() -> [str] ! E {
+    fail(E{ m: "none" })
+}
+
+/// Prints when it runs, so laziness is observable rather than asserted.
+fn fallback() -> i64 {
+    print("evaluated once")
+    -1
+}
+
+fn main() {
+    print("{parse("42") ?? 0}")
+    print("{parse("oops") ?? 0}")
+    print("{names() ?? []}")
+    print("{(parse("1") ?? 0) + (parse("x") ?? 100)}")
+    // The success path does not evaluate the fallback; the failing one does.
+    let _ok = parse("5") ?? fallback()
+    let _bad = parse("z") ?? fallback()
+}

@@ -2199,12 +2199,22 @@ declare it before `parallel`",
                         self.check_expr(rhs, &inner);
                         inner
                     }
+                    // `T ! E` takes the same fallback. Absence and failure are
+                    // different things, but "give me the value or this
+                    // default" is one thing, and writing it as a four-line
+                    // `match` at every call site was the most repetitive
+                    // shape in the first real program anyone wrote.
+                    Type::Fallible(ok, _) => {
+                        let inner = (*ok).clone();
+                        self.check_expr(rhs, &inner);
+                        inner
+                    }
                     Type::Error => Type::Error,
                     _ => {
                         let shown = self.show(&lhs_ty);
                         self.error_help(
                             lhs.span(),
-                            format!("`??` needs an `Option` on the left, found `{shown}`"),
+                            format!("`??` needs an `Option` or a fallible value on the left, found `{shown}`"),
                             "`a ?? b` unwraps `a` or falls back to `b`",
                         )
                     }
