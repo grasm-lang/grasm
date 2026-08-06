@@ -90,6 +90,8 @@ grasm lsp                        # language server (stdio)
 grasm dap                        # debug adapter (stdio) — breakpoints, stepping
 grasm deps [dir]                 # resolve deps, check capabilities, write grasm.lock
         --locked                 # fail if anything changed since grasm.lock (CI)
+grasm publish [dir]              # copy a package into a registry (versions are immutable)
+grasm add <name> <version>       # add a registry dependency to grasm.toml
 grasm tokens <file.gr>           # lexer debug dump
 ```
 

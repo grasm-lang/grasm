@@ -61,6 +61,14 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   minor number carries the weight of a major, the same rule the stability
   policy states for the language.
 
+- **`grasm publish` and `grasm add`.** `publish` copies a package into a
+  registry after checking it against its own ceiling, and **refuses to
+  overwrite a version that already exists** — a published version is
+  immutable, which is what makes the lockfile's checksum mean something.
+  `add` appends a dependency to `grasm.toml` without reformatting the file.
+- **[L-DISPLAY] and [L-UFCS].** How every type renders, because a program's
+  output is what its correctness is judged on; and that a free function whose
+  first parameter accepts the receiver may be called as `x.f(y)`.
 - **A registry, and minimal version selection.** A dependency with a `version`
   and no `path` is resolved from a directory of `<name>/<version>/` packages
   (`GRASM_REGISTRY`, or the nearest `.grasm/registry`). Each package gets the
@@ -118,6 +126,21 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   walk reached first, silently, and the other dependent linked something it
   never asked for. It is an error naming both directories, both versions, and
   who required each.
+- **The parallel-purity proof only checked closures written at the call site.**
+  `xs.par_map(announce)` where `announce` prints compiled and ran across
+  threads — including with `/ {io}` declared on it. The check walked the
+  argument as an expression, and naming a value performs nothing; what counts
+  is the row of the function about to run on several cores. Named functions,
+  named closures, and effects reached transitively are all caught now.
+- **`grasm deps` exited 0 for a package it could not analyze**, omitting it
+  from the capability table and writing the lockfile. A dependency that cannot
+  be checked has not passed; it is an error and no lockfile is written.
+- Tuples printed as `[1, one, true]` natively and `(1, one, true)` under the
+  interpreter: the runtime had no tuple, so the backend built one as a list.
+  Found by writing [L-DISPLAY], which specifies what `print` produces for
+  every type.
+- A failed import named one of the two places it looked, and named the one it
+  did not want. It lists both now.
 - The native backend's static type inference — used where no annotation
   exists, most sharply for a list literal's element type — knew four builtin
   methods. Every other one failed there, so `[xs.min() ?? 0]` ran under the
