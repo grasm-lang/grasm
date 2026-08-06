@@ -69,7 +69,7 @@ grasm build hello.gr --native -o hello && ./hello
 ```
 
 `dist/grasm-language-pack.md` is the whole language — grammar, types,
-semantics, a tutorial, and a runnable program for every rule — in about 16k
+semantics, a tutorial, and a runnable program for every rule — in about 17k
 tokens. It is small enough to hand to an AI assistant in full, which is how
 you get useful completions for a language it has never seen.
 
@@ -100,23 +100,28 @@ runtime into one distributable executable).
 
 ### Performance
 
-Five programs written the same way in Grasm, C, Rust, Go, and Python. Best of
-3, milliseconds, Apple M-series:
+Six programs written the same way in Grasm, C, Rust, Go, and Python. Best of
+5, milliseconds, Apple M-series:
 
 | program  |   C |  Rust |  Go | grasm-native | Python |
 |----------|----:|------:|----:|-------------:|-------:|
-| fib      |  25 |    27 |  28 |       **27** |    153 |
-| sieve    |  28 |    29 |  29 |           42 |    384 |
-| matmul   |  26 |    26 |  29 |           61 |    930 |
-| wordfreq |  52 |    47 |  39 |          147 |    154 |
-| sort     |  60 |    33 |  70 |       **47** |    234 |
-| parmap   |  75 |    74 | 115 |          130 |  3,561 |
+| fib      |  25 |    26 |  28 |       **27** |    153 |
+| sieve    |  28 |    28 |  29 |           39 |    370 |
+| matmul   |  25 |    26 |  29 |           32 |    974 |
+| wordfreq |  54 |    48 |  39 |          117 |    153 |
+| sort     |  58 |    33 |  70 |       **47** |    237 |
+| parmap   |  69 |    72 | 112 |          128 |  3,521 |
 
 `./scripts/bench.sh` builds every implementation, checks each one against the
 interpreter's answer, and refuses to report a timing for a wrong one. Native
 Grasm matches C on call-and-arithmetic work and **beats C and Go on sort**;
-scalar lists store elements inline, so hot loops load and store instead of
-allocating. The remaining gap is per-access runtime calls and boxed map values.
+scalar lists store elements inline, and a list a loop only indexes is reached
+through its data pointer, so `matmul`'s innermost loop is 17 instructions with
+no calls. What is left is allocation: `wordfreq` builds two strings per
+iteration and boxes every value, which is most of its remaining 2.2x.
+`benchmarks/README.md` records two things this table used to blame that
+measurement cleared — the bounds check and the absence of SIMD, each worth
+0ms.
 
 Compile time is ~53 ms/program — about Go's, roughly 3× faster than Rust.
 Binaries are ~440 KB after link-time dead-stripping — Rust's size, a fifth of
