@@ -13,6 +13,8 @@ use grasm_sema::loader::{self, Program};
 
 const BUNDLE_MAGIC: &[u8; 8] = b"GRASMBDL";
 
+
+
 fn main() -> ExitCode {
     // Bundled-executable mode: our own binary carries a program.
     if let Some(bundle) = read_own_bundle() {

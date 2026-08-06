@@ -86,7 +86,7 @@ pub struct Interp<'a, W: Write> {
     task_scopes: Vec<Vec<Block>>,
 }
 
-const MAX_DEPTH: u32 = 2_000;
+const MAX_DEPTH: u32 = 100_000;
 
 impl<'a, W: Write> Interp<'a, W> {
     pub fn new(module: &'a Module, out: &'a mut W) -> Self {

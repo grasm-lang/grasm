@@ -1,0 +1,37 @@
+//! tag: E-RECURSION-DEPTH
+//! expect: output
+//! 10000
+//! 10000
+// Ten thousand nested calls is the guaranteed floor, so it has to work in
+// both engines. The interpreter recurses through its host's stack, and used
+// to exhaust it — aborting with no output — a thousand calls before its own
+// depth guard could report anything.
+fn down(n: i64) -> i64 {
+    if n <= 0 {
+        0
+    } else {
+        down(n - 1) + 1
+    }
+}
+
+/// Mutual recursion counts against the same bound.
+fn ping(n: i64) -> i64 {
+    if n <= 0 {
+        0
+    } else {
+        pong(n - 1) + 1
+    }
+}
+
+fn pong(n: i64) -> i64 {
+    if n <= 0 {
+        0
+    } else {
+        ping(n - 1) + 1
+    }
+}
+
+fn main() {
+    print("{down(10000)}")
+    print("{ping(10000)}")
+}

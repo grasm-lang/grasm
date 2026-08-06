@@ -479,6 +479,13 @@ rather than trapping. `i64::MIN % -1` is `0`, as `x % -1` is for every `x`.
 
 **[E-POW-NEG]** A negative integer exponent panics; use floats.
 
+**[E-RECURSION-DEPTH]** Recursion is bounded. **At least 10,000 nested calls
+are guaranteed to work.** Past an implementation's own bound the program
+panics with a stack-overflow message and exit 101 — it does not abort, crash,
+or corrupt the process. The bound above the guaranteed minimum is
+implementation-defined and differs between the two engines, so a program that
+recurses deeper than 10,000 should not assume it will run everywhere.
+
 **[E-ARITH-FLOAT]** Float arithmetic follows IEEE-754, including infinities and
 NaN. Division by zero yields an infinity rather than panicking.
 
@@ -1797,6 +1804,48 @@ fn main() {
 fn main() {
     let e = 0 - 1
     print("{2 ^ e}")
+}
+```
+
+## `E-RECURSION-DEPTH.gr`
+
+```grasm
+//! tag: E-RECURSION-DEPTH
+//! expect: output
+//! 10000
+//! 10000
+// Ten thousand nested calls is the guaranteed floor, so it has to work in
+// both engines. The interpreter recurses through its host's stack, and used
+// to exhaust it — aborting with no output — a thousand calls before its own
+// depth guard could report anything.
+fn down(n: i64) -> i64 {
+    if n <= 0 {
+        0
+    } else {
+        down(n - 1) + 1
+    }
+}
+
+/// Mutual recursion counts against the same bound.
+fn ping(n: i64) -> i64 {
+    if n <= 0 {
+        0
+    } else {
+        pong(n - 1) + 1
+    }
+}
+
+fn pong(n: i64) -> i64 {
+    if n <= 0 {
+        0
+    } else {
+        ping(n - 1) + 1
+    }
+}
+
+fn main() {
+    print("{down(10000)}")
+    print("{ping(10000)}")
 }
 ```
 

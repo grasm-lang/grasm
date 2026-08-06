@@ -35,6 +35,13 @@ rather than trapping. `i64::MIN % -1` is `0`, as `x % -1` is for every `x`.
 
 **[E-POW-NEG]** A negative integer exponent panics; use floats.
 
+**[E-RECURSION-DEPTH]** Recursion is bounded. **At least 10,000 nested calls
+are guaranteed to work.** Past an implementation's own bound the program
+panics with a stack-overflow message and exit 101 — it does not abort, crash,
+or corrupt the process. The bound above the guaranteed minimum is
+implementation-defined and differs between the two engines, so a program that
+recurses deeper than 10,000 should not assume it will run everywhere.
+
 **[E-ARITH-FLOAT]** Float arithmetic follows IEEE-754, including infinities and
 NaN. Division by zero yields an infinity rather than panicking.
 

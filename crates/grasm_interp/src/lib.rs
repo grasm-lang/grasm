@@ -11,15 +11,23 @@ use grasm_syntax::ast::Module;
 use std::io::Write;
 
 /// Check + run `main`. Returns (exit_code, diagnostics).
-pub fn run_src(
+pub fn run_src<W: Write + Send>(
     src: &str,
-    out: &mut impl Write,
+    out: &mut W,
 ) -> (i32, Vec<grasm_syntax::Diagnostic>) {
     run_src_with_args(src, &[], out)
 }
 
 /// Like `run_src`, with program arguments for the `args()` builtin.
-pub fn run_src_with_args(
+pub fn run_src_with_args<W: Write + Send>(
+    src: &str,
+    program_args: &[String],
+    out: &mut W,
+) -> (i32, Vec<grasm_syntax::Diagnostic>) {
+    on_deep_stack(move || run_src_here(src, program_args, out))
+}
+
+fn run_src_here(
     src: &str,
     program_args: &[String],
     out: &mut impl Write,
@@ -34,13 +42,52 @@ pub fn run_src_with_args(
     (code, vec![])
 }
 
-pub fn run_module(module: &Module, out: &mut impl Write) -> i32 {
-    let mut interp = Interp::new(module, out);
-    interp.run_main()
+
+/// Runs `f` on a thread with a large stack, so the depth guard is what stops
+/// deep recursion rather than the host's stack running out.
+///
+/// This belongs here and not in the CLI. The interpreter recurses through
+/// Rust frames, so *any* embedder — the conformance harness included — hits
+/// the same wall, and an embedder should not have to know to spawn a thread
+/// to get the recursion depth the language promises ([E-RECURSION-DEPTH]).
+///
+/// The stack is reserved, not committed: a program that does not recurse
+/// deeply pays nothing.
+fn on_deep_stack<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    const STACK_BYTES: usize = 512 * 1024 * 1024;
+    std::thread::scope(|scope| {
+        let spawned = std::thread::Builder::new()
+            .stack_size(STACK_BYTES)
+            .spawn_scoped(scope, f);
+        match spawned {
+            Ok(handle) => match handle.join() {
+                Ok(v) => v,
+                Err(payload) => std::panic::resume_unwind(payload),
+            },
+            // No thread available. The closure went with the failed spawn, so
+            // there is nothing left to run inline.
+            Err(e) => panic!("cannot start the interpreter thread: {e}"),
+        }
+    })
+}
+
+pub fn run_module<W: Write + Send>(module: &Module, out: &mut W) -> i32 {
+    on_deep_stack(move || {
+        let mut interp = Interp::new(module, out);
+        interp.run_main()
+    })
 }
 
 /// Run a loaded program, also returning the call stack if it panicked.
-pub fn run_program_traced(
+pub fn run_program_traced<W: Write + Send>(
+    program: &grasm_sema::loader::Program,
+    program_args: &[String],
+    out: &mut W,
+) -> (i32, Vec<Frame>) {
+    on_deep_stack(move || run_program_traced_here(program, program_args, out))
+}
+
+fn run_program_traced_here(
     program: &grasm_sema::loader::Program,
     program_args: &[String],
     out: &mut impl Write,
@@ -58,7 +105,15 @@ pub fn run_program_traced(
 }
 
 /// Run a loaded multi-file program. Assumes it already checked clean.
-pub fn run_program(
+pub fn run_program<W: Write + Send>(
+    program: &grasm_sema::loader::Program,
+    program_args: &[String],
+    out: &mut W,
+) -> i32 {
+    on_deep_stack(move || run_program_here(program, program_args, out))
+}
+
+fn run_program_here(
     program: &grasm_sema::loader::Program,
     program_args: &[String],
     out: &mut impl Write,
@@ -74,9 +129,9 @@ pub fn run_program(
 }
 
 /// Run the entry module's test blocks of a loaded program.
-pub fn test_program(
+pub fn test_program<W: Write + Send>(
     program: &grasm_sema::loader::Program,
-    out: &mut impl Write,
+    out: &mut W,
 ) -> (u32, u32) {
     let summary = test_program_with(program, &testing::TestOptions::default(), out);
     (summary.passed, summary.failed)
@@ -84,7 +139,15 @@ pub fn test_program(
 
 /// Run every `test` declaration in the entry module: unit tests directly,
 /// property tests over generated inputs, with optional line coverage.
-pub fn test_program_with(
+pub fn test_program_with<W: Write + Send>(
+    program: &grasm_sema::loader::Program,
+    opts: &testing::TestOptions,
+    out: &mut W,
+) -> testing::TestSummary {
+    on_deep_stack(move || test_program_here(program, opts, out))
+}
+
+fn test_program_here(
     program: &grasm_sema::loader::Program,
     opts: &testing::TestOptions,
     out: &mut impl Write,
@@ -250,7 +313,15 @@ fn build_coverage(
 }
 
 /// Run every `bench` declaration in the entry module.
-pub fn bench_program(
+pub fn bench_program<W: Write + Send>(
+    program: &grasm_sema::loader::Program,
+    filter: &str,
+    out: &mut W,
+) -> Vec<testing::BenchResult> {
+    on_deep_stack(move || bench_program_here(program, filter, out))
+}
+
+fn bench_program_here(
     program: &grasm_sema::loader::Program,
     filter: &str,
     out: &mut impl Write,

@@ -71,6 +71,7 @@ Specified and tested; the design is still being validated against real
 programs. May change in a minor release, with a changelog entry.
 
 - `E-MINMAX-OPTION` — provisional
+- `E-RECURSION-DEPTH` — provisional
 - `E-PAD-CYCLE` — provisional
 - `E-SEARCH-SHORTCIRCUIT` — provisional
 - `G-ARM-CONTROL` — provisional
