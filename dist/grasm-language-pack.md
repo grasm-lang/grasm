@@ -356,7 +356,12 @@ mutable. **[T-INOUT-EXCLUSIVE]** The same variable may not be passed as
 ## 9. Effects
 
 **[T-EFFECT-DECL]** `effect E { fn op(…) -> T }` declares an effect and, with
-it, a handler struct type `EHandler` whose fields are the operations.
+it, a handler struct type `EHandler` whose fields are the operations. One
+operation per line. Operations take parameters, and a handler closure receives
+them in declaration order; an operation with no `->` returns nothing. A handler
+may be written at `handled_by` or bound to a name first, and its body may
+perform effects of its own — a logger that prints performs `io`, which is the
+usual case rather than an exception.
 
 **[T-EFFECT-ROW]** Every function has an inferred set of effects. A declared
 row `/ {io, E}` is an upper bound: performing an effect outside it is an error.
@@ -2776,13 +2781,47 @@ fn main() {
 //! tag: T-EFFECT-DECL
 //! expect: output
 //! 99
+//! I: starting
+//! W: disk almost full
+//! a=1
+//! b=2
+//! 3
+// Declaring `Cfg` also declares the handler type `CfgHandler`, whose fields
+// are the operations.
 effect Cfg {
     fn value() -> i64
 }
+
+// Operations take parameters, and more than one, and may return nothing.
+// A handler closure receives them in declaration order.
+effect Log {
+    fn info(msg: str)
+    fn warn(msg: str)
+}
+
+effect Kv {
+    fn put(key: str, value: i64)
+    fn size() -> i64
+}
+
 fn main() {
-    // Declaring `Cfg` also declares the handler type `CfgHandler`.
     with Cfg handled_by CfgHandler{ value: || 99 } {
         print("{Cfg.value()}")
+    }
+
+    // A handler body may itself perform effects — here `io` — which is the
+    // shape almost every real handler has and the one worth demonstrating.
+    with Log handled_by LogHandler{ info: |m| print("I: {m}"), warn: |m| print("W: {m}") } {
+        Log.info("starting")
+        Log.warn("disk almost full")
+    }
+
+    // A handler bound to a name first, rather than written at `handled_by`.
+    let store = KvHandler{ put: |k, v| print("{k}={v}"), size: || 3 }
+    with Kv handled_by store {
+        Kv.put("a", 1)
+        Kv.put("b", 2)
+        print("{Kv.size()}")
     }
 }
 ```

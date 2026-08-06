@@ -118,7 +118,12 @@ mutable. **[T-INOUT-EXCLUSIVE]** The same variable may not be passed as
 ## 9. Effects
 
 **[T-EFFECT-DECL]** `effect E { fn op(…) -> T }` declares an effect and, with
-it, a handler struct type `EHandler` whose fields are the operations.
+it, a handler struct type `EHandler` whose fields are the operations. One
+operation per line. Operations take parameters, and a handler closure receives
+them in declaration order; an operation with no `->` returns nothing. A handler
+may be written at `handled_by` or bound to a name first, and its body may
+perform effects of its own — a logger that prints performs `io`, which is the
+usual case rather than an exception.
 
 **[T-EFFECT-ROW]** Every function has an inferred set of effects. A declared
 row `/ {io, E}` is an upper bound: performing an effect outside it is an error.

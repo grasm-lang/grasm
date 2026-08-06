@@ -246,6 +246,9 @@ struct Codegen<'m> {
     handler_sites: HashMap<u32, Vec<(String, FuncId)>>,
     /// Lifted handler bodies to compile after the main functions.
     pending_handlers: Vec<PendingHandler>,
+    /// Handler struct literals bound to a name, so `handled_by store` finds
+    /// the literal this pass has to lift closures out of.
+    handler_lits: HashMap<String, Expr>,
     /// Lifted closure bodies, likewise.
     pending_closures: Vec<PendingClosure>,
     /// Lifted `par_map` bodies, compiled with the scalar-bits ABI.
@@ -335,6 +338,7 @@ impl<'m> Codegen<'m> {
             effects: HashMap::new(),
             handler_sites: HashMap::new(),
             pending_handlers: Vec::new(),
+            handler_lits: HashMap::new(),
             pending_closures: Vec::new(),
             pending_par_maps: Vec::new(),
             par_map_seq: 0,
@@ -1110,9 +1114,41 @@ impl<'m> Codegen<'m> {
 
     fn collect_handlers_block(&mut self, b: &grasm_syntax::ast::Block) -> CResult<()> {
         for st in &b.stmts {
+            // A handler bound to a name before `handled_by` uses it. This pass
+            // lifts each op's closure into its own function, so it needs the
+            // literal itself, not the name standing for it. Statements are
+            // walked in order, so the binding is always recorded first.
+            if let Stmt::Let { name, init, .. } = st {
+                if matches!(init, Expr::StructLit { .. }) {
+                    self.handler_lits.insert(name.name.clone(), init.clone());
+                }
+            }
             self.collect_handlers_stmt(st)?;
         }
         Ok(())
+    }
+
+    /// Whether an expression is a handler struct literal — `EHandler{ .. }`
+    /// for a declared effect `E`.
+    fn is_handler_literal(&self, e: &Expr) -> bool {
+        let Expr::StructLit { name, .. } = e else {
+            return false;
+        };
+        let n = &name.segments[0].name;
+        match n.strip_suffix("Handler") {
+            Some(eff) => self.effects.contains_key(eff),
+            None => false,
+        }
+    }
+
+    /// The struct literal a handler expression stands for, if it is a name
+    /// bound to one.
+    fn handler_literal(&self, handler: &Expr) -> Option<Expr> {
+        match handler {
+            Expr::StructLit { .. } => Some(handler.clone()),
+            Expr::Ident(id) => self.handler_lits.get(&id.name).cloned(),
+            _ => None,
+        }
     }
 
     fn collect_handlers_stmt(&mut self, st: &Stmt) -> CResult<()> {
@@ -1127,8 +1163,12 @@ impl<'m> Codegen<'m> {
                 let Some(ops) = self.effects.get(&ename).cloned() else {
                     return nope(*span, format!("the effect `{ename}`"));
                 };
-                let Expr::StructLit { fields, .. } = handler else {
-                    return nope(handler.span(), "handlers that aren't struct literals");
+                let resolved = self.handler_literal(handler);
+                let Some(Expr::StructLit { fields, .. }) = &resolved else {
+                    return nope(
+                        handler.span(),
+                        "handlers that are neither a struct literal nor a name bound to one",
+                    );
                 };
                 let mut site = Vec::new();
                 for (fname, fexpr) in fields {
@@ -2342,6 +2382,13 @@ impl FnCx<'_, '_> {
             Stmt::Let {
                 name, ty, init, ..
             } => {
+                // A handler bound to a name is consumed by the pass that lifts
+                // its operations into functions, not by this one. There is no
+                // runtime value to produce: `EHandler` is a type the effect
+                // declaration conjures, not a struct anyone can build.
+                if self.cg.is_handler_literal(init) {
+                    return Ok(StmtOut::Value(None));
+                }
                 // An annotation gives empty collection literals their type.
                 let expected = match ty {
                     Some(te) => Some(self.cg.vtype_of(te)?),

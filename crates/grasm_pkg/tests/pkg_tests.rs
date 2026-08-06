@@ -9,15 +9,21 @@ use grasm_pkg::{Manifest, MANIFEST_NAME};
 /// A scratch workspace that cleans itself up.
 struct Workspace(PathBuf);
 
+/// Distinguishes concurrent workspaces without depending on the clock.
+static WORKSPACE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl Workspace {
     fn new(tag: &str) -> Workspace {
+        // The name used to be process id + nanoseconds + a hand-written tag,
+        // and two tests were given the same tag. Tests run concurrently, so
+        // when their timestamps landed in the same bucket they shared a
+        // directory — and one finishing deleted the other's files underneath
+        // it. That failed roughly one run in fifty, which is the worst
+        // frequency for a gate to fail at. A counter cannot collide.
+        let n = WORKSPACE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "grasm_pkg_test_{}_{}_{tag}",
+            "grasm_pkg_test_{}_{n}_{tag}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0)
         ));
         std::fs::create_dir_all(&dir).unwrap();
         Workspace(dir)
