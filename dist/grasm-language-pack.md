@@ -471,7 +471,9 @@ evaluate left to right before the call.
 
 ## 3. Arithmetic
 
-**[E-ARITH-INT]** `+ - *` on `i64` wrap on overflow (two's complement).
+**[E-ARITH-INT]** `+ - *` on `i64` wrap on overflow (two's complement), and
+so does `/`: `i64::MIN / -1` has no representable result and yields `i64::MIN`
+rather than trapping. `i64::MIN % -1` is `0`, as `x % -1` is for every `x`.
 
 **[E-DIV-ZERO]** Integer `/` or `%` by zero panics.
 
@@ -1232,11 +1234,25 @@ fn main() {
 //! expect: output
 //! 14
 //! -9223372036854775808
+//! -9223372036854775808
+//! 0
+//! 7 0 -7
 fn main() {
     print("{2 + 3 * 4}")
     // Wrapping on overflow, two's complement.
     var max = 9223372036854775807
     print("{max + 1}")
+
+    // `i64::MIN / -1` has no i64 result, so it wraps like any other overflow
+    // rather than trapping. The hardware divide instruction does trap on it,
+    // which is why this is worth a program: the native backend has to avoid
+    // handing the CPU that operand pair.
+    var min = -9223372036854775807
+    min = min - 1
+    print("{min / -1}")
+    print("{min % -1}")
+
+    print("{-7 / -1} {-7 % -1} {7 / -1}")
 }
 ```
 

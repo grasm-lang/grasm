@@ -1735,17 +1735,22 @@ impl<'a, W: Write> Interp<'a, W> {
                     Add => Value::Int(a.wrapping_add(b)),
                     Sub => Value::Int(a.wrapping_sub(b)),
                     Mul => Value::Int(a.wrapping_mul(b)),
+                    // `i64::MIN / -1` has no i64 result, so it wraps like
+                    // every other overflow ([E-ARITH-INT]) rather than
+                    // panicking. Plain `/` raised a *Rust* panic there —
+                    // a host-level abort that an embedder cannot catch and
+                    // that says nothing a Grasm programmer can act on.
                     Div => {
                         if b == 0 {
                             return Err(Flow::Panic("division by zero".into()));
                         }
-                        Value::Int(a / b)
+                        Value::Int(a.wrapping_div(b))
                     }
                     Rem => {
                         if b == 0 {
                             return Err(Flow::Panic("remainder by zero".into()));
                         }
-                        Value::Int(a % b)
+                        Value::Int(a.wrapping_rem(b))
                     }
                     Pow => {
                         if b < 0 {

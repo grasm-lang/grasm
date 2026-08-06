@@ -3925,13 +3925,31 @@ impl FnCx<'_, '_> {
             (VType::I64, Add) => (self.b.ins().iadd(lv, rv), VType::I64),
             (VType::I64, Sub) => (self.b.ins().isub(lv, rv), VType::I64),
             (VType::I64, Mul) => (self.b.ins().imul(lv, rv), VType::I64),
+            // `i64::MIN / -1` overflows, and the hardware divide instruction
+            // traps on it rather than wrapping — the process died with SIGFPE
+            // and no message. Substituting 1 for a -1 divisor avoids the trap;
+            // the true result is then the negation, which wraps like every
+            // other overflow ([E-ARITH-INT]). Three extra instructions on an
+            // operation already tens of cycles deep.
             (VType::I64, Div) => {
                 self.guard_zero(rv, "grasm_panic_div_zero");
-                (self.b.ins().sdiv(lv, rv), VType::I64)
+                let minus_one = self.b.ins().iconst(types::I64, -1);
+                let is_neg1 = self.b.ins().icmp(IntCC::Equal, rv, minus_one);
+                let one = self.b.ins().iconst(types::I64, 1);
+                let safe = self.b.ins().select(is_neg1, one, rv);
+                let quotient = self.b.ins().sdiv(lv, safe);
+                let negated = self.b.ins().ineg(lv);
+                (self.b.ins().select(is_neg1, negated, quotient), VType::I64)
             }
+            // `x % -1` is 0 for every x, and `x % 1` is 0 too, so the same
+            // substitution gives the right answer with no fixup.
             (VType::I64, Rem) => {
                 self.guard_zero(rv, "grasm_panic_rem_zero");
-                (self.b.ins().srem(lv, rv), VType::I64)
+                let minus_one = self.b.ins().iconst(types::I64, -1);
+                let is_neg1 = self.b.ins().icmp(IntCC::Equal, rv, minus_one);
+                let one = self.b.ins().iconst(types::I64, 1);
+                let safe = self.b.ins().select(is_neg1, one, rv);
+                (self.b.ins().srem(lv, safe), VType::I64)
             }
             (VType::I64, Pow) => (
                 self.call_rt("grasm_pow_i64", &[lv, rv]).unwrap(),
