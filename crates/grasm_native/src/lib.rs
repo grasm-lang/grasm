@@ -381,6 +381,7 @@ impl<'m> Codegen<'m> {
             ("grasm_panic_msg", vec![ptr, i64t], None),
             ("grasm_pow_i64", vec![i64t, i64t], Some(i64t)),
             ("grasm_pow_f64", vec![f64t, f64t], Some(f64t)),
+            ("grasm_f64_rem", vec![f64t, f64t], Some(f64t)),
             ("grasm_val_inc", vec![i64t], None),
             ("grasm_val_dec", vec![i64t], None),
             ("grasm_str_lit", vec![ptr, i64t], Some(i64t)),
@@ -2438,6 +2439,28 @@ impl FnCx<'_, '_> {
 
     fn eval_stmt(&mut self, s: &Stmt, is_last: bool) -> CResult<StmtOut> {
         match s {
+            // `let (a, b) = pair` — the tuple is a list underneath, so each
+            // name is bound to one element read out of it.
+            Stmt::LetTuple {
+                names, init, span, ..
+            } => {
+                let (tv, tt) = self.eval_expr_val(init)?;
+                let VType::Tuple(part_ts) = tt else {
+                    return nope(*span, "destructuring a non-tuple");
+                };
+                if part_ts.len() != names.len() {
+                    return nope(*span, "a tuple destructured into a different number of names");
+                }
+                for (i, (n, pt)) in names.iter().zip(&part_ts).enumerate() {
+                    let idx = self.b.ins().iconst(types::I64, i as i64);
+                    let (v, vt) = self.list_get_elem(tv, idx, pt)?;
+                    let var = self.new_var(&vt);
+                    self.b.def_var(var, v);
+                    self.bind(&n.name, var, vt);
+                }
+                self.dec_if_boxed(tv, &VType::Tuple(part_ts));
+                Ok(StmtOut::Value(None))
+            }
             Stmt::Let {
                 name, ty, init, ..
             } => {
@@ -4206,6 +4229,11 @@ impl FnCx<'_, '_> {
             (VType::F64, Sub) => (self.b.ins().fsub(lv, rv), VType::F64),
             (VType::F64, Mul) => (self.b.ins().fmul(lv, rv), VType::F64),
             (VType::F64, Div) => (self.b.ins().fdiv(lv, rv), VType::F64),
+            // Cranelift has no floating remainder instruction.
+            (VType::F64, Rem) => (
+                self.call_rt("grasm_f64_rem", &[lv, rv]).unwrap(),
+                VType::F64,
+            ),
             (VType::F64, Pow) => (
                 self.call_rt("grasm_pow_f64", &[lv, rv]).unwrap(),
                 VType::F64,

@@ -1,0 +1,37 @@
+//! tag: T-RECURSIVE
+//! expect: output
+//! 6
+//! 3
+// A type referring to itself, which is the first thing a parser needs and
+// which the type section did not mention. Through a list, through a map, and
+// through a plain field.
+type Tree =
+    | Leaf(n: i64)
+    | Node(kids: [Tree])
+
+type Doc =
+    | Text(s: str)
+    | Obj(fields: Map[str, Doc])
+
+fn total(t: Tree) -> i64 {
+    match t {
+        Leaf(n) -> n
+        Node(kids) -> kids.fold(0, |acc, k| acc + total(k))
+    }
+}
+
+fn depth(d: Doc) -> i64 {
+    match d {
+        Text(_s) -> 1
+        Obj(fields) -> 1 + fields.values().fold(0, |acc, v| acc.max(depth(v)))
+    }
+}
+
+fn main() {
+    print("{total(Node([Leaf(1), Node([Leaf(2), Leaf(3)])]))}")
+    var inner = map()
+    inner.set("a", Text("x"))
+    var mid = map()
+    mid.set("b", Obj(inner))
+    print("{depth(Obj(mid))}")
+}

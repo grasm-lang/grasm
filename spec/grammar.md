@@ -122,7 +122,9 @@ so existing code that uses `bench` as a name keeps working.
 ## 7. Types
 
 ```
-type       = named_type | list_type | tuple_type | union_type
+type       = named_type | list_type | tuple_type | union_type | fn_type
+fn_type    = "fn" "(" ( type ( "," type )* )? ")" ( "->" type )? effect_row?
+effect_row = "/" "{" ( path ( "," path )* )? "}"
 named_type = path type_args?
 type_args  = "[" type ( "," type )* "]"
 list_type  = "[" type "]"
@@ -140,7 +142,15 @@ statement = let_stmt | assign_stmt | expr_stmt | return_stmt
           | break_stmt | continue_stmt | while_stmt | for_stmt
           | with_stmt | parallel_stmt | spawn_stmt
 
-let_stmt      = ( "let" | "var" ) identifier ( ":" type )? "=" expression
+let_stmt      = ( "let" | "var" ) ( identifier ( ":" type )? | tuple_names ) "=" expression
+tuple_names   = "(" identifier ( "," identifier )* ")"
+```
+
+**[G-LET-TUPLE]** `let (a, b) = pair` binds a tuple's components by name. The
+count must match the tuple's arity. This is the only destructuring form: there
+is no `if let`, and patterns elsewhere appear only in `match`.
+
+```
 assign_stmt   = place ( "=" | "+=" | "-=" | "*=" | "/=" ) expression
 return_stmt   = "return" expression?
 break_stmt    = "break"

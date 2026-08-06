@@ -462,6 +462,27 @@ impl<'a, W: Write> Interp<'a, W> {
 
     fn eval_stmt_inner(&mut self, s: &Stmt) -> EResult {
         match s {
+            Stmt::LetTuple { names, init, span, .. } => {
+                let v = self.eval_expr(init)?;
+                let Value::Tuple(items) = &v else {
+                    return Err(Flow::Panic("destructuring a non-tuple".into()));
+                };
+                if items.len() != names.len() {
+                    let _ = span;
+                    return Err(Flow::Panic(format!(
+                        "this tuple has {} component(s) but {} name(s) were given",
+                        items.len(),
+                        names.len()
+                    )));
+                }
+                for (n, item) in names.iter().zip(items.iter()) {
+                    self.scopes
+                        .last_mut()
+                        .unwrap()
+                        .insert(n.name.clone(), item.clone());
+                }
+                Ok(Value::Unit)
+            }
             Stmt::Let {
                 name, ty, init, ..
             } => {

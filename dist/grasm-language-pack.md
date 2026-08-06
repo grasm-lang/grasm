@@ -137,7 +137,9 @@ so existing code that uses `bench` as a name keeps working.
 ## 7. Types
 
 ```
-type       = named_type | list_type | tuple_type | union_type
+type       = named_type | list_type | tuple_type | union_type | fn_type
+fn_type    = "fn" "(" ( type ( "," type )* )? ")" ( "->" type )? effect_row?
+effect_row = "/" "{" ( path ( "," path )* )? "}"
 named_type = path type_args?
 type_args  = "[" type ( "," type )* "]"
 list_type  = "[" type "]"
@@ -155,7 +157,15 @@ statement = let_stmt | assign_stmt | expr_stmt | return_stmt
           | break_stmt | continue_stmt | while_stmt | for_stmt
           | with_stmt | parallel_stmt | spawn_stmt
 
-let_stmt      = ( "let" | "var" ) identifier ( ":" type )? "=" expression
+let_stmt      = ( "let" | "var" ) ( identifier ( ":" type )? | tuple_names ) "=" expression
+tuple_names   = "(" identifier ( "," identifier )* ")"
+```
+
+**[G-LET-TUPLE]** `let (a, b) = pair` binds a tuple's components by name. The
+count must match the tuple's arity. This is the only destructuring form: there
+is no `if let`, and patterns elsewhere appear only in `match`.
+
+```
 assign_stmt   = place ( "=" | "+=" | "-=" | "*=" | "/=" ) expression
 return_stmt   = "return" expression?
 break_stmt    = "break"
@@ -266,6 +276,11 @@ fields are accessed with `.`.
 
 **[T-SUM]** `type S = | A(f: T) | B` declares a named sum type; values are
 built with variant constructors and consumed with `match`.
+
+**[T-RECURSIVE]** A type may refer to itself, directly or through a
+collection: `type Json = | JArr(items: [Json]) | JObj(fields: Map[str, Json])`
+is the shape a parser needs and is legal. Recursion through a field of the
+same type is legal too, since every composite is a reference underneath.
 
 **[T-OPTION]** `Option[T]` is the prelude sum type `| Some(v: T) | None`.
 
@@ -941,6 +956,19 @@ fn main() {
 
 `match` must be exhaustive. Adding a variant to `Shape` turns every incomplete
 match into a compile error rather than a surprise at runtime.
+
+A tuple can be split into names:
+
+```
+fn main() {
+    let (a, b) = (1, "two")
+    print("{a} {b}")
+}
+```
+
+That is the only destructuring form — there is no `if let`, and patterns
+elsewhere appear only in `match`. It matters most with maps, where
+`entries()` hands back pairs.
 
 Maps iterate in sorted key order, so printing one is deterministic:
 
@@ -2267,6 +2295,42 @@ fn double(b: Box) -> i64 {
     b.n * 2
 }
 type Box = { n: i64 }
+```
+
+## `G-LET-TUPLE.gr`
+
+```grasm
+//! tag: G-LET-TUPLE
+//! expect: output
+//! 1 two
+//! fig=1
+//! pear=2
+//! 3
+//! 30
+// Binding a tuple's components by name.
+//
+// `m.entries()` hands back `[(K, V)]` and splitting it used to cost a whole
+// `match` arm — a type system charging rent rather than paying for itself.
+fn main() {
+    let (a, b) = (1, "two")
+    print("{a} {b}")
+
+    var m = map()
+    m.set("pear", 2)
+    m.set("fig", 1)
+    var total = 0
+    for e in m.entries() {
+        let (k, v) = e
+        print("{k}={v}")
+        total = total + v
+    }
+    print("{total}")
+
+    // `var` binds them mutably.
+    var (p, q) = (10, 20)
+    p = p + q
+    print("{p}")
+}
 ```
 
 ## `G-NEST-LIMIT.gr`
@@ -3598,6 +3662,48 @@ fn main() {
     let b: bool = true
     let s: str = "text"
     print("{i} {f} {b} {s}")
+}
+```
+
+## `T-RECURSIVE.gr`
+
+```grasm
+//! tag: T-RECURSIVE
+//! expect: output
+//! 6
+//! 3
+// A type referring to itself, which is the first thing a parser needs and
+// which the type section did not mention. Through a list, through a map, and
+// through a plain field.
+type Tree =
+    | Leaf(n: i64)
+    | Node(kids: [Tree])
+
+type Doc =
+    | Text(s: str)
+    | Obj(fields: Map[str, Doc])
+
+fn total(t: Tree) -> i64 {
+    match t {
+        Leaf(n) -> n
+        Node(kids) -> kids.fold(0, |acc, k| acc + total(k))
+    }
+}
+
+fn depth(d: Doc) -> i64 {
+    match d {
+        Text(_s) -> 1
+        Obj(fields) -> 1 + fields.values().fold(0, |acc, v| acc.max(depth(v)))
+    }
+}
+
+fn main() {
+    print("{total(Node([Leaf(1), Node([Leaf(2), Leaf(3)])]))}")
+    var inner = map()
+    inner.set("a", Text("x"))
+    var mid = map()
+    mid.set("b", Obj(inner))
+    print("{depth(Obj(mid))}")
 }
 ```
 

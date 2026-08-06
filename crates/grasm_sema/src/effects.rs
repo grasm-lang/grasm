@@ -873,7 +873,9 @@ fn walk_stmt(
     out: &mut BTreeSet<String>,
 ) {
     match s {
-        Stmt::Let { init, .. } => walk_expr(init, current, active, ctx, fnb, out),
+        Stmt::Let { init, .. } | Stmt::LetTuple { init, .. } => {
+            walk_expr(init, current, active, ctx, fnb, out)
+        }
         Stmt::Assign { target, value, .. } => {
             walk_expr(target, current, active, ctx, fnb, out);
             walk_expr(value, current, active, ctx, fnb, out);

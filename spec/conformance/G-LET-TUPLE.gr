@@ -1,0 +1,31 @@
+//! tag: G-LET-TUPLE
+//! expect: output
+//! 1 two
+//! fig=1
+//! pear=2
+//! 3
+//! 30
+// Binding a tuple's components by name.
+//
+// `m.entries()` hands back `[(K, V)]` and splitting it used to cost a whole
+// `match` arm — a type system charging rent rather than paying for itself.
+fn main() {
+    let (a, b) = (1, "two")
+    print("{a} {b}")
+
+    var m = map()
+    m.set("pear", 2)
+    m.set("fig", 1)
+    var total = 0
+    for e in m.entries() {
+        let (k, v) = e
+        print("{k}={v}")
+        total = total + v
+    }
+    print("{total}")
+
+    // `var` binds them mutably.
+    var (p, q) = (10, 20)
+    p = p + q
+    print("{p}")
+}

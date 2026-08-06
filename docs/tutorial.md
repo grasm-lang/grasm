@@ -94,6 +94,19 @@ fn main() {
 `match` must be exhaustive. Adding a variant to `Shape` turns every incomplete
 match into a compile error rather than a surprise at runtime.
 
+A tuple can be split into names:
+
+```
+fn main() {
+    let (a, b) = (1, "two")
+    print("{a} {b}")
+}
+```
+
+That is the only destructuring form — there is no `if let`, and patterns
+elsewhere appear only in `match`. It matters most with maps, where
+`entries()` hands back pairs.
+
 Maps iterate in sorted key order, so printing one is deterministic:
 
 ```

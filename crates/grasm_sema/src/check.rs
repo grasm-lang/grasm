@@ -585,6 +585,36 @@ impl Checker {
 
     fn check_stmt(&mut self, s: &Stmt) -> Type {
         match s {
+            // `let (a, b) = pair`. The initializer is unified with a tuple of
+            // fresh variables, so each name gets its component's type.
+            Stmt::LetTuple {
+                mutable,
+                names,
+                init,
+                span,
+            } => {
+                let parts: Vec<Type> = names.iter().map(|_| self.uni.fresh()).collect();
+                let want = Type::Tuple(parts.clone());
+                self.check_expr(init, &want);
+                let got = self.uni.resolve(&want);
+                if let Type::Tuple(actual) = &got {
+                    if actual.len() != names.len() {
+                        self.error(
+                            *span,
+                            format!(
+                                "this tuple has {} component(s) but {} name(s) were given",
+                                actual.len(),
+                                names.len()
+                            ),
+                        );
+                    }
+                }
+                for (n, t) in names.iter().zip(&parts) {
+                    let t = self.uni.resolve(t);
+                    self.bind(n, t, *mutable);
+                }
+                Type::Unit
+            }
             Stmt::Let {
                 mutable,
                 name,
@@ -2614,6 +2644,7 @@ fn place_root(e: &Expr) -> Option<&Ident> {
 fn stmt_span(s: &Stmt) -> Span {
     match s {
         Stmt::Let { span, .. }
+        | Stmt::LetTuple { span, .. }
         | Stmt::Assign { span, .. }
         | Stmt::Return(_, span)
         | Stmt::Break(span)

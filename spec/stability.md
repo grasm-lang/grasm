@@ -7,7 +7,7 @@ before it is listed as stable.
 `crates/grasm_spec` fails if a clause here is missing, unknown, or listed twice,
 so this file cannot drift away from the specification it describes.
 
-Today: 91 stable, 20 provisional, 16 experimental, of 127.
+Today: 93 stable, 21 provisional, 16 experimental, of 130.
 
 ## Stable
 
@@ -71,8 +71,8 @@ Will not change incompatibly before 2.0.
 - `L-STRING` — stable
 - `L-WHITESPACE` — stable
 - `T-ARM-TYPES` — stable
-- `T-COPY` — stable
 - `T-CAPTURE-WRITE` — stable
+- `T-COPY` — stable
 - `T-EMPTY-LIT` — stable
 - `T-ERR-SUBSET` — stable
 - `T-FAIL` — stable
@@ -99,6 +99,7 @@ Will not change incompatibly before 2.0.
 - `T-PARAM-LET` — stable
 - `T-PARAM-OWN` — stable
 - `T-PRIM` — stable
+- `T-RECURSIVE` — stable
 - `T-STRUCT` — stable
 - `T-SUM` — stable
 - `T-TRY` — stable
@@ -118,6 +119,7 @@ implementation admits are unfinished, and the rest were written too recently
 for "no problem found" to mean anything.
 
 - `E-RECURSION-DEPTH` — provisional
+- `G-LET-TUPLE` — provisional
 - `G-NEST-LIMIT` — provisional
 - `L-DISPLAY` — provisional
 - `L-LIB-FREE` — provisional

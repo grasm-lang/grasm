@@ -866,6 +866,31 @@ impl Parser {
             TokenKind::KwLet | TokenKind::KwVar => {
                 let mutable = matches!(self.cur(), TokenKind::KwVar);
                 self.bump();
+                // `let (a, b) = pair` binds a tuple's components by name.
+                if self.at(&TokenKind::LParen) {
+                    self.bump();
+                    let mut names = Vec::new();
+                    loop {
+                        if self.at(&TokenKind::RParen) {
+                            break;
+                        }
+                        names.push(self.ident()?);
+                        if !self.eat(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                    self.expect(&TokenKind::RParen)?;
+                    self.expect(&TokenKind::Eq)?;
+                    self.skip_newlines_if_continuation();
+                    let init = self.parse_expr()?;
+                    let span = start.merge(init.span());
+                    return Ok(Stmt::LetTuple {
+                        mutable,
+                        names,
+                        init,
+                        span,
+                    });
+                }
                 let name = self.ident()?;
                 let ty = if self.eat(&TokenKind::Colon) {
                     Some(self.parse_type()?)
@@ -1754,6 +1779,7 @@ impl Parser {
 pub(crate) fn stmt_span_of(s: &Stmt) -> Span {
     match s {
         Stmt::Let { span, .. }
+        | Stmt::LetTuple { span, .. }
         | Stmt::Assign { span, .. }
         | Stmt::Return(_, span)
         | Stmt::Break(span)

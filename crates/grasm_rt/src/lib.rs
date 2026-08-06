@@ -124,6 +124,14 @@ pub extern "C" fn grasm_pow_f64(base: f64, exp: f64) -> f64 {
     base.powf(exp)
 }
 
+/// Floating remainder. Cranelift has no instruction for it, so the backend
+/// calls this rather than leaving `%` on `f64` unsupported while the
+/// interpreter accepted it.
+#[no_mangle]
+pub extern "C" fn grasm_f64_rem(a: f64, b: f64) -> f64 {
+    a % b
+}
+
 // ---------------------------------------------------------------------------
 // Boxed values (N2): refcounted str/list with copy-on-write semantics.
 // Codegen passes these as opaque pointers (`i64`-sized).

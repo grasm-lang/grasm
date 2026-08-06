@@ -250,6 +250,18 @@ pub enum Stmt {
         init: Expr,
         span: Span,
     },
+    /// `let (a, b) = pair` — destructuring a tuple into names.
+    ///
+    /// A separate statement rather than a pattern on `Let`, because a pattern
+    /// there would be a much larger change for the one shape people actually
+    /// reach for: `m.entries()` hands back `[(K, V)]` and splitting it used to
+    /// cost a whole `match`.
+    LetTuple {
+        mutable: bool,
+        names: Vec<Ident>,
+        init: Expr,
+        span: Span,
+    },
     Assign {
         target: Expr,
         op: AssignOp,

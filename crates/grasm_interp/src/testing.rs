@@ -674,6 +674,7 @@ pub(crate) fn stmt_span(s: &grasm_syntax::ast::Stmt) -> grasm_syntax::span::Span
     use grasm_syntax::ast::Stmt;
     match s {
         Stmt::Let { span, .. }
+        | Stmt::LetTuple { span, .. }
         | Stmt::Assign { span, .. }
         | Stmt::Return(_, span)
         | Stmt::Break(span)

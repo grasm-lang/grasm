@@ -29,6 +29,11 @@ fields are accessed with `.`.
 **[T-SUM]** `type S = | A(f: T) | B` declares a named sum type; values are
 built with variant constructors and consumed with `match`.
 
+**[T-RECURSIVE]** A type may refer to itself, directly or through a
+collection: `type Json = | JArr(items: [Json]) | JObj(fields: Map[str, Json])`
+is the shape a parser needs and is legal. Recursion through a field of the
+same type is legal too, since every composite is a reference underneath.
+
 **[T-OPTION]** `Option[T]` is the prelude sum type `| Some(v: T) | None`.
 
 **[T-NO-NULL]** There is no null value. Absence is represented by
