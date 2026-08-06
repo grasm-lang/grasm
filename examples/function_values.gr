@@ -64,4 +64,20 @@ fn main() {
 
     let totals = [1, 2, 3]
     print("{run_pipeline(0, totals)}")
+
+    // A named function passed to a combinator, which is the way most people
+    // reach for first. The backend used to require a closure written at the
+    // call site and refuse this, so `xs.map(square)` compiled only under the
+    // interpreter.
+    let ns = [1, 2, 3, 4, 5]
+    print("{ns.map(square)}")
+    print("{ns.filter(is_even)}")
+    print("{ns.any(is_even)} {ns.all(is_even)}")
+    print("{ns.find(is_even) ?? -1}")
+    print("{ns.par_map(square)}")
+    print("{ns.par_filter(is_even)}")
+}
+
+fn is_even(n: i64) -> bool {
+    n % 2 == 0
 }

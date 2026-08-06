@@ -3579,6 +3579,11 @@ impl FnCx<'_, '_> {
             }
             (VType::List(e), "any" | "all" | "find") => {
                 let elem_t = (**e).clone();
+                if let Some((param, body)) = self.desugar_fn_arg(&args[0]) {
+                    return self
+                        .emit_list_search(rv, &elem_t, &param, &body, m)
+                        .map(Some);
+                }
                 let Expr::Closure {
                     params: cparams,
                     body: cbody,
@@ -3594,6 +3599,11 @@ impl FnCx<'_, '_> {
             }
             (VType::List(e), "par_filter") => {
                 let elem_t = (**e).clone();
+                if let Some((param, body)) = self.desugar_fn_arg(&args[0]) {
+                    return self
+                        .emit_par_filter(rv, &elem_t, &param, &body, span)
+                        .map(Some);
+                }
                 let Expr::Closure {
                     params: cparams,
                     body: cbody,
@@ -3609,6 +3619,9 @@ impl FnCx<'_, '_> {
             }
             (VType::List(e), "par_map") => {
                 let elem_t = (**e).clone();
+                if let Some((param, body)) = self.desugar_fn_arg(&args[0]) {
+                    return self.emit_par_map(rv, &elem_t, &param, &body, span).map(Some);
+                }
                 let Expr::Closure {
                     params: cparams,
                     body: cbody,
@@ -3624,6 +3637,12 @@ impl FnCx<'_, '_> {
             }
             (VType::List(e), "map" | "filter") => {
                 let elem_t = (**e).clone();
+                if let Some((param, body)) = self.desugar_fn_arg(&args[0]) {
+                    let is_map = m == "map";
+                    return self
+                        .emit_list_transform(rv, &elem_t, &param, &body, is_map)
+                        .map(Some);
+                }
                 let Expr::Closure {
                     params: cparams,
                     body: cbody,
@@ -5453,6 +5472,34 @@ impl FnCx<'_, '_> {
 
     /// Lowers `xs.par_map(|x| body)` onto real threads.
     ///
+    /// `xs.par_map(f)` as `xs.par_map(|x| f(x))`.
+    ///
+    /// The parallel lowering needs a body to compile into the worker, and a
+    /// bare function name is not one. Rather than teach the lowering a second
+    /// shape, the call is desugared into the shape it already handles — which
+    /// is also exactly what the effect checker treats the two spellings as.
+    ///
+    /// Returns `None` when the argument is already a closure, or is neither.
+    fn desugar_fn_arg(&self, arg: &Expr) -> Option<(Ident, Expr)> {
+        let Expr::Ident(id) = arg else {
+            return None;
+        };
+        // Only a real function, not a local holding one: a local would need
+        // an indirect call, which the worker cannot make.
+        self.lookup_fn(&id.name)?;
+        let span = id.span;
+        let param = Ident {
+            name: "__par_arg".to_string(),
+            span,
+        };
+        let call = Expr::Call {
+            callee: Box::new(Expr::Ident(id.clone())),
+            args: vec![Expr::Ident(param.clone())],
+            span,
+        };
+        Some((param, call))
+    }
+
     /// Safe to run on several cores because two separate things hold: the
     /// checker has proved the function effect-free, so there is no observable
     /// interleaving; and both the elements and the captured values are
