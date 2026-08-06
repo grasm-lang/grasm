@@ -54,4 +54,11 @@ fn main() {
 
     // Nested one level down, so the probe has to recurse.
     print("{[[[5, 6].sum(), [7, 8].sum()].max() ?? 0]}")
+
+    // An empty literal as a `??` fallback: the type comes from the Option's
+    // payload, which is the only place it can come from.
+    var lists = map()
+    lists.set("k", [1, 2])
+    print("{lists.get("k") ?? []}")
+    print("{lists.get("absent") ?? []}")
 }

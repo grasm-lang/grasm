@@ -4603,7 +4603,10 @@ impl FnCx<'_, '_> {
 
         self.goto_block(none_blk);
         self.call_rt("grasm_val_dec", &[lv]);
-        let (mut rv, rvt) = self.eval_expr_val(rhs)?;
+        // The fallback is evaluated against the Option's payload type, so an
+        // empty collection literal — `m.get(k) ?? []`, the natural way to
+        // write a default — has the annotation it needs.
+        let (mut rv, rvt) = self.eval_expr_expecting(rhs, Some(&out_t))?;
         if out_t == VType::F64 && rvt == VType::I64 {
             rv = self.b.ins().fcvt_from_sint(types::F64, rv);
         }
