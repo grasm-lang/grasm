@@ -746,10 +746,11 @@ impl Checker {
                     let t = self.infer_expr(init);
                     let resolved = self.uni.shallow_resolve(&t);
                     if let Type::Fallible(..) = resolved {
+                        let shown = self.show(&resolved);
                         self.error_help(
                             init.span(),
                             "this expression can fail — its error must be handled",
-                            "use `try` to propagate it or `match` to handle both cases",
+                            format!("use `try` to propagate it, `match` to handle both cases, or annotate the binding `: {shown}` to hold it as a value"),
                         );
                     }
                     t

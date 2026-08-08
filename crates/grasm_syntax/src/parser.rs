@@ -458,7 +458,7 @@ impl Parser {
             };
             let name = self.ident()?;
             self.expect(&TokenKind::Colon)?;
-            let ty = self.parse_type()?;
+            let ty = self.parse_type_nested()?;
             let span = start.merge(ty.span());
             params.push(Param {
                 mode,
@@ -543,7 +543,7 @@ impl Parser {
                         }
                         let fname = self.ident()?;
                         self.expect(&TokenKind::Colon)?;
-                        let fty = self.parse_type()?;
+                        let fty = self.parse_type_nested()?;
                         let fspan = fname.span.merge(fty.span());
                         fields.push(FieldDef {
                             name: fname,
@@ -573,7 +573,7 @@ impl Parser {
             let end = self.toks[self.i - 1].span;
             (TypeBody::Sum(variants), end)
         } else {
-            let ty = self.parse_type()?;
+            let ty = self.parse_type_nested()?;
             let end = ty.span();
             (TypeBody::Alias(ty), end)
         };
@@ -597,7 +597,7 @@ impl Parser {
             }
             let name = self.ident()?;
             self.expect(&TokenKind::Colon)?;
-            let ty = self.parse_type()?;
+            let ty = self.parse_type_nested()?;
             let span = name.span.merge(ty.span());
             fields.push(FieldDef { name, ty, span });
             let had_sep = self.eat(&TokenKind::Comma);
@@ -726,7 +726,9 @@ impl Parser {
 
     /// A type in a nested position, where `T ! E` is unambiguous.
     ///
-    /// Not at a function's return type: there the `! E` belongs to the
+    /// Everywhere a type is written *inside* something else: a parameter, a
+    /// field, a type argument, a tuple member, a `let` annotation. Not at a
+    /// function declaration's return type — there the `! E` belongs to the
     /// declaration, alongside the effect row, and is parsed there.
     fn parse_type_nested(&mut self) -> PResult<TypeExpr> {
         let inner = self.parse_type()?;
@@ -752,7 +754,7 @@ impl Parser {
                         if self.at(&TokenKind::RBracket) {
                             break;
                         }
-                        args.push(self.parse_type()?);
+                        args.push(self.parse_type_nested()?);
                         if !self.eat(&TokenKind::Comma) {
                             break;
                         }
@@ -772,7 +774,7 @@ impl Parser {
                     if self.at(&TokenKind::RParen) {
                         break;
                     }
-                    params.push(self.parse_type()?);
+                    params.push(self.parse_type_nested()?);
                     if !self.eat(&TokenKind::Comma) {
                         break;
                     }
@@ -780,7 +782,7 @@ impl Parser {
                 let rp = self.expect(&TokenKind::RParen)?;
                 let mut span = start.merge(rp.span);
                 let ret = if self.eat(&TokenKind::Arrow) {
-                    let t = self.parse_type()?;
+                    let t = self.parse_type_nested()?;
                     span = span.merge(t.span());
                     Box::new(t)
                 } else {
@@ -822,11 +824,11 @@ impl Parser {
                     let rp = self.bump();
                     return Ok(TypeExpr::Tuple(Vec::new(), start.merge(rp.span)));
                 }
-                let first = self.parse_type()?;
+                let first = self.parse_type_nested()?;
                 if self.at(&TokenKind::Pipe) {
                     let mut members = vec![first];
                     while self.eat(&TokenKind::Pipe) {
-                        members.push(self.parse_type()?);
+                        members.push(self.parse_type_nested()?);
                     }
                     let rp = self.expect(&TokenKind::RParen)?;
                     Ok(TypeExpr::Union(members, start.merge(rp.span)))
@@ -836,7 +838,7 @@ impl Parser {
                         if self.at(&TokenKind::RParen) {
                             break;
                         }
-                        members.push(self.parse_type()?);
+                        members.push(self.parse_type_nested()?);
                     }
                     let rp = self.expect(&TokenKind::RParen)?;
                     Ok(TypeExpr::Tuple(members, start.merge(rp.span)))
@@ -950,7 +952,7 @@ impl Parser {
                 }
                 let name = self.ident()?;
                 let ty = if self.eat(&TokenKind::Colon) {
-                    Some(self.parse_type()?)
+                    Some(self.parse_type_nested()?)
                 } else {
                     None
                 };

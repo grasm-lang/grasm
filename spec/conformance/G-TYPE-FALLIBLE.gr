@@ -1,5 +1,9 @@
 //! tag: G-TYPE-FALLIBLE
 //! expect: output
+//! held=5
+//! b!bad x
+//! p=7
+//! k=9
 //! 3 42
 //! ok 1
 //! err bad x
@@ -23,7 +27,28 @@ fn total(rs: [i64 ! E]) -> i64 {
     sum
 }
 
+/// A fallible parameter, which is what an error-reporting helper needs.
+fn show(label: str, r: i64 ! E) -> str {
+    match r {
+        Ok(v) -> "{label}={v}"
+        Err(e) -> "{label}!{e.m}"
+    }
+}
+
+type Box = { r: i64 ! E, tag: str }
+
 fn main() {
+    // Held as a value, which the annotation is what permits.
+    let held: i64 ! E = parse("5")
+    print("{show("held", held)}")
+    // A struct field, a tuple member, a type argument.
+    let b = Box{ r: parse("x"), tag: "b" }
+    print("{show(b.tag, b.r)}")
+    let pair: (i64 ! E, str) = (parse("7"), "p")
+    print("{show(pair.1, pair.0)}")
+    let m: Map[str, i64 ! E] = {"k": parse("9")}
+    print("{show("k", m.get("k") ?? parse("0"))}")
+
     let rs: [i64 ! E] = ["1", "x", "41"].map(parse)
     print("{rs.len()} {total(rs)}")
     for r in rs {

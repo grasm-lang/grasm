@@ -144,24 +144,30 @@ so existing code that uses `bench` as a name keeps working.
 ```
 type       = named_type | list_type | tuple_type | union_type | fn_type
 nested     = type ( "!" type )?
-fn_type    = "fn" "(" ( type ( "," type )* )? ")" ( "->" type )? effect_row?
+fn_type    = "fn" "(" ( nested ( "," nested )* )? ")" ( "->" nested )? effect_row?
 effect_row = "/" "{" ( path ( "," path )* )? "}"
 named_type = path type_args?
-type_args  = "[" type ( "," type )* "]"
+type_args  = "[" nested ( "," nested )* "]"
 list_type  = "[" nested "]"
-tuple_type = "(" ( type ( "," type )* )? ")"
-union_type = "(" type ( "|" type )+ ")"
+tuple_type = "(" ( nested ( "," nested )* )? ")"
+union_type = "(" nested ( "|" nested )+ ")"
 ```
 
-**[G-TYPE-FALLIBLE]** `T ! E` is a type wherever a type is *nested* — inside
-`[…]`, most of all. `[i64 ! E]` is what `xs.map(parse)` produces when `parse`
-can fail, and it used to be a thing the checker could infer and nobody could
-write, so crossing a `map` with a fallible function meant declaring a sum type
-by hand to carry what the language already had.
+**[G-TYPE-FALLIBLE]** `T ! E` is a type wherever a type is written *inside*
+something else: a parameter, a struct or variant field, a type argument, a
+tuple member, a `let` annotation, an alias. `[i64 ! E]` is what `xs.map(parse)`
+produces when `parse` can fail — a thing the checker could infer and nobody
+could write, so crossing a `map` with a fallible function meant declaring a
+sum type by hand to carry what the language already had.
 
-At a function's return type the `!` belongs to the declaration — `fn f() ->
-i64 ! E` — where it sits alongside the effect row, so it is parsed there and
-not as part of the type.
+The one place the `!` is *not* part of the type is a function declaration's
+return: `fn f() -> i64 ! E` gives it to the declaration, alongside the effect
+row.
+
+Writing the type is also how a fallible value is *held*. `let r = risky()` is
+an error, because forgetting `try` is the far more common reading of it; the
+annotation `let r: i64 ! E = risky()` says the failure is meant to be kept,
+and the error names that spelling.
 
 **[G-TYPE-UNIT]** `()` is the unit type.
 
