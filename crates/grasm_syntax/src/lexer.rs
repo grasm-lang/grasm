@@ -231,7 +231,39 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// A `"""…"""` block: every byte between the delimiters, verbatim.
+    ///
+    /// A newline immediately after the opening delimiter is dropped, so the
+    /// content can start on its own line without a leading blank one.
+    fn lex_raw_string(&mut self) -> Token {
+        let start = self.pos;
+        self.pos += 3;
+        if self.pos < self.bytes.len() && self.peek() == b'\n' {
+            self.pos += 1;
+        }
+        let from = self.pos;
+        while self.pos < self.bytes.len() && !self.bytes[self.pos..].starts_with(b"\"\"\"") {
+            self.pos += 1;
+        }
+        if self.pos >= self.bytes.len() {
+            return self.tok(
+                TokenKind::Error("unterminated `\"\"\"` string".into()),
+                start,
+            );
+        }
+        let text = String::from_utf8_lossy(&self.bytes[from..self.pos]).into_owned();
+        self.pos += 3;
+        self.tok(TokenKind::Str(vec![StrPart::Text(text)]), start)
+    }
+
     fn lex_string(&mut self) -> Token {
+        // `"""…"""` — a raw block. No escapes, no interpolation, newlines
+        // kept. Embedding a document (JSON, CSV, a fixture) in a program
+        // otherwise means a list of strings joined on "\n" with every `{` and
+        // `}` escaped, which is more noise than the data.
+        if self.bytes[self.pos..].starts_with(b"\"\"\"") {
+            return self.lex_raw_string();
+        }
         let start = self.pos;
         self.bump(); // opening quote
         let mut parts: Vec<StrPart> = Vec::new();

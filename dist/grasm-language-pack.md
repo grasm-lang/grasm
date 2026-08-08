@@ -75,6 +75,16 @@ ignored. Integers are 64-bit signed.
 
 **[L-STRING]** String literals are delimited by `"`. They may not span lines.
 
+**[L-RAW-STRING]** `"""…"""` is a **raw block**: every character between the
+delimiters is taken literally, newlines included. No escapes, no
+interpolation. A newline immediately after the opening delimiter is dropped so
+the content can begin on its own line.
+
+This exists because embedding a document in a program — a JSON fixture, a CSV
+sample, an expected report — otherwise means a list of strings joined on
+`"\n"` with every `{` and `}` written as `\{` and `\}`, which is more noise
+than data. The one thing a raw block cannot contain is `"""`.
+
 **[L-ESCAPE]** Recognized escapes: `\n`, `\t`, `\r`, `\\`, `\"`, `\0`, `\{`,
 `\}`. Any other escape is a lexical error.
 
@@ -3774,6 +3784,42 @@ fn main() {
         3,
     ]
     print("{xs.sum()}")
+}
+```
+
+## `L-RAW-STRING.gr`
+
+```grasm
+//! tag: L-RAW-STRING
+//! expect: output
+//! 3
+//! [{"users": [{"name": "ada"}], "ok": true}]
+//! [a	tab and "quotes" kept]
+//! [a \n that is two characters]
+//! 4 [97, 92, 110, 98]
+//! interpolation still works: 2
+//! empty:[] one:[x]
+// A raw block: every character literal, newlines included.
+let DOC = """
+{"users": [{"name": "ada"}], "ok": true}
+a	tab and "quotes" kept
+a \n that is two characters
+"""
+
+let ESCAPES = """a\nb"""
+let EMPTY = """"""
+let ONE = """x"""
+
+fn main() {
+    print("{DOC.lines().len()}")
+    for l in DOC.lines() {
+        print("[{l}]")
+    }
+    // `\n` inside a raw block is a backslash and an `n`, not a newline.
+    print("{ESCAPES.len()} {ESCAPES.codes()}")
+    // Ordinary strings are unaffected.
+    print("interpolation still works: {1 + 1}")
+    print("empty:[{EMPTY}] one:[{ONE}]")
 }
 ```
 

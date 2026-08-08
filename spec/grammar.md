@@ -60,6 +60,16 @@ ignored. Integers are 64-bit signed.
 
 **[L-STRING]** String literals are delimited by `"`. They may not span lines.
 
+**[L-RAW-STRING]** `"""…"""` is a **raw block**: every character between the
+delimiters is taken literally, newlines included. No escapes, no
+interpolation. A newline immediately after the opening delimiter is dropped so
+the content can begin on its own line.
+
+This exists because embedding a document in a program — a JSON fixture, a CSV
+sample, an expected report — otherwise means a list of strings joined on
+`"\n"` with every `{` and `}` written as `\{` and `\}`, which is more noise
+than data. The one thing a raw block cannot contain is `"""`.
+
 **[L-ESCAPE]** Recognized escapes: `\n`, `\t`, `\r`, `\\`, `\"`, `\0`, `\{`,
 `\}`. Any other escape is a lexical error.
 
