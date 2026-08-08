@@ -4014,7 +4014,15 @@ impl FnCx<'_, '_> {
             let VType::List(elem_t) = vt else {
                 return nope(span, "push on non-lists");
             };
-            let (mut av, avt) = self.eval_expr_val(&args[0])?;
+            // The list's element type is what an empty literal needs, and it
+            // is right here: `succ.push([])` on a `[[i64]]` said the type
+            // could not be inferred while naming the one place it came from.
+            let want = if *elem_t == VType::Any {
+                None
+            } else {
+                Some((*elem_t).clone())
+            };
+            let (mut av, avt) = self.eval_expr_expecting(&args[0], want.as_ref())?;
             let avt = if *elem_t == VType::F64 && avt == VType::I64 {
                 av = self.b.ins().fcvt_from_sint(types::F64, av);
                 VType::F64
@@ -5970,6 +5978,16 @@ impl FnCx<'_, '_> {
                     if let Some((_, VType::Fn(_, ret))) = self.lookup(&id.name) {
                         return Ok(*ret);
                     }
+                    // Builtins that answer with nothing. Their absence here
+                    // meant a closure whose body is `print(x)` had no type at
+                    // all, so a void callback could not be passed anywhere.
+                    if matches!(
+                        id.name.as_str(),
+                        "print" | "assert" | "assert_eq" | "write_file" | "exit" | "panic"
+                    ) && self.lookup(&id.name).is_none()
+                    {
+                        return Ok(VType::Unit);
+                    }
                     if let Some(sig) = self.lookup_fn(&id.name) {
                         return Ok(sig.ret.clone());
                     }
@@ -7389,6 +7407,25 @@ impl FnCx<'_, '_> {
         // produces — probed so a scalar result gets inline storage. A body the
         // probe cannot type falls back to a boxed list rather than failing:
         // it compiled before this optimization existed.
+        // `xs.map(|x| print(x))` builds a list of nothings. The interpreter
+        // will do it; there is no native representation for it, and the thing
+        // the author wanted is a loop.
+        if is_map {
+            self.push_scope();
+            let dummy = self.new_var(elem_t);
+            let zero = self.zero_of(elem_t);
+            self.b.def_var(dummy, zero);
+            self.bind(&param.name, dummy, elem_t.clone());
+            let probed = self.probe_type(body);
+            self.pop_scope_no_decs();
+            if matches!(probed, Ok(VType::Unit)) {
+                return nope(
+                    body.span(),
+                    "`map` with a function that returns nothing (write a `for` loop, \
+which is what a list of nothings was standing in for)",
+                );
+            }
+        }
         let out_hint = if is_map {
             self.push_scope();
             let dummy = self.new_var(elem_t);
