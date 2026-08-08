@@ -483,6 +483,13 @@ it travels with the function *as a value*: `risky` referenced by name has type
 `fn(A) -> T ! E`, not `fn(A) -> T`. Passing it where a plain function is
 wanted is a type error.
 
+`map` and `par_map` are not that case, and the difference is deliberate: they
+place no demand on what the function returns, so `xs.map(risky)` is
+well-typed and produces `[T ! E]` ([G-TYPE-FALLIBLE]) — every failure kept,
+none of them silently dropped. `filter`, `par_filter`, `any`, `all`, `find`
+and `sort_by` each need a specific answer — a `bool`, an ordered key — and
+`Ok(true)` is not `true`, so those reject it.
+
 This is the rule that stops [T-FALLIBLE-UNHANDLED] from being sidestepped.
 Without it `xs.filter(risky)` typechecked, and then filtered on `Ok(true)` —
 which is not `true` — so the answer was the empty list, with nothing reported
@@ -854,7 +861,7 @@ is judged on.
 | type | rendering | example |
 |------|-----------|---------|
 | `i64` | decimal | `-7` |
-| `f64` | shortest form that round-trips, **always with a point** at every magnitude | `1.5`, `1000000.0`, `1000000000000000.0`, `-0.0` |
+| `f64` | the fewest **digits** that round-trip, written out positionally — never exponent notation, and **always with a point** at every magnitude | `1.5`, `1000000.0`, `1000000000000000.0`, `-0.0`; `1e300` is 301 characters |
 | `f64`, not finite | `inf`, `-inf`, `NaN` — `NaN` is the one mixed-case rendering here | `inf` |
 | `()` | `()` | |
 | `bool` | `true` / `false` | |
@@ -943,7 +950,7 @@ because the text may not be a number.
 |--------|------|-------|
 | `s.len()` | `-> i64` | characters |
 | `s.is_empty()` | `-> bool` | |
-| `s.substr(start, len)` | `(i64, i64) -> str` | **start and length**, not start and end |
+| `s.substr(start, len)` | `(i64, i64) -> str` | **start and length**, not start and end; clamps past the end rather than panicking, unlike indexing |
 | `s.chars()` | `-> [str]` | one single-character string per element |
 | `s.lines()` | `-> [str]` | splits on newlines; no trailing empty line |
 | `s.split(sep)` | `(str) -> [str]` | on an exact separator; adjacent separators give empty elements |
@@ -955,8 +962,8 @@ because the text may not be a number.
 | `s.to_upper()`, `s.to_lower()` | `-> str` | |
 | `s.repeat(n)` | `(i64) -> str` | |
 | `s.pad_start(w, fill)`, `s.pad_end(w, fill)` | `(i64, str) -> str` | fill repeats and is cut to width ([E-PAD-CYCLE]) |
-| `s.parse_int()` | `-> Option[i64]` | |
-| `s.parse_float()` | `-> Option[f64]` | |
+| `s.parse_int()` | `-> Option[i64]` | surrounding space and a leading `+` are accepted; `1_000` and `0xFF` are **not** ([L-LIB-PARSE]) |
+| `s.parse_float()` | `-> Option[f64]` | accepts `inf`, `-inf`, `nan`; overflow gives an infinity, not `None` ([L-LIB-PARSE]) |
 | `s.code_at(i)` | `(i64) -> i64` | Unicode code point of character `i`; panics out of range ([L-LIB-CODES]) |
 | `s.codes()` | `-> [i64]` | every code point, in order |
 | `n.to_char()` | `i64 -> str` | a code point back to a one-character string; panics if `n` is not one |
@@ -973,6 +980,18 @@ empty elements, which is what reading a line of aligned columns needs.
 `s.split(" ")` is the other thing — an exact separator, where two spaces in a
 row mean an empty element between them — and both are worth having, because a
 CSV wants the second and a log line wants the first.
+
+**[L-LIB-PARSE]** `parse_int` and `parse_float` answer `None` for text that
+is not a number, and are worth stating exactly because untrusted input reaches
+them:
+
+- `parse_int` accepts surrounding whitespace and a leading `+` or `-`. It does
+  **not** accept the `1_000` and `0xFF` forms that [L-INT] allows in *source*:
+  a literal in a program and a number in a data file are different things.
+- `parse_float` accepts `inf`, `-inf` and `nan`, and a value too large to
+  represent gives an infinity rather than `None`. So `"1e400"` parses, and the
+  `inf` it produces then flows into arithmetic, `as_i64` ([L-LIB-NUM]) and
+  sorting ([L-LIB-SORT-NAN]) — which is how those three came to be specified.
 
 ## 4. `[T]`
 
@@ -1541,7 +1560,7 @@ That number is exactly the smallest `n` where `n * 2` wraps.
 
 `grasm test --coverage` reports which statement lines the suite reached.
 `bench "name" { ... }` bodies are warmed up, then sampled, and `grasm bench`
-reports ns/op.
+reports time per operation, in whatever unit keeps the figure readable.
 
 ## 10. Documentation that cannot rot
 
@@ -3422,6 +3441,45 @@ fn main() {
         pairs.push("{n}{w}")
     }
     print("{pairs.join(" ")}")
+}
+```
+
+## `L-LIB-PARSE.gr`
+
+```grasm
+//! tag: L-LIB-PARSE
+//! expect: output
+//! inf NaN inf -inf
+//! none none
+//! 42 -7 none none
+//! cdef |  |
+// What a parser does with input that is nearly a number. Untrusted data
+// reaches these, and every surprise here becomes a surprise somewhere else:
+// `"1e400"` parsing to `inf` is what put an infinity into `as_i64` and into a
+// sort, so both of those had to be specified too.
+fn show(o: Option[f64]) -> str {
+    match o {
+        Some(v) -> "{v}"
+        None -> "none"
+    }
+}
+
+fn showi(o: Option[i64]) -> str {
+    match o {
+        Some(v) -> "{v}"
+        None -> "none"
+    }
+}
+
+fn main() {
+    // Infinities and NaN are accepted, and overflow gives an infinity.
+    print("{show("inf".parse_float())} {show("nan".parse_float())} {show("1e400".parse_float())} {show("-inf".parse_float())}")
+    // Text that is not a number is `None`, not zero.
+    print("{show("abc".parse_float())} {showi("abc".parse_int())}")
+    // Space and a sign are fine; source-literal spellings are not.
+    print("{showi(" +42 ".parse_int())} {showi("-7".parse_int())} {showi("1_000".parse_int())} {showi("0xFF".parse_int())}")
+    // `substr` clamps rather than panicking, unlike indexing.
+    print("{"abcdef".substr(2, 100)} | {"abc".substr(5, 2)} |")
 }
 ```
 

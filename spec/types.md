@@ -197,6 +197,13 @@ it travels with the function *as a value*: `risky` referenced by name has type
 `fn(A) -> T ! E`, not `fn(A) -> T`. Passing it where a plain function is
 wanted is a type error.
 
+`map` and `par_map` are not that case, and the difference is deliberate: they
+place no demand on what the function returns, so `xs.map(risky)` is
+well-typed and produces `[T ! E]` ([G-TYPE-FALLIBLE]) — every failure kept,
+none of them silently dropped. `filter`, `par_filter`, `any`, `all`, `find`
+and `sort_by` each need a specific answer — a `bool`, an ordered key — and
+`Ok(true)` is not `true`, so those reject it.
+
 This is the rule that stops [T-FALLIBLE-UNHANDLED] from being sidestepped.
 Without it `xs.filter(risky)` typechecked, and then filtered on `Ok(true)` —
 which is not `true` — so the answer was the empty list, with nothing reported

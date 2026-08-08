@@ -394,7 +394,7 @@ fn main() -> ExitCode {
             eprintln!("      --seed N                 seed for property generation");
             eprintln!("      --cases N                property cases per test (default 100)");
             eprintln!("      --filter TEXT            only tests whose name contains TEXT");
-            eprintln!("  bench <file.gr>              run bench blocks, report ns/op");
+            eprintln!("  bench <file.gr>              run bench blocks, report time per op");
             eprintln!("      --filter TEXT            only benchmarks whose name contains TEXT");
             eprintln!("  check <file.gr>              parse + typecheck");
             eprintln!("  build <file.gr> [-o out]     self-contained executable");

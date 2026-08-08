@@ -44,7 +44,7 @@ is judged on.
 | type | rendering | example |
 |------|-----------|---------|
 | `i64` | decimal | `-7` |
-| `f64` | shortest form that round-trips, **always with a point** at every magnitude | `1.5`, `1000000.0`, `1000000000000000.0`, `-0.0` |
+| `f64` | the fewest **digits** that round-trip, written out positionally — never exponent notation, and **always with a point** at every magnitude | `1.5`, `1000000.0`, `1000000000000000.0`, `-0.0`; `1e300` is 301 characters |
 | `f64`, not finite | `inf`, `-inf`, `NaN` — `NaN` is the one mixed-case rendering here | `inf` |
 | `()` | `()` | |
 | `bool` | `true` / `false` | |
@@ -133,7 +133,7 @@ because the text may not be a number.
 |--------|------|-------|
 | `s.len()` | `-> i64` | characters |
 | `s.is_empty()` | `-> bool` | |
-| `s.substr(start, len)` | `(i64, i64) -> str` | **start and length**, not start and end |
+| `s.substr(start, len)` | `(i64, i64) -> str` | **start and length**, not start and end; clamps past the end rather than panicking, unlike indexing |
 | `s.chars()` | `-> [str]` | one single-character string per element |
 | `s.lines()` | `-> [str]` | splits on newlines; no trailing empty line |
 | `s.split(sep)` | `(str) -> [str]` | on an exact separator; adjacent separators give empty elements |
@@ -145,8 +145,8 @@ because the text may not be a number.
 | `s.to_upper()`, `s.to_lower()` | `-> str` | |
 | `s.repeat(n)` | `(i64) -> str` | |
 | `s.pad_start(w, fill)`, `s.pad_end(w, fill)` | `(i64, str) -> str` | fill repeats and is cut to width ([E-PAD-CYCLE]) |
-| `s.parse_int()` | `-> Option[i64]` | |
-| `s.parse_float()` | `-> Option[f64]` | |
+| `s.parse_int()` | `-> Option[i64]` | surrounding space and a leading `+` are accepted; `1_000` and `0xFF` are **not** ([L-LIB-PARSE]) |
+| `s.parse_float()` | `-> Option[f64]` | accepts `inf`, `-inf`, `nan`; overflow gives an infinity, not `None` ([L-LIB-PARSE]) |
 | `s.code_at(i)` | `(i64) -> i64` | Unicode code point of character `i`; panics out of range ([L-LIB-CODES]) |
 | `s.codes()` | `-> [i64]` | every code point, in order |
 | `n.to_char()` | `i64 -> str` | a code point back to a one-character string; panics if `n` is not one |
@@ -163,6 +163,18 @@ empty elements, which is what reading a line of aligned columns needs.
 `s.split(" ")` is the other thing — an exact separator, where two spaces in a
 row mean an empty element between them — and both are worth having, because a
 CSV wants the second and a log line wants the first.
+
+**[L-LIB-PARSE]** `parse_int` and `parse_float` answer `None` for text that
+is not a number, and are worth stating exactly because untrusted input reaches
+them:
+
+- `parse_int` accepts surrounding whitespace and a leading `+` or `-`. It does
+  **not** accept the `1_000` and `0xFF` forms that [L-INT] allows in *source*:
+  a literal in a program and a number in a data file are different things.
+- `parse_float` accepts `inf`, `-inf` and `nan`, and a value too large to
+  represent gives an infinity rather than `None`. So `"1e400"` parses, and the
+  `inf` it produces then flows into arithmetic, `as_i64` ([L-LIB-NUM]) and
+  sorting ([L-LIB-SORT-NAN]) — which is how those three came to be specified.
 
 ## 4. `[T]`
 

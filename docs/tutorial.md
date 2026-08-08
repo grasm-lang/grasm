@@ -482,7 +482,7 @@ That number is exactly the smallest `n` where `n * 2` wraps.
 
 `grasm test --coverage` reports which statement lines the suite reached.
 `bench "name" { ... }` bodies are warmed up, then sampled, and `grasm bench`
-reports ns/op.
+reports time per operation, in whatever unit keeps the figure readable.
 
 ## 10. Documentation that cannot rot
 

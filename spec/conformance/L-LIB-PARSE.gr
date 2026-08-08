@@ -1,0 +1,34 @@
+//! tag: L-LIB-PARSE
+//! expect: output
+//! inf NaN inf -inf
+//! none none
+//! 42 -7 none none
+//! cdef |  |
+// What a parser does with input that is nearly a number. Untrusted data
+// reaches these, and every surprise here becomes a surprise somewhere else:
+// `"1e400"` parsing to `inf` is what put an infinity into `as_i64` and into a
+// sort, so both of those had to be specified too.
+fn show(o: Option[f64]) -> str {
+    match o {
+        Some(v) -> "{v}"
+        None -> "none"
+    }
+}
+
+fn showi(o: Option[i64]) -> str {
+    match o {
+        Some(v) -> "{v}"
+        None -> "none"
+    }
+}
+
+fn main() {
+    // Infinities and NaN are accepted, and overflow gives an infinity.
+    print("{show("inf".parse_float())} {show("nan".parse_float())} {show("1e400".parse_float())} {show("-inf".parse_float())}")
+    // Text that is not a number is `None`, not zero.
+    print("{show("abc".parse_float())} {showi("abc".parse_int())}")
+    // Space and a sign are fine; source-literal spellings are not.
+    print("{showi(" +42 ".parse_int())} {showi("-7".parse_int())} {showi("1_000".parse_int())} {showi("0xFF".parse_int())}")
+    // `substr` clamps rather than panicking, unlike indexing.
+    print("{"abcdef".substr(2, 100)} | {"abc".substr(5, 2)} |")
+}

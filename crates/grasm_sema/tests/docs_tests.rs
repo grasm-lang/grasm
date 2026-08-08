@@ -87,6 +87,41 @@ fn struct_sum_and_effect_signatures_render() {
     assert_eq!(sig("Clock"), "effect Clock { fn now() -> i64 }");
 }
 
+/// An operation's `! E` is part of its contract and must survive into the
+/// rendering — dropping it made the documented signature disagree with the
+/// real one, which is the drift the generator exists to prevent.
+#[test]
+fn an_effect_operations_error_type_is_documented() {
+    let fx = Fixture::new(
+        "diag",
+        &[(
+            "main",
+            "type Diag = { why: str }
+
+effect Docs {
+    fn load(name: str) -> str ! Diag
+    fn note(m: str)
+}
+
+fn main() {
+}
+",
+        )],
+    );
+    let modules = docs::collect(&fx.program());
+    let sig = modules[0]
+        .items
+        .iter()
+        .find(|i| i.name == "Docs")
+        .expect("Docs missing")
+        .signature
+        .clone();
+    assert_eq!(
+        sig,
+        "effect Docs { fn load(name: str) -> str ! Diag; fn note(m: str) }"
+    );
+}
+
 #[test]
 fn private_items_of_an_imported_module_are_not_documented() {
     let fx = Fixture::new(

@@ -233,6 +233,14 @@ fn fn_sig_text(op: &grasm_syntax::ast::FnSig) -> String {
         s.push_str(" -> ");
         s.push_str(&type_text(r));
     }
+    // An operation's `! E` is part of its contract, and dropping it made the
+    // documented signature disagree with the real one — the exact drift the
+    // generator exists to prevent. Plain functions kept theirs; operations
+    // did not.
+    if let Some(e) = &op.err {
+        s.push_str(" ! ");
+        s.push_str(&type_text(e));
+    }
     s
 }
 
