@@ -88,6 +88,9 @@ format through the same code, so they agree digit for digit — which a
 formatter built by hand out of `round` and `to_str` cannot promise, and which
 is what every report with an average needs.
 
+A value that is not finite answers with `inf`, `-inf` or `NaN` regardless of
+the requested precision, matching [L-DISPLAY].
+
 Ties go **away from zero**, the same rule `round` uses ([L-LIB-ROUND]), so
 `(2.5).to_fixed(0)` is `"3"` and `(0.125).to_fixed(2)` is `"0.13"`. A tie
 means the *stored* value is exactly halfway, which is rarer than it looks:

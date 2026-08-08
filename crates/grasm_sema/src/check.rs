@@ -1006,8 +1006,11 @@ impl Checker {
                     "task body uses `{}`, which is declared inside the `parallel` block",
                     id.name
                 ),
-                "tasks run after the block finishes, so that binding is gone — \
-declare it before `parallel`",
+                "tasks run after the block finishes, so that binding is gone. \
+Declaring it before `parallel` compiles but reads the value it has *then*, \
+which for a loop counter is its final one — give each task the value it \
+needs before the loop advances, or have the task compute it from something \
+that does not change",
             );
         }
     }

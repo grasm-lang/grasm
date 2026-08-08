@@ -1,9 +1,22 @@
 # Evaluation Semantics
 
 The tree-walking interpreter in `grasm_interp` is the **reference
-implementation**: where the native backend and the interpreter disagree, the
-interpreter is right and the backend has a bug. `scripts/difftest.sh` enforces
-this on every program in the repository.
+implementation**: where the native backend and the interpreter disagree about
+what a program *computes*, the interpreter is right and the backend has a bug.
+`scripts/difftest.sh` enforces this on every program in the repository.
+
+Two differences are not that, and are stated where they arise rather than left
+to be discovered:
+
+- **Resource bounds.** How deep recursion may go before it stops is
+  implementation-defined above the guaranteed minimum, and differs between the
+  two ([E-RECURSION-DEPTH]). Both stop by panicking; they stop in different
+  places.
+- **What the backend can compile at all.** `grasm build --native` rejects a
+  few shapes the interpreter runs, always by name and always at build time —
+  never by miscompiling. Each refusal says what it cannot do and tells you to
+  use `grasm run`. This is a smaller language than the one specified here, and
+  the gap is a defect being closed rather than a design.
 
 ## 1. Values
 

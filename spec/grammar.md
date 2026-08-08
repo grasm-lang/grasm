@@ -205,8 +205,11 @@ spawn_stmt    = "spawn" block
 place = identifier ( "." identifier | "[" expression "]" )*
 ```
 
-**[G-STMT-TERM]** A statement is terminated by a newline, a `}`, or end of
-file.
+**[G-STMT-TERM]** A statement is terminated by a newline, by the `}` that
+closes the block it is in, or by end of file. There is no separator that lets
+two statements share a line: the `}` of a *nested* block does not end the
+statement that follows it, so `var x = 0 if c { }` is an error and not two
+statements.
 
 **[G-STMT-LAST]** The value of a block is the value of its final statement if
 that statement is an expression; otherwise the block has type `()`.

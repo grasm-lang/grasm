@@ -549,12 +549,11 @@ fn load_and_check(path: &str) -> Result<Program, ExitCode> {
     // surprise, and not something a reviewer has to happen to notice", which
     // is only true if the compiler is the one noticing.
     if let Err(violations) = check_dependency_ceilings(entry) {
-        for v in violations {
-            eprintln!("error: {v}");
-            eprintln!(
-                "  help: either add the capability to that package's manifest, \
-or stop it from performing the effect"
-            );
+        for (message, help) in violations {
+            eprintln!("error: {message}");
+            if let Some(h) = help {
+                eprintln!("  help: {h}");
+            }
         }
         return Err(ExitCode::FAILURE);
     }
@@ -565,7 +564,9 @@ or stop it from performing the effect"
 ///
 /// Path dependencies included: a package being local is a reason the ceiling
 /// matters more, not less, since it is the one changing under you.
-fn check_dependency_ceilings(entry: &std::path::Path) -> Result<(), Vec<String>> {
+fn check_dependency_ceilings(
+    entry: &std::path::Path,
+) -> Result<(), Vec<(String, Option<String>)>> {
     let mut here = entry.parent().map(std::path::Path::to_path_buf);
     let pkg_dir = loop {
         match here {
@@ -574,26 +575,38 @@ fn check_dependency_ceilings(entry: &std::path::Path) -> Result<(), Vec<String>>
             None => return Ok(()),
         }
     };
-    let Ok(resolution) = grasm_pkg::resolve(&pkg_dir) else {
-        // Resolution failures are reported by the commands that resolve; this
-        // check has nothing to say about them.
-        return Ok(());
+    // A resolution failure is a build failure. Swallowing it meant a version
+    // requirement nothing could satisfy — `version = "=9.9.9"` against a 0.1.0
+    // dependency — was caught by `grasm deps` and by nothing else, while the
+    // capability ceiling right beside it was enforced everywhere.
+    let resolution = match grasm_pkg::resolve(&pkg_dir) {
+        Ok(r) => r,
+        Err(e) => return Err(vec![(e, None)]),
     };
-    let mut violations = Vec::new();
+    let mut violations: Vec<(String, Option<String>)> = Vec::new();
     for pkg in &resolution.packages {
         if pkg.capabilities.is_none() {
             continue;
         }
         let Ok(performed) = grasm_pkg::effects_of_package(pkg) else {
-            violations.push(format!(
-                "cannot check the capability ceiling of `{}` — refusing to \
+            violations.push((
+                format!(
+                    "cannot check the capability ceiling of `{}` — refusing to \
 build against a dependency whose reach is unknown",
-                pkg.name
+                    pkg.name
+                ),
+                None,
             ));
             continue;
         };
         if let Some(v) = grasm_pkg::check_capabilities(pkg, &performed) {
-            violations.push(v.to_string());
+            violations.push((
+                v.to_string(),
+                Some(
+                    "either add the capability to that package's manifest, or stop it from performing the effect"
+                        .to_string(),
+                ),
+            ));
         }
     }
     if violations.is_empty() {

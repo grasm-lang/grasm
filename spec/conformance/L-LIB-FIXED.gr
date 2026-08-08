@@ -8,6 +8,7 @@
 //! -1.5 0.000
 //! 0.3333
 //! [      3.50]
+//! inf -inf NaN
 //! 6.875 2.292
 fn main() {
     // Ties go away from zero, matching `round` ([L-LIB-ROUND]).
@@ -24,6 +25,9 @@ fn main() {
     print("{(1.0 / 3.0).to_fixed(4)}")
     // It composes with the padding a column needs.
     print("[{(3.5).to_fixed(2).pad_start(10, " ")}]")
+    // Not-finite values ignore the precision, as [L-DISPLAY] renders them.
+    let z = 0.0
+    print("{(1.0 / z).to_fixed(2)} {((0.0 - 1.0) / z).to_fixed(0)} {(z / z).to_fixed(3)}")
     var total = 0.0
     for x in [1.5, 2.25, 3.125] {
         total = total + x

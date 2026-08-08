@@ -220,8 +220,11 @@ spawn_stmt    = "spawn" block
 place = identifier ( "." identifier | "[" expression "]" )*
 ```
 
-**[G-STMT-TERM]** A statement is terminated by a newline, a `}`, or end of
-file.
+**[G-STMT-TERM]** A statement is terminated by a newline, by the `}` that
+closes the block it is in, or by end of file. There is no separator that lets
+two statements share a line: the `}` of a *nested* block does not end the
+statement that follows it, so `var x = 0 if c { }` is an error and not two
+statements.
 
 **[G-STMT-LAST]** The value of a block is the value of its final statement if
 that statement is an expression; otherwise the block has type `()`.
@@ -606,9 +609,22 @@ was walked.
 # Evaluation Semantics
 
 The tree-walking interpreter in `grasm_interp` is the **reference
-implementation**: where the native backend and the interpreter disagree, the
-interpreter is right and the backend has a bug. `scripts/difftest.sh` enforces
-this on every program in the repository.
+implementation**: where the native backend and the interpreter disagree about
+what a program *computes*, the interpreter is right and the backend has a bug.
+`scripts/difftest.sh` enforces this on every program in the repository.
+
+Two differences are not that, and are stated where they arise rather than left
+to be discovered:
+
+- **Resource bounds.** How deep recursion may go before it stops is
+  implementation-defined above the guaranteed minimum, and differs between the
+  two ([E-RECURSION-DEPTH]). Both stop by panicking; they stop in different
+  places.
+- **What the backend can compile at all.** `grasm build --native` rejects a
+  few shapes the interpreter runs, always by name and always at build time —
+  never by miscompiling. Each refusal says what it cannot do and tells you to
+  use `grasm run`. This is a smaller language than the one specified here, and
+  the gap is a defect being closed rather than a design.
 
 ## 1. Values
 
@@ -939,6 +955,9 @@ many digits after the point, 0 to 17; anything else panics. Both engines
 format through the same code, so they agree digit for digit — which a
 formatter built by hand out of `round` and `to_str` cannot promise, and which
 is what every report with an average needs.
+
+A value that is not finite answers with `inf`, `-inf` or `NaN` regardless of
+the requested precision, matching [L-DISPLAY].
 
 Ties go **away from zero**, the same rule `round` uses ([L-LIB-ROUND]), so
 `(2.5).to_fixed(0)` is `"3"` and `(0.125).to_fixed(2)` is `"0.13"`. A tie
@@ -3355,6 +3374,7 @@ fn hash(s: str) -> i64 {
 //! -1.5 0.000
 //! 0.3333
 //! [      3.50]
+//! inf -inf NaN
 //! 6.875 2.292
 fn main() {
     // Ties go away from zero, matching `round` ([L-LIB-ROUND]).
@@ -3371,6 +3391,9 @@ fn main() {
     print("{(1.0 / 3.0).to_fixed(4)}")
     // It composes with the padding a column needs.
     print("[{(3.5).to_fixed(2).pad_start(10, " ")}]")
+    // Not-finite values ignore the precision, as [L-DISPLAY] renders them.
+    let z = 0.0
+    print("{(1.0 / z).to_fixed(2)} {((0.0 - 1.0) / z).to_fixed(0)} {(z / z).to_fixed(3)}")
     var total = 0.0
     for x in [1.5, 2.25, 3.125] {
         total = total + x
