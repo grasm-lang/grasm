@@ -1199,3 +1199,4 @@ fn the_lockfile_records_the_versions_selection_chose() {
     assert_eq!(text.version, "1.4.0");
     assert!(!text.checksum.is_empty());
 }
+

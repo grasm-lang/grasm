@@ -517,11 +517,67 @@ fn load_and_check(path: &str) -> Result<Program, ExitCode> {
     if diags.is_empty() {
         diags.extend(grasm_sema::check::check_program(&program).diagnostics);
     }
-    if diags.is_empty() {
-        Ok(program)
-    } else {
+    if !diags.is_empty() {
         render_diags(&program, &diags);
-        Err(ExitCode::FAILURE)
+        return Err(ExitCode::FAILURE);
+    }
+    // A dependency's capability ceiling is a *build* guarantee, so it is
+    // checked here — on the path `check`, `run` and `build` all take — and not
+    // only by `grasm deps`. Documented as "a compile error, not a runtime
+    // surprise, and not something a reviewer has to happen to notice", which
+    // is only true if the compiler is the one noticing.
+    if let Err(violations) = check_dependency_ceilings(entry) {
+        for v in violations {
+            eprintln!("error: {v}");
+            eprintln!(
+                "  help: either add the capability to that package's manifest, \
+or stop it from performing the effect"
+            );
+        }
+        return Err(ExitCode::FAILURE);
+    }
+    Ok(program)
+}
+
+/// Every dependency's effects against its declared ceiling.
+///
+/// Path dependencies included: a package being local is a reason the ceiling
+/// matters more, not less, since it is the one changing under you.
+fn check_dependency_ceilings(entry: &std::path::Path) -> Result<(), Vec<String>> {
+    let mut here = entry.parent().map(std::path::Path::to_path_buf);
+    let pkg_dir = loop {
+        match here {
+            Some(ref d) if d.join(grasm_pkg::MANIFEST_NAME).is_file() => break d.clone(),
+            Some(ref d) => here = d.parent().map(std::path::Path::to_path_buf),
+            None => return Ok(()),
+        }
+    };
+    let Ok(resolution) = grasm_pkg::resolve(&pkg_dir) else {
+        // Resolution failures are reported by the commands that resolve; this
+        // check has nothing to say about them.
+        return Ok(());
+    };
+    let mut violations = Vec::new();
+    for pkg in &resolution.packages {
+        if pkg.capabilities.is_none() {
+            continue;
+        }
+        let Ok(performed) = grasm_pkg::effects_of_package(pkg) else {
+            violations.push(format!(
+                "cannot check the capability ceiling of `{}` — refusing to \
+build against a dependency whose reach is unknown",
+                pkg.name
+            ));
+            continue;
+        };
+        if let Some(v) = grasm_pkg::check_capabilities(pkg, &performed) {
+            violations.push(v.to_string());
+        }
+    }
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(violations)
     }
 }
 
