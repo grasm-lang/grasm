@@ -410,6 +410,7 @@ impl<'m> Codegen<'m> {
             ("grasm_i64_to_char", vec![i64t], Some(i64t)),
             ("grasm_f64_to_fixed", vec![f64t, i64t], Some(i64t)),
             ("grasm_val_cmp", vec![i64t, i64t], Some(i64t)),
+            ("grasm_assert_eq", vec![i64t, i64t], None),
             ("grasm_str_from_i64", vec![i64t], Some(i64t)),
             ("grasm_str_from_f64", vec![f64t], Some(i64t)),
             ("grasm_str_from_bool", vec![i8t], Some(i64t)),
@@ -609,6 +610,9 @@ impl<'m> Codegen<'m> {
             self.collect_types(m)?;
             let _ = name;
         }
+        for (_, m, _) in views {
+            self.collect_effects(m)?;
+        }
         for (name, m, _) in views {
             self.current_module = name.clone();
             self.declare_fns(m)?;
@@ -671,6 +675,40 @@ impl<'m> Codegen<'m> {
         Ok(())
     }
 
+    /// Effect declarations, in a pass of their own.
+    ///
+    /// An operation's signature may name a type declared in another module,
+    /// and doing this inside `collect_types` meant the answer depended on
+    /// which file happened to be compiled first.
+    fn collect_effects(&mut self, module_ast: &AstModule) -> CResult<()> {
+        for decl in &module_ast.decls {
+            if let Decl::Effect(e) = decl {
+                let mut ops = Vec::new();
+                for op in &e.ops {
+                    let mut pts = Vec::new();
+                    for p in &op.params {
+                        pts.push(self.vtype_of(&p.ty)?);
+                    }
+                    let mut rt = match &op.ret {
+                        Some(t) => self.vtype_of(t)?,
+                        None => VType::Unit,
+                    };
+                    // An operation may declare an error type, in which case
+                    // its result is fallible like any other — the checker
+                    // treats it that way, so the backend has to as well or
+                    // `try Cfg.get(x)` is rejected here and accepted there.
+                    if let Some(et) = &op.err {
+                        let e = self.vtype_of(et)?;
+                        rt = VType::Fallible(Box::new(rt), Box::new(e));
+                    }
+                    ops.push((op.name.name.clone(), pts, rt));
+                }
+                self.effects.insert(e.name.name.clone(), ops);
+            }
+        }
+        Ok(())
+    }
+
     fn collect_types(&mut self, module_ast: &AstModule) -> CResult<()> {
         // Pass 0: type declarations (structs + sums; aliases unsupported).
         for decl in &module_ast.decls {
@@ -716,32 +754,6 @@ impl<'m> Codegen<'m> {
                     }
                     TypeBody::Alias(_) => {}
                 }
-            }
-        }
-        // Effect declarations: op signatures drive handler lowering.
-        for decl in &module_ast.decls {
-            if let Decl::Effect(e) = decl {
-                let mut ops = Vec::new();
-                for op in &e.ops {
-                    let mut pts = Vec::new();
-                    for p in &op.params {
-                        pts.push(self.vtype_of(&p.ty)?);
-                    }
-                    let mut rt = match &op.ret {
-                        Some(t) => self.vtype_of(t)?,
-                        None => VType::Unit,
-                    };
-                    // An operation may declare an error type, in which case
-                    // its result is fallible like any other — the checker
-                    // treats it that way, so the backend has to as well or
-                    // `try Cfg.get(x)` is rejected here and accepted there.
-                    if let Some(et) = &op.err {
-                        let e = self.vtype_of(et)?;
-                        rt = VType::Fallible(Box::new(rt), Box::new(e));
-                    }
-                    ops.push((op.name.name.clone(), pts, rt));
-                }
-                self.effects.insert(e.name.name.clone(), ops);
             }
         }
         Ok(())
@@ -4940,7 +4952,7 @@ impl FnCx<'_, '_> {
         &mut self,
         callee: &Expr,
         args: &[Expr],
-        span: Span,
+        _span: Span,
     ) -> CResult<Option<(Value, VType)>> {
         let Expr::Ident(id) = callee else {
             return nope(callee.span(), "indirect calls");
@@ -4967,10 +4979,14 @@ impl FnCx<'_, '_> {
                 return Ok(None);
             }
             "assert_eq" => {
+                // Boxed rather than reduced to a bool, so the failure can name
+                // both values the way the interpreter does. A test that says
+                // only "assertion failed" has told you nothing.
                 let (a, at) = self.eval_expr_val(&args[0])?;
+                let ab = self.box_value(a, &at);
                 let (bv, bt) = self.eval_expr_val(&args[1])?;
-                let (eq, _) = self.binop_values(BinaryOp::Eq, a, at, bv, bt, span)?;
-                self.assert_true(eq);
+                let bb = self.box_value(bv, &bt);
+                self.call_rt("grasm_assert_eq", &[ab, bb]);
                 return Ok(None);
             }
             "panic" => {

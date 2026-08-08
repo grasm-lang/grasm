@@ -56,6 +56,10 @@ fn check_modules(files: &[ModuleView]) -> Analysis {
     }
     for f in files {
         c.current_module = f.name.clone();
+        c.collect_effects(f.module);
+    }
+    for f in files {
+        c.current_module = f.name.clone();
         c.collect_fns(f.module);
     }
     for f in files {
@@ -259,7 +263,58 @@ impl Checker {
                 }
             }
         }
-        // Effects: register ops + auto-generate `<Name>Handler` struct types.
+        for (di, id) in ids {
+            let Decl::Type(t) = &module.decls[di] else {
+                continue;
+            };
+            let generics: Vec<String> = t.generics.iter().map(|g| g.name.clone()).collect();
+            let kind = match &t.body {
+                TypeBody::Struct(fields) => {
+                    let mut fs = Vec::new();
+                    for f in fields {
+                        let ty = self.resolve_type(&f.ty, &generics);
+                        if fs.iter().any(|(n, _)| n == &f.name.name) {
+                            self.error(f.name.span, format!("duplicate field `{}`", f.name.name));
+                            continue;
+                        }
+                        fs.push((f.name.name.clone(), ty));
+                    }
+                    TypeDefKind::Struct { fields: fs }
+                }
+                TypeBody::Sum(variants) => {
+                    let mut vs = Vec::new();
+                    for (vi, v) in variants.iter().enumerate() {
+                        let mut fs = Vec::new();
+                        for f in &v.fields {
+                            let ty = self.resolve_type(&f.ty, &generics);
+                            fs.push((f.name.name.clone(), ty));
+                        }
+                        self.variants
+                            .entry(v.name.name.clone())
+                            .or_default()
+                            .push((id, vi));
+                        vs.push(Variant {
+                            name: v.name.name.clone(),
+                            fields: fs,
+                        });
+                    }
+                    TypeDefKind::Sum { variants: vs }
+                }
+                TypeBody::Alias(_) => continue,
+            };
+            self.defs.defs[id].kind = kind;
+        }
+    }
+
+    /// Effects, in a pass of their own.
+    ///
+    /// An operation's signature may name a type from any module, and every
+    /// module's types are registered by the time this runs. Doing it inside
+    /// `collect_types` meant a file processed before the one declaring the
+    /// type reported `unknown type` — and the help said to declare it with
+    /// `type`, which then said `duplicate type name`. Two rules, neither of
+    /// which could be satisfied.
+    fn collect_effects(&mut self, module: &Module) {
         for decl in &module.decls {
             if let Decl::Effect(e) = decl {
                 if self.effects.contains_key(&e.name.name) {
@@ -311,47 +366,6 @@ impl Checker {
                 });
                 self.effects.insert(e.name.name.clone(), (ops, handler_id));
             }
-        }
-        for (di, id) in ids {
-            let Decl::Type(t) = &module.decls[di] else {
-                continue;
-            };
-            let generics: Vec<String> = t.generics.iter().map(|g| g.name.clone()).collect();
-            let kind = match &t.body {
-                TypeBody::Struct(fields) => {
-                    let mut fs = Vec::new();
-                    for f in fields {
-                        let ty = self.resolve_type(&f.ty, &generics);
-                        if fs.iter().any(|(n, _)| n == &f.name.name) {
-                            self.error(f.name.span, format!("duplicate field `{}`", f.name.name));
-                            continue;
-                        }
-                        fs.push((f.name.name.clone(), ty));
-                    }
-                    TypeDefKind::Struct { fields: fs }
-                }
-                TypeBody::Sum(variants) => {
-                    let mut vs = Vec::new();
-                    for (vi, v) in variants.iter().enumerate() {
-                        let mut fs = Vec::new();
-                        for f in &v.fields {
-                            let ty = self.resolve_type(&f.ty, &generics);
-                            fs.push((f.name.name.clone(), ty));
-                        }
-                        self.variants
-                            .entry(v.name.name.clone())
-                            .or_default()
-                            .push((id, vi));
-                        vs.push(Variant {
-                            name: v.name.name.clone(),
-                            fields: fs,
-                        });
-                    }
-                    TypeDefKind::Sum { variants: vs }
-                }
-                TypeBody::Alias(_) => continue,
-            };
-            self.defs.defs[id].kind = kind;
         }
     }
 

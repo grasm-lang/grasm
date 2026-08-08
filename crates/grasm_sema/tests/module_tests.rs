@@ -131,3 +131,50 @@ fn duplicate_type_across_modules_rejected() {
         "duplicate type name",
     );
 }
+
+/// An effect operation may name a type declared in another module.
+///
+/// Effects used to be registered in the same pass as type declarations, so
+/// whether this worked depended on which file the loader happened to hand
+/// over first. The error was `unknown type` with a help saying to declare it
+/// with `type` — which then said `duplicate type name`. Two rules, and no way
+/// to satisfy both.
+#[test]
+fn an_effect_operation_may_name_a_type_from_another_module() {
+    ok(&[
+        (
+            "main",
+            "import lib\n\n\
+             effect Docs {\n\
+             \x20   fn take(d: Diag) -> str\n\
+             }\n\n\
+             fn describe() -> str / {Docs} {\n\
+             \x20   Docs.take(Diag{ msg: \"hello\" })\n\
+             }\n\n\
+             fn main() {\n\
+             \x20   with Docs handled_by DocsHandler{ take: |d| \"got {d.msg}\" } {\n\
+             \x20       print(\"{describe()}\")\n\
+             \x20   }\n\
+             }\n",
+        ),
+        ("lib", "pub type Diag = { msg: str }\n"),
+    ]);
+}
+
+/// The same, with the operation's *error* type coming from another module.
+#[test]
+fn an_effect_operations_error_type_may_come_from_another_module() {
+    ok(&[
+        (
+            "main",
+            "import lib\n\n\
+             effect Store {\n\
+             \x20   fn read(k: str) -> str ! Missing\n\
+             }\n\n\
+             fn main() {\n\
+             \x20   print(\"ok\")\n\
+             }\n",
+        ),
+        ("lib", "pub type Missing = { key: str }\n"),
+    ]);
+}

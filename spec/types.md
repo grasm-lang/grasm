@@ -234,7 +234,9 @@ than a runtime failure.
 ## 10. Modules
 
 **[T-MODULE-NS]** Functions are per-module; types and effects share one global
-namespace, so a type name may not be declared twice across a program.
+namespace, so a type name may not be declared twice across a program. One
+namespace means one namespace: an effect operation's signature may name a type
+from any module, the same as an ordinary function's.
 
 **[T-MODULE-PUB]** Only `pub` functions are callable from another module.
 

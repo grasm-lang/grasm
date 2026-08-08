@@ -2122,6 +2122,27 @@ unsafe fn cmp_vals(a: *mut RtVal, b: *mut RtVal) -> std::cmp::Ordering {
     }
 }
 
+/// `assert_eq(a, b)`: panics naming both values when they differ.
+///
+/// The values are what makes the message useful — "assertion failed" alone
+/// tells you a test broke and nothing about how — so they are boxed and
+/// compared here rather than reduced to a bool at the call site.
+///
+/// # Safety: live pointers.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_assert_eq(a: *mut RtVal, b: *mut RtVal) {
+    if val_eq(a, b) {
+        dec(a);
+        dec(b);
+        return;
+    }
+    rt_panic(&format!(
+        "assertion failed: `{}` != `{}`",
+        display(a),
+        display(b)
+    ));
+}
+
 /// Three-way comparison of two boxed values: -1, 0 or 1.
 ///
 /// # Safety: live pointers.
