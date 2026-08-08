@@ -480,7 +480,8 @@ test "reversing twice is the identity" (xs: [i64]) {
 ```
 
 `grasm test file.gr` runs the tests of every module the program imports, not
-just that file's, and names each one by its module. A library whose tests are
+just that file's, and names each one by its module. `grasm bench` does the
+same for benchmarks. A library whose tests are
 failing should not look like a library whose tests passed.
 
 Parameters make it a **property** test: the runner generates the inputs.

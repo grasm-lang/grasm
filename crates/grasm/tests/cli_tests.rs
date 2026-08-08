@@ -295,3 +295,63 @@ fn ten_thousand_frames_work_in_a_native_binary() {
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "10000");
 }
+
+/// `grasm bench` covers every module, the way `grasm test` does.
+///
+/// Scanning only the entry file reported "no benchmarks found" for a library
+/// whose submodules each declared one.
+#[test]
+fn benchmarks_in_imported_modules_run() {
+    let w = Work::new("modbench");
+    std::fs::create_dir_all(&w.0).unwrap();
+    std::fs::write(
+        w.0.join("lib.gr"),
+        "pub fn work(n: i64) -> i64 {\n    n * 2\n}\n\nbench \"lib work\" {\n    work(21)\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        w.0.join("main.gr"),
+        "import lib\n\nfn main() {\n    print(\"{lib.work(1)}\")\n}\n",
+    )
+    .unwrap();
+    let (code, text) = run(&["bench", w.0.join("main.gr").to_str().unwrap()]);
+    assert_eq!(code, 0, "should run:\n{text}");
+    assert!(
+        text.contains("lib::lib work"),
+        "the library's benchmark must run:\n{text}"
+    );
+}
+
+/// `grasm --help` is a request, not an error.
+#[test]
+fn help_succeeds_and_an_unknown_command_does_not() {
+    for arg in ["--help", "help", "-h"] {
+        let (code, text) = run(&[arg]);
+        assert_eq!(code, 0, "`grasm {arg}` should succeed:\n{text}");
+        assert!(text.contains("usage: grasm"), "should print usage:\n{text}");
+    }
+    let (code, text) = run(&["definitely-not-a-command"]);
+    assert_eq!(code, 1, "an unknown command should fail:\n{text}");
+    assert!(text.contains("unknown command"), "should say so:\n{text}");
+}
+
+/// `grasm fmt` refuses source that does not parse.
+///
+/// The formatter works from the token stream, so it rewrote what it could and
+/// reported success on source the compiler rejects — and `--check` called it
+/// canonically formatted.
+#[test]
+fn fmt_refuses_source_that_does_not_parse() {
+    let w = Work::new("fmtbad");
+    std::fs::create_dir_all(&w.0).unwrap();
+    let bad = w.0.join("bad.gr");
+    std::fs::write(&bad, "fn main( {\n  broken\n").unwrap();
+    for args in [
+        vec!["fmt", bad.to_str().unwrap()],
+        vec!["fmt", bad.to_str().unwrap(), "--check"],
+    ] {
+        let (code, text) = run(&args);
+        assert_eq!(code, 1, "should fail:\n{text}");
+        assert!(text.contains("does not parse"), "should say why:\n{text}");
+    }
+}

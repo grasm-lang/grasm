@@ -398,12 +398,24 @@ fn bench_program_here(
         .collect();
     let mut interp = Interp::new_program(&files, out);
     let mut results = Vec::new();
-    for decl in &program.files[0].module.decls {
-        let Decl::Bench(b) = decl else { continue };
-        if !filter.is_empty() && !b.name.contains(filter) {
-            continue;
+    // Every module's benchmarks, the way `grasm test` runs every module's
+    // tests. Scanning only the entry file reported "no benchmarks found" for a
+    // library whose submodules each declared one.
+    let multi = program.files.len() > 1;
+    for file in &program.files {
+        for decl in &file.module.decls {
+            let Decl::Bench(b) = decl else { continue };
+            if !filter.is_empty() && !b.name.contains(filter) {
+                continue;
+            }
+            interp.set_current_module(&file.name);
+            let label = if multi {
+                format!("{}::{}", file.name, b.name)
+            } else {
+                b.name.clone()
+            };
+            results.push(interp.run_bench(&label, &b.body));
         }
-        results.push(interp.run_bench(&b.name, &b.body));
     }
     results
 }

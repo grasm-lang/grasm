@@ -248,6 +248,17 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+            // Formatting a file that does not parse cannot mean anything:
+            // the formatter works from the token stream, so it rewrote what it
+            // could and reported success on source the compiler rejects.
+            let parsed = grasm_syntax::parse(&src);
+            if !parsed.diagnostics.is_empty() {
+                eprintln!("error: `{path}` does not parse, so there is nothing to format");
+                for d in parsed.diagnostics.iter().take(3) {
+                    eprintln!("  {}", d.message);
+                }
+                return ExitCode::FAILURE;
+            }
             let formatted = grasm_syntax::fmt::format_src(&src);
             if args.iter().any(|a| a == "--check") {
                 if formatted == src {
@@ -382,7 +393,14 @@ fn main() -> ExitCode {
             println!("grasm 0.2.0-dev (phase 2: modules, maps, build)");
             ExitCode::SUCCESS
         }
-        _ => {
+        // Asking for help is not an error; an unknown command is. Printing
+        // usage and exiting 1 for `--help` breaks any script that checks.
+        other => {
+            let asked = matches!(other, Some("help") | Some("--help") | Some("-h") | None);
+            if let Some(cmd) = other.filter(|_| !asked) {
+                eprintln!("error: unknown command `{cmd}`");
+                eprintln!();
+            }
             eprintln!("grasm — the Grasm language toolchain (pre-alpha)");
             eprintln!();
             eprintln!("usage: grasm <command>");
@@ -412,7 +430,11 @@ fn main() -> ExitCode {
             eprintln!("  add <name> <version> [dir]   add a registry dependency to grasm.toml");
             eprintln!("  tokens <file.gr>             dump lexer output (debug)");
             eprintln!("  version                      print version");
-            ExitCode::FAILURE
+            if asked {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
         }
     }
 }
