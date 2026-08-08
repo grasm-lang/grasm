@@ -545,7 +545,11 @@ from any module, the same as an ordinary function's.
 **[T-MODULE-PUB]** Only `pub` functions are callable from another module.
 
 **[T-MODULE-RESOLVE]** `import a.b` names the module in `a/b.gr`, relative to
-the importing package's source directory. The last segment is the qualifier
+**the source directory of the package the importing file belongs to** — a
+dependency's imports resolve inside that dependency, not in whatever consumer
+happens to be building it. Otherwise a file at the same relative path in the
+consumer silently replaced the library's own private module, and the program
+ran and printed the wrong answer. The last segment is the qualifier
 calls use, so `import lib.math` is called as `math.f(...)`. Execution begins in
 the file passed to the toolchain, which is the only module required to define
 `main`.

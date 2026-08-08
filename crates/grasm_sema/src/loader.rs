@@ -5,7 +5,7 @@
 //! space (per-file base offsets), so every later stage keeps a single flat
 //! diagnostic list; the CLI maps spans back to files for rendering.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use grasm_syntax::ast::Module;
 use grasm_syntax::diag::Diagnostic;
@@ -49,7 +49,7 @@ pub fn load_with(
     entry_display_path: &str,
     provider: &dyn Fn(&str) -> Option<String>,
 ) -> Program {
-    load_with_paths(entry_name, entry_display_path, provider, &|_| Vec::new())
+    load_with_paths_in(entry_name, entry_display_path, provider, &|_| Vec::new(), &HashSet::new())
 }
 
 /// `load_with`, plus a way to say where a missing module was looked for.
@@ -63,6 +63,23 @@ pub fn load_with_paths(
     entry_display_path: &str,
     provider: &dyn Fn(&str) -> Option<String>,
     tried: &dyn Fn(&str) -> Vec<String>,
+) -> Program {
+    load_with_paths_in(entry_name, entry_display_path, provider, tried, &HashSet::new())
+}
+
+/// `load_with_paths`, told which module names are *dependencies*.
+///
+/// A module inside a dependency resolves its own imports inside that
+/// dependency. Without this, `import sub.helper` in a library was looked up in
+/// the *consumer's* source directory: a same-named file there silently
+/// replaced the library's own private module, and the program ran and printed
+/// the wrong answer with nothing reported.
+pub fn load_with_paths_in(
+    entry_name: &str,
+    entry_display_path: &str,
+    provider: &dyn Fn(&str) -> Option<String>,
+    tried: &dyn Fn(&str) -> Vec<String>,
+    deps: &HashSet<String>,
 ) -> Program {
     let mut files: Vec<LoadedFile> = Vec::new();
     let mut diagnostics = Vec::new();
@@ -90,10 +107,25 @@ pub fn load_with_paths(
         };
         let out = grasm_syntax::parser::parse_with_offset(&src, base);
         diagnostics.extend(out.diagnostics);
+        // Which dependency, if any, this module lives inside.
+        let owner: Option<String> = if deps.contains(&name) {
+            Some(name.clone())
+        } else {
+            name.split_once('.')
+                .map(|(root, _)| root.to_string())
+                .filter(|root| deps.contains(root))
+        };
         let mut imports = HashMap::new();
         for decl in &out.module.decls {
             if let grasm_syntax::ast::Decl::Import(imp) = decl {
-                let full = imp.path.dotted();
+                let written = imp.path.dotted();
+                // Inside a dependency, a relative import stays inside it —
+                // unless it names another dependency, which is absolute.
+                let root = written.split('.').next().unwrap_or(&written);
+                let full = match &owner {
+                    Some(pkg) if !deps.contains(root) => format!("{pkg}.{written}"),
+                    _ => written,
+                };
                 let alias = imp
                     .path
                     .segments
@@ -166,6 +198,7 @@ pub fn load_from_disk_with(
         deps.insert(name.clone(), dir.clone());
     }
 
+    let dep_names: HashSet<String> = deps.keys().cloned().collect();
     let dirs = entry_src_dir.clone();
     let dep_dirs = deps.clone();
     // The same two candidates the provider tries, so the failure message says
@@ -209,7 +242,13 @@ pub fn load_from_disk_with(
             }
         }
     };
-    Ok(load_with_paths("main", &entry_display, &provider, &tried))
+    Ok(load_with_paths_in(
+        "main",
+        &entry_display,
+        &provider,
+        &tried,
+        &dep_names,
+    ))
 }
 
 /// Dependencies of the package containing `dir`, as name → package directory.

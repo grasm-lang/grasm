@@ -150,3 +150,82 @@ fn tests_in_imported_modules_run() {
         "the summary must count every module's tests:\n{text}"
     );
 }
+
+/// A dependency's own `import` resolves inside that dependency.
+///
+/// It used to resolve against the *consumer's* source directory, so a
+/// same-named file there silently replaced the library's private module. The
+/// program ran, printed the wrong answer, and exited 0.
+#[test]
+fn a_dependencys_private_module_is_not_replaceable_by_the_consumer() {
+    let w = Work::new("modres");
+    let lib = w.0.join("liba");
+    let app = w.0.join("app");
+    std::fs::create_dir_all(lib.join("src/sub")).unwrap();
+    std::fs::create_dir_all(app.join("src/sub")).unwrap();
+    std::fs::write(
+        lib.join("grasm.toml"),
+        "[package]\nname = \"liba\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        lib.join("src/main.gr"),
+        "import sub.helper\n\npub fn f() -> i64 {\n    helper.g()\n}\n",
+    )
+    .unwrap();
+    std::fs::write(lib.join("src/sub/helper.gr"), "pub fn g() -> i64 {\n    7\n}\n").unwrap();
+    std::fs::write(
+        app.join("grasm.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies.liba]\npath = \"../liba\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        app.join("src/main.gr"),
+        "import liba\n\nfn main() {\n    print(\"{liba.f()}\")\n}\n",
+    )
+    .unwrap();
+    // The consumer has a file at the same relative path. The library's own
+    // must win: the library says what its imports mean.
+    std::fs::write(
+        app.join("src/sub/helper.gr"),
+        "pub fn g() -> i64 {\n    999\n}\n",
+    )
+    .unwrap();
+
+    let (code, text) = run(&["run", app.join("src/main.gr").to_str().unwrap()]);
+    assert_eq!(code, 0, "should run:\n{text}");
+    assert!(
+        text.contains('7') && !text.contains("999"),
+        "the dependency's own module must be the one loaded:\n{text}"
+    );
+}
+
+/// A doc example runs even when the entry module declares tests of its own.
+///
+/// The runner picked the *first* test in the module, and the example is
+/// appended after the module's own declarations — so any project with a test
+/// in its entry module had every doc example reported `ok` without being
+/// executed. One evaluation had 13 falsified examples pass at once.
+#[test]
+fn doc_examples_run_even_when_the_entry_module_has_tests() {
+    let w = Work::new("docex");
+    std::fs::create_dir_all(&w.0).unwrap();
+    std::fs::write(
+        w.0.join("lib.gr"),
+        "/// ```\n/// assert(1 == 2)\n/// ```\npub fn f() -> i64 {\n    1\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        w.0.join("main.gr"),
+        "import lib\n\nfn main() {\n    print(\"{lib.f()}\")\n}\n\n\
+         test \"a test of its own\" {\n    assert(true)\n}\n",
+    )
+    .unwrap();
+
+    let (code, text) = run(&["test", w.0.join("main.gr").to_str().unwrap()]);
+    assert_eq!(code, 1, "a false doc example must fail the suite:\n{text}");
+    assert!(
+        text.contains("doc example lib::f ... FAILED"),
+        "the example must actually run:\n{text}"
+    );
+}

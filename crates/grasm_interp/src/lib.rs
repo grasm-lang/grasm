@@ -315,12 +315,16 @@ fn run_doc_examples(
         let mut buf = Vec::new();
         let ok = {
             let mut interp = Interp::new_program(&files, &mut buf);
-            let Some(grasm_syntax::ast::Decl::Test(t)) = entry
-                .decls
-                .iter()
-                .find(|d| matches!(d, grasm_syntax::ast::Decl::Test(_)))
-            else {
-                // example_program always appends one, so this cannot happen.
+            // By name, not by position. `example_program` inlines the
+            // documented module's own declarations — its tests included — and
+            // appends the example after them, so taking the *first* test ran
+            // one of the module's own and reported the example as `ok`. Any
+            // real project has a test in its entry module, so this reported
+            // every doc example in it as passing without executing one.
+            let wanted = example.owner.replace('"', "'");
+            let Some(grasm_syntax::ast::Decl::Test(t)) = entry.decls.iter().find(
+                |d| matches!(d, grasm_syntax::ast::Decl::Test(t) if t.name == wanted),
+            ) else {
                 let _ = writeln!(out, "doc example {} ... FAILED: no test", example.owner);
                 failed += 1;
                 continue;
