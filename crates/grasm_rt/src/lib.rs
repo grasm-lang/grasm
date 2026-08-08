@@ -1860,6 +1860,40 @@ pub extern "C" fn grasm_f64_to_fixed(x: f64, places: i64) -> *mut RtVal {
     alloc(RtPayload::Str(fixed_text(x, places)))
 }
 
+thread_local! {
+    /// The lowest stack address this thread may use, or 0 before the first
+    /// check on it. Per thread, because a worker's stack is somewhere else
+    /// entirely and a limit from another one says nothing about it.
+    static STACK_FLOOR: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How much stack a program may use below its entry frame.
+///
+/// Under the 8 MiB a main thread usually gets, this leaves room for the panic
+/// itself to be reported — which is the whole point of stopping early.
+const STACK_BUDGET: usize = 6 * 1024 * 1024;
+
+/// Panics if the stack has run down past this thread's floor.
+///
+/// Called on entry to every function that can recurse. [E-RECURSION-DEPTH]
+/// requires a panic and exit 101 past the bound — "it does not abort, crash,
+/// or corrupt the process" — and without this a deep enough recursion took
+/// SIGSEGV, exit 139, with nothing on stderr at all.
+///
+/// # Safety: `sp` is an address in the current thread's stack.
+#[no_mangle]
+pub extern "C" fn grasm_stack_check(sp: i64) {
+    let sp = sp as usize;
+    let floor = STACK_FLOOR.with(std::cell::Cell::get);
+    if floor == 0 {
+        STACK_FLOOR.with(|c| c.set(sp.saturating_sub(STACK_BUDGET)));
+        return;
+    }
+    if sp < floor {
+        rt_panic("stack overflow: recursion too deep");
+    }
+}
+
 /// Whether `x` is NaN.
 #[no_mangle]
 pub extern "C" fn grasm_f64_is_nan(x: f64) -> i8 {

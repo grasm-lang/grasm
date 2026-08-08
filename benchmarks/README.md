@@ -23,6 +23,15 @@ numbers taken that way, and they should not be published.
 | Program    | Stresses                                       |
 |------------|------------------------------------------------|
 | `fib`      | function call overhead and integer arithmetic   |
+
+`fib` is the one figure a stack guard shows up in. A compiled Grasm function
+that can recurse checks how much stack is left on entry ([E-RECURSION-DEPTH]);
+without it, deep recursion took SIGSEGV with nothing reported. On `fib` — a
+microbenchmark whose entire body *is* the call — that check costs about 70%.
+On a small recursive interpreter it costs about 5%, and on the loop-based
+programs here it costs nothing, because only functions that can reach
+themselves are guarded. The trade is a measured one and it is the right way
+round: a program that crashes silently has no time to report.
 | `sieve`    | list indexing and tight loops                   |
 | `matmul`   | nested indexing over a flat list                |
 | `wordfreq` | hashing, string handling, map updates           |

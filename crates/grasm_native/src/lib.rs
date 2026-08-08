@@ -295,6 +295,9 @@ struct Codegen<'m> {
     /// effect-free, so each use compiles the expression again rather than
     /// reading a global — which keeps the two engines doing the same thing.
     consts: HashMap<String, grasm_syntax::ast::ConstDecl>,
+    /// Functions that can reach themselves, directly or through others. Only
+    /// these need a stack check.
+    recursive: std::collections::HashSet<String>,
     /// Instantiations discovered at call sites and not yet compiled.
     pending_generics: Vec<PendingGeneric>,
     /// Bindings for the generic parameters of the function being compiled.
@@ -376,6 +379,7 @@ impl<'m> Codegen<'m> {
             only_module: None,
             generic_fns: HashMap::new(),
             consts: HashMap::new(),
+            recursive: std::collections::HashSet::new(),
             pending_generics: Vec::new(),
             generic_subst: HashMap::new(),
         }
@@ -418,6 +422,7 @@ impl<'m> Codegen<'m> {
             ("grasm_f64_is_finite", vec![f64t], Some(i8t)),
             ("grasm_val_cmp", vec![i64t, i64t], Some(i64t)),
             ("grasm_assert_eq", vec![i64t, i64t], None),
+            ("grasm_stack_check", vec![i64t], None),
             ("grasm_str_from_i64", vec![i64t], Some(i64t)),
             ("grasm_str_from_f64", vec![f64t], Some(i64t)),
             ("grasm_str_from_bool", vec![i8t], Some(i64t)),
@@ -624,6 +629,7 @@ impl<'m> Codegen<'m> {
             self.current_module = name.clone();
             self.declare_fns(m)?;
         }
+        self.recursive = recursive_functions(views);
         if !self.fns.contains_key("main::main") {
             return nope(Span::new(0, 1), "programs without a `main` function");
         }
@@ -1106,6 +1112,24 @@ impl<'m> Codegen<'m> {
         let entry = fcx.b.create_block();
         fcx.b.append_block_params_for_function_params(entry);
         fcx.b.switch_to_block(entry);
+        // A function that can recurse checks how much stack is left.
+        // Cranelift emits no such check, so a deep enough recursion took
+        // SIGSEGV with nothing reported, while [E-RECURSION-DEPTH] requires a
+        // panic and exit 101 and says outright that it "does not abort,
+        // crash, or corrupt the process". Only recursive functions pay for
+        // it, and the address of a scratch slot stands in for the stack
+        // pointer.
+        if fcx.cg.recursive.contains(&key) {
+            let slot = fcx.b.create_sized_stack_slot(
+                cranelift_codegen::ir::StackSlotData::new(
+                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                    8,
+                    3,
+                ),
+            );
+            let here = fcx.b.ins().stack_addr(ptr_ty, slot, 0);
+            fcx.call_rt("grasm_stack_check", &[here]);
+        }
         fcx.push_scope();
         let entry_params: Vec<Value> = fcx.b.block_params(entry).to_vec();
         for (i, p) in f.params.iter().enumerate() {
@@ -1782,6 +1806,62 @@ struct BlockHints {
     declared: HashMap<String, Vec<VType>>,
 }
 
+/// Every function that can reach itself, directly or through others.
+///
+/// Only these need a stack check, so a straight-line program pays nothing for
+/// it. A function taking a function *parameter* counts too: the call it makes
+/// through that parameter is opaque here and can close a cycle this cannot
+/// see.
+fn recursive_functions(
+    views: &[(String, &AstModule, std::collections::HashMap<String, String>)],
+) -> std::collections::HashSet<String> {
+    let mut calls: HashMap<String, Vec<String>> = HashMap::new();
+    let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (module, m, imports) in views {
+        for decl in &m.decls {
+            let Decl::Fn(f) = decl else { continue };
+            let key = format!("{module}::{}", f.name.name);
+            if f.params
+                .iter()
+                .any(|p| matches!(p.ty, grasm_syntax::ast::TypeExpr::Fn { .. }))
+            {
+                out.insert(key.clone());
+            }
+            let mut named = Vec::new();
+            collect_named_calls_block(&f.body, &mut named);
+            let callees = named
+                .into_iter()
+                .map(|(name, _)| match name.split_once('.') {
+                    // A qualified call names another module through an alias.
+                    Some((alias, callee)) => match imports.get(alias) {
+                        Some(target) => format!("{target}::{callee}"),
+                        None => format!("{module}::{name}"),
+                    },
+                    None => format!("{module}::{name}"),
+                })
+                .collect();
+            calls.insert(key, callees);
+        }
+    }
+    for start in calls.keys() {
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut stack: Vec<&str> = calls[start].iter().map(String::as_str).collect();
+        while let Some(next) = stack.pop() {
+            if next == start.as_str() {
+                out.insert(start.clone());
+                break;
+            }
+            if !seen.insert(next) {
+                continue;
+            }
+            if let Some(more) = calls.get(next) {
+                stack.extend(more.iter().map(String::as_str));
+            }
+        }
+    }
+    out
+}
+
 /// Every `f(args...)` in a block where `f` is a plain name, innermost first.
 fn collect_named_calls_block(b: &grasm_syntax::ast::Block, out: &mut Vec<(String, Vec<Expr>)>) {
     for st in &b.stmts {
@@ -1836,6 +1916,59 @@ fn collect_named_calls_expr(e: &Expr, out: &mut Vec<(String, Vec<Expr>)>) {
                 }
             }
         }
+        // The rest of the expression forms. Missing `if` here meant the most
+        // ordinary recursive function in the world — `if n <= 0 { 0 } else {
+        // f(n - 1) }` — did not look recursive at all.
+        Expr::If {
+            cond,
+            then_block,
+            else_branch,
+            ..
+        } => {
+            collect_named_calls_expr(cond, out);
+            collect_named_calls_block(then_block, out);
+            match else_branch.as_deref() {
+                Some(grasm_syntax::ast::ElseBranch::Else(b)) => {
+                    collect_named_calls_block(b, out)
+                }
+                Some(grasm_syntax::ast::ElseBranch::ElseIf(e)) => {
+                    collect_named_calls_expr(e, out)
+                }
+                None => {}
+            }
+        }
+        Expr::Match { scrutinee, arms, .. } => {
+            collect_named_calls_expr(scrutinee, out);
+            for a in arms {
+                collect_named_calls_expr(&a.body, out);
+                if let Some(g) = &a.guard {
+                    collect_named_calls_expr(g, out);
+                }
+            }
+        }
+        Expr::List(items, _) | Expr::Tuple(items, _) => {
+            for i in items {
+                collect_named_calls_expr(i, out);
+            }
+        }
+        Expr::Map(entries, _) => {
+            for (k, v) in entries {
+                collect_named_calls_expr(k, out);
+                collect_named_calls_expr(v, out);
+            }
+        }
+        Expr::StructLit { fields, .. } => {
+            for (_, v) in fields {
+                collect_named_calls_expr(v, out);
+            }
+        }
+        Expr::Index { recv, index, .. } => {
+            collect_named_calls_expr(recv, out);
+            collect_named_calls_expr(index, out);
+        }
+        Expr::Field { recv, .. } => collect_named_calls_expr(recv, out),
+        Expr::Closure { body, .. } => collect_named_calls_expr(body, out),
+        Expr::Try { expr, .. } => collect_named_calls_expr(expr, out),
         _ => {}
     }
 }

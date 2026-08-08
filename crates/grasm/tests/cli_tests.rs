@@ -229,3 +229,69 @@ fn doc_examples_run_even_when_the_entry_module_has_tests() {
         "the example must actually run:\n{text}"
     );
 }
+
+/// Deep recursion in a *compiled* program panics rather than crashing.
+///
+/// Cranelift emits no stack check, so past a few hundred thousand frames the
+/// binary took SIGSEGV — exit 139, nothing on stderr — while
+/// [E-RECURSION-DEPTH] requires a panic and exit 101 and says outright that it
+/// "does not abort, crash, or corrupt the process".
+#[test]
+fn deep_recursion_in_a_native_binary_panics_rather_than_crashing() {
+    let w = Work::new("deeprec");
+    std::fs::create_dir_all(&w.0).unwrap();
+    let src = w.0.join("deep.gr");
+    std::fs::write(
+        &src,
+        "fn down(n: i64) -> i64 {\n    if n <= 0 { 0 } else { down(n - 1) + 1 }\n}\n\
+         fn main() {\n    print(\"{down(2000000)}\")\n}\n",
+    )
+    .unwrap();
+    let bin = w.0.join("deep");
+    let (code, _) = run(&[
+        "build",
+        src.to_str().unwrap(),
+        "--native",
+        "-o",
+        bin.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "should build");
+
+    let out = Command::new(&bin).output().expect("runs");
+    assert_eq!(
+        out.status.code(),
+        Some(101),
+        "expected a panic and exit 101, got {:?}",
+        out.status
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("stack overflow"),
+        "the panic must say what happened: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// And the guaranteed depth still works, guard and all.
+#[test]
+fn ten_thousand_frames_work_in_a_native_binary() {
+    let w = Work::new("depth10k");
+    std::fs::create_dir_all(&w.0).unwrap();
+    let src = w.0.join("ok.gr");
+    std::fs::write(
+        &src,
+        "fn down(n: i64) -> i64 {\n    if n <= 0 { 0 } else { down(n - 1) + 1 }\n}\n\
+         fn main() {\n    print(\"{down(10000)}\")\n}\n",
+    )
+    .unwrap();
+    let bin = w.0.join("ok");
+    run(&[
+        "build",
+        src.to_str().unwrap(),
+        "--native",
+        "-o",
+        bin.to_str().unwrap(),
+    ]);
+    let out = Command::new(&bin).output().expect("runs");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "10000");
+}

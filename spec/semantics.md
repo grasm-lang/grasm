@@ -67,7 +67,10 @@ rather than trapping. `i64::MIN % -1` is `0`, as `x % -1` is for every `x`.
 **[E-RECURSION-DEPTH]** Recursion is bounded. **At least 10,000 nested calls
 are guaranteed to work.** Past an implementation's own bound the program
 panics with a stack-overflow message and exit 101 — it does not abort, crash,
-or corrupt the process. The bound above the guaranteed minimum is
+or corrupt the process. This holds for compiled programs too: a function that
+can reach itself checks the remaining stack on entry, because nothing in the
+generated code would otherwise notice, and the failure was SIGSEGV with an
+empty stderr. The bound above the guaranteed minimum is
 implementation-defined and differs between the two engines, so a program that
 recurses deeper than 10,000 should not assume it will run everywhere.
 
