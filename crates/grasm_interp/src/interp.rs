@@ -49,6 +49,10 @@ pub struct Interp<'a, W: Write> {
     /// qualified `mod::fn` → decl
     fns: HashMap<String, &'a FnDecl>,
     current_module: String,
+    /// Module-level constants by `module::NAME`. Effect-free, so each use
+    /// evaluates the initializer again — the same thing the native backend
+    /// does, rather than two different notions of when a constant happens.
+    consts: HashMap<String, &'a grasm_syntax::ast::ConstDecl>,
     /// module → (alias → target module)
     imports: HashMap<String, HashMap<String, String>>,
     /// sum type name → variant names (arity implied by decl).
@@ -137,6 +141,10 @@ impl<'a, W: Write> Interp<'a, W> {
                     self.fns
                         .insert(format!("{mod_name}::{}", f.name.name), f);
                 }
+                Decl::Const(c) => {
+                    self.consts
+                        .insert(format!("{mod_name}::{}", c.name.name), c);
+                }
                 Decl::Type(t) => {
                     if let TypeBody::Sum(vs) = &t.body {
                         let list: Vec<(String, usize)> = vs
@@ -181,6 +189,7 @@ impl<'a, W: Write> Interp<'a, W> {
         Interp {
             fns,
             current_module: "main".to_string(),
+            consts: HashMap::new(),
             imports: HashMap::new(),
             sums,
             variants,
@@ -989,6 +998,11 @@ impl<'a, W: Write> Interp<'a, W> {
             });
         }
         let qual = format!("{}::{}", self.current_module, id.name);
+        // A module-level constant: its initializer is effect-free, so
+        // evaluating it here is the whole of what the name means.
+        if let Some(c) = self.consts.get(&qual).copied() {
+            return self.eval_expr(&c.init);
+        }
         if self.fns.contains_key(&qual) {
             return Ok(Value::FnRef(Rc::new(qual)));
         }

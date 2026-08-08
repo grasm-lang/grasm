@@ -67,6 +67,21 @@ Copies are lazy — a copy costs a reference-count bump and only becomes a real
 copy on mutation of a shared value — but that is an optimization you cannot
 observe.
 
+A `let` at module level is a **constant** — one value for the whole program:
+
+```
+let TABLE_WIDTH = 77
+let TITLE = "Sales report"
+
+fn main() {
+    print("{TITLE}, {TABLE_WIDTH} wide")
+}
+```
+
+A constant's value cannot perform effects. It is evaluated wherever its name
+is used, so an effect in it would happen once per mention; a value that has to
+be computed once, with effects, is a function.
+
 ## 3. Types
 
 Scalars are `i64`, `f64`, `bool`, `str`. Collections are `[T]` and

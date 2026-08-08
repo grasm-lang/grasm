@@ -635,7 +635,10 @@ fn declaration_recovery_always_makes_progress() {
         "bench\n",
         "bench bench\n",
         "42\n",
-        "let x = 1\n",
+        // `let x = 1` used to belong here; it is a module-level constant now.
+        // `let` with nothing after it still fails.
+        "let\n",
+        "let = 1\n",
         "]\n",
         "bench {\n}\nfn main() {\n}\n",
     ] {

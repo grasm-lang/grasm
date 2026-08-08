@@ -90,8 +90,9 @@ one of them is reported by name rather than as a stray token.
 
 ```
 module      = declaration*
-declaration = fn_decl | type_decl | effect_decl | test_decl | bench_decl
-            | import_decl
+declaration = fn_decl | const_decl | type_decl | effect_decl | test_decl
+            | bench_decl | import_decl
+const_decl  = "pub"? "let" identifier ( ":" nested )? "=" expression
 
 fn_decl     = "pub"? "fn" identifier generics? params ret? err? effects? block
 generics    = "[" identifier ( "," identifier )* "]"

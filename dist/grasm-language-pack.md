@@ -105,8 +105,9 @@ one of them is reported by name rather than as a stray token.
 
 ```
 module      = declaration*
-declaration = fn_decl | type_decl | effect_decl | test_decl | bench_decl
-            | import_decl
+declaration = fn_decl | const_decl | type_decl | effect_decl | test_decl
+            | bench_decl | import_decl
+const_decl  = "pub"? "let" identifier ( ":" nested )? "=" expression
 
 fn_decl     = "pub"? "fn" identifier generics? params ret? err? effects? block
 generics    = "[" identifier ( "," identifier )* "]"
@@ -603,6 +604,14 @@ evaluate left to right before the call.
 
 **[E-SHORTCIRCUIT]** `and` does not evaluate its right operand when the left is
 `false`; `or` does not when the left is `true`.
+
+**[E-CONST]** A module-level `let` is a constant: one value for the whole
+program, not assignable, and **its initializer may not perform effects**. It
+is evaluated wherever the name is used, so an effect in it would happen once
+per mention — which would make how often something happens a property of how
+many times a name appears. That is why the restriction exists rather than
+being a limitation to work around: a value that has to be computed once, with
+effects, is a function.
 
 **[E-CLOSURE-CAPTURE]** A closure captures the values it uses **at the moment
 it is created**, not the bindings. Changing a captured variable afterwards is
@@ -1145,6 +1154,21 @@ fn main() {
 Copies are lazy — a copy costs a reference-count bump and only becomes a real
 copy on mutation of a shared value — but that is an optimization you cannot
 observe.
+
+A `let` at module level is a **constant** — one value for the whole program:
+
+```
+let TABLE_WIDTH = 77
+let TITLE = "Sales report"
+
+fn main() {
+    print("{TITLE}, {TABLE_WIDTH} wide")
+}
+```
+
+A constant's value cannot perform effects. It is evaluated wherever its name
+is used, so an effect in it would happen once per mention; a value that has to
+be computed once, with effects, is a function.
 
 ## 3. Types
 
@@ -1759,6 +1783,36 @@ fn main() {
     print("{some ?? 0}")
     let none: Option[i64] = None
     print("{none ?? 7}")
+}
+```
+
+## `E-CONST.gr`
+
+```grasm
+//! tag: E-CONST
+//! expect: output
+//! Sales report is 77 wide, tab 9
+//! #####
+//! [10, 20, 30] 3
+//! 77 154
+// A module-level `let` is a constant. Without them every layout constant had
+// to be a zero-argument function, which is what a program ends up full of.
+let TABLE_WIDTH = 77
+let TAB = 9
+let TITLE: str = "Sales report"
+let LIMITS = [10, 20, 30]
+/// A constant may be computed from another declared before it.
+let DOUBLE_WIDTH = TABLE_WIDTH * 2
+
+fn bar(n: i64) -> str {
+    "#".repeat(n.min(TABLE_WIDTH))
+}
+
+fn main() {
+    print("{TITLE} is {TABLE_WIDTH} wide, tab {TAB}")
+    print("{bar(5)}")
+    print("{LIMITS} {LIMITS.len()}")
+    print("{TABLE_WIDTH} {DOUBLE_WIDTH}")
 }
 ```
 

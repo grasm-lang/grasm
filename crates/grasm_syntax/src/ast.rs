@@ -49,6 +49,7 @@ impl Module {
 pub fn decl_span(d: &Decl) -> Span {
     match d {
         Decl::Fn(f) => f.span,
+        Decl::Const(c) => c.span,
         Decl::Type(t) => t.span,
         Decl::Effect(e) => e.span,
         Decl::Test(t) => t.span,
@@ -60,11 +61,24 @@ pub fn decl_span(d: &Decl) -> Span {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Decl {
     Fn(FnDecl),
+    /// `let NAME = expr` at module level.
+    Const(ConstDecl),
     Type(TypeDecl),
     Effect(EffectDecl),
     Test(TestDecl),
     Bench(BenchDecl),
     Import(ImportDecl),
+}
+
+/// A module-level constant. Immutable, and its initializer must be free of
+/// effects, because it is evaluated wherever the name is used.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConstDecl {
+    pub is_pub: bool,
+    pub name: Ident,
+    pub ty: Option<TypeExpr>,
+    pub init: Expr,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]

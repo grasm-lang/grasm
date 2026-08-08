@@ -1,0 +1,25 @@
+//! tag: E-CONST
+//! expect: output
+//! Sales report is 77 wide, tab 9
+//! #####
+//! [10, 20, 30] 3
+//! 77 154
+// A module-level `let` is a constant. Without them every layout constant had
+// to be a zero-argument function, which is what a program ends up full of.
+let TABLE_WIDTH = 77
+let TAB = 9
+let TITLE: str = "Sales report"
+let LIMITS = [10, 20, 30]
+/// A constant may be computed from another declared before it.
+let DOUBLE_WIDTH = TABLE_WIDTH * 2
+
+fn bar(n: i64) -> str {
+    "#".repeat(n.min(TABLE_WIDTH))
+}
+
+fn main() {
+    print("{TITLE} is {TABLE_WIDTH} wide, tab {TAB}")
+    print("{bar(5)}")
+    print("{LIMITS} {LIMITS.len()}")
+    print("{TABLE_WIDTH} {DOUBLE_WIDTH}")
+}

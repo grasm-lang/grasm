@@ -393,6 +393,7 @@ impl Server {
         for decl in &module.decls {
             let (name, kind, span) = match decl {
                 Decl::Fn(f) => (f.name.name.clone(), 12, f.span), // Function
+                Decl::Const(c) => (c.name.name.clone(), 14, c.span), // Constant
                 Decl::Type(t) => (t.name.name.clone(), 23, t.span), // Struct
                 Decl::Effect(e) => (e.name.name.clone(), 11, e.span), // Interface
                 Decl::Test(t) => (format!("test {:?}", t.name), 12, t.span),

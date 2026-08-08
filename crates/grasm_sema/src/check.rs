@@ -60,6 +60,10 @@ fn check_modules(files: &[ModuleView]) -> Analysis {
     }
     for f in files {
         c.current_module = f.name.clone();
+        c.collect_consts(f.module);
+    }
+    for f in files {
+        c.current_module = f.name.clone();
         c.collect_fns(f.module);
     }
     for f in files {
@@ -132,6 +136,8 @@ struct Checker {
     /// program never mentioned. The body waits until the end of its block, by
     /// which point the uses have had their say.
     deferred_closures: Vec<Vec<DeferredClosure>>,
+    /// Module-level constants: `module::NAME` to (type, is_pub).
+    consts: HashMap<String, (Type, bool)>,
     /// (ret, err) of the function being checked.
     fn_ret: Type,
     fn_err: Option<Type>,
@@ -179,6 +185,7 @@ impl Checker {
             closure_floors: Vec::new(),
             current_generics: Vec::new(),
             deferred_closures: Vec::new(),
+            consts: HashMap::new(),
             fn_ret: Type::Unit,
             fn_err: None,
             err_open: false,
@@ -366,6 +373,31 @@ impl Checker {
                 });
                 self.effects.insert(e.name.name.clone(), (ops, handler_id));
             }
+        }
+    }
+
+    /// Module-level constants.
+    ///
+    /// The initializer is checked here, so a constant may name a type or a
+    /// function from any module but not another constant declared later —
+    /// which keeps "what does this name mean" answerable by reading forwards.
+    fn collect_consts(&mut self, module: &Module) {
+        for decl in &module.decls {
+            let Decl::Const(c) = decl else { continue };
+            let key = format!("{}::{}", self.current_module, c.name.name);
+            if self.consts.contains_key(&key) {
+                self.error(c.name.span, format!("duplicate constant `{}`", c.name.name));
+                continue;
+            }
+            let ty = match &c.ty {
+                Some(te) => {
+                    let want = self.resolve_type(te, &[]);
+                    self.check_expr(&c.init, &want);
+                    want
+                }
+                None => self.infer_expr(&c.init),
+            };
+            self.consts.insert(key, (self.uni.resolve(&ty), c.is_pub));
         }
     }
 
@@ -1004,6 +1036,16 @@ declare it before `parallel`",
                     );
                 }
                 Some(_) => {}
+                None if self
+                    .consts
+                    .contains_key(&format!("{}::{}", self.current_module, id.name)) =>
+                {
+                    self.error_help(
+                        id.span,
+                        format!("cannot assign to `{}` — it is a constant", id.name),
+                        "constants have one value for the whole program; use a `var` if it needs to change",
+                    );
+                }
                 None => {
                     self.error(id.span, format!("unknown variable `{}`", id.name));
                 }
@@ -1246,6 +1288,16 @@ declare it before `parallel`",
                     "qualify it as `TypeName.Variant`",
                 );
             }
+        }
+        // A module-level constant. Looked up before functions, because a
+        // constant and a function cannot share a name and the constant is the
+        // more specific reading of a bare identifier.
+        if let Some((ty, _)) = self
+            .consts
+            .get(&format!("{}::{}", self.current_module, id.name))
+            .cloned()
+        {
+            return ty;
         }
         // Function referenced as a value. A fallible function's `! E` is
         // part of what it answers with, so it has to travel with the value —

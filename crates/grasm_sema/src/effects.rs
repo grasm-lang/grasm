@@ -222,6 +222,36 @@ pub fn check_effects_multi(files: &[ModuleView]) -> Vec<Diagnostic> {
 
     let mut diags = Vec::new();
 
+    // A module-level constant is evaluated wherever its name is used, so an
+    // initializer with effects would run once per use — which is not what
+    // anybody writing `let WIDTH = ...` means, and makes the number of times
+    // an effect happens a property of how often a name is mentioned.
+    for f in files {
+        let current = f.name.clone();
+        for d in &f.module.decls {
+            let Decl::Const(c) = d else { continue };
+            let mut row = BTreeSet::new();
+            let mut active = Vec::new();
+            let fnb = FnBindings::default();
+            walk_expr(&c.init, &current, &mut active, &ctx, &fnb, &mut row);
+            if !row.is_empty() {
+                let names: Vec<String> = row.iter().cloned().collect();
+                diags.push(
+                    Diagnostic::error(
+                        c.init.span(),
+                        format!(
+                            "a constant's value cannot perform effects, and this performs `{}`",
+                            names.join("`, `")
+                        ),
+                    )
+                    .with_help(
+                        "a constant is evaluated wherever its name is used, so this would happen once per mention — make it a function instead",
+                    ),
+                );
+            }
+        }
+    }
+
     // Declared rows are upper bounds.
     for (key, f) in &ctx.fns {
         if let Some(declared) = &f.effects {

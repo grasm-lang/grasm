@@ -363,6 +363,9 @@ impl Parser {
         }
         match self.cur() {
             TokenKind::KwFn => Ok(Decl::Fn(self.parse_fn(is_pub)?)),
+            // `let WIDTH = 77` at module level. Without it every layout
+            // constant became a zero-argument function.
+            TokenKind::KwLet => Ok(Decl::Const(self.parse_const(is_pub)?)),
             TokenKind::KwType => Ok(Decl::Type(self.parse_type_decl(is_pub)?)),
             TokenKind::KwEffect => Ok(Decl::Effect(self.parse_effect_decl()?)),
             TokenKind::KwTest => Ok(Decl::Test(self.parse_test_decl()?)),
@@ -370,11 +373,33 @@ impl Parser {
             _ => {
                 let found = self.cur().describe();
                 self.error_here(format!(
-                    "expected a declaration (`fn`, `type`, `effect`, `test`, `bench`, `import`) but found {found}"
+                    "expected a declaration (`fn`, `let`, `type`, `effect`, `test`, `bench`, `import`) but found {found}"
                 ));
                 Err(())
             }
         }
+    }
+
+    fn parse_const(&mut self, is_pub: bool) -> PResult<ConstDecl> {
+        let start = self.cur_span();
+        self.expect(&TokenKind::KwLet)?;
+        let name = self.ident()?;
+        let ty = if self.eat(&TokenKind::Colon) {
+            Some(self.parse_type_nested()?)
+        } else {
+            None
+        };
+        self.expect(&TokenKind::Eq)?;
+        self.skip_newlines_if_continuation();
+        let init = self.parse_expr()?;
+        let span = start.merge(init.span());
+        Ok(ConstDecl {
+            is_pub,
+            name,
+            ty,
+            init,
+            span,
+        })
     }
 
     fn parse_fn(&mut self, is_pub: bool) -> PResult<FnDecl> {

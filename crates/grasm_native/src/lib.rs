@@ -291,6 +291,10 @@ struct Codegen<'m> {
     /// thing as a generic machine-code symbol, so each *instantiation* becomes
     /// its own concrete function.
     generic_fns: HashMap<String, FnDecl>,
+    /// Module-level constants, by `module::NAME`. Their initializers are
+    /// effect-free, so each use compiles the expression again rather than
+    /// reading a global — which keeps the two engines doing the same thing.
+    consts: HashMap<String, grasm_syntax::ast::ConstDecl>,
     /// Instantiations discovered at call sites and not yet compiled.
     pending_generics: Vec<PendingGeneric>,
     /// Bindings for the generic parameters of the function being compiled.
@@ -371,6 +375,7 @@ impl<'m> Codegen<'m> {
             module_imports: HashMap::new(),
             only_module: None,
             generic_fns: HashMap::new(),
+            consts: HashMap::new(),
             pending_generics: Vec::new(),
             generic_subst: HashMap::new(),
         }
@@ -909,6 +914,12 @@ impl<'m> Codegen<'m> {
     fn declare_fns(&mut self, module_ast: &AstModule) -> CResult<()> {
         for decl in &module_ast.decls {
             match decl {
+                // Constants are inlined at each use, so there is no symbol to
+                // declare — see `const_inits`.
+                Decl::Const(c) => {
+                    self.consts
+                        .insert(format!("{}::{}", self.current_module, c.name.name), c.clone());
+                }
                 Decl::Fn(f) => {
                     if !f.generics.is_empty() {
                         // No signature until a call site says what the type
@@ -3443,6 +3454,13 @@ impl FnCx<'_, '_> {
                 self.b.ins().iconst(types::I8, i64::from(*v)),
                 VType::Bool,
             ))),
+            Expr::Ident(id) if self.lookup(&id.name).is_none() && self.const_of(&id.name).is_some() => {
+                // A module-level constant. The initializer is effect-free, so
+                // compiling it here is the whole of what the name means — no
+                // global, and the same rule the interpreter follows.
+                let init = self.const_of(&id.name).expect("just checked");
+                self.eval_expr(&init)
+            }
             Expr::Ident(id) => match self.lookup(&id.name) {
                 Some((var, vt)) => {
                     let v = self.b.use_var(var);
@@ -5651,6 +5669,14 @@ impl FnCx<'_, '_> {
         out
     }
 
+    /// The initializer of a module-level constant with this name, if any.
+    fn const_of(&self, name: &str) -> Option<Expr> {
+        self.cg
+            .consts
+            .get(&format!("{}::{}", self.cg.current_module, name))
+            .map(|c| c.init.clone())
+    }
+
     /// Static type probe without emitting code. Best-effort but covers the
     /// realistic expression shapes; used for merge-block param types.
     fn probe_type(&mut self, e: &Expr) -> CResult<VType> {
@@ -5739,6 +5765,10 @@ impl FnCx<'_, '_> {
                     lt
                 }
             },
+            Expr::Ident(id) if self.lookup(&id.name).is_none() && self.const_of(&id.name).is_some() => {
+                let init = self.const_of(&id.name).expect("just checked");
+                self.probe_type(&init)?
+            }
             Expr::Ident(id) => match self.lookup(&id.name) {
                 Some((_, vt)) => vt,
                 None if self

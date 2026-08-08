@@ -309,6 +309,10 @@ pub fn module_signature(module: &Module) -> String {
                 out.push_str(&fn_signature(f));
                 out.push('\n');
             }
+            Decl::Const(c) => {
+                out.push_str(&const_signature(c));
+                out.push('\n');
+            }
             Decl::Type(t) => {
                 out.push_str(&type_signature(t));
                 out.push('\n');
@@ -386,9 +390,19 @@ pub fn examples(program: &Program) -> Vec<Example> {
     out
 }
 
+/// `let NAME: T` — the value is not part of the signature, only the promise
+/// that the name exists and what type it has.
+pub fn const_signature(c: &grasm_syntax::ast::ConstDecl) -> String {
+    match &c.ty {
+        Some(t) => format!("let {}: {}", c.name.name, type_text(t)),
+        None => format!("let {}", c.name.name),
+    }
+}
+
 fn decl_name(d: &Decl) -> String {
     match d {
         Decl::Fn(f) => f.name.name.clone(),
+        Decl::Const(c) => c.name.name.clone(),
         Decl::Type(t) => t.name.name.clone(),
         Decl::Effect(e) => e.name.name.clone(),
         Decl::Test(t) => t.name.clone(),

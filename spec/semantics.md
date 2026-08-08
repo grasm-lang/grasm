@@ -23,6 +23,14 @@ evaluate left to right before the call.
 **[E-SHORTCIRCUIT]** `and` does not evaluate its right operand when the left is
 `false`; `or` does not when the left is `true`.
 
+**[E-CONST]** A module-level `let` is a constant: one value for the whole
+program, not assignable, and **its initializer may not perform effects**. It
+is evaluated wherever the name is used, so an effect in it would happen once
+per mention — which would make how often something happens a property of how
+many times a name appears. That is why the restriction exists rather than
+being a limitation to work around: a value that has to be computed once, with
+effects, is a function.
+
 **[E-CLOSURE-CAPTURE]** A closure captures the values it uses **at the moment
 it is created**, not the bindings. Changing a captured variable afterwards is
 not visible inside, and a closure may not write to one at all — that is a
