@@ -39,6 +39,7 @@ fn run_src_here(
     let mut interp = Interp::new(&module, out);
     interp.program_args = program_args.to_vec();
     let code = interp.run_main();
+    report_fault(&interp.fault);
     (code, vec![])
 }
 
@@ -71,19 +72,52 @@ fn on_deep_stack<T: Send>(f: impl FnOnce() -> T + Send) -> T {
     })
 }
 
-pub fn run_module<W: Write + Send>(module: &Module, out: &mut W) -> i32 {
+/// Runs a program and hands back its fault text instead of printing it.
+///
+/// The conformance harness needs to *read* a panic message, which is exactly
+/// what sending it to stderr takes away from an in-process caller.
+pub fn run_src_capturing_fault<W: Write + Send>(
+    src: &str,
+    out: &mut W,
+) -> (i32, Option<String>, Vec<grasm_syntax::Diagnostic>) {
     on_deep_stack(move || {
-        let mut interp = Interp::new(module, out);
-        interp.run_main()
+        let (module, diags) = grasm_sema::analyze(src);
+        if !diags.is_empty() {
+            return (1, None, diags);
+        }
+        let mut interp = Interp::new(&module, out);
+        let code = interp.run_main();
+        (code, interp.fault.clone(), vec![])
     })
 }
 
-/// Run a loaded program, also returning the call stack if it panicked.
+/// Sends a panic or an unhandled `main` error to stderr.
+///
+/// It is not the program's output: on stdout it lands in the middle of
+/// whatever is reading the program, which is the one place it cannot be
+/// noticed and the one place it does damage ([E-PANIC-EXIT]).
+fn report_fault(fault: &Option<String>) {
+    if let Some(f) = fault {
+        eprintln!("{f}");
+    }
+}
+
+pub fn run_module<W: Write + Send>(module: &Module, out: &mut W) -> i32 {
+    on_deep_stack(move || {
+        let mut interp = Interp::new(module, out);
+        let code = interp.run_main();
+        report_fault(&interp.fault);
+        code
+    })
+}
+
+/// Run a loaded program, also returning the call stack if it panicked and
+/// the fault text, which has already been reported on stderr.
 pub fn run_program_traced<W: Write + Send>(
     program: &grasm_sema::loader::Program,
     program_args: &[String],
     out: &mut W,
-) -> (i32, Vec<Frame>) {
+) -> (i32, Vec<Frame>, Option<String>) {
     on_deep_stack(move || run_program_traced_here(program, program_args, out))
 }
 
@@ -91,7 +125,7 @@ fn run_program_traced_here(
     program: &grasm_sema::loader::Program,
     program_args: &[String],
     out: &mut impl Write,
-) -> (i32, Vec<Frame>) {
+) -> (i32, Vec<Frame>, Option<String>) {
     let files: Vec<(String, &Module, std::collections::HashMap<String, String>)> = program
         .files
         .iter()
@@ -100,8 +134,9 @@ fn run_program_traced_here(
     let mut interp = Interp::new_program(&files, out);
     interp.program_args = program_args.to_vec();
     let code = interp.run_main();
+    report_fault(&interp.fault);
     let trace = interp.panic_trace().unwrap_or_default().to_vec();
-    (code, trace)
+    (code, trace, interp.fault.clone())
 }
 
 /// Run a loaded multi-file program. Assumes it already checked clean.
@@ -125,7 +160,9 @@ fn run_program_here(
         .collect();
     let mut interp = Interp::new_program(&files, out);
     interp.program_args = program_args.to_vec();
-    interp.run_main()
+    let code = interp.run_main();
+    report_fault(&interp.fault);
+    code
 }
 
 /// Run the entry module's test blocks of a loaded program.

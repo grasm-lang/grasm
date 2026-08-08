@@ -1,13 +1,22 @@
 //! End-to-end interpreter tests: source in, stdout + exit code out.
 
+/// The program's output, with a panic or unhandled `main` error appended.
+///
+/// Those go to stderr now ([E-PANIC-EXIT]), so a test that wants to read one
+/// asks for it rather than finding it mixed into what the program printed.
 fn run(src: &str) -> (i32, String) {
     let mut out = Vec::new();
-    let (code, diags) = grasm_interp::run_src(src, &mut out);
+    let (code, fault, diags) = grasm_interp::run_src_capturing_fault(src, &mut out);
     assert!(
         diags.is_empty(),
         "unexpected diagnostics:\n{diags:#?}\nfor:\n{src}"
     );
-    (code, String::from_utf8(out).unwrap())
+    let mut text = String::from_utf8(out).unwrap();
+    if let Some(f) = fault {
+        text.push_str(&f);
+        text.push('\n');
+    }
+    (code, text)
 }
 
 fn run_expect(src: &str, expected_out: &str) {

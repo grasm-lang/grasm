@@ -64,6 +64,13 @@ pub struct Interp<'a, W: Write> {
     /// Innermost-last handler stack: (effect name, op name → closure).
     handlers: Vec<(String, HashMap<String, Value>)>,
     pub out: &'a mut W,
+    /// A panic or an unhandled error from `main`, if one ended the run.
+    ///
+    /// These are not the program's output. Printing them to stdout put them
+    /// in the middle of whatever a pipeline was reading, so the interpreter
+    /// records them and the caller decides — every caller sends them to
+    /// stderr ([E-PANIC-EXIT]).
+    pub fault: Option<String>,
     /// Recursion guard.
     depth: u32,
     /// Active calls, innermost last: (qualified name, call site).
@@ -182,6 +189,7 @@ impl<'a, W: Write> Interp<'a, W> {
             effect_names,
             handlers: Vec::new(),
             out,
+            fault: None,
             depth: 0,
             call_stack: Vec::new(),
             cur_span: grasm_syntax::span::Span::new(0, 0),
@@ -200,23 +208,23 @@ impl<'a, W: Write> Interp<'a, W> {
     /// Runs `main`. Returns process exit code.
     pub fn run_main(&mut self) -> i32 {
         let Some(main) = self.fns.get("main::main").copied() else {
-            let _ = writeln!(self.out, "error: no `main` function");
+            self.fault = Some("error: no `main` function".to_string());
             return 1;
         };
         match self.call_decl_at(main, "main", vec![], main.span) {
             // A fallible `main` returns Err as a *value*; report it rather
             // than exiting 0 as if nothing happened.
             Ok(Value::Err(e)) => {
-                let _ = writeln!(self.out, "error: unhandled error from main: {e}");
+                self.fault = Some(format!("error: unhandled error from main: {e}"));
                 1
             }
             Ok(_) => 0,
             Err(Flow::Err(e)) => {
-                let _ = writeln!(self.out, "error: unhandled error from main: {e}");
+                self.fault = Some(format!("error: unhandled error from main: {e}"));
                 1
             }
             Err(Flow::Panic(msg)) => {
-                let _ = writeln!(self.out, "panic: {msg}");
+                self.fault = Some(format!("panic: {msg}"));
                 101
             }
             Err(Flow::Exit(code)) => code,

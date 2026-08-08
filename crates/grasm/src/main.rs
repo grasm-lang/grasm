@@ -40,7 +40,7 @@ fn main() -> ExitCode {
                 Err(code) => return code,
             };
             let mut stdout = std::io::stdout();
-            let (code, trace) =
+            let (code, trace, _fault) =
                 grasm_interp::run_program_traced(&program, &prog_args, &mut stdout);
             let _ = stdout.flush();
             print_trace(&program, &trace);
@@ -643,7 +643,7 @@ fn run_bundle(bundle: &Bundle, program_args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
     let mut stdout = std::io::stdout();
-    let (code, trace) = grasm_interp::run_program_traced(&program, program_args, &mut stdout);
+    let (code, trace, _fault) = grasm_interp::run_program_traced(&program, program_args, &mut stdout);
     let _ = stdout.flush();
     print_trace(&program, &trace);
     ExitCode::from(code.clamp(0, 255) as u8)

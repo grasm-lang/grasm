@@ -73,7 +73,11 @@ pub extern "C" fn grasm_out_nl() {
 // ---------------------------------------------------------------------------
 
 fn rt_panic(msg: &str) -> ! {
-    let mut out = std::io::stdout().lock();
+    // stdout is the program's output; a panic printed into it corrupts
+    // whatever is reading ([E-PANIC-EXIT]). Flush stdout first so anything
+    // already produced is not lost behind the exit.
+    let _ = std::io::stdout().flush();
+    let mut out = std::io::stderr().lock();
     let _ = writeln!(out, "panic: {msg}");
     let _ = out.flush();
     std::process::exit(101);
@@ -1478,7 +1482,9 @@ pub unsafe extern "C" fn grasm_report_main_err(v: *mut RtVal) {
     let RtPayload::Variant { fields, .. } = &(*v).payload else {
         rt_panic("bad main error value");
     };
-    let mut out = std::io::stdout().lock();
+    // stderr, for the same reason a panic goes there ([E-MAIN-ERR]).
+    let _ = std::io::stdout().flush();
+    let mut out = std::io::stderr().lock();
     let _ = writeln!(out, "error: unhandled error from main: {}", display(fields[0]));
     let _ = out.flush();
     std::process::exit(1);

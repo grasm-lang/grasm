@@ -1747,6 +1747,67 @@ struct BlockHints {
     /// Every binding's initializer, so an argument naming a binding declared
     /// after the closure can still be typed.
     inits: HashMap<String, Expr>,
+    /// `apply(f, 5)` where `apply` declares `fn(i64) -> i64`: the signature
+    /// says what `f`'s parameters are, and no call of `f` by name ever will.
+    declared: HashMap<String, Vec<VType>>,
+}
+
+/// Every `f(args...)` in a block where `f` is a plain name, innermost first.
+fn collect_named_calls_block(b: &grasm_syntax::ast::Block, out: &mut Vec<(String, Vec<Expr>)>) {
+    for st in &b.stmts {
+        collect_named_calls_stmt(st, out);
+    }
+}
+
+fn collect_named_calls_stmt(st: &Stmt, out: &mut Vec<(String, Vec<Expr>)>) {
+    match st {
+        Stmt::Let { init, .. } => collect_named_calls_expr(init, out),
+        Stmt::LetTuple { init, .. } => collect_named_calls_expr(init, out),
+        Stmt::Assign { value, .. } => collect_named_calls_expr(value, out),
+        Stmt::Return(Some(e), _) | Stmt::Expr(e) => collect_named_calls_expr(e, out),
+        Stmt::While { cond, body, .. } => {
+            collect_named_calls_expr(cond, out);
+            collect_named_calls_block(body, out);
+        }
+        Stmt::For { iter, body, .. } => {
+            collect_named_calls_expr(iter, out);
+            collect_named_calls_block(body, out);
+        }
+        _ => {}
+    }
+}
+
+fn collect_named_calls_expr(e: &Expr, out: &mut Vec<(String, Vec<Expr>)>) {
+    match e {
+        Expr::Call { callee, args, .. } => {
+            if let Expr::Ident(id) = &**callee {
+                out.push((id.name.clone(), args.to_vec()));
+            }
+            for a in args {
+                collect_named_calls_expr(a, out);
+            }
+        }
+        Expr::MethodCall { recv, args, .. } => {
+            collect_named_calls_expr(recv, out);
+            for a in args {
+                collect_named_calls_expr(a, out);
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_named_calls_expr(lhs, out);
+            collect_named_calls_expr(rhs, out);
+        }
+        Expr::Unary { expr, .. } => collect_named_calls_expr(expr, out),
+        Expr::Block(b) => collect_named_calls_block(b, out),
+        Expr::Str(pieces, _) => {
+            for p in pieces {
+                if let StrPiece::Expr(inner) = p {
+                    collect_named_calls_expr(inner, out);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn collect_block_hints(blk: &grasm_syntax::ast::Block) -> BlockHints {
@@ -1800,6 +1861,40 @@ fn collect_calls_expr(e: &Expr, bound: &[String], out: &mut HashMap<String, Vec<
         if let Expr::Ident(id) = &**callee {
             if bound.contains(&id.name) {
                 out.entry(id.name.clone()).or_insert_with(|| args.to_vec());
+            }
+        }
+    }
+    // `xs.filter(f)` never calls `f` by name, so the rule above sees nothing
+    // and the closure has no parameter types. But the receiver says what they
+    // are: one element of `xs`. Recording `xs[0]` as a stand-in argument is
+    // enough — the hint is only ever *probed*, never evaluated, so an index
+    // that might be out of range costs nothing.
+    if let Expr::MethodCall { recv, name, args, span } = e {
+        let per_element = matches!(
+            name.name.as_str(),
+            "map" | "par_map" | "filter" | "par_filter" | "any" | "all" | "find" | "sort_by"
+        );
+        if per_element || name.name == "fold" {
+            let elem = Expr::Index {
+                recv: recv.clone(),
+                index: Box::new(Expr::Int(0, *span)),
+                span: *span,
+            };
+            for (i, a) in args.iter().enumerate() {
+                let Expr::Ident(id) = a else { continue };
+                if !bound.contains(&id.name) {
+                    continue;
+                }
+                // `fold(init, f)` takes the accumulator first.
+                let stand_in = if name.name == "fold" {
+                    if i == 0 {
+                        continue;
+                    }
+                    vec![args[0].clone(), elem.clone()]
+                } else {
+                    vec![elem.clone()]
+                };
+                out.entry(id.name.clone()).or_insert(stand_in);
             }
         }
     }
@@ -2584,7 +2679,9 @@ impl FnCx<'_, '_> {
         blk: &grasm_syntax::ast::Block,
     ) -> CResult<(Option<(Value, VType)>, bool)> {
         self.push_scope();
-        self.closure_hints.push(collect_block_hints(blk));
+        let mut hints = collect_block_hints(blk);
+        self.declared_fn_arg_types(blk, &mut hints);
+        self.closure_hints.push(hints);
         // The hint belongs to this block's tail and to no other. Taking it
         // means a nested block sees nothing — a `fail` inside an `if` is not
         // the function's return value, and typing it as one is how this first
@@ -4174,7 +4271,10 @@ impl FnCx<'_, '_> {
                     ..
                 } = &args[0]
                 else {
-                    return nope(args[0].span(), "par_filter with a non-literal closure");
+                    return nope(
+                        args[0].span(),
+                        "par_filter with a closure bound to a name (write it inline, or as a top-level `fn`, which parallel workers can call)",
+                    );
                 };
                 if cparams.len() != 1 {
                     return nope(args[0].span(), "par_filter with multiple parameters");
@@ -4192,7 +4292,10 @@ impl FnCx<'_, '_> {
                     ..
                 } = &args[0]
                 else {
-                    return nope(args[0].span(), "par_map with a non-literal closure");
+                    return nope(
+                        args[0].span(),
+                        "par_map with a closure bound to a name (write it inline, or as a top-level `fn`, which parallel workers can call)",
+                    );
                 };
                 if cparams.len() != 1 {
                     return nope(args[0].span(), "par_map with multiple parameters");
@@ -6316,6 +6419,37 @@ impl FnCx<'_, '_> {
     /// Parameter types of a closure literal, inferred from how the body uses
     /// them. Only a few shapes are inferable without a function-type syntax,
     /// so anything else is reported rather than assumed.
+    /// Records, for each closure bound in this block, the parameter types any
+    /// function it is *passed to* declares. `collect_block_hints` cannot do
+    /// this: it is a free function and the signatures live on the compiler.
+    fn declared_fn_arg_types(&mut self, blk: &grasm_syntax::ast::Block, hints: &mut BlockHints) {
+        let bound: Vec<String> = hints
+            .inits
+            .iter()
+            .filter(|(_, init)| matches!(init, Expr::Closure { params, .. } if !params.is_empty()))
+            .map(|(n, _)| n.clone())
+            .collect();
+        if bound.is_empty() {
+            return;
+        }
+        let mut calls: Vec<(String, Vec<Expr>)> = Vec::new();
+        collect_named_calls_block(blk, &mut calls);
+        for (fname, args) in calls {
+            let Some(sig) = self.lookup_fn(&fname).map(|s| s.params.clone()) else {
+                continue;
+            };
+            for (i, a) in args.iter().enumerate() {
+                let Expr::Ident(id) = a else { continue };
+                if !bound.contains(&id.name) {
+                    continue;
+                }
+                if let Some(VType::Fn(ps, _)) = sig.get(i) {
+                    hints.declared.entry(id.name.clone()).or_insert(ps.clone());
+                }
+            }
+        }
+    }
+
     fn closure_param_types(
         &mut self,
         params: &[Ident],
@@ -6327,6 +6461,19 @@ impl FnCx<'_, '_> {
         }
         // The parameter types come from a call site of whatever the closure
         // was bound to. Nothing else in the language says what they are.
+        // A declared signature is the surer source, so it is asked first.
+        if let Some(name) = binding {
+            let declared = self
+                .closure_hints
+                .iter()
+                .rev()
+                .find_map(|scope| scope.declared.get(name).cloned());
+            if let Some(ts) = declared {
+                if ts.len() == params.len() {
+                    return Ok(ts);
+                }
+            }
+        }
         let hint = binding.and_then(|name| {
             self.closure_hints
                 .iter()

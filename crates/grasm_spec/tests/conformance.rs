@@ -213,7 +213,9 @@ fn run_case(case: &Case) -> (i32, String, Vec<String>) {
 
 fn run_program(source: &str) -> (i32, String, Vec<String>) {
     let mut out = Vec::new();
-    let (code, diags) = grasm_interp::run_src(source, &mut out);
+    // A panic goes to stderr now ([E-PANIC-EXIT]), so it is collected rather
+    // than read back out of the program's own output.
+    let (code, fault, diags) = grasm_interp::run_src_capturing_fault(source, &mut out);
     let messages = diags
         .iter()
         .map(|d| {
@@ -225,7 +227,12 @@ fn run_program(source: &str) -> (i32, String, Vec<String>) {
             m
         })
         .collect();
-    (code, String::from_utf8_lossy(&out).into_owned(), messages)
+    let mut text = String::from_utf8_lossy(&out).into_owned();
+    if let Some(f) = fault {
+        text.push_str(&f);
+        text.push('\n');
+    }
+    (code, text, messages)
 }
 
 #[test]

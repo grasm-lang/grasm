@@ -119,6 +119,15 @@ struct Checker {
     /// reported "unknown type `T`" and suggested declaring it with `type`,
     /// which is advice that cannot work.
     current_generics: Vec<String>,
+    /// Closure bodies not yet checked, one list per open block.
+    ///
+    /// `let f = |p| p.n` says nothing about what `p` is; only a later
+    /// `ps.sort_by(f)` does. A closure parameter cannot be annotated, so
+    /// checking the body where it is written is checking it against nothing —
+    /// which reported `_1 has no field n`, naming an inference variable the
+    /// program never mentioned. The body waits until the end of its block, by
+    /// which point the uses have had their say.
+    deferred_closures: Vec<Vec<DeferredClosure>>,
     /// (ret, err) of the function being checked.
     fn_ret: Type,
     fn_err: Option<Type>,
@@ -133,6 +142,14 @@ struct Checker {
     /// parallel block, and is gone by the time the task runs.
     task_capture: Option<(usize, usize)>,
     loop_depth: u32,
+}
+
+/// A closure whose body is checked once its parameter types are settled.
+struct DeferredClosure {
+    params: Vec<Ident>,
+    body: Expr,
+    param_tys: Vec<Type>,
+    ret: Type,
 }
 
 impl Checker {
@@ -157,6 +174,7 @@ impl Checker {
             scopes: Vec::new(),
             closure_floors: Vec::new(),
             current_generics: Vec::new(),
+            deferred_closures: Vec::new(),
             fn_ret: Type::Unit,
             fn_err: None,
             err_open: false,
@@ -592,6 +610,7 @@ impl Checker {
     /// Returns the block's value type (last expression statement, else unit).
     fn check_block(&mut self, b: &Block) -> Type {
         self.scopes.push(HashMap::new());
+        self.deferred_closures.push(Vec::new());
         let mut ty = Type::Unit;
         let n = b.stmts.len();
         for (i, stmt) in b.stmts.iter().enumerate() {
@@ -600,8 +619,33 @@ impl Checker {
                 ty = Type::Unit;
             }
         }
+        // Every use in this block has now been seen, so the deferred bodies
+        // have types to be checked against. Checking one can defer another.
+        while let Some(next) = self.deferred_closures.last_mut().and_then(|v| v.pop()) {
+            self.check_deferred_closure(next);
+        }
+        self.deferred_closures.pop();
         self.scopes.pop();
         ty
+    }
+
+    fn check_deferred_closure(&mut self, d: DeferredClosure) {
+        self.scopes.push(HashMap::new());
+        self.closure_floors.push(self.scopes.len() - 1);
+        for (p, t) in d.params.iter().zip(&d.param_tys) {
+            self.bind(p, t.clone(), false);
+        }
+        let produced = self.infer_expr(&d.body);
+        self.closure_floors.pop();
+        self.scopes.pop();
+        if !self.uni.unify(&produced, &d.ret) {
+            let got = self.show(&produced);
+            let want = self.show(&d.ret);
+            self.error(
+                d.body.span(),
+                format!("this closure produces `{got}` but `{want}` is expected here"),
+            );
+        }
     }
 
     fn check_stmt(&mut self, s: &Stmt) -> Type {
@@ -2017,10 +2061,11 @@ declare it before `parallel`",
                                 ret: Box::new(key.clone()),
                             };
                             self.check_expr(&args[0], &f);
+                            // No default here: the key function may be a
+                            // closure whose body has not been checked yet, so
+                            // an unresolved key is "not known", not "an int".
                             let k = self.uni.shallow_resolve(&key);
-                            if let Type::Var(_) = k {
-                                self.uni.unify(&key, &Type::I64);
-                            } else if !self.is_ordered(&k) {
+                            if !self.is_ordered(&k) {
                                 let shown = self.show(&key);
                                 self.error_help(
                                     span,
@@ -2843,6 +2888,23 @@ declare it before `parallel`",
                         want_params.len()
                     ),
                 );
+            }
+        }
+        // Nothing here says what the parameters are, so the body waits for
+        // whatever does. Zero-parameter closures have nothing to wait for.
+        if expected.is_none() && !params.is_empty() {
+            let ret = self.uni.fresh();
+            if let Some(slot) = self.deferred_closures.last_mut() {
+                slot.push(DeferredClosure {
+                    params: params.clone(),
+                    body: (**body).clone(),
+                    param_tys: param_tys.clone(),
+                    ret: ret.clone(),
+                });
+                return Type::Fn {
+                    params: param_tys,
+                    ret: Box::new(ret),
+                };
             }
         }
         self.scopes.push(HashMap::new());

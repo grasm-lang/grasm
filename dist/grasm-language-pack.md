@@ -689,11 +689,17 @@ zero times.
 **[E-ERR-PROPAGATE]** `try` on `Err(e)` returns `Err(e)` from the enclosing
 function immediately, skipping the rest of its body.
 
-**[E-PANIC-EXIT]** A panic prints `panic: <message>` and exits with status
-101. It is a program bug, not a recoverable condition.
+**[E-PANIC-EXIT]** A panic prints `panic: <message>` **on stderr** and exits
+with status 101. It is a program bug, not a recoverable condition. It is not
+the program's output either: on stdout it lands in the middle of whatever is
+reading the program, which is the one place it does damage and the one place
+nobody looks.
 
 **[E-MAIN-ERR]** An error reaching `main` prints
-`error: unhandled error from main: <value>` and exits with status 1.
+`error: unhandled error from main: <value>` on stderr and exits with status 1.
+
+Which is to say: stdout is what a program *produces*, stderr is what went
+wrong with it, and the two never mix.
 
 ## 7. Effects
 
