@@ -1,0 +1,29 @@
+//! tag: T-MAP-KEY-GENERIC
+//! expect: output
+//! {a: 3, b: 1, c: 1}
+//! {1: 2, 2: 1}
+//! {true: 1}
+// A type parameter may stand where a map key goes; each call site is where
+// the rule is applied. There is no bounds syntax, so without this the most
+// repeated shape a counting program has could not be declared at all.
+fn bump[K](inout m: Map[K, i64], k: K) {
+    m.set(k, (m.get(k) ?? 0) + 1)
+}
+
+fn main() {
+    var words: Map[str, i64] = {}
+    for w in "a b a c a".words() {
+        bump(words, w)
+    }
+    print("{words}")
+
+    var nums: Map[i64, i64] = {}
+    for n in [1, 2, 1] {
+        bump(nums, n)
+    }
+    print("{nums}")
+
+    var flags: Map[bool, i64] = {}
+    bump(flags, true)
+    print("{flags}")
+}

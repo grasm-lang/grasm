@@ -1,0 +1,26 @@
+//! tag: L-LIB-SORT-NAN
+//! expect: output
+//! [1.0, 2.0, 3.0, 4.0, 5.0, NaN]
+//! [-inf, -1.0, 0.0, 1.0, inf, NaN]
+//! [(1.0, a), (2.0, b), (NaN, c)]
+// A NaN in a list of floats used to leave the whole list unsorted, not just
+// the NaN misplaced: calling every NaN comparison "equal" is not an order,
+// and a sort given a non-order returns whatever it happens to return. One
+// `nan` cell in an otherwise clean file was enough to scramble a column.
+fn nan() -> f64 {
+    "nan".parse_float() ?? 0.0
+}
+
+fn main() {
+    var xs = [5.0, 4.0, 3.0, nan(), 2.0, 1.0]
+    xs.sort()
+    print("{xs}")
+    // NaN sorts last; the infinities sit at the ends where they belong.
+    var ys = [1.0, nan(), 0.0 - 1.0, 1.0 / 0.0, 0.0, (0.0 - 1.0) / 0.0]
+    ys.sort()
+    print("{ys}")
+    // And the same order is what a float sort key uses.
+    var ps = [(nan(), "c"), (2.0, "b"), (1.0, "a")]
+    ps.sort_by(|p| p.0)
+    print("{ps}")
+}

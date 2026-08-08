@@ -18,8 +18,14 @@ aliases for `f64`. Distinct fixed-width types are designed but unimplemented.
 
 **[T-LIST]** `[T]` is a homogeneous, growable sequence of `T`.
 
-**[T-MAP]** `Map[K, V]` maps keys to values. **[T-MAP-KEY]** `K` must be
-`i64`, `str`, or `bool`; any other key type is a compile error.
+**[T-MAP]** `Map[K, V]` maps keys to values. **[T-MAP-KEY]** `K` must be `i64`, `str`, or `bool`; any other key type is a
+compile error.
+
+**[T-MAP-KEY-GENERIC]** A *type parameter* is allowed where a map key goes,
+and [T-MAP-KEY] is applied at each call site instead, once the arguments have
+said what the parameter is. There is no bounds syntax, so without this a
+generic helper over maps — `fn bump[K](inout m: Map[K, i64], k: K)`, which is
+the most repeated shape a counting program has — could not be written at all.
 
 **[T-TUPLE]** `(A, B, …)` is a fixed-size heterogeneous product.
 

@@ -505,44 +505,50 @@ unsafe fn inc(v: *mut RtVal) {
 
 /// # Safety
 /// `v` must be a live pointer produced by this runtime.
+/// Releases a value, and anything it was the last owner of.
+///
+/// Iterative, not recursive. A list a hundred thousand deep is an ordinary
+/// thing for a parser to build, and freeing it by recursion ran out of stack
+/// and killed the process with a signal — no message, no exit code anyone
+/// could act on, and in direct contradiction of [E-RECURSION-DEPTH], which
+/// says a program past the bound panics rather than crashing. The depth a
+/// structure can reach is not the depth the code that frees it should need.
 unsafe fn dec(v: *mut RtVal) {
-    if v.is_null() {
-        return;
-    }
-    let rc = &(*v).rc;
-    if rc.get() == IMMORTAL {
-        return;
-    }
-    rc.set(rc.get() - 1);
-    if rc.get() <= 0 {
-        let boxed = Box::from_raw(v);
-        match &boxed.payload {
-            RtPayload::List(items) | RtPayload::Tuple(items) => {
-                for &it in items {
-                    dec(it);
+    let mut pending: Vec<*mut RtVal> = Vec::new();
+    let mut cur = v;
+    loop {
+        if !cur.is_null() {
+            let rc = &(*cur).rc;
+            if rc.get() != IMMORTAL {
+                rc.set(rc.get() - 1);
+                if rc.get() <= 0 {
+                    let boxed = Box::from_raw(cur);
+                    match &boxed.payload {
+                        RtPayload::List(items) | RtPayload::Tuple(items) => {
+                            pending.extend(items.iter().copied());
+                        }
+                        RtPayload::Map(entries) => {
+                            pending.extend(entries.values().copied());
+                        }
+                        RtPayload::Struct { fields, .. } => {
+                            pending.extend(fields.iter().map(|(_, fv)| *fv));
+                        }
+                        RtPayload::Fn { env, .. } => {
+                            if !env.is_null() {
+                                pending.push(*env);
+                            }
+                        }
+                        RtPayload::Variant { fields, .. } => {
+                            pending.extend(fields.iter().copied());
+                        }
+                        _ => {}
+                    }
                 }
             }
-            RtPayload::Map(entries) => {
-                for &v in entries.values() {
-                    dec(v);
-                }
-            }
-            RtPayload::Struct { fields, .. } => {
-                for (_, fv) in fields {
-                    dec(*fv);
-                }
-            }
-            RtPayload::Fn { env, .. } => {
-                if !env.is_null() {
-                    dec(*env);
-                }
-            }
-            RtPayload::Variant { fields, .. } => {
-                for &fv in fields {
-                    dec(fv);
-                }
-            }
-            _ => {}
+        }
+        match pending.pop() {
+            Some(next) => cur = next,
+            None => return,
         }
     }
 }
@@ -921,9 +927,9 @@ fn scalar_cmp(kind: ScalarKind, a: i64, b: i64) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     match kind {
         ScalarKind::I64 => a.cmp(&b),
-        ScalarKind::F64 => f64::from_bits(a as u64)
-            .partial_cmp(&f64::from_bits(b as u64))
-            .unwrap_or(Ordering::Equal),
+        // A total order — see `cmp_vals`. An unboxed list of floats is the
+        // one most likely to hold a NaN and be sorted.
+        ScalarKind::F64 => f64::from_bits(a as u64).total_cmp(&f64::from_bits(b as u64)),
         ScalarKind::Bool => Ordering::Equal,
     }
 }
@@ -1851,8 +1857,63 @@ pub extern "C" fn grasm_f64_to_fixed(x: f64, places: i64) -> *mut RtVal {
     if !(0..=17).contains(&places) {
         rt_panic(&format!("to_fixed({places}): places must be 0 to 17"));
     }
-    alloc(RtPayload::Str(format!("{:.*}", places as usize, x)))
+    alloc(RtPayload::Str(fixed_text(x, places)))
 }
+
+/// `x` as text with exactly `places` digits after the point, ties **away from
+/// zero** — the same rule `round` uses ([L-LIB-ROUND]).
+pub fn fixed_text(x: f64, places: i64) -> String {
+    let p = places as usize;
+    if !x.is_finite() {
+        return format!("{x:.p$}");
+    }
+    // Rust's formatting rounds half to *even*, and `round` rounds half away
+    // from zero — two rules in one language, in the function every report's
+    // money column goes through. This keeps `round`'s rule.
+    //
+    // Only an exact tie is affected, and telling one apart from a value that
+    // merely looks like one has to be done on the true stored value: 2.675 is
+    // really 2.67499…, so it is not a tie and must round down. An exact tie is
+    // a terminating decimal, so looking well past the requested precision
+    // distinguishes "5000…" from "4999…" without any scaling error.
+    const LOOKAHEAD: usize = 25;
+    let wide = format!("{:.*}", p + LOOKAHEAD, x.abs());
+    let (head, tail) = wide.split_at(wide.len() - LOOKAHEAD);
+    let tie = tail.as_bytes()[0] == b'5' && tail.as_bytes()[1..].iter().all(|&b| b == b'0');
+    if !tie {
+        return format!("{x:.p$}");
+    }
+    let bumped = bump_last_digit(head.trim_end_matches('.'));
+    if x.is_sign_negative() {
+        format!("-{bumped}")
+    } else {
+        bumped
+    }
+}
+
+/// A decimal string plus one unit in its last place, carrying as needed.
+fn bump_last_digit(s: &str) -> String {
+    let mut digits: Vec<u8> = s.bytes().collect();
+    let mut i = digits.len();
+    loop {
+        if i == 0 {
+            digits.insert(0, b'1');
+            break;
+        }
+        i -= 1;
+        if digits[i] == b'.' {
+            continue;
+        }
+        if digits[i] == b'9' {
+            digits[i] = b'0';
+            continue;
+        }
+        digits[i] += 1;
+        break;
+    }
+    String::from_utf8(digits).expect("digits stay ascii")
+}
+
 
 /// The Unicode code point of character `i`, counting characters not bytes.
 ///
@@ -2042,7 +2103,9 @@ unsafe fn cmp_vals(a: *mut RtVal, b: *mut RtVal) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     match (&(*a).payload, &(*b).payload) {
         (RtPayload::I64(x), RtPayload::I64(y)) => x.cmp(y),
-        (RtPayload::F64(x), RtPayload::F64(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+        // A total order, so a sort stays a sort even with a NaN in the list
+        // ([L-LIB-SORT-NAN]).
+        (RtPayload::F64(x), RtPayload::F64(y)) => x.total_cmp(y),
         (RtPayload::Str(x), RtPayload::Str(y)) => x.cmp(y),
         // A tuple of ordered things is ordered, component by component — this
         // is what a multi-key sort is.

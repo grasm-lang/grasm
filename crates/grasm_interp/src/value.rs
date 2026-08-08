@@ -7,13 +7,63 @@ use std::rc::Rc;
 
 use grasm_syntax::ast::{Block, Ident};
 
-/// A float, always distinguishable from an integer.
+/// `x` as text with exactly `places` digits after the point, ties **away from
+/// zero** — the same rule `round` uses ([L-LIB-ROUND]).
 ///
-/// [L-DISPLAY] promises a point, and the point is the whole property: without
-/// it a large `f64` prints exactly like an `i64`, and a reader of a program's
-/// output cannot tell which they have. The rule used to be "a point below
-/// 1e15", which meant the guarantee quietly stopped holding at a boundary
-/// nobody could see — and the conformance program only tested values below it.
+/// The twin of `grasm_rt::fixed_text`, kept in step by the differential suite
+/// the way `float_text` is.
+pub fn fixed_text(x: f64, places: i64) -> String {
+    let p = places as usize;
+    if !x.is_finite() {
+        return format!("{x:.p$}");
+    }
+    // Rust's formatting rounds half to *even*, and `round` rounds half away
+    // from zero — two rules in one language, in the function every report's
+    // money column goes through. This keeps `round`'s rule.
+    //
+    // Only an exact tie is affected, and telling one apart from a value that
+    // merely looks like one has to be done on the true stored value: 2.675 is
+    // really 2.67499…, so it is not a tie and must round down. An exact tie is
+    // a terminating decimal, so looking well past the requested precision
+    // distinguishes "5000…" from "4999…" without any scaling error.
+    const LOOKAHEAD: usize = 25;
+    let wide = format!("{:.*}", p + LOOKAHEAD, x.abs());
+    let (head, tail) = wide.split_at(wide.len() - LOOKAHEAD);
+    let tie = tail.as_bytes()[0] == b'5' && tail.as_bytes()[1..].iter().all(|&b| b == b'0');
+    if !tie {
+        return format!("{x:.p$}");
+    }
+    let bumped = bump_last_digit(head.trim_end_matches('.'));
+    if x.is_sign_negative() {
+        format!("-{bumped}")
+    } else {
+        bumped
+    }
+}
+
+/// A decimal string plus one unit in its last place, carrying as needed.
+fn bump_last_digit(s: &str) -> String {
+    let mut digits: Vec<u8> = s.bytes().collect();
+    let mut i = digits.len();
+    loop {
+        if i == 0 {
+            digits.insert(0, b'1');
+            break;
+        }
+        i -= 1;
+        if digits[i] == b'.' {
+            continue;
+        }
+        if digits[i] == b'9' {
+            digits[i] = b'0';
+            continue;
+        }
+        digits[i] += 1;
+        break;
+    }
+    String::from_utf8(digits).expect("digits stay ascii")
+}
+
 pub fn float_text(v: f64) -> String {
     let s = format!("{v}");
     if v.is_finite() && !s.contains(['.', 'e', 'E']) {

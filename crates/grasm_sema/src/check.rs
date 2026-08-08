@@ -1563,6 +1563,16 @@ declare it before `parallel`",
             let want = substitute_generics(p, &fresh);
             self.check_expr(a, &want);
         }
+        // Now that the arguments have fixed the type parameters, a `Map[K, _]`
+        // parameter has a real key type — which is where the key rule lands
+        // for a generic ([T-MAP-KEY]). Checking it in the loop above would ask
+        // before the answer existed.
+        if !fresh.is_empty() {
+            for (a, p) in args.iter().zip(&info.params) {
+                let want = substitute_generics(p, &fresh);
+                self.require_map_keys_within(&want, a.span());
+            }
+        }
         // Ownership Tier-0: `own` moves, `inout` needs an exclusive mutable place.
         let mut inout_roots: Vec<(String, Span)> = Vec::new();
         let mut own_roots: Vec<String> = Vec::new();
@@ -2317,12 +2327,38 @@ declare it before `parallel`",
         Some(t)
     }
 
+    /// Applies the map-key rule to every map inside a type.
+    ///
+    /// Declaring `Map[K, V]` with a type parameter is allowed; each call site
+    /// is where `K` is finally something, and so where the rule lands.
+    fn require_map_keys_within(&mut self, t: &Type, span: Span) {
+        match self.uni.resolve(t) {
+            Type::Map(k, v) => {
+                self.require_map_key(&k, span);
+                self.require_map_keys_within(&v, span);
+            }
+            Type::List(e) => self.require_map_keys_within(&e, span),
+            Type::Tuple(parts) => {
+                for p in parts {
+                    self.require_map_keys_within(&p, span);
+                }
+            }
+            Type::Fallible(ok, _) => self.require_map_keys_within(&ok, span),
+            _ => {}
+        }
+    }
+
     /// Map keys must be orderable primitives.
     fn require_map_key(&mut self, k: &Type, span: Span) {
         let r = self.uni.resolve(k);
+        // A type *parameter* is allowed here and checked at each call site
+        // instead ([T-MAP-KEY]). Without this a generic helper over maps —
+        // `fn bump[K](inout m: Map[K, i64], k: K)`, the most repeated shape
+        // there is — could not be declared at all, and there are no bounds to
+        // declare it with.
         if !matches!(
             r,
-            Type::I64 | Type::Str | Type::Bool | Type::Var(_) | Type::Error
+            Type::I64 | Type::Str | Type::Bool | Type::Var(_) | Type::Generic(_) | Type::Error
         ) {
             let shown = self.show(k);
             self.error_help(

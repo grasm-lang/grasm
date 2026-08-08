@@ -304,8 +304,14 @@ aliases for `f64`. Distinct fixed-width types are designed but unimplemented.
 
 **[T-LIST]** `[T]` is a homogeneous, growable sequence of `T`.
 
-**[T-MAP]** `Map[K, V]` maps keys to values. **[T-MAP-KEY]** `K` must be
-`i64`, `str`, or `bool`; any other key type is a compile error.
+**[T-MAP]** `Map[K, V]` maps keys to values. **[T-MAP-KEY]** `K` must be `i64`, `str`, or `bool`; any other key type is a
+compile error.
+
+**[T-MAP-KEY-GENERIC]** A *type parameter* is allowed where a map key goes,
+and [T-MAP-KEY] is applied at each call site instead, once the arguments have
+said what the parameter is. There is no bounds syntax, so without this a
+generic helper over maps — `fn bump[K](inout m: Map[K, i64], k: K)`, which is
+the most repeated shape a counting program has — could not be written at all.
 
 **[T-TUPLE]** `(A, B, …)` is a fixed-size heterogeneous product.
 
@@ -889,6 +895,20 @@ many digits after the point, 0 to 17; anything else panics. Both engines
 format through the same code, so they agree digit for digit — which a
 formatter built by hand out of `round` and `to_str` cannot promise, and which
 is what every report with an average needs.
+
+Ties go **away from zero**, the same rule `round` uses ([L-LIB-ROUND]), so
+`(2.5).to_fixed(0)` is `"3"` and `(0.125).to_fixed(2)` is `"0.13"`. A tie
+means the *stored* value is exactly halfway, which is rarer than it looks:
+`2.675` is really `2.67499…`, so `(2.675).to_fixed(2)` is `"2.67"`. Nothing is
+scaled to decide this — scaling `2.675` by 100 lands on `267.5` and would
+round it the wrong way.
+
+**[L-LIB-SORT-NAN]** Floats sort by a **total** order: `-NaN` before every
+number, `NaN` after every number, and `-0.0` before `0.0`. This is not IEEE
+comparison, where a NaN is unordered with everything — `<` keeps that. A sort
+needs an order, and calling every NaN comparison "equal" is not one: given a
+non-order a sort returns a list that is not sorted *at all*, so one `nan` cell
+in a file scrambled a whole column rather than misplacing one value.
 
 **[L-LIB-ROUND]** `round` breaks ties **away from zero**: `2.5` and `3.5`
 round to `3.0` and `4.0`, `-2.5` to `-3.0`, `-0.5` to `-1.0`. It is not
@@ -3195,12 +3215,23 @@ fn hash(s: str) -> i64 {
 ```grasm
 //! tag: L-LIB-FIXED
 //! expect: output
+//! 3 4 1 -1
+//! 0.13 0.38 -0.13
+//! 2.67 9.99 1.00
+//! 100 0.01
 //! 289.22 289 289.22222
 //! -1.5 0.000
 //! 0.3333
 //! [      3.50]
 //! 6.875 2.292
 fn main() {
+    // Ties go away from zero, matching `round` ([L-LIB-ROUND]).
+    print("{(2.5).to_fixed(0)} {(3.5).to_fixed(0)} {(0.5).to_fixed(0)} {(0.0 - 0.5).to_fixed(0)}")
+    print("{(0.125).to_fixed(2)} {(0.375).to_fixed(2)} {(0.0 - 0.125).to_fixed(2)}")
+    // A tie is a property of the stored value: 2.675 is really 2.67499...
+    print("{(2.675).to_fixed(2)} {(9.995).to_fixed(2)} {(1.005).to_fixed(2)}")
+    // Carrying past the point.
+    print("{(99.5).to_fixed(0)} {(0.005).to_fixed(2)}")
     let mean = 289.2222222222222
     print("{mean.to_fixed(2)} {mean.to_fixed(0)} {mean.to_fixed(5)}")
     // Negatives and zero keep the requested width.
@@ -3461,6 +3492,37 @@ fn main() {
 
 fn age_of(p: P) -> i64 {
     p.age
+}
+```
+
+## `L-LIB-SORT-NAN.gr`
+
+```grasm
+//! tag: L-LIB-SORT-NAN
+//! expect: output
+//! [1.0, 2.0, 3.0, 4.0, 5.0, NaN]
+//! [-inf, -1.0, 0.0, 1.0, inf, NaN]
+//! [(1.0, a), (2.0, b), (NaN, c)]
+// A NaN in a list of floats used to leave the whole list unsorted, not just
+// the NaN misplaced: calling every NaN comparison "equal" is not an order,
+// and a sort given a non-order returns whatever it happens to return. One
+// `nan` cell in an otherwise clean file was enough to scramble a column.
+fn nan() -> f64 {
+    "nan".parse_float() ?? 0.0
+}
+
+fn main() {
+    var xs = [5.0, 4.0, 3.0, nan(), 2.0, 1.0]
+    xs.sort()
+    print("{xs}")
+    // NaN sorts last; the infinities sit at the ends where they belong.
+    var ys = [1.0, nan(), 0.0 - 1.0, 1.0 / 0.0, 0.0, (0.0 - 1.0) / 0.0]
+    ys.sort()
+    print("{ys}")
+    // And the same order is what a float sort key uses.
+    var ps = [(nan(), "c"), (2.0, "b"), (1.0, "a")]
+    ps.sort_by(|p| p.0)
+    print("{ps}")
 }
 ```
 
@@ -4354,6 +4416,40 @@ fn main() {
     var xs: [i64] = [1, 2]
     xs.push(3)
     print("{xs} {xs.len()} {xs[0]}")
+}
+```
+
+## `T-MAP-KEY-GENERIC.gr`
+
+```grasm
+//! tag: T-MAP-KEY-GENERIC
+//! expect: output
+//! {a: 3, b: 1, c: 1}
+//! {1: 2, 2: 1}
+//! {true: 1}
+// A type parameter may stand where a map key goes; each call site is where
+// the rule is applied. There is no bounds syntax, so without this the most
+// repeated shape a counting program has could not be declared at all.
+fn bump[K](inout m: Map[K, i64], k: K) {
+    m.set(k, (m.get(k) ?? 0) + 1)
+}
+
+fn main() {
+    var words: Map[str, i64] = {}
+    for w in "a b a c a".words() {
+        bump(words, w)
+    }
+    print("{words}")
+
+    var nums: Map[i64, i64] = {}
+    for n in [1, 2, 1] {
+        bump(nums, n)
+    }
+    print("{nums}")
+
+    var flags: Map[bool, i64] = {}
+    bump(flags, true)
+    print("{flags}")
 }
 ```
 

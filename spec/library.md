@@ -88,6 +88,20 @@ format through the same code, so they agree digit for digit — which a
 formatter built by hand out of `round` and `to_str` cannot promise, and which
 is what every report with an average needs.
 
+Ties go **away from zero**, the same rule `round` uses ([L-LIB-ROUND]), so
+`(2.5).to_fixed(0)` is `"3"` and `(0.125).to_fixed(2)` is `"0.13"`. A tie
+means the *stored* value is exactly halfway, which is rarer than it looks:
+`2.675` is really `2.67499…`, so `(2.675).to_fixed(2)` is `"2.67"`. Nothing is
+scaled to decide this — scaling `2.675` by 100 lands on `267.5` and would
+round it the wrong way.
+
+**[L-LIB-SORT-NAN]** Floats sort by a **total** order: `-NaN` before every
+number, `NaN` after every number, and `-0.0` before `0.0`. This is not IEEE
+comparison, where a NaN is unordered with everything — `<` keeps that. A sort
+needs an order, and calling every NaN comparison "equal" is not one: given a
+non-order a sort returns a list that is not sorted *at all*, so one `nan` cell
+in a file scrambled a whole column rather than misplacing one value.
+
 **[L-LIB-ROUND]** `round` breaks ties **away from zero**: `2.5` and `3.5`
 round to `3.0` and `4.0`, `-2.5` to `-3.0`, `-0.5` to `-1.0`. It is not
 banker's rounding, and a report's figures depend on which it is.

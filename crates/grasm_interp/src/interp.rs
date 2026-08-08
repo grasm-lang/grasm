@@ -1754,7 +1754,7 @@ impl<'a, W: Write> Interp<'a, W> {
                         "to_fixed({places}): places must be 0 to 17"
                     )));
                 }
-                Value::str(format!("{:.*}", places as usize, f))
+                Value::str(crate::value::fixed_text(*f, places))
             }
             (Value::Int(i), "as_f64") => Value::Float(*i as f64),
             (Value::Int(i), "abs") => Value::Int(i.abs()),
@@ -2061,7 +2061,11 @@ fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => x.cmp(y),
-        (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+        // `total_cmp`, not `partial_cmp`. Calling every NaN comparison `Equal`
+        // is not a total order, and a sort given one does not merely misplace
+        // the NaN — it returns a list that is not sorted at all. One `nan`
+        // cell in a CSV was enough to scramble the whole column.
+        (Value::Float(x), Value::Float(y)) => x.total_cmp(y),
         (Value::Str(x), Value::Str(y)) => x.cmp(y),
         // A tuple of ordered things is ordered, component by component — this
         // is what a multi-key sort is.

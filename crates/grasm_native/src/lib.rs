@@ -4461,7 +4461,16 @@ impl FnCx<'_, '_> {
                 };
                 (self.call_rt(f, &[rv, a]).unwrap(), VType::I64)
             }
-            (VType::F64, "as_i64") => (self.b.ins().fcvt_to_sint(types::I64, rv), VType::I64),
+            // Saturating, not trapping. `"1e400".parse_float()` succeeds and
+            // gives `inf`, so an out-of-range float reaches this from
+            // ordinary data — and the trapping conversion killed the process
+            // with SIGILL, no message, while the interpreter saturated. Rust's
+            // `as` does the same thing this does: NaN to 0, the infinities to
+            // the ends.
+            (VType::F64, "as_i64") => (
+                self.b.ins().fcvt_to_sint_sat(types::I64, rv),
+                VType::I64,
+            ),
             (VType::F64, "to_str") => (
                 self.call_rt("grasm_str_from_f64", &[rv]).unwrap(),
                 VType::Str,
