@@ -1,0 +1,17 @@
+//! tag: L-LIB-WORDS
+//! expect: output
+//! [2026-08-09T10:00:00Z, INFO, server, started]
+//! 10 4
+//! [] [] [a, b, c]
+//! [a, , b] [a, b]
+fn main() {
+    // A line of aligned columns: what `split(" ")` cannot read.
+    let line = "2026-08-09T10:00:00Z INFO     server   started"
+    print("{line.words()}")
+    print("{line.split(" ").len()} {line.words().len()}")
+    // Empty, all-whitespace, and mixed whitespace kinds.
+    print("{"".words()} {"   ".words()} {"\ta\nb  c ".words()}")
+    // The two are different on purpose: `split` keeps the empty, `words` does
+    // not, and a CSV needs the first while a log line needs the second.
+    print("{"a,,b".split(",")} {"a  b".words()}")
+}

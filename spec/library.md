@@ -45,6 +45,7 @@ is judged on.
 |------|-----------|---------|
 | `i64` | decimal | `-7` |
 | `f64` | shortest form that round-trips, **always with a point** at every magnitude | `1.5`, `1000000.0`, `1000000000000000.0`, `-0.0` |
+| `f64`, not finite | `inf`, `-inf`, `NaN` — `NaN` is the one mixed-case rendering here | `inf` |
 | `()` | `()` | |
 | `bool` | `true` / `false` | |
 | `str` | its characters, **unquoted and unescaped** | `b c` |
@@ -87,6 +88,12 @@ format through the same code, so they agree digit for digit — which a
 formatter built by hand out of `round` and `to_str` cannot promise, and which
 is what every report with an average needs.
 
+**[L-LIB-ROUND]** `round` breaks ties **away from zero**: `2.5` and `3.5`
+round to `3.0` and `4.0`, `-2.5` to `-3.0`, `-0.5` to `-1.0`. It is not
+banker's rounding, and a report's figures depend on which it is.
+`(i64_min).abs()` is `i64_min`: there is no positive `i64` that far out, and
+the wrap is the same one `/` and `%` take ([E-ARITH-INT]).
+
 **[L-LIB-NUM]**
 
 | method | type | notes |
@@ -115,7 +122,8 @@ because the text may not be a number.
 | `s.substr(start, len)` | `(i64, i64) -> str` | **start and length**, not start and end |
 | `s.chars()` | `-> [str]` | one single-character string per element |
 | `s.lines()` | `-> [str]` | splits on newlines; no trailing empty line |
-| `s.split(sep)` | `(str) -> [str]` | |
+| `s.split(sep)` | `(str) -> [str]` | on an exact separator; adjacent separators give empty elements |
+| `s.words()` | `-> [str]` | on runs of whitespace, with no empties ([L-LIB-WORDS]) |
 | `s.contains(t)`, `s.starts_with(t)`, `s.ends_with(t)` | `(str) -> bool` | |
 | `s.index_of(t)` | `(str) -> Option[i64]` | `None` when absent |
 | `s.replace(from, to)` | `(str, str) -> str` | |
@@ -135,6 +143,12 @@ one back into text. `code_at` panics out of range, like indexing; `to_char`
 panics on a value that is not a code point, surrogates included. Together they
 are what lets a program compute *on* text — hash it, encode it, parse a number
 by hand — rather than only cut and compare it.
+
+**[L-LIB-WORDS]** `s.words()` splits on runs of whitespace and yields no
+empty elements, which is what reading a line of aligned columns needs.
+`s.split(" ")` is the other thing — an exact separator, where two spaces in a
+row mean an empty element between them — and both are worth having, because a
+CSV wants the second and a log line wants the first.
 
 ## 4. `[T]`
 

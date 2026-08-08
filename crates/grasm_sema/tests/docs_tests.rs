@@ -80,8 +80,10 @@ fn struct_sum_and_effect_signatures_render() {
             .clone()
     };
     assert_eq!(sig("Point"), "type Point = { x: f64, y: f64 }");
-    // Variant field names are API, so they survive into the rendering.
-    assert_eq!(sig("Shape"), "type Shape = Circle(r: f64) | Dot");
+    // Variant field names are API, so they survive into the rendering. The
+    // leading `|` is part of the grammar: what `grasm doc` prints has to parse
+    // back in, and without it this did not.
+    assert_eq!(sig("Shape"), "type Shape = | Circle(r: f64) | Dot");
     assert_eq!(sig("Clock"), "effect Clock { fn now() -> i64 }");
 }
 

@@ -832,6 +832,7 @@ is judged on.
 |------|-----------|---------|
 | `i64` | decimal | `-7` |
 | `f64` | shortest form that round-trips, **always with a point** at every magnitude | `1.5`, `1000000.0`, `1000000000000000.0`, `-0.0` |
+| `f64`, not finite | `inf`, `-inf`, `NaN` — `NaN` is the one mixed-case rendering here | `inf` |
 | `()` | `()` | |
 | `bool` | `true` / `false` | |
 | `str` | its characters, **unquoted and unescaped** | `b c` |
@@ -874,6 +875,12 @@ format through the same code, so they agree digit for digit — which a
 formatter built by hand out of `round` and `to_str` cannot promise, and which
 is what every report with an average needs.
 
+**[L-LIB-ROUND]** `round` breaks ties **away from zero**: `2.5` and `3.5`
+round to `3.0` and `4.0`, `-2.5` to `-3.0`, `-0.5` to `-1.0`. It is not
+banker's rounding, and a report's figures depend on which it is.
+`(i64_min).abs()` is `i64_min`: there is no positive `i64` that far out, and
+the wrap is the same one `/` and `%` take ([E-ARITH-INT]).
+
 **[L-LIB-NUM]**
 
 | method | type | notes |
@@ -902,7 +909,8 @@ because the text may not be a number.
 | `s.substr(start, len)` | `(i64, i64) -> str` | **start and length**, not start and end |
 | `s.chars()` | `-> [str]` | one single-character string per element |
 | `s.lines()` | `-> [str]` | splits on newlines; no trailing empty line |
-| `s.split(sep)` | `(str) -> [str]` | |
+| `s.split(sep)` | `(str) -> [str]` | on an exact separator; adjacent separators give empty elements |
+| `s.words()` | `-> [str]` | on runs of whitespace, with no empties ([L-LIB-WORDS]) |
 | `s.contains(t)`, `s.starts_with(t)`, `s.ends_with(t)` | `(str) -> bool` | |
 | `s.index_of(t)` | `(str) -> Option[i64]` | `None` when absent |
 | `s.replace(from, to)` | `(str, str) -> str` | |
@@ -922,6 +930,12 @@ one back into text. `code_at` panics out of range, like indexing; `to_char`
 panics on a value that is not a code point, surrogates included. Together they
 are what lets a program compute *on* text — hash it, encode it, parse a number
 by hand — rather than only cut and compare it.
+
+**[L-LIB-WORDS]** `s.words()` splits on runs of whitespace and yields no
+empty elements, which is what reading a line of aligned columns needs.
+`s.split(" ")` is the other thing — an exact separator, where two spaces in a
+row mean an empty element between them — and both are worth having, because a
+CSV wants the second and a log line wants the first.
 
 ## 4. `[T]`
 
@@ -3293,6 +3307,29 @@ fn main() {
 }
 ```
 
+## `L-LIB-ROUND.gr`
+
+```grasm
+//! tag: L-LIB-ROUND
+//! expect: output
+//! 3.0 4.0 -3.0 -1.0
+//! 2.0 3.0 -2.0 -0.0
+//! inf -inf NaN
+//! -9223372036854775808
+fn main() {
+    // Ties go away from zero, not to even.
+    print("{(2.5).round()} {(3.5).round()} {(0.0 - 2.5).round()} {(0.0 - 0.5).round()}")
+    // Non-ties are unremarkable, and `-0.4` rounds to `-0.0`, not `0.0`.
+    print("{(2.4).round()} {(2.6).round()} {(0.0 - 2.4).round()} {(0.0 - 0.4).round()}")
+    // Division by zero on floats is not a panic; it is the IEEE answer.
+    let z = 0.0
+    print("{1.0 / z} {(0.0 - 1.0) / z} {z / z}")
+    // The one integer with no positive counterpart wraps to itself.
+    let least = 0 - 9223372036854775807 - 1
+    print("{least.abs()}")
+}
+```
+
 ## `L-LIB-SORT-BY.gr`
 
 ```grasm
@@ -3403,6 +3440,28 @@ fn main() {
     var ts = [(2, 1), (1, 5), (1, 2)]
     ts.sort()
     print("{ts}")
+}
+```
+
+## `L-LIB-WORDS.gr`
+
+```grasm
+//! tag: L-LIB-WORDS
+//! expect: output
+//! [2026-08-09T10:00:00Z, INFO, server, started]
+//! 10 4
+//! [] [] [a, b, c]
+//! [a, , b] [a, b]
+fn main() {
+    // A line of aligned columns: what `split(" ")` cannot read.
+    let line = "2026-08-09T10:00:00Z INFO     server   started"
+    print("{line.words()}")
+    print("{line.split(" ").len()} {line.words().len()}")
+    // Empty, all-whitespace, and mixed whitespace kinds.
+    print("{"".words()} {"   ".words()} {"\ta\nb  c ".words()}")
+    // The two are different on purpose: `split` keeps the empty, `words` does
+    // not, and a CSV needs the first while a log line needs the second.
+    print("{"a,,b".split(",")} {"a  b".words()}")
 }
 ```
 

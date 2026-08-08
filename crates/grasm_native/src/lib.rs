@@ -406,6 +406,7 @@ impl<'m> Codegen<'m> {
             ("grasm_list_zip", vec![i64t, i64t], Some(i64t)),
             ("grasm_str_code_at", vec![i64t, i64t], Some(i64t)),
             ("grasm_str_codes", vec![i64t], Some(i64t)),
+            ("grasm_str_words", vec![i64t], Some(i64t)),
             ("grasm_i64_to_char", vec![i64t], Some(i64t)),
             ("grasm_f64_to_fixed", vec![f64t, i64t], Some(i64t)),
             ("grasm_val_cmp", vec![i64t, i64t], Some(i64t)),
@@ -4116,6 +4117,11 @@ impl FnCx<'_, '_> {
                 self.call_rt("grasm_val_dec", &[rv]);
                 (v, VType::I64)
             }
+            (VType::Str, "words") => {
+                let v = self.call_rt("grasm_str_words", &[rv]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                (v, VType::List(Box::new(VType::Str)))
+            }
             (VType::Str, "codes") => {
                 let v = self.call_rt("grasm_str_codes", &[rv]).unwrap();
                 self.call_rt("grasm_val_dec", &[rv]);
@@ -5782,7 +5788,7 @@ impl FnCx<'_, '_> {
                 // as if it were a pointer.
                 "sqrt" | "floor" | "ceil" | "round" => VType::F64,
                 "abs" => self.probe_type(recv)?,
-                "chars" | "lines" | "split" | "keys" => VType::List(Box::new(VType::Str)),
+                "chars" | "lines" | "split" | "words" | "keys" => VType::List(Box::new(VType::Str)),
                 "entries" => match self.probe_type(recv)? {
                     VType::Map(k, v) => VType::List(Box::new(VType::Tuple(vec![*k, *v]))),
                     _ => return nope(e.span(), "inferring this type"),

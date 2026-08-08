@@ -854,7 +854,7 @@ impl Checker {
                         self.error_help(
                             iter.span(),
                             format!("cannot iterate over `{shown}`"),
-                            "iterate over a list (`[T]`), a range (`0..n`), or a string",
+                            "iterate over a list (`[T]`), a range (`0..n`), or a string — a map iterates through `keys()`, `values()` or `entries()`",
                         )
                     }
                 };
@@ -2127,6 +2127,13 @@ declare it before `parallel`",
                 "codes" => {
                     check_arity(self, 0);
                     Type::List(Box::new(Type::I64))
+                }
+                // Splitting on runs of whitespace. `split(" ")` cannot do it:
+                // aligned columns give `["INFO", "", "", "", "server"]`, so
+                // every call site grew a `.filter(|s| not s.is_empty())`.
+                "words" => {
+                    check_arity(self, 0);
+                    Type::List(Box::new(Type::Str))
                 }
                 "repeat" => {
                     if check_arity(self, 1) {

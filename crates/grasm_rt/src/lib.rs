@@ -1867,6 +1867,18 @@ pub unsafe extern "C" fn grasm_str_code_at(s: *mut RtVal, i: i64) -> i64 {
     text.chars().nth(i as usize).expect("in bounds") as i64
 }
 
+/// The whitespace-separated words of a string, with no empties.
+///
+/// # Safety: live pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_words(s: *mut RtVal) -> *mut RtVal {
+    let items: Vec<*mut RtVal> = as_str(s)
+        .split_whitespace()
+        .map(|w| alloc(RtPayload::Str(w.to_string())))
+        .collect();
+    alloc(RtPayload::List(items))
+}
+
 /// Every code point, in order.
 ///
 /// # Safety: live pointer.

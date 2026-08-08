@@ -1733,6 +1733,9 @@ impl<'a, W: Write> Interp<'a, W> {
                 }
                 Value::Int(s.chars().nth(i as usize).expect("in bounds") as i64)
             }
+            (Value::Str(s), "words") => Value::List(Rc::new(
+                s.split_whitespace().map(Value::str).collect(),
+            )),
             (Value::Str(s), "codes") => {
                 Value::List(Rc::new(s.chars().map(|c| Value::Int(c as i64)).collect()))
             }

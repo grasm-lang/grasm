@@ -1,0 +1,18 @@
+//! tag: L-LIB-ROUND
+//! expect: output
+//! 3.0 4.0 -3.0 -1.0
+//! 2.0 3.0 -2.0 -0.0
+//! inf -inf NaN
+//! -9223372036854775808
+fn main() {
+    // Ties go away from zero, not to even.
+    print("{(2.5).round()} {(3.5).round()} {(0.0 - 2.5).round()} {(0.0 - 0.5).round()}")
+    // Non-ties are unremarkable, and `-0.4` rounds to `-0.0`, not `0.0`.
+    print("{(2.4).round()} {(2.6).round()} {(0.0 - 2.4).round()} {(0.0 - 0.4).round()}")
+    // Division by zero on floats is not a panic; it is the IEEE answer.
+    let z = 0.0
+    print("{1.0 / z} {(0.0 - 1.0) / z} {z / z}")
+    // The one integer with no positive counterpart wraps to itself.
+    let least = 0 - 9223372036854775807 - 1
+    print("{least.abs()}")
+}

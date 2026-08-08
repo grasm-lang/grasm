@@ -204,6 +204,9 @@ fn type_signature(t: &TypeDecl) -> String {
                     }
                 })
                 .collect();
+            // The leading `|` is part of the grammar, so without it the
+            // rendered declaration does not parse back in ([G-SUM]).
+            s.push_str("| ");
             s.push_str(&rendered.join(" | "));
         }
         TypeBody::Alias(te) => s.push_str(&type_text(te)),
