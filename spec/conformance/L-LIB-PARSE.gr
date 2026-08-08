@@ -3,6 +3,7 @@
 //! inf NaN inf -inf
 //! none none
 //! 42 -7 none none
+//! [1.5, -2.5] true
 //! cdef |  |
 // What a parser does with input that is nearly a number. Untrusted data
 // reaches these, and every surprise here becomes a surprise somewhere else:
@@ -29,6 +30,15 @@ fn main() {
     print("{show("abc".parse_float())} {showi("abc".parse_int())}")
     // Space and a sign are fine; source-literal spellings are not.
     print("{showi(" +42 ".parse_int())} {showi("-7".parse_int())} {showi("1_000".parse_int())} {showi("0xFF".parse_int())}")
+    // Which is why a program reading untrusted numbers can ask.
+    var kept: [f64] = []
+    for c in ["1.5", "1e400", "nan", "-2.5"] {
+        let v = c.parse_float() ?? 0.0
+        if v.is_finite() {
+            kept.push(v)
+        }
+    }
+    print("{kept} {(0.0 / 0.0).is_nan()}")
     // `substr` clamps rather than panicking, unlike indexing.
     print("{"abcdef".substr(2, 100)} | {"abc".substr(5, 2)} |")
 }

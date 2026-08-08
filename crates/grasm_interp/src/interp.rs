@@ -232,6 +232,13 @@ impl<'a, W: Write> Interp<'a, W> {
         }
     }
 
+    /// Runs subsequent top-level bodies as though they were written in
+    /// `module`, so an unqualified call inside a test resolves against the
+    /// file the test was written in.
+    pub fn set_current_module(&mut self, module: &str) {
+        self.current_module = module.to_string();
+    }
+
     /// Frames captured when a panic first escaped, innermost first.
     pub fn panic_trace(&self) -> Option<&[Frame]> {
         self.panic_trace.as_deref()
@@ -1745,6 +1752,8 @@ impl<'a, W: Write> Interp<'a, W> {
                     return Err(Flow::Panic(format!("{i} is not a Unicode code point")))
                 }
             },
+            (Value::Float(f), "is_nan") => Value::Bool(f.is_nan()),
+            (Value::Float(f), "is_finite") => Value::Bool(f.is_finite()),
             (Value::Float(f), "to_fixed") => {
                 let Value::Int(places) = self.eval_expr(&args[0])? else {
                     return Err(Flow::Panic("to_fixed expects an integer".into()));

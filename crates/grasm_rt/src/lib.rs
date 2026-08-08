@@ -1860,6 +1860,18 @@ pub extern "C" fn grasm_f64_to_fixed(x: f64, places: i64) -> *mut RtVal {
     alloc(RtPayload::Str(fixed_text(x, places)))
 }
 
+/// Whether `x` is NaN.
+#[no_mangle]
+pub extern "C" fn grasm_f64_is_nan(x: f64) -> i8 {
+    i8::from(x.is_nan())
+}
+
+/// Whether `x` is neither NaN nor an infinity.
+#[no_mangle]
+pub extern "C" fn grasm_f64_is_finite(x: f64) -> i8 {
+    i8::from(x.is_finite())
+}
+
 /// `x` as text with exactly `places` digits after the point, ties **away from
 /// zero** — the same rule `round` uses ([L-LIB-ROUND]).
 pub fn fixed_text(x: f64, places: i64) -> String {

@@ -409,6 +409,8 @@ impl<'m> Codegen<'m> {
             ("grasm_str_words", vec![i64t], Some(i64t)),
             ("grasm_i64_to_char", vec![i64t], Some(i64t)),
             ("grasm_f64_to_fixed", vec![f64t, i64t], Some(i64t)),
+            ("grasm_f64_is_nan", vec![f64t], Some(i8t)),
+            ("grasm_f64_is_finite", vec![f64t], Some(i8t)),
             ("grasm_val_cmp", vec![i64t, i64t], Some(i64t)),
             ("grasm_assert_eq", vec![i64t, i64t], None),
             ("grasm_str_from_i64", vec![i64t], Some(i64t)),
@@ -4156,6 +4158,14 @@ impl FnCx<'_, '_> {
                 self.call_rt("grasm_val_dec", &[rv]);
                 (v, VType::List(Box::new(VType::I64)))
             }
+            (VType::F64, "is_nan") => (
+                self.call_rt("grasm_f64_is_nan", &[rv]).unwrap(),
+                VType::Bool,
+            ),
+            (VType::F64, "is_finite") => (
+                self.call_rt("grasm_f64_is_finite", &[rv]).unwrap(),
+                VType::Bool,
+            ),
             (VType::F64, "to_fixed") => {
                 let n = arg_scalar!(0, VType::I64);
                 let v = self.call_rt("grasm_f64_to_fixed", &[rv, n]).unwrap();
@@ -5840,6 +5850,7 @@ impl FnCx<'_, '_> {
             // while looking nothing like it.
             Expr::MethodCall { recv, name, args, .. } => match name.name.as_str() {
                 "len" => VType::I64,
+                "is_nan" | "is_finite" => VType::Bool,
                 "is_some" | "is_none" | "is_empty" | "contains" | "starts_with"
                 | "ends_with" | "has" | "delete" | "any" | "all" => VType::Bool,
                 "to_str" | "join" | "trim" | "to_upper" | "to_lower" | "replace"

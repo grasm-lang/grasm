@@ -108,3 +108,45 @@ fn a_dependency_within_its_ceiling_builds_and_runs() {
     assert!(text.contains("side effect"), "should run the body:\n{text}");
     assert!(text.contains('5'), "should print the result:\n{text}");
 }
+
+/// `grasm test` runs the tests of every module in the program, not just the
+/// entry file's.
+///
+/// A library's tests used to be skipped in silence: importing a module whose
+/// tests were failing reported "1 passed, 0 failed" and exit 0. Doc examples
+/// from that same module *did* run, so one kind of test crossed the module
+/// boundary and the other did not.
+#[test]
+fn tests_in_imported_modules_run() {
+    let w = Work::new("modtests");
+    std::fs::create_dir_all(&w.0).unwrap();
+    std::fs::write(
+        w.0.join("lib.gr"),
+        "pub fn double(n: i64) -> i64 {\n    n * 2\n}\n\n\
+         test \"double works\" {\n    assert_eq(double(2), 4)\n}\n\n\
+         test \"double is broken\" {\n    assert_eq(double(3), 999)\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        w.0.join("main.gr"),
+        "import lib\n\ntest \"entry test\" {\n    assert_eq(lib.double(1), 2)\n}\n\n\
+         fn main() {\n    print(\"{lib.double(21)}\")\n}\n",
+    )
+    .unwrap();
+
+    let entry = w.0.join("main.gr");
+    let (code, text) = run(&["test", entry.to_str().unwrap()]);
+    assert_eq!(code, 1, "a failing library test must fail the run:\n{text}");
+    assert!(
+        text.contains("lib::double works") && text.contains("lib::double is broken"),
+        "the library's tests must run and be named by module:\n{text}"
+    );
+    assert!(
+        text.contains("main::entry test"),
+        "the entry module's test must still run:\n{text}"
+    );
+    assert!(
+        text.contains("2 passed, 1 failed"),
+        "the summary must count every module's tests:\n{text}"
+    );
+}

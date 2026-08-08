@@ -2226,6 +2226,13 @@ declare it before `parallel`",
                 _ => return None,
             },
             Type::F64 => match name.name.as_str() {
+                // Defensive parsing needs these: `parse_float` accepts `nan`
+                // and overflows to an infinity ([L-LIB-PARSE]), so a program
+                // reading untrusted numbers has to be able to ask.
+                "is_nan" | "is_finite" => {
+                    check_arity(self, 0);
+                    Type::Bool
+                }
                 // Fixed-point text. Without it a report that has a mean can
                 // only print `289.22222222222223`, and every program grows a
                 // hand-rolled formatter built out of `round` and `to_str`.

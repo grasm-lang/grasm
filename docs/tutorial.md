@@ -464,6 +464,10 @@ test "reversing twice is the identity" (xs: [i64]) {
 }
 ```
 
+`grasm test file.gr` runs the tests of every module the program imports, not
+just that file's, and names each one by its module. A library whose tests are
+failing should not look like a library whose tests passed.
+
 Parameters make it a **property** test: the runner generates the inputs.
 Pointing one at `str` is fuzzing — the generator emits tabs, newlines, quotes,
 backslashes, and multi-byte characters.

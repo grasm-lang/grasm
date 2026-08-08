@@ -203,8 +203,31 @@ fn test_program_here(
 
     let mut passed = 0;
     let mut failed = 0;
-    for decl in &program.files[0].module.decls {
-        let Decl::Test(t) = decl else { continue };
+    // Every module's tests, not just the entry file's. A library's tests used
+    // to be skipped in silence — `grasm test main.gr` reported "1 passed, 0
+    // failed" and exit 0 while a deliberately broken test in an imported
+    // module never ran. Doc examples already crossed the module boundary, so
+    // one kind of test in a file ran and the other did not.
+    let mut units: Vec<(&str, &grasm_syntax::ast::TestDecl)> = Vec::new();
+    for file in &program.files {
+        for decl in &file.module.decls {
+            if let Decl::Test(t) = decl {
+                units.push((file.name.as_str(), t));
+            }
+        }
+    }
+    let multi = program.files.len() > 1;
+    for (module, t) in units {
+        interp.set_current_module(module);
+        let label = if multi {
+            format!("{module}::{}", t.name)
+        } else {
+            t.name.clone()
+        };
+        let t = &grasm_syntax::ast::TestDecl {
+            name: label,
+            ..t.clone()
+        };
         if !opts.filter.is_empty() && !t.name.contains(&opts.filter) {
             continue;
         }

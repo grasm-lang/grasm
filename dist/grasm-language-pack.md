@@ -964,6 +964,7 @@ because the text may not be a number.
 | `s.pad_start(w, fill)`, `s.pad_end(w, fill)` | `(i64, str) -> str` | fill repeats and is cut to width ([E-PAD-CYCLE]) |
 | `s.parse_int()` | `-> Option[i64]` | surrounding space and a leading `+` are accepted; `1_000` and `0xFF` are **not** ([L-LIB-PARSE]) |
 | `s.parse_float()` | `-> Option[f64]` | accepts `inf`, `-inf`, `nan`; overflow gives an infinity, not `None` ([L-LIB-PARSE]) |
+| `x.is_nan()`, `x.is_finite()` | `-> bool` | what `parse_float` makes necessary ([L-LIB-PARSE]) |
 | `s.code_at(i)` | `(i64) -> i64` | Unicode code point of character `i`; panics out of range ([L-LIB-CODES]) |
 | `s.codes()` | `-> [i64]` | every code point, in order |
 | `n.to_char()` | `i64 -> str` | a code point back to a one-character string; panics if `n` is not one |
@@ -1541,6 +1542,10 @@ test "reversing twice is the identity" (xs: [i64]) {
     assert(reverse(reverse(xs)) == xs)
 }
 ```
+
+`grasm test file.gr` runs the tests of every module the program imports, not
+just that file's, and names each one by its module. A library whose tests are
+failing should not look like a library whose tests passed.
 
 Parameters make it a **property** test: the runner generates the inputs.
 Pointing one at `str` is fuzzing — the generator emits tabs, newlines, quotes,
@@ -3452,6 +3457,7 @@ fn main() {
 //! inf NaN inf -inf
 //! none none
 //! 42 -7 none none
+//! [1.5, -2.5] true
 //! cdef |  |
 // What a parser does with input that is nearly a number. Untrusted data
 // reaches these, and every surprise here becomes a surprise somewhere else:
@@ -3478,6 +3484,15 @@ fn main() {
     print("{show("abc".parse_float())} {showi("abc".parse_int())}")
     // Space and a sign are fine; source-literal spellings are not.
     print("{showi(" +42 ".parse_int())} {showi("-7".parse_int())} {showi("1_000".parse_int())} {showi("0xFF".parse_int())}")
+    // Which is why a program reading untrusted numbers can ask.
+    var kept: [f64] = []
+    for c in ["1.5", "1e400", "nan", "-2.5"] {
+        let v = c.parse_float() ?? 0.0
+        if v.is_finite() {
+            kept.push(v)
+        }
+    }
+    print("{kept} {(0.0 / 0.0).is_nan()}")
     // `substr` clamps rather than panicking, unlike indexing.
     print("{"abcdef".substr(2, 100)} | {"abc".substr(5, 2)} |")
 }
