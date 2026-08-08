@@ -191,6 +191,8 @@ pub enum TypeExpr {
     },
     /// `[T]`
     List(Box<TypeExpr>, Span),
+    /// `T ! E` — a value that is either a `T` or a failure carrying an `E`.
+    Fallible(Box<TypeExpr>, Box<TypeExpr>, Span),
     /// `(A, B)`; empty = unit `()`
     Tuple(Vec<TypeExpr>, Span),
     /// `(E1 | E2)` — used for error unions.
@@ -215,6 +217,7 @@ impl TypeExpr {
         match self {
             TypeExpr::Name { span, .. }
             | TypeExpr::List(_, span)
+            | TypeExpr::Fallible(_, _, span)
             | TypeExpr::Tuple(_, span)
             | TypeExpr::Fn { span, .. }
             | TypeExpr::Union(_, span) => *span,

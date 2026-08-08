@@ -147,14 +147,25 @@ so existing code that uses `bench` as a name keeps working.
 
 ```
 type       = named_type | list_type | tuple_type | union_type | fn_type
+nested     = type ( "!" type )?
 fn_type    = "fn" "(" ( type ( "," type )* )? ")" ( "->" type )? effect_row?
 effect_row = "/" "{" ( path ( "," path )* )? "}"
 named_type = path type_args?
 type_args  = "[" type ( "," type )* "]"
-list_type  = "[" type "]"
+list_type  = "[" nested "]"
 tuple_type = "(" ( type ( "," type )* )? ")"
 union_type = "(" type ( "|" type )+ ")"
 ```
+
+**[G-TYPE-FALLIBLE]** `T ! E` is a type wherever a type is *nested* — inside
+`[…]`, most of all. `[i64 ! E]` is what `xs.map(parse)` produces when `parse`
+can fail, and it used to be a thing the checker could infer and nobody could
+write, so crossing a `map` with a fallible function meant declaring a sum type
+by hand to carry what the language already had.
+
+At a function's return type the `!` belongs to the declaration — `fn f() ->
+i64 ! E` — where it sits alongside the effect row, so it is parsed there and
+not as part of the type.
 
 **[G-TYPE-UNIT]** `()` is the unit type.
 
@@ -594,6 +605,10 @@ has to change belongs in the caller, threaded through `inout` or returned.
 
 Note the contrast with **[E-SPAWN-SHARED]**: a `spawn` body *does* see and
 mutate the enclosing scope. Two block-shaped constructs, two rules.
+
+**[E-COALESCE-DIVERGE]** The right-hand side of `??` may leave instead of
+producing a value — `m.get(k) ?? fail(e)` is the shortest way to turn absence
+into a failure, and it is the shape a fallible function's body most often has.
 
 **[E-COALESCE-LAZY]** `a ?? b` evaluates `b` only when `a` is `None`.
 
@@ -1653,6 +1668,36 @@ fn main() {
 
     // Writing to a captured variable is a compile error, because the write
     // would change a copy nobody can observe. See T-CAPTURE-WRITE.
+}
+```
+
+## `E-COALESCE-DIVERGE.gr`
+
+```grasm
+//! tag: E-COALESCE-DIVERGE
+//! expect: output
+//! 1 0
+//! 10 -1
+//! 7
+// `?? fail(e)` — absence turned into a failure, which is the shape most
+// fallible function bodies take.
+type E = { m: str }
+
+fn need(m: Map[str, i64], k: str) -> i64 ! E {
+    m.get(k) ?? fail(E{ m: "no {k}" })
+}
+
+fn doubled(o: Option[i64]) -> i64 ! E {
+    let v = o ?? fail(E{ m: "none" })
+    v * 2
+}
+
+fn main() {
+    let m = {"a": 1}
+    print("{need(m, "a") ?? 0} {need(m, "b") ?? 0}")
+    print("{doubled(Some(5)) ?? 0 - 1} {doubled(None) ?? 0 - 1}")
+    // A fallback that does produce a value still does.
+    print("{m.get("zz") ?? 7}")
 }
 ```
 
@@ -2831,6 +2876,46 @@ test "the runner owns its inputs" (inout n: i64) {
     n = n + 1
 }
 fn main() {
+}
+```
+
+## `G-TYPE-FALLIBLE.gr`
+
+```grasm
+//! tag: G-TYPE-FALLIBLE
+//! expect: output
+//! 3 42
+//! ok 1
+//! err bad x
+//! ok 41
+// `[i64 ! E]` is what `map` over a fallible function produces. The checker
+// could always infer it; until now nothing could write it down, so a program
+// that wanted to name the type declared a sum type by hand to carry it.
+type E = { m: str }
+
+fn parse(s: str) -> i64 ! E {
+    s.parse_int() ?? fail(E{ m: "bad {s}" })
+}
+
+/// A fallible type as a parameter, which is the point of being able to write
+/// it: this function could not be declared at all before.
+fn total(rs: [i64 ! E]) -> i64 {
+    var sum = 0
+    for r in rs {
+        sum = sum + (r ?? 0)
+    }
+    sum
+}
+
+fn main() {
+    let rs: [i64 ! E] = ["1", "x", "41"].map(parse)
+    print("{rs.len()} {total(rs)}")
+    for r in rs {
+        match r {
+            Ok(v) -> print("ok {v}")
+            Err(e) -> print("err {e.m}")
+        }
+    }
 }
 ```
 

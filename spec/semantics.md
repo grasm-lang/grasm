@@ -40,6 +40,10 @@ has to change belongs in the caller, threaded through `inout` or returned.
 Note the contrast with **[E-SPAWN-SHARED]**: a `spawn` body *does* see and
 mutate the enclosing scope. Two block-shaped constructs, two rules.
 
+**[E-COALESCE-DIVERGE]** The right-hand side of `??` may leave instead of
+producing a value — `m.get(k) ?? fail(e)` is the shortest way to turn absence
+into a failure, and it is the shape a fallible function's body most often has.
+
 **[E-COALESCE-LAZY]** `a ?? b` evaluates `b` only when `a` is `None`.
 
 ## 3. Arithmetic

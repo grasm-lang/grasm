@@ -1,0 +1,35 @@
+//! tag: G-TYPE-FALLIBLE
+//! expect: output
+//! 3 42
+//! ok 1
+//! err bad x
+//! ok 41
+// `[i64 ! E]` is what `map` over a fallible function produces. The checker
+// could always infer it; until now nothing could write it down, so a program
+// that wanted to name the type declared a sum type by hand to carry it.
+type E = { m: str }
+
+fn parse(s: str) -> i64 ! E {
+    s.parse_int() ?? fail(E{ m: "bad {s}" })
+}
+
+/// A fallible type as a parameter, which is the point of being able to write
+/// it: this function could not be declared at all before.
+fn total(rs: [i64 ! E]) -> i64 {
+    var sum = 0
+    for r in rs {
+        sum = sum + (r ?? 0)
+    }
+    sum
+}
+
+fn main() {
+    let rs: [i64 ! E] = ["1", "x", "41"].map(parse)
+    print("{rs.len()} {total(rs)}")
+    for r in rs {
+        match r {
+            Ok(v) -> print("ok {v}")
+            Err(e) -> print("err {e.m}")
+        }
+    }
+}

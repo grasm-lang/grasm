@@ -274,6 +274,7 @@ pub fn type_text(t: &TypeExpr) -> String {
             )
         }
         TypeExpr::List(inner, _) => format!("[{}]", type_text(inner)),
+        TypeExpr::Fallible(ok, err, _) => format!("{} ! {}", type_text(ok), type_text(err)),
         TypeExpr::Tuple(items, _) => format!(
             "({})",
             items.iter().map(type_text).collect::<Vec<_>>().join(", ")

@@ -582,6 +582,10 @@ impl<'m> Codegen<'m> {
                 Ok(VType::Fn(ps, Box::new(self.vtype_of(ret)?)))
             }
             TypeExpr::List(inner, _) => Ok(VType::List(Box::new(self.vtype_of(inner)?))),
+            TypeExpr::Fallible(ok, err, _) => Ok(VType::Fallible(
+                Box::new(self.vtype_of(ok)?),
+                Box::new(self.vtype_of(err)?),
+            )),
             TypeExpr::Tuple(items, _) if items.is_empty() => Ok(VType::Unit),
             TypeExpr::Tuple(items, _) => {
                 let mut ts = Vec::with_capacity(items.len());
@@ -3339,18 +3343,31 @@ impl FnCx<'_, '_> {
         e: &Expr,
         expected: Option<&VType>,
     ) -> CResult<(Value, VType)> {
+        match self.eval_expr_expecting_opt(e, expected)? {
+            Some(v) => Ok(v),
+            None => nope(e.span(), "using a unit value"),
+        }
+    }
+
+    /// As `eval_expr_expecting`, but `None` for an expression that produces no
+    /// value — because it is unit, or because control left before it could.
+    fn eval_expr_expecting_opt(
+        &mut self,
+        e: &Expr,
+        expected: Option<&VType>,
+    ) -> CResult<Option<(Value, VType)>> {
         // A closure literal in argument position gets its parameter types from
         // the parameter it is being passed to. Before function types existed
         // there was nowhere for them to come from, and the backend said so.
         if let (Expr::Closure { params, body, span }, Some(VType::Fn(want_ps, _))) = (e, expected) {
             if params.len() == want_ps.len() {
-                return self.closure_value_typed(params, body, want_ps, *span);
+                return self.closure_value_typed(params, body, want_ps, *span).map(Some);
             }
         }
         if let (Expr::List(items, _), Some(VType::List(elem_t))) = (e, expected) {
             if items.is_empty() {
                 let v = self.new_list_of(elem_t);
-                return Ok((v, VType::List(elem_t.clone())));
+                return Ok(Some((v, VType::List(elem_t.clone()))));
             }
             // A non-empty list whose element type is known passes it down.
             // A closure among the elements has nowhere else to get its
@@ -3368,13 +3385,13 @@ impl FnCx<'_, '_> {
                     };
                     list = self.list_push_elem(list, v, &vt);
                 }
-                return Ok((list, VType::List(elem_t.clone())));
+                return Ok(Some((list, VType::List(elem_t.clone()))));
             }
         }
         if let (Expr::Map(entries, _), Some(VType::Map(k, v))) = (e, expected) {
             if entries.is_empty() {
                 let m = self.call_rt("grasm_map_new", &[]).unwrap();
-                return Ok((m, VType::Map(k.clone(), v.clone())));
+                return Ok(Some((m, VType::Map(k.clone(), v.clone()))));
             }
         }
         if let (Expr::Call { callee, args, .. }, Some(VType::Map(k, v))) = (e, expected) {
@@ -3382,12 +3399,12 @@ impl FnCx<'_, '_> {
                 if let Expr::Ident(id) = &**callee {
                     if id.name == "map" && self.lookup("map").is_none() {
                         let m = self.call_rt("grasm_map_new", &[]).unwrap();
-                        return Ok((m, VType::Map(k.clone(), v.clone())));
+                        return Ok(Some((m, VType::Map(k.clone(), v.clone()))));
                     }
                 }
             }
         }
-        self.eval_expr_val(e)
+        self.eval_expr(e)
     }
 
     fn eval_expr(&mut self, e: &Expr) -> CResult<Option<(Value, VType)>> {
@@ -5413,12 +5430,25 @@ impl FnCx<'_, '_> {
 
         self.goto_block(err_blk);
         self.call_rt("grasm_val_dec", &[lv]);
-        let (mut rv, rvt) = self.eval_expr_expecting(rhs, Some(ok_t))?;
-        if *ok_t == VType::F64 && rvt == VType::I64 {
-            rv = self.b.ins().fcvt_from_sint(types::F64, rv);
+        // `x ?? fail(e)` and `x ?? return d`: the fallback leaves rather than
+        // producing a value, so there is nothing to carry to the merge and the
+        // block is already terminated.
+        match self.eval_expr_expecting_opt(rhs, Some(ok_t))? {
+            Some((mut rv, rvt)) => {
+                if *ok_t == VType::F64 && rvt == VType::I64 {
+                    rv = self.b.ins().fcvt_from_sint(types::F64, rv);
+                }
+                self.b.ins().jump(merge, &[rv]);
+                self.filled = true;
+            }
+            None => {
+                if !self.filled {
+                    let zero = self.zero_of(ok_t);
+                    self.b.ins().jump(merge, &[zero]);
+                    self.filled = true;
+                }
+            }
         }
-        self.b.ins().jump(merge, &[rv]);
-        self.filled = true;
 
         self.goto_block(merge);
         let out = self.b.block_params(merge)[0];
@@ -5461,12 +5491,25 @@ impl FnCx<'_, '_> {
         // The fallback is evaluated against the Option's payload type, so an
         // empty collection literal — `m.get(k) ?? []`, the natural way to
         // write a default — has the annotation it needs.
-        let (mut rv, rvt) = self.eval_expr_expecting(rhs, Some(&out_t))?;
-        if out_t == VType::F64 && rvt == VType::I64 {
-            rv = self.b.ins().fcvt_from_sint(types::F64, rv);
+        // `m.get(k) ?? fail(e)` and `?? return d`: the fallback may leave
+        // rather than produce a value, in which case the block is already
+        // terminated and nothing reaches the merge.
+        match self.eval_expr_expecting_opt(rhs, Some(&out_t))? {
+            Some((mut rv, rvt)) => {
+                if out_t == VType::F64 && rvt == VType::I64 {
+                    rv = self.b.ins().fcvt_from_sint(types::F64, rv);
+                }
+                self.b.ins().jump(merge, &[rv]);
+                self.filled = true;
+            }
+            None => {
+                if !self.filled {
+                    let zero = self.zero_of(&out_t);
+                    self.b.ins().jump(merge, &[zero]);
+                    self.filled = true;
+                }
+            }
         }
-        self.b.ins().jump(merge, &[rv]);
-        self.filled = true;
 
         self.goto_block(merge);
         let out = self.b.block_params(merge)[0];

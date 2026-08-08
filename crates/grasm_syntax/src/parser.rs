@@ -699,6 +699,21 @@ impl Parser {
     // Types
     // ------------------------------------------------------------------
 
+    /// A type in a nested position, where `T ! E` is unambiguous.
+    ///
+    /// Not at a function's return type: there the `! E` belongs to the
+    /// declaration, alongside the effect row, and is parsed there.
+    fn parse_type_nested(&mut self) -> PResult<TypeExpr> {
+        let inner = self.parse_type()?;
+        if !self.at(&TokenKind::Bang) {
+            return Ok(inner);
+        }
+        self.bump();
+        let err = self.parse_type()?;
+        let span = inner.span().merge(err.span());
+        Ok(TypeExpr::Fallible(Box::new(inner), Box::new(err), span))
+    }
+
     fn parse_type(&mut self) -> PResult<TypeExpr> {
         let start = self.cur_span();
         match self.cur().clone() {
@@ -772,7 +787,7 @@ impl Parser {
             }
             TokenKind::LBracket => {
                 self.bump();
-                let inner = self.parse_type()?;
+                let inner = self.parse_type_nested()?;
                 let rb = self.expect(&TokenKind::RBracket)?;
                 Ok(TypeExpr::List(Box::new(inner), start.merge(rb.span)))
             }

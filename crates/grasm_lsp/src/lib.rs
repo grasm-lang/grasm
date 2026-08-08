@@ -550,6 +550,7 @@ pub fn type_text(t: &TypeExpr) -> String {
             type_text(ret)
         ),
         TypeExpr::List(inner, _) => format!("[{}]", type_text(inner)),
+        TypeExpr::Fallible(ok, err, _) => format!("{} ! {}", type_text(ok), type_text(err)),
         TypeExpr::Tuple(items, _) => {
             let a: Vec<String> = items.iter().map(type_text).collect();
             format!("({})", a.join(", "))

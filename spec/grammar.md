@@ -132,14 +132,25 @@ so existing code that uses `bench` as a name keeps working.
 
 ```
 type       = named_type | list_type | tuple_type | union_type | fn_type
+nested     = type ( "!" type )?
 fn_type    = "fn" "(" ( type ( "," type )* )? ")" ( "->" type )? effect_row?
 effect_row = "/" "{" ( path ( "," path )* )? "}"
 named_type = path type_args?
 type_args  = "[" type ( "," type )* "]"
-list_type  = "[" type "]"
+list_type  = "[" nested "]"
 tuple_type = "(" ( type ( "," type )* )? ")"
 union_type = "(" type ( "|" type )+ ")"
 ```
+
+**[G-TYPE-FALLIBLE]** `T ! E` is a type wherever a type is *nested* — inside
+`[…]`, most of all. `[i64 ! E]` is what `xs.map(parse)` produces when `parse`
+can fail, and it used to be a thing the checker could infer and nobody could
+write, so crossing a `map` with a fallible function meant declaring a sum type
+by hand to carry what the language already had.
+
+At a function's return type the `!` belongs to the declaration — `fn f() ->
+i64 ! E` — where it sits alongside the effect row, so it is parsed there and
+not as part of the type.
 
 **[G-TYPE-UNIT]** `()` is the unit type.
 

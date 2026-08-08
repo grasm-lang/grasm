@@ -1,0 +1,25 @@
+//! tag: E-COALESCE-DIVERGE
+//! expect: output
+//! 1 0
+//! 10 -1
+//! 7
+// `?? fail(e)` — absence turned into a failure, which is the shape most
+// fallible function bodies take.
+type E = { m: str }
+
+fn need(m: Map[str, i64], k: str) -> i64 ! E {
+    m.get(k) ?? fail(E{ m: "no {k}" })
+}
+
+fn doubled(o: Option[i64]) -> i64 ! E {
+    let v = o ?? fail(E{ m: "none" })
+    v * 2
+}
+
+fn main() {
+    let m = {"a": 1}
+    print("{need(m, "a") ?? 0} {need(m, "b") ?? 0}")
+    print("{doubled(Some(5)) ?? 0 - 1} {doubled(None) ?? 0 - 1}")
+    // A fallback that does produce a value still does.
+    print("{m.get("zz") ?? 7}")
+}

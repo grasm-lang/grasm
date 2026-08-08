@@ -96,7 +96,10 @@ pub fn generate(rng: &mut Rng, te: &TypeExpr, size: u32) -> Value {
         // is no sensible arbitrary function to invent. This arm exists so the
         // generator degrades rather than being the thing that panics if that
         // gate is ever loosened.
-        TypeExpr::Fn { .. } => Value::Unit,
+        // Same reasoning as `Fn`: a property parameter whose type cannot be
+        // generated is rejected ([G-TEST-PARAMS]), and "either a value or a
+        // failure" has no arbitrary form worth inventing.
+        TypeExpr::Fn { .. } | TypeExpr::Fallible(..) => Value::Unit,
         TypeExpr::List(inner, _) => {
             let n = rng.below(u64::from(size).min(32) + 1) as usize;
             let items = (0..n).map(|_| generate(rng, inner, size)).collect();

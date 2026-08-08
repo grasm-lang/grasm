@@ -472,6 +472,10 @@ impl Checker {
                 )
             }
             TypeExpr::List(inner, _) => Type::List(Box::new(self.resolve_type(inner, generics))),
+            TypeExpr::Fallible(ok, err, _) => Type::Fallible(
+                Box::new(self.resolve_type(ok, generics)),
+                Box::new(self.resolve_type(err, generics)),
+            ),
             TypeExpr::Tuple(items, _) => {
                 if items.is_empty() {
                     Type::Unit
