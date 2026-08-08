@@ -1166,6 +1166,23 @@ impl<'a, W: Write> Interp<'a, W> {
                 }
             }
         }
+        // `utils.helper` as a value: the function itself.
+        if let Expr::Ident(tid) = recv {
+            let is_local = self.scopes.iter().rev().any(|s| s.contains_key(&tid.name));
+            if !is_local {
+                let target = self
+                    .imports
+                    .get(&self.current_module)
+                    .and_then(|m| m.get(&tid.name))
+                    .cloned();
+                if let Some(target_mod) = target {
+                    let qual = format!("{target_mod}::{}", name.name);
+                    if self.fns.contains_key(&qual) {
+                        return Ok(Value::FnRef(Rc::new(qual)));
+                    }
+                }
+            }
+        }
         let r = self.eval_expr(recv)?;
         match r {
             // `pair.0` — components named by position.

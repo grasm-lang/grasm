@@ -5115,6 +5115,22 @@ impl FnCx<'_, '_> {
         args: &[Expr],
         _span: Span,
     ) -> CResult<Option<(Value, VType)>> {
+        // `x |> utils.helper` desugars to a call whose callee is qualified.
+        // That is the same thing as `utils.helper(x)`, which the method path
+        // already handles.
+        if let Expr::Field { recv, name, span } = callee {
+            if let Expr::Ident(tid) = &**recv {
+                if self.lookup(&tid.name).is_none()
+                    && self
+                        .cg
+                        .module_imports
+                        .get(&self.cg.current_module)
+                        .is_some_and(|m| m.contains_key(&tid.name))
+                {
+                    return self.eval_method(recv, name, args, *span);
+                }
+            }
+        }
         let Expr::Ident(id) = callee else {
             return nope(callee.span(), "indirect calls");
         };
@@ -5510,6 +5526,24 @@ impl FnCx<'_, '_> {
                 let v = self.build_variant_call(&parent, &name.name, &[])?;
                 let vt = self.sum_vtype(&parent);
                 return Ok(Some((v, vt)));
+            }
+        }
+        // `utils.helper` as a value: the same function a qualified call would
+        // reach, built as a function value.
+        if let Expr::Ident(tid) = recv {
+            if self.lookup(&tid.name).is_none() {
+                let target = self
+                    .cg
+                    .module_imports
+                    .get(&self.cg.current_module)
+                    .and_then(|m| m.get(&tid.name))
+                    .cloned();
+                if let Some(target_mod) = target {
+                    let key = format!("{target_mod}::{}", name.name);
+                    if self.cg.fns.contains_key(&key) {
+                        return self.make_named_fn_value(&key, span).map(Some);
+                    }
+                }
             }
         }
         let (rv, rt) = self.eval_expr_val(recv)?;
@@ -5969,6 +6003,25 @@ impl FnCx<'_, '_> {
             }
             Expr::StructLit { name, .. } => VType::Struct(name.segments[0].name.clone()),
             Expr::Field { recv, name, span } => {
+                if let Expr::Ident(tid) = &**recv {
+                    if self.lookup(&tid.name).is_none() {
+                        let target = self
+                            .cg
+                            .module_imports
+                            .get(&self.cg.current_module)
+                            .and_then(|m| m.get(&tid.name))
+                            .cloned();
+                        if let Some(target_mod) = target {
+                            let key = format!("{target_mod}::{}", name.name);
+                            if let Some(sig) = self.cg.fns.get(&key) {
+                                return Ok(VType::Fn(
+                                    sig.params.clone(),
+                                    Box::new(sig.ret.clone()),
+                                ));
+                            }
+                        }
+                    }
+                }
                 let rt = self.probe_type(recv)?;
                 match rt {
                     VType::Struct(sname) => self.struct_field_type(&sname, &name.name, *span)?,
@@ -6792,6 +6845,32 @@ impl FnCx<'_, '_> {
     ///
     /// Returns `None` when the argument is already a closure, or is neither.
     fn desugar_fn_arg(&self, arg: &Expr, parallel: bool) -> Option<(Ident, Expr)> {
+        // `utils.helper` passed as a value is the same thing as a bare name,
+        // wrapped one level deeper. Rewriting it to `|x| utils.helper(x)` is
+        // exactly what a caller had to write by hand.
+        if let Expr::Field { recv, name, span } = arg {
+            if let Expr::Ident(tid) = &**recv {
+                if self.lookup(&tid.name).is_none()
+                    && self
+                        .cg
+                        .module_imports
+                        .get(&self.cg.current_module)
+                        .is_some_and(|m| m.contains_key(&tid.name))
+                {
+                    let param = Ident {
+                        name: "__par_arg".to_string(),
+                        span: *span,
+                    };
+                    let call = Expr::MethodCall {
+                        recv: recv.clone(),
+                        name: name.clone(),
+                        args: vec![Expr::Ident(param.clone())],
+                        span: *span,
+                    };
+                    return Some((param, call));
+                }
+            }
+        }
         let Expr::Ident(id) = arg else {
             return None;
         };

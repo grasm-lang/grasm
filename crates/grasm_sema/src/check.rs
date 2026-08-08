@@ -1741,6 +1741,48 @@ declare it before `parallel`",
                 }
             }
         }
+        // `utils.helper` as a *value* — the same function a call would reach,
+        // not called. Without this, every `map`/`sort_by`/`fold` over an
+        // imported function had to be wrapped in a closure, and the error said
+        // the module did not exist.
+        if let Expr::Ident(tid) = recv {
+            if self.lookup(&tid.name).is_none() {
+                let target = self
+                    .module_imports
+                    .get(&self.current_module)
+                    .and_then(|m| m.get(&tid.name))
+                    .cloned();
+                if let Some(target_mod) = target {
+                    let qual = format!("{target_mod}::{}", name.name);
+                    match self.fns.get(&qual).cloned() {
+                        Some(info) if info.is_pub => {
+                            let ret = match &info.err {
+                                Some(e) => Type::Fallible(
+                                    Box::new(info.ret.clone()),
+                                    Box::new(e.clone()),
+                                ),
+                                None => info.ret.clone(),
+                            };
+                            return Type::Fn {
+                                params: info.params.clone(),
+                                ret: Box::new(ret),
+                            };
+                        }
+                        Some(_) => {
+                            return self.error_help(
+                                name.span,
+                                format!(
+                                    "function `{}` in module `{target_mod}` is private",
+                                    name.name
+                                ),
+                                "mark it `pub fn` to allow cross-module use",
+                            );
+                        }
+                        None => {}
+                    }
+                }
+            }
+        }
         let recv_ty = self.infer_expr(recv);
         match self.uni.shallow_resolve(&recv_ty) {
             // `pair.0` — a tuple's components are named by position.

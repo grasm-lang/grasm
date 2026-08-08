@@ -178,3 +178,48 @@ fn an_effect_operations_error_type_may_come_from_another_module() {
         ("lib", "pub type Missing = { key: str }\n"),
     ]);
 }
+
+/// An imported function can be used as a *value*, not only called.
+///
+/// `[1].map(util.dbl)` reported `unknown name \`util\`` — the message denying
+/// the module exists while `util.dbl(1)` on the next line worked. Every
+/// `map`/`sort_by`/`fold` over an imported function had to be wrapped in a
+/// closure to get past it.
+#[test]
+fn an_imported_function_may_be_used_as_a_value() {
+    ok(&[
+        (
+            "main",
+            "import util\n\n\
+             fn apply(f: fn(i64) -> i64, v: i64) -> i64 {\n\
+             \x20   f(v)\n\
+             }\n\n\
+             fn main() {\n\
+             \x20   print(\"{[1, 2].map(util.dbl)}\")\n\
+             \x20   var xs = [1, 3, 2]\n\
+             \x20   xs.sort_by(util.key)\n\
+             \x20   print(\"{apply(util.dbl, 5)} {5 |> util.dbl}\")\n\
+             }\n",
+        ),
+        (
+            "util",
+            "pub fn dbl(n: i64) -> i64 {\n    n * 2\n}\n\
+             pub fn key(n: i64) -> i64 {\n    0 - n\n}\n",
+        ),
+    ]);
+}
+
+/// Privacy still applies to a function used as a value.
+#[test]
+fn a_private_function_may_not_be_used_as_a_value_either() {
+    err(
+        &[
+            (
+                "main",
+                "import util\n\nfn main() {\n    print(\"{[1].map(util.hidden)}\")\n}\n",
+            ),
+            ("util", "fn hidden(n: i64) -> i64 {\n    n\n}\n"),
+        ],
+        "is private",
+    );
+}

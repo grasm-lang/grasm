@@ -245,7 +245,10 @@ namespace, so a type name may not be declared twice across a program. One
 namespace means one namespace: an effect operation's signature may name a type
 from any module, the same as an ordinary function's.
 
-**[T-MODULE-PUB]** Only `pub` functions are callable from another module.
+**[T-MODULE-PUB]** Only `pub` functions are callable from another module, and
+the same rule governs using one as a *value*: `xs.map(utils.helper)` reaches
+exactly the function `utils.helper(x)` would, and a private one is refused the
+same way.
 
 **[T-MODULE-RESOLVE]** `import a.b` names the module in `a/b.gr`, relative to
 **the source directory of the package the importing file belongs to** — a
