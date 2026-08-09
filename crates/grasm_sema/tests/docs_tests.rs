@@ -199,14 +199,18 @@ fn several_examples_on_one_item_are_numbered() {
 
 #[test]
 fn an_example_program_keeps_module_structure() {
-    // The example calls `lib.square`, exactly as a consumer would. Flattening
-    // every module into one file would make that name fail to resolve.
+    // The example is compiled in the module that owns it, so it calls
+    // `square` the way that module's own code does. Writing `lib.square` here
+    // used to be the rule, and it could not be: the same example then failed
+    // when the library was tested through a consumer, where `lib` is not a
+    // name the example's own module binds. One spelling has to work in both
+    // positions, and this is the one.
     let fx = Fixture::new(
         "modstruct",
         &[
             (
                 "lib",
-                "/// Squares.\n///\n/// ```\n/// assert(lib.square(4) == 16)\n/// ```\npub fn square(n: i64) -> i64 {\n    n * n\n}\n",
+                "/// Squares.\n///\n/// ```\n/// assert(square(4) == 16)\n/// ```\npub fn square(n: i64) -> i64 {\n    n * n\n}\n",
             ),
             ("main", "import lib\n\nfn main() {\n    print(\"{lib.square(2)}\")\n}\n"),
         ],
@@ -223,11 +227,14 @@ fn an_example_program_keeps_module_structure() {
     let diags = grasm_sema::check::check_program(&ex_program).diagnostics;
     assert!(
         diags.is_empty(),
-        "qualified names must resolve in an example: {diags:#?}"
+        "the owning module's own names must resolve in an example: {diags:#?}"
     );
     assert!(
-        ex_program.files.iter().any(|f| f.name == "lib"),
-        "the documented module must be present"
+        ex_program
+            .files
+            .iter()
+            .any(|f| f.src.contains("fn square")),
+        "the documented module's items must be in the example program"
     );
 }
 

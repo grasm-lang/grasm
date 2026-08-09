@@ -1656,10 +1656,13 @@ fn add(a: i64, b: i64) -> i64 {
 }
 ````
 
-The fenced block is **executable**. `grasm test` runs it as a test, in a
-program that keeps the real module structure — so an example may write
-`mathlib.square(4)`, exactly as a consumer would. Documentation that stops
-being true fails the suite instead of quietly misleading the next reader.
+The fenced block is **executable**. `grasm test` runs it as a test, compiled
+in the module that owns it: that module's own items are in scope unqualified,
+and everything else it imports is available the way the module has it. So an
+example writes `square(4)` — the way the module's own code does — and the same
+example passes whether the library is tested on its own or through a consumer.
+Documentation that stops being true fails the suite instead of quietly
+misleading the next reader.
 
 Lines beginning `# ` inside a block are hidden setup: they run, but they are
 not part of what a reader sees.

@@ -452,19 +452,38 @@ pub fn example_program(program: &Program, example: &Example) -> Program {
         .map(|f| (f.name.clone(), f.src.clone()))
         .collect();
 
+    // The example is compiled in the context of the module that *owns* it:
+    // its own items unqualified, everything else imported. Compiling it in the
+    // program's entry module instead made an example unwritable — a library's
+    // own suite wanted `describe(...)` and a consumer's wanted
+    // `statlib.describe(...)`, and no spelling passed in both.
+    let owner_module = example
+        .owner
+        .split("::")
+        .next()
+        .unwrap_or("main")
+        .to_string();
     let mut entry = String::new();
     for (name, _) in &sources {
-        // The original entry module is inlined below rather than imported:
-        // importing it would pull in a second `main`.
-        if name != "main" {
+        // The owner is inlined below rather than imported, so its items are in
+        // scope unqualified; the entry module is skipped because importing it
+        // would pull in a second `main`.
+        if name != "main" && *name != owner_module {
             entry.push_str(&format!("import {name}\n"));
         }
     }
-    // The documented module's own items must be in scope unqualified too, so
-    // an example for the entry module reads naturally.
-    if let Some(main_src) = program.files.first() {
-        for line in main_src.src.lines() {
+    let owner_src = program
+        .files
+        .iter()
+        .find(|f| f.name == owner_module)
+        .or_else(|| program.files.first());
+    if let Some(owner) = owner_src {
+        for line in owner.src.lines() {
+            // The owner's own imports come along, so an example may use
+            // anything the documented module itself can.
             if line.trim_start().starts_with("import ") {
+                entry.push_str(line);
+                entry.push('\n');
                 continue;
             }
             entry.push_str(line);

@@ -355,3 +355,38 @@ fn fmt_refuses_source_that_does_not_parse() {
         assert!(text.contains("does not parse"), "should say why:\n{text}");
     }
 }
+
+/// A doc example passes in both positions, or fails in both.
+///
+/// It used to compile in the *program's entry* module, so a library's own
+/// suite wanted `describe(4)` and a consumer's wanted `lib.describe(4)`, and
+/// no spelling passed in both. A library's suite was green standalone and red
+/// from its consumer, permanently.
+#[test]
+fn a_doc_example_behaves_the_same_from_the_library_and_from_a_consumer() {
+    for (body, expected_code) in [("8", 0), ("999", 1)] {
+        let w = Work::new("docpos");
+        std::fs::create_dir_all(&w.0).unwrap();
+        std::fs::write(
+            w.0.join("lib.gr"),
+            format!(
+                "/// ```\n/// assert_eq(describe(4), {body})\n/// ```\n\
+                 pub fn describe(n: i64) -> i64 {{\n    n * 2\n}}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            w.0.join("main.gr"),
+            "import lib\n\nfn main() {\n    print(\"{lib.describe(2)}\")\n}\n\n\
+             test \"own\" {\n    assert(true)\n}\n",
+        )
+        .unwrap();
+        for entry in ["lib.gr", "main.gr"] {
+            let (code, text) = run(&["test", w.0.join(entry).to_str().unwrap()]);
+            assert_eq!(
+                code, expected_code,
+                "`{entry}` with example `{body}` should exit {expected_code}:\n{text}"
+            );
+        }
+    }
+}
