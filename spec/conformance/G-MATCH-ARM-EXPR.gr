@@ -1,0 +1,14 @@
+//! tag: G-MATCH-ARM-EXPR
+//! expect: error
+//! expected an expression but found `for`
+// A match arm's body is an expression. The grammar read
+// `( expression | statement )`, which the parser had never accepted — so a
+// reader who trusted it got this error with no way to tell which of the two
+// was wrong. Write `1 -> { for i in 0..2 { ... } }` when you want a statement.
+fn main() {
+    let n = 1
+    match n {
+        1 -> for i in 0..2 { print("{i}") }
+        _ -> print("no")
+    }
+}

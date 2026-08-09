@@ -266,10 +266,18 @@ struct_lit   = identifier "{" ( ".." expression ","? )?
 field_init   = identifier ":" expression
 if_expr      = "if" expression block ( "else" ( if_expr | block ) )?
 match_expr   = "match" expression "{" match_arm* "}"
-match_arm    = alt_pattern ( "if" expression )? "->" ( expression | statement )
+match_arm    = alt_pattern ( "if" expression )? "->" expression
 alt_pattern  = pattern ( "|" pattern )*
 closure      = "|" ( identifier ( "," identifier )* )? "|" ( expression | block )
 ```
+
+**[G-MATCH-ARM-EXPR]** A match arm's body is an *expression*. `for`, `while`,
+`let`, `var` and `with` are statements, so they need a block: `1 -> { for i in
+0..2 { … } }`, not `1 -> for i in 0..2 { … }`. The rule used to read
+`( expression | statement )`, which the parser had never accepted — a grammar
+that promises more than the implementation gives is a worse guide than no
+grammar, because a reader trusts it and gets a parse error with no idea which
+of the two is wrong.
 
 **[G-PIPE]** `x |> f(a)` is exactly `f(x, a)`; `x |> f` is `f(x)`.
 
@@ -775,7 +783,13 @@ rather than trapping. `i64::MIN % -1` is `0`, as `x % -1` is for every `x`.
 
 **[E-DIV-ZERO]** Integer `/` or `%` by zero panics.
 
-**[E-POW-NEG]** A negative integer exponent panics; use floats.
+**[E-POW]** `^` is exponentiation, not the bitwise xor it is in the C family.
+`2 ^ 10` is `1024`. It works on `f64` as well as `i64` — `2.0 ^ 0.5` is a
+square root — and a float exponent may be fractional or negative.
+
+**[E-POW-NEG]** A negative *integer* exponent panics: `2 ^ -1` has no `i64`
+value and silently returning `0` would be worse than stopping. Write it in
+floats, where `2.0 ^ -1.0` is `0.5`.
 
 **[E-RECURSION-DEPTH]** Recursion is bounded. **At least 10,000 nested calls
 are guaranteed to work.** Past an implementation's own bound the program
@@ -1140,11 +1154,18 @@ the wrap is the same one `/` and `%` take ([E-ARITH-INT]).
 | `x.sqrt()` | `f64 -> f64` | |
 | `n.to_str()` | `-> str` | |
 | `n.as_f64()` | `i64 -> f64` | widening |
-| `x.as_i64()` | `f64 -> i64` | truncates toward zero |
+| `x.as_i64()` | `f64 -> i64` | truncates toward zero, saturating ([L-LIB-AS-I64]) |
 
 Conversion is by method, not by a cast or a `int(...)`-style function. A `str`
 becomes a number with `parse_int` / `parse_float`, which return `Option`
 because the text may not be a number.
+
+**[L-LIB-AS-I64]** `as_i64` is total: it has an answer for every `f64`, so it
+never panics and never returns `Option`. A value too large for `i64` gives
+`i64`'s maximum, one too small gives its minimum, and `NaN` gives `0`. That is
+saturation, not wrapping — `1.0e30.as_i64()` is `9223372036854775807`, and it
+being a *clamp* rather than a truncated bit pattern is the part worth knowing,
+because the two disagree and only one of them stays ordered.
 
 ## 3. `str`
 
@@ -1748,6 +1769,13 @@ leaving it out means "do not check me". Because effects are inferred from source
 quietly starts reading the filesystem exceeds its declared ceiling and fails
 to build **in every consumer** — a compile error, not a runtime surprise, and
 not something a reviewer has to happen to notice.
+
+A capability is what a package needs from **outside** itself, so what counts is
+what *escapes*: the effects `main` performs, and the effects left in a `pub`
+function's row for a consumer to handle. An effect you declare, perform and
+handle inside your own package needs nothing from anyone and is not a
+capability — but the handler answers for what it really does, so a `Log`
+handler that calls `print` puts `io` in the ceiling whoever asked for it.
 
 `grasm deps` resolves the graph, checks every package against its ceiling, and
 writes `grasm.lock` with a SHA-256 over each package's sources.
@@ -2915,6 +2943,26 @@ fn main() {
 }
 ```
 
+## `E-POW.gr`
+
+```grasm
+//! tag: E-POW
+//! expect: output
+//! 1024 1024.0
+//! 1.5 0.5 0.25
+// `^` is exponentiation, not xor.
+//
+// Coming from the C family, `^` reads as bitwise xor, and `2 ^ 10` being 1024
+// rather than 8 is the kind of difference that produces a wrong answer instead
+// of an error. It was in the grammar as an operator and nowhere as a meaning.
+fn main() {
+    print("{2 ^ 10} {2.0 ^ 10.0}")
+    // A float exponent may be fractional or negative; an integer one may not
+    // be negative, which is [E-POW-NEG].
+    print("{2.25 ^ 0.5} {2.0 ^ -1.0} {2.0 ^ -2.0}")
+}
+```
+
 ## `E-PRINT-ATOMIC.gr`
 
 ```grasm
@@ -3375,6 +3423,25 @@ fn main() {
 
 fn label(n: i64) -> str {
     if n == 1 { "ok" } else { "no" }
+}
+```
+
+## `G-MATCH-ARM-EXPR.gr`
+
+```grasm
+//! tag: G-MATCH-ARM-EXPR
+//! expect: error
+//! expected an expression but found `for`
+// A match arm's body is an expression. The grammar read
+// `( expression | statement )`, which the parser had never accepted — so a
+// reader who trusted it got this error with no way to tell which of the two
+// was wrong. Write `1 -> { for i in 0..2 { ... } }` when you want a statement.
+fn main() {
+    let n = 1
+    match n {
+        1 -> for i in 0..2 { print("{i}") }
+        _ -> print("no")
+    }
 }
 ```
 
@@ -3844,6 +3911,24 @@ fn main() {
 fn main() {
     // `type` is reserved and cannot name a variable.
     let type = 1
+}
+```
+
+## `L-LIB-AS-I64.gr`
+
+```grasm
+//! tag: L-LIB-AS-I64
+//! expect: output
+//! 3 -3
+//! 9223372036854775807 -9223372036854775808 0
+// `as_i64` saturates. It is total, so it has an answer for every f64 and never
+// panics — but "truncates toward zero" was the whole of what was written down,
+// which says nothing about the values that have no i64 at all.
+fn main() {
+    print("{3.7.as_i64()} {(-3.7).as_i64()}")
+    let huge = 1.0e30
+    let nan = 0.0 / 0.0
+    print("{huge.as_i64()} {(-huge).as_i64()} {nan.as_i64()}")
 }
 ```
 

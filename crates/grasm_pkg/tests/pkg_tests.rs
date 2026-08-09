@@ -1200,3 +1200,50 @@ fn the_lockfile_records_the_versions_selection_chose() {
     assert!(!text.checksum.is_empty());
 }
 
+
+/// An effect handled inside the package is not a capability.
+///
+/// A capability is what a package needs from *outside* itself. `Cfg` is
+/// declared here, performed by a private helper, and handled three lines later
+/// in `main` — it never leaves this source, so nothing outside has to provide
+/// it. Counting it anyway made this package fail to build against
+/// `capabilities = ["io"]` demanding a capability named `Cfg`, and the only
+/// way through was to publish an internal name in the manifest.
+///
+/// The opposite case still counts: see
+/// `a_user_effect_is_a_capability_like_any_other`, where `Network` is in a
+/// `pub fn`'s row with no handler, so a consumer really does have to supply
+/// one.
+#[test]
+fn an_effect_handled_inside_the_package_is_not_a_capability() {
+    let ws = Workspace::new("usereffect");
+    let src = "effect Cfg {\n    fn value() -> i64\n}\n\n\
+               fn read() -> i64 / {Cfg} {\n    Cfg.value()\n}\n\n\
+               fn main() {\n    let h = CfgHandler{ value: || 7 }\n    \
+               with Cfg handled_by h {\n        print(\"{read()}\")\n    }\n}\n";
+    let dir = ws.package("cfgpkg", &manifest("cfgpkg", Some("\"io\""), &[]), src);
+    let m = Manifest::load(&dir).unwrap();
+    let performed = grasm_pkg::effects_of_package(&m).unwrap();
+    assert!(!performed.contains("Cfg"), "got: {performed:?}");
+    assert!(performed.contains("io"), "the print still counts: {performed:?}");
+    assert!(grasm_pkg::check_capabilities(&m, &performed).is_none());
+}
+
+/// The other half: the handler's *real* effect is still counted.
+///
+/// This is what keeps the rule above from being a hole. `Log` is abstract, but
+/// the handler prints, and printing is `io` whoever asked for it.
+#[test]
+fn an_effect_handler_still_answers_for_what_it_does() {
+    let ws = Workspace::new("handlereffect");
+    let src = "effect Log {\n    fn note(m: str)\n}\n\n\
+               fn work() / {Log} {\n    Log.note(\"hi\")\n}\n\n\
+               fn main() {\n    let h = LogHandler{ note: |m| print(\"{m}\") }\n    \
+               with Log handled_by h {\n        work()\n    }\n}\n";
+    let dir = ws.package("logpkg", &manifest("logpkg", Some(""), &[]), src);
+    let m = Manifest::load(&dir).unwrap();
+    let performed = grasm_pkg::effects_of_package(&m).unwrap();
+    let v = grasm_pkg::check_capabilities(&m, &performed)
+        .expect("the handler's io must still be caught");
+    assert_eq!(v.exceeded, vec!["io"]);
+}

@@ -80,7 +80,13 @@ rather than trapping. `i64::MIN % -1` is `0`, as `x % -1` is for every `x`.
 
 **[E-DIV-ZERO]** Integer `/` or `%` by zero panics.
 
-**[E-POW-NEG]** A negative integer exponent panics; use floats.
+**[E-POW]** `^` is exponentiation, not the bitwise xor it is in the C family.
+`2 ^ 10` is `1024`. It works on `f64` as well as `i64` — `2.0 ^ 0.5` is a
+square root — and a float exponent may be fractional or negative.
+
+**[E-POW-NEG]** A negative *integer* exponent panics: `2 ^ -1` has no `i64`
+value and silently returning `0` would be worse than stopping. Write it in
+floats, where `2.0 ^ -1.0` is `0.5`.
 
 **[E-RECURSION-DEPTH]** Recursion is bounded. **At least 10,000 nested calls
 are guaranteed to work.** Past an implementation's own bound the program

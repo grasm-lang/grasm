@@ -126,9 +126,17 @@ fn main() -> ExitCode {
                 Err(code) => return code,
             };
             let modules = grasm_sema::docs::collect(&program);
-            let title = std::path::Path::new(&path)
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
+            // The package's name, when the file is in one. The entry file's
+            // stem is `main` in every package laid out the ordinary way, so
+            // every generated document was titled `main` regardless of what
+            // the package was called.
+            let title = enclosing_package(std::path::Path::new(&path))
+                .map(|m| m.name)
+                .or_else(|| {
+                    std::path::Path::new(&path)
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                })
                 .unwrap_or_else(|| "API".to_string());
             let text = grasm_sema::docs::render_markdown(&title, &modules);
             match flag_value(&args[2..], "-o") {
@@ -178,6 +186,19 @@ fn main() -> ExitCode {
                         .map(|s| s.to_string_lossy().to_string())
                         .unwrap_or_else(|| "app".to_string())
                 });
+            // An output path that is not a regular file cannot become an
+            // executable. `-o /dev/null` used to report `built ... (0 bytes)`
+            // and exit 0 — in a build script, a green light for something that
+            // will never run. Checked here so the message names the cause
+            // rather than surfacing whatever errno the linker happened to hit.
+            if let Ok(meta) = std::fs::metadata(&out_path) {
+                if !meta.is_file() {
+                    eprintln!(
+                        "error: `{out_path}` is not a regular file, so it cannot be an executable",
+                    );
+                    return ExitCode::FAILURE;
+                }
+            }
             let program = match load_and_check(path) {
                 Ok(p) => p,
                 Err(code) => return code,
@@ -213,6 +234,16 @@ fn main() -> ExitCode {
                 } else {
                     build_native(&program, &out_path)
                 } {
+                    // A linker that writes nothing has not built anything.
+                    // `-o /dev/null` reported "built ... (0 bytes)" and exited
+                    // 0, which in a build script is a green light for a file
+                    // that will never run.
+                    Ok(0) => {
+                        eprintln!(
+                            "error: linking produced an empty file at `{out_path}` — it is not an executable",
+                        );
+                        ExitCode::FAILURE
+                    }
                     Ok(size) => {
                         println!(
                             "built `{out_path}` natively ({size} bytes, Cranelift)",
@@ -527,6 +558,23 @@ fn format_duration(ns: f64) -> String {
 /// Package directories for a file's registry dependencies, if it has any.
 ///
 /// Path dependencies the loader finds on its own. A registry dependency needs
+/// The manifest of the package a file belongs to, if it is in one.
+///
+/// Walks up from the file, so any file in a package finds it — the same rule
+/// the loader uses for resolving a package's dependencies.
+fn enclosing_package(path: &std::path::Path) -> Option<grasm_pkg::Manifest> {
+    let mut here = path.parent().map(std::path::Path::to_path_buf);
+    loop {
+        match here {
+            Some(ref d) if d.join(grasm_pkg::MANIFEST_NAME).is_file() => {
+                return grasm_pkg::Manifest::load(d).ok();
+            }
+            Some(ref d) => here = d.parent().map(std::path::Path::to_path_buf),
+            None => return None,
+        }
+    }
+}
+
 /// the whole graph resolved before its version is known, so that happens here
 /// and the answer is handed down. Packages with no registry dependency pay
 /// nothing: there is nothing to resolve.
@@ -660,6 +708,14 @@ fn api_surface(program: &Program) -> String {
     let const_types = grasm_sema::check::check_program(program).const_types;
     let mut lines: Vec<String> = Vec::new();
     for file in &program.files {
+        // A dependency's exports are that package's surface, not this one's.
+        // Including them meant upgrading a dependency reported a breaking
+        // change in *your* API — the one signal this command exists to keep
+        // clean. The dependency tracks its own surface with its own `api`.
+        let root = file.name.split('.').next().unwrap_or(&file.name);
+        if program.deps.contains(root) {
+            continue;
+        }
         for decl in &file.module.decls {
             // Exactly what another package can reach. The documentation
             // collector was the wrong source: it shows the *entry* module's

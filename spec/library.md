@@ -152,11 +152,18 @@ the wrap is the same one `/` and `%` take ([E-ARITH-INT]).
 | `x.sqrt()` | `f64 -> f64` | |
 | `n.to_str()` | `-> str` | |
 | `n.as_f64()` | `i64 -> f64` | widening |
-| `x.as_i64()` | `f64 -> i64` | truncates toward zero |
+| `x.as_i64()` | `f64 -> i64` | truncates toward zero, saturating ([L-LIB-AS-I64]) |
 
 Conversion is by method, not by a cast or a `int(...)`-style function. A `str`
 becomes a number with `parse_int` / `parse_float`, which return `Option`
 because the text may not be a number.
+
+**[L-LIB-AS-I64]** `as_i64` is total: it has an answer for every `f64`, so it
+never panics and never returns `Option`. A value too large for `i64` gives
+`i64`'s maximum, one too small gives its minimum, and `NaN` gives `0`. That is
+saturation, not wrapping — `1.0e30.as_i64()` is `9223372036854775807`, and it
+being a *clamp* rather than a truncated bit pattern is the part worth knowing,
+because the two disagree and only one of them stays ordered.
 
 ## 3. `str`
 

@@ -156,9 +156,34 @@ pub fn effects_of_program(program: &crate::loader::Program) -> BTreeSet<String> 
             break;
         }
     }
+    // What the package needs from *outside* itself: the entry point's row,
+    // which is what running it takes from the environment, and every `pub`
+    // item's row, which is what a consumer has to supply. A private function's
+    // effects are not skipped — rows are transitive, so they already appear in
+    // whatever calls it — but they stop counting once something in between
+    // *handles* them, which is the point.
+    //
+    // The union over every function counted a handled effect anyway. A package
+    // that declared `effect Cfg`, performed it in a private helper, handled it
+    // three lines later in `main` and never let it out of its own source
+    // failed to build against `capabilities = ["io"]`, demanding a capability
+    // named `Cfg`. The only way through was to publish an internal name in the
+    // manifest. An effect that never escapes is not a capability; one that
+    // does — `pub fn grab(u) -> str / {Network}` — still is.
+    let entry_module = program
+        .files
+        .first()
+        .map(|f| f.name.as_str())
+        .unwrap_or("main");
     let mut all = BTreeSet::new();
-    for row in ctx.rows.values() {
-        all.extend(row.iter().cloned());
+    for (key, row) in &ctx.rows {
+        let Some((module, name)) = key.rsplit_once("::") else {
+            continue;
+        };
+        let escapes = ctx.fns[key].is_pub || (module == entry_module && name == "main");
+        if escapes {
+            all.extend(row.iter().cloned());
+        }
     }
     // Tests and benchmarks may perform effects too.
     for f in &views {

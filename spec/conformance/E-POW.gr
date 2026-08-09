@@ -1,0 +1,15 @@
+//! tag: E-POW
+//! expect: output
+//! 1024 1024.0
+//! 1.5 0.5 0.25
+// `^` is exponentiation, not xor.
+//
+// Coming from the C family, `^` reads as bitwise xor, and `2 ^ 10` being 1024
+// rather than 8 is the kind of difference that produces a wrong answer instead
+// of an error. It was in the grammar as an operator and nowhere as a meaning.
+fn main() {
+    print("{2 ^ 10} {2.0 ^ 10.0}")
+    // A float exponent may be fractional or negative; an integer one may not
+    // be negative, which is [E-POW-NEG].
+    print("{2.25 ^ 0.5} {2.0 ^ -1.0} {2.0 ^ -2.0}")
+}

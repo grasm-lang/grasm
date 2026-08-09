@@ -1,0 +1,13 @@
+//! tag: L-LIB-AS-I64
+//! expect: output
+//! 3 -3
+//! 9223372036854775807 -9223372036854775808 0
+// `as_i64` saturates. It is total, so it has an answer for every f64 and never
+// panics — but "truncates toward zero" was the whole of what was written down,
+// which says nothing about the values that have no i64 at all.
+fn main() {
+    print("{3.7.as_i64()} {(-3.7).as_i64()}")
+    let huge = 1.0e30
+    let nan = 0.0 / 0.0
+    print("{huge.as_i64()} {(-huge).as_i64()} {nan.as_i64()}")
+}

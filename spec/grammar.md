@@ -251,10 +251,18 @@ struct_lit   = identifier "{" ( ".." expression ","? )?
 field_init   = identifier ":" expression
 if_expr      = "if" expression block ( "else" ( if_expr | block ) )?
 match_expr   = "match" expression "{" match_arm* "}"
-match_arm    = alt_pattern ( "if" expression )? "->" ( expression | statement )
+match_arm    = alt_pattern ( "if" expression )? "->" expression
 alt_pattern  = pattern ( "|" pattern )*
 closure      = "|" ( identifier ( "," identifier )* )? "|" ( expression | block )
 ```
+
+**[G-MATCH-ARM-EXPR]** A match arm's body is an *expression*. `for`, `while`,
+`let`, `var` and `with` are statements, so they need a block: `1 -> { for i in
+0..2 { … } }`, not `1 -> for i in 0..2 { … }`. The rule used to read
+`( expression | statement )`, which the parser had never accepted — a grammar
+that promises more than the implementation gives is a worse guide than no
+grammar, because a reader trusts it and gets a parse error with no idea which
+of the two is wrong.
 
 **[G-PIPE]** `x |> f(a)` is exactly `f(x, a)`; `x |> f` is `f(x)`.
 

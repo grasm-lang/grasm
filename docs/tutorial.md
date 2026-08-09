@@ -463,6 +463,13 @@ quietly starts reading the filesystem exceeds its declared ceiling and fails
 to build **in every consumer** — a compile error, not a runtime surprise, and
 not something a reviewer has to happen to notice.
 
+A capability is what a package needs from **outside** itself, so what counts is
+what *escapes*: the effects `main` performs, and the effects left in a `pub`
+function's row for a consumer to handle. An effect you declare, perform and
+handle inside your own package needs nothing from anyone and is not a
+capability — but the handler answers for what it really does, so a `Log`
+handler that calls `print` puts `io` in the ceiling whoever asked for it.
+
 `grasm deps` resolves the graph, checks every package against its ceiling, and
 writes `grasm.lock` with a SHA-256 over each package's sources.
 
