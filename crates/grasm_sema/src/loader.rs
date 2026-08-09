@@ -189,13 +189,31 @@ pub fn load_from_disk_with(
     entry_path: &std::path::Path,
     resolved: &HashMap<String, std::path::PathBuf>,
 ) -> Result<Program, String> {
+    load_from_disk_in(entry_path, resolved, None)
+}
+
+/// `load_from_disk_with`, with the entry file's text supplied by the caller.
+///
+/// An editor holds the buffer being typed into, which is not what is on disk.
+/// Without this the language server could only analyse a single file with no
+/// imports resolved at all, so every use of an imported name was reported as
+/// unknown — twenty-two errors on a file `grasm check` passes, and the real
+/// error somewhere among them.
+pub fn load_from_disk_in(
+    entry_path: &std::path::Path,
+    resolved: &HashMap<String, std::path::PathBuf>,
+    entry_override: Option<String>,
+) -> Result<Program, String> {
     let entry_src_dir = entry_path
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_default();
     let entry_display = entry_path.display().to_string();
-    let entry_src = std::fs::read_to_string(entry_path)
-        .map_err(|e| format!("cannot read `{entry_display}`: {e}"))?;
+    let entry_src = match entry_override {
+        Some(src) => src,
+        None => std::fs::read_to_string(entry_path)
+            .map_err(|e| format!("cannot read `{entry_display}`: {e}"))?,
+    };
     // A file inside a package can import that package's dependencies by name,
     // not just its own sibling files.
     let mut deps = package_dependencies(&entry_src_dir);

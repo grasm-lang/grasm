@@ -327,3 +327,40 @@ fn hover_without_a_doc_comment_shows_only_the_signature() {
     assert!(text.contains("fn add"), "got: {text}");
     assert!(!text.contains("---"), "no separator without a doc: {text}");
 }
+
+/// A file with an `import` is analysed as part of its program.
+///
+/// The server used to analyse the buffer alone, with no imports resolved, so
+/// every use of an imported name came back "unknown name" — twenty-two errors
+/// on a file `grasm check` passes clean, with any real error indistinguishable
+/// among them. An editor showed every multi-module file solid red.
+#[test]
+fn a_file_with_imports_resolves_them() {
+    let dir = std::env::temp_dir().join(format!("grasm_lsp_imports_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("util.gr"),
+        "pub fn scale(n: i64) -> i64 {\n    n * 2\n}\n",
+    )
+    .unwrap();
+    let main = "import util\n\nfn main() {\n    print(\"{util.scale(3)}\")\n}\n";
+    let main_path = dir.join("main.gr");
+    std::fs::write(&main_path, main).unwrap();
+
+    let uri = format!("file://{}", main_path.display());
+    let out = run(&[&open_doc(&uri, main)]);
+    let diags = out[0].path("params.diagnostics").unwrap();
+    assert_eq!(diags, &Json::Arr(vec![]), "imports should resolve");
+
+    // And a genuine error in the same file is still reported.
+    let broken = "import util\n\nfn main() {\n    let s: str = util.scale(3)\n    print(\"{s}\")\n}\n";
+    std::fs::write(&main_path, broken).unwrap();
+    let out = run(&[&open_doc(&uri, broken)]);
+    let Json::Arr(diags) = out[0].path("params.diagnostics").unwrap() else {
+        panic!("expected an array")
+    };
+    assert_eq!(diags.len(), 1, "{diags:?}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

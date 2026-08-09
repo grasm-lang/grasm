@@ -200,7 +200,40 @@ impl Server {
         let Some(doc) = self.docs.get(uri) else {
             return Json::Null;
         };
-        let (_, diags) = grasm_sema::analyze(&doc.text);
+        // Resolved the way `grasm check` resolves it, with the buffer
+        // standing in for the entry file — an editor holds text that is not on
+        // disk yet. Analysing the buffer alone left every import unresolved,
+        // so a file that `grasm check` passes showed twenty-two errors and the
+        // real one was indistinguishable from the noise.
+        let diags = match uri.strip_prefix("file://").map(std::path::PathBuf::from) {
+            Some(path) => {
+                match grasm_sema::loader::load_from_disk_in(
+                    &path,
+                    &std::collections::HashMap::new(),
+                    Some(doc.text.clone()),
+                ) {
+                    Ok(program) => {
+                        let mut ds = program.diagnostics.clone();
+                        if ds.is_empty() {
+                            ds = grasm_sema::check::check_program(&program).diagnostics;
+                        }
+                        // Only this file's. The others belong to their own URIs
+                        // and would land at meaningless offsets here.
+                        let end = program
+                            .files
+                            .first()
+                            .map(|f| f.src.len() as u32)
+                            .unwrap_or(u32::MAX);
+                        ds.retain(|d| d.span.start < end);
+                        ds
+                    }
+                    // A path that will not load at all — unsaved buffer with no
+                    // file yet, say. One file is better than none.
+                    Err(_) => grasm_sema::analyze(&doc.text).1,
+                }
+            }
+            None => grasm_sema::analyze(&doc.text).1,
+        };
         let items: Vec<Json> = diags
             .iter()
             .map(|d| {
