@@ -55,6 +55,8 @@ pub struct Interp<'a, W: Write> {
     consts: HashMap<String, &'a grasm_syntax::ast::ConstDecl>,
     /// Integer literals the checker resolved to `f64`, by span start.
     float_literals: std::collections::HashSet<u32>,
+    /// `sum()` calls the checker resolved to `f64`, by span start.
+    float_sums: std::collections::HashSet<u32>,
     /// `type Res = i64 ! E` — needed to tell whether a function that returns
     /// an alias is fallible, which decides whether its value is wrapped.
     aliases: HashMap<String, TypeExpr>,
@@ -120,7 +122,9 @@ impl<'a, W: Write> Interp<'a, W> {
         // are `f64` is a fact only the checker has ([T-INT-TO-FLOAT-CARRIED]),
         // and a caller that forgets to pass it gets silently wrong arithmetic
         // — so no caller is asked to remember.
-        me.float_literals = grasm_sema::check::check(module).float_literals;
+        let a = grasm_sema::check::check(module);
+        me.float_literals = a.float_literals;
+        me.float_sums = a.float_sums;
         me
     }
 
@@ -139,6 +143,11 @@ impl<'a, W: Write> Interp<'a, W> {
     /// wrong but not worse than it was.
     pub fn set_float_literals(&mut self, spans: std::collections::HashSet<u32>) {
         self.float_literals = spans;
+    }
+
+    /// The `sum()` calls the checker resolved to `f64`.
+    pub fn set_float_sums(&mut self, spans: std::collections::HashSet<u32>) {
+        self.float_sums = spans;
     }
 
     fn build(
@@ -233,6 +242,7 @@ impl<'a, W: Write> Interp<'a, W> {
             current_module: "main".to_string(),
             consts: HashMap::new(),
             float_literals: std::collections::HashSet::new(),
+            float_sums: std::collections::HashSet::new(),
             aliases: HashMap::new(),
             externs: HashMap::new(),
             fallible_ops: std::collections::HashSet::new(),
@@ -1811,7 +1821,13 @@ build links it, `grasm run` can only reach what is already loaded",
                         }
                     }
                 }
-                if is_float {
+                // An empty list has no element to read the type off, so the
+                // checker's answer is used instead: `[f64].sum()` is `0.0`,
+                // not `0`. Without it this engine returned an integer, printed
+                // it without a point, and then panicked `no method to_fixed on
+                // 0` the moment the caller used the `f64` it had been
+                // promised — the documented deviation this closes.
+                if is_float || self.float_sums.contains(&name.span.start) {
                     Value::Float(float_sum + int_sum as f64)
                 } else {
                     Value::Int(int_sum)

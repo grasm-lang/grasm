@@ -135,7 +135,9 @@ fn run_program_traced_here(
     let mut interp = Interp::new_program(&files, out);
     // Which integer literals are `f64` is a fact only the checker has
     // ([T-INT-TO-FLOAT]); this engine has no types of its own.
-    interp.set_float_literals(grasm_sema::check::check_program(program).float_literals);
+    let analysis = grasm_sema::check::check_program(program);
+    interp.set_float_literals(analysis.float_literals);
+    interp.set_float_sums(analysis.float_sums);
     interp.program_args = program_args.to_vec();
     let code = interp.run_main();
     report_fault(&interp.fault);
@@ -165,7 +167,9 @@ fn run_program_here(
     let mut interp = Interp::new_program(&files, out);
     // Which integer literals are `f64` is a fact only the checker has
     // ([T-INT-TO-FLOAT]); this engine has no types of its own.
-    interp.set_float_literals(grasm_sema::check::check_program(program).float_literals);
+    let analysis = grasm_sema::check::check_program(program);
+    interp.set_float_literals(analysis.float_literals);
+    interp.set_float_sums(analysis.float_sums);
     interp.program_args = program_args.to_vec();
     let code = interp.run_main();
     report_fault(&interp.fault);
@@ -206,7 +210,9 @@ fn test_program_here(
     let mut interp = Interp::new_program(&files, out);
     // Which integer literals are `f64` is a fact only the checker has
     // ([T-INT-TO-FLOAT]); this engine has no types of its own.
-    interp.set_float_literals(grasm_sema::check::check_program(program).float_literals);
+    let analysis = grasm_sema::check::check_program(program);
+    interp.set_float_literals(analysis.float_literals);
+    interp.set_float_sums(analysis.float_sums);
     if opts.coverage {
         interp.enable_coverage();
     }
@@ -325,9 +331,9 @@ fn run_doc_examples(
         let mut buf = Vec::new();
         let ok = {
             let mut interp = Interp::new_program(&files, &mut buf);
-            interp.set_float_literals(
-                grasm_sema::check::check_program(&ex_program).float_literals,
-            );
+            let a = grasm_sema::check::check_program(&ex_program);
+            interp.set_float_literals(a.float_literals);
+            interp.set_float_sums(a.float_sums);
             // By name, not by position. `example_program` inlines the
             // documented module's own declarations — its tests included — and
             // appends the example after them, so taking the *first* test ran
@@ -412,7 +418,9 @@ fn bench_program_here(
     let mut interp = Interp::new_program(&files, out);
     // Which integer literals are `f64` is a fact only the checker has
     // ([T-INT-TO-FLOAT]); this engine has no types of its own.
-    interp.set_float_literals(grasm_sema::check::check_program(program).float_literals);
+    let analysis = grasm_sema::check::check_program(program);
+    interp.set_float_literals(analysis.float_literals);
+    interp.set_float_sums(analysis.float_sums);
     let mut results = Vec::new();
     // Every module's benchmarks, the way `grasm test` runs every module's
     // tests. Scanning only the entry file reported "no benchmarks found" for a

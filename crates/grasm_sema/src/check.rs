@@ -28,6 +28,11 @@ pub struct Analysis {
     /// Spans are globally unique across a program — the loader gives each file
     /// a disjoint base — so the start offset identifies the literal.
     pub float_literals: std::collections::HashSet<u32>,
+    /// Start offsets of the `sum()` calls whose result type is `f64`.
+    ///
+    /// Same reason as `float_literals`: the interpreter reads the type off the
+    /// elements, and an empty `[f64]` has none to read.
+    pub float_sums: std::collections::HashSet<u32>,
 }
 
 pub fn check(module: &Module) -> Analysis {
@@ -107,6 +112,7 @@ fn check_modules(files: &[ModuleView]) -> Analysis {
             .map(|(k, (t, _))| (k.clone(), TypeDisplay { ty: t, defs: &c.defs }.to_string()))
             .collect(),
         float_literals: c.float_literals,
+        float_sums: c.float_sums,
         defs: c.defs,
         diagnostics,
     }
@@ -146,6 +152,8 @@ struct Checker {
     /// Integer literals promoted to `f64`, by span start. See
     /// `Analysis::float_literals`.
     float_literals: std::collections::HashSet<u32>,
+    /// `sum()` calls whose result is `f64`, by span start.
+    float_sums: std::collections::HashSet<u32>,
     /// effect name → (ops, handler struct TypeDefId).
     effects: HashMap<String, (Vec<EffectOp>, TypeDefId)>,
     /// variant name → (typedef, variant index); ambiguous names keep all.
@@ -215,6 +223,7 @@ impl Checker {
             aliases: HashMap::new(),
             fns: HashMap::new(),
             float_literals: std::collections::HashSet::new(),
+            float_sums: std::collections::HashSet::new(),
             effects: HashMap::new(),
             variants,
             uni: Unifier::new(),
@@ -2380,6 +2389,20 @@ that does not change",
                         if let Type::Var(_) = r {
                             self.uni.unify(&elem, &Type::I64);
                             return Some(Type::I64);
+                        }
+                        // A float sum is a float even with nothing to add.
+                        // The interpreter decides int-versus-float from the
+                        // elements, and an empty `[f64]` has none — so it
+                        // answered `0`, printed without a point, and then
+                        // panicked `no method to_fixed on 0` when the caller
+                        // treated the result as the `f64` the checker had
+                        // promised. Recorded the same way promoted literals
+                        // are, because the type is again something only this
+                        // pass knows.
+                        // Keyed on the method name's own span, which the
+                        // interpreter also has where it needs it.
+                        if r == Type::F64 {
+                            self.float_sums.insert(name.span.start);
                         }
                         r
                     }
