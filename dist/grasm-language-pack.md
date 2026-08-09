@@ -508,6 +508,12 @@ error at the call site. This is the only place a row can be checked rather than
 inferred — a written type has no body to infer from — and without it a function
 value would be a way to carry an effect past a declared row.
 
+**[T-OK-ERR]** `Ok(v)` and `Err(e)` build a `T ! E` directly. They are the
+constructors matching what `match` already destructures, and without them a
+plain value could not be *put into* a fallible slot at all: `fail` is legal
+only inside a fallible function, so a program storing per-item results needed
+a trampoline whose whole body was `v` and another whose body was `fail(e)`.
+
 **[T-FALLIBLE-VALUE]** A function's `! E` is part of what it answers with, so
 it travels with the function *as a value*: `risky` referenced by name has type
 `fn(A) -> T ! E`, not `fn(A) -> T`. Passing it where a plain function is
@@ -5161,6 +5167,54 @@ fn main() {
     let xs = [10]
     // Absence is Option, never null.
     print("{xs.get(0) ?? 0} {xs.get(9) ?? 0 - 1}")
+}
+```
+
+## `T-OK-ERR.gr`
+
+```grasm
+//! tag: T-OK-ERR
+//! expect: output
+//! a = 1
+//! b ! bad ref
+//! 4
+//! ok 7 / err gone
+// `Ok(v)` and `Err(e)` build a fallible value.
+//
+// They were matchable and not constructible, so a program storing per-item
+// results — which is what `T ! E` is for — needed a trampoline function whose
+// entire body was `v`, and another whose body was `fail(e)`, because `fail` is
+// legal only inside a fallible function.
+type E = { c: str }
+type V = | N(n: i64) | S(s: str)
+
+fn describe(r: i64 ! E) -> str {
+    match r {
+        Ok(v) -> "ok {v}"
+        Err(e) -> "err {e.c}"
+    }
+}
+
+fn main() {
+    var cells: Map[str, V ! E] = {}
+    cells.set("a", Ok(V.N(1)))
+    cells.set("b", Err(E{ c: "bad ref" }))
+    for k in cells.keys() {
+        match cells.get(k) ?? Err(E{ c: "missing" }) {
+            Ok(V.N(n)) -> print("{k} = {n}")
+            Ok(V.S(s)) -> print("{k} = {s}")
+            Err(e) -> print("{k} ! {e.c}")
+        }
+    }
+    // In a list, and consumed with `??`.
+    let xs: [i64 ! E] = [Ok(1), Err(E{ c: "z" }), Ok(3)]
+    var total = 0
+    for r in xs {
+        total = total + (r ?? 0)
+    }
+    print("{total}")
+    // And passed to something expecting a fallible parameter.
+    print("{describe(Ok(7))} / {describe(Err(E{ c: "gone" }))}")
 }
 ```
 

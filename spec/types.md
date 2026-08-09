@@ -192,6 +192,12 @@ error at the call site. This is the only place a row can be checked rather than
 inferred — a written type has no body to infer from — and without it a function
 value would be a way to carry an effect past a declared row.
 
+**[T-OK-ERR]** `Ok(v)` and `Err(e)` build a `T ! E` directly. They are the
+constructors matching what `match` already destructures, and without them a
+plain value could not be *put into* a fallible slot at all: `fail` is legal
+only inside a fallible function, so a program storing per-item results needed
+a trampoline whose whole body was `v` and another whose body was `fail(e)`.
+
 **[T-FALLIBLE-VALUE]** A function's `! E` is part of what it answers with, so
 it travels with the function *as a value*: `risky` referenced by name has type
 `fn(A) -> T ! E`, not `fn(A) -> T`. Passing it where a plain function is

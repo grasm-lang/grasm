@@ -1566,6 +1566,25 @@ that does not change",
                         }
                         return Type::Str;
                     }
+                    // `Ok(v)` / `Err(e)` build a fallible value directly.
+                    // They were matchable and not constructible, so a plain
+                    // value could not be put into a `Map[str, T ! E]` without
+                    // a trampoline function whose whole body was `v`.
+                    "Ok" | "Err" => {
+                        if args.len() != 1 {
+                            return self.error(
+                                span,
+                                format!("`{}` takes exactly 1 argument", id.name),
+                            );
+                        }
+                        let inner = self.infer_expr(&args[0]);
+                        let other = self.uni.fresh();
+                        return if id.name == "Ok" {
+                            Type::Fallible(Box::new(inner), Box::new(other))
+                        } else {
+                            Type::Fallible(Box::new(other), Box::new(inner))
+                        };
+                    }
                     "fail" => {
                         if args.len() != 1 {
                             return self.error(span, "fail takes exactly 1 argument (the error value)");

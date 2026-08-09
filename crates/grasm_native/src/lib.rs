@@ -5294,6 +5294,17 @@ impl FnCx<'_, '_> {
                 self.call_rt("grasm_val_dec", &[pv]);
                 return Ok(Some((v, VType::Bool)));
             }
+            "Ok" | "Err" => {
+                let (v, vt) = self.eval_expr_val(&args[0])?;
+                let boxed = self.box_value(v, &vt);
+                let (f, ty) = if id.name == "Ok" {
+                    ("grasm_ok_new", VType::Fallible(Box::new(vt), Box::new(VType::Any)))
+                } else {
+                    ("grasm_err_new", VType::Fallible(Box::new(VType::Any), Box::new(vt)))
+                };
+                let out = self.call_rt(f, &[boxed]).unwrap();
+                return Ok(Some((out, ty)));
+            }
             "map" => {
                 let m = self.call_rt("grasm_map_new", &[]).unwrap();
                 return Ok(Some((
@@ -6059,6 +6070,17 @@ impl FnCx<'_, '_> {
                     ) && self.lookup(&id.name).is_none()
                     {
                         return Ok(VType::Unit);
+                    }
+                    if matches!(id.name.as_str(), "Ok" | "Err")
+                        && args.len() == 1
+                        && self.lookup(&id.name).is_none()
+                    {
+                        let inner = self.probe_type(&args[0])?;
+                        return Ok(if id.name == "Ok" {
+                            VType::Fallible(Box::new(inner), Box::new(VType::Any))
+                        } else {
+                            VType::Fallible(Box::new(VType::Any), Box::new(inner))
+                        });
                     }
                     if let Some(sig) = self.lookup_fn(&id.name) {
                         return Ok(sig.ret.clone());

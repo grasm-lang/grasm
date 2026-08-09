@@ -1101,6 +1101,14 @@ impl<'a, W: Write> Interp<'a, W> {
                             self.program_args.iter().map(|a| Value::str(a.clone())).collect();
                         return Ok(Value::List(Rc::new(vs)));
                     }
+                    "Ok" | "Err" => {
+                        let v = self.eval_expr(&args[0])?;
+                        return Ok(if id.name == "Ok" {
+                            Value::Ok(Rc::new(v))
+                        } else {
+                            Value::Err(Rc::new(v))
+                        });
+                    }
                     "map" => {
                         return Ok(Value::Map(Rc::new(std::collections::BTreeMap::new())));
                     }
