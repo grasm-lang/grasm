@@ -857,6 +857,16 @@ fn render_diags(program: &Program, diags: &[grasm_syntax::Diagnostic]) {
 struct Bundle {
     /// module name → source
     files: Vec<(String, String)>,
+    /// Which of those names are *dependency packages*.
+    ///
+    /// A bundle reloads its own sources at startup, and without this the
+    /// reload had no idea a module came from a dependency — so a library's
+    /// `import util` was resolved as a bare name and found the application's
+    /// `util` instead. The bundled program then printed a different answer
+    /// from the same source run any other way, with nothing reported. This is
+    /// C21 for the third time: the loader takes a dependency set, and every
+    /// place that reloads a program has to carry it.
+    deps: Vec<String>,
 }
 
 fn read_own_bundle() -> Option<Bundle> {
@@ -892,7 +902,22 @@ fn parse_bundle(data: &[u8]) -> Option<Bundle> {
         pos += src_len;
         files.push((name, src));
     }
-    Some(Bundle { files })
+    // Older payloads stop here. A bundle carries the runtime that reads it, so
+    // this only matters while a build is in flight; an absent list means no
+    // dependencies, which is what every bundle before this could express.
+    let deps = match read_u32(&mut pos) {
+        Some(d) => {
+            let mut out = Vec::with_capacity(d as usize);
+            for _ in 0..d {
+                let len = read_u32(&mut pos)? as usize;
+                out.push(String::from_utf8(payload.get(pos..pos + len)?.to_vec()).ok()?);
+                pos += len;
+            }
+            out
+        }
+        None => Vec::new(),
+    };
+    Some(Bundle { files, deps })
 }
 
 fn write_bundle(program: &Program, out_path: &str) -> Result<u64, String> {
@@ -911,6 +936,13 @@ fn write_bundle(program: &Program, out_path: &str) -> Result<u64, String> {
         payload.extend(f.name.as_bytes());
         payload.extend((f.src.len() as u32).to_le_bytes());
         payload.extend(f.src.as_bytes());
+    }
+    let mut deps: Vec<&String> = program.deps.iter().collect();
+    deps.sort();
+    payload.extend((deps.len() as u32).to_le_bytes());
+    for d in deps {
+        payload.extend((d.len() as u32).to_le_bytes());
+        payload.extend(d.as_bytes());
     }
     let payload_len = payload.len() as u64;
     data.extend(payload);
@@ -938,7 +970,8 @@ fn run_bundle(bundle: &Bundle, program_args: &[String]) -> ExitCode {
             .find(|(n, _)| n == name)
             .map(|(_, s)| s.clone())
     };
-    let program = loader::load_with("main", "<bundled>", &provider);
+    let deps: std::collections::HashSet<String> = bundle.deps.iter().cloned().collect();
+    let program = loader::load_with_paths_in("main", "<bundled>", &provider, &|_| Vec::new(), &deps);
     let mut diags = program.diagnostics.clone();
     if diags.is_empty() {
         diags.extend(grasm_sema::check::check_program(&program).diagnostics);

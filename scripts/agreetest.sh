@@ -187,6 +187,86 @@ fn main() {
     print("{v}")
 }'
 
+# A *package* with a dependency, run all three ways.
+#
+# `check` above writes one file, and this class of bug needs two packages: a
+# dependency whose own `import util` has to resolve inside the dependency. It
+# did not, in the bundler — the bundle reloads its sources at startup and had
+# no record of which modules were packages, so the library's `util` was
+# resolved as a bare name and found the *application's*. The bundled program
+# printed `3000 3000` where every other way of running it printed `6 3000`.
+# Third time for this class: the main loader, then the doc-example harness,
+# now the bundler.
+check_package() {
+    local root="$WORK/pkgcase"
+    rm -rf "$root"
+    mkdir -p "$root/dep/src" "$root/app/src"
+    cat >"$root/dep/grasm.toml" <<'EOF'
+[package]
+name = "dep"
+version = "0.1.0"
+entry = "src/main.gr"
+capabilities = []
+EOF
+    printf 'import util
+
+pub fn twice(n: i64) -> i64 {
+    util.scale(n)
+}
+'         >"$root/dep/src/main.gr"
+    printf 'pub fn scale(n: i64) -> i64 {
+    n * 2
+}
+' >"$root/dep/src/util.gr"
+    cat >"$root/app/grasm.toml" <<'EOF'
+[package]
+name = "app"
+version = "0.1.0"
+entry = "src/main.gr"
+capabilities = ["io"]
+
+[dependencies.dep]
+path = "../dep"
+version = "^0.1.0"
+EOF
+    # Same module name as the dependency's private one, different answer.
+    printf 'pub fn scale(n: i64) -> i64 {
+    n * 1000
+}
+' >"$root/app/src/util.gr"
+    printf 'import dep
+import util
+
+fn main() {
+    print("{dep.twice(3)} {util.scale(3)}")
+}
+'         >"$root/app/src/main.gr"
+
+    local entry="$root/app/src/main.gr"
+    if ! "$GRASM" build "$entry" --native -o "$root/native" >/dev/null 2>&1         || ! "$GRASM" build "$entry" -o "$root/bundle" >/dev/null 2>&1; then
+        echo "  BUILD FAILED: package_dependency"
+        fail=$((fail + 1))
+        FAILED+=("package_dependency: build")
+        return
+    fi
+    local i n b
+    i=$("$GRASM" run "$entry" 2>&1)
+    n=$("$root/native" 2>&1)
+    b=$("$root/bundle" 2>&1)
+    if [ "$i" == "$n" ] && [ "$i" == "$b" ] && [ "$i" == "6 3000" ]; then
+        pass=$((pass + 1))
+    else
+        fail=$((fail + 1))
+        FAILED+=("package_dependency")
+        echo "  DISAGREE: package_dependency (want '6 3000')"
+        echo "    interp: $i"
+        echo "    native: $n"
+        echo "    bundle: $b"
+    fi
+}
+
+check_package
+
 echo
 echo "=========================================="
 echo "agreeing: $pass   disagreeing: $fail"
