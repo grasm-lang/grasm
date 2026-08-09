@@ -15,6 +15,10 @@ enum Mode {
     Interp(u32),
     LineComment,
     BlockComment(u32),
+    /// Inside a `"""…"""` block. Every character is the program's data, so
+    /// the formatter must not touch a line of it — indenting one changed what
+    /// the string *was*, and `--check` then demanded the change.
+    RawStr,
 }
 
 pub fn format_src(src: &str) -> String {
@@ -31,8 +35,13 @@ pub fn format_src(src: &str) -> String {
         };
         let trimmed = content.trim_start();
 
-        // A line-spanning block comment keeps its own indentation untouched.
-        let in_block_comment = matches!(stack.last(), Some(Mode::BlockComment(_)));
+        // A line-spanning block comment keeps its own indentation untouched,
+        // and so does a raw string — there the indentation is the program's
+        // data, not its layout.
+        let in_block_comment = matches!(
+            stack.last(),
+            Some(Mode::BlockComment(_)) | Some(Mode::RawStr)
+        );
 
         // Leading closers dedent this line before printing.
         let mut lead_closers = 0i32;
@@ -45,7 +54,7 @@ pub fn format_src(src: &str) -> String {
             }
         }
 
-        if trimmed.is_empty() {
+        if trimmed.is_empty() && !matches!(stack.last(), Some(Mode::RawStr)) {
             out.push_str(newline);
         } else if in_block_comment {
             out.push_str(content);
@@ -69,6 +78,11 @@ pub fn format_src(src: &str) -> String {
             let mode = *stack.last().unwrap();
             match mode {
                 Mode::Code => match ch {
+                    '"' if chars.clone().take(2).eq(['"', '"'].iter().copied()) => {
+                        chars.next();
+                        chars.next();
+                        stack.push(Mode::RawStr);
+                    }
                     '"' => stack.push(Mode::Str),
                     '/' if chars.peek() == Some(&'/') => {
                         stack.push(Mode::LineComment);
@@ -83,6 +97,11 @@ pub fn format_src(src: &str) -> String {
                     _ => {}
                 },
                 Mode::Interp(n) => match ch {
+                    '"' if chars.clone().take(2).eq(['"', '"'].iter().copied()) => {
+                        chars.next();
+                        chars.next();
+                        stack.push(Mode::RawStr);
+                    }
                     '"' => stack.push(Mode::Str),
                     '{' => *stack.last_mut().unwrap() = Mode::Interp(n + 1),
                     '}' => {
@@ -104,6 +123,13 @@ pub fn format_src(src: &str) -> String {
                     '{' => stack.push(Mode::Interp(0)),
                     _ => {}
                 },
+                Mode::RawStr => {
+                    if ch == '"' && chars.clone().take(2).eq(['"', '"'].iter().copied()) {
+                        chars.next();
+                        chars.next();
+                        stack.pop();
+                    }
+                }
                 Mode::LineComment => {}
                 Mode::BlockComment(n) => {
                     if ch == '*' && chars.peek() == Some(&'/') {

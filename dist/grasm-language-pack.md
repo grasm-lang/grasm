@@ -775,6 +775,12 @@ so an empty list is not a panic and not a sentinel value.
 
 ## 5. Control flow
 
+**[E-IF-DIVERGE]** A branch that leaves — through `fail`, `panic`, `return`,
+`break` or `continue` — produces no value, so an `if` used as a value is worth
+whatever its *other* branch produced. `if c { fail(e) } else { v }` is `v`'s
+type, and an `else if` chain of failures is the type of the one arm that does
+produce something.
+
 **[E-IF-VALUE]** `if` is an expression when both branches yield the same type;
 otherwise it is a statement of type `()`.
 
@@ -2050,6 +2056,82 @@ fn middle() -> i64 {
 fn main() {
     with Cfg handled_by CfgHandler{ value: || 42 } {
         print("{middle()}")
+    }
+}
+```
+
+## `E-IF-DIVERGE.gr`
+
+```grasm
+//! tag: E-IF-DIVERGE
+//! expect: output
+//! 25 ok2 0.25 true
+//! N 7
+//! 15 -1
+//! 25
+//! 0 -> err z
+//! 1 -> 100
+//! 2 -> 50
+// A branch that leaves — `fail`, `panic`, `return` — has no value, so the
+// `if` is worth whatever the *other* branch produced.
+//
+// Taking the type from the then branch alone meant `if c { fail(e) } else
+// { v }` in tail position had no merge value at all: the compiled function
+// returned a zero, with exit 0 and nothing reported. For a boxed payload it
+// was a SIGSEGV later, in whichever code read the value back.
+type E = { c: str }
+type V = | N(n: i64) | S(s: str)
+
+fn fi(y: i64) -> i64 ! E {
+    if y == 0 { fail(E{ c: "z" }) } else { 100 / y }
+}
+
+fn fs(y: i64) -> str ! E {
+    if y == 0 { fail(E{ c: "z" }) } else { "ok{y}" }
+}
+
+fn ff(y: i64) -> f64 ! E {
+    if y == 0 { fail(E{ c: "z" }) } else { 1.0 / y.as_f64() }
+}
+
+fn fb(y: i64) -> bool ! E {
+    if y == 0 { fail(E{ c: "z" }) } else { y > 1 }
+}
+
+/// A boxed payload: this was the SIGSEGV.
+fn fv(y: i64) -> V ! E {
+    if y == 0 { fail(E{ c: "z" }) } else { V.N(y) }
+}
+
+/// An `else if` chain of failures ending at the one arm with a value.
+fn chain(y: i64) -> i64 ! E {
+    if y == 0 {
+        fail(E{ c: "a" })
+    } else if y == 1 {
+        fail(E{ c: "b" })
+    } else {
+        y * 3
+    }
+}
+
+fn main() {
+    print("{fi(4) ?? 0 - 1} {fs(2) ?? "?"} {ff(4) ?? 0.0} {fb(2) ?? false}")
+    match fv(7) {
+        Ok(V.N(n)) -> print("N {n}")
+        Ok(V.S(s)) -> print("S {s}")
+        Err(e) -> print("e {e.c}")
+    }
+    print("{chain(5) ?? 0 - 1} {chain(1) ?? 0 - 1}")
+    // Stored and read back, which is where the boxed case crashed.
+    var m: Map[str, i64 ! E] = {}
+    m.set("a", fi(4))
+    print("{m.get("a") ?? fi(1) ?? 0 - 1}")
+    // And the whole shape end to end.
+    for n in [0, 1, 2] {
+        match fi(n) {
+            Ok(v) -> print("{n} -> {v}")
+            Err(e) -> print("{n} -> err {e.c}")
+        }
     }
 }
 ```

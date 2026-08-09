@@ -103,6 +103,14 @@ pub enum Value {
         params: Rc<Vec<Ident>>,
         body: Rc<ClosureBody>,
         env: Rc<Vec<(String, Value)>>,
+        /// The module the closure was *written* in.
+        ///
+        /// A closure's body names things where it appears, not where it is
+        /// called: `engine.apply(|| helper.value())` has to find `helper` in
+        /// the caller's module, and resolving it in `engine` panicked with
+        /// "unknown name `helper`" for a program the compiled binary ran
+        /// correctly.
+        module: Rc<String>,
     },
     /// Reference to a named top-level function.
     FnRef(Rc<String>),

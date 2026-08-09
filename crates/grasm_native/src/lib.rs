@@ -5047,10 +5047,33 @@ impl FnCx<'_, '_> {
         let (then_val, mut then_term) = self.eval_block_inner(then_block)?;
         then_term |= self.is_filled();
 
+        // What the whole `if` is worth. Taking it from the *then* branch
+        // alone was wrong whenever that branch leaves — `if c { fail(e) } else
+        // { v }` in tail position then had no merge parameter at all, so the
+        // else branch's value was dropped and the function returned a zero.
+        // Exit 0, no diagnostic, and for a boxed payload a SIGSEGV later.
+        //
+        // When then produces nothing, the type is probed off the else branch
+        // instead. `fail` returns directly and leaves the builder in a dead
+        // block, so "did the branch terminate" is not the question to ask —
+        // "did it produce a value" is.
         let mut merge_ty: Option<VType> = None;
         if let (Some((_, vt)), Some(_)) = (&then_val, &else_branch) {
             if *vt != VType::Unit {
                 merge_ty = Some(vt.clone());
+            }
+        }
+        if merge_ty.is_none() {
+            if let Some(eb) = else_branch {
+                let probed = match eb {
+                    ElseBranch::Else(b) => self.probe_block_tail(b).ok(),
+                    ElseBranch::ElseIf(e) => self.probe_type(e).ok(),
+                };
+                if let Some(t) = probed {
+                    if t != VType::Unit {
+                        merge_ty = Some(t);
+                    }
+                }
             }
         }
         if let Some(vt) = &merge_ty {
@@ -6107,10 +6130,28 @@ impl FnCx<'_, '_> {
                     }
                 }
             }
-            Expr::If { then_block, .. } => {
-                match then_block.stmts.last() {
-                    Some(Stmt::Expr(inner)) => self.probe_type(inner)?,
-                    _ => return nope(e.span(), "inferring this type"),
+            Expr::If {
+                then_block,
+                else_branch,
+                ..
+            } => {
+                // The then branch first, then the else — a branch that leaves
+                // (`fail`, `panic`) has no type, and an `else if` chain of
+                // them ends at the one arm that does produce a value.
+                let from_then = self.probe_block_tail(then_block).ok();
+                match from_then.clone().filter(|t| *t != VType::Unit) {
+                    Some(t) => t,
+                    None => {
+                        let from_else = match else_branch.as_deref() {
+                            Some(ElseBranch::Else(b)) => self.probe_block_tail(b).ok(),
+                            Some(ElseBranch::ElseIf(inner)) => self.probe_type(inner).ok(),
+                            None => None,
+                        };
+                        match from_else {
+                            Some(t) => t,
+                            None => from_then.unwrap_or(VType::Unit),
+                        }
+                    }
                 }
             }
             Expr::Match { arms, .. } => {
@@ -6185,8 +6226,14 @@ impl FnCx<'_, '_> {
                 // Mutating methods answer with nothing. `sort` used to probe
                 // as the list's own type, which is only harmless while the
                 // value is discarded.
-                "sort" => self.probe_type(recv)?,
-                "sort_by" => VType::Unit,
+                // Mutating methods answer with nothing. `sort` probing as
+                // the list's own type is only harmless while the value is
+                // discarded.
+                "sort" | "sort_by" | "push" | "set" => VType::Unit,
+                "remove" => match self.probe_type(recv)? {
+                    VType::List(elem) => *elem,
+                    _ => return nope(e.span(), "inferring this type"),
+                },
                 "enumerate" => match self.probe_type(recv)? {
                     VType::List(elem) => {
                         VType::List(Box::new(VType::Tuple(vec![VType::I64, *elem])))

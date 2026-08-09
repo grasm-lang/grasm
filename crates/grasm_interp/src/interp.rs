@@ -387,11 +387,18 @@ impl<'a, W: Write> Interp<'a, W> {
 
     fn call_value(&mut self, callee: Value, args: Vec<Value>, span_hint: &str) -> EResult {
         match callee {
-            Value::Closure { params, body, env } => {
+            Value::Closure {
+                params,
+                body,
+                env,
+                module,
+            } => {
                 if self.depth >= MAX_DEPTH {
                     return Err(Flow::Panic("stack overflow in closure call".into()));
                 }
                 self.depth += 1;
+                // Names in the body mean what they meant where it was written.
+                let saved_module = std::mem::replace(&mut self.current_module, (*module).clone());
                 let mut scope: HashMap<String, Value> =
                     env.iter().cloned().collect();
                 for (p, v) in params.iter().zip(args) {
@@ -404,6 +411,7 @@ impl<'a, W: Write> Interp<'a, W> {
                     ClosureBody::Block(b) => self.eval_block(b),
                 };
                 self.scopes = saved;
+                self.current_module = saved_module;
                 self.depth -= 1;
                 match r {
                     Err(Flow::Return(v)) => Ok(v),
@@ -997,6 +1005,7 @@ impl<'a, W: Write> Interp<'a, W> {
                     params: Rc::new(params.clone()),
                     body: Rc::new(cb),
                     env: Rc::new(env),
+                    module: Rc::new(self.current_module.clone()),
                 })
             }
         }

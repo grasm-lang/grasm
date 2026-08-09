@@ -144,6 +144,12 @@ so an empty list is not a panic and not a sentinel value.
 
 ## 5. Control flow
 
+**[E-IF-DIVERGE]** A branch that leaves — through `fail`, `panic`, `return`,
+`break` or `continue` — produces no value, so an `if` used as a value is worth
+whatever its *other* branch produced. `if c { fail(e) } else { v }` is `v`'s
+type, and an `else if` chain of failures is the type of the one arm that does
+produce something.
+
 **[E-IF-VALUE]** `if` is an expression when both branches yield the same type;
 otherwise it is a statement of type `()`.
 

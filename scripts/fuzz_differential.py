@@ -70,16 +70,26 @@ class Gen:
                     self.int_arith, self.int_cond, self.int_from_list,
                     self.int_from_match, self.int_from_field, self.int_from_map,
                     self.int_from_concat, self.int_from_map_lit,
+                    self.int_from_tuple,
                 ]
-                if not self.in_interp:
-                    choices += [self.int_from_sort_by, self.int_from_pairs]
+                # Block-shaped generators only at the top of an expression.
+                # Nested inside a `match` arm inside a list literal they build
+                # shapes the native type *probe* cannot see through — an
+                # honest refusal, but not what this is testing.
+                if not self.in_interp and self.depth <= 1:
+                    choices += [
+                        self.int_from_sort_by, self.int_from_pairs,
+                        self.int_from_remove,
+                    ]
             elif ty == FLOAT:
                 choices += [self.float_arith, self.float_cond]
             elif ty == BOOL:
+                pass
+            elif ty == BOOL:
                 choices += [self.bool_cmp, self.bool_logic]
             elif ty == STR:
-                choices += [self.str_concat, self.str_method]
-                if not self.in_interp:
+                choices += [self.str_concat, self.str_method, self.str_words]
+                if not self.in_interp and self.depth <= 1:
                     choices += [self.str_from_codes]
             return self.rng.choice(choices)(ty)
         finally:
@@ -152,6 +162,37 @@ class Gen:
         # `??` binds looser than arithmetic, so the whole thing is wrapped:
         # `a + xs.min() ?? 0` would parse as `(a + xs.min()) ?? 0`.
         return f"([{items}].{m})"
+
+    def int_from_tuple(self, _):
+        """Tuple components by position, and the order they sort in."""
+        a, b = self.expr(INT), self.expr(INT)
+        mode = self.rng.random()
+        if mode < 0.4:
+            return f"(({a}, {b}).{self.rng.choice(['0', '1'])})"
+        if mode < 0.7:
+            c, d = self.expr(INT), self.expr(INT)
+            op = self.rng.choice(["<", "<=", ">", ">="])
+            return f"(if ({a}, {b}) {op} ({c}, {d}) {{ 1 }} else {{ 0 }})"
+        return f"(({a}, {b}).0 + ({a}, {b}).1)"
+
+    def int_from_remove(self, _):
+        """`remove` on an index that is definitely in range."""
+        n = self.rng.randint(1, 4)
+        items = ", ".join(self.expr(INT) for _ in range(n))
+        name = self.fresh("r")
+        return (
+            f"({{ var {name}: [i64] = [{items}]\n"
+            f"{name}.remove({name}.len() - 1) }})"
+        )
+
+    def str_words(self, _):
+        """`words` and `split` differ on runs of whitespace; both engines
+        have to agree on which."""
+        src = self.expr(STR)
+        mode = self.rng.random()
+        if mode < 0.5:
+            return f'(({src}).words().len().to_str())'
+        return f'(({src}).words().join("-"))'
 
     def int_from_concat(self, _):
         """`+` on lists, reduced to a scalar so nothing can go out of range."""
@@ -372,9 +413,20 @@ class Gen:
             saved = self.scope
             self.scope = [("p0", INT)]
             out.append(f"fn {name}(p0: i64) -> {ret} ! Bad {{")
-            out.append(f"    if p0 == {guard} {{")
-            out.append(f'        fail(Bad{{ why: "p0 was {guard}" }})')
-            out.append("    }")
+            # Half the time the failure sits in the *then* branch of a tail
+            # `if/else`, which is a different shape from a guard statement and
+            # the one that miscompiled: the branch leaves, so the `if` is worth
+            # what the else branch produced, and taking the type from the then
+            # branch alone returned a zero ([E-IF-DIVERGE]).
+            tail_if = self.rng.random() < 0.5
+            if tail_if:
+                out.append(f"    if p0 == {guard} {{")
+                out.append(f'        fail(Bad{{ why: "p0 was {guard}" }})')
+                out.append("    } else {")
+            else:
+                out.append(f"    if p0 == {guard} {{")
+                out.append(f'        fail(Bad{{ why: "p0 was {guard}" }})')
+                out.append("    }")
             # A match whose arms are method calls — the shape that miscompiled.
             if ret == FLOAT:
                 out.append("    match p0 % 3 {")
@@ -384,6 +436,8 @@ class Gen:
                 out.append("    }")
             else:
                 out.append(f"    {self.expr(INT)}")
+            if tail_if:
+                out.append("    }")
             out.append("}")
             out.append("")
             self.scope = saved

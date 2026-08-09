@@ -463,15 +463,11 @@ pub fn example_program(program: &Program, example: &Example) -> Program {
         .next()
         .unwrap_or("main")
         .to_string();
+    // The example gets exactly the owner's own context: its declarations
+    // inlined, its imports as it wrote them. Adding an import for every other
+    // module in the program produced `duplicate import alias` the moment the
+    // owner imported one of them — which is any module that imports anything.
     let mut entry = String::new();
-    for (name, _) in &sources {
-        // The owner is inlined below rather than imported, so its items are in
-        // scope unqualified; the entry module is skipped because importing it
-        // would pull in a second `main`.
-        if name != "main" && *name != owner_module {
-            entry.push_str(&format!("import {name}\n"));
-        }
-    }
     let owner_src = program
         .files
         .iter()

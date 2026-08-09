@@ -390,3 +390,72 @@ fn a_doc_example_behaves_the_same_from_the_library_and_from_a_consumer() {
         }
     }
 }
+
+/// The same, end to end: the two engines must agree on what it prints.
+#[test]
+fn a_closure_crossing_a_module_boundary_agrees_between_engines() {
+    let w = Work::new("closmod");
+    std::fs::create_dir_all(&w.0).unwrap();
+    std::fs::write(w.0.join("helper.gr"), "pub fn value() -> str {\n    \"from helper\"\n}\n").unwrap();
+    std::fs::write(
+        w.0.join("engine.gr"),
+        "pub fn apply(f: fn() -> str) -> str {\n    f()\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        w.0.join("main.gr"),
+        "import engine\nimport helper\n\nfn main() {\n\
+         \x20   print(\"{engine.apply(|| helper.value())}\")\n}\n",
+    )
+    .unwrap();
+    let entry = w.0.join("main.gr");
+    let (code, text) = run(&["run", entry.to_str().unwrap()]);
+    assert_eq!(code, 0, "the interpreter should run it:\n{text}");
+    assert!(text.contains("from helper"), "wrong output:\n{text}");
+
+    let bin = w.0.join("out");
+    run(&["build", entry.to_str().unwrap(), "--native", "-o", bin.to_str().unwrap()]);
+    let out = Command::new(&bin).output().expect("runs");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        text.trim(),
+        "the two engines must agree"
+    );
+}
+
+/// `grasm fmt` leaves a raw block exactly as written.
+///
+/// The formatter is line-based and was written when strings could not span
+/// lines. Raw blocks changed that, and it indented their *contents* — which
+/// changes what the string is — then `--check` reported the correct file as
+/// unformatted, so CI would have forced the corruption.
+#[test]
+fn fmt_does_not_touch_raw_string_blocks() {
+    let w = Work::new("fmtraw");
+    std::fs::create_dir_all(&w.0).unwrap();
+    let src = w.0.join("raw.gr");
+    let program = "fn main() {\n\
+                   \x20   if true {\n\
+                   \x20       let doc = \"\"\"\n\
+                   alpha\n\
+                   \x20 beta\n\
+                   \n\
+                   \"\"\"\n\
+                   \x20       print(\"{doc.len()}\")\n\
+                   \x20   }\n\
+                   }\n";
+    std::fs::write(&src, program).unwrap();
+
+    let (check_code, check_text) = run(&["fmt", src.to_str().unwrap(), "--check"]);
+    assert_eq!(
+        check_code, 0,
+        "a correctly formatted file must pass --check:\n{check_text}"
+    );
+    let (code, text) = run(&["fmt", src.to_str().unwrap()]);
+    assert_eq!(code, 0, "fmt should succeed:\n{text}");
+    let after = std::fs::read_to_string(&src).unwrap();
+    assert_eq!(
+        after, program,
+        "the raw block's contents are the program's data, not its layout"
+    );
+}

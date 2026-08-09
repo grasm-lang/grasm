@@ -223,3 +223,30 @@ fn a_private_function_may_not_be_used_as_a_value_either() {
         "is private",
     );
 }
+
+/// A closure's body names things where the closure is *written*.
+///
+/// The interpreter resolved them in whatever module was calling, so
+/// `engine.apply(|| helper.value())` panicked with `unknown name \`helper\``
+/// for a program the compiled binary ran correctly — the reference
+/// implementation being the wrong one, and `difftest.sh` unable to see it
+/// because it takes two modules and a closure crossing between them.
+#[test]
+fn a_closure_resolves_names_where_it_was_written() {
+    ok(&[
+        (
+            "main",
+            "import engine\nimport helper\n\n\
+             fn local_value() -> str {\n    \"local\"\n}\n\n\
+             fn main() {\n\
+             \x20   print(\"{engine.apply(|| helper.value())}\")\n\
+             \x20   print(\"{engine.apply(|| local_value())}\")\n\
+             }\n",
+        ),
+        (
+            "engine",
+            "pub fn apply(f: fn() -> str) -> str {\n    f()\n}\n",
+        ),
+        ("helper", "pub fn value() -> str {\n    \"from helper\"\n}\n"),
+    ]);
+}
