@@ -92,6 +92,31 @@ fn describe(decl: &Decl, module: &Module, is_entry: bool) -> Option<Item> {
             signature: effect_signature(e),
             doc,
         }),
+        // A constant is API too. `pub let` exports, `grasm api` lists it, and
+        // this dropped both the item and its `///` comment — so a library's
+        // documented layout constants were simply absent from its docs.
+        Decl::Const(c) => {
+            if !c.is_pub && !is_entry {
+                return None;
+            }
+            Some(Item {
+                kind: "let",
+                name: c.name.name.clone(),
+                signature: const_signature(c),
+                doc,
+            })
+        }
+        Decl::Extern(e) => {
+            if !e.is_pub && !is_entry {
+                return None;
+            }
+            Some(Item {
+                kind: "extern fn",
+                name: e.name.name.clone(),
+                signature: extern_signature(e),
+                doc,
+            })
+        }
         // Tests, benchmarks, and imports are not API.
         _ => None,
     }
@@ -421,9 +446,12 @@ pub fn examples(program: &Program) -> Vec<Example> {
 /// `let NAME: T` — the value is not part of the signature, only the promise
 /// that the name exists and what type it has.
 pub fn const_signature(c: &grasm_syntax::ast::ConstDecl) -> String {
+    // `pub` is part of the signature: it is the difference between something
+    // another module can read and something it cannot.
+    let vis = if c.is_pub { "pub " } else { "" };
     match &c.ty {
-        Some(t) => format!("let {}: {}", c.name.name, type_text(t)),
-        None => format!("let {}", c.name.name),
+        Some(t) => format!("{vis}let {}: {}", c.name.name, type_text(t)),
+        None => format!("{vis}let {}", c.name.name),
     }
 }
 

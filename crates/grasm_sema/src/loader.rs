@@ -86,6 +86,25 @@ pub fn load_with_paths_in(
     tried: &dyn Fn(&str) -> Vec<String>,
     deps: &HashSet<String>,
 ) -> Program {
+    load_with_alias(entry_name, entry_display_path, provider, tried, deps, None)
+}
+
+/// `load_with_paths_in`, told which module name *is* the entry file.
+///
+/// A file may be both the entry and a module its own modules import — mutual
+/// imports are legal, and `alpha.gr` importing `beta.gr` which imports `alpha`
+/// is the ordinary shape of it. Loading it a second time under that name gave
+/// two copies of every declaration in it, so a type declared once was reported
+/// as a duplicate at its sole declaration, and `grasm test` ran each of its
+/// tests twice. The import resolves to the entry instead.
+fn load_with_alias(
+    entry_name: &str,
+    entry_display_path: &str,
+    provider: &dyn Fn(&str) -> Option<String>,
+    tried: &dyn Fn(&str) -> Vec<String>,
+    deps: &HashSet<String>,
+    entry_alias: Option<&str>,
+) -> Program {
     let mut files: Vec<LoadedFile> = Vec::new();
     let mut diagnostics = Vec::new();
     let mut loaded: HashMap<String, ()> = HashMap::new();
@@ -130,6 +149,11 @@ pub fn load_with_paths_in(
                 let full = match &owner {
                     Some(pkg) if !deps.contains(root) => format!("{pkg}.{written}"),
                     _ => written,
+                };
+                // An import that names the entry file resolves to it.
+                let full = match entry_alias {
+                    Some(a) if full == a => entry_name.to_string(),
+                    _ => full,
                 };
                 let alias = imp
                     .path
@@ -284,12 +308,17 @@ pub fn load_from_disk_in(
         note(name, &path);
         Some(src)
     };
-    let mut program = load_with_paths_in(
+    // The name this file would answer to if a sibling imported it.
+    let entry_alias = entry_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string());
+    let mut program = load_with_alias(
         "main",
         &entry_display,
         &provider,
         &tried,
         &dep_names,
+        entry_alias.as_deref(),
     );
     // The real path wins over the one derived from the module name.
     let found = found.into_inner();

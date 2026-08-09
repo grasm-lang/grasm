@@ -256,6 +256,18 @@ fn main() -> ExitCode {
                     }
                 };
             }
+            // A program with no `main` is an error ([E-ENTRY]), and the
+            // other two build modes say so. The bundle used to ship a 9.7 MB
+            // executable, report success, and fail on startup.
+            if !program.files.first().is_some_and(|f| {
+                f.module.decls.iter().any(|d| {
+                    matches!(d, grasm_syntax::ast::Decl::Fn(fd) if fd.name.name == "main")
+                })
+            }) {
+                eprintln!("error: no `main` function");
+                eprintln!("  help: a bundled build needs an entry point, the same as a native one");
+                return ExitCode::FAILURE;
+            }
             match write_bundle(&program, &out_path) {
                 Ok(size) => {
                     println!("built `{out_path}` ({size} bytes, {} module(s))", program.files.len());
