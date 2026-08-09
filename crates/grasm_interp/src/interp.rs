@@ -121,6 +121,52 @@ pub struct Interp<'a, W: Write> {
 
 const MAX_DEPTH: u32 = 100_000;
 
+/// One step of an assignment path.
+enum Seg {
+    Field(String),
+    Index(usize),
+}
+
+/// Walks `segs` into `root` and stores `v` at the end, copy-on-write.
+fn assign_into(root: &mut Value, segs: &[Seg], v: Value) -> Result<(), Flow> {
+    let mut slot = root;
+    for seg in segs {
+        match seg {
+            Seg::Field(fname) => match slot {
+                Value::Struct { fields, .. } => {
+                    let fields = Rc::make_mut(fields);
+                    match fields.iter_mut().find(|(k, _)| k == fname) {
+                        Some((_, fv)) => slot = fv,
+                        None => return Err(Flow::Panic(format!("no field `{fname}`"))),
+                    }
+                }
+                other => {
+                    return Err(Flow::Panic(format!(
+                        "cannot access field `{fname}` of `{other}`"
+                    )))
+                }
+            },
+            Seg::Index(i) => match slot {
+                Value::List(items) => {
+                    let items = Rc::make_mut(items);
+                    let len = items.len();
+                    match items.get_mut(*i) {
+                        Some(iv) => slot = iv,
+                        None => {
+                            return Err(Flow::Panic(format!(
+                                "index {i} out of bounds (len {len})"
+                            )))
+                        }
+                    }
+                }
+                other => return Err(Flow::Panic(format!("cannot index into `{other}`"))),
+            },
+        }
+    }
+    *slot = v;
+    Ok(())
+}
+
 impl<'a, W: Write> Interp<'a, W> {
     pub fn new(module: &'a Module, out: &'a mut W) -> Self {
         let mut me = Self::raw_new(out);
@@ -799,10 +845,6 @@ impl<'a, W: Write> Interp<'a, W> {
 
     fn assign_place(&mut self, target: &Expr, v: Value) -> Result<(), Flow> {
         // Collect the access path down to the root identifier.
-        enum Seg {
-            Field(String),
-            Index(usize),
-        }
         let mut segs: Vec<Seg> = Vec::new();
         let mut cur = target;
         loop {
@@ -826,6 +868,40 @@ impl<'a, W: Write> Interp<'a, W> {
                 }
                 Expr::Ident(id) => {
                     segs.reverse();
+                    // A `ref` root: the value lives in the slab, not in the
+                    // binding, so it comes out, is written through, and goes
+                    // back. Without this a write through a reference — the
+                    // whole reason Tier 2 exists — typechecked and then
+                    // panicked `cannot access field of ref#0.0`, which left a
+                    // `ref` graph write-once and a cycle impossible to close.
+                    // Only when there is a path to walk. `at = other` with
+                    // no segments rebinds the *variable*; taking the reference
+                    // path there overwrote the node `at` pointed at, which
+                    // silently replaced a graph node with a reference to
+                    // another one. The checker draws the same line.
+                    let root_ref = self
+                        .scopes
+                        .iter()
+                        .rev()
+                        .filter(|_| !segs.is_empty())
+                        .find_map(|sc| sc.get(&id.name))
+                        .and_then(|rv| match rv {
+                            Value::Ref(i, g) => Some((*i, *g)),
+                            _ => None,
+                        });
+                    if let Some((i, g)) = root_ref {
+                        let idx = i as usize;
+                        let live = matches!(self.slab.get(idx), Some((Some(_), gen)) if *gen == g);
+                        if !live {
+                            return Err(Flow::Panic(
+                                "stale reference: the value it pointed to was released".to_string(),
+                            ));
+                        }
+                        let mut inner = self.slab[idx].0.take().expect("checked live");
+                        let r = assign_into(&mut inner, &segs, v);
+                        self.slab[idx].0 = Some(inner);
+                        return r;
+                    }
                     // Find the binding.
                     let slot = self
                         .scopes

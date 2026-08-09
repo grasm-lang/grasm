@@ -415,6 +415,17 @@ identity, not the equality of what they point at, which is what a graph walk
 needs to recognise a node it has already visited. Equality recurses, so this is
 also what makes a struct or list *containing* a reference compare sensibly.
 
+**[T-REF-WRITE]** A reference is written through the same way it is read
+through: `r.field = v`, `r.items.push(x)`, `r.n += 1`. The binding's own
+mutability is not the question — writing through a reference does not modify
+the reference — so `let r = ref(...)` is the ordinary form and `var` is not
+required.
+
+Without this a `ref` graph was **write-once**: closing a cycle needs one write
+after both nodes exist, and that write typechecked and then panicked. The
+compiled backend refuses the shape by name for now (§11), so it is one of the
+places the two engines differ in what they accept rather than in what they do.
+
 **[T-REF-STALE]** Reading through a released reference **panics**, always. The
 slot may already hold something else — released slots are reused immediately,
 which is what keeps a long-lived graph from growing without bound — so the

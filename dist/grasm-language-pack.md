@@ -759,6 +759,17 @@ identity, not the equality of what they point at, which is what a graph walk
 needs to recognise a node it has already visited. Equality recurses, so this is
 also what makes a struct or list *containing* a reference compare sensibly.
 
+**[T-REF-WRITE]** A reference is written through the same way it is read
+through: `r.field = v`, `r.items.push(x)`, `r.n += 1`. The binding's own
+mutability is not the question — writing through a reference does not modify
+the reference — so `let r = ref(...)` is the ordinary form and `var` is not
+required.
+
+Without this a `ref` graph was **write-once**: closing a cycle needs one write
+after both nodes exist, and that write typechecked and then panicked. The
+compiled backend refuses the shape by name for now (§11), so it is one of the
+places the two engines differ in what they accept rather than in what they do.
+
 **[T-REF-STALE]** Reading through a released reference **panics**, always. The
 slot may already hold something else — released slots are reused immediately,
 which is what keeps a long-lived graph from growing without bound — so the
@@ -2191,6 +2202,7 @@ runs only under `grasm run`:
 | an `inout` argument that is not a plain variable | `push_one(b.items)`, `add(xs[0], 5)` — bind it to a `var` first |
 | returning a closure | `fn mk(n: i64) -> fn(i64) -> i64 { \|x\| x + n }` — a top-level `fn` works |
 | a handler that is a loop variable or a list element | `for h in hs { with Src handled_by h { … } }` — a `let`-bound handler compiles |
+| writing *through* a `ref` | `r.field = v`, `r.items.push(x)` — reading through one compiles |
 
 Each of these is a defect being worked off, not a design boundary. The list is
 checked against the implementation rather than remembered: if one of them
@@ -6901,6 +6913,52 @@ fn main() {
     print("{r.v}")
     release(r)
     print("{r.v}")
+}
+```
+
+## `T-REF-WRITE.gr`
+
+```grasm
+//! tag: T-REF-WRITE
+//! expect: output
+//! ababa
+//! 42 [7] 43
+// Writing through a reference, which is what makes a graph a graph.
+//
+// This typechecked and panicked at run time, so a `ref` graph was write-once:
+// closing a cycle needs one write after both nodes exist, and there was no
+// way to make it. An evaluation building a real object graph had to keep every
+// mutable edge in a `Map[str, [ref Cell]]` keyed by name — the arena-of-indices
+// pattern this tier exists to replace. The spec's own [T-REF-GENERATIONAL]
+// program built its "cycle" out of `next: i64` indices for the same reason,
+// which is how the gap stayed invisible.
+//
+// The binding's own mutability is not the question: writing *through* a
+// reference does not modify the reference. `let` is right here.
+type Node = { name: str, out: [ref Node] }
+type Counter = { n: i64, hits: [i64] }
+
+fn main() {
+    let a = ref(Node{ name: "a", out: [] })
+    let b = ref(Node{ name: "b", out: [a] })
+    // The write that closes the cycle.
+    a.out.push(b)
+    var at = a
+    var walk = ""
+    for step in 0..5 {
+        walk = walk + at.name
+        at = at.out[0]
+    }
+    print("{walk}")
+
+    // Assignment, a mutating method, and a compound assignment, all through
+    // an immutably-bound reference.
+    let c = ref(Counter{ n: 1, hits: [] })
+    c.n = 42
+    let first = c.n
+    c.hits.push(7)
+    c.n += 1
+    print("{first} {c.hits} {c.n}")
 }
 ```
 

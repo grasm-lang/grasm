@@ -174,6 +174,14 @@ fn main() {
 
 # The neighbouring shapes that must keep compiling, so the three rows above
 # stay as narrow as they claim to be.
+expect_refused "writing through a ref" 'type Node = { v: i64 }
+
+fn main() {
+    let r = ref(Node{ v: 1 })
+    r.v = 42
+    print("{r.v}")
+}'
+
 expect_compiled "an inout argument that is a plain variable" 'fn push_one(inout xs: [i64]) {
     xs.push(1)
 }

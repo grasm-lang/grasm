@@ -1348,9 +1348,20 @@ that does not change",
         while let Expr::Field { recv, .. } | Expr::Index { recv, .. } = root {
             root = recv;
         }
+        // Writing *through* a `ref` does not mutate the reference — it mutates
+        // what the reference points at, which is shared state by construction.
+        // Requiring `var` for that asked for the wrong thing and, since the
+        // write then panicked at run time, its suggested fix turned a compile
+        // error into a crash.
+        let through_ref = if std::ptr::eq(root, target) {
+            false
+        } else {
+            let t = self.infer_expr(root);
+            matches!(self.uni.resolve(&t), Type::Ref(_))
+        };
         match root {
             Expr::Ident(id) => match self.lookup(&id.name) {
-                Some(b) if !b.mutable => {
+                Some(b) if !b.mutable && !through_ref => {
                     self.error_help(
                         id.span,
                         format!("cannot assign to `{}` — it is immutable", id.name),
@@ -3124,9 +3135,18 @@ that does not change",
         while let Expr::Field { recv, .. } | Expr::Index { recv, .. } = root {
             root = recv;
         }
+        // As in `check_assign_target`: mutating through a `ref` mutates what
+        // it points at, not the reference, so the binding's own mutability is
+        // not the question.
+        let through_ref = if std::ptr::eq(root, recv) {
+            false
+        } else {
+            let t = self.infer_expr(root);
+            matches!(self.uni.resolve(&t), Type::Ref(_))
+        };
         if let Expr::Ident(id) = root {
             if let Some(b) = self.lookup(&id.name) {
-                if !b.mutable {
+                if !b.mutable && !through_ref {
                     self.error_help(
                         id.span,
                         format!("cannot mutate `{}` — it is immutable", id.name),

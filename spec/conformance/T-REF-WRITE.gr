@@ -1,0 +1,41 @@
+//! tag: T-REF-WRITE
+//! expect: output
+//! ababa
+//! 42 [7] 43
+// Writing through a reference, which is what makes a graph a graph.
+//
+// This typechecked and panicked at run time, so a `ref` graph was write-once:
+// closing a cycle needs one write after both nodes exist, and there was no
+// way to make it. An evaluation building a real object graph had to keep every
+// mutable edge in a `Map[str, [ref Cell]]` keyed by name — the arena-of-indices
+// pattern this tier exists to replace. The spec's own [T-REF-GENERATIONAL]
+// program built its "cycle" out of `next: i64` indices for the same reason,
+// which is how the gap stayed invisible.
+//
+// The binding's own mutability is not the question: writing *through* a
+// reference does not modify the reference. `let` is right here.
+type Node = { name: str, out: [ref Node] }
+type Counter = { n: i64, hits: [i64] }
+
+fn main() {
+    let a = ref(Node{ name: "a", out: [] })
+    let b = ref(Node{ name: "b", out: [a] })
+    // The write that closes the cycle.
+    a.out.push(b)
+    var at = a
+    var walk = ""
+    for step in 0..5 {
+        walk = walk + at.name
+        at = at.out[0]
+    }
+    print("{walk}")
+
+    // Assignment, a mutating method, and a compound assignment, all through
+    // an immutably-bound reference.
+    let c = ref(Counter{ n: 1, hits: [] })
+    c.n = 42
+    let first = c.n
+    c.hits.push(7)
+    c.n += 1
+    print("{first} {c.hits} {c.n}")
+}
