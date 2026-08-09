@@ -1162,6 +1162,9 @@ impl<'a, W: Write> Interp<'a, W> {
                 scrutinee, arms, ..
             } => {
                 let v = self.eval_expr(scrutinee)?;
+                // Matching through a reference matches what it points at, and
+                // a stale one panics here rather than matching anything.
+                let v = self.deref_value(v)?;
                 for arm in arms {
                     let mut bindings = Vec::new();
                     if self.match_pattern(&arm.pattern, &v, &mut bindings) {

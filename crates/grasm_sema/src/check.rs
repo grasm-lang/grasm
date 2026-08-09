@@ -3372,6 +3372,15 @@ that does not change",
 
     fn infer_match(&mut self, scrutinee: &Expr, arms: &[Arm], span: Span) -> Type {
         let scrut_ty = self.infer_expr(scrutinee);
+        // Matching through a reference matches what it points at. Without
+        // this a `ref` to a sum type could never be opened — `r.v` said "sum
+        // types are accessed via match" and the match said "pattern cannot
+        // match a `ref Expr`", a closed loop — which excluded exactly the
+        // recursive shapes an AST or a graph node is made of.
+        let scrut_ty = match self.uni.resolve(&scrut_ty) {
+            Type::Ref(inner) => *inner,
+            _ => scrut_ty,
+        };
         let result = self.uni.fresh();
         let mut covered: Vec<String> = Vec::new();
         let mut has_irrefutable = false;

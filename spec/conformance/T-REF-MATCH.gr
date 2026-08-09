@@ -1,0 +1,26 @@
+//! tag: T-REF-MATCH
+//! expect: output
+//! 3 6
+// A reference to a sum type is matched through.
+//
+// Without this a `ref` to a sum could never be opened, and the two diagnostics
+// formed a closed loop: `r.v` said "sum types are accessed via `match`", and
+// the match said "pattern `Num(..)` cannot match a `ref Expr`". That excluded
+// exactly the recursive shapes an AST or a graph node is made of — which is
+// the case this tier exists for.
+type Expr = | Num(v: i64) | Add(l: ref Expr, r: ref Expr)
+
+fn eval(e: ref Expr) -> i64 {
+    match e {
+        Num(v) -> v
+        Add(l, r) -> eval(l) + eval(r)
+    }
+}
+
+fn main() {
+    let one = ref(Num(1))
+    let two = ref(Num(2))
+    let sum = ref(Add(one, two))
+    // And nested one level deeper, so the recursion is real.
+    print("{eval(sum)} {eval(ref(Add(sum, ref(Num(3)))))}")
+}

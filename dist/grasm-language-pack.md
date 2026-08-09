@@ -759,6 +759,12 @@ identity, not the equality of what they point at, which is what a graph walk
 needs to recognise a node it has already visited. Equality recurses, so this is
 also what makes a struct or list *containing* a reference compare sensibly.
 
+**[T-REF-MATCH]** A `match` on a reference matches what it points at, so a
+`ref` to a sum type is opened the ordinary way. Without it the two diagnostics
+formed a closed loop — a field access said to use `match`, and the match said
+the pattern could not match a `ref` — which excluded the recursive shapes an
+AST or a graph node is made of, and those are the case this tier exists for.
+
 **[T-REF-WRITE]** A reference is written through the same way it is read
 through: `r.field = v`, `r.items.push(x)`, `r.n += 1`. The binding's own
 mutability is not the question — writing through a reference does not modify
@@ -6921,6 +6927,37 @@ fn main() {
     // and says so rather than reading the slot's next occupant.
     release(first)
     print("{alive(first)} {alive(slots[1])}")
+}
+```
+
+## `T-REF-MATCH.gr`
+
+```grasm
+//! tag: T-REF-MATCH
+//! expect: output
+//! 3 6
+// A reference to a sum type is matched through.
+//
+// Without this a `ref` to a sum could never be opened, and the two diagnostics
+// formed a closed loop: `r.v` said "sum types are accessed via `match`", and
+// the match said "pattern `Num(..)` cannot match a `ref Expr`". That excluded
+// exactly the recursive shapes an AST or a graph node is made of — which is
+// the case this tier exists for.
+type Expr = | Num(v: i64) | Add(l: ref Expr, r: ref Expr)
+
+fn eval(e: ref Expr) -> i64 {
+    match e {
+        Num(v) -> v
+        Add(l, r) -> eval(l) + eval(r)
+    }
+}
+
+fn main() {
+    let one = ref(Num(1))
+    let two = ref(Num(2))
+    let sum = ref(Add(one, two))
+    // And nested one level deeper, so the recursion is real.
+    print("{eval(sum)} {eval(ref(Add(sum, ref(Num(3)))))}")
 }
 ```
 

@@ -415,6 +415,12 @@ identity, not the equality of what they point at, which is what a graph walk
 needs to recognise a node it has already visited. Equality recurses, so this is
 also what makes a struct or list *containing* a reference compare sensibly.
 
+**[T-REF-MATCH]** A `match` on a reference matches what it points at, so a
+`ref` to a sum type is opened the ordinary way. Without it the two diagnostics
+formed a closed loop — a field access said to use `match`, and the match said
+the pattern could not match a `ref` — which excluded the recursive shapes an
+AST or a graph node is made of, and those are the case this tier exists for.
+
 **[T-REF-WRITE]** A reference is written through the same way it is read
 through: `r.field = v`, `r.items.push(x)`, `r.n += 1`. The binding's own
 mutability is not the question — writing through a reference does not modify

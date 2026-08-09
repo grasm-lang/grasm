@@ -6895,6 +6895,15 @@ impl FnCx<'_, '_> {
         span: Span,
     ) -> CResult<Option<(Value, VType)>> {
         let (sv, st) = self.eval_expr_val(scrutinee)?;
+        // Matching through a reference matches what it points at — the same
+        // unwrap a field read does, and for the same reason.
+        let (sv, st) = match st {
+            VType::Ref(inner) => {
+                let boxed = self.call_rt("grasm_ref_get", &[sv]).unwrap();
+                self.unbox(boxed, &inner)?
+            }
+            other => (sv, other),
+        };
         // Hold the scrutinee in a variable for repeated tests.
         let svar = self.new_var(&st);
         self.b.def_var(svar, sv);
