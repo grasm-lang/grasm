@@ -54,7 +54,7 @@ digit       = "0".."9"
 ```
 and  break  continue  effect  else  false  fn  for  handled_by  if
 import  in  inout  let  match  not  or  own  pub  return  test  true
-try  type  unsafe  var  while  with
+ref  try  type  unsafe  var  while  with
 ```
 
 **[L-CONTEXTUAL]** `parallel` and `spawn` are *contextual* keywords: they
@@ -158,12 +158,14 @@ so existing code that uses `bench` as a name keeps working.
 
 ```
 type       = named_type | list_type | tuple_type | union_type | fn_type
+             | ref_type
 nested     = type ( "!" type )?
 fn_type    = "fn" "(" ( nested ( "," nested )* )? ")" ( "->" nested )? effect_row?
 effect_row = "/" "{" ( path ( "," path )* )? "}"
 named_type = identifier type_args?
 type_args  = "[" nested ( "," nested )* "]"
 list_type  = "[" nested "]"
+ref_type   = "ref" nested
 tuple_type = "(" ( nested ( "," nested )* )? ")"
 union_type = "(" nested ( "|" nested )+ ")"
 ```
@@ -256,8 +258,9 @@ Precedence, loosest to tightest:
 expression   = or_expr
 primary      = literal | identifier | list_lit | map_lit | tuple_lit
              | struct_lit | if_expr | match_expr | block | closure
-             | unsafe_expr | "(" expression ")"
+             | unsafe_expr | ref_expr | "(" expression ")"
 unsafe_expr  = "unsafe" block
+ref_expr     = "ref" "(" expression ")"
 list_lit     = "[" ( expression ( "," expression )* ","? )? "]"
 map_lit      = "{" ( map_entry ( "," map_entry )* ","? )? "}"
 map_entry    = expression ":" expression
@@ -720,6 +723,27 @@ had a door straight through it.
 **[T-CONST-PUB]** `pub let` exports a constant; a bare `let` keeps it to its
 own module, like a function. Reaching a private one through its module is the
 same error a private function gives.
+
+**[T-REF-GENERATIONAL]** `ref T` is Tier 2: a *generational reference* into a
+shared heap. `ref(v)` puts a value there and hands back a reference — a slot
+index paired with the generation that slot was on. Reading a field through one
+reads the value it points at. A reference is a plain word: it copies, and it
+can be stored in a struct, a list or a map, which is exactly what Tier 0's
+second-class references cannot do and the reason this tier exists. A cyclic or
+shared object graph has no other safe representation here.
+
+`release(r)` gives the slot up and `alive(r)` asks whether a reference still
+points at something. Releasing an already-released slot does nothing: a double
+release is not a use-after-free, and making it an error would turn cleanup
+order into something every caller has to track.
+
+**[T-REF-STALE]** Reading through a released reference **panics**, always. The
+slot may already hold something else — released slots are reused immediately,
+which is what keeps a long-lived graph from growing without bound — so the
+generation is what distinguishes a live reference from one into the slot's
+previous life. This is the property that makes the tier safe rather than merely
+convenient: a stale read is caught every time, never undefined behaviour, and
+never a silently wrong value.
 
 **[T-UNSAFE-FFI]** `unsafe { … }` is Tier 3: the block where the guarantees of
 the safe tiers do not apply. Using a declared C function — calling one *or
@@ -6722,6 +6746,71 @@ fn main() {
     var mid = map()
     mid.set("b", Obj(inner))
     print("{depth(Obj(mid))}")
+}
+```
+
+## `T-REF-GENERATIONAL.gr`
+
+```grasm
+//! tag: T-REF-GENERATIONAL
+//! expect: output
+//! abcab
+//! true 7
+//! false true
+// Tier 2 — `ref T`, the safe graph escape hatch.
+//
+// Tier 0's references are second-class: they can be passed but not stored,
+// which is what removes lifetime annotations from safe code and also makes a
+// cyclic or shared graph inexpressible. A `ref T` is a slot in a shared heap
+// plus the generation that slot held when the reference was taken. It copies
+// freely, so it can live in a struct or a list — that is the point — and every
+// read checks the generation, so a reference to a released slot is a
+// deterministic panic and never a read of whatever occupies the slot now.
+type Node = { name: str, next: i64, v: i64 }
+
+fn main() {
+    // A cycle. Each node names the next by slot; the last points back.
+    var slots: [ref Node] = []
+    slots.push(ref(Node{ name: "a", next: 1, v: 7 }))
+    slots.push(ref(Node{ name: "b", next: 2, v: 8 }))
+    slots.push(ref(Node{ name: "c", next: 0, v: 9 }))
+    var at = 0
+    var walk = ""
+    for step in 0..5 {
+        walk = walk + slots[at].name
+        at = slots[at].next
+    }
+    print("{walk}")
+
+    let first = slots[0]
+    print("{alive(first)} {first.v}")
+    // Releasing a slot leaves every reference into its previous life stale,
+    // and says so rather than reading the slot's next occupant.
+    release(first)
+    print("{alive(first)} {alive(slots[1])}")
+}
+```
+
+## `T-REF-STALE.gr`
+
+```grasm
+//! tag: T-REF-STALE
+//! expect: panic
+//! stale reference: the value it pointed to was released
+// Reading through a released reference is a deterministic panic.
+//
+// This is the property that makes Tier 2 safe rather than merely convenient:
+// the slot may already have been reused, and without the generation check the
+// read would return whatever now lives there — a use-after-free with no
+// symptom. The generation moves on release, so a reference taken before it can
+// never match again.
+type Node = { v: i64 }
+
+fn main() {
+    let r = ref(Node{ v: 7 })
+    print("{r.v}")
+    release(r)
+    print("{r.v}")
 }
 ```
 

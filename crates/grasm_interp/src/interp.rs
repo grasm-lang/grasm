@@ -57,6 +57,13 @@ pub struct Interp<'a, W: Write> {
     float_literals: std::collections::HashSet<u32>,
     /// `sum()` calls the checker resolved to `f64`, by span start.
     float_sums: std::collections::HashSet<u32>,
+    /// Tier 2's shared heap: the value in each slot (`None` once released) and
+    /// the generation that slot is on. A reference matches only while the
+    /// generation it was taken at is still current, so a released slot can be
+    /// reused immediately and every reference into its previous life is caught.
+    slab: Vec<(Option<Value>, u32)>,
+    /// Slots free for reuse.
+    slab_free: Vec<u32>,
     /// `type Res = i64 ! E` — needed to tell whether a function that returns
     /// an alias is fallible, which decides whether its value is wrapped.
     aliases: HashMap<String, TypeExpr>,
@@ -243,6 +250,8 @@ impl<'a, W: Write> Interp<'a, W> {
             consts: HashMap::new(),
             float_literals: std::collections::HashSet::new(),
             float_sums: std::collections::HashSet::new(),
+            slab: Vec::new(),
+            slab_free: Vec::new(),
             aliases: HashMap::new(),
             externs: HashMap::new(),
             fallible_ops: std::collections::HashSet::new(),
@@ -1325,6 +1334,57 @@ build links it, `grasm run` can only reach what is already loaded",
                             std::f64::consts::E
                         }));
                     }
+                    "ref" if !self.fns.contains_key(&format!("{}::ref", self.current_module)) => {
+                        let v = self.eval_expr(&args[0])?;
+                        let r = match self.slab_free.pop() {
+                            Some(i) => {
+                                let idx = i as usize;
+                                self.slab[idx].0 = Some(v);
+                                Value::Ref(i, self.slab[idx].1)
+                            }
+                            None => {
+                                let i = self.slab.len() as u32;
+                                self.slab.push((Some(v), 0));
+                                Value::Ref(i, 0)
+                            }
+                        };
+                        return Ok(r);
+                    }
+                    "release"
+                        if !self
+                            .fns
+                            .contains_key(&format!("{}::release", self.current_module)) =>
+                    {
+                        let v = self.eval_expr(&args[0])?;
+                        if let Value::Ref(i, g) = v {
+                            let idx = i as usize;
+                            if idx < self.slab.len() && self.slab[idx].1 == g {
+                                self.slab[idx].0 = None;
+                                // The generation moves whether or not anything
+                                // was there, so every reference taken before
+                                // this stops matching.
+                                self.slab[idx].1 = self.slab[idx].1.wrapping_add(1);
+                                self.slab_free.push(i);
+                            }
+                        }
+                        return Ok(Value::Unit);
+                    }
+                    "alive"
+                        if !self
+                            .fns
+                            .contains_key(&format!("{}::alive", self.current_module)) =>
+                    {
+                        let v = self.eval_expr(&args[0])?;
+                        return Ok(Value::Bool(match v {
+                            Value::Ref(i, g) => {
+                                let idx = i as usize;
+                                idx < self.slab.len()
+                                    && self.slab[idx].1 == g
+                                    && self.slab[idx].0.is_some()
+                            }
+                            _ => false,
+                        }));
+                    }
                     "now_millis" => {
                         let ms = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -1399,6 +1459,18 @@ build links it, `grasm run` can only reach what is already loaded",
         self.call_value(callee_v, vs, "call")
     }
 
+    /// A `ref` resolves to what it points at; anything else is itself.
+    fn deref_value(&mut self, v: Value) -> EResult {
+        let Value::Ref(i, g) = v else { return Ok(v) };
+        let idx = i as usize;
+        match self.slab.get(idx) {
+            Some((Some(inner), gen)) if *gen == g => Ok(inner.clone()),
+            _ => Err(Flow::Panic(
+                "stale reference: the value it pointed to was released".to_string(),
+            )),
+        }
+    }
+
     fn eval_field(&mut self, recv: &Expr, name: &Ident) -> EResult {
         // Qualified nullary variant `Type.Variant`.
         if let Expr::Ident(tid) = recv {
@@ -1441,6 +1513,10 @@ build links it, `grasm run` can only reach what is already loaded",
             }
         }
         let r = self.eval_expr(recv)?;
+        // Tier 2: reading through a reference checks the generation first. A
+        // stale one panics here rather than reading whatever now occupies the
+        // slot, which is the property that makes `ref` safe.
+        let r = self.deref_value(r)?;
         match r {
             // `pair.0` — components named by position.
             Value::Tuple(parts) => match name.name.parse::<usize>() {

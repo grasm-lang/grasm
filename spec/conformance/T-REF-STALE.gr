@@ -1,0 +1,18 @@
+//! tag: T-REF-STALE
+//! expect: panic
+//! stale reference: the value it pointed to was released
+// Reading through a released reference is a deterministic panic.
+//
+// This is the property that makes Tier 2 safe rather than merely convenient:
+// the slot may already have been reused, and without the generation check the
+// read would return whatever now lives there — a use-after-free with no
+// symptom. The generation moves on release, so a reference taken before it can
+// never match again.
+type Node = { v: i64 }
+
+fn main() {
+    let r = ref(Node{ v: 7 })
+    print("{r.v}")
+    release(r)
+    print("{r.v}")
+}

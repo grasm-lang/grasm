@@ -220,6 +220,11 @@ pub enum TypeExpr {
     },
     /// `[T]`
     List(Box<TypeExpr>, Span),
+    /// `ref T` — Tier 2. A generational reference into the shared heap: a
+    /// slot index plus the generation that slot held when the reference was
+    /// made. Reading through one checks the generation, so a reference to a
+    /// released slot is a deterministic panic and never a dangling read.
+    Ref(Box<TypeExpr>, Span),
     /// `T ! E` — a value that is either a `T` or a failure carrying an `E`.
     Fallible(Box<TypeExpr>, Box<TypeExpr>, Span),
     /// `(A, B)`; empty = unit `()`
@@ -248,6 +253,7 @@ impl TypeExpr {
             | TypeExpr::List(_, span)
             | TypeExpr::Fallible(_, _, span)
             | TypeExpr::Tuple(_, span)
+            | TypeExpr::Ref(_, span)
             | TypeExpr::Fn { span, .. }
             | TypeExpr::Union(_, span) => *span,
         }

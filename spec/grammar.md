@@ -39,7 +39,7 @@ digit       = "0".."9"
 ```
 and  break  continue  effect  else  false  fn  for  handled_by  if
 import  in  inout  let  match  not  or  own  pub  return  test  true
-try  type  unsafe  var  while  with
+ref  try  type  unsafe  var  while  with
 ```
 
 **[L-CONTEXTUAL]** `parallel` and `spawn` are *contextual* keywords: they
@@ -143,12 +143,14 @@ so existing code that uses `bench` as a name keeps working.
 
 ```
 type       = named_type | list_type | tuple_type | union_type | fn_type
+             | ref_type
 nested     = type ( "!" type )?
 fn_type    = "fn" "(" ( nested ( "," nested )* )? ")" ( "->" nested )? effect_row?
 effect_row = "/" "{" ( path ( "," path )* )? "}"
 named_type = identifier type_args?
 type_args  = "[" nested ( "," nested )* "]"
 list_type  = "[" nested "]"
+ref_type   = "ref" nested
 tuple_type = "(" ( nested ( "," nested )* )? ")"
 union_type = "(" nested ( "|" nested )+ ")"
 ```
@@ -241,8 +243,9 @@ Precedence, loosest to tightest:
 expression   = or_expr
 primary      = literal | identifier | list_lit | map_lit | tuple_lit
              | struct_lit | if_expr | match_expr | block | closure
-             | unsafe_expr | "(" expression ")"
+             | unsafe_expr | ref_expr | "(" expression ")"
 unsafe_expr  = "unsafe" block
+ref_expr     = "ref" "(" expression ")"
 list_lit     = "[" ( expression ( "," expression )* ","? )? "]"
 map_lit      = "{" ( map_entry ( "," map_entry )* ","? )? "}"
 map_entry    = expression ":" expression

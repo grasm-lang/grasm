@@ -85,6 +85,10 @@ pub enum Value {
     /// Sorted map — deterministic iteration order.
     Map(Rc<std::collections::BTreeMap<MapKey, Value>>),
     Tuple(Rc<Vec<Value>>),
+    /// Tier 2 — a generational reference: `(slot, generation)`. Copyable, so
+    /// it can be stored anywhere; whether it still points at something is a
+    /// question for the slab, asked on every read.
+    Ref(u32, u32),
     /// Ordered fields, as declared.
     Struct {
         name: Rc<String>,
@@ -239,6 +243,10 @@ impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Value::Int(v) => write!(f, "{v}"),
+            // Printing a reference prints the slot it names, not the value —
+            // the value may be gone, and reading it to render a message would
+            // be the exact use-after-free the tier prevents.
+            Value::Ref(i, g) => write!(f, "ref#{i}.{g}"),
             Value::Float(v) => write!(f, "{}", crate::value::float_text(*v)),
             Value::Bool(v) => write!(f, "{v}"),
             Value::Str(s) => write!(f, "{s}"),

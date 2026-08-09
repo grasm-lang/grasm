@@ -1,0 +1,37 @@
+//! tag: T-REF-GENERATIONAL
+//! expect: output
+//! abcab
+//! true 7
+//! false true
+// Tier 2 — `ref T`, the safe graph escape hatch.
+//
+// Tier 0's references are second-class: they can be passed but not stored,
+// which is what removes lifetime annotations from safe code and also makes a
+// cyclic or shared graph inexpressible. A `ref T` is a slot in a shared heap
+// plus the generation that slot held when the reference was taken. It copies
+// freely, so it can live in a struct or a list — that is the point — and every
+// read checks the generation, so a reference to a released slot is a
+// deterministic panic and never a read of whatever occupies the slot now.
+type Node = { name: str, next: i64, v: i64 }
+
+fn main() {
+    // A cycle. Each node names the next by slot; the last points back.
+    var slots: [ref Node] = []
+    slots.push(ref(Node{ name: "a", next: 1, v: 7 }))
+    slots.push(ref(Node{ name: "b", next: 2, v: 8 }))
+    slots.push(ref(Node{ name: "c", next: 0, v: 9 }))
+    var at = 0
+    var walk = ""
+    for step in 0..5 {
+        walk = walk + slots[at].name
+        at = slots[at].next
+    }
+    print("{walk}")
+
+    let first = slots[0]
+    print("{alive(first)} {first.v}")
+    // Releasing a slot leaves every reference into its previous life stale,
+    // and says so rather than reading the slot's next occupant.
+    release(first)
+    print("{alive(first)} {alive(slots[1])}")
+}

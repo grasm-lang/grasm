@@ -1873,6 +1873,161 @@ pub extern "C" fn grasm_f64_to_fixed(x: f64, places: i64) -> *mut RtVal {
     alloc(RtPayload::Str(fixed_text(x, places)))
 }
 
+// ---------------------------------------------------------------------------
+// Tier 2 — generational references
+// ---------------------------------------------------------------------------
+
+/// The shared heap `ref T` points into.
+///
+/// A reference is a slot index and the generation that slot held when the
+/// reference was taken, packed into one 64-bit word. Releasing a slot bumps
+/// its generation, so every reference taken before that stops matching — and
+/// reading through one is a deterministic panic rather than a read of whatever
+/// occupies the slot now. That is the whole safety property: a stale reference
+/// is *always* caught, never undefined behaviour, and the slot is free to be
+/// reused immediately.
+///
+/// Slots are per process and never shrink; a released slot is reused, which is
+/// what keeps a long-lived graph from growing without bound.
+struct Slab {
+    /// `None` once released. The generation keeps counting either way.
+    slots: Vec<Option<*mut RtVal>>,
+    gens: Vec<u32>,
+    free: Vec<u32>,
+}
+
+thread_local! {
+    static SLAB: std::cell::RefCell<Slab> = const {
+        std::cell::RefCell::new(Slab {
+            slots: Vec::new(),
+            gens: Vec::new(),
+            free: Vec::new(),
+        })
+    };
+}
+
+fn pack_ref(index: u32, gen: u32) -> i64 {
+    ((index as i64) << 32) | (gen as i64 & 0xffff_ffff)
+}
+
+fn unpack_ref(r: i64) -> (u32, u32) {
+    (((r >> 32) & 0xffff_ffff) as u32, (r & 0xffff_ffff) as u32)
+}
+
+/// Puts a value in the shared heap and returns a reference to it.
+///
+/// # Safety: `v` is a live pointer whose ownership passes to the slab.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_ref_new(v: *mut RtVal) -> i64 {
+    SLAB.with(|s| {
+        let mut s = s.borrow_mut();
+        match s.free.pop() {
+            Some(i) => {
+                let idx = i as usize;
+                s.slots[idx] = Some(v);
+                pack_ref(i, s.gens[idx])
+            }
+            None => {
+                let i = s.slots.len() as u32;
+                s.slots.push(Some(v));
+                s.gens.push(0);
+                pack_ref(i, 0)
+            }
+        }
+    })
+}
+
+/// The value a reference points at, or a panic if it is stale.
+///
+/// Hands out an *owned* reference — incremented before returning — because
+/// every caller of a field read decrements its receiver when it is done. A
+/// borrowed pointer here meant the first read through a `ref` dropped the
+/// slab's own count, and the slot was left pointing at freed memory: the next
+/// `release` corrupted the heap, which surfaced as SIGTRAP rather than
+/// anything a reader could act on.
+///
+/// # Safety: the caller takes ownership of the returned reference.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_ref_get(r: i64) -> *mut RtVal {
+    let (i, gen) = unpack_ref(r);
+    let found = SLAB.with(|s| {
+        let s = s.borrow();
+        let idx = i as usize;
+        if idx >= s.slots.len() || s.gens[idx] != gen {
+            return None;
+        }
+        s.slots[idx]
+    });
+    match found {
+        Some(p) => {
+            inc(p);
+            p
+        }
+        None => rt_panic("stale reference: the value it pointed to was released"),
+    }
+}
+
+/// Replaces what a reference points at. Panics if it is stale.
+///
+/// # Safety: `v` is a live pointer whose ownership passes to the slab.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_ref_set(r: i64, v: *mut RtVal) {
+    let (i, gen) = unpack_ref(r);
+    let old = SLAB.with(|s| {
+        let mut s = s.borrow_mut();
+        let idx = i as usize;
+        if idx >= s.slots.len() || s.gens[idx] != gen || s.slots[idx].is_none() {
+            return Err(());
+        }
+        Ok(s.slots[idx].replace(v))
+    });
+    match old {
+        Ok(prev) => {
+            if let Some(p) = prev {
+                dec(p);
+            }
+        }
+        Err(()) => rt_panic("stale reference: the value it pointed to was released"),
+    }
+}
+
+/// Releases a slot. Every reference to it becomes stale.
+///
+/// Releasing an already-released slot is a no-op, not a panic: a double
+/// release is not a use-after-free and reporting it would make cleanup order
+/// something a caller has to track.
+#[no_mangle]
+pub extern "C" fn grasm_ref_release(r: i64) {
+    let (i, gen) = unpack_ref(r);
+    let taken = SLAB.with(|s| {
+        let mut s = s.borrow_mut();
+        let idx = i as usize;
+        if idx >= s.slots.len() || s.gens[idx] != gen {
+            return None;
+        }
+        let v = s.slots[idx].take();
+        // The generation moves whether or not anything was there, so a
+        // reference taken before this can never match again.
+        s.gens[idx] = s.gens[idx].wrapping_add(1);
+        s.free.push(i);
+        v
+    });
+    if let Some(p) = taken {
+        unsafe { dec(p) };
+    }
+}
+
+/// Whether a reference still points at something.
+#[no_mangle]
+pub extern "C" fn grasm_ref_alive(r: i64) -> i8 {
+    let (i, gen) = unpack_ref(r);
+    SLAB.with(|s| {
+        let s = s.borrow();
+        let idx = i as usize;
+        i8::from(idx < s.slots.len() && s.gens[idx] == gen && s.slots[idx].is_some())
+    })
+}
+
 thread_local! {
     /// The lowest stack address this thread may use, or 0 before the first
     /// check on it. Per thread, because a worker's stack is somewhere else

@@ -571,6 +571,7 @@ pub fn render_type_decl(t: &TypeDecl) -> String {
 
 pub fn type_text(t: &TypeExpr) -> String {
     match t {
+        TypeExpr::Ref(inner, _) => format!("ref {}", type_text(inner)),
         TypeExpr::Name { path, args, .. } => {
             if args.is_empty() {
                 path.dotted()

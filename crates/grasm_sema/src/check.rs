@@ -614,6 +614,9 @@ impl Checker {
     /// TypeExpr → Type. `generics` are the in-scope generic parameter names.
     fn resolve_type(&mut self, te: &TypeExpr, generics: &[String]) -> Type {
         match te {
+            TypeExpr::Ref(inner, _) => {
+                Type::Ref(Box::new(self.resolve_type(inner, generics)))
+            }
             TypeExpr::Fn { params, ret, effects, .. } => {
                 let ps = params.iter().map(|p| self.resolve_type(p, generics)).collect();
                 // The row is part of the type, not decoration on the syntax.
@@ -1902,6 +1905,46 @@ that does not change",
                         }
                         return Type::F64;
                     }
+                    // Tier 2. `ref(v)` puts a value in the shared heap and
+                    // hands back a generational reference to it; `release(r)`
+                    // gives the slot up, after which every reference to it is
+                    // stale and reading through one panics rather than reading
+                    // whatever landed there next.
+                    "ref" if self.lookup_fn("ref").is_none() => {
+                        if args.len() != 1 {
+                            return self.error(span, "ref takes exactly 1 argument (the value)");
+                        }
+                        let inner = self.infer_expr(&args[0]);
+                        return Type::Ref(Box::new(inner));
+                    }
+                    "release" if self.lookup_fn("release").is_none() => {
+                        if args.len() != 1 {
+                            return self.error(span, "release takes exactly 1 argument (a `ref`)");
+                        }
+                        let t = self.infer_expr(&args[0]);
+                        if !matches!(self.uni.resolve(&t), Type::Ref(_) | Type::Error) {
+                            let shown = self.show(&t);
+                            return self.error(
+                                args[0].span(),
+                                format!("release expects a `ref`, not `{shown}`"),
+                            );
+                        }
+                        return Type::Unit;
+                    }
+                    "alive" if self.lookup_fn("alive").is_none() => {
+                        if args.len() != 1 {
+                            return self.error(span, "alive takes exactly 1 argument (a `ref`)");
+                        }
+                        let t = self.infer_expr(&args[0]);
+                        if !matches!(self.uni.resolve(&t), Type::Ref(_) | Type::Error) {
+                            let shown = self.show(&t);
+                            return self.error(
+                                args[0].span(),
+                                format!("alive expects a `ref`, not `{shown}`"),
+                            );
+                        }
+                        return Type::Bool;
+                    }
                     "now_millis" => {
                         if !args.is_empty() {
                             return self.error(span, "now_millis takes no arguments");
@@ -2242,6 +2285,13 @@ that does not change",
             }
         }
         let recv_ty = self.infer_expr(recv);
+        // Tier 2: a `ref T` reads as the `T` it points at. The check happens
+        // at run time, on the generation, so a reference to a released slot
+        // panics rather than reading whatever occupies it now.
+        let recv_ty = match self.uni.resolve(&recv_ty) {
+            Type::Ref(inner) => *inner,
+            _ => recv_ty,
+        };
         match self.uni.shallow_resolve(&recv_ty) {
             // `pair.0` — a tuple's components are named by position.
             Type::Tuple(parts) => match name.name.parse::<usize>() {

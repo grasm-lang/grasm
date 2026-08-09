@@ -841,6 +841,13 @@ impl Parser {
                 let rb = self.expect(&TokenKind::RBracket)?;
                 Ok(TypeExpr::List(Box::new(inner), start.merge(rb.span)))
             }
+            // `ref T` — Tier 2.
+            TokenKind::KwRef => {
+                self.bump();
+                let inner = self.parse_type_nested()?;
+                let sp = start.merge(inner.span());
+                Ok(TypeExpr::Ref(Box::new(inner), sp))
+            }
             TokenKind::LParen => {
                 self.bump();
                 if self.at(&TokenKind::RParen) {
@@ -1571,6 +1578,26 @@ impl Parser {
             TokenKind::KwUnsafe => {
                 self.bump();
                 Ok(Expr::Unsafe(self.parse_block()?))
+            }
+            // `ref(v)` — Tier 2. `ref` is a keyword because it is also a type
+            // prefix, so it cannot arrive here as an ordinary identifier the
+            // way `release` and `alive` do.
+            TokenKind::KwRef => {
+                let kw = self.bump();
+                self.expect(&TokenKind::LParen)?;
+                let saved = self.no_struct_lit;
+                self.no_struct_lit = false;
+                let inner = self.parse_expr()?;
+                self.no_struct_lit = saved;
+                let rp = self.expect(&TokenKind::RParen)?;
+                Ok(Expr::Call {
+                    callee: Box::new(Expr::Ident(Ident {
+                        name: "ref".to_string(),
+                        span: kw.span,
+                    })),
+                    args: vec![inner],
+                    span: kw.span.merge(rp.span),
+                })
             }
             TokenKind::LBrace => self.parse_brace_expr(),
             TokenKind::Pipe => self.parse_closure(),

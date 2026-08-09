@@ -48,6 +48,10 @@ enum VType {
     Unit,
     Str,
     List(Box<VType>),
+    /// Tier 2 — a generational reference, one i64: slot index in the high
+    /// half, generation in the low half. A plain scalar, so it copies freely
+    /// and needs no refcount of its own; the slab owns what it points at.
+    Ref(Box<VType>),
     Struct(String),
     Sum(String),
     Option(Box<VType>),
@@ -70,6 +74,7 @@ impl VType {
     fn mangle(&self) -> String {
         match self {
             VType::I64 => "i64".into(),
+            VType::Ref(inner) => format!("ref_{}", inner.mangle()),
             VType::F64 => "f64".into(),
             VType::Bool => "bool".into(),
             VType::Unit => "unit".into(),
@@ -95,6 +100,8 @@ impl VType {
     fn cl(&self) -> types::Type {
         match self {
             VType::I64 => types::I64,
+            // One word: slot index and generation packed together.
+            VType::Ref(_) => types::I64,
             VType::F64 => types::F64,
             VType::Bool => types::I8,
             VType::Unit => types::I8,
@@ -554,6 +561,11 @@ impl<'m> Codegen<'m> {
             ("grasm_file_exists", vec![i64t], Some(i8t)),
             ("grasm_set_args", vec![i64t, ptr], None),
             ("grasm_now_millis", vec![], Some(i64t)),
+            ("grasm_ref_new", vec![i64t], Some(i64t)),
+            ("grasm_ref_get", vec![i64t], Some(i64t)),
+            ("grasm_ref_set", vec![i64t, i64t], None),
+            ("grasm_ref_release", vec![i64t], None),
+            ("grasm_ref_alive", vec![i64t], Some(i8t)),
             ("grasm_env", vec![i64t], Some(i64t)),
             ("grasm_exit", vec![i64t], None),
             ("grasm_str_lines", vec![i64t], Some(i64t)),
@@ -590,6 +602,7 @@ impl<'m> Codegen<'m> {
 
     fn vtype_of(&self, te: &TypeExpr) -> CResult<VType> {
         match te {
+            TypeExpr::Ref(inner, _) => Ok(VType::Ref(Box::new(self.vtype_of(inner)?))),
             TypeExpr::Name { path, args, span } => {
                 if path.segments.len() == 1 {
                     let n = path.segments[0].name.as_str();
@@ -2671,6 +2684,9 @@ fn scan_uses_expr(e: &Expr, indexed: &mut Vec<String>, bad: &mut Vec<String>) {
 fn scalar_kind_i64(vt: &VType) -> Option<i64> {
     match vt {
         VType::I64 => Some(0),
+        // A reference is one word, so a list of them is an unboxed scalar
+        // list like any other — which is what makes an object graph cheap.
+        VType::Ref(_) => Some(0),
         VType::F64 => Some(1),
         VType::Bool => Some(2),
         _ => None,
@@ -2900,7 +2916,8 @@ impl FnCx<'_, '_> {
     /// A scalar as the i64 bit pattern a `ListScalar` stores.
     fn scalar_bits_of(&mut self, v: Value, vt: &VType) -> Value {
         match vt {
-            VType::I64 => v,
+            // A reference is already the word it is stored as.
+            VType::I64 | VType::Ref(_) => v,
             VType::F64 => {
                 self.b
                     .ins()
@@ -2916,21 +2933,25 @@ impl FnCx<'_, '_> {
     /// flat slot array rather than a typed structure.
     fn value_to_bits(&mut self, v: Value, vt: &VType) -> Value {
         match vt {
-            VType::I64 | VType::F64 | VType::Bool => self.scalar_bits_of(v, vt),
+            VType::I64 | VType::F64 | VType::Bool | VType::Ref(_) => {
+                self.scalar_bits_of(v, vt)
+            }
             _ => v,
         }
     }
 
     fn bits_to_value(&mut self, bits: Value, vt: &VType) -> Value {
         match vt {
-            VType::I64 | VType::F64 | VType::Bool => self.scalar_of_bits(bits, vt),
+            VType::I64 | VType::F64 | VType::Bool | VType::Ref(_) => {
+                self.scalar_of_bits(bits, vt)
+            }
             _ => bits,
         }
     }
 
     fn scalar_of_bits(&mut self, bits: Value, vt: &VType) -> Value {
         match vt {
-            VType::I64 => bits,
+            VType::I64 | VType::Ref(_) => bits,
             VType::F64 => {
                 self.b
                     .ins()
@@ -3611,6 +3632,13 @@ impl FnCx<'_, '_> {
                 self.call_rt("grasm_val_dec", &[boxed]);
                 Ok((v, VType::I64))
             }
+            // The same word, kept at its own type so a later field read still
+            // knows to go through the slab.
+            VType::Ref(inner) => {
+                let v = self.call_rt("grasm_unbox_i64", &[boxed]).unwrap();
+                self.call_rt("grasm_val_dec", &[boxed]);
+                Ok((v, VType::Ref(inner.clone())))
+            }
             VType::F64 => {
                 let v = self.call_rt("grasm_unbox_f64", &[boxed]).unwrap();
                 self.call_rt("grasm_val_dec", &[boxed]);
@@ -3640,7 +3668,10 @@ impl FnCx<'_, '_> {
                 let z = self.b.ins().iconst(types::I64, 0);
                 self.call_rt("grasm_box_i64", &[z]).unwrap()
             }
-            VType::I64 => self.call_rt("grasm_box_i64", &[v]).unwrap(),
+            // A reference is a packed word, not a pointer. Falling through to
+            // "already boxed" below stored the packed value *as* a pointer,
+            // and reading it back dereferenced an integer.
+            VType::I64 | VType::Ref(_) => self.call_rt("grasm_box_i64", &[v]).unwrap(),
             VType::F64 => self.call_rt("grasm_box_f64", &[v]).unwrap(),
             VType::Bool => self.call_rt("grasm_box_bool", &[v]).unwrap(),
             // Already boxed: ownership transfers into the container.
@@ -5659,6 +5690,33 @@ impl FnCx<'_, '_> {
                 };
                 return Ok(Some((self.b.ins().f64const(c), VType::F64)));
             }
+            // Tier 2.
+            "ref" if !self.cg.fns.contains_key(&format!("{}::ref", self.cg.current_module)) => {
+                let (v, vt) = self.eval_expr_val(&args[0])?;
+                let boxed = self.box_value(v, &vt);
+                let r = self.call_rt("grasm_ref_new", &[boxed]).unwrap();
+                return Ok(Some((r, VType::Ref(Box::new(vt)))));
+            }
+            "release"
+                if !self
+                    .cg
+                    .fns
+                    .contains_key(&format!("{}::release", self.cg.current_module)) =>
+            {
+                let (v, _) = self.eval_expr_val(&args[0])?;
+                self.call_rt("grasm_ref_release", &[v]);
+                return Ok(None);
+            }
+            "alive"
+                if !self
+                    .cg
+                    .fns
+                    .contains_key(&format!("{}::alive", self.cg.current_module)) =>
+            {
+                let (v, _) = self.eval_expr_val(&args[0])?;
+                let b = self.call_rt("grasm_ref_alive", &[v]).unwrap();
+                return Ok(Some((b, VType::Bool)));
+            }
             "now_millis" => {
                 let v = self.call_rt("grasm_now_millis", &[]).unwrap();
                 return Ok(Some((v, VType::I64)));
@@ -6070,6 +6128,16 @@ impl FnCx<'_, '_> {
             }
         }
         let (rv, rt) = self.eval_expr_val(recv)?;
+        // Tier 2: reading through a reference goes via the slab, which checks
+        // the generation and panics if the slot has been released. The value
+        // comes back boxed, so it is unboxed to the pointee's own shape.
+        let (rv, rt) = match rt {
+            VType::Ref(inner) => {
+                let boxed = self.call_rt("grasm_ref_get", &[rv]).unwrap();
+                self.unbox(boxed, &inner)?
+            }
+            other => (rv, other),
+        };
         // `pair.0` — a tuple's components are named by position.
         if let VType::Tuple(parts) = &rt {
             let Ok(i) = name.name.parse::<usize>() else {

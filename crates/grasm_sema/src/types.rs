@@ -17,6 +17,11 @@ pub enum Type {
     Range,
     Tuple(Vec<Type>),
     List(Box<Type>),
+    /// `ref T` — Tier 2. A generational reference: a slot in the shared heap
+    /// plus the generation it held when the reference was taken. Copyable, so
+    /// it can be stored in a struct or a list, which is the point — that is
+    /// the graph shape Tier 0's second-class references cannot express.
+    Ref(Box<Type>),
     /// `Map[K, V]` — keys restricted to i64/str/bool.
     Map(Box<Type>, Box<Type>),
     /// Struct or sum type instance, e.g. `Option[i64]`.
@@ -197,6 +202,7 @@ impl Unifier {
                 id,
                 args: args.iter().map(|a| self.resolve(a)).collect(),
             },
+            Type::Ref(inner) => Type::Ref(Box::new(self.resolve(&inner))),
             Type::Fn { params, ret, row } => Type::Fn {
                 params: params.iter().map(|p| self.resolve(p)).collect(),
                 ret: Box::new(self.resolve(&ret)),
@@ -262,6 +268,7 @@ impl Unifier {
             (Type::Named { id: i1, args: a1 }, Type::Named { id: i2, args: a2 }) => {
                 i1 == i2 && a1.len() == a2.len() && a1.iter().zip(a2).all(|(x, y)| self.unify(x, y))
             }
+            (Type::Ref(a), Type::Ref(b)) => self.unify(a, b),
             (
                 Type::Fn {
                     params: p1,
@@ -315,6 +322,7 @@ pub fn substitute_generics(ty: &Type, args: &[Type]) -> Type {
             id: *id,
             args: targs.iter().map(|t| substitute_generics(t, args)).collect(),
         },
+        Type::Ref(inner) => Type::Ref(Box::new(substitute_generics(inner, args))),
         Type::Fn { params, ret, row } => Type::Fn {
             params: params.iter().map(|t| substitute_generics(t, args)).collect(),
             ret: Box::new(substitute_generics(ret, args)),
@@ -345,6 +353,10 @@ impl fmt::Display for TypeDisplay<'_> {
 
 fn write_type(f: &mut fmt::Formatter<'_>, ty: &Type, defs: &TypeDefs) -> fmt::Result {
     match ty {
+        Type::Ref(inner) => {
+            write!(f, "ref ")?;
+            write_type(f, inner, defs)
+        }
         Type::I64 => write!(f, "i64"),
         Type::F64 => write!(f, "f64"),
         Type::Bool => write!(f, "bool"),

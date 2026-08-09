@@ -239,6 +239,7 @@ fn type_name(value: &grasm_interp::Value) -> &'static str {
     use grasm_interp::Value;
     match value {
         Value::Int(_) => "i64",
+        Value::Ref(..) => "ref",
         Value::Float(_) => "f64",
         Value::Bool(_) => "bool",
         Value::Str(_) => "str",

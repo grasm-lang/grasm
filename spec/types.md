@@ -380,6 +380,27 @@ had a door straight through it.
 own module, like a function. Reaching a private one through its module is the
 same error a private function gives.
 
+**[T-REF-GENERATIONAL]** `ref T` is Tier 2: a *generational reference* into a
+shared heap. `ref(v)` puts a value there and hands back a reference — a slot
+index paired with the generation that slot was on. Reading a field through one
+reads the value it points at. A reference is a plain word: it copies, and it
+can be stored in a struct, a list or a map, which is exactly what Tier 0's
+second-class references cannot do and the reason this tier exists. A cyclic or
+shared object graph has no other safe representation here.
+
+`release(r)` gives the slot up and `alive(r)` asks whether a reference still
+points at something. Releasing an already-released slot does nothing: a double
+release is not a use-after-free, and making it an error would turn cleanup
+order into something every caller has to track.
+
+**[T-REF-STALE]** Reading through a released reference **panics**, always. The
+slot may already hold something else — released slots are reused immediately,
+which is what keeps a long-lived graph from growing without bound — so the
+generation is what distinguishes a live reference from one into the slot's
+previous life. This is the property that makes the tier safe rather than merely
+convenient: a stale read is caught every time, never undefined behaviour, and
+never a silently wrong value.
+
 **[T-UNSAFE-FFI]** `unsafe { … }` is Tier 3: the block where the guarantees of
 the safe tiers do not apply. Using a declared C function — calling one *or
 naming one*, which are the same permission — is allowed only inside it.

@@ -91,6 +91,12 @@ const INTERESTING_INTS: &[i64] = &[0, 1, -1, 2, -2, 10, 100, i64::MIN, i64::MAX,
 /// reports stay readable) while later ones stress bigger inputs.
 pub fn generate(rng: &mut Rng, te: &TypeExpr, size: u32) -> Value {
     match te {
+        // A `ref T` names a slot in the shared heap, and inventing one would
+        // mean inventing the object graph it points into. Rejected as a
+        // property parameter for the same reason a function is
+        // ([G-TEST-PARAMS]); this arm keeps the generator from being what
+        // panics if that gate is ever loosened.
+        TypeExpr::Ref(..) => Value::Unit,
         // The checker rejects a property parameter whose type cannot be
         // generated ([G-TEST-PARAMS]), and a function is one of those — there
         // is no sensible arbitrary function to invent. This arm exists so the
