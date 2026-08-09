@@ -1,0 +1,16 @@
+//! tag: E-PANIC-TRACE
+//! expect: panic
+//! stack overflow: recursion too deep
+// The panic line is the same in every engine; only the trace after it differs.
+//
+// The two engines stop at different depths on purpose — one counts calls, the
+// other measures remaining stack — and both bounds are implementation-defined
+// ([E-RECURSION-DEPTH]). The interpreter used to name its own number here, so
+// the same failure read as two different failures depending on how you ran it.
+fn down(n: i64) -> i64 {
+    down(n + 1)
+}
+
+fn main() {
+    print("{down(0)}")
+}

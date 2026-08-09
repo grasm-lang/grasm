@@ -48,16 +48,21 @@ for src in $programs; do
     fi
 
     # stdout and the exit code are what a program *produces*, and they must
-    # match exactly. stderr carries diagnostics, and the interpreter's panic
-    # stack trace has no native counterpart yet (see README, "Native gaps"),
-    # so that block is stripped before stderr is compared.
+    # match exactly. stderr carries diagnostics, and a panic's stack trace is
+    # the one thing on it the two engines are allowed to differ about —
+    # [E-PANIC-TRACE] says which of them prints one and why — so that block is
+    # stripped before stderr is compared. Everything else on stderr, the panic
+    # line included, has to be identical.
     interp_err=$(mktemp)
     native_err=$(mktemp)
     interp_out=$("$GRASM" run "$src" 2>"$interp_err")
     interp_code=$?
     native_out=$("$bin" 2>"$native_err")
     native_code=$?
-    interp_diag=$(grep -v -e '^stack trace (innermost first):$' -e '^  [A-Za-z_][A-Za-z0-9_:]* at ' "$interp_err")
+    interp_diag=$(grep -v \
+        -e '^stack trace (innermost first):$' \
+        -e '^  [A-Za-z_][A-Za-z0-9_:]* at ' \
+        -e '^  \.\.\. [0-9]* more frame(s)$' "$interp_err")
     native_diag=$(cat "$native_err")
     rm -f "$interp_err" "$native_err"
 

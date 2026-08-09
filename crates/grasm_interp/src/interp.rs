@@ -387,9 +387,13 @@ impl<'a, W: Write> Interp<'a, W> {
         call_site: grasm_syntax::span::Span,
     ) -> EResult {
         if self.depth >= MAX_DEPTH {
-            return Err(Flow::Panic(format!(
-                "stack overflow: recursion deeper than {MAX_DEPTH} calls"
-            )));
+            // Word for word what the compiled backend says. The two engines
+            // stop at different depths on purpose — this one counts calls, the
+            // other measures remaining stack — and both bounds are
+            // implementation-defined ([E-RECURSION-DEPTH]), so naming this
+            // one's number here advertised a limit no program should depend on
+            // and made the same failure read as two different failures.
+            return Err(Flow::Panic("stack overflow: recursion too deep".to_string()));
         }
         self.depth += 1;
         self.call_stack

@@ -7,7 +7,7 @@ before it is listed as stable.
 `crates/grasm_spec` fails if a clause here is missing, unknown, or listed twice,
 so this file cannot drift away from the specification it describes.
 
-Today: 98 stable, 57 provisional, 19 experimental, of 174.
+Today: 99 stable, 57 provisional, 19 experimental, of 175.
 
 ## Stable
 
@@ -40,6 +40,7 @@ Will not change incompatibly before 2.0.
 - `E-OWN-RUNTIME` — stable
 - `E-PAD-CYCLE` — stable
 - `E-PANIC-EXIT` — stable
+- `E-PANIC-TRACE` — stable
 - `E-POW` — stable
 - `E-POW-NEG` — stable
 - `E-PRINT-ATOMIC` — stable

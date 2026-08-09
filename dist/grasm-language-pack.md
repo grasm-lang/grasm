@@ -799,7 +799,21 @@ can reach itself checks the remaining stack on entry, because nothing in the
 generated code would otherwise notice, and the failure was SIGSEGV with an
 empty stderr. The bound above the guaranteed minimum is
 implementation-defined and differs between the two engines, so a program that
-recurses deeper than 10,000 should not assume it will run everywhere.
+recurses deeper than 10,000 should not assume it will run everywhere. The
+*message* does not differ: both engines say `stack overflow: recursion too
+deep`, and neither names its own bound, because a number printed there reads
+like a limit worth coding against and is not one.
+
+**[E-PANIC-TRACE]** A panic *may* be followed by a stack trace on stderr, and
+whether one appears depends on how the program was run, not on what it did.
+`grasm run` prints one, and so does a bundled executable, which is this
+interpreter with the program attached. A `--native` build does not: the
+compiled code keeps no frame table, and paying for one on every call to
+improve a message that only prints as the process dies is the wrong trade. The
+panic line itself, and the exit status, are identical in all three. This is the
+one place the three ways of running a program differ in what reaches stderr,
+which is why `scripts/agreetest.sh` strips the trace block and compares
+everything else exactly.
 
 **[E-ARITH-FLOAT]** Float arithmetic follows IEEE-754, including infinities and
 NaN. Division by zero yields an infinity rather than panicking.
@@ -2856,6 +2870,27 @@ fn main() {
 //! deliberate
 fn main() {
     panic("deliberate")
+}
+```
+
+## `E-PANIC-TRACE.gr`
+
+```grasm
+//! tag: E-PANIC-TRACE
+//! expect: panic
+//! stack overflow: recursion too deep
+// The panic line is the same in every engine; only the trace after it differs.
+//
+// The two engines stop at different depths on purpose — one counts calls, the
+// other measures remaining stack — and both bounds are implementation-defined
+// ([E-RECURSION-DEPTH]). The interpreter used to name its own number here, so
+// the same failure read as two different failures depending on how you ran it.
+fn down(n: i64) -> i64 {
+    down(n + 1)
+}
+
+fn main() {
+    print("{down(0)}")
 }
 ```
 

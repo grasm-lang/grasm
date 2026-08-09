@@ -68,7 +68,10 @@ check() {
     # from both. Everything else, including the panic message and the exit
     # code, has to match exactly.
     strip_trace() {
-        grep -v -e '^stack trace (innermost first):$' -e '^  [A-Za-z_][A-Za-z0-9_:]* at ' <<<"$1"
+        grep -v \
+            -e '^stack trace (innermost first):$' \
+            -e '^  [A-Za-z_][A-Za-z0-9_:]* at ' \
+            -e '^  \.\.\. [0-9]* more frame(s)$' <<<"$1"
     }
     i_out=$(strip_trace "$i_out")
     b_out=$(strip_trace "$b_out")
@@ -140,6 +143,17 @@ fn main() {
     print("before")
     print("a=1 b={boom(2)} c=3")
     print("after")
+}'
+
+# The panic *line* is identical in all three modes even where the trace after
+# it is not, and even where the engines stop at different depths. The
+# interpreter used to name its own bound here, so one failure read as two.
+check panic_stack_overflow 'fn down(n: i64) -> i64 {
+    down(n + 1)
+}
+
+fn main() {
+    print("{down(0)}")
 }'
 
 check exit_code 'fn main() {
