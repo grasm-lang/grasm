@@ -257,7 +257,12 @@ class Gen:
         """`enumerate`/`zip`, consumed through `for (a, b)` destructuring."""
         n = self.rng.randint(1, 3)
         items = ", ".join(self.expr(INT) for _ in range(n))
-        acc = self.fresh("p")
+        # Not "p": helper parameters are named `p0`, `p1`, … and a local
+        # minted with the same prefix collided with one. The scope map then
+        # said `p1` was the parameter's type while the shadowing local had
+        # another, so the generator emitted programs that do not typecheck —
+        # noise that hides a real rejection.
+        acc = self.fresh("acc")
         if self.rng.random() < 0.5:
             src = f"[{items}].enumerate()"
         else:
