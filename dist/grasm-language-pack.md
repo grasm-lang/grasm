@@ -1065,6 +1065,17 @@ and a float method called on it panics in the interpreter. Fixing it properly
 needs the interpreter to carry element types on empty lists, which is a change
 to its value representation rather than a patch to this one method.
 
+**[L-LIB-CMP]** `a.cmp(b)` answers `-1`, `0` or `1` in exactly the order
+`sort` uses — [L-LIB-SORT-NAN]'s total order for floats included. It exists
+because that order was specified, used internally, and callable by nothing: a
+program needing it reimplemented it from `<` and `>`, got NaN wrong, and
+scrambled a column in precisely the way that clause warns about. Naming a
+hazard without handing over the fix is how a specification becomes a trap.
+
+It is also what makes a *comparator* sort writable — several keys with
+directions decided at run time, which a single `sort_by` key expression cannot
+express.
+
 **[L-LIB-SORT-NAN]** Floats sort by a **total** order: `-NaN` before every
 number, `NaN` after every number, and `-0.0` before `0.0`. This is not IEEE
 comparison, where a NaN is unordered with everything — `<` keeps that. A sort
@@ -1162,6 +1173,7 @@ them:
 | `xs.push(v)` | `(T)` | mutates; receiver must be `var` |
 | `xs.pop()` | `-> Option[T]` | mutates |
 | `xs.remove(i)` | `(i64) -> T` | mutates; panics out of range, like indexing ([L-LIB-REMOVE]) |
+| `a.cmp(b)` | `(T) -> i64` | `-1`, `0` or `1` in the order `sort` uses; `i64`, `f64`, `str` and tuples ([L-LIB-CMP]) |
 | `xs.sort()` | | mutates; ascending. Only `i64`, `f64` and `str` are ordered — sorting anything else is a compile error, the same one `<` gives |
 | `xs.rev()` | `-> [T]` | |
 | `xs.slice(a, b)` | `(i64, i64) -> [T]` | `a` up to but excluding `b`; clamps past either end rather than panicking, like `substr` |
@@ -3663,6 +3675,69 @@ fn main() {
 fn main() {
     // `type` is reserved and cannot name a variable.
     let type = 1
+}
+```
+
+## `L-LIB-CMP.gr`
+
+```grasm
+//! tag: L-LIB-CMP
+//! expect: output
+//! -1 0 1
+//! -1 1 -1
+//! -1 0 1
+//! -1 1
+//! [(a, 3), (b, 3), (c, 1)]
+// The total order sorting uses ([L-LIB-SORT-NAN]), as a number.
+//
+// It was specified, used internally by `sort`, and callable by nothing — so a
+// program needing it reimplemented it with `<` and `>`, got NaN wrong, and
+// scrambled a column exactly as that clause warns. A language that names the
+// hazard should hand over the fix.
+fn nan() -> f64 {
+    "nan".parse_float() ?? 0.0
+}
+
+/// What `cmp` makes writable: a comparator sort, with per-key direction
+/// decided at run time rather than baked into a key expression.
+fn sort_desc_by_count(rows: [(str, i64)]) -> [(str, i64)] {
+    var out: [(str, i64)] = []
+    for r in rows {
+        var at = out.len()
+        var i = 0
+        for o in out {
+            // Count descending, then name ascending.
+            let by_count = r.1.cmp(o.1)
+            let better = if by_count != 0 { by_count > 0 } else { r.0.cmp(o.0) < 0 }
+            if better and i < at {
+                at = i
+            }
+            i += 1
+        }
+        var next: [(str, i64)] = []
+        var j = 0
+        for o in out {
+            if j == at {
+                next.push(r)
+            }
+            next.push(o)
+            j += 1
+        }
+        if at >= out.len() {
+            next.push(r)
+        }
+        out = next
+    }
+    out
+}
+
+fn main() {
+    print("{(1).cmp(2)} {(2).cmp(2)} {(3).cmp(2)}")
+    // NaN sorts after every number, which is the part hand-rolling gets wrong.
+    print("{(1.0).cmp(2.0)} {nan().cmp(1.0)} {(1.0).cmp(nan())}")
+    print("{"a".cmp("b")} {"b".cmp("b")} {"c".cmp("b")}")
+    print("{(1, 2).cmp((1, 3))} {(2, 0).cmp((1, 9))}")
+    print("{sort_desc_by_count([("c", 1), ("a", 3), ("b", 3)])}")
 }
 ```
 

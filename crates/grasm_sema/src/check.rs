@@ -2340,6 +2340,7 @@ that does not change",
                 }
             }
             Type::Str => match name.name.as_str() {
+                "cmp" => return self.check_cmp(recv, args, span),
                 "len" => {
                     check_arity(self, 0);
                     Type::I64
@@ -2431,7 +2432,9 @@ that does not change",
                 }
                 _ => return None,
             },
+            Type::Tuple(_) if name.name == "cmp" => return self.check_cmp(recv, args, span),
             Type::I64 => match name.name.as_str() {
+                "cmp" => return self.check_cmp(recv, args, span),
                 "as_f64" => {
                     check_arity(self, 0);
                     Type::F64
@@ -2458,6 +2461,7 @@ that does not change",
                 _ => return None,
             },
             Type::F64 => match name.name.as_str() {
+                "cmp" => return self.check_cmp(recv, args, span),
                 // Defensive parsing needs these: `parse_float` accepts `nan`
                 // and overflows to an infinity ([L-LIB-PARSE]), so a program
                 // reading untrusted numbers has to be able to ask.
@@ -2678,6 +2682,22 @@ that does not change",
     ///
     /// A non-literal `i64` still does not convert ([T-INT-TO-FLOAT]); that is
     /// the rule, not an oversight, and the mismatch says how to cross it.
+    /// `a.cmp(b)` — the same total order sorting uses, as a number.
+    ///
+    /// [L-LIB-SORT-NAN] specifies an order that `sort` uses internally and
+    /// nothing could call, so a program needing it reimplemented it with `<`
+    /// and `>` — and got NaN wrong, which is the exact hazard the clause
+    /// warns about.
+    fn check_cmp(&mut self, recv: &Expr, args: &[Expr], span: Span) -> Option<Type> {
+        let t = self.infer_expr(recv);
+        if args.len() != 1 {
+            self.error(span, "`cmp` takes exactly 1 argument".to_string());
+            return Some(Type::I64);
+        }
+        self.check_expr(&args[0], &t);
+        Some(Type::I64)
+    }
+
     /// Whether values of this type have an order.
     ///
     /// `i64`, `f64` and `str` do. A tuple of them does too, compared

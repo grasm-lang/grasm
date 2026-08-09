@@ -4770,6 +4770,17 @@ impl FnCx<'_, '_> {
                 (v, VType::List(Box::new(pair)))
             }
             // ---- numeric ----
+            // The same total order sorting uses ([L-LIB-SORT-NAN]), callable.
+            (VType::I64 | VType::F64 | VType::Str | VType::Tuple(_), "cmp") => {
+                let rt2 = rt.clone();
+                let ab = self.box_value(rv, &rt2);
+                let (ov, ovt) = self.eval_expr_val(&args[0])?;
+                let bb = self.box_value(ov, &ovt);
+                let v = self.call_rt("grasm_val_cmp", &[ab, bb]).unwrap();
+                self.call_rt("grasm_val_dec", &[ab]);
+                self.call_rt("grasm_val_dec", &[bb]);
+                (v, VType::I64)
+            }
             (VType::I64, "as_f64") => {
                 (self.b.ins().fcvt_from_sint(types::F64, rv), VType::F64)
             }
@@ -6317,7 +6328,7 @@ impl FnCx<'_, '_> {
                 "to_str" | "join" | "trim" | "to_upper" | "to_lower" | "replace"
                 | "substr" | "repeat" | "pad_start" | "pad_end" | "to_char"
                 | "to_fixed" => VType::Str,
-                "code_at" => VType::I64,
+                "code_at" | "cmp" => VType::I64,
                 "codes" => VType::List(Box::new(VType::I64)),
                 "as_f64" => VType::F64,
                 "as_i64" => VType::I64,

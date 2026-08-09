@@ -118,6 +118,17 @@ and a float method called on it panics in the interpreter. Fixing it properly
 needs the interpreter to carry element types on empty lists, which is a change
 to its value representation rather than a patch to this one method.
 
+**[L-LIB-CMP]** `a.cmp(b)` answers `-1`, `0` or `1` in exactly the order
+`sort` uses — [L-LIB-SORT-NAN]'s total order for floats included. It exists
+because that order was specified, used internally, and callable by nothing: a
+program needing it reimplemented it from `<` and `>`, got NaN wrong, and
+scrambled a column in precisely the way that clause warns about. Naming a
+hazard without handing over the fix is how a specification becomes a trap.
+
+It is also what makes a *comparator* sort writable — several keys with
+directions decided at run time, which a single `sort_by` key expression cannot
+express.
+
 **[L-LIB-SORT-NAN]** Floats sort by a **total** order: `-NaN` before every
 number, `NaN` after every number, and `-0.0` before `0.0`. This is not IEEE
 comparison, where a NaN is unordered with everything — `<` keeps that. A sort
@@ -215,6 +226,7 @@ them:
 | `xs.push(v)` | `(T)` | mutates; receiver must be `var` |
 | `xs.pop()` | `-> Option[T]` | mutates |
 | `xs.remove(i)` | `(i64) -> T` | mutates; panics out of range, like indexing ([L-LIB-REMOVE]) |
+| `a.cmp(b)` | `(T) -> i64` | `-1`, `0` or `1` in the order `sort` uses; `i64`, `f64`, `str` and tuples ([L-LIB-CMP]) |
 | `xs.sort()` | | mutates; ascending. Only `i64`, `f64` and `str` are ordered — sorting anything else is a compile error, the same one `<` gives |
 | `xs.rev()` | `-> [T]` | |
 | `xs.slice(a, b)` | `(i64, i64) -> [T]` | `a` up to but excluding `b`; clamps past either end rather than panicking, like `substr` |

@@ -1924,6 +1924,14 @@ impl<'a, W: Write> Interp<'a, W> {
                 }
                 Value::str(crate::value::fixed_text(*f, places))
             }
+            (Value::Int(_) | Value::Float(_) | Value::Str(_) | Value::Tuple(_), "cmp") => {
+                let other = self.eval_expr(&args[0])?;
+                Value::Int(match compare_values(&recv, &other) {
+                    std::cmp::Ordering::Less => -1,
+                    std::cmp::Ordering::Equal => 0,
+                    std::cmp::Ordering::Greater => 1,
+                })
+            }
             (Value::Int(i), "as_f64") => Value::Float(*i as f64),
             (Value::Int(i), "abs") => Value::Int(i.abs()),
             (Value::Int(i), "to_str") => Value::str(i.to_string()),
