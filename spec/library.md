@@ -217,7 +217,7 @@ them:
 | `xs.remove(i)` | `(i64) -> T` | mutates; panics out of range, like indexing ([L-LIB-REMOVE]) |
 | `xs.sort()` | | mutates; ascending. Only `i64`, `f64` and `str` are ordered — sorting anything else is a compile error, the same one `<` gives |
 | `xs.rev()` | `-> [T]` | |
-| `xs.slice(a, b)` | `(i64, i64) -> [T]` | `a` up to but excluding `b` |
+| `xs.slice(a, b)` | `(i64, i64) -> [T]` | `a` up to but excluding `b`; clamps past either end rather than panicking, like `substr` |
 | `xs.contains(v)` | `(T) -> bool` | |
 | `xs.join(sep)` | `(str) -> str` | `[str]` only — map to `str` first |
 | `xs.sum()` | `-> T` | numeric elements; `0` of the element type when empty ([L-LIB-SUM]) |

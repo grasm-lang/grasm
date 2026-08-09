@@ -161,7 +161,7 @@ type       = named_type | list_type | tuple_type | union_type | fn_type
 nested     = type ( "!" type )?
 fn_type    = "fn" "(" ( nested ( "," nested )* )? ")" ( "->" nested )? effect_row?
 effect_row = "/" "{" ( path ( "," path )* )? "}"
-named_type = path type_args?
+named_type = identifier type_args?
 type_args  = "[" nested ( "," nested )* "]"
 list_type  = "[" nested "]"
 tuple_type = "(" ( nested ( "," nested )* )? ")"
@@ -183,6 +183,11 @@ Writing the type is also how a fallible value is *held*. `let r = risky()` is
 an error, because forgetting `try` is the far more common reading of it; the
 annotation `let r: i64 ! E = risky()` says the failure is meant to be kept,
 and the error names that spelling.
+
+**[G-TYPE-NOT-QUALIFIED]** A type is named by a bare identifier, never
+`module.Type`. Types share one global namespace ([T-MODULE-NS]), so the
+qualifier would carry no information — and the grammar used to allow one,
+which meant the only way to find out was the error.
 
 **[G-TYPE-UNIT]** `()` is the unit type.
 
@@ -1123,7 +1128,7 @@ them:
 | `xs.remove(i)` | `(i64) -> T` | mutates; panics out of range, like indexing ([L-LIB-REMOVE]) |
 | `xs.sort()` | | mutates; ascending. Only `i64`, `f64` and `str` are ordered — sorting anything else is a compile error, the same one `<` gives |
 | `xs.rev()` | `-> [T]` | |
-| `xs.slice(a, b)` | `(i64, i64) -> [T]` | `a` up to but excluding `b` |
+| `xs.slice(a, b)` | `(i64, i64) -> [T]` | `a` up to but excluding `b`; clamps past either end rather than panicking, like `substr` |
 | `xs.contains(v)` | `(T) -> bool` | |
 | `xs.join(sep)` | `(str) -> str` | `[str]` only — map to `str` first |
 | `xs.sum()` | `-> T` | numeric elements; `0` of the element type when empty ([L-LIB-SUM]) |
@@ -3297,6 +3302,26 @@ fn main() {
             Err(e) -> print("err {e.m}")
         }
     }
+}
+```
+
+## `G-TYPE-NOT-QUALIFIED.gr`
+
+```grasm
+//! tag: G-TYPE-NOT-QUALIFIED
+//! expect: error
+//! a type is named without a module qualifier
+// Types share one global namespace ([T-MODULE-NS]), so a module qualifier on
+// a type name would carry no information. The grammar used to permit one,
+// which meant the only way to find out was the error.
+type Thing = { n: i64 }
+
+fn f(t: main.Thing) -> i64 {
+    t.n
+}
+
+fn main() {
+    print("{f(Thing{ n: 1 })}")
 }
 ```
 

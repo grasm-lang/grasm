@@ -1,0 +1,15 @@
+//! tag: G-TYPE-NOT-QUALIFIED
+//! expect: error
+//! a type is named without a module qualifier
+// Types share one global namespace ([T-MODULE-NS]), so a module qualifier on
+// a type name would carry no information. The grammar used to permit one,
+// which meant the only way to find out was the error.
+type Thing = { n: i64 }
+
+fn f(t: main.Thing) -> i64 {
+    t.n
+}
+
+fn main() {
+    print("{f(Thing{ n: 1 })}")
+}

@@ -497,7 +497,7 @@ fn entry(name: &str, checksum: &str, caps: &[&str]) -> grasm_pkg::LockEntry {
         name: name.to_string(),
         version: "0.1.0".to_string(),
         checksum: checksum.to_string(),
-        capabilities: caps.iter().map(|c| c.to_string()).collect(),
+        capabilities: Some(caps.iter().map(|c| c.to_string()).collect()),
     }
 }
 
@@ -549,7 +549,7 @@ fn a_changed_capability_ceiling_is_reported_separately() {
         matches!(
             &changes[0],
             grasm_pkg::LockChange::CapabilitiesChanged { name, now, .. }
-                if name == "alpha" && now == &vec!["io".to_string()]
+                if name == "alpha" && now.as_deref() == Some(["io".to_string()].as_slice())
         ),
         "{changes:?}"
     );

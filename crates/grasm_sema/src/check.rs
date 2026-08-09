@@ -455,7 +455,19 @@ impl Checker {
             }
             TypeExpr::Name { path, args, span } => {
                 if path.segments.len() > 1 {
-                    return self.error(*span, "qualified type paths are not supported yet");
+                    // Not "yet" — never. Types share one global namespace
+                    // ([T-MODULE-NS]), so the qualifier says nothing the bare
+                    // name does not ([G-TYPE-NOT-QUALIFIED]).
+                    let bare = path
+                        .segments
+                        .last()
+                        .map(|s| s.name.clone())
+                        .unwrap_or_default();
+                    return self.error_help(
+                        *span,
+                        "a type is named without a module qualifier".to_string(),
+                        format!("types share one namespace across the program — write `{bare}`"),
+                    );
                 }
                 let name = &path.segments[0].name;
                 if let Some(i) = generics.iter().position(|g| g == name) {
@@ -1199,6 +1211,20 @@ that does not change",
             Expr::Field { recv, name, span } => self.infer_field(recv, name, *span),
             Expr::Index { recv, index, span } => {
                 let recv_ty = self.infer_expr(recv);
+                // What may be indexed is decided before the index is checked
+                // against `i64`. Otherwise `m["a"]` on a `Map[str, i64]`
+                // reported `expected i64, found str` *first* — naming the key
+                // type as the mistake — and only then said maps are not
+                // indexable at all.
+                if let Type::Map(k, v) = self.uni.shallow_resolve(&recv_ty) {
+                    let kt = self.show(&k);
+                    let vt = self.show(&v);
+                    return self.error_help(
+                        *span,
+                        format!("cannot index into `Map[{kt}, {vt}]`"),
+                        "a map is read with `m.get(k)`, which answers `Option` because the key may be absent",
+                    );
+                }
                 self.check_expr(index, &Type::I64);
                 match self.uni.shallow_resolve(&recv_ty) {
                     Type::List(inner) => *inner,

@@ -349,7 +349,7 @@ pub fn render_markdown(title: &str, modules: &[ModuleDocs]) -> String {
             out.push_str("\n```\n");
             if let Some(doc) = &item.doc {
                 out.push('\n');
-                out.push_str(doc);
+                out.push_str(&without_hidden_lines(doc));
                 out.push('\n');
             }
         }
@@ -360,6 +360,30 @@ pub fn render_markdown(title: &str, modules: &[ModuleDocs]) -> String {
 // ---------------------------------------------------------------------------
 // Executable examples
 // ---------------------------------------------------------------------------
+
+/// A doc comment with its hidden setup lines removed.
+///
+/// `# ` inside a fenced block is setup: it runs, and it is not part of what a
+/// reader sees. The example *runner* already stripped it; the renderer did
+/// not, so every hidden line appeared verbatim in the published API docs —
+/// the one place the feature exists to keep them out of.
+fn without_hidden_lines(doc: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let mut in_block = false;
+    for line in doc.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            in_block = !in_block;
+            out.push(line);
+            continue;
+        }
+        if in_block && trimmed.starts_with("# ") {
+            continue;
+        }
+        out.push(line);
+    }
+    out.join("\n")
+}
 
 /// Extracts fenced code blocks from doc comments.
 ///
