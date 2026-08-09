@@ -12,6 +12,12 @@ use crate::types::*;
 pub struct Analysis {
     pub defs: TypeDefs,
     pub diagnostics: Vec<Diagnostic>,
+    /// `module::NAME` -> rendered type, for every exported constant.
+    ///
+    /// A constant's type is inferred, so it is not in the source for a tool to
+    /// read — and without it `pub let WIDTH = 42` becoming `= "x"` looked like
+    /// no change at all to `grasm api`.
+    pub const_types: std::collections::BTreeMap<String, String>,
 }
 
 pub fn check(module: &Module) -> Analysis {
@@ -84,6 +90,12 @@ fn check_modules(files: &[ModuleView]) -> Analysis {
     let mut diagnostics = c.diags;
     diagnostics.extend(crate::effects::check_effects_multi(files));
     Analysis {
+        const_types: c
+            .consts
+            .iter()
+            .filter(|(_, (_, is_pub))| *is_pub)
+            .map(|(k, (t, _))| (k.clone(), TypeDisplay { ty: t, defs: &c.defs }.to_string()))
+            .collect(),
         defs: c.defs,
         diagnostics,
     }
@@ -1922,6 +1934,31 @@ that does not change",
                         span,
                         format!("type `{}` has no variant `{}`", tid.name, name.name),
                     );
+                }
+            }
+        }
+        // `lib.WIDTH` — an exported constant. `pub let` parsed, checked and
+        // did nothing: no other module could read one, `doc` omitted it and
+        // `api` omitted it, so it was syntax with no meaning.
+        if let Expr::Ident(tid) = recv {
+            if self.lookup(&tid.name).is_none() {
+                let target = self
+                    .module_imports
+                    .get(&self.current_module)
+                    .and_then(|m| m.get(&tid.name))
+                    .cloned();
+                if let Some(target_mod) = target {
+                    let qual = format!("{target_mod}::{}", name.name);
+                    if let Some((ty, is_pub)) = self.consts.get(&qual).cloned() {
+                        if is_pub {
+                            return ty;
+                        }
+                        return self.error_help(
+                            name.span,
+                            format!("constant `{}` in module `{target_mod}` is private", name.name),
+                            "mark it `pub let` to allow cross-module use",
+                        );
+                    }
                 }
             }
         }

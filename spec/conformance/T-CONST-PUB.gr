@@ -1,0 +1,18 @@
+//! tag: T-CONST-PUB
+//! expect: output
+//! 42 84
+// `pub let` exports a constant. A bare `let` keeps it to its own module.
+//
+// `pub` on a constant used to parse, check, and do nothing at all: no other
+// module could read one, `doc` omitted it and `api` omitted it. Syntax with no
+// meaning is worse than an error, because it looks like it worked.
+pub let WIDTH = 42
+let SCALE = 2
+
+pub fn scaled() -> i64 {
+    WIDTH * SCALE
+}
+
+fn main() {
+    print("{WIDTH} {scaled()}")
+}

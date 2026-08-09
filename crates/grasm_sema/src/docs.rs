@@ -154,7 +154,7 @@ fn param_text(p: &Param) -> String {
     format!("{mode}{}: {}", p.name.name, type_text(&p.ty))
 }
 
-fn type_signature(t: &TypeDecl) -> String {
+pub fn type_signature(t: &TypeDecl) -> String {
     let mut s = String::new();
     if t.is_pub {
         s.push_str("pub ");
@@ -214,7 +214,7 @@ fn type_signature(t: &TypeDecl) -> String {
     s
 }
 
-fn effect_signature(e: &EffectDecl) -> String {
+pub fn effect_signature(e: &EffectDecl) -> String {
     let ops: Vec<String> = e.ops.iter().map(fn_sig_text).collect();
     format!("effect {} {{ {} }}", e.name.name, ops.join("; "))
 }

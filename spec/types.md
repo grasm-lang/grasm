@@ -288,6 +288,17 @@ including a function type, a map, and a fallible one — and when a function's
 declared return type resolves to `T ! E`, the function is fallible even though
 its declaration does not spell the `!` out.
 
+**[T-EXTERN-VALUE]** A C function may be named without being called, the way
+any function may. Naming one carries the same `io` a call does: holding a
+reference to it *is* the permission to call it, so a bare mention counts
+against a package's capability ceiling and disqualifies a function from
+`par_map`. Without that rule, `xs.par_map(sqrt)` typechecked and the ceiling
+had a door straight through it.
+
+**[T-CONST-PUB]** `pub let` exports a constant; a bare `let` keeps it to its
+own module, like a function. Reaching a private one through its module is the
+same error a private function gives.
+
 **[T-EXTERN]** `extern fn name(a: i64) -> f64` declares a C function. It has
 no body: a compiled build resolves the symbol at link time, and `grasm run`
 finds it in the interpreter's own process. Parameters and results are `i64`

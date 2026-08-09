@@ -5865,6 +5865,15 @@ impl FnCx<'_, '_> {
                     .cloned();
                 if let Some(target_mod) = target {
                     let key = format!("{target_mod}::{}", name.name);
+                    // An exported constant is inlined here, in the module that
+                    // declared it.
+                    if let Some(c) = self.cg.consts.get(&key).cloned() {
+                        let saved =
+                            std::mem::replace(&mut self.cg.current_module, target_mod.clone());
+                        let out = self.eval_expr(&c.init);
+                        self.cg.current_module = saved;
+                        return out;
+                    }
                     if self.cg.fns.contains_key(&key) {
                         return self.make_named_fn_value(&key, span).map(Some);
                     }
@@ -6359,6 +6368,15 @@ impl FnCx<'_, '_> {
                             .cloned();
                         if let Some(target_mod) = target {
                             let key = format!("{target_mod}::{}", name.name);
+                            if let Some(c) = self.cg.consts.get(&key).cloned() {
+                                let saved = std::mem::replace(
+                                    &mut self.cg.current_module,
+                                    target_mod.clone(),
+                                );
+                                let out = self.probe_type(&c.init);
+                                self.cg.current_module = saved;
+                                return out;
+                            }
                             if let Some(sig) = self.cg.fns.get(&key) {
                                 return Ok(VType::Fn(
                                     sig.params.clone(),

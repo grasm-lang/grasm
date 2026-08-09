@@ -1,0 +1,22 @@
+//! tag: T-EXTERN-VALUE
+//! expect: output
+//! 2.0 3.0
+//! [1.0, 2.0, 3.0]
+// A C function named without being called.
+//
+// The compiled backend made one a function value and the interpreter said
+// `unknown name` — for a program `check` accepted. And naming one carried no
+// effect at all, so `xs.par_map(sqrt)` typechecked: the purity proof, the
+// declared row and a package's capability ceiling all passed something that
+// reaches libc. Holding a C function is the same permission as calling one.
+extern fn sqrt(x: f64) -> f64
+
+fn apply(f: fn(f64) -> f64 / {io}, v: f64) -> f64 / {io} {
+    f(v)
+}
+
+fn main() {
+    let f = sqrt
+    print("{f(4.0)} {apply(sqrt, 9.0)}")
+    print("{[1.0, 4.0, 9.0].map(sqrt)}")
+}

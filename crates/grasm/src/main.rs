@@ -656,14 +656,49 @@ build against a dependency whose reach is unknown",
 /// declaration moved to. One line per item because that makes the comparison
 /// a set operation on names and signatures rather than a parse.
 fn api_surface(program: &Program) -> String {
+    use grasm_syntax::ast::Decl;
+    let const_types = grasm_sema::check::check_program(program).const_types;
     let mut lines: Vec<String> = Vec::new();
-    for m in grasm_sema::docs::collect(program) {
-        for item in m.items {
-            // Tests, benchmarks and imports are not surface.
-            if matches!(item.kind, "test" | "bench" | "import") {
-                continue;
-            }
-            lines.push(format!("{}\t{}\t{}", m.module, item.name, item.signature));
+    for file in &program.files {
+        for decl in &file.module.decls {
+            // Exactly what another package can reach. The documentation
+            // collector was the wrong source: it shows the *entry* module's
+            // private items too, so a renamed private helper read as a
+            // breaking change while dropping `pub` from a real export read as
+            // no change at all — backwards in both directions.
+            let (name, sig) = match decl {
+                Decl::Fn(f) if f.is_pub => (
+                    f.name.name.clone(),
+                    grasm_sema::docs::fn_signature(f),
+                ),
+                Decl::Extern(e) if e.is_pub => (
+                    e.name.name.clone(),
+                    grasm_sema::docs::extern_signature(e),
+                ),
+                Decl::Const(c) if c.is_pub => {
+                    // The inferred type, not just the name: `pub let W = 42`
+                    // becoming `= "x"` is a breaking change and the source
+                    // alone does not show it.
+                    let key = format!("{}::{}", file.name, c.name.name);
+                    let sig = match const_types.get(&key) {
+                        Some(t) => format!("pub let {}: {t}", c.name.name),
+                        None => grasm_sema::docs::const_signature(c),
+                    };
+                    (c.name.name.clone(), sig)
+                }
+                // Types and effects share one namespace across the program
+                // ([T-MODULE-NS]), so every one of them is surface.
+                Decl::Type(t) => (
+                    t.name.name.clone(),
+                    grasm_sema::docs::type_signature(t),
+                ),
+                Decl::Effect(e) => (
+                    e.name.name.clone(),
+                    grasm_sema::docs::effect_signature(e),
+                ),
+                _ => continue,
+            };
+            lines.push(format!("{}\t{}\t{}", file.name, name, sig));
         }
     }
     lines.sort();

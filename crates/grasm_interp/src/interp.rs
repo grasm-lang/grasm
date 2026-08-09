@@ -486,6 +486,9 @@ impl<'a, W: Write> Interp<'a, W> {
                 }
             }
             Value::FnRef(name) => {
+                if let Some(e) = self.externs.get(name.as_str()).copied() {
+                    return self.call_extern_values(e, args);
+                }
                 let Some(f) = self.fns.get(name.as_str()).copied() else {
                     return Err(Flow::Panic(format!("unknown function `{name}`")));
                 };
@@ -1093,6 +1096,12 @@ impl<'a, W: Write> Interp<'a, W> {
             });
         }
         let qual = format!("{}::{}", self.current_module, id.name);
+        // A C function named without being called. The compiled backend makes
+        // one a function value; the interpreter said `unknown name`, so the
+        // two engines disagreed about a program that `check` accepted.
+        if self.externs.contains_key(&qual) {
+            return Ok(Value::FnRef(Rc::new(qual)));
+        }
         // A module-level constant: its initializer is effect-free, so
         // evaluating it here is the whole of what the name means.
         if let Some(c) = self.consts.get(&qual).copied() {
@@ -1111,6 +1120,19 @@ impl<'a, W: Write> Interp<'a, W> {
         e: &grasm_syntax::ast::ExternDecl,
         args: &[Expr],
     ) -> EResult {
+        let mut vals = Vec::with_capacity(args.len());
+        for a in args {
+            vals.push(self.eval_expr(a)?);
+        }
+        self.call_extern_values(e, vals)
+    }
+
+    /// The same, with the arguments already evaluated.
+    fn call_extern_values(
+        &mut self,
+        e: &grasm_syntax::ast::ExternDecl,
+        args: Vec<Value>,
+    ) -> EResult {
         use crate::ffi::{CArg, CKind, CRet};
         let Some(sym) = crate::ffi::find(&e.name.name) else {
             return Err(Flow::Panic(format!(
@@ -1121,7 +1143,7 @@ build links it, `grasm run` can only reach what is already loaded",
         };
         let mut cargs = Vec::with_capacity(args.len());
         for a in args {
-            cargs.push(match self.eval_expr(a)? {
+            cargs.push(match a {
                 Value::Int(i) => CArg::I64(i),
                 Value::Float(f) => CArg::F64(f),
                 other => {
@@ -1331,7 +1353,7 @@ build links it, `grasm run` can only reach what is already loaded",
                 }
             }
         }
-        // `utils.helper` as a value: the function itself.
+        // `utils.helper` as a value, and `lib.WIDTH` — an exported constant.
         if let Expr::Ident(tid) = recv {
             let is_local = self.scopes.iter().rev().any(|s| s.contains_key(&tid.name));
             if !is_local {
@@ -1342,6 +1364,14 @@ build links it, `grasm run` can only reach what is already loaded",
                     .cloned();
                 if let Some(target_mod) = target {
                     let qual = format!("{target_mod}::{}", name.name);
+                    if let Some(c) = self.consts.get(&qual).copied() {
+                        // Evaluated in the module that declared it, so its own
+                        // names mean what they meant there.
+                        let saved = std::mem::replace(&mut self.current_module, target_mod);
+                        let v = self.eval_expr(&c.init);
+                        self.current_module = saved;
+                        return v;
+                    }
                     if self.fns.contains_key(&qual) {
                         return Ok(Value::FnRef(Rc::new(qual)));
                     }

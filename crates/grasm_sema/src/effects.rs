@@ -403,6 +403,15 @@ fn par_fn_row(
     out: &mut BTreeSet<String>,
 ) {
     if let Expr::Ident(id) = func {
+        // `xs.par_map(sqrt)` where `sqrt` is a C function. Naming one is
+        // handing over the right to call it, so it carries the same `io` a
+        // call does — otherwise the row was empty and the purity proof, the
+        // effect row and the capability ceiling all passed something that
+        // reaches libc.
+        if ctx.externs.contains(&format!("{current}::{}", id.name)) {
+            out.insert(IO.to_string());
+            return;
+        }
         if let Some(qual) = ctx.resolve_call(current, &id.name) {
             if let Some(row) = ctx.rows.get(&qual) {
                 out.extend(row.iter().cloned());
@@ -994,7 +1003,16 @@ fn walk_expr(
     out: &mut BTreeSet<String>,
 ) {
     match e {
-        Expr::Int(..) | Expr::Float(..) | Expr::Bool(..) | Expr::Ident(_) => {}
+        Expr::Int(..) | Expr::Float(..) | Expr::Bool(..) => {}
+        // A bare mention of a C function is a reference to it, and holding one
+        // is the same permission as calling it.
+        Expr::Ident(id) => {
+            if ctx.externs.contains(&format!("{current}::{}", id.name))
+                && !active.iter().any(|a| a == IO)
+            {
+                out.insert(IO.to_string());
+            }
+        }
         Expr::Str(pieces, _) => {
             for p in pieces {
                 if let StrPiece::Expr(inner) = p {

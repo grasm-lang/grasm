@@ -609,6 +609,17 @@ including a function type, a map, and a fallible one — and when a function's
 declared return type resolves to `T ! E`, the function is fallible even though
 its declaration does not spell the `!` out.
 
+**[T-EXTERN-VALUE]** A C function may be named without being called, the way
+any function may. Naming one carries the same `io` a call does: holding a
+reference to it *is* the permission to call it, so a bare mention counts
+against a package's capability ceiling and disqualifies a function from
+`par_map`. Without that rule, `xs.par_map(sqrt)` typechecked and the ceiling
+had a door straight through it.
+
+**[T-CONST-PUB]** `pub let` exports a constant; a bare `let` keeps it to its
+own module, like a function. Reaching a private one through its module is the
+same error a private function gives.
+
 **[T-EXTERN]** `extern fn name(a: i64) -> f64` declares a C function. It has
 no body: a compiled build resolves the symbol at link time, and `grasm run`
 finds it in the interpreter's own process. Parameters and results are `i64`
@@ -4621,6 +4632,29 @@ fn main() {
 }
 ```
 
+## `T-CONST-PUB.gr`
+
+```grasm
+//! tag: T-CONST-PUB
+//! expect: output
+//! 42 84
+// `pub let` exports a constant. A bare `let` keeps it to its own module.
+//
+// `pub` on a constant used to parse, check, and do nothing at all: no other
+// module could read one, `doc` omitted it and `api` omitted it. Syntax with no
+// meaning is worse than an error, because it looks like it worked.
+pub let WIDTH = 42
+let SCALE = 2
+
+pub fn scaled() -> i64 {
+    WIDTH * SCALE
+}
+
+fn main() {
+    print("{WIDTH} {scaled()}")
+}
+```
+
 ## `T-COPY.gr`
 
 ```grasm
@@ -4966,6 +5000,33 @@ fn main() {
         Ok(v) -> print("{v}")
         Err(e) -> print("err")
     }
+}
+```
+
+## `T-EXTERN-VALUE.gr`
+
+```grasm
+//! tag: T-EXTERN-VALUE
+//! expect: output
+//! 2.0 3.0
+//! [1.0, 2.0, 3.0]
+// A C function named without being called.
+//
+// The compiled backend made one a function value and the interpreter said
+// `unknown name` — for a program `check` accepted. And naming one carried no
+// effect at all, so `xs.par_map(sqrt)` typechecked: the purity proof, the
+// declared row and a package's capability ceiling all passed something that
+// reaches libc. Holding a C function is the same permission as calling one.
+extern fn sqrt(x: f64) -> f64
+
+fn apply(f: fn(f64) -> f64 / {io}, v: f64) -> f64 / {io} {
+    f(v)
+}
+
+fn main() {
+    let f = sqrt
+    print("{f(4.0)} {apply(sqrt, 9.0)}")
+    print("{[1.0, 4.0, 9.0].map(sqrt)}")
 }
 ```
 

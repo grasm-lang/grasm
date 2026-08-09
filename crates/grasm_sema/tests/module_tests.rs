@@ -308,3 +308,33 @@ fn a_qualified_generic_may_be_piped_and_passed() {
         ),
     ]);
 }
+
+/// `pub let` crosses a module boundary; a bare `let` does not.
+///
+/// `pub` on a constant parsed and checked and did nothing: no other module
+/// could read one, and both `doc` and `api` omitted it. Syntax with no meaning
+/// is worse than an error, because it looks like it worked.
+#[test]
+fn a_pub_constant_is_readable_from_another_module() {
+    ok(&[
+        (
+            "main",
+            "import lib\n\nfn main() {\n    print(\"{lib.WIDTH}\")\n}\n",
+        ),
+        ("lib", "pub let WIDTH = 42\n"),
+    ]);
+}
+
+#[test]
+fn a_private_constant_is_not() {
+    err(
+        &[
+            (
+                "main",
+                "import lib\n\nfn main() {\n    print(\"{lib.HIDDEN}\")\n}\n",
+            ),
+            ("lib", "let HIDDEN = 7\npub fn w() -> i64 {\n    HIDDEN\n}\n"),
+        ],
+        "is private",
+    );
+}

@@ -7,7 +7,7 @@ before it is listed as stable.
 `crates/grasm_spec` fails if a clause here is missing, unknown, or listed twice,
 so this file cannot drift away from the specification it describes.
 
-Today: 94 stable, 56 provisional, 18 experimental, of 168.
+Today: 94 stable, 57 provisional, 19 experimental, of 170.
 
 ## Stable
 
@@ -154,6 +154,7 @@ for "no problem found" to mean anything.
 - `L-LIB-WORDS` — provisional
 - `L-RAW-STRING` — provisional
 - `L-UFCS` — provisional
+- `T-CONST-PUB` — provisional
 - `T-DIVERGE` — provisional
 - `T-EFFECT-DECL` — provisional
 - `T-EFFECT-DISCHARGE` — provisional
@@ -196,5 +197,6 @@ May change or be removed in any release. New surface starts here.
 - `L-LIB-SUM` — experimental
 - `T-EFFECT-BUILTIN` — experimental
 - `T-EXTERN` — experimental
+- `T-EXTERN-VALUE` — experimental
 - `T-PAR-MAP-PURE` — experimental
 - `T-TASK-CAPTURE` — experimental
