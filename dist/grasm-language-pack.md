@@ -922,6 +922,16 @@ would silently unhappen.
 **[E-INOUT-WRITEBACK]** Mutations to an `inout` parameter are visible to the
 caller when the function returns.
 
+**[E-BORROWED-READ]** A read-only method called on a plain variable does not
+change that value's reference count. The variable holds a reference for the
+whole of the call, so the count cannot reach zero during it, and the usual
++1/-1 pair is traffic with no effect.
+
+This is an observable property rather than an optimization detail: it is why
+`xs.len()` in a loop costs one runtime call instead of three, and it is the
+first step of the larger job — proving where a value's last use is, so the
+release can be placed there instead of counted for.
+
 **[E-OWN-RUNTIME]** `own` has no runtime effect beyond an ordinary pass; the
 guarantee it provides is entirely static.
 
@@ -1932,6 +1942,57 @@ bench "doubling" {
 
 fn main() {
     print("{2 * 2}")
+}
+```
+
+## `E-BORROWED-READ.gr`
+
+```grasm
+//! tag: E-BORROWED-READ
+//! expect: output
+//! Hello World|15|[Hello, World]|15
+//! [2, 1, 3] 3 false
+//! [a, b] [1, 2] [(a, 1), (b, 2)] 2
+//! 15 3 2
+//! 2000 40000 1 20
+// A read-only method on a plain variable does not touch the value's
+// refcount: the variable already holds a reference for the whole call, so
+// the usual +1/-1 around it is traffic and nothing else.
+//
+// This program exists to prove the value survives it. Every receiver is read
+// several times and then used again, and the last block builds and keeps two
+// thousand lists while reading them, which is where an early free would show.
+fn main() {
+    let s = "  Hello World  "
+    let xs = [3, 1, 2]
+    var m: Map[str, i64] = {"a": 1, "b": 2}
+    print("{s.trim()}|{s.to_upper().len()}|{s.words()}|{s.chars().len()}")
+    print("{xs.rev()} {xs.len()} {xs.is_empty()}")
+    print("{m.keys()} {m.values()} {m.entries()} {m.len()}")
+    // Still usable after every one of those.
+    print("{s.len()} {xs.len()} {m.len()}")
+
+    var kept: [[i64]] = []
+    var i = 0
+    while i < 2000 {
+        var ys: [i64] = []
+        var j = 0
+        while j < 20 {
+            ys.push(j)
+            j = j + 1
+        }
+        if ys.len() > 0 and not ys.is_empty() {
+            kept.push(ys)
+        }
+        i = i + 1
+    }
+    var total = 0
+    for k in kept {
+        total = total + k.len()
+    }
+    var held: Map[str, [i64]] = {}
+    held.set("a", kept.get(0) ?? [])
+    print("{kept.len()} {total} {held.len()} {(held.get("a") ?? []).len()}")
 }
 ```
 

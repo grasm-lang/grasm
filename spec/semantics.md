@@ -238,6 +238,16 @@ would silently unhappen.
 **[E-INOUT-WRITEBACK]** Mutations to an `inout` parameter are visible to the
 caller when the function returns.
 
+**[E-BORROWED-READ]** A read-only method called on a plain variable does not
+change that value's reference count. The variable holds a reference for the
+whole of the call, so the count cannot reach zero during it, and the usual
++1/-1 pair is traffic with no effect.
+
+This is an observable property rather than an optimization detail: it is why
+`xs.len()` in a loop costs one runtime call instead of three, and it is the
+first step of the larger job — proving where a value's last use is, so the
+release can be placed there instead of counted for.
+
 **[E-OWN-RUNTIME]** `own` has no runtime effect beyond an ordinary pass; the
 guarantee it provides is entirely static.
 

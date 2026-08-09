@@ -4332,6 +4332,17 @@ impl FnCx<'_, '_> {
                 return Ok(Some((v, vt)));
             }
         }
+        // A read-only method on a plain local borrows its receiver: the
+        // variable already holds a reference for the whole call, so the
+        // ordinary +1/-1 pair around it is pure traffic. `xs.len()` in a loop
+        // was three runtime calls where one was needed.
+        //
+        // Only methods that take the receiver, read it, and keep nothing are
+        // eligible — the general path below hands `rv` to things that consume
+        // it, and borrowing there would free it early.
+        if let Some(out) = self.borrowed_read(recv, name, args)? {
+            return Ok(Some(out));
+        }
         let (rv, rt) = self.eval_expr_val(recv)?;
         // list.get(i) -> Option[elem]
         if let (VType::List(elem_t), "get") = (&rt, name.name.as_str()) {
@@ -4394,6 +4405,68 @@ impl FnCx<'_, '_> {
     /// Full builtin-method surface over an owned receiver value. `recv` is the
     /// receiver *expression* (needed for `inout` UFCS calls).
     #[allow(clippy::too_many_arguments)]
+    /// `xs.len()` and friends on a plain local, without touching its
+    /// refcount. `None` means "not one of these", and the caller falls
+    /// through to the owning path.
+    fn borrowed_read(
+        &mut self,
+        recv: &Expr,
+        name: &Ident,
+        args: &[Expr],
+    ) -> CResult<Option<(Value, VType)>> {
+        if !args.is_empty() {
+            return Ok(None);
+        }
+        let Expr::Ident(id) = recv else {
+            return Ok(None);
+        };
+        let Some((var, vt)) = self.lookup(&id.name) else {
+            return Ok(None);
+        };
+        if !vt.boxed() {
+            return Ok(None);
+        }
+        let f = match (&vt, name.name.as_str()) {
+            (VType::List(_), "len") => "grasm_list_len",
+            (VType::List(_), "is_empty") => "grasm_list_is_empty",
+            (VType::Map(_, _), "len") => "grasm_map_len",
+            (VType::Map(_, _), "is_empty") => "grasm_map_is_empty",
+            (VType::Str, "len") => "grasm_str_len",
+            (VType::Str, "is_empty") => "grasm_str_is_empty",
+            // Each of these takes the receiver, reads it, and keeps nothing.
+            (VType::List(_), "rev") => "grasm_list_rev",
+            (VType::Map(_, _), "keys") => "grasm_map_keys",
+            (VType::Map(_, _), "values") => "grasm_map_values",
+            (VType::Map(_, _), "entries") => "grasm_map_entries",
+            (VType::Str, "chars") => "grasm_str_chars",
+            (VType::Str, "lines") => "grasm_str_lines",
+            (VType::Str, "codes") => "grasm_str_codes",
+            (VType::Str, "words") => "grasm_str_words",
+            (VType::Str, "trim") => "grasm_str_trim",
+            (VType::Str, "to_upper") => "grasm_str_upper",
+            (VType::Str, "to_lower") => "grasm_str_lower",
+            _ => return Ok(None),
+        };
+        let borrowed = self.b.use_var(var);
+        let v = self.call_rt(f, &[borrowed]).unwrap();
+        let out_t = match (&vt, name.name.as_str()) {
+            (_, "len") => VType::I64,
+            (_, "is_empty") => VType::Bool,
+            (VType::List(_), "rev") => vt.clone(),
+            (VType::Map(k, _), "keys") => VType::List(k.clone()),
+            (VType::Map(_, v), "values") => VType::List(v.clone()),
+            (VType::Map(k, v), "entries") => VType::List(Box::new(VType::Tuple(vec![
+                (**k).clone(),
+                (**v).clone(),
+            ]))),
+            (VType::Str, "chars" | "lines" | "words") => VType::List(Box::new(VType::Str)),
+            (VType::Str, "codes") => VType::List(Box::new(VType::I64)),
+            (VType::Str, _) => VType::Str,
+            _ => return Ok(None),
+        };
+        Ok(Some((v, out_t)))
+    }
+
     fn dispatch_method(
         &mut self,
         rv: Value,
