@@ -442,10 +442,56 @@ pub struct RtVal {
 }
 
 fn alloc(payload: RtPayload) -> *mut RtVal {
+    LIVE.with(|n| n.set(n.get() + 1));
     Box::into_raw(Box::new(RtVal {
         rc: Cell::new(1),
         payload,
     }))
+}
+
+thread_local! {
+    /// Allocations this thread has made and not yet freed.
+    ///
+    /// A leak is invisible to the differential harness: it compares output,
+    /// and a program that leaks produces exactly the right output. This is
+    /// what makes the difference observable, and it is the prerequisite for
+    /// Tier 1 — a `region` works by *not* decrementing inside the block and
+    /// sweeping at the brace, so a miscount there is a double-free or a leak
+    /// and only one of those announces itself.
+    static LIVE: Cell<i64> = const { Cell::new(0) };
+}
+
+/// Allocations still live on this thread.
+///
+/// Zero at the end of `main` means every allocation was released. It is not
+/// zero *during* a program, and it counts only this thread — a worker's
+/// allocations are its own.
+#[no_mangle]
+pub extern "C" fn grasm_live_allocations() -> i64 {
+    LIVE.with(Cell::get)
+}
+
+/// Reports still-live allocations, if `GRASM_LEAK_CHECK` is set.
+///
+/// Called at the end of `main`. Silent unless asked, because a leak is a
+/// property of the implementation and not something a program's user can act
+/// on — and printing it unasked would put it on the stderr the differential
+/// harness compares. Under the variable it prints a line and exits 7, a code
+/// nothing else here uses.
+#[no_mangle]
+pub extern "C" fn grasm_check_leaks() {
+    if std::env::var_os("GRASM_LEAK_CHECK").is_none() {
+        return;
+    }
+    let live = LIVE.with(Cell::get);
+    if live == 0 {
+        return;
+    }
+    let _ = std::io::stdout().flush();
+    let mut err = std::io::stderr().lock();
+    let _ = writeln!(err, "leak: {live} allocation(s) still live at exit");
+    let _ = err.flush();
+    std::process::exit(7);
 }
 
 /// Refcount marking a value that is shared forever and never freed.
@@ -522,6 +568,7 @@ unsafe fn dec(v: *mut RtVal) {
             if rc.get() != IMMORTAL {
                 rc.set(rc.get() - 1);
                 if rc.get() <= 0 {
+                    LIVE.with(|n| n.set(n.get() - 1));
                     let boxed = Box::from_raw(cur);
                     match &boxed.payload {
                         RtPayload::List(items) | RtPayload::Tuple(items) => {

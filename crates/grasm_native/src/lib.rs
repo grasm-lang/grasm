@@ -561,6 +561,7 @@ impl<'m> Codegen<'m> {
             ("grasm_file_exists", vec![i64t], Some(i8t)),
             ("grasm_set_args", vec![i64t, ptr], None),
             ("grasm_now_millis", vec![], Some(i64t)),
+            ("grasm_check_leaks", vec![], None),
             ("grasm_ref_new", vec![i64t], Some(i64t)),
             ("grasm_ref_get", vec![i64t], Some(i64t)),
             ("grasm_ref_set", vec![i64t, i64t], None),
@@ -1156,6 +1157,12 @@ impl<'m> Codegen<'m> {
             b.ins().trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
             b.switch_to_block(ok_blk);
         }
+        // Leak check, silent unless `GRASM_LEAK_CHECK` is set. A leak
+        // produces exactly the right output, so the differential harness
+        // cannot see one; this is what makes it observable.
+        let leak_id = self.runtime["grasm_check_leaks"];
+        let leak_ref = self.module.declare_func_in_func(leak_id, b.func);
+        b.ins().call(leak_ref, &[]);
         let zero = b.ins().iconst(types::I32, 0);
         b.ins().return_(&[zero]);
         b.seal_all_blocks();
