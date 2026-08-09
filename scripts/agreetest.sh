@@ -171,6 +171,20 @@ fn main() {
     print("{xs.par_map(|x| down(x)).len()}")
 }'
 
+# Recursion that closes its cycle through a function value, not a name. The
+# call graph cannot see it, so the compiled backend left the stack guard off
+# and the program took SIGSEGV — exit 139, empty stderr.
+check panic_indirect_overflow 'type Box = { f: fn(i64) -> i64 }
+
+fn down(n: i64) -> i64 {
+    let b = Box{ f: down }
+    b.f(n + 1)
+}
+
+fn main() {
+    print("{down(0)}")
+}'
+
 check exit_code 'fn main() {
     print("before")
     exit(3)

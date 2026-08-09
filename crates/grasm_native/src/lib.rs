@@ -1922,6 +1922,16 @@ fn recursive_functions(
 ) -> std::collections::HashSet<String> {
     let mut calls: HashMap<String, Vec<String>> = HashMap::new();
     let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Every function name in the program, unqualified — enough to tell a
+    // mention of a function from a mention of a local.
+    let fn_names: std::collections::HashSet<String> = views
+        .iter()
+        .flat_map(|(_, m, _)| m.decls.iter())
+        .filter_map(|d| match d {
+            Decl::Fn(f) => Some(f.name.name.clone()),
+            _ => None,
+        })
+        .collect();
     for (module, m, imports) in views {
         for decl in &m.decls {
             let Decl::Fn(f) = decl else { continue };
@@ -1934,6 +1944,20 @@ fn recursive_functions(
             }
             let mut named = Vec::new();
             collect_named_calls_block(&f.body, &mut named);
+            // A function *value* handed somewhere — `Box{ f: down }`,
+            // `[shout]`, a return — can be called back through later, and that
+            // call is invisible to this graph. Without it, recursion through a
+            // struct field ran off the stack for real: SIGSEGV, exit 139,
+            // empty stderr, which is what [E-RECURSION-DEPTH] rules out.
+            // Naming one is enough to need the check; calling it by name is
+            // the ordinary case the graph already sees.
+            let mut idents = Vec::new();
+            collect_idents_block(&f.body, &mut idents);
+            let called: std::collections::HashSet<&str> =
+                named.iter().map(|(n, _)| n.as_str()).collect();
+            if idents.iter().any(|i| !called.contains(i.as_str()) && fn_names.contains(i)) {
+                out.insert(key.clone());
+            }
             let callees = named
                 .into_iter()
                 .map(|(name, _)| match name.split_once('.') {
@@ -2254,6 +2278,16 @@ fn collect_idents(e: &Expr, out: &mut Vec<String>) {
             }
         }
         Expr::Closure { body, .. } => collect_idents(body, out),
+        // A struct literal's field values were not walked at all, so
+        // `Box{ f: down }` mentioned nothing as far as this could tell.
+        Expr::StructLit { base, fields, .. } => {
+            if let Some(b) = base {
+                collect_idents(b, out);
+            }
+            for (_, v) in fields {
+                collect_idents(v, out);
+            }
+        }
         Expr::Block(b) | Expr::Unsafe(b) => collect_idents_block(b, out),
         Expr::If {
             cond,
