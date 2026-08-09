@@ -536,6 +536,15 @@ A closure passed to such a parameter takes its parameter types from it. A
 closure bound to a name and never called, with no function type to take them
 from, still has nothing to infer from and is an error.
 
+**[T-FIELD-CALL]** A struct field of function type is called through the
+field: `n.run(5)`. Building the value and reading the field back both worked
+from the start and the call did not, so the only spelling that ran was
+`let f = n.run` followed by `f(5)` — which nothing pointed to, while the error
+suggested declaring a free `fn run(Node, ...)`, a different function that would
+not call the field at all. A field shadows nothing: a real method or a UFCS
+free function of the same name still wins, and a non-function field called this
+way is still "no method".
+
 **[T-FN-TYPE-ROW]** A function type carries its effect row explicitly:
 `fn(i64) -> i64 / {io}`. **No row means the empty row**, so `fn(i64) -> i64`
 accepts only functions that perform nothing, and passing one that prints is an
@@ -5611,6 +5620,40 @@ fn main() {
         Ok(v) -> print("ok {v}")
         Err(e) -> print("err {e}")
     }
+}
+```
+
+## `T-FIELD-CALL.gr`
+
+```grasm
+//! tag: T-FIELD-CALL
+//! expect: output
+//! 10 hi bob
+//! 105 BOB
+//! 42 a
+// A struct field holding a function is called through the field.
+//
+// Storing one and reading it back both worked; `n.run(5)` did not. The only
+// spelling that ran was `let f = n.run` and then `f(5)`, which nothing pointed
+// to — the error suggested declaring a free `fn run(Node, ...)`, which is a
+// different function and would not call the field.
+type Node = { name: str, run: fn(i64) -> i64, greet: fn(str) -> str }
+
+fn twice(n: i64) -> i64 {
+    n * 2
+}
+
+fn main() {
+    let n = Node{ name: "a", run: twice, greet: |s| "hi {s}" }
+    print("{n.run(5)} {n.greet("bob")}")
+    // A closure that captured something, stored in a field and called there.
+    let base = 100
+    let m = Node{ name: "b", run: |x| x + base, greet: |s| s.to_upper() }
+    print("{m.run(5)} {m.greet("bob")}")
+    // Reading the field as a value still works, and a plain field is still a
+    // plain field.
+    let f = n.run
+    print("{f(21)} {n.name}")
 }
 ```
 

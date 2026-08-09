@@ -7,7 +7,7 @@ before it is listed as stable.
 `crates/grasm_spec` fails if a clause here is missing, unknown, or listed twice,
 so this file cannot drift away from the specification it describes.
 
-Today: 105 stable, 57 provisional, 19 experimental, of 181.
+Today: 106 stable, 57 provisional, 19 experimental, of 182.
 
 ## Stable
 
@@ -89,6 +89,7 @@ Will not change incompatibly before 2.0.
 - `T-FAIL` — stable
 - `T-FALLIBLE` — stable
 - `T-FALLIBLE-UNHANDLED` — stable
+- `T-FIELD-CALL` — stable
 - `T-INFER-LOCAL` — stable
 - `T-INOUT-EXCLUSIVE` — stable
 - `T-INOUT-MUTABLE` — stable

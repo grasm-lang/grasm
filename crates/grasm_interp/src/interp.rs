@@ -1613,6 +1613,19 @@ build links it, `grasm run` can only reach what is already loaded",
             self.apply_writebacks(&arg_refs)?;
             return Ok(r);
         }
+        // A field holding a function, called through the field. The checker
+        // accepts this, so refusing here would be a well-typed program failing
+        // at run time.
+        if let Value::Struct { fields, .. } = &recv_v {
+            if let Some((_, f)) = fields.iter().find(|(n, _)| *n == name.name) {
+                let callee = f.clone();
+                let mut vs = Vec::with_capacity(args.len());
+                for a in args {
+                    vs.push(self.eval_expr(a)?);
+                }
+                return self.call_value(callee, vs, &name.name);
+            }
+        }
         Err(Flow::Panic(format!(
             "no method `{}` on `{recv_v}`",
             name.name

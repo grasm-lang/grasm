@@ -5135,6 +5135,18 @@ impl FnCx<'_, '_> {
                         Some((results[0], ret))
                     });
                 }
+                // A field holding a function, called through the field. The
+                // checker accepts it, so this backend has to compile it or
+                // the two disagree about what the language is.
+                if let Some((fv, fvt)) = self.eval_field(recv, name, span)? {
+                    if let VType::Fn(param_ts, ret_t) = fvt.clone() {
+                        // `call_fn_value` reads its callee out of a variable,
+                        // so the field's value gets one.
+                        let var = self.new_var(&fvt);
+                        self.b.def_var(var, fv);
+                        return self.call_fn_value(var, &param_ts, &ret_t, args, span);
+                    }
+                }
                 return nope(span, format!("the method `{}`", name.name));
             }
         };

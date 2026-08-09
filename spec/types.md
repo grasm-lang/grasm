@@ -207,6 +207,15 @@ A closure passed to such a parameter takes its parameter types from it. A
 closure bound to a name and never called, with no function type to take them
 from, still has nothing to infer from and is an error.
 
+**[T-FIELD-CALL]** A struct field of function type is called through the
+field: `n.run(5)`. Building the value and reading the field back both worked
+from the start and the call did not, so the only spelling that ran was
+`let f = n.run` followed by `f(5)` — which nothing pointed to, while the error
+suggested declaring a free `fn run(Node, ...)`, a different function that would
+not call the field at all. A field shadows nothing: a real method or a UFCS
+free function of the same name still wins, and a non-function field called this
+way is still "no method".
+
 **[T-FN-TYPE-ROW]** A function type carries its effect row explicitly:
 `fn(i64) -> i64 / {io}`. **No row means the empty row**, so `fn(i64) -> i64`
 accepts only functions that perform nothing, and passing one that prints is an

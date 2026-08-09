@@ -2232,12 +2232,49 @@ that does not change",
             full_args.extend(args.iter().cloned());
             return self.check_fn_call(&name.name, &info, &full_args, span);
         }
+        // A field holding a function, called through the field. Storing one
+        // and building the value both worked, and `n.run(5)` did not: the only
+        // spelling that ran was `let f = n.run` and then `f(5)`, which nothing
+        // pointed to. The help offered instead — declare `fn run(Node, ...)` —
+        // is a different function that would not call the field at all.
+        if self.struct_field_type(&recv_res, &name.name).is_some() {
+            let ft = self.infer_field(recv, name, span);
+            let resolved = self.uni.shallow_resolve(&ft);
+            if let Type::Fn { params, ret } = resolved {
+                if args.len() != params.len() {
+                    return self.error(
+                        span,
+                        format!(
+                            "`{}` expects {} argument(s), got {}",
+                            name.name,
+                            params.len(),
+                            args.len()
+                        ),
+                    );
+                }
+                for (a, p) in args.iter().zip(&params) {
+                    self.check_expr(a, p);
+                }
+                return *ret;
+            }
+        }
         let shown = self.show(&recv_ty);
         self.error_help(
             name.span,
             format!("no method `{}` on `{shown}`", name.name),
             format!("a free function `fn {}({shown}, ...)` would also work here (UFCS)", name.name),
         )
+    }
+
+    /// The declared type of `field` on a struct type, if `t` is one with it.
+    fn struct_field_type(&mut self, t: &Type, field: &str) -> Option<Type> {
+        let Type::Named { id, .. } = self.uni.shallow_resolve(t) else {
+            return None;
+        };
+        let TypeDefKind::Struct { fields } = &self.defs.get(id).kind else {
+            return None;
+        };
+        fields.iter().find(|(n, _)| n == field).map(|(_, t)| t.clone())
     }
 
     /// Built-in methods on list/str/i64/f64. Returns None → not a builtin.
