@@ -22,7 +22,25 @@ pub enum Type {
     /// Struct or sum type instance, e.g. `Option[i64]`.
     Named { id: TypeDefId, args: Vec<Type> },
     /// Closure / function value.
-    Fn { params: Vec<Type>, ret: Box<Type> },
+    /// A function value's type, **including its effect row**.
+    ///
+    /// The row used to live only in the syntax a reader wrote, never in the
+    /// type — so `fn(i64) -> i64` and `fn(i64) -> i64 / {io}` were the same
+    /// type here, and the only thing comparing them was one hand-written check
+    /// on direct call arguments. Every other way of turning a named function
+    /// into a value — a return type, a type alias, a struct field, a list
+    /// element, a map value — dropped the row silently, which let a function
+    /// that prints reach a `/ {}` row, a `par_map`, and a package declaring
+    /// `capabilities = []` ([T-FN-TYPE-ROW]).
+    Fn {
+        params: Vec<Type>,
+        ret: Box<Type>,
+        /// The written effect row. `None` is *unconstrained* — the shape the
+        /// built-in higher-order methods want, since `xs.map(|x| print(x))`
+        /// is fine. `Some(set)` is a row someone wrote down, and `Some({})` is
+        /// the empty row a bare `fn(i64) -> i64` means ([T-FN-TYPE-ROW]).
+        row: Option<std::collections::BTreeSet<String>>,
+    },
     /// `T ! E` — fallible value.
     Fallible(Box<Type>, Box<Type>),
     /// Error union member set, e.g. `(IoError | ParseError)`.
@@ -179,9 +197,10 @@ impl Unifier {
                 id,
                 args: args.iter().map(|a| self.resolve(a)).collect(),
             },
-            Type::Fn { params, ret } => Type::Fn {
+            Type::Fn { params, ret, row } => Type::Fn {
                 params: params.iter().map(|p| self.resolve(p)).collect(),
                 ret: Box::new(self.resolve(&ret)),
+                row,
             },
             Type::Fallible(ok, err) => {
                 Type::Fallible(Box::new(self.resolve(&ok)), Box::new(self.resolve(&err)))
@@ -198,7 +217,7 @@ impl Unifier {
             Type::List(inner) => self.occurs(v, &inner),
             Type::Map(mk, mv) => self.occurs(v, &mk) || self.occurs(v, &mv),
             Type::Named { args, .. } => args.iter().any(|a| self.occurs(v, a)),
-            Type::Fn { params, ret } => {
+            Type::Fn { params, ret, .. } => {
                 params.iter().any(|p| self.occurs(v, p)) || self.occurs(v, &ret)
             }
             Type::Fallible(ok, err) => self.occurs(v, &ok) || self.occurs(v, &err),
@@ -247,10 +266,12 @@ impl Unifier {
                 Type::Fn {
                     params: p1,
                     ret: r1,
+                    ..
                 },
                 Type::Fn {
                     params: p2,
                     ret: r2,
+                    ..
                 },
             ) => {
                 p1.len() == p2.len()
@@ -294,9 +315,10 @@ pub fn substitute_generics(ty: &Type, args: &[Type]) -> Type {
             id: *id,
             args: targs.iter().map(|t| substitute_generics(t, args)).collect(),
         },
-        Type::Fn { params, ret } => Type::Fn {
+        Type::Fn { params, ret, row } => Type::Fn {
             params: params.iter().map(|t| substitute_generics(t, args)).collect(),
             ret: Box::new(substitute_generics(ret, args)),
+            row: row.clone(),
         },
         Type::Fallible(ok, err) => Type::Fallible(
             Box::new(substitute_generics(ok, args)),
@@ -365,7 +387,7 @@ fn write_type(f: &mut fmt::Formatter<'_>, ty: &Type, defs: &TypeDefs) -> fmt::Re
             }
             Ok(())
         }
-        Type::Fn { params, ret } => {
+        Type::Fn { params, ret, .. } => {
             write!(f, "fn(")?;
             for (i, p) in params.iter().enumerate() {
                 if i > 0 {

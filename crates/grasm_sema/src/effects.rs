@@ -206,7 +206,8 @@ pub fn effects_of_program(program: &crate::loader::Program) -> BTreeSet<String> 
     all
 }
 
-pub fn check_effects_multi(files: &[ModuleView]) -> Vec<Diagnostic> {
+/// The shared context both effect passes work from.
+fn build_ctx<'a>(files: &'a [ModuleView<'a>]) -> Ctx<'a> {
     let mut ctx = Ctx {
         fns: HashMap::new(),
         effect_names: HashSet::new(),
@@ -219,8 +220,7 @@ pub fn check_effects_multi(files: &[ModuleView]) -> Vec<Diagnostic> {
         for d in &f.module.decls {
             match d {
                 Decl::Fn(fd) => {
-                    ctx.fns
-                        .insert(format!("{}::{}", f.name, fd.name.name), fd);
+                    ctx.fns.insert(format!("{}::{}", f.name, fd.name.name), fd);
                 }
                 Decl::Effect(e) => {
                     ctx.effect_names.insert(e.name.name.clone());
@@ -232,25 +232,28 @@ pub fn check_effects_multi(files: &[ModuleView]) -> Vec<Diagnostic> {
             }
         }
     }
-    ctx.rows = ctx
-        .fns
-        .keys()
-        .map(|k| (k.clone(), BTreeSet::new()))
-        .collect();
+    ctx.rows = ctx.fns.keys().map(|k| (k.clone(), BTreeSet::new())).collect();
+    ctx
+}
 
-    // Fixpoint.
+/// Runs the row fixpoint to completion.
+fn solve_rows(ctx: &mut Ctx) {
     loop {
         let mut changed = false;
         let keys: Vec<String> = ctx.fns.keys().cloned().collect();
         for key in keys {
             let f = ctx.fns[&key];
-            let current = key.rsplit_once("::").map(|(m, _)| m).unwrap_or("main").to_string();
+            let current = key
+                .rsplit_once("::")
+                .map(|(m, _)| m)
+                .unwrap_or("main")
+                .to_string();
             let mut row = BTreeSet::new();
             let mut active = Vec::new();
             let mut fnb = FnBindings::default();
             seed_params(&f.params, &mut fnb);
-            collect_fn_bindings(&f.body, &ctx, &current, &mut fnb);
-            walk_block(&f.body, &current, &mut active, &ctx, &fnb, &mut row);
+            collect_fn_bindings(&f.body, ctx, &current, &mut fnb);
+            walk_block(&f.body, &current, &mut active, ctx, &fnb, &mut row);
             let entry = ctx.rows.get_mut(&key).unwrap();
             if &row != entry {
                 *entry = row;
@@ -261,6 +264,24 @@ pub fn check_effects_multi(files: &[ModuleView]) -> Vec<Diagnostic> {
             break;
         }
     }
+}
+
+/// Every function's inferred effect row, keyed `module::name`.
+///
+/// The checker needs this *before* it types anything, because a function's row
+/// is part of its type: `fn(i64) -> i64` and `fn(i64) -> i64 / {io}` are
+/// different types, and without the rows there is nothing to compare
+/// ([T-FN-TYPE-ROW]). It is the same fixpoint `check_effects_multi` runs, with
+/// no diagnostics — those stay in one place, reported once.
+pub fn rows_of_modules(files: &[ModuleView]) -> HashMap<String, BTreeSet<String>> {
+    let mut ctx = build_ctx(files);
+    solve_rows(&mut ctx);
+    ctx.rows
+}
+
+pub fn check_effects_multi(files: &[ModuleView]) -> Vec<Diagnostic> {
+    let mut ctx = build_ctx(files);
+    solve_rows(&mut ctx);
 
     let mut diags = Vec::new();
 

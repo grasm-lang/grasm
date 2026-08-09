@@ -237,6 +237,22 @@ not call the field at all. A field shadows nothing: a real method or a UFCS
 free function of the same name still wins, and a non-function field called this
 way is still "no method".
 
+**[T-FN-TYPE-ROW-CARRIED]** The row is part of the **type**, so it is checked
+wherever a function value meets a written type — a parameter, a return type, a
+`let` annotation, a struct field, a list element, a map value, a tuple member,
+a generic argument — and structurally, because a function reaches its
+destination inside things. It is a *subset* rule: a function that performs
+nothing fits `fn(..) / {io}`, and one that prints does not fit `fn(..)`.
+
+This needed saying because it was not true. The row lived only in the syntax
+someone wrote and never in the type, so `fn(i64) -> i64` and
+`fn(i64) -> i64 / {io}` were the same type here and nothing could compare them;
+one hand-written check covered direct call arguments and nothing else. Every
+other route dropped the row, which made each of them a way to hand a printing
+function to a `/ {}` row, to `par_map` past [T-PAR-MAP-PURE], to the
+missing-handler backstop [E-HANDLER-MISSING] says well-typed programs never
+reach, and to a package declaring `capabilities = []`.
+
 **[T-FN-TYPE-ROW]** A function type carries its effect row explicitly:
 `fn(i64) -> i64 / {io}`. **No row means the empty row**, so `fn(i64) -> i64`
 accepts only functions that perform nothing, and passing one that prints is an

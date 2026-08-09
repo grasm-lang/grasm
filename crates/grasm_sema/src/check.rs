@@ -67,6 +67,9 @@ pub fn check_program(program: &crate::loader::Program) -> Analysis {
 
 fn check_modules(files: &[ModuleView]) -> Analysis {
     let mut c = Checker::new();
+    // The effect fixpoint runs first: a function's row is part of its type,
+    // and nothing can be typed until the rows are known ([T-FN-TYPE-ROW]).
+    c.fn_rows = crate::effects::rows_of_modules(files);
     for f in files {
         c.module_imports
             .insert(f.name.clone(), f.imports.clone());
@@ -149,6 +152,10 @@ struct Checker {
     defs: TypeDefs,
     aliases: HashMap<String, Type>,
     fns: HashMap<String, FnInfo>,
+    /// Every function's inferred effect row, from the effects fixpoint run
+    /// before checking. A function's row is part of its type, so this has to
+    /// be known before anything is typed.
+    fn_rows: HashMap<String, std::collections::BTreeSet<String>>,
     /// How many `unsafe` blocks enclose the expression being checked.
     unsafe_depth: u32,
     /// Qualified names of declared C functions, so a use of one can be
@@ -227,6 +234,7 @@ impl Checker {
             defs,
             aliases: HashMap::new(),
             fns: HashMap::new(),
+            fn_rows: HashMap::new(),
             unsafe_depth: 0,
             extern_names: std::collections::HashSet::new(),
             float_literals: std::collections::HashSet::new(),
@@ -445,6 +453,7 @@ impl Checker {
                         Type::Fn {
                             params: params.clone(),
                             ret: Box::new(ret.clone()),
+                            row: None,
                         },
                     ));
                     ops.push(EffectOp {
@@ -605,11 +614,15 @@ impl Checker {
     /// TypeExpr → Type. `generics` are the in-scope generic parameter names.
     fn resolve_type(&mut self, te: &TypeExpr, generics: &[String]) -> Type {
         match te {
-            TypeExpr::Fn { params, ret, .. } => {
+            TypeExpr::Fn { params, ret, effects, .. } => {
                 let ps = params.iter().map(|p| self.resolve_type(p, generics)).collect();
+                // The row is part of the type, not decoration on the syntax.
+                // A bare `fn(i64) -> i64` is the *empty* row, which is what
+                // makes it reject a function that prints ([T-FN-TYPE-ROW]).
                 Type::Fn {
                     params: ps,
                     ret: Box::new(self.resolve_type(ret, generics)),
+                    row: Some(effects.iter().map(|e| e.dotted()).collect()),
                 }
             }
             TypeExpr::Name { path, args, span } => {
@@ -820,6 +833,12 @@ impl Checker {
         let fits_whole = whole
             .as_ref()
             .is_some_and(|w| self.uni.unify(&body_ty, w));
+        // The row check has to run here too: a function body's value is
+        // compared with `unify`, not `check_expr`, so returning a named
+        // function was the one coercion nothing looked at.
+        if !ends_with_return {
+            self.check_row_fits(&body_ty, &ret, f.body.span);
+        }
         if ret != Type::Unit && !ends_with_return && !fits_whole && !self.uni.unify(&body_ty, &ret) {
             let span = f
                 .body
@@ -1167,6 +1186,94 @@ impl Checker {
             .cloned()
     }
 
+    /// A named function's inferred effect row, if it has one.
+    fn row_of_fn(&self, name: &str) -> Option<std::collections::BTreeSet<String>> {
+        self.fn_rows
+            .get(&format!("{}::{}", self.current_module, name))
+            .cloned()
+    }
+
+    /// A function value's row must fit the row of the type it is going into.
+    ///
+    /// This is a *subset* rule, not equality: a function that performs nothing
+    /// fits `fn(..) / {io}`, and one that prints does not fit `fn(..)`. It runs
+    /// wherever a value meets a written type — a parameter, a return, a `let`
+    /// annotation, a struct field, a list element, a map value — because the
+    /// row is part of the type. It used to run only for a parameter written
+    /// inline as `fn(...)`, and every other route dropped the row: through a
+    /// return type, through a `type Stage = fn(..)` alias, through a struct
+    /// field, through a `[fn(..)]`. Each of those was a way to hand a printing
+    /// function to a `/ {}` row, to `par_map`, and to a package declaring
+    /// `capabilities = []`.
+    fn check_row_fits(&mut self, got: &Type, want: &Type, span: Span) {
+        let (g, w) = (self.uni.resolve(got), self.uni.resolve(want));
+        // Structural, because a function value reaches its destination inside
+        // things: `[fn(..)]`, `Map[str, fn(..)]`, `(fn(..), str)`,
+        // `Option[fn(..)]`, a generic argument. Checking only the outermost
+        // type left every one of those as a way through.
+        match (&g, &w) {
+            (Type::List(a), Type::List(b)) => return self.check_row_fits(a, b, span),
+            (Type::Map(ak, av), Type::Map(bk, bv)) => {
+                self.check_row_fits(ak, bk, span);
+                return self.check_row_fits(av, bv, span);
+            }
+            (Type::Tuple(a), Type::Tuple(b)) if a.len() == b.len() => {
+                for (x, y) in a.iter().zip(b) {
+                    self.check_row_fits(x, y, span);
+                }
+                return;
+            }
+            (Type::Fallible(ao, ae), Type::Fallible(bo, be)) => {
+                self.check_row_fits(ao, bo, span);
+                return self.check_row_fits(ae, be, span);
+            }
+            (Type::Named { id: i1, args: a }, Type::Named { id: i2, args: b })
+                if i1 == i2 && a.len() == b.len() =>
+            {
+                for (x, y) in a.iter().zip(b) {
+                    self.check_row_fits(x, y, span);
+                }
+                return;
+            }
+            (Type::Fn { ret: ar, .. }, Type::Fn { ret: br, .. }) => {
+                // A function's result may itself be a function.
+                self.check_row_fits(ar, br, span);
+            }
+            _ => {}
+        }
+        let (Type::Fn { row: Some(have), .. }, Type::Fn { row: Some(allowed), .. }) = (&g, &w)
+        else {
+            return;
+        };
+        let over: Vec<&String> = have.difference(allowed).collect();
+        if over.is_empty() {
+            return;
+        }
+        let list = over
+            .iter()
+            .map(|e| format!("`{e}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let shown = if allowed.is_empty() {
+            "performs nothing".to_string()
+        } else {
+            format!(
+                "performs only {}",
+                allowed
+                    .iter()
+                    .map(|e| format!("`{e}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        self.error_help(
+            span,
+            format!("this expects a function that {shown}, but this one performs {list}"),
+            "widen the written row — `fn(..) -> .. / {io}` — or use a function that does not \
+perform it",
+        );
+    }
+
     /// Tier 3: a declared C function may only be reached inside `unsafe`.
     ///
     /// Calling one and merely naming one are the same permission — holding the
@@ -1297,6 +1404,7 @@ that does not change",
             return;
         }
         let got = self.infer_expr(e);
+        self.check_row_fits(&got, &want, e.span());
         self.unify_or_report(e.span(), &got, &want);
     }
 
@@ -1555,6 +1663,10 @@ that does not change",
                 Some(e) => Type::Fallible(Box::new(ret.clone()), Box::new(e.clone())),
                 None => ret.clone(),
             };
+            // The function's *own* row travels with it. Without this a
+            // named function became a row-less value the moment it stopped
+            // being called directly, and could then be stored anywhere.
+            let own_row = self.row_of_fn(&id.name);
             if info.generics > 0 {
                 let fresh: Vec<Type> = (0..info.generics).map(|_| self.uni.fresh()).collect();
                 let ret = ret_of(&info.ret, &info.err);
@@ -1565,11 +1677,13 @@ that does not change",
                         .map(|p| substitute_generics(p, &fresh))
                         .collect(),
                     ret: Box::new(substitute_generics(&ret, &fresh)),
+                    row: own_row,
                 };
             }
             return Type::Fn {
                 params: info.params.clone(),
                 ret: Box::new(ret_of(&info.ret, &info.err)),
+                row: own_row,
             };
         }
         self.error_help(
@@ -1886,7 +2000,7 @@ that does not change",
         // name and lands in infer_method_call, not here. General case:
         let callee_ty = self.infer_expr(callee);
         match self.uni.shallow_resolve(&callee_ty) {
-            Type::Fn { params, ret } => {
+            Type::Fn { params, ret, .. } => {
                 if args.len() != params.len() {
                     return self.error(
                         span,
@@ -2098,6 +2212,7 @@ that does not change",
                                     .map(|p| substitute_generics(p, &fresh))
                                     .collect(),
                                 ret: Box::new(substitute_generics(&ret, &fresh)),
+                                row: None,
                             };
                         }
                         Some(_) => {
@@ -2297,7 +2412,7 @@ that does not change",
         if self.struct_field_type(&recv_res, &name.name).is_some() {
             let ft = self.infer_field(recv, name, span);
             let resolved = self.uni.shallow_resolve(&ft);
-            if let Type::Fn { params, ret } = resolved {
+            if let Type::Fn { params, ret, .. } = resolved {
                 if args.len() != params.len() {
                     return self.error(
                         span,
@@ -2391,6 +2506,7 @@ that does not change",
                             let f = Type::Fn {
                                 params: vec![elem.clone()],
                                 ret: Box::new(out.clone()),
+                                row: None,
                             };
                             self.check_expr(&args[0], &f);
                         }
@@ -2407,6 +2523,7 @@ that does not change",
                             let f = Type::Fn {
                                 params: vec![acc.clone(), elem.clone()],
                                 ret: Box::new(acc.clone()),
+                                row: None,
                             };
                             self.check_expr(&args[1], &f);
                         }
@@ -2422,6 +2539,7 @@ that does not change",
                             let f = Type::Fn {
                                 params: vec![elem.clone()],
                                 ret: Box::new(out.clone()),
+                                row: None,
                             };
                             self.check_expr(&args[0], &f);
                         }
@@ -2435,6 +2553,7 @@ that does not change",
                             let f = Type::Fn {
                                 params: vec![elem.clone()],
                                 ret: Box::new(Type::Bool),
+                                row: None,
                             };
                             self.check_expr(&args[0], &f);
                         }
@@ -2445,6 +2564,7 @@ that does not change",
                             let f = Type::Fn {
                                 params: vec![elem.clone()],
                                 ret: Box::new(Type::Bool),
+                                row: None,
                             };
                             self.check_expr(&args[0], &f);
                         }
@@ -2455,6 +2575,7 @@ that does not change",
                             let f = Type::Fn {
                                 params: vec![elem.clone()],
                                 ret: Box::new(Type::Bool),
+                                row: None,
                             };
                             self.check_expr(&args[0], &f);
                         }
@@ -2579,6 +2700,7 @@ that does not change",
                             let f = Type::Fn {
                                 params: vec![elem.clone()],
                                 ret: Box::new(key.clone()),
+                                row: None,
                             };
                             self.check_expr(&args[0], &f);
                             // No default here: the key function may be a
@@ -3464,14 +3586,12 @@ that does not change",
         };
         let param_tys: Vec<Type> = match expected {
             Some(Type::Fn {
-                params: want_params,
-                ..
+                params: want_params, ..
             }) if want_params.len() == params.len() => want_params.clone(),
             _ => params.iter().map(|_| self.uni.fresh()).collect(),
         };
         if let Some(Type::Fn {
-            params: want_params,
-            ..
+            params: want_params, ..
         }) = expected
         {
             if want_params.len() != params.len() {
@@ -3499,6 +3619,7 @@ that does not change",
                 return Type::Fn {
                     params: param_tys,
                     ret: Box::new(ret),
+                    row: None,
                 };
             }
         }
@@ -3538,6 +3659,7 @@ that does not change",
         Type::Fn {
             params: param_tys,
             ret: Box::new(ret),
+            row: None,
         }
     }
 }
