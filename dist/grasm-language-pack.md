@@ -1273,7 +1273,7 @@ the wrap is the same one `/` and `%` take ([E-ARITH-INT]).
 | `n.min(m)`, `n.max(m)` | `(T) -> T` | |
 | `x.floor()`, `x.ceil()`, `x.round()` | `f64 -> f64` | |
 | `x.sqrt()` | `f64 -> f64` | |
-| `n.to_str()` | `-> str` | |
+| `n.to_str()` | `-> str` | the same text `print` gives, [L-DISPLAY] included ([L-LIB-TO-STR]) |
 | `n.as_f64()` | `i64 -> f64` | widening |
 | `x.as_i64()` | `f64 -> i64` | truncates toward zero, saturating ([L-LIB-AS-I64]) |
 
@@ -1305,6 +1305,14 @@ cosine put a trigonometry helper over the ceiling of any package declaring
 `pi` and `e` are the only two builtins that yield to a function you declare
 yourself: a program with its own `fn e()` keeps it. `e` is a common enough
 identifier that taking it outright would break working programs.
+
+**[L-LIB-TO-STR]** `to_str` produces exactly what `print` would. In
+particular an `f64` keeps its point at every magnitude: `(1.0).to_str()` is
+`"1.0"`. The interpreter used to hand the job to its host language, which drops
+the point on a whole value, so it answered `"1"` where the compiled backend
+answered `"1.0"` — and the documented idiom `xs.map(|v| v.to_str()).join(", ")`
+printed a `[f64]` as a list of integers, which is the one thing [L-DISPLAY]
+exists to prevent.
 
 **[L-LIB-AS-I64]** `as_i64` is total: it has an answer for every `f64`, so it
 never panics and never returns `Option`. A value too large for `i64` gives
@@ -4891,6 +4899,32 @@ fn main() {
     print("{empty.sum()} {total(empty).to_fixed(4)}")
     // And an emptied one, where the element type comes from the source list.
     print("{fs.filter(|x| x > 99.0).sum()}")
+}
+```
+
+## `L-LIB-TO-STR.gr`
+
+```grasm
+//! tag: L-LIB-TO-STR
+//! expect: output
+//! 1.0-2.5-0.0-1000000000000000.0
+//! 0.0 3.0 0.0
+//! 7 -12
+// `to_str` gives exactly what `print` gives.
+//
+// The interpreter handed the job to its host language, which drops the point
+// on a whole float. So `(1.0).to_str()` was `"1"` under `grasm run` and `"1.0"`
+// compiled, and the documented idiom below printed a `[f64]` as a list of
+// integers — the one thing [L-DISPLAY] exists to prevent, in the engine this
+// specification calls normative.
+fn main() {
+    let xs: [f64] = [1.0, 2.5, 0.0, 1.0e15]
+    print("{xs.map(|v| v.to_str()).join("-")}")
+    // Through a conversion, and through a sum with nothing to add.
+    let empty: [f64] = []
+    print("{(0 - 0.0).to_str()} {(3).as_f64().to_str()} {empty.sum().to_str()}")
+    // An integer is still an integer.
+    print("{(7).to_str()} {(0 - 12).to_str()}")
 }
 ```
 

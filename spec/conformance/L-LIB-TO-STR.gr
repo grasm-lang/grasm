@@ -1,0 +1,21 @@
+//! tag: L-LIB-TO-STR
+//! expect: output
+//! 1.0-2.5-0.0-1000000000000000.0
+//! 0.0 3.0 0.0
+//! 7 -12
+// `to_str` gives exactly what `print` gives.
+//
+// The interpreter handed the job to its host language, which drops the point
+// on a whole float. So `(1.0).to_str()` was `"1"` under `grasm run` and `"1.0"`
+// compiled, and the documented idiom below printed a `[f64]` as a list of
+// integers — the one thing [L-DISPLAY] exists to prevent, in the engine this
+// specification calls normative.
+fn main() {
+    let xs: [f64] = [1.0, 2.5, 0.0, 1.0e15]
+    print("{xs.map(|v| v.to_str()).join("-")}")
+    // Through a conversion, and through a sum with nothing to add.
+    let empty: [f64] = []
+    print("{(0 - 0.0).to_str()} {(3).as_f64().to_str()} {empty.sum().to_str()}")
+    // An integer is still an integer.
+    print("{(7).to_str()} {(0 - 12).to_str()}")
+}

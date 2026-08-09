@@ -2174,7 +2174,14 @@ build links it, `grasm run` can only reach what is already loaded",
             (Value::Float(x), "floor") => Value::Float(x.floor()),
             (Value::Float(x), "ceil") => Value::Float(x.ceil()),
             (Value::Float(x), "round") => Value::Float(x.round()),
-            (Value::Float(x), "to_str") => Value::str(x.to_string()),
+            // The same text `print` produces, not Rust's. `f64::to_string`
+            // drops the point on a whole value — `(1.0).to_str()` was `"1"` —
+            // so the interpreter disagreed with the compiled backend and, more
+            // to the point, broke [L-DISPLAY]'s reason for existing: a float
+            // has a point at every magnitude so it stays distinguishable from
+            // an integer. The documented idiom `xs.map(|v| v.to_str())`
+            // printed a `[f64]` as integers.
+            (Value::Float(x), "to_str") => Value::str(crate::value::float_text(*x)),
             (Value::Float(x), "min") => {
                 let o = self.eval_expr(&args[0])?;
                 match o {
