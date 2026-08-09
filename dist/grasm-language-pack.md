@@ -544,6 +544,19 @@ Tasks run *after* the block finishes, so a binding declared inside it — a loop
 variable included — no longer exists by then. This is a compile error rather
 than a runtime failure.
 
+One consequence is worth stating outright, because it is the first thing
+somebody tries: **`for x in xs { spawn { … x … } }` is not writable.** The
+number of tasks a `parallel` block starts is fixed where it is written, and
+each task's body reads the enclosing scope as it stands when the tasks run —
+not as it stood when that `spawn` was reached.
+
+That is a division of labour, not an omission. Work *per element of a list* is
+`par_map` / `par_filter`, which is where a runtime-sized amount of parallelism
+belongs and which enforces purity so the answer cannot depend on scheduling
+([T-PAR-MAP-PURE], [E-PAR-MAP-ORDER]). `parallel`/`spawn` is for a fixed set
+of distinct concurrent activities that share results through the enclosing
+scope ([E-SPAWN-SHARED]).
+
 ## 10. Modules
 
 **[T-MODULE-NS]** Functions are per-module; types and effects share one global
@@ -1536,6 +1549,17 @@ detector to run. Results come back in input order whatever the core count is,
 so the answer never depends on the machine.
 
 A panicking task aborts the whole scope; tasks spawned after it do not run.
+
+The two forms divide the work between them, and it is worth knowing which you
+want before you reach for one. **`for x in xs { spawn { … x … } }` is not
+writable**: a task's body reads the enclosing scope as it stands when the
+tasks run, so a loop variable is gone by then, and the compiler says so. The
+number of tasks a `parallel` block starts is fixed where it is written.
+
+So: a *runtime-sized* amount of work over data is `par_map`/`par_filter`,
+which is also the form that gets real cores and that the compiler proves safe.
+`parallel`/`spawn` is for a fixed set of distinct activities that share results
+through the enclosing scope.
 
 ## 8. Modules and packages
 

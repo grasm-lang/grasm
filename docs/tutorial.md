@@ -394,6 +394,17 @@ so the answer never depends on the machine.
 
 A panicking task aborts the whole scope; tasks spawned after it do not run.
 
+The two forms divide the work between them, and it is worth knowing which you
+want before you reach for one. **`for x in xs { spawn { … x … } }` is not
+writable**: a task's body reads the enclosing scope as it stands when the
+tasks run, so a loop variable is gone by then, and the compiler says so. The
+number of tasks a `parallel` block starts is fixed where it is written.
+
+So: a *runtime-sized* amount of work over data is `par_map`/`par_filter`,
+which is also the form that gets real cores and that the compiler proves safe.
+`parallel`/`spawn` is for a fixed set of distinct activities that share results
+through the enclosing scope.
+
 ## 8. Modules and packages
 
 ```
