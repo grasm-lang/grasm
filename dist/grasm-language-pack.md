@@ -256,7 +256,8 @@ list_lit     = "[" ( expression ( "," expression )* ","? )? "]"
 map_lit      = "{" ( map_entry ( "," map_entry )* ","? )? "}"
 map_entry    = expression ":" expression
 tuple_lit    = "(" ( expression ( "," expression )+ ","? )? ")"
-struct_lit   = identifier "{" ( field_init ( ("," | newline) field_init )* )? "}"
+struct_lit   = identifier "{" ( ".." expression ","? )?
+               ( field_init ( ("," | newline) field_init )* )? "}"
 field_init   = identifier ":" expression
 if_expr      = "if" expression block ( "else" ( if_expr | block ) )?
 match_expr   = "match" expression "{" match_arm* "}"
@@ -266,6 +267,15 @@ closure      = "|" ( identifier ( "," identifier )* )? "|" ( expression | block 
 ```
 
 **[G-PIPE]** `x |> f(a)` is exactly `f(x, a)`; `x |> f` is `f(x)`.
+
+**[G-STRUCT-UPDATE]** `Point{ ..p, x: 1 }` takes every field from `p` and
+overwrites the ones written after it. The base must be the same struct type,
+and it is evaluated first ([E-ORDER-LTR]). With a base, no field is required;
+without one, all of them are.
+
+`p` is unchanged — this builds a new value, like every other expression
+([E-VALUE-SEMANTICS]). Without it an accumulator restated all its fields at
+every step, which is exactly where a wrong one hides.
 
 **[G-MAP-BLOCK-AMBIG]** In expression position `{` opens a map literal if
 what follows is `}` or an expression then `:`, and a block otherwise. The two
@@ -3046,6 +3056,48 @@ fn main() {
     if (P{ ok: true }).ok {
         // reachable
     }
+}
+```
+
+## `G-STRUCT-UPDATE.gr`
+
+```grasm
+//! tag: G-STRUCT-UPDATE
+//! expect: output
+//! run n=3 total=8.0 min=1.0 max=4.0
+//! 3 99 run
+//! 3
+//! 1 2
+// Taking the fields you are not changing from a value you already have.
+type Stats = { count: i64, total: f64, min: f64, max: f64, label: str }
+
+/// The shape this exists for: an accumulator that otherwise restates every
+/// field at every step.
+fn add(s: Stats, v: f64) -> Stats {
+    Stats{ ..s, count: s.count + 1, total: s.total + v, min: s.min.min(v), max: s.max.max(v) }
+}
+
+type Pair = { a: i64, b: i64 }
+
+fn main() {
+    var s = Stats{ count: 0, total: 0.0, min: 1.0e308, max: 0.0 - 1.0e308, label: "run" }
+    for v in [3.0, 1.0, 4.0] {
+        s = add(s, v)
+    }
+    print("{s.label} n={s.count} total={s.total.to_fixed(1)} min={s.min.to_fixed(1)} max={s.max.to_fixed(1)}")
+
+    // The base is unchanged: this builds a new value ([E-VALUE-SEMANTICS]).
+    let bumped = Stats{ ..s, count: 99 }
+    print("{s.count} {bumped.count} {bumped.label}")
+
+    // No overrides at all is a copy.
+    let copy = Stats{ ..s }
+    print("{copy.count}")
+
+    // Overriding every field is allowed, and the base still decides the type.
+    let p = Pair{ a: 9, b: 9 }
+    let q = Pair{ ..p, a: 1, b: 2 }
+    print("{q.a} {q.b}")
 }
 ```
 

@@ -241,7 +241,8 @@ list_lit     = "[" ( expression ( "," expression )* ","? )? "]"
 map_lit      = "{" ( map_entry ( "," map_entry )* ","? )? "}"
 map_entry    = expression ":" expression
 tuple_lit    = "(" ( expression ( "," expression )+ ","? )? ")"
-struct_lit   = identifier "{" ( field_init ( ("," | newline) field_init )* )? "}"
+struct_lit   = identifier "{" ( ".." expression ","? )?
+               ( field_init ( ("," | newline) field_init )* )? "}"
 field_init   = identifier ":" expression
 if_expr      = "if" expression block ( "else" ( if_expr | block ) )?
 match_expr   = "match" expression "{" match_arm* "}"
@@ -251,6 +252,15 @@ closure      = "|" ( identifier ( "," identifier )* )? "|" ( expression | block 
 ```
 
 **[G-PIPE]** `x |> f(a)` is exactly `f(x, a)`; `x |> f` is `f(x)`.
+
+**[G-STRUCT-UPDATE]** `Point{ ..p, x: 1 }` takes every field from `p` and
+overwrites the ones written after it. The base must be the same struct type,
+and it is evaluated first ([E-ORDER-LTR]). With a base, no field is required;
+without one, all of them are.
+
+`p` is unchanged — this builds a new value, like every other expression
+([E-VALUE-SEMANTICS]). Without it an accumulator restated all its fields at
+every step, which is exactly where a wrong one hides.
 
 **[G-MAP-BLOCK-AMBIG]** In expression position `{` opens a map literal if
 what follows is `}` or an expression then `:`, and a block otherwise. The two

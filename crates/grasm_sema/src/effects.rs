@@ -998,7 +998,10 @@ fn walk_expr(
                 walk_expr(v, current, active, ctx, fnb, out);
             }
         }
-        Expr::StructLit { fields, .. } => {
+        Expr::StructLit { base, fields, .. } => {
+            if let Some(b) = base {
+                walk_expr(b, current, active, ctx, fnb, out);
+            }
             for (_, v) in fields {
                 walk_expr(v, current, active, ctx, fnb, out);
             }

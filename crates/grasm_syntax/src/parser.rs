@@ -1588,6 +1588,9 @@ impl Parser {
                 }
                 matches!(self.toks[j].kind, TokenKind::Colon)
             }
+            // `Point{ ..p }` — a struct update. Nothing else in the language
+            // starts a brace with `..`.
+            TokenKind::DotDot => true,
             _ => false,
         };
         // Roll back to before the `{` either way; parse_struct_lit re-consumes.
@@ -1605,6 +1608,19 @@ impl Parser {
         let start = name.span;
         self.expect(&TokenKind::LBrace)?;
         let mut fields = Vec::new();
+        // `Point{ ..p, x: 1 }` — the fields not written come from `p`. An
+        // accumulator otherwise restates every field at every step, which is
+        // where a wrong one hides.
+        let mut base: Option<Box<Expr>> = None;
+        self.skip_newlines();
+        if self.at(&TokenKind::DotDot) {
+            self.bump();
+            let saved = self.no_struct_lit;
+            self.no_struct_lit = false;
+            base = Some(Box::new(self.parse_expr()?));
+            self.no_struct_lit = saved;
+            self.eat(&TokenKind::Comma);
+        }
         loop {
             self.skip_newlines();
             if self.at(&TokenKind::RBrace) {
@@ -1632,6 +1648,7 @@ impl Parser {
         };
         Ok(Expr::StructLit {
             name: path,
+            base,
             fields,
             span: start.merge(rb.span),
         })

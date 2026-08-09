@@ -1179,7 +1179,12 @@ that does not change",
                     Type::Tuple(items.iter().map(|i| self.infer_expr(i)).collect())
                 }
             }
-            Expr::StructLit { name, fields, span } => self.infer_struct_lit(name, fields, *span),
+            Expr::StructLit {
+                name,
+                base,
+                fields,
+                span,
+            } => self.infer_struct_lit(name, base.as_deref(), fields, *span),
             Expr::Call { callee, args, span } => self.infer_call(callee, args, *span),
             Expr::MethodCall {
                 recv,
@@ -1372,7 +1377,13 @@ that does not change",
         }
     }
 
-    fn infer_struct_lit(&mut self, name: &Path, fields: &[(Ident, Expr)], span: Span) -> Type {
+    fn infer_struct_lit(
+        &mut self,
+        name: &Path,
+        base: Option<&Expr>,
+        fields: &[(Ident, Expr)],
+        span: Span,
+    ) -> Type {
         let tname = &name.segments[0].name;
         let Some(&def_id) = self.defs.by_name.get(tname) else {
             return self.error(name.span, format!("unknown type `{tname}`"));
@@ -1408,6 +1419,16 @@ that does not change",
                     );
                 }
             }
+        }
+        let result = Type::Named {
+            id: def_id,
+            args: fresh.clone(),
+        };
+        // `Point{ ..p, x: 1 }` — `p` supplies every field not written, so it
+        // must be the same struct, and nothing is missing.
+        if let Some(b) = base {
+            self.check_expr(b, &result);
+            return result;
         }
         let missing: Vec<&String> = def_fields
             .iter()

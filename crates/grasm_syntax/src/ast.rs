@@ -365,6 +365,8 @@ pub enum Expr {
     /// `User{ id: 1, name: "x" }`
     StructLit {
         name: Path,
+        /// `Point{ ..p, x: 1 }` — every field not written comes from here.
+        base: Option<Box<Expr>>,
         fields: Vec<(Ident, Expr)>,
         span: Span,
     },

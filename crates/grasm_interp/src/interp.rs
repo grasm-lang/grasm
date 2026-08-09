@@ -821,11 +821,30 @@ impl<'a, W: Write> Interp<'a, W> {
                 }
                 Ok(Value::Tuple(Rc::new(vs)))
             }
-            Expr::StructLit { name, fields, .. } => {
-                let mut vs = Vec::with_capacity(fields.len());
+            Expr::StructLit {
+                name, base, fields, ..
+            } => {
+                // `Point{ ..p, x: 1 }` — start from `p`'s fields in their
+                // declared order, then overwrite the ones written here. The
+                // base is evaluated first, so `Point{ ..f(), x: g() }` runs
+                // `f` before `g` like every other expression ([E-ORDER-LTR]).
+                let mut vs: Vec<(String, Value)> = match base {
+                    Some(b) => match self.eval_expr(b)? {
+                        Value::Struct { fields, .. } => (*fields).clone(),
+                        other => {
+                            return Err(Flow::Panic(format!(
+                                "`..` in a struct literal needs a struct, got `{other}`"
+                            )))
+                        }
+                    },
+                    None => Vec::with_capacity(fields.len()),
+                };
                 for (fname, fexpr) in fields {
                     let v = self.eval_expr(fexpr)?;
-                    vs.push((fname.name.clone(), v));
+                    match vs.iter_mut().find(|(n, _)| n == &fname.name) {
+                        Some(slot) => slot.1 = v,
+                        None => vs.push((fname.name.clone(), v)),
+                    }
                 }
                 Ok(Value::Struct {
                     name: Rc::new(name.segments[0].name.clone()),

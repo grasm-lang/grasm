@@ -1958,7 +1958,10 @@ fn collect_named_calls_expr(e: &Expr, out: &mut Vec<(String, Vec<Expr>)>) {
                 collect_named_calls_expr(v, out);
             }
         }
-        Expr::StructLit { fields, .. } => {
+        Expr::StructLit { base, fields, .. } => {
+            if let Some(b) = base {
+                collect_named_calls_expr(b, out);
+            }
             for (_, v) in fields {
                 collect_named_calls_expr(v, out);
             }
@@ -3739,9 +3742,14 @@ impl FnCx<'_, '_> {
                 let sealed = self.call_rt("grasm_tuple_seal", &[list]).unwrap();
                 Ok(Some((sealed, VType::Tuple(ts))))
             }
-            Expr::StructLit { name, fields, span } => {
-                self.eval_struct_lit(name, fields, *span).map(Some)
-            }
+            Expr::StructLit {
+                name,
+                base,
+                fields,
+                span,
+            } => self
+                .eval_struct_lit(name, base.as_deref(), fields, *span)
+                .map(Some),
             Expr::Field { recv, name, span } => self.eval_field(recv, name, *span),
             Expr::Match {
                 scrutinee, arms, span,
@@ -5522,12 +5530,24 @@ impl FnCx<'_, '_> {
     fn eval_struct_lit(
         &mut self,
         name: &Path,
+        base: Option<&Expr>,
         fields: &[(Ident, Expr)],
         span: Span,
     ) -> CResult<(Value, VType)> {
         let sname = name.segments[0].name.clone();
-        let (np, nl) = self.str_ptr_len(&sname);
-        let sv = self.call_rt("grasm_struct_new", &[np, nl]).unwrap();
+        // `Point{ ..p, x: 1 }` — start from a copy of `p` and overwrite. The
+        // base is evaluated first, as it is written ([E-ORDER-LTR]).
+        let sv = match base {
+            Some(b) => {
+                let (bv, _) = self.eval_expr_val(b)?;
+                bv
+            }
+            None => {
+                let (np, nl) = self.str_ptr_len(&sname);
+                self.call_rt("grasm_struct_new", &[np, nl]).unwrap()
+            }
+        };
+        let mut sv = sv;
         for (fname, fexpr) in fields {
             let ft = self.struct_field_type(&sname, &fname.name, span)?;
             let (mut fv, fvt) = self.eval_expr_expecting(fexpr, Some(&ft))?;
@@ -5535,6 +5555,13 @@ impl FnCx<'_, '_> {
                 fv = self.b.ins().fcvt_from_sint(types::F64, fv);
             }
             let boxed = self.box_value(fv, &ft);
+            if base.is_some() {
+                let (fp, fl) = self.str_ptr_len(&fname.name);
+                sv = self
+                    .call_rt("grasm_struct_set_field", &[sv, fp, fl, boxed])
+                    .unwrap();
+                continue;
+            }
             let (fp, fl) = self.str_ptr_len(&fname.name);
             self.call_rt("grasm_struct_push_field", &[sv, fp, fl, boxed]);
         }
