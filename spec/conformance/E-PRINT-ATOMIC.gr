@@ -1,0 +1,20 @@
+//! tag: E-PRINT-ATOMIC
+//! expect: output
+//!   side 3
+//!   side 4
+//! x=6 y=8
+// `print` evaluates every interpolation before it writes anything.
+//
+// Emitting each piece as it was computed saved an allocation and cost two
+// guarantees: a panic partway along a line left the earlier pieces on stdout,
+// against [E-PANIC-EXIT], and a nested `print` landed in the middle of the
+// outer line instead of before it. This program pins the second; the first is
+// in scripts/agreetest.sh, which can see stderr and the exit code.
+fn side(n: i64) -> i64 {
+    print("  side {n}")
+    n * 2
+}
+
+fn main() {
+    print("x={side(3)} y={side(4)}")
+}

@@ -2429,7 +2429,17 @@ fn arm_diverges(body: &Expr) -> bool {
 }
 
 fn needs_element_hint(e: &Expr) -> bool {
-    matches!(e, Expr::Closure { params, .. } if !params.is_empty())
+    match e {
+        Expr::Closure { params, .. } => !params.is_empty(),
+        // An empty container has no element to infer a type from, so the
+        // annotation has to reach it. `[[]]` is one element long, so the outer
+        // list looked complete, stopped passing the type down, and the inner
+        // literal had nowhere left to get it — `let g: [[i64]] = [[]]` was
+        // refused with its own annotation in view.
+        Expr::List(items, _) => items.is_empty() || items.iter().any(needs_element_hint),
+        Expr::Map(entries, _) => entries.is_empty(),
+        _ => false,
+    }
 }
 
 fn needs_type_hint(e: &Expr) -> bool {
@@ -3838,7 +3848,14 @@ impl FnCx<'_, '_> {
 
     fn list_elem_type(&mut self, items: &[Expr], span: Span) -> CResult<VType> {
         let Some(first) = items.first() else {
-            return nope(span, "empty list literals (annotate via a function param for now)");
+            // The advice used to say "annotate via a function param", which
+            // was both narrower than the truth and, for `[[]]`, useless: the
+            // annotation was already there and still refused. Any annotation
+            // that reaches the literal works — a `let`, a parameter, a field.
+            return nope(
+                span,
+                "an empty list literal with no type in view (annotate the binding, as in `let xs: [i64] = []`)",
+            );
         };
         self.probe_type(first)
     }
@@ -5666,6 +5683,24 @@ impl FnCx<'_, '_> {
     fn lower_print(&mut self, arg: &Expr) -> CResult<()> {
         match arg {
             Expr::Str(pieces, _) => {
+                // Every interpolated expression is evaluated before anything
+                // is written. Writing each piece as it was computed was one
+                // less allocation, and it cost two guarantees: a panic partway
+                // along a line left the earlier pieces on stdout, which
+                // [E-PANIC-EXIT] says never happens, and a `print` *inside* an
+                // interpolation landed in the middle of the outer line rather
+                // than before it, which is where the interpreter puts it.
+                let mut vals = Vec::new();
+                for piece in pieces {
+                    if let StrPiece::Expr(inner) = piece {
+                        let (v, vt) = self.eval_expr_val(inner)?;
+                        if vt == VType::Unit {
+                            return nope(inner.span(), "printing unit");
+                        }
+                        vals.push((v, vt));
+                    }
+                }
+                let mut next = 0;
                 for piece in pieces {
                     match piece {
                         StrPiece::Text(t) => {
@@ -5674,8 +5709,9 @@ impl FnCx<'_, '_> {
                                 self.call_rt("grasm_out_text", &[p, l]);
                             }
                         }
-                        StrPiece::Expr(inner) => {
-                            let (v, vt) = self.eval_expr_val(inner)?;
+                        StrPiece::Expr(_) => {
+                            let (v, vt) = vals[next].clone();
+                            next += 1;
                             match vt {
                                 VType::I64 => {
                                     self.call_rt("grasm_out_i64", &[v]);
@@ -5690,7 +5726,8 @@ impl FnCx<'_, '_> {
                                     self.call_rt("grasm_out_val", &[v]);
                                     self.call_rt("grasm_val_dec", &[v]);
                                 }
-                                VType::Unit => return nope(inner.span(), "printing unit"),
+                                // Rejected in the pass above, before any write.
+                                VType::Unit => unreachable!(),
                                 _ => unreachable!(),
                             }
                         }

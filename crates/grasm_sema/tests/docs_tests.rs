@@ -271,3 +271,54 @@ fn an_item_without_examples_contributes_none() {
     );
     assert!(docs::examples(&fx.program()).is_empty());
 }
+
+/// A doc example inside a dependency resolves that dependency's imports.
+///
+/// The harness reloads the program to compile the example, and the reload had
+/// lost which modules were packages. So a library's `import util` was looked
+/// up as a bare name and found the *consumer's* `util.gr` — the example ran
+/// against the application's code and reported the library as broken. This is
+/// the C21 bug one layer up, which is why the package set now travels on
+/// `Program` instead of being rederived.
+#[test]
+fn a_dependency_doc_example_resolves_inside_the_dependency() {
+    let root = std::env::temp_dir().join(format!("grasm_docs_dep_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let write = |path: std::path::PathBuf, src: &str| {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, src).unwrap();
+    };
+    write(
+        root.join("dep/grasm.toml"),
+        "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nentry = \"src/main.gr\"\ncapabilities = []\n",
+    );
+    write(
+        root.join("dep/src/main.gr"),
+        "import util\n\n/// ```\n/// assert(twice(3) == 6)\n/// ```\npub fn twice(n: i64) -> i64 {\n    util.scale(n)\n}\n",
+    );
+    write(root.join("dep/src/util.gr"), "pub fn scale(n: i64) -> i64 {\n    n * 2\n}\n");
+    write(
+        root.join("app/grasm.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nentry = \"src/main.gr\"\ncapabilities = [\"io\"]\n\n[dependencies.dep]\npath = \"../dep\"\nversion = \"^0.1.0\"\n",
+    );
+    // Same module name, different answer. Without the fix the example picks
+    // this one and computes 3000.
+    write(root.join("app/src/util.gr"), "pub fn scale(n: i64) -> i64 {\n    n * 1000\n}\n");
+    write(
+        root.join("app/src/main.gr"),
+        "import dep\n\nfn main() {\n    print(\"{dep.twice(3)}\")\n}\n",
+    );
+
+    let program = grasm_sema::loader::load_from_disk(&root.join("app/src/main.gr")).expect("loads");
+    assert!(program.diagnostics.is_empty(), "{:#?}", program.diagnostics);
+    let examples = docs::examples(&program);
+    let example = examples
+        .iter()
+        .find(|e| e.owner.starts_with("dep::"))
+        .expect("the dependency's example is collected");
+    let ex = docs::example_program(&program, example);
+    assert!(ex.diagnostics.is_empty(), "{:#?}", ex.diagnostics);
+    assert_eq!(ex.files[0].imports.get("util").map(String::as_str), Some("dep.util"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}

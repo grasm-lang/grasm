@@ -185,6 +185,13 @@ nobody looks.
 Which is to say: stdout is what a program *produces*, stderr is what went
 wrong with it, and the two never mix.
 
+**[E-PRINT-ATOMIC]** `print` writes a whole line or none of it. Every
+interpolated expression is evaluated first, so a panic partway along a line
+leaves nothing of that line on stdout — which is what makes the rule above hold
+for the common case of panicking inside an interpolation. The same order means
+a `print` reached from inside an interpolation completes *before* the line that
+contains it, rather than landing in the middle of it.
+
 ## 7. Effects
 
 **[E-HANDLER-INNERMOST]** An effect operation dispatches to the innermost

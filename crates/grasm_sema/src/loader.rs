@@ -30,6 +30,11 @@ pub struct Program {
     /// files[0] is the entry module.
     pub files: Vec<LoadedFile>,
     pub diagnostics: Vec<Diagnostic>,
+    /// Module names that are *dependency packages*, kept so anything that
+    /// reloads this program — the doc-example harness does — can resolve
+    /// imports the way the original load did. Dropping it re-created the
+    /// bug the `deps` parameter exists to fix, one layer up.
+    pub deps: HashSet<String>,
 }
 
 impl Program {
@@ -164,6 +169,7 @@ pub fn load_with_paths_in(
     Program {
         files,
         diagnostics,
+        deps: deps.clone(),
     }
 }
 

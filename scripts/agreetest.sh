@@ -127,6 +127,21 @@ check panic_divide 'fn main() {
     print("{10 / z}")
 }'
 
+# A panic partway along an interpolated line. Emitting pieces as they were
+# computed left the first half of the line on stdout, which [E-PANIC-EXIT]
+# says never happens. difftest cannot see it: it compares stdout only for
+# programs that finish.
+check panic_mid_line 'fn boom(n: i64) -> i64 {
+    var z = 0
+    n / z
+}
+
+fn main() {
+    print("before")
+    print("a=1 b={boom(2)} c=3")
+    print("after")
+}'
+
 check exit_code 'fn main() {
     print("before")
     exit(3)

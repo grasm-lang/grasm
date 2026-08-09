@@ -515,9 +515,23 @@ pub fn example_program(program: &Program, example: &Example) -> Program {
     if let Some(owner) = owner_src {
         for line in owner.src.lines() {
             // The owner's own imports come along, so an example may use
-            // anything the documented module itself can.
+            // anything the documented module itself can — but spelled the way
+            // the *loader* resolved them, not the way the owner wrote them.
+            // Inside a dependency, `import util` means that dependency's
+            // `util`; re-reading it here as a bare name found the consumer's
+            // file of the same name instead, so a library's doc example ran
+            // against the application's code and reported the wrong answer as
+            // a failure of the library. That is C21 again, one layer up.
             if line.trim_start().starts_with("import ") {
-                entry.push_str(line);
+                let written = line.trim_start().trim_start_matches("import ").trim();
+                let alias = written.rsplit('.').next().unwrap_or(written);
+                match owner.imports.get(alias) {
+                    Some(full) => {
+                        entry.push_str("import ");
+                        entry.push_str(full);
+                    }
+                    None => entry.push_str(line),
+                }
                 entry.push('\n');
                 continue;
             }
@@ -538,12 +552,20 @@ pub fn example_program(program: &Program, example: &Example) -> Program {
     sources.retain(|(n, _)| n != "main");
     sources.push(("main".to_string(), entry));
 
-    crate::loader::load_with("main", "<doc example>", &|name| {
-        sources
-            .iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, src)| src.clone())
-    })
+    // The dependency set comes along too, so every *other* module reloaded
+    // here namespaces its imports the way it did the first time.
+    crate::loader::load_with_paths_in(
+        "main",
+        "<doc example>",
+        &|name| {
+            sources
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, src)| src.clone())
+        },
+        &|_| Vec::new(),
+        &program.deps,
+    )
 }
 
 #[cfg(test)]

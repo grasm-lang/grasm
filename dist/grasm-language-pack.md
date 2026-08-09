@@ -880,6 +880,13 @@ nobody looks.
 Which is to say: stdout is what a program *produces*, stderr is what went
 wrong with it, and the two never mix.
 
+**[E-PRINT-ATOMIC]** `print` writes a whole line or none of it. Every
+interpolated expression is evaluated first, so a panic partway along a line
+leaves nothing of that line on stdout — which is what makes the rule above hold
+for the common case of panicking inside an interpolation. The same order means
+a `print` reached from inside an interpolation completes *before* the line that
+contains it, rather than landing in the middle of it.
+
 ## 7. Effects
 
 **[E-HANDLER-INNERMOST]** An effect operation dispatches to the innermost
@@ -1892,6 +1899,7 @@ runs only under `grasm run`:
 | `par_map`/`par_filter` with a closure bound to a name | `let f = \|n\| n * 2` then `xs.par_map(f)` — write it inline, or as a top-level `fn` |
 | `map` with a function that returns nothing | `xs.map(\|x\| print(x))` — a `for` loop is what that meant |
 | a type parameter appearing **only** in a function-typed parameter's result | `fn key_by[T, K](xs: [T], f: fn(T) -> K) -> [K]` |
+| an empty list literal with no type in view | `var xs = []` — write `var xs: [i64] = []` |
 
 Each of these is a defect being worked off, not a design boundary. The list is
 checked against the implementation rather than remembered: if one of them
@@ -2904,6 +2912,31 @@ fn main() {
 fn main() {
     let e = 0 - 1
     print("{2 ^ e}")
+}
+```
+
+## `E-PRINT-ATOMIC.gr`
+
+```grasm
+//! tag: E-PRINT-ATOMIC
+//! expect: output
+//!   side 3
+//!   side 4
+//! x=6 y=8
+// `print` evaluates every interpolation before it writes anything.
+//
+// Emitting each piece as it was computed saved an allocation and cost two
+// guarantees: a panic partway along a line left the earlier pieces on stdout,
+// against [E-PANIC-EXIT], and a nested `print` landed in the middle of the
+// outer line instead of before it. This program pins the second; the first is
+// in scripts/agreetest.sh, which can see stderr and the exit code.
+fn side(n: i64) -> i64 {
+    print("  side {n}")
+    n * 2
+}
+
+fn main() {
+    print("x={side(3)} y={side(4)}")
 }
 ```
 

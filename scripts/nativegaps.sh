@@ -41,6 +41,32 @@ expect_refused() {
     fi
 }
 
+# The other direction: a shape that is *not* in the table has to compile, and
+# has to agree with the interpreter. A gap list is only honest if the things
+# left off it work.
+expect_compiled() {
+    local name="$1" src="$2"
+    printf '%s\n' "$src" >"$WORK/p.gr"
+    rm -f "$WORK/out"
+    if ! "$GRASM" build "$WORK/p.gr" --native -o "$WORK/out" >"$WORK/build.log" 2>&1; then
+        echo "  REFUSED: $name"
+        sed 's/^/    /' "$WORK/build.log"
+        fail=1
+        return
+    fi
+    local want got
+    want=$("$GRASM" run "$WORK/p.gr" 2>&1)
+    got=$("$WORK/out" 2>&1)
+    if [ "$want" != "$got" ]; then
+        echo "  DISAGREE: $name"
+        echo "    interp: $want"
+        echo "    native: $got"
+        fail=1
+        return
+    fi
+    echo "  compiles: $name"
+}
+
 echo "checking the documented --native gaps ..."
 
 expect_refused "a generic type declaration" 'type Pair[A, B] = { fst: A, snd: B }
@@ -84,6 +110,24 @@ expect_refused "a type parameter only in a function result" 'fn key_by[T, K](xs:
 }
 fn main() {
     print("{key_by([1, 2], |n| n * 2)}")
+}'
+
+# An annotated empty literal compiles — the gap is only the case where there
+# is genuinely nothing to infer from. Both halves are checked, because the
+# refusal used to cover both and told the reader to add an annotation that was
+# already there.
+expect_refused "an empty list literal with no type in view" 'fn main() {
+    var xs = []
+    xs = [1, 2]
+    print("{xs}")
+}'
+
+expect_compiled "an annotated empty list, however deeply nested" 'fn main() {
+    let a: [i64] = []
+    let b: [[i64]] = [[]]
+    let c: [[[str]]] = [[[]]]
+    let d: [Map[str, i64]] = [{}]
+    print("{a} {b} {c} {d}")
 }'
 
 echo

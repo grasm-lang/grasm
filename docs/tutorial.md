@@ -613,6 +613,7 @@ runs only under `grasm run`:
 | `par_map`/`par_filter` with a closure bound to a name | `let f = \|n\| n * 2` then `xs.par_map(f)` — write it inline, or as a top-level `fn` |
 | `map` with a function that returns nothing | `xs.map(\|x\| print(x))` — a `for` loop is what that meant |
 | a type parameter appearing **only** in a function-typed parameter's result | `fn key_by[T, K](xs: [T], f: fn(T) -> K) -> [K]` |
+| an empty list literal with no type in view | `var xs = []` — write `var xs: [i64] = []` |
 
 Each of these is a defect being worked off, not a design boundary. The list is
 checked against the implementation rather than remembered: if one of them
