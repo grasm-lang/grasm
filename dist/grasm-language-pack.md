@@ -54,7 +54,7 @@ digit       = "0".."9"
 ```
 and  break  continue  effect  else  false  fn  for  handled_by  if
 import  in  inout  let  match  not  or  own  pub  return  test  true
-try  type  var  while  with
+try  type  unsafe  var  while  with
 ```
 
 **[L-CONTEXTUAL]** `parallel` and `spawn` are *contextual* keywords: they
@@ -256,7 +256,8 @@ Precedence, loosest to tightest:
 expression   = or_expr
 primary      = literal | identifier | list_lit | map_lit | tuple_lit
              | struct_lit | if_expr | match_expr | block | closure
-             | "(" expression ")"
+             | unsafe_expr | "(" expression ")"
+unsafe_expr  = "unsafe" block
 list_lit     = "[" ( expression ( "," expression )* ","? )? "]"
 map_lit      = "{" ( map_entry ( "," map_entry )* ","? )? "}"
 map_entry    = expression ":" expression
