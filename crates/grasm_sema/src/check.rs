@@ -1689,6 +1689,21 @@ that does not change",
                         let v = self.uni.fresh();
                         return Type::Map(Box::new(k), Box::new(v));
                     }
+                    // The two constants the math methods are useless
+                    // without. Guarded on `lookup_fn`, so a program with its
+                    // own `fn e()` keeps it — unlike the older builtins here,
+                    // which shadow a user function of the same name. `e` is a
+                    // common enough identifier that taking it outright would
+                    // break working programs.
+                    "pi" | "e" if self.lookup_fn(&id.name).is_none() => {
+                        if !args.is_empty() {
+                            return self.error(
+                                span,
+                                format!("{} takes no arguments", id.name),
+                            );
+                        }
+                        return Type::F64;
+                    }
                     "now_millis" => {
                         if !args.is_empty() {
                             return self.error(span, "now_millis takes no arguments");
@@ -2589,6 +2604,20 @@ that does not change",
                 }
                 "abs" | "sqrt" | "floor" | "ceil" | "round" => {
                     check_arity(self, 0);
+                    Type::F64
+                }
+                // The math library: pure `f64 -> f64`. Reaching them through
+                // `extern fn` instead cost a capability ([T-EXTERN-VALUE]),
+                // which put a trigonometry helper over the ceiling of any
+                // package declaring `capabilities = []`.
+                "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "exp" | "ln" | "log2" | "log10" | "cbrt" | "to_radians" | "to_degrees" => {
+                    check_arity(self, 0);
+                    Type::F64
+                }
+                "atan2" | "hypot" | "log" => {
+                    if check_arity(self, 1) {
+                        self.check_expr(&args[0], &Type::F64);
+                    }
                     Type::F64
                 }
                 "min" | "max" => {

@@ -2533,6 +2533,88 @@ pub extern "C" fn grasm_f64_sqrt(v: f64) -> f64 {
 pub extern "C" fn grasm_f64_floor(v: f64) -> f64 {
     v.floor()
 }
+
+// The math library. These are `f64 -> f64` and nothing else: no allocation, no
+// effect, no error case. Without them the only way to get a cosine was
+// `extern fn cos`, which carries `io` ([T-EXTERN-VALUE]) and so put a
+// trigonometry helper over the ceiling of any package declaring
+// `capabilities = []`. A pure function should not cost a capability.
+#[no_mangle]
+pub extern "C" fn grasm_f64_sin(v: f64) -> f64 {
+    v.sin()
+}
+#[no_mangle]
+pub extern "C" fn grasm_f64_cos(v: f64) -> f64 {
+    v.cos()
+}
+#[no_mangle]
+pub extern "C" fn grasm_f64_tan(v: f64) -> f64 {
+    v.tan()
+}
+#[no_mangle]
+pub extern "C" fn grasm_f64_asin(v: f64) -> f64 {
+    v.asin()
+}
+#[no_mangle]
+pub extern "C" fn grasm_f64_acos(v: f64) -> f64 {
+    v.acos()
+}
+#[no_mangle]
+pub extern "C" fn grasm_f64_atan(v: f64) -> f64 {
+    v.atan()
+}
+#[no_mangle]
+pub extern "C" fn grasm_f64_sinh(v: f64) -> f64 {
+    v.sinh()
+}
+#[no_mangle]
+pub extern "C" fn grasm_f64_cosh(v: f64) -> f64 {
+    v.cosh()
+}
+#[no_mangle]
+pub extern "C" fn grasm_f64_tanh(v: f64) -> f64 {
+    v.tanh()
+}
+#[no_mangle]
+pub extern "C" fn grasm_f64_exp(v: f64) -> f64 {
+    v.exp()
+}
+#[no_mangle]
+pub extern "C" fn grasm_f64_ln(v: f64) -> f64 {
+    v.ln()
+}
+#[no_mangle]
+pub extern "C" fn grasm_f64_log2(v: f64) -> f64 {
+    v.log2()
+}
+#[no_mangle]
+pub extern "C" fn grasm_f64_log10(v: f64) -> f64 {
+    v.log10()
+}
+#[no_mangle]
+pub extern "C" fn grasm_f64_cbrt(v: f64) -> f64 {
+    v.cbrt()
+}
+#[no_mangle]
+pub extern "C" fn grasm_f64_to_radians(v: f64) -> f64 {
+    v.to_radians()
+}
+#[no_mangle]
+pub extern "C" fn grasm_f64_to_degrees(v: f64) -> f64 {
+    v.to_degrees()
+}
+#[no_mangle]
+pub extern "C" fn grasm_f64_atan2(a: f64, b: f64) -> f64 {
+    a.atan2(b)
+}
+#[no_mangle]
+pub extern "C" fn grasm_f64_hypot(a: f64, b: f64) -> f64 {
+    a.hypot(b)
+}
+#[no_mangle]
+pub extern "C" fn grasm_f64_log(a: f64, b: f64) -> f64 {
+    a.log(b)
+}
 #[no_mangle]
 pub extern "C" fn grasm_f64_ceil(v: f64) -> f64 {
     v.ceil()

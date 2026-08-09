@@ -1174,6 +1174,31 @@ Conversion is by method, not by a cast or a `int(...)`-style function. A `str`
 becomes a number with `parse_int` / `parse_float`, which return `Option`
 because the text may not be a number.
 
+**[L-LIB-MATH]** Trigonometry, exponentials and logarithms, on `f64`:
+
+| method | type | notes |
+|--------|------|-------|
+| `x.sin()`, `x.cos()`, `x.tan()` | `f64 -> f64` | radians |
+| `x.asin()`, `x.acos()`, `x.atan()` | `f64 -> f64` | radians |
+| `x.atan2(y)` | `(f64) -> f64` | `x.atan2(y)` is `atan(x/y)` with the quadrant of `(y, x)` |
+| `x.sinh()`, `x.cosh()`, `x.tanh()` | `f64 -> f64` | |
+| `x.exp()`, `x.ln()` | `f64 -> f64` | base *e* |
+| `x.log2()`, `x.log10()` | `f64 -> f64` | |
+| `x.log(b)` | `(f64) -> f64` | base `b` |
+| `x.cbrt()`, `x.hypot(y)` | `f64 -> f64` | |
+| `x.to_radians()`, `x.to_degrees()` | `f64 -> f64` | |
+| `pi()`, `e()` | `-> f64` | |
+
+Every one is pure: no allocation, no error case, and **no capability**. That
+last part is the reason they are here rather than left to `extern fn cos` — a
+declared C function performs `io` ([T-EXTERN-VALUE]), so reaching libm for a
+cosine put a trigonometry helper over the ceiling of any package declaring
+`capabilities = []`. A pure function should not cost a capability.
+
+`pi` and `e` are the only two builtins that yield to a function you declare
+yourself: a program with its own `fn e()` keeps it. `e` is a common enough
+identifier that taking it outright would break working programs.
+
 **[L-LIB-AS-I64]** `as_i64` is total: it has an answer for every `f64`, so it
 never panics and never returns `Option`. A value too large for `i64` gives
 `i64`'s maximum, one too small gives its minimum, and `NaN` gives `0`. That is
@@ -4219,6 +4244,40 @@ fn main() {
 
     let gone = m.delete("b")
     print("{gone} {m.len()}")
+}
+```
+
+## `L-LIB-MATH.gr`
+
+```grasm
+//! tag: L-LIB-MATH
+//! expect: output
+//! 3.141593 2.718282
+//! 0.0000 1.0000 0.785398
+//! 2.718282 1.000000 3.0000 3.0000
+//! 5.00 3.00 4.0000 1.047198
+//! 3.141593 180.00 1.1752 0.7616
+//! 99.0
+// The math library, and the reason it is a library at all.
+//
+// Reaching libm through `extern fn cos` works, and it costs a capability: a
+// declared C function performs `io` ([T-EXTERN-VALUE]), so a package declaring
+// `capabilities = []` could not compute a cosine. A pure function should not
+// cost a capability.
+fn shadowed() -> f64 {
+    // `pi` and `e` are the only builtins that yield to a function of the same
+    // name. `e` is common enough as an identifier that taking it outright
+    // would break working programs.
+    99.0
+}
+
+fn main() {
+    print("{pi().to_fixed(6)} {e().to_fixed(6)}")
+    print("{(0.0).sin().to_fixed(4)} {(0.0).cos().to_fixed(4)} {(1.0).atan().to_fixed(6)}")
+    print("{(1.0).exp().to_fixed(6)} {e().ln().to_fixed(6)} {(8.0).log2().to_fixed(4)} {(1000.0).log10().to_fixed(4)}")
+    print("{(3.0).hypot(4.0).to_fixed(2)} {(27.0).cbrt().to_fixed(2)} {(81.0).log(3.0).to_fixed(4)} {(0.5).acos().to_fixed(6)}")
+    print("{(180.0).to_radians().to_fixed(6)} {pi().to_degrees().to_fixed(2)} {(1.0).sinh().to_fixed(4)} {(1.0).tanh().to_fixed(4)}")
+    print("{shadowed()}")
 }
 ```
 

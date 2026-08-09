@@ -1247,3 +1247,24 @@ fn an_effect_handler_still_answers_for_what_it_does() {
         .expect("the handler's io must still be caught");
     assert_eq!(v.exceeded, vec!["io"]);
 }
+
+/// A pure package can do trigonometry.
+///
+/// This is the reason the math methods exist. Reaching libm through
+/// `extern fn cos` works and costs a capability — a declared C function
+/// performs `io` — so a package declaring `capabilities = []` could not
+/// compute a cosine, and a geometry library had to claim a permission it had
+/// no use for.
+#[test]
+fn a_pure_package_can_do_trigonometry() {
+    let ws = Workspace::new("puremath");
+    let src = "pub fn deg(r: f64) -> f64 {\n    r.to_degrees()\n}\n\n\
+               pub fn dist(x: f64, y: f64) -> f64 {\n    x.hypot(y)\n}\n\n\
+               pub fn angle(x: f64) -> f64 {\n    (x / pi()).atan()\n}\n\n\
+               fn main() {\n}\n";
+    let dir = ws.package("geom", &manifest("geom", Some(""), &[]), src);
+    let m = Manifest::load(&dir).unwrap();
+    let performed = grasm_pkg::effects_of_package(&m).unwrap();
+    assert!(performed.is_empty(), "math is pure: {performed:?}");
+    assert!(grasm_pkg::check_capabilities(&m, &performed).is_none());
+}

@@ -501,6 +501,25 @@ impl<'m> Codegen<'m> {
             ("grasm_i64_max", vec![i64t, i64t], Some(i64t)),
             ("grasm_f64_abs", vec![f64t], Some(f64t)),
             ("grasm_f64_sqrt", vec![f64t], Some(f64t)),
+            ("grasm_f64_sin", vec![f64t], Some(f64t)),
+            ("grasm_f64_cos", vec![f64t], Some(f64t)),
+            ("grasm_f64_tan", vec![f64t], Some(f64t)),
+            ("grasm_f64_asin", vec![f64t], Some(f64t)),
+            ("grasm_f64_acos", vec![f64t], Some(f64t)),
+            ("grasm_f64_atan", vec![f64t], Some(f64t)),
+            ("grasm_f64_sinh", vec![f64t], Some(f64t)),
+            ("grasm_f64_cosh", vec![f64t], Some(f64t)),
+            ("grasm_f64_tanh", vec![f64t], Some(f64t)),
+            ("grasm_f64_exp", vec![f64t], Some(f64t)),
+            ("grasm_f64_ln", vec![f64t], Some(f64t)),
+            ("grasm_f64_log2", vec![f64t], Some(f64t)),
+            ("grasm_f64_log10", vec![f64t], Some(f64t)),
+            ("grasm_f64_cbrt", vec![f64t], Some(f64t)),
+            ("grasm_f64_to_radians", vec![f64t], Some(f64t)),
+            ("grasm_f64_to_degrees", vec![f64t], Some(f64t)),
+            ("grasm_f64_atan2", vec![f64t, f64t], Some(f64t)),
+            ("grasm_f64_hypot", vec![f64t, f64t], Some(f64t)),
+            ("grasm_f64_log", vec![f64t, f64t], Some(f64t)),
             ("grasm_f64_floor", vec![f64t], Some(f64t)),
             ("grasm_f64_ceil", vec![f64t], Some(f64t)),
             ("grasm_f64_round", vec![f64t], Some(f64t)),
@@ -4947,6 +4966,38 @@ impl FnCx<'_, '_> {
                 };
                 (self.call_rt(f, &[rv]).unwrap(), VType::F64)
             }
+            // The math library. Every one is `f64 -> f64` with no allocation
+            // and no effect, so it lowers to a direct runtime call.
+            (VType::F64, "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "exp" | "ln" | "log2" | "log10" | "cbrt" | "to_radians" | "to_degrees") => {
+                let f = match m {
+                    "sin" => "grasm_f64_sin",
+                    "cos" => "grasm_f64_cos",
+                    "tan" => "grasm_f64_tan",
+                    "asin" => "grasm_f64_asin",
+                    "acos" => "grasm_f64_acos",
+                    "atan" => "grasm_f64_atan",
+                    "sinh" => "grasm_f64_sinh",
+                    "cosh" => "grasm_f64_cosh",
+                    "tanh" => "grasm_f64_tanh",
+                    "exp" => "grasm_f64_exp",
+                    "ln" => "grasm_f64_ln",
+                    "log2" => "grasm_f64_log2",
+                    "log10" => "grasm_f64_log10",
+                    "cbrt" => "grasm_f64_cbrt",
+                    "to_radians" => "grasm_f64_to_radians",
+                    _ => "grasm_f64_to_degrees",
+                };
+                (self.call_rt(f, &[rv]).unwrap(), VType::F64)
+            }
+            (VType::F64, "atan2" | "hypot" | "log") => {
+                let a = arg_scalar!(0, VType::F64);
+                let f = match m {
+                    "atan2" => "grasm_f64_atan2",
+                    "hypot" => "grasm_f64_hypot",
+                    _ => "grasm_f64_log",
+                };
+                (self.call_rt(f, &[rv, a]).unwrap(), VType::F64)
+            }
             (VType::F64, "min" | "max") => {
                 let a = arg_scalar!(0, VType::F64);
                 let f = if m == "min" {
@@ -5506,6 +5557,22 @@ impl FnCx<'_, '_> {
             "input" => {
                 let v = self.call_rt("grasm_input", &[]).unwrap();
                 return Ok(Some((v, VType::Str)));
+            }
+            // Guarded on the user's own namespace, the way the checker and
+            // the interpreter guard them: `e` is a common enough identifier
+            // that a builtin taking it outright would break working programs.
+            "pi" | "e"
+                if !self
+                    .cg
+                    .fns
+                    .contains_key(&format!("{}::{}", self.cg.current_module, id.name)) =>
+            {
+                let c = if id.name == "pi" {
+                    std::f64::consts::PI
+                } else {
+                    std::f64::consts::E
+                };
+                return Ok(Some((self.b.ins().f64const(c), VType::F64)));
             }
             "now_millis" => {
                 let v = self.call_rt("grasm_now_millis", &[]).unwrap();
@@ -6501,6 +6568,8 @@ impl FnCx<'_, '_> {
                 // fell through to a representation that then unboxed an f64
                 // as if it were a pointer.
                 "sqrt" | "floor" | "ceil" | "round" => VType::F64,
+                "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "exp" | "ln" | "log2" | "log10" | "cbrt" | "to_radians" | "to_degrees" => VType::F64,
+                "atan2" | "hypot" | "log" => VType::F64,
                 "abs" => self.probe_type(recv)?,
                 "chars" | "lines" | "split" | "words" | "keys" => VType::List(Box::new(VType::Str)),
                 "entries" => match self.probe_type(recv)? {

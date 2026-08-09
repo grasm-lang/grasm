@@ -158,6 +158,31 @@ Conversion is by method, not by a cast or a `int(...)`-style function. A `str`
 becomes a number with `parse_int` / `parse_float`, which return `Option`
 because the text may not be a number.
 
+**[L-LIB-MATH]** Trigonometry, exponentials and logarithms, on `f64`:
+
+| method | type | notes |
+|--------|------|-------|
+| `x.sin()`, `x.cos()`, `x.tan()` | `f64 -> f64` | radians |
+| `x.asin()`, `x.acos()`, `x.atan()` | `f64 -> f64` | radians |
+| `x.atan2(y)` | `(f64) -> f64` | `x.atan2(y)` is `atan(x/y)` with the quadrant of `(y, x)` |
+| `x.sinh()`, `x.cosh()`, `x.tanh()` | `f64 -> f64` | |
+| `x.exp()`, `x.ln()` | `f64 -> f64` | base *e* |
+| `x.log2()`, `x.log10()` | `f64 -> f64` | |
+| `x.log(b)` | `(f64) -> f64` | base `b` |
+| `x.cbrt()`, `x.hypot(y)` | `f64 -> f64` | |
+| `x.to_radians()`, `x.to_degrees()` | `f64 -> f64` | |
+| `pi()`, `e()` | `-> f64` | |
+
+Every one is pure: no allocation, no error case, and **no capability**. That
+last part is the reason they are here rather than left to `extern fn cos` — a
+declared C function performs `io` ([T-EXTERN-VALUE]), so reaching libm for a
+cosine put a trigonometry helper over the ceiling of any package declaring
+`capabilities = []`. A pure function should not cost a capability.
+
+`pi` and `e` are the only two builtins that yield to a function you declare
+yourself: a program with its own `fn e()` keeps it. `e` is a common enough
+identifier that taking it outright would break working programs.
+
 **[L-LIB-AS-I64]** `as_i64` is total: it has an answer for every `f64`, so it
 never panics and never returns `Option`. A value too large for `i64` gives
 `i64`'s maximum, one too small gives its minimum, and `NaN` gives `0`. That is

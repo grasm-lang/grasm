@@ -1,0 +1,29 @@
+//! tag: L-LIB-MATH
+//! expect: output
+//! 3.141593 2.718282
+//! 0.0000 1.0000 0.785398
+//! 2.718282 1.000000 3.0000 3.0000
+//! 5.00 3.00 4.0000 1.047198
+//! 3.141593 180.00 1.1752 0.7616
+//! 99.0
+// The math library, and the reason it is a library at all.
+//
+// Reaching libm through `extern fn cos` works, and it costs a capability: a
+// declared C function performs `io` ([T-EXTERN-VALUE]), so a package declaring
+// `capabilities = []` could not compute a cosine. A pure function should not
+// cost a capability.
+fn shadowed() -> f64 {
+    // `pi` and `e` are the only builtins that yield to a function of the same
+    // name. `e` is common enough as an identifier that taking it outright
+    // would break working programs.
+    99.0
+}
+
+fn main() {
+    print("{pi().to_fixed(6)} {e().to_fixed(6)}")
+    print("{(0.0).sin().to_fixed(4)} {(0.0).cos().to_fixed(4)} {(1.0).atan().to_fixed(6)}")
+    print("{(1.0).exp().to_fixed(6)} {e().ln().to_fixed(6)} {(8.0).log2().to_fixed(4)} {(1000.0).log10().to_fixed(4)}")
+    print("{(3.0).hypot(4.0).to_fixed(2)} {(27.0).cbrt().to_fixed(2)} {(81.0).log(3.0).to_fixed(4)} {(0.5).acos().to_fixed(6)}")
+    print("{(180.0).to_radians().to_fixed(6)} {pi().to_degrees().to_fixed(2)} {(1.0).sinh().to_fixed(4)} {(1.0).tanh().to_fixed(4)}")
+    print("{shadowed()}")
+}

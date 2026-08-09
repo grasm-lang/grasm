@@ -1267,6 +1267,22 @@ build links it, `grasm run` can only reach what is already loaded",
                     "map" => {
                         return Ok(Value::Map(Rc::new(std::collections::BTreeMap::new())));
                     }
+                    // Guarded on the user's own namespace, the way the
+                    // checker guards them: `e` is a common enough identifier
+                    // that a builtin taking it outright would break working
+                    // programs. The older builtins beside them do shadow a
+                    // user function of the same name; these do not.
+                    "pi" | "e"
+                        if !self
+                            .fns
+                            .contains_key(&format!("{}::{}", self.current_module, id.name)) =>
+                    {
+                        return Ok(Value::Float(if id.name == "pi" {
+                            std::f64::consts::PI
+                        } else {
+                            std::f64::consts::E
+                        }));
+                    }
                     "now_millis" => {
                         let ms = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -2055,6 +2071,43 @@ build links it, `grasm run` can only reach what is already loaded",
             (Value::Float(x), "as_i64") => Value::Int(*x as i64),
             (Value::Float(x), "abs") => Value::Float(x.abs()),
             (Value::Float(x), "sqrt") => Value::Float(x.sqrt()),
+            (Value::Float(x), "sin") => Value::Float(x.sin()),
+            (Value::Float(x), "cos") => Value::Float(x.cos()),
+            (Value::Float(x), "tan") => Value::Float(x.tan()),
+            (Value::Float(x), "asin") => Value::Float(x.asin()),
+            (Value::Float(x), "acos") => Value::Float(x.acos()),
+            (Value::Float(x), "atan") => Value::Float(x.atan()),
+            (Value::Float(x), "sinh") => Value::Float(x.sinh()),
+            (Value::Float(x), "cosh") => Value::Float(x.cosh()),
+            (Value::Float(x), "tanh") => Value::Float(x.tanh()),
+            (Value::Float(x), "exp") => Value::Float(x.exp()),
+            (Value::Float(x), "ln") => Value::Float(x.ln()),
+            (Value::Float(x), "log2") => Value::Float(x.log2()),
+            (Value::Float(x), "log10") => Value::Float(x.log10()),
+            (Value::Float(x), "cbrt") => Value::Float(x.cbrt()),
+            (Value::Float(x), "to_radians") => Value::Float(x.to_radians()),
+            (Value::Float(x), "to_degrees") => Value::Float(x.to_degrees()),
+            (Value::Float(x), "atan2") => {
+                let o = self.eval_expr(&args[0])?;
+                match o {
+                    Value::Float(y) => Value::Float(x.atan2(y)),
+                    _ => return Err(Flow::Panic("atan2 expects a float".into())),
+                }
+            }
+            (Value::Float(x), "hypot") => {
+                let o = self.eval_expr(&args[0])?;
+                match o {
+                    Value::Float(y) => Value::Float(x.hypot(y)),
+                    _ => return Err(Flow::Panic("hypot expects a float".into())),
+                }
+            }
+            (Value::Float(x), "log") => {
+                let o = self.eval_expr(&args[0])?;
+                match o {
+                    Value::Float(y) => Value::Float(x.log(y)),
+                    _ => return Err(Flow::Panic("log expects a float".into())),
+                }
+            }
             (Value::Float(x), "floor") => Value::Float(x.floor()),
             (Value::Float(x), "ceil") => Value::Float(x.ceil()),
             (Value::Float(x), "round") => Value::Float(x.round()),
