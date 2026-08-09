@@ -101,6 +101,15 @@ recurses deeper than 10,000 should not assume it will run everywhere. The
 deep`, and neither names its own bound, because a number printed there reads
 like a limit worth coding against and is not one.
 
+**[E-MATCH-BUILTIN-ARMS]** A match yields a value whenever its arms do,
+whatever the arms are made of — a builtin call is not a special case. The
+compiled backend types a match by looking at its arms, and where it cannot, it
+**refuses**; it does not fall back to treating the match as a statement. Those
+two used to be the same answer, so a value match whose arms it did not
+understand compiled to no value at all and the enclosing function returned
+whatever was in the register. A wrong answer with nothing reported is the worst
+outcome available, and strictly worse than the refusal that replaced it.
+
 **[E-PANIC-TRACE]** A panic *may* be followed by a stack trace on stderr, and
 whether one appears depends on how the program was run, not on what it did.
 `grasm run` prints one, and so does a bundled executable, which is this

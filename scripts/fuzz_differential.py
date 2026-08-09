@@ -82,10 +82,15 @@ class Gen:
                         self.int_from_remove,
                     ]
             elif ty == FLOAT:
-                choices += [self.float_arith, self.float_cond]
+                choices += [self.float_arith, self.float_cond, self.float_method]
             elif ty == BOOL:
-                pass
-            elif ty == BOOL:
+                # There were two `elif ty == BOOL` branches here, the first of
+                # them `pass`. Python takes the first, so `bool_cmp` and
+                # `bool_logic` were unreachable and every boolean this fuzzer
+                # ever generated was the literal `true` or `false`. Comparison
+                # and `and`/`or` went untested for the whole life of the tool,
+                # which is the kind of hole a generator hides best: it kept
+                # producing valid programs and reporting no mismatches.
                 choices += [self.bool_cmp, self.bool_logic]
             elif ty == STR:
                 choices += [self.str_concat, self.str_method, self.str_words]
@@ -132,6 +137,33 @@ class Gen:
         op = self.rng.choice(["+", "-", "*"])
         return f"({self.expr(FLOAT)} {op} {self.expr(FLOAT)})"
 
+    # The math library. Both engines route these to the same Rust std
+    # functions, so any difference in the last bit is a real one.
+    MATH_UNARY = [
+        "sin", "cos", "tan", "atan", "sinh", "cosh", "tanh", "exp",
+        "cbrt", "to_radians", "to_degrees",
+    ]
+    MATH_BINARY = ["atan2", "hypot"]
+
+    def float_method(self, _):
+        r = self.rng.random()
+        if r < 0.15:
+            return self.rng.choice(["pi()", "e()"])
+        if r < 0.4:
+            # Domain-restricted: `sqrt`, `ln` and friends of a negative are
+            # NaN, which both engines agree on but which then swallows every
+            # later operation and makes a mismatch impossible to see.
+            m = self.rng.choice(["sqrt", "ln", "log2", "log10"])
+            return f"(({self.expr(FLOAT)}).abs() + 1.0).{m}()"
+        if r < 0.55:
+            m = self.rng.choice(["asin", "acos"])
+            return f"(({self.expr(FLOAT)}).sin()).{m}()"
+        if r < 0.8:
+            m = self.rng.choice(self.MATH_UNARY)
+            return f"({self.expr(FLOAT)}).{m}()"
+        m = self.rng.choice(self.MATH_BINARY)
+        return f"({self.expr(FLOAT)}).{m}({self.expr(FLOAT)})"
+
     def int_cond(self, _):
         return f"(if {self.expr(BOOL)} {{ {self.expr(INT)} }} else {{ {self.expr(INT)} }})"
 
@@ -151,7 +183,9 @@ class Gen:
         return f"({self.expr(STR)} + {self.expr(STR)})"
 
     def str_method(self, _):
-        m = self.rng.choice(["to_upper()", "to_lower()", "trim()"])
+        m = self.rng.choice([
+            "to_upper()", "to_lower()", "trim()", "trim_start()", "trim_end()",
+        ])
         return f"{self.expr(STR)}.{m}"
 
     def int_from_list(self, _):

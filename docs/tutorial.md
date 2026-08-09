@@ -621,6 +621,7 @@ runs only under `grasm run`:
 | `map` with a function that returns nothing | `xs.map(\|x\| print(x))` — a `for` loop is what that meant |
 | a type parameter appearing **only** in a function-typed parameter's result | `fn key_by[T, K](xs: [T], f: fn(T) -> K) -> [K]` |
 | an empty list literal with no type in view | `var xs = []` — write `var xs: [i64] = []` |
+| a `match` no arm of which has an inferable type | every arm `map()` — give one arm a type, or lift it into an annotated `let` |
 
 Each of these is a defect being worked off, not a design boundary. The list is
 checked against the implementation rather than remembered: if one of them

@@ -1,0 +1,49 @@
+//! tag: E-MATCH-BUILTIN-ARMS
+//! expect: output
+//! 2.718281828459045
+//! 0 false
+// A match whose every arm is a builtin call still yields a value.
+//
+// The compiled backend types a match by probing its arms, and no builtin free
+// function was in the probe's table. When *no* arm could be typed the result
+// was not a refusal: "nothing could be typed" and "every arm yields nothing"
+// were the same answer, so a value match compiled as a statement match and the
+// enclosing function returned whatever was there. `args()` in both arms of a
+// fallible function returned `0`. The fuzzer found it the day boolean
+// expressions started being generated at all.
+fn constant(p: i64) -> f64 ! str {
+    match p {
+        0 -> e()
+        _ -> pi()
+    }
+}
+
+fn from_env(p: i64) -> [str] ! str {
+    match p {
+        0 -> args()
+        _ -> args()
+    }
+}
+
+fn exists(p: i64) -> bool ! str {
+    match p {
+        0 -> file_exists("/definitely/not/here")
+        _ -> file_exists("/nor/here")
+    }
+}
+
+fn main() {
+    match constant(0) {
+        Ok(v) -> print("{v}")
+        Err(x) -> print("{x}")
+    }
+    let n = match from_env(0) {
+        Ok(v) -> v.len()
+        Err(_) -> -1
+    }
+    let b = match exists(0) {
+        Ok(v) -> v
+        Err(_) -> true
+    }
+    print("{n} {b}")
+}

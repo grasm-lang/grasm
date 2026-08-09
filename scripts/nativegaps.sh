@@ -122,6 +122,47 @@ expect_refused "an empty list literal with no type in view" 'fn main() {
     print("{xs}")
 }'
 
+expect_refused "a match no arm of which has an inferable type" 'fn pick(p: i64) -> Map[str, i64] ! str {
+    match p {
+        0 -> map()
+        _ -> map()
+    }
+}
+
+fn main() {
+    match pick(0) {
+        Ok(m) -> print("{m.len()}")
+        Err(e) -> print("{e}")
+    }
+}'
+
+# The half that must keep working: builtins the probe *does* know. Every one of
+# these compiled to a silent `0` before, which no refusal would have caught.
+expect_compiled "a match whose arms are builtin calls" 'fn constant(p: i64) -> f64 ! str {
+    match p {
+        0 -> e()
+        _ -> pi()
+    }
+}
+
+fn listing(p: i64) -> [str] ! str {
+    match p {
+        0 -> args()
+        _ -> args()
+    }
+}
+
+fn main() {
+    match constant(0) {
+        Ok(v) -> print("{v}")
+        Err(e) -> print("{e}")
+    }
+    match listing(0) {
+        Ok(v) -> print("{v.len()}")
+        Err(e) -> print("{e}")
+    }
+}'
+
 expect_compiled "an annotated empty list, however deeply nested" 'fn main() {
     let a: [i64] = []
     let b: [[i64]] = [[]]

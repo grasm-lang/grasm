@@ -804,6 +804,15 @@ recurses deeper than 10,000 should not assume it will run everywhere. The
 deep`, and neither names its own bound, because a number printed there reads
 like a limit worth coding against and is not one.
 
+**[E-MATCH-BUILTIN-ARMS]** A match yields a value whenever its arms do,
+whatever the arms are made of — a builtin call is not a special case. The
+compiled backend types a match by looking at its arms, and where it cannot, it
+**refuses**; it does not fall back to treating the match as a statement. Those
+two used to be the same answer, so a value match whose arms it did not
+understand compiled to no value at all and the enclosing function returned
+whatever was in the register. A wrong answer with nothing reported is the worst
+outcome available, and strictly worse than the refusal that replaced it.
+
 **[E-PANIC-TRACE]** A panic *may* be followed by a stack trace on stderr, and
 whether one appears depends on how the program was run, not on what it did.
 `grasm run` prints one, and so does a bundled executable, which is this
@@ -1977,6 +1986,7 @@ runs only under `grasm run`:
 | `map` with a function that returns nothing | `xs.map(\|x\| print(x))` — a `for` loop is what that meant |
 | a type parameter appearing **only** in a function-typed parameter's result | `fn key_by[T, K](xs: [T], f: fn(T) -> K) -> [K]` |
 | an empty list literal with no type in view | `var xs = []` — write `var xs: [i64] = []` |
+| a `match` no arm of which has an inferable type | every arm `map()` — give one arm a type, or lift it into an annotated `let` |
 
 Each of these is a defect being worked off, not a design boundary. The list is
 checked against the implementation rather than remembered: if one of them
@@ -2753,6 +2763,60 @@ fn main() {
     m.set("beta", 2)
     print("{m.keys()}")
     print("{m}")
+}
+```
+
+## `E-MATCH-BUILTIN-ARMS.gr`
+
+```grasm
+//! tag: E-MATCH-BUILTIN-ARMS
+//! expect: output
+//! 2.718281828459045
+//! 0 false
+// A match whose every arm is a builtin call still yields a value.
+//
+// The compiled backend types a match by probing its arms, and no builtin free
+// function was in the probe's table. When *no* arm could be typed the result
+// was not a refusal: "nothing could be typed" and "every arm yields nothing"
+// were the same answer, so a value match compiled as a statement match and the
+// enclosing function returned whatever was there. `args()` in both arms of a
+// fallible function returned `0`. The fuzzer found it the day boolean
+// expressions started being generated at all.
+fn constant(p: i64) -> f64 ! str {
+    match p {
+        0 -> e()
+        _ -> pi()
+    }
+}
+
+fn from_env(p: i64) -> [str] ! str {
+    match p {
+        0 -> args()
+        _ -> args()
+    }
+}
+
+fn exists(p: i64) -> bool ! str {
+    match p {
+        0 -> file_exists("/definitely/not/here")
+        _ -> file_exists("/nor/here")
+    }
+}
+
+fn main() {
+    match constant(0) {
+        Ok(v) -> print("{v}")
+        Err(x) -> print("{x}")
+    }
+    let n = match from_env(0) {
+        Ok(v) -> v.len()
+        Err(_) -> -1
+    }
+    let b = match exists(0) {
+        Ok(v) -> v
+        Err(_) -> true
+    }
+    print("{n} {b}")
 }
 ```
 

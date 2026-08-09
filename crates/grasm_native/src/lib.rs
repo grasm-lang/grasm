@@ -6419,10 +6419,39 @@ impl FnCx<'_, '_> {
                     // all, so a void callback could not be passed anywhere.
                     if matches!(
                         id.name.as_str(),
-                        "print" | "assert" | "assert_eq" | "write_file" | "exit" | "panic"
+                        "print" | "assert" | "assert_eq" | "exit" | "panic"
                     ) && self.lookup(&id.name).is_none()
                     {
                         return Ok(VType::Unit);
+                    }
+                    // And the ones that answer with something. Every builtin
+                    // free function was missing here, and the consequence was
+                    // not a refusal: a match none of whose arms could be typed
+                    // compiled as a *statement* match, so a fallible function
+                    // whose arms were `args()` returned `0`. Silently. The
+                    // list is kept beside the one above so the next builtin
+                    // added has to pick a side.
+                    if self.lookup(&id.name).is_none() && self.lookup_fn(&id.name).is_none() {
+                        let t = match id.name.as_str() {
+                            "pi" | "e" => Some(VType::F64),
+                            "now_millis" => Some(VType::I64),
+                            "input" => Some(VType::Str),
+                            "file_exists" => Some(VType::Bool),
+                            "args" => Some(VType::List(Box::new(VType::Str))),
+                            "env" => Some(VType::Option(Box::new(VType::Str))),
+                            "read_file" => Some(VType::Fallible(
+                                Box::new(VType::Str),
+                                Box::new(VType::Sum("IoError".into())),
+                            )),
+                            "write_file" => Some(VType::Fallible(
+                                Box::new(VType::Unit),
+                                Box::new(VType::Sum("IoError".into())),
+                            )),
+                            _ => None,
+                        };
+                        if let Some(t) = t {
+                            return Ok(t);
+                        }
                     }
                     if matches!(id.name.as_str(), "Ok" | "Err")
                         && args.len() == 1
@@ -6715,6 +6744,16 @@ impl FnCx<'_, '_> {
         // Probe the result type. Pattern binds aren't live yet, so bind their
         // *types* in a scratch scope first, and try each arm until one probes.
         let mut out_t: Option<VType> = None;
+        // "No arm could be typed" and "every arm yields nothing" used to be
+        // the same answer here — both left `out_t` as `None`, which compiles a
+        // statement match with no merge parameter. So a *value* match whose
+        // arms the probe did not understand silently became a match that
+        // produces no value, and the enclosing function returned whatever
+        // happened to be there: `fn f() -> [str] ! str { match p { 0 -> args()
+        // _ -> args() } }` returned `0`. Not a panic, not a refusal — a wrong
+        // answer. These are now distinguished, and the first one refuses.
+        let mut probed_any = false;
+        let mut live_arms = false;
         for arm in arms {
             // An arm that leaves the function (or the loop) never reaches the
             // merge, so it says nothing about what the match is worth. Reading
@@ -6724,6 +6763,7 @@ impl FnCx<'_, '_> {
             if arm_diverges(&arm.body) {
                 continue;
             }
+            live_arms = true;
             self.push_scope();
             let bound = self.bind_pattern_types(&arm.pattern, &st).is_ok();
             let probed = if bound {
@@ -6734,17 +6774,25 @@ impl FnCx<'_, '_> {
             self.pop_scope_no_decs();
             match probed {
                 Some(t) if t != VType::Unit => {
+                    probed_any = true;
                     out_t = Some(t);
                     break;
                 }
                 // An arm that yields nothing (e.g. `-> print(..)`) makes this
                 // a statement match: no merge parameter, no value.
                 Some(_) => {
+                    probed_any = true;
                     out_t = None;
                     break;
                 }
                 None => continue,
             }
+        }
+        if live_arms && !probed_any {
+            return nope(
+                span,
+                "a match here whose arms it cannot type (annotate one of them, or lift it into a `let` with a type)",
+            );
         }
         // A value-match needs EVERY arm to yield a value; if any arm is a bare
         // statement call, fall back to statement form.
