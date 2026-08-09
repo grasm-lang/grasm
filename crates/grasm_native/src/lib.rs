@@ -3485,6 +3485,19 @@ impl FnCx<'_, '_> {
             }
             self.goto_block(step);
             let iv2 = self.b.use_var(ivar);
+            // An inclusive range stops *before* incrementing past its end.
+            // Incrementing first and re-testing `i <= end` spins forever when
+            // the end is `i64::MAX`: the add wraps to `i64::MIN`, which is
+            // still `<= end`. The exclusive form cannot reach that, because
+            // its last value is one below the end.
+            if *inclusive {
+                let ev2 = self.b.use_var(end_var);
+                let done = self.b.ins().icmp(IntCC::Equal, iv2, ev2);
+                let bump = self.b.create_block();
+                self.b.ins().brif(done, exit, &[], bump, &[]);
+                self.filled = true;
+                self.goto_block(bump);
+            }
             let one = self.b.ins().iconst(types::I64, 1);
             let next = self.b.ins().iadd(iv2, one);
             self.b.def_var(ivar, next);

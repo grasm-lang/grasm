@@ -1,0 +1,43 @@
+//! tag: E-LOOP-RANGE-MAX
+//! expect: output
+//! 1 1 3
+//! 10 0 0
+// A range may reach the ends of `i64`.
+//
+// The interpreter built `a..=b` as `a..(b + 1)`, which wraps at the top of the
+// range: `mx..=mx` iterated over nothing. The compiled backend incremented
+// and then re-tested `i <= end`, so `i` wrapped and the loop never ended. One
+// program, an empty loop and an endless one, from an overflow neither engine
+// reported.
+fn main() {
+    let mx = 9223372036854775807
+    let mn = 0 - mx - 1
+    var a = 0
+    for i in mx..=mx {
+        a = a + 1
+    }
+    var b = 0
+    for i in mn..=mn {
+        b = b + 1
+    }
+    var c = 0
+    for i in (mx - 2)..=mx {
+        c = c + 1
+    }
+    print("{a} {b} {c}")
+    // The ordinary cases, unchanged: inclusive counts the end, exclusive does
+    // not, and a backwards range runs zero times rather than forever.
+    var d = 0
+    for i in 0..=4 {
+        d = d + i
+    }
+    var e2 = 0
+    for i in 3..3 {
+        e2 = e2 + 1
+    }
+    var f = 0
+    for i in 3..=2 {
+        f = f + 1
+    }
+    print("{d} {e2} {f}")
+}

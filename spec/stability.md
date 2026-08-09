@@ -7,7 +7,7 @@ before it is listed as stable.
 `crates/grasm_spec` fails if a clause here is missing, unknown, or listed twice,
 so this file cannot drift away from the specification it describes.
 
-Today: 103 stable, 57 provisional, 19 experimental, of 179.
+Today: 105 stable, 57 provisional, 19 experimental, of 181.
 
 ## Stable
 
@@ -31,6 +31,7 @@ Will not change incompatibly before 2.0.
 - `E-INOUT-WRITEBACK` — stable
 - `E-LOOP-LIST` — stable
 - `E-LOOP-RANGE` — stable
+- `E-LOOP-RANGE-MAX` — stable
 - `E-MAIN-ERR` — stable
 - `E-MAP-ORDER` — stable
 - `E-MATCH-BUILTIN-ARMS` — stable
@@ -45,6 +46,7 @@ Will not change incompatibly before 2.0.
 - `E-POW` — stable
 - `E-POW-NEG` — stable
 - `E-PRINT-ATOMIC` — stable
+- `E-RECURSION-PARALLEL` — stable
 - `E-SEARCH-SHORTCIRCUIT` — stable
 - `E-SHORTCIRCUIT` — stable
 - `E-STR-CHARS` — stable

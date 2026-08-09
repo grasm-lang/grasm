@@ -1,0 +1,26 @@
+//! tag: E-RECURSION-PARALLEL
+//! expect: output
+//! 4000000
+// Deep recursion inside a parallel closure is bounded the same way.
+//
+// A `par_map` worker runs on its own stack, and it took the platform default —
+// small enough that the guard computed its floor below the end of it and could
+// never fire. Recursion this deep in a worker then ran off the stack for real:
+// SIGBUS, exit 138, nothing on stderr, in the one place [E-RECURSION-DEPTH]
+// promises a panic and exit 101. Inputs small enough to run sequentially were
+// unaffected, which is why it took a few hundred elements to see.
+fn descend(n: i64) -> i64 {
+    if n <= 0 {
+        0
+    } else {
+        descend(n - 1) + 1
+    }
+}
+
+fn main() {
+    var xs: [i64] = []
+    for i in 0..500 {
+        xs.push(8000)
+    }
+    print("{xs.par_map(|x| descend(x)).sum()}")
+}

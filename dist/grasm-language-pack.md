@@ -834,6 +834,14 @@ one place the three ways of running a program differ in what reaches stderr,
 which is why `scripts/agreetest.sh` strips the trace block and compares
 everything else exactly.
 
+**[E-RECURSION-PARALLEL]** The bound above holds inside `par_map` and
+`par_filter` too. A worker runs on its own stack, and it must be big enough for
+the same guarantee — a worker on the platform's default stack computed its
+floor below the end of it, so the guard could never fire and deep recursion in
+a parallel closure took SIGBUS with an empty stderr, which is the exact outcome
+[E-RECURSION-DEPTH] rules out. Small inputs run sequentially and were
+unaffected, so this only appeared past a few hundred elements.
+
 **[E-ARITH-FLOAT]** Float arithmetic follows IEEE-754, including infinities and
 NaN. Division by zero yields an infinity rather than panicking.
 
@@ -905,6 +913,14 @@ matches and whose guard passes is taken.
 
 **[E-LOOP-RANGE]** `for i in a..b` iterates `a` up to but excluding `b`;
 `a..=b` includes `b`. An empty range runs zero times.
+
+**[E-LOOP-RANGE-MAX]** The bounds are `i64` values, `i64::MIN` and `i64::MAX`
+included. `mx..=mx` runs once. Neither engine managed that: the interpreter
+built the inclusive form as `a..(b + 1)`, which wraps to `i64::MIN` at the top
+of the range and iterated over nothing, and the compiled backend tested
+`i <= end` after incrementing, so `i` wrapped and the loop never ended. An
+empty loop and an endless one, from the same program, from an overflow neither
+reported.
 
 **[E-LOOP-LIST]** `for x in xs` iterates a list's elements directly, in order.
 The loop variable is the element, not its index. Iterating an empty list runs
@@ -2667,6 +2683,54 @@ fn main() {
 }
 ```
 
+## `E-LOOP-RANGE-MAX.gr`
+
+```grasm
+//! tag: E-LOOP-RANGE-MAX
+//! expect: output
+//! 1 1 3
+//! 10 0 0
+// A range may reach the ends of `i64`.
+//
+// The interpreter built `a..=b` as `a..(b + 1)`, which wraps at the top of the
+// range: `mx..=mx` iterated over nothing. The compiled backend incremented
+// and then re-tested `i <= end`, so `i` wrapped and the loop never ended. One
+// program, an empty loop and an endless one, from an overflow neither engine
+// reported.
+fn main() {
+    let mx = 9223372036854775807
+    let mn = 0 - mx - 1
+    var a = 0
+    for i in mx..=mx {
+        a = a + 1
+    }
+    var b = 0
+    for i in mn..=mn {
+        b = b + 1
+    }
+    var c = 0
+    for i in (mx - 2)..=mx {
+        c = c + 1
+    }
+    print("{a} {b} {c}")
+    // The ordinary cases, unchanged: inclusive counts the end, exclusive does
+    // not, and a backwards range runs zero times rather than forever.
+    var d = 0
+    for i in 0..=4 {
+        d = d + i
+    }
+    var e2 = 0
+    for i in 3..3 {
+        e2 = e2 + 1
+    }
+    var f = 0
+    for i in 3..=2 {
+        f = f + 1
+    }
+    print("{d} {e2} {f}")
+}
+```
+
 ## `E-LOOP-RANGE.gr`
 
 ```grasm
@@ -3171,6 +3235,37 @@ fn pong(n: i64) -> i64 {
 fn main() {
     print("{down(10000)}")
     print("{ping(10000)}")
+}
+```
+
+## `E-RECURSION-PARALLEL.gr`
+
+```grasm
+//! tag: E-RECURSION-PARALLEL
+//! expect: output
+//! 4000000
+// Deep recursion inside a parallel closure is bounded the same way.
+//
+// A `par_map` worker runs on its own stack, and it took the platform default —
+// small enough that the guard computed its floor below the end of it and could
+// never fire. Recursion this deep in a worker then ran off the stack for real:
+// SIGBUS, exit 138, nothing on stderr, in the one place [E-RECURSION-DEPTH]
+// promises a panic and exit 101. Inputs small enough to run sequentially were
+// unaffected, which is why it took a few hundred elements to see.
+fn descend(n: i64) -> i64 {
+    if n <= 0 {
+        0
+    } else {
+        descend(n - 1) + 1
+    }
+}
+
+fn main() {
+    var xs: [i64] = []
+    for i in 0..500 {
+        xs.push(8000)
+    }
+    print("{xs.par_map(|x| descend(x)).sum()}")
 }
 ```
 

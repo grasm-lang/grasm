@@ -121,6 +121,14 @@ one place the three ways of running a program differ in what reaches stderr,
 which is why `scripts/agreetest.sh` strips the trace block and compares
 everything else exactly.
 
+**[E-RECURSION-PARALLEL]** The bound above holds inside `par_map` and
+`par_filter` too. A worker runs on its own stack, and it must be big enough for
+the same guarantee — a worker on the platform's default stack computed its
+floor below the end of it, so the guard could never fire and deep recursion in
+a parallel closure took SIGBUS with an empty stderr, which is the exact outcome
+[E-RECURSION-DEPTH] rules out. Small inputs run sequentially and were
+unaffected, so this only appeared past a few hundred elements.
+
 **[E-ARITH-FLOAT]** Float arithmetic follows IEEE-754, including infinities and
 NaN. Division by zero yields an infinity rather than panicking.
 
@@ -192,6 +200,14 @@ matches and whose guard passes is taken.
 
 **[E-LOOP-RANGE]** `for i in a..b` iterates `a` up to but excluding `b`;
 `a..=b` includes `b`. An empty range runs zero times.
+
+**[E-LOOP-RANGE-MAX]** The bounds are `i64` values, `i64::MIN` and `i64::MAX`
+included. `mx..=mx` runs once. Neither engine managed that: the interpreter
+built the inclusive form as `a..(b + 1)`, which wraps to `i64::MIN` at the top
+of the range and iterated over nothing, and the compiled backend tested
+`i <= end` after incrementing, so `i` wrapped and the loop never ended. An
+empty loop and an endless one, from the same program, from an overflow neither
+reported.
 
 **[E-LOOP-LIST]** `for x in xs` iterates a list's elements directly, in order.
 The loop variable is the element, not its index. Iterating an empty list runs

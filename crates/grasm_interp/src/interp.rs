@@ -721,10 +721,13 @@ impl<'a, W: Write> Interp<'a, W> {
             } => {
                 let iterable = self.eval_expr(iter)?;
                 let items: Vec<Value> = match iterable {
-                    Value::Range(a, b, incl) => {
-                        let end = if incl { b + 1 } else { b };
-                        (a..end).map(Value::Int).collect()
-                    }
+                    // Built from the two forms directly rather than by
+                    // turning `a..=b` into `a..(b + 1)`. That addition wraps
+                    // when `b` is `i64::MAX`, and the range then ran zero
+                    // times — `mx..=mx` iterated over nothing, against
+                    // [E-LOOP-RANGE], with no overflow reported anywhere.
+                    Value::Range(a, b, true) => (a..=b).map(Value::Int).collect(),
+                    Value::Range(a, b, false) => (a..b).map(Value::Int).collect(),
                     Value::List(items) => items.iter().cloned().collect(),
                     Value::Str(s) => s
                         .chars()

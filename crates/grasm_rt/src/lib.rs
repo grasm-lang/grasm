@@ -711,24 +711,31 @@ pub unsafe extern "C" fn grasm_par_map_scalar(
         let pieces: std::sync::Mutex<Vec<(usize, &mut [i64])>> =
             std::sync::Mutex::new(out.chunks_mut(chunk).enumerate().collect());
         std::thread::scope(|scope| {
-            for _ in 0..workers {
-                let queue = &pieces;
-                let env_ref = &env_owned;
-                scope.spawn(move || {
-                    IN_PARALLEL.with(|f| f.set(true));
-                    loop {
-                        let Some((ci, slot)) =
-                            queue.lock().expect("no panics inside").pop()
-                        else {
-                            return;
-                        };
-                        let src = &input[ci * chunk..ci * chunk + slot.len()];
-                        for (o, &x) in slot.iter_mut().zip(src.iter()) {
-                            *o = code(env_ref.as_ptr(), x);
-                        }
+            let queue = &pieces;
+            let env_ref = &env_owned;
+            let drain = move || {
+                IN_PARALLEL.with(|f| f.set(true));
+                loop {
+                    let Some((ci, slot)) = queue.lock().expect("no panics inside").pop() else {
+                        return;
+                    };
+                    let src = &input[ci * chunk..ci * chunk + slot.len()];
+                    for (o, &x) in slot.iter_mut().zip(src.iter()) {
+                        *o = code(env_ref.as_ptr(), x);
                     }
-                });
+                }
+            };
+            for _ in 0..workers {
+                // A worker that cannot be created is not an error: the queue
+                // is hand-out, so whatever it would have taken is still there
+                // for someone else. The calling thread drains the remainder
+                // below, which is why this result can be dropped and why the
+                // answer is complete even if every spawn fails.
+                let _ = std::thread::Builder::new()
+                    .stack_size(WORKER_STACK)
+                    .spawn_scoped(scope, drain);
             }
+            drain();
         });
     }
 
@@ -865,23 +872,29 @@ pub unsafe extern "C" fn grasm_par_filter_scalar(
         let pieces: std::sync::Mutex<Vec<(usize, &mut [u8])>> =
             std::sync::Mutex::new(keep.chunks_mut(chunk).enumerate().collect());
         std::thread::scope(|scope| {
-            for _ in 0..workers {
-                let queue = &pieces;
-                let env_ref = &env_owned;
-                scope.spawn(move || {
-                    IN_PARALLEL.with(|f| f.set(true));
-                    loop {
-                        let Some((ci, slot)) = queue.lock().expect("no panics inside").pop()
-                        else {
-                            return;
-                        };
-                        let src = &words[ci * chunk..ci * chunk + slot.len()];
-                        for (k, &x) in slot.iter_mut().zip(src.iter()) {
-                            *k = u8::from(code(env_ref.as_ptr(), x) != 0);
-                        }
+            let queue = &pieces;
+            let env_ref = &env_owned;
+            let drain = move || {
+                IN_PARALLEL.with(|f| f.set(true));
+                loop {
+                    let Some((ci, slot)) = queue.lock().expect("no panics inside").pop() else {
+                        return;
+                    };
+                    let src = &words[ci * chunk..ci * chunk + slot.len()];
+                    for (k, &x) in slot.iter_mut().zip(src.iter()) {
+                        *k = u8::from(code(env_ref.as_ptr(), x) != 0);
                     }
-                });
+                }
+            };
+            for _ in 0..workers {
+                // See the note in `par_map`: the calling thread drains the
+                // remainder, so a failed spawn costs parallelism and never
+                // correctness.
+                let _ = std::thread::Builder::new()
+                    .stack_size(WORKER_STACK)
+                    .spawn_scoped(scope, drain);
             }
+            drain();
         });
     }
 
@@ -1872,6 +1885,17 @@ thread_local! {
 /// Under the 8 MiB a main thread usually gets, this leaves room for the panic
 /// itself to be reported — which is the whole point of stopping early.
 const STACK_BUDGET: usize = 6 * 1024 * 1024;
+
+/// The stack a `par_map` / `par_filter` worker gets.
+///
+/// It has to be larger than `STACK_BUDGET`, and by enough to report a panic.
+/// A worker took the platform default — 2 MiB — so the floor computed on its
+/// first check sat *below the end of its own stack* and the guard could never
+/// fire. Deep recursion inside a parallel closure then ran off the stack for
+/// real: SIGBUS, exit 138, nothing on stderr, in the one place
+/// [E-RECURSION-DEPTH] promises a panic and exit 101. The sequential fallback
+/// for small inputs hid it, so it only appeared past a few hundred elements.
+const WORKER_STACK: usize = 8 * 1024 * 1024;
 
 /// Panics if the stack has run down past this thread's floor.
 ///

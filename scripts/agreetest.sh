@@ -156,6 +156,21 @@ fn main() {
     print("{down(0)}")
 }'
 
+# Infinite recursion inside a `par_map` worker. Natively this was SIGBUS,
+# exit 138, with nothing on stderr — the worker's stack was smaller than the
+# budget the guard assumed, so the guard never fired.
+check panic_parallel_overflow 'fn down(n: i64) -> i64 {
+    down(n + 1)
+}
+
+fn main() {
+    var xs: [i64] = []
+    for i in 0..600 {
+        xs.push(i)
+    }
+    print("{xs.par_map(|x| down(x)).len()}")
+}'
+
 check exit_code 'fn main() {
     print("before")
     exit(3)
