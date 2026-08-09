@@ -461,6 +461,17 @@ thread_local! {
     static LIVE: Cell<i64> = const { Cell::new(0) };
 }
 
+/// Prints a reference as the slot it names.
+///
+/// Not the value it points at: the value may already be gone, and reading it
+/// to render a message would be the exact use-after-free the tier prevents.
+#[no_mangle]
+pub extern "C" fn grasm_out_ref(r: i64) {
+    let (i, gen) = unpack_ref(r);
+    let mut out = std::io::stdout().lock();
+    let _ = write!(out, "ref#{i}.{gen}");
+}
+
 /// Allocations still live on this thread.
 ///
 /// Zero at the end of `main` means every allocation was released. It is not
@@ -1943,15 +1954,28 @@ struct Slab {
     free: Vec<u32>,
 }
 
-thread_local! {
-    static SLAB: std::cell::RefCell<Slab> = const {
-        std::cell::RefCell::new(Slab {
-            slots: Vec::new(),
-            gens: Vec::new(),
-            free: Vec::new(),
-        })
-    };
-}
+/// One heap for the whole process, not one per thread.
+///
+/// It was `thread_local`, which is wrong in a way that produces silently
+/// correct-looking programs: a `par_map` worker allocating a `ref` put it in
+/// *its own* slab, and reading that reference from the main thread looked up
+/// the same slot number in a different heap. References came back dead though
+/// nothing was released, or alive holding another node's data — the "stale or
+/// wrong value" [T-REF-STALE] says cannot happen. Sequential code never saw
+/// it, because there was only ever one slab.
+///
+/// A mutex is the right cost here: taking a reference is rare next to reading
+/// through one, and correctness across threads is the entire point of a shared
+/// heap.
+static SLAB: std::sync::Mutex<Slab> = std::sync::Mutex::new(Slab {
+    slots: Vec::new(),
+    gens: Vec::new(),
+    free: Vec::new(),
+});
+
+/// The values in the slab are shared across threads by construction; the mutex
+/// is what orders access to them.
+unsafe impl Send for Slab {}
 
 fn pack_ref(index: u32, gen: u32) -> i64 {
     ((index as i64) << 32) | (gen as i64 & 0xffff_ffff)
@@ -1966,8 +1990,8 @@ fn unpack_ref(r: i64) -> (u32, u32) {
 /// # Safety: `v` is a live pointer whose ownership passes to the slab.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_ref_new(v: *mut RtVal) -> i64 {
-    SLAB.with(|s| {
-        let mut s = s.borrow_mut();
+    {
+        let mut s = SLAB.lock().expect("slab");
         match s.free.pop() {
             Some(i) => {
                 let idx = i as usize;
@@ -1981,7 +2005,7 @@ pub unsafe extern "C" fn grasm_ref_new(v: *mut RtVal) -> i64 {
                 pack_ref(i, 0)
             }
         }
-    })
+    }
 }
 
 /// The value a reference points at, or a panic if it is stale.
@@ -1997,14 +2021,15 @@ pub unsafe extern "C" fn grasm_ref_new(v: *mut RtVal) -> i64 {
 #[no_mangle]
 pub unsafe extern "C" fn grasm_ref_get(r: i64) -> *mut RtVal {
     let (i, gen) = unpack_ref(r);
-    let found = SLAB.with(|s| {
-        let s = s.borrow();
+    let found = {
+        let s = SLAB.lock().expect("slab");
         let idx = i as usize;
         if idx >= s.slots.len() || s.gens[idx] != gen {
-            return None;
+            None
+        } else {
+            s.slots[idx]
         }
-        s.slots[idx]
-    });
+    };
     match found {
         Some(p) => {
             inc(p);
@@ -2020,14 +2045,15 @@ pub unsafe extern "C" fn grasm_ref_get(r: i64) -> *mut RtVal {
 #[no_mangle]
 pub unsafe extern "C" fn grasm_ref_set(r: i64, v: *mut RtVal) {
     let (i, gen) = unpack_ref(r);
-    let old = SLAB.with(|s| {
-        let mut s = s.borrow_mut();
+    let old = {
+        let mut s = SLAB.lock().expect("slab");
         let idx = i as usize;
         if idx >= s.slots.len() || s.gens[idx] != gen || s.slots[idx].is_none() {
-            return Err(());
+            Err(())
+        } else {
+            Ok(s.slots[idx].replace(v))
         }
-        Ok(s.slots[idx].replace(v))
-    });
+    };
     match old {
         Ok(prev) => {
             if let Some(p) = prev {
@@ -2046,11 +2072,11 @@ pub unsafe extern "C" fn grasm_ref_set(r: i64, v: *mut RtVal) {
 #[no_mangle]
 pub extern "C" fn grasm_ref_release(r: i64) {
     let (i, gen) = unpack_ref(r);
-    let taken = SLAB.with(|s| {
-        let mut s = s.borrow_mut();
+    let taken = {
+        let mut s = SLAB.lock().expect("slab");
         let idx = i as usize;
         if idx >= s.slots.len() || s.gens[idx] != gen {
-            return None;
+            return;
         }
         let v = s.slots[idx].take();
         // The generation moves whether or not anything was there, so a
@@ -2058,7 +2084,7 @@ pub extern "C" fn grasm_ref_release(r: i64) {
         s.gens[idx] = s.gens[idx].wrapping_add(1);
         s.free.push(i);
         v
-    });
+    };
     if let Some(p) = taken {
         unsafe { dec(p) };
     }
@@ -2068,11 +2094,9 @@ pub extern "C" fn grasm_ref_release(r: i64) {
 #[no_mangle]
 pub extern "C" fn grasm_ref_alive(r: i64) -> i8 {
     let (i, gen) = unpack_ref(r);
-    SLAB.with(|s| {
-        let s = s.borrow();
-        let idx = i as usize;
-        i8::from(idx < s.slots.len() && s.gens[idx] == gen && s.slots[idx].is_some())
-    })
+    let s = SLAB.lock().expect("slab");
+    let idx = i as usize;
+    i8::from(idx < s.slots.len() && s.gens[idx] == gen && s.slots[idx].is_some())
 }
 
 thread_local! {

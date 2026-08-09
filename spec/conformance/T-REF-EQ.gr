@@ -1,0 +1,22 @@
+//! tag: T-REF-EQ
+//! expect: output
+//! true true false true
+// Two references are equal when they name the same live slot.
+//
+// The interpreter had no case for it, so a `ref` was not equal to *itself* —
+// and the failure was contagious, because equality recurses: any struct, list,
+// tuple or `Option` holding one was never equal to itself either. `contains`,
+// `assert_eq` and every dedup silently misbehaved, against [E-EQ-STRUCTURAL],
+// and the compiled backend disagreed because it compares the packed words and
+// got this right by accident. A cycle-safe graph walk keyed on `seen.contains`
+// looped forever under `grasm run` and terminated compiled — the same program.
+type Node = { v: i64 }
+type Edge = { to: ref Node, w: i64 }
+
+fn main() {
+    let r = ref(Node{ v: 1 })
+    let e1 = Edge{ to: r, w: 5 }
+    let e2 = e1
+    var seen: [Edge] = [e1]
+    print("{e1 == e1} {e1 == e2} {e1 != e1} {seen.contains(e1)}")
+}

@@ -97,7 +97,7 @@ pub fn load_with_paths_in(
 /// two copies of every declaration in it, so a type declared once was reported
 /// as a duplicate at its sole declaration, and `grasm test` ran each of its
 /// tests twice. The import resolves to the entry instead.
-fn load_with_alias(
+pub(crate) fn load_with_alias(
     entry_name: &str,
     entry_display_path: &str,
     provider: &dyn Fn(&str) -> Option<String>,

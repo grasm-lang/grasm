@@ -182,6 +182,14 @@ impl Value {
     pub fn eq_value(&self, other: &Value) -> bool {
         match (self, other) {
             (Value::Int(a), Value::Int(b)) => a == b,
+            // Two references are equal when they name the same live slot.
+            // Missing this arm made a `ref` unequal to *itself* — and the
+            // failure was contagious: any struct, list, tuple or `Option`
+            // holding one was never equal to itself either, so `contains`,
+            // `assert_eq` and every dedup silently misbehaved, against
+            // [E-EQ-STRUCTURAL]. It also disagreed with the compiled backend,
+            // which compares the packed words and got this right by accident.
+            (Value::Ref(i1, g1), Value::Ref(i2, g2)) => i1 == i2 && g1 == g2,
             (Value::Float(a), Value::Float(b)) => a == b,
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Str(a), Value::Str(b)) => a == b,

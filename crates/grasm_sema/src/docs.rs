@@ -606,7 +606,14 @@ pub fn example_program(program: &Program, example: &Example) -> Program {
 
     // The dependency set comes along too, so every *other* module reloaded
     // here namespaces its imports the way it did the first time.
-    crate::loader::load_with_paths_in(
+    // The owner's declarations are inlined into the synthesized entry, so an
+    // import naming the owner has to resolve *to* that entry rather than
+    // loading the module a second time. Without this the kept host module's
+    // own `import lib` pulled in a second copy of everything the example
+    // already had, and every doc example in an imported library failed with
+    // `duplicate type name` — but only when tested through a consumer, which
+    // is the case the tutorial promises behaves identically.
+    crate::loader::load_with_alias(
         "main",
         "<doc example>",
         &|name| {
@@ -617,6 +624,7 @@ pub fn example_program(program: &Program, example: &Example) -> Program {
         },
         &|_| Vec::new(),
         &program.deps,
+        Some(&owner_module),
     )
 }
 

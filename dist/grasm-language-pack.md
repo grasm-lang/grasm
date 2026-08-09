@@ -737,6 +737,11 @@ points at something. Releasing an already-released slot does nothing: a double
 release is not a use-after-free, and making it an error would turn cleanup
 order into something every caller has to track.
 
+**[T-REF-EQ]** Two references are equal when they name the same live slot —
+identity, not the equality of what they point at, which is what a graph walk
+needs to recognise a node it has already visited. Equality recurses, so this is
+also what makes a struct or list *containing* a reference compare sensibly.
+
 **[T-REF-STALE]** Reading through a released reference **panics**, always. The
 slot may already hold something else — released slots are reused immediately,
 which is what keeps a long-lived graph from growing without bound — so the
@@ -6746,6 +6751,33 @@ fn main() {
     var mid = map()
     mid.set("b", Obj(inner))
     print("{depth(Obj(mid))}")
+}
+```
+
+## `T-REF-EQ.gr`
+
+```grasm
+//! tag: T-REF-EQ
+//! expect: output
+//! true true false true
+// Two references are equal when they name the same live slot.
+//
+// The interpreter had no case for it, so a `ref` was not equal to *itself* —
+// and the failure was contagious, because equality recurses: any struct, list,
+// tuple or `Option` holding one was never equal to itself either. `contains`,
+// `assert_eq` and every dedup silently misbehaved, against [E-EQ-STRUCTURAL],
+// and the compiled backend disagreed because it compares the packed words and
+// got this right by accident. A cycle-safe graph walk keyed on `seen.contains`
+// looped forever under `grasm run` and terminated compiled — the same program.
+type Node = { v: i64 }
+type Edge = { to: ref Node, w: i64 }
+
+fn main() {
+    let r = ref(Node{ v: 1 })
+    let e1 = Edge{ to: r, w: 5 }
+    let e2 = e1
+    var seen: [Edge] = [e1]
+    print("{e1 == e1} {e1 == e2} {e1 != e1} {seen.contains(e1)}")
 }
 ```
 

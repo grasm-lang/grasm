@@ -562,6 +562,7 @@ impl<'m> Codegen<'m> {
             ("grasm_set_args", vec![i64t, ptr], None),
             ("grasm_now_millis", vec![], Some(i64t)),
             ("grasm_check_leaks", vec![], None),
+            ("grasm_out_ref", vec![i64t], None),
             ("grasm_ref_new", vec![i64t], Some(i64t)),
             ("grasm_ref_get", vec![i64t], Some(i64t)),
             ("grasm_ref_set", vec![i64t, i64t], None),
@@ -5938,6 +5939,15 @@ impl FnCx<'_, '_> {
                                 }
                                 VType::Bool => {
                                     self.call_rt("grasm_out_bool", &[v]);
+                                }
+                                // A reference prints as the slot it names, the
+                                // same as in the interpreter. Falling through
+                                // to `unreachable!` here made interpolating a
+                                // bare `ref` a Rust panic out of the compiler,
+                                // which is neither a refusal by name nor at
+                                // build time.
+                                VType::Ref(_) => {
+                                    self.call_rt("grasm_out_ref", &[v]);
                                 }
                                 ref vt2 if vt2.boxed() => {
                                     self.call_rt("grasm_out_val", &[v]);

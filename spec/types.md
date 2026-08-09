@@ -393,6 +393,11 @@ points at something. Releasing an already-released slot does nothing: a double
 release is not a use-after-free, and making it an error would turn cleanup
 order into something every caller has to track.
 
+**[T-REF-EQ]** Two references are equal when they name the same live slot —
+identity, not the equality of what they point at, which is what a graph walk
+needs to recognise a node it has already visited. Equality recurses, so this is
+also what makes a struct or list *containing* a reference compare sensibly.
+
 **[T-REF-STALE]** Reading through a released reference **panics**, always. The
 slot may already hold something else — released slots are reused immediately,
 which is what keeps a long-lived graph from growing without bound — so the
