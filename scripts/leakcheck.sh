@@ -9,6 +9,24 @@
 # It is the prerequisite for Tier 1: a `region` works by *not* decrementing
 # inside the block and sweeping at the brace, and a miscount there is either a
 # double-free or a leak. Only one of those announces itself.
+#
+# One cause is already isolated, and it accounts for a good share of the 25.
+# A *tuple pattern* binding a boxed component leaks that component:
+#
+#     let p = (1, "one")
+#     match p { (a, b) -> print("{a} {b}") }     # leaks the string
+#
+# A tuple of two integers is clean, and a *variant* pattern binding a string is
+# clean, so it is specific to the tuple path. There, each component is read out
+# with `grasm_list_get`, which returns a +1, and bound to a temporary made with
+# `new_var` — which is not in a scope, so nothing releases it. The variant path
+# binds through the scope and is released with it.
+#
+# The fix is one of "release the temporary" or "bind it into the scope", and
+# which one is right depends on whether the sub-pattern's own binding takes the
+# +1 or aliases it. Getting that backwards is a use-after-free, so it wants
+# tracing rather than a guess — and now there is a check that will confirm it
+# either way.
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
