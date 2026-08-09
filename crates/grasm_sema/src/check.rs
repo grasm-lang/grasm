@@ -1879,9 +1879,20 @@ that does not change",
                                 ),
                                 None => info.ret.clone(),
                             };
+                            // A generic's type parameters are instantiated
+                            // here, as they are for a bare name. Leaving them
+                            // as `Generic(i)` meant `xs |> lib.uniq` and
+                            // `xs.map(lib.uniq)` reported `expected [T0]`,
+                            // while `lib.uniq(xs)` on the next line was fine.
+                            let fresh: Vec<Type> =
+                                (0..info.generics).map(|_| self.uni.fresh()).collect();
                             return Type::Fn {
-                                params: info.params.clone(),
-                                ret: Box::new(ret),
+                                params: info
+                                    .params
+                                    .iter()
+                                    .map(|p| substitute_generics(p, &fresh))
+                                    .collect(),
+                                ret: Box::new(substitute_generics(&ret, &fresh)),
                             };
                         }
                         Some(_) => {

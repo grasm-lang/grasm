@@ -274,3 +274,37 @@ fn a_type_declaration_may_name_a_type_from_another_module() {
         ("lib", "pub type Thing = { n: i64 }\n"),
     ]);
 }
+
+/// A *generic* imported function may be piped and passed as a value.
+///
+/// Its type parameters were left uninstantiated when it was used as a value,
+/// so `xs |> lib.uniq` reported `expected [T0], found [str]` while
+/// `lib.uniq(xs)` on the next line was fine. A local generic piped correctly
+/// and a qualified non-generic passed correctly; only the combination broke.
+#[test]
+fn a_qualified_generic_may_be_piped_and_passed() {
+    ok(&[
+        (
+            "main",
+            "import lib\n\n\
+             fn main() {\n\
+             \x20   let n = lib.uniq([1, 1, 2]).len()\n\
+             \x20   let piped = [1, 1] |> lib.uniq\n\
+             \x20   let mapped = [[1, 1]].map(lib.uniq)\n\
+             \x20   print(\"{n} {piped} {mapped}\")\n\
+             }\n",
+        ),
+        (
+            "lib",
+            "pub fn uniq[T](xs: [T]) -> [T] {\n\
+             \x20   var out: [T] = []\n\
+             \x20   for x in xs {\n\
+             \x20       if not out.contains(x) {\n\
+             \x20           out.push(x)\n\
+             \x20       }\n\
+             \x20   }\n\
+             \x20   out\n\
+             }\n",
+        ),
+    ]);
+}
