@@ -390,6 +390,16 @@ inference local and errors near their cause.
 and is converted at compile time. A non-literal `i64` value is not implicitly
 converted; use `.as_f64()`.
 
+**[T-INT-TO-FLOAT-CARRIED]** "Converted at compile time" means *everywhere the
+value goes afterwards*, not only where it was written. `xs.push(3)` into a
+`[f64]` pushes `3.0`, so the list sorts as floats, compares equal to the same
+list written `3.0`, and prints with a point. This is a rule about the engines
+rather than about the language, and it needed saying because neither engine had
+the information: only the checker knows which literals are floats, and each
+backend had been converting where it happened to remember to — differently, and
+in both cases incompletely. The checker now hands the set over, so the answer is
+the same one twice.
+
 **[T-EMPTY-LIT]** An empty collection literal takes its element type from the
 surrounding annotation, struct field, parameter, or return type. Without any
 of those the program is rejected.
@@ -5685,6 +5695,56 @@ fn add(a: i32, b: u8) -> int {
 }
 fn main() {
     print("{add(1, 2)} {5.0}")
+}
+```
+
+## `T-INT-TO-FLOAT-CARRIED.gr`
+
+```grasm
+//! tag: T-INT-TO-FLOAT-CARRIED
+//! expect: output
+//! [1.5, 3.0] 3.0
+//! true true
+//! 7.0 4.0 -2.0
+//! 3.0 true
+//! 1.5 3.0
+// An integer literal in an `f64` position is a float *everywhere*.
+//
+// [T-INT-TO-FLOAT] says the conversion happens at compile time, and only the
+// checker knows which literals are affected. Neither engine was told, so each
+// converted where it happened to remember to. The interpreter — the normative
+// one — kept `xs.push(3)` into a `[f64]` as an integer, and that list then
+// sorted wrong, compared unequal to the same list written `3.0`, and printed
+// with no point. The compiled backend forgot elsewhere: a `Map[str, f64]`
+// value panicked with `unbox: not an f64`, and `contains(3)` answered `false`
+// to a comparison that was true.
+type P = { v: f64 }
+
+fn arg(v: f64) -> f64 {
+    v
+}
+
+fn main() {
+    var xs: [f64] = []
+    xs.push(3)
+    xs.push(1.5)
+    xs.sort()
+    print("{xs} {xs.max() ?? 0.0}")
+    // Structural equality has to see the same value on both sides.
+    let ys: [f64] = [1.0]
+    var zs: [f64] = []
+    zs.push(1)
+    print("{P{ v: 1 } == P{ v: 1.0 }} {ys == zs}")
+    // A parameter, a map value, a negated literal.
+    var m: Map[str, f64] = {}
+    m.set("a", 4)
+    print("{arg(7)} {m.get("a") ?? 0.0} {arg(-2)}")
+    // Inferred from a sibling element rather than from an annotation.
+    let x = 1.5
+    print("{[x, 3].max() ?? 0.0} {[x, 3, 2, -4].contains(3)}")
+    // A method argument. The checker accepted this and the interpreter
+    // panicked with `min expects a float`.
+    print("{x.min(3)} {x.max(3)}")
 }
 ```
 

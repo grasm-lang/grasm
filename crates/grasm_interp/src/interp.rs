@@ -53,6 +53,8 @@ pub struct Interp<'a, W: Write> {
     /// evaluates the initializer again — the same thing the native backend
     /// does, rather than two different notions of when a constant happens.
     consts: HashMap<String, &'a grasm_syntax::ast::ConstDecl>,
+    /// Integer literals the checker resolved to `f64`, by span start.
+    float_literals: std::collections::HashSet<u32>,
     /// `type Res = i64 ! E` — needed to tell whether a function that returns
     /// an alias is fallible, which decides whether its value is wrapped.
     aliases: HashMap<String, TypeExpr>,
@@ -114,6 +116,11 @@ impl<'a, W: Write> Interp<'a, W> {
     pub fn new(module: &'a Module, out: &'a mut W) -> Self {
         let mut me = Self::raw_new(out);
         me.register_module("main", module);
+        // Asked for here rather than by each caller. Which integer literals
+        // are `f64` is a fact only the checker has ([T-INT-TO-FLOAT-CARRIED]),
+        // and a caller that forgets to pass it gets silently wrong arithmetic
+        // — so no caller is asked to remember.
+        me.float_literals = grasm_sema::check::check(module).float_literals;
         me
     }
 
@@ -123,6 +130,15 @@ impl<'a, W: Write> Interp<'a, W> {
         out: &'a mut W,
     ) -> Self {
         Self::build(files, out)
+    }
+
+    /// The integer literals the checker resolved to `f64`, from `Analysis`.
+    ///
+    /// Every path that runs a program checks it first, so this is always
+    /// available; a caller that skips it gets the old behaviour, which is
+    /// wrong but not worse than it was.
+    pub fn set_float_literals(&mut self, spans: std::collections::HashSet<u32>) {
+        self.float_literals = spans;
     }
 
     fn build(
@@ -216,6 +232,7 @@ impl<'a, W: Write> Interp<'a, W> {
             fns,
             current_module: "main".to_string(),
             consts: HashMap::new(),
+            float_literals: std::collections::HashSet::new(),
             aliases: HashMap::new(),
             externs: HashMap::new(),
             fallible_ops: std::collections::HashSet::new(),
@@ -857,7 +874,19 @@ impl<'a, W: Write> Interp<'a, W> {
 
     fn eval_expr(&mut self, e: &Expr) -> EResult {
         match e {
-            Expr::Int(v, _) => Ok(Value::Int(*v)),
+            // An integer literal the checker placed in an `f64` position is
+            // a float here, because [T-INT-TO-FLOAT] says the conversion
+            // happens at compile time and this engine has no types of its own
+            // to do it with. Keeping it an integer made `xs.push(3)` into a
+            // `[f64]` store an `i64`: the list then sorted wrong, compared
+            // unequal to the same list written `3.0`, and printed with no
+            // point — three wrong answers from the engine the specification
+            // calls normative.
+            Expr::Int(v, sp) => Ok(if self.float_literals.contains(&sp.start) {
+                Value::Float(*v as f64)
+            } else {
+                Value::Int(*v)
+            }),
             Expr::Float(v, _) => Ok(Value::Float(*v)),
             Expr::Bool(v, _) => Ok(Value::Bool(*v)),
             Expr::Str(pieces, _) => {

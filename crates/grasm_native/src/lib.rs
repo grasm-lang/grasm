@@ -203,6 +203,7 @@ fn compile_object_scoped(
     let mut module = ObjectModule::new(builder);
 
     let mut cg = Codegen::new(&mut module);
+    cg.float_literals = grasm_sema::check::check_program(program).float_literals;
     cg.only_module = only_module.map(str::to_string);
     cg.declare_runtime()?;
     let views: Vec<(String, &AstModule, std::collections::HashMap<String, String>)> = program
@@ -308,6 +309,16 @@ struct Codegen<'m> {
     /// Consulted by `vtype_of`, so a `T` in a signature resolves like any
     /// other type name while that instantiation is being emitted.
     generic_subst: HashMap<String, VType>,
+    /// Integer literals the checker resolved to `f64`, by span start.
+    ///
+    /// The backend used to convert these itself, at each place it happened to
+    /// remember to: a list element, a function argument, an `if` merge. Where
+    /// it forgot — a `Map[str, f64]` value, a `contains` argument — the
+    /// literal stayed an `i64` and the program either panicked with
+    /// `unbox: not an f64` or answered `false` to a comparison that was true.
+    /// The checker already knows which literals are floats; asking it once is
+    /// both correct and the same answer the interpreter gets.
+    float_literals: std::collections::HashSet<u32>,
 }
 
 /// One monomorphized copy of a generic function.
@@ -387,6 +398,7 @@ impl<'m> Codegen<'m> {
             recursive: std::collections::HashSet::new(),
             pending_generics: Vec::new(),
             generic_subst: HashMap::new(),
+            float_literals: std::collections::HashSet::new(),
         }
     }
 
@@ -3672,6 +3684,13 @@ impl FnCx<'_, '_> {
 
     fn eval_expr(&mut self, e: &Expr) -> CResult<Option<(Value, VType)>> {
         match e {
+            // A literal the checker placed in an `f64` position *is* a float
+            // ([T-INT-TO-FLOAT]), everywhere and not only where this backend
+            // remembered to convert it.
+            Expr::Int(v, sp) if self.cg.float_literals.contains(&sp.start) => Ok(Some((
+                self.b.ins().f64const(*v as f64),
+                VType::F64,
+            ))),
             Expr::Int(v, _) => Ok(Some((self.b.ins().iconst(types::I64, *v), VType::I64))),
             Expr::Map(entries, _) => {
                 let mut m = self.call_rt("grasm_map_new", &[]).unwrap();

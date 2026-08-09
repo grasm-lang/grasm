@@ -18,6 +18,16 @@ pub struct Analysis {
     /// read — and without it `pub let WIDTH = 42` becoming `= "x"` looked like
     /// no change at all to `grasm api`.
     pub const_types: std::collections::BTreeMap<String, String>,
+    /// Start offsets of the integer literals that sit in an `f64` position.
+    ///
+    /// [T-INT-TO-FLOAT] says such a literal "is converted at compile time",
+    /// and only the checker knows which ones those are. Without this the
+    /// interpreter kept them as `i64` at run time, so `xs.push(3)` into a
+    /// `[f64]` stored an integer: the list then sorted wrong, compared
+    /// unequal to the same list written `3.0`, and printed without its point.
+    /// Spans are globally unique across a program — the loader gives each file
+    /// a disjoint base — so the start offset identifies the literal.
+    pub float_literals: std::collections::HashSet<u32>,
 }
 
 pub fn check(module: &Module) -> Analysis {
@@ -96,6 +106,7 @@ fn check_modules(files: &[ModuleView]) -> Analysis {
             .filter(|(_, (_, is_pub))| *is_pub)
             .map(|(k, (t, _))| (k.clone(), TypeDisplay { ty: t, defs: &c.defs }.to_string()))
             .collect(),
+        float_literals: c.float_literals,
         defs: c.defs,
         diagnostics,
     }
@@ -132,6 +143,9 @@ struct Checker {
     defs: TypeDefs,
     aliases: HashMap<String, Type>,
     fns: HashMap<String, FnInfo>,
+    /// Integer literals promoted to `f64`, by span start. See
+    /// `Analysis::float_literals`.
+    float_literals: std::collections::HashSet<u32>,
     /// effect name → (ops, handler struct TypeDefId).
     effects: HashMap<String, (Vec<EffectOp>, TypeDefId)>,
     /// variant name → (typedef, variant index); ambiguous names keep all.
@@ -200,6 +214,7 @@ impl Checker {
             defs,
             aliases: HashMap::new(),
             fns: HashMap::new(),
+            float_literals: std::collections::HashSet::new(),
             effects: HashMap::new(),
             variants,
             uni: Unifier::new(),
@@ -1208,12 +1223,16 @@ that does not change",
 
     fn check_expr(&mut self, e: &Expr, expected: &Type) {
         let want = self.uni.shallow_resolve(expected);
-        // Int literal adapts to f64.
+        // Int literal adapts to f64. Recorded, not just allowed: the engines
+        // have no types of their own and would otherwise keep the value an
+        // integer for the whole run ([T-INT-TO-FLOAT]).
         if let (Expr::Int(..), Type::F64) = (e, &want) {
+            self.float_literals.insert(e.span().start);
             return;
         }
         if let (Expr::Unary { op: UnaryOp::Neg, expr, .. }, Type::F64) = (e, &want) {
             if matches!(**expr, Expr::Int(..)) {
+                self.float_literals.insert(expr.span().start);
                 return;
             }
         }
@@ -2851,6 +2870,7 @@ that does not change",
         if matches!(lhs, Expr::Int(..)) && self.uni.shallow_resolve(&lhs_ty) == Type::I64 {
             let probe = self.infer_expr(rhs);
             if self.uni.shallow_resolve(&probe) == Type::F64 {
+                self.float_literals.insert(lhs.span().start);
                 return Type::F64;
             }
         }

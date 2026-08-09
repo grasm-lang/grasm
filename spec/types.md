@@ -61,6 +61,16 @@ inference local and errors near their cause.
 and is converted at compile time. A non-literal `i64` value is not implicitly
 converted; use `.as_f64()`.
 
+**[T-INT-TO-FLOAT-CARRIED]** "Converted at compile time" means *everywhere the
+value goes afterwards*, not only where it was written. `xs.push(3)` into a
+`[f64]` pushes `3.0`, so the list sorts as floats, compares equal to the same
+list written `3.0`, and prints with a point. This is a rule about the engines
+rather than about the language, and it needed saying because neither engine had
+the information: only the checker knows which literals are floats, and each
+backend had been converting where it happened to remember to — differently, and
+in both cases incompletely. The checker now hands the set over, so the answer is
+the same one twice.
+
 **[T-EMPTY-LIT]** An empty collection literal takes its element type from the
 surrounding annotation, struct field, parameter, or return type. Without any
 of those the program is rejected.
