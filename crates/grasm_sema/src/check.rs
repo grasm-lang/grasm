@@ -2368,8 +2368,12 @@ that does not change",
                     }
                     "min" | "max" => {
                         check_arity(self, 0);
-                        let r = self.uni.shallow_resolve(&elem);
-                        if !matches!(r, Type::I64 | Type::F64 | Type::Str | Type::Var(_) | Type::Error) {
+                        // The same predicate `sort` uses. Spelling the list
+                        // out separately here left tuples out, so
+                        // `xs.enumerate().min()` — the obvious "index of the
+                        // smallest" — was an error on a list `sort` will
+                        // happily order, against [L-LIB-TUPLE].
+                        if !self.is_ordered(&elem) {
                             let shown = self.show(&elem);
                             self.error(span, format!("cannot take min/max of `{shown}` values"));
                         }

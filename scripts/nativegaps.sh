@@ -138,6 +138,63 @@ fn main() {
 
 # The half that must keep working: builtins the probe *does* know. Every one of
 # these compiled to a silent `0` before, which no refusal would have caught.
+expect_refused "an inout argument that is not a plain variable" 'type Bag = { items: [i64] }
+
+fn push_one(inout xs: [i64]) {
+    xs.push(1)
+}
+
+fn main() {
+    var b = Bag{ items: [] }
+    push_one(b.items)
+    print("{b.items}")
+}'
+
+expect_refused "returning a closure" 'fn mk_adder(n: i64) -> fn(i64) -> i64 {
+    |x| x + n
+}
+
+fn main() {
+    let f = mk_adder(10)
+    print("{f(5)}")
+}'
+
+expect_refused "a handler bound by a for loop" 'effect Src {
+    fn get() -> str
+}
+
+fn main() {
+    let hs = [SrcHandler{ get: || "a" }, SrcHandler{ get: || "b" }]
+    for h in hs {
+        with Src handled_by h {
+            print("{Src.get()}")
+        }
+    }
+}'
+
+# The neighbouring shapes that must keep compiling, so the three rows above
+# stay as narrow as they claim to be.
+expect_compiled "an inout argument that is a plain variable" 'fn push_one(inout xs: [i64]) {
+    xs.push(1)
+}
+
+fn main() {
+    var xs: [i64] = []
+    push_one(xs)
+    print("{xs}")
+}'
+
+expect_compiled "a let-bound handler" 'effect Src {
+    fn get() -> str
+}
+
+fn main() {
+    let h = SrcHandler{ get: || "a" }
+    with Src handled_by h {
+        print("{Src.get()}")
+    }
+}'
+
 expect_compiled "a match whose arms are builtin calls" 'fn constant(p: i64) -> f64 ! str {
     match p {
         0 -> e()

@@ -1095,7 +1095,7 @@ is judged on.
 | type | rendering | example |
 |------|-----------|---------|
 | `i64` | decimal | `-7` |
-| `f64` | the fewest **digits** that round-trip, written out positionally — never exponent notation, and **always with a point** at every magnitude | `1.5`, `1000000.0`, `1000000000000000.0`, `-0.0`; `1e300` is 301 characters |
+| `f64` | the fewest **digits** that round-trip, written out positionally — never exponent notation, and **always with a point** at every magnitude | `1.5`, `1000000.0`, `1000000000000000.0`, `-0.0`; `1e300` is 303 characters |
 | `f64`, not finite | `inf`, `-inf`, `NaN` — `NaN` is the one mixed-case rendering here | `inf` |
 | `()` | `()` | |
 | `bool` | `true` / `false` | |
@@ -1356,8 +1356,11 @@ is no element to invent past the end of one. Both give `[(A, B)]`, which
 **[L-LIB-TUPLE]** A tuple's components are read by position — `pair.0`,
 `pair.1` — and a tuple of ordered components is itself ordered, compared
 component by component. That is what `<` on tuples means, what `sort` on a
-list of them does, and what makes `xs.sort_by(|p| (p.dept, p.age, p.name))` a
-multi-key sort rather than an error.
+list of them does, `min`/`max` included, and what makes
+`xs.sort_by(|p| (p.dept, p.age, p.name))` a multi-key sort rather than an
+error. `min` and `max` used to spell out the types they accepted instead of
+asking whether the element was ordered, so `xs.enumerate().min()` — the obvious
+"index of the smallest" — was refused on a list `sort` orders happily.
 
 ## 5. `Map[K, V]`
 
@@ -2015,6 +2018,9 @@ runs only under `grasm run`:
 | a type parameter appearing **only** in a function-typed parameter's result | `fn key_by[T, K](xs: [T], f: fn(T) -> K) -> [K]` |
 | an empty list literal with no type in view | `var xs = []` — write `var xs: [i64] = []` |
 | a `match` no arm of which has an inferable type | every arm `map()` — give one arm a type, or lift it into an annotated `let` |
+| an `inout` argument that is not a plain variable | `push_one(b.items)`, `add(xs[0], 5)` — bind it to a `var` first |
+| returning a closure | `fn mk(n: i64) -> fn(i64) -> i64 { \|x\| x + n }` — a top-level `fn` works |
+| a handler that is a loop variable or a list element | `for h in hs { with Src handled_by h { … } }` — a `let`-bound handler compiles |
 
 Each of these is a defect being worked off, not a design boundary. The list is
 checked against the implementation rather than remembered: if one of them

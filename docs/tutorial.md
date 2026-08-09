@@ -622,6 +622,9 @@ runs only under `grasm run`:
 | a type parameter appearing **only** in a function-typed parameter's result | `fn key_by[T, K](xs: [T], f: fn(T) -> K) -> [K]` |
 | an empty list literal with no type in view | `var xs = []` — write `var xs: [i64] = []` |
 | a `match` no arm of which has an inferable type | every arm `map()` — give one arm a type, or lift it into an annotated `let` |
+| an `inout` argument that is not a plain variable | `push_one(b.items)`, `add(xs[0], 5)` — bind it to a `var` first |
+| returning a closure | `fn mk(n: i64) -> fn(i64) -> i64 { \|x\| x + n }` — a top-level `fn` works |
+| a handler that is a loop variable or a list element | `for h in hs { with Src handled_by h { … } }` — a `let`-bound handler compiles |
 
 Each of these is a defect being worked off, not a design boundary. The list is
 checked against the implementation rather than remembered: if one of them

@@ -1383,7 +1383,8 @@ impl<'m> Codegen<'m> {
                 let Some(Expr::StructLit { fields, .. }) = &resolved else {
                     return nope(
                         handler.span(),
-                        "handlers that are neither a struct literal nor a name bound to one",
+                        "a handler that is not a struct literal or a `let` bound \
+to one — a loop variable or a list element is this case",
                     );
                 };
                 let mut site = Vec::new();
@@ -7365,8 +7366,9 @@ impl FnCx<'_, '_> {
         let Some(args) = hint else {
             return nope(
                 span,
-                "a closure with parameters used as a value without being called \
-(its parameter types have nothing to come from)",
+                "a closure with parameters used as a value where no type says \
+what its parameters are (returning one from a function is this case: give the \
+closure explicit parameter types, or make it a top-level `fn`)",
             );
         };
         if args.len() != params.len() {
