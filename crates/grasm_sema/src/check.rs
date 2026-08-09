@@ -71,6 +71,10 @@ fn check_modules(files: &[ModuleView]) -> Analysis {
     // names the thing that was already declared.
     for f in files {
         c.current_module = f.name.clone();
+        c.collect_externs(f.module);
+    }
+    for f in files {
+        c.current_module = f.name.clone();
         c.collect_consts(f.module);
     }
     for f in files {
@@ -427,6 +431,70 @@ impl Checker {
             };
             self.consts.insert(key, (self.uni.resolve(&ty), c.is_pub));
         }
+    }
+
+    /// C functions, registered as ordinary functions with an `io` effect.
+    ///
+    /// Their effects are unknowable, so the conservative row is the one that
+    /// says "this touches the outside world" — which is what keeps a package's
+    /// capability ceiling meaningful across an FFI call.
+    fn collect_externs(&mut self, module: &Module) {
+        for decl in &module.decls {
+            let Decl::Extern(e) = decl else { continue };
+            let key = format!("{}::{}", self.current_module, e.name.name);
+            if self.fns.contains_key(&key) {
+                self.error(e.name.span, format!("duplicate function `{}`", e.name.name));
+                continue;
+            }
+            let params: Vec<Type> = e
+                .params
+                .iter()
+                .map(|p| self.resolve_type(&p.ty, &[]))
+                .collect();
+            let ret = e
+                .ret
+                .as_ref()
+                .map(|t| self.resolve_type(t, &[]))
+                .unwrap_or(Type::Unit);
+            for (p, t) in e.params.iter().zip(&params) {
+                if !Self::is_c_abi_type(t) {
+                    let shown = self.show(t);
+                    self.error_help(
+                        p.ty.span(),
+                        format!("`{shown}` has no C representation"),
+                        "an `extern fn` takes and returns `i64` or `f64`",
+                    );
+                }
+            }
+            if ret != Type::Unit && !Self::is_c_abi_type(&ret) {
+                let shown = self.show(&ret);
+                self.error_help(
+                    e.span,
+                    format!("`{shown}` has no C representation"),
+                    "an `extern fn` takes and returns `i64` or `f64`",
+                );
+            }
+            self.fns.insert(
+                key,
+                FnInfo {
+                    is_pub: e.is_pub,
+                    generics: 0,
+                    params,
+                    modes: e.params.iter().map(|p| p.mode).collect(),
+                    ret,
+                    err: None,
+                },
+            );
+        }
+    }
+
+    /// Types that cross the C boundary unchanged.
+    ///
+    /// `bool` is deliberately excluded: C's is one byte and Grasm's is a
+    /// register, and a silent width mismatch at an FFI boundary is the kind of
+    /// bug that shows up as garbage three calls later.
+    fn is_c_abi_type(t: &Type) -> bool {
+        matches!(t, Type::I64 | Type::F64)
     }
 
     fn collect_fns(&mut self, module: &Module) {

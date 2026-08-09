@@ -31,6 +31,13 @@ struct Ctx<'a> {
     /// qualified name (`mod::fn`) → decl
     fns: HashMap<String, &'a FnDecl>,
     effect_names: HashSet<String>,
+    /// `module::name` for every declared C function.
+    ///
+    /// What a C function does is unknowable, so calling one performs `io`.
+    /// Without that an `extern` call escaped both the capability ceiling and
+    /// [T-PAR-MAP-PURE] — `par_map` accepted a function calling `getpid`, and
+    /// returned different answers on different elements.
+    externs: HashSet<String>,
     rows: HashMap<String, BTreeSet<String>>,
     /// module → (alias → target module)
     imports: HashMap<String, HashMap<String, String>>,
@@ -101,6 +108,7 @@ pub fn effects_of_program(program: &crate::loader::Program) -> BTreeSet<String> 
     let mut ctx = Ctx {
         fns: HashMap::new(),
         effect_names: HashSet::new(),
+        externs: HashSet::new(),
         rows: HashMap::new(),
         imports: HashMap::new(),
     };
@@ -113,6 +121,9 @@ pub fn effects_of_program(program: &crate::loader::Program) -> BTreeSet<String> 
                 }
                 Decl::Effect(e) => {
                     ctx.effect_names.insert(e.name.name.clone());
+                }
+                Decl::Extern(x) => {
+                    ctx.externs.insert(format!("{}::{}", f.name, x.name.name));
                 }
                 _ => {}
             }
@@ -172,6 +183,7 @@ pub fn check_effects_multi(files: &[ModuleView]) -> Vec<Diagnostic> {
     let mut ctx = Ctx {
         fns: HashMap::new(),
         effect_names: HashSet::new(),
+        externs: HashSet::new(),
         rows: HashMap::new(),
         imports: HashMap::new(),
     };
@@ -185,6 +197,9 @@ pub fn check_effects_multi(files: &[ModuleView]) -> Vec<Diagnostic> {
                 }
                 Decl::Effect(e) => {
                     ctx.effect_names.insert(e.name.name.clone());
+                }
+                Decl::Extern(x) => {
+                    ctx.externs.insert(format!("{}::{}", f.name, x.name.name));
                 }
                 _ => {}
             }
@@ -1009,6 +1024,12 @@ fn walk_expr(
         Expr::Call { callee, args, .. } => {
             if let Expr::Ident(id) = &**callee {
                 if IO_BUILTINS.contains(&id.name.as_str()) && !active.iter().any(|a| a == IO) {
+                    out.insert(IO.to_string());
+                }
+                // A C function's effects are unknowable, so it performs `io`.
+                if ctx.externs.contains(&format!("{current}::{}", id.name))
+                    && !active.iter().any(|a| a == IO)
+                {
                     out.insert(IO.to_string());
                 }
                 if let Some(qual) = ctx.resolve_call(current, &id.name) {

@@ -1,0 +1,23 @@
+//! tag: T-EXTERN
+//! expect: output
+//! 7 4.0
+//! 3.0 -2
+//! true
+// Calling C. The compiled backend resolves the symbol at link time; the
+// interpreter finds it in its own process, which already has libc loaded.
+// Both make the identical call.
+//
+// Signatures are `i64` and `f64` only. `bool` is excluded on purpose: C's is
+// one byte and Grasm's is a register, and a silent width mismatch at an FFI
+// boundary shows up as garbage three calls later.
+extern fn abs(n: i64) -> i64
+extern fn sqrt(x: f64) -> f64
+extern fn pow(base: f64, exp: f64) -> f64
+extern fn getpid() -> i64
+
+fn main() {
+    print("{abs(0 - 7)} {sqrt(16.0)}")
+    print("{pow(3.0, 1.0)} {abs(2) - 4}")
+    // A real process id, so this proves the call actually happened.
+    print("{getpid() > 0}")
+}

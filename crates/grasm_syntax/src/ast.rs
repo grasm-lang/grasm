@@ -50,6 +50,7 @@ pub fn decl_span(d: &Decl) -> Span {
     match d {
         Decl::Fn(f) => f.span,
         Decl::Const(c) => c.span,
+        Decl::Extern(e) => e.span,
         Decl::Type(t) => t.span,
         Decl::Effect(e) => e.span,
         Decl::Test(t) => t.span,
@@ -63,11 +64,25 @@ pub enum Decl {
     Fn(FnDecl),
     /// `let NAME = expr` at module level.
     Const(ConstDecl),
+    /// `extern fn name(a: i64) -> i64` — a C function, resolved at link time.
+    Extern(ExternDecl),
     Type(TypeDecl),
     Effect(EffectDecl),
     Test(TestDecl),
     Bench(BenchDecl),
     Import(ImportDecl),
+}
+
+/// A C function this program calls. It has no body: the symbol is resolved
+/// against the platform at link time, and by the process's own symbol table
+/// when interpreted.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExternDecl {
+    pub is_pub: bool,
+    pub name: Ident,
+    pub params: Vec<Param>,
+    pub ret: Option<TypeExpr>,
+    pub span: Span,
 }
 
 /// A module-level constant. Immutable, and its initializer must be free of

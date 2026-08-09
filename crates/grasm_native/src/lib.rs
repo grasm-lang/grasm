@@ -949,6 +949,41 @@ impl<'m> Codegen<'m> {
     fn declare_fns(&mut self, module_ast: &AstModule) -> CResult<()> {
         for decl in &module_ast.decls {
             match decl {
+                // A C function: declared as an imported symbol and called
+                // directly. The linker resolves it against libc or whatever
+                // else the platform provides.
+                Decl::Extern(e) => {
+                    let mut sig = self.module.make_signature();
+                    let mut param_ts = Vec::new();
+                    for p in &e.params {
+                        let vt = self.vtype_of(&p.ty)?;
+                        sig.params.push(AbiParam::new(vt.cl()));
+                        param_ts.push(vt);
+                    }
+                    let ret_t = match &e.ret {
+                        Some(t) => self.vtype_of(t)?,
+                        None => VType::Unit,
+                    };
+                    if ret_t != VType::Unit {
+                        sig.returns.push(AbiParam::new(ret_t.cl()));
+                    }
+                    let id = self
+                        .module
+                        .declare_function(&e.name.name, Linkage::Import, &sig)
+                        .map_err(|err| Unsupported {
+                            span: e.span,
+                            what: format!("declaring `{}`: {err}", e.name.name),
+                        })?;
+                    self.fns.insert(
+                        format!("{}::{}", self.current_module, e.name.name),
+                        FnSig {
+                            id,
+                            params: param_ts,
+                            modes: e.params.iter().map(|p| p.mode).collect(),
+                            ret: ret_t,
+                        },
+                    );
+                }
                 // Constants are inlined at each use, so there is no symbol to
                 // declare — see `const_inits`.
                 Decl::Const(c) => {

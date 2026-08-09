@@ -363,6 +363,8 @@ impl Parser {
         }
         match self.cur() {
             TokenKind::KwFn => Ok(Decl::Fn(self.parse_fn(is_pub)?)),
+            // `extern fn abs(n: i64) -> i64` — a C function.
+            TokenKind::Ident(n) if n == "extern" => Ok(Decl::Extern(self.parse_extern(is_pub)?)),
             // `let WIDTH = 77` at module level. Without it every layout
             // constant became a zero-argument function.
             TokenKind::KwLet => Ok(Decl::Const(self.parse_const(is_pub)?)),
@@ -378,6 +380,27 @@ impl Parser {
                 Err(())
             }
         }
+    }
+
+    fn parse_extern(&mut self, is_pub: bool) -> PResult<ExternDecl> {
+        let start = self.cur_span();
+        self.bump(); // `extern`
+        self.expect(&TokenKind::KwFn)?;
+        let name = self.ident()?;
+        let params = self.parse_params()?;
+        let ret = if self.eat(&TokenKind::Arrow) {
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        let span = start.merge(self.toks[self.i - 1].span);
+        Ok(ExternDecl {
+            is_pub,
+            name,
+            params,
+            ret,
+            span,
+        })
     }
 
     fn parse_const(&mut self, is_pub: bool) -> PResult<ConstDecl> {

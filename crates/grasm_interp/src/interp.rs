@@ -56,6 +56,8 @@ pub struct Interp<'a, W: Write> {
     /// `type Res = i64 ! E` — needed to tell whether a function that returns
     /// an alias is fallible, which decides whether its value is wrapped.
     aliases: HashMap<String, TypeExpr>,
+    /// C functions this program declares, by `module::name`.
+    externs: HashMap<String, &'a grasm_syntax::ast::ExternDecl>,
     /// `Effect.op` for every operation declaring `! E`.
     ///
     /// A handler is an ordinary closure, so calling one produced a bare value
@@ -154,6 +156,10 @@ impl<'a, W: Write> Interp<'a, W> {
                     self.consts
                         .insert(format!("{mod_name}::{}", c.name.name), c);
                 }
+                Decl::Extern(e) => {
+                    self.externs
+                        .insert(format!("{mod_name}::{}", e.name.name), e);
+                }
                 Decl::Type(t) if matches!(t.body, TypeBody::Alias(_)) => {
                     if let TypeBody::Alias(te) = &t.body {
                         self.aliases.insert(t.name.name.clone(), te.clone());
@@ -211,6 +217,7 @@ impl<'a, W: Write> Interp<'a, W> {
             current_module: "main".to_string(),
             consts: HashMap::new(),
             aliases: HashMap::new(),
+            externs: HashMap::new(),
             fallible_ops: std::collections::HashSet::new(),
             imports: HashMap::new(),
             sums,
@@ -1097,9 +1104,71 @@ impl<'a, W: Write> Interp<'a, W> {
         Err(Flow::Panic(format!("unknown name `{}`", id.name)))
     }
 
+
+    /// Calls a declared C function.
+    fn call_extern(
+        &mut self,
+        e: &grasm_syntax::ast::ExternDecl,
+        args: &[Expr],
+    ) -> EResult {
+        use crate::ffi::{CArg, CKind, CRet};
+        let Some(sym) = crate::ffi::find(&e.name.name) else {
+            return Err(Flow::Panic(format!(
+                "cannot find the C function `{}` in this process — a compiled \
+build links it, `grasm run` can only reach what is already loaded",
+                e.name.name
+            )));
+        };
+        let mut cargs = Vec::with_capacity(args.len());
+        for a in args {
+            cargs.push(match self.eval_expr(a)? {
+                Value::Int(i) => CArg::I64(i),
+                Value::Float(f) => CArg::F64(f),
+                other => {
+                    return Err(Flow::Panic(format!(
+                        "`{}` cannot take `{other}` across the C boundary",
+                        e.name.name
+                    )))
+                }
+            });
+        }
+        let ret = match &e.ret {
+            None => None,
+            Some(grasm_syntax::ast::TypeExpr::Name { path, .. }) => {
+                match path.segments[0].name.as_str() {
+                    "f64" => Some(CKind::F64),
+                    _ => Some(CKind::I64),
+                }
+            }
+            Some(_) => Some(CKind::I64),
+        };
+        // SAFETY: `sym` came from `find` for this declaration's own name, and
+        // the checker restricted the declared parameter and result types to
+        // `i64` and `f64` ([T-EXTERN]) — which is exactly what `cargs` and
+        // `ret` describe here.
+        match unsafe { crate::ffi::call(sym, &cargs, ret) } {
+            Some(CRet::I64(v)) => Ok(Value::Int(v)),
+            Some(CRet::F64(v)) => Ok(Value::Float(v)),
+            Some(CRet::Unit) => Ok(Value::Unit),
+            None => Err(Flow::Panic(format!(
+                "`{}` has a signature this interpreter cannot call \
+(at most three arguments, and no mixed shapes past two)",
+                e.name.name
+            ))),
+        }
+    }
+
     fn eval_call(&mut self, callee: &Expr, args: &[Expr]) -> EResult {
         if let Expr::Ident(id) = callee {
             let is_local = self.scopes.iter().rev().any(|s| s.contains_key(&id.name));
+            // A declared C function, looked up in this process rather than
+            // linked. The compiled backend calls the same symbol.
+            if !is_local {
+                let qual = format!("{}::{}", self.current_module, id.name);
+                if let Some(e) = self.externs.get(&qual).copied() {
+                    return self.call_extern(e, args);
+                }
+            }
             if !is_local {
                 // Builtins.
                 match id.name.as_str() {

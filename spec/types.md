@@ -288,6 +288,19 @@ including a function type, a map, and a fallible one — and when a function's
 declared return type resolves to `T ! E`, the function is fallible even though
 its declaration does not spell the `!` out.
 
+**[T-EXTERN]** `extern fn name(a: i64) -> f64` declares a C function. It has
+no body: a compiled build resolves the symbol at link time, and `grasm run`
+finds it in the interpreter's own process. Parameters and results are `i64`
+and `f64` only — `bool` is excluded because C's is one byte and Grasm's is a
+register, and a width mismatch at an FFI boundary surfaces as garbage far from
+its cause.
+
+**Calling one performs `io`.** What a C function does cannot be known, so the
+conservative row is the only sound one: an `extern` call counts against a
+package's capability ceiling and disqualifies a function from `par_map`
+([T-PAR-MAP-PURE]). Without that, FFI would be a hole straight through both
+guarantees — and it was, in the first version of this feature.
+
 **[T-MODULE-NS]** Functions are per-module; types and effects share one global
 namespace, so a type name may not be declared twice across a program. One
 namespace means one namespace: an effect operation's signature may name a type

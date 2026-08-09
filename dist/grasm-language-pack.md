@@ -609,6 +609,19 @@ including a function type, a map, and a fallible one — and when a function's
 declared return type resolves to `T ! E`, the function is fallible even though
 its declaration does not spell the `!` out.
 
+**[T-EXTERN]** `extern fn name(a: i64) -> f64` declares a C function. It has
+no body: a compiled build resolves the symbol at link time, and `grasm run`
+finds it in the interpreter's own process. Parameters and results are `i64`
+and `f64` only — `bool` is excluded because C's is one byte and Grasm's is a
+register, and a width mismatch at an FFI boundary surfaces as garbage far from
+its cause.
+
+**Calling one performs `io`.** What a C function does cannot be known, so the
+conservative row is the only sound one: an `extern` call counts against a
+package's capability ceiling and disqualifies a function from `par_map`
+([T-PAR-MAP-PURE]). Without that, FFI would be a hole straight through both
+guarantees — and it was, in the first version of this feature.
+
 **[T-MODULE-NS]** Functions are per-module; types and effects share one global
 namespace, so a type name may not be declared twice across a program. One
 namespace means one namespace: an effect operation's signature may name a type
@@ -1789,6 +1802,30 @@ misleading the next reader.
 
 Lines beginning `# ` inside a block are hidden setup: they run, but they are
 not part of what a reader sees.
+
+## 10a. Calling C
+
+`extern fn` declares a C function. There is no body and no binding layer: a
+compiled build resolves the symbol at link time, and `grasm run` finds it in
+its own process.
+
+```
+extern fn sqrt(x: f64) -> f64
+extern fn getpid() -> i64
+
+fn main() {
+    print("{sqrt(16.0)}")
+}
+```
+
+Parameters and results are `i64` and `f64`. `bool` is deliberately not
+allowed: C's is one byte and Grasm's is a register, and that kind of mismatch
+surfaces as garbage far from where it was caused.
+
+**Calling one counts as `io`.** What a C function does cannot be known, so the
+safe assumption is the only one available: an `extern` call counts against a
+package's capability ceiling, and a function that makes one cannot be handed
+to `par_map`. FFI does not become a hole through the guarantees.
 
 ## 11. What `--native` will not compile yet
 
@@ -4841,6 +4878,34 @@ fn main() {
         Ok(v) -> print("{v}")
         Err(e) -> print("err")
     }
+}
+```
+
+## `T-EXTERN.gr`
+
+```grasm
+//! tag: T-EXTERN
+//! expect: output
+//! 7 4.0
+//! 3.0 -2
+//! true
+// Calling C. The compiled backend resolves the symbol at link time; the
+// interpreter finds it in its own process, which already has libc loaded.
+// Both make the identical call.
+//
+// Signatures are `i64` and `f64` only. `bool` is excluded on purpose: C's is
+// one byte and Grasm's is a register, and a silent width mismatch at an FFI
+// boundary shows up as garbage three calls later.
+extern fn abs(n: i64) -> i64
+extern fn sqrt(x: f64) -> f64
+extern fn pow(base: f64, exp: f64) -> f64
+extern fn getpid() -> i64
+
+fn main() {
+    print("{abs(0 - 7)} {sqrt(16.0)}")
+    print("{pow(3.0, 1.0)} {abs(2) - 4}")
+    // A real process id, so this proves the call actually happened.
+    print("{getpid() > 0}")
 }
 ```
 

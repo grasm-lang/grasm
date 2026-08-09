@@ -313,6 +313,10 @@ pub fn module_signature(module: &Module) -> String {
                 out.push_str(&const_signature(c));
                 out.push('\n');
             }
+            Decl::Extern(e) => {
+                out.push_str(&extern_signature(e));
+                out.push('\n');
+            }
             Decl::Type(t) => {
                 out.push_str(&type_signature(t));
                 out.push('\n');
@@ -423,10 +427,21 @@ pub fn const_signature(c: &grasm_syntax::ast::ConstDecl) -> String {
     }
 }
 
+/// `extern fn name(params) -> T` — the contract, which is all there is.
+pub fn extern_signature(e: &grasm_syntax::ast::ExternDecl) -> String {
+    let params: Vec<String> = e.params.iter().map(param_text).collect();
+    let ret = match &e.ret {
+        Some(t) => format!(" -> {}", type_text(t)),
+        None => String::new(),
+    };
+    format!("extern fn {}({}){}", e.name.name, params.join(", "), ret)
+}
+
 fn decl_name(d: &Decl) -> String {
     match d {
         Decl::Fn(f) => f.name.name.clone(),
         Decl::Const(c) => c.name.name.clone(),
+        Decl::Extern(e) => e.name.name.clone(),
         Decl::Type(t) => t.name.name.clone(),
         Decl::Effect(e) => e.name.name.clone(),
         Decl::Test(t) => t.name.clone(),

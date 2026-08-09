@@ -545,6 +545,30 @@ misleading the next reader.
 Lines beginning `# ` inside a block are hidden setup: they run, but they are
 not part of what a reader sees.
 
+## 10a. Calling C
+
+`extern fn` declares a C function. There is no body and no binding layer: a
+compiled build resolves the symbol at link time, and `grasm run` finds it in
+its own process.
+
+```
+extern fn sqrt(x: f64) -> f64
+extern fn getpid() -> i64
+
+fn main() {
+    print("{sqrt(16.0)}")
+}
+```
+
+Parameters and results are `i64` and `f64`. `bool` is deliberately not
+allowed: C's is one byte and Grasm's is a register, and that kind of mismatch
+surfaces as garbage far from where it was caused.
+
+**Calling one counts as `io`.** What a C function does cannot be known, so the
+safe assumption is the only one available: an `extern` call counts against a
+package's capability ceiling, and a function that makes one cannot be handed
+to `par_map`. FFI does not become a hole through the guarantees.
+
 ## 11. What `--native` will not compile yet
 
 `grasm run` and `grasm build --native` are two implementations of one
