@@ -1,0 +1,32 @@
+//! tag: L-LIB-REMOVE
+//! expect: output
+//! 10 30 [20, 40]
+//! b [a, c]
+//! x 1
+//! [3, 1, 2]
+// Taking an element out by index, which is what draining a queue from the
+// front needs.
+type Job = { id: i64, name: str }
+
+fn main() {
+    var q = [10, 20, 30, 40]
+    let first = q.remove(0)
+    let mid = q.remove(1)
+    print("{first} {mid} {q}")
+
+    // Boxed elements too.
+    var names = ["a", "b", "c"]
+    let b = names.remove(1)
+    print("{b} {names}")
+    var jobs = [Job{ id: 1, name: "x" }, Job{ id: 2, name: "y" }]
+    let j = jobs.remove(0)
+    print("{j.name} {jobs.len()}")
+
+    // The shape it exists for: a queue drained in order.
+    var ready = [3, 1, 2]
+    var order: [i64] = []
+    while ready.len() > 0 {
+        order.push(ready.remove(0))
+    }
+    print("{order}")
+}

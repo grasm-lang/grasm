@@ -966,6 +966,15 @@ means the *stored* value is exactly halfway, which is rarer than it looks:
 scaled to decide this — scaling `2.675` by 100 lands on `267.5` and would
 round it the wrong way.
 
+**[L-LIB-REMOVE]** `xs.remove(i)` takes the element at `i` out of the list
+and answers with it, shifting the rest down. Out of range panics, the way
+indexing does — `pop` is the one that answers `Option`, because "the list was
+empty" is a thing a caller can reasonably not know and "index 9 of 2" is not.
+
+This is what draining a queue from the front needs. Without it a ready queue
+cost `ready = ready.slice(1, ready.len())` a step, which is O(n) and reads
+like the workaround it was.
+
 **[L-LIB-SORT-NAN]** Floats sort by a **total** order: `-NaN` before every
 number, `NaN` after every number, and `-0.0` before `0.0`. This is not IEEE
 comparison, where a NaN is unordered with everything — `<` keeps that. A sort
@@ -1062,6 +1071,7 @@ them:
 | `xs.first()`, `xs.last()` | `-> Option[T]` | |
 | `xs.push(v)` | `(T)` | mutates; receiver must be `var` |
 | `xs.pop()` | `-> Option[T]` | mutates |
+| `xs.remove(i)` | `(i64) -> T` | mutates; panics out of range, like indexing ([L-LIB-REMOVE]) |
 | `xs.sort()` | | mutates; ascending. Only `i64`, `f64` and `str` are ordered — sorting anything else is a compile error, the same one `<` gives |
 | `xs.rev()` | `-> [T]` | |
 | `xs.slice(a, b)` | `(i64, i64) -> [T]` | `a` up to but excluding `b` |
@@ -3627,6 +3637,43 @@ fn main() {
     print("{kept} {(0.0 / 0.0).is_nan()}")
     // `substr` clamps rather than panicking, unlike indexing.
     print("{"abcdef".substr(2, 100)} | {"abc".substr(5, 2)} |")
+}
+```
+
+## `L-LIB-REMOVE.gr`
+
+```grasm
+//! tag: L-LIB-REMOVE
+//! expect: output
+//! 10 30 [20, 40]
+//! b [a, c]
+//! x 1
+//! [3, 1, 2]
+// Taking an element out by index, which is what draining a queue from the
+// front needs.
+type Job = { id: i64, name: str }
+
+fn main() {
+    var q = [10, 20, 30, 40]
+    let first = q.remove(0)
+    let mid = q.remove(1)
+    print("{first} {mid} {q}")
+
+    // Boxed elements too.
+    var names = ["a", "b", "c"]
+    let b = names.remove(1)
+    print("{b} {names}")
+    var jobs = [Job{ id: 1, name: "x" }, Job{ id: 2, name: "y" }]
+    let j = jobs.remove(0)
+    print("{j.name} {jobs.len()}")
+
+    // The shape it exists for: a queue drained in order.
+    var ready = [3, 1, 2]
+    var order: [i64] = []
+    while ready.len() > 0 {
+        order.push(ready.remove(0))
+    }
+    print("{order}")
 }
 ```
 

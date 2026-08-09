@@ -411,6 +411,7 @@ impl<'m> Codegen<'m> {
             ("grasm_str_concat", vec![i64t, i64t], Some(i64t)),
             ("grasm_list_concat", vec![i64t, i64t], Some(i64t)),
             ("grasm_list_sort_by", vec![i64t, i64t], Some(i64t)),
+            ("grasm_list_remove", vec![i64t, i64t, ptr], Some(i64t)),
             ("grasm_list_enumerate", vec![i64t], Some(i64t)),
             ("grasm_list_zip", vec![i64t, i64t], Some(i64t)),
             ("grasm_str_code_at", vec![i64t, i64t], Some(i64t)),
@@ -3818,7 +3819,7 @@ impl FnCx<'_, '_> {
         span: Span,
     ) -> CResult<Option<(Value, VType)>> {
         // Mutating map/list methods on a variable receiver.
-        if matches!(name.name.as_str(), "set" | "delete" | "pop" | "sort" | "sort_by") {
+        if matches!(name.name.as_str(), "set" | "delete" | "pop" | "sort" | "sort_by" | "remove") {
             if let Expr::Ident(id) = recv {
                 if let Some((var, vt)) = self.lookup(&id.name) {
                     match (&vt, name.name.as_str()) {
@@ -3878,6 +3879,27 @@ impl FnCx<'_, '_> {
                             self.b.def_var(var, np);
                             let opt = self.b.ins().stack_load(types::I64, slot, 0);
                             return Ok(Some((opt, VType::Option(et))));
+                        }
+                        (VType::List(e), "remove") => {
+                            let et = (**e).clone();
+                            let (idx, _) = self.eval_expr_val(&args[0])?;
+                            let ptr_ty = self.cg.module.target_config().pointer_type();
+                            let slot = self.b.create_sized_stack_slot(
+                                cranelift_codegen::ir::StackSlotData::new(
+                                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                                    8,
+                                    3,
+                                ),
+                            );
+                            let addr = self.b.ins().stack_addr(ptr_ty, slot, 0);
+                            let cur = self.b.use_var(var);
+                            let np = self
+                                .call_rt("grasm_list_remove", &[cur, idx, addr])
+                                .unwrap();
+                            self.b.def_var(var, np);
+                            let boxed = self.b.ins().stack_load(types::I64, slot, 0);
+                            let (v, vt) = self.unbox(boxed, &et)?;
+                            return Ok(Some((v, vt)));
                         }
                         (VType::List(_), "sort") => {
                             let cur = self.b.use_var(var);

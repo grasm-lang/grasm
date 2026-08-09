@@ -1282,6 +1282,22 @@ impl<'a, W: Write> Interp<'a, W> {
             }
         }
         // Mutating list/map methods need place semantics.
+        if name.name == "remove" {
+            let Value::List(items) = self.eval_expr(recv)? else {
+                return Err(Flow::Panic("remove on a non-list".into()));
+            };
+            let Value::Int(i) = self.eval_expr(&args[0])? else {
+                return Err(Flow::Panic("remove expects an integer".into()));
+            };
+            let n = items.len() as i64;
+            if i < 0 || i >= n {
+                return Err(Flow::Panic(format!("remove {i} out of bounds (len {n})")));
+            }
+            let mut next = (*items).clone();
+            let taken = next.remove(i as usize);
+            self.assign_place(recv, Value::List(Rc::new(next)))?;
+            return Ok(taken);
+        }
         if name.name == "sort_by" {
             let Value::List(items) = self.eval_expr(recv)? else {
                 return Err(Flow::Panic("sort_by on a non-list".into()));

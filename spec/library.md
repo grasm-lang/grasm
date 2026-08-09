@@ -98,6 +98,15 @@ means the *stored* value is exactly halfway, which is rarer than it looks:
 scaled to decide this — scaling `2.675` by 100 lands on `267.5` and would
 round it the wrong way.
 
+**[L-LIB-REMOVE]** `xs.remove(i)` takes the element at `i` out of the list
+and answers with it, shifting the rest down. Out of range panics, the way
+indexing does — `pop` is the one that answers `Option`, because "the list was
+empty" is a thing a caller can reasonably not know and "index 9 of 2" is not.
+
+This is what draining a queue from the front needs. Without it a ready queue
+cost `ready = ready.slice(1, ready.len())` a step, which is O(n) and reads
+like the workaround it was.
+
 **[L-LIB-SORT-NAN]** Floats sort by a **total** order: `-NaN` before every
 number, `NaN` after every number, and `-0.0` before `0.0`. This is not IEEE
 comparison, where a NaN is unordered with everything — `<` keeps that. A sort
@@ -194,6 +203,7 @@ them:
 | `xs.first()`, `xs.last()` | `-> Option[T]` | |
 | `xs.push(v)` | `(T)` | mutates; receiver must be `var` |
 | `xs.pop()` | `-> Option[T]` | mutates |
+| `xs.remove(i)` | `(i64) -> T` | mutates; panics out of range, like indexing ([L-LIB-REMOVE]) |
 | `xs.sort()` | | mutates; ascending. Only `i64`, `f64` and `str` are ordered — sorting anything else is a compile error, the same one `<` gives |
 | `xs.rev()` | `-> [T]` | |
 | `xs.slice(a, b)` | `(i64, i64) -> [T]` | `a` up to but excluding `b` |

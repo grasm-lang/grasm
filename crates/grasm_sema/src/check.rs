@@ -2167,6 +2167,16 @@ that does not change",
                     // Sorting by an extracted key. The keys are what must be
                     // ordered, not the elements, so this is how a list of
                     // structs gets sorted at all.
+                    // Removing by index. A queue drained with
+                    // `xs = xs.slice(1, xs.len())` is O(n) a step and reads
+                    // like a workaround, because it is one.
+                    "remove" => {
+                        self.require_mutable(recv);
+                        if check_arity(self, 1) {
+                            self.check_expr(&args[0], &Type::I64);
+                        }
+                        elem.clone()
+                    }
                     "enumerate" => {
                         check_arity(self, 0);
                         Type::List(Box::new(Type::Tuple(vec![Type::I64, elem.clone()])))

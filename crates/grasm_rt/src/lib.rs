@@ -2214,6 +2214,35 @@ pub unsafe extern "C" fn grasm_list_sort(v: *mut RtVal) -> *mut RtVal {
     target
 }
 
+/// Removes the element at `i`, writing it to `out`. Panics out of range, the
+/// way indexing does.
+///
+/// # Safety: live pointers.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_list_remove(v: *mut RtVal, i: i64, out: *mut *mut RtVal) -> *mut RtVal {
+    let n = grasm_list_len(v);
+    if i < 0 || i >= n {
+        rt_panic(&format!("remove {i} out of bounds (len {n})"));
+    }
+    *out = grasm_list_get(v, i);
+    let target = cow_list(v);
+    match &mut (*target).payload {
+        RtPayload::List(items) => {
+            let removed = items.remove(i as usize);
+            dec(removed);
+        }
+        RtPayload::ListScalar { kind, data } => {
+            let kept: Vec<i64> = (0..data.len())
+                .filter(|&j| j != i as usize)
+                .map(|j| data.get(j))
+                .collect();
+            *data = ScalarData::from_words(*kind, kept);
+        }
+        _ => unreachable!(),
+    }
+    target
+}
+
 /// `[(index, element)]`, so a loop can name both.
 ///
 /// # Safety: live pointer.
