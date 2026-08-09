@@ -459,3 +459,66 @@ fn fmt_does_not_touch_raw_string_blocks() {
         "the raw block's contents are the program's data, not its layout"
     );
 }
+
+/// `grasm api` derives the release kind from the public surface.
+///
+/// A version number is supposed to answer "will this break me", and one a
+/// human typed cannot. This one is read off the code: an item that
+/// disappeared or changed shape is breaking, whatever the changelog claims.
+#[test]
+fn api_classifies_changes_by_what_actually_changed() {
+    let w = Work::new("api");
+    std::fs::create_dir_all(&w.0).unwrap();
+    let lib = w.0.join("lib.gr");
+    std::fs::write(
+        &lib,
+        "pub type Point = { x: i64, y: i64 }\n\
+         pub fn origin() -> Point {\n    Point{ x: 0, y: 0 }\n}\n\
+         fn helper() -> i64 {\n    1\n}\n",
+    )
+    .unwrap();
+    let main = w.0.join("main.gr");
+    std::fs::write(
+        &main,
+        "import lib\n\nfn main() {\n    print(\"{lib.origin().x}\")\n}\n",
+    )
+    .unwrap();
+
+    let (code, surface) = run(&["api", main.to_str().unwrap()]);
+    assert_eq!(code, 0, "should print a surface:\n{surface}");
+    assert!(surface.contains("lib\torigin"), "surface:\n{surface}");
+    // A private function is not surface.
+    assert!(!surface.contains("helper"), "private item leaked:\n{surface}");
+    let saved = w.0.join("v1.api");
+    std::fs::write(&saved, &surface).unwrap();
+
+    // Unchanged.
+    let (code, text) = run(&["api", main.to_str().unwrap(), "--against", saved.to_str().unwrap()]);
+    assert_eq!(code, 0);
+    assert!(text.contains("PATCH"), "{text}");
+
+    // Additive.
+    std::fs::write(
+        &lib,
+        "pub type Point = { x: i64, y: i64 }\n\
+         pub fn origin() -> Point {\n    Point{ x: 0, y: 0 }\n}\n\
+         pub fn unit() -> Point {\n    Point{ x: 1, y: 1 }\n}\n\
+         fn helper() -> i64 {\n    1\n}\n",
+    )
+    .unwrap();
+    let (code, text) = run(&["api", main.to_str().unwrap(), "--against", saved.to_str().unwrap()]);
+    assert_eq!(code, 0, "additive must not fail:\n{text}");
+    assert!(text.contains("MINOR") && text.contains("ADDED"), "{text}");
+
+    // Breaking: a field's type changed.
+    std::fs::write(
+        &lib,
+        "pub type Point = { x: f64, y: i64 }\n\
+         pub fn origin() -> Point {\n    Point{ x: 0.0, y: 0 }\n}\n\
+         fn helper() -> i64 {\n    1\n}\n",
+    )
+    .unwrap();
+    let (code, text) = run(&["api", main.to_str().unwrap(), "--against", saved.to_str().unwrap()]);
+    assert_eq!(code, 1, "breaking must fail the check:\n{text}");
+    assert!(text.contains("MAJOR") && text.contains("CHANGED"), "{text}");
+}

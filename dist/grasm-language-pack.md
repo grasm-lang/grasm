@@ -1837,6 +1837,33 @@ safe assumption is the only one available: an `extern` call counts against a
 package's capability ceiling, and a function that makes one cannot be handed
 to `par_map`. FFI does not become a hole through the guarantees.
 
+## 10b. Knowing what you broke
+
+`grasm api` prints a package's public surface — every `pub` item, sorted, one
+line each. Save it, and a later `--against` says what changed:
+
+```text
+$ grasm api src/main.gr > v1.api
+$ grasm api src/main.gr --against v1.api
+CHANGED  lib::Point
+    was  pub type Point = { x: i64, y: i64 }
+    now  pub type Point = { x: f64, y: i64 }
+
+breaking: 0 removed, 1 changed, 0 added — this is a MAJOR release
+```
+
+It exits 1 on a breaking change, so a build can refuse one that the version
+number does not admit to.
+
+A version number is supposed to answer "will this break me". One a human typed
+cannot answer it — it records what somebody *believed*. This one is read off
+the code.
+
+The limit is worth stating: this compares **shape**, not behaviour. A function
+that keeps its signature and starts returning something else is a `PATCH` here
+and a disaster for you. Deciding that automatically is undecidable, and a tool
+that claimed to would be worse than one that says where it stops.
+
 ## 11. What `--native` will not compile yet
 
 `grasm run` and `grasm build --native` are two implementations of one

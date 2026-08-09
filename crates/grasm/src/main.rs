@@ -236,6 +236,38 @@ fn main() -> ExitCode {
                 }
             }
         }
+        // The public surface of a package, and what changed in it.
+        Some("api") => {
+            let Some(path) = args.get(1).filter(|a| !a.starts_with("--")) else {
+                eprintln!("usage: grasm api <file.gr> [--against <saved.api>]");
+                return ExitCode::FAILURE;
+            };
+            let program = match load_and_check(path) {
+                Ok(p) => p,
+                Err(code) => return code,
+            };
+            let surface = api_surface(&program);
+            let against = args
+                .iter()
+                .position(|a| a == "--against")
+                .and_then(|i| args.get(i + 1));
+            match against {
+                None => {
+                    print!("{surface}");
+                    ExitCode::SUCCESS
+                }
+                Some(saved) => {
+                    let old = match std::fs::read_to_string(saved) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            eprintln!("error: cannot read `{saved}`: {e}");
+                            return ExitCode::FAILURE;
+                        }
+                    };
+                    report_api_change(&old, &surface)
+                }
+            }
+        }
         Some("fmt") => {
             let Some(path) = args.get(1) else {
                 eprintln!("usage: grasm fmt <file.gr> [--check]");
@@ -420,6 +452,7 @@ fn main() -> ExitCode {
             eprintln!("      --target <triple>        emit a cross-target object file");
             eprintln!("      --no-incremental         one object, no cache (best for a single build)");
             eprintln!("  doc <file.gr> [-o out.md]    API documentation from `///` comments");
+            eprintln!("  api <file.gr> [--against F]  public surface, and what changed in it");
             eprintln!("  fmt <file.gr> [--check]      canonical formatting");
             eprintln!("  lsp                          language server (stdio)");
             eprintln!("  dap                          debug adapter (stdio) — breakpoints, stepping");
@@ -613,6 +646,96 @@ build against a dependency whose reach is unknown",
         Ok(())
     } else {
         Err(violations)
+    }
+}
+
+
+/// A package's public surface, one item per line, sorted.
+///
+/// Sorted because a diff should report what *changed*, not where a
+/// declaration moved to. One line per item because that makes the comparison
+/// a set operation on names and signatures rather than a parse.
+fn api_surface(program: &Program) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for m in grasm_sema::docs::collect(program) {
+        for item in m.items {
+            // Tests, benchmarks and imports are not surface.
+            if matches!(item.kind, "test" | "bench" | "import") {
+                continue;
+            }
+            lines.push(format!("{}\t{}\t{}", m.module, item.name, item.signature));
+        }
+    }
+    lines.sort();
+    lines.dedup();
+    let mut out = String::new();
+    for l in lines {
+        out.push_str(&l);
+        out.push('\n');
+    }
+    out
+}
+
+/// Compares two surfaces and says what kind of release this is.
+///
+/// The question a version number is supposed to answer is "will this break
+/// me", and a number a human typed cannot answer it. This one is derived from
+/// the surface itself: an item that disappeared or changed shape is breaking,
+/// whatever the changelog says.
+fn report_api_change(old: &str, new: &str) -> ExitCode {
+    use std::collections::BTreeMap;
+    let parse = |text: &str| -> BTreeMap<String, String> {
+        text.lines()
+            .filter_map(|l| {
+                let mut parts = l.splitn(3, '\t');
+                let m = parts.next()?;
+                let n = parts.next()?;
+                let sig = parts.next()?;
+                Some((format!("{m}::{n}"), sig.to_string()))
+            })
+            .collect()
+    };
+    let (before, after) = (parse(old), parse(new));
+
+    let mut removed: Vec<&String> = Vec::new();
+    let mut changed: Vec<(&String, &String, &String)> = Vec::new();
+    for (key, sig) in &before {
+        match after.get(key) {
+            None => removed.push(key),
+            Some(now) if now != sig => changed.push((key, sig, now)),
+            Some(_) => {}
+        }
+    }
+    let added: Vec<&String> = after.keys().filter(|k| !before.contains_key(*k)).collect();
+
+    for k in &removed {
+        println!("REMOVED  {k}");
+    }
+    for (k, was, now) in &changed {
+        println!("CHANGED  {k}");
+        println!("    was  {was}");
+        println!("    now  {now}");
+    }
+    for k in &added {
+        println!("ADDED    {k}");
+    }
+
+    let breaking = !removed.is_empty() || !changed.is_empty();
+    println!();
+    if breaking {
+        println!(
+            "breaking: {} removed, {} changed, {} added — this is a MAJOR release",
+            removed.len(),
+            changed.len(),
+            added.len()
+        );
+        ExitCode::FAILURE
+    } else if !added.is_empty() {
+        println!("compatible: {} added — this is a MINOR release", added.len());
+        ExitCode::SUCCESS
+    } else {
+        println!("no change to the public surface — this is a PATCH release");
+        ExitCode::SUCCESS
     }
 }
 
