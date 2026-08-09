@@ -1748,6 +1748,28 @@ misleading the next reader.
 Lines beginning `# ` inside a block are hidden setup: they run, but they are
 not part of what a reader sees.
 
+## 11. What `--native` will not compile yet
+
+`grasm run` and `grasm build --native` are two implementations of one
+language, and `scripts/difftest.sh` holds them to identical output on every
+program in the repository. The compiled backend is nonetheless a *smaller*
+language than this document describes. It refuses what it cannot do, by name
+and at build time — it never miscompiles it — but a program using one of these
+runs only under `grasm run`:
+
+| shape | example |
+|-------|---------|
+| a generic **type** declaration | `type Pair[A, B] = { fst: A, snd: B }` |
+| an effect handler as a return type | `fn mk() -> ClockHandler { … }` |
+| a range held as a value | `let r = 1..5` (`for i in 0..5` is fine) |
+| `par_map`/`par_filter` with a closure bound to a name | `let f = \|n\| n * 2` then `xs.par_map(f)` — write it inline, or as a top-level `fn` |
+| `map` with a function that returns nothing | `xs.map(\|x\| print(x))` — a `for` loop is what that meant |
+| a type parameter appearing **only** in a function-typed parameter's result | `fn key_by[T, K](xs: [T], f: fn(T) -> K) -> [K]` |
+
+Each of these is a defect being worked off, not a design boundary. The list is
+checked against the implementation rather than remembered: if one of them
+starts compiling, this table is what has to change.
+
 ## Where to go next
 
 - `spec/` — the normative rules, each tagged and backed by a program in
