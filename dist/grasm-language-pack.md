@@ -373,6 +373,13 @@ said what the parameter is. There is no bounds syntax, so without this a
 generic helper over maps — `fn bump[K](inout m: Map[K, i64], k: K)`, which is
 the most repeated shape a counting program has — could not be written at all.
 
+"Each call site" means the whole instantiated signature — the parameters and
+the **result**. Only the parameters were checked, so
+`fn fresh[K](k: K) -> Map[K, i64]`, which puts the key type nowhere in its
+parameters, let `fresh(2.5)` past the checker and into a runtime
+`invalid map key`. A type parameter reaching a map *only* inside the body,
+mentioned in no part of the signature, is still not caught this way.
+
 **[T-TUPLE]** `(A, B, …)` is a fixed-size heterogeneous product.
 
 **[T-STRUCT]** `type P = { x: T, … }` declares a named product type whose
@@ -6176,33 +6183,21 @@ fn main() {
 
 ```grasm
 //! tag: T-MAP-KEY-GENERIC
-//! expect: output
-//! {a: 3, b: 1, c: 1}
-//! {1: 2, 2: 1}
-//! {true: 1}
-// A type parameter may stand where a map key goes; each call site is where
-// the rule is applied. There is no bounds syntax, so without this the most
-// repeated shape a counting program has could not be declared at all.
-fn bump[K](inout m: Map[K, i64], k: K) {
-    m.set(k, (m.get(k) ?? 0) + 1)
+//! expect: error
+//! map keys must be `i64`, `str`, or `bool`, not `f64`
+// A type parameter used as a map key is checked at the call site.
+//
+// Only the parameters were checked, and this function puts `K` nowhere in its
+// parameters — so `fresh(2.5)` typechecked and panicked with `invalid map key`
+// at run time. The result is part of the instantiated signature too.
+fn fresh[K](k: K) -> Map[K, i64] {
+    var m: Map[K, i64] = {}
+    m.set(k, 1)
+    m
 }
 
 fn main() {
-    var words: Map[str, i64] = {}
-    for w in "a b a c a".words() {
-        bump(words, w)
-    }
-    print("{words}")
-
-    var nums: Map[i64, i64] = {}
-    for n in [1, 2, 1] {
-        bump(nums, n)
-    }
-    print("{nums}")
-
-    var flags: Map[bool, i64] = {}
-    bump(flags, true)
-    print("{flags}")
+    print("{fresh(2.5)}")
 }
 ```
 

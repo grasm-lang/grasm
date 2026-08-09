@@ -322,3 +322,36 @@ fn a_dependency_doc_example_resolves_inside_the_dependency() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A doc example sees types declared in other modules.
+///
+/// Types are one namespace across a program ([T-MODULE-NS]), but the example
+/// harness dropped the program's entry module when it built the example, so a
+/// library function whose signature named a type declared in the *application*
+/// failed to compile on a type its example never mentions. The failure comes
+/// from the signature, so every example in that module died with it.
+#[test]
+fn a_doc_example_sees_types_from_other_modules() {
+    let fx = Fixture::new(
+        "globaltype",
+        &[
+            (
+                "main",
+                "import b\n\ntype Oops = { why: str }\n\nfn main() {\n    print(\"{b.twice(2) ?? 0}\")\n}\n",
+            ),
+            (
+                "b",
+                "/// ```\n/// assert((twice(2) ?? 0) == 4)\n/// ```\npub fn twice(n: i64) -> i64 ! Oops {\n    n * 2\n}\n",
+            ),
+        ],
+    );
+    let program = fx.program();
+    let examples = docs::examples(&program);
+    let example = examples
+        .iter()
+        .find(|e| e.owner.starts_with("b::"))
+        .expect("the library's example is collected");
+    let ex = docs::example_program(&program, example);
+    let diags = grasm_sema::check::check_program(&ex).diagnostics;
+    assert!(diags.is_empty(), "{diags:#?}");
+}

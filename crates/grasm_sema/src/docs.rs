@@ -577,8 +577,31 @@ pub fn example_program(program: &Program, example: &Example) -> Program {
     }
     entry.push_str("}\n");
 
+    // The program's original entry module is kept, under a name nothing else
+    // uses, and imported. Dropping it lost every type it declared — and types
+    // are one namespace across the whole program ([T-MODULE-NS]), so a doc
+    // example on a *library* function failed to compile on a type it never
+    // mentions, because the type was declared in the application. The failure
+    // came from the signature, so every example in that module died with it.
+    const HOST: &str = "__doc_host";
+    let host = sources
+        .iter()
+        .find(|(n, _)| n == "main")
+        .map(|(_, src)| src.clone());
     sources.retain(|(n, _)| n != "main");
-    sources.push(("main".to_string(), entry));
+    let mut entry_with_host = String::new();
+    if let Some(src) = host {
+        // Only when the owner is not itself the entry — otherwise its
+        // declarations are already inlined above and this would duplicate them.
+        if owner_module != "main" {
+            sources.push((HOST.to_string(), src));
+            entry_with_host.push_str("import ");
+            entry_with_host.push_str(HOST);
+            entry_with_host.push('\n');
+        }
+    }
+    entry_with_host.push_str(&entry);
+    sources.push(("main".to_string(), entry_with_host));
 
     // The dependency set comes along too, so every *other* module reloaded
     // here namespaces its imports the way it did the first time.

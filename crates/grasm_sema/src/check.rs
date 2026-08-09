@@ -2049,6 +2049,17 @@ that does not change",
                 let want = substitute_generics(p, &fresh);
                 self.require_map_keys_within(&want, a.span());
             }
+            // The *result* too. `fn fresh[K](k: K) -> Map[K, i64]` puts the
+            // key type nowhere in its parameters, so checking only those let
+            // `fresh(2.5)` through the checker and into a runtime
+            // `invalid map key` — a well-typed program panicking, which is the
+            // thing [T-MAP-KEY] exists to stop.
+            let ret = substitute_generics(&info.ret, &fresh);
+            self.require_map_keys_within(&ret, span);
+            if let Some(e) = &info.err {
+                let e = substitute_generics(e, &fresh);
+                self.require_map_keys_within(&e, span);
+            }
         }
         // Ownership Tier-0: `own` moves, `inout` needs an exclusive mutable place.
         let mut inout_roots: Vec<(String, Span)> = Vec::new();

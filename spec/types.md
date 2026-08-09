@@ -32,6 +32,13 @@ said what the parameter is. There is no bounds syntax, so without this a
 generic helper over maps — `fn bump[K](inout m: Map[K, i64], k: K)`, which is
 the most repeated shape a counting program has — could not be written at all.
 
+"Each call site" means the whole instantiated signature — the parameters and
+the **result**. Only the parameters were checked, so
+`fn fresh[K](k: K) -> Map[K, i64]`, which puts the key type nowhere in its
+parameters, let `fresh(2.5)` past the checker and into a runtime
+`invalid map key`. A type parameter reaching a map *only* inside the body,
+mentioned in no part of the signature, is still not caught this way.
+
 **[T-TUPLE]** `(A, B, …)` is a fixed-size heterogeneous product.
 
 **[T-STRUCT]** `type P = { x: T, … }` declares a named product type whose
