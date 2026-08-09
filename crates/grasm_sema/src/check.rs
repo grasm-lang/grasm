@@ -60,11 +60,15 @@ fn check_modules(files: &[ModuleView]) -> Analysis {
     }
     for f in files {
         c.current_module = f.name.clone();
-        c.collect_consts(f.module);
+        c.collect_fns(f.module);
     }
+    // After the functions: a constant's value may call one, or name one as a
+    // value. Collecting constants first meant `let DOUBLE = two() * 2` said
+    // "unknown name `two`" and suggested declaring it with `let` — advice that
+    // names the thing that was already declared.
     for f in files {
         c.current_module = f.name.clone();
-        c.collect_fns(f.module);
+        c.collect_consts(f.module);
     }
     for f in files {
         c.current_module = f.name.clone();

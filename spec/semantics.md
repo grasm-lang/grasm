@@ -38,6 +38,9 @@ evaluate left to right before the call.
 
 **[E-CONST]** A module-level `let` is a constant: one value for the whole
 program, not assignable, and **its initializer may not perform effects**. It
+may call functions and name them as values — a dispatch table
+(`let OPS: Map[str, fn(A) -> B] = {…}`) is what constants are most wanted for
+— and may use constants declared before it. It
 is evaluated wherever the name is used, so an effect in it would happen once
 per mention — which would make how often something happens a property of how
 many times a name appears. That is why the restriction exists rather than

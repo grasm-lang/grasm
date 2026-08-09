@@ -2483,6 +2483,11 @@ pub unsafe extern "C" fn grasm_list_sum_i64(v: *mut RtVal) -> i64 {
 /// # Safety: live pointer.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_list_sum_f64(v: *mut RtVal) -> f64 {
+    if grasm_list_len(v) == 0 {
+        // Explicit, so the empty sum is `0.0` and not whatever a zero-length
+        // accumulator happened to leave behind.
+        return 0.0;
+    }
     match items_of(v) {
         Items::Boxed(items) => {
             let mut total = 0f64;

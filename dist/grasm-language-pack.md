@@ -669,6 +669,9 @@ evaluate left to right before the call.
 
 **[E-CONST]** A module-level `let` is a constant: one value for the whole
 program, not assignable, and **its initializer may not perform effects**. It
+may call functions and name them as values — a dispatch table
+(`let OPS: Map[str, fn(A) -> B] = {…}`) is what constants are most wanted for
+— and may use constants declared before it. It
 is evaluated wherever the name is used, so an effect in it would happen once
 per mention — which would make how often something happens a property of how
 many times a name appears. That is why the restriction exists rather than
@@ -1004,6 +1007,17 @@ This is what draining a queue from the front needs. Without it a ready queue
 cost `ready = ready.slice(1, ready.len())` a step, which is O(n) and reads
 like the workaround it was.
 
+**[L-LIB-SUM]** `xs.sum()` of an empty list is the zero of the element type:
+`0` for `[i64]`, `0.0` for `[f64]`.
+
+**Known deviation:** the interpreter answers `0` for an empty `[f64]` as well,
+because it decides int-versus-float from the elements and an empty list has
+none. The compiled backend, which has the static type, answers `0.0`. So an
+empty float sum prints `0` under `grasm run` and `0.0` from a native binary,
+and a float method called on it panics in the interpreter. Fixing it properly
+needs the interpreter to carry element types on empty lists, which is a change
+to its value representation rather than a patch to this one method.
+
 **[L-LIB-SORT-NAN]** Floats sort by a **total** order: `-NaN` before every
 number, `NaN` after every number, and `-0.0` before `0.0`. This is not IEEE
 comparison, where a NaN is unordered with everything — `<` keeps that. A sort
@@ -1106,7 +1120,7 @@ them:
 | `xs.slice(a, b)` | `(i64, i64) -> [T]` | `a` up to but excluding `b` |
 | `xs.contains(v)` | `(T) -> bool` | |
 | `xs.join(sep)` | `(str) -> str` | `[str]` only — map to `str` first |
-| `xs.sum()` | `-> T` | numeric elements |
+| `xs.sum()` | `-> T` | numeric elements; `0` of the element type when empty ([L-LIB-SUM]) |
 | `xs.min()`, `xs.max()` | `-> Option[T]` | `None` when empty; not available for `bool` |
 | `xs.fold(init, f)` | `(B, (B, T) -> B) -> B` | left fold; the accumulator's type comes from `init`, not from `T` |
 | `xs.map(f)` | `(T -> U) -> [U]` | |
@@ -1894,6 +1908,7 @@ fn main() {
 //! #####
 //! [10, 20, 30] 3
 //! 77 154
+//! 4 6
 // A module-level `let` is a constant. Without them every layout constant had
 // to be a zero-argument function, which is what a program ends up full of.
 let TABLE_WIDTH = 77
@@ -1902,6 +1917,22 @@ let TITLE: str = "Sales report"
 let LIMITS = [10, 20, 30]
 /// A constant may be computed from another declared before it.
 let DOUBLE_WIDTH = TABLE_WIDTH * 2
+/// And from a function, or naming one as a value — a dispatch table is the
+/// shape this is for.
+let TWICE_TWO = two() * 2
+let AGGS: Map[str, fn([i64]) -> i64] = {"sum": total, "count": howmany}
+
+fn two() -> i64 {
+    2
+}
+
+fn total(xs: [i64]) -> i64 {
+    xs.sum()
+}
+
+fn howmany(xs: [i64]) -> i64 {
+    xs.len()
+}
 
 fn bar(n: i64) -> str {
     "#".repeat(n.min(TABLE_WIDTH))
@@ -1912,6 +1943,8 @@ fn main() {
     print("{bar(5)}")
     print("{LIMITS} {LIMITS.len()}")
     print("{TABLE_WIDTH} {DOUBLE_WIDTH}")
+    let f = AGGS.get("sum") ?? howmany
+    print("{TWICE_TWO} {f([1, 2, 3])}")
 }
 ```
 
@@ -3956,6 +3989,37 @@ fn main() {
     print("{s.contains("World")} {s.starts_with("He")} {s.ends_with("ld")} {s.index_of("W") ?? 0 - 1}")
     print("{s.replace("l", "L")} {"  x ".trim()} {s.to_upper()} {s.to_lower()} {"ab".repeat(2)}")
     print("{"7".pad_start(3, "0")} {"7".pad_end(3, ".")} {"a\nb".lines().len()} {"5".parse_int() ?? 0} {"2.5".parse_float() ?? 0.0}")
+}
+```
+
+## `L-LIB-SUM.gr`
+
+```grasm
+//! tag: L-LIB-SUM
+//! expect: output
+//! 6 0
+//! 6.0 3.0
+//! 0
+// The sum of an empty list is the zero of the element type.
+//
+// The interpreter answers `0` for an empty `[f64]` as well, because it decides
+// int-versus-float from the elements and an empty list has none. That
+// deviation is recorded in [L-LIB-SUM] rather than hidden: this program only
+// asserts what both engines agree on, so it cannot quietly start passing for
+// the wrong reason.
+fn main() {
+    // Integers, empty and not.
+    let some: [i64] = [1, 2, 3]
+    let none: [i64] = []
+    print("{some.sum()} {none.sum()}")
+
+    // Floats with elements are unambiguous in both engines.
+    let fs: [f64] = [1.0, 2.0, 3.0]
+    print("{fs.sum()} {fs.filter(|x| x < 3.5).sum() - 3.0}")
+
+    // A filter that removes everything still has the element type.
+    let gone = some.filter(|x| x > 99)
+    print("{gone.sum()}")
 }
 ```
 

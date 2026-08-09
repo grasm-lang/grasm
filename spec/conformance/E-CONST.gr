@@ -4,6 +4,7 @@
 //! #####
 //! [10, 20, 30] 3
 //! 77 154
+//! 4 6
 // A module-level `let` is a constant. Without them every layout constant had
 // to be a zero-argument function, which is what a program ends up full of.
 let TABLE_WIDTH = 77
@@ -12,6 +13,22 @@ let TITLE: str = "Sales report"
 let LIMITS = [10, 20, 30]
 /// A constant may be computed from another declared before it.
 let DOUBLE_WIDTH = TABLE_WIDTH * 2
+/// And from a function, or naming one as a value — a dispatch table is the
+/// shape this is for.
+let TWICE_TWO = two() * 2
+let AGGS: Map[str, fn([i64]) -> i64] = {"sum": total, "count": howmany}
+
+fn two() -> i64 {
+    2
+}
+
+fn total(xs: [i64]) -> i64 {
+    xs.sum()
+}
+
+fn howmany(xs: [i64]) -> i64 {
+    xs.len()
+}
 
 fn bar(n: i64) -> str {
     "#".repeat(n.min(TABLE_WIDTH))
@@ -22,4 +39,6 @@ fn main() {
     print("{bar(5)}")
     print("{LIMITS} {LIMITS.len()}")
     print("{TABLE_WIDTH} {DOUBLE_WIDTH}")
+    let f = AGGS.get("sum") ?? howmany
+    print("{TWICE_TWO} {f([1, 2, 3])}")
 }

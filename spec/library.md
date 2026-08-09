@@ -107,6 +107,17 @@ This is what draining a queue from the front needs. Without it a ready queue
 cost `ready = ready.slice(1, ready.len())` a step, which is O(n) and reads
 like the workaround it was.
 
+**[L-LIB-SUM]** `xs.sum()` of an empty list is the zero of the element type:
+`0` for `[i64]`, `0.0` for `[f64]`.
+
+**Known deviation:** the interpreter answers `0` for an empty `[f64]` as well,
+because it decides int-versus-float from the elements and an empty list has
+none. The compiled backend, which has the static type, answers `0.0`. So an
+empty float sum prints `0` under `grasm run` and `0.0` from a native binary,
+and a float method called on it panics in the interpreter. Fixing it properly
+needs the interpreter to carry element types on empty lists, which is a change
+to its value representation rather than a patch to this one method.
+
 **[L-LIB-SORT-NAN]** Floats sort by a **total** order: `-NaN` before every
 number, `NaN` after every number, and `-0.0` before `0.0`. This is not IEEE
 comparison, where a NaN is unordered with everything — `<` keeps that. A sort
@@ -209,7 +220,7 @@ them:
 | `xs.slice(a, b)` | `(i64, i64) -> [T]` | `a` up to but excluding `b` |
 | `xs.contains(v)` | `(T) -> bool` | |
 | `xs.join(sep)` | `(str) -> str` | `[str]` only — map to `str` first |
-| `xs.sum()` | `-> T` | numeric elements |
+| `xs.sum()` | `-> T` | numeric elements; `0` of the element type when empty ([L-LIB-SUM]) |
 | `xs.min()`, `xs.max()` | `-> Option[T]` | `None` when empty; not available for `bool` |
 | `xs.fold(init, f)` | `(B, (B, T) -> B) -> B` | left fold; the accumulator's type comes from `init`, not from `T` |
 | `xs.map(f)` | `(T -> U) -> [U]` | |

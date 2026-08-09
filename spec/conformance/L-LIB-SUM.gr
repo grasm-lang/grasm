@@ -1,0 +1,26 @@
+//! tag: L-LIB-SUM
+//! expect: output
+//! 6 0
+//! 6.0 3.0
+//! 0
+// The sum of an empty list is the zero of the element type.
+//
+// The interpreter answers `0` for an empty `[f64]` as well, because it decides
+// int-versus-float from the elements and an empty list has none. That
+// deviation is recorded in [L-LIB-SUM] rather than hidden: this program only
+// asserts what both engines agree on, so it cannot quietly start passing for
+// the wrong reason.
+fn main() {
+    // Integers, empty and not.
+    let some: [i64] = [1, 2, 3]
+    let none: [i64] = []
+    print("{some.sum()} {none.sum()}")
+
+    // Floats with elements are unambiguous in both engines.
+    let fs: [f64] = [1.0, 2.0, 3.0]
+    print("{fs.sum()} {fs.filter(|x| x < 3.5).sum() - 3.0}")
+
+    // A filter that removes everything still has the element type.
+    let gone = some.filter(|x| x > 99)
+    print("{gone.sum()}")
+}
