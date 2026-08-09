@@ -1,0 +1,26 @@
+//! tag: T-PARAM-INOUT-PLACES
+//! expect: output
+//! 3 [1, 2]
+//! 1 [2]
+//! 8 [9]
+//! [0, 1]
+// Mutating a list held in a struct field, and taking from it.
+//
+// `vm.stack.pop()` is the core operation of anything keeping a stack in a
+// struct, and the compiled backend refused it — so a VM had to use `slice`
+// and turn an O(1) pop into O(depth).
+type VM = { stack: [i64], mem: [i64] }
+
+fn main() {
+    var vm = VM{ stack: [1, 2, 3], mem: [1, 0] }
+    print("{vm.stack.pop() ?? 0} {vm.stack}")
+    print("{vm.stack.remove(0)} {vm.stack}")
+
+    // Through an index as well as a field.
+    var rows = [VM{ stack: [9, 8], mem: [] }]
+    print("{rows[0].stack.pop() ?? 0} {rows[0].stack}")
+
+    // And the mutating methods that were already reachable stay so.
+    vm.mem.sort()
+    print("{vm.mem}")
+}

@@ -139,6 +139,13 @@ loop is rejected: the second iteration would use a value that is gone.
 **[T-COPY]** `i64`, `f64`, `bool`, and `()` are copied rather than moved, so
 `own` on them never invalidates the caller's binding.
 
+**[T-PARAM-INOUT-PLACES]** A mutating method works on any place, not only a
+plain variable: `vm.stack.pop()`, `bag.items.set(k, v)`, `rows[0].xs.remove(i)`.
+And an `inout` parameter crosses a module boundary like any other. Both were
+compiled-backend gaps, and both mattered more than they sound — `inout` is the
+answer [T-CAPTURE-WRITE] gives for threading mutable state, so its stopping at
+a file edge reshaped a public API.
+
 **[T-PARAM-INOUT]** An `inout` parameter is an exclusive mutable borrow.
 **[T-INOUT-PLACE]** Its argument must be a variable, field, or index
 expression — never a temporary. **[T-INOUT-MUTABLE]** That place must be

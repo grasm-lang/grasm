@@ -3988,7 +3988,7 @@ impl FnCx<'_, '_> {
         // The same mutating methods on a nested place: `bag.seen.set(k, v)`.
         // Reached only when the receiver is not a plain variable, so the
         // variable case above still takes the shorter path.
-        if matches!(name.name.as_str(), "set" | "delete" | "sort")
+        if matches!(name.name.as_str(), "set" | "delete" | "sort" | "pop" | "remove")
             && matches!(recv, Expr::Field { .. } | Expr::Index { .. })
         {
             let (root, path) = self.place_path(recv)?;
@@ -4044,6 +4044,53 @@ impl FnCx<'_, '_> {
                     let updated = self.write_place(cur2, &path, &root_t, newlist)?;
                     self.b.def_var(var, updated);
                     return Ok(None);
+                }
+                // `vm.stack.pop()` — the core operation of anything holding a
+                // stack in a struct, and the reason a whole VM had to use
+                // `slice` instead.
+                (VType::List(e), "pop") => {
+                    let et = e.clone();
+                    let ptr_ty = self.cg.module.target_config().pointer_type();
+                    let slot = self.b.create_sized_stack_slot(
+                        cranelift_codegen::ir::StackSlotData::new(
+                            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                            8,
+                            3,
+                        ),
+                    );
+                    let addr = self.b.ins().stack_addr(ptr_ty, slot, 0);
+                    let cur = self.b.use_var(var);
+                    let listv = self.read_place_boxed(cur, &path, &root_t)?;
+                    let newlist = self.call_rt("grasm_list_pop", &[listv, addr]).unwrap();
+                    let cur2 = self.b.use_var(var);
+                    let updated = self.write_place(cur2, &path, &root_t, newlist)?;
+                    self.b.def_var(var, updated);
+                    let opt = self.b.ins().stack_load(types::I64, slot, 0);
+                    return Ok(Some((opt, VType::Option(et))));
+                }
+                (VType::List(e), "remove") => {
+                    let et = (**e).clone();
+                    let (idx, _) = self.eval_expr_val(&args[0])?;
+                    let ptr_ty = self.cg.module.target_config().pointer_type();
+                    let slot = self.b.create_sized_stack_slot(
+                        cranelift_codegen::ir::StackSlotData::new(
+                            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                            8,
+                            3,
+                        ),
+                    );
+                    let addr = self.b.ins().stack_addr(ptr_ty, slot, 0);
+                    let cur = self.b.use_var(var);
+                    let listv = self.read_place_boxed(cur, &path, &root_t)?;
+                    let newlist = self
+                        .call_rt("grasm_list_remove", &[listv, idx, addr])
+                        .unwrap();
+                    let cur2 = self.b.use_var(var);
+                    let updated = self.write_place(cur2, &path, &root_t, newlist)?;
+                    self.b.def_var(var, updated);
+                    let boxed = self.b.ins().stack_load(types::I64, slot, 0);
+                    let (v, vt) = self.unbox(boxed, &et)?;
+                    return Ok(Some((v, vt)));
                 }
                 _ => return nope(span, "this mutating method on this place"),
             }
@@ -4130,11 +4177,40 @@ impl FnCx<'_, '_> {
                             sig.modes.clone(),
                             sig.ret.clone(),
                         );
-                        if modes.contains(&ParamMode::Inout) {
-                            return nope(span, "`inout` across module boundaries");
-                        }
+                        // `inout` marshals the same way here as in a
+                        // same-module call: the caller's variable goes through
+                        // a stack slot and is read back after. Refusing it
+                        // across a module boundary made the documented way to
+                        // thread mutable state stop at the file edge.
+                        let ptr_ty = self.cg.module.target_config().pointer_type();
                         let mut vals = Vec::with_capacity(args.len());
-                        for (a, want) in args.iter().zip(&params) {
+                        let mut inout_args: Vec<(cranelift_codegen::ir::StackSlot, Variable, VType)> =
+                            Vec::new();
+                        for (i, (a, want)) in args.iter().zip(&params).enumerate() {
+                            if modes.get(i).copied() == Some(ParamMode::Inout) {
+                                let Expr::Ident(aid) = a else {
+                                    return nope(
+                                        a.span(),
+                                        "`inout` arguments that aren't plain variables",
+                                    );
+                                };
+                                let Some((avar, avt)) = self.lookup(&aid.name) else {
+                                    return nope(aid.span, "an unknown `inout` argument");
+                                };
+                                let slot = self.b.create_sized_stack_slot(
+                                    cranelift_codegen::ir::StackSlotData::new(
+                                        cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                                        8,
+                                        3,
+                                    ),
+                                );
+                                let cur = self.b.use_var(avar);
+                                self.b.ins().stack_store(cur, slot, 0);
+                                let addr = self.b.ins().stack_addr(ptr_ty, slot, 0);
+                                vals.push(addr);
+                                inout_args.push((slot, avar, avt));
+                                continue;
+                            }
                             let (mut v, vt) = self.eval_expr_expecting(a, Some(want))?;
                             if *want == VType::F64 && vt == VType::I64 {
                                 v = self.b.ins().fcvt_from_sint(types::F64, v);
@@ -4144,6 +4220,10 @@ impl FnCx<'_, '_> {
                         let fref = self.cg.module.declare_func_in_func(fid, self.b.func);
                         let inst = self.b.ins().call(fref, &vals);
                         let results: Vec<Value> = self.b.inst_results(inst).to_vec();
+                        for (slot, var, vt) in inout_args {
+                            let updated = self.b.ins().stack_load(vt.cl(), slot, 0);
+                            self.b.def_var(var, updated);
+                        }
                         return Ok(if ret == VType::Unit {
                             None
                         } else {

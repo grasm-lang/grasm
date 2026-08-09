@@ -460,6 +460,13 @@ loop is rejected: the second iteration would use a value that is gone.
 **[T-COPY]** `i64`, `f64`, `bool`, and `()` are copied rather than moved, so
 `own` on them never invalidates the caller's binding.
 
+**[T-PARAM-INOUT-PLACES]** A mutating method works on any place, not only a
+plain variable: `vm.stack.pop()`, `bag.items.set(k, v)`, `rows[0].xs.remove(i)`.
+And an `inout` parameter crosses a module boundary like any other. Both were
+compiled-backend gaps, and both mattered more than they sound — `inout` is the
+answer [T-CAPTURE-WRITE] gives for threading mutable state, so its stopping at
+a file edge reshaped a public API.
+
 **[T-PARAM-INOUT]** An `inout` parameter is an exclusive mutable borrow.
 **[T-INOUT-PLACE]** Its argument must be a variable, field, or index
 expression — never a temporary. **[T-INOUT-MUTABLE]** That place must be
@@ -5474,6 +5481,37 @@ fn main() {
         x
     })
     print("{ys}")
+}
+```
+
+## `T-PARAM-INOUT-PLACES.gr`
+
+```grasm
+//! tag: T-PARAM-INOUT-PLACES
+//! expect: output
+//! 3 [1, 2]
+//! 1 [2]
+//! 8 [9]
+//! [0, 1]
+// Mutating a list held in a struct field, and taking from it.
+//
+// `vm.stack.pop()` is the core operation of anything keeping a stack in a
+// struct, and the compiled backend refused it — so a VM had to use `slice`
+// and turn an O(1) pop into O(depth).
+type VM = { stack: [i64], mem: [i64] }
+
+fn main() {
+    var vm = VM{ stack: [1, 2, 3], mem: [1, 0] }
+    print("{vm.stack.pop() ?? 0} {vm.stack}")
+    print("{vm.stack.remove(0)} {vm.stack}")
+
+    // Through an index as well as a field.
+    var rows = [VM{ stack: [9, 8], mem: [] }]
+    print("{rows[0].stack.pop() ?? 0} {rows[0].stack}")
+
+    // And the mutating methods that were already reachable stay so.
+    vm.mem.sort()
+    print("{vm.mem}")
 }
 ```
 
