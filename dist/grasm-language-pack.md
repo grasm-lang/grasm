@@ -478,6 +478,24 @@ it is a compile error where no error type is declared.
 is checked for sum types, `bool`, `Ok`/`Err`, and products of booleans; other
 scrutinee types require a `_` arm.
 
+**[T-MATCH-NESTED]** A pattern's *payload* counts too. `Wrap(A)` matches only
+the `Wrap`s carrying `A`, so it does not on its own cover `Wrap`.
+
+This used to not be checked at all: a payload pattern was recorded as covering
+its whole variant, so `match o { Wrap(A) -> … Plain -> … }` compiled and
+panicked on `Wrap(B)`. The same held for an integer payload, an `Option`
+payload and an `Ok`/`Err` payload. That is precisely the runtime surprise the
+clause above exists to prevent.
+
+**[T-MATCH-NESTED-COVER]** Payload patterns that *between them* cover the
+payload type do cover the variant: `Wrap(A)` and `Wrap(B)` cover `Wrap` exactly
+when `A` and `B` cover `Inner`. It is the same question one level down, asked
+recursively. Without this the stricter rule above would push people to a `_`
+catch-all, which hides the next variant anyone adds — trading one silent
+failure for another. Where a variant carries more than one field, coverage is
+not tracked precisely, and it needs an arm that binds rather than
+destructures.
+
 **[T-MATCH-GUARD]** A guarded arm does not contribute to coverage, because its
 guard may fail.
 
@@ -6293,6 +6311,76 @@ fn f(b: bool) -> i64 {
 }
 fn main() {
     print("{f(true)}")
+}
+```
+
+## `T-MATCH-NESTED-COVER.gr`
+
+```grasm
+//! tag: T-MATCH-NESTED-COVER
+//! expect: output
+//! wrapped b plain none a
+// The other side of [T-MATCH-NESTED]: payload patterns that between them cover
+// the payload type do cover the variant, so the stricter rule does not push
+// anyone toward a `_` that would hide the next variant added.
+type Inner = | A | B
+type Outer = | Wrap(i: Inner) | Plain
+
+fn describe(o: Outer) -> str {
+    match o {
+        Wrap(A) -> "wrapped a"
+        Wrap(B) -> "wrapped b"
+        Plain -> "plain"
+    }
+}
+
+fn opt(o: Option[Inner]) -> str {
+    match o {
+        Some(A) -> "a"
+        Some(B) -> "b"
+        None -> "none"
+    }
+}
+
+fn main() {
+    // And a binding payload still covers the variant outright.
+    let bound = match Plain {
+        Wrap(i) -> "w"
+        Plain -> "plain"
+    }
+    print("{describe(Wrap(B))} {bound} {opt(None)} {opt(Some(A))}")
+}
+```
+
+## `T-MATCH-NESTED.gr`
+
+```grasm
+//! tag: T-MATCH-NESTED
+//! expect: error
+//! match is not exhaustive — missing `Wrap`
+// A payload pattern does not cover the whole variant.
+//
+// `Wrap(A)` matches only the `Wrap`s carrying `A`, and it was recorded as
+// covering every `Wrap`. So this compiled and then panicked on `Wrap(B)` — the
+// runtime surprise [T-MATCH-EXHAUSTIVE] exists to prevent, and the one the
+// tutorial advertises against by name. The same held for an integer payload,
+// an `Option` payload and an `Ok`/`Err` payload.
+//
+// `Wrap(A)` and `Wrap(B)` in two arms still cover `Wrap`, because between them
+// they cover `Inner` — refusing that would push people to a `_` catch-all,
+// which hides the next variant anyone adds.
+type Inner = | A | B
+type Outer = | Wrap(i: Inner) | Plain
+
+fn describe(o: Outer) -> str {
+    match o {
+        Wrap(A) -> "wrapped a"
+        Plain -> "plain"
+    }
+}
+
+fn main() {
+    print("{describe(Wrap(B))}")
 }
 ```
 

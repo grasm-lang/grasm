@@ -1,0 +1,27 @@
+//! tag: T-MATCH-NESTED
+//! expect: error
+//! match is not exhaustive — missing `Wrap`
+// A payload pattern does not cover the whole variant.
+//
+// `Wrap(A)` matches only the `Wrap`s carrying `A`, and it was recorded as
+// covering every `Wrap`. So this compiled and then panicked on `Wrap(B)` — the
+// runtime surprise [T-MATCH-EXHAUSTIVE] exists to prevent, and the one the
+// tutorial advertises against by name. The same held for an integer payload,
+// an `Option` payload and an `Ok`/`Err` payload.
+//
+// `Wrap(A)` and `Wrap(B)` in two arms still cover `Wrap`, because between them
+// they cover `Inner` — refusing that would push people to a `_` catch-all,
+// which hides the next variant anyone adds.
+type Inner = | A | B
+type Outer = | Wrap(i: Inner) | Plain
+
+fn describe(o: Outer) -> str {
+    match o {
+        Wrap(A) -> "wrapped a"
+        Plain -> "plain"
+    }
+}
+
+fn main() {
+    print("{describe(Wrap(B))}")
+}

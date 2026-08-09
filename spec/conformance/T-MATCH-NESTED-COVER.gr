@@ -1,0 +1,33 @@
+//! tag: T-MATCH-NESTED-COVER
+//! expect: output
+//! wrapped b plain none a
+// The other side of [T-MATCH-NESTED]: payload patterns that between them cover
+// the payload type do cover the variant, so the stricter rule does not push
+// anyone toward a `_` that would hide the next variant added.
+type Inner = | A | B
+type Outer = | Wrap(i: Inner) | Plain
+
+fn describe(o: Outer) -> str {
+    match o {
+        Wrap(A) -> "wrapped a"
+        Wrap(B) -> "wrapped b"
+        Plain -> "plain"
+    }
+}
+
+fn opt(o: Option[Inner]) -> str {
+    match o {
+        Some(A) -> "a"
+        Some(B) -> "b"
+        None -> "none"
+    }
+}
+
+fn main() {
+    // And a binding payload still covers the variant outright.
+    let bound = match Plain {
+        Wrap(i) -> "w"
+        Plain -> "plain"
+    }
+    print("{describe(Wrap(B))} {bound} {opt(None)} {opt(Some(A))}")
+}

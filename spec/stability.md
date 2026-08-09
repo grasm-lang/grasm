@@ -7,7 +7,7 @@ before it is listed as stable.
 `crates/grasm_spec` fails if a clause here is missing, unknown, or listed twice,
 so this file cannot drift away from the specification it describes.
 
-Today: 109 stable, 58 provisional, 20 experimental, of 187.
+Today: 111 stable, 58 provisional, 20 experimental, of 189.
 
 ## Stable
 
@@ -105,6 +105,8 @@ Will not change incompatibly before 2.0.
 - `T-MAP-KEY` — stable
 - `T-MATCH-EXHAUSTIVE` — stable
 - `T-MATCH-GUARD` — stable
+- `T-MATCH-NESTED` — stable
+- `T-MATCH-NESTED-COVER` — stable
 - `T-MODULE-NS` — stable
 - `T-MODULE-PUB` — stable
 - `T-MODULE-RESOLVE` — stable

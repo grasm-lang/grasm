@@ -3302,62 +3302,7 @@ that does not change",
         }
         // Exhaustiveness.
         if !has_irrefutable {
-            let missing: Vec<String> = match self.uni.resolve(&scrut_ty) {
-                Type::Named { id, .. } => match &self.defs.get(id).kind {
-                    TypeDefKind::Sum { variants } => variants
-                        .iter()
-                        .map(|v| v.name.clone())
-                        .filter(|n| !covered.contains(n))
-                        .collect(),
-                    TypeDefKind::Struct { .. } => vec!["_".into()],
-                },
-                Type::Bool => ["true", "false"]
-                    .iter()
-                    .map(|s| s.to_string())
-                    .filter(|n| !covered.contains(n))
-                    .collect(),
-                Type::Fallible(..) => ["Ok", "Err"]
-                    .iter()
-                    .map(|s| s.to_string())
-                    .filter(|n| !covered.contains(n))
-                    .collect(),
-                // All-bool tuples: check the full cartesian product of
-                // combinations (up to 2^8) against the covered combo tags.
-                Type::Tuple(members)
-                    if !members.is_empty()
-                        && members.len() <= 8
-                        && members
-                            .iter()
-                            .all(|m| self.uni.resolve(m) == Type::Bool) =>
-                {
-                    let n = members.len();
-                    let mut missing = Vec::new();
-                    for bits in 0..(1u32 << n) {
-                        let combo: Vec<&str> = (0..n)
-                            .map(|i| if bits & (1 << i) != 0 { "true" } else { "false" })
-                            .collect();
-                        let is_covered = covered.iter().any(|tag| {
-                            tag.strip_prefix('(')
-                                .and_then(|t| t.strip_suffix(')'))
-                                .map(|inner| {
-                                    let parts: Vec<&str> =
-                                        inner.split(", ").collect();
-                                    parts.len() == n
-                                        && parts.iter().zip(&combo).all(
-                                            |(p, want)| *p == "_" || p == want,
-                                        )
-                                })
-                                .unwrap_or(false)
-                        });
-                        if !is_covered {
-                            missing.push(format!("({})", combo.join(", ")));
-                        }
-                    }
-                    missing
-                }
-                Type::Error => vec![],
-                _ => vec!["_".into()], // ints, strings, … need a catch-all
-            };
+            let missing = self.missing_for(&scrut_ty, &covered);
             let missing: Vec<String> = missing.into_iter().filter(|m| !covered.contains(m)).collect();
             if !missing.is_empty() {
                 let list = missing
@@ -3373,6 +3318,117 @@ that does not change",
             }
         }
         result
+    }
+
+    /// Which constructors of `ty` no arm covers, given the tags collected.
+    ///
+    /// Split out of the match checker so the payload-coverage helpers can ask
+    /// the same question about a *nested* type: `Wrap(A)` and `Wrap(B)` cover
+    /// `Wrap` exactly when `A` and `B` cover `Inner`, which is the same
+    /// question one level down.
+    fn missing_for(&mut self, ty: &Type, covered: &[String]) -> Vec<String> {
+        let missing: Vec<String> = match self.uni.resolve(ty) {
+            Type::Named { id, args } => match &self.defs.get(id).kind.clone() {
+                TypeDefKind::Sum { variants } => variants
+                    .iter()
+                    .filter(|v| !self.variant_is_covered(v, &args, covered))
+                    .map(|v| v.name.clone())
+                    .collect(),
+                TypeDefKind::Struct { .. } => vec!["_".into()],
+            },
+            Type::Bool => ["true", "false"]
+                .iter()
+                .map(|s| s.to_string())
+                .filter(|n| !covered.contains(n))
+                .collect(),
+            Type::Fallible(ok, err) => ["Ok", "Err"]
+                .iter()
+                .map(|s| s.to_string())
+                .filter(|n| {
+                    let inner = if n == "Ok" { &ok } else { &err };
+                    !self.tag_is_covered(n, inner, covered)
+                })
+                .collect(),
+            // All-bool tuples: check the full cartesian product of
+            // combinations (up to 2^8) against the covered combo tags.
+            Type::Tuple(members)
+                if !members.is_empty()
+                    && members.len() <= 8
+                    && members
+                        .iter()
+                        .all(|m| self.uni.resolve(m) == Type::Bool) =>
+            {
+                let n = members.len();
+                let mut missing = Vec::new();
+                for bits in 0..(1u32 << n) {
+                    let combo: Vec<&str> = (0..n)
+                        .map(|i| if bits & (1 << i) != 0 { "true" } else { "false" })
+                        .collect();
+                    let is_covered = covered.iter().any(|tag| {
+                        tag.strip_prefix('(')
+                            .and_then(|t| t.strip_suffix(')'))
+                            .map(|inner| {
+                                let parts: Vec<&str> =
+                                    inner.split(", ").collect();
+                                parts.len() == n
+                                    && parts.iter().zip(&combo).all(
+                                        |(p, want)| *p == "_" || p == want,
+                                    )
+                            })
+                            .unwrap_or(false)
+                    });
+                    if !is_covered {
+                        missing.push(format!("({})", combo.join(", ")));
+                    }
+                }
+                missing
+            }
+            Type::Error => vec![],
+            _ => vec!["_".into()], // ints, strings, … need a catch-all
+        };
+        missing.into_iter().filter(|m| !covered.contains(m)).collect()
+    }
+
+    /// Is every value of this variant matched by some arm?
+    ///
+    /// Either an arm matched it with an irrefutable payload — the tag is the
+    /// bare name — or the arms that matched it with *refutable* payloads
+    /// between them cover the payload type. A single-field variant is the case
+    /// worth handling: `Wrap(A)` and `Wrap(B)` together do cover `Wrap`, and
+    /// refusing that would be a conservative check people would have to work
+    /// around with a `_` that hides the next added variant.
+    fn variant_is_covered(
+        &mut self,
+        v: &crate::types::Variant,
+        targs: &[Type],
+        covered: &[String],
+    ) -> bool {
+        if covered.contains(&v.name) {
+            return true;
+        }
+        let [(_, fty)] = v.fields.as_slice() else {
+            return false;
+        };
+        let want = substitute_generics(fty, targs);
+        self.tag_is_covered(&v.name, &want, covered)
+    }
+
+    /// The same question for a one-payload constructor named `tag`.
+    fn tag_is_covered(&mut self, tag: &str, payload: &Type, covered: &[String]) -> bool {
+        if covered.contains(&tag.to_string()) {
+            return true;
+        }
+        let prefix = format!("{tag}{PAYLOAD_SEP}");
+        let subs: Vec<String> = covered
+            .iter()
+            .filter_map(|c| c.strip_prefix(&prefix))
+            .map(str::to_string)
+            .collect();
+        // `?` is the multi-field case, which is not tracked precisely.
+        if subs.is_empty() || subs.iter().any(|s| s == "?") {
+            return false;
+        }
+        self.missing_for(payload, &subs).is_empty()
     }
 
     /// Checks a pattern against the expected type, binding names.
@@ -3453,20 +3509,22 @@ that does not change",
                 if let Type::Fallible(ok, err) = self.uni.resolve(expected) {
                     match vname.as_str() {
                         "Ok" => {
-                            if fields.len() == 1 {
-                                self.check_pattern(&fields[0], &ok);
+                            let sub = if fields.len() == 1 {
+                                self.check_pattern(&fields[0], &ok)
                             } else {
                                 self.error(*span, "`Ok` pattern takes exactly 1 binding");
-                            }
-                            return Some("Ok".into());
+                                None
+                            };
+                            return Some(tag_with_payload("Ok", &[sub]));
                         }
                         "Err" => {
-                            if fields.len() == 1 {
-                                self.check_pattern(&fields[0], &err);
+                            let sub = if fields.len() == 1 {
+                                self.check_pattern(&fields[0], &err)
                             } else {
                                 self.error(*span, "`Err` pattern takes exactly 1 binding");
-                            }
-                            return Some("Err".into());
+                                None
+                            };
+                            return Some(tag_with_payload("Err", &[sub]));
                         }
                         _ => {
                             self.error_help(
@@ -3525,10 +3583,18 @@ that does not change",
                                 ),
                             );
                         }
+                        let mut subs = Vec::new();
                         for (fpat, (_, fty)) in fields.iter().zip(&v.fields) {
                             let want = substitute_generics(fty, &targs);
-                            self.check_pattern(fpat, &want);
+                            subs.push(self.check_pattern(fpat, &want));
                         }
+                        // The tag records whether the *payload* was refutable.
+                        // Reporting a bare `Wrap` here made `Wrap(A)` cover
+                        // `Wrap(_)`, so `match o { Wrap(A) -> .. Plain -> .. }`
+                        // typechecked and then panicked on `Wrap(B)` — the
+                        // runtime surprise [T-MATCH-EXHAUSTIVE] exists to
+                        // prevent, and the one the tutorial advertises against.
+                        return Some(tag_with_payload(vname, &subs));
                     }
                     None => {
                         let tname = self.defs.get(def_id).name.clone();
@@ -3687,6 +3753,28 @@ fn place_root(e: &Expr) -> Option<&Ident> {
         _ => None,
     }
 }
+
+/// Separates a constructor from a refutable payload tag.
+const PAYLOAD_SEP: char = '\u{2}';
+
+/// A constructor tag that records whether its payload patterns were refutable.
+///
+/// `Wrap` means "this arm matches every `Wrap`". `Wrap` plus a payload tag
+/// means "this arm matches only the `Wrap`s whose payload is that" — not the
+/// same thing, and treating it as the same is how `Wrap(A)` came to cover
+/// `Wrap(_)`.
+fn tag_with_payload(name: &str, subs: &[Option<String>]) -> String {
+    if subs.iter().all(Option::is_none) {
+        return name.to_string();
+    }
+    if let [Some(one)] = subs {
+        // One field: the sub-tag is kept, so several arms over the same
+        // variant can be shown together to cover it.
+        return format!("{name}{PAYLOAD_SEP}{one}");
+    }
+    format!("{name}{PAYLOAD_SEP}?")
+}
+
 
 fn stmt_span(s: &Stmt) -> Span {
     match s {
