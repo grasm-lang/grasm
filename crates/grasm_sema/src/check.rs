@@ -344,6 +344,21 @@ impl Checker {
                 let generics: Vec<String> = t.generics.iter().map(|g| g.name.clone()).collect();
                 let kind = match &t.body {
                     TypeBody::Struct(fields) => {
+                        // A zero-field struct has no literal: `{}` after a
+                        // name is a *block*, which is what keeps
+                        // `handled_by h { … }` unambiguous. So `type E = { }`
+                        // declared a type no value of which could be written,
+                        // and `E{}` failed with "expected end of line after
+                        // statement" — a parse error about the wrong thing,
+                        // for a declaration the grammar had offered
+                        // ([G-STRUCT-NONEMPTY]).
+                        if fields.is_empty() {
+                            self.error_help(
+                                t.name.span,
+                                format!("struct `{}` has no fields", t.name.name),
+                                "a struct needs at least one field, because `Name{}` is a block and there would be no way to write a value; for a value that carries nothing use a sum variant, as in `type Marker = | Done`",
+                            );
+                        }
                         let mut fs = Vec::new();
                         for f in fields {
                             let ty = self.resolve_type(&f.ty, &generics);

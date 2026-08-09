@@ -1,0 +1,17 @@
+//! tag: G-STRUCT-NONEMPTY
+//! expect: error
+//! struct `Empty` has no fields
+// A struct has at least one field.
+//
+// `{}` after a name is a block — that is what makes `handled_by h { … }`
+// unambiguous — so a zero-field struct is a type no value of which can be
+// written. The grammar made both the field list and the literal's contents
+// optional, so this was declared and accepted, and `Empty{}` then failed with
+// "expected end of line after statement": a parse error about the wrong thing,
+// for a declaration the grammar had offered. Use a sum variant for a value
+// that carries nothing.
+type Empty = { }
+
+fn main() {
+    print("unreachable")
+}

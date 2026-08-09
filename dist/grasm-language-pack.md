@@ -129,7 +129,7 @@ effects     = "/" "{" ( path ( "," path )* )? "}"
 
 type_decl   = "pub"? "type" identifier generics? "=" type_body
 type_body   = struct_body | sum_body | type
-struct_body = "{" ( field ( ("," | newline) field )* )? "}"
+struct_body = "{" field ( ("," | newline) field )* "}"
 field       = identifier ":" type
 sum_body    = ( "|" variant )+
 variant     = identifier ( "(" ( field ( "," field )* )? ")" )?
@@ -261,8 +261,10 @@ list_lit     = "[" ( expression ( "," expression )* ","? )? "]"
 map_lit      = "{" ( map_entry ( "," map_entry )* ","? )? "}"
 map_entry    = expression ":" expression
 tuple_lit    = "(" ( expression ( "," expression )+ ","? )? ")"
-struct_lit   = identifier "{" ( ".." expression ","? )?
-               ( field_init ( ("," | newline) field_init )* )? "}"
+struct_lit   = identifier "{" struct_lit_body "}"
+struct_lit_body
+             = ".." expression ","? ( field_init ( ("," | newline) field_init )* )?
+             | field_init ( ("," | newline) field_init )*
 field_init   = identifier ":" expression
 if_expr      = "if" expression block ( "else" ( if_expr | block ) )?
 match_expr   = "match" expression "{" match_arm* "}"
@@ -270,6 +272,15 @@ match_arm    = alt_pattern ( "if" expression )? "->" expression
 alt_pattern  = pattern ( "|" pattern )*
 closure      = "|" ( identifier ( "," identifier )* )? "|" ( expression | block )
 ```
+
+**[G-STRUCT-NONEMPTY]** A struct has at least one field, and a struct literal
+names at least one field or a base. `{}` after a name is a *block* — that is
+what makes `with C handled_by h { … }` unambiguous — so a zero-field struct
+would be a type with no way to write a value of it. The rules above used to
+make both the field list and the literal's contents optional, so `type E = { }`
+was declared, accepted, and unbuildable, and `E{}` failed with "expected end of
+line after statement". For a value that carries nothing, use a sum variant:
+`type Marker = | Done`.
 
 **[G-MATCH-ARM-EXPR]** A match arm's body is an *expression*. `for`, `while`,
 `let`, `var` and `with` are statements, so they need a block: `1 -> { for i in
@@ -3795,6 +3806,28 @@ fn main() {
     if (P{ ok: true }).ok {
         // reachable
     }
+}
+```
+
+## `G-STRUCT-NONEMPTY.gr`
+
+```grasm
+//! tag: G-STRUCT-NONEMPTY
+//! expect: error
+//! struct `Empty` has no fields
+// A struct has at least one field.
+//
+// `{}` after a name is a block — that is what makes `handled_by h { … }`
+// unambiguous — so a zero-field struct is a type no value of which can be
+// written. The grammar made both the field list and the literal's contents
+// optional, so this was declared and accepted, and `Empty{}` then failed with
+// "expected end of line after statement": a parse error about the wrong thing,
+// for a declaration the grammar had offered. Use a sum variant for a value
+// that carries nothing.
+type Empty = { }
+
+fn main() {
+    print("unreachable")
 }
 ```
 

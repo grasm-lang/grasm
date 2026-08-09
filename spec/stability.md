@@ -7,7 +7,7 @@ before it is listed as stable.
 `crates/grasm_spec` fails if a clause here is missing, unknown, or listed twice,
 so this file cannot drift away from the specification it describes.
 
-Today: 106 stable, 57 provisional, 19 experimental, of 182.
+Today: 107 stable, 57 provisional, 19 experimental, of 183.
 
 ## Stable
 
@@ -61,6 +61,7 @@ Will not change incompatibly before 2.0.
 - `G-STMT-LAST` — stable
 - `G-STMT-TERM` — stable
 - `G-STRUCT-AMBIG` — stable
+- `G-STRUCT-NONEMPTY` — stable
 - `G-TYPE-UNIT` — stable
 - `L-BOOL` — stable
 - `L-COMMENT-BLOCK` — stable
