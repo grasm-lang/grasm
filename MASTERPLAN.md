@@ -443,8 +443,33 @@ by every consumer.
 **Tier 1 is not implemented** — `region` does not parse, and allocation
 grouping is whatever the allocator does. It is the one performance tier of the
 four, so nothing above is unsound without it; what is missing is the bulk-free
-arena, not a safety property. This paragraph stays until that is no longer
-true.
+arena, not a safety property.
+
+What it will take is worth writing down, because the obvious implementation is
+wrong. The compiled runtime is reference-counted: every allocation starts at
+one and is decremented when the local holding it leaves scope. A region that
+*also* freed what it recorded would double-free, and a region that took its own
+count would add a pair of refcount operations per allocation — more work than
+it saves, which is decoration wearing a performance feature's name.
+
+The real shape is three parts that only work together:
+
+  1. **An escape rule in the checker.** A region may not write to any binding
+     declared outside it, may not `return` through the brace, and yields a
+     scalar or nothing. Then nothing allocated inside can be named afterwards.
+  2. **No per-local decrements inside a region**, in the compiled backend.
+     This is what removes the work; it is sound only given (1).
+  3. **One sweep at the closing brace**, freeing everything allocated during
+     the region.
+
+The interpreter needs none of this — it is `Rc`-based and a region is simply a
+scope there. Both engines would agree on behaviour while allocating
+differently, which is fine and is already true of other things.
+
+The reason this is not done yet is (2). A miscounted decrement is a
+double-free or a leak, and the differential suite compares output — it would
+catch the first and not reliably the second. That wants a leak check in the
+harness before the change, not after it.
 
 **Guarantees across tiers 0–2:** no use-after-free, no double-free, no OOB
 (bounds-checked, elided by refinement/iterator proofs), no uninitialized reads
