@@ -428,6 +428,14 @@ impl Checker {
                     .map(|t| self.resolve_type(t, &generics))
                     .unwrap_or(Type::Unit);
                 let err = f.err.as_ref().map(|t| self.resolve_type(t, &generics));
+                // `type Res = i64 ! E` used as a return type: the `! E` is
+                // inside the alias, not written on the declaration, so the
+                // error half has to be taken out of the resolved type or the
+                // function looks infallible and `fail` inside it is an error.
+                let (ret, err) = match (self.uni.shallow_resolve(&ret), &err) {
+                    (Type::Fallible(ok, e), None) => (*ok, Some(*e)),
+                    _ => (ret, err),
+                };
                 self.fns.insert(
                     key,
                     FnInfo {

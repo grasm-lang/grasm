@@ -252,6 +252,10 @@ struct Codegen<'m> {
     strings: HashMap<String, cranelift_module::DataId>,
     /// struct name → ordered fields (name, type)
     structs: HashMap<String, Vec<(String, VType)>>,
+    /// `type Name = str` — the aliased type expression, resolved on demand.
+    /// Kept as the AST rather than a `VType` because an alias may name a type
+    /// declared later in the file.
+    aliases: HashMap<String, TypeExpr>,
     /// sum name → variants (name, field types)
     sums: HashMap<String, Vec<(String, Vec<VType>)>>,
     /// variant name → (parent sum, arity) — unambiguous per checker
@@ -363,6 +367,7 @@ impl<'m> Codegen<'m> {
             runtime: HashMap::new(),
             strings: HashMap::new(),
             structs: HashMap::new(),
+            aliases: HashMap::new(),
             sums: HashMap::new(),
             variant_index: HashMap::new(),
             effects: HashMap::new(),
@@ -569,6 +574,11 @@ impl<'m> Codegen<'m> {
                             "str" => return Ok(VType::Str),
                             _ => {}
                         }
+                        // An alias is its target, resolved here so nothing
+                        // downstream has to know aliases exist.
+                        if let Some(target) = self.aliases.get(n).cloned() {
+                            return self.vtype_of(&target);
+                        }
                         if self.structs.contains_key(n) {
                             return Ok(VType::Struct(n.to_string()));
                         }
@@ -737,7 +747,11 @@ impl<'m> Codegen<'m> {
                     TypeBody::Sum(_) => {
                         self.sums.insert(t.name.name.clone(), Vec::new());
                     }
-                    TypeBody::Alias(_) => return nope(t.span, "type aliases"),
+                    TypeBody::Alias(te) => {
+                        // Recorded, not rejected: `vtype_of` resolves an alias
+                        // to its target, so nothing downstream sees one.
+                        self.aliases.insert(t.name.name.clone(), te.clone());
+                    }
                 }
             }
         }
@@ -766,7 +780,9 @@ impl<'m> Codegen<'m> {
                         }
                         self.sums.insert(t.name.name.clone(), vs);
                     }
-                    TypeBody::Alias(_) => {}
+                    TypeBody::Alias(te) => {
+                        self.aliases.insert(t.name.name.clone(), te.clone());
+                    }
                 }
             }
         }

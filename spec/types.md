@@ -259,6 +259,12 @@ scope ([E-SPAWN-SHARED]).
 
 ## 10. Modules
 
+**[T-TYPE-ALIAS]** `type Name = T` gives a type another name; it is not a new
+type, and the two are interchangeable everywhere. An alias may name any type,
+including a function type, a map, and a fallible one — and when a function's
+declared return type resolves to `T ! E`, the function is fallible even though
+its declaration does not spell the `!` out.
+
 **[T-MODULE-NS]** Functions are per-module; types and effects share one global
 namespace, so a type name may not be declared twice across a program. One
 namespace means one namespace: an effect operation's signature may name a type

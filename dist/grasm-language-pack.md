@@ -580,6 +580,12 @@ scope ([E-SPAWN-SHARED]).
 
 ## 10. Modules
 
+**[T-TYPE-ALIAS]** `type Name = T` gives a type another name; it is not a new
+type, and the two are interchangeable everywhere. An alias may name any type,
+including a function type, a map, and a fallible one — and when a function's
+declared return type resolves to `T ! E`, the function is fallible even though
+its declaration does not spell the `!` out.
+
 **[T-MODULE-NS]** Functions are per-module; types and effects share one global
 namespace, so a type name may not be declared twice across a program. One
 namespace means one namespace: an effect operation's signature may name a type
@@ -5461,6 +5467,63 @@ fn main() {
     match pair {
         (n, name) -> print("{n} is {name}")
     }
+}
+```
+
+## `T-TYPE-ALIAS.gr`
+
+```grasm
+//! tag: T-TYPE-ALIAS
+//! expect: output
+//! <a> 6
+//! 8 -1
+//! {k: 1}
+//! HI
+// `type Name = str` — a name for a type, not a new type.
+//
+// The compiled backend refused every one of these, so a program that named its
+// types could not be built at all: `type Name = str`, `type Ids = [i64]`, a
+// function type, a map, and a fallible one.
+type E = { c: str }
+type Name = str
+type Ids = [i64]
+type Res = i64 ! E
+type Counts = Map[Name, i64]
+type Stage = fn(str) -> str
+
+fn label(n: Name) -> Name {
+    "<{n}>"
+}
+
+fn total(xs: Ids) -> i64 {
+    xs.sum()
+}
+
+/// An alias whose target carries the `! E`: the function is fallible even
+/// though its declaration does not say so directly.
+fn risky(n: i64) -> Res {
+    if n < 0 {
+        fail(E{ c: "neg" })
+    } else {
+        n * 2
+    }
+}
+
+fn up(s: str) -> str {
+    s.to_upper()
+}
+
+fn run(f: Stage, v: str) -> str {
+    f(v)
+}
+
+fn main() {
+    print("{label("a")} {total([1, 2, 3])}")
+    print("{risky(4) ?? 0 - 1} {risky(0 - 1) ?? 0 - 1}")
+    var c: Counts = {}
+    c.set("k", 1)
+    print("{c}")
+    print("{run(up, "hi")}")
 }
 ```
 

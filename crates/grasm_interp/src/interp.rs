@@ -53,6 +53,9 @@ pub struct Interp<'a, W: Write> {
     /// evaluates the initializer again — the same thing the native backend
     /// does, rather than two different notions of when a constant happens.
     consts: HashMap<String, &'a grasm_syntax::ast::ConstDecl>,
+    /// `type Res = i64 ! E` — needed to tell whether a function that returns
+    /// an alias is fallible, which decides whether its value is wrapped.
+    aliases: HashMap<String, TypeExpr>,
     /// module → (alias → target module)
     imports: HashMap<String, HashMap<String, String>>,
     /// sum type name → variant names (arity implied by decl).
@@ -145,6 +148,11 @@ impl<'a, W: Write> Interp<'a, W> {
                     self.consts
                         .insert(format!("{mod_name}::{}", c.name.name), c);
                 }
+                Decl::Type(t) if matches!(t.body, TypeBody::Alias(_)) => {
+                    if let TypeBody::Alias(te) = &t.body {
+                        self.aliases.insert(t.name.name.clone(), te.clone());
+                    }
+                }
                 Decl::Type(t) => {
                     if let TypeBody::Sum(vs) = &t.body {
                         let list: Vec<(String, usize)> = vs
@@ -190,6 +198,7 @@ impl<'a, W: Write> Interp<'a, W> {
             fns,
             current_module: "main".to_string(),
             consts: HashMap::new(),
+            aliases: HashMap::new(),
             imports: HashMap::new(),
             sums,
             variants,
@@ -246,6 +255,29 @@ impl<'a, W: Write> Interp<'a, W> {
     /// file the test was written in.
     pub fn set_current_module(&mut self, module: &str) {
         self.current_module = module.to_string();
+    }
+
+
+    /// Whether this function's return type is fallible, following aliases.
+    fn returns_fallible(&self, f: &FnDecl) -> bool {
+        let mut te = match &f.ret {
+            Some(t) => t,
+            None => return false,
+        };
+        // Aliases can chain; a short bound is enough and cannot loop forever.
+        for _ in 0..8 {
+            match te {
+                TypeExpr::Fallible(..) => return true,
+                TypeExpr::Name { path, args, .. } if args.is_empty() => {
+                    match self.aliases.get(&path.segments[0].name) {
+                        Some(next) => te = next,
+                        None => return false,
+                    }
+                }
+                _ => return false,
+            }
+        }
+        false
     }
 
     /// Frames captured when a panic first escaped, innermost first.
@@ -369,7 +401,9 @@ impl<'a, W: Write> Interp<'a, W> {
         self.call_stack.pop();
         self.cur_span = saved_span;
 
-        let fallible = f.err.is_some();
+        // The `! E` may be written on the declaration or hidden inside an
+        // alias used as the return type; both make the function fallible.
+        let fallible = f.err.is_some() || self.returns_fallible(f);
         match result {
             Ok(v) => Ok(if fallible { Value::Ok(Rc::new(v)) } else { v }),
             Err(Flow::Return(v)) => Ok(if fallible { Value::Ok(Rc::new(v)) } else { v }),
