@@ -228,6 +228,11 @@ interchangeable with a `map` in every observable way.
 
 ## 9. Ownership at runtime
 
+**[E-INOUT-FAIL]** A function that fails still returns, so the `inout` writes
+it made before failing are visible to the caller. Discarding them would make
+"what the function did" depend on how it ended, and a `push` before a `fail`
+would silently unhappen.
+
 **[E-INOUT-WRITEBACK]** Mutations to an `inout` parameter are visible to the
 caller when the function returns.
 

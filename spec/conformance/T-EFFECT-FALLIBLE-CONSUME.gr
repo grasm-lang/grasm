@@ -1,0 +1,47 @@
+//! tag: T-EFFECT-FALLIBLE-CONSUME
+//! expect: output
+//! V DEFAULT
+//! ok V / err no bad
+//! got V / caught no bad
+// A fallible effect operation answers with a `T ! E`, so all three ways of
+// consuming one work — not only `try`.
+//
+// A handler is an ordinary closure, so calling one produced a bare value and a
+// `fail` inside it propagated straight past the caller. `??` fell through to
+// nothing and `match` panicked with "no match arm matched `V`" on the
+// *success* path. Only `try` worked, which is the one form the original
+// conformance program used.
+type A = { a: str }
+
+effect Src {
+    fn fetch(k: str) -> str ! A
+}
+
+fn with_default(k: str) -> str / {Src} {
+    Src.fetch(k) ?? "DEFAULT"
+}
+
+fn matched(k: str) -> str / {Src} {
+    match Src.fetch(k) {
+        Ok(v) -> "ok {v}"
+        Err(e) -> "err {e.a}"
+    }
+}
+
+fn propagated(k: str) -> str ! A / {Src} {
+    let v = try Src.fetch(k)
+    "got {v}"
+}
+
+fn main() {
+    with Src handled_by SrcHandler{ fetch: |k| if k == "good" { "V" } else { fail(A{ a: "no {k}" }) } } {
+        print("{with_default("good")} {with_default("bad")}")
+        print("{matched("good")} / {matched("bad")}")
+        let a = propagated("good") ?? "?"
+        let b = match propagated("bad") {
+            Ok(v) -> v
+            Err(e) -> "caught {e.a}"
+        }
+        print("{a} / {b}")
+    }
+}

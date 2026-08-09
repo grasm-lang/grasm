@@ -1191,15 +1191,22 @@ impl<'m> Codegen<'m> {
                     fcx.b.ins().return_(&[]);
                 }
                 (want, Some((mut v, vt))) => {
-                    if let VType::Fallible(ok_t, _) = want.clone() {
-                        let mut inner = v;
-                        if *ok_t == VType::F64 && vt == VType::I64 {
-                            inner = fcx.b.ins().fcvt_from_sint(types::F64, inner);
+                    // A body that already produced a `T ! E` is the result;
+                    // wrapping it again would make an `Ok(Ok(..))`. Falls
+                    // through to the shared return below.
+                    let already_fallible =
+                        matches!(want, VType::Fallible(..)) && matches!(vt, VType::Fallible(..));
+                    if !already_fallible {
+                        if let VType::Fallible(ok_t, _) = want.clone() {
+                            let mut inner = v;
+                            if *ok_t == VType::F64 && vt == VType::I64 {
+                                inner = fcx.b.ins().fcvt_from_sint(types::F64, inner);
+                            }
+                            let boxed = fcx.box_value(inner, &ok_t);
+                            v = fcx.call_rt("grasm_ok_new", &[boxed]).unwrap();
+                        } else if *want == VType::F64 && vt == VType::I64 {
+                            v = fcx.b.ins().fcvt_from_sint(types::F64, v);
                         }
-                        let boxed = fcx.box_value(inner, &ok_t);
-                        v = fcx.call_rt("grasm_ok_new", &[boxed]).unwrap();
-                    } else if *want == VType::F64 && vt == VType::I64 {
-                        v = fcx.b.ins().fcvt_from_sint(types::F64, v);
                     }
                     fcx.emit_scope_decs_all();
                     fcx.b.ins().return_(&[v]);

@@ -339,7 +339,12 @@ aliases for `f64`. Distinct fixed-width types are designed but unimplemented.
 
 **[T-LIST]** `[T]` is a homogeneous, growable sequence of `T`.
 
-**[T-MAP]** `Map[K, V]` maps keys to values. **[T-MAP-KEY]** `K` must be `i64`, `str`, or `bool`; any other key type is a
+**[T-MAP]** `Map[K, V]` maps keys to values. **[T-EFFECT-FALLIBLE-CONSUME]** An effect operation declaring `! E` answers
+with a `T ! E`, whichever way its handler ended: a value becomes `Ok`, a
+`fail` inside the handler becomes `Err`. So `try`, `match` and `??` all
+consume one, the same as any other fallible value.
+
+**[T-MAP-KEY]** `K` must be `i64`, `str`, or `bool`; any other key type is a
 compile error.
 
 **[T-MAP-KEY-GENERIC]** A *type parameter* is allowed where a map key goes,
@@ -518,6 +523,12 @@ constructors matching what `match` already destructures, and without them a
 plain value could not be *put into* a fallible slot at all: `fail` is legal
 only inside a fallible function, so a program storing per-item results needed
 a trampoline whose whole body was `v` and another whose body was `fail(e)`.
+
+**[T-OK-ERR-RETURN]** A fallible function's body may produce either the ok
+half — the ordinary case, wrapped in `Ok` on the way out — or the whole
+`T ! E`, which is what `Ok(v)` and `Err(e)` build. The second was rejected,
+so the constructors worked everywhere a fallible value could be *stored* and
+nowhere one was *produced*.
 
 **[T-FALLIBLE-VALUE]** A function's `! E` is part of what it answers with, so
 it travels with the function *as a value*: `risky` referenced by name has type
@@ -875,6 +886,11 @@ depend on how many cores ran it — including one — so a `par_map` is
 interchangeable with a `map` in every observable way.
 
 ## 9. Ownership at runtime
+
+**[E-INOUT-FAIL]** A function that fails still returns, so the `inout` writes
+it made before failing are visible to the caller. Discarding them would make
+"what the function did" depend on how it ended, and a `push` before a `fail`
+would silently unhappen.
 
 **[E-INOUT-WRITEBACK]** Mutations to an `inout` parameter are visible to the
 caller when the function returns.
@@ -2241,6 +2257,57 @@ fn main() {
 fn main() {
     let xs = [1, 2]
     print("{xs[5]}")
+}
+```
+
+## `E-INOUT-FAIL.gr`
+
+```grasm
+//! tag: E-INOUT-FAIL
+//! expect: output
+//! 1 -1 [1, 2]
+//! -1 [1, 2]
+// A function that *fails* still returns, and the writes it made before
+// failing happened.
+//
+// The interpreter dropped `inout` writebacks on the error path, so a `push`
+// before a `fail` was silently undone — and the compiled binary kept it. The
+// two engines disagreed about what the program had *done*, not just what it
+// answered.
+type E = { m: str }
+type Box = { xs: [i64] }
+
+fn push_then_fail(inout xs: [i64], v: i64) -> i64 ! E {
+    xs.push(v)
+    if v > 1 {
+        fail(E{ m: "too big" })
+    }
+    v
+}
+
+fn add(inout b: Box, v: i64) -> i64 ! E {
+    b.xs.push(v)
+    if v > 1 {
+        fail(E{ m: "no" })
+    }
+    v
+}
+
+/// Through a `try` chain, where the failure crosses two frames.
+fn outer(inout b: Box) -> i64 ! E {
+    let a = try add(b, 1)
+    let c = try add(b, 2)
+    a + c
+}
+
+fn main() {
+    var xs: [i64] = []
+    let a = push_then_fail(xs, 1) ?? 0 - 1
+    let b = push_then_fail(xs, 2) ?? 0 - 1
+    print("{a} {b} {xs}")
+
+    var box = Box{ xs: [] }
+    print("{outer(box) ?? 0 - 1} {box.xs}")
 }
 ```
 
@@ -4527,6 +4594,58 @@ fn main() {
 }
 ```
 
+## `T-EFFECT-FALLIBLE-CONSUME.gr`
+
+```grasm
+//! tag: T-EFFECT-FALLIBLE-CONSUME
+//! expect: output
+//! V DEFAULT
+//! ok V / err no bad
+//! got V / caught no bad
+// A fallible effect operation answers with a `T ! E`, so all three ways of
+// consuming one work — not only `try`.
+//
+// A handler is an ordinary closure, so calling one produced a bare value and a
+// `fail` inside it propagated straight past the caller. `??` fell through to
+// nothing and `match` panicked with "no match arm matched `V`" on the
+// *success* path. Only `try` worked, which is the one form the original
+// conformance program used.
+type A = { a: str }
+
+effect Src {
+    fn fetch(k: str) -> str ! A
+}
+
+fn with_default(k: str) -> str / {Src} {
+    Src.fetch(k) ?? "DEFAULT"
+}
+
+fn matched(k: str) -> str / {Src} {
+    match Src.fetch(k) {
+        Ok(v) -> "ok {v}"
+        Err(e) -> "err {e.a}"
+    }
+}
+
+fn propagated(k: str) -> str ! A / {Src} {
+    let v = try Src.fetch(k)
+    "got {v}"
+}
+
+fn main() {
+    with Src handled_by SrcHandler{ fetch: |k| if k == "good" { "V" } else { fail(A{ a: "no {k}" }) } } {
+        print("{with_default("good")} {with_default("bad")}")
+        print("{matched("good")} / {matched("bad")}")
+        let a = propagated("good") ?? "?"
+        let b = match propagated("bad") {
+            Ok(v) -> v
+            Err(e) -> "caught {e.a}"
+        }
+        print("{a} / {b}")
+    }
+}
+```
+
 ## `T-EFFECT-FALLIBLE.gr`
 
 ```grasm
@@ -5220,6 +5339,45 @@ fn main() {
     let xs = [10]
     // Absence is Option, never null.
     print("{xs.get(0) ?? 0} {xs.get(9) ?? 0 - 1}")
+}
+```
+
+## `T-OK-ERR-RETURN.gr`
+
+```grasm
+//! tag: T-OK-ERR-RETURN
+//! expect: output
+//! 1 -1
+//! 1 -1
+// `Ok(v)` and `Err(e)` in a fallible function's own return position.
+//
+// They worked everywhere a fallible value could be *stored* and nowhere it
+// was *produced*: the body's type was checked against the ok half alone, so
+// returning the whole `T ! E` was an error — and the two runtimes then wrapped
+// it a second time, giving `Ok(Ok(1))` in one and a raw pointer in the other.
+type E = { m: str }
+type Cell = i64 ! E
+
+fn tail(b: bool) -> i64 ! E {
+    if b {
+        Ok(1)
+    } else {
+        Err(E{ m: "no" })
+    }
+}
+
+/// The same through an alias, which is where it was first noticed.
+fn held(b: bool) -> Cell {
+    if b {
+        Ok(1)
+    } else {
+        Err(E{ m: "no" })
+    }
+}
+
+fn main() {
+    print("{tail(true) ?? 0 - 1} {tail(false) ?? 0 - 1}")
+    print("{held(true) ?? 0 - 1} {held(false) ?? 0 - 1}")
 }
 ```
 

@@ -56,6 +56,12 @@ pub struct Interp<'a, W: Write> {
     /// `type Res = i64 ! E` — needed to tell whether a function that returns
     /// an alias is fallible, which decides whether its value is wrapped.
     aliases: HashMap<String, TypeExpr>,
+    /// `Effect.op` for every operation declaring `! E`.
+    ///
+    /// A handler is an ordinary closure, so calling one produced a bare value
+    /// and a `fail` inside it propagated straight past the caller. The
+    /// operation's declared type is what says it should have been a `T ! E`.
+    fallible_ops: std::collections::HashSet<String>,
     /// module → (alias → target module)
     imports: HashMap<String, HashMap<String, String>>,
     /// sum type name → variant names (arity implied by decl).
@@ -170,6 +176,12 @@ impl<'a, W: Write> Interp<'a, W> {
                 }
                 Decl::Effect(e) => {
                     self.effect_names.insert(e.name.name.clone());
+                    for op in &e.ops {
+                        if op.err.is_some() {
+                            self.fallible_ops
+                                .insert(format!("{}.{}", e.name.name, op.name.name));
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -199,6 +211,7 @@ impl<'a, W: Write> Interp<'a, W> {
             current_module: "main".to_string(),
             consts: HashMap::new(),
             aliases: HashMap::new(),
+            fallible_ops: std::collections::HashSet::new(),
             imports: HashMap::new(),
             sums,
             variants,
@@ -387,7 +400,12 @@ impl<'a, W: Write> Interp<'a, W> {
         self.current_module = saved_module;
         // Copy-out for `inout` params (applied by the caller to its places).
         self.pending_writebacks.clear();
-        if result.is_ok() || matches!(result, Err(Flow::Return(_))) {
+        // A function that *fails* still returns, and the writes it made before
+        // failing happened. Dropping them on the error path meant
+        // `xs.push(v)` before a `fail` was silently undone — in the
+        // interpreter only, so the compiled binary and the reference
+        // implementation disagreed about what the program had done.
+        if result.is_ok() || matches!(result, Err(Flow::Return(_)) | Err(Flow::Err(_))) {
             for (i, p) in f.params.iter().enumerate() {
                 if p.mode == ParamMode::Inout {
                     if let Some(v) = self.scopes[0].get(&p.name.name) {
@@ -404,9 +422,17 @@ impl<'a, W: Write> Interp<'a, W> {
         // The `! E` may be written on the declaration or hidden inside an
         // alias used as the return type; both make the function fallible.
         let fallible = f.err.is_some() || self.returns_fallible(f);
+        // A fallible function's plain value is wrapped on the way out — but a
+        // body that already produced a `T ! E`, which is what `Ok(v)` and
+        // `Err(e)` build, must not be wrapped twice.
+        let wrap = |v: Value| match v {
+            already @ (Value::Ok(_) | Value::Err(_)) if fallible => already,
+            v if fallible => Value::Ok(Rc::new(v)),
+            v => v,
+        };
         match result {
-            Ok(v) => Ok(if fallible { Value::Ok(Rc::new(v)) } else { v }),
-            Err(Flow::Return(v)) => Ok(if fallible { Value::Ok(Rc::new(v)) } else { v }),
+            Ok(v) => Ok(wrap(v)),
+            Err(Flow::Return(v)) => Ok(wrap(v)),
             Err(Flow::Err(e)) => {
                 if fallible {
                     Ok(Value::Err(Rc::new(e)))
@@ -1334,7 +1360,23 @@ impl<'a, W: Write> Interp<'a, W> {
                 for a in args {
                     vs.push(self.eval_expr(a)?);
                 }
-                return self.call_value(f, vs, "effect op");
+                let fallible = self
+                    .fallible_ops
+                    .contains(&format!("{}.{}", tid.name, name.name));
+                let out = self.call_value(f, vs, "effect op");
+                if !fallible {
+                    return out;
+                }
+                // A fallible operation answers with a `T ! E`, whichever way
+                // the handler ended: a value becomes `Ok`, a `fail` becomes
+                // `Err`. Without this `??` and `match` on one saw a bare
+                // value, and the failure escaped the caller entirely.
+                return match out {
+                    Ok(v @ Value::Ok(_)) | Ok(v @ Value::Err(_)) => Ok(v),
+                    Ok(v) => Ok(Value::Ok(Rc::new(v))),
+                    Err(Flow::Err(e)) => Ok(Value::Err(Rc::new(e))),
+                    other => other,
+                };
             }
         }
         if let Expr::Ident(tid) = recv {

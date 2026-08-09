@@ -18,7 +18,12 @@ aliases for `f64`. Distinct fixed-width types are designed but unimplemented.
 
 **[T-LIST]** `[T]` is a homogeneous, growable sequence of `T`.
 
-**[T-MAP]** `Map[K, V]` maps keys to values. **[T-MAP-KEY]** `K` must be `i64`, `str`, or `bool`; any other key type is a
+**[T-MAP]** `Map[K, V]` maps keys to values. **[T-EFFECT-FALLIBLE-CONSUME]** An effect operation declaring `! E` answers
+with a `T ! E`, whichever way its handler ended: a value becomes `Ok`, a
+`fail` inside the handler becomes `Err`. So `try`, `match` and `??` all
+consume one, the same as any other fallible value.
+
+**[T-MAP-KEY]** `K` must be `i64`, `str`, or `bool`; any other key type is a
 compile error.
 
 **[T-MAP-KEY-GENERIC]** A *type parameter* is allowed where a map key goes,
@@ -197,6 +202,12 @@ constructors matching what `match` already destructures, and without them a
 plain value could not be *put into* a fallible slot at all: `fail` is legal
 only inside a fallible function, so a program storing per-item results needed
 a trampoline whose whole body was `v` and another whose body was `fail(e)`.
+
+**[T-OK-ERR-RETURN]** A fallible function's body may produce either the ok
+half — the ordinary case, wrapped in `Ok` on the way out — or the whole
+`T ! E`, which is what `Ok(v)` and `Err(e)` build. The second was rejected,
+so the constructors worked everywhere a fallible value could be *stored* and
+nowhere one was *produced*.
 
 **[T-FALLIBLE-VALUE]** A function's `! E` is part of what it answers with, so
 it travels with the function *as a value*: `risky` referenced by name has type

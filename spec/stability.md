@@ -7,7 +7,7 @@ before it is listed as stable.
 `crates/grasm_spec` fails if a clause here is missing, unknown, or listed twice,
 so this file cannot drift away from the specification it describes.
 
-Today: 94 stable, 50 provisional, 17 experimental, of 161.
+Today: 94 stable, 53 provisional, 17 experimental, of 164.
 
 ## Stable
 
@@ -122,6 +122,7 @@ for "no problem found" to mean anything.
 - `E-COALESCE-DIVERGE` — provisional
 - `E-CONST` — provisional
 - `E-IF-DIVERGE` — provisional
+- `E-INOUT-FAIL` — provisional
 - `E-LIST-CONCAT` — provisional
 - `E-MAP-LIT` — provisional
 - `E-RECURSION-DEPTH` — provisional
@@ -155,6 +156,7 @@ for "no problem found" to mean anything.
 - `T-EFFECT-DECL` — provisional
 - `T-EFFECT-DISCHARGE` — provisional
 - `T-EFFECT-FALLIBLE` — provisional
+- `T-EFFECT-FALLIBLE-CONSUME` — provisional
 - `T-EFFECT-ROW` — provisional
 - `T-FALLIBLE-COALESCE` — provisional
 - `T-FALLIBLE-VALUE` — provisional
@@ -168,6 +170,7 @@ for "no problem found" to mean anything.
 - `T-MATCH-ALT` — provisional
 - `T-MODULE-DEP` — provisional
 - `T-OK-ERR` — provisional
+- `T-OK-ERR-RETURN` — provisional
 - `T-TYPE-ALIAS` — provisional
 
 ## Experimental

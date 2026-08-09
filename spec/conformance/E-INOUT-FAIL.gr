@@ -1,0 +1,46 @@
+//! tag: E-INOUT-FAIL
+//! expect: output
+//! 1 -1 [1, 2]
+//! -1 [1, 2]
+// A function that *fails* still returns, and the writes it made before
+// failing happened.
+//
+// The interpreter dropped `inout` writebacks on the error path, so a `push`
+// before a `fail` was silently undone — and the compiled binary kept it. The
+// two engines disagreed about what the program had *done*, not just what it
+// answered.
+type E = { m: str }
+type Box = { xs: [i64] }
+
+fn push_then_fail(inout xs: [i64], v: i64) -> i64 ! E {
+    xs.push(v)
+    if v > 1 {
+        fail(E{ m: "too big" })
+    }
+    v
+}
+
+fn add(inout b: Box, v: i64) -> i64 ! E {
+    b.xs.push(v)
+    if v > 1 {
+        fail(E{ m: "no" })
+    }
+    v
+}
+
+/// Through a `try` chain, where the failure crosses two frames.
+fn outer(inout b: Box) -> i64 ! E {
+    let a = try add(b, 1)
+    let c = try add(b, 2)
+    a + c
+}
+
+fn main() {
+    var xs: [i64] = []
+    let a = push_then_fail(xs, 1) ?? 0 - 1
+    let b = push_then_fail(xs, 2) ?? 0 - 1
+    print("{a} {b} {xs}")
+
+    var box = Box{ xs: [] }
+    print("{outer(box) ?? 0 - 1} {box.xs}")
+}

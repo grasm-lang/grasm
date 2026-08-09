@@ -658,7 +658,18 @@ impl Checker {
         let body_ty = self.check_block(&f.body);
         let ret = info.ret.clone();
         let ends_with_return = matches!(f.body.stmts.last(), Some(Stmt::Return(..)));
-        if ret != Type::Unit && !ends_with_return && !self.uni.unify(&body_ty, &ret) {
+        // A fallible function's body may produce either the ok half — the
+        // ordinary case, wrapped in `Ok` on the way out — or the whole
+        // `T ! E`, which is what `Ok(v)` and `Err(e)` build ([T-OK-ERR]).
+        // Only the first was accepted, so the constructors worked everywhere
+        // except the position a function's own result is written in.
+        let whole = self.fn_err.clone().map(|e| {
+            Type::Fallible(Box::new(ret.clone()), Box::new(e))
+        });
+        let fits_whole = whole
+            .as_ref()
+            .is_some_and(|w| self.uni.unify(&body_ty, w));
+        if ret != Type::Unit && !ends_with_return && !fits_whole && !self.uni.unify(&body_ty, &ret) {
             let span = f
                 .body
                 .stmts

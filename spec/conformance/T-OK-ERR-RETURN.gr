@@ -1,0 +1,34 @@
+//! tag: T-OK-ERR-RETURN
+//! expect: output
+//! 1 -1
+//! 1 -1
+// `Ok(v)` and `Err(e)` in a fallible function's own return position.
+//
+// They worked everywhere a fallible value could be *stored* and nowhere it
+// was *produced*: the body's type was checked against the ok half alone, so
+// returning the whole `T ! E` was an error — and the two runtimes then wrapped
+// it a second time, giving `Ok(Ok(1))` in one and a raw pointer in the other.
+type E = { m: str }
+type Cell = i64 ! E
+
+fn tail(b: bool) -> i64 ! E {
+    if b {
+        Ok(1)
+    } else {
+        Err(E{ m: "no" })
+    }
+}
+
+/// The same through an alias, which is where it was first noticed.
+fn held(b: bool) -> Cell {
+    if b {
+        Ok(1)
+    } else {
+        Err(E{ m: "no" })
+    }
+}
+
+fn main() {
+    print("{tail(true) ?? 0 - 1} {tail(false) ?? 0 - 1}")
+    print("{held(true) ?? 0 - 1} {held(false) ?? 0 - 1}")
+}
