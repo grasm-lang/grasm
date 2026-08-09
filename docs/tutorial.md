@@ -598,8 +598,8 @@ line each. Save it, and a later `--against` says what changed:
 $ grasm api src/main.gr > v1.api
 $ grasm api src/main.gr --against v1.api
 CHANGED  lib::Point
-    was  pub type Point = { x: i64, y: i64 }
-    now  pub type Point = { x: f64, y: i64 }
+    was  type Point = { x: i64, y: i64 }
+    now  type Point = { x: f64, y: i64 }
 
 breaking: 0 removed, 1 changed, 0 added — this is a MAJOR release
 ```

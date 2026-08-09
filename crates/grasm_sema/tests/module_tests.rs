@@ -126,7 +126,7 @@ fn duplicate_type_across_modules_rejected() {
     err(
         &[
             ("main", "import other\ntype Thing = { x: i64 }\n\nfn main() {\n}\n"),
-            ("other", "pub type Thing = { y: i64 }\n"),
+            ("other", "type Thing = { y: i64 }\n"),
         ],
         "duplicate type name",
     );
@@ -157,7 +157,7 @@ fn an_effect_operation_may_name_a_type_from_another_module() {
              \x20   }\n\
              }\n",
         ),
-        ("lib", "pub type Diag = { msg: str }\n"),
+        ("lib", "type Diag = { msg: str }\n"),
     ]);
 }
 
@@ -175,7 +175,7 @@ fn an_effect_operations_error_type_may_come_from_another_module() {
              \x20   print(\"ok\")\n\
              }\n",
         ),
-        ("lib", "pub type Missing = { key: str }\n"),
+        ("lib", "type Missing = { key: str }\n"),
     ]);
 }
 
@@ -271,7 +271,7 @@ fn a_type_declaration_may_name_a_type_from_another_module() {
              \x20   print(\"{w.inner.n}\")\n\
              }\n",
         ),
-        ("lib", "pub type Thing = { n: i64 }\n"),
+        ("lib", "type Thing = { n: i64 }\n"),
     ]);
 }
 

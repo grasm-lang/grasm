@@ -1,0 +1,16 @@
+//! tag: T-TYPE-NO-PUB
+//! expect: error
+//! `pub` means nothing on type `Point`
+// `pub` on a type is not a permission, so it is not accepted.
+//
+// Types share one namespace across the whole program ([T-MODULE-NS]), so a
+// type declared without `pub` is already reachable from every module — which
+// the grammar offered anyway, `grasm api` printed, and nothing enforced. That
+// is the same defect [T-CONST-PUB] records for `pub let` and
+// [G-STRUCT-NONEMPTY] for a zero-field struct: syntax that parses, checks, and
+// does nothing, while reading to a person as a permission being granted.
+pub type Point = { x: i64, y: i64 }
+
+fn main() {
+    print("{Point{ x: 1, y: 2 }.x}")
+}

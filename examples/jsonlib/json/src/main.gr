@@ -3,7 +3,7 @@
 /// Objects hold a `Map[str, Json]` rather than parallel key and value lists:
 /// the map keeps its keys sorted, so rendering is deterministic without
 /// sorting at the end.
-pub type Json =
+type Json =
     | JNull
     | JBool(b: bool)
     | JNum(n: f64)
@@ -11,7 +11,7 @@ pub type Json =
     | JArr(items: [Json])
     | JObj(fields: Map[str, Json])
 
-pub type JsonError =
+type JsonError =
     | Unexpected(at: i64, found: str)
     | Truncated(at: i64)
     | TrailingInput(at: i64)

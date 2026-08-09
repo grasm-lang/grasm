@@ -356,9 +356,24 @@ impl Checker {
                 let Decl::Type(t) = &module.decls[di] else {
                     continue;
                 };
+                // `pub` on a type means nothing: types share one namespace
+                // across the whole program ([T-MODULE-NS]), so a type declared
+                // without it is already reachable everywhere. Accepting the
+                // word anyway is the `pub let` mistake again — syntax that
+                // parses, checks, and does nothing, which reads as a
+                // permission being granted.
+                if t.is_pub {
+                    self.error_help(
+                        t.name.span,
+                        format!("`pub` means nothing on type `{}`", t.name.name),
+                        "types are one namespace across the program, so every type is \
+already reachable from every module — drop the `pub`",
+                    );
+                }
                 let generics: Vec<String> = t.generics.iter().map(|g| g.name.clone()).collect();
                 let kind = match &t.body {
                     TypeBody::Struct(fields) => {
+                        // (visibility is checked for every type body below)
                         // A zero-field struct has no literal: `{}` after a
                         // name is a *block*, which is what keeps
                         // `handled_by h { … }` unambiguous. So `type E = { }`

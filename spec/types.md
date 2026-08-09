@@ -478,6 +478,12 @@ namespace, so a type name may not be declared twice across a program. One
 namespace means one namespace: an effect operation's signature may name a type
 from any module, the same as an ordinary function's.
 
+**[T-TYPE-NO-PUB]** It follows that `pub` on a type is meaningless, so it is
+**rejected** rather than accepted and ignored. A type is reachable from every
+module whether or not the word is there; accepting it would read as a
+permission being granted, which is the defect [T-CONST-PUB] records for
+`pub let`.
+
 **[T-MODULE-PUB]** Only `pub` functions are callable from another module, and
 the same rule governs using one as a *value*: `xs.map(utils.helper)` reaches
 exactly the function `utils.helper(x)` would, and a private one is refused the

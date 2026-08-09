@@ -472,7 +472,7 @@ fn api_classifies_changes_by_what_actually_changed() {
     let lib = w.0.join("lib.gr");
     std::fs::write(
         &lib,
-        "pub type Point = { x: i64, y: i64 }\n\
+        "type Point = { x: i64, y: i64 }\n\
          pub fn origin() -> Point {\n    Point{ x: 0, y: 0 }\n}\n\
          fn helper() -> i64 {\n    1\n}\n",
     )
@@ -500,7 +500,7 @@ fn api_classifies_changes_by_what_actually_changed() {
     // Additive.
     std::fs::write(
         &lib,
-        "pub type Point = { x: i64, y: i64 }\n\
+        "type Point = { x: i64, y: i64 }\n\
          pub fn origin() -> Point {\n    Point{ x: 0, y: 0 }\n}\n\
          pub fn unit() -> Point {\n    Point{ x: 1, y: 1 }\n}\n\
          fn helper() -> i64 {\n    1\n}\n",
@@ -513,7 +513,7 @@ fn api_classifies_changes_by_what_actually_changed() {
     // Breaking: a field's type changed.
     std::fs::write(
         &lib,
-        "pub type Point = { x: f64, y: i64 }\n\
+        "type Point = { x: f64, y: i64 }\n\
          pub fn origin() -> Point {\n    Point{ x: 0.0, y: 0 }\n}\n\
          fn helper() -> i64 {\n    1\n}\n",
     )

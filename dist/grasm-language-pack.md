@@ -822,6 +822,12 @@ namespace, so a type name may not be declared twice across a program. One
 namespace means one namespace: an effect operation's signature may name a type
 from any module, the same as an ordinary function's.
 
+**[T-TYPE-NO-PUB]** It follows that `pub` on a type is meaningless, so it is
+**rejected** rather than accepted and ignored. A type is reachable from every
+module whether or not the word is there; accepting it would read as a
+permission being granted, which is the defect [T-CONST-PUB] records for
+`pub let`.
+
 **[T-MODULE-PUB]** Only `pub` functions are callable from another module, and
 the same rule governs using one as a *value*: `xs.map(utils.helper)` reaches
 exactly the function `utils.helper(x)` would, and a private one is refused the
@@ -2175,8 +2181,8 @@ line each. Save it, and a later `--against` says what changed:
 $ grasm api src/main.gr > v1.api
 $ grasm api src/main.gr --against v1.api
 CHANGED  lib::Point
-    was  pub type Point = { x: i64, y: i64 }
-    now  pub type Point = { x: f64, y: i64 }
+    was  type Point = { x: i64, y: i64 }
+    now  type Point = { x: f64, y: i64 }
 
 breaking: 0 removed, 1 changed, 0 added — this is a MAJOR release
 ```
@@ -7168,6 +7174,27 @@ fn main() {
     c.set("k", 1)
     print("{c}")
     print("{run(up, "hi")}")
+}
+```
+
+## `T-TYPE-NO-PUB.gr`
+
+```grasm
+//! tag: T-TYPE-NO-PUB
+//! expect: error
+//! `pub` means nothing on type `Point`
+// `pub` on a type is not a permission, so it is not accepted.
+//
+// Types share one namespace across the whole program ([T-MODULE-NS]), so a
+// type declared without `pub` is already reachable from every module — which
+// the grammar offered anyway, `grasm api` printed, and nothing enforced. That
+// is the same defect [T-CONST-PUB] records for `pub let` and
+// [G-STRUCT-NONEMPTY] for a zero-field struct: syntax that parses, checks, and
+// does nothing, while reading to a person as a permission being granted.
+pub type Point = { x: i64, y: i64 }
+
+fn main() {
+    print("{Point{ x: 1, y: 2 }.x}")
 }
 ```
 
