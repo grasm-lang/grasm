@@ -749,7 +749,13 @@ fn print_trace(program: &Program, trace: &[grasm_interp::Frame]) {
         return;
     }
     eprintln!("stack trace (innermost first):");
-    for frame in trace {
+    // A stack overflow has one frame per level: at the interpreter's bound
+    // that is 100,000 lines and about 5 MB of stderr, which buries the
+    // message that matters under the repetition that does not. The innermost
+    // frames are where the recursion is, so those are the ones kept.
+    const KEEP: usize = 20;
+    let elided = trace.len().saturating_sub(KEEP);
+    for frame in trace.iter().take(KEEP) {
         let i = program.file_of(frame.at);
         let file = &program.files[i];
         let index = grasm_syntax::span::LineIndex::new(&file.src);
@@ -758,6 +764,9 @@ fn print_trace(program: &Program, trace: &[grasm_interp::Frame]) {
             "  {} at {}:{}:{}",
             frame.function, file.path, lc.line, lc.col
         );
+    }
+    if elided > 0 {
+        eprintln!("  ... {elided} more frame(s)");
     }
 }
 

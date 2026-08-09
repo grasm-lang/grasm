@@ -634,6 +634,9 @@ impl<'m> Codegen<'m> {
             let _ = name;
         }
         for (_, m, _) in views {
+            self.resolve_type_bodies(m)?;
+        }
+        for (_, m, _) in views {
             self.collect_effects(m)?;
         }
         for (name, m, _) in views {
@@ -755,6 +758,15 @@ impl<'m> Codegen<'m> {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Fills in field types, once every module's type *names* are registered.
+    ///
+    /// A field's type may live in any module, so resolving bodies inside
+    /// `collect_types` made the answer depend on which file was compiled
+    /// first — the same ordering the checker had.
+    fn resolve_type_bodies(&mut self, module_ast: &AstModule) -> CResult<()> {
         for decl in &module_ast.decls {
             if let Decl::Type(t) = decl {
                 match &t.body {

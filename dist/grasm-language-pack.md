@@ -548,11 +548,16 @@ which is not `true` — so the answer was the empty list, with nothing reported
 and exit code 0. The same door made `any` always `false`, `find` always
 `None`, and `sort_by` leave the list untouched.
 
-**[T-DIVERGE]** `return`, `break` and `continue` fit wherever an expression is
-expected, the way `fail` does ([T-FAIL]): control leaves before a value is
-produced, so there is no value to disagree about. This is what makes
-`0 -> return false` legal next to an arm that yields a `bool` — reading the
-returning arm as `()` put the error on the *other* arm.
+**[T-DIVERGE]** `return`, `break` and `continue` produce no value, so they do
+not have to agree with one: an `if` branch or a match arm that ends in one is
+compatible with any other branch's type. This is what makes `0 -> return
+false` legal next to an arm that yields a `bool` — reading the returning arm
+as `()` put the error on the *other* arm.
+
+They are **statements**, not expressions, so unlike `fail` they cannot appear
+as a sub-expression: `o ?? return -1` and `n.max(return 0)` do not parse.
+`fail(e)` can, and is the form to reach for on the right of `??`
+([E-COALESCE-DIVERGE]).
 
 **[T-CAPTURE-WRITE]** Assigning to, calling a mutating method on, or passing
 as `inout` a binding a closure captured from outside is a compile error. The
@@ -726,6 +731,8 @@ mutate the enclosing scope. Two block-shaped constructs, two rules.
 **[E-COALESCE-DIVERGE]** The right-hand side of `??` may leave instead of
 producing a value — `m.get(k) ?? fail(e)` is the shortest way to turn absence
 into a failure, and it is the shape a fallible function's body most often has.
+`fail` is an expression; `return` is a statement and cannot go there
+([T-DIVERGE]).
 
 **[E-COALESCE-LAZY]** `a ?? b` evaluates `b` only when `a` is `None`.
 
@@ -4428,6 +4435,7 @@ fn main() {
 ```grasm
 //! tag: T-DIVERGE
 //! expect: output
+//! 4 -1
 //! pos non-pos b c
 //! -2 0
 //! 3
@@ -4476,7 +4484,14 @@ fn checked(n: i64) -> i64 ! S {
     }
 }
 
+/// `fail` is an expression and may sit on the right of `??`; `return` is a
+/// statement and may not ([E-COALESCE-DIVERGE]).
+fn from_option(o: Option[i64]) -> i64 ! S {
+    o ?? fail(S.B)
+}
+
 fn main() {
+    print("{from_option(Some(4)) ?? 0} {from_option(None) ?? 0 - 1}")
     print("{classify(S.A(1))} {classify(S.A(-1))} {classify(S.B)} {classify(S.C("c"))}")
     print("{first_negative([0, 3, -2, 5])} {first_negative([1, 2])}")
     print("{sum_until_nine([1, 2, 9, 100])}")

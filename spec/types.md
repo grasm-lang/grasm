@@ -227,11 +227,16 @@ which is not `true` — so the answer was the empty list, with nothing reported
 and exit code 0. The same door made `any` always `false`, `find` always
 `None`, and `sort_by` leave the list untouched.
 
-**[T-DIVERGE]** `return`, `break` and `continue` fit wherever an expression is
-expected, the way `fail` does ([T-FAIL]): control leaves before a value is
-produced, so there is no value to disagree about. This is what makes
-`0 -> return false` legal next to an arm that yields a `bool` — reading the
-returning arm as `()` put the error on the *other* arm.
+**[T-DIVERGE]** `return`, `break` and `continue` produce no value, so they do
+not have to agree with one: an `if` branch or a match arm that ends in one is
+compatible with any other branch's type. This is what makes `0 -> return
+false` legal next to an arm that yields a `bool` — reading the returning arm
+as `()` put the error on the *other* arm.
+
+They are **statements**, not expressions, so unlike `fail` they cannot appear
+as a sub-expression: `o ?? return -1` and `n.max(return 0)` do not parse.
+`fail(e)` can, and is the form to reach for on the right of `??`
+([E-COALESCE-DIVERGE]).
 
 **[T-CAPTURE-WRITE]** Assigning to, calling a mutating method on, or passing
 as `inout` a binding a closure captured from outside is a compile error. The

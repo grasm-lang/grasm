@@ -250,3 +250,27 @@ fn a_closure_resolves_names_where_it_was_written() {
         ("helper", "pub fn value() -> str {\n    \"from helper\"\n}\n"),
     ]);
 }
+
+/// A `type` declaration may name a type from another module.
+///
+/// Type *bodies* were resolved in the same pass that registers type names, so
+/// whether a field could name a type came down to which file the loader
+/// handed over first. It worked in function signatures and `let` annotations
+/// and nowhere else — and the error said to declare it with `type`, naming
+/// the thing that was already declared. The same ordering effects had.
+#[test]
+fn a_type_declaration_may_name_a_type_from_another_module() {
+    ok(&[
+        (
+            "main",
+            "import lib\n\n\
+             type Wrap = { inner: Thing }\n\
+             type Holder = | One(t: Thing) | None2\n\n\
+             fn main() {\n\
+             \x20   let w = Wrap{ inner: Thing{ n: 5 } }\n\
+             \x20   print(\"{w.inner.n}\")\n\
+             }\n",
+        ),
+        ("lib", "pub type Thing = { n: i64 }\n"),
+    ]);
+}

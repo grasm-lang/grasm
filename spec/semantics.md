@@ -67,6 +67,8 @@ mutate the enclosing scope. Two block-shaped constructs, two rules.
 **[E-COALESCE-DIVERGE]** The right-hand side of `??` may leave instead of
 producing a value — `m.get(k) ?? fail(e)` is the shortest way to turn absence
 into a failure, and it is the shape a fallible function's body most often has.
+`fail` is an expression; `return` is a statement and cannot go there
+([T-DIVERGE]).
 
 **[E-COALESCE-LAZY]** `a ?? b` evaluates `b` only when `a` is `None`.
 
