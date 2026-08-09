@@ -679,6 +679,19 @@ had a door straight through it.
 own module, like a function. Reaching a private one through its module is the
 same error a private function gives.
 
+**[T-UNSAFE-FFI]** `unsafe { … }` is Tier 3: the block where the guarantees of
+the safe tiers do not apply. Using a declared C function — calling one *or
+naming one*, which are the same permission — is allowed only inside it.
+
+The block is not merely syntax. An `unsafe` block puts `unsafe` in the
+enclosing function's effect row, so it reaches the package's capability ceiling
+by the same path every other effect does, and a package containing one must
+declare `capabilities = [..., "unsafe"]` or fail to build. That declaration is
+in the manifest, which every consumer can read, transitively: a library cannot
+quietly contain an `unsafe` block, and a consumer can refuse to depend on one
+that does. `unsafe` is a capability rather than a handleable effect — there is
+no `with unsafe handled_by`, the same as for `io`.
+
 **[T-EXTERN]** `extern fn name(a: i64) -> f64` declares a C function. It has
 no body: a compiled build resolves the symbol at link time, and `grasm run`
 finds it in the interpreter's own process. Parameters and results are `i64`
@@ -2000,7 +2013,10 @@ extern fn sqrt(x: f64) -> f64
 extern fn getpid() -> i64
 
 fn main() {
-    print("{sqrt(16.0)}")
+    let r = unsafe {
+        sqrt(16.0)
+    }
+    print("{r}")
 }
 ```
 
@@ -2008,10 +2024,20 @@ Parameters and results are `i64` and `f64`. `bool` is deliberately not
 allowed: C's is one byte and Grasm's is a register, and that kind of mismatch
 surfaces as garbage far from where it was caused.
 
-**Calling one counts as `io`.** What a C function does cannot be known, so the
-safe assumption is the only one available: an `extern` call counts against a
-package's capability ceiling, and a function that makes one cannot be handed
-to `par_map`. FFI does not become a hole through the guarantees.
+**It has to be inside `unsafe`, and it counts as both `unsafe` and `io`.**
+Calling C is Tier 3 — outside everything the safe tiers guarantee — so the
+source says so at the use, and the package says so in its manifest:
+
+```
+capabilities = ["io", "unsafe"]
+```
+
+Naming a C function without calling it needs `unsafe` as well: holding the
+function *is* the ability to call it. What a C function does cannot be known,
+so the safe assumption is the only one available — an `extern` use counts
+against the ceiling, and a function that makes one cannot be handed to
+`par_map`. A consumer can see `unsafe` in your manifest, transitively, and
+refuse to depend on you: your JSON parser cannot quietly contain one.
 
 ## 10b. Knowing what you broke
 
@@ -5550,9 +5576,13 @@ fn apply(f: fn(f64) -> f64 / {io}, v: f64) -> f64 / {io} {
 }
 
 fn main() {
-    let f = sqrt
-    print("{f(4.0)} {apply(sqrt, 9.0)}")
-    print("{[1.0, 4.0, 9.0].map(sqrt)}")
+    unsafe {
+        // Naming one is the same permission as calling one, so the *name*
+        // needs `unsafe` too, not just the call.
+        let f = sqrt
+        print("{f(4.0)} {apply(sqrt, 9.0)}")
+        print("{[1.0, 4.0, 9.0].map(sqrt)}")
+    }
 }
 ```
 
@@ -5577,10 +5607,21 @@ extern fn pow(base: f64, exp: f64) -> f64
 extern fn getpid() -> i64
 
 fn main() {
-    print("{abs(0 - 7)} {sqrt(16.0)}")
-    print("{pow(3.0, 1.0)} {abs(2) - 4}")
-    // A real process id, so this proves the call actually happened.
-    print("{getpid() > 0}")
+    // Every use is inside `unsafe` — Tier 3 ([T-UNSAFE-FFI]). Leaving the
+    // safe tiers is the thing being asked for, and it is asked for in the
+    // source and again in the manifest.
+    let a = unsafe {
+        abs(0 - 7)
+    }
+    let s = unsafe {
+        sqrt(16.0)
+    }
+    print("{a} {s}")
+    unsafe {
+        print("{pow(3.0, 1.0)} {abs(2) - 4}")
+        // A real process id, so this proves the call actually happened.
+        print("{getpid() > 0}")
+    }
 }
 ```
 
@@ -6656,6 +6697,26 @@ fn main() {
     c.set("k", 1)
     print("{c}")
     print("{run(up, "hi")}")
+}
+```
+
+## `T-UNSAFE-FFI.gr`
+
+```grasm
+//! tag: T-UNSAFE-FFI
+//! expect: error
+//! can only be used inside `unsafe`
+// Tier 3 is asked for, not fallen into.
+//
+// Calling C leaves everything the safe tiers guarantee, so it is spelled at
+// the use — `unsafe { ... }` — and again in the manifest, where a consumer can
+// see it. `T-EXTERN.gr` and `T-EXTERN-VALUE.gr` show the accepted form; this
+// one pins the refusal, including that it covers *naming* a C function and not
+// only calling it.
+extern fn sqrt(x: f64) -> f64
+
+fn main() {
+    print("{sqrt(16.0)}")
 }
 ```
 

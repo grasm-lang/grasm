@@ -563,7 +563,10 @@ extern fn sqrt(x: f64) -> f64
 extern fn getpid() -> i64
 
 fn main() {
-    print("{sqrt(16.0)}")
+    let r = unsafe {
+        sqrt(16.0)
+    }
+    print("{r}")
 }
 ```
 
@@ -571,10 +574,20 @@ Parameters and results are `i64` and `f64`. `bool` is deliberately not
 allowed: C's is one byte and Grasm's is a register, and that kind of mismatch
 surfaces as garbage far from where it was caused.
 
-**Calling one counts as `io`.** What a C function does cannot be known, so the
-safe assumption is the only one available: an `extern` call counts against a
-package's capability ceiling, and a function that makes one cannot be handed
-to `par_map`. FFI does not become a hole through the guarantees.
+**It has to be inside `unsafe`, and it counts as both `unsafe` and `io`.**
+Calling C is Tier 3 — outside everything the safe tiers guarantee — so the
+source says so at the use, and the package says so in its manifest:
+
+```
+capabilities = ["io", "unsafe"]
+```
+
+Naming a C function without calling it needs `unsafe` as well: holding the
+function *is* the ability to call it. What a C function does cannot be known,
+so the safe assumption is the only one available — an `extern` use counts
+against the ceiling, and a function that makes one cannot be handed to
+`par_map`. A consumer can see `unsafe` in your manifest, transitively, and
+refuse to depend on you: your JSON parser cannot quietly contain one.
 
 ## 10b. Knowing what you broke
 

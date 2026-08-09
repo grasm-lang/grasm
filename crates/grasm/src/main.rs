@@ -1321,7 +1321,7 @@ to its ceiling,\n        so its dependents get no guarantee at all"
             eprintln!("error: {u}");
         }
         eprintln!(
-            "  help: a capability must be `io`, `async`, or an effect the \
+            "  help: a capability must be `io`, `async`, `unsafe`, or an effect the \
 program declares"
         );
         return Err(format!(

@@ -14,6 +14,7 @@ use grasm_syntax::span::Span;
 use crate::check::ModuleView;
 
 pub const IO: &str = "io";
+pub const UNSAFE: &str = "unsafe";
 pub const ASYNC: &str = "async";
 
 const IO_BUILTINS: &[&str] = &[
@@ -84,7 +85,8 @@ pub fn check_effects(module: &Module) -> Vec<Diagnostic> {
 /// a typo or a fiction, and either way the manifest is claiming something the
 /// code cannot mean.
 pub fn effect_vocabulary(program: &crate::loader::Program) -> BTreeSet<String> {
-    let mut names: BTreeSet<String> = [IO.to_string(), ASYNC.to_string()].into();
+    let mut names: BTreeSet<String> =
+        [IO.to_string(), ASYNC.to_string(), UNSAFE.to_string()].into();
     for file in &program.files {
         for decl in &file.module.decls {
             if let Decl::Effect(e) = decl {
@@ -339,7 +341,7 @@ pub fn check_effects_multi(files: &[ModuleView]) -> Vec<Diagnostic> {
     if let Some(main) = ctx.fns.get("main::main") {
         let leftover: Vec<&String> = ctx.rows["main::main"]
             .iter()
-            .filter(|e| *e != IO && *e != ASYNC)
+            .filter(|e| *e != IO && *e != ASYNC && *e != UNSAFE)
             .collect();
         if !leftover.is_empty() {
             let list = leftover
@@ -369,7 +371,7 @@ pub fn check_effects_multi(files: &[ModuleView]) -> Vec<Diagnostic> {
                 collect_fn_bindings(body, &ctx, &f.name, &mut fnb);
                 walk_block(body, &f.name, &mut active, &ctx, &fnb, &mut row);
                 let leftover: Vec<&String> =
-                    row.iter().filter(|e| *e != IO && *e != ASYNC).collect();
+                    row.iter().filter(|e| *e != IO && *e != ASYNC && *e != UNSAFE).collect();
                 if !leftover.is_empty() {
                     let list = leftover
                         .iter()
@@ -610,7 +612,7 @@ fn collect_calls_expr<'e>(e: &'e Expr, out: &mut Vec<(&'e str, &'e [Expr], Span)
                 None => {}
             }
         }
-        Expr::Block(b) => collect_calls_block(b, out),
+        Expr::Block(b) | Expr::Unsafe(b) => collect_calls_block(b, out),
         Expr::Match { scrutinee, arms, .. } => {
             collect_calls_expr(scrutinee, out);
             for a in arms {
@@ -739,7 +741,7 @@ fn collect_par_maps_expr<'e>(e: &'e Expr, out: &mut Vec<(&'e Expr, Span)>) {
             }
         }
         Expr::Closure { body, .. } => collect_par_maps_expr(body, out),
-        Expr::Block(b) => collect_par_maps_block(b, out),
+        Expr::Block(b) | Expr::Unsafe(b) => collect_par_maps_block(b, out),
         Expr::If {
             cond,
             then_block,
@@ -1157,6 +1159,14 @@ fn walk_expr(
             }
         }
         Expr::Block(b) => walk_block(b, current, active, ctx, fnb, out),
+        // Tier 3 is a capability, not just a syntax. A package containing an
+        // `unsafe` block declares `unsafe` in its manifest or fails to build,
+        // which is what makes it visible to — and refusable by — everyone
+        // downstream: your JSON parser cannot quietly contain one.
+        Expr::Unsafe(b) => {
+            out.insert(UNSAFE.to_string());
+            walk_block(b, current, active, ctx, fnb, out);
+        }
         Expr::Closure { body, .. } => walk_expr(body, current, active, ctx, fnb, out),
     }
 }

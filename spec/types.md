@@ -339,6 +339,19 @@ had a door straight through it.
 own module, like a function. Reaching a private one through its module is the
 same error a private function gives.
 
+**[T-UNSAFE-FFI]** `unsafe { … }` is Tier 3: the block where the guarantees of
+the safe tiers do not apply. Using a declared C function — calling one *or
+naming one*, which are the same permission — is allowed only inside it.
+
+The block is not merely syntax. An `unsafe` block puts `unsafe` in the
+enclosing function's effect row, so it reaches the package's capability ceiling
+by the same path every other effect does, and a package containing one must
+declare `capabilities = [..., "unsafe"]` or fail to build. That declaration is
+in the manifest, which every consumer can read, transitively: a library cannot
+quietly contain an `unsafe` block, and a consumer can refuse to depend on one
+that does. `unsafe` is a capability rather than a handleable effect — there is
+no `with unsafe handled_by`, the same as for `io`.
+
 **[T-EXTERN]** `extern fn name(a: i64) -> f64` declares a C function. It has
 no body: a compiled build resolves the symbol at link time, and `grasm run`
 finds it in the interpreter's own process. Parameters and results are `i64`

@@ -149,6 +149,11 @@ struct Checker {
     defs: TypeDefs,
     aliases: HashMap<String, Type>,
     fns: HashMap<String, FnInfo>,
+    /// How many `unsafe` blocks enclose the expression being checked.
+    unsafe_depth: u32,
+    /// Qualified names of declared C functions, so a use of one can be
+    /// required to sit inside `unsafe` (Tier 3).
+    extern_names: std::collections::HashSet<String>,
     /// Integer literals promoted to `f64`, by span start. See
     /// `Analysis::float_literals`.
     float_literals: std::collections::HashSet<u32>,
@@ -222,6 +227,8 @@ impl Checker {
             defs,
             aliases: HashMap::new(),
             fns: HashMap::new(),
+            unsafe_depth: 0,
+            extern_names: std::collections::HashSet::new(),
             float_literals: std::collections::HashSet::new(),
             float_sums: std::collections::HashSet::new(),
             effects: HashMap::new(),
@@ -497,6 +504,7 @@ impl Checker {
                 self.error(e.name.span, format!("duplicate function `{}`", e.name.name));
                 continue;
             }
+            self.extern_names.insert(key.clone());
             let params: Vec<Type> = e
                 .params
                 .iter()
@@ -1159,6 +1167,28 @@ impl Checker {
             .cloned()
     }
 
+    /// Tier 3: a declared C function may only be reached inside `unsafe`.
+    ///
+    /// Calling one and merely naming one are the same permission — holding the
+    /// function *is* the ability to call it — so both go through here.
+    /// Reporting at the use rather than at the declaration is deliberate: the
+    /// declaration is fine, and the use is where the reader has to be told
+    /// what they are taking on.
+    fn require_unsafe(&mut self, name: &str, span: Span) {
+        if self.unsafe_depth > 0 {
+            return;
+        }
+        let key = format!("{}::{}", self.current_module, name);
+        if self.extern_names.contains(&key) {
+            self.error_help(
+                span,
+                format!("`{name}` is a C function, so it can only be used inside `unsafe`"),
+                "wrap the use in `unsafe { ... }`; the package must then declare the \
+`unsafe` capability, which is what makes it visible to everyone who depends on you",
+            );
+        }
+    }
+
     /// Rejects a task body's reference to a binding that will not exist when
     /// the task runs.
     ///
@@ -1464,6 +1494,16 @@ that does not change",
                 scrutinee, arms, ..
             } => self.infer_match(scrutinee, arms, e.span()),
             Expr::Block(b) => self.check_block(b),
+            // Tier 3. The block itself is ordinary; what it does is permit
+            // what the safe tiers refuse — today, calling a declared C
+            // function. The depth is a counter rather than a flag so a nested
+            // `unsafe` does not turn the outer one off on the way out.
+            Expr::Unsafe(b) => {
+                self.unsafe_depth += 1;
+                let t = self.check_block(b);
+                self.unsafe_depth -= 1;
+                t
+            }
             Expr::Try { expr, span } => self.infer_try(expr, *span),
             Expr::Closure { .. } => self.infer_closure(e, None),
         }
@@ -1510,6 +1550,7 @@ that does not change",
         // `fn(T) -> bool`, then filter on `Ok(true)`, which is not `true`, and
         // quietly return the empty list.
         if let Some(info) = self.lookup_fn(&id.name) {
+            self.require_unsafe(&id.name, id.span);
             let ret_of = |ret: &Type, err: &Option<Type>| match err {
                 Some(e) => Type::Fallible(Box::new(ret.clone()), Box::new(e.clone())),
                 None => ret.clone(),
@@ -1836,6 +1877,7 @@ that does not change",
                 }
                 // Named function.
                 if let Some(info) = self.lookup_fn(&id.name) {
+                    self.require_unsafe(&id.name, id.span);
                     return self.check_fn_call(&id.name, &info, args, span);
                 }
             }

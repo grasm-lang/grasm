@@ -16,7 +16,11 @@ fn apply(f: fn(f64) -> f64 / {io}, v: f64) -> f64 / {io} {
 }
 
 fn main() {
-    let f = sqrt
-    print("{f(4.0)} {apply(sqrt, 9.0)}")
-    print("{[1.0, 4.0, 9.0].map(sqrt)}")
+    unsafe {
+        // Naming one is the same permission as calling one, so the *name*
+        // needs `unsafe` too, not just the call.
+        let f = sqrt
+        print("{f(4.0)} {apply(sqrt, 9.0)}")
+        print("{[1.0, 4.0, 9.0].map(sqrt)}")
+    }
 }

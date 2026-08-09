@@ -436,6 +436,11 @@ pub enum Expr {
         span: Span,
     },
     Block(Block),
+    /// `unsafe { ... }` — Tier 3. Everything the safe tiers forbid lives in
+    /// here, and a package containing one must declare the `unsafe`
+    /// capability, which makes it visible in the manifest and refusable by a
+    /// consumer.
+    Unsafe(Block),
     /// `try expr` — propagate the error branch.
     Try {
         expr: Box<Expr>,
@@ -510,6 +515,7 @@ impl Expr {
             | Expr::Try { span, .. }
             | Expr::Closure { span, .. } => *span,
             Expr::Block(b) => b.span,
+            Expr::Unsafe(b) => b.span,
         }
     }
 }

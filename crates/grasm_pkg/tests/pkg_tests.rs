@@ -1294,3 +1294,36 @@ fn a_version_change_alone_is_a_lockfile_change() {
     assert!(msg.contains("0.1.5"), "{msg}");
     assert!(msg.contains("0.1.0"), "{msg}");
 }
+
+/// Tier 3 is visible in the manifest and refusable by a consumer.
+///
+/// An `unsafe` block puts `unsafe` in the effect row, so it reaches the
+/// capability ceiling by the same path every other effect does. Without that
+/// the block would be a comment: a library could contain one and nothing
+/// downstream would know.
+#[test]
+fn an_unsafe_block_needs_the_unsafe_capability() {
+    let ws = Workspace::new("tier3");
+    let src = "extern fn sqrt(x: f64) -> f64\n\n\
+               fn main() {\n    let r = unsafe {\n        sqrt(9.0)\n    }\n    \
+               print(\"{r}\")\n}\n";
+    let dir = ws.package("ffipkg", &manifest("ffipkg", Some("\"io\""), &[]), src);
+    let m = Manifest::load(&dir).unwrap();
+    let performed = grasm_pkg::effects_of_package(&m).unwrap();
+    assert!(performed.contains("unsafe"), "{performed:?}");
+    let v = grasm_pkg::check_capabilities(&m, &performed)
+        .expect("unsafe beyond an io-only ceiling must be caught");
+    assert_eq!(v.exceeded, vec!["unsafe"]);
+
+    // And it is declarable: `unsafe` is a real capability name, not a typo.
+    let ok_dir = ws.package(
+        "ffiok",
+        &manifest("ffiok", Some("\"io\", \"unsafe\""), &[]),
+        src,
+    );
+    let ok = Manifest::load(&ok_dir).unwrap();
+    let performed = grasm_pkg::effects_of_package(&ok).unwrap();
+    assert!(grasm_pkg::check_capabilities(&ok, &performed).is_none());
+    let vocab = grasm_pkg::effect_vocabulary_of_package(&ok).unwrap();
+    assert!(grasm_pkg::check_capability_names(&ok, &vocab).is_empty());
+}

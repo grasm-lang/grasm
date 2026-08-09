@@ -1,0 +1,15 @@
+//! tag: T-UNSAFE-FFI
+//! expect: error
+//! can only be used inside `unsafe`
+// Tier 3 is asked for, not fallen into.
+//
+// Calling C leaves everything the safe tiers guarantee, so it is spelled at
+// the use — `unsafe { ... }` — and again in the manifest, where a consumer can
+// see it. `T-EXTERN.gr` and `T-EXTERN-VALUE.gr` show the accepted form; this
+// one pins the refusal, including that it covers *naming* a C function and not
+// only calling it.
+extern fn sqrt(x: f64) -> f64
+
+fn main() {
+    print("{sqrt(16.0)}")
+}

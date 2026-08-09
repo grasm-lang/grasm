@@ -1568,6 +1568,10 @@ impl Parser {
             }
             TokenKind::KwIf => self.parse_if(),
             TokenKind::KwMatch => self.parse_match(),
+            TokenKind::KwUnsafe => {
+                self.bump();
+                Ok(Expr::Unsafe(self.parse_block()?))
+            }
             TokenKind::LBrace => self.parse_brace_expr(),
             TokenKind::Pipe => self.parse_closure(),
             other => {

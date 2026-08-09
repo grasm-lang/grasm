@@ -1462,7 +1462,7 @@ to one — a loop variable or a list element is this case",
 
     fn collect_handlers_expr(&mut self, e: &Expr) -> CResult<()> {
         match e {
-            Expr::Block(b) => self.collect_handlers_block(b),
+            Expr::Block(b) | Expr::Unsafe(b) => self.collect_handlers_block(b),
             Expr::If {
                 then_block,
                 else_branch,
@@ -2013,7 +2013,7 @@ fn collect_named_calls_expr(e: &Expr, out: &mut Vec<(String, Vec<Expr>)>) {
             collect_named_calls_expr(rhs, out);
         }
         Expr::Unary { expr, .. } => collect_named_calls_expr(expr, out),
-        Expr::Block(b) => collect_named_calls_block(b, out),
+        Expr::Block(b) | Expr::Unsafe(b) => collect_named_calls_block(b, out),
         Expr::Str(pieces, _) => {
             for p in pieces {
                 if let StrPiece::Expr(inner) = p {
@@ -2254,7 +2254,7 @@ fn collect_idents(e: &Expr, out: &mut Vec<String>) {
             }
         }
         Expr::Closure { body, .. } => collect_idents(body, out),
-        Expr::Block(b) => collect_idents_block(b, out),
+        Expr::Block(b) | Expr::Unsafe(b) => collect_idents_block(b, out),
         Expr::If {
             cond,
             then_block,
@@ -2365,7 +2365,7 @@ fn walk_spawns_expr<'b>(e: &'b Expr, out: &mut Vec<&'b grasm_syntax::ast::Block>
                 walk_spawns_expr(&arm.body, out);
             }
         }
-        Expr::Block(b) => walk_spawns(b, out),
+        Expr::Block(b) | Expr::Unsafe(b) => walk_spawns(b, out),
         _ => {}
     }
 }
@@ -2451,7 +2451,7 @@ fn is_probe_safe(e: &Expr) -> bool {
 /// or failing — and so never reaches the match's merge point.
 fn arm_diverges(body: &Expr) -> bool {
     match body {
-        Expr::Block(b) => matches!(
+        Expr::Block(b) | Expr::Unsafe(b) => matches!(
             b.stmts.last(),
             Some(Stmt::Return(..) | Stmt::Break(_) | Stmt::Continue(_))
         ),
@@ -2602,7 +2602,7 @@ fn scan_uses_expr(e: &Expr, indexed: &mut Vec<String>, bad: &mut Vec<String>) {
             }
         }
         Expr::Closure { body, .. } => scan_uses_expr(body, indexed, bad),
-        Expr::Block(b) => scan_uses_block(b, indexed, bad),
+        Expr::Block(b) | Expr::Unsafe(b) => scan_uses_block(b, indexed, bad),
         Expr::If {
             cond,
             then_block,
@@ -3853,7 +3853,7 @@ impl FnCx<'_, '_> {
                 ..
             } => self.eval_if(cond, then_block, else_branch.as_deref()),
             Expr::Call { callee, args, span } => self.eval_call(callee, args, *span),
-            Expr::Block(b) => {
+            Expr::Block(b) | Expr::Unsafe(b) => {
                 let (last, terminated) = self.eval_block_inner(b)?;
                 if terminated {
                     Ok(None)
@@ -6353,7 +6353,7 @@ impl FnCx<'_, '_> {
             // A block's type is its tail expression's, and the tail may name
             // the block's own bindings — so those are probed into a scope
             // first. Nothing is emitted; the scope is dropped without decs.
-            Expr::Block(b) => {
+            Expr::Block(b) | Expr::Unsafe(b) => {
                 self.push_scope();
                 let probed = self.probe_block_tail(b);
                 self.pop_scope_no_decs();
