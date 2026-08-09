@@ -920,6 +920,13 @@ many times a name appears. That is why the restriction exists rather than
 being a limitation to work around: a value that has to be computed once, with
 effects, is a function.
 
+**[E-CONST-REF]** A constant's value may not take a reference. Because it is
+evaluated at every mention, each mention would allocate a different slot: the
+same constant printed as two different references on one line, releasing it
+gave up a slot nothing else would ever name, and a loop reading it allocated
+one per iteration. This follows from the clause above and was worth saying
+out loud, since it silently destroys the one thing a reference is for.
+
 **[E-CLOSURE-CAPTURE]** A closure captures the values it uses **at the moment
 it is created**, not the bindings. Changing a captured variable afterwards is
 not visible inside, and a closure may not write to one at all — that is a
@@ -2424,6 +2431,30 @@ fn main() {
     print("{some ?? 0}")
     let none: Option[i64] = None
     print("{none ?? 7}")
+}
+```
+
+## `E-CONST-REF.gr`
+
+```grasm
+//! tag: E-CONST-REF
+//! expect: error
+//! a constant's value cannot take a reference
+// A constant cannot hold a reference.
+//
+// [E-CONST] says a constant is evaluated wherever its name is used, so every
+// mention allocates a *different* slot. `print("{ROOT} {ROOT}")` printed two
+// different references on one line; `release(ROOT)` gave up a slot nothing
+// else would ever name and `alive(ROOT)` was then still true; a loop reading
+// the constant allocated a slot per iteration. All three engines agreed, so it
+// was language semantics rather than a bug — and it silently destroyed the one
+// thing a reference is for. It follows from [E-CONST] and nothing said so.
+type Node = { id: i64 }
+
+let ROOT = ref(Node{ id: 1 })
+
+fn main() {
+    print("{ROOT.id}")
 }
 ```
 

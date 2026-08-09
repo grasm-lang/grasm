@@ -206,6 +206,19 @@ pub fn effects_of_program(program: &crate::loader::Program) -> BTreeSet<String> 
     all
 }
 
+/// Does this expression take a reference anywhere inside it?
+fn makes_ref(e: &Expr) -> bool {
+    let mut found = false;
+    let mut idents = Vec::new();
+    collect_calls_expr(e, &mut idents);
+    for (name, _, _) in &idents {
+        if *name == "ref" {
+            found = true;
+        }
+    }
+    found
+}
+
 /// The shared context both effect passes work from.
 fn build_ctx<'a>(files: &'a [ModuleView<'a>]) -> Ctx<'a> {
     let mut ctx = Ctx {
@@ -293,6 +306,26 @@ pub fn check_effects_multi(files: &[ModuleView]) -> Vec<Diagnostic> {
         let current = f.name.clone();
         for d in &f.module.decls {
             let Decl::Const(c) = d else { continue };
+            // Taking a reference in a constant has the same problem an effect
+            // does, for the same reason: a constant is evaluated at every
+            // mention, so each mention allocates a *different* slot. `ROOT`
+            // printed as two different references on one line, `release(ROOT)`
+            // released a slot nothing else would ever name, `alive(ROOT)` was
+            // then true — and a loop reading it allocated a slot per
+            // iteration. It followed from [E-CONST] and nothing said so.
+            if makes_ref(&c.init) {
+                diags.push(
+                    Diagnostic::error(
+                        c.init.span(),
+                        "a constant's value cannot take a reference".to_string(),
+                    )
+                    .with_help(
+                        "a constant is evaluated wherever its name is used, so every mention \
+would allocate a different slot — make it a function, or take the reference \
+once inside `main`",
+                    ),
+                );
+            }
             let mut row = BTreeSet::new();
             let mut active = Vec::new();
             let fnb = FnBindings::default();

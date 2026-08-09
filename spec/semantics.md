@@ -47,6 +47,13 @@ many times a name appears. That is why the restriction exists rather than
 being a limitation to work around: a value that has to be computed once, with
 effects, is a function.
 
+**[E-CONST-REF]** A constant's value may not take a reference. Because it is
+evaluated at every mention, each mention would allocate a different slot: the
+same constant printed as two different references on one line, releasing it
+gave up a slot nothing else would ever name, and a loop reading it allocated
+one per iteration. This follows from the clause above and was worth saying
+out loud, since it silently destroys the one thing a reference is for.
+
 **[E-CLOSURE-CAPTURE]** A closure captures the values it uses **at the moment
 it is created**, not the bindings. Changing a captured variable afterwards is
 not visible inside, and a closure may not write to one at all — that is a

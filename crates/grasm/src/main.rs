@@ -171,7 +171,15 @@ fn main() -> ExitCode {
             }
         }
         Some("build") => {
-            let Some(path) = args.get(1) else {
+            // The first argument that is not a flag, so `build --native f.gr`
+            // works as well as `build f.gr --native`. Taking argument one
+            // literally made the first form report `cannot read '--native'`,
+            // which reads like a missing file.
+            let Some(path) = args[1..]
+                .iter()
+                .find(|a| !a.starts_with('-'))
+                .filter(|a| args.iter().position(|x| x == *a) == Some(1) || a.ends_with(".gr"))
+            else {
                 eprintln!("usage: grasm build <file.gr> [-o output]");
                 return ExitCode::FAILURE;
             };

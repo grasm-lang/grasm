@@ -1178,7 +1178,12 @@ impl Checker {
     fn is_copy_type(&self, ty: &Type) -> bool {
         matches!(
             self.uni.resolve(ty),
-            Type::I64 | Type::F64 | Type::Bool | Type::Unit | Type::Range
+            // A reference is one word — a slot number and a generation — and
+            // [T-REF-GENERATIONAL] says it copies. It moved instead, so
+            // `own r: ref N` consumed the caller's, which is neither what the
+            // clause says nor useful: the point of a reference is that several
+            // places hold it.
+            Type::I64 | Type::F64 | Type::Bool | Type::Unit | Type::Range | Type::Ref(_)
         )
     }
 

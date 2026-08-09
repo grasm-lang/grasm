@@ -7,7 +7,7 @@ before it is listed as stable.
 `crates/grasm_spec` fails if a clause here is missing, unknown, or listed twice,
 so this file cannot drift away from the specification it describes.
 
-Today: 113 stable, 62 provisional, 20 experimental, of 195.
+Today: 114 stable, 62 provisional, 20 experimental, of 196.
 
 ## Stable
 
@@ -18,6 +18,7 @@ Will not change incompatibly before 2.0.
 - `E-ARITH-INT` — stable
 - `E-CLOSURE-CAPTURE` — stable
 - `E-COALESCE-LAZY` — stable
+- `E-CONST-REF` — stable
 - `E-COW` — stable
 - `E-DIV-ZERO` — stable
 - `E-ENTRY` — stable

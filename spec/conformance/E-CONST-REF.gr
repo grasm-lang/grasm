@@ -1,0 +1,19 @@
+//! tag: E-CONST-REF
+//! expect: error
+//! a constant's value cannot take a reference
+// A constant cannot hold a reference.
+//
+// [E-CONST] says a constant is evaluated wherever its name is used, so every
+// mention allocates a *different* slot. `print("{ROOT} {ROOT}")` printed two
+// different references on one line; `release(ROOT)` gave up a slot nothing
+// else would ever name and `alive(ROOT)` was then still true; a loop reading
+// the constant allocated a slot per iteration. All three engines agreed, so it
+// was language semantics rather than a bug — and it silently destroyed the one
+// thing a reference is for. It follows from [E-CONST] and nothing said so.
+type Node = { id: i64 }
+
+let ROOT = ref(Node{ id: 1 })
+
+fn main() {
+    print("{ROOT.id}")
+}
