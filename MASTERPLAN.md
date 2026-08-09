@@ -430,6 +430,17 @@ checks (Vale's own-lending result: elision can reach 100% in linear style).
 the manifest, auditable transitively, deniable by consumers: your JSON parser
 cannot quietly contain `unsafe`).
 
+**Where this stands today.** Tier 0 is the language: `let` / `inout` / `own`
+parameters, second-class references, enforced exclusivity, move checking. Tier
+3 is in: `unsafe { … }` gates FFI, carries `unsafe` in the effect row, and is
+enforced against the package's declared capabilities, so it is visible to and
+refusable by every consumer. **Tiers 1 and 2 are not implemented** — `region`
+and `ref T` do not parse. Until they are, a genuinely cyclic or long-lived
+object graph has no safe representation here beyond indices into a list, and
+the arena story is whatever the allocator does. The guarantees below describe
+the design, not the current compiler, and this paragraph stays until that is
+no longer true.
+
 **Guarantees across tiers 0–2:** no use-after-free, no double-free, no OOB
 (bounds-checked, elided by refinement/iterator proofs), no uninitialized reads
 (definite initialization), no data races, no UB. Deterministic destruction order.
