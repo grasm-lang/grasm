@@ -1022,6 +1022,14 @@ pub enum LockChange {
     /// A package's sources changed since the lockfile was written. This is the
     /// case a lockfile exists to catch: a dependency that is not what it was.
     Changed { name: String, was: String, now: String },
+    /// A package resolved to a different *version* than the lockfile records.
+    ///
+    /// Reported separately from a content change because it can happen without
+    /// one: a metadata-only release has the same sources, so the checksums
+    /// match and only the version moved. Comparing checksums alone let that
+    /// through `--locked`, and the lockfile then went on recording a version
+    /// that was no longer in the build — a factually wrong record passing CI.
+    VersionChanged { name: String, was: String, now: String },
     /// A package the lockfile does not mention.
     Added(String),
     /// A package the lockfile mentions that is no longer in the graph.
@@ -1044,6 +1052,10 @@ impl std::fmt::Display for LockChange {
                 "`{name}` contents changed since the lockfile ({}… → {}…)",
                 &was[..was.len().min(12)],
                 &now[..now.len().min(12)]
+            ),
+            LockChange::VersionChanged { name, was, now } => write!(
+                f,
+                "`{name}` is version {now} but the lockfile records {was}"
             ),
             LockChange::Added(name) => write!(f, "`{name}` is not in the lockfile"),
             LockChange::Removed(name) => {
@@ -1110,6 +1122,13 @@ pub fn diff_lock(previous: &str, current: &[LockEntry]) -> Vec<LockChange> {
         match by_name.get(e.name.as_str()) {
             None => changes.push(LockChange::Added(e.name.clone())),
             Some(old) => {
+                if old.version != e.version {
+                    changes.push(LockChange::VersionChanged {
+                        name: e.name.clone(),
+                        was: old.version.clone(),
+                        now: e.version.clone(),
+                    });
+                }
                 if old.checksum != e.checksum {
                     changes.push(LockChange::Changed {
                         name: e.name.clone(),

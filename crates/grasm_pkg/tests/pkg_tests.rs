@@ -1268,3 +1268,29 @@ fn a_pure_package_can_do_trigonometry() {
     assert!(performed.is_empty(), "math is pure: {performed:?}");
     assert!(grasm_pkg::check_capabilities(&m, &performed).is_none());
 }
+
+/// `--locked` catches a version change with unchanged sources.
+///
+/// The diff compared checksums and capabilities, and a metadata-only release
+/// changes neither: same sources, same ceiling, different version. So the
+/// change passed CI and the lockfile went on recording a version that was no
+/// longer in the build — a record that is not merely stale but wrong.
+#[test]
+fn a_version_change_alone_is_a_lockfile_change() {
+    let before = grasm_pkg::LockEntry {
+        name: "lib".into(),
+        version: "0.1.0".into(),
+        checksum: "abc".into(),
+        capabilities: Some(vec![]),
+    };
+    let after = grasm_pkg::LockEntry {
+        version: "0.1.5".into(),
+        ..before.clone()
+    };
+    let text = grasm_pkg::render_lock(&[before]);
+    let changes = grasm_pkg::diff_lock(&text, &[after]);
+    assert_eq!(changes.len(), 1, "{changes:?}");
+    let msg = changes[0].to_string();
+    assert!(msg.contains("0.1.5"), "{msg}");
+    assert!(msg.contains("0.1.0"), "{msg}");
+}

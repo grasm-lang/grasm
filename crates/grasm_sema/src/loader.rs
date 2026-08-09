@@ -227,34 +227,60 @@ pub fn load_from_disk_with(
         out
     };
 
-    let provider = move |name: &str| -> Option<String> {
+    // Where each module actually came from. A diagnostic has to name a path a
+    // reader can open, and the one the loader derives from a module name is
+    // only right for a sibling file: a dependency's module `liba.helper`
+    // became `liba/helper.gr`, which exists nowhere — not relative to the
+    // working directory, not relative to the manifest. Any editor or CI
+    // annotation that followed it landed on nothing.
+    let found: std::cell::RefCell<HashMap<String, String>> =
+        std::cell::RefCell::new(HashMap::new());
+    let note = |name: &str, path: &std::path::Path| {
+        found
+            .borrow_mut()
+            .insert(name.to_string(), path.display().to_string());
+    };
+    let provider = |name: &str| -> Option<String> {
         if name == "main" {
             return Some(entry_src.clone());
         }
         let rel = format!("{}.gr", name.replace('.', "/"));
-        if let Ok(src) = std::fs::read_to_string(entry_src_dir.join(&rel)) {
+        let sibling = entry_src_dir.join(&rel);
+        if let Ok(src) = std::fs::read_to_string(&sibling) {
+            note(name, &sibling);
             return Some(src);
         }
         // Then a dependency declared in grasm.toml, loaded from its entry.
         let root = name.split('.').next().unwrap_or(name);
         let dep_dir = deps.get(root)?;
         let entry = package_entry(dep_dir);
-        match name.split_once('.') {
-            None => std::fs::read_to_string(entry).ok(),
+        let path = match name.split_once('.') {
+            None => entry,
             // `import dep.sub` — a file inside the dependency's source tree.
-            Some((_, sub)) => {
-                let base = entry.parent()?.to_path_buf();
-                std::fs::read_to_string(base.join(format!("{}.gr", sub.replace('.', "/")))).ok()
-            }
-        }
+            Some((_, sub)) => entry
+                .parent()?
+                .to_path_buf()
+                .join(format!("{}.gr", sub.replace('.', "/"))),
+        };
+        let src = std::fs::read_to_string(&path).ok()?;
+        note(name, &path);
+        Some(src)
     };
-    Ok(load_with_paths_in(
+    let mut program = load_with_paths_in(
         "main",
         &entry_display,
         &provider,
         &tried,
         &dep_names,
-    ))
+    );
+    // The real path wins over the one derived from the module name.
+    let found = found.into_inner();
+    for f in &mut program.files {
+        if let Some(real) = found.get(&f.name) {
+            f.path.clone_from(real);
+        }
+    }
+    Ok(program)
 }
 
 /// Dependencies of the package containing `dir`, as name → package directory.

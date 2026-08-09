@@ -338,3 +338,48 @@ fn a_private_constant_is_not() {
         "is private",
     );
 }
+
+/// A diagnostic in a dependency names a path that exists.
+///
+/// The loader derived a display path from the module name, which is right only
+/// for a sibling file: a dependency's `liba.helper` became `liba/helper.gr`,
+/// which exists nowhere — not relative to the working directory, not relative
+/// to the manifest. Every editor and CI annotation that followed it landed on
+/// nothing.
+#[test]
+fn a_diagnostic_in_a_dependency_names_a_real_file() {
+    let root = std::env::temp_dir().join(format!("grasm_diagpath_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let write = |p: std::path::PathBuf, s: &str| {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, s).unwrap();
+    };
+    write(
+        root.join("liba/grasm.toml"),
+        "[package]\nname = \"liba\"\nversion = \"0.1.0\"\nentry = \"src/main.gr\"\ncapabilities = []\n",
+    );
+    write(
+        root.join("liba/src/main.gr"),
+        "import helper\n\npub fn go() -> str {\n    helper.bad()\n}\n",
+    );
+    write(root.join("liba/src/helper.gr"), "pub fn bad() -> str {\n    42\n}\n");
+    write(
+        root.join("app/grasm.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nentry = \"src/main.gr\"\ncapabilities = [\"io\"]\n\n[dependencies.liba]\npath = \"../liba\"\nversion = \"^0.1.0\"\n",
+    );
+    write(
+        root.join("app/src/main.gr"),
+        "import liba\n\nfn main() {\n    print(\"{liba.go()}\")\n}\n",
+    );
+
+    let program = grasm_sema::loader::load_from_disk(&root.join("app/src/main.gr")).expect("loads");
+    for f in &program.files {
+        assert!(
+            std::path::Path::new(&f.path).is_file(),
+            "module `{}` reports path `{}`, which does not exist",
+            f.name,
+            f.path
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
