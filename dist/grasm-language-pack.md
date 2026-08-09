@@ -447,6 +447,27 @@ reports whatever reaches it (see **[E-MAIN-ERR]**).
 **[T-ERR-SUBSET]** `try` is allowed only when the callee's error type is a
 subset of the caller's declared error union.
 
+**[T-ERR-UNION-OPAQUE]** A union error type is, today, **opaque**: a value of
+`(A | B)` can be raised, propagated, caught by `Err(e)`, and printed, and it
+cannot be narrowed back to `A` or `B`. There is no pattern for it and no field
+access through it — `e.key` is "`(A | B)` has no field `key`", and matching
+`A(..)` against it is refused. So a function declaring two error types can say
+*that* it failed and not *which way*, which is usually the reason for declaring
+two.
+
+This is a gap, not a design position, and it is stated here because the type is
+easy to arrive at without asking for it: [T-ERR-SUBSET] promotes a caller's
+error type to the union of what it propagates. Until narrowing exists, a
+program that needs to branch on which failure occurred should declare one error
+type that is a sum:
+
+```
+type Failure = | NotFound(key: str) | Cycle(path: [str])
+```
+
+which matches exhaustively, carries the same information, and is checked the
+same way everywhere.
+
 **[T-FAIL]** `fail(e)` raises the error branch. Its type fits any context, and
 it is a compile error where no error type is declared.
 
@@ -5475,6 +5496,35 @@ fn main() {
     match narrow() {
         Ok(v) -> print("{v}")
         Err(e) -> print("err")
+    }
+}
+```
+
+## `T-ERR-UNION-OPAQUE.gr`
+
+```grasm
+//! tag: T-ERR-UNION-OPAQUE
+//! expect: error
+//! has no field `key`
+// A union error type cannot be narrowed back to one of its members.
+//
+// It can be raised, propagated, caught and printed — and a function declaring
+// two error types can therefore say *that* it failed and not *which way*,
+// which is usually why two were declared. [T-ERR-SUBSET] promotes a caller's
+// error type to this union automatically, so a program arrives here without
+// asking. The way to branch on the failure today is one error type that is a
+// sum. This is recorded as a gap rather than left for a reader to discover.
+type NotFound = { key: str }
+type Cycle = { path: [str] }
+
+fn boom(w: i64) -> i64 ! (NotFound | Cycle) {
+    fail(NotFound{ key: "k" })
+}
+
+fn main() {
+    match boom(0) {
+        Ok(v) -> print("{v}")
+        Err(e) -> print("{e.key}")
     }
 }
 ```

@@ -1,0 +1,24 @@
+//! tag: T-ERR-UNION-OPAQUE
+//! expect: error
+//! has no field `key`
+// A union error type cannot be narrowed back to one of its members.
+//
+// It can be raised, propagated, caught and printed — and a function declaring
+// two error types can therefore say *that* it failed and not *which way*,
+// which is usually why two were declared. [T-ERR-SUBSET] promotes a caller's
+// error type to this union automatically, so a program arrives here without
+// asking. The way to branch on the failure today is one error type that is a
+// sum. This is recorded as a gap rather than left for a reader to discover.
+type NotFound = { key: str }
+type Cycle = { path: [str] }
+
+fn boom(w: i64) -> i64 ! (NotFound | Cycle) {
+    fail(NotFound{ key: "k" })
+}
+
+fn main() {
+    match boom(0) {
+        Ok(v) -> print("{v}")
+        Err(e) -> print("{e.key}")
+    }
+}

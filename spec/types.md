@@ -107,6 +107,27 @@ reports whatever reaches it (see **[E-MAIN-ERR]**).
 **[T-ERR-SUBSET]** `try` is allowed only when the callee's error type is a
 subset of the caller's declared error union.
 
+**[T-ERR-UNION-OPAQUE]** A union error type is, today, **opaque**: a value of
+`(A | B)` can be raised, propagated, caught by `Err(e)`, and printed, and it
+cannot be narrowed back to `A` or `B`. There is no pattern for it and no field
+access through it — `e.key` is "`(A | B)` has no field `key`", and matching
+`A(..)` against it is refused. So a function declaring two error types can say
+*that* it failed and not *which way*, which is usually the reason for declaring
+two.
+
+This is a gap, not a design position, and it is stated here because the type is
+easy to arrive at without asking for it: [T-ERR-SUBSET] promotes a caller's
+error type to the union of what it propagates. Until narrowing exists, a
+program that needs to branch on which failure occurred should declare one error
+type that is a sum:
+
+```
+type Failure = | NotFound(key: str) | Cycle(path: [str])
+```
+
+which matches exhaustively, carries the same information, and is checked the
+same way everywhere.
+
 **[T-FAIL]** `fail(e)` raises the error branch. Its type fits any context, and
 it is a compile error where no error type is declared.
 

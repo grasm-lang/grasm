@@ -7,7 +7,7 @@ before it is listed as stable.
 `crates/grasm_spec` fails if a clause here is missing, unknown, or listed twice,
 so this file cannot drift away from the specification it describes.
 
-Today: 107 stable, 57 provisional, 19 experimental, of 183.
+Today: 107 stable, 57 provisional, 20 experimental, of 184.
 
 ## Stable
 
@@ -209,6 +209,7 @@ May change or be removed in any release. New surface starts here.
 - `G-TEST-PARAMS` — experimental
 - `L-LIB-SUM` — experimental
 - `T-EFFECT-BUILTIN` — experimental
+- `T-ERR-UNION-OPAQUE` — experimental
 - `T-EXTERN` — experimental
 - `T-EXTERN-VALUE` — experimental
 - `T-PAR-MAP-PURE` — experimental
