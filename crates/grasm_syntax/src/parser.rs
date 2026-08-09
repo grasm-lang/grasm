@@ -497,6 +497,26 @@ impl Parser {
         Ok(params)
     }
 
+    /// One entry in an effect row.
+    ///
+    /// `unsafe` is a keyword, and it is also a capability that belongs in a
+    /// row — `/ {io, unsafe}` is what a function calling C declares. Parsing
+    /// rows as plain paths made that unwritable, so the only way to satisfy
+    /// the checker was to leave the row off and let it be inferred.
+    fn parse_row_entry(&mut self) -> PResult<Path> {
+        if self.at(&TokenKind::KwUnsafe) {
+            let t = self.bump();
+            return Ok(Path {
+                segments: vec![Ident {
+                    name: "unsafe".to_string(),
+                    span: t.span,
+                }],
+                span: t.span,
+            });
+        }
+        self.parse_path()
+    }
+
     /// `-> Ret ! Err / {effects}` — every piece optional.
     #[allow(clippy::type_complexity)]
     fn parse_fn_tail(&mut self) -> PResult<(Option<TypeExpr>, Option<TypeExpr>, Option<Vec<Path>>)> {
@@ -517,7 +537,7 @@ impl Parser {
                 if self.at(&TokenKind::RBrace) {
                     break;
                 }
-                paths.push(self.parse_path()?);
+                paths.push(self.parse_row_entry()?);
                 if !self.eat(&TokenKind::Comma) {
                     break;
                 }
@@ -819,7 +839,7 @@ impl Parser {
                         if self.at(&TokenKind::RBrace) {
                             break;
                         }
-                        effects.push(self.parse_path()?);
+                        effects.push(self.parse_row_entry()?);
                         if !self.eat(&TokenKind::Comma) {
                             break;
                         }

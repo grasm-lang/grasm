@@ -622,6 +622,23 @@ function to a `/ {}` row, to `par_map` past [T-PAR-MAP-PURE], to the
 missing-handler backstop [E-HANDLER-MISSING] says well-typed programs never
 reach, and to a package declaring `capabilities = []`.
 
+**[T-FN-VALUE-ROW]** Naming a function contributes its effect row to the
+function doing the naming, whether or not the call is written there. Holding a
+function is the permission to call it — the rule [T-EXTERN-VALUE] states for a
+C function, and it holds for every function for the same reason.
+
+This is deliberately conservative: storing an effectful function and never
+calling it is refused, and the way out is to declare the row. The alternative
+was worse. A built-in higher-order method's function parameter is
+unconstrained by design, since `xs.map(|x| print(x))` is ordinary code — so a
+*named* effectful function passed to one had no row to check against, and
+`[1, 2].map(shout)` inside a `/ {}` function typechecked and printed. One hop
+further, `let fs = [uses]` and then `fs.map(call)`, went past `par_map`'s own
+purity check as well: the effectful function is never called in the source,
+only mentioned, and something else calls it. That reached through `/ {}`,
+[T-PAR-MAP-PURE], the [E-HANDLER-MISSING] backstop, and a package's
+`capabilities = []` ceiling.
+
 **[T-FN-TYPE-ROW]** A function type carries its effect row explicitly:
 `fn(i64) -> i64 / {io}`. **No row means the empty row**, so `fn(i64) -> i64`
 accepts only functions that perform nothing, and passing one that prints is an
@@ -762,6 +779,13 @@ in the manifest, which every consumer can read, transitively: a library cannot
 quietly contain an `unsafe` block, and a consumer can refuse to depend on one
 that does. `unsafe` is a capability rather than a handleable effect — there is
 no `with unsafe handled_by`, the same as for `io`.
+
+**[T-UNSAFE-UFCS]** The `unsafe` requirement applies to `x.f()` exactly as to
+`f(x)`, because [L-UFCS] makes them the same call. Only the second spelling was
+gated: `n.close()` reached libc with no `unsafe`, no `io` in the row and no
+capability, and a package declaring `capabilities = []` was reported as
+`performs []` while its compiled binary called C. `unsafe` is also writable in
+an effect row — `/ {io, unsafe}` — which it was not, being a keyword.
 
 **[T-EXTERN]** `extern fn name(a: i64) -> f64` declares a C function. It has
 no body: a compiled build resolves the symbol at link time, and `grasm run`
@@ -5978,6 +6002,40 @@ fn main() {
 }
 ```
 
+## `T-FN-VALUE-ROW.gr`
+
+```grasm
+//! tag: T-FN-VALUE-ROW
+//! expect: error
+//! performs effect(s) `io` not in its declared row
+// Naming a function carries its effect row, calling it or not.
+//
+// A built-in higher-order method's function parameter is deliberately
+// unconstrained — `xs.map(|x| print(x))` is ordinary — so a *named* effectful
+// function handed to one had no row to be checked against, and
+// `[1, 2].map(shout)` inside a `/ {}` function typechecked and printed. One
+// hop further, `let fs = [uses]` then `fs.map(call)`, defeated even the
+// hand-written purity check on `par_map`: the effectful function is never
+// called in the source, only mentioned, and something else calls it.
+//
+// The rule is the one already applied to a declared C function — holding one
+// is the permission to call it. It is conservative, and it is what keeps
+// `/ {}`, [T-PAR-MAP-PURE], [E-HANDLER-MISSING] and a package's
+// `capabilities = []` from being one indirection away from meaningless.
+fn shout(n: i64) -> i64 {
+    print("noisy {n}")
+    n
+}
+
+fn quiet() -> [i64] / {} {
+    [1, 2].map(shout)
+}
+
+fn main() {
+    print("{quiet()}")
+}
+```
+
 ## `T-FN-VALUE.gr`
 
 ```grasm
@@ -7004,6 +7062,31 @@ extern fn sqrt(x: f64) -> f64
 
 fn main() {
     print("{sqrt(16.0)}")
+}
+```
+
+## `T-UNSAFE-UFCS.gr`
+
+```grasm
+//! tag: T-UNSAFE-UFCS
+//! expect: error
+//! can only be used inside `unsafe`
+// `x.f()` is the same call as `f(x)`, Tier 3 included.
+//
+// [L-UFCS] says the two spellings are one call, and only one of them was
+// gated. `n.close()` reached libc with no `unsafe`, no `io` in the row, and no
+// capability — a package declaring `capabilities = []` called a C function and
+// `grasm deps` reported `performs []`. The compiled binary really made the
+// call; the interpreter said `no method`, so the two engines disagreed about
+// it as well.
+extern fn labs(n: i64) -> i64
+
+fn quiet(n: i64) -> i64 / {} {
+    n.labs()
+}
+
+fn main() {
+    print("{quiet(0 - 5)}")
 }
 ```
 

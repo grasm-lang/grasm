@@ -1,0 +1,20 @@
+//! tag: T-UNSAFE-UFCS
+//! expect: error
+//! can only be used inside `unsafe`
+// `x.f()` is the same call as `f(x)`, Tier 3 included.
+//
+// [L-UFCS] says the two spellings are one call, and only one of them was
+// gated. `n.close()` reached libc with no `unsafe`, no `io` in the row, and no
+// capability — a package declaring `capabilities = []` called a C function and
+// `grasm deps` reported `performs []`. The compiled binary really made the
+// call; the interpreter said `no method`, so the two engines disagreed about
+// it as well.
+extern fn labs(n: i64) -> i64
+
+fn quiet(n: i64) -> i64 / {} {
+    n.labs()
+}
+
+fn main() {
+    print("{quiet(0 - 5)}")
+}

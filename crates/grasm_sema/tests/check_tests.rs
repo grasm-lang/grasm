@@ -971,10 +971,35 @@ fn a_function_value_that_is_pure_still_works_through_a_binding() {
     check_ok("fn stays_pure(n: i64) -> i64 / {} {\n    let f = |x| x * 2\n    f(n)\n}\n\nfn main() {\n    print(\"{stays_pure(1)}\")\n}\n");
 }
 
+/// Naming an effectful function counts, even without calling it.
+///
+/// This test used to assert the opposite, on the reasoning that mentioning a
+/// function performs nothing and only calling does. That is true of the
+/// mention and false of the program: a cold evaluation turned it into a hole
+/// through every capability guarantee at once.
+///
+/// `[1, 2].map(shout)` was the easy half — a built-in higher-order method's
+/// parameter is deliberately unconstrained, so `map` accepts any row and the
+/// enclosing function's declared `/ {}` had nothing to check against. Hiding
+/// it one hop further, `let fs = [uses]` then `fs.map(call)`, defeated even
+/// `par_map`'s own hand-written purity check: the effectful function is only
+/// ever *mentioned*, and something else calls it.
+///
+/// So the rule is now the one already applied to a declared C function —
+/// holding one is the permission to call it. It is conservative: it rejects
+/// storing an effectful function and never calling it, which this test used to
+/// pin as legitimate. That is a real cost, paid to keep `/ {}`,
+/// [T-PAR-MAP-PURE], [E-HANDLER-MISSING] and `capabilities = []` from being
+/// one indirection away from meaningless. Declaring the row is the way out.
 #[test]
-fn naming_an_effectful_function_without_calling_it_is_not_an_effect() {
-    // Mentioning a function as a value performs nothing. Only calling does.
-    check_ok("fn shout(n: i64) -> i64 {\n    print(\"{n}\")\n    n\n}\n\nfn stays_pure() -> i64 / {} {\n    let fs = [shout]\n    fs.len()\n}\n\nfn main() {\n    print(\"{stays_pure()}\")\n}\n");
+fn naming_an_effectful_function_counts_as_performing_it() {
+    check_err(
+        "fn shout(n: i64) -> i64 {\n    print(\"{n}\")\n    n\n}\n\nfn stays_pure() -> i64 / {} {\n    let fs = [shout]\n    fs.len()\n}\n\nfn main() {\n    print(\"{stays_pure()}\")\n}\n",
+        "io",
+    );
+    // A pure function named as a value is still pure — the row travels, it is
+    // not invented.
+    check_ok("fn dbl(n: i64) -> i64 {\n    n * 2\n}\n\nfn stays_pure() -> i64 / {} {\n    let fs = [dbl]\n    fs.len()\n}\n\nfn main() {\n    print(\"{stays_pure()}\")\n}\n");
 }
 
 /// Passing a captured binding as `inout` is the quiet member of the

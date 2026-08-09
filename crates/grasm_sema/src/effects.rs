@@ -321,7 +321,7 @@ pub fn check_effects_multi(files: &[ModuleView]) -> Vec<Diagnostic> {
             let declared_set: BTreeSet<String> = declared.iter().map(|p| p.dotted()).collect();
             for d in &declared_set {
                 let base = d.split('.').next().unwrap_or(d);
-                if base != IO && base != ASYNC && !ctx.effect_names.contains(base) {
+                if base != IO && base != ASYNC && base != UNSAFE && !ctx.effect_names.contains(base) {
                     diags.push(Diagnostic::error(
                         f.name.span,
                         format!("function `{}` declares unknown effect `{d}`", f.name.name),
@@ -1059,6 +1059,21 @@ fn walk_expr(
                 && !active.iter().any(|a| a == IO)
             {
                 out.insert(IO.to_string());
+            }
+            // A named function mentioned as a *value* carries its own row.
+            //
+            // This is the rule already applied to a declared C function —
+            // holding one is the permission to call it — and it has to hold
+            // for every function, because handing one to something that will
+            // call it is how the effect actually happens. Without it,
+            // `[1, 2].map(shout)` inside a `/ {}` function typechecked and
+            // printed: `map`'s parameter is unconstrained by design, so the
+            // row had nowhere else to come from. That defeated the declared
+            // row, [T-PAR-MAP-PURE] one hop away from `par_map`'s own check,
+            // [E-HANDLER-MISSING]'s "well-typed programs never reach" backstop,
+            // and a package's `capabilities = []` ceiling.
+            if let Some(qual) = ctx.resolve_call(current, &id.name) {
+                contribute(&qual, active, ctx, out);
             }
         }
         Expr::Str(pieces, _) => {

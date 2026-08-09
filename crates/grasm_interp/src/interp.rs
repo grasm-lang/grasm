@@ -1675,6 +1675,17 @@ build links it, `grasm run` can only reach what is already loaded",
         }
         // UFCS: x.f(a) → f(x, a).
         let ufcs_qual = format!("{}::{}", self.current_module, name.name);
+        // Including a declared C function. [L-UFCS] says the two spellings are
+        // the same call, and the compiled backend made it; this engine said
+        // `no method` for a program that ran natively.
+        if let Some(e) = self.externs.get(&ufcs_qual).copied() {
+            let mut vs = Vec::with_capacity(args.len() + 1);
+            vs.push(recv_v);
+            for a in args {
+                vs.push(self.eval_expr(a)?);
+            }
+            return self.call_extern_values(e, vs);
+        }
         if let Some(f) = self.fns.get(&ufcs_qual).copied() {
             let module = self.current_module.clone();
             let mut vs = Vec::with_capacity(args.len() + 1);

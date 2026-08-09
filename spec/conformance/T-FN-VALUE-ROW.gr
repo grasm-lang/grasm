@@ -1,0 +1,29 @@
+//! tag: T-FN-VALUE-ROW
+//! expect: error
+//! performs effect(s) `io` not in its declared row
+// Naming a function carries its effect row, calling it or not.
+//
+// A built-in higher-order method's function parameter is deliberately
+// unconstrained — `xs.map(|x| print(x))` is ordinary — so a *named* effectful
+// function handed to one had no row to be checked against, and
+// `[1, 2].map(shout)` inside a `/ {}` function typechecked and printed. One
+// hop further, `let fs = [uses]` then `fs.map(call)`, defeated even the
+// hand-written purity check on `par_map`: the effectful function is never
+// called in the source, only mentioned, and something else calls it.
+//
+// The rule is the one already applied to a declared C function — holding one
+// is the permission to call it. It is conservative, and it is what keeps
+// `/ {}`, [T-PAR-MAP-PURE], [E-HANDLER-MISSING] and a package's
+// `capabilities = []` from being one indirection away from meaningless.
+fn shout(n: i64) -> i64 {
+    print("noisy {n}")
+    n
+}
+
+fn quiet() -> [i64] / {} {
+    [1, 2].map(shout)
+}
+
+fn main() {
+    print("{quiet()}")
+}

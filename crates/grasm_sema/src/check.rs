@@ -2460,6 +2460,12 @@ that does not change",
         }
         // UFCS: `x.f(a)` → `f(x, a)`.
         if let Some(info) = self.lookup_fn(&name.name) {
+            // Including the Tier 3 gate. [L-UFCS] says the two spellings are
+            // the same call, and only one of them was checked: `n.close()`
+            // reached libc with no `unsafe`, no `io` in the row, and no
+            // capability — through a rule that exists to make exactly that
+            // impossible.
+            self.require_unsafe(&name.name, name.span);
             let mut full_args: Vec<Expr> = Vec::with_capacity(args.len() + 1);
             full_args.push(recv.clone());
             full_args.extend(args.iter().cloned());
