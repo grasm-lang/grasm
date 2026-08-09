@@ -1959,6 +1959,8 @@ build links it, `grasm run` can only reach what is already loaded",
                 }
             }
             (Value::Str(s), "trim") => Value::str(s.trim()),
+            (Value::Str(s), "trim_start") => Value::str(s.trim_start()),
+            (Value::Str(s), "trim_end") => Value::str(s.trim_end()),
             (Value::Str(s), "to_upper") => Value::str(s.to_uppercase()),
             (Value::Str(s), "to_lower") => Value::str(s.to_lowercase()),
             (Value::Str(s), "repeat") => {

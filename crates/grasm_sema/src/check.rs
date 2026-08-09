@@ -2492,7 +2492,7 @@ that does not change",
                     check_arity(self, 0);
                     Type::Bool
                 }
-                "trim" | "to_upper" | "to_lower" => {
+                "trim" | "trim_start" | "trim_end" | "to_upper" | "to_lower" => {
                     check_arity(self, 0);
                     Type::Str
                 }

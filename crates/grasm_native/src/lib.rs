@@ -477,6 +477,8 @@ impl<'m> Codegen<'m> {
             ("grasm_str_split", vec![i64t, i64t], Some(i64t)),
             ("grasm_str_chars", vec![i64t], Some(i64t)),
             ("grasm_str_trim", vec![i64t], Some(i64t)),
+            ("grasm_str_trim_start", vec![i64t], Some(i64t)),
+            ("grasm_str_trim_end", vec![i64t], Some(i64t)),
             ("grasm_str_upper", vec![i64t], Some(i64t)),
             ("grasm_str_lower", vec![i64t], Some(i64t)),
             ("grasm_str_repeat", vec![i64t, i64t], Some(i64t)),
@@ -4479,6 +4481,8 @@ impl FnCx<'_, '_> {
             (VType::Str, "codes") => "grasm_str_codes",
             (VType::Str, "words") => "grasm_str_words",
             (VType::Str, "trim") => "grasm_str_trim",
+            (VType::Str, "trim_start") => "grasm_str_trim_start",
+            (VType::Str, "trim_end") => "grasm_str_trim_end",
             (VType::Str, "to_upper") => "grasm_str_upper",
             (VType::Str, "to_lower") => "grasm_str_lower",
             _ => return Ok(None),
@@ -4580,9 +4584,11 @@ impl FnCx<'_, '_> {
                 self.call_rt("grasm_val_dec", &[fill]);
                 (v, VType::Str)
             }
-            (VType::Str, "trim" | "to_upper" | "to_lower") => {
+            (VType::Str, "trim" | "trim_start" | "trim_end" | "to_upper" | "to_lower") => {
                 let f = match m {
                     "trim" => "grasm_str_trim",
+                    "trim_start" => "grasm_str_trim_start",
+                    "trim_end" => "grasm_str_trim_end",
                     "to_upper" => "grasm_str_upper",
                     _ => "grasm_str_lower",
                 };
@@ -6555,7 +6561,8 @@ impl FnCx<'_, '_> {
                 "is_nan" | "is_finite" => VType::Bool,
                 "is_some" | "is_none" | "is_empty" | "contains" | "starts_with"
                 | "ends_with" | "has" | "delete" | "any" | "all" => VType::Bool,
-                "to_str" | "join" | "trim" | "to_upper" | "to_lower" | "replace"
+                "to_str" | "join" | "trim" | "trim_start" | "trim_end"
+                | "to_upper" | "to_lower" | "replace"
                 | "substr" | "repeat" | "pad_start" | "pad_end" | "to_char"
                 | "to_fixed" => VType::Str,
                 "code_at" | "cmp" => VType::I64,

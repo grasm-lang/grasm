@@ -2027,6 +2027,18 @@ pub unsafe extern "C" fn grasm_str_trim(s: *mut RtVal) -> *mut RtVal {
 
 /// # Safety: live pointer.
 #[no_mangle]
+pub unsafe extern "C" fn grasm_str_trim_start(s: *mut RtVal) -> *mut RtVal {
+    alloc(RtPayload::Str(as_str(s).trim_start().to_string()))
+}
+
+/// # Safety: live pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_trim_end(s: *mut RtVal) -> *mut RtVal {
+    alloc(RtPayload::Str(as_str(s).trim_end().to_string()))
+}
+
+/// # Safety: live pointer.
+#[no_mangle]
 pub unsafe extern "C" fn grasm_str_upper(s: *mut RtVal) -> *mut RtVal {
     alloc(RtPayload::Str(as_str(s).to_uppercase()))
 }

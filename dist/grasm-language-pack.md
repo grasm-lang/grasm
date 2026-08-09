@@ -1211,6 +1211,12 @@ because the two disagree and only one of them stays ordered.
 **[L-LIB-STR]** Lengths and offsets are in **characters, not bytes**
 ([E-STR-CHARS]).
 
+**[L-LIB-TRIM-SIDES]** `trim_start` and `trim_end` remove whitespace from one
+end only; `trim` removes it from both. None of the three takes an argument —
+whitespace is what they trim. The one-sided pair exists because a line's
+leading indentation usually carries meaning and its trailing newline does not,
+and `trim` cannot tell you that.
+
 | method | type | notes |
 |--------|------|-------|
 | `s.len()` | `-> i64` | characters |
@@ -1224,6 +1230,7 @@ because the two disagree and only one of them stays ordered.
 | `s.index_of(t)` | `(str) -> Option[i64]` | `None` when absent |
 | `s.replace(from, to)` | `(str, str) -> str` | |
 | `s.trim()` | `-> str` | |
+| `s.trim_start()`, `s.trim_end()` | `-> str` | one side only ([L-LIB-TRIM-SIDES]) |
 | `s.to_upper()`, `s.to_lower()` | `-> str` | |
 | `s.repeat(n)` | `(i64) -> str` | |
 | `s.pad_start(w, fill)`, `s.pad_end(w, fill)` | `(i64, str) -> str` | fill repeats and is cut to width ([E-PAD-CYCLE]) |
@@ -1299,7 +1306,10 @@ them:
 element, which is where a list of structs gets its order from — `sort` needs
 the *elements* ordered, and a struct is not. The key must be `i64`, `f64` or
 `str`. The sort is stable: elements with equal keys stay in the order they
-were written.
+were written. It sorts **ascending**, always; descending is
+`xs.sort_by(k)` followed by `xs.rev()`. Negating the key works for a number
+and has no counterpart for a `str`, so the reversal is the general answer and
+the one to reach for.
 
 **[L-LIB-PAIRS]** `xs.enumerate()` pairs each element with its index and
 `xs.zip(ys)` pairs the two lists positionally, stopping at the shorter — there
@@ -4583,6 +4593,25 @@ fn main() {
     // A filter that removes everything still has the element type.
     let gone = some.filter(|x| x > 99)
     print("{gone.sum()}")
+}
+```
+
+## `L-LIB-TRIM-SIDES.gr`
+
+```grasm
+//! tag: L-LIB-TRIM-SIDES
+//! expect: output
+//! [  hi] [hi  ] [hi]
+//! [    let x = 1]
+// Trimming one side. `trim` alone loses the distinction, and a line's leading
+// indentation is often exactly what you are trying to keep.
+fn main() {
+    let s = "  hi  "
+    print("[{s.trim_end()}] [{s.trim_start()}] [{s.trim()}]")
+    // The case it exists for: dropping the trailing newline and spaces a file
+    // leaves on a line without flattening the indentation that carries meaning.
+    let line = "    let x = 1   "
+    print("[{line.trim_end()}]")
 }
 ```
 

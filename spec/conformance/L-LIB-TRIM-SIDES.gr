@@ -1,0 +1,14 @@
+//! tag: L-LIB-TRIM-SIDES
+//! expect: output
+//! [  hi] [hi  ] [hi]
+//! [    let x = 1]
+// Trimming one side. `trim` alone loses the distinction, and a line's leading
+// indentation is often exactly what you are trying to keep.
+fn main() {
+    let s = "  hi  "
+    print("[{s.trim_end()}] [{s.trim_start()}] [{s.trim()}]")
+    // The case it exists for: dropping the trailing newline and spaces a file
+    // leaves on a line without flattening the indentation that carries meaning.
+    let line = "    let x = 1   "
+    print("[{line.trim_end()}]")
+}
