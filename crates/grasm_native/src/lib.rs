@@ -5240,6 +5240,16 @@ impl FnCx<'_, '_> {
                 // A field holding a function, called through the field. The
                 // checker accepts it, so this backend has to compile it or
                 // the two disagree about what the language is.
+                //
+                // The receiver was already evaluated above for method
+                // dispatch, and `eval_field` evaluates it again — so the first
+                // one has to be released here. Before this arm existed the
+                // path ended in a compile error, where leaking it cost
+                // nothing; now it runs, and it leaked the receiver on every
+                // call through a field.
+                if rt.boxed() {
+                    self.call_rt("grasm_val_dec", &[rv]);
+                }
                 if let Some((fv, fvt)) = self.eval_field(recv, name, span)? {
                     if let VType::Fn(param_ts, ret_t) = fvt.clone() {
                         // `call_fn_value` reads its callee out of a variable,
@@ -8479,15 +8489,34 @@ which is what a list of nothings was standing in for)",
                             self.call_rt("grasm_val_dec", &[boxed]);
                         }
                         nested => {
-                            // Recursive sub-pattern on the (boxed) field. Held
-                            // as a typed temp var; failure path may leak the
-                            // temp (hardened later).
+                            // Recursive sub-pattern on the (boxed) field, held
+                            // as a typed temp that owns the +1 from
+                            // `grasm_variant_field`.
                             let (fv, fvt) = self.unbox(boxed, ft)?;
                             let fvar = self.new_var(&fvt);
                             self.b.def_var(fvar, fv);
+                            // The temp is released on *both* ways out: on a
+                            // match, because any name the sub-pattern bound
+                            // took its own reference; on a mismatch, because
+                            // the arm is abandoned. Nothing released it
+                            // before, so every nested variant pattern —
+                            // `Wrap(A)`, the shape [T-MATCH-NESTED] is about —
+                            // leaked its payload, once per arm *tried*.
                             let cont = self.b.create_block();
-                            self.lower_pattern_test(nested, fvar, &fvt, cont, next_test)?;
+                            let fail = self.b.create_block();
+                            self.lower_pattern_test(nested, fvar, &fvt, cont, fail)?;
+                            self.goto_block(fail);
+                            if fvt.boxed() {
+                                let t = self.b.use_var(fvar);
+                                self.call_rt("grasm_val_dec", &[t]);
+                            }
+                            self.b.ins().jump(next_test, &[]);
+                            self.filled = true;
                             self.goto_block(cont);
+                            if fvt.boxed() {
+                                let t = self.b.use_var(fvar);
+                                self.call_rt("grasm_val_dec", &[t]);
+                            }
                         }
                     }
                 }
