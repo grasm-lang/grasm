@@ -57,10 +57,11 @@ import  in  inout  let  match  not  or  own  pub  return  test  true
 ref  try  type  unsafe  var  while  with
 ```
 
-**[L-CONTEXTUAL]** `parallel` and `spawn` are *contextual* keywords: they
-introduce a concurrency scope only when a `{` follows. In every other position
-they are ordinary identifiers, so existing code using those names keeps
-compiling.
+**[L-CONTEXTUAL]** `parallel`, `spawn` and `region` are *contextual* keywords:
+they introduce a scope only when a `{` follows. In every other position they
+are ordinary identifiers, so existing code using those names keeps compiling.
+`region` was briefly a reserved word and it broke a program in this repository
+that used it as a field name, which is the compatibility this rule exists for.
 
 ## 4. Literals
 
@@ -258,8 +259,9 @@ Precedence, loosest to tightest:
 expression   = or_expr
 primary      = literal | identifier | list_lit | map_lit | tuple_lit
              | struct_lit | if_expr | match_expr | block | closure
-             | unsafe_expr | ref_expr | "(" expression ")"
+             | unsafe_expr | region_expr | ref_expr | "(" expression ")"
 unsafe_expr  = "unsafe" block
+region_expr  = "region" block
 ref_expr     = "ref" "(" expression ")"
 list_lit     = "[" ( expression ( "," expression )* ","? )? "]"
 map_lit      = "{" ( map_entry ( "," map_entry )* ","? )? "}"
@@ -783,6 +785,25 @@ generation is what distinguishes a live reference from one into the slot's
 previous life. This is the property that makes the tier safe rather than merely
 convenient: a stale read is caught every time, never undefined behaviour, and
 never a silently wrong value.
+
+**[T-REGION]** `region { ... }` is Tier 1: a scope **nothing allocated inside
+may outlive**. Three rules give that. It may not write to a binding declared
+outside it — by assignment or by a mutating method, since `outer.push(x)` is
+how a value would otherwise get out. It may not `return` through the brace. And
+it yields a scalar or nothing, because a scalar is not an allocation.
+
+What it buys today is the guarantee itself: the peak memory of the block is the
+block, and that is checked rather than hoped for. What it does *not* yet buy is
+the bulk deallocation the guarantee exists to make sound — the compiled runtime
+is reference-counted, and freeing a region's allocations in one sweep needs an
+allocator that does not individually free, which is a change to the runtime
+rather than to this rule. The rule comes first because the sweep is only
+correct if the rule holds.
+
+**[T-REGION-ESCAPE]** The escape rule is enforced against *writes*, not only
+against assignment: `outer.push(made_here)` is refused for the same reason
+`outer = made_here` is. A rule about assignment alone would miss the case
+people actually write.
 
 **[T-UNSAFE-FFI]** `unsafe { … }` is Tier 3: the block where the guarantees of
 the safe tiers do not apply. Using a declared C function — calling one *or
@@ -7033,6 +7054,69 @@ fn main() {
     c.hits.push(7)
     c.n += 1
     print("{first} {c.hits} {c.n}")
+}
+```
+
+## `T-REGION-ESCAPE.gr`
+
+```grasm
+//! tag: T-REGION-ESCAPE
+//! expect: error
+//! cannot mutate `out` from inside a region
+// Tier 1 — `region { ... }`. Nothing allocated inside outlives the brace.
+//
+// The rule is what a region *is*, and it is what would make bulk deallocation
+// sound: a scope whose allocations provably have no reader afterwards can be
+// freed in one sweep. Writing to a binding declared outside is how a value
+// would get out — and by a *mutating method*, not only by assignment, which is
+// the case a rule about assignment alone would miss.
+fn main() {
+    var out: [str] = []
+    region {
+        var scratch: [str] = []
+        scratch.push("fine — declared inside")
+        out.push("not fine")
+    }
+    print("{out.len()}")
+}
+```
+
+## `T-REGION.gr`
+
+```grasm
+//! tag: T-REGION
+//! expect: output
+//! 3 0
+//! 9
+// What a region is for: scratch work whose result is a number.
+//
+// Everything the block allocates is provably unreachable after the brace, so
+// its peak memory is the block. A scalar may come out, because a scalar is not
+// an allocation; a list may not.
+fn main() {
+    var kept: [str] = []
+    let words = region {
+        var parts: [str] = []
+        parts.push("alpha")
+        parts.push("beta")
+        parts.push("gamma")
+        parts.len()
+    }
+    print("{words} {kept.len()}")
+    // Regions nest, and a region may be an ordinary statement.
+    var total = 0
+    for i in 0..3 {
+        let n = region {
+            var scratch: [str] = []
+            scratch.push("x{i}")
+            region {
+                let inner = ["a", "b"]
+                inner.len()
+            } + scratch.len()
+        }
+        total = total + n
+    }
+    print("{total}")
 }
 ```
 

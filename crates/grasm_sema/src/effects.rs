@@ -666,7 +666,7 @@ fn collect_calls_expr<'e>(e: &'e Expr, out: &mut Vec<(&'e str, &'e [Expr], Span)
                 None => {}
             }
         }
-        Expr::Block(b) | Expr::Unsafe(b) => collect_calls_block(b, out),
+        Expr::Block(b) | Expr::Unsafe(b) | Expr::Region(b) => collect_calls_block(b, out),
         Expr::Match { scrutinee, arms, .. } => {
             collect_calls_expr(scrutinee, out);
             for a in arms {
@@ -795,7 +795,7 @@ fn collect_par_maps_expr<'e>(e: &'e Expr, out: &mut Vec<(&'e Expr, Span)>) {
             }
         }
         Expr::Closure { body, .. } => collect_par_maps_expr(body, out),
-        Expr::Block(b) | Expr::Unsafe(b) => collect_par_maps_block(b, out),
+        Expr::Block(b) | Expr::Unsafe(b) | Expr::Region(b) => collect_par_maps_block(b, out),
         Expr::If {
             cond,
             then_block,
@@ -1232,6 +1232,9 @@ fn walk_expr(
         // `unsafe` block declares `unsafe` in its manifest or fails to build,
         // which is what makes it visible to — and refusable by — everyone
         // downstream: your JSON parser cannot quietly contain one.
+        // A region performs whatever its body performs; it is a scope, not
+        // a capability.
+        Expr::Region(b) => walk_block(b, current, active, ctx, fnb, out),
         Expr::Unsafe(b) => {
             out.insert(UNSAFE.to_string());
             walk_block(b, current, active, ctx, fnb, out);

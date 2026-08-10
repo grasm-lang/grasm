@@ -1183,7 +1183,7 @@ impl<'a, W: Write> Interp<'a, W> {
                 }
                 Err(Flow::Panic(format!("no match arm matched `{v}`")))
             }
-            Expr::Block(b) | Expr::Unsafe(b) => self.eval_block(b),
+            Expr::Block(b) | Expr::Unsafe(b) | Expr::Region(b) => self.eval_block(b),
             Expr::Try { expr, .. } => {
                 let v = self.eval_expr(expr)?;
                 match v {
@@ -1202,7 +1202,7 @@ impl<'a, W: Write> Interp<'a, W> {
                     }
                 }
                 let cb = match &**body {
-                    Expr::Block(b) | Expr::Unsafe(b) => ClosureBody::Block(b.clone()),
+                    Expr::Block(b) | Expr::Unsafe(b) | Expr::Region(b) => ClosureBody::Block(b.clone()),
                     other => ClosureBody::Expr(other.clone()),
                 };
                 Ok(Value::Closure {

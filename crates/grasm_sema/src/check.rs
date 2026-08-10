@@ -158,6 +158,11 @@ struct Checker {
     fn_rows: HashMap<String, std::collections::BTreeSet<String>>,
     /// How many `unsafe` blocks enclose the expression being checked.
     unsafe_depth: u32,
+    /// How many `region` blocks enclose it.
+    region_depth: u32,
+    /// The scope depth at the start of each open region: a binding below its
+    /// region's floor was declared outside and may not be written to.
+    region_floors: Vec<usize>,
     /// Qualified names of declared C functions, so a use of one can be
     /// required to sit inside `unsafe` (Tier 3).
     extern_names: std::collections::HashSet<String>,
@@ -236,6 +241,8 @@ impl Checker {
             fns: HashMap::new(),
             fn_rows: HashMap::new(),
             unsafe_depth: 0,
+            region_depth: 0,
+            region_floors: Vec::new(),
             extern_names: std::collections::HashSet::new(),
             float_literals: std::collections::HashSet::new(),
             float_sums: std::collections::HashSet::new(),
@@ -1015,6 +1022,17 @@ already reachable from every module — drop the `pub`",
             }
             Stmt::Expr(e) => self.infer_expr(e),
             Stmt::Return(value, span) => {
+                // A `return` through a region's brace carries a value out of a
+                // scope that promises nothing leaves it — and skips the sweep
+                // that would free the region's allocations.
+                if self.region_depth > 0 {
+                    self.error_help(
+                        *span,
+                        "cannot `return` from inside a region".to_string(),
+                        "a region promises that nothing allocated inside outlives the \
+closing brace — yield a number from the region and return that",
+                    );
+                }
                 let ret = self.fn_ret.clone();
                 match value {
                     Some(e) => {
@@ -1353,6 +1371,32 @@ that does not change",
         }
     }
 
+    /// Rejects writing to a binding that was declared outside the region.
+    ///
+    /// This is the escape rule. A region promises that nothing allocated
+    /// inside it is reachable afterwards, and writing into an outer binding —
+    /// by assignment or by a mutating method — is precisely how something
+    /// would get out. `outer.push(made_here)` is the case that a rule about
+    /// assignment alone would miss.
+    fn reject_region_escape(&mut self, id: &Ident, verb: &str) {
+        let Some(&floor) = self.region_floors.last() else {
+            return;
+        };
+        let declared_at = self
+            .scopes
+            .iter()
+            .rposition(|sc| sc.contains_key(&id.name));
+        if declared_at.is_some_and(|d| d < floor) {
+            self.error_help(
+                id.span,
+                format!("cannot {verb} `{}` from inside a region", id.name),
+                "a region promises that nothing allocated inside it outlives the closing \
+brace, and writing to something declared outside is how a value escapes — move the \
+declaration into the region, or compute a number and yield that",
+            );
+        }
+    }
+
     fn lookup(&self, name: &str) -> Option<Binding> {
         for scope in self.scopes.iter().rev() {
             if let Some(b) = scope.get(name) {
@@ -1373,6 +1417,9 @@ that does not change",
         // Requiring `var` for that asked for the wrong thing and, since the
         // write then panicked at run time, its suggested fix turned a compile
         // error into a crash.
+        if let Expr::Ident(id) = root {
+            self.reject_region_escape(id, "assign to");
+        }
         let through_ref = if std::ptr::eq(root, target) {
             false
         } else {
@@ -1644,6 +1691,37 @@ that does not change",
                 self.unsafe_depth += 1;
                 let t = self.check_block(b);
                 self.unsafe_depth -= 1;
+                t
+            }
+            // Tier 1. The rule is what a region *is*: nothing allocated inside
+            // may be reachable after the brace. That is what would make bulk
+            // deallocation sound, and it is a guarantee on its own — the peak
+            // memory of the block is the block.
+            //
+            // Three restrictions give it. No writing to a binding declared
+            // outside (assignment or a mutating method), because that is how a
+            // value gets out. No `return` through the brace. And the region
+            // yields a scalar or nothing, since a scalar is not an allocation.
+            Expr::Region(b) => {
+                self.region_depth += 1;
+                let floor = self.scopes.len();
+                self.region_floors.push(floor);
+                let t = self.check_block(b);
+                self.region_floors.pop();
+                self.region_depth -= 1;
+                let r = self.uni.resolve(&t);
+                if !matches!(
+                    r,
+                    Type::Unit | Type::I64 | Type::F64 | Type::Bool | Type::Var(_) | Type::Error
+                ) {
+                    let shown = self.show(&t);
+                    self.error_help(
+                        b.span,
+                        format!("a region cannot produce a `{shown}`"),
+                        "everything allocated inside a region dies at the closing brace, so \
+only a number or a `bool` can come out — compute what you need and yield that",
+                    );
+                }
                 t
             }
             Expr::Try { expr, span } => self.infer_try(expr, *span),
@@ -3165,6 +3243,7 @@ that does not change",
             matches!(self.uni.resolve(&t), Type::Ref(_))
         };
         if let Expr::Ident(id) = root {
+            self.reject_region_escape(id, "mutate");
             if let Some(b) = self.lookup(&id.name) {
                 if !b.mutable && !through_ref {
                     self.error_help(

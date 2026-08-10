@@ -440,13 +440,20 @@ safe representation, which is the thing Tier 0 cannot express. Tier 3 is in:
 against the package's declared capabilities, so it is visible to and refusable
 by every consumer.
 
-**Tier 1 is not implemented** — `region` does not parse, and allocation
-grouping is whatever the allocator does. It is the one performance tier of the
-four, so nothing above is unsound without it; what is missing is the bulk-free
-arena, not a safety property.
+**Tier 1 is half in.** `region { … }` parses and its rule is enforced: nothing
+allocated inside may outlive the closing brace. It may not write to a binding
+declared outside — by assignment *or* by a mutating method, since
+`outer.push(x)` is how a value would otherwise get out — it may not `return`
+through the brace, and it yields a scalar or nothing. That is a guarantee on
+its own: the peak memory of the block is the block, checked rather than hoped
+for.
 
-What it will take is worth writing down, because the obvious implementation is
-wrong. The compiled runtime is reference-counted: every allocation starts at
+What is not in is the bulk-free arena the rule exists to make sound. The order
+is deliberate — the sweep is only correct if the rule holds — but until the
+allocator changes, a region costs nothing and saves nothing.
+
+What the remaining half will take is worth writing down, because the obvious
+implementation is wrong. The compiled runtime is reference-counted: every allocation starts at
 one and is decremented when the local holding it leaves scope. A region that
 *also* freed what it recorded would double-free, and a region that took its own
 count would add a pair of refcount operations per allocation — more work than
@@ -454,9 +461,7 @@ it saves, which is decoration wearing a performance feature's name.
 
 The real shape is three parts that only work together:
 
-  1. **An escape rule in the checker.** A region may not write to any binding
-     declared outside it, may not `return` through the brace, and yields a
-     scalar or nothing. Then nothing allocated inside can be named afterwards.
+  1. **An escape rule in the checker.** *Done* — see [T-REGION].
   2. **No per-local decrements inside a region**, in the compiled backend.
      This is what removes the work; it is sound only given (1).
   3. **One sweep at the closing brace**, freeing everything allocated during

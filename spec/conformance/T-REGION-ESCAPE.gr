@@ -1,0 +1,19 @@
+//! tag: T-REGION-ESCAPE
+//! expect: error
+//! cannot mutate `out` from inside a region
+// Tier 1 — `region { ... }`. Nothing allocated inside outlives the brace.
+//
+// The rule is what a region *is*, and it is what would make bulk deallocation
+// sound: a scope whose allocations provably have no reader afterwards can be
+// freed in one sweep. Writing to a binding declared outside is how a value
+// would get out — and by a *mutating method*, not only by assignment, which is
+// the case a rule about assignment alone would miss.
+fn main() {
+    var out: [str] = []
+    region {
+        var scratch: [str] = []
+        scratch.push("fine — declared inside")
+        out.push("not fine")
+    }
+    print("{out.len()}")
+}

@@ -440,6 +440,25 @@ previous life. This is the property that makes the tier safe rather than merely
 convenient: a stale read is caught every time, never undefined behaviour, and
 never a silently wrong value.
 
+**[T-REGION]** `region { ... }` is Tier 1: a scope **nothing allocated inside
+may outlive**. Three rules give that. It may not write to a binding declared
+outside it — by assignment or by a mutating method, since `outer.push(x)` is
+how a value would otherwise get out. It may not `return` through the brace. And
+it yields a scalar or nothing, because a scalar is not an allocation.
+
+What it buys today is the guarantee itself: the peak memory of the block is the
+block, and that is checked rather than hoped for. What it does *not* yet buy is
+the bulk deallocation the guarantee exists to make sound — the compiled runtime
+is reference-counted, and freeing a region's allocations in one sweep needs an
+allocator that does not individually free, which is a change to the runtime
+rather than to this rule. The rule comes first because the sweep is only
+correct if the rule holds.
+
+**[T-REGION-ESCAPE]** The escape rule is enforced against *writes*, not only
+against assignment: `outer.push(made_here)` is refused for the same reason
+`outer = made_here` is. A rule about assignment alone would miss the case
+people actually write.
+
 **[T-UNSAFE-FFI]** `unsafe { … }` is Tier 3: the block where the guarantees of
 the safe tiers do not apply. Using a declared C function — calling one *or
 naming one*, which are the same permission — is allowed only inside it.

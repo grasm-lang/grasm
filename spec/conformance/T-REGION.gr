@@ -1,0 +1,34 @@
+//! tag: T-REGION
+//! expect: output
+//! 3 0
+//! 9
+// What a region is for: scratch work whose result is a number.
+//
+// Everything the block allocates is provably unreachable after the brace, so
+// its peak memory is the block. A scalar may come out, because a scalar is not
+// an allocation; a list may not.
+fn main() {
+    var kept: [str] = []
+    let words = region {
+        var parts: [str] = []
+        parts.push("alpha")
+        parts.push("beta")
+        parts.push("gamma")
+        parts.len()
+    }
+    print("{words} {kept.len()}")
+    // Regions nest, and a region may be an ordinary statement.
+    var total = 0
+    for i in 0..3 {
+        let n = region {
+            var scratch: [str] = []
+            scratch.push("x{i}")
+            region {
+                let inner = ["a", "b"]
+                inner.len()
+            } + scratch.len()
+        }
+        total = total + n
+    }
+    print("{total}")
+}

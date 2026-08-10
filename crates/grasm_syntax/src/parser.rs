@@ -1537,6 +1537,15 @@ impl Parser {
                 }
                 Ok(Expr::Str(pieces, start))
             }
+            // `region {` is a *contextual* keyword, like `parallel` and
+            // `spawn` ([L-CONTEXTUAL]). Making it a reserved word broke a
+            // program in this repository that used `region` as a field name,
+            // which is exactly the compatibility the contextual rule exists
+            // for.
+            TokenKind::Ident(n) if n == "region" && self.block_follows() => {
+                self.bump();
+                Ok(Expr::Region(self.parse_block()?))
+            }
             TokenKind::Ident(name) => {
                 self.bump();
                 let ident = Ident {
@@ -1599,6 +1608,7 @@ impl Parser {
                 self.bump();
                 Ok(Expr::Unsafe(self.parse_block()?))
             }
+
             // `ref(v)` — Tier 2. `ref` is a keyword because it is also a type
             // prefix, so it cannot arrive here as an ordinary identifier the
             // way `release` and `alive` do.

@@ -442,6 +442,11 @@ pub enum Expr {
         span: Span,
     },
     Block(Block),
+    /// `region { ... }` — Tier 1. A scope nothing allocated inside may
+    /// outlive, which is what makes bulk deallocation sound: the region may
+    /// not write to anything declared outside it, may not `return` through the
+    /// brace, and yields a scalar or nothing.
+    Region(Block),
     /// `unsafe { ... }` — Tier 3. Everything the safe tiers forbid lives in
     /// here, and a package containing one must declare the `unsafe`
     /// capability, which makes it visible in the manifest and refusable by a
@@ -522,6 +527,7 @@ impl Expr {
             | Expr::Closure { span, .. } => *span,
             Expr::Block(b) => b.span,
             Expr::Unsafe(b) => b.span,
+            Expr::Region(b) => b.span,
         }
     }
 }

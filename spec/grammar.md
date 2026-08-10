@@ -42,10 +42,11 @@ import  in  inout  let  match  not  or  own  pub  return  test  true
 ref  try  type  unsafe  var  while  with
 ```
 
-**[L-CONTEXTUAL]** `parallel` and `spawn` are *contextual* keywords: they
-introduce a concurrency scope only when a `{` follows. In every other position
-they are ordinary identifiers, so existing code using those names keeps
-compiling.
+**[L-CONTEXTUAL]** `parallel`, `spawn` and `region` are *contextual* keywords:
+they introduce a scope only when a `{` follows. In every other position they
+are ordinary identifiers, so existing code using those names keeps compiling.
+`region` was briefly a reserved word and it broke a program in this repository
+that used it as a field name, which is the compatibility this rule exists for.
 
 ## 4. Literals
 
@@ -243,8 +244,9 @@ Precedence, loosest to tightest:
 expression   = or_expr
 primary      = literal | identifier | list_lit | map_lit | tuple_lit
              | struct_lit | if_expr | match_expr | block | closure
-             | unsafe_expr | ref_expr | "(" expression ")"
+             | unsafe_expr | region_expr | ref_expr | "(" expression ")"
 unsafe_expr  = "unsafe" block
+region_expr  = "region" block
 ref_expr     = "ref" "(" expression ")"
 list_lit     = "[" ( expression ( "," expression )* ","? )? "]"
 map_lit      = "{" ( map_entry ( "," map_entry )* ","? )? "}"
