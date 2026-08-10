@@ -22,11 +22,18 @@
 # `new_var` — which is not in a scope, so nothing releases it. The variant path
 # binds through the scope and is released with it.
 #
-# The fix is one of "release the temporary" or "bind it into the scope", and
-# which one is right depends on whether the sub-pattern's own binding takes the
-# +1 or aliases it. Getting that backwards is a use-after-free, so it wants
-# tracing rather than a guess — and now there is a check that will confirm it
-# either way.
+# What is left is dominated by `write_place`: descending a multi-segment place
+# (`rows[0].stack.pop()`) reads each intermediate with a +1 and writes a new
+# child back without releasing the old one. The obvious repair — decrement the
+# old child — is *wrong*, and this harness caught it: `grasm_list_set` mutates
+# in place when the container is uniquely owned and returns the same pointer,
+# so the "old" child is often the new one and the decrement frees what was just
+# stored. Three programs turned into SIGSEGV and SIGABRT, difftest reported it,
+# and it was reverted.
+#
+# That is the shape of the remaining work, and the reason it is not being
+# guessed at: a leak is visible here, and a use-after-free is visible in
+# difftest, but only if both are run.
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
@@ -77,7 +84,7 @@ if [ "$leaked" -gt 0 ]; then
     printf '  %s\n' "${LEAKS[@]}"
     echo
     echo "Not yet a gate. 27 programs were leaking the day this check was"
-    echo "written and 17 are now; the compiled backend does not yet free"
+    echo "written and 7 are now; the compiled backend does not yet free"
     echo "everything it allocates, and no other check here can see that,"
     echo "because a leaking program produces exactly the right output. It goes"
     echo "into CI when the count reaches zero — wiring it in before then would"

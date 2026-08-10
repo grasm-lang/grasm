@@ -3601,12 +3601,20 @@ impl FnCx<'_, '_> {
         }
 
         // List iteration: index-based over an owned temp.
+        //
+        // The temp lives in a scope of its own, so every way out of the loop
+        // releases it — including a `return` from the body, which jumps
+        // straight past the loop's own teardown. It used to be a bare
+        // temporary, so returning out of a `for` leaked the list being
+        // iterated, which is the shape any search function has.
+        self.push_scope();
         let (list_v, list_t) = self.eval_expr_val(iter)?;
         let VType::List(elem_t) = list_t.clone() else {
             return nope(iter.span(), "for over non-range, non-list iterables");
         };
         let list_var = self.new_var(&list_t);
         self.b.def_var(list_var, list_v);
+        self.bind(" for", list_var, list_t.clone());
         let ivar = self.new_var(&VType::I64);
         let zero = self.b.ins().iconst(types::I64, 0);
         self.b.def_var(ivar, zero);
@@ -3654,9 +3662,10 @@ impl FnCx<'_, '_> {
         self.b.ins().jump(header, &[]);
         self.filled = true;
         self.goto_block(exit);
-        // Release the list temp.
-        let lv3 = self.b.use_var(list_var);
-        self.call_rt("grasm_val_dec", &[lv3]);
+        // Released by popping the scope it was bound into, so a `return` out
+        // of the body — which calls `emit_scope_decs_all` and never arrives
+        // here — releases it too.
+        self.pop_scope_with_decs();
         Ok(StmtOut::Value(None))
     }
 
