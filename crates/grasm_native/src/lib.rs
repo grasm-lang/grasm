@@ -8637,6 +8637,12 @@ which is what a list of nothings was standing in for)",
                 // component leaked it. A wildcard owns nothing and releases
                 // immediately.
                 let mut chain: Vec<(Variable, VType, &Pattern)> = Vec::new();
+                // Components bound to a name. On the success path the arm's
+                // scope releases them; on the *failure* path that scope is
+                // never entered, so nothing did — every failing arm that binds
+                // a name leaked one reference per boxed component, unbounded
+                // in a loop.
+                let mut bound: Vec<(Variable, VType)> = Vec::new();
                 for (i, (pat_i, t_i)) in items.iter().zip(&elem_ts).enumerate() {
                     let sv = self.b.use_var(svar);
                     let idx = self.b.ins().iconst(types::I64, i as i64);
@@ -8649,6 +8655,7 @@ which is what a list of nothings was standing in for)",
                             let (v, vt) = self.unbox(boxed, t_i)?;
                             let var = self.new_var(&vt);
                             self.b.def_var(var, v);
+                            bound.push((var, vt.clone()));
                             self.bind(&fid.name, var, vt);
                         }
                         Pattern::Wildcard(_) => {
@@ -8689,7 +8696,7 @@ which is what a list of nothings was standing in for)",
                     // why the arms *after* the first two leaked and the first
                     // two did not.
                     self.goto_block(fail);
-                    for (tv, tt) in temps.iter() {
+                    for (tv, tt) in temps.iter().chain(bound.iter()) {
                         if tt.boxed() {
                             let v = self.b.use_var(*tv);
                             self.call_rt("grasm_val_dec", &[v]);

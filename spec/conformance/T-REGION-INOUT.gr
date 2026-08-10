@@ -1,0 +1,22 @@
+//! tag: T-REGION-INOUT
+//! expect: error
+//! cannot pass `inout` `kept` from inside a region
+// The escape rule covers `inout`, because `inout` is a write.
+//
+// The direct spelling `kept.push(made)` was refused and this was not — so the
+// same write, moved one call away, defeated assignment, mutating methods,
+// deep places, `map.set`, writes through a `ref`, and `spawn`. Two independent
+// evaluations found it within an hour of the rule shipping, which is what a
+// rule stated in terms of syntax rather than of effect gets you.
+fn stash(inout sink: [[str]], v: [str]) {
+    sink.push(v)
+}
+
+fn main() {
+    var kept: [[str]] = []
+    region {
+        let made = ["allocated inside"]
+        stash(kept, made)
+    }
+    print("{kept.len()}")
+}

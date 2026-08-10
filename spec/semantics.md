@@ -246,6 +246,13 @@ contains it, rather than landing in the middle of it.
 
 ## 7. Effects
 
+**[E-EFFECT-NO-INOUT]** An effect operation may not take an `inout`
+parameter. A handler is reached through a function value, so the write lands in
+a copy the caller never sees: the handler reports success and the caller reads
+back an unchanged value. It typechecked and every engine agreed on the wrong
+answer, which is the one shape differential testing cannot see. Return the new
+value from the operation instead.
+
 **[E-HANDLER-INNERMOST]** An effect operation dispatches to the innermost
 enclosing handler for that effect.
 

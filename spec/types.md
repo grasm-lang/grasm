@@ -459,6 +459,14 @@ against assignment: `outer.push(made_here)` is refused for the same reason
 `outer = made_here` is. A rule about assignment alone would miss the case
 people actually write.
 
+**[T-REGION-INOUT]** And against writes made *through a call*: passing a
+binding declared outside the region as `inout` is refused, because the callee
+can store into it. `fail` is refused for the same reason `return` is — it
+leaves the region carrying a value, and that value is usually built right
+there. The rule was stated for direct writes first, and two independent
+evaluations found both holes within an hour, which is what a rule expressed in
+terms of syntax rather than of effect gets you.
+
 **[T-UNSAFE-FFI]** `unsafe { … }` is Tier 3: the block where the guarantees of
 the safe tiers do not apply. Using a declared C function — calling one *or
 naming one*, which are the same permission — is allowed only inside it.

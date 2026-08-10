@@ -451,6 +451,27 @@ already reachable from every module — drop the `pub`",
                 let mut ops = Vec::new();
                 let mut handler_fields = Vec::new();
                 for op in &e.ops {
+                    // An effect operation cannot take `inout`. The handler is
+                    // called through a function value, so the write lands in a
+                    // copy the caller never sees — it typechecked, ran, and
+                    // silently discarded the write, with every engine
+                    // agreeing on the wrong answer. Refusing it at the
+                    // declaration is what [T-CONST-PUB] and [T-TYPE-NO-PUB]
+                    // do for the same disease: syntax that parses and does
+                    // nothing is worse than syntax that is rejected.
+                    for prm in &op.params {
+                        if prm.mode == ParamMode::Inout {
+                            self.error_help(
+                                prm.name.span,
+                                format!(
+                                    "effect operation `{}` cannot take an `inout` parameter",
+                                    op.name.name
+                                ),
+                                "a handler runs through a function value, so the write would \
+land in a copy the caller never sees — return the new value from the operation instead",
+                            );
+                        }
+                    }
                     let params: Vec<Type> =
                         op.params.iter().map(|p| self.resolve_type(&p.ty, &[])).collect();
                     let mut ret = op
@@ -2103,6 +2124,19 @@ only a number or a `bool` can come out — compute what you need and yield that"
                         if args.len() != 1 {
                             return self.error(span, "fail takes exactly 1 argument (the error value)");
                         }
+                        // `fail` leaves the region carrying a value, the same
+                        // as `return` — and its payload is usually built right
+                        // there, which is precisely what must not escape.
+                        // `return` was refused and this was not.
+                        if self.region_depth > 0 {
+                            self.error_help(
+                                span,
+                                "cannot `fail` from inside a region".to_string(),
+                                "a region promises that nothing allocated inside outlives the \
+closing brace, and an error value carries one out — yield a number from the region and \
+fail outside it",
+                            );
+                        }
                         let e_ty = self.infer_expr(&args[0]);
                         match self.fn_err.clone() {
                             Some(declared) => {
@@ -2230,6 +2264,12 @@ only a number or a `bool` can come out — compute what you need and yield that"
                     let root = place_root(a);
                     match root {
                         Some(id) => {
+                            // `inout` is a write, so the region rule applies:
+                            // passing an outer binding lets the callee store
+                            // something region-allocated into it, which is the
+                            // direct write one call away. The direct form was
+                            // already refused and this was not.
+                            self.reject_region_escape(id, "pass `inout`");
                             match self.lookup(&id.name) {
                                 Some(b) if !b.mutable => {
                                     self.error_help(

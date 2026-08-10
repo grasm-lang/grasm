@@ -7,7 +7,7 @@ before it is listed as stable.
 `crates/grasm_spec` fails if a clause here is missing, unknown, or listed twice,
 so this file cannot drift away from the specification it describes.
 
-Today: 115 stable, 65 provisional, 20 experimental, of 200.
+Today: 116 stable, 66 provisional, 20 experimental, of 202.
 
 ## Stable
 
@@ -21,6 +21,7 @@ Will not change incompatibly before 2.0.
 - `E-CONST-REF` — stable
 - `E-COW` — stable
 - `E-DIV-ZERO` — stable
+- `E-EFFECT-NO-INOUT` — stable
 - `E-ENTRY` — stable
 - `E-EQ-STRUCTURAL` — stable
 - `E-ERR-PROPAGATE` — stable
@@ -203,6 +204,7 @@ for "no problem found" to mean anything.
 - `T-REF-WRITE` — provisional
 - `T-REGION` — provisional
 - `T-REGION-ESCAPE` — provisional
+- `T-REGION-INOUT` — provisional
 - `T-TYPE-ALIAS` — provisional
 - `T-UNSAFE-FFI` — provisional
 

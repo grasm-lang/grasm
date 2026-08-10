@@ -805,6 +805,14 @@ against assignment: `outer.push(made_here)` is refused for the same reason
 `outer = made_here` is. A rule about assignment alone would miss the case
 people actually write.
 
+**[T-REGION-INOUT]** And against writes made *through a call*: passing a
+binding declared outside the region as `inout` is refused, because the callee
+can store into it. `fail` is refused for the same reason `return` is — it
+leaves the region carrying a value, and that value is usually built right
+there. The rule was stated for direct writes first, and two independent
+evaluations found both holes within an hour, which is what a rule expressed in
+terms of syntax rather than of effect gets you.
+
 **[T-UNSAFE-FFI]** `unsafe { … }` is Tier 3: the block where the guarantees of
 the safe tiers do not apply. Using a declared C function — calling one *or
 naming one*, which are the same permission — is allowed only inside it.
@@ -1151,6 +1159,13 @@ a `print` reached from inside an interpolation completes *before* the line that
 contains it, rather than landing in the middle of it.
 
 ## 7. Effects
+
+**[E-EFFECT-NO-INOUT]** An effect operation may not take an `inout`
+parameter. A handler is reached through a function value, so the write lands in
+a copy the caller never sees: the handler reports success and the caller reads
+back an unchanged value. It typechecked and every engine agreed on the wrong
+answer, which is the one shape differential testing cannot see. Return the new
+value from the operation instead.
 
 **[E-HANDLER-INNERMOST]** An effect operation dispatches to the innermost
 enclosing handler for that effect.
@@ -2565,6 +2580,28 @@ fn main() {
     let a = 1
     let b = 0
     print("{a / b}")
+}
+```
+
+## `E-EFFECT-NO-INOUT.gr`
+
+```grasm
+//! tag: E-EFFECT-NO-INOUT
+//! expect: error
+//! cannot take an `inout` parameter
+// An effect operation cannot take `inout`.
+//
+// A handler runs through a function value, so the write landed in a copy the
+// caller never saw: the handler reported success, the caller read back an
+// empty list, and every engine agreed on the wrong answer — which is the one
+// shape no differential test can catch. It typechecked, so the only way to
+// learn this was to run it and disbelieve the result.
+effect Audit {
+    fn record(inout sink: [str], entry: str)
+}
+
+fn main() {
+    print("unreachable")
 }
 ```
 
@@ -7078,6 +7115,33 @@ fn main() {
         out.push("not fine")
     }
     print("{out.len()}")
+}
+```
+
+## `T-REGION-INOUT.gr`
+
+```grasm
+//! tag: T-REGION-INOUT
+//! expect: error
+//! cannot pass `inout` `kept` from inside a region
+// The escape rule covers `inout`, because `inout` is a write.
+//
+// The direct spelling `kept.push(made)` was refused and this was not — so the
+// same write, moved one call away, defeated assignment, mutating methods,
+// deep places, `map.set`, writes through a `ref`, and `spawn`. Two independent
+// evaluations found it within an hour of the rule shipping, which is what a
+// rule stated in terms of syntax rather than of effect gets you.
+fn stash(inout sink: [[str]], v: [str]) {
+    sink.push(v)
+}
+
+fn main() {
+    var kept: [[str]] = []
+    region {
+        let made = ["allocated inside"]
+        stash(kept, made)
+    }
+    print("{kept.len()}")
 }
 ```
 

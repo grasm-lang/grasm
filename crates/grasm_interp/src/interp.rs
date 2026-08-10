@@ -785,6 +785,46 @@ impl<'a, W: Write> Interp<'a, W> {
                 var, iter, body, ..
             } => {
                 let iterable = self.eval_expr(iter)?;
+                // A range is walked, not built. Collecting it first cost ~40
+                // bytes per *potential* iteration whether or not the loop ran
+                // that far — `for i in 0..200000000 { break }` took 5.8 GB
+                // where the compiled backend took 1.4 MB — and at the top of
+                // `i64` it did not run at all: the allocation overflowed and
+                // the process died with a raw `capacity overflow` from inside
+                // the host language, with no `panic:` line, against
+                // [E-PANIC-EXIT] and [E-LOOP-RANGE-MAX].
+                if let Value::Range(a, b, incl) = iterable {
+                    let mut i = a;
+                    loop {
+                        if incl {
+                            if i > b {
+                                break;
+                            }
+                        } else if i >= b {
+                            break;
+                        }
+                        self.scopes.push(HashMap::new());
+                        self.scopes
+                            .last_mut()
+                            .unwrap()
+                            .insert(var.name.clone(), Value::Int(i));
+                        let r = self.eval_block(body);
+                        self.scopes.pop();
+                        match r {
+                            Ok(_) => {}
+                            Err(Flow::Break) => break,
+                            Err(Flow::Continue) => {}
+                            Err(other) => return Err(other),
+                        }
+                        // The last value of an inclusive range is the end, so
+                        // stepping past it would wrap ([E-LOOP-RANGE-MAX]).
+                        if incl && i == b {
+                            break;
+                        }
+                        i += 1;
+                    }
+                    return Ok(Value::Unit);
+                }
                 let items: Vec<Value> = match iterable {
                     // Built from the two forms directly rather than by
                     // turning `a..=b` into `a..(b + 1)`. That addition wraps
