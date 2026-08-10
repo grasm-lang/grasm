@@ -24,16 +24,26 @@
 #
 # What is left is dominated by `write_place`: descending a multi-segment place
 # (`rows[0].stack.pop()`) reads each intermediate with a +1 and writes a new
-# child back without releasing the old one. The obvious repair — decrement the
-# old child — is *wrong*, and this harness caught it: `grasm_list_set` mutates
-# in place when the container is uniquely owned and returns the same pointer,
-# so the "old" child is often the new one and the decrement frees what was just
-# stored. Three programs turned into SIGSEGV and SIGABRT, difftest reported it,
-# and it was reverted.
+# child back without releasing the old one.
 #
-# That is the shape of the remaining work, and the reason it is not being
-# guessed at: a leak is visible here, and a use-after-free is visible in
-# difftest, but only if both are run.
+# Two repairs have been tried and both were wrong. Decrementing the old child
+# unconditionally crashed three programs: `cow_list` returns the container
+# *itself* when its refcount is one, so the "old" child is frequently the very
+# object just stored. Decrementing only when the pointers differ crashed five:
+# whether the read handed over a reference at all depends on the payload kind,
+# since a scalar list boxes an element on the fly while a boxed list
+# increments an existing one.
+#
+# The conclusion is that this ownership contract is not derivable at the call
+# site. `cow_list` and `cow_map` have ten call sites between them and each
+# mutator decides independently whether it consumes its container, its value,
+# both or neither. Fixing the leak means writing that contract down and making
+# the family obey it — an audit, not a patch — and until then the remaining
+# count stays where it is rather than being traded for a use-after-free.
+#
+# Both attempts were caught by `difftest.sh` on the first run. That is the
+# argument for having both harnesses: a leak is visible here and only here, a
+# use-after-free is visible there and only there.
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
