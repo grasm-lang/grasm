@@ -4108,9 +4108,17 @@ impl FnCx<'_, '_> {
                             let (kt, vt2) = (k_t.clone(), v_t.clone());
                             let want_k: Option<VType> = if **k_t == VType::Any { None } else { Some((**k_t).clone()) };
                             let want_v: Option<VType> = if **v_t == VType::Any { None } else { Some((**v_t).clone()) };
+                            // The key is held while the value is evaluated,
+                            // so a value that diverges — `m.set(k, try f())` —
+                            // releases the key instead of stranding it. That
+                            // is a parser's inner loop: read a key, then fail
+                            // reading its value.
+                            self.push_scope();
                             let (kv, kvt) = self.eval_expr_expecting(&args[0], want_k.as_ref())?;
                             let kb = self.box_value(kv, &kvt);
+                            let kb = self.hold_operand((kb, VType::Any)).0;
                             let (vv, vvt) = self.eval_expr_expecting(&args[1], want_v.as_ref())?;
+                            self.pop_scope_no_decs();
                             let vb = self.box_value(vv, &vvt);
                             let cur = self.b.use_var(var);
                             let np = self.call_rt("grasm_map_set", &[cur, kb, vb]).unwrap();
