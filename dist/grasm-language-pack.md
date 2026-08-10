@@ -1173,6 +1173,18 @@ enclosing handler for that effect.
 **[E-HANDLER-SCOPE]** A handler is installed for the dynamic extent of its
 `with` block, including calls made from inside it.
 
+**[E-HANDLER-OWN-ROW]** A handler's *own* effects are counted where the handler
+is **installed**, not where its operations are called. So a `B` handler whose
+body performs `A` needs `A` handled around the `with B` block, even if every
+call to `B.b()` happens inside an `A` block further in.
+
+This is narrower than the dynamic extent above, and it is a limit of the
+analysis rather than a design choice: effect rows are computed per function
+from the call graph, and which handler is installed at a given moment is a
+property of the run. Stating it is better than leaving a reader to infer the
+dynamic rule and be refused — the message they get names the enclosing
+function, which is the one place the fix does not go.
+
 **[E-HANDLER-MISSING]** A user effect that reaches `main` or a test without a
 handler is rejected *at compile time*, so the runtime's missing-handler panic is
 a defensive backstop that well-typed programs never reach.
@@ -2699,6 +2711,37 @@ fn main() {
     // No `with Cfg handled_by ...` anywhere: the checker rejects this before
     // the program can run, so the runtime panic is unreachable here.
     print("{reader()}")
+}
+```
+
+## `E-HANDLER-OWN-ROW.gr`
+
+```grasm
+//! tag: E-HANDLER-OWN-ROW
+//! expect: output
+//! 42
+// A handler's own effects are handled where the handler is installed.
+//
+// [E-HANDLER-SCOPE] describes a dynamic extent, and this is narrower: the `B`
+// handler's body performs `A`, so `A` must be handled around the `with B`
+// block — not merely around the calls to `B.b()`. Writing it the other way
+// round is refused, and the message names the enclosing function, which is the
+// one place the fix does not go.
+effect A {
+    fn a() -> i64
+}
+
+effect B {
+    fn b() -> i64
+}
+
+fn main() {
+    // `A` outside, `B` inside: the B handler's body may then perform A.
+    with A handled_by AHandler{ a: || 21 } {
+        with B handled_by BHandler{ b: || A.a() * 2 } {
+            print("{B.b()}")
+        }
+    }
 }
 ```
 

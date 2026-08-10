@@ -259,6 +259,18 @@ enclosing handler for that effect.
 **[E-HANDLER-SCOPE]** A handler is installed for the dynamic extent of its
 `with` block, including calls made from inside it.
 
+**[E-HANDLER-OWN-ROW]** A handler's *own* effects are counted where the handler
+is **installed**, not where its operations are called. So a `B` handler whose
+body performs `A` needs `A` handled around the `with B` block, even if every
+call to `B.b()` happens inside an `A` block further in.
+
+This is narrower than the dynamic extent above, and it is a limit of the
+analysis rather than a design choice: effect rows are computed per function
+from the call graph, and which handler is installed at a given moment is a
+property of the run. Stating it is better than leaving a reader to infer the
+dynamic rule and be refused — the message they get names the enclosing
+function, which is the one place the fix does not go.
+
 **[E-HANDLER-MISSING]** A user effect that reaches `main` or a test without a
 handler is rejected *at compile time*, so the runtime's missing-handler panic is
 a defensive backstop that well-typed programs never reach.

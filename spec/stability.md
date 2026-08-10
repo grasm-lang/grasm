@@ -7,7 +7,7 @@ before it is listed as stable.
 `crates/grasm_spec` fails if a clause here is missing, unknown, or listed twice,
 so this file cannot drift away from the specification it describes.
 
-Today: 116 stable, 66 provisional, 20 experimental, of 202.
+Today: 117 stable, 66 provisional, 20 experimental, of 203.
 
 ## Stable
 
@@ -27,6 +27,7 @@ Will not change incompatibly before 2.0.
 - `E-ERR-PROPAGATE` — stable
 - `E-HANDLER-INNERMOST` — stable
 - `E-HANDLER-MISSING` — stable
+- `E-HANDLER-OWN-ROW` — stable
 - `E-HANDLER-SCOPE` — stable
 - `E-IF-VALUE` — stable
 - `E-INDEX-BOUNDS` — stable

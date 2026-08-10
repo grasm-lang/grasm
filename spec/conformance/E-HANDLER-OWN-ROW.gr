@@ -1,0 +1,26 @@
+//! tag: E-HANDLER-OWN-ROW
+//! expect: output
+//! 42
+// A handler's own effects are handled where the handler is installed.
+//
+// [E-HANDLER-SCOPE] describes a dynamic extent, and this is narrower: the `B`
+// handler's body performs `A`, so `A` must be handled around the `with B`
+// block — not merely around the calls to `B.b()`. Writing it the other way
+// round is refused, and the message names the enclosing function, which is the
+// one place the fix does not go.
+effect A {
+    fn a() -> i64
+}
+
+effect B {
+    fn b() -> i64
+}
+
+fn main() {
+    // `A` outside, `B` inside: the B handler's body may then perform A.
+    with A handled_by AHandler{ a: || 21 } {
+        with B handled_by BHandler{ b: || A.a() * 2 } {
+            print("{B.b()}")
+        }
+    }
+}

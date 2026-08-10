@@ -405,7 +405,11 @@ once inside `main`",
                 .join(", ");
             diags.push(
                 Diagnostic::error(main.name.span, format!("`main` has unhandled effect(s) {list}"))
-                    .with_help("wrap the calls in `with <Effect> handled_by <handler> { ... }`"),
+                    .with_help(
+                        "wrap the calls in `with <Effect> handled_by <handler> { ... }` — and \
+if the effect comes from a *handler's own body*, the `with` goes around where that handler \
+is installed, not around the calls to it ([E-HANDLER-OWN-ROW])",
+                    ),
             );
         }
     }
