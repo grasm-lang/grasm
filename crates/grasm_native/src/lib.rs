@@ -3958,15 +3958,24 @@ impl FnCx<'_, '_> {
                 // `xs + []` and `[] + xs` both have somewhere to get one from.
                 // Taking the empty one second cannot be observed: a literal
                 // has no effects, so [E-ORDER-LTR] still holds.
+                // The first operand is held in a scope while the second is
+                // evaluated, so a second operand that diverges — `a + "{try
+                // f()}"` — releases the first instead of stranding it. `try`
+                // unwinds through `emit_scope_decs_all`, which sees scope
+                // bindings and not loose temporaries.
+                self.push_scope();
                 let ((lv, lt), (rv, rt)) = if needs_type_hint(lhs) {
                     let r = self.eval_expr_val(rhs)?;
+                    let r = self.hold_operand(r);
                     let l = self.eval_expr_expecting(lhs, Some(&r.1))?;
                     (l, r)
                 } else {
                     let l = self.eval_expr_val(lhs)?;
+                    let l = self.hold_operand(l);
                     let r = self.eval_expr_expecting(rhs, Some(&l.1))?;
                     (l, r)
                 };
+                self.pop_scope_no_decs();
                 Ok(Some(self.binop_values(*op, lv, lt, rv, rt, *span)?))
             }
             Expr::If {
@@ -4231,9 +4240,16 @@ impl FnCx<'_, '_> {
                         if **k_t == VType::Any { None } else { Some((**k_t).clone()) };
                     let want_v: Option<VType> =
                         if **v_t == VType::Any { None } else { Some((**v_t).clone()) };
+                    // The key is held while the value is evaluated, so a
+                    // value that diverges — `m.set(k, try f())` — releases the
+                    // key instead of stranding it. That is the shape a parser
+                    // has: read a key, then fail reading its value.
+                    self.push_scope();
                     let (kv, kvt) = self.eval_expr_expecting(&args[0], want_k.as_ref())?;
                     let kb = self.box_value(kv, &kvt);
+                    let kb = self.hold_operand((kb, VType::Any)).0;
                     let (vv, vvt) = self.eval_expr_expecting(&args[1], want_v.as_ref())?;
+                    self.pop_scope_no_decs();
                     let vb = self.box_value(vv, &vvt);
                     let cur = self.b.use_var(var);
                     let mapv = self.read_place_boxed(cur, &path, &root_t)?;
@@ -5906,6 +5922,14 @@ impl FnCx<'_, '_> {
         );
         let ptr_ty = self.cg.module.target_config().pointer_type();
         let mut vals = Vec::with_capacity(args.len());
+        // Arguments are evaluated one at a time and their ownership passes to
+        // the callee — but only if the call happens. A later argument that
+        // diverges (`f(key, try boom())`) leaves the earlier ones owned by
+        // nobody: `try` unwinds through `emit_scope_decs_all`, which sees
+        // scope bindings and not loose temporaries. So they are bound into a
+        // scope of their own, and that scope is dropped *without* releasing
+        // them once the call is about to happen.
+        self.push_scope();
         // (arg index, stack slot, variable to refresh) for inout write-back.
         let mut inout_args: Vec<(usize, cranelift_codegen::ir::StackSlot, Variable, VType)> =
             Vec::new();
@@ -5935,9 +5959,19 @@ impl FnCx<'_, '_> {
             if *want == VType::F64 && vt == VType::I64 {
                 v = self.b.ins().fcvt_from_sint(types::F64, v);
             }
-            // Boxed args transfer ownership to the callee (it decs at exit).
+            // Boxed args transfer ownership to the callee (it decs at exit),
+            // but are held in scope until then so a diverging later argument
+            // releases them.
+            if vt.boxed() {
+                let hold = self.new_var(&vt);
+                self.b.def_var(hold, v);
+                self.bind(&format!(" arg{i}"), hold, vt.clone());
+                v = self.b.use_var(hold);
+            }
             vals.push(v);
         }
+        // The call is happening: ownership passes, so no release here.
+        self.pop_scope_no_decs();
         let fref = self.cg.module.declare_func_in_func(fid, self.b.func);
         let inst = self.b.ins().call(fref, &vals);
         let results: Vec<Value> = self.b.inst_results(inst).to_vec();
@@ -5950,6 +5984,25 @@ impl FnCx<'_, '_> {
         } else {
             Ok(Some((results[0], ret)))
         }
+    }
+
+    /// Binds a boxed operand into the current scope so an unwind releases it.
+    ///
+    /// Operands and arguments are evaluated one at a time and their ownership
+    /// passes onward only when the operation actually happens. A later operand
+    /// that diverges leaves the earlier ones owned by nobody, and `try`
+    /// unwinds through `emit_scope_decs_all`, which sees scope bindings rather
+    /// than loose temporaries. The caller pops the scope *without* releasing
+    /// once the operation is committed.
+    fn hold_operand(&mut self, (v, t): (Value, VType)) -> (Value, VType) {
+        if !t.boxed() {
+            return (v, t);
+        }
+        let hold = self.new_var(&t);
+        self.b.def_var(hold, v);
+        let name = format!(" hold{}", self.vars.last().map(|s| s.len()).unwrap_or(0));
+        self.bind(&name, hold, t.clone());
+        (self.b.use_var(hold), t)
     }
 
     fn assert_true(&mut self, c: Value) {
