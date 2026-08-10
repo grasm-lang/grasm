@@ -5246,7 +5246,13 @@ impl FnCx<'_, '_> {
                         // so the field's value gets one.
                         let var = self.new_var(&fvt);
                         self.b.def_var(var, fv);
-                        return self.call_fn_value(var, &param_ts, &ret_t, args, span);
+                        let out = self.call_fn_value(var, &param_ts, &ret_t, args, span)?;
+                        // `eval_field` handed over an owned reference; the
+                        // call borrowed it. Without this every call through a
+                        // field leaked the function value and its environment.
+                        let f2 = self.b.use_var(var);
+                        self.call_rt("grasm_val_dec", &[f2]);
+                        return Ok(out);
                     }
                 }
                 return nope(span, format!("the method `{}`", name.name));
@@ -8005,6 +8011,11 @@ closure explicit parameter types, or make it a top-level `fn`)",
 
         self.goto_block(hit);
         if is_find {
+            // The result started as a freshly allocated `None`. Overwriting it
+            // without releasing it leaked that allocation on every `find` that
+            // actually found something — which is most of them.
+            let prev = self.b.use_var(out_var);
+            self.call_rt("grasm_val_dec", &[prev]);
             let e2 = self.b.use_var(evar);
             if evt.boxed() {
                 self.call_rt("grasm_val_inc", &[e2]);

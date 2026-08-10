@@ -76,12 +76,12 @@ if [ "$leaked" -gt 0 ]; then
     echo "LEAKS:"
     printf '  %s\n' "${LEAKS[@]}"
     echo
-    echo "This is not yet a gate. 25 of these were leaking the day the check"
-    echo "was written — the compiled backend does not free everything it"
-    echo "allocates, and no other check here could see that, because a leaking"
-    echo "program produces exactly the right output. Fixing them is the work;"
-    echo "wiring this into CI before they are fixed would only make the gate"
-    echo "red and teach everyone to skip it."
+    echo "Not yet a gate. 27 programs were leaking the day this check was"
+    echo "written and 17 are now; the compiled backend does not yet free"
+    echo "everything it allocates, and no other check here can see that,"
+    echo "because a leaking program produces exactly the right output. It goes"
+    echo "into CI when the count reaches zero — wiring it in before then would"
+    echo "make the gate red on arrival and teach everyone to skip it."
     exit 1
 fi
 exit 0

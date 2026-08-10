@@ -494,6 +494,22 @@ pub extern "C" fn grasm_check_leaks() {
     if std::env::var_os("GRASM_LEAK_CHECK").is_none() {
         return;
     }
+    // Everything the shared heap still holds is released first. A `ref` the
+    // program never released is held on purpose — the slab is a root, like a
+    // global — so counting it as a leak would report every program using Tier
+    // 2 and drown the real thing. What is measured is what is unreachable and
+    // still not freed.
+    {
+        let taken: Vec<*mut RtVal> = {
+            let mut slab = SLAB.lock().expect("slab");
+            slab.gens.clear();
+            slab.free.clear();
+            slab.slots.drain(..).flatten().collect()
+        };
+        for p in taken {
+            unsafe { dec(p) };
+        }
+    }
     let live = LIVE.with(Cell::get);
     if live == 0 {
         return;
