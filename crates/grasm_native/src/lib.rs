@@ -26,6 +26,16 @@ use grasm_syntax::span::Span;
 /// Marks an `Unsupported` that is really a backend bug, not a gap.
 const INTERNAL: &str = "\u{1}internal\u{1}";
 
+/// Whether `region` frees its allocations in one sweep at the closing brace.
+///
+/// The sweep is only sound if [T-REGION]'s escape rule is airtight, and it is
+/// not yet: a `ref` written through a call, and an effect handler written
+/// outside the block, both carry a value allocated inside past the brace. With
+/// the sweep on, those are use-after-free rather than a wrong answer. The
+/// runtime half is written and tested; this turns it on once the checker
+/// closes the two routes. See MASTERPLAN §8.3.
+const REGION_SWEEP: bool = false;
+
 pub struct Unsupported {
     pub span: Span,
     pub what: String,
@@ -562,6 +572,8 @@ impl<'m> Codegen<'m> {
             ("grasm_set_args", vec![i64t, ptr], None),
             ("grasm_now_millis", vec![], Some(i64t)),
             ("grasm_check_leaks", vec![], None),
+            ("grasm_region_push", vec![], None),
+            ("grasm_region_pop", vec![], None),
             ("grasm_out_ref", vec![i64t], None),
             ("grasm_ref_new", vec![i64t], Some(i64t)),
             ("grasm_ref_get", vec![i64t], Some(i64t)),
@@ -2268,6 +2280,20 @@ fn collect_calls_expr(e: &Expr, bound: &[String], out: &mut HashMap<String, Vec<
 }
 
 /// Every identifier appearing in an expression, in source order.
+/// Whether this closure body can fail, and so cannot run on a parallel worker.
+///
+/// The lifted worker ABI carries one `i64` of result bits and no error
+/// channel, so a `fail` inside it used to leave the error's boxed pointer in
+/// the result slot: `[1, 2, 3].par_map(|x| if x == 2 { fail(e) } else { x })`
+/// built natively printed a raw address as the middle element and exited 0.
+/// The sequential lowering propagates the failure correctly, and `par_map` is
+/// free to run sequentially, so a body like this takes that path.
+fn body_can_fail(e: &Expr) -> bool {
+    let mut names = Vec::new();
+    collect_idents(e, &mut names);
+    names.iter().any(|n| n == "fail")
+}
+
 fn collect_idents(e: &Expr, out: &mut Vec<String>) {
     match e {
         Expr::Ident(id) => out.push(id.name.clone()),
@@ -3985,8 +4011,27 @@ impl FnCx<'_, '_> {
                 ..
             } => self.eval_if(cond, then_block, else_branch.as_deref()),
             Expr::Call { callee, args, span } => self.eval_call(callee, args, *span),
-            Expr::Block(b) | Expr::Unsafe(b) | Expr::Region(b) => {
+            Expr::Block(b) | Expr::Unsafe(b) => {
                 let (last, terminated) = self.eval_block_inner(b)?;
+                if terminated {
+                    Ok(None)
+                } else {
+                    Ok(last)
+                }
+            }
+            // Tier 1. Allocations made inside are arena-owned: no reference
+            // counting while the region is open, and the whole set is freed in
+            // one sweep at the closing brace. Sound because the checker proves
+            // nothing allocated inside is reachable afterwards, and the result
+            // is a scalar, which is not an allocation ([T-REGION]).
+            Expr::Region(b) => {
+                if REGION_SWEEP {
+                    self.call_rt("grasm_region_push", &[]);
+                }
+                let (last, terminated) = self.eval_block_inner(b)?;
+                if REGION_SWEEP {
+                    self.call_rt("grasm_region_pop", &[]);
+                }
                 if terminated {
                     Ok(None)
                 } else {
@@ -7806,7 +7851,7 @@ closure explicit parameter types, or make it a top-level `fn`)",
         let elems_inline = scalar_kind_i64(elem_t).is_some();
         let out_inline = scalar_kind_i64(&out_t).is_some();
         let caps_inline = captures.iter().all(|(_, t)| scalar_kind_i64(t).is_some());
-        if !(elems_inline && out_inline && caps_inline) {
+        if !(elems_inline && out_inline && caps_inline) || body_can_fail(body) {
             // Not parallelizable with this representation; the sequential
             // lowering produces the same list.
             return self.emit_list_transform(list, elem_t, param, body, true);
@@ -7890,7 +7935,7 @@ closure explicit parameter types, or make it a top-level `fn`)",
         let captures = self.closure_captures(std::slice::from_ref(param), body);
         let elems_inline = scalar_kind_i64(elem_t).is_some();
         let caps_inline = captures.iter().all(|(_, t)| scalar_kind_i64(t).is_some());
-        if !(elems_inline && caps_inline) {
+        if !(elems_inline && caps_inline) || body_can_fail(body) {
             return self.emit_list_transform(list, elem_t, param, body, false);
         }
 
@@ -8307,6 +8352,17 @@ which is what a list of nothings was standing in for)",
         let zero = self.b.ins().iconst(types::I64, 0);
         self.b.def_var(ivar, zero);
 
+        // The input and the half-built output are live across the whole loop,
+        // and the body can leave without reaching the exit block — a `fail`
+        // inside the closure returns straight out of the enclosing function.
+        // Binding them into a scope is what releases them on that path;
+        // without it `xs.par_map(|x| if p { fail(e) } else { x })` leaked the
+        // input list and every element pushed before the failure.
+        self.push_scope();
+        let lt = VType::List(Box::new(elem_t.clone()));
+        self.bind(" transform.in", list_var, lt.clone());
+        self.bind(" transform.out", out_var, lt);
+
         let header = self.b.create_block();
         let body_blk = self.b.create_block();
         let step = self.b.create_block();
@@ -8372,6 +8428,10 @@ which is what a list of nothings was standing in for)",
         self.filled = true;
 
         self.goto_block(exit);
+        // Reaching here means the loop finished: the output is the value of
+        // the expression and belongs to whoever asked for it, so it is not
+        // released — only the input is.
+        self.pop_scope_no_decs();
         let lv3 = self.b.use_var(list_var);
         self.call_rt("grasm_val_dec", &[lv3]);
         let out = self.b.use_var(out_var);

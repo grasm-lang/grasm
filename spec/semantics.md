@@ -306,6 +306,15 @@ several cores, and returns the results in **input order**. The result does not
 depend on how many cores ran it — including one — so a `par_map` is
 interchangeable with a `map` in every observable way.
 
+**[E-PAR-FAIL]** A `par_map` or `par_filter` whose closure fails produces the
+failure, exactly as the `map` or `filter` written in its place would. Because
+the result never depends on how many cores ran it, an implementation is free to
+run such a closure sequentially, and the native backend does: its parallel
+workers carry one machine word of result and no error channel, so a `fail`
+inside one used to leave the error's address in the result slot —
+`[1, 2, 3].par_map(|x| if x == 2 { fail(e) } else { x })` printed a raw pointer
+as its middle element and exited 0.
+
 ## 9. Ownership at runtime
 
 **[E-INOUT-FAIL]** A function that fails still returns, so the `inout` writes

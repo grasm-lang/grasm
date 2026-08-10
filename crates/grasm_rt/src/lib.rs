@@ -443,10 +443,21 @@ pub struct RtVal {
 
 fn alloc(payload: RtPayload) -> *mut RtVal {
     LIVE.with(|n| n.set(n.get() + 1));
-    Box::into_raw(Box::new(RtVal {
-        rc: Cell::new(1),
+    // Inside a region the value is arena-owned: no reference counting, and the
+    // whole set is freed at the closing brace ([T-REGION]).
+    let in_region = REGIONS.with(|r| !r.borrow().is_empty());
+    let p = Box::into_raw(Box::new(RtVal {
+        rc: Cell::new(if in_region { ARENA } else { 1 }),
         payload,
-    }))
+    }));
+    if in_region {
+        REGIONS.with(|r| {
+            if let Some(top) = r.borrow_mut().last_mut() {
+                top.push(p);
+            }
+        });
+    }
+    p
 }
 
 thread_local! {
@@ -529,6 +540,77 @@ pub extern "C" fn grasm_check_leaks() {
 /// from ever freeing one.
 const IMMORTAL: i64 = i64::MAX;
 
+/// Refcount marking a value owned by an open `region` ([T-REGION]).
+///
+/// Two things follow from one sentinel. `inc`/`dec` skip it, so a region pays
+/// no reference counting at all — which is the performance the tier exists
+/// for. And it is an O(1) test for "was this allocated in the region", which
+/// the sweep needs to tell its own values from ones it merely points at.
+///
+/// This is sound only because the checker proves nothing allocated inside a
+/// region is reachable afterwards ([T-REGION], [T-REGION-ESCAPE],
+/// [T-REGION-INOUT]): every ARENA value is unreachable at the closing brace by
+/// construction.
+const ARENA: i64 = i64::MAX - 1;
+
+fn is_counted(rc: i64) -> bool {
+    rc != IMMORTAL && rc != ARENA
+}
+
+thread_local! {
+    /// One list of allocations per open region, innermost last.
+    static REGIONS: std::cell::RefCell<Vec<Vec<*mut RtVal>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Opens a region: allocations until the matching pop belong to it.
+#[no_mangle]
+pub extern "C" fn grasm_region_push() {
+    REGIONS.with(|r| r.borrow_mut().push(Vec::new()));
+}
+
+/// Closes a region, freeing everything allocated inside it in one sweep.
+///
+/// Values are released without walking into their children, because every
+/// child allocated inside the region is in this same list and is freed by its
+/// own entry — walking would free it twice. A child allocated *outside* is a
+/// reference the region took, so that one is decremented normally.
+///
+/// # Safety: every pointer in the region's list was allocated by this runtime
+/// and, by [T-REGION], is unreachable from outside.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_region_pop() {
+    let Some(vals) = REGIONS.with(|r| r.borrow_mut().pop()) else {
+        return;
+    };
+    for p in vals {
+        // Release what this value points at that the region does not own.
+        let mut outside: Vec<*mut RtVal> = Vec::new();
+        match &(*p).payload {
+            RtPayload::List(items) | RtPayload::Tuple(items) => {
+                outside.extend(items.iter().copied().filter(|c| (**c).rc.get() != ARENA));
+            }
+            RtPayload::Map(entries) => {
+                outside.extend(entries.values().copied().filter(|c| (**c).rc.get() != ARENA));
+            }
+            RtPayload::Struct { fields, .. } => {
+                outside.extend(
+                    fields.iter().map(|(_, v)| *v).filter(|c| (**c).rc.get() != ARENA),
+                );
+            }
+            RtPayload::Variant { fields, .. } => {
+                outside.extend(fields.iter().copied().filter(|c| (**c).rc.get() != ARENA));
+            }
+            _ => {}
+        }
+        for c in outside {
+            dec(c);
+        }
+        LIVE.with(|n| n.set(n.get() - 1));
+        drop(Box::from_raw(p));
+    }
+}
+
 /// Small integers worth interning. Covers loop counters, indices, flags, and
 /// the small constants that dominate real programs.
 const SMALL_MIN: i64 = -128;
@@ -570,7 +652,7 @@ fn interned_int(n: i64) -> *mut RtVal {
 unsafe fn inc(v: *mut RtVal) {
     if !v.is_null() {
         let rc = &(*v).rc;
-        if rc.get() != IMMORTAL {
+        if is_counted(rc.get()) {
             rc.set(rc.get() + 1);
         }
     }
@@ -592,7 +674,7 @@ unsafe fn dec(v: *mut RtVal) {
     loop {
         if !cur.is_null() {
             let rc = &(*cur).rc;
-            if rc.get() != IMMORTAL {
+            if is_counted(rc.get()) {
                 rc.set(rc.get() - 1);
                 if rc.get() <= 0 {
                     LIVE.with(|n| n.set(n.get() - 1));

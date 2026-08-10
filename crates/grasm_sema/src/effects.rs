@@ -42,6 +42,22 @@ struct Ctx<'a> {
     rows: HashMap<String, BTreeSet<String>>,
     /// module → (alias → target module)
     imports: HashMap<String, HashMap<String, String>>,
+    /// field name → the union of every effect row written on a function-typed
+    /// field of that name, anywhere in the program.
+    ///
+    /// [T-FN-TYPE-ROW-CARRIED] says a function type carries its row wherever
+    /// it goes. Storing one into a field was checked; calling it back *out*
+    /// was not, and inference is syntactic, so it has no type to read the row
+    /// off `b.f(x)`. The declaration is where the row is written, so that is
+    /// where it is harvested. Two structs with a same-named function field
+    /// contribute to each other, which over-approximates — the safe direction,
+    /// since under-approximating is what let a `/ {}` function print.
+    field_rows: HashMap<String, BTreeSet<String>>,
+    /// Every row written on a function type that is *not* a struct field: a
+    /// list element, a map value, a tuple component, a generic argument. There
+    /// is no name to key those on, so calling through an index or any other
+    /// computed callee contributes all of them.
+    elem_rows: BTreeSet<String>,
 }
 
 impl Ctx<'_> {
@@ -113,6 +129,8 @@ pub fn effects_of_program(program: &crate::loader::Program) -> BTreeSet<String> 
         externs: HashSet::new(),
         rows: HashMap::new(),
         imports: HashMap::new(),
+        field_rows: HashMap::new(),
+        elem_rows: BTreeSet::new(),
     };
     for f in &views {
         ctx.imports.insert(f.name.clone(), f.imports.clone());
@@ -130,6 +148,9 @@ pub fn effects_of_program(program: &crate::loader::Program) -> BTreeSet<String> 
                 _ => {}
             }
         }
+    }
+    for f in &views {
+        harvest_module(f.module, &mut ctx.field_rows, &mut ctx.elem_rows);
     }
     ctx.rows = ctx.fns.keys().map(|k| (k.clone(), BTreeSet::new())).collect();
     loop {
@@ -227,6 +248,8 @@ fn build_ctx<'a>(files: &'a [ModuleView<'a>]) -> Ctx<'a> {
         externs: HashSet::new(),
         rows: HashMap::new(),
         imports: HashMap::new(),
+        field_rows: HashMap::new(),
+        elem_rows: BTreeSet::new(),
     };
     for f in files {
         ctx.imports.insert(f.name.clone(), f.imports.clone());
@@ -244,6 +267,9 @@ fn build_ctx<'a>(files: &'a [ModuleView<'a>]) -> Ctx<'a> {
                 _ => {}
             }
         }
+    }
+    for f in files {
+        harvest_module(f.module, &mut ctx.field_rows, &mut ctx.elem_rows);
     }
     ctx.rows = ctx.fns.keys().map(|k| (k.clone(), BTreeSet::new())).collect();
     ctx
@@ -877,6 +903,19 @@ fn fn_sources<'a>(e: &'a Expr, ctx: &Ctx, current: &str, out: &mut Vec<FnSource<
             }
         }
         Expr::Closure { .. } => out.push(FnSource::Closure(e)),
+        // `let g = b.f` — the row travels with the value, so the binding
+        // inherits what the field's type declares ([T-FN-TYPE-ROW-CARRIED]).
+        Expr::Field { name, .. } => {
+            if let Some(row) = ctx.field_rows.get(&name.name) {
+                out.push(FnSource::Declared(row.clone()));
+            }
+        }
+        // `let g = fs[0]` names no field; every nameless row is a candidate.
+        Expr::Index { .. } => {
+            if !ctx.elem_rows.is_empty() {
+                out.push(FnSource::Declared(ctx.elem_rows.clone()));
+            }
+        }
         Expr::List(items, _) | Expr::Tuple(items, _) => {
             for i in items {
                 fn_sources(i, ctx, current, out);
@@ -995,6 +1034,109 @@ fn indirect_row(
                 active.pop();
             }
         }
+    }
+}
+
+/// Records every effect row written on a function type reachable from `t`.
+///
+/// A row on a struct field is keyed by the field's name, because that is what
+/// a call site spells (`b.f(x)`). A row anywhere else has no name to key on
+/// and joins the nameless pool.
+fn harvest_rows(
+    t: &TypeExpr,
+    field: Option<&str>,
+    field_rows: &mut HashMap<String, BTreeSet<String>>,
+    elem_rows: &mut BTreeSet<String>,
+) {
+    match t {
+        TypeExpr::Fn {
+            params,
+            ret,
+            effects,
+            ..
+        } => {
+            let row: BTreeSet<String> =
+                effects.iter().map(|p| p.segments.last().unwrap().name.clone()).collect();
+            if !row.is_empty() {
+                match field {
+                    Some(name) => field_rows.entry(name.to_string()).or_default().extend(row),
+                    None => elem_rows.extend(row),
+                }
+            }
+            for p in params {
+                harvest_rows(p, None, field_rows, elem_rows);
+            }
+            harvest_rows(ret, None, field_rows, elem_rows);
+        }
+        // Inside any other type constructor the function type has lost its
+        // field name, so what it carries joins the nameless pool.
+        TypeExpr::List(inner, _) | TypeExpr::Ref(inner, _) => {
+            harvest_rows(inner, None, field_rows, elem_rows)
+        }
+        TypeExpr::Fallible(a, b, _) => {
+            harvest_rows(a, None, field_rows, elem_rows);
+            harvest_rows(b, None, field_rows, elem_rows);
+        }
+        TypeExpr::Tuple(items, _) | TypeExpr::Union(items, _) => {
+            for i in items {
+                harvest_rows(i, None, field_rows, elem_rows);
+            }
+        }
+        TypeExpr::Name { args, .. } => {
+            for a in args {
+                harvest_rows(a, None, field_rows, elem_rows);
+            }
+        }
+    }
+}
+
+/// Harvests the rows every function type in one module declares.
+fn harvest_module(
+    m: &grasm_syntax::ast::Module,
+    field_rows: &mut HashMap<String, BTreeSet<String>>,
+    elem_rows: &mut BTreeSet<String>,
+) {
+    use grasm_syntax::ast::TypeBody;
+    for d in &m.decls {
+        match d {
+            Decl::Type(td) => match &td.body {
+                TypeBody::Struct(fields) => {
+                    for f in fields {
+                        harvest_rows(&f.ty, Some(&f.name.name), field_rows, elem_rows);
+                    }
+                }
+                TypeBody::Sum(variants) => {
+                    for v in variants {
+                        for f in &v.fields {
+                            harvest_rows(&f.ty, Some(&f.name.name), field_rows, elem_rows);
+                        }
+                    }
+                }
+                TypeBody::Alias(t) => harvest_rows(t, None, field_rows, elem_rows),
+            },
+            Decl::Fn(fd) => {
+                for p in &fd.params {
+                    harvest_rows(&p.ty, None, field_rows, elem_rows);
+                }
+                if let Some(r) = &fd.ret {
+                    harvest_rows(r, None, field_rows, elem_rows);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The row a callee that is not a plain name may carry.
+fn computed_callee_row(callee: &Expr, ctx: &Ctx, out: &mut BTreeSet<String>) {
+    match callee {
+        Expr::Field { name, .. } => {
+            if let Some(row) = ctx.field_rows.get(&name.name) {
+                out.extend(row.iter().cloned());
+            }
+        }
+        // An index names no field, so every nameless row is a candidate.
+        _ => out.extend(ctx.elem_rows.iter().cloned()),
     }
 }
 
@@ -1159,6 +1301,10 @@ fn walk_expr(
                     indirect_row(&id.name, current, active, ctx, fnb, out);
                 }
             } else {
+                // A call through something that is not a name: a struct
+                // field, a list element, a map value. The row is on the type
+                // it was declared with ([T-FN-TYPE-ROW-CARRIED]).
+                computed_callee_row(callee, ctx, out);
                 walk_expr(callee, current, active, ctx, fnb, out);
             }
             for a in args {
@@ -1186,6 +1332,11 @@ fn walk_expr(
             // UFCS / callback-taking builtin: same-module named fn contributes.
             if let Some(qual) = ctx.resolve_call(current, &name.name) {
                 contribute(&qual, active, ctx, out);
+            }
+            // Or a call of a function held in a field of that name
+            // ([T-FIELD-CALL]): `b.f(x)` where `f: fn(i64) -> i64 / {io}`.
+            if let Some(row) = ctx.field_rows.get(&name.name) {
+                out.extend(row.iter().cloned());
             }
             for a in args {
                 walk_expr(a, current, active, ctx, fnb, out);

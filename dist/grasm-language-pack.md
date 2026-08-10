@@ -1232,6 +1232,15 @@ several cores, and returns the results in **input order**. The result does not
 depend on how many cores ran it — including one — so a `par_map` is
 interchangeable with a `map` in every observable way.
 
+**[E-PAR-FAIL]** A `par_map` or `par_filter` whose closure fails produces the
+failure, exactly as the `map` or `filter` written in its place would. Because
+the result never depends on how many cores ran it, an implementation is free to
+run such a closure sequentially, and the native backend does: its parallel
+workers carry one machine word of result and no error channel, so a `fail`
+inside one used to leave the error's address in the result slot —
+`[1, 2, 3].par_map(|x| if x == 2 { fail(e) } else { x })` printed a raw pointer
+as its middle element and exited 0.
+
 ## 9. Ownership at runtime
 
 **[E-INOUT-FAIL]** A function that fails still returns, so the `inout` writes
@@ -3412,6 +3421,35 @@ fn down(n: i64) -> i64 {
 
 fn main() {
     print("{down(0)}")
+}
+```
+
+## `E-PAR-FAIL.gr`
+
+```grasm
+//! tag: E-PAR-FAIL
+//! expect: output
+//! []
+//! []
+//! [1, 3]
+// A failure inside a parallel closure is the whole call's failure — not a
+// value in the result. The native backend runs such a closure sequentially,
+// because its workers have nowhere to put an error.
+type E = { m: str }
+
+fn doubled(xs: [i64]) -> [i64] ! E {
+    xs.par_map(|x| if x == 2 { fail(E{ m: "two" }) } else { x })
+}
+
+fn kept(xs: [i64]) -> [i64] ! E {
+    xs.par_filter(|x| if x == 2 { fail(E{ m: "two" }) } else { true })
+}
+
+fn main() {
+    print("{doubled([1, 2, 3]) ?? []}")
+    print("{kept([1, 2, 3]) ?? []}")
+    // Without a failing element the parallel path runs as usual.
+    print("{kept([1, 3]) ?? []}")
 }
 ```
 
