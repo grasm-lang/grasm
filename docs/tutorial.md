@@ -639,6 +639,8 @@ runs only under `grasm run`:
 | returning a closure | `fn mk(n: i64) -> fn(i64) -> i64 { \|x\| x + n }` — a top-level `fn` works |
 | a handler that is a loop variable or a list element | `for h in hs { with Src handled_by h { … } }` — a `let`-bound handler compiles |
 | writing *through* a `ref` | `r.field = v`, `r.items.push(x)` — reading through one compiles |
+| a handler operation that is a named `fn` | `SrcHandler{ get: named }` — write the closure inline |
+| `==` on two bare `ref`s | `a == b` — comparing structs or lists *containing* refs compiles |
 
 Each of these is a defect being worked off, not a design boundary. The list is
 checked against the implementation rather than remembered: if one of them

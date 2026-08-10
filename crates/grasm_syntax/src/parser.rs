@@ -148,6 +148,23 @@ struct Parser {
     depth: u32,
 }
 
+/// What to write instead, for an operator this language does not have.
+///
+/// [L-MAXMUNCH] lists them precisely because they are what someone arriving
+/// from another language types first.
+fn spelled_differently(t: &TokenKind) -> Option<&'static str> {
+    Some(match t {
+        TokenKind::ColonColon => "paths use `.`, as in `utils.helper`",
+        TokenKind::FatArrow => "match arms use `->`, not `=>`",
+        TokenKind::At => "there is no `@`; bind a name with `let`",
+        TokenKind::Question | TokenKind::QuestionDot => {
+            "an `Option` is opened with `??` or `match`, and a fallible value with `try`"
+        }
+        TokenKind::Bang => "negation is `not`, as in `not done`",
+        _ => return None,
+    })
+}
+
 impl Parser {
     fn new(toks: Vec<Token>) -> Self {
         Parser {
@@ -266,7 +283,15 @@ impl Parser {
 
     fn error_here(&mut self, msg: impl Into<String>) {
         let span = self.cur_span();
-        self.diags.push(Diagnostic::error(span, msg));
+        let mut d = Diagnostic::error(span, msg);
+        // The operators [L-MAXMUNCH] says this language deliberately does not
+        // have are the ones a newcomer types by reflex. Naming the token was
+        // already done; saying what to reach for instead is the part that
+        // helps, and only `=>` had it.
+        if let Some(h) = spelled_differently(self.cur()) {
+            d = d.with_help(h);
+        }
+        self.diags.push(d);
     }
 
     /// Panic-mode recovery: skip to the next statement boundary.

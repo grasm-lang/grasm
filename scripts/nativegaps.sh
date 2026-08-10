@@ -182,6 +182,39 @@ fn main() {
     print("{r.v}")
 }'
 
+expect_refused "a handler op that is a named fn" 'effect Src {
+    fn get() -> str
+}
+
+fn named() -> str {
+    "x"
+}
+
+fn main() {
+    with Src handled_by SrcHandler{ get: named } {
+        print("{Src.get()}")
+    }
+}'
+
+expect_refused "== on two bare refs" 'type N = { v: i64 }
+
+fn main() {
+    let a = ref(N{ v: 1 })
+    let b = ref(N{ v: 1 })
+    print("{a == b}")
+}'
+
+# The neighbouring shape that must keep compiling, so the row above stays as
+# narrow as it claims: a struct *containing* a ref compares fine.
+expect_compiled "== on a struct containing a ref" 'type N = { v: i64 }
+type E = { to: ref N, w: i64 }
+
+fn main() {
+    let r = ref(N{ v: 1 })
+    let a = E{ to: r, w: 1 }
+    print("{a == a}")
+}'
+
 expect_compiled "an inout argument that is a plain variable" 'fn push_one(inout xs: [i64]) {
     xs.push(1)
 }
