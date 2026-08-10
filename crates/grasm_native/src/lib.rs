@@ -1881,7 +1881,13 @@ struct FnCx<'a, 'm> {
     b: FunctionBuilder<'a>,
     vars: Vec<HashMap<String, (Variable, VType)>>,
     var_count: usize,
-    loops: Vec<(Block, Block)>,
+    /// `(continue target, break target, scope depth at loop entry)`.
+    ///
+    /// The depth is what lets `break` and `continue` release the locals the
+    /// loop body declared. Without it they jumped straight out and the body's
+    /// scope decs — emitted only on the fall-through path — never ran, so
+    /// every `break` past a boxed local leaked it.
+    loops: Vec<(Block, Block, usize)>,
     ret: VType,
     /// (caller pointer, local var, type) for `inout` params — stored back
     /// through the pointer before every return.
@@ -2745,6 +2751,27 @@ impl FnCx<'_, '_> {
         }
     }
 
+    /// Releases boxed locals in every scope deeper than `depth`.
+    ///
+    /// What `break` and `continue` need: they leave the loop body without
+    /// running its fall-through scope decs, so anything it declared has to be
+    /// released here. The scopes are not popped — the code after this is
+    /// unreachable, and the enclosing lowering still owns the bookkeeping.
+    fn emit_decs_above(&mut self, depth: usize) {
+        let live: Vec<(Variable, VType)> = self
+            .vars
+            .iter()
+            .skip(depth)
+            .flat_map(|sc| sc.values().cloned())
+            .collect();
+        for (var, vt) in live {
+            if vt.boxed() {
+                let v = self.b.use_var(var);
+                self.call_rt("grasm_val_dec", &[v]);
+            }
+        }
+    }
+
     /// Before a `return`: release every boxed local in every scope.
     fn emit_scope_decs_all(&mut self) {
         self.emit_inout_writeback();
@@ -3356,17 +3383,19 @@ impl FnCx<'_, '_> {
                 Ok(StmtOut::Terminated)
             }
             Stmt::Break(span) => {
-                let Some(&(_, break_blk)) = self.loops.last() else {
+                let Some(&(_, break_blk, depth)) = self.loops.last() else {
                     return nope(*span, "break outside loop");
                 };
+                self.emit_decs_above(depth);
                 self.b.ins().jump(break_blk, &[]);
                 self.filled = true;
                 Ok(StmtOut::Terminated)
             }
             Stmt::Continue(span) => {
-                let Some(&(cont_blk, _)) = self.loops.last() else {
+                let Some(&(cont_blk, _, depth)) = self.loops.last() else {
                     return nope(*span, "continue outside loop");
                 };
+                self.emit_decs_above(depth);
                 self.b.ins().jump(cont_blk, &[]);
                 self.filled = true;
                 Ok(StmtOut::Terminated)
@@ -3391,7 +3420,7 @@ impl FnCx<'_, '_> {
                 self.b.ins().brif(c, body_blk, &[], exit, &[]);
                 self.filled = true;
                 self.goto_block(body_blk);
-                self.loops.push((header, exit));
+                self.loops.push((header, exit, self.vars.len()));
                 let inner = self.eval_block_inner(body);
                 self.loops.pop();
                 self.pinned.pop();
@@ -3536,7 +3565,7 @@ impl FnCx<'_, '_> {
             self.goto_block(body_blk);
             self.push_scope();
             self.bind(&loop_var.name, ivar, VType::I64);
-            self.loops.push((step, exit));
+            self.loops.push((step, exit, self.vars.len()));
             let inner = self.eval_block_inner(body);
             self.loops.pop();
             self.pinned.pop();
@@ -3604,7 +3633,7 @@ impl FnCx<'_, '_> {
         self.b.def_var(evar, elem_val);
         self.push_scope();
         self.bind(&loop_var.name, evar, elem_vt.clone());
-        self.loops.push((step, exit));
+        self.loops.push((step, exit, self.vars.len()));
         let (_, mut terminated) = self.eval_block_inner(body)?;
         self.loops.pop();
         terminated |= self.is_filled();
@@ -6904,9 +6933,17 @@ impl FnCx<'_, '_> {
             }
             other => (sv, other),
         };
+        // The scrutinee lives in a scope of its own, so *every* way out of
+        // the match releases it. It used to be released only at the merge
+        // block, which an arm that `return`s never reaches — so a match with
+        // an early return leaked its scrutinee, and that is the shape a
+        // `classify`-style function has.
+        self.push_scope();
         // Hold the scrutinee in a variable for repeated tests.
         let svar = self.new_var(&st);
         self.b.def_var(svar, sv);
+        // Bound under a name no source can write, so scope release covers it.
+        self.bind(" match", svar, st.clone());
 
         let merge = self.b.create_block();
         // Merge param type discovered from the first value-producing arm; we
@@ -7076,11 +7113,10 @@ impl FnCx<'_, '_> {
         }
 
         self.goto_block(merge);
-        // Release the scrutinee.
-        if st.boxed() {
-            let sv2 = self.b.use_var(svar);
-            self.call_rt("grasm_val_dec", &[sv2]);
-        }
+        // Released by popping the scope it was bound into, so a `return` out
+        // of an arm — which calls `emit_scope_decs_all` and never arrives
+        // here — releases it too.
+        self.pop_scope_with_decs();
         if let Some(t) = out_t {
             let out = self.b.block_params(merge)[0];
             let _ = span;
@@ -8461,15 +8497,45 @@ which is what a list of nothings was standing in for)",
                     return Ok(true);
                 }
                 // Bind each element to a temp, then chain the sub-tests.
+                //
+                // `grasm_list_get` hands back a reference the temp now owns.
+                // A `Bind` sub-pattern takes that ownership directly, the way
+                // the variant path above does: routing it through
+                // `lower_pattern_test` instead incremented a *second* time —
+                // that arm assumes a borrowed receiver — and only one
+                // decrement ever ran, so every tuple pattern binding a boxed
+                // component leaked it. A wildcard owns nothing and releases
+                // immediately.
                 let mut chain: Vec<(Variable, VType, &Pattern)> = Vec::new();
                 for (i, (pat_i, t_i)) in items.iter().zip(&elem_ts).enumerate() {
                     let sv = self.b.use_var(svar);
                     let idx = self.b.ins().iconst(types::I64, i as i64);
                     let boxed = self.call_rt("grasm_list_get", &[sv, idx]).unwrap();
-                    let (v, vt) = self.unbox(boxed, t_i)?;
-                    let var = self.new_var(&vt);
-                    self.b.def_var(var, v);
-                    chain.push((var, vt, pat_i));
+                    match pat_i {
+                        Pattern::Bind(fid)
+                            if !matches!(self.cg.variant_index.get(&fid.name), Some((_, 0)))
+                                && fid.name != "None" =>
+                        {
+                            let (v, vt) = self.unbox(boxed, t_i)?;
+                            let var = self.new_var(&vt);
+                            self.b.def_var(var, v);
+                            self.bind(&fid.name, var, vt);
+                        }
+                        Pattern::Wildcard(_) => {
+                            self.call_rt("grasm_val_dec", &[boxed]);
+                        }
+                        _ => {
+                            let (v, vt) = self.unbox(boxed, t_i)?;
+                            let var = self.new_var(&vt);
+                            self.b.def_var(var, v);
+                            chain.push((var, vt, pat_i));
+                        }
+                    }
+                }
+                if chain.is_empty() {
+                    self.b.ins().jump(body_blk, &[]);
+                    self.filled = true;
+                    return Ok(true);
                 }
                 let n = chain.len();
                 for (k, (var, vt, pat_i)) in chain.into_iter().enumerate() {
