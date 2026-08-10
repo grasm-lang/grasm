@@ -1157,6 +1157,13 @@ impl<'m> Codegen<'m> {
             b.ins().call(rep_ref, &[res]);
             b.ins().trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
             b.switch_to_block(ok_blk);
+            // The `Ok(())` a fallible `main` returns is an allocation like any
+            // other, and nothing released it — so every program whose entry
+            // point declares an error type leaked one, forever, in a place no
+            // amount of looking at the *program* would find.
+            let dec_id = self.runtime["grasm_val_dec"];
+            let dec_ref = self.module.declare_func_in_func(dec_id, b.func);
+            b.ins().call(dec_ref, &[res]);
         }
         // Leak check, silent unless `GRASM_LEAK_CHECK` is set. A leak
         // produces exactly the right output, so the differential harness
@@ -8591,16 +8598,45 @@ which is what a list of nothings was standing in for)",
                     self.filled = true;
                     return Ok(true);
                 }
+                // Each chained temp owns the +1 from `grasm_list_get`, and a
+                // sub-pattern that only *tests* — a string, an integer, a
+                // nullary variant — never takes it. So it has to be released
+                // here, on the way out of the test either way: on success
+                // before the body runs, on failure before the next arm is
+                // tried. `match (req.method, head) { ("GET", "users") -> ... }`
+                // leaked both components on every call, which is what a router
+                // does once per request.
                 let n = chain.len();
+                let temps: Vec<(Variable, VType)> =
+                    chain.iter().map(|(v, t, _)| (*v, t.clone())).collect();
                 for (k, (var, vt, pat_i)) in chain.into_iter().enumerate() {
-                    let cont = if k + 1 == n {
-                        body_blk
-                    } else {
-                        self.b.create_block()
-                    };
-                    self.lower_pattern_test(pat_i, var, &vt, cont, next_test)?;
-                    if k + 1 < n {
-                        self.goto_block(cont);
+                    let cont = self.b.create_block();
+                    let fail = self.b.create_block();
+                    self.lower_pattern_test(pat_i, var, &vt, cont, fail)?;
+                    // Failure: release every temp taken so far, then try the
+                    // next arm.
+                    self.goto_block(fail);
+                    for (tv, tt) in temps.iter().take(k + 1) {
+                        if tt.boxed() {
+                            let v = self.b.use_var(*tv);
+                            self.call_rt("grasm_val_dec", &[v]);
+                        }
+                    }
+                    self.b.ins().jump(next_test, &[]);
+                    self.filled = true;
+                    self.goto_block(cont);
+                    if k + 1 == n {
+                        // All components matched: release them and enter the
+                        // body. A `Bind` component never reaches here — those
+                        // are bound directly above and own their reference.
+                        for (tv, tt) in temps.iter() {
+                            if tt.boxed() {
+                                let v = self.b.use_var(*tv);
+                                self.call_rt("grasm_val_dec", &[v]);
+                            }
+                        }
+                        self.b.ins().jump(body_blk, &[]);
+                        self.filled = true;
                     }
                 }
                 Ok(true)
