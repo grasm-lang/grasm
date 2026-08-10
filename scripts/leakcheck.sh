@@ -26,20 +26,36 @@
 # (`rows[0].stack.pop()`) reads each intermediate with a +1 and writes a new
 # child back without releasing the old one.
 #
-# Two repairs have been tried and both were wrong. Decrementing the old child
-# unconditionally crashed three programs: `cow_list` returns the container
-# *itself* when its refcount is one, so the "old" child is frequently the very
-# object just stored. Decrementing only when the pointers differ crashed five:
-# whether the read handed over a reference at all depends on the payload kind,
-# since a scalar list boxes an element on the fly while a boxed list
-# increments an existing one.
+# Three repairs have been tried and each was wrong in a different way.
+#
+#   1. Release the old child unconditionally — three programs crashed.
+#      `cow_list` returns the container *itself* when its refcount is one, so
+#      the "old" child is frequently the very object just stored.
+#   2. Release it only when the pointers differ — five crashed. Whether the
+#      read handed over a reference at all depends on the payload kind: a
+#      scalar list boxes an element on the fly, a boxed list increments an
+#      existing one.
+#   3. Borrow the child instead of owning it, so there is nothing to release —
+#      also wrong, and it is the most instructive of the three. Borrowing
+#      leaves the child's refcount at one, so the sub-write's `cow` mutates in
+#      place and returns the same pointer; the parent's setter then decrements
+#      what it thinks is the old element, which is the object just written.
+#
+# Every one of the three is defensible from the call site and every one is
+# wrong, which is the point: the aliasing is decided inside the mutators.
 #
 # The conclusion is that this ownership contract is not derivable at the call
 # site. `cow_list` and `cow_map` have ten call sites between them and each
 # mutator decides independently whether it consumes its container, its value,
-# both or neither. Fixing the leak means writing that contract down and making
-# the family obey it — an audit, not a patch — and until then the remaining
-# count stays where it is rather than being traded for a use-after-free.
+# both or neither — and the setters unconditionally release the element they
+# overwrite, which is only correct when it is not the element being written.
+#
+# Fixing this means the setters stop releasing an element identical to the one
+# being stored, *and* the descent borrows, *and* the contract is written down
+# so the next reader does not have to rediscover it three times. That is a
+# coordinated change across the runtime's mutator family, not a call-site
+# patch, and until it happens the remaining count stays where it is rather
+# than being traded for a use-after-free.
 #
 # Both attempts were caught by `difftest.sh` on the first run. That is the
 # argument for having both harnesses: a leak is visible here and only here, a
