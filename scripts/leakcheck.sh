@@ -104,17 +104,39 @@ echo "=========================================="
 echo "leak-free: $clean   leaking: $leaked   not compiled: $skipped"
 echo "=========================================="
 
+# Known-leaking programs, as a ratchet. Anything *not* on this list that leaks
+# is a regression and fails; the list only ever shrinks. That is worth having
+# before the count reaches zero, because the value of this check is mostly in
+# catching the next leak rather than in the number itself — every fix so far
+# has touched refcount paths shared by the whole backend.
+KNOWN="examples/jsonlib/app/src/main.gr"
+
+new_leaks=0
+for entry in "${LEAKS[@]:-}"; do
+    [ -z "$entry" ] && continue
+    src="${entry%% —*}"
+    case " $KNOWN " in
+        *" $src "*) ;;
+        *) new_leaks=$((new_leaks + 1)) ;;
+    esac
+done
+
 if [ "$leaked" -gt 0 ]; then
     echo
     echo "LEAKS:"
     printf '  %s\n' "${LEAKS[@]}"
     echo
-    echo "Not yet a gate. 27 programs were leaking the day this check was"
-    echo "written and 7 are now; the compiled backend does not yet free"
-    echo "everything it allocates, and no other check here can see that,"
-    echo "because a leaking program produces exactly the right output. It goes"
-    echo "into CI when the count reaches zero — wiring it in before then would"
-    echo "make the gate red on arrival and teach everyone to skip it."
-    exit 1
+    echo "27 programs were leaking the day this check was written and 1 is"
+    echo "now. No other check here can see a leak, because a leaking program"
+    echo "produces exactly the right output — so this runs as a ratchet: any"
+    echo "program not on the known list is a regression and fails. It becomes"
+    echo "an unconditional gate when the list is empty."
+    if [ "$new_leaks" -gt 0 ]; then
+        echo
+        echo "$new_leaks of these are NOT on the known list — that is a regression."
+        exit 1
+    fi
+    echo
+    echo "All of them are known. No new leak."
 fi
 exit 0
