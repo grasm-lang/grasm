@@ -8629,10 +8629,14 @@ which is what a list of nothings was standing in for)",
                     let cont = self.b.create_block();
                     let fail = self.b.create_block();
                     self.lower_pattern_test(pat_i, var, &vt, cont, fail)?;
-                    // Failure: release every temp taken so far, then try the
-                    // next arm.
+                    // Failure: release *every* temp, not just the ones
+                    // tested so far. All the components are read up front,
+                    // before any of them is tested, so a mismatch at the first
+                    // one still leaves the rest holding a reference — which is
+                    // why the arms *after* the first two leaked and the first
+                    // two did not.
                     self.goto_block(fail);
-                    for (tv, tt) in temps.iter().take(k + 1) {
+                    for (tv, tt) in temps.iter() {
                         if tt.boxed() {
                             let v = self.b.use_var(*tv);
                             self.call_rt("grasm_val_dec", &[v]);
