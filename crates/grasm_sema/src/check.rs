@@ -3250,6 +3250,19 @@ fail outside it",
         let Some(floor) = self.closure_floors.last().copied() else {
             return;
         };
+        // A captured `ref` is exempt, and it is the whole point of Tier 2.
+        // The rule exists because a closure captures *values*, so a write
+        // lands in a copy nobody can see — but a reference copies as a slot
+        // id, so a write through one is visible to everybody holding it.
+        // Refusing it left an effect handler unable to accumulate anything at
+        // all: the obvious `|e| log.push(e)` was rejected, and so was the
+        // reference that answers it, which is what made `inout` on an effect
+        // operation look like the remaining option ([E-EFFECT-NO-INOUT]).
+        if let Some(b) = self.lookup(&id.name) {
+            if matches!(self.uni.resolve(&b.ty), Type::Ref(_)) {
+                return;
+            }
+        }
         let declared_at = self
             .scopes
             .iter()
@@ -3262,7 +3275,9 @@ fail outside it",
                         "cannot {verb} `{}`{tail} inside a closure — it was captured from outside",
                         id.name
                     ),
-                    "a closure captures values, not bindings, so this write would change a copy nobody can see; return the new value instead, or thread the state through an `inout` parameter",
+                    "a closure captures values, not bindings, so this write would change a copy \
+nobody can see — return the new value, thread the state through an `inout` parameter, or hold \
+it behind a `ref`, which copies as a slot rather than as a value and so is shared",
                 );
             }
         }

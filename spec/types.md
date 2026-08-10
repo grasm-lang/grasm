@@ -432,6 +432,18 @@ after both nodes exist, and that write typechecked and then panicked. The
 compiled backend refuses the shape by name for now (§11), so it is one of the
 places the two engines differ in what they accept rather than in what they do.
 
+**[T-REF-CAPTURE]** A captured `ref` may be written through inside a closure.
+[T-CAPTURE-WRITE] refuses writing to a captured binding because a closure
+captures *values*, so the write would land in a copy nobody can see — a
+reference copies as a slot rather than as a value, so a write through one is
+visible to everyone holding it and the reason does not apply.
+
+This is what lets an effect handler accumulate. Without it the obvious spelling
+was refused and so was the reference that answers it, leaving `inout` on an
+effect operation as the apparent last option — which typechecked and silently
+discarded the write ([E-EFFECT-NO-INOUT]). A feature with no working spelling
+sends people somewhere worse.
+
 **[T-REF-STALE]** Reading through a released reference **panics**, always. The
 slot may already hold something else — released slots are reused immediately,
 which is what keeps a long-lived graph from growing without bound — so the

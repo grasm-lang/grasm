@@ -1,0 +1,32 @@
+//! tag: T-REF-CAPTURE
+//! expect: output
+//! [started, finished] 2
+// A captured `ref` may be written through, and that is what lets an effect
+// handler accumulate.
+//
+// [T-CAPTURE-WRITE] refuses a closure that writes to a captured binding,
+// because a closure captures *values* and the write would land in a copy
+// nobody can see. A reference copies as a slot id, not as a value, so a write
+// through one is visible to everyone holding it — the rule does not apply, and
+// applying it anyway left a handler unable to accumulate anything at all. The
+// obvious spelling was refused and so was the reference that answers it, which
+// is what made `inout` on an effect operation look like the only option left
+// ([E-EFFECT-NO-INOUT]) — and that silently discarded the write.
+type Sink = { lines: [str] }
+
+effect Audit {
+    fn record(entry: str)
+}
+
+fn work() / {Audit} {
+    Audit.record("started")
+    Audit.record("finished")
+}
+
+fn main() {
+    let sink = ref(Sink{ lines: [] })
+    with Audit handled_by AuditHandler{ record: |e| sink.lines.push(e) } {
+        work()
+    }
+    print("{sink.lines} {sink.lines.len()}")
+}
