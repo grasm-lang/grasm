@@ -3639,9 +3639,14 @@ impl FnCx<'_, '_> {
         let (elem_val, elem_vt) = self.list_get_elem(lv2, iv2, &elem_t)?;
         let evar = self.new_var(&elem_vt);
         self.b.def_var(evar, elem_val);
+        // The depth is recorded *before* the loop variable's scope, so
+        // `continue` releases it: the element was read with a +1 and the next
+        // iteration binds a fresh one. Recording it after meant
+        // `emit_decs_above` skipped that scope, and every `continue` in a loop
+        // over boxed elements leaked the element it skipped.
+        self.loops.push((step, exit, self.vars.len()));
         self.push_scope();
         self.bind(&loop_var.name, evar, elem_vt.clone());
-        self.loops.push((step, exit, self.vars.len()));
         let (_, mut terminated) = self.eval_block_inner(body)?;
         self.loops.pop();
         terminated |= self.is_filled();
