@@ -7265,7 +7265,14 @@ impl FnCx<'_, '_> {
     ) -> CResult<Value> {
         let mut cur = root;
         let mut cur_t = root_t.clone();
+        // Whether `cur` is a reference this function took. The root is the
+        // caller's — borrowed — and everything after it comes from an
+        // accessor that increments.
+        let mut owned = false;
         for seg in path {
+            let prev = cur;
+            let prev_owned = owned;
+            let prev_t = cur_t.clone();
             match (&cur_t, seg) {
                 (VType::Struct(sname), PlaceSeg::Field(f)) => {
                     let sname = sname.clone();
@@ -7281,6 +7288,15 @@ impl FnCx<'_, '_> {
                     cur_t = et;
                 }
                 _ => return nope(Span::new(0, 1), "this place's shape"),
+            }
+            owned = true;
+            // The intermediate we just walked past is still held by its own
+            // parent, and this function's reference to it is finished with —
+            // only the last one is handed to the caller. Nothing released
+            // them, so every mutating method through a multi-segment place
+            // (`rows[0].stack.sort()`) leaked one per intermediate.
+            if prev_owned && prev_t.boxed() {
+                self.call_rt("grasm_val_dec", &[prev]);
             }
         }
         Ok(cur)
