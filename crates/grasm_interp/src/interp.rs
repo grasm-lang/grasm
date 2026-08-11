@@ -2705,15 +2705,22 @@ build links it, `grasm run` can only reach what is already loaded",
                 let b = self.eval_expr(&args[1])?;
                 match (a, b) {
                     (Value::Int(start), Value::Int(len)) => {
-                        let chars: Vec<char> = s.chars().collect();
-                        let n = chars.len() as i64;
+                        // Through the same character index `code_at` uses, so
+                        // a `substr(i, 1)` scan is linear rather than
+                        // quadratic. Collecting the characters on every call
+                        // cost O(n) whatever the slice.
+                        let n = s.char_len() as i64;
                         let start = start.clamp(0, n) as usize;
                         // Saturating: `substr(2, i64::MAX)` overflowed to a
                         // negative end and panicked inside Rust with a slice
                         // message and a developer's absolute path, where
                         // [L-LIB-STR] says `substr` clamps.
                         let end = (start as i64).saturating_add(len.max(0)).clamp(0, n) as usize;
-                        Value::str(chars[start..end].iter().collect::<String>())
+                        let (a, b) = (
+                            s.byte_at(start).unwrap_or(0),
+                            s.byte_at(end).unwrap_or_else(|| s.as_str().len()),
+                        );
+                        Value::str(s.as_str()[a..b].to_string())
                     }
                     _ => return Err(Flow::Panic("substr takes (start, len) ints".into())),
                 }

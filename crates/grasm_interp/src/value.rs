@@ -185,6 +185,26 @@ impl GStr {
         }
     }
 
+    /// The byte offset of character `i`, in constant time after the first
+    /// call. `None` past the end.
+    ///
+    /// Shared by `code_at` and `substr`: the latter walked from the start on
+    /// every call, so an ordinary `substr(i, 1)` scan was quadratic even
+    /// though the index was already built and sitting next to it.
+    pub fn byte_at(&self, i: usize) -> Option<usize> {
+        if self.is_flat() {
+            return (i <= self.s.len()).then_some(i);
+        }
+        let offs = self
+            .offsets
+            .get_or_init(|| self.s.char_indices().map(|(o, _)| o as u32).collect());
+        match i.cmp(&offs.len()) {
+            std::cmp::Ordering::Less => Some(offs[i] as usize),
+            std::cmp::Ordering::Equal => Some(self.s.len()),
+            std::cmp::Ordering::Greater => None,
+        }
+    }
+
     /// The character at `i`, in constant time after the first call.
     pub fn char_at(&self, i: usize) -> Option<char> {
         if self.is_flat() {

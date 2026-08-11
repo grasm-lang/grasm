@@ -428,6 +428,22 @@ impl RtStr {
         }
     }
 
+    /// The byte offset of character `i`, in constant time after the first
+    /// call. Shared with `substr`, which walked from the start otherwise.
+    pub fn byte_at(&self, i: usize) -> Option<usize> {
+        if self.is_flat() {
+            return (i <= self.s.len()).then_some(i);
+        }
+        let offs = self
+            .offsets
+            .get_or_init(|| self.s.char_indices().map(|(o, _)| o as u32).collect());
+        match i.cmp(&offs.len()) {
+            std::cmp::Ordering::Less => Some(offs[i] as usize),
+            std::cmp::Ordering::Equal => Some(self.s.len()),
+            std::cmp::Ordering::Greater => None,
+        }
+    }
+
     /// The character at `i`, in constant time after the first call.
     pub fn char_at(&self, i: usize) -> Option<char> {
         if self.is_flat() {
@@ -2761,12 +2777,17 @@ pub unsafe extern "C" fn grasm_str_replace(
 /// # Safety: live pointer.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_str_substr(s: *mut RtVal, start: i64, len: i64) -> *mut RtVal {
-    let chars: Vec<char> = as_str(s).chars().collect();
-    let n = chars.len() as i64;
+    let RtPayload::Str(gs) = &(*s).payload else {
+        grasm_panic_msg_str("substr on non-string");
+    };
+    // Through the character index, as `code_at` is.
+    let n = gs.char_len() as i64;
     let start = start.clamp(0, n) as usize;
     // Saturating: see the interpreter — `substr(2, i64::MAX)` overflowed.
     let end = (start as i64).saturating_add(len.max(0)).clamp(0, n) as usize;
-    alloc(RtPayload::Str(RtStr::new(chars[start..end].iter().collect::<String>())))
+    let a = gs.byte_at(start).unwrap_or(0);
+    let b = gs.byte_at(end).unwrap_or(gs.len());
+    alloc(RtPayload::Str(RtStr::new(gs[a..b].to_string())))
 }
 
 /// # Safety: live pointers; returns Option[i64] (char index).
