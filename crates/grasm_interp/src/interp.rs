@@ -298,6 +298,12 @@ enum PathSeg {
     Index(i64),
 }
 
+/// The largest string this implementation will build.
+///
+/// A `repeat` past it is a panic with a sentence, not a Rust allocator
+/// message or `capacity overflow` with a backtrace.
+const MAX_ALLOC: usize = 1 << 33;
+
 impl<'a, W: Write> Interp<'a, W> {
     pub fn new(module: &'a Module, out: &'a mut W) -> Self {
         let mut me = Self::raw_new(out);
@@ -2559,7 +2565,19 @@ build links it, `grasm run` can only reach what is already loaded",
             (Value::Str(s), "repeat") => {
                 let n = self.eval_expr(&args[0])?;
                 match n {
-                    Value::Int(k) if k >= 0 => Value::str(s.repeat(k as usize)),
+                    // A count that cannot fit in memory is a panic with a
+                    // message, not a Rust `capacity overflow` and a
+                    // 19-frame backtrace ([E-PANIC-EXIT]).
+                    Value::Int(k) if k >= 0 => {
+                        match (k as usize).checked_mul(s.len()) {
+                            Some(bytes) if bytes <= MAX_ALLOC => Value::str(s.repeat(k as usize)),
+                            _ => {
+                                return Err(Flow::Panic(format!(
+                                    "repeat would need more memory than a string can hold ({k} copies)"
+                                )))
+                            }
+                        }
+                    }
                     _ => return Err(Flow::Panic("repeat count must be a non-negative int".into())),
                 }
             }
@@ -2576,7 +2594,11 @@ build links it, `grasm run` can only reach what is already loaded",
                         let chars: Vec<char> = s.chars().collect();
                         let n = chars.len() as i64;
                         let start = start.clamp(0, n) as usize;
-                        let end = (start as i64 + len.max(0)).clamp(0, n) as usize;
+                        // Saturating: `substr(2, i64::MAX)` overflowed to a
+                        // negative end and panicked inside Rust with a slice
+                        // message and a developer's absolute path, where
+                        // [L-LIB-STR] says `substr` clamps.
+                        let end = (start as i64).saturating_add(len.max(0)).clamp(0, n) as usize;
                         Value::str(chars[start..end].iter().collect::<String>())
                     }
                     _ => return Err(Flow::Panic("substr takes (start, len) ints".into())),

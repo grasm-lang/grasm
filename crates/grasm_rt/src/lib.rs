@@ -1572,6 +1572,7 @@ pub unsafe extern "C" fn grasm_out_val(v: *mut RtVal) {
 }
 
 unsafe fn display(v: *mut RtVal) -> String {
+    rt_stack_check();
     match &(*v).payload {
         RtPayload::Tuple(items) => {
             let parts: Vec<String> = items.iter().map(|&i| display(i)).collect();
@@ -1891,10 +1892,80 @@ pub unsafe extern "C" fn grasm_report_main_err(v: *mut RtVal) {
 /// # Safety: live pointers.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_val_eq(a: *mut RtVal, b: *mut RtVal) -> i8 {
-    i8::from(val_eq(a, b))
+    // Iterative: the pairs still to compare live on the heap, not on the
+    // stack. Recursing, `l == l` on a 100 000-deep list took SIGSEGV with an
+    // empty stderr while the interpreter answered `true` — a crash where §11
+    // promises no miscompile, and a disagreement between engines. The
+    // interpreter walks deep values happily, so matching it means not being
+    // bounded by the stack at all.
+    let mut work = vec![(a, b)];
+    while let Some((x, y)) = work.pop() {
+        if !val_eq_step(x, y, &mut work) {
+            return 0;
+        }
+    }
+    1
+}
+
+/// One level of structural equality; children are pushed for the caller.
+unsafe fn val_eq_step(a: *mut RtVal, b: *mut RtVal, work: &mut Vec<(*mut RtVal, *mut RtVal)>) -> bool {
+    match (&(*a).payload, &(*b).payload) {
+        (RtPayload::Map(x), RtPayload::Map(y)) => {
+            if x.len() != y.len() {
+                return false;
+            }
+            for (k, &v) in x.iter() {
+                match y.get(k) {
+                    Some(&w) => work.push((v, w)),
+                    None => return false,
+                }
+            }
+            true
+        }
+        (
+            RtPayload::Struct { name: n1, fields: f1 },
+            RtPayload::Struct { name: n2, fields: f2 },
+        ) => {
+            if n1 != n2 || f1.len() != f2.len() {
+                return false;
+            }
+            for ((k1, v1), (k2, v2)) in f1.iter().zip(f2) {
+                if k1 != k2 {
+                    return false;
+                }
+                work.push((*v1, *v2));
+            }
+            true
+        }
+        (
+            RtPayload::Variant { type_name: t1, name: n1, fields: f1 },
+            RtPayload::Variant { type_name: t2, name: n2, fields: f2 },
+        ) => {
+            if t1 != t2 || n1 != n2 || f1.len() != f2.len() {
+                return false;
+            }
+            for (&i, &j) in f1.iter().zip(f2) {
+                work.push((i, j));
+            }
+            true
+        }
+        (RtPayload::List(x), RtPayload::List(y))
+        | (RtPayload::Tuple(x), RtPayload::Tuple(y)) => {
+            if x.len() != y.len() {
+                return false;
+            }
+            for (&i, &j) in x.iter().zip(y) {
+                work.push((i, j));
+            }
+            true
+        }
+        // Everything else has no children to queue.
+        _ => val_eq(a, b),
+    }
 }
 
 unsafe fn val_eq(a: *mut RtVal, b: *mut RtVal) -> bool {
+    rt_stack_check();
     match (&(*a).payload, &(*b).payload) {
         (RtPayload::I64(x), RtPayload::I64(y)) => x == y,
         (RtPayload::F64(x), RtPayload::F64(y)) => x == y,
@@ -2443,6 +2514,31 @@ const STACK_BUDGET: usize = 6 * 1024 * 1024;
 /// for small inputs hid it, so it only appeared past a few hundred elements.
 const WORKER_STACK: usize = 8 * 1024 * 1024;
 
+/// The largest string this implementation will build. See the interpreter.
+const MAX_ALLOC: usize = 1 << 33;
+
+/// The same check, for the runtime's own recursive walks.
+///
+/// `grasm_stack_check` is emitted at the top of every compiled function that
+/// can recurse, which covers what a *program* does. It does not cover what the
+/// runtime does on the program's behalf: comparing or rendering a value walks
+/// it recursively, so `l == l` on a 100 000-deep list took SIGSEGV with an
+/// empty stderr, where the interpreter answered `true`. [E-RECURSION-DEPTH]
+/// promises a panic and exit 101 — "it does not abort, crash, or corrupt the
+/// process" — and §11 promises the compiled backend never miscompiles.
+fn rt_stack_check() {
+    let here = 0u8;
+    let sp = std::ptr::addr_of!(here) as usize;
+    let floor = STACK_FLOOR.with(std::cell::Cell::get);
+    if floor == 0 {
+        STACK_FLOOR.with(|c| c.set(sp.saturating_sub(STACK_BUDGET)));
+        return;
+    }
+    if sp < floor {
+        rt_panic("stack overflow: recursion too deep");
+    }
+}
+
 /// Panics if the stack has run down past this thread's floor.
 ///
 /// Called on entry to every function that can recurse. [E-RECURSION-DEPTH]
@@ -2629,7 +2725,14 @@ pub unsafe extern "C" fn grasm_str_repeat(s: *mut RtVal, n: i64) -> *mut RtVal {
     if n < 0 {
         rt_panic("repeat count must be a non-negative int");
     }
-    alloc(RtPayload::Str(RtStr::new(as_str(s).repeat(n as usize))))
+    let text = as_str(s);
+    match (n as usize).checked_mul(text.len()) {
+        Some(bytes) if bytes <= MAX_ALLOC => {}
+        _ => rt_panic(&format!(
+            "repeat would need more memory than a string can hold ({n} copies)"
+        )),
+    }
+    alloc(RtPayload::Str(RtStr::new(text.repeat(n as usize))))
 }
 
 /// # Safety: live pointers.
@@ -2648,7 +2751,8 @@ pub unsafe extern "C" fn grasm_str_substr(s: *mut RtVal, start: i64, len: i64) -
     let chars: Vec<char> = as_str(s).chars().collect();
     let n = chars.len() as i64;
     let start = start.clamp(0, n) as usize;
-    let end = (start as i64 + len.max(0)).clamp(0, n) as usize;
+    // Saturating: see the interpreter — `substr(2, i64::MAX)` overflowed.
+    let end = (start as i64).saturating_add(len.max(0)).clamp(0, n) as usize;
     alloc(RtPayload::Str(RtStr::new(chars[start..end].iter().collect::<String>())))
 }
 

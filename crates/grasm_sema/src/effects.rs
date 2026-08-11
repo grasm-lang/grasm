@@ -1106,7 +1106,11 @@ fn fn_sources<'a>(e: &'a Expr, ctx: &Ctx, current: &str, out: &mut Vec<FnSource<
         // `let g = b.f` — the row travels with the value, so the binding
         // inherits what the field's type declares ([T-FN-TYPE-ROW-CARRIED]).
         Expr::Field { name, .. } => {
-            if let Some(row) = ctx.field_rows.get(&name.name) {
+            if name.name.parse::<usize>().is_ok() {
+                if !ctx.elem_rows.is_empty() {
+                    out.push(FnSource::Declared(ctx.elem_rows.clone()));
+                }
+            } else if let Some(row) = ctx.field_rows.get(&name.name) {
                 out.push(FnSource::Declared(row.clone()));
             }
         }
@@ -1330,6 +1334,14 @@ fn harvest_module(
 /// The row a callee that is not a plain name may carry.
 fn computed_callee_row(callee: &Expr, ctx: &Ctx, out: &mut BTreeSet<String>) {
     match callee {
+        // A tuple component is spelled with a number, and a tuple member's
+        // row has no field name to be keyed on — it is in the nameless pool
+        // with list elements and map values. Reading it as a *field* name
+        // found nothing, so `p.0(1)` carried no row at all while the struct,
+        // list, map and `let`-bound spellings were all charged.
+        Expr::Field { name, .. } if name.name.parse::<usize>().is_ok() => {
+            out.extend(ctx.elem_rows.iter().cloned())
+        }
         Expr::Field { name, .. } => {
             if let Some(row) = ctx.field_rows.get(&name.name) {
                 out.extend(row.iter().cloned());
@@ -1556,14 +1568,24 @@ fn walk_expr(
             }
             // Or a call of a function held in a field of that name
             // ([T-FIELD-CALL]): `b.f(x)` where `f: fn(i64) -> i64 / {io}`.
-            if let Some(row) = ctx.field_rows.get(&name.name) {
+            if name.name.parse::<usize>().is_ok() {
+                // A tuple component: numbered, so keyed nowhere.
+                out.extend(ctx.elem_rows.iter().cloned());
+            } else if let Some(row) = ctx.field_rows.get(&name.name) {
                 out.extend(row.iter().cloned());
             }
             for a in args {
                 walk_expr(a, current, active, ctx, fnb, out);
             }
         }
-        Expr::Field { recv, .. } => walk_expr(recv, current, active, ctx, fnb, out),
+        // Reading a function out of a field or a tuple component is the same
+        // permission as naming one ([T-FN-VALUE-ROW]) — `xs.map(p.0)` hands
+        // it to something that will call it.
+        Expr::Field { recv, name, .. } => {
+            computed_callee_row(e, ctx, out);
+            let _ = name;
+            walk_expr(recv, current, active, ctx, fnb, out);
+        }
         Expr::Index { recv, index, .. } => {
             walk_expr(recv, current, active, ctx, fnb, out);
             walk_expr(index, current, active, ctx, fnb, out);

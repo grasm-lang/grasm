@@ -1394,6 +1394,9 @@ impl Parser {
     fn parse_pipeline(&mut self) -> PResult<Expr> {
         let mut lhs = self.parse_additive()?;
         while self.at(&TokenKind::PipeGt) {
+            // A pipeline stage deepens the tree exactly as a folded operator
+            // does; 50 000 stages passed the cap without touching it.
+            self.enter_nested()?;
             self.bump();
             self.skip_newlines_if_continuation();
             let rhs = self.parse_additive()?;
@@ -1498,6 +1501,18 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> PResult<Expr> {
+        // A prefix operator deepens the tree and recurses to do it, so it
+        // costs a level like everything else. `not not not …` at 220 000 and
+        // unary `-` at 600 000 aborted the process with a stack overflow and
+        // nothing on stderr — the failure [G-NEST-LIMIT] was written after,
+        // reached through the one operator position it did not count.
+        self.enter_nested()?;
+        let r = self.parse_unary_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn parse_unary_inner(&mut self) -> PResult<Expr> {
         let start = self.cur_span();
         match self.cur() {
             TokenKind::Minus => {

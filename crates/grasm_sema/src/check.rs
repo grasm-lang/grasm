@@ -1154,6 +1154,33 @@ with a fallback to say what should happen instead",
 closing brace — yield a number from the region and return that",
                     );
                 }
+                // Returning out of a `with` carries the value past the
+                // handler exactly as assigning to an outer binding does —
+                // and the escape rule covered assignment and container-push
+                // but not this. `fn mk() -> fn() -> i64 / {Cfg} { with Cfg
+                // handled_by … { return || Cfg.value() } }` checked clean and
+                // panicked at the call ([E-HANDLER-MISSING]).
+                if let Some(v) = value.as_ref() {
+                    let rt = self.fn_ret.clone();
+                    if !self.with_floors.is_empty() {
+                        let row = self.row_carried_by(&rt);
+                        let escaping: Vec<String> = self
+                            .with_floors
+                            .iter()
+                            .map(|(e, _)| e.clone())
+                            .filter(|e| row.contains(e))
+                            .collect();
+                        if let Some(first) = escaping.first() {
+                            self.error_help(
+                                v.span(),
+                                format!(
+                                    "cannot return a function that performs `{first}` from inside a `with` block"
+                                ),
+                                "the handler is installed only for this block, so calling the value afterwards has nowhere to send the effect — call it here, or return what it computed",
+                            );
+                        }
+                    }
+                }
                 let ret = self.fn_ret.clone();
                 match value {
                     Some(e) => {
@@ -1408,6 +1435,36 @@ closing brace — yield a number from the region and return that",
             // places hold it.
             Type::I64 | Type::F64 | Type::Bool | Type::Unit | Type::Range | Type::Ref(_)
         )
+    }
+
+    /// Whether a value could have been built before the region began.
+    ///
+    /// A literal is built here. A name is judged by where it was declared —
+    /// the same floor the escape rule uses. Anything else is treated as
+    /// having come from outside, which is the safe answer.
+    fn from_outside_region(&self, e: &Expr) -> bool {
+        let Some(&floor) = self.region_floors.last() else {
+            return false;
+        };
+        let mut root = e;
+        loop {
+            match root {
+                Expr::Closure { .. }
+                | Expr::StructLit { .. }
+                | Expr::List(..)
+                | Expr::Tuple(..)
+                | Expr::Map(..) => return false,
+                Expr::Field { recv, .. } | Expr::Index { recv, .. } => root = recv,
+                Expr::Ident(id) => {
+                    return self
+                        .scopes
+                        .iter()
+                        .rposition(|sc| sc.contains_key(&id.name))
+                        .is_some_and(|at| at < floor);
+                }
+                _ => return true,
+            }
+        }
     }
 
     /// Whether a type can reach a `ref` anywhere inside it.
@@ -2008,14 +2065,12 @@ afterwards has nowhere to send the effect — call it here, or return what it co
     fn infer_expr(&mut self, e: &Expr) -> Type {
         let t = self.infer_expr_inner(e);
         // A closure written *here* can only capture what a region already
-        // allows. One that arrived from outside carries its captures, and
-        // running it inside the region is how what the region allocated gets
-        // out — whether it arrives by name, in a struct field, a list, a
-        // tuple, a map or an `Option` ([T-REGION-FOREIGN]).
-        if self.region_depth > 0
-            && !matches!(e, Expr::Closure { .. })
-            && self.carries_fn(&t)
-        {
+        // allows, and so can one bound to a name declared here. One that
+        // arrived from *outside* carries its captures, and running it inside
+        // the region is how what the region allocated gets out — whether it
+        // arrives by name, in a struct field, a list, a tuple, a map or an
+        // `Option` ([T-REGION-FOREIGN]).
+        if self.region_depth > 0 && self.from_outside_region(e) && self.carries_fn(&t) {
             self.error_help(
                 e.span(),
                 "a function value cannot be used inside a region",
@@ -2826,9 +2881,16 @@ fail outside it",
                             // and vanishes with no diagnostic. The two ways of
                             // mutating are individually sound and cannot be
                             // combined ([T-INOUT-REF]).
+                            // The whole path, not only its root: hiding the
+                            // reference one field deep — `f(h.r.xs, h)` where
+                            // `h: Holder { r: ref B }` — walked straight past
+                            // a rule about the root's type, and
+                            // [T-REF-GENERATIONAL] names a struct or a list
+                            // as the ordinary place a reference lives.
                             let root_is_ref = self
                                 .lookup(&id.name)
-                                .is_some_and(|b| matches!(b.ty, Type::Ref(_)));
+                                .is_some_and(|b| matches!(b.ty, Type::Ref(_)))
+                                || self.path_crosses_ref(a);
                             if root_is_ref {
                                 self.error_help(
                                     id.span,
