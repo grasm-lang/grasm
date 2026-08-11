@@ -1,14 +1,20 @@
 //! tag: E-HANDLER-MISSING
 //! expect: error
-//! unhandled effect
+//! it was declared outside the `with` block
+// A handled effect cannot leave the block that handles it.
+//
+// The closure's `Cfg` is discharged where it is written, because that is
+// where the handler is. Storing it in `f`, which outlives the block, carried
+// the discharge along: `f()` afterwards found no handler and reached the
+// runtime panic this clause says well-typed programs never do.
 effect Cfg {
     fn value() -> i64
 }
-fn reader() -> i64 {
-    Cfg.value()
-}
+
 fn main() {
-    // No `with Cfg handled_by ...` anywhere: the checker rejects this before
-    // the program can run, so the runtime panic is unreachable here.
-    print("{reader()}")
+    var f: fn() -> i64 / {Cfg} = || 0
+    with Cfg handled_by CfgHandler{ value: || 1 } {
+        f = || Cfg.value()
+    }
+    print("{f()}")
 }

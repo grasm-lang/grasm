@@ -186,6 +186,10 @@ struct Checker {
     /// mismatch there is reported as what it is — the function's return value
     /// — rather than as an anonymous type mismatch.
     tail_fn: Option<String>,
+    /// Effects handled by an enclosing `with`, and the scope depth each
+    /// block began at. Used to stop a value carrying a discharged effect out
+    /// of the block that discharged it.
+    with_floors: Vec<(String, usize)>,
     region_depth: u32,
     /// The scope depth at the start of each open region: a binding below its
     /// region's floor was declared outside and may not be written to.
@@ -272,6 +276,7 @@ impl Checker {
             fn_rows: HashMap::new(),
             unsafe_depth: 0,
             tail_fn: None,
+            with_floors: Vec::new(),
             region_depth: 0,
             region_floors: Vec::new(),
             extern_names: std::collections::HashSet::new(),
@@ -1089,6 +1094,7 @@ land in a copy the caller never sees — return the new value from the operation
                 }
                 self.check_assign_target(target);
                 let target_ty = self.infer_expr(target);
+                self.reject_handler_escape(target, &target_ty);
                 if *op == AssignOp::Assign {
                     self.check_expr(value, &target_ty);
                 } else {
@@ -1212,7 +1218,15 @@ closing brace — yield a number from the region and return that",
                         self.infer_expr(handler);
                     }
                 }
+                // A closure written inside the block has this effect
+                // discharged *here*, because here is where the handler is.
+                // If the value then leaves the block, the discharge leaves
+                // with it and the call happens somewhere the handler is not
+                // installed — which is how a well-typed program reached
+                // [E-HANDLER-MISSING]'s panic.
+                self.with_floors.push((ename, self.scopes.len()));
                 self.check_block(body);
+                self.with_floors.pop();
                 Type::Unit
             }
             Stmt::For {
@@ -1651,6 +1665,86 @@ declaration into the region, or compute a number and yield that",
         // Re-typing a prefix must not report the same problem twice.
         self.diags.truncate(mark);
         found
+    }
+
+    /// Refuses carrying a handled effect out of the block that handles it.
+    ///
+    /// The value is a function whose row still names an effect an enclosing
+    /// `with` discharges, and the place it is going was declared before that
+    /// `with` began — so it outlives the handler. Calling it afterwards
+    /// reaches the runtime's missing-handler panic, which
+    /// `[E-HANDLER-MISSING]` says well-typed programs never do.
+    fn reject_handler_escape(&mut self, target: &Expr, value_ty: &Type) {
+        if self.with_floors.is_empty() {
+            return;
+        }
+        let mut root = target;
+        while let Expr::Field { recv, .. } | Expr::Index { recv, .. } = root {
+            root = recv;
+        }
+        let Expr::Ident(id) = root else { return };
+        let Some(declared_at) = self
+            .scopes
+            .iter()
+            .rposition(|sc| sc.contains_key(&id.name))
+        else {
+            return;
+        };
+        let row = self.row_carried_by(value_ty);
+        let floors = self.with_floors.clone();
+        for (effect, floor) in floors {
+            if declared_at < floor && row.contains(&effect) {
+                self.error_help(
+                    target.span(),
+                    format!(
+                        "cannot store a function that performs `{effect}` in `{}` — it was declared outside the `with` block",
+                        id.name
+                    ),
+                    "the handler is installed only for this block, so calling the value \
+afterwards has nowhere to send the effect — call it here, or return what it computed",
+                );
+                return;
+            }
+        }
+    }
+
+    /// Every effect named by a function type anywhere inside `t`.
+    fn row_carried_by(&self, t: &Type) -> std::collections::BTreeSet<String> {
+        let mut out = std::collections::BTreeSet::new();
+        let mut stack = vec![self.uni.resolve(t)];
+        let mut seen = 0;
+        while let Some(cur) = stack.pop() {
+            seen += 1;
+            // A recursive type would otherwise walk forever; the row is
+            // written on the function type itself, so depth buys nothing.
+            if seen > 64 {
+                break;
+            }
+            match cur {
+                Type::Fn { params, ret, row } => {
+                    if let Some(r) = row {
+                        out.extend(r.iter().cloned());
+                    }
+                    stack.extend(params.iter().map(|p| self.uni.resolve(p)));
+                    stack.push(self.uni.resolve(&ret));
+                }
+                Type::List(e) => stack.push(self.uni.resolve(&e)),
+                Type::Ref(e) => stack.push(self.uni.resolve(&e)),
+                Type::Map(k, v) => {
+                    stack.push(self.uni.resolve(&k));
+                    stack.push(self.uni.resolve(&v));
+                }
+                Type::Tuple(items) => {
+                    stack.extend(items.iter().map(|i| self.uni.resolve(i)))
+                }
+                Type::Fallible(a, b) => {
+                    stack.push(self.uni.resolve(&a));
+                    stack.push(self.uni.resolve(&b));
+                }
+                _ => {}
+            }
+        }
+        out
     }
 
     fn check_assign_target(&mut self, target: &Expr) {
@@ -3786,6 +3880,10 @@ the state through an `inout` parameter",
                 }
             }
             self.reject_capture_write(id, "mutate", "");
+            // Pushing into an outer container is the same departure as
+            // assigning to an outer binding.
+            let t = self.infer_expr(recv);
+            self.reject_handler_escape(recv, &t);
         } else {
             // Not rooted at a binding at all: `[3, 1, 2].remove(0)`,
             // `mk().pop()`. There is nothing for the mutation to land in, so

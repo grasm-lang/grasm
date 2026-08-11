@@ -303,6 +303,13 @@ a defensive backstop that well-typed programs never reach.
 
 ## 8. Concurrency
 
+Keeping that true takes one restriction. A closure written inside a `with`
+has the effect discharged *there*, because there is where the handler is — so
+storing that closure somewhere declared before the block began carries the
+discharge out with it, and calling it afterwards has nowhere to send the
+effect. Both spellings are refused: assigning to an outer binding, and
+pushing into an outer container.
+
 **[E-PARALLEL-JOIN]** A `parallel` block does not exit until every task spawned
 inside it has completed.
 

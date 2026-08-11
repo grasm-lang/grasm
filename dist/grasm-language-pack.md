@@ -1345,6 +1345,13 @@ a defensive backstop that well-typed programs never reach.
 
 ## 8. Concurrency
 
+Keeping that true takes one restriction. A closure written inside a `with`
+has the effect discharged *there*, because there is where the handler is — so
+storing that closure somewhere declared before the block began carries the
+discharge out with it, and calling it afterwards has nowhere to send the
+effect. Both spellings are refused: assigning to an outer binding, and
+pushing into an outer container.
+
 **[E-PARALLEL-JOIN]** A `parallel` block does not exit until every task spawned
 inside it has completed.
 
@@ -2884,17 +2891,23 @@ fn main() {
 ```grasm
 //! tag: E-HANDLER-MISSING
 //! expect: error
-//! unhandled effect
+//! it was declared outside the `with` block
+// A handled effect cannot leave the block that handles it.
+//
+// The closure's `Cfg` is discharged where it is written, because that is
+// where the handler is. Storing it in `f`, which outlives the block, carried
+// the discharge along: `f()` afterwards found no handler and reached the
+// runtime panic this clause says well-typed programs never do.
 effect Cfg {
     fn value() -> i64
 }
-fn reader() -> i64 {
-    Cfg.value()
-}
+
 fn main() {
-    // No `with Cfg handled_by ...` anywhere: the checker rejects this before
-    // the program can run, so the runtime panic is unreachable here.
-    print("{reader()}")
+    var f: fn() -> i64 / {Cfg} = || 0
+    with Cfg handled_by CfgHandler{ value: || 1 } {
+        f = || Cfg.value()
+    }
+    print("{f()}")
 }
 ```
 
