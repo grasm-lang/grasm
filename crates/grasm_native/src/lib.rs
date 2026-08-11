@@ -6490,7 +6490,16 @@ impl FnCx<'_, '_> {
         let ok_blk = self.b.create_block();
         let err_blk = self.b.create_block();
         let merge = self.b.create_block();
-        self.b.append_block_param(merge, ok_t.cl());
+        // `() ! E` carries no value, so the merge takes no parameter. Giving
+        // it one anyway produced a Cranelift verifier error, which surfaced as
+        // "does not yet support (codegen bug in `main`)" — a refusal naming
+        // nothing, which then masked the *real* refusal elsewhere in the same
+        // program. `f() ?? ()` is the natural way to say a setup call's
+        // failure is deliberately ignored, so this is a shape people write.
+        let unit = *ok_t == VType::Unit;
+        if !unit {
+            self.b.append_block_param(merge, ok_t.cl());
+        }
         let c = self.call_rt("grasm_is_ok", &[lv]).unwrap();
         self.b.ins().brif(c, ok_blk, &[], err_blk, &[]);
         self.filled = true;
@@ -6499,8 +6508,13 @@ impl FnCx<'_, '_> {
         let zero = self.b.ins().iconst(types::I64, 0);
         let payload = self.call_rt("grasm_variant_field", &[lv, zero]).unwrap();
         self.call_rt("grasm_val_dec", &[lv]);
-        let (v, _) = self.unbox(payload, ok_t)?;
-        self.b.ins().jump(merge, &[v]);
+        if unit {
+            self.call_rt("grasm_val_dec", &[payload]);
+            self.b.ins().jump(merge, &[]);
+        } else {
+            let (v, _) = self.unbox(payload, ok_t)?;
+            self.b.ins().jump(merge, &[v]);
+        }
         self.filled = true;
 
         self.goto_block(err_blk);
@@ -6510,22 +6524,40 @@ impl FnCx<'_, '_> {
         // block is already terminated.
         match self.eval_expr_expecting_opt(rhs, Some(ok_t))? {
             Some((mut rv, rvt)) => {
-                if *ok_t == VType::F64 && rvt == VType::I64 {
-                    rv = self.b.ins().fcvt_from_sint(types::F64, rv);
+                if unit {
+                    // The fallback's value goes nowhere — `()` is written as
+                    // an empty tuple, which allocates — so it is released
+                    // rather than stranded.
+                    if rvt.boxed() {
+                        self.call_rt("grasm_val_dec", &[rv]);
+                    }
+                    self.b.ins().jump(merge, &[]);
+                } else {
+                    if *ok_t == VType::F64 && rvt == VType::I64 {
+                        rv = self.b.ins().fcvt_from_sint(types::F64, rv);
+                    }
+                    self.b.ins().jump(merge, &[rv]);
                 }
-                self.b.ins().jump(merge, &[rv]);
                 self.filled = true;
             }
             None => {
                 if !self.filled {
-                    let zero = self.zero_of(ok_t);
-                    self.b.ins().jump(merge, &[zero]);
+                    if unit {
+                        self.b.ins().jump(merge, &[]);
+                    } else {
+                        let zero = self.zero_of(ok_t);
+                        self.b.ins().jump(merge, &[zero]);
+                    }
                     self.filled = true;
                 }
             }
         }
 
         self.goto_block(merge);
+        if unit {
+            let nothing = self.zero_of(&VType::Unit);
+            return Ok((nothing, VType::Unit));
+        }
         let out = self.b.block_params(merge)[0];
         Ok((out, ok_t.clone()))
     }

@@ -130,6 +130,10 @@ but "the value, or this default" is one thing, and writing it as a `match` at
 every call site is the most repetitive shape in a program that reports errors
 as values. The error itself is discarded — reach for `match` when it matters.
 
+`() ! E` works the same way, and `f() ?? ()` is how a call whose failure is
+deliberately ignored says so — the one consumer a value-less fallible call
+otherwise lacks, since `let _ = f()` is refused by the clause above.
+
 **[T-TRY]** `try e` where `e : T ! E` yields `T`, propagating `Err` to the
 caller. It is a compile error in a function that declares no error type —
 except in `main` and in tests, whose error slot is open because the runtime
