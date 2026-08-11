@@ -679,6 +679,14 @@ impl<'m> Codegen<'m> {
             )),
             TypeExpr::Tuple(items, _) if items.is_empty() => Ok(VType::Unit),
             TypeExpr::Tuple(items, _) => {
+                // `()` is the unit type, not a zero-length tuple. Reading it
+                // as the latter gave a `let nothing: () = ()` a boxed-pointer
+                // variable holding unit's one-byte value, and Cranelift
+                // rejected the function with "declared type of variable var0
+                // doesn't match type of value".
+                if items.is_empty() {
+                    return Ok(VType::Unit);
+                }
                 let mut ts = Vec::with_capacity(items.len());
                 for i in items {
                     ts.push(self.vtype_of(i)?);
@@ -3867,7 +3875,11 @@ impl FnCx<'_, '_> {
     fn eval_expr_val(&mut self, e: &Expr) -> CResult<(Value, VType)> {
         match self.eval_expr(e)? {
             Some(v) => Ok(v),
-            None => nope(e.span(), "using a unit value"),
+            // An expression that produces nothing *is* the unit value —
+            // `let u = noop()` binds it, and it renders as `()`. Refusing
+            // here made a shape the checker accepts one the backend would not
+            // take, for a type that has exactly one value to hand over.
+            None => Ok((self.zero_of(&VType::Unit), VType::Unit)),
         }
     }
 
@@ -3880,7 +3892,9 @@ impl FnCx<'_, '_> {
     ) -> CResult<(Value, VType)> {
         match self.eval_expr_expecting_opt(e, expected)? {
             Some(v) => Ok(v),
-            None => nope(e.span(), "using a unit value"),
+            // As in `eval_expr_val`: an expression that produces nothing is
+            // the unit value, and unit has exactly one.
+            None => Ok((self.zero_of(&VType::Unit), VType::Unit)),
         }
     }
 
@@ -4136,6 +4150,12 @@ impl FnCx<'_, '_> {
                 }
             }
             Expr::Tuple(items, _) => {
+                // `()` is unit, not a zero-length tuple — and unit is a
+                // value, not an allocation, so nothing is built for it.
+                if items.is_empty() {
+                    let nothing = self.zero_of(&VType::Unit);
+                    return Ok(Some((nothing, VType::Unit)));
+                }
                 let mut list = self.call_rt("grasm_list_new", &[]).unwrap();
                 let mut ts = Vec::with_capacity(items.len());
                 for item in items {
@@ -5682,6 +5702,15 @@ impl FnCx<'_, '_> {
                 self.b.ins().fcmp(FloatCC::GreaterThanOrEqual, lv, rv),
                 VType::Bool,
             ),
+            // Unit has one value, so two of them are always equal.
+            (VType::Unit, Eq) => {
+                let t = self.b.ins().iconst(types::I8, 1);
+                (t, VType::Bool)
+            }
+            (VType::Unit, NotEq) => {
+                let f = self.b.ins().iconst(types::I8, 0);
+                (f, VType::Bool)
+            }
             (VType::Bool, Eq) => (self.b.ins().icmp(IntCC::Equal, lv, rv), VType::Bool),
             (VType::Bool, NotEq) => (self.b.ins().icmp(IntCC::NotEqual, lv, rv), VType::Bool),
             _ => return nope(span, "this operator on these types"),
@@ -6197,7 +6226,7 @@ impl FnCx<'_, '_> {
                 for piece in pieces {
                     if let StrPiece::Expr(inner) = piece {
                         let (v, vt) = self.eval_expr_val(inner)?;
-                        if vt == VType::Unit {
+                        if false {
                             return nope(inner.span(), "printing unit");
                         }
                         vals.push((v, vt));
@@ -6238,8 +6267,11 @@ impl FnCx<'_, '_> {
                                     self.call_rt("grasm_out_val", &[v]);
                                     self.call_rt("grasm_val_dec", &[v]);
                                 }
-                                // Rejected in the pass above, before any write.
-                                VType::Unit => unreachable!(),
+                                // Unit has one value and renders as `()`.
+                                VType::Unit => {
+                                    let (p, l) = self.str_ptr_len("()");
+                                    self.call_rt("grasm_out_text", &[p, l]);
+                                }
                                 _ => unreachable!(),
                             }
                         }
@@ -6262,7 +6294,10 @@ impl FnCx<'_, '_> {
                         self.call_rt("grasm_out_val", &[v]);
                         self.call_rt("grasm_val_dec", &[v]);
                     }
-                    VType::Unit => return nope(other.span(), "printing unit"),
+                    VType::Unit => {
+                        let (p, l) = self.str_ptr_len("()");
+                        self.call_rt("grasm_out_text", &[p, l]);
+                    }
                     _ => unreachable!(),
                 }
             }

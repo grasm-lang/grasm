@@ -3163,7 +3163,7 @@ fn main() {
 //! expect: output
 //! big
 //! 0
-//! 1
+//! 1 true ()
 fn describe(n: i64) -> str {
     if n > 10 {
         "big"
@@ -3175,6 +3175,9 @@ fn takes_unit(u: ()) -> i64 {
     1
 }
 
+fn noop() {
+}
+
 fn main() {
     print(describe(50))
     var count = 0
@@ -3182,9 +3185,12 @@ fn main() {
         count = 1
     }
     print("{count}")
-    // `()` has one value, and that is the only thing of its type.
+    // `()` has one value, and that is the only thing of its type. It binds,
+    // compares, prints and crosses a function boundary like any other value —
+    // the compiled backend used to refuse each of those in turn.
     let nothing: () = ()
-    print("{takes_unit(nothing)}")
+    let produced = noop()
+    print("{takes_unit(nothing)} {nothing == produced} {produced}")
 }
 ```
 
