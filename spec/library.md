@@ -242,12 +242,15 @@ panics on a value that is not a code point, surrogates included. Together they
 are what lets a program compute *on* text — hash it, encode it, parse a number
 by hand — rather than only cut and compare it.
 
-Both `len` and `code_at` answer in constant time. They count *characters*, so
-each used to decode the string from the start: `while i < s.len()` was
-quadratic in two ways at once, and 400 000 characters took 6.7 seconds where
-the identical loop over a list took 0.21. A string never changes once built,
-so its character count is computed once and kept; when that count equals the
-byte count the text is ASCII and an index is an index.
+Both `len` and `code_at` answer in constant time, whatever the text. They
+count *characters*, so each used to decode the string from the start:
+`while i < s.len()` was quadratic in two ways at once, and 400 000 characters
+took 6.7 seconds where the identical loop over a list took 0.21. A string
+never changes once built, so its character count is computed once and kept.
+When that count equals the byte count the text is ASCII and an index is an
+index; when it does not, a character index is built once, the first time one
+is asked for by position. Fixing only the ASCII half left the same 6.3 seconds
+waiting behind a single two-byte character.
 
 **[L-LIB-WORDS]** `s.words()` splits on runs of whitespace and yields no
 empty elements, which is what reading a line of aligned columns needs.

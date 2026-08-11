@@ -2611,15 +2611,12 @@ build links it, `grasm run` can only reach what is already loaded",
                         "code_at {i} out of bounds (len {n})"
                     )));
                 }
-                // When every character is one byte, the index *is* an index.
-                // Walking it made `code_at` cost O(i), so a loop reading a
-                // string left to right was quadratic — and that loop is what
+                // Constant time whatever the text: ASCII indexes directly,
+                // and anything else builds a character index once. Walking
+                // made `code_at` cost O(i), so a loop reading a string left
+                // to right was quadratic — and that loop is what
                 // [L-LIB-CODES] recommends the method for.
-                if s.is_flat() {
-                    Value::Int(s.as_bytes()[i as usize] as i64)
-                } else {
-                    Value::Int(s.chars().nth(i as usize).expect("in bounds") as i64)
-                }
+                Value::Int(s.char_at(i as usize).expect("in bounds") as i64)
             }
             (Value::Str(s), "words") => Value::List(Rc::new(
                 s.split_whitespace().map(Value::str).collect(),

@@ -166,6 +166,14 @@ pub struct GStr {
     s: String,
     /// `u32::MAX` until asked for.
     chars: std::cell::Cell<u32>,
+    /// Byte offset of each character, built the first time one is asked for
+    /// by index and only when the text is not ASCII.
+    ///
+    /// Without it `code_at(i)` walked from the start, so a loop reading a
+    /// string left to right was quadratic — 400 000 characters took 6.3
+    /// seconds the moment one of them was two bytes wide. ASCII needs no
+    /// index, because there the offset *is* the index.
+    offsets: std::cell::OnceCell<Vec<u32>>,
 }
 
 impl GStr {
@@ -173,7 +181,20 @@ impl GStr {
         GStr {
             s,
             chars: std::cell::Cell::new(u32::MAX),
+            offsets: std::cell::OnceCell::new(),
         }
+    }
+
+    /// The character at `i`, in constant time after the first call.
+    pub fn char_at(&self, i: usize) -> Option<char> {
+        if self.is_flat() {
+            return self.s.as_bytes().get(i).map(|b| *b as char);
+        }
+        let offs = self
+            .offsets
+            .get_or_init(|| self.s.char_indices().map(|(o, _)| o as u32).collect());
+        let start = *offs.get(i)? as usize;
+        self.s[start..].chars().next()
     }
 
     /// The number of characters, computed at most once.

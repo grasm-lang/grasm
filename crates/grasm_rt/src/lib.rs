@@ -407,6 +407,10 @@ pub struct RtStr {
     s: String,
     /// `u32::MAX` until asked for.
     chars: Cell<u32>,
+    /// Byte offset of each character, built the first time one is asked for
+    /// by index and only when the text is not ASCII. ASCII needs no index,
+    /// because there the offset *is* the index.
+    offsets: std::cell::OnceCell<Vec<u32>>,
 }
 
 impl RtStr {
@@ -414,7 +418,20 @@ impl RtStr {
         RtStr {
             s,
             chars: Cell::new(u32::MAX),
+            offsets: std::cell::OnceCell::new(),
         }
+    }
+
+    /// The character at `i`, in constant time after the first call.
+    pub fn char_at(&self, i: usize) -> Option<char> {
+        if self.is_flat() {
+            return self.s.as_bytes().get(i).map(|b| *b as char);
+        }
+        let offs = self
+            .offsets
+            .get_or_init(|| self.s.char_indices().map(|(o, _)| o as u32).collect());
+        let start = *offs.get(i)? as usize;
+        self.s[start..].chars().next()
     }
 
     pub fn char_len(&self) -> usize {
@@ -2517,12 +2534,9 @@ pub unsafe extern "C" fn grasm_str_code_at(s: *mut RtVal, i: i64) -> i64 {
     if i < 0 || i >= n {
         rt_panic(&format!("code_at {i} out of bounds (len {n})"));
     }
-    // When every character is one byte, the index *is* an index.
-    if gs.is_flat() {
-        gs.as_bytes()[i as usize] as i64
-    } else {
-        gs.chars().nth(i as usize).expect("in bounds") as i64
-    }
+    // Constant time whatever the text: ASCII indexes directly, anything else
+    // builds a character index once.
+    gs.char_at(i as usize).expect("in bounds") as i64
 }
 
 /// The whitespace-separated words of a string, with no empties.
