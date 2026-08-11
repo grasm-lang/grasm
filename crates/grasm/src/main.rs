@@ -255,6 +255,15 @@ fn run() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             }
+            // `--target` only means anything to the compiled backend. Without
+            // `--native` it was accepted and ignored, so asking for a Linux
+            // build on a Mac produced a Mach-O bundle that ran locally and
+            // reported success — a silent wrong answer from the toolchain.
+            if args.iter().any(|a| a == "--target") && !args.iter().any(|a| a == "--native") {
+                eprintln!("error: `--target` needs `--native` — a bundled build carries the interpreter, which is this machine's");
+                eprintln!("  help: add `--native`, or drop `--target` to build for this machine");
+                return ExitCode::FAILURE;
+            }
             let program = match load_and_check(path) {
                 Ok(p) => p,
                 Err(code) => return code,

@@ -473,10 +473,17 @@ points at something. Releasing an already-released slot does nothing: a double
 release is not a use-after-free, and making it an error would turn cleanup
 order into something every caller has to track.
 
-**[T-REF-EQ]** Two references are equal when they name the same live slot —
-identity, not the equality of what they point at, which is what a graph walk
-needs to recognise a node it has already visited. Equality recurses, so this is
-also what makes a struct or list *containing* a reference compare sensibly.
+**[T-REF-EQ]** Two references are equal when they name the same slot *and the
+same generation* — identity, not the equality of what they point at, which is
+what a graph walk needs to recognise a node it has already visited. Equality
+recurses, so this is also what makes a struct or list *containing* a reference
+compare sensibly.
+
+Liveness is not consulted, and does not need to be: releasing a slot bumps its
+generation, so a stale reference is never equal to a live one that reuses the
+same slot. Two copies of the same released reference *are* equal, which is
+what identity means — a value is equal to itself, and a rule that said
+otherwise would make `a == a` depend on when it was asked.
 
 **[T-REF-MATCH]** A `match` on a reference matches what it points at, so a
 `ref` to a sum type is opened the ordinary way. Without it the two diagnostics

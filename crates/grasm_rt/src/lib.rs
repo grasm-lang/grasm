@@ -246,7 +246,10 @@ unsafe fn with_key<R>(v: *mut RtVal, f: impl FnOnce(&MapKey) -> R) -> R {
             *buf = returned;
             out
         }),
-        _ => grasm_panic_msg_str("map keys must be i64, str, or bool"),
+        // Worded exactly as the interpreter words it: [E-PANIC-TRACE] says
+        // the panic line and the exit status are identical in all three
+        // engines, and this was the one message that was not.
+        _ => rt_panic(&format!("invalid map key `{}`", display(v))),
     }
 }
 
@@ -257,7 +260,7 @@ impl MapKey {
             RtPayload::Bool(b) => MapKey::Bool(*b),
             RtPayload::I64(n) => MapKey::I64(*n),
             RtPayload::Str(s) => MapKey::Str(s.to_string()),
-            _ => grasm_panic_msg_str("map keys must be i64, str, or bool"),
+            _ => rt_panic(&format!("invalid map key `{}`", display(v))),
         }
     }
 

@@ -1,7 +1,8 @@
 //! tag: T-REF-EQ
 //! expect: output
 //! true true false true
-// Two references are equal when they name the same live slot.
+//! false true false
+// Two references are equal when they name the same slot and generation.
 //
 // The interpreter had no case for it, so a `ref` was not equal to *itself* —
 // and the failure was contagious, because equality recurses: any struct, list,
@@ -10,6 +11,11 @@
 // and the compiled backend disagreed because it compares the packed words and
 // got this right by accident. A cycle-safe graph walk keyed on `seen.contains`
 // looped forever under `grasm run` and terminated compiled — the same program.
+//
+// Liveness is not consulted. Releasing a slot bumps its generation, so a
+// stale reference is never equal to a live one that reuses the slot; and two
+// copies of the same released reference are equal, because a value is equal
+// to itself and identity cannot depend on when it is asked.
 type Node = { v: i64 }
 type Edge = { to: ref Node, w: i64 }
 
@@ -19,4 +25,12 @@ fn main() {
     let e2 = e1
     var seen: [Edge] = [e1]
     print("{e1 == e1} {e1 == e2} {e1 != e1} {seen.contains(e1)}")
+    // Released: still itself, still not the new occupant of its slot.
+    // Compared through a struct, since `==` on two bare refs is one of the
+    // shapes the compiled backend does not take yet (§11).
+    let dead = r
+    release(r)
+    let fresh = ref(Node{ v: 2 })
+    let held = Edge{ to: dead, w: 0 }
+    print("{alive(dead)} {held == Edge{ to: r, w: 0 }} {held == Edge{ to: fresh, w: 0 }}")
 }

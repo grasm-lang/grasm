@@ -87,13 +87,19 @@ fn check_modules(files: &[ModuleView]) -> Analysis {
         c.current_module = f.name.clone();
         c.collect_types(f.module);
     }
-    let modules: Vec<(String, &Module)> =
-        files.iter().map(|f| (f.name.clone(), f.module)).collect();
-    c.resolve_type_bodies(&modules);
+    // Before the bodies are resolved: `effect E` declares the type `EHandler`,
+    // and a struct field may name one. Registering handlers afterwards meant
+    // `type Holder = { h: LogHandler }` was "unknown type `LogHandler`" while
+    // the same name worked as a parameter, a return type, a `let` annotation
+    // and a list element — one namespace with a hole in it ([T-EFFECT-DECL],
+    // [T-MODULE-NS]).
     for f in files {
         c.current_module = f.name.clone();
         c.collect_effects(f.module);
     }
+    let modules: Vec<(String, &Module)> =
+        files.iter().map(|f| (f.name.clone(), f.module)).collect();
+    c.resolve_type_bodies(&modules);
     for f in files {
         c.current_module = f.name.clone();
         c.collect_fns(f.module);

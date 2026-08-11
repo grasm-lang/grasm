@@ -835,10 +835,17 @@ points at something. Releasing an already-released slot does nothing: a double
 release is not a use-after-free, and making it an error would turn cleanup
 order into something every caller has to track.
 
-**[T-REF-EQ]** Two references are equal when they name the same live slot —
-identity, not the equality of what they point at, which is what a graph walk
-needs to recognise a node it has already visited. Equality recurses, so this is
-also what makes a struct or list *containing* a reference compare sensibly.
+**[T-REF-EQ]** Two references are equal when they name the same slot *and the
+same generation* — identity, not the equality of what they point at, which is
+what a graph walk needs to recognise a node it has already visited. Equality
+recurses, so this is also what makes a struct or list *containing* a reference
+compare sensibly.
+
+Liveness is not consulted, and does not need to be: releasing a slot bumps its
+generation, so a stale reference is never equal to a live one that reuses the
+same slot. Two copies of the same released reference *are* equal, which is
+what identity means — a value is equal to itself, and a rule that said
+otherwise would make `a == a` depend on when it was asked.
 
 **[T-REF-MATCH]** A `match` on a reference matches what it points at, so a
 `ref` to a sum type is opened the ordinary way. Without it the two diagnostics
@@ -7395,7 +7402,8 @@ fn main() {
 //! tag: T-REF-EQ
 //! expect: output
 //! true true false true
-// Two references are equal when they name the same live slot.
+//! false true false
+// Two references are equal when they name the same slot and generation.
 //
 // The interpreter had no case for it, so a `ref` was not equal to *itself* —
 // and the failure was contagious, because equality recurses: any struct, list,
@@ -7404,6 +7412,11 @@ fn main() {
 // and the compiled backend disagreed because it compares the packed words and
 // got this right by accident. A cycle-safe graph walk keyed on `seen.contains`
 // looped forever under `grasm run` and terminated compiled — the same program.
+//
+// Liveness is not consulted. Releasing a slot bumps its generation, so a
+// stale reference is never equal to a live one that reuses the slot; and two
+// copies of the same released reference are equal, because a value is equal
+// to itself and identity cannot depend on when it is asked.
 type Node = { v: i64 }
 type Edge = { to: ref Node, w: i64 }
 
@@ -7413,6 +7426,14 @@ fn main() {
     let e2 = e1
     var seen: [Edge] = [e1]
     print("{e1 == e1} {e1 == e2} {e1 != e1} {seen.contains(e1)}")
+    // Released: still itself, still not the new occupant of its slot.
+    // Compared through a struct, since `==` on two bare refs is one of the
+    // shapes the compiled backend does not take yet (§11).
+    let dead = r
+    release(r)
+    let fresh = ref(Node{ v: 2 })
+    let held = Edge{ to: dead, w: 0 }
+    print("{alive(dead)} {held == Edge{ to: r, w: 0 }} {held == Edge{ to: fresh, w: 0 }}")
 }
 ```
 
