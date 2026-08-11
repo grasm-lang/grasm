@@ -913,7 +913,17 @@ pub fn effect_sites_of_package(
         return Ok(std::collections::HashMap::new());
     }
     let program = grasm_sema::loader::load_from_disk(&entry)?;
-    Ok(grasm_sema::effects::effect_sites(&program))
+    let mut out = grasm_sema::effects::effect_sites(&program);
+    // The same whole-package scan the ceiling uses, so a breach in an
+    // unimported sibling module still says where it is.
+    for extra in package_modules(&entry) {
+        if let Ok(p) = grasm_sema::loader::load_from_disk(&extra) {
+            for (k, v) in grasm_sema::effects::effect_sites(&p) {
+                out.entry(k).or_insert(v);
+            }
+        }
+    }
+    Ok(out)
 }
 
 pub fn effects_of_package(manifest: &Manifest) -> Result<BTreeSet<String>, String> {
@@ -926,7 +936,46 @@ pub fn effects_of_package(manifest: &Manifest) -> Result<BTreeSet<String>, Strin
         ));
     }
     let program = grasm_sema::loader::load_from_disk(&entry)?;
-    Ok(grasm_sema::effects::effects_of_program(&program))
+    let mut out = grasm_sema::effects::effects_of_program(&program);
+    // Every module in the package, not only the ones its entry imports.
+    //
+    // A consumer reaches a `pub` function with `import dep.module`, whether or
+    // not the dependency's own entry mentions that module — so a `capabilities
+    // = []` package could keep a `pub fn read_secrets` in an unimported
+    // sibling file and be reported as `performs []`. The effects then landed
+    // on the *consumer*, at a source location inside the dependency that the
+    // consumer cannot fix, and if the consumer already declared `io` for its
+    // own reasons, nothing was reported at all.
+    for extra in package_modules(&entry) {
+        if let Ok(p) = grasm_sema::loader::load_from_disk(&extra) {
+            out.extend(grasm_sema::effects::effects_of_program(&p));
+        }
+    }
+    Ok(out)
+}
+
+/// Every `.gr` file in a package's source tree apart from its entry.
+fn package_modules(entry: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let Some(dir) = entry.parent() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let path = e.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|x| x == "gr") && path != entry {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 /// The effect names a package's sources make available, for name checking.

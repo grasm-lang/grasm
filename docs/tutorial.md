@@ -465,7 +465,14 @@ not something a reviewer has to happen to notice.
 
 A capability is what a package needs from **outside** itself, so what counts is
 what *escapes*: the effects `main` performs, and the effects left in a `pub`
-function's row for a consumer to handle. An effect you declare, perform and
+function's row for a consumer to handle. Every module in the package counts,
+not only the ones its entry file imports — a consumer reaches `pub fn f` with
+`import dep.module` whether or not the dependency's own entry mentions that
+module, so a `capabilities = []` package could otherwise keep a filesystem
+reader in an unimported sibling file and be reported as performing nothing.
+A *dependency's* `pub` rows do not count toward the consumer, whose ceiling is
+what it needs, not what everything it depends on offers; what the consumer
+actually calls is already in the row of whatever calls it. An effect you declare, perform and
 handle inside your own package needs nothing from anyone and is not a
 capability — but the handler answers for what it really does, so a `Log`
 handler that calls `print` puts `io` in the ceiling whoever asked for it.

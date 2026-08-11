@@ -212,11 +212,27 @@ pub fn effects_of_program(program: &crate::loader::Program) -> BTreeSet<String> 
         .first()
         .map(|f| f.name.as_str())
         .unwrap_or("main");
+    // A dependency's modules are loaded into the same program, and its
+    // ceiling is its own business. Counting its `pub` rows here charged this
+    // package for effects it never names: an app whose `main` calls one pure
+    // function from a library was charged for a *different* `pub` function in
+    // that library it does not use, at a source location it cannot fix. What
+    // the consumer actually calls still counts — rows are transitive, so it
+    // is already in the row of whatever calls it.
+    let foreign = |module: &str| {
+        program
+            .deps
+            .iter()
+            .any(|d| module == d || module.starts_with(&format!("{d}.")))
+    };
     let mut all = BTreeSet::new();
     for (key, row) in &ctx.rows {
         let Some((module, name)) = key.rsplit_once("::") else {
             continue;
         };
+        if foreign(module) {
+            continue;
+        }
         let escapes = ctx.fns[key].is_pub || (module == entry_module && name == "main");
         if escapes {
             all.extend(row.iter().cloned());
@@ -224,6 +240,9 @@ pub fn effects_of_program(program: &crate::loader::Program) -> BTreeSet<String> 
     }
     // Tests and benchmarks may perform effects too.
     for f in &views {
+        if foreign(&f.name) {
+            continue;
+        }
         for d in &f.module.decls {
             let body = match d {
                 Decl::Test(t) => &t.body,
