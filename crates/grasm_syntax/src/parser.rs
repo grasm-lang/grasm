@@ -2059,6 +2059,18 @@ impl Parser {
     // ------------------------------------------------------------------
 
     fn parse_pattern(&mut self) -> PResult<Pattern> {
+        // Patterns nest like everything else, and everything that walks one
+        // does it by recursion. A 5000-deep constructor pattern checked in
+        // 15ms and then took the native backend 114 seconds to compile, its
+        // build time growing roughly cubically — the one deep shape the cap
+        // did not count ([G-NEST-LIMIT]).
+        self.enter_nested()?;
+        let r = self.parse_pattern_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn parse_pattern_inner(&mut self) -> PResult<Pattern> {
         let start = self.cur_span();
         match self.cur().clone() {
             TokenKind::Underscore => {
