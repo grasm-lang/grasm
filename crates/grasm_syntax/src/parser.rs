@@ -1365,21 +1365,29 @@ impl Parser {
         })
     }
 
+    /// `a ?? b ?? c` groups to the **right**: `a ?? (b ?? c)`.
+    ///
+    /// Left-associative, the middle operand had to be a plain value, so
+    /// `first() ?? second() ?? fallback` did not compile — the `??` between
+    /// two `Option`s saw an `Option` where it wanted the element type. For an
+    /// operator whose whole job is "or this default", chaining defaults is
+    /// the obvious thing to write, and parentheses were the only way to say
+    /// it.
     fn parse_coalesce(&mut self) -> PResult<Expr> {
-        let mut lhs = self.parse_pipeline()?;
-        while self.at(&TokenKind::QuestionQuestion) {
-            self.bump();
-            self.skip_newlines_if_continuation();
-            let rhs = self.parse_pipeline()?;
-            let span = lhs.span().merge(rhs.span());
-            lhs = self.fold(Expr::Binary {
-                op: BinaryOp::Coalesce,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-                span,
-            })?;
+        let lhs = self.parse_pipeline()?;
+        if !self.at(&TokenKind::QuestionQuestion) {
+            return Ok(lhs);
         }
-        Ok(lhs)
+        self.bump();
+        self.skip_newlines_if_continuation();
+        let rhs = self.parse_coalesce()?;
+        let span = lhs.span().merge(rhs.span());
+        self.fold(Expr::Binary {
+            op: BinaryOp::Coalesce,
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+            span,
+        })
     }
 
     /// `x |> f(a)` desugars to `f(x, a)`; `x |> obj.m(a)` to `obj.m(x, a)`.

@@ -89,6 +89,13 @@ into a failure, and it is the shape a fallible function's body most often has.
 
 **[E-COALESCE-LAZY]** `a ?? b` evaluates `b` only when `a` is `None`.
 
+`??` groups to the **right**, so `a ?? b ?? c` is `a ?? (b ?? c)` and each
+default may itself be something that might be absent. Grouping left, the
+middle operand had to be a plain value, so `first() ?? second() ?? fallback`
+did not compile at all — for an operator whose whole job is "or this default",
+chaining defaults is the obvious thing to write. The layered case, an `Option`
+of a fallible value, says what it means with brackets.
+
 ## 3. Arithmetic
 
 **[E-ARITH-INT]** `+ - *` on `i64` wrap on overflow (two's complement), and

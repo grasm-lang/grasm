@@ -60,7 +60,9 @@ fn main() {
     // Stored and read back, which is where the boxed case crashed.
     var m: Map[str, i64 ! E] = {}
     m.set("a", fi(4))
-    print("{m.get("a") ?? fi(1) ?? 0 - 1}")
+    // `??` groups to the right, so the layered unwrap — an `Option` of a
+    // fallible value — says so with brackets.
+    print("{(m.get("a") ?? fi(1)) ?? 0 - 1}")
     // And the whole shape end to end.
     for n in [0, 1, 2] {
         match fi(n) {

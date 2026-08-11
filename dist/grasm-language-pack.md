@@ -1142,6 +1142,13 @@ into a failure, and it is the shape a fallible function's body most often has.
 
 **[E-COALESCE-LAZY]** `a ?? b` evaluates `b` only when `a` is `None`.
 
+`??` groups to the **right**, so `a ?? b ?? c` is `a ?? (b ?? c)` and each
+default may itself be something that might be absent. Grouping left, the
+middle operand had to be a plain value, so `first() ?? second() ?? fallback`
+did not compile at all — for an operator whose whole job is "or this default",
+chaining defaults is the obvious thing to write. The layered case, an `Option`
+of a fallible value, says what it means with brackets.
+
 ## 3. Arithmetic
 
 **[E-ARITH-INT]** `+ - *` on `i64` wrap on overflow (two's complement), and
@@ -2691,13 +2698,42 @@ fn main() {
 ```grasm
 //! tag: E-COALESCE-LAZY
 //! expect: output
-//! 5
-//! 7
+//! evaluated 1
+//! evaluated 2
+//! 2
+//! 3
+//! 9
+// The right side runs only when it is needed, and defaults chain.
+//
+// `??` groups to the right, so each default may itself be absent. Grouping
+// left made the middle operand have to be a plain value, and
+// `first() ?? second() ?? fallback` did not compile.
+type E = | Bad
+
+fn loud(n: i64) -> Option[i64] {
+    print("evaluated {n}")
+    if n == 2 {
+        Some(n)
+    } else {
+        None
+    }
+}
+
+fn fallible(b: bool) -> i64 ! E {
+    if b {
+        Ok(9)
+    } else {
+        Err(Bad)
+    }
+}
+
 fn main() {
-    let some = Some(5)
-    print("{some ?? 0}")
-    let none: Option[i64] = None
-    print("{none ?? 7}")
+    // `loud(3)` is never reached, and neither is the final `0`.
+    print("{loud(1) ?? loud(2) ?? loud(3) ?? 0}")
+    var m: Map[str, i64] = {}
+    m.set("c", 3)
+    print("{m.get("a") ?? m.get("b") ?? m.get("c") ?? 0}")
+    print("{fallible(false) ?? fallible(true) ?? 0}")
 }
 ```
 
@@ -3039,7 +3075,9 @@ fn main() {
     // Stored and read back, which is where the boxed case crashed.
     var m: Map[str, i64 ! E] = {}
     m.set("a", fi(4))
-    print("{m.get("a") ?? fi(1) ?? 0 - 1}")
+    // `??` groups to the right, so the layered unwrap — an `Option` of a
+    // fallible value — says so with brackets.
+    print("{(m.get("a") ?? fi(1)) ?? 0 - 1}")
     // And the whole shape end to end.
     for n in [0, 1, 2] {
         match fi(n) {
