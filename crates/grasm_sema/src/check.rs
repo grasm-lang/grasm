@@ -2072,7 +2072,15 @@ afterwards has nowhere to send the effect — call it here, or return what it co
             _ => {}
         }
         // The same, through the shapes whose value is another expression.
+        //
+        // Not for `()`: a block or `if` in *statement* position is checked
+        // against `()` too, and pushing that inward would compare every tail
+        // with unit. `let a: () = …` therefore goes the ordinary way, which
+        // is what makes it an error rather than a silent success — it used to
+        // accept anything at all, so `let a: () = if c { 1 } else { 2.5 }`
+        // left `a` holding an `i64`.
         match e {
+            _ if want == Type::Unit => {}
             Expr::Block(b) => {
                 let t = self.check_block_with(b, Some(&want));
                 self.unify_or_report(e.span(), &t, &want);
@@ -2374,6 +2382,7 @@ allocates could outlive it — move the work out of the region, or yield a numbe
                 // nowhere too, so `if c { write_file(p, s) }` is as unhandled
                 // as `write_file(p, s)` on its own line.
                 let disc = std::mem::take(&mut self.discarding);
+                let e_span = e.span();
                 let before = self.moved_snapshot();
                 let then_ty = if disc {
                     self.check_block_discarded(then_block)
@@ -2398,9 +2407,26 @@ allocates could outlive it — move the work out of the region, or yield a numbe
                         self.merge_moved(&[after_then, after_else]);
                         if self.uni.unify(&then_ty, &else_ty) {
                             then_ty
-                        } else {
-                            // Branches disagree — it's a statement-style if.
+                        } else if disc {
+                            // Branches disagree, and nothing wanted the value:
+                            // a statement-style `if` ([E-IF-VALUE]).
                             Type::Unit
+                        } else {
+                            // Something *did* want the value. Calling it `()`
+                            // made `let a: () = if c { 1 } else { 2.5 }` legal
+                            // and left `a` holding an `i64` at run time —
+                            // printing as `1`, unequal to `()`, and passable
+                            // to a `fn f(u: ())`. `()` has one value.
+                            let t = self.show(&then_ty);
+                            let e = self.show(&else_ty);
+                            self.error_help(
+                                e_span,
+                                format!(
+                                    "the branches of this `if` have different types (`{t}` and `{e}`)"
+                                ),
+                                "an `if` used as a value needs both branches to agree — give them a common type, or use it as a statement",
+                            );
+                            Type::Error
                         }
                     }
                     None => Type::Unit,

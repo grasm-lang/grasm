@@ -229,7 +229,13 @@ type, and an `else if` chain of failures is the type of the one arm that does
 produce something.
 
 **[E-IF-VALUE]** `if` is an expression when both branches yield the same type;
-otherwise it is a statement of type `()`.
+otherwise it is a statement of type `()`, and using its value is an error.
+
+The second half was missing. A mismatched `if` became `()` wherever it stood,
+and `()` was accepted as an initializer without checking — so
+`let a: () = if c { 1 } else { 2.5 }` typechecked and left `a` holding an
+`i64` at run time: it printed as `1`, compared unequal to `()`, and could be
+passed to a `fn f(u: ())`. `()` has one value.
 
 **[E-MATCH-ORDER]** Match arms are tried top to bottom; the first whose pattern
 matches and whose guard passes is taken.

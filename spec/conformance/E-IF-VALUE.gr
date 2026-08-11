@@ -2,6 +2,7 @@
 //! expect: output
 //! big
 //! 0
+//! 1
 fn describe(n: i64) -> str {
     if n > 10 {
         "big"
@@ -9,6 +10,10 @@ fn describe(n: i64) -> str {
         "small"
     }
 }
+fn takes_unit(u: ()) -> i64 {
+    1
+}
+
 fn main() {
     print(describe(50))
     var count = 0
@@ -16,4 +21,7 @@ fn main() {
         count = 1
     }
     print("{count}")
+    // `()` has one value, and that is the only thing of its type.
+    let nothing: () = ()
+    print("{takes_unit(nothing)}")
 }
