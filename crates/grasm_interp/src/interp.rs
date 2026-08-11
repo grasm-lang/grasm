@@ -128,6 +128,35 @@ enum Seg {
 }
 
 /// Walks `segs` into `root` and stores `v` at the end, copy-on-write.
+/// The deepest `ref` reachable along a path, and how many segments it took.
+///
+/// `None` when the path holds no reference, or when it cannot be followed —
+/// the ordinary walk reports that, with its own message.
+fn deepest_ref(root: &Value, segs: &[Seg]) -> Option<(usize, u32, u32)> {
+    let mut cur = root;
+    let mut found: Option<(usize, u32, u32)> = None;
+    for (i, seg) in segs.iter().enumerate() {
+        if let Value::Ref(slot, gen) = cur {
+            found = Some((i, *slot, *gen));
+            // Anything past a reference is inside the slab, and the caller
+            // takes it from there.
+            return found;
+        }
+        cur = match (cur, seg) {
+            (Value::Struct { fields, .. }, Seg::Field(f)) => {
+                &fields.iter().find(|(k, _)| k == f)?.1
+            }
+            (Value::Tuple(items), Seg::Field(f)) => items.get(f.parse::<usize>().ok()?)?,
+            (Value::List(items), Seg::Index(i)) => items.get(*i)?,
+            _ => return None,
+        };
+    }
+    if let Value::Ref(slot, gen) = cur {
+        found = Some((segs.len(), *slot, *gen));
+    }
+    found
+}
+
 fn assign_into(root: &mut Value, segs: &[Seg], v: Value) -> Result<(), Flow> {
     let mut slot = root;
     for seg in segs {
@@ -1021,6 +1050,34 @@ impl<'a, W: Write> Interp<'a, W> {
                     // path there overwrote the node `at` pointed at, which
                     // silently replaced a graph node with a reference to
                     // another one. The checker draws the same line.
+                    // A `ref` anywhere on the path, not only at the root.
+                    // Writing *through* a reference does not modify what
+                    // holds it, so the way there is read-only and the write
+                    // lands in the slab. Only the root was handled, so
+                    // `rs[0].v = 5` and `h.r.v = 9` — a node in a list and a
+                    // node in a field, which is the ordinary Tier 2 arena —
+                    // typechecked and panicked `cannot access field 'v' of
+                    // 'ref#0.0'` ([T-REF-WRITE], [T-REF-GENERATIONAL]).
+                    let via = self
+                        .scopes
+                        .iter()
+                        .rev()
+                        .find_map(|sc| sc.get(&id.name))
+                        .cloned()
+                        .and_then(|rv| deepest_ref(&rv, &segs));
+                    if let Some((consumed, i, g)) = via {
+                        let idx = i as usize;
+                        let live = matches!(self.slab.get(idx), Some((Some(_), gen)) if *gen == g);
+                        if !live {
+                            return Err(Flow::Panic(
+                                "stale reference: the value it pointed to was released".to_string(),
+                            ));
+                        }
+                        let mut inner = self.slab[idx].0.take().expect("checked live");
+                        let r = assign_into(&mut inner, &segs[consumed..], v);
+                        self.slab[idx].0 = Some(inner);
+                        return r;
+                    }
                     let root_ref = self
                         .scopes
                         .iter()

@@ -1626,6 +1626,33 @@ declaration into the region, or compute a number and yield that",
     }
 
     /// Assignment target must be a place rooted in a mutable binding.
+    /// Whether a place path passes through a `ref` at any depth.
+    ///
+    /// Writing through a reference does not modify what holds it, so nothing
+    /// on the way needs to be mutable. Only the *root* was tested, so a node
+    /// in a list or in a struct field — the ordinary Tier 2 arena — demanded
+    /// `var` on the container, named the container in the error, and could
+    /// not be expressed at all for a `[ref N]` parameter ([T-REF-WRITE]).
+    fn path_crosses_ref(&mut self, target: &Expr) -> bool {
+        let mark = self.diags.len();
+        let mut cur = target;
+        let mut found = false;
+        loop {
+            let (Expr::Field { recv, .. } | Expr::Index { recv, .. }) = cur else {
+                break;
+            };
+            let t = self.infer_expr(recv);
+            if matches!(self.uni.resolve(&t), Type::Ref(_)) {
+                found = true;
+                break;
+            }
+            cur = recv;
+        }
+        // Re-typing a prefix must not report the same problem twice.
+        self.diags.truncate(mark);
+        found
+    }
+
     fn check_assign_target(&mut self, target: &Expr) {
         let mut root = target;
         while let Expr::Field { recv, .. } | Expr::Index { recv, .. } = root {
@@ -1639,12 +1666,7 @@ declaration into the region, or compute a number and yield that",
         if let Expr::Ident(id) = root {
             self.reject_region_escape(id, "assign to");
         }
-        let through_ref = if std::ptr::eq(root, target) {
-            false
-        } else {
-            let t = self.infer_expr(root);
-            matches!(self.uni.resolve(&t), Type::Ref(_))
-        };
+        let through_ref = self.path_crosses_ref(target);
         match root {
             Expr::Ident(id) => match self.lookup(&id.name) {
                 Some(b) if !b.mutable && !through_ref => {
@@ -3751,12 +3773,7 @@ the state through an `inout` parameter",
         // As in `check_assign_target`: mutating through a `ref` mutates what
         // it points at, not the reference, so the binding's own mutability is
         // not the question.
-        let through_ref = if std::ptr::eq(root, recv) {
-            false
-        } else {
-            let t = self.infer_expr(root);
-            matches!(self.uni.resolve(&t), Type::Ref(_))
-        };
+        let through_ref = self.path_crosses_ref(recv);
         if let Expr::Ident(id) = root {
             self.reject_region_escape(id, "mutate");
             if let Some(b) = self.lookup(&id.name) {

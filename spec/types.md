@@ -495,6 +495,15 @@ after both nodes exist, and that write typechecked and then panicked. The
 compiled backend refuses the shape by name for now (§11), so it is one of the
 places the two engines differ in what they accept rather than in what they do.
 
+Anywhere on the path, not only at the root. A node held in a list or in a
+struct field is the ordinary Tier 2 arena — `[T-REF-GENERATIONAL]` names
+storing a reference in a struct, a list or a map as the reason the tier
+exists — and `rs[0].v = 5` typechecked and then panicked `cannot access field
+'v' of 'ref#0.0'`, while reading the identical path worked. The container's
+mutability is not the question either, for the same reason the root's is not:
+a `[ref N]` parameter cannot be declared `var` at all, so the demand had no
+answer.
+
 **[T-REF-CAPTURE]** A captured `ref` may be written through inside a closure.
 [T-CAPTURE-WRITE] refuses writing to a captured binding because a closure
 captures *values*, so the write would land in a copy nobody can see — a

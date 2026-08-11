@@ -855,6 +855,15 @@ after both nodes exist, and that write typechecked and then panicked. The
 compiled backend refuses the shape by name for now (§11), so it is one of the
 places the two engines differ in what they accept rather than in what they do.
 
+Anywhere on the path, not only at the root. A node held in a list or in a
+struct field is the ordinary Tier 2 arena — `[T-REF-GENERATIONAL]` names
+storing a reference in a struct, a list or a map as the reason the tier
+exists — and `rs[0].v = 5` typechecked and then panicked `cannot access field
+'v' of 'ref#0.0'`, while reading the identical path worked. The container's
+mutability is not the question either, for the same reason the root's is not:
+a `[ref N]` parameter cannot be declared `var` at all, so the demand had no
+answer.
+
 **[T-REF-CAPTURE]** A captured `ref` may be written through inside a closure.
 [T-CAPTURE-WRITE] refuses writing to a captured binding because a closure
 captures *values*, so the write would land in a copy nobody can see — a
@@ -7493,44 +7502,36 @@ fn main() {
 ```grasm
 //! tag: T-REF-WRITE
 //! expect: output
-//! ababa
-//! 42 [7] 43
-// Writing through a reference, which is what makes a graph a graph.
+//! 1 2
+//! 5 9
+//! 6 [7]
+// A reference is written through the same way it is read through.
 //
-// This typechecked and panicked at run time, so a `ref` graph was write-once:
-// closing a cycle needs one write after both nodes exist, and there was no
-// way to make it. An evaluation building a real object graph had to keep every
-// mutable edge in a `Map[str, [ref Cell]]` keyed by name — the arena-of-indices
-// pattern this tier exists to replace. The spec's own [T-REF-GENERATIONAL]
-// program built its "cycle" out of `next: i64` indices for the same reason,
-// which is how the gap stayed invisible.
-//
-// The binding's own mutability is not the question: writing *through* a
-// reference does not modify the reference. `let` is right here.
-type Node = { name: str, out: [ref Node] }
-type Counter = { n: i64, hits: [i64] }
+// The binding's own mutability is not the question — writing through a
+// reference does not modify the reference — and neither is the mutability of
+// whatever *holds* it. Only a reference at the root of the path was handled,
+// so a node in a list and a node in a struct field, which is what a graph is
+// made of, typechecked and then panicked `cannot access field of ref#0.0`.
+type Node = { v: i64, kids: [i64] }
+
+type Holder = { r: ref Node }
+
+fn bump(rs: [ref Node]) {
+    rs[0].v = rs[0].v + 1
+}
 
 fn main() {
-    let a = ref(Node{ name: "a", out: [] })
-    let b = ref(Node{ name: "b", out: [a] })
-    // The write that closes the cycle.
-    a.out.push(b)
-    var at = a
-    var walk = ""
-    for step in 0..5 {
-        walk = walk + at.name
-        at = at.out[0]
-    }
-    print("{walk}")
-
-    // Assignment, a mutating method, and a compound assignment, all through
-    // an immutably-bound reference.
-    let c = ref(Counter{ n: 1, hits: [] })
-    c.n = 42
-    let first = c.n
-    c.hits.push(7)
-    c.n += 1
-    print("{first} {c.hits} {c.n}")
+    // `let`, not `var`: nothing on the way to the referent is modified.
+    let rs = [ref(Node{ v: 1, kids: [] })]
+    let h = Holder{ r: ref(Node{ v: 2, kids: [] }) }
+    print("{rs[0].v} {h.r.v}")
+    rs[0].v = 5
+    h.r.v = 9
+    print("{rs[0].v} {h.r.v}")
+    // Through a parameter, where `var` is not even expressible.
+    bump(rs)
+    h.r.kids.push(7)
+    print("{rs[0].v} {h.r.kids}")
 }
 ```
 
