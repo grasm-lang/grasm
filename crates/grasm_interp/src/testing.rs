@@ -403,12 +403,37 @@ pub struct TestSummary {
 pub fn render_inputs(inputs: &[(String, Value)]) -> String {
     inputs
         .iter()
-        .map(|(n, v)| match v {
-            Value::Str(s) => format!("{n} = {s:?}"),
-            other => format!("{n} = {other}"),
-        })
+        .map(|(n, v)| format!("{n} = {}", quoted(v)))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// A value with its strings quoted, at any depth.
+///
+/// `print` renders a string as its contents, which is right for output and
+/// wrong here: a failing property reporting `xs = []` when the input was
+/// `[""]` names a value that *satisfies* the property. A counterexample is
+/// read as data, so it is shown as data.
+fn quoted(v: &Value) -> String {
+    match v {
+        Value::Str(s) => format!("{s:?}"),
+        Value::List(items) => {
+            let parts: Vec<String> = items.iter().map(quoted).collect();
+            format!("[{}]", parts.join(", "))
+        }
+        Value::Tuple(items) => {
+            let parts: Vec<String> = items.iter().map(quoted).collect();
+            format!("({})", parts.join(", "))
+        }
+        Value::Map(entries) => {
+            let parts: Vec<String> = entries
+                .iter()
+                .map(|(k, val)| format!("{}: {}", quoted(&k.to_value()), quoted(val)))
+                .collect();
+            format!("{{{}}}", parts.join(", "))
+        }
+        other => format!("{other}"),
+    }
 }
 
 impl<W: Write> Interp<'_, W> {

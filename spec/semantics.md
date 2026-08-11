@@ -332,6 +332,13 @@ several cores, and returns the results in **input order**. The result does not
 depend on how many cores ran it — including one — so a `par_map` is
 interchangeable with a `map` in every observable way.
 
+Any list, however it was built. A compiled backend may store a list of
+scalars as raw words, chosen from the static type — and a runtime producer
+that builds a boxed list for the same type must not change what the program
+computes. `m.values().par_map(f)` built and then panicked `par_map on a
+non-scalar list` where `grasm run` answered, which is a miscompile rather than
+the refusal §11 promises.
+
 **[E-PAR-FAIL]** A `par_map` or `par_filter` whose closure fails produces the
 failure, exactly as the `map` or `filter` written in its place would. Because
 the result never depends on how many cores ran it, an implementation is free to

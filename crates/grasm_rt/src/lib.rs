@@ -885,6 +885,32 @@ thread_local! {
 /// # Safety
 /// `code` is a compiler-emitted function pointer; `env` points to `env_len`
 /// readable i64s; `list` is a live scalar list.
+/// A list of scalars as machine words, whichever representation holds it.
+///
+/// The backend picks a representation from the *static* type, so a `[i64]` is
+/// normally a `ListScalar`. A few runtime producers build a boxed list even
+/// for scalar elements — `Map.values()` is one — and every other operation
+/// copes with both, so the parallel ones assuming the scalar form was a
+/// miscompile rather than a refusal: `m.values().par_map(f)` built and then
+/// panicked `par_map on a non-scalar list`, while `grasm run` answered.
+///
+/// # Safety: `list` is a live list this runtime allocated.
+unsafe fn scalar_words(list: *mut RtVal, what: &str) -> Vec<i64> {
+    match &(*list).payload {
+        RtPayload::ListScalar { data, .. } => data.iter().collect(),
+        RtPayload::List(items) => items
+            .iter()
+            .map(|&p| match &(*p).payload {
+                RtPayload::I64(v) => *v,
+                RtPayload::F64(v) => v.to_bits() as i64,
+                RtPayload::Bool(b) => i64::from(*b),
+                _ => rt_panic(&format!("{what} on a list of non-scalars")),
+            })
+            .collect(),
+        _ => rt_panic(&format!("{what} on a non-list")),
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn grasm_par_map_scalar(
     list: *mut RtVal,
@@ -893,18 +919,29 @@ pub unsafe extern "C" fn grasm_par_map_scalar(
     env_len: i64,
     out_kind: i64,
 ) -> *mut RtVal {
-    let RtPayload::ListScalar { data, .. } = &(*list).payload else {
-        grasm_panic_msg_str("par_map on a non-scalar list");
-    };
     // Workers operate on machine words. Word-backed input is used directly;
-    // only byte-backed (bool) input needs materializing, so the common case
-    // does not pay for a copy of the whole list.
-    let widened: Option<Vec<i64>> = match data {
-        ScalarData::Words(_) => None,
-        ScalarData::Bytes(_) => Some(data.iter().collect()),
+    // anything else — a byte-backed bool list, or a boxed list from a
+    // producer like `Map.values()` — is materialized first.
+    let is_words = matches!(
+        &(*list).payload,
+        RtPayload::ListScalar {
+            data: ScalarData::Words(_),
+            ..
+        }
+    );
+    let widened: Option<Vec<i64>> = if is_words {
+        None
+    } else {
+        Some(scalar_words(list, "par_map"))
     };
-    let words: &[i64] = match (data, &widened) {
-        (ScalarData::Words(v), _) => v,
+    let words: &[i64] = match (&(*list).payload, &widened) {
+        (
+            RtPayload::ListScalar {
+                data: ScalarData::Words(v),
+                ..
+            },
+            _,
+        ) => v,
         (_, Some(v)) => v,
         _ => unreachable!(),
     };
@@ -1063,16 +1100,37 @@ pub unsafe extern "C" fn grasm_par_filter_scalar(
     env: *const i64,
     env_len: i64,
 ) -> *mut RtVal {
-    let RtPayload::ListScalar { kind, data } = &(*list).payload else {
-        grasm_panic_msg_str("par_filter on a non-scalar list");
+    // As in `par_map`: the representation follows the static type, and a
+    // boxed list of scalars is materialized rather than refused.
+    let kind = match &(*list).payload {
+        RtPayload::ListScalar { kind, .. } => *kind,
+        RtPayload::List(items) => match items.first().map(|&p| &(*p).payload) {
+            Some(RtPayload::F64(_)) => ScalarKind::F64,
+            Some(RtPayload::Bool(_)) => ScalarKind::Bool,
+            _ => ScalarKind::I64,
+        },
+        _ => grasm_panic_msg_str("par_filter on a non-list"),
     };
-    let kind = *kind;
-    let widened: Option<Vec<i64>> = match data {
-        ScalarData::Words(_) => None,
-        ScalarData::Bytes(_) => Some(data.iter().collect()),
+    let is_words = matches!(
+        &(*list).payload,
+        RtPayload::ListScalar {
+            data: ScalarData::Words(_),
+            ..
+        }
+    );
+    let widened: Option<Vec<i64>> = if is_words {
+        None
+    } else {
+        Some(scalar_words(list, "par_filter"))
     };
-    let words: &[i64] = match (data, &widened) {
-        (ScalarData::Words(v), _) => v,
+    let words: &[i64] = match (&(*list).payload, &widened) {
+        (
+            RtPayload::ListScalar {
+                data: ScalarData::Words(v),
+                ..
+            },
+            _,
+        ) => v,
         (_, Some(v)) => v,
         _ => unreachable!(),
     };

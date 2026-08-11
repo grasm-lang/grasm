@@ -1,0 +1,30 @@
+//! tag: E-PAR-VALUES
+//! expect: output
+//! [6, 8]
+//! [4]
+//! [3.0, 5.0]
+//! [true]
+// A parallel operation works on any list, however the list was built.
+//
+// The compiled backend picks a representation from the *static* type, so a
+// `[i64]` is normally stored as raw words. `Map.values()` builds a boxed list
+// even when its elements are scalars, and every other operation copes with
+// both — `sum`, `sort`, indexing, `fold`, `map`, `filter`, `==`. The parallel
+// ones did not, so this built and then panicked `par_map on a non-scalar
+// list` while `grasm run` answered correctly: a miscompile, where §11
+// promises a refusal by name at build time.
+fn main() {
+    var m: Map[str, i64] = {}
+    m.set("a", 3)
+    m.set("b", 4)
+    print("{m.values().par_map(|x| x * 2)}")
+    print("{m.values().par_filter(|x| x > 3)}")
+    var f: Map[str, f64] = {}
+    f.set("a", 1.5)
+    f.set("b", 2.5)
+    print("{f.values().par_map(|x| x * 2.0)}")
+    var b: Map[str, bool] = {}
+    b.set("a", true)
+    b.set("b", false)
+    print("{b.values().par_filter(|x| x)}")
+}

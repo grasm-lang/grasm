@@ -162,7 +162,6 @@ impl MapKey {
 /// reference — so it is computed once and kept. It also answers whether the
 /// text is ASCII, since that is exactly "as many characters as bytes", which
 /// is what makes `code_at(i)` an index rather than a walk.
-#[derive(Debug)]
 pub struct GStr {
     s: String,
     /// `u32::MAX` until asked for.
@@ -232,6 +231,17 @@ impl Ord for GStr {
 impl std::fmt::Display for GStr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.s)
+    }
+}
+
+/// Debug is the string's own, not this wrapper's.
+///
+/// The derived one put `GStr { s: "aaa", chars: Cell { value: 3 } }` into a
+/// property test's counterexample — a Rust type in a Grasm programmer's
+/// terminal.
+impl std::fmt::Debug for GStr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.s)
     }
 }
 

@@ -1863,6 +1863,22 @@ declaration into the region, or compute a number and yield that",
     /// ([T-REGION-REF]).
     fn infer_expr(&mut self, e: &Expr) -> Type {
         let t = self.infer_expr_inner(e);
+        // A closure written *here* can only capture what a region already
+        // allows. One that arrived from outside carries its captures, and
+        // running it inside the region is how what the region allocated gets
+        // out — whether it arrives by name, in a struct field, a list, a
+        // tuple, a map or an `Option` ([T-REGION-FOREIGN]).
+        if self.region_depth > 0
+            && !matches!(e, Expr::Closure { .. })
+            && self.carries_fn(&t)
+        {
+            self.error_help(
+                e.span(),
+                "a function value cannot be used inside a region",
+                "a function written outside the region carries its captures, so what the region allocates could be kept — write the closure inside the region, or move the call out",
+            );
+            return Type::Error;
+        }
         if self.region_depth > 0 && self.carries_ref(&t) {
             self.error_help(
                 e.span(),
