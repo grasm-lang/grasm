@@ -1,6 +1,7 @@
 //! tag: T-OK-ERR-RETURN
 //! expect: output
 //! 1 -1
+//! 2 -1
 //! 1 -1
 // `Ok(v)` and `Err(e)` in a fallible function's own return position.
 //
@@ -28,7 +29,17 @@ fn held(b: bool) -> Cell {
     }
 }
 
+/// The same from an early `return`, which is how an exit mid-function is
+/// written — and the one place the constructors did not work.
+fn early(b: bool) -> i64 ! E {
+    if b {
+        return Ok(2)
+    }
+    return Err(E{ m: "no" })
+}
+
 fn main() {
     print("{tail(true) ?? 0 - 1} {tail(false) ?? 0 - 1}")
+    print("{early(true) ?? 0 - 1} {early(false) ?? 0 - 1}")
     print("{held(true) ?? 0 - 1} {held(false) ?? 0 - 1}")
 }

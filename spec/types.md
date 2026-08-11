@@ -409,6 +409,11 @@ half — the ordinary case, wrapped in `Ok` on the way out — or the whole
 so the constructors worked everywhere a fallible value could be *stored* and
 nowhere one was *produced*.
 
+`return` takes either half too. Only the tail expression was taught this, so
+`return Ok(1)` was "this expression can fail but `i64` is required" — a
+message about the wrong problem, in the shape early exits are written in, and
+the workaround was to rewrite every one of them as `fail`.
+
 **[T-FALLIBLE-VALUE]** A function's `! E` is part of what it answers with, so
 it travels with the function *as a value*: `risky` referenced by name has type
 `fn(A) -> T ! E`, not `fn(A) -> T`. Passing it where a plain function is

@@ -525,7 +525,10 @@ test "doubling is monotonic" ... FAILED on case 5 of 100
 
 That number is exactly the smallest `n` where `n * 2` wraps.
 
-`grasm test --coverage` reports which statement lines the suite reached.
+`grasm test --coverage` reports which statement lines the suite reached —
+counting the lines that doc examples reach, since those are tests too. It did
+not, so a function reached *only* by its own documented example was reported
+uncovered while the suite had just run it.
 `bench "name" { ... }` bodies are warmed up, then sampled, and `grasm bench`
 reports time per operation, in whatever unit keeps the figure readable.
 

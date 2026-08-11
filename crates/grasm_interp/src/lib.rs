@@ -281,13 +281,20 @@ fn test_program_here(
         }
     }
 
-    let coverage = interp
-        .take_coverage()
-        .map(|hits| build_coverage(program, &hits));
+    let unit_hits = interp.take_coverage();
 
     // Examples in `///` comments are tests. Documentation that stops being
     // true should fail the suite, not quietly mislead the next reader.
-    let (doc_passed, doc_failed) = run_doc_examples(program, &opts.filter, out);
+    let (doc_passed, doc_failed, doc_hits) =
+        run_doc_examples(program, &opts.filter, out, opts.coverage);
+    // Their lines count as covered. They run in their own interpreter — each
+    // example is its own program — so their hits were dropped, and a function
+    // reached *only* by its documented example was reported uncovered even
+    // though the suite had just run it.
+    let coverage = unit_hits.map(|mut hits| {
+        hits.extend(doc_hits);
+        build_coverage(program, &hits)
+    });
     testing::TestSummary {
         passed: passed + doc_passed,
         failed: failed + doc_failed,
@@ -303,9 +310,11 @@ fn run_doc_examples(
     program: &grasm_sema::loader::Program,
     filter: &str,
     out: &mut impl Write,
-) -> (u32, u32) {
+    coverage: bool,
+) -> (u32, u32, std::collections::BTreeSet<u32>) {
     let mut passed = 0;
     let mut failed = 0;
+    let mut hits: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
     for example in grasm_sema::docs::examples(program) {
         if !filter.is_empty() && !example.owner.contains(filter) {
             continue;
@@ -334,6 +343,9 @@ fn run_doc_examples(
             let a = grasm_sema::check::check_program(&ex_program);
             interp.set_float_literals(a.float_literals);
             interp.set_float_sums(a.float_sums);
+            if coverage {
+                interp.enable_coverage();
+            }
             // By name, not by position. `example_program` inlines the
             // documented module's own declarations — its tests included — and
             // appends the example after them, so taking the *first* test ran
@@ -348,7 +360,11 @@ fn run_doc_examples(
                 failed += 1;
                 continue;
             };
-            interp.run_unit_test(t)
+            let ok = interp.run_unit_test(t);
+            if let Some(h) = interp.take_coverage() {
+                hits.extend(h);
+            }
+            ok
         };
         // The example's own report names it as a test; relabel so a reader can
         // tell a doc example from a declared one.
@@ -364,7 +380,7 @@ fn run_doc_examples(
             failed += 1;
         }
     }
-    (passed, failed)
+    (passed, failed, hits)
 }
 
 /// Maps executed span offsets back to (file, line), against every line that

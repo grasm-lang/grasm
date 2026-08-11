@@ -774,6 +774,11 @@ half — the ordinary case, wrapped in `Ok` on the way out — or the whole
 so the constructors worked everywhere a fallible value could be *stored* and
 nowhere one was *produced*.
 
+`return` takes either half too. Only the tail expression was taught this, so
+`return Ok(1)` was "this expression can fail but `i64` is required" — a
+message about the wrong problem, in the shape early exits are written in, and
+the workaround was to rewrite every one of them as `fail`.
+
 **[T-FALLIBLE-VALUE]** A function's `! E` is part of what it answers with, so
 it travels with the function *as a value*: `risky` referenced by name has type
 `fn(A) -> T ! E`, not `fn(A) -> T`. Passing it where a plain function is
@@ -2434,7 +2439,10 @@ test "doubling is monotonic" ... FAILED on case 5 of 100
 
 That number is exactly the smallest `n` where `n * 2` wraps.
 
-`grasm test --coverage` reports which statement lines the suite reached.
+`grasm test --coverage` reports which statement lines the suite reached —
+counting the lines that doc examples reach, since those are tests too. It did
+not, so a function reached *only* by its own documented example was reported
+uncovered while the suite had just run it.
 `bench "name" { ... }` bodies are warmed up, then sampled, and `grasm bench`
 reports time per operation, in whatever unit keeps the figure readable.
 
@@ -7335,6 +7343,7 @@ fn main() {
 //! tag: T-OK-ERR-RETURN
 //! expect: output
 //! 1 -1
+//! 2 -1
 //! 1 -1
 // `Ok(v)` and `Err(e)` in a fallible function's own return position.
 //
@@ -7362,8 +7371,18 @@ fn held(b: bool) -> Cell {
     }
 }
 
+/// The same from an early `return`, which is how an exit mid-function is
+/// written — and the one place the constructors did not work.
+fn early(b: bool) -> i64 ! E {
+    if b {
+        return Ok(2)
+    }
+    return Err(E{ m: "no" })
+}
+
 fn main() {
     print("{tail(true) ?? 0 - 1} {tail(false) ?? 0 - 1}")
+    print("{early(true) ?? 0 - 1} {early(false) ?? 0 - 1}")
     print("{held(true) ?? 0 - 1} {held(false) ?? 0 - 1}")
 }
 ```

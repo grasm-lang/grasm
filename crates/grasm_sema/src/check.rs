@@ -1306,7 +1306,23 @@ closing brace — yield a number from the region and return that",
                 let ret = self.fn_ret.clone();
                 match value {
                     Some(e) => {
-                        self.check_expr(e, &ret);
+                        // A fallible function's `return` takes either half,
+                        // exactly as its tail expression does ([T-OK-ERR-RETURN]).
+                        // Only the tail was taught this, so `return Ok(1)` was
+                        // "this expression can fail but `i64` is required" —
+                        // a message pointing at the wrong problem, in the
+                        // shape early exits are written in.
+                        let wrapped = matches!(e, Expr::Call { callee, .. }
+                            if matches!(&**callee, Expr::Ident(id)
+                                if id.name == "Ok" || id.name == "Err"));
+                        match (wrapped, self.fn_err.clone()) {
+                            (true, Some(err)) => {
+                                let whole =
+                                    Type::Fallible(Box::new(ret.clone()), Box::new(err));
+                                self.check_expr(e, &whole);
+                            }
+                            _ => self.check_expr(e, &ret),
+                        }
                     }
                     None => {
                         if self.uni.shallow_resolve(&ret) != Type::Unit {
