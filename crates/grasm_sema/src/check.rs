@@ -370,20 +370,61 @@ impl Checker {
             }
         }
         // Pass 2: aliases (non-recursive), then bodies.
-        for decl in &module.decls {
-            if let Decl::Type(t) = decl {
-                if let TypeBody::Alias(te) = &t.body {
-                    let generics: Vec<String> = t.generics.iter().map(|g| g.name.clone()).collect();
-                    let ty = self.resolve_type(te, &generics);
-                    if !t.generics.is_empty() {
-                        self.error(
-                            t.name.span,
-                            "generic type aliases are not supported yet".to_string(),
-                        );
-                    }
-                    self.aliases.insert(t.name.name.clone(), ty);
+        //
+        // To a fixpoint, because an alias may name a later one. Resolving in
+        // declaration order made `type Name = Text` above `type Text = str`
+        // an "unknown type `Text`" that swapping the two lines fixed, while
+        // an alias to a later *struct* worked — so [G-DECL-ORDER]'s "forward
+        // references are permitted" held everywhere but here.
+        let aliases: Vec<(&Ident, &TypeExpr, Vec<String>)> = module
+            .decls
+            .iter()
+            .filter_map(|d| match d {
+                Decl::Type(t) => match &t.body {
+                    TypeBody::Alias(te) => Some((
+                        &t.name,
+                        te,
+                        t.generics.iter().map(|g| g.name.clone()).collect(),
+                    )),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        for (name, _, generics) in &aliases {
+            if !generics.is_empty() {
+                self.error(
+                    name.span,
+                    "generic type aliases are not supported yet".to_string(),
+                );
+            }
+        }
+        let mut todo: Vec<usize> = (0..aliases.len()).collect();
+        loop {
+            let before = todo.len();
+            let mut still: Vec<usize> = Vec::new();
+            for &i in &todo {
+                let (name, te, generics) = &aliases[i];
+                let mark = self.diags.len();
+                let ty = self.resolve_type(te, generics);
+                if self.diags.len() > mark {
+                    // Not resolvable yet; it may name an alias not seen.
+                    self.diags.truncate(mark);
+                    still.push(i);
+                } else {
+                    self.aliases.insert(name.name.clone(), ty);
                 }
             }
+            todo = still;
+            if todo.is_empty() || todo.len() == before {
+                break;
+            }
+        }
+        // Whatever is left really is unknown; report it properly.
+        for &i in &todo {
+            let (name, te, generics) = &aliases[i];
+            let ty = self.resolve_type(te, generics);
+            self.aliases.insert(name.name.clone(), ty);
         }
         self.pending_type_bodies.push((self.current_module.clone(), ids));
     }
@@ -913,7 +954,30 @@ land in a copy the caller never sees — return the new value from the operation
         // the declared return type rather than inferred and compared after.
         // A fallible function's body may also produce the whole `T ! E`, and
         // that is decided below, so it is not pushed down here.
-        let want_tail = if self.fn_err.is_none() && ret != Type::Unit {
+        // A fallible function's body may produce either the ok half or the
+        // whole `T ! E`, so the tail is only pushed the ok half when it
+        // cannot be the whole thing — a literal, or a container of them.
+        // Skipping the push entirely meant `fn a() -> f64 ! E { 3 }` was
+        // refused while `{ return 3 }` and `let x: f64 ! E = Ok(3)` were
+        // accepted: [T-INT-TO-FLOAT-CARRIED] survived, one `! E` away.
+        let tail_is_literal = matches!(
+            f.body.stmts.last(),
+            Some(Stmt::Expr(
+                Expr::Int(..) | Expr::Float(..) | Expr::List(..) | Expr::Tuple(..) | Expr::Map(..)
+            ))
+        );
+        // `Ok(3)` / `Err(e)` in tail position build the *whole* `T ! E`, so
+        // that is what reaches them ([T-OK-ERR]).
+        let tail_is_wrapper = matches!(
+            f.body.stmts.last(),
+            Some(Stmt::Expr(Expr::Call { callee, .. }))
+                if matches!(&**callee, Expr::Ident(id) if id.name == "Ok" || id.name == "Err")
+        );
+        let want_tail = if ret == Type::Unit {
+            None
+        } else if let (true, Some(e)) = (tail_is_wrapper, self.fn_err.clone()) {
+            Some(Type::Fallible(Box::new(ret.clone()), Box::new(e)))
+        } else if self.fn_err.is_none() || tail_is_literal {
             Some(ret.clone())
         } else {
             None
@@ -1906,10 +1970,19 @@ afterwards has nowhere to send the effect — call it here, or return what it co
         // tuple, `Some`, `Ok`, an `if`, or a `match`, each of which reported
         // a type error about a program the clause says is well typed.
         match (e, &want) {
-            (Expr::List(items, _), Type::List(elem)) => {
+            (Expr::List(items, span), Type::List(elem)) => {
                 let elem = (**elem).clone();
                 for it in items {
                     self.check_expr(it, &elem);
+                }
+                // Recorded here too. This path returns before `infer_expr`
+                // ever sees the literal, so an empty one pushed a type into
+                // was known to the checker and not handed to the backend:
+                // `log = []` after `var log: [str] = []`, `{"a": []}`,
+                // `([], "x")` and `if c { [] } else { … }` all checked and ran
+                // and could not be built ([T-EMPTY-LIT]).
+                if items.is_empty() {
+                    self.empty_lits.push((span.start, elem));
                 }
                 return;
             }
@@ -1920,11 +1993,15 @@ afterwards has nowhere to send the effect — call it here, or return what it co
                 }
                 return;
             }
-            (Expr::Map(entries, _), Type::Map(k, v)) => {
+            (Expr::Map(entries, span), Type::Map(k, v)) => {
                 let (k, v) = ((**k).clone(), (**v).clone());
                 for (ke, ve) in entries {
                     self.check_expr(ke, &k);
                     self.check_expr(ve, &v);
+                }
+                if entries.is_empty() {
+                    self.empty_lits
+                        .push((span.start, Type::Map(Box::new(k), Box::new(v))));
                 }
                 return;
             }

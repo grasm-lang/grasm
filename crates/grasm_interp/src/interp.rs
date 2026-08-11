@@ -133,6 +133,13 @@ enum Seg {
 /// `None` when the path holds no reference, or when it cannot be followed —
 /// the ordinary walk reports that, with its own message.
 fn deepest_ref(root: &Value, segs: &[Seg]) -> Option<(usize, u32, u32)> {
+    // With no path to walk, `r = other` rebinds the *variable*; it does not
+    // write through the reference, so a released one is not touched and the
+    // liveness question does not arise. Asking it anyway made
+    // `release(r)  r = ref(…)` panic in the interpreter and succeed compiled.
+    if segs.is_empty() {
+        return None;
+    }
     let mut cur = root;
     let mut found: Option<(usize, u32, u32)> = None;
     for (i, seg) in segs.iter().enumerate() {
@@ -1647,8 +1654,25 @@ build links it, `grasm run` can only reach what is already loaded",
                                 // The generation moves whether or not anything
                                 // was there, so every reference taken before
                                 // this stops matching.
-                                self.slab[idx].1 = self.slab[idx].1.wrapping_add(1);
-                                self.slab_free.push(i);
+                                //
+                                // A generation is 32 bits, and wrapping it
+                                // would hand a slot's *identity* back: after
+                                // 2^32 release/allocate cycles a reference
+                                // released at the start of the program was
+                                // reported alive, read the current occupant's
+                                // value, and compared equal to a live one —
+                                // the use-after-free [T-REF-STALE] exists to
+                                // rule out. So a slot whose generation cannot
+                                // advance is retired instead of reused: it
+                                // never has a new occupant, so nothing can
+                                // ever match a reference to it again.
+                                match self.slab[idx].1.checked_add(1) {
+                                    Some(next) => {
+                                        self.slab[idx].1 = next;
+                                        self.slab_free.push(i);
+                                    }
+                                    None => {}
+                                }
                             }
                         }
                         return Ok(Value::Unit);
@@ -2358,14 +2382,22 @@ build links it, `grasm run` can only reach what is already loaded",
             }
             (Value::List(items), "sum") => {
                 let mut int_sum = 0i64;
-                let mut float_sum = 0f64;
+                // Folded from the first element, not from a `+0.0` seed:
+                // `-0.0 + -0.0` is `-0.0` under IEEE-754, and seeding with
+                // `+0.0` turned it into `+0.0`. `-0.0` is an observable
+                // rendering ([L-DISPLAY]), so the two engines printed
+                // different answers for `[-0.0].sum()` ([E-ARITH-FLOAT]).
+                let mut float_sum: Option<f64> = None;
                 let mut is_float = false;
                 for item in items.iter() {
                     match item {
                         Value::Int(i) => int_sum += i,
                         Value::Float(f) => {
                             is_float = true;
-                            float_sum += f;
+                            float_sum = Some(match float_sum {
+                                Some(acc) => acc + f,
+                                None => *f,
+                            });
                         }
                         other => {
                             return Err(Flow::Panic(format!("cannot sum `{other}`")))
@@ -2379,7 +2411,11 @@ build links it, `grasm run` can only reach what is already loaded",
                 // 0` the moment the caller used the `f64` it had been
                 // promised — the documented deviation this closes.
                 if is_float || self.float_sums.contains(&name.span.start) {
-                    Value::Float(float_sum + int_sum as f64)
+                    match float_sum {
+                        Some(f) if int_sum == 0 => Value::Float(f),
+                        Some(f) => Value::Float(f + int_sum as f64),
+                        None => Value::Float(int_sum as f64),
+                    }
                 } else {
                     Value::Int(int_sum)
                 }

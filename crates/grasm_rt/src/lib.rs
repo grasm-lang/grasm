@@ -2472,8 +2472,21 @@ pub extern "C" fn grasm_ref_release(r: i64) {
         let v = s.slots[idx].take();
         // The generation moves whether or not anything was there, so a
         // reference taken before this can never match again.
-        s.gens[idx] = s.gens[idx].wrapping_add(1);
-        s.free.push(i);
+        //
+        // A generation is 32 bits — a reference is one machine word, index and
+        // generation packed together — and wrapping it would hand a slot's
+        // identity back. After 2^32 release/allocate cycles, reachable in
+        // eleven minutes here, a reference released at the start of the
+        // program read the current occupant's value and compared equal to a
+        // live one. A slot whose generation cannot advance is retired instead
+        // of reused: with no new occupant, nothing can match it again.
+        match s.gens[idx].checked_add(1) {
+            Some(next) => {
+                s.gens[idx] = next;
+                s.free.push(i);
+            }
+            None => {}
+        }
         v
     };
     if let Some(p) = taken {
