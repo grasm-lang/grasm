@@ -4553,8 +4553,20 @@ impl FnCx<'_, '_> {
             self.b.def_var(var, updated);
             return Ok(None);
         }
+        // A module alias is not a receiver: `bag.push(xs, 7)` is a call to
+        // that module's `push`, not a list push. Treating every `push` as the
+        // builtin refused it as "push on unknown variable" — which names
+        // neither the construct nor the fix, and made the *name* of a `pub fn`
+        // decide whether a package could be built natively.
+        let via_module = matches!(recv, Expr::Ident(tid)
+            if self.lookup(&tid.name).is_none()
+                && self
+                    .cg
+                    .module_imports
+                    .get(&self.cg.current_module)
+                    .is_some_and(|m| m.contains_key(&tid.name)));
         // Mutating list push on a variable.
-        if name.name == "push" {
+        if name.name == "push" && !via_module {
             let Expr::Ident(id) = recv else {
                 return nope(span, "push on non-variable receivers");
             };
@@ -7017,9 +7029,16 @@ impl FnCx<'_, '_> {
                     // all, so a void callback could not be passed anywhere.
                     if matches!(
                         id.name.as_str(),
-                        "print" | "assert" | "assert_eq" | "exit" | "panic"
+                        "print" | "assert" | "assert_eq" | "exit" | "panic" | "release"
                     ) && self.lookup(&id.name).is_none()
+                        && self.lookup_fn(&id.name).is_none()
                     {
+                        // `release` belongs here too: without it a statement
+                        // `match r { A -> release(r)  B(n) -> release(r) }`
+                        // was refused as "a match whose arms it cannot type",
+                        // advising an annotation that a unit arm has no
+                        // spelling for — and freeing a `ref` tree by matching
+                        // on its shape is the ordinary way to write it.
                         return Ok(VType::Unit);
                     }
                     // And the ones that answer with something. Every builtin
