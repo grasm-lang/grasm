@@ -3448,15 +3448,22 @@ impl FnCx<'_, '_> {
             Stmt::Return(v, _) => {
                 match v {
                     Some(e) => {
-                        let expect = match &self.ret {
-                            VType::Fallible(ok, _) => (**ok).clone(),
-                            other => other.clone(),
+                        // `return Ok(v)` / `return Err(e)` build the *whole*
+                        // `T ! E`, so they are not wrapped again — expecting
+                        // the ok half made the returned value a pointer read
+                        // as an `i64` and printed as one ([T-OK-ERR-RETURN]).
+                        let wrapped = matches!(e, Expr::Call { callee, .. }
+                            if matches!(&**callee, Expr::Ident(id)
+                                if id.name == "Ok" || id.name == "Err"));
+                        let expect = match (&self.ret, wrapped) {
+                            (VType::Fallible(ok, _), false) => (**ok).clone(),
+                            (other, _) => other.clone(),
                         };
                         let (mut val, vt) = self.eval_expr_expecting(e, Some(&expect))?;
                         if self.ret == VType::F64 && vt == VType::I64 {
                             val = self.b.ins().fcvt_from_sint(types::F64, val);
                         }
-                        if let VType::Fallible(ok_t, _) = self.ret.clone() {
+                        if let (VType::Fallible(ok_t, _), false) = (self.ret.clone(), wrapped) {
                             let mut inner = val;
                             if *ok_t == VType::F64 && vt == VType::I64 {
                                 inner = self.b.ins().fcvt_from_sint(types::F64, inner);
