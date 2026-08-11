@@ -78,7 +78,9 @@ fn check_modules(files: &[ModuleView]) -> Analysis {
     let mut c = Checker::new();
     // The effect fixpoint runs first: a function's row is part of its type,
     // and nothing can be typed until the rows are known ([T-FN-TYPE-ROW]).
-    c.fn_rows = crate::effects::rows_of_modules(files);
+    let (rows, closure_rows) = crate::effects::rows_and_closures(files);
+    c.fn_rows = rows;
+    c.closure_rows = closure_rows;
     for f in files {
         c.module_imports
             .insert(f.name.clone(), f.imports.clone());
@@ -185,6 +187,8 @@ struct Checker {
     /// before checking. A function's row is part of its type, so this has to
     /// be known before anything is typed.
     fn_rows: HashMap<String, std::collections::BTreeSet<String>>,
+    /// Each closure literal's row, keyed by span. See `rows_and_closures`.
+    closure_rows: HashMap<u32, std::collections::BTreeSet<String>>,
     /// How many `unsafe` blocks enclose the expression being checked.
     unsafe_depth: u32,
     /// How many `region` blocks enclose it.
@@ -280,6 +284,7 @@ impl Checker {
             aliases: HashMap::new(),
             fns: HashMap::new(),
             fn_rows: HashMap::new(),
+            closure_rows: HashMap::new(),
             unsafe_depth: 0,
             tail_fn: None,
             with_floors: Vec::new(),
@@ -2061,7 +2066,32 @@ afterwards has nowhere to send the effect — call it here, or return what it co
             _ => {}
         }
         // Closures check against an expected fn type for param inference.
-        if let (Expr::Closure { .. }, Type::Fn { .. }) = (e, &want) {
+        if let (Expr::Closure { .. }, Type::Fn { row, .. }) = (e, &want) {
+            // The closure's own row must fit the row written on the type it
+            // is going into ([T-FN-TYPE-ROW]). Only the *shape* was compared,
+            // so an effectful closure went into a `fn(i64) -> i64` — a
+            // written empty row — on every route but a direct call argument:
+            // a struct field, a reassignment, a `push`, a `set`, an
+            // index-assign, `Some(...)`, a tuple. A named function was
+            // checked everywhere; only closures leaked.
+            if let (Some(want_row), Some(got_row)) =
+                (row.clone(), self.closure_rows.get(&e.span().start).cloned())
+            {
+                let extra: Vec<&String> = got_row.difference(&want_row).collect();
+                if let Some(first) = extra.first() {
+                    let list = extra
+                        .iter()
+                        .map(|x| format!("`{x}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let _ = first;
+                    self.error_help(
+                        e.span(),
+                        format!("this closure performs {list}, which the expected type does not allow"),
+                        "widen the type's effect row, or move the effect out of the closure",
+                    );
+                }
+            }
             let got = self.infer_closure(e, Some(&want));
             self.unify_or_report(e.span(), &got, &want);
             return;

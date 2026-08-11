@@ -745,6 +745,15 @@ error at the call site. This is the only place a row can be checked rather than
 inferred — a written type has no body to infer from — and without it a function
 value would be a way to carry an effect past a declared row.
 
+A closure literal is checked the same way a named function is. It was not:
+only the shape was compared when a closure met a written function type, so
+`Box{ f: shout }` was refused and `Box{ f: |n| shout(n) }` was accepted — the
+same function, one closure apart. Every consequence followed from that one
+gap: a `/ {}` function printed, `[T-PAR-MAP-PURE]`'s compile-time proof
+passed, a C function reached libc from a declared-empty row, a closure
+carrying a handled effect left its `with` block inside a list, and a package
+declaring `capabilities = []` exported one.
+
 **[T-OK-ERR]** `Ok(v)` and `Err(e)` build a `T ! E` directly. They are the
 constructors matching what `match` already destructures, and without them a
 plain value could not be *put into* a fallible slot at all: `fail` is legal
@@ -6562,21 +6571,29 @@ fn main() {
 ```grasm
 //! tag: T-FN-TYPE-ROW
 //! expect: error
-//! expects a function that performs nothing
-// `fn(i64) -> i64` states the empty row, so a function that prints does not
-// fit it. Without this check a function value would be a way to carry an
-// effect past a declared row — which is exactly what it used to be.
-fn shout(n: i64) -> i64 {
+//! this closure performs `io`, which the expected type does not allow
+// A closure's row is part of its type, wherever the type comes from.
+//
+// Only the *shape* was compared when a closure literal met a written function
+// type, so an effectful closure went into a `fn(i64) -> i64` — a written
+// empty row — on every route except a direct call argument: a struct field,
+// a reassignment, a `push`, a `set`, an index write, `Some(...)`, a tuple.
+// A named function was checked everywhere, so `f: shout` was refused and
+// `f: |n| shout(n)` was not — the same function, one closure apart.
+type Box = { f: fn(i64) -> i64 }
+
+fn noisy(n: i64) -> i64 {
     print("{n}")
     n
 }
 
-fn apply(f: fn(i64) -> i64, x: i64) -> i64 {
+fn pure_apply(f: fn(i64) -> i64, x: i64) -> i64 / {} {
     f(x)
 }
 
 fn main() {
-    print("{apply(shout, 1)}")
+    let b = Box{ f: |n| noisy(n) }
+    print("{pure_apply(b.f, 1)}")
 }
 ```
 

@@ -503,9 +503,165 @@ fn solve_fn_rows(ctx: &mut Ctx) {
 /// ([T-FN-TYPE-ROW]). It is the same fixpoint `check_effects_multi` runs, with
 /// no diagnostics — those stay in one place, reported once.
 pub fn rows_of_modules(files: &[ModuleView]) -> HashMap<String, BTreeSet<String>> {
+    rows_and_closures(files).0
+}
+
+/// Function rows, and the row of every closure *literal* in the program.
+///
+/// A closure's row is part of its type just as a named function's is
+/// ([T-FN-TYPE-ROW]), and the checker needs it to compare against the type a
+/// closure is being stored into. Without it, `Box{ f: |n| noisy(n) }` went
+/// into a `fn(i64) -> i64` — a written *empty* row — and everything
+/// downstream believed the field performed nothing: a `/ {}` function
+/// printed, `par_map`'s purity proof passed, a C function reached libc, and a
+/// closure carrying a handled effect left its `with` block inside a list.
+/// A named function was checked on every route; only closures leaked.
+pub fn rows_and_closures(
+    files: &[ModuleView],
+) -> (
+    HashMap<String, BTreeSet<String>>,
+    HashMap<u32, BTreeSet<String>>,
+) {
     let mut ctx = build_ctx(files);
     solve_rows(&mut ctx);
-    ctx.rows
+    let closures = compute_closure_rows(&ctx);
+    (ctx.rows, closures)
+}
+
+/// The row of every closure literal, keyed by its span.
+fn compute_closure_rows(ctx: &Ctx) -> HashMap<u32, BTreeSet<String>> {
+    let mut out = HashMap::new();
+    let keys: Vec<String> = ctx.fns.keys().cloned().collect();
+    for key in keys {
+        let f = ctx.fns[&key];
+        let current = key.rsplit_once("::").map(|(m, _)| m).unwrap_or("main").to_string();
+        let mut lits: Vec<&Expr> = Vec::new();
+        collect_closure_lits_inner(&f.body, &mut lits);
+        for lit in lits {
+            let Expr::Closure { body, span, .. } = lit else {
+                continue;
+            };
+            let mut row = BTreeSet::new();
+            let mut active = Vec::new();
+            let mut fnb = FnBindings::default();
+            seed_params(&f.params, &mut fnb);
+            collect_fn_bindings(&f.body, ctx, &current, &mut fnb);
+            walk_expr(body, &current, &mut active, ctx, &fnb, &mut row);
+            out.insert(span.start, row);
+        }
+    }
+    out
+}
+
+/// Every closure literal reachable from a block.
+fn collect_closure_lits_inner<'e>(b: &'e Block, out: &mut Vec<&'e Expr>) {
+    for st in &b.stmts {
+        match st {
+            Stmt::Let { init, .. } => collect_closure_lits(init, out),
+            Stmt::Assign { value, target, .. } => {
+                collect_closure_lits(value, out);
+                collect_closure_lits(target, out);
+            }
+            Stmt::Return(Some(e), _) | Stmt::Expr(e) => collect_closure_lits(e, out),
+            Stmt::While { cond, body, .. } => {
+                collect_closure_lits(cond, out);
+                collect_closure_lits_inner(body, out);
+            }
+            Stmt::For { iter, body, .. } => {
+                collect_closure_lits(iter, out);
+                collect_closure_lits_inner(body, out);
+            }
+            Stmt::With { handler, body, .. } => {
+                collect_closure_lits(handler, out);
+                collect_closure_lits_inner(body, out);
+            }
+            Stmt::Parallel { body, .. } | Stmt::Spawn { body, .. } => {
+                collect_closure_lits_inner(body, out)
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_closure_lits<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
+    match e {
+        Expr::Closure { body, .. } => {
+            out.push(e);
+            collect_closure_lits(body, out);
+        }
+        Expr::StructLit { fields, base, .. } => {
+            if let Some(b) = base {
+                collect_closure_lits(b, out);
+            }
+            for (_, v) in fields {
+                collect_closure_lits(v, out);
+            }
+        }
+        Expr::Call { callee, args, .. } => {
+            collect_closure_lits(callee, out);
+            for a in args {
+                collect_closure_lits(a, out);
+            }
+        }
+        Expr::MethodCall { recv, args, .. } => {
+            collect_closure_lits(recv, out);
+            for a in args {
+                collect_closure_lits(a, out);
+            }
+        }
+        Expr::List(items, _) | Expr::Tuple(items, _) => {
+            for i in items {
+                collect_closure_lits(i, out);
+            }
+        }
+        Expr::Map(entries, _) => {
+            for (k, v) in entries {
+                collect_closure_lits(k, out);
+                collect_closure_lits(v, out);
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_closure_lits(lhs, out);
+            collect_closure_lits(rhs, out);
+        }
+        Expr::Unary { expr, .. } | Expr::Try { expr, .. } => collect_closure_lits(expr, out),
+        Expr::Field { recv, .. } => collect_closure_lits(recv, out),
+        Expr::Index { recv, index, .. } => {
+            collect_closure_lits(recv, out);
+            collect_closure_lits(index, out);
+        }
+        Expr::Block(b) | Expr::Unsafe(b) | Expr::Region(b) => collect_closure_lits_inner(b, out),
+        Expr::If {
+            cond,
+            then_block,
+            else_branch,
+            ..
+        } => {
+            collect_closure_lits(cond, out);
+            collect_closure_lits_inner(then_block, out);
+            match else_branch.as_deref() {
+                Some(ElseBranch::Else(b)) => collect_closure_lits_inner(b, out),
+                Some(ElseBranch::ElseIf(inner)) => collect_closure_lits(inner, out),
+                None => {}
+            }
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            collect_closure_lits(scrutinee, out);
+            for a in arms {
+                collect_closure_lits(&a.body, out);
+            }
+        }
+        Expr::Str(pieces, _) => {
+            for p in pieces {
+                if let StrPiece::Expr(i) = p {
+                    collect_closure_lits(i, out);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 pub fn check_effects_multi(files: &[ModuleView]) -> Vec<Diagnostic> {

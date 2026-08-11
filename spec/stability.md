@@ -7,7 +7,7 @@ before it is listed as stable.
 `crates/grasm_spec` fails if a clause here is missing, unknown, or listed twice,
 so this file cannot drift away from the specification it describes.
 
-Today: 114 stable, 75 provisional, 22 experimental, of 211.
+Today: 115 stable, 74 provisional, 22 experimental, of 211.
 
 ## Stable
 
@@ -92,6 +92,7 @@ Will not change incompatibly before 2.0.
 - `T-FALLIBLE` — stable
 - `T-FALLIBLE-UNHANDLED` — stable
 - `T-FIELD-CALL` — stable
+- `T-FN-TYPE-ROW` — stable
 - `T-FN-TYPE-ROW-CARRIED` — stable
 - `T-FN-VALUE-ROW` — stable
 - `T-INFER-LOCAL` — stable
@@ -188,7 +189,6 @@ for "no problem found" to mean anything.
 - `T-FALLIBLE-UNIT` — provisional
 - `T-FALLIBLE-VALUE` — provisional
 - `T-FN-TYPE` — provisional
-- `T-FN-TYPE-ROW` — provisional
 - `T-FN-VALUE` — provisional
 - `T-GENERIC-FN` — provisional
 - `T-GENERIC-INST` — provisional

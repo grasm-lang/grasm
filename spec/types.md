@@ -380,6 +380,15 @@ error at the call site. This is the only place a row can be checked rather than
 inferred — a written type has no body to infer from — and without it a function
 value would be a way to carry an effect past a declared row.
 
+A closure literal is checked the same way a named function is. It was not:
+only the shape was compared when a closure met a written function type, so
+`Box{ f: shout }` was refused and `Box{ f: |n| shout(n) }` was accepted — the
+same function, one closure apart. Every consequence followed from that one
+gap: a `/ {}` function printed, `[T-PAR-MAP-PURE]`'s compile-time proof
+passed, a C function reached libc from a declared-empty row, a closure
+carrying a handled effect left its `with` block inside a list, and a package
+declaring `capabilities = []` exported one.
+
 **[T-OK-ERR]** `Ok(v)` and `Err(e)` build a `T ! E` directly. They are the
 constructors matching what `match` already destructures, and without them a
 plain value could not be *put into* a fallible slot at all: `fail` is legal
