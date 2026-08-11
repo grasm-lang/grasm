@@ -334,8 +334,13 @@ component by component. That is what `<` on tuples means, what `sort` on a
 list of them does, `min`/`max` included, and what makes
 `xs.sort_by(|p| (p.dept, p.age, p.name))` a multi-key sort rather than an
 error. `min` and `max` used to spell out the types they accepted instead of
-asking whether the element was ordered, so `xs.enumerate().min()` — the obvious
-"index of the smallest" — was refused on a list `sort` orders happily.
+asking whether the element was ordered, so `xs.enumerate().min()` was refused
+on a list `sort` orders happily.
+
+That example is worth spelling out, because it does *not* mean "index of the
+smallest": components compare left to right, so `enumerate().min()` compares
+indices first and always answers `(0, xs[0])`. To find the smallest and where
+it was, put the value first — `xs.enumerate().map(|p| (p.1, p.0)).min()`.
 
 ## 5. `Map[K, V]`
 

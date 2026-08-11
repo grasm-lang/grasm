@@ -1136,7 +1136,11 @@ evaluate left to right before the call.
 program, not assignable, and **its initializer may not perform effects**. It
 may call functions and name them as values — a dispatch table
 (`let OPS: Map[str, fn(A) -> B] = {…}`) is what constants are most wanted for
-— and may use constants declared before it. It
+— and may use constants declared before it. The functions in such a table must
+themselves perform nothing, since naming one is the permission to call it
+([T-FN-VALUE-ROW]) and that charge lands on the constant: a table of `io`
+functions has no spelling as a constant, and writing the row on the constant's
+type does not change that. Build one in a function instead. It
 is evaluated wherever the name is used, so an effect in it would happen once
 per mention — which would make how often something happens a property of how
 many times a name appears. That is why the restriction exists rather than
@@ -1877,8 +1881,13 @@ component by component. That is what `<` on tuples means, what `sort` on a
 list of them does, `min`/`max` included, and what makes
 `xs.sort_by(|p| (p.dept, p.age, p.name))` a multi-key sort rather than an
 error. `min` and `max` used to spell out the types they accepted instead of
-asking whether the element was ordered, so `xs.enumerate().min()` — the obvious
-"index of the smallest" — was refused on a list `sort` orders happily.
+asking whether the element was ordered, so `xs.enumerate().min()` was refused
+on a list `sort` orders happily.
+
+That example is worth spelling out, because it does *not* mean "index of the
+smallest": components compare left to right, so `enumerate().min()` compares
+indices first and always answers `(0, xs[0])`. To find the smallest and where
+it was, put the value first — `xs.enumerate().map(|p| (p.1, p.0)).min()`.
 
 ## 5. `Map[K, V]`
 

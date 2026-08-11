@@ -40,7 +40,11 @@ evaluate left to right before the call.
 program, not assignable, and **its initializer may not perform effects**. It
 may call functions and name them as values — a dispatch table
 (`let OPS: Map[str, fn(A) -> B] = {…}`) is what constants are most wanted for
-— and may use constants declared before it. It
+— and may use constants declared before it. The functions in such a table must
+themselves perform nothing, since naming one is the permission to call it
+([T-FN-VALUE-ROW]) and that charge lands on the constant: a table of `io`
+functions has no spelling as a constant, and writing the row on the constant's
+type does not change that. Build one in a function instead. It
 is evaluated wherever the name is used, so an effect in it would happen once
 per mention — which would make how often something happens a property of how
 many times a name appears. That is why the restriction exists rather than
