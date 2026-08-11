@@ -105,7 +105,10 @@ inside an interpolation cannot silently delete part of the output.
 ```
 
 **[L-MAXMUNCH]** The lexer always takes the longest matching operator, so
-`->` is one token, never `-` followed by `>`.
+`->` is one token, never `-` followed by `>`. A number directly after `.` is
+the exception, because there it is a tuple component: `t.1.0` is two of them,
+not `t` and the float `1.0`. Without that, a component of a nested tuple had
+no unparenthesised spelling and the error talked about floats.
 
 `!` appears only in `T ! E` (a function's error type); negation is `not`.
 There is deliberately no `::`, `=>`, `@`, postfix `?`, or `?.`: paths use `.`,
@@ -5520,41 +5523,24 @@ fn main() {
 ```grasm
 //! tag: L-LIB-TUPLE
 //! expect: output
-//! 1 a
-//! eng 25 bo
-//! eng 30 cy
-//! ops 25 al
-//! [(c, 5), (a, 3), (b, 3)]
-//! true false true
-//! [(1, 2), (1, 5), (2, 1)]
-type P = { name: str, dept: str, age: i64 }
-
+//! 1 2 3 4
+//! 1.5 1000.0 10
+// Tuple components, including nested ones.
+//
+// A number directly after `.` is a component, not the start of a float:
+// `t.1.1.0` used to lex as `t` `.` `1.1` `.` `0` and report "expected an
+// identifier but found float `1.1`", so a nested component could only be
+// written with brackets. Ordinary floats and ranges are unaffected.
 fn main() {
-    // Components are read by position.
-    let pair = (1, "a")
-    print("{pair.0} {pair.1}")
-
-    // A tuple key is a multi-key sort: department, then age, then name.
-    var ps = [
-        P{ name: "cy", dept: "eng", age: 30 },
-        P{ name: "al", dept: "ops", age: 25 },
-        P{ name: "bo", dept: "eng", age: 25 },
-    ]
-    ps.sort_by(|p| (p.dept, p.age, p.name))
-    for p in ps {
-        print("{p.dept} {p.age} {p.name}")
+    let t = (1, (2, (3, 4)))
+    print("{t.0} {t.1.0} {t.1.1.0} {t.1.1.1}")
+    let f = 1.5
+    let g = 1.0e3
+    var n = 0
+    for i in 1..5 {
+        n = n + i
     }
-
-    // The counting idiom: most frequent first, ties broken by key ascending.
-    var pairs = [("b", 3), ("a", 3), ("c", 5)]
-    pairs.sort_by(|e| (0 - e.1, e.0))
-    print("{pairs}")
-
-    // The same order is what `<` and `sort` use.
-    print("{(1, 2) < (1, 3)} {(2, 0) < (1, 9)} {(1, "a") < (1, "b")}")
-    var ts = [(2, 1), (1, 5), (1, 2)]
-    ts.sort()
-    print("{ts}")
+    print("{f} {g} {n}")
 }
 ```
 

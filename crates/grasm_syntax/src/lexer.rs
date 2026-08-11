@@ -10,6 +10,14 @@ pub struct Lexer<'a> {
     pos: usize,
     /// `///` lines, in source order: (span of the line, text after the slashes).
     docs: Vec<(Span, String)>,
+    /// Whether the token just emitted was `.`.
+    ///
+    /// After one, a number is a *tuple component*, so its own `.` starts the
+    /// next component rather than a fraction. Max-munch read `t.1.0` as
+    /// `t` `.` `1.0` and reported "expected an identifier but found float
+    /// `1`" — so a component of a nested tuple had no unparenthesised
+    /// spelling at all ([L-LIB-TUPLE]).
+    after_dot: bool,
 }
 
 pub fn lex(src: &str) -> Vec<Token> {
@@ -29,6 +37,7 @@ impl<'a> Lexer<'a> {
             bytes: src.as_bytes(),
             pos: 0,
             docs: Vec::new(),
+            after_dot: false,
         }
     }
 
@@ -36,6 +45,7 @@ impl<'a> Lexer<'a> {
         let mut out = Vec::new();
         loop {
             let tok = self.next_token();
+            self.after_dot = tok.kind == TokenKind::Dot;
             let is_eof = tok.kind == TokenKind::Eof;
             // Collapse consecutive newlines into one.
             if tok.kind == TokenKind::Newline
@@ -190,8 +200,9 @@ impl<'a> Lexer<'a> {
         while self.peek().is_ascii_digit() || self.peek() == b'_' {
             self.bump();
         }
-        // Fractional part — but `1..5` is a range, not a float.
-        if self.peek() == b'.' && self.peek2().is_ascii_digit() {
+        // Fractional part — but `1..5` is a range, not a float, and `t.1.0`
+        // is two tuple components.
+        if !self.after_dot && self.peek() == b'.' && self.peek2().is_ascii_digit() {
             is_float = true;
             self.bump();
             while self.peek().is_ascii_digit() || self.peek() == b'_' {

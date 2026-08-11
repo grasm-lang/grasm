@@ -90,7 +90,10 @@ inside an interpolation cannot silently delete part of the output.
 ```
 
 **[L-MAXMUNCH]** The lexer always takes the longest matching operator, so
-`->` is one token, never `-` followed by `>`.
+`->` is one token, never `-` followed by `>`. A number directly after `.` is
+the exception, because there it is a tuple component: `t.1.0` is two of them,
+not `t` and the float `1.0`. Without that, a component of a nested tuple had
+no unparenthesised spelling and the error talked about floats.
 
 `!` appears only in `T ! E` (a function's error type); negation is `not`.
 There is deliberately no `::`, `=>`, `@`, postfix `?`, or `?.`: paths use `.`,

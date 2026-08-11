@@ -917,11 +917,17 @@ impl Parser {
                 }
                 let rp = self.expect(&TokenKind::RParen)?;
                 let mut span = start.merge(rp.span);
-                // Same as `ref`: the `!` binds outside the function type,
-                // so `fn(i64) -> i64 ! E` is a fallible function value. An
-                // inner fallible return is written `fn(i64) -> (i64 ! E)`.
+                // Unlike `ref`, a function type's return *absorbs* the `!`:
+                // `fn(i64) -> i64 ! E` is a function that can fail, which is
+                // what a struct field holding one means. Binding it outward
+                // made that field a *fallible function value* instead — a
+                // type that displays identically and unifies with nothing, so
+                // `Box{ f: twice }` was refused with "expected
+                // `fn(i64) -> i64 ! E`, found `fn(i64) -> i64 ! E`". A
+                // fallible function value, if anyone wants one, is
+                // `(fn(i64) -> i64) ! E`.
                 let ret = if self.eat(&TokenKind::Arrow) {
-                    let t = self.parse_type()?;
+                    let t = self.parse_type_nested()?;
                     span = span.merge(t.span());
                     Box::new(t)
                 } else {
