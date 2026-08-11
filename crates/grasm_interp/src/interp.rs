@@ -64,12 +64,6 @@ pub struct Interp<'a, W: Write> {
     slab: Vec<(Option<Value>, u32)>,
     /// Slots free for reuse.
     slab_free: Vec<u32>,
-    /// An assignment target's path, resolved before its value is evaluated.
-    ///
-    /// `xs[f()] = g()` must run `f` before `g` ([E-ORDER-LTR]), and the walk
-    /// that writes the value is what evaluates the indices — so doing it
-    /// after left the order reversed.
-    pending_segs: Option<Vec<Seg>>,
     /// `type Res = i64 ! E` — needed to tell whether a function that returns
     /// an alias is fallible, which decides whether its value is wrapped.
     aliases: HashMap<String, TypeExpr>,
@@ -448,7 +442,6 @@ impl<'a, W: Write> Interp<'a, W> {
             float_sums: std::collections::HashSet::new(),
             slab: Vec::new(),
             slab_free: Vec::new(),
-            pending_segs: None,
             aliases: HashMap::new(),
             externs: HashMap::new(),
             fallible_ops: std::collections::HashSet::new(),
@@ -846,7 +839,12 @@ impl<'a, W: Write> Interp<'a, W> {
                 // runs `f` before `g` ([E-ORDER-LTR]). Evaluating the value
                 // and only then walking the place ran them the other way
                 // round, consistently in every engine.
-                self.pending_segs = self.place_segs(target)?;
+                //
+                // Held here rather than on `self`: evaluating the value can
+                // run another assignment — a call that assigns, a compound
+                // `+=` in a loop — and a field would hand this statement's
+                // path to that one.
+                let resolved = self.place_segs(target)?;
                 let new = self.eval_expr(value)?;
                 let final_v = if *op == AssignOp::Assign {
                     new
@@ -861,7 +859,22 @@ impl<'a, W: Write> Interp<'a, W> {
                     };
                     self.apply_binary(bop, old, new)?
                 };
-                self.assign_place(target, final_v)?;
+                match resolved {
+                    Some(segs) => {
+                        let mut root = target;
+                        while let Expr::Field { recv, .. } | Expr::Index { recv, .. } = root {
+                            root = recv;
+                        }
+                        match root {
+                            Expr::Ident(id) => {
+                                let id = id.clone();
+                                self.assign_rooted(&id, segs, final_v)?
+                            }
+                            _ => self.assign_place(target, final_v)?,
+                        }
+                    }
+                    None => self.assign_place(target, final_v)?,
+                }
                 Ok(Value::Unit)
             }
             Stmt::Expr(e) => self.eval_expr(e),
@@ -1199,15 +1212,6 @@ impl<'a, W: Write> Interp<'a, W> {
         //
         // Already evaluated by `place_segs` when an assignment statement got
         // here, so an index's side effects happen once and in source order.
-        if let Some(segs) = self.pending_segs.take() {
-            let mut root = target;
-            while let Expr::Field { recv, .. } | Expr::Index { recv, .. } = root {
-                root = recv;
-            }
-            if let Expr::Ident(id) = root {
-                return self.assign_rooted(id, segs, v);
-            }
-        }
         let mut segs: Vec<Seg> = Vec::new();
         let mut cur = target;
         loop {

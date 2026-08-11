@@ -1139,6 +1139,11 @@ gave up a slot nothing else would ever name, and a loop reading it allocated
 one per iteration. This follows from the clause above and was worth saying
 out loud, since it silently destroys the one thing a reference is for.
 
+However it got one. The rule looked for a literal `ref(...)` in the
+initializer, so `let ROOT = mk()` where `mk` returns one was accepted — and so
+was a struct or a list holding one. It is the constant's *type* that decides
+now, so every carrier is covered.
+
 **[E-CLOSURE-CAPTURE]** A closure captures the values it uses **at the moment
 it is created**, not the bindings. Changing a captured variable afterwards is
 not visible inside, and a closure may not write to one at all — that is a
@@ -2792,22 +2797,25 @@ fn main() {
 ```grasm
 //! tag: E-CONST-REF
 //! expect: error
-//! a constant's value cannot take a reference
-// A constant cannot hold a reference.
+//! holds a reference
+// A constant may not hold a reference, however it got one.
 //
-// [E-CONST] says a constant is evaluated wherever its name is used, so every
-// mention allocates a *different* slot. `print("{ROOT} {ROOT}")` printed two
-// different references on one line; `release(ROOT)` gave up a slot nothing
-// else would ever name and `alive(ROOT)` was then still true; a loop reading
-// the constant allocated a slot per iteration. All three engines agreed, so it
-// was language semantics rather than a bug — and it silently destroyed the one
-// thing a reference is for. It follows from [E-CONST] and nothing said so.
+// A constant is evaluated again at every mention, so a reference in one is a
+// fresh slot each time: two mentions on one line print two different
+// references, `release` gives up a slot nothing else names, and a loop leaks
+// one per iteration. The check looked for a literal `ref(...)` in the
+// initializer, so a helper returning one walked straight past it — and so
+// would a struct or a list holding one.
 type Node = { id: i64 }
 
-let ROOT = ref(Node{ id: 1 })
+fn mk() -> ref Node {
+    ref(Node{ id: 1 })
+}
+
+let ROOT = mk()
 
 fn main() {
-    print("{ROOT.id}")
+    print("{ROOT} {ROOT}")
 }
 ```
 

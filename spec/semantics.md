@@ -54,6 +54,11 @@ gave up a slot nothing else would ever name, and a loop reading it allocated
 one per iteration. This follows from the clause above and was worth saying
 out loud, since it silently destroys the one thing a reference is for.
 
+However it got one. The rule looked for a literal `ref(...)` in the
+initializer, so `let ROOT = mk()` where `mk` returns one was accepted — and so
+was a struct or a list holding one. It is the constant's *type* that decides
+now, so every carrier is covered.
+
 **[E-CLOSURE-CAPTURE]** A closure captures the values it uses **at the moment
 it is created**, not the bindings. Changing a captured variable afterwards is
 not visible inside, and a closure may not write to one at all — that is a

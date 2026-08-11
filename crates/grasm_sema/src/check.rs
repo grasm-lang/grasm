@@ -635,7 +635,22 @@ land in a copy the caller never sees — return the new value from the operation
                 }
                 None => self.infer_expr(&c.init),
             };
-            self.consts.insert(key, (self.uni.resolve(&ty), c.is_pub));
+            // A constant is *re-evaluated* at every mention ([E-CONST]), so a
+            // reference in one is a fresh slot each time: two mentions on one
+            // line printed two different references, `release` gave up a slot
+            // nothing else named, and a loop leaked one per iteration. The
+            // syntactic check caught a literal `ref(...)` and nothing else —
+            // a helper returning one walked past it, and so would a struct or
+            // a list holding one ([E-CONST-REF]).
+            let resolved = self.uni.resolve(&ty);
+            if self.carries_ref(&resolved) {
+                self.error_help(
+                    c.name.span,
+                    format!("constant `{}` holds a reference", c.name.name),
+                    "a constant is evaluated again at every mention, so each one would be a different slot — bind it with `let` inside a function instead",
+                );
+            }
+            self.consts.insert(key, (resolved, c.is_pub));
         }
     }
 
