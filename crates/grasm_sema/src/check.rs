@@ -124,17 +124,36 @@ fn check_modules(files: &[ModuleView]) -> Analysis {
     }
     // Resolved now: unification is finished, so a literal's element type has
     // whatever answer the whole body gave it.
+    let mut unresolved: Vec<u32> = Vec::new();
     let empty_types: std::collections::HashMap<u32, String> = c
         .empty_lits
         .clone()
         .into_iter()
         .filter_map(|(off, t)| {
             let shown = c.show(&t);
-            // A type inference never pinned down is not one the backend could
-            // use either.
-            (!shown.contains('_')).then_some((off, shown))
+            if shown.contains('_') {
+                // Nothing in the program says what this holds.
+                // `[T-EMPTY-LIT]` says such a literal is rejected, and it was
+                // not: `var xs = []` with no later use ran under `grasm run`
+                // and could not be built — the one divergence the clause
+                // records as fixed.
+                unresolved.push(off);
+                return None;
+            }
+            Some((off, shown))
         })
         .collect();
+    for off in unresolved {
+        c.diags.push(
+            Diagnostic::error(
+                Span::new(off, off + 2),
+                "this empty literal's element type is not determined by anything".to_string(),
+            )
+            .with_help(
+                "annotate it, as in `let xs: [i64] = []`, or use it somewhere that says what it holds",
+            ),
+        );
+    }
     let mut diagnostics = c.diags;
     diagnostics.extend(crate::effects::check_effects_multi(files));
     Analysis {

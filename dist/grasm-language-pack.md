@@ -465,8 +465,10 @@ all of those, from a later use: `var xs = []` followed by `xs.push(1)` is a
 `[i64]`, because inference reads the whole body before deciding. A literal
 whose type nothing determines is rejected.
 
-The clause used to say that anything without an annotation is rejected, which
-was not true of `grasm run` and was true of `grasm build --native` — so the
+A literal whose type nothing determines *is* rejected, by the checker, so both
+engines agree about it. The clause used to say that anything without an
+annotation is rejected, which was not true of `grasm run` and was true of
+`grasm build --native` — so the
 one thing it said, it said about a case where the engines differed, and a
 reader consulting it about a program `check` had just accepted would have been
 told the opposite. Both now accept it: the checker resolves an empty literal
@@ -2402,8 +2404,12 @@ to build **in every consumer** — a compile error, not a runtime surprise, and
 not something a reviewer has to happen to notice.
 
 A capability is what a package needs from **outside** itself, so what counts is
-what *escapes*: the effects `main` performs, and the effects left in a `pub`
-function's row for a consumer to handle. Every module in the package counts,
+what *escapes*: the effects `main` performs, the effects left in a `pub`
+function's row for a consumer to handle, and the effects its `test` and `bench`
+bodies perform. That last one surprises people — a test is not part of the
+interface — but `grasm test` runs the tests of every imported module, so a
+dependency's test body really does execute in your process. The consequence is
+worth knowing: a `capabilities = []` package cannot `print` from a test. Every module in the package counts,
 not only the ones its entry file imports — a consumer reaches `pub fn f` with
 `import dep.module` whether or not the dependency's own entry mentions that
 module, so a `capabilities = []` package could otherwise keep a filesystem
@@ -4890,14 +4896,32 @@ fn main() {
 ```grasm
 //! tag: L-CONTEXTUAL
 //! expect: output
-//! 5 7
-fn spawn(n: i64) -> i64 {
-    n + 2
-}
+//! 1
+//! 2
+//! has 2
+//! two
+//! 2
+// A contextual keyword is an ordinary name everywhere else.
+//
+// `region` is an *expression* form, and the rule that a following `{` opens a
+// body — the one that makes `if User{..}.ok` need brackets — was not applied
+// to it. So `for x in region { … }` read the loop's own brace as a region
+// body, and a variable called `region` could not be used in a condition, a
+// loop header or a `match` scrutinee at all.
 fn main() {
-    // `spawn`/`parallel` are ordinary names when no block follows.
-    let parallel = 5
-    print("{parallel} {spawn(parallel)}")
+    let region = [1, 2]
+    for x in region {
+        print("{x}")
+    }
+    if region.len() > 0 {
+        print("has {region.len()}")
+    }
+    match region.len() {
+        2 -> print("two")
+        _ -> print("other")
+    }
+    // And the expression form still works where a brace really does open one.
+    print("{region { 1 + 1 }}")
 }
 ```
 

@@ -464,8 +464,12 @@ to build **in every consumer** — a compile error, not a runtime surprise, and
 not something a reviewer has to happen to notice.
 
 A capability is what a package needs from **outside** itself, so what counts is
-what *escapes*: the effects `main` performs, and the effects left in a `pub`
-function's row for a consumer to handle. Every module in the package counts,
+what *escapes*: the effects `main` performs, the effects left in a `pub`
+function's row for a consumer to handle, and the effects its `test` and `bench`
+bodies perform. That last one surprises people — a test is not part of the
+interface — but `grasm test` runs the tests of every imported module, so a
+dependency's test body really does execute in your process. The consequence is
+worth knowing: a `capabilities = []` package cannot `print` from a test. Every module in the package counts,
 not only the ones its entry file imports — a consumer reaches `pub fn f` with
 `import dep.module` whether or not the dependency's own entry mentions that
 module, so a `capabilities = []` package could otherwise keep a filesystem

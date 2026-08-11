@@ -100,8 +100,10 @@ all of those, from a later use: `var xs = []` followed by `xs.push(1)` is a
 `[i64]`, because inference reads the whole body before deciding. A literal
 whose type nothing determines is rejected.
 
-The clause used to say that anything without an annotation is rejected, which
-was not true of `grasm run` and was true of `grasm build --native` — so the
+A literal whose type nothing determines *is* rejected, by the checker, so both
+engines agree about it. The clause used to say that anything without an
+annotation is rejected, which was not true of `grasm run` and was true of
+`grasm build --native` — so the
 one thing it said, it said about a case where the engines differed, and a
 reader consulting it about a program `check` had just accepted would have been
 told the opposite. Both now accept it: the checker resolves an empty literal

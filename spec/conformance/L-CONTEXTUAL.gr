@@ -1,11 +1,29 @@
 //! tag: L-CONTEXTUAL
 //! expect: output
-//! 5 7
-fn spawn(n: i64) -> i64 {
-    n + 2
-}
+//! 1
+//! 2
+//! has 2
+//! two
+//! 2
+// A contextual keyword is an ordinary name everywhere else.
+//
+// `region` is an *expression* form, and the rule that a following `{` opens a
+// body — the one that makes `if User{..}.ok` need brackets — was not applied
+// to it. So `for x in region { … }` read the loop's own brace as a region
+// body, and a variable called `region` could not be used in a condition, a
+// loop header or a `match` scrutinee at all.
 fn main() {
-    // `spawn`/`parallel` are ordinary names when no block follows.
-    let parallel = 5
-    print("{parallel} {spawn(parallel)}")
+    let region = [1, 2]
+    for x in region {
+        print("{x}")
+    }
+    if region.len() > 0 {
+        print("has {region.len()}")
+    }
+    match region.len() {
+        2 -> print("two")
+        _ -> print("other")
+    }
+    // And the expression form still works where a brace really does open one.
+    print("{region { 1 + 1 }}")
 }

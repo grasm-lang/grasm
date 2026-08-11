@@ -238,7 +238,18 @@ pub fn effects_of_program(program: &crate::loader::Program) -> BTreeSet<String> 
             all.extend(row.iter().cloned());
         }
     }
-    // Tests and benchmarks may perform effects too.
+    // Tests and benchmarks count. They are not part of the package's
+    // interface, and a reader reasonably expects the ceiling to be about what
+    // *escapes* — but `grasm test` runs the tests of every imported module,
+    // including a dependency's, so a test body really does execute in a
+    // consumer's process. A `capabilities = []` package that printed from a
+    // test would print in someone else's test run.
+    //
+    // The cost is real: such a package cannot `print` from a test at all,
+    // which is the one place a careful library most wants to. That is a
+    // restriction to lift by making the ceiling distinguish "runs when a
+    // consumer builds" from "runs when a consumer tests", not by dropping the
+    // check.
     for f in &views {
         if foreign(&f.name) {
             continue;

@@ -1696,7 +1696,16 @@ impl Parser {
             // program in this repository that used `region` as a field name,
             // which is exactly the compatibility the contextual rule exists
             // for.
-            TokenKind::Ident(n) if n == "region" && self.block_follows() => {
+            // In a condition, an iterator, or a `match` scrutinee, a
+            // following `{` opens the *body* — which is exactly what
+            // `no_struct_lit` marks, and why `if User{..}.ok` needs parens
+            // ([G-STRUCT-AMBIG]). `region` is an expression form and was not
+            // asking, so `for x in region { … }` read the loop's own brace as
+            // a region body and `let region = [1, 2]` stopped being a usable
+            // name ([L-CONTEXTUAL]).
+            TokenKind::Ident(n)
+                if n == "region" && !self.no_struct_lit && self.block_follows() =>
+            {
                 self.bump();
                 Ok(Expr::Region(self.parse_block()?))
             }

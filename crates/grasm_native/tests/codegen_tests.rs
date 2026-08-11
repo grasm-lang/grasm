@@ -47,9 +47,19 @@ fn unsupported_features_reported_cleanly() {
     )
     .expect("function values compile");
 
-    let e = compile("fn main() {\n    var xs = []\n    print(\"{xs.len()}\")\n}\n")
-        .expect_err("an unannotated empty literal has no element type");
-    assert!(e.contains("does not yet support"), "got: {e}");
+    // An empty literal nothing determines is now a *checker* error rather
+    // than a backend refusal, which is what [T-EMPTY-LIT] says it is — and it
+    // removes a divergence, since `grasm run` used to accept it. So it is the
+    // checker that has to report it, before the backend sees the program.
+    let src = "fn main() {\n    var xs = []\n    print(\"{xs.len()}\")\n}\n";
+    let map: HashMap<String, String> = [("main".to_string(), src.to_string())].into();
+    let provider = move |name: &str| map.get(name).cloned();
+    let program = grasm_sema::loader::load_with("main", "test.gr", &provider);
+    let diags = grasm_sema::check::check_program(&program).diagnostics;
+    assert!(
+        diags.iter().any(|d| d.message.contains("not determined by anything")),
+        "got: {diags:#?}"
+    );
 }
 
 #[test]
