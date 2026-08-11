@@ -1,10 +1,26 @@
 //! tag: T-FALLIBLE-UNHANDLED
 //! expect: error
 //! can fail
+// A fallible value may not be used as if it were `T`, and discarding it is
+// using it.
+//
+// A bare statement was checked, and the *tail* of a block whose value goes
+// nowhere was not — so `if c { write_file(p, s) }` swallowed the failure that
+// `write_file(p, s)` on its own line reports. Loop bodies were the same. That
+// is verbatim the shape this clause exists to prevent: "wrote the report",
+// exit 0, nothing on stderr, and no file.
 type E = | Bad
+
 fn risky() -> i64 ! E {
     1
 }
+
 fn main() {
     let v = risky()
+    if true {
+        risky()
+    }
+    for _n in 0..1 {
+        risky()
+    }
 }

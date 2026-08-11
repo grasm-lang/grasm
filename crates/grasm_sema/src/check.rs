@@ -192,6 +192,12 @@ struct Checker {
     /// How many `unsafe` blocks enclose the expression being checked.
     unsafe_depth: u32,
     /// How many `region` blocks enclose it.
+    /// Whether the block being checked has its value thrown away.
+    ///
+    /// A loop body, and a branch of an `if` used as a statement. Their tail
+    /// is discarded like any other line, so `if c { write_file(p, s) }`
+    /// swallowed a failure that a bare `write_file(p, s)` would not.
+    discarding: bool,
     /// Set while checking the expression a function's body ends with, so a
     /// mismatch there is reported as what it is — the function's return value
     /// — rather than as an anonymous type mismatch.
@@ -286,6 +292,7 @@ impl Checker {
             fn_rows: HashMap::new(),
             closure_rows: HashMap::new(),
             unsafe_depth: 0,
+            discarding: false,
             tail_fn: None,
             with_floors: Vec::new(),
             region_depth: 0,
@@ -1041,6 +1048,16 @@ land in a copy the caller never sees — return the new value from the operation
         self.check_block_with(b, None)
     }
 
+    /// A block whose value is thrown away — a loop body, or a branch of an
+    /// `if` written as a statement. Its *tail* is discarded too, so a
+    /// fallible value there is as unhandled as one on any other line.
+    fn check_block_discarded(&mut self, b: &Block) -> Type {
+        let saved = std::mem::replace(&mut self.discarding, true);
+        let t = self.check_block_with(b, None);
+        self.discarding = saved;
+        t
+    }
+
     /// Checks a block, pushing an expected type into its tail expression.
     ///
     /// The tail is the block's value, so a type known at the outside is known
@@ -1061,14 +1078,20 @@ land in a copy the caller never sees — return the new value from the operation
                     ty = w;
                 }
                 _ => {
+                    let disc = i + 1 < n || self.discarding;
+                    let saved = std::mem::replace(
+                        &mut self.discarding,
+                        disc && matches!(stmt, Stmt::Expr(_)),
+                    );
                     ty = self.check_stmt(stmt);
+                    self.discarding = saved;
                     // A statement that is not the block's value throws that
                     // value away, and throwing away a failure is using a
                     // fallible value as if it were `T`. `write_file` to an
                     // unwritable path printed "wrote the report", exit 0,
                     // nothing on stderr and no file — and every user function
                     // that can fail did the same ([T-FALLIBLE-UNHANDLED]).
-                    if i + 1 < n
+                    if (i + 1 < n || self.discarding)
                         && matches!(stmt, Stmt::Expr(_))
                         && matches!(self.uni.shallow_resolve(&ty), Type::Fallible(..))
                     {
@@ -1282,7 +1305,7 @@ closing brace — yield a number from the region and return that",
             Stmt::While { cond, body, .. } => {
                 self.check_expr(cond, &Type::Bool);
                 self.loop_depth += 1;
-                self.check_block(body);
+                self.check_block_discarded(body);
                 self.loop_depth -= 1;
                 Type::Unit
             }
@@ -1349,7 +1372,7 @@ closing brace — yield a number from the region and return that",
                 // installed — which is how a well-typed program reached
                 // [E-HANDLER-MISSING]'s panic.
                 self.with_floors.push((ename, self.scopes.len()));
-                self.check_block(body);
+                self.check_block_discarded(body);
                 self.with_floors.pop();
                 Type::Unit
             }
@@ -1378,7 +1401,7 @@ closing brace — yield a number from the region and return that",
                 self.scopes.push(HashMap::new());
                 self.bind(var, elem, false);
                 self.loop_depth += 1;
-                self.check_block(body);
+                self.check_block_discarded(body);
                 self.loop_depth -= 1;
                 self.scopes.pop();
                 Type::Unit
@@ -2332,15 +2355,29 @@ allocates could outlive it — move the work out of the region, or yield a numbe
                 ..
             } => {
                 self.check_expr(cond, &Type::Bool);
+                // If this `if` is a statement, its branches' values go
+                // nowhere too, so `if c { write_file(p, s) }` is as unhandled
+                // as `write_file(p, s)` on its own line.
+                let disc = std::mem::take(&mut self.discarding);
                 let before = self.moved_snapshot();
-                let then_ty = self.check_block(then_block);
+                let then_ty = if disc {
+                    self.check_block_discarded(then_block)
+                } else {
+                    self.check_block(then_block)
+                };
                 let after_then = self.moved_snapshot();
                 match else_branch {
                     Some(eb) => {
                         self.restore_moved(&before);
                         let else_ty = match &**eb {
+                            ElseBranch::Else(b) if disc => self.check_block_discarded(b),
                             ElseBranch::Else(b) => self.check_block(b),
-                            ElseBranch::ElseIf(e) => self.infer_expr(e),
+                            ElseBranch::ElseIf(e) => {
+                                self.discarding = disc;
+                                let t = self.infer_expr(e);
+                                self.discarding = false;
+                                t
+                            }
                         };
                         let after_else = self.moved_snapshot();
                         self.merge_moved(&[after_then, after_else]);

@@ -483,7 +483,9 @@ with `E`. It is an ordinary value, not an exception.
 **[T-FALLIBLE-UNHANDLED]** A fallible value may not be used as if it were `T`.
 It must be consumed by `try`, by a `match` covering `Ok` and `Err`, or by
 `??`. Discarding it counts as using it: a call written as a bare statement
-throws its failure away, and nothing says so. `write_file` to a path that
+throws its failure away, and nothing says so — and so does one written as the
+last line of a loop body, or of a branch of an `if` used as a statement, where
+the block's own value goes nowhere either. `write_file` to a path that
 cannot be written printed "wrote the report", exited 0, wrote nothing to
 stderr and left no file — and every user function that can fail behaved the
 same way when its result was ignored.
@@ -6400,12 +6402,28 @@ fn main() {
 //! tag: T-FALLIBLE-UNHANDLED
 //! expect: error
 //! can fail
+// A fallible value may not be used as if it were `T`, and discarding it is
+// using it.
+//
+// A bare statement was checked, and the *tail* of a block whose value goes
+// nowhere was not — so `if c { write_file(p, s) }` swallowed the failure that
+// `write_file(p, s)` on its own line reports. Loop bodies were the same. That
+// is verbatim the shape this clause exists to prevent: "wrote the report",
+// exit 0, nothing on stderr, and no file.
 type E = | Bad
+
 fn risky() -> i64 ! E {
     1
 }
+
 fn main() {
     let v = risky()
+    if true {
+        risky()
+    }
+    for _n in 0..1 {
+        risky()
+    }
 }
 ```
 

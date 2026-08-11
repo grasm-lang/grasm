@@ -118,7 +118,9 @@ with `E`. It is an ordinary value, not an exception.
 **[T-FALLIBLE-UNHANDLED]** A fallible value may not be used as if it were `T`.
 It must be consumed by `try`, by a `match` covering `Ok` and `Err`, or by
 `??`. Discarding it counts as using it: a call written as a bare statement
-throws its failure away, and nothing says so. `write_file` to a path that
+throws its failure away, and nothing says so — and so does one written as the
+last line of a loop body, or of a branch of an `if` used as a statement, where
+the block's own value goes nowhere either. `write_file` to a path that
 cannot be written printed "wrote the report", exited 0, wrote nothing to
 stderr and left no file — and every user function that can fail behaved the
 same way when its result was ignored.
