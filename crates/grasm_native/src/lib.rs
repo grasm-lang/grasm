@@ -572,6 +572,8 @@ impl<'m> Codegen<'m> {
             ("grasm_set_args", vec![i64t, ptr], None),
             ("grasm_now_millis", vec![], Some(i64t)),
             ("grasm_check_leaks", vec![], None),
+            ("grasm_struct_take", vec![ptr, ptr, i64t], Some(ptr)),
+            ("grasm_list_take", vec![ptr, i64t], Some(ptr)),
             ("grasm_region_push", vec![], None),
             ("grasm_region_pop", vec![], None),
             ("grasm_out_ref", vec![i64t], None),
@@ -4329,7 +4331,7 @@ impl FnCx<'_, '_> {
                     self.pop_scope_no_decs();
                     let vb = self.box_value(vv, &vvt);
                     let cur = self.b.use_var(var);
-                    let mapv = self.read_place_boxed(cur, &path, &root_t)?;
+                    let mapv = self.read_place_boxed(cur, &path, &root_t, true)?;
                     let newmap = self.call_rt("grasm_map_set", &[mapv, kb, vb]).unwrap();
                     let cur2 = self.b.use_var(var);
                     let updated = self.write_place(span, cur2, &path, &root_t, newmap)?;
@@ -4349,7 +4351,7 @@ impl FnCx<'_, '_> {
                     let ptr_ty = self.cg.module.target_config().pointer_type();
                     let addr = self.b.ins().stack_addr(ptr_ty, slot, 0);
                     let cur = self.b.use_var(var);
-                    let mapv = self.read_place_boxed(cur, &path, &root_t)?;
+                    let mapv = self.read_place_boxed(cur, &path, &root_t, true)?;
                     let newmap = self.call_rt("grasm_map_delete", &[mapv, kb, addr]).unwrap();
                     let cur2 = self.b.use_var(var);
                     let updated = self.write_place(span, cur2, &path, &root_t, newmap)?;
@@ -4360,7 +4362,7 @@ impl FnCx<'_, '_> {
                 }
                 (VType::List(_), "sort") => {
                     let cur = self.b.use_var(var);
-                    let listv = self.read_place_boxed(cur, &path, &root_t)?;
+                    let listv = self.read_place_boxed(cur, &path, &root_t, true)?;
                     let newlist = self.call_rt("grasm_list_sort", &[listv]).unwrap();
                     let cur2 = self.b.use_var(var);
                     let updated = self.write_place(span, cur2, &path, &root_t, newlist)?;
@@ -4382,7 +4384,7 @@ impl FnCx<'_, '_> {
                     );
                     let addr = self.b.ins().stack_addr(ptr_ty, slot, 0);
                     let cur = self.b.use_var(var);
-                    let listv = self.read_place_boxed(cur, &path, &root_t)?;
+                    let listv = self.read_place_boxed(cur, &path, &root_t, true)?;
                     let newlist = self.call_rt("grasm_list_pop", &[listv, addr]).unwrap();
                     let cur2 = self.b.use_var(var);
                     let updated = self.write_place(span, cur2, &path, &root_t, newlist)?;
@@ -4403,7 +4405,7 @@ impl FnCx<'_, '_> {
                     );
                     let addr = self.b.ins().stack_addr(ptr_ty, slot, 0);
                     let cur = self.b.use_var(var);
-                    let listv = self.read_place_boxed(cur, &path, &root_t)?;
+                    let listv = self.read_place_boxed(cur, &path, &root_t, true)?;
                     let newlist = self
                         .call_rt("grasm_list_remove", &[listv, idx, addr])
                         .unwrap();
@@ -4430,7 +4432,7 @@ impl FnCx<'_, '_> {
             let (av, _) = self.eval_expr_expecting(&args[0], Some(&elem_t))?;
             let boxed = self.box_value(av, &elem_t);
             let cur = self.b.use_var(var);
-            let list_val = self.read_place_boxed(cur, &path, &root_t)?;
+            let list_val = self.read_place_boxed(cur, &path, &root_t, true)?;
             let newlist = self.call_rt("grasm_list_push", &[list_val, boxed]).unwrap();
             let cur2 = self.b.use_var(var);
             let updated = self.write_place(span, cur2, &path, &root_t, newlist)?;
@@ -7392,11 +7394,52 @@ impl FnCx<'_, '_> {
     }
 
     /// Reads a place without unboxing the final value (for container places).
+    /// Calls the taking accessor, falling back to the copying one when it
+    /// answers null — which is how the runtime says the parent is shared.
+    fn take_or_get(
+        &mut self,
+        take_fn: &'static str,
+        get_fn: &'static str,
+        args: &[Value],
+        take: bool,
+    ) -> Value {
+        if !take {
+            return self.call_rt(get_fn, args).unwrap();
+        }
+        let took = self.call_rt(take_fn, args).unwrap();
+        let zero = self.b.ins().iconst(types::I64, 0);
+        let is_null = self.b.ins().icmp(IntCC::Equal, took, zero);
+        let copy_blk = self.b.create_block();
+        let done = self.b.create_block();
+        let ptr_ty = self.cg.module.target_config().pointer_type();
+        self.b.append_block_param(done, ptr_ty);
+        self.b.ins().brif(is_null, copy_blk, &[], done, &[took.into()]);
+        self.filled = true;
+        self.goto_block(copy_blk);
+        let got = self.call_rt(get_fn, args).unwrap();
+        self.b.ins().jump(done, &[got.into()]);
+        self.filled = true;
+        self.goto_block(done);
+        self.b.block_params(done)[0]
+    }
+
+    /// Reads the value at a place.
+    ///
+    /// With `take`, each step *moves* the child out of its parent instead of
+    /// copying a reference to it, so the caller is the sole owner and a
+    /// mutation happens where the value lies. The value is put back by
+    /// `write_place`, and the runtime recognises a value returning to the
+    /// slot it came from. Without this `s.xs.push(i)` was O(n) per push — the
+    /// read incremented the field's count, and the push then found the list
+    /// shared and copied it. Taking is only possible when the parent is
+    /// unshared; the runtime answers null when it is not, and the copying
+    /// accessor runs instead.
     fn read_place_boxed(
         &mut self,
         root: Value,
         path: &[PlaceSeg<'_>],
         root_t: &VType,
+        take: bool,
     ) -> CResult<Value> {
         let mut cur = root;
         let mut cur_t = root_t.clone();
@@ -7404,7 +7447,15 @@ impl FnCx<'_, '_> {
         // caller's — borrowed — and everything after it comes from an
         // accessor that increments.
         let mut owned = false;
-        for seg in path {
+        for (i, seg) in path.iter().enumerate() {
+            // Only the last step may take. `write_place` walks the path again
+            // from the root, so an intermediate moved out of its parent would
+            // leave a placeholder there for that walk to find —
+            // `rows[0].stack.pop()` reached `set_field` with a `bool` where
+            // the struct used to be. The last step's parent is re-read by
+            // that walk and still holds the placeholder, which is exactly
+            // what the write replaces.
+            let take = take && i + 1 == path.len();
             let prev = cur;
             let prev_owned = owned;
             let prev_t = cur_t.clone();
@@ -7413,13 +7464,23 @@ impl FnCx<'_, '_> {
                     let sname = sname.clone();
                     let ft = self.struct_field_type(&sname, f, Span::new(0, 1))?;
                     let (fp, fl) = self.str_ptr_len(f);
-                    cur = self.call_rt("grasm_struct_get", &[cur, fp, fl]).unwrap();
+                    cur = self.take_or_get(
+                        "grasm_struct_take",
+                        "grasm_struct_get",
+                        &[cur, fp, fl],
+                        take,
+                    );
                     cur_t = ft;
                 }
                 (VType::List(e), PlaceSeg::Index(ix)) => {
                     let et = (**e).clone();
                     let (iv, _) = self.eval_expr_val(ix)?;
-                    cur = self.call_rt("grasm_list_get", &[cur, iv]).unwrap();
+                    cur = self.take_or_get(
+                        "grasm_list_take",
+                        "grasm_list_get",
+                        &[cur, iv],
+                        take,
+                    );
                     cur_t = et;
                 }
                 _ => return nope(Span::new(0, 1), "this place's shape"),

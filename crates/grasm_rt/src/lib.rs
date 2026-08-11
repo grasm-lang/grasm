@@ -1533,6 +1533,62 @@ pub unsafe extern "C" fn grasm_struct_get(
     grasm_panic_msg_str("no such field");
 }
 
+/// Moves a field's value out, leaving a shared placeholder.
+///
+/// The caller becomes the sole owner, so a mutation through it happens where
+/// the value lies instead of copying: `s.xs.push(v)` in a loop was O(n) per
+/// push, because reading the field incremented its count and the push then
+/// found it shared. The value is put back by `grasm_struct_set_field`, which
+/// recognises a value returning to the field it came from.
+///
+/// Only when the struct itself is unshared. If it is not, taking would mutate
+/// something another owner can see, so this reports failure by returning null
+/// and the caller reads-and-copies as before.
+///
+/// # Safety: `s` is a struct this runtime allocated.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_struct_take(
+    s: *mut RtVal,
+    name: *const u8,
+    len: u64,
+) -> *mut RtVal {
+    if (*s).rc.get() != 1 {
+        return std::ptr::null_mut();
+    }
+    let RtPayload::Struct { fields, .. } = &mut (*s).payload else {
+        grasm_panic_msg_str("field access on non-struct");
+    };
+    let key = take_str(name, len);
+    let hole = interned_bool(false);
+    for (k, v) in fields.iter_mut() {
+        if *k == key {
+            return std::mem::replace(v, hole);
+        }
+    }
+    grasm_panic_msg_str("no such field");
+}
+
+/// The same for a list element.
+///
+/// # Safety: `l` is a list this runtime allocated.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_list_take(l: *mut RtVal, i: i64) -> *mut RtVal {
+    if (*l).rc.get() != 1 {
+        return std::ptr::null_mut();
+    }
+    let RtPayload::List(items) = &mut (*l).payload else {
+        // A scalar list holds no pointers to take.
+        return std::ptr::null_mut();
+    };
+    let n = items.len() as i64;
+    let i = if i < 0 { n + i } else { i };
+    if i < 0 || i >= n {
+        return std::ptr::null_mut();
+    }
+    let hole = interned_bool(false);
+    Some(std::mem::replace(&mut items[i as usize], hole)).unwrap_or(std::ptr::null_mut())
+}
+
 /// CoW field update: returns the (possibly new) struct pointer.
 /// # Safety: as above; `val` ownership transfers.
 #[no_mangle]
@@ -1568,7 +1624,12 @@ pub unsafe extern "C" fn grasm_struct_set_field(
     let key = take_str(name, len);
     for (k, v) in fields.iter_mut() {
         if *k == key {
-            dec(*v);
+            // A value returning to the field it was taken from carries no
+            // new reference, and the old one is the same object — decrementing
+            // would free what is being stored.
+            if *v != val {
+                dec(*v);
+            }
             *v = val;
             return target;
         }
@@ -3198,7 +3259,11 @@ pub unsafe extern "C" fn grasm_list_set(v: *mut RtVal, i: i64, val: *mut RtVal) 
             if i < 0 || i as usize >= items.len() {
                 rt_panic(&format!("index {i} out of bounds (len {})", items.len()));
             }
-            dec(items[i as usize]);
+            // As in `grasm_struct_set_field`: an element returning to the
+            // slot it was taken from carries no new reference.
+            if items[i as usize] != val {
+                dec(items[i as usize]);
+            }
             items[i as usize] = val;
         }
         RtPayload::ListScalar { kind, data } => {

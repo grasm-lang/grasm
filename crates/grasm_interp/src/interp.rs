@@ -167,6 +167,108 @@ fn assign_into(root: &mut Value, segs: &[Seg], v: Value) -> Result<(), Flow> {
     Ok(())
 }
 
+/// Applies a mutating method to a value in place.
+///
+/// `None` means "not a shape this handles" — the caller falls back to the
+/// read-modify-write path rather than reporting an error, because the set of
+/// mutators is checked elsewhere.
+fn mutate_in_place(
+    slot: &mut Value,
+    method: &str,
+    args: &mut Vec<Value>,
+) -> Result<Option<Value>, Flow> {
+    let r = match (slot, method) {
+        (Value::List(items), "push") => {
+            Rc::make_mut(items).push(args.remove(0));
+            Value::Unit
+        }
+        (Value::List(items), "pop") => match Rc::make_mut(items).pop() {
+            Some(v) => Value::some(v),
+            None => Value::none(),
+        },
+        (Value::List(items), "sort") => {
+            Rc::make_mut(items).sort_by(compare_values);
+            Value::Unit
+        }
+        (Value::Map(entries), "set") => {
+            let v = args.pop().unwrap();
+            let k = args.pop().unwrap();
+            let Some(key) = crate::value::MapKey::from_value(&k) else {
+                return Err(Flow::Panic(format!("invalid map key `{k}`")));
+            };
+            Rc::make_mut(entries).insert(key, v);
+            Value::Unit
+        }
+        (Value::Map(entries), "delete") => {
+            let k = args.pop().unwrap();
+            let Some(key) = crate::value::MapKey::from_value(&k) else {
+                return Err(Flow::Panic(format!("invalid map key `{k}`")));
+            };
+            Value::Bool(Rc::make_mut(entries).remove(&key).is_some())
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(r))
+}
+
+/// The binding a place expression is rooted at, if it is a place at all.
+fn place_root_name(e: &Expr) -> Option<String> {
+    let mut cur = e;
+    loop {
+        match cur {
+            Expr::Field { recv, .. } | Expr::Index { recv, .. } => cur = recv,
+            Expr::Ident(id) => return Some(id.name.clone()),
+            _ => return None,
+        }
+    }
+}
+
+/// Whether an expression may mention a name.
+///
+/// Deliberately blunt, and conservative in the one direction that matters:
+/// anything it does not recognise answers "yes". This decides whether it is
+/// safe to move a value out of its place for the duration of a call, and a
+/// false "yes" only costs the clone that used to happen unconditionally.
+fn mentions_ident(e: &Expr, name: &str) -> bool {
+    match e {
+        Expr::Ident(id) => id.name == name,
+        Expr::Int(..) | Expr::Float(..) | Expr::Bool(..) => false,
+        Expr::Str(pieces, _) => pieces.iter().any(|p| match p {
+            StrPiece::Expr(inner) => mentions_ident(inner, name),
+            _ => false,
+        }),
+        Expr::Unary { expr, .. } | Expr::Try { expr, .. } => mentions_ident(expr, name),
+        Expr::Field { recv, .. } => mentions_ident(recv, name),
+        Expr::Binary { lhs, rhs, .. } => {
+            mentions_ident(lhs, name) || mentions_ident(rhs, name)
+        }
+        Expr::Index { recv, index, .. } => {
+            mentions_ident(recv, name) || mentions_ident(index, name)
+        }
+        Expr::List(items, _) | Expr::Tuple(items, _) => {
+            items.iter().any(|i| mentions_ident(i, name))
+        }
+        Expr::Call { callee, args, .. } => {
+            mentions_ident(callee, name) || args.iter().any(|a| mentions_ident(a, name))
+        }
+        Expr::MethodCall { recv, args, .. } => {
+            mentions_ident(recv, name) || args.iter().any(|a| mentions_ident(a, name))
+        }
+        _ => true,
+    }
+}
+
+/// One step of a place path, with any index already evaluated.
+///
+/// Indices are values, not expressions, because walking to the slot needs a
+/// mutable borrow of the environment and evaluating an index needs the
+/// environment too. Doing all the evaluation first is what lets the walk be a
+/// single borrow.
+enum PathSeg {
+    Field(String),
+    Index(i64),
+}
+
 impl<'a, W: Write> Interp<'a, W> {
     pub fn new(module: &'a Module, out: &'a mut W) -> Self {
         let mut me = Self::raw_new(out);
@@ -1559,10 +1661,8 @@ build links it, `grasm run` can only reach what is already loaded",
                 let qual = format!("{}::{}", self.current_module, id.name);
                 if let Some(f) = self.fns.get(&qual).copied() {
                     let module = self.current_module.clone();
-                    let mut vs = Vec::with_capacity(args.len());
-                    for a in args {
-                        vs.push(self.eval_expr(a)?);
-                    }
+                    let modes: Vec<ParamMode> = f.params.iter().map(|p| p.mode).collect();
+                    let vs = self.eval_call_args(&modes, args, None)?;
                     let r = self.call_decl(f, &module, vs)?;
                     let arg_refs: Vec<&Expr> = args.iter().collect();
                     self.apply_writebacks(&arg_refs)?;
@@ -1668,10 +1768,8 @@ build links it, `grasm run` can only reach what is already loaded",
                 if let Some(target_mod) = target {
                     let qual = format!("{target_mod}::{}", name.name);
                     if let Some(f) = self.fns.get(&qual).copied() {
-                        let mut vs = Vec::with_capacity(args.len());
-                        for a in args {
-                            vs.push(self.eval_expr(a)?);
-                        }
+                        let modes: Vec<ParamMode> = f.params.iter().map(|p| p.mode).collect();
+                        let vs = self.eval_call_args(&modes, args, None)?;
                         let r = self.call_decl(f, &target_mod, vs)?;
                         let arg_refs: Vec<&Expr> = args.iter().collect();
                         self.apply_writebacks(&arg_refs)?;
@@ -1807,11 +1905,8 @@ build links it, `grasm run` can only reach what is already loaded",
         }
         if let Some(f) = self.fns.get(&ufcs_qual).copied() {
             let module = self.current_module.clone();
-            let mut vs = Vec::with_capacity(args.len() + 1);
-            vs.push(recv_v);
-            for a in args {
-                vs.push(self.eval_expr(a)?);
-            }
+            let modes: Vec<ParamMode> = f.params.iter().map(|p| p.mode).collect();
+            let vs = self.eval_call_args(&modes, args, Some(recv_v))?;
             let r = self.call_decl(f, &module, vs)?;
             let mut arg_refs: Vec<&Expr> = Vec::with_capacity(args.len() + 1);
             arg_refs.push(recv);
@@ -1850,6 +1945,147 @@ build links it, `grasm run` can only reach what is already loaded",
     }
 
     /// push/pop/sort mutate the receiver in place (copy-on-write at the slot).
+    /// Evaluates a call's arguments, moving `inout` ones out of their place.
+    ///
+    /// `inout` is an exclusive borrow: nothing else may observe the value
+    /// while the call runs, so the caller hands over its only reference and
+    /// takes it back at the writeback. Cloning instead left the caller's slot
+    /// holding a second reference, so the callee's first `push` found the
+    /// value shared and copied it — `add(xs, i)` in a loop was O(n) per call
+    /// and 40 000 calls took 3.5 seconds against 0.01 for the same loop
+    /// written inline.
+    ///
+    /// The move is skipped when another argument mentions the same root. The
+    /// checker allows `f(xs, xs)` where the first is `inout` and the second a
+    /// plain read, and that read must see the value, not the hole left behind.
+    fn eval_call_args(
+        &mut self,
+        modes: &[ParamMode],
+        args: &[Expr],
+        recv: Option<Value>,
+    ) -> Result<Vec<Value>, Flow> {
+        let shift = usize::from(recv.is_some());
+        let mut vs = Vec::with_capacity(args.len() + shift);
+        if let Some(r) = recv {
+            vs.push(r);
+        }
+        for (i, a) in args.iter().enumerate() {
+            let takeable = modes.get(i + shift) == Some(&ParamMode::Inout)
+                && place_root_name(a).is_some_and(|root| {
+                    !args
+                        .iter()
+                        .enumerate()
+                        .any(|(j, other)| j != i && mentions_ident(other, &root))
+                });
+            let v = if takeable {
+                match self.take_place(a)? {
+                    Some(v) => v,
+                    None => self.eval_expr(a)?,
+                }
+            } else {
+                self.eval_expr(a)?
+            };
+            vs.push(v);
+        }
+        Ok(vs)
+    }
+
+    /// Moves the value out of a place, leaving nothing behind.
+    fn take_place(&mut self, e: &Expr) -> Result<Option<Value>, Flow> {
+        let Some((root, path)) = self.place_path(e)? else {
+            return Ok(None);
+        };
+        Ok(self
+            .slot_mut(&root, &path)
+            .map(|slot| std::mem::replace(slot, Value::Unit)))
+    }
+
+    /// Resolves a place expression to a root binding and a path of steps.
+    ///
+    /// `None` when the expression is not a place rooted at a binding, or when
+    /// an index is not an integer — a map key is not a step this walk takes.
+    fn place_path(&mut self, e: &Expr) -> Result<Option<(String, Vec<PathSeg>)>, Flow> {
+        let mut segs: Vec<PathSeg> = Vec::new();
+        let mut cur = e;
+        loop {
+            match cur {
+                Expr::Field { recv, name, .. } => {
+                    segs.push(PathSeg::Field(name.name.clone()));
+                    cur = recv;
+                }
+                Expr::Index { recv, index, .. } => {
+                    let Value::Int(i) = self.eval_expr(index)? else {
+                        return Ok(None);
+                    };
+                    segs.push(PathSeg::Index(i));
+                    cur = recv;
+                }
+                Expr::Ident(id) => {
+                    segs.reverse();
+                    return Ok(Some((id.name.clone(), segs)));
+                }
+                _ => return Ok(None),
+            }
+        }
+    }
+
+    /// The slot a path names, ready to be written through.
+    ///
+    /// `Rc::make_mut` at each step is what keeps value semantics: a container
+    /// shared with anything else is copied here, and one that is not is
+    /// mutated where it lies.
+    fn slot_mut(&mut self, root: &str, path: &[PathSeg]) -> Option<&mut Value> {
+        // A `ref` root lives in the slab, not in the binding. Reading the
+        // slot id first — it is two integers, and copying it ends the borrow
+        // on the scopes — is what lets the walk continue into the shared
+        // heap, so mutating through a reference is as cheap as mutating a
+        // local. Without it every `node.edges.push(e)` copied the list.
+        let via_ref = match self.scopes.iter().rev().find_map(|s| s.get(root)) {
+            Some(Value::Ref(i, g)) if !path.is_empty() => Some((*i, *g)),
+            _ => None,
+        };
+        let mut cur = match via_ref {
+            Some((i, g)) => {
+                let idx = i as usize;
+                match self.slab.get_mut(idx) {
+                    Some((Some(v), gen)) if *gen == g => v,
+                    // A stale reference is a panic, and this is not the place
+                    // that reports one — the slow path does, with its message.
+                    _ => return None,
+                }
+            }
+            None => self
+                .scopes
+                .iter_mut()
+                .rev()
+                .find_map(|s| s.get_mut(root))?,
+        };
+        for seg in path {
+            cur = match (cur, seg) {
+                (Value::Struct { fields, .. }, PathSeg::Field(f)) => Rc::make_mut(fields)
+                    .iter_mut()
+                    .find(|(n, _)| n == f)
+                    .map(|(_, v)| v)?,
+                (Value::Tuple(items), PathSeg::Field(f)) => {
+                    let i: usize = f.parse().ok()?;
+                    Rc::make_mut(items).get_mut(i)?
+                }
+                (Value::List(items), PathSeg::Index(i)) => {
+                    let items = Rc::make_mut(items);
+                    let n = items.len() as i64;
+                    // A negative index counts from the end, as everywhere else.
+                    let i = if *i < 0 { n + *i } else { *i };
+                    if i < 0 || i >= n {
+                        return None;
+                    }
+                    &mut items[i as usize]
+                }
+                _ => return None,
+            };
+        }
+        Some(cur)
+    }
+
     fn try_mutating_method(
         &mut self,
         recv: &Expr,
@@ -1935,7 +2171,29 @@ build links it, `grasm run` can only reach what is already loaded",
                 _ => return Ok(None),
             }
         }
-        // Nested place (`bag.items.push(v)` / `obj.cache.set(k, v)`): clone +
+        // Nested place (`bag.items.push(v)` / `obj.cache.set(k, v)`).
+        //
+        // Walking to the slot and mutating it through `Rc::make_mut` is what
+        // makes this O(1) amortized like the bare-variable case above. It
+        // used to read the whole collection, clone it, and assign the clone
+        // back — so `s.xs.push(i)` in a loop was O(n) per push, and 40 000
+        // pushes took 3.5 seconds against 0.01 for the same loop on a plain
+        // variable. Value semantics are unaffected: `make_mut` copies exactly
+        // when the value is shared, which is the rule the fast path and the
+        // compiled backend already follow ([E-COW]).
+        if let Some(path) = self.place_path(recv)? {
+            let mut arg_vals = Vec::with_capacity(args.len());
+            for a in args {
+                arg_vals.push(self.eval_expr(a)?);
+            }
+            if let Some(slot) = self.slot_mut(&path.0, &path.1) {
+                if let Some(r) = mutate_in_place(slot, &name.name, &mut arg_vals)? {
+                    return Ok(Some(r));
+                }
+            }
+        }
+        // Anything the walk could not reach — a place rooted somewhere other
+        // than a binding, or a shape with no in-place mutator: read, modify,
         // write back.
         let current = self.eval_expr(recv)?;
         if let Value::Map(entries) = &current {
