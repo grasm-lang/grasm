@@ -347,8 +347,10 @@ brackets and recurse nowhere in the parser, and each builds a spine as deep as
 it is long. Every pass after the parser walks that spine by recursion, so
 8000 terms — well inside any bracket-counting limit — aborted the whole
 toolchain with `fatal runtime error: stack overflow` and nothing on stderr to
-say which program did it. A folded operator, a method call, a field access and
-an index each count as one level, exactly as a bracket does.
+say which program did it. A folded operator, a method call, a field access,
+an index, a pattern and a type each count as one level, exactly as a bracket
+does — and so does an interpolation, which is parsed as its own expression and
+so restarted the count from zero every time it nested.
 
 The exact number is deliberately not specified, and no diagnostic quotes one:
 the cap is far above any program a person writes, and where it sits depends on

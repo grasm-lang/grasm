@@ -113,11 +113,22 @@ pub fn parse_type_src(src: &str) -> Option<TypeExpr> {
 
 /// Parse a single expression (used by the REPL and interpolation).
 pub fn parse_expr_src(src: &str, offset: u32) -> (Option<Expr>, Vec<Diagnostic>) {
+    parse_expr_src_at(src, offset, 0)
+}
+
+/// The same, starting from a depth already spent.
+///
+/// An interpolation is parsed by a *new* parser, which started counting from
+/// zero — so nesting `"{ … }"` inside itself was the one shape the cap could
+/// not see, and 60 000 levels aborted the process with a stack overflow while
+/// 40 000 were accepted with no error at all ([G-NEST-LIMIT]).
+fn parse_expr_src_at(src: &str, offset: u32, depth: u32) -> (Option<Expr>, Vec<Diagnostic>) {
     let mut tokens = lex(src);
     for t in &mut tokens {
         t.span = Span::new(t.span.start + offset, t.span.end + offset);
     }
     let mut p = Parser::new(tokens);
+    p.depth = depth;
     p.skip_newlines();
     let expr = p.parse_expr().ok();
     // Everything between the braces has to be one expression. Parsing a
@@ -857,6 +868,16 @@ impl Parser {
     }
 
     fn parse_type(&mut self) -> PResult<TypeExpr> {
+        // Types nest, and everything that walks one recurses. `[[[…i64…]]]`
+        // at 250 000 deep aborted the process, and a 40 000-deep
+        // `Map[str, …]` took 45 seconds of `check` with nothing reported.
+        self.enter_nested()?;
+        let r = self.parse_type_atom();
+        self.depth -= 1;
+        r
+    }
+
+    fn parse_type_atom(&mut self) -> PResult<TypeExpr> {
         let start = self.cur_span();
         match self.cur().clone() {
             TokenKind::Ident(_) => {
@@ -1624,7 +1645,8 @@ impl Parser {
                     match part {
                         StrPart::Text(t) => pieces.push(StrPiece::Text(t)),
                         StrPart::Interp { src, offset } => {
-                            let (expr, mut diags) = parse_expr_src(&src, offset);
+                            let (expr, mut diags) =
+                                parse_expr_src_at(&src, offset, self.depth + 1);
                             self.diags.append(&mut diags);
                             match expr {
                                 Some(e) => pieces.push(StrPiece::Expr(e)),
