@@ -7,7 +7,7 @@ before it is listed as stable.
 `crates/grasm_spec` fails if a clause here is missing, unknown, or listed twice,
 so this file cannot drift away from the specification it describes.
 
-Today: 115 stable, 74 provisional, 23 experimental, of 212.
+Today: 115 stable, 75 provisional, 23 experimental, of 213.
 
 ## Stable
 
@@ -145,6 +145,7 @@ for "no problem found" to mean anything.
 - `E-COALESCE-DIVERGE` — provisional
 - `E-CONST` — provisional
 - `E-HANDLER-MISSING` — provisional
+- `E-HANDLER-OPS` — provisional
 - `E-HANDLER-OWN-ROW` — provisional
 - `E-IF-DIVERGE` — provisional
 - `E-INOUT-FAIL` — provisional

@@ -332,6 +332,13 @@ direction: it was previously charged only where the handler was *constructed*,
 so `fn run(h: LogHandler) / {}` installed a printing handler and the
 declared-empty row held.
 
+**[E-HANDLER-OPS]** A handler's operations are reached by performing the
+effect, not by reading them off the handler. They are the one function value
+whose row is not checked — that exemption is what lets a handler be written —
+so `h.info(x)`, `par_map(h.info)` and `let f = h.info` turned the exemption
+into a way to launder anything: `io` and `unsafe` crossed a declared empty
+row, and an operation carrying a handled effect left its `with` block.
+
 **[E-HANDLER-MISSING]** A user effect that reaches `main` or a test without a
 handler is rejected *at compile time*, so the runtime's missing-handler panic is
 a defensive backstop that well-typed programs never reach.

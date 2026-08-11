@@ -1428,6 +1428,13 @@ direction: it was previously charged only where the handler was *constructed*,
 so `fn run(h: LogHandler) / {}` installed a printing handler and the
 declared-empty row held.
 
+**[E-HANDLER-OPS]** A handler's operations are reached by performing the
+effect, not by reading them off the handler. They are the one function value
+whose row is not checked — that exemption is what lets a handler be written —
+so `h.info(x)`, `par_map(h.info)` and `let f = h.info` turned the exemption
+into a way to launder anything: `io` and `unsafe` crossed a declared empty
+row, and an operation carrying a handled effect left its `with` block.
+
 **[E-HANDLER-MISSING]** A user effect that reaches `main` or a test without a
 handler is rejected *at compile time*, so the runtime's missing-handler panic is
 a defensive backstop that well-typed programs never reach.
@@ -3058,6 +3065,32 @@ fn main() {
 }
 ```
 
+## `E-HANDLER-OPS.gr`
+
+```grasm
+//! tag: E-HANDLER-OPS
+//! expect: error
+//! is an operation of a handler
+// A handler's operations are called by performing the effect.
+//
+// They are the one function value with no row to check — that exemption is
+// what lets `LogHandler{ info: |m| print(m) }` be written at all. Reading one
+// back out turned the exemption into a laundry: this `quiet` declares the
+// empty row and prints, `par_map(h.info)` ran it on several cores, and one
+// carrying a handled effect escaped its `with` block.
+effect Log {
+    fn info(m: str)
+}
+
+fn quiet(h: LogHandler) / {} {
+    h.info("io from a function declaring nothing")
+}
+
+fn main() {
+    quiet(LogHandler{ info: |m| print("{m}") })
+}
+```
+
 ## `E-HANDLER-OWN-ROW.gr`
 
 ```grasm
@@ -3711,6 +3744,8 @@ fn main() {
 //! index
 //! value
 //! [[7], [0]]
+//! [15, 20, 30] 1
+//! [[10, 21], [30, 40]] 2
 // Subexpressions evaluate left to right — including an assignment's target.
 //
 // The walk that writes a value is what evaluates the target's index, so doing
@@ -3727,6 +3762,24 @@ fn main() {
     var rows = [[0], [0]]
     rows[note("index", 0)] = [note("value", 7)]
     print("{rows}")
+    // Once, and only once: a compound assignment reads and writes the same
+    // place, and the index that names it is one expression. The interpreter
+    // evaluated it twice and the compiled backend three times, so they wrote
+    // to different elements and disagreed about the answer.
+    var i = 0
+    var xs = [10, 20, 30]
+    xs[step(i)] += 5
+    print("{xs} {i}")
+    // Nested indices run outermost-first, which is leftmost-first.
+    var d = [[10, 20], [30, 40]]
+    d[step(i)][step(i)] += 1
+    print("{d} {i}")
+}
+
+fn step(inout n: i64) -> i64 {
+    let was = n
+    n = n + 1
+    was
 }
 ```
 

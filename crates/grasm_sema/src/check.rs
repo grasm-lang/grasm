@@ -189,6 +189,15 @@ struct Checker {
     fn_rows: HashMap<String, std::collections::BTreeSet<String>>,
     /// Each closure literal's row, keyed by span. See `rows_and_closures`.
     closure_rows: HashMap<u32, std::collections::BTreeSet<String>>,
+    /// The generated `EHandler` types.
+    ///
+    /// Their operation fields are the one place a function value is *not*
+    /// checked against a row — that exemption is what lets
+    /// `LogHandler{ info: |m| print(m) }` be written. Reading one back out
+    /// turned the exemption into a laundry: `h.info(x)` inside a `/ {}`
+    /// function printed, `par_map(h.info)` ran it on several cores, and one
+    /// carrying a handled effect escaped its `with` block.
+    handler_ids: std::collections::HashSet<TypeDefId>,
     /// How many `unsafe` blocks enclose the expression being checked.
     unsafe_depth: u32,
     /// How many `region` blocks enclose it.
@@ -291,6 +300,7 @@ impl Checker {
             fns: HashMap::new(),
             fn_rows: HashMap::new(),
             closure_rows: HashMap::new(),
+            handler_ids: std::collections::HashSet::new(),
             unsafe_depth: 0,
             discarding: false,
             tail_fn: None,
@@ -609,6 +619,7 @@ land in a copy the caller never sees — return the new value from the operation
                         fields: handler_fields,
                     },
                 });
+                self.handler_ids.insert(handler_id);
                 self.effects.insert(e.name.name.clone(), (ops, handler_id));
             }
         }
@@ -3209,6 +3220,27 @@ fail outside it",
                 }
             }
         }
+        // A handler's operations belong to the effect system. They are the
+        // one function value with no row to check — which is what lets a
+        // handler be written at all — so taking one out and calling it
+        // directly launders whatever it does. Asked here, after the
+        // type-qualified forms, because those receivers are not values.
+        if !matches!(recv, Expr::Ident(id) if self.lookup(&id.name).is_none()) {
+            let rt0 = self.infer_expr(recv);
+            if let Type::Named { id, .. } = self.uni.resolve(&rt0) {
+                if self.handler_ids.contains(&id)
+                    && matches!(&self.defs.get(id).kind, TypeDefKind::Struct { fields }
+                        if fields.iter().any(|(n, _)| n == &name.name))
+                {
+                    return self.error_help(
+                        span,
+                        format!("`{}` is an operation of a handler, not a field to read", name.name),
+                        "a handler's operations are called by performing the effect inside `with ... handled_by`, which is what makes their effects count where the handler is installed",
+                    );
+                }
+            }
+        }
+
         // `lib.WIDTH` — an exported constant. `pub let` parsed, checked and
         // did nothing: no other module could read one, `doc` omitted it and
         // `api` omitted it, so it was syntax with no meaning.

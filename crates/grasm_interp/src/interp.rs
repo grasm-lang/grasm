@@ -849,7 +849,15 @@ impl<'a, W: Write> Interp<'a, W> {
                 let final_v = if *op == AssignOp::Assign {
                     new
                 } else {
-                    let old = self.eval_expr(target)?;
+                    // Read through the path already resolved, not by
+                    // evaluating the target again: `xs[step(i)] += 5` must
+                    // call `step` once. Re-evaluating read one element and
+                    // wrote another, and the two engines disagreed about how
+                    // many times it happened ([E-ORDER-LTR]).
+                    let old = match &resolved {
+                        Some(segs) => self.read_rooted(target, segs)?,
+                        None => self.eval_expr(target)?,
+                    };
                     let bop = match op {
                         AssignOp::Add => BinaryOp::Add,
                         AssignOp::Sub => BinaryOp::Sub,
@@ -1052,21 +1060,100 @@ impl<'a, W: Write> Interp<'a, W> {
     // Places (assignment targets)
     // ------------------------------------------------------------------
 
+    /// Reads the value at a path already resolved to its root binding.
+    fn read_rooted(&mut self, target: &Expr, segs: &[Seg]) -> Result<Value, Flow> {
+        let mut root = target;
+        while let Expr::Field { recv, .. } | Expr::Index { recv, .. } = root {
+            root = recv;
+        }
+        let Expr::Ident(id) = root else {
+            return self.eval_expr(target);
+        };
+        let Some(mut cur) = self.scopes.iter().rev().find_map(|sc| sc.get(&id.name)).cloned()
+        else {
+            return self.eval_expr(target);
+        };
+        for seg in segs {
+            cur = match (&cur, seg) {
+                (Value::Ref(i, g), _) => {
+                    let idx = *i as usize;
+                    let live = matches!(self.slab.get(idx), Some((Some(_), gen)) if *gen == *g);
+                    if !live {
+                        return Err(Flow::Panic(
+                            "stale reference: the value it pointed to was released".to_string(),
+                        ));
+                    }
+                    let inner = self.slab[idx].0.clone().expect("checked live");
+                    match (&inner, seg) {
+                        (Value::Struct { fields, .. }, Seg::Field(f)) => fields
+                            .iter()
+                            .find(|(k, _)| k == f)
+                            .map(|(_, v)| v.clone())
+                            .ok_or_else(|| Flow::Panic(format!("no field `{f}`")))?,
+                        (Value::List(items), Seg::Index(i)) => items
+                            .get(*i)
+                            .cloned()
+                            .ok_or_else(|| Flow::Panic(format!("index {i} out of bounds")))?,
+                        _ => return self.eval_expr(target),
+                    }
+                }
+                (Value::Struct { fields, .. }, Seg::Field(f)) => fields
+                    .iter()
+                    .find(|(k, _)| k == f)
+                    .map(|(_, v)| v.clone())
+                    .ok_or_else(|| Flow::Panic(format!("no field `{f}`")))?,
+                (Value::Tuple(items), Seg::Field(f)) => {
+                    let i: usize = f.parse().map_err(|_| Flow::Panic(format!("no field `{f}`")))?;
+                    items
+                        .get(i)
+                        .cloned()
+                        .ok_or_else(|| Flow::Panic(format!("no component `{i}`")))?
+                }
+                (Value::List(items), Seg::Index(i)) => items
+                    .get(*i)
+                    .cloned()
+                    .ok_or_else(|| Flow::Panic(format!("index {i} out of bounds (len {})", items.len())))?,
+                _ => return self.eval_expr(target),
+            };
+        }
+        Ok(cur)
+    }
+
     /// The target's path, with its index expressions already evaluated.
     ///
     /// `None` when the target is not a place rooted at a name; the ordinary
     /// walk reports that, with its own message.
     fn place_segs(&mut self, target: &Expr) -> Result<Option<Vec<Seg>>, Flow> {
-        let mut segs: Vec<Seg> = Vec::new();
+        // The path is collected first and *then* evaluated, so the indices
+        // run root-to-leaf — left to right as written. Evaluating while
+        // walking inward ran `d[f()][g()]` as `g` then `f` ([E-ORDER-LTR]).
+        enum Step<'e> {
+            Field(String),
+            Index(&'e Expr),
+        }
+        let mut steps: Vec<Step> = Vec::new();
         let mut cur = target;
         loop {
             match cur {
                 Expr::Field { recv, name, .. } => {
-                    segs.push(Seg::Field(name.name.clone()));
+                    steps.push(Step::Field(name.name.clone()));
                     cur = recv;
                 }
                 Expr::Index { recv, index, .. } => {
-                    let idx = match self.eval_expr(index)? {
+                    steps.push(Step::Index(index));
+                    cur = recv;
+                }
+                Expr::Ident(_) => break,
+                _ => return Ok(None),
+            }
+        }
+        steps.reverse();
+        let mut segs: Vec<Seg> = Vec::with_capacity(steps.len());
+        for step in steps {
+            match step {
+                Step::Field(f) => segs.push(Seg::Field(f)),
+                Step::Index(e) => {
+                    let idx = match self.eval_expr(e)? {
                         Value::Int(i) => i,
                         other => {
                             return Err(Flow::Panic(format!(
@@ -1078,15 +1165,10 @@ impl<'a, W: Write> Interp<'a, W> {
                         return Err(Flow::Panic(format!("negative index {idx}")));
                     }
                     segs.push(Seg::Index(idx as usize));
-                    cur = recv;
                 }
-                Expr::Ident(_) => {
-                    segs.reverse();
-                    return Ok(Some(segs));
-                }
-                _ => return Ok(None),
             }
         }
+        Ok(Some(segs))
     }
 
     /// Writes `v` at a path already resolved to its root binding.

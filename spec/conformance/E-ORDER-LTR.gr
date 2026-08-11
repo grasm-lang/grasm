@@ -6,6 +6,8 @@
 //! index
 //! value
 //! [[7], [0]]
+//! [15, 20, 30] 1
+//! [[10, 21], [30, 40]] 2
 // Subexpressions evaluate left to right — including an assignment's target.
 //
 // The walk that writes a value is what evaluates the target's index, so doing
@@ -22,4 +24,23 @@ fn main() {
     var rows = [[0], [0]]
     rows[note("index", 0)] = [note("value", 7)]
     print("{rows}")
+    // Once, and only once: a compound assignment reads and writes the same
+    // place, and the index that names it is one expression. The interpreter
+    // evaluated it twice and the compiled backend three times, so they wrote
+    // to different elements and disagreed about the answer.
+    var i = 0
+    var xs = [10, 20, 30]
+    xs[step(i)] += 5
+    print("{xs} {i}")
+    // Nested indices run outermost-first, which is leftmost-first.
+    var j = 0
+    var d = [[10, 20], [30, 40]]
+    d[step(j)][step(j)] += 1
+    print("{d} {j}")
+}
+
+fn step(inout n: i64) -> i64 {
+    let was = n
+    n = n + 1
+    was
 }

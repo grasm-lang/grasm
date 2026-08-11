@@ -3281,7 +3281,7 @@ impl FnCx<'_, '_> {
                                 if elem_t == VType::F64 && val_t == VType::I64 {
                                     val = self.b.ins().fcvt_from_sint(types::F64, val);
                                 }
-                                let (iv, _) = self.eval_expr_val(ix)?;
+                                let (iv, _) = self.index_value(ix)?;
                                 let addr = self.pinned_address(data, len, iv, stride_of(&elem_t));
                                 let flags = cranelift_codegen::ir::MemFlags::trusted();
                                 let final_v = if *op == AssignOp::Assign {
@@ -3320,7 +3320,7 @@ impl FnCx<'_, '_> {
                                 val
                             } else {
                                 let cur = self.b.use_var(var);
-                                let (iv, _) = self.eval_expr_val(ix)?;
+                                let (iv, _) = self.index_value(ix)?;
                                 let kc = self.b.ins().iconst(types::I64, kind);
                                 let bits = self
                                     .call_rt("grasm_list_get_scalar", &[cur, iv, kc])
@@ -3343,7 +3343,7 @@ impl FnCx<'_, '_> {
                                 )?
                                 .0
                             };
-                            let (iv2, _) = self.eval_expr_val(ix)?;
+                            let (iv2, _) = self.index_value(ix)?;
                             let bits = self.scalar_bits_of(final_v, &elem_t);
                             let kc = self.b.ins().iconst(types::I64, kind);
                             let cur2 = self.b.use_var(var);
@@ -7603,9 +7603,16 @@ impl FnCx<'_, '_> {
     ) -> CResult<Value> {
         let mut cur = root;
         let mut cur_t = root_t.clone();
-        // Intermediate reads borrow; only the final read is unboxed.
+        // The accessors *increment* what they hand back, so an intermediate
+        // is released once the walk has moved past it — the comment here used
+        // to say they borrow, and they do not: `d[0][1] += 1` leaked the
+        // inner list on every execution.
+        let mut owned = false;
         for (i, seg) in path.iter().enumerate() {
             let is_last = i + 1 == path.len();
+            let prev = cur;
+            let prev_owned = owned;
+            let prev_t = cur_t.clone();
             let boxed = match (&cur_t, seg) {
                 (VType::Struct(sname), PlaceSeg::Field(f)) => {
                     let sname = sname.clone();
@@ -7624,8 +7631,17 @@ impl FnCx<'_, '_> {
                 }
                 _ => return nope(Span::new(0, 1), "this assignment target's shape"),
             };
+            owned = true;
+            if prev_owned && prev_t.boxed() {
+                self.call_rt("grasm_val_dec", &[prev]);
+            }
             if is_last {
                 let (v, _) = self.unbox(boxed, elem_t)?;
+                if elem_t.boxed() {
+                    // The unboxed value is the caller's; the box it came from
+                    // is this walk's and is finished with.
+                    self.call_rt("grasm_val_dec", &[boxed]);
+                }
                 return Ok(v);
             }
             cur = boxed;

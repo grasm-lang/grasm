@@ -1,0 +1,21 @@
+//! tag: E-HANDLER-OPS
+//! expect: error
+//! is an operation of a handler
+// A handler's operations are called by performing the effect.
+//
+// They are the one function value with no row to check — that exemption is
+// what lets `LogHandler{ info: |m| print(m) }` be written at all. Reading one
+// back out turned the exemption into a laundry: this `quiet` declares the
+// empty row and prints, `par_map(h.info)` ran it on several cores, and one
+// carrying a handled effect escaped its `with` block.
+effect Log {
+    fn info(m: str)
+}
+
+fn quiet(h: LogHandler) / {} {
+    h.info("io from a function declaring nothing")
+}
+
+fn main() {
+    quiet(LogHandler{ info: |m| print("{m}") })
+}
