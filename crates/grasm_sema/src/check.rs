@@ -2727,13 +2727,25 @@ closing brace",
 
     /// The declared type of `field` on a struct type, if `t` is one with it.
     fn struct_field_type(&mut self, t: &Type, field: &str) -> Option<Type> {
-        let Type::Named { id, .. } = self.uni.shallow_resolve(t) else {
-            return None;
-        };
-        let TypeDefKind::Struct { fields } = &self.defs.get(id).kind else {
-            return None;
-        };
-        fields.iter().find(|(n, _)| n == field).map(|(_, t)| t.clone())
+        match self.uni.shallow_resolve(t) {
+            Type::Named { id, .. } => {
+                let TypeDefKind::Struct { fields } = &self.defs.get(id).kind else {
+                    return None;
+                };
+                fields.iter().find(|(n, _)| n == field).map(|(_, t)| t.clone())
+            }
+            // A tuple's components are fields spelled with numbers. Reading
+            // one as a value already worked; calling one did not, so a
+            // function in a tuple could only be called by binding it to a
+            // name first — the same defect [T-FIELD-CALL] records for struct
+            // fields, and the help offered was `fn 0(...)`, which is not a
+            // name anyone can write.
+            Type::Tuple(items) => field.parse::<usize>().ok().and_then(|i| items.get(i).cloned()),
+            // Reading a field through a reference works, so calling one does
+            // too ([T-REF-READ]).
+            Type::Ref(inner) => self.struct_field_type(&inner, field),
+            _ => None,
+        }
     }
 
     /// Built-in methods on list/str/i64/f64. Returns None → not a builtin.

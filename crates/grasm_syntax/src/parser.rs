@@ -818,6 +818,14 @@ impl Parser {
         self.bump();
         let err = self.parse_type()?;
         let span = inner.span().merge(err.span());
+        if self.at(&TokenKind::Bang) {
+            // `T ! E ! E` used to be accepted, because the second `!` was
+            // read as a function declaration's error type — so the fix
+            // suggested for a mis-parsed `ref T ! E` compiled, as a different
+            // type from the one asked for.
+            self.error_here("a type can carry only one `!`".to_string());
+            return Err(());
+        }
         Ok(TypeExpr::Fallible(Box::new(inner), Box::new(err), span))
     }
 
@@ -861,8 +869,11 @@ impl Parser {
                 }
                 let rp = self.expect(&TokenKind::RParen)?;
                 let mut span = start.merge(rp.span);
+                // Same as `ref`: the `!` binds outside the function type,
+                // so `fn(i64) -> i64 ! E` is a fallible function value. An
+                // inner fallible return is written `fn(i64) -> (i64 ! E)`.
                 let ret = if self.eat(&TokenKind::Arrow) {
-                    let t = self.parse_type_nested()?;
+                    let t = self.parse_type()?;
                     span = span.merge(t.span());
                     Box::new(t)
                 } else {
@@ -899,9 +910,17 @@ impl Parser {
                 Ok(TypeExpr::List(Box::new(inner), start.merge(rb.span)))
             }
             // `ref T` — Tier 2.
+            //
+            // The referent is parsed *without* the fallible suffix, so
+            // `-> ref Node ! E` is `(ref Node) ! E` and not `ref (Node ! E)`.
+            // It used to be the latter, and the two errors that followed
+            // contradicted each other: "`fail` used in a function that
+            // declares no error type" alongside "must return `ref Node ! E`
+            // but its body produces `ref Node`". Applying the help verbatim
+            // gave `! E ! E`, which parsed as something else again.
             TokenKind::KwRef => {
                 self.bump();
-                let inner = self.parse_type_nested()?;
+                let inner = self.parse_type()?;
                 let sp = start.merge(inner.span());
                 Ok(TypeExpr::Ref(Box::new(inner), sp))
             }

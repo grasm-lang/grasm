@@ -483,14 +483,32 @@ fn decl_name(d: &Decl) -> String {
 fn fenced_blocks(doc: &str) -> Vec<String> {
     let mut blocks = Vec::new();
     let mut current: Option<Vec<String>> = None;
+    // Inside a fence whose info string says the contents are not Grasm.
+    let mut skipping = false;
     for line in doc.lines() {
         let trimmed = line.trim_start();
         if trimmed.starts_with("```") {
+            if skipping {
+                skipping = false;
+                continue;
+            }
             match current.take() {
                 // Closing fence.
                 Some(lines) => blocks.push(lines.join("\n")),
-                // Opening fence; an info string like ```grasm is ignored.
-                None => current = Some(Vec::new()),
+                None => {
+                    // Opening fence. An empty info string or `grasm` means
+                    // the block is an example and is run; anything else —
+                    // `text`, `console`, `toml`, `ignore` — means it is not.
+                    // Every block used to be run whatever it said, so there
+                    // was no way to show a manifest or a shell transcript in
+                    // documentation without breaking the test suite.
+                    let info = trimmed[3..].trim();
+                    if info.is_empty() || info == "grasm" {
+                        current = Some(Vec::new());
+                    } else {
+                        skipping = true;
+                    }
+                }
             }
             continue;
         }
@@ -653,6 +671,20 @@ mod tests {
     #[test]
     fn an_info_string_is_ignored() {
         assert_eq!(fenced_blocks("```grasm\nx\n```"), vec!["x"]);
+    }
+
+    #[test]
+    fn a_block_that_is_not_grasm_is_not_an_example() {
+        // Otherwise there is no way to show a manifest, a shell transcript,
+        // or deliberately-broken code in documentation.
+        assert!(fenced_blocks("```text\nname : dep @ cost\n```").is_empty());
+        assert!(fenced_blocks("```console\n$ grasm run x.gr\n```").is_empty());
+        assert!(fenced_blocks("```ignore\nnot valid\n```").is_empty());
+    }
+
+    #[test]
+    fn a_skipped_block_does_not_swallow_the_next_one() {
+        assert_eq!(fenced_blocks("```text\na : b\n```\n\n```\nx\n```"), vec!["x"]);
     }
 
     #[test]

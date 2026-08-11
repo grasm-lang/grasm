@@ -633,6 +633,12 @@ not call the field at all. A field shadows nothing: a real method or a UFCS
 free function of the same name still wins, and a non-function field called this
 way is still "no method".
 
+The same holds for the two other things a field can be reached through. A
+tuple's components are fields spelled with numbers, so `p.0(4)` calls the
+function in the first position; the error used to be "no method `0`", with
+help suggesting a free `fn 0(...)`, which is not a name that can be written.
+And a `ref` is read through, so `c.f(3)` calls the field of the referent.
+
 **[T-FN-TYPE-ROW-CARRIED]** The row is part of the **type**, so it is checked
 wherever a function value meets a written type — a parameter, a return type, a
 `let` annotation, a struct field, a list element, a map value, a tuple member,
@@ -6138,32 +6144,38 @@ fn main() {
 ```grasm
 //! tag: T-FIELD-CALL
 //! expect: output
-//! 10 hi bob
-//! 105 BOB
-//! 42 a
-// A struct field holding a function is called through the field.
+//! 10
+//! 8
+//! 6
+//! 7
+// A function held in a field is called through the field.
 //
-// Storing one and reading it back both worked; `n.run(5)` did not. The only
-// spelling that ran was `let f = n.run` and then `f(5)`, which nothing pointed
-// to — the error suggested declaring a free `fn run(Node, ...)`, which is a
-// different function and would not call the field.
-type Node = { name: str, run: fn(i64) -> i64, greet: fn(str) -> str }
+// Building the value and reading the field back both worked from the start
+// and the call did not, so the only spelling that ran was `let f = n.run`
+// followed by `f(5)` — which nothing pointed to. The same gap was left for a
+// tuple component, where the error suggested declaring `fn 0(...)`, and for a
+// field reached through a reference.
+type Node = { run: fn(i64) -> i64 }
+
+type Plain = { step: fn(i64) -> i64 }
 
 fn twice(n: i64) -> i64 {
     n * 2
 }
 
+fn step(p: Plain, x: i64) -> i64 {
+    x + 2
+}
+
 fn main() {
-    let n = Node{ name: "a", run: twice, greet: |s| "hi {s}" }
-    print("{n.run(5)} {n.greet("bob")}")
-    // A closure that captured something, stored in a field and called there.
-    let base = 100
-    let m = Node{ name: "b", run: |x| x + base, greet: |s| s.to_upper() }
-    print("{m.run(5)} {m.greet("bob")}")
-    // Reading the field as a value still works, and a plain field is still a
-    // plain field.
-    let f = n.run
-    print("{f(21)} {n.name}")
+    let n = Node{ run: twice }
+    print("{n.run(5)}")
+    let pair = (twice, "label")
+    print("{pair.0(4)}")
+    let r = ref(Node{ run: twice })
+    print("{r.run(3)}")
+    // A field shadows nothing: a UFCS free function of the same name wins.
+    print("{Plain{ step: twice }.step(5)}")
 }
 ```
 

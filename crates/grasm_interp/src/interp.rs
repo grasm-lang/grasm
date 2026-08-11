@@ -1822,15 +1822,26 @@ build links it, `grasm run` can only reach what is already loaded",
         // A field holding a function, called through the field. The checker
         // accepts this, so refusing here would be a well-typed program failing
         // at run time.
-        if let Value::Struct { fields, .. } = &recv_v {
-            if let Some((_, f)) = fields.iter().find(|(n, _)| *n == name.name) {
-                let callee = f.clone();
-                let mut vs = Vec::with_capacity(args.len());
-                for a in args {
-                    vs.push(self.eval_expr(a)?);
-                }
-                return self.call_value(callee, vs, &name.name);
+        // A tuple's components are fields spelled with numbers, and a
+        // reference is read through.
+        let callee = match &self.deref_value(recv_v.clone())? {
+            Value::Struct { fields, .. } => fields
+                .iter()
+                .find(|(n, _)| *n == name.name)
+                .map(|(_, f)| f.clone()),
+            Value::Tuple(items) => name
+                .name
+                .parse::<usize>()
+                .ok()
+                .and_then(|i| items.get(i).cloned()),
+            _ => None,
+        };
+        if let Some(callee) = callee {
+            let mut vs = Vec::with_capacity(args.len());
+            for a in args {
+                vs.push(self.eval_expr(a)?);
             }
+            return self.call_value(callee, vs, &name.name);
         }
         Err(Flow::Panic(format!(
             "no method `{}` on `{recv_v}`",

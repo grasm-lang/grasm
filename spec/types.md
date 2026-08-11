@@ -273,6 +273,12 @@ not call the field at all. A field shadows nothing: a real method or a UFCS
 free function of the same name still wins, and a non-function field called this
 way is still "no method".
 
+The same holds for the two other things a field can be reached through. A
+tuple's components are fields spelled with numbers, so `p.0(4)` calls the
+function in the first position; the error used to be "no method `0`", with
+help suggesting a free `fn 0(...)`, which is not a name that can be written.
+And a `ref` is read through, so `c.f(3)` calls the field of the referent.
+
 **[T-FN-TYPE-ROW-CARRIED]** The row is part of the **type**, so it is checked
 wherever a function value meets a written type — a parameter, a return type, a
 `let` annotation, a struct field, a list element, a map value, a tuple member,
