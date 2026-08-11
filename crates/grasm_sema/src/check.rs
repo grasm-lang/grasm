@@ -3669,12 +3669,30 @@ closing brace",
                     "fold" => {
                         let acc = self.uni.fresh();
                         if check_arity(self, 2) {
-                            self.check_expr(&args[0], &acc);
                             let f = Type::Fn {
                                 params: vec![acc.clone(), elem.clone()],
                                 ret: Box::new(acc.clone()),
                                 row: None,
                             };
+                            // The function first when the seed is an integer
+                            // literal: the literal adopts what it meets, and
+                            // checking it first made it decide instead.
+                            // `[1.0, 2.0].fold(0, |x, y| x + y)` reported the
+                            // mismatch on `x + y` and wanted `0.0` — and a
+                            // bare `0` is what anyone writes for an
+                            // accumulator ([T-INT-TO-FLOAT]).
+                            // Folding floats with a bare `0`: the seed is a
+                            // literal, so it adopts the element type rather
+                            // than deciding for it. Reordering the two checks
+                            // instead would break a closure that calls a
+                            // method *on* the accumulator, which needs its
+                            // type known first.
+                            if Self::is_int_literal(&args[0])
+                                && self.uni.shallow_resolve(&elem) == Type::F64
+                            {
+                                self.uni.unify(&acc, &Type::F64);
+                            }
+                            self.check_expr(&args[0], &acc);
                             self.check_expr(&args[1], &f);
                         }
                         acc

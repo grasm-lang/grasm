@@ -78,8 +78,10 @@ backend had been converting where it happened to remember to — differently, an
 in both cases incompletely. The checker now hands the set over, so the answer is
 the same one twice.
 
-Order does not matter. A list, a map's values, and a `match`'s arms are
-checked with their integer literals *last*, so whatever fixes the type does it
+Order does not matter, and neither does position. A `fold`'s seed adopts the
+element type, so `[1.5, 2.5].fold(0, |a, b| a + b)` needs no `0.0`. A list, a
+map's values, and a `match`'s arms are checked with their integer literals
+*last*, so whatever fixes the type does it
 first: `[1, 2.5]` and `[2.5, 1]` are both `[f64]`. Checking left to right made
 the first element decide, which is the asymmetry `[E-NUM-PROMOTE]` records as
 fixed for comparisons, still present one level up.
@@ -483,6 +485,12 @@ of distinct concurrent activities that share results through the enclosing
 scope ([E-SPAWN-SHARED]).
 
 ## 10. Modules
+
+"Fixed where it is written" means each `spawn` *statement* starts one task
+each time it is reached — not that the count is a constant. A `spawn` inside a
+`while` in the same block starts one per iteration, so the number can depend on
+a runtime value; what it cannot do is depend on a binding made inside the
+block, which is what the capture rule refuses.
 
 **[T-TYPE-ALIAS]** `type Name = T` gives a type another name; it is not a new
 type, and the two are interchangeable everywhere. An alias may name any type,
