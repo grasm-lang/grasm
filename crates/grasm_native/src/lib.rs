@@ -712,6 +712,9 @@ impl<'m> Codegen<'m> {
         }
         self.recursive = recursive_functions(views);
         if !self.fns.contains_key("main::main") {
+            // Not a backend limitation: a program without `main` has no
+            // entry point in any engine ([E-ENTRY]). The CLI checks for it
+            // before getting here, so this is a backstop.
             return nope(Span::new(0, 1), "programs without a `main` function");
         }
         for (name, m, _) in views {
@@ -6452,7 +6455,19 @@ impl FnCx<'_, '_> {
             return Ok(Some((out, out_t)));
         }
         let VType::Struct(sname) = rt else {
-            return nope(span, "field access on non-structs");
+            // A UFCS call — `xs.describe()` for a free `fn describe[T]` —
+            // reaches here as a field read, so refusing it as "field access
+            // on non-structs" named neither the construct nor the fix. §11
+            // says a refusal is by name.
+            let what = if matches!(rt, VType::List(_) | VType::Map(..) | VType::Str) {
+                format!(
+                    "a UFCS call of a generic function (`{}` here) — call it as `{}(x)` instead",
+                    name.name, name.name
+                )
+            } else {
+                "field access on non-structs".to_string()
+            };
+            return nope(span, &what);
         };
         let ft = self.struct_field_type(&sname, &name.name, span)?;
         let (fp, fl) = self.str_ptr_len(&name.name);

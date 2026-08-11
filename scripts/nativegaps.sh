@@ -208,6 +208,14 @@ fn main() {
     print("{TABLE[0](21)}")
 }'
 
+expect_refused "a UFCS call of a generic function" 'fn describe[T](xs: [T]) -> str {
+    "n={xs.len()}"
+}
+
+fn main() {
+    print("{[1, 2].describe()}")
+}'
+
 # The neighbouring shape that must keep compiling, so the row above stays as
 # narrow as it claims: a struct *containing* a ref compares fine.
 expect_compiled "== on a struct containing a ref" 'type N = { v: i64 }

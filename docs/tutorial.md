@@ -648,6 +648,7 @@ runs only under `grasm run`:
 | a handler operation that is a named `fn` | `SrcHandler{ get: named }` — write the closure inline |
 | `==` on two bare `ref`s | `a == b` — comparing structs or lists *containing* refs compiles |
 | calling a function value through anything but a name | `TABLE[0](21)`, `(m.get(k) ?? d)(x)` — bind it with `let` first, then call it |
+| a UFCS call of a *generic* free function | `[1, 2].describe()` for `fn describe[T](xs: [T])` — write `describe([1, 2])` |
 
 Each of these is a defect being worked off, not a design boundary. The list is
 checked against the implementation rather than remembered: if one of them

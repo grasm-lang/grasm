@@ -135,9 +135,26 @@ pub fn generate(rng: &mut Rng, te: &TypeExpr, size: u32) -> Value {
                 }),
                 "f64" => {
                     if rng.below(8) == 0 {
+                        // NaN is in the list. It was not, so a property over
+                        // `f64` never saw the one value `[L-LIB-SORT-NAN]`
+                        // and the NaN clause of [E-EQ-STRUCTURAL] exist for —
+                        // six thousand cases across two seeds produced
+                        // infinities, signed zeros and huge magnitudes, and
+                        // never a NaN. Subnormals and the extremes are here
+                        // for the same reason.
                         Value::Float(
-                            [0.0f64, -0.0, 1.0, -1.0, f64::INFINITY, f64::NEG_INFINITY]
-                                [rng.below(6) as usize],
+                            [
+                                0.0f64,
+                                -0.0,
+                                1.0,
+                                -1.0,
+                                f64::INFINITY,
+                                f64::NEG_INFINITY,
+                                f64::NAN,
+                                f64::MIN_POSITIVE,
+                                f64::MAX,
+                                f64::MIN,
+                            ][rng.below(10) as usize],
                         )
                     } else {
                         let scale = f64::from(size).max(1.0);

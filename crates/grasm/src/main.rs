@@ -268,6 +268,20 @@ fn run() -> ExitCode {
                 Ok(p) => p,
                 Err(code) => return code,
             };
+            // A program with no entry point is not a backend limitation
+            // ([E-ENTRY]). Leaving it to the native backend produced "does
+            // not yet support programs without a `main` function — use
+            // `grasm run`", which sends a reader to try something that fails
+            // there too, with a clearer message.
+            if !program.files.iter().any(|f| {
+                f.name == "main"
+                    && f.module.decls.iter().any(|d| {
+                        matches!(d, grasm_syntax::ast::Decl::Fn(fd) if fd.name.name == "main")
+                    })
+            }) {
+                eprintln!("error: no `main` function");
+                return ExitCode::FAILURE;
+            }
             if args.iter().any(|a| a == "--native") {
                 let target = args
                     .iter()

@@ -390,6 +390,12 @@ guarantee it provides is entirely static.
 **[E-TEST-PROPERTY]** A property test runs its body once per generated case.
 It passes only if every case holds; the first failing case ends the run.
 
+The `f64` generator produces NaN, both infinities, both zeros, the subnormal
+boundary and the extremes, as well as ordinary values. It did not produce NaN,
+so a property over `f64` never saw the one value `[L-LIB-SORT-NAN]` and
+`[E-EQ-STRUCTURAL]`'s NaN paragraph exist for — six thousand cases across two
+seeds found everything else and never that.
+
 **[E-TEST-SHRINK]** A failing property is reported with a *shrunk*
 counterexample: the runner repeatedly substitutes smaller inputs and keeps any
 that still fail, so the reported values are minimal rather than whatever the

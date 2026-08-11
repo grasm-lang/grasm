@@ -1450,6 +1450,12 @@ guarantee it provides is entirely static.
 **[E-TEST-PROPERTY]** A property test runs its body once per generated case.
 It passes only if every case holds; the first failing case ends the run.
 
+The `f64` generator produces NaN, both infinities, both zeros, the subnormal
+boundary and the extremes, as well as ordinary values. It did not produce NaN,
+so a property over `f64` never saw the one value `[L-LIB-SORT-NAN]` and
+`[E-EQ-STRUCTURAL]`'s NaN paragraph exist for — six thousand cases across two
+seeds found everything else and never that.
+
 **[E-TEST-SHRINK]** A failing property is reported with a *shrunk*
 counterexample: the runner repeatedly substitutes smaller inputs and keeps any
 that still fail, so the reported values are minimal rather than whatever the
@@ -2494,6 +2500,7 @@ runs only under `grasm run`:
 | a handler operation that is a named `fn` | `SrcHandler{ get: named }` — write the closure inline |
 | `==` on two bare `ref`s | `a == b` — comparing structs or lists *containing* refs compiles |
 | calling a function value through anything but a name | `TABLE[0](21)`, `(m.get(k) ?? d)(x)` — bind it with `let` first, then call it |
+| a UFCS call of a *generic* free function | `[1, 2].describe()` for `fn describe[T](xs: [T])` — write `describe([1, 2])` |
 
 Each of these is a defect being worked off, not a design boundary. The list is
 checked against the implementation rather than remembered: if one of them
