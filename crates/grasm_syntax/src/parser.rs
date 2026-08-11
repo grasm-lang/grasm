@@ -134,9 +134,20 @@ type PResult<T> = Result<T, ()>;
 
 /// Hard recursion cap: keeps deeply nested (possibly adversarial) input from
 /// overflowing the native stack (each level costs ~13 recursive-descent
-/// frames). 64 levels is far beyond any reasonable program. Applied to both
-/// expressions and blocks.
-const MAX_NESTING: u32 = 64;
+/// frames). Applied to both expressions and blocks.
+///
+/// The cap is on the *depth of the tree*, not on how many brackets were
+/// typed. `1 + 1 + … + 1` needs no brackets at all and parses without
+/// recursing, but it builds a left spine as deep as it is long, and every
+/// pass after the parser walks that spine by recursion: 8000 terms aborted
+/// the process with a stack overflow and no diagnostic. So a folded binary
+/// operator counts as a level, exactly as a bracket does.
+///
+/// The number is generous because it is not the real safety margin — the
+/// stack the tool runs on is (see `COMPILER_STACK`). It is here so that
+/// adversarial input gets a diagnostic instead of finding whatever the
+/// margin happens to be.
+const MAX_NESTING: u32 = 2048;
 
 struct Parser {
     toks: Vec<Token>,
@@ -179,9 +190,10 @@ impl Parser {
 
     fn enter_nested(&mut self) -> PResult<()> {
         if self.depth >= MAX_NESTING {
-            self.error_here(format!(
-                "code is nested too deeply (more than {MAX_NESTING} levels)"
-            ));
+            // Not a level count: a block costs more than one, and quoting a
+            // number that does not match where it fired is worse than
+            // quoting none.
+            self.error_here("code is nested too deeply".to_string());
             // Skip to EOF: no useful recovery from pathological nesting.
             while !matches!(self.toks[self.i].kind, TokenKind::Eof) {
                 self.i += 1;
@@ -1193,9 +1205,19 @@ impl Parser {
 
     pub(crate) fn parse_expr(&mut self) -> PResult<Expr> {
         self.enter_nested()?;
+        // Folding a binary operator deepens the tree, and `fold` charges for
+        // it without a matching release — so the whole chain is paid for and
+        // released together, here, when the expression is done.
+        let saved = self.depth;
         let r = self.parse_or();
-        self.depth -= 1;
+        self.depth = saved - 1;
         r
+    }
+
+    /// Charges one level of tree depth for a folded binary operator.
+    fn fold(&mut self, e: Expr) -> PResult<Expr> {
+        self.enter_nested()?;
+        Ok(e)
     }
 
     fn parse_or(&mut self) -> PResult<Expr> {
@@ -1205,12 +1227,12 @@ impl Parser {
             self.skip_newlines_if_continuation();
             let rhs = self.parse_and()?;
             let span = lhs.span().merge(rhs.span());
-            lhs = Expr::Binary {
+            lhs = self.fold(Expr::Binary {
                 op: BinaryOp::Or,
                 lhs: Box::new(lhs),
                 rhs: Box::new(rhs),
                 span,
-            };
+            })?;
         }
         Ok(lhs)
     }
@@ -1222,12 +1244,12 @@ impl Parser {
             self.skip_newlines_if_continuation();
             let rhs = self.parse_comparison()?;
             let span = lhs.span().merge(rhs.span());
-            lhs = Expr::Binary {
+            lhs = self.fold(Expr::Binary {
                 op: BinaryOp::And,
                 lhs: Box::new(lhs),
                 rhs: Box::new(rhs),
                 span,
-            };
+            })?;
         }
         Ok(lhs)
     }
@@ -1248,12 +1270,12 @@ impl Parser {
             self.skip_newlines_if_continuation();
             let rhs = self.parse_range()?;
             let span = lhs.span().merge(rhs.span());
-            lhs = Expr::Binary {
+            lhs = self.fold(Expr::Binary {
                 op,
                 lhs: Box::new(lhs),
                 rhs: Box::new(rhs),
                 span,
-            };
+            })?;
         }
         Ok(lhs)
     }
@@ -1283,12 +1305,12 @@ impl Parser {
             self.skip_newlines_if_continuation();
             let rhs = self.parse_pipeline()?;
             let span = lhs.span().merge(rhs.span());
-            lhs = Expr::Binary {
+            lhs = self.fold(Expr::Binary {
                 op: BinaryOp::Coalesce,
                 lhs: Box::new(lhs),
                 rhs: Box::new(rhs),
                 span,
-            };
+            })?;
         }
         Ok(lhs)
     }
@@ -1349,12 +1371,12 @@ impl Parser {
             self.skip_newlines_if_continuation();
             let rhs = self.parse_multiplicative()?;
             let span = lhs.span().merge(rhs.span());
-            lhs = Expr::Binary {
+            lhs = self.fold(Expr::Binary {
                 op,
                 lhs: Box::new(lhs),
                 rhs: Box::new(rhs),
                 span,
-            };
+            })?;
         }
         Ok(lhs)
     }
@@ -1372,12 +1394,12 @@ impl Parser {
             self.skip_newlines_if_continuation();
             let rhs = self.parse_power()?;
             let span = lhs.span().merge(rhs.span());
-            lhs = Expr::Binary {
+            lhs = self.fold(Expr::Binary {
                 op,
                 lhs: Box::new(lhs),
                 rhs: Box::new(rhs),
                 span,
-            };
+            })?;
         }
         Ok(lhs)
     }
@@ -1439,6 +1461,16 @@ impl Parser {
     fn parse_postfix(&mut self) -> PResult<Expr> {
         let mut expr = self.parse_primary()?;
         loop {
+            // A postfix chain deepens the tree exactly as a folded binary
+            // operator does — `(1).max(1).max(1)…` needs no brackets and
+            // recurses nowhere, and still built a spine deep enough to
+            // overflow every pass that walks it.
+            if matches!(
+                self.cur(),
+                TokenKind::LParen | TokenKind::Dot | TokenKind::LBracket
+            ) {
+                self.enter_nested()?;
+            }
             match self.cur() {
                 TokenKind::LParen => {
                     self.bump();

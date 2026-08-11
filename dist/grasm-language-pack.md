@@ -338,8 +338,22 @@ the scrutinee's type, in which case it tests for that variant.
 
 ## 11. Nesting limit
 
-**[G-NEST-LIMIT]** Expression and block nesting is capped at 64 levels.
-Exceeding it is a diagnostic, never a crash.
+**[G-NEST-LIMIT]** The depth of the syntax tree is capped. Exceeding the cap
+is a diagnostic, never a crash.
+
+The cap is on tree depth, not on how many brackets were typed, because those
+are not the same thing: `1 + 1 + … + 1` and `x.max(1).max(1)…` open no
+brackets and recurse nowhere in the parser, and each builds a spine as deep as
+it is long. Every pass after the parser walks that spine by recursion, so
+8000 terms — well inside any bracket-counting limit — aborted the whole
+toolchain with `fatal runtime error: stack overflow` and nothing on stderr to
+say which program did it. A folded operator, a method call, a field access and
+an index each count as one level, exactly as a bracket does.
+
+The exact number is deliberately not specified, and no diagnostic quotes one:
+the cap is far above any program a person writes, and where it sits depends on
+the stack the implementation gives itself. What is normative is that some cap
+exists and that reaching it is reported.
 
 
 <!-- ===== spec/types.md ===== -->
@@ -4103,12 +4117,19 @@ fn main() {
 ```grasm
 //! tag: G-NEST-LIMIT
 //! expect: output
-//! ok
+//! ok 1
+// Depth is bounded, and the bound is on the tree rather than on brackets.
+//
+// None of these three is deep: the point is that the second and third build a
+// spine as long as they are while opening no brackets at all, which is how a
+// few thousand terms used to abort the toolchain with a stack overflow and
+// nothing on stderr. They are counted the same way now.
 fn main() {
-    // Deep but within the 64-level cap.
-    let x = ((((((((((1))))))))))
-    if x == 1 {
-        print("ok")
+    let nested = ((((((((((1))))))))))
+    let chain = 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1
+    let postfix = (1).max(1).max(1).max(1).min(1)
+    if nested == 1 and chain == 8 {
+        print("ok {postfix}")
     }
 }
 ```

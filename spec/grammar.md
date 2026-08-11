@@ -323,5 +323,19 @@ the scrutinee's type, in which case it tests for that variant.
 
 ## 11. Nesting limit
 
-**[G-NEST-LIMIT]** Expression and block nesting is capped at 64 levels.
-Exceeding it is a diagnostic, never a crash.
+**[G-NEST-LIMIT]** The depth of the syntax tree is capped. Exceeding the cap
+is a diagnostic, never a crash.
+
+The cap is on tree depth, not on how many brackets were typed, because those
+are not the same thing: `1 + 1 + … + 1` and `x.max(1).max(1)…` open no
+brackets and recurse nowhere in the parser, and each builds a spine as deep as
+it is long. Every pass after the parser walks that spine by recursion, so
+8000 terms — well inside any bracket-counting limit — aborted the whole
+toolchain with `fatal runtime error: stack overflow` and nothing on stderr to
+say which program did it. A folded operator, a method call, a field access and
+an index each count as one level, exactly as a bracket does.
+
+The exact number is deliberately not specified, and no diagnostic quotes one:
+the cap is far above any program a person writes, and where it sits depends on
+the stack the implementation gives itself. What is normative is that some cap
+exists and that reaching it is reported.

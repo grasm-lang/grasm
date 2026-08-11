@@ -1,10 +1,17 @@
 //! tag: G-NEST-LIMIT
 //! expect: output
-//! ok
+//! ok 1
+// Depth is bounded, and the bound is on the tree rather than on brackets.
+//
+// None of these three is deep: the point is that the second and third build a
+// spine as long as they are while opening no brackets at all, which is how a
+// few thousand terms used to abort the toolchain with a stack overflow and
+// nothing on stderr. They are counted the same way now.
 fn main() {
-    // Deep but within the 64-level cap.
-    let x = ((((((((((1))))))))))
-    if x == 1 {
-        print("ok")
+    let nested = ((((((((((1))))))))))
+    let chain = 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1
+    let postfix = (1).max(1).max(1).max(1).min(1)
+    if nested == 1 and chain == 8 {
+        print("ok {postfix}")
     }
 }

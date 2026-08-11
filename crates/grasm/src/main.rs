@@ -15,7 +15,30 @@ const BUNDLE_MAGIC: &[u8; 8] = b"GRASMBDL";
 
 
 
+/// The stack the whole tool runs on.
+///
+/// Every pass after the parser — checking, formatting, the interpreter's own
+/// compile step, the native backend — walks the syntax tree by recursion, so
+/// the depth a program is allowed to reach and the stack available to walk it
+/// are one budget. The platform default is 8 MiB, which a flat chain of a few
+/// thousand terms exhausted: `let x = 1+1+…+1` aborted the process with
+/// `fatal runtime error: stack overflow` and no diagnostic, against
+/// [G-NEST-LIMIT]. The parser's cap is what keeps input inside this.
+const COMPILER_STACK: usize = 256 * 1024 * 1024;
+
 fn main() -> ExitCode {
+    match std::thread::Builder::new()
+        .stack_size(COMPILER_STACK)
+        .spawn(run)
+    {
+        Ok(h) => h.join().unwrap_or(ExitCode::FAILURE),
+        // If the thread cannot be spawned there is nothing left but to try on
+        // whatever stack we already have.
+        Err(_) => run(),
+    }
+}
+
+fn run() -> ExitCode {
     // Bundled-executable mode: our own binary carries a program.
     if let Some(bundle) = read_own_bundle() {
         let args: Vec<String> = std::env::args().skip(1).collect();
