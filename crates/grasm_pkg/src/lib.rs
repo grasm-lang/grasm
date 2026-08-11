@@ -901,6 +901,21 @@ fn edit_distance(a: &str, b: &str) -> usize {
 }
 
 /// Effects performed by a package's own source files (not its dependencies').
+/// Where a package performs each effect, for the ceiling message.
+///
+/// One representative site per effect. Effects a package only inherits from a
+/// call it makes have no site, and are reported by name alone as before.
+pub fn effect_sites_of_package(
+    manifest: &Manifest,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    let entry = manifest.entry_path();
+    if !entry.exists() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let program = grasm_sema::loader::load_from_disk(&entry)?;
+    Ok(grasm_sema::effects::effect_sites(&program))
+}
+
 pub fn effects_of_package(manifest: &Manifest) -> Result<BTreeSet<String>, String> {
     let entry = manifest.entry_path();
     if !entry.exists() {

@@ -26,6 +26,31 @@ const BUNDLE_MAGIC: &[u8; 8] = b"GRASMBDL";
 /// [G-NEST-LIMIT]. The parser's cap is what keeps input inside this.
 const COMPILER_STACK: usize = 256 * 1024 * 1024;
 
+/// The ceiling breach, said with the place the effect happens.
+///
+/// The message named the effect and stopped there, so a `capabilities = []`
+/// package that printed told you only that it printed — finding the `print`
+/// was then a manual search. Where an effect has a syntactic site, it is
+/// quoted; where it only arrives through a call the package makes, there is
+/// no honest line to point at and the name stands alone.
+fn ceiling_help(pkg: &grasm_pkg::Manifest, v: &grasm_pkg::CapabilityViolation) -> String {
+    let mut where_at: Vec<String> = Vec::new();
+    if let Ok(sites) = grasm_pkg::effect_sites_of_package(pkg) {
+        for e in &v.exceeded {
+            if let Some(at) = sites.get(e) {
+                where_at.push(format!("`{e}` at {at}"));
+            }
+        }
+    }
+    let mut help = String::from(
+        "either add the capability to that package's manifest, or stop it from performing the effect",
+    );
+    if !where_at.is_empty() {
+        help.push_str(&format!("\n  performed: {}", where_at.join(", ")));
+    }
+    help
+}
+
 fn main() -> ExitCode {
     match std::thread::Builder::new()
         .stack_size(COMPILER_STACK)
@@ -724,13 +749,8 @@ build against a dependency whose reach is unknown",
             continue;
         };
         if let Some(v) = grasm_pkg::check_capabilities(pkg, &performed) {
-            violations.push((
-                v.to_string(),
-                Some(
-                    "either add the capability to that package's manifest, or stop it from performing the effect"
-                        .to_string(),
-                ),
-            ));
+            let help = ceiling_help(pkg, &v);
+            violations.push((v.to_string(), Some(help)));
         }
     }
     if violations.is_empty() {
@@ -1335,7 +1355,8 @@ fn cmd_deps(dir: &std::path::Path, locked: bool) -> Result<(), String> {
             declared
         );
         if let Some(v) = grasm_pkg::check_capabilities(pkg, &performed) {
-            violations.push(v);
+            let help = ceiling_help(pkg, &v);
+            violations.push((v, help));
         }
         // A ceiling only means something if its names do. A capability naming
         // no real effect reads to a reviewer as a granted permission while
@@ -1374,12 +1395,9 @@ program declares"
     }
 
     if !violations.is_empty() {
-        for v in &violations {
+        for (v, help) in &violations {
             eprintln!("error: {v}");
-            eprintln!(
-                "  help: either add the capability to that package's manifest, \
-or stop it from performing the effect"
-            );
+            eprintln!("  help: {help}");
         }
         return Err(format!(
             "{} package(s) exceed their declared capabilities",

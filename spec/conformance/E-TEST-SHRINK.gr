@@ -2,6 +2,7 @@
 //! expect: test-output
 //! counterexample: n = 3
 //! counterexample: xs = [0, 0]
+//! counterexample: s = "aaa"
 // The generator produces large values, but the reported counterexample is the
 // smallest one that still fails.
 test "under three" (n: i64) {
@@ -12,6 +13,14 @@ test "under three" (n: i64) {
 
 test "at most one element" (xs: [i64]) {
     assert(xs.len() < 2)
+}
+
+// A shrunk string is simple as well as short. Length was the only thing
+// reduced at first, so a property failing on any three characters reported
+// whichever three the generator produced — `s = "🙂/🙂"` is length-minimal
+// and says nothing about why the property failed.
+test "under three characters" (s: str) {
+    assert(s.len() < 3)
 }
 
 fn main() {

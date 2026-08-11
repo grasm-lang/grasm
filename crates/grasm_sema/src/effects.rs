@@ -1397,3 +1397,184 @@ fn walk_expr(
         Expr::Closure { body, .. } => walk_expr(body, current, active, ctx, fnb, out),
     }
 }
+
+/// Where each effect is *directly* performed, one representative site each.
+///
+/// The capability ceiling reports which effects a package exceeds and used to
+/// stop there — so a `capabilities = []` package that printed somewhere told
+/// you only that it printed. Finding the `print` was then a manual search of
+/// the package. This answers "where", for the effects that have a syntactic
+/// site: an `io` builtin, a C function, an `unsafe` block, an effect
+/// operation. An effect reaching a package only through a call it makes has
+/// no site of its own and is left out; the message falls back to naming it.
+pub fn effect_sites(program: &crate::loader::Program) -> HashMap<String, String> {
+    let mut out: HashMap<String, String> = HashMap::new();
+    for file in &program.files {
+        let externs: HashSet<String> = file
+            .module
+            .decls
+            .iter()
+            .filter_map(|d| match d {
+                Decl::Extern(x) => Some(x.name.name.clone()),
+                _ => None,
+            })
+            .collect();
+        let effect_names: HashSet<String> = file
+            .module
+            .decls
+            .iter()
+            .filter_map(|d| match d {
+                Decl::Effect(e) => Some(e.name.name.clone()),
+                _ => None,
+            })
+            .collect();
+        // Rendered the same way every other diagnostic is: a path, a line,
+        // and a column. A byte offset into a virtual span space is not a
+        // place anyone can go and look at.
+        let mut note = |name: &str, span: Span| {
+            out.entry(name.to_string()).or_insert_with(|| {
+                let off = span.start.saturating_sub(file.base) as usize;
+                let upto = &file.src[..off.min(file.src.len())];
+                let line = upto.matches('\n').count() + 1;
+                let col = upto.rsplit('\n').next().map_or(1, |l| l.chars().count() + 1);
+                format!("{}:{line}:{col}", file.path)
+            });
+        };
+        for decl in &file.module.decls {
+            let Decl::Fn(f) = decl else { continue };
+            let mut sites: Vec<(String, Span)> = Vec::new();
+            site_block(&f.body, &externs, &effect_names, &mut sites);
+            for (n, sp) in sites {
+                note(&n, sp);
+            }
+        }
+    }
+    out
+}
+
+fn site_block(
+    b: &Block,
+    externs: &HashSet<String>,
+    effects: &HashSet<String>,
+    out: &mut Vec<(String, Span)>,
+) {
+    for s in &b.stmts {
+        match s {
+            Stmt::Let { init, .. } => site_expr(init, externs, effects, out),
+            Stmt::Assign { value, .. } => site_expr(value, externs, effects, out),
+            Stmt::Return(Some(e), _) | Stmt::Expr(e) => site_expr(e, externs, effects, out),
+            Stmt::While { body, cond, .. } => {
+                site_expr(cond, externs, effects, out);
+                site_block(body, externs, effects, out);
+            }
+            Stmt::For { body, iter, .. } => {
+                site_expr(iter, externs, effects, out);
+                site_block(body, externs, effects, out);
+            }
+            Stmt::With { body, .. } => site_block(body, externs, effects, out),
+            Stmt::Parallel { body, .. } | Stmt::Spawn { body, .. } => {
+                site_block(body, externs, effects, out)
+            }
+            _ => {}
+        }
+    }
+}
+
+fn site_expr(
+    e: &Expr,
+    externs: &HashSet<String>,
+    effects: &HashSet<String>,
+    out: &mut Vec<(String, Span)>,
+) {
+    match e {
+        Expr::Call { callee, args, span } => {
+            if let Expr::Ident(id) = &**callee {
+                if IO_BUILTINS.contains(&id.name.as_str()) {
+                    out.push((IO.to_string(), *span));
+                }
+                if externs.contains(&id.name) {
+                    out.push((IO.to_string(), *span));
+                    out.push((UNSAFE.to_string(), *span));
+                }
+            }
+            site_expr(callee, externs, effects, out);
+            for a in args {
+                site_expr(a, externs, effects, out);
+            }
+        }
+        Expr::MethodCall {
+            recv, name, args, span,
+        } => {
+            if let Expr::Ident(tid) = &**recv {
+                if effects.contains(&tid.name) {
+                    out.push((tid.name.clone(), *span));
+                }
+            }
+            let _ = name;
+            site_expr(recv, externs, effects, out);
+            for a in args {
+                site_expr(a, externs, effects, out);
+            }
+        }
+        Expr::Unsafe(b) => {
+            out.push((UNSAFE.to_string(), b.span));
+            site_block(b, externs, effects, out);
+        }
+        Expr::Block(b) | Expr::Region(b) => site_block(b, externs, effects, out),
+        Expr::If {
+            cond,
+            then_block,
+            else_branch,
+            ..
+        } => {
+            site_expr(cond, externs, effects, out);
+            site_block(then_block, externs, effects, out);
+            if let Some(eb) = else_branch {
+                match &**eb {
+                    ElseBranch::Else(b) => site_block(b, externs, effects, out),
+                    ElseBranch::ElseIf(inner) => site_expr(inner, externs, effects, out),
+                }
+            }
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            site_expr(scrutinee, externs, effects, out);
+            for a in arms {
+                site_expr(&a.body, externs, effects, out);
+            }
+        }
+        Expr::Closure { body, .. } => site_expr(body, externs, effects, out),
+        Expr::Unary { expr, .. } | Expr::Try { expr, .. } => {
+            site_expr(expr, externs, effects, out)
+        }
+        Expr::Field { recv, .. } => site_expr(recv, externs, effects, out),
+        Expr::Binary { lhs, rhs, .. } => {
+            site_expr(lhs, externs, effects, out);
+            site_expr(rhs, externs, effects, out);
+        }
+        Expr::Index { recv, index, .. } => {
+            site_expr(recv, externs, effects, out);
+            site_expr(index, externs, effects, out);
+        }
+        Expr::List(items, _) | Expr::Tuple(items, _) => {
+            for i in items {
+                site_expr(i, externs, effects, out);
+            }
+        }
+        Expr::Map(entries, _) => {
+            for (k, v) in entries {
+                site_expr(k, externs, effects, out);
+                site_expr(v, externs, effects, out);
+            }
+        }
+        Expr::Str(pieces, _) => {
+            for p in pieces {
+                if let StrPiece::Expr(inner) = p {
+                    site_expr(inner, externs, effects, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}

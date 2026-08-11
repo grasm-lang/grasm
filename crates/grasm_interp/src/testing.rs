@@ -225,6 +225,18 @@ fn shrink(v: &Value) -> Vec<Value> {
                 c.remove(i);
                 out.push(Value::str(c.into_iter().collect::<String>()));
             }
+            // Then simplify what is left. Length was the only thing shrunk
+            // before, so a property that fails on any three characters
+            // reported whatever three the generator happened to produce —
+            // `s = "🙂/🙂"` is length-minimal and tells you nothing about
+            // why. A counterexample is read, so it is worth making readable.
+            for i in 0..chars.len() {
+                if chars[i] != 'a' {
+                    let mut c = chars.clone();
+                    c[i] = 'a';
+                    out.push(Value::str(c.into_iter().collect::<String>()));
+                }
+            }
             out
         }
         Value::List(items) if items.is_empty() => vec![],
@@ -739,6 +751,32 @@ mod tests {
             }
         }
         assert_eq!(r.below(0), 0, "below(0) must not divide by zero");
+    }
+
+    #[test]
+    fn a_shrunk_string_is_simple_as_well_as_short() {
+        // Length-minimal is not enough: the counterexample is something a
+        // person reads, and `"🙂/🙂"` says nothing about the property.
+        let text = |v: &Value| match v {
+            Value::Str(s) => s.to_string(),
+            other => panic!("not a string: {other}"),
+        };
+        let mut cur = Value::str("🙂/🙂".to_string());
+        // Greedy, the way the harness does it: take the first candidate that
+        // is still three characters long.
+        for _ in 0..16 {
+            let Some(next) = shrink(&cur)
+                .into_iter()
+                .find(|c| matches!(c, Value::Str(s) if s.chars().count() == 3))
+            else {
+                break;
+            };
+            if text(&next) == text(&cur) {
+                break;
+            }
+            cur = next;
+        }
+        assert_eq!(text(&cur), "aaa");
     }
 
     #[test]

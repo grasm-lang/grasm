@@ -1339,7 +1339,10 @@ It passes only if every case holds; the first failing case ends the run.
 **[E-TEST-SHRINK]** A failing property is reported with a *shrunk*
 counterexample: the runner repeatedly substitutes smaller inputs and keeps any
 that still fail, so the reported values are minimal rather than whatever the
-generator happened to produce.
+generator happened to produce. Smaller means simpler as well as shorter — a
+string shrinks its characters toward `a` once it can no longer lose any, since
+`s = "🙂/🙂"` is length-minimal and tells a reader nothing about the property
+that rejected it.
 
 **[E-TEST-SEED]** Generation is driven entirely by a seed. The same seed and
 case count reproduce the same run exactly, and a failure reports the seed that
@@ -3909,6 +3912,7 @@ fn main() {
 //! expect: test-output
 //! counterexample: n = 3
 //! counterexample: xs = [0, 0]
+//! counterexample: s = "aaa"
 // The generator produces large values, but the reported counterexample is the
 // smallest one that still fails.
 test "under three" (n: i64) {
@@ -3919,6 +3923,14 @@ test "under three" (n: i64) {
 
 test "at most one element" (xs: [i64]) {
     assert(xs.len() < 2)
+}
+
+// A shrunk string is simple as well as short. Length was the only thing
+// reduced at first, so a property failing on any three characters reported
+// whichever three the generator produced — `s = "🙂/🙂"` is length-minimal
+// and says nothing about why the property failed.
+test "under three characters" (s: str) {
+    assert(s.len() < 3)
 }
 
 fn main() {
