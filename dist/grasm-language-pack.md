@@ -438,6 +438,16 @@ backend had been converting where it happened to remember to — differently, an
 in both cases incompletely. The checker now hands the set over, so the answer is
 the same one twice.
 
+An expected type also reaches a literal *through the shape that carries it*: a
+list, tuple or map literal, `Some`, `Ok`, `Err`, an `if`'s branches, a
+`match`'s arms, and the expression a function body ends with. Each of those
+used to report a type error about a program this clause calls well typed, and
+the last was the sharpest: `fn f() -> f64 { 3 }` was refused while
+`fn f() -> f64 { return 3 }` was accepted and printed `3.0`. In a `match` the
+first arm decided for all of them, so `let x: f64 = match n { 1 -> 2  _ -> 3.5 }`
+complained that the *second* arm produced `f64`, with help that said to "use a
+literal, which does adopt the other side" — which is what was written.
+
 **[T-EMPTY-LIT]** An empty collection literal takes its element type from the
 surrounding annotation, struct field, parameter, or return type. Without any
 of those the program is rejected.
@@ -6485,6 +6495,7 @@ fn main() {
 //! 7.0 4.0 -2.0
 //! 3.0 true
 //! 1.5 3.0
+//! 3.0 [1.0, 2.0] 5.0 3.0 3.0 1.0 2.0 2.0
 // An integer literal in an `f64` position is a float *everywhere*.
 //
 // [T-INT-TO-FLOAT] says the conversion happens at compile time, and only the
@@ -6522,6 +6533,28 @@ fn main() {
     // A method argument. The checker accepted this and the interpreter
     // panicked with `min expects a float`.
     print("{x.min(3)} {x.max(3)}")
+    // Every shape that *carries* an expected type inward. Each of these was
+    // once a type error about a program this clause says is well typed, and
+    // the tail-expression one was the sharpest: `fn tail() -> f64 { 3 }` was
+    // refused while `return 3` — the same value, one keyword apart — was
+    // accepted and printed `3.0`.
+    let list: [f64] = [1, 2]
+    let tup: (f64, str) = (5, "a")
+    let opt: Option[f64] = Some(3)
+    let fal: f64 ! Bad = Ok(3)
+    let mp: Map[str, f64] = {"k": 1}
+    let matched: f64 = match 1 {
+        1 -> 2
+        _ -> 3.5
+    }
+    let branch: f64 = if true { 2 } else { 3.5 }
+    print("{tail()} {list} {tup.0} {opt ?? 0.0} {fal ?? 0.0} {mp.get("k") ?? 0.0} {matched} {branch}")
+}
+
+type Bad = | Bad
+
+fn tail() -> f64 {
+    3
 }
 ```
 

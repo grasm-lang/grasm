@@ -159,6 +159,10 @@ struct Checker {
     /// How many `unsafe` blocks enclose the expression being checked.
     unsafe_depth: u32,
     /// How many `region` blocks enclose it.
+    /// Set while checking the expression a function's body ends with, so a
+    /// mismatch there is reported as what it is — the function's return value
+    /// — rather than as an anonymous type mismatch.
+    tail_fn: Option<String>,
     region_depth: u32,
     /// The scope depth at the start of each open region: a binding below its
     /// region's floor was declared outside and may not be written to.
@@ -241,6 +245,7 @@ impl Checker {
             fns: HashMap::new(),
             fn_rows: HashMap::new(),
             unsafe_depth: 0,
+            tail_fn: None,
             region_depth: 0,
             region_floors: Vec::new(),
             extern_names: std::collections::HashSet::new(),
@@ -865,8 +870,24 @@ land in a copy the caller never sees — return the new value from the operation
             );
         }
         self.scopes.push(scope);
-        let body_ty = self.check_block(&f.body);
         let ret = info.ret.clone();
+        // The tail expression is the return value, so it is checked against
+        // the declared return type rather than inferred and compared after.
+        // A fallible function's body may also produce the whole `T ! E`, and
+        // that is decided below, so it is not pushed down here.
+        let want_tail = if self.fn_err.is_none() && ret != Type::Unit {
+            Some(ret.clone())
+        } else {
+            None
+        };
+        // Only when the body actually ends in an expression: an explicit
+        // `return` is not "the last expression of the body", and saying so
+        // would attach the wrong advice to a plain type mismatch.
+        if want_tail.is_some() && matches!(f.body.stmts.last(), Some(Stmt::Expr(_))) {
+            self.tail_fn = Some(f.name.name.clone());
+        }
+        let body_ty = self.check_block_with(&f.body, want_tail.as_ref());
+        self.tail_fn = None;
         let ends_with_return = matches!(f.body.stmts.last(), Some(Stmt::Return(..)));
         // A fallible function's body may produce either the ok half — the
         // ordinary case, wrapped in `Ok` on the way out — or the whole
@@ -910,12 +931,30 @@ land in a copy the caller never sees — return the new value from the operation
 
     /// Returns the block's value type (last expression statement, else unit).
     fn check_block(&mut self, b: &Block) -> Type {
+        self.check_block_with(b, None)
+    }
+
+    /// Checks a block, pushing an expected type into its tail expression.
+    ///
+    /// The tail is the block's value, so a type known at the outside is known
+    /// there too. Without this an integer literal in tail position had no
+    /// expected type to adopt: `fn f() -> f64 { 3 }` was rejected while
+    /// `fn f() -> f64 { return 3 }` — the same value, one keyword apart —
+    /// was accepted and printed `3.0` ([T-INT-TO-FLOAT]).
+    fn check_block_with(&mut self, b: &Block, want: Option<&Type>) -> Type {
         self.scopes.push(HashMap::new());
         self.deferred_closures.push(Vec::new());
         let mut ty = Type::Unit;
         let n = b.stmts.len();
         for (i, stmt) in b.stmts.iter().enumerate() {
-            ty = self.check_stmt(stmt);
+            match (i + 1 == n, want, stmt) {
+                (true, Some(w), Stmt::Expr(e)) if *w != Type::Unit => {
+                    let w = w.clone();
+                    self.check_expr(e, &w);
+                    ty = w;
+                }
+                _ => ty = self.check_stmt(stmt),
+            }
             if i + 1 < n {
                 ty = Type::Unit;
             }
@@ -1485,6 +1524,7 @@ declaration into the region, or compute a number and yield that",
     // ------------------------------------------------------------------
 
     fn check_expr(&mut self, e: &Expr, expected: &Type) {
+        let tail_fn = self.tail_fn.take();
         let want = self.uni.shallow_resolve(expected);
         // Int literal adapts to f64. Recorded, not just allowed: the engines
         // have no types of their own and would otherwise keep the value an
@@ -1499,6 +1539,90 @@ declaration into the region, or compute a number and yield that",
                 return;
             }
         }
+        // [T-INT-TO-FLOAT-CARRIED]: the expected type reaches the literal
+        // through the shape that carries it. Without this the rule held only
+        // where the literal was the whole expression, so `let x: f64 = 3`
+        // worked and `let xs: [f64] = [1, 2]` did not — and neither did a
+        // tuple, `Some`, `Ok`, an `if`, or a `match`, each of which reported
+        // a type error about a program the clause says is well typed.
+        match (e, &want) {
+            (Expr::List(items, _), Type::List(elem)) => {
+                let elem = (**elem).clone();
+                for it in items {
+                    self.check_expr(it, &elem);
+                }
+                return;
+            }
+            (Expr::Tuple(items, _), Type::Tuple(ts)) if items.len() == ts.len() => {
+                let ts = ts.clone();
+                for (it, t) in items.iter().zip(&ts) {
+                    self.check_expr(it, t);
+                }
+                return;
+            }
+            (Expr::Map(entries, _), Type::Map(k, v)) => {
+                let (k, v) = ((**k).clone(), (**v).clone());
+                for (ke, ve) in entries {
+                    self.check_expr(ke, &k);
+                    self.check_expr(ve, &v);
+                }
+                return;
+            }
+            // `Some(3)` against `Option[f64]`, `Ok(3)` and `Err(3)` against
+            // `f64 ! E`. A user-declared variant already carried its
+            // declared field type down; the three built-in ones did not.
+            (Expr::Call { callee, args, .. }, _) if args.len() == 1 => {
+                if let Expr::Ident(id) = &**callee {
+                    let inner = match (id.name.as_str(), &want) {
+                        ("Some", Type::Named { id: nid, args: targs })
+                            if self.defs.get(*nid).name == "Option" && targs.len() == 1 =>
+                        {
+                            Some(targs[0].clone())
+                        }
+                        ("Ok", Type::Fallible(ok, _)) => Some((**ok).clone()),
+                        ("Err", Type::Fallible(_, err)) => Some((**err).clone()),
+                        _ => None,
+                    };
+                    if let Some(inner) = inner {
+                        self.check_expr(&args[0], &inner);
+                        return;
+                    }
+                }
+            }
+            _ => {}
+        }
+        // The same, through the shapes whose value is another expression.
+        match e {
+            Expr::Block(b) => {
+                let t = self.check_block_with(b, Some(&want));
+                self.unify_or_report(e.span(), &t, &want);
+                return;
+            }
+            Expr::Match {
+                scrutinee, arms, ..
+            } => {
+                let t = self.infer_match_with(scrutinee, arms, e.span(), Some(&want));
+                self.unify_or_report(e.span(), &t, &want);
+                return;
+            }
+            Expr::If {
+                cond,
+                then_block,
+                else_branch: Some(eb),
+                ..
+            } => {
+                self.check_expr(cond, &Type::Bool);
+                self.check_block_with(then_block, Some(&want));
+                match &**eb {
+                    ElseBranch::Else(b) => {
+                        self.check_block_with(b, Some(&want));
+                    }
+                    ElseBranch::ElseIf(inner) => self.check_expr(inner, &want),
+                }
+                return;
+            }
+            _ => {}
+        }
         // Closures check against an expected fn type for param inference.
         if let (Expr::Closure { .. }, Type::Fn { .. }) = (e, &want) {
             let got = self.infer_closure(e, Some(&want));
@@ -1507,6 +1631,18 @@ declaration into the region, or compute a number and yield that",
         }
         let got = self.infer_expr(e);
         self.check_row_fits(&got, &want, e.span());
+        if let Some(name) = tail_fn {
+            if !self.uni.unify(&got, &want) {
+                let w = self.show(&want);
+                let g = self.show(&got);
+                self.error_help(
+                    e.span(),
+                    format!("function `{name}` must return `{w}` but its body produces `{g}`"),
+                    "the last expression of the body is the return value",
+                );
+            }
+            return;
+        }
         self.unify_or_report(e.span(), &got, &want);
     }
 
@@ -3603,6 +3739,16 @@ it behind a `ref`, which copies as a slot rather than as a value and so is share
     // ------------------------------------------------------------------
 
     fn infer_match(&mut self, scrutinee: &Expr, arms: &[Arm], span: Span) -> Type {
+        self.infer_match_with(scrutinee, arms, span, None)
+    }
+
+    fn infer_match_with(
+        &mut self,
+        scrutinee: &Expr,
+        arms: &[Arm],
+        span: Span,
+        want: Option<&Type>,
+    ) -> Type {
         let scrut_ty = self.infer_expr(scrutinee);
         // Matching through a reference matches what it points at. Without
         // this a `ref` to a sum type could never be opened — `r.v` said "sum
@@ -3613,7 +3759,15 @@ it behind a `ref`, which copies as a slot rather than as a value and so is share
             Type::Ref(inner) => *inner,
             _ => scrut_ty,
         };
-        let result = self.uni.fresh();
+        // Seeded from the outside when the caller knows what it wants, so
+        // every arm adopts it rather than the first arm deciding for all of
+        // them: `let x: f64 = match n { 1 -> 2  _ -> 3.5 }` reported that the
+        // second arm produced `f64` where `i64` was expected, having settled
+        // the question on the first.
+        let result = match want {
+            Some(w) => w.clone(),
+            None => self.uni.fresh(),
+        };
         let mut covered: Vec<String> = Vec::new();
         let mut has_irrefutable = false;
         for arm in arms {

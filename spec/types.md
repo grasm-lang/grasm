@@ -78,6 +78,16 @@ backend had been converting where it happened to remember to — differently, an
 in both cases incompletely. The checker now hands the set over, so the answer is
 the same one twice.
 
+An expected type also reaches a literal *through the shape that carries it*: a
+list, tuple or map literal, `Some`, `Ok`, `Err`, an `if`'s branches, a
+`match`'s arms, and the expression a function body ends with. Each of those
+used to report a type error about a program this clause calls well typed, and
+the last was the sharpest: `fn f() -> f64 { 3 }` was refused while
+`fn f() -> f64 { return 3 }` was accepted and printed `3.0`. In a `match` the
+first arm decided for all of them, so `let x: f64 = match n { 1 -> 2  _ -> 3.5 }`
+complained that the *second* arm produced `f64`, with help that said to "use a
+literal, which does adopt the other side" — which is what was written.
+
 **[T-EMPTY-LIT]** An empty collection literal takes its element type from the
 surrounding annotation, struct field, parameter, or return type. Without any
 of those the program is rejected.
