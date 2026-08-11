@@ -1,12 +1,25 @@
 //! tag: E-ORDER-LTR
 //! expect: output
-//! a
-//! b
+//! left
+//! right
 //! 3
-fn note(s: str, v: i64) -> i64 {
-    print(s)
+//! index
+//! value
+//! [[7], [0]]
+// Subexpressions evaluate left to right — including an assignment's target.
+//
+// The walk that writes a value is what evaluates the target's index, so doing
+// it after the value ran `xs[f()] = g()` as `g` then `f`. Both engines agreed
+// on the wrong order, which is why no differential test could see it.
+fn note(tag: str, v: i64) -> i64 {
+    print("{tag}")
     v
 }
+
 fn main() {
-    print("{note("a", 1) + note("b", 2)}")
+    let sum = note("left", 1) + note("right", 2)
+    print("{sum}")
+    var rows = [[0], [0]]
+    rows[note("index", 0)] = [note("value", 7)]
+    print("{rows}")
 }

@@ -1250,6 +1250,7 @@ impl<'m> Codegen<'m> {
             pinned: Vec::new(),
             tail_hint: None,
             probe_types: Vec::new(),
+            index_vals: HashMap::new(),
             task_scopes: Vec::new(),
         };
 
@@ -1623,6 +1624,7 @@ to one — a loop variable or a list element is this case",
             pinned: Vec::new(),
             tail_hint: None,
             probe_types: Vec::new(),
+            index_vals: HashMap::new(),
             task_scopes: Vec::new(),
         };
         let entry = fcx.b.create_block();
@@ -1702,6 +1704,7 @@ to one — a loop variable or a list element is this case",
             pinned: Vec::new(),
             tail_hint: None,
             probe_types: Vec::new(),
+            index_vals: HashMap::new(),
             task_scopes: Vec::new(),
         };
         let entry = fcx.b.create_block();
@@ -1798,6 +1801,7 @@ to one — a loop variable or a list element is this case",
             pinned: Vec::new(),
             tail_hint: None,
             probe_types: Vec::new(),
+            index_vals: HashMap::new(),
             task_scopes: Vec::new(),
         };
         let entry = fcx.b.create_block();
@@ -1941,6 +1945,12 @@ struct FnCx<'a, 'm> {
     /// because a probe must not create a Cranelift variable — one declared and
     /// never defined is read as garbage if anything later uses it.
     probe_types: Vec<HashMap<String, VType>>,
+    /// Assignment-target index expressions, evaluated before the value.
+    ///
+    /// `xs[f()] = g()` must run `f` before `g` ([E-ORDER-LTR]), and the walk
+    /// that writes the value is what evaluates the indices — so doing it
+    /// after left the order reversed. Keyed by span, cleared per statement.
+    index_vals: HashMap<u32, (Value, VType)>,
     /// One entry per enclosing `parallel` block: the runtime list that records
     /// which spawn sites fired, and how many sites have been lowered so far.
     ///
@@ -3216,9 +3226,34 @@ impl FnCx<'_, '_> {
                 span,
                 ..
             } => {
+                self.index_vals.clear();
                 // Field/index places (any depth, plain or compound).
                 if matches!(target, Expr::Field { .. } | Expr::Index { .. }) {
                     let (root, path) = self.place_path(target)?;
+                    // The target's own subexpressions run first, before the
+                    // value: `xs[f()] = g()` calls `f` then `g`
+                    // ([E-ORDER-LTR]). The walk that writes is what evaluates
+                    // them, so without this they ran last.
+                    let index_spans: Vec<Span> = path
+                        .iter()
+                        .filter_map(|seg| match seg {
+                            PlaceSeg::Index(ix) => Some(ix.span()),
+                            _ => None,
+                        })
+                        .collect();
+                    if !index_spans.is_empty() {
+                        let exprs: Vec<&Expr> = path
+                            .iter()
+                            .filter_map(|seg| match seg {
+                                PlaceSeg::Index(ix) => Some(*ix),
+                                _ => None,
+                            })
+                            .collect();
+                        for (ix, sp) in exprs.iter().zip(&index_spans) {
+                            let v = self.eval_expr_val(ix)?;
+                            self.index_vals.insert(sp.start, v);
+                        }
+                    }
                     let Some((var, root_t)) = self.lookup(&root.name) else {
                         return nope(root.span, "assignment to unknown variable");
                     };
@@ -7396,6 +7431,15 @@ impl FnCx<'_, '_> {
     }
 
     /// Splits a place expression into its root variable and access path.
+    /// An index expression's value, taken from the pre-evaluated cache when
+    /// this is an assignment target.
+    fn index_value(&mut self, ix: &Expr) -> CResult<(Value, VType)> {
+        if let Some(v) = self.index_vals.get(&ix.span().start) {
+            return Ok(v.clone());
+        }
+        self.eval_expr_val(ix)
+    }
+
     fn place_path<'e>(&mut self, e: &'e Expr) -> CResult<(&'e Ident, Vec<PlaceSeg<'e>>)> {
         let mut segs: Vec<PlaceSeg<'e>> = Vec::new();
         let mut cur = e;
@@ -7458,7 +7502,7 @@ impl FnCx<'_, '_> {
                 }
                 (VType::List(e), PlaceSeg::Index(ix)) => {
                     let et = (**e).clone();
-                    let (iv, _) = self.eval_expr_val(ix)?;
+                    let (iv, _) = self.index_value(ix)?;
                     let v = self.call_rt("grasm_list_get", &[cur, iv]).unwrap();
                     cur_t = et;
                     v
@@ -7555,7 +7599,7 @@ impl FnCx<'_, '_> {
                 }
                 (VType::List(e), PlaceSeg::Index(ix)) => {
                     let et = (**e).clone();
-                    let (iv, _) = self.eval_expr_val(ix)?;
+                    let (iv, _) = self.index_value(ix)?;
                     cur = self.take_or_get(
                         "grasm_list_take",
                         "grasm_list_get",
@@ -7599,7 +7643,7 @@ impl FnCx<'_, '_> {
                         .unwrap())
                 }
                 (VType::List(_), PlaceSeg::Index(ix)) => {
-                    let (iv, _) = self.eval_expr_val(ix)?;
+                    let (iv, _) = self.index_value(ix)?;
                     Ok(self
                         .call_rt("grasm_list_set", &[root, iv, boxed_val])
                         .unwrap())
@@ -7619,7 +7663,7 @@ impl FnCx<'_, '_> {
                         }
                         (VType::List(e), PlaceSeg::Index(ix)) => {
                             let et = (**e).clone();
-                            let (iv, _) = self.eval_expr_val(ix)?;
+                            let (iv, _) = self.index_value(ix)?;
                             let c = self.call_rt("grasm_list_get", &[root, iv]).unwrap();
                             let _ = iv;
                             (c, et, PlaceSeg::Index(ix))
@@ -7635,7 +7679,7 @@ impl FnCx<'_, '_> {
                             .unwrap())
                     }
                     (VType::List(_), PlaceSeg::Index(ix)) => {
-                        let (iv, _) = self.eval_expr_val(ix)?;
+                        let (iv, _) = self.index_value(ix)?;
                         Ok(self
                             .call_rt("grasm_list_set", &[root, iv, new_child])
                             .unwrap())

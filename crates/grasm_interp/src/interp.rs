@@ -64,6 +64,12 @@ pub struct Interp<'a, W: Write> {
     slab: Vec<(Option<Value>, u32)>,
     /// Slots free for reuse.
     slab_free: Vec<u32>,
+    /// An assignment target's path, resolved before its value is evaluated.
+    ///
+    /// `xs[f()] = g()` must run `f` before `g` ([E-ORDER-LTR]), and the walk
+    /// that writes the value is what evaluates the indices — so doing it
+    /// after left the order reversed.
+    pending_segs: Option<Vec<Seg>>,
     /// `type Res = i64 ! E` — needed to tell whether a function that returns
     /// an alias is fallible, which decides whether its value is wrapped.
     aliases: HashMap<String, TypeExpr>,
@@ -442,6 +448,7 @@ impl<'a, W: Write> Interp<'a, W> {
             float_sums: std::collections::HashSet::new(),
             slab: Vec::new(),
             slab_free: Vec::new(),
+            pending_segs: None,
             aliases: HashMap::new(),
             externs: HashMap::new(),
             fallible_ops: std::collections::HashSet::new(),
@@ -835,6 +842,11 @@ impl<'a, W: Write> Interp<'a, W> {
             Stmt::Assign {
                 target, op, value, ..
             } => {
+                // The target's own subexpressions come first: `xs[f()] = g()`
+                // runs `f` before `g` ([E-ORDER-LTR]). Evaluating the value
+                // and only then walking the place ran them the other way
+                // round, consistently in every engine.
+                self.pending_segs = self.place_segs(target)?;
                 let new = self.eval_expr(value)?;
                 let final_v = if *op == AssignOp::Assign {
                     new
@@ -1027,8 +1039,175 @@ impl<'a, W: Write> Interp<'a, W> {
     // Places (assignment targets)
     // ------------------------------------------------------------------
 
+    /// The target's path, with its index expressions already evaluated.
+    ///
+    /// `None` when the target is not a place rooted at a name; the ordinary
+    /// walk reports that, with its own message.
+    fn place_segs(&mut self, target: &Expr) -> Result<Option<Vec<Seg>>, Flow> {
+        let mut segs: Vec<Seg> = Vec::new();
+        let mut cur = target;
+        loop {
+            match cur {
+                Expr::Field { recv, name, .. } => {
+                    segs.push(Seg::Field(name.name.clone()));
+                    cur = recv;
+                }
+                Expr::Index { recv, index, .. } => {
+                    let idx = match self.eval_expr(index)? {
+                        Value::Int(i) => i,
+                        other => {
+                            return Err(Flow::Panic(format!(
+                                "index must be an int, got `{other}`"
+                            )))
+                        }
+                    };
+                    if idx < 0 {
+                        return Err(Flow::Panic(format!("negative index {idx}")));
+                    }
+                    segs.push(Seg::Index(idx as usize));
+                    cur = recv;
+                }
+                Expr::Ident(_) => {
+                    segs.reverse();
+                    return Ok(Some(segs));
+                }
+                _ => return Ok(None),
+            }
+        }
+    }
+
+    /// Writes `v` at a path already resolved to its root binding.
+    fn assign_rooted(&mut self, id: &Ident, segs: Vec<Seg>, v: Value) -> Result<(), Flow> {
+        // A `ref` root: the value lives in the slab, not in the
+        // binding, so it comes out, is written through, and goes
+        // back. Without this a write through a reference — the
+        // whole reason Tier 2 exists — typechecked and then
+        // panicked `cannot access field of ref#0.0`, which left a
+        // `ref` graph write-once and a cycle impossible to close.
+        // Only when there is a path to walk. `at = other` with
+        // no segments rebinds the *variable*; taking the reference
+        // path there overwrote the node `at` pointed at, which
+        // silently replaced a graph node with a reference to
+        // another one. The checker draws the same line.
+        // A `ref` anywhere on the path, not only at the root.
+        // Writing *through* a reference does not modify what
+        // holds it, so the way there is read-only and the write
+        // lands in the slab. Only the root was handled, so
+        // `rs[0].v = 5` and `h.r.v = 9` — a node in a list and a
+        // node in a field, which is the ordinary Tier 2 arena —
+        // typechecked and panicked `cannot access field 'v' of
+        // 'ref#0.0'` ([T-REF-WRITE], [T-REF-GENERATIONAL]).
+        let via = self
+            .scopes
+            .iter()
+            .rev()
+            .find_map(|sc| sc.get(&id.name))
+            .cloned()
+            .and_then(|rv| deepest_ref(&rv, &segs));
+        if let Some((consumed, i, g)) = via {
+            let idx = i as usize;
+            let live = matches!(self.slab.get(idx), Some((Some(_), gen)) if *gen == g);
+            if !live {
+                return Err(Flow::Panic(
+                    "stale reference: the value it pointed to was released".to_string(),
+                ));
+            }
+            let mut inner = self.slab[idx].0.take().expect("checked live");
+            let r = assign_into(&mut inner, &segs[consumed..], v);
+            self.slab[idx].0 = Some(inner);
+            return r;
+        }
+        let root_ref = self
+            .scopes
+            .iter()
+            .rev()
+            .filter(|_| !segs.is_empty())
+            .find_map(|sc| sc.get(&id.name))
+            .and_then(|rv| match rv {
+                Value::Ref(i, g) => Some((*i, *g)),
+                _ => None,
+            });
+        if let Some((i, g)) = root_ref {
+            let idx = i as usize;
+            let live = matches!(self.slab.get(idx), Some((Some(_), gen)) if *gen == g);
+            if !live {
+                return Err(Flow::Panic(
+                    "stale reference: the value it pointed to was released".to_string(),
+                ));
+            }
+            let mut inner = self.slab[idx].0.take().expect("checked live");
+            let r = assign_into(&mut inner, &segs, v);
+            self.slab[idx].0 = Some(inner);
+            return r;
+        }
+        // Find the binding.
+        let slot = self
+            .scopes
+            .iter_mut()
+            .rev()
+            .find_map(|s| s.get_mut(&id.name));
+        let Some(mut slot) = slot else {
+            return Err(Flow::Panic(format!("unknown variable `{}`", id.name)));
+        };
+        // Descend with copy-on-write.
+        for seg in &segs {
+            match seg {
+                Seg::Field(fname) => match slot {
+                    Value::Struct { fields, .. } => {
+                        let fields = Rc::make_mut(fields);
+                        match fields.iter_mut().find(|(k, _)| k == fname) {
+                            Some((_, fv)) => slot = fv,
+                            None => {
+                                return Err(Flow::Panic(format!(
+                                    "no field `{fname}`"
+                                )))
+                            }
+                        }
+                    }
+                    other => {
+                        return Err(Flow::Panic(format!(
+                            "cannot access field `{fname}` of `{other}`"
+                        )))
+                    }
+                },
+                Seg::Index(i) => match slot {
+                    Value::List(items) => {
+                        let items = Rc::make_mut(items);
+                        let len = items.len();
+                        match items.get_mut(*i) {
+                            Some(iv) => slot = iv,
+                            None => {
+                                return Err(Flow::Panic(format!(
+                                    "index {i} out of bounds (len {len})"
+                                )))
+                            }
+                        }
+                    }
+                    other => {
+                        return Err(Flow::Panic(format!(
+                            "cannot index into `{other}`"
+                        )))
+                    }
+                },
+            }
+        }
+        *slot = v;
+        return Ok(());
+    }
     fn assign_place(&mut self, target: &Expr, v: Value) -> Result<(), Flow> {
         // Collect the access path down to the root identifier.
+        //
+        // Already evaluated by `place_segs` when an assignment statement got
+        // here, so an index's side effects happen once and in source order.
+        if let Some(segs) = self.pending_segs.take() {
+            let mut root = target;
+            while let Expr::Field { recv, .. } | Expr::Index { recv, .. } = root {
+                root = recv;
+            }
+            if let Expr::Ident(id) = root {
+                return self.assign_rooted(id, segs, v);
+            }
+        }
         let mut segs: Vec<Seg> = Vec::new();
         let mut cur = target;
         loop {
@@ -1052,121 +1231,7 @@ impl<'a, W: Write> Interp<'a, W> {
                 }
                 Expr::Ident(id) => {
                     segs.reverse();
-                    // A `ref` root: the value lives in the slab, not in the
-                    // binding, so it comes out, is written through, and goes
-                    // back. Without this a write through a reference — the
-                    // whole reason Tier 2 exists — typechecked and then
-                    // panicked `cannot access field of ref#0.0`, which left a
-                    // `ref` graph write-once and a cycle impossible to close.
-                    // Only when there is a path to walk. `at = other` with
-                    // no segments rebinds the *variable*; taking the reference
-                    // path there overwrote the node `at` pointed at, which
-                    // silently replaced a graph node with a reference to
-                    // another one. The checker draws the same line.
-                    // A `ref` anywhere on the path, not only at the root.
-                    // Writing *through* a reference does not modify what
-                    // holds it, so the way there is read-only and the write
-                    // lands in the slab. Only the root was handled, so
-                    // `rs[0].v = 5` and `h.r.v = 9` — a node in a list and a
-                    // node in a field, which is the ordinary Tier 2 arena —
-                    // typechecked and panicked `cannot access field 'v' of
-                    // 'ref#0.0'` ([T-REF-WRITE], [T-REF-GENERATIONAL]).
-                    let via = self
-                        .scopes
-                        .iter()
-                        .rev()
-                        .find_map(|sc| sc.get(&id.name))
-                        .cloned()
-                        .and_then(|rv| deepest_ref(&rv, &segs));
-                    if let Some((consumed, i, g)) = via {
-                        let idx = i as usize;
-                        let live = matches!(self.slab.get(idx), Some((Some(_), gen)) if *gen == g);
-                        if !live {
-                            return Err(Flow::Panic(
-                                "stale reference: the value it pointed to was released".to_string(),
-                            ));
-                        }
-                        let mut inner = self.slab[idx].0.take().expect("checked live");
-                        let r = assign_into(&mut inner, &segs[consumed..], v);
-                        self.slab[idx].0 = Some(inner);
-                        return r;
-                    }
-                    let root_ref = self
-                        .scopes
-                        .iter()
-                        .rev()
-                        .filter(|_| !segs.is_empty())
-                        .find_map(|sc| sc.get(&id.name))
-                        .and_then(|rv| match rv {
-                            Value::Ref(i, g) => Some((*i, *g)),
-                            _ => None,
-                        });
-                    if let Some((i, g)) = root_ref {
-                        let idx = i as usize;
-                        let live = matches!(self.slab.get(idx), Some((Some(_), gen)) if *gen == g);
-                        if !live {
-                            return Err(Flow::Panic(
-                                "stale reference: the value it pointed to was released".to_string(),
-                            ));
-                        }
-                        let mut inner = self.slab[idx].0.take().expect("checked live");
-                        let r = assign_into(&mut inner, &segs, v);
-                        self.slab[idx].0 = Some(inner);
-                        return r;
-                    }
-                    // Find the binding.
-                    let slot = self
-                        .scopes
-                        .iter_mut()
-                        .rev()
-                        .find_map(|s| s.get_mut(&id.name));
-                    let Some(mut slot) = slot else {
-                        return Err(Flow::Panic(format!("unknown variable `{}`", id.name)));
-                    };
-                    // Descend with copy-on-write.
-                    for seg in &segs {
-                        match seg {
-                            Seg::Field(fname) => match slot {
-                                Value::Struct { fields, .. } => {
-                                    let fields = Rc::make_mut(fields);
-                                    match fields.iter_mut().find(|(k, _)| k == fname) {
-                                        Some((_, fv)) => slot = fv,
-                                        None => {
-                                            return Err(Flow::Panic(format!(
-                                                "no field `{fname}`"
-                                            )))
-                                        }
-                                    }
-                                }
-                                other => {
-                                    return Err(Flow::Panic(format!(
-                                        "cannot access field `{fname}` of `{other}`"
-                                    )))
-                                }
-                            },
-                            Seg::Index(i) => match slot {
-                                Value::List(items) => {
-                                    let items = Rc::make_mut(items);
-                                    let len = items.len();
-                                    match items.get_mut(*i) {
-                                        Some(iv) => slot = iv,
-                                        None => {
-                                            return Err(Flow::Panic(format!(
-                                                "index {i} out of bounds (len {len})"
-                                            )))
-                                        }
-                                    }
-                                }
-                                other => {
-                                    return Err(Flow::Panic(format!(
-                                        "cannot index into `{other}`"
-                                    )))
-                                }
-                            },
-                        }
-                    }
-                    *slot = v;
-                    return Ok(());
+                    return self.assign_rooted(id, segs, v);
                 }
                 other => {
                     return Err(Flow::Panic(format!(
