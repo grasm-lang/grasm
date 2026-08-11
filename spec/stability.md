@@ -7,7 +7,7 @@ before it is listed as stable.
 `crates/grasm_spec` fails if a clause here is missing, unknown, or listed twice,
 so this file cannot drift away from the specification it describes.
 
-Today: 115 stable, 74 provisional, 22 experimental, of 211.
+Today: 115 stable, 74 provisional, 23 experimental, of 212.
 
 ## Stable
 
@@ -220,6 +220,7 @@ for "no problem found" to mean anything.
 May change or be removed in any release. New surface starts here.
 
 - `E-BENCH-WARMUP` — experimental
+- `E-IF-FALLIBLE-MERGE` — experimental
 - `E-NOT-PARALLEL` — experimental
 - `E-PAR-FAIL` — experimental
 - `E-PAR-FILTER-ORDER` — experimental

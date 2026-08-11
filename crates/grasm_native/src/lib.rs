@@ -5773,6 +5773,36 @@ impl FnCx<'_, '_> {
                 merge_ty = Some(vt.clone());
             }
         }
+        // A branch that is `Err(e)` has no ok half to give, so its type is
+        // `() ! E` — and taking it for the merge told everything downstream
+        // that the ok half was unit. `xs.map(|x| if p { Err(e) } else { Ok(x) })`
+        // then produced a list whose elements `??` unboxed as the wrong
+        // thing: SIGSEGV, empty stderr, exit 139, from a build that reported
+        // no problem. The other branch is asked when this one cannot say.
+        if let (Some(VType::Fallible(ok, _)), Some(eb)) = (&merge_ty, &else_branch) {
+            if matches!(**ok, VType::Any | VType::Unit) {
+                let probed = match eb {
+                    ElseBranch::Else(b) => self.probe_block_tail(b).ok(),
+                    ElseBranch::ElseIf(e) => self.probe_type(e).ok(),
+                };
+                if let Some(VType::Fallible(other_ok, other_err)) = probed {
+                    if !matches!(*other_ok, VType::Any | VType::Unit) {
+                        // Keep this branch's error type, which is the real
+                        // one; the other's is `Any` for the same reason.
+                        let err = match (&**ok, &*other_err) {
+                            (_, VType::Any) => {
+                                let VType::Fallible(_, e) = merge_ty.clone().unwrap() else {
+                                    unreachable!()
+                                };
+                                e
+                            }
+                            _ => other_err,
+                        };
+                        merge_ty = Some(VType::Fallible(other_ok, err));
+                    }
+                }
+            }
+        }
         if merge_ty.is_none() {
             if let Some(eb) = else_branch {
                 let probed = match eb {
@@ -6853,6 +6883,34 @@ impl FnCx<'_, '_> {
                 let probed = self.probe_block_tail(b);
                 self.pop_scope_no_decs();
                 probed?
+            }
+            // An `if` is worth the same as whichever branch can be typed.
+            // Without this a closure body like
+            // `|x| if p { Err(e) } else { Ok(x) }` could not be typed, and
+            // `map` built a list whose element type was decided elsewhere —
+            // `xs.map(...)[0] ?? d` then read a boxed value as a machine word
+            // and took SIGSEGV with an empty stderr.
+            Expr::If {
+                then_block,
+                else_branch,
+                ..
+            } => {
+                self.push_scope();
+                let t = self.probe_block_tail(then_block);
+                self.pop_scope_no_decs();
+                match t {
+                    Ok(t) if t != VType::Unit => t,
+                    _ => match else_branch.as_deref() {
+                        Some(ElseBranch::Else(b)) => {
+                            self.push_scope();
+                            let e = self.probe_block_tail(b);
+                            self.pop_scope_no_decs();
+                            e?
+                        }
+                        Some(ElseBranch::ElseIf(inner)) => self.probe_type(inner)?,
+                        None => VType::Unit,
+                    },
+                }
             }
             Expr::Closure { params, body, span } => {
                 // Probing must not lift anything; only the shape is needed.

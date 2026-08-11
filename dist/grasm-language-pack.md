@@ -1337,6 +1337,12 @@ and `()` was accepted as an initializer without checking — so
 `i64` at run time: it printed as `1`, compared unequal to `()`, and could be
 passed to a `fn f(u: ())`. `()` has one value.
 
+**[E-IF-FALLIBLE-MERGE]** When the branches are `Err(e)` and `Ok(v)`, the
+`if` is worth `T ! E` with `T` from the `Ok` side. `Err(e)` says nothing about
+the ok half, so a branch that is only `Err` cannot decide the type by itself —
+taking it anyway made `xs.map(|x| if p { Err(e) } else { Ok(x) })` produce a
+list whose elements were later read as the wrong thing.
+
 **[E-MATCH-ORDER]** Match arms are tried top to bottom; the first whose pattern
 matches and whose guard passes is taken.
 
@@ -3176,6 +3182,35 @@ fn main() {
             Err(e) -> print("{n} -> err {e.c}")
         }
     }
+}
+```
+
+## `E-IF-FALLIBLE-MERGE.gr`
+
+```grasm
+//! tag: E-IF-FALLIBLE-MERGE
+//! expect: output
+//! -1
+//! -1 3
+//! -1
+// An `if` whose branches are `Err(e)` and `Ok(v)` is worth `T ! E`.
+//
+// `Err(e)` says nothing about the ok half — there is no value to read it off
+// — so a branch that is only `Err` cannot type the merge on its own. Taking
+// it anyway made `xs.map(|x| if p { Err(e) } else { Ok(x) })` produce a list
+// whose elements `??` then unboxed as the wrong thing: SIGSEGV, empty stderr,
+// exit 139, from a compiled build that had reported no problem at all.
+type E = | Bad
+
+fn main() {
+    let r = [2].map(|x| if x == 2 { Err(Bad) } else { Ok(x) })
+    print("{r[0] ?? 0 - 1}")
+    let p = [2, 3].par_map(|x| if x == 2 { Err(Bad) } else { Ok(x) })
+    print("{p[0] ?? 0 - 1} {p[1] ?? 0 - 1}")
+    var m: Map[str, i64] = {}
+    m.set("a", 2)
+    let v = m.values().map(|x| if x == 2 { Err(Bad) } else { Ok(x) })
+    print("{v[0] ?? 0 - 1}")
 }
 ```
 

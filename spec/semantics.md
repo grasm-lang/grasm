@@ -241,6 +241,12 @@ and `()` was accepted as an initializer without checking — so
 `i64` at run time: it printed as `1`, compared unequal to `()`, and could be
 passed to a `fn f(u: ())`. `()` has one value.
 
+**[E-IF-FALLIBLE-MERGE]** When the branches are `Err(e)` and `Ok(v)`, the
+`if` is worth `T ! E` with `T` from the `Ok` side. `Err(e)` says nothing about
+the ok half, so a branch that is only `Err` cannot decide the type by itself —
+taking it anyway made `xs.map(|x| if p { Err(e) } else { Ok(x) })` produce a
+list whose elements were later read as the wrong thing.
+
 **[E-MATCH-ORDER]** Match arms are tried top to bottom; the first whose pattern
 matches and whose guard passes is taken.
 
