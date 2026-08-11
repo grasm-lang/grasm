@@ -94,12 +94,13 @@ all of those, from a later use: `var xs = []` followed by `xs.push(1)` is a
 `[i64]`, because inference reads the whole body before deciding. A literal
 whose type nothing determines is rejected.
 
-The clause used to say that anything without an annotation is rejected, and
-that was not true of `grasm run`, which accepts and runs it. It *is* true of
-`grasm build --native`, which refuses an unannotated empty literal by name —
-so the one thing the clause said, it said about the case where the two engines
-differ, and a reader consulting it about a program `check` had just accepted
-would have been told the opposite. §11 lists the native refusal.
+The clause used to say that anything without an annotation is rejected, which
+was not true of `grasm run` and was true of `grasm build --native` — so the
+one thing it said, it said about a case where the engines differed, and a
+reader consulting it about a program `check` had just accepted would have been
+told the opposite. Both now accept it: the checker resolves an empty literal
+against the whole body, and it hands the answer to the backend, which has
+nothing to read the type off otherwise.
 
 ## 4. Generics
 

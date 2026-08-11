@@ -28,6 +28,15 @@ pub struct Analysis {
     /// Spans are globally unique across a program — the loader gives each file
     /// a disjoint base — so the start offset identifies the literal.
     pub float_literals: std::collections::HashSet<u32>,
+    /// Start offset of each empty `[]` or `{}` literal → the type inference
+    /// settled on for it, written the way a person would.
+    ///
+    /// The compiled backend reads a literal's type off the literal, so an
+    /// empty one had nothing to read and was refused by name — `xs.fold([], f)`
+    /// and a `None -> []` match arm both ran under `grasm run` and could not
+    /// be built. The checker resolves them by unifying with the whole body, so
+    /// it is the one pass that knows, and this is how it says so.
+    pub empty_types: std::collections::HashMap<u32, String>,
     /// Start offsets of the `sum()` calls whose result type is `f64`.
     ///
     /// Same reason as `float_literals`: the interpreter reads the type off the
@@ -105,6 +114,19 @@ fn check_modules(files: &[ModuleView]) -> Analysis {
         c.current_module = f.name.clone();
         c.check_module(f.module);
     }
+    // Resolved now: unification is finished, so a literal's element type has
+    // whatever answer the whole body gave it.
+    let empty_types: std::collections::HashMap<u32, String> = c
+        .empty_lits
+        .clone()
+        .into_iter()
+        .filter_map(|(off, t)| {
+            let shown = c.show(&t);
+            // A type inference never pinned down is not one the backend could
+            // use either.
+            (!shown.contains('_')).then_some((off, shown))
+        })
+        .collect();
     let mut diagnostics = c.diags;
     diagnostics.extend(crate::effects::check_effects_multi(files));
     Analysis {
@@ -115,6 +137,7 @@ fn check_modules(files: &[ModuleView]) -> Analysis {
             .map(|(k, (t, _))| (k.clone(), TypeDisplay { ty: t, defs: &c.defs }.to_string()))
             .collect(),
         float_literals: c.float_literals,
+        empty_types,
         float_sums: c.float_sums,
         defs: c.defs,
         diagnostics,
@@ -173,6 +196,9 @@ struct Checker {
     /// Integer literals promoted to `f64`, by span start. See
     /// `Analysis::float_literals`.
     float_literals: std::collections::HashSet<u32>,
+    /// See `Analysis::empty_types`. Collected as type variables and resolved
+    /// once checking is over, since that is when they have answers.
+    empty_lits: Vec<(u32, Type)>,
     /// `sum()` calls whose result is `f64`, by span start.
     float_sums: std::collections::HashSet<u32>,
     /// effect name → (ops, handler struct TypeDefId).
@@ -250,6 +276,7 @@ impl Checker {
             region_floors: Vec::new(),
             extern_names: std::collections::HashSet::new(),
             float_literals: std::collections::HashSet::new(),
+            empty_lits: Vec::new(),
             float_sums: std::collections::HashSet::new(),
             effects: HashMap::new(),
             variants,
@@ -1818,19 +1845,26 @@ allocates could outlive it — move the work out of the region, or yield a numbe
                 Type::Str
             }
             Expr::Ident(id) => self.infer_ident(id),
-            Expr::List(items, _) => {
+            Expr::List(items, span) => {
                 let elem = self.uni.fresh();
                 for item in items {
                     self.check_expr(item, &elem);
                 }
+                if items.is_empty() {
+                    self.empty_lits.push((span.start, elem.clone()));
+                }
                 Type::List(Box::new(elem))
             }
-            Expr::Map(entries, _) => {
+            Expr::Map(entries, span) => {
                 let k = self.uni.fresh();
                 let v = self.uni.fresh();
                 for (ke, ve) in entries {
                     self.check_expr(ke, &k);
                     self.check_expr(ve, &v);
+                }
+                if entries.is_empty() {
+                    self.empty_lits
+                        .push((span.start, Type::Map(Box::new(k.clone()), Box::new(v.clone()))));
                 }
                 Type::Map(Box::new(k), Box::new(v))
             }

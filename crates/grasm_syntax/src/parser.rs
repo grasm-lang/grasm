@@ -95,6 +95,22 @@ pub fn parse_with_offset(src: &str, offset: u32) -> ParseOutput {
     }
 }
 
+/// Parse a single type, as written in source.
+///
+/// The checker knows types the backend cannot re-derive — the element type of
+/// an empty literal, for one — and hands them over as the text a person would
+/// write. This is how that text comes back as a tree.
+pub fn parse_type_src(src: &str) -> Option<TypeExpr> {
+    let mut p = Parser::new(lex(src));
+    p.skip_newlines();
+    let t = p.parse_type_nested().ok()?;
+    p.skip_newlines();
+    if !p.at(&TokenKind::Eof) || !p.diags.is_empty() {
+        return None;
+    }
+    Some(t)
+}
+
 /// Parse a single expression (used by the REPL and interpolation).
 pub fn parse_expr_src(src: &str, offset: u32) -> (Option<Expr>, Vec<Diagnostic>) {
     let mut tokens = lex(src);

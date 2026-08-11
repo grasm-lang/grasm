@@ -454,12 +454,13 @@ all of those, from a later use: `var xs = []` followed by `xs.push(1)` is a
 `[i64]`, because inference reads the whole body before deciding. A literal
 whose type nothing determines is rejected.
 
-The clause used to say that anything without an annotation is rejected, and
-that was not true of `grasm run`, which accepts and runs it. It *is* true of
-`grasm build --native`, which refuses an unannotated empty literal by name —
-so the one thing the clause said, it said about the case where the two engines
-differ, and a reader consulting it about a program `check` had just accepted
-would have been told the opposite. §11 lists the native refusal.
+The clause used to say that anything without an annotation is rejected, which
+was not true of `grasm run` and was true of `grasm build --native` — so the
+one thing it said, it said about a case where the engines differed, and a
+reader consulting it about a program `check` had just accepted would have been
+told the opposite. Both now accept it: the checker resolves an empty literal
+against the whole body, and it hands the answer to the backend, which has
+nothing to read the type off otherwise.
 
 ## 4. Generics
 
@@ -2418,7 +2419,6 @@ runs only under `grasm run`:
 | `par_map`/`par_filter` with a closure bound to a name | `let f = \|n\| n * 2` then `xs.par_map(f)` — write it inline, or as a top-level `fn` |
 | `map` with a function that returns nothing | `xs.map(\|x\| print(x))` — a `for` loop is what that meant |
 | a type parameter appearing **only** in a function-typed parameter's result | `fn key_by[T, K](xs: [T], f: fn(T) -> K) -> [K]` |
-| an empty list literal with no type in view | `var xs = []` — write `var xs: [i64] = []` |
 | a `match` no arm of which has an inferable type | every arm `map()` — give one arm a type, or lift it into an annotated `let` |
 | an `inout` argument that is not a plain variable | `push_one(b.items)`, `add(xs[0], 5)` — bind it to a `var` first |
 | returning a closure | `fn mk(n: i64) -> fn(i64) -> i64 { \|x\| x + n }` — a top-level `fn` works |
@@ -5974,13 +5974,37 @@ fn main() {
 ```grasm
 //! tag: T-EMPTY-LIT
 //! expect: output
-//! 1 0
-type Bag = { items: [str] }
+//! [1]
+//! [1, 2, 3]
+//! 0
+//! 1
+// An empty literal takes its element type from wherever one reaches it.
+//
+// An annotation, a field, a parameter or a return type is the direct case;
+// failing all of those, a later use answers it. The compiled backend reads a
+// literal's type off the literal, so an empty one had nothing to read: the
+// last three of these ran under `grasm run` and could not be built. The
+// checker resolves them against the whole body, and now says so.
+fn add(acc: [i64], x: i64) -> [i64] {
+    var out = acc
+    out.push(x)
+    out
+}
+
 fn main() {
-    var xs: [i64] = []
+    var xs = []
     xs.push(1)
-    let b = Bag{ items: [] }
-    print("{xs.len()} {b.items.len()}")
+    print("{xs}")
+    print("{[1, 2, 3].fold([], add)}")
+    let missing: Option[[str]] = None
+    let got = match missing {
+        Some(v) -> v
+        None -> []
+    }
+    print("{got.len()}")
+    var m = {}
+    m.set("a", 1)
+    print("{m.get("a") ?? 0}")
 }
 ```
 

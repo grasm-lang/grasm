@@ -1,10 +1,34 @@
 //! tag: T-EMPTY-LIT
 //! expect: output
-//! 1 0
-type Bag = { items: [str] }
+//! [1]
+//! [1, 2, 3]
+//! 0
+//! 1
+// An empty literal takes its element type from wherever one reaches it.
+//
+// An annotation, a field, a parameter or a return type is the direct case;
+// failing all of those, a later use answers it. The compiled backend reads a
+// literal's type off the literal, so an empty one had nothing to read: the
+// last three of these ran under `grasm run` and could not be built. The
+// checker resolves them against the whole body, and now says so.
+fn add(acc: [i64], x: i64) -> [i64] {
+    var out = acc
+    out.push(x)
+    out
+}
+
 fn main() {
-    var xs: [i64] = []
+    var xs = []
     xs.push(1)
-    let b = Bag{ items: [] }
-    print("{xs.len()} {b.items.len()}")
+    print("{xs}")
+    print("{[1, 2, 3].fold([], add)}")
+    let missing: Option[[str]] = None
+    let got = match missing {
+        Some(v) -> v
+        None -> []
+    }
+    print("{got.len()}")
+    var m = {}
+    m.set("a", 1)
+    print("{m.get("a") ?? 0}")
 }

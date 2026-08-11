@@ -7,7 +7,7 @@ before it is listed as stable.
 `crates/grasm_spec` fails if a clause here is missing, unknown, or listed twice,
 so this file cannot drift away from the specification it describes.
 
-Today: 115 stable, 73 provisional, 21 experimental, of 209.
+Today: 114 stable, 74 provisional, 21 experimental, of 209.
 
 ## Stable
 
@@ -87,7 +87,6 @@ Will not change incompatibly before 2.0.
 - `T-ARM-TYPES` — stable
 - `T-CAPTURE-WRITE` — stable
 - `T-COPY` — stable
-- `T-EMPTY-LIT` — stable
 - `T-ERR-SUBSET` — stable
 - `T-FAIL` — stable
 - `T-FALLIBLE` — stable
@@ -184,6 +183,7 @@ for "no problem found" to mean anything.
 - `T-EFFECT-FALLIBLE` — provisional
 - `T-EFFECT-FALLIBLE-CONSUME` — provisional
 - `T-EFFECT-ROW` — provisional
+- `T-EMPTY-LIT` — provisional
 - `T-FALLIBLE-COALESCE` — provisional
 - `T-FALLIBLE-VALUE` — provisional
 - `T-FN-TYPE` — provisional

@@ -220,7 +220,9 @@ fn compile_object_scoped(
     let mut module = ObjectModule::new(builder);
 
     let mut cg = Codegen::new(&mut module);
-    cg.float_literals = grasm_sema::check::check_program(program).float_literals;
+    let analysis = grasm_sema::check::check_program(program);
+    cg.float_literals = analysis.float_literals;
+    cg.empty_types = analysis.empty_types;
     cg.only_module = only_module.map(str::to_string);
     cg.declare_runtime()?;
     let views: Vec<(String, &AstModule, std::collections::HashMap<String, String>)> = program
@@ -336,6 +338,8 @@ struct Codegen<'m> {
     /// The checker already knows which literals are floats; asking it once is
     /// both correct and the same answer the interpreter gets.
     float_literals: std::collections::HashSet<u32>,
+    /// Start offset of each empty literal → the type the checker settled on.
+    empty_types: std::collections::HashMap<u32, String>,
 }
 
 /// One monomorphized copy of a generic function.
@@ -416,6 +420,7 @@ impl<'m> Codegen<'m> {
             pending_generics: Vec::new(),
             generic_subst: HashMap::new(),
             float_literals: std::collections::HashSet::new(),
+            empty_types: std::collections::HashMap::new(),
         }
     }
 
@@ -4131,8 +4136,24 @@ impl FnCx<'_, '_> {
         }
     }
 
+    /// The type the checker recorded for an empty literal at this span.
+    fn empty_vtype(&self, span: Span) -> Option<VType> {
+        let text = self.cg.empty_types.get(&span.start)?;
+        let te = grasm_syntax::parse_type_src(text)?;
+        self.cg.vtype_of(&te).ok()
+    }
+
     fn list_elem_type(&mut self, items: &[Expr], span: Span) -> CResult<VType> {
         let Some(first) = items.first() else {
+            // The checker resolved this one against the whole body, which is
+            // the only place the answer exists: an empty literal has nothing
+            // to read a type off.
+            if let Some(vt) = self.empty_vtype(span) {
+                return Ok(match vt {
+                    VType::List(e) => *e,
+                    other => other,
+                });
+            }
             // The advice used to say "annotate via a function param", which
             // was both narrower than the truth and, for `[[]]`, useless: the
             // annotation was already there and still refused. Any annotation
