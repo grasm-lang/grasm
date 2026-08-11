@@ -217,6 +217,13 @@ ownership; the caller keeps using it.
 **[T-PARAM-OWN]** An `own` parameter transfers ownership. **[T-USE-AFTER-MOVE]**
 Using a moved binding afterwards is a compile error. Reassignment revives it.
 
+The transfer is tracked for *bindings*. An argument that is a field or an
+index — `eat(b.xs)`, `eat(rows[0])` — is a value read out of a place, and
+reading a place copies ([E-VALUE-SEMANTICS]), so the place keeps what it had
+and using it afterwards is fine. That is sound, and it is not the invalidation
+the first sentence describes, so it is written down here rather than left to
+be discovered.
+
 **[T-MOVE-LOOP]** Moving a binding declared outside a loop from inside that
 loop is rejected: the second iteration would use a value that is gone. A
 closure body is the same case — it runs once per call, and the second call
@@ -481,6 +488,12 @@ points at something. Releasing an already-released slot does nothing: a double
 release is not a use-after-free, and making it an error would turn cleanup
 order into something every caller has to track.
 
+Reclamation is manual: a slot returns to the pool when `release` is called on
+a reference to it, and not otherwise. Four hundred thousand un-released `ref`s
+hold about 180 MB. Nothing collects them, which is the point of the tier — the
+lifetime is the program's to state — but "reused immediately" describes what
+happens *after* a release, not a reason to skip one.
+
 **[T-REF-EQ]** Two references are equal when they name the same slot *and the
 same generation* — identity, not the equality of what they point at, which is
 what a graph walk needs to recognise a node it has already visited. Equality
@@ -532,8 +545,9 @@ discarded the write ([E-EFFECT-NO-INOUT]). A feature with no working spelling
 sends people somewhere worse.
 
 **[T-REF-STALE]** Reading through a released reference **panics**, always. The
-slot may already hold something else — released slots are reused immediately,
-which is what keeps a long-lived graph from growing without bound — so the
+slot may already hold something else — a released slot is reused by the next
+`ref`, which is what keeps a long-lived graph from growing without bound — so
+the
 generation is what distinguishes a live reference from one into the slot's
 previous life. This is the property that makes the tier safe rather than merely
 convenient: a stale read is caught every time, never undefined behaviour, and

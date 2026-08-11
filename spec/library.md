@@ -103,9 +103,13 @@ and answers with it, shifting the rest down. Out of range panics, the way
 indexing does — `pop` is the one that answers `Option`, because "the list was
 empty" is a thing a caller can reasonably not know and "index 9 of 2" is not.
 
-This is what draining a queue from the front needs. Without it a ready queue
-cost `ready = ready.slice(1, ready.len())` a step, which is O(n) and reads
-like the workaround it was.
+This is what draining a queue from the front *reads* like. Without it a ready
+queue cost `ready = ready.slice(1, ready.len())` a step, which reads like the
+workaround it was — but the cost is the same: `remove(0)` shifts the rest down,
+so both are O(n) per step and a full drain is quadratic either way. Measured at
+80 000 elements, 17.2 s for `remove(0)` against 12.8 s for the slice. If a
+queue is what you have, reverse it once and `pop` from the end, which is O(1);
+this method is for taking an element out of the middle.
 
 **[L-LIB-SUM]** `xs.sum()` of an empty list is the zero of the element type:
 `0` for `[i64]`, `0.0` for `[f64]`.
