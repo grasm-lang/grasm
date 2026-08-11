@@ -198,6 +198,32 @@ pub(crate) fn load_with_alias(
 }
 
 /// Disk loader: resolves module names relative to the entry file's directory.
+/// A path as a reader would write it.
+///
+/// A dependency is reached from the consumer's directory, so its files came
+/// out as `taskflow/../textkit/src/main.gr` — correct, and not what anyone
+/// would type. The collapse is lexical: these paths have already been opened,
+/// so there is no symlink question to resolve, and touching the filesystem to
+/// print a diagnostic would be the wrong trade.
+fn tidy(path: &std::path::Path) -> String {
+    use std::path::Component;
+    let mut parts: Vec<std::ffi::OsString> = Vec::new();
+    for c in path.components() {
+        match c {
+            Component::ParentDir if parts.last().is_some_and(|p| p != "..") => {
+                parts.pop();
+            }
+            Component::CurDir => {}
+            other => parts.push(other.as_os_str().to_os_string()),
+        }
+    }
+    let mut out = std::path::PathBuf::new();
+    for p in parts {
+        out.push(p);
+    }
+    out.display().to_string()
+}
+
 pub fn load_from_disk(entry_path: &std::path::Path) -> Result<Program, String> {
     load_from_disk_with(entry_path, &HashMap::new())
 }
@@ -278,9 +304,7 @@ pub fn load_from_disk_in(
     let found: std::cell::RefCell<HashMap<String, String>> =
         std::cell::RefCell::new(HashMap::new());
     let note = |name: &str, path: &std::path::Path| {
-        found
-            .borrow_mut()
-            .insert(name.to_string(), path.display().to_string());
+        found.borrow_mut().insert(name.to_string(), tidy(path));
     };
     let provider = |name: &str| -> Option<String> {
         if name == "main" {

@@ -2526,6 +2526,26 @@ fn unify_generic(
 /// originally called from and not harmless everywhere. Rather than trust the
 /// whole of it, the block probe only looks at shapes whose probe bottoms out
 /// in literals and names.
+/// Names the place shape the backend cannot write through.
+///
+/// §11 promises every native refusal is "by name". This one said "this
+/// assignment target's shape", which names nothing — a reader could not tell
+/// whether it was the `ref`, the map, or the depth that was the problem, and
+/// the refusal for a handler type in the same program did name its type.
+fn place_shape(root_t: &VType, seg: &PlaceSeg<'_>) -> String {
+    let what = match root_t {
+        VType::Ref(_) => "a write through a `ref`",
+        VType::Map(..) => "a write into a map through a place",
+        VType::Tuple(_) => "a write into a tuple component",
+        VType::Str => "a write into a string",
+        _ => match seg {
+            PlaceSeg::Field(f) => return format!("a write to field `{f}` of this type"),
+            PlaceSeg::Index(_) => "an indexed write into this type",
+        },
+    };
+    what.to_string()
+}
+
 fn is_probe_safe(e: &Expr) -> bool {
     match e {
         Expr::Int(..) | Expr::Float(..) | Expr::Bool(..) | Expr::Str(..) | Expr::Ident(_) => true,
@@ -3183,7 +3203,11 @@ impl FnCx<'_, '_> {
                 Ok(StmtOut::Value(None))
             }
             Stmt::Assign {
-                target, op, value, ..
+                target,
+                op,
+                value,
+                span,
+                ..
             } => {
                 // Field/index places (any depth, plain or compound).
                 if matches!(target, Expr::Field { .. } | Expr::Index { .. }) {
@@ -3306,7 +3330,7 @@ impl FnCx<'_, '_> {
                     };
                     let boxed = self.box_value(final_v, &elem_t);
                     let cur = self.b.use_var(var);
-                    let updated = self.write_place(cur, &path, &root_t, boxed)?;
+                    let updated = self.write_place(*span, cur, &path, &root_t, boxed)?;
                     self.b.def_var(var, updated);
                     return Ok(StmtOut::Value(None));
                 }
@@ -4308,7 +4332,7 @@ impl FnCx<'_, '_> {
                     let mapv = self.read_place_boxed(cur, &path, &root_t)?;
                     let newmap = self.call_rt("grasm_map_set", &[mapv, kb, vb]).unwrap();
                     let cur2 = self.b.use_var(var);
-                    let updated = self.write_place(cur2, &path, &root_t, newmap)?;
+                    let updated = self.write_place(span, cur2, &path, &root_t, newmap)?;
                     self.b.def_var(var, updated);
                     return Ok(None);
                 }
@@ -4328,7 +4352,7 @@ impl FnCx<'_, '_> {
                     let mapv = self.read_place_boxed(cur, &path, &root_t)?;
                     let newmap = self.call_rt("grasm_map_delete", &[mapv, kb, addr]).unwrap();
                     let cur2 = self.b.use_var(var);
-                    let updated = self.write_place(cur2, &path, &root_t, newmap)?;
+                    let updated = self.write_place(span, cur2, &path, &root_t, newmap)?;
                     self.b.def_var(var, updated);
                     self.call_rt("grasm_val_dec", &[kb]);
                     let found = self.b.ins().stack_load(types::I8, slot, 0);
@@ -4339,7 +4363,7 @@ impl FnCx<'_, '_> {
                     let listv = self.read_place_boxed(cur, &path, &root_t)?;
                     let newlist = self.call_rt("grasm_list_sort", &[listv]).unwrap();
                     let cur2 = self.b.use_var(var);
-                    let updated = self.write_place(cur2, &path, &root_t, newlist)?;
+                    let updated = self.write_place(span, cur2, &path, &root_t, newlist)?;
                     self.b.def_var(var, updated);
                     return Ok(None);
                 }
@@ -4361,7 +4385,7 @@ impl FnCx<'_, '_> {
                     let listv = self.read_place_boxed(cur, &path, &root_t)?;
                     let newlist = self.call_rt("grasm_list_pop", &[listv, addr]).unwrap();
                     let cur2 = self.b.use_var(var);
-                    let updated = self.write_place(cur2, &path, &root_t, newlist)?;
+                    let updated = self.write_place(span, cur2, &path, &root_t, newlist)?;
                     self.b.def_var(var, updated);
                     let opt = self.b.ins().stack_load(types::I64, slot, 0);
                     return Ok(Some((opt, VType::Option(et))));
@@ -4384,7 +4408,7 @@ impl FnCx<'_, '_> {
                         .call_rt("grasm_list_remove", &[listv, idx, addr])
                         .unwrap();
                     let cur2 = self.b.use_var(var);
-                    let updated = self.write_place(cur2, &path, &root_t, newlist)?;
+                    let updated = self.write_place(span, cur2, &path, &root_t, newlist)?;
                     self.b.def_var(var, updated);
                     let boxed = self.b.ins().stack_load(types::I64, slot, 0);
                     let (v, vt) = self.unbox(boxed, &et)?;
@@ -4409,7 +4433,7 @@ impl FnCx<'_, '_> {
             let list_val = self.read_place_boxed(cur, &path, &root_t)?;
             let newlist = self.call_rt("grasm_list_push", &[list_val, boxed]).unwrap();
             let cur2 = self.b.use_var(var);
-            let updated = self.write_place(cur2, &path, &root_t, newlist)?;
+            let updated = self.write_place(span, cur2, &path, &root_t, newlist)?;
             self.b.def_var(var, updated);
             return Ok(None);
         }
@@ -7321,7 +7345,7 @@ impl FnCx<'_, '_> {
                     self.struct_field_type(&sname, f, span)?
                 }
                 (VType::List(e), PlaceSeg::Index(_)) => (**e).clone(),
-                _ => return nope(span, "this assignment target's shape"),
+                _ => return nope(span, &place_shape(&t, seg)),
             };
         }
         Ok(t)
@@ -7417,6 +7441,7 @@ impl FnCx<'_, '_> {
     /// Returns the (possibly new) root value.
     fn write_place(
         &mut self,
+        span: Span,
         root: Value,
         path: &[PlaceSeg<'_>],
         root_t: &VType,
@@ -7437,7 +7462,7 @@ impl FnCx<'_, '_> {
                         .call_rt("grasm_list_set", &[root, iv, boxed_val])
                         .unwrap())
                 }
-                _ => nope(Span::new(0, 1), "this assignment target's shape"),
+                _ => nope(span, &place_shape(root_t, seg)),
             },
             Some((seg, rest)) => {
                 // Descend: read the child, recurse, then write it back.
@@ -7457,9 +7482,9 @@ impl FnCx<'_, '_> {
                             let _ = iv;
                             (c, et, PlaceSeg::Index(ix))
                         }
-                        _ => return nope(Span::new(0, 1), "this assignment target's shape"),
+                        _ => return nope(span, &place_shape(root_t, seg)),
                     };
-                let new_child = self.write_place(child, rest, &child_t, boxed_val)?;
+                let new_child = self.write_place(span, child, rest, &child_t, boxed_val)?;
                 match (root_t, writeback) {
                     (VType::Struct(_), PlaceSeg::Field(f)) => {
                         let (fp, fl) = self.str_ptr_len(f);
@@ -7473,7 +7498,7 @@ impl FnCx<'_, '_> {
                             .call_rt("grasm_list_set", &[root, iv, new_child])
                             .unwrap())
                     }
-                    _ => nope(Span::new(0, 1), "this assignment target's shape"),
+                    _ => nope(span, &place_shape(root_t, seg)),
                 }
             }
         }

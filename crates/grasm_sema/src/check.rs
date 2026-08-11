@@ -3494,9 +3494,16 @@ closing brace",
                         "cannot {verb} `{}`{tail} inside a closure — it was captured from outside",
                         id.name
                     ),
+                    // `ref` is first because it is the one that always
+                    // works. When the closure is an effect operation —
+                    // which is the shape people hit this in — `inout` is
+                    // not available at all ([E-EFFECT-NO-INOUT]), and
+                    // following that suggestion led to the dead end
+                    // [T-REF-CAPTURE] exists to keep people out of.
                     "a closure captures values, not bindings, so this write would change a copy \
-nobody can see — return the new value, thread the state through an `inout` parameter, or hold \
-it behind a `ref`, which copies as a slot rather than as a value and so is shared",
+nobody can see — hold it behind a `ref`, which copies as a slot rather than as a value and so \
+is shared; or return the new value; or, where the closure is not an effect operation, thread \
+the state through an `inout` parameter",
                 );
             }
         }
