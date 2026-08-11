@@ -406,19 +406,25 @@ impl ScalarData {
 pub struct RtStr {
     s: String,
     /// `u32::MAX` until asked for.
-    chars: Cell<u32>,
+    ///
+    /// Atomic, and the index below is a `OnceLock`, because a value crosses
+    /// threads here: `spawn { scan(text) }` hands the same allocation to
+    /// several workers, and two of them asking a string its length at the
+    /// same moment is an ordinary thing to write. A `Cell` would have been a
+    /// data race that happened to print the right answer.
+    chars: std::sync::atomic::AtomicU32,
     /// Byte offset of each character, built the first time one is asked for
     /// by index and only when the text is not ASCII. ASCII needs no index,
     /// because there the offset *is* the index.
-    offsets: std::cell::OnceCell<Vec<u32>>,
+    offsets: std::sync::OnceLock<Vec<u32>>,
 }
 
 impl RtStr {
     pub fn new(s: String) -> RtStr {
         RtStr {
             s,
-            chars: Cell::new(u32::MAX),
-            offsets: std::cell::OnceCell::new(),
+            chars: std::sync::atomic::AtomicU32::new(u32::MAX),
+            offsets: std::sync::OnceLock::new(),
         }
     }
 
@@ -435,13 +441,16 @@ impl RtStr {
     }
 
     pub fn char_len(&self) -> usize {
-        let c = self.chars.get();
+        use std::sync::atomic::Ordering::Relaxed;
+        let c = self.chars.load(Relaxed);
         if c != u32::MAX {
             return c as usize;
         }
         let n = self.s.chars().count();
+        // Two threads may both compute it; they compute the same number, so
+        // whichever stores last stores the same bytes.
         if n < u32::MAX as usize {
-            self.chars.set(n as u32);
+            self.chars.store(n as u32, Relaxed);
         }
         n
     }
