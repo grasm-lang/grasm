@@ -1246,6 +1246,28 @@ closing brace — yield a number from the region and return that",
     /// Marks `name` as moved (`own` transfer). Errors for loop-crossing moves.
     fn mark_moved(&mut self, id: &Ident) {
         let loop_depth = self.loop_depth;
+        // A closure body runs once per call, so moving something captured
+        // from outside it is the same mistake as moving inside a loop: the
+        // second call finds the value gone. It was refused in the loop and
+        // accepted in the closure, which are the same program written two
+        // ways ([T-MOVE-LOOP]).
+        let captured = self.closure_floors.last().is_some_and(|floor| {
+            self.scopes
+                .iter()
+                .rposition(|sc| sc.contains_key(&id.name))
+                .is_some_and(|at| at < *floor)
+        });
+        if captured {
+            self.error_help(
+                id.span,
+                format!(
+                    "cannot move `{}` here — it was captured, and would be gone the next time the closure is called",
+                    id.name
+                ),
+                "move a copy instead, or take the value as a parameter of the closure",
+            );
+            return;
+        }
         let mut err: Option<Diagnostic> = None;
         if let Some(b) = self.lookup_mut(&id.name) {
             if b.decl_loop_depth < loop_depth {
@@ -1278,6 +1300,63 @@ closing brace — yield a number from the region and return that",
             // places hold it.
             Type::I64 | Type::F64 | Type::Bool | Type::Unit | Type::Range | Type::Ref(_)
         )
+    }
+
+    /// Whether a type can reach a `ref` anywhere inside it.
+    ///
+    /// A region's rule was checked against the *syntax written between the
+    /// braces*, so hiding the reference one field deep defeated it: passing a
+    /// `Holder { s: ref Sink }` into the region names no `ref` at all, and the
+    /// callee reads the field and writes through it ([T-REGION-REF]).
+    fn carries(&self, t: &Type, want_fn: bool, seen: &mut Vec<usize>) -> bool {
+        match self.uni.resolve(t) {
+            Type::Ref(inner) => !want_fn || self.carries(&inner, want_fn, seen),
+            Type::Fn { params, ret, .. } => {
+                want_fn
+                    || params.iter().any(|p| self.carries(p, want_fn, seen))
+                    || self.carries(&ret, want_fn, seen)
+            }
+            Type::List(e) => self.carries(&e, want_fn, seen),
+            Type::Map(k, v) => {
+                self.carries(&k, want_fn, seen) || self.carries(&v, want_fn, seen)
+            }
+            Type::Tuple(items) => items.iter().any(|i| self.carries(i, want_fn, seen)),
+            Type::Fallible(a, b) => {
+                self.carries(&a, want_fn, seen) || self.carries(&b, want_fn, seen)
+            }
+            Type::Named { id, args } => {
+                if args.iter().any(|a| self.carries(a, want_fn, seen)) {
+                    return true;
+                }
+                // A recursive type is reached twice; the second visit answers
+                // for the first rather than recursing forever.
+                if seen.contains(&id) {
+                    return false;
+                }
+                seen.push(id);
+                let inner: Vec<Type> = match &self.defs.get(id).kind {
+                    TypeDefKind::Struct { fields } => {
+                        fields.iter().map(|(_, t)| t.clone()).collect()
+                    }
+                    TypeDefKind::Sum { variants } => variants
+                        .iter()
+                        .flat_map(|v| v.fields.iter().map(|(_, t)| t.clone()))
+                        .collect(),
+                };
+                let found = inner.iter().any(|t| self.carries(t, want_fn, seen));
+                seen.pop();
+                found
+            }
+            _ => false,
+        }
+    }
+
+    fn carries_ref(&self, t: &Type) -> bool {
+        self.carries(t, false, &mut Vec::new())
+    }
+
+    fn carries_fn(&self, t: &Type) -> bool {
+        self.carries(t, true, &mut Vec::new())
     }
 
     /// Function lookup in the current module's namespace.
@@ -1704,7 +1783,7 @@ declaration into the region, or compute a number and yield that",
     /// ([T-REGION-REF]).
     fn infer_expr(&mut self, e: &Expr) -> Type {
         let t = self.infer_expr_inner(e);
-        if self.region_depth > 0 && matches!(self.uni.shallow_resolve(&t), Type::Ref(_)) {
+        if self.region_depth > 0 && self.carries_ref(&t) {
             self.error_help(
                 e.span(),
                 "a `ref` cannot be used inside a region",
@@ -2380,7 +2459,54 @@ fail outside it",
         }
     }
 
+    /// What a call may do when it is made from inside a region.
+    ///
+    /// The region rules were each written against the syntax between the
+    /// braces, and a one-hop wrapper walked through all of them: a helper
+    /// that performs the effect, or that is handed a closure bound outside,
+    /// writes what the region allocated somewhere the region cannot see. What
+    /// matters is not where the text is but what the call can reach
+    /// ([T-REGION-FOREIGN]).
+    fn check_region_call(&mut self, name: &str, args: &[Expr], span: Span) {
+        if self.region_depth == 0 {
+            return;
+        }
+        // A user-declared effect means a handler, and a handler is written
+        // outside and may keep what it is given. `io`, `async` and `unsafe`
+        // are built in: they have no handler and retain nothing.
+        if let Some(row) = self.row_of_fn(name) {
+            let user: Vec<&String> = row
+                .iter()
+                .filter(|e| !matches!(e.as_str(), "io" | "async" | "unsafe"))
+                .collect();
+            if let Some(first) = user.first() {
+                self.error_help(
+                    span,
+                    format!("cannot call `{name}` inside a region — it performs `{first}`"),
+                    "the effect's handler is written outside the region and may keep what it is given, which is how a value allocated inside gets out — perform the effect after the closing brace",
+                );
+            }
+        }
+        // A function value reaching the callee is a body written elsewhere,
+        // and it carries its captures. One written *here* carries only what a
+        // region already allows.
+        for a in args {
+            if matches!(a, Expr::Closure { .. }) {
+                continue;
+            }
+            let t = self.infer_expr(a);
+            if self.carries_fn(&t) {
+                self.error_help(
+                    a.span(),
+                    "cannot pass a function into a call inside a region",
+                    "a function value written outside the region carries its captures, so what the region allocates could be kept — write the closure inside the region, or move the call out",
+                );
+            }
+        }
+    }
+
     fn check_fn_call(&mut self, name: &str, info: &FnInfo, args: &[Expr], span: Span) -> Type {
+        self.check_region_call(name, args, span);
         let fresh: Vec<Type> = (0..info.generics).map(|_| self.uni.fresh()).collect();
         if args.len() != info.params.len() {
             return self.error(

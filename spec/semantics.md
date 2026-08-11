@@ -271,6 +271,15 @@ property of the run. Stating it is better than leaving a reader to infer the
 dynamic rule and be refused — the message they get names the enclosing
 function, which is the one place the fix does not go.
 
+Counted where it is installed means *counted*, including when the handler was
+built somewhere else. A handler type says nothing about what its operations
+do — that is what lets `LogHandler{ info: |m| print(m) }` be written at all —
+so installing one that arrived as a parameter charges what *any* handler for
+that effect does, anywhere in the program. Over-approximate, and the safe
+direction: it was previously charged only where the handler was *constructed*,
+so `fn run(h: LogHandler) / {}` installed a printing handler and the
+declared-empty row held.
+
 **[E-HANDLER-MISSING]** A user effect that reaches `main` or a test without a
 handler is rejected *at compile time*, so the runtime's missing-handler panic is
 a defensive backstop that well-typed programs never reach.

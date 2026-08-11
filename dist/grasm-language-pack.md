@@ -569,7 +569,11 @@ ownership; the caller keeps using it.
 Using a moved binding afterwards is a compile error. Reassignment revives it.
 
 **[T-MOVE-LOOP]** Moving a binding declared outside a loop from inside that
-loop is rejected: the second iteration would use a value that is gone.
+loop is rejected: the second iteration would use a value that is gone. A
+closure body is the same case — it runs once per call, and the second call
+would find the value gone — so moving a *captured* binding out of one is
+rejected too. It was refused in the loop and accepted in the closure, which
+are the same program written two ways.
 
 **[T-COPY]** `i64`, `f64`, `bool`, and `()` are copied rather than moved, so
 `own` on them never invalidates the caller's binding.
@@ -891,6 +895,16 @@ which is a closure and carries its captures. A closure written *inside* the
 region is fine — it can only capture what a region already allows. This is the
 same rule as the one above seen from the other side: the earlier rules ask
 what a region's own text may write, and this one asks whose text runs there.
+
+The rule is about what a call can *reach*, not about where the text sits, and
+that distinction is the whole of it. Each region rule was written first
+against the syntax between the braces, and a one-hop wrapper walked through
+every one: a helper that performs the effect, a struct holding the reference
+one field deep, a struct holding the closure. So a call made from inside a
+region may not perform a declared effect, and may not be handed a function
+value — `io`, `async` and `unsafe` are exempt, because they have no handler
+and retain nothing, and a closure written inside the region is exempt, because
+it can only capture what a region already allows.
 
 **[T-UNSAFE-FFI]** `unsafe { … }` is Tier 3: the block where the guarantees of
 the safe tiers do not apply. Using a declared C function — calling one *or
@@ -1263,6 +1277,15 @@ from the call graph, and which handler is installed at a given moment is a
 property of the run. Stating it is better than leaving a reader to infer the
 dynamic rule and be refused — the message they get names the enclosing
 function, which is the one place the fix does not go.
+
+Counted where it is installed means *counted*, including when the handler was
+built somewhere else. A handler type says nothing about what its operations
+do — that is what lets `LogHandler{ info: |m| print(m) }` be written at all —
+so installing one that arrived as a parameter charges what *any* handler for
+that effect does, anywhere in the program. Over-approximate, and the safe
+direction: it was previously charged only where the handler was *constructed*,
+so `fn run(h: LogHandler) / {}` installed a printing handler and the
+declared-empty row held.
 
 **[E-HANDLER-MISSING]** A user effect that reaches `main` or a test without a
 handler is rejected *at compile time*, so the runtime's missing-handler panic is
@@ -2809,30 +2832,26 @@ fn main() {
 
 ```grasm
 //! tag: E-HANDLER-OWN-ROW
-//! expect: output
-//! 42
-// A handler's own effects are handled where the handler is installed.
+//! expect: error
+//! performs effect(s) `io` not in its declared row
+// A handler's own effects belong to whoever installs it.
 //
-// [E-HANDLER-SCOPE] describes a dynamic extent, and this is narrower: the `B`
-// handler's body performs `A`, so `A` must be handled around the `with B`
-// block — not merely around the calls to `B.b()`. Writing it the other way
-// round is refused, and the message names the enclosing function, which is the
-// one place the fix does not go.
-effect A {
-    fn a() -> i64
+// They were charged where the handler was *constructed*, which is the same
+// place only when the handler is written at the `with`. One function call
+// away, a declared row meant nothing: this `run` installs a printing handler
+// and claimed to perform nothing.
+effect Log {
+    fn info(m: str)
 }
 
-effect B {
-    fn b() -> i64
+fn run(h: LogHandler) / {} {
+    with Log handled_by h {
+        Log.info("x")
+    }
 }
 
 fn main() {
-    // `A` outside, `B` inside: the B handler's body may then perform A.
-    with A handled_by AHandler{ a: || 21 } {
-        with B handled_by BHandler{ b: || A.a() * 2 } {
-            print("{B.b()}")
-        }
-    }
+    run(LogHandler{ info: |m| print("{m}") })
 }
 ```
 
@@ -6883,14 +6902,23 @@ fn main() {
 //! tag: T-MOVE-LOOP
 //! expect: error
 //! next loop iteration
+// A move that would happen more than once.
+//
+// The closure below is the same case: it runs once per call, so the second
+// call would find the value gone. That one was accepted while this one was
+// refused, which are the same program written two ways.
 fn consume(own s: str) -> i64 {
     s.len()
 }
+
 fn main() {
     let name = "ada"
     for _i in 0..3 {
         let n = consume(name)
     }
+    let other = "grace"
+    let f = |_x| consume(other)
+    print("{f(1)} {f(2)}")
 }
 ```
 

@@ -58,6 +58,19 @@ struct Ctx<'a> {
     /// is no name to key those on, so calling through an index or any other
     /// computed callee contributes all of them.
     elem_rows: BTreeSet<String>,
+    /// effect name → what any handler for it, written anywhere in the
+    /// program, performs.
+    ///
+    /// [E-HANDLER-OWN-ROW] says a handler's own effects are counted where it
+    /// is *installed*. They were counted where it was *constructed*, which is
+    /// the same place only when the handler is written at the `with`. The
+    /// moment one crossed a function boundary its effects disappeared:
+    /// `fn run(h: LogHandler) / {}` installed a printing handler and the
+    /// declared-empty row held. Since the handler type says nothing about
+    /// what its operations do, installing one that was built elsewhere
+    /// charges what *any* handler for that effect does — over-approximate,
+    /// and the safe direction.
+    handler_rows: HashMap<String, BTreeSet<String>>,
 }
 
 impl Ctx<'_> {
@@ -131,6 +144,7 @@ pub fn effects_of_program(program: &crate::loader::Program) -> BTreeSet<String> 
         imports: HashMap::new(),
         field_rows: HashMap::new(),
         elem_rows: BTreeSet::new(),
+        handler_rows: HashMap::new(),
     };
     for f in &views {
         ctx.imports.insert(f.name.clone(), f.imports.clone());
@@ -250,6 +264,7 @@ fn build_ctx<'a>(files: &'a [ModuleView<'a>]) -> Ctx<'a> {
         imports: HashMap::new(),
         field_rows: HashMap::new(),
         elem_rows: BTreeSet::new(),
+        handler_rows: HashMap::new(),
     };
     for f in files {
         ctx.imports.insert(f.name.clone(), f.imports.clone());
@@ -277,6 +292,162 @@ fn build_ctx<'a>(files: &'a [ModuleView<'a>]) -> Ctx<'a> {
 
 /// Runs the row fixpoint to completion.
 fn solve_rows(ctx: &mut Ctx) {
+    // Two interlocking fixpoints: a function's row depends on what the
+    // handlers it installs do, and a handler's operations are code whose row
+    // depends on the functions it calls. The outer loop runs until neither
+    // moves.
+    loop {
+        solve_fn_rows(ctx);
+        let found = compute_handler_rows(ctx);
+        if found == ctx.handler_rows {
+            break;
+        }
+        ctx.handler_rows = found;
+        for v in ctx.rows.values_mut() {
+            v.clear();
+        }
+    }
+}
+
+/// What every handler literal in the program performs, keyed by its effect.
+fn compute_handler_rows(ctx: &Ctx) -> HashMap<String, BTreeSet<String>> {
+    let mut out: HashMap<String, BTreeSet<String>> = HashMap::new();
+    let keys: Vec<String> = ctx.fns.keys().cloned().collect();
+    for key in keys {
+        let f = ctx.fns[&key];
+        let current = key.rsplit_once("::").map(|(m, _)| m).unwrap_or("main").to_string();
+        let mut lits: Vec<&Expr> = Vec::new();
+        collect_handler_lits_block(&f.body, &mut lits);
+        for lit in lits {
+            let Expr::StructLit { name, .. } = lit else {
+                continue;
+            };
+            let tname = name.segments.last().unwrap().name.clone();
+            let Some(effect) = tname.strip_suffix("Handler") else {
+                continue;
+            };
+            if !ctx.effect_names.contains(effect) {
+                continue;
+            }
+            let mut row = BTreeSet::new();
+            let mut active = Vec::new();
+            let mut fnb = FnBindings::default();
+            seed_params(&f.params, &mut fnb);
+            collect_fn_bindings(&f.body, ctx, &current, &mut fnb);
+            walk_expr(lit, &current, &mut active, ctx, &fnb, &mut row);
+            out.entry(effect.to_string()).or_default().extend(row);
+        }
+    }
+    out
+}
+
+/// Every `EHandler{ … }` literal reachable from a block.
+fn collect_handler_lits_block<'e>(b: &'e Block, out: &mut Vec<&'e Expr>) {
+    for st in &b.stmts {
+        match st {
+            Stmt::Let { init, .. } => collect_handler_lits(init, out),
+            Stmt::Assign { value, .. } => collect_handler_lits(value, out),
+            Stmt::Return(Some(e), _) | Stmt::Expr(e) => collect_handler_lits(e, out),
+            Stmt::While { cond, body, .. } => {
+                collect_handler_lits(cond, out);
+                collect_handler_lits_block(body, out);
+            }
+            Stmt::For { iter, body, .. } => {
+                collect_handler_lits(iter, out);
+                collect_handler_lits_block(body, out);
+            }
+            Stmt::With { handler, body, .. } => {
+                collect_handler_lits(handler, out);
+                collect_handler_lits_block(body, out);
+            }
+            Stmt::Parallel { body, .. } | Stmt::Spawn { body, .. } => {
+                collect_handler_lits_block(body, out)
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_handler_lits<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
+    match e {
+        Expr::StructLit { fields, base, .. } => {
+            out.push(e);
+            if let Some(b) = base {
+                collect_handler_lits(b, out);
+            }
+            for (_, v) in fields {
+                collect_handler_lits(v, out);
+            }
+        }
+        Expr::Call { callee, args, .. } => {
+            collect_handler_lits(callee, out);
+            for a in args {
+                collect_handler_lits(a, out);
+            }
+        }
+        Expr::MethodCall { recv, args, .. } => {
+            collect_handler_lits(recv, out);
+            for a in args {
+                collect_handler_lits(a, out);
+            }
+        }
+        Expr::List(items, _) | Expr::Tuple(items, _) => {
+            for i in items {
+                collect_handler_lits(i, out);
+            }
+        }
+        Expr::Map(entries, _) => {
+            for (k, v) in entries {
+                collect_handler_lits(k, out);
+                collect_handler_lits(v, out);
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_handler_lits(lhs, out);
+            collect_handler_lits(rhs, out);
+        }
+        Expr::Unary { expr, .. } | Expr::Try { expr, .. } => collect_handler_lits(expr, out),
+        Expr::Field { recv, .. } => collect_handler_lits(recv, out),
+        Expr::Index { recv, index, .. } => {
+            collect_handler_lits(recv, out);
+            collect_handler_lits(index, out);
+        }
+        Expr::Closure { body, .. } => collect_handler_lits(body, out),
+        Expr::Block(b) | Expr::Unsafe(b) | Expr::Region(b) => collect_handler_lits_block(b, out),
+        Expr::If {
+            cond,
+            then_block,
+            else_branch,
+            ..
+        } => {
+            collect_handler_lits(cond, out);
+            collect_handler_lits_block(then_block, out);
+            match else_branch.as_deref() {
+                Some(ElseBranch::Else(b)) => collect_handler_lits_block(b, out),
+                Some(ElseBranch::ElseIf(inner)) => collect_handler_lits(inner, out),
+                None => {}
+            }
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            collect_handler_lits(scrutinee, out);
+            for a in arms {
+                collect_handler_lits(&a.body, out);
+            }
+        }
+        Expr::Str(pieces, _) => {
+            for p in pieces {
+                if let StrPiece::Expr(i) = p {
+                    collect_handler_lits(i, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn solve_fn_rows(ctx: &mut Ctx) {
     loop {
         let mut changed = false;
         let keys: Vec<String> = ctx.fns.keys().cloned().collect();
@@ -1214,6 +1385,18 @@ fn walk_stmt(
             ..
         } => {
             walk_expr(handler, current, active, ctx, fnb, out);
+            // A handler written right here has just been walked. One that
+            // arrived from somewhere else — a parameter, a variable, a list
+            // element — has not, and its operations run *here*.
+            if !matches!(handler, Expr::StructLit { .. }) {
+                if let Some(row) = ctx.handler_rows.get(&effect.dotted()) {
+                    for e in row {
+                        if !active.contains(e) {
+                            out.insert(e.clone());
+                        }
+                    }
+                }
+            }
             active.push(effect.dotted());
             walk_block(body, current, active, ctx, fnb, out);
             active.pop();

@@ -1,12 +1,21 @@
 //! tag: T-MOVE-LOOP
 //! expect: error
 //! next loop iteration
+// A move that would happen more than once.
+//
+// The closure below is the same case: it runs once per call, so the second
+// call would find the value gone. That one was accepted while this one was
+// refused, which are the same program written two ways.
 fn consume(own s: str) -> i64 {
     s.len()
 }
+
 fn main() {
     let name = "ada"
     for _i in 0..3 {
         let n = consume(name)
     }
+    let other = "grace"
+    let f = |_x| consume(other)
+    print("{f(1)} {f(2)}")
 }

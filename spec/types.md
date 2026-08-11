@@ -209,7 +209,11 @@ ownership; the caller keeps using it.
 Using a moved binding afterwards is a compile error. Reassignment revives it.
 
 **[T-MOVE-LOOP]** Moving a binding declared outside a loop from inside that
-loop is rejected: the second iteration would use a value that is gone.
+loop is rejected: the second iteration would use a value that is gone. A
+closure body is the same case — it runs once per call, and the second call
+would find the value gone — so moving a *captured* binding out of one is
+rejected too. It was refused in the loop and accepted in the closure, which
+are the same program written two ways.
 
 **[T-COPY]** `i64`, `f64`, `bool`, and `()` are copied rather than moved, so
 `own` on them never invalidates the caller's binding.
@@ -531,6 +535,16 @@ which is a closure and carries its captures. A closure written *inside* the
 region is fine — it can only capture what a region already allows. This is the
 same rule as the one above seen from the other side: the earlier rules ask
 what a region's own text may write, and this one asks whose text runs there.
+
+The rule is about what a call can *reach*, not about where the text sits, and
+that distinction is the whole of it. Each region rule was written first
+against the syntax between the braces, and a one-hop wrapper walked through
+every one: a helper that performs the effect, a struct holding the reference
+one field deep, a struct holding the closure. So a call made from inside a
+region may not perform a declared effect, and may not be handed a function
+value — `io`, `async` and `unsafe` are exempt, because they have no handler
+and retain nothing, and a closure written inside the region is exempt, because
+it can only capture what a region already allows.
 
 **[T-UNSAFE-FFI]** `unsafe { … }` is Tier 3: the block where the guarantees of
 the safe tiers do not apply. Using a declared C function — calling one *or
