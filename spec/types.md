@@ -117,7 +117,11 @@ with `E`. It is an ordinary value, not an exception.
 
 **[T-FALLIBLE-UNHANDLED]** A fallible value may not be used as if it were `T`.
 It must be consumed by `try`, by a `match` covering `Ok` and `Err`, or by
-`??`.
+`??`. Discarding it counts as using it: a call written as a bare statement
+throws its failure away, and nothing says so. `write_file` to a path that
+cannot be written printed "wrote the report", exited 0, wrote nothing to
+stderr and left no file — and every user function that can fail behaved the
+same way when its result was ignored.
 
 **[T-FALLIBLE-COALESCE]** `e ?? d` where `e : T ! E` yields the value or `d`,
 the same shape `??` has over an `Option` ([E-COALESCE-LAZY] applies equally:

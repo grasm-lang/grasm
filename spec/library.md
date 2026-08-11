@@ -26,7 +26,7 @@ came to be documented as returning `Option[str]` when it is fallible.
 | `env(name)` | `(str) -> Option[str]` | environment variable; `io` |
 | `exit(code)` | `(i64)` | ends the program with that status |
 | `read_file(p)` | `(str) -> str ! IoError` | fallible, not `Option`; `io` ([L-LIB-IO]) |
-| `write_file(p, s)` | `(str, str)` | `io` |
+| `write_file(p, s)` | `(str, str) -> () ! IoError` | fallible; `io` ([L-LIB-IO]) |
 | `file_exists(p)` | `(str) -> bool` | `io` |
 
 **[L-LIB-IO]** The three ways a library call reports "no": `read_file` is

@@ -991,7 +991,29 @@ land in a copy the caller never sees — return the new value from the operation
                     self.check_expr(e, &w);
                     ty = w;
                 }
-                _ => ty = self.check_stmt(stmt),
+                _ => {
+                    ty = self.check_stmt(stmt);
+                    // A statement that is not the block's value throws that
+                    // value away, and throwing away a failure is using a
+                    // fallible value as if it were `T`. `write_file` to an
+                    // unwritable path printed "wrote the report", exit 0,
+                    // nothing on stderr and no file — and every user function
+                    // that can fail did the same ([T-FALLIBLE-UNHANDLED]).
+                    if i + 1 < n
+                        && matches!(stmt, Stmt::Expr(_))
+                        && matches!(self.uni.shallow_resolve(&ty), Type::Fallible(..))
+                    {
+                        let shown = self.show(&ty);
+                        self.error_help(
+                            stmt_span(stmt),
+                            format!(
+                                "this expression can fail (`{shown}`) and its failure is discarded"
+                            ),
+                            "use `try` to propagate it, `match` to handle both cases, or `??` \
+with a fallback to say what should happen instead",
+                        );
+                    }
+                }
             }
             if i + 1 < n {
                 ty = Type::Unit;

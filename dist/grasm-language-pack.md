@@ -479,7 +479,11 @@ with `E`. It is an ordinary value, not an exception.
 
 **[T-FALLIBLE-UNHANDLED]** A fallible value may not be used as if it were `T`.
 It must be consumed by `try`, by a `match` covering `Ok` and `Err`, or by
-`??`.
+`??`. Discarding it counts as using it: a call written as a bare statement
+throws its failure away, and nothing says so. `write_file` to a path that
+cannot be written printed "wrote the report", exited 0, wrote nothing to
+stderr and left no file — and every user function that can fail behaved the
+same way when its result was ignored.
 
 **[T-FALLIBLE-COALESCE]** `e ?? d` where `e : T ! E` yields the value or `d`,
 the same shape `??` has over an `Option` ([E-COALESCE-LAZY] applies equally:
@@ -1491,7 +1495,7 @@ came to be documented as returning `Option[str]` when it is fallible.
 | `env(name)` | `(str) -> Option[str]` | environment variable; `io` |
 | `exit(code)` | `(i64)` | ends the program with that status |
 | `read_file(p)` | `(str) -> str ! IoError` | fallible, not `Option`; `io` ([L-LIB-IO]) |
-| `write_file(p, s)` | `(str, str)` | `io` |
+| `write_file(p, s)` | `(str, str) -> () ! IoError` | fallible; `io` ([L-LIB-IO]) |
 | `file_exists(p)` | `(str) -> bool` | `io` |
 
 **[L-LIB-IO]** The three ways a library call reports "no": `read_file` is
@@ -4998,7 +5002,13 @@ fn main() {
     print("env: {env("GRASM_A_VARIABLE_NOBODY_SETS_9F3C") ?? "unset"}")
     // Typechecked, never run — enough to pin the signatures.
     if file_exists("grasm_absent_9f3c.txt") {
-        write_file("grasm_absent_9f3c.txt", "unused")
+        // A write can fail, and its failure is not discardable: the shape
+        // that printed "wrote the report" with no file on disk was exactly
+        // this call as a bare statement.
+        match write_file("grasm_absent_9f3c.txt", "unused") {
+            Ok(_) -> print("wrote")
+            Err(e) -> print("{e}")
+        }
         let line = input()
         let ms = now_millis()
         print("{line} {ms}")
