@@ -8,10 +8,14 @@
 // `unknown name` — for a program `check` accepted. And naming one carried no
 // effect at all, so `xs.par_map(sqrt)` typechecked: the purity proof, the
 // declared row and a package's capability ceiling all passed something that
-// reaches libc. Holding a C function is the same permission as calling one.
+// reaches libc. Holding a C function is the same permission as calling one —
+// and the row that travels with it says so: `{io, unsafe}`, not just `{io}`.
+// A type written `fn(f64) -> f64 / {io}` does not accept one, which is what
+// stopped `sqrt` from being pushed into a list annotated that way inside an
+// `unsafe` block and called back out from a function declaring nothing.
 extern fn sqrt(x: f64) -> f64
 
-fn apply(f: fn(f64) -> f64 / {io}, v: f64) -> f64 / {io} {
+fn apply(f: fn(f64) -> f64 / {io, unsafe}, v: f64) -> f64 / {io, unsafe} {
     f(v)
 }
 

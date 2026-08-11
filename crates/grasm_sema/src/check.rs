@@ -1271,6 +1271,45 @@ closing brace — yield a number from the region and return that",
     }
 
     /// Marks `name` as moved (`own` transfer). Errors for loop-crossing moves.
+    /// Which bindings are currently moved, so a branch can be checked from
+    /// the state before it rather than from what a sibling branch did.
+    ///
+    /// Branches are mutually exclusive: only one of them runs. Checking them
+    /// in sequence let the first one's move leak into the second, so
+    /// `if c { eat(s) } else { eat(s) }` — where `s` is moved exactly once
+    /// however it goes — was "use of moved value" ([T-USE-AFTER-MOVE]).
+    fn moved_snapshot(&self) -> Vec<Vec<(String, bool)>> {
+        self.scopes
+            .iter()
+            .map(|sc| sc.iter().map(|(k, b)| (k.clone(), b.moved)).collect())
+            .collect()
+    }
+
+    fn restore_moved(&mut self, snap: &[Vec<(String, bool)>]) {
+        for (sc, saved) in self.scopes.iter_mut().zip(snap) {
+            for (name, moved) in saved {
+                if let Some(b) = sc.get_mut(name) {
+                    b.moved = *moved;
+                }
+            }
+        }
+    }
+
+    /// After the branches: a value is gone if any path could have taken it.
+    fn merge_moved(&mut self, branches: &[Vec<Vec<(String, bool)>>]) {
+        for snap in branches {
+            for (sc, saved) in self.scopes.iter_mut().zip(snap) {
+                for (name, moved) in saved {
+                    if *moved {
+                        if let Some(b) = sc.get_mut(name) {
+                            b.moved = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn mark_moved(&mut self, id: &Ident) {
         let loop_depth = self.loop_depth;
         // A closure body runs once per call, so moving something captured
@@ -1395,9 +1434,23 @@ closing brace — yield a number from the region and return that",
 
     /// A named function's inferred effect row, if it has one.
     fn row_of_fn(&self, name: &str) -> Option<std::collections::BTreeSet<String>> {
-        self.fn_rows
-            .get(&format!("{}::{}", self.current_module, name))
-            .cloned()
+        let key = format!("{}::{}", self.current_module, name);
+        // A C function has no body to infer from, and what it does is
+        // unknowable: `[T-EXTERN]` says calling one performs `io` and
+        // `[T-UNSAFE-FFI]` puts it in Tier 3. Without a row of its own it
+        // became a row-less value the moment it was stored — pushing `sqrt`
+        // into a `[fn(f64) -> f64 / {io}]` inside an `unsafe` block was
+        // accepted, and calling it back out ran libc from a function
+        // declaring nothing.
+        if self.extern_names.contains(&key) {
+            return Some(
+                ["io", "unsafe"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            );
+        }
+        self.fn_rows.get(&key).cloned()
     }
 
     /// A function value's row must fit the row of the type it is going into.
@@ -1957,13 +2010,18 @@ allocates could outlive it — move the work out of the region, or yield a numbe
                 ..
             } => {
                 self.check_expr(cond, &Type::Bool);
+                let before = self.moved_snapshot();
                 let then_ty = self.check_block(then_block);
+                let after_then = self.moved_snapshot();
                 match else_branch {
                     Some(eb) => {
+                        self.restore_moved(&before);
                         let else_ty = match &**eb {
                             ElseBranch::Else(b) => self.check_block(b),
                             ElseBranch::ElseIf(e) => self.infer_expr(e),
                         };
+                        let after_else = self.moved_snapshot();
+                        self.merge_moved(&[after_then, after_else]);
                         if self.uni.unify(&then_ty, &else_ty) {
                             then_ty
                         } else {
@@ -3960,7 +4018,12 @@ the state through an `inout` parameter",
         };
         let mut covered: Vec<String> = Vec::new();
         let mut has_irrefutable = false;
+        let before = self.moved_snapshot();
+        let mut arm_states: Vec<Vec<Vec<(String, bool)>>> = Vec::new();
         for arm in arms {
+            // Each arm starts from the state before the match: at most one of
+            // them runs, so a move in an earlier arm has not happened here.
+            self.restore_moved(&before);
             self.scopes.push(HashMap::new());
             let tag = self.check_pattern(&arm.pattern, &scrut_ty);
             if let Some(guard) = &arm.guard {
@@ -3976,7 +4039,10 @@ the state through an `inout` parameter",
             }
             self.check_expr(&arm.body, &result);
             self.scopes.pop();
+            arm_states.push(self.moved_snapshot());
         }
+        self.restore_moved(&before);
+        self.merge_moved(&arm_states);
         // Exhaustiveness.
         if !has_irrefutable {
             let missing = self.missing_for(&scrut_ty, &covered);

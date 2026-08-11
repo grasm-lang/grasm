@@ -1076,6 +1076,16 @@ struct FnBindings<'a> {
 }
 
 impl<'a> FnBindings<'a> {
+    /// Whether this name is bound to something known to be a function value.
+    ///
+    /// Distinct from `sources_for`, which falls back to every function value
+    /// in the body when it does not recognise the name — right for a callee
+    /// that must be *something*, wrong for a bare mention, where it would
+    /// charge every `i64` local for whatever the body happens to hold.
+    fn knows(&self, name: &str) -> bool {
+        self.by_name.contains_key(name)
+    }
+
     fn sources_for(&self, name: &str) -> &[FnSource<'a>] {
         match self.by_name.get(name) {
             Some(v) => v,
@@ -1455,6 +1465,15 @@ fn walk_expr(
             // and a package's `capabilities = []` ceiling.
             if let Some(qual) = ctx.resolve_call(current, &id.name) {
                 contribute(&qual, active, ctx, out);
+            } else if fnb.knows(&id.name) {
+                // A *local* holding a function value — most often a parameter
+                // whose type wrote the row. The direct call `f(x)` was
+                // charged and the mention was not, so handing the same `f` to
+                // a builtin that calls it charged nothing: `xs.map(f)` inside
+                // a `/ {}` function printed, and so did `fold`, `filter`,
+                // `any`, `all`, `find` and `sort_by`. `par_map` was checked,
+                // which is what made the hole look closed.
+                indirect_row(&id.name, current, active, ctx, fnb, out);
             }
         }
         Expr::Str(pieces, _) => {

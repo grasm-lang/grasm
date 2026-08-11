@@ -344,6 +344,20 @@ only mentioned, and something else calls it. That reached through `/ {}`,
 [T-PAR-MAP-PURE], the [E-HANDLER-MISSING] backstop, and a package's
 `capabilities = []` ceiling.
 
+That covers a named function. A function value that arrives as a *parameter*
+carries its row on its written type instead, and mentioning one is the same
+permission as mentioning a name: `xs.map(f)` where `f: fn(i64) -> i64 / {io}`
+performs `io`, exactly as `f(x)` does. Only the direct call was charged, so
+`map`, `fold`, `filter`, `any`, `all`, `find` and `sort_by` each carried an
+effect past a declared row. `par_map` was checked, which is what made the hole
+look closed.
+
+A declared C function has no body to infer a row from and what it does is
+unknowable, so its row is `{io, unsafe}` — and that travels with the value.
+Without it, pushing `sqrt` into a `[fn(f64) -> f64 / {io}]` inside an `unsafe`
+block was accepted, and calling it back out ran libc from a function declaring
+nothing at all.
+
 **[T-FN-TYPE-ROW]** A function type carries its effect row explicitly:
 `fn(i64) -> i64 / {io}`. **No row means the empty row**, so `fn(i64) -> i64`
 accepts only functions that perform nothing, and passing one that prints is an
