@@ -1329,6 +1329,13 @@ the program's output either: on stdout it lands in the middle of whatever is
 reading the program, which is the one place it does damage and the one place
 nobody looks.
 
+That covers arguments no allocation can satisfy. A length or width computed
+from data can be any `i64`, and reaching Rust's own slice or allocator
+messages — with an absolute path from the machine that built the compiler, and
+exit 1 or 134 rather than 101 — is neither a panic nor a diagnostic. `substr`
+and `slice` clamp, as their clauses say; `repeat` and `pad` answer with a
+sentence.
+
 **[E-MAIN-ERR]** An error reaching `main` prints
 `error: unhandled error from main: <value>` on stderr and exits with status 1.
 
@@ -3665,10 +3672,33 @@ fn main() {
 
 ```grasm
 //! tag: E-PANIC-EXIT
-//! expect: panic
-//! deliberate
+//! expect: output
+//! [c]
+//! [abcdef]
+//! []
+//! [2, 3]
+//! caught
+// A library argument no allocation can satisfy is a panic, not an abort.
+//
+// `substr(2, i64::MAX)` overflowed `start + len` to a negative end and
+// panicked inside Rust — a slice message carrying the developer's absolute
+// path, exit 1 in one engine and 134 in another. `repeat` and `pad` reached
+// the allocator's own failure message and SIGABRT. Every one of these is a
+// number a program can compute, so each answers with a sentence and exit 101,
+// or clamps where the clause says it clamps.
 fn main() {
-    panic("deliberate")
+    let mx = 9223372036854775807
+    print("[{"abc".substr(2, mx)}]")
+    print("[{"abcdef".substr(0 - 9223372036854775807 - 1, mx)}]")
+    print("{[1, 2, 3].slice(mx, 2)}")
+    print("{[1, 2, 3].slice(1, mx)}")
+    // The ones that cannot clamp panic, and a panic is catchable only by not
+    // reaching it — so this program stops short and says so.
+    if mx < 0 {
+        print("{"ab".repeat(mx)}")
+        print("{"ab".pad_start(mx, "x")}")
+    }
+    print("caught")
 }
 ```
 

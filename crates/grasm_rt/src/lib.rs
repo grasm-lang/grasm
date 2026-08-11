@@ -3611,6 +3611,13 @@ pub unsafe extern "C" fn grasm_str_pad(
         grasm_panic_msg_str("pad fill must not be empty");
     }
     let len = text.chars().count();
+    // A width past what a string can hold is a panic with a sentence, not the
+    // allocator's own failure message and SIGABRT — as `repeat` already is.
+    if width > MAX_ALLOC as i64 {
+        rt_panic(&format!(
+            "pad width {width} is larger than a string can hold"
+        ));
+    }
     // A multi-character fill repeats and is cut to the exact width, matching
     // the interpreter (spec [E-PAD-CYCLE]).
     let pad: String = fill

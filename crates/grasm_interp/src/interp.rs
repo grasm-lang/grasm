@@ -2644,7 +2644,16 @@ build links it, `grasm run` can only reach what is already loaded",
                 if fill.is_empty() {
                     return Err(Flow::Panic("pad fill must not be empty".into()));
                 }
-                let len = s.chars().count();
+                let len = s.char_len();
+                // A width past what a string can hold is a panic with a
+                // sentence, not the allocator's own `memory allocation of
+                // 9223372036854775805 bytes failed` and SIGABRT — the same
+                // class as `repeat` ([E-PANIC-EXIT]).
+                if width > MAX_ALLOC {
+                    return Err(Flow::Panic(format!(
+                        "pad width {width} is larger than a string can hold"
+                    )));
+                }
                 // A multi-character fill repeats and is cut to the exact width,
                 // rather than silently using only its first character.
                 let pad: String = fill

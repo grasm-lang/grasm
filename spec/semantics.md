@@ -255,6 +255,13 @@ the program's output either: on stdout it lands in the middle of whatever is
 reading the program, which is the one place it does damage and the one place
 nobody looks.
 
+That covers arguments no allocation can satisfy. A length or width computed
+from data can be any `i64`, and reaching Rust's own slice or allocator
+messages — with an absolute path from the machine that built the compiler, and
+exit 1 or 134 rather than 101 — is neither a panic nor a diagnostic. `substr`
+and `slice` clamp, as their clauses say; `repeat` and `pad` answer with a
+sentence.
+
 **[E-MAIN-ERR]** An error reaching `main` prints
 `error: unhandled error from main: <value>` on stderr and exits with status 1.
 
