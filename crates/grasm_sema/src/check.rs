@@ -1059,6 +1059,21 @@ land in a copy the caller never sees — return the new value from the operation
     // ------------------------------------------------------------------
 
     /// Returns the block's value type (last expression statement, else unit).
+    /// Whether an expression is an integer literal, possibly negated.
+    ///
+    /// These adopt the type they meet ([T-INT-TO-FLOAT]), so in a list, a map
+    /// or a set of `match` arms they are checked *after* everything else —
+    /// otherwise the first element fixed the type and `[1, 2.5]` was an
+    /// error while `[2.5, 1]` was fine, an asymmetry [E-NUM-PROMOTE] already
+    /// records as fixed for comparisons.
+    fn is_int_literal(e: &Expr) -> bool {
+        match e {
+            Expr::Int(..) => true,
+            Expr::Unary { op: UnaryOp::Neg, expr, .. } => matches!(**expr, Expr::Int(..)),
+            _ => false,
+        }
+    }
+
     fn check_block(&mut self, b: &Block) -> Type {
         self.check_block_with(b, None)
     }
@@ -2268,7 +2283,10 @@ allocates could outlive it — move the work out of the region, or yield a numbe
             Expr::Ident(id) => self.infer_ident(id),
             Expr::List(items, span) => {
                 let elem = self.uni.fresh();
-                for item in items {
+                for item in items.iter().filter(|i| !Self::is_int_literal(i)) {
+                    self.check_expr(item, &elem);
+                }
+                for item in items.iter().filter(|i| Self::is_int_literal(i)) {
                     self.check_expr(item, &elem);
                 }
                 if items.is_empty() {
@@ -2279,8 +2297,13 @@ allocates could outlive it — move the work out of the region, or yield a numbe
             Expr::Map(entries, span) => {
                 let k = self.uni.fresh();
                 let v = self.uni.fresh();
-                for (ke, ve) in entries {
+                for (ke, _) in entries {
                     self.check_expr(ke, &k);
+                }
+                for (_, ve) in entries.iter().filter(|(_, v)| !Self::is_int_literal(v)) {
+                    self.check_expr(ve, &v);
+                }
+                for (_, ve) in entries.iter().filter(|(_, v)| Self::is_int_literal(v)) {
                     self.check_expr(ve, &v);
                 }
                 if entries.is_empty() {

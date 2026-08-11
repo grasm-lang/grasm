@@ -78,6 +78,12 @@ backend had been converting where it happened to remember to — differently, an
 in both cases incompletely. The checker now hands the set over, so the answer is
 the same one twice.
 
+Order does not matter. A list, a map's values, and a `match`'s arms are
+checked with their integer literals *last*, so whatever fixes the type does it
+first: `[1, 2.5]` and `[2.5, 1]` are both `[f64]`. Checking left to right made
+the first element decide, which is the asymmetry `[E-NUM-PROMOTE]` records as
+fixed for comparisons, still present one level up.
+
 An expected type also reaches a literal *through the shape that carries it*: a
 list, tuple or map literal, `Some`, `Ok`, `Err`, an `if`'s branches, a
 `match`'s arms, and the expression a function body ends with. Each of those

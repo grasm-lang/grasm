@@ -443,6 +443,12 @@ backend had been converting where it happened to remember to — differently, an
 in both cases incompletely. The checker now hands the set over, so the answer is
 the same one twice.
 
+Order does not matter. A list, a map's values, and a `match`'s arms are
+checked with their integer literals *last*, so whatever fixes the type does it
+first: `[1, 2.5]` and `[2.5, 1]` are both `[f64]`. Checking left to right made
+the first element decide, which is the asymmetry `[E-NUM-PROMOTE]` records as
+fixed for comparisons, still present one level up.
+
 An expected type also reaches a literal *through the shape that carries it*: a
 list, tuple or map literal, `Some`, `Ok`, `Err`, an `if`'s branches, a
 `match`'s arms, and the expression a function body ends with. Each of those
@@ -6899,6 +6905,7 @@ fn main() {
 //! 3.0 true
 //! 1.5 3.0
 //! 3.0 [1.0, 2.0] 5.0 3.0 3.0 1.0 2.0 2.0
+//! [1.0, 2.5] [2.5, 1.0] 1.0 2.0
 // An integer literal in an `f64` position is a float *everywhere*.
 //
 // [T-INT-TO-FLOAT] says the conversion happens at compile time, and only the
@@ -6952,6 +6959,14 @@ fn main() {
     }
     let branch: f64 = if true { 2 } else { 3.5 }
     print("{tail()} {list} {tup.0} {opt ?? 0.0} {fal ?? 0.0} {mp.get("k") ?? 0.0} {matched} {branch}")
+    // Order does not matter: the literal adopts whichever side is a float,
+    // whether it comes first or second.
+    let first: Map[str, f64] = {"a": 1, "b": 2.5}
+    let arms: f64 = match 1 {
+        1 -> 2
+        _ -> 3.5
+    }
+    print("{[1, 2.5]} {[2.5, 1]} {first.get("a") ?? 0.0} {arms}")
 }
 
 type Bad = | Bad

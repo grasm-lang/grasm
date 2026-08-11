@@ -10,6 +10,8 @@ pub struct Lexer<'a> {
     pos: usize,
     /// `///` lines, in source order: (span of the line, text after the slashes).
     docs: Vec<(Span, String)>,
+    /// Where an unterminated `/*` began, if one was seen.
+    unterminated_comment: Option<u32>,
     /// Whether the token just emitted was `.`.
     ///
     /// After one, a number is a *tuple component*, so its own `.` starts the
@@ -38,6 +40,7 @@ impl<'a> Lexer<'a> {
             pos: 0,
             docs: Vec::new(),
             after_dot: false,
+            unterminated_comment: None,
         }
     }
 
@@ -60,6 +63,21 @@ impl<'a> Lexer<'a> {
             if is_eof {
                 break;
             }
+        }
+        if let Some(at) = self.unterminated_comment {
+            // Reported as a token so the parser surfaces it like any other
+            // lexical error, with a location.
+            let last = out.len().saturating_sub(1);
+            out.insert(
+                last,
+                Token {
+                    kind: TokenKind::Error(
+                        "unterminated `/* ... */` comment — these nest, so an inner `/*` needs its own `*/`"
+                            .into(),
+                    ),
+                    span: Span::new(at, at + 2),
+                },
+            );
         }
         (out, self.docs)
     }
@@ -139,6 +157,7 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 b'/' if self.peek2() == b'*' => {
+                    let opened = self.pos;
                     self.bump();
                     self.bump();
                     let mut depth = 1u32;
@@ -154,6 +173,15 @@ impl<'a> Lexer<'a> {
                         } else {
                             self.bump();
                         }
+                    }
+                    // Running out of file is not a way to end a comment.
+                    // Swallowing the rest silently made `/* outer /* inner */`
+                    // — an easy thing to write, since these nest — delete
+                    // everything after it and still report `ok`; if `main` was
+                    // in what it ate, only `run` said anything, and it said
+                    // "no `main` function" ([L-COMMENT-BLOCK]).
+                    if depth > 0 {
+                        self.unterminated_comment = Some(opened as u32);
                     }
                 }
                 _ => break,
