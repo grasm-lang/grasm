@@ -2441,7 +2441,7 @@ build links it, `grasm run` can only reach what is already loaded",
                 Some(v) => Value::some(v.clone()),
                 None => Value::none(),
             },
-            (Value::Str(s), "len") => Value::Int(s.chars().count() as i64),
+            (Value::Str(s), "len") => Value::Int(s.char_len() as i64),
             (Value::Str(s), "contains") => {
                 let n = self.eval_expr(&args[0])?;
                 Value::Bool(s.contains(&n.to_string()))
@@ -2548,13 +2548,21 @@ build links it, `grasm run` can only reach what is already loaded",
                 let Value::Int(i) = self.eval_expr(&args[0])? else {
                     return Err(Flow::Panic("code_at expects an integer".into()));
                 };
-                let n = s.chars().count() as i64;
+                let n = s.char_len() as i64;
                 if i < 0 || i >= n {
                     return Err(Flow::Panic(format!(
                         "code_at {i} out of bounds (len {n})"
                     )));
                 }
-                Value::Int(s.chars().nth(i as usize).expect("in bounds") as i64)
+                // When every character is one byte, the index *is* an index.
+                // Walking it made `code_at` cost O(i), so a loop reading a
+                // string left to right was quadratic — and that loop is what
+                // [L-LIB-CODES] recommends the method for.
+                if s.is_flat() {
+                    Value::Int(s.as_bytes()[i as usize] as i64)
+                } else {
+                    Value::Int(s.chars().nth(i as usize).expect("in bounds") as i64)
+                }
             }
             (Value::Str(s), "words") => Value::List(Rc::new(
                 s.split_whitespace().map(Value::str).collect(),

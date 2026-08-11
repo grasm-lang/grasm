@@ -78,7 +78,7 @@ pub enum Value {
     Int(i64),
     Float(f64),
     Bool(bool),
-    Str(Rc<String>),
+    Str(Rc<GStr>),
     Unit,
     Range(i64, i64, bool),
     List(Rc<Vec<Value>>),
@@ -139,7 +139,7 @@ impl MapKey {
         match v {
             Value::Int(i) => Some(MapKey::Int(*i)),
             Value::Bool(b) => Some(MapKey::Bool(*b)),
-            Value::Str(s) => Some(MapKey::Str(s.as_ref().clone())),
+            Value::Str(s) => Some(MapKey::Str(s.as_str().to_string())),
             _ => None,
         }
     }
@@ -153,9 +153,91 @@ impl MapKey {
     }
 }
 
+/// A string, with its character count remembered.
+///
+/// `s.len()` counts *characters*, which meant decoding the whole string every
+/// time it was asked: `while i < s.len()` was quadratic, and 400 000
+/// characters took 6.7 seconds where the same loop over a list took 0.21. The
+/// count never changes for a given string — these are immutable and shared by
+/// reference — so it is computed once and kept. It also answers whether the
+/// text is ASCII, since that is exactly "as many characters as bytes", which
+/// is what makes `code_at(i)` an index rather than a walk.
+#[derive(Debug)]
+pub struct GStr {
+    s: String,
+    /// `u32::MAX` until asked for.
+    chars: std::cell::Cell<u32>,
+}
+
+impl GStr {
+    pub fn new(s: String) -> GStr {
+        GStr {
+            s,
+            chars: std::cell::Cell::new(u32::MAX),
+        }
+    }
+
+    /// The number of characters, computed at most once.
+    pub fn char_len(&self) -> usize {
+        let c = self.chars.get();
+        if c != u32::MAX {
+            return c as usize;
+        }
+        let n = self.s.chars().count();
+        // A string longer than 4 billion characters is recomputed each time
+        // rather than remembered wrongly.
+        if n < u32::MAX as usize {
+            self.chars.set(n as u32);
+        }
+        n
+    }
+
+    /// Whether every character is one byte, so an index is an index.
+    pub fn is_flat(&self) -> bool {
+        self.char_len() == self.s.len()
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.s
+    }
+}
+
+impl std::ops::Deref for GStr {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.s
+    }
+}
+
+impl PartialEq for GStr {
+    fn eq(&self, other: &GStr) -> bool {
+        self.s == other.s
+    }
+}
+
+impl Eq for GStr {}
+
+impl PartialOrd for GStr {
+    fn partial_cmp(&self, other: &GStr) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for GStr {
+    fn cmp(&self, other: &GStr) -> std::cmp::Ordering {
+        self.s.cmp(&other.s)
+    }
+}
+
+impl std::fmt::Display for GStr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.s)
+    }
+}
+
 impl Value {
     pub fn str(s: impl Into<String>) -> Value {
-        Value::Str(Rc::new(s.into()))
+        Value::Str(Rc::new(GStr::new(s.into())))
     }
 
     pub fn none() -> Value {

@@ -256,7 +256,7 @@ impl MapKey {
         match &(*v).payload {
             RtPayload::Bool(b) => MapKey::Bool(*b),
             RtPayload::I64(n) => MapKey::I64(*n),
-            RtPayload::Str(s) => MapKey::Str(s.clone()),
+            RtPayload::Str(s) => MapKey::Str(s.to_string()),
             _ => grasm_panic_msg_str("map keys must be i64, str, or bool"),
         }
     }
@@ -265,7 +265,7 @@ impl MapKey {
         match self {
             MapKey::Bool(b) => interned_bool(*b),
             MapKey::I64(n) => grasm_box_i64(*n),
-            MapKey::Str(s) => alloc(RtPayload::Str(s.clone())),
+            MapKey::Str(s) => alloc(RtPayload::Str(RtStr::new(s.clone()))),
         }
     }
 }
@@ -391,11 +391,85 @@ impl ScalarData {
     }
 }
 
+/// A string, with its character count remembered.
+///
+/// `len` counts *characters*, which meant decoding the whole string every time
+/// it was asked: `while i < s.len()` was quadratic, and 400 000 characters
+/// took 6.7 seconds. These strings are immutable once built, so the count is
+/// computed once and kept. It also answers whether the text is ASCII — that is
+/// exactly "as many characters as bytes" — which is what makes `code_at(i)` an
+/// index rather than a walk.
+#[derive(Debug)]
+pub struct RtStr {
+    s: String,
+    /// `u32::MAX` until asked for.
+    chars: Cell<u32>,
+}
+
+impl RtStr {
+    pub fn new(s: String) -> RtStr {
+        RtStr {
+            s,
+            chars: Cell::new(u32::MAX),
+        }
+    }
+
+    pub fn char_len(&self) -> usize {
+        let c = self.chars.get();
+        if c != u32::MAX {
+            return c as usize;
+        }
+        let n = self.s.chars().count();
+        if n < u32::MAX as usize {
+            self.chars.set(n as u32);
+        }
+        n
+    }
+
+    /// Every character one byte, so an index is an index.
+    pub fn is_flat(&self) -> bool {
+        self.char_len() == self.s.len()
+    }
+}
+
+impl PartialEq for RtStr {
+    fn eq(&self, other: &RtStr) -> bool {
+        self.s == other.s
+    }
+}
+
+impl Eq for RtStr {}
+
+impl PartialOrd for RtStr {
+    fn partial_cmp(&self, other: &RtStr) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RtStr {
+    fn cmp(&self, other: &RtStr) -> std::cmp::Ordering {
+        self.s.cmp(&other.s)
+    }
+}
+
+impl std::ops::Deref for RtStr {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.s
+    }
+}
+
+impl std::fmt::Display for RtStr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.s)
+    }
+}
+
 pub enum RtPayload {
     I64(i64),
     F64(f64),
     Bool(bool),
-    Str(String),
+    Str(RtStr),
     List(Vec<*mut RtVal>),
     /// Same shape as a list, rendered with parentheses.
     ///
@@ -722,7 +796,7 @@ pub unsafe extern "C" fn grasm_val_dec(v: *mut RtVal) {
 #[no_mangle]
 pub unsafe extern "C" fn grasm_str_lit(ptr: *const u8, len: u64) -> *mut RtVal {
     let bytes = std::slice::from_raw_parts(ptr, len as usize);
-    alloc(RtPayload::Str(String::from_utf8_lossy(bytes).into_owned()))
+    alloc(RtPayload::Str(RtStr::new(String::from_utf8_lossy(bytes).into_owned())))
 }
 
 #[no_mangle]
@@ -730,28 +804,28 @@ pub unsafe extern "C" fn grasm_str_concat(a: *mut RtVal, b: *mut RtVal) -> *mut 
     let (RtPayload::Str(sa), RtPayload::Str(sb)) = (&(*a).payload, &(*b).payload) else {
         grasm_panic_msg_str("concat on non-strings");
     };
-    alloc(RtPayload::Str(format!("{sa}{sb}")))
+    alloc(RtPayload::Str(RtStr::new(format!("{sa}{sb}"))))
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn grasm_str_from_i64(v: i64) -> *mut RtVal {
-    alloc(RtPayload::Str(v.to_string()))
+    alloc(RtPayload::Str(RtStr::new(v.to_string())))
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn grasm_str_from_f64(v: f64) -> *mut RtVal {
-    alloc(RtPayload::Str(float_text(v)))
+    alloc(RtPayload::Str(RtStr::new(float_text(v))))
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn grasm_str_from_bool(v: i8) -> *mut RtVal {
-    alloc(RtPayload::Str((v != 0).to_string()))
+    alloc(RtPayload::Str(RtStr::new((v != 0).to_string())))
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn grasm_str_len(v: *mut RtVal) -> i64 {
     match &(*v).payload {
-        RtPayload::Str(s) => s.chars().count() as i64,
+        RtPayload::Str(s) => s.char_len() as i64,
         _ => grasm_panic_msg_str("len on non-string"),
     }
 }
@@ -1440,7 +1514,7 @@ unsafe fn display(v: *mut RtVal) -> String {
         RtPayload::I64(x) => x.to_string(),
         RtPayload::F64(x) => float_text(*x),
         RtPayload::Bool(x) => x.to_string(),
-        RtPayload::Str(s) => s.clone(),
+        RtPayload::Str(s) => s.to_string(),
         RtPayload::List(items) => {
             let parts: Vec<String> = items.iter().map(|&i| display(i)).collect();
             format!("[{}]", parts.join(", "))
@@ -1834,7 +1908,7 @@ pub unsafe extern "C" fn grasm_list_get_opt(v: *mut RtVal, i: i64) -> *mut RtVal
 /// # Safety: live pointer.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_str_from_val(v: *mut RtVal) -> *mut RtVal {
-    alloc(RtPayload::Str(display(v)))
+    alloc(RtPayload::Str(RtStr::new(display(v))))
 }
 
 // ---------------------------------------------------------------------------
@@ -1984,7 +2058,7 @@ pub unsafe extern "C" fn grasm_map_keys(m: *mut RtVal) -> *mut RtVal {
 #[no_mangle]
 pub unsafe extern "C" fn grasm_panic_value(v: *mut RtVal) -> ! {
     let msg = match &(*v).payload {
-        RtPayload::Str(s) => s.clone(),
+        RtPayload::Str(s) => s.to_string(),
         other => {
             let _ = other;
             display(v)
@@ -2040,7 +2114,7 @@ unsafe fn as_str(v: *mut RtVal) -> &'static str {
     match &(*v).payload {
         RtPayload::Str(s) => {
             // Lifetime is tied to the caller's borrow; safe for the call span.
-            std::mem::transmute::<&str, &'static str>(s.as_str())
+            std::mem::transmute::<&str, &'static str>(&**s)
         }
         _ => grasm_panic_msg_str("expected a string"),
     }
@@ -2066,11 +2140,11 @@ pub unsafe extern "C" fn grasm_str_split(s: *mut RtVal, sep: *mut RtVal) -> *mut
     let sp = as_str(sep);
     let parts: Vec<*mut RtVal> = if sp.is_empty() {
         text.chars()
-            .map(|c| alloc(RtPayload::Str(c.to_string())))
+            .map(|c| alloc(RtPayload::Str(RtStr::new(c.to_string()))))
             .collect()
     } else {
         text.split(sp)
-            .map(|p| alloc(RtPayload::Str(p.to_string())))
+            .map(|p| alloc(RtPayload::Str(RtStr::new(p.to_string()))))
             .collect()
     };
     alloc(RtPayload::List(parts))
@@ -2087,7 +2161,7 @@ pub extern "C" fn grasm_f64_to_fixed(x: f64, places: i64) -> *mut RtVal {
     if !(0..=17).contains(&places) {
         rt_panic(&format!("to_fixed({places}): places must be 0 to 17"));
     }
-    alloc(RtPayload::Str(fixed_text(x, places)))
+    alloc(RtPayload::Str(RtStr::new(fixed_text(x, places))))
 }
 
 // ---------------------------------------------------------------------------
@@ -2375,12 +2449,19 @@ fn bump_last_digit(s: &str) -> String {
 /// # Safety: live pointer.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_str_code_at(s: *mut RtVal, i: i64) -> i64 {
-    let text = as_str(s);
-    let n = text.chars().count() as i64;
+    let RtPayload::Str(gs) = &(*s).payload else {
+        grasm_panic_msg_str("code_at on non-string");
+    };
+    let n = gs.char_len() as i64;
     if i < 0 || i >= n {
         rt_panic(&format!("code_at {i} out of bounds (len {n})"));
     }
-    text.chars().nth(i as usize).expect("in bounds") as i64
+    // When every character is one byte, the index *is* an index.
+    if gs.is_flat() {
+        gs.as_bytes()[i as usize] as i64
+    } else {
+        gs.chars().nth(i as usize).expect("in bounds") as i64
+    }
 }
 
 /// The whitespace-separated words of a string, with no empties.
@@ -2390,7 +2471,7 @@ pub unsafe extern "C" fn grasm_str_code_at(s: *mut RtVal, i: i64) -> i64 {
 pub unsafe extern "C" fn grasm_str_words(s: *mut RtVal) -> *mut RtVal {
     let items: Vec<*mut RtVal> = as_str(s)
         .split_whitespace()
-        .map(|w| alloc(RtPayload::Str(w.to_string())))
+        .map(|w| alloc(RtPayload::Str(RtStr::new(w.to_string()))))
         .collect();
     alloc(RtPayload::List(items))
 }
@@ -2414,7 +2495,7 @@ pub unsafe extern "C" fn grasm_str_codes(s: *mut RtVal) -> *mut RtVal {
 #[no_mangle]
 pub extern "C" fn grasm_i64_to_char(n: i64) -> *mut RtVal {
     match u32::try_from(n).ok().and_then(char::from_u32) {
-        Some(c) => alloc(RtPayload::Str(c.to_string())),
+        Some(c) => alloc(RtPayload::Str(RtStr::new(c.to_string()))),
         None => rt_panic(&format!("{n} is not a Unicode code point")),
     }
 }
@@ -2423,7 +2504,7 @@ pub extern "C" fn grasm_i64_to_char(n: i64) -> *mut RtVal {
 pub unsafe extern "C" fn grasm_str_chars(s: *mut RtVal) -> *mut RtVal {
     let items: Vec<*mut RtVal> = as_str(s)
         .chars()
-        .map(|c| alloc(RtPayload::Str(c.to_string())))
+        .map(|c| alloc(RtPayload::Str(RtStr::new(c.to_string()))))
         .collect();
     alloc(RtPayload::List(items))
 }
@@ -2431,31 +2512,31 @@ pub unsafe extern "C" fn grasm_str_chars(s: *mut RtVal) -> *mut RtVal {
 /// # Safety: live pointer.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_str_trim(s: *mut RtVal) -> *mut RtVal {
-    alloc(RtPayload::Str(as_str(s).trim().to_string()))
+    alloc(RtPayload::Str(RtStr::new(as_str(s).trim().to_string())))
 }
 
 /// # Safety: live pointer.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_str_trim_start(s: *mut RtVal) -> *mut RtVal {
-    alloc(RtPayload::Str(as_str(s).trim_start().to_string()))
+    alloc(RtPayload::Str(RtStr::new(as_str(s).trim_start().to_string())))
 }
 
 /// # Safety: live pointer.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_str_trim_end(s: *mut RtVal) -> *mut RtVal {
-    alloc(RtPayload::Str(as_str(s).trim_end().to_string()))
+    alloc(RtPayload::Str(RtStr::new(as_str(s).trim_end().to_string())))
 }
 
 /// # Safety: live pointer.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_str_upper(s: *mut RtVal) -> *mut RtVal {
-    alloc(RtPayload::Str(as_str(s).to_uppercase()))
+    alloc(RtPayload::Str(RtStr::new(as_str(s).to_uppercase())))
 }
 
 /// # Safety: live pointer.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_str_lower(s: *mut RtVal) -> *mut RtVal {
-    alloc(RtPayload::Str(as_str(s).to_lowercase()))
+    alloc(RtPayload::Str(RtStr::new(as_str(s).to_lowercase())))
 }
 
 /// # Safety: live pointer.
@@ -2464,7 +2545,7 @@ pub unsafe extern "C" fn grasm_str_repeat(s: *mut RtVal, n: i64) -> *mut RtVal {
     if n < 0 {
         rt_panic("repeat count must be a non-negative int");
     }
-    alloc(RtPayload::Str(as_str(s).repeat(n as usize)))
+    alloc(RtPayload::Str(RtStr::new(as_str(s).repeat(n as usize))))
 }
 
 /// # Safety: live pointers.
@@ -2474,7 +2555,7 @@ pub unsafe extern "C" fn grasm_str_replace(
     from: *mut RtVal,
     to: *mut RtVal,
 ) -> *mut RtVal {
-    alloc(RtPayload::Str(as_str(s).replace(as_str(from), as_str(to))))
+    alloc(RtPayload::Str(RtStr::new(as_str(s).replace(as_str(from), as_str(to)))))
 }
 
 /// # Safety: live pointer.
@@ -2484,7 +2565,7 @@ pub unsafe extern "C" fn grasm_str_substr(s: *mut RtVal, start: i64, len: i64) -
     let n = chars.len() as i64;
     let start = start.clamp(0, n) as usize;
     let end = (start as i64 + len.max(0)).clamp(0, n) as usize;
-    alloc(RtPayload::Str(chars[start..end].iter().collect::<String>()))
+    alloc(RtPayload::Str(RtStr::new(chars[start..end].iter().collect::<String>())))
 }
 
 /// # Safety: live pointers; returns Option[i64] (char index).
@@ -2541,7 +2622,7 @@ pub unsafe extern "C" fn grasm_list_join(v: *mut RtVal, sep: *mut RtVal) -> *mut
         Items::Boxed(items) => items.iter().map(|&i| display(i)).collect(),
         Items::Scalar(kind, data) => data.iter().map(|b| scalar_display(kind, b)).collect(),
     };
-    alloc(RtPayload::Str(parts.join(as_str(sep))))
+    alloc(RtPayload::Str(RtStr::new(parts.join(as_str(sep)))))
 }
 
 /// # Safety: live pointer.
@@ -3181,7 +3262,7 @@ pub extern "C" fn grasm_args() -> *mut RtVal {
     let items: Vec<*mut RtVal> = PROGRAM_ARGS.with(|a| {
         a.borrow()
             .iter()
-            .map(|s| alloc(RtPayload::Str(s.clone())))
+            .map(|s| alloc(RtPayload::Str(RtStr::new(s.clone()))))
             .collect()
     });
     alloc(RtPayload::List(items))
@@ -3194,13 +3275,13 @@ pub extern "C" fn grasm_input() -> *mut RtVal {
     while line.ends_with('\n') || line.ends_with('\r') {
         line.pop();
     }
-    alloc(RtPayload::Str(line))
+    alloc(RtPayload::Str(RtStr::new(line)))
 }
 
 // --- filesystem (fallible: returns Ok/Err variants) ---
 
 fn io_err(variant: &'static str, payload: String) -> *mut RtVal {
-    let inner = alloc(RtPayload::Str(payload));
+    let inner = alloc(RtPayload::Str(RtStr::new(payload)));
     alloc(RtPayload::Variant {
         type_name: "IoError",
         name: variant,
@@ -3228,7 +3309,7 @@ fn ok_of(v: *mut RtVal) -> *mut RtVal {
 pub unsafe extern "C" fn grasm_read_file(path: *mut RtVal) -> *mut RtVal {
     let p = as_str(path).to_string();
     match std::fs::read_to_string(&p) {
-        Ok(s) => ok_of(alloc(RtPayload::Str(s))),
+        Ok(s) => ok_of(alloc(RtPayload::Str(RtStr::new(s)))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => err_of(io_err("NotFound", p)),
         Err(e) => err_of(io_err("IoFailed", e.to_string())),
     }
@@ -3293,7 +3374,7 @@ pub extern "C" fn grasm_now_millis() -> i64 {
 #[no_mangle]
 pub unsafe extern "C" fn grasm_env(name: *mut RtVal) -> *mut RtVal {
     match std::env::var(as_str(name)) {
-        Ok(v) => some_of(alloc(RtPayload::Str(v))),
+        Ok(v) => some_of(alloc(RtPayload::Str(RtStr::new(v)))),
         Err(_) => none_val(),
     }
 }
@@ -3310,7 +3391,7 @@ pub extern "C" fn grasm_exit(code: i64) {
 pub unsafe extern "C" fn grasm_str_lines(s: *mut RtVal) -> *mut RtVal {
     let items: Vec<*mut RtVal> = as_str(s)
         .lines()
-        .map(|l| alloc(RtPayload::Str(l.to_string())))
+        .map(|l| alloc(RtPayload::Str(RtStr::new(l.to_string()))))
         .collect();
     alloc(RtPayload::List(items))
 }
@@ -3341,7 +3422,7 @@ pub unsafe extern "C" fn grasm_str_pad(
     } else {
         format!("{text}{pad}")
     };
-    alloc(RtPayload::Str(out))
+    alloc(RtPayload::Str(RtStr::new(out)))
 }
 
 /// # Safety: live runtime pointer.
