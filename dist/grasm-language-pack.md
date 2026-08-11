@@ -875,7 +875,8 @@ people actually write.
 binding declared outside the region as `inout` is refused, because the callee
 can store into it. `fail` is refused for the same reason `return` is — it
 leaves the region carrying a value, and that value is usually built right
-there. The rule was stated for direct writes first, and two independent
+there — and `try` for the same reason again, being a conditional `return` of
+an `Err` whose payload is normally allocated where the failure happened. The rule was stated for direct writes first, and two independent
 evaluations found both holes within an hour, which is what a rule expressed in
 terms of syntax rather than of effect gets you.
 
@@ -1077,6 +1078,16 @@ has to change belongs in the caller, threaded through `inout` or returned.
 
 Note the contrast with **[E-SPAWN-SHARED]**: a `spawn` body *does* see and
 mutate the enclosing scope. Two block-shaped constructs, two rules.
+
+A capture is a value, and for a value that lives on the heap that means
+holding a reference to it. The compiled backend stored the bare pointer, so
+the binding still looked uniquely owned and a later `xs.push(v)` mutated the
+very list the handler had captured — `[E-COW]` copies on mutation of a
+*shared* value, and this made a shared value look unshared. Of forty
+handler-capture shapes, thirty-two disagreed between the engines: a mutating
+method returned the new value, a reassignment freed what the handler still
+pointed at and the next call read a raw word as the wrong type, and returning
+the captured value crashed with nothing on stderr.
 
 **[E-COALESCE-DIVERGE]** The right-hand side of `??` may leave instead of
 producing a value — `m.get(k) ?? fail(e)` is the shortest way to turn absence
@@ -2533,35 +2544,32 @@ fn main() {
 ```grasm
 //! tag: E-CLOSURE-CAPTURE
 //! expect: output
-//! 1
-//! 2
-//! 7
-// A closure captures values, not bindings. Changing the variable afterwards
-// is not visible inside, and writing to it inside changes only a copy.
+//! 2 one
+//! 2 one
+//! 3 two
+// A closure captures values, at the moment it is created.
 //
-// This is worth a program because the same author who wrote the rule got it
-// wrong writing an effect handler: a `write` operation that updates a
-// captured list updates a copy, and the next `read` does not see it. The
-// counter below is that mistake in miniature.
+// A handler's operations are closures, so a handler cannot hold mutable
+// state: what it captured is what it keeps, however the binding moves on.
+// The compiled backend stored the pointer without holding a reference to it,
+// so the binding looked unshared, copy-on-write never fired, and the handler
+// saw every later mutation — a wrong answer, and a crash when the binding was
+// reassigned and freed what the handler still pointed at.
+effect Snap {
+    fn size() -> i64
+    fn text() -> str
+}
+
 fn main() {
-    var n = 1
-    let plus_n = |x| x + n
-    n = 100
-    // Still 1: the closure kept the value it was built with.
-    print("{plus_n(0)}")
-
     var xs = [1, 2]
-    let size = |_ignored| xs.len()
-    xs.push(3)
-    print("{size(0)}")
-
-    // A captured binding may be read freely.
-    let base = 7
-    let from_base = |x| base + x
-    print("{from_base(0)}")
-
-    // Writing to a captured variable is a compile error, because the write
-    // would change a copy nobody can observe. See T-CAPTURE-WRITE.
+    var s = "one"
+    with Snap handled_by SnapHandler{ size: || xs.len(), text: || s } {
+        print("{Snap.size()} {Snap.text()}")
+        xs.push(3)
+        s = "two"
+        print("{Snap.size()} {Snap.text()}")
+    }
+    print("{xs.len()} {s}")
 }
 ```
 

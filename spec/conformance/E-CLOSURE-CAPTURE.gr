@@ -1,32 +1,29 @@
 //! tag: E-CLOSURE-CAPTURE
 //! expect: output
-//! 1
-//! 2
-//! 7
-// A closure captures values, not bindings. Changing the variable afterwards
-// is not visible inside, and writing to it inside changes only a copy.
+//! 2 one
+//! 2 one
+//! 3 two
+// A closure captures values, at the moment it is created.
 //
-// This is worth a program because the same author who wrote the rule got it
-// wrong writing an effect handler: a `write` operation that updates a
-// captured list updates a copy, and the next `read` does not see it. The
-// counter below is that mistake in miniature.
+// A handler's operations are closures, so a handler cannot hold mutable
+// state: what it captured is what it keeps, however the binding moves on.
+// The compiled backend stored the pointer without holding a reference to it,
+// so the binding looked unshared, copy-on-write never fired, and the handler
+// saw every later mutation — a wrong answer, and a crash when the binding was
+// reassigned and freed what the handler still pointed at.
+effect Snap {
+    fn size() -> i64
+    fn text() -> str
+}
+
 fn main() {
-    var n = 1
-    let plus_n = |x| x + n
-    n = 100
-    // Still 1: the closure kept the value it was built with.
-    print("{plus_n(0)}")
-
     var xs = [1, 2]
-    let size = |_ignored| xs.len()
-    xs.push(3)
-    print("{size(0)}")
-
-    // A captured binding may be read freely.
-    let base = 7
-    let from_base = |x| base + x
-    print("{from_base(0)}")
-
-    // Writing to a captured variable is a compile error, because the write
-    // would change a copy nobody can observe. See T-CAPTURE-WRITE.
+    var s = "one"
+    with Snap handled_by SnapHandler{ size: || xs.len(), text: || s } {
+        print("{Snap.size()} {Snap.text()}")
+        xs.push(3)
+        s = "two"
+        print("{Snap.size()} {Snap.text()}")
+    }
+    print("{xs.len()} {s}")
 }

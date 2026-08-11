@@ -3802,6 +3802,17 @@ the state through an `inout` parameter",
     }
 
     fn infer_try(&mut self, inner: &Expr, span: Span) -> Type {
+        // `try` is a conditional `return` of an `Err`, and the error value it
+        // carries out is usually built right where it failed. `return` and
+        // `fail` were both refused inside a region and this, which is the
+        // same departure spelled differently, was not ([T-REGION]).
+        if self.region_depth > 0 {
+            self.error_help(
+                span,
+                "cannot `try` from inside a region",
+                "`try` leaves the region carrying an error value, exactly as `return` and `fail` do — take the fallible call out of the region, or handle it there with `match` and yield a number",
+            );
+        }
         let t = self.infer_expr(inner);
         match self.uni.shallow_resolve(&t) {
             Type::Fallible(ok, err) => {

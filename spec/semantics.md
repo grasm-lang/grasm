@@ -71,6 +71,16 @@ has to change belongs in the caller, threaded through `inout` or returned.
 Note the contrast with **[E-SPAWN-SHARED]**: a `spawn` body *does* see and
 mutate the enclosing scope. Two block-shaped constructs, two rules.
 
+A capture is a value, and for a value that lives on the heap that means
+holding a reference to it. The compiled backend stored the bare pointer, so
+the binding still looked uniquely owned and a later `xs.push(v)` mutated the
+very list the handler had captured — `[E-COW]` copies on mutation of a
+*shared* value, and this made a shared value look unshared. Of forty
+handler-capture shapes, thirty-two disagreed between the engines: a mutating
+method returned the new value, a reassignment freed what the handler still
+pointed at and the next call read a raw word as the wrong type, and returning
+the captured value crashed with nothing on stderr.
+
 **[E-COALESCE-DIVERGE]** The right-hand side of `??` may leave instead of
 producing a value — `m.get(k) ?? fail(e)` is the shortest way to turn absence
 into a failure, and it is the shape a fallible function's body most often has.

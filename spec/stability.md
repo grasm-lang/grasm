@@ -7,7 +7,7 @@ before it is listed as stable.
 `crates/grasm_spec` fails if a clause here is missing, unknown, or listed twice,
 so this file cannot drift away from the specification it describes.
 
-Today: 116 stable, 71 provisional, 21 experimental, of 208.
+Today: 115 stable, 72 provisional, 21 experimental, of 208.
 
 ## Stable
 
@@ -16,7 +16,6 @@ Will not change incompatibly before 2.0.
 - `E-ARGS` — stable
 - `E-ARITH-FLOAT` — stable
 - `E-ARITH-INT` — stable
-- `E-CLOSURE-CAPTURE` — stable
 - `E-COALESCE-LAZY` — stable
 - `E-CONST-REF` — stable
 - `E-COW` — stable
@@ -142,6 +141,7 @@ implementation admits are unfinished, and the rest were written too recently
 for "no problem found" to mean anything.
 
 - `E-BORROWED-READ` — provisional
+- `E-CLOSURE-CAPTURE` — provisional
 - `E-COALESCE-DIVERGE` — provisional
 - `E-CONST` — provisional
 - `E-HANDLER-OWN-ROW` — provisional

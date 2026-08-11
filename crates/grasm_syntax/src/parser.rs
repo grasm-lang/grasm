@@ -157,6 +157,16 @@ struct Parser {
     /// When true, `Ident {` is NOT a struct literal (condition positions).
     no_struct_lit: bool,
     depth: u32,
+    /// Token positions already found not to start a map literal.
+    ///
+    /// `{…}` is tried as a map and, failing that, re-parsed as a block. Both
+    /// attempts descend into the same nested braces, so each level of nesting
+    /// doubled the work: `"{{{{…1…}}}}"` at depth 26 — an 81-byte file — took
+    /// 27 seconds, and every two further levels quadrupled it. The nesting cap
+    /// could never fire, because reaching it took geometric time. The verdict
+    /// for a position does not depend on how it was reached, so recording it
+    /// makes the second attempt a single pass.
+    not_a_map: std::collections::HashSet<usize>,
 }
 
 /// What to write instead, for an operator this language does not have.
@@ -185,6 +195,7 @@ impl Parser {
             diags: Vec::new(),
             no_struct_lit: false,
             depth: 0,
+            not_a_map: std::collections::HashSet::new(),
         }
     }
 
@@ -1966,8 +1977,11 @@ impl Parser {
 
     fn parse_brace_expr(&mut self) -> PResult<Expr> {
         let mark = (self.i, self.modes.clone(), self.diags.len());
-        if let Some(e) = self.try_parse_map() {
-            return Ok(e);
+        if !self.not_a_map.contains(&mark.0) {
+            if let Some(e) = self.try_parse_map() {
+                return Ok(e);
+            }
+            self.not_a_map.insert(mark.0);
         }
         self.i = mark.0;
         self.modes = mark.1;

@@ -3530,6 +3530,8 @@ impl FnCx<'_, '_> {
                 let (ep, el) = self.str_ptr_len(&ename);
                 self.call_rt("grasm_handler_push", &[ep, el]);
                 let ptr_ty = self.cg.module.target_config().pointer_type();
+                let mut held: Vec<(cranelift_codegen::ir::StackSlot, Vec<(String, VType)>)> =
+                    Vec::new();
                 for (opname, fid, free) in site {
                     // Free names that resolve to something in scope here are
                     // the operation's captures. They are typed now, at the
@@ -3556,8 +3558,24 @@ impl FnCx<'_, '_> {
                         };
                         let v = self.b.use_var(var);
                         let bits = self.value_to_bits(v, cvt);
+                        // The capture is a *value*, and for a boxed one that
+                        // means holding a reference to it ([E-CLOSURE-CAPTURE]).
+                        // Storing the bare pointer did not: the binding stayed
+                        // uniquely owned, so a later `xs.push(v)` mutated the
+                        // very list the handler had captured. `[E-COW]` copies
+                        // on mutation of a *shared* value, and this made it
+                        // look unshared. The interpreter, which clones its
+                        // reference-counted value, got this right, so the two
+                        // engines disagreed about what the program computed —
+                        // and reassigning the binding freed what the handler
+                        // still pointed at, which crashed.
+                        if cvt.boxed() {
+                            self.call_rt("grasm_val_inc", &[v]);
+                        }
                         self.b.ins().stack_store(bits, slot, (i * 8) as i32);
                     }
+                    // Released when the handler goes out of scope, below.
+                    held.push((slot, captures.clone()));
                     let env = self.b.ins().stack_addr(ptr_ty, slot, 0);
                     self.cg.handler_captures.insert(fid, captures);
                     let (op_p, op_l) = self.str_ptr_len(&opname);
@@ -3569,6 +3587,16 @@ impl FnCx<'_, '_> {
                 terminated |= self.is_filled();
                 if !terminated {
                     self.call_rt("grasm_handler_pop", &[]);
+                    for (slot, captures) in &held {
+                        for (i, (_, cvt)) in captures.iter().enumerate() {
+                            if !cvt.boxed() {
+                                continue;
+                            }
+                            let bits =
+                                self.b.ins().stack_load(types::I64, *slot, (i * 8) as i32);
+                            self.call_rt("grasm_val_dec", &[bits]);
+                        }
+                    }
                 }
                 Ok(StmtOut::Value(None))
             }

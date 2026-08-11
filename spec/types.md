@@ -515,7 +515,8 @@ people actually write.
 binding declared outside the region as `inout` is refused, because the callee
 can store into it. `fail` is refused for the same reason `return` is — it
 leaves the region carrying a value, and that value is usually built right
-there. The rule was stated for direct writes first, and two independent
+there — and `try` for the same reason again, being a conditional `return` of
+an `Err` whose payload is normally allocated where the failure happened. The rule was stated for direct writes first, and two independent
 evaluations found both holes within an hour, which is what a rule expressed in
 terms of syntax rather than of effect gets you.
 
