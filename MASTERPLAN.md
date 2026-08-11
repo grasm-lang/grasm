@@ -443,10 +443,23 @@ by every consumer.
 **Tier 1 is half in.** `region { … }` parses and its rule is enforced: nothing
 allocated inside may outlive the closing brace. It may not write to a binding
 declared outside — by assignment *or* by a mutating method, since
-`outer.push(x)` is how a value would otherwise get out — it may not `return`
-through the brace, and it yields a scalar or nothing. That is a guarantee on
-its own: the peak memory of the block is the block, checked rather than hoped
-for.
+`outer.push(x)` is how a value would otherwise get out — it may not `return`,
+`fail` or `try` through the brace, and it yields a scalar or nothing. That is a
+guarantee on its own: the peak memory of the block is the block, checked rather
+than hoped for.
+
+The rule took four rounds of adversarial reading to get right, and every hole
+was the same shape: the check was written against the syntax between the
+braces, and one hop of indirection walked past it. In order — an `inout`
+argument; a `ref` passed as a plain parameter; a `ref` hidden one field deep
+inside a struct; an effect operation behind a one-line wrapper; a closure
+carried in a struct field, a list, a tuple, a map, an `Option`. The rule is now
+stated in terms of what a call can *reach*: a value that can reach a `ref`
+anywhere in its type may not appear, a call may not perform a declared effect,
+and a call may not be handed a function value. `io`, `async` and `unsafe` are
+exempt because they have no handler and retain nothing; a closure written
+inside the region is exempt because it can only capture what a region already
+allows.
 
 What is not in is the bulk-free arena the rule exists to make sound. The order
 is deliberate — the sweep is only correct if the rule holds — but until the
@@ -475,6 +488,29 @@ The reason this is not done yet is (2). A miscounted decrement is a
 double-free or a leak, and the differential suite compares output — it would
 catch the first and not reliably the second. That wants a leak check in the
 harness before the change, not after it.
+
+`scripts/leakcheck.sh` is now that check, and it gates every commit. The
+runtime half was then written and reverted, which is worth recording because
+both reasons are load-bearing:
+
+  - The sweep freed each recorded value and, for each, read its children's
+    refcounts to decide which were the region's own. An earlier iteration may
+    already have freed a child, so the sweep's *own* traversal was a
+    use-after-free. Fixable — collect every decision before freeing anything —
+    but it is the second reason that decided it.
+  - Marking region allocations with a sentinel refcount, which is what removes
+    the counting work, also removes copy-on-write's ability to tell a uniquely
+    owned value from a shared one. Every mutation inside a region would copy,
+    which is asymptotically worse than the counting it saves. Keeping ordinary
+    counting inside the region and freeing in bulk at the brace is correct and
+    sound, but then the only win is the bulk free, and reference counting
+    already frees at the same point.
+
+So the arena is not deferred for lack of a rule any more — the rule is airtight
+as of this round. It is deferred because the version that pays for itself needs
+an allocator that can answer "is this uniquely owned" without a refcount, and
+that is a different piece of work. `REGION_SWEEP` in the native backend is the
+switch, and it is off.
 
 **Guarantees across tiers 0–2:** no use-after-free, no double-free, no OOB
 (bounds-checked, elided by refinement/iterator proofs), no uninitialized reads
