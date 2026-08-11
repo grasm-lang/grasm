@@ -3038,14 +3038,14 @@ closing brace",
                         Type::I64
                     }
                     "push" => {
-                        self.require_mutable(recv);
+                        self.require_mutable(recv, name);
                         if check_arity(self, 1) {
                             self.check_expr(&args[0], &elem);
                         }
                         Type::Unit
                     }
                     "pop" => {
-                        self.require_mutable(recv);
+                        self.require_mutable(recv, name);
                         check_arity(self, 0);
                         self.defs.option_some(elem)
                     }
@@ -3212,7 +3212,7 @@ closing brace",
                         self.defs.option_some(elem)
                     }
                     "sort" => {
-                        self.require_mutable(recv);
+                        self.require_mutable(recv, name);
                         check_arity(self, 0);
                         // Sorting elements with no order was a silent no-op:
                         // the list came back unchanged and nothing said why.
@@ -3237,7 +3237,7 @@ closing brace",
                     // `xs = xs.slice(1, xs.len())` is O(n) a step and reads
                     // like a workaround, because it is one.
                     "remove" => {
-                        self.require_mutable(recv);
+                        self.require_mutable(recv, name);
                         if check_arity(self, 1) {
                             self.check_expr(&args[0], &Type::I64);
                         }
@@ -3255,7 +3255,7 @@ closing brace",
                         Type::List(Box::new(Type::Tuple(vec![elem.clone(), other])))
                     }
                     "sort_by" => {
-                        self.require_mutable(recv);
+                        self.require_mutable(recv, name);
                         let key = self.uni.fresh();
                         if check_arity(self, 1) {
                             let f = Type::Fn {
@@ -3460,7 +3460,7 @@ closing brace",
                 let v = (**v).clone();
                 match name.name.as_str() {
                     "set" => {
-                        self.require_mutable(recv);
+                        self.require_mutable(recv, name);
                         if check_arity(self, 2) {
                             self.check_expr(&args[0], &k);
                             self.check_expr(&args[1], &v);
@@ -3482,7 +3482,7 @@ closing brace",
                         Type::Bool
                     }
                     "delete" => {
-                        self.require_mutable(recv);
+                        self.require_mutable(recv, name);
                         if check_arity(self, 1) {
                             self.check_expr(&args[0], &k);
                         }
@@ -3635,7 +3635,7 @@ the state through an `inout` parameter",
         }
     }
 
-    fn require_mutable(&mut self, recv: &Expr) {
+    fn require_mutable(&mut self, recv: &Expr, name: &Ident) {
         let mut root = recv;
         while let Expr::Field { recv, .. } | Expr::Index { recv, .. } = root {
             root = recv;
@@ -3661,6 +3661,18 @@ the state through an `inout` parameter",
                 }
             }
             self.reject_capture_write(id, "mutate", "");
+        } else {
+            // Not rooted at a binding at all: `[3, 1, 2].remove(0)`,
+            // `mk().pop()`. There is nothing for the mutation to land in, so
+            // it was accepted and then panicked at run time — and one of the
+            // messages printed a compiler-internal `Span { start: .., end: .. }`
+            // into a user's terminal. `[T-VAR-MUTABLE]` says a mutating method
+            // needs a `var`; a temporary is not even a place.
+            self.error_help(
+                recv.span(),
+                format!("cannot use `{}` on a temporary", name.name),
+                "a mutating method changes a value in place, and there is nowhere for this one to land — bind it with `var` first",
+            );
         }
     }
 

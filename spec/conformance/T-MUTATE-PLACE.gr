@@ -1,0 +1,11 @@
+//! tag: T-MUTATE-PLACE
+//! expect: error
+//! cannot use `remove` on a temporary
+// A mutating method needs somewhere to put the result.
+//
+// A `let` binding was already refused and a temporary was not, so a list
+// literal accepted `remove` and panicked at run time — with a message quoting
+// a compiler-internal `Span { .. }` rather than a source location.
+fn main() {
+    print("{[3, 1, 2].remove(0)}")
+}

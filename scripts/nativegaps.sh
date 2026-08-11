@@ -204,6 +204,16 @@ fn main() {
     print("{a == b}")
 }'
 
+expect_refused "a call through a non-name callee" 'fn double(n: i64) -> i64 {
+    n * 2
+}
+
+let TABLE: [fn(i64) -> i64] = [double]
+
+fn main() {
+    print("{TABLE[0](21)}")
+}'
+
 # The neighbouring shape that must keep compiling, so the row above stays as
 # narrow as it claims: a struct *containing* a ref compares fine.
 expect_compiled "== on a struct containing a ref" 'type N = { v: i64 }

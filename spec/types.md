@@ -226,6 +226,14 @@ answer [T-CAPTURE-WRITE] gives for threading mutable state, so its stopping at
 a file edge reshaped a public API.
 
 **[T-PARAM-INOUT]** An `inout` parameter is an exclusive mutable borrow.
+**[T-MUTATE-PLACE]** A mutating method's receiver must be a *place* — a
+binding, or a field or index reached from one. `[3, 1, 2].remove(0)` and
+`mk().pop()` are not: there is nowhere for the mutation to land, and they were
+accepted and then panicked at run time, one of them printing a
+compiler-internal `Span { start: .., end: .. }` into the terminal. Writing to
+a `let` binding was already a compile error, so the temporary was the one
+receiver nothing checked.
+
 **[T-INOUT-PLACE]** Its argument must be a variable, field, or index
 expression — never a temporary. **[T-INOUT-MUTABLE]** That place must be
 mutable. **[T-INOUT-EXCLUSIVE]** The same variable may not be passed as

@@ -586,6 +586,14 @@ answer [T-CAPTURE-WRITE] gives for threading mutable state, so its stopping at
 a file edge reshaped a public API.
 
 **[T-PARAM-INOUT]** An `inout` parameter is an exclusive mutable borrow.
+**[T-MUTATE-PLACE]** A mutating method's receiver must be a *place* — a
+binding, or a field or index reached from one. `[3, 1, 2].remove(0)` and
+`mk().pop()` are not: there is nowhere for the mutation to land, and they were
+accepted and then panicked at run time, one of them printing a
+compiler-internal `Span { start: .., end: .. }` into the terminal. Writing to
+a `let` binding was already a compile error, so the temporary was the one
+receiver nothing checked.
+
 **[T-INOUT-PLACE]** Its argument must be a variable, field, or index
 expression — never a temporary. **[T-INOUT-MUTABLE]** That place must be
 mutable. **[T-INOUT-EXCLUSIVE]** The same variable may not be passed as
@@ -1175,6 +1183,13 @@ point.
 the same shape and contents are equal.
 
 ## 4. Collections
+
+A float that is not equal to itself is the one exception, and it is inherited
+rather than chosen: `NaN == NaN` is false, so a struct, list, tuple or
+`Option` containing one is not equal to itself either, and `contains`,
+`assert_eq` and de-duplication all fail on it. `cmp` answers `0` for the same
+pair, because `[L-LIB-SORT-NAN]` needs a total order to sort by. Both are
+right for what they are for, and they are one method apart.
 
 **[E-INDEX-BOUNDS]** Indexing a list out of bounds panics with the index and
 the length. `list.get(i)` returns `Option` instead of panicking.
@@ -2404,6 +2419,7 @@ runs only under `grasm run`:
 | writing *through* a `ref` | `r.field = v`, `r.items.push(x)` — reading through one compiles |
 | a handler operation that is a named `fn` | `SrcHandler{ get: named }` — write the closure inline |
 | `==` on two bare `ref`s | `a == b` — comparing structs or lists *containing* refs compiles |
+| calling a function value through anything but a name | `TABLE[0](21)`, `(m.get(k) ?? d)(x)` — bind it with `let` first, then call it |
 
 Each of these is a defect being worked off, not a design boundary. The list is
 checked against the implementation rather than remembered: if one of them
@@ -6934,6 +6950,22 @@ fn main() {
     let other = "grace"
     let f = |_x| consume(other)
     print("{f(1)} {f(2)}")
+}
+```
+
+## `T-MUTATE-PLACE.gr`
+
+```grasm
+//! tag: T-MUTATE-PLACE
+//! expect: error
+//! cannot use `remove` on a temporary
+// A mutating method needs somewhere to put the result.
+//
+// A `let` binding was already refused and a temporary was not, so a list
+// literal accepted `remove` and panicked at run time — with a message quoting
+// a compiler-internal `Span { .. }` rather than a source location.
+fn main() {
+    print("{[3, 1, 2].remove(0)}")
 }
 ```
 

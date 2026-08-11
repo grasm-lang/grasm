@@ -368,7 +368,12 @@ fn run() -> ExitCode {
             }
         }
         Some("fmt") => {
-            let Some(path) = args.get(1) else {
+            // The path is whichever argument is not a flag, so
+            // `fmt --check f.gr` and `fmt f.gr --check` both work. Only the
+            // second used to: the first read `--check` as the file name and
+            // reported `cannot read '--check'`, which says nothing about the
+            // real mistake.
+            let Some(path) = args.iter().skip(1).find(|a| !a.starts_with("--")) else {
                 eprintln!("usage: grasm fmt <file.gr> [--check]");
                 return ExitCode::FAILURE;
             };

@@ -168,6 +168,13 @@ the same shape and contents are equal.
 
 ## 4. Collections
 
+A float that is not equal to itself is the one exception, and it is inherited
+rather than chosen: `NaN == NaN` is false, so a struct, list, tuple or
+`Option` containing one is not equal to itself either, and `contains`,
+`assert_eq` and de-duplication all fail on it. `cmp` answers `0` for the same
+pair, because `[L-LIB-SORT-NAN]` needs a total order to sort by. Both are
+right for what they are for, and they are one method apart.
+
 **[E-INDEX-BOUNDS]** Indexing a list out of bounds panics with the index and
 the length. `list.get(i)` returns `Option` instead of panicking.
 
