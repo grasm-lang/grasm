@@ -24,6 +24,12 @@ enum Mode {
 pub fn format_src(src: &str) -> String {
     let mut out = String::with_capacity(src.len() + 64);
     let mut depth: i32 = 0;
+    // One indent level per *line* that leaves brackets open, not one per
+    // bracket. `take([` opens two, and counting both put the elements two
+    // levels in while the closing `], 1)` — whose leading closers dedent it
+    // once — sat one level out. Nobody writes that, and `fmt` rewrote code
+    // that was already right. Each entry is the depth the level was opened at.
+    let mut levels: Vec<i32> = Vec::new();
     // Mode stack survives across lines (block comments, not strings — strings
     // cannot span lines in Grasm).
     let mut stack: Vec<Mode> = vec![Mode::Code];
@@ -63,7 +69,11 @@ pub fn format_src(src: &str) -> String {
             // Continuation lines starting with `|` (sum-type variants, or a
             // leading pipeline op) sit one level deeper than their declaration.
             let pipe_extra = i32::from(trimmed.starts_with('|'));
-            let this_indent = (depth - lead_closers + pipe_extra).max(0) as usize;
+            // Leading closers land this line back at the level whose opening
+            // line they close.
+            let after_closers = depth - lead_closers;
+            let open_levels = levels.iter().filter(|&&d| d <= after_closers).count() as i32;
+            let this_indent = (open_levels + pipe_extra).max(0) as usize;
             for _ in 0..this_indent {
                 out.push_str(INDENT);
             }
@@ -154,6 +164,16 @@ pub fn format_src(src: &str) -> String {
         ) {
             stack.pop();
         }
+        // Levels whose brackets this line closed are done with; a line that
+        // leaves anything newly open adds exactly one.
+        if !in_block_comment {
+            while levels.last().is_some_and(|&d| d > depth) {
+                levels.pop();
+            }
+            if levels.last().copied().unwrap_or(0) < depth {
+                levels.push(depth);
+            }
+        }
         if depth < 0 {
             depth = 0;
         }
@@ -195,6 +215,16 @@ mod tests {
         assert!(got.contains("// top { comment"));
         assert!(got.contains("    // inner } comment"));
         assert!(got.contains("    let x = 1 // trailing {"));
+    }
+
+    #[test]
+    fn a_line_opening_two_brackets_is_one_level() {
+        // `take([` opens a paren and a bracket. Counting both put the
+        // elements two levels in while the closing `], 1)` sat one level out
+        // — a shape nobody writes, which `fmt` then imposed on code that was
+        // already right.
+        let src = "fn main() {\n    let n = take([\n        \"a\",\n    ], 1)\n}\n";
+        assert_eq!(format_src(src), src);
     }
 
     #[test]
