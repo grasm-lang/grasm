@@ -6629,6 +6629,11 @@ impl FnCx<'_, '_> {
     fn probe_type(&mut self, e: &Expr) -> CResult<VType> {
         use BinaryOp::*;
         Ok(match e {
+            // The checker decided which integer literals are floats, and the
+            // probe has to agree with the lowering or a match's merge block
+            // gets one type declared and the other jumped to it
+            // ([T-INT-TO-FLOAT-CARRIED]).
+            Expr::Int(_, sp) if self.cg.float_literals.contains(&sp.start) => VType::F64,
             Expr::Int(..) => VType::I64,
             Expr::Float(..) => VType::F64,
             Expr::Bool(..) => VType::Bool,
