@@ -125,8 +125,10 @@ with `E`. It is an ordinary value, not an exception.
 It must be consumed by `try`, by a `match` covering `Ok` and `Err`, or by
 `??`. Discarding it counts as using it: a call written as a bare statement
 throws its failure away, and nothing says so — and so does one written as the
-last line of a loop body, or of a branch of an `if` used as a statement, where
-the block's own value goes nowhere either. `write_file` to a path that
+last line of a loop body, of a branch of an `if` used as a statement, or of a
+`spawn`, `parallel`, `test` or `bench` body, where the block's own value goes
+nowhere either. A test whose entire body was a failing call reported `ok`,
+which is worse than having no test. `write_file` to a path that
 cannot be written printed "wrote the report", exited 0, wrote nothing to
 stderr and left no file — and every user function that can fail behaved the
 same way when its result was ignored.

@@ -23,4 +23,15 @@ fn main() {
     for _n in 0..1 {
         risky()
     }
+    parallel {
+        spawn {
+            risky()
+        }
+    }
+}
+
+// A test body's value goes nowhere too, so a test whose whole body is a
+// failing call used to *pass*.
+test "checked" {
+    risky()
 }

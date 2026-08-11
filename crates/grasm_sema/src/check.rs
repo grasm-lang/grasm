@@ -943,7 +943,7 @@ land in a copy the caller never sees — return the new value from the operation
                         );
                     }
                     self.scopes.push(scope);
-                    self.check_block(&t.body);
+                    self.check_block_discarded(&t.body);
                     self.scopes.pop();
                 }
                 Decl::Bench(b) => {
@@ -951,7 +951,7 @@ land in a copy the caller never sees — return the new value from the operation
                     self.fn_err = Some(self.uni.fresh());
                     self.err_open = true;
                     self.scopes.push(HashMap::new());
-                    self.check_block(&b.body);
+                    self.check_block_discarded(&b.body);
                     self.scopes.pop();
                 }
                 _ => {}
@@ -1372,7 +1372,7 @@ closing brace — yield a number from the region and return that",
                 // Bindings from here down live only for the collection pass;
                 // tasks run after this block's scope is gone.
                 self.parallel_floor = Some(self.scopes.len());
-                self.check_block(body);
+                self.check_block_discarded(body);
                 self.parallel_floor = saved_floor;
                 self.parallel_depth -= 1;
                 Type::Unit
@@ -1393,7 +1393,7 @@ closing brace — yield a number from the region and return that",
                 if let Some(floor) = self.parallel_floor {
                     self.task_capture = Some((floor, self.scopes.len()));
                 }
-                self.check_block(body);
+                self.check_block_discarded(body);
                 self.task_capture = saved_capture;
                 self.loop_depth = saved_loop;
                 Type::Unit

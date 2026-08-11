@@ -490,8 +490,10 @@ with `E`. It is an ordinary value, not an exception.
 It must be consumed by `try`, by a `match` covering `Ok` and `Err`, or by
 `??`. Discarding it counts as using it: a call written as a bare statement
 throws its failure away, and nothing says so — and so does one written as the
-last line of a loop body, or of a branch of an `if` used as a statement, where
-the block's own value goes nowhere either. `write_file` to a path that
+last line of a loop body, of a branch of an `if` used as a statement, or of a
+`spawn`, `parallel`, `test` or `bench` body, where the block's own value goes
+nowhere either. A test whose entire body was a failing call reported `ok`,
+which is worse than having no test. `write_file` to a path that
 cannot be written printed "wrote the report", exited 0, wrote nothing to
 stderr and left no file — and every user function that can fail behaved the
 same way when its result was ignored.
@@ -3771,9 +3773,10 @@ fn main() {
     xs[step(i)] += 5
     print("{xs} {i}")
     // Nested indices run outermost-first, which is leftmost-first.
+    var j = 0
     var d = [[10, 20], [30, 40]]
-    d[step(i)][step(i)] += 1
-    print("{d} {i}")
+    d[step(j)][step(j)] += 1
+    print("{d} {j}")
 }
 
 fn step(inout n: i64) -> i64 {
@@ -6567,6 +6570,17 @@ fn main() {
     for _n in 0..1 {
         risky()
     }
+    parallel {
+        spawn {
+            risky()
+        }
+    }
+}
+
+// A test body's value goes nowhere too, so a test whose whole body is a
+// failing call used to *pass*.
+test "checked" {
+    risky()
 }
 ```
 
