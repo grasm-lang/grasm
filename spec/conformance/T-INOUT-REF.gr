@@ -1,0 +1,22 @@
+//! tag: T-INOUT-REF
+//! expect: error
+//! cannot pass `r` as `inout` — it is reached through a `ref`
+// Two sound ways of mutating that cannot be combined.
+//
+// `inout` snapshots the place at the call and writes it back at the return. A
+// `ref` reaches the same value without that snapshot, so the writeback wins
+// and the write made through the reference vanishes — silently, and the same
+// way whichever order the two happen in. Exclusivity did not catch it: that
+// rule compares binding names, and `r.xs` and `r` are two names for one slot.
+type B = { xs: [i64] }
+
+fn f(inout a: [i64], r: ref B) {
+    a.push(1)
+    r.xs.push(2)
+}
+
+fn main() {
+    var r = ref(B{ xs: [0] })
+    f(r.xs, r)
+    print("{r.xs}")
+}

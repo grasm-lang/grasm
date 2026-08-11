@@ -1,0 +1,25 @@
+//! tag: T-REGION-FOREIGN
+//! expect: error
+//! cannot perform effect `Audit.record` inside a region
+// Whose code runs inside the region, not just what the region's own text says.
+//
+// The handler is written outside and captures a reference. Calling the effect
+// from inside the region runs that outside body while the region is open, and
+// what it is given is allocated inside — so the region's text contains no
+// write to anything outside, and the value escapes anyway.
+type Sink = { lines: [str] }
+
+effect Audit {
+    fn record(e: str)
+}
+
+fn main() {
+    let sink = ref(Sink{ lines: [] })
+    with Audit handled_by AuditHandler{ record: |e| sink.lines.push(e) } {
+        region {
+            let made = "inside"
+            Audit.record(made)
+        }
+    }
+    print("{sink.lines.len()}")
+}

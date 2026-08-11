@@ -554,6 +554,17 @@ expression — never a temporary. **[T-INOUT-MUTABLE]** That place must be
 mutable. **[T-INOUT-EXCLUSIVE]** The same variable may not be passed as
 `inout` twice in one call, nor as both `own` and `inout`.
 
+**[T-INOUT-REF]** Nor may an `inout` argument be reached through a `ref`.
+`inout` works by snapshotting the place at the call and writing it back at the
+return; a reference reaches the same value without going through that
+snapshot, so a write made through one *during* the call is overwritten by the
+writeback and vanishes with nothing reported. `f(r.xs, r)` where `f` pushes to
+both left `[0, 1]`, not `[0, 1, 2]`, and swapping the two pushes did not change
+which one survived. The exclusivity rule above did not catch it, because it
+compares binding names and `r.xs` and `r` are different names for the same
+storage. The two ways of mutating are each sound and cannot be combined: write
+through the reference, or hold the value in a `var` and drop the reference.
+
 ## 9. Effects
 
 **[T-EFFECT-DECL]** `effect E { fn op(…) -> T }` declares an effect and, with
@@ -824,6 +835,23 @@ leaves the region carrying a value, and that value is usually built right
 there. The rule was stated for direct writes first, and two independent
 evaluations found both holes within an hour, which is what a rule expressed in
 terms of syntax rather than of effect gets you.
+
+**[T-REGION-REF]** A `ref` may not be used inside a region at all. A reference
+reaches storage the region cannot see; it needs no `inout`, so the rule above
+never fires, and it can be copied to a name declared *inside* the region, so
+the declared-outside rule never fires either. Two independent evaluations
+carried a value out through one — in one line, four different ways. Since a
+region's entire guarantee is that nothing allocated inside outlives the brace,
+and a reference is the one thing that can carry something out without naming
+anything outside, a region and a reference do not mix.
+
+**[T-REGION-FOREIGN]** A region may not run code written outside it that
+carries state: an effect operation, whose handler is written outside and may
+keep what it is given, and a call through a function *value* bound outside,
+which is a closure and carries its captures. A closure written *inside* the
+region is fine — it can only capture what a region already allows. This is the
+same rule as the one above seen from the other side: the earlier rules ask
+what a region's own text may write, and this one asks whose text runs there.
 
 **[T-UNSAFE-FFI]** `unsafe { … }` is Tier 3: the block where the guarantees of
 the safe tiers do not apply. Using a declared C function — calling one *or
@@ -6373,6 +6401,33 @@ fn main() {
 }
 ```
 
+## `T-INOUT-REF.gr`
+
+```grasm
+//! tag: T-INOUT-REF
+//! expect: error
+//! cannot pass `r` as `inout` — it is reached through a `ref`
+// Two sound ways of mutating that cannot be combined.
+//
+// `inout` snapshots the place at the call and writes it back at the return. A
+// `ref` reaches the same value without that snapshot, so the writeback wins
+// and the write made through the reference vanishes — silently, and the same
+// way whichever order the two happen in. Exclusivity did not catch it: that
+// rule compares binding names, and `r.xs` and `r` are two names for one slot.
+type B = { xs: [i64] }
+
+fn f(inout a: [i64], r: ref B) {
+    a.push(1)
+    r.xs.push(2)
+}
+
+fn main() {
+    var r = ref(B{ xs: [0] })
+    f(r.xs, r)
+    print("{r.xs}")
+}
+```
+
 ## `T-INT-ALIAS.gr`
 
 ```grasm
@@ -7250,6 +7305,36 @@ fn main() {
 }
 ```
 
+## `T-REGION-FOREIGN.gr`
+
+```grasm
+//! tag: T-REGION-FOREIGN
+//! expect: error
+//! cannot perform effect `Audit.record` inside a region
+// Whose code runs inside the region, not just what the region's own text says.
+//
+// The handler is written outside and captures a reference. Calling the effect
+// from inside the region runs that outside body while the region is open, and
+// what it is given is allocated inside — so the region's text contains no
+// write to anything outside, and the value escapes anyway.
+type Sink = { lines: [str] }
+
+effect Audit {
+    fn record(e: str)
+}
+
+fn main() {
+    let sink = ref(Sink{ lines: [] })
+    with Audit handled_by AuditHandler{ record: |e| sink.lines.push(e) } {
+        region {
+            let made = "inside"
+            Audit.record(made)
+        }
+    }
+    print("{sink.lines.len()}")
+}
+```
+
 ## `T-REGION-INOUT.gr`
 
 ```grasm
@@ -7274,6 +7359,34 @@ fn main() {
         stash(kept, made)
     }
     print("{kept.len()}")
+}
+```
+
+## `T-REGION-REF.gr`
+
+```grasm
+//! tag: T-REGION-REF
+//! expect: error
+//! a `ref` cannot be used inside a region
+// A reference is a way out of a region that names nothing outside it.
+//
+// `stash` is handed a reference the region never mentions by an outside name,
+// and a plain parameter, not `inout` — so neither the escape rule nor the
+// `inout` rule sees it. The value pushed was allocated inside, and reading it
+// after the brace is the one thing a region promises cannot happen.
+type Sink = { kids: [str] }
+
+fn stash(s: ref Sink, n: str) {
+    s.kids.push(n)
+}
+
+fn main() {
+    let sink = ref(Sink{ kids: [] })
+    region {
+        let n = "born inside"
+        stash(sink, n)
+    }
+    print("{sink.kids[0]}")
 }
 ```
 

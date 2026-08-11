@@ -1,0 +1,23 @@
+//! tag: T-REGION-REF
+//! expect: error
+//! a `ref` cannot be used inside a region
+// A reference is a way out of a region that names nothing outside it.
+//
+// `stash` is handed a reference the region never mentions by an outside name,
+// and a plain parameter, not `inout` — so neither the escape rule nor the
+// `inout` rule sees it. The value pushed was allocated inside, and reading it
+// after the brace is the one thing a region promises cannot happen.
+type Sink = { kids: [str] }
+
+fn stash(s: ref Sink, n: str) {
+    s.kids.push(n)
+}
+
+fn main() {
+    let sink = ref(Sink{ kids: [] })
+    region {
+        let n = "born inside"
+        stash(sink, n)
+    }
+    print("{sink.kids[0]}")
+}

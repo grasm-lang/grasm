@@ -208,6 +208,17 @@ expression — never a temporary. **[T-INOUT-MUTABLE]** That place must be
 mutable. **[T-INOUT-EXCLUSIVE]** The same variable may not be passed as
 `inout` twice in one call, nor as both `own` and `inout`.
 
+**[T-INOUT-REF]** Nor may an `inout` argument be reached through a `ref`.
+`inout` works by snapshotting the place at the call and writing it back at the
+return; a reference reaches the same value without going through that
+snapshot, so a write made through one *during* the call is overwritten by the
+writeback and vanishes with nothing reported. `f(r.xs, r)` where `f` pushes to
+both left `[0, 1]`, not `[0, 1, 2]`, and swapping the two pushes did not change
+which one survived. The exclusivity rule above did not catch it, because it
+compares binding names and `r.xs` and `r` are different names for the same
+storage. The two ways of mutating are each sound and cannot be combined: write
+through the reference, or hold the value in a `var` and drop the reference.
+
 ## 9. Effects
 
 **[T-EFFECT-DECL]** `effect E { fn op(…) -> T }` declares an effect and, with
@@ -478,6 +489,23 @@ leaves the region carrying a value, and that value is usually built right
 there. The rule was stated for direct writes first, and two independent
 evaluations found both holes within an hour, which is what a rule expressed in
 terms of syntax rather than of effect gets you.
+
+**[T-REGION-REF]** A `ref` may not be used inside a region at all. A reference
+reaches storage the region cannot see; it needs no `inout`, so the rule above
+never fires, and it can be copied to a name declared *inside* the region, so
+the declared-outside rule never fires either. Two independent evaluations
+carried a value out through one — in one line, four different ways. Since a
+region's entire guarantee is that nothing allocated inside outlives the brace,
+and a reference is the one thing that can carry something out without naming
+anything outside, a region and a reference do not mix.
+
+**[T-REGION-FOREIGN]** A region may not run code written outside it that
+carries state: an effect operation, whose handler is written outside and may
+keep what it is given, and a call through a function *value* bound outside,
+which is a closure and carries its captures. A closure written *inside* the
+region is fine — it can only capture what a region already allows. This is the
+same rule as the one above seen from the other side: the earlier rules ask
+what a region's own text may write, and this one asks whose text runs there.
 
 **[T-UNSAFE-FFI]** `unsafe { … }` is Tier 3: the block where the guarantees of
 the safe tiers do not apply. Using a declared C function — calling one *or

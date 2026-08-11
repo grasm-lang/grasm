@@ -1555,7 +1555,32 @@ declaration into the region, or compute a number and yield that",
         }
     }
 
+    /// Types one expression, and enforces the one rule that is about the
+    /// *type* a region may not touch.
+    ///
+    /// A `ref` reaches storage the region cannot see. It needs no `inout`, so
+    /// [T-REGION-INOUT] never fires, and it can be copied to a name declared
+    /// inside, so the declared-outside rule never fires either. Two
+    /// independent evaluations carried a value out of a region through one.
+    /// Since a region's whole guarantee is that nothing inside outlives the
+    /// brace, and a reference is the one thing that can carry something out
+    /// without naming anything outside, a region and a reference do not mix
+    /// ([T-REGION-REF]).
     fn infer_expr(&mut self, e: &Expr) -> Type {
+        let t = self.infer_expr_inner(e);
+        if self.region_depth > 0 && matches!(self.uni.shallow_resolve(&t), Type::Ref(_)) {
+            self.error_help(
+                e.span(),
+                "a `ref` cannot be used inside a region",
+                "a reference reaches storage outside the region, so what the region \
+allocates could outlive it — move the work out of the region, or yield a number",
+            );
+            return Type::Error;
+        }
+        t
+    }
+
+    fn infer_expr_inner(&mut self, e: &Expr) -> Type {
         match e {
             Expr::Int(..) => Type::I64,
             Expr::Float(..) => Type::F64,
@@ -2184,6 +2209,15 @@ fail outside it",
         }
         // Qualified variant: `Shape.Circle(...)` parses as MethodCall on type
         // name and lands in infer_method_call, not here. General case:
+        //
+        // A function *value* bound outside the region is a body written
+        // outside it, and a closure carries its captures — the same way out
+        // an effect handler is ([T-REGION-FOREIGN]). A closure written inside
+        // the region is not: it can only capture what a region already
+        // allows.
+        if let Expr::Ident(id) = callee {
+            self.reject_region_escape(id, "call");
+        }
         let callee_ty = self.infer_expr(callee);
         match self.uni.shallow_resolve(&callee_ty) {
             Type::Fn { params, ret, .. } => {
@@ -2270,8 +2304,29 @@ fail outside it",
                             // direct write one call away. The direct form was
                             // already refused and this was not.
                             self.reject_region_escape(id, "pass `inout`");
+                            // `inout` works by snapshotting the place at the
+                            // call and writing it back at the return. A `ref`
+                            // reaches the same value without going through
+                            // that snapshot, so a write made through one
+                            // during the call is overwritten by the writeback
+                            // and vanishes with no diagnostic. The two ways of
+                            // mutating are individually sound and cannot be
+                            // combined ([T-INOUT-REF]).
+                            let root_is_ref = self
+                                .lookup(&id.name)
+                                .is_some_and(|b| matches!(b.ty, Type::Ref(_)));
+                            if root_is_ref {
+                                self.error_help(
+                                    id.span,
+                                    format!(
+                                        "cannot pass `{}` as `inout` — it is reached through a `ref`",
+                                        id.name
+                                    ),
+                                    "write through the reference instead, or hold the value in a `var` and drop the reference",
+                                );
+                            }
                             match self.lookup(&id.name) {
-                                Some(b) if !b.mutable => {
+                                Some(b) if !b.mutable && !root_is_ref => {
                                     self.error_help(
                                         id.span,
                                         format!(
@@ -2555,6 +2610,22 @@ fail outside it",
         if let Expr::Ident(tid) = recv {
             if self.lookup(&tid.name).is_none() {
                 if let Some((ops, _)) = self.effects.get(&tid.name).cloned() {
+                    // The handler is written outside the region and runs
+                    // inside it, so whatever it captures — a `ref`, most
+                    // usefully — is a way out that the region cannot see
+                    // ([T-REGION-FOREIGN]).
+                    if self.region_depth > 0 {
+                        self.error_help(
+                            span,
+                            format!(
+                                "cannot perform effect `{}.{}` inside a region",
+                                tid.name, name.name
+                            ),
+                            "the handler is written outside the region and may keep what it \
+is given, which is how a value allocated inside gets out — perform the effect after the \
+closing brace",
+                        );
+                    }
                     match ops.iter().find(|o| o.name == name.name) {
                         Some(op) => {
                             if args.len() != op.params.len() {
