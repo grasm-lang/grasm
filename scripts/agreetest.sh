@@ -89,7 +89,91 @@ check() {
     fi
 }
 
+# A package graph, which `check` cannot express: three packages in a chain,
+# where the middle one imports both a sibling module of its own and its own
+# dependency. The module names a build gives such a graph come from the
+# manifests on disk, and a bundle does not carry those — so the bundled build
+# of a program the other two ran correctly reported a module nobody wrote,
+# and no gate here could see it.
+check_chain() {
+    local root="$WORK/chain"
+    rm -rf "$root"
+    mkdir -p "$root/c/src" "$root/b/src" "$root/a/src"
+    cat >"$root/c/grasm.toml" <<'TOML'
+[package]
+name = "c"
+version = "0.1.0"
+capabilities = []
+TOML
+    cat >"$root/c/src/main.gr" <<'SRC'
+pub fn triple(n: i64) -> i64 {
+    n * 3
+}
+SRC
+    cat >"$root/b/grasm.toml" <<'TOML'
+[package]
+name = "b"
+version = "0.1.0"
+capabilities = []
+
+[dependencies.c]
+path = "../c"
+TOML
+    cat >"$root/b/src/main.gr" <<'SRC'
+import c
+import helper
+
+pub fn six(n: i64) -> i64 {
+    helper.twice(c.triple(n))
+}
+SRC
+    cat >"$root/b/src/helper.gr" <<'SRC'
+pub fn twice(n: i64) -> i64 {
+    n * 2
+}
+SRC
+    cat >"$root/a/grasm.toml" <<'TOML'
+[package]
+name = "a"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.b]
+path = "../b"
+TOML
+    cat >"$root/a/src/main.gr" <<'SRC'
+import b
+
+fn main() {
+    print("{b.six(2)}")
+}
+SRC
+    local f="$root/a/src/main.gr"
+    local i_out n_out b_out
+    if ! "$GRASM" build "$f" --native -o "$root/native" >/dev/null 2>&1         || ! "$GRASM" build "$f" -o "$root/bundle" >/dev/null 2>&1; then
+        echo "  BUILD FAILED: package_chain"
+        fail=$((fail + 1))
+        FAILED+=("package_chain: build")
+        return
+    fi
+    i_out=$("$GRASM" run "$f" 2>&1)
+    n_out=$("$root/native" 2>&1)
+    b_out=$("$root/bundle" 2>&1)
+    if [ "$i_out" == "$n_out" ] && [ "$i_out" == "$b_out" ]; then
+        pass=$((pass + 1))
+    else
+        fail=$((fail + 1))
+        FAILED+=("package_chain")
+        echo "  DISAGREE: package_chain"
+        echo "    interp: $(tr '\n' '|' <<<"$i_out")"
+        echo "    native: $(tr '\n' '|' <<<"$n_out")"
+        echo "    bundle: $(tr '\n' '|' <<<"$b_out")"
+    fi
+}
+
 echo "comparing interpreter / native / bundled ..."
+
+check_chain
 
 check args_none 'fn main() {
     print("{args()}")

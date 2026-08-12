@@ -679,6 +679,17 @@ fn enclosing_package(path: &std::path::Path) -> Option<grasm_pkg::Manifest> {
 /// the whole graph resolved before its version is known, so that happens here
 /// and the answer is handed down. Packages with no registry dependency pay
 /// nothing: there is nothing to resolve.
+/// Whether two paths name the same directory, following symlinks when they
+/// both exist.
+fn same_dir(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    }
+}
+
+/// The package graph, as name → directory — *excluding* the package being
+/// built, whose own modules are named relative to it rather than under it.
 fn registry_packages(path: &std::path::Path) -> Result<HashMap<String, PathBuf>, String> {
     let mut here = path.parent().map(std::path::Path::to_path_buf);
     let pkg_dir = loop {
@@ -698,6 +709,7 @@ fn registry_packages(path: &std::path::Path) -> Result<HashMap<String, PathBuf>,
             .map(|r| {
                 r.packages
                     .iter()
+                    .filter(|p| !same_dir(&p.dir, &pkg_dir))
                     .map(|p| (p.name.clone(), p.dir.clone()))
                     .collect()
             })
@@ -707,6 +719,7 @@ fn registry_packages(path: &std::path::Path) -> Result<HashMap<String, PathBuf>,
     Ok(resolution
         .packages
         .iter()
+        .filter(|p| !same_dir(&p.dir, &pkg_dir))
         .map(|p| (p.name.clone(), p.dir.clone()))
         .collect())
 }
@@ -1043,6 +1056,8 @@ struct Bundle {
     /// C21 for the third time: the loader takes a dependency set, and every
     /// place that reloads a program has to carry it.
     deps: Vec<String>,
+    /// (importing module, written path) → the module name the build chose.
+    imports: Vec<(String, String, String)>,
 }
 
 fn read_own_bundle() -> Option<Bundle> {
@@ -1093,7 +1108,27 @@ fn parse_bundle(data: &[u8]) -> Option<Bundle> {
         }
         None => Vec::new(),
     };
-    Some(Bundle { files, deps })
+    // Older payloads stop before this, as they did before `deps`.
+    let mut imports = Vec::new();
+    if let Some(n) = read_u32(&mut pos) {
+        for _ in 0..n {
+            let mut part = || -> Option<String> {
+                let len = read_u32(&mut pos)? as usize;
+                let out = String::from_utf8(payload.get(pos..pos + len)?.to_vec()).ok()?;
+                pos += len;
+                Some(out)
+            };
+            let (Some(m), Some(a), Some(t)) = (part(), part(), part()) else {
+                break;
+            };
+            imports.push((m, a, t));
+        }
+    }
+    Some(Bundle {
+        files,
+        deps,
+        imports,
+    })
 }
 
 fn write_bundle(program: &Program, out_path: &str) -> Result<u64, String> {
@@ -1119,6 +1154,24 @@ fn write_bundle(program: &Program, out_path: &str) -> Result<u64, String> {
     for d in deps {
         payload.extend((d.len() as u32).to_le_bytes());
         payload.extend(d.as_bytes());
+    }
+    // Where each import already resolved to. The module names a build gives a
+    // package graph come from the manifests on disk, which a bundle does not
+    // carry — deriving them again made a three-package chain look for a module
+    // under a name the build never used.
+    let mut imports: Vec<(&str, &str, &str)> = Vec::new();
+    for f in &program.files {
+        for (alias, target) in &f.imports {
+            imports.push((f.name.as_str(), alias.as_str(), target.as_str()));
+        }
+    }
+    imports.sort();
+    payload.extend((imports.len() as u32).to_le_bytes());
+    for (module, alias, target) in imports {
+        for part in [module, alias, target] {
+            payload.extend((part.len() as u32).to_le_bytes());
+            payload.extend(part.as_bytes());
+        }
     }
     let payload_len = payload.len() as u64;
     data.extend(payload);
@@ -1147,7 +1200,21 @@ fn run_bundle(bundle: &Bundle, program_args: &[String]) -> ExitCode {
             .map(|(_, s)| s.clone())
     };
     let deps: std::collections::HashSet<String> = bundle.deps.iter().cloned().collect();
-    let program = loader::load_with_paths_in("main", "<bundled>", &provider, &|_| Vec::new(), &deps);
+    let resolved: HashMap<(String, String), String> = bundle
+        .imports
+        .iter()
+        .map(|(m, a, t)| ((m.clone(), a.clone()), t.clone()))
+        .collect();
+    let program = loader::load_with_resolved_imports(
+        "main",
+        "<bundled>",
+        &provider,
+        &|_| Vec::new(),
+        &deps,
+        None,
+        &|_| None,
+        &resolved,
+    );
     let mut diags = program.diagnostics.clone();
     if diags.is_empty() {
         diags.extend(grasm_sema::check::check_program(&program).diagnostics);

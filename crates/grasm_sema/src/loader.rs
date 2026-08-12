@@ -131,6 +131,36 @@ pub(crate) fn load_with_canonical(
     entry_alias: Option<&str>,
     canonical: &dyn Fn(&str) -> Option<String>,
 ) -> Program {
+    load_with_resolved_imports(
+        entry_name,
+        entry_display_path,
+        provider,
+        tried,
+        deps,
+        entry_alias,
+        canonical,
+        &HashMap::new(),
+    )
+}
+
+/// `load_with_canonical`, with some import targets already decided.
+///
+/// A bundled program carries the module names the build gave it, and those
+/// names come from the package graph on disk — which the bundle does not
+/// have. Re-deriving them made a three-package chain load as `b.c` where the
+/// build had named it `c`, so the bundled build of a program `grasm run` and
+/// `grasm build --native` both ran correctly reported a missing module.
+/// Keyed by (importing module, written path).
+pub fn load_with_resolved_imports(
+    entry_name: &str,
+    entry_display_path: &str,
+    provider: &dyn Fn(&str) -> Option<String>,
+    tried: &dyn Fn(&str) -> Vec<String>,
+    deps: &HashSet<String>,
+    entry_alias: Option<&str>,
+    canonical: &dyn Fn(&str) -> Option<String>,
+    resolved_imports: &HashMap<(String, String), String>,
+) -> Program {
     let mut files: Vec<LoadedFile> = Vec::new();
     let mut diagnostics = Vec::new();
     let mut loaded: HashMap<String, ()> = HashMap::new();
@@ -171,6 +201,16 @@ pub(crate) fn load_with_canonical(
         for decl in &out.module.decls {
             if let grasm_syntax::ast::Decl::Import(imp) = decl {
                 let written = imp.path.dotted();
+                // The name this import is called by, which is what a
+                // resolved map is keyed on: aliases are unique per module
+                // (a duplicate is an error), and a written path is not
+                // reconstructible from a bundle.
+                let alias = imp
+                    .path
+                    .segments
+                    .last()
+                    .map(|s| s.name.clone())
+                    .unwrap_or_default();
                 // Inside a package, an import is relative to that package —
                 // whether it names a sibling file or one of that package's
                 // own dependencies. Nesting is carried by the prefix, so both
@@ -181,17 +221,16 @@ pub(crate) fn load_with_canonical(
                 };
                 // The same package reached by two paths is one module.
                 let full = canonical(&full).unwrap_or(full);
+                // A name the build already decided wins over any derivation.
+                let full = resolved_imports
+                    .get(&(name.clone(), alias.clone()))
+                    .cloned()
+                    .unwrap_or(full);
                 // An import that names the entry file resolves to it.
                 let full = match entry_alias {
                     Some(a) if full == a => entry_name.to_string(),
                     _ => full,
                 };
-                let alias = imp
-                    .path
-                    .segments
-                    .last()
-                    .map(|s| s.name.clone())
-                    .unwrap_or_default();
                 if imports.contains_key(&alias) {
                     diagnostics.push(Diagnostic::error(
                         imp.span,
