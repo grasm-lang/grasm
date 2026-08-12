@@ -231,6 +231,16 @@ struct Checker {
     /// Every closure literal's return type, by start offset, resolved once
     /// the whole program is typed.
     closure_types: HashMap<u32, Type>,
+    /// Closure literals that a built-in higher-order method calls *now* —
+    /// `xs.map(|x| …)` and its siblings.
+    ///
+    /// A `fail` inside a closure that is not itself fallible raises the
+    /// enclosing function's error, which is what [E-PAR-FAIL] describes and
+    /// is sound exactly while the closure cannot outlive the call. Stored
+    /// instead — in a struct field, a list, a returned value — it is called
+    /// later, from a function that may declare no error type at all, and the
+    /// failure reached `main` at run time.
+    hof_closures: std::collections::HashSet<u32>,
     /// The generated `EHandler` types.
     ///
     /// Their operation fields are the one place a function value is *not*
@@ -362,6 +372,7 @@ impl Checker {
             fn_rows: HashMap::new(),
             closure_rows: HashMap::new(),
             closure_types: HashMap::new(),
+            hof_closures: std::collections::HashSet::new(),
             handler_ids: std::collections::HashSet::new(),
             unsafe_depth: 0,
             discarding: false,
@@ -1064,6 +1075,8 @@ land in a copy the caller never sees — return the new value from the operation
                 "drop the return type — a program's status comes from `exit(n)`, and an error reaching `main` is reported and exits 1",
             );
         }
+        self.hof_closures.clear();
+        collect_hof_closures_block(&f.body, &mut self.hof_closures);
         self.current_generics = f.generics.iter().map(|g| g.name.clone()).collect();
         self.key_generic_owner = if f.generics.is_empty() {
             None
@@ -5499,6 +5512,14 @@ the state through an `inout` parameter",
                 want_ret.clone().unwrap()
             }
         } else {
+            // A closure that is not fallible has no error branch, so a `fail`
+            // inside it belongs to nobody: charged to the enclosing function
+            // instead, `Box{ f: |x| if c { fail(e) } else { x } }` built in a
+            // fallible function and *called* from one that declares no error
+            // type let the failure out of `main` at run time.
+            if !self.hof_closures.contains(&span.start) {
+                self.fn_err = None;
+            }
             self.infer_expr(body)
         };
         self.fn_err = saved_err;
@@ -5591,6 +5612,152 @@ fn yields_whole(e: &Expr) -> bool {
         }
     }
     matches!(e, Expr::If { .. } | Expr::Match { .. }) && whole(e)
+}
+
+/// Closure literals passed directly to a built-in that calls them at once.
+fn collect_hof_closures_block(b: &Block, out: &mut std::collections::HashSet<u32>) {
+    for stmt in &b.stmts {
+        walk_stmt_exprs(stmt, &mut |e| collect_hof_closures(e, out));
+    }
+}
+
+fn collect_hof_closures(e: &Expr, out: &mut std::collections::HashSet<u32>) {
+    if let Expr::MethodCall { name, args, .. } = e {
+        if matches!(
+            name.name.as_str(),
+            "map" | "par_map" | "filter" | "par_filter" | "fold" | "any" | "all"
+                | "find" | "sort_by" | "each"
+        ) {
+            for a in args {
+                if let Expr::Closure { span, .. } = a {
+                    out.insert(span.start);
+                }
+            }
+        }
+    }
+}
+
+/// Applies `f` to every expression a statement contains, recursively.
+fn walk_stmt_exprs(s: &Stmt, f: &mut dyn FnMut(&Expr)) {
+    let mut walk_expr = |e: &Expr, f: &mut dyn FnMut(&Expr)| walk_exprs(e, f);
+    match s {
+        Stmt::Let { init, .. } => walk_expr(init, f),
+        Stmt::LetTuple { init, .. } => walk_expr(init, f),
+        Stmt::Assign { target, value, .. } => {
+            walk_expr(target, f);
+            walk_expr(value, f);
+        }
+        Stmt::Return(Some(e), _) | Stmt::Expr(e) => walk_expr(e, f),
+        Stmt::While { cond, body, .. } => {
+            walk_expr(cond, f);
+            for st in &body.stmts {
+                walk_stmt_exprs(st, f);
+            }
+        }
+        Stmt::For { iter, body, .. } => {
+            walk_expr(iter, f);
+            for st in &body.stmts {
+                walk_stmt_exprs(st, f);
+            }
+        }
+        Stmt::With { handler, body, .. } => {
+            walk_expr(handler, f);
+            for st in &body.stmts {
+                walk_stmt_exprs(st, f);
+            }
+        }
+        Stmt::Parallel { body, .. } | Stmt::Spawn { body, .. } => {
+            for st in &body.stmts {
+                walk_stmt_exprs(st, f);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn walk_exprs(e: &Expr, f: &mut dyn FnMut(&Expr)) {
+    f(e);
+    match e {
+        Expr::Unary { expr, .. } | Expr::Try { expr, .. } => walk_exprs(expr, f),
+        Expr::Binary { lhs, rhs, .. } => {
+            walk_exprs(lhs, f);
+            walk_exprs(rhs, f);
+        }
+        Expr::Field { recv, .. } => walk_exprs(recv, f),
+        Expr::Index { recv, index, .. } => {
+            walk_exprs(recv, f);
+            walk_exprs(index, f);
+        }
+        Expr::Call { callee, args, .. } => {
+            walk_exprs(callee, f);
+            for a in args {
+                walk_exprs(a, f);
+            }
+        }
+        Expr::MethodCall { recv, args, .. } => {
+            walk_exprs(recv, f);
+            for a in args {
+                walk_exprs(a, f);
+            }
+        }
+        Expr::List(items, _) | Expr::Tuple(items, _) => {
+            for i in items {
+                walk_exprs(i, f);
+            }
+        }
+        Expr::Map(entries, _) => {
+            for (k, v) in entries {
+                walk_exprs(k, f);
+                walk_exprs(v, f);
+            }
+        }
+        Expr::Str(pieces, _) => {
+            for p in pieces {
+                if let StrPiece::Expr(inner) = p {
+                    walk_exprs(inner, f);
+                }
+            }
+        }
+        Expr::Closure { body, .. } => walk_exprs(body, f),
+        Expr::StructLit { fields, base, .. } => {
+            if let Some(b) = base {
+                walk_exprs(b, f);
+            }
+            for (_, v) in fields {
+                walk_exprs(v, f);
+            }
+        }
+        Expr::Block(b) | Expr::Unsafe(b) | Expr::Region(b) => {
+            for st in &b.stmts {
+                walk_stmt_exprs(st, f);
+            }
+        }
+        Expr::If { cond, then_block, else_branch, .. } => {
+            walk_exprs(cond, f);
+            for st in &then_block.stmts {
+                walk_stmt_exprs(st, f);
+            }
+            match else_branch.as_deref() {
+                Some(ElseBranch::Else(b)) => {
+                    for st in &b.stmts {
+                        walk_stmt_exprs(st, f);
+                    }
+                }
+                Some(ElseBranch::ElseIf(inner)) => walk_exprs(inner, f),
+                None => {}
+            }
+        }
+        Expr::Match { scrutinee, arms, .. } => {
+            walk_exprs(scrutinee, f);
+            for a in arms {
+                walk_exprs(&a.body, f);
+                if let Some(g) = &a.guard {
+                    walk_exprs(g, f);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn place_root(e: &Expr) -> Option<&Ident> {

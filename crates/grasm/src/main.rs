@@ -317,6 +317,21 @@ fn run() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             }
+            // An output that *is* an input is a destroyed source file:
+            // `grasm build x.gr -o x.gr` reported success and left a 10 MB
+            // executable where the program used to be.
+            if same_dir(std::path::Path::new(&out_path), std::path::Path::new(path)) {
+                eprintln!(
+                    "error: `{out_path}` is the source file — the build would overwrite it"
+                );
+                eprintln!("  help: name the output something else, or drop `-o` to use the file's stem");
+                return ExitCode::FAILURE;
+            }
+            if out_path.ends_with(".gr") {
+                eprintln!("error: `{out_path}` ends in `.gr`, and a build writes an executable there");
+                eprintln!("  help: name the output without the `.gr` suffix");
+                return ExitCode::FAILURE;
+            }
             // `--target` only means anything to the compiled backend. Without
             // `--native` it was accepted and ignored, so asking for a Linux
             // build on a Mac produced a Mach-O bundle that ran locally and
