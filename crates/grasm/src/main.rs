@@ -1654,6 +1654,27 @@ fn cmd_deps(dir: &std::path::Path, locked: bool) -> Result<(), String> {
     let mut violations = Vec::new();
     let mut unknown: Vec<grasm_pkg::UnknownCapability> = Vec::new();
     let mut unanalyzable = Vec::new();
+    // What each package performs *in this graph*, as the build path counts
+    // it: a library that installs a handler its consumer passed in performs
+    // nothing on its own, and `deps` reported it clean while `check` on the
+    // same graph refused — two commands, one graph, opposite exit codes.
+    let whole_program = {
+        let root = resolution
+            .packages
+            .iter()
+            .find(|p| same_dir(&p.dir, dir))
+            .map(|p| p.entry_path());
+        root.and_then(|entry| {
+            let resolved: HashMap<String, PathBuf> = resolution
+                .packages
+                .iter()
+                .map(|p| (p.name.clone(), p.dir.clone()))
+                .collect();
+            loader::load_from_disk_with(&entry, &resolved).ok()
+        })
+        .map(|p| grasm_sema::effects::effects_by_package(&p))
+        .unwrap_or_default()
+    };
     for pkg in &resolution.packages {
         // A package that cannot be analyzed used to warn and carry on, which
         // meant the ceiling silently stopped being enforced for it while the
@@ -1668,6 +1689,10 @@ fn cmd_deps(dir: &std::path::Path, locked: bool) -> Result<(), String> {
                 continue;
             }
         };
+        let mut performed = performed;
+        if let Some(extra) = whole_program.get(&pkg.name) {
+            performed.extend(extra.iter().cloned());
+        }
         let shown: Vec<&str> = performed.iter().map(|s| s.as_str()).collect();
         let declared = match &pkg.capabilities {
             Some(c) => c.iter().cloned().collect::<Vec<_>>().join(", "),

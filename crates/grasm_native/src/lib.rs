@@ -4383,6 +4383,15 @@ impl FnCx<'_, '_> {
                         let v = self.make_variant("Option", "None", &[])?;
                         return Ok(Some((v, VType::Option(Box::new(VType::Any)))));
                     }
+                    // A handler bound to a name, used as a value rather
+                    // than installed. The message named the *variable*, which
+                    // says nothing about which shape was hit.
+                    if self.cg.handler_lits.contains_key(&id.name) {
+                        return nope(
+                            id.span,
+                            "a handler used as a value (install it with `with ... handled_by`; printing or storing one is not compiled yet)",
+                        );
+                    }
                     nope(id.span, format!("the name `{}` here", id.name))
                 }
             },

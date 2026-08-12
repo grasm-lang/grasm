@@ -109,6 +109,17 @@ fn main() {
     print("{pick(1)}")
 }'
 
+expect_refused "a handler used as a value" 'effect Log {
+    fn info(m: str)
+}
+fn main() {
+    let h = LogHandler{ info: |m| print("L: {m}") }
+    with Log handled_by h {
+        Log.info("one")
+    }
+    print("{h}")
+}'
+
 expect_refused "a generic instantiated at a handler type" 'effect Clock {
     fn now() -> i64
 }
