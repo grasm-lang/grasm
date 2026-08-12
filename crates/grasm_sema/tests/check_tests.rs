@@ -1193,3 +1193,62 @@ fn a_coalesced_function_keeps_its_row() {
         "needs an effect-free function",
     );
 }
+
+/// A function that returns nothing throws its tail away, and throwing away a
+/// failure is using a fallible value as if it were `T`
+/// ([T-FALLIBLE-UNHANDLED]).
+#[test]
+fn a_discarded_tail_is_refused() {
+    check_err(
+        "fn write_report(p: str, b: str) {\n    write_file(p, b)\n}\nfn main() {\n    write_report(\"/x\", \"y\")\n}\n",
+        "failure is discarded",
+    );
+    // `exit`/`panic`/`fail` in that position produce no value to discard.
+    check_ok("fn main() {\n    print(\"bye\")\n    exit(2)\n}\n");
+    // And `main` may propagate, which is [E-MAIN-ERR], not a discard.
+    check_ok("fn main() {\n    write_file(\"/x\", \"y\")\n}\n");
+}
+
+/// A closure body is checked against the closure, not the enclosing function.
+#[test]
+fn a_closure_body_is_its_own_function() {
+    check_err(
+        "fn f() -> str {\n    let g: fn(i64) -> i64 = |x| {\n        return \"oops\"\n    }\n    print(\"{g(1)}\")\n    \"done\"\n}\nfn main() {\n    print(f())\n}\n",
+        "type mismatch",
+    );
+    check_err(
+        "fn main() {\n    for i in [1] {\n        let f = |x| {\n            break\n        }\n        print(\"{i}\")\n    }\n}\n",
+        "`break` outside of a loop",
+    );
+    // A `return` that agrees with the closure's own type is fine.
+    check_ok(
+        "fn main() {\n    let g: fn(i64) -> i64 = |x| {\n        if x < 0 {\n            return 0\n        }\n        x * 2\n    }\n    print(\"{g(3)}\")\n}\n",
+    );
+}
+
+/// A value stored under a written function type must fit that type's row.
+#[test]
+fn a_written_row_is_checked_where_a_value_is_stored() {
+    check_err(
+        "fn id[T](x: T) -> T {\n    x\n}\nfn main() {\n    let f: fn() -> i64 = id(|| {\n        print(\"IO\")\n        1\n    })\n    print(\"{f()}\")\n}\n",
+        "but the value performs `io`",
+    );
+    check_err(
+        "effect Cfg {\n    fn value() -> i64\n}\nfn main() {\n    var keep: [fn() -> i64] = []\n    with Cfg handled_by CfgHandler{ value: || 1 } {\n        keep = [1].map(|_x| || Cfg.value())\n    }\n    print(\"{keep[0]()}\")\n}\n",
+        "but the value performs `Cfg`",
+    );
+}
+
+/// A `fail` in a closure that is not fallible belongs to the enclosing
+/// function, and is sound only while the closure cannot outlive the call.
+#[test]
+fn a_stored_closure_may_not_fail() {
+    check_err(
+        "type E = { c: str }\ntype Box = { f: fn(i64) -> i64 }\nfn build() -> Box ! E {\n    Box{ f: |x| if x == 0 { fail(E{ c: \"z\" }) } else { x } }\n}\nfn main() {\n    let b = build() ?? Box{ f: |x| x }\n    print(\"{b.f(0)}\")\n}\n",
+        "declares no error type",
+    );
+    // A built-in that calls the closure at once keeps working ([E-PAR-FAIL]).
+    check_ok(
+        "type E = | Bad\nfn go(xs: [i64]) -> [i64] ! E {\n    xs.par_map(|x| if x == 2 {\n        fail(Bad)\n    } else {\n        x\n    })\n}\nfn main() {\n    print(\"{go([1, 3]) ?? []}\")\n}\n",
+    );
+}

@@ -734,3 +734,58 @@ fn an_unknown_flag_is_refused() {
     assert_eq!(code, 1, "{out}");
     assert!(out.contains("needs a value"), "{out}");
 }
+
+/// `main`'s discarded failure is reported and exits 1, in every engine
+/// ([E-MAIN-ERR]).
+#[test]
+fn a_discarded_failure_in_main_is_reported() {
+    let w = Work::new("mainerr");
+    let f = w.0.join("m.gr");
+    std::fs::write(
+        &f,
+        "fn main() {\n    print(\"before\")\n    write_file(\"/no/such/dir/x.txt\", \"data\")\n}\n",
+    )
+    .unwrap();
+    let native = w.0.join("m_native");
+    let bundle = w.0.join("m_bundle");
+    assert_eq!(
+        run(&["build", f.to_str().unwrap(), "--native", "-o", native.to_str().unwrap()]).0,
+        0
+    );
+    assert_eq!(
+        run(&["build", f.to_str().unwrap(), "-o", bundle.to_str().unwrap()]).0,
+        0
+    );
+    let interp = run(&["run", f.to_str().unwrap()]);
+    for (name, out) in [
+        ("native", Command::new(&native).output().unwrap()),
+        ("bundle", Command::new(&bundle).output().unwrap()),
+    ] {
+        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&out.stderr));
+        assert_eq!(
+            out.status.code().unwrap_or(-1),
+            1,
+            "{name} must exit 1:\n{text}"
+        );
+        assert!(
+            text.contains("unhandled error from main"),
+            "{name}:\n{text}"
+        );
+    }
+    assert_eq!(interp.0, 1, "{}", interp.1);
+}
+
+/// A second file operand is a lost argument, not a second program.
+#[test]
+fn a_stray_second_operand_is_refused() {
+    let w = Work::new("operand");
+    let f = w.0.join("h.gr");
+    std::fs::write(&f, "fn main() {\n    print(\"hi\")\n}\n").unwrap();
+    let (code, out) = run(&["check", f.to_str().unwrap(), "/nonexistent.gr"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("takes one file"), "{out}");
+    // Program arguments after `--` are still the program's.
+    let (code, out) = run(&["run", f.to_str().unwrap(), "--", "a", "b"]);
+    assert_eq!(code, 0, "{out}");
+}

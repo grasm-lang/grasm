@@ -955,6 +955,22 @@ pub fn effects_of_package(manifest: &Manifest) -> Result<BTreeSet<String>, Strin
     }
     let resolved = own_resolved(manifest);
     let program = grasm_sema::loader::load_from_disk_with(&entry, &resolved)?;
+    // The entry file gets the same treatment as a sibling: a package whose
+    // source cannot be read cannot be held to its ceiling, and affirming it
+    // anyway reported `performs []` and wrote a lockfile over code that had
+    // never been analysed.
+    if !program.diagnostics.is_empty() {
+        return Err(format!(
+            "package `{}`: cannot read `{}` — {}",
+            manifest.name,
+            entry.display(),
+            program
+                .diagnostics
+                .first()
+                .map(|d| d.message.clone())
+                .unwrap_or_default()
+        ));
+    }
     let mut out = grasm_sema::effects::effects_of_program(&program);
     // Every module in the package, not only the ones its entry imports.
     //

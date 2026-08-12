@@ -97,12 +97,29 @@ fn run() -> ExitCode {
             _ => (&[], &[]),
         };
         // Everything after `--` belongs to the program, not to the toolchain.
+        // `add <name> <version> [dir]` and `deps [dir]`/`publish [dir]` take
+        // more than one operand; the rest take a file.
+        let takes_two: &[&str] = &["add", "deps", "publish", "version", "lsp", "dap"];
         let mut i = 1;
+        let mut seen_operand = false;
         let mut bad: Option<String> = None;
         while i < args.len() {
             let a = &args[i];
             if a == "--" {
                 break;
+            }
+            if !a.starts_with('-') {
+                // A second path is a lost operand, not a second program:
+                // `grasm check a.gr b.gr` checked `a.gr` and said nothing
+                // about `b.gr`, which hides a typo.
+                if seen_operand && !takes_two.contains(&cmd) {
+                    eprintln!("error: `grasm {cmd}` takes one file, and `{a}` is a second");
+                    eprintln!("  help: run it once per file, or put program arguments after `--`");
+                    return ExitCode::FAILURE;
+                }
+                seen_operand = true;
+                i += 1;
+                continue;
             }
             if a.starts_with('-') && a != "-" {
                 if valued.contains(&a.as_str()) {
