@@ -82,13 +82,18 @@ fn run() -> ExitCode {
                 &["--coverage"],
                 &["--seed", "--cases", "--filter"],
             ),
+            "bench" => (&[], &["--filter"]),
             "check" => (&[], &[]),
-            "build" => (&["--native"], &["-o", "--target"]),
+            "build" => (
+                &["--native", "--no-incremental"],
+                &["-o", "--target"],
+            ),
             "doc" => (&[], &["-o"]),
             "api" => (&[], &["--against"]),
             "fmt" => (&["--check"], &[]),
             "deps" => (&["--locked"], &[]),
             "publish" => (&[], &["--registry"]),
+            "add" => (&[], &["--registry"]),
             _ => (&[], &[]),
         };
         // Everything after `--` belongs to the program, not to the toolchain.
@@ -655,7 +660,9 @@ fn run() -> ExitCode {
         // Asking for help is not an error; an unknown command is. Printing
         // usage and exiting 1 for `--help` breaks any script that checks.
         other => {
-            let asked = matches!(other, Some("help") | Some("--help") | Some("-h") | None);
+            // Asking is not an error; being told nothing at all is — a bare
+            // `grasm` in a script that forgot its argument exited 0.
+            let asked = matches!(other, Some("help") | Some("--help") | Some("-h"));
             if let Some(cmd) = other.filter(|_| !asked) {
                 eprintln!("error: unknown command `{cmd}`");
                 eprintln!();

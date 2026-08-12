@@ -398,6 +398,9 @@ a `map`. The answer is identical — that is the whole point of requiring purity
 — but the throughput is not, so measure with `grasm build --native`.
 
 A panicking task aborts the whole scope; tasks spawned after it do not run.
+A `return` inside a task body returns from the function the `parallel` block
+is in, and the rest of the scope — the tasks not yet run, and the statements
+after the block — is abandoned. That is a way out, not a way to end one task.
 
 The two forms divide the work between them, and it is worth knowing which you
 want before you reach for one. **`for x in xs { spawn { … x … } }` is not
