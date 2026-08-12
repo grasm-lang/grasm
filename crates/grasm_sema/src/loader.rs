@@ -164,10 +164,17 @@ pub fn load_with_resolved_imports(
     let mut files: Vec<LoadedFile> = Vec::new();
     let mut diagnostics = Vec::new();
     let mut loaded: HashMap<String, ()> = HashMap::new();
-    let mut queue: Vec<(String, String)> = vec![(entry_name.to_string(), entry_display_path.to_string())];
+    // The span of the `import` that asked for each module, so a failure
+    // points at the line that wrote it rather than at the first import in the
+    // file.
+    let mut queue: Vec<(String, String, Span)> = vec![(
+        entry_name.to_string(),
+        entry_display_path.to_string(),
+        Span::new(0, 1),
+    )];
     let mut base = 0u32;
 
-    while let Some((name, display)) = queue.pop() {
+    while let Some((name, display, asked_at)) = queue.pop() {
         if loaded.contains_key(&name) {
             continue;
         }
@@ -180,7 +187,7 @@ pub fn load_with_resolved_imports(
                 format!("looked in:\n  {}", candidates.join("\n  "))
             };
             diagnostics.push(Diagnostic::error(
-                Span::new(0, 1),
+                asked_at,
                 format!("cannot load module `{name}` ({where_})"),
             ));
             continue;
@@ -241,7 +248,7 @@ pub fn load_with_resolved_imports(
                 }
                 imports.insert(alias, full.clone());
                 let disp = format!("{}.gr", full.replace('.', "/"));
-                queue.push((full, disp));
+                queue.push((full, disp, imp.span));
             }
         }
         let alias = name

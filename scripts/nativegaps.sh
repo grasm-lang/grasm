@@ -86,6 +86,29 @@ fn main() {
     }
 }'
 
+expect_refused "a with block inside parallel or spawn" 'effect Clock {
+    fn now() -> i64
+}
+fn main() {
+    parallel {
+        spawn {
+            with Clock handled_by ClockHandler{ now: || 7 } {
+                print("{Clock.now()}")
+            }
+        }
+    }
+}'
+
+expect_refused "exit as a match arm value" 'fn pick(n: i64) -> i64 {
+    match n {
+        0 -> exit(4)
+        _ -> n
+    }
+}
+fn main() {
+    print("{pick(1)}")
+}'
+
 expect_refused "a generic instantiated at a handler type" 'effect Clock {
     fn now() -> i64
 }

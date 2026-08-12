@@ -7504,6 +7504,20 @@ impl FnCx<'_, '_> {
                     // that had to know the ok half — `??` does, `match` does
                     // not — read the fallback it produced as a pointer and
                     // the program died with an empty stderr.
+                    // `ref(v)` — a Tier-2 reference to whatever it is given.
+                    // Without this a list literal of them could not be typed,
+                    // so `let rs: [ref N] = [ref(N{ v: 3 })]` was refused
+                    // while the same list built with `push` compiled.
+                    if id.name == "ref"
+                        && args.len() == 1
+                        && !self
+                            .cg
+                            .fns
+                            .contains_key(&format!("{}::ref", self.cg.current_module))
+                    {
+                        let inner = self.probe_type(&args[0])?;
+                        return Ok(VType::Ref(Box::new(inner)));
+                    }
                     if id.name == "Ok" && args.len() == 1 {
                         let inner = self.probe_type(&args[0])?;
                         return Ok(VType::Fallible(

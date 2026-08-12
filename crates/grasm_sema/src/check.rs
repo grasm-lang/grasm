@@ -1311,6 +1311,24 @@ with a fallback to say what should happen instead",
         self.deferred_closures.pop();
         self.closure_floors.pop();
         self.scopes.pop();
+        // Nothing ever said what the parameters are. [T-FN-TYPE]: "A closure
+        // bound to a name and never called, with no function type to take
+        // them from, still has nothing to infer from and is an error."
+        // Accepted silently, it compiled to a function whose parameter types
+        // the backend then had to guess.
+        if let Some(p) = d
+            .params
+            .iter()
+            .zip(&d.param_tys)
+            .find(|(_, t)| matches!(self.uni.shallow_resolve(t), Type::Var(_)))
+            .map(|(p, _)| p.clone())
+        {
+            self.error_help(
+                p.span,
+                format!("nothing says what `{}` is", p.name),
+                "a closure's parameter types come from where it is used — call it, pass it somewhere with a function type, or annotate the binding as in `let f: fn(i64) -> i64 = |x| x + 1`",
+            );
+        }
         if !self.uni.unify(&produced, &d.ret) {
             let got = self.show(&produced);
             let want = self.show(&d.ret);

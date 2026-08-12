@@ -625,7 +625,26 @@ impl<'a> Lexer<'a> {
                         start,
                     );
                 }
-                Error(format!("unexpected character `{text}`"))
+                // Named, not pasted, when it has no glyph: a byte order mark
+                // or another invisible renders as nothing at all, and the
+                // message then says a character is wrong without showing
+                // which ([L-ENCODING]).
+                {
+                    let ch = text.chars().next().unwrap_or('\u{fffd}');
+                    if ch.is_control() || ch.is_whitespace() || matches!(ch, '\u{feff}' | '\u{200b}'..='\u{200f}' | '\u{2060}') {
+                        let named = match ch {
+                            '\u{feff}' => " (a byte order mark — legal only at the very start of a file)".to_string(),
+                            '\u{200b}' => " (a zero-width space)".to_string(),
+                            _ => String::new(),
+                        };
+                        Error(format!(
+                            "unexpected character U+{:04X}{named}",
+                            ch as u32
+                        ))
+                    } else {
+                        Error(format!("unexpected character `{text}`"))
+                    }
+                }
             }
         };
         self.tok(kind, start)
