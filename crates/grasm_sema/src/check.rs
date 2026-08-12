@@ -353,14 +353,33 @@ impl Checker {
     }
 
     fn error(&mut self, span: Span, msg: impl Into<String>) -> Type {
-        self.diags.push(Diagnostic::error(span, msg));
+        let d = Diagnostic::error(span, msg);
+        self.push_diag(d);
         Type::Error
     }
 
     fn error_help(&mut self, span: Span, msg: impl Into<String>, help: impl Into<String>) -> Type {
-        self.diags
-            .push(Diagnostic::error(span, msg).with_help(help));
+        let d = Diagnostic::error(span, msg).with_help(help);
+        self.push_diag(d);
         Type::Error
+    }
+
+    /// One diagnostic per (span, message).
+    ///
+    /// An expression can be visited more than once — inference probes it, then
+    /// the checker walks it — and a rule that fires on the expression rather
+    /// than on a binding fires each time. `region { print("{r.v}") }` reported
+    /// "a `ref` cannot be used inside a region" twice at the same span, which
+    /// reads as two problems.
+    fn push_diag(&mut self, d: Diagnostic) {
+        if self
+            .diags
+            .iter()
+            .any(|prev| prev.span == d.span && prev.message == d.message)
+        {
+            return;
+        }
+        self.diags.push(d);
     }
 
     fn show(&self, ty: &Type) -> String {
@@ -2305,6 +2324,19 @@ allocates could outlive it — move the work out of the region, or yield a numbe
     }
 
     fn infer_expr_inner(&mut self, e: &Expr) -> Type {
+        // `discarding` is about *this statement's own* value, and only the
+        // shapes whose value is the statement's value carry it inward. It
+        // used to stay set for everything under the statement, so the first
+        // `if` reached anywhere below — including one inside a closure body,
+        // whose value is the closure's result and is discarded by nobody —
+        // read the flag as its own. `take(xs.map(|x| if c { Err(E) } else {
+        // Ok(x) }).len())` was then refused for discarding a failure, and
+        // only when it was not the last statement in its block, so the same
+        // line compiled or not depending on what followed it
+        // ([T-FALLIBLE-UNHANDLED]).
+        if !matches!(e, Expr::If { .. } | Expr::Block(..) | Expr::Region { .. }) {
+            self.discarding = false;
+        }
         match e {
             Expr::Int(..) => Type::I64,
             Expr::Float(..) => Type::F64,
@@ -2446,11 +2478,13 @@ allocates could outlive it — move the work out of the region, or yield a numbe
                 else_branch,
                 ..
             } => {
-                self.check_expr(cond, &Type::Bool);
                 // If this `if` is a statement, its branches' values go
                 // nowhere too, so `if c { write_file(p, s) }` is as unhandled
-                // as `write_file(p, s)` on its own line.
+                // as `write_file(p, s)` on its own line. Read before the
+                // condition, which is an expression like any other and turns
+                // the flag off.
                 let disc = std::mem::take(&mut self.discarding);
+                self.check_expr(cond, &Type::Bool);
                 let e_span = e.span();
                 let before = self.moved_snapshot();
                 let then_ty = if disc {
@@ -2619,6 +2653,25 @@ only a number or a `bool` can come out — compute what you need and yield that"
                 ret: Box::new(ret_of(&info.ret, &info.err)),
                 row: own_row,
             };
+        }
+        // Types are program-wide but functions are per-module, so the name
+        // that is missing here is very often one that exists next door. The
+        // old advice — spelling, or `let` — was the one fix that is never
+        // right for that case.
+        let qualified: Vec<String> = self
+            .module_imports
+            .get(&self.current_module)
+            .into_iter()
+            .flat_map(|m| m.iter())
+            .filter(|(_, target)| self.fns.contains_key(&format!("{target}::{}", id.name)))
+            .map(|(alias, _)| format!("`{alias}.{}`", id.name))
+            .collect();
+        if !qualified.is_empty() {
+            return self.error_help(
+                id.span,
+                format!("unknown name `{}`", id.name),
+                format!("did you mean {}?", qualified.join(" or ")),
+            );
         }
         self.error_help(
             id.span,
@@ -3472,9 +3525,9 @@ fail outside it",
                                 "cannot perform effect `{}.{}` inside a region",
                                 tid.name, name.name
                             ),
-                            "the handler is written outside the region and may keep what it \
-is given, which is how a value allocated inside gets out — perform the effect after the \
-closing brace",
+                            "a handler can keep what it is given, and nothing here says \
+this one does not — which is how a value allocated inside the region would get out. \
+Perform the effect after the closing brace, or yield a number and do the work outside",
                         );
                     }
                     match ops.iter().find(|o| o.name == name.name) {

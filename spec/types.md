@@ -438,6 +438,14 @@ which is not `true` — so the answer was the empty list, with nothing reported
 and exit code 0. The same door made `any` always `false`, `find` always
 `None`, and `sort_by` leave the list untouched.
 
+**[T-FALLIBLE-UNIT]** `() ! E` is a fallible type like any other. A function
+that produces nothing can still fail; `try f()` on one yields `()`, and
+`f() ?? ()` is how a caller says the failure is deliberately ignored. The
+empty ok half changes nothing about where the failure has to be handled
+([T-FALLIBLE-UNHANDLED]) — it is the ordinary shape of a setup call, and the
+one a compiled backend is most likely to get wrong, because the value it
+merges the two halves through does not exist.
+
 **[T-DIVERGE]** `return`, `break` and `continue` produce no value, so they do
 not have to agree with one: an `if` branch or a match arm that ends in one is
 compatible with any other branch's type. This is what makes `0 -> return
@@ -641,6 +649,15 @@ region may not perform a declared effect, and may not be handed a function
 value — `io`, `async` and `unsafe` are exempt, because they have no handler
 and retain nothing, and a closure written inside the region is exempt, because
 it can only capture what a region already allows.
+
+"Retains nothing" is about *memory*, which is what a region governs. Writing a
+region's contents to a file with `write_file` is allowed and is not a hole:
+what leaves is a copy of the bytes, and nothing holds a reference into the
+arena past the closing brace. The rule exists so no live pointer outlasts the
+region, not to make what a region computes secret. `unsafe` is the one exempt
+row where retention is possible — a C function can keep whatever address it is
+given — and that is Tier 3's bargain, stated in [T-UNSAFE-FFI] rather than
+weakened here.
 
 **[T-UNSAFE-FFI]** `unsafe { … }` is Tier 3: the block where the guarantees of
 the safe tiers do not apply. Using a declared C function — calling one *or

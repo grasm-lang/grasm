@@ -794,9 +794,71 @@ build against a dependency whose reach is unknown",
 /// Sorted because a diff should report what *changed*, not where a
 /// declaration moved to. One line per item because that makes the comparison
 /// a set operation on names and signatures rather than a parse.
+/// Replaces every type alias with what it stands for.
+///
+/// `[T-TYPE-ALIAS]`: an alias is not a new type, and the two are
+/// interchangeable everywhere. Comparing the *written* signatures made
+/// `-> str` becoming `-> Text` (with `type Text = str`) a changed export and
+/// so a MAJOR release — exit 1 on a release gate for a change no consumer can
+/// observe. Expanded first, both spellings render the same.
+fn expand_aliases(sig: &str, aliases: &std::collections::BTreeMap<String, String>) -> String {
+    if aliases.is_empty() {
+        return sig.to_string();
+    }
+    // Bounded: an alias chain is finite, and a cyclic one (rejected by the
+    // checker, but this runs on text) must not spin here.
+    let mut out = sig.to_string();
+    for _ in 0..8 {
+        let mut next = String::with_capacity(out.len());
+        let mut word = String::new();
+        let mut changed = false;
+        for ch in out.chars().chain(std::iter::once('\0')) {
+            if ch.is_alphanumeric() || ch == '_' {
+                word.push(ch);
+                continue;
+            }
+            if !word.is_empty() {
+                match aliases.get(&word) {
+                    Some(target) => {
+                        next.push_str(target);
+                        changed = true;
+                    }
+                    None => next.push_str(&word),
+                }
+                word.clear();
+            }
+            if ch != '\0' {
+                next.push(ch);
+            }
+        }
+        out = next;
+        if !changed {
+            break;
+        }
+    }
+    out
+}
+
 fn api_surface(program: &Program) -> String {
     use grasm_syntax::ast::Decl;
     let const_types = grasm_sema::check::check_program(program).const_types;
+    // Aliases are program-wide: types share one namespace ([T-MODULE-NS]).
+    let mut aliases: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for file in &program.files {
+        for decl in &file.module.decls {
+            if let Decl::Type(t) = decl {
+                if let grasm_syntax::ast::TypeBody::Alias(target) = &t.body {
+                    if t.generics.is_empty() {
+                        aliases.insert(
+                            t.name.name.clone(),
+                            grasm_sema::docs::type_text(target),
+                        );
+                    }
+                }
+            }
+        }
+    }
     let mut lines: Vec<String> = Vec::new();
     for file in &program.files {
         // A dependency's exports are that package's surface, not this one's.
@@ -844,6 +906,13 @@ fn api_surface(program: &Program) -> String {
                     grasm_sema::docs::effect_signature(e),
                 ),
                 _ => continue,
+            };
+            // An alias declaration keeps its own text — `type Text = str`
+            // disappearing *is* a change to the surface. Only uses expand.
+            let sig = if matches!(decl, Decl::Type(_)) {
+                sig
+            } else {
+                expand_aliases(&sig, &aliases)
             };
             lines.push(format!("{}\t{}\t{}", file.name, name, sig));
         }

@@ -803,6 +803,14 @@ which is not `true` — so the answer was the empty list, with nothing reported
 and exit code 0. The same door made `any` always `false`, `find` always
 `None`, and `sort_by` leave the list untouched.
 
+**[T-FALLIBLE-UNIT]** `() ! E` is a fallible type like any other. A function
+that produces nothing can still fail; `try f()` on one yields `()`, and
+`f() ?? ()` is how a caller says the failure is deliberately ignored. The
+empty ok half changes nothing about where the failure has to be handled
+([T-FALLIBLE-UNHANDLED]) — it is the ordinary shape of a setup call, and the
+one a compiled backend is most likely to get wrong, because the value it
+merges the two halves through does not exist.
+
 **[T-DIVERGE]** `return`, `break` and `continue` produce no value, so they do
 not have to agree with one: an `if` branch or a match arm that ends in one is
 compatible with any other branch's type. This is what makes `0 -> return
@@ -1007,6 +1015,15 @@ value — `io`, `async` and `unsafe` are exempt, because they have no handler
 and retain nothing, and a closure written inside the region is exempt, because
 it can only capture what a region already allows.
 
+"Retains nothing" is about *memory*, which is what a region governs. Writing a
+region's contents to a file with `write_file` is allowed and is not a hole:
+what leaves is a copy of the bytes, and nothing holds a reference into the
+arena past the closing brace. The rule exists so no live pointer outlasts the
+region, not to make what a region computes secret. `unsafe` is the one exempt
+row where retention is possible — a C function can keep whatever address it is
+given — and that is Tier 3's bargain, stated in [T-UNSAFE-FFI] rather than
+weakened here.
+
 **[T-UNSAFE-FFI]** `unsafe { … }` is Tier 3: the block where the guarantees of
 the safe tiers do not apply. Using a declared C function — calling one *or
 naming one*, which are the same permission — is allowed only inside it.
@@ -1152,18 +1169,27 @@ may call functions and name them as values — a dispatch table
 themselves perform nothing, since naming one is the permission to call it
 ([T-FN-VALUE-ROW]) and that charge lands on the constant: a table of `io`
 functions has no spelling as a constant, and writing the row on the constant's
-type does not change that. Build one in a function instead. It
-is evaluated wherever the name is used, so an effect in it would happen once
-per mention — which would make how often something happens a property of how
-many times a name appears. That is why the restriction exists rather than
-being a limitation to work around: a value that has to be computed once, with
-effects, is a function.
+type does not change that. Build one in a function instead. The initializer
+*is* what the name means, so an effect in it would happen once per mention —
+which would make how often something happens a property of how many times a
+name appears. That is why the restriction exists rather than being a
+limitation to work around: a value that has to be computed once, with effects,
+is a function.
 
-**[E-CONST-REF]** A constant's value may not take a reference. Because it is
-evaluated at every mention, each mention would allocate a different slot: the
-same constant printed as two different references on one line, releasing it
-gave up a slot nothing else would ever name, and a loop reading it allocated
-one per iteration. This follows from the clause above and was worth saying
+Because the initializer is effect-free, when it runs is unobservable, and an
+engine may build the value once and hand out copies — which both of them do.
+This is a promise about cost, not only a permission: rebuilding per mention
+made every *read* of an n-element constant O(n), so a loop of k reads over a
+4 000-entry dispatch table took 632 ms where the same loop over a local copy
+took 1 ms. A constant is the shape this clause recommends for a table read in
+a loop, and reading one is O(1).
+
+**[E-CONST-REF]** A constant's value may not take a reference. A reference
+names a slot with a lifetime, and a constant has no place to put one: built
+per mention it allocates a different slot each time — the same constant
+printed as two different references on one line, and a loop reading it
+allocated one per iteration — and built once it is a slot any mention can
+`release`, leaving every other mention holding a stale reference. This follows from the clause above and was worth saying
 out loud, since it silently destroys the one thing a reference is for.
 
 However it got one. The rule looked for a literal `ref(...)` in the
@@ -1494,7 +1520,8 @@ several cores, and returns the results in **input order**. The result does not
 depend on how many cores ran it — including one — so a `par_map` is
 interchangeable with a `map` in every observable way.
 
-Any list, however it was built. A compiled backend may store a list of
+**[E-PAR-VALUES]** A parallel operation takes any list, however it was
+built. A compiled backend may store a list of
 scalars as raw words, chosen from the static type — and a runtime producer
 that builds a boxed list for the same type must not change what the program
 computes. `m.values().par_map(f)` built and then panicked `par_map on a
@@ -2609,6 +2636,8 @@ runs only under `grasm run`:
 | `==` on two bare `ref`s | `a == b` — comparing structs or lists *containing* refs compiles |
 | calling a function value through anything but a name | `TABLE[0](21)`, `(m.get(k) ?? d)(x)` — bind it with `let` first, then call it |
 | a UFCS call of a *generic* free function | `[1, 2].describe()` for `fn describe[T](xs: [T])` — write `describe([1, 2])` |
+| an effect handler as a **struct field** type | `type Box = { h: CfgHandler }` — bind the handler with `let` instead |
+| polymorphic recursion | `fn f[T](x: T) -> i64 { f([x]) }` — one compiled copy per type, and the types never stop growing |
 
 Each of these is a defect being worked off, not a design boundary. The list is
 checked against the implementation rather than remembered: if one of them
@@ -3767,6 +3796,10 @@ fn main() {
 //! [[7], [0]]
 //! [15, 20, 30] 1
 //! [[10, 21], [30, 40]] 2
+//! recv
+//! arg
+//! [[1, 9]]
+//! 6 [[5], []] [0]
 // Subexpressions evaluate left to right — including an assignment's target.
 //
 // The walk that writes a value is what evaluates the target's index, so doing
@@ -3796,6 +3829,17 @@ fn main() {
     var d = [[10, 20], [30, 40]]
     d[step(j)][step(j)] += 1
     print("{d} {j}")
+    // A mutating method names its receiver's place once too. Reading the
+    // receiver and then writing the result back walked the path twice, so
+    // `k[q.remove(0)].remove(0)` took an element from one list and deleted it
+    // from another.
+    var g = [[1]]
+    g[note("recv", 0)].push(note("arg", 9))
+    print("{g}")
+    var q = [1, 0]
+    var k = [[5], [6]]
+    let taken = k[q.remove(0)].remove(0)
+    print("{taken} {k} {q}")
 }
 
 fn step(inout n: i64) -> i64 {
@@ -4961,6 +5005,12 @@ fn main() {
 //! B(7)
 //! Some(1)
 //! None
+//! [(), ()]
+//! (1, ())
+//! Some(())
+//! ref#0.0
+//! [ref#0.0]
+//! Some(ref#0.0)
 // Every type's rendering, because a program's output is what its correctness
 // is judged on. Strings are unquoted even inside a collection, so `[a, b c]`
 // is two elements and the second contains a space.
@@ -4969,6 +5019,8 @@ type P = { x: i64, y: str }
 type S =
     | A
     | B(n: i64)
+
+type N = { v: i64 }
 
 fn main() {
     print("{-7}")
@@ -4999,6 +5051,19 @@ fn main() {
     print("{B(7)}")
     print("{[1].first()}")
     print("{[1].get(9)}")
+    // A value keeps its rendering inside a container. Both of these were
+    // boxed as plain integers by the compiled backend, so a list of units
+    // printed `[0, 0]` and a list of references printed the packed slot and
+    // generation as a number — a wrong answer rather than a refusal, and for
+    // the reference also a disclosure of where the slab put it.
+    print("{[(), ()]}")
+    print("{(1, ())}")
+    print("{Some(())}")
+    let r = ref(N{ v: 1 })
+    print("{r}")
+    print("{[r]}")
+    print("{Some(r)}")
+    release(r)
 }
 ```
 

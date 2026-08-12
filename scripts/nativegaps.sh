@@ -86,6 +86,31 @@ fn main() {
     }
 }'
 
+expect_refused "an effect handler as a struct field type" 'effect Cfg {
+    fn get() -> i64
+}
+type Box = { h: CfgHandler }
+fn main() {
+    let b = Box{ h: CfgHandler{ get: || 5 } }
+    with Cfg handled_by b.h {
+        print("{Cfg.get()}")
+    }
+}'
+
+# Not a shape anyone writes on purpose, but the build used to run until it was
+# killed — no diagnostic, unbounded memory — where every other gap here is a
+# refusal by name at build time.
+expect_refused "polymorphic recursion" 'fn f[T](x: T, n: i64) -> i64 {
+    if n <= 0 {
+        0
+    } else {
+        f([x], n - 1)
+    }
+}
+fn main() {
+    print("{f(1, 40)}")
+}'
+
 expect_refused "a range held as a value" 'fn main() {
     let r = 1..5
     var t = 0

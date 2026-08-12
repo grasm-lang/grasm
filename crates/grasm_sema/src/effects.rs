@@ -238,6 +238,32 @@ pub fn effects_of_program(program: &crate::loader::Program) -> BTreeSet<String> 
             all.extend(row.iter().cloned());
         }
     }
+    // Doc examples count, for the same reason and more sharply. `grasm test`
+    // runs the examples of every imported module, so a dependency's `///`
+    // block executes in the consumer's process — and unlike a test body it is
+    // *documentation*, which nobody reads as code that runs. A
+    // `capabilities = []` package could put `write_file` and
+    // `unsafe { getpid() }` in one and `grasm deps` reported `performs []`,
+    // manifest and lockfile agreeing that it did nothing.
+    for ex in crate::docs::examples(program) {
+        let module = ex.owner.rsplit_once("::").map(|(m, _)| m).unwrap_or("main");
+        let module = module.split(" #").next().unwrap_or(module).to_string();
+        let wrapped = format!("fn __doc_example() {{\n{}\n}}\n", ex.source);
+        let parsed = grasm_syntax::parse(&wrapped);
+        if !parsed.diagnostics.is_empty() {
+            continue;
+        }
+        for d in &parsed.module.decls {
+            let Decl::Fn(f) = d else { continue };
+            let mut row = BTreeSet::new();
+            let mut active = Vec::new();
+            let mut fnb = FnBindings::default();
+            collect_fn_bindings(&f.body, &ctx, &module, &mut fnb);
+            walk_block(&f.body, &module, &mut active, &ctx, &fnb, &mut row);
+            all.extend(row);
+        }
+    }
+
     // Tests and benchmarks count. They are not part of the package's
     // interface, and a reader reasonably expects the ceiling to be about what
     // *escapes* — but `grasm test` runs the tests of every imported module,

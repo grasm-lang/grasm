@@ -8,6 +8,10 @@
 //! [[7], [0]]
 //! [15, 20, 30] 1
 //! [[10, 21], [30, 40]] 2
+//! recv
+//! arg
+//! [[1, 9]]
+//! 6 [[5], []] [0]
 // Subexpressions evaluate left to right — including an assignment's target.
 //
 // The walk that writes a value is what evaluates the target's index, so doing
@@ -37,6 +41,17 @@ fn main() {
     var d = [[10, 20], [30, 40]]
     d[step(j)][step(j)] += 1
     print("{d} {j}")
+    // A mutating method names its receiver's place once too. Reading the
+    // receiver and then writing the result back walked the path twice, so
+    // `k[q.remove(0)].remove(0)` took an element from one list and deleted it
+    // from another.
+    var g = [[1]]
+    g[note("recv", 0)].push(note("arg", 9))
+    print("{g}")
+    var q = [1, 0]
+    var k = [[5], [6]]
+    let taken = k[q.remove(0)].remove(0)
+    print("{taken} {k} {q}")
 }
 
 fn step(inout n: i64) -> i64 {

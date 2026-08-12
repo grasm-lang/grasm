@@ -2,9 +2,24 @@
 
 use grasm_sema::analyze;
 
+/// The stack every entry point gives the compiler (`COMPILER_STACK` in the
+/// binary). The parser's nesting limit is set against this number, so a test
+/// that runs the checker on the harness's own small stack is not testing what
+/// ships: 300 nested blocks — well inside the limit, and fine from the
+/// command line — aborted the test binary with a stack overflow.
+const COMPILER_STACK: usize = 256 * 1024 * 1024;
+
 /// Analyze must not panic, whatever the input.
 fn survives(src: &str) {
-    let _ = analyze(src);
+    let src = src.to_string();
+    std::thread::Builder::new()
+        .stack_size(COMPILER_STACK)
+        .spawn(move || {
+            let _ = analyze(&src);
+        })
+        .expect("spawn")
+        .join()
+        .expect("the checker must diagnose, not panic");
 }
 
 #[test]

@@ -425,7 +425,11 @@ fn write_type(f: &mut fmt::Formatter<'_>, ty: &Type, defs: &TypeDefs) -> fmt::Re
             }
             write!(f, ")")
         }
-        Type::Var(v) => write!(f, "_{v}"),
+        // An unsolved inference variable prints as `_`, the way one is
+        // written. Numbering them leaked the checker's own counter into
+        // messages — `_3 ! Bad` names a type nobody can write, and the number
+        // changes when unrelated code above it does.
+        Type::Var(_) => write!(f, "_"),
         Type::Generic(i) => write!(f, "T{i}"),
         Type::Error => write!(f, "<error>"),
     }

@@ -656,6 +656,8 @@ runs only under `grasm run`:
 | `==` on two bare `ref`s | `a == b` — comparing structs or lists *containing* refs compiles |
 | calling a function value through anything but a name | `TABLE[0](21)`, `(m.get(k) ?? d)(x)` — bind it with `let` first, then call it |
 | a UFCS call of a *generic* free function | `[1, 2].describe()` for `fn describe[T](xs: [T])` — write `describe([1, 2])` |
+| an effect handler as a **struct field** type | `type Box = { h: CfgHandler }` — bind the handler with `let` instead |
+| polymorphic recursion | `fn f[T](x: T) -> i64 { f([x]) }` — one compiled copy per type, and the types never stop growing |
 
 Each of these is a defect being worked off, not a design boundary. The list is
 checked against the implementation rather than remembered: if one of them

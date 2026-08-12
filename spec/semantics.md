@@ -44,18 +44,27 @@ may call functions and name them as values — a dispatch table
 themselves perform nothing, since naming one is the permission to call it
 ([T-FN-VALUE-ROW]) and that charge lands on the constant: a table of `io`
 functions has no spelling as a constant, and writing the row on the constant's
-type does not change that. Build one in a function instead. It
-is evaluated wherever the name is used, so an effect in it would happen once
-per mention — which would make how often something happens a property of how
-many times a name appears. That is why the restriction exists rather than
-being a limitation to work around: a value that has to be computed once, with
-effects, is a function.
+type does not change that. Build one in a function instead. The initializer
+*is* what the name means, so an effect in it would happen once per mention —
+which would make how often something happens a property of how many times a
+name appears. That is why the restriction exists rather than being a
+limitation to work around: a value that has to be computed once, with effects,
+is a function.
 
-**[E-CONST-REF]** A constant's value may not take a reference. Because it is
-evaluated at every mention, each mention would allocate a different slot: the
-same constant printed as two different references on one line, releasing it
-gave up a slot nothing else would ever name, and a loop reading it allocated
-one per iteration. This follows from the clause above and was worth saying
+Because the initializer is effect-free, when it runs is unobservable, and an
+engine may build the value once and hand out copies — which both of them do.
+This is a promise about cost, not only a permission: rebuilding per mention
+made every *read* of an n-element constant O(n), so a loop of k reads over a
+4 000-entry dispatch table took 632 ms where the same loop over a local copy
+took 1 ms. A constant is the shape this clause recommends for a table read in
+a loop, and reading one is O(1).
+
+**[E-CONST-REF]** A constant's value may not take a reference. A reference
+names a slot with a lifetime, and a constant has no place to put one: built
+per mention it allocates a different slot each time — the same constant
+printed as two different references on one line, and a loop reading it
+allocated one per iteration — and built once it is a slot any mention can
+`release`, leaving every other mention holding a stale reference. This follows from the clause above and was worth saying
 out loud, since it silently destroys the one thing a reference is for.
 
 However it got one. The rule looked for a literal `ref(...)` in the
@@ -386,7 +395,8 @@ several cores, and returns the results in **input order**. The result does not
 depend on how many cores ran it — including one — so a `par_map` is
 interchangeable with a `map` in every observable way.
 
-Any list, however it was built. A compiled backend may store a list of
+**[E-PAR-VALUES]** A parallel operation takes any list, however it was
+built. A compiled backend may store a list of
 scalars as raw words, chosen from the static type — and a runtime producer
 that builds a boxed list for the same type must not change what the program
 computes. `m.values().par_map(f)` built and then panicked `par_map on a

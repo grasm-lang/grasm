@@ -18,6 +18,12 @@
 //! B(7)
 //! Some(1)
 //! None
+//! [(), ()]
+//! (1, ())
+//! Some(())
+//! ref#0.0
+//! [ref#0.0]
+//! Some(ref#0.0)
 // Every type's rendering, because a program's output is what its correctness
 // is judged on. Strings are unquoted even inside a collection, so `[a, b c]`
 // is two elements and the second contains a space.
@@ -26,6 +32,8 @@ type P = { x: i64, y: str }
 type S =
     | A
     | B(n: i64)
+
+type N = { v: i64 }
 
 fn main() {
     print("{-7}")
@@ -56,4 +64,17 @@ fn main() {
     print("{B(7)}")
     print("{[1].first()}")
     print("{[1].get(9)}")
+    // A value keeps its rendering inside a container. Both of these were
+    // boxed as plain integers by the compiled backend, so a list of units
+    // printed `[0, 0]` and a list of references printed the packed slot and
+    // generation as a number — a wrong answer rather than a refusal, and for
+    // the reference also a disclosure of where the slab put it.
+    print("{[(), ()]}")
+    print("{(1, ())}")
+    print("{Some(())}")
+    let r = ref(N{ v: 1 })
+    print("{r}")
+    print("{[r]}")
+    print("{Some(r)}")
+    release(r)
 }

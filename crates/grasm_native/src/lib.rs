@@ -36,6 +36,11 @@ const INTERNAL: &str = "\u{1}internal\u{1}";
 /// closes the two routes. See MASTERPLAN §8.3.
 const REGION_SWEEP: bool = false;
 
+/// How deeply a type argument to a generic may nest before the backend calls
+/// it polymorphic recursion. Generous: 32 nested lists is far past anything
+/// written on purpose, and the shape that hits it grows without bound.
+const MAX_TYPE_DEPTH: usize = 32;
+
 pub struct Unsupported {
     pub span: Span,
     pub what: String,
@@ -81,6 +86,23 @@ enum VType {
 
 impl VType {
     /// A symbol-safe name, for monomorphized function symbols.
+    /// How deeply the type nests. Monomorphization instantiates one machine
+    /// copy per type argument, so polymorphic recursion — `fn f[T](x: T) { f([x]) }`
+    /// — asks for `f[i64]`, `f[[i64]]`, `f[[[i64]]]` and never stops. The
+    /// build ran until it was killed, with no diagnostic and unbounded
+    /// memory, where §11 promises a refusal by name.
+    fn depth(&self) -> usize {
+        1 + match self {
+            VType::List(t) | VType::Ref(t) | VType::Option(t) => t.depth(),
+            VType::Fallible(a, b) | VType::Map(a, b) => a.depth().max(b.depth()),
+            VType::Tuple(ts) => ts.iter().map(|t| t.depth()).max().unwrap_or(0),
+            VType::Fn(ps, r) => {
+                ps.iter().map(|t| t.depth()).max().unwrap_or(0).max(r.depth())
+            }
+            _ => 0,
+        }
+    }
+
     fn mangle(&self) -> String {
         match self {
             VType::I64 => "i64".into(),
@@ -475,6 +497,8 @@ impl<'m> Codegen<'m> {
             ("grasm_list_len", vec![i64t], Some(i64t)),
             ("grasm_list_get", vec![i64t, i64t], Some(i64t)),
             ("grasm_box_i64", vec![i64t], Some(i64t)),
+            ("grasm_box_unit", vec![], Some(i64t)),
+            ("grasm_box_ref", vec![i64t], Some(i64t)),
             ("grasm_box_f64", vec![f64t], Some(i64t)),
             ("grasm_box_bool", vec![i8t], Some(i64t)),
             ("grasm_unbox_i64", vec![i64t], Some(i64t)),
@@ -929,6 +953,17 @@ impl<'m> Codegen<'m> {
             return nope(span, format!("calling `{name}` with a different arity"));
         }
         let subst = self.infer_generic_subst(&decl, arg_types, span)?;
+        // A type argument that keeps growing is polymorphic recursion, and
+        // one machine copy per type means the worklist never empties.
+        if let Some(deep) = subst.values().find(|t| t.depth() > MAX_TYPE_DEPTH) {
+            return nope(
+                span,
+                format!(
+                    "a generic function whose type argument keeps growing (`{name}` here, reached a type nested {} deep) — polymorphic recursion needs one compiled copy per type, and there is no end to them",
+                    deep.depth()
+                ),
+            );
+        }
 
         let suffix: Vec<String> = decl
             .generics
@@ -2613,7 +2648,19 @@ fn needs_element_hint(e: &Expr) -> bool {
         // literal had nowhere left to get it — `let g: [[i64]] = [[]]` was
         // refused with its own annotation in view.
         Expr::List(items, _) => items.is_empty() || items.iter().any(needs_element_hint),
-        Expr::Map(entries, _) => entries.is_empty(),
+        Expr::Map(entries, _) => {
+            entries.is_empty() || entries.iter().any(|(_, v)| needs_element_hint(v))
+        }
+        Expr::Tuple(items, _) => items.iter().any(needs_element_hint),
+        // `Some(|n| n + 1)` is the closure one level in. The payload's type
+        // is the annotation's, and passing it through is what lets the
+        // closure be written where the type is already named.
+        Expr::Call { callee, args, .. } => {
+            matches!(&**callee, Expr::Ident(id)
+                if matches!(id.name.as_str(), "Some" | "Ok" | "Err"))
+                && args.len() == 1
+                && needs_element_hint(&args[0])
+        }
         _ => false,
     }
 }
@@ -2781,7 +2828,9 @@ fn scalar_kind_i64(vt: &VType) -> Option<i64> {
         VType::I64 => Some(0),
         // A reference is one word, so a list of them is an unboxed scalar
         // list like any other — which is what makes an object graph cheap.
-        VType::Ref(_) => Some(0),
+        // Its own kind, not `i64`: stored the same, printed as the slot it
+        // names rather than as the packed word.
+        VType::Ref(_) => Some(3),
         VType::F64 => Some(1),
         VType::Bool => Some(2),
         _ => None,
@@ -2924,6 +2973,43 @@ impl FnCx<'_, '_> {
     /// used any other way — passed to a function, pushed to, captured by a
     /// closure — is left alone, because any of those can change its refcount
     /// or its length and invalidate the pointer.
+    /// Builds each module constant a loop mentions, once, before the loop.
+    ///
+    /// A constant is its initializer, and the initializer is effect-free, so
+    /// building it per mention is only ever a cost — an O(n) rebuild inside
+    /// an O(k) loop. [E-CONST] recommends a constant for a dispatch table,
+    /// which is read in a loop by definition. Bound under a name no program
+    /// can write, so the ordinary scope teardown releases it on every exit
+    /// path (`break`, `return`, falling out) without a second mechanism.
+    fn pin_loop_consts(&mut self, body: &grasm_syntax::ast::Block) -> CResult<()> {
+        let mut names: Vec<String> = Vec::new();
+        collect_idents_block(body, &mut names);
+        names.sort();
+        names.dedup();
+        for name in names {
+            // A local of the same name shadows the constant.
+            if self.lookup(&name).is_some() {
+                continue;
+            }
+            let pin = format!(" const {name}");
+            if self.lookup(&pin).is_some() {
+                continue;
+            }
+            let Some(init) = self.const_of(&name) else {
+                continue;
+            };
+            // A constant whose initializer this backend cannot compile is
+            // left alone: the mention itself will report it, at its own span.
+            let Ok((v, vt)) = self.eval_expr_val(&init) else {
+                continue;
+            };
+            let var = self.new_var(&vt);
+            self.b.def_var(var, v);
+            self.bind(&pin, var, vt);
+        }
+        Ok(())
+    }
+
     fn pin_loop_lists(&mut self, body: &grasm_syntax::ast::Block) -> CResult<()> {
         let mut scope: HashMap<String, (Value, Value, VType)> = HashMap::new();
         let candidates: Vec<String> = indexed_only_lists(body);
@@ -3522,6 +3608,7 @@ impl FnCx<'_, '_> {
                 // block is still open — before the jump that closes it.
                 // Lists the body only indexes get a raw pointer for the whole
                 // loop, turning each access from a call into a load.
+                self.pin_loop_consts(body)?;
                 self.pin_loop_lists(body)?;
                 let header = self.b.create_block();
                 let body_blk = self.b.create_block();
@@ -3860,14 +3947,17 @@ impl FnCx<'_, '_> {
         match vt {
             // Unit has no runtime payload; box a placeholder so `Ok(())` and
             // unit-typed containers still hold a valid pointer.
-            VType::Unit => {
-                let z = self.b.ins().iconst(types::I64, 0);
-                self.call_rt("grasm_box_i64", &[z]).unwrap()
-            }
+            // Boxed as itself, not as the integer 0: a container holding
+            // units printed `[0, 0]` where the interpreter printed
+            // `[(), ()]`, which is a wrong answer rather than a refusal.
+            VType::Unit => self.call_rt("grasm_box_unit", &[]).unwrap(),
             // A reference is a packed word, not a pointer. Falling through to
             // "already boxed" below stored the packed value *as* a pointer,
-            // and reading it back dereferenced an integer.
-            VType::I64 | VType::Ref(_) => self.call_rt("grasm_box_i64", &[v]).unwrap(),
+            // and reading it back dereferenced an integer. Boxed as an
+            // integer instead, it printed as the packed word — the slab slot
+            // and generation, as a number nobody can read.
+            VType::Ref(_) => self.call_rt("grasm_box_ref", &[v]).unwrap(),
+            VType::I64 => self.call_rt("grasm_box_i64", &[v]).unwrap(),
             VType::F64 => self.call_rt("grasm_box_f64", &[v]).unwrap(),
             VType::Bool => self.call_rt("grasm_box_bool", &[v]).unwrap(),
             // Already boxed: ownership transfers into the container.
@@ -3949,6 +4039,77 @@ impl FnCx<'_, '_> {
                 let m = self.call_rt("grasm_map_new", &[]).unwrap();
                 return Ok(Some((m, VType::Map(k.clone(), v.clone()))));
             }
+            // A value that cannot say its own type — a closure, an empty
+            // container — takes it from the annotation, exactly as a list's
+            // elements do. `let m: Map[str, fn(i64) -> i64] = {"inc": |n| n +
+            // 1}` was refused for having no type to read the parameters from,
+            // with the type written on the line above.
+            if entries.iter().any(|(_, ve)| needs_element_hint(ve)) {
+                let (k, v) = (k.clone(), v.clone());
+                let mut m = self.call_rt("grasm_map_new", &[]).unwrap();
+                for (ke, ve) in entries {
+                    let (kv, kvt) = self.eval_expr_expecting(ke, Some(&k))?;
+                    let kb = self.box_value(kv, &kvt);
+                    let (vv, vvt) = self.eval_expr_expecting(ve, Some(&v))?;
+                    let vb = self.box_value(vv, &vvt);
+                    m = self.call_rt("grasm_map_set", &[m, kb, vb]).unwrap();
+                }
+                return Ok(Some((m, VType::Map(k, v))));
+            }
+        }
+        if let (Expr::Tuple(items, _), Some(VType::Tuple(ts))) = (e, expected) {
+            if !items.is_empty()
+                && items.len() == ts.len()
+                && items.iter().any(needs_element_hint)
+            {
+                let ts = ts.clone();
+                let mut list = self.call_rt("grasm_list_new", &[]).unwrap();
+                let mut got = Vec::with_capacity(items.len());
+                for (item, want) in items.iter().zip(&ts) {
+                    let (v, vt) = self.eval_expr_expecting(item, Some(want))?;
+                    let bx = self.box_value(v, &vt);
+                    list = self.call_rt("grasm_list_push", &[list, bx]).unwrap();
+                    got.push(vt);
+                }
+                let sealed = self.call_rt("grasm_tuple_seal", &[list]).unwrap();
+                return Ok(Some((sealed, VType::Tuple(got))));
+            }
+        }
+        // `Some(x)` / `Ok(x)` / `Err(x)`: the payload's expected type is the
+        // one written on the container.
+        if let Expr::Call { callee, args, .. } = e {
+            if let Expr::Ident(id) = &**callee {
+                let payload = match (id.name.as_str(), expected) {
+                    ("Some", Some(VType::Option(t))) => Some((*t).clone()),
+                    ("Ok", Some(VType::Fallible(t, _))) => Some((*t).clone()),
+                    ("Err", Some(VType::Fallible(_, t))) => Some((*t).clone()),
+                    _ => None,
+                };
+                if let Some(want) = payload {
+                    if args.len() == 1
+                        && needs_element_hint(&args[0])
+                        && self.lookup(&id.name).is_none()
+                    {
+                        let (pv, pvt) = self.eval_expr_expecting(&args[0], Some(&want))?;
+                        let boxed = self.box_value(pv, &pvt);
+                        let out = match id.name.as_str() {
+                            "Some" => (
+                                self.make_variant("Option", "Some", &[boxed])?,
+                                VType::Option(Box::new(pvt)),
+                            ),
+                            "Ok" => (
+                                self.call_rt("grasm_ok_new", &[boxed]).unwrap(),
+                                VType::Fallible(Box::new(pvt), Box::new(VType::Any)),
+                            ),
+                            _ => (
+                                self.call_rt("grasm_err_new", &[boxed]).unwrap(),
+                                VType::Fallible(Box::new(VType::Any), Box::new(pvt)),
+                            ),
+                        };
+                        return Ok(Some(out));
+                    }
+                }
+            }
         }
         if let (Expr::Call { callee, args, .. }, Some(VType::Map(k, v))) = (e, expected) {
             if args.is_empty() {
@@ -3992,6 +4153,20 @@ impl FnCx<'_, '_> {
                 self.b.ins().iconst(types::I8, i64::from(*v)),
                 VType::Bool,
             ))),
+            // Built once before the enclosing loop, if there was one.
+            Expr::Ident(id)
+                if self.lookup(&id.name).is_none()
+                    && self.lookup(&format!(" const {}", id.name)).is_some() =>
+            {
+                let (var, vt) = self
+                    .lookup(&format!(" const {}", id.name))
+                    .expect("just checked");
+                let v = self.b.use_var(var);
+                if vt.boxed() {
+                    self.call_rt("grasm_val_inc", &[v]);
+                }
+                Ok(Some((v, vt)))
+            }
             Expr::Ident(id) if self.lookup(&id.name).is_none() && self.const_of(&id.name).is_some() => {
                 // A module-level constant. The initializer is effect-free, so
                 // compiling it here is the whole of what the name means — no
@@ -4035,7 +4210,10 @@ impl FnCx<'_, '_> {
                 let elem_t = self.list_elem_type(items, *span)?;
                 let mut list = self.new_list_of(&elem_t);
                 for item in items {
-                    let (mut v, vt) = self.eval_expr_val(item)?;
+                    // The element type reaches every element, not only the
+                    // annotated case: in `[double, |n| n + 1]` the named
+                    // function is what says what the closure's parameter is.
+                    let (mut v, vt) = self.eval_expr_expecting(item, Some(&elem_t))?;
                     // Int-literal → f64 adaptation inside float lists.
                     let vt = if elem_t == VType::F64 && vt == VType::I64 {
                         v = self.b.ins().fcvt_from_sint(types::F64, v);
@@ -4209,7 +4387,13 @@ impl FnCx<'_, '_> {
     }
 
     fn list_elem_type(&mut self, items: &[Expr], span: Span) -> CResult<VType> {
-        let Some(first) = items.first() else {
+        // The first element that can say its own type. A closure cannot, so
+        // `[|n| n + 1, double]` has to read the answer off `double`.
+        let first = items
+            .iter()
+            .find(|i| !needs_element_hint(i))
+            .or_else(|| items.first());
+        let Some(first) = first else {
             // The checker resolved this one against the whole body, which is
             // the only place the answer exists: an empty literal has nothing
             // to read a type off.
@@ -4419,10 +4603,13 @@ impl FnCx<'_, '_> {
         // The same mutating methods on a nested place: `bag.seen.set(k, v)`.
         // Reached only when the receiver is not a plain variable, so the
         // variable case above still takes the shorter path.
-        if matches!(name.name.as_str(), "set" | "delete" | "sort" | "pop" | "remove")
-            && matches!(recv, Expr::Field { .. } | Expr::Index { .. })
+        if matches!(
+            name.name.as_str(),
+            "set" | "delete" | "sort" | "sort_by" | "pop" | "remove"
+        ) && matches!(recv, Expr::Field { .. } | Expr::Index { .. })
         {
             let (root, path) = self.place_path(recv)?;
+            self.pin_place_indices(&path)?;
             let Some((var, root_t)) = self.lookup(&root.name) else {
                 return nope(root.span, "a mutating method on an unknown variable");
             };
@@ -4486,6 +4673,39 @@ impl FnCx<'_, '_> {
                 // `vm.stack.pop()` — the core operation of anything holding a
                 // stack in a struct, and the reason a whole VM had to use
                 // `slice` instead.
+                // The same sort as on a plain variable. Left out, this fell
+                // through to the UFCS path and was refused as "a UFCS call of
+                // a generic function", naming neither the shape nor the
+                // reason — for `s.rows.sort_by(key)`, which is where a sort
+                // by an extracted key is usually written.
+                (VType::List(e), "sort_by") => {
+                    let elem_t = (**e).clone();
+                    let (param, body) = match self.desugar_fn_arg(&args[0], false) {
+                        Some(pb) => pb,
+                        None => match &args[0] {
+                            Expr::Closure { params, body, .. } if params.len() == 1 => {
+                                (params[0].clone(), (**body).clone())
+                            }
+                            other => {
+                                return nope(
+                                    other.span(),
+                                    "sort_by with something other than a one-argument function",
+                                )
+                            }
+                        },
+                    };
+                    let cur = self.b.use_var(var);
+                    let listv = self.read_place_boxed(cur, &path, &root_t, true)?;
+                    self.call_rt("grasm_val_inc", &[listv]);
+                    let (keys, _) =
+                        self.emit_list_transform(listv, &elem_t, &param, &body, true)?;
+                    let newlist = self.call_rt("grasm_list_sort_by", &[listv, keys]).unwrap();
+                    self.call_rt("grasm_val_dec", &[keys]);
+                    let cur2 = self.b.use_var(var);
+                    let updated = self.write_place(span, cur2, &path, &root_t, newlist)?;
+                    self.b.def_var(var, updated);
+                    return Ok(None);
+                }
                 (VType::List(e), "pop") => {
                     let et = e.clone();
                     let ptr_ty = self.cg.module.target_config().pointer_type();
@@ -4536,6 +4756,7 @@ impl FnCx<'_, '_> {
         // Mutating list push on a nested place: `bag.items.push(v)`.
         if name.name == "push" && matches!(recv, Expr::Field { .. } | Expr::Index { .. }) {
             let (root, path) = self.place_path(recv)?;
+            self.pin_place_indices(&path)?;
             let Some((var, root_t)) = self.lookup(&root.name) else {
                 return nope(root.span, "push on an unknown variable");
             };
@@ -7145,6 +7366,16 @@ impl FnCx<'_, '_> {
                 let rt = self.probe_type(recv)?;
                 match rt {
                     VType::Struct(sname) => self.struct_field_type(&sname, &name.name, *span)?,
+                    // Reading *through* a reference is an ordinary field
+                    // read, and compiles — but the probe did not know that,
+                    // so `let f = |_u| r.v` was refused for a type it could
+                    // work out, while the same read outside a closure built.
+                    VType::Ref(inner) => match *inner {
+                        VType::Struct(sname) => {
+                            self.struct_field_type(&sname, &name.name, *span)?
+                        }
+                        _ => return nope(*span, "inferring this type"),
+                    },
                     VType::Tuple(parts) => match name.name.parse::<usize>() {
                         Ok(i) if i < parts.len() => parts[i].clone(),
                         _ => return nope(*span, "inferring this type"),
@@ -7565,6 +7796,26 @@ impl FnCx<'_, '_> {
     }
 
     /// Splits a place expression into its root variable and access path.
+    /// Evaluates a place path's index expressions now, so everything that
+    /// walks the path afterwards reuses the values.
+    ///
+    /// A mutating method reads its receiver and writes it back, each walking
+    /// the path — so `g[f()].push(v)` called `f` twice, and once more for the
+    /// argument's own walk. It also has to happen *before* the argument is
+    /// evaluated, since the receiver is written first ([E-ORDER-LTR]).
+    fn pin_place_indices(&mut self, path: &[PlaceSeg<'_>]) -> CResult<()> {
+        for seg in path {
+            if let PlaceSeg::Index(ix) = seg {
+                let key = ix.span().start;
+                if !self.index_vals.contains_key(&key) {
+                    let v = self.eval_expr_val(ix)?;
+                    self.index_vals.insert(key, v);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// An index expression's value, taken from the pre-evaluated cache when
     /// this is an assignment target.
     fn index_value(&mut self, ix: &Expr) -> CResult<(Value, VType)> {

@@ -149,6 +149,12 @@ pub enum ScalarKind {
     I64,
     F64,
     Bool,
+    /// A Tier-2 reference: one word, like an `i64`, but rendered as the slot
+    /// it names. Stored inline for the same reason an integer is — an object
+    /// graph is a list of references, and a heap cell each would undo the
+    /// tier — but it is not an integer, and printed as one it disclosed the
+    /// packed slot and generation as a raw number.
+    Ref,
 }
 
 impl ScalarKind {
@@ -156,6 +162,7 @@ impl ScalarKind {
         match k {
             0 => ScalarKind::I64,
             1 => ScalarKind::F64,
+            3 => ScalarKind::Ref,
             _ => ScalarKind::Bool,
         }
     }
@@ -512,6 +519,15 @@ impl std::fmt::Display for RtStr {
 
 pub enum RtPayload {
     I64(i64),
+    /// The unit value. No payload, but it renders as `()` and a container can
+    /// hold one — boxing it as `I64(0)` made `[(), ()]` print `[0, 0]` under
+    /// a compiled build and `[(), ()]` under the interpreter.
+    Unit,
+    /// A Tier-2 reference: slot index and generation packed in one word,
+    /// exactly as the compiled backend carries it. Boxed as a plain integer,
+    /// a `ref` inside a list printed as `4294967296` — the packed word — which
+    /// is both wrong and a disclosure of where the slab put it.
+    Ref(i64),
     F64(f64),
     Bool(bool),
     Str(RtStr),
@@ -1152,6 +1168,7 @@ pub unsafe extern "C" fn grasm_par_filter_scalar(
         RtPayload::List(items) => match items.first().map(|&p| &(*p).payload) {
             Some(RtPayload::F64(_)) => ScalarKind::F64,
             Some(RtPayload::Bool(_)) => ScalarKind::Bool,
+            Some(RtPayload::Ref(_)) => ScalarKind::Ref,
             _ => ScalarKind::I64,
         },
         _ => grasm_panic_msg_str("par_filter on a non-list"),
@@ -1248,6 +1265,7 @@ pub unsafe extern "C" fn grasm_par_filter_scalar(
 fn scalar_box(kind: ScalarKind, bits: i64) -> *mut RtVal {
     match kind {
         ScalarKind::I64 => grasm_box_i64(bits),
+        ScalarKind::Ref => grasm_box_ref(bits),
         ScalarKind::F64 => alloc(RtPayload::F64(f64::from_bits(bits as u64))),
         ScalarKind::Bool => interned_bool(bits != 0),
     }
@@ -1258,6 +1276,7 @@ fn scalar_box(kind: ScalarKind, bits: i64) -> *mut RtVal {
 unsafe fn scalar_unbox_val(kind: ScalarKind, v: *mut RtVal) -> i64 {
     match (kind, &(*v).payload) {
         (ScalarKind::I64, RtPayload::I64(x)) => *x,
+        (ScalarKind::Ref, RtPayload::Ref(x)) => *x,
         (ScalarKind::F64, RtPayload::F64(x)) => x.to_bits() as i64,
         (ScalarKind::F64, RtPayload::I64(x)) => (*x as f64).to_bits() as i64,
         (ScalarKind::Bool, RtPayload::Bool(x)) => i64::from(*x),
@@ -1272,7 +1291,7 @@ unsafe fn scalar_unbox_val(kind: ScalarKind, v: *mut RtVal) -> i64 {
 fn scalar_cmp(kind: ScalarKind, a: i64, b: i64) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     match kind {
-        ScalarKind::I64 => a.cmp(&b),
+        ScalarKind::I64 | ScalarKind::Ref => a.cmp(&b),
         // A total order — see `cmp_vals`. An unboxed list of floats is the
         // one most likely to hold a NaN and be sorted.
         ScalarKind::F64 => f64::from_bits(a as u64).total_cmp(&f64::from_bits(b as u64)),
@@ -1293,6 +1312,10 @@ fn scalar_eq(kind: ScalarKind, a: i64, b: i64) -> bool {
 fn scalar_display(kind: ScalarKind, bits: i64) -> String {
     match kind {
         ScalarKind::I64 => bits.to_string(),
+        ScalarKind::Ref => {
+            let (i, gen) = unpack_ref(bits);
+            format!("ref#{i}.{gen}")
+        }
         ScalarKind::F64 => float_text(f64::from_bits(bits as u64)),
         ScalarKind::Bool => (bits != 0).to_string(),
     }
@@ -1537,6 +1560,20 @@ pub extern "C" fn grasm_box_i64(v: i64) -> *mut RtVal {
     }
 }
 
+/// Boxes the unit value. One allocation, like any other box: unit is rare
+/// inside containers and not worth a shared singleton whose refcount every
+/// container would have to respect.
+#[no_mangle]
+pub extern "C" fn grasm_box_unit() -> *mut RtVal {
+    alloc(RtPayload::Unit)
+}
+
+/// Boxes a packed reference so it keeps its identity as one.
+#[no_mangle]
+pub extern "C" fn grasm_box_ref(v: i64) -> *mut RtVal {
+    alloc(RtPayload::Ref(v))
+}
+
 #[no_mangle]
 pub extern "C" fn grasm_box_f64(v: f64) -> *mut RtVal {
     alloc(RtPayload::F64(v))
@@ -1553,6 +1590,13 @@ pub extern "C" fn grasm_box_bool(v: i8) -> *mut RtVal {
 pub unsafe extern "C" fn grasm_unbox_i64(v: *mut RtVal) -> i64 {
     match &(*v).payload {
         RtPayload::I64(x) => *x,
+        // A reference is one machine word, and the compiled backend keeps it
+        // in an integer register. It boxes as itself so it can be told apart
+        // when rendered, and unboxes back into that word.
+        RtPayload::Ref(x) => *x,
+        // Unit has one value and no bits. Something has to come back for
+        // `let u = xs[0]` where the list holds units.
+        RtPayload::Unit => 0,
         _ => grasm_panic_msg_str("unbox: not an i64"),
     }
 }
@@ -1590,6 +1634,14 @@ pub unsafe extern "C" fn grasm_out_val(v: *mut RtVal) {
 unsafe fn display(v: *mut RtVal) -> String {
     rt_stack_check();
     match &(*v).payload {
+        RtPayload::Unit => "()".to_string(),
+        // The slot it names, not what it points at — the value may already be
+        // gone, and reading it to render would be the use-after-free the tier
+        // exists to prevent.
+        RtPayload::Ref(r) => {
+            let (i, gen) = unpack_ref(*r);
+            format!("ref#{i}.{gen}")
+        }
         RtPayload::Tuple(items) => {
             let parts: Vec<String> = items.iter().map(|&i| display(i)).collect();
             format!("({})", parts.join(", "))
@@ -1984,6 +2036,11 @@ unsafe fn val_eq(a: *mut RtVal, b: *mut RtVal) -> bool {
     rt_stack_check();
     match (&(*a).payload, &(*b).payload) {
         (RtPayload::I64(x), RtPayload::I64(y)) => x == y,
+        // Unit has exactly one value, so two of them are always equal.
+        (RtPayload::Unit, RtPayload::Unit) => true,
+        // Two references are the same reference when they name the same slot
+        // at the same generation — identity, not the values they point at.
+        (RtPayload::Ref(x), RtPayload::Ref(y)) => x == y,
         (RtPayload::F64(x), RtPayload::F64(y)) => x == y,
         (RtPayload::Bool(x), RtPayload::Bool(y)) => x == y,
         (RtPayload::Str(x), RtPayload::Str(y)) => x == y,
@@ -2009,6 +2066,7 @@ unsafe fn val_eq(a: *mut RtVal, b: *mut RtVal) -> bool {
                     .zip(items)
                     .all(|(bits, &boxed)| match (*kind, &(*boxed).payload) {
                         (ScalarKind::I64, RtPayload::I64(x)) => bits == *x,
+                        (ScalarKind::Ref, RtPayload::Ref(x)) => bits == *x,
                         (ScalarKind::F64, RtPayload::F64(x)) => {
                             f64::from_bits(bits as u64) == *x
                         }
@@ -3112,6 +3170,7 @@ pub unsafe extern "C" fn grasm_list_contains(v: *mut RtVal, needle: *mut RtVal) 
         Items::Boxed(items) => items.iter().any(|&i| val_eq(i, needle)),
         Items::Scalar(kind, data) => match (kind, &(*needle).payload) {
             (ScalarKind::I64, RtPayload::I64(x)) => data.iter().any(|b| b == *x),
+            (ScalarKind::Ref, RtPayload::Ref(x)) => data.iter().any(|b| b == *x),
             (ScalarKind::F64, RtPayload::F64(x)) => {
                 data.iter().any(|b| f64::from_bits(b as u64) == *x)
             }
