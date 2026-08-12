@@ -99,7 +99,7 @@ fn main() {
     }
 }'
 
-expect_refused "exit as a match arm value" 'fn pick(n: i64) -> i64 {
+expect_compiled "exit as a match arm value" 'fn pick(n: i64) -> i64 {
     match n {
         0 -> exit(4)
         _ -> n

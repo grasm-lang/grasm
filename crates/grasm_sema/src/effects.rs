@@ -153,9 +153,18 @@ pub fn effects_by_package(
     let mut out: std::collections::BTreeMap<String, BTreeSet<String>> =
         std::collections::BTreeMap::new();
     for (key, row) in &ctx.rows {
-        let Some((module, _)) = key.rsplit_once("::") else {
+        let Some((module, name)) = key.rsplit_once("::") else {
             continue;
         };
+        // Only what *escapes* the package, as `effects_of_program` counts it:
+        // a `pub` row a consumer has to handle, or the entry point. A private
+        // helper's effect that the package handles three lines later is not a
+        // capability, and charging it demanded one named after an internal
+        // effect nobody outside can see.
+        let escapes = ctx.fns[key].is_pub || name == "main";
+        if !escapes {
+            continue;
+        }
         // The package a module belongs to is the longest declared prefix.
         let owner = program
             .deps
@@ -913,6 +922,15 @@ is installed, not around the calls to it ([E-HANDLER-OWN-ROW])",
             collect_fn_bindings(body, &ctx, &f.name, &mut fnb);
             check_par_map_block(body, &f.name, &ctx, &fnb, &mut diags);
             check_fn_args_block(body, &f.name, &ctx, &fnb, &mut diags);
+            let mut declared_bindings = HashMap::new();
+            check_declared_rows_block(
+                body,
+                &f.name,
+                &ctx,
+                &fnb,
+                &mut declared_bindings,
+                &mut diags,
+            );
         }
     }
 
@@ -974,6 +992,93 @@ fn par_fn_row(
 /// not inferred, so nothing else compares what the caller hands over against
 /// what the callee promised — and without it `fn(i64) -> i64`, which says it
 /// performs nothing, would accept a function that prints.
+/// A value put in a binding whose written type names a row must fit it.
+///
+/// The argument check below covers a function *passed* to a declared
+/// parameter. Nothing covered a function *stored*: `let f: fn() -> i64 =
+/// id(closure_that_prints)` and `keep = [1].map(|_| || Cfg.value())` both
+/// promised an empty row and kept a value that had one, and the second
+/// carried a handler's discharge out of its `with` block
+/// ([T-FN-TYPE-ROW-CARRIED], [E-HANDLER-MISSING]).
+fn check_declared_rows_block(
+    b: &Block,
+    current: &str,
+    ctx: &Ctx,
+    fnb: &FnBindings,
+    declared: &mut HashMap<String, BTreeSet<String>>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    for stmt in &b.stmts {
+        match stmt {
+            Stmt::Let { name, ty: Some(t), init, .. } => {
+                if let Some(allowed) = declared_row_within(t) {
+                    declared.insert(name.name.clone(), allowed.clone());
+                    report_row_over(init, current, ctx, fnb, &allowed, diags);
+                }
+            }
+            Stmt::Assign { target, value, .. } => {
+                if let Expr::Ident(id) = target {
+                    if let Some(allowed) = declared.get(&id.name).cloned() {
+                        report_row_over(value, current, ctx, fnb, &allowed, diags);
+                    }
+                }
+            }
+            Stmt::While { body, .. }
+            | Stmt::For { body, .. }
+            | Stmt::With { body, .. }
+            | Stmt::Parallel { body, .. }
+            | Stmt::Spawn { body, .. } => {
+                check_declared_rows_block(body, current, ctx, fnb, declared, diags)
+            }
+            _ => {}
+        }
+    }
+}
+
+fn report_row_over(
+    e: &Expr,
+    current: &str,
+    ctx: &Ctx,
+    fnb: &FnBindings,
+    allowed: &BTreeSet<String>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let mut row = BTreeSet::new();
+    carried_row(e, current, ctx, fnb, 0, &mut row);
+    let over: Vec<&String> = row.difference(allowed).collect();
+    if over.is_empty() {
+        return;
+    }
+    let list = over
+        .iter()
+        .map(|x| format!("`{x}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let shown = if allowed.is_empty() {
+        "performs nothing".to_string()
+    } else {
+        format!(
+            "performs only {}",
+            allowed
+                .iter()
+                .map(|x| format!("`{x}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    diags.push(
+        Diagnostic::error(
+            e.span(),
+            format!(
+                "this type says the function {shown}, but the value performs {list}"
+            ),
+        )
+        .with_help(
+            "widen the written type — `fn(..) -> .. / {io}` — or hand over a function that does not perform it",
+        ),
+    );
+}
+
 fn check_fn_args_block(
     b: &Block,
     current: &str,
@@ -984,7 +1089,15 @@ fn check_fn_args_block(
     let mut calls = Vec::new();
     collect_calls_block(b, &mut calls);
     for (callee, args, _) in calls {
-        let Some(qual) = ctx.resolve_call(current, callee) else {
+        // `helper.run(f)` is the same call as `run(f)` next door, and the
+        // declared row on its parameter is the same promise. Only the bare
+        // spelling was collected, so a function value crossing a module
+        // boundary was never held to what it was handed to.
+        let qual = match callee.split_once('.') {
+            Some((alias, name)) => ctx.resolve_qualified(current, alias, name),
+            None => ctx.resolve_call(current, &callee),
+        };
+        let Some(qual) = qual else {
             continue;
         };
         let decl = ctx.fns[&qual];
@@ -1033,13 +1146,13 @@ fn check_fn_args_block(
 }
 
 /// Every direct call in a block, as (callee name, args, span).
-fn collect_calls_block<'e>(b: &'e Block, out: &mut Vec<(&'e str, &'e [Expr], Span)>) {
+fn collect_calls_block<'e>(b: &'e Block, out: &mut Vec<(String, &'e [Expr], Span)>) {
     for s in &b.stmts {
         collect_calls_stmt(s, out);
     }
 }
 
-fn collect_calls_stmt<'e>(s: &'e Stmt, out: &mut Vec<(&'e str, &'e [Expr], Span)>) {
+fn collect_calls_stmt<'e>(s: &'e Stmt, out: &mut Vec<(String, &'e [Expr], Span)>) {
     match s {
         Stmt::Let { init, .. } => collect_calls_expr(init, out),
         Stmt::Assign { target, value, .. } => {
@@ -1064,12 +1177,38 @@ fn collect_calls_stmt<'e>(s: &'e Stmt, out: &mut Vec<(&'e str, &'e [Expr], Span)
     }
 }
 
-fn collect_calls_expr<'e>(e: &'e Expr, out: &mut Vec<(&'e str, &'e [Expr], Span)>) {
+fn collect_calls_expr<'e>(e: &'e Expr, out: &mut Vec<(String, &'e [Expr], Span)>) {
     match e {
         Expr::Call { callee, args, span } => {
-            if let Expr::Ident(id) = &**callee {
-                out.push((id.name.as_str(), args.as_slice(), *span));
+            match &**callee {
+                Expr::Ident(id) => out.push((id.name.clone(), args.as_slice(), *span)),
+                // `helper.run(f)` parses as a call on a field of the module
+                // alias, and is the same call as the bare spelling.
+                Expr::Field { recv, name, .. } => {
+                    if let Expr::Ident(alias) = &**recv {
+                        out.push((
+                            format!("{}.{}", alias.name, name.name),
+                            args.as_slice(),
+                            *span,
+                        ));
+                    }
+                }
+                _ => {}
             }
+            for a in args {
+                collect_calls_expr(a, out);
+            }
+        }
+        // And the method-call spelling of the same thing.
+        Expr::MethodCall { recv, name, args, span } => {
+            if let Expr::Ident(alias) = &**recv {
+                out.push((
+                    format!("{}.{}", alias.name, name.name),
+                    args.as_slice(),
+                    *span,
+                ));
+            }
+            collect_calls_expr(recv, out);
             for a in args {
                 collect_calls_expr(a, out);
             }
@@ -1416,6 +1555,162 @@ fn declared_row(te: &TypeExpr) -> Option<BTreeSet<String>> {
     match te {
         TypeExpr::Fn { effects, .. } => Some(effects.iter().map(|p| p.dotted()).collect()),
         _ => None,
+    }
+}
+
+/// The row written on a function type *anywhere inside* a written type.
+///
+/// `[fn() -> i64]` promises its elements perform nothing just as
+/// `fn() -> i64` does, and a value put in one has to keep that promise —
+/// otherwise a `with` block's closure was stored in an outer list, called
+/// afterwards, and reached the runtime's missing-handler panic that
+/// [E-HANDLER-MISSING] says a well-typed program never reaches.
+fn declared_row_within(te: &TypeExpr) -> Option<BTreeSet<String>> {
+    match te {
+        TypeExpr::Fn { effects, .. } => {
+            Some(effects.iter().map(|p| p.dotted()).collect())
+        }
+        TypeExpr::List(inner, _) | TypeExpr::Ref(inner, _) => declared_row_within(inner),
+        TypeExpr::Fallible(a, b, _) => union_rows(
+            declared_row_within(a),
+            declared_row_within(b),
+        ),
+        // `Option[T]`, `Map[K, V]` and any other named generic.
+        TypeExpr::Name { args, .. } => {
+            let mut found: Option<BTreeSet<String>> = None;
+            for a in args {
+                found = union_rows(found, declared_row_within(a));
+            }
+            found
+        }
+        TypeExpr::Union(items, _) | TypeExpr::Tuple(items, _) => {
+            let mut found: Option<BTreeSet<String>> = None;
+            for i in items {
+                if let Some(r) = declared_row_within(i) {
+                    found = Some(match found {
+                        None => r,
+                        Some(prev) => prev.union(&r).cloned().collect(),
+                    });
+                }
+            }
+            found
+        }
+        _ => None,
+    }
+}
+
+fn union_rows(
+    a: Option<BTreeSet<String>>,
+    b: Option<BTreeSet<String>>,
+) -> Option<BTreeSet<String>> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.union(&y).cloned().collect()),
+        (Some(x), None) => Some(x),
+        (None, y) => y,
+    }
+}
+
+/// The row carried by the *value* an expression produces.
+///
+/// Not what evaluating it performs — what calling the function it hands over
+/// would. A generic that passes its argument through, a builtin that maps a
+/// closure over a list, a `??` between two candidates: each is a hop the row
+/// has to survive, and each was one it did not ([T-FN-TYPE-ROW-CARRIED]).
+fn carried_row(
+    e: &Expr,
+    current: &str,
+    ctx: &Ctx,
+    fnb: &FnBindings,
+    depth: usize,
+    out: &mut BTreeSet<String>,
+) {
+    if depth > 16 {
+        return;
+    }
+    match e {
+        Expr::Closure { body, .. } => {
+            let mut active = Vec::new();
+            walk_expr(body, current, &mut active, ctx, fnb, out);
+        }
+        Expr::Ident(id) => {
+            let mut active = Vec::new();
+            par_fn_row(e, current, ctx, fnb, &mut active, out);
+            let _ = id;
+        }
+        // `id(f)` — a generic that hands its argument back, and any call
+        // whose arguments include function values.
+        Expr::Call { callee, args, .. } => {
+            if let Expr::Ident(id) = &**callee {
+                if matches!(id.name.as_str(), "Some" | "Ok" | "Err") {
+                    for a in args {
+                        carried_row(a, current, ctx, fnb, depth + 1, out);
+                    }
+                    return;
+                }
+                // A function that can only return what it was given.
+                if let Some(qual) = ctx.resolve_call(current, &id.name) {
+                    if ctx.fns.get(&qual).is_some_and(|d| !d.generics.is_empty()) {
+                        for a in args {
+                            carried_row(a, current, ctx, fnb, depth + 1, out);
+                        }
+                    }
+                }
+            }
+        }
+        // `xs.map(|x| || ...)` — the elements are what the closure returns.
+        Expr::MethodCall { name, args, .. } => {
+            if matches!(
+                name.name.as_str(),
+                "map" | "par_map" | "filter" | "par_filter" | "fold" | "find"
+            ) {
+                for a in args {
+                    if let Expr::Closure { body, .. } = a {
+                        carried_row(body, current, ctx, fnb, depth + 1, out);
+                    }
+                }
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            carried_row(lhs, current, ctx, fnb, depth + 1, out);
+            carried_row(rhs, current, ctx, fnb, depth + 1, out);
+        }
+        Expr::List(items, _) | Expr::Tuple(items, _) => {
+            for i in items {
+                carried_row(i, current, ctx, fnb, depth + 1, out);
+            }
+        }
+        Expr::Map(entries, _) => {
+            for (_, v) in entries {
+                carried_row(v, current, ctx, fnb, depth + 1, out);
+            }
+        }
+        Expr::If { then_block, else_branch, .. } => {
+            if let Some(Stmt::Expr(t)) = then_block.stmts.last() {
+                carried_row(t, current, ctx, fnb, depth + 1, out);
+            }
+            match else_branch.as_deref() {
+                Some(ElseBranch::Else(b)) => {
+                    if let Some(Stmt::Expr(t)) = b.stmts.last() {
+                        carried_row(t, current, ctx, fnb, depth + 1, out);
+                    }
+                }
+                Some(ElseBranch::ElseIf(inner)) => {
+                    carried_row(inner, current, ctx, fnb, depth + 1, out)
+                }
+                None => {}
+            }
+        }
+        Expr::Match { arms, .. } => {
+            for a in arms {
+                carried_row(&a.body, current, ctx, fnb, depth + 1, out);
+            }
+        }
+        Expr::Block(b) | Expr::Unsafe(b) | Expr::Region(b) => {
+            if let Some(Stmt::Expr(t)) = b.stmts.last() {
+                carried_row(t, current, ctx, fnb, depth + 1, out);
+            }
+        }
+        _ => {}
     }
 }
 

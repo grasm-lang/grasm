@@ -377,6 +377,36 @@ impl Value {
                     && f1.iter().zip(f2.iter()).all(|(x, y)| x.eq_value(y))
             }
             (Value::Ok(a), Value::Ok(b)) | (Value::Err(a), Value::Err(b)) => a.eq_value(b),
+            // Two function values are the same function when they name the
+            // same one. Falling through made `dbl == dbl` false and
+            // `assert_eq(dbl, dbl)` fail — the one type that was not equal to
+            // itself ([E-EQ-STRUCTURAL]).
+            (Value::FnRef(a), Value::FnRef(b)) => a == b,
+            // A closure is its body and its captures: two values built from
+            // the same literal with the same captures are the same closure,
+            // and the same value compared with itself always is.
+            (
+                Value::Closure {
+                    body: b1,
+                    env: e1,
+                    params: p1,
+                    ..
+                },
+                Value::Closure {
+                    body: b2,
+                    env: e2,
+                    params: p2,
+                    ..
+                },
+            ) => {
+                Rc::ptr_eq(b1, b2)
+                    && p1.len() == p2.len()
+                    && e1.len() == e2.len()
+                    && e1
+                        .iter()
+                        .zip(e2.iter())
+                        .all(|((k1, v1), (k2, v2))| k1 == k2 && v1.eq_value(v2))
+            }
             _ => false,
         }
     }

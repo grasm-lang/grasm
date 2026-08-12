@@ -1717,12 +1717,23 @@ program declares"
 
     let entries = grasm_pkg::build_lock(&resolution)?;
     let lock_path = dir.join(grasm_pkg::LOCKFILE_NAME);
-    let changes = match std::fs::read_to_string(&lock_path) {
-        Ok(previous) => grasm_pkg::diff_lock(&previous, &entries),
-        Err(_) => Vec::new(),
+    let existing = std::fs::read_to_string(&lock_path).ok();
+    let changes = match &existing {
+        Some(previous) => grasm_pkg::diff_lock(previous, &entries),
+        None => Vec::new(),
     };
 
     if locked {
+        // No lockfile at all is not "up to date": `--locked` is the CI mode
+        // that refuses to accept anything the lockfile did not record, and
+        // with nothing recorded it reported success and wrote nothing — a
+        // green gate over an unpinned graph.
+        if existing.is_none() {
+            return Err(format!(
+                "no {} — `--locked` checks the graph against one, and there is nothing to check it against (run `grasm deps` to write it)",
+                grasm_pkg::LOCKFILE_NAME
+            ));
+        }
         // CI mode: a dependency that is not what the lockfile recorded is the
         // case the lockfile exists to catch, so it fails rather than being
         // silently rewritten into agreement.

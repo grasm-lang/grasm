@@ -2681,7 +2681,6 @@ runs only under `grasm run`:
 | an effect handler as a **struct field** type | `type Box = { h: CfgHandler }` — bind the handler with `let` instead |
 | a generic instantiated at a handler type | `f(h)` for `fn f[T](x: T)` — pass what the handler computes instead |
 | a `with` block inside `parallel`/`spawn` | install the handler around the `parallel` block instead |
-| `exit(n)` as a `match` arm's value | `match n { 0 -> exit(4)  _ -> n }` — call `exit` on its own line |
 | polymorphic recursion | `fn f[T](x: T) -> i64 { f([x]) }` — one compiled copy per type, and the types never stop growing |
 
 Each of these is a defect being worked off, not a design boundary. The list is

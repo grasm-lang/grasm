@@ -2044,6 +2044,15 @@ unsafe fn val_eq(a: *mut RtVal, b: *mut RtVal) -> bool {
         (RtPayload::F64(x), RtPayload::F64(y)) => x == y,
         (RtPayload::Bool(x), RtPayload::Bool(y)) => x == y,
         (RtPayload::Str(x), RtPayload::Str(y)) => x == y,
+        // Two function values are the same function when they run the same
+        // code over the same captures. Falling through to "not equal" made
+        // `dbl == dbl` false and `assert_eq(dbl, dbl)` fail — the one type
+        // that was not equal to itself, which also broke deduplicating a list
+        // of them ([E-EQ-STRUCTURAL]).
+        (
+            RtPayload::Fn { code: c1, env: e1, .. },
+            RtPayload::Fn { code: c2, env: e2, .. },
+        ) => c1 == c2 && (e1 == e2 || (!e1.is_null() && !e2.is_null() && val_eq(*e1, *e2))),
         (RtPayload::Tuple(x), RtPayload::Tuple(y))
         | (RtPayload::List(x), RtPayload::List(y)) => {
             x.len() == y.len() && x.iter().zip(y).all(|(&i, &j)| val_eq(i, j))

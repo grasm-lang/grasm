@@ -1299,7 +1299,19 @@ with a fallback to say what should happen instead",
             self.bind(p, t.clone(), false);
         }
         self.deferred_closures.push(Vec::new());
+        // A closure is a function: `return` inside one returns from *it*, and
+        // `break` cannot reach a loop outside it. Checked against the
+        // enclosing function's return type instead, `let g: fn(i64) -> i64 =
+        // |x| { return "oops" }` was accepted inside a `fn f() -> str`, and
+        // the string came back where an integer was promised — a panic under
+        // one engine and printed heap addresses under the other.
+        let saved_ret = std::mem::replace(&mut self.fn_ret, d.ret.clone());
+        let saved_err = self.fn_err.take();
+        let saved_loop = std::mem::replace(&mut self.loop_depth, 0);
         let produced = self.infer_expr(&d.body);
+        self.fn_ret = saved_ret;
+        self.fn_err = saved_err;
+        self.loop_depth = saved_loop;
         // A closure literal *inside* this body waits for its own call site,
         // and this body's parameters are in scope for it — here and nowhere
         // else. Left on the enclosing block's list it was checked after this
@@ -4742,6 +4754,34 @@ the state through an `inout` parameter",
         }
     }
 
+    /// As `float_aware_lhs`, and says whether the right operand was already
+    /// inferred — so the caller does not walk it a second time.
+    ///
+    /// Walking it twice made a right-nested chain exponential: `2^2^…^2`
+    /// thirty terms long doubled the work per term, and `check` never
+    /// finished on a program `[G-NEST-LIMIT]` promises a diagnostic for.
+    fn float_aware_lhs_seen(&mut self, lhs: &Expr, rhs: &Expr) -> (Type, Option<Type>) {
+        let lhs_ty = self.infer_expr(lhs);
+        let literal_span = match lhs {
+            Expr::Int(..) => Some(lhs.span().start),
+            Expr::Unary { op: UnaryOp::Neg, expr, .. } if matches!(**expr, Expr::Int(..)) => {
+                Some(expr.span().start)
+            }
+            _ => None,
+        };
+        if let Some(at) = literal_span {
+            if self.uni.shallow_resolve(&lhs_ty) == Type::I64 {
+                let probe = self.infer_expr(rhs);
+                if self.uni.shallow_resolve(&probe) == Type::F64 {
+                    self.float_literals.insert(at);
+                    return (Type::F64, Some(probe));
+                }
+                return (lhs_ty, Some(probe));
+            }
+        }
+        (lhs_ty, None)
+    }
+
     fn float_aware_lhs(&mut self, lhs: &Expr, rhs: &Expr) -> Type {
         let lhs_ty = self.infer_expr(lhs);
         // A negated literal is a literal: `-3` is `Neg` applied to `3`, and
@@ -4830,8 +4870,13 @@ the state through an `inout` parameter",
                 }
             }
             Add | Sub | Mul | Div | Rem | Pow => {
-                let lhs_ty = self.float_aware_lhs(lhs, rhs);
-                self.check_expr(rhs, &lhs_ty);
+                let (lhs_ty, rhs_seen) = self.float_aware_lhs_seen(lhs, rhs);
+                match rhs_seen {
+                    // Already walked, and walking it again is what made a
+                    // right-nested arithmetic chain exponential.
+                    Some(rt) => self.unify_or_report(rhs.span(), &rt, &lhs_ty),
+                    None => self.check_expr(rhs, &lhs_ty),
+                }
                 let r = self.uni.shallow_resolve(&lhs_ty);
                 match r {
                     Type::I64 | Type::F64 => r,
@@ -5432,6 +5477,15 @@ the state through an `inout` parameter",
             _ => None,
         };
         let saved_err = self.fn_err.clone();
+        // As above: the closure's own return type is what `return` means
+        // here, and a loop outside it is out of reach.
+        let closure_ret = match &want_ret {
+            Some(Type::Fallible(ok, _)) => (**ok).clone(),
+            Some(t) => t.clone(),
+            None => self.uni.fresh(),
+        };
+        let saved_fn_ret = std::mem::replace(&mut self.fn_ret, closure_ret);
+        let saved_loop = std::mem::replace(&mut self.loop_depth, 0);
         let ret = if let Some(Type::Fallible(ok, err)) = &want_ret {
             self.fn_err = Some((**err).clone());
             let produced = self.infer_expr(body);
@@ -5448,6 +5502,8 @@ the state through an `inout` parameter",
             self.infer_expr(body)
         };
         self.fn_err = saved_err;
+        self.fn_ret = saved_fn_ret;
+        self.loop_depth = saved_loop;
         while let Some(next) = self.deferred_closures.last_mut().and_then(|v| v.pop()) {
             self.check_deferred_closure(next);
         }

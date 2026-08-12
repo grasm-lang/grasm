@@ -244,6 +244,7 @@ fn compile_object_scoped(
     let mut cg = Codegen::new(&mut module);
     let analysis = grasm_sema::check::check_program(program);
     cg.float_literals = analysis.float_literals;
+    cg.fallible_closures = analysis.fallible_closures;
     cg.empty_types = analysis.empty_types;
     cg.only_module = only_module.map(str::to_string);
     cg.declare_runtime()?;
@@ -252,7 +253,26 @@ fn compile_object_scoped(
         .iter()
         .map(|f| (f.name.clone(), &f.module, f.imports.clone()))
         .collect();
-    match cg.compile_program(&views) {
+    // A panic inside the code generator is a bug in the backend, and it used
+    // to reach the user as raw Rust text — a Cranelift assertion, the file it
+    // fired in, and an absolute path from the machine that built the
+    // compiler, with no `error:` line of grasm's own. Caught here so it
+    // arrives as a diagnostic that says what happened and what still works.
+    let compiled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cg.compile_program(&views)
+    }));
+    let compiled = match compiled {
+        Ok(r) => r,
+        Err(_) => {
+            return Err(
+                "internal compiler error — the backend panicked while generating code.
+  This is a bug in the backend, not a limitation of the language.
+  `grasm run` will still work. Please report it with this program."
+                    .to_string(),
+            );
+        }
+    };
+    match compiled {
         Ok(()) => {}
         Err(u) => {
             let idx = program.file_of(u.span);
@@ -360,6 +380,8 @@ struct Codegen<'m> {
     /// The checker already knows which literals are floats; asking it once is
     /// both correct and the same answer the interpreter gets.
     float_literals: std::collections::HashSet<u32>,
+    /// Closure literals whose own type is fallible, by start offset.
+    fallible_closures: std::collections::HashSet<u32>,
     /// Start offset of each empty literal → the type the checker settled on.
     empty_types: std::collections::HashMap<u32, String>,
 }
@@ -446,6 +468,7 @@ impl<'m> Codegen<'m> {
             pending_generics: Vec::new(),
             generic_subst: HashMap::new(),
             float_literals: std::collections::HashSet::new(),
+            fallible_closures: std::collections::HashSet::new(),
             empty_types: std::collections::HashMap::new(),
         }
     }
@@ -2736,12 +2759,21 @@ fn is_probe_safe(e: &Expr) -> bool {
 /// or failing — and so never reaches the match's merge point.
 fn arm_diverges(body: &Expr) -> bool {
     match body {
-        Expr::Block(b) | Expr::Unsafe(b) | Expr::Region(b) => matches!(
-            b.stmts.last(),
-            Some(Stmt::Return(..) | Stmt::Break(_) | Stmt::Continue(_))
-        ),
+        // A block that *ends* in something that leaves, by any spelling: a
+        // `{ panic("x") }` arm read as an ordinary block yielding nothing, so
+        // a `match` with one live arm became a statement and the value was
+        // thrown away — `()` printed where the answer was `7`, and `false`
+        // where it was `true`.
+        Expr::Block(b) | Expr::Unsafe(b) | Expr::Region(b) => match b.stmts.last() {
+            Some(Stmt::Return(..) | Stmt::Break(_) | Stmt::Continue(_)) => true,
+            Some(Stmt::Expr(e)) => arm_diverges(e),
+            _ => false,
+        },
+        // `exit(n)` ends the program, so an arm that calls it produces no
+        // value and says nothing about what the match is worth.
         Expr::Call { callee, .. } => {
-            matches!(&**callee, Expr::Ident(id) if id.name == "fail" || id.name == "panic")
+            matches!(&**callee, Expr::Ident(id)
+                if id.name == "fail" || id.name == "panic" || id.name == "exit")
         }
         _ => false,
     }
@@ -9215,6 +9247,20 @@ the binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level \
         body: &Expr,
         is_map: bool,
     ) -> CResult<(Value, VType)> {
+        let closure_at = body.span().start;
+        // The body is inlined into the loop, and `fail` there lowers as a
+        // return from the *enclosing* function — so `[1, 2].map(|x| if x == 2
+        // { fail(e) } else { Ok(x) })` reported an unhandled error from
+        // `main` where the interpreter produced `[Ok(1), Err(e)]`. A `fail`
+        // inside a closure is that closure's own failure, which needs a value
+        // per element rather than a return; until the loop can carry one,
+        // this is a refusal rather than a wrong answer.
+        if body_can_fail(body) && self.cg.fallible_closures.contains(&closure_at) {
+            return nope(
+                body.span(),
+                "`fail` inside a *fallible* closure passed to `map`, `filter` or `fold` (write the failing part as a named function and pass that, or produce `Err(e)` instead of failing)",
+            );
+        }
         let list_var = self.new_var(&VType::List(Box::new(elem_t.clone())));
         self.b.def_var(list_var, list);
         let out_var = self.new_var(&VType::List(Box::new(elem_t.clone())));
