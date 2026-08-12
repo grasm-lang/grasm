@@ -1135,3 +1135,61 @@ fn a_generic_call_cannot_carry_a_handler_row_out() {
         "cannot pass a function that performs `Cfg`",
     );
 }
+
+/// `main` produces no value: a return type on it read as a status code and
+/// was discarded ([E-ENTRY]).
+#[test]
+fn main_produces_no_value() {
+    check_err(
+        "fn main() -> i64 {\n    print(\"x\")\n    3\n}\n",
+        "`main` produces no value",
+    );
+    // A `! E` on main is a different thing and is allowed.
+    check_ok(
+        "type E = { m: str }\nfn boom() -> i64 ! E {\n    fail(E{ m: \"x\" })\n}\nfn main() ! E {\n    print(\"{try boom()}\")\n}\n",
+    );
+}
+
+/// A negated literal is a literal ([E-NUM-PROMOTE]: "on either side").
+#[test]
+fn a_negated_literal_promotes_to_float() {
+    check_ok("fn main() {\n    print(\"{-3 * 2.5}\")\n    print(\"{2.5 * -3}\")\n    print(\"{-1 < 0.5}\")\n}\n");
+}
+
+/// An expected type reaches an `if`'s branches through a fallible return type,
+/// and a branch that gives the ok half merges with one that builds the whole
+/// `T ! E` ([T-INT-TO-FLOAT-CARRIED], [T-OK-ERR-RETURN]).
+#[test]
+fn a_fallible_body_may_end_in_an_if() {
+    check_ok("type E = | Bad\nfn f(n: i64) -> f64 ! E {\n    if n == 0 {\n        4.5\n    } else {\n        6\n    }\n}\nfn main() {\n    print(\"{f(0) ?? -1.0}\")\n}\n");
+    check_ok("type E = | Bad\nfn f(b: bool) -> i64 ! E {\n    if b {\n        Err(Bad)\n    } else {\n        3\n    }\n}\nfn main() {\n    print(\"{f(false) ?? -1}\")\n}\n");
+}
+
+/// A closure with parameters that nothing ever uses has nothing to infer from
+/// ([T-FN-TYPE]).
+#[test]
+fn an_unusable_closure_is_refused() {
+    check_err(
+        "fn main() {\n    let f = |x| x\n    print(\"done\")\n}\n",
+        "nothing says what `x` is",
+    );
+}
+
+/// A handler's discharge may not leave its block inside an `Option`.
+#[test]
+fn some_cannot_carry_a_handler_row_out() {
+    check_err(
+        "effect Cfg {\n    fn value() -> i64\n}\nfn main() {\n    var o: Option[fn() -> i64 / {Cfg}] = None\n    with Cfg handled_by CfgHandler{ value: || 111 } {\n        o = Some(|| Cfg.value())\n    }\n    print(\"{(o ?? (|| 0))()}\")\n}\n",
+        "cannot store a function that performs `Cfg`",
+    );
+}
+
+/// A function value laundered through `Some(f) ?? f` still carries its row
+/// ([T-PAR-MAP-PURE]).
+#[test]
+fn a_coalesced_function_keeps_its_row() {
+    check_err(
+        "fn shout(n: i64) -> i64 {\n    print(\"noisy\")\n    n\n}\nfn main() {\n    let o = Some(shout)\n    let g = o ?? shout\n    print(\"{[1, 2].par_map(g)}\")\n}\n",
+        "needs an effect-free function",
+    );
+}

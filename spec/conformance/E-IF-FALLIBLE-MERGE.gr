@@ -3,6 +3,8 @@
 //! -1
 //! -1 3
 //! -1
+//! 9 7 -1
+//! 3
 // An `if` whose branches are `Err(e)` and `Ok(v)` is worth `T ! E`.
 //
 // `Err(e)` says nothing about the ok half — there is no value to read it off
@@ -21,4 +23,30 @@ fn main() {
     m.set("a", 2)
     let v = m.values().map(|x| if x == 2 { Err(Bad) } else { Ok(x) })
     print("{v[0] ?? 0 - 1}")
+    // Every arm that can say something, and no arm that leaves. Folding a
+    // `return` arm in made the inner match worth nothing, so the enclosing
+    // function returned whatever was in the register — `0` where the answer
+    // was `9`.
+    print("{g(true, 3) ?? -1} {g(true, 0) ?? -1} {g(false, 3) ?? -1}")
+    // One branch builds the whole `T ! E`, the other gives the ok half, which
+    // a fallible body may do either way ([T-OK-ERR-RETURN]).
+    print("{h(false) ?? -1}")
+}
+
+fn g(live: bool, x: i64) -> i64 ! E {
+    match live {
+        false -> fail(Bad)
+        _ -> match x {
+            0 -> return 7
+            _ -> x * 3
+        }
+    }
+}
+
+fn h(b: bool) -> i64 ! E {
+    if b {
+        Err(Bad)
+    } else {
+        3
+    }
 }

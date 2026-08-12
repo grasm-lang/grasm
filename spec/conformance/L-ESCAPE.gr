@@ -6,6 +6,8 @@
 //! 😀 1 [128512]
 //! é
 //! [a, b]
+//! A3B
+//! a}b
 fn main() {
     print("a\tb")
     print("quote\" brace\{ close\}")
@@ -17,4 +19,10 @@ fn main() {
     print("{smile} {smile.len()} {smile.codes()}")
     print("\u{e9}")
     print("a\u{1}b".split("\u{1}"))
+    // An escape covers the byte after it, inside an interpolation too: the
+    // `\}` of a nested string is not the brace that closes the
+    // interpolation. Counted as one, it ended the interpolation early and the
+    // diagnostic that followed carried a raw NUL byte.
+    print("A{"x\}y".len()}B")
+    print("a\}b")
 }

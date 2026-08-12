@@ -613,3 +613,124 @@ fn exit_reports_the_low_eight_bits() {
     let (code, out) = run(&["run", f.to_str().unwrap()]);
     assert_eq!(code, 255, "exit(-1) must not report success:\n{out}");
 }
+
+/// A consumer's source file cannot replace a dependency's module.
+///
+/// `[T-MODULE-RESOLVE]`: "a dependency's imports resolve inside that
+/// dependency, not in whatever consumer happens to be building it. Otherwise a
+/// file at the same relative path in the consumer silently replaced the
+/// library's own private module, and the program ran and printed the wrong
+/// answer." A planted `app/src/util.gr` did exactly that, and `grasm deps`
+/// reported the library as performing nothing while the planted file read the
+/// filesystem.
+#[test]
+fn a_consumer_cannot_shadow_a_dependencys_module() {
+    let w = Work::new("shadow");
+    // The real `util`, and a `lib` that imports it.
+    w.package(
+        "util",
+        "[package]\nname = \"util\"\nversion = \"0.1.0\"\ncapabilities = []\n",
+        "pub fn who() -> str {\n    \"the real util\"\n}\n",
+    );
+    w.package(
+        "lib",
+        "[package]\nname = \"lib\"\nversion = \"0.1.0\"\ncapabilities = []\n\n[dependencies.util]\npath = \"../util\"\n",
+        "import util\n\npub fn ask() -> str {\n    util.who()\n}\n",
+    );
+    let app = w.package(
+        "app",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\ncapabilities = [\"io\"]\n\n[dependencies.lib]\npath = \"../lib\"\n",
+        "import lib\n\nfn main() {\n    print(\"{lib.ask()}\")\n}\n",
+    );
+    // The consumer plants a file with the name the library imports.
+    std::fs::write(
+        app.join("src/util.gr"),
+        "pub fn who() -> str {\n    \"hijacked\"\n}\n",
+    )
+    .unwrap();
+    let entry = app_entry(&app);
+    let (code, out) = run(&["run", entry.as_str()]);
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        out.contains("the real util"),
+        "the dependency's own module must win:\n{out}"
+    );
+}
+
+/// A package may import only what its own manifest declares.
+///
+/// `[T-MODULE-DEP]`: "A package may also import a dependency declared in its
+/// `grasm.toml`." Reaching a dependency's dependency by name gave the consumer
+/// a hard dependency with no version requirement and no manifest record.
+#[test]
+fn an_undeclared_transitive_dependency_is_not_importable() {
+    let w = Work::new("undeclared");
+    w.package(
+        "deep",
+        "[package]\nname = \"deep\"\nversion = \"0.1.0\"\ncapabilities = []\n",
+        "pub fn secret() -> i64 {\n    42\n}\n",
+    );
+    w.package(
+        "mid",
+        "[package]\nname = \"mid\"\nversion = \"0.1.0\"\ncapabilities = []\n\n[dependencies.deep]\npath = \"../deep\"\n",
+        "import deep\n\npub fn m() -> i64 {\n    deep.secret()\n}\n",
+    );
+    let app = w.package(
+        "app",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\ncapabilities = [\"io\"]\n\n[dependencies.mid]\npath = \"../mid\"\n",
+        "import mid\nimport deep\n\nfn main() {\n    print(\"{mid.m()} {deep.secret()}\")\n}\n",
+    );
+    let entry = app_entry(&app);
+    let (code, out) = run(&["check", entry.as_str()]);
+    assert_eq!(code, 1, "an undeclared package is not importable:\n{out}");
+    assert!(out.contains("cannot load module `deep`"), "{out}");
+}
+
+/// A package that installs a handler it did not construct is charged what that
+/// handler does, in the program being built.
+///
+/// `[E-HANDLER-OWN-ROW]` charges "what *any* handler for that effect does,
+/// anywhere in the program". Computed per package in isolation, a
+/// `capabilities = []` library printed through a handler the consumer passed
+/// it and every command reported it as performing nothing.
+#[test]
+fn a_handler_from_the_consumer_counts_against_the_library() {
+    let w = Work::new("handlerparam");
+    w.package(
+        "pure",
+        OVER_CEILING.replace("quietlib", "pure").as_str(),
+        "effect Log {\n    fn info(m: str)\n}\n\npub fn run(h: LogHandler) {\n    with Log handled_by h {\n        Log.info(\"x\")\n    }\n}\n",
+    );
+    let app = w.package(
+        "app",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\ncapabilities = [\"io\"]\n\n[dependencies.pure]\npath = \"../pure\"\n",
+        "import pure\n\nfn main() {\n    pure.run(LogHandler{ info: |m| print(\"{m}\") })\n}\n",
+    );
+    let entry = app_entry(&app);
+    let (code, out) = run(&["check", entry.as_str()]);
+    assert_eq!(code, 1, "the library is over its ceiling:\n{out}");
+    assert!(out.contains("package `pure` performs `io`"), "{out}");
+}
+
+/// An option the command does not know is a mistake, not a comment.
+#[test]
+fn an_unknown_flag_is_refused() {
+    let w = Work::new("flags");
+    let f = w.0.join("h.gr");
+    std::fs::write(&f, "fn main() {\n    print(\"hi\")\n}\n").unwrap();
+    let out_path = w.0.join("out");
+    let (code, out) = run(&[
+        "build",
+        f.to_str().unwrap(),
+        "--natives",
+        "-o",
+        out_path.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 1, "a typo in --native must not build a bundle:\n{out}");
+    assert!(out.contains("has no option `--natives`"), "{out}");
+
+    // And a value-taking option with no value is a lost operand.
+    let (code, out) = run(&["api", f.to_str().unwrap(), "--against"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("needs a value"), "{out}");
+}

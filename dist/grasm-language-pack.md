@@ -3321,6 +3321,8 @@ fn main() {
 //! -1
 //! -1 3
 //! -1
+//! 9 7 -1
+//! 3
 // An `if` whose branches are `Err(e)` and `Ok(v)` is worth `T ! E`.
 //
 // `Err(e)` says nothing about the ok half — there is no value to read it off
@@ -3339,6 +3341,32 @@ fn main() {
     m.set("a", 2)
     let v = m.values().map(|x| if x == 2 { Err(Bad) } else { Ok(x) })
     print("{v[0] ?? 0 - 1}")
+    // Every arm that can say something, and no arm that leaves. Folding a
+    // `return` arm in made the inner match worth nothing, so the enclosing
+    // function returned whatever was in the register — `0` where the answer
+    // was `9`.
+    print("{g(true, 3) ?? -1} {g(true, 0) ?? -1} {g(false, 3) ?? -1}")
+    // One branch builds the whole `T ! E`, the other gives the ok half, which
+    // a fallible body may do either way ([T-OK-ERR-RETURN]).
+    print("{h(false) ?? -1}")
+}
+
+fn g(live: bool, x: i64) -> i64 ! E {
+    match live {
+        false -> fail(Bad)
+        _ -> match x {
+            0 -> return 7
+            _ -> x * 3
+        }
+    }
+}
+
+fn h(b: bool) -> i64 ! E {
+    if b {
+        Err(Bad)
+    } else {
+        3
+    }
 }
 ```
 
@@ -5152,6 +5180,8 @@ fn main() {
 //! 😀 1 [128512]
 //! é
 //! [a, b]
+//! A3B
+//! a}b
 fn main() {
     print("a\tb")
     print("quote\" brace\{ close\}")
@@ -5163,6 +5193,12 @@ fn main() {
     print("{smile} {smile.len()} {smile.codes()}")
     print("\u{e9}")
     print("a\u{1}b".split("\u{1}"))
+    // An escape covers the byte after it, inside an interpolation too: the
+    // `\}` of a nested string is not the brace that closes the
+    // interpolation. Counted as one, it ended the interpolation early and the
+    // diagnostic that followed carried a raw NUL byte.
+    print("A{"x\}y".len()}B")
+    print("a\}b")
 }
 ```
 
@@ -6854,6 +6890,10 @@ fn main() {
 //! expect: output
 //! ok 5
 //! err Bad
+//! v1
+//! d
+//! err
+//! -1 6
 type E = | Bad
 fn maybe(fail_it: bool) -> i64 ! E {
     if fail_it {
@@ -6870,6 +6910,29 @@ fn main() {
         Ok(v) -> print("ok {v}")
         Err(e) -> print("err {e}")
     }
+    // A closure is a function boundary like any other: a `fail` inside a
+    // *fallible* closure is that closure's own failure, and an ordinary value
+    // out of one is its ok half. Neither was true — the failure unwound past
+    // the `??` and the `match` written to handle it, out of `main`, and the
+    // compiled build took the fallback on the success path.
+    let f: fn(i64) -> str ! E = |n| if n == 0 {
+        fail(Bad)
+    } else {
+        "v{n}"
+    }
+    print("{f(1) ?? "d"}")
+    print("{f(0) ?? "d"}")
+    match f(0) {
+        Ok(v) -> print("ok {v}")
+        Err(_) -> print("err")
+    }
+    // And with no annotation at all, where each branch knows one half.
+    let g = |n| if n == 0 {
+        Err(Bad)
+    } else {
+        Ok(n * 2)
+    }
+    print("{g(0) ?? -1} {g(3) ?? -1}")
 }
 ```
 
