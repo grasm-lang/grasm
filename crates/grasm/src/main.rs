@@ -1574,7 +1574,15 @@ fn build_native_incremental(
                 } else {
                     return None;
                 };
-                (!name.is_empty() && !name.starts_with("g_")).then_some(name)
+                // Not an internal symbol: `g_…` is a compiled function,
+                // `gc_…` a lifted closure, `gh_…` a handler operation. One
+                // of those missing is a backend bug, and reporting it as a
+                // missing C function sent the reader looking for a library.
+                (!name.is_empty()
+                    && !name.starts_with("g_")
+                    && !name.starts_with("gc_")
+                    && !name.starts_with("gh_"))
+                .then_some(name)
             })
             .collect();
         if !missing.is_empty() {

@@ -454,6 +454,19 @@ impl<'a> Lexer<'a> {
                         }
                     }
                     let expr_src = &self.src[expr_start..self.pos - 1];
+                    // An empty `{}` is not an expression, and parsing it as
+                    // one reported "expected an expression but found end of
+                    // file" — about a file with lines left in it.
+                    if expr_src.trim().is_empty() {
+                        return self.tok(
+                            TokenKind::Error(
+                                "an empty `{}` in a string interpolates nothing — write \
+`\\{}` for literal braces, or put an expression between them"
+                                    .to_string(),
+                            ),
+                            start,
+                        );
+                    }
                     if !cur.is_empty() {
                         parts.push(StrPart::Text(std::mem::take(&mut cur)));
                     }

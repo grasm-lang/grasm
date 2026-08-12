@@ -914,8 +914,20 @@ impl<'a, W: Write> Interp<'a, W> {
                 self.scopes = saved;
                 self.current_module = saved_module;
                 self.depth -= 1;
+                // A fallible closure's plain value is its ok half, wrapped
+                // on the way out — the same rule a named fallible function
+                // follows ([T-OK-ERR-RETURN]). Unwrapped, `[1, 2].map(f)` for
+                // `let f: fn(i64) -> i64 ! E = |x| x * 2` produced a
+                // `[i64 ! E]` holding bare integers: printed as `[2, 4]`, and
+                // a `match` on one panicked `no match arm matched`.
+                let wrap = |v: Value| match v {
+                    already @ (Value::Ok(_) | Value::Err(_)) if fallible => already,
+                    v if fallible => Value::Ok(Rc::new(v)),
+                    v => v,
+                };
                 match r {
-                    Err(Flow::Return(v)) => Ok(v),
+                    Ok(v) => Ok(wrap(v)),
+                    Err(Flow::Return(v)) => Ok(wrap(v)),
                     // A *fallible* closure is a function boundary like any
                     // other, so a `fail` inside one is that closure's own
                     // failure. Letting it through unwound past the `??` and

@@ -533,13 +533,16 @@ A failure reports a *shrunk* counterexample — the smallest input that still
 fails — plus the seed that found it:
 
 ```text
-test "doubling is monotonic" ... FAILED on case 5 of 100
+test "doubling is monotonic" ... FAILED on case 1 of 100
   assertion failed
-  counterexample: n = 4611686018427387904
+  counterexample: n = -1
   replay: --seed 24301 --cases 100
 ```
 
-That number is exactly the smallest `n` where `n * 2` wraps.
+`-1` is the simplest witness the shrinker could reach: `-1 * 2` is `-2`, which
+is smaller. The property is false for every negative number, and for
+`4611686018427387904` and up, where `n * 2` wraps — the shrinker reports the
+smallest one it can, not the first one it found.
 
 `grasm test --coverage` reports which statement lines the suite reached —
 counting the lines that doc examples reach, since those are tests too. It did

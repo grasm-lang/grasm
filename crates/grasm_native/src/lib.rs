@@ -814,15 +814,28 @@ impl<'m> Codegen<'m> {
         }
 
         // A lifted closure can itself create another, so drain the worklist.
-        while let Some(c) = self.pending_closures.pop() {
-            self.current_module = c.module.clone();
-            self.compile_closure(c)?;
-        }
-
-        let pending = std::mem::take(&mut self.pending_handlers);
-        for h in pending {
-            self.current_module = h.module.clone();
-            self.compile_handler(h)?;
+        // Until both queues are empty: compiling a handler operation can
+        // create closures, and compiling a closure can create handlers.
+        // Draining closures once and then handlers left a closure declared
+        // inside a handler operation never emitted, and the *linker* reported
+        // it — as a missing C function named `gc_main_161`, for a program
+        // with no `extern fn` in it.
+        loop {
+            let mut moved = false;
+            while let Some(c) = self.pending_closures.pop() {
+                moved = true;
+                self.current_module = c.module.clone();
+                self.compile_closure(c)?;
+            }
+            let pending = std::mem::take(&mut self.pending_handlers);
+            for h in pending {
+                moved = true;
+                self.current_module = h.module.clone();
+                self.compile_handler(h)?;
+            }
+            if !moved {
+                break;
+            }
         }
         // `main` is emitted once, into the entry module's object.
         if self.only_module.as_deref().unwrap_or("main") == "main" {
@@ -1382,6 +1395,25 @@ impl<'m> Codegen<'m> {
         if !terminated {
             match (&sig_ret, last) {
                 (VType::Unit, last) => {
+                    // A discarded fallible tail in `main`. Everywhere else
+                    // the checker refuses one; `main` may propagate, and
+                    // [E-MAIN-ERR] says the failure prints and exits 1.
+                    // Dropped instead, `fn main() { write_file(p, s) }`
+                    // printed the line before it, exited 0, wrote nothing to
+                    // stderr and left no file — in the compiled build only.
+                    if let Some((v, vt)) = &last {
+                        if matches!(vt, VType::Fallible(..)) {
+                            let v = *v;
+                            let ok_blk = fcx.b.create_block();
+                            let err_blk = fcx.b.create_block();
+                            let c = fcx.call_rt("grasm_is_ok", &[v]).unwrap();
+                            fcx.b.ins().brif(c, ok_blk, &[], err_blk, &[]);
+                            fcx.goto_block(err_blk);
+                            fcx.call_rt("grasm_report_main_err", &[v]);
+                            fcx.trap_here();
+                            fcx.goto_block(ok_blk);
+                        }
+                    }
                     // Unused trailing boxed value must be released.
                     if let Some((v, vt)) = last {
                         if vt.boxed() {
@@ -1846,7 +1878,17 @@ to one — a loop variable or a list element is this case",
                 }
             }
             (_, None) => {
-                if !fcx.is_filled() {
+                // A body that produces nothing, where the declaration says
+                // `() ! E`: the value is `Ok(())`. Refused instead, an
+                // ordinary `|x| { }` filling a fallible slot could not be
+                // compiled — and before that it crashed with SIGTRAP.
+                if c.wrap_ok && !fcx.is_filled() {
+                    let z = fcx.b.ins().iconst(types::I64, 0);
+                    let boxed = fcx.call_rt("grasm_box_unit", &[]).unwrap_or(z);
+                    let v = fcx.call_rt("grasm_ok_new", &[boxed]).unwrap();
+                    fcx.emit_scope_decs_all();
+                    fcx.b.ins().return_(&[v]);
+                } else if !fcx.is_filled() {
                     return nope(c.body.span(), "a closure body with no value");
                 }
             }
@@ -2169,6 +2211,56 @@ fn recursive_functions(
 }
 
 /// Every `f(args...)` in a block where `f` is a plain name, innermost first.
+/// Every struct literal a statement contains, as (type path, fields).
+fn collect_struct_lits_stmt<'e>(
+    s: &'e Stmt,
+    out: &mut Vec<(&'e Path, &'e Vec<(Ident, Expr)>)>,
+) {
+    match s {
+        Stmt::Let { init, .. } => collect_struct_lits(init, out),
+        Stmt::Assign { value, .. } => collect_struct_lits(value, out),
+        Stmt::Return(Some(e), _) | Stmt::Expr(e) => collect_struct_lits(e, out),
+        Stmt::While { body, .. }
+        | Stmt::For { body, .. }
+        | Stmt::With { body, .. }
+        | Stmt::Parallel { body, .. }
+        | Stmt::Spawn { body, .. } => {
+            for st in &body.stmts {
+                collect_struct_lits_stmt(st, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_struct_lits<'e>(
+    e: &'e Expr,
+    out: &mut Vec<(&'e Path, &'e Vec<(Ident, Expr)>)>,
+) {
+    match e {
+        Expr::StructLit { name, fields, base, .. } => {
+            out.push((name, fields));
+            if let Some(b) = base {
+                collect_struct_lits(b, out);
+            }
+            for (_, v) in fields {
+                collect_struct_lits(v, out);
+            }
+        }
+        Expr::Call { args, .. } | Expr::MethodCall { args, .. } => {
+            for a in args {
+                collect_struct_lits(a, out);
+            }
+        }
+        Expr::List(items, _) | Expr::Tuple(items, _) => {
+            for i in items {
+                collect_struct_lits(i, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn collect_named_calls_block(b: &grasm_syntax::ast::Block, out: &mut Vec<(String, Vec<Expr>)>) {
     for st in &b.stmts {
         collect_named_calls_stmt(st, out);
@@ -4190,9 +4282,25 @@ impl FnCx<'_, '_> {
         // A closure literal in argument position gets its parameter types from
         // the parameter it is being passed to. Before function types existed
         // there was nowhere for them to come from, and the backend said so.
-        if let (Expr::Closure { params, body, span }, Some(VType::Fn(want_ps, _))) = (e, expected) {
+        if let (Expr::Closure { params, body, span }, Some(VType::Fn(want_ps, want_ret))) =
+            (e, expected)
+        {
             if params.len() == want_ps.len() {
-                return self.closure_value_typed(params, body, want_ps, *span).map(Some);
+                // The declared *return* type too. Dropped, a closure literal
+                // meeting `fn(i64) -> str ! E` in argument, struct-field or
+                // list-element position was lifted as if it returned the ok
+                // half alone: the caller's `??` then read a bare value as a
+                // fallible one — a wrong answer for a boxed half, SIGSEGV for
+                // an `i64`, SIGTRAP for `()`.
+                return self
+                    .closure_value_with_ret(
+                        params,
+                        body,
+                        want_ps,
+                        Some((**want_ret).clone()),
+                        *span,
+                    )
+                    .map(Some);
             }
         }
         if let (Expr::List(items, _), Some(VType::List(elem_t))) = (e, expected) {
@@ -7820,7 +7928,28 @@ impl FnCx<'_, '_> {
                 // body can itself be probed.
                 "map" | "par_map" => {
                     let inner = match args.first() {
-                        Some(Expr::Closure { body, .. }) => self.probe_type(body)?,
+                        Some(Expr::Closure { params, body, .. }) => {
+                            // The closure's parameter is one element of the
+                            // receiver. Without binding it the body could not
+                            // be typed at all, so `count([1, 2].map(|x| x + 1))`
+                            // — a generic applied to a mapped list — was
+                            // refused for a type one step away.
+                            let elem = match self.probe_type(recv)? {
+                                VType::List(t) => Some(*t),
+                                _ => None,
+                            };
+                            match (params.first(), elem) {
+                                (Some(p), Some(t)) => {
+                                    let env: HashMap<String, VType> =
+                                        std::iter::once((p.name.clone(), t)).collect();
+                                    self.probe_types.push(env);
+                                    let out = self.probe_type(body);
+                                    self.probe_types.pop();
+                                    out?
+                                }
+                                _ => self.probe_type(body)?,
+                            }
+                        }
                         _ => return nope(e.span(), "inferring this type"),
                     };
                     VType::List(Box::new(inner))
@@ -8624,6 +8753,31 @@ impl FnCx<'_, '_> {
                     .declared_ret
                     .entry(name.name.clone())
                     .or_insert(*ret);
+            }
+        }
+        // A struct field's declared type says what a closure put in it takes:
+        // `type Box = { f: fn(i64) -> i64 }` and `Box{ f: g }` for a
+        // `let`-bound `g`. Without this the backend refused `g` for having
+        // "no type to say what its parameters are", with the type written on
+        // the field.
+        for stmt in &blk.stmts {
+            let mut lits: Vec<(&Path, &Vec<(Ident, Expr)>)> = Vec::new();
+            collect_struct_lits_stmt(stmt, &mut lits);
+            for (name, fields) in lits {
+                let sname = name.segments.last().map(|s| s.name.clone()).unwrap_or_default();
+                for (fname, value) in fields {
+                    let Expr::Ident(id) = value else { continue };
+                    if !bound.contains(&id.name) {
+                        continue;
+                    }
+                    let Ok(VType::Fn(ps, ret)) =
+                        self.struct_field_type(&sname, &fname.name, id.span)
+                    else {
+                        continue;
+                    };
+                    hints.declared.entry(id.name.clone()).or_insert(ps);
+                    hints.declared_ret.entry(id.name.clone()).or_insert(*ret);
+                }
             }
         }
         let mut calls: Vec<(String, Vec<Expr>)> = Vec::new();

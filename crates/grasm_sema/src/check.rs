@@ -1158,6 +1158,31 @@ land in a copy the caller never sees — return the new value from the operation
         }
         let body_ty = self.check_block_with(&f.body, want_tail.as_ref());
         self.tail_fn = None;
+        // A function that returns nothing throws its tail away, and throwing
+        // away a failure is using a fallible value as if it were `T`.
+        // `fn write_report(p, b) { write_file(p, b) }` printed "wrote the
+        // report", exited 0, said nothing on stderr and left no file —
+        // verbatim the failure [T-FALLIBLE-UNHANDLED] exists to prevent, one
+        // position away from where it was already caught. A statement that
+        // *leaves* — `exit(n)`, `panic(m)`, `fail(e)` — produces no value to
+        // discard.
+        if ret == Type::Unit && self.fn_err.is_none() {
+            if let Some(Stmt::Expr(e)) = f.body.stmts.last() {
+                let leaves = matches!(e, Expr::Call { callee, .. }
+                    if matches!(&**callee, Expr::Ident(id)
+                        if matches!(id.name.as_str(), "exit" | "panic" | "fail")));
+                if !leaves && matches!(self.uni.shallow_resolve(&body_ty), Type::Fallible(..)) {
+                    let shown = self.show(&body_ty);
+                    self.error_help(
+                        e.span(),
+                        format!(
+                            "this expression can fail (`{shown}`) and its failure is discarded"
+                        ),
+                        "use `try` to propagate it, `match` to handle both cases, or `??` with a fallback to say what should happen instead",
+                    );
+                }
+            }
+        }
         let ends_with_return = matches!(f.body.stmts.last(), Some(Stmt::Return(..)));
         // A fallible function's body may produce either the ok half — the
         // ordinary case, wrapped in `Ok` on the way out — or the whole
@@ -1250,6 +1275,13 @@ land in a copy the caller never sees — return the new value from the operation
                     ty = w;
                 }
                 _ => {
+                    // The tail of a block whose value is thrown away is
+                    // discarded too — and a function returning `()` throws its
+                    // tail away. `fn write_report(p, b) { write_file(p, b) }`
+                    // printed "wrote the report", exited 0, said nothing on
+                    // stderr and left no file: verbatim the failure
+                    // [T-FALLIBLE-UNHANDLED] exists to prevent, one position
+                    // from where it was already caught.
                     let disc = i + 1 < n || self.discarding;
                     let saved = std::mem::replace(
                         &mut self.discarding,
@@ -1269,13 +1301,13 @@ land in a copy the caller never sees — return the new value from the operation
                     // `let f = |x| risky(x)` then `f(-1)` on its own line
                     // printed the next line and exited 0 — the silence this
                     // rule exists to stop.
-                    if (i + 1 < n || self.discarding)
+                    if disc
                         && matches!(stmt, Stmt::Expr(_))
                         && matches!(self.uni.shallow_resolve(&ty), Type::Var(_))
                     {
                         self.pending_discards.push((stmt_span(stmt), ty.clone()));
                     }
-                    if (i + 1 < n || self.discarding)
+                    if disc
                         && matches!(stmt, Stmt::Expr(_))
                         && matches!(self.uni.shallow_resolve(&ty), Type::Fallible(..))
                     {
@@ -3954,6 +3986,13 @@ Perform the effect after the closing brace, or yield a number and do the work ou
         // signature nobody can type.
         if matches!(self.uni.resolve(&recv_ty), Type::Error) {
             return Type::Error;
+        }
+        // Nothing determined the receiver's type, and the reason is reported
+        // where it belongs — at the literal that has no element type
+        // ([T-EMPTY-LIT]). "no method `to_str` on `_`" points at the method
+        // and names a type nobody can write.
+        if matches!(self.uni.resolve(&recv_ty), Type::Var(_)) {
+            return self.uni.fresh();
         }
         let shown = self.show(&recv_ty);
         self.error_help(

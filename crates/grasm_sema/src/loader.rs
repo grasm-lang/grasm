@@ -379,6 +379,7 @@ pub fn load_from_disk_in(
     let prefix_dirs = all_prefixes.clone();
     let canon = canon_of_dir.clone();
     let entry_dir_for_canon = entry_src_dir.clone();
+    let resolved_for_canon = resolved.clone();
     // Given the importing module and what it wrote, the module name this
     // import resolves to — or None to keep the one derived from the prefix.
     //
@@ -401,9 +402,21 @@ pub fn load_from_disk_in(
         }
         let root = written.split('.').next().unwrap_or(written);
         // A package the importing package declares, by whatever name the
-        // graph settled on.
+        // graph settled on. A *registry* dependency has no path in the
+        // manifest, so without the resolved map a package reached both
+        // directly and through another was loaded under two names — and the
+        // second one prefixed its own private modules with a sibling
+        // package's name, which resolved nowhere.
         let subs = package_dependencies(&pkg_dir);
-        let dir = subs.get(root)?;
+        let dir = subs
+            .get(root)
+            .or_else(|| {
+                dependency_names(&pkg_dir)
+                    .iter()
+                    .any(|d| d == root)
+                    .then(|| resolved_for_canon.get(root))
+                    .flatten()
+            })?;
         let key = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
         let want = canon.get(&key)?;
         Some(match written.split_once('.') {
