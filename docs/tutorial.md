@@ -466,10 +466,14 @@ not something a reviewer has to happen to notice.
 A capability is what a package needs from **outside** itself, so what counts is
 what *escapes*: the effects `main` performs, the effects left in a `pub`
 function's row for a consumer to handle, and the effects its `test` and `bench`
-bodies perform. That last one surprises people — a test is not part of the
-interface — but `grasm test` runs the tests of every imported module, so a
-dependency's test body really does execute in your process. The consequence is
-worth knowing: a `capabilities = []` package cannot `print` from a test. Every module in the package counts,
+bodies and its **doc examples** perform. That last group surprises people — a
+test is not part of the interface, and an example is documentation — but
+`grasm test` runs the tests *and the doc examples* of every imported module,
+so a dependency's test body and its `///` fenced blocks really do execute in
+your process. The consequence is worth knowing: a `capabilities = []` package
+cannot `print` from a test or from a doc example, which rules out the usual
+`/// print("{f(2)}")` — write the example as `assert(f(2) == 4)` instead, which
+performs nothing and checks more. Every module in the package counts,
 not only the ones its entry file imports — a consumer reaches `pub fn f` with
 `import dep.module` whether or not the dependency's own entry mentions that
 module, so a `capabilities = []` package could otherwise keep a filesystem
