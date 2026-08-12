@@ -291,7 +291,12 @@ fn run() -> ExitCode {
                 if let Some(t) = &target {
                     // Cross-target: emit the object only — linking needs a
                     // cross-linker and a runtime built for that target.
-                    let obj = format!("{out_path}.o");
+                    // `-o out.o` means that file, not `out.o.o`.
+                    let obj = if out_path.ends_with(".o") {
+                        out_path.clone()
+                    } else {
+                        format!("{out_path}.o")
+                    };
                     return match grasm_native::compile_object_for(
                         &program,
                         std::path::Path::new(&obj),

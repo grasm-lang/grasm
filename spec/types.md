@@ -36,8 +36,13 @@ the most repeated shape a counting program has — could not be written at all.
 the **result**. Only the parameters were checked, so
 `fn fresh[K](k: K) -> Map[K, i64]`, which puts the key type nowhere in its
 parameters, let `fresh(2.5)` past the checker and into a runtime
-`invalid map key`. A type parameter reaching a map *only* inside the body,
-mentioned in no part of the signature, is still not caught this way.
+`invalid map key`.
+
+A type parameter reaching a map *only* inside the body counts too, and is
+named in no part of the signature at all: `fn tally[T](xs: [T]) -> i64`
+holding a `Map[T, i64]` let `tally([1.5, 2.5])` through. What a body does with
+its type parameters is known once every body has been walked, so these call
+sites are checked at the end of the analysis rather than where they appear.
 
 **[T-TUPLE]** `(A, B, …)` is a fixed-size heterogeneous product.
 

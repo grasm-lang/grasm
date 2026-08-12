@@ -2,7 +2,19 @@
 //! expect: output
 //! a	b
 //! quote" brace{ close}
+//! [1]
+//! 😀 1 [128512]
+//! é
+//! [a, b]
 fn main() {
     print("a\tb")
     print("quote\" brace\{ close\}")
+    // A character with no other spelling. A group separator used to be
+    // written `"{1.to_char()}"` — an interpolation whose only purpose was to
+    // reach a character the source could not say.
+    print("\u{1}".codes())
+    let smile = "\u{1F600}"
+    print("{smile} {smile.len()} {smile.codes()}")
+    print("\u{e9}")
+    print("a\u{1}b".split("\u{1}"))
 }

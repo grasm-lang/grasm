@@ -122,6 +122,9 @@ fn check_modules(files: &[ModuleView]) -> Analysis {
         c.current_module = f.name.clone();
         c.check_module(f.module);
     }
+    // Every body has been walked, so a generic's own use of its type
+    // parameters as map keys is known ([T-MAP-KEY-GENERIC]).
+    c.flush_key_checks();
     // Resolved now: unification is finished, so a literal's element type has
     // whatever answer the whole body gave it.
     let mut unresolved: Vec<u32> = Vec::new();
@@ -256,6 +259,22 @@ struct Checker {
     uni: Unifier,
     diags: Vec<Diagnostic>,
     current_module: String,
+    /// Type parameters that reach a map key inside a generic function's own
+    /// body, by qualified function name.
+    ///
+    /// [T-MAP-KEY-GENERIC] applies the key rule at each call site, and the
+    /// signature is where it looked. A parameter that reaches a map *only*
+    /// inside the body is mentioned in no part of the signature, so
+    /// `fn tally[T](xs: [T]) -> i64` holding a `Map[T, i64]` let
+    /// `tally([1.5, 2.5])` past the checker and into a runtime
+    /// `invalid map key` — the one shape where a checked program still
+    /// panicked for a type error.
+    key_generics: HashMap<String, std::collections::BTreeSet<usize>>,
+    /// The generic function whose body is being checked, if any.
+    key_generic_owner: Option<String>,
+    /// Call sites of generic functions, checked once every body has been
+    /// walked — a call may be checked before the body it constrains.
+    pending_key_checks: Vec<(String, Vec<Type>, Span)>,
     /// module → (alias → full target module name)
     module_imports: HashMap<String, HashMap<String, String>>,
     scopes: Vec<HashMap<String, Binding>>,
@@ -335,6 +354,9 @@ impl Checker {
             uni: Unifier::new(),
             diags: Vec::new(),
             current_module: "main".to_string(),
+            key_generics: HashMap::new(),
+            key_generic_owner: None,
+            pending_key_checks: Vec::new(),
             module_imports: HashMap::new(),
             scopes: Vec::new(),
             closure_floors: Vec::new(),
@@ -1005,6 +1027,11 @@ land in a copy the caller never sees — return the new value from the operation
         // Generic params stay opaque (`Generic(i)`) while checking the body,
         // and are in scope for annotations written inside it.
         self.current_generics = f.generics.iter().map(|g| g.name.clone()).collect();
+        self.key_generic_owner = if f.generics.is_empty() {
+            None
+        } else {
+            Some(format!("{}::{}", self.current_module, f.name.name))
+        };
         self.fn_ret = info.ret.clone();
         self.err_open = f.name.name == "main" && info.err.is_none();
         self.fn_err = if f.name.name == "main" && info.err.is_none() {
@@ -1101,6 +1128,7 @@ land in a copy the caller never sees — return the new value from the operation
         }
         self.scopes.pop();
         self.current_generics.clear();
+        self.key_generic_owner = None;
     }
 
     // ------------------------------------------------------------------
@@ -2269,6 +2297,22 @@ afterwards has nowhere to send the effect — call it here, or return what it co
                 } else {
                     self.error(span, format!("type mismatch: expected `{w}`, found `{g}`"));
                 }
+            } else if match self.uni.shallow_resolve(want) {
+                // A value that cannot fail, where one that can is wanted.
+                // Half the arms of a `match` inside a fallible function are
+                // usually like this, and the message named two types without
+                // saying that the fix is on this side and is one word long.
+                Type::Fallible(ok, _) => {
+                    let ok = self.uni.resolve(&ok);
+                    !matches!(got_r, Type::Fallible(..)) && self.uni.unify(&got_r, &ok)
+                }
+                _ => false,
+            } {
+                self.error_help(
+                    span,
+                    format!("type mismatch: expected `{w}`, found `{g}`"),
+                    "a value that cannot fail is written `Ok(...)` here; in a `match`, either wrap the arms that cannot fail or add `try` to the ones that can, so every arm is the same shape",
+                );
             } else if matches!(
                 (&got_r, self.uni.shallow_resolve(want)),
                 (Type::I64, Type::F64) | (Type::F64, Type::I64)
@@ -3156,6 +3200,13 @@ fail outside it",
                 let e = substitute_generics(e, &fresh);
                 self.require_map_keys_within(&e, span);
             }
+            // And whatever the body does with them, which is only known once
+            // every body has been walked — this call may be checked first.
+            self.pending_key_checks.push((
+                format!("{}::{}", self.current_module, name),
+                fresh.clone(),
+                span,
+            ));
         }
         // Ownership Tier-0: `own` moves, `inout` needs an exclusive mutable place.
         let mut inout_roots: Vec<(String, Span)> = Vec::new();
@@ -4222,6 +4273,22 @@ Perform the effect after the closing brace, or yield a number and do the work ou
         }
     }
 
+    /// Applies each generic's recorded key constraints to its call sites.
+    fn flush_key_checks(&mut self) {
+        let pending = std::mem::take(&mut self.pending_key_checks);
+        for (name, fresh, span) in pending {
+            let Some(indices) = self.key_generics.get(&name).cloned() else {
+                continue;
+            };
+            for i in indices {
+                if let Some(t) = fresh.get(i) {
+                    let t = t.clone();
+                    self.require_map_key(&t, span);
+                }
+            }
+        }
+    }
+
     /// Map keys must be orderable primitives.
     fn require_map_key(&mut self, k: &Type, span: Span) {
         let r = self.uni.resolve(k);
@@ -4230,6 +4297,13 @@ Perform the effect after the closing brace, or yield a number and do the work ou
         // `fn bump[K](inout m: Map[K, i64], k: K)`, the most repeated shape
         // there is — could not be declared at all, and there are no bounds to
         // declare it with.
+        if let Type::Generic(i) = r {
+            // Written inside a generic function's own body: remember which
+            // parameter it was, so the call sites can be held to it.
+            if let Some(owner) = self.key_generic_owner.clone() {
+                self.key_generics.entry(owner).or_default().insert(i as usize);
+            }
+        }
         if !matches!(
             r,
             Type::I64 | Type::Str | Type::Bool | Type::Var(_) | Type::Generic(_) | Type::Error

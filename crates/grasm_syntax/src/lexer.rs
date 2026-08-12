@@ -134,6 +134,17 @@ impl<'a> Lexer<'a> {
     /// Does NOT skip newlines — they are tokens.
     fn skip_trivia(&mut self) {
         loop {
+            // A byte order mark at the very start of the file. It is legal
+            // UTF-8 and every editor that writes one expects to be ignored;
+            // lexed as a character it made the first declaration
+            // "unexpected character `\u{feff}`", which renders as nothing and
+            // names nothing.
+            if self.pos == 0 && self.bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
+                self.bump();
+                self.bump();
+                self.bump();
+                continue;
+            }
             match self.peek() {
                 b' ' | b'\t' | b'\r' => {
                     self.bump();
@@ -328,6 +339,68 @@ impl<'a> Lexer<'a> {
                         b'0' => cur.push('\0'),
                         b'{' => cur.push('{'),
                         b'}' => cur.push('}'),
+                        // `\u{1}`, `\u{1F600}` — a character named by its
+                        // code point. Without it a control character had no
+                        // spelling at all: a group separator was written
+                        // `"{1.to_char()}"`, an interpolation whose only job
+                        // was to reach a character the source could not say.
+                        b'u' => {
+                            if self.peek() != b'{' {
+                                return self.tok(
+                                    TokenKind::Error(
+                                        "`\\u` needs braces, as in `\\u{1F600}`".to_string(),
+                                    ),
+                                    start,
+                                );
+                            }
+                            self.bump();
+                            let digits_at = self.pos;
+                            // Bounded by the string, not by the file: an
+                            // escape missing its `}` used to scan past the
+                            // closing quote and report the rest of the line
+                            // as the code point.
+                            while self.pos < self.bytes.len()
+                                && self.peek() != b'}'
+                                && self.peek() != b'"'
+                                && self.peek() != b'\n'
+                                && self.pos - digits_at < 6
+                            {
+                                self.bump();
+                            }
+                            if self.pos >= self.bytes.len() || self.peek() != b'}' {
+                                return self.tok(
+                                    TokenKind::Error(
+                                        "unterminated `\\u{...}` escape — write up to six hex digits, then `}`"
+                                            .to_string(),
+                                    ),
+                                    start,
+                                );
+                            }
+                            let digits = self.src[digits_at..self.pos].to_string();
+                            self.bump();
+                            let ok = !digits.is_empty()
+                                && digits.len() <= 6
+                                && digits.chars().all(|c| c.is_ascii_hexdigit());
+                            let ch = if ok {
+                                u32::from_str_radix(&digits, 16).ok().and_then(char::from_u32)
+                            } else {
+                                None
+                            };
+                            match ch {
+                                Some(c) => cur.push(c),
+                                // A surrogate or a value past U+10FFFF is not
+                                // a character, and the string type holds
+                                // characters ([L-ENCODING]).
+                                None => {
+                                    return self.tok(
+                                        TokenKind::Error(format!(
+                                            "`\\u{{{digits}}}` is not a character — write up to six hex digits naming a code point below U+110000, and not a surrogate"
+                                        )),
+                                        start,
+                                    )
+                                }
+                            }
+                        }
                         _ => {
                             return self.tok(
                                 TokenKind::Error(format!("unknown escape `\\{}`", esc as char)),

@@ -44,6 +44,9 @@ struct Case {
 
 fn parse_case(path: &Path) -> Case {
     let source = std::fs::read_to_string(path).expect("readable conformance file");
+    // A leading byte order mark is ignored, the same as the compiler ignores
+    // one ([L-ENCODING]) — and one of these files begins with one on purpose.
+    let source = source.strip_prefix('\u{feff}').unwrap_or(&source).to_string();
     let name = path.file_name().unwrap().to_string_lossy().to_string();
 
     let mut tag = None;

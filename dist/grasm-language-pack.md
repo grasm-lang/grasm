@@ -22,7 +22,11 @@ Notation: `|` alternation, `?` optional, `*` zero or more, `+` one or more,
 
 **[L-ENCODING]** A source file is a sequence of UTF-8 encoded Unicode
 characters. Identifiers and keywords are restricted to ASCII; string literals
-and comments may contain any Unicode character.
+and comments may contain any Unicode character. A byte order mark at the very
+start of the file is ignored: it is legal UTF-8, editors write one without
+being asked, and lexed as a character it made the first declaration
+"unexpected character `\u{feff}`" — a message that renders as nothing and
+names nothing.
 
 **[L-NEWLINE]** A newline (U+000A, optionally preceded by U+000D) terminates a
 statement. Consecutive newlines are equivalent to one. Inside `(` … `)` and
@@ -87,7 +91,15 @@ sample, an expected report — otherwise means a list of strings joined on
 than data. The one thing a raw block cannot contain is `"""`.
 
 **[L-ESCAPE]** Recognized escapes: `\n`, `\t`, `\r`, `\\`, `\"`, `\0`, `\{`,
-`\}`. Any other escape is a lexical error.
+`\}`, and `\u{...}` — one to six hexadecimal digits naming a code point. Any
+other escape is a lexical error, as is a `\u{...}` naming a surrogate or a
+value at or above U+110000: those are not characters, and a string holds
+characters ([L-ENCODING]).
+
+`\u{...}` is how a character with no other spelling is written. Without it a
+control character could not be put in a literal at all — a group separator was
+written `"{1.to_char()}"`, an interpolation whose only purpose was to reach a
+character the source could not say.
 
 **[L-INTERP]** `{` inside a string begins an interpolation whose contents are
 parsed as an expression and whose value is converted to text. Braces nest. A
@@ -401,8 +413,13 @@ the most repeated shape a counting program has — could not be written at all.
 the **result**. Only the parameters were checked, so
 `fn fresh[K](k: K) -> Map[K, i64]`, which puts the key type nowhere in its
 parameters, let `fresh(2.5)` past the checker and into a runtime
-`invalid map key`. A type parameter reaching a map *only* inside the body,
-mentioned in no part of the signature, is still not caught this way.
+`invalid map key`.
+
+A type parameter reaching a map *only* inside the body counts too, and is
+named in no part of the signature at all: `fn tally[T](xs: [T]) -> i64`
+holding a `Map[T, i64]` let `tally([1.5, 2.5])` through. What a body does with
+its type parameters is known once every body has been walked, so these call
+sites are checked at the end of the analysis rather than where they appear.
 
 **[T-TUPLE]** `(A, B, …)` is a fixed-size heterogeneous product.
 
@@ -5070,12 +5087,18 @@ fn main() {
 ## `L-ENCODING.gr`
 
 ```grasm
-//! tag: L-ENCODING
+﻿//! tag: L-ENCODING
 //! expect: output
 //! héllo ✓ 日本語
+//! no bom in sight
 fn main() {
     // Source is UTF-8; strings and comments may hold any Unicode: ✓ 日本語
     print("héllo ✓ 日本語")
+    // This file begins with a byte order mark. It is ignored — legal UTF-8
+    // that editors write unasked, and lexed as a character it made the first
+    // declaration "unexpected character" for something that renders as
+    // nothing.
+    print("no bom in sight")
 }
 ```
 
@@ -5086,9 +5109,21 @@ fn main() {
 //! expect: output
 //! a	b
 //! quote" brace{ close}
+//! [1]
+//! 😀 1 [128512]
+//! é
+//! [a, b]
 fn main() {
     print("a\tb")
     print("quote\" brace\{ close\}")
+    // A character with no other spelling. A group separator used to be
+    // written `"{1.to_char()}"` — an interpolation whose only purpose was to
+    // reach a character the source could not say.
+    print("\u{1}".codes())
+    let smile = "\u{1F600}"
+    print("{smile} {smile.len()} {smile.codes()}")
+    print("\u{e9}")
+    print("a\u{1}b".split("\u{1}"))
 }
 ```
 
@@ -7251,8 +7286,21 @@ fn fresh[K](k: K) -> Map[K, i64] {
     m
 }
 
+// And a parameter that reaches a map only *inside* a body, named in no part
+// of the signature: `tally` returns an `i64` and takes a `[T]`, so nothing in
+// what it declares says `T` is a key. It was the last shape where a checked
+// program still panicked for a type error.
+fn tally[T](xs: [T]) -> i64 {
+    var m: Map[T, i64] = {}
+    for x in xs {
+        m.set(x, 1)
+    }
+    m.len()
+}
+
 fn main() {
     print("{fresh(2.5)}")
+    print("{tally([1.5, 2.5])}")
 }
 ```
 

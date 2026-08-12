@@ -1,7 +1,13 @@
-//! tag: L-ENCODING
+﻿//! tag: L-ENCODING
 //! expect: output
 //! héllo ✓ 日本語
+//! no bom in sight
 fn main() {
     // Source is UTF-8; strings and comments may hold any Unicode: ✓ 日本語
     print("héllo ✓ 日本語")
+    // This file begins with a byte order mark. It is ignored — legal UTF-8
+    // that editors write unasked, and lexed as a character it made the first
+    // declaration "unexpected character" for something that renders as
+    // nothing.
+    print("no bom in sight")
 }

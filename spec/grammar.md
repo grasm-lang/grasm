@@ -7,7 +7,11 @@ Notation: `|` alternation, `?` optional, `*` zero or more, `+` one or more,
 
 **[L-ENCODING]** A source file is a sequence of UTF-8 encoded Unicode
 characters. Identifiers and keywords are restricted to ASCII; string literals
-and comments may contain any Unicode character.
+and comments may contain any Unicode character. A byte order mark at the very
+start of the file is ignored: it is legal UTF-8, editors write one without
+being asked, and lexed as a character it made the first declaration
+"unexpected character `\u{feff}`" — a message that renders as nothing and
+names nothing.
 
 **[L-NEWLINE]** A newline (U+000A, optionally preceded by U+000D) terminates a
 statement. Consecutive newlines are equivalent to one. Inside `(` … `)` and
@@ -72,7 +76,15 @@ sample, an expected report — otherwise means a list of strings joined on
 than data. The one thing a raw block cannot contain is `"""`.
 
 **[L-ESCAPE]** Recognized escapes: `\n`, `\t`, `\r`, `\\`, `\"`, `\0`, `\{`,
-`\}`. Any other escape is a lexical error.
+`\}`, and `\u{...}` — one to six hexadecimal digits naming a code point. Any
+other escape is a lexical error, as is a `\u{...}` naming a surrogate or a
+value at or above U+110000: those are not characters, and a string holds
+characters ([L-ENCODING]).
+
+`\u{...}` is how a character with no other spelling is written. Without it a
+control character could not be put in a literal at all — a group separator was
+written `"{1.to_char()}"`, an interpolation whose only purpose was to reach a
+character the source could not say.
 
 **[L-INTERP]** `{` inside a string begins an interpolation whose contents are
 parsed as an expression and whose value is converted to text. Braces nest. A

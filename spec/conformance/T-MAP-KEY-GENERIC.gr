@@ -12,6 +12,19 @@ fn fresh[K](k: K) -> Map[K, i64] {
     m
 }
 
+// And a parameter that reaches a map only *inside* a body, named in no part
+// of the signature: `tally` returns an `i64` and takes a `[T]`, so nothing in
+// what it declares says `T` is a key. It was the last shape where a checked
+// program still panicked for a type error.
+fn tally[T](xs: [T]) -> i64 {
+    var m: Map[T, i64] = {}
+    for x in xs {
+        m.set(x, 1)
+    }
+    m.len()
+}
+
 fn main() {
     print("{fresh(2.5)}")
+    print("{tally([1.5, 2.5])}")
 }
