@@ -15,8 +15,19 @@ fn risky() -> i64 ! E {
     1
 }
 
+fn risky_of(n: i64) -> i64 ! E {
+    n
+}
+
 fn main() {
     let v = risky()
+    // A call to a `let`-bound closure. Its return type is not known until the
+    // body is checked, and the bodies wait for a call site to say what the
+    // parameters are — so the check ran too early, saw an inference variable
+    // rather than a fallible type, and this line printed the next one and
+    // exited 0.
+    let f = |x| risky_of(x)
+    f(1)
     if true {
         risky()
     }

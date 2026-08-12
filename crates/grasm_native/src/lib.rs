@@ -2338,6 +2338,51 @@ fn collect_calls_expr(e: &Expr, bound: &[String], out: &mut HashMap<String, Vec<
                 }
             }
         }
+        // The shapes a call can hide in. A closure whose only call site was a
+        // `match` scrutinee, an `if` branch, or a field read had no parameter
+        // types to be found, and the backend refused it for having none —
+        // `let h = |x| risky(x)` followed by `match h(-1) { ... }`.
+        Expr::Field { recv, .. } => collect_calls_expr(recv, bound, out),
+        Expr::Index { recv, index, .. } => {
+            collect_calls_expr(recv, bound, out);
+            collect_calls_expr(index, bound, out);
+        }
+        Expr::Block(b) | Expr::Unsafe(b) | Expr::Region(b) => {
+            for st in &b.stmts {
+                collect_calls_stmt(st, bound, out);
+            }
+        }
+        Expr::If {
+            cond,
+            then_block,
+            else_branch,
+            ..
+        } => {
+            collect_calls_expr(cond, bound, out);
+            for st in &then_block.stmts {
+                collect_calls_stmt(st, bound, out);
+            }
+            match else_branch.as_deref() {
+                Some(grasm_syntax::ast::ElseBranch::Else(b)) => {
+                    for st in &b.stmts {
+                        collect_calls_stmt(st, bound, out);
+                    }
+                }
+                Some(grasm_syntax::ast::ElseBranch::ElseIf(e)) => {
+                    collect_calls_expr(e, bound, out)
+                }
+                None => {}
+            }
+        }
+        Expr::Match { scrutinee, arms, .. } => {
+            collect_calls_expr(scrutinee, bound, out);
+            for a in arms {
+                collect_calls_expr(&a.body, bound, out);
+                if let Some(g) = &a.guard {
+                    collect_calls_expr(g, bound, out);
+                }
+            }
+        }
         _ => {}
     }
 }

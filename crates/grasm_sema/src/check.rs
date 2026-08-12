@@ -125,6 +125,7 @@ fn check_modules(files: &[ModuleView]) -> Analysis {
     // Every body has been walked, so a generic's own use of its type
     // parameters as map keys is known ([T-MAP-KEY-GENERIC]).
     c.flush_key_checks();
+    c.flush_discards();
     // Resolved now: unification is finished, so a literal's element type has
     // whatever answer the whole body gave it.
     let mut unresolved: Vec<u32> = Vec::new();
@@ -275,6 +276,9 @@ struct Checker {
     /// Call sites of generic functions, checked once every body has been
     /// walked — a call may be checked before the body it constrains.
     pending_key_checks: Vec<(String, Vec<Type>, Span)>,
+    /// Discarded statements whose type was still an inference variable when
+    /// the statement was checked, resolved once the whole program is typed.
+    pending_discards: Vec<(Span, Type)>,
     /// module → (alias → full target module name)
     module_imports: HashMap<String, HashMap<String, String>>,
     scopes: Vec<HashMap<String, Binding>>,
@@ -357,6 +361,7 @@ impl Checker {
             key_generics: HashMap::new(),
             key_generic_owner: None,
             pending_key_checks: Vec::new(),
+            pending_discards: Vec::new(),
             module_imports: HashMap::new(),
             scopes: Vec::new(),
             closure_floors: Vec::new(),
@@ -1198,6 +1203,18 @@ land in a copy the caller never sees — return the new value from the operation
                     // unwritable path printed "wrote the report", exit 0,
                     // nothing on stderr and no file — and every user function
                     // that can fail did the same ([T-FALLIBLE-UNHANDLED]).
+                    // Not resolved yet, and it may become fallible: a call
+                    // to a closure has the closure's body's type, and closure
+                    // bodies are checked after the block that binds them.
+                    // `let f = |x| risky(x)` then `f(-1)` on its own line
+                    // printed the next line and exited 0 — the silence this
+                    // rule exists to stop.
+                    if (i + 1 < n || self.discarding)
+                        && matches!(stmt, Stmt::Expr(_))
+                        && matches!(self.uni.shallow_resolve(&ty), Type::Var(_))
+                    {
+                        self.pending_discards.push((stmt_span(stmt), ty.clone()));
+                    }
                     if (i + 1 < n || self.discarding)
                         && matches!(stmt, Stmt::Expr(_))
                         && matches!(self.uni.shallow_resolve(&ty), Type::Fallible(..))
@@ -4273,6 +4290,44 @@ Perform the effect after the closing brace, or yield a number and do the work ou
         }
     }
 
+    /// Checks the deferred closure body that produces `t`, if there is one.
+    ///
+    /// A closure with parameters waits for a call site to say what they are,
+    /// so its return type is an inference variable until its body is checked.
+    /// Anything that needs the *shape* of that type — not just to unify with
+    /// it — has to ask for the body now.
+    fn force_deferred(&mut self, t: &Type) -> bool {
+        let Type::Var(v) = self.uni.shallow_resolve(t) else {
+            return false;
+        };
+        for depth in (0..self.deferred_closures.len()).rev() {
+            let hit = self.deferred_closures[depth].iter().position(|d| {
+                matches!(self.uni.shallow_resolve(&d.ret), Type::Var(w) if w == v)
+            });
+            if let Some(i) = hit {
+                let d = self.deferred_closures[depth].remove(i);
+                self.check_deferred_closure(d);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Reports discarded failures whose type only became known later.
+    fn flush_discards(&mut self) {
+        let pending = std::mem::take(&mut self.pending_discards);
+        for (span, ty) in pending {
+            if matches!(self.uni.shallow_resolve(&ty), Type::Fallible(..)) {
+                let shown = self.show(&ty);
+                self.error_help(
+                    span,
+                    format!("this expression can fail (`{shown}`) and its failure is discarded"),
+                    "use `try` to propagate it, `match` to handle both cases, or `??` with a fallback to say what should happen instead",
+                );
+            }
+        }
+    }
+
     /// Applies each generic's recorded key constraints to its call sites.
     fn flush_key_checks(&mut self) {
         let pending = std::mem::take(&mut self.pending_key_checks);
@@ -4485,6 +4540,13 @@ the state through an `inout` parameter",
             }
             Coalesce => {
                 let lhs_ty = self.infer_expr(lhs);
+                // A call to a `let`-bound closure has the closure's body's
+                // type, and those bodies wait for their parameter types.
+                // Here the call itself has just supplied them, so the body
+                // can be checked now — without this, `f(1) ?? 0` for
+                // `let f = |x| risky(x)` was refused for a left side whose
+                // type the checker was about to work out.
+                self.force_deferred(&lhs_ty);
                 match self.uni.shallow_resolve(&lhs_ty) {
                     Type::Named { id, args } if id == self.defs.option_id => {
                         let inner = args[0].clone();
@@ -4559,6 +4621,10 @@ the state through an `inout` parameter",
             );
         }
         let t = self.infer_expr(inner);
+        // As in `??`: a call to a `let`-bound closure has just fixed that
+        // closure's parameter types, so its body can be checked now — and
+        // `try` needs the shape of the answer, not just to unify with it.
+        self.force_deferred(&t);
         match self.uni.shallow_resolve(&t) {
             Type::Fallible(ok, err) => {
                 match self.fn_err.clone() {
@@ -4639,6 +4705,9 @@ the state through an `inout` parameter",
         want: Option<&Type>,
     ) -> Type {
         let scrut_ty = self.infer_expr(scrutinee);
+        // The patterns are matched against the *shape* of this type, so a
+        // closure call's deferred body has to be checked first.
+        self.force_deferred(&scrut_ty);
         // Matching through a reference matches what it points at. Without
         // this a `ref` to a sum type could never be opened — `r.v` said "sum
         // types are accessed via match" and the match said "pattern cannot
