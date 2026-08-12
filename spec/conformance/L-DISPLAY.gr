@@ -24,6 +24,8 @@
 //! ref#0.0
 //! [ref#0.0]
 //! Some(ref#0.0)
+//! <fn main::dbl>
+//! <closure>
 // Every type's rendering, because a program's output is what its correctness
 // is judged on. Strings are unquoted even inside a collection, so `[a, b c]`
 // is two elements and the second contains a space.
@@ -77,4 +79,13 @@ fn main() {
     print("{[r]}")
     print("{Some(r)}")
     release(r)
+    // A function value shows the name it was declared with; a closure has
+    // none to show. Both render, and [L-DISPLAY] is what output is judged on.
+    print("{dbl}")
+    let c: fn(i64) -> i64 = |x| x + 1
+    print("{c}")
+}
+
+fn dbl(n: i64) -> i64 {
+    n * 2
 }

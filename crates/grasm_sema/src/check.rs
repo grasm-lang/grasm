@@ -1251,7 +1251,17 @@ with a fallback to say what should happen instead",
         for (p, t) in d.params.iter().zip(&d.param_tys) {
             self.bind(p, t.clone(), false);
         }
+        self.deferred_closures.push(Vec::new());
         let produced = self.infer_expr(&d.body);
+        // A closure literal *inside* this body waits for its own call site,
+        // and this body's parameters are in scope for it — here and nowhere
+        // else. Left on the enclosing block's list it was checked after this
+        // scope was gone, so `let mk = |n| |m| n + m` reported "unknown name
+        // `n`" about the parameter one line to its left.
+        while let Some(next) = self.deferred_closures.last_mut().and_then(|v| v.pop()) {
+            self.check_deferred_closure(next);
+        }
+        self.deferred_closures.pop();
         self.closure_floors.pop();
         self.scopes.pop();
         if !self.uni.unify(&produced, &d.ret) {
@@ -2021,6 +2031,58 @@ declaration into the region, or compute a number and yield that",
 afterwards has nowhere to send the effect — call it here, or return what it computed",
                 );
                 return;
+            }
+        }
+    }
+
+    /// Refuses carrying a `with`-discharged row into a call that writes to a
+    /// place declared outside the block.
+    ///
+    /// What escapes is the *store*, not the call: passing a closure to
+    /// `xs.map(f)` is fine, because nothing outliving the block keeps it.
+    /// An `inout` argument rooted before the `with` is exactly a place that
+    /// does.
+    fn reject_handler_escape_through_call(&mut self, args: &[Expr], info: &FnInfo, span: Span) {
+        // Which effects this call could carry out, and where they came from.
+        let mut carried: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        for (a, p) in args.iter().zip(&info.params) {
+            carried.extend(self.row_carried_by(p));
+            // A closure literal's row is known from the effect pass, and a
+            // type parameter erases it: `T` says nothing about what the
+            // value it stands for performs.
+            if let Some(row) = self.closure_rows.get(&a.span().start) {
+                carried.extend(row.iter().cloned());
+            }
+        }
+        if carried.is_empty() {
+            return;
+        }
+        for ((a, _), mode) in args.iter().zip(&info.params).zip(&info.modes) {
+            if *mode != ParamMode::Inout {
+                continue;
+            }
+            let Some(id) = place_root(a) else { continue };
+            let Some(declared_at) = self
+                .scopes
+                .iter()
+                .rposition(|sc| sc.contains_key(&id.name))
+            else {
+                continue;
+            };
+            let floors = self.with_floors.clone();
+            for (effect, floor) in floors {
+                if declared_at < floor && carried.contains(&effect) {
+                    self.error_help(
+                        span,
+                        format!(
+                            "cannot pass a function that performs `{effect}` to a call that writes to `{}` — it was declared outside the `with` block",
+                            id.name
+                        ),
+                        "the handler is installed only for this block, so the value would be called afterwards with nowhere to send the effect — call it here, or store what it computed",
+                    );
+                    return;
+                }
             }
         }
     }
@@ -3109,6 +3171,11 @@ fail outside it",
             self.reject_region_escape(id, "call");
         }
         let callee_ty = self.infer_expr(callee);
+        // Calling something whose type a deferred closure body will supply:
+        // `let mk = |n| |m| n + m` then `mk(3)(4)` through a binding. The
+        // shape has to exist before the arguments can be checked against it,
+        // and the call that fixed `mk`'s parameters has already happened.
+        self.force_deferred(&callee_ty);
         match self.uni.shallow_resolve(&callee_ty) {
             Type::Fn { params, ret, .. } => {
                 if args.len() != params.len() {
@@ -3224,6 +3291,18 @@ fail outside it",
                 fresh.clone(),
                 span,
             ));
+        }
+        // A handler's discharge may not leave its block through a call that
+        // writes to a place declared before it. The direct spellings —
+        // `outer = closure` and `outer.push(closure)` — are refused where
+        // they are written; this is the same store one call deep, and a
+        // generic parameter hides the function type from the row analysis
+        // entirely: `keep[T](inout xs: [T], v: T)` carried
+        // `|| Cfg.value()` out of its `with` and dispatched it to a different
+        // handler, with both engines agreeing on the wrong answer
+        // ([E-HANDLER-MISSING]).
+        if !self.with_floors.is_empty() {
+            self.reject_handler_escape_through_call(args, info, span);
         }
         // Ownership Tier-0: `own` moves, `inout` needs an exclusive mutable place.
         let mut inout_roots: Vec<(String, Span)> = Vec::new();
@@ -3455,7 +3534,20 @@ fail outside it",
                                 "mark it `pub fn` to allow cross-module use",
                             );
                         }
-                        None => {}
+                        // The module is imported and the member is not
+                        // there. Falling through reported "unknown name
+                        // `util`" about the module — which exists — and
+                        // advised declaring it with `let`. The call position
+                        // already said the right thing.
+                        None => {
+                            return self.error(
+                                name.span,
+                                format!(
+                                    "module `{target_mod}` has no function `{}`",
+                                    name.name
+                                ),
+                            );
+                        }
                     }
                 }
             }
@@ -3645,6 +3737,26 @@ Perform the effect after the closing brace, or yield a number and do the work ou
                 }
             }
         }
+        // A mutating method writes to its receiver, and inside a region a
+        // write to something declared outside is the whole problem. Asked
+        // before the receiver is typed, so that is the error the reader sees:
+        // typed first, `keep.push(Box{ f: || made })` reported "a function
+        // value cannot be used inside a region" about `keep`, with help
+        // asking for a closure written inside the region — which it was.
+        if self.region_depth > 0
+            && matches!(
+                name.name.as_str(),
+                "push" | "pop" | "set" | "delete" | "sort" | "sort_by" | "remove"
+            )
+        {
+            let mut root = recv;
+            while let Expr::Field { recv, .. } | Expr::Index { recv, .. } = root {
+                root = recv;
+            }
+            if let Expr::Ident(id) = root {
+                self.reject_region_escape(id, "mutate");
+            }
+        }
         let recv_ty = self.infer_expr(recv);
         let recv_res = self.uni.resolve(&recv_ty);
         if let Some(result) = self.builtin_method(&recv_res, recv, name, args, span) {
@@ -3688,6 +3800,13 @@ Perform the effect after the closing brace, or yield a number and do the work ou
                 }
                 return *ret;
             }
+        }
+        // The receiver's type is already broken, and the error that broke it
+        // has been reported. Saying "no method `len` on `<error>`" adds
+        // nothing, and the help suggested writing `fn len(<error>, ...)` — a
+        // signature nobody can type.
+        if matches!(self.uni.resolve(&recv_ty), Type::Error) {
+            return Type::Error;
         }
         let shown = self.show(&recv_ty);
         self.error_help(
@@ -4730,6 +4849,7 @@ the state through an `inout` parameter",
         let mut has_irrefutable = false;
         let before = self.moved_snapshot();
         let mut arm_states: Vec<Vec<Vec<(String, bool)>>> = Vec::new();
+        let mut deferred_literals: Vec<&Expr> = Vec::new();
         for arm in arms {
             // Each arm starts from the state before the match: at most one of
             // them runs, so a move in an earlier arm has not happened here.
@@ -4747,9 +4867,22 @@ the state through an `inout` parameter",
                     Some(t) => covered.extend(t.split('\u{1}').map(str::to_string)),
                 }
             }
-            self.check_expr(&arm.body, &result);
+            // Integer literals last, as in a list or a map's values: whatever
+            // fixes the type does it first, so `match n { 1 -> 2  _ -> 3.5 }`
+            // and the same two arms the other way round both produce `f64`.
+            // Checked in order, the first arm decided for all of them — the
+            // asymmetry [T-INT-TO-FLOAT-CARRIED] says is fixed, and was, for
+            // every carrier except this one.
+            if Self::is_int_literal(&arm.body) {
+                deferred_literals.push(&arm.body);
+            } else {
+                self.check_expr(&arm.body, &result);
+            }
             self.scopes.pop();
             arm_states.push(self.moved_snapshot());
+        }
+        for body in deferred_literals {
+            self.check_expr(body, &result);
         }
         self.restore_moved(&before);
         self.merge_moved(&arm_states);
@@ -5147,6 +5280,11 @@ the state through an `inout` parameter",
         for (p, t) in params.iter().zip(&param_tys) {
             self.bind(p, t.clone(), false);
         }
+        // Closures deferred by this body belong to this scope, where this
+        // closure's parameters are bound. On the enclosing block's list they
+        // were checked after it was gone, so an annotated
+        // `|n| |m| n + m` reported "unknown name `n`" ([E-CLOSURE-CAPTURE]).
+        self.deferred_closures.push(Vec::new());
         // A closure filling a fallible slot — a handler for an operation that
         // declares `! E` — is checked the way a fallible function body is:
         // producing a plain `T` is producing `Ok(T)`, and `fail` inside it
@@ -5173,6 +5311,10 @@ the state through an `inout` parameter",
             self.infer_expr(body)
         };
         self.fn_err = saved_err;
+        while let Some(next) = self.deferred_closures.last_mut().and_then(|v| v.pop()) {
+            self.check_deferred_closure(next);
+        }
+        self.deferred_closures.pop();
         self.closure_floors.pop();
         self.scopes.pop();
         Type::Fn {

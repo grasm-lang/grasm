@@ -1645,10 +1645,16 @@ came to be documented as returning `Option[str]` when it is fallible.
 | `map()` | `() -> Map[K, V]` | a new empty map |
 | `now_millis()` | `() -> i64` | milliseconds since the epoch; `io` |
 | `env(name)` | `(str) -> Option[str]` | environment variable; `io` |
-| `exit(code)` | `(i64)` | ends the program with that status |
+| `exit(code)` | `(i64)` | ends the program with that status — its low eight bits ([L-LIB-EXIT]) |
 | `read_file(p)` | `(str) -> str ! IoError` | fallible, not `Option`; `io` ([L-LIB-IO]) |
 | `write_file(p, s)` | `(str, str) -> () ! IoError` | fallible; `io` ([L-LIB-IO]) |
 | `file_exists(p)` | `(str) -> bool` | `io` |
+
+**[L-LIB-EXIT]** `exit(code)` ends the program with the **low eight bits** of
+`code`, which is what an operating system reports and what C's `exit` does with
+the same number: `exit(-1)` is 255 and `exit(256)` is 0. Clamping to 0..=255
+instead was worse in the direction that matters — it made `exit(-1)`, the most
+common spelling of "fail" in a script, report *success*.
 
 **[L-LIB-IO]** The three ways a library call reports "no": `read_file` is
 **fallible** (`str ! IoError`) because a failure has a reason worth reading —
@@ -1677,6 +1683,11 @@ is judged on.
 | variant with fields | `Name(v, …)` | `B(7)` |
 | variant without | `Name` | `A` |
 | `Option[T]` | `Some(v)` or `None` | `Some(1)` |
+| `ref T` | the slot it names and that slot's generation, never what it points at — the value may already be gone, and reading it to render would be the use-after-free the tier prevents | `ref#0.0` |
+| a named function | `<fn module::name>` | `<fn main::dbl>` |
+| a closure | `<closure>` — it has no name to show | |
+| a handler | a struct with the operation names as fields | `CHandler{now: <closure>}` |
+| a range | `start..end`, as written | `1..5` |
 
 Strings nested inside a collection are **not** quoted, so `[a, b c]` is a
 two-element list whose second element contains a space. Rendering is for people
@@ -2389,6 +2400,11 @@ build fails — so there are no `Send`/`Sync` bounds to satisfy and no race
 detector to run. Results come back in input order whatever the core count is,
 so the answer never depends on the machine.
 
+Which is also why only the compiled backend actually uses them: `grasm run`
+and `grasm build -o` produce a bundled *interpreter*, and there a `par_map` is
+a `map`. The answer is identical — that is the whole point of requiring purity
+— but the throughput is not, so measure with `grasm build --native`.
+
 A panicking task aborts the whole scope; tasks spawned after it do not run.
 
 The two forms divide the work between them, and it is worth knowing which you
@@ -2658,6 +2674,7 @@ runs only under `grasm run`:
 | calling a function value through anything but a name | `TABLE[0](21)`, `(m.get(k) ?? d)(x)` — bind it with `let` first, then call it |
 | a UFCS call of a *generic* free function | `[1, 2].describe()` for `fn describe[T](xs: [T])` — write `describe([1, 2])` |
 | an effect handler as a **struct field** type | `type Box = { h: CfgHandler }` — bind the handler with `let` instead |
+| a generic instantiated at a handler type | `f(h)` for `fn f[T](x: T)` — pass what the handler computes instead |
 | polymorphic recursion | `fn f[T](x: T) -> i64 { f([x]) }` — one compiled copy per type, and the types never stop growing |
 
 Each of these is a defect being worked off, not a design boundary. The list is
@@ -5032,6 +5049,8 @@ fn main() {
 //! ref#0.0
 //! [ref#0.0]
 //! Some(ref#0.0)
+//! <fn main::dbl>
+//! <closure>
 // Every type's rendering, because a program's output is what its correctness
 // is judged on. Strings are unquoted even inside a collection, so `[a, b c]`
 // is two elements and the second contains a space.
@@ -5085,6 +5104,15 @@ fn main() {
     print("{[r]}")
     print("{Some(r)}")
     release(r)
+    // A function value shows the name it was declared with; a closure has
+    // none to show. Both render, and [L-DISPLAY] is what output is judged on.
+    print("{dbl}")
+    let c: fn(i64) -> i64 = |x| x + 1
+    print("{c}")
+}
+
+fn dbl(n: i64) -> i64 {
+    n * 2
 }
 ```
 
@@ -5326,6 +5354,23 @@ fn hash(s: str) -> i64 {
         h = (h * 31 + c) % 1000007
     }
     h
+}
+```
+
+## `L-LIB-EXIT.gr`
+
+```grasm
+//! tag: L-LIB-EXIT
+//! expect: output-failing
+//! about to fail
+// `exit(code)` ends the program with the low eight bits of `code`.
+//
+// Clamping to 0..=255 instead reported *success* for `exit(-1)`, which is the
+// most common spelling of "fail" in a script: the shell saw 0, and the three
+// engines agreed on it.
+fn main() {
+    print("about to fail")
+    exit(-1)
 }
 ```
 

@@ -1,0 +1,12 @@
+//! tag: L-LIB-EXIT
+//! expect: output-failing
+//! about to fail
+// `exit(code)` ends the program with the low eight bits of `code`.
+//
+// Clamping to 0..=255 instead reported *success* for `exit(-1)`, which is the
+// most common spelling of "fail" in a script: the shell saw 0, and the three
+// engines agreed on it.
+fn main() {
+    print("about to fail")
+    exit(-1)
+}

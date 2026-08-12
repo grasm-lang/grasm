@@ -162,6 +162,7 @@ for "no problem found" to mean anything.
 - `L-LIB-CMP` — provisional
 - `L-LIB-CODES` — provisional
 - `L-LIB-FIXED` — provisional
+- `L-LIB-EXIT` — provisional
 - `L-LIB-FREE` — provisional
 - `L-LIB-IO` — provisional
 - `L-LIB-LIST` — provisional

@@ -92,7 +92,7 @@ fn run() -> ExitCode {
                 grasm_interp::run_program_traced(&program, &prog_args, &mut stdout);
             let _ = stdout.flush();
             print_trace(&program, &trace);
-            ExitCode::from(code.clamp(0, 255) as u8)
+            ExitCode::from((code & 0xff) as u8)
         }
         Some("test") => {
             let Some(path) = args.get(1).filter(|a| !a.starts_with("--")) else {
@@ -429,7 +429,7 @@ fn run() -> ExitCode {
                     println!("ok: `{path}` is formatted");
                     ExitCode::SUCCESS
                 } else {
-                    eprintln!("`{path}` is not canonically formatted (run `grasm fmt {path}`)");
+                    eprintln!("`{path}` is not canonically indented (run `grasm fmt {path}`)");
                     ExitCode::FAILURE
                 }
             } else if formatted != src {
@@ -585,7 +585,7 @@ fn run() -> ExitCode {
             eprintln!("      --no-incremental         one object, no cache (best for a single build)");
             eprintln!("  doc <file.gr> [-o out.md]    API documentation from `///` comments");
             eprintln!("  api <file.gr> [--against F]  public surface, and what changed in it");
-            eprintln!("  fmt <file.gr> [--check]      canonical formatting");
+            eprintln!("  fmt <file.gr> [--check]      re-indent (4 spaces per level); line contents are left alone");
             eprintln!("  lsp                          language server (stdio)");
             eprintln!("  dap                          debug adapter (stdio) — breakpoints, stepping");
             eprintln!("  deps [dir]                   resolve dependencies, check capabilities, write grasm.lock");
@@ -690,7 +690,18 @@ fn registry_packages(path: &std::path::Path) -> Result<HashMap<String, PathBuf>,
     };
     let manifest = grasm_pkg::Manifest::load(&pkg_dir)?;
     if manifest.dependencies.iter().all(|d| d.path.is_some()) {
-        return Ok(HashMap::new());
+        // A *nested* package may still want the registry: this package's own
+        // dependencies being paths says nothing about theirs. Attempted, not
+        // required — a graph that is entirely paths must not start needing a
+        // registry to build.
+        return Ok(grasm_pkg::resolve(&pkg_dir)
+            .map(|r| {
+                r.packages
+                    .iter()
+                    .map(|p| (p.name.clone(), p.dir.clone()))
+                    .collect()
+            })
+            .unwrap_or_default());
     }
     let resolution = grasm_pkg::resolve(&pkg_dir)?;
     Ok(resolution
@@ -1149,7 +1160,7 @@ fn run_bundle(bundle: &Bundle, program_args: &[String]) -> ExitCode {
     let (code, trace, _fault) = grasm_interp::run_program_traced(&program, program_args, &mut stdout);
     let _ = stdout.flush();
     print_trace(&program, &trace);
-    ExitCode::from(code.clamp(0, 255) as u8)
+    ExitCode::from((code & 0xff) as u8)
 }
 
 /// Prints a panic's call stack, innermost frame first.
@@ -1361,11 +1372,50 @@ fn build_native_incremental(
     } else if cfg!(target_os = "linux") {
         link.arg("-Wl,--gc-sections");
     }
-    let status = link
-        .status()
+    // Captured rather than inherited: the linker's own text names a temporary
+    // object file, an internal symbol and an architecture, and four lines of
+    // it arrived before grasm's own one-line diagnostic. The one thing in it
+    // a reader needs is which symbol was missing.
+    let out = link
+        .output()
         .map_err(|e| format!("failed to run `cc`: {e}"))?;
-    if !status.success() {
-        return Err("linking failed".into());
+    if !out.status.success() {
+        let text = String::from_utf8_lossy(&out.stderr);
+        let missing: Vec<String> = text
+            .lines()
+            .filter_map(|l| {
+                let l = l.trim();
+                // `"_sym", referenced from:` (macOS) and
+                // `undefined reference to \`sym'` (GNU ld).
+                let name = if let Some(rest) = l.strip_prefix('"') {
+                    rest.split('"').next()?.trim_start_matches('_').to_string()
+                } else if let Some(rest) = l.split("undefined reference to").nth(1) {
+                    rest.trim().trim_matches(|c| c == '`' || c == '\'').to_string()
+                } else {
+                    return None;
+                };
+                (!name.is_empty() && !name.starts_with("g_")).then_some(name)
+            })
+            .collect();
+        if !missing.is_empty() {
+            let mut names: Vec<String> = missing;
+            names.sort();
+            names.dedup();
+            return Err(format!(
+                "cannot find the C function(s) {} — an `extern fn` is resolved by the system linker, so the library defining it has to be on the link line",
+                names
+                    .iter()
+                    .map(|n| format!("`{n}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        // Something else went wrong; the linker's own words are all there is.
+        let detail = text.trim();
+        if detail.is_empty() {
+            return Err("linking failed".into());
+        }
+        return Err(format!("linking failed:\n{detail}"));
     }
     let size = std::fs::metadata(out_path).map_err(|e| e.to_string())?.len();
     Ok(size)

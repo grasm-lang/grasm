@@ -24,10 +24,16 @@ came to be documented as returning `Option[str]` when it is fallible.
 | `map()` | `() -> Map[K, V]` | a new empty map |
 | `now_millis()` | `() -> i64` | milliseconds since the epoch; `io` |
 | `env(name)` | `(str) -> Option[str]` | environment variable; `io` |
-| `exit(code)` | `(i64)` | ends the program with that status |
+| `exit(code)` | `(i64)` | ends the program with that status — its low eight bits ([L-LIB-EXIT]) |
 | `read_file(p)` | `(str) -> str ! IoError` | fallible, not `Option`; `io` ([L-LIB-IO]) |
 | `write_file(p, s)` | `(str, str) -> () ! IoError` | fallible; `io` ([L-LIB-IO]) |
 | `file_exists(p)` | `(str) -> bool` | `io` |
+
+**[L-LIB-EXIT]** `exit(code)` ends the program with the **low eight bits** of
+`code`, which is what an operating system reports and what C's `exit` does with
+the same number: `exit(-1)` is 255 and `exit(256)` is 0. Clamping to 0..=255
+instead was worse in the direction that matters — it made `exit(-1)`, the most
+common spelling of "fail" in a script, report *success*.
 
 **[L-LIB-IO]** The three ways a library call reports "no": `read_file` is
 **fallible** (`str ! IoError`) because a failure has a reason worth reading —
@@ -56,6 +62,11 @@ is judged on.
 | variant with fields | `Name(v, …)` | `B(7)` |
 | variant without | `Name` | `A` |
 | `Option[T]` | `Some(v)` or `None` | `Some(1)` |
+| `ref T` | the slot it names and that slot's generation, never what it points at — the value may already be gone, and reading it to render would be the use-after-free the tier prevents | `ref#0.0` |
+| a named function | `<fn module::name>` | `<fn main::dbl>` |
+| a closure | `<closure>` — it has no name to show | |
+| a handler | a struct with the operation names as fields | `CHandler{now: <closure>}` |
+| a range | `start..end`, as written | `1..5` |
 
 Strings nested inside a collection are **not** quoted, so `[a, b c]` is a
 two-element list whose second element contains a space. Rendering is for people

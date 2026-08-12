@@ -2735,6 +2735,42 @@ fn stride_of(vt: &VType) -> i64 {
 /// the target of a whole-variable assignment — can change the list's refcount
 /// or its length, either of which invalidates a raw pointer into it. So the
 /// rule is deliberately strict: index it, or it is not pinned.
+/// Whether `Any` appears anywhere in a type — the placeholder a value that
+/// cannot name its element type carries.
+fn any_inside(t: &VType) -> bool {
+    match t {
+        VType::Any => true,
+        VType::List(e) | VType::Option(e) | VType::Ref(e) => any_inside(e),
+        VType::Fallible(a, b) | VType::Map(a, b) => any_inside(a) || any_inside(b),
+        VType::Tuple(ts) => ts.iter().any(any_inside),
+        VType::Fn(ps, r) => ps.iter().any(any_inside) || any_inside(r),
+        _ => false,
+    }
+}
+
+/// Combines two branches' types when both produce a value.
+///
+/// The only interesting case is a fallible pair where one side is `Err(e)` or
+/// `Ok(v)` alone: `Err(e)` has no ok half to name and carries `Any` there,
+/// `Ok(v)` has no error half and carries `Any` there. Each side supplies what
+/// the other cannot.
+fn merge_fallible_halves(a: VType, b: VType) -> VType {
+    let (VType::Fallible(a_ok, a_err), VType::Fallible(b_ok, b_err)) = (&a, &b) else {
+        return a;
+    };
+    let pick = |x: &VType, y: &VType| -> VType {
+        if matches!(x, VType::Any | VType::Unit) && !matches!(y, VType::Any | VType::Unit) {
+            y.clone()
+        } else {
+            x.clone()
+        }
+    };
+    VType::Fallible(
+        Box::new(pick(a_ok, b_ok)),
+        Box::new(pick(a_err, b_err)),
+    )
+}
+
 fn indexed_only_lists(block: &grasm_syntax::ast::Block) -> Vec<String> {
     let mut indexed: Vec<String> = Vec::new();
     let mut disqualified: Vec<String> = Vec::new();
@@ -5832,6 +5868,16 @@ impl FnCx<'_, '_> {
             rv = self.b.ins().fcvt_from_sint(types::F64, rv);
             rt = VType::F64;
         }
+        // `Any` is what a value with nothing to say about its element type
+        // carries — `None`, an `Err` with no ok half. Comparing it with a
+        // side that does know is the same comparison, done in the runtime on
+        // boxed values either way: `Some(()) == None` was refused as a
+        // "mixed-type operation" for two values of the same type.
+        if lt != rt && lt.boxed() && rt.boxed() && (any_inside(&lt) || any_inside(&rt)) {
+            let unified = if any_inside(&lt) { rt.clone() } else { lt.clone() };
+            lt = unified.clone();
+            rt = unified;
+        }
         if lt != rt {
             return nope(span, "mixed-type operation");
         }
@@ -6034,99 +6080,10 @@ impl FnCx<'_, '_> {
         self.goto_block(then_blk);
         let (then_val, mut then_term) = self.eval_block_inner(then_block)?;
         then_term |= self.is_filled();
-
-        // What the whole `if` is worth. Taking it from the *then* branch
-        // alone was wrong whenever that branch leaves — `if c { fail(e) } else
-        // { v }` in tail position then had no merge parameter at all, so the
-        // else branch's value was dropped and the function returned a zero.
-        // Exit 0, no diagnostic, and for a boxed payload a SIGSEGV later.
-        //
-        // When then produces nothing, the type is probed off the else branch
-        // instead. `fail` returns directly and leaves the builder in a dead
-        // block, so "did the branch terminate" is not the question to ask —
-        // "did it produce a value" is.
-        let mut merge_ty: Option<VType> = None;
-        if let (Some((_, vt)), Some(_)) = (&then_val, &else_branch) {
-            if *vt != VType::Unit {
-                merge_ty = Some(vt.clone());
-            }
-        }
-        // A branch that is `Err(e)` has no ok half to give, so its type is
-        // `() ! E` — and taking it for the merge told everything downstream
-        // that the ok half was unit. `xs.map(|x| if p { Err(e) } else { Ok(x) })`
-        // then produced a list whose elements `??` unboxed as the wrong
-        // thing: SIGSEGV, empty stderr, exit 139, from a build that reported
-        // no problem. The other branch is asked when this one cannot say.
-        if let (Some(VType::Fallible(ok, _)), Some(eb)) = (&merge_ty, &else_branch) {
-            if matches!(**ok, VType::Any | VType::Unit) {
-                let probed = match eb {
-                    ElseBranch::Else(b) => self.probe_block_tail(b).ok(),
-                    ElseBranch::ElseIf(e) => self.probe_type(e).ok(),
-                };
-                if let Some(VType::Fallible(other_ok, other_err)) = probed {
-                    if !matches!(*other_ok, VType::Any | VType::Unit) {
-                        // Keep this branch's error type, which is the real
-                        // one; the other's is `Any` for the same reason.
-                        let err = match (&**ok, &*other_err) {
-                            (_, VType::Any) => {
-                                let VType::Fallible(_, e) = merge_ty.clone().unwrap() else {
-                                    unreachable!()
-                                };
-                                e
-                            }
-                            _ => other_err,
-                        };
-                        merge_ty = Some(VType::Fallible(other_ok, err));
-                    }
-                }
-            }
-        }
-        if merge_ty.is_none() {
-            if let Some(eb) = else_branch {
-                let probed = match eb {
-                    ElseBranch::Else(b) => self.probe_block_tail(b).ok(),
-                    ElseBranch::ElseIf(e) => self.probe_type(e).ok(),
-                };
-                if let Some(t) = probed {
-                    if t != VType::Unit {
-                        merge_ty = Some(t);
-                    }
-                }
-            }
-        }
-        if let Some(vt) = &merge_ty {
-            self.b.append_block_param(merge, vt.cl());
-        }
-        if !then_term {
-            match (&merge_ty, &then_val) {
-                (Some(_), Some((v, _))) => {
-                    let v = *v;
-                    self.b.ins().jump(merge, &[v]);
-                    self.filled = true;
-                }
-                (Some(want), None) => {
-                    let z = match want {
-                        VType::F64 => self.b.ins().f64const(0.0),
-                        VType::Bool => self.b.ins().iconst(types::I8, 0),
-                        other => self.b.ins().iconst(other.cl(), 0),
-                    };
-                    self.b.ins().jump(merge, &[z]);
-                    self.filled = true;
-                }
-                _ => {
-                    // Unused boxed then-value must be released.
-                    if let Some((v, vt)) = &then_val {
-                        if vt.boxed() && merge_ty.is_none() {
-                            let v = *v;
-                            let vt = vt.clone();
-                            self.dec_if_boxed(v, &vt);
-                        }
-                    }
-                    self.b.ins().jump(merge, &[]);
-                    self.filled = true;
-                }
-            }
-        }
+        // Where this branch ended — its body may have created blocks of its
+        // own. The terminator is emitted here later, once both branches have
+        // been compiled and the merge type is known for certain.
+        let then_end = self.b.current_block();
 
         self.goto_block(else_blk);
         let mut else_term = false;
@@ -6143,7 +6100,84 @@ impl FnCx<'_, '_> {
             None => {}
         }
         else_term |= self.is_filled();
+        let else_end = self.b.current_block();
+
+        // What the whole `if` is worth, decided from the branches themselves
+        // rather than from a probe of one of them.
+        //
+        // Taking it from the *then* branch alone was wrong whenever that
+        // branch leaves — `if c { fail(e) } else { v }` in tail position then
+        // had no merge parameter at all, so the else branch's value was
+        // dropped and the function returned a zero. Probing the else branch
+        // instead only moved the problem: the probe is a guess made without
+        // compiling anything, and it cannot type a `match` whose arms bind
+        // patterns, so `if c { fail(e) } else { match f() { Ok(t) -> Ok(t) …
+        // } }` printed `0` in place of the string, and SIGSEGV with an empty
+        // stderr one nesting level up. Both branches are compiled first now,
+        // and each says what it actually produced.
+        let mut merge_ty: Option<VType> = None;
+        for (val, term) in [(&then_val, then_term), (&else_val, else_term)] {
+            let Some((_, vt)) = val else { continue };
+            if term || *vt == VType::Unit {
+                continue;
+            }
+            merge_ty = Some(match merge_ty {
+                None => vt.clone(),
+                // A branch that is `Err(e)` has no ok half to give, so its
+                // type is `() ! E`; the other branch is the one that knows.
+                // `xs.map(|x| if p { Err(e) } else { Ok(x) })` produced a list
+                // whose elements `??` unboxed as the wrong thing.
+                Some(prev) => merge_fallible_halves(prev, vt.clone()),
+            });
+        }
+        if merge_ty.is_none() && else_branch.is_none() {
+            // No else: the `if` is a statement, and produces nothing.
+        }
+        if let Some(vt) = &merge_ty {
+            self.b.append_block_param(merge, vt.cl());
+        }
+
+        // Now the terminators, in the blocks the branches ended in.
+        if !then_term {
+            if let Some(blk) = then_end {
+                self.b.switch_to_block(blk);
+            }
+            match (&merge_ty, &then_val) {
+                (Some(want), Some((v, vt))) => {
+                    let mut v = *v;
+                    if *want == VType::F64 && *vt == VType::I64 {
+                        v = self.b.ins().fcvt_from_sint(types::F64, v);
+                    }
+                    self.b.ins().jump(merge, &[v]);
+                }
+                (Some(want), None) => {
+                    // The branch produced nothing where the other produced a
+                    // value. Feed the merge a placeholder so the CFG stays
+                    // well-formed.
+                    let z = match want {
+                        VType::F64 => self.b.ins().f64const(0.0),
+                        VType::Bool => self.b.ins().iconst(types::I8, 0),
+                        other => self.b.ins().iconst(other.cl(), 0),
+                    };
+                    self.b.ins().jump(merge, &[z]);
+                }
+                _ => {
+                    // Unused boxed then-value must be released.
+                    if let Some((v, vt)) = &then_val {
+                        if vt.boxed() && merge_ty.is_none() {
+                            let v = *v;
+                            let vt = vt.clone();
+                            self.dec_if_boxed(v, &vt);
+                        }
+                    }
+                    self.b.ins().jump(merge, &[]);
+                }
+            }
+        }
         if !else_term {
+            if let Some(blk) = else_end {
+                self.b.switch_to_block(blk);
+            }
             match (&merge_ty, &else_val) {
                 (Some(want), Some((v, vt))) => {
                     let mut v = *v;
@@ -6151,34 +6185,28 @@ impl FnCx<'_, '_> {
                         v = self.b.ins().fcvt_from_sint(types::F64, v);
                     }
                     self.b.ins().jump(merge, &[v]);
-                    self.filled = true;
                 }
                 (Some(want), None) => {
-                    // The branch diverged (`fail(..)`, `panic(..)`). Feed the
-                    // merge a placeholder so the CFG stays well-formed; the
-                    // value is unreachable.
                     let z = match want {
                         VType::F64 => self.b.ins().f64const(0.0),
                         VType::Bool => self.b.ins().iconst(types::I8, 0),
                         other => self.b.ins().iconst(other.cl(), 0),
                     };
                     self.b.ins().jump(merge, &[z]);
-                    self.filled = true;
                 }
                 _ => {
                     if let Some((v, vt)) = &else_val {
-                        if vt.boxed() {
+                        if vt.boxed() && merge_ty.is_none() {
                             let v = *v;
                             let vt = vt.clone();
                             self.dec_if_boxed(v, &vt);
                         }
                     }
                     self.b.ins().jump(merge, &[]);
-                    self.filled = true;
                 }
             }
         }
-
+        self.filled = true;
         self.goto_block(merge);
         if let Some(vt) = merge_ty {
             let out = self.b.block_params(merge)[0];
@@ -7372,6 +7400,15 @@ impl FnCx<'_, '_> {
                 return nope(e.span(), "inferring this type");
             }
             Expr::Tuple(items, _) => {
+                // `()` is unit, not a zero-length tuple — the same rule the
+                // type syntax follows. Probed as an empty tuple it was a
+                // boxed pointer, so a generic instantiated at it built a
+                // signature taking `i64` while the call site passed the unit
+                // value's `i8`: `idg(())` failed the verifier, and the
+                // refusal that surfaced said "codegen bug" and named nothing.
+                if items.is_empty() {
+                    return Ok(VType::Unit);
+                }
                 let mut ts = Vec::with_capacity(items.len());
                 for i in items {
                     ts.push(self.probe_type(i)?);
@@ -8312,6 +8349,20 @@ impl FnCx<'_, '_> {
         if bound.is_empty() {
             return;
         }
+        // The annotation on the binding itself, which is what the refusal
+        // tells the reader to write: `let f: fn(i64) -> i64 = |x| x + 1`.
+        // Without this the advice named a form the backend then refused.
+        for stmt in &blk.stmts {
+            let Stmt::Let { name, ty: Some(ty), init, .. } = stmt else {
+                continue;
+            };
+            if !matches!(init, Expr::Closure { params, .. } if !params.is_empty()) {
+                continue;
+            }
+            if let Ok(VType::Fn(ps, _)) = self.cg.vtype_of(ty) {
+                hints.declared.entry(name.name.clone()).or_insert(ps);
+            }
+        }
         let mut calls: Vec<(String, Vec<Expr>)> = Vec::new();
         collect_named_calls_block(blk, &mut calls);
         for (fname, args) in calls {
@@ -8364,8 +8415,9 @@ impl FnCx<'_, '_> {
             return nope(
                 span,
                 "a closure with parameters used as a value where no type says \
-what its parameters are (returning one from a function is this case: give the \
-closure explicit parameter types, or make it a top-level `fn`)",
+what its parameters are (returning one from a function is this case: annotate \
+the binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level \
+`fn` — a closure's own parameters cannot be annotated)",
             );
         };
         if args.len() != params.len() {

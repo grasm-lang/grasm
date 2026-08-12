@@ -194,6 +194,9 @@ struct Parser {
     /// for a position does not depend on how it was reached, so recording it
     /// makes the second attempt a single pass.
     not_a_map: std::collections::HashSet<usize>,
+    /// Whether the map reading of `{...}` has read a `key :` and so cannot be
+    /// anything else.
+    map_committed: bool,
 }
 
 /// What to write instead, for an operator this language does not have.
@@ -223,6 +226,7 @@ impl Parser {
             no_struct_lit: false,
             depth: 0,
             not_a_map: std::collections::HashSet::new(),
+            map_committed: false,
         }
     }
 
@@ -2054,8 +2058,17 @@ impl Parser {
     fn parse_brace_expr(&mut self) -> PResult<Expr> {
         let mark = (self.i, self.modes.clone(), self.diags.len());
         if !self.not_a_map.contains(&mark.0) {
+            self.map_committed = false;
             if let Some(e) = self.try_parse_map() {
                 return Ok(e);
+            }
+            // A `key :` was read, so this *is* a map literal and the error is
+            // inside it. Rewinding to the block reading instead reported
+            // "expected end of line after statement" at the colon — a parse
+            // error about the wrong thing, which is what
+            // [G-STRUCT-NONEMPTY] records as fixed for struct literals.
+            if self.map_committed {
+                return Err(());
             }
             self.not_a_map.insert(mark.0);
         }
@@ -2081,6 +2094,7 @@ impl Parser {
             let key = self.parse_expr().ok()?;
             self.skip_newlines();
             self.expect(&TokenKind::Colon).ok()?;
+            self.map_committed = true;
             self.skip_newlines();
             let val = self.parse_expr().ok()?;
             entries.push((key, val));

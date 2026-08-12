@@ -367,7 +367,8 @@ fn an_uncalled_closure_with_parameters_is_reported() {
     )
     .expect_err("should be reported, not guessed");
     assert!(
-        err.contains("nothing to come from") || err.contains("parameter types"),
+        err.contains("nothing to come from")
+            || err.contains("no type says what its parameters are"),
         "expected a clear reason, got: {err}"
     );
 }

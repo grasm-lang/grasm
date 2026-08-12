@@ -86,6 +86,17 @@ fn main() {
     }
 }'
 
+expect_refused "a generic instantiated at a handler type" 'effect Clock {
+    fn now() -> i64
+}
+fn idg[T](x: T) -> i64 {
+    1
+}
+fn main() {
+    let h = ClockHandler{ now: || 1 }
+    print("{idg(h)}")
+}'
+
 expect_refused "an effect handler as a struct field type" 'effect Cfg {
     fn get() -> i64
 }

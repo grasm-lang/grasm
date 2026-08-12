@@ -721,7 +721,14 @@ impl<'a, W: Write> Interp<'a, W> {
                 module,
             } => {
                 if self.depth >= MAX_DEPTH {
-                    return Err(Flow::Panic("stack overflow in closure call".into()));
+                    // The same sentence every engine says. [E-RECURSION-DEPTH]
+                    // guarantees the message does not differ and that no
+                    // engine names its own bound; a second overflow site with
+                    // its own wording made `[1].map(|x| f(x))` recursion
+                    // report differently under `grasm run` than compiled.
+                    return Err(Flow::Panic(
+                        "stack overflow: recursion too deep".into(),
+                    ));
                 }
                 self.depth += 1;
                 // Names in the body mean what they meant where it was written.
@@ -1930,7 +1937,8 @@ build links it, `grasm run` can only reach what is already loaded",
                             }
                         };
                         let _ = self.out.flush();
-                        return Err(Flow::Exit(code.clamp(0, 255) as i32));
+                        // The low eight bits, as the operating system reports it.
+                        return Err(Flow::Exit((code & 0xff) as i32));
                     }
                     "input" => {
                         let mut line = String::new();

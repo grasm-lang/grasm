@@ -392,6 +392,11 @@ build fails — so there are no `Send`/`Sync` bounds to satisfy and no race
 detector to run. Results come back in input order whatever the core count is,
 so the answer never depends on the machine.
 
+Which is also why only the compiled backend actually uses them: `grasm run`
+and `grasm build -o` produce a bundled *interpreter*, and there a `par_map` is
+a `map`. The answer is identical — that is the whole point of requiring purity
+— but the throughput is not, so measure with `grasm build --native`.
+
 A panicking task aborts the whole scope; tasks spawned after it do not run.
 
 The two forms divide the work between them, and it is worth knowing which you
@@ -661,6 +666,7 @@ runs only under `grasm run`:
 | calling a function value through anything but a name | `TABLE[0](21)`, `(m.get(k) ?? d)(x)` — bind it with `let` first, then call it |
 | a UFCS call of a *generic* free function | `[1, 2].describe()` for `fn describe[T](xs: [T])` — write `describe([1, 2])` |
 | an effect handler as a **struct field** type | `type Box = { h: CfgHandler }` — bind the handler with `let` instead |
+| a generic instantiated at a handler type | `f(h)` for `fn f[T](x: T)` — pass what the handler computes instead |
 | polymorphic recursion | `fn f[T](x: T) -> i64 { f([x]) }` — one compiled copy per type, and the types never stop growing |
 
 Each of these is a defect being worked off, not a design boundary. The list is

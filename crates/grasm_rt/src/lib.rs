@@ -3664,7 +3664,11 @@ pub unsafe extern "C" fn grasm_env(name: *mut RtVal) -> *mut RtVal {
 pub extern "C" fn grasm_exit(code: i64) {
     use std::io::Write as _;
     let _ = std::io::stdout().flush();
-    std::process::exit(code.clamp(0, 255) as i32);
+    // The low eight bits, which is what an operating system reports and what
+    // C's `exit` does with the same number. Clamping to 0..=255 instead made
+    // `exit(-1)` — the most common spelling of "fail" in a script — report
+    // *success*.
+    std::process::exit((code & 0xff) as i32);
 }
 
 /// # Safety: live runtime pointer.

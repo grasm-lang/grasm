@@ -105,6 +105,32 @@ pub(crate) fn load_with_alias(
     deps: &HashSet<String>,
     entry_alias: Option<&str>,
 ) -> Program {
+    load_with_canonical(
+        entry_name,
+        entry_display_path,
+        provider,
+        tried,
+        deps,
+        entry_alias,
+        &|_| None,
+    )
+}
+
+/// `load_with_alias`, told how to canonicalize a module name.
+///
+/// One package can be reached by two paths — declared directly *and* through a
+/// dependency that also uses it — and it must be one module either way. Types
+/// are program-wide ([T-MODULE-NS]), so loading it twice reported every type
+/// in it as a duplicate of itself.
+pub(crate) fn load_with_canonical(
+    entry_name: &str,
+    entry_display_path: &str,
+    provider: &dyn Fn(&str) -> Option<String>,
+    tried: &dyn Fn(&str) -> Vec<String>,
+    deps: &HashSet<String>,
+    entry_alias: Option<&str>,
+    canonical: &dyn Fn(&str) -> Option<String>,
+) -> Program {
     let mut files: Vec<LoadedFile> = Vec::new();
     let mut diagnostics = Vec::new();
     let mut loaded: HashMap<String, ()> = HashMap::new();
@@ -131,25 +157,30 @@ pub(crate) fn load_with_alias(
         };
         let out = grasm_syntax::parser::parse_with_offset(&src, base);
         diagnostics.extend(out.diagnostics);
-        // Which dependency, if any, this module lives inside.
-        let owner: Option<String> = if deps.contains(&name) {
-            Some(name.clone())
-        } else {
-            name.split_once('.')
-                .map(|(root, _)| root.to_string())
-                .filter(|root| deps.contains(root))
-        };
+        // Which package this module lives inside, as its qualified prefix.
+        // The *longest* one: a dependency's own dependency is a package too,
+        // and `typolog.typo` is where `typo`'s files live. Taking the first
+        // segment instead made `typo`'s `import measure` resolve to
+        // `typolog.measure`, a module in the wrong package.
+        let owner: Option<String> = deps
+            .iter()
+            .filter(|d| name == **d || name.starts_with(&format!("{d}.")))
+            .max_by_key(|d| d.len())
+            .cloned();
         let mut imports = HashMap::new();
         for decl in &out.module.decls {
             if let grasm_syntax::ast::Decl::Import(imp) = decl {
                 let written = imp.path.dotted();
-                // Inside a dependency, a relative import stays inside it —
-                // unless it names another dependency, which is absolute.
-                let root = written.split('.').next().unwrap_or(&written);
+                // Inside a package, an import is relative to that package —
+                // whether it names a sibling file or one of that package's
+                // own dependencies. Nesting is carried by the prefix, so both
+                // cases are the same string.
                 let full = match &owner {
-                    Some(pkg) if !deps.contains(root) => format!("{pkg}.{written}"),
-                    _ => written,
+                    Some(pkg) => format!("{pkg}.{written}"),
+                    None => written,
                 };
+                // The same package reached by two paths is one module.
+                let full = canonical(&full).unwrap_or(full);
                 // An import that names the entry file resolves to it.
                 let full = match entry_alias {
                     Some(a) if full == a => entry_name.to_string(),
@@ -272,7 +303,43 @@ pub fn load_from_disk_in(
         deps.insert(name.clone(), dir.clone());
     }
 
-    let dep_names: HashSet<String> = deps.keys().cloned().collect();
+    // Every package in the graph, as the qualified prefix its modules carry.
+    // A dependency's own dependencies are packages too, and a module name has
+    // to say which one it belongs to.
+    let mut all_prefixes: HashMap<String, std::path::PathBuf> = HashMap::new();
+    for (name, dir) in &deps {
+        collect_packages(name, dir, resolved, &mut all_prefixes, 0);
+    }
+    // One name per package. The shortest prefix wins, so a package a consumer
+    // declares itself keeps the name the consumer wrote.
+    let mut canon_of_dir: HashMap<std::path::PathBuf, String> = HashMap::new();
+    let mut prefixes: Vec<(&String, &std::path::PathBuf)> = all_prefixes.iter().collect();
+    prefixes.sort_by(|a, b| (a.0.len(), a.0).cmp(&(b.0.len(), b.0)));
+    for (prefix, dir) in prefixes {
+        let key = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
+        canon_of_dir.entry(key).or_insert_with(|| prefix.clone());
+    }
+    let dep_names: HashSet<String> = canon_of_dir.values().cloned().collect();
+    // A module name written under a non-canonical prefix, rewritten to the
+    // canonical one: `typolog.typo.model` is `typo.model` when the consumer
+    // declares `typo` itself.
+    let prefix_dirs = all_prefixes.clone();
+    let canon = canon_of_dir.clone();
+    let canonical = move |name: &str| -> Option<String> {
+        let (prefix, dir) = prefix_dirs
+            .iter()
+            .filter(|(p, _)| name == p.as_str() || name.starts_with(&format!("{p}.")))
+            .max_by_key(|(p, _)| p.len())?;
+        let key = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
+        let want = canon.get(&key)?;
+        if want == prefix {
+            return None;
+        }
+        Some(match name.strip_prefix(prefix.as_str()) {
+            Some(rest) => format!("{want}{rest}"),
+            None => want.clone(),
+        })
+    };
     let dirs = entry_src_dir.clone();
     let dep_dirs = deps.clone();
     // The same two candidates the provider tries, so the failure message says
@@ -319,15 +386,8 @@ pub fn load_from_disk_in(
         // Then a dependency declared in grasm.toml, loaded from its entry.
         let root = name.split('.').next().unwrap_or(name);
         let dep_dir = deps.get(root)?;
-        let entry = package_entry(dep_dir);
-        let path = match name.split_once('.') {
-            None => entry,
-            // `import dep.sub` — a file inside the dependency's source tree.
-            Some((_, sub)) => entry
-                .parent()?
-                .to_path_buf()
-                .join(format!("{}.gr", sub.replace('.', "/"))),
-        };
+        let rest = name.split_once('.').map(|(_, s)| s).unwrap_or("");
+        let path = resolve_in_package(dep_dir, rest, 0)?;
         let src = std::fs::read_to_string(&path).ok()?;
         note(name, &path);
         Some(src)
@@ -336,13 +396,14 @@ pub fn load_from_disk_in(
     let entry_alias = entry_path
         .file_stem()
         .map(|s| s.to_string_lossy().to_string());
-    let mut program = load_with_alias(
+    let mut program = load_with_canonical(
         "main",
         &entry_display,
         &provider,
         &tried,
         &dep_names,
         entry_alias.as_deref(),
+        &canonical,
     );
     // The real path wins over the one derived from the module name.
     let found = found.into_inner();
@@ -352,6 +413,75 @@ pub fn load_from_disk_in(
         }
     }
     Ok(program)
+}
+
+/// Every package reachable from `dir`, named by the prefix its modules carry.
+fn collect_packages(
+    prefix: &str,
+    dir: &std::path::Path,
+    resolved: &HashMap<String, std::path::PathBuf>,
+    out: &mut HashMap<String, std::path::PathBuf>,
+    depth: usize,
+) {
+    if depth > 16 || out.contains_key(prefix) {
+        return;
+    }
+    out.insert(prefix.to_string(), dir.to_path_buf());
+    let src_dir = package_entry(dir)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| dir.to_path_buf());
+    let mut subs = package_dependencies(&src_dir);
+    // A registry dependency has no path in the manifest; the toolchain
+    // resolved the graph and passed the directories down.
+    for name in dependency_names(&src_dir) {
+        if let (false, Some(dir)) = (subs.contains_key(&name), resolved.get(&name)) {
+            subs.insert(name, dir.clone());
+        }
+    }
+    for (name, sub) in subs {
+        collect_packages(&format!("{prefix}.{name}"), &sub, resolved, out, depth + 1);
+    }
+}
+
+/// A module path *inside* a package, following that package's own
+/// dependencies.
+///
+/// `import dep.sub` is a file in the dependency's source tree — unless `sub`
+/// names a dependency *of that dependency*, in which case it is that package's
+/// entry file. Without the second case a library could not use a library:
+/// `thin` depending on `typolog` depending on `typo` looked for
+/// `typolog/typo/model.gr` under the *consumer's* source directory and
+/// reported a module nobody wrote. The only way to build was for every
+/// consumer to re-declare the whole transitive graph in its own manifest.
+fn resolve_in_package(
+    pkg_dir: &std::path::Path,
+    rest: &str,
+    depth: usize,
+) -> Option<std::path::PathBuf> {
+    let entry = package_entry(pkg_dir);
+    if rest.is_empty() {
+        return Some(entry);
+    }
+    // A path dependency can name a directory that names it back; the graph is
+    // resolved elsewhere, and this is only the file lookup.
+    if depth > 16 {
+        return None;
+    }
+    let src_dir = entry.parent()?.to_path_buf();
+    // A file of this package wins, matching the entry package's own order.
+    let direct = src_dir.join(format!("{}.gr", rest.replace('.', "/")));
+    if direct.exists() {
+        return Some(direct);
+    }
+    let head = rest.split('.').next().unwrap_or(rest);
+    let tail = rest.split_once('.').map(|(_, t)| t).unwrap_or("");
+    if let Some(dir) = package_dependencies(&src_dir).get(head) {
+        return resolve_in_package(dir, tail, depth + 1);
+    }
+    // Nothing found: hand back the path a reader should have written, so the
+    // diagnostic names something openable.
+    Some(direct)
 }
 
 /// Dependencies of the package containing `dir`, as name → package directory.
@@ -381,6 +511,26 @@ fn package_dependencies(dir: &std::path::Path) -> HashMap<String, std::path::Pat
         if key.trim() == "path" {
             let path = value.trim().trim_matches('"');
             out.insert(dep.clone(), root.join(path));
+        }
+    }
+    out
+}
+
+/// Every dependency name a package declares, whether or not it has a path.
+///
+/// A registry dependency has no path here; the toolchain resolves the graph
+/// and passes the directories down, and this says which names to look for.
+fn dependency_names(dir: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some((_, text)) = find_manifest(dir) else {
+        return out;
+    };
+    for raw in text.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if let Some(rest) = line.strip_prefix('[') {
+            if let Some(name) = rest.trim_end_matches(']').trim().strip_prefix("dependencies.") {
+                out.push(name.trim().to_string());
+            }
         }
     }
     out
