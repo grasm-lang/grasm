@@ -656,7 +656,6 @@ runs only under `grasm run`:
 | `par_map`/`par_filter` with a closure bound to a name | `let f = \|n\| n * 2` then `xs.par_map(f)` — write it inline, or as a top-level `fn` |
 | `map` with a function that returns nothing | `xs.map(\|x\| print(x))` — a `for` loop is what that meant |
 | a type parameter appearing **only** in a function-typed parameter's result | `fn key_by[T, K](xs: [T], f: fn(T) -> K) -> [K]` |
-| a `match` no arm of which has an inferable type | every arm `map()` — give one arm a type, or lift it into an annotated `let` |
 | an `inout` argument that is not a plain variable | `push_one(b.items)`, `add(xs[0], 5)` — bind it to a `var` first |
 | returning a closure | `fn mk(n: i64) -> fn(i64) -> i64 { \|x\| x + n }` — a top-level `fn` works |
 | a handler that is a loop variable or a list element | `for h in hs { with Src handled_by h { … } }` — a `let`-bound handler compiles |

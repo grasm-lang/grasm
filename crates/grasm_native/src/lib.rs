@@ -3478,6 +3478,15 @@ impl FnCx<'_, '_> {
                         body,
                         span: cspan,
                     } => self.make_closure_value(params, body, Some(&name.name), *cspan)?,
+                    // A `match` reads the annotation as its tail hint, which
+                    // is how the remedy §11 names — "lift it into an
+                    // annotated `let`" — actually reaches the arms.
+                    Expr::Match { .. } => {
+                        let saved = std::mem::replace(&mut self.tail_hint, expected.clone());
+                        let out = self.eval_expr_expecting(init, expected.as_ref());
+                        self.tail_hint = saved;
+                        out?
+                    }
                     _ => self.eval_expr_expecting(init, expected.as_ref())?,
                 };
                 if let Some(te) = ty {
@@ -7671,6 +7680,14 @@ impl FnCx<'_, '_> {
                     (None, None) => from_then.or(from_else).unwrap_or(VType::Unit),
                 }
             }
+            // `try e` is the ok half of `e`. Without this a `match` with a
+            // `try` arm could not be typed, and the backend refused it as "a
+            // match whose arms it cannot type" — about an arm whose type it
+            // was one step from working out.
+            Expr::Try { expr, .. } => match self.probe_type(expr)? {
+                VType::Fallible(ok, _) => *ok,
+                other => other,
+            },
             Expr::Match { arms, .. } => {
                 // Every arm that can say something, for the same reason as an
                 // `if`'s two branches: one arm's `Err(e)` and another's
@@ -7925,6 +7942,19 @@ impl FnCx<'_, '_> {
                     break;
                 }
                 None => continue,
+            }
+        }
+        // A written type on the binding this match initialises says what the
+        // arms are worth when none of them can say it themselves — which is
+        // exactly the remedy §11's table names, and it did not work:
+        // `let m: Map[str, i64] = match p { 0 -> map()  _ -> map() }` was
+        // refused with its own annotation in view.
+        if live_arms && !probed_any {
+            if let Some(hint) = self.tail_hint.clone() {
+                if hint != VType::Unit {
+                    out_t = Some(hint);
+                    probed_any = true;
+                }
             }
         }
         if live_arms && !probed_any {

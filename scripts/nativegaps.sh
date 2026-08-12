@@ -175,7 +175,7 @@ fn main() {
 # is genuinely nothing to infer from. Both halves are checked, because the
 # refusal used to cover both and told the reader to add an annotation that was
 # already there.
-expect_refused "a match no arm of which has an inferable type" 'fn pick(p: i64) -> Map[str, i64] ! str {
+expect_compiled "a match no arm of which has an inferable type" 'fn pick(p: i64) -> Map[str, i64] ! str {
     match p {
         0 -> map()
         _ -> map()

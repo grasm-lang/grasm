@@ -5070,12 +5070,31 @@ the state through an `inout` parameter",
             if Self::is_int_literal(&arm.body) {
                 deferred_literals.push(&arm.body);
             } else {
-                self.check_expr(&arm.body, &result);
+                // One arm may build the whole `T ! E` while another gives the
+                // ok half, which a fallible body may do either way
+                // ([T-OK-ERR-RETURN]). The `if` spelling of the same two
+                // branches was accepted and this one was not.
+                let arm_ty = self.infer_expr(&arm.body);
+                if !self.uni.unify(&arm_ty, &result) {
+                    match self.merge_fallible_branches(&arm_ty, &result) {
+                        Some(t) => {
+                            let _ = self.uni.unify(&result, &t);
+                        }
+                        None => self.unify_or_report(arm.body.span(), &arm_ty, &result),
+                    }
+                }
             }
             self.scopes.pop();
             arm_states.push(self.moved_snapshot());
         }
         for body in deferred_literals {
+            // As above: a literal arm beside an `Err(e)` arm is the ok half.
+            let r = self.uni.shallow_resolve(&result);
+            if let Type::Fallible(ok, _) = &r {
+                let ok = (**ok).clone();
+                self.check_expr(body, &ok);
+                continue;
+            }
             self.check_expr(body, &result);
         }
         self.restore_moved(&before);

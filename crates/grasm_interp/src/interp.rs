@@ -325,6 +325,128 @@ fn place_root_name(e: &Expr) -> Option<String> {
     }
 }
 
+/// Every identifier a closure body could mention, over-approximated.
+///
+/// A closure captured the *whole* visible environment by value, which put a
+/// second owner on every list in scope — so the next `xs.push(v)` in the same
+/// loop copied the list instead of mutating it, and a loop that created a
+/// closure was quadratic while the identical loop without one was linear
+/// ([E-COW]: the copy "is never observable", and its cost was).
+///
+/// Over-approximating is safe: a name captured and never used costs one
+/// refcount, and missing one would change what the closure sees.
+fn mentioned_names(e: &Expr, out: &mut std::collections::HashSet<String>) {
+    match e {
+        Expr::Ident(id) => {
+            out.insert(id.name.clone());
+        }
+        Expr::Unary { expr, .. } | Expr::Try { expr, .. } => mentioned_names(expr, out),
+        Expr::Binary { lhs, rhs, .. } => {
+            mentioned_names(lhs, out);
+            mentioned_names(rhs, out);
+        }
+        Expr::Field { recv, .. } => mentioned_names(recv, out),
+        Expr::Index { recv, index, .. } => {
+            mentioned_names(recv, out);
+            mentioned_names(index, out);
+        }
+        Expr::Call { callee, args, .. } => {
+            mentioned_names(callee, out);
+            for a in args {
+                mentioned_names(a, out);
+            }
+        }
+        Expr::MethodCall { recv, args, .. } => {
+            mentioned_names(recv, out);
+            for a in args {
+                mentioned_names(a, out);
+            }
+        }
+        Expr::List(items, _) | Expr::Tuple(items, _) => {
+            for i in items {
+                mentioned_names(i, out);
+            }
+        }
+        Expr::Map(entries, _) => {
+            for (k, v) in entries {
+                mentioned_names(k, out);
+                mentioned_names(v, out);
+            }
+        }
+        Expr::Str(pieces, _) => {
+            for p in pieces {
+                if let StrPiece::Expr(inner) = p {
+                    mentioned_names(inner, out);
+                }
+            }
+        }
+        Expr::Closure { body, .. } => mentioned_names(body, out),
+        Expr::StructLit { fields, base, .. } => {
+            if let Some(b) = base {
+                mentioned_names(b, out);
+            }
+            for (_, v) in fields {
+                mentioned_names(v, out);
+            }
+        }
+        Expr::Block(b) | Expr::Unsafe(b) | Expr::Region(b) => mentioned_names_block(b, out),
+        Expr::If { cond, then_block, else_branch, .. } => {
+            mentioned_names(cond, out);
+            mentioned_names_block(then_block, out);
+            match else_branch.as_deref() {
+                Some(grasm_syntax::ast::ElseBranch::Else(b)) => mentioned_names_block(b, out),
+                Some(grasm_syntax::ast::ElseBranch::ElseIf(inner)) => {
+                    mentioned_names(inner, out)
+                }
+                None => {}
+            }
+        }
+        Expr::Match { scrutinee, arms, .. } => {
+            mentioned_names(scrutinee, out);
+            for a in arms {
+                mentioned_names(&a.body, out);
+                if let Some(g) = &a.guard {
+                    mentioned_names(g, out);
+                }
+            }
+        }
+        Expr::Range { start, end, .. } => {
+            mentioned_names(start, out);
+            mentioned_names(end, out);
+        }
+        _ => {}
+    }
+}
+
+fn mentioned_names_block(b: &Block, out: &mut std::collections::HashSet<String>) {
+    for st in &b.stmts {
+        match st {
+            Stmt::Let { init, .. } | Stmt::LetTuple { init, .. } => mentioned_names(init, out),
+            Stmt::Assign { target, value, .. } => {
+                mentioned_names(target, out);
+                mentioned_names(value, out);
+            }
+            Stmt::Return(Some(e), _) | Stmt::Expr(e) => mentioned_names(e, out),
+            Stmt::While { cond, body, .. } => {
+                mentioned_names(cond, out);
+                mentioned_names_block(body, out);
+            }
+            Stmt::For { iter, body, .. } => {
+                mentioned_names(iter, out);
+                mentioned_names_block(body, out);
+            }
+            Stmt::With { handler, body, .. } => {
+                mentioned_names(handler, out);
+                mentioned_names_block(body, out);
+            }
+            Stmt::Parallel { body, .. } | Stmt::Spawn { body, .. } => {
+                mentioned_names_block(body, out)
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Whether an expression may mention a name.
 ///
 /// Deliberately blunt, and conservative in the one direction that matters:
@@ -1676,10 +1798,19 @@ impl<'a, W: Write> Interp<'a, W> {
                 }
             }
             Expr::Closure { params, body, span } => {
-                // Capture the current visible environment by value.
+                // Capture, by value, the names the body could mention — not
+                // the whole visible environment. Capturing everything put a
+                // second owner on every list in scope, so the next
+                // `xs.push(v)` copied instead of mutating and a loop that
+                // created a closure was quadratic.
+                let mut wanted = std::collections::HashSet::new();
+                mentioned_names(body, &mut wanted);
                 let mut env: Vec<(String, Value)> = Vec::new();
                 for scope in &self.scopes {
                     for (k, v) in scope {
+                        if !wanted.contains(k.as_str()) {
+                            continue;
+                        }
                         env.retain(|(ek, _)| ek != k);
                         env.push((k.clone(), v.clone()));
                     }

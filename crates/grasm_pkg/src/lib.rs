@@ -905,6 +905,23 @@ fn edit_distance(a: &str, b: &str) -> usize {
 ///
 /// One representative site per effect. Effects a package only inherits from a
 /// call it makes have no site, and are reported by name alone as before.
+/// The package's own dependency graph, as name → directory.
+///
+/// A registry dependency has no path in the manifest, so a module that
+/// imports one cannot be read without this — and a *sibling* module that did
+/// made the ceiling check refuse to build against the package "whose reach is
+/// unknown", naming nothing.
+fn own_resolved(manifest: &Manifest) -> std::collections::HashMap<String, PathBuf> {
+    resolve(&manifest.dir)
+        .map(|r| {
+            r.packages
+                .iter()
+                .map(|p| (p.name.clone(), p.dir.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub fn effect_sites_of_package(
     manifest: &Manifest,
 ) -> Result<std::collections::HashMap<String, String>, String> {
@@ -912,12 +929,13 @@ pub fn effect_sites_of_package(
     if !entry.exists() {
         return Ok(std::collections::HashMap::new());
     }
-    let program = grasm_sema::loader::load_from_disk(&entry)?;
+    let resolved = own_resolved(manifest);
+    let program = grasm_sema::loader::load_from_disk_with(&entry, &resolved)?;
     let mut out = grasm_sema::effects::effect_sites(&program);
     // The same whole-package scan the ceiling uses, so a breach in an
     // unimported sibling module still says where it is.
     for extra in package_modules(&entry) {
-        if let Ok(p) = grasm_sema::loader::load_from_disk(&extra) {
+        if let Ok(p) = grasm_sema::loader::load_from_disk_with(&extra, &resolved) {
             for (k, v) in grasm_sema::effects::effect_sites(&p) {
                 out.entry(k).or_insert(v);
             }
@@ -935,7 +953,8 @@ pub fn effects_of_package(manifest: &Manifest) -> Result<BTreeSet<String>, Strin
             entry.display()
         ));
     }
-    let program = grasm_sema::loader::load_from_disk(&entry)?;
+    let resolved = own_resolved(manifest);
+    let program = grasm_sema::loader::load_from_disk_with(&entry, &resolved)?;
     let mut out = grasm_sema::effects::effects_of_program(&program);
     // Every module in the package, not only the ones its entry imports.
     //
@@ -947,7 +966,7 @@ pub fn effects_of_package(manifest: &Manifest) -> Result<BTreeSet<String>, Strin
     // consumer cannot fix, and if the consumer already declared `io` for its
     // own reasons, nothing was reported at all.
     for extra in package_modules(&entry) {
-        let p = grasm_sema::loader::load_from_disk(&extra).map_err(|e| {
+        let p = grasm_sema::loader::load_from_disk_with(&extra, &resolved).map_err(|e| {
             format!("package `{}`: {}", manifest.name, e)
         })?;
         // A file that does not parse cannot be read for what it performs, and
@@ -1004,7 +1023,7 @@ pub fn effect_vocabulary_of_package(manifest: &Manifest) -> Result<BTreeSet<Stri
             entry.display()
         ));
     }
-    let program = grasm_sema::loader::load_from_disk(&entry)?;
+    let program = grasm_sema::loader::load_from_disk_with(&entry, &own_resolved(manifest))?;
     Ok(grasm_sema::effects::effect_vocabulary(&program))
 }
 
