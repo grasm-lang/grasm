@@ -1037,3 +1037,101 @@ fn a_closures_own_var_may_still_be_passed_as_inout() {
          }\n",
     );
 }
+
+/// A parse error in a map literal's *value* is reported where it is.
+///
+/// `{` opens either a block or a map, and the map reading rewound on any
+/// failure — so `{"k": *}` was reported as "expected end of line after
+/// statement" at the colon, a parse error about the wrong thing. Once a
+/// `key :` has been read it cannot be a block.
+#[test]
+fn a_map_literal_reports_its_own_error() {
+    let (_, diags) = analyze("fn main() {\n    let m = {\"k\": *}\n    print(\"{m}\")\n}\n");
+    let text = diags
+        .iter()
+        .map(|d| d.message.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        text.contains("expected an expression"),
+        "the error should be the one inside the literal, got: {text}"
+    );
+    assert!(
+        !text.contains("end of line after statement"),
+        "the block reading should not be what is reported: {text}"
+    );
+}
+
+/// A cascade from an earlier error says nothing twice.
+///
+/// `p.zz.len()` reported that `P` has no field `zz` and then that `<error>`
+/// has no method `len` — with help suggesting `fn len(<error>, ...)`, a
+/// signature nobody can type.
+#[test]
+fn a_broken_receiver_does_not_cascade() {
+    let (_, diags) = analyze(
+        "type P = { a: i64 }\nfn main() {\n    let p = P{ a: 1 }\n    print(\"{p.zz.len()}\")\n}\n",
+    );
+    assert_eq!(diags.len(), 1, "{diags:#?}");
+    assert!(!format!("{diags:?}").contains("<error>"), "{diags:#?}");
+}
+
+/// An integer literal in a `match` arm adopts `f64` whichever arm it is in.
+///
+/// [T-INT-TO-FLOAT-CARRIED] says a list, a map's values and a `match`'s arms
+/// are checked with their integer literals last. Lists and maps were; arms
+/// decided left to right, so one order compiled and the other did not.
+#[test]
+fn match_arms_check_integer_literals_last() {
+    check_ok("fn main() {\n    let x = match 1 { 1 -> 3  _ -> 3.5 }\n    print(\"{x}\")\n}\n");
+    check_ok("fn main() {\n    let x = match 1 { 1 -> 3.5  _ -> 3 }\n    print(\"{x}\")\n}\n");
+}
+
+/// A closure's failure is a failure, whichever order the checker learns it in.
+///
+/// A closure with parameters waits for a call site to say what they are, so
+/// its return type is unknown when the statement is checked. `f(-1)` on its
+/// own line printed the next line and exited 0.
+#[test]
+fn a_discarded_closure_failure_is_refused() {
+    check_err(
+        "type E = { m: str }\nfn risky(n: i64) -> i64 ! E {\n    if n < 0 {\n        fail(E{ m: \"x\" })\n    }\n    n\n}\nfn main() {\n    let f = |x| risky(x)\n    f(-1)\n    print(\"after\")\n}\n",
+        "failure is discarded",
+    );
+}
+
+/// And the three shapes that need the *shape* of a closure's return type.
+#[test]
+fn a_closure_call_can_be_coalesced_matched_and_tried() {
+    check_ok(
+        "type E = { m: str }\nfn risky(n: i64) -> i64 ! E {\n    if n < 0 {\n        fail(E{ m: \"x\" })\n    }\n    n\n}\nfn main() ! E {\n    let f = |x| risky(x)\n    print(\"{f(1) ?? -1}\")\n    let g = |x| risky(x)\n    match g(1) {\n        Ok(v) -> print(\"{v}\")\n        Err(e) -> print(\"{e.m}\")\n    }\n    let h = |x| risky(x)\n    print(\"{try h(1)}\")\n}\n",
+    );
+}
+
+/// A closure that returns a closure keeps its captured binding in scope.
+#[test]
+fn a_closure_may_return_a_closure() {
+    check_ok(
+        "fn main() {\n    let mk = |n| |m| n + m\n    let add3 = mk(3)\n    print(\"{add3(4)}\")\n}\n",
+    );
+}
+
+/// A type parameter that reaches a map only inside a body is still a key.
+#[test]
+fn a_body_only_map_key_is_checked_at_the_call_site() {
+    let head = "fn tally[T](xs: [T]) -> i64 {\n    var m: Map[T, i64] = {}\n    for x in xs {\n        m.set(x, 1)\n    }\n    m.len()\n}\nfn main() {\n";
+    check_err(
+        &format!("{head}    print(\"{{tally([1.5, 2.5])}}\")\n}}\n"),
+        "map keys must be",
+    );
+    check_ok(&format!("{head}    print(\"{{tally([1, 2])}}\")\n}}\n"));
+}
+
+/// A handler's discharge may not leave its block through a generic call.
+#[test]
+fn a_generic_call_cannot_carry_a_handler_row_out() {
+    check_err(
+        "effect Cfg {\n    fn value() -> i64\n}\nfn keep[T](inout xs: [T], v: T) {\n    xs.push(v)\n}\nfn main() {\n    var fs: [fn() -> i64 / {Cfg}] = []\n    with Cfg handled_by CfgHandler{ value: || 1 } {\n        keep(fs, || Cfg.value())\n    }\n}\n",
+        "cannot pass a function that performs `Cfg`",
+    );
+}

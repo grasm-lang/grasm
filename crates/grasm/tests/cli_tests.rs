@@ -522,3 +522,94 @@ fn api_classifies_changes_by_what_actually_changed() {
     assert_eq!(code, 1, "breaking must fail the check:\n{text}");
     assert!(text.contains("MAJOR") && text.contains("CHANGED"), "{text}");
 }
+
+/// A type alias substituted into a signature is not a breaking change.
+///
+/// `[T-TYPE-ALIAS]`: an alias is not a new type, and the two are
+/// interchangeable everywhere. Comparing the written signatures made
+/// `-> str` becoming `-> Text` a MAJOR release and exit 1 on a release gate,
+/// for a change no consumer can observe.
+#[test]
+fn an_alias_substitution_is_not_a_breaking_api_change() {
+    let w = Work::new("api");
+    let v1 = w.0.join("v1.gr");
+    let v2 = w.0.join("v2.gr");
+    let v3 = w.0.join("v3.gr");
+    let saved = w.0.join("v1.api");
+    std::fs::write(
+        &v1,
+        "pub fn show(n: i64) -> str {\n    \"{n}\"\n}\n\nfn main() {\n    print(\"{show(1)}\")\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &v2,
+        "type Text = str\n\npub fn show(n: i64) -> Text {\n    \"{n}\"\n}\n\nfn main() {\n    print(\"{show(1)}\")\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &v3,
+        "pub fn show(n: i64) -> i64 {\n    n\n}\n\nfn main() {\n    print(\"{show(1)}\")\n}\n",
+    )
+    .unwrap();
+    let (code, out) = run(&["api", v1.to_str().unwrap()]);
+    assert_eq!(code, 0, "{out}");
+    std::fs::write(&saved, out).unwrap();
+
+    let (code, out) = run(&[
+        "api",
+        v2.to_str().unwrap(),
+        "--against",
+        saved.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "an alias substitution is not breaking:\n{out}");
+
+    // The other direction still works: a real change is still MAJOR.
+    let (code, out) = run(&[
+        "api",
+        v3.to_str().unwrap(),
+        "--against",
+        saved.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 1, "a changed return type is breaking:\n{out}");
+}
+
+/// A doc example is a test: `grasm test` runs the examples of every imported
+/// module, so a dependency's `///` block executes in the consumer's process
+/// and counts against that dependency's declared ceiling.
+#[test]
+fn a_doc_example_counts_toward_the_capability_ceiling() {
+    let w = Work::new("docex");
+    w.package(
+        "lib",
+        OVER_CEILING,
+        "/// Doubles a number.\n///\n/// ```\n/// print(\"{twice(2)}\")\n/// ```\npub fn twice(n: i64) -> i64 {\n    n * 2\n}\n",
+    );
+    let app = w.package(
+        "app",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\ncapabilities = [\"io\"]\n\n[dependencies.quietlib]\npath = \"../lib\"\n",
+        "import quietlib\n\nfn main() {\n    print(\"{quietlib.twice(2)}\")\n}\n",
+    );
+    let entry = app_entry(&app);
+    let (code, out) = run(&["check", entry.as_str()]);
+    assert_eq!(code, 1, "a printing doc example is over the ceiling:\n{out}");
+    assert!(out.contains("performs `io`"), "{out}");
+
+    // And the form that does not perform anything is accepted.
+    std::fs::write(
+        w.0.join("lib/src/main.gr"),
+        "/// Doubles a number.\n///\n/// ```\n/// assert(twice(2) == 4)\n/// ```\npub fn twice(n: i64) -> i64 {\n    n * 2\n}\n",
+    )
+    .unwrap();
+    let (code, out) = run(&["check", entry.as_str()]);
+    assert_eq!(code, 0, "an asserting doc example performs nothing:\n{out}");
+}
+
+/// `exit(code)` reports the low eight bits, so `exit(-1)` is a failure.
+#[test]
+fn exit_reports_the_low_eight_bits() {
+    let w = Work::new("exit");
+    let f = w.0.join("e.gr");
+    std::fs::write(&f, "fn main() {\n    exit(-1)\n}\n").unwrap();
+    let (code, out) = run(&["run", f.to_str().unwrap()]);
+    assert_eq!(code, 255, "exit(-1) must not report success:\n{out}");
+}
