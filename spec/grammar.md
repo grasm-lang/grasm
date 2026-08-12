@@ -228,6 +228,15 @@ spawn_stmt    = "spawn" block
 place = identifier ( "." identifier | "[" expression "]" )*
 ```
 
+**[G-PLACE]** A `place` — the left side of an assignment, and the receiver of
+a mutating method — is a name followed by field reads and index reads. A
+*tuple component* is not one: `identifier` cannot start with a digit, so `.0`
+never parsed as part of a place. The checker accepted `t.0 = 5` anyway and the
+program then panicked with `cannot access field \`0\`` — a message about
+reading, for a program that wrote — while `t.0.push(x)` mutated the tuple
+under `grasm run` and was refused by the compiled backend. A tuple is a fixed
+group of values; a struct is what has parts worth writing to by name.
+
 **[G-STMT-TERM]** A statement is terminated by a newline, by the `}` that
 closes the block it is in, or by end of file. There is no separator that lets
 two statements share a line: the `}` of a *nested* block does not end the

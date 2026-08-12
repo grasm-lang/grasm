@@ -56,6 +56,10 @@ fn run_src_here(
 /// The stack is reserved, not committed: a program that does not recurse
 /// deeply pays nothing.
 fn on_deep_stack<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    // Reserved, not committed — see `STACK_BUDGET`, which this must exceed.
+    #[cfg(debug_assertions)]
+    const STACK_BYTES: usize = 2048 * 1024 * 1024;
+    #[cfg(not(debug_assertions))]
     const STACK_BYTES: usize = 512 * 1024 * 1024;
     std::thread::scope(|scope| {
         let spawned = std::thread::Builder::new()
@@ -318,73 +322,135 @@ fn run_doc_examples(
     let mut passed = 0;
     let mut failed = 0;
     let mut hits: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
-    for example in grasm_sema::docs::examples(program) {
-        if !filter.is_empty() && !example.owner.contains(filter) {
-            continue;
+    let all: Vec<grasm_sema::docs::Example> = grasm_sema::docs::examples(program)
+        .into_iter()
+        .filter(|e| filter.is_empty() || e.owner.contains(filter))
+        .collect();
+    // The examples of one module share a synthesized program, so the whole
+    // graph is parsed and checked once per module rather than once per
+    // example. A module with sixty documented items checked its dependencies
+    // sixty times, which is what made `grasm test` on a real project spend
+    // nearly all of its time in the checker.
+    let mut groups: Vec<(String, Vec<&grasm_sema::docs::Example>)> = Vec::new();
+    for e in &all {
+        let owner_module = e.owner.split("::").next().unwrap_or("main").to_string();
+        match groups.iter_mut().find(|(m, _)| *m == owner_module) {
+            Some((_, v)) => v.push(e),
+            None => groups.push((owner_module, vec![e])),
         }
-        let ex_program = grasm_sema::docs::example_program(program, &example);
-        let mut diags = ex_program.diagnostics.clone();
-        diags.extend(grasm_sema::check::check_program(&ex_program).diagnostics);
-        if !diags.is_empty() {
-            let _ = writeln!(
-                out,
-                "doc example {} ... FAILED to compile: {}",
-                example.owner, diags[0].message
-            );
-            failed += 1;
-            continue;
-        }
-        let entry = &ex_program.files[0].module;
-        let files: Vec<(String, &Module, std::collections::HashMap<String, String>)> = ex_program
-            .files
-            .iter()
-            .map(|f| (f.name.clone(), &f.module, f.imports.clone()))
-            .collect();
-        let mut buf = Vec::new();
-        let ok = {
-            let mut interp = Interp::new_program(&files, &mut buf);
-            let a = grasm_sema::check::check_program(&ex_program);
-            interp.set_float_literals(a.float_literals);
-            interp.set_fallible_closures(a.fallible_closures);
-            interp.set_float_sums(a.float_sums);
-            if coverage {
-                interp.enable_coverage();
-            }
-            // By name, not by position. `example_program` inlines the
-            // documented module's own declarations — its tests included — and
-            // appends the example after them, so taking the *first* test ran
-            // one of the module's own and reported the example as `ok`. Any
-            // real project has a test in its entry module, so this reported
-            // every doc example in it as passing without executing one.
-            let wanted = example.owner.replace('"', "'");
-            let Some(grasm_syntax::ast::Decl::Test(t)) = entry.decls.iter().find(
-                |d| matches!(d, grasm_syntax::ast::Decl::Test(t) if t.name == wanted),
-            ) else {
-                let _ = writeln!(out, "doc example {} ... FAILED: no test", example.owner);
-                failed += 1;
-                continue;
-            };
-            let ok = interp.run_unit_test(t);
-            if let Some(h) = interp.take_coverage() {
+    }
+    for (_, group) in &groups {
+        // A group that does not compile is retried one example at a time, so
+        // a single bad example still reports against itself rather than
+        // taking its module's other examples down with it.
+        let grouped = grasm_sema::docs::example_group_program(program, group);
+        let mut gdiags = grouped.diagnostics.clone();
+        let ganalysis = grasm_sema::check::check_program(&grouped);
+        gdiags.extend(ganalysis.diagnostics.clone());
+        if gdiags.is_empty() {
+            for e in group {
+                let (ok, h) = run_one_example(&grouped, &ganalysis, &e.owner, out, coverage);
                 hits.extend(h);
+                if ok {
+                    passed += 1;
+                } else {
+                    failed += 1;
+                }
             }
-            ok
-        };
-        // The example's own report names it as a test; relabel so a reader can
-        // tell a doc example from a declared one.
-        let report = String::from_utf8_lossy(&buf);
-        let detail = report
-            .split_once("... ")
-            .map(|(_, rest)| rest.trim_end().to_string())
-            .unwrap_or_default();
-        let _ = writeln!(out, "doc example {} ... {detail}", example.owner);
-        if ok {
-            passed += 1;
-        } else {
-            failed += 1;
+            continue;
+        }
+        for example in group {
+            let (p, f, h) = run_example_alone(program, example, out, coverage);
+            passed += p;
+            failed += f;
+            hits.extend(h);
         }
     }
     (passed, failed, hits)
+}
+
+/// One example, in its own program — the slow path, for a module whose group
+/// did not compile.
+fn run_example_alone(
+    program: &grasm_sema::loader::Program,
+    example: &grasm_sema::docs::Example,
+    out: &mut impl Write,
+    coverage: bool,
+) -> (u32, u32, std::collections::BTreeSet<u32>) {
+    let ex_program = grasm_sema::docs::example_program(program, example);
+    let mut diags = ex_program.diagnostics.clone();
+    let analysis = grasm_sema::check::check_program(&ex_program);
+    diags.extend(analysis.diagnostics.clone());
+    if !diags.is_empty() {
+        let _ = writeln!(
+            out,
+            "doc example {} ... FAILED to compile: {}",
+            example.owner, diags[0].message
+        );
+        return (0, 1, std::collections::BTreeSet::new());
+    }
+    let (ok, hits) = run_one_example(&ex_program, &analysis, &example.owner, out, coverage);
+    if ok {
+        (1, 0, hits)
+    } else {
+        (0, 1, hits)
+    }
+}
+
+/// Runs the test a synthesized program holds under `wanted`.
+fn run_one_example(
+    ex_program: &grasm_sema::loader::Program,
+    analysis: &grasm_sema::check::Analysis,
+    wanted: &str,
+    out: &mut impl Write,
+    coverage: bool,
+) -> (bool, std::collections::BTreeSet<u32>) {
+    let mut hits: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    let entry = &ex_program.files[0].module;
+    let files: Vec<(String, &Module, std::collections::HashMap<String, String>)> = ex_program
+        .files
+        .iter()
+        .map(|f| (f.name.clone(), &f.module, f.imports.clone()))
+        .collect();
+    let mut buf = Vec::new();
+    // By name, not by position. The synthesized entry inlines the
+    // documented module's own declarations — its tests included — and
+    // appends the examples after them, so taking the *first* test ran one
+    // of the module's own and reported the example as `ok`. Any real
+    // project has a test in its entry module, so this reported every doc
+    // example in it as passing without executing one.
+    let quoted = wanted.replace('"', "'");
+    let Some(grasm_syntax::ast::Decl::Test(t)) = entry
+        .decls
+        .iter()
+        .find(|d| matches!(d, grasm_syntax::ast::Decl::Test(t) if t.name == quoted))
+    else {
+        let _ = writeln!(out, "doc example {wanted} ... FAILED: no test");
+        return (false, hits);
+    };
+    let ok = {
+        let mut interp = Interp::new_program(&files, &mut buf);
+        interp.set_float_literals(analysis.float_literals.clone());
+        interp.set_fallible_closures(analysis.fallible_closures.clone());
+        interp.set_float_sums(analysis.float_sums.clone());
+        if coverage {
+            interp.enable_coverage();
+        }
+        let ok = interp.run_unit_test(t);
+        if let Some(h) = interp.take_coverage() {
+            hits.extend(h);
+        }
+        ok
+    };
+    // The example's own report names it as a test; relabel so a reader can
+    // tell a doc example from a declared one.
+    let report = String::from_utf8_lossy(&buf);
+    let detail = report
+        .split_once("... ")
+        .map(|(_, rest)| rest.trim_end().to_string())
+        .unwrap_or_default();
+    let _ = writeln!(out, "doc example {wanted} ... {detail}");
+    (ok, hits)
 }
 
 /// Maps executed span offsets back to (file, line), against every line that

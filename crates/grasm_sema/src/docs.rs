@@ -532,6 +532,19 @@ fn fenced_blocks(doc: &str) -> Vec<String> {
 /// way a consumer actually writes it — instead of an unqualified name that
 /// only works because everything was flattened into one file.
 pub fn example_program(program: &Program, example: &Example) -> Program {
+    example_group_program(program, &[example])
+}
+
+/// The same, for every example a module owns at once.
+///
+/// One example at a time meant re-parsing and re-checking the whole program
+/// per example: a module with sixty documented items checked its dependencies
+/// sixty times, and `grasm test` on a real project spent almost all of its
+/// time doing that. The examples of one module share a synthesized entry, so
+/// the work is per *module* instead. `examples` must all name the same owner
+/// module; the caller groups them.
+pub fn example_group_program(program: &Program, examples: &[&Example]) -> Program {
+    let example = examples.first().expect("a group has at least one example");
     let mut sources: Vec<(String, String)> = program
         .files
         .iter()
@@ -586,15 +599,19 @@ pub fn example_program(program: &Program, example: &Example) -> Program {
             entry.push('\n');
         }
     }
-    entry.push_str("\ntest \"");
-    entry.push_str(&example.owner.replace('"', "'"));
-    entry.push_str("\" {\n");
-    for line in example.source.lines() {
-        entry.push_str("    ");
-        entry.push_str(line);
-        entry.push('\n');
+    // `examples` already gives two examples of one item distinct owners
+    // (`main::f` and `main::f #2`), so each is a test of its own name.
+    for ex in examples {
+        entry.push_str("\ntest \"");
+        entry.push_str(&ex.owner.replace('"', "'"));
+        entry.push_str("\" {\n");
+        for line in ex.source.lines() {
+            entry.push_str("    ");
+            entry.push_str(line);
+            entry.push('\n');
+        }
+        entry.push_str("}\n");
     }
-    entry.push_str("}\n");
 
     // The program's original entry module is kept, under a name nothing else
     // uses, and imported. Dropping it lost every type it declared — and types

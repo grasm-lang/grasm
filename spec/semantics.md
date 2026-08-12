@@ -136,7 +136,11 @@ panics with a stack-overflow message and exit 101 — it does not abort, crash,
 or corrupt the process. This holds for compiled programs too: a function that
 can reach itself checks the remaining stack on entry, because nothing in the
 generated code would otherwise notice, and the failure was SIGSEGV with an
-empty stderr. The bound above the guaranteed minimum is
+empty stderr. "Can reach itself" includes reaching itself through a
+module-level constant: evaluating `let A = f()` runs `f`, and a function that
+reads `A` re-enters it, so the constant is a node in that call graph like any
+body. Left out of it, `let A = f()` beside `fn f() -> i64 { A }` was the one
+cycle the check could not see. The bound above the guaranteed minimum is
 implementation-defined and differs between the two engines, so a program that
 recurses deeper than 10,000 should not assume it will run everywhere. The
 *message* does not differ: both engines say `stack overflow: recursion too
@@ -465,11 +469,15 @@ that panics is reported as a failure instead of a measurement.
 
 **[E-ENTRY]** Execution begins at `main` in the entry module. A program
 without `main` is an error. `main` takes no parameters and produces no value:
-a return type on it is refused, because nothing would read the value. Writing
-`fn main() -> i64` and ending the body with `2` looked like a status code, and
-the program exited 0 — the status a program reports is `exit(n)`, and an error
-reaching `main` is [E-MAIN-ERR]. A `! E` on `main` is allowed and means what
-that clause says.
+both are refused, because nothing calls `main` and nothing reads its value.
+Writing `fn main() -> i64` and ending the body with `2` looked like a status
+code, and the program exited 0 — the status a program reports is `exit(n)`,
+and an error reaching `main` is [E-MAIN-ERR]. A `! E` on `main` is allowed and
+means what that clause says. Only the return type was refused for a while, so
+`fn main(x: i64)` checked clean and then panicked at run time with
+`unknown name \`x\`` — a compiler-internal message arriving after the point
+where types are supposed to be settled. Read the command line with [E-ARGS]
+instead.
 
 **[E-ARGS]** `args()` returns the arguments the program was given, excluding
 the program's own name. How they are given depends on how the program is run,

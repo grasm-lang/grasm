@@ -48,6 +48,33 @@ pub struct Unsupported {
 
 type CResult<T> = Result<T, Unsupported>;
 
+/// What an expression is, in the words the tutorial uses for it. A refusal
+/// that says "inferring this type" tells the reader nothing they can act on;
+/// naming the shape at least says which line to rewrite.
+fn expr_kind(e: &Expr) -> &'static str {
+    match e {
+        Expr::Ident(_) => "a name",
+        Expr::Int(..) | Expr::Float(..) | Expr::Str(..) | Expr::Bool(..) => "a literal",
+        Expr::Call { .. } => "a call",
+        Expr::MethodCall { .. } => "a method call",
+        Expr::Field { .. } => "a field read",
+        Expr::Index { .. } => "an index",
+        Expr::Binary { .. } => "an operator expression",
+        Expr::Unary { .. } => "a unary expression",
+        Expr::Closure { .. } => "a closure",
+        Expr::StructLit { .. } => "a struct literal",
+        Expr::List(..) => "a list literal",
+        Expr::Map(..) => "a map literal",
+        Expr::Tuple(..) => "a tuple",
+        Expr::If { .. } => "an `if`",
+        Expr::Match { .. } => "a `match`",
+        Expr::Block(..) => "a block",
+        Expr::Try { .. } => "a `try`",
+        Expr::Range { .. } => "a range",
+        _ => "this expression",
+    }
+}
+
 fn nope<T>(span: Span, what: impl Into<String>) -> CResult<T> {
     Err(Unsupported {
         span,
@@ -125,6 +152,35 @@ impl VType {
             VType::Tuple(ts) => format!(
                 "t{}",
                 ts.iter().map(VType::mangle).collect::<Vec<_>>().join("_")
+            ),
+        }
+    }
+
+    /// The type as a reader would write it. §11 promises a refusal that names
+    /// what it refused; "this operator on these types" names nothing, and the
+    /// reader had no way to tell which of the two operands was the problem.
+    fn show(&self) -> String {
+        match self {
+            VType::I64 => "i64".into(),
+            VType::F64 => "f64".into(),
+            VType::Bool => "bool".into(),
+            VType::Unit => "()".into(),
+            VType::Str => "str".into(),
+            VType::Any => "an inferred type".into(),
+            VType::Ref(inner) => format!("ref {}", inner.show()),
+            VType::List(e) => format!("[{}]", e.show()),
+            VType::Option(e) => format!("{}?", e.show()),
+            VType::Fallible(o, e) => format!("{} ! {}", o.show(), e.show()),
+            VType::Struct(n) | VType::Sum(n) => n.clone(),
+            VType::Map(k, v) => format!("[{}: {}]", k.show(), v.show()),
+            VType::Fn(ps, r) => format!(
+                "fn({}) -> {}",
+                ps.iter().map(VType::show).collect::<Vec<_>>().join(", "),
+                r.show()
+            ),
+            VType::Tuple(ts) => format!(
+                "({})",
+                ts.iter().map(VType::show).collect::<Vec<_>>().join(", ")
             ),
         }
     }
@@ -1452,8 +1508,16 @@ impl<'m> Codegen<'m> {
                     fcx.emit_scope_decs_all();
                     fcx.b.ins().return_(&[v]);
                 }
-                (_, None) => {
-                    return nope(f.span, "a missing return value here");
+                (want, None) => {
+                    // A body that leaves — `panic(m)`, `exit(n)` — produces no
+                    // value because control never reaches the end. The trap is
+                    // already emitted and what follows is a dead block, so the
+                    // function needs a terminator and nothing else:
+                    // `fn unreachable() -> T { panic(…) }` is ordinary code and
+                    // §11 lists no row for it, so refusing it made the gap
+                    // table wrong either way.
+                    let z = fcx.zero_of(&want);
+                    fcx.b.ins().return_(&[z]);
                 }
             }
         }
@@ -2021,8 +2085,15 @@ to one — a loop variable or a list element is this case",
                 fcx.emit_scope_decs_all();
                 fcx.b.ins().return_(&[x]);
             }
-            (_, None) => {
-                return nope(h.body.span(), "a handler op with no value");
+            (want, None) => {
+                // A handler operation whose body leaves — `|| fail(e)` for a
+                // fallible op — produces no value because control never
+                // reaches the end. The refusal depended on the *shape* of the
+                // closure body rather than on the operation's type, so
+                // `|b| if b { 1 } else { fail(e) }` compiled and the bare
+                // `fail` did not.
+                let z = fcx.zero_of(&want);
+                fcx.b.ins().return_(&[z]);
             }
         }
         fcx.b.seal_all_blocks();
@@ -2130,6 +2201,12 @@ struct BlockHints {
     declared_ret: HashMap<String, VType>,
 }
 
+/// The call-graph node standing for a module-level constant's initializer.
+/// Named so no function key can collide with it.
+fn const_node(module: &str, name: &str) -> String {
+    format!("{module}::<const {name}>")
+}
+
 /// Every function that can reach itself, directly or through others.
 ///
 /// Only these need a stack check, so a straight-line program pays nothing for
@@ -2151,8 +2228,39 @@ fn recursive_functions(
             _ => None,
         })
         .collect();
+    // A module-level constant is computed by evaluating its initializer, so
+    // the initializer is a node in this graph like any body — and a function
+    // that *reads* the constant can re-enter it. `let A = f()` beside
+    // `fn f() -> i64 { A }` is a cycle that runs off the stack for real:
+    // SIGSEGV, exit 139, empty stderr, which is what [E-RECURSION-DEPTH]
+    // rules out. Neither half of the cycle is a call this graph could see
+    // without the constant in it.
+    let const_names: std::collections::HashSet<String> = views
+        .iter()
+        .flat_map(|(_, m, _)| m.decls.iter())
+        .filter_map(|d| match d {
+            Decl::Const(c) => Some(c.name.name.clone()),
+            _ => None,
+        })
+        .collect();
     for (module, m, imports) in views {
         for decl in &m.decls {
+            if let Decl::Const(c) = decl {
+                let mut named: Vec<(String, Vec<Expr>)> = Vec::new();
+                collect_named_calls_expr(&c.init, &mut named);
+                let callees: Vec<String> = named
+                    .into_iter()
+                    .map(|(name, _)| match name.split_once('.') {
+                        Some((alias, callee)) => match imports.get(alias) {
+                            Some(target) => format!("{target}::{callee}"),
+                            None => format!("{module}::{name}"),
+                        },
+                        None => format!("{module}::{name}"),
+                    })
+                    .collect();
+                calls.insert(const_node(module, &c.name.name), callees);
+                continue;
+            }
             let Decl::Fn(f) = decl else { continue };
             let key = format!("{module}::{}", f.name.name);
             if f.params
@@ -2177,7 +2285,7 @@ fn recursive_functions(
             if idents.iter().any(|i| !called.contains(i.as_str()) && fn_names.contains(i)) {
                 out.insert(key.clone());
             }
-            let callees = named
+            let mut callees: Vec<String> = named
                 .into_iter()
                 .map(|(name, _)| match name.split_once('.') {
                     // A qualified call names another module through an alias.
@@ -2188,6 +2296,12 @@ fn recursive_functions(
                     None => format!("{module}::{name}"),
                 })
                 .collect();
+            // Reading a constant runs its initializer, so the read is an edge.
+            for id in &idents {
+                if const_names.contains(id) {
+                    callees.push(const_node(module, id));
+                }
+            }
             calls.insert(key, callees);
         }
     }
@@ -2942,9 +3056,6 @@ fn any_inside(t: &VType) -> bool {
 /// `Ok(v)` has no error half and carries `Any` there. Each side supplies what
 /// the other cannot.
 fn merge_fallible_halves(a: VType, b: VType) -> VType {
-    let (VType::Fallible(a_ok, a_err), VType::Fallible(b_ok, b_err)) = (&a, &b) else {
-        return a;
-    };
     let pick = |x: &VType, y: &VType| -> VType {
         if matches!(x, VType::Any | VType::Unit) && !matches!(y, VType::Any | VType::Unit) {
             y.clone()
@@ -2952,10 +3063,26 @@ fn merge_fallible_halves(a: VType, b: VType) -> VType {
             x.clone()
         }
     };
-    VType::Fallible(
-        Box::new(pick(a_ok, b_ok)),
-        Box::new(pick(a_err, b_err)),
-    )
+    match (&a, &b) {
+        (VType::Fallible(a_ok, a_err), VType::Fallible(b_ok, b_err)) => VType::Fallible(
+            Box::new(pick(a_ok, b_ok)),
+            Box::new(pick(a_err, b_err)),
+        ),
+        // One side gives the whole `T ! E` and the other only the ok half —
+        // `if n == 1 { 10 } else { Ok(n * 3) }` in a fallible function
+        // ([T-OK-ERR-RETURN]). The whole type is the wider of the two, and
+        // taking the *first* branch's answer regardless meant the merge was
+        // typed `i64`: the `Ok(...)` branch's pointer travelled as a bare
+        // integer and was wrapped a second time on the way out, so the caller
+        // matched `Ok(v)` and printed a heap address where the number was.
+        (VType::Fallible(ok, err), other) => {
+            VType::Fallible(Box::new(pick(ok, other)), err.clone())
+        }
+        (other, VType::Fallible(ok, err)) => {
+            VType::Fallible(Box::new(pick(ok, other)), err.clone())
+        }
+        _ => a,
+    }
 }
 
 fn indexed_only_lists(block: &grasm_syntax::ast::Block) -> Vec<String> {
@@ -3947,7 +4074,14 @@ impl FnCx<'_, '_> {
             } => {
                 let ename = effect.dotted();
                 let Some(site) = self.cg.handler_sites.get(&span.start).cloned() else {
-                    return nope(*span, "this handler block");
+                    // The only way a `with` reaches here without a lifted
+                    // handler is one inside a `parallel`/`spawn` body, whose
+                    // statements are compiled into a task rather than the
+                    // enclosing function. Say which effect, and where.
+                    return nope(
+                        *span,
+                        format!("a `with {ename}` block inside `parallel` or `spawn`"),
+                    );
                 };
                 let (ep, el) = self.str_ptr_len(&ename);
                 self.call_rt("grasm_handler_push", &[ep, el]);
@@ -6081,6 +6215,23 @@ impl FnCx<'_, '_> {
         mut rt: VType,
         span: Span,
     ) -> CResult<(Value, VType)> {
+        let opname = match op {
+            Add => "+",
+            Sub => "-",
+            Mul => "*",
+            Div => "/",
+            Rem => "%",
+            Pow => "^",
+            Eq => "==",
+            NotEq => "!=",
+            Lt => "<",
+            LtEq => "<=",
+            Gt => ">",
+            GtEq => ">=",
+            And => "and",
+            Or => "or",
+            Coalesce => "??",
+        };
         if lt == VType::I64 && rt == VType::F64 {
             lv = self.b.ins().fcvt_from_sint(types::F64, lv);
             lt = VType::F64;
@@ -6100,7 +6251,10 @@ impl FnCx<'_, '_> {
             rt = unified;
         }
         if lt != rt {
-            return nope(span, "mixed-type operation");
+            return nope(
+                span,
+                format!("`{}` between `{}` and `{}`", opname, lt.show(), rt.show()),
+            );
         }
         use BinaryOp::*;
         // Tuples compare component by component; the runtime already knows
@@ -6265,7 +6419,7 @@ impl FnCx<'_, '_> {
             }
             (VType::Bool, Eq) => (self.b.ins().icmp(IntCC::Equal, lv, rv), VType::Bool),
             (VType::Bool, NotEq) => (self.b.ins().icmp(IntCC::NotEqual, lv, rv), VType::Bool),
-            _ => return nope(span, "this operator on these types"),
+            _ => return nope(span, format!("`{}` on `{}`", opname, lt.show())),
         };
         Ok(out)
     }
@@ -6301,10 +6455,23 @@ impl FnCx<'_, '_> {
         self.goto_block(then_blk);
         let (then_val, mut then_term) = self.eval_block_inner(then_block)?;
         then_term |= self.is_filled();
-        // Where this branch ended — its body may have created blocks of its
-        // own. The terminator is emitted here later, once both branches have
-        // been compiled and the merge type is known for certain.
-        let then_end = self.b.current_block();
+        // Where the branch's conversion and jump go. The merge type is not
+        // known until both branches have been compiled, so the jump cannot be
+        // written yet — but leaving the branch's last block unterminated and
+        // switching away from it breaks Cranelift's contract ("you have to
+        // fill your block before switching"), which a release build does not
+        // check and an SSA construction is entitled to mis-seal. A jump to an
+        // empty block of its own fills it honestly; the conversion is written
+        // into that block afterwards, where the branch's values still
+        // dominate.
+        let then_fix = if then_term {
+            None
+        } else {
+            let fix = self.b.create_block();
+            self.b.ins().jump(fix, &[]);
+            self.filled = true;
+            Some(fix)
+        };
 
         self.goto_block(else_blk);
         let mut else_term = false;
@@ -6321,7 +6488,14 @@ impl FnCx<'_, '_> {
             None => {}
         }
         else_term |= self.is_filled();
-        let else_end = self.b.current_block();
+        let else_fix = if else_term {
+            None
+        } else {
+            let fix = self.b.create_block();
+            self.b.ins().jump(fix, &[]);
+            self.filled = true;
+            Some(fix)
+        };
 
         // What the whole `if` is worth, decided from the branches themselves
         // rather than from a probe of one of them.
@@ -6358,11 +6532,9 @@ impl FnCx<'_, '_> {
             self.b.append_block_param(merge, vt.cl());
         }
 
-        // Now the terminators, in the blocks the branches ended in.
-        if !then_term {
-            if let Some(blk) = then_end {
-                self.b.switch_to_block(blk);
-            }
+        // Now the terminators, in each branch's own landing block.
+        if let Some(blk) = then_fix {
+            self.goto_block(blk);
             match (&merge_ty, &then_val) {
                 (Some(want), Some((v, vt))) => {
                     let mut v = *v;
@@ -6404,10 +6576,8 @@ impl FnCx<'_, '_> {
                 }
             }
         }
-        if !else_term {
-            if let Some(blk) = else_end {
-                self.b.switch_to_block(blk);
-            }
+        if let Some(blk) = else_fix {
+            self.goto_block(blk);
             match (&merge_ty, &else_val) {
                 (Some(want), Some((v, vt))) => {
                     let mut v = *v;
@@ -7503,7 +7673,7 @@ impl FnCx<'_, '_> {
                 VType::Map(_, v) => VType::Option(v),
                 VType::Str => VType::Str,
                 VType::Tuple(ts) => ts.first().cloned().unwrap_or(VType::Any),
-                _ => return nope(*span, "inferring this type"),
+                other => return nope(*span, format!("indexing into `{}`", other.show())),
             },
             Expr::Unary { op, expr, .. } => match op {
                 UnaryOp::Not => VType::Bool,
@@ -7567,8 +7737,18 @@ impl FnCx<'_, '_> {
                         VType::Option(Box::new(VType::Any))
                     } else if let Some(sig) = self.lookup_fn(&id.name) {
                         VType::Fn(sig.params.clone(), Box::new(sig.ret.clone()))
+                    } else if self.cg.handler_lits.contains_key(&id.name) {
+                        // A handler has no runtime value — its operations are
+                        // lifted into functions — so a name bound to one has
+                        // no type to hand anywhere a value is expected. §11
+                        // lists three shapes that end here; all of them are
+                        // this, and none of them said so.
+                        return nope(
+                            id.span,
+                            format!("the handler `{}` used as a value", id.name),
+                        );
                     } else {
-                        return nope(id.span, "inferring this type");
+                        return nope(id.span, format!("the type of `{}`", id.name));
                     }
                 }
             },
@@ -7691,7 +7871,14 @@ impl FnCx<'_, '_> {
                         ));
                     }
                 }
-                return nope(e.span(), "inferring this type");
+                let what = match &**callee {
+                    Expr::Ident(id) => format!("the result type of `{}`", id.name),
+                    Expr::Field { name, .. } | Expr::MethodCall { name, .. } => {
+                        format!("the result type of `{}`", name.name)
+                    }
+                    _ => "the result type of this call".to_string(),
+                };
+                return nope(e.span(), what);
             }
             Expr::Tuple(items, _) => {
                 // `()` is unit, not a zero-length tuple — the same rule the
@@ -7750,51 +7937,38 @@ impl FnCx<'_, '_> {
                         VType::Struct(sname) => {
                             self.struct_field_type(&sname, &name.name, *span)?
                         }
-                        _ => return nope(*span, "inferring this type"),
+                        other => {
+                            return nope(
+                                *span,
+                                format!("reading `.{}` through a `ref {}`", name.name, other.show()),
+                            )
+                        }
                     },
                     VType::Tuple(parts) => match name.name.parse::<usize>() {
                         Ok(i) if i < parts.len() => parts[i].clone(),
-                        _ => return nope(*span, "inferring this type"),
+                        _ => {
+                            return nope(
+                                *span,
+                                format!(
+                                    "`.{}` on a {}-part tuple",
+                                    name.name,
+                                    parts.len()
+                                ),
+                            )
+                        }
                     },
-                    _ => {
+                    other => {
                         // `Type.Variant` value probe.
                         if let Expr::Ident(tid) = &**recv {
                             if self.cg.sums.contains_key(&tid.name) {
                                 return Ok(self.sum_vtype(&tid.name));
                             }
                         }
-                        return nope(*span, "inferring this type");
+                        return nope(
+                            *span,
+                            format!("`.{}` on `{}`", name.name, other.show()),
+                        );
                     }
-                }
-            }
-            Expr::If {
-                then_block,
-                else_branch,
-                ..
-            } => {
-                // The then branch first, then the else — a branch that leaves
-                // (`fail`, `panic`) has no type, and an `else if` chain of
-                // them ends at the one arm that does produce a value.
-                let from_then = self.probe_block_tail(then_block).ok();
-                let from_else = match else_branch.as_deref() {
-                    Some(ElseBranch::Else(b)) => self.probe_block_tail(b).ok(),
-                    Some(ElseBranch::ElseIf(inner)) => self.probe_type(inner).ok(),
-                    None => None,
-                };
-                match (
-                    from_then.clone().filter(|t| *t != VType::Unit),
-                    from_else.clone().filter(|t| *t != VType::Unit),
-                ) {
-                    // Each branch of a fallible `if` knows one half: `Err(e)`
-                    // has no ok type to give and `Ok(v)` has no error type.
-                    // Taking the first branch's answer alone typed
-                    // `|n| if c { Err(e) } else { Ok(v) }` as `_ ! E`, so the
-                    // caller unboxed the ok half as a pointer — SIGSEGV with
-                    // an empty stderr for an `i64`, and a verifier failure
-                    // for an `f64`.
-                    (Some(a), Some(b)) => merge_fallible_halves(a, b),
-                    (Some(t), None) | (None, Some(t)) => t,
-                    (None, None) => from_then.or(from_else).unwrap_or(VType::Unit),
                 }
             }
             // `try e` is the ok half of `e`. Without this a `match` with a
@@ -7830,10 +8004,21 @@ impl FnCx<'_, '_> {
                         None => t,
                         Some(prev) => merge_fallible_halves(prev, t),
                     });
+                    // Both halves known: no later arm can add anything, and a
+                    // long match should not be probed twice over.
+                    if let Some(VType::Fallible(ok, err)) = &found {
+                        if !matches!(**ok, VType::Any | VType::Unit)
+                            && !matches!(**err, VType::Any | VType::Unit)
+                        {
+                            break;
+                        }
+                    }
                 }
                 match found {
                     Some(t) => t,
-                    None => return nope(e.span(), "inferring this type"),
+                    None => {
+                        return nope(e.span(), "a `match` whose arms say nothing about its type")
+                    }
                 }
             }
             // The builtin methods, typed from `spec/library.md`. Anything
@@ -7866,11 +8051,11 @@ impl FnCx<'_, '_> {
                 "chars" | "lines" | "split" | "words" | "keys" => VType::List(Box::new(VType::Str)),
                 "entries" => match self.probe_type(recv)? {
                     VType::Map(k, v) => VType::List(Box::new(VType::Tuple(vec![*k, *v]))),
-                    _ => return nope(e.span(), "inferring this type"),
+                    _ => return nope(e.span(), format!("`.{}()` on a receiver whose type is not known here", name.name)),
                 },
                 "values" => match self.probe_type(recv)? {
                     VType::Map(_, v) => VType::List(v),
-                    _ => return nope(e.span(), "inferring this type"),
+                    _ => return nope(e.span(), format!("`.{}()` on a receiver whose type is not known here", name.name)),
                 },
                 "parse_int" => VType::Option(Box::new(VType::I64)),
                 "parse_float" => VType::Option(Box::new(VType::F64)),
@@ -7878,7 +8063,7 @@ impl FnCx<'_, '_> {
                 // Element-wise: the result follows the receiver's elements.
                 "sum" => match self.probe_type(recv)? {
                     VType::List(elem) => *elem,
-                    _ => return nope(e.span(), "inferring this type"),
+                    _ => return nope(e.span(), format!("`.{}()` on a receiver whose type is not known here", name.name)),
                 },
                 // `min`/`max` are two methods sharing a name: the reduction
                 // over a list yields an Option, the two-argument numeric form
@@ -7886,12 +8071,12 @@ impl FnCx<'_, '_> {
                 "min" | "max" => match self.probe_type(recv)? {
                     VType::List(elem) => VType::Option(elem),
                     n @ (VType::I64 | VType::F64) => n,
-                    _ => return nope(e.span(), "inferring this type"),
+                    _ => return nope(e.span(), format!("`.{}()` on a receiver whose type is not known here", name.name)),
                 },
                 "first" | "last" | "pop" => {
                     match self.probe_type(recv)? {
                         VType::List(elem) => VType::Option(elem),
-                        _ => return nope(e.span(), "inferring this type"),
+                        _ => return nope(e.span(), format!("`.{}()` on a receiver whose type is not known here", name.name)),
                     }
                 }
                 "rev" | "slice" | "filter" | "par_filter" => self.probe_type(recv)?,
@@ -7904,24 +8089,24 @@ impl FnCx<'_, '_> {
                 "sort" | "sort_by" | "push" | "set" => VType::Unit,
                 "remove" => match self.probe_type(recv)? {
                     VType::List(elem) => *elem,
-                    _ => return nope(e.span(), "inferring this type"),
+                    _ => return nope(e.span(), format!("`.{}()` on a receiver whose type is not known here", name.name)),
                 },
                 "enumerate" => match self.probe_type(recv)? {
                     VType::List(elem) => {
                         VType::List(Box::new(VType::Tuple(vec![VType::I64, *elem])))
                     }
-                    _ => return nope(e.span(), "inferring this type"),
+                    _ => return nope(e.span(), format!("`.{}()` on a receiver whose type is not known here", name.name)),
                 },
                 "zip" => match (self.probe_type(recv)?, args.first()) {
                     (VType::List(a), Some(other)) => match self.probe_type(other)? {
                         VType::List(b) => VType::List(Box::new(VType::Tuple(vec![*a, *b]))),
-                        _ => return nope(e.span(), "inferring this type"),
+                        _ => return nope(e.span(), format!("`.{}()` on a receiver whose type is not known here", name.name)),
                     },
-                    _ => return nope(e.span(), "inferring this type"),
+                    _ => return nope(e.span(), format!("`.{}()` on a receiver whose type is not known here", name.name)),
                 },
                 "find" => match self.probe_type(recv)? {
                     VType::List(elem) => VType::Option(elem),
-                    _ => return nope(e.span(), "inferring this type"),
+                    _ => return nope(e.span(), format!("`.{}()` on a receiver whose type is not known here", name.name)),
                 },
                 // `map`/`par_map` change the element type, which needs the
                 // function's result — only knowable when it is a closure whose
@@ -7950,7 +8135,7 @@ impl FnCx<'_, '_> {
                                 _ => self.probe_type(body)?,
                             }
                         }
-                        _ => return nope(e.span(), "inferring this type"),
+                        _ => return nope(e.span(), format!("`.{}()` on a receiver whose type is not known here", name.name)),
                     };
                     VType::List(Box::new(inner))
                 }
@@ -7959,7 +8144,7 @@ impl FnCx<'_, '_> {
                     match rt {
                         VType::List(elem) => VType::Option(elem),
                         VType::Map(_, v) => VType::Option(v),
-                        _ => return nope(e.span(), "inferring this type"),
+                        _ => return nope(e.span(), format!("`.{}()` on a receiver whose type is not known here", name.name)),
                     }
                 }
                 _ => {
@@ -7990,14 +8175,16 @@ impl FnCx<'_, '_> {
                         if self.cg.sums.contains_key(&tid.name) {
                             self.sum_vtype(&tid.name)
                         } else {
-                            return nope(e.span(), "inferring this type");
+                            return nope(e.span(), format!("`.{}()` on a receiver whose type is not known here", name.name));
                         }
                     } else {
-                        return nope(e.span(), "inferring this type");
+                        return nope(e.span(), format!("`.{}()` on a receiver whose type is not known here", name.name));
                     }
                 }
             },
-            _ => return nope(e.span(), "inferring this type"),
+            other => {
+                return nope(e.span(), format!("working out the type of {}", expr_kind(other)))
+            }
         })
     }
 
@@ -8067,17 +8254,37 @@ impl FnCx<'_, '_> {
             };
             self.pop_scope_no_decs();
             match probed {
+                // Every arm that can say something, not the first one that
+                // can. `match n { 1 -> 10  2 -> Ok(n * 3)  _ -> Err("no") }`
+                // took `i64` from the first arm, so the other two jumped a
+                // `T ! E` pointer into a merge holding a machine word and the
+                // caller printed a heap address where the number was.
                 Some(t) if t != VType::Unit => {
                     probed_any = true;
-                    out_t = Some(t);
-                    break;
+                    out_t = Some(match out_t {
+                        None => t,
+                        Some(prev) => merge_fallible_halves(prev, t),
+                    });
+                    // Once both halves of a `T ! E` are known no later arm can
+                    // add anything, and probing the rest of a long match is
+                    // work with no answer in it.
+                    if let Some(VType::Fallible(ok, err)) = &out_t {
+                        if !matches!(**ok, VType::Any | VType::Unit)
+                            && !matches!(**err, VType::Any | VType::Unit)
+                        {
+                            break;
+                        }
+                    }
                 }
                 // An arm that yields nothing (e.g. `-> print(..)`) makes this
-                // a statement match: no merge parameter, no value.
+                // a statement match: no merge parameter, no value. Only while
+                // no arm has yielded a value — one that has is the checker's
+                // business, and dropping the value here is not the answer.
                 Some(_) => {
-                    probed_any = true;
-                    out_t = None;
-                    break;
+                    if out_t.is_none() {
+                        probed_any = true;
+                        break;
+                    }
                 }
                 None => continue,
             }
@@ -8168,7 +8375,15 @@ impl FnCx<'_, '_> {
             if !bterm {
                 match (&out_t, bv) {
                     (Some(want), Some((mut v, vt))) => {
-                        if *want == VType::F64 && vt == VType::I64 {
+                        // An arm of a fallible function may give the whole
+                        // `T ! E` or just the ok half ([T-OK-ERR-RETURN]),
+                        // exactly as an `if` branch may.
+                        if matches!(want, VType::Fallible(..))
+                            && !matches!(vt, VType::Fallible(..))
+                        {
+                            let boxed = self.box_value(v, &vt);
+                            v = self.call_rt("grasm_ok_new", &[boxed]).unwrap();
+                        } else if *want == VType::F64 && vt == VType::I64 {
                             v = self.b.ins().fcvt_from_sint(types::F64, v);
                         }
                         self.pop_scope_with_decs();
@@ -8615,18 +8830,6 @@ impl FnCx<'_, '_> {
                 .find_map(|scope| scope.declared_ret.get(name).cloned())
         });
         self.closure_value_with_ret(params, body, &param_types, want_ret, span)
-    }
-
-    /// `make_closure_value` with the parameter types already known — from the
-    /// function type of the parameter the closure is being passed to.
-    fn closure_value_typed(
-        &mut self,
-        params: &[Ident],
-        body: &Expr,
-        param_types: &[VType],
-        span: Span,
-    ) -> CResult<(Value, VType)> {
-        self.closure_value_with_ret(params, body, param_types, None, span)
     }
 
     /// `closure_value_typed`, told what the closure is declared to return.
@@ -9404,9 +9607,17 @@ the binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level \
         self.bind(&elem_param.name, evar, evt.clone());
         let (bv, bvt) = self.eval_expr_val(body)?;
         if bvt != acc_t {
+            // Naming both is the difference between a refusal a reader can
+            // act on and one that is simply false: an unannotated `map()`
+            // seed reached here as a map with an unknown key, and the message
+            // said the two types differed when they were written identically.
             return nope(
                 body.span(),
-                "a fold whose function returns a different type than the accumulator",
+                format!(
+                    "a `fold` over `{}` whose function answers `{}`",
+                    acc_t.show(),
+                    bvt.show()
+                ),
             );
         }
         // The previous accumulator is consumed by this round.

@@ -1,0 +1,16 @@
+//! tag: G-PLACE
+//! expect: error
+//! cannot assign to a tuple component
+// A tuple component is not a place.
+//
+// `place = identifier ( "." identifier | "[" expression "]" )*`, and an
+// identifier cannot start with a digit — so `.0` never parsed as part of one.
+// The checker accepted this anyway and the program panicked with `cannot
+// access field `0``, a message about *reading* for a program that wrote; the
+// same write spelled `t.0.push(x)` mutated the tuple under `grasm run` and
+// was refused by the compiled backend.
+fn main() {
+    var t = (1, "x")
+    t.0 = 5
+    print("{t}")
+}

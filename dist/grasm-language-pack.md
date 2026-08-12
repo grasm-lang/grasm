@@ -243,6 +243,15 @@ spawn_stmt    = "spawn" block
 place = identifier ( "." identifier | "[" expression "]" )*
 ```
 
+**[G-PLACE]** A `place` — the left side of an assignment, and the receiver of
+a mutating method — is a name followed by field reads and index reads. A
+*tuple component* is not one: `identifier` cannot start with a digit, so `.0`
+never parsed as part of a place. The checker accepted `t.0 = 5` anyway and the
+program then panicked with `cannot access field \`0\`` — a message about
+reading, for a program that wrote — while `t.0.push(x)` mutated the tuple
+under `grasm run` and was refused by the compiled backend. A tuple is a fixed
+group of values; a struct is what has parts worth writing to by name.
+
 **[G-STMT-TERM]** A statement is terminated by a newline, by the `}` that
 closes the block it is in, or by end of file. There is no separator that lets
 two statements share a line: the `}` of a *nested* block does not end the
@@ -484,6 +493,13 @@ all of those, from a later use: `var xs = []` followed by `xs.push(1)` is a
 `[i64]`, because inference reads the whole body before deciding. A literal
 whose type nothing determines is rejected.
 
+`map()` is an empty literal like `[]` and `{}`, and was not treated as one:
+`let m = map()` used only through `values()` left the *key* type decided by
+nothing, which `grasm run` answered anyway and the compiled backend refused —
+an acceptance split between the two engines over a program the checker had
+just approved. A method that pins the element type counts as determining it,
+which is why `[].sum()` is an `i64`.
+
 A literal whose type nothing determines *is* rejected, by the checker, so both
 engines agree about it. The clause used to say that anything without an
 annotation is rejected, which was not true of `grasm run` and was true of
@@ -518,6 +534,12 @@ which is worse than having no test. `write_file` to a path that
 cannot be written printed "wrote the report", exited 0, wrote nothing to
 stderr and left no file — and every user function that can fail behaved the
 same way when its result was ignored.
+
+A container built out of failures and then discarded discards them too:
+`[risky(x)]` and `xs.map(risky)` written as bare statements throw away every
+failure they hold. One pair of brackets was enough to get the old silence
+back. [T-FALLIBLE-VALUE] keeping the failures in the list is what makes them
+readable — while somebody reads them.
 
 **[T-FALLIBLE-COALESCE]** `e ?? d` where `e : T ! E` yields the value or `d`,
 the same shape `??` has over an `Option` ([E-COALESCE-LAZY] applies equally:
@@ -802,6 +824,15 @@ nowhere one was *produced*.
 message about the wrong problem, in the shape early exits are written in, and
 the workaround was to rewrite every one of them as `fail`.
 
+The two halves mix *within one expression*: an `if` may give the bare ok half
+in one branch and the whole `T ! E` in another, and a `match` may do the same
+across its arms. What the expression is worth is the wider of the two — the
+whole `T ! E` — and the branches giving only the ok half are the ones wrapped.
+Taking the type from whichever branch came first instead meant
+`if n == 1 { 10 } else { Ok(n * 3) }` was typed `i64`: the `Ok` branch's value
+travelled as a machine word and was wrapped a second time on the way out, so a
+caller that matched `Ok(v)` printed a heap address where the number was.
+
 **[T-FALLIBLE-VALUE]** A function's `! E` is part of what it answers with, so
 it travels with the function *as a value*: `risky` referenced by name has type
 `fn(A) -> T ! E`, not `fn(A) -> T`. Passing it where a plain function is
@@ -1077,7 +1108,12 @@ guarantees — and it was, in the first version of this feature.
 **[T-MODULE-NS]** Functions are per-module; types and effects share one global
 namespace, so a type name may not be declared twice across a program. One
 namespace means one namespace: an effect operation's signature may name a type
-from any module, the same as an ordinary function's.
+from any module, the same as an ordinary function's. A *type alias* is a type
+declaration like any other, and it was the one that escaped both this rule and
+[T-TYPE-NO-PUB]: aliases resolve a pass after struct and sum bodies, so
+nothing had registered the first `type Id = i64` when the second was
+collected, and two declarations of one name checked clean with the later one
+silently winning.
 
 **[T-TYPE-NO-PUB]** It follows that `pub` on a type is meaningless, so it is
 **rejected** rather than accepted and ignored. A type is reachable from every
@@ -1278,7 +1314,11 @@ panics with a stack-overflow message and exit 101 — it does not abort, crash,
 or corrupt the process. This holds for compiled programs too: a function that
 can reach itself checks the remaining stack on entry, because nothing in the
 generated code would otherwise notice, and the failure was SIGSEGV with an
-empty stderr. The bound above the guaranteed minimum is
+empty stderr. "Can reach itself" includes reaching itself through a
+module-level constant: evaluating `let A = f()` runs `f`, and a function that
+reads `A` re-enters it, so the constant is a node in that call graph like any
+body. Left out of it, `let A = f()` beside `fn f() -> i64 { A }` was the one
+cycle the check could not see. The bound above the guaranteed minimum is
 implementation-defined and differs between the two engines, so a program that
 recurses deeper than 10,000 should not assume it will run everywhere. The
 *message* does not differ: both engines say `stack overflow: recursion too
@@ -1607,11 +1647,15 @@ that panics is reported as a failure instead of a measurement.
 
 **[E-ENTRY]** Execution begins at `main` in the entry module. A program
 without `main` is an error. `main` takes no parameters and produces no value:
-a return type on it is refused, because nothing would read the value. Writing
-`fn main() -> i64` and ending the body with `2` looked like a status code, and
-the program exited 0 — the status a program reports is `exit(n)`, and an error
-reaching `main` is [E-MAIN-ERR]. A `! E` on `main` is allowed and means what
-that clause says.
+both are refused, because nothing calls `main` and nothing reads its value.
+Writing `fn main() -> i64` and ending the body with `2` looked like a status
+code, and the program exited 0 — the status a program reports is `exit(n)`,
+and an error reaching `main` is [E-MAIN-ERR]. A `! E` on `main` is allowed and
+means what that clause says. Only the return type was refused for a while, so
+`fn main(x: i64)` checked clean and then panicked at run time with
+`unknown name \`x\`` — a compiler-internal message arriving after the point
+where types are supposed to be settled. Read the command line with [E-ARGS]
+instead.
 
 **[E-ARGS]** `args()` returns the arguments the program was given, excluding
 the program's own name. How they are given depends on how the program is run,
@@ -2451,6 +2495,11 @@ mathlib/
 ```
 
 `src/main.gr` is the default; `entry = "src/lib.gr"` in `[package]` changes it.
+It has to name a file *inside* the package: the lockfile's checksum, the
+capability ceiling and `grasm publish` all cover the package's own directory,
+so an `entry` reaching out of it with `..` — or an absolute path — is refused
+rather than silently leaving all three describing a tree the program does not
+use.
 Everything a package exports lives behind that one file, so a dependency's
 other modules are reached as `import mathlib.helpers`.
 
@@ -2687,6 +2736,9 @@ runs only under `grasm run`:
 | a generic instantiated at a handler type | `f(h)` for `fn f[T](x: T)` — pass what the handler computes instead |
 | a handler used as a *value* | `print("{h}")`, or storing one — install it with `with … handled_by` instead |
 | a `with` block inside `parallel`/`spawn` | install the handler around the `parallel` block instead |
+| a `match` whose arms are effect-operation calls | `match n { 1 -> Log.info("a")  _ -> Log.info("b") }` — the same arms inside an `if`/`else` compile |
+| a closure literal in the arms of a `match` or `if` | `let f: fn(i64) -> i64 = match n { 1 -> \|x\| x + 1  _ -> \|x\| x * 2 }` — bind each closure first, or make them top-level `fn`s |
+| a `fold` seeded with an unannotated `map()` | `xs.fold(map(), add)` — annotate the seed: `let seed: Map[str, i64] = map()` |
 | polymorphic recursion | `fn f[T](x: T) -> i64 { f([x]) }` — one compiled copy per type, and the types never stop growing |
 
 Each of these is a defect being worked off, not a design boundary. The list is
@@ -4768,6 +4820,27 @@ fn main() {
 }
 ```
 
+## `G-PLACE.gr`
+
+```grasm
+//! tag: G-PLACE
+//! expect: error
+//! cannot assign to a tuple component
+// A tuple component is not a place.
+//
+// `place = identifier ( "." identifier | "[" expression "]" )*`, and an
+// identifier cannot start with a digit — so `.0` never parsed as part of one.
+// The checker accepted this anyway and the program panicked with `cannot
+// access field `0``, a message about *reading* for a program that wrote; the
+// same write spelled `t.0.push(x)` mutated the tuple under `grasm run` and
+// was refused by the compiled backend.
+fn main() {
+    var t = (1, "x")
+    t.0 = 5
+    print("{t}")
+}
+```
+
 ## `G-STMT-LAST.gr`
 
 ```grasm
@@ -5471,7 +5544,9 @@ fn main() {
 //! 0 true
 fn main() {
     // `args()` is empty with no `--` arguments; a fresh map has no entries.
-    var m = map()
+    // Annotated because `map()` is an empty literal like `[]`, and one whose
+    // type nothing determines is refused ([T-EMPTY-LIT]).
+    var m: Map[str, i64] = map()
     print("{args().len()} {m.is_empty()}")
     assert(1 + 1 == 2)
     assert_eq(2 * 2, 4)
@@ -7741,6 +7816,8 @@ fn main() {
 //! 1 -1
 //! 2 -1
 //! 1 -1
+//! 10 6 -1
+//! 10 6 -1
 // `Ok(v)` and `Err(e)` in a fallible function's own return position.
 //
 // They worked everywhere a fallible value could be *stored* and nowhere it
@@ -7776,10 +7853,37 @@ fn early(b: bool) -> i64 ! E {
     return Err(E{ m: "no" })
 }
 
+/// A branch giving the bare ok half beside one giving the whole `T ! E`.
+///
+/// The merge took its type from whichever branch was written first, so
+/// `Ok(n * 3)` travelled as a bare integer and was wrapped a second time on
+/// the way out: the caller matched `Ok(v)` and printed a heap address where
+/// the number was.
+fn mixed(n: i64) -> i64 ! E {
+    if n == 1 {
+        10
+    } else if n < 0 {
+        Err(E{ m: "neg" })
+    } else {
+        Ok(n * 3)
+    }
+}
+
+/// And the same mixture across `match` arms, which is a separate merge.
+fn picked(n: i64) -> i64 ! E {
+    match n {
+        1 -> 10
+        2 -> Ok(n * 3)
+        _ -> Err(E{ m: "no" })
+    }
+}
+
 fn main() {
     print("{tail(true) ?? 0 - 1} {tail(false) ?? 0 - 1}")
     print("{early(true) ?? 0 - 1} {early(false) ?? 0 - 1}")
     print("{held(true) ?? 0 - 1} {held(false) ?? 0 - 1}")
+    print("{mixed(1) ?? 0 - 1} {mixed(2) ?? 0 - 1} {mixed(0 - 1) ?? 0 - 1}")
+    print("{picked(1) ?? 0 - 1} {picked(2) ?? 0 - 1} {picked(3) ?? 0 - 1}")
 }
 ```
 

@@ -58,6 +58,7 @@ Will not change incompatibly before 2.0.
 - `G-MATCH-ARM-EXPR` — stable
 - `G-PAT-BIND` — stable
 - `G-PIPE` — stable
+- `G-PLACE` — stable
 - `G-STMT-LAST` — stable
 - `G-STMT-TERM` — stable
 - `G-STRUCT-AMBIG` — stable

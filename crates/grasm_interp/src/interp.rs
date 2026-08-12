@@ -146,6 +146,13 @@ const MAX_DEPTH: u32 = 100_000;
 /// call does. At 100 000 Grasm frames that overflowed the real stack first,
 /// and the reference implementation died with `fatal runtime error: stack
 /// overflow` and SIGABRT — the abort [E-RECURSION-DEPTH] says cannot happen.
+// A debug build's frames are several times larger for the same recursion, so
+// the same *depth* needs several times the bytes. Held to one number, the
+// 10,000 frames [E-RECURSION-DEPTH] guarantees stopped short under
+// `cargo test` — a red suite that said nothing about the language.
+#[cfg(debug_assertions)]
+const STACK_BUDGET: usize = 1792 * 1024 * 1024;
+#[cfg(not(debug_assertions))]
 const STACK_BUDGET: usize = 448 * 1024 * 1024;
 
 thread_local! {
@@ -1264,11 +1271,6 @@ impl<'a, W: Write> Interp<'a, W> {
                 Ok(Value::Unit)
             }
         }
-    }
-
-    /// Applies `inout` copy-out values to the caller's argument places.
-    fn apply_writebacks(&mut self, arg_exprs: &[&Expr]) -> Result<(), Flow> {
-        self.apply_writebacks_at(arg_exprs, &[])
     }
 
     /// The same, using each argument's already-resolved path where there is
@@ -2468,29 +2470,6 @@ build links it, `grasm run` can only reach what is already loaded",
         )))
     }
 
-    /// push/pop/sort mutate the receiver in place (copy-on-write at the slot).
-    /// Evaluates a call's arguments, moving `inout` ones out of their place.
-    ///
-    /// `inout` is an exclusive borrow: nothing else may observe the value
-    /// while the call runs, so the caller hands over its only reference and
-    /// takes it back at the writeback. Cloning instead left the caller's slot
-    /// holding a second reference, so the callee's first `push` found the
-    /// value shared and copied it — `add(xs, i)` in a loop was O(n) per call
-    /// and 40 000 calls took 3.5 seconds against 0.01 for the same loop
-    /// written inline.
-    ///
-    /// The move is skipped when another argument mentions the same root. The
-    /// checker allows `f(xs, xs)` where the first is `inout` and the second a
-    /// plain read, and that read must see the value, not the hole left behind.
-    fn eval_call_args(
-        &mut self,
-        modes: &[ParamMode],
-        args: &[Expr],
-        recv: Option<Value>,
-    ) -> Result<Vec<Value>, Flow> {
-        self.eval_call_args_paths(modes, args, recv).map(|(v, _)| v)
-    }
-
     /// The same, also returning each `inout` argument's resolved path.
     ///
     /// The writeback must land where the snapshot came from. Re-walking the
@@ -2555,16 +2534,6 @@ build links it, `grasm run` can only reach what is already loaded",
         let name = id.name.clone();
         self.slot_mut(&name, &path)
             .map(|slot| std::mem::replace(slot, Value::Unit))
-    }
-
-    /// Moves the value out of a place, leaving nothing behind.
-    fn take_place(&mut self, e: &Expr) -> Result<Option<Value>, Flow> {
-        let Some((root, path)) = self.place_path(e)? else {
-            return Ok(None);
-        };
-        Ok(self
-            .slot_mut(&root, &path)
-            .map(|slot| std::mem::replace(slot, Value::Unit)))
     }
 
     /// Resolves a place expression to a root binding and a path of steps.
@@ -3187,7 +3156,7 @@ build links it, `grasm run` can only reach what is already loaded",
                 })
             }
             (Value::Int(i), "as_f64") => Value::Float(*i as f64),
-            (Value::Int(i), "abs") => Value::Int(i.abs()),
+            (Value::Int(i), "abs") => Value::Int(i.wrapping_abs()),
             (Value::Int(i), "to_str") => Value::str(i.to_string()),
             (Value::Int(i), "min") => {
                 let o = self.eval_expr(&args[0])?;

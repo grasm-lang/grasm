@@ -1236,12 +1236,6 @@ fn collect_calls_expr<'e>(e: &'e Expr, out: &mut Vec<(String, &'e [Expr], Span)>
             collect_calls_expr(rhs, out);
         }
         Expr::Unary { expr, .. } | Expr::Try { expr, .. } => collect_calls_expr(expr, out),
-        Expr::MethodCall { recv, args, .. } => {
-            collect_calls_expr(recv, out);
-            for a in args {
-                collect_calls_expr(a, out);
-            }
-        }
         Expr::Index { recv, index, .. } => {
             collect_calls_expr(recv, out);
             collect_calls_expr(index, out);
@@ -1595,7 +1589,6 @@ fn declared_row_within(te: &TypeExpr) -> Option<BTreeSet<String>> {
             }
             found
         }
-        _ => None,
     }
 }
 

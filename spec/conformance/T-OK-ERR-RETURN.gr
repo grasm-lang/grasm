@@ -3,6 +3,8 @@
 //! 1 -1
 //! 2 -1
 //! 1 -1
+//! 10 6 -1
+//! 10 6 -1
 // `Ok(v)` and `Err(e)` in a fallible function's own return position.
 //
 // They worked everywhere a fallible value could be *stored* and nowhere it
@@ -38,8 +40,35 @@ fn early(b: bool) -> i64 ! E {
     return Err(E{ m: "no" })
 }
 
+/// A branch giving the bare ok half beside one giving the whole `T ! E`.
+///
+/// The merge took its type from whichever branch was written first, so
+/// `Ok(n * 3)` travelled as a bare integer and was wrapped a second time on
+/// the way out: the caller matched `Ok(v)` and printed a heap address where
+/// the number was.
+fn mixed(n: i64) -> i64 ! E {
+    if n == 1 {
+        10
+    } else if n < 0 {
+        Err(E{ m: "neg" })
+    } else {
+        Ok(n * 3)
+    }
+}
+
+/// And the same mixture across `match` arms, which is a separate merge.
+fn picked(n: i64) -> i64 ! E {
+    match n {
+        1 -> 10
+        2 -> Ok(n * 3)
+        _ -> Err(E{ m: "no" })
+    }
+}
+
 fn main() {
     print("{tail(true) ?? 0 - 1} {tail(false) ?? 0 - 1}")
     print("{early(true) ?? 0 - 1} {early(false) ?? 0 - 1}")
     print("{held(true) ?? 0 - 1} {held(false) ?? 0 - 1}")
+    print("{mixed(1) ?? 0 - 1} {mixed(2) ?? 0 - 1} {mixed(0 - 1) ?? 0 - 1}")
+    print("{picked(1) ?? 0 - 1} {picked(2) ?? 0 - 1} {picked(3) ?? 0 - 1}")
 }

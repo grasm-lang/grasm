@@ -138,12 +138,12 @@ fn check_modules(files: &[ModuleView]) -> Analysis {
     c.flush_discards();
     // Resolved now: unification is finished, so a literal's element type has
     // whatever answer the whole body gave it.
-    let mut unresolved: Vec<u32> = Vec::new();
+    let mut unresolved: Vec<(u32, u32)> = Vec::new();
     let empty_types: std::collections::HashMap<u32, String> = c
         .empty_lits
         .clone()
         .into_iter()
-        .filter_map(|(off, t)| {
+        .filter_map(|(off, len, t)| {
             let shown = c.show(&t);
             if shown.contains('_') {
                 // Nothing in the program says what this holds.
@@ -151,20 +151,20 @@ fn check_modules(files: &[ModuleView]) -> Analysis {
                 // not: `var xs = []` with no later use ran under `grasm run`
                 // and could not be built — the one divergence the clause
                 // records as fixed.
-                unresolved.push(off);
+                unresolved.push((off, len));
                 return None;
             }
             Some((off, shown))
         })
         .collect();
-    for off in unresolved {
+    for (off, len) in unresolved {
         c.diags.push(
             Diagnostic::error(
-                Span::new(off, off + 2),
+                Span::new(off, off + len),
                 "this empty literal's element type is not determined by anything".to_string(),
             )
             .with_help(
-                "annotate it, as in `let xs: [i64] = []`, or use it somewhere that says what it holds",
+                "annotate it, as in `let xs: [i64] = []` or `let m: Map[str, i64] = map()`, or use it somewhere that says what it holds",
             ),
         );
     }
@@ -263,6 +263,9 @@ struct Checker {
     /// mismatch there is reported as what it is — the function's return value
     /// — rather than as an anonymous type mismatch.
     tail_fn: Option<String>,
+    /// The function whose body is being checked, handed to `tail_fn` only
+    /// when the block's actual tail expression is reached.
+    tail_fn_name: Option<String>,
     /// Effects handled by an enclosing `with`, and the scope depth each
     /// block began at. Used to stop a value carrying a discharged effect out
     /// of the block that discharged it.
@@ -279,7 +282,9 @@ struct Checker {
     float_literals: std::collections::HashSet<u32>,
     /// See `Analysis::empty_types`. Collected as type variables and resolved
     /// once checking is over, since that is when they have answers.
-    empty_lits: Vec<(u32, Type)>,
+    /// (start offset, length, element type) — the length so the
+    /// diagnostic underlines `map()` and not its first two characters.
+    empty_lits: Vec<(u32, u32, Type)>,
     /// `sum()` calls whose result is `f64`, by span start.
     float_sums: std::collections::HashSet<u32>,
     /// effect name → (ops, handler struct TypeDefId).
@@ -304,7 +309,10 @@ struct Checker {
     key_generic_owner: Option<String>,
     /// Call sites of generic functions, checked once every body has been
     /// walked — a call may be checked before the body it constrains.
-    pending_key_checks: Vec<(String, Vec<Type>, Span)>,
+    /// (callee, its type arguments at this site, span, the generic function
+    /// the call is written inside — which is how a key generic propagates
+    /// from a callee to its caller).
+    pending_key_checks: Vec<(String, Vec<Type>, Span, Option<String>)>,
     /// Discarded statements whose type was still an inference variable when
     /// the statement was checked, resolved once the whole program is typed.
     pending_discards: Vec<(Span, Type)>,
@@ -377,6 +385,7 @@ impl Checker {
             unsafe_depth: 0,
             discarding: false,
             tail_fn: None,
+            tail_fn_name: None,
             with_floors: Vec::new(),
             region_depth: 0,
             region_floors: Vec::new(),
@@ -456,6 +465,13 @@ impl Checker {
     fn collect_types(&mut self, module: &Module) {
         // Pass 1: register names so recursive references resolve.
         let mut ids: Vec<(usize, TypeDefId)> = Vec::new();
+        // Aliases are resolved in pass 2, so nothing had registered them by
+        // the time a second declaration of the same name was collected: two
+        // `type Id = ...` lines in one module both checked clean and the
+        // later one silently won, where [T-MODULE-NS] says a type name may
+        // not be declared twice. Struct and sum bodies were caught because
+        // pass 1 inserts them immediately.
+        let mut alias_names: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (di, decl) in module.decls.iter().enumerate() {
             if let Decl::Type(t) = decl {
                 if let Some(&existing) = self.defs.by_name.get(&t.name.name) {
@@ -470,12 +486,28 @@ impl Checker {
                     }
                     continue;
                 }
-                if self.aliases.contains_key(&t.name.name) {
+                if self.aliases.contains_key(&t.name.name)
+                    || alias_names.contains(&t.name.name)
+                {
                     self.error(t.name.span, format!("duplicate type name `{}`", t.name.name));
                     continue;
                 }
                 match &t.body {
-                    TypeBody::Alias(_) => {} // resolved in pass 2
+                    TypeBody::Alias(_) => {
+                        alias_names.insert(t.name.name.clone());
+                        // The `pub` check runs over the types pass 2 gives
+                        // bodies, which an alias never reaches — so
+                        // `pub type N = i64` was accepted and ignored, which
+                        // is the exact thing [T-TYPE-NO-PUB] exists to stop.
+                        if t.is_pub {
+                            self.error_help(
+                                t.name.span,
+                                format!("`pub` means nothing on type `{}`", t.name.name),
+                                "types are one namespace across the program, so every type is \
+already reachable from every module — drop the `pub`",
+                            );
+                        }
+                    }
                     _ => {
                         let id = self.defs.insert(TypeDef {
                             name: t.name.name.clone(),
@@ -1055,6 +1087,66 @@ land in a copy the caller never sees — return the new value from the operation
         }
     }
 
+    /// Whether any branch of a tail `if`/`match` is a call to a function that
+    /// can fail.
+    ///
+    /// Such a branch produces the whole `T ! E`, not the ok half, so pushing
+    /// the ok half into it is a demand it cannot meet:
+    /// `if c { risky(1) } else { risky(n) }` in a `-> i64 ! E` function was
+    /// refused as "can fail but `i64` is required" while the identical
+    /// `match` and the same `if` bound to an annotated `let` both compiled.
+    /// Syntax alone cannot tell — `risky(1)` and `plain(1)` look the same —
+    /// so this asks what the callee actually returns.
+    fn branch_calls_fallible(&self, e: &Expr) -> bool {
+        fn tail<'a>(b: &'a Block) -> Option<&'a Expr> {
+            match b.stmts.last() {
+                Some(Stmt::Expr(e)) => Some(e),
+                _ => None,
+            }
+        }
+        match e {
+            Expr::Call { callee, .. } => match &**callee {
+                Expr::Ident(id) => self.lookup_fn(&id.name).is_some_and(|f| f.err.is_some()),
+                _ => false,
+            },
+            Expr::If {
+                then_block,
+                else_branch,
+                ..
+            } => {
+                let t = tail(then_block).is_some_and(|e| self.branch_calls_fallible(e));
+                let f = match else_branch.as_deref() {
+                    Some(ElseBranch::Else(b)) => {
+                        tail(b).is_some_and(|e| self.branch_calls_fallible(e))
+                    }
+                    Some(ElseBranch::ElseIf(inner)) => self.branch_calls_fallible(inner),
+                    None => false,
+                };
+                t || f
+            }
+            Expr::Match { arms, .. } => {
+                arms.iter().any(|a| self.branch_calls_fallible(&a.body))
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a value of this type *carries* failures inside a container it
+    /// was built from — a list, a tuple, a map, a `ref`.
+    ///
+    /// Deliberately structural: a failure stored in a user struct's field is
+    /// part of that struct's design and is read wherever the struct is, while
+    /// `[risky(x)]` written as a statement can only be throwing them away.
+    fn holds_fallible(&mut self, t: &Type) -> bool {
+        match self.uni.shallow_resolve(t) {
+            Type::Fallible(..) => true,
+            Type::List(e) | Type::Ref(e) => self.holds_fallible(&e),
+            Type::Map(_, v) => self.holds_fallible(&v),
+            Type::Tuple(parts) => parts.iter().any(|p| self.holds_fallible(p)),
+            _ => false,
+        }
+    }
+
     fn check_fn(&mut self, f: &FnDecl) {
         let info = match self.lookup_fn(&f.name.name) {
             Some(i) => i,
@@ -1065,15 +1157,26 @@ land in a copy the caller never sees — return the new value from the operation
         // `main` produces no value: nothing reads one, and a return type on
         // it read as a status code that was silently discarded — the program
         // exited 0 ([E-ENTRY]).
-        if f.name.name == "main"
-            && self.current_module == "main"
-            && !matches!(info.ret, Type::Unit)
-        {
-            self.error_help(
-                f.name.span,
-                "`main` produces no value".to_string(),
-                "drop the return type — a program's status comes from `exit(n)`, and an error reaching `main` is reported and exits 1",
-            );
+        if f.name.name == "main" && self.current_module == "main" {
+            if !matches!(info.ret, Type::Unit) {
+                self.error_help(
+                    f.name.span,
+                    "`main` produces no value".to_string(),
+                    "drop the return type — a program's status comes from `exit(n)`, and an error reaching `main` is reported and exits 1",
+                );
+            }
+            // And it takes none. The return type was refused and the
+            // parameters were not, so `fn main(x: i64)` checked clean and then
+            // panicked with `unknown name \`x\`` — a compiler-internal message
+            // arriving at run time, where the whole point of the check is that
+            // types are settled before anything runs ([E-ENTRY]).
+            if let Some(p) = f.params.first() {
+                self.error_help(
+                    p.name.span,
+                    "`main` takes no parameters".to_string(),
+                    "nothing calls `main`, so there is nothing to pass it — read the command line with `args()`",
+                );
+            }
         }
         self.hof_closures.clear();
         collect_hof_closures_block(&f.body, &mut self.hof_closures);
@@ -1127,7 +1230,7 @@ land in a copy the caller never sees — return the new value from the operation
         // `if`'s branches and a `match`'s arms explicitly.
         ) || matches!(
             f.body.stmts.last(),
-            Some(Stmt::Expr(e)) if yields_ok_half(e)
+            Some(Stmt::Expr(e)) if yields_ok_half(e) && !self.branch_calls_fallible(e)
         );
         // `Ok(3)` / `Err(e)` in tail position build the *whole* `T ! E`, so
         // that is what reaches them ([T-OK-ERR]).
@@ -1154,10 +1257,10 @@ land in a copy the caller never sees — return the new value from the operation
         // `return` is not "the last expression of the body", and saying so
         // would attach the wrong advice to a plain type mismatch.
         if want_tail.is_some() && matches!(f.body.stmts.last(), Some(Stmt::Expr(_))) {
-            self.tail_fn = Some(f.name.name.clone());
+            self.tail_fn_name = Some(f.name.name.clone());
         }
         let body_ty = self.check_block_with(&f.body, want_tail.as_ref());
-        self.tail_fn = None;
+        self.tail_fn_name = None;
         // A function that returns nothing throws its tail away, and throwing
         // away a failure is using a fallible value as if it were `T`.
         // `fn write_report(p, b) { write_file(p, b) }` printed "wrote the
@@ -1271,7 +1374,15 @@ land in a copy the caller never sees — return the new value from the operation
             match (i + 1 == n, want, stmt) {
                 (true, Some(w), Stmt::Expr(e)) if *w != Type::Unit => {
                     let w = w.clone();
+                    // Armed here and nowhere else. Set once for the whole
+                    // body, the "must return" template fired on whatever
+                    // `check_expr` ran first — so `fn g() -> i64 { let r: str
+                    // = 1  2 }` was reported as `g` returning `str`, on a line
+                    // that is not the last expression, with a help saying it
+                    // was.
+                    self.tail_fn = self.tail_fn_name.take();
                     self.check_expr(e, &w);
+                    self.tail_fn = None;
                     ty = w;
                 }
                 _ => {
@@ -1307,19 +1418,35 @@ land in a copy the caller never sees — return the new value from the operation
                     {
                         self.pending_discards.push((stmt_span(stmt), ty.clone()));
                     }
-                    if disc
-                        && matches!(stmt, Stmt::Expr(_))
-                        && matches!(self.uni.shallow_resolve(&ty), Type::Fallible(..))
-                    {
-                        let shown = self.show(&ty);
-                        self.error_help(
-                            stmt_span(stmt),
-                            format!(
-                                "this expression can fail (`{shown}`) and its failure is discarded"
-                            ),
-                            "use `try` to propagate it, `match` to handle both cases, or `??` \
+                    if disc && matches!(stmt, Stmt::Expr(_)) {
+                        let resolved = self.uni.shallow_resolve(&ty);
+                        if matches!(resolved, Type::Fallible(..)) {
+                            let shown = self.show(&ty);
+                            self.error_help(
+                                stmt_span(stmt),
+                                format!(
+                                    "this expression can fail (`{shown}`) and its failure is discarded"
+                                ),
+                                "use `try` to propagate it, `match` to handle both cases, or `??` \
 with a fallback to say what should happen instead",
-                        );
+                            );
+                        } else if self.holds_fallible(&resolved) {
+                            // One pair of brackets was enough to get the old
+                            // silence back: `[risky(-1)]` and `[1, 2].map(risky)`
+                            // as bare statements threw away every failure they
+                            // held and said nothing ([T-FALLIBLE-UNHANDLED]).
+                            // `map` keeping the failures ([T-FALLIBLE-VALUE])
+                            // only matters while somebody reads them.
+                            let shown = self.show(&ty);
+                            self.error_help(
+                                stmt_span(stmt),
+                                format!(
+                                    "this expression holds failures (`{shown}`) and they are discarded"
+                                ),
+                                "bind it and handle the failures it holds — a value nothing reads \
+is a failure nothing reports",
+                            );
+                        }
                     }
                 }
             }
@@ -2283,7 +2410,6 @@ afterwards has nowhere to send the effect — call it here, or return what it co
                                 );
                             }
                         }
-                        _ => {}
                     }
                 }
                 _ => {}
@@ -2295,6 +2421,23 @@ afterwards has nowhere to send the effect — call it here, or return what it co
     fn check_assign_target(&mut self, target: &Expr) {
         let mut root = target;
         while let Expr::Field { recv, .. } | Expr::Index { recv, .. } = root {
+            // A numeric field name is a tuple component — no identifier can
+            // start with a digit — and a tuple is a fixed group of values
+            // with no place to write into. `t.0 = 5` typechecked and then
+            // panicked with `cannot access field \`0\``, a message about
+            // reading for a program that wrote; the grammar's `place` never
+            // admitted it.
+            if let Expr::Field { name, span, .. } = root {
+                if name.name.chars().all(|c| c.is_ascii_digit()) {
+                    self.error_help(
+                        *span,
+                        "cannot assign to a tuple component".to_string(),
+                        "a tuple is a fixed group of values — rebuild it, as in \
+`t = (5, t.1)`, or use a struct when the parts have names worth writing",
+                    );
+                    return;
+                }
+            }
             root = recv;
         }
         // Writing *through* a `ref` does not mutate the reference — it mutates
@@ -2378,7 +2521,7 @@ afterwards has nowhere to send the effect — call it here, or return what it co
                 // `([], "x")` and `if c { [] } else { … }` all checked and ran
                 // and could not be built ([T-EMPTY-LIT]).
                 if items.is_empty() {
-                    self.empty_lits.push((span.start, elem));
+                    self.empty_lits.push((span.start, span.end - span.start, elem));
                 }
                 return;
             }
@@ -2396,8 +2539,11 @@ afterwards has nowhere to send the effect — call it here, or return what it co
                     self.check_expr(ve, &v);
                 }
                 if entries.is_empty() {
-                    self.empty_lits
-                        .push((span.start, Type::Map(Box::new(k), Box::new(v))));
+                    self.empty_lits.push((
+                        span.start,
+                        span.end - span.start,
+                        Type::Map(Box::new(k), Box::new(v)),
+                    ));
                 }
                 return;
             }
@@ -2657,7 +2803,7 @@ allocates could outlive it — move the work out of the region, or yield a numbe
                     self.check_expr(item, &elem);
                 }
                 if items.is_empty() {
-                    self.empty_lits.push((span.start, elem.clone()));
+                    self.empty_lits.push((span.start, span.end - span.start, elem.clone()));
                 }
                 Type::List(Box::new(elem))
             }
@@ -2674,8 +2820,11 @@ allocates could outlive it — move the work out of the region, or yield a numbe
                     self.check_expr(ve, &v);
                 }
                 if entries.is_empty() {
-                    self.empty_lits
-                        .push((span.start, Type::Map(Box::new(k.clone()), Box::new(v.clone()))));
+                    self.empty_lits.push((
+                        span.start,
+                        span.end - span.start,
+                        Type::Map(Box::new(k.clone()), Box::new(v.clone())),
+                    ));
                 }
                 Type::Map(Box::new(k), Box::new(v))
             }
@@ -2828,7 +2977,44 @@ allocates could outlive it — move the work out of the region, or yield a numbe
                             Type::Error
                         }
                     }
-                    None => Type::Unit,
+                    None => {
+                        // A one-armed `if` throws its branch's value away —
+                        // there is no other branch for it to agree with — so
+                        // a failure in that tail is a discarded failure.
+                        // Checked nowhere: the `if` itself is `()`, so the
+                        // statement rule saw nothing to complain about, and
+                        // `fn save(p, b) { if c { write_file(p, b) } }`
+                        // printed the line after it, exited 0, wrote nothing
+                        // to stderr and left no file — verbatim the failure
+                        // [T-FALLIBLE-UNHANDLED] exists to prevent.
+                        let where_ = match then_block.stmts.last() {
+                            Some(Stmt::Expr(t)) => t.span(),
+                            _ => e_span,
+                        };
+                        let resolved = self.uni.shallow_resolve(&then_ty);
+                        if matches!(resolved, Type::Fallible(..)) {
+                            let shown = self.show(&then_ty);
+                            self.error_help(
+                                where_,
+                                format!(
+                                    "this expression can fail (`{shown}`) and its failure is discarded"
+                                ),
+                                "use `try` to propagate it, `match` to handle both cases, or `??` \
+with a fallback to say what should happen instead",
+                            );
+                        } else if self.holds_fallible(&resolved) {
+                            let shown = self.show(&then_ty);
+                            self.error_help(
+                                where_,
+                                format!(
+                                    "this expression holds failures (`{shown}`) and they are discarded"
+                                ),
+                                "bind it and handle the failures it holds — a value nothing reads \
+is a failure nothing reports",
+                            );
+                        }
+                        Type::Unit
+                    }
                 }
             }
             Expr::Match {
@@ -3168,7 +3354,14 @@ only a number or a `bool` can come out — compute what you need and yield that"
                         }
                         let k = self.uni.fresh();
                         let v = self.uni.fresh();
-                        return Type::Map(Box::new(k), Box::new(v));
+                        // An empty literal like any other ([T-EMPTY-LIT]):
+                        // `let m = map()` used only through `values()` left
+                        // the *key* type decided by nothing, which `grasm run`
+                        // answered anyway and the backend refused. Registering
+                        // it here is what holds both engines to one answer.
+                        let t = Type::Map(Box::new(k), Box::new(v));
+                        self.empty_lits.push((span.start, span.end - span.start, t.clone()));
+                        return t;
                     }
                     // The two constants the math methods are useless
                     // without. Guarded on `lookup_fn`, so a program with its
@@ -3463,6 +3656,7 @@ fail outside it",
                 format!("{}::{}", self.current_module, name),
                 fresh.clone(),
                 span,
+                self.key_generic_owner.clone(),
             ));
         }
         // A handler's discharge may not leave its block through a call that
@@ -4636,7 +4830,40 @@ Perform the effect after the closing brace, or yield a number and do the work ou
     /// Applies each generic's recorded key constraints to its call sites.
     fn flush_key_checks(&mut self) {
         let pending = std::mem::take(&mut self.pending_key_checks);
-        for (name, fresh, span) in pending {
+        // A generic that forwards to a generic makes its *own* parameter a key
+        // generic, and that is only knowable once the callee's is. Run to a
+        // fixpoint first: `fn outer[T](xs: [T]) { inner(xs) }` over an
+        // `inner[T]` holding a `Map[T, _]` let `outer([1.5])` through the
+        // checker and into a runtime `invalid map key` — a well-typed program
+        // panicking, which is what [T-MAP-KEY-GENERIC] exists to stop. One
+        // hop was checked; two were not, and neither were three or four.
+        loop {
+            let mut changed = false;
+            for (name, fresh, _, owner) in &pending {
+                let (Some(indices), Some(owner)) =
+                    (self.key_generics.get(name).cloned(), owner.clone())
+                else {
+                    continue;
+                };
+                for i in indices {
+                    let Some(t) = fresh.get(i) else { continue };
+                    if let Type::Generic(g) = self.uni.resolve(t) {
+                        if self
+                            .key_generics
+                            .entry(owner.clone())
+                            .or_default()
+                            .insert(g as usize)
+                        {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        for (name, fresh, span, _) in pending {
             let Some(indices) = self.key_generics.get(&name).cloned() else {
                 continue;
             };
@@ -4732,6 +4959,21 @@ the state through an `inout` parameter",
     fn require_mutable(&mut self, recv: &Expr, name: &Ident) {
         let mut root = recv;
         while let Expr::Field { recv, .. } | Expr::Index { recv, .. } = root {
+            // A mutating method on a tuple component is the same write
+            // `check_assign_target` refuses, spelled differently — and the
+            // two engines disagreed about it: `t.0.push(5)` mutated the
+            // tuple under `grasm run` and was refused by the backend.
+            if let Expr::Field { name: f, span, .. } = root {
+                if f.name.chars().all(|c| c.is_ascii_digit()) {
+                    self.error_help(
+                        *span,
+                        format!("cannot use `{}` on a tuple component", name.name),
+                        "a tuple is a fixed group of values with no place to write into — \
+bind the component to a `var`, or use a struct when the parts have names worth writing",
+                    );
+                    return;
+                }
+            }
             root = recv;
         }
         // As in `check_assign_target`: mutating through a `ref` mutates what
@@ -5697,7 +5939,7 @@ fn collect_hof_closures(e: &Expr, out: &mut std::collections::HashSet<u32>) {
 
 /// Applies `f` to every expression a statement contains, recursively.
 fn walk_stmt_exprs(s: &Stmt, f: &mut dyn FnMut(&Expr)) {
-    let mut walk_expr = |e: &Expr, f: &mut dyn FnMut(&Expr)| walk_exprs(e, f);
+    let walk_expr = |e: &Expr, f: &mut dyn FnMut(&Expr)| walk_exprs(e, f);
     match s {
         Stmt::Let { init, .. } => walk_expr(init, f),
         Stmt::LetTuple { init, .. } => walk_expr(init, f),

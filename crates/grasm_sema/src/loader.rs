@@ -167,14 +167,17 @@ pub fn load_with_resolved_imports(
     // The span of the `import` that asked for each module, so a failure
     // points at the line that wrote it rather than at the first import in the
     // file.
-    let mut queue: Vec<(String, String, Span)> = vec![(
+    // The fourth field is the module name *as the import wrote it*, which is
+    // the only spelling a reader can look for in their own file.
+    let mut queue: Vec<(String, String, Span, String)> = vec![(
         entry_name.to_string(),
         entry_display_path.to_string(),
         Span::new(0, 1),
+        entry_name.to_string(),
     )];
     let mut base = 0u32;
 
-    while let Some((name, display, asked_at)) = queue.pop() {
+    while let Some((name, display, asked_at, written)) = queue.pop() {
         if loaded.contains_key(&name) {
             continue;
         }
@@ -188,7 +191,13 @@ pub fn load_with_resolved_imports(
             };
             diagnostics.push(Diagnostic::error(
                 asked_at,
-                format!("cannot load module `{name}` ({where_})"),
+                // Named the way the import wrote it. Quoting the loader's
+                // qualified form instead put a module path in front of the
+                // reader that appears in no source file — `dep.helpers.math`
+                // for `import helpers.math`, and one segment more per package
+                // hop, so a ten-deep graph reported
+                // `p8.p7.p6.p5.p4.p3.p2.p1.p0.sub.deep`.
+                format!("cannot load module `{written}` ({where_})"),
             ));
             continue;
         };
@@ -248,7 +257,7 @@ pub fn load_with_resolved_imports(
                 }
                 imports.insert(alias, full.clone());
                 let disp = format!("{}.gr", full.replace('.', "/"));
-                queue.push((full, disp, imp.span));
+                queue.push((full, disp, imp.span, written.clone()));
             }
         }
         let alias = name
@@ -286,9 +295,15 @@ pub fn load_with_resolved_imports(
 /// print a diagnostic would be the wrong trade.
 fn tidy(path: &std::path::Path) -> String {
     use std::path::Component;
+    fn is_root(p: &std::ffi::OsString) -> bool {
+        p == std::path::MAIN_SEPARATOR_STR
+    }
     let mut parts: Vec<std::ffi::OsString> = Vec::new();
     for c in path.components() {
         match c {
+            // `/..` is `/`, and popping the root left an empty string where
+            // a path belonged.
+            Component::ParentDir if parts.last().is_some_and(is_root) => {}
             Component::ParentDir if parts.last().is_some_and(|p| p != "..") => {
                 parts.pop();
             }
@@ -427,18 +442,28 @@ pub fn load_from_disk_in(
     let dirs = entry_src_dir.clone();
     let dep_dirs = deps.clone();
     let declared = dependency_names(&entry_src_dir);
+    let prefix_dirs_for_tried = all_prefixes.clone();
     // The same two candidates the provider tries, so the failure message says
     // where it actually looked instead of naming one of the two.
     let tried = move |name: &str| -> Vec<String> {
-        let mut out = vec![dirs
-            .join(format!("{}.gr", name.replace('.', "/")))
-            .display()
-            .to_string()];
         let root = name.split('.').next().unwrap_or(name);
+        // A module that belongs to a package is looked for *inside that
+        // package*, and the message has to say so. Built from the entry's own
+        // source directory regardless, it named `app/src/liba/nope/here.gr`
+        // and the dependency's entry file — two paths the loader never opens
+        // for this import — for a module whose only real candidates are in
+        // `liba/src`. A "looked in" list that did not is worse than none.
+        if let Some(dir) = prefix_dirs_for_tried.get(root) {
+            let rest = name.split_once('.').map(|(_, r)| r).unwrap_or("");
+            let mut out = Vec::new();
+            candidates_in_package(dir, rest, root, 0, &mut out);
+            return out;
+        }
+        let mut out = vec![tidy(&dirs.join(format!("{}.gr", name.replace('.', "/"))))];
         match (declared.iter().any(|d| d == root), dep_dirs.get(root)) {
             (true, Some(dir)) => out.push(format!(
                 "{} (entry file of dependency `{root}`)",
-                package_entry(dir).display()
+                tidy(&package_entry(dir))
             )),
             // In the graph, but this package does not declare it. Naming the
             // path it would have had is worse than useless — the loader built
@@ -604,6 +629,49 @@ fn resolve_in_package(
     // Nothing found: hand back the path a reader should have written, so the
     // diagnostic names something openable.
     Some(direct)
+}
+
+/// The paths `resolve_in_package` would open, in the order it opens them.
+///
+/// Written separately from the resolver once, it drifted: the message named
+/// the consumer's source tree for an import made *inside* a dependency, and
+/// the dependency's entry file for a module two levels down. A "looked in"
+/// list is a promise about where the loader went, and one that is wrong is
+/// worse than none — so this mirrors the resolver step for step.
+fn candidates_in_package(
+    pkg_dir: &std::path::Path,
+    rest: &str,
+    pkg_name: &str,
+    depth: usize,
+    out: &mut Vec<String>,
+) {
+    let entry = package_entry(pkg_dir);
+    if rest.is_empty() {
+        out.push(format!(
+            "{} (entry file of dependency `{pkg_name}`)",
+            tidy(&entry)
+        ));
+        return;
+    }
+    if depth > 16 {
+        return;
+    }
+    let Some(src_dir) = entry.parent().map(|p| p.to_path_buf()) else {
+        return;
+    };
+    out.push(tidy(&src_dir.join(format!("{}.gr", rest.replace('.', "/")))));
+    let head = rest.split('.').next().unwrap_or(rest);
+    let tail = rest.split_once('.').map(|(_, t)| t).unwrap_or("");
+    match package_dependencies(&src_dir).get(head) {
+        Some(dir) => candidates_in_package(dir, tail, head, depth + 1, out),
+        // The same note the entry package gets. Without it a failure inside a
+        // dependency listed one path and stopped, while the identical failure
+        // in the entry package said which manifest was missing the name.
+        None if rest.contains('.') => out.push(format!(
+            "no dependency named `{head}` in `{pkg_name}`'s grasm.toml"
+        )),
+        None => {}
+    }
 }
 
 /// Dependencies of the package containing `dir`, as name → package directory.

@@ -1252,3 +1252,190 @@ fn a_stored_closure_may_not_fail() {
         "type E = | Bad\nfn go(xs: [i64]) -> [i64] ! E {\n    xs.par_map(|x| if x == 2 {\n        fail(Bad)\n    } else {\n        x\n    })\n}\nfn main() {\n    print(\"{go([1, 3]) ?? []}\")\n}\n",
     );
 }
+
+/// An `if` or `match` may give the bare ok half in one branch and the whole
+/// `T ! E` in another; what it is worth is the whole type ([T-OK-ERR-RETURN]).
+#[test]
+fn the_two_halves_may_be_mixed_across_branches() {
+    check_ok(
+        "fn f(n: i64) -> i64 ! str {\n    if n == 1 {\n        10\n    } else {\n        Ok(n * 3)\n    }\n}\nfn main() {\n    print(\"{f(2) ?? 0 - 1}\")\n}\n",
+    );
+    check_ok(
+        "fn f(n: i64) -> i64 ! str {\n    match n {\n        1 -> 10\n        2 -> Ok(n * 3)\n        _ -> Err(\"no\")\n    }\n}\nfn main() {\n    print(\"{f(2) ?? 0 - 1}\")\n}\n",
+    );
+    // Mixing halves is not mixing *types*: the ok halves still have to agree.
+    check_err(
+        "fn f(n: i64) -> i64 ! str {\n    if n == 1 {\n        \"x\"\n    } else {\n        Ok(n * 3)\n    }\n}\nfn main() {\n    print(\"{f(2) ?? 0 - 1}\")\n}\n",
+        "different types",
+    );
+}
+
+/// `main` takes no parameters ([E-ENTRY]).
+///
+/// The return type was refused and the parameters were not, so
+/// `fn main(x: i64)` checked clean and then panicked at run time with a
+/// compiler-internal message — and the backend could not generate code for it
+/// at all.
+#[test]
+fn main_takes_no_parameters() {
+    check_err(
+        "fn main(x: i64) {\n    print(\"{x}\")\n}\n",
+        "`main` takes no parameters",
+    );
+    check_err(
+        "fn main(x: i64) {\n    print(\"hello\")\n}\n",
+        "`main` takes no parameters",
+    );
+    // A `main` in another module is an ordinary function.
+    check_ok("fn main() {\n    print(\"hello\")\n}\n");
+}
+
+/// A type alias is a type declaration: it may not repeat a name, and `pub`
+/// means nothing on it ([T-MODULE-NS], [T-TYPE-NO-PUB]).
+///
+/// Aliases are resolved a pass later than struct and sum bodies, so nothing
+/// had registered the first one when the second was collected — two
+/// `type Id = ...` lines checked clean and the later one silently won.
+#[test]
+fn an_alias_is_a_type_declaration() {
+    check_err(
+        "type Id = i64\ntype Id = str\nfn main() {\n    print(\"x\")\n}\n",
+        "duplicate type name `Id`",
+    );
+    check_err(
+        "type Id = i64\ntype Id = { n: i64 }\nfn main() {\n    print(\"x\")\n}\n",
+        "duplicate type name `Id`",
+    );
+    check_err(
+        "pub type N = i64\nfn main() {\n    print(\"x\")\n}\n",
+        "`pub` means nothing on type `N`",
+    );
+    check_ok("type Id = i64\nfn main() {\n    let x: Id = 1\n    print(\"{x}\")\n}\n");
+}
+
+/// Failures held inside a container that nothing reads are discarded
+/// ([T-FALLIBLE-UNHANDLED]).
+///
+/// One pair of brackets was enough to get the old silence back.
+#[test]
+fn failures_inside_a_discarded_container_are_refused() {
+    let prelude = "type E = | Bad\nfn risky(n: i64) -> i64 ! E {\n    if n < 0 {\n        fail(Bad)\n    } else {\n        n\n    }\n}\n";
+    check_err(
+        &format!("{prelude}fn main() {{\n    [risky(0 - 1)]\n    print(\"done\")\n}}\n"),
+        "holds failures",
+    );
+    check_err(
+        &format!("{prelude}fn main() {{\n    (risky(0 - 1), 1)\n    print(\"done\")\n}}\n"),
+        "holds failures",
+    );
+    check_err(
+        &format!("{prelude}fn main() {{\n    [1, 2].map(risky)\n    print(\"done\")\n}}\n"),
+        "holds failures",
+    );
+    // Bound, they are a value somebody can read ([T-FALLIBLE-VALUE]).
+    check_ok(&format!(
+        "{prelude}fn main() {{\n    let rs = [1, 2].map(risky)\n    print(\"{{rs.len()}}\")\n}}\n"
+    ));
+}
+
+/// A tail `if` whose branches call a fallible function produces the whole
+/// `T ! E`, exactly as the same `match` does ([T-OK-ERR-RETURN]).
+#[test]
+fn a_tail_if_may_call_fallible_functions() {
+    let prelude = "type E = | Bad\nfn risky(n: i64) -> i64 ! E {\n    if n < 0 {\n        fail(Bad)\n    } else {\n        n\n    }\n}\n";
+    check_ok(&format!(
+        "{prelude}fn pick(n: i64) -> i64 ! E {{\n    if n == 0 {{\n        risky(1)\n    }} else {{\n        risky(n)\n    }}\n}}\nfn main() {{\n    print(\"{{pick(2) ?? 0 - 1}}\")\n}}\n"
+    ));
+    check_ok(&format!(
+        "{prelude}fn pick(n: i64) -> i64 ! E {{\n    if n == 0 {{\n        risky(1)\n    }} else {{\n        fail(Bad)\n    }}\n}}\nfn main() {{\n    print(\"{{pick(2) ?? 0 - 1}}\")\n}}\n"
+    ));
+    // And an int literal beside a float branch still promotes
+    // ([T-INT-TO-FLOAT-CARRIED]).
+    check_ok(
+        "type E = | Bad\nfn f(c: bool) -> f64 ! E {\n    if c {\n        4.5\n    } else {\n        6\n    }\n}\nfn main() {\n    print(\"{f(false) ?? 0.0}\")\n}\n",
+    );
+}
+
+/// A one-armed `if` throws its branch's value away, so a failure in that tail
+/// is a discarded failure ([T-FALLIBLE-UNHANDLED]).
+///
+/// The `if` itself is `()`, so the statement rule saw nothing to complain
+/// about: `fn save(p, b) { if c { write_file(p, b) } }` printed the line after
+/// it, exited 0, wrote nothing to stderr and left no file.
+#[test]
+fn a_one_armed_if_does_not_swallow_a_failure() {
+    let prelude = "type E = | Bad\nfn risky() -> i64 ! E {\n    fail(Bad)\n}\n";
+    check_err(
+        &format!("{prelude}fn caller() {{\n    if true {{\n        risky()\n    }}\n}}\nfn main() {{\n    caller()\n}}\n"),
+        "its failure is discarded",
+    );
+    check_err(
+        "fn save(path: str, body: str) {\n    if not path.is_empty() {\n        write_file(path, body)\n    }\n}\nfn main() {\n    save(\"/x\", \"y\")\n}\n",
+        "its failure is discarded",
+    );
+    // Handled, it is fine.
+    check_ok(
+        &format!("{prelude}fn caller() {{\n    if true {{\n        risky() ?? 0\n    }}\n}}\nfn main() {{\n    caller()\n}}\n"),
+    );
+}
+
+/// A generic forwarding to a generic makes its own parameter a map-key
+/// parameter, however many hops away ([T-MAP-KEY-GENERIC]).
+#[test]
+fn a_key_generic_travels_through_forwarding() {
+    let inner = "fn inner[T](xs: [T]) -> i64 {\n    var m: Map[T, i64] = {}\n    for x in xs {\n        m.set(x, 1)\n    }\n    m.len()\n}\n";
+    check_err(
+        &format!("{inner}fn outer[T](xs: [T]) -> i64 {{\n    inner(xs)\n}}\nfn main() {{\n    print(\"{{outer([1.5])}}\")\n}}\n"),
+        "map keys must be",
+    );
+    check_err(
+        &format!("{inner}fn h2[T](xs: [T]) -> i64 {{\n    inner(xs)\n}}\nfn h3[T](xs: [T]) -> i64 {{\n    h2(xs)\n}}\nfn main() {{\n    print(\"{{h3([1.5])}}\")\n}}\n"),
+        "map keys must be",
+    );
+    check_ok(&format!(
+        "{inner}fn outer[T](xs: [T]) -> i64 {{\n    inner(xs)\n}}\nfn main() {{\n    let n = outer([\"a\"])\n    print(\"{{n}}\")\n}}\n"
+    ));
+}
+
+/// A tuple has no place to write into ([G-PLACE]).
+#[test]
+fn a_tuple_component_is_not_a_place() {
+    check_err(
+        "fn main() {\n    var t = (1, \"x\")\n    t.0 = 5\n    print(\"{t}\")\n}\n",
+        "cannot assign to a tuple component",
+    );
+    check_err(
+        "fn main() {\n    var t = ([1], \"x\")\n    t.0.push(5)\n    print(\"{t}\")\n}\n",
+        "cannot use `push` on a tuple component",
+    );
+    // Reading one is ordinary.
+    check_ok("fn main() {\n    let t = ([1], \"x\")\n    print(\"{t.0.len()}\")\n}\n");
+}
+
+/// `map()` is an empty literal like `[]` ([T-EMPTY-LIT]).
+#[test]
+fn an_undetermined_map_is_refused() {
+    check_err(
+        "fn main() {\n    let m = map()\n    print(\"{m.values().all(|x| x != 0)}\")\n}\n",
+        "not determined by anything",
+    );
+    check_ok(
+        "fn main() {\n    var m: Map[str, i64] = map()\n    m.set(\"a\", 1)\n    print(\"{m.len()}\")\n}\n",
+    );
+    check_ok(
+        "fn main() {\n    var m = map()\n    m.set(\"a\", 1)\n    print(\"{m.len()}\")\n}\n",
+    );
+}
+
+/// The "must return" template belongs to the tail expression and to no other.
+#[test]
+fn a_let_mismatch_is_not_blamed_on_the_return_type() {
+    check_err(
+        "fn g() -> i64 {\n    let r: str = 1\n    2\n}\nfn main() {\n    print(\"{g()}\")\n}\n",
+        "type mismatch: expected `str`, found `i64`",
+    );
+    check_err(
+        "fn g() -> str {\n    1\n}\nfn main() {\n    print(\"{g()}\")\n}\n",
+        "function `g` must return `str` but its body produces `i64`",
+    );
+}

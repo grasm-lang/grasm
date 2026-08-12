@@ -355,3 +355,81 @@ fn a_doc_example_sees_types_from_other_modules() {
     let diags = grasm_sema::check::check_program(&ex).diagnostics;
     assert!(diags.is_empty(), "{diags:#?}");
 }
+
+/// Every example a module owns compiles into one program, so the graph is
+/// checked once per module instead of once per example.
+#[test]
+fn a_group_holds_every_example_of_its_module() {
+    let src = "\
+/// Doubles.
+///
+/// ```
+/// assert(dbl(2) == 4)
+/// ```
+pub fn dbl(n: i64) -> i64 { n * 2 }
+
+/// Triples.
+///
+/// ```
+/// assert(tpl(2) == 6)
+/// ```
+pub fn tpl(n: i64) -> i64 { n * 3 }
+
+fn main() { print(\"{dbl(1)}\") }
+";
+    let fx = Fixture::new("groupall", &[("main", src)]);
+    let program = fx.program();
+    let examples = docs::examples(&program);
+    assert_eq!(examples.len(), 2, "{:?}", examples);
+    let group: Vec<&docs::Example> = examples.iter().collect();
+    let grouped = docs::example_group_program(&program, &group);
+    assert!(grouped.diagnostics.is_empty(), "{:?}", grouped.diagnostics);
+    let names: Vec<String> = grouped.files[0]
+        .module
+        .decls
+        .iter()
+        .filter_map(|d| match d {
+            grasm_syntax::ast::Decl::Test(t) => Some(t.name.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(names.contains(&"main::dbl".to_string()), "{names:?}");
+    assert!(names.contains(&"main::tpl".to_string()), "{names:?}");
+}
+
+/// Two examples on one item are two tests, so neither shadows the other.
+#[test]
+fn two_examples_on_one_item_get_distinct_names() {
+    let src = "\
+/// Doubles.
+///
+/// ```
+/// assert(dbl(2) == 4)
+/// ```
+///
+/// ```
+/// assert(dbl(3) == 6)
+/// ```
+pub fn dbl(n: i64) -> i64 { n * 2 }
+
+fn main() { print(\"{dbl(1)}\") }
+";
+    let fx = Fixture::new("grouptwo", &[("main", src)]);
+    let program = fx.program();
+    let examples = docs::examples(&program);
+    assert_eq!(examples.len(), 2);
+    let group: Vec<&docs::Example> = examples.iter().collect();
+    let grouped = docs::example_group_program(&program, &group);
+    assert!(grouped.diagnostics.is_empty(), "{:?}", grouped.diagnostics);
+    let names: Vec<String> = grouped.files[0]
+        .module
+        .decls
+        .iter()
+        .filter_map(|d| match d {
+            grasm_syntax::ast::Decl::Test(t) => Some(t.name.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(names.contains(&"main::dbl".to_string()), "{names:?}");
+    assert!(names.contains(&"main::dbl #2".to_string()), "{names:?}");
+}

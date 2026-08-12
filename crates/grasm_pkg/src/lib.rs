@@ -183,6 +183,28 @@ impl Manifest {
             .and_then(|v| v.as_str())
             .unwrap_or("src/main.gr")
             .to_string();
+        // A package's sources are the `.gr` files under its own directory:
+        // that is what the lockfile checksums, what the capability scan reads,
+        // and what `publish` copies. An `entry` pointing outside it — `../x.gr`
+        // or an absolute path — built and ran, while the lockfile recorded a
+        // checksum over files the program never used and the ceiling was
+        // computed from a tree the entry had left. A ceiling nobody can rely
+        // on is worse than none.
+        {
+            let p = Path::new(&entry);
+            if p.is_absolute() {
+                return Err(format!(
+                    "`entry` must be a path inside the package: `{entry}` is absolute"
+                ));
+            }
+            if p.components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return Err(format!(
+                    "`entry` must be a path inside the package: `{entry}` leaves it with `..` —                      the lockfile checksums, the capability ceiling and `grasm publish` all                      cover this package's own directory, and a file outside it is in none of them"
+                ));
+            }
+        }
 
         let mut dependencies = Vec::new();
         for (dep_name, table) in doc.subtables("dependencies") {
@@ -1069,6 +1091,17 @@ pub fn package_checksum(manifest: &Manifest) -> Result<String, String> {
     collect_sources(&manifest.dir, &mut files)?;
     files.sort();
     let mut buf: Vec<u8> = Vec::new();
+    // The manifest is part of what a consumer depends on, and it was not part
+    // of the checksum: three releases with identical sources and different
+    // `capabilities` lines hashed the same. The ceiling is the security-
+    // relevant field, so a checksum that cannot tell two of them apart is a
+    // record with a hole in exactly the place it matters.
+    if let Ok(text) = std::fs::read(manifest.dir.join(MANIFEST_NAME)) {
+        buf.extend(MANIFEST_NAME.as_bytes());
+        buf.push(0);
+        buf.extend(text);
+        buf.push(0);
+    }
     for f in &files {
         let rel = f.strip_prefix(&manifest.dir).unwrap_or(f);
         buf.extend(rel.to_string_lossy().as_bytes());

@@ -7,7 +7,9 @@
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
-GRASM=./target/release/grasm
+# Overridable so a gate can be run against a debug build, where Cranelift
+# keeps its own assertions on and the runtime checks integer overflow.
+GRASM=${GRASM:-./target/release/grasm}
 WORK="${TMPDIR:-/tmp}/grasm_difftest_$$"
 mkdir -p "$WORK"
 trap 'rm -rf "$WORK"' EXIT
@@ -23,7 +25,12 @@ skip=0
 declare -a FAILED=()
 declare -a SKIPPED=()
 
-programs=$(find examples projects spec/conformance benchmarks/grasm -name '*.gr' | sort)
+# Overridable so a slower build can be held to the same programs without the
+# benchmarks, which are sized for a release interpreter and take minutes each
+# under a debug one.
+DIRS=${DIRS:-"examples projects spec/conformance benchmarks/grasm"}
+# shellcheck disable=SC2086
+programs=$(find $DIRS -name '*.gr' | sort)
 
 for src in $programs; do
     # Library modules (no `main`) are not standalone programs.

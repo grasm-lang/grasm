@@ -3303,7 +3303,12 @@ pub unsafe extern "C" fn grasm_list_sum_f64(v: *mut RtVal) -> f64 {
 
 #[no_mangle]
 pub extern "C" fn grasm_i64_abs(v: i64) -> i64 {
-    v.abs()
+    // `i64::MIN` has no positive counterpart and wraps to itself
+    // ([L-LIB-ROUND]). Written as `abs()` that is an overflow: defined only
+    // because a release build wraps, and an abort in any build with overflow
+    // checks on. Saying `wrapping_abs` makes the documented answer the one
+    // the code asks for.
+    v.wrapping_abs()
 }
 #[no_mangle]
 pub extern "C" fn grasm_i64_min(a: i64, b: i64) -> i64 {

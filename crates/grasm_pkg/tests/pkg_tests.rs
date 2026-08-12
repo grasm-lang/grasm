@@ -1327,3 +1327,53 @@ fn an_unsafe_block_needs_the_unsafe_capability() {
     let vocab = grasm_pkg::effect_vocabulary_of_package(&ok).unwrap();
     assert!(grasm_pkg::check_capability_names(&ok, &vocab).is_empty());
 }
+
+/// A package's sources are the files under its own directory. An `entry`
+/// outside it left the lockfile checksumming a tree the program did not use
+/// and the capability ceiling scanning one the entry had left.
+#[test]
+fn an_entry_outside_the_package_is_refused() {
+    let text = "[package]\nname = \"a\"\nversion = \"0.1.0\"\nentry = \"../shared/main.gr\"\n";
+    let err = Manifest::parse(text, Path::new("/tmp")).unwrap_err();
+    assert!(err.contains("inside the package"), "{err}");
+    assert!(err.contains("../shared/main.gr"), "{err}");
+}
+
+#[test]
+fn an_absolute_entry_is_refused() {
+    let text = "[package]\nname = \"a\"\nversion = \"0.1.0\"\nentry = \"/etc/main.gr\"\n";
+    let err = Manifest::parse(text, Path::new("/tmp")).unwrap_err();
+    assert!(err.contains("is absolute"), "{err}");
+}
+
+/// The checksum covers the manifest, not only the sources.
+///
+/// Two releases with identical sources and different `capabilities` lines
+/// hashed the same, so the lockfile could not tell them apart — a hole in the
+/// record at exactly the security-relevant field.
+#[test]
+fn the_checksum_covers_the_manifest() {
+    let w = Workspace::new("cksum");
+    let dir = w.0.join("lib");
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/main.gr"), "pub fn f() -> i64 {\n    1\n}\n").unwrap();
+
+    std::fs::write(
+        dir.join(MANIFEST_NAME),
+        "[package]\nname = \"lib\"\nversion = \"0.1.0\"\ncapabilities = []\n",
+    )
+    .unwrap();
+    let closed = grasm_pkg::package_checksum(&Manifest::load(&dir).unwrap()).unwrap();
+
+    std::fs::write(
+        dir.join(MANIFEST_NAME),
+        "[package]\nname = \"lib\"\nversion = \"0.1.0\"\ncapabilities = [\"io\"]\n",
+    )
+    .unwrap();
+    let open = grasm_pkg::package_checksum(&Manifest::load(&dir).unwrap()).unwrap();
+
+    assert_ne!(
+        closed, open,
+        "a changed capability ceiling must change the checksum"
+    );
+}

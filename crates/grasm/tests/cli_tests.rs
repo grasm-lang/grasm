@@ -789,3 +789,119 @@ fn a_stray_second_operand_is_refused() {
     let (code, out) = run(&["run", f.to_str().unwrap(), "--", "a", "b"]);
     assert_eq!(code, 0, "{out}");
 }
+
+/// The "looked in" list names where the loader actually went.
+///
+/// An import made *inside* a dependency was reported against the consumer's
+/// source tree — paths the loader never opens for it — so the one place worth
+/// looking was the one place the message did not name.
+#[test]
+fn a_failed_import_names_the_paths_that_were_tried() {
+    let w = Work::new("lookedin");
+    w.package(
+        "libb",
+        "[package]\nname = \"libb\"\nversion = \"0.1.0\"\ncapabilities = []\n",
+        "pub fn inc(n: i64) -> i64 {\n    n + 1\n}\n",
+    );
+    w.package(
+        "liba",
+        "[package]\nname = \"liba\"\nversion = \"0.1.0\"\ncapabilities = []\n\n[dependencies.libb]\npath = \"../libb\"\n",
+        "import libb\nimport nope.here\n\npub fn twice(n: i64) -> i64 {\n    libb.inc(n) * 2\n}\n",
+    );
+    let app = w.package(
+        "app",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\ncapabilities = [\"io\"]\n\n[dependencies.liba]\npath = \"../liba\"\n",
+        "import liba\n\nfn main() {\n    print(\"{liba.twice(4)}\")\n}\n",
+    );
+    let (code, out) = run(&["check", &app_entry(&app)]);
+    assert_eq!(code, 1, "{out}");
+    assert!(
+        out.contains("liba/src/nope/here.gr"),
+        "the candidate inside `liba` must be named:\n{out}"
+    );
+    assert!(
+        !out.contains("app/src/liba"),
+        "the consumer's tree is not where this import is looked for:\n{out}"
+    );
+    assert!(!out.contains(".."), "paths are collapsed, not chained:\n{out}");
+
+    // A module two packages down names both real candidates, in order.
+    std::fs::write(
+        w.0.join("liba/src/main.gr"),
+        "import libb\nimport libb.gone\n\npub fn twice(n: i64) -> i64 {\n    libb.inc(n) * 2\n}\n",
+    )
+    .unwrap();
+    let (code, out) = run(&["check", &app_entry(&app)]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("liba/src/libb/gone.gr"), "{out}");
+    assert!(out.contains("libb/src/gone.gr"), "{out}");
+}
+
+/// A function whose whole body leaves compiles natively ([E-PANIC-EXIT]).
+///
+/// `fn unreachable() -> T { panic("…") }` is ordinary code and §11 lists no
+/// row for it, so refusing it made the gap table wrong either way.
+#[test]
+fn a_body_that_only_panics_compiles_natively() {
+    let w = Work::new("divergebody");
+    let f = w.0.join("d.gr");
+    std::fs::write(
+        &f,
+        "fn boom() -> i64 {\n    panic(\"mid\")\n}\nfn main() {\n    print(\"{boom()}\")\n}\n",
+    )
+    .unwrap();
+    let bin = w.0.join("d");
+    let (code, out) = run(&[
+        "build",
+        f.to_str().unwrap(),
+        "--native",
+        "-o",
+        bin.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{out}");
+    let got = Command::new(&bin).output().expect("runs");
+    assert_eq!(got.status.code(), Some(101));
+    assert!(
+        String::from_utf8_lossy(&got.stderr).contains("panic: mid"),
+        "{:?}",
+        String::from_utf8_lossy(&got.stderr)
+    );
+}
+
+/// Recursion reached through a constant's initializer panics rather than
+/// crashing, in a compiled build too ([E-RECURSION-DEPTH]).
+///
+/// The call graph the stack check is installed from had functions in it and
+/// not constants, so `let A = f()` beside `fn f() { A }` closed a cycle it
+/// could not see: SIGSEGV, exit 139, empty stderr.
+#[test]
+fn recursion_through_a_constant_panics_in_a_native_binary() {
+    let w = Work::new("constrec");
+    let f = w.0.join("c.gr");
+    std::fs::write(
+        &f,
+        "let A = f()\n\nfn f() -> i64 {\n    A\n}\n\nfn main() {\n    print(\"{A}\")\n}\n",
+    )
+    .unwrap();
+    let bin = w.0.join("c");
+    let (code, out) = run(&[
+        "build",
+        f.to_str().unwrap(),
+        "--native",
+        "-o",
+        bin.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{out}");
+    let got = Command::new(&bin).output().expect("runs");
+    assert_eq!(
+        got.status.code(),
+        Some(101),
+        "stderr: {}",
+        String::from_utf8_lossy(&got.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&got.stderr).contains("stack overflow"),
+        "{:?}",
+        String::from_utf8_lossy(&got.stderr)
+    );
+}

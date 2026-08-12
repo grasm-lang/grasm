@@ -7,7 +7,9 @@
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
-GRASM=./target/release/grasm
+# Overridable so a gate can be run against a debug build, where Cranelift
+# keeps its own assertions on and the runtime checks integer overflow.
+GRASM=${GRASM:-./target/release/grasm}
 WORK="${TMPDIR:-/tmp}/grasm_gaps_$$"
 mkdir -p "$WORK"
 trap 'rm -rf "$WORK"' EXIT
@@ -145,6 +147,59 @@ fn main() {
 # Not a shape anyone writes on purpose, but the build used to run until it was
 # killed — no diagnostic, unbounded memory — where every other gap here is a
 # refusal by name at build time.
+expect_refused "a match whose arms are effect operations" 'effect Log {
+    fn info(m: str)
+}
+fn main() {
+    with Log handled_by LogHandler{ info: |m| print(m) } {
+        let s = 1
+        match s {
+            1 -> Log.info("a")
+            _ -> Log.info("b")
+        }
+    }
+}'
+
+expect_refused "a closure literal in a match arm" 'fn main() {
+    let n = 1
+    let f: fn(i64) -> i64 = match n {
+        1 -> |x| x + 1
+        _ -> |x| x * 2
+    }
+    print("{f(3)}")
+}'
+
+expect_refused "a fold seeded with an unannotated map()" 'fn add(acc: Map[str, i64], n: i64) -> Map[str, i64] {
+    var a = acc
+    a.set("k", n)
+    a
+}
+fn main() {
+    let m = [1, 2, 3].fold(map(), add)
+    print("{m.len()}")
+}'
+
+# The other direction for the two that stopped being gaps: a handler operation
+# whose body is a bare `fail`, and a function whose whole body leaves.
+expect_compiled "a fallible handler op whose body is a bare fail" 'type E = { m: str }
+effect A {
+    fn go() -> i64 ! E
+}
+fn main() {
+    with A handled_by AHandler{ go: || fail(E{ m: "x" }) } {
+        print("{A.go() ?? 0 - 1}")
+    }
+}'
+
+# `exit` rather than `panic`, so the comparison is not about the stack trace a
+# compiled binary deliberately does not carry ([E-PANIC-TRACE]).
+expect_compiled "a body that only leaves" 'fn boom() -> i64 {
+    exit(3)
+}
+fn main() {
+    print("{boom()}")
+}'
+
 expect_refused "polymorphic recursion" 'fn f[T](x: T, n: i64) -> i64 {
     if n <= 0 {
         0

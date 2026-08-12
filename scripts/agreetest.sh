@@ -15,7 +15,9 @@
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
-GRASM=./target/release/grasm
+# Overridable so a gate can be run against a debug build, where Cranelift
+# keeps its own assertions on and the runtime checks integer overflow.
+GRASM=${GRASM:-./target/release/grasm}
 WORK="${TMPDIR:-/tmp}/grasm_agree_$$"
 mkdir -p "$WORK"
 trap 'rm -rf "$WORK"' EXIT

@@ -107,6 +107,13 @@ all of those, from a later use: `var xs = []` followed by `xs.push(1)` is a
 `[i64]`, because inference reads the whole body before deciding. A literal
 whose type nothing determines is rejected.
 
+`map()` is an empty literal like `[]` and `{}`, and was not treated as one:
+`let m = map()` used only through `values()` left the *key* type decided by
+nothing, which `grasm run` answered anyway and the compiled backend refused —
+an acceptance split between the two engines over a program the checker had
+just approved. A method that pins the element type counts as determining it,
+which is why `[].sum()` is an `i64`.
+
 A literal whose type nothing determines *is* rejected, by the checker, so both
 engines agree about it. The clause used to say that anything without an
 annotation is rejected, which was not true of `grasm run` and was true of
@@ -141,6 +148,12 @@ which is worse than having no test. `write_file` to a path that
 cannot be written printed "wrote the report", exited 0, wrote nothing to
 stderr and left no file — and every user function that can fail behaved the
 same way when its result was ignored.
+
+A container built out of failures and then discarded discards them too:
+`[risky(x)]` and `xs.map(risky)` written as bare statements throw away every
+failure they hold. One pair of brackets was enough to get the old silence
+back. [T-FALLIBLE-VALUE] keeping the failures in the list is what makes them
+readable — while somebody reads them.
 
 **[T-FALLIBLE-COALESCE]** `e ?? d` where `e : T ! E` yields the value or `d`,
 the same shape `??` has over an `Option` ([E-COALESCE-LAZY] applies equally:
@@ -425,6 +438,15 @@ nowhere one was *produced*.
 message about the wrong problem, in the shape early exits are written in, and
 the workaround was to rewrite every one of them as `fail`.
 
+The two halves mix *within one expression*: an `if` may give the bare ok half
+in one branch and the whole `T ! E` in another, and a `match` may do the same
+across its arms. What the expression is worth is the wider of the two — the
+whole `T ! E` — and the branches giving only the ok half are the ones wrapped.
+Taking the type from whichever branch came first instead meant
+`if n == 1 { 10 } else { Ok(n * 3) }` was typed `i64`: the `Ok` branch's value
+travelled as a machine word and was wrapped a second time on the way out, so a
+caller that matched `Ok(v)` printed a heap address where the number was.
+
 **[T-FALLIBLE-VALUE]** A function's `! E` is part of what it answers with, so
 it travels with the function *as a value*: `risky` referenced by name has type
 `fn(A) -> T ! E`, not `fn(A) -> T`. Passing it where a plain function is
@@ -700,7 +722,12 @@ guarantees — and it was, in the first version of this feature.
 **[T-MODULE-NS]** Functions are per-module; types and effects share one global
 namespace, so a type name may not be declared twice across a program. One
 namespace means one namespace: an effect operation's signature may name a type
-from any module, the same as an ordinary function's.
+from any module, the same as an ordinary function's. A *type alias* is a type
+declaration like any other, and it was the one that escaped both this rule and
+[T-TYPE-NO-PUB]: aliases resolve a pass after struct and sum bodies, so
+nothing had registered the first `type Id = i64` when the second was
+collected, and two declarations of one name checked clean with the later one
+silently winning.
 
 **[T-TYPE-NO-PUB]** It follows that `pub` on a type is meaningless, so it is
 **rejected** rather than accepted and ignored. A type is reachable from every

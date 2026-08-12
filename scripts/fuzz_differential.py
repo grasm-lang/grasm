@@ -27,7 +27,10 @@ import sys
 import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-GRASM = os.path.join(ROOT, "target", "release", "grasm")
+# Overridable so the fuzzer can be pointed at a debug build, where Cranelift
+# keeps its own assertions on and the runtime checks integer overflow — both
+# of which a release build compiles out.
+GRASM = os.environ.get("GRASM") or os.path.join(ROOT, "target", "release", "grasm")
 
 INT, FLOAT, BOOL, STR = "i64", "f64", "bool", "str"
 
