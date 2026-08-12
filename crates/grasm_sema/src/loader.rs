@@ -112,7 +112,7 @@ pub(crate) fn load_with_alias(
         tried,
         deps,
         entry_alias,
-        &|_| None,
+        &|_, _| None,
     )
 }
 
@@ -129,7 +129,7 @@ pub(crate) fn load_with_canonical(
     tried: &dyn Fn(&str) -> Vec<String>,
     deps: &HashSet<String>,
     entry_alias: Option<&str>,
-    canonical: &dyn Fn(&str) -> Option<String>,
+    canonical: &dyn Fn(&str, &str) -> Option<String>,
 ) -> Program {
     load_with_resolved_imports(
         entry_name,
@@ -158,7 +158,7 @@ pub fn load_with_resolved_imports(
     tried: &dyn Fn(&str) -> Vec<String>,
     deps: &HashSet<String>,
     entry_alias: Option<&str>,
-    canonical: &dyn Fn(&str) -> Option<String>,
+    canonical: &dyn Fn(&str, &str) -> Option<String>,
     resolved_imports: &HashMap<(String, String), String>,
 ) -> Program {
     let mut files: Vec<LoadedFile> = Vec::new();
@@ -217,10 +217,12 @@ pub fn load_with_resolved_imports(
                 // cases are the same string.
                 let full = match &owner {
                     Some(pkg) => format!("{pkg}.{written}"),
-                    None => written,
+                    None => written.clone(),
                 };
-                // The same package reached by two paths is one module.
-                let full = canonical(&full).unwrap_or(full);
+                // The same package reached by two paths is one module —
+                // asked with who is importing, because a file inside the
+                // importing package wins over any package of that name.
+                let full = canonical(&name, &written).unwrap_or(full);
                 // A name the build already decided wins over any derivation.
                 let full = resolved_imports
                     .get(&(name.clone(), alias.clone()))
@@ -345,9 +347,14 @@ pub fn load_from_disk_in(
     // Every package in the graph, as the qualified prefix its modules carry.
     // A dependency's own dependencies are packages too, and a module name has
     // to say which one it belongs to.
+    // Seeded from what the entry package *declares*, not from every package
+    // the graph resolution found: a package reachable only through a
+    // dependency is not one this package may import by name.
     let mut all_prefixes: HashMap<String, std::path::PathBuf> = HashMap::new();
-    for (name, dir) in &deps {
-        collect_packages(name, dir, resolved, &mut all_prefixes, 0);
+    for name in dependency_names(&entry_src_dir) {
+        if let Some(dir) = deps.get(&name) {
+            collect_packages(&name, dir, resolved, &mut all_prefixes, 0);
+        }
     }
     // One name per package. The shortest prefix wins, so a package a consumer
     // declares itself keeps the name the consumer wrote.
@@ -364,23 +371,42 @@ pub fn load_from_disk_in(
     // declares `typo` itself.
     let prefix_dirs = all_prefixes.clone();
     let canon = canon_of_dir.clone();
-    let canonical = move |name: &str| -> Option<String> {
-        let (prefix, dir) = prefix_dirs
+    let entry_dir_for_canon = entry_src_dir.clone();
+    // Given the importing module and what it wrote, the module name this
+    // import resolves to — or None to keep the one derived from the prefix.
+    //
+    // A file inside the *importing* package wins, which is what makes
+    // `import helper` mean your own `helper.gr` ([T-MODULE-DEP]). Only when
+    // there is no such file does the name mean a package, and then it means
+    // the one canonical name that package has however it was reached.
+    let canonical = move |importer: &str, written: &str| -> Option<String> {
+        let pkg_dir: std::path::PathBuf = prefix_dirs
             .iter()
-            .filter(|(p, _)| name == p.as_str() || name.starts_with(&format!("{p}.")))
-            .max_by_key(|(p, _)| p.len())?;
-        let key = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
-        let want = canon.get(&key)?;
-        if want == prefix {
+            .filter(|(p, _)| importer == p.as_str() || importer.starts_with(&format!("{p}.")))
+            .max_by_key(|(p, _)| p.len())
+            .map(|(_, d)| package_entry(d).parent().map(|s| s.to_path_buf()).unwrap_or_else(|| d.clone()))
+            .unwrap_or_else(|| entry_dir_for_canon.clone());
+        if pkg_dir
+            .join(format!("{}.gr", written.replace('.', "/")))
+            .exists()
+        {
             return None;
         }
-        Some(match name.strip_prefix(prefix.as_str()) {
-            Some(rest) => format!("{want}{rest}"),
+        let root = written.split('.').next().unwrap_or(written);
+        // A package the importing package declares, by whatever name the
+        // graph settled on.
+        let subs = package_dependencies(&pkg_dir);
+        let dir = subs.get(root)?;
+        let key = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
+        let want = canon.get(&key)?;
+        Some(match written.split_once('.') {
+            Some((_, rest)) => format!("{want}.{rest}"),
             None => want.clone(),
         })
     };
     let dirs = entry_src_dir.clone();
     let dep_dirs = deps.clone();
+    let declared = dependency_names(&entry_src_dir);
     // The same two candidates the provider tries, so the failure message says
     // where it actually looked instead of naming one of the two.
     let tried = move |name: &str| -> Vec<String> {
@@ -389,12 +415,19 @@ pub fn load_from_disk_in(
             .display()
             .to_string()];
         let root = name.split('.').next().unwrap_or(name);
-        match dep_dirs.get(root) {
-            Some(dir) => out.push(format!(
+        match (declared.iter().any(|d| d == root), dep_dirs.get(root)) {
+            (true, Some(dir)) => out.push(format!(
                 "{} (entry file of dependency `{root}`)",
                 package_entry(dir).display()
             )),
-            None => out.push(format!(
+            // In the graph, but this package does not declare it. Naming the
+            // path it would have had is worse than useless — the loader built
+            // one by chaining every hop, `../a/../b/../c/src/main.gr`, which
+            // exists nowhere.
+            (false, Some(_)) => out.push(format!(
+                "no dependency named `{root}` in grasm.toml — it is somewhere in the graph, reached through another package; add it here to import it"
+            )),
+            (_, None) => out.push(format!(
                 "no dependency named `{root}` in grasm.toml"
             )),
         }
@@ -412,9 +445,31 @@ pub fn load_from_disk_in(
     let note = |name: &str, path: &std::path::Path| {
         found.borrow_mut().insert(name.to_string(), tidy(path));
     };
+    let pkg_dirs = all_prefixes.clone();
+    let entry_declares = dependency_names(&entry_src_dir);
     let provider = |name: &str| -> Option<String> {
         if name == "main" {
             return Some(entry_src.clone());
+        }
+        // A module that belongs to a package resolves *inside that package*.
+        // Trying the entry's own source directory first let a consumer plant
+        // a file with the right relative name and silently replace a
+        // dependency's module — the program ran, printed the wrong answer,
+        // and `grasm deps` reported the library as performing nothing while
+        // the planted file read the filesystem ([T-MODULE-RESOLVE]).
+        if let Some((prefix, dir)) = pkg_dirs
+            .iter()
+            .filter(|(p, _)| name == p.as_str() || name.starts_with(&format!("{p}.")))
+            .max_by_key(|(p, _)| p.len())
+        {
+            let rest = name
+                .strip_prefix(prefix.as_str())
+                .map(|r| r.trim_start_matches('.'))
+                .unwrap_or("");
+            let path = resolve_in_package(dir, rest, 0)?;
+            let src = std::fs::read_to_string(&path).ok()?;
+            note(name, &path);
+            return Some(src);
         }
         let rel = format!("{}.gr", name.replace('.', "/"));
         let sibling = entry_src_dir.join(&rel);
@@ -422,8 +477,16 @@ pub fn load_from_disk_in(
             note(name, &sibling);
             return Some(src);
         }
-        // Then a dependency declared in grasm.toml, loaded from its entry.
+        // Then a dependency this package declares. Only its own: the graph
+        // resolution hands down every package it found, and taking any of
+        // them let `import deep` compile in a package whose manifest names
+        // only `mid` — a hard dependency with no version requirement, absent
+        // from the manifest and from minimal version selection
+        // ([T-MODULE-DEP]: "a dependency the manifest declares").
         let root = name.split('.').next().unwrap_or(name);
+        if !entry_declares.iter().any(|d| d == root) {
+            return None;
+        }
         let dep_dir = deps.get(root)?;
         let rest = name.split_once('.').map(|(_, s)| s).unwrap_or("");
         let path = resolve_in_package(dep_dir, rest, 0)?;

@@ -947,9 +947,25 @@ pub fn effects_of_package(manifest: &Manifest) -> Result<BTreeSet<String>, Strin
     // consumer cannot fix, and if the consumer already declared `io` for its
     // own reasons, nothing was reported at all.
     for extra in package_modules(&entry) {
-        if let Ok(p) = grasm_sema::loader::load_from_disk(&extra) {
-            out.extend(grasm_sema::effects::effects_of_program(&p));
+        let p = grasm_sema::loader::load_from_disk(&extra).map_err(|e| {
+            format!("package `{}`: {}", manifest.name, e)
+        })?;
+        // A file that does not parse cannot be read for what it performs, and
+        // affirming the package anyway is the wrong answer in the one
+        // direction that matters: `grasm deps` reported `performs []` and
+        // wrote a lockfile over sources it had never analysed.
+        if !p.diagnostics.is_empty() {
+            return Err(format!(
+                "package `{}`: cannot read `{}` — {}",
+                manifest.name,
+                extra.display(),
+                p.diagnostics
+                    .first()
+                    .map(|d| d.message.clone())
+                    .unwrap_or_default()
+            ));
         }
+        out.extend(grasm_sema::effects::effects_of_program(&p));
     }
     Ok(out)
 }

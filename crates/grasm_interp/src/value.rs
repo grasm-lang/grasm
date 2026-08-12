@@ -115,6 +115,9 @@ pub enum Value {
         /// "unknown name `helper`" for a program the compiled binary ran
         /// correctly.
         module: Rc<String>,
+        /// Whether this closure's own type is fallible, so a `fail` inside it
+        /// is *its* error rather than the enclosing function's.
+        fallible: bool,
     },
     /// Reference to a named top-level function.
     FnRef(Rc<String>),

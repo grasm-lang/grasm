@@ -398,6 +398,10 @@ struct PendingClosure {
     captures: Vec<(String, VType)>,
     params: Vec<(String, VType)>,
     ret: VType,
+    /// The body produces the ok half and the declared type is `T ! E`, so the
+    /// value is wrapped on the way out — the same rule a named fallible
+    /// function follows.
+    wrap_ok: bool,
     body: Expr,
 }
 
@@ -1757,6 +1761,20 @@ to one — a loop variable or a list element is this case",
         fcx.b.append_block_params_for_function_params(entry);
         fcx.b.switch_to_block(entry);
         fcx.push_scope();
+        // A lifted body recurses through no name, so the call-graph analysis
+        // that guards named functions never sees it.
+        if body_can_call(&c.body) {
+            let ptr_ty = fcx.cg.module.target_config().pointer_type();
+            let slot = fcx.b.create_sized_stack_slot(
+                cranelift_codegen::ir::StackSlotData::new(
+                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                    8,
+                    3,
+                ),
+            );
+            let here = fcx.b.ins().stack_addr(ptr_ty, slot, 0);
+            fcx.call_rt("grasm_stack_check", &[here]);
+        }
         let ps: Vec<Value> = fcx.b.block_params(entry).to_vec();
 
         // Unpack the captured environment, which was built in this order.
@@ -1789,7 +1807,14 @@ to one — a loop variable or a list element is this case",
                 }
             }
             (want, Some((mut x, xt))) => {
-                if *want == VType::F64 && xt == VType::I64 {
+                if c.wrap_ok {
+                    // The body gave the ok half; the declaration says the
+                    // value is `T ! E`. Without this the caller's `??` saw a
+                    // bare value where an `Ok` was expected and took the
+                    // fallback on the *success* path.
+                    let boxed = fcx.box_value(x, &xt);
+                    x = fcx.call_rt("grasm_ok_new", &[boxed]).unwrap();
+                } else if *want == VType::F64 && xt == VType::I64 {
                     x = fcx.b.ins().fcvt_from_sint(types::F64, x);
                 }
                 fcx.emit_scope_decs_all();
@@ -1854,6 +1879,20 @@ to one — a loop variable or a list element is this case",
         fcx.b.append_block_params_for_function_params(entry);
         fcx.b.switch_to_block(entry);
         fcx.push_scope();
+        // A lifted body recurses through no name, so the call-graph analysis
+        // that guards named functions never sees it.
+        if body_can_call(&h.body) {
+            let ptr_ty = fcx.cg.module.target_config().pointer_type();
+            let slot = fcx.b.create_sized_stack_slot(
+                cranelift_codegen::ir::StackSlotData::new(
+                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                    8,
+                    3,
+                ),
+            );
+            let here = fcx.b.ins().stack_addr(ptr_ty, slot, 0);
+            fcx.call_rt("grasm_stack_check", &[here]);
+        }
         let ps: Vec<Value> = fcx.b.block_params(entry).to_vec();
         let env = ps[0];
         for (i, (cname, ct)) in h.captures.iter().enumerate() {
@@ -2018,6 +2057,12 @@ struct BlockHints {
     /// `apply(f, 5)` where `apply` declares `fn(i64) -> i64`: the signature
     /// says what `f`'s parameters are, and no call of `f` by name ever will.
     declared: HashMap<String, Vec<VType>>,
+    /// And what it returns. A closure's own body cannot say that it is
+    /// *fallible*: `|n| if c { fail(e) } else { v }` probes as `v`'s type, so
+    /// the lifted function returned a bare value and a `fail` inside it
+    /// returned an error object through a slot typed for the value —
+    /// `f(1) ?? "d"` then took the fallback on the success path.
+    declared_ret: HashMap<String, VType>,
 }
 
 /// Every function that can reach itself, directly or through others.
@@ -2388,6 +2433,24 @@ fn collect_calls_expr(e: &Expr, bound: &[String], out: &mut HashMap<String, Vec<
 }
 
 /// Every identifier appearing in an expression, in source order.
+/// Whether a lifted body can call anything, and so can recurse.
+///
+/// A named function gets its stack check from the call-graph analysis, which
+/// only knows names. A handler operation calling its own effect —
+/// `CfgHandler{ value: |n| Cfg.value(n - 1) }` — recurses through no name at
+/// all, and the compiled program died with SIGSEGV and an empty stderr where
+/// [E-RECURSION-DEPTH] promises a panic and exit 101.
+fn body_can_call(e: &Expr) -> bool {
+    let mut names = Vec::new();
+    collect_idents(e, &mut names);
+    if !names.is_empty() {
+        return true;
+    }
+    let mut calls: Vec<(String, Vec<Expr>)> = Vec::new();
+    collect_named_calls_expr(e, &mut calls);
+    !calls.is_empty()
+}
+
 /// Whether this closure body can fail, and so cannot run on a parallel worker.
 ///
 /// The lifted worker ABI carries one `i64` of result bits and no error
@@ -6145,7 +6208,16 @@ impl FnCx<'_, '_> {
             match (&merge_ty, &then_val) {
                 (Some(want), Some((v, vt))) => {
                     let mut v = *v;
-                    if *want == VType::F64 && *vt == VType::I64 {
+                    // A fallible function's branch may give the whole `T ! E`
+                    // or just the ok half ([T-OK-ERR-RETURN]).
+                    // `if b { Err(e) } else { 3 }` jumped a bare integer into
+                    // a merge holding a pointer: SIGSEGV, empty stderr.
+                    if matches!(want, VType::Fallible(..))
+                        && !matches!(vt, VType::Fallible(..))
+                    {
+                        let boxed = self.box_value(v, vt);
+                        v = self.call_rt("grasm_ok_new", &[boxed]).unwrap();
+                    } else if *want == VType::F64 && *vt == VType::I64 {
                         v = self.b.ins().fcvt_from_sint(types::F64, v);
                     }
                     self.b.ins().jump(merge, &[v]);
@@ -6181,7 +6253,16 @@ impl FnCx<'_, '_> {
             match (&merge_ty, &else_val) {
                 (Some(want), Some((v, vt))) => {
                     let mut v = *v;
-                    if *want == VType::F64 && *vt == VType::I64 {
+                    // A fallible function's branch may give the whole `T ! E`
+                    // or just the ok half ([T-OK-ERR-RETURN]).
+                    // `if b { Err(e) } else { 3 }` jumped a bare integer into
+                    // a merge holding a pointer: SIGSEGV, empty stderr.
+                    if matches!(want, VType::Fallible(..))
+                        && !matches!(vt, VType::Fallible(..))
+                    {
+                        let boxed = self.box_value(v, vt);
+                        v = self.call_rt("grasm_ok_new", &[boxed]).unwrap();
+                    } else if *want == VType::F64 && *vt == VType::I64 {
                         v = self.b.ins().fcvt_from_sint(types::F64, v);
                     }
                     self.b.ins().jump(merge, &[v]);
@@ -6408,7 +6489,17 @@ impl FnCx<'_, '_> {
                 }
                 let wrapped = self.call_rt("grasm_err_new", &[ev]).unwrap();
                 self.emit_scope_decs_all();
-                self.b.ins().return_(&[wrapped]);
+                if matches!(self.ret, VType::Fallible(_, _)) {
+                    self.b.ins().return_(&[wrapped]);
+                } else {
+                    // `fn main() { fail(e) }` — `main` may propagate without
+                    // declaring `! E`, and its signature then returns nothing.
+                    // Returning the error value from it anyway failed the
+                    // Cranelift verifier and surfaced as "codegen bug",
+                    // naming nothing. The same report `try` makes from here.
+                    self.call_rt("grasm_report_main_err", &[wrapped]);
+                    self.trap_here();
+                }
                 self.filled = true;
                 let dead = self.b.create_block();
                 self.goto_block(dead);
@@ -7204,18 +7295,30 @@ impl FnCx<'_, '_> {
                 self.push_scope();
                 let t = self.probe_block_tail(then_block);
                 self.pop_scope_no_decs();
-                match t {
-                    Ok(t) if t != VType::Unit => t,
-                    _ => match else_branch.as_deref() {
-                        Some(ElseBranch::Else(b)) => {
-                            self.push_scope();
-                            let e = self.probe_block_tail(b);
-                            self.pop_scope_no_decs();
-                            e?
-                        }
-                        Some(ElseBranch::ElseIf(inner)) => self.probe_type(inner)?,
-                        None => VType::Unit,
-                    },
+                let e = match else_branch.as_deref() {
+                    Some(ElseBranch::Else(b)) => {
+                        self.push_scope();
+                        let e = self.probe_block_tail(b);
+                        self.pop_scope_no_decs();
+                        e.ok()
+                    }
+                    Some(ElseBranch::ElseIf(inner)) => self.probe_type(inner).ok(),
+                    None => None,
+                };
+                // Each branch of a fallible `if` knows one half: `Err(e)` has
+                // no ok type to give and `Ok(v)` has no error type. Taking the
+                // first branch that could be typed made
+                // `|n| if c { Err(e) } else { Ok(n) }` probe as `_ ! E`, so a
+                // caller that needed the ok half read its own fallback as a
+                // pointer — SIGSEGV with an empty stderr.
+                match (
+                    t.ok().filter(|t| *t != VType::Unit),
+                    e.clone().filter(|t| *t != VType::Unit),
+                ) {
+                    (Some(a), Some(b)) => merge_fallible_halves(a, b),
+                    (Some(t), None) => t,
+                    (None, Some(t)) => t,
+                    (None, None) => e.unwrap_or(VType::Unit),
                 }
             }
             Expr::Closure { params, body, span } => {
@@ -7396,6 +7499,25 @@ impl FnCx<'_, '_> {
                         let inner = self.probe_type(&args[0])?;
                         return Ok(VType::Option(Box::new(inner)));
                     }
+                    // `Ok(v)` and `Err(e)` each name one half. Without these
+                    // a closure returning them probed as `_ ! _`, so a caller
+                    // that had to know the ok half — `??` does, `match` does
+                    // not — read the fallback it produced as a pointer and
+                    // the program died with an empty stderr.
+                    if id.name == "Ok" && args.len() == 1 {
+                        let inner = self.probe_type(&args[0])?;
+                        return Ok(VType::Fallible(
+                            Box::new(inner),
+                            Box::new(VType::Any),
+                        ));
+                    }
+                    if id.name == "Err" && args.len() == 1 {
+                        let inner = self.probe_type(&args[0])?;
+                        return Ok(VType::Fallible(
+                            Box::new(VType::Any),
+                            Box::new(inner),
+                        ));
+                    }
                 }
                 return nope(e.span(), "inferring this type");
             }
@@ -7482,28 +7604,52 @@ impl FnCx<'_, '_> {
                 // (`fail`, `panic`) has no type, and an `else if` chain of
                 // them ends at the one arm that does produce a value.
                 let from_then = self.probe_block_tail(then_block).ok();
-                match from_then.clone().filter(|t| *t != VType::Unit) {
-                    Some(t) => t,
-                    None => {
-                        let from_else = match else_branch.as_deref() {
-                            Some(ElseBranch::Else(b)) => self.probe_block_tail(b).ok(),
-                            Some(ElseBranch::ElseIf(inner)) => self.probe_type(inner).ok(),
-                            None => None,
-                        };
-                        match from_else {
-                            Some(t) => t,
-                            None => from_then.unwrap_or(VType::Unit),
-                        }
-                    }
+                let from_else = match else_branch.as_deref() {
+                    Some(ElseBranch::Else(b)) => self.probe_block_tail(b).ok(),
+                    Some(ElseBranch::ElseIf(inner)) => self.probe_type(inner).ok(),
+                    None => None,
+                };
+                match (
+                    from_then.clone().filter(|t| *t != VType::Unit),
+                    from_else.clone().filter(|t| *t != VType::Unit),
+                ) {
+                    // Each branch of a fallible `if` knows one half: `Err(e)`
+                    // has no ok type to give and `Ok(v)` has no error type.
+                    // Taking the first branch's answer alone typed
+                    // `|n| if c { Err(e) } else { Ok(v) }` as `_ ! E`, so the
+                    // caller unboxed the ok half as a pointer — SIGSEGV with
+                    // an empty stderr for an `i64`, and a verifier failure
+                    // for an `f64`.
+                    (Some(a), Some(b)) => merge_fallible_halves(a, b),
+                    (Some(t), None) | (None, Some(t)) => t,
+                    (None, None) => from_then.or(from_else).unwrap_or(VType::Unit),
                 }
             }
             Expr::Match { arms, .. } => {
+                // Every arm that can say something, for the same reason as an
+                // `if`'s two branches: one arm's `Err(e)` and another's
+                // `Ok(v)` each know a different half.
                 let mut found: Option<VType> = None;
                 for arm in arms {
-                    if let Ok(t) = self.probe_type(&arm.body) {
-                        found = Some(t);
-                        break;
+                    // An arm that leaves — `return`, `fail`, `panic` — never
+                    // reaches the merge and says nothing about what the match
+                    // is worth. Folding it in made an inner
+                    // `match x { 0 -> return 7  _ -> x * 3 }` probe as
+                    // nothing, so the enclosing function returned whatever
+                    // was in the register: `0` where the answer was `9`.
+                    if arm_diverges(&arm.body) {
+                        continue;
                     }
+                    let Ok(t) = self.probe_type(&arm.body) else {
+                        continue;
+                    };
+                    if t == VType::Unit {
+                        continue;
+                    }
+                    found = Some(match found {
+                        None => t,
+                        Some(prev) => merge_fallible_halves(prev, t),
+                    });
                 }
                 match found {
                     Some(t) => t,
@@ -8248,7 +8394,13 @@ impl FnCx<'_, '_> {
         span: Span,
     ) -> CResult<(Value, VType)> {
         let param_types = self.closure_param_types(params, binding, span)?;
-        self.closure_value_typed(params, body, &param_types, span)
+        let want_ret = binding.and_then(|name| {
+            self.closure_hints
+                .iter()
+                .rev()
+                .find_map(|scope| scope.declared_ret.get(name).cloned())
+        });
+        self.closure_value_with_ret(params, body, &param_types, want_ret, span)
     }
 
     /// `make_closure_value` with the parameter types already known — from the
@@ -8258,6 +8410,18 @@ impl FnCx<'_, '_> {
         params: &[Ident],
         body: &Expr,
         param_types: &[VType],
+        span: Span,
+    ) -> CResult<(Value, VType)> {
+        self.closure_value_with_ret(params, body, param_types, None, span)
+    }
+
+    /// `closure_value_typed`, told what the closure is declared to return.
+    fn closure_value_with_ret(
+        &mut self,
+        params: &[Ident],
+        body: &Expr,
+        param_types: &[VType],
+        want_ret: Option<VType>,
         span: Span,
     ) -> CResult<(Value, VType)> {
         let param_types = param_types.to_vec();
@@ -8280,7 +8444,16 @@ impl FnCx<'_, '_> {
         }
         let ret = self.probe_type(body);
         self.pop_scope_no_decs();
-        let ret = ret?;
+        let probed = ret?;
+        // A declaration wins: the body of a fallible closure probes as its ok
+        // half, and only the declaration says the other half exists.
+        let (ret, wrap_ok) = match &want_ret {
+            Some(w @ VType::Fallible(..)) if !matches!(probed, VType::Fallible(..)) => {
+                (w.clone(), true)
+            }
+            Some(w) if *w != VType::Unit && probed == VType::Unit => (w.clone(), false),
+            _ => (probed, false),
+        };
 
         let ptr_ty = self.cg.module.target_config().pointer_type();
         let mut sig = self.cg.module.make_signature();
@@ -8303,6 +8476,7 @@ impl FnCx<'_, '_> {
         self.cg.pending_closures.push(PendingClosure {
             id,
             module: self.cg.current_module.clone(),
+            wrap_ok,
             captures: captures.clone(),
             params: params
                 .iter()
@@ -8359,8 +8533,12 @@ impl FnCx<'_, '_> {
             if !matches!(init, Expr::Closure { params, .. } if !params.is_empty()) {
                 continue;
             }
-            if let Ok(VType::Fn(ps, _)) = self.cg.vtype_of(ty) {
+            if let Ok(VType::Fn(ps, ret)) = self.cg.vtype_of(ty) {
                 hints.declared.entry(name.name.clone()).or_insert(ps);
+                hints
+                    .declared_ret
+                    .entry(name.name.clone())
+                    .or_insert(*ret);
             }
         }
         let mut calls: Vec<(String, Vec<Expr>)> = Vec::new();
@@ -8374,8 +8552,12 @@ impl FnCx<'_, '_> {
                 if !bound.contains(&id.name) {
                     continue;
                 }
-                if let Some(VType::Fn(ps, _)) = sig.get(i) {
+                if let Some(VType::Fn(ps, ret)) = sig.get(i) {
                     hints.declared.entry(id.name.clone()).or_insert(ps.clone());
+                    hints
+                        .declared_ret
+                        .entry(id.name.clone())
+                        .or_insert((**ret).clone());
                 }
             }
         }

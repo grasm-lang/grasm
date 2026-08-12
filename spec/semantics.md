@@ -464,7 +464,12 @@ that panics is reported as a failure instead of a measurement.
 ## 11. Program startup
 
 **[E-ENTRY]** Execution begins at `main` in the entry module. A program
-without `main` is an error.
+without `main` is an error. `main` takes no parameters and produces no value:
+a return type on it is refused, because nothing would read the value. Writing
+`fn main() -> i64` and ending the body with `2` looked like a status code, and
+the program exited 0 — the status a program reports is `exit(n)`, and an error
+reaching `main` is [E-MAIN-ERR]. A `! E` on `main` is allowed and means what
+that clause says.
 
 **[E-ARGS]** `args()` returns the arguments the program was given, excluding
 the program's own name. How they are given depends on how the program is run,

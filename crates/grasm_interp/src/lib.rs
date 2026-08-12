@@ -137,6 +137,7 @@ fn run_program_traced_here(
     // ([T-INT-TO-FLOAT]); this engine has no types of its own.
     let analysis = grasm_sema::check::check_program(program);
     interp.set_float_literals(analysis.float_literals);
+    interp.set_fallible_closures(analysis.fallible_closures);
     interp.set_float_sums(analysis.float_sums);
     interp.program_args = program_args.to_vec();
     let code = interp.run_main();
@@ -169,6 +170,7 @@ fn run_program_here(
     // ([T-INT-TO-FLOAT]); this engine has no types of its own.
     let analysis = grasm_sema::check::check_program(program);
     interp.set_float_literals(analysis.float_literals);
+    interp.set_fallible_closures(analysis.fallible_closures);
     interp.set_float_sums(analysis.float_sums);
     interp.program_args = program_args.to_vec();
     let code = interp.run_main();
@@ -212,6 +214,7 @@ fn test_program_here(
     // ([T-INT-TO-FLOAT]); this engine has no types of its own.
     let analysis = grasm_sema::check::check_program(program);
     interp.set_float_literals(analysis.float_literals);
+    interp.set_fallible_closures(analysis.fallible_closures);
     interp.set_float_sums(analysis.float_sums);
     if opts.coverage {
         interp.enable_coverage();
@@ -342,6 +345,7 @@ fn run_doc_examples(
             let mut interp = Interp::new_program(&files, &mut buf);
             let a = grasm_sema::check::check_program(&ex_program);
             interp.set_float_literals(a.float_literals);
+            interp.set_fallible_closures(a.fallible_closures);
             interp.set_float_sums(a.float_sums);
             if coverage {
                 interp.enable_coverage();
@@ -436,6 +440,7 @@ fn bench_program_here(
     // ([T-INT-TO-FLOAT]); this engine has no types of its own.
     let analysis = grasm_sema::check::check_program(program);
     interp.set_float_literals(analysis.float_literals);
+    interp.set_fallible_closures(analysis.fallible_closures);
     interp.set_float_sums(analysis.float_sums);
     let mut results = Vec::new();
     // Every module's benchmarks, the way `grasm test` runs every module's

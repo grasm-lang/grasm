@@ -28,6 +28,16 @@ pub struct Analysis {
     /// Spans are globally unique across a program — the loader gives each file
     /// a disjoint base — so the start offset identifies the literal.
     pub float_literals: std::collections::HashSet<u32>,
+    /// Start offsets of closure literals whose own type is fallible.
+    ///
+    /// `fail(e)` raises the error branch of the enclosing *fallible* function,
+    /// and a closure is one only when its type says so. Catching every
+    /// failure at every closure boundary made
+    /// `xs.par_map(|x| if c { fail(e) } else { x })` produce a list holding an
+    /// `Err` instead of failing ([E-PAR-FAIL]); catching none of them let a
+    /// `fail` inside `let f: fn(i64) -> str ! E = |n| …` unwind past the
+    /// `??` written to handle it. Only the checker knows which is which.
+    pub fallible_closures: std::collections::HashSet<u32>,
     /// Start offset of each empty `[]` or `{}` literal → the type inference
     /// settled on for it, written the way a person would.
     ///
@@ -168,6 +178,12 @@ fn check_modules(files: &[ModuleView]) -> Analysis {
             .map(|(k, (t, _))| (k.clone(), TypeDisplay { ty: t, defs: &c.defs }.to_string()))
             .collect(),
         float_literals: c.float_literals,
+        fallible_closures: c
+            .closure_types
+            .iter()
+            .filter(|(_, t)| matches!(c.uni.shallow_resolve(t), Type::Fallible(..)))
+            .map(|(off, _)| *off)
+            .collect(),
         empty_types,
         float_sums: c.float_sums,
         defs: c.defs,
@@ -212,6 +228,9 @@ struct Checker {
     fn_rows: HashMap<String, std::collections::BTreeSet<String>>,
     /// Each closure literal's row, keyed by span. See `rows_and_closures`.
     closure_rows: HashMap<u32, std::collections::BTreeSet<String>>,
+    /// Every closure literal's return type, by start offset, resolved once
+    /// the whole program is typed.
+    closure_types: HashMap<u32, Type>,
     /// The generated `EHandler` types.
     ///
     /// Their operation fields are the one place a function value is *not*
@@ -342,6 +361,7 @@ impl Checker {
             fns: HashMap::new(),
             fn_rows: HashMap::new(),
             closure_rows: HashMap::new(),
+            closure_types: HashMap::new(),
             handler_ids: std::collections::HashSet::new(),
             unsafe_depth: 0,
             discarding: false,
@@ -1031,6 +1051,19 @@ land in a copy the caller never sees — return the new value from the operation
         };
         // Generic params stay opaque (`Generic(i)`) while checking the body,
         // and are in scope for annotations written inside it.
+        // `main` produces no value: nothing reads one, and a return type on
+        // it read as a status code that was silently discarded — the program
+        // exited 0 ([E-ENTRY]).
+        if f.name.name == "main"
+            && self.current_module == "main"
+            && !matches!(info.ret, Type::Unit)
+        {
+            self.error_help(
+                f.name.span,
+                "`main` produces no value".to_string(),
+                "drop the return type — a program's status comes from `exit(n)`, and an error reaching `main` is reported and exits 1",
+            );
+        }
         self.current_generics = f.generics.iter().map(|g| g.name.clone()).collect();
         self.key_generic_owner = if f.generics.is_empty() {
             None
@@ -1073,6 +1106,15 @@ land in a copy the caller never sees — return the new value from the operation
             Some(Stmt::Expr(
                 Expr::Int(..) | Expr::Float(..) | Expr::List(..) | Expr::Tuple(..) | Expr::Map(..)
             ))
+        // An `if` or a `match` none of whose branches builds the whole
+        // `T ! E` produces the ok half, so the ok half is what reaches them.
+        // Without this `fn f(n: i64) -> f64 ! E { if c { 4.5 } else { 6 } }`
+        // was refused for branches "of different types" while the same body
+        // with a plain `-> f64` compiled — [T-INT-TO-FLOAT-CARRIED] names an
+        // `if`'s branches and a `match`'s arms explicitly.
+        ) || matches!(
+            f.body.stmts.last(),
+            Some(Stmt::Expr(e)) if yields_ok_half(e)
         );
         // `Ok(3)` / `Err(e)` in tail position build the *whole* `T ! E`, so
         // that is what reaches them ([T-OK-ERR]).
@@ -1080,6 +1122,11 @@ land in a copy the caller never sees — return the new value from the operation
             f.body.stmts.last(),
             Some(Stmt::Expr(Expr::Call { callee, .. }))
                 if matches!(&**callee, Expr::Ident(id) if id.name == "Ok" || id.name == "Err")
+        // And an `if` or `match` whose branches all do: there the whole
+        // `T ! E` is what every branch builds, so it is what reaches them.
+        ) || matches!(
+            f.body.stmts.last(),
+            Some(Stmt::Expr(e)) if yields_whole(e)
         );
         let want_tail = if ret == Type::Unit {
             None
@@ -2087,6 +2134,27 @@ afterwards has nowhere to send the effect — call it here, or return what it co
         }
     }
 
+    /// `T ! E` merged with a bare `T`, when that is what the two branches
+    /// are. `None` when they disagree about something else.
+    fn merge_fallible_branches(&mut self, a: &Type, b: &Type) -> Option<Type> {
+        for (whole, half) in [(a, b), (b, a)] {
+            let Type::Fallible(ok, _) = self.uni.shallow_resolve(whole) else {
+                continue;
+            };
+            if matches!(self.uni.shallow_resolve(half), Type::Fallible(..)) {
+                continue;
+            }
+            let ok = self.uni.resolve(&ok);
+            // An `Err(e)` branch has no ok half of its own, so an unresolved
+            // one adopts the other branch's type.
+            if matches!(ok, Type::Var(_)) || self.uni.unify(&ok, half) {
+                let _ = self.uni.unify(&ok, half);
+                return Some(self.uni.resolve(whole));
+            }
+        }
+        None
+    }
+
     /// Every effect named by a function type anywhere inside `t`.
     fn row_carried_by(&self, t: &Type) -> std::collections::BTreeSet<String> {
         let mut out = std::collections::BTreeSet::new();
@@ -2119,6 +2187,29 @@ afterwards has nowhere to send the effect — call it here, or return what it co
                 Type::Fallible(a, b) => {
                     stack.push(self.uni.resolve(&a));
                     stack.push(self.uni.resolve(&b));
+                }
+                // A named generic — `Option[T]`, and any sum or struct with
+                // type arguments. Without this `Some(|| Cfg.value())` carried
+                // a handler's discharge out of its `with` block while every
+                // other carrier was refused, and the closure answered to a
+                // different handler afterwards ([E-HANDLER-MISSING]).
+                Type::Named { id, args } => {
+                    stack.extend(args.iter().map(|a| self.uni.resolve(a)));
+                    // And what the type itself is made of: a struct or a
+                    // variant can hold a function value in a field.
+                    match &self.defs.get(id).kind {
+                        TypeDefKind::Struct { fields } => {
+                            stack.extend(fields.iter().map(|(_, t)| self.uni.resolve(t)));
+                        }
+                        TypeDefKind::Sum { variants } => {
+                            for v in variants {
+                                stack.extend(
+                                    v.fields.iter().map(|(_, t)| self.uni.resolve(t)),
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
                 }
                 _ => {}
             }
@@ -2643,6 +2734,13 @@ allocates could outlive it — move the work out of the region, or yield a numbe
                             // and left `a` holding an `i64` at run time —
                             // printing as `1`, unequal to `()`, and passable
                             // to a `fn f(u: ())`. `()` has one value.
+                            // One branch built the whole `T ! E` and the
+                            // other gave the ok half, which a fallible body
+                            // may do either way ([T-OK-ERR-RETURN]). The
+                            // whole is what the `if` is worth.
+                            if let Some(t) = self.merge_fallible_branches(&then_ty, &else_ty) {
+                                return t;
+                            }
                             let t = self.show(&then_ty);
                             let e = self.show(&else_ty);
                             self.error_help(
@@ -3758,6 +3856,12 @@ Perform the effect after the closing brace, or yield a number and do the work ou
             }
         }
         let recv_ty = self.infer_expr(recv);
+        // A method is dispatched on the receiver's *shape*, so a call to a
+        // `let`-bound closure has to have its body checked first — the call
+        // itself has just fixed that closure's parameter types. Without this
+        // `let g = |y| f(y).len()` was refused with "no method `len` on `_`",
+        // naming the inference variable it was about to resolve.
+        self.force_deferred(&recv_ty);
         let recv_res = self.uni.resolve(&recv_ty);
         if let Some(result) = self.builtin_method(&recv_res, recv, name, args, span) {
             return result;
@@ -4622,11 +4726,25 @@ the state through an `inout` parameter",
 
     fn float_aware_lhs(&mut self, lhs: &Expr, rhs: &Expr) -> Type {
         let lhs_ty = self.infer_expr(lhs);
-        if matches!(lhs, Expr::Int(..)) && self.uni.shallow_resolve(&lhs_ty) == Type::I64 {
-            let probe = self.infer_expr(rhs);
-            if self.uni.shallow_resolve(&probe) == Type::F64 {
-                self.float_literals.insert(lhs.span().start);
-                return Type::F64;
+        // A negated literal is a literal: `-3` is `Neg` applied to `3`, and
+        // matching only the bare shape meant `2.5 * -3` worked while
+        // `-3 * 2.5` was a type error — with help that said to "use a
+        // literal, which does adopt the other side" about one
+        // ([E-NUM-PROMOTE]: "on either side").
+        let literal_span = match lhs {
+            Expr::Int(..) => Some(lhs.span().start),
+            Expr::Unary { op: UnaryOp::Neg, expr, .. } if matches!(**expr, Expr::Int(..)) => {
+                Some(expr.span().start)
+            }
+            _ => None,
+        };
+        if let Some(at) = literal_span {
+            if self.uni.shallow_resolve(&lhs_ty) == Type::I64 {
+                let probe = self.infer_expr(rhs);
+                if self.uni.shallow_resolve(&probe) == Type::F64 {
+                    self.float_literals.insert(at);
+                    return Type::F64;
+                }
             }
         }
         lhs_ty
@@ -5268,6 +5386,7 @@ the state through an `inout` parameter",
                     param_tys: param_tys.clone(),
                     ret: ret.clone(),
                 });
+                self.closure_types.insert(span.start, ret.clone());
                 return Type::Fn {
                     params: param_tys,
                     ret: Box::new(ret),
@@ -5317,6 +5436,7 @@ the state through an `inout` parameter",
         self.deferred_closures.pop();
         self.closure_floors.pop();
         self.scopes.pop();
+        self.closure_types.insert(span.start, ret.clone());
         Type::Fn {
             params: param_tys,
             ret: Box::new(ret),
@@ -5339,6 +5459,64 @@ impl Checker {
             _ => false,
         }
     }
+}
+
+/// Whether a tail expression can only produce a fallible function's *ok* half
+/// — that is, whether every branch of it is an ordinary value rather than an
+/// `Ok(..)`/`Err(..)` that builds the whole `T ! E`.
+fn yields_ok_half(e: &Expr) -> bool {
+    fn block_tail(b: &Block) -> Option<&Expr> {
+        match b.stmts.last() {
+            Some(Stmt::Expr(e)) => Some(e),
+            _ => None,
+        }
+    }
+    fn ok(e: &Expr) -> bool {
+        match e {
+            Expr::Call { callee, .. } => !matches!(&**callee, Expr::Ident(id)
+                if id.name == "Ok" || id.name == "Err"),
+            Expr::If { then_block, else_branch, .. } => {
+                let t = block_tail(then_block).map(ok).unwrap_or(true);
+                let f = match else_branch.as_deref() {
+                    Some(ElseBranch::Else(b)) => block_tail(b).map(ok).unwrap_or(true),
+                    Some(ElseBranch::ElseIf(inner)) => ok(inner),
+                    None => true,
+                };
+                t && f
+            }
+            Expr::Match { arms, .. } => arms.iter().all(|a| ok(&a.body)),
+            _ => true,
+        }
+    }
+    matches!(e, Expr::If { .. } | Expr::Match { .. }) && ok(e)
+}
+
+/// Whether every branch of a tail `if`/`match` builds the whole `T ! E`.
+fn yields_whole(e: &Expr) -> bool {
+    fn block_tail(b: &Block) -> Option<&Expr> {
+        match b.stmts.last() {
+            Some(Stmt::Expr(e)) => Some(e),
+            _ => None,
+        }
+    }
+    fn whole(e: &Expr) -> bool {
+        match e {
+            Expr::Call { callee, .. } => matches!(&**callee, Expr::Ident(id)
+                if id.name == "Ok" || id.name == "Err" || id.name == "fail"),
+            Expr::If { then_block, else_branch, .. } => {
+                let t = block_tail(then_block).map(whole).unwrap_or(false);
+                let f = match else_branch.as_deref() {
+                    Some(ElseBranch::Else(b)) => block_tail(b).map(whole).unwrap_or(false),
+                    Some(ElseBranch::ElseIf(inner)) => whole(inner),
+                    None => false,
+                };
+                t && f
+            }
+            Expr::Match { arms, .. } => arms.iter().all(|a| whole(&a.body)),
+            _ => false,
+        }
+    }
+    matches!(e, Expr::If { .. } | Expr::Match { .. }) && whole(e)
 }
 
 fn place_root(e: &Expr) -> Option<&Ident> {

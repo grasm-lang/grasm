@@ -631,7 +631,24 @@ pub fn example_program(program: &Program, example: &Example) -> Program {
     // already had, and every doc example in an imported library failed with
     // `duplicate type name` — but only when tested through a consumer, which
     // is the case the tutorial promises behaves identically.
-    crate::loader::load_with_alias(
+    // Where each import already resolved to, so this reload names modules the
+    // way the build did. The names a package graph gets come from the
+    // manifests on disk, which this reload has no access to: derived again,
+    // a dependency's own `import cc` became `bb.cc` and every doc example in
+    // a package two hops down failed to compile — 81 of 176 tests in a
+    // four-package project, none of them the program's fault.
+    let resolved: std::collections::HashMap<(String, String), String> = program
+        .files
+        .iter()
+        .flat_map(|f| {
+            f.imports
+                .iter()
+                .map(move |(alias, target)| {
+                    ((f.name.clone(), alias.clone()), target.clone())
+                })
+        })
+        .collect();
+    crate::loader::load_with_resolved_imports(
         "main",
         "<doc example>",
         &|name| {
@@ -643,6 +660,8 @@ pub fn example_program(program: &Program, example: &Example) -> Program {
         &|_| Vec::new(),
         &program.deps,
         Some(&owner_module),
+        &|_, _| None,
+        &resolved,
     )
 }
 

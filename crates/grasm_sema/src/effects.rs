@@ -126,6 +126,49 @@ pub fn effect_vocabulary(program: &crate::loader::Program) -> BTreeSet<String> {
     names
 }
 
+/// What each *package* in a program performs, by the prefix its modules carry
+/// (the entry package answers to `""`).
+///
+/// A package's ceiling is otherwise computed from that package alone, and a
+/// library that installs a handler it did not construct performs nothing on
+/// its own: `pub fn run(h: LogHandler) { with Log handled_by h { … } }` in a
+/// `capabilities = []` package printed through a handler the consumer passed
+/// it, and every command reported the library as performing nothing. In a
+/// whole program the handler exists, so this is what the consumer's build
+/// holds each dependency to ([E-HANDLER-OWN-ROW]).
+pub fn effects_by_package(
+    program: &crate::loader::Program,
+) -> std::collections::BTreeMap<String, BTreeSet<String>> {
+    let views: Vec<ModuleView> = program
+        .files
+        .iter()
+        .map(|f| ModuleView {
+            name: f.name.clone(),
+            module: &f.module,
+            imports: f.imports.clone(),
+        })
+        .collect();
+    let mut ctx = build_ctx(&views);
+    solve_rows(&mut ctx);
+    let mut out: std::collections::BTreeMap<String, BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    for (key, row) in &ctx.rows {
+        let Some((module, _)) = key.rsplit_once("::") else {
+            continue;
+        };
+        // The package a module belongs to is the longest declared prefix.
+        let owner = program
+            .deps
+            .iter()
+            .filter(|d| module == d.as_str() || module.starts_with(&format!("{d}.")))
+            .max_by_key(|d| d.len())
+            .cloned()
+            .unwrap_or_default();
+        out.entry(owner).or_default().extend(row.iter().cloned());
+    }
+    out
+}
+
 pub fn effects_of_program(program: &crate::loader::Program) -> BTreeSet<String> {
     let views: Vec<ModuleView> = program
         .files
@@ -1324,6 +1367,42 @@ fn fn_sources<'a>(e: &'a Expr, ctx: &Ctx, current: &str, out: &mut Vec<FnSource<
                 fn_sources(v, ctx, current, out);
             }
         }
+        // Every shape that hands a function value through: `Some(f) ?? f`
+        // laundered a printing function past [T-PAR-MAP-PURE], which the
+        // clause calls "a compile error, not a race".
+        Expr::Binary { lhs, rhs, .. } => {
+            fn_sources(lhs, ctx, current, out);
+            fn_sources(rhs, ctx, current, out);
+        }
+        Expr::Call { callee, args, .. } => {
+            if matches!(&**callee, Expr::Ident(id)
+                if matches!(id.name.as_str(), "Some" | "Ok" | "Err"))
+            {
+                for a in args {
+                    fn_sources(a, ctx, current, out);
+                }
+            }
+        }
+        Expr::If { then_block, else_branch, .. } => {
+            if let Some(Stmt::Expr(t)) = then_block.stmts.last() {
+                fn_sources(t, ctx, current, out);
+            }
+            match else_branch.as_deref() {
+                Some(ElseBranch::Else(b)) => {
+                    if let Some(Stmt::Expr(t)) = b.stmts.last() {
+                        fn_sources(t, ctx, current, out);
+                    }
+                }
+                Some(ElseBranch::ElseIf(inner)) => fn_sources(inner, ctx, current, out),
+                None => {}
+            }
+        }
+        Expr::Match { arms, .. } => {
+            for a in arms {
+                fn_sources(&a.body, ctx, current, out);
+            }
+        }
+        Expr::Try { expr, .. } => fn_sources(expr, ctx, current, out),
         _ => {}
     }
 }

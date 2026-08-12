@@ -409,7 +409,14 @@ impl<'a> Lexer<'a> {
                         }
                         _ => {
                             return self.tok(
-                                TokenKind::Error(format!("unknown escape `\\{}`", esc as char)),
+                                // Rendered, not pasted: the byte after a lone
+                                // backslash can be anything, and a message
+                                // carrying a raw control character shows as
+                                // nothing at all.
+                                TokenKind::Error(format!(
+                                    "unknown escape `\\{}`",
+                                    (esc as char).escape_debug()
+                                )),
                                 start,
                             )
                         }
@@ -431,6 +438,16 @@ impl<'a> Lexer<'a> {
                             );
                         }
                         match self.bump() {
+                            // An escape covers the byte after it, so a
+                            // nested string's `\}` is not the brace that
+                            // closes this interpolation. Counting it as one
+                            // ended the interpolation early and handed the
+                            // lexer a fragment ending in a lone backslash.
+                            b'\\' => {
+                                if self.pos < self.bytes.len() {
+                                    self.bump();
+                                }
+                            }
                             b'{' => depth += 1,
                             b'}' => depth -= 1,
                             _ => {}

@@ -65,6 +65,12 @@ pub struct Interp<'a, W: Write> {
     const_cache: HashMap<String, Value>,
     /// Integer literals the checker resolved to `f64`, by span start.
     float_literals: std::collections::HashSet<u32>,
+    /// Closure literals whose own type is fallible, by start offset.
+    ///
+    /// `fail(e)` raises the error branch of the enclosing fallible function,
+    /// and a closure is one only when its type says so. Which closures those
+    /// are is a fact only the checker has.
+    fallible_closures: std::collections::HashSet<u32>,
     /// `sum()` calls the checker resolved to `f64`, by span start.
     float_sums: std::collections::HashSet<u32>,
     /// Tier 2's shared heap: the value in each slot (`None` once released) and
@@ -130,6 +136,34 @@ pub struct Interp<'a, W: Write> {
 }
 
 const MAX_DEPTH: u32 = 100_000;
+
+/// How much of this thread's stack the interpreter will spend before it calls
+/// the recursion too deep.
+///
+/// The call counter alone is not enough: how many Rust frames one Grasm call
+/// costs depends on the path it takes, and recursion through a built-in
+/// higher-order method — `[n].map(down)` — costs several times what a plain
+/// call does. At 100 000 Grasm frames that overflowed the real stack first,
+/// and the reference implementation died with `fatal runtime error: stack
+/// overflow` and SIGABRT — the abort [E-RECURSION-DEPTH] says cannot happen.
+const STACK_BUDGET: usize = 448 * 1024 * 1024;
+
+thread_local! {
+    /// The lowest stack address this thread may use, set on the first check.
+    static STACK_FLOOR: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether the stack has run down past this thread's floor.
+fn stack_exhausted() -> bool {
+    let here = 0u8;
+    let sp = std::ptr::addr_of!(here) as usize;
+    let floor = STACK_FLOOR.with(std::cell::Cell::get);
+    if floor == 0 {
+        STACK_FLOOR.with(|c| c.set(sp.saturating_sub(STACK_BUDGET)));
+        return false;
+    }
+    sp < floor
+}
 
 /// One step of an assignment path.
 #[derive(Clone)]
@@ -247,7 +281,10 @@ fn mutate_in_place(
             };
             let items = Rc::make_mut(items);
             let n = items.len() as i64;
-            let i = if i < 0 { n + i } else { i };
+            // Out of range panics, the way indexing does ([L-LIB-REMOVE]).
+            // Treating a negative index as counting from the end removed the
+            // *last* element for `remove(-1)` and said nothing, while the
+            // compiled backend panicked — two engines, two answers.
             if i < 0 || i >= n {
                 return Err(Flow::Panic(format!(
                     "remove {i} out of bounds (len {n})"
@@ -351,6 +388,7 @@ impl<'a, W: Write> Interp<'a, W> {
         let a = grasm_sema::check::check(module);
         me.float_literals = a.float_literals;
         me.float_sums = a.float_sums;
+        me.fallible_closures = a.fallible_closures;
         me
     }
 
@@ -369,6 +407,11 @@ impl<'a, W: Write> Interp<'a, W> {
     /// wrong but not worse than it was.
     pub fn set_float_literals(&mut self, spans: std::collections::HashSet<u32>) {
         self.float_literals = spans;
+    }
+
+    /// The closure literals the checker typed as fallible, from `Analysis`.
+    pub fn set_fallible_closures(&mut self, spans: std::collections::HashSet<u32>) {
+        self.fallible_closures = spans;
     }
 
     /// The `sum()` calls the checker resolved to `f64`.
@@ -469,6 +512,7 @@ impl<'a, W: Write> Interp<'a, W> {
             consts: HashMap::new(),
             const_cache: HashMap::new(),
             float_literals: std::collections::HashSet::new(),
+            fallible_closures: std::collections::HashSet::new(),
             float_sums: std::collections::HashSet::new(),
             slab: Vec::new(),
             slab_free: Vec::new(),
@@ -642,7 +686,7 @@ impl<'a, W: Write> Interp<'a, W> {
         args: Vec<Value>,
         call_site: grasm_syntax::span::Span,
     ) -> EResult {
-        if self.depth >= MAX_DEPTH {
+        if self.depth >= MAX_DEPTH || stack_exhausted() {
             // Word for word what the compiled backend says. The two engines
             // stop at different depths on purpose — this one counts calls, the
             // other measures remaining stack — and both bounds are
@@ -719,8 +763,9 @@ impl<'a, W: Write> Interp<'a, W> {
                 body,
                 env,
                 module,
+                fallible,
             } => {
-                if self.depth >= MAX_DEPTH {
+                if self.depth >= MAX_DEPTH || stack_exhausted() {
                     // The same sentence every engine says. [E-RECURSION-DEPTH]
                     // guarantees the message does not differ and that no
                     // engine names its own bound; a second overflow site with
@@ -749,6 +794,17 @@ impl<'a, W: Write> Interp<'a, W> {
                 self.depth -= 1;
                 match r {
                     Err(Flow::Return(v)) => Ok(v),
+                    // A *fallible* closure is a function boundary like any
+                    // other, so a `fail` inside one is that closure's own
+                    // failure. Letting it through unwound past the `??` and
+                    // the `match` written to handle it, all the way out of
+                    // `main` ([T-FALLIBLE]: "an ordinary value, not an
+                    // exception"). A closure whose type is *not* fallible has
+                    // no error branch of its own, and there the failure
+                    // belongs to the enclosing function —
+                    // `xs.par_map(|x| if c { fail(e) } else { x })` produces
+                    // the failure, not a list holding one ([E-PAR-FAIL]).
+                    Err(Flow::Err(e)) if fallible => Ok(Value::Err(Rc::new(e))),
                     other => other,
                 }
             }
@@ -1619,7 +1675,7 @@ impl<'a, W: Write> Interp<'a, W> {
                     other => Ok(other),
                 }
             }
-            Expr::Closure { params, body, .. } => {
+            Expr::Closure { params, body, span } => {
                 // Capture the current visible environment by value.
                 let mut env: Vec<(String, Value)> = Vec::new();
                 for scope in &self.scopes {
@@ -1637,6 +1693,7 @@ impl<'a, W: Write> Interp<'a, W> {
                     body: Rc::new(cb),
                     env: Rc::new(env),
                     module: Rc::new(self.current_module.clone()),
+                    fallible: self.fallible_closures.contains(&span.start),
                 })
             }
         }

@@ -71,6 +71,68 @@ fn run() -> ExitCode {
     }
 
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // A flag this command does not know is a mistake, not a comment. A typo
+    // in `--native` produced a 10 MB interpreter bundle and reported success,
+    // and `--filter` misspelt ran the whole suite.
+    if let Some(cmd) = args.first().map(String::as_str) {
+        // The flags each command takes, and which of them take a value.
+        let (flags, valued): (&[&str], &[&str]) = match cmd {
+            "run" => (&[], &[]),
+            "test" => (
+                &["--coverage"],
+                &["--seed", "--cases", "--filter"],
+            ),
+            "check" => (&[], &[]),
+            "build" => (&["--native"], &["-o", "--target"]),
+            "doc" => (&[], &["-o"]),
+            "api" => (&[], &["--against"]),
+            "fmt" => (&["--check"], &[]),
+            "deps" => (&["--locked"], &[]),
+            "publish" => (&[], &["--registry"]),
+            _ => (&[], &[]),
+        };
+        // Everything after `--` belongs to the program, not to the toolchain.
+        let mut i = 1;
+        let mut bad: Option<String> = None;
+        while i < args.len() {
+            let a = &args[i];
+            if a == "--" {
+                break;
+            }
+            if a.starts_with('-') && a != "-" {
+                if valued.contains(&a.as_str()) {
+                    // A value-taking flag whose value is missing is a lost
+                    // operand, not a flag on its own: `--against "$BASE"`
+                    // with `BASE` unset dropped the comparison and exited 0.
+                    if args.get(i + 1).is_none_or(|v| v.starts_with('-')) {
+                        eprintln!("error: `{a}` needs a value");
+                        return ExitCode::FAILURE;
+                    }
+                    i += 2;
+                    continue;
+                }
+                if !flags.contains(&a.as_str()) {
+                    bad = Some(a.clone());
+                    break;
+                }
+            }
+            i += 1;
+        }
+        if let Some(flag) = bad {
+            eprintln!("error: `grasm {cmd}` has no option `{flag}`");
+            let known: Vec<String> = flags
+                .iter()
+                .chain(valued.iter())
+                .map(|f| format!("`{f}`"))
+                .collect();
+            if known.is_empty() {
+                eprintln!("  help: `grasm {cmd}` takes no options");
+            } else {
+                eprintln!("  help: it takes {}", known.join(", "));
+            }
+            return ExitCode::FAILURE;
+        }
+    }
     match args.first().map(String::as_str) {
         Some("run") => {
             let Some(path) = args.get(1) else {
@@ -391,6 +453,24 @@ fn run() -> ExitCode {
                             return ExitCode::FAILURE;
                         }
                     };
+                    // A baseline with no entries cannot be a baseline: every
+                    // export reads as "added" and a removal becomes a MINOR
+                    // release. A truncated file, a wrong path that happens to
+                    // exist, or binary junk all landed there and exited 0 —
+                    // the one exit code a release gate reads.
+                    let entries = old
+                        .lines()
+                        .filter(|l| l.split('\t').count() == 3)
+                        .count();
+                    if entries == 0 && !surface.trim().is_empty() {
+                        eprintln!(
+                            "error: `{saved}` has no API entries — a baseline that says nothing would report every export as added"
+                        );
+                        eprintln!(
+                            "  help: regenerate it with `grasm api <the previous version> > {saved}`"
+                        );
+                        return ExitCode::FAILURE;
+                    }
                     report_api_change(&old, &surface)
                 }
             }
@@ -754,7 +834,7 @@ fn load_and_check(path: &str) -> Result<Program, ExitCode> {
     // only by `grasm deps`. Documented as "a compile error, not a runtime
     // surprise, and not something a reviewer has to happen to notice", which
     // is only true if the compiler is the one noticing.
-    if let Err(violations) = check_dependency_ceilings(entry) {
+    if let Err(violations) = check_dependency_ceilings(entry, Some(&program)) {
         for (message, help) in violations {
             eprintln!("error: {message}");
             if let Some(h) = help {
@@ -772,6 +852,7 @@ fn load_and_check(path: &str) -> Result<Program, ExitCode> {
 /// matters more, not less, since it is the one changing under you.
 fn check_dependency_ceilings(
     entry: &std::path::Path,
+    program: Option<&Program>,
 ) -> Result<(), Vec<(String, Option<String>)>> {
     let mut here = entry.parent().map(std::path::Path::to_path_buf);
     let pkg_dir = loop {
@@ -805,6 +886,16 @@ build against a dependency whose reach is unknown",
             ));
             continue;
         };
+        // What the package performs *in this program* counts too: a library
+        // that installs a handler it did not construct performs nothing on
+        // its own, and printed through one the consumer handed it.
+        let mut performed = performed;
+        if let Some(p) = program {
+            let by_pkg = grasm_sema::effects::effects_by_package(p);
+            if let Some(extra) = by_pkg.get(&pkg.name) {
+                performed.extend(extra.iter().cloned());
+            }
+        }
         if let Some(v) = grasm_pkg::check_capabilities(pkg, &performed) {
             let help = ceiling_help(pkg, &v);
             violations.push((v.to_string(), Some(help)));
@@ -1212,7 +1303,7 @@ fn run_bundle(bundle: &Bundle, program_args: &[String]) -> ExitCode {
         &|_| Vec::new(),
         &deps,
         None,
-        &|_| None,
+        &|_, _| None,
         &resolved,
     );
     let mut diags = program.diagnostics.clone();
