@@ -550,6 +550,22 @@ as a counter that stays at zero rather than as anything failing.
 differently between runs; requiring purity is what makes the parallelism
 deterministic. This is a compile error, not a race.
 
+*And it may not write through a `ref` it captured.* An empty row is not the
+whole of purity: mutation is not an effect, so nothing in the row system saw
+`xs.par_map(|x| { acc.n = acc.n + 1; x })` — every element's call writing the
+same slot, which is exactly the interleaving the rule promises cannot happen.
+The write a closure is otherwise allowed to make ([T-REF-CAPTURE]) is the one
+that has to be refused here. A `ref` created *inside* the function is one per
+element and is left alone, as is reading a captured one.
+
+Two shapes still reach past this, which is part of why the rule is
+[experimental](stability.md): a function that writes through a captured `ref`
+but is bound to a name first — `let f = |x| { acc.n = 1; x }`, then
+`xs.par_map(f)` — and a list holding the same `ref` twice, where the write goes
+through a parameter rather than through a capture. Neither is a race today:
+`grasm run` maps sequentially, and the native backend refuses a write through a
+`ref` outright (§11). Both become one when it stops refusing.
+
 **[T-TASK-CAPTURE]** A `spawn` body may only use bindings that already existed
 when the enclosing `parallel` block began, plus the ones it declares itself.
 Tasks run *after* the block finishes, so a binding declared inside it — a loop

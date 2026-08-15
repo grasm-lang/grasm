@@ -333,6 +333,11 @@ struct Checker {
     /// Scope depth at which each enclosing closure body begins. A binding
     /// found below the innermost of these is captured, not local.
     closure_floors: Vec<usize>,
+    /// Scope depth at which the innermost enclosing *parallel* function began,
+    /// if any — the function handed to `par_map` or `par_filter`. A `ref`
+    /// declared below it is shared by every element's call, and writing
+    /// through one is the race [T-PAR-MAP-PURE] exists to prevent.
+    parallel_fn_floor: Option<usize>,
     /// Type parameters of the function being checked, so an annotation inside
     /// its body can name them. Without this `fn f[T](xs: [T]) { var o: [T] }`
     /// reported "unknown type `T`" and suggested declaring it with `type`,
@@ -416,6 +421,7 @@ impl Checker {
             module_imports: HashMap::new(),
             scopes: Vec::new(),
             closure_floors: Vec::new(),
+            parallel_fn_floor: None,
             current_generics: Vec::new(),
             deferred_closures: Vec::new(),
             pending_type_bodies: Vec::new(),
@@ -3824,18 +3830,13 @@ fail outside it",
     /// writes what the region allocated somewhere the region cannot see. What
     /// matters is not where the text is but what the call can reach
     /// ([T-REGION-FOREIGN]).
-    fn check_region_call(&mut self, name: &str, args: &[Expr], span: Span) {
-        let owner = self.current_module.clone();
-        self.check_region_call_in(&owner, name, args, span)
-    }
-
-    /// The same, for a call written `mod.name(...)`.
     ///
-    /// The row was looked up under the *calling* module, so a qualified call
-    /// carried no row here and `region { lib.cfg_user() }` was accepted — the
-    /// handler is written outside the region and may keep what it is given,
-    /// which is exactly how a value allocated inside gets out
-    /// ([T-REGION-FOREIGN]).
+    /// `owner` is the module whose rows the name is looked up in. A call
+    /// written `mod.name(...)` resolves in `mod`, not in the calling module:
+    /// looked up under the caller it carried no row at all, and
+    /// `region { lib.cfg_user() }` was accepted — the handler is written
+    /// outside the region and may keep what it is given, which is exactly how
+    /// a value allocated inside gets out.
     fn check_region_call_in(
         &mut self,
         owner: &str,
@@ -4673,7 +4674,7 @@ Perform the effect after the closing brace, or yield a number and do the work ou
                                 ret: Box::new(out.clone()),
                                 row: None,
                             };
-                            self.check_expr(&args[0], &f);
+                            self.check_parallel_fn(&args[0], &f);
                         }
                         Type::List(Box::new(out))
                     }
@@ -4687,7 +4688,11 @@ Perform the effect after the closing brace, or yield a number and do the work ou
                                 ret: Box::new(Type::Bool),
                                 row: None,
                             };
-                            self.check_expr(&args[0], &f);
+                            if name.name == "par_filter" {
+                                self.check_parallel_fn(&args[0], &f);
+                            } else {
+                                self.check_expr(&args[0], &f);
+                            }
                         }
                         Type::List(Box::new(elem))
                     }
@@ -5248,6 +5253,21 @@ Perform the effect after the closing brace, or yield a number and do the work ou
         }
     }
 
+    /// The function argument of a parallel operation, checked knowing it runs
+    /// on several cores at once.
+    ///
+    /// An effect is refused by [T-PAR-MAP-PURE] in `effects.rs`. A write
+    /// through a captured `ref` is not an effect — mutation is not in the row
+    /// system — so `xs.par_map(|x| { acc.n = acc.n + 1; x })` typechecked and
+    /// every element's call wrote the same slot. Purity is what makes the
+    /// parallelism deterministic, and that has to include the one write the
+    /// closure rules deliberately allow ([T-REF-CAPTURE]).
+    fn check_parallel_fn(&mut self, arg: &Expr, want: &Type) {
+        let outer = self.parallel_fn_floor.replace(self.scopes.len());
+        self.check_expr(arg, want);
+        self.parallel_fn_floor = outer;
+    }
+
     /// Mutating methods need a mutable receiver root.
     /// Rejects a write to a binding the enclosing closure captured.
     ///
@@ -5268,15 +5288,36 @@ Perform the effect after the closing brace, or yield a number and do the work ou
         // all: the obvious `|e| log.push(e)` was rejected, and so was the
         // reference that answers it, which is what made `inout` on an effect
         // operation look like the remaining option ([E-EFFECT-NO-INOUT]).
-        if let Some(b) = self.lookup(&id.name) {
-            if matches!(self.uni.resolve(&b.ty), Type::Ref(_)) {
-                return;
-            }
-        }
         let declared_at = self
             .scopes
             .iter()
             .rposition(|sc| sc.contains_key(&id.name));
+        if let Some(b) = self.lookup(&id.name) {
+            if matches!(self.uni.resolve(&b.ty), Type::Ref(_)) {
+                // …except inside a parallel operation's function, where the
+                // exemption is the race. Every element's call holds the same
+                // slot, so the write interleaves differently between runs —
+                // which is exactly what [T-PAR-MAP-PURE] promises cannot
+                // happen. A `ref` created *inside* the function is one per
+                // element and is left alone.
+                if let (Some(floor), Some(at)) = (self.parallel_fn_floor, declared_at) {
+                    if at < floor {
+                        self.error_help(
+                            id.span,
+                            format!(
+                                "cannot {verb} `{}`{tail} inside a parallel operation — \
+it is a `ref` from outside, so every element writes the same slot",
+                                id.name
+                            ),
+                            "elements are processed on several cores, so this write would \
+interleave differently between runs — use `map` for work that shares state, or return a \
+value per element and combine the results afterwards",
+                        );
+                    }
+                }
+                return;
+            }
+        }
         if let Some(at) = declared_at {
             if at < floor {
                 self.error_help(

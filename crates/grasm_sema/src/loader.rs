@@ -293,7 +293,7 @@ pub fn load_with_resolved_imports(
 /// would type. The collapse is lexical: these paths have already been opened,
 /// so there is no symlink question to resolve, and touching the filesystem to
 /// print a diagnostic would be the wrong trade.
-fn tidy(path: &std::path::Path) -> String {
+pub fn tidy(path: &std::path::Path) -> String {
     use std::path::Component;
     fn is_root(p: &std::ffi::OsString) -> bool {
         p == std::path::MAIN_SEPARATOR_STR
@@ -378,9 +378,14 @@ pub fn load_from_disk_in(
     // the graph resolution found: a package reachable only through a
     // dependency is not one this package may import by name.
     let mut all_prefixes: HashMap<String, std::path::PathBuf> = HashMap::new();
+    // Whether the walk stopped at the depth backstop with packages still to
+    // visit. Past that point a dependency name no longer has a prefix, so the
+    // import degrades into dotted-module-path resolution and the failure has
+    // to say the limit rather than list the paths that degradation invented.
+    let mut graph_truncated = false;
     for name in dependency_names(&entry_src_dir) {
         if let Some(dir) = deps.get(&name) {
-            collect_packages(&name, dir, resolved, &mut all_prefixes, 0);
+            graph_truncated |= collect_packages(&name, dir, resolved, &mut all_prefixes, 0);
         }
     }
     // One name per package. The shortest prefix wins, so a package a consumer
@@ -389,7 +394,7 @@ pub fn load_from_disk_in(
     let mut prefixes: Vec<(&String, &std::path::PathBuf)> = all_prefixes.iter().collect();
     prefixes.sort_by(|a, b| (a.0.len(), a.0).cmp(&(b.0.len(), b.0)));
     for (prefix, dir) in prefixes {
-        let key = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
+        let key = real_dir(dir);
         canon_of_dir.entry(key).or_insert_with(|| prefix.clone());
     }
     let dep_names: HashSet<String> = canon_of_dir.values().cloned().collect();
@@ -437,7 +442,7 @@ pub fn load_from_disk_in(
                     .then(|| resolved_for_canon.get(root))
                     .flatten()
             })?;
-        let key = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
+        let key = real_dir(dir);
         let want = canon.get(&key)?;
         Some(match written.split_once('.') {
             Some((_, rest)) => format!("{want}.{rest}"),
@@ -462,7 +467,18 @@ pub fn load_from_disk_in(
             let rest = name.split_once('.').map(|(_, r)| r).unwrap_or("");
             let mut out = Vec::new();
             candidates_in_package(dir, rest, root, 0, &mut out);
-            return out;
+            // Past the depth backstop a dependency name has no prefix, so the
+            // import was resolved as a dotted module path — one candidate per
+            // package in the chain, each naming a file made of every package
+            // between the entry and this one. Sixty-six lines of that told a
+            // reader nothing; the limit is the whole answer.
+            if graph_truncated {
+                return vec![format!(
+                    "the package graph is more than {MAX_PACKAGE_DEPTH} deep from the entry, \
+so `{root}`'s dependencies past that point were not resolved as package names"
+                )];
+            }
+            return cap_candidates(out);
         }
         let mut out = vec![tidy(&dirs.join(format!("{}.gr", name.replace('.', "/"))))];
         match (declared.iter().any(|d| d == root), dep_dirs.get(root)) {
@@ -577,15 +593,20 @@ pub fn load_from_disk_in(
 const MAX_PACKAGE_DEPTH: usize = 64;
 
 /// Every package reachable from `dir`, named by the prefix its modules carry.
+///
+/// Returns whether the walk stopped at [`MAX_PACKAGE_DEPTH`] with packages
+/// left unvisited.
 fn collect_packages(
     prefix: &str,
     dir: &std::path::Path,
     resolved: &HashMap<String, std::path::PathBuf>,
     out: &mut HashMap<String, std::path::PathBuf>,
     depth: usize,
-) {
+) -> bool {
     let mut expanded = std::collections::HashSet::new();
-    collect_packages_in(prefix, dir, resolved, out, depth, &mut expanded)
+    let mut truncated = false;
+    collect_packages_in(prefix, dir, resolved, out, depth, &mut expanded, &mut truncated);
+    truncated
 }
 
 fn collect_packages_in(
@@ -595,8 +616,13 @@ fn collect_packages_in(
     out: &mut HashMap<String, std::path::PathBuf>,
     depth: usize,
     expanded: &mut std::collections::HashSet<std::path::PathBuf>,
+    truncated: &mut bool,
 ) {
-    if depth > MAX_PACKAGE_DEPTH || out.contains_key(prefix) {
+    if depth > MAX_PACKAGE_DEPTH {
+        *truncated = true;
+        return;
+    }
+    if out.contains_key(prefix) {
         return;
     }
     out.insert(prefix.to_string(), dir.to_path_buf());
@@ -606,7 +632,7 @@ fn collect_packages_in(
     // second time under a longer prefix has the same dependencies, and every
     // prefix that walk would add loses to the shorter one already recorded —
     // so the sub-tree is expanded once.
-    let key = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let key = real_dir(dir);
     if !expanded.insert(key) {
         return;
     }
@@ -630,6 +656,7 @@ fn collect_packages_in(
             out,
             depth + 1,
             expanded,
+            truncated,
         );
     }
 }
@@ -672,6 +699,28 @@ fn resolve_in_package(
     // Nothing found: hand back the path a reader should have written, so the
     // diagnostic names something openable.
     Some(direct)
+}
+
+/// How many "looked in" paths a reader is served by seeing.
+const MAX_LISTED_CANDIDATES: usize = 8;
+
+/// The list a reader can actually read.
+///
+/// A deep graph produced one candidate per package hop, and a twenty-package
+/// chain listed twenty paths of four hundred characters each. The *last* ones
+/// are the ones worth reading — they name the package the failing import was
+/// written in, and the manifest that would have to declare the name — so the
+/// tail is kept and the hops before it are counted rather than printed.
+fn cap_candidates(mut out: Vec<String>) -> Vec<String> {
+    if out.len() > MAX_LISTED_CANDIDATES {
+        let dropped = out.len() - MAX_LISTED_CANDIDATES;
+        out.drain(..dropped);
+        out.insert(
+            0,
+            format!("… {dropped} earlier candidate(s) in packages between the entry and here"),
+        );
+    }
+    out
 }
 
 /// The paths `resolve_in_package` would open, in the order it opens them.
@@ -779,8 +828,7 @@ fn dependency_names(dir: &std::path::Path) -> Vec<String> {
 fn find_manifest(dir: &std::path::Path) -> Option<(std::path::PathBuf, String)> {
     let mut here = Some(dir.to_path_buf());
     while let Some(d) = here {
-        let manifest = d.join("grasm.toml");
-        if let Ok(text) = std::fs::read_to_string(&manifest) {
+        if let Some(text) = manifest_text(&d) {
             return Some((d, text));
         }
         here = d.parent().map(|p| p.to_path_buf());
@@ -788,10 +836,60 @@ fn find_manifest(dir: &std::path::Path) -> Option<(std::path::PathBuf, String)> 
     None
 }
 
+/// A directory's real path, resolved once.
+///
+/// The package walk canonicalizes the same directories at every hop, and
+/// `realpath` was the single largest cost of `grasm check` on a
+/// sixty-four-package chain. A directory that moves out from under a running
+/// command is not a case this has to serve.
+fn real_dir(dir: &std::path::Path) -> std::path::PathBuf {
+    thread_local! {
+        static CACHE: std::cell::RefCell<HashMap<std::path::PathBuf, std::path::PathBuf>> =
+            std::cell::RefCell::new(HashMap::new());
+    }
+    if let Some(hit) = CACHE.with(|c| c.borrow().get(dir).cloned()) {
+        return hit;
+    }
+    let real = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    CACHE.with(|c| c.borrow_mut().insert(dir.to_path_buf(), real.clone()));
+    real
+}
+
+/// A package directory's `grasm.toml`, read once per (modification time,
+/// length).
+///
+/// Import resolution walks the chain from the entry for every module, asking
+/// each package along the way for its dependencies and its entry file, so a
+/// chain of N packages read O(N²) manifests from disk — most of `grasm
+/// check`'s wall clock at sixty-four packages. The stat keeps it honest: a
+/// manifest edited between two loads in the same process is re-read.
+fn manifest_text(dir: &std::path::Path) -> Option<String> {
+    type Stamp = (Option<std::time::SystemTime>, u64);
+    thread_local! {
+        static CACHE: std::cell::RefCell<HashMap<std::path::PathBuf, (Stamp, String)>> =
+            std::cell::RefCell::new(HashMap::new());
+    }
+    let path = dir.join("grasm.toml");
+    let stamp: Stamp = std::fs::metadata(&path)
+        .ok()
+        .map(|m| (m.modified().ok(), m.len()))?;
+    let hit = CACHE.with(|c| {
+        c.borrow()
+            .get(&path)
+            .filter(|(s, _)| *s == stamp)
+            .map(|(_, t)| t.clone())
+    });
+    if hit.is_some() {
+        return hit;
+    }
+    let text = std::fs::read_to_string(&path).ok()?;
+    CACHE.with(|c| c.borrow_mut().insert(path, (stamp, text.clone())));
+    Some(text)
+}
+
 /// A package's entry file: its declared `entry`, or `src/main.gr`.
 fn package_entry(dir: &std::path::Path) -> std::path::PathBuf {
-    let entry = std::fs::read_to_string(dir.join("grasm.toml"))
-        .ok()
+    let entry = manifest_text(dir)
         .and_then(|text| {
             text.lines()
                 .map(|l| l.split('#').next().unwrap_or("").trim().to_string())

@@ -1732,7 +1732,8 @@ fn cmd_deps(dir: &std::path::Path, locked: bool) -> Result<(), String> {
             Ok(e) => e,
             Err(e) => {
                 println!("  {:<16} CANNOT ANALYZE", pkg.name);
-                unanalyzable.push(format!("`{}`: {e}", pkg.name));
+                // The failure already names the package it is about.
+                unanalyzable.push(e);
                 continue;
             }
         };

@@ -166,6 +166,11 @@ pub fn effects_by_package(
     solve_rows(&mut ctx);
     let mut out: std::collections::BTreeMap<String, BTreeSet<String>> =
         std::collections::BTreeMap::new();
+    // Which package owns each module, worked out once per module rather than
+    // once per row. Scanning every dependency for every row — and building a
+    // `"{d}."` string to test each one — was quadratic in the size of the
+    // graph: five hundred packages spent most of `grasm check` here.
+    let mut owner_of: HashMap<&str, String> = HashMap::new();
     for (key, row) in &ctx.rows {
         let Some((module, name)) = key.rsplit_once("::") else {
             continue;
@@ -180,16 +185,31 @@ pub fn effects_by_package(
             continue;
         }
         // The package a module belongs to is the longest declared prefix.
-        let owner = program
-            .deps
-            .iter()
-            .filter(|d| module == d.as_str() || module.starts_with(&format!("{d}.")))
-            .max_by_key(|d| d.len())
-            .cloned()
-            .unwrap_or_default();
-        out.entry(owner).or_default().extend(row.iter().cloned());
+        let owner = owner_of.entry(module).or_insert_with(|| {
+            program
+                .deps
+                .iter()
+                .filter(|d| is_prefix_module(module, d))
+                .max_by_key(|d| d.len())
+                .cloned()
+                .unwrap_or_default()
+        });
+        out.entry(owner.clone())
+            .or_default()
+            .extend(row.iter().cloned());
     }
     out
+}
+
+/// Whether `module` is `pkg` itself or a module inside it.
+///
+/// Written without building the `"{pkg}."` string it compares against: that
+/// allocation ran once per (row, dependency) pair.
+fn is_prefix_module(module: &str, pkg: &str) -> bool {
+    module == pkg
+        || (module.len() > pkg.len()
+            && module.as_bytes()[pkg.len()] == b'.'
+            && module.starts_with(pkg))
 }
 
 pub fn effects_of_program(program: &crate::loader::Program) -> BTreeSet<String> {

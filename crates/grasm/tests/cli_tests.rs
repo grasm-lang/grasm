@@ -1070,3 +1070,131 @@ fn a_deep_package_chain_builds_natively() {
     let got = Command::new(&bin).output().expect("runs");
     assert_eq!(String::from_utf8_lossy(&got.stdout).trim(), "45");
 }
+
+/// Builds a chain of `n` packages, `p0` depending on `p1` and so on, under a
+/// fresh working directory. Returns the app package that imports `p0`.
+fn chain(w: &Work, n: usize) -> PathBuf {
+    for i in 0..n {
+        let mut manifest =
+            format!("[package]\nname = \"p{i}\"\nversion = \"0.1.0\"\ncapabilities = []\n");
+        let src = if i + 1 < n {
+            manifest.push_str(&format!(
+                "\n[dependencies.p{}]\npath = \"../p{}\"\n",
+                i + 1,
+                i + 1
+            ));
+            format!(
+                "import p{}\n\npub fn v() -> i64 {{\n    1 + p{}.v()\n}}\n",
+                i + 1,
+                i + 1
+            )
+        } else {
+            "pub fn v() -> i64 {\n    0\n}\n".to_string()
+        };
+        w.package(&format!("p{i}"), &manifest, &src);
+    }
+    w.package(
+        "app",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\ncapabilities = [\"io\"]\n\n[dependencies.p0]\npath = \"../p0\"\n",
+        "import p0\n\nfn main() {\n    print(\"{p0.v()}\")\n}\n",
+    )
+}
+
+/// Past the depth backstop the loader says the limit, instead of listing the
+/// paths its degraded resolution invented.
+///
+/// A dependency name past the limit has no package prefix, so the import fell
+/// through to dotted-module-path resolution: sixty-six candidates, each a
+/// four-hundred-character path made of every package between the entry and
+/// this one, naming a file nobody wrote.
+#[test]
+fn a_graph_past_the_depth_limit_says_the_limit() {
+    let w = Work::new("toodeep");
+    let app = chain(&w, 70);
+    let (code, out) = run(&["check", &app_entry(&app)]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("more than 64 deep from the entry"), "{out}");
+    assert!(!out.contains("/p10/p11/p12"), "concatenated path in:\n{out}");
+    assert!(out.lines().count() < 12, "{out}");
+}
+
+/// A chain just under the limit resolves and runs.
+#[test]
+fn a_chain_under_the_depth_limit_runs() {
+    let w = Work::new("deepok");
+    let app = chain(&w, 60);
+    let (code, out) = run(&["run", &app_entry(&app)]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out.trim(), "59");
+}
+
+/// A "looked in" list one line per package hop is capped, keeping the tail —
+/// the package that wrote the import, and the manifest missing the name.
+#[test]
+fn a_long_looked_in_list_keeps_its_tail() {
+    let w = Work::new("longlist");
+    let app = chain(&w, 20);
+    std::fs::write(
+        w.0.join("p19/src/main.gr"),
+        "import nope.here\n\npub fn v() -> i64 {\n    0\n}\n",
+    )
+    .unwrap();
+    let (code, out) = run(&["check", &app_entry(&app)]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("earlier candidate(s)"), "{out}");
+    assert!(
+        out.contains("no dependency named `nope` in `p19`'s grasm.toml"),
+        "the last line has to be the one worth reading:\n{out}"
+    );
+    assert!(out.contains("p19/src/nope/here.gr"), "{out}");
+}
+
+/// A syntax error inside a dependency is reported against the dependency's own
+/// file, at a path a reader can open.
+///
+/// `deps` named the *consumer's* entry for it — `./src/main.gr`, a file with
+/// nothing wrong in it — and spelled the dependency's path
+/// `./../dep/src/main.gr`.
+#[test]
+fn deps_blames_the_file_the_error_is_in() {
+    let w = Work::new("blame");
+    w.package(
+        "dep",
+        "[package]\nname = \"dep\"\nversion = \"0.1.0\"\ncapabilities = []\n",
+        "pub fn f( -> i64 {\n    1\n}\n",
+    );
+    let app = w.package(
+        "app",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\ncapabilities = [\"io\"]\n\n[dependencies.dep]\npath = \"../dep\"\n",
+        "import dep\n\nfn main() {\n    print(\"{dep.f()}\")\n}\n",
+    );
+    let out = Command::new(GRASM)
+        .arg("deps")
+        .arg(".")
+        .current_dir(&app)
+        .output()
+        .expect("runs");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(!text.contains("./../"), "un-normalized path in:\n{text}");
+    assert!(!text.contains("`app`: package `app`"), "{text}");
+    // Both rows name the dependency's file; the consumer's row says why it is
+    // being told about a file it does not own.
+    assert_eq!(
+        text.matches("../dep/src/main.gr").count(),
+        2,
+        "both rows name the failing file:\n{text}"
+    );
+    assert!(
+        text.contains("cannot analyze package `app`: `../dep/src/main.gr` (reached through a dependency)"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("cannot analyze package `app`: `src/main.gr`"),
+        "the consumer's own entry is not the failing file:\n{text}"
+    );
+}

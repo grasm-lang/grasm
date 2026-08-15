@@ -1729,3 +1729,62 @@ fn a_callbacks_parameter_row_is_checked_the_other_way() {
         "fn dbl(n: i64) -> i64 {\n    n * 2\n}\nfn call(f: fn(i64) -> i64) -> i64 {\n    f(1)\n}\nfn main() {\n    let fs = [dbl]\n    print(\"{fs.par_map(call)}\")\n}\n",
     );
 }
+
+/// A parallel operation's function may not write through a `ref` it captured
+/// ([T-PAR-MAP-PURE]).
+///
+/// An empty effect row is only half of purity. Mutation is not an effect, so
+/// nothing in the row system saw every element's call writing the same slot —
+/// which is the interleaving the clause promises is a compile error.
+#[test]
+fn a_parallel_function_may_not_write_through_a_captured_ref() {
+    let base = "type Acc = { n: i64, seen: [i64] }\n";
+    check_err(
+        &format!(
+            "{base}fn main() {{\n    let acc = ref(Acc{{ n: 0, seen: [] }})\n    \
+let ys = [1, 2].par_map(|x| {{\n        acc.n = acc.n + x\n        x\n    }})\n    \
+print(\"{{ys}}\")\n}}\n"
+        ),
+        "every element writes the same slot",
+    );
+    // A mutating method through the same reference, and `par_filter` too.
+    check_err(
+        &format!(
+            "{base}fn main() {{\n    let acc = ref(Acc{{ n: 0, seen: [] }})\n    \
+let ys = [1, 2].par_map(|x| {{\n        acc.seen.push(x)\n        x\n    }})\n    \
+print(\"{{ys}}\")\n}}\n"
+        ),
+        "every element writes the same slot",
+    );
+    check_err(
+        &format!(
+            "{base}fn main() {{\n    let acc = ref(Acc{{ n: 0, seen: [] }})\n    \
+let ys = [1, 2].par_filter(|x| {{\n        acc.n = acc.n + x\n        x > 0\n    }})\n    \
+print(\"{{ys}}\")\n}}\n"
+        ),
+        "every element writes the same slot",
+    );
+    // A `ref` created inside the function is one per element.
+    check_ok(
+        &format!(
+            "{base}fn main() {{\n    let ys = [1, 2].par_map(|x| {{\n        \
+let mine = ref(Acc{{ n: x, seen: [] }})\n        mine.n = mine.n * 2\n        \
+mine.n\n    }})\n    print(\"{{ys}}\")\n}}\n"
+        ),
+    );
+    // Reading a captured one shares nothing.
+    check_ok(
+        &format!(
+            "{base}fn main() {{\n    let acc = ref(Acc{{ n: 7, seen: [] }})\n    \
+let ys = [1, 2].par_map(|x| x + acc.n)\n    print(\"{{ys}}\")\n}}\n"
+        ),
+    );
+    // `map` is sequential, so the write is exactly what [T-REF-CAPTURE] allows.
+    check_ok(
+        &format!(
+            "{base}fn main() {{\n    let acc = ref(Acc{{ n: 0, seen: [] }})\n    \
+let ys = [1, 2].map(|x| {{\n        acc.n = acc.n + x\n        x\n    }})\n    \
+print(\"{{ys}} {{acc.n}}\")\n}}\n"
+        ),
+    );
+}

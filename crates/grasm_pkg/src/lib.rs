@@ -248,7 +248,7 @@ package's own directory, and a file outside it is in none of them"
 
     pub fn load(dir: &Path) -> Result<Manifest, String> {
         let path = dir.join(MANIFEST_NAME);
-        let text = std::fs::read_to_string(&path)
+        let text = read_manifest_text(&path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         Manifest::parse(&text, dir)
     }
@@ -655,7 +655,56 @@ struct Resolved {
 /// Where a path leads with `..` and symlinks removed, so that `../text` from
 /// two different packages is recognised as the same package.
 fn canonical(p: &Path) -> PathBuf {
-    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+    thread_local! {
+        static CACHE: std::cell::RefCell<std::collections::HashMap<PathBuf, PathBuf>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    // Resolution canonicalizes the same directories at every hop, and
+    // `realpath` was the single largest cost of `grasm check` on a
+    // sixty-four-package chain. A directory that moves out from under a
+    // running command is not a case this has to serve.
+    if let Some(hit) = CACHE.with(|c| c.borrow().get(p).cloned()) {
+        return hit;
+    }
+    let real = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    CACHE.with(|c| c.borrow_mut().insert(p.to_path_buf(), real.clone()));
+    real
+}
+
+/// A manifest's text, read once per (path, modification time, length).
+///
+/// Resolution asks for the same manifests over and over — every dependency is
+/// loaded once to check its name, once to check its version, and once more
+/// when the walk reaches it — so a chain of N packages read O(N²) files. The
+/// stat keeps the cache honest: a manifest edited between two loads in the
+/// same process is re-read.
+fn read_manifest_text(path: &Path) -> std::io::Result<String> {
+    type Stamp = (Option<std::time::SystemTime>, u64);
+    thread_local! {
+        static CACHE: std::cell::RefCell<std::collections::HashMap<PathBuf, (Stamp, String)>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    let Some(stamp) = std::fs::metadata(path)
+        .ok()
+        .map(|m| (m.modified().ok(), m.len()))
+    else {
+        return std::fs::read_to_string(path);
+    };
+    let hit = CACHE.with(|c| {
+        c.borrow()
+            .get(path)
+            .filter(|(s, _)| *s == stamp)
+            .map(|(_, t)| t.clone())
+    });
+    if let Some(text) = hit {
+        return Ok(text);
+    }
+    let text = std::fs::read_to_string(path)?;
+    CACHE.with(|c| {
+        c.borrow_mut()
+            .insert(path.to_path_buf(), (stamp, text.clone()))
+    });
+    Ok(text)
 }
 
 /// Walks the dependency graph depth-first, detecting cycles and missing
@@ -978,22 +1027,17 @@ pub fn effects_of_package(manifest: &Manifest) -> Result<BTreeSet<String>, Strin
         ));
     }
     let resolved = own_resolved(manifest);
-    let program = grasm_sema::loader::load_from_disk_with(&entry, &resolved)?;
+    // Every failure this returns names the package, so a caller listing them
+    // does not have to add the name back — and adding it anyway printed
+    // ``dep`: package `dep`: …`.
+    let program = grasm_sema::loader::load_from_disk_with(&entry, &resolved)
+        .map_err(|e| format!("package `{}`: {e}", manifest.name))?;
     // The entry file gets the same treatment as a sibling: a package whose
     // source cannot be read cannot be held to its ceiling, and affirming it
     // anyway reported `performs []` and wrote a lockfile over code that had
     // never been analysed.
-    if !program.diagnostics.is_empty() {
-        return Err(format!(
-            "package `{}`: cannot read `{}` — {}",
-            manifest.name,
-            entry.display(),
-            program
-                .diagnostics
-                .first()
-                .map(|d| d.message.clone())
-                .unwrap_or_default()
-        ));
+    if let Some(failure) = first_failure(&program, &entry) {
+        return Err(format!("package `{}`: {failure}", manifest.name));
     }
     let mut out = grasm_sema::effects::effects_of_program(&program);
     // Every module in the package, not only the ones its entry imports.
@@ -1013,20 +1057,39 @@ pub fn effects_of_package(manifest: &Manifest) -> Result<BTreeSet<String>, Strin
         // affirming the package anyway is the wrong answer in the one
         // direction that matters: `grasm deps` reported `performs []` and
         // wrote a lockfile over sources it had never analysed.
-        if !p.diagnostics.is_empty() {
-            return Err(format!(
-                "package `{}`: cannot read `{}` — {}",
-                manifest.name,
-                extra.display(),
-                p.diagnostics
-                    .first()
-                    .map(|d| d.message.clone())
-                    .unwrap_or_default()
-            ));
+        if let Some(failure) = first_failure(&p, &extra) {
+            return Err(format!("package `{}`: {failure}", manifest.name));
         }
         out.extend(grasm_sema::effects::effects_of_program(&p));
     }
     Ok(out)
+}
+
+/// Why a package could not be analysed, naming the file the failure is in.
+///
+/// A loaded program's `diagnostics` is one flat list across every file the
+/// load pulled in — including the source of every dependency — so the first
+/// entry is often not in the entry file at all. Naming the entry anyway sent a
+/// reader to a file with nothing wrong in it: a syntax error in `dep` was
+/// reported as `cannot read ./src/main.gr` against the consumer, at a path
+/// spelled `./../dep/src/main.gr` when it named the right file at all.
+fn first_failure(program: &grasm_sema::loader::Program, entry: &Path) -> Option<String> {
+    let d = program.diagnostics.first()?;
+    let (path, borrowed) = match program.files.get(program.file_of(d.span)) {
+        Some(f) => (
+            grasm_sema::loader::tidy(Path::new(&f.path)),
+            f.path != grasm_sema::loader::tidy(entry) && !f.name.is_empty() && f.base != 0,
+        ),
+        None => (grasm_sema::loader::tidy(entry), false),
+    };
+    // A failure inside a dependency is not the consumer's to fix, and saying
+    // so is the difference between one useful line and two identical ones.
+    let whose = if borrowed {
+        " (reached through a dependency)"
+    } else {
+        ""
+    };
+    Some(format!("`{path}`{whose} — {}", d.message))
 }
 
 /// Every `.gr` file in a package's source tree apart from its entry.

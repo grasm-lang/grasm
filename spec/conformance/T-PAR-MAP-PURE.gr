@@ -1,11 +1,34 @@
 //! tag: T-PAR-MAP-PURE
 //! expect: error
 //! effect-free
+//! every element writes the same slot
+// A parallel operation's function must be pure — in both senses.
+//
+// An empty effect row is the half the row system can see. The other half is
+// mutation, which is not an effect at all, so a write through a captured `ref`
+// went past this rule entirely: `[T-REF-CAPTURE]` allows exactly that write in
+// an ordinary closure, and here every element's call holds the same slot. That
+// is the interleaving the clause promises is a compile error rather than a
+// race.
+type Acc = { n: i64 }
+
 fn main() {
     let xs = [1, 2, 3]
     let ys = xs.par_map(|x| {
         print("{x}")
         x
     })
-    print("{ys}")
+    let acc = ref(Acc{ n: 0 })
+    let zs = xs.par_map(|x| {
+        acc.n = acc.n + x
+        x
+    })
+    // A `ref` made inside the function is one per element, and reading a
+    // captured one shares nothing — neither is refused.
+    let ws = xs.par_map(|x| {
+        let mine = ref(Acc{ n: x })
+        mine.n = mine.n * 2
+        mine.n + acc.n
+    })
+    print("{ys} {zs} {ws}")
 }
