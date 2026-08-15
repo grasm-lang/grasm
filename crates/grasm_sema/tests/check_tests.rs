@@ -1788,3 +1788,137 @@ print(\"{{ys}} {{acc.n}}\")\n}}\n"
         ),
     );
 }
+
+/// The builtin capability names cannot be declared as effects
+/// ([T-EFFECT-BUILTIN]).
+///
+/// `io` and `async` are not keywords, so `effect io { … }` parsed — and the
+/// `with io handled_by …` it made available discharged the *builtin* `io` for
+/// everything in the block. A function declaring `/ {}` printed, `par_map`
+/// ran a printing function on several cores, and a `capabilities = []`
+/// package read and wrote files while `grasm deps` certified it as performing
+/// nothing.
+#[test]
+fn a_builtin_capability_cannot_be_declared_as_an_effect() {
+    for name in ["io", "async"] {
+        check_err(
+            &format!("effect {name} {{\n    fn nothing() -> i64\n}}\n\nfn main() {{\n}}\n"),
+            "is reserved by the language",
+        );
+    }
+    // The hole it opened, in each of the three places it defeated.
+    let decl = "effect io {\n    fn nothing() -> i64\n}\n";
+    check_err(
+        &format!(
+            "{decl}fn quiet(n: i64) -> i64 / {{}} {{\n    \
+with io handled_by ioHandler{{ nothing: || 1 }} {{\n        print(\"x\")\n    }}\n    n\n}}\n\n\
+fn main() {{\n    print(\"{{quiet(1)}}\")\n}}\n"
+        ),
+        "is reserved by the language",
+    );
+    check_err(
+        &format!(
+            "{decl}fn shout(n: i64) -> i64 / {{}} {{\n    \
+with io handled_by ioHandler{{ nothing: || 1 }} {{\n        print(\"x\")\n    }}\n    n\n}}\n\n\
+fn main() {{\n    print(\"{{[1, 2].par_map(shout)}}\")\n}}\n"
+        ),
+        "is reserved by the language",
+    );
+    // And there is no `with io handled_by` even without the declaration.
+    check_err(
+        "fn main() {\n    with io handled_by ioHandler{ nothing: || 1 } {\n        print(\"x\")\n    }\n}\n",
+        "unknown effect `io`",
+    );
+    // An effect merely *named* like one of them is fine.
+    check_ok(
+        "effect Io {\n    fn nothing() -> i64\n}\n\nfn main() {\n    \
+with Io handled_by IoHandler{ nothing: || 1 } {\n        print(\"{Io.nothing()}\")\n    }\n}\n",
+    );
+}
+
+/// A container of failures in `main`'s tail is discarded like anywhere else
+/// ([T-FALLIBLE-UNHANDLED]).
+///
+/// `main` has an open error slot, so a directly fallible tail there is
+/// propagated ([E-MAIN-ERR]) — and the whole check was skipped for `main` on
+/// that account. The slot carries one failure, not a list of them, so
+/// `fn main() { xs.map(risky) }` threw away every one: silent, exit 0. Adding
+/// any line after it caught the same expression.
+#[test]
+fn a_container_of_failures_in_mains_tail_is_not_discarded() {
+    let base = "type E = | Bad\nfn risky(x: i64) -> i64 ! E {\n    \
+if x == 0 {\n        fail(Bad)\n    } else {\n        Ok(x)\n    }\n}\n";
+    for tail in ["[1, 2].map(risky)", "[risky(1)]", "Some(risky(1))"] {
+        check_err(
+            &format!("{base}fn main() {{\n    {tail}\n}}\n"),
+            "holds failures",
+        );
+    }
+    // A directly fallible tail still propagates: that is what the slot is for.
+    check_ok(&format!("{base}fn main() {{\n    risky(0)\n}}\n"));
+    check_ok(&format!("{base}fn main() {{\n    let r = [1, 2].map(risky)\n    \
+match r[0] {{\n        Ok(v) -> print(\"{{v}}\")\n        Err(e) -> print(\"bad\")\n    }}\n}}\n"));
+}
+
+/// A field read waits for a receiver whose type is not settled yet.
+///
+/// `let f = |x| S{ c: x }` defers its body until its call sites are seen, so
+/// `f(2).c` one line later asked an inference variable for a field and was
+/// told ``_` has no field `c`` — naming a type no program can write, about a
+/// value every other use of the same call inferred correctly.
+#[test]
+fn a_field_read_waits_for_a_deferred_closures_result() {
+    let base = "type S = { c: i64 }\n";
+    check_ok(&format!(
+        "{base}fn main() {{\n    let f = |x| S{{ c: x }}\n    print(\"{{f(2).c}}\")\n}}\n"
+    ));
+    // Through a binding, and for a tuple component.
+    check_ok(&format!(
+        "{base}fn main() {{\n    let f = |x| S{{ c: x }}\n    let s = f(2)\n    \
+print(\"{{s.c}}\")\n}}\n"
+    ));
+    check_ok(
+        "fn main() {\n    let f = |x| (x, x + 1)\n    print(\"{f(2).0} {f(2).1}\")\n}\n",
+    );
+    // A field the type does not have is still refused, and named by its type.
+    check_err(
+        &format!("{base}fn main() {{\n    let f = |x| S{{ c: x }}\n    print(\"{{f(2).nope}}\")\n}}\n"),
+        "`S` has no field `nope`",
+    );
+    check_err(
+        "fn main() {\n    let f = |x| x\n    print(\"{f(2).nope}\")\n}\n",
+        "`i64` has no field `nope`",
+    );
+}
+
+/// A builtin type name cannot be redeclared.
+///
+/// `resolve_type` answers for `i64`, `str`, `Map` and the rest before it ever
+/// consults a declaration, and those names are not in the definition table —
+/// so nothing collided with them. `type Map = { x: i64 }` and `type i64 = str`
+/// were accepted and then silently ignored, which reads to a reviewer as a
+/// definition that took effect.
+#[test]
+fn a_builtin_type_name_cannot_be_redeclared() {
+    for decl in [
+        "type Map = { x: i64 }",
+        "type i64 = str",
+        "type str = i64",
+        "type bool = i64",
+        "type f64 = i64",
+        "type float = i64",
+        "type int = str",
+    ] {
+        check_err(
+            &format!("{decl}\n\nfn main() {{\n    print(\"x\")\n}}\n"),
+            "is built in",
+        );
+    }
+    // The prelude's own types keep their own message, and an ordinary name
+    // is unaffected.
+    check_err(
+        "type Option = { x: i64 }\n\nfn main() {\n}\n",
+        "reserved by the prelude",
+    );
+    check_ok("type Good = { x: i64 }\n\nfn main() {\n    print(\"{Good{ x: 1 }.x}\")\n}\n");
+}

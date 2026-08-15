@@ -2,6 +2,8 @@
 //! expect: output
 //! both survived
 //! err boom
+//! handler ok
+//! handler err
 // A fallible call that produces nothing.
 //
 // `() ! E` is what a setup call returns, and `f() ?? ()` is how you say its
@@ -10,7 +12,17 @@
 // rejected — surfacing as "does not yet support (codegen bug in `main`)", a
 // refusal naming nothing, which then masked the real refusal elsewhere in the
 // same program.
+//
+// The same merge inside a *handler* had no arm at all: an operation declared
+// `-> () ! E` whose body gives the bare `()` half produced no value, and the
+// lifted body returned a null pointer typed as a fallible. The build
+// succeeded and the program died with SIGSEGV and nothing on stderr — the one
+// thing §11 promises never happens.
 type E = { m: str }
+
+effect Setup {
+    fn once(b: bool) -> () ! E
+}
 
 fn nothing(b: bool) -> () ! E {
     if b {
@@ -25,5 +37,15 @@ fn main() {
     match nothing(true) {
         Ok(_) -> print("ok")
         Err(e) -> print("err {e.m}")
+    }
+    with Setup handled_by SetupHandler{ once: |b| if b { fail(E{ m: "h" }) } else { () } } {
+        match Setup.once(false) {
+            Ok(_) -> print("handler ok")
+            Err(e) -> print("handler err {e.m}")
+        }
+        match Setup.once(true) {
+            Ok(_) -> print("handler ok2")
+            Err(e) -> print("handler err")
+        }
     }
 }

@@ -605,7 +605,11 @@ fn the_supply_chain_demo_catches_a_tampered_dependency() {
     // fail to build. If this ever passes, the headline security claim is
     // broken and the benchmark is lying.
     let ws = Workspace::new("supply_chain");
-    let tampered = "pub fn total(xs: [i64]) -> i64 {\n    let s = read_file(\"/etc/passwd\") ?? \"\"\n    write_file(\"/tmp/x\", s)\n    xs.sum()\n}\n\nfn main() {\n}\n";
+    // Well-typed on purpose: `effects_of_package` typechecks what it
+    // certifies, and a discarded `() ! IoError` is refused
+    // ([T-FALLIBLE-UNHANDLED]) — so a fixture that leaked one was testing the
+    // ceiling against a program nobody could have built.
+    let tampered = "pub fn total(xs: [i64]) -> i64 {\n    let s = read_file(\"/etc/passwd\") ?? \"\"\n    write_file(\"/tmp/x\", s) ?? ()\n    xs.sum()\n}\n\nfn main() {\n}\n";
     let dir = ws.package("mathlib", &manifest("mathlib", Some(""), &[]), tampered);
     let m = Manifest::load(&dir).unwrap();
     let effects = grasm_pkg::effects_of_package(&m).unwrap();
@@ -1376,4 +1380,36 @@ fn the_checksum_covers_the_manifest() {
         closed, open,
         "a changed capability ceiling must change the checksum"
     );
+}
+
+/// A manifest that does not parse is reported against the file it is in.
+///
+/// `line 1: expected `key = value`` said which line of *something*, and a
+/// graph has one manifest per package.
+#[test]
+fn a_manifest_error_names_the_file_it_is_in() {
+    let ws = Workspace::new("manifest_path");
+    let dir = ws.package("p", &manifest("p", Some(""), &[]), PURE_SRC);
+    std::fs::write(dir.join("grasm.toml"), "this is not toml [[[\n").unwrap();
+    let err = Manifest::load(&dir).expect_err("a malformed manifest cannot load");
+    assert!(err.contains("grasm.toml"), "{err}");
+    assert!(err.contains("line 1"), "{err}");
+}
+
+/// A missing dependency names a path a reader can look at.
+///
+/// A dependency is reached from the depending package's directory, so the
+/// path came out as `md/../gone` — correct, and not something anyone could
+/// `cd` to.
+#[test]
+fn a_missing_dependency_names_a_tidy_path() {
+    let ws = Workspace::new("missing_dep_path");
+    let dir = ws.package(
+        "md",
+        &manifest("md", Some(""), &[("gone", "../gone")]),
+        PURE_SRC,
+    );
+    let err = grasm_pkg::resolve(&dir).expect_err("the dependency does not exist");
+    assert!(err.contains("no grasm.toml at"), "{err}");
+    assert!(!err.contains("/../"), "un-normalized path in:\n{err}");
 }

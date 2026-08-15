@@ -1198,3 +1198,174 @@ fn deps_blames_the_file_the_error_is_in() {
         "the consumer's own entry is not the failing file:\n{text}"
     );
 }
+
+/// A bundled executable's stack trace names the entry file, the same way it
+/// already named every imported module.
+///
+/// Every frame but the entry's was labelled from its module name, so a trace
+/// read `helper::crash at helper.gr:2:5` and then
+/// `main::main at <bundled>:5:5` — the same trace naming the same kind of
+/// thing two ways, one of which is not a file. Only the basename travels: the
+/// directory the build happened in names nothing on the machine running the
+/// binary.
+#[test]
+fn a_bundles_trace_names_the_entry_file() {
+    let w = Work::new("bundletrace");
+    let dir = w.0.join("src");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("helper.gr"), "pub fn crash(n: i64) -> i64 {\n    n / 0\n}\n")
+        .unwrap();
+    let entry = dir.join("app.gr");
+    std::fs::write(
+        &entry,
+        "import helper\n\nfn main() {\n    print(\"{helper.crash(2)}\")\n}\n",
+    )
+    .unwrap();
+    let bin = w.0.join("bundled");
+    let (code, out) = run(&[
+        "build",
+        entry.to_str().unwrap(),
+        "-o",
+        bin.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{out}");
+
+    let got = Command::new(&bin).output().expect("runs");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&got.stdout),
+        String::from_utf8_lossy(&got.stderr)
+    );
+    assert_eq!(got.status.code(), Some(101), "{text}");
+    assert!(!text.contains("<bundled>"), "{text}");
+    assert!(text.contains("helper::crash at helper.gr:2:5"), "{text}");
+    assert!(text.contains("main::main at app.gr:4:5"), "{text}");
+    // The build directory is not carried into the binary.
+    assert!(
+        !text.contains(w.0.to_str().unwrap()),
+        "the build path must not travel with the bundle:\n{text}"
+    );
+}
+
+/// `grasm deps` refuses to certify a package that does not typecheck.
+///
+/// Only *parse* failures produced `CANNOT ANALYZE`. A package that parsed but
+/// did not typecheck was reported `performs []` and written into a lockfile —
+/// and "does not typecheck" is exactly where an effect the ceiling would have
+/// caught can hide, since a refused declaration performs nothing the inference
+/// can see.
+#[test]
+fn deps_refuses_a_package_that_does_not_typecheck() {
+    let w = Work::new("depstypes");
+    w.package(
+        "lib",
+        "[package]\nname = \"lib\"\nversion = \"0.1.0\"\ncapabilities = []\n",
+        "pub fn go(n: i64) -> i64 {\n    \"not an int\"\n}\n",
+    );
+    let app = w.package(
+        "con",
+        "[package]\nname = \"con\"\nversion = \"0.1.0\"\n\n[dependencies.lib]\npath = \"../lib\"\n",
+        "import lib\n\nfn main() {\n    print(\"{lib.go(3)}\")\n}\n",
+    );
+    let out = Command::new(GRASM)
+        .arg("deps")
+        .arg(".")
+        .current_dir(&app)
+        .output()
+        .expect("runs");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("CANNOT ANALYZE"), "{text}");
+    assert!(text.contains("must return `i64`"), "{text}");
+    assert!(!text.contains("performs []"), "{text}");
+    assert!(
+        !app.join("grasm.lock").exists(),
+        "a package that cannot be analysed must not be written into a lockfile"
+    );
+}
+
+/// A dependency cannot declare away the capability ceiling.
+///
+/// `effect io { … }` parsed, and the `with io handled_by …` it made available
+/// discharged the *builtin* `io` — so a `capabilities = []` dependency printed
+/// and wrote files while `grasm deps` certified it as performing nothing.
+#[test]
+fn a_dependency_cannot_declare_away_its_ceiling() {
+    let w = Work::new("ioceiling");
+    w.package(
+        "lib",
+        "[package]\nname = \"lib\"\nversion = \"0.1.0\"\ncapabilities = []\n",
+        "effect io {\n    fn nothing() -> i64\n}\n\npub fn go(n: i64) -> i64 {\n    \
+with io handled_by ioHandler{ nothing: || 1 } {\n        print(\"lib wrote to your stdout\")\n    }\n    \
+n * 2\n}\n",
+    );
+    let app = w.package(
+        "con",
+        "[package]\nname = \"con\"\nversion = \"0.1.0\"\ncapabilities = [\"io\"]\n\n[dependencies.lib]\npath = \"../lib\"\n",
+        "import lib\n\nfn main() {\n    print(\"{lib.go(3)}\")\n}\n",
+    );
+    let entry = app_entry(&app);
+    for args in [
+        vec!["check", entry.as_str()],
+        vec!["run", entry.as_str()],
+    ] {
+        let (code, out) = run(&args);
+        assert_eq!(code, 1, "{args:?}: {out}");
+        assert!(out.contains("is reserved by the language"), "{args:?}: {out}");
+        assert!(!out.contains("lib wrote to your stdout"), "{args:?}: {out}");
+    }
+    let out = Command::new(GRASM)
+        .arg("deps")
+        .arg(".")
+        .current_dir(&app)
+        .output()
+        .expect("runs");
+    assert_eq!(out.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&out.stdout).into_owned()
+        + &String::from_utf8_lossy(&out.stderr);
+    assert!(text.contains("CANNOT ANALYZE"), "{text}");
+    assert!(!text.contains("performs []"), "{text}");
+}
+
+/// A build that cannot write its output says so in the tool's own voice.
+///
+/// The bundle path reported a bare `No such file or directory (os error 2)`
+/// naming nothing, and the native path surfaced four lines of the linker's own
+/// words — including grasm's temporary object file, a path with no meaning
+/// outside that process.
+#[test]
+fn a_build_that_cannot_write_its_output_says_so_plainly() {
+    let w = Work::new("outpath");
+    let dir = w.0.join("src");
+    std::fs::create_dir_all(&dir).unwrap();
+    let entry = dir.join("t.gr");
+    std::fs::write(&entry, "fn main() {\n    print(\"x\")\n}\n").unwrap();
+    let missing = w.0.join("no/such/dir/out");
+    for extra in [vec![], vec!["--native"]] {
+        let mut args = vec!["build", entry.to_str().unwrap()];
+        args.extend(extra.iter().copied());
+        args.extend(["-o", missing.to_str().unwrap()]);
+        let (code, out) = run(&args);
+        assert_eq!(code, 1, "{args:?}: {out}");
+        assert!(out.contains("cannot write"), "{args:?}: {out}");
+        assert!(out.contains("is not a directory"), "{args:?}: {out}");
+        assert!(!out.contains("grasm_native_"), "internal path leaked:\n{out}");
+        assert!(!out.contains("out.o"), "internal path leaked:\n{out}");
+    }
+    // And a build that does work is unaffected.
+    let good = w.0.join("good");
+    let (code, out) = run(&[
+        "build",
+        entry.to_str().unwrap(),
+        "--native",
+        "-o",
+        good.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{out}");
+    let got = Command::new(&good).output().expect("runs");
+    assert_eq!(String::from_utf8_lossy(&got.stdout).trim(), "x");
+}

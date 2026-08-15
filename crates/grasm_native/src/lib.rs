@@ -2063,6 +2063,20 @@ to one — a loop variable or a list element is this case",
             other => Some(other.clone()),
         };
         let val = fcx.eval_expr(&h.body)?;
+        // A body that already left — `|| panic(m)` — filled its block, and
+        // Cranelift takes one terminator per block. The named-function path
+        // has always guarded this; a lifted handler body did not.
+        if fcx.is_filled() {
+            fcx.b.seal_all_blocks();
+            fcx.b.finalize();
+            return self
+                .module
+                .define_function(h.id, &mut ctx)
+                .map_err(|e| Unsupported {
+                    span: h.body.span(),
+                    what: format!("{INTERNAL}  {e}"),
+                });
+        }
         match (&h.ret, val) {
             (VType::Unit, v) => {
                 if let Some((x, xt)) = v {
@@ -2096,6 +2110,22 @@ to one — a loop variable or a list element is this case",
                 }
                 fcx.emit_scope_decs_all();
                 fcx.b.ins().return_(&[x]);
+            }
+            // An operation declared `-> () ! E` whose body gives the bare ok
+            // half. Unit has no value to carry, so the merge of `()` against
+            // `fail(e)` produces nothing at all — and the arm below returned
+            // `zero_of(Fallible)`, a null pointer, which the caller then read.
+            // The build succeeded and the program died with SIGSEGV and no
+            // message, which is the one thing §11 promises never happens.
+            // This is [T-FALLIBLE-UNIT]'s "the value it merges the two halves
+            // through does not exist", in the one position that had no arm
+            // for it; the named-function path has had one all along.
+            (VType::Fallible(_, _), None) => {
+                let z = fcx.b.ins().iconst(types::I64, 0);
+                let boxed = fcx.call_rt("grasm_box_i64", &[z]).unwrap();
+                let v = fcx.call_rt("grasm_ok_new", &[boxed]).unwrap();
+                fcx.emit_scope_decs_all();
+                fcx.b.ins().return_(&[v]);
             }
             (want, None) => {
                 // A handler operation whose body leaves — `|| fail(e)` for a

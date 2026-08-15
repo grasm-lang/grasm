@@ -1,10 +1,26 @@
 //! tag: E-TEST-SEED
 //! expect: test-output
 //! counterexample: n = 1
+//! "never 2" ... FAILED counterexample: n = 2
+//! "never MIN" ... FAILED counterexample: n = -9223372036854775808
 // Generation is a pure function of the seed, so this report is identical on
 // every run and every machine.
+//
+// The default seed is fixed, which makes the opening cases the only ones a
+// reader can count on — so they walk the boundary list in order rather than
+// drawing from it. Drawn, each value was merely likely: `2` first appeared at
+// case 138 of the default seed and the default run is 100 cases, so a
+// property false at `2` was reported as holding.
 test "no positive ints" (n: i64) {
     assert(n <= 0)
+}
+
+test "never 2" (n: i64) {
+    assert(n != 2)
+}
+
+test "never MIN" (n: i64) {
+    assert(n != 0 - 9223372036854775807 - 1)
 }
 
 fn main() {

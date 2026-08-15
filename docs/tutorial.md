@@ -549,6 +549,14 @@ not greater. The property is false for `0`, for every negative number, and for
 `4611686018427387904` and up, where `n * 2` wraps — the shrinker reports the
 simplest one it can, not the first one it found.
 
+That seed is the *default*, and it does not change between runs: `grasm test`
+twice runs the same hundred cases twice, so a suite that passes today passes
+tomorrow. Running it again is not how you widen coverage — `--seed` is. What
+the fixed run does guarantee is the boundary values: the first ten cases walk
+them in order, so `0`, `±1`, `±2`, `10`, `100`, the `i64` extremes, NaN, both
+infinities, both zeros, both `bool`s and the empty string are tried every time
+rather than merely often. The rest of the run is the widening random mix.
+
 `grasm test --coverage` reports which statement lines the suite reached —
 counting the lines that doc examples reach, since those are tests too. It did
 not, so a function reached *only* by its own documented example was reported
@@ -676,6 +684,7 @@ runs only under `grasm run`:
 | calling a function value through anything but a name | `TABLE[0](21)`, `(m.get(k) ?? d)(x)` — bind it with `let` first, then call it |
 | a UFCS call of a *generic* free function | `[1, 2].describe()` for `fn describe[T](xs: [T])` — write `describe([1, 2])` |
 | an effect handler as a **struct field** type | `type Box = { h: CfgHandler }` — bind the handler with `let` instead |
+| an effect handler as a **parameter** type | `fn run(h: LogHandler) { with Log handled_by h { … } }` — the shape [E-HANDLER-OWN-ROW] documents; install the handler at the call site instead |
 | a generic instantiated at a handler type | `f(h)` for `fn f[T](x: T)` — pass what the handler computes instead |
 | a handler used as a *value* | `print("{h}")`, or storing one — install it with `with … handled_by` instead |
 | a `with` block inside `parallel`/`spawn` | install the handler around the `parallel` block instead |

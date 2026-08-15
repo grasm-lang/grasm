@@ -1427,6 +1427,56 @@ impl<'a, W: Write> Interp<'a, W> {
         Ok(Some(segs))
     }
 
+    /// How many references one write may follow.
+    ///
+    /// A bound rather than a cycle check: a path is written by hand and no
+    /// real one is this long, while `ref(ref(...))` pointing back at itself
+    /// would otherwise loop forever inside the interpreter.
+    const REF_HOPS: u32 = 64;
+
+    /// Writes `v` at `segs`, starting from the value in slab slot `idx`.
+    ///
+    /// A path may cross more than one reference: `b.one.v`, where `b` holds a
+    /// reference to a node whose `one` field is a reference to another. The
+    /// write used to descend into one slab value and panic the moment it met
+    /// the next — `cannot access field `v` of `ref#0.0`` — so a graph node
+    /// holding a reference to a graph node was write-once, which is every
+    /// graph. Reading the identical path worked, which is what
+    /// [T-REF-WRITE]'s "anywhere on the path, not only at the root" means.
+    fn assign_in_slab(
+        &mut self,
+        idx: usize,
+        gen: u32,
+        segs: &[Seg],
+        v: Value,
+        hops: u32,
+    ) -> Result<(), Flow> {
+        if hops > Self::REF_HOPS {
+            return Err(Flow::Panic(format!(
+                "a write followed more than {} references",
+                Self::REF_HOPS
+            )));
+        }
+        let live = matches!(self.slab.get(idx), Some((Some(_), g)) if *g == gen);
+        if !live {
+            return Err(Flow::Panic(
+                "stale reference: the value it pointed to was released".to_string(),
+            ));
+        }
+        let inner = self.slab[idx].0.take().expect("checked live");
+        // The next reference on what is left of the path, if any. Put this
+        // slot back before descending: the next one may be this one again.
+        if let Some((consumed, next, next_gen)) = deepest_ref(&inner, segs) {
+            let rest: Vec<Seg> = segs[consumed..].to_vec();
+            self.slab[idx].0 = Some(inner);
+            return self.assign_in_slab(next as usize, next_gen, &rest, v, hops + 1);
+        }
+        let mut inner = inner;
+        let r = assign_into(&mut inner, segs, v);
+        self.slab[idx].0 = Some(inner);
+        r
+    }
+
     /// Writes `v` at a path already resolved to its root binding.
     fn assign_rooted(&mut self, id: &Ident, segs: Vec<Seg>, v: Value) -> Result<(), Flow> {
         // A `ref` root: the value lives in the slab, not in the
@@ -1456,17 +1506,7 @@ impl<'a, W: Write> Interp<'a, W> {
             .cloned()
             .and_then(|rv| deepest_ref(&rv, &segs));
         if let Some((consumed, i, g)) = via {
-            let idx = i as usize;
-            let live = matches!(self.slab.get(idx), Some((Some(_), gen)) if *gen == g);
-            if !live {
-                return Err(Flow::Panic(
-                    "stale reference: the value it pointed to was released".to_string(),
-                ));
-            }
-            let mut inner = self.slab[idx].0.take().expect("checked live");
-            let r = assign_into(&mut inner, &segs[consumed..], v);
-            self.slab[idx].0 = Some(inner);
-            return r;
+            return self.assign_in_slab(i as usize, g, &segs[consumed..], v, 0);
         }
         let root_ref = self
             .scopes
@@ -1479,17 +1519,7 @@ impl<'a, W: Write> Interp<'a, W> {
                 _ => None,
             });
         if let Some((i, g)) = root_ref {
-            let idx = i as usize;
-            let live = matches!(self.slab.get(idx), Some((Some(_), gen)) if *gen == g);
-            if !live {
-                return Err(Flow::Panic(
-                    "stale reference: the value it pointed to was released".to_string(),
-                ));
-            }
-            let mut inner = self.slab[idx].0.take().expect("checked live");
-            let r = assign_into(&mut inner, &segs, v);
-            self.slab[idx].0 = Some(inner);
-            return r;
+            return self.assign_in_slab(i as usize, g, &segs, v, 0);
         }
         // Find the binding.
         let slot = self

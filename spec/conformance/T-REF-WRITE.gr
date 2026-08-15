@@ -3,6 +3,7 @@
 //! 1 2
 //! 5 9
 //! 6 [7]
+//! B! A!
 // A reference is written through the same way it is read through.
 //
 // The binding's own mutability is not the question — writing through a
@@ -13,6 +14,12 @@
 type Node = { v: i64, kids: [i64] }
 
 type Holder = { r: ref Node }
+
+// A reference *to a reference*, which is what a graph edge is. The write
+// descended into one slab value and panicked the moment it met the next —
+// `cannot access field `v` of `ref#0.0`` — so a node holding a reference to a
+// node was write-once. Reading the identical path worked.
+type Graph = { name: str, out: [ref Graph] }
 
 fn bump(rs: [ref Node]) {
     rs[0].v = rs[0].v + 1
@@ -30,4 +37,12 @@ fn main() {
     bump(rs)
     h.r.kids.push(7)
     print("{rs[0].v} {h.r.kids}")
+    // Through two hops, and then around a cycle back to the start.
+    let a = ref(Graph{ name: "A", out: [] })
+    let b = ref(Graph{ name: "B", out: [] })
+    a.out.push(b)
+    b.out.push(a)
+    a.out[0].name = "B!"
+    a.out[0].out[0].name = "A!"
+    print("{b.name} {a.name}")
 }

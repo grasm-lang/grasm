@@ -352,6 +352,17 @@ struct Checker {
     /// program never mentioned. The body waits until the end of its block, by
     /// which point the uses have had their say.
     deferred_closures: Vec<Vec<DeferredClosure>>,
+    /// Field reads whose receiver type is not known yet, one list per open
+    /// block — the same shape, and for the same reason, as the closure
+    /// bodies above.
+    ///
+    /// `let f = |x| S{ c: x }` defers its body, so `f(2).c` one line later
+    /// asked an inference variable for a field and was told `_` has no field
+    /// `c` — naming a type no program can write, about a value whose type is
+    /// inferred perfectly well by the time the block ends. Every other use of
+    /// the same call worked, so the refusal depended only on which use came
+    /// first.
+    deferred_fields: Vec<Vec<DeferredField>>,
     /// Types whose bodies are not resolved yet, by module.
     pending_type_bodies: Vec<(String, Vec<(usize, TypeDefId)>)>,
     /// Module-level constants: `module::NAME` to (type, is_pub).
@@ -373,6 +384,15 @@ struct Checker {
 }
 
 /// A closure whose body is checked once its parameter types are settled.
+/// A field read waiting for its receiver's type.
+struct DeferredField {
+    recv: Type,
+    name: Ident,
+    /// The type the surrounding expression was handed; unified with the
+    /// field's real type once the receiver is known.
+    out: Type,
+}
+
 struct DeferredClosure {
     params: Vec<Ident>,
     body: Expr,
@@ -424,6 +444,7 @@ impl Checker {
             parallel_fn_floor: None,
             current_generics: Vec::new(),
             deferred_closures: Vec::new(),
+            deferred_fields: Vec::new(),
             pending_type_bodies: Vec::new(),
             consts: HashMap::new(),
             fn_ret: Type::Unit,
@@ -491,6 +512,22 @@ impl Checker {
         let mut alias_names: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (di, decl) in module.decls.iter().enumerate() {
             if let Decl::Type(t) = decl {
+                // A builtin type name is not in `defs`, so nothing collided
+                // with it: `type Map = { x: i64 }` and `type i64 = str` were
+                // accepted and then silently ignored, since `resolve_type`
+                // answers for those names before it ever consults a
+                // declaration. Accepted-and-ignored reads to a reviewer as a
+                // definition that took effect, which is the failure
+                // [T-TYPE-NO-PUB] argues against in the same words.
+                if is_builtin_type_name(&t.name.name) {
+                    self.error_help(
+                        t.name.span,
+                        format!("type name `{}` is built in", t.name.name),
+                        "a declaration of it would never be reached — every use of the name \
+resolves to the builtin; pick a different name",
+                    );
+                    continue;
+                }
                 if let Some(&existing) = self.defs.by_name.get(&t.name.name) {
                     if existing == self.defs.option_id || existing == self.defs.io_error_id {
                         self.error_help(
@@ -695,6 +732,30 @@ already reachable from every module — drop the `pub`",
     fn collect_effects(&mut self, module: &Module) {
         for decl in &module.decls {
             if let Decl::Effect(e) = decl {
+                // The builtin effects are not handleable, and declaring one
+                // made it so. `effect io { ... }` gave a program
+                // `with io handled_by ...`, which discharged the *builtin*
+                // `io` for everything in the block — so a function declaring
+                // `/ {}` printed, `par_map` ran a printing function on several
+                // cores, and a `capabilities = []` package read and wrote
+                // files while `grasm deps` certified it as performing nothing.
+                // One word in a manifest is the whole capability story; a
+                // dependency must not be able to write it away.
+                if matches!(
+                    e.name.name.as_str(),
+                    crate::effects::IO
+                        | crate::effects::ASYNC
+                        | crate::effects::UNSAFE
+                ) {
+                    self.error_help(
+                        e.name.span,
+                        format!("effect name `{}` is reserved by the language", e.name.name),
+                        "`io`, `async` and `unsafe` are capabilities the runtime discharges, \
+not effects a program declares or handles — there is no `with io handled_by` \
+([T-EFFECT-BUILTIN]); rename this one",
+                    );
+                    continue;
+                }
                 if self.effects.contains_key(&e.name.name) {
                     self.error(e.name.span, format!("duplicate effect `{}`", e.name.name));
                     continue;
@@ -1362,13 +1423,20 @@ capability visible to everyone who depends on you",
         // position away from where it was already caught. A statement that
         // *leaves* — `exit(n)`, `panic(m)`, `fail(e)` — produces no value to
         // discard.
-        if ret == Type::Unit && self.fn_err.is_none() {
+        if ret == Type::Unit {
             if let Some(Stmt::Expr(e)) = f.body.stmts.last() {
                 let leaves = matches!(e, Expr::Call { callee, .. }
                     if matches!(&**callee, Expr::Ident(id)
                         if matches!(id.name.as_str(), "exit" | "panic" | "fail")));
                 let resolved = self.uni.shallow_resolve(&body_ty);
-                if !leaves && matches!(resolved, Type::Fallible(..)) {
+                // `main` has an open error slot, so a directly fallible tail
+                // there is propagated rather than discarded ([E-MAIN-ERR]).
+                // A *container* of failures is not: the slot carries one
+                // failure, not a list of them, so `fn main() { xs.map(risky) }`
+                // threw away every one of them — silent, exit 0. The whole
+                // check was skipped for `main`, and only this half should be.
+                let may_propagate = self.fn_err.is_some();
+                if !leaves && !may_propagate && matches!(resolved, Type::Fallible(..)) {
                     let shown = self.show(&body_ty);
                     self.error_help(
                         e.span(),
@@ -1377,7 +1445,10 @@ capability visible to everyone who depends on you",
                         ),
                         "use `try` to propagate it, `match` to handle both cases, or `??` with a fallback to say what should happen instead",
                     );
-                } else if !leaves && self.holds_fallible(&resolved) {
+                } else if !leaves
+                    && !matches!(resolved, Type::Fallible(..))
+                    && self.holds_fallible(&resolved)
+                {
                     // The tail of a `()`-returning function throws its value
                     // away like any other discarded statement, and the
                     // container rule was checked only for statements: adding
@@ -1479,6 +1550,7 @@ is a failure nothing reports",
     fn check_block_with(&mut self, b: &Block, want: Option<&Type>) -> Type {
         self.scopes.push(HashMap::new());
         self.deferred_closures.push(Vec::new());
+        self.deferred_fields.push(Vec::new());
         let mut ty = Type::Unit;
         let n = b.stmts.len();
         for (i, stmt) in b.stmts.iter().enumerate() {
@@ -1571,8 +1643,26 @@ is a failure nothing reports",
             self.check_deferred_closure(next);
         }
         self.deferred_closures.pop();
+        self.settle_deferred_fields();
         self.scopes.pop();
         ty
+    }
+
+    /// Resolves the field reads this block deferred, now that its closure
+    /// bodies have been checked.
+    ///
+    /// A receiver still unknown here is genuinely unknown — nothing later can
+    /// say more about it — so the original refusal stands, with the same
+    /// message it would have had. One that resolved is checked exactly as a
+    /// field read written after the call site would have been.
+    fn settle_deferred_fields(&mut self) {
+        let Some(pending) = self.deferred_fields.pop() else {
+            return;
+        };
+        for d in pending {
+            let got = self.field_type_of(&d.recv, &d.name, d.name.span);
+            self.uni.unify(&d.out, &got);
+        }
     }
 
     fn check_deferred_closure(&mut self, d: DeferredClosure) {
@@ -1582,6 +1672,7 @@ is a failure nothing reports",
             self.bind(p, t.clone(), false);
         }
         self.deferred_closures.push(Vec::new());
+        self.deferred_fields.push(Vec::new());
         // A closure is a function: `return` inside one returns from *it*, and
         // `break` cannot reach a loop outside it. Checked against the
         // enclosing function's return type instead, `let g: fn(i64) -> i64 =
@@ -1604,6 +1695,7 @@ is a failure nothing reports",
             self.check_deferred_closure(next);
         }
         self.deferred_closures.pop();
+        self.settle_deferred_fields();
         self.closure_floors.pop();
         self.scopes.pop();
         // Nothing ever said what the parameters are. [T-FN-TYPE]: "A closure
@@ -4243,12 +4335,35 @@ parts have names worth writing",
             }
         }
         let recv_ty = self.infer_expr(recv);
+        // Not known yet. A closure's body waits for its call sites, so the
+        // type of what it returns is not settled until the end of the block —
+        // and asking here reported ``_` has no field `c``, naming a type no
+        // program can write. The read waits with it.
+        if matches!(self.uni.shallow_resolve(&recv_ty), Type::Var(_))
+            && !self.deferred_fields.is_empty()
+        {
+            let out = self.uni.fresh();
+            self.deferred_fields
+                .last_mut()
+                .expect("checked non-empty")
+                .push(DeferredField {
+                    recv: recv_ty,
+                    name: name.clone(),
+                    out: out.clone(),
+                });
+            return out;
+        }
+        self.field_type_of(&recv_ty, name, span)
+    }
+
+    /// The type of `recv.name`, with the receiver's type already inferred.
+    fn field_type_of(&mut self, recv_ty: &Type, name: &Ident, span: Span) -> Type {
         // Tier 2: a `ref T` reads as the `T` it points at. The check happens
         // at run time, on the generation, so a reference to a released slot
         // panics rather than reading whatever occupies it now.
-        let recv_ty = match self.uni.resolve(&recv_ty) {
+        let recv_ty = match self.uni.resolve(recv_ty) {
             Type::Ref(inner) => *inner,
-            _ => recv_ty,
+            other => other,
         };
         match self.uni.shallow_resolve(&recv_ty) {
             // `pair.0` — a tuple's components are named by position.
@@ -6474,6 +6589,31 @@ enum PlaceSeg {
 }
 
 /// A place as root name plus the steps taken from it.
+/// Names `resolve_type` answers for before it consults any declaration.
+///
+/// Kept in step with that function on purpose: a name it handles and this one
+/// does not is a name a program may declare and never reach.
+fn is_builtin_type_name(name: &str) -> bool {
+    matches!(
+        name,
+        "i8" | "i16"
+            | "i32"
+            | "i64"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "usize"
+            | "int"
+            | "f32"
+            | "f64"
+            | "float"
+            | "bool"
+            | "str"
+            | "Map"
+    )
+}
+
 fn place_path(e: &Expr) -> Option<(String, Vec<PlaceSeg>)> {
     match e {
         Expr::Ident(id) => Some((id.name.clone(), Vec::new())),

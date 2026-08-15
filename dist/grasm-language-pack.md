@@ -458,6 +458,14 @@ initializer unless annotated. Function signatures are never inferred —
 parameter and return types are always written explicitly, which keeps
 inference local and errors near their cause.
 
+A closure's body waits for its call sites ([T-FN-TYPE]), so what it returns is
+not settled where it is written — and a *field read* of that result asked
+before the block ended, and was told ``_` has no field `c``: a type no program
+can write, about a value the same block infers perfectly well. Every other use
+of the identical call worked, so the refusal turned on which use came first.
+The read waits with the body; a receiver still unknown when the block ends is
+genuinely unknown, and is refused then with the type it does have.
+
 **[T-INT-TO-FLOAT]** An integer *literal* is accepted where `f64` is expected
 and is converted at compile time. A non-literal `i64` value is not implicitly
 converted; use `.as_f64()`.
@@ -553,6 +561,13 @@ fallible field, a sum variant carrying one. A named type holds values like any
 other container. [T-FALLIBLE-VALUE] keeping the failures in the list is what makes them
 readable — while somebody reads them.
 
+`main` is not an exception to that half. Its open error slot ([E-MAIN-ERR])
+carries *one* failure, so a directly fallible tail there is propagated rather
+than discarded — but a container of them is not, and the whole rule was
+skipped for `main` on the strength of the slot. `fn main() { xs.map(risky) }`
+threw away every failure it held: silent, exit 0. Adding any line after it
+caught the identical expression, so the silence depended only on position.
+
 **[T-FALLIBLE-COALESCE]** `e ?? d` where `e : T ! E` yields the value or `d`,
 the same shape `??` has over an `Option` ([E-COALESCE-LAZY] applies equally:
 `d` is evaluated only on failure). Absence and failure are different things,
@@ -592,6 +607,13 @@ type Failure = | NotFound(key: str) | Cycle(path: [str])
 
 which matches exhaustively, carries the same information, and is checked the
 same way everywhere.
+
+`NotFound` is also a variant of the prelude's `IoError`, and a variant name
+shared by two types has to be *constructed* qualified: `fail(Failure.NotFound(k))`,
+not `fail(NotFound(k))`. Reading one does not — `Err(NotFound(k))` in a match
+arm already knows which type it is matching, because the scrutinee says so.
+The example is written with the collision on purpose: it is the name anybody
+reaches for first.
 
 **[T-FAIL]** `fail(e)` raises the error branch. Its type fits any context, and
 it is a compile error where no error type is declared.
@@ -723,6 +745,20 @@ row `/ {io, E}` is an upper bound: performing an effect outside it is an error.
 **[T-EFFECT-BUILTIN]** `io` is performed by `print` and the filesystem
 builtins. `async` is performed by `parallel`/`spawn`. Both are discharged by
 the runtime at `main` and in tests.
+
+**[T-EFFECT-RESERVED]** `io`, `async` and `unsafe` may not be declared as
+effects. They are capabilities the runtime discharges, not effects a program
+handles — there is no `with io handled_by`, the same point [T-UNSAFE-FFI]
+makes for `unsafe`.
+
+`unsafe` is a keyword, so it never parsed. The other two are not, so
+`effect io { … }` did — and the `with io handled_by …` it then made available
+discharged the *builtin* `io` for everything in the block. A function
+declaring `/ {}` printed, `par_map` ran a printing function on several cores
+past [T-PAR-MAP-PURE], and a dependency declaring `capabilities = []` read and
+wrote files while `grasm deps` certified it as performing nothing. A
+capability ceiling one declaration away from meaningless is not a ceiling; a
+package may not write away the word that constrains it.
 
 **[T-EFFECT-DISCHARGE]** `with E handled_by h { … }` discharges `E` inside the
 block. Any user effect still outstanding at `main` or in a test is an error.
@@ -912,6 +948,14 @@ empty ok half changes nothing about where the failure has to be handled
 one a compiled backend is most likely to get wrong, because the value it
 merges the two halves through does not exist.
 
+An effect operation declared `-> () ! E` is the same shape one hop further
+out, and the position with no arm for it at all: a handler whose body gives
+the bare `()` half in one branch and `fail(e)` in the other produced no value,
+and the lifted body returned a null pointer typed as a fallible. The build
+succeeded and the program died with SIGSEGV and nothing on stderr — the one
+outcome §11 promises cannot happen, since a backend that cannot compile
+something names it at build time.
+
 **[T-DIVERGE]** `return`, `break` and `continue` produce no value, so they do
 not have to agree with one: an `if` branch or a match arm that ends in one is
 compatible with any other branch's type. This is what makes `0 -> return
@@ -1055,6 +1099,15 @@ exists — and `rs[0].v = 5` typechecked and then panicked `cannot access field
 mutability is not the question either, for the same reason the root's is not:
 a `[ref N]` parameter cannot be declared `var` at all, so the demand had no
 answer.
+
+*Anywhere* means through more than one, too. A graph edge is a reference held
+by a node that is itself reached through one, so `a.out[0].name = "B!"` — and
+every write that closes a cycle — crosses two. The write descended into one
+slab entry and panicked with the same message the moment it met the next, so a
+node holding a reference to a node was still write-once, which is every graph
+the tier exists for. A path is now followed reference by reference, each one
+checked for staleness as it is crossed, up to a bound no hand-written path
+reaches.
 
 **[T-REF-CAPTURE]** A captured `ref` may be written through inside a closure.
 [T-CAPTURE-WRITE] refuses writing to a captured binding because a closure
@@ -1429,6 +1482,12 @@ one place the three ways of running a program differ in what reaches stderr,
 which is why `scripts/agreetest.sh` strips the trace block and compares
 everything else exactly.
 
+A bundle's frames name files by their *basename* — `app.gr:4:5`, not the
+directory the build happened in, which names nothing on the machine running
+the binary. Every frame is spelled that way, the entry file included: it alone
+read `<bundled>` while its imports read `helper.gr`, so one trace named the
+same kind of thing two ways and one of them was not a file.
+
 **[E-RECURSION-PARALLEL]** The bound above holds inside `par_map` and
 `par_filter` too. A worker runs on its own stack, and it must be big enough for
 the same guarantee — a worker on the platform's default stack computed its
@@ -1729,9 +1788,28 @@ string shrinks its characters toward `a` once it can no longer lose any, since
 `s = "🙂/🙂"` is length-minimal and tells a reader nothing about the property
 that rejected it.
 
+Parts that have to agree shrink together. Replacing one at a time is greedy,
+and greedy cannot cross a failure the parts share: a property false only when
+two components are equal reported `(107, 107)`, because `(0, 107)` and
+`(107, 0)` both hold, so every single step landed on a passing value and the
+search stopped at whatever the generator produced. The candidate list starts
+with every part replaced at once, which reaches `(0, 0)` in one step.
+
 **[E-TEST-SEED]** Generation is driven entirely by a seed. The same seed and
 case count reproduce the same run exactly, and a failure reports the seed that
 found it.
+
+The default seed is *fixed*, so running `grasm test` twice runs the same cases
+twice — a suite that passes does not become a suite that might not. Widening
+coverage is `--seed`, deliberately, not repetition.
+
+That makes the opening cases worth spending carefully, so the first ten walk
+the boundary lists in order rather than drawing from them: every `i64` in
+`0 1 -1 2 -2 10 100 i64::MIN i64::MAX i64::MIN+1`, every `f64` in the list
+[E-TEST-PROPERTY] names, both `bool`s, and the empty string. Drawn at random
+each was only *likely*: `2` first appeared at case 138 of the default seed,
+and the default run is 100 cases, so `assert(n != 2)` passed — a property
+false at a value the generator names on purpose, reported as holding.
 
 **[E-BENCH-WARMUP]** A benchmark body runs once before timing starts. A body
 that panics is reported as a failure instead of a measurement.
@@ -1797,6 +1875,14 @@ came to be documented as returning `Option[str]` when it is fallible.
 the same number: `exit(-1)` is 255 and `exit(256)` is 0. Clamping to 0..=255
 instead was worse in the direction that matters — it made `exit(-1)`, the most
 common spelling of "fail" in a script, report *success*.
+
+`exit` performs no effect, so a dependency declaring `capabilities = []` can
+end the host process. That is deliberate and worth stating: `panic` and an
+endless loop already do the same, and a ceiling has never claimed to bound how
+long a dependency runs or whether it returns — only what it can *reach*.
+Nothing observable outside the process changes, so charging `io` for it would
+buy no guarantee while making every program that reports a status ask for the
+filesystem.
 
 **[L-LIB-IO]** The three ways a library call reports "no": `read_file` is
 **fallible** (`str ! IoError`) because a failure has a reason worth reading —
@@ -2701,6 +2787,14 @@ not greater. The property is false for `0`, for every negative number, and for
 `4611686018427387904` and up, where `n * 2` wraps — the shrinker reports the
 simplest one it can, not the first one it found.
 
+That seed is the *default*, and it does not change between runs: `grasm test`
+twice runs the same hundred cases twice, so a suite that passes today passes
+tomorrow. Running it again is not how you widen coverage — `--seed` is. What
+the fixed run does guarantee is the boundary values: the first ten cases walk
+them in order, so `0`, `±1`, `±2`, `10`, `100`, the `i64` extremes, NaN, both
+infinities, both zeros, both `bool`s and the empty string are tried every time
+rather than merely often. The rest of the run is the widening random mix.
+
 `grasm test --coverage` reports which statement lines the suite reached —
 counting the lines that doc examples reach, since those are tests too. It did
 not, so a function reached *only* by its own documented example was reported
@@ -2828,6 +2922,7 @@ runs only under `grasm run`:
 | calling a function value through anything but a name | `TABLE[0](21)`, `(m.get(k) ?? d)(x)` — bind it with `let` first, then call it |
 | a UFCS call of a *generic* free function | `[1, 2].describe()` for `fn describe[T](xs: [T])` — write `describe([1, 2])` |
 | an effect handler as a **struct field** type | `type Box = { h: CfgHandler }` — bind the handler with `let` instead |
+| an effect handler as a **parameter** type | `fn run(h: LogHandler) { with Log handled_by h { … } }` — the shape [E-HANDLER-OWN-ROW] documents; install the handler at the call site instead |
 | a generic instantiated at a handler type | `f(h)` for `fn f[T](x: T)` — pass what the handler computes instead |
 | a handler used as a *value* | `print("{h}")`, or storing one — install it with `with … handled_by` instead |
 | a `with` block inside `parallel`/`spawn` | install the handler around the `parallel` block instead |
@@ -4605,10 +4700,26 @@ fn main() {
 //! tag: E-TEST-SEED
 //! expect: test-output
 //! counterexample: n = 1
+//! "never 2" ... FAILED counterexample: n = 2
+//! "never MIN" ... FAILED counterexample: n = -9223372036854775808
 // Generation is a pure function of the seed, so this report is identical on
 // every run and every machine.
+//
+// The default seed is fixed, which makes the opening cases the only ones a
+// reader can count on — so they walk the boundary list in order rather than
+// drawing from it. Drawn, each value was merely likely: `2` first appeared at
+// case 138 of the default seed and the default run is 100 cases, so a
+// property false at `2` was reported as holding.
 test "no positive ints" (n: i64) {
     assert(n <= 0)
+}
+
+test "never 2" (n: i64) {
+    assert(n != 2)
+}
+
+test "never MIN" (n: i64) {
+    assert(n != 0 - 9223372036854775807 - 1)
 }
 
 fn main() {
@@ -6708,6 +6819,36 @@ fn main() {
 }
 ```
 
+## `T-EFFECT-RESERVED.gr`
+
+```grasm
+//! tag: T-EFFECT-RESERVED
+//! expect: error
+//! effect name `io` is reserved by the language
+// A capability the runtime discharges is not an effect a program handles.
+//
+// `io` and `async` are not keywords, so this parsed — and the
+// `with io handled_by ...` it made available discharged the *builtin* `io`
+// for everything in the block. This function's declared row is empty and it
+// printed; the same trick let `par_map` run a printing function on several
+// cores, and let a dependency declaring `capabilities = []` read and write
+// files while `grasm deps` certified it as performing nothing.
+effect io {
+    fn nothing() -> i64
+}
+
+fn quiet(n: i64) -> i64 / {} {
+    with io handled_by ioHandler{ nothing: || 1 } {
+        print("a declared-empty row printed")
+    }
+    n
+}
+
+fn main() {
+    print("{quiet(1)}")
+}
+```
+
 ## `T-EFFECT-ROW.gr`
 
 ```grasm
@@ -7007,6 +7148,8 @@ test "checked" {
 //! expect: output
 //! both survived
 //! err boom
+//! handler ok
+//! handler err
 // A fallible call that produces nothing.
 //
 // `() ! E` is what a setup call returns, and `f() ?? ()` is how you say its
@@ -7015,7 +7158,17 @@ test "checked" {
 // rejected — surfacing as "does not yet support (codegen bug in `main`)", a
 // refusal naming nothing, which then masked the real refusal elsewhere in the
 // same program.
+//
+// The same merge inside a *handler* had no arm at all: an operation declared
+// `-> () ! E` whose body gives the bare `()` half produced no value, and the
+// lifted body returned a null pointer typed as a fallible. The build
+// succeeded and the program died with SIGSEGV and nothing on stderr — the one
+// thing §11 promises never happens.
 type E = { m: str }
+
+effect Setup {
+    fn once(b: bool) -> () ! E
+}
 
 fn nothing(b: bool) -> () ! E {
     if b {
@@ -7030,6 +7183,16 @@ fn main() {
     match nothing(true) {
         Ok(_) -> print("ok")
         Err(e) -> print("err {e.m}")
+    }
+    with Setup handled_by SetupHandler{ once: |b| if b { fail(E{ m: "h" }) } else { () } } {
+        match Setup.once(false) {
+            Ok(_) -> print("handler ok")
+            Err(e) -> print("handler err {e.m}")
+        }
+        match Setup.once(true) {
+            Ok(_) -> print("handler ok2")
+            Err(e) -> print("handler err")
+        }
     }
 }
 ```
@@ -8430,6 +8593,7 @@ fn main() {
 //! 1 2
 //! 5 9
 //! 6 [7]
+//! B! A!
 // A reference is written through the same way it is read through.
 //
 // The binding's own mutability is not the question — writing through a
@@ -8440,6 +8604,12 @@ fn main() {
 type Node = { v: i64, kids: [i64] }
 
 type Holder = { r: ref Node }
+
+// A reference *to a reference*, which is what a graph edge is. The write
+// descended into one slab value and panicked the moment it met the next —
+// `cannot access field `v` of `ref#0.0`` — so a node holding a reference to a
+// node was write-once. Reading the identical path worked.
+type Graph = { name: str, out: [ref Graph] }
 
 fn bump(rs: [ref Node]) {
     rs[0].v = rs[0].v + 1
@@ -8457,6 +8627,14 @@ fn main() {
     bump(rs)
     h.r.kids.push(7)
     print("{rs[0].v} {h.r.kids}")
+    // Through two hops, and then around a cycle back to the start.
+    let a = ref(Graph{ name: "A", out: [] })
+    let b = ref(Graph{ name: "B", out: [] })
+    a.out.push(b)
+    b.out.push(a)
+    a.out[0].name = "B!"
+    a.out[0].out[0].name = "A!"
+    print("{b.name} {a.name}")
 }
 ```
 

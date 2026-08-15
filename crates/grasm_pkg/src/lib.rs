@@ -250,7 +250,11 @@ package's own directory, and a file outside it is in none of them"
         let path = dir.join(MANIFEST_NAME);
         let text = read_manifest_text(&path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        // Named here, not in the parser: `line 1: expected `key = value``
+        // said which line of *something*, and a graph has one manifest per
+        // package. Which file is the first thing a reader needs.
         Manifest::parse(&text, dir)
+            .map_err(|e| format!("{}: {e}", grasm_sema::loader::tidy(&path)))
     }
 
     pub fn entry_path(&self) -> PathBuf {
@@ -803,7 +807,10 @@ fn visit(
                 "dependency `{}` of `{}`: no {MANIFEST_NAME} at {}",
                 dep.name,
                 manifest.name,
-                dep_dir.display()
+                // A dependency is reached from the depending package's
+                // directory, so the path came out as `md/../gone` — correct,
+                // and not what anyone would type or could `cd` to and look at.
+                grasm_sema::loader::tidy(&dep_dir)
             ));
         }
         let dep_manifest = Manifest::load(&dep_dir)?;
@@ -1074,7 +1081,21 @@ pub fn effects_of_package(manifest: &Manifest) -> Result<BTreeSet<String>, Strin
 /// reported as `cannot read ./src/main.gr` against the consumer, at a path
 /// spelled `./../dep/src/main.gr` when it named the right file at all.
 fn first_failure(program: &grasm_sema::loader::Program, entry: &Path) -> Option<String> {
-    let d = program.diagnostics.first()?;
+    // Parse errors live on the program; type errors come from the check, and
+    // only the first half was consulted. A package that parsed but did not
+    // typecheck was reported `performs []` and written into a lockfile — and
+    // "did not typecheck" is exactly where an effect the ceiling would have
+    // caught can hide, since a refused declaration performs nothing the
+    // inference can see. Affirming a package nobody could compile is the one
+    // direction that must never be silent.
+    let checked;
+    let d = match program.diagnostics.first() {
+        Some(d) => d,
+        None => {
+            checked = grasm_sema::check::check_program(program).diagnostics;
+            checked.first()?
+        }
+    };
     let (path, borrowed) = match program.files.get(program.file_of(d.span)) {
         Some(f) => (
             grasm_sema::loader::tidy(Path::new(&f.path)),

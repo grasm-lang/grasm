@@ -286,7 +286,7 @@ fn generated_values_cover_the_declared_types() {
         let vals: Vec<_> = t
             .params
             .iter()
-            .map(|p| generate(&mut rng, &p.ty, size))
+            .map(|p| generate(&mut rng, &p.ty, size, None))
             .collect();
         match &vals[0] {
             grasm_interp::Value::Int(0) => saw_zero = true,
@@ -429,4 +429,117 @@ fn a_trace_spans_recursion_without_unbounded_growth() {
     assert_eq!(trace.len(), 5, "frames: {trace:?}");
     assert_eq!(trace[0].function, "main::down");
     assert_eq!(trace[4].function, "main::main");
+}
+
+/// Every boundary value the generator names is tried in every run.
+///
+/// They were drawn at random, which makes each one *likely* rather than
+/// certain — and the default seed is fixed, so a value the list names on
+/// purpose could be absent from every run anyone would ever make. `2` was: on
+/// the default seed it first appeared at case 138, and the default run is 100
+/// cases, so `assert(n != 2)` passed.
+#[test]
+fn a_run_tries_every_boundary_value() {
+    use grasm_interp::testing::{generate, Rng};
+    let fx = Fixture::new(
+        "boundary_values",
+        "test \"t\" (n: i64) {\n    assert(true)\n}\n\nfn main() {\n}\n",
+    );
+    let program = fx.program();
+    let grasm_syntax::ast::Decl::Test(t) = &program.files[0].module.decls[0] else {
+        panic!("expected the test declaration first");
+    };
+    let want: Vec<i64> = vec![0, 1, -1, 2, -2, 10, 100, i64::MIN, i64::MAX, i64::MIN + 1];
+    // Whatever the seed: the opening cases do not consult it.
+    for seed in [24301u64, 0, 1, 999] {
+        let mut rng = Rng::new(seed);
+        let mut seen = Vec::new();
+        for case in 0..10u32 {
+            let v = generate(&mut rng, &t.params[0].ty, 1 + case / 2, Some(case as usize));
+            if let grasm_interp::Value::Int(n) = v {
+                seen.push(n);
+            }
+        }
+        for w in &want {
+            assert!(seen.contains(w), "seed {seed} never generated {w}: {seen:?}");
+        }
+    }
+}
+
+/// The same, through the whole runner rather than the generator alone: a
+/// property false for a named boundary value fails inside the default run.
+#[test]
+fn a_property_false_at_a_boundary_fails_in_the_default_run() {
+    for (value, spelling) in [
+        (2i64, "2"),
+        (-2, "0 - 2"),
+        (100, "100"),
+        (i64::MAX, "9223372036854775807"),
+    ] {
+        let src = format!(
+            "test \"never\" (n: i64) {{\n    assert(n != ({spelling}))\n}}\n\nfn main() {{\n}}\n"
+        );
+        let fx = Fixture::new("boundary_run", &src);
+        let program = fx.program();
+        let files: Vec<_> = program
+            .files
+            .iter()
+            .map(|f| (f.name.clone(), &f.module, f.imports.clone()))
+            .collect();
+        let mut out = Vec::new();
+        let mut interp = grasm_interp::Interp::new_program(&files, &mut out);
+        let grasm_syntax::ast::Decl::Test(t) = &program.files[0].module.decls[0] else {
+            panic!("expected the test declaration first");
+        };
+        let outcome = interp.run_property(&t.params, &t.body, &TestOptions::default());
+        assert!(
+            matches!(outcome, PropertyOutcome::Failed { .. }),
+            "a property false at {value} passed the default run"
+        );
+    }
+}
+
+/// A counterexample whose parts must agree still shrinks.
+///
+/// Component-wise shrinking is greedy, and greedy cannot cross a failure the
+/// parts share: `(107, 107)` failing "these differ" reported `(107, 107)`,
+/// because `(0, 107)` and `(107, 0)` both hold, so every single step landed on
+/// a passing value and the search stopped at whatever the generator produced.
+#[test]
+fn a_correlated_counterexample_shrinks_to_the_minimal_one() {
+    let fx = Fixture::new(
+        "correlated_shrink",
+        "test \"pairs differ\" (p: (i64, i64)) {\n    assert(p.0 != p.1)\n}\n\n\
+test \"all distinct\" (xs: [i64]) {\n    var i = 0\n    while i < xs.len() {\n        \
+var j = i + 1\n        while j < xs.len() {\n            assert(xs[i] != xs[j])\n            \
+j = j + 1\n        }\n        i = i + 1\n    }\n}\n\nfn main() {\n}\n",
+    );
+    let program = fx.program();
+    let files: Vec<_> = program
+        .files
+        .iter()
+        .map(|f| (f.name.clone(), &f.module, f.imports.clone()))
+        .collect();
+    let mut out = Vec::new();
+    let mut interp = grasm_interp::Interp::new_program(&files, &mut out);
+
+    let grasm_syntax::ast::Decl::Test(pair) = &program.files[0].module.decls[0] else {
+        panic!("expected the pair property first");
+    };
+    match interp.run_property(&pair.params, &pair.body, &TestOptions::default()) {
+        PropertyOutcome::Failed { inputs, .. } => {
+            assert_eq!(format!("{}", inputs[0].1), "(0, 0)", "not shrunk: {inputs:?}");
+        }
+        PropertyOutcome::Passed(_) => panic!("this property cannot hold"),
+    }
+
+    let grasm_syntax::ast::Decl::Test(list) = &program.files[0].module.decls[1] else {
+        panic!("expected the list property second");
+    };
+    match interp.run_property(&list.params, &list.body, &TestOptions::default()) {
+        PropertyOutcome::Failed { inputs, .. } => {
+            assert_eq!(format!("{}", inputs[0].1), "[0, 0]", "not shrunk: {inputs:?}");
+        }
+        PropertyOutcome::Passed(_) => panic!("this property cannot hold"),
+    }
 }

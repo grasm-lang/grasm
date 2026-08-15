@@ -167,6 +167,12 @@ one place the three ways of running a program differ in what reaches stderr,
 which is why `scripts/agreetest.sh` strips the trace block and compares
 everything else exactly.
 
+A bundle's frames name files by their *basename* — `app.gr:4:5`, not the
+directory the build happened in, which names nothing on the machine running
+the binary. Every frame is spelled that way, the entry file included: it alone
+read `<bundled>` while its imports read `helper.gr`, so one trace named the
+same kind of thing two ways and one of them was not a file.
+
 **[E-RECURSION-PARALLEL]** The bound above holds inside `par_map` and
 `par_filter` too. A worker runs on its own stack, and it must be big enough for
 the same guarantee — a worker on the platform's default stack computed its
@@ -467,9 +473,28 @@ string shrinks its characters toward `a` once it can no longer lose any, since
 `s = "🙂/🙂"` is length-minimal and tells a reader nothing about the property
 that rejected it.
 
+Parts that have to agree shrink together. Replacing one at a time is greedy,
+and greedy cannot cross a failure the parts share: a property false only when
+two components are equal reported `(107, 107)`, because `(0, 107)` and
+`(107, 0)` both hold, so every single step landed on a passing value and the
+search stopped at whatever the generator produced. The candidate list starts
+with every part replaced at once, which reaches `(0, 0)` in one step.
+
 **[E-TEST-SEED]** Generation is driven entirely by a seed. The same seed and
 case count reproduce the same run exactly, and a failure reports the seed that
 found it.
+
+The default seed is *fixed*, so running `grasm test` twice runs the same cases
+twice — a suite that passes does not become a suite that might not. Widening
+coverage is `--seed`, deliberately, not repetition.
+
+That makes the opening cases worth spending carefully, so the first ten walk
+the boundary lists in order rather than drawing from them: every `i64` in
+`0 1 -1 2 -2 10 100 i64::MIN i64::MAX i64::MIN+1`, every `f64` in the list
+[E-TEST-PROPERTY] names, both `bool`s, and the empty string. Drawn at random
+each was only *likely*: `2` first appeared at case 138 of the default seed,
+and the default run is 100 cases, so `assert(n != 2)` passed — a property
+false at a value the generator names on purpose, reported as holding.
 
 **[E-BENCH-WARMUP]** A benchmark body runs once before timing starts. A body
 that panics is reported as a failure instead of a measurement.

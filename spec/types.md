@@ -69,6 +69,14 @@ initializer unless annotated. Function signatures are never inferred —
 parameter and return types are always written explicitly, which keeps
 inference local and errors near their cause.
 
+A closure's body waits for its call sites ([T-FN-TYPE]), so what it returns is
+not settled where it is written — and a *field read* of that result asked
+before the block ended, and was told ``_` has no field `c``: a type no program
+can write, about a value the same block infers perfectly well. Every other use
+of the identical call worked, so the refusal turned on which use came first.
+The read waits with the body; a receiver still unknown when the block ends is
+genuinely unknown, and is refused then with the type it does have.
+
 **[T-INT-TO-FLOAT]** An integer *literal* is accepted where `f64` is expected
 and is converted at compile time. A non-literal `i64` value is not implicitly
 converted; use `.as_f64()`.
@@ -164,6 +172,13 @@ fallible field, a sum variant carrying one. A named type holds values like any
 other container. [T-FALLIBLE-VALUE] keeping the failures in the list is what makes them
 readable — while somebody reads them.
 
+`main` is not an exception to that half. Its open error slot ([E-MAIN-ERR])
+carries *one* failure, so a directly fallible tail there is propagated rather
+than discarded — but a container of them is not, and the whole rule was
+skipped for `main` on the strength of the slot. `fn main() { xs.map(risky) }`
+threw away every failure it held: silent, exit 0. Adding any line after it
+caught the identical expression, so the silence depended only on position.
+
 **[T-FALLIBLE-COALESCE]** `e ?? d` where `e : T ! E` yields the value or `d`,
 the same shape `??` has over an `Option` ([E-COALESCE-LAZY] applies equally:
 `d` is evaluated only on failure). Absence and failure are different things,
@@ -203,6 +218,13 @@ type Failure = | NotFound(key: str) | Cycle(path: [str])
 
 which matches exhaustively, carries the same information, and is checked the
 same way everywhere.
+
+`NotFound` is also a variant of the prelude's `IoError`, and a variant name
+shared by two types has to be *constructed* qualified: `fail(Failure.NotFound(k))`,
+not `fail(NotFound(k))`. Reading one does not — `Err(NotFound(k))` in a match
+arm already knows which type it is matching, because the scrutinee says so.
+The example is written with the collision on purpose: it is the name anybody
+reaches for first.
 
 **[T-FAIL]** `fail(e)` raises the error branch. Its type fits any context, and
 it is a compile error where no error type is declared.
@@ -334,6 +356,20 @@ row `/ {io, E}` is an upper bound: performing an effect outside it is an error.
 **[T-EFFECT-BUILTIN]** `io` is performed by `print` and the filesystem
 builtins. `async` is performed by `parallel`/`spawn`. Both are discharged by
 the runtime at `main` and in tests.
+
+**[T-EFFECT-RESERVED]** `io`, `async` and `unsafe` may not be declared as
+effects. They are capabilities the runtime discharges, not effects a program
+handles — there is no `with io handled_by`, the same point [T-UNSAFE-FFI]
+makes for `unsafe`.
+
+`unsafe` is a keyword, so it never parsed. The other two are not, so
+`effect io { … }` did — and the `with io handled_by …` it then made available
+discharged the *builtin* `io` for everything in the block. A function
+declaring `/ {}` printed, `par_map` ran a printing function on several cores
+past [T-PAR-MAP-PURE], and a dependency declaring `capabilities = []` read and
+wrote files while `grasm deps` certified it as performing nothing. A
+capability ceiling one declaration away from meaningless is not a ceiling; a
+package may not write away the word that constrains it.
 
 **[T-EFFECT-DISCHARGE]** `with E handled_by h { … }` discharges `E` inside the
 block. Any user effect still outstanding at `main` or in a test is an error.
@@ -523,6 +559,14 @@ empty ok half changes nothing about where the failure has to be handled
 one a compiled backend is most likely to get wrong, because the value it
 merges the two halves through does not exist.
 
+An effect operation declared `-> () ! E` is the same shape one hop further
+out, and the position with no arm for it at all: a handler whose body gives
+the bare `()` half in one branch and `fail(e)` in the other produced no value,
+and the lifted body returned a null pointer typed as a fallible. The build
+succeeded and the program died with SIGSEGV and nothing on stderr — the one
+outcome §11 promises cannot happen, since a backend that cannot compile
+something names it at build time.
+
 **[T-DIVERGE]** `return`, `break` and `continue` produce no value, so they do
 not have to agree with one: an `if` branch or a match arm that ends in one is
 compatible with any other branch's type. This is what makes `0 -> return
@@ -666,6 +710,15 @@ exists — and `rs[0].v = 5` typechecked and then panicked `cannot access field
 mutability is not the question either, for the same reason the root's is not:
 a `[ref N]` parameter cannot be declared `var` at all, so the demand had no
 answer.
+
+*Anywhere* means through more than one, too. A graph edge is a reference held
+by a node that is itself reached through one, so `a.out[0].name = "B!"` — and
+every write that closes a cycle — crosses two. The write descended into one
+slab entry and panicked with the same message the moment it met the next, so a
+node holding a reference to a node was still write-once, which is every graph
+the tier exists for. A path is now followed reference by reference, each one
+checked for staleness as it is crossed, up to a bound no hand-written path
+reaches.
 
 **[T-REF-CAPTURE]** A captured `ref` may be written through inside a closure.
 [T-CAPTURE-WRITE] refuses writing to a captured binding because a closure

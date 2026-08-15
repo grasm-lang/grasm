@@ -144,6 +144,18 @@ fn main() {
     }
 }'
 
+expect_refused "an effect handler as a parameter type" 'effect Log {
+    fn info(m: str)
+}
+fn run(h: LogHandler) / {io} {
+    with Log handled_by h {
+        Log.info("x")
+    }
+}
+fn main() {
+    run(LogHandler{ info: |m| print("{m}") })
+}'
+
 # Not a shape anyone writes on purpose, but the build used to run until it was
 # killed — no diagnostic, unbounded memory — where every other gap here is a
 # refusal by name at build time.

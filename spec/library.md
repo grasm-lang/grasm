@@ -35,6 +35,14 @@ the same number: `exit(-1)` is 255 and `exit(256)` is 0. Clamping to 0..=255
 instead was worse in the direction that matters — it made `exit(-1)`, the most
 common spelling of "fail" in a script, report *success*.
 
+`exit` performs no effect, so a dependency declaring `capabilities = []` can
+end the host process. That is deliberate and worth stating: `panic` and an
+endless loop already do the same, and a ceiling has never claimed to bound how
+long a dependency runs or whether it returns — only what it can *reach*.
+Nothing observable outside the process changes, so charging `io` for it would
+buy no guarantee while making every program that reports a status ask for the
+filesystem.
+
 **[L-LIB-IO]** The three ways a library call reports "no": `read_file` is
 **fallible** (`str ! IoError`) because a failure has a reason worth reading —
 `NotFound(path)`, and so on. `env` returns `Option[str]`, because an unset

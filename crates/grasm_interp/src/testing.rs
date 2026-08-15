@@ -85,11 +85,39 @@ const INTERESTING_CHARS: &[char] = &[
 /// Integers that sit on the boundaries where arithmetic tends to go wrong.
 const INTERESTING_INTS: &[i64] = &[0, 1, -1, 2, -2, 10, 100, i64::MIN, i64::MAX, i64::MIN + 1];
 
+/// Floats worth throwing at arithmetic: both zeros, both infinities, NaN, the
+/// subnormal boundary and the extremes.
+const INTERESTING_FLOATS: &[f64] = &[
+    0.0,
+    -0.0,
+    1.0,
+    -1.0,
+    f64::INFINITY,
+    f64::NEG_INFINITY,
+    f64::NAN,
+    f64::MIN_POSITIVE,
+    f64::MAX,
+    f64::MIN,
+];
+
+/// How many of a run's cases walk the boundary lists in order before the
+/// random mix takes over.
+///
+/// Drawing boundary values at random makes each one *likely*, not certain,
+/// and the default seed is fixed — so a value the list names on purpose could
+/// be absent from every run anyone would ever make. `2` was: it took 138
+/// cases to appear, and the default run is 100. Walking the lists first costs
+/// ten cases and turns "usually tried" into "always tried".
+const BOUNDARY_CASES: u32 = 10;
+
 /// Generates a value of the type `te` describes.
 ///
 /// `size` grows with the case number so early cases are small (and shrink
 /// reports stay readable) while later ones stress bigger inputs.
-pub fn generate(rng: &mut Rng, te: &TypeExpr, size: u32) -> Value {
+/// `boundary` is `Some(i)` for the first cases of a run: the scalar is taken
+/// from the boundary list at that index rather than drawn, so every value in
+/// the list is certain to be tried. Later cases pass `None`.
+pub fn generate(rng: &mut Rng, te: &TypeExpr, size: u32, boundary: Option<usize>) -> Value {
     match te {
         // A `ref T` names a slot in the shared heap, and inventing one would
         // mean inventing the object graph it points into. Rejected as a
@@ -108,25 +136,34 @@ pub fn generate(rng: &mut Rng, te: &TypeExpr, size: u32) -> Value {
         TypeExpr::Fn { .. } | TypeExpr::Fallible(..) => Value::Unit,
         TypeExpr::List(inner, _) => {
             let n = rng.below(u64::from(size).min(32) + 1) as usize;
-            let items = (0..n).map(|_| generate(rng, inner, size)).collect();
+            let items = (0..n)
+                .map(|i| generate(rng, inner, size, boundary.map(|b| b + i)))
+                .collect();
             list_of(items)
         }
         TypeExpr::Tuple(items, _) => {
             Value::Tuple(Rc::new(
-                items.iter().map(|t| generate(rng, t, size)).collect(),
+                items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| generate(rng, t, size, boundary.map(|b| b + i)))
+                    .collect(),
             ))
         }
         TypeExpr::Union(items, _) => match items.first() {
-            Some(t) => generate(rng, t, size),
+            Some(t) => generate(rng, t, size, boundary),
             None => Value::Unit,
         },
         TypeExpr::Name { path, args, .. } => {
             let name = path.dotted();
             match name.as_str() {
                 "i64" => Value::Int({
-                    // One case in four is a boundary value; the rest are
-                    // spread over a range that widens with `size`.
-                    if rng.below(4) == 0 {
+                    // The first cases walk the boundary list; after that one
+                    // case in four is a boundary value and the rest are spread
+                    // over a range that widens with `size`.
+                    if let Some(i) = boundary {
+                        INTERESTING_INTS[i % INTERESTING_INTS.len()]
+                    } else if rng.below(4) == 0 {
                         INTERESTING_INTS[rng.below(INTERESTING_INTS.len() as u64) as usize]
                     } else {
                         let span = i64::from(size).saturating_mul(8).max(16);
@@ -134,7 +171,9 @@ pub fn generate(rng: &mut Rng, te: &TypeExpr, size: u32) -> Value {
                     }
                 }),
                 "f64" => {
-                    if rng.below(8) == 0 {
+                    if let Some(i) = boundary {
+                        Value::Float(INTERESTING_FLOATS[i % INTERESTING_FLOATS.len()])
+                    } else if rng.below(8) == 0 {
                         // NaN is in the list. It was not, so a property over
                         // `f64` never saw the one value `[L-LIB-SORT-NAN]`
                         // and the NaN clause of [E-EQ-STRUCTURAL] exist for —
@@ -143,18 +182,8 @@ pub fn generate(rng: &mut Rng, te: &TypeExpr, size: u32) -> Value {
                         // never a NaN. Subnormals and the extremes are here
                         // for the same reason.
                         Value::Float(
-                            [
-                                0.0f64,
-                                -0.0,
-                                1.0,
-                                -1.0,
-                                f64::INFINITY,
-                                f64::NEG_INFINITY,
-                                f64::NAN,
-                                f64::MIN_POSITIVE,
-                                f64::MAX,
-                                f64::MIN,
-                            ][rng.below(10) as usize],
+                            INTERESTING_FLOATS
+                                [rng.below(INTERESTING_FLOATS.len() as u64) as usize],
                         )
                     } else {
                         let scale = f64::from(size).max(1.0);
@@ -162,8 +191,22 @@ pub fn generate(rng: &mut Rng, te: &TypeExpr, size: u32) -> Value {
                         Value::Float((unit * 2.0 - 1.0) * scale)
                     }
                 }
-                "bool" => Value::Bool(rng.bool()),
+                "bool" => Value::Bool(match boundary {
+                    Some(i) => i % 2 == 0,
+                    None => rng.bool(),
+                }),
                 "str" => {
+                    // The first cases are the empty string and one interesting
+                    // character each, so the empty case and the multi-byte
+                    // ones are tried rather than merely likely.
+                    if let Some(i) = boundary {
+                        return match i {
+                            0 => Value::str(String::new()),
+                            _ => Value::str(
+                                INTERESTING_CHARS[(i - 1) % INTERESTING_CHARS.len()].to_string(),
+                            ),
+                        };
+                    }
                     let n = rng.below(u64::from(size).min(24) + 1) as usize;
                     let s: String = (0..n)
                         .map(|_| INTERESTING_CHARS[rng.below(INTERESTING_CHARS.len() as u64) as usize])
@@ -174,7 +217,7 @@ pub fn generate(rng: &mut Rng, te: &TypeExpr, size: u32) -> Value {
                     // `None` stays common so the empty case is well covered.
                     match args.first() {
                         Some(inner) if rng.below(4) != 0 => {
-                            Value::some(generate(rng, inner, size))
+                            Value::some(generate(rng, inner, size, boundary))
                         }
                         _ => Value::none(),
                     }
@@ -268,6 +311,13 @@ fn shrink(v: &Value) -> Vec<Value> {
                 c.remove(i);
                 out.push(list_of(c));
             }
+            // Every element at once, keeping the length. One at a time cannot
+            // move off a failure the elements share — a property false only
+            // when two of them are equal stayed at whatever the generator
+            // produced, because changing either alone made it hold.
+            if let Some(together) = all_at_once(items) {
+                out.push(list_of(together));
+            }
             // Then shrink elements in place, keeping the length.
             for i in 0..items.len() {
                 for smaller in shrink(&items[i]) {
@@ -280,6 +330,14 @@ fn shrink(v: &Value) -> Vec<Value> {
         }
         Value::Tuple(items) => {
             let mut out = Vec::new();
+            // Every component at once, for the same reason: `(107, 107)`
+            // failing a "these differ" property shrank to nothing at all,
+            // because `(0, 107)` and `(107, 0)` both hold. The reported
+            // counterexample was whatever pair the generator happened to
+            // produce, which [E-TEST-SHRINK] exists to avoid.
+            if let Some(together) = all_at_once(items) {
+                out.push(Value::Tuple(Rc::new(together)));
+            }
             for i in 0..items.len() {
                 for smaller in shrink(&items[i]) {
                     let mut c = items.as_ref().clone();
@@ -302,6 +360,27 @@ fn shrink(v: &Value) -> Vec<Value> {
         }
         _ => vec![],
     }
+}
+
+/// Each part replaced by its most aggressive shrink at once, or `None` if
+/// nothing in it can shrink.
+///
+/// Component-wise shrinking is greedy, and greedy cannot cross a failure the
+/// parts share: every single-part step lands on a passing value, so the search
+/// stops at whatever the generator produced.
+fn all_at_once(items: &[Value]) -> Option<Vec<Value>> {
+    let mut any = false;
+    let out: Vec<Value> = items
+        .iter()
+        .map(|v| match shrink(v).into_iter().next() {
+            Some(smaller) => {
+                any = true;
+                smaller
+            }
+            None => v.clone(),
+        })
+        .collect();
+    any.then_some(out)
 }
 
 /// Total shrink attempts allowed, so a pathological property cannot hang the
@@ -494,9 +573,18 @@ impl<W: Write> Interp<'_, W> {
         for case in 0..opts.cases {
             // Size ramps from 1 to ~50 over the run.
             let size = 1 + case / 2;
+            // The opening cases walk the boundary lists in order, so every
+            // value they name is tried in every run.
+            let boundary = (case < BOUNDARY_CASES).then_some(case as usize);
             let inputs: Vec<(String, Value)> = params
                 .iter()
-                .map(|p| (p.name.name.clone(), generate(&mut rng, &p.ty, size)))
+                .enumerate()
+                .map(|(i, p)| {
+                    (
+                        p.name.name.clone(),
+                        generate(&mut rng, &p.ty, size, boundary.map(|b| b + i)),
+                    )
+                })
                 .collect();
             if let Some(message) = self.try_case(&inputs, body) {
                 let (inputs, message) = self.shrink_failure(inputs, message, body);

@@ -1,0 +1,25 @@
+//! tag: T-EFFECT-RESERVED
+//! expect: error
+//! effect name `io` is reserved by the language
+// A capability the runtime discharges is not an effect a program handles.
+//
+// `io` and `async` are not keywords, so this parsed — and the
+// `with io handled_by ...` it made available discharged the *builtin* `io`
+// for everything in the block. This function's declared row is empty and it
+// printed; the same trick let `par_map` run a printing function on several
+// cores, and let a dependency declaring `capabilities = []` read and write
+// files while `grasm deps` certified it as performing nothing.
+effect io {
+    fn nothing() -> i64
+}
+
+fn quiet(n: i64) -> i64 / {} {
+    with io handled_by ioHandler{ nothing: || 1 } {
+        print("a declared-empty row printed")
+    }
+    n
+}
+
+fn main() {
+    print("{quiet(1)}")
+}

@@ -347,6 +347,23 @@ fn run() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             }
+            // The output's directory has to exist. Left to the step that
+            // writes, a bundle reported a bare `No such file or directory
+            // (os error 2)` naming nothing, and a native build surfaced four
+            // lines of the linker's own words — including grasm's temporary
+            // object file, a path with no meaning outside this process.
+            if let Some(dir) = std::path::Path::new(&out_path)
+                .parent()
+                .filter(|d| !d.as_os_str().is_empty())
+            {
+                if !dir.is_dir() {
+                    eprintln!(
+                        "error: cannot write `{out_path}`: `{}` is not a directory",
+                        dir.display()
+                    );
+                    return ExitCode::FAILURE;
+                }
+            }
             // An output that *is* an input is a destroyed source file:
             // `grasm build x.gr -o x.gr` reported success and left a 10 MB
             // executable where the program used to be.
@@ -1196,6 +1213,15 @@ struct Bundle {
     deps: Vec<String>,
     /// (importing module, written path) → the module name the build chose.
     imports: Vec<(String, String, String)>,
+    /// The entry file's name, for the stack trace a panic prints.
+    ///
+    /// Every other module's frames are labelled from its module name, so an
+    /// imported `helper` printed `helper.gr:2:5` while the entry printed
+    /// `<bundled>:5:5` — the same trace naming the same kind of thing two
+    /// ways, one of which is not a file. Only the basename is kept: the
+    /// directory the build happened in is not something a distributed binary
+    /// should carry, and it names nothing on the machine running it.
+    entry: Option<String>,
 }
 
 fn read_own_bundle() -> Option<Bundle> {
@@ -1262,10 +1288,18 @@ fn parse_bundle(data: &[u8]) -> Option<Bundle> {
             imports.push((m, a, t));
         }
     }
+    // Older payloads stop before this, as they did before `imports`.
+    let entry = read_u32(&mut pos).and_then(|len| {
+        let len = len as usize;
+        let out = String::from_utf8(payload.get(pos..pos + len)?.to_vec()).ok()?;
+        pos += len;
+        Some(out)
+    });
     Some(Bundle {
         files,
         deps,
         imports,
+        entry,
     })
 }
 
@@ -1311,6 +1345,19 @@ fn write_bundle(program: &Program, out_path: &str) -> Result<u64, String> {
             payload.extend(part.as_bytes());
         }
     }
+    // The entry file's basename, so its frames read like every other module's.
+    let entry = program
+        .files
+        .first()
+        .map(|f| {
+            std::path::Path::new(&f.path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| f.path.clone())
+        })
+        .unwrap_or_default();
+    payload.extend((entry.len() as u32).to_le_bytes());
+    payload.extend(entry.as_bytes());
     let payload_len = payload.len() as u64;
     data.extend(payload);
     data.extend(payload_len.to_le_bytes());
@@ -1343,9 +1390,10 @@ fn run_bundle(bundle: &Bundle, program_args: &[String]) -> ExitCode {
         .iter()
         .map(|(m, a, t)| ((m.clone(), a.clone()), t.clone()))
         .collect();
+    let entry_display = bundle.entry.clone().unwrap_or_else(|| "main.gr".to_string());
     let program = loader::load_with_resolved_imports(
         "main",
-        "<bundled>",
+        &entry_display,
         &provider,
         &|_| Vec::new(),
         &deps,
@@ -1630,12 +1678,21 @@ fn build_native_incremental(
                     .join(", ")
             ));
         }
-        // Something else went wrong; the linker's own words are all there is.
-        let detail = text.trim();
+        // Something else went wrong; the linker's own words are all there
+        // is — minus the lines that name grasm's own scratch directory, which
+        // exists for the length of this process and tells a reader nothing
+        // except that the toolchain has internals.
+        let scratch_str = scratch.to_string_lossy().into_owned();
+        let detail = text
+            .lines()
+            .filter(|l| !l.contains(&scratch_str))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let detail = detail.trim();
         if detail.is_empty() {
-            return Err("linking failed".into());
+            return Err(format!("linking `{out_path}` failed"));
         }
-        return Err(format!("linking failed:\n{detail}"));
+        return Err(format!("linking `{out_path}` failed:\n{detail}"));
     }
     let size = std::fs::metadata(out_path).map_err(|e| e.to_string())?.len();
     Ok(size)
