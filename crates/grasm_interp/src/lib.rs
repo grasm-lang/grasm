@@ -348,9 +348,15 @@ fn run_doc_examples(
         let ganalysis = grasm_sema::check::check_program(&grouped);
         gdiags.extend(ganalysis.diagnostics.clone());
         if gdiags.is_empty() {
-            for e in group {
-                let (ok, h) = run_one_example(&grouped, &ganalysis, &e.owner, out, coverage);
-                hits.extend(h);
+            // One interpreter for the whole group. Building one per example
+            // registers the module's declarations — its other examples
+            // included — once per example, which made `grasm test` quadratic
+            // in the number of documented items: 8,000 of them took 7.7 s
+            // where the same count of plain `test` blocks took 0.13 s.
+            let names: Vec<String> = group.iter().map(|e| e.owner.clone()).collect();
+            let (oks, h) = run_examples_together(&grouped, &ganalysis, &names, out, coverage);
+            hits.extend(h);
+            for ok in oks {
                 if ok {
                     passed += 1;
                 } else {
@@ -395,6 +401,73 @@ fn run_example_alone(
     } else {
         (0, 1, hits)
     }
+}
+
+/// Runs every named test a synthesized program holds, in one interpreter.
+///
+/// Each test's own report line is relabelled as a doc example, so the output
+/// is what running them one at a time produced.
+fn run_examples_together(
+    ex_program: &grasm_sema::loader::Program,
+    analysis: &grasm_sema::check::Analysis,
+    wanted: &[String],
+    out: &mut impl Write,
+    coverage: bool,
+) -> (Vec<bool>, std::collections::BTreeSet<u32>) {
+    let mut hits: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    let entry = &ex_program.files[0].module;
+    let files: Vec<(String, &Module, std::collections::HashMap<String, String>)> = ex_program
+        .files
+        .iter()
+        .map(|f| (f.name.clone(), &f.module, f.imports.clone()))
+        .collect();
+    let mut oks = Vec::with_capacity(wanted.len());
+    let mut buf = Vec::new();
+    {
+        let mut interp = Interp::new_program(&files, &mut buf);
+        interp.set_float_literals(analysis.float_literals.clone());
+        interp.set_fallible_closures(analysis.fallible_closures.clone());
+        interp.set_float_sums(analysis.float_sums.clone());
+        if coverage {
+            interp.enable_coverage();
+        }
+        for name in wanted {
+            let quoted = name.replace('"', "'");
+            let found = entry
+                .decls
+                .iter()
+                .find(|d| matches!(d, grasm_syntax::ast::Decl::Test(t) if t.name == quoted));
+            match found {
+                Some(grasm_syntax::ast::Decl::Test(t)) => oks.push(interp.run_unit_test(t)),
+                _ => oks.push(false),
+            }
+        }
+        if let Some(h) = interp.take_coverage() {
+            hits.extend(h);
+        }
+    }
+    // One report line per test, in the order they were run.
+    let report = String::from_utf8_lossy(&buf);
+    let mut lines = report.lines();
+    for (name, ok) in wanted.iter().zip(&oks) {
+        match lines.next() {
+            Some(line) => {
+                let detail = line
+                    .split_once("... ")
+                    .map(|(_, rest)| rest.trim_end().to_string())
+                    .unwrap_or_default();
+                let _ = writeln!(out, "doc example {name} ... {detail}");
+            }
+            None => {
+                let _ = writeln!(
+                    out,
+                    "doc example {name} ... {}",
+                    if *ok { "ok" } else { "FAILED: no test" }
+                );
+            }
+        }
+    }
+    (oks, hits)
 }
 
 /// Runs the test a synthesized program holds under `wanted`.

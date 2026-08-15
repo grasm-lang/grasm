@@ -993,3 +993,80 @@ fn a_qualified_function_value_keeps_its_row() {
     let (code, out) = run(&["check", ok.to_str().unwrap()]);
     assert_eq!(code, 0, "{out}");
 }
+
+/// A dependency's `entry` outside its own package is refused before the file
+/// is opened.
+///
+/// The loader read the field directly and so opened the outside file first,
+/// quoting a line of it into the diagnostic — a dependency could point at any
+/// file the build user can read and have its contents echoed.
+#[test]
+fn an_entry_outside_the_package_is_not_read() {
+    let w = Work::new("entryleak");
+    std::fs::create_dir_all(w.0.join("secrets")).unwrap();
+    std::fs::write(
+        w.0.join("secrets/creds.env"),
+        "AWS_SECRET_ACCESS_KEY=hunter2-do-not-share\n",
+    )
+    .unwrap();
+    let secret = w.0.join("secrets/creds.env");
+    w.package(
+        "lib",
+        &format!(
+            "[package]\nname = \"lib\"\nversion = \"0.1.0\"\nentry = \"{}\"\n",
+            secret.display()
+        ),
+        "pub fn f() -> i64 {\n    1\n}\n",
+    );
+    let app = w.package(
+        "app",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\ncapabilities = [\"io\"]\n\n[dependencies.lib]\npath = \"../lib\"\n",
+        "import lib\n\nfn main() {\n    print(\"{lib.f()}\")\n}\n",
+    );
+    let (code, out) = run(&["check", &app_entry(&app)]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("must be a path inside the package"), "{out}");
+    assert!(
+        !out.contains("hunter2"),
+        "the file's contents must not reach the diagnostic:\n{out}"
+    );
+    // And the message is one line of prose, not Rust's source indentation.
+    assert!(!out.contains("  \n") && !out.contains("—       "), "{out}");
+}
+
+/// A deep package chain builds natively: the incremental cache names an
+/// object by a digest, not by every package between it and the entry.
+#[test]
+fn a_deep_package_chain_builds_natively() {
+    let w = Work::new("longname");
+    let n = 10;
+    for i in 0..n {
+        let name = format!("acme_pkg_component_{i}");
+        let mut manifest =
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\ncapabilities = []\n");
+        let src = if i + 1 < n {
+            let next = format!("acme_pkg_component_{}", i + 1);
+            manifest.push_str(&format!("\n[dependencies.{next}]\npath = \"../{next}\"\n"));
+            format!("import {next}\n\npub fn v() -> i64 {{\n    {i} + {next}.v()\n}}\n")
+        } else {
+            format!("pub fn v() -> i64 {{\n    {i}\n}}\n")
+        };
+        w.package(&name, &manifest, &src);
+    }
+    let app = w.package(
+        "app",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\ncapabilities = [\"io\"]\n\n[dependencies.acme_pkg_component_0]\npath = \"../acme_pkg_component_0\"\n",
+        "import acme_pkg_component_0\n\nfn main() {\n    print(\"{acme_pkg_component_0.v()}\")\n}\n",
+    );
+    let bin = w.0.join("chained");
+    let (code, out) = run(&[
+        "build",
+        &app_entry(&app),
+        "--native",
+        "-o",
+        bin.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{out}");
+    let got = Command::new(&bin).output().expect("runs");
+    assert_eq!(String::from_utf8_lossy(&got.stdout).trim(), "45");
+}

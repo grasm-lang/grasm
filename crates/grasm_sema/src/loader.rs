@@ -801,5 +801,17 @@ fn package_entry(dir: &std::path::Path) -> std::path::PathBuf {
                 })
         })
         .unwrap_or_else(|| "src/main.gr".to_string());
+    // A package's sources are the files under its own directory. An `entry`
+    // reaching outside it is refused where the manifest is parsed — but this
+    // loader reads the field directly, so it opened the outside file first
+    // and quoted a line of it into a diagnostic. A dependency could point at
+    // any file the build user can read and have its contents echoed.
+    let p = std::path::Path::new(&entry);
+    if p.is_absolute()
+        || p.components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return dir.join("src/main.gr");
+    }
     dir.join(entry)
 }

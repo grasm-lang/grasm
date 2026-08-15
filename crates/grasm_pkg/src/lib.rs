@@ -201,7 +201,9 @@ impl Manifest {
                 .any(|c| matches!(c, std::path::Component::ParentDir))
             {
                 return Err(format!(
-                    "`entry` must be a path inside the package: `{entry}` leaves it with `..` —                      the lockfile checksums, the capability ceiling and `grasm publish` all                      cover this package's own directory, and a file outside it is in none of them"
+                    "`entry` must be a path inside the package: `{entry}` leaves it with \
+`..` — the lockfile checksums, the capability ceiling and `grasm publish` all cover this \
+package's own directory, and a file outside it is in none of them"
                 ));
             }
         }

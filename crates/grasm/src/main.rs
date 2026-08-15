@@ -1513,10 +1513,17 @@ fn build_native_incremental(
             .enumerate()
             .map(|(i, f)| {
                 let key = module_cache_key(program, i, &world);
-                (
-                    f.name.clone(),
-                    cache.join(format!("{}-{key}.o", f.name.replace('.', "_"))),
-                )
+                // The readable half is a convenience; `key` is what makes the
+                // name unique. A module's qualified name carries every
+                // package between it and the entry, so ten ordinary packages
+                // with ordinary names produced a 248-character file name and
+                // the build died on `File name too long (os error 63)` —
+                // naming no package and not mentioning `--no-incremental`.
+                let mut label = f.name.replace('.', "_");
+                if label.len() > 40 {
+                    label.truncate(40);
+                }
+                (f.name.clone(), cache.join(format!("{label}-{key}.o")))
             })
             .collect();
 
