@@ -330,9 +330,11 @@ element, which is where a list of structs gets its order from — `sort` needs
 the *elements* ordered, and a struct is not. The key must be `i64`, `f64` or
 `str`. The sort is stable: elements with equal keys stay in the order they
 were written. It sorts **ascending**, always; descending is
-`xs.sort_by(k)` followed by `xs.rev()`. Negating the key works for a number
-and has no counterpart for a `str`, so the reversal is the general answer and
-the one to reach for.
+`xs.sort_by(k)` followed by `xs = xs.rev()`. Negating the key works for a
+number and has no counterpart for a `str`, so the reversal is the general
+answer and the one to reach for. The assignment is the whole point: `sort_by`
+mutates and `rev` answers with a new list, so the clause's earlier wording —
+`xs.rev()` on its own line — left the list ascending and said nothing.
 
 **[L-LIB-PAIRS]** `xs.enumerate()` pairs each element with its index and
 `xs.zip(ys)` pairs the two lists positionally, stopping at the shorter — there

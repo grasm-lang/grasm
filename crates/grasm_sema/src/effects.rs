@@ -17,6 +17,20 @@ pub const IO: &str = "io";
 pub const UNSAFE: &str = "unsafe";
 pub const ASYNC: &str = "async";
 
+/// Whether a bare name is one of the language's own, rather than something a
+/// program could have bound.
+fn is_builtin_name(name: &str) -> bool {
+    IO_BUILTINS.contains(&name)
+        || matches!(
+            name,
+            "len" | "map" | "filter" | "fold" | "any" | "all" | "find" | "sort" | "sort_by"
+                | "push" | "pop" | "remove" | "set" | "get" | "has" | "delete" | "keys"
+                | "values" | "entries" | "par_map" | "par_filter" | "range" | "list" | "map_new"
+                | "exit" | "panic" | "assert" | "assert_eq" | "ref" | "release" | "alive"
+                | "Some" | "None" | "Ok" | "Err" | "fail" | "try" | "pi" | "e"
+        )
+}
+
 const IO_BUILTINS: &[&str] = &[
     "print",
     "read_file",
@@ -1459,6 +1473,16 @@ enum FnSource<'a> {
 #[derive(Default)]
 struct FnBindings<'a> {
     by_name: HashMap<String, Vec<FnSource<'a>>>,
+    /// Every name the body binds, and the offset it comes into scope at.
+    ///
+    /// A local shadows a function of the same name, and only this pass
+    /// disagreed: `fn bump(shout: i64) / {}` was charged the row of a
+    /// same-module `fn shout` it never mentions — which broke a
+    /// `capabilities = []` package in every consumer over one parameter's
+    /// spelling. Parameters are in scope for the whole body, so they are
+    /// recorded at 0; a `let` shadows only what follows it, which is why the
+    /// offset is kept rather than a bare set.
+    bound_at: HashMap<String, u32>,
     /// Every function value the body mentions anywhere. Used when a callee
     /// cannot be pinned to one binding: over-approximating there is the whole
     /// point, since under-approximating is what let effects escape.
@@ -1474,6 +1498,18 @@ impl<'a> FnBindings<'a> {
     /// charge every `i64` local for whatever the body happens to hold.
     fn knows(&self, name: &str) -> bool {
         self.by_name.contains_key(name)
+    }
+
+    /// Whether a mention at this offset is inside a local of that name.
+    fn shadowed(&self, name: &str, at: u32) -> bool {
+        self.bound_at.get(name).is_some_and(|from| at >= *from)
+    }
+
+    fn bind_name(&mut self, name: &str, at: u32) {
+        let slot = self.bound_at.entry(name.to_string()).or_insert(at);
+        if at < *slot {
+            *slot = at;
+        }
     }
 
     fn sources_for(&self, name: &str) -> &[FnSource<'a>] {
@@ -1741,10 +1777,75 @@ fn carried_row(
 /// row instead of to nothing.
 fn seed_params<'a>(params: &[Param], fnb: &mut FnBindings<'a>) {
     for p in params {
+        // A parameter is in scope for the whole body, so it shadows a
+        // function of the same name everywhere in it.
+        fnb.bind_name(&p.name.name, 0);
         if let Some(row) = declared_row(&p.ty) {
             fnb.by_name
                 .insert(p.name.name.clone(), vec![FnSource::Declared(row)]);
         }
+    }
+}
+
+/// Every closure parameter in an expression, so a closure's own parameter
+/// shadows a function of that name inside it.
+///
+/// `[1, 2].par_map(|shout| shout * 2)` was charged the row of a same-module
+/// `fn shout` the closure never mentions, and the purity proof failed over
+/// one parameter's spelling.
+fn seed_closure_params(e: &Expr, fnb: &mut FnBindings<'_>) {
+    if let Expr::Closure { params, body, .. } = e {
+        for p in params {
+            fnb.bind_name(&p.name, body.span().start);
+        }
+    }
+    walk_exprs_shallow(e, &mut |inner| seed_closure_params(inner, fnb));
+}
+
+/// Every direct subexpression of `e`.
+fn walk_exprs_shallow(e: &Expr, f: &mut impl FnMut(&Expr)) {
+    match e {
+        Expr::Closure { body, .. } | Expr::Unary { expr: body, .. } | Expr::Try { expr: body, .. } => f(body),
+        Expr::Binary { lhs, rhs, .. } => {
+            f(lhs);
+            f(rhs);
+        }
+        Expr::Call { callee, args, .. } => {
+            f(callee);
+            for a in args {
+                f(a);
+            }
+        }
+        Expr::MethodCall { recv, args, .. } => {
+            f(recv);
+            for a in args {
+                f(a);
+            }
+        }
+        Expr::Field { recv, .. } => f(recv),
+        Expr::Index { recv, index, .. } => {
+            f(recv);
+            f(index);
+        }
+        Expr::List(items, _) | Expr::Tuple(items, _) => {
+            for i in items {
+                f(i);
+            }
+        }
+        Expr::Map(entries, _) => {
+            for (k, v) in entries {
+                f(k);
+                f(v);
+            }
+        }
+        Expr::Str(pieces, _) => {
+            for p in pieces {
+                if let StrPiece::Expr(i) = p {
+                    f(i);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1753,6 +1854,8 @@ fn collect_fn_bindings<'a>(b: &'a Block, ctx: &Ctx, current: &str, fnb: &mut FnB
     for stmt in &b.stmts {
         match stmt {
             Stmt::Let { name, init, .. } => {
+                fnb.bind_name(&name.name, name.span.start);
+                seed_closure_params(init, fnb);
                 let mut found = Vec::new();
                 fn_sources(init, ctx, current, &mut found);
                 if !found.is_empty() {
@@ -1761,6 +1864,7 @@ fn collect_fn_bindings<'a>(b: &'a Block, ctx: &Ctx, current: &str, fnb: &mut FnB
                 }
             }
             Stmt::For { var, iter, body, .. } => {
+                fnb.bind_name(&var.name, var.span.start);
                 // `for f in fs` where `fs` holds function values.
                 let mut found = Vec::new();
                 match iter {
@@ -1781,6 +1885,7 @@ fn collect_fn_bindings<'a>(b: &'a Block, ctx: &Ctx, current: &str, fnb: &mut FnB
             | Stmt::Parallel { body, .. }
             | Stmt::Spawn { body, .. }
             | Stmt::With { body, .. } => collect_fn_bindings(body, ctx, current, fnb),
+            Stmt::Expr(e) | Stmt::Return(Some(e), _) => seed_closure_params(e, fnb),
             _ => {}
         }
     }
@@ -1818,7 +1923,15 @@ fn indirect_row(
                     contribute(&qual, active, ctx, out);
                 }
             }
-            FnSource::Declared(row) => out.extend(row.iter().cloned()),
+            // Minus whatever a `with` around this mention has already
+            // discharged. Without that, `with Log … { let f: fn(str) -> ()
+            // / {Log} = shout }` charged `Log` to the enclosing function —
+            // inside the block that handles it, and where the direct call
+            // `shout("z")` and `["a"].map(shout)` both compile
+            // ([T-EFFECT-DISCHARGE]).
+            FnSource::Declared(row) => {
+                out.extend(row.iter().filter(|e| !active.contains(e)).cloned())
+            }
             FnSource::Closure(e) => {
                 // A closure has no name to guard recursion with, so its
                 // identity stands in for one.
@@ -2070,9 +2183,12 @@ fn walk_expr(
             // row, [T-PAR-MAP-PURE] one hop away from `par_map`'s own check,
             // [E-HANDLER-MISSING]'s "well-typed programs never reach" backstop,
             // and a package's `capabilities = []` ceiling.
-            if let Some(qual) = ctx.resolve_call(current, &id.name) {
-                contribute(&qual, active, ctx, out);
-            } else if fnb.knows(&id.name) {
+            if !fnb.shadowed(&id.name, id.span.start) {
+                if let Some(qual) = ctx.resolve_call(current, &id.name) {
+                    contribute(&qual, active, ctx, out);
+                }
+            }
+            if fnb.knows(&id.name) {
                 // A *local* holding a function value — most often a parameter
                 // whose type wrote the row. The direct call `f(x)` was
                 // charged and the mention was not, so handing the same `f` to
@@ -2122,10 +2238,18 @@ fn walk_expr(
                 }
                 if let Some(qual) = ctx.resolve_call(current, &id.name) {
                     contribute(&qual, active, ctx, out);
-                } else {
+                } else if fnb.knows(&id.name) || !is_builtin_name(&id.name) {
                     // A call through a name that is not a top-level function:
                     // a local holding a function value. Whatever that value
                     // may be, calling it performs what it performs.
+                    //
+                    // Not for a *builtin* — `print`, `map`, `len`. Those are
+                    // not locals, so the unknown-name fallback handed them
+                    // every function value the body binds: a handler literal
+                    // containing `print` was charged the row of an unrelated
+                    // `let f = shout` elsewhere in the same function, and
+                    // `main` was told it had an unhandled effect inside the
+                    // `with` that handles it ([T-EFFECT-DISCHARGE]).
                     indirect_row(&id.name, current, active, ctx, fnb, out);
                 }
             } else {

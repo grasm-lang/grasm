@@ -1,0 +1,21 @@
+//! tag: T-FN-TYPE-ROW-PARAM
+//! expect: error
+//! performs nothing, but this one performs `io`
+// A row in a parameter position is checked the other way round.
+//
+// `call` declares that it will be given a function performing nothing.
+// Checking the two rows covariantly with the result let a list of `/ {io}`
+// functions through, and `par_map` then ran the effect on several cores —
+// [T-PAR-MAP-PURE]'s "a compile error, not a race", reached by putting the
+// row in a parameter instead of in the callback.
+fn shout(n: i64) -> i64 / {io} {
+    print("side effect")
+    n
+}
+fn call(f: fn(i64) -> i64) -> i64 {
+    f(1)
+}
+fn main() {
+    let fs = [shout]
+    print("{fs.par_map(call)}")
+}

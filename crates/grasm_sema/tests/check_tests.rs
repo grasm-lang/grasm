@@ -1636,3 +1636,96 @@ fn an_extern_may_not_be_pub() {
         "extern fn sqrt(x: f64) -> f64\npub fn root(x: f64) -> f64 {\n    unsafe {\n        sqrt(x)\n    }\n}\nfn main() {\n    print(\"{root(16.0)}\")\n}\n",
     );
 }
+
+/// The tail of a `()`-returning function throws its value away, so a
+/// container of failures there is discarded ([T-FALLIBLE-UNHANDLED]).
+///
+/// The container rule was checked for statements only: adding one line after
+/// `paths.map(|p| write_file(p, body))` caught it and leaving it last did
+/// not — "wrote the report", exit 0, nothing on stderr, no file.
+#[test]
+fn a_unit_functions_tail_may_not_hold_failures() {
+    check_err(
+        "fn write_all(paths: [str], body: str) / {io} {\n    paths.map(|p| write_file(p, body))\n}\nfn main() {\n    write_all([\"/x/a.txt\"], \"hi\")\n}\n",
+        "holds failures",
+    );
+    let prelude = "type E = | Bad\ntype R = { w: () ! E }\nfn s() -> () ! E {\n    fail(Bad)\n}\n";
+    for held in ["[s()]", "Some(s())", "R{ w: s() }", "(s(), 1)"] {
+        check_err(
+            &format!("{prelude}fn go() {{\n    {held}\n}}\nfn main() {{\n    go()\n}}\n"),
+            "holds failures",
+        );
+    }
+    // Handled, it is fine.
+    check_ok(&format!(
+        "{prelude}fn go() {{\n    let r = [s()]\n    print(\"{{r.len()}}\")\n}}\nfn main() {{\n    go()\n}}\n"
+    ));
+}
+
+/// A local shadows a function of the same name, for effect rows too
+/// ([T-FN-VALUE-ROW] charges the row for *naming a function*).
+///
+/// A parameter spelled like a private helper charged its row: it broke a
+/// `capabilities = []` package in every consumer, and failed a `par_map`
+/// purity proof over a closure parameter's name.
+#[test]
+fn a_local_shadows_a_function_for_effect_rows() {
+    let shout = "fn shout(n: i64) -> i64 / {io} {\n    print(\"{n}\")\n    n\n}\n";
+    check_ok(&format!(
+        "{shout}fn bump(shout: i64) -> i64 / {{}} {{\n    shout + 1\n}}\nfn main() {{\n    print(\"{{bump(1)}}\")\n}}\n"
+    ));
+    check_ok(&format!(
+        "{shout}fn f() -> i64 / {{}} {{\n    let xs = [1, 2].par_map(|shout| shout * 2)\n    xs.len()\n}}\nfn main() {{\n    print(\"{{f()}}\")\n}}\n"
+    ));
+    // A real mention before the shadowing binding still counts.
+    check_err(
+        &format!(
+            "{shout}fn f() -> i64 / {{}} {{\n    let a = shout(1)\n    let shout = 5\n    a + shout\n}}\nfn main() {{\n    print(\"{{f()}}\")\n}}\n"
+        ),
+        "not in its declared row",
+    );
+}
+
+/// A `with` discharges the effect for a function *value* named inside it, not
+/// only for a call ([T-EFFECT-DISCHARGE]).
+#[test]
+fn a_with_discharges_a_named_function_value() {
+    let base = "effect Log {\n    fn info(m: str)\n}\nfn shout(m: str) / {Log} {\n    Log.info(\"!{m}\")\n}\n";
+    for body in [
+        "let f: fn(str) -> () / {Log} = shout\n        f(\"z\")",
+        "let f = shout\n        f(\"z\")",
+        "[\"a\"].map(shout)",
+    ] {
+        check_ok(&format!(
+            "{base}fn main() {{\n    with Log handled_by LogHandler{{ info: |m| print(\"L: {{m}}\") }} {{\n        {body}\n    }}\n}}\n"
+        ));
+    }
+    // Outside the `with`, it is still unhandled.
+    check_err(
+        &format!("{base}fn main() {{\n    let f = shout\n    f(\"z\")\n}}\n"),
+        "unhandled effect",
+    );
+}
+
+/// A function handed to a higher-order builtin must accept what that builtin
+/// will give it, rows included ([T-PAR-MAP-PURE], [T-FN-TYPE-ROW]).
+///
+/// Parameters were checked covariantly, so a `call` taking a pure
+/// `fn(i64) -> i64` accepted a list of `/ {io}` ones and `par_map` ran the
+/// effect on several cores.
+#[test]
+fn a_callbacks_parameter_row_is_checked_the_other_way() {
+    let base = "fn shout(n: i64) -> i64 / {io} {\n    print(\"x\")\n    n\n}\nfn call(f: fn(i64) -> i64) -> i64 {\n    f(1)\n}\n";
+    check_err(
+        &format!("{base}fn main() {{\n    let fs = [shout]\n    print(\"{{fs.par_map(call)}}\")\n}}\n"),
+        "performs nothing, but this one performs `io`",
+    );
+    check_err(
+        &format!("{base}fn main() {{\n    let fs = [shout]\n    print(\"{{fs.map(call)}}\")\n}}\n"),
+        "performs nothing, but this one performs `io`",
+    );
+    // A pure element is fine.
+    check_ok(
+        "fn dbl(n: i64) -> i64 {\n    n * 2\n}\nfn call(f: fn(i64) -> i64) -> i64 {\n    f(1)\n}\nfn main() {\n    let fs = [dbl]\n    print(\"{fs.par_map(call)}\")\n}\n",
+    );
+}

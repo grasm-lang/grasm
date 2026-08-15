@@ -139,13 +139,24 @@ fn check_modules(files: &[ModuleView]) -> Analysis {
     // Resolved now: unification is finished, so a literal's element type has
     // whatever answer the whole body gave it.
     let mut unresolved: Vec<(u32, u32)> = Vec::new();
+    // One literal can be recorded twice — inferred once to learn the
+    // receiver's shape, then checked again against the parameter it feeds.
+    // Only the second attempt resolves, and reporting the first made
+    // `[].total()` "not determined by anything" while `total([])`, the same
+    // call one spelling apart, compiled ([L-UFCS], [T-EMPTY-LIT]).
+    let resolved_once: std::collections::HashSet<u32> = c
+        .empty_lits
+        .iter()
+        .filter(|(_, _, t)| !c.show(t).contains('_'))
+        .map(|(off, _, _)| *off)
+        .collect();
     let empty_types: std::collections::HashMap<u32, String> = c
         .empty_lits
         .clone()
         .into_iter()
         .filter_map(|(off, len, t)| {
             let shown = c.show(&t);
-            if shown.contains('_') {
+            if shown.contains('_') && !resolved_once.contains(&off) {
                 // Nothing in the program says what this holds.
                 // `[T-EMPTY-LIT]` says such a literal is rejected, and it was
                 // not: `var xs = []` with no later use ran under `grasm run`
@@ -1350,7 +1361,8 @@ capability visible to everyone who depends on you",
                 let leaves = matches!(e, Expr::Call { callee, .. }
                     if matches!(&**callee, Expr::Ident(id)
                         if matches!(id.name.as_str(), "exit" | "panic" | "fail")));
-                if !leaves && matches!(self.uni.shallow_resolve(&body_ty), Type::Fallible(..)) {
+                let resolved = self.uni.shallow_resolve(&body_ty);
+                if !leaves && matches!(resolved, Type::Fallible(..)) {
                     let shown = self.show(&body_ty);
                     self.error_help(
                         e.span(),
@@ -1358,6 +1370,23 @@ capability visible to everyone who depends on you",
                             "this expression can fail (`{shown}`) and its failure is discarded"
                         ),
                         "use `try` to propagate it, `match` to handle both cases, or `??` with a fallback to say what should happen instead",
+                    );
+                } else if !leaves && self.holds_fallible(&resolved) {
+                    // The tail of a `()`-returning function throws its value
+                    // away like any other discarded statement, and the
+                    // container rule was checked only for statements: adding
+                    // one line after `paths.map(|p| write_file(p, body))`
+                    // caught it, and leaving it as the last line did not —
+                    // "wrote the report", exit 0, nothing on stderr, no file
+                    // ([T-FALLIBLE-UNHANDLED]).
+                    let shown = self.show(&body_ty);
+                    self.error_help(
+                        e.span(),
+                        format!(
+                            "this expression holds failures (`{shown}`) and they are discarded"
+                        ),
+                        "bind it and handle the failures it holds — a value nothing reads \
+is a failure nothing reports",
                     );
                 }
             }
@@ -2179,9 +2208,23 @@ closing brace — yield a number from the region and return that",
                 }
                 return;
             }
-            (Type::Fn { ret: ar, .. }, Type::Fn { ret: br, .. }) => {
+            (
+                Type::Fn { ret: ar, params: ap, .. },
+                Type::Fn { ret: br, params: bp, .. },
+            ) => {
                 // A function's result may itself be a function.
                 self.check_row_fits(ar, br, span);
+                // And so may its *parameters* — the other way round. What is
+                // handed over must accept everything the expected type
+                // promises it will be given, so the roles flip. Checked
+                // covariantly, `fs.par_map(call)` where `call` takes a
+                // `fn(i64) -> i64` and `fs` holds an `/ {io}` one passed: the
+                // element's row went into a parameter declaring none, and
+                // [T-PAR-MAP-PURE]'s "compile error, not a race" ran the
+                // effect on several cores instead.
+                for (a, b) in ap.iter().zip(bp.iter()) {
+                    self.check_row_fits(b, a, span);
+                }
             }
             _ => {}
         }

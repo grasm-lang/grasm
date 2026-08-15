@@ -94,6 +94,7 @@ Will not change incompatibly before 2.0.
 - `T-FALLIBLE-UNHANDLED` — stable
 - `T-FIELD-CALL` — stable
 - `T-FN-TYPE-ROW` — stable
+- `T-FN-TYPE-ROW-PARAM` — stable
 - `T-FN-TYPE-ROW-CARRIED` — stable
 - `T-FN-VALUE-ROW` — stable
 - `T-INFER-LOCAL` — stable

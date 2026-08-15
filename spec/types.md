@@ -393,6 +393,12 @@ function doing the naming, whether or not the call is written there. Holding a
 function is the permission to call it — the rule [T-EXTERN-VALUE] states for a
 C function, and it holds for every function for the same reason.
 
+*And only when it is a function.* A local of that name is a different thing:
+a parameter spelled like a private helper charged that helper's row, which
+broke a `capabilities = []` package in every consumer and failed a `par_map`
+purity proof over a closure parameter's spelling. Scope decides, here as
+everywhere else.
+
 *However it is named.* `lib.shout` is the same function `shout` would be and
 carries the same row, and it did not: only the bare spelling was charged, so
 one `import` emptied the row and with it every rule that rests on it —
@@ -427,6 +433,14 @@ unknowable, so its row is `{io, unsafe}` — and that travels with the value.
 Without it, pushing `sqrt` into a `[fn(f64) -> f64 / {io}]` inside an `unsafe`
 block was accepted, and calling it back out ran libc from a function declaring
 nothing at all.
+
+**[T-FN-TYPE-ROW-PARAM]** A row in a *parameter* position is checked the
+other way round: what is handed over must accept everything the expected type
+promises to give it. Checked covariantly with the result, a `call` declaring
+`fn(i64) -> i64` accepted a list of `/ {io}` functions, and
+`fs.par_map(call)` then ran the effect on several cores — [T-PAR-MAP-PURE]'s
+"a compile error, not a race", reached by giving the row to a parameter rather
+than to the callback itself.
 
 **[T-FN-TYPE-ROW]** A function type carries its effect row explicitly:
 `fn(i64) -> i64 / {io}`. **No row means the empty row**, so `fn(i64) -> i64`

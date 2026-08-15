@@ -782,6 +782,12 @@ function doing the naming, whether or not the call is written there. Holding a
 function is the permission to call it — the rule [T-EXTERN-VALUE] states for a
 C function, and it holds for every function for the same reason.
 
+*And only when it is a function.* A local of that name is a different thing:
+a parameter spelled like a private helper charged that helper's row, which
+broke a `capabilities = []` package in every consumer and failed a `par_map`
+purity proof over a closure parameter's spelling. Scope decides, here as
+everywhere else.
+
 *However it is named.* `lib.shout` is the same function `shout` would be and
 carries the same row, and it did not: only the bare spelling was charged, so
 one `import` emptied the row and with it every rule that rests on it —
@@ -816,6 +822,14 @@ unknowable, so its row is `{io, unsafe}` — and that travels with the value.
 Without it, pushing `sqrt` into a `[fn(f64) -> f64 / {io}]` inside an `unsafe`
 block was accepted, and calling it back out ran libc from a function declaring
 nothing at all.
+
+**[T-FN-TYPE-ROW-PARAM]** A row in a *parameter* position is checked the
+other way round: what is handed over must accept everything the expected type
+promises to give it. Checked covariantly with the result, a `call` declaring
+`fn(i64) -> i64` accepted a list of `/ {io}` functions, and
+`fs.par_map(call)` then ran the effect on several cores — [T-PAR-MAP-PURE]'s
+"a compile error, not a race", reached by giving the row to a parameter rather
+than to the callback itself.
 
 **[T-FN-TYPE-ROW]** A function type carries its effect row explicitly:
 `fn(i64) -> i64 / {io}`. **No row means the empty row**, so `fn(i64) -> i64`
@@ -1087,7 +1101,10 @@ anything outside, a region and a reference do not mix.
 **[T-REGION-FOREIGN]** A region may not run code written outside it that
 carries state: an effect operation, whose handler is written outside and may
 keep what it is given, and a call through a function *value* bound outside,
-which is a closure and carries its captures. A closure written *inside* the
+which is a closure and carries its captures. However the call is spelled: the
+row was read under the *calling* module, so `region { lib.cfg_user() }`
+carried none and was accepted, while the same function called unqualified was
+refused. A closure written *inside* the
 region is fine — it can only capture what a region already allows. This is the
 same rule as the one above seen from the other side: the earlier rules ask
 what a region's own text may write, and this one asks whose text runs there.
@@ -1114,6 +1131,15 @@ weakened here.
 **[T-UNSAFE-FFI]** `unsafe { … }` is Tier 3: the block where the guarantees of
 the safe tiers do not apply. Using a declared C function — calling one *or
 naming one*, which are the same permission — is allowed only inside it.
+
+An `extern fn` may not be `pub`. A C function is a link-time symbol of the
+package that declares it, and exporting the name carried it past every gate
+that makes Tier 3 visible: `libext.getpid()` in another module needed no
+`unsafe`, charged no capability, panicked under the interpreter with `module
+has no function` and printed an answer from a native build — three engines,
+two of them wrong, over a symbol the consumer's manifest never mentioned. A
+package offers a C function by wrapping it: `pub fn root(x) { unsafe { sqrt(x)
+} }`, which is the spelling that shows up in the ceiling.
 
 The block is not merely syntax. An `unsafe` block puts `unsafe` in the
 enclosing function's effect row, so it reaches the package's capability ceiling
@@ -2051,9 +2077,11 @@ element, which is where a list of structs gets its order from — `sort` needs
 the *elements* ordered, and a struct is not. The key must be `i64`, `f64` or
 `str`. The sort is stable: elements with equal keys stay in the order they
 were written. It sorts **ascending**, always; descending is
-`xs.sort_by(k)` followed by `xs.rev()`. Negating the key works for a number
-and has no counterpart for a `str`, so the reversal is the general answer and
-the one to reach for.
+`xs.sort_by(k)` followed by `xs = xs.rev()`. Negating the key works for a
+number and has no counterpart for a `str`, so the reversal is the general
+answer and the one to reach for. The assignment is the whole point: `sort_by`
+mutates and `rev` answers with a new list, so the clause's earlier wording —
+`xs.rev()` on its own line — left the list ascending and said nothing.
 
 **[L-LIB-PAIRS]** `xs.enumerate()` pairs each element with its index and
 `xs.zip(ys)` pairs the two lists positionally, stopping at the shorter — there
@@ -7136,6 +7164,32 @@ type Box = { f: fn(i64) -> i64 }
 fn main() {
     let b = Box{ f: shout }
     print("{b.f(1)}")
+}
+```
+
+## `T-FN-TYPE-ROW-PARAM.gr`
+
+```grasm
+//! tag: T-FN-TYPE-ROW-PARAM
+//! expect: error
+//! performs nothing, but this one performs `io`
+// A row in a parameter position is checked the other way round.
+//
+// `call` declares that it will be given a function performing nothing.
+// Checking the two rows covariantly with the result let a list of `/ {io}`
+// functions through, and `par_map` then ran the effect on several cores —
+// [T-PAR-MAP-PURE]'s "a compile error, not a race", reached by putting the
+// row in a parameter instead of in the callback.
+fn shout(n: i64) -> i64 / {io} {
+    print("side effect")
+    n
+}
+fn call(f: fn(i64) -> i64) -> i64 {
+    f(1)
+}
+fn main() {
+    let fs = [shout]
+    print("{fs.par_map(call)}")
 }
 ```
 

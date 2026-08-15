@@ -161,6 +161,22 @@ fn main() {
     }
 }'
 
+expect_refused "a closure whose parameter types nothing fixes" 'fn main() {
+    let f = |p| p.0 + p.1
+    for (i, v) in [10, 20].enumerate() {
+        print("{f((i, v))}")
+    }
+}'
+
+# Was a gap: a `for` variable and a binding declared after the closure are
+# both typed from what the block already says.
+expect_compiled "a closure called with a for variable" 'fn main() {
+    let f = |x| x * 2
+    for v in [1, 2] {
+        print("{f(v)}")
+    }
+}'
+
 expect_refused "a closure literal in a match arm" 'fn main() {
     let n = 1
     let f: fn(i64) -> i64 = match n {

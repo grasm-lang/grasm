@@ -1392,6 +1392,7 @@ impl<'m> Codegen<'m> {
             pinned: Vec::new(),
             tail_hint: None,
             probe_types: Vec::new(),
+            probing_args: false,
             index_vals: HashMap::new(),
             task_scopes: Vec::new(),
         };
@@ -1801,6 +1802,7 @@ to one — a loop variable or a list element is this case",
             pinned: Vec::new(),
             tail_hint: None,
             probe_types: Vec::new(),
+            probing_args: false,
             index_vals: HashMap::new(),
             task_scopes: Vec::new(),
         };
@@ -1881,6 +1883,7 @@ to one — a loop variable or a list element is this case",
             pinned: Vec::new(),
             tail_hint: None,
             probe_types: Vec::new(),
+            probing_args: false,
             index_vals: HashMap::new(),
             task_scopes: Vec::new(),
         };
@@ -2009,6 +2012,7 @@ to one — a loop variable or a list element is this case",
             pinned: Vec::new(),
             tail_hint: None,
             probe_types: Vec::new(),
+            probing_args: false,
             index_vals: HashMap::new(),
             task_scopes: Vec::new(),
         };
@@ -2174,6 +2178,9 @@ struct FnCx<'a, 'm> {
     /// because a probe must not create a Cranelift variable — one declared and
     /// never defined is read as garbage if anything later uses it.
     probe_types: Vec<HashMap<String, VType>>,
+    /// Guards the one retry `probe_arg_type` makes with the block's hints
+    /// bound, so probing a hint cannot re-enter it.
+    probing_args: bool,
     /// Assignment-target index expressions, evaluated before the value.
     ///
     /// `xs[f()] = g()` must run `f` before `g` ([E-ORDER-LTR]), and the walk
@@ -2198,6 +2205,14 @@ struct BlockHints {
     /// Every binding's initializer, so an argument naming a binding declared
     /// after the closure can still be typed.
     inits: HashMap<String, Expr>,
+    /// A `for` variable and the thing it iterates. The variable is not a
+    /// `let`, so it had no initializer to probe: `let f = |x| x * 2` then
+    /// `for v in [1, 2] { f(v) }` was refused as "the type of `v`" — about a
+    /// binding whose type the list two lines up fixes.
+    loop_over: HashMap<String, Expr>,
+    /// A binding's written type, which beats its initializer when the
+    /// initializer is an empty literal.
+    declared_ty: HashMap<String, grasm_syntax::ast::TypeExpr>,
     /// `apply(f, 5)` where `apply` declares `fn(i64) -> i64`: the signature
     /// says what `f`'s parameters are, and no call of `f` by name ever will.
     declared: HashMap<String, Vec<VType>>,
@@ -2500,14 +2515,29 @@ fn collect_block_hints(blk: &grasm_syntax::ast::Block) -> BlockHints {
     let mut hints = BlockHints::default();
     let mut bound: Vec<String> = Vec::new();
     for stmt in &blk.stmts {
-        if let Stmt::Let { name, init, .. } = stmt {
+        if let Stmt::Let { name, init, ty, .. } = stmt {
             hints
                 .inits
                 .entry(name.name.clone())
                 .or_insert_with(|| init.clone());
+            // The annotation says more than the initializer when the
+            // initializer is an empty literal: `var m: Map[str, i64] = map()`
+            // probes as a map of nothing without it.
+            if let Some(t) = ty {
+                hints
+                    .declared_ty
+                    .entry(name.name.clone())
+                    .or_insert_with(|| t.clone());
+            }
             if matches!(init, Expr::Closure { params, .. } if !params.is_empty()) {
                 bound.push(name.name.clone());
             }
+        }
+        if let Stmt::For { var, iter, .. } = stmt {
+            hints
+                .loop_over
+                .entry(var.name.clone())
+                .or_insert_with(|| iter.clone());
         }
     }
     if bound.is_empty() {
@@ -9170,6 +9200,69 @@ own parameters cannot be annotated)",
         if let Ok(t) = self.probe_type(a) {
             return Ok(t);
         }
+        // The argument may *contain* a binding declared after the closure —
+        // `f(xs[0])`, `f(m.get(k) ?? 0)`, `f(t.0)`. Bind every hint this
+        // block carries into a probe scope and try once more, so the shape is
+        // worked out from what the block already says rather than refused as
+        // "the type of `xs`" about a list whose literal is two lines down.
+        if !self.probing_args {
+            self.probing_args = true;
+            let hinted: Vec<(String, Expr)> = self
+                .closure_hints
+                .iter()
+                .rev()
+                .flat_map(|scope| {
+                    scope
+                        .inits
+                        .iter()
+                        .map(|(n, e)| (n.clone(), e.clone()))
+                        .chain(scope.loop_over.iter().map(|(n, e)| (n.clone(), e.clone())))
+                })
+                .collect();
+            let loop_names: std::collections::HashSet<String> = self
+                .closure_hints
+                .iter()
+                .flat_map(|scope| scope.loop_over.keys().cloned())
+                .collect();
+            let mut env: HashMap<String, VType> = HashMap::new();
+            let declared: Vec<(String, grasm_syntax::ast::TypeExpr)> = self
+                .closure_hints
+                .iter()
+                .rev()
+                .flat_map(|scope| {
+                    scope.declared_ty.iter().map(|(n, t)| (n.clone(), t.clone()))
+                })
+                .collect();
+            for (n, t) in declared {
+                if let Ok(vt) = self.cg.vtype_of(&t) {
+                    env.insert(n, vt);
+                }
+            }
+            for (n, e) in hinted {
+                if env.contains_key(&n) {
+                    continue;
+                }
+                if let Ok(t) = self.probe_type(&e) {
+                    let t = if loop_names.contains(&n) {
+                        match t {
+                            VType::List(el) => *el,
+                            VType::Map(k, v) => VType::Tuple(vec![*k, *v]),
+                            other => other,
+                        }
+                    } else {
+                        t
+                    };
+                    env.insert(n, t);
+                }
+            }
+            self.probe_types.push(env);
+            let out = self.probe_type(a);
+            self.probe_types.pop();
+            self.probing_args = false;
+            if let Ok(t) = out {
+                return Ok(t);
+            }
+        }
         if let Expr::Ident(id) = a {
             let init = self
                 .closure_hints
@@ -9179,8 +9272,34 @@ own parameters cannot be annotated)",
             if let Some(init) = init {
                 return self.probe_type(&init);
             }
+            // A `for` variable: its type is the element type of what the loop
+            // walks.
+            let over = self
+                .closure_hints
+                .iter()
+                .rev()
+                .find_map(|scope| scope.loop_over.get(&id.name).cloned());
+            if let Some(over) = over {
+                if let Ok(t) = self.probe_type(&over) {
+                    return Ok(match t {
+                        VType::List(e) => *e,
+                        VType::Map(k, v) => VType::Tuple(vec![*k, *v]),
+                        VType::Str => VType::Str,
+                        other => other,
+                    });
+                }
+            }
+            let _ = id;
         }
-        self.probe_type(a)
+        // The retry did not settle it either. Name the shape rather than the
+        // argument: "the type of `v`" pointed at a binding whose type the
+        // line above fixes, and sent the reader to the one place the fix does
+        // not go.
+        nope(
+            a.span(),
+            "a closure with parameters whose types nothing here fixes (annotate the \
+binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)",
+        )
     }
 
     /// Locals the closure body refers to, in a stable order.
