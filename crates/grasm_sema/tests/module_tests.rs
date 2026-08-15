@@ -405,3 +405,26 @@ fn a_key_generic_is_checked_at_a_qualified_call_site() {
         ("mk", tally),
     ]);
 }
+
+/// A call made from inside a region is refused however it is spelled
+/// ([T-REGION-FOREIGN]).
+///
+/// The row was looked up under the *calling* module, so a qualified call
+/// carried none and `region { lib.cfg_user() }` was accepted — the handler is
+/// written outside the region and may keep what it is given.
+#[test]
+fn a_qualified_call_inside_a_region_is_refused() {
+    let lib = "effect Cfg {\n    fn value() -> i64\n}\npub fn cfg_user() -> i64 / {Cfg} {\n    Cfg.value()\n}\npub fn plain(n: i64) -> i64 {\n    n\n}\n";
+    err(
+        &[
+            ("main", "import lib\n\nfn main() {\n    with Cfg handled_by CfgHandler{ value: || 5 } {\n        let n = region {\n            lib.cfg_user()\n        }\n        print(\"{n}\")\n    }\n}\n"),
+            ("lib", lib),
+        ],
+        "inside a region",
+    );
+    // A call that performs nothing is ordinary.
+    ok(&[
+        ("main", "import lib\n\nfn main() {\n    let n = region {\n        lib.plain(5)\n    }\n    print(\"{n}\")\n}\n"),
+        ("lib", lib),
+    ]);
+}

@@ -3782,13 +3782,31 @@ fail outside it",
     /// matters is not where the text is but what the call can reach
     /// ([T-REGION-FOREIGN]).
     fn check_region_call(&mut self, name: &str, args: &[Expr], span: Span) {
+        let owner = self.current_module.clone();
+        self.check_region_call_in(&owner, name, args, span)
+    }
+
+    /// The same, for a call written `mod.name(...)`.
+    ///
+    /// The row was looked up under the *calling* module, so a qualified call
+    /// carried no row here and `region { lib.cfg_user() }` was accepted — the
+    /// handler is written outside the region and may keep what it is given,
+    /// which is exactly how a value allocated inside gets out
+    /// ([T-REGION-FOREIGN]).
+    fn check_region_call_in(
+        &mut self,
+        owner: &str,
+        name: &str,
+        args: &[Expr],
+        span: Span,
+    ) {
         if self.region_depth == 0 {
             return;
         }
         // A user-declared effect means a handler, and a handler is written
         // outside and may keep what it is given. `io`, `async` and `unsafe`
         // are built in: they have no handler and retain nothing.
-        if let Some(row) = self.row_of_fn(name) {
+        if let Some(row) = self.row_of_qualified(owner, name) {
             let user: Vec<&String> = row
                 .iter()
                 .filter(|e| !matches!(e.as_str(), "io" | "async" | "unsafe"))
@@ -3839,7 +3857,7 @@ fail outside it",
         args: &[Expr],
         span: Span,
     ) -> Type {
-        self.check_region_call(name, args, span);
+        self.check_region_call_in(owner, name, args, span);
         let fresh: Vec<Type> = (0..info.generics).map(|_| self.uni.fresh()).collect();
         if args.len() != info.params.len() {
             return self.error(

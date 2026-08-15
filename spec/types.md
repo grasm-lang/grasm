@@ -698,7 +698,10 @@ anything outside, a region and a reference do not mix.
 **[T-REGION-FOREIGN]** A region may not run code written outside it that
 carries state: an effect operation, whose handler is written outside and may
 keep what it is given, and a call through a function *value* bound outside,
-which is a closure and carries its captures. A closure written *inside* the
+which is a closure and carries its captures. However the call is spelled: the
+row was read under the *calling* module, so `region { lib.cfg_user() }`
+carried none and was accepted, while the same function called unqualified was
+refused. A closure written *inside* the
 region is fine — it can only capture what a region already allows. This is the
 same rule as the one above seen from the other side: the earlier rules ask
 what a region's own text may write, and this one asks whose text runs there.
