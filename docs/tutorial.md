@@ -679,8 +679,8 @@ runs only under `grasm run`:
 | a generic instantiated at a handler type | `f(h)` for `fn f[T](x: T)` — pass what the handler computes instead |
 | a handler used as a *value* | `print("{h}")`, or storing one — install it with `with … handled_by` instead |
 | a `with` block inside `parallel`/`spawn` | install the handler around the `parallel` block instead |
-| a `match` whose arms are effect-operation calls | `match n { 1 -> Log.info("a")  _ -> Log.info("b") }` — the same arms inside an `if`/`else` compile |
 | a closure literal in the arms of a `match` or `if` | `let f: fn(i64) -> i64 = match n { 1 -> \|x\| x + 1  _ -> \|x\| x * 2 }` — bind each closure first, or make them top-level `fn`s |
+| `fail` inside a *fallible* closure passed to `map`, `filter` or `fold` | `xs.map(\|x\| fail(e))` where the result is held as `[T ! E]` — produce `Err(e)` instead of failing, or pass a named function |
 | a `fold` seeded with an unannotated `map()` | `xs.fold(map(), add)` — annotate the seed: `let seed: Map[str, i64] = map()` |
 | polymorphic recursion | `fn f[T](x: T) -> i64 { f([x]) }` — one compiled copy per type, and the types never stop growing |
 

@@ -147,7 +147,8 @@ fn main() {
 # Not a shape anyone writes on purpose, but the build used to run until it was
 # killed — no diagnostic, unbounded memory — where every other gap here is a
 # refusal by name at build time.
-expect_refused "a match whose arms are effect operations" 'effect Log {
+# Was a gap: the probe called an effect a "receiver whose type is not known".
+expect_compiled "a match whose arms are effect operations" 'effect Log {
     fn info(m: str)
 }
 fn main() {
@@ -167,6 +168,13 @@ expect_refused "a closure literal in a match arm" 'fn main() {
         _ -> |x| x * 2
     }
     print("{f(3)}")
+}'
+
+expect_refused "fail inside a fallible closure passed to map" 'type E = { m: str }
+fn main() -> () ! E {
+    let ys: [i64 ! E] = [0, 1].map(|x| fail(E{ m: "d" }))
+    let v = ys[0] ?? 4
+    print("{v}")
 }'
 
 expect_refused "a fold seeded with an unannotated map()" 'fn add(acc: Map[str, i64], n: i64) -> Map[str, i64] {

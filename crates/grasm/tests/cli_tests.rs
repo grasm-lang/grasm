@@ -905,3 +905,91 @@ fn recursion_through_a_constant_panics_in_a_native_binary() {
         String::from_utf8_lossy(&got.stderr)
     );
 }
+
+/// A binding annotated `T ! E` may be given either half, and the compiled
+/// build must agree with the interpreter ([T-OK-ERR-RETURN]).
+///
+/// The bare half was bound under a type that says it is a boxed variant, so
+/// reading it back dereferenced the payload as one: a wrong answer for some
+/// types and a misaligned-pointer abort for others.
+#[test]
+fn an_annotated_fallible_binding_agrees_between_engines() {
+    let w = Work::new("annbind");
+    for (tag, src) in [
+        (
+            "bare-both",
+            "type E = | Bad\nfn f(n: i64) -> str ! E {\n    let v: str ! E = if n == 0 {\n        \"c\"\n    } else {\n        \"d\"\n    }\n    v\n}\nfn main() {\n    let a = f(0) ?? \"-\"\n    let b = f(1) ?? \"-\"\n    print(\"{a} {b}\")\n}\n",
+        ),
+        (
+            "bare-and-fail",
+            "type E = | Bad\nfn f(n: i64) -> i64 ! E {\n    let v: i64 ! E = if n == 0 {\n        fail(Bad)\n    } else {\n        0 - 7\n    }\n    v\n}\nfn main() {\n    print(\"{f(0) ?? 0 - 1}\")\n    print(\"{f(1) ?? 0 - 1}\")\n}\n",
+        ),
+    ] {
+        let f = w.0.join(format!("{tag}.gr"));
+        std::fs::write(&f, src).unwrap();
+        let bin = w.0.join(tag);
+        let (code, out) = run(&[
+            "build",
+            f.to_str().unwrap(),
+            "--native",
+            "-o",
+            bin.to_str().unwrap(),
+        ]);
+        assert_eq!(code, 0, "{tag}: {out}");
+        let interp = run(&["run", f.to_str().unwrap()]);
+        let native = Command::new(&bin).output().expect("runs");
+        let native_text = String::from_utf8_lossy(&native.stdout).into_owned();
+        assert_eq!(interp.1, native_text, "{tag}: engines disagree");
+        assert_eq!(native.status.code(), Some(0), "{tag}");
+    }
+}
+
+/// A function named through its module carries its effect row, exactly as a
+/// bare name does ([T-FN-VALUE-ROW], [T-MODULE-PUB]).
+///
+/// It carried an empty one, so a single `import` was enough to hand a printing
+/// function to a `/ {}` row, to `par_map`, to a constant table and to a
+/// package declaring `capabilities = []` — every refusal the spec calls closed
+/// was open one word longer.
+#[test]
+fn a_qualified_function_value_keeps_its_row() {
+    let w = Work::new("qualrow");
+    std::fs::create_dir_all(w.0.join("src")).unwrap();
+    std::fs::write(
+        w.0.join("src/lib.gr"),
+        "pub fn shout(n: i64) -> i64 {\n    print(\"noisy {n}\")\n    n\n}\n",
+    )
+    .unwrap();
+    for (tag, src, needle) in [
+        (
+            "empty-row",
+            "import lib\nfn quiet() -> [i64] / {} {\n    [1, 2].map(lib.shout)\n}\nfn main() {\n    print(\"{quiet()}\")\n}\n",
+            "not in its declared row",
+        ),
+        (
+            "par-map",
+            "import lib\nfn main() {\n    print(\"{[1, 2].par_map(lib.shout)}\")\n}\n",
+            "needs an effect-free function",
+        ),
+        (
+            "written-type",
+            "import lib\nfn main() {\n    let f: fn(i64) -> i64 = lib.shout\n    print(\"{f(1)}\")\n}\n",
+            "performs nothing, but this one performs `io`",
+        ),
+    ] {
+        let f = w.0.join(format!("src/{tag}.gr"));
+        std::fs::write(&f, src).unwrap();
+        let (code, out) = run(&["check", f.to_str().unwrap()]);
+        assert_eq!(code, 1, "{tag} must be refused:\n{out}");
+        assert!(out.contains(needle), "{tag}: {out}");
+    }
+    // Calling it is still ordinary.
+    let ok = w.0.join("src/ok.gr");
+    std::fs::write(
+        &ok,
+        "import lib\nfn main() {\n    print(\"{lib.shout(1)}\")\n}\n",
+    )
+    .unwrap();
+    let (code, out) = run(&["check", ok.to_str().unwrap()]);
+    assert_eq!(code, 0, "{out}");
+}

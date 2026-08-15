@@ -159,7 +159,9 @@ same way when its result was ignored.
 A container built out of failures and then discarded discards them too:
 `[risky(x)]` and `xs.map(risky)` written as bare statements throw away every
 failure they hold. One pair of brackets was enough to get the old silence
-back. [T-FALLIBLE-VALUE] keeping the failures in the list is what makes them
+back — and so was one *constructor*: `Some(save())`, a struct literal with a
+fallible field, a sum variant carrying one. A named type holds values like any
+other container. [T-FALLIBLE-VALUE] keeping the failures in the list is what makes them
 readable — while somebody reads them.
 
 **[T-FALLIBLE-COALESCE]** `e ?? d` where `e : T ! E` yields the value or `d`,
@@ -390,6 +392,15 @@ reach, and to a package declaring `capabilities = []`.
 function doing the naming, whether or not the call is written there. Holding a
 function is the permission to call it — the rule [T-EXTERN-VALUE] states for a
 C function, and it holds for every function for the same reason.
+
+*However it is named.* `lib.shout` is the same function `shout` would be and
+carries the same row, and it did not: only the bare spelling was charged, so
+one `import` emptied the row and with it every rule that rests on it —
+`/ {}`, [T-PAR-MAP-PURE], [E-CONST]'s constant table, [T-REGION-FOREIGN],
+[E-HANDLER-MISSING]'s "well-typed programs never reach it", and a package
+declaring `capabilities = []`, which `grasm deps` then certified as performing
+nothing while it printed. A capability ceiling one `import` away from
+meaningless is not a ceiling.
 
 This is deliberately conservative: storing an effectful function and never
 calling it is refused, and the way out is to declare the row. The alternative
@@ -745,7 +756,10 @@ package's capability ceiling and disqualifies a function from `par_map`
 guarantees — and it was, in the first version of this feature.
 
 **[T-MODULE-NS]** Functions are per-module; types and effects share one global
-namespace, so a type name may not be declared twice across a program. One
+namespace, so a type name may not be declared twice across a program — and an
+*effect* is one of the things that claims a name, two of them in fact: `effect
+Clock` declares `Clock` and `ClockHandler`. Both were free to collide with a
+type, and both names stayed usable afterwards. One
 namespace means one namespace: an effect operation's signature may name a type
 from any module, the same as an ordinary function's. A *type alias* is a type
 declaration like any other, and it was the one that escaped both this rule and

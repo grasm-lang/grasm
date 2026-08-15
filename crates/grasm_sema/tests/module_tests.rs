@@ -383,3 +383,25 @@ fn a_diagnostic_in_a_dependency_names_a_real_file() {
     }
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// The end-of-analysis map-key pass is keyed by the callee, not the caller
+/// ([T-MAP-KEY-GENERIC]).
+///
+/// A qualified call recorded the calling module, so `mk.tally([1.5])` over a
+/// `Map[T, _]` in `mk` went through the checker and into a runtime
+/// `invalid map key`, while the identical body called unqualified was refused.
+#[test]
+fn a_key_generic_is_checked_at_a_qualified_call_site() {
+    let tally = "pub fn tally[T](xs: [T]) -> i64 {\n    var m: Map[T, i64] = {}\n    for x in xs {\n        m.set(x, 1)\n    }\n    m.len()\n}\n";
+    err(
+        &[
+            ("main", "import mk\n\nfn main() {\n    print(\"{mk.tally([1.5, 2.5])}\")\n}\n"),
+            ("mk", tally),
+        ],
+        "map keys must be",
+    );
+    ok(&[
+        ("main", "import mk\n\nfn main() {\n    let n = mk.tally([\"a\"])\n    print(\"{n}\")\n}\n"),
+        ("mk", tally),
+    ]);
+}

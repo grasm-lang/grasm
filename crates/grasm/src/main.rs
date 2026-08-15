@@ -126,7 +126,15 @@ fn run() -> ExitCode {
                     // A value-taking flag whose value is missing is a lost
                     // operand, not a flag on its own: `--against "$BASE"`
                     // with `BASE` unset dropped the comparison and exited 0.
-                    if args.get(i + 1).is_none_or(|v| v.starts_with('-')) {
+                    // A negative number is a value, not the next flag.
+                    // `--cases -1` reported "`--cases` needs a value" about a
+                    // value that was supplied, and the real complaint — that
+                    // it is out of range — never reached the reader.
+                    let is_value = |v: &String| {
+                        !v.starts_with('-')
+                            || v.len() > 1 && v[1..].chars().all(|c| c.is_ascii_digit())
+                    };
+                    if !args.get(i + 1).is_some_and(is_value) {
                         eprintln!("error: `{a}` needs a value");
                         return ExitCode::FAILURE;
                     }

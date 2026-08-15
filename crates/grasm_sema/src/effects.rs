@@ -977,6 +977,27 @@ fn par_fn_row(
         indirect_row(&id.name, current, active, ctx, fnb, out);
         return;
     }
+    // `xs.par_map(lib.shout)` — the same function a call would reach, named
+    // through its module. Only the bare spelling was recognised, so one
+    // `import` emptied the row: a printing function reached `par_map`, a
+    // `/ {}` row, a region and a `capabilities = []` package, and every one of
+    // those refusals is the same refusal one word longer.
+    if let Expr::Field { recv, name, .. } = func {
+        if let Expr::Ident(alias) = &**recv {
+            if let Some(target) = ctx.imports.get(current).and_then(|m| m.get(&alias.name)) {
+                if ctx.externs.contains(&format!("{target}::{}", name.name)) {
+                    out.insert(IO.to_string());
+                    return;
+                }
+                if let Some(qual) = ctx.resolve_qualified(current, &alias.name, &name.name) {
+                    if let Some(row) = ctx.rows.get(&qual) {
+                        out.extend(row.iter().cloned());
+                    }
+                    return;
+                }
+            }
+        }
+    }
     walk_expr(func, current, active, ctx, fnb, out);
 }
 
@@ -1474,7 +1495,16 @@ fn fn_sources<'a>(e: &'a Expr, ctx: &Ctx, current: &str, out: &mut Vec<FnSource<
         Expr::Closure { .. } => out.push(FnSource::Closure(e)),
         // `let g = b.f` — the row travels with the value, so the binding
         // inherits what the field's type declares ([T-FN-TYPE-ROW-CARRIED]).
-        Expr::Field { name, .. } => {
+        Expr::Field { recv, name, .. } => {
+            // `let g = lib.shout` names a function through its module, which
+            // is the same value the bare name would give and carries the same
+            // row.
+            if let Expr::Ident(alias) = &**recv {
+                if let Some(qual) = ctx.resolve_qualified(current, &alias.name, &name.name) {
+                    out.push(FnSource::Named(qual));
+                    return;
+                }
+            }
             if name.name.parse::<usize>().is_ok() {
                 if !ctx.elem_rows.is_empty() {
                     out.push(FnSource::Declared(ctx.elem_rows.clone()));
@@ -1779,7 +1809,12 @@ fn indirect_row(
     for src in fnb.sources_for(name) {
         match src {
             FnSource::Named(n) => {
-                if let Some(qual) = ctx.resolve_call(current, n) {
+                // Already qualified when the value was named through its
+                // module — `let g = lib.shout` records `lib::shout`, which is
+                // the key, not a name to qualify again.
+                if n.contains("::") {
+                    contribute(n, active, ctx, out);
+                } else if let Some(qual) = ctx.resolve_call(current, n) {
                     contribute(&qual, active, ctx, out);
                 }
             }
@@ -2142,9 +2177,30 @@ fn walk_expr(
         // permission as naming one ([T-FN-VALUE-ROW]) — `xs.map(p.0)` hands
         // it to something that will call it.
         Expr::Field { recv, name, .. } => {
-            computed_callee_row(e, ctx, out);
-            let _ = name;
-            walk_expr(recv, current, active, ctx, fnb, out);
+            // `lib.shout` as a value is the same permission as naming it
+            // unqualified: whoever receives it can call it. Charged only for
+            // the bare spelling, one `import` emptied the row, and with it
+            // the `/ {}` check, [T-PAR-MAP-PURE], [T-REGION-FOREIGN] and the
+            // capability ceiling.
+            let mut qualified = false;
+            if let Expr::Ident(alias) = &**recv {
+                if let Some(target) = ctx.imports.get(current).and_then(|m| m.get(&alias.name)) {
+                    if ctx.externs.contains(&format!("{target}::{}", name.name)) {
+                        out.insert(IO.to_string());
+                        out.insert(UNSAFE.to_string());
+                        qualified = true;
+                    } else if let Some(qual) =
+                        ctx.resolve_qualified(current, &alias.name, &name.name)
+                    {
+                        contribute(&qual, active, ctx, out);
+                        qualified = true;
+                    }
+                }
+            }
+            if !qualified {
+                computed_callee_row(e, ctx, out);
+                walk_expr(recv, current, active, ctx, fnb, out);
+            }
         }
         Expr::Index { recv, index, .. } => {
             walk_expr(recv, current, active, ctx, fnb, out);

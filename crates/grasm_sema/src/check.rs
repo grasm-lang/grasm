@@ -682,6 +682,30 @@ already reachable from every module — drop the `pub`",
                     self.error(e.name.span, format!("duplicate effect `{}`", e.name.name));
                     continue;
                 }
+                // One namespace means one namespace ([T-MODULE-NS]). An
+                // effect and a type of the same name were both accepted and
+                // both stayed usable — and an effect declares `EHandler` too,
+                // so `type ClockHandler = i64` beside `effect Clock` collided
+                // with a name the reader never wrote.
+                for clash in [e.name.name.clone(), format!("{}Handler", e.name.name)] {
+                    if self.defs.by_name.contains_key(&clash)
+                        || self.aliases.contains_key(&clash)
+                    {
+                        let what = if clash == e.name.name {
+                            format!("effect `{clash}` collides with a type of that name")
+                        } else {
+                            format!(
+                                "effect `{}` declares `{clash}`, which collides with a type of that name",
+                                e.name.name
+                            )
+                        };
+                        self.error_help(
+                            e.name.span,
+                            what,
+                            "types and effects share one namespace across the program — rename one of them",
+                        );
+                    }
+                }
                 let mut ops = Vec::new();
                 let mut handler_fields = Vec::new();
                 for op in &e.ops {
@@ -1138,11 +1162,45 @@ land in a copy the caller never sees — return the new value from the operation
     /// part of that struct's design and is read wherever the struct is, while
     /// `[risky(x)]` written as a statement can only be throwing them away.
     fn holds_fallible(&mut self, t: &Type) -> bool {
+        self.holds_fallible_at(t, 0)
+    }
+
+    fn holds_fallible_at(&mut self, t: &Type, depth: usize) -> bool {
+        if depth > 8 {
+            return false;
+        }
         match self.uni.shallow_resolve(t) {
             Type::Fallible(..) => true,
-            Type::List(e) | Type::Ref(e) => self.holds_fallible(&e),
-            Type::Map(_, v) => self.holds_fallible(&v),
-            Type::Tuple(parts) => parts.iter().any(|p| self.holds_fallible(p)),
+            Type::List(e) | Type::Ref(e) => self.holds_fallible_at(&e, depth + 1),
+            Type::Map(_, v) => self.holds_fallible_at(&v, depth + 1),
+            Type::Tuple(parts) => parts
+                .iter()
+                .any(|p| self.holds_fallible_at(p, depth + 1)),
+            // `Some(save())`, `Report{ written: save() }`, `W(save())` — one
+            // constructor was enough to launder a failure past the rule, and
+            // the recursion stopped at the type-argument boundary so even a
+            // list of them slipped through. A named type's arguments and its
+            // own fields carry values like any other container.
+            Type::Named { id, args } => {
+                if args
+                    .iter()
+                    .any(|a| self.holds_fallible_at(a, depth + 1))
+                {
+                    return true;
+                }
+                let fields: Vec<Type> = match &self.defs.get(id).kind {
+                    TypeDefKind::Struct { fields } => {
+                        fields.iter().map(|(_, t)| t.clone()).collect()
+                    }
+                    TypeDefKind::Sum { variants } => variants
+                        .iter()
+                        .flat_map(|v| v.fields.iter().map(|(_, t)| t.clone()))
+                        .collect(),
+                };
+                fields
+                    .iter()
+                    .any(|f| self.holds_fallible_at(f, depth + 1))
+            }
             _ => false,
         }
     }
@@ -2028,6 +2086,19 @@ closing brace — yield a number from the region and return that",
     }
 
     /// A named function's inferred effect row, if it has one.
+    /// The row of a function named through its module.
+    fn row_of_qualified(
+        &self,
+        module: &str,
+        name: &str,
+    ) -> Option<std::collections::BTreeSet<String>> {
+        let key = format!("{module}::{name}");
+        if self.extern_names.contains(&key) {
+            return Some(["io", "unsafe"].iter().map(|s| s.to_string()).collect());
+        }
+        self.fn_rows.get(&key).cloned()
+    }
+
     fn row_of_fn(&self, name: &str) -> Option<std::collections::BTreeSet<String>> {
         let key = format!("{}::{}", self.current_module, name);
         // A C function has no body to infer from, and what it does is
@@ -3731,6 +3802,25 @@ fail outside it",
     }
 
     fn check_fn_call(&mut self, name: &str, info: &FnInfo, args: &[Expr], span: Span) -> Type {
+        let owner = self.current_module.clone();
+        self.check_fn_call_in(&owner, name, info, args, span)
+    }
+
+    /// The same, for a call written `mod.name(...)`.
+    ///
+    /// The end-of-analysis map-key pass is keyed by the *callee*, and a
+    /// qualified call recorded the caller's module instead — so
+    /// `mk.tally([1.5])` over a `Map[T, _]` in `mk` went through the checker
+    /// and into a runtime `invalid map key`, while the identical body called
+    /// unqualified was refused ([T-MAP-KEY-GENERIC]).
+    fn check_fn_call_in(
+        &mut self,
+        owner: &str,
+        name: &str,
+        info: &FnInfo,
+        args: &[Expr],
+        span: Span,
+    ) -> Type {
         self.check_region_call(name, args, span);
         let fresh: Vec<Type> = (0..info.generics).map(|_| self.uni.fresh()).collect();
         if args.len() != info.params.len() {
@@ -3770,7 +3860,7 @@ fail outside it",
             // And whatever the body does with them, which is only known once
             // every body has been walked — this call may be checked first.
             self.pending_key_checks.push((
-                format!("{}::{}", self.current_module, name),
+                format!("{owner}::{name}"),
                 fresh.clone(),
                 span,
                 self.key_generic_owner.clone(),
@@ -3803,6 +3893,26 @@ fail outside it",
                     }
                 }
                 ParamMode::Inout => {
+                    // A tuple component is not a place ([G-PLACE]), and
+                    // `inout` is the spelling that was missed: `bump(t.0)`
+                    // typechecked and then panicked with `cannot access field
+                    // \`0\``, the very message that clause exists to
+                    // eliminate — after the snapshot had already emptied the
+                    // component.
+                    if let Some((_, segs)) = place_path(a) {
+                        if segs.iter().any(|s| matches!(s, PlaceSeg::Field(f)
+                            if f.chars().all(|c| c.is_ascii_digit())))
+                        {
+                            self.error_help(
+                                a.span(),
+                                "cannot pass a tuple component as `inout`".to_string(),
+                                "a tuple is a fixed group of values with no place to write \
+into — bind the component to a `var` and rebuild the tuple, or use a struct when the \
+parts have names worth writing",
+                            );
+                            continue;
+                        }
+                    }
                     let root = place_root(a);
                     match root {
                         Some(id) => {
@@ -4003,6 +4113,17 @@ fail outside it",
                             // while `lib.uniq(xs)` on the next line was fine.
                             let fresh: Vec<Type> =
                                 (0..info.generics).map(|_| self.uni.fresh()).collect();
+                            // The function's *own* row travels with it here
+                            // exactly as it does for a bare name, and it did
+                            // not: `lib.shout` named as a value carried an
+                            // empty row, so one `import` was enough to hand a
+                            // printing function to a `/ {}` row, to `par_map`,
+                            // to a `capabilities = []` package, and to a call
+                            // made from inside a region. [T-FN-VALUE-ROW] says
+                            // naming a function contributes its row to the
+                            // function doing the naming, and says nothing
+                            // about which module it was declared in.
+                            let own_row = self.row_of_qualified(&target_mod, &name.name);
                             return Type::Fn {
                                 params: info
                                     .params
@@ -4010,7 +4131,7 @@ fail outside it",
                                     .map(|p| substitute_generics(p, &fresh))
                                     .collect(),
                                 ret: Box::new(substitute_generics(&ret, &fresh)),
-                                row: None,
+                                row: own_row,
                             };
                         }
                         Some(_) => {
@@ -4125,7 +4246,13 @@ fail outside it",
                     let qual = format!("{target_mod}::{}", name.name);
                     match self.fns.get(&qual).cloned() {
                         Some(info) if info.is_pub => {
-                            return self.check_fn_call(&name.name, &info, args, span);
+                            return self.check_fn_call_in(
+                                &target_mod,
+                                &name.name,
+                                &info,
+                                args,
+                                span,
+                            );
                         }
                         Some(_) => {
                             return self.error_help(
@@ -5885,6 +6012,14 @@ bind the component to a `var`, or use a struct when the parts have names worth w
                     ret: ret.clone(),
                 });
                 self.closure_types.insert(span.start, ret.clone());
+                // Keyed by the body too. The backend identifies a closure by
+                // where its *body* starts, and a closure with parameters
+                // begins earlier than that — so the guard that refuses `fail`
+                // inside a `map` closure never matched one, and the `fail`
+                // was compiled as a return from the enclosing function:
+                // `main` reported an unhandled error where the interpreter
+                // produced an `Err` element.
+                self.closure_types.insert(body.span().start, ret.clone());
                 return Type::Fn {
                     params: param_tys,
                     ret: Box::new(ret),
@@ -5954,6 +6089,7 @@ bind the component to a `var`, or use a struct when the parts have names worth w
         self.closure_floors.pop();
         self.scopes.pop();
         self.closure_types.insert(span.start, ret.clone());
+        self.closure_types.insert(body.span().start, ret.clone());
         Type::Fn {
             params: param_tys,
             ret: Box::new(ret),

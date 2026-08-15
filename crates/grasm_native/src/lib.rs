@@ -1448,6 +1448,14 @@ impl<'m> Codegen<'m> {
             other => Some(other.clone()),
         };
         let (last, terminated) = fcx.eval_block_inner(&f.body)?;
+        // A body whose last statement is a bare `{ … return … }` block leaves
+        // through that `return`, and the block it left in is already closed —
+        // but `eval_block_inner` reports the *statement* as non-terminating,
+        // so the epilogue added a second terminator and Cranelift refused the
+        // function. The refusal named nothing ("codegen bug in `main`:
+        // Verifier errors") and covered a quarter of every well-typed program
+        // containing a `return`.
+        let terminated = terminated || fcx.is_filled();
         if !terminated {
             match (&sig_ret, last) {
                 (VType::Unit, last) => {
@@ -3712,6 +3720,23 @@ impl FnCx<'_, '_> {
                     let want = self.cg.vtype_of(te)?;
                     if want == VType::F64 && vt == VType::I64 {
                         v = self.b.ins().fcvt_from_sint(types::F64, v);
+                    }
+                    // A binding annotated `T ! E` may be given either half,
+                    // exactly as a fallible function's return position is
+                    // ([T-OK-ERR-RETURN]) — `let v: str ! E = if c { "a" }
+                    // else { "b" }` produced a bare string and bound it under
+                    // a type that says it is a boxed variant, so reading it
+                    // back dereferenced a `str` as one: a wrong answer for
+                    // some payloads and a misaligned-pointer abort for others.
+                    if let VType::Fallible(ok_t, _) = want.clone() {
+                        if !matches!(vt, VType::Fallible(..)) {
+                            let mut inner = v;
+                            if *ok_t == VType::F64 && vt == VType::I64 {
+                                inner = self.b.ins().fcvt_from_sint(types::F64, inner);
+                            }
+                            let boxed = self.box_value(inner, &ok_t);
+                            v = self.call_rt("grasm_ok_new", &[boxed]).unwrap();
+                        }
                     }
                     vt = want;
                 }
@@ -7345,6 +7370,16 @@ impl FnCx<'_, '_> {
         ok_t: &VType,
         rhs: &Expr,
     ) -> CResult<(Value, VType)> {
+        // A value whose ok half nothing determined — `xs.map(|x| Err(e))`,
+        // where the closure never says what a success would hold — takes it
+        // from the fallback, which is the only side that knows. Left as
+        // `Any`, the merge held a boxed value on one edge and an immediate on
+        // the other, and reading it back dereferenced the fallback: a
+        // misaligned-pointer abort with nothing on stdout or stderr.
+        let ok_t = &match (ok_t, self.probe_type(rhs)) {
+            (VType::Any, Ok(t)) if t != VType::Any => t,
+            _ => ok_t.clone(),
+        };
         let ok_blk = self.b.create_block();
         let err_blk = self.b.create_block();
         let merge = self.b.create_block();
@@ -8037,6 +8072,30 @@ impl FnCx<'_, '_> {
             // and fails only where it has to be inferred — as a list element,
             // say — which is a hole that reads as "the backend cannot do this"
             // while looking nothing like it.
+            // `Cfg.base()` is an effect operation, not a method: its type is
+            // the operation's declared result. Left to the builtin table it
+            // was "`.base()` on a receiver whose type is not known here",
+            // which named an effect a receiver — and refused the operation
+            // inside a list literal while every other position compiled.
+            Expr::MethodCall { recv, name, .. }
+                if matches!(&**recv, Expr::Ident(tid)
+                    if self.lookup(&tid.name).is_none()
+                        && self.cg.effects.contains_key(&tid.name)) =>
+            {
+                let Expr::Ident(tid) = &**recv else {
+                    unreachable!("just matched")
+                };
+                let ops = self.cg.effects.get(&tid.name).cloned().unwrap_or_default();
+                match ops.iter().find(|(o, _, _)| *o == name.name) {
+                    Some((_, _, ret)) => ret.clone(),
+                    None => {
+                        return nope(
+                            name.span,
+                            format!("`{}` is not an operation of effect `{}`", name.name, tid.name),
+                        )
+                    }
+                }
+            }
             Expr::MethodCall { recv, name, args, .. } => match name.name.as_str() {
                 "len" => VType::I64,
                 "is_nan" | "is_finite" => VType::Bool,

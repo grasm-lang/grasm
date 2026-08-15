@@ -240,6 +240,14 @@ construction, so codegen is the only thing left to disagree about. It earned
 its place on its first run by finding a construct that ran under the
 interpreter and would not compile natively, which the 130 had all missed.
 
+`scripts/fuzz_fallible.py` narrows the aim at the shape that has produced the
+most miscompiles by a wide margin: a fallible function whose value-position
+`if`, `match`, `return` or annotated `let` mixes a bare ok half with `Ok(..)`,
+`Err(..)`, `fail(..)` and a fallible call. Each of those positions is a
+separate conversion in the backend and each has been wrong at least once —
+turning an `Err` into an `Ok` carrying a heap address, inverting an exit code,
+or aborting on a misaligned pointer. It found three of them on its first run.
+
 `scripts/crosstest.sh` runs the same gate against a *cross-compiled* target to
 prove the backend isn't accidentally host-specific — currently **130 identical,
 0 mismatched, 0 unsupported** for x86_64 built on arm64. CI
@@ -448,7 +456,7 @@ Currently **65 normative clauses, 65 conformance programs**.
 | `projects/advanced` | validation: router+middleware, scheduler, WAL mini-DB, **Mini-Grasm interpreter written in Grasm** |
 | `spec/` | normative specification + one conformance program per clause |
 | `editors/` | VS Code extension and LSP setup for other editors |
-| `scripts/` | `difftest.sh` (native vs interpreter), `crosstest.sh` (cross-target), `fuzz_differential.py` (generated programs) |
+| `scripts/` | `difftest.sh` (native vs interpreter), `crosstest.sh` (cross-target), `fuzz_differential.py` and `fuzz_fallible.py` (generated programs) |
 | `MASTERPLAN.md` | the full v0.3 strategic blueprint this implements Phase 0–1 of |
 
 ## Status

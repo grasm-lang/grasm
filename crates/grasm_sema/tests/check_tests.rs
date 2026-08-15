@@ -1566,3 +1566,55 @@ fn return_takes_a_branching_expression_of_either_half() {
         "{e}fn pick(n: i64) -> i64 ! E {{\n    return match n {{\n        0 -> 3\n        1 -> Ok(4)\n        _ -> Err(Bad)\n    }}\n}}\nfn main() {{\n    print(\"{{pick(0) ?? 0 - 1}}\")\n}}\n"
     ));
 }
+
+/// A failure held inside any container is discarded with it
+/// ([T-FALLIBLE-UNHANDLED]).
+///
+/// The recursion stopped at the type-argument boundary, so one constructor —
+/// `Some(save())`, a struct literal, a sum variant — laundered a failure past
+/// the rule, and so did a list of them.
+#[test]
+fn a_constructor_does_not_launder_a_discarded_failure() {
+    let prelude = "type E = | Bad\ntype Report = { written: () ! E }\ntype Wrapped = | W(c: () ! E) | N\nfn save() -> () ! E {\n    fail(Bad)\n}\n";
+    for held in ["Some(save())", "Report{ written: save() }", "W(save())"] {
+        check_err(
+            &format!("{prelude}fn main() {{\n    {held}\n    print(\"done\")\n}}\n"),
+            "holds failures",
+        );
+    }
+    // Bound, they are a value somebody can read.
+    check_ok(&format!(
+        "{prelude}fn main() {{\n    let r = Some(save())\n    print(\"{{r.is_some()}}\")\n}}\n"
+    ));
+}
+
+/// A tuple component is not a place, in the `inout` spelling too ([G-PLACE]).
+#[test]
+fn a_tuple_component_is_not_an_inout_argument() {
+    check_err(
+        "fn bump(inout n: i64) {\n    n += 1\n}\nfn main() {\n    var t = (1, 2)\n    bump(t.0)\n    print(\"{t}\")\n}\n",
+        "cannot pass a tuple component as `inout`",
+    );
+    check_ok(
+        "fn bump(inout n: i64) {\n    n += 1\n}\nfn main() {\n    var n = 1\n    bump(n)\n    print(\"{n}\")\n}\n",
+    );
+}
+
+/// An effect and a type may not share a name ([T-MODULE-NS]).
+///
+/// An effect declares `EHandler` too, so a type of that name collides with
+/// something the reader never wrote.
+#[test]
+fn an_effect_may_not_collide_with_a_type() {
+    check_err(
+        "type Clock = i64\neffect Clock {\n    fn now() -> i64\n}\nfn main() {\n    print(\"x\")\n}\n",
+        "collides with a type of that name",
+    );
+    check_err(
+        "type ClockHandler = i64\neffect Clock {\n    fn now() -> i64\n}\nfn main() {\n    print(\"x\")\n}\n",
+        "declares `ClockHandler`",
+    );
+    check_ok(
+        "effect Clock {\n    fn now() -> i64\n}\nfn main() {\n    with Clock handled_by ClockHandler{ now: || 1 } {\n        print(\"{Clock.now()}\")\n    }\n}\n",
+    );
+}
