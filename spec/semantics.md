@@ -259,6 +259,15 @@ and `()` was accepted as an initializer without checking — so
 `i64` at run time: it printed as `1`, compared unequal to `()`, and could be
 passed to a `fn f(u: ())`. `()` has one value.
 
+A branch that must deliver a value has to *end in an expression*. The expected
+type is pushed into a tail expression and there is nothing to push it into
+otherwise, so a branch ending in a `with`, `for` or `while` statement sailed
+past the demand entirely: `if c { 7 } else { with D handled_by h { n } }` in an
+`-> i64` function checked clean, `grasm run` printed `()` where the integer
+belonged and a compiled build printed `0` — while the same `with` as the
+*whole* body was refused. A branch that leaves — `return`, `break`, `continue`
+— delivers its value by not coming back, and is not this case.
+
 **[E-IF-FALLIBLE-MERGE]** When the branches are `Err(e)` and `Ok(v)`, the
 `if` is worth `T ! E` with `T` from the `Ok` side. `Err(e)` says nothing about
 the ok half, so a branch that is only `Err` cannot decide the type by itself —

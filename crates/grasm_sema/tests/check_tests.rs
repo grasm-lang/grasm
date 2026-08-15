@@ -1439,3 +1439,60 @@ fn a_let_mismatch_is_not_blamed_on_the_return_type() {
         "function `g` must return `str` but its body produces `i64`",
     );
 }
+
+/// A value-bearing branch has to end in an expression ([E-IF-VALUE]).
+///
+/// `check_block_with` pushes the expected type into a tail *expression* and
+/// has nothing to push it into otherwise, so a branch ending in a `with`
+/// statement sailed past the demand: the checker accepted it, the interpreter
+/// printed `()` where an integer belonged, and a native build printed `0`.
+#[test]
+fn a_value_branch_may_not_end_in_a_statement() {
+    check_err(
+        "effect D {\n    fn depth() -> i64\n}\nfn go(n: i64) -> i64 {\n    if n == 0 {\n        7\n    } else {\n        with D handled_by DHandler{ depth: || n * 10 } {\n            n + 1\n        }\n    }\n}\nfn main() {\n    with D handled_by DHandler{ depth: || 0 } {\n        print(\"{go(3)}\")\n    }\n}\n",
+        "must produce `i64` but ends in a statement",
+    );
+    // A branch that leaves delivers its value by not coming back.
+    check_ok(
+        "fn g(n: i64) -> i64 {\n    if n < 0 {\n        return 0\n    } else {\n        n + 1\n    }\n}\nfn main() {\n    print(\"{g(2)}\")\n}\n",
+    );
+    // A statement followed by a value is the ordinary shape.
+    check_ok(
+        "fn g(n: i64) -> i64 {\n    if n == 0 {\n        7\n    } else {\n        var t = 0\n        for i in 0..n {\n            t = t + i\n        }\n        t\n    }\n}\nfn main() {\n    print(\"{g(4)}\")\n}\n",
+    );
+}
+
+/// `inout` twice is about the same *place*, not the same root
+/// ([T-INOUT-EXCLUSIVE]).
+///
+/// Comparing roots alone refused `two(p.xs, p.ys)` — two fields that share
+/// nothing but the struct they live in.
+#[test]
+fn two_disjoint_fields_may_both_be_inout() {
+    let two = "fn two(inout a: [i64], inout b: [i64]) {\n    a.push(1)\n    b.push(2)\n}\n";
+    check_ok(&format!(
+        "type P = {{ xs: [i64], ys: [i64] }}\n{two}fn main() {{\n    var p = P{{ xs: [], ys: [] }}\n    two(p.xs, p.ys)\n    print(\"{{p.xs}}\")\n}}\n"
+    ));
+    // The same field twice is the same place.
+    check_err(
+        &format!(
+            "type P = {{ xs: [i64] }}\n{two}fn main() {{\n    var p = P{{ xs: [] }}\n    two(p.xs, p.xs)\n    print(\"{{p.xs}}\")\n}}\n"
+        ),
+        "passed as `inout` twice",
+    );
+    // A whole value beside one of its fields overlaps.
+    check_err(
+        &format!(
+            "type P = {{ xs: [i64] }}\nfn mix(inout a: P, inout b: [i64]) {{\n    b.push(1)\n    a.xs.push(2)\n}}\nfn main() {{\n    var p = P{{ xs: [] }}\n    mix(p, p.xs)\n    print(\"{{p.xs}}\")\n}}\n"
+        ),
+        "passed as `inout` twice",
+    );
+    let _ = two;
+    // Two indices may be the same element, so they are treated as one place.
+    check_err(
+        &format!(
+            "{two}fn main() {{\n    var g = [[1], [2]]\n    two(g[0], g[1])\n    print(\"{{g}}\")\n}}\n"
+        ),
+        "passed as `inout` twice",
+    );
+}

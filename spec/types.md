@@ -284,8 +284,13 @@ receiver nothing checked.
 
 **[T-INOUT-PLACE]** Its argument must be a variable, field, or index
 expression — never a temporary. **[T-INOUT-MUTABLE]** That place must be
-mutable. **[T-INOUT-EXCLUSIVE]** The same variable may not be passed as
-`inout` twice in one call, nor as both `own` and `inout`.
+mutable. **[T-INOUT-EXCLUSIVE]** The same *place* may not be passed as
+`inout` twice in one call, nor as both `own` and `inout`. Two places overlap
+when one is a prefix of the other — `p` covers `p.xs` — and two different
+fields of one value do not: `two(p.xs, p.ys)` is legal, and comparing roots
+alone refused it, on the most ordinary shape a struct-of-collections has. An
+*index* is treated as naming any element, because `g[i]` and `g[j]` may be the
+same one and nothing here can tell.
 
 **[T-INOUT-REF]** Nor may an `inout` argument be reached through a `ref`.
 `inout` works by snapshotting the place at the call and writing it back at the

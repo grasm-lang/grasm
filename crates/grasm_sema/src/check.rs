@@ -2418,6 +2418,40 @@ afterwards has nowhere to send the effect — call it here, or return what it co
         out
     }
 
+
+    /// A branch that must deliver a value has to end in an expression.
+    ///
+    /// `check_block_with` pushes the expected type into a tail *expression*
+    /// and has nothing to push it into otherwise — so a branch ending in a
+    /// `with`, `for` or `while` statement sailed past the demand entirely:
+    /// `fn go(n) -> i64 { if c { 7 } else { with D handled_by h { n } } }`
+    /// checked clean, the interpreter printed `()` where an integer belonged,
+    /// and a native build printed `0` — while the same `with` as the whole
+    /// body was refused. A branch that *leaves* (`return`, `break`,
+    /// `continue`, a diverging call) delivers its value by not coming back,
+    /// and is not this case.
+    fn require_branch_value(&mut self, b: &Block, got: &Type, want: &Type) {
+        if *want == Type::Unit {
+            return;
+        }
+        match b.stmts.last() {
+            None => {}
+            Some(Stmt::Expr(_)) | Some(Stmt::Return(..)) | Some(Stmt::Break(_))
+            | Some(Stmt::Continue(_)) => return,
+            Some(_) => {}
+        }
+        if self.uni.shallow_resolve(got) == Type::Unit {
+            let w = self.show(want);
+            let span = b.stmts.last().map(stmt_span).unwrap_or(b.span);
+            self.error_help(
+                span,
+                format!("this branch must produce `{w}` but ends in a statement"),
+                "the last expression of a branch is its value — a `with`, `for` or `while` \
+produces none; end the branch with the value it computes",
+            );
+        }
+    }
+
     fn check_assign_target(&mut self, target: &Expr) {
         let mut root = target;
         while let Expr::Field { recv, .. } | Expr::Index { recv, .. } = root {
@@ -2599,10 +2633,12 @@ afterwards has nowhere to send the effect — call it here, or return what it co
                 ..
             } => {
                 self.check_expr(cond, &Type::Bool);
-                self.check_block_with(then_block, Some(&want));
+                let t = self.check_block_with(then_block, Some(&want));
+                self.require_branch_value(then_block, &t, &want);
                 match &**eb {
                     ElseBranch::Else(b) => {
-                        self.check_block_with(b, Some(&want));
+                        let t = self.check_block_with(b, Some(&want));
+                        self.require_branch_value(b, &t, &want);
                     }
                     ElseBranch::ElseIf(inner) => self.check_expr(inner, &want),
                 }
@@ -3673,6 +3709,7 @@ fail outside it",
         }
         // Ownership Tier-0: `own` moves, `inout` needs an exclusive mutable place.
         let mut inout_roots: Vec<(String, Span)> = Vec::new();
+        let mut inout_places: Vec<((String, Vec<PlaceSeg>), Span)> = Vec::new();
         let mut own_roots: Vec<String> = Vec::new();
         for ((a, p), mode) in args.iter().zip(&info.params).zip(&info.modes) {
             match mode {
@@ -3742,17 +3779,21 @@ fail outside it",
                             // be the quiet one: the call ran, the write landed
                             // somewhere invisible, and the caller saw nothing.
                             self.reject_capture_write(id, "pass", " as `inout`");
-                            if let Some((first, _)) =
-                                inout_roots.iter().find(|(n, _)| n == &id.name)
-                            {
-                                let first = first.clone();
-                                self.error_help(
-                                    id.span,
-                                    format!(
-                                        "`{first}` is passed as `inout` twice in one call"
-                                    ),
-                                    "two exclusive references to the same value cannot coexist",
-                                );
+                            if let Some(here) = place_path(a) {
+                                if inout_places
+                                    .iter()
+                                    .any(|(prev, _)| places_overlap(prev, &here))
+                                {
+                                    self.error_help(
+                                        id.span,
+                                        format!(
+                                            "`{}` is passed as `inout` twice in one call",
+                                            id.name
+                                        ),
+                                        "two exclusive references to the same value cannot coexist",
+                                    );
+                                }
+                                inout_places.push((here, id.span));
                             }
                             inout_roots.push((id.name.clone(), id.span));
                         }
@@ -6058,6 +6099,46 @@ fn walk_exprs(e: &Expr, f: &mut dyn FnMut(&Expr)) {
         }
         _ => {}
     }
+}
+
+/// One step of a place path. An index is a wildcard: `xs[i]` and `xs[j]` may
+/// be the same element and this pass cannot know.
+#[derive(PartialEq)]
+enum PlaceSeg {
+    Field(String),
+    Index,
+}
+
+/// A place as root name plus the steps taken from it.
+fn place_path(e: &Expr) -> Option<(String, Vec<PlaceSeg>)> {
+    match e {
+        Expr::Ident(id) => Some((id.name.clone(), Vec::new())),
+        Expr::Field { recv, name, .. } => {
+            let (root, mut segs) = place_path(recv)?;
+            segs.push(PlaceSeg::Field(name.name.clone()));
+            Some((root, segs))
+        }
+        Expr::Index { recv, .. } => {
+            let (root, mut segs) = place_path(recv)?;
+            segs.push(PlaceSeg::Index);
+            Some((root, segs))
+        }
+        _ => None,
+    }
+}
+
+/// Whether two places can name the same storage.
+///
+/// One being a prefix of the other is an overlap — `p` covers `p.xs`. Two
+/// different *fields* of one value are disjoint, and refusing them was a
+/// false alarm on the most ordinary shape there is: `two(p.xs, p.ys)` was
+/// "`p` is passed as `inout` twice in one call", about two places that share
+/// nothing but a root ([T-INOUT-EXCLUSIVE] is about the same value).
+fn places_overlap(a: &(String, Vec<PlaceSeg>), b: &(String, Vec<PlaceSeg>)) -> bool {
+    if a.0 != b.0 {
+        return false;
+    }
+    a.1.iter().zip(b.1.iter()).all(|(x, y)| x == y)
 }
 
 fn place_root(e: &Expr) -> Option<&Ident> {

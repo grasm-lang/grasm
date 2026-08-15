@@ -352,7 +352,12 @@ pub fn load_from_disk_in(
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_default();
-    let entry_display = entry_path.display().to_string();
+    // Collapsed like every other path a diagnostic names. A dependency is
+    // reached from the consumer's directory, so its entry came out as
+    // `app/../lib/src/main.gr` — correct, and not what anyone would type. The
+    // capability ceiling's "performed: `io` at ..." line is the one a reader
+    // is most likely to go and open.
+    let entry_display = tidy(entry_path);
     let entry_src = match entry_override {
         Some(src) => src,
         None => std::fs::read_to_string(entry_path)
