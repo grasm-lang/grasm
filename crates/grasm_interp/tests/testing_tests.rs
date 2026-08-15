@@ -543,3 +543,39 @@ j = j + 1\n        }\n        i = i + 1\n    }\n}\n\nfn main() {\n}\n",
         PropertyOutcome::Passed(_) => panic!("this property cannot hold"),
     }
 }
+
+/// A property false only when its parameters agree shrinks to the simplest
+/// witness, not to whatever the generator produced ([E-TEST-SHRINK]).
+///
+/// The joint candidate existed inside a tuple and inside a list, and a `test`
+/// with several parameters is the same shape one level out — where it did
+/// not, so `(a, b)` reported `a = 107, b = 107` because `(0, 107)` and
+/// `(107, 0)` both hold.
+#[test]
+fn parameters_that_must_agree_shrink_together() {
+    let fx = Fixture::new(
+        "joint_params",
+        "test \"components differ\" (a: i64, b: i64) {\n    assert(a != b)\n}\n\nfn main() {\n}\n",
+    );
+    let program = fx.program();
+    let files: Vec<_> = program
+        .files
+        .iter()
+        .map(|f| (f.name.clone(), &f.module, f.imports.clone()))
+        .collect();
+    let mut out = Vec::new();
+    let mut interp = grasm_interp::Interp::new_program(&files, &mut out);
+    let grasm_syntax::ast::Decl::Test(t) = &program.files[0].module.decls[0] else {
+        panic!("expected the test declaration first");
+    };
+    match interp.run_property(&t.params, &t.body, &TestOptions::default()) {
+        PropertyOutcome::Failed { inputs, .. } => {
+            let shown: Vec<String> = inputs
+                .iter()
+                .map(|(n, v)| format!("{n} = {v}"))
+                .collect();
+            assert_eq!(shown, vec!["a = 0", "b = 0"], "not shrunk: {shown:?}");
+        }
+        PropertyOutcome::Passed(_) => panic!("this property cannot hold"),
+    }
+}

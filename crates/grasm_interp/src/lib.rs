@@ -295,12 +295,15 @@ fn test_program_here(
     let (doc_passed, doc_failed, doc_hits) =
         run_doc_examples(program, &opts.filter, out, opts.coverage);
     // Their lines count as covered. They run in their own interpreter — each
-    // example is its own program — so their hits were dropped, and a function
-    // reached *only* by its documented example was reported uncovered even
-    // though the suite had just run it.
-    let coverage = unit_hits.map(|mut hits| {
-        hits.extend(doc_hits);
-        build_coverage(program, &hits)
+    // group is its own synthesized program — so their hits were dropped, and
+    // a function reached *only* by its documented example was reported
+    // uncovered even though the suite had just run it. The hits come back as
+    // (file, line) rather than as offsets, because the offsets belong to a
+    // program with a different span space and a different set of files.
+    let coverage = unit_hits.map(|hits| {
+        let mut cov = build_coverage(program, &hits);
+        cov.covered.extend(doc_hits);
+        cov
     });
     testing::TestSummary {
         passed: passed + doc_passed,
@@ -318,10 +321,10 @@ fn run_doc_examples(
     filter: &str,
     out: &mut impl Write,
     coverage: bool,
-) -> (u32, u32, std::collections::BTreeSet<u32>) {
+) -> (u32, u32, std::collections::BTreeSet<(String, u32)>) {
     let mut passed = 0;
     let mut failed = 0;
-    let mut hits: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    let mut hits: std::collections::BTreeSet<(String, u32)> = std::collections::BTreeSet::new();
     let all: Vec<grasm_sema::docs::Example> = grasm_sema::docs::examples(program)
         .into_iter()
         .filter(|e| filter.is_empty() || e.owner.contains(filter))
@@ -339,7 +342,7 @@ fn run_doc_examples(
             None => groups.push((owner_module, vec![e])),
         }
     }
-    for (_, group) in &groups {
+    for (owner, group) in &groups {
         // A group that does not compile is retried one example at a time, so
         // a single bad example still reports against itself rather than
         // taking its module's other examples down with it.
@@ -355,7 +358,7 @@ fn run_doc_examples(
             // where the same count of plain `test` blocks took 0.13 s.
             let names: Vec<String> = group.iter().map(|e| e.owner.clone()).collect();
             let (oks, h) = run_examples_together(&grouped, &ganalysis, &names, out, coverage);
-            hits.extend(h);
+            hits.extend(doc_hits_in_original(&grouped, program, owner, &h));
             for ok in oks {
                 if ok {
                     passed += 1;
@@ -382,7 +385,7 @@ fn run_example_alone(
     example: &grasm_sema::docs::Example,
     out: &mut impl Write,
     coverage: bool,
-) -> (u32, u32, std::collections::BTreeSet<u32>) {
+) -> (u32, u32, std::collections::BTreeSet<(String, u32)>) {
     let ex_program = grasm_sema::docs::example_program(program, example);
     let mut diags = ex_program.diagnostics.clone();
     let analysis = grasm_sema::check::check_program(&ex_program);
@@ -396,6 +399,8 @@ fn run_example_alone(
         return (0, 1, std::collections::BTreeSet::new());
     }
     let (ok, hits) = run_one_example(&ex_program, &analysis, &example.owner, out, coverage);
+    let owner_module = example.owner.split("::").next().unwrap_or("main");
+    let hits = doc_hits_in_original(&ex_program, program, owner_module, &hits);
     if ok {
         (1, 0, hits)
     } else {
@@ -528,6 +533,73 @@ fn run_one_example(
 
 /// Maps executed span offsets back to (file, line), against every line that
 /// could have executed.
+/// Coverage from a synthesized doc-example program, read back as (file, line)
+/// in the original one.
+///
+/// A group's program is not the program under test: the owner's source is
+/// *inlined* into a synthesized entry, and the offsets a run reports belong to
+/// that entry's span space. Read against the original they landed on the wrong
+/// file or on nothing at all, so a function reached only by its documented
+/// example was reported uncovered — the failure the coverage rule exists to
+/// prevent, one import away. The inlining is line for line, so the whole
+/// translation is a fixed line offset plus a name lookup.
+fn doc_hits_in_original(
+    synth: &grasm_sema::loader::Program,
+    original: &grasm_sema::loader::Program,
+    owner_module: &str,
+    hits: &std::collections::BTreeSet<u32>,
+) -> std::collections::BTreeSet<(String, u32)> {
+    let mut out = std::collections::BTreeSet::new();
+    if hits.is_empty() {
+        return out;
+    }
+    let prefix = grasm_sema::docs::example_group_prefix_lines(original, owner_module) as u32;
+    let indexes: Vec<grasm_syntax::span::LineIndex> = synth
+        .files
+        .iter()
+        .map(|f| grasm_syntax::span::LineIndex::new(&f.src))
+        .collect();
+    // How many lines the owner's own source has, so the appended `test`
+    // blocks — which belong to no file anyone wrote — are dropped.
+    let owner_lines = original
+        .files
+        .iter()
+        .find(|f| f.name == owner_module)
+        .map(|f| f.src.lines().count() as u32);
+    for &offset in hits {
+        let Some(i) = synth.files.iter().rposition(|f| offset >= f.base) else {
+            continue;
+        };
+        let f = &synth.files[i];
+        let line = indexes[i].line_col(offset - f.base).line;
+        if f.name == "main" {
+            // The synthesized entry: the owner's lines, shifted.
+            if line <= prefix {
+                continue;
+            }
+            let owner_line = line - prefix;
+            if owner_lines.is_some_and(|n| owner_line > n) {
+                continue;
+            }
+            if let Some(orig) = original.files.iter().find(|o| o.name == owner_module) {
+                out.insert((orig.path.clone(), owner_line));
+            }
+            continue;
+        }
+        // Every other module is carried over unchanged, so its lines are its
+        // own — but under the name the original program gave it.
+        let name = f.name.trim_start_matches("__doc_host");
+        if let Some(orig) = original
+            .files
+            .iter()
+            .find(|o| o.name == f.name || (name.is_empty() && o.name == "main"))
+        {
+            out.insert((orig.path.clone(), line));
+        }
+    }
+    out
+}
+
 fn build_coverage(
     program: &grasm_sema::loader::Program,
     hits: &std::collections::BTreeSet<u32>,

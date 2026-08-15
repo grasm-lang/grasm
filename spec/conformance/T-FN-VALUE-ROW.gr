@@ -1,6 +1,8 @@
 //! tag: T-FN-VALUE-ROW
 //! expect: error
-//! performs effect(s) `io` not in its declared row
+//! function `quiet` performs effect(s) `io` not in its declared row
+//! function `looped` performs effect(s) `io` not in its declared row
+//! function `aliased` performs effect(s) `io` not in its declared row
 // Naming a function carries its effect row, calling it or not.
 //
 // A built-in higher-order method's function parameter is deliberately
@@ -24,6 +26,43 @@ fn quiet() -> [i64] / {} {
     [1, 2].map(shout)
 }
 
+// And through every binder, not only `let`. `let f = fs[0]` was charged and
+// `for f in fs` was not — the same program one keyword apart — which is a
+// `for` loop away from a printing function running inside a `/ {}` function,
+// on `par_map`'s workers, and in a package declaring `capabilities = []`.
+type Cb = fn(i64) -> i64 / {io}
+
+fn looped(fs: [fn(i64) -> i64 / {io}]) -> i64 / {} {
+    for f in fs {
+        return f(5)
+    }
+    0
+}
+
+// A `type` name counts as the type it stands for ([T-TYPE-ALIAS]). This is
+// read off written syntax, and a row behind a name was not there: `f: Cb`
+// recorded an *empty* row, which then shadowed every fallback.
+fn aliased(f: Cb, x: i64) -> i64 / {} {
+    f(x)
+}
+
+// An element type that declares no effects is charged nothing, whatever some
+// other declaration in the file says.
+fn dbl(n: i64) -> i64 {
+    n * 2
+}
+
+fn pure_sum(fs: [fn(i64) -> i64]) -> i64 / {} {
+    var t = 0
+    for f in fs {
+        t = t + f(2)
+    }
+    t
+}
+
 fn main() {
     print("{quiet()}")
+    print("{looped([shout])}")
+    print("{aliased(shout, 5)}")
+    print("{pure_sum([dbl])}")
 }

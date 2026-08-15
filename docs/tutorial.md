@@ -499,7 +499,10 @@ capability — but the handler answers for what it really does, so a `Log`
 handler that calls `print` puts `io` in the ceiling whoever asked for it.
 
 `grasm deps` resolves the graph, checks every package against its ceiling, and
-writes `grasm.lock` with a SHA-256 over each package's sources.
+writes `grasm.lock` with a SHA-256 over each package's manifest and sources.
+The manifest is in the digest because the `capabilities` line is what a
+consumer is relying on: three releases with identical code and different
+ceilings hashed the same without it.
 
 ## 9. Testing
 
@@ -560,7 +563,10 @@ rather than merely often. The rest of the run is the widening random mix.
 `grasm test --coverage` reports which statement lines the suite reached —
 counting the lines that doc examples reach, since those are tests too. It did
 not, so a function reached *only* by its own documented example was reported
-uncovered while the suite had just run it.
+uncovered while the suite had just run it — and then it did, but only for the
+entry file: a group of examples runs in a synthesized program where the owner's
+source is inlined, so the lines an *imported* module's examples reached were
+being read against the wrong file.
 `bench "name" { ... }` bodies are warmed up, then sampled, and `grasm bench`
 reports time per operation, in whatever unit keeps the figure readable.
 

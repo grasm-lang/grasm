@@ -10056,6 +10056,35 @@ which is what a list of nothings was standing in for)",
         Ok((out, VType::List(Box::new(out_elem_t))))
     }
 
+    /// Whether a bare identifier in a pattern *tests* for a variant rather
+    /// than binding a name.
+    ///
+    /// [G-PAT-BIND]: it tests only when it names a nullary variant of **the
+    /// scrutinee's type**. Asked of every type in the program instead — and
+    /// of the literal name `None` whatever the scrutinee — `match n { None ->
+    /// … }` over an `i64` compiled as a variant test on a scalar. The arm's
+    /// body then read a name nothing had bound, and the binary died with
+    /// SIGSEGV and no output, or with `panic: assertion failed`, while the
+    /// interpreter printed the answer. §11 promises the backend refuses what
+    /// it cannot compile rather than miscompiling it.
+    fn pattern_names_variant(&self, name: &str, st: &VType) -> bool {
+        match st {
+            VType::Option(_) => name == "None",
+            VType::Fallible(..) => name == "Ok" || name == "Err",
+            VType::Sum(parent) => matches!(
+                self.cg.variant_index.get(name),
+                Some((p, 0)) if p == parent
+            ),
+            // A type the probe could not pin down. Every variant name is a
+            // candidate, which is what this arm used to do for every
+            // scrutinee.
+            VType::Any => {
+                matches!(self.cg.variant_index.get(name), Some((_, 0))) || name == "None"
+            }
+            _ => false,
+        }
+    }
+
     /// Declares the *types* a pattern would bind, without emitting any code.
     /// Used to type-probe match arm bodies before lowering.
     fn bind_pattern_types(&mut self, pat: &Pattern, st: &VType) -> CResult<()> {
@@ -10066,9 +10095,7 @@ which is what a list of nothings was standing in for)",
                 Ok(())
             }
             Pattern::Bind(id) => {
-                let is_variant = matches!(self.cg.variant_index.get(&id.name), Some((_, 0)))
-                    || id.name == "None";
-                if !is_variant {
+                if !self.pattern_names_variant(&id.name, st) {
                     let var = self.new_var(st);
                     self.bind(&id.name, var, st.clone());
                 }
@@ -10156,18 +10183,11 @@ which is what a list of nothings was standing in for)",
                 Ok(true)
             }
             Pattern::Bind(id) => {
-                // Nullary-variant name check.
-                if let Some((_, 0)) = self.cg.variant_index.get(&id.name).cloned() {
+                // A nullary variant *of the scrutinee's type* tests; anything
+                // else binds ([G-PAT-BIND]).
+                if self.pattern_names_variant(&id.name, st) {
                     let sv = self.b.use_var(svar);
                     let (vp, vl) = self.str_ptr_len(&id.name);
-                    let c = self.call_rt("grasm_variant_is", &[sv, vp, vl]).unwrap();
-                    self.b.ins().brif(c, body_blk, &[], next_test, &[]);
-                    self.filled = true;
-                    return Ok(true);
-                }
-                if id.name == "None" {
-                    let sv = self.b.use_var(svar);
-                    let (vp, vl) = self.str_ptr_len("None");
                     let c = self.call_rt("grasm_variant_is", &[sv, vp, vl]).unwrap();
                     self.b.ins().brif(c, body_blk, &[], next_test, &[]);
                     self.filled = true;

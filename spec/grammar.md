@@ -348,6 +348,16 @@ pattern = "_" | int_lit | "-" int_lit | bool_lit | string_lit
 **[G-PAT-BIND]** A bare identifier binds unless it names a nullary variant of
 the scrutinee's type, in which case it tests for that variant.
 
+*The scrutinee's* type, not any type. `None` is a nullary variant of `Option`,
+and an `i64` is not an `Option`, so `match n { None -> … }` over one binds the
+name. The compiled backend asked whether the name was a nullary variant of
+anything the program declared, so it emitted a variant test against a scalar:
+the arm's body then read a name nothing had bound, and the binary died with
+SIGSEGV and no output — or with `panic: assertion failed` — while the
+interpreter printed the answer. Nothing in the program has to declare the
+colliding type: `None` is in the prelude, so the shape is one variable name
+away in any program at all.
+
 ## 11. Nesting limit
 
 **[G-NEST-LIMIT]** The depth of the syntax tree is capped. Exceeding the cap

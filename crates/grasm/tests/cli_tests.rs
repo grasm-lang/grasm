@@ -1369,3 +1369,208 @@ fn a_build_that_cannot_write_its_output_says_so_plainly() {
     let got = Command::new(&good).output().expect("runs");
     assert_eq!(String::from_utf8_lossy(&got.stdout).trim(), "x");
 }
+
+/// A `capabilities = []` package cannot reach a C function by taking a
+/// function value that declares the row.
+///
+/// The row on a `[fn(i64) -> i64 / {io, unsafe}]` element was dropped by the
+/// `for` that bound it, so the library called into `getpid` while
+/// `grasm deps` certified it as performing nothing and wrote that into the
+/// lockfile.
+#[test]
+fn a_ceiling_holds_against_a_function_value_parameter() {
+    let w = Work::new("rowceiling");
+    w.package(
+        "lib",
+        "[package]\nname = \"lib\"\nversion = \"0.1.0\"\ncapabilities = []\n",
+        "pub fn call_all(fs: [fn(i64) -> i64 / {io, unsafe}]) -> i64 {\n    \
+for f in fs {\n        return f(0)\n    }\n    0\n}\n",
+    );
+    let app = w.package(
+        "app",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\ncapabilities = [\"io\", \"unsafe\"]\n\n[dependencies.lib]\npath = \"../lib\"\n",
+        "import lib\n\nextern fn getpid() -> i64\n\nfn pid(x: i64) -> i64 {\n    \
+unsafe {\n        getpid() + x\n    }\n}\n\nfn main() {\n    print(\"{lib.call_all([pid])}\")\n}\n",
+    );
+    let entry = app_entry(&app);
+    for args in [vec!["check", entry.as_str()], vec!["run", entry.as_str()]] {
+        let (code, out) = run(&args);
+        assert_eq!(code, 1, "{args:?}: {out}");
+        assert!(out.contains("package `lib` performs"), "{args:?}: {out}");
+    }
+    let out = Command::new(GRASM)
+        .arg("deps")
+        .arg(".")
+        .current_dir(&app)
+        .output()
+        .expect("runs");
+    assert_eq!(out.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&out.stdout).into_owned()
+        + &String::from_utf8_lossy(&out.stderr);
+    assert!(!text.contains("lib              performs []"), "{text}");
+    assert!(!app.join("grasm.lock").exists(), "{text}");
+}
+
+/// A flag written before the directory does not swallow its place.
+///
+/// `args.get(1)` was the whole operand scan, so `grasm deps --locked <dir>`
+/// reported on the *working directory* and exited 0 with a clean bill of
+/// health for a package that was never named — including when `<dir>` did not
+/// exist.
+#[test]
+fn a_flag_before_the_directory_does_not_swallow_it() {
+    let w = Work::new("depsflag");
+    let pkg = w.package(
+        "dd",
+        "[package]\nname = \"dd\"\nversion = \"0.1.0\"\ncapabilities = []\n",
+        "fn main() {\n    let x = 1\n}\n",
+    );
+    // Establish a lockfile so `--locked` has something to compare against.
+    let (code, out) = run(&["deps", pkg.to_str().unwrap()]);
+    assert_eq!(code, 0, "{out}");
+
+    let missing = w.0.join("nowhere");
+    let out = Command::new(GRASM)
+        .args(["deps", "--locked", missing.to_str().unwrap()])
+        .current_dir(&pkg)
+        .output()
+        .expect("runs");
+    let text = String::from_utf8_lossy(&out.stdout).into_owned()
+        + &String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(!text.contains("up to date"), "{text}");
+    assert!(text.contains("nowhere"), "{text}");
+
+    // And the flag still works when the directory is real.
+    let out = Command::new(GRASM)
+        .args(["deps", "--locked", pkg.to_str().unwrap()])
+        .current_dir(&w.0)
+        .output()
+        .expect("runs");
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// A flag written before the file does not take its place.
+///
+/// The operand scan read position 1 only, so `grasm test --cases 5 f.gr` —
+/// the ordinary spelling — printed the usage line, which reads as "that file
+/// is wrong".
+#[test]
+fn a_flag_before_the_file_does_not_take_its_place() {
+    let w = Work::new("flagfirst");
+    let dir = w.0.join("src");
+    std::fs::create_dir_all(&dir).unwrap();
+    let entry = dir.join("t.gr");
+    std::fs::write(
+        &entry,
+        "test \"one\" {\n    assert(1 == 1)\n}\n\nfn main() {\n    print(\"x\")\n}\n",
+    )
+    .unwrap();
+    let p = entry.to_str().unwrap();
+
+    let (code, out) = run(&["test", "--cases", "5", p]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("1 passed"), "{out}");
+    // The same flags after the file still work.
+    let (code, out) = run(&["test", p, "--cases", "5"]);
+    assert_eq!(code, 0, "{out}");
+
+    // A bad flag value is still named, whichever side it is written on.
+    for args in [
+        vec!["test", "--cases", "0", p],
+        vec!["test", p, "--cases", "0"],
+    ] {
+        let (code, out) = run(&args);
+        assert_eq!(code, 1, "{args:?}: {out}");
+        assert!(out.contains("--cases must be at least 1"), "{args:?}: {out}");
+    }
+
+    let md = w.0.join("out.md");
+    let (code, out) = run(&["doc", "-o", md.to_str().unwrap(), p]);
+    assert_eq!(code, 0, "{out}");
+    assert!(md.exists(), "{out}");
+
+    let (code, out) = run(&["bench", "--filter", "nothing", p]);
+    assert_eq!(code, 0, "{out}");
+}
+
+/// A doc example in an *imported* module credits the lines it ran.
+///
+/// A group's examples run in a synthesized program where the owner's source
+/// is inlined into a new entry, so the offsets they report belong to that
+/// entry's span space. Read against the original they landed on the wrong
+/// file, and the function the example had just run was reported uncovered —
+/// the failure the coverage rule exists to prevent, one import away.
+#[test]
+fn a_doc_example_in_an_imported_module_counts_toward_coverage() {
+    let w = Work::new("doccov");
+    let dir = w.0.join("src");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("helper.gr"),
+        "/// Doubles a number.\n///\n/// ```\n/// assert(dbl(2) == 4)\n/// ```\n\
+pub fn dbl(n: i64) -> i64 {\n    n * 2\n}\n",
+    )
+    .unwrap();
+    let entry = dir.join("app.gr");
+    std::fs::write(
+        &entry,
+        "import helper\n\nfn main() {\n    print(\"{helper.dbl(1)}\")\n}\n",
+    )
+    .unwrap();
+    let (code, out) = run(&["test", entry.to_str().unwrap(), "--coverage"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("doc example helper::dbl ... ok"), "{out}");
+    // `helper.gr:7` is the line the example ran; only `app.gr:4` is left.
+    assert!(!out.contains("helper.gr: 1 uncovered"), "{out}");
+    assert!(out.contains("app.gr: 1 uncovered"), "{out}");
+    assert!(!out.contains("coverage: 0.0%"), "{out}");
+}
+
+/// A bare identifier in a pattern binds unless it names a nullary variant of
+/// *the scrutinee's type* ([G-PAT-BIND]) — in every engine.
+///
+/// The compiled backend asked whether the name was a nullary variant of any
+/// type in the program, so `match n { None -> … }` over an `i64` became a
+/// variant test on a scalar: the arm's body read a name nothing had bound and
+/// the binary died with SIGSEGV and no output, while the interpreter printed
+/// the answer.
+#[test]
+fn a_pattern_binder_that_shares_a_variants_name_agrees_across_engines() {
+    let w = Work::new("patbind");
+    let dir = w.0.join("src");
+    std::fs::create_dir_all(&dir).unwrap();
+    let entry = dir.join("p.gr");
+    std::fs::write(
+        &entry,
+        "type A = | On | Off\ntype B = | Yes | No\ntype W = | Wrap(v: i64)\n\n\
+fn main() {\n    \
+let n = 7\n    let a = match n { None -> \"bound\" }\n    print(a)\n    \
+let o: Option[i64] = Some(3)\n    let b = match o { Yes -> \"bound-o\" }\n    print(b)\n    \
+let c = match o { Some(v) -> \"some\" None -> \"none\" }\n    print(c)\n    \
+let p = (1, 2)\n    let d = match p { (Yes, No) -> \"bound-t\" }\n    print(d)\n    \
+let e = match W.Wrap(5) { Wrap(Yes) -> \"bound-w\" }\n    print(e)\n    \
+let f = match A.Off { On -> \"on\" Off -> \"off\" }\n    print(f)\n}\n",
+    )
+    .unwrap();
+    let p = entry.to_str().unwrap();
+    let (code, expected) = run(&["run", p]);
+    assert_eq!(code, 0, "{expected}");
+    assert!(expected.contains("bound"), "{expected}");
+
+    for extra in [vec![], vec!["--native"]] {
+        let bin = w.0.join(if extra.is_empty() { "b" } else { "n" });
+        let mut args = vec!["build", p];
+        args.extend(extra.iter().copied());
+        args.extend(["-o", bin.to_str().unwrap()]);
+        let (code, out) = run(&args);
+        assert_eq!(code, 0, "{args:?}: {out}");
+        let got = Command::new(&bin).output().expect("runs");
+        assert_eq!(got.status.code(), Some(0), "{args:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&got.stdout),
+            expected,
+            "{args:?} disagrees with the interpreter"
+        );
+    }
+}

@@ -981,6 +981,21 @@ capability visible to everyone who depends on you",
     fn collect_fns(&mut self, module: &Module) {
         for decl in &module.decls {
             if let Decl::Fn(f) = decl {
+                // A call resolves to the builtin before it consults any
+                // declaration, so `fn print(x: str)` was accepted and then
+                // never ran — the builtin printed instead, and the reader had
+                // written a function nothing calls. Same shape as a redeclared
+                // builtin type or a reserved effect name: accepted-and-ignored
+                // reads as a definition that took effect.
+                if is_builtin_fn_name(&f.name.name) {
+                    self.error_help(
+                        f.name.span,
+                        format!("function name `{}` is built in", f.name.name),
+                        "a call would reach the builtin, never this declaration — pick a \
+different name, or call it as a method if you meant to extend a type (UFCS)",
+                    );
+                    continue;
+                }
                 let key = format!("{}::{}", self.current_module, f.name.name);
                 if self.fns.contains_key(&key) {
                     self.error(
@@ -6589,6 +6604,34 @@ enum PlaceSeg {
 }
 
 /// A place as root name plus the steps taken from it.
+/// Free functions a call reaches before it consults any declaration.
+///
+/// Method names are deliberately absent: `xs.len()` is a method, and a free
+/// `fn len(xs: [i64])` is the ordinary UFCS extension [L-UFCS] describes.
+/// These are the names written as a plain call.
+fn is_builtin_fn_name(name: &str) -> bool {
+    matches!(
+        name,
+        "print"
+            | "assert"
+            | "assert_eq"
+            | "panic"
+            | "fail"
+            | "read_file"
+            | "write_file"
+            | "file_exists"
+            | "args"
+            | "map"
+            | "now_millis"
+            | "env"
+            | "exit"
+            | "input"
+            | "ref"
+            | "release"
+            | "alive"
+    )
+}
+
 /// Names `resolve_type` answers for before it consults any declaration.
 ///
 /// Kept in step with that function on purpose: a name it handles and this one

@@ -543,6 +543,21 @@ pub fn example_program(program: &Program, example: &Example) -> Program {
 /// time doing that. The examples of one module share a synthesized entry, so
 /// the work is per *module* instead. `examples` must all name the same owner
 /// module; the caller groups them.
+/// How many lines the synthesized entry writes *before* the owner's own
+/// source, which is inlined line for line after them.
+///
+/// Coverage from a doc-example run is measured in the synthesized program and
+/// has to be read back in the original one. The owner's lines survive the
+/// inlining one for one — an `import` is rewritten but stays one line — so
+/// the whole translation is this offset. Without it, a doc example in an
+/// *imported* module credited nothing: the function it had just run was
+/// reported uncovered, which is the exact failure the coverage rule exists to
+/// prevent, one import away.
+pub fn example_group_prefix_lines(program: &Program, owner_module: &str) -> usize {
+    let has_host = program.files.iter().any(|f| f.name == "main");
+    usize::from(has_host && owner_module != "main")
+}
+
 pub fn example_group_program(program: &Program, examples: &[&Example]) -> Program {
     let example = examples.first().expect("a group has at least one example");
     let mut sources: Vec<(String, String)> = program

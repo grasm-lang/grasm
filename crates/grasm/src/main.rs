@@ -187,12 +187,14 @@ fn run() -> ExitCode {
             ExitCode::from((code & 0xff) as u8)
         }
         Some("test") => {
-            let Some(path) = args.get(1).filter(|a| !a.starts_with("--")) else {
+            // The operand is wherever it is written, not at position 1:
+            // `grasm test --cases 5 f.gr` is the ordinary spelling and
+            // printed the usage line, which reads as "that file is wrong".
+            let Some(path) = first_operand(&args[1..], &["--seed", "--cases", "--filter"]) else {
                 eprintln!("usage: grasm test <file.gr> [--coverage] [--seed N] [--cases N] [--filter TEXT]");
                 return ExitCode::FAILURE;
             };
-            let path = path.clone();
-            let opts = match parse_test_opts(&args[2..]) {
+            let opts = match parse_test_opts(&args[1..]) {
                 Ok(o) => o,
                 Err(e) => {
                     eprintln!("error: {e}");
@@ -216,12 +218,11 @@ fn run() -> ExitCode {
             }
         }
         Some("bench") => {
-            let Some(path) = args.get(1).filter(|a| !a.starts_with("--")) else {
+            let Some(path) = first_operand(&args[1..], &["--filter"]) else {
                 eprintln!("usage: grasm bench <file.gr> [--filter TEXT]");
                 return ExitCode::FAILURE;
             };
-            let path = path.clone();
-            let filter = flag_value(&args[2..], "--filter").unwrap_or_default();
+            let filter = flag_value(&args[1..], "--filter").unwrap_or_default();
             let program = match load_and_check(&path) {
                 Ok(p) => p,
                 Err(code) => return code,
@@ -256,11 +257,10 @@ fn run() -> ExitCode {
             }
         }
         Some("doc") => {
-            let Some(path) = args.get(1).filter(|a| !a.starts_with("--")) else {
+            let Some(path) = first_operand(&args[1..], &["-o"]) else {
                 eprintln!("usage: grasm doc <file.gr> [-o out.md]");
                 return ExitCode::FAILURE;
             };
-            let path = path.clone();
             let program = match load_and_check(&path) {
                 Ok(p) => p,
                 Err(code) => return code,
@@ -279,7 +279,7 @@ fn run() -> ExitCode {
                 })
                 .unwrap_or_else(|| "API".to_string());
             let text = grasm_sema::docs::render_markdown(&title, &modules);
-            match flag_value(&args[2..], "-o") {
+            match flag_value(&args[1..], "-o") {
                 Some(out) => match std::fs::write(&out, &text) {
                     Ok(()) => {
                         let items: usize = modules.iter().map(|m| m.items.len()).sum();
@@ -588,9 +588,7 @@ fn run() -> ExitCode {
         }
         Some("deps") => {
             let locked = args.iter().any(|a| a == "--locked");
-            let dir = args
-                .get(1)
-                .filter(|a| !a.starts_with("--"))
+            let dir = first_operand(&args[1..], &[])
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("."));
             match cmd_deps(&dir, locked) {
@@ -602,9 +600,7 @@ fn run() -> ExitCode {
             }
         }
         Some("publish") => {
-            let dir = args
-                .get(1)
-                .filter(|a| !a.starts_with("--"))
+            let dir = first_operand(&args[1..], &["--registry"])
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("."));
             match cmd_publish(&dir, flag_value(&args[1..], "--registry")) {
@@ -749,6 +745,30 @@ fn run() -> ExitCode {
 }
 
 /// `--flag value` lookup.
+/// The first operand among `args`, skipping flags and the values they take.
+///
+/// Reading position 1 alone meant a flag written first swallowed the
+/// operand's place: `grasm deps --locked <dir>` reported on the *working
+/// directory* and exited 0 with a clean bill of health for a package that was
+/// never named — including when `<dir>` did not exist.
+fn first_operand(args: &[String], valued: &[&str]) -> Option<String> {
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "--" {
+            return None;
+        }
+        // `-o out.md` is a flag with a value too, so the scan cannot key on
+        // the number of dashes.
+        if a.starts_with('-') && a.len() > 1 {
+            i += if valued.contains(&a.as_str()) { 2 } else { 1 };
+            continue;
+        }
+        return Some(a.clone());
+    }
+    None
+}
+
 fn flag_value(args: &[String], flag: &str) -> Option<String> {
     let i = args.iter().position(|a| a == flag)?;
     args.get(i + 1).cloned()

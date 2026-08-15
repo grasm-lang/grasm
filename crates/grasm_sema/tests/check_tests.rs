@@ -1922,3 +1922,108 @@ fn a_builtin_type_name_cannot_be_redeclared() {
     );
     check_ok("type Good = { x: i64 }\n\nfn main() {\n    print(\"{Good{ x: 1 }.x}\")\n}\n");
 }
+
+/// Every binder carries a function value's effect row, not just `let`
+/// ([T-FN-VALUE-ROW], [T-FN-TYPE-ROW-CARRIED]).
+///
+/// `let f = fs[0]` was charged correctly and `for f in fs` was charged
+/// nothing — the same program, one keyword apart. So were a `match` payload,
+/// a tuple destructuring and a closure parameter, each of which carried a
+/// printing function past a `/ {}` row, `par_map`'s purity proof and a
+/// package's `capabilities = []`.
+#[test]
+fn every_binder_carries_a_function_values_row() {
+    let base = "fn shout(n: i64) -> i64 {\n    print(\"shout {n}\")\n    n\n}\n";
+    let main = "fn main() {\n    print(\"{quiet([shout])}\")\n}\n";
+    let bodies = [
+        "fn quiet(fs: [fn(i64) -> i64 / {io}]) -> i64 / {} {\n    let f = fs[0]\n    f(5)\n}\n",
+        "fn quiet(fs: [fn(i64) -> i64 / {io}]) -> i64 / {} {\n    for f in fs {\n        return f(5)\n    }\n    0\n}\n",
+        "fn quiet(fs: [fn(i64) -> i64 / {io}]) -> i64 / {} {\n    match fs.find(|g| true) {\n        Some(f) -> f(5)\n        None -> 0\n    }\n}\n",
+        "fn quiet(fs: [fn(i64) -> i64 / {io}]) -> i64 / {} {\n    fs.map(|f| f(5))[0]\n}\n",
+    ];
+    for body in bodies {
+        check_err(&format!("{body}{base}{main}"), "not in its declared row");
+    }
+    // And through a parallel operation, which the clause calls a compile
+    // error rather than a race.
+    check_err(
+        &format!(
+            "fn quiet(fs: [fn(i64) -> i64 / {{io}}]) -> [i64] / {{}} {{\n    \
+fs.par_map(|f| f(5))\n}}\n{base}{main}"
+        ),
+        "not in its declared row",
+    );
+    // An element type that declares no effects is not charged for a row
+    // written somewhere else in the program.
+    check_ok(
+        "type Cb = fn(i64) -> i64 / {io}\n\
+fn shout(n: i64) -> i64 {\n    print(\"{n}\")\n    n\n}\n\
+fn loud(f: Cb) -> i64 / {io} {\n    f(1)\n}\n\
+fn dbl(n: i64) -> i64 {\n    n * 2\n}\n\
+fn pure_sum(fs: [fn(i64) -> i64]) -> i64 / {} {\n    var t = 0\n    \
+for f in fs {\n        t = t + f(2)\n    }\n    t\n}\n\
+fn main() {\n    print(\"{loud(shout)}\")\n    print(\"{pure_sum([dbl])}\")\n}\n",
+    );
+}
+
+/// A type alias for a function type carries its row ([T-TYPE-ALIAS]: "it is
+/// not a new type, and the two are interchangeable everywhere").
+///
+/// This pass reads written syntax rather than resolved types, so a row behind
+/// a name was not there: `f: Cb` seeded an *empty* declared row, which then
+/// shadowed every fallback. One `type` line laundered `io`.
+#[test]
+fn a_type_alias_carries_its_functions_row() {
+    let tail = "fn shout(n: i64) -> i64 {\n    print(\"shout {n}\")\n    n\n}\n\n\
+fn main() {\n    print(\"{quiet(shout, 5)}\")\n}\n";
+    check_err(
+        &format!(
+            "type Cb = fn(i64) -> i64 / {{io}}\n\n\
+fn quiet(f: Cb, x: i64) -> i64 / {{}} {{\n    f(x)\n}}\n\n{tail}"
+        ),
+        "not in its declared row",
+    );
+    // Through a second alias, and inside a container.
+    check_err(
+        &format!(
+            "type Cb = fn(i64) -> i64 / {{io}}\ntype Cb2 = Cb\n\n\
+fn quiet(f: Cb2, x: i64) -> i64 / {{}} {{\n    f(x)\n}}\n\n{tail}"
+        ),
+        "not in its declared row",
+    );
+    check_err(
+        "type Cb = fn(i64) -> i64 / {io}\n\n\
+fn quiet(fs: [Cb]) -> i64 / {} {\n    for f in fs {\n        return f(5)\n    }\n    0\n}\n\n\
+fn shout(n: i64) -> i64 {\n    print(\"shout {n}\")\n    n\n}\n\n\
+fn main() {\n    print(\"{quiet([shout])}\")\n}\n",
+        "not in its declared row",
+    );
+    // An alias for a pure function type is still pure.
+    check_ok(
+        "type Pure = fn(i64) -> i64\n\n\
+fn quiet(f: Pure, x: i64) -> i64 / {} {\n    f(x)\n}\n\n\
+fn dbl(n: i64) -> i64 {\n    n * 2\n}\n\n\
+fn main() {\n    print(\"{quiet(dbl, 5)}\")\n}\n",
+    );
+}
+
+/// A builtin free function's name cannot be redeclared.
+///
+/// A call resolves to the builtin before it consults any declaration, so
+/// `fn print(x: str)` was accepted and then never ran — the builtin printed
+/// instead, and the reader had written a function nothing calls.
+#[test]
+fn a_builtin_function_name_cannot_be_redeclared() {
+    for name in ["print", "panic", "env", "file_exists", "fail", "exit", "read_file"] {
+        check_err(
+            &format!("fn {name}(x: str) -> i64 {{\n    99\n}}\n\nfn main() {{\n}}\n"),
+            "is built in",
+        );
+    }
+    // A free function used in method position is the ordinary UFCS
+    // extension, and a *method* name is not reserved.
+    check_ok(
+        "fn describe(xs: [i64]) -> str {\n    \"n={xs.len()}\"\n}\n\n\
+fn main() {\n    print(\"{[1, 2].describe()}\")\n}\n",
+    );
+}

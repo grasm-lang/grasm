@@ -363,6 +363,16 @@ pattern = "_" | int_lit | "-" int_lit | bool_lit | string_lit
 **[G-PAT-BIND]** A bare identifier binds unless it names a nullary variant of
 the scrutinee's type, in which case it tests for that variant.
 
+*The scrutinee's* type, not any type. `None` is a nullary variant of `Option`,
+and an `i64` is not an `Option`, so `match n { None -> … }` over one binds the
+name. The compiled backend asked whether the name was a nullary variant of
+anything the program declared, so it emitted a variant test against a scalar:
+the arm's body then read a name nothing had bound, and the binary died with
+SIGSEGV and no output — or with `panic: assertion failed` — while the
+interpreter printed the answer. Nothing in the program has to declare the
+colliding type: `None` is in the prelude, so the shape is one variable name
+away in any program at all.
+
 ## 11. Nesting limit
 
 **[G-NEST-LIMIT]** The depth of the syntax tree is capped. Exceeding the cap
@@ -812,6 +822,26 @@ other route dropped the row, which made each of them a way to hand a printing
 function to a `/ {}` row, to `par_map` past [T-PAR-MAP-PURE], to the
 missing-handler backstop [E-HANDLER-MISSING] says well-typed programs never
 reach, and to a package declaring `capabilities = []`.
+
+That is the rule for a value *arriving* at a written type. Calling one that
+arrived is the other half, and it was only carried by `let`. `let f = fs[0]`
+charged `io` and `for f in fs` charged nothing — the same program, one keyword
+apart — and so did a `match` payload, a tuple destructuring and a closure
+parameter. Each of those is a `for` loop away from a printing function running
+inside a `/ {}` function, on `par_map`'s workers, and in a package declaring
+`capabilities = []`. A call through a local that no binder accounts for is
+charged every row written in the *enclosing function's own signature* at a
+position with no field name — its list elements, its tuple components, its
+`Option` payloads. Scoped to that signature rather than to the program: the
+wider pool charged `io` to a function whose own element type declares no
+effects, on the strength of an unrelated declaration elsewhere in the file.
+
+A `type` name counts as the type it stands for, here as everywhere
+([T-TYPE-ALIAS]). This is inferred from written syntax rather than from
+resolved types, and a row behind a name was not there: `f: Cb` for
+`type Cb = fn(i64) -> i64 / {io}` recorded an *empty* row, which then shadowed
+every fallback. One `type` line laundered `io` past all four of the guarantees
+above.
 
 **[T-FN-VALUE-ROW]** Naming a function contributes its effect row to the
 function doing the naming, whether or not the call is written there. Holding a
@@ -2737,7 +2767,10 @@ capability — but the handler answers for what it really does, so a `Log`
 handler that calls `print` puts `io` in the ceiling whoever asked for it.
 
 `grasm deps` resolves the graph, checks every package against its ceiling, and
-writes `grasm.lock` with a SHA-256 over each package's sources.
+writes `grasm.lock` with a SHA-256 over each package's manifest and sources.
+The manifest is in the digest because the `capabilities` line is what a
+consumer is relying on: three releases with identical code and different
+ceilings hashed the same without it.
 
 ## 9. Testing
 
@@ -2798,7 +2831,10 @@ rather than merely often. The rest of the run is the widening random mix.
 `grasm test --coverage` reports which statement lines the suite reached —
 counting the lines that doc examples reach, since those are tests too. It did
 not, so a function reached *only* by its own documented example was reported
-uncovered while the suite had just run it.
+uncovered while the suite had just run it — and then it did, but only for the
+entry file: a group of examples runs in a synthesized program where the owner's
+source is inlined, so the lines an *imported* module's examples reached were
+being read against the wrong file.
 `bench "name" { ... }` bodies are warmed up, then sampled, and `grasm bench`
 reports time per operation, in whatever unit keeps the figure readable.
 
@@ -4998,6 +5034,7 @@ fn main() {
 //! tag: G-PAT-BIND
 //! expect: output
 //! none-case bound-42
+//! bound 7 borrowed-name
 type S = | Empty | Full(v: i64)
 fn describe(s: S) -> str {
     match s {
@@ -5005,8 +5042,29 @@ fn describe(s: S) -> str {
         Full(v) -> "bound-{v}"
     }
 }
+// *Of the scrutinee's type*. `None` is a nullary variant of `Option`, and an
+// `i64` is not an `Option`, so this binds. The compiled backend asked whether
+// the name was a nullary variant of any type in the program, so it emitted a
+// variant test against a scalar: the arm's body then read a name nothing had
+// bound and the binary died with SIGSEGV and no output, while the interpreter
+// printed the answer.
+fn borrowed(n: i64) -> str {
+    match n {
+        None -> "bound {None}"
+    }
+}
+
+// And the other way: over its own type, the same spelling still tests.
+fn own_type(s: S) -> str {
+    match s {
+        Empty -> "borrowed-name"
+        Full(v) -> "full-{v}"
+    }
+}
+
 fn main() {
     print("{describe(Empty)} {describe(Full(42))}")
+    print("{borrowed(7)} {own_type(Empty)}")
 }
 ```
 
@@ -7446,7 +7504,9 @@ fn main() {
 ```grasm
 //! tag: T-FN-VALUE-ROW
 //! expect: error
-//! performs effect(s) `io` not in its declared row
+//! function `quiet` performs effect(s) `io` not in its declared row
+//! function `looped` performs effect(s) `io` not in its declared row
+//! function `aliased` performs effect(s) `io` not in its declared row
 // Naming a function carries its effect row, calling it or not.
 //
 // A built-in higher-order method's function parameter is deliberately
@@ -7470,8 +7530,45 @@ fn quiet() -> [i64] / {} {
     [1, 2].map(shout)
 }
 
+// And through every binder, not only `let`. `let f = fs[0]` was charged and
+// `for f in fs` was not — the same program one keyword apart — which is a
+// `for` loop away from a printing function running inside a `/ {}` function,
+// on `par_map`'s workers, and in a package declaring `capabilities = []`.
+type Cb = fn(i64) -> i64 / {io}
+
+fn looped(fs: [fn(i64) -> i64 / {io}]) -> i64 / {} {
+    for f in fs {
+        return f(5)
+    }
+    0
+}
+
+// A `type` name counts as the type it stands for ([T-TYPE-ALIAS]). This is
+// read off written syntax, and a row behind a name was not there: `f: Cb`
+// recorded an *empty* row, which then shadowed every fallback.
+fn aliased(f: Cb, x: i64) -> i64 / {} {
+    f(x)
+}
+
+// An element type that declares no effects is charged nothing, whatever some
+// other declaration in the file says.
+fn dbl(n: i64) -> i64 {
+    n * 2
+}
+
+fn pure_sum(fs: [fn(i64) -> i64]) -> i64 / {} {
+    var t = 0
+    for f in fs {
+        t = t + f(2)
+    }
+    t
+}
+
 fn main() {
     print("{quiet()}")
+    print("{looped([shout])}")
+    print("{aliased(shout, 5)}")
+    print("{pure_sum([dbl])}")
 }
 ```
 

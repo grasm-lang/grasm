@@ -631,6 +631,28 @@ impl<W: Write> Interp<'_, W> {
         let mut improved = true;
         while improved && budget > 0 {
             improved = false;
+            // Every parameter at once, first. One at a time cannot cross a
+            // failure the parameters share: a property false only when two of
+            // them are equal reported whatever pair the generator produced,
+            // because `(0, 107)` and `(107, 0)` both hold. `shrink` already
+            // does this *inside* a tuple or a list; a `test` with several
+            // parameters is the same shape one level out.
+            if inputs.len() > 1 && budget > 0 {
+                let parts: Vec<Value> = inputs.iter().map(|(_, v)| v.clone()).collect();
+                if let Some(together) = all_at_once(&parts) {
+                    budget -= 1;
+                    let trial: Vec<(String, Value)> = inputs
+                        .iter()
+                        .zip(together)
+                        .map(|((n, _), v)| (n.clone(), v))
+                        .collect();
+                    if let Some(m) = self.try_case(&trial, body) {
+                        inputs = trial;
+                        message = m;
+                        improved = true;
+                    }
+                }
+            }
             for i in 0..inputs.len() {
                 for candidate in shrink(&inputs[i].1) {
                     if budget == 0 {

@@ -72,6 +72,14 @@ struct Ctx<'a> {
     /// is no name to key those on, so calling through an index or any other
     /// computed callee contributes all of them.
     elem_rows: BTreeSet<String>,
+    /// `type Cb = fn(i64) -> i64 / {io}` — an alias is not a new type, and
+    /// the two are interchangeable everywhere ([T-TYPE-ALIAS]). This pass
+    /// reads written syntax rather than resolved types, so a row written
+    /// behind a name was not there: `f: Cb` seeded an *empty* declared row,
+    /// which then shadowed every fallback, and one `type` line laundered
+    /// `io` past a `/ {}` row, `par_map`'s purity proof and a package's
+    /// `capabilities = []`.
+    type_aliases: HashMap<String, TypeExpr>,
     /// effect name → what any handler for it, written anywhere in the
     /// program, performs.
     ///
@@ -230,6 +238,7 @@ pub fn effects_of_program(program: &crate::loader::Program) -> BTreeSet<String> 
         imports: HashMap::new(),
         field_rows: HashMap::new(),
         elem_rows: BTreeSet::new(),
+        type_aliases: HashMap::new(),
         handler_rows: HashMap::new(),
     };
     for f in &views {
@@ -251,6 +260,7 @@ pub fn effects_of_program(program: &crate::loader::Program) -> BTreeSet<String> 
     }
     for f in &views {
         harvest_module(f.module, &mut ctx.field_rows, &mut ctx.elem_rows);
+        collect_type_aliases(f.module, &mut ctx.type_aliases);
     }
     ctx.rows = ctx.fns.keys().map(|k| (k.clone(), BTreeSet::new())).collect();
     loop {
@@ -266,7 +276,7 @@ pub fn effects_of_program(program: &crate::loader::Program) -> BTreeSet<String> 
             let mut row = BTreeSet::new();
             let mut active = Vec::new();
             let mut fnb = FnBindings::default();
-            seed_params(&f.params, &mut fnb);
+            seed_params(&f.params, &mut fnb, &ctx.type_aliases);
             collect_fn_bindings(&f.body, &ctx, &current, &mut fnb);
             walk_block(&f.body, &current, &mut active, &ctx, &fnb, &mut row);
             let entry = ctx.rows.get_mut(&key).unwrap();
@@ -406,6 +416,7 @@ fn build_ctx<'a>(files: &'a [ModuleView<'a>]) -> Ctx<'a> {
         imports: HashMap::new(),
         field_rows: HashMap::new(),
         elem_rows: BTreeSet::new(),
+        type_aliases: HashMap::new(),
         handler_rows: HashMap::new(),
     };
     for f in files {
@@ -427,6 +438,7 @@ fn build_ctx<'a>(files: &'a [ModuleView<'a>]) -> Ctx<'a> {
     }
     for f in files {
         harvest_module(f.module, &mut ctx.field_rows, &mut ctx.elem_rows);
+        collect_type_aliases(f.module, &mut ctx.type_aliases);
     }
     ctx.rows = ctx.fns.keys().map(|k| (k.clone(), BTreeSet::new())).collect();
     ctx
@@ -474,7 +486,7 @@ fn compute_handler_rows(ctx: &Ctx) -> HashMap<String, BTreeSet<String>> {
             let mut row = BTreeSet::new();
             let mut active = Vec::new();
             let mut fnb = FnBindings::default();
-            seed_params(&f.params, &mut fnb);
+            seed_params(&f.params, &mut fnb, &ctx.type_aliases);
             collect_fn_bindings(&f.body, ctx, &current, &mut fnb);
             walk_expr(lit, &current, &mut active, ctx, &fnb, &mut row);
             out.entry(effect.to_string()).or_default().extend(row);
@@ -603,7 +615,7 @@ fn solve_fn_rows(ctx: &mut Ctx) {
             let mut row = BTreeSet::new();
             let mut active = Vec::new();
             let mut fnb = FnBindings::default();
-            seed_params(&f.params, &mut fnb);
+            seed_params(&f.params, &mut fnb, &ctx.type_aliases);
             collect_fn_bindings(&f.body, ctx, &current, &mut fnb);
             walk_block(&f.body, &current, &mut active, ctx, &fnb, &mut row);
             let entry = ctx.rows.get_mut(&key).unwrap();
@@ -667,7 +679,7 @@ fn compute_closure_rows(ctx: &Ctx) -> HashMap<u32, BTreeSet<String>> {
             let mut row = BTreeSet::new();
             let mut active = Vec::new();
             let mut fnb = FnBindings::default();
-            seed_params(&f.params, &mut fnb);
+            seed_params(&f.params, &mut fnb, &ctx.type_aliases);
             collect_fn_bindings(&f.body, ctx, &current, &mut fnb);
             walk_expr(body, &current, &mut active, ctx, &fnb, &mut row);
             out.insert(span.start, row);
@@ -952,7 +964,7 @@ is installed, not around the calls to it ([E-HANDLER-OWN-ROW])",
                 _ => continue,
             };
             let mut fnb = FnBindings::default();
-            seed_params(params, &mut fnb);
+            seed_params(params, &mut fnb, &ctx.type_aliases);
             collect_fn_bindings(body, &ctx, &f.name, &mut fnb);
             check_par_map_block(body, &f.name, &ctx, &fnb, &mut diags);
             check_fn_args_block(body, &f.name, &ctx, &fnb, &mut diags);
@@ -1066,7 +1078,7 @@ fn check_declared_rows_block(
     for stmt in &b.stmts {
         match stmt {
             Stmt::Let { name, ty: Some(t), init, .. } => {
-                if let Some(allowed) = declared_row_within(t) {
+                if let Some(allowed) = declared_row_within(t, &ctx.type_aliases) {
                     declared.insert(name.name.clone(), allowed.clone());
                     report_row_over(init, current, ctx, fnb, &allowed, diags);
                 }
@@ -1157,7 +1169,7 @@ fn check_fn_args_block(
         };
         let decl = ctx.fns[&qual];
         for (arg, param) in args.iter().zip(&decl.params) {
-            let Some(allowed) = declared_row(&param.ty) else {
+            let Some(allowed) = declared_row(&param.ty, &ctx.type_aliases) else {
                 continue;
             };
             let mut row = BTreeSet::new();
@@ -1507,6 +1519,20 @@ struct FnBindings<'a> {
     /// cannot be pinned to one binding: over-approximating there is the whole
     /// point, since under-approximating is what let effects escape.
     any: Vec<FnSource<'a>>,
+    /// Rows written on function types inside *this function's own signature*,
+    /// at positions with no field name to key on — a list element, a tuple
+    /// component, an `Option`'s payload.
+    ///
+    /// A call through a local that no binder here understands is charged
+    /// these. `for f in fs`, a `match` payload, a tuple destructuring and a
+    /// closure parameter each called a `/ {io}` element and were charged
+    /// nothing, while `let f = fs[0]` one line away was charged correctly —
+    /// which let one `for` loop carry a printing function past a `/ {}` row,
+    /// `par_map`'s purity proof and a package's `capabilities = []`. Scoped
+    /// to this signature rather than to every row the program writes: the
+    /// wider pool charged `io` to a function whose own element type declares
+    /// no effects, on the strength of an unrelated declaration elsewhere.
+    signature_rows: BTreeSet<String>,
 }
 
 impl<'a> FnBindings<'a> {
@@ -1631,11 +1657,40 @@ fn fn_sources<'a>(e: &'a Expr, ctx: &Ctx, current: &str, out: &mut Vec<FnSource<
 /// Empty is the meaningful default: `fn(i64) -> i64` accepts only functions
 /// that perform nothing, so an effectful one passed there is an error rather
 /// than a silent widening of whatever row the caller declared.
-fn declared_row(te: &TypeExpr) -> Option<BTreeSet<String>> {
-    match te {
+fn declared_row(te: &TypeExpr, aliases: &HashMap<String, TypeExpr>) -> Option<BTreeSet<String>> {
+    match resolve_alias(te, aliases, 0) {
         TypeExpr::Fn { effects, .. } => Some(effects.iter().map(|p| p.dotted()).collect()),
         _ => None,
     }
+}
+
+/// How many `type` names one written type may hide behind.
+///
+/// A bound rather than a cycle check: `type A = B` and `type B = A` is
+/// refused elsewhere, and this pass must not be the thing that loops.
+const MAX_ALIAS_DEPTH: usize = 32;
+
+/// A written type with its leading alias names resolved.
+///
+/// Returns a clone rather than a borrow because an alias body lives in
+/// another declaration; the types involved are small and this runs once per
+/// binding.
+fn resolve_alias(
+    te: &TypeExpr,
+    aliases: &HashMap<String, TypeExpr>,
+    depth: usize,
+) -> TypeExpr {
+    if depth > MAX_ALIAS_DEPTH {
+        return te.clone();
+    }
+    if let TypeExpr::Name { path, args, .. } = te {
+        if args.is_empty() && path.segments.len() == 1 {
+            if let Some(body) = aliases.get(&path.segments[0].name) {
+                return resolve_alias(body, aliases, depth + 1);
+            }
+        }
+    }
+    te.clone()
 }
 
 /// The row written on a function type *anywhere inside* a written type.
@@ -1645,28 +1700,33 @@ fn declared_row(te: &TypeExpr) -> Option<BTreeSet<String>> {
 /// otherwise a `with` block's closure was stored in an outer list, called
 /// afterwards, and reached the runtime's missing-handler panic that
 /// [E-HANDLER-MISSING] says a well-typed program never reaches.
-fn declared_row_within(te: &TypeExpr) -> Option<BTreeSet<String>> {
-    match te {
+fn declared_row_within(
+    te: &TypeExpr,
+    aliases: &HashMap<String, TypeExpr>,
+) -> Option<BTreeSet<String>> {
+    match &resolve_alias(te, aliases, 0) {
         TypeExpr::Fn { effects, .. } => {
             Some(effects.iter().map(|p| p.dotted()).collect())
         }
-        TypeExpr::List(inner, _) | TypeExpr::Ref(inner, _) => declared_row_within(inner),
+        TypeExpr::List(inner, _) | TypeExpr::Ref(inner, _) => {
+            declared_row_within(inner, aliases)
+        }
         TypeExpr::Fallible(a, b, _) => union_rows(
-            declared_row_within(a),
-            declared_row_within(b),
+            declared_row_within(a, aliases),
+            declared_row_within(b, aliases),
         ),
         // `Option[T]`, `Map[K, V]` and any other named generic.
         TypeExpr::Name { args, .. } => {
             let mut found: Option<BTreeSet<String>> = None;
             for a in args {
-                found = union_rows(found, declared_row_within(a));
+                found = union_rows(found, declared_row_within(a, aliases));
             }
             found
         }
         TypeExpr::Union(items, _) | TypeExpr::Tuple(items, _) => {
             let mut found: Option<BTreeSet<String>> = None;
             for i in items {
-                if let Some(r) = declared_row_within(i) {
+                if let Some(r) = declared_row_within(i, aliases) {
                     found = Some(match found {
                         None => r,
                         Some(prev) => prev.union(&r).cloned().collect(),
@@ -1795,12 +1855,21 @@ fn carried_row(
 
 /// Parameters of function type, so calling one is attributed to its declared
 /// row instead of to nothing.
-fn seed_params<'a>(params: &[Param], fnb: &mut FnBindings<'a>) {
+fn seed_params<'a>(
+    params: &[Param],
+    fnb: &mut FnBindings<'a>,
+    aliases: &HashMap<String, TypeExpr>,
+) {
+    for p in params {
+        if let Some(row) = declared_row_within(&p.ty, aliases) {
+            fnb.signature_rows.extend(row);
+        }
+    }
     for p in params {
         // A parameter is in scope for the whole body, so it shadows a
         // function of the same name everywhere in it.
         fnb.bind_name(&p.name.name, 0);
-        if let Some(row) = declared_row(&p.ty) {
+        if let Some(row) = declared_row(&p.ty, aliases) {
             fnb.by_name
                 .insert(p.name.name.clone(), vec![FnSource::Declared(row)]);
         }
@@ -1931,6 +2000,21 @@ fn indirect_row(
     fnb: &FnBindings,
     out: &mut BTreeSet<String>,
 ) {
+    // Nothing recorded: the name is a local holding a function value that no
+    // binder this pass understands put there. A `for` variable over a list of
+    // them, a `match` payload, a tuple destructuring, a closure parameter —
+    // each of those called a `/ {io}` function and was charged nothing, while
+    // `let f = fs[0]` one line away was charged correctly. Falling back to
+    // every row the program writes without a field name is the same
+    // conservatism `let f = fs[0]` already uses, and it errs toward refusing.
+    if fnb.sources_for(name).is_empty() && !fnb.signature_rows.is_empty() {
+        out.extend(
+            fnb.signature_rows
+                .iter()
+                .filter(|e| !active.contains(e))
+                .cloned(),
+        );
+    }
     for src in fnb.sources_for(name) {
         match src {
             FnSource::Named(n) => {
@@ -2017,6 +2101,24 @@ fn harvest_rows(
         TypeExpr::Name { args, .. } => {
             for a in args {
                 harvest_rows(a, None, field_rows, elem_rows);
+            }
+        }
+    }
+}
+
+/// Every `type N = ...` alias in one module, by name.
+///
+/// Types share one namespace across the program ([T-MODULE-NS]), so one map
+/// over every module is the right shape.
+fn collect_type_aliases(
+    m: &grasm_syntax::ast::Module,
+    out: &mut HashMap<String, TypeExpr>,
+) {
+    use grasm_syntax::ast::TypeBody;
+    for d in &m.decls {
+        if let Decl::Type(td) = d {
+            if let TypeBody::Alias(t) = &td.body {
+                out.insert(td.name.name.clone(), t.clone());
             }
         }
     }

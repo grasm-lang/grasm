@@ -1,6 +1,7 @@
 //! tag: G-PAT-BIND
 //! expect: output
 //! none-case bound-42
+//! bound 7 borrowed-name
 type S = | Empty | Full(v: i64)
 fn describe(s: S) -> str {
     match s {
@@ -8,6 +9,27 @@ fn describe(s: S) -> str {
         Full(v) -> "bound-{v}"
     }
 }
+// *Of the scrutinee's type*. `None` is a nullary variant of `Option`, and an
+// `i64` is not an `Option`, so this binds. The compiled backend asked whether
+// the name was a nullary variant of any type in the program, so it emitted a
+// variant test against a scalar: the arm's body then read a name nothing had
+// bound and the binary died with SIGSEGV and no output, while the interpreter
+// printed the answer.
+fn borrowed(n: i64) -> str {
+    match n {
+        None -> "bound {None}"
+    }
+}
+
+// And the other way: over its own type, the same spelling still tests.
+fn own_type(s: S) -> str {
+    match s {
+        Empty -> "borrowed-name"
+        Full(v) -> "full-{v}"
+    }
+}
+
 fn main() {
     print("{describe(Empty)} {describe(Full(42))}")
+    print("{borrowed(7)} {own_type(Empty)}")
 }

@@ -424,6 +424,26 @@ function to a `/ {}` row, to `par_map` past [T-PAR-MAP-PURE], to the
 missing-handler backstop [E-HANDLER-MISSING] says well-typed programs never
 reach, and to a package declaring `capabilities = []`.
 
+That is the rule for a value *arriving* at a written type. Calling one that
+arrived is the other half, and it was only carried by `let`. `let f = fs[0]`
+charged `io` and `for f in fs` charged nothing — the same program, one keyword
+apart — and so did a `match` payload, a tuple destructuring and a closure
+parameter. Each of those is a `for` loop away from a printing function running
+inside a `/ {}` function, on `par_map`'s workers, and in a package declaring
+`capabilities = []`. A call through a local that no binder accounts for is
+charged every row written in the *enclosing function's own signature* at a
+position with no field name — its list elements, its tuple components, its
+`Option` payloads. Scoped to that signature rather than to the program: the
+wider pool charged `io` to a function whose own element type declares no
+effects, on the strength of an unrelated declaration elsewhere in the file.
+
+A `type` name counts as the type it stands for, here as everywhere
+([T-TYPE-ALIAS]). This is inferred from written syntax rather than from
+resolved types, and a row behind a name was not there: `f: Cb` for
+`type Cb = fn(i64) -> i64 / {io}` recorded an *empty* row, which then shadowed
+every fallback. One `type` line laundered `io` past all four of the guarantees
+above.
+
 **[T-FN-VALUE-ROW]** Naming a function contributes its effect row to the
 function doing the naming, whether or not the call is written there. Holding a
 function is the permission to call it — the rule [T-EXTERN-VALUE] states for a
