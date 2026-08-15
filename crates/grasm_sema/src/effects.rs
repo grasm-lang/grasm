@@ -92,7 +92,31 @@ struct Ctx<'a> {
     /// what its operations do, installing one that was built elsewhere
     /// charges what *any* handler for that effect does — over-approximate,
     /// and the safe direction.
-    handler_rows: HashMap<String, BTreeSet<String>>,
+    /// What each handler literal performs, by (effect, the module it is
+    /// *written in*).
+    ///
+    /// Installing a handler that arrived from elsewhere charges what a handler
+    /// for that effect does ([E-HANDLER-OWN-ROW]) — but charging every handler
+    /// in the program made a library's row a function of its *consumer's*
+    /// code. A `capabilities = []` library that installs a handler its
+    /// consumer passes in was charged the consumer's `io` and failed to build
+    /// for a `print` written entirely in the consumer, with the help text
+    /// telling the library's author to widen a manifest that had nothing wrong
+    /// with it. Authority flows from whoever wrote the handler, and it is
+    /// charged there.
+    handler_rows: HashMap<(String, String), BTreeSet<String>>,
+    /// Module names that are dependency packages, so "the same package" can be
+    /// decided the way [T-CAPABILITY] counts it.
+    packages: BTreeSet<String>,
+    /// Every effect row reachable from a declared type's own body, by type
+    /// name.
+    ///
+    /// A written type is read for the rows inside it, and a *name* stood for
+    /// nothing: `type V = | Hold(f: fn(i64) -> i64 / {io})` as a parameter
+    /// contributed no row, so a `match` payload bound from it called a
+    /// printing function inside a `/ {}` body, on `par_map`'s workers, and in
+    /// a package declaring `capabilities = []`.
+    type_rows: HashMap<String, BTreeSet<String>>,
 }
 
 impl Ctx<'_> {
@@ -170,7 +194,7 @@ pub fn effects_by_package(
             imports: f.imports.clone(),
         })
         .collect();
-    let mut ctx = build_ctx(&views);
+    let mut ctx = build_ctx_in(&views, &program.deps.iter().cloned().collect());
     solve_rows(&mut ctx);
     let mut out: std::collections::BTreeMap<String, BTreeSet<String>> =
         std::collections::BTreeMap::new();
@@ -240,6 +264,8 @@ pub fn effects_of_program(program: &crate::loader::Program) -> BTreeSet<String> 
         elem_rows: BTreeSet::new(),
         type_aliases: HashMap::new(),
         handler_rows: HashMap::new(),
+        packages: program.deps.iter().cloned().collect(),
+        type_rows: HashMap::new(),
     };
     for f in &views {
         ctx.imports.insert(f.name.clone(), f.imports.clone());
@@ -259,8 +285,17 @@ pub fn effects_of_program(program: &crate::loader::Program) -> BTreeSet<String> 
         }
     }
     for f in &views {
-        harvest_module(f.module, &mut ctx.field_rows, &mut ctx.elem_rows);
         collect_type_aliases(f.module, &mut ctx.type_aliases);
+    }
+    ctx.type_rows = collect_type_rows(&views, &ctx.type_aliases);
+    for f in &views {
+        harvest_module(
+            f.module,
+            &ctx.type_aliases,
+            &ctx.type_rows,
+            &mut ctx.field_rows,
+            &mut ctx.elem_rows,
+        );
     }
     ctx.rows = ctx.fns.keys().map(|k| (k.clone(), BTreeSet::new())).collect();
     loop {
@@ -276,7 +311,7 @@ pub fn effects_of_program(program: &crate::loader::Program) -> BTreeSet<String> 
             let mut row = BTreeSet::new();
             let mut active = Vec::new();
             let mut fnb = FnBindings::default();
-            seed_params(&f.params, &mut fnb, &ctx.type_aliases);
+            seed_params(&f.params, &mut fnb, &ctx.type_aliases, &ctx.type_rows);
             collect_fn_bindings(&f.body, &ctx, &current, &mut fnb);
             walk_block(&f.body, &current, &mut active, &ctx, &fnb, &mut row);
             let entry = ctx.rows.get_mut(&key).unwrap();
@@ -408,6 +443,15 @@ fn makes_ref(e: &Expr) -> bool {
 
 /// The shared context both effect passes work from.
 fn build_ctx<'a>(files: &'a [ModuleView<'a>]) -> Ctx<'a> {
+    build_ctx_in(files, &BTreeSet::new())
+}
+
+/// `build_ctx`, told which module names are dependency packages.
+///
+/// Only the capability pass needs this: it decides where a handler's effects
+/// are charged, and a handler written by a consumer runs on the consumer's
+/// authority.
+fn build_ctx_in<'a>(files: &'a [ModuleView<'a>], packages: &BTreeSet<String>) -> Ctx<'a> {
     let mut ctx = Ctx {
         fns: HashMap::new(),
         effect_names: HashSet::new(),
@@ -418,6 +462,8 @@ fn build_ctx<'a>(files: &'a [ModuleView<'a>]) -> Ctx<'a> {
         elem_rows: BTreeSet::new(),
         type_aliases: HashMap::new(),
         handler_rows: HashMap::new(),
+        packages: packages.clone(),
+        type_rows: HashMap::new(),
     };
     for f in files {
         ctx.imports.insert(f.name.clone(), f.imports.clone());
@@ -437,8 +483,17 @@ fn build_ctx<'a>(files: &'a [ModuleView<'a>]) -> Ctx<'a> {
         }
     }
     for f in files {
-        harvest_module(f.module, &mut ctx.field_rows, &mut ctx.elem_rows);
         collect_type_aliases(f.module, &mut ctx.type_aliases);
+    }
+    ctx.type_rows = collect_type_rows(files, &ctx.type_aliases);
+    for f in files {
+        harvest_module(
+            f.module,
+            &ctx.type_aliases,
+            &ctx.type_rows,
+            &mut ctx.field_rows,
+            &mut ctx.elem_rows,
+        );
     }
     ctx.rows = ctx.fns.keys().map(|k| (k.clone(), BTreeSet::new())).collect();
     ctx
@@ -464,8 +519,22 @@ fn solve_rows(ctx: &mut Ctx) {
 }
 
 /// What every handler literal in the program performs, keyed by its effect.
-fn compute_handler_rows(ctx: &Ctx) -> HashMap<String, BTreeSet<String>> {
-    let mut out: HashMap<String, BTreeSet<String>> = HashMap::new();
+impl Ctx<'_> {
+    /// Which package a module belongs to: the longest declared prefix, the
+    /// same way `effects_by_package` counts it. The entry package's own
+    /// modules answer with the empty string.
+    fn package_of(&self, module: &str) -> String {
+        self.packages
+            .iter()
+            .filter(|d| is_prefix_module(module, d))
+            .max_by_key(|d| d.len())
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+fn compute_handler_rows(ctx: &Ctx) -> HashMap<(String, String), BTreeSet<String>> {
+    let mut out: HashMap<(String, String), BTreeSet<String>> = HashMap::new();
     let keys: Vec<String> = ctx.fns.keys().cloned().collect();
     for key in keys {
         let f = ctx.fns[&key];
@@ -486,10 +555,12 @@ fn compute_handler_rows(ctx: &Ctx) -> HashMap<String, BTreeSet<String>> {
             let mut row = BTreeSet::new();
             let mut active = Vec::new();
             let mut fnb = FnBindings::default();
-            seed_params(&f.params, &mut fnb, &ctx.type_aliases);
+            seed_params(&f.params, &mut fnb, &ctx.type_aliases, &ctx.type_rows);
             collect_fn_bindings(&f.body, ctx, &current, &mut fnb);
             walk_expr(lit, &current, &mut active, ctx, &fnb, &mut row);
-            out.entry(effect.to_string()).or_default().extend(row);
+            out.entry((effect.to_string(), current.clone()))
+                .or_default()
+                .extend(row);
         }
     }
     out
@@ -615,7 +686,7 @@ fn solve_fn_rows(ctx: &mut Ctx) {
             let mut row = BTreeSet::new();
             let mut active = Vec::new();
             let mut fnb = FnBindings::default();
-            seed_params(&f.params, &mut fnb, &ctx.type_aliases);
+            seed_params(&f.params, &mut fnb, &ctx.type_aliases, &ctx.type_rows);
             collect_fn_bindings(&f.body, ctx, &current, &mut fnb);
             walk_block(&f.body, &current, &mut active, ctx, &fnb, &mut row);
             let entry = ctx.rows.get_mut(&key).unwrap();
@@ -679,7 +750,7 @@ fn compute_closure_rows(ctx: &Ctx) -> HashMap<u32, BTreeSet<String>> {
             let mut row = BTreeSet::new();
             let mut active = Vec::new();
             let mut fnb = FnBindings::default();
-            seed_params(&f.params, &mut fnb, &ctx.type_aliases);
+            seed_params(&f.params, &mut fnb, &ctx.type_aliases, &ctx.type_rows);
             collect_fn_bindings(&f.body, ctx, &current, &mut fnb);
             walk_expr(body, &current, &mut active, ctx, &fnb, &mut row);
             out.insert(span.start, row);
@@ -964,7 +1035,7 @@ is installed, not around the calls to it ([E-HANDLER-OWN-ROW])",
                 _ => continue,
             };
             let mut fnb = FnBindings::default();
-            seed_params(params, &mut fnb, &ctx.type_aliases);
+            seed_params(params, &mut fnb, &ctx.type_aliases, &ctx.type_rows);
             collect_fn_bindings(body, &ctx, &f.name, &mut fnb);
             check_par_map_block(body, &f.name, &ctx, &fnb, &mut diags);
             check_fn_args_block(body, &f.name, &ctx, &fnb, &mut diags);
@@ -1078,7 +1149,7 @@ fn check_declared_rows_block(
     for stmt in &b.stmts {
         match stmt {
             Stmt::Let { name, ty: Some(t), init, .. } => {
-                if let Some(allowed) = declared_row_within(t, &ctx.type_aliases) {
+                if let Some(allowed) = declared_row_within(t, &ctx.type_aliases, &ctx.type_rows) {
                     declared.insert(name.name.clone(), allowed.clone());
                     report_row_over(init, current, ctx, fnb, &allowed, diags);
                 }
@@ -1620,9 +1691,23 @@ fn fn_sources<'a>(e: &'a Expr, ctx: &Ctx, current: &str, out: &mut Vec<FnSource<
             fn_sources(rhs, ctx, current, out);
         }
         Expr::Call { callee, args, .. } => {
-            if matches!(&**callee, Expr::Ident(id)
-                if matches!(id.name.as_str(), "Some" | "Ok" | "Err"))
-            {
+            // A constructor hands its arguments through: the prelude's three,
+            // and a user sum type's variants, which are spelled the same way.
+            // Only the prelude's were recognised, so `Hold(shout)` for
+            // `type V = | Hold(f: fn(i64) -> i64 / {io})` carried a printing
+            // function into a binding with no row on it, and the `match`
+            // payload that read it back called it inside `par_map`.
+            let carrier = match &**callee {
+                Expr::Ident(id) => {
+                    matches!(id.name.as_str(), "Some" | "Ok" | "Err")
+                        || (ctx.resolve_call(current, &id.name).is_none()
+                            && id.name.starts_with(char::is_uppercase))
+                }
+                // `Type.Variant(..)`, the qualified spelling.
+                Expr::Field { name, .. } => name.name.starts_with(char::is_uppercase),
+                _ => false,
+            };
+            if carrier {
                 for a in args {
                     fn_sources(a, ctx, current, out);
                 }
@@ -1703,30 +1788,42 @@ fn resolve_alias(
 fn declared_row_within(
     te: &TypeExpr,
     aliases: &HashMap<String, TypeExpr>,
+    type_rows: &HashMap<String, BTreeSet<String>>,
 ) -> Option<BTreeSet<String>> {
     match &resolve_alias(te, aliases, 0) {
         TypeExpr::Fn { effects, .. } => {
             Some(effects.iter().map(|p| p.dotted()).collect())
         }
         TypeExpr::List(inner, _) | TypeExpr::Ref(inner, _) => {
-            declared_row_within(inner, aliases)
+            declared_row_within(inner, aliases, type_rows)
         }
         TypeExpr::Fallible(a, b, _) => union_rows(
-            declared_row_within(a, aliases),
-            declared_row_within(b, aliases),
+            declared_row_within(a, aliases, type_rows),
+            declared_row_within(b, aliases, type_rows),
         ),
-        // `Option[T]`, `Map[K, V]` and any other named generic.
-        TypeExpr::Name { args, .. } => {
+        // `Option[T]`, `Map[K, V]` and any other named generic — and a
+        // declared type, whose own fields may hold a row. A name stood for
+        // nothing here, so `fn pure(v: V) -> i64 / {}` where
+        // `type V = | Hold(f: fn(i64) -> i64 / {io})` had an empty signature
+        // pool and the payload it bound called a printing function.
+        TypeExpr::Name { path, args, .. } => {
             let mut found: Option<BTreeSet<String>> = None;
+            if let Some(seg) = path.segments.last() {
+                if let Some(r) = type_rows.get(&seg.name) {
+                    if !r.is_empty() {
+                        found = Some(r.clone());
+                    }
+                }
+            }
             for a in args {
-                found = union_rows(found, declared_row_within(a, aliases));
+                found = union_rows(found, declared_row_within(a, aliases, type_rows));
             }
             found
         }
         TypeExpr::Union(items, _) | TypeExpr::Tuple(items, _) => {
             let mut found: Option<BTreeSet<String>> = None;
             for i in items {
-                if let Some(r) = declared_row_within(i, aliases) {
+                if let Some(r) = declared_row_within(i, aliases, type_rows) {
                     found = Some(match found {
                         None => r,
                         Some(prev) => prev.union(&r).cloned().collect(),
@@ -1859,9 +1956,10 @@ fn seed_params<'a>(
     params: &[Param],
     fnb: &mut FnBindings<'a>,
     aliases: &HashMap<String, TypeExpr>,
+    type_rows: &HashMap<String, BTreeSet<String>>,
 ) {
     for p in params {
-        if let Some(row) = declared_row_within(&p.ty, aliases) {
+        if let Some(row) = declared_row_within(&p.ty, aliases, type_rows) {
             fnb.signature_rows.extend(row);
         }
     }
@@ -2061,10 +2159,15 @@ fn indirect_row(
 fn harvest_rows(
     t: &TypeExpr,
     field: Option<&str>,
+    aliases: &HashMap<String, TypeExpr>,
+    type_rows: &HashMap<String, BTreeSet<String>>,
     field_rows: &mut HashMap<String, BTreeSet<String>>,
     elem_rows: &mut BTreeSet<String>,
 ) {
-    match t {
+    // A `type` name stands for what it names, here as everywhere: a field
+    // whose type was written as an alias contributed no row at all, so the
+    // same program was refused with the row inline and accepted behind a name.
+    match &resolve_alias(t, aliases, 0) {
         TypeExpr::Fn {
             params,
             ret,
@@ -2080,27 +2183,27 @@ fn harvest_rows(
                 }
             }
             for p in params {
-                harvest_rows(p, None, field_rows, elem_rows);
+                harvest_rows(p, None, aliases, type_rows, field_rows, elem_rows);
             }
-            harvest_rows(ret, None, field_rows, elem_rows);
+            harvest_rows(ret, None, aliases, type_rows, field_rows, elem_rows);
         }
         // Inside any other type constructor the function type has lost its
         // field name, so what it carries joins the nameless pool.
         TypeExpr::List(inner, _) | TypeExpr::Ref(inner, _) => {
-            harvest_rows(inner, None, field_rows, elem_rows)
+            harvest_rows(inner, None, aliases, type_rows, field_rows, elem_rows)
         }
         TypeExpr::Fallible(a, b, _) => {
-            harvest_rows(a, None, field_rows, elem_rows);
-            harvest_rows(b, None, field_rows, elem_rows);
+            harvest_rows(a, None, aliases, type_rows, field_rows, elem_rows);
+            harvest_rows(b, None, aliases, type_rows, field_rows, elem_rows);
         }
         TypeExpr::Tuple(items, _) | TypeExpr::Union(items, _) => {
             for i in items {
-                harvest_rows(i, None, field_rows, elem_rows);
+                harvest_rows(i, None, aliases, type_rows, field_rows, elem_rows);
             }
         }
         TypeExpr::Name { args, .. } => {
             for a in args {
-                harvest_rows(a, None, field_rows, elem_rows);
+                harvest_rows(a, None, aliases, type_rows, field_rows, elem_rows);
             }
         }
     }
@@ -2124,9 +2227,143 @@ fn collect_type_aliases(
     }
 }
 
+/// Every effect row reachable from each declared type's own body.
+///
+/// Two passes, because a type may name another: the first reads the rows
+/// written *directly* in each declaration, the second propagates along the
+/// names they mention until nothing changes. A fixpoint rather than recursion,
+/// so a self-referential type — `type Node = { next: Option[Node] }`, the
+/// ordinary shape — terminates.
+fn collect_type_rows(
+    files: &[ModuleView],
+    aliases: &HashMap<String, TypeExpr>,
+) -> HashMap<String, BTreeSet<String>> {
+    use grasm_syntax::ast::TypeBody;
+    let mut own: HashMap<String, BTreeSet<String>> = HashMap::new();
+    let mut mentions: HashMap<String, BTreeSet<String>> = HashMap::new();
+    for f in files {
+        for d in &f.module.decls {
+            let Decl::Type(td) = d else {
+                continue;
+            };
+            let parts: Vec<&TypeExpr> = match &td.body {
+                TypeBody::Struct(fields) => fields.iter().map(|f| &f.ty).collect(),
+                TypeBody::Sum(variants) => {
+                    variants.iter().flat_map(|v| v.fields.iter().map(|f| &f.ty)).collect()
+                }
+                TypeBody::Alias(t) => vec![t],
+            };
+            let e_own = own.entry(td.name.name.clone()).or_default();
+            for t in &parts {
+                if let Some(r) = declared_row_shallow(t, aliases) {
+                    e_own.extend(r);
+                }
+            }
+            let e_names = mentions.entry(td.name.name.clone()).or_default();
+            for t in &parts {
+                collect_type_names(t, aliases, e_names);
+            }
+        }
+    }
+    // Propagate. Bounded by the number of declarations, since each round that
+    // changes nothing stops the loop and each name can only be added once.
+    for _ in 0..own.len() + 1 {
+        let mut changed = false;
+        let names: Vec<String> = own.keys().cloned().collect();
+        for n in names {
+            let from: BTreeSet<String> = mentions
+                .get(&n)
+                .into_iter()
+                .flatten()
+                .filter(|m| **m != n)
+                .filter_map(|m| own.get(m).cloned())
+                .flatten()
+                .collect();
+            let e = own.entry(n).or_default();
+            let before = e.len();
+            e.extend(from);
+            changed |= e.len() != before;
+        }
+        if !changed {
+            break;
+        }
+    }
+    own
+}
+
+/// Every declared type name a written type mentions, aliases followed.
+fn collect_type_names(
+    te: &TypeExpr,
+    aliases: &HashMap<String, TypeExpr>,
+    out: &mut BTreeSet<String>,
+) {
+    match &resolve_alias(te, aliases, 0) {
+        TypeExpr::Fn { params, ret, .. } => {
+            for p in params {
+                collect_type_names(p, aliases, out);
+            }
+            collect_type_names(ret, aliases, out);
+        }
+        TypeExpr::List(inner, _) | TypeExpr::Ref(inner, _) => {
+            collect_type_names(inner, aliases, out)
+        }
+        TypeExpr::Fallible(a, b, _) => {
+            collect_type_names(a, aliases, out);
+            collect_type_names(b, aliases, out);
+        }
+        TypeExpr::Tuple(items, _) | TypeExpr::Union(items, _) => {
+            for i in items {
+                collect_type_names(i, aliases, out);
+            }
+        }
+        TypeExpr::Name { path, args, .. } => {
+            if let Some(seg) = path.segments.last() {
+                out.insert(seg.name.clone());
+            }
+            for a in args {
+                collect_type_names(a, aliases, out);
+            }
+        }
+    }
+}
+
+/// The rows written *directly* inside a type, without following a name to
+/// another declaration. Used to seed the fixpoint above.
+fn declared_row_shallow(
+    te: &TypeExpr,
+    aliases: &HashMap<String, TypeExpr>,
+) -> Option<BTreeSet<String>> {
+    match &resolve_alias(te, aliases, 0) {
+        TypeExpr::Fn { effects, .. } => Some(effects.iter().map(|p| p.dotted()).collect()),
+        TypeExpr::List(inner, _) | TypeExpr::Ref(inner, _) => {
+            declared_row_shallow(inner, aliases)
+        }
+        TypeExpr::Fallible(a, b, _) => union_rows(
+            declared_row_shallow(a, aliases),
+            declared_row_shallow(b, aliases),
+        ),
+        TypeExpr::Tuple(items, _) | TypeExpr::Union(items, _) => {
+            let mut found: Option<BTreeSet<String>> = None;
+            for i in items {
+                found = union_rows(found, declared_row_shallow(i, aliases));
+            }
+            found
+        }
+        TypeExpr::Name { args, .. } => {
+            let mut found: Option<BTreeSet<String>> = None;
+            for a in args {
+                found = union_rows(found, declared_row_shallow(a, aliases));
+            }
+            found
+        }
+    }
+}
+
 /// Harvests the rows every function type in one module declares.
 fn harvest_module(
     m: &grasm_syntax::ast::Module,
+    aliases: &HashMap<String, TypeExpr>,
+    type_rows: &HashMap<String, BTreeSet<String>>,
     field_rows: &mut HashMap<String, BTreeSet<String>>,
     elem_rows: &mut BTreeSet<String>,
 ) {
@@ -2136,24 +2373,24 @@ fn harvest_module(
             Decl::Type(td) => match &td.body {
                 TypeBody::Struct(fields) => {
                     for f in fields {
-                        harvest_rows(&f.ty, Some(&f.name.name), field_rows, elem_rows);
+                        harvest_rows(&f.ty, Some(&f.name.name), aliases, type_rows, field_rows, elem_rows);
                     }
                 }
                 TypeBody::Sum(variants) => {
                     for v in variants {
                         for f in &v.fields {
-                            harvest_rows(&f.ty, Some(&f.name.name), field_rows, elem_rows);
+                            harvest_rows(&f.ty, Some(&f.name.name), aliases, type_rows, field_rows, elem_rows);
                         }
                     }
                 }
-                TypeBody::Alias(t) => harvest_rows(t, None, field_rows, elem_rows),
+                TypeBody::Alias(t) => harvest_rows(t, None, aliases, type_rows, field_rows, elem_rows),
             },
             Decl::Fn(fd) => {
                 for p in &fd.params {
-                    harvest_rows(&p.ty, None, field_rows, elem_rows);
+                    harvest_rows(&p.ty, None, aliases, type_rows, field_rows, elem_rows);
                 }
                 if let Some(r) = &fd.ret {
-                    harvest_rows(r, None, field_rows, elem_rows);
+                    harvest_rows(r, None, aliases, type_rows, field_rows, elem_rows);
                 }
             }
             _ => {}
@@ -2260,7 +2497,15 @@ fn walk_stmt(
             // arrived from somewhere else — a parameter, a variable, a list
             // element — has not, and its operations run *here*.
             if !matches!(handler, Expr::StructLit { .. }) {
-                if let Some(row) = ctx.handler_rows.get(&effect.dotted()) {
+                // Handlers written in *this* package. One written by a
+                // consumer runs on the consumer's authority — it is charged
+                // where it was written, and charging it here as well made a
+                // library's ceiling a statement about somebody else's code.
+                let here = ctx.package_of(current);
+                for ((eff, module), row) in &ctx.handler_rows {
+                    if eff != &effect.dotted() || ctx.package_of(module) != here {
+                        continue;
+                    }
                     for e in row {
                         if !active.contains(e) {
                             out.insert(e.clone());

@@ -2027,3 +2027,86 @@ fn a_builtin_function_name_cannot_be_redeclared() {
 fn main() {\n    print(\"{[1, 2].describe()}\")\n}\n",
     );
 }
+
+/// A row written inside a declared type travels with that type's name
+/// ([T-FN-TYPE-ROW-CARRIED], [T-TYPE-ALIAS]).
+///
+/// A written type is read for the rows inside it, and a *name* stood for
+/// nothing: a struct field spelled with an alias, and a sum variant's payload
+/// reached through a `match`, both contributed an empty row. The same program
+/// with the row written inline was refused, so the guarantee turned on how the
+/// type was spelled.
+#[test]
+fn a_row_inside_a_declared_type_travels_with_its_name() {
+    let base = "fn shout(n: i64) -> i64 {\n    print(\"shout {n}\")\n    n\n}\n";
+    // A sum variant's payload, read back through a `match`.
+    check_err(
+        &format!(
+            "{base}type V = | Hold(f: fn(i64) -> i64 / {{io}}) | Nil\n\n\
+fn pure(v: V) -> i64 / {{}} {{\n    match v {{\n        Hold(g) -> g(7)\n        Nil -> 0\n    }}\n}}\n\n\
+fn main() {{\n    print(\"{{pure(Hold(shout))}}\")\n}}\n"
+        ),
+        "not in its declared row",
+    );
+    // A struct field whose type is an alias, and the same inline.
+    for field in ["Cb", "fn(i64) -> i64 / {io}"] {
+        check_err(
+            &format!(
+                "type Cb = fn(i64) -> i64 / {{io}}\ntype Box = {{ f: {field} }}\n{base}\n\
+fn pure(b: Box) -> i64 / {{}} {{\n    b.f(5)\n}}\n\n\
+fn main() {{\n    print(\"{{pure(Box{{ f: shout }})}}\")\n}}\n"
+            ),
+            "not in its declared row",
+        );
+    }
+    // Through a parallel operation, which the clause calls a compile error
+    // rather than a race — the constructor carries the value there.
+    check_err(
+        &format!(
+            "{base}type V = | Hold(f: fn(i64) -> i64 / {{io}}) | Nil\n\n\
+fn main() {{\n    let v = Hold(shout)\n    \
+print(\"{{[1, 2].par_map(|x| match v {{ Hold(g) -> g(x) Nil -> 0 }})}}\")\n}}\n"
+        ),
+        "effect-free function",
+    );
+    // A named type whose fields declare no effects is charged nothing.
+    check_ok(
+        "type P = | Keep(f: fn(i64) -> i64) | Skip\n\n\
+fn dbl(n: i64) -> i64 {\n    n * 2\n}\n\n\
+fn pure(p: P) -> i64 / {} {\n    match p {\n        Keep(g) -> g(7)\n        Skip -> 0\n    }\n}\n\n\
+fn main() {\n    print(\"{pure(Keep(dbl))}\")\n}\n",
+    );
+}
+
+/// An integer literal reaches its expected type through a constructor in a
+/// `match` arm or an `if` branch ([T-INT-TO-FLOAT-CARRIED]).
+///
+/// The deferral looked for a *bare* literal, so `Some(3)` beside `Some(4.5)`
+/// was inferred as `Option[i64]` and reported a mismatch against a program the
+/// clause calls well typed — while `Some(3)` in every other carrier position
+/// was accepted, and the same two branches spelled `3` and `4.5` were too.
+#[test]
+fn a_literal_inside_a_constructor_adopts_the_expected_float() {
+    check_ok(
+        "fn g(n: i64) -> Option[f64] {\n    match n {\n        1 -> Some(4.5)\n        \
+_ -> Some(3)\n    }\n}\n\nfn main() {\n    print(\"{g(1) ?? -1.0} {g(2) ?? -1.0}\")\n}\n",
+    );
+    let e = "type E = { m: str }\n";
+    check_ok(&format!(
+        "{e}fn g(n: i64) -> f64 ! E {{\n    match n {{\n        1 -> Ok(4.5)\n        \
+_ -> Ok(3)\n    }}\n}}\n\nfn main() {{\n    print(\"{{g(1) ?? -1.0}} {{g(2) ?? -1.0}}\")\n}}\n"
+    ));
+    // The literal on either side of an `if`, inside the constructor or not.
+    for (a, b) in [("Ok(3)", "4.5"), ("3", "Ok(4.5)"), ("Ok(3)", "Ok(4.5)")] {
+        check_ok(&format!(
+            "{e}fn g(c: bool) -> f64 ! E {{\n    if c {{\n        {a}\n    }} else {{\n        {b}\n    }}\n}}\n\n\
+fn main() {{\n    print(\"{{g(true) ?? -1.0}} {{g(false) ?? -1.0}}\")\n}}\n"
+        ));
+    }
+    // A genuine mismatch is still a mismatch.
+    check_err(
+        "fn g(n: i64) -> Option[f64] {\n    match n {\n        1 -> Some(4.5)\n        \
+_ -> Some(\"x\")\n    }\n}\n\nfn main() {\n    print(\"{g(1) ?? -1.0}\")\n}\n",
+        "type mismatch",
+    );
+}

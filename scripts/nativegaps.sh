@@ -144,6 +144,16 @@ fn main() {
     }
 }'
 
+expect_refused "matching the prelude IoError's variants" 'fn main() {
+    match read_file("/no/such/file") {
+        Ok(s) -> print("{s.len()}")
+        Err(e) -> match e {
+            NotFound(p) -> print("nf {p}")
+            _ -> print("other")
+        }
+    }
+}'
+
 expect_refused "an effect handler as a parameter type" 'effect Log {
     fn info(m: str)
 }

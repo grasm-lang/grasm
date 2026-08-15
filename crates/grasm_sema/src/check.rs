@@ -1541,6 +1541,35 @@ is a failure nothing reports",
         }
     }
 
+    /// An expression made only of integer literals and the shapes
+    /// [T-INT-TO-FLOAT-CARRIED] says an expected type reaches through.
+    ///
+    /// Such an expression decides nothing about its own type, so it has to be
+    /// checked *after* whatever does. The test looked for a bare literal, so
+    /// `match n { 1 -> Some(4.5)  _ -> Some(3) }` inferred the second arm as
+    /// `Option[i64]` and reported a mismatch against a program the clause
+    /// calls well typed — while `Some(3)` in every other carrier position was
+    /// accepted, and the same two branches spelled `3` and `4.5` were too.
+    fn defers_to_its_context(e: &Expr) -> bool {
+        match e {
+            Expr::Int(..) => true,
+            Expr::Unary { op: UnaryOp::Neg, expr, .. } => Self::defers_to_its_context(expr),
+            Expr::List(items, _) | Expr::Tuple(items, _) => {
+                !items.is_empty() && items.iter().all(Self::defers_to_its_context)
+            }
+            Expr::Map(entries, _) => {
+                !entries.is_empty() && entries.iter().all(|(_, v)| Self::defers_to_its_context(v))
+            }
+            Expr::Call { callee, args, .. } => {
+                matches!(&**callee, Expr::Ident(id)
+                    if matches!(id.name.as_str(), "Some" | "Ok" | "Err"))
+                    && args.len() == 1
+                    && Self::defers_to_its_context(&args[0])
+            }
+            _ => false,
+        }
+    }
+
     fn check_block(&mut self, b: &Block) -> Type {
         self.check_block_with(b, None)
     }
@@ -2608,8 +2637,8 @@ afterwards has nowhere to send the effect — call it here, or return what it co
         a_at: Option<&Expr>,
         b_at: Option<&Expr>,
     ) -> Option<Type> {
-        for (whole, half, half_at) in [(a, b, b_at), (b, a, a_at)] {
-            let Type::Fallible(ok, _) = self.uni.shallow_resolve(whole) else {
+        for (whole, half, whole_at, half_at) in [(a, b, a_at, b_at), (b, a, b_at, a_at)] {
+            let Type::Fallible(ok, err) = self.uni.shallow_resolve(whole) else {
                 continue;
             };
             if matches!(self.uni.shallow_resolve(half), Type::Fallible(..)) {
@@ -2631,6 +2660,19 @@ afterwards has nowhere to send the effect — call it here, or return what it co
                     return Some(self.uni.resolve(whole));
                 }
             }
+            // And the other way: the literal is the one *inside* the whole
+            // half, as in `if c { Ok(3) } else { 4.5 }`. The same two branches
+            // with the halves swapped were accepted, so the rule held or not
+            // depending on which side the constructor was written on.
+            if ok == Type::I64 && matches!(self.uni.shallow_resolve(half), Type::F64) {
+                if let Some(e) = whole_at.and_then(Self::int_literal_tail) {
+                    self.float_literals.insert(e.span().start);
+                    return Some(Type::Fallible(
+                        Box::new(Type::F64),
+                        Box::new(self.uni.resolve(&err)),
+                    ));
+                }
+            }
         }
         None
     }
@@ -2643,6 +2685,15 @@ afterwards has nowhere to send the effect — call it here, or return what it co
                 Some(Stmt::Expr(inner)) => Self::int_literal_tail(inner),
                 _ => None,
             },
+            // Through the constructor that carries it: `Ok(3)` is a literal
+            // one shape out, and [T-INT-TO-FLOAT-CARRIED] names that shape.
+            Expr::Call { callee, args, .. }
+                if args.len() == 1
+                    && matches!(&**callee, Expr::Ident(id)
+                        if matches!(id.name.as_str(), "Some" | "Ok" | "Err")) =>
+            {
+                Self::int_literal_tail(&args[0])
+            }
             _ => None,
         }
     }
@@ -5863,7 +5914,7 @@ bind the component to a `var`, or use a struct when the parts have names worth w
             // Checked in order, the first arm decided for all of them — the
             // asymmetry [T-INT-TO-FLOAT-CARRIED] says is fixed, and was, for
             // every carrier except this one.
-            if Self::is_int_literal(&arm.body) {
+            if Self::defers_to_its_context(&arm.body) {
                 deferred_literals.push(&arm.body);
             } else {
                 // One arm may build the whole `T ! E` while another gives the
@@ -5884,12 +5935,21 @@ bind the component to a `var`, or use a struct when the parts have names worth w
             arm_states.push(self.moved_snapshot());
         }
         for body in deferred_literals {
-            // As above: a literal arm beside an `Err(e)` arm is the ok half.
+            // As above: a literal arm beside an `Err(e)` arm is the ok half —
+            // unless it *is* the whole fallible, which `Ok(3)` is. A body may
+            // give either ([T-OK-ERR-RETURN]), and taking the ok half for both
+            // reported "this expression can fail but `f64` is required" about
+            // an arm whose whole job is to say it did not.
             let r = self.uni.shallow_resolve(&result);
             if let Type::Fallible(ok, _) = &r {
-                let ok = (**ok).clone();
-                self.check_expr(body, &ok);
-                continue;
+                let whole = matches!(body, Expr::Call { callee, .. }
+                    if matches!(&**callee, Expr::Ident(id)
+                        if matches!(id.name.as_str(), "Ok" | "Err")));
+                if !whole {
+                    let ok = (**ok).clone();
+                    self.check_expr(body, &ok);
+                    continue;
+                }
             }
             self.check_expr(body, &result);
         }

@@ -345,8 +345,11 @@ pattern = "_" | int_lit | "-" int_lit | bool_lit | string_lit
         | "(" ( pattern ( "," pattern )* )? ")"
 ```
 
-**[G-PAT-BIND]** A bare identifier binds unless it names a nullary variant of
-the scrutinee's type, in which case it tests for that variant.
+**[G-PAT-BIND]** A bare identifier binds unless it names a variant of the
+scrutinee's type. A *nullary* one tests for that variant; one that carries
+fields is refused, naming them — `Circle` for `| Circle(r: i64)` is a variant
+test somebody wrote without its payload far more often than it is a binding,
+and reading it as a binding would silently shadow the variant it looks like.
 
 *The scrutinee's* type, not any type. `None` is a nullary variant of `Option`,
 and an `i64` is not an `Option`, so `match n { None -> … }` over one binds the

@@ -427,9 +427,17 @@ fn run_examples_together(
         .map(|f| (f.name.clone(), &f.module, f.imports.clone()))
         .collect();
     let mut oks = Vec::with_capacity(wanted.len());
-    let mut buf = Vec::new();
+    // What each example wrote, and how it ended. The two used to share one
+    // buffer that was then split into lines, so an example containing a
+    // `print` slid the mapping by one: its own status was lost and the *next*
+    // example was reported with it — a failing example printed `ok`, with its
+    // reason gone. The buffer is shared so the boundaries can be read while
+    // the interpreter still holds the writer.
+    let shared = SharedBuf::default();
+    let mut chunks: Vec<(usize, usize, Result<(), String>)> = Vec::new();
     {
-        let mut interp = Interp::new_program(&files, &mut buf);
+        let mut sink = shared.clone();
+        let mut interp = Interp::new_program(&files, &mut sink);
         interp.set_float_literals(analysis.float_literals.clone());
         interp.set_fallible_closures(analysis.fallible_closures.clone());
         interp.set_float_sums(analysis.float_sums.clone());
@@ -442,37 +450,60 @@ fn run_examples_together(
                 .decls
                 .iter()
                 .find(|d| matches!(d, grasm_syntax::ast::Decl::Test(t) if t.name == quoted));
-            match found {
-                Some(grasm_syntax::ast::Decl::Test(t)) => oks.push(interp.run_unit_test(t)),
-                _ => oks.push(false),
-            }
+            let start = shared.len();
+            let outcome = match found {
+                Some(grasm_syntax::ast::Decl::Test(t)) => interp.run_unit_test_result(t),
+                _ => Err("no test".to_string()),
+            };
+            let end = shared.len();
+            oks.push(outcome.is_ok());
+            chunks.push((start, end, outcome));
         }
         if let Some(h) = interp.take_coverage() {
             hits.extend(h);
         }
     }
-    // One report line per test, in the order they were run.
-    let report = String::from_utf8_lossy(&buf);
-    let mut lines = report.lines();
-    for (name, ok) in wanted.iter().zip(&oks) {
-        match lines.next() {
-            Some(line) => {
-                let detail = line
-                    .split_once("... ")
-                    .map(|(_, rest)| rest.trim_end().to_string())
-                    .unwrap_or_default();
-                let _ = writeln!(out, "doc example {name} ... {detail}");
+    // Each example's own output, then its report line — the order running
+    // them one at a time produced.
+    let written = shared.take();
+    for (name, (start, end, outcome)) in wanted.iter().zip(chunks) {
+        let _ = out.write_all(&written[start..end]);
+        match outcome {
+            Ok(()) => {
+                let _ = writeln!(out, "doc example {name} ... ok");
             }
-            None => {
-                let _ = writeln!(
-                    out,
-                    "doc example {name} ... {}",
-                    if *ok { "ok" } else { "FAILED: no test" }
-                );
+            Err(message) => {
+                let _ = writeln!(out, "doc example {name} ... FAILED: {message}");
             }
         }
     }
     (oks, hits)
+}
+
+/// A byte sink whose contents can be read while something else is writing to
+/// it, so the boundary between two runs can be recorded as it passes.
+#[derive(Clone, Default)]
+struct SharedBuf(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+impl SharedBuf {
+    fn len(&self) -> usize {
+        self.0.borrow().len()
+    }
+
+    fn take(self) -> Vec<u8> {
+        std::mem::take(&mut *self.0.borrow_mut())
+    }
+}
+
+impl Write for SharedBuf {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.borrow_mut().extend_from_slice(b);
+        Ok(b.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Runs the test a synthesized program holds under `wanted`.

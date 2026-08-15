@@ -21,6 +21,14 @@ fn borrowed(n: i64) -> str {
     }
 }
 
+// A variant that carries fields is refused rather than bound, naming them:
+// `Circle` for `| Circle(r: i64)` is a variant test written without its
+// payload far more often than it is a binding, and reading it as a binding
+// would silently shadow the variant it looks like.
+//
+//     match s { Full -> "x" }
+//     error: variant `Full` has 1 field(s) — bind them: `Full(..)`
+
 // And the other way: over its own type, the same spelling still tests.
 fn own_type(s: S) -> str {
     match s {

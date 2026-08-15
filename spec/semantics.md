@@ -365,6 +365,17 @@ direction: it was previously charged only where the handler was *constructed*,
 so `fn run(h: LogHandler) / {}` installed a printing handler and the
 declared-empty row held.
 
+"Anywhere in the program" stops at the package boundary, because a
+*capability* is a statement about a package's own source ([T-CAPABILITY]).
+Applied across it, a `capabilities = []` library that installs a handler its
+consumer passes in failed to build for a `print` written entirely in the
+consumer — and the help text told the library's author to widen a manifest
+with nothing wrong in it. Worse, when the consumer's handler performed an
+effect the *consumer* declared, no manifest satisfied both diagnostics at
+once: naming it in the library was refused as an effect the library does not
+define. Authority flows from whoever wrote the handler and is charged there;
+the consumer already has to declare it, so nothing escapes uncounted.
+
 **[E-HANDLER-OPS]** A handler's operations are reached by performing the
 effect, not by reading them off the handler. They are the one function value
 whose row is not checked — that exemption is what lets a handler be written —

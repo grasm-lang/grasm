@@ -686,15 +686,18 @@ fn an_undeclared_transitive_dependency_is_not_importable() {
     assert!(out.contains("cannot load module `deep`"), "{out}");
 }
 
-/// A package that installs a handler it did not construct is charged what that
-/// handler does, in the program being built.
+/// A handler's effects are charged to the package that *wrote* it, not to the
+/// one that installs it.
 ///
-/// `[E-HANDLER-OWN-ROW]` charges "what *any* handler for that effect does,
-/// anywhere in the program". Computed per package in isolation, a
-/// `capabilities = []` library printed through a handler the consumer passed
-/// it and every command reported it as performing nothing.
+/// `[E-HANDLER-OWN-ROW]` charges an installed non-literal handler with what a
+/// handler for that effect does, which is right for the row. Applied across
+/// package boundaries it made a library's *ceiling* a statement about its
+/// consumer's code: a `capabilities = []` library that installs a handler its
+/// consumer passes in failed to build for a `print` written entirely in the
+/// consumer, and the help text told the library's author to widen a manifest
+/// with nothing wrong in it. Authority flows from whoever wrote the handler.
 #[test]
-fn a_handler_from_the_consumer_counts_against_the_library() {
+fn a_handler_is_charged_to_the_package_that_wrote_it() {
     let w = Work::new("handlerparam");
     w.package(
         "pure",
@@ -707,9 +710,45 @@ fn a_handler_from_the_consumer_counts_against_the_library() {
         "import pure\n\nfn main() {\n    pure.run(LogHandler{ info: |m| print(\"{m}\") })\n}\n",
     );
     let entry = app_entry(&app);
-    let (code, out) = run(&["check", entry.as_str()]);
-    assert_eq!(code, 1, "the library is over its ceiling:\n{out}");
-    assert!(out.contains("package `pure` performs `io`"), "{out}");
+    let (code, out) = run(&["run", entry.as_str()]);
+    assert_eq!(code, 0, "the library performs nothing of its own:\n{out}");
+    assert!(out.contains('x'), "{out}");
+    // And `deps` says the same thing, which is the whole point: two commands,
+    // one graph, one answer.
+    let out = Command::new(GRASM)
+        .arg("deps")
+        .arg(".")
+        .current_dir(&app)
+        .output()
+        .expect("runs");
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(text.contains("pure             performs []"), "{text}");
+    assert!(text.contains("app              performs [io]"), "{text}");
+}
+
+/// A library that writes its own printing handler is still charged for it.
+///
+/// The safety half of the rule above: "charged where it was written" only
+/// helps if a handler written *here* is charged here.
+#[test]
+fn a_handler_a_library_wrote_itself_is_charged_to_it() {
+    let w = Work::new("ownhandler");
+    w.package(
+        "loud",
+        "[package]\nname = \"loud\"\nversion = \"0.1.0\"\ncapabilities = []\n",
+        "effect Log {\n    fn info(m: str)\n}\n\nfn noisy() -> LogHandler {\n    \
+LogHandler{ info: |m| print(\"loud: {m}\") }\n}\n\npub fn run() {\n    let h = noisy()\n    \
+with Log handled_by h {\n        Log.info(\"x\")\n    }\n}\n",
+    );
+    let app = w.package(
+        "app",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\ncapabilities = [\"io\"]\n\n[dependencies.loud]\npath = \"../loud\"\n",
+        "import loud\n\nfn main() {\n    loud.run()\n}\n",
+    );
+    let (code, out) = run(&["check", &app_entry(&app)]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("package `loud` performs `io`"), "{out}");
 }
 
 /// An option the command does not know is a mistake, not a comment.
@@ -1573,4 +1612,36 @@ let f = match A.Off { On -> \"on\" Off -> \"off\" }\n    print(f)\n}\n",
             "{args:?} disagrees with the interpreter"
         );
     }
+}
+
+/// A doc example that prints keeps its own status line.
+///
+/// The runner recovered each example's status by splitting one shared output
+/// buffer into lines, so a `print` inside a body slid the mapping by one: the
+/// example's own status was lost and the *next* example was reported with it.
+/// A failing example printed `ok`, with its reason gone — a library whose
+/// tests are failing looking exactly like one whose tests passed.
+#[test]
+fn a_printing_doc_example_does_not_steal_the_next_ones_status() {
+    let w = Work::new("docprint");
+    let dir = w.0.join("src");
+    std::fs::create_dir_all(&dir).unwrap();
+    let entry = dir.join("d.gr");
+    std::fs::write(
+        &entry,
+        "/// ```\n/// print(\"x\")\n/// ```\nfn a() -> i64 {\n    1\n}\n\n\
+/// ```\n/// assert(b() == 99)\n/// ```\nfn b() -> i64 {\n    2\n}\n\n\
+fn main() {\n    print(\"{a()}{b()}\")\n}\n",
+    )
+    .unwrap();
+    let (code, out) = run(&["test", entry.to_str().unwrap()]);
+    assert_eq!(code, 1, "{out}");
+    // The example's own output reaches stdout.
+    assert!(out.contains("\nx\n") || out.starts_with("x\n"), "{out}");
+    assert!(out.contains("doc example main::a ... ok"), "{out}");
+    assert!(
+        out.contains("doc example main::b ... FAILED: assertion failed"),
+        "{out}"
+    );
+    assert!(out.contains("1 passed, 1 failed"), "{out}");
 }

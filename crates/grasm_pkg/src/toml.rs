@@ -107,6 +107,14 @@ pub fn parse(src: &str) -> Result<Doc, String> {
             if name.is_empty() {
                 return Err(format!("{}: empty table name", at()));
             }
+            // Defining a table twice is invalid TOML, and it was accepted with
+            // the later one silently winning: two `[package]` tables published
+            // under whichever name came last, and that name went into the
+            // lockfile. Two `[dependencies.n]` tables surfaced later as a
+            // resolution error that never mentioned the duplicate.
+            if doc.tables.contains_key(name) {
+                return Err(format!("{}: table `{name}` is defined twice", at()));
+            }
             current = Target::Table(name.to_string());
             doc.tables.entry(name.to_string()).or_default();
             continue;
@@ -122,7 +130,11 @@ pub fn parse(src: &str) -> Result<Doc, String> {
         let value = parse_value(value.trim()).map_err(|e| format!("{}: {e}", at()))?;
         match &current {
             Target::Table(name) => {
-                doc.tables.entry(name.clone()).or_default().insert(key, value);
+                let table = doc.tables.entry(name.clone()).or_default();
+                if table.contains_key(&key) {
+                    return Err(format!("{}: key `{key}` is set twice", at()));
+                }
+                table.insert(key, value);
             }
             Target::ArrayEntry(name, i) => {
                 doc.arrays

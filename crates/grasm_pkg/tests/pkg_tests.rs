@@ -1413,3 +1413,84 @@ fn a_missing_dependency_names_a_tidy_path() {
     assert!(err.contains("no grasm.toml at"), "{err}");
     assert!(!err.contains("/../"), "un-normalized path in:\n{err}");
 }
+
+/// A manifest key nobody recognises is a typo, and one typo costs the whole
+/// guarantee.
+///
+/// `capabilitys = []` left the package *unrestricted*, which is what omitting
+/// the key means — the one manifest mistake that silently trades a security
+/// property away.
+#[test]
+fn an_unknown_manifest_key_is_refused() {
+    let ws = Workspace::new("unknown_key");
+    let dir = ws.package("uk", &manifest("uk", Some(""), &[]), PURE_SRC);
+    for text in [
+        "[package]\nname = \"uk\"\nversion = \"0.1.0\"\ncapabilitys = []\n",
+        "[package]\nname = \"uk\"\nversion = \"0.1.0\"\nentrypoint = \"src/other.gr\"\n",
+        "capabilities = []\n\n[package]\nname = \"uk\"\nversion = \"0.1.0\"\n",
+    ] {
+        std::fs::write(dir.join("grasm.toml"), text).unwrap();
+        let err = Manifest::load(&dir).expect_err("an unknown key cannot load");
+        assert!(
+            err.contains("no key") || err.contains("belongs to no"),
+            "{text:?}: {err}"
+        );
+    }
+    // The correctly spelled manifest still loads.
+    std::fs::write(
+        dir.join("grasm.toml"),
+        "[package]\nname = \"uk\"\nversion = \"0.1.0\"\ncapabilities = []\n",
+    )
+    .unwrap();
+    let m = Manifest::load(&dir).expect("loads");
+    assert_eq!(m.capabilities.map(|c| c.len()), Some(0));
+}
+
+/// A table or key written twice is refused, rather than the later one
+/// silently winning.
+///
+/// Two `[package]` tables published under whichever name came last, and that
+/// name went into the lockfile.
+#[test]
+fn a_duplicate_manifest_table_is_refused() {
+    let ws = Workspace::new("dup_table");
+    let dir = ws.package("dt", &manifest("dt", Some(""), &[]), PURE_SRC);
+    for text in [
+        "[package]\nname = \"dt\"\nversion = \"0.1.0\"\n\n[package]\nname = \"other\"\nversion = \"9.9.9\"\n",
+        "[package]\nname = \"dt\"\nname = \"other\"\nversion = \"0.1.0\"\n",
+    ] {
+        std::fs::write(dir.join("grasm.toml"), text).unwrap();
+        let err = Manifest::load(&dir).expect_err("a duplicate cannot load");
+        assert!(err.contains("twice"), "{text:?}: {err}");
+    }
+}
+
+/// A package name a consumer could not write after `import` is refused.
+///
+/// It was accepted, listed in the graph and written to the lockfile, and the
+/// failure surfaced only in the consumer's parser.
+#[test]
+fn a_package_name_has_to_be_an_identifier() {
+    let ws = Workspace::new("badname");
+    let dir = ws.package("bn", &manifest("bn", Some(""), &[]), PURE_SRC);
+    for name in ["my-lib", "match", "9lives", "with space", ""] {
+        std::fs::write(
+            dir.join("grasm.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\ncapabilities = []\n"),
+        )
+        .unwrap();
+        let err = Manifest::load(&dir).expect_err("`{name}` cannot load");
+        assert!(
+            err.contains("not a usable package name") || err.contains("must not be empty"),
+            "{name:?}: {err}"
+        );
+    }
+    for name in ["ok_name", "_x", "A1"] {
+        std::fs::write(
+            dir.join("grasm.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\ncapabilities = []\n"),
+        )
+        .unwrap();
+        assert!(Manifest::load(&dir).is_ok(), "{name} should load");
+    }
+}

@@ -550,15 +550,32 @@ impl<W: Write> Interp<'_, W> {
 
     /// Runs one unit test (no parameters). Returns whether it passed.
     pub fn run_unit_test(&mut self, t: &grasm_syntax::ast::TestDecl) -> bool {
-        match self.try_case(&[], &t.body) {
-            None => {
+        match self.run_unit_test_result(t) {
+            Ok(()) => {
                 self.report(&format!("test \"{}\" ... ok", t.name));
                 true
             }
-            Some(message) => {
+            Err(message) => {
                 self.report(&format!("test \"{}\" ... FAILED: {message}", t.name));
                 false
             }
+        }
+    }
+
+    /// The same, without writing a report line.
+    ///
+    /// A caller that relabels the line — the doc-example runner does — used to
+    /// recover it by splitting the shared output buffer into lines. A `print`
+    /// inside a test body puts its own lines in that same buffer, so the
+    /// mapping slid by one: the example's own status was lost and the *next*
+    /// example was reported with it. A failing example printed `ok`.
+    pub fn run_unit_test_result(
+        &mut self,
+        t: &grasm_syntax::ast::TestDecl,
+    ) -> Result<(), String> {
+        match self.try_case(&[], &t.body) {
+            None => Ok(()),
+            Some(message) => Err(message),
         }
     }
 

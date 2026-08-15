@@ -236,6 +236,54 @@ package's own directory, and a file outside it is in none of them"
         }
         dependencies.sort_by(|a, b| a.name.cmp(&b.name));
 
+        // An unknown key is a typo, and one typo costs the whole guarantee:
+        // `capabilitys = []` left the package *unrestricted*, which is what
+        // omitting the key means, and only `grasm deps`'s `(unrestricted)`
+        // column said so. `entrypoint` for `entry` silently kept the default.
+        // A key in no table at all — written above `[package]` — was ignored
+        // the same way.
+        const PACKAGE_KEYS: &[&str] = &["name", "version", "capabilities", "entry"];
+        if let Some(pkg) = doc.table("package") {
+            if let Some(k) = pkg.keys().find(|k| !PACKAGE_KEYS.contains(&k.as_str())) {
+                return Err(format!(
+                    "`[package]` has no key `{k}` — it takes {}",
+                    PACKAGE_KEYS
+                        .iter()
+                        .map(|k| format!("`{k}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
+        if let Some(root) = doc.table("") {
+            if let Some(k) = root.keys().next() {
+                return Err(format!(
+                    "`{k}` is written above the first table header, so it belongs to no \
+table — put it under `[package]`"
+                ));
+            }
+        }
+        const DEP_KEYS: &[&str] = &["path", "version"];
+        for (dep_name, table) in doc.subtables("dependencies") {
+            if let Some(k) = table.keys().find(|k| !DEP_KEYS.contains(&k.as_str())) {
+                return Err(format!(
+                    "dependency `{dep_name}` has no key `{k}` — it takes `path` or `version`"
+                ));
+            }
+        }
+
+        // A package's name is how a consumer writes `import <name>`, so a name
+        // that is not an identifier names a package nobody can depend on. It
+        // was accepted, listed in the graph and written to the lockfile, and
+        // the failure surfaced only in the consumer's parser.
+        if !is_identifier(&name) {
+            return Err(format!(
+                "`{name}` is not a usable package name: a consumer writes `import {name}`, \
+so it has to be a Grasm identifier — letters, digits and `_`, not starting with a digit, \
+and not a keyword"
+            ));
+        }
+
         Ok(Manifest {
             name,
             version,
@@ -260,6 +308,29 @@ package's own directory, and a file outside it is in none of them"
     pub fn entry_path(&self) -> PathBuf {
         self.dir.join(&self.entry)
     }
+}
+
+/// Whether `name` is something a consumer could write after `import`.
+fn is_identifier(name: &str) -> bool {
+    // The keyword list the grammar reserves. A package named for one of them
+    // parses as that keyword in the consumer's `import` line.
+    const KEYWORDS: &[&str] = &[
+        "and", "as", "bench", "break", "const", "continue", "effect", "else", "extern", "fail",
+        "fn", "for", "handled_by", "if", "import", "in", "inout", "let", "match", "not", "or",
+        "own", "parallel", "pub", "ref", "region", "return", "spawn", "test", "try", "type",
+        "unsafe", "var", "while", "with",
+    ];
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return false;
+    }
+    !KEYWORDS.contains(&name)
 }
 
 /// `MAJOR.MINOR.PATCH`, each a number.

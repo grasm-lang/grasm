@@ -360,8 +360,11 @@ pattern = "_" | int_lit | "-" int_lit | bool_lit | string_lit
         | "(" ( pattern ( "," pattern )* )? ")"
 ```
 
-**[G-PAT-BIND]** A bare identifier binds unless it names a nullary variant of
-the scrutinee's type, in which case it tests for that variant.
+**[G-PAT-BIND]** A bare identifier binds unless it names a variant of the
+scrutinee's type. A *nullary* one tests for that variant; one that carries
+fields is refused, naming them — `Circle` for `| Circle(r: i64)` is a variant
+test somebody wrote without its payload far more often than it is a binding,
+and reading it as a binding would silently shadow the variant it looks like.
 
 *The scrutinee's* type, not any type. `None` is a nullary variant of `Option`,
 and an `i64` is not an `Option`, so `match n { None -> … }` over one binds the
@@ -1710,6 +1713,17 @@ direction: it was previously charged only where the handler was *constructed*,
 so `fn run(h: LogHandler) / {}` installed a printing handler and the
 declared-empty row held.
 
+"Anywhere in the program" stops at the package boundary, because a
+*capability* is a statement about a package's own source ([T-CAPABILITY]).
+Applied across it, a `capabilities = []` library that installs a handler its
+consumer passes in failed to build for a `print` written entirely in the
+consumer — and the help text told the library's author to widen a manifest
+with nothing wrong in it. Worse, when the consumer's handler performed an
+effect the *consumer* declared, no manifest satisfied both diagnostics at
+once: naming it in the library was refused as an effect the library does not
+define. Authority flows from whoever wrote the handler and is charged there;
+the consumer already has to declare it, so nothing escapes uncounted.
+
 **[E-HANDLER-OPS]** A handler's operations are reached by performing the
 effect, not by reading them off the handler. They are the one function value
 whose row is not checked — that exemption is what lets a handler be written —
@@ -2739,7 +2753,10 @@ else you were already using.
 actually does. **Omitting the key means unrestricted**, not empty — a package
 with no `capabilities` line is not held to anything, and `grasm deps` reports
 it as `(unrestricted)`. Write `capabilities = []` to mean "performs nothing";
-leaving it out means "do not check me". Because effects are inferred from source, a dependency that
+leaving it out means "do not check me". A key `[package]` does not recognise is
+refused rather than ignored, because that difference is exactly what a typo
+would spend: `capabilitys = []` used to leave the package unrestricted, and the
+only trace was a column in `grasm deps`. Because effects are inferred from source, a dependency that
 quietly starts reading the filesystem exceeds its declared ceiling and fails
 to build **in every consumer** — a compile error, not a runtime surprise, and
 not something a reviewer has to happen to notice.
@@ -2958,6 +2975,7 @@ runs only under `grasm run`:
 | calling a function value through anything but a name | `TABLE[0](21)`, `(m.get(k) ?? d)(x)` — bind it with `let` first, then call it |
 | a UFCS call of a *generic* free function | `[1, 2].describe()` for `fn describe[T](xs: [T])` — write `describe([1, 2])` |
 | an effect handler as a **struct field** type | `type Box = { h: CfgHandler }` — bind the handler with `let` instead |
+| matching the prelude `IoError`'s variants | `match e { NotFound(p) -> … }` — [L-LIB-IO]'s way of reading *why* a read failed; compare `e` as a whole, or use `??`, until this compiles |
 | an effect handler as a **parameter** type | `fn run(h: LogHandler) { with Log handled_by h { … } }` — the shape [E-HANDLER-OWN-ROW] documents; install the handler at the call site instead |
 | a generic instantiated at a handler type | `f(h)` for `fn f[T](x: T)` — pass what the handler computes instead |
 | a handler used as a *value* | `print("{h}")`, or storing one — install it with `with … handled_by` instead |
@@ -5053,6 +5071,14 @@ fn borrowed(n: i64) -> str {
         None -> "bound {None}"
     }
 }
+
+// A variant that carries fields is refused rather than bound, naming them:
+// `Circle` for `| Circle(r: i64)` is a variant test written without its
+// payload far more often than it is a binding, and reading it as a binding
+// would silently shadow the variant it looks like.
+//
+//     match s { Full -> "x" }
+//     error: variant `Full` has 1 field(s) — bind them: `Full(..)`
 
 // And the other way: over its own type, the same spelling still tests.
 fn own_type(s: S) -> str {
