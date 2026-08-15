@@ -248,6 +248,12 @@ separate conversion in the backend and each has been wrong at least once —
 turning an `Err` into an `Ok` carrying a heap address, inverting an exit code,
 or aborting on a misaligned pointer. It found three of them on its first run.
 
+`scripts/fuzz_generics.py` aims at the other place the backend has to work out
+a type it was never told: a generic body instantiated at two types, a function
+held in a binding and called later, a closure passed through a helper, and a
+place written back through `inout`. Where the type is written down the backend
+reads it; in these four shapes it probes for one, and a probe is a guess.
+
 `scripts/crosstest.sh` runs the same gate against a *cross-compiled* target to
 prove the backend isn't accidentally host-specific — currently **130 identical,
 0 mismatched, 0 unsupported** for x86_64 built on arm64. CI
@@ -456,7 +462,7 @@ Currently **65 normative clauses, 65 conformance programs**.
 | `projects/advanced` | validation: router+middleware, scheduler, WAL mini-DB, **Mini-Grasm interpreter written in Grasm** |
 | `spec/` | normative specification + one conformance program per clause |
 | `editors/` | VS Code extension and LSP setup for other editors |
-| `scripts/` | `difftest.sh` (native vs interpreter), `crosstest.sh` (cross-target), `fuzz_differential.py` and `fuzz_fallible.py` (generated programs) |
+| `scripts/` | `difftest.sh` (native vs interpreter), `crosstest.sh` (cross-target), `fuzz_differential.py`, `fuzz_fallible.py` and `fuzz_generics.py` (generated programs) |
 | `MASTERPLAN.md` | the full v0.3 strategic blueprint this implements Phase 0–1 of |
 
 ## Status
