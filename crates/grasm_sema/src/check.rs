@@ -1665,9 +1665,14 @@ closing brace — yield a number from the region and return that",
                         // "this expression can fail but `i64` is required" —
                         // a message pointing at the wrong problem, in the
                         // shape early exits are written in.
-                        let wrapped = matches!(e, Expr::Call { callee, .. }
-                            if matches!(&**callee, Expr::Ident(id)
-                                if id.name == "Ok" || id.name == "Err"));
+                        // An `if` or `match` counts too: its branches take
+                        // either half individually, so the whole type is what
+                        // reaches them. `return if c { 3 } else { Ok(4) }` was
+                        // "this expression can fail but `i64` is required" —
+                        // the message this whole rule replaced, one shape
+                        // further out.
+                        let wrapped = yields_whole_expr(e)
+                            || matches!(e, Expr::If { .. } | Expr::Match { .. });
                         match (wrapped, self.fn_err.clone()) {
                             (true, Some(err)) => {
                                 let whole =

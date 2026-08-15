@@ -1543,3 +1543,26 @@ fn an_annotated_fallible_branch_may_give_either_half() {
         "expected `i64`, found `str`",
     );
 }
+
+/// `return` takes an `if` or `match` that mixes the two halves
+/// ([T-OK-ERR-RETURN]).
+///
+/// The rule was written for a direct `Ok(..)`/`Err(..)`, so
+/// `return if c { 3 } else { Ok(4) }` was "this expression can fail but `i64`
+/// is required" — the message the rule replaced, one shape further out.
+#[test]
+fn return_takes_a_branching_expression_of_either_half() {
+    let e = "type E = | Bad\n";
+    check_ok(&format!(
+        "{e}fn pick(c: bool) -> i64 ! E {{\n    return if c {{\n        3\n    }} else {{\n        Ok(4)\n    }}\n}}\nfn main() {{\n    print(\"{{pick(true) ?? 0 - 1}}\")\n}}\n"
+    ));
+    check_ok(&format!(
+        "{e}fn pick(c: bool) -> i64 ! E {{\n    return if c {{\n        Err(Bad)\n    }} else {{\n        Ok(4)\n    }}\n}}\nfn main() {{\n    print(\"{{pick(true) ?? 0 - 1}}\")\n}}\n"
+    ));
+    check_ok(&format!(
+        "{e}fn pick(c: bool) -> i64 ! E {{\n    return if c {{\n        3\n    }} else {{\n        4\n    }}\n}}\nfn main() {{\n    print(\"{{pick(true) ?? 0 - 1}}\")\n}}\n"
+    ));
+    check_ok(&format!(
+        "{e}fn pick(n: i64) -> i64 ! E {{\n    return match n {{\n        0 -> 3\n        1 -> Ok(4)\n        _ -> Err(Bad)\n    }}\n}}\nfn main() {{\n    print(\"{{pick(0) ?? 0 - 1}}\")\n}}\n"
+    ));
+}

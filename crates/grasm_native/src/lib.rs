@@ -3942,9 +3942,14 @@ impl FnCx<'_, '_> {
                         // `T ! E`, so they are not wrapped again — expecting
                         // the ok half made the returned value a pointer read
                         // as an `i64` and printed as one ([T-OK-ERR-RETURN]).
+                        // An `if` or `match` merges its branches to the whole
+                        // `T ! E` when any of them builds one, so the whole
+                        // type is the hint that reaches them — the same rule
+                        // the checker follows.
                         let wrapped = matches!(e, Expr::Call { callee, .. }
                             if matches!(&**callee, Expr::Ident(id)
-                                if id.name == "Ok" || id.name == "Err"));
+                                if id.name == "Ok" || id.name == "Err"))
+                            || matches!(e, Expr::If { .. } | Expr::Match { .. });
                         let expect = match (&self.ret, wrapped) {
                             (VType::Fallible(ok, _), false) => (**ok).clone(),
                             (other, _) => other.clone(),
@@ -3953,13 +3958,19 @@ impl FnCx<'_, '_> {
                         if self.ret == VType::F64 && vt == VType::I64 {
                             val = self.b.ins().fcvt_from_sint(types::F64, val);
                         }
-                        if let (VType::Fallible(ok_t, _), false) = (self.ret.clone(), wrapped) {
-                            let mut inner = val;
-                            if *ok_t == VType::F64 && vt == VType::I64 {
-                                inner = self.b.ins().fcvt_from_sint(types::F64, inner);
+                        // Wrapped by what it *produced*, not by how it was
+                        // written: `return if c { 3 } else { Ok(4) }` gives the
+                        // whole thing already, and wrapping it a second time
+                        // returned a pointer the caller printed as a number.
+                        if let VType::Fallible(ok_t, _) = self.ret.clone() {
+                            if !matches!(vt, VType::Fallible(..)) {
+                                let mut inner = val;
+                                if *ok_t == VType::F64 && vt == VType::I64 {
+                                    inner = self.b.ins().fcvt_from_sint(types::F64, inner);
+                                }
+                                let boxed = self.box_value(inner, &ok_t);
+                                val = self.call_rt("grasm_ok_new", &[boxed]).unwrap();
                             }
-                            let boxed = self.box_value(inner, &ok_t);
-                            val = self.call_rt("grasm_ok_new", &[boxed]).unwrap();
                         }
                         // Returned value stays owned; release the rest.
                         // (Locals holding the same box are fine: their dec is

@@ -453,10 +453,15 @@ expression without the annotation was an unhandled failure whose help says to
 annotate it. Two diagnostics pointing at each other is no way to write the
 program at all.
 
-`return` takes either half too. Only the tail expression was taught this, so
-`return Ok(1)` was "this expression can fail but `i64` is required" — a
-message about the wrong problem, in the shape early exits are written in, and
-the workaround was to rewrite every one of them as `fail`.
+`return` takes either half too, including through a branching expression:
+`return if c { 3 } else { Ok(4) }` is the two shapes in one statement. Only the
+tail expression was taught this, so `return Ok(1)` was "this expression can
+fail but `i64` is required" — a message about the wrong problem, in the shape
+early exits are written in, and the workaround was to rewrite every one of them
+as `fail`. Deciding by *how the value was written* rather than by what it
+turned out to be left the same hole one level out: an `if` whose branches
+merged to the whole `T ! E` was wrapped a second time on the way out, and the
+caller printed a heap address.
 
 The two halves mix *within one expression*: an `if` may give the bare ok half
 in one branch and the whole `T ! E` in another, and a `match` may do the same
