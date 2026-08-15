@@ -8096,6 +8096,33 @@ impl FnCx<'_, '_> {
                     }
                 }
             }
+            // `b.f(x)` where `f` is a struct field of function type
+            // ([T-FIELD-CALL]). Left to the builtin table it was "`.f()` on a
+            // receiver whose type is not known here" — about a receiver whose
+            // type a struct literal two lines up had fixed — and refused the
+            // ordinary spelling wherever the probe, rather than the compiler,
+            // had to work it out.
+            Expr::MethodCall { recv, name, .. }
+                if matches!(
+                    self.probe_type(recv),
+                    Ok(VType::Struct(ref sn))
+                        if self
+                            .cg
+                            .structs
+                            .get(sn)
+                            .is_some_and(|fs| fs.iter().any(|(f, t)| {
+                                f == &name.name && matches!(t, VType::Fn(..))
+                            }))
+                ) =>
+            {
+                let VType::Struct(sname) = self.probe_type(recv)? else {
+                    unreachable!("just matched")
+                };
+                match self.struct_field_type(&sname, &name.name, e.span())? {
+                    VType::Fn(_, ret) => *ret,
+                    other => other,
+                }
+            }
             Expr::MethodCall { recv, name, args, .. } => match name.name.as_str() {
                 "len" => VType::I64,
                 "is_nan" | "is_finite" => VType::Bool,
@@ -9106,12 +9133,24 @@ impl FnCx<'_, '_> {
                 .find_map(|scope| scope.calls.get(name).cloned())
         });
         let Some(args) = hint else {
+            // Name the shape §11 names. A function whose declared return type
+            // *is* a function type says exactly what the parameters are, so
+            // "no type says what its parameters are" was about a different
+            // program — the reader was sent to annotate a binding that the
+            // return type had already annotated.
+            if matches!(self.ret, VType::Fn(..)) {
+                return nope(
+                    span,
+                    "returning a closure (a top-level `fn` works, and so does returning \
+what the closure computes)",
+                );
+            }
             return nope(
                 span,
                 "a closure with parameters used as a value where no type says \
-what its parameters are (returning one from a function is this case: annotate \
-the binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level \
-`fn` — a closure's own parameters cannot be annotated)",
+what its parameters are (annotate the binding, as in \
+`let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn` — a closure's \
+own parameters cannot be annotated)",
             );
         };
         if args.len() != params.len() {

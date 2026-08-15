@@ -830,6 +830,24 @@ land in a copy the caller never sees — return the new value from the operation
                 self.error(e.name.span, format!("duplicate function `{}`", e.name.name));
                 continue;
             }
+            // A C function is a link-time symbol of the package that declares
+            // it, and `pub` on one exported the name past every gate that
+            // makes Tier 3 visible: `libext.getpid()` in another module
+            // needed no `unsafe`, charged no capability, panicked under the
+            // interpreter with `module has no function` and printed `true`
+            // from a native build. The wrapper — `pub fn f(x) { unsafe {
+            // c_fn(x) } }` — is how a package offers one, and it is the
+            // spelling that shows up in the consumer's ceiling
+            // ([T-UNSAFE-FFI]).
+            if e.is_pub {
+                self.error_help(
+                    e.name.span,
+                    format!("`extern fn {}` cannot be `pub`", e.name.name),
+                    "a C function is resolved by the linker for the package that declares \
+it — wrap it in a `pub fn` whose body is `unsafe`, which is what makes the `unsafe` \
+capability visible to everyone who depends on you",
+                );
+            }
             self.extern_names.insert(key.clone());
             let params: Vec<Type> = e
                 .params
@@ -4246,6 +4264,22 @@ parts have names worth writing",
                     let qual = format!("{target_mod}::{}", name.name);
                     match self.fns.get(&qual).cloned() {
                         Some(info) if info.is_pub => {
+                            // Belt and braces for [T-UNSAFE-FFI]: a C
+                            // function reached through a qualifier is still a
+                            // C function.
+                            if self.unsafe_depth == 0
+                                && self.extern_names.contains(&qual)
+                            {
+                                self.error_help(
+                                    name.span,
+                                    format!(
+                                        "`{}` is a C function, so it can only be used inside `unsafe`",
+                                        name.name
+                                    ),
+                                    "wrap the use in `unsafe { ... }`; the package must then \
+declare the `unsafe` capability, which is what makes it visible to everyone who depends on you",
+                                );
+                            }
                             return self.check_fn_call_in(
                                 &target_mod,
                                 &name.name,

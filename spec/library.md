@@ -305,7 +305,7 @@ them:
 | `xs.pop()` | `-> Option[T]` | mutates |
 | `xs.remove(i)` | `(i64) -> T` | mutates; panics out of range, like indexing ([L-LIB-REMOVE]) |
 | `a.cmp(b)` | `(T) -> i64` | `-1`, `0` or `1` in the order `sort` uses; `i64`, `f64`, `str` and tuples ([L-LIB-CMP]) |
-| `xs.sort()` | | mutates; ascending. Only `i64`, `f64` and `str` are ordered — sorting anything else is a compile error, the same one `<` gives |
+| `xs.sort()` | | mutates; ascending. Ordered means `i64`, `f64`, `str`, and a tuple of those ([L-LIB-TUPLE]) — sorting anything else is a compile error, the same one `<` gives |
 | `xs.rev()` | `-> [T]` | |
 | `xs.slice(a, b)` | `(i64, i64) -> [T]` | `a` up to but excluding `b`; clamps past either end rather than panicking, like `substr` |
 | `xs.contains(v)` | `(T) -> bool` | |

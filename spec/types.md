@@ -726,6 +726,15 @@ weakened here.
 the safe tiers do not apply. Using a declared C function — calling one *or
 naming one*, which are the same permission — is allowed only inside it.
 
+An `extern fn` may not be `pub`. A C function is a link-time symbol of the
+package that declares it, and exporting the name carried it past every gate
+that makes Tier 3 visible: `libext.getpid()` in another module needed no
+`unsafe`, charged no capability, panicked under the interpreter with `module
+has no function` and printed an answer from a native build — three engines,
+two of them wrong, over a symbol the consumer's manifest never mentioned. A
+package offers a C function by wrapping it: `pub fn root(x) { unsafe { sqrt(x)
+} }`, which is the spelling that shows up in the ceiling.
+
 The block is not merely syntax. An `unsafe` block puts `unsafe` in the
 enclosing function's effect row, so it reaches the package's capability ceiling
 by the same path every other effect does, and a package containing one must

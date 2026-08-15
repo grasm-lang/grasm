@@ -567,6 +567,15 @@ pub fn load_from_disk_in(
     Ok(program)
 }
 
+/// How deep a package graph may nest.
+///
+/// A backstop against a cycle in a path dependency, not a limit anyone should
+/// meet: at 16 a perfectly ordinary twenty-package chain stopped resolving
+/// *and* stopped saying so — dependency-name resolution degraded silently
+/// into dotted-module-path resolution, and the error named a file whose path
+/// was every package in the chain concatenated.
+const MAX_PACKAGE_DEPTH: usize = 64;
+
 /// Every package reachable from `dir`, named by the prefix its modules carry.
 fn collect_packages(
     prefix: &str,
@@ -575,10 +584,32 @@ fn collect_packages(
     out: &mut HashMap<String, std::path::PathBuf>,
     depth: usize,
 ) {
-    if depth > 16 || out.contains_key(prefix) {
+    let mut expanded = std::collections::HashSet::new();
+    collect_packages_in(prefix, dir, resolved, out, depth, &mut expanded)
+}
+
+fn collect_packages_in(
+    prefix: &str,
+    dir: &std::path::Path,
+    resolved: &HashMap<String, std::path::PathBuf>,
+    out: &mut HashMap<String, std::path::PathBuf>,
+    depth: usize,
+    expanded: &mut std::collections::HashSet<std::path::PathBuf>,
+) {
+    if depth > MAX_PACKAGE_DEPTH || out.contains_key(prefix) {
         return;
     }
     out.insert(prefix.to_string(), dir.to_path_buf());
+    // One key per *path* through the graph, and a graph has exponentially
+    // many of those: twenty ordinary packages with three dependencies each
+    // took over a minute, ×3.3 for every two added. A package reached a
+    // second time under a longer prefix has the same dependencies, and every
+    // prefix that walk would add loses to the shorter one already recorded —
+    // so the sub-tree is expanded once.
+    let key = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    if !expanded.insert(key) {
+        return;
+    }
     let src_dir = package_entry(dir)
         .parent()
         .map(|p| p.to_path_buf())
@@ -592,7 +623,14 @@ fn collect_packages(
         }
     }
     for (name, sub) in subs {
-        collect_packages(&format!("{prefix}.{name}"), &sub, resolved, out, depth + 1);
+        collect_packages_in(
+            &format!("{prefix}.{name}"),
+            &sub,
+            resolved,
+            out,
+            depth + 1,
+            expanded,
+        );
     }
 }
 
@@ -617,7 +655,7 @@ fn resolve_in_package(
     }
     // A path dependency can name a directory that names it back; the graph is
     // resolved elsewhere, and this is only the file lookup.
-    if depth > 16 {
+    if depth > MAX_PACKAGE_DEPTH {
         return None;
     }
     let src_dir = entry.parent()?.to_path_buf();
@@ -658,7 +696,14 @@ fn candidates_in_package(
         ));
         return;
     }
-    if depth > 16 {
+    if depth > MAX_PACKAGE_DEPTH {
+        // Say the limit rather than degrade into dotted-module-path
+        // resolution, which produced a path made of every package name in the
+        // chain and named a file nobody wrote.
+        out.push(format!(
+            "the package graph is more than {MAX_PACKAGE_DEPTH} deep from the entry, \
+so this import was not resolved as a dependency name"
+        ));
         return;
     }
     let Some(src_dir) = entry.parent().map(|p| p.to_path_buf()) else {

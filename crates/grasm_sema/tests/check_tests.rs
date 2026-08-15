@@ -1618,3 +1618,21 @@ fn an_effect_may_not_collide_with_a_type() {
         "effect Clock {\n    fn now() -> i64\n}\nfn main() {\n    with Clock handled_by ClockHandler{ now: || 1 } {\n        print(\"{Clock.now()}\")\n    }\n}\n",
     );
 }
+
+/// A C function is a link-time symbol of the package that declares it, so
+/// `pub` on one is refused ([T-UNSAFE-FFI]).
+///
+/// Exported, the name escaped every gate that makes Tier 3 visible: a
+/// qualified call needed no `unsafe`, charged no capability, panicked under
+/// the interpreter and printed an answer from a native build.
+#[test]
+fn an_extern_may_not_be_pub() {
+    check_err(
+        "pub extern fn getpid() -> i64\nfn main() {\n    unsafe {\n        print(\"{getpid() > 0}\")\n    }\n}\n",
+        "cannot be `pub`",
+    );
+    // The wrapper is how a package offers one.
+    check_ok(
+        "extern fn sqrt(x: f64) -> f64\npub fn root(x: f64) -> f64 {\n    unsafe {\n        sqrt(x)\n    }\n}\nfn main() {\n    print(\"{root(16.0)}\")\n}\n",
+    );
+}

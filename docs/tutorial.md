@@ -540,14 +540,14 @@ fails — plus the seed that found it:
 ```text
 test "doubling is monotonic" ... FAILED on case 1 of 100
   assertion failed
-  counterexample: n = -1
+  counterexample: n = 0
   replay: --seed 24301 --cases 100
 ```
 
-`-1` is the simplest witness the shrinker could reach: `-1 * 2` is `-2`, which
-is smaller. The property is false for every negative number, and for
+`0` is the simplest witness the shrinker could reach: `0 * 2` is `0`, which is
+not greater. The property is false for `0`, for every negative number, and for
 `4611686018427387904` and up, where `n * 2` wraps — the shrinker reports the
-smallest one it can, not the first one it found.
+simplest one it can, not the first one it found.
 
 `grasm test --coverage` reports which statement lines the suite reached —
 counting the lines that doc examples reach, since those are tests too. It did

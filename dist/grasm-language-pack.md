@@ -250,7 +250,10 @@ never parsed as part of a place. The checker accepted `t.0 = 5` anyway and the
 program then panicked with `cannot access field \`0\`` — a message about
 reading, for a program that wrote — while `t.0.push(x)` mutated the tuple
 under `grasm run` and was refused by the compiled backend. A tuple is a fixed
-group of values; a struct is what has parts worth writing to by name.
+group of values; a struct is what has parts worth writing to by name. `inout`
+is a write too, and it was the spelling that outlived the others: `bump(t.0)`
+typechecked and then panicked with `cannot access field \`0\`` — after the
+snapshot had already emptied the component.
 
 **[G-STMT-TERM]** A statement is terminated by a newline, by the `}` that
 closes the block it is in, or by end of file. There is no separator that lets
@@ -477,6 +480,13 @@ first: `[1, 2.5]` and `[2.5, 1]` are both `[f64]`. Checking left to right made
 the first element decide, which is the asymmetry `[E-NUM-PROMOTE]` records as
 fixed for comparisons, still present one level up.
 
+The promotion crosses the two halves of a fallible value too. In
+`fn f(c: bool) -> f64 ! E { if c { 3 } else { Ok(4.5) } }` one branch gives the
+bare ok half and the other the whole `T ! E` ([T-OK-ERR-RETURN]); the `3` is a
+`f64` all the same. Only the all-bare form worked, so adding an `Ok` to one
+branch turned a compiling function into "the branches of this `if` have
+different types".
+
 An expected type also reaches a literal *through the shape that carries it*: a
 list, tuple or map literal, `Some`, `Ok`, `Err`, an `if`'s branches, a
 `match`'s arms, and the expression a function body ends with. Each of those
@@ -538,7 +548,9 @@ same way when its result was ignored.
 A container built out of failures and then discarded discards them too:
 `[risky(x)]` and `xs.map(risky)` written as bare statements throw away every
 failure they hold. One pair of brackets was enough to get the old silence
-back. [T-FALLIBLE-VALUE] keeping the failures in the list is what makes them
+back — and so was one *constructor*: `Some(save())`, a struct literal with a
+fallible field, a sum variant carrying one. A named type holds values like any
+other container. [T-FALLIBLE-VALUE] keeping the failures in the list is what makes them
 readable — while somebody reads them.
 
 **[T-FALLIBLE-COALESCE]** `e ?? d` where `e : T ! E` yields the value or `d`,
@@ -670,8 +682,13 @@ receiver nothing checked.
 
 **[T-INOUT-PLACE]** Its argument must be a variable, field, or index
 expression — never a temporary. **[T-INOUT-MUTABLE]** That place must be
-mutable. **[T-INOUT-EXCLUSIVE]** The same variable may not be passed as
-`inout` twice in one call, nor as both `own` and `inout`.
+mutable. **[T-INOUT-EXCLUSIVE]** The same *place* may not be passed as
+`inout` twice in one call, nor as both `own` and `inout`. Two places overlap
+when one is a prefix of the other — `p` covers `p.xs` — and two different
+fields of one value do not: `two(p.xs, p.ys)` is legal, and comparing roots
+alone refused it, on the most ordinary shape a struct-of-collections has. An
+*index* is treated as naming any element, because `g[i]` and `g[j]` may be the
+same one and nothing here can tell.
 
 **[T-INOUT-REF]** Nor may an `inout` argument be reached through a `ref`.
 `inout` works by snapshotting the place at the call and writing it back at the
@@ -765,6 +782,15 @@ function doing the naming, whether or not the call is written there. Holding a
 function is the permission to call it — the rule [T-EXTERN-VALUE] states for a
 C function, and it holds for every function for the same reason.
 
+*However it is named.* `lib.shout` is the same function `shout` would be and
+carries the same row, and it did not: only the bare spelling was charged, so
+one `import` emptied the row and with it every rule that rests on it —
+`/ {}`, [T-PAR-MAP-PURE], [E-CONST]'s constant table, [T-REGION-FOREIGN],
+[E-HANDLER-MISSING]'s "well-typed programs never reach it", and a package
+declaring `capabilities = []`, which `grasm deps` then certified as performing
+nothing while it printed. A capability ceiling one `import` away from
+meaningless is not a ceiling.
+
 This is deliberately conservative: storing an effectful function and never
 calling it is refused, and the way out is to declare the row. The alternative
 was worse. A built-in higher-order method's function parameter is
@@ -819,10 +845,23 @@ half — the ordinary case, wrapped in `Ok` on the way out — or the whole
 so the constructors worked everywhere a fallible value could be *stored* and
 nowhere one was *produced*.
 
-`return` takes either half too. Only the tail expression was taught this, so
-`return Ok(1)` was "this expression can fail but `i64` is required" — a
-message about the wrong problem, in the shape early exits are written in, and
-the workaround was to rewrite every one of them as `fail`.
+This is a rule about the *position*, not about how it was reached: an
+annotation naming `T ! E` — a `let`, a struct field, a parameter — accepts the
+same two shapes per branch, and demanding the whole type of every branch made
+`let v: f64 ! E = if c { 3.0 } else { Ok(4.5) }` a type mismatch while the same
+expression without the annotation was an unhandled failure whose help says to
+annotate it. Two diagnostics pointing at each other is no way to write the
+program at all.
+
+`return` takes either half too, including through a branching expression:
+`return if c { 3 } else { Ok(4) }` is the two shapes in one statement. Only the
+tail expression was taught this, so `return Ok(1)` was "this expression can
+fail but `i64` is required" — a message about the wrong problem, in the shape
+early exits are written in, and the workaround was to rewrite every one of them
+as `fail`. Deciding by *how the value was written* rather than by what it
+turned out to be left the same hole one level out: an `if` whose branches
+merged to the whole `T ! E` was wrapped a second time on the way out, and the
+caller printed a heap address.
 
 The two halves mix *within one expression*: an `if` may give the bare ok half
 in one branch and the whole `T ! E` in another, and a `match` may do the same
@@ -1106,7 +1145,10 @@ package's capability ceiling and disqualifies a function from `par_map`
 guarantees — and it was, in the first version of this feature.
 
 **[T-MODULE-NS]** Functions are per-module; types and effects share one global
-namespace, so a type name may not be declared twice across a program. One
+namespace, so a type name may not be declared twice across a program — and an
+*effect* is one of the things that claims a name, two of them in fact: `effect
+Clock` declares `Clock` and `ClockHandler`. Both were free to collide with a
+type, and both names stayed usable afterwards. One
 namespace means one namespace: an effect operation's signature may name a type
 from any module, the same as an ordinary function's. A *type alias* is a type
 declaration like any other, and it was the one that escaped both this rule and
@@ -1436,6 +1478,15 @@ and `()` was accepted as an initializer without checking — so
 `let a: () = if c { 1 } else { 2.5 }` typechecked and left `a` holding an
 `i64` at run time: it printed as `1`, compared unequal to `()`, and could be
 passed to a `fn f(u: ())`. `()` has one value.
+
+A branch that must deliver a value has to *end in an expression*. The expected
+type is pushed into a tail expression and there is nothing to push it into
+otherwise, so a branch ending in a `with`, `for` or `while` statement sailed
+past the demand entirely: `if c { 7 } else { with D handled_by h { n } }` in an
+`-> i64` function checked clean, `grasm run` printed `()` where the integer
+belonged and a compiled build printed `0` — while the same `with` as the
+*whole* body was refused. A branch that leaves — `return`, `break`, `continue`
+— delivers its value by not coming back, and is not this case.
 
 **[E-IF-FALLIBLE-MERGE]** When the branches are `Err(e)` and `Ok(v)`, the
 `if` is worth `T ! E` with `T` from the `Ok` side. `Err(e)` says nothing about
@@ -1975,7 +2026,7 @@ them:
 | `xs.pop()` | `-> Option[T]` | mutates |
 | `xs.remove(i)` | `(i64) -> T` | mutates; panics out of range, like indexing ([L-LIB-REMOVE]) |
 | `a.cmp(b)` | `(T) -> i64` | `-1`, `0` or `1` in the order `sort` uses; `i64`, `f64`, `str` and tuples ([L-LIB-CMP]) |
-| `xs.sort()` | | mutates; ascending. Only `i64`, `f64` and `str` are ordered — sorting anything else is a compile error, the same one `<` gives |
+| `xs.sort()` | | mutates; ascending. Ordered means `i64`, `f64`, `str`, and a tuple of those ([L-LIB-TUPLE]) — sorting anything else is a compile error, the same one `<` gives |
 | `xs.rev()` | `-> [T]` | |
 | `xs.slice(a, b)` | `(i64, i64) -> [T]` | `a` up to but excluding `b`; clamps past either end rather than panicking, like `substr` |
 | `xs.contains(v)` | `(T) -> bool` | |
@@ -2597,14 +2648,14 @@ fails — plus the seed that found it:
 ```text
 test "doubling is monotonic" ... FAILED on case 1 of 100
   assertion failed
-  counterexample: n = -1
+  counterexample: n = 0
   replay: --seed 24301 --cases 100
 ```
 
-`-1` is the simplest witness the shrinker could reach: `-1 * 2` is `-2`, which
-is smaller. The property is false for every negative number, and for
+`0` is the simplest witness the shrinker could reach: `0 * 2` is `0`, which is
+not greater. The property is false for `0`, for every negative number, and for
 `4611686018427387904` and up, where `n * 2` wraps — the shrinker reports the
-smallest one it can, not the first one it found.
+simplest one it can, not the first one it found.
 
 `grasm test --coverage` reports which statement lines the suite reached —
 counting the lines that doc examples reach, since those are tests too. It did
@@ -2736,8 +2787,8 @@ runs only under `grasm run`:
 | a generic instantiated at a handler type | `f(h)` for `fn f[T](x: T)` — pass what the handler computes instead |
 | a handler used as a *value* | `print("{h}")`, or storing one — install it with `with … handled_by` instead |
 | a `with` block inside `parallel`/`spawn` | install the handler around the `parallel` block instead |
-| a `match` whose arms are effect-operation calls | `match n { 1 -> Log.info("a")  _ -> Log.info("b") }` — the same arms inside an `if`/`else` compile |
 | a closure literal in the arms of a `match` or `if` | `let f: fn(i64) -> i64 = match n { 1 -> \|x\| x + 1  _ -> \|x\| x * 2 }` — bind each closure first, or make them top-level `fn`s |
+| `fail` inside a *fallible* closure passed to `map`, `filter` or `fold` | `xs.map(\|x\| fail(e))` where the result is held as `[T ! E]` — produce `Err(e)` instead of failing, or pass a named function |
 | a `fold` seeded with an unannotated `map()` | `xs.fold(map(), add)` — annotate the seed: `let seed: Map[str, i64] = map()` |
 | polymorphic recursion | `fn f[T](x: T) -> i64 { f([x]) }` — one compiled copy per type, and the types never stop growing |
 
