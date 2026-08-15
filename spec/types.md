@@ -91,6 +91,13 @@ first: `[1, 2.5]` and `[2.5, 1]` are both `[f64]`. Checking left to right made
 the first element decide, which is the asymmetry `[E-NUM-PROMOTE]` records as
 fixed for comparisons, still present one level up.
 
+The promotion crosses the two halves of a fallible value too. In
+`fn f(c: bool) -> f64 ! E { if c { 3 } else { Ok(4.5) } }` one branch gives the
+bare ok half and the other the whole `T ! E` ([T-OK-ERR-RETURN]); the `3` is a
+`f64` all the same. Only the all-bare form worked, so adding an `Ok` to one
+branch turned a compiling function into "the branches of this `if` have
+different types".
+
 An expected type also reaches a literal *through the shape that carries it*: a
 list, tuple or map literal, `Some`, `Ok`, `Err`, an `if`'s branches, a
 `match`'s arms, and the expression a function body ends with. Each of those
@@ -437,6 +444,14 @@ half — the ordinary case, wrapped in `Ok` on the way out — or the whole
 `T ! E`, which is what `Ok(v)` and `Err(e)` build. The second was rejected,
 so the constructors worked everywhere a fallible value could be *stored* and
 nowhere one was *produced*.
+
+This is a rule about the *position*, not about how it was reached: an
+annotation naming `T ! E` — a `let`, a struct field, a parameter — accepts the
+same two shapes per branch, and demanding the whole type of every branch made
+`let v: f64 ! E = if c { 3.0 } else { Ok(4.5) }` a type mismatch while the same
+expression without the annotation was an unhandled failure whose help says to
+annotate it. Two diagnostics pointing at each other is no way to write the
+program at all.
 
 `return` takes either half too. Only the tail expression was taught this, so
 `return Ok(1)` was "this expression can fail but `i64` is required" — a

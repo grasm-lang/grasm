@@ -2339,7 +2339,26 @@ afterwards has nowhere to send the effect — call it here, or return what it co
     /// `T ! E` merged with a bare `T`, when that is what the two branches
     /// are. `None` when they disagree about something else.
     fn merge_fallible_branches(&mut self, a: &Type, b: &Type) -> Option<Type> {
-        for (whole, half) in [(a, b), (b, a)] {
+        self.merge_fallible_branches_at(a, b, None, None)
+    }
+
+    /// The same, given the expressions the two types came from.
+    ///
+    /// The spans are what lets an integer literal beside a whole `T ! E`
+    /// promote: `fn f(n) -> f64 ! E { if c { 3 } else { Ok(4.5) } }` was
+    /// refused as "branches of different types", while the same `if` with
+    /// *both* halves bare — `{ 4.5 } else { 6 }` — compiled, and
+    /// [T-INT-TO-FLOAT-CARRIED] names an `if`'s branches as exactly the place
+    /// this promotion applies. Which literals are `f64` is a fact only this
+    /// pass has, so it has to be recorded here.
+    fn merge_fallible_branches_at(
+        &mut self,
+        a: &Type,
+        b: &Type,
+        a_at: Option<&Expr>,
+        b_at: Option<&Expr>,
+    ) -> Option<Type> {
+        for (whole, half, half_at) in [(a, b, b_at), (b, a, a_at)] {
             let Type::Fallible(ok, _) = self.uni.shallow_resolve(whole) else {
                 continue;
             };
@@ -2353,8 +2372,29 @@ afterwards has nowhere to send the effect — call it here, or return what it co
                 let _ = self.uni.unify(&ok, half);
                 return Some(self.uni.resolve(whole));
             }
+            // An integer literal adopts the ok half's float.
+            if ok == Type::F64
+                && matches!(self.uni.shallow_resolve(half), Type::I64)
+            {
+                if let Some(e) = half_at.and_then(Self::int_literal_tail) {
+                    self.float_literals.insert(e.span().start);
+                    return Some(self.uni.resolve(whole));
+                }
+            }
         }
         None
+    }
+
+    /// The integer literal a branch is worth, if that is all it is.
+    fn int_literal_tail(e: &Expr) -> Option<&Expr> {
+        match e {
+            Expr::Int(..) => Some(e),
+            Expr::Block(b) => match b.stmts.last() {
+                Some(Stmt::Expr(inner)) => Self::int_literal_tail(inner),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     /// Every effect named by a function type anywhere inside `t`.
@@ -2418,6 +2458,27 @@ afterwards has nowhere to send the effect — call it here, or return what it co
         out
     }
 
+
+    /// What to demand of one branch of an `if` whose whole value is `want`.
+    ///
+    /// When `want` is a `T ! E`, a branch may give the whole thing or just the
+    /// ok half ([T-OK-ERR-RETURN]) — the rule a fallible function's body
+    /// already follows. Demanding the whole type of every branch left
+    /// `let v: f64 ! E = if c { 3.0 } else { Ok(4.5) }` refused as a type
+    /// mismatch, while the same expression *without* the annotation was
+    /// refused as an unhandled failure whose help says to annotate it: two
+    /// diagnostics pointing at each other and no way to write the program.
+    fn branch_want(&self, tail: Option<&Stmt>, want: &Type) -> Type {
+        let Type::Fallible(ok, _) = want else {
+            return want.clone();
+        };
+        match tail {
+            Some(Stmt::Expr(e)) if yields_whole_expr(e) || self.branch_calls_fallible(e) => {
+                want.clone()
+            }
+            _ => (**ok).clone(),
+        }
+    }
 
     /// A branch that must deliver a value has to end in an expression.
     ///
@@ -2633,11 +2694,13 @@ produces none; end the branch with the value it computes",
                 ..
             } => {
                 self.check_expr(cond, &Type::Bool);
-                let t = self.check_block_with(then_block, Some(&want));
+                let want_then = self.branch_want(then_block.stmts.last(), &want);
+                let t = self.check_block_with(then_block, Some(&want_then));
                 self.require_branch_value(then_block, &t, &want);
                 match &**eb {
                     ElseBranch::Else(b) => {
-                        let t = self.check_block_with(b, Some(&want));
+                        let want_else = self.branch_want(b.stmts.last(), &want);
+                        let t = self.check_block_with(b, Some(&want_else));
                         self.require_branch_value(b, &t, &want);
                     }
                     ElseBranch::ElseIf(inner) => self.check_expr(inner, &want),
@@ -2998,7 +3061,20 @@ allocates could outlive it — move the work out of the region, or yield a numbe
                             // other gave the ok half, which a fallible body
                             // may do either way ([T-OK-ERR-RETURN]). The
                             // whole is what the `if` is worth.
-                            if let Some(t) = self.merge_fallible_branches(&then_ty, &else_ty) {
+                            let then_at = match then_block.stmts.last() {
+                                Some(Stmt::Expr(e)) => Some(e),
+                                _ => None,
+                            };
+                            let else_at = match &**eb {
+                                ElseBranch::Else(b) => match b.stmts.last() {
+                                    Some(Stmt::Expr(e)) => Some(e),
+                                    _ => None,
+                                },
+                                ElseBranch::ElseIf(inner) => Some(inner),
+                            };
+                            if let Some(t) = self.merge_fallible_branches_at(
+                                &then_ty, &else_ty, then_at, else_at,
+                            ) {
                                 return t;
                             }
                             let t = self.show(&then_ty);
@@ -5928,6 +6004,17 @@ fn yields_ok_half(e: &Expr) -> bool {
 }
 
 /// Whether every branch of a tail `if`/`match` builds the whole `T ! E`.
+/// Whether this expression builds the whole `T ! E` rather than the ok half.
+fn yields_whole_expr(e: &Expr) -> bool {
+    match e {
+        Expr::Call { callee, .. } => matches!(&**callee, Expr::Ident(id)
+            if id.name == "Ok" || id.name == "Err" || id.name == "fail"),
+        Expr::If { .. } | Expr::Match { .. } => yields_whole(e),
+        Expr::Try { .. } => false,
+        _ => false,
+    }
+}
+
 fn yields_whole(e: &Expr) -> bool {
     fn block_tail(b: &Block) -> Option<&Expr> {
         match b.stmts.last() {

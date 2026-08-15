@@ -1496,3 +1496,50 @@ fn two_disjoint_fields_may_both_be_inout() {
         "passed as `inout` twice",
     );
 }
+
+/// An integer literal beside a whole `T ! E` adopts the ok half's float
+/// ([T-INT-TO-FLOAT-CARRIED]).
+///
+/// The same `if` with *both* halves bare compiled; mixing a bare literal with
+/// an `Ok(4.5)` was "branches of different types".
+#[test]
+fn an_int_literal_promotes_against_a_whole_fallible_float() {
+    check_ok(
+        "type E = | Bad\nfn f(c: bool) -> f64 ! E {\n    if c {\n        3\n    } else {\n        Ok(4.5)\n    }\n}\nfn main() {\n    print(\"{f(true) ?? 0.0}\")\n}\n",
+    );
+    // Either order.
+    check_ok(
+        "type E = | Bad\nfn f(c: bool) -> f64 ! E {\n    if c {\n        Ok(4.5)\n    } else {\n        3\n    }\n}\nfn main() {\n    print(\"{f(true) ?? 0.0}\")\n}\n",
+    );
+    // And across an `else if` chain that also carries an `Err`.
+    check_ok(
+        "type E = | Bad\nfn f(n: i64) -> f64 ! E {\n    if n == 0 {\n        3\n    } else if n == 1 {\n        Ok(4.5)\n    } else {\n        Err(Bad)\n    }\n}\nfn main() {\n    print(\"{f(0) ?? 0.0}\")\n}\n",
+    );
+    // A genuinely different type is still a mismatch.
+    check_err(
+        "type E = | Bad\nfn f(c: bool) -> f64 ! E {\n    if c {\n        \"x\"\n    } else {\n        Ok(4.5)\n    }\n}\nfn main() {\n    print(\"{f(true) ?? 0.0}\")\n}\n",
+        "different types",
+    );
+}
+
+/// Under an annotation naming `T ! E`, each branch may still give either half
+/// ([T-OK-ERR-RETURN]).
+///
+/// Demanding the whole type of every branch made
+/// `let v: f64 ! E = if c { 3.0 } else { Ok(4.5) }` a type mismatch, while the
+/// same expression *without* the annotation was an unhandled failure whose
+/// help says to annotate it — two diagnostics pointing at each other.
+#[test]
+fn an_annotated_fallible_branch_may_give_either_half() {
+    check_ok(
+        "type E = | Bad\nfn main() {\n    let c = true\n    let v: f64 ! E = if c {\n        3.0\n    } else {\n        Ok(4.5)\n    }\n    print(\"{v ?? 0.0}\")\n}\n",
+    );
+    check_ok(
+        "type E = | Bad\nfn main() {\n    let c = true\n    let v: i64 ! E = if c {\n        3\n    } else {\n        Ok(4)\n    }\n    print(\"{v ?? 0 - 1}\")\n}\n",
+    );
+    // A real mismatch is still one.
+    check_err(
+        "type E = | Bad\nfn main() {\n    let c = true\n    let v: i64 ! E = if c {\n        \"x\"\n    } else {\n        Ok(4)\n    }\n    print(\"{v ?? 0 - 1}\")\n}\n",
+        "expected `i64`, found `str`",
+    );
+}
