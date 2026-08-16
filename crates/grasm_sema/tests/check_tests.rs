@@ -2771,3 +2771,84 @@ fn shout(n: i64) -> i64 {\n    print(\"{n}\")\n    n\n}\n\n";
         );
     }
 }
+
+/// An effect operation's declared *result* carries its row.
+///
+/// [E-HANDLER-OWN-ROW] exempts the handler's own operations from the
+/// installing function's row — not the value an operation hands back. An
+/// operation answering `-> fn(i64) -> i64 / {io}` gave out a printing function
+/// that nothing charged, so a function declaring `/ {Mk}` printed, `par_map`'s
+/// purity proof passed, and a package permitting only `Mk` reached `io`. The
+/// same shape written as an ordinary `fn` was refused.
+#[test]
+fn an_operation_result_carries_its_row() {
+    let handler = "\nfn main() {\n    with Mk handled_by MkHandler{ get: || noisy } {\n        \
+print(\"{quiet()}\")\n    }\n}\n\nfn noisy(x: i64) -> i64 {\n    print(\"{x}\")\n    x\n}\n";
+    for (ret, body) in [
+        ("fn(i64) -> i64 / {io}", "let f = Mk.get()\n    f(4)"),
+        ("fn(i64) -> i64 / {io}", "Mk.get()(4)"),
+        ("[fn(i64) -> i64 / {io}]", "let fs = Mk.get()\n    fs[0](4)"),
+        ("Option[fn(i64) -> i64 / {io}]", "let f = Mk.get() ?? noisy\n    f(4)"),
+    ] {
+        check_err(
+            &format!(
+                "effect Mk {{\n    fn get() -> {ret}\n}}\n\n\
+fn quiet() -> i64 / {{Mk}} {{\n    {body}\n}}\n{handler}"
+            ),
+            "not in its declared row",
+        );
+    }
+    // The parallel proof sees it too, through a name and written at the call.
+    for body in ["let f = Mk.get()\n    [1, 2].par_map(f)", "[1, 2].par_map(Mk.get())"] {
+        check_err(
+            &format!(
+                "effect Mk {{\n    fn get() -> fn(i64) -> i64 / {{io}}\n}}\n\n\
+fn quiet() -> [i64] / {{Mk}} {{\n    {body}\n}}\n\nfn main() {{\n    \
+with Mk handled_by MkHandler{{ get: || |x| x }} {{\n        print(\"{{quiet()}}\")\n    }}\n}}\n"
+            ),
+            "performs",
+        );
+    }
+    // An operation answering a *pure* function type is not charged.
+    check_ok(
+        "effect Mk {\n    fn get() -> fn(i64) -> i64\n}\n\n\
+fn quiet() -> i64 / {Mk} {\n    let f = Mk.get()\n    f(4)\n}\n\nfn main() {\n    \
+with Mk handled_by MkHandler{ get: || |x| x * 2 } {\n        print(\"{quiet()}\")\n    }\n}\n",
+    );
+}
+
+/// Scope decides for a module alias and an effect name, as it already does for
+/// a function name.
+///
+/// [T-FN-VALUE-ROW] says so in as many words — "scope decides, here as
+/// everywhere else" — but only the function-name arm honoured it. A binding
+/// spelled like an imported module made `binding.field` take the *module
+/// function's* row: an `io` field looked pure, so a printing function reached
+/// `par_map` and a `capabilities = []` package; and a pure field was charged
+/// an unreachable private helper's `io`, so a package performing nothing
+/// failed to build. A parameter spelled like an effect demanded a handler for
+/// an effect the body never performs.
+#[test]
+fn scope_decides_for_a_module_alias_and_an_effect_name() {
+    // The effect name, shadowed by a parameter: no handler is demanded.
+    check_ok(
+        "effect Clock {\n    fn now() -> i64\n}\n\ntype C = { now: fn() -> i64 }\n\n\
+fn quiet(Clock: C) -> i64 {\n    Clock.now()\n}\n\nfn main() {\n    \
+print(\"{quiet(C{ now: || 42 })}\")\n}\n",
+    );
+    // …and the unshadowed spelling still is.
+    check_err(
+        "effect Clock {\n    fn now() -> i64\n}\n\nfn quiet() -> i64 {\n    Clock.now()\n}\n\n\
+fn main() {\n    print(\"{quiet()}\")\n}\n",
+        "unhandled effect",
+    );
+    // A local spelled like a same-file type's field, holding an `io` function,
+    // is charged by the field's written row.
+    check_err(
+        "type P = { shout: fn(i64) -> i64 / {io} }\n\n\
+fn noisy(n: i64) -> i64 {\n    print(\"{n}\")\n    n\n}\n\n\
+fn quiet() -> [i64] / {} {\n    let p = P{ shout: noisy }\n    [1, 2].par_map(p.shout)\n}\n\n\
+fn main() {\n    print(\"{quiet()}\")\n}\n",
+        "effect-free function",
+    );
+}

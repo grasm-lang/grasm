@@ -855,6 +855,16 @@ position with no field name — its list elements, its tuple components, its
 wider pool charged `io` to a function whose own element type declares no
 effects, on the strength of an unrelated declaration elsewhere in the file.
 
+And the pool is reached for only where nothing is known about the part. Where
+every binding the expression reads has a written type, *those* types say what
+came out: a tuple component, a `??` between two known carriers, a block around
+one. Each of those drew the pool anyway, so a `/ {}` body performing nothing
+was refused on the strength of an unrelated parameter — including a parameter
+whose own row is charged exactly, at every mention of it. Where both a field
+name and the binding's own type are known, the answer is their
+**intersection**: each over-approximates the true row, so the intersection
+does too, and it is the tighter of the two.
+
 An **empty** carried row is a fact, not the absence of one. A parameter written
 `fs: [fn(i64) -> i64]` says its elements perform nothing, and reading one out
 hands that on — but only non-empty rows were recorded, so `let f = fs[0]`
@@ -891,6 +901,15 @@ above.
 function doing the naming, whether or not the call is written there. Holding a
 function is the permission to call it — the rule [T-EXTERN-VALUE] states for a
 C function, and it holds for every function for the same reason.
+
+*And for every name, not only a function's.* A binding spelled like an imported
+module made `binding.field` take the *module function's* row: an `io` field
+looked pure, so a printing function reached `par_map` and a `capabilities = []`
+package; and a pure field was charged an unreachable private helper's `io`, so
+a package that performs nothing failed to build in its consumer. A parameter
+spelled like an **effect** demanded a handler for an effect the body never
+performs. Both directions of one defect, and both are the rule below applied
+to a name that is not a function's.
 
 *And only when it is a function.* Scope decides at a **call** as well as at a
 mention: the two arms disagreed, so a *parameter* spelled like a private helper
@@ -1146,6 +1165,15 @@ reference to it *is* the permission to call it, so a bare mention counts
 against a package's capability ceiling and disqualifies a function from
 `par_map`. Without that rule, `xs.par_map(sqrt)` typechecked and the ceiling
 had a door straight through it.
+
+**[T-EFFECT-OP-RESULT]** An operation's declared *result* carries its row like
+any other written type. [E-HANDLER-OWN-ROW] exempts the handler's own
+operations from the installing function's row; it says nothing about the value
+an operation hands back. An operation answering
+`-> fn(i64) -> i64 / {io}` gave out a printing function that nothing charged,
+so a function declaring `/ {Mk}` printed, `par_map`'s purity proof passed, and
+a package permitting only `Mk` reached `io` — while the same signature written
+as an ordinary `fn` was refused, one keyword apart.
 
 **[T-CAPABILITY]** A package's manifest may declare `capabilities`: the set of
 effects it is permitted to perform. What counts against it is what *escapes*
@@ -7097,6 +7125,43 @@ fn main() {
     } {
         show("x")
         show("y")
+    }
+}
+```
+
+## `T-EFFECT-OP-RESULT.gr`
+
+```grasm
+//! tag: T-EFFECT-OP-RESULT
+//! expect: output
+//! 8
+//! 16
+// An operation's declared result carries its row like any other written type.
+//
+// [E-HANDLER-OWN-ROW] exempts the handler's own operations from the installing
+// function's row. It says nothing about the value an operation hands back, and
+// that was read as though it did: an operation answering
+// `-> fn(i64) -> i64 / {io}` gave out a printing function nothing charged, so
+// a function declaring `/ {Mk}` printed, `par_map`'s purity proof passed, and
+// a package permitting only `Mk` reached `io`. The same signature written as
+// an ordinary `fn` was refused, one keyword apart.
+//
+// A *pure* result is not charged, which is what this program is: `Mk.get()`
+// answers `fn(i64) -> i64`, so `twice` really does declare everything it
+// performs.
+effect Mk {
+    fn get() -> fn(i64) -> i64
+}
+
+fn twice(n: i64) -> i64 / {Mk} {
+    let f = Mk.get()
+    f(f(n))
+}
+
+fn main() {
+    with Mk handled_by MkHandler{ get: || |x| x * 2 } {
+        print("{twice(2)}")
+        print("{twice(4)}")
     }
 }
 ```

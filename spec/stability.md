@@ -246,6 +246,7 @@ May change or be removed in any release. New surface starts here.
 - `T-EFFECT-RESERVED` — experimental
 - `T-ERR-UNION-OPAQUE` — experimental
 - `T-EXTERN` — experimental
+- `T-EFFECT-OP-RESULT` — experimental
 - `T-EXTERN-VALUE` — experimental
 - `T-PAR-MAP-PURE` — experimental
 - `T-TASK-CAPTURE` — experimental

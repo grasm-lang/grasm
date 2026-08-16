@@ -500,6 +500,15 @@ function doing the naming, whether or not the call is written there. Holding a
 function is the permission to call it — the rule [T-EXTERN-VALUE] states for a
 C function, and it holds for every function for the same reason.
 
+*And for every name, not only a function's.* A binding spelled like an imported
+module made `binding.field` take the *module function's* row: an `io` field
+looked pure, so a printing function reached `par_map` and a `capabilities = []`
+package; and a pure field was charged an unreachable private helper's `io`, so
+a package that performs nothing failed to build in its consumer. A parameter
+spelled like an **effect** demanded a handler for an effect the body never
+performs. Both directions of one defect, and both are the rule below applied
+to a name that is not a function's.
+
 *And only when it is a function.* Scope decides at a **call** as well as at a
 mention: the two arms disagreed, so a *parameter* spelled like a private helper
 was charged that helper's row — a `capabilities = []` package broke in every
@@ -754,6 +763,15 @@ reference to it *is* the permission to call it, so a bare mention counts
 against a package's capability ceiling and disqualifies a function from
 `par_map`. Without that rule, `xs.par_map(sqrt)` typechecked and the ceiling
 had a door straight through it.
+
+**[T-EFFECT-OP-RESULT]** An operation's declared *result* carries its row like
+any other written type. [E-HANDLER-OWN-ROW] exempts the handler's own
+operations from the installing function's row; it says nothing about the value
+an operation hands back. An operation answering
+`-> fn(i64) -> i64 / {io}` gave out a printing function that nothing charged,
+so a function declaring `/ {Mk}` printed, `par_map`'s purity proof passed, and
+a package permitting only `Mk` reached `io` — while the same signature written
+as an ordinary `fn` was refused, one keyword apart.
 
 **[T-CAPABILITY]** A package's manifest may declare `capabilities`: the set of
 effects it is permitted to perform. What counts against it is what *escapes*

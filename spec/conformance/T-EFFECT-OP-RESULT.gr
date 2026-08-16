@@ -1,0 +1,32 @@
+//! tag: T-EFFECT-OP-RESULT
+//! expect: output
+//! 8
+//! 16
+// An operation's declared result carries its row like any other written type.
+//
+// [E-HANDLER-OWN-ROW] exempts the handler's own operations from the installing
+// function's row. It says nothing about the value an operation hands back, and
+// that was read as though it did: an operation answering
+// `-> fn(i64) -> i64 / {io}` gave out a printing function nothing charged, so
+// a function declaring `/ {Mk}` printed, `par_map`'s purity proof passed, and
+// a package permitting only `Mk` reached `io`. The same signature written as
+// an ordinary `fn` was refused, one keyword apart.
+//
+// A *pure* result is not charged, which is what this program is: `Mk.get()`
+// answers `fn(i64) -> i64`, so `twice` really does declare everything it
+// performs.
+effect Mk {
+    fn get() -> fn(i64) -> i64
+}
+
+fn twice(n: i64) -> i64 / {Mk} {
+    let f = Mk.get()
+    f(f(n))
+}
+
+fn main() {
+    with Mk handled_by MkHandler{ get: || |x| x * 2 } {
+        print("{twice(2)}")
+        print("{twice(4)}")
+    }
+}

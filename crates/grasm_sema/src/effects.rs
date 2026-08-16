@@ -46,6 +46,15 @@ struct Ctx<'a> {
     /// qualified name (`mod::fn`) → decl
     fns: HashMap<String, &'a FnDecl>,
     effect_names: HashSet<String>,
+    /// The row an effect operation's declared *result* carries, keyed
+    /// `Effect::op`. An operation answering `-> fn(i64) -> i64 / {io}` hands
+    /// out a printing function, and nothing recorded that: the row travelled
+    /// with the value everywhere else and stopped at the one place a handler
+    /// hands one over.
+    op_rows: HashMap<String, BTreeSet<String>>,
+    /// Operation result types, held until the alias and type-row tables that
+    /// resolve them are built.
+    pending_op_rets: Vec<(String, TypeExpr)>,
     /// `module::name` for every declared C function.
     ///
     /// What a C function does is unknowable, so calling one performs `io`.
@@ -257,6 +266,8 @@ pub fn effects_of_program(program: &crate::loader::Program) -> BTreeSet<String> 
     let mut ctx = Ctx {
         fns: HashMap::new(),
         effect_names: HashSet::new(),
+        op_rows: HashMap::new(),
+        pending_op_rets: Vec::new(),
         externs: HashSet::new(),
         rows: HashMap::new(),
         imports: HashMap::new(),
@@ -276,6 +287,14 @@ pub fn effects_of_program(program: &crate::loader::Program) -> BTreeSet<String> 
                 }
                 Decl::Effect(e) => {
                     ctx.effect_names.insert(e.name.name.clone());
+                    for op in &e.ops {
+                        if let Some(ret) = &op.ret {
+                            ctx.pending_op_rets.push((
+                                format!("{}::{}", e.name.name, op.name.name),
+                                ret.clone(),
+                            ));
+                        }
+                    }
                 }
                 Decl::Extern(x) => {
                     ctx.externs.insert(format!("{}::{}", f.name, x.name.name));
@@ -288,6 +307,7 @@ pub fn effects_of_program(program: &crate::loader::Program) -> BTreeSet<String> 
         collect_type_aliases(f.module, &mut ctx.type_aliases);
     }
     ctx.type_rows = collect_type_rows(&views, &ctx.type_aliases);
+    settle_op_rows(&mut ctx);
     for f in &views {
         harvest_module(
             f.module,
@@ -464,6 +484,8 @@ fn build_ctx_in<'a>(files: &'a [ModuleView<'a>], packages: &BTreeSet<String>) ->
     let mut ctx = Ctx {
         fns: HashMap::new(),
         effect_names: HashSet::new(),
+        op_rows: HashMap::new(),
+        pending_op_rets: Vec::new(),
         externs: HashSet::new(),
         rows: HashMap::new(),
         imports: HashMap::new(),
@@ -483,6 +505,14 @@ fn build_ctx_in<'a>(files: &'a [ModuleView<'a>], packages: &BTreeSet<String>) ->
                 }
                 Decl::Effect(e) => {
                     ctx.effect_names.insert(e.name.name.clone());
+                    for op in &e.ops {
+                        if let Some(ret) = &op.ret {
+                            ctx.pending_op_rets.push((
+                                format!("{}::{}", e.name.name, op.name.name),
+                                ret.clone(),
+                            ));
+                        }
+                    }
                 }
                 Decl::Extern(x) => {
                     ctx.externs.insert(format!("{}::{}", f.name, x.name.name));
@@ -495,6 +525,7 @@ fn build_ctx_in<'a>(files: &'a [ModuleView<'a>], packages: &BTreeSet<String>) ->
         collect_type_aliases(f.module, &mut ctx.type_aliases);
     }
     ctx.type_rows = collect_type_rows(files, &ctx.type_aliases);
+    settle_op_rows(&mut ctx);
     for f in files {
         harvest_module(
             f.module,
@@ -1134,7 +1165,11 @@ fn par_fn_row(
     // those refusals is the same refusal one word longer.
     if let Expr::Field { recv, name, .. } = func {
         if let Expr::Ident(alias) = &**recv {
-            if let Some(target) = ctx.imports.get(current).and_then(|m| m.get(&alias.name)) {
+            let shadowed = fnb.shadowed(&alias.name, alias.span.start);
+            if let Some(target) = (!shadowed)
+                .then(|| ctx.imports.get(current).and_then(|m| m.get(&alias.name)))
+                .flatten()
+            {
                 if ctx.externs.contains(&format!("{target}::{}", name.name)) {
                     out.insert(IO.to_string());
                     return;
@@ -1147,6 +1182,11 @@ fn par_fn_row(
                 }
             }
         }
+    }
+    // `xs.par_map(Mk.get())` — an effect operation whose declared result is a
+    // function type hands out whatever row that type writes.
+    if let Some(row) = carried_of(func, ctx, fnb) {
+        out.extend(row.into_iter().filter(|e| !active.contains(e)));
     }
     // `xs.par_map(o ?? dflt)` — each side is a candidate function value, and
     // walking the expression as an ordinary one reached neither: the left is a
@@ -1706,21 +1746,33 @@ impl<'a> FnBindings<'a> {
 /// Where it is `Some`, the pool is the wrong answer by construction: the
 /// binding's own written type is the contract, and an unrelated declaration in
 /// the same signature has nothing to do with what came out of *this* one.
-fn carried_of(e: &Expr, fnb: &FnBindings) -> Option<BTreeSet<String>> {
+fn carried_of(e: &Expr, ctx: &Ctx, fnb: &FnBindings) -> Option<BTreeSet<String>> {
     match e {
         Expr::Ident(id) => fnb.carried_rows.get(&id.name).cloned(),
-        Expr::Index { recv, .. } => carried_of(recv, fnb),
-        Expr::Field { recv, .. } => carried_of(recv, fnb),
+        Expr::Index { recv, .. } => carried_of(recv, ctx, fnb),
+        Expr::Field { recv, .. } => carried_of(recv, ctx, fnb),
+        // An effect operation's declared *result*. `fn get() -> fn(i64) ->
+        // i64 / {io}` hands out a printing function, and the row travelled
+        // with the value through every other carrier and stopped at the one
+        // place a handler hands one over: the operation's row exempts the
+        // handler ([E-HANDLER-OWN-ROW]), not what it returns.
+        Expr::MethodCall { recv, name, .. } => match &**recv {
+            Expr::Ident(tid) if !fnb.shadowed(&tid.name, tid.span.start) => ctx
+                .op_rows
+                .get(&format!("{}::{}", tid.name, name.name))
+                .cloned(),
+            _ => None,
+        },
         // `o ?? dflt`, and any other shape whose value is one side or the
         // other: both sides have to be known for the answer to be.
         Expr::Binary { lhs, rhs, .. } => {
-            let a = carried_of(lhs, fnb)?;
-            let b = carried_of(rhs, fnb)?;
+            let a = carried_of(lhs, ctx, fnb)?;
+            let b = carried_of(rhs, ctx, fnb)?;
             Some(a.union(&b).cloned().collect())
         }
-        Expr::Try { expr, .. } => carried_of(expr, fnb),
+        Expr::Try { expr, .. } => carried_of(expr, ctx, fnb),
         Expr::Block(b) | Expr::Unsafe(b) | Expr::Region(b) => match b.stmts.last() {
-            Some(Stmt::Expr(t)) => carried_of(t, fnb),
+            Some(Stmt::Expr(t)) => carried_of(t, ctx, fnb),
             _ => None,
         },
         _ => None,
@@ -2233,7 +2285,7 @@ fn collect_fn_bindings<'a>(b: &'a Block, ctx: &Ctx, current: &str, fnb: &mut FnB
                 // bindings it reads say what they carry, and that is what
                 // came out. Only when *every* part is known: where one is
                 // not, the fallback pool is the right conservatism.
-                if let Some(row) = carried_of(init, fnb) {
+                if let Some(row) = carried_of(init, ctx, fnb) {
                     fnb.bind_name(&name.name, name.span.start);
                     fnb.any.push(FnSource::Declared(row.clone()));
                     fnb.by_name
@@ -2473,6 +2525,19 @@ fn collect_type_aliases(
 /// names they mention until nothing changes. A fixpoint rather than recursion,
 /// so a self-referential type — `type Node = { next: Option[Node] }`, the
 /// ordinary shape — terminates.
+/// Resolves each effect operation's declared result into the row it carries.
+///
+/// Deferred until the alias and type-row tables exist, since a result written
+/// `-> Cb` or `-> Box[Cb]` says nothing until those are built.
+fn settle_op_rows(ctx: &mut Ctx) {
+    let pending = std::mem::take(&mut ctx.pending_op_rets);
+    for (key, ret) in pending {
+        if let Some(row) = declared_row_within(&ret, &ctx.type_aliases, &ctx.type_rows) {
+            ctx.op_rows.insert(key, row);
+        }
+    }
+}
+
 fn collect_type_rows(
     files: &[ModuleView],
     aliases: &HashMap<String, TypeExpr>,
@@ -2673,7 +2738,7 @@ fn computed_callee_row(
     // *intersection* is still an over-approximation and is the tighter one:
     // a field name is keyed across the whole program, and a binding's type is
     // keyed to the binding.
-    let carried = carried_of(callee, fnb);
+    let carried = carried_of(callee, ctx, fnb);
     match callee {
         Expr::Field { name, .. } if name.name.parse::<usize>().is_ok() => match carried {
             Some(row) => out.extend(row),
@@ -2929,12 +2994,25 @@ fn walk_expr(
             recv, name, args, ..
         } => {
             if let Expr::Ident(tid) = &**recv {
-                if ctx.effect_names.contains(&tid.name) {
+                // A binding of that name is a different thing, and scope
+                // decides — the rule [T-FN-VALUE-ROW] already states for a
+                // function name, which an effect name and a module alias need
+                // for the same reason. A parameter spelled like an imported
+                // module took the *module function's* row at
+                // `binding.field(x)`: an `io` field looked pure inside a
+                // `capabilities = []` package, and a pure one was charged an
+                // unreachable private helper's `io` and failed the build.
+                // A parameter spelled like an effect demanded a handler for
+                // an effect the body never performs.
+                let shadowed = fnb.shadowed(&tid.name, tid.span.start);
+                if !shadowed && ctx.effect_names.contains(&tid.name) {
                     let ename = tid.name.clone();
                     if !active.contains(&ename) {
                         out.insert(ename);
                     }
-                } else if let Some(qual) = ctx.resolve_qualified(current, &tid.name, &name.name) {
+                } else if let (false, Some(qual)) =
+                    (shadowed, ctx.resolve_qualified(current, &tid.name, &name.name))
+                {
                     // Cross-module call `utils.helper(...)`.
                     contribute(&qual, active, ctx, out);
                 } else {
@@ -2964,12 +3042,12 @@ fn walk_expr(
                 // binding it was read out of says it carries, and only where
                 // that is unknown, this function's own signature — the
                 // program's pool never.
-                match carried_of(recv, fnb) {
+                match carried_of(recv, ctx, fnb) {
                     Some(row) => out.extend(row),
                     None => out.extend(fnb.signature_rows.iter().cloned()),
                 }
             } else if let Some(row) = ctx.field_rows.get(&name.name) {
-                match carried_of(recv, fnb) {
+                match carried_of(recv, ctx, fnb) {
                     // Both over-approximate, so the intersection still does.
                     Some(by_binding) => out.extend(row.intersection(&by_binding).cloned()),
                     None => out.extend(row.iter().cloned()),
@@ -2990,7 +3068,11 @@ fn walk_expr(
             // capability ceiling.
             let mut qualified = false;
             if let Expr::Ident(alias) = &**recv {
-                if let Some(target) = ctx.imports.get(current).and_then(|m| m.get(&alias.name)) {
+                let shadowed = fnb.shadowed(&alias.name, alias.span.start);
+                if let Some(target) = (!shadowed)
+                    .then(|| ctx.imports.get(current).and_then(|m| m.get(&alias.name)))
+                    .flatten()
+                {
                     if ctx.externs.contains(&format!("{target}::{}", name.name)) {
                         out.insert(IO.to_string());
                         out.insert(UNSAFE.to_string());
