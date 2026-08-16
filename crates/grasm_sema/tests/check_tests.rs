@@ -3179,3 +3179,34 @@ fn main() {{\n    print(\"ok\")\n}}\n"
     ));
     check_ok("fn main() {\n    let t = (((1, 2), 2), 3)\n    print(\"{t.0.0.0}\")\n}\n");
 }
+
+/// A chain of UFCS method calls is checked in linear time.
+///
+/// The same defect as the field chain, one path over: a method call infers its
+/// receiver to resolve the method, and then `check_fn_call` checks that same
+/// receiver against the parameter it fills. Twenty `.bump(1)`s took 0.7
+/// seconds, forty never finished — under the nesting cap that [G-NEST-LIMIT]
+/// says must be *reported* rather than hung on.
+///
+/// Fixed by memoizing inference for the shapes that cannot hold a closure. A
+/// closure literal's type depends on the position it fills and its body is
+/// checked against the enclosing function's error type, so for those a second
+/// visit is not a repeat — memoizing them lost the refusal of a stored closure
+/// that fails inside a function declaring no error type, which is why the
+/// cache is narrow.
+#[test]
+fn a_chain_of_method_calls_is_linear() {
+    let chain = ".bump(1)".repeat(400);
+    check_ok(&format!(
+        "type B = {{ v: i64 }}\n\nfn bump(b: B, n: i64) -> B {{\n    B{{ v: b.v + n }}\n}}\n\n\
+fn main() {{\n    let b = B{{ v: 0 }}\n    print(\"{{b{chain}.v}}\")\n}}\n"
+    ));
+    // The narrowness is the point: a closure in an argument is still walked
+    // where it is checked, so this stays refused.
+    check_err(
+        "type E = { c: str }\ntype Box = { f: fn(i64) -> i64 }\n\n\
+fn build() -> Box ! E {\n    Box{ f: |x| if x == 0 { fail(E{ c: \"z\" }) } else { x } }\n}\n\n\
+fn main() {\n    let b = build() ?? Box{ f: |x| x }\n    print(\"{b.f(0)}\")\n}\n",
+        "declares no error type",
+    );
+}

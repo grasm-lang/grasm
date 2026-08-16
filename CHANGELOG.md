@@ -7,6 +7,16 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
 
 ### Fixed
 
+- **`grasm check` no longer takes exponential time on a chain of method calls**
+  either. The same defect as the field chain, one path over: a method call
+  infers its receiver to resolve the method, and `check_fn_call` then checks
+  that same receiver against the parameter it fills. Twenty `.bump(1)`s took
+  0.7 seconds and forty never finished. Inference is now memoized for the
+  shapes that cannot hold a closure — narrow deliberately, since a closure's
+  type depends on the position it fills and its body is checked against the
+  enclosing function's error type, so for those a second visit is not a repeat.
+  Found by auditing for siblings of the field-chain defect rather than by an
+  evaluator.
 - **`grasm check` no longer takes exponential time on a chain of field reads.**
   `infer_field` inferred its receiver twice — once for the handler-operation
   check, once for the read — so cost doubled per link: twenty-two `.next`s took

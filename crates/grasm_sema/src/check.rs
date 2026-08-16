@@ -411,6 +411,8 @@ struct Checker {
     /// whole span.
     callee_rows: std::collections::HashMap<(u32, u32), std::collections::BTreeSet<String>>,
     field_calls: std::collections::HashSet<(u32, u32)>,
+    /// Inferred type per expression, keyed by whole span. See `infer_expr`.
+    expr_types: HashMap<(u32, u32), Type>,
     /// See `Analysis::empty_types`. Collected as type variables and resolved
     /// once checking is over, since that is when they have answers.
     /// (start offset, length, element type) — the length so the
@@ -577,6 +579,7 @@ impl Checker {
             value_rows: std::collections::HashMap::new(),
             callee_rows: std::collections::HashMap::new(),
             field_calls: std::collections::HashSet::new(),
+            expr_types: HashMap::new(),
             empty_lits: Vec::new(),
             float_sums: std::collections::HashSet::new(),
             effects: HashMap::new(),
@@ -3407,7 +3410,62 @@ write back to — copy it into a local first, as in `var {} = {}`",
     /// without naming anything outside, a region and a reference do not mix
     /// ([T-REGION-REF]).
     fn infer_expr(&mut self, e: &Expr) -> Type {
+        // Memoized by span. An expression appears once in a program and its
+        // type does not depend on where it is asked from — but it *is* asked
+        // more than once: a method call infers its receiver to resolve the
+        // method, and then `check_fn_call` checks the same receiver against
+        // the parameter it fills. That doubled the cost per link of a UFCS
+        // chain, so twenty `.bump(1)`s took 0.7 seconds and forty never
+        // finished. The same shape as the field chain, one path over.
+        //
+        // Skipping the repeat also stops the walk emitting the same diagnostic
+        // twice, which it did for anything reached this way.
+        // Only the shapes that cannot hold a closure are memoized. A closure
+        // literal's type depends on the position it fills, and its body is
+        // checked against the enclosing function's error type — so a second
+        // visit is not a repeat of the first, and skipping it lost the refusal
+        // of a stored closure that fails inside a function declaring no error
+        // type. A projection chain holds no closure, and it is the shape that
+        // was costing 2^n.
+        let key = {
+            let sp = e.span();
+            (sp.start, sp.end)
+        };
+        fn simple(e: &Expr) -> bool {
+            matches!(
+                e,
+                Expr::Ident(_) | Expr::Int(..) | Expr::Float(..) | Expr::Bool(..)
+            )
+        }
+        let cacheable = match e {
+            Expr::Ident(_) | Expr::Int(..) | Expr::Float(..) | Expr::Bool(..) => true,
+            // A projection off something already known.
+            Expr::Field { recv, .. } | Expr::Index { recv, .. } => self
+                .expr_types
+                .contains_key(&(recv.span().start, recv.span().end)),
+            // A call whose arguments are plain values holds no closure, so a
+            // second visit really is a repeat. This is the chain that cost
+            // 2^n: `b.bump(1).bump(1)…`, where each receiver is itself a call
+            // and the receiver is walked once to resolve the method and again
+            // to check it against the parameter it fills.
+            Expr::MethodCall { recv, args, .. } => {
+                args.iter().all(simple)
+                    && (simple(recv)
+                        || self
+                            .expr_types
+                            .contains_key(&(recv.span().start, recv.span().end)))
+            }
+            _ => false,
+        };
+        if cacheable {
+            if let Some(t) = self.expr_types.get(&key) {
+                return t.clone();
+            }
+        }
         let t = self.infer_expr_inner(e);
+        if cacheable {
+            self.expr_types.insert(key, t.clone());
+        }
         self.record_value_row(e, &t);
         // A `ref` from outside, mentioned inside a parallel operation's
         // function. Writing through one was already refused; *reading* is no
