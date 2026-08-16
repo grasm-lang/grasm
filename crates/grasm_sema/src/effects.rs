@@ -1699,6 +1699,34 @@ impl<'a> FnBindings<'a> {
 ///
 /// Only a path of reads, so `mk()[0]` and `xs[i] + ys[j]` answer `None` — the
 /// point is to hand on the sources of one known binding, not to guess.
+/// The row the *written types* of the bindings this expression reads say it
+/// carries, when every part of it is a binding this pass knows.
+///
+/// `None` where any part is not, which is where the fallback pool belongs.
+/// Where it is `Some`, the pool is the wrong answer by construction: the
+/// binding's own written type is the contract, and an unrelated declaration in
+/// the same signature has nothing to do with what came out of *this* one.
+fn carried_of(e: &Expr, fnb: &FnBindings) -> Option<BTreeSet<String>> {
+    match e {
+        Expr::Ident(id) => fnb.carried_rows.get(&id.name).cloned(),
+        Expr::Index { recv, .. } => carried_of(recv, fnb),
+        Expr::Field { recv, .. } => carried_of(recv, fnb),
+        // `o ?? dflt`, and any other shape whose value is one side or the
+        // other: both sides have to be known for the answer to be.
+        Expr::Binary { lhs, rhs, .. } => {
+            let a = carried_of(lhs, fnb)?;
+            let b = carried_of(rhs, fnb)?;
+            Some(a.union(&b).cloned().collect())
+        }
+        Expr::Try { expr, .. } => carried_of(expr, fnb),
+        Expr::Block(b) | Expr::Unsafe(b) | Expr::Region(b) => match b.stmts.last() {
+            Some(Stmt::Expr(t)) => carried_of(t, fnb),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn binding_root(e: &Expr) -> Option<&str> {
     match e {
         // A plain copy: `let f = step`. Without this it fell through to the
@@ -2193,16 +2221,19 @@ fn collect_fn_bindings<'a>(b: &'a Block, ctx: &Ctx, current: &str, fnb: &mut FnB
                         fnb.by_name.insert(name.name.clone(), carried);
                         continue;
                     }
-                    // The root is not itself a function value — it is a list,
-                    // a tuple, a struct, an `Option` of them — but its written
-                    // type says what it carries, and that is what came out.
-                    if let Some(row) = fnb.carried_rows.get(root).cloned() {
-                        fnb.bind_name(&name.name, name.span.start);
-                        fnb.any.push(FnSource::Declared(row.clone()));
-                        fnb.by_name
-                            .insert(name.name.clone(), vec![FnSource::Declared(row)]);
-                        continue;
-                    }
+                }
+                // The initializer is not itself a function value — it is a
+                // list, a tuple, a struct, an `Option` of them, or a `??`
+                // between two of those — but the written types of the
+                // bindings it reads say what they carry, and that is what
+                // came out. Only when *every* part is known: where one is
+                // not, the fallback pool is the right conservatism.
+                if let Some(row) = carried_of(init, fnb) {
+                    fnb.bind_name(&name.name, name.span.start);
+                    fnb.any.push(FnSource::Declared(row.clone()));
+                    fnb.by_name
+                        .insert(name.name.clone(), vec![FnSource::Declared(row)]);
+                    continue;
                 }
                 // An annotation is a written type in this function, exactly as
                 // a parameter's is, and the fallback pool was seeded only from
@@ -2289,7 +2320,13 @@ fn indirect_row(
             .sources_for(name)
             .iter()
             .any(|s| matches!(s, FnSource::Unknown));
-    if unaccounted && !fnb.signature_rows.is_empty() {
+    // …unless the name's own written type says what it carries. That is not
+    // "nothing known" — it is the contract, and it is already charged at the
+    // mention. Drawing the pool as well refused `t.0(1)` for a pure `t` on
+    // the strength of an unrelated parameter in the same signature, while the
+    // same read through a `let` was accepted.
+    let known_by_type = fnb.carried_rows.contains_key(name);
+    if unaccounted && !known_by_type && !fnb.signature_rows.is_empty() {
         out.extend(
             fnb.signature_rows
                 .iter()
@@ -2626,16 +2663,30 @@ fn computed_callee_row(
     fnb: &FnBindings,
     out: &mut BTreeSet<String>,
 ) {
+    // What the binding this was read out of says it carries. Both this and
+    // `field_rows` over-approximate the true row, so where both are known the
+    // *intersection* is still an over-approximation and is the tighter one:
+    // a field name is keyed across the whole program, and a binding's type is
+    // keyed to the binding.
+    let carried = carried_of(callee, fnb);
     match callee {
-        Expr::Field { name, .. } if name.name.parse::<usize>().is_ok() => {
-            out.extend(fnb.signature_rows.iter().cloned())
-        }
-        Expr::Field { name, .. } => {
-            if let Some(row) = ctx.field_rows.get(&name.name) {
-                out.extend(row.iter().cloned());
+        Expr::Field { name, .. } if name.name.parse::<usize>().is_ok() => match carried {
+            Some(row) => out.extend(row),
+            // A tuple component of a binding this pass does not know.
+            None => out.extend(fnb.signature_rows.iter().cloned()),
+        },
+        Expr::Field { name, .. } => match (ctx.field_rows.get(&name.name), carried) {
+            (Some(by_name), Some(by_binding)) => {
+                out.extend(by_name.intersection(&by_binding).cloned())
             }
-        }
-        _ => out.extend(fnb.signature_rows.iter().cloned()),
+            (Some(row), None) => out.extend(row.iter().cloned()),
+            (None, Some(row)) => out.extend(row),
+            (None, None) => {}
+        },
+        _ => match carried {
+            Some(row) => out.extend(row),
+            None => out.extend(fnb.signature_rows.iter().cloned()),
+        },
     }
 }
 
@@ -2904,11 +2955,20 @@ fn walk_expr(
             // Or a call of a function held in a field of that name
             // ([T-FIELD-CALL]): `b.f(x)` where `f: fn(i64) -> i64 / {io}`.
             if name.name.parse::<usize>().is_ok() {
-                // A tuple component: numbered, so keyed nowhere. From this
-                // function's own signature, not the program's pool.
-                out.extend(fnb.signature_rows.iter().cloned());
+                // A tuple component: numbered, so keyed nowhere. What the
+                // binding it was read out of says it carries, and only where
+                // that is unknown, this function's own signature — the
+                // program's pool never.
+                match carried_of(recv, fnb) {
+                    Some(row) => out.extend(row),
+                    None => out.extend(fnb.signature_rows.iter().cloned()),
+                }
             } else if let Some(row) = ctx.field_rows.get(&name.name) {
-                out.extend(row.iter().cloned());
+                match carried_of(recv, fnb) {
+                    // Both over-approximate, so the intersection still does.
+                    Some(by_binding) => out.extend(row.intersection(&by_binding).cloned()),
+                    None => out.extend(row.iter().cloned()),
+                }
             }
             for a in args {
                 walk_expr(a, current, active, ctx, fnb, out);

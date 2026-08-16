@@ -453,6 +453,16 @@ position with no field name — its list elements, its tuple components, its
 wider pool charged `io` to a function whose own element type declares no
 effects, on the strength of an unrelated declaration elsewhere in the file.
 
+And the pool is reached for only where nothing is known about the part. Where
+every binding the expression reads has a written type, *those* types say what
+came out: a tuple component, a `??` between two known carriers, a block around
+one. Each of those drew the pool anyway, so a `/ {}` body performing nothing
+was refused on the strength of an unrelated parameter — including a parameter
+whose own row is charged exactly, at every mention of it. Where both a field
+name and the binding's own type are known, the answer is their
+**intersection**: each over-approximates the true row, so the intersection
+does too, and it is the tighter of the two.
+
 An **empty** carried row is a fact, not the absence of one. A parameter written
 `fs: [fn(i64) -> i64]` says its elements perform nothing, and reading one out
 hands that on — but only non-empty rows were recorded, so `let f = fs[0]`

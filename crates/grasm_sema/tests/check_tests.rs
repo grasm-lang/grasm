@@ -2685,3 +2685,49 @@ f(x)\n    print(\"{x}\")\n}\n");
         diags[0].help
     );
 }
+
+/// Where every part of what was read is a binding this pass knows, the
+/// fallback pool is the wrong answer.
+///
+/// [T-FN-TYPE-ROW-CARRIED] scopes the pool to rows written "at a position with
+/// no field name", and reaches for it only where nothing is known about the
+/// part. A tuple component and a `??` between two known carriers drew it
+/// anyway, so a `/ {}` body performing nothing was refused on the strength of
+/// an unrelated parameter in the same signature — including a parameter whose
+/// own row is exactly accounted for at every mention of it.
+#[test]
+fn a_known_carrier_is_read_by_its_own_type() {
+    let decls = "type Cb = fn(i64) -> i64\ntype Loud = fn(i64) -> i64 / {io}\n\n\
+fn inc(n: i64) -> i64 {\n    n + 1\n}\n\n";
+    let sig = "fn go(fs: [Cb], o: Option[Cb], t: (Cb, i64), l: Loud) -> i64 / {} {\n    ";
+    let tail = "\n}\n\nfn main() {\n    print(\"{go([inc], Some(inc), (inc, 1), inc)}\")\n}\n";
+    for body in [
+        "let a = fs[0]\n    a(1)",
+        "let d = t.0\n    d(1)",
+        "t.0(1)",
+        "let b = o ?? fs[0]\n    b(1)",
+        "let b = o ?? t.0\n    b(1)",
+        "(o ?? t.0)(1)",
+        "let c = { fs[0] }\n    c(1)",
+    ] {
+        check_ok(&format!("{decls}{sig}{body}{tail}"));
+    }
+    // The same reads through an effectful carrier are still charged.
+    let loud = "type Cb = fn(i64) -> i64 / {io}\n\n\
+fn shout(n: i64) -> i64 {\n    print(\"{n}\")\n    n\n}\n\n";
+    let lsig = "fn go(fs: [Cb], o: Option[Cb], t: (Cb, i64)) -> i64 / {} {\n    ";
+    let ltail = "\n}\n\nfn main() {\n    print(\"{go([shout], Some(shout), (shout, 1))}\")\n}\n";
+    for body in [
+        "let a = fs[0]\n    a(1)",
+        "let d = t.0\n    d(1)",
+        "t.0(1)",
+        "let b = o ?? fs[0]\n    b(1)",
+        "(o ?? t.0)(1)",
+        "let c = { fs[0] }\n    c(1)",
+    ] {
+        check_err(
+            &format!("{loud}{lsig}{body}{ltail}"),
+            "not in its declared row",
+        );
+    }
+}
