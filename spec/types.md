@@ -453,6 +453,14 @@ position with no field name — its list elements, its tuple components, its
 wider pool charged `io` to a function whose own element type declares no
 effects, on the strength of an unrelated declaration elsewhere in the file.
 
+An **empty** carried row is a fact, not the absence of one. A parameter written
+`fs: [fn(i64) -> i64]` says its elements perform nothing, and reading one out
+hands that on — but only non-empty rows were recorded, so `let f = fs[0]`
+looked unaccounted and drew the whole pool: a sibling parameter whose own
+*named field* holds an `io` function refused a `/ {}` body that performs
+nothing, which is the shape this clause already records as fixed, one scope
+level in.
+
 Reading a part out of a binding hands on *that* binding's sources, and so does
 copying one whole: `let f = step` is `step`'s row, not the pool. A plain named
 parameter is not a position "with no field name", but the copy fell through to
@@ -674,6 +682,12 @@ as a counter that stays at zero rather than as anything failing.
 `par_filter` — must have an empty effect row. Elements are processed concurrently, so an effect would interleave
 differently between runs; requiring purity is what makes the parallelism
 deterministic. This is a compile error, not a race.
+
+*And a block hands its tail through.* `let f = { loud }` is the same function
+value `let f = loud` is, and `unsafe { sqrt }` is the same C function a bare
+mention names ([T-EXTERN-VALUE]) — but a block recorded no source at all, not
+even an unaccounted one, so the proof saw an empty row and `print` really did
+run on the workers. One pair of braces from the spelling that was refused.
 
 *And it may not write through a `ref` it captured.* An empty row is not the
 whole of purity: mutation is not an effect, so nothing in the row system saw
@@ -949,6 +963,13 @@ gated: `n.close()` reached libc with no `unsafe`, no `io` in the row and no
 capability, and a package declaring `capabilities = []` was reported as
 `performs []` while its compiled binary called C. `unsafe` is also writable in
 an effect row — `/ {io, unsafe}` — which it was not, being a keyword.
+
+Both halves, at that. Gating `unsafe` on `x.f()` and leaving `io` behind
+turned the same defect down by one bit rather than closing it: `n.labs()`
+inside an `unsafe` block charged nothing while `labs(n)` charged `io`, so a
+package declaring `capabilities = ["unsafe"]` was reported as reaching no `io`
+while its binary called libc. Every other spelling — `labs(n)`, `n |> labs`,
+`let f = labs` then `f(n)`, `[n].map(labs)` — was charged.
 
 **[T-EXTERN]** `extern fn name(a: i64) -> f64` declares a C function. It has
 no body: a compiled build resolves the symbol at link time, and `grasm run`

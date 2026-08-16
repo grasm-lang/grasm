@@ -1092,6 +1092,12 @@ fn par_fn_row(
     active: &mut Vec<String>,
     out: &mut BTreeSet<String>,
 ) {
+    if let Expr::Block(b) | Expr::Unsafe(b) | Expr::Region(b) = func {
+        if let Some(Stmt::Expr(t)) = b.stmts.last() {
+            par_fn_row(t, current, ctx, fnb, active, out);
+        }
+        return;
+    }
     if let Expr::Ident(id) = func {
         // A local of that name is a different thing, scope decides, and a
         // parameter spelled like a private helper failed this purity proof
@@ -1713,7 +1719,13 @@ fn binding_root(e: &Expr) -> Option<&str> {
 fn fn_sources<'a>(e: &'a Expr, ctx: &Ctx, current: &str, out: &mut Vec<FnSource<'a>>) {
     match e {
         Expr::Ident(id) => {
-            if ctx.resolve_call(current, &id.name).is_some() {
+            // A declared C function, named rather than called. `par_fn_row`
+            // recognised one written directly at the call and nothing else,
+            // so `let f = unsafe { sqrt }` handed libc to `par_map`'s workers
+            // — the escape [T-EXTERN-VALUE] says a bare mention closes.
+            if ctx.externs.contains(&format!("{current}::{}", id.name)) {
+                out.push(FnSource::Declared([IO.to_string()].into_iter().collect()));
+            } else if ctx.resolve_call(current, &id.name).is_some() {
                 out.push(FnSource::Named(id.name.clone()));
             } else {
                 // A local holding a function value, or a parameter. Which one
@@ -1823,6 +1835,18 @@ fn fn_sources<'a>(e: &'a Expr, ctx: &Ctx, current: &str, out: &mut Vec<FnSource<
             }
         }
         Expr::Try { expr, .. } => fn_sources(expr, ctx, current, out),
+        // A block hands its tail through, and so do `unsafe` and a region:
+        // `let f = { loud }` is the same function value `let f = loud` is.
+        // Falling to the default recorded no source at all — not even an
+        // unaccounted one — so the purity proof saw an empty row and a
+        // printing function ran on `par_map`'s workers, which
+        // [T-PAR-MAP-PURE] calls "a compile error, not a race". One pair of
+        // braces apart from the spelling that was refused.
+        Expr::Block(b) | Expr::Unsafe(b) | Expr::Region(b) => {
+            if let Some(Stmt::Expr(t)) = b.stmts.last() {
+                fn_sources(t, ctx, current, out);
+            }
+        }
         _ => {}
     }
 }
@@ -2063,9 +2087,14 @@ fn seed_params<'a>(
 ) {
     for p in params {
         if let Some(row) = declared_row_within(&p.ty, aliases, type_rows) {
-            if !row.is_empty() {
-                fnb.carried_rows.insert(p.name.name.clone(), row.clone());
-            }
+            // Recorded even when empty. An empty row is not "nothing known" —
+            // it is the written contract that this parameter carries no
+            // effects, and reading a part out of it hands that on. Skipping
+            // the empty ones left `let f = fs[0]` for a pure `fs` looking
+            // unaccounted, so it was charged the whole signature pool: an
+            // unrelated `l: Loud` elsewhere in the same signature refused a
+            // `/ {}` function whose own element type declares nothing.
+            fnb.carried_rows.insert(p.name.name.clone(), row.clone());
             fnb.signature_rows.extend(row);
         }
     }
@@ -2164,6 +2193,16 @@ fn collect_fn_bindings<'a>(b: &'a Block, ctx: &Ctx, current: &str, fnb: &mut FnB
                         fnb.by_name.insert(name.name.clone(), carried);
                         continue;
                     }
+                    // The root is not itself a function value — it is a list,
+                    // a tuple, a struct, an `Option` of them — but its written
+                    // type says what it carries, and that is what came out.
+                    if let Some(row) = fnb.carried_rows.get(root).cloned() {
+                        fnb.bind_name(&name.name, name.span.start);
+                        fnb.any.push(FnSource::Declared(row.clone()));
+                        fnb.by_name
+                            .insert(name.name.clone(), vec![FnSource::Declared(row)]);
+                        continue;
+                    }
                 }
                 // An annotation is a written type in this function, exactly as
                 // a parameter's is, and the fallback pool was seeded only from
@@ -2174,6 +2213,7 @@ fn collect_fn_bindings<'a>(b: &'a Block, ctx: &Ctx, current: &str, fnb: &mut FnB
                     if let Some(row) =
                         declared_row_within(te, &ctx.type_aliases, &ctx.type_rows)
                     {
+                        fnb.carried_rows.insert(name.name.clone(), row.clone());
                         fnb.signature_rows.extend(row);
                     }
                 }
@@ -2194,6 +2234,8 @@ fn collect_fn_bindings<'a>(b: &'a Block, ctx: &Ctx, current: &str, fnb: &mut FnB
                     Expr::Ident(id) => {
                         if let Some(src) = fnb.by_name.get(&id.name) {
                             found.extend(src.iter().map(FnSource::clone_of));
+                        } else if let Some(row) = fnb.carried_rows.get(&id.name) {
+                            found.push(FnSource::Declared(row.clone()));
                         }
                     }
                     other => fn_sources(other, ctx, current, &mut found),
@@ -2846,7 +2888,17 @@ fn walk_expr(
                 walk_expr(recv, current, active, ctx, fnb, out);
             }
             // UFCS / callback-taking builtin: same-module named fn contributes.
-            if let Some(qual) = ctx.resolve_call(current, &name.name) {
+            //
+            // A C function reached this way is the same call ([L-UFCS]), and
+            // it is not in `rows` — so `n.labs()` charged nothing while
+            // `labs(n)` charged `io`, and a package declaring
+            // `capabilities = ["unsafe"]` was reported as reaching no `io`
+            // while its binary called libc. The `unsafe` half of
+            // [T-UNSAFE-UFCS] was gated; the `io` half was not.
+            if ctx.externs.contains(&format!("{current}::{}", name.name)) {
+                out.insert(IO.to_string());
+                out.insert(UNSAFE.to_string());
+            } else if let Some(qual) = ctx.resolve_call(current, &name.name) {
                 contribute(&qual, active, ctx, out);
             }
             // Or a call of a function held in a field of that name

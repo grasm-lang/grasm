@@ -2548,3 +2548,140 @@ fn main() {\n    print(\"{run(shout, [1])}\")\n}\n",
         "not in its declared row",
     );
 }
+
+/// A block hands its tail through, so `par_map`'s purity proof sees the same
+/// function `let f = loud` would give.
+///
+/// [T-PAR-MAP-PURE] calls an effectful function at a parallel operation "a
+/// compile error, not a race" — but `let f = { loud }` recorded no source at
+/// all, so the proof saw an empty row and `grasm run` really did `print` from
+/// inside `par_map`. One pair of braces from the spelling that was refused.
+/// `unsafe { sqrt }` is the same shape, and it is how a declared C function
+/// got onto the workers past [T-EXTERN-VALUE].
+#[test]
+fn a_block_hands_its_tail_to_the_purity_proof() {
+    let fns = "fn loud(n: i64) -> i64 {\n    print(\"{n}\")\n    n\n}\n\n\
+fn dbl(n: i64) -> i64 {\n    n * 2\n}\n\n";
+    for op in ["par_map", "par_filter"] {
+        for held in ["{ loud }", "{ { loud } }", "unsafe { loud }"] {
+            check_err(
+                &format!(
+                    "{fns}fn main() {{\n    let f = {held}\n    \
+let out = [1, 2].{op}(f)\n}}\n"
+                ),
+                "needs an effect-free function",
+            );
+            check_err(
+                &format!("{fns}fn main() {{\n    let out = [1, 2].{op}({held})\n}}\n"),
+                "needs an effect-free function",
+            );
+        }
+        // A pure one held the same way is still accepted. `par_filter`
+        // wants a predicate, so each takes the function of its own type.
+        let pure = if op == "par_filter" { "keep" } else { "dbl" };
+        check_ok(&format!(
+            "{fns}fn keep(n: i64) -> bool {{\n    n > 0\n}}\n\n\
+fn main() {{\n    let f = {{ {pure} }}\n    \
+print(\"{{[1, 2].{op}(f)}}\")\n}}\n"
+        ));
+    }
+    // A C function named through a block carries the `io` a call does.
+    check_err(
+        "extern fn sqrt(x: f64) -> f64\n\nfn main() {\n    let f = unsafe { sqrt }\n    \
+let out = [16.0].par_map(f)\n}\n",
+        "needs an effect-free function",
+    );
+}
+
+/// A C function called in method position is the same call, and carries the
+/// same row.
+///
+/// [T-UNSAFE-UFCS] gated the `unsafe` half of `x.f()` and left the `io` half
+/// behind, so `n.labs()` charged nothing while `labs(n)` charged `io` — and a
+/// package declaring `capabilities = ["unsafe"]` was reported as reaching no
+/// `io` while its binary called libc.
+#[test]
+fn a_c_function_in_method_position_charges_the_same_row() {
+    let ext = "extern fn labs(x: i64) -> i64\n\n";
+    for call in ["labs(n)", "n.labs()"] {
+        check_err(
+            &format!(
+                "{ext}fn quiet(n: i64) -> i64 / {{unsafe}} {{\n    unsafe {{\n        \
+{call}\n    }}\n}}\n\nfn main() {{\n    print(\"{{quiet(0 - 5)}}\")\n}}\n"
+            ),
+            "not in its declared row",
+        );
+        check_ok(&format!(
+            "{ext}fn loud(n: i64) -> i64 / {{io, unsafe}} {{\n    unsafe {{\n        \
+{call}\n    }}\n}}\n\nfn main() {{\n    print(\"{{loud(0 - 5)}}\")\n}}\n"
+        ));
+    }
+}
+
+/// Reading a part out of a binding hands on *that* binding's row, including
+/// when the row it carries is empty.
+///
+/// [T-FN-TYPE-ROW-CARRIED] scopes the fallback pool to positions "with no
+/// field name", but an empty carried row was not recorded at all, so
+/// `let f = fs[0]` for a pure `fs` looked unaccounted and drew the whole
+/// signature pool — and an unrelated parameter whose *named field* holds an
+/// `io` function refused a `/ {}` body that performs nothing.
+#[test]
+fn a_pure_carrier_is_not_charged_a_siblings_row() {
+    let decls = "type Loud = { g: fn(i64) -> i64 / {io} }\n\n\
+fn inc(n: i64) -> i64 {\n    n + 1\n}\n\n";
+    let tail = "\nfn main() {\n    print(\"{go([inc], Loud{ g: inc })}\")\n}\n";
+    for body in [
+        "let f = fs[0]\n    f(1)",
+        "let f = fs[0]\n    [1].map(f)[0]",
+        "var t = 0\n    for f in fs {\n        t = t + f(1)\n    }\n    t",
+    ] {
+        check_ok(&format!(
+            "{decls}fn go(fs: [fn(i64) -> i64], l: Loud) -> i64 / {{}} {{\n    {body}\n}}\n{tail}"
+        ));
+    }
+    // The effectful carrier is still charged, through each of the same shapes.
+    let loud = "fn shout(n: i64) -> i64 {\n    print(\"{n}\")\n    n\n}\n\n";
+    for body in [
+        "let f = fs[0]\n    f(1)",
+        "let f = fs[0]\n    [1].map(f)[0]",
+        "var t = 0\n    for f in fs {\n        t = t + f(1)\n    }\n    t",
+    ] {
+        check_err(
+            &format!(
+                "{loud}fn go(fs: [fn(i64) -> i64 / {{io}}]) -> i64 / {{}} {{\n    {body}\n}}\n\
+\nfn main() {{\n    print(\"{{go([shout])}}\")\n}}\n"
+            ),
+            "not in its declared row",
+        );
+    }
+}
+
+/// The help for a write to an immutable name says something that parses.
+///
+/// A parameter cannot be `var` — the grammar has no such parameter — so
+/// "declare it with `var n` instead of `let`" produced `fn f(var n: i64)`,
+/// which is a syntax error, and left `inout` and the local copy unsaid. A
+/// property test's parameter has no caller to write back to at all.
+#[test]
+fn the_immutability_help_names_a_fix_that_parses() {
+    check_err(
+        "fn f(n: i64) -> i64 {\n    n = 5\n    n\n}\n\nfn main() {\n    print(\"{f(1)}\")\n}\n",
+        "cannot assign to `n`",
+    );
+    let (_, diags) = analyze(
+        "fn f(n: i64) -> i64 {\n    n = 5\n    n\n}\n\nfn main() {\n    print(\"{f(1)}\")\n}\n",
+    );
+    let help = diags[0].help.clone().expect("the write has help");
+    assert!(help.contains("inout n") && help.contains("var n = n"), "{help}");
+    // Following it compiles.
+    check_ok("fn f(inout n: i64) {\n    n = 5\n}\n\nfn main() {\n    var x = 1\n    \
+f(x)\n    print(\"{x}\")\n}\n");
+    // A local still gets the `var` advice, which is right for a local.
+    let (_, diags) = analyze("fn main() {\n    let a = 1\n    a = 2\n    print(\"{a}\")\n}\n");
+    assert!(
+        diags[0].help.as_deref().is_some_and(|h| h.contains("var a")),
+        "{:?}",
+        diags[0].help
+    );
+}

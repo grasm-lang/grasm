@@ -245,10 +245,27 @@ fn check_modules_in(
 struct Binding {
     ty: Type,
     mutable: bool,
+    /// What introduced the name, so a write to an immutable one can say the
+    /// thing that actually fixes it. A parameter cannot be `var` — the
+    /// grammar has no such parameter — so the generic help sent people to a
+    /// program that does not parse.
+    kind: BindKind,
     /// Ownership was transferred with `own` — further use is an error.
     moved: bool,
     /// Loop nesting depth at declaration (for move-in-loop detection).
     decl_loop_depth: u32,
+}
+
+/// What introduced a binding.
+#[derive(Clone, Copy, PartialEq)]
+enum BindKind {
+    /// `let` or `var` in a body.
+    Local,
+    /// A function parameter: `inout` writes through to the caller's value.
+    Param,
+    /// A property test's parameter, which the runner supplies
+    /// ([G-TEST-PARAMS]). There is no caller to write back to.
+    Generated,
 }
 
 #[derive(Clone)]
@@ -1293,6 +1310,7 @@ different name, or call it as a method if you meant to extend a type (UFCS)",
                             Binding {
                                 ty,
                                 mutable: false,
+                                kind: BindKind::Generated,
                                 moved: false,
                                 decl_loop_depth: 0,
                             },
@@ -1462,6 +1480,7 @@ different name, or call it as a method if you meant to extend a type (UFCS)",
                 Binding {
                     ty: ty.clone(),
                     mutable: p.mode == ParamMode::Inout,
+                    kind: BindKind::Param,
                     moved: false,
                     decl_loop_depth: 0,
                 },
@@ -2183,6 +2202,7 @@ closing brace — yield a number from the region and return that",
             Binding {
                 ty,
                 mutable,
+                kind: BindKind::Local,
                 moved: false,
                 decl_loop_depth,
             },
@@ -2974,10 +2994,28 @@ produces none; end the branch with the value it computes",
         match root {
             Expr::Ident(id) => match self.lookup(&id.name) {
                 Some(b) if !b.mutable && !through_ref => {
+                    let kind = b.kind;
                     self.error_help(
                         id.span,
                         format!("cannot assign to `{}` — it is immutable", id.name),
-                        format!("declare it with `var {}` instead of `let`", id.name),
+                        match kind {
+                            // `fn f(var n: i64)` does not parse, so the
+                            // generic help sent people to a syntax error and
+                            // left the two things that do work unsaid.
+                            BindKind::Param => format!(
+                                "a parameter cannot be `var` — take it as `inout {}` to write \
+through to the caller's value, or copy it into a local first, as in `var {} = {}`",
+                                id.name, id.name, id.name
+                            ),
+                            BindKind::Generated => format!(
+                                "the test runner supplies this value, so there is nothing to \
+write back to — copy it into a local first, as in `var {} = {}`",
+                                id.name, id.name
+                            ),
+                            BindKind::Local => {
+                                format!("declare it with `var {}` instead of `let`", id.name)
+                            }
+                        },
                     );
                 }
                 Some(_) => {}

@@ -1772,3 +1772,32 @@ logging.work(LogHandler{ write: |s| print(s) }, \"x\")\n}\n",
     let effects = grasm_pkg::effects_of_package(&m).expect("effects are inferred");
     assert!(grasm_pkg::check_capabilities(&m, &effects).is_none(), "{effects:?}");
 }
+
+/// A C function called in method position counts against the ceiling.
+///
+/// [L-UFCS] makes `n.labs()` and `labs(n)` the same call, and [T-EXTERN] says
+/// calling one performs `io`. Only the second spelling was charged, so a
+/// package declaring `capabilities = ["unsafe"]` was reported as reaching no
+/// `io` while its binary called libc — the ceiling's own security claim, lost
+/// to a call spelling.
+#[test]
+fn a_c_function_in_method_position_counts_against_the_ceiling() {
+    for call in ["labs(n)", "n.labs()"] {
+        let ws = Workspace::new("ufcs_ceiling");
+        let dir = ws.package(
+            "ffilib",
+            &manifest("ffilib", Some("\"unsafe\""), &[]),
+            &format!(
+                "extern fn labs(x: i64) -> i64\n\npub fn magnitude(n: i64) -> i64 / {{io, unsafe}} \
+{{\n    unsafe {{\n        {call}\n    }}\n}}\n\nfn main() {{\n}}\n"
+            ),
+        );
+        let m = Manifest::load(&dir).expect("manifest loads");
+        let effects = grasm_pkg::effects_of_package(&m).expect("effects are inferred");
+        assert!(effects.contains("io"), "{call}: {effects:?}");
+        assert!(
+            grasm_pkg::check_capabilities(&m, &effects).is_some(),
+            "{call}: reaching libc must exceed `capabilities = [\"unsafe\"]`"
+        );
+    }
+}
