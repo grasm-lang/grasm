@@ -3053,4 +3053,23 @@ print(\"{os.par_map(|o| o ?? 0)}\")",
         "fn go[T](xs: [T]) -> [i64] {\n    xs.par_map(|x| 1)\n}\n\nfn main() {\n    \
 print(\"{go([1, 2])}\")\n    print(\"{go([\"a\"])}\")\n}\n",
     );
+    // And every carrier that *does* reach one is refused — the refusal walks
+    // the whole type, not just its outermost shape.
+    let decls = "type Acc = { n: i64 }\ntype V = | Hold(r: ref Acc) | Nil\ntype E = | Bad\n\
+type W = { inner: Option[ref Acc] }\n\n";
+    for build in [
+        "let vs = [Hold(acc), Nil]\n    print(\"{vs.par_map(|v| 1)}\")",
+        "let fs: [ref Acc ! E] = [Ok(acc)]\n    print(\"{fs.par_map(|f| 1)}\")",
+        "let ms: [Map[str, ref Acc]] = [{\"a\": acc}]\n    print(\"{ms.par_map(|m| 1)}\")",
+        "let ws = [W{ inner: Some(acc) }]\n    print(\"{ws.par_map(|w| 1)}\")",
+        "let ts = [(acc, 1)]\n    print(\"{ts.par_map(|t| 1)}\")",
+        "let ls = [[acc]]\n    print(\"{ls.par_map(|l| 1)}\")",
+    ] {
+        check_err(
+            &format!(
+                "{decls}fn main() {{\n    let acc = ref(Acc{{ n: 1 }})\n    {build}\n}}\n"
+            ),
+            "reaches a `ref`",
+        );
+    }
 }
