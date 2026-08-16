@@ -44,6 +44,10 @@ pub struct Analysis {
     /// wrapped branch also matched the `0` inside it — and the interpreter
     /// wrapped that instead, then tried to subtract `7` from `Ok(0)`.
     pub ok_wrapped: std::collections::HashSet<(u32, u32)>,
+    /// The effect row of every function-valued expression, and of every call
+    /// whose callee is not an expression of its own. See `value_tables`.
+    pub value_rows: std::collections::HashMap<(u32, u32), std::collections::BTreeSet<String>>,
+    pub callee_rows: std::collections::HashMap<(u32, u32), std::collections::BTreeSet<String>>,
     /// Start offsets of closure literals whose own type is fallible.
     ///
     /// `fail(e)` raises the error branch of the enclosing *fallible* function,
@@ -85,6 +89,24 @@ pub struct ModuleView<'a> {
     pub module: &'a Module,
     /// alias → full target module name
     pub imports: std::collections::HashMap<String, String>,
+}
+
+/// The rows the checker worked out for function-valued expressions and for
+/// call sites whose callee is not an expression of its own.
+///
+/// The package-level entry points in `effects` compute rows without going
+/// through the checker, so without this they would be back to guessing where a
+/// function value came from — and a `capabilities = []` library taking a
+/// `[fn(i64) -> i64 / {io, unsafe}]` and calling one element would be
+/// certified as performing nothing.
+pub type ValueTables = (
+    std::collections::HashMap<(u32, u32), std::collections::BTreeSet<String>>,
+    std::collections::HashMap<(u32, u32), std::collections::BTreeSet<String>>,
+);
+
+pub fn value_tables(program: &crate::loader::Program) -> ValueTables {
+    let a = check_program(program);
+    (a.value_rows, a.callee_rows)
 }
 
 pub fn check_program(program: &crate::loader::Program) -> Analysis {
@@ -215,6 +237,7 @@ fn check_modules_in(
         files,
         packages,
         &c.value_rows,
+        &c.callee_rows,
     ));
     // Source order. The effect pass walks a hash map, so the *same* file
     // reported its errors in a different order on every run — and `grasm run`
@@ -231,6 +254,8 @@ fn check_modules_in(
             .map(|(k, (t, _))| (k.clone(), TypeDisplay { ty: t, defs: &c.defs }.to_string()))
             .collect(),
         float_literals: c.float_literals,
+        value_rows: c.value_rows.clone(),
+        callee_rows: c.callee_rows.clone(),
         ok_wrapped: c.ok_wrapped,
         fallible_closures: c
             .closure_types
@@ -356,6 +381,10 @@ struct Checker {
     /// The effect row of every expression whose type is a function, keyed by
     /// its whole span. See `record_value_row`.
     value_rows: std::collections::HashMap<(u32, u32), std::collections::BTreeSet<String>>,
+    /// The row of the function a *call* reaches, where that function is not an
+    /// expression in its own right — `t.0(1)`, `b.f(1)`. Keyed by the call's
+    /// whole span.
+    callee_rows: std::collections::HashMap<(u32, u32), std::collections::BTreeSet<String>>,
     /// See `Analysis::empty_types`. Collected as type variables and resolved
     /// once checking is over, since that is when they have answers.
     /// (start offset, length, element type) — the length so the
@@ -494,6 +523,7 @@ impl Checker {
             extern_names: std::collections::HashSet::new(),
             float_literals: std::collections::HashSet::new(),
             value_rows: std::collections::HashMap::new(),
+            callee_rows: std::collections::HashMap::new(),
             empty_lits: Vec::new(),
             float_sums: std::collections::HashSet::new(),
             effects: HashMap::new(),
@@ -4895,7 +4925,13 @@ Perform the effect after the closing brace, or yield a number and do the work ou
         if self.struct_field_type(&recv_res, &name.name).is_some() {
             let ft = self.infer_field(recv, name, span);
             let resolved = self.uni.shallow_resolve(&ft);
-            if let Type::Fn { params, ret, .. } = resolved {
+            if let Type::Fn { params, ret, row } = resolved {
+                // A call through a field or a tuple component: the thing being
+                // called has no expression of its own for the effect pass to
+                // ask about, so the call site records what it calls.
+                if let Some(r) = row {
+                    self.callee_rows.insert((span.start, span.end), r);
+                }
                 if args.len() != params.len() {
                     return self.error(
                         span,

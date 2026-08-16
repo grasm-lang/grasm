@@ -19,17 +19,6 @@ pub const ASYNC: &str = "async";
 
 /// Whether a bare name is one of the language's own, rather than something a
 /// program could have bound.
-fn is_builtin_name(name: &str) -> bool {
-    IO_BUILTINS.contains(&name)
-        || matches!(
-            name,
-            "len" | "map" | "filter" | "fold" | "any" | "all" | "find" | "sort" | "sort_by"
-                | "push" | "pop" | "remove" | "set" | "get" | "has" | "delete" | "keys"
-                | "values" | "entries" | "par_map" | "par_filter" | "range" | "list" | "map_new"
-                | "exit" | "panic" | "assert" | "assert_eq" | "ref" | "release" | "alive"
-                | "Some" | "None" | "Ok" | "Err" | "fail" | "try" | "pi" | "e"
-        )
-}
 
 const IO_BUILTINS: &[&str] = &[
     "print",
@@ -55,6 +44,9 @@ struct Ctx<'a> {
     /// What the type checker worked out, keyed by whole span. Authoritative
     /// wherever it has an entry.
     value_rows: HashMap<(u32, u32), BTreeSet<String>>,
+    /// The row of the function a call reaches, for calls whose callee is not
+    /// an expression of its own. Keyed by the call's whole span.
+    callee_rows: HashMap<(u32, u32), BTreeSet<String>>,
     /// Operation result types, held until the alias and type-row tables that
     /// resolve them are built.
     pending_op_rets: Vec<(String, TypeExpr)>,
@@ -207,6 +199,13 @@ pub fn effects_by_package(
         })
         .collect();
     let mut ctx = build_ctx_in(&views, &program.deps.iter().cloned().collect());
+    // The rows the checker worked out. Without them this path is back to
+    // guessing where a function value came from, and a `capabilities = []`
+    // library taking a `[fn(i64) -> i64 / {io, unsafe}]` and calling one
+    // element was certified as performing nothing.
+    let (value_rows, callee_rows) = crate::check::value_tables(program);
+    ctx.value_rows = value_rows;
+    ctx.callee_rows = callee_rows;
     solve_rows(&mut ctx);
     let mut out: std::collections::BTreeMap<String, BTreeSet<String>> =
         std::collections::BTreeMap::new();
@@ -271,6 +270,7 @@ pub fn effects_of_program(program: &crate::loader::Program) -> BTreeSet<String> 
         effect_names: HashSet::new(),
         op_rows: HashMap::new(),
         value_rows: HashMap::new(),
+        callee_rows: HashMap::new(),
         pending_op_rets: Vec::new(),
         externs: HashSet::new(),
         rows: HashMap::new(),
@@ -321,6 +321,11 @@ pub fn effects_of_program(program: &crate::loader::Program) -> BTreeSet<String> 
             &mut ctx.elem_rows,
         );
     }
+    // As in `effects_by_package`: the rows the checker worked out, so a call
+    // through a value this pass cannot see the origin of is still charged.
+    let (value_rows, callee_rows) = crate::check::value_tables(program);
+    ctx.value_rows = value_rows;
+    ctx.callee_rows = callee_rows;
     ctx.rows = ctx.fns.keys().map(|k| (k.clone(), BTreeSet::new())).collect();
     loop {
         let mut changed = false;
@@ -335,7 +340,7 @@ pub fn effects_of_program(program: &crate::loader::Program) -> BTreeSet<String> 
             let mut row = BTreeSet::new();
             let mut active = Vec::new();
             let mut fnb = FnBindings::default();
-            seed_params(&f.params, &mut fnb, &ctx.type_aliases, &ctx.type_rows);
+            seed_params(&f.params, &mut fnb);
             collect_fn_bindings(&f.body, &ctx, &current, &mut fnb);
             walk_block(&f.body, &current, &mut active, &ctx, &fnb, &mut row);
             let entry = ctx.rows.get_mut(&key).unwrap();
@@ -490,6 +495,7 @@ fn build_ctx_in<'a>(files: &'a [ModuleView<'a>], packages: &BTreeSet<String>) ->
         effect_names: HashSet::new(),
         op_rows: HashMap::new(),
         value_rows: HashMap::new(),
+        callee_rows: HashMap::new(),
         pending_op_rets: Vec::new(),
         externs: HashSet::new(),
         rows: HashMap::new(),
@@ -600,7 +606,7 @@ fn compute_handler_rows(ctx: &Ctx) -> HashMap<(String, String), BTreeSet<String>
             let mut row = BTreeSet::new();
             let mut active = Vec::new();
             let mut fnb = FnBindings::default();
-            seed_params(&f.params, &mut fnb, &ctx.type_aliases, &ctx.type_rows);
+            seed_params(&f.params, &mut fnb);
             collect_fn_bindings(&f.body, ctx, &current, &mut fnb);
             walk_expr(lit, &current, &mut active, ctx, &fnb, &mut row);
             out.entry((effect.to_string(), current.clone()))
@@ -731,7 +737,7 @@ fn solve_fn_rows(ctx: &mut Ctx) {
             let mut row = BTreeSet::new();
             let mut active = Vec::new();
             let mut fnb = FnBindings::default();
-            seed_params(&f.params, &mut fnb, &ctx.type_aliases, &ctx.type_rows);
+            seed_params(&f.params, &mut fnb);
             collect_fn_bindings(&f.body, ctx, &current, &mut fnb);
             walk_block(&f.body, &current, &mut active, ctx, &fnb, &mut row);
             let entry = ctx.rows.get_mut(&key).unwrap();
@@ -795,7 +801,7 @@ fn compute_closure_rows(ctx: &Ctx) -> HashMap<u32, BTreeSet<String>> {
             let mut row = BTreeSet::new();
             let mut active = Vec::new();
             let mut fnb = FnBindings::default();
-            seed_params(&f.params, &mut fnb, &ctx.type_aliases, &ctx.type_rows);
+            seed_params(&f.params, &mut fnb);
             collect_fn_bindings(&f.body, ctx, &current, &mut fnb);
             walk_expr(body, &current, &mut active, ctx, &fnb, &mut row);
             out.insert(span.start, row);
@@ -925,7 +931,7 @@ pub fn check_effects_multi_in(
     files: &[ModuleView],
     packages: &BTreeSet<String>,
 ) -> Vec<Diagnostic> {
-    check_effects_multi_with(files, packages, &HashMap::new())
+    check_effects_multi_with(files, packages, &HashMap::new(), &HashMap::new())
 }
 
 /// As above, given the rows the *type checker* worked out for every
@@ -942,9 +948,11 @@ pub fn check_effects_multi_with(
     files: &[ModuleView],
     packages: &BTreeSet<String>,
     value_rows: &HashMap<(u32, u32), BTreeSet<String>>,
+    callee_rows: &HashMap<(u32, u32), BTreeSet<String>>,
 ) -> Vec<Diagnostic> {
     let mut ctx = build_ctx_in(files, packages);
     ctx.value_rows = value_rows.clone();
+    ctx.callee_rows = callee_rows.clone();
     solve_rows(&mut ctx);
 
     let mut diags = Vec::new();
@@ -1108,7 +1116,7 @@ is installed, not around the calls to it ([E-HANDLER-OWN-ROW])",
                 _ => continue,
             };
             let mut fnb = FnBindings::default();
-            seed_params(params, &mut fnb, &ctx.type_aliases, &ctx.type_rows);
+            seed_params(params, &mut fnb);
             collect_fn_bindings(body, &ctx, &f.name, &mut fnb);
             check_par_map_block(body, &f.name, &ctx, &fnb, &mut diags);
             check_fn_args_block(body, &f.name, &ctx, &fnb, &mut diags);
@@ -1180,13 +1188,6 @@ fn par_fn_row(
             }
             return;
         }
-        // A name whose written type *carries* a row — `o: Option[fn / {io}]`
-        // handed to `par_map` through `o ?? dflt`.
-        if let Some(row) = fnb.carried_rows.get(&id.name) {
-            out.extend(row.iter().filter(|e| !active.contains(e)).cloned());
-        }
-        // Not a top-level function: a local holding one, or holding several.
-        indirect_row(&id.name, current, active, ctx, fnb, out);
         return;
     }
     // `xs.par_map(lib.shout)` — the same function a call would reach, named
@@ -1213,11 +1214,6 @@ fn par_fn_row(
                 }
             }
         }
-    }
-    // `xs.par_map(Mk.get())` — an effect operation whose declared result is a
-    // function type hands out whatever row that type writes.
-    if let Some(row) = carried_of(func, ctx, fnb) {
-        out.extend(row.into_iter().filter(|e| !active.contains(e)));
     }
     // `xs.par_map(o ?? dflt)` — each side is a candidate function value, and
     // walking the expression as an ordinary one reached neither: the left is a
@@ -1668,84 +1664,33 @@ fn collect_par_maps_expr<'e>(e: &'e Expr, out: &mut Vec<(&'e Expr, Span)>) {
 }
 
 
-/// A function value a body can reach by name.
-enum FnSource<'a> {
-    /// A top-level function, by its unqualified name.
-    Named(String),
-    /// A closure written in the body.
-    Closure(&'a Expr),
-    /// A parameter of function type. Its row is written on the type, because
-    /// there is no body here to infer one from — that declaration is the
-    /// contract the caller is held to.
-    Declared(BTreeSet<String>),
-    /// A function value this pass could not pin to any of the above.
-    ///
-    /// Recorded rather than dropped: a binding with *some* recognised source
-    /// and one unrecognised operand looked fully accounted for, so the
-    /// signature fallback never fired. `let g = o ?? nop` recorded only the
-    /// pure `nop` and charged nothing, while `o.unwrap_or(nop)` and the
-    /// `match` spelling of the same thing were both charged — so one operator
-    /// erased a row that defeats `/ {}`, [T-PAR-MAP-PURE] and a package's
-    /// `capabilities = []`.
-    Unknown,
-}
-
-/// Function values bound to names in one function body.
+/// The names a body binds, and where each comes into scope.
 ///
-/// Effect inference was written before function values existed, so a call
-/// through a name that is not a top-level function contributed nothing —
-/// `let f = shout; f(n)` performed no effects as far as the checker knew, even
-/// inside a declared-empty row. Resolving the binding is what closes that.
+/// All that is left of a much larger structure. This pass used to track *where
+/// every function value came from* — a map of name to sources, a pool of every
+/// value the body mentions, the rows a signature writes at nameless positions
+/// — so that it could work out the row of a call through a local. The type
+/// checker already knew: a function's row is part of its type and travels
+/// through every carrier by unification, so the answer is a lookup rather than
+/// a reconstruction, and the reconstruction is where nearly every defect of
+/// the last two weeks lived.
+///
+/// What remains is scope. A local shadows a function, an effect and a module
+/// alias of the same name, and only this pass disagreed: `fn bump(shout: i64)`
+/// was charged the row of a same-module `fn shout` it never mentions, which
+/// broke a `capabilities = []` package in every consumer over one parameter's
+/// spelling ([T-FN-VALUE-ROW]).
 #[derive(Default)]
 struct FnBindings<'a> {
-    by_name: HashMap<String, Vec<FnSource<'a>>>,
     /// Every name the body binds, and the offset it comes into scope at.
-    ///
-    /// A local shadows a function of the same name, and only this pass
-    /// disagreed: `fn bump(shout: i64) / {}` was charged the row of a
-    /// same-module `fn shout` it never mentions — which broke a
-    /// `capabilities = []` package in every consumer over one parameter's
-    /// spelling. Parameters are in scope for the whole body, so they are
-    /// recorded at 0; a `let` shadows only what follows it, which is why the
-    /// offset is kept rather than a bare set.
+    /// Parameters are in scope for the whole body, so they are recorded at 0;
+    /// a `let` shadows only what follows it, which is why the offset is kept
+    /// rather than a bare set.
     bound_at: HashMap<String, u32>,
-    /// Every function value the body mentions anywhere. Used when a callee
-    /// cannot be pinned to one binding: over-approximating there is the whole
-    /// point, since under-approximating is what let effects escape.
-    any: Vec<FnSource<'a>>,
-    /// The row a parameter *carries* — written inside its type rather than on
-    /// it. `o: Option[fn(i64) -> i64 / {io}]` is not a function, so nothing
-    /// recorded it, and `[1, 2].map(o ?? dflt)` charged only the pure default
-    /// on the right: the same program with the `??` bound to a `let` first was
-    /// charged correctly.
-    carried_rows: HashMap<String, BTreeSet<String>>,
-    /// Rows written on function types inside *this function's own signature*,
-    /// at positions with no field name to key on — a list element, a tuple
-    /// component, an `Option`'s payload.
-    ///
-    /// A call through a local that no binder here understands is charged
-    /// these. `for f in fs`, a `match` payload, a tuple destructuring and a
-    /// closure parameter each called a `/ {io}` element and were charged
-    /// nothing, while `let f = fs[0]` one line away was charged correctly —
-    /// which let one `for` loop carry a printing function past a `/ {}` row,
-    /// `par_map`'s purity proof and a package's `capabilities = []`. Scoped
-    /// to this signature rather than to every row the program writes: the
-    /// wider pool charged `io` to a function whose own element type declares
-    /// no effects, on the strength of an unrelated declaration elsewhere.
-    signature_rows: BTreeSet<String>,
+    _marker: std::marker::PhantomData<&'a ()>,
 }
 
-impl<'a> FnBindings<'a> {
-    /// Whether this name is bound to something known to be a function value.
-    ///
-    /// Distinct from `sources_for`, which falls back to every function value
-    /// in the body when it does not recognise the name — right for a callee
-    /// that must be *something*, wrong for a bare mention, where it would
-    /// charge every `i64` local for whatever the body happens to hold.
-    fn knows(&self, name: &str) -> bool {
-        self.by_name.contains_key(name)
-    }
-
+impl FnBindings<'_> {
     /// Whether a mention at this offset is inside a local of that name.
     fn shadowed(&self, name: &str, at: u32) -> bool {
         self.bound_at.get(name).is_some_and(|from| at >= *from)
@@ -1757,216 +1702,8 @@ impl<'a> FnBindings<'a> {
             *slot = at;
         }
     }
-
-    fn sources_for(&self, name: &str) -> &[FnSource<'a>] {
-        match self.by_name.get(name) {
-            Some(v) => v,
-            None => &self.any,
-        }
-    }
 }
 
-/// The binding an expression reads a *part* out of: `fs[0]`, `t.1`, `b.f`.
-///
-/// Only a path of reads, so `mk()[0]` and `xs[i] + ys[j]` answer `None` — the
-/// point is to hand on the sources of one known binding, not to guess.
-/// The row the *written types* of the bindings this expression reads say it
-/// carries, when every part of it is a binding this pass knows.
-///
-/// `None` where any part is not, which is where the fallback pool belongs.
-/// Where it is `Some`, the pool is the wrong answer by construction: the
-/// binding's own written type is the contract, and an unrelated declaration in
-/// the same signature has nothing to do with what came out of *this* one.
-fn carried_of(e: &Expr, ctx: &Ctx, fnb: &FnBindings) -> Option<BTreeSet<String>> {
-    match e {
-        Expr::Ident(id) => fnb.carried_rows.get(&id.name).cloned(),
-        Expr::Index { recv, .. } => carried_of(recv, ctx, fnb),
-        Expr::Field { recv, .. } => carried_of(recv, ctx, fnb),
-        // An effect operation's declared *result*. `fn get() -> fn(i64) ->
-        // i64 / {io}` hands out a printing function, and the row travelled
-        // with the value through every other carrier and stopped at the one
-        // place a handler hands one over: the operation's row exempts the
-        // handler ([E-HANDLER-OWN-ROW]), not what it returns.
-        Expr::MethodCall { recv, name, .. } => match &**recv {
-            Expr::Ident(tid) if !fnb.shadowed(&tid.name, tid.span.start) => ctx
-                .op_rows
-                .get(&format!("{}::{}", tid.name, name.name))
-                .cloned(),
-            _ => None,
-        },
-        // `o ?? dflt`, and any other shape whose value is one side or the
-        // other: both sides have to be known for the answer to be.
-        Expr::Binary { lhs, rhs, .. } => {
-            let a = carried_of(lhs, ctx, fnb)?;
-            let b = carried_of(rhs, ctx, fnb)?;
-            Some(a.union(&b).cloned().collect())
-        }
-        Expr::Try { expr, .. } => carried_of(expr, ctx, fnb),
-        Expr::Block(b) | Expr::Unsafe(b) | Expr::Region(b) => match b.stmts.last() {
-            Some(Stmt::Expr(t)) => carried_of(t, ctx, fnb),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-fn binding_root(e: &Expr) -> Option<&str> {
-    match e {
-        // A plain copy: `let f = step`. Without this it fell through to the
-        // unaccounted fallback, so an unrelated `log: fn(str) / {io}` in the
-        // same signature charged `io` to a call through `step` — while
-        // `xs.map(step)` written directly was accepted, the same program one
-        // `let` apart.
-        Expr::Ident(id) => Some(&id.name),
-        Expr::Index { recv, .. } | Expr::Field { recv, .. } => match &**recv {
-            Expr::Ident(id) => Some(&id.name),
-            inner => binding_root(inner),
-        },
-        _ => None,
-    }
-}
-
-/// Function values reachable from an initializer expression.
-fn fn_sources<'a>(e: &'a Expr, ctx: &Ctx, current: &str, out: &mut Vec<FnSource<'a>>) {
-    match e {
-        Expr::Ident(id) => {
-            // A declared C function, named rather than called. `par_fn_row`
-            // recognised one written directly at the call and nothing else,
-            // so `let f = unsafe { sqrt }` handed libc to `par_map`'s workers
-            // — the escape [T-EXTERN-VALUE] says a bare mention closes.
-            if ctx.externs.contains(&format!("{current}::{}", id.name)) {
-                out.push(FnSource::Declared([IO.to_string()].into_iter().collect()));
-            } else if ctx.resolve_call(current, &id.name).is_some() {
-                out.push(FnSource::Named(id.name.clone()));
-            } else {
-                // A local holding a function value, or a parameter. Which one
-                // is settled by `sources_for`; what matters here is that this
-                // operand was *not* accounted for.
-                out.push(FnSource::Unknown);
-            }
-        }
-        Expr::Closure { .. } => out.push(FnSource::Closure(e)),
-        // `let g = b.f` — the row travels with the value, so the binding
-        // inherits what the field's type declares ([T-FN-TYPE-ROW-CARRIED]).
-        Expr::Field { recv, name, .. } => {
-            // `let g = lib.shout` names a function through its module, which
-            // is the same value the bare name would give and carries the same
-            // row.
-            if let Expr::Ident(alias) = &**recv {
-                if let Some(qual) = ctx.resolve_qualified(current, &alias.name, &name.name) {
-                    out.push(FnSource::Named(qual));
-                    return;
-                }
-            }
-            if name.name.parse::<usize>().is_ok() {
-                // A tuple component. Unaccounted rather than charged from the
-                // program-wide pool: reaching for every nameless row anywhere
-                // meant an *unused* `type Loud = fn(i64) -> i64 / {io}` — in
-                // this file or in a dependency — refused a `/ {}` function
-                // whose own tuple component declares no effects. The clause
-                // says "scoped to that signature rather than to the program"
-                // in as many words, and `indirect_row`'s fallback does that.
-                out.push(FnSource::Unknown);
-            } else if let Some(row) = ctx.field_rows.get(&name.name) {
-                out.push(FnSource::Declared(row.clone()));
-            } else {
-                // A field this pass has no row for. Unaccounted, not absent:
-                // dropping it left `b.opt ?? dflt` looking fully explained by
-                // the pure default on the right.
-                out.push(FnSource::Unknown);
-            }
-        }
-        // `let g = fs[0]` names no field. Unaccounted, so the fallback
-        // charges this function's *own* signature rather than every nameless
-        // row in the program — an unused alias elsewhere was refusing a
-        // `/ {}` function whose own element type declares nothing.
-        Expr::Index { .. } => out.push(FnSource::Unknown),
-        Expr::List(items, _) | Expr::Tuple(items, _) => {
-            for i in items {
-                fn_sources(i, ctx, current, out);
-            }
-        }
-        Expr::Map(entries, _) => {
-            for (k, v) in entries {
-                fn_sources(k, ctx, current, out);
-                fn_sources(v, ctx, current, out);
-            }
-        }
-        // A call this pass does not read through — `fs.get(0)`, `xs.first()`.
-        // Unaccounted, not absent: `fs.get(0) ?? dflt` was one `??` away from
-        // a `/ {}` function performing `io`.
-        Expr::MethodCall { .. } => out.push(FnSource::Unknown),
-        // Every shape that hands a function value through: `Some(f) ?? f`
-        // laundered a printing function past [T-PAR-MAP-PURE], which the
-        // clause calls "a compile error, not a race".
-        Expr::Binary { lhs, rhs, .. } => {
-            fn_sources(lhs, ctx, current, out);
-            fn_sources(rhs, ctx, current, out);
-        }
-        Expr::Call { callee, args, .. } => {
-            // A constructor hands its arguments through: the prelude's three,
-            // and a user sum type's variants, which are spelled the same way.
-            // Only the prelude's were recognised, so `Hold(shout)` for
-            // `type V = | Hold(f: fn(i64) -> i64 / {io})` carried a printing
-            // function into a binding with no row on it, and the `match`
-            // payload that read it back called it inside `par_map`.
-            let carrier = match &**callee {
-                Expr::Ident(id) => {
-                    matches!(id.name.as_str(), "Some" | "Ok" | "Err")
-                        || (ctx.resolve_call(current, &id.name).is_none()
-                            && id.name.starts_with(char::is_uppercase))
-                }
-                // `Type.Variant(..)`, the qualified spelling.
-                Expr::Field { name, .. } => name.name.starts_with(char::is_uppercase),
-                _ => false,
-            };
-            if carrier {
-                for a in args {
-                    fn_sources(a, ctx, current, out);
-                }
-            }
-        }
-        Expr::If { then_block, else_branch, .. } => {
-            if let Some(Stmt::Expr(t)) = then_block.stmts.last() {
-                fn_sources(t, ctx, current, out);
-            }
-            match else_branch.as_deref() {
-                Some(ElseBranch::Else(b)) => {
-                    if let Some(Stmt::Expr(t)) = b.stmts.last() {
-                        fn_sources(t, ctx, current, out);
-                    }
-                }
-                Some(ElseBranch::ElseIf(inner)) => fn_sources(inner, ctx, current, out),
-                None => {}
-            }
-        }
-        Expr::Match { arms, .. } => {
-            for a in arms {
-                fn_sources(&a.body, ctx, current, out);
-            }
-        }
-        Expr::Try { expr, .. } => fn_sources(expr, ctx, current, out),
-        // A block hands its tail through, and so do `unsafe` and a region:
-        // `let f = { loud }` is the same function value `let f = loud` is.
-        // Falling to the default recorded no source at all — not even an
-        // unaccounted one — so the purity proof saw an empty row and a
-        // printing function ran on `par_map`'s workers, which
-        // [T-PAR-MAP-PURE] calls "a compile error, not a race". One pair of
-        // braces apart from the spelling that was refused.
-        Expr::Block(b) | Expr::Unsafe(b) | Expr::Region(b) => {
-            if let Some(Stmt::Expr(t)) = b.stmts.last() {
-                fn_sources(t, ctx, current, out);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// The effect row written on a function type, or the empty row when none is.
-///
-/// Empty is the meaningful default: `fn(i64) -> i64` accepts only functions
-/// that perform nothing, so an effectful one passed there is an error rather
-/// than a silent widening of whatever row the caller declared.
 fn declared_row(te: &TypeExpr, aliases: &HashMap<String, TypeExpr>) -> Option<BTreeSet<String>> {
     match resolve_alias(te, aliases, 0) {
         TypeExpr::Fn { effects, .. } => Some(effects.iter().map(|p| p.dotted()).collect()),
@@ -2193,35 +1930,11 @@ fn carried_row(
     }
 }
 
-/// Parameters of function type, so calling one is attributed to its declared
-/// row instead of to nothing.
-fn seed_params<'a>(
-    params: &[Param],
-    fnb: &mut FnBindings<'a>,
-    aliases: &HashMap<String, TypeExpr>,
-    type_rows: &HashMap<String, BTreeSet<String>>,
-) {
+/// A parameter is in scope for the whole body, so it shadows a function, an
+/// effect or a module alias of the same name everywhere in it.
+fn seed_params(params: &[Param], fnb: &mut FnBindings<'_>) {
     for p in params {
-        if let Some(row) = declared_row_within(&p.ty, aliases, type_rows) {
-            // Recorded even when empty. An empty row is not "nothing known" —
-            // it is the written contract that this parameter carries no
-            // effects, and reading a part out of it hands that on. Skipping
-            // the empty ones left `let f = fs[0]` for a pure `fs` looking
-            // unaccounted, so it was charged the whole signature pool: an
-            // unrelated `l: Loud` elsewhere in the same signature refused a
-            // `/ {}` function whose own element type declares nothing.
-            fnb.carried_rows.insert(p.name.name.clone(), row.clone());
-            fnb.signature_rows.extend(row);
-        }
-    }
-    for p in params {
-        // A parameter is in scope for the whole body, so it shadows a
-        // function of the same name everywhere in it.
         fnb.bind_name(&p.name.name, 0);
-        if let Some(row) = declared_row(&p.ty, aliases) {
-            fnb.by_name
-                .insert(p.name.name.clone(), vec![FnSource::Declared(row)]);
-        }
     }
 }
 
@@ -2287,82 +2000,20 @@ fn walk_exprs_shallow(e: &Expr, f: &mut impl FnMut(&Expr)) {
     }
 }
 
-/// Collects, in statement order, every name a body binds to a function value.
+/// Every name a body binds, and where each comes into scope.
+///
+/// Only the names and the offsets: what a name *holds* is the type checker's
+/// question, and asking it twice is what this pass used to do.
 fn collect_fn_bindings<'a>(b: &'a Block, ctx: &Ctx, current: &str, fnb: &mut FnBindings<'a>) {
+    let _ = (ctx, current);
     for stmt in &b.stmts {
         match stmt {
-            Stmt::Let { name, ty, init, .. } => {
-                // Reading an element or a field out of a binding this pass
-                // already knows hands on *that* binding's sources — not the
-                // whole body's. `let g = fs[0]` fell through to the pool of
-                // every function value in the function, so an unrelated
-                // closure elsewhere charged its effect to a call through `g`:
-                // the same program with `for g in fs` was accepted, which is
-                // the pair [T-FN-TYPE-ROW-CARRIED] names as the defect it was
-                // written to close.
-                if let Some(root) = binding_root(init) {
-                    if let Some(src) = fnb.by_name.get(root) {
-                        let carried: Vec<FnSource<'a>> =
-                            src.iter().map(FnSource::clone_of).collect();
-                        fnb.bind_name(&name.name, name.span.start);
-                        fnb.any.extend(carried.iter().map(FnSource::clone_of));
-                        fnb.by_name.insert(name.name.clone(), carried);
-                        continue;
-                    }
-                }
-                // The initializer is not itself a function value — it is a
-                // list, a tuple, a struct, an `Option` of them, or a `??`
-                // between two of those — but the written types of the
-                // bindings it reads say what they carry, and that is what
-                // came out. Only when *every* part is known: where one is
-                // not, the fallback pool is the right conservatism.
-                if let Some(row) = carried_of(init, ctx, fnb) {
-                    fnb.bind_name(&name.name, name.span.start);
-                    fnb.any.push(FnSource::Declared(row.clone()));
-                    fnb.by_name
-                        .insert(name.name.clone(), vec![FnSource::Declared(row)]);
-                    continue;
-                }
-                // An annotation is a written type in this function, exactly as
-                // a parameter's is, and the fallback pool was seeded only from
-                // the signature. So `let o: Option[fn(i64) -> i64 / {io}]` in
-                // a `main` that takes nothing left the pool empty, and the
-                // value it held reached `par_map` uncharged.
-                if let Some(te) = ty {
-                    if let Some(row) =
-                        declared_row_within(te, &ctx.type_aliases, &ctx.type_rows)
-                    {
-                        fnb.carried_rows.insert(name.name.clone(), row.clone());
-                        fnb.signature_rows.extend(row);
-                    }
-                }
+            Stmt::Let { name, init, .. } => {
                 fnb.bind_name(&name.name, name.span.start);
                 seed_closure_params(init, fnb);
-                let mut found = Vec::new();
-                fn_sources(init, ctx, current, &mut found);
-                if !found.is_empty() {
-                    fnb.any.extend(found.iter().map(FnSource::clone_of));
-                    fnb.by_name.insert(name.name.clone(), found);
-                }
             }
-            Stmt::For { var, iter, body, .. } => {
+            Stmt::For { var, body, .. } => {
                 fnb.bind_name(&var.name, var.span.start);
-                // `for f in fs` where `fs` holds function values.
-                let mut found = Vec::new();
-                match iter {
-                    Expr::Ident(id) => {
-                        if let Some(src) = fnb.by_name.get(&id.name) {
-                            found.extend(src.iter().map(FnSource::clone_of));
-                        } else if let Some(row) = fnb.carried_rows.get(&id.name) {
-                            found.push(FnSource::Declared(row.clone()));
-                        }
-                    }
-                    other => fn_sources(other, ctx, current, &mut found),
-                }
-                if !found.is_empty() {
-                    fnb.any.extend(found.iter().map(FnSource::clone_of));
-                    fnb.by_name.insert(var.name.clone(), found);
-                }
                 collect_fn_bindings(body, ctx, current, fnb);
             }
             Stmt::While { body, .. }
@@ -2375,99 +2026,6 @@ fn collect_fn_bindings<'a>(b: &'a Block, ctx: &Ctx, current: &str, fnb: &mut FnB
     }
 }
 
-impl<'a> FnSource<'a> {
-    fn clone_of(&self) -> FnSource<'a> {
-        match self {
-            FnSource::Named(n) => FnSource::Named(n.clone()),
-            FnSource::Closure(e) => FnSource::Closure(e),
-            FnSource::Declared(r) => FnSource::Declared(r.clone()),
-            FnSource::Unknown => FnSource::Unknown,
-        }
-    }
-}
-
-/// The effects a call through `name` may perform, when `name` is not a
-/// top-level function but a local holding a function value.
-fn indirect_row(
-    name: &str,
-    current: &str,
-    active: &mut Vec<String>,
-    ctx: &Ctx,
-    fnb: &FnBindings,
-    out: &mut BTreeSet<String>,
-) {
-    // Nothing recorded: the name is a local holding a function value that no
-    // binder this pass understands put there. A `for` variable over a list of
-    // them, a `match` payload, a tuple destructuring, a closure parameter —
-    // each of those called a `/ {io}` function and was charged nothing, while
-    // `let f = fs[0]` one line away was charged correctly. Falling back to
-    // every row the program writes without a field name is the same
-    // conservatism `let f = fs[0]` already uses, and it errs toward refusing.
-    let unaccounted = fnb.sources_for(name).is_empty()
-        || fnb
-            .sources_for(name)
-            .iter()
-            .any(|s| matches!(s, FnSource::Unknown));
-    // …unless the name's own written type says what it carries. That is not
-    // "nothing known" — it is the contract, and it is already charged at the
-    // mention. Drawing the pool as well refused `t.0(1)` for a pure `t` on
-    // the strength of an unrelated parameter in the same signature, while the
-    // same read through a `let` was accepted.
-    let known_by_type = fnb.carried_rows.contains_key(name);
-    if unaccounted && !known_by_type && !fnb.signature_rows.is_empty() {
-        out.extend(
-            fnb.signature_rows
-                .iter()
-                .filter(|e| !active.contains(e))
-                .cloned(),
-        );
-    }
-    for src in fnb.sources_for(name) {
-        match src {
-            FnSource::Named(n) => {
-                // Already qualified when the value was named through its
-                // module — `let g = lib.shout` records `lib::shout`, which is
-                // the key, not a name to qualify again.
-                if n.contains("::") {
-                    contribute(n, active, ctx, out);
-                } else if let Some(qual) = ctx.resolve_call(current, n) {
-                    contribute(&qual, active, ctx, out);
-                }
-            }
-            // Minus whatever a `with` around this mention has already
-            // discharged. Without that, `with Log … { let f: fn(str) -> ()
-            // / {Log} = shout }` charged `Log` to the enclosing function —
-            // inside the block that handles it, and where the direct call
-            // `shout("z")` and `["a"].map(shout)` both compile
-            // ([T-EFFECT-DISCHARGE]).
-            FnSource::Declared(row) => {
-                out.extend(row.iter().filter(|e| !active.contains(e)).cloned())
-            }
-            // Accounted for by the fallback above.
-            FnSource::Unknown => {}
-            FnSource::Closure(e) => {
-                // A closure has no name to guard recursion with, so its
-                // identity stands in for one.
-                let guard = format!("closure@{:p}", *e as *const Expr);
-                if active.contains(&guard) {
-                    continue;
-                }
-                active.push(guard);
-                if let Expr::Closure { body, .. } = e {
-                    walk_expr(body, current, active, ctx, fnb, out);
-                }
-                active.pop();
-            }
-        }
-    }
-}
-
-/// Records every effect row written on a function type reachable from `t`.
-///
-/// A row on a struct field is keyed by the field's name, because that is what
-/// a call site spells (`b.f(x)`). A row anywhere else has no name to key on
-/// and joins the nameless pool.
-#[allow(clippy::too_many_arguments)]
 fn harvest_rows_at(
     t: &TypeExpr,
     field: Option<&str>,
@@ -2749,48 +2307,6 @@ fn harvest_module(
     }
 }
 
-/// The row a callee that is not a plain name may carry.
-///
-/// A numbered component and an index are keyed nowhere, so the row comes from
-/// the *enclosing function's own signature* — its list elements, its tuple
-/// components, its `Option` payloads. Taken from every nameless row in the
-/// program instead, an **unused** `type Loud = fn(i64) -> i64 / {io}`, in this
-/// file or in a dependency, refused a `/ {}` function whose own tuple
-/// component declares no effects. [T-FN-TYPE-ROW-CARRIED] says "scoped to that
-/// signature rather than to the program" in as many words.
-fn computed_callee_row(
-    callee: &Expr,
-    ctx: &Ctx,
-    fnb: &FnBindings,
-    out: &mut BTreeSet<String>,
-) {
-    // What the binding this was read out of says it carries. Both this and
-    // `field_rows` over-approximate the true row, so where both are known the
-    // *intersection* is still an over-approximation and is the tighter one:
-    // a field name is keyed across the whole program, and a binding's type is
-    // keyed to the binding.
-    let carried = carried_of(callee, ctx, fnb);
-    match callee {
-        Expr::Field { name, .. } if name.name.parse::<usize>().is_ok() => match carried {
-            Some(row) => out.extend(row),
-            // A tuple component of a binding this pass does not know.
-            None => out.extend(fnb.signature_rows.iter().cloned()),
-        },
-        Expr::Field { name, .. } => match (ctx.field_rows.get(&name.name), carried) {
-            (Some(by_name), Some(by_binding)) => {
-                out.extend(by_name.intersection(&by_binding).cloned())
-            }
-            (Some(row), None) => out.extend(row.iter().cloned()),
-            (None, Some(row)) => out.extend(row),
-            (None, None) => {}
-        },
-        _ => match carried {
-            Some(row) => out.extend(row),
-            None => out.extend(fnb.signature_rows.iter().cloned()),
-        },
-    }
-}
-
 impl Ctx<'_> {
     /// The row the type checker gave this expression, when it is a function
     /// value it could type.
@@ -2909,6 +2425,18 @@ fn walk_expr(
     fnb: &FnBindings,
     out: &mut BTreeSet<String>,
 ) {
+    // A *value* of function type is the permission to call it
+    // ([T-FN-VALUE-ROW]), and the checker knows the row of every one it typed
+    // — including the ones that are not names: `o ?? dflt`, a block's tail, a
+    // branch that merges two. A closure literal is excluded: its own body is
+    // walked where it is written, and a handler's operations are charged to
+    // whoever wrote the handler ([E-HANDLER-OWN-ROW]), not to whoever installs
+    // it.
+    if !matches!(e, Expr::Closure { .. }) {
+        if let Some(row) = ctx.value_row_of(e) {
+            out.extend(row.iter().filter(|x| !active.contains(x)).cloned());
+        }
+    }
     match e {
         Expr::Int(..) | Expr::Float(..) | Expr::Bool(..) => {}
         // A bare mention of a C function is a reference to it, and holding one
@@ -2936,26 +2464,8 @@ fn walk_expr(
                     contribute(&qual, active, ctx, out);
                 }
             }
-            // A name whose written type *carries* a row: `o` for
-            // `o: Option[fn(i64) -> i64 / {io}]` is not itself a function, so
-            // nothing recorded it and `[1, 2].map(o ?? dflt)` charged only the
-            // pure default. Mentioning one is the same permission as
-            // mentioning a function ([T-FN-VALUE-ROW]), and the rule is
-            // deliberately conservative in that direction.
-            if let Some(row) = fnb.carried_rows.get(&id.name) {
-                out.extend(row.iter().filter(|e| !active.contains(e)).cloned());
-            }
             if let Some(row) = ctx.value_row_of(e) {
                 out.extend(row.iter().filter(|x| !active.contains(x)).cloned());
-            } else if fnb.knows(&id.name) {
-                // A *local* holding a function value — most often a parameter
-                // whose type wrote the row. The direct call `f(x)` was
-                // charged and the mention was not, so handing the same `f` to
-                // a builtin that calls it charged nothing: `xs.map(f)` inside
-                // a `/ {}` function printed, and so did `fold`, `filter`,
-                // `any`, `all`, `find` and `sort_by`. `par_map` was checked,
-                // which is what made the hole look closed.
-                indirect_row(&id.name, current, active, ctx, fnb, out);
             }
         }
         Expr::Str(pieces, _) => {
@@ -3013,28 +2523,11 @@ fn walk_expr(
                     // tuple destructuring and a closure parameter all arrive
                     // here already carrying it.
                     out.extend(row.iter().filter(|x| !active.contains(x)).cloned());
-                } else if fnb.knows(&id.name) || !is_builtin_name(&id.name) {
-                    // A call through a name that is not a top-level function:
-                    // a local holding a function value. Whatever that value
-                    // may be, calling it performs what it performs.
-                    //
-                    // Not for a *builtin* — `print`, `map`, `len`. Those are
-                    // not locals, so the unknown-name fallback handed them
-                    // every function value the body binds: a handler literal
-                    // containing `print` was charged the row of an unrelated
-                    // `let f = shout` elsewhere in the same function, and
-                    // `main` was told it had an unhandled effect inside the
-                    // `with` that handles it ([T-EFFECT-DISCHARGE]).
-                    indirect_row(&id.name, current, active, ctx, fnb, out);
                 }
             } else if let Some(row) = ctx.value_row_of(callee) {
                 out.extend(row.iter().filter(|e| !active.contains(e)).cloned());
                 walk_expr(callee, current, active, ctx, fnb, out);
             } else {
-                // A call through something that is not a name: a struct
-                // field, a list element, a map value. The row is on the type
-                // it was declared with ([T-FN-TYPE-ROW-CARRIED]).
-                computed_callee_row(callee, ctx, fnb, out);
                 walk_expr(callee, current, active, ctx, fnb, out);
             }
             for a in args {
@@ -3044,6 +2537,16 @@ fn walk_expr(
         Expr::MethodCall {
             recv, name, args, ..
         } => {
+            // What the checker says this call reaches, where the callee is not
+            // an expression of its own: `t.0(1)`, `b.f(1)`.
+            if let Some(row) = ctx.callee_rows.get(&(e.span().start, e.span().end)) {
+                out.extend(row.iter().filter(|x| !active.contains(x)).cloned());
+                walk_expr(recv, current, active, ctx, fnb, out);
+                for a in args {
+                    walk_expr(a, current, active, ctx, fnb, out);
+                }
+                return;
+            }
             if let Expr::Ident(tid) = &**recv {
                 // A binding of that name is a different thing, and scope
                 // decides — the rule [T-FN-VALUE-ROW] already states for a
@@ -3086,24 +2589,11 @@ fn walk_expr(
             } else if let Some(qual) = ctx.resolve_call(current, &name.name) {
                 contribute(&qual, active, ctx, out);
             }
-            // Or a call of a function held in a field of that name
-            // ([T-FIELD-CALL]): `b.f(x)` where `f: fn(i64) -> i64 / {io}`.
-            if name.name.parse::<usize>().is_ok() {
-                // A tuple component: numbered, so keyed nowhere. What the
-                // binding it was read out of says it carries, and only where
-                // that is unknown, this function's own signature — the
-                // program's pool never.
-                match carried_of(recv, ctx, fnb) {
-                    Some(row) => out.extend(row),
-                    None => out.extend(fnb.signature_rows.iter().cloned()),
-                }
-            } else if let Some(row) = ctx.field_rows.get(&name.name) {
-                match carried_of(recv, ctx, fnb) {
-                    // Both over-approximate, so the intersection still does.
-                    Some(by_binding) => out.extend(row.intersection(&by_binding).cloned()),
-                    None => out.extend(row.iter().cloned()),
-                }
-            }
+            // A call of a function held in a field of that name
+            // ([T-FIELD-CALL]) is answered by `callee_rows` at the top of this
+            // arm: the checker resolved the field's type, which is keyed to
+            // *this* struct rather than to every type with a field of the same
+            // name.
             for a in args {
                 walk_expr(a, current, active, ctx, fnb, out);
             }
@@ -3137,7 +2627,6 @@ fn walk_expr(
                 }
             }
             if !qualified {
-                computed_callee_row(e, ctx, fnb, out);
                 walk_expr(recv, current, active, ctx, fnb, out);
             }
         }

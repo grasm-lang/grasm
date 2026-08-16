@@ -73,10 +73,16 @@ explicitly not covered by the compatibility promise.
 That split is not a retreat. It is where the evaluation rounds actually found
 things: of the defects found in the last four rounds, all but one were in the
 `experimental` set, and the effect-row inference alone accounts for most of
-them — because it is a syntactic approximation of a type-and-effect system
-rather than the thing itself. Rewriting it so rows travel through the type
-checker's own unification is the work that ends that class of defect; until
-that lands, the honest label for the area is `experimental`.
+them — because it was a syntactic approximation of a type-and-effect system
+rather than the thing itself.
+
+That approximation was removed on 2026-08-16. Rows now travel through the type
+checker's own unification, and the effect pass reads the checker's answer
+instead of reconstructing it: 511 lines of guessing deleted, every gate green,
+and the class of defect that produced most of the last four rounds' findings no
+longer has a mechanism. The area stays `experimental` until it has sat through
+evaluation rounds in its new form — a clause is settled by evidence, not by the
+day its rewrite landed.
 
 ## Where the evaluation rounds fit
 
