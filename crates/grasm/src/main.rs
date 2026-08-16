@@ -1714,6 +1714,8 @@ fn build_native_incremental(
         link.arg("-Wl,-dead_strip");
     } else if cfg!(target_os = "linux") {
         link.arg("-Wl,--gc-sections");
+        // Linux strips fully at link time; macOS needs the tool, below.
+        link.arg("-Wl,-s");
     }
     // Captured rather than inherited: the linker's own text names a temporary
     // object file, an internal symbol and an architecture, and four lines of
@@ -1776,6 +1778,20 @@ fn build_native_incremental(
             return Err(format!("linking `{out_path}` failed"));
         }
         return Err(format!("linking `{out_path}` failed:\n{detail}"));
+    }
+    // The symbol table is a quarter of the binary and nothing reads it at run
+    // time: a compiled program carries no reflection, and a panic names a
+    // source line rather than a symbol ([E-PANIC-TRACE] — a `--native` build
+    // prints no trace at all). Linux strips at link time with `-s`; macOS's
+    // linker has no equivalent that removes the whole table, so the tool is
+    // used, and a failure is ignored because a larger binary is a worse binary
+    // and not a broken one. 437 KB -> 332 KB on a hello-world, against [G5]'s
+    // 300 KB budget.
+    if cfg!(target_os = "macos") {
+        let _ = std::process::Command::new("strip")
+            .arg("-no_uuid")
+            .arg(out_path)
+            .output();
     }
     let size = std::fs::metadata(out_path).map_err(|e| e.to_string())?.len();
     Ok(size)

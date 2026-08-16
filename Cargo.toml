@@ -20,3 +20,13 @@ license = "Apache-2.0"
 
 [profile.release]
 lto = "thin"
+# `panic = "abort"` was tried here and reverted: it saved 1 KB. The 39 KB of
+# unwinding tables in a compiled program come from Rust's *precompiled* `std`,
+# which this setting cannot reach — removing them needs `-Z build-std` (nightly,
+# so not available to a stable toolchain) or a `no_std` runtime. Recorded so the
+# next person does not spend the afternoon finding that out again.
+
+# `[profile.release.package.grasm_rt] opt-level = "z"` was tried here and
+# reverted: it made a compiled program 4 KB *bigger*. Optimising the runtime for
+# size blocks the inlining that lets link-time optimisation delete the code
+# around it, so the archive shrinks and the binary grows. Measured, not assumed.

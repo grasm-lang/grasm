@@ -113,6 +113,14 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   and [L-LIB-TUPLE] said so; [T-REF-WRITE] said the compiled backend refuses
   writes through a reference, one day after it stopped.
 
+- **A compiled binary is 25% smaller** — 437 KB to 328 KB, against [G5]'s 300 KB
+  budget. The symbol table is a quarter of a binary and nothing reads it at run
+  time. Two other levers were tried and reverted with their numbers recorded in
+  `Cargo.toml`, so the next person does not spend the afternoon rediscovering
+  them: `panic = "abort"` saves 1 KB (the unwinding tables come from
+  precompiled `std`), and `opt-level = "z"` on the runtime makes the binary
+  *bigger* by blocking the inlining link-time optimisation needs.
+
 ### Added
 
 - **`spec/core.md` — the Grasm-Core / Grasm-Full split**, the commitment

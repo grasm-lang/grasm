@@ -21,7 +21,7 @@ Figures below were taken on 2026-08-17 on an idle machine.
 | G3 | Frontend throughput | ≥ 500k LOC/s | 458k–500k, mean ~483k | **borderline** |
 | G3 | Incremental edit-to-diagnostic | ≤ 50 ms | — | **not built** — there is no query engine |
 | G4 | Safe-subset guarantees | 100% | 204 programs identical across three engines, 204 leak-free, row and FFI soundness fuzzers clean | **strongest area** |
-| G5 | Hello-world static binary | ≤ 300 KB | 437 KB | **missed by 46%** |
+| G5 | Hello-world static binary | ≤ 300 KB | 328 KB | **missed by 9%** |
 | G6 | Structured, uncolored concurrency | 1M+ tasks/node | `spawn` is deliberately single-core ([E-NOT-PARALLEL]); `par_map` is the only multicore path | **retreated** |
 | G7 | Capability-sandboxed dependencies | 100% | the supply-chain benchmark's tamper is refused as `performs [io] permits []` | **met, for what exists** |
 | G8 | Production failure → deterministic replay | ≥ 99% | — | **not built** |
@@ -57,9 +57,23 @@ size of Go, and where a program is a loop over an array it is a typed language
 paying typed-language costs. Closing the Python gap is a *syntax* question, not
 a semantics one, and §19.3 made it a hard KPI for exactly that reason.
 
-**G5 is missed by 46%**, and the changelog records why: 437 KB is mostly Rust
-`std` machinery, and going lower needs `no_std` or `build-std`. That is a known,
-bounded piece of work rather than an open question.
+**G5 is missed by 9%**, down from 46%. The binary went 437 KB → 328 KB by
+stripping the symbol table, which nothing reads at run time: a compiled program
+carries no reflection and a `--native` build prints no stack trace at all
+([E-PANIC-TRACE]). Two other levers were tried and reverted, both measured:
+
+* `panic = "abort"` saved **1 KB**. The 39 KB of unwinding tables in a compiled
+  program come from Rust's *precompiled* `std`, which the setting cannot reach.
+* `opt-level = "z"` on the runtime made the binary **4 KB bigger**. Optimising
+  the runtime for size blocks the inlining that lets link-time optimisation
+  delete the code around it — the archive shrinks and the binary grows.
+
+The remaining 28 KB is `std`: `core::fmt`'s formatting machinery, the allocator,
+and those unwinding tables. Reaching 300 KB needs `-Z build-std` (nightly, so
+not available to a stable toolchain) or a `no_std` runtime, which means
+reimplementing float formatting, allocation and threads. That is a real project
+with a known shape, not an open question — and it is the only thing between here
+and the goal.
 
 **G1 and G10 cannot be moved from inside this repository.** No human has run a
 Grasm program. Every signal the project has is model-generated, and the two
