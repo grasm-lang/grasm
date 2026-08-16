@@ -439,7 +439,7 @@ struct Codegen<'m> {
     float_literals: std::collections::HashSet<u32>,
     /// Method calls the checker resolved to a struct field holding a function.
     /// See the UFCS branch of the method-call lowering.
-    field_calls: std::collections::HashSet<(u32, u32)>,
+    field_calls: grasm_sema::check::SpanSet,
     /// Closure literals whose own type is fallible, by start offset.
     fallible_closures: std::collections::HashSet<u32>,
     /// Start offset of each empty literal → the type the checker settled on.
@@ -528,7 +528,7 @@ impl<'m> Codegen<'m> {
             pending_generics: Vec::new(),
             generic_subst: HashMap::new(),
             float_literals: std::collections::HashSet::new(),
-            field_calls: std::collections::HashSet::new(),
+            field_calls: Default::default(),
             fallible_closures: std::collections::HashSet::new(),
             empty_types: std::collections::HashMap::new(),
         }

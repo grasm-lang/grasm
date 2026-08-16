@@ -63,6 +63,24 @@ fn main() -> ExitCode {
     }
 }
 
+/// Gives up a value without running its destructor, when the process is about
+/// to end anyway.
+///
+/// A third of `grasm check` on a large program was `drop_in_place` walking the
+/// syntax tree node by node to free it, immediately before the process exited
+/// and the operating system reclaimed the whole address space in one step.
+/// Freeing memory a moment before the kernel throws it away is work with no
+/// reader.
+///
+/// Only at the end of a command, and never for anything whose destructor does
+/// something — the scratch directory a native build uses is removed by its own
+/// guard, and this must not be reached for that. `exit`ing the process outright
+/// would be simpler and was tried: it collapsed every program's own exit code
+/// to 1, because an `ExitCode` cannot be read back.
+fn release_at_exit<T>(v: T) {
+    std::mem::forget(v);
+}
+
 fn run() -> ExitCode {
     // Bundled-executable mode: our own binary carries a program.
     if let Some(bundle) = read_own_bundle() {
@@ -303,8 +321,12 @@ fn run() -> ExitCode {
                 return ExitCode::FAILURE;
             };
             match load_and_check(path) {
-                Ok(_) => {
+                Ok(program) => {
                     println!("ok: `{path}` has no errors");
+                    // A third of the time on a large program was spent freeing
+                    // the syntax tree, node by node, immediately before the
+                    // process ended.
+                    release_at_exit(program);
                     ExitCode::SUCCESS
                 }
                 Err(code) => code,

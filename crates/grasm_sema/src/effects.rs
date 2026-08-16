@@ -40,10 +40,10 @@ struct Ctx<'a> {
     op_rows: HashMap<String, BTreeSet<String>>,
     /// What the type checker worked out, keyed by whole span. Authoritative
     /// wherever it has an entry.
-    value_rows: HashMap<(u32, u32), BTreeSet<String>>,
+    value_rows: crate::check::SpanMap<BTreeSet<String>>,
     /// The row of the function a call reaches, for calls whose callee is not
     /// an expression of its own. Keyed by the call's whole span.
-    callee_rows: HashMap<(u32, u32), BTreeSet<String>>,
+    callee_rows: crate::check::SpanMap<BTreeSet<String>>,
     /// Operation result types, held until the alias and type-row tables that
     /// resolve them are built.
     pending_op_rets: Vec<(String, TypeExpr)>,
@@ -266,8 +266,8 @@ pub fn effects_of_program(program: &crate::loader::Program) -> BTreeSet<String> 
         fns: HashMap::new(),
         effect_names: HashSet::new(),
         op_rows: HashMap::new(),
-        value_rows: HashMap::new(),
-        callee_rows: HashMap::new(),
+        value_rows: Default::default(),
+        callee_rows: Default::default(),
         pending_op_rets: Vec::new(),
         externs: HashSet::new(),
         rows: HashMap::new(),
@@ -490,8 +490,8 @@ fn build_ctx_in<'a>(files: &'a [ModuleView<'a>], packages: &BTreeSet<String>) ->
         fns: HashMap::new(),
         effect_names: HashSet::new(),
         op_rows: HashMap::new(),
-        value_rows: HashMap::new(),
-        callee_rows: HashMap::new(),
+        value_rows: Default::default(),
+        callee_rows: Default::default(),
         pending_op_rets: Vec::new(),
         externs: HashSet::new(),
         rows: HashMap::new(),
@@ -926,7 +926,7 @@ pub fn check_effects_multi_in(
     files: &[ModuleView],
     packages: &BTreeSet<String>,
 ) -> Vec<Diagnostic> {
-    check_effects_multi_with(files, packages, &HashMap::new(), &HashMap::new())
+    check_effects_multi_with(files, packages, &Default::default(), &Default::default())
 }
 
 /// As above, given the rows the *type checker* worked out for every
@@ -942,8 +942,8 @@ pub fn check_effects_multi_in(
 pub fn check_effects_multi_with(
     files: &[ModuleView],
     packages: &BTreeSet<String>,
-    value_rows: &HashMap<(u32, u32), BTreeSet<String>>,
-    callee_rows: &HashMap<(u32, u32), BTreeSet<String>>,
+    value_rows: &crate::check::SpanMap<BTreeSet<String>>,
+    callee_rows: &crate::check::SpanMap<BTreeSet<String>>,
 ) -> Vec<Diagnostic> {
     let mut ctx = build_ctx_in(files, packages);
     ctx.value_rows = value_rows.clone();

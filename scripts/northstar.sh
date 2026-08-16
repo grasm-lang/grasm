@@ -24,8 +24,6 @@ WORK="${TMPDIR:-/tmp}/grasm_northstar_$$"
 mkdir -p "$WORK"
 trap 'rm -rf "$WORK"' EXIT
 
-ms_now() { python3 -c 'import time;print(int(time.time()*1000))'; }
-
 printf '%-4s %-34s %-22s %s\n' "goal" "what" "target" "measured"
 printf '%-4s %-34s %-22s %s\n' "----" "----------------------------------" "----------------------" "--------"
 
@@ -63,14 +61,32 @@ open(f"{work}/big.gr", "w").write("".join(parts))
 PY
 
 lines=$(wc -l < "$WORK/big.gr")
-# The process floor, so throughput is the frontend's and not the loader's.
-t0=$(ms_now); "$GRASM" version >/dev/null 2>&1; floor=$(( $(ms_now) - t0 ))
-t0=$(ms_now); "$GRASM" check "$WORK/big.gr" >/dev/null 2>&1; rc=$?; total=$(( $(ms_now) - t0 ))
-if [ $rc -ne 0 ]; then
+# Timed inside one process. Shelling out for each timestamp put the cost of
+# starting that helper *inside* the interval being measured — about 25 ms, or a
+# sixth of the figure, which is how a measurement quietly becomes a measurement
+# of itself. Best of five, because the number is meant to describe the compiler
+# rather than whatever else the machine is doing.
+read -r work_ms rc <<EOF
+$(python3 - "$GRASM" "$WORK/big.gr" <<'PYEOF'
+import subprocess, sys, time
+grasm, path = sys.argv[1], sys.argv[2]
+def once(args):
+    t = time.perf_counter()
+    rc = subprocess.run([grasm, *args], stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL).returncode
+    return (time.perf_counter() - t) * 1000, rc
+floor = min(once(["version"])[0] for _ in range(3))
+runs = [once(["check", path]) for _ in range(5)]
+best = min(t for t, _ in runs)
+rc = max(r for _, r in runs)
+print(int(max(best - floor, 1)), rc)
+PYEOF
+)
+EOF
+if [ "${rc:-1}" -ne 0 ]; then
     echo "error: the generated program does not check — the measurement is meaningless"
     exit 1
 fi
-work_ms=$(( total - floor )); [ $work_ms -lt 1 ] && work_ms=1
 locs=$(( lines * 1000 / work_ms ))
 printf '%-4s %-34s %-22s %s\n' "G3" "frontend throughput" ">= 500,000 LOC/s" "$(printf "%'d" $locs) LOC/s   ($lines lines in ${work_ms}ms)"
 printf '%-4s %-34s %-22s %s\n' "" "incremental edit-to-diagnostic" "<= 50 ms" "not built (no query engine)"

@@ -75,7 +75,7 @@ pub struct Interp<'a, W: Write> {
     ok_wrapped: std::collections::HashSet<(u32, u32)>,
     /// Method calls the checker resolved to a struct field. See
     /// `set_field_calls`.
-    field_calls: std::collections::HashSet<(u32, u32)>,
+    field_calls: grasm_sema::check::SpanSet,
     /// Closure literals whose own type is fallible, by start offset.
     ///
     /// `fail(e)` raises the error branch of the enclosing fallible function,
@@ -566,7 +566,7 @@ impl<'a, W: Write> Interp<'a, W> {
     /// that name, which is right for UFCS and wrong when the free function
     /// cannot take the receiver at all ([L-UFCS] requires that it can). Only
     /// the checker knows, so it decides and this reads the decision.
-    pub fn set_field_calls(&mut self, spans: std::collections::HashSet<(u32, u32)>) {
+    pub fn set_field_calls(&mut self, spans: grasm_sema::check::SpanSet) {
         self.field_calls = spans;
     }
 
@@ -688,7 +688,7 @@ impl<'a, W: Write> Interp<'a, W> {
             const_cache: HashMap::new(),
             float_literals: std::collections::HashSet::new(),
             ok_wrapped: std::collections::HashSet::new(),
-            field_calls: std::collections::HashSet::new(),
+            field_calls: Default::default(),
             fallible_closures: std::collections::HashSet::new(),
             float_sums: std::collections::HashSet::new(),
             slab: Vec::new(),

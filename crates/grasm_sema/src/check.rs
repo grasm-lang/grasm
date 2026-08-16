@@ -3,6 +3,58 @@
 
 use std::collections::HashMap;
 
+/// A fast hasher for the checker's own tables, which are keyed by span — a
+/// pair of integers this pass produced itself.
+///
+/// The default hasher is cryptographic, because a `HashMap` in a program that
+/// takes untrusted keys has to resist an attacker choosing collisions. None of
+/// these do: the keys are byte offsets in a file the compiler is already
+/// reading, and an attacker who can choose them can choose the whole program.
+/// Hashing them with SipHash showed up as 5% of `grasm check` on a large file.
+#[derive(Default, Clone, Copy)]
+pub struct SpanHasher(u64);
+
+impl std::hash::Hasher for SpanHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.write_u8(*b);
+        }
+    }
+    fn write_u8(&mut self, n: u8) {
+        self.write_u64(n as u64);
+    }
+    fn write_u32(&mut self, n: u32) {
+        self.write_u64(n as u64);
+    }
+    fn write_u64(&mut self, n: u64) {
+        // The multiply-xor-rotate of FxHash, the hasher rustc uses for exactly
+        // this: a good enough spread over integer keys for a fraction of the
+        // cost.
+        self.0 = (self.0.rotate_left(5) ^ n).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+    fn write_usize(&mut self, n: usize) {
+        self.write_u64(n as u64);
+    }
+}
+
+#[derive(Default, Clone, Copy)]
+pub struct SpanHash;
+
+impl std::hash::BuildHasher for SpanHash {
+    type Hasher = SpanHasher;
+    fn build_hasher(&self) -> SpanHasher {
+        SpanHasher(0)
+    }
+}
+
+/// A map keyed by span, hashed cheaply. See `SpanHasher`.
+pub type SpanMap<V> = HashMap<(u32, u32), V, SpanHash>;
+/// A set of spans, hashed cheaply.
+pub type SpanSet = std::collections::HashSet<(u32, u32), SpanHash>;
+
 use grasm_syntax::ast::*;
 use grasm_syntax::diag::Diagnostic;
 use grasm_syntax::span::Span;
@@ -46,12 +98,12 @@ pub struct Analysis {
     pub ok_wrapped: std::collections::HashSet<(u32, u32)>,
     /// The effect row of every function-valued expression, and of every call
     /// whose callee is not an expression of its own. See `value_tables`.
-    pub value_rows: std::collections::HashMap<(u32, u32), std::collections::BTreeSet<String>>,
-    pub callee_rows: std::collections::HashMap<(u32, u32), std::collections::BTreeSet<String>>,
+    pub value_rows: SpanMap<std::collections::BTreeSet<String>>,
+    pub callee_rows: SpanMap<std::collections::BTreeSet<String>>,
     /// Method-call spans the checker resolved to a *struct field* holding a
     /// function, rather than to a method or a UFCS free function. The engines
     /// resolve by name and would otherwise disagree with the types.
-    pub field_calls: std::collections::HashSet<(u32, u32)>,
+    pub field_calls: SpanSet,
     /// Start offsets of closure literals whose own type is fallible.
     ///
     /// `fail(e)` raises the error branch of the enclosing *fallible* function,
@@ -104,8 +156,8 @@ pub struct ModuleView<'a> {
 /// `[fn(i64) -> i64 / {io, unsafe}]` and calling one element would be
 /// certified as performing nothing.
 pub type ValueTables = (
-    std::collections::HashMap<(u32, u32), std::collections::BTreeSet<String>>,
-    std::collections::HashMap<(u32, u32), std::collections::BTreeSet<String>>,
+    SpanMap<std::collections::BTreeSet<String>>,
+    SpanMap<std::collections::BTreeSet<String>>,
 );
 
 pub fn value_tables(program: &crate::loader::Program) -> ValueTables {
@@ -405,14 +457,14 @@ struct Checker {
     float_literals: std::collections::HashSet<u32>,
     /// The effect row of every expression whose type is a function, keyed by
     /// its whole span. See `record_value_row`.
-    value_rows: std::collections::HashMap<(u32, u32), std::collections::BTreeSet<String>>,
+    value_rows: SpanMap<std::collections::BTreeSet<String>>,
     /// The row of the function a *call* reaches, where that function is not an
     /// expression in its own right — `t.0(1)`, `b.f(1)`. Keyed by the call's
     /// whole span.
-    callee_rows: std::collections::HashMap<(u32, u32), std::collections::BTreeSet<String>>,
-    field_calls: std::collections::HashSet<(u32, u32)>,
+    callee_rows: SpanMap<std::collections::BTreeSet<String>>,
+    field_calls: SpanSet,
     /// Inferred type per expression, keyed by whole span. See `infer_expr`.
-    expr_types: HashMap<(u32, u32), Type>,
+    expr_types: SpanMap<Type>,
     /// See `Analysis::empty_types`. Collected as type variables and resolved
     /// once checking is over, since that is when they have answers.
     /// (start offset, length, element type) — the length so the
@@ -576,10 +628,10 @@ impl Checker {
             region_floors: Vec::new(),
             extern_names: std::collections::HashSet::new(),
             float_literals: std::collections::HashSet::new(),
-            value_rows: std::collections::HashMap::new(),
-            callee_rows: std::collections::HashMap::new(),
-            field_calls: std::collections::HashSet::new(),
-            expr_types: HashMap::new(),
+            value_rows: SpanMap::default(),
+            callee_rows: SpanMap::default(),
+            field_calls: SpanSet::default(),
+            expr_types: SpanMap::default(),
             empty_lits: Vec::new(),
             float_sums: std::collections::HashSet::new(),
             effects: HashMap::new(),
