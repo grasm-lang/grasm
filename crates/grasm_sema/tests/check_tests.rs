@@ -3112,3 +3112,70 @@ print(\"{{[1, 2].{op}}}\")\n}}\n"
 print(\"{{[1, 2].map(h)}}\")\n}}\n"
     ));
 }
+
+/// A struct field of function type is reachable even when a free function
+/// shares its name.
+///
+/// [L-UFCS] takes a free function in method position only when "its first
+/// parameter accepts the receiver", and [T-FIELD-CALL] says a field is what
+/// remains when no method and no such candidate exists. Sharing a name was
+/// enough, so declaring `fn len(xs: [i64])` anywhere in the module made every
+/// `n.len()` on a struct with a `len` field a type error naming `[i64]` — a
+/// type that appears nowhere near the call. Any struct with a field called
+/// `len`, `get`, `run` or `parse` was one same-named free function away from
+/// being uncallable.
+#[test]
+fn a_field_call_survives_a_free_function_of_the_same_name() {
+    // The free function cannot take the receiver, so the field is the call.
+    check_ok(
+        "type Node = { len: fn() -> i64 }\n\nfn len(xs: [i64]) -> i64 {\n    999\n}\n\n\
+fn main() {\n    let n = Node{ len: || 7 }\n    print(\"{n.len()}\")\n}\n",
+    );
+    // Through a reference and a tuple component, the other two routes
+    // [T-FIELD-CALL] names.
+    check_ok(
+        "type Node = { len: fn() -> i64 }\n\nfn len(xs: [i64]) -> i64 {\n    999\n}\n\n\
+fn main() {\n    let r = ref(Node{ len: || 7 })\n    let p = (Node{ len: || 8 }, 1)\n    \
+print(\"{r.len()} {p.0.len()}\")\n}\n",
+    );
+    // A free function that *does* accept the receiver still wins, which is the
+    // half of the rule that was already right.
+    check_ok(
+        "type Node = { len: fn() -> i64 }\n\nfn len(n: Node) -> i64 {\n    999\n}\n\n\
+fn main() {\n    let n = Node{ len: || 7 }\n    print(\"{n.len()}\")\n}\n",
+    );
+    // And a builtin beats both.
+    check_ok(
+        "fn get(n: i64) -> i64 {\n    999\n}\n\nfn main() {\n    let xs = [1, 2]\n    \
+print(\"{xs.get(0) ?? 0}\")\n    print(\"{5.get()}\")\n}\n",
+    );
+}
+
+/// A chain of field reads is checked in linear time.
+///
+/// `infer_field` inferred its receiver twice — once for the handler-operation
+/// check and once for the read itself — so the cost doubled per link. Forty
+/// `.next`s never finished, at one core and 13 MB: not a stack overflow, not a
+/// memory limit, and well under the nesting cap that [G-NEST-LIMIT] says must
+/// be *reported* rather than hung on. Twenty-two links took 1.3 seconds and
+/// twenty-six took twenty-one.
+///
+/// A thousand links check instantly now. The test is a timing one only in the
+/// sense that the old code could not have finished it in the age of the
+/// universe: 2^1000.
+#[test]
+fn a_chain_of_field_reads_is_linear() {
+    let chain = ".next".repeat(1000);
+    check_ok(&format!(
+        "type N = {{ next: N, v: i64 }}\n\nfn depth(n: N) -> i64 {{\n    n{chain}.v\n}}\n\n\
+fn main() {{\n    print(\"ok\")\n}}\n"
+    ));
+    // The same for an index chain and a tuple chain, the other two shapes a
+    // projection can take.
+    let idx = ".xs[0]".repeat(200);
+    check_ok(&format!(
+        "type W = {{ xs: [W], v: i64 }}\n\nfn f(w: W) -> i64 {{\n    w{idx}.v\n}}\n\n\
+fn main() {{\n    print(\"ok\")\n}}\n"
+    ));
+    check_ok("fn main() {\n    let t = (((1, 2), 2), 3)\n    print(\"{t.0.0.0}\")\n}\n");
+}

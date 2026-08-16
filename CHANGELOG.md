@@ -7,6 +7,34 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
 
 ### Fixed
 
+- **`grasm check` no longer takes exponential time on a chain of field reads.**
+  `infer_field` inferred its receiver twice — once for the handler-operation
+  check, once for the read — so cost doubled per link: twenty-two `.next`s took
+  1.3 seconds, twenty-six took twenty-one, and forty never finished, at one
+  core and 13 MB. Not a stack overflow and not the nesting cap, which
+  [G-NEST-LIMIT] says must *report* rather than hang. A thousand links now
+  check instantly.
+- **A `par_map` inside a closure emits its worker.** The worklists are drained
+  to a fixpoint because compiling one body discovers another; the parallel
+  workers were drained once, before that loop, so a `par_map` written inside a
+  closure or a handler operation had its lifted worker declared and never
+  defined — and the *linker* reported it as a missing C function `gp_main_1`,
+  for a program containing no `extern fn`. The identical defect the loop
+  already existed to prevent for closures.
+- **A struct field of function type is reachable again.** [L-UFCS] takes a free
+  function in method position only when "its first parameter accepts the
+  receiver", and only the name was compared: declaring `fn len(xs: [i64])`
+  anywhere in the module made every `n.len()` on a struct with a `len` field a
+  type error naming `[i64]`. Worse, the engines resolve by name and had no way
+  to know better, so once the checker was fixed they still called the free
+  function: the checker now records which calls it resolved to a field, and
+  both engines read that.
+- **`--native` compiles two more shapes**, and §11 loses two rows: a parallel
+  operation given a function *value* (a `fn`-typed parameter, or `let f = sq`),
+  which refused with a message about a closure in programs containing none; and
+  a closure literal in a `match` or `if` arm whose binding is annotated, which
+  refused with "no type says what its parameters are" about a binding that says
+  exactly that. The annotation now reaches the arms.
 - **A parallel operation may no longer reach a `ref` from outside** — the race
   the previous entry created. [T-PAR-MAP-PURE] had named the shape and said it
   was "not a race today: the native backend refuses a write through a `ref`

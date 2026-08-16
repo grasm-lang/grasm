@@ -701,7 +701,6 @@ runs only under `grasm run`:
 | a generic **type** declaration | `type Pair[A, B] = { fst: A, snd: B }` |
 | an effect handler as a return type | `fn mk() -> ClockHandler { … }` |
 | a range held as a value | `let r = 1..5` (`for i in 0..5` is fine) |
-| `par_map`/`par_filter` with a closure bound to a name | `let f = \|n\| n * 2` then `xs.par_map(f)` — write it inline, or as a top-level `fn` |
 | `map` with a function that returns nothing | `xs.map(\|x\| print(x))` — a `for` loop is what that meant |
 | a type parameter appearing **only** in a function-typed parameter's result | `fn key_by[T, K](xs: [T], f: fn(T) -> K) -> [K]` |
 | an `inout` argument that is not a plain variable | `push_one(b.items)`, `add(xs[0], 5)` — bind it to a `var` first |
@@ -717,7 +716,6 @@ runs only under `grasm run`:
 | a handler used as a *value* | `print("{h}")`, or storing one — install it with `with … handled_by` instead |
 | a `with` block inside `parallel`/`spawn` | install the handler around the `parallel` block instead |
 | a closure with parameters whose types nothing fixes | `let f = \|x\| x * 2` then `f(p.0)` where `p` is destructured by a `for` — annotate the binding, as in `let f: fn(i64) -> i64 = \|x\| x * 2` |
-| a closure literal in the arms of a `match` or `if` | `let f: fn(i64) -> i64 = match n { 1 -> \|x\| x + 1  _ -> \|x\| x * 2 }` — bind each closure first, or make them top-level `fn`s |
 | `fail` inside a *fallible* closure passed to `map`, `filter` or `fold` | `xs.map(\|x\| fail(e))` where the result is held as `[T ! E]` — produce `Err(e)` instead of failing, or pass a named function |
 | a `fold` seeded with an unannotated `map()` | `xs.fold(map(), add)` — annotate the seed: `let seed: Map[str, i64] = map()` |
 | polymorphic recursion | `fn f[T](x: T) -> i64 { f([x]) }` — one compiled copy per type, and the types never stop growing |

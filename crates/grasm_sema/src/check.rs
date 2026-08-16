@@ -48,6 +48,10 @@ pub struct Analysis {
     /// whose callee is not an expression of its own. See `value_tables`.
     pub value_rows: std::collections::HashMap<(u32, u32), std::collections::BTreeSet<String>>,
     pub callee_rows: std::collections::HashMap<(u32, u32), std::collections::BTreeSet<String>>,
+    /// Method-call spans the checker resolved to a *struct field* holding a
+    /// function, rather than to a method or a UFCS free function. The engines
+    /// resolve by name and would otherwise disagree with the types.
+    pub field_calls: std::collections::HashSet<(u32, u32)>,
     /// Start offsets of closure literals whose own type is fallible.
     ///
     /// `fail(e)` raises the error branch of the enclosing *fallible* function,
@@ -276,6 +280,7 @@ fn check_modules_in(
         float_literals: c.float_literals,
         value_rows: c.value_rows.clone(),
         callee_rows: c.callee_rows.clone(),
+        field_calls: c.field_calls.clone(),
         ok_wrapped: c.ok_wrapped,
         fallible_closures: c
             .closure_types
@@ -405,6 +410,7 @@ struct Checker {
     /// expression in its own right — `t.0(1)`, `b.f(1)`. Keyed by the call's
     /// whole span.
     callee_rows: std::collections::HashMap<(u32, u32), std::collections::BTreeSet<String>>,
+    field_calls: std::collections::HashSet<(u32, u32)>,
     /// See `Analysis::empty_types`. Collected as type variables and resolved
     /// once checking is over, since that is when they have answers.
     /// (start offset, length, element type) — the length so the
@@ -570,6 +576,7 @@ impl Checker {
             float_literals: std::collections::HashSet::new(),
             value_rows: std::collections::HashMap::new(),
             callee_rows: std::collections::HashMap::new(),
+            field_calls: std::collections::HashSet::new(),
             empty_lits: Vec::new(),
             float_sums: std::collections::HashSet::new(),
             effects: HashMap::new(),
@@ -4634,8 +4641,15 @@ parts have names worth writing",
         // handler be written at all — so taking one out and calling it
         // directly launders whatever it does. Asked here, after the
         // type-qualified forms, because those receivers are not values.
+        // Walked at most once. This function used to infer the receiver here
+        // and again below, so a chain of field reads cost 2^n: `n.next` forty
+        // times deep never finished typechecking, at 13 MB of memory and one
+        // core — under a nesting cap that [G-NEST-LIMIT] says must *report*
+        // rather than hang.
+        let mut recv_ty0: Option<Type> = None;
         if !matches!(recv, Expr::Ident(id) if self.lookup(&id.name).is_none()) {
             let rt0 = self.infer_expr(recv);
+            recv_ty0 = Some(rt0.clone());
             if let Type::Named { id, .. } = self.uni.resolve(&rt0) {
                 if self.handler_ids.contains(&id)
                     && matches!(&self.defs.get(id).kind, TypeDefKind::Struct { fields }
@@ -4753,7 +4767,10 @@ parts have names worth writing",
                 }
             }
         }
-        let recv_ty = self.infer_expr(recv);
+        let recv_ty = match recv_ty0 {
+            Some(t) => t,
+            None => self.infer_expr(recv),
+        };
         // Not known yet. A closure's body waits for its call sites, so the
         // type of what it returns is not settled until the end of the block —
         // and asking here reported ``_` has no field `c``, naming a type no
@@ -5015,7 +5032,18 @@ Perform the effect after the closing brace, or yield a number and do the work ou
             return result;
         }
         // UFCS: `x.f(a)` → `f(x, a)`.
-        if let Some(info) = self.lookup_fn(&name.name) {
+        //
+        // Only when the free function's first parameter *accepts the
+        // receiver*, which is what [L-UFCS] says and what was never checked.
+        // Sharing a name was enough, so declaring `fn len(xs: [i64])` anywhere
+        // in the module made every `n.len()` on a struct with a `len` field a
+        // type error about `[i64]` — a type that appears nowhere near the
+        // call. [T-FIELD-CALL] promises the opposite in as many words: a field
+        // is reached when no method and no UFCS candidate takes the receiver.
+        if let Some(info) = self
+            .lookup_fn(&name.name)
+            .filter(|info| self.ufcs_accepts(info, &recv_res))
+        {
             // Including the Tier 3 gate. [L-UFCS] says the two spellings are
             // the same call, and only one of them was checked: `n.close()`
             // reached libc with no `unsafe`, no `io` in the row, and no
@@ -5033,6 +5061,11 @@ Perform the effect after the closing brace, or yield a number and do the work ou
         // pointed to. The help offered instead — declare `fn run(Node, ...)` —
         // is a different function that would not call the field at all.
         if self.struct_field_type(&recv_res, &name.name).is_some() {
+            // Recorded, because the engines have no types to decide this with:
+            // the interpreter looked a free function up by name and called it
+            // with the struct, so a program the checker had resolved to the
+            // field printed the free function's answer instead.
+            self.field_calls.insert((span.start, span.end));
             let ft = self.infer_field(recv, name, span);
             let resolved = self.uni.shallow_resolve(&ft);
             if let Type::Fn { params, ret, row } = resolved {
@@ -5092,6 +5125,41 @@ Perform the effect after the closing brace, or yield a number and do the work ou
             format!("no method `{}` on `{shown}`", name.name),
             format!("a free function `fn {}({shown}, ...)` would also work here (UFCS)", name.name),
         )
+    }
+
+    /// Whether a free function could take this receiver as its first argument.
+    ///
+    /// Deliberately generous: an inference variable, a generic parameter or an
+    /// error type could still turn out to fit, and refusing those would make
+    /// this rule the thing that breaks a program. Only a *definite* mismatch —
+    /// two concrete types that cannot be the same — disqualifies the function,
+    /// which is exactly the case that was mistaking a field for a bad call.
+    fn ufcs_accepts(&self, info: &FnInfo, recv: &Type) -> bool {
+        let Some(first) = info.params.first() else {
+            return false;
+        };
+        fn compatible(a: &Type, b: &Type) -> bool {
+            use Type::*;
+            match (a, b) {
+                (Var(_), _) | (_, Var(_)) => true,
+                (Generic(_), _) | (_, Generic(_)) => true,
+                (Error, _) | (_, Error) => true,
+                (List(x), List(y)) => compatible(x, y),
+                (Ref(x), Ref(y)) => compatible(x, y),
+                // A reference reads as what it points at ([T-REF-READ]), so a
+                // function over the pointee still takes one.
+                (Ref(x), other) | (other, Ref(x)) => compatible(x, other),
+                (Map(k1, v1), Map(k2, v2)) => compatible(k1, k2) && compatible(v1, v2),
+                (Tuple(x), Tuple(y)) => {
+                    x.len() == y.len() && x.iter().zip(y).all(|(p, q)| compatible(p, q))
+                }
+                (Named { id: i1, .. }, Named { id: i2, .. }) => i1 == i2,
+                (Fallible(o1, _), Fallible(o2, _)) => compatible(o1, o2),
+                (Fn { .. }, Fn { .. }) => true,
+                _ => a == b,
+            }
+        }
+        compatible(&self.uni.resolve(first), &self.uni.resolve(recv))
     }
 
     /// The declared type of `field` on a struct type, if `t` is one with it.

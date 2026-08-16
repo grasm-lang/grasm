@@ -199,13 +199,14 @@ expect_compiled "a closure called with a for variable" 'fn main() {
     }
 }'
 
-expect_refused "a closure literal in a match arm" 'fn main() {
+expect_compiles "a closure literal in a match arm" 'fn main() {
     let n = 1
     let f: fn(i64) -> i64 = match n {
         1 -> |x| x + 1
         _ -> |x| x * 2
     }
-    print("{f(3)}")
+    let g: fn(i64) -> i64 = if n > 0 { |x| x + 10 } else { |x| x - 10 }
+    print("{f(10)} {g(10)}")
 }'
 
 expect_refused "fail inside a fallible closure passed to map" 'type E = { m: str }
@@ -266,9 +267,18 @@ expect_refused "a range held as a value" 'fn main() {
     print("{t}")
 }'
 
-expect_refused "par_map with a closure bound to a name" 'fn main() {
-    let d = |n| n * 2
-    print("{[1, 2].par_map(d)}")
+expect_compiles "par_map with a closure bound to a name" 'fn sq(n: i64) -> i64 {
+    n * n
+}
+
+fn go(xs: [i64], f: fn(i64) -> i64) -> [i64] {
+    xs.par_map(f)
+}
+
+fn main() {
+    let g = sq
+    let h = |n| n + 1
+    print("{go([1, 2], sq)} {[1, 2].par_map(g)} {[1, 2].par_map(h)}")
 }'
 
 expect_refused "map with a function that returns nothing" 'fn main() {

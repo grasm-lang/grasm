@@ -73,6 +73,9 @@ pub struct Interp<'a, W: Write> {
     float_literals: std::collections::HashSet<u32>,
     /// See `Analysis::ok_wrapped`.
     ok_wrapped: std::collections::HashSet<(u32, u32)>,
+    /// Method calls the checker resolved to a struct field. See
+    /// `set_field_calls`.
+    field_calls: std::collections::HashSet<(u32, u32)>,
     /// Closure literals whose own type is fallible, by start offset.
     ///
     /// `fail(e)` raises the error branch of the enclosing fallible function,
@@ -525,6 +528,7 @@ impl<'a, W: Write> Interp<'a, W> {
         let a = grasm_sema::check::check(module);
         me.float_literals = a.float_literals;
         me.ok_wrapped = a.ok_wrapped;
+        me.field_calls = a.field_calls;
         me.float_sums = a.float_sums;
         me.fallible_closures = a.fallible_closures;
         me
@@ -551,6 +555,17 @@ impl<'a, W: Write> Interp<'a, W> {
     /// `Analysis`.
     pub fn set_ok_wrapped(&mut self, spans: std::collections::HashSet<(u32, u32)>) {
         self.ok_wrapped = spans;
+    }
+
+    /// The method calls the checker resolved to a struct field holding a
+    /// function, from `Analysis`.
+    ///
+    /// This engine resolves a method name by looking for a free function of
+    /// that name, which is right for UFCS and wrong when the free function
+    /// cannot take the receiver at all ([L-UFCS] requires that it can). Only
+    /// the checker knows, so it decides and this reads the decision.
+    pub fn set_field_calls(&mut self, spans: std::collections::HashSet<(u32, u32)>) {
+        self.field_calls = spans;
     }
 
     /// The closure literals the checker typed as fallible, from `Analysis`.
@@ -657,6 +672,7 @@ impl<'a, W: Write> Interp<'a, W> {
             const_cache: HashMap::new(),
             float_literals: std::collections::HashSet::new(),
             ok_wrapped: std::collections::HashSet::new(),
+            field_calls: std::collections::HashSet::new(),
             fallible_closures: std::collections::HashSet::new(),
             float_sums: std::collections::HashSet::new(),
             slab: Vec::new(),
@@ -1747,8 +1763,8 @@ impl<'a, W: Write> Interp<'a, W> {
             }
             Expr::Call { callee, args, .. } => self.eval_call(callee, args),
             Expr::MethodCall {
-                recv, name, args, ..
-            } => self.eval_method_call(recv, name, args),
+                recv, name, args, span,
+            } => self.eval_method_call(recv, name, args, *span),
             Expr::Field { recv, name, .. } => self.eval_field(recv, name),
             Expr::Index { recv, index, .. } => {
                 let r = self.eval_expr(recv)?;
@@ -2334,7 +2350,13 @@ build links it, `grasm run` can only reach what is already loaded",
     }
 
     /// Effect op / cross-module / qualified variant / builtin / UFCS method.
-    fn eval_method_call(&mut self, recv: &Expr, name: &Ident, args: &[Expr]) -> EResult {
+    fn eval_method_call(
+        &mut self,
+        recv: &Expr,
+        name: &Ident,
+        args: &[Expr],
+        span: grasm_syntax::Span,
+    ) -> EResult {
         // Cross-module qualified call `utils.helper(...)`.
         if let Expr::Ident(tid) = recv {
             let is_local = self.scopes.iter().rev().any(|s| s.contains_key(&tid.name));
@@ -2479,12 +2501,14 @@ build links it, `grasm run` can only reach what is already loaded",
         if let Some(r) = self.builtin_method(recv_v.clone(), name, args)? {
             return Ok(r);
         }
-        // UFCS: x.f(a) → f(x, a).
+        // UFCS: x.f(a) → f(x, a) — unless the checker resolved this call to a
+        // field of the receiver instead.
+        let is_field_call = self.field_calls.contains(&(span.start, span.end));
         let ufcs_qual = format!("{}::{}", self.current_module, name.name);
         // Including a declared C function. [L-UFCS] says the two spellings are
         // the same call, and the compiled backend made it; this engine said
         // `no method` for a program that ran natively.
-        if let Some(e) = self.externs.get(&ufcs_qual).copied() {
+        if let (false, Some(e)) = (is_field_call, self.externs.get(&ufcs_qual).copied()) {
             let mut vs = Vec::with_capacity(args.len() + 1);
             vs.push(recv_v);
             for a in args {
@@ -2492,7 +2516,7 @@ build links it, `grasm run` can only reach what is already loaded",
             }
             return self.call_extern_values(e, vs);
         }
-        if let Some(f) = self.fns.get(&ufcs_qual).copied() {
+        if let (false, Some(f)) = (is_field_call, self.fns.get(&ufcs_qual).copied()) {
             let module = self.current_module.clone();
             let modes: Vec<ParamMode> = f.params.iter().map(|p| p.mode).collect();
             let (vs, paths) = self.eval_call_args_paths(&modes, args, Some(recv_v))?;

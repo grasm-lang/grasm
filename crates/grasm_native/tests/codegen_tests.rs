@@ -479,3 +479,29 @@ print(\"{g(3)}\")\n}\n",
         compile(src).unwrap_or_else(|e| panic!("{src}\n{e}"));
     }
 }
+
+/// A `par_map` written inside a closure body has its worker emitted.
+///
+/// The worklists are drained to a fixpoint because compiling one body can
+/// discover another — the loop's own comment records a closure inside a
+/// handler operation reported by the *linker* as a missing C function
+/// `gc_main_161`, for a program with no `extern fn` in it. The parallel
+/// workers were drained once, before that loop, so the identical defect
+/// remained for a `par_map` inside a closure: `gp_main_1`, same wrong
+/// diagnostic, same cause.
+#[test]
+fn a_par_map_inside_a_closure_emits_its_worker() {
+    for src in [
+        "fn main() {\n    let f = |k| [1, 2, 3].par_map(|x| x * 2).sum()\n    \
+print(\"{f(2)}\")\n}\n",
+        // Inside a handler operation, which is the other body compiled late.
+        "effect Src {\n    fn get(k: i64) -> i64\n}\n\nfn main() {\n    \
+with Src handled_by SrcHandler{ get: |k| [1, 2, 3].par_map(|x| x * k).sum() } {\n        \
+print(\"{Src.get(2)}\")\n    }\n}\n",
+        // And a `par_filter` in a closure held by a struct field.
+        "type Box = { f: fn(i64) -> i64 }\n\nfn main() {\n    \
+let b = Box{ f: |k| [1, 2, 3].par_filter(|x| x > 1).len() + k }\n    print(\"{b.f(5)}\")\n}\n",
+    ] {
+        compile(src).unwrap_or_else(|e| panic!("{src}\n{e}"));
+    }
+}

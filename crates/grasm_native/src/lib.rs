@@ -300,6 +300,7 @@ fn compile_object_scoped(
     let mut cg = Codegen::new(&mut module);
     let analysis = grasm_sema::check::check_program(program);
     cg.float_literals = analysis.float_literals;
+    cg.field_calls = analysis.field_calls;
     cg.fallible_closures = analysis.fallible_closures;
     cg.empty_types = analysis.empty_types;
     cg.only_module = only_module.map(str::to_string);
@@ -436,6 +437,9 @@ struct Codegen<'m> {
     /// The checker already knows which literals are floats; asking it once is
     /// both correct and the same answer the interpreter gets.
     float_literals: std::collections::HashSet<u32>,
+    /// Method calls the checker resolved to a struct field holding a function.
+    /// See the UFCS branch of the method-call lowering.
+    field_calls: std::collections::HashSet<(u32, u32)>,
     /// Closure literals whose own type is fallible, by start offset.
     fallible_closures: std::collections::HashSet<u32>,
     /// Start offset of each empty literal → the type the checker settled on.
@@ -524,6 +528,7 @@ impl<'m> Codegen<'m> {
             pending_generics: Vec::new(),
             generic_subst: HashMap::new(),
             float_literals: std::collections::HashSet::new(),
+            field_calls: std::collections::HashSet::new(),
             fallible_closures: std::collections::HashSet::new(),
             empty_types: std::collections::HashMap::new(),
         }
@@ -865,11 +870,6 @@ impl<'m> Codegen<'m> {
             result?;
         }
 
-        while let Some(c) = self.pending_par_maps.pop() {
-            self.current_module = c.module.clone();
-            self.compile_par_map(c)?;
-        }
-
         // A lifted closure can itself create another, so drain the worklist.
         // Until both queues are empty: compiling a handler operation can
         // create closures, and compiling a closure can create handlers.
@@ -889,6 +889,19 @@ impl<'m> Codegen<'m> {
                 moved = true;
                 self.current_module = h.module.clone();
                 self.compile_handler(h)?;
+            }
+            // In the same loop, for the reason above: a `par_map` written
+            // inside a closure body — or inside a handler operation — is
+            // discovered while that body is compiled. Drained once beforehand
+            // instead, its lifted worker was declared and never defined, and
+            // the *linker* reported it as a missing C function named
+            // `gp_main_1`, for a program with no `extern fn` in it. The same
+            // shape, and the same wrong diagnostic, as the closure case this
+            // loop already exists to prevent.
+            while let Some(c) = self.pending_par_maps.pop() {
+                moved = true;
+                self.current_module = c.module.clone();
+                self.compile_par_map(c)?;
             }
             if !moved {
                 break;
@@ -2251,6 +2264,10 @@ struct BlockHints {
     /// A binding's written type, which beats its initializer when the
     /// initializer is an empty literal.
     declared_ty: HashMap<String, grasm_syntax::ast::TypeExpr>,
+    /// The declared type of a closure literal that is not bound to a name of
+    /// its own — an arm of a `match` or an `if` whose *result* is annotated.
+    /// Keyed by the literal's start offset, since there is no name to key on.
+    declared_at: HashMap<u32, grasm_syntax::ast::TypeExpr>,
     /// `apply(f, 5)` where `apply` declares `fn(i64) -> i64`: the signature
     /// says what `f`'s parameters are, and no call of `f` by name ever will.
     declared: HashMap<String, Vec<VType>>,
@@ -2569,6 +2586,17 @@ fn collect_block_hints(blk: &grasm_syntax::ast::Block) -> BlockHints {
             }
             if matches!(init, Expr::Closure { params, .. } if !params.is_empty()) {
                 bound.push(name.name.clone());
+            }
+            // `let f: fn(i64) -> i64 = match n { 1 -> |x| x + 1  _ -> … }`.
+            // The annotation is on the binding and the closures are in the
+            // arms, so nothing connected the two: the refusal said "no type
+            // says what its parameters are" about a program whose binding says
+            // exactly that, and its suggested fix was what the source already
+            // contained.
+            if let Some(t) = ty {
+                for at in arm_closure_spans(init) {
+                    hints.declared_at.entry(at).or_insert_with(|| t.clone());
+                }
             }
         }
         if let Stmt::For { var, iter, .. } = stmt {
@@ -3008,6 +3036,54 @@ fn unify_generic(
 /// assignment target's shape", which names nothing — a reader could not tell
 /// whether it was the `ref`, the map, or the depth that was the problem, and
 /// the refusal for a handler type in the same program did name its type.
+/// Start offsets of closure literals sitting in the arms of a `match` or an
+/// `if` that is the whole of an expression — the positions where the type is
+/// written on what *holds* the closure rather than beside it.
+fn arm_closure_spans(e: &Expr) -> Vec<u32> {
+    let mut out = Vec::new();
+    fn walk(e: &Expr, out: &mut Vec<u32>) {
+        match e {
+            Expr::Closure { params, span, .. } if !params.is_empty() => out.push(span.start),
+            Expr::Match { arms, .. } => {
+                for a in arms {
+                    walk(&a.body, out);
+                }
+            }
+            Expr::If {
+                then_block,
+                else_branch,
+                ..
+            } => {
+                if let Some(Stmt::Expr(t)) = then_block.stmts.last() {
+                    walk(t, out);
+                }
+                match else_branch.as_deref() {
+                    Some(ElseBranch::Else(b)) => {
+                        if let Some(Stmt::Expr(t)) = b.stmts.last() {
+                            walk(t, out);
+                        }
+                    }
+                    Some(ElseBranch::ElseIf(inner)) => walk(inner, out),
+                    None => {}
+                }
+            }
+            Expr::Block(b) => {
+                if let Some(Stmt::Expr(t)) = b.stmts.last() {
+                    walk(t, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    // Only *inside* a branching shape: a closure written directly is already
+    // connected to its binding by name.
+    match e {
+        Expr::Match { .. } | Expr::If { .. } | Expr::Block(_) => walk(e, &mut out),
+        _ => {}
+    }
+    out
+}
+
 fn place_shape(root_t: &VType, seg: &PlaceSeg<'_>) -> String {
     let what = match root_t {
         VType::Ref(_) => "a write through a `ref`",
@@ -6235,8 +6311,18 @@ impl FnCx<'_, '_> {
                 (self.call_rt(f, &[rv, a]).unwrap(), VType::F64)
             }
             _ => {
-                // UFCS: x.f(a) → f(x, a).
-                if let Some(sig) = self.lookup_fn(&name.name) {
+                // UFCS: x.f(a) → f(x, a) — unless the checker resolved this
+                // call to a field of the receiver holding a function. This
+                // backend resolves by name, like the interpreter, and
+                // [L-UFCS] takes a free function only when its first parameter
+                // accepts the receiver: an unrelated `fn len(xs: [i64])` made
+                // `n.len()` on a struct with a `len` field call the free
+                // function, so the three engines printed two different
+                // answers for a program that typechecks.
+                if let Some(sig) = self
+                    .lookup_fn(&name.name)
+                    .filter(|_| !self.cg.field_calls.contains(&(span.start, span.end)))
+                {
                     let (fid, params, modes, ret) = (
                         sig.id,
                         sig.params.clone(),
@@ -9379,6 +9465,19 @@ impl FnCx<'_, '_> {
                 }
             }
         }
+        // No name of its own: an arm of an annotated `match` or `if`.
+        if let Some(t) = self
+            .closure_hints
+            .iter()
+            .rev()
+            .find_map(|scope| scope.declared_at.get(&span.start).cloned())
+        {
+            if let Ok(VType::Fn(ps, _)) = self.cg.vtype_of(&t) {
+                if ps.len() == params.len() {
+                    return Ok(ps);
+                }
+            }
+        }
         let hint = binding.and_then(|name| {
             self.closure_hints
                 .iter()
@@ -9583,8 +9682,17 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
         // a parameter, or a local — needs an indirect call, which the
         // sequential loops can make and the parallel workers cannot.
         let is_named = self.lookup_fn(&id.name).is_some();
-        let is_fn_value =
-            !parallel && matches!(self.lookup(&id.name), Some((_, VType::Fn(_, _))));
+        // A *value* of function type — a parameter, or a local — needs an
+        // indirect call. The sequential loops make one directly; a parallel
+        // operation makes it inside `emit_par_map`, which routes anything
+        // whose captures are not scalars to its own sequential fallback
+        // ("slower, never wrong"). Refusing it outright instead named a
+        // closure in programs that contain none — `fn go(xs: [i64], f:
+        // fn(i64) -> i64) { xs.par_map(f) }` and `let f = sq` — and the help
+        // told the reader to pass a top-level `fn`, which is what they had
+        // passed.
+        let is_fn_value = matches!(self.lookup(&id.name), Some((_, VType::Fn(_, _))));
+        let _ = parallel;
         if !is_named && !is_fn_value {
             return None;
         }
