@@ -7,6 +7,19 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
 
 ### Fixed
 
+- **A parallel operation may no longer reach a `ref` from outside** — the race
+  the previous entry created. [T-PAR-MAP-PURE] had named the shape and said it
+  was "not a race today: the native backend refuses a write through a `ref`
+  outright". It stopped refusing, and a program `check` accepted then died with
+  SIGTRAP, or panicked inside the runtime with `field access on non-struct`, or
+  printed a different wrong answer on each run at exit 0 — several workers
+  reaching one slot touch a reference count that is not atomic. Reading was as
+  unsafe as writing, because a read takes a count on what it finds. Now refused
+  three ways: an element type that reaches a reference, any mention of an
+  outside reference inside the function, and a generic carrying one in
+  (recorded on the generic's parameter and settled at its call sites, the way
+  [T-MAP-KEY-GENERIC] settles map keys). Found independently by both evaluators
+  of round 42.
 - **`--native` compiles writes through a `ref`.** The backend refused every one
   of them, so §11 listed the shape and two conformance programs ran under the
   interpreter alone. The write now lands in the slab rather than rebuilding the

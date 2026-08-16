@@ -716,13 +716,37 @@ The write a closure is otherwise allowed to make ([T-REF-CAPTURE]) is the one
 that has to be refused here. A `ref` created *inside* the function is one per
 element and is left alone, as is reading a captured one.
 
-Two shapes still reach past this, which is part of why the rule is
+*And it may not reach a `ref` from outside at all.* Reading one was allowed on
+the reasoning that a read shares nothing; it shares the reference **count**,
+which a read through a reference takes and which is not atomic. The day the
+native backend stopped refusing writes through a reference, a program made only
+of reads — `[1, 2].par_map(|x| x + acc.n)` — died with SIGTRAP, panicked inside
+the runtime with `field access on non-struct`, or printed a different wrong
+answer on each run at exit 0. The clause below had named the shape and said it
+was "not a race today"; it became one exactly as predicted, and the fix is the
+one the prediction implies.
+
+So an **element type that reaches a reference** is refused at the operation —
+`[ref T]`, or a struct holding one anywhere inside — because every element is
+then the shared thing and there is no outside binding to point at. A reference
+*created inside* the function is one per element and is left alone, which is
+the shape that makes a per-element accumulator writable.
+
+A type **parameter** in that position says nothing yet, so it is recorded and
+settled at the call sites — the same treatment [T-MAP-KEY-GENERIC] gives a map
+key, and needed for the same reason: `fn go[T](xs: [T], f: fn(T) -> i64) {
+xs.par_map(f) }` hid `[ref Acc]` from the check entirely, which is a door
+straight back to the race. It propagates through a generic that forwards to a
+generic.
+
+One shape still reaches past this, which is part of why the rule is
 [experimental](stability.md): a function that writes through a captured `ref`
 but is bound to a name first — `let f = |x| { acc.n = 1; x }`, then
-`xs.par_map(f)` — and a list holding the same `ref` twice, where the write goes
-through a parameter rather than through a capture. Neither is a race today:
-`grasm run` maps sequentially, and the native backend refuses a write through a
-`ref` outright (§11). Both become one when it stops refusing.
+`xs.par_map(f)`. The native backend refuses that spelling for an unrelated
+reason (§11) and both other engines map sequentially, so it is not reachable
+today — but "held closed by a gap elsewhere" is what the paragraph above
+described right until the gap closed, so it is written down in
+`docs/known-issues.md` rather than left to be rediscovered.
 
 **[T-TASK-CAPTURE]** A `spawn` body may only use bindings that already existed
 when the enclosing `parallel` block began, plus the ones it declares itself.

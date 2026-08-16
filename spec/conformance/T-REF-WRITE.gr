@@ -4,6 +4,9 @@
 //! 5 9
 //! 6 [7]
 //! B! A!
+//! 42 [1, 99, 7]
+//! 5
+//! 6 6
 // A reference is written through the same way it is read through.
 //
 // The binding's own mutability is not the question — writing through a
@@ -20,6 +23,10 @@ type Holder = { r: ref Node }
 // `cannot access field `v` of `ref#0.0`` — so a node holding a reference to a
 // node was write-once. Reading the identical path worked.
 type Graph = { name: str, out: [ref Graph] }
+
+type Inner = { v: i64, xs: [i64] }
+
+type Outer = { r: ref Inner, tag: str }
 
 fn bump(rs: [ref Node]) {
     rs[0].v = rs[0].v + 1
@@ -45,4 +52,25 @@ fn main() {
     a.out[0].name = "B!"
     a.out[0].out[0].name = "A!"
     print("{b.name} {a.name}")
+    // Two reference hops, then a field, an index and a push. The compiled
+    // backend refused every write through a reference until it stopped
+    // rebuilding the referent and started writing into the slab: a rebuilt
+    // copy stored afterwards erased whatever an inner hop had already
+    // written, which is what the cycle above proves.
+    let i = ref(Inner{ v: 1, xs: [1, 2] })
+    let o = ref(Outer{ r: i, tag: "t" })
+    o.r.v = 42
+    o.r.xs[1] = 99
+    o.r.xs.push(7)
+    print("{i.v} {i.xs}")
+    // A reference read back out of a map is the same reference.
+    let m: Map[str, ref Inner] = {"a": i}
+    let got = m.get("a") ?? i
+    got.v = 5
+    print("{i.v}")
+    // And a copy of one writes to the same place: a reference copies as a
+    // slot id, which is what makes it shared ([T-REF-GENERATIONAL]).
+    let alias = o.r
+    alias.v = 6
+    print("{i.v} {o.r.v}")
 }

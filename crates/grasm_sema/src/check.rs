@@ -206,6 +206,7 @@ fn check_modules_in(
     // Every body has been walked, so a generic's own use of its type
     // parameters as map keys is known ([T-MAP-KEY-GENERIC]).
     c.flush_key_checks();
+    c.flush_par_checks();
     c.flush_discards();
     // Resolved now: unification is finished, so a literal's element type has
     // whatever answer the whole body gave it.
@@ -428,6 +429,15 @@ struct Checker {
     /// `invalid map key` — the one shape where a checked program still
     /// panicked for a type error.
     key_generics: HashMap<String, std::collections::BTreeSet<usize>>,
+    /// Generic parameters that reach a parallel operation's elements, by the
+    /// function that declares them. Instantiating one at a type that carries a
+    /// `ref` is what [T-PAR-MAP-PURE] refuses, and a generic hides that from
+    /// the operation itself — `fn go[T](xs: [T], f: fn(T) -> i64) {
+    /// xs.par_map(f) }` called with `[ref Acc]`. The same shape
+    /// [T-MAP-KEY-GENERIC] describes for map keys, and checked the same way.
+    par_generics: HashMap<String, std::collections::BTreeSet<usize>>,
+    /// Call sites of generics, held until every body has been walked.
+    pending_par_checks: Vec<(String, Vec<Type>, Span, Option<String>)>,
     /// The generic function whose body is being checked, if any.
     key_generic_owner: Option<String>,
     /// Call sites of generic functions, checked once every body has been
@@ -550,6 +560,8 @@ impl Checker {
             diags: Vec::new(),
             current_module: "main".to_string(),
             key_generics: HashMap::new(),
+            par_generics: HashMap::new(),
+            pending_par_checks: Vec::new(),
             key_generic_owner: None,
             pending_key_checks: Vec::new(),
             pending_discards: Vec::new(),
@@ -3353,6 +3365,28 @@ write back to — copy it into a local first, as in `var {} = {}`",
     fn infer_expr(&mut self, e: &Expr) -> Type {
         let t = self.infer_expr_inner(e);
         self.record_value_row(e, &t);
+        // A `ref` from outside, mentioned inside a parallel operation's
+        // function. Writing through one was already refused; *reading* is no
+        // safer, because a read takes a count on what it finds and the count
+        // is not atomic. Several workers reaching the same slot at once made a
+        // program `check` accepted die with SIGTRAP.
+        if let (Some(floor), Expr::Ident(id)) = (self.parallel_fn_floor, e) {
+            let declared_at = self.scopes.iter().rposition(|sc| sc.contains_key(&id.name));
+            if declared_at.is_some_and(|at| at < floor) && self.carries_ref(&t) {
+                self.error_help(
+                    id.span,
+                    format!(
+                        "cannot use `{}` inside a parallel operation — it reaches a `ref` \
+from outside, which every element would share",
+                        id.name
+                    ),
+                    "elements are processed on several cores, so two of them reaching the same \
+slot would race — use `map` or `filter` for work over shared state, or build the reference \
+inside the function, one per element",
+                );
+                return Type::Error;
+            }
+        }
         // A closure written *here* can only capture what a region already
         // allows, and so can one bound to a name declared here. One that
         // arrived from *outside* carries its captures, and running it inside
@@ -4364,6 +4398,12 @@ fail outside it",
                 span,
                 self.key_generic_owner.clone(),
             ));
+            self.pending_par_checks.push((
+                format!("{owner}::{name}"),
+                fresh.clone(),
+                span,
+                self.key_generic_owner.clone(),
+            ));
         }
         // A handler's discharge may not leave its block through a call that
         // writes to a place declared before it. The direct spellings —
@@ -5130,6 +5170,7 @@ Perform the effect after the closing brace, or yield a number and do the work ou
                         // without any observable interleaving.
                         let out = self.uni.fresh();
                         if check_arity(self, 1) {
+                            self.reject_parallel_ref_elem(&elem, name, span);
                             let f = Type::Fn {
                                 params: vec![elem.clone()],
                                 ret: Box::new(out.clone()),
@@ -5150,6 +5191,7 @@ Perform the effect after the closing brace, or yield a number and do the work ou
                                 row: None,
                             };
                             if name.name == "par_filter" {
+                                self.reject_parallel_ref_elem(&elem, name, span);
                                 self.check_parallel_fn(&args[0], &f);
                             } else {
                                 self.check_expr(&args[0], &f);
@@ -5637,6 +5679,64 @@ Perform the effect after the closing brace, or yield a number and do the work ou
         }
     }
 
+    /// Applies each generic's recorded `ref`-in-parallel constraint to its
+    /// call sites, propagating through generics that forward to generics.
+    fn flush_par_checks(&mut self) {
+        let pending = std::mem::take(&mut self.pending_par_checks);
+        // Same fixpoint as the key checks, and for the same reason: a generic
+        // that forwards to a generic makes its own parameter a parallel
+        // parameter, and that is only knowable once the callee's is.
+        loop {
+            let mut changed = false;
+            for (name, fresh, _, owner) in &pending {
+                let (Some(indices), Some(owner)) =
+                    (self.par_generics.get(name).cloned(), owner.clone())
+                else {
+                    continue;
+                };
+                for i in indices {
+                    let Some(t) = fresh.get(i) else { continue };
+                    if let Type::Generic(g) = self.uni.resolve(t) {
+                        if self
+                            .par_generics
+                            .entry(owner.clone())
+                            .or_default()
+                            .insert(g as usize)
+                        {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        for (name, fresh, span, _) in pending {
+            let Some(indices) = self.par_generics.get(&name).cloned() else {
+                continue;
+            };
+            for i in indices {
+                let Some(t) = fresh.get(i).cloned() else { continue };
+                if matches!(self.uni.resolve(&t), Type::Generic(_)) {
+                    continue;
+                }
+                if self.carries_ref(&t) {
+                    let shown = self.show(&t);
+                    self.error_help(
+                        span,
+                        format!(
+                            "this call reaches a parallel operation with `{shown}`, which \
+reaches a `ref` — every element would share it"
+                        ),
+                        "elements are processed on several cores, so two of them reaching the \
+same slot would race — pass a type that holds no `ref`, or use `map` inside the callee",
+                    );
+                }
+            }
+        }
+    }
+
     /// Applies each generic's recorded key constraints to its call sites.
     fn flush_key_checks(&mut self) {
         let pending = std::mem::take(&mut self.pending_key_checks);
@@ -5727,6 +5827,51 @@ Perform the effect after the closing brace, or yield a number and do the work ou
         let outer = self.parallel_fn_floor.replace(self.scopes.len());
         self.check_expr(arg, want);
         self.parallel_fn_floor = outer;
+    }
+
+    /// Refuses a parallel operation whose *elements* reach a `ref`.
+    ///
+    /// [T-PAR-MAP-PURE] names this hole in as many words — "a list holding the
+    /// same `ref` twice, where the write goes through a parameter rather than
+    /// through a capture" — and says it is "not a race today" only because the
+    /// native backend refused every write through a reference. It stopped
+    /// refusing, so it is one: several workers reaching the same slot at once
+    /// touch a reference count that is not atomic, and a program `check`
+    /// accepted printed a different wrong answer on each run, or died with
+    /// SIGTRAP, or panicked inside the runtime.
+    ///
+    /// Reading is no safer than writing here — a read through a reference
+    /// takes a count on what it finds — so this refuses the element type
+    /// outright rather than the operations on it. An element that *is* a
+    /// reference, or that holds one anywhere inside, is refused; a reference
+    /// created inside the function is one per element and is left alone.
+    fn reject_parallel_ref_elem(&mut self, elem: &Type, name: &Ident, span: Span) {
+        // A type *parameter* here says nothing yet; the call sites are where
+        // it becomes a type, and that is where it is checked
+        // ([T-MAP-KEY-GENERIC] settles map keys the same way). Without this a
+        // generic wrapper was a door straight back to the race: `go(rs, hit)`
+        // for `fn go[T](xs: [T], f: fn(T) -> i64) { xs.par_map(f) }`.
+        if let Type::Generic(i) = self.uni.resolve(elem) {
+            if let Some(owner) = self.key_generic_owner.clone() {
+                self.par_generics.entry(owner).or_default().insert(i as usize);
+            }
+            return;
+        }
+        if !self.carries_ref(elem) {
+            return;
+        }
+        let shown = self.show(elem);
+        self.error_help(
+            span,
+            format!(
+                "`{}` cannot process `{shown}` — it reaches a `ref`, which every \
+element would share",
+                name.name
+            ),
+            "elements are processed on several cores, so two of them reaching the same slot \
+would race — which is what this operation exists to make impossible. Use `map` or `filter` \
+for work over shared state, or build the references inside the function, one per element",
+        );
     }
 
     /// Mutating methods need a mutable receiver root.

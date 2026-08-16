@@ -1118,13 +1118,37 @@ The write a closure is otherwise allowed to make ([T-REF-CAPTURE]) is the one
 that has to be refused here. A `ref` created *inside* the function is one per
 element and is left alone, as is reading a captured one.
 
-Two shapes still reach past this, which is part of why the rule is
+*And it may not reach a `ref` from outside at all.* Reading one was allowed on
+the reasoning that a read shares nothing; it shares the reference **count**,
+which a read through a reference takes and which is not atomic. The day the
+native backend stopped refusing writes through a reference, a program made only
+of reads — `[1, 2].par_map(|x| x + acc.n)` — died with SIGTRAP, panicked inside
+the runtime with `field access on non-struct`, or printed a different wrong
+answer on each run at exit 0. The clause below had named the shape and said it
+was "not a race today"; it became one exactly as predicted, and the fix is the
+one the prediction implies.
+
+So an **element type that reaches a reference** is refused at the operation —
+`[ref T]`, or a struct holding one anywhere inside — because every element is
+then the shared thing and there is no outside binding to point at. A reference
+*created inside* the function is one per element and is left alone, which is
+the shape that makes a per-element accumulator writable.
+
+A type **parameter** in that position says nothing yet, so it is recorded and
+settled at the call sites — the same treatment [T-MAP-KEY-GENERIC] gives a map
+key, and needed for the same reason: `fn go[T](xs: [T], f: fn(T) -> i64) {
+xs.par_map(f) }` hid `[ref Acc]` from the check entirely, which is a door
+straight back to the race. It propagates through a generic that forwards to a
+generic.
+
+One shape still reaches past this, which is part of why the rule is
 [experimental](stability.md): a function that writes through a captured `ref`
 but is bound to a name first — `let f = |x| { acc.n = 1; x }`, then
-`xs.par_map(f)` — and a list holding the same `ref` twice, where the write goes
-through a parameter rather than through a capture. Neither is a race today:
-`grasm run` maps sequentially, and the native backend refuses a write through a
-`ref` outright (§11). Both become one when it stops refusing.
+`xs.par_map(f)`. The native backend refuses that spelling for an unrelated
+reason (§11) and both other engines map sequentially, so it is not reachable
+today — but "held closed by a gap elsewhere" is what the paragraph above
+described right until the gap closed, so it is written down in
+`docs/known-issues.md` rather than left to be rediscovered.
 
 **[T-TASK-CAPTURE]** A `spawn` body may only use bindings that already existed
 when the enclosing `parallel` block began, plus the ones it declares itself.
@@ -8986,6 +9010,9 @@ fn main() {
 //! 5 9
 //! 6 [7]
 //! B! A!
+//! 42 [1, 99, 7]
+//! 5
+//! 6 6
 // A reference is written through the same way it is read through.
 //
 // The binding's own mutability is not the question — writing through a
@@ -9002,6 +9029,10 @@ type Holder = { r: ref Node }
 // `cannot access field `v` of `ref#0.0`` — so a node holding a reference to a
 // node was write-once. Reading the identical path worked.
 type Graph = { name: str, out: [ref Graph] }
+
+type Inner = { v: i64, xs: [i64] }
+
+type Outer = { r: ref Inner, tag: str }
 
 fn bump(rs: [ref Node]) {
     rs[0].v = rs[0].v + 1
@@ -9027,6 +9058,27 @@ fn main() {
     a.out[0].name = "B!"
     a.out[0].out[0].name = "A!"
     print("{b.name} {a.name}")
+    // Two reference hops, then a field, an index and a push. The compiled
+    // backend refused every write through a reference until it stopped
+    // rebuilding the referent and started writing into the slab: a rebuilt
+    // copy stored afterwards erased whatever an inner hop had already
+    // written, which is what the cycle above proves.
+    let i = ref(Inner{ v: 1, xs: [1, 2] })
+    let o = ref(Outer{ r: i, tag: "t" })
+    o.r.v = 42
+    o.r.xs[1] = 99
+    o.r.xs.push(7)
+    print("{i.v} {i.xs}")
+    // A reference read back out of a map is the same reference.
+    let m: Map[str, ref Inner] = {"a": i}
+    let got = m.get("a") ?? i
+    got.v = 5
+    print("{i.v}")
+    // And a copy of one writes to the same place: a reference copies as a
+    // slot id, which is what makes it shared ([T-REF-GENERATIONAL]).
+    let alias = o.r
+    alias.v = 6
+    print("{i.v} {o.r.v}")
 }
 ```
 

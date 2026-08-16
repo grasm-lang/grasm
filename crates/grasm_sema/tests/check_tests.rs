@@ -1732,14 +1732,20 @@ fn a_callbacks_parameter_row_is_checked_the_other_way() {
     );
 }
 
-/// A parallel operation's function may not write through a `ref` it captured
-/// ([T-PAR-MAP-PURE]).
+/// A parallel operation's function may not reach a `ref` from outside — read
+/// or written ([T-PAR-MAP-PURE]).
 ///
 /// An empty effect row is only half of purity. Mutation is not an effect, so
-/// nothing in the row system saw every element's call writing the same slot —
+/// nothing in the row system saw every element's call reaching the same slot —
 /// which is the interleaving the clause promises is a compile error.
+///
+/// Reading was refused later than writing, and had to be: a read through a
+/// reference takes a count on what it finds, and that count is not atomic. Once
+/// the native backend compiled writes through a reference, a program that only
+/// *read* one — `[1, 2].par_map(|x| x + acc.n)` — died with SIGTRAP, or
+/// panicked inside the runtime, or printed a different wrong answer each run.
 #[test]
-fn a_parallel_function_may_not_write_through_a_captured_ref() {
+fn a_parallel_function_may_not_reach_a_ref_from_outside() {
     let base = "type Acc = { n: i64, seen: [i64] }\n";
     check_err(
         &format!(
@@ -1747,7 +1753,7 @@ fn a_parallel_function_may_not_write_through_a_captured_ref() {
 let ys = [1, 2].par_map(|x| {{\n        acc.n = acc.n + x\n        x\n    }})\n    \
 print(\"{{ys}}\")\n}}\n"
         ),
-        "every element writes the same slot",
+        "inside a parallel operation",
     );
     // A mutating method through the same reference, and `par_filter` too.
     check_err(
@@ -1756,7 +1762,7 @@ print(\"{{ys}}\")\n}}\n"
 let ys = [1, 2].par_map(|x| {{\n        acc.seen.push(x)\n        x\n    }})\n    \
 print(\"{{ys}}\")\n}}\n"
         ),
-        "every element writes the same slot",
+        "inside a parallel operation",
     );
     check_err(
         &format!(
@@ -1764,7 +1770,7 @@ print(\"{{ys}}\")\n}}\n"
 let ys = [1, 2].par_filter(|x| {{\n        acc.n = acc.n + x\n        x > 0\n    }})\n    \
 print(\"{{ys}}\")\n}}\n"
         ),
-        "every element writes the same slot",
+        "inside a parallel operation",
     );
     // A `ref` created inside the function is one per element.
     check_ok(
@@ -1774,13 +1780,37 @@ let mine = ref(Acc{{ n: x, seen: [] }})\n        mine.n = mine.n * 2\n        \
 mine.n\n    }})\n    print(\"{{ys}}\")\n}}\n"
         ),
     );
-    // Reading a captured one shares nothing.
-    check_ok(
+    // Reading a captured one was allowed, on the reasoning that a read shares
+    // nothing. It shares the *reference count*: a read through a reference
+    // takes one on what it finds, and it is not atomic. This assertion was
+    // this test asserting the defect — harmless only while the native backend
+    // refused writes through a reference, and a SIGTRAP the day it stopped.
+    check_err(
         &format!(
             "{base}fn main() {{\n    let acc = ref(Acc{{ n: 7, seen: [] }})\n    \
 let ys = [1, 2].par_map(|x| x + acc.n)\n    print(\"{{ys}}\")\n}}\n"
         ),
+        "inside a parallel operation",
     );
+    // The element type reaching a reference is refused at the operation, since
+    // there is no mention of an outside binding to point at: every element
+    // *is* the shared thing.
+    for (elem, build) in [
+        ("[ref Acc]", "var rs: [ref Acc] = []\n    rs.push(acc)"),
+        ("[Holder]", "var rs: [Holder] = []\n    rs.push(Holder{ r: acc })"),
+    ] {
+        let _ = elem;
+        for op in ["par_map(|r| 1)", "par_filter(|r| true)"] {
+            check_err(
+                &format!(
+                    "{base}type Holder = {{ r: ref Acc }}\n\nfn main() {{\n    \
+let acc = ref(Acc{{ n: 7, seen: [] }})\n    {build}\n    \
+let ys = rs.{op}\n    print(\"{{ys.len()}}\")\n}}\n"
+                ),
+                "reaches a `ref`",
+            );
+        }
+    }
     // `map` is sequential, so the write is exactly what [T-REF-CAPTURE] allows.
     check_ok(
         &format!(
@@ -2950,4 +2980,35 @@ fn a_builtin_is_not_offered_as_a_method() {
         "fn double(n: i64) -> i64 {\n    n * 2\n}\n\nfn main() {\n    \
 print(\"{5.double()}\")\n}\n",
     );
+}
+
+/// A generic does not launder a `ref` into a parallel operation.
+///
+/// [T-PAR-MAP-PURE] refuses an element type that reaches a reference, but a
+/// type *parameter* says nothing at the operation — `fn go[T](xs: [T], f:
+/// fn(T) -> i64) { xs.par_map(f) }` hid `[ref Acc]` from the check entirely,
+/// which is the door back to the race the clause describes. Settled at the
+/// call sites, exactly as [T-MAP-KEY-GENERIC] settles map keys, and through a
+/// generic that forwards to a generic.
+#[test]
+fn a_generic_does_not_launder_a_ref_into_a_parallel_operation() {
+    let base = "type Acc = { n: i64 }\n\n\
+fn hit(q: ref Acc) -> i64 {\n    q.n\n}\n\nfn dbl(n: i64) -> i64 {\n    n * 2\n}\n\n";
+    let one = "fn go[T](xs: [T], f: fn(T) -> i64) -> [i64] {\n    xs.par_map(f)\n}\n\n";
+    // Forwarding one hop further still lands the constraint on the caller.
+    let two = "fn go[T](xs: [T], f: fn(T) -> i64) -> [i64] {\n    xs.par_map(f)\n}\n\n\
+fn outer[T](xs: [T], f: fn(T) -> i64) -> [i64] {\n    go(xs, f)\n}\n\n";
+    for (decls, call) in [(one, "go"), (two, "outer")] {
+        check_err(
+            &format!(
+                "{base}{decls}fn main() {{\n    let r = ref(Acc{{ n: 0 }})\n    \
+let rs = [r]\n    print(\"{{{call}(rs, hit).len()}}\")\n}}\n"
+            ),
+            "reaches a `ref`",
+        );
+        // The same generic at a type that holds none is untouched.
+        check_ok(&format!(
+            "{base}{decls}fn main() {{\n    print(\"{{{call}([1, 2], dbl)}}\")\n}}\n"
+        ));
+    }
 }

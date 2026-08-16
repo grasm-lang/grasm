@@ -5,7 +5,7 @@ Every defect that is known and not fixed, with its severity from
 to paste. S1 and S2 block a release; S3 and S4 do not, and this file is what
 makes shipping them honest rather than quiet.
 
-**Open S1: none. Open S2: none. Open S3: none. Open S4: none.**
+**Open S1: none. Open S2: none. Open S3: one, below. Open S4: none.**
 
 Closed on 2026-08-16: the effect-row fallback pool (and the mechanism behind
 it), writes through a `ref` under `--native`, returning a closure under
@@ -14,6 +14,27 @@ it), writes through a `ref` under `--native`, returning a closure under
 This file is not empty because nothing is wrong — it is empty because what was
 wrong is listed above as closed. The next round of evaluation is what refills
 it.
+
+## S3 — latent, parallel purity
+
+### A closure bound to a name can still write through a captured `ref`
+
+[T-PAR-MAP-PURE] (`experimental`). The clause names it: `let f = |x| { acc.n =
+1; x }` and then `xs.par_map(f)`. The purity proof looks at the function
+written *at* the operation, and a name is not one.
+
+Not reachable today — the native backend refuses `par_map` with a closure bound
+to a name (a §11 gap, gate-proven), and both other engines map sequentially. It
+is listed because that refusal is the only thing keeping it closed, and the
+sibling shape it was listed beside became a live race the day the backend
+stopped refusing writes through a `ref`: SIGTRAP, a runtime panic, and a
+different wrong answer on each run, at exit 0. The lesson is that "held closed
+by a gap elsewhere" is a state worth writing down.
+
+Every other route is refused: an element type that reaches a reference, any
+mention inside the function of a reference from outside (read or written), and
+a generic that carries one in — recorded on the generic's parameter and settled
+at each call site, propagating through generics that forward to generics.
 
 ## S3 — over-strict, effect-row inference
 
