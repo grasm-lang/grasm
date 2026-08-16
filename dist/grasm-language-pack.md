@@ -859,7 +859,11 @@ Reading a part out of a binding hands on *that* binding's sources. `let g =
 fs[0]` fell through to the pool of every function value in the function, so an
 unrelated closure elsewhere charged its effect to a call through `g` — while
 the same program written `for g in fs` was accepted, which is the pair this
-clause exists to close, back in the other direction.
+clause exists to close, back in the other direction. Where nothing is known
+about the part, the fallback is this function's own signature and nothing
+wider: reaching for every nameless row in the *program* meant an **unused**
+`type Loud = fn(i64) -> i64 / {io}` — in this file or in a dependency — refused
+a `/ {}` function whose own tuple component declares no effects.
 
 A `type` name counts as the type it stands for, here as everywhere
 ([T-TYPE-ALIAS]). This is inferred from written syntax rather than from
@@ -961,6 +965,16 @@ half — the ordinary case, wrapped in `Ok` on the way out — or the whole
 `T ! E`, which is what `Ok(v)` and `Err(e)` build. The second was rejected,
 so the constructors worked everywhere a fallible value could be *stored* and
 nowhere one was *produced*.
+
+The wrapping happens wherever the branch lands, not only on the way out of a
+function. A fallible function re-wraps its whole body, which masked a gap
+everywhere except the positions that do not — a `let` annotation, a struct
+field, a list element — where the interpreter stored the *raw* value:
+`let a: i64 ! E = if true { 1 } else { Ok(2) }` held `1` rather than `Ok(1)`,
+so it printed as `1`, compared unequal to `Ok(1)`, and matched no arm of a
+`match` over it. A native build, which wraps by produced type, answered
+correctly — the normative engine was the wrong one, at exit 0 with nothing on
+stderr.
 
 This is a rule about the *position*, not about how it was reached: an
 annotation naming `T ! E` — a `let`, a struct field, a parameter — accepts the
@@ -2795,12 +2809,28 @@ capability ceiling and `grasm publish` all cover the package's own directory,
 so an `entry` reaching out of it with `..` — or an absolute path — is refused
 rather than silently leaving all three describing a tree the program does not
 use. It has to end in `.gr` for the same reason: those three collect the
-package's `.gr` files, and an entry named anything else was executed but
+package's Grasm sources, and an entry named anything else was executed but
 recorded nowhere — `--locked` reported "up to date" after it changed, and
 `grasm publish` shipped a package that could not build into a slot that cannot
 be republished.
 Everything a package exports lives behind that one file, so a dependency's
 other modules are reached as `import mathlib.helpers`.
+
+"The package's sources" is **one** answer to all three questions, which it was
+not: the checksum skipped `target/` and every dot-directory, both of which are
+legal import path segments; the `.gr` extension was matched case-sensitively,
+so `HELPER.GR` — what `import helper` resolves to on a case-insensitive
+filesystem — was invisible to the checksum, to `publish` and to the ceiling
+alike; and `publish` walked from the entry's directory while the checksum
+walked from the package's, so one released version had two checksums. A
+directory symlink is followed once: a package holding two self-links took
+`deps` and `publish` from "34 copies into an immutable slot" to "never
+returns".
+
+A package with a `path` dependency cannot be published at all. Only the
+package's own directory travels, so the release named a dependency that
+resolved outside the version directory — every consumer failed on a version
+that cannot be republished.
 
 ```toml
 [package]

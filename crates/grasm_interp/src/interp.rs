@@ -65,6 +65,8 @@ pub struct Interp<'a, W: Write> {
     const_cache: HashMap<String, Value>,
     /// Integer literals the checker resolved to `f64`, by span start.
     float_literals: std::collections::HashSet<u32>,
+    /// See `Analysis::ok_wrapped`.
+    ok_wrapped: std::collections::HashSet<(u32, u32)>,
     /// Closure literals whose own type is fallible, by start offset.
     ///
     /// `fail(e)` raises the error branch of the enclosing fallible function,
@@ -516,6 +518,7 @@ impl<'a, W: Write> Interp<'a, W> {
         // — so no caller is asked to remember.
         let a = grasm_sema::check::check(module);
         me.float_literals = a.float_literals;
+        me.ok_wrapped = a.ok_wrapped;
         me.float_sums = a.float_sums;
         me.fallible_closures = a.fallible_closures;
         me
@@ -536,6 +539,12 @@ impl<'a, W: Write> Interp<'a, W> {
     /// wrong but not worse than it was.
     pub fn set_float_literals(&mut self, spans: std::collections::HashSet<u32>) {
         self.float_literals = spans;
+    }
+
+    /// The branch tails the checker accepted as the bare ok half, from
+    /// `Analysis`.
+    pub fn set_ok_wrapped(&mut self, spans: std::collections::HashSet<(u32, u32)>) {
+        self.ok_wrapped = spans;
     }
 
     /// The closure literals the checker typed as fallible, from `Analysis`.
@@ -641,6 +650,7 @@ impl<'a, W: Write> Interp<'a, W> {
             consts: HashMap::new(),
             const_cache: HashMap::new(),
             float_literals: std::collections::HashSet::new(),
+            ok_wrapped: std::collections::HashSet::new(),
             fallible_closures: std::collections::HashSet::new(),
             float_sums: std::collections::HashSet::new(),
             slab: Vec::new(),
@@ -1620,6 +1630,26 @@ impl<'a, W: Write> Interp<'a, W> {
     // ------------------------------------------------------------------
 
     fn eval_expr(&mut self, e: &Expr) -> EResult {
+        let v = self.eval_expr_inner(e)?;
+        // A branch that gave the bare ok half where the whole `T ! E` was
+        // wanted is wrapped here ([T-OK-ERR-RETURN]: "the branches giving only
+        // the ok half are the ones wrapped"). Only the checker knows which
+        // those are, so it hands the set over the way it hands over the float
+        // literals. A fallible *function* re-wraps on the way out, which
+        // masked this everywhere except the positions that do not — a `let`
+        // annotation, a struct field, a list element — where the raw value was
+        // stored: `let a: i64 ! E = if true { 1 } else { Ok(2) }` printed `1`,
+        // compared unequal to `Ok(1)`, and matched no arm of a `match` over
+        // it, while a native build answered correctly.
+        if self.ok_wrapped.contains(&(e.span().start, e.span().end))
+            && !matches!(v, Value::Ok(_) | Value::Err(_))
+        {
+            return Ok(Value::Ok(std::rc::Rc::new(v)));
+        }
+        Ok(v)
+    }
+
+    fn eval_expr_inner(&mut self, e: &Expr) -> EResult {
         match e {
             // An integer literal the checker placed in an `f64` position is
             // a float here, because [T-INT-TO-FLOAT] says the conversion

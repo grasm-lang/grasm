@@ -1721,9 +1721,14 @@ fn fn_sources<'a>(e: &'a Expr, ctx: &Ctx, current: &str, out: &mut Vec<FnSource<
                 }
             }
             if name.name.parse::<usize>().is_ok() {
-                if !ctx.elem_rows.is_empty() {
-                    out.push(FnSource::Declared(ctx.elem_rows.clone()));
-                }
+                // A tuple component. Unaccounted rather than charged from the
+                // program-wide pool: reaching for every nameless row anywhere
+                // meant an *unused* `type Loud = fn(i64) -> i64 / {io}` — in
+                // this file or in a dependency — refused a `/ {}` function
+                // whose own tuple component declares no effects. The clause
+                // says "scoped to that signature rather than to the program"
+                // in as many words, and `indirect_row`'s fallback does that.
+                out.push(FnSource::Unknown);
             } else if let Some(row) = ctx.field_rows.get(&name.name) {
                 out.push(FnSource::Declared(row.clone()));
             } else {
@@ -1733,14 +1738,11 @@ fn fn_sources<'a>(e: &'a Expr, ctx: &Ctx, current: &str, out: &mut Vec<FnSource<
                 out.push(FnSource::Unknown);
             }
         }
-        // `let g = fs[0]` names no field; every nameless row is a candidate.
-        Expr::Index { .. } => {
-            if ctx.elem_rows.is_empty() {
-                out.push(FnSource::Unknown);
-            } else {
-                out.push(FnSource::Declared(ctx.elem_rows.clone()));
-            }
-        }
+        // `let g = fs[0]` names no field. Unaccounted, so the fallback
+        // charges this function's *own* signature rather than every nameless
+        // row in the program — an unused alias elsewhere was refusing a
+        // `/ {}` function whose own element type declares nothing.
+        Expr::Index { .. } => out.push(FnSource::Unknown),
         Expr::List(items, _) | Expr::Tuple(items, _) => {
             for i in items {
                 fn_sources(i, ctx, current, out);
@@ -2553,23 +2555,30 @@ fn harvest_module(
 }
 
 /// The row a callee that is not a plain name may carry.
-fn computed_callee_row(callee: &Expr, ctx: &Ctx, out: &mut BTreeSet<String>) {
+///
+/// A numbered component and an index are keyed nowhere, so the row comes from
+/// the *enclosing function's own signature* — its list elements, its tuple
+/// components, its `Option` payloads. Taken from every nameless row in the
+/// program instead, an **unused** `type Loud = fn(i64) -> i64 / {io}`, in this
+/// file or in a dependency, refused a `/ {}` function whose own tuple
+/// component declares no effects. [T-FN-TYPE-ROW-CARRIED] says "scoped to that
+/// signature rather than to the program" in as many words.
+fn computed_callee_row(
+    callee: &Expr,
+    ctx: &Ctx,
+    fnb: &FnBindings,
+    out: &mut BTreeSet<String>,
+) {
     match callee {
-        // A tuple component is spelled with a number, and a tuple member's
-        // row has no field name to be keyed on — it is in the nameless pool
-        // with list elements and map values. Reading it as a *field* name
-        // found nothing, so `p.0(1)` carried no row at all while the struct,
-        // list, map and `let`-bound spellings were all charged.
         Expr::Field { name, .. } if name.name.parse::<usize>().is_ok() => {
-            out.extend(ctx.elem_rows.iter().cloned())
+            out.extend(fnb.signature_rows.iter().cloned())
         }
         Expr::Field { name, .. } => {
             if let Some(row) = ctx.field_rows.get(&name.name) {
                 out.extend(row.iter().cloned());
             }
         }
-        // An index names no field, so every nameless row is a candidate.
-        _ => out.extend(ctx.elem_rows.iter().cloned()),
+        _ => out.extend(fnb.signature_rows.iter().cloned()),
     }
 }
 
@@ -2796,7 +2805,7 @@ fn walk_expr(
                 // A call through something that is not a name: a struct
                 // field, a list element, a map value. The row is on the type
                 // it was declared with ([T-FN-TYPE-ROW-CARRIED]).
-                computed_callee_row(callee, ctx, out);
+                computed_callee_row(callee, ctx, fnb, out);
                 walk_expr(callee, current, active, ctx, fnb, out);
             }
             for a in args {
@@ -2828,8 +2837,9 @@ fn walk_expr(
             // Or a call of a function held in a field of that name
             // ([T-FIELD-CALL]): `b.f(x)` where `f: fn(i64) -> i64 / {io}`.
             if name.name.parse::<usize>().is_ok() {
-                // A tuple component: numbered, so keyed nowhere.
-                out.extend(ctx.elem_rows.iter().cloned());
+                // A tuple component: numbered, so keyed nowhere. From this
+                // function's own signature, not the program's pool.
+                out.extend(fnb.signature_rows.iter().cloned());
             } else if let Some(row) = ctx.field_rows.get(&name.name) {
                 out.extend(row.iter().cloned());
             }
@@ -2862,7 +2872,7 @@ fn walk_expr(
                 }
             }
             if !qualified {
-                computed_callee_row(e, ctx, out);
+                computed_callee_row(e, ctx, fnb, out);
                 walk_expr(recv, current, active, ctx, fnb, out);
             }
         }

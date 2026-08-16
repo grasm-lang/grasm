@@ -1796,3 +1796,46 @@ fn a_native_build_leaves_no_scratch_directory() {
         "a native build left a scratch directory behind"
     );
 }
+
+/// The bare ok half of a mixed branch reads back the same in every engine.
+///
+/// The interpreter stored the raw value in every annotated position that does
+/// not re-wrap — a `let`, a struct field, a list element — so it printed `3`
+/// where a native build printed `Ok(3)`, compared unequal to `Ok(3)`, and
+/// panicked `no match arm matched` on a `match` a native build satisfied. The
+/// normative engine was the wrong one, at exit 0 with nothing on stderr.
+#[test]
+fn a_mixed_branch_reads_back_the_same_in_every_engine() {
+    let w = Work::new("okwrap");
+    let dir = w.0.join("src");
+    std::fs::create_dir_all(&dir).unwrap();
+    let entry = dir.join("m.gr");
+    std::fs::write(
+        &entry,
+        "type E = | Bad\ntype Box = { v: i64 ! E }\n\nfn main() {\n    \
+let b = Box{ v: if true { 3 } else { Ok(4) } }\n    print(\"boxed: {b}\")\n    \
+let l: [i64 ! E] = [if true { 5 } else { Ok(6) }]\n    print(\"list: {l}\")\n    \
+let a: i64 ! E = if true { 1 } else { Ok(2) }\n    print(\"eq: {a == Ok(1)}\")\n    \
+let c: i64 ! E = match 1 {\n        1 -> 7\n        _ -> Ok(8)\n    }\n    \
+match c {\n        Ok(n) -> print(\"Ok({n})\")\n        Err(x) -> print(\"Err\")\n    }\n}\n",
+    )
+    .unwrap();
+    let p = entry.to_str().unwrap();
+    let (code, expected) = run(&["run", p]);
+    assert_eq!(code, 0, "{expected}");
+    assert_eq!(
+        expected, "boxed: Box{v: Ok(3)}\nlist: [Ok(5)]\neq: true\nOk(7)\n",
+        "the interpreter is normative and has to be right"
+    );
+    for extra in [vec![], vec!["--native"]] {
+        let bin = w.0.join(if extra.is_empty() { "b" } else { "n" });
+        let mut args = vec!["build", p];
+        args.extend(extra.iter().copied());
+        args.extend(["-o", bin.to_str().unwrap()]);
+        let (code, out) = run(&args);
+        assert_eq!(code, 0, "{args:?}: {out}");
+        let got = Command::new(&bin).output().expect("runs");
+        assert_eq!(String::from_utf8_lossy(&got.stdout), expected, "{args:?}");
+        let _ = std::fs::remove_file(&bin);
+    }
+}

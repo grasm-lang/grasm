@@ -1574,3 +1574,109 @@ fn the_boolean_literals_are_not_package_names() {
         assert!(err.contains("not a usable package name"), "{name}: {err}");
     }
 }
+
+/// One walk answers "this package's sources" for the checksum, for
+/// `grasm publish`, and for the capability scan.
+///
+/// Three walks meant one hole per disagreement: the checksum skipped
+/// `target/` and every dot-directory — both legal import path segments — the
+/// extension was matched case-sensitively so `HELPER.GR` was invisible to all
+/// three, and `publish` walked from the *entry's* directory while the checksum
+/// walked from the package's.
+#[test]
+fn one_walk_answers_for_the_checksum_publish_and_the_ceiling() {
+    let ws = Workspace::new("one_walk");
+    let dir = ws.package("ow", &manifest("ow", Some(""), &[]), PURE_SRC);
+    for rel in ["src/target/m.gr", "src/.hidden/h.gr", "src/HELPER.GR", "tools/gen.gr"] {
+        let p = dir.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, "pub fn v() -> i64 {\n    1\n}\n").unwrap();
+    }
+    let m = Manifest::load(&dir).unwrap();
+    let before = grasm_pkg::package_checksum(&m).unwrap();
+    for rel in ["src/target/m.gr", "src/.hidden/h.gr", "src/HELPER.GR", "tools/gen.gr"] {
+        std::fs::write(dir.join(rel), "pub fn v() -> i64 {\n    2\n}\n").unwrap();
+        let after = grasm_pkg::package_checksum(&m).unwrap();
+        assert_ne!(before, after, "{rel} is not in the checksum");
+        std::fs::write(dir.join(rel), "pub fn v() -> i64 {\n    1\n}\n").unwrap();
+    }
+    // And `source_files` is what all three consult.
+    let found = grasm_pkg::source_files(&dir).unwrap();
+    for rel in ["src/target/m.gr", "src/.hidden/h.gr", "src/HELPER.GR", "tools/gen.gr"] {
+        assert!(
+            found.iter().any(|p| p.ends_with(rel.rsplit('/').next().unwrap())),
+            "{rel} missing from {found:?}"
+        );
+    }
+}
+
+/// A directory symlink is followed once, not forever.
+///
+/// With no visited set a package holding one self-link published 34 copies of
+/// its own tree into an immutable slot, and one holding two never returned
+/// from either `deps` or `publish`.
+#[test]
+fn a_symlink_cycle_is_walked_once() {
+    let ws = Workspace::new("symlink_cycle");
+    let dir = ws.package("sc", &manifest("sc", Some(""), &[]), PURE_SRC);
+    #[cfg(unix)]
+    {
+        let src = dir.join("src");
+        std::os::unix::fs::symlink("..", src.join("a")).unwrap();
+        std::os::unix::fs::symlink("..", src.join("b")).unwrap();
+        let found = grasm_pkg::source_files(&dir).expect("terminates");
+        assert_eq!(found.len(), 1, "walked the cycle: {found:?}");
+    }
+}
+
+/// A package with a `path` dependency cannot be published.
+///
+/// Only the package's own directory travels, so the release named a
+/// dependency that resolved outside the version directory — every consumer
+/// failed on a version that cannot be republished.
+#[test]
+fn a_path_dependency_cannot_be_published() {
+    let ws = Workspace::new("publish_path");
+    let dir = ws.package(
+        "pp",
+        &manifest("pp", Some(""), &[("util", "../util")]),
+        PURE_SRC,
+    );
+    let reg = grasm_pkg::Registry::new(ws.0.join("reg"));
+    let err = match grasm_pkg::publish(&dir, &reg) {
+        Err(e) => e,
+        Ok(_) => panic!("a path dependency cannot travel into a registry"),
+    };
+    assert!(err.contains("cannot travel into a registry"), "{err}");
+}
+
+/// `grasm add` refuses a name a manifest cannot hold.
+///
+/// The name was written verbatim and unquoted, so `../evil` produced a
+/// dependency resolved outside the registry root — and a name containing a
+/// newline and a `[` appended a second `[package]` table, corrupting the
+/// manifest while `add` reported success.
+#[test]
+fn add_refuses_a_name_a_manifest_cannot_hold() {
+    let ws = Workspace::new("add_name");
+    let dir = ws.package("an", &manifest("an", Some(""), &[]), PURE_SRC);
+    let before = std::fs::read_to_string(dir.join("grasm.toml")).unwrap();
+    let req = grasm_pkg::VersionReq::parse("1.0.0").unwrap();
+    for name in [
+        "../evil",
+        "x]\n[package]\nname = \"hijacked\"\n[dependencies.y",
+        "my-lib",
+        "match",
+    ] {
+        let err = grasm_pkg::add_dependency(&dir, name, &req)
+            .expect_err("an unusable name cannot be added");
+        assert!(err.contains("not a usable dependency name"), "{name:?}: {err}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(dir.join("grasm.toml")).unwrap(),
+        before,
+        "a refused `add` must leave the manifest alone"
+    );
+    // A usable name still works.
+    assert!(grasm_pkg::add_dependency(&dir, "util", &req).is_ok());
+}

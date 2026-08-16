@@ -141,6 +141,7 @@ fn run_program_traced_here(
     // ([T-INT-TO-FLOAT]); this engine has no types of its own.
     let analysis = grasm_sema::check::check_program(program);
     interp.set_float_literals(analysis.float_literals);
+    interp.set_ok_wrapped(analysis.ok_wrapped);
     interp.set_fallible_closures(analysis.fallible_closures);
     interp.set_float_sums(analysis.float_sums);
     interp.program_args = program_args.to_vec();
@@ -174,6 +175,7 @@ fn run_program_here(
     // ([T-INT-TO-FLOAT]); this engine has no types of its own.
     let analysis = grasm_sema::check::check_program(program);
     interp.set_float_literals(analysis.float_literals);
+    interp.set_ok_wrapped(analysis.ok_wrapped);
     interp.set_fallible_closures(analysis.fallible_closures);
     interp.set_float_sums(analysis.float_sums);
     interp.program_args = program_args.to_vec();
@@ -218,6 +220,7 @@ fn test_program_here(
     // ([T-INT-TO-FLOAT]); this engine has no types of its own.
     let analysis = grasm_sema::check::check_program(program);
     interp.set_float_literals(analysis.float_literals);
+    interp.set_ok_wrapped(analysis.ok_wrapped);
     interp.set_fallible_closures(analysis.fallible_closures);
     interp.set_float_sums(analysis.float_sums);
     if opts.coverage {
@@ -439,6 +442,7 @@ fn run_examples_together(
         let mut sink = shared.clone();
         let mut interp = Interp::new_program(&files, &mut sink);
         interp.set_float_literals(analysis.float_literals.clone());
+        interp.set_ok_wrapped(analysis.ok_wrapped.clone());
         interp.set_fallible_closures(analysis.fallible_closures.clone());
         interp.set_float_sums(analysis.float_sums.clone());
         if coverage {
@@ -540,6 +544,7 @@ fn run_one_example(
     let outcome = {
         let mut interp = Interp::new_program(&files, &mut buf);
         interp.set_float_literals(analysis.float_literals.clone());
+        interp.set_ok_wrapped(analysis.ok_wrapped.clone());
         interp.set_fallible_closures(analysis.fallible_closures.clone());
         interp.set_float_sums(analysis.float_sums.clone());
         if coverage {
@@ -687,6 +692,7 @@ fn bench_program_here(
     // ([T-INT-TO-FLOAT]); this engine has no types of its own.
     let analysis = grasm_sema::check::check_program(program);
     interp.set_float_literals(analysis.float_literals);
+    interp.set_ok_wrapped(analysis.ok_wrapped);
     interp.set_fallible_closures(analysis.fallible_closures);
     interp.set_float_sums(analysis.float_sums);
     let mut results = Vec::new();

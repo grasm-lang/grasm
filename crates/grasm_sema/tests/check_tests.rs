@@ -2466,3 +2466,32 @@ fn pure(b: Bx) -> i64 / {} {\n    let f = b.opt ?? dflt\n    f(1)\n}\n\n\
 fn main() {\n    print(\"{pure(Bx{ opt: None })}\")\n}\n",
     );
 }
+
+/// A branch that gives the bare ok half is wrapped where it lands
+/// ([T-OK-ERR-RETURN]: "the branches giving only the ok half are the ones
+/// wrapped").
+///
+/// A fallible *function* re-wraps on the way out, which masked this everywhere
+/// except the positions that do not — a `let` annotation, a struct field, a
+/// list element — where the interpreter stored the raw value. The engines then
+/// disagreed, and the normative one was wrong: `let a: i64 ! E = if true { 1 }
+/// else { Ok(2) }` printed `1`, compared unequal to `Ok(1)`, and matched no arm
+/// of a `match` over it.
+#[test]
+fn a_bare_ok_half_is_wrapped_where_it_lands() {
+    let e = "type E = | Bad\n";
+    check_ok(&format!(
+        "{e}fn main() {{\n    let a: i64 ! E = if true {{ 1 }} else {{ Ok(2) }}\n    \
+match a {{\n        Ok(n) -> print(\"Ok({{n}})\")\n        Err(x) -> print(\"Err\")\n    }}\n}}\n"
+    ));
+    check_ok(&format!(
+        "{e}fn main() {{\n    let b: i64 ! E = match 1 {{\n        1 -> 7\n        _ -> Ok(8)\n    }}\n    \
+match b {{\n        Ok(n) -> print(\"Ok({{n}})\")\n        Err(x) -> print(\"Err\")\n    }}\n}}\n"
+    ));
+    // A binary tail: the wrap belongs to the whole branch, not to its leftmost
+    // leaf, which begins at the same offset.
+    check_ok(&format!(
+        "{e}fn f(n: i64) -> i64 ! E {{\n    let v: i64 ! E = if n == 0 {{\n        fail(Bad)\n    }} else {{\n        0 - 7\n    }}\n    v\n}}\n\n\
+fn main() {{\n    print(\"{{f(1) ?? 0 - 1}}\")\n}}\n"
+    ));
+}

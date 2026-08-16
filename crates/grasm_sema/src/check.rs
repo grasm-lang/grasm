@@ -28,6 +28,22 @@ pub struct Analysis {
     /// Spans are globally unique across a program — the loader gives each file
     /// a disjoint base — so the start offset identifies the literal.
     pub float_literals: std::collections::HashSet<u32>,
+    /// Start offsets of expressions that give the bare ok half where the whole
+    /// `T ! E` is wanted, and so have to be wrapped in `Ok` at run time.
+    ///
+    /// [T-OK-ERR-RETURN]: "the branches giving only the ok half are the ones
+    /// wrapped". A fallible *function* re-wraps on the way out, which masked
+    /// this everywhere except the positions that do not — a `let` annotation,
+    /// a struct field, a list element. There the interpreter stored the raw
+    /// value: `let a: i64 ! E = if true { 1 } else { Ok(2) }` printed `1`
+    /// rather than `Ok(1)`, compared unequal to `Ok(1)`, and matched no arm of
+    /// a `match` over it — while a native build, which wraps by produced type,
+    /// answered correctly. The normative engine was the wrong one.
+    /// Keyed by the *whole* span, not its start: a binary expression and its
+    /// leftmost leaf begin at the same offset, so `0 - 7` recorded as a
+    /// wrapped branch also matched the `0` inside it — and the interpreter
+    /// wrapped that instead, then tried to subtract `7` from `Ok(0)`.
+    pub ok_wrapped: std::collections::HashSet<(u32, u32)>,
     /// Start offsets of closure literals whose own type is fallible.
     ///
     /// `fail(e)` raises the error branch of the enclosing *fallible* function,
@@ -196,6 +212,7 @@ fn check_modules(files: &[ModuleView]) -> Analysis {
             .map(|(k, (t, _))| (k.clone(), TypeDisplay { ty: t, defs: &c.defs }.to_string()))
             .collect(),
         float_literals: c.float_literals,
+        ok_wrapped: c.ok_wrapped,
         fallible_closures: c
             .closure_types
             .iter()
@@ -246,6 +263,8 @@ struct Checker {
     fn_rows: HashMap<String, std::collections::BTreeSet<String>>,
     /// Each closure literal's row, keyed by span. See `rows_and_closures`.
     closure_rows: HashMap<u32, std::collections::BTreeSet<String>>,
+    /// See `Analysis::ok_wrapped`.
+    ok_wrapped: std::collections::HashSet<(u32, u32)>,
     /// Every closure literal's return type, by start offset, resolved once
     /// the whole program is typed.
     closure_types: HashMap<u32, Type>,
@@ -422,6 +441,7 @@ impl Checker {
             fns: HashMap::new(),
             fn_rows: HashMap::new(),
             closure_rows: HashMap::new(),
+            ok_wrapped: std::collections::HashSet::new(),
             closure_types: HashMap::new(),
             hof_closures: std::collections::HashSet::new(),
             handler_ids: std::collections::HashSet::new(),
@@ -2847,13 +2867,19 @@ afterwards has nowhere to send the effect — call it here, or return what it co
     /// mismatch, while the same expression *without* the annotation was
     /// refused as an unhandled failure whose help says to annotate it: two
     /// diagnostics pointing at each other and no way to write the program.
-    fn branch_want(&self, tail: Option<&Stmt>, want: &Type) -> Type {
+    fn branch_want(&mut self, tail: Option<&Stmt>, want: &Type) -> Type {
         let Type::Fallible(ok, _) = want else {
             return want.clone();
         };
         match tail {
             Some(Stmt::Expr(e)) if yields_whole_expr(e) || self.branch_calls_fallible(e) => {
                 want.clone()
+            }
+            // This branch gives the bare half, so its value has to be wrapped
+            // where it lands. Only the checker knows which branches those are.
+            Some(Stmt::Expr(e)) => {
+                self.ok_wrapped.insert((e.span().start, e.span().end));
+                (**ok).clone()
             }
             _ => (**ok).clone(),
         }
@@ -6023,6 +6049,14 @@ bind the component to a `var`, or use a struct when the parts have names worth w
                 if !self.uni.unify(&arm_ty, &result) {
                     match self.merge_fallible_branches(&arm_ty, &result) {
                         Some(t) => {
+                            // The arm that gave the bare half is the one
+                            // wrapped; the other already built the whole.
+                            if !matches!(
+                                self.uni.shallow_resolve(&arm_ty),
+                                Type::Fallible(..)
+                            ) {
+                                self.ok_wrapped.insert((arm.body.span().start, arm.body.span().end));
+                            }
                             let _ = self.uni.unify(&result, &t);
                         }
                         None => {
@@ -6060,6 +6094,9 @@ bind the component to a `var`, or use a struct when the parts have names worth w
                         if matches!(id.name.as_str(), "Ok" | "Err")));
                 if !whole {
                     let ok = (**ok).clone();
+                    // Accepted as the bare half, so its value is wrapped where
+                    // it lands ([T-OK-ERR-RETURN]).
+                    self.ok_wrapped.insert((body.span().start, body.span().end));
                     self.check_expr(body, &ok);
                     continue;
                 }

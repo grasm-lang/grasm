@@ -485,6 +485,21 @@ pub fn publish(pkg_dir: &Path, registry: &Registry) -> Result<Published, String>
         return Err(format!("{v}\n  refusing to publish a package that exceeds its own ceiling"));
     }
 
+    // A `path` dependency names a directory beside the package, and only the
+    // package travels into the registry. Published anyway, the release named a
+    // dependency that resolved to `<registry>/<name>/../util` — outside the
+    // version directory — so every consumer failed on a package that cannot be
+    // republished. Refused for the same reason an `entry` may not leave the
+    // package.
+    if let Some(dep) = manifest.dependencies.iter().find(|d| d.path.is_some()) {
+        return Err(format!(
+            "`{}` depends on `{}` by path, which cannot travel into a registry: \
+only this package's own directory is published, so the release would name a dependency \
+no consumer can resolve\n  give `{}` a `version` and publish it first",
+            manifest.name, dep.name, dep.name
+        ));
+    }
+
     let dest = registry.dir(&manifest.name, &version);
     if dest.join(MANIFEST_NAME).exists() {
         return Err(format!(
@@ -506,12 +521,9 @@ pub fn publish(pkg_dir: &Path, registry: &Registry) -> Result<Published, String>
     let mut files = 0;
     copy_into(&pkg_dir.join(MANIFEST_NAME), &dest.join(MANIFEST_NAME))?;
     files += 1;
-    let src_root = entry.parent().unwrap_or(pkg_dir);
-    let rel = src_root
-        .strip_prefix(pkg_dir)
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|_| PathBuf::from("src"));
-    files += copy_sources(src_root, &dest.join(rel))?;
+    // From the package root, which is what the checksum covers. Walking from
+    // the *entry's* directory dropped every `.gr` file beside `src/`.
+    files += copy_sources(pkg_dir, &dest)?;
 
     Ok(Published {
         name: manifest.name,
@@ -528,6 +540,20 @@ pub fn publish(pkg_dir: &Path, registry: &Registry) -> Result<Published, String>
 /// rewrites it to its own taste every time it touches it is a tool people stop
 /// using.
 pub fn add_dependency(pkg_dir: &Path, name: &str, req: &VersionReq) -> Result<String, String> {
+    // The name is written into the manifest verbatim, so it has to be one a
+    // manifest can hold — and one a consumer can write after `import`, which
+    // is the same rule a package's own name follows. Unchecked, `grasm add
+    // ../evil 1.0.0` wrote `[dependencies.../evil]` and resolved it outside
+    // the registry root; a name containing a newline and a `[` appended a
+    // second `[package]` table and corrupted the manifest while `add` reported
+    // success.
+    if !is_identifier(name) {
+        return Err(format!(
+            "`{name}` is not a usable dependency name: a consumer writes `import {name}`, \
+so it has to be a Grasm identifier — letters, digits and `_`, not starting with a digit, \
+and not a keyword"
+        ));
+    }
     let path = pkg_dir.join(MANIFEST_NAME);
     let text = std::fs::read_to_string(&path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
@@ -557,23 +583,24 @@ fn copy_into(from: &Path, to: &Path) -> Result<(), String> {
 }
 
 /// Every `.gr` file under `from`, preserving the tree so imports still resolve.
+/// Copies the package's sources into the registry, from the same enumeration
+/// the checksum uses.
+///
+/// Two walks meant two answers about one released version: a `.gr` file beside
+/// `src/` was hashed by the author and dropped here, so the registry copy and
+/// the published package had different checksums and there was no way to check
+/// one against the other.
 fn copy_sources(from: &Path, to: &Path) -> Result<usize, String> {
     let mut n = 0;
-    let entries =
-        std::fs::read_dir(from).map_err(|e| format!("cannot read {}: {e}", from.display()))?;
-    for e in entries.flatten() {
-        let path = e.path();
-        let name = e.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if name.starts_with('.') {
-            continue;
+    for path in source_files(from)? {
+        let rel = path.strip_prefix(from).unwrap_or(&path);
+        let dest = to.join(rel);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
         }
-        if path.is_dir() {
-            n += copy_sources(&path, &to.join(name))?;
-        } else if path.extension().and_then(|s| s.to_str()) == Some("gr") {
-            copy_into(&path, &to.join(name))?;
-            n += 1;
-        }
+        copy_into(&path, &dest)?;
+        n += 1;
     }
     Ok(n)
 }
@@ -1219,23 +1246,11 @@ fn package_modules(entry: &std::path::Path) -> Vec<std::path::PathBuf> {
     let Some(dir) = entry.parent() else {
         return Vec::new();
     };
-    let mut out = Vec::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&d) else {
-            continue;
-        };
-        for e in rd.flatten() {
-            let path = e.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().is_some_and(|x| x == "gr") && path != entry {
-                out.push(path);
-            }
-        }
-    }
-    out.sort();
-    out
+    source_files(dir)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| p != entry)
+        .collect()
 }
 
 /// The effect names a package's sources make available, for name checking.
@@ -1274,9 +1289,7 @@ pub struct LockEntry {
 /// Hashes every `.gr` file in a package, in sorted order, so the digest is
 /// stable across filesystems.
 pub fn package_checksum(manifest: &Manifest) -> Result<String, String> {
-    let mut files: Vec<PathBuf> = Vec::new();
-    collect_sources(&manifest.dir, &mut files)?;
-    files.sort();
+    let files = source_files(&manifest.dir)?;
     let mut buf: Vec<u8> = Vec::new();
     // The manifest is part of what a consumer depends on, and it was not part
     // of the checksum: three releases with identical sources and different
@@ -1301,22 +1314,65 @@ pub fn package_checksum(manifest: &Manifest) -> Result<String, String> {
     Ok(hash::sha256_hex(&buf))
 }
 
-fn collect_sources(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+/// Every Grasm source file in a package, sorted.
+///
+/// The lockfile's checksum, `grasm publish` and the capability scan are three
+/// claims about "this package's sources", and each used to enumerate them
+/// differently — which is one hole per disagreement:
+///
+///   * the checksum skipped `target/` and every dot-directory, and both are
+///     legal import path segments, so a module under one was executed and
+///     `--locked` still reported "up to date" after it changed;
+///   * the extension was matched case-sensitively, so `HELPER.GR` — which
+///     `import helper` resolves to on a case-insensitive filesystem — was
+///     invisible to all three, including the ceiling;
+///   * `publish` walked from the *entry's* directory and the checksum from the
+///     *package's*, so a `.gr` file beside `src/` was hashed by the author and
+///     dropped by `publish`: one released version, two checksums.
+///
+/// One walk answers all three. Symlinked directories are followed — a source
+/// tree may legitimately be assembled that way — but each real directory is
+/// visited once: a package containing two self-links took `deps` and `publish`
+/// from "34 copies into an immutable slot" to "never returns".
+pub fn source_files(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    collect_sources(root, &mut out, &mut seen)?;
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+fn collect_sources(
+    dir: &Path,
+    out: &mut Vec<PathBuf>,
+    seen: &mut std::collections::HashSet<PathBuf>,
+) -> Result<(), String> {
+    let real = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    if !seen.insert(real) {
+        return Ok(());
+    }
     let entries = std::fs::read_dir(dir)
         .map_err(|e| format!("cannot read directory {}: {e}", dir.display()))?;
     for entry in entries.flatten() {
         let path = entry.path();
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') || name == "target" {
-            continue;
-        }
         if path.is_dir() {
-            collect_sources(&path, out)?;
-        } else if path.extension().is_some_and(|e| e == "gr") {
+            collect_sources(&path, out, seen)?;
+        } else if is_grasm_source(&path) {
             out.push(path);
         }
     }
     Ok(())
+}
+
+/// Whether a path names a Grasm source file.
+///
+/// Case-insensitively: `import helper` resolves to `HELPER.GR` on a
+/// case-insensitive filesystem, so a file spelled that way is executable code
+/// and has to be counted as such.
+fn is_grasm_source(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|e| e.to_string_lossy().eq_ignore_ascii_case("gr"))
 }
 
 pub fn build_lock(resolution: &Resolution) -> Result<Vec<LockEntry>, String> {

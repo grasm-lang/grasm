@@ -443,12 +443,28 @@ capability ceiling and `grasm publish` all cover the package's own directory,
 so an `entry` reaching out of it with `..` — or an absolute path — is refused
 rather than silently leaving all three describing a tree the program does not
 use. It has to end in `.gr` for the same reason: those three collect the
-package's `.gr` files, and an entry named anything else was executed but
+package's Grasm sources, and an entry named anything else was executed but
 recorded nowhere — `--locked` reported "up to date" after it changed, and
 `grasm publish` shipped a package that could not build into a slot that cannot
 be republished.
 Everything a package exports lives behind that one file, so a dependency's
 other modules are reached as `import mathlib.helpers`.
+
+"The package's sources" is **one** answer to all three questions, which it was
+not: the checksum skipped `target/` and every dot-directory, both of which are
+legal import path segments; the `.gr` extension was matched case-sensitively,
+so `HELPER.GR` — what `import helper` resolves to on a case-insensitive
+filesystem — was invisible to the checksum, to `publish` and to the ceiling
+alike; and `publish` walked from the entry's directory while the checksum
+walked from the package's, so one released version had two checksums. A
+directory symlink is followed once: a package holding two self-links took
+`deps` and `publish` from "34 copies into an immutable slot" to "never
+returns".
+
+A package with a `path` dependency cannot be published at all. Only the
+package's own directory travels, so the release named a dependency that
+resolved outside the version directory — every consumer failed on a version
+that cannot be republished.
 
 ```toml
 [package]

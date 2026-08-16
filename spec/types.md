@@ -457,7 +457,11 @@ Reading a part out of a binding hands on *that* binding's sources. `let g =
 fs[0]` fell through to the pool of every function value in the function, so an
 unrelated closure elsewhere charged its effect to a call through `g` — while
 the same program written `for g in fs` was accepted, which is the pair this
-clause exists to close, back in the other direction.
+clause exists to close, back in the other direction. Where nothing is known
+about the part, the fallback is this function's own signature and nothing
+wider: reaching for every nameless row in the *program* meant an **unused**
+`type Loud = fn(i64) -> i64 / {io}` — in this file or in a dependency — refused
+a `/ {}` function whose own tuple component declares no effects.
 
 A `type` name counts as the type it stands for, here as everywhere
 ([T-TYPE-ALIAS]). This is inferred from written syntax rather than from
@@ -559,6 +563,16 @@ half — the ordinary case, wrapped in `Ok` on the way out — or the whole
 `T ! E`, which is what `Ok(v)` and `Err(e)` build. The second was rejected,
 so the constructors worked everywhere a fallible value could be *stored* and
 nowhere one was *produced*.
+
+The wrapping happens wherever the branch lands, not only on the way out of a
+function. A fallible function re-wraps its whole body, which masked a gap
+everywhere except the positions that do not — a `let` annotation, a struct
+field, a list element — where the interpreter stored the *raw* value:
+`let a: i64 ! E = if true { 1 } else { Ok(2) }` held `1` rather than `Ok(1)`,
+so it printed as `1`, compared unequal to `Ok(1)`, and matched no arm of a
+`match` over it. A native build, which wraps by produced type, answered
+correctly — the normative engine was the wrong one, at exit 0 with nothing on
+stderr.
 
 This is a rule about the *position*, not about how it was reached: an
 annotation naming `T ! E` — a `let`, a struct field, a parameter — accepts the
