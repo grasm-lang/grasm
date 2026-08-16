@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""Every spelling by which a C function can be reached, in both directions.
+
+Naming a C function is the permission to call it, so [T-EXTERN-VALUE] charges a
+bare mention what a call costs, and [T-UNSAFE-UFCS] says the method spelling is
+the same call as the free one. Two rounds found holes here that no other gate
+covers: `n.labs()` charged nothing while `labs(n)` charged `io`, so a package
+declaring `capabilities = ["unsafe"]` was reported as reaching no `io` while
+its binary called libc; and `unsafe { sqrt }` carried one onto `par_map`'s
+workers, which [T-PAR-MAP-PURE] calls a compile error rather than a race.
+
+Each spelling is checked twice, and the oracle is exact both ways:
+
+  * declared `/ {unsafe}` — the `io` a C function costs is missing, so
+    `grasm check` must **fail**;
+  * declared `/ {io, unsafe}` — everything performed is declared, so it must
+    **succeed**, and the program must run.
+
+A spelling that passes the first and fails the second is a hole; one that
+fails the second is a false positive. Both print the whole program, since the
+grid position alone does not say what to look at.
+
+    scripts/fuzz_extern.py [--keep]
+"""
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+GRASM = os.environ.get("GRASM") or os.path.join(ROOT, "target", "release", "grasm")
+
+DECL = "extern fn labs(x: i64) -> i64\n\n"
+
+# How the C function is reached, written inside an `unsafe` block whose value
+# is an `i64`. Each is the same call, so each costs the same row.
+SPELLINGS = [
+    ("direct", "labs(n)"),
+    ("method", "n.labs()"),
+    ("pipeline", "n |> labs"),
+    ("let-then-call", "let f = labs\n        f(n)"),
+    ("block-then-call", "let f = { labs }\n        f(n)"),
+    ("nested-block", "let f = { { labs } }\n        f(n)"),
+    ("map", "[n].map(labs)[0]"),
+    ("map-through-let", "let f = labs\n        [n].map(f)[0]"),
+    ("list-element", "let fs = [labs]\n        fs[0](n)"),
+    ("tuple-component", "let t = (labs, 1)\n        t.0(n)"),
+    ("option-payload", "let o = Some(labs)\n        (o ?? labs)(n)"),
+    ("closure-body", "let f = |x| labs(x)\n        f(n)"),
+    ("closure-value", "let f = |x| x\n        [n].map(labs)[0] + f(0)"),
+    ("fold", "[n].fold(0, |a, b| a + labs(b))"),
+    ("if-branch", "if n > 0 { labs(n) } else { labs(0 - n) }"),
+    ("match-arm", "match n > 0 {\n            true -> labs(n)\n            false -> 0\n        }"),
+    ("interpolation", "let s = \"{labs(n)}\"\n        s.len()"),
+    ("helper-arg", "call(labs, n)"),
+]
+
+# The helper's parameter declares the row it will be handed. A written type
+# is the contract ([T-FN-TYPE-ROW-CARRIED]), so a `fn(i64) -> i64` there
+# would rightly refuse a C function and the probe would measure the
+# generator rather than the compiler.
+HELPER = (
+    "fn call(f: fn(i64) -> i64 / {io, unsafe}, n: i64) -> i64 / {io, unsafe} {\n"
+    "    f(n)\n}\n\n"
+)
+
+# The row the enclosing function declares. `unsafe` alone is missing the `io` a
+# C function costs; the pair is complete.
+ROWS = [("{unsafe}", False), ("{io, unsafe}", True)]
+
+
+def build(spelling, row):
+    return (
+        DECL
+        + HELPER
+        + f"fn work(n: i64) -> i64 / {row} {{\n    unsafe {{\n        {spelling}\n    }}\n}}\n"
+        + "\nfn main() {\n    print(\"{work(0 - 5)}\")\n}\n"
+    )
+
+
+def run(cmd):
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    return p.returncode, p.stdout, p.stderr
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--keep", action="store_true")
+    args = ap.parse_args()
+
+    work = tempfile.mkdtemp(prefix="grasm_fuzz_extern_")
+    path = os.path.join(work, "p.gr")
+    leaks, false_positives, checked = [], [], 0
+    try:
+        for name, spelling in SPELLINGS:
+            for row, should_pass in ROWS:
+                src = build(spelling, row)
+                with open(path, "w") as f:
+                    f.write(src)
+                rc, out, err = run([GRASM, "check", path])
+                checked += 1
+                text = (out + err).strip()
+                if should_pass and rc != 0:
+                    false_positives.append(name)
+                    first = text.splitlines()[0] if text else ""
+                    print(f"FALSE POSITIVE {name}: {first}\n{src}")
+                elif not should_pass and rc == 0:
+                    leaks.append(name)
+                    print(f"LEAK {name}: a C function reached `/ {row}`\n{src}")
+                # A program that passes must also run.
+                if should_pass and rc == 0:
+                    rc2, _, err2 = run([GRASM, "run", path])
+                    if rc2 != 0:
+                        false_positives.append(f"{name}/run")
+                        print(f"RUN FAILED {name}: {err2.strip()}\n{src}")
+        print(
+            f"programs: {checked}   leaked: {len(leaks)}   "
+            f"false positives: {len(false_positives)}"
+        )
+    finally:
+        if args.keep:
+            print(f"kept: {work}")
+        else:
+            shutil.rmtree(work, ignore_errors=True)
+    sys.exit(1 if leaks or false_positives else 0)
+
+
+if __name__ == "__main__":
+    main()
