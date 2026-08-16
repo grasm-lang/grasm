@@ -739,14 +739,15 @@ xs.par_map(f) }` hid `[ref Acc]` from the check entirely, which is a door
 straight back to the race. It propagates through a generic that forwards to a
 generic.
 
-One shape still reaches past this, which is part of why the rule is
-[experimental](stability.md): a function that writes through a captured `ref`
-but is bound to a name first — `let f = |x| { acc.n = 1; x }`, then
-`xs.par_map(f)`. The native backend refuses that spelling for an unrelated
-reason (§11) and both other engines map sequentially, so it is not reachable
-today — but "held closed by a gap elsewhere" is what the paragraph above
-described right until the gap closed, so it is written down in
-`docs/known-issues.md` rather than left to be rediscovered.
+*And a name carries what the closure behind it reaches.* `let f = |x| { acc.n =
+1; x }` and then `xs.par_map(f)` was the last shape to reach past this rule, on
+the argument that the native backend refused that spelling for an unrelated
+reason and both other engines map sequentially. That is the same argument the
+paragraph above made, right until it stopped being true — so the closure is
+recorded where it is written and the name is refused where it is used. Settled
+at the end of the analysis, because a closure whose parameter types nothing
+fixes has its body checked after the `let` that binds it, and sometimes after
+the very call that fixed them.
 
 **[T-TASK-CAPTURE]** A `spawn` body may only use bindings that already existed
 when the enclosing `parallel` block began, plus the ones it declares itself.

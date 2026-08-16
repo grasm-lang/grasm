@@ -207,6 +207,7 @@ fn check_modules_in(
     // parameters as map keys is known ([T-MAP-KEY-GENERIC]).
     c.flush_key_checks();
     c.flush_par_checks();
+    c.flush_par_name_checks();
     c.flush_discards();
     // Resolved now: unification is finished, so a literal's element type has
     // whatever answer the whole body gave it.
@@ -455,6 +456,20 @@ struct Checker {
     /// Scope depth at which each enclosing closure body begins. A binding
     /// found below the innermost of these is captured, not local.
     closure_floors: Vec<usize>,
+    /// Whether the closure literal currently being checked reaches a `ref`
+    /// declared outside it. A closure written *at* a parallel operation is
+    /// checked there; one bound to a name first is not, and that is the shape
+    /// [T-PAR-MAP-PURE] lists as still reaching past the rule.
+    closure_touches_outside_ref: bool,
+    /// Closure literals, by start offset, that reach a `ref` from outside
+    /// themselves. Filled when the body is checked, which for a closure whose
+    /// parameter types nothing fixes happens *after* the `let` that binds it —
+    /// so the answer is recorded and applied at the end.
+    ref_touching_closures: std::collections::HashSet<u32>,
+    /// Name → the closure literal it was bound to.
+    let_closure_span: HashMap<String, u32>,
+    /// Parallel operations given a name, held until every body is checked.
+    pending_par_name_checks: Vec<(u32, String, Span)>,
     /// Scope depth at which the innermost enclosing *parallel* function began,
     /// if any — the function handed to `par_map` or `par_filter`. A `ref`
     /// declared below it is shared by every element's call, and writing
@@ -520,6 +535,9 @@ struct DeferredClosure {
     body: Expr,
     param_tys: Vec<Type>,
     ret: Type,
+    /// Start offset of the closure literal, so what the body turns out to
+    /// reach can be recorded against the name it was bound to.
+    at: u32,
 }
 
 impl Checker {
@@ -568,6 +586,10 @@ impl Checker {
             module_imports: HashMap::new(),
             scopes: Vec::new(),
             closure_floors: Vec::new(),
+            closure_touches_outside_ref: false,
+            ref_touching_closures: std::collections::HashSet::new(),
+            let_closure_span: HashMap::new(),
+            pending_par_name_checks: Vec::new(),
             parallel_fn_floor: None,
             current_generics: Vec::new(),
             deferred_closures: Vec::new(),
@@ -1915,6 +1937,7 @@ is a failure nothing reports",
     fn check_deferred_closure(&mut self, d: DeferredClosure) {
         self.scopes.push(HashMap::new());
         self.closure_floors.push(self.scopes.len() - 1);
+        let saved_touch = std::mem::replace(&mut self.closure_touches_outside_ref, false);
         for (p, t) in d.params.iter().zip(&d.param_tys) {
             self.bind(p, t.clone(), false);
         }
@@ -1945,6 +1968,10 @@ is a failure nothing reports",
         self.settle_deferred_fields();
         self.closure_floors.pop();
         self.scopes.pop();
+        if self.closure_touches_outside_ref {
+            self.ref_touching_closures.insert(d.at);
+        }
+        self.closure_touches_outside_ref = saved_touch;
         // Nothing ever said what the parameters are. [T-FN-TYPE]: "A closure
         // bound to a name and never called, with no function type to take
         // them from, still has nothing to infer from and is an error."
@@ -2012,6 +2039,10 @@ is a failure nothing reports",
                 init,
                 ..
             } => {
+                // Whether the initializer is a closure that reaches a `ref`
+                // from outside itself, so that handing this name to a parallel
+                // operation can be refused the way the inline spelling is.
+                let saw_ref = std::mem::replace(&mut self.closure_touches_outside_ref, false);
                 let bound_ty = if let Some(te) = ty {
                     let gs = self.current_generics.clone();
                     let want = self.resolve_type(te, &gs);
@@ -2030,6 +2061,12 @@ is a failure nothing reports",
                     }
                     t
                 };
+                if let Expr::Closure { span, .. } = init {
+                    self.let_closure_span.insert(name.name.clone(), span.start);
+                } else {
+                    self.let_closure_span.remove(&name.name);
+                }
+                self.closure_touches_outside_ref = saw_ref;
                 self.bind(name, bound_ty, *mutable);
                 Type::Unit
             }
@@ -3370,6 +3407,21 @@ write back to — copy it into a local first, as in `var {} = {}`",
         // safer, because a read takes a count on what it finds and the count
         // is not atomic. Several workers reaching the same slot at once made a
         // program `check` accepted die with SIGTRAP.
+        if let Expr::Ident(id) = e {
+            // Inside a closure literal, reaching a `ref` from outside it.
+            // Remembered rather than refused: a closure may do this perfectly
+            // well ([T-REF-CAPTURE]); it is handing it to a parallel operation
+            // that is the race.
+            let outside = self.closure_floors.last().is_some_and(|floor| {
+                self.scopes
+                    .iter()
+                    .rposition(|sc| sc.contains_key(&id.name))
+                    .is_some_and(|at| at < *floor)
+            });
+            if outside && self.carries_ref(&t) {
+                self.closure_touches_outside_ref = true;
+            }
+        }
         if let (Some(floor), Expr::Ident(id)) = (self.parallel_fn_floor, e) {
             let declared_at = self.scopes.iter().rposition(|sc| sc.contains_key(&id.name));
             if declared_at.is_some_and(|at| at < floor) && self.carries_ref(&t) {
@@ -5679,6 +5731,30 @@ Perform the effect after the closing brace, or yield a number and do the work ou
         }
     }
 
+    /// Refuses a parallel operation handed the *name* of a closure that
+    /// reaches a `ref` from outside itself.
+    ///
+    /// Deferred to the end because a closure whose parameter types nothing
+    /// fixes has its body checked after the `let` that binds it — and after
+    /// the call that fixed them, which may be the parallel operation itself.
+    fn flush_par_name_checks(&mut self) {
+        let pending = std::mem::take(&mut self.pending_par_name_checks);
+        for (at, name, span) in pending {
+            if self.ref_touching_closures.contains(&at) {
+                self.error_help(
+                    span,
+                    format!(
+                        "`{name}` reaches a `ref` from outside itself, so it cannot run in \
+parallel"
+                    ),
+                    "elements are processed on several cores, so two of them reaching the same \
+slot would race — use `map` or `filter`, or build the reference inside the function, one per \
+element",
+                );
+            }
+        }
+    }
+
     /// Applies each generic's recorded `ref`-in-parallel constraint to its
     /// call sites, propagating through generics that forward to generics.
     fn flush_par_checks(&mut self) {
@@ -5824,6 +5900,14 @@ same slot would race — pass a type that holds no `ref`, or use `map` inside th
     /// parallelism deterministic, and that has to include the one write the
     /// closure rules deliberately allow ([T-REF-CAPTURE]).
     fn check_parallel_fn(&mut self, arg: &Expr, want: &Type) {
+        // A closure bound to a name first. The purity proof looks at the
+        // function written *at* the operation, and a name is not one — the
+        // shape [T-PAR-MAP-PURE] listed as still reaching past the rule.
+        if let Expr::Ident(id) = arg {
+            if let Some(at) = self.let_closure_span.get(&id.name).copied() {
+                self.pending_par_name_checks.push((at, id.name.clone(), id.span));
+            }
+        }
         let outer = self.parallel_fn_floor.replace(self.scopes.len());
         self.check_expr(arg, want);
         self.parallel_fn_floor = outer;
@@ -6799,6 +6883,7 @@ bind the component to a `var`, or use a struct when the parts have names worth w
                     body: (**body).clone(),
                     param_tys: param_tys.clone(),
                     ret: ret.clone(),
+                    at: span.start,
                 });
                 self.closure_types.insert(span.start, ret.clone());
                 // Keyed by the body too. The backend identifies a closure by
@@ -6820,6 +6905,9 @@ bind the component to a `var`, or use a struct when the parts have names worth w
         }
         self.scopes.push(HashMap::new());
         self.closure_floors.push(self.scopes.len() - 1);
+        // Per closure: an inner one reaching a `ref` says nothing about the
+        // one around it.
+        let saved_touch = std::mem::replace(&mut self.closure_touches_outside_ref, false);
         for (p, t) in params.iter().zip(&param_tys) {
             self.bind(p, t.clone(), false);
         }
@@ -6906,6 +6994,10 @@ bind the component to a `var`, or use a struct when the parts have names worth w
         self.deferred_closures.pop();
         self.closure_floors.pop();
         self.scopes.pop();
+        if self.closure_touches_outside_ref {
+            self.ref_touching_closures.insert(span.start);
+        }
+        self.closure_touches_outside_ref = saved_touch;
         self.closure_types.insert(span.start, ret.clone());
         self.closure_types.insert(body.span().start, ret.clone());
         Type::Fn {

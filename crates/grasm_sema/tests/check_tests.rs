@@ -3073,3 +3073,42 @@ type W = { inner: Option[ref Acc] }\n\n";
         );
     }
 }
+
+/// A closure bound to a name carries its `ref` with it.
+///
+/// The last shape [T-PAR-MAP-PURE] listed as reaching past the rule: the
+/// purity proof looks at the function written *at* the operation, and a name
+/// is not one. It was held closed only by the native backend refusing
+/// `par_map` with a name-bound closure — the same "held closed by a gap
+/// elsewhere" argument that stopped being true the day the backend started
+/// compiling writes through a reference.
+///
+/// Settled at the end of the analysis, because a closure whose parameter types
+/// nothing fixes has its body checked after the `let` that binds it — and
+/// after the call that fixed them, which may be the parallel operation itself.
+#[test]
+fn a_name_bound_closure_carries_its_ref_into_a_parallel_operation() {
+    let base = "type Acc = { n: i64 }\n\n";
+    for (bind, op) in [
+        ("let f = |x| {\n        acc.n = acc.n + x\n        x\n    }", "par_map(f)"),
+        ("let f = |x| x + acc.n", "par_map(f)"),
+        ("let f = |x| acc.n > x", "par_filter(f)"),
+    ] {
+        check_err(
+            &format!(
+                "{base}fn main() {{\n    let acc = ref(Acc{{ n: 0 }})\n    {bind}\n    \
+print(\"{{[1, 2].{op}}}\")\n}}\n"
+            ),
+            "cannot run in parallel",
+        );
+    }
+    // A name-bound closure that touches no reference is untouched…
+    check_ok(&format!(
+        "{base}fn main() {{\n    let g = |x| x * 2\n    print(\"{{[1, 2].par_map(g)}}\")\n}}\n"
+    ));
+    // …and one that does may still be used sequentially ([T-REF-CAPTURE]).
+    check_ok(&format!(
+        "{base}fn main() {{\n    let acc = ref(Acc{{ n: 1 }})\n    let h = |x| x + acc.n\n    \
+print(\"{{[1, 2].map(h)}}\")\n}}\n"
+    ));
+}
