@@ -3012,3 +3012,45 @@ let rs = [r]\n    print(\"{{{call}(rs, hit).len()}}\")\n}}\n"
         ));
     }
 }
+
+/// The `ref`-in-parallel rule refuses the shared shapes and nothing else.
+///
+/// Three refusals were added at once — an element type reaching a reference,
+/// a mention of an outside reference, and a generic carrying one in — and a
+/// rule that also refuses correct programs costs a user a workaround for a
+/// race they did not write. Sequential `map`, `filter` and `fold` may still
+/// write through a captured reference ([T-REF-CAPTURE]); a reference created
+/// *inside* a parallel function is one per element; and a reference merely in
+/// scope constrains nothing.
+#[test]
+fn the_parallel_ref_rule_refuses_only_what_is_shared() {
+    let base = "type Acc = { n: i64 }\ntype Pair = { a: i64, b: str }\n\n";
+    for body in [
+        // Sequential combinators, writing through a captured reference.
+        "let acc = ref(Acc{ n: 0 })\n    let ys = [1, 2].map(|x| {\n        \
+acc.n = acc.n + x\n        x\n    })\n    print(\"{ys} {acc.n}\")",
+        "let acc = ref(Acc{ n: 1 })\n    let zs = [1, 2].filter(|x| acc.n > 0)\n    \
+print(\"{zs}\")",
+        "let acc = ref(Acc{ n: 1 })\n    let s = [1, 2].fold(0, |a, b| a + b + acc.n)\n    \
+print(\"{s}\")",
+        // A reference created inside the parallel function: one per element.
+        "let ps = [1, 2].par_map(|x| {\n        let mine = ref(Acc{ n: x })\n        \
+mine.n = mine.n * 2\n        mine.n\n    })\n    print(\"{ps}\")",
+        // One merely in scope.
+        "let acc = ref(Acc{ n: 5 })\n    let qs = [1, 2].par_map(|x| x * 2)\n    \
+print(\"{qs} {acc.n}\")",
+        // Element types that hold no reference, through every carrier.
+        "let ps = [Pair{ a: 1, b: \"x\" }].par_map(|p| p.a * 10)\n    print(\"{ps}\")",
+        "let ls = [[1], [2]].par_map(|l| l.sum())\n    print(\"{ls}\")",
+        "let os: [Option[i64]] = [Some(1), None]\n    \
+print(\"{os.par_map(|o| o ?? 0)}\")",
+        "let ts = [(1, \"a\")].par_map(|t| t.0)\n    print(\"{ts}\")",
+    ] {
+        check_ok(&format!("{base}fn main() {{\n    {body}\n}}\n"));
+    }
+    // A generic whose parallel parameter is instantiated at a plain type.
+    check_ok(
+        "fn go[T](xs: [T]) -> [i64] {\n    xs.par_map(|x| 1)\n}\n\nfn main() {\n    \
+print(\"{go([1, 2])}\")\n    print(\"{go([\"a\"])}\")\n}\n",
+    );
+}
