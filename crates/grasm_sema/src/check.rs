@@ -6498,7 +6498,34 @@ bind the component to a `var`, or use a struct when the parts have names worth w
             if !self.hof_closures.contains(&span.start) {
                 self.fn_err = None;
             }
-            self.infer_expr(body)
+            // Checked against the written result type, not merely inferred:
+            // "a closure literal is checked the same way a named function is"
+            // ([T-FN-TYPE-ROW]), and a named function's body *is* checked
+            // against its declared return. Inferred instead, the expected type
+            // never reached the literals in the tail, so `|x| 3` against
+            // `fn(i64) -> f64` was refused while `fn named(x: i64) -> f64 { 3 }`
+            // — the same body, one closure apart — was accepted, and so was
+            // `|x| { return 3 }`. That is the asymmetry
+            // [T-INT-TO-FLOAT-CARRIED] records as fixed for named functions,
+            // still present here.
+            match want_ret
+                .clone()
+                .filter(|t| !matches!(self.uni.shallow_resolve(t), Type::Var(_) | Type::Error))
+            {
+                Some(want) => {
+                    let mark = self.diags.len();
+                    self.check_expr(body, &want);
+                    if self.diags.len() > mark {
+                        // Not a fit: report it the way the caller would, from
+                        // the type the body actually has.
+                        self.diags.truncate(mark);
+                        self.infer_expr(body)
+                    } else {
+                        want
+                    }
+                }
+                None => self.infer_expr(body),
+            }
         };
         self.fn_err = saved_err;
         self.fn_ret = saved_fn_ret;

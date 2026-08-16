@@ -450,6 +450,12 @@ position with no field name — its list elements, its tuple components, its
 wider pool charged `io` to a function whose own element type declares no
 effects, on the strength of an unrelated declaration elsewhere in the file.
 
+Reading a part out of a binding hands on *that* binding's sources. `let g =
+fs[0]` fell through to the pool of every function value in the function, so an
+unrelated closure elsewhere charged its effect to a call through `g` — while
+the same program written `for g in fs` was accepted, which is the pair this
+clause exists to close, back in the other direction.
+
 A `type` name counts as the type it stands for, here as everywhere
 ([T-TYPE-ALIAS]). This is inferred from written syntax rather than from
 resolved types, and a row behind a name was not there: `f: Cb` for
@@ -462,7 +468,11 @@ function doing the naming, whether or not the call is written there. Holding a
 function is the permission to call it — the rule [T-EXTERN-VALUE] states for a
 C function, and it holds for every function for the same reason.
 
-*And only when it is a function.* A local of that name is a different thing:
+*And only when it is a function.* Scope decides at a **call** as well as at a
+mention: the two arms disagreed, so a *parameter* spelled like a private helper
+was charged that helper's row — a `capabilities = []` package broke in every
+consumer, and `par_map`'s purity proof failed, over one parameter's spelling.
+A local of that name is a different thing:
 a parameter spelled like a private helper charged that helper's row, which
 broke a `capabilities = []` package in every consumer and failed a `par_map`
 purity proof over a closure parameter's spelling. Scope decides, here as
@@ -526,6 +536,14 @@ gap: a `/ {}` function printed, `[T-PAR-MAP-PURE]`'s compile-time proof
 passed, a C function reached libc from a declared-empty row, a closure
 carrying a handled effect left its `with` block inside a list, and a package
 declaring `capabilities = []` exported one.
+
+"The same way" is about the *body* too: a named function's is checked against
+its declared return, and a closure's was merely inferred. So the expected type
+never reached the literals in its tail — `|x| 3` against `fn(i64) -> f64` was
+refused while `fn named(x: i64) -> f64 { 3 }`, the same body one closure apart,
+was accepted, and so was `|x| { return 3 }`. That is the asymmetry
+[T-INT-TO-FLOAT-CARRIED] records as fixed for named functions, still present
+one shape in.
 
 **[T-OK-ERR]** `Ok(v)` and `Err(e)` build a `T ! E` directly. They are the
 constructors matching what `match` already destructures, and without them a

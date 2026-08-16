@@ -1084,16 +1084,20 @@ fn par_fn_row(
     out: &mut BTreeSet<String>,
 ) {
     if let Expr::Ident(id) = func {
+        // A local of that name is a different thing, scope decides, and a
+        // parameter spelled like a private helper failed this purity proof
+        // over its spelling ([T-FN-VALUE-ROW]).
+        let shadowed = fnb.shadowed(&id.name, id.span.start);
         // `xs.par_map(sqrt)` where `sqrt` is a C function. Naming one is
         // handing over the right to call it, so it carries the same `io` a
         // call does — otherwise the row was empty and the purity proof, the
         // effect row and the capability ceiling all passed something that
         // reaches libc.
-        if ctx.externs.contains(&format!("{current}::{}", id.name)) {
+        if !shadowed && ctx.externs.contains(&format!("{current}::{}", id.name)) {
             out.insert(IO.to_string());
             return;
         }
-        if let Some(qual) = ctx.resolve_call(current, &id.name) {
+        if let (false, Some(qual)) = (shadowed, ctx.resolve_call(current, &id.name)) {
             if let Some(row) = ctx.rows.get(&qual) {
                 out.extend(row.iter().cloned());
             }
@@ -1656,6 +1660,20 @@ impl<'a> FnBindings<'a> {
     }
 }
 
+/// The binding an expression reads a *part* out of: `fs[0]`, `t.1`, `b.f`.
+///
+/// Only a path of reads, so `mk()[0]` and `xs[i] + ys[j]` answer `None` — the
+/// point is to hand on the sources of one known binding, not to guess.
+fn binding_root(e: &Expr) -> Option<&str> {
+    match e {
+        Expr::Index { recv, .. } | Expr::Field { recv, .. } => match &**recv {
+            Expr::Ident(id) => Some(&id.name),
+            inner => binding_root(inner),
+        },
+        _ => None,
+    }
+}
+
 /// Function values reachable from an initializer expression.
 fn fn_sources<'a>(e: &'a Expr, ctx: &Ctx, current: &str, out: &mut Vec<FnSource<'a>>) {
     match e {
@@ -2078,6 +2096,24 @@ fn collect_fn_bindings<'a>(b: &'a Block, ctx: &Ctx, current: &str, fnb: &mut FnB
     for stmt in &b.stmts {
         match stmt {
             Stmt::Let { name, ty, init, .. } => {
+                // Reading an element or a field out of a binding this pass
+                // already knows hands on *that* binding's sources — not the
+                // whole body's. `let g = fs[0]` fell through to the pool of
+                // every function value in the function, so an unrelated
+                // closure elsewhere charged its effect to a call through `g`:
+                // the same program with `for g in fs` was accepted, which is
+                // the pair [T-FN-TYPE-ROW-CARRIED] names as the defect it was
+                // written to close.
+                if let Some(root) = binding_root(init) {
+                    if let Some(src) = fnb.by_name.get(root) {
+                        let carried: Vec<FnSource<'a>> =
+                            src.iter().map(FnSource::clone_of).collect();
+                        fnb.bind_name(&name.name, name.span.start);
+                        fnb.any.extend(carried.iter().map(FnSource::clone_of));
+                        fnb.by_name.insert(name.name.clone(), carried);
+                        continue;
+                    }
+                }
                 // An annotation is a written type in this function, exactly as
                 // a parameter's is, and the fallback pool was seeded only from
                 // the signature. So `let o: Option[fn(i64) -> i64 / {io}]` in
@@ -2687,7 +2723,17 @@ fn walk_expr(
                 {
                     out.insert(IO.to_string());
                 }
-                if let Some(qual) = ctx.resolve_call(current, &id.name) {
+                // A local of that name is a different thing, and scope
+                // decides — the mention arm has always said so and the call
+                // arm did not, so a *parameter* spelled like a private helper
+                // was charged that helper's row: a `capabilities = []`
+                // package broke in every consumer, and `par_map`'s purity
+                // proof failed, over one parameter's spelling
+                // ([T-FN-VALUE-ROW]).
+                let shadowed = fnb.shadowed(&id.name, id.span.start);
+                if let (false, Some(qual)) =
+                    (shadowed, ctx.resolve_call(current, &id.name))
+                {
                     contribute(&qual, active, ctx, out);
                 } else if fnb.knows(&id.name) || !is_builtin_name(&id.name) {
                     // A call through a name that is not a top-level function:

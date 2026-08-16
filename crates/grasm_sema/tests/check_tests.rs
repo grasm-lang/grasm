@@ -2319,3 +2319,87 @@ fn pure(o: Option[fn(i64) -> i64]) -> i64 / {} {\n    let g = o ?? dbl\n    g(3)
 fn main() {\n    print(\"{pure(None)}\")\n}\n",
     );
 }
+
+/// A local spelled like a top-level function is a different thing — scope
+/// decides, at a *call* as well as at a mention ([T-FN-VALUE-ROW]).
+///
+/// The mention arm checked shadowing and the call arm did not, so a parameter
+/// named after a private helper was charged that helper's row: a
+/// `capabilities = []` package broke in every consumer, and `par_map`'s
+/// purity proof failed, over one parameter's spelling.
+#[test]
+fn a_local_spelled_like_a_function_is_not_that_function() {
+    let head = "fn shout(n: i64) -> i64 {\n    print(\"shout {n}\")\n    n\n}\n\n";
+    check_ok(&format!(
+        "{head}fn quiet(shout: fn(i64) -> i64) -> i64 / {{}} {{\n    shout(1)\n}}\n\n\
+fn main() {{\n    print(\"{{quiet(|x| x + 1)}}\")\n}}\n"
+    ));
+    check_ok(&format!(
+        "{head}fn twice(shout: fn(i64) -> i64) -> [i64] {{\n    [1, 2].par_map(shout)\n}}\n\n\
+fn main() {{\n    print(\"{{twice(|x| x * 2)}}\")\n}}\n"
+    ));
+    // The real function is still charged, called and named.
+    check_err(
+        &format!("{head}fn quiet() -> i64 / {{}} {{\n    shout(1)\n}}\n\nfn main() {{\n    print(\"{{quiet()}}\")\n}}\n"),
+        "not in its declared row",
+    );
+    check_err(
+        &format!("{head}fn main() {{\n    print(\"{{[1, 2].par_map(shout)}}\")\n}}\n"),
+        "effect-free function",
+    );
+}
+
+/// Reading an element out of a known binding hands on *that* binding's
+/// sources, not every function value in the body.
+///
+/// `let g = fs[0]` fell through to the whole-body pool, so an unrelated
+/// closure elsewhere charged its effect to a call through `g` — while the same
+/// program with `for g in fs` was accepted, which is the pair
+/// [T-FN-TYPE-ROW-CARRIED] names as the defect it was written to close.
+#[test]
+fn an_element_read_carries_only_its_own_bindings_sources() {
+    check_ok(
+        "effect Cfg {\n    fn value() -> i64\n}\n\nfn main() {\n    \
+with Cfg handled_by CfgHandler{ value: || 21 } {\n        \
+let cf = |x| x + Cfg.value()\n        print(\"{cf(0)}\")\n    }\n    \
+let fs: [fn(i64) -> i64] = [|x| x + 1]\n    let g = fs[0]\n    print(\"{g(1)}\")\n}\n",
+    );
+    // A list that really does hold an effectful function is still charged.
+    let head = "fn shout(n: i64) -> i64 {\n    print(\"x\")\n    n\n}\n\n";
+    check_err(
+        &format!("{head}fn quiet() -> i64 / {{}} {{\n    let fs = [shout]\n    let g = fs[0]\n    g(1)\n}}\n\nfn main() {{\n    print(\"{{quiet()}}\")\n}}\n"),
+        "not in its declared row",
+    );
+    check_err(
+        &format!("{head}fn quiet(fs: [fn(i64) -> i64 / {{io}}]) -> i64 / {{}} {{\n    \
+let g = fs[0]\n    g(1)\n}}\n\nfn main() {{\n    print(\"{{quiet([shout])}}\")\n}}\n"),
+        "not in its declared row",
+    );
+}
+
+/// A closure's body is checked against the written result type, the same way
+/// a named function's is ([T-FN-TYPE-ROW], [T-INT-TO-FLOAT-CARRIED]).
+///
+/// Inferred instead, the expected type never reached the literals in the
+/// tail: `|x| 3` against `fn(i64) -> f64` was refused while
+/// `fn named(x: i64) -> f64 { 3 }` — the same body, one closure apart — was
+/// accepted, and so was `|x| { return 3 }`.
+#[test]
+fn a_closures_tail_adopts_its_written_result_type() {
+    check_ok(
+        "type E = | Bad\ntype Box = { f: fn(i64) -> f64 }\n\n\
+fn take(f: fn(i64) -> f64) -> f64 {\n    f(1)\n}\n\nfn main() {\n    \
+let a: fn(i64) -> f64 = |x| 3\n    let b = Box{ f: |x| 3 }\n    \
+let cs: [fn(i64) -> f64] = [|x| 3]\n    let d: fn(i64) -> [f64] = |x| [1, 2]\n    \
+let e: fn(i64) -> Option[f64] = |x| Some(3)\n    let g: fn() -> f64 = || 3\n    \
+let h: fn(i64) -> f64 ! E = |x| 3\n    \
+print(\"{a(0)} {b.f(0)} {cs[0](0)} {d(0)} {e(0) ?? -1.0} {g()} {h(0) ?? -1.0}\")\n    \
+print(\"{take(|x| if x == 1 { 3 } else { 2.5 })}\")\n}\n",
+    );
+    // A genuine mismatch is still refused.
+    check_err(
+        "fn take(f: fn(i64) -> f64) -> f64 {\n    f(1)\n}\n\n\
+fn main() {\n    print(\"{take(|x| \"oops\")}\")\n}\n",
+        "type mismatch",
+    );
+}
