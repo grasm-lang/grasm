@@ -8,6 +8,12 @@ use grasm_syntax::ast::*;
 
 use crate::value::{ClosureBody, Value};
 
+/// Evaluated arguments, paired with the place each `inout` one names.
+///
+/// The place is `None` for an ordinary argument: only an `inout` has somewhere
+/// to write back to ([E-INOUT-WRITEBACK]).
+type ArgsAndPlaces = (Vec<Value>, Vec<Option<Vec<Seg>>>);
+
 /// Non-local control flow during evaluation.
 #[derive(Debug)]
 pub enum Flow {
@@ -1583,7 +1589,7 @@ impl<'a, W: Write> Interp<'a, W> {
             }
         }
         *slot = v;
-        return Ok(());
+        Ok(())
     }
     fn assign_place(&mut self, target: &Expr, v: Value) -> Result<(), Flow> {
         // Collect the access path down to the root identifier.
@@ -2148,12 +2154,9 @@ build links it, `grasm run` can only reach what is already loaded",
                                 // advance is retired instead of reused: it
                                 // never has a new occupant, so nothing can
                                 // ever match a reference to it again.
-                                match self.slab[idx].1.checked_add(1) {
-                                    Some(next) => {
-                                        self.slab[idx].1 = next;
-                                        self.slab_free.push(i);
-                                    }
-                                    None => {}
+                                if let Some(next) = self.slab[idx].1.checked_add(1) {
+                                    self.slab[idx].1 = next;
+                                    self.slab_free.push(i);
                                 }
                             }
                         }
@@ -2542,7 +2545,7 @@ build links it, `grasm run` can only reach what is already loaded",
         modes: &[ParamMode],
         args: &[Expr],
         recv: Option<Value>,
-    ) -> Result<(Vec<Value>, Vec<Option<Vec<Seg>>>), Flow> {
+    ) -> Result<ArgsAndPlaces, Flow> {
         let shift = usize::from(recv.is_some());
         let mut vs = Vec::with_capacity(args.len() + shift);
         let mut paths: Vec<Option<Vec<Seg>>> = vec![None; args.len() + shift];

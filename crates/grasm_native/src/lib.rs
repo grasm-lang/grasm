@@ -1525,7 +1525,7 @@ impl<'m> Codegen<'m> {
                     // `fn unreachable() -> T { panic(…) }` is ordinary code and
                     // §11 lists no row for it, so refusing it made the gap
                     // table wrong either way.
-                    let z = fcx.zero_of(&want);
+                    let z = fcx.zero_of(want);
                     fcx.b.ins().return_(&[z]);
                 }
             }
@@ -2134,7 +2134,7 @@ to one — a loop variable or a list element is this case",
                 // closure body rather than on the operation's type, so
                 // `|b| if b { 1 } else { fail(e) }` compiled and the bare
                 // `fail` did not.
-                let z = fcx.zero_of(&want);
+                let z = fcx.zero_of(want);
                 fcx.b.ins().return_(&[z]);
             }
         }
@@ -8746,7 +8746,7 @@ impl FnCx<'_, '_> {
                     self.struct_field_type(&sname, f, span)?
                 }
                 (VType::List(e), PlaceSeg::Index(_)) => (**e).clone(),
-                _ => return nope(span, &place_shape(&t, seg)),
+                _ => return nope(span, place_shape(&t, seg)),
             };
         }
         Ok(t)
@@ -8828,11 +8828,11 @@ impl FnCx<'_, '_> {
         let done = self.b.create_block();
         let ptr_ty = self.cg.module.target_config().pointer_type();
         self.b.append_block_param(done, ptr_ty);
-        self.b.ins().brif(is_null, copy_blk, &[], done, &[took.into()]);
+        self.b.ins().brif(is_null, copy_blk, &[], done, &[took]);
         self.filled = true;
         self.goto_block(copy_blk);
         let got = self.call_rt(get_fn, args).unwrap();
-        self.b.ins().jump(done, &[got.into()]);
+        self.b.ins().jump(done, &[got]);
         self.filled = true;
         self.goto_block(done);
         self.b.block_params(done)[0]
@@ -8938,7 +8938,7 @@ impl FnCx<'_, '_> {
                         .call_rt("grasm_list_set", &[root, iv, boxed_val])
                         .unwrap())
                 }
-                _ => nope(span, &place_shape(root_t, seg)),
+                _ => nope(span, place_shape(root_t, seg)),
             },
             Some((seg, rest)) => {
                 // Descend: read the child, recurse, then write it back.
@@ -8958,7 +8958,7 @@ impl FnCx<'_, '_> {
                             let _ = iv;
                             (c, et, PlaceSeg::Index(ix))
                         }
-                        _ => return nope(span, &place_shape(root_t, seg)),
+                        _ => return nope(span, place_shape(root_t, seg)),
                     };
                 let new_child = self.write_place(span, child, rest, &child_t, boxed_val)?;
                 match (root_t, writeback) {
@@ -8974,7 +8974,7 @@ impl FnCx<'_, '_> {
                             .call_rt("grasm_list_set", &[root, iv, new_child])
                             .unwrap())
                     }
-                    _ => nope(span, &place_shape(root_t, seg)),
+                    _ => nope(span, place_shape(root_t, seg)),
                 }
             }
         }

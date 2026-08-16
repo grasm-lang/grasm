@@ -1816,7 +1816,7 @@ pub unsafe extern "C" fn grasm_list_take(l: *mut RtVal, i: i64) -> *mut RtVal {
         return std::ptr::null_mut();
     }
     let hole = interned_bool(false);
-    Some(std::mem::replace(&mut items[i as usize], hole)).unwrap_or(std::ptr::null_mut())
+    std::mem::replace(&mut items[i as usize], hole)
 }
 
 /// CoW field update: returns the (possibly new) struct pointer.
@@ -2563,12 +2563,9 @@ pub extern "C" fn grasm_ref_release(r: i64) {
         // program read the current occupant's value and compared equal to a
         // live one. A slot whose generation cannot advance is retired instead
         // of reused: with no new occupant, nothing can match it again.
-        match s.gens[idx].checked_add(1) {
-            Some(next) => {
-                s.gens[idx] = next;
-                s.free.push(i);
-            }
-            None => {}
+        if let Some(next) = s.gens[idx].checked_add(1) {
+            s.gens[idx] = next;
+            s.free.push(i);
         }
         v
     };

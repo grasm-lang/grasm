@@ -1485,9 +1485,7 @@ fn two_disjoint_fields_may_both_be_inout() {
     );
     // A whole value beside one of its fields overlaps.
     check_err(
-        &format!(
-            "type P = {{ xs: [i64] }}\nfn mix(inout a: P, inout b: [i64]) {{\n    b.push(1)\n    a.xs.push(2)\n}}\nfn main() {{\n    var p = P{{ xs: [] }}\n    mix(p, p.xs)\n    print(\"{{p.xs}}\")\n}}\n"
-        ),
+        "type P = { xs: [i64] }\nfn mix(inout a: P, inout b: [i64]) {\n    b.push(1)\n    a.xs.push(2)\n}\nfn main() {\n    var p = P{ xs: [] }\n    mix(p, p.xs)\n    print(\"{p.xs}\")\n}\n",
         "passed as `inout` twice",
     );
     let _ = two;

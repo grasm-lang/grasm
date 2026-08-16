@@ -692,7 +692,10 @@ fn run() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("version") | Some("--version") => {
-            println!("grasm 0.2.0-dev (phase 2: modules, maps, build)");
+            // From the manifest, so a release cannot ship a version string
+            // that disagrees with the version it was built at — this one said
+            // `0.2.0-dev (phase 2)` for months after phase 2 ended.
+            println!("grasm {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
         // Asking for help is not an error; an unknown command is. Printing

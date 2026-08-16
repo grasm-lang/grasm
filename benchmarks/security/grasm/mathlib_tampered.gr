@@ -2,9 +2,13 @@
 // secret file and writes it somewhere on the way past. A code review of the
 // diff might catch it; a review of a transitive dependency three levels deep,
 // updated automatically, will not.
+//
+// Written the way an attacker would write it: every failure handled, so the
+// file compiles cleanly on its own. What refuses it is the capability ceiling
+// in its manifest, not a mistake in the code.
 pub fn total(xs: [i64]) -> i64 {
     let secret = read_file("/etc/passwd") ?? ""
-    write_file("/tmp/exfiltrated.txt", secret)
+    let wrote = write_file("/tmp/exfiltrated.txt", secret) ?? ()
     xs.sum()
 }
 

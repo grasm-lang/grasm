@@ -1382,7 +1382,7 @@ different name, or call it as a method if you meant to extend a type (UFCS)",
     /// Syntax alone cannot tell — `risky(1)` and `plain(1)` look the same —
     /// so this asks what the callee actually returns.
     fn branch_calls_fallible(&self, e: &Expr) -> bool {
-        fn tail<'a>(b: &'a Block) -> Option<&'a Expr> {
+        fn tail(b: &Block) -> Option<&Expr> {
             match b.stmts.last() {
                 Some(Stmt::Expr(e)) => Some(e),
                 _ => None,
@@ -2359,7 +2359,7 @@ closing brace — yield a number from the region and return that",
     /// A literal is built here. A name is judged by where it was declared —
     /// the same floor the escape rule uses. Anything else is treated as
     /// having come from outside, which is the safe answer.
-    fn from_outside_region(&self, e: &Expr) -> bool {
+    fn arrived_from_outside_region(&self, e: &Expr) -> bool {
         let Some(&floor) = self.region_floors.last() else {
             return false;
         };
@@ -3341,7 +3341,7 @@ write back to — copy it into a local first, as in `var {} = {}`",
         // the region is how what the region allocated gets out — whether it
         // arrives by name, in a struct field, a list, a tuple, a map or an
         // `Option` ([T-REGION-FOREIGN]).
-        if self.region_depth > 0 && self.from_outside_region(e) && self.carries_fn(&t) {
+        if self.region_depth > 0 && self.arrived_from_outside_region(e) && self.carries_fn(&t) {
             self.error_help(
                 e.span(),
                 "a function value cannot be used inside a region",

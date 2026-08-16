@@ -17,9 +17,6 @@ pub const IO: &str = "io";
 pub const UNSAFE: &str = "unsafe";
 pub const ASYNC: &str = "async";
 
-/// Whether a bare name is one of the language's own, rather than something a
-/// program could have bound.
-
 const IO_BUILTINS: &[&str] = &[
     "print",
     "read_file",
@@ -316,7 +313,6 @@ pub fn effects_of_program(program: &crate::loader::Program) -> BTreeSet<String> 
         harvest_module(
             f.module,
             &ctx.type_aliases,
-            &ctx.type_rows,
             &mut ctx.field_rows,
             &mut ctx.elem_rows,
         );
@@ -541,7 +537,6 @@ fn build_ctx_in<'a>(files: &'a [ModuleView<'a>], packages: &BTreeSet<String>) ->
         harvest_module(
             f.module,
             &ctx.type_aliases,
-            &ctx.type_rows,
             &mut ctx.field_rows,
             &mut ctx.elem_rows,
         );
@@ -1263,11 +1258,13 @@ fn check_declared_rows_block(
                     report_row_over(init, current, ctx, fnb, &allowed, diags);
                 }
             }
-            Stmt::Assign { target, value, .. } => {
-                if let Expr::Ident(id) = target {
-                    if let Some(allowed) = declared.get(&id.name).cloned() {
-                        report_row_over(value, current, ctx, fnb, &allowed, diags);
-                    }
+            Stmt::Assign {
+                target: Expr::Ident(id),
+                value,
+                ..
+            } => {
+                if let Some(allowed) = declared.get(&id.name).cloned() {
+                    report_row_over(value, current, ctx, fnb, &allowed, diags);
                 }
             }
             Stmt::While { body, .. }
@@ -2030,7 +2027,6 @@ fn harvest_rows_at(
     t: &TypeExpr,
     field: Option<&str>,
     aliases: &HashMap<String, TypeExpr>,
-    type_rows: &HashMap<String, BTreeSet<String>>,
     field_rows: &mut HashMap<String, BTreeSet<String>>,
     elem_rows: &mut BTreeSet<String>,
     depth: usize,
@@ -2063,27 +2059,27 @@ fn harvest_rows_at(
                 }
             }
             for p in params {
-                harvest_rows_at(p, None, aliases, type_rows, field_rows, elem_rows, depth + 1);
+                harvest_rows_at(p, None, aliases, field_rows, elem_rows, depth + 1);
             }
-            harvest_rows_at(ret, None, aliases, type_rows, field_rows, elem_rows, depth + 1);
+            harvest_rows_at(ret, None, aliases, field_rows, elem_rows, depth + 1);
         }
         // Inside any other type constructor the function type has lost its
         // field name, so what it carries joins the nameless pool.
         TypeExpr::List(inner, _) | TypeExpr::Ref(inner, _) => {
-            harvest_rows_at(inner, None, aliases, type_rows, field_rows, elem_rows, depth + 1)
+            harvest_rows_at(inner, None, aliases, field_rows, elem_rows, depth + 1)
         }
         TypeExpr::Fallible(a, b, _) => {
-            harvest_rows_at(a, None, aliases, type_rows, field_rows, elem_rows, depth + 1);
-            harvest_rows_at(b, None, aliases, type_rows, field_rows, elem_rows, depth + 1);
+            harvest_rows_at(a, None, aliases, field_rows, elem_rows, depth + 1);
+            harvest_rows_at(b, None, aliases, field_rows, elem_rows, depth + 1);
         }
         TypeExpr::Tuple(items, _) | TypeExpr::Union(items, _) => {
             for i in items {
-                harvest_rows_at(i, None, aliases, type_rows, field_rows, elem_rows, depth + 1);
+                harvest_rows_at(i, None, aliases, field_rows, elem_rows, depth + 1);
             }
         }
         TypeExpr::Name { args, .. } => {
             for a in args {
-                harvest_rows_at(a, None, aliases, type_rows, field_rows, elem_rows, depth + 1);
+                harvest_rows_at(a, None, aliases, field_rows, elem_rows, depth + 1);
             }
         }
     }
@@ -2272,7 +2268,6 @@ fn declared_row_shallow(
 fn harvest_module(
     m: &grasm_syntax::ast::Module,
     aliases: &HashMap<String, TypeExpr>,
-    type_rows: &HashMap<String, BTreeSet<String>>,
     field_rows: &mut HashMap<String, BTreeSet<String>>,
     elem_rows: &mut BTreeSet<String>,
 ) {
@@ -2282,24 +2277,24 @@ fn harvest_module(
             Decl::Type(td) => match &td.body {
                 TypeBody::Struct(fields) => {
                     for f in fields {
-                        harvest_rows_at(&f.ty, Some(&f.name.name), aliases, type_rows, field_rows, elem_rows, 0);
+                        harvest_rows_at(&f.ty, Some(&f.name.name), aliases, field_rows, elem_rows, 0);
                     }
                 }
                 TypeBody::Sum(variants) => {
                     for v in variants {
                         for f in &v.fields {
-                            harvest_rows_at(&f.ty, Some(&f.name.name), aliases, type_rows, field_rows, elem_rows, 0);
+                            harvest_rows_at(&f.ty, Some(&f.name.name), aliases, field_rows, elem_rows, 0);
                         }
                     }
                 }
-                TypeBody::Alias(t) => harvest_rows_at(t, None, aliases, type_rows, field_rows, elem_rows, 0),
+                TypeBody::Alias(t) => harvest_rows_at(t, None, aliases, field_rows, elem_rows, 0),
             },
             Decl::Fn(fd) => {
                 for p in &fd.params {
-                    harvest_rows_at(&p.ty, None, aliases, type_rows, field_rows, elem_rows, 0);
+                    harvest_rows_at(&p.ty, None, aliases, field_rows, elem_rows, 0);
                 }
                 if let Some(r) = &fd.ret {
-                    harvest_rows_at(r, None, aliases, type_rows, field_rows, elem_rows, 0);
+                    harvest_rows_at(r, None, aliases, field_rows, elem_rows, 0);
                 }
             }
             _ => {}

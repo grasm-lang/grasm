@@ -3,6 +3,80 @@
 Grasm is pre-1.0: minor releases may break anything not marked `stable` in
 `spec/stability.md`. See `docs/stability.md`.
 
+## 0.9.0 — 2026-08-16
+
+The first release with a scope. Everything below `1.0` is still pre-1.0 by the
+rules in `docs/stability.md`; what changes here is that a version now has a
+defined surface and a defined bar, written down in `docs/release-scope.md`.
+
+### The 1.0 surface
+
+**In:** types and inference, functions, pattern matching, collections and the
+standard library, modules, fallible values `T ! E`, ownership and `inout`, the
+interpreter, the bundle format and the native backend.
+
+**Out, and documented as out:** effects and their rows, the capability ceiling,
+parallel purity, regions, Tier-2 `ref`, and FFI. Those clauses are
+`experimental` — usable, specified, tested, and not covered by the
+compatibility promise.
+
+### What blocks a release
+
+S1 (a crash, a wrong answer, a disagreement between the three engines that
+[E-PANIC-TRACE] does not license, or a build that leaks state) and S2 (a
+`stable` clause proved unsound) block. S3 and S4 — unsoundness in surface the
+specification already labels experimental, over-strictness anywhere, and
+diagnostics — are changelog content, and every open one is listed with a
+reproducer in `docs/known-issues.md`.
+
+At this release: **no S1 and no S2 are open.** One S3 (`--native` refuses three
+shapes the interpreter accepts, all listed in §11 and gate-proven) and one S4
+(the UFCS help text promises a call the compiler will not make).
+
+### Effect rows come from the type, not from a guess
+
+The effect pass used to reconstruct, syntactically, a fact the type checker
+already had: which function value a name holds, and therefore what calling it
+performs. It did that with a name-to-sources map, a pool of every function
+value a body mentions, and a special case per binder — `let`, `for`, a `match`
+payload, a tuple destructuring, an index, a field, `??`, a block, a closure
+parameter. Every missing cell of that grid was a defect, and ten rounds of
+cold-model evaluation spent most of their findings there.
+
+A function's row is part of its type and travels through every carrier by
+unification, so the checker now publishes the row of each function-valued
+expression and of each call whose callee is not an expression of its own, and
+the effect pass reads it. **511 lines of guessing deleted**, and the class of
+defect they produced no longer has a mechanism.
+
+The deletion was made on evidence: the whole gate set was run first with the
+syntactic path switched off, and only what it caught was removed.
+
+### Gates
+
+201 conformance and example programs identical across `grasm run`, the bundle
+and the native binary; 16 three-engine agreement programs; 201 leak-free
+builds; the §11 gap list proved to match the compiler in both directions; and
+five generated-program gates — effect rows (204 programs, both directions,
+including across a package boundary), FFI spellings (36), effect handlers,
+differential, fallible values and generic instantiation. All of it now runs in
+CI rather than by hand.
+
+### Also in this release
+
+- **`scripts/fuzz_extern.py`** — every spelling by which a C function can be
+  named or called, each checked against a row missing `io` (must fail) and
+  against the complete row (must compile and run).
+- **[T-EFFECT-OP-RESULT]** — an effect operation's declared result carries its
+  row. An operation answering `-> fn(i64) -> i64 / {io}` handed out a printing
+  function that nothing charged.
+- Scope decides for a **module alias** and an **effect name**, as it already
+  did for a function name.
+- Five clauses demoted from `stable` to `experimental`
+  (`T-FN-TYPE-ROW`, `T-FN-TYPE-ROW-PARAM`, `T-FN-TYPE-ROW-CARRIED`,
+  `T-FN-VALUE-ROW`, `T-UNSAFE-UFCS`): their implementation changed in nearly
+  every evaluation round, which is what the promotion criteria forbid.
+
 ## Unreleased
 
 ### Added

@@ -151,6 +151,10 @@ pub(crate) fn load_with_canonical(
 /// build had named it `c`, so the bundled build of a program `grasm run` and
 /// `grasm build --native` both ran correctly reported a missing module.
 /// Keyed by (importing module, written path).
+// Eight, and each is a distinct thing the loader needs: grouping them into a
+// struct would move the same arguments one line up without making a caller
+// clearer.
+#[allow(clippy::too_many_arguments)]
 pub fn load_with_resolved_imports(
     entry_name: &str,
     entry_display_path: &str,

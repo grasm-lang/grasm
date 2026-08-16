@@ -502,7 +502,7 @@ fn fenced_blocks(doc: &str) -> Vec<String> {
                     // Every block used to be run whatever it said, so there
                     // was no way to show a manifest or a shell transcript in
                     // documentation without breaking the test suite.
-                    let info = trimmed[3..].trim();
+                    let info = trimmed.strip_prefix("```").unwrap_or(trimmed).trim();
                     if info.is_empty() || info == "grasm" {
                         current = Some(Vec::new());
                     } else {
