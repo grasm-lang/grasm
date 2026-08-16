@@ -344,6 +344,13 @@ enclosing handler for that effect.
 **[E-HANDLER-SCOPE]** A handler is installed for the dynamic extent of its
 `with` block, including calls made from inside it.
 
+A handler's operations are closures, so they capture where the handler is
+*written*, not where it is installed. The compiled backend filled the
+environment at the `with`, so a binding changed between the two was read at
+its new value: `var n = 1`, build the handler, `n = 100`, install it — the
+interpreter answered `1` and the compiled binary answered `100`, with matching
+exit codes and nothing on stderr to say the two disagreed.
+
 **[E-HANDLER-OWN-ROW]** A handler's *own* effects are counted where the handler
 is **installed**, not where its operations are called. So a `B` handler whose
 body performs `A` needs `A` handled around the `with B` block, even if every

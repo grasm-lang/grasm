@@ -181,6 +181,13 @@ fn check_modules(files: &[ModuleView]) -> Analysis {
     }
     let mut diagnostics = c.diags;
     diagnostics.extend(crate::effects::check_effects_multi(files));
+    // Source order. The effect pass walks a hash map, so the *same* file
+    // reported its errors in a different order on every run — and `grasm run`
+    // and `grasm build` could disagree about the order of the same two — which
+    // makes compiler output undiffable in CI and in any `--check` gate. The
+    // sort is stable, so a diagnostic and the one deliberately emitted right
+    // after it at the same span keep their order.
+    diagnostics.sort_by_key(|d| d.span.start);
     Analysis {
         const_types: c
             .consts
@@ -625,8 +632,27 @@ already reachable from every module — drop the `pub`",
             }
         }
         // Whatever is left really is unknown; report it properly.
+        let stuck: std::collections::HashSet<String> =
+            todo.iter().map(|&i| aliases[i].0.name.clone()).collect();
         for &i in &todo {
             let (name, te, generics) = &aliases[i];
+            // An alias that stands for a shape holding itself. `type A = [A]`
+            // has no base case and no indirection to stop at — unlike a struct
+            // or a sum, which [T-RECURSIVE] does allow to refer to themselves,
+            // because a value of one is built out of *other* values. Reported
+            // as `unknown type `A`` it named a type declared two words to the
+            // left, and every pass that walked it recursively overflowed the
+            // process stack: exit 134, no diagnostic, and a dependency
+            // carrying the line took its consumer's toolchain down too.
+            if Self::names_itself(te, &name.name, &stuck) {
+                self.error_help(
+                    name.span,
+                    format!("type `{}` is defined in terms of itself", name.name),
+                    "a `type` alias is another spelling of the type it names, so it has nowhere to stop — a struct or a sum type may refer to itself ([T-RECURSIVE]), because a value of one holds *other* values",
+                );
+                self.aliases.insert(name.name.clone(), Type::Error);
+                continue;
+            }
             let ty = self.resolve_type(te, generics);
             self.aliases.insert(name.name.clone(), ty);
         }
@@ -1040,6 +1066,38 @@ different name, or call it as a method if you meant to extend a type (UFCS)",
     }
 
     /// TypeExpr → Type. `generics` are the in-scope generic parameter names.
+    /// Whether a written type reaches `name`, or any other alias that is also
+    /// stuck, so a mutually recursive pair is reported as such rather than as
+    /// two unknown names.
+    fn names_itself(
+        te: &TypeExpr,
+        name: &str,
+        stuck: &std::collections::HashSet<String>,
+    ) -> bool {
+        match te {
+            TypeExpr::Name { path, args, .. } => {
+                let here = path
+                    .segments
+                    .last()
+                    .is_some_and(|s| s.name == name || stuck.contains(&s.name));
+                here || args.iter().any(|a| Self::names_itself(a, name, stuck))
+            }
+            TypeExpr::List(inner, _) | TypeExpr::Ref(inner, _) => {
+                Self::names_itself(inner, name, stuck)
+            }
+            TypeExpr::Fallible(a, b, _) => {
+                Self::names_itself(a, name, stuck) || Self::names_itself(b, name, stuck)
+            }
+            TypeExpr::Tuple(items, _) | TypeExpr::Union(items, _) => {
+                items.iter().any(|i| Self::names_itself(i, name, stuck))
+            }
+            TypeExpr::Fn { params, ret, .. } => {
+                params.iter().any(|p| Self::names_itself(p, name, stuck))
+                    || Self::names_itself(ret, name, stuck)
+            }
+        }
+    }
+
     fn resolve_type(&mut self, te: &TypeExpr, generics: &[String]) -> Type {
         match te {
             TypeExpr::Ref(inner, _) => {
@@ -1419,6 +1477,26 @@ different name, or call it as a method if you meant to extend a type (UFCS)",
             Some(Type::Fallible(Box::new(ret.clone()), Box::new(e)))
         } else if self.fn_err.is_none() || tail_is_literal {
             Some(ret.clone())
+        } else if let (Some(e), true) = (
+            self.fn_err.clone(),
+            // Only a *branching* tail. A plain one giving the ok half —
+            // `a / b` in a `-> i64 ! MathError` — is the ordinary case and
+            // wants the half, not the whole.
+            matches!(
+                f.body.stmts.last(),
+                Some(Stmt::Expr(Expr::If { .. } | Expr::Match { .. }))
+            ),
+        ) {
+            // A fallible body whose tail *mixes* the halves — one branch
+            // `Err(e)`, another a bare value — is expecting the whole `T ! E`,
+            // and reached no expectation at all. So the merge had only the
+            // branches to go on: `-> f64 ! E` with `if c { Err(Bad) } else
+            // { 4 }` produced `i64 ! E` and was refused, while the identical
+            // body under a `let v: f64 ! E =` annotation was accepted.
+            // [T-OK-ERR-RETURN] says the rule is about the *position*, not
+            // about how it was reached; each branch may still give either
+            // half.
+            Some(Type::Fallible(Box::new(ret.clone()), Box::new(e)))
         } else {
             None
         };
@@ -5927,7 +6005,22 @@ bind the component to a `var`, or use a struct when the parts have names worth w
                         Some(t) => {
                             let _ = self.uni.unify(&result, &t);
                         }
-                        None => self.unify_or_report(arm.body.span(), &arm_ty, &result),
+                        None => {
+                            // The arm may still fit once the expected type
+                            // reaches the literals *inside* it. Inference
+                            // alone gave `(3.5, 4)` the type `(f64, i64)`, so
+                            // a mixed tuple in a `match` arm was refused —
+                            // while the same tuple in every other position,
+                            // and a mixed *list* in the same arm, promoted
+                            // ([T-INT-TO-FLOAT-CARRIED] names both "a list,
+                            // tuple or map literal" and "a `match`'s arms").
+                            let mark = self.diags.len();
+                            self.check_expr(&arm.body, &result);
+                            if self.diags.len() > mark {
+                                self.diags.truncate(mark);
+                                self.unify_or_report(arm.body.span(), &arm_ty, &result);
+                            }
+                        }
                     }
                 }
             }
@@ -6346,10 +6439,12 @@ bind the component to a `var`, or use a struct when the parts have names worth w
                 // `main` reported an unhandled error where the interpreter
                 // produced an `Err` element.
                 self.closure_types.insert(body.span().start, ret.clone());
+                // As below: the value carries what its body performs, even
+                // when the body itself waits for a call site.
                 return Type::Fn {
                     params: param_tys,
                     ret: Box::new(ret),
-                    row: None,
+                    row: self.closure_rows.get(&span.start).cloned(),
                 };
             }
         }
@@ -6419,7 +6514,18 @@ bind the component to a `var`, or use a struct when the parts have names worth w
         Type::Fn {
             params: param_tys,
             ret: Box::new(ret),
-            row: None,
+            // What this closure body actually performs, so the value carries
+            // it wherever it goes. `None` means *unconstrained*, which is
+            // right for the built-in higher-order methods and wrong for the
+            // value itself: one unannotated `let` between the literal and its
+            // destination erased the row, so `let c = |m| print(m)` then
+            // `Box{ f: c }` put a printing closure in a written `fn(str)` — a
+            // declared empty row ([T-FN-TYPE-ROW]) — while the literal written
+            // in place was refused. The same `let` carried a handled effect
+            // out of its `with` block through a `push`, reaching the
+            // missing-handler panic [E-HANDLER-MISSING] calls a backstop that
+            // well-typed programs never reach.
+            row: self.closure_rows.get(&span.start).cloned(),
         }
     }
 }

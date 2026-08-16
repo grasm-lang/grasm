@@ -1645,3 +1645,88 @@ fn main() {\n    print(\"{a()}{b()}\")\n}\n",
     );
     assert!(out.contains("1 passed, 1 failed"), "{out}");
 }
+
+/// A handler's operations capture at the moment the handler is *created*, in
+/// every engine ([E-CLOSURE-CAPTURE]).
+///
+/// The compiled backend filled the environment at the `with` instead, so a
+/// binding changed between the two was read at its new value: the interpreter
+/// answered 1 and the binary answered 100, with matching exit codes and
+/// nothing on stderr to say the two disagreed.
+#[test]
+fn a_handlers_captures_are_taken_where_it_is_written() {
+    let w = Work::new("hcap");
+    let dir = w.0.join("src");
+    std::fs::create_dir_all(&dir).unwrap();
+    let entry = dir.join("h.gr");
+    std::fs::write(
+        &entry,
+        "effect Src {\n    fn get() -> i64\n}\n\ntype Sub = { n: i64 }\n\n\
+fn main() {\n    \
+var n = 1\n    let h = SrcHandler{ get: || n }\n    n = 100\n    \
+with Src handled_by h {\n        print(\"{Src.get()}\")\n    }\n    \
+var xs = [1, 2, 3]\n    let g = SrcHandler{ get: || xs.len() }\n    xs.push(4)\n    \
+with Src handled_by g {\n        print(\"{Src.get()}\")\n    }\n    \
+var sub = Sub{ n: 5 }\n    let u = SrcHandler{ get: || sub.n }\n    sub.n = 50\n    \
+with Src handled_by u {\n        print(\"{Src.get()}\")\n    }\n    \
+var k = 1\n    let a = SrcHandler{ get: || k }\n    k = 2\n    \
+let b = SrcHandler{ get: || k * 10 }\n    k = 3\n    \
+with Src handled_by a {\n        print(\"{Src.get()}\")\n    }\n    \
+with Src handled_by b {\n        print(\"{Src.get()}\")\n    }\n    \
+with Src handled_by SrcHandler{ get: || k } {\n        print(\"{Src.get()}\")\n    }\n}\n",
+    )
+    .unwrap();
+    let p = entry.to_str().unwrap();
+    let (code, expected) = run(&["run", p]);
+    assert_eq!(code, 0, "{expected}");
+    assert_eq!(expected, "1\n3\n5\n1\n20\n3\n", "{expected}");
+
+    for extra in [vec![], vec!["--native"]] {
+        let bin = w.0.join(if extra.is_empty() { "b" } else { "n" });
+        let mut args = vec!["build", p];
+        args.extend(extra.iter().copied());
+        args.extend(["-o", bin.to_str().unwrap()]);
+        let (code, out) = run(&args);
+        assert_eq!(code, 0, "{args:?}: {out}");
+        let got = Command::new(&bin).output().expect("runs");
+        assert_eq!(
+            String::from_utf8_lossy(&got.stdout),
+            expected,
+            "{args:?} disagrees with the interpreter"
+        );
+    }
+}
+
+/// A dependency's doc example is the dependency's, not the consumer's.
+///
+/// Every other loop in the capability pass skips a foreign module and this one
+/// did not, so a consumer performing nothing at all was charged for a `print`
+/// in a `///` block in someone else's package — with no `performed:` location,
+/// so its author had no pointer to a file they did not write.
+#[test]
+fn a_dependencys_doc_example_is_not_the_consumers() {
+    let w = Work::new("depdoc");
+    w.package(
+        "dep",
+        "[package]\nname = \"dep\"\nversion = \"0.1.0\"\ncapabilities = [\"io\"]\n",
+        "/// Adds.\n///\n/// ```\n/// print(\"{add(2, 3)}\")\n/// ```\n\
+pub fn add(a: i64, b: i64) -> i64 {\n    a + b\n}\n",
+    );
+    let app = w.package(
+        "app",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\ncapabilities = []\n\n[dependencies.dep]\npath = \"../dep\"\n",
+        "import dep\n\nfn main() {\n    let n = dep.add(1, 2)\n}\n",
+    );
+    let (code, out) = run(&["check", &app_entry(&app)]);
+    assert_eq!(code, 0, "the consumer performs nothing:\n{out}");
+    let out = Command::new(GRASM)
+        .arg("deps")
+        .arg(".")
+        .current_dir(&app)
+        .output()
+        .expect("runs");
+    let text = String::from_utf8_lossy(&out.stdout).into_owned()
+        + &String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains("app              performs []"), "{text}");
+}

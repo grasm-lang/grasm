@@ -3750,6 +3750,18 @@ impl FnCx<'_, '_> {
                 // runtime value to produce: `EHandler` is a type the effect
                 // declaration conjures, not a struct anyone can build.
                 if self.cg.is_handler_literal(init) {
+                    // No runtime value to produce — `EHandler` is a type the
+                    // effect declaration conjures, not a struct anyone can
+                    // build. But its operations are closures, and a closure
+                    // captures the values it uses *at the moment it is
+                    // created* ([E-CLOSURE-CAPTURE]). The environment was
+                    // filled at the `with` instead, so a binding changed
+                    // between the two was read at its new value: `var n = 1`,
+                    // build the handler, `n = 100`, install it — the
+                    // interpreter answered 1 and the compiled binary answered
+                    // 100, with matching exit codes and nothing on stderr.
+                    // Copied here, the `with` finds what the literal saw.
+                    self.snapshot_handler_captures(init);
                     return Ok(StmtOut::Value(None));
                 }
                 // An annotation gives empty collection literals their type.
@@ -4164,11 +4176,18 @@ impl FnCx<'_, '_> {
             }
             Stmt::With {
                 effect,
+                handler,
                 body,
                 span,
-                ..
             } => {
                 let ename = effect.dotted();
+                // Where the handler literal was *written*, which is where its
+                // operations captured. An inline literal is its own site.
+                let resolved_span = self
+                    .cg
+                    .handler_literal(handler)
+                    .map(|lit| lit.span().start)
+                    .unwrap_or(span.start);
                 let Some(site) = self.cg.handler_sites.get(&span.start).cloned() else {
                     // The only way a `with` reaches here without a lifted
                     // handler is one inside a `parallel`/`spawn` body, whose
@@ -4189,9 +4208,17 @@ impl FnCx<'_, '_> {
                     // the operation's captures. They are typed now, at the
                     // `with` site, because the pass that lifted the operation
                     // ran before any body was compiled and had no types yet.
+                    // Read through the snapshot taken where the literal was
+                    // written, when there is one. The name recorded is still
+                    // the original — that is what the operation's body reads.
+                    let lit_span = resolved_span;
                     let captures: Vec<(String, VType)> = free
                         .iter()
-                        .filter_map(|n| self.lookup(n).map(|(_, vt)| (n.clone(), vt)))
+                        .filter_map(|n| {
+                            self.lookup(&Self::snapshot_name(lit_span, n))
+                                .or_else(|| self.lookup(n))
+                                .map(|(_, vt)| (n.clone(), vt))
+                        })
                         .collect();
                     // A slot in this frame. The frame cannot return while the
                     // handler is installed, so the pointer stays good for as
@@ -4205,7 +4232,10 @@ impl FnCx<'_, '_> {
                         ),
                     );
                     for (i, (cname, cvt)) in captures.iter().enumerate() {
-                        let Some((var, _)) = self.lookup(cname) else {
+                        let Some((var, _)) = self
+                            .lookup(&Self::snapshot_name(lit_span, cname))
+                            .or_else(|| self.lookup(cname))
+                        else {
                             continue;
                         };
                         let v = self.b.use_var(var);
@@ -4252,6 +4282,51 @@ impl FnCx<'_, '_> {
                 }
                 Ok(StmtOut::Value(None))
             }
+        }
+    }
+
+    /// The hidden local a handler literal's capture is copied into.
+    ///
+    /// Keyed by where the literal was written, so two handlers over the same
+    /// binding keep their own values.
+    fn snapshot_name(lit_span: u32, name: &str) -> String {
+        format!("__hcap{lit_span}#{name}")
+    }
+
+    /// Copies every binding a handler literal's operations read into a hidden
+    /// local, at the point the literal is written.
+    ///
+    /// A closure captures values, not bindings ([E-CLOSURE-CAPTURE]), and the
+    /// environment was filled at the `with` instead — so a binding changed
+    /// between the two was read at its new value.
+    fn snapshot_handler_captures(&mut self, lit: &Expr) {
+        let Expr::StructLit { fields, span, .. } = lit else {
+            return;
+        };
+        let mut free = Vec::new();
+        for (_, fexpr) in fields {
+            let Expr::Closure { params, body, .. } = fexpr else {
+                continue;
+            };
+            let mut names = Vec::new();
+            collect_idents(body, &mut names);
+            names.retain(|n| !params.iter().any(|p| p.name == *n));
+            free.extend(names);
+        }
+        free.sort();
+        free.dedup();
+        for n in free {
+            let Some((var, vt)) = self.lookup(&n) else {
+                continue;
+            };
+            let v = self.b.use_var(var);
+            // The copy holds a reference of its own, the same way the `with`
+            // site's does: the original binding may be reassigned or dropped
+            // before the handler is ever installed.
+            self.inc_if_boxed(v, &vt);
+            let copy = self.new_var(&vt);
+            self.b.def_var(copy, v);
+            self.bind(&Self::snapshot_name(span.start, &n), copy, vt);
         }
     }
 

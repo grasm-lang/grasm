@@ -1264,9 +1264,12 @@ fn the_two_halves_may_be_mixed_across_branches() {
         "fn f(n: i64) -> i64 ! str {\n    match n {\n        1 -> 10\n        2 -> Ok(n * 3)\n        _ -> Err(\"no\")\n    }\n}\nfn main() {\n    print(\"{f(2) ?? 0 - 1}\")\n}\n",
     );
     // Mixing halves is not mixing *types*: the ok halves still have to agree.
+    // Named against the branch that disagrees, rather than against the `if`:
+    // the declared return type is what the branches are checked against, so
+    // the mismatch has a side.
     check_err(
         "fn f(n: i64) -> i64 ! str {\n    if n == 1 {\n        \"x\"\n    } else {\n        Ok(n * 3)\n    }\n}\nfn main() {\n    print(\"{f(2) ?? 0 - 1}\")\n}\n",
-        "different types",
+        "expected `i64`, found `str`",
     );
 }
 
@@ -1515,10 +1518,11 @@ fn an_int_literal_promotes_against_a_whole_fallible_float() {
     check_ok(
         "type E = | Bad\nfn f(n: i64) -> f64 ! E {\n    if n == 0 {\n        3\n    } else if n == 1 {\n        Ok(4.5)\n    } else {\n        Err(Bad)\n    }\n}\nfn main() {\n    print(\"{f(0) ?? 0.0}\")\n}\n",
     );
-    // A genuinely different type is still a mismatch.
+    // A genuinely different type is still a mismatch, named against the
+    // branch that disagrees rather than against the `if`.
     check_err(
         "type E = | Bad\nfn f(c: bool) -> f64 ! E {\n    if c {\n        \"x\"\n    } else {\n        Ok(4.5)\n    }\n}\nfn main() {\n    print(\"{f(true) ?? 0.0}\")\n}\n",
-        "different types",
+        "found `str`",
     );
 }
 
@@ -2107,6 +2111,170 @@ fn main() {{\n    print(\"{{g(true) ?? -1.0}} {{g(false) ?? -1.0}}\")\n}}\n"
     check_err(
         "fn g(n: i64) -> Option[f64] {\n    match n {\n        1 -> Some(4.5)\n        \
 _ -> Some(\"x\")\n    }\n}\n\nfn main() {\n    print(\"{g(1) ?? -1.0}\")\n}\n",
+        "type mismatch",
+    );
+}
+
+/// A closure value carries what its body performs, through an unannotated
+/// `let` as well as in place ([T-FN-TYPE-ROW], [T-FN-TYPE-ROW-CARRIED]).
+///
+/// The literal's row was recorded against its own span and consulted only
+/// where the literal appeared, so one `let` between it and its destination
+/// erased it: `let c = |m| print(m)` then `Box{ f: c }` put a printing closure
+/// into a written `fn(str)` — a declared empty row — while the same literal
+/// written in place was refused.
+#[test]
+fn a_closure_carries_its_row_through_a_let() {
+    let head = "type Box = { f: fn(str) }\n\n";
+    for build in [
+        "Box{ f: |m| print(\"x {m}\") }",
+        "{\n        let c = |m| print(\"x {m}\")\n        Box{ f: c }\n    }",
+    ] {
+        check_err(
+            &format!(
+                "{head}fn build() -> Box / {{io}} {{\n    {build}\n}}\n\n\
+fn pure_caller(b: Box) / {{}} {{\n    b.f(\"hello\")\n}}\n\n\
+fn main() {{\n    pure_caller(build())\n}}\n"
+            ),
+            "performs",
+        );
+    }
+    // Through a `push` into an annotated list, and a `set` into a map.
+    check_err(
+        "fn main() {\n    var fs: [fn(str)] = []\n    let c = |m| print(\"x {m}\")\n    \
+fs.push(c)\n    fs[0](\"hi\")\n}\n",
+        "performs",
+    );
+    // A handled effect cannot leave its `with` block that way either
+    // ([E-HANDLER-MISSING]).
+    check_err(
+        "effect Log {\n    fn info(m: str)\n}\n\nfn main() {\n    \
+var fs: [fn(str) / {io}] = []\n    \
+with Log handled_by LogHandler{ info: |m| print(\"shout {m}\") } {\n        \
+let c = |m| Log.info(m)\n        fs.push(c)\n    }\n    fs[0](\"late\")\n}\n",
+        "performs",
+    );
+    // A pure closure still fits a pure written type.
+    check_ok(
+        "type Box = { f: fn(str) -> i64 }\n\nfn main() {\n    \
+let c = |m| m.len()\n    let b = Box{ f: c }\n    print(\"{b.f(\"hi\")}\")\n}\n",
+    );
+}
+
+/// A `type` alias that stands for a shape holding itself is refused, naming
+/// itself.
+///
+/// It has no base case and no indirection to stop at, unlike a struct or a sum
+/// ([T-RECURSIVE]). Every pass that walked it recursed forever: the process
+/// aborted with a Rust stack overflow and exit 134 and no diagnostic at all —
+/// and a dependency carrying the line took its consumer's toolchain down with
+/// it. [G-NEST-LIMIT]: exceeding a cap is a diagnostic, never a crash.
+#[test]
+fn a_self_referential_alias_is_refused_not_a_crash() {
+    for body in [
+        "[A]",
+        "(A, i64)",
+        "Map[str, A]",
+        "fn(A) -> i64",
+        "Option[A]",
+        "i64 ! A",
+        "ref A",
+    ] {
+        check_err(
+            &format!("type A = {body}\n\nfn main() {{\n}}\n"),
+            "defined in terms of itself",
+        );
+    }
+    // A mutually recursive pair is the same thing spelled twice.
+    check_err(
+        "type A = [B]\ntype B = [A]\n\nfn main() {\n}\n",
+        "defined in terms of itself",
+    );
+    // The nominal forms [T-RECURSIVE] allows are unaffected.
+    check_ok(
+        "type A = { x: Option[A] }\ntype S = | W(x: [S]) | Z\n\n\
+fn main() {\n    let a = A{ x: None }\n    print(\"{a.x.is_none()}\")\n}\n",
+    );
+}
+
+/// Diagnostics come out in source order, every run.
+///
+/// The effect pass walks a hash map, so the same file reported its errors in a
+/// different order on every run — and `grasm run` and `grasm build` could
+/// disagree about the order of the same two, which makes compiler output
+/// undiffable in CI and in any `--check` gate.
+#[test]
+fn diagnostics_come_out_in_source_order() {
+    let src = "fn a() / {} {\n    print(\"a\")\n}\n\nfn b() / {} {\n    print(\"b\")\n}\n\n\
+fn c() / {} {\n    print(\"c\")\n}\n\nfn main() {\n    a()\n    b()\n    c()\n}\n";
+    let (_, diags) = grasm_sema::analyze(src);
+    let spans: Vec<u32> = diags.iter().map(|d| d.span.start).collect();
+    let mut sorted = spans.clone();
+    sorted.sort();
+    assert_eq!(spans, sorted, "diagnostics are not in source order: {spans:?}");
+    assert!(spans.len() >= 3, "expected one per function: {spans:?}");
+}
+
+/// A fallible function's declared return reaches a tail that *mixes* the two
+/// halves ([T-OK-ERR-RETURN], [T-INT-TO-FLOAT-CARRIED]).
+///
+/// A branching tail giving `Err(e)` on one side and a bare value on the other
+/// reached no expectation at all, so the merge had only the branches to go on:
+/// `-> f64 ! E` with `if c { Err(Bad) } else { 4 }` produced `i64 ! E` and was
+/// refused — while the identical body under a `let v: f64 ! E =` annotation
+/// was accepted. The clause says the rule is about the *position*.
+#[test]
+fn a_declared_fallible_return_reaches_a_mixed_tail() {
+    let e = "type E = | Bad\n";
+    for body in [
+        "if c { Err(Bad) } else { 4 }",
+        "if c { 4 } else { Err(Bad) }",
+        "if c { 6 } else { Ok(7) }",
+        "if c { 6.0 } else { Ok(7) }",
+        "if c { Ok(6) } else { Ok(7) }",
+        "if c { fail(Bad) } else { 4 }",
+    ] {
+        check_ok(&format!(
+            "{e}fn m(c: bool) -> f64 ! E {{\n    {body}\n}}\n\n\
+fn main() {{\n    print(\"{{m(false) ?? -1.0}}\")\n}}\n"
+        ));
+    }
+    check_ok(&format!(
+        "{e}fn m(n: i64) -> f64 ! E {{\n    match n {{\n        1 -> Err(Bad)\n        _ -> 4\n    }}\n}}\n\n\
+fn main() {{\n    print(\"{{m(2) ?? -1.0}}\")\n}}\n"
+    ));
+    check_ok(&format!(
+        "{e}fn m(c: bool) -> f64 ! E {{\n    match c {{\n        true -> 6.0\n        false -> Ok(7)\n    }}\n}}\n\n\
+fn main() {{\n    print(\"{{m(false) ?? -1.0}}\")\n}}\n"
+    ));
+    // A plain ok-half tail is unaffected — the ordinary case.
+    check_ok(
+        "type MathError = | DivByZero\n\nfn safe_div(a: i64, b: i64) -> i64 ! MathError {\n    \
+if b == 0 {\n        fail(DivByZero)\n    }\n    a / b\n}\n\n\
+fn main() {\n    print(\"{safe_div(10, 2) ?? 0}\")\n}\n",
+    );
+}
+
+/// A mixed-literal tuple in a `match` arm adopts the expected type.
+///
+/// Inference alone gave `(3.5, 4)` the type `(f64, i64)`, so it was refused —
+/// while the same tuple in every other position, and a mixed *list* in the
+/// same arm, promoted. [T-INT-TO-FLOAT-CARRIED] names both "a list, tuple or
+/// map literal" and "a `match`'s arms".
+#[test]
+fn a_mixed_tuple_in_a_match_arm_promotes() {
+    check_ok(
+        "fn main() {\n    let t: (f64, f64) = match 1 {\n        _ -> (3.5, 4)\n    }\n    \
+print(\"{t}\")\n}\n",
+    );
+    check_ok(
+        "type P = { x: f64, y: f64 }\n\nfn main() {\n    \
+let p: P = match 1 {\n        _ -> P{ x: 3.5, y: 4 }\n    }\n    print(\"{p.x} {p.y}\")\n}\n",
+    );
+    // A genuine mismatch inside the tuple is still one.
+    check_err(
+        "fn main() {\n    let t: (f64, f64) = match 1 {\n        _ -> (3.5, \"x\")\n    }\n    \
+print(\"{t}\")\n}\n",
         "type mismatch",
     );
 }

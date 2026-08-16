@@ -379,6 +379,15 @@ pub fn effects_of_program(program: &crate::loader::Program) -> BTreeSet<String> 
     for ex in crate::docs::examples(program) {
         let module = ex.owner.rsplit_once("::").map(|(m, _)| m).unwrap_or("main");
         let module = module.split(" #").next().unwrap_or(module).to_string();
+        // A dependency's examples are the dependency's, exactly as its
+        // functions, tests and benchmarks are — every other loop here says so
+        // and this one did not, so a consumer that performs nothing at all was
+        // charged for a `print` in a `///` block in someone else's package.
+        // The diagnostic carried no location, so its author had no pointer to
+        // a file they did not write.
+        if foreign(&module) {
+            continue;
+        }
         let wrapped = format!("fn __doc_example() {{\n{}\n}}\n", ex.source);
         let parsed = grasm_syntax::parse(&wrapped);
         if !parsed.diagnostics.is_empty() {
@@ -1790,16 +1799,29 @@ fn declared_row_within(
     aliases: &HashMap<String, TypeExpr>,
     type_rows: &HashMap<String, BTreeSet<String>>,
 ) -> Option<BTreeSet<String>> {
+    declared_row_within_at(te, aliases, type_rows, 0)
+}
+
+fn declared_row_within_at(
+    te: &TypeExpr,
+    aliases: &HashMap<String, TypeExpr>,
+    type_rows: &HashMap<String, BTreeSet<String>>,
+    depth: usize,
+) -> Option<BTreeSet<String>> {
+    // Bounded for the same reason as `collect_type_names`.
+    if depth > MAX_ALIAS_DEPTH {
+        return None;
+    }
     match &resolve_alias(te, aliases, 0) {
         TypeExpr::Fn { effects, .. } => {
             Some(effects.iter().map(|p| p.dotted()).collect())
         }
         TypeExpr::List(inner, _) | TypeExpr::Ref(inner, _) => {
-            declared_row_within(inner, aliases, type_rows)
+            declared_row_within_at(inner, aliases, type_rows, depth + 1)
         }
         TypeExpr::Fallible(a, b, _) => union_rows(
-            declared_row_within(a, aliases, type_rows),
-            declared_row_within(b, aliases, type_rows),
+            declared_row_within_at(a, aliases, type_rows, depth + 1),
+            declared_row_within_at(b, aliases, type_rows, depth + 1),
         ),
         // `Option[T]`, `Map[K, V]` and any other named generic — and a
         // declared type, whose own fields may hold a row. A name stood for
@@ -1816,14 +1838,14 @@ fn declared_row_within(
                 }
             }
             for a in args {
-                found = union_rows(found, declared_row_within(a, aliases, type_rows));
+                found = union_rows(found, declared_row_within_at(a, aliases, type_rows, depth + 1));
             }
             found
         }
         TypeExpr::Union(items, _) | TypeExpr::Tuple(items, _) => {
             let mut found: Option<BTreeSet<String>> = None;
             for i in items {
-                if let Some(r) = declared_row_within(i, aliases, type_rows) {
+                if let Some(r) = declared_row_within_at(i, aliases, type_rows, depth + 1) {
                     found = Some(match found {
                         None => r,
                         Some(prev) => prev.union(&r).cloned().collect(),
@@ -2156,14 +2178,25 @@ fn indirect_row(
 /// A row on a struct field is keyed by the field's name, because that is what
 /// a call site spells (`b.f(x)`). A row anywhere else has no name to key on
 /// and joins the nameless pool.
-fn harvest_rows(
+#[allow(clippy::too_many_arguments)]
+fn harvest_rows_at(
     t: &TypeExpr,
     field: Option<&str>,
     aliases: &HashMap<String, TypeExpr>,
     type_rows: &HashMap<String, BTreeSet<String>>,
     field_rows: &mut HashMap<String, BTreeSet<String>>,
     elem_rows: &mut BTreeSet<String>,
+    depth: usize,
 ) {
+    // `type A = [A]` resolves one alias and finds the shape holding it again,
+    // so an unbounded walk here overflowed the process stack and aborted the
+    // whole toolchain with exit 134 and no diagnostic — including a
+    // consumer's, when the line was in a dependency. [G-NEST-LIMIT]: exceeding
+    // a cap is a diagnostic, never a crash. The declaration is refused
+    // elsewhere; this pass only has to stop.
+    if depth > MAX_ALIAS_DEPTH {
+        return;
+    }
     // A `type` name stands for what it names, here as everywhere: a field
     // whose type was written as an alias contributed no row at all, so the
     // same program was refused with the row inline and accepted behind a name.
@@ -2183,27 +2216,27 @@ fn harvest_rows(
                 }
             }
             for p in params {
-                harvest_rows(p, None, aliases, type_rows, field_rows, elem_rows);
+                harvest_rows_at(p, None, aliases, type_rows, field_rows, elem_rows, depth + 1);
             }
-            harvest_rows(ret, None, aliases, type_rows, field_rows, elem_rows);
+            harvest_rows_at(ret, None, aliases, type_rows, field_rows, elem_rows, depth + 1);
         }
         // Inside any other type constructor the function type has lost its
         // field name, so what it carries joins the nameless pool.
         TypeExpr::List(inner, _) | TypeExpr::Ref(inner, _) => {
-            harvest_rows(inner, None, aliases, type_rows, field_rows, elem_rows)
+            harvest_rows_at(inner, None, aliases, type_rows, field_rows, elem_rows, depth + 1)
         }
         TypeExpr::Fallible(a, b, _) => {
-            harvest_rows(a, None, aliases, type_rows, field_rows, elem_rows);
-            harvest_rows(b, None, aliases, type_rows, field_rows, elem_rows);
+            harvest_rows_at(a, None, aliases, type_rows, field_rows, elem_rows, depth + 1);
+            harvest_rows_at(b, None, aliases, type_rows, field_rows, elem_rows, depth + 1);
         }
         TypeExpr::Tuple(items, _) | TypeExpr::Union(items, _) => {
             for i in items {
-                harvest_rows(i, None, aliases, type_rows, field_rows, elem_rows);
+                harvest_rows_at(i, None, aliases, type_rows, field_rows, elem_rows, depth + 1);
             }
         }
         TypeExpr::Name { args, .. } => {
             for a in args {
-                harvest_rows(a, None, aliases, type_rows, field_rows, elem_rows);
+                harvest_rows_at(a, None, aliases, type_rows, field_rows, elem_rows, depth + 1);
             }
         }
     }
@@ -2255,13 +2288,13 @@ fn collect_type_rows(
             };
             let e_own = own.entry(td.name.name.clone()).or_default();
             for t in &parts {
-                if let Some(r) = declared_row_shallow(t, aliases) {
+                if let Some(r) = declared_row_shallow(t, aliases, 0) {
                     e_own.extend(r);
                 }
             }
             let e_names = mentions.entry(td.name.name.clone()).or_default();
             for t in &parts {
-                collect_type_names(t, aliases, e_names);
+                collect_type_names(t, aliases, e_names, 0);
             }
         }
     }
@@ -2296,24 +2329,35 @@ fn collect_type_names(
     te: &TypeExpr,
     aliases: &HashMap<String, TypeExpr>,
     out: &mut BTreeSet<String>,
+    depth: usize,
 ) {
+    // `type A = [A]` is a name that stands for a shape holding itself. Each
+    // step through it resolves one alias and finds another, so an unbounded
+    // walk here overflowed the process stack and aborted the whole toolchain
+    // with exit 134 and no diagnostic — including a consumer's, when the line
+    // was in a dependency. [G-NEST-LIMIT]: exceeding a cap is a diagnostic,
+    // never a crash. The declaration is refused elsewhere; this pass only has
+    // to stop.
+    if depth > MAX_ALIAS_DEPTH {
+        return;
+    }
     match &resolve_alias(te, aliases, 0) {
         TypeExpr::Fn { params, ret, .. } => {
             for p in params {
-                collect_type_names(p, aliases, out);
+                collect_type_names(p, aliases, out, depth + 1);
             }
-            collect_type_names(ret, aliases, out);
+            collect_type_names(ret, aliases, out, depth + 1);
         }
         TypeExpr::List(inner, _) | TypeExpr::Ref(inner, _) => {
-            collect_type_names(inner, aliases, out)
+            collect_type_names(inner, aliases, out, depth + 1)
         }
         TypeExpr::Fallible(a, b, _) => {
-            collect_type_names(a, aliases, out);
-            collect_type_names(b, aliases, out);
+            collect_type_names(a, aliases, out, depth + 1);
+            collect_type_names(b, aliases, out, depth + 1);
         }
         TypeExpr::Tuple(items, _) | TypeExpr::Union(items, _) => {
             for i in items {
-                collect_type_names(i, aliases, out);
+                collect_type_names(i, aliases, out, depth + 1);
             }
         }
         TypeExpr::Name { path, args, .. } => {
@@ -2321,7 +2365,7 @@ fn collect_type_names(
                 out.insert(seg.name.clone());
             }
             for a in args {
-                collect_type_names(a, aliases, out);
+                collect_type_names(a, aliases, out, depth + 1);
             }
         }
     }
@@ -2332,27 +2376,32 @@ fn collect_type_names(
 fn declared_row_shallow(
     te: &TypeExpr,
     aliases: &HashMap<String, TypeExpr>,
+    depth: usize,
 ) -> Option<BTreeSet<String>> {
+    // Bounded for the same reason as `collect_type_names`.
+    if depth > MAX_ALIAS_DEPTH {
+        return None;
+    }
     match &resolve_alias(te, aliases, 0) {
         TypeExpr::Fn { effects, .. } => Some(effects.iter().map(|p| p.dotted()).collect()),
         TypeExpr::List(inner, _) | TypeExpr::Ref(inner, _) => {
-            declared_row_shallow(inner, aliases)
+            declared_row_shallow(inner, aliases, depth + 1)
         }
         TypeExpr::Fallible(a, b, _) => union_rows(
-            declared_row_shallow(a, aliases),
-            declared_row_shallow(b, aliases),
+            declared_row_shallow(a, aliases, depth + 1),
+            declared_row_shallow(b, aliases, depth + 1),
         ),
         TypeExpr::Tuple(items, _) | TypeExpr::Union(items, _) => {
             let mut found: Option<BTreeSet<String>> = None;
             for i in items {
-                found = union_rows(found, declared_row_shallow(i, aliases));
+                found = union_rows(found, declared_row_shallow(i, aliases, depth + 1));
             }
             found
         }
         TypeExpr::Name { args, .. } => {
             let mut found: Option<BTreeSet<String>> = None;
             for a in args {
-                found = union_rows(found, declared_row_shallow(a, aliases));
+                found = union_rows(found, declared_row_shallow(a, aliases, depth + 1));
             }
             found
         }
@@ -2373,24 +2422,24 @@ fn harvest_module(
             Decl::Type(td) => match &td.body {
                 TypeBody::Struct(fields) => {
                     for f in fields {
-                        harvest_rows(&f.ty, Some(&f.name.name), aliases, type_rows, field_rows, elem_rows);
+                        harvest_rows_at(&f.ty, Some(&f.name.name), aliases, type_rows, field_rows, elem_rows, 0);
                     }
                 }
                 TypeBody::Sum(variants) => {
                     for v in variants {
                         for f in &v.fields {
-                            harvest_rows(&f.ty, Some(&f.name.name), aliases, type_rows, field_rows, elem_rows);
+                            harvest_rows_at(&f.ty, Some(&f.name.name), aliases, type_rows, field_rows, elem_rows, 0);
                         }
                     }
                 }
-                TypeBody::Alias(t) => harvest_rows(t, None, aliases, type_rows, field_rows, elem_rows),
+                TypeBody::Alias(t) => harvest_rows_at(t, None, aliases, type_rows, field_rows, elem_rows, 0),
             },
             Decl::Fn(fd) => {
                 for p in &fd.params {
-                    harvest_rows(&p.ty, None, aliases, type_rows, field_rows, elem_rows);
+                    harvest_rows_at(&p.ty, None, aliases, type_rows, field_rows, elem_rows, 0);
                 }
                 if let Some(r) = &fd.ret {
-                    harvest_rows(r, None, aliases, type_rows, field_rows, elem_rows);
+                    harvest_rows_at(r, None, aliases, type_rows, field_rows, elem_rows, 0);
                 }
             }
             _ => {}

@@ -537,7 +537,7 @@ fn run_one_example(
         let _ = writeln!(out, "doc example {wanted} ... FAILED: no test");
         return (false, hits);
     };
-    let ok = {
+    let outcome = {
         let mut interp = Interp::new_program(&files, &mut buf);
         interp.set_float_literals(analysis.float_literals.clone());
         interp.set_fallible_closures(analysis.fallible_closures.clone());
@@ -545,21 +545,26 @@ fn run_one_example(
         if coverage {
             interp.enable_coverage();
         }
-        let ok = interp.run_unit_test(t);
+        let outcome = interp.run_unit_test_result(t);
         if let Some(h) = interp.take_coverage() {
             hits.extend(h);
         }
-        ok
+        outcome
     };
-    // The example's own report names it as a test; relabel so a reader can
-    // tell a doc example from a declared one.
-    let report = String::from_utf8_lossy(&buf);
-    let detail = report
-        .split_once("... ")
-        .map(|(_, rest)| rest.trim_end().to_string())
-        .unwrap_or_default();
-    let _ = writeln!(out, "doc example {wanted} ... {detail}");
-    (ok, hits)
+    // The example's own output, then a line naming it as a doc example rather
+    // than as the declared test it was synthesized into. Recovering that line
+    // by splitting the buffer took whatever the *body* printed as the status,
+    // and dropped the output entirely.
+    let _ = out.write_all(&buf);
+    match &outcome {
+        Ok(()) => {
+            let _ = writeln!(out, "doc example {wanted} ... ok");
+        }
+        Err(message) => {
+            let _ = writeln!(out, "doc example {wanted} ... FAILED: {message}");
+        }
+    }
+    (outcome.is_ok(), hits)
 }
 
 /// Maps executed span offsets back to (file, line), against every line that

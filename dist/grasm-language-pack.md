@@ -454,6 +454,19 @@ fields are accessed with `.`.
 **[T-SUM]** `type S = | A(f: T) | B` declares a named sum type; values are
 built with variant constructors and consumed with `match`.
 
+**[T-ALIAS-NOT-RECURSIVE]** A `type` alias may not be defined in terms of
+itself, directly or through other aliases. It is another spelling of the type
+it names, so it has nowhere to stop — unlike a struct or a sum, which
+[T-RECURSIVE] does allow to refer to themselves, because a value of one is
+built out of *other* values.
+
+`type A = [A]` was accepted at the declaration and then walked recursively by
+every pass that reads a written type: the process aborted with a Rust stack
+overflow, exit 134 and no diagnostic at all — and a dependency carrying the
+line took its consumer's toolchain down with it, after `grasm deps` had
+printed a partial success line. [G-NEST-LIMIT]: exceeding a cap is a
+diagnostic, never a crash.
+
 **[T-RECURSIVE]** A type may refer to itself, directly or through a
 collection: `type Json = | JArr(items: [Json]) | JObj(fields: Map[str, Json])`
 is the shape a parser needs and is legal. Recursion through a field of the
@@ -1691,6 +1704,13 @@ enclosing handler for that effect.
 
 **[E-HANDLER-SCOPE]** A handler is installed for the dynamic extent of its
 `with` block, including calls made from inside it.
+
+A handler's operations are closures, so they capture where the handler is
+*written*, not where it is installed. The compiled backend filled the
+environment at the `with`, so a binding changed between the two was read at
+its new value: `var n = 1`, build the handler, `n = 100`, install it — the
+interpreter answered `1` and the compiled binary answered `100`, with matching
+exit codes and nothing on stderr to say the two disagreed.
 
 **[E-HANDLER-OWN-ROW]** A handler's *own* effects are counted where the handler
 is **installed**, not where its operations are called. So a `B` handler whose
@@ -6527,6 +6547,33 @@ fn main() {
 	let    a	=	1
 	let  b  =  2
 	print("{a+b}")
+}
+```
+
+## `T-ALIAS-NOT-RECURSIVE.gr`
+
+```grasm
+//! tag: T-ALIAS-NOT-RECURSIVE
+//! expect: error
+//! type `Loop` is defined in terms of itself
+// An alias is another spelling of the type it names, so it has nowhere to
+// stop.
+//
+// Accepted at the declaration, it was then walked recursively by every pass
+// that reads a written type: the process aborted with a Rust stack overflow,
+// exit 134 and no diagnostic at all — and a dependency carrying the line took
+// its consumer's toolchain down with it, after `grasm deps` had printed a
+// partial success line. [G-NEST-LIMIT]: exceeding a cap is a diagnostic,
+// never a crash.
+//
+// A struct or a sum may refer to itself ([T-RECURSIVE]), because a value of
+// one is built out of *other* values — `Tree` below is legal and compiles.
+type Loop = [Loop]
+
+type Tree = | Node(kids: [Tree]) | Leaf
+
+fn main() {
+    print("{Tree.Leaf}")
 }
 ```
 

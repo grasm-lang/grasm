@@ -1,0 +1,22 @@
+//! tag: T-ALIAS-NOT-RECURSIVE
+//! expect: error
+//! type `Loop` is defined in terms of itself
+// An alias is another spelling of the type it names, so it has nowhere to
+// stop.
+//
+// Accepted at the declaration, it was then walked recursively by every pass
+// that reads a written type: the process aborted with a Rust stack overflow,
+// exit 134 and no diagnostic at all — and a dependency carrying the line took
+// its consumer's toolchain down with it, after `grasm deps` had printed a
+// partial success line. [G-NEST-LIMIT]: exceeding a cap is a diagnostic,
+// never a crash.
+//
+// A struct or a sum may refer to itself ([T-RECURSIVE]), because a value of
+// one is built out of *other* values — `Tree` below is legal and compiles.
+type Loop = [Loop]
+
+type Tree = | Node(kids: [Tree]) | Leaf
+
+fn main() {
+    print("{Tree.Leaf}")
+}

@@ -52,6 +52,19 @@ fields are accessed with `.`.
 **[T-SUM]** `type S = | A(f: T) | B` declares a named sum type; values are
 built with variant constructors and consumed with `match`.
 
+**[T-ALIAS-NOT-RECURSIVE]** A `type` alias may not be defined in terms of
+itself, directly or through other aliases. It is another spelling of the type
+it names, so it has nowhere to stop — unlike a struct or a sum, which
+[T-RECURSIVE] does allow to refer to themselves, because a value of one is
+built out of *other* values.
+
+`type A = [A]` was accepted at the declaration and then walked recursively by
+every pass that reads a written type: the process aborted with a Rust stack
+overflow, exit 134 and no diagnostic at all — and a dependency carrying the
+line took its consumer's toolchain down with it, after `grasm deps` had
+printed a partial success line. [G-NEST-LIMIT]: exceeding a cap is a
+diagnostic, never a crash.
+
 **[T-RECURSIVE]** A type may refer to itself, directly or through a
 collection: `type Json = | JArr(items: [Json]) | JObj(fields: Map[str, Json])`
 is the shape a parser needs and is legal. Recursion through a field of the
