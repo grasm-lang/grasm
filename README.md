@@ -267,6 +267,14 @@ in that property, and each was one cell of a grid nobody had written down.
 question the ceiling is actually for: a `capabilities = []` dependency that
 holds an effectful function value has to fail the build in its *consumer*.
 
+`scripts/fuzz_handlers.py` covers what the other generators' grammars cannot
+reach: effect handlers and pattern binders, which is where both of this
+project's SIGSEGVs came from — an operation declared `-> () ! E` whose body
+gave the bare `()` half, and a bare identifier in a pattern that happened to
+name a nullary variant of another type. It varies where the handler literal is
+written, whether a captured binding changes between that point and the `with`,
+what the operation returns, and which pattern shapes the body matches.
+
 `scripts/crosstest.sh` runs the same gate against a *cross-compiled* target to
 prove the backend isn't accidentally host-specific — currently **130 identical,
 0 mismatched, 0 unsupported** for x86_64 built on arm64. CI
@@ -475,7 +483,7 @@ Currently **65 normative clauses, 65 conformance programs**.
 | `projects/advanced` | validation: router+middleware, scheduler, WAL mini-DB, **Mini-Grasm interpreter written in Grasm** |
 | `spec/` | normative specification + one conformance program per clause |
 | `editors/` | VS Code extension and LSP setup for other editors |
-| `scripts/` | `difftest.sh` (native vs interpreter), `crosstest.sh` (cross-target), `fuzz_differential.py`, `fuzz_fallible.py`, `fuzz_generics.py` and `fuzz_rows.py` (generated programs) |
+| `scripts/` | `difftest.sh` (native vs interpreter), `crosstest.sh` (cross-target), `fuzz_differential.py`, `fuzz_fallible.py`, `fuzz_generics.py`, `fuzz_rows.py` and `fuzz_handlers.py` (generated programs) |
 | `MASTERPLAN.md` | the full v0.3 strategic blueprint this implements Phase 0–1 of |
 
 ## Status

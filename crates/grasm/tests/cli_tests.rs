@@ -1751,3 +1751,48 @@ fn a_directory_where_a_file_belongs_is_named() {
         assert!(!out.contains("``"), "{cmd} names nothing:\n{out}");
     }
 }
+
+/// A native build leaves no temporary directory behind.
+///
+/// The scratch directory holding the object file was created and never
+/// removed, on any path: 33,000 of them and 2.2 GB accumulated on one machine
+/// during this project's own test runs, which is a compiler filling the disk
+/// of anyone who builds in a loop.
+#[test]
+fn a_native_build_leaves_no_scratch_directory() {
+    let w = Work::new("scratch");
+    let dir = w.0.join("src");
+    std::fs::create_dir_all(&dir).unwrap();
+    let entry = dir.join("t.gr");
+    std::fs::write(&entry, "fn main() {\n    print(\"x\")\n}\n").unwrap();
+    let p = entry.to_str().unwrap();
+
+    let leaked = || -> usize {
+        let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) else {
+            return 0;
+        };
+        rd.flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("grasm_native_")
+            })
+            .count()
+    };
+    let before = leaked();
+
+    let good = w.0.join("out");
+    for _ in 0..3 {
+        let (code, out) = run(&["build", p, "--native", "-o", good.to_str().unwrap()]);
+        assert_eq!(code, 0, "{out}");
+    }
+    // And on the failure path, where a dozen `?` return early.
+    let (code, _) = run(&["build", p, "--native", "-o", "/nonexistent/dir/x"]);
+    assert_eq!(code, 1);
+
+    assert_eq!(
+        leaked(),
+        before,
+        "a native build left a scratch directory behind"
+    );
+}

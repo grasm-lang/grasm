@@ -1556,6 +1556,33 @@ fn build_native_whole(program: &Program, out_path: &str) -> Result<u64, String> 
     build_native_incremental(program, out_path, false)
 }
 
+/// A temporary directory that goes away when this value does.
+///
+/// Named for the process rather than randomly so a build that is killed leaves
+/// at most one, and so a reader who finds one knows what wrote it.
+struct Scratch(std::path::PathBuf);
+
+impl Scratch {
+    fn new() -> Result<Scratch, String> {
+        let dir = std::env::temp_dir().join(format!("grasm_native_{}", std::process::id()));
+        // A previous run with this pid may have been killed before its own
+        // cleanup; its object files are not ours.
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        Ok(Scratch(dir))
+    }
+
+    fn path(&self) -> std::path::PathBuf {
+        self.0.clone()
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Compiles each module to its own object, reusing cached ones whose inputs
 /// have not changed, then links them together.
 fn build_native_incremental(
@@ -1563,8 +1590,12 @@ fn build_native_incremental(
     out_path: &str,
     incremental: bool,
 ) -> Result<u64, String> {
-    let scratch = std::env::temp_dir().join(format!("grasm_native_{}", std::process::id()));
-    std::fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
+    // Removed however this function returns — and there are a dozen `?` on
+    // the way out. Left behind, every native build leaked a directory holding
+    // its object file: 33,000 of them and 2.2 GB on this machine, which is a
+    // compiler filling up the disk of anyone who builds in a loop.
+    let scratch = Scratch::new()?;
+    let scratch = scratch.path();
 
     let mut objects: Vec<std::path::PathBuf> = Vec::new();
     if incremental && program.files.len() > 1 {
