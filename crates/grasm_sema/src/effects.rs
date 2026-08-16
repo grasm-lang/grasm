@@ -880,7 +880,16 @@ fn collect_closure_lits<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
 }
 
 pub fn check_effects_multi(files: &[ModuleView]) -> Vec<Diagnostic> {
-    let mut ctx = build_ctx(files);
+    check_effects_multi_in(files, &BTreeSet::new())
+}
+
+/// `check_effects_multi`, told which module names are dependency packages, so
+/// a handler written by a consumer is charged to the consumer.
+pub fn check_effects_multi_in(
+    files: &[ModuleView],
+    packages: &BTreeSet<String>,
+) -> Vec<Diagnostic> {
+    let mut ctx = build_ctx_in(files, packages);
     solve_rows(&mut ctx);
 
     let mut diags = Vec::new();
@@ -1686,6 +1695,12 @@ impl<'a> FnBindings<'a> {
 /// point is to hand on the sources of one known binding, not to guess.
 fn binding_root(e: &Expr) -> Option<&str> {
     match e {
+        // A plain copy: `let f = step`. Without this it fell through to the
+        // unaccounted fallback, so an unrelated `log: fn(str) / {io}` in the
+        // same signature charged `io` to a call through `step` — while
+        // `xs.map(step)` written directly was accepted, the same program one
+        // `let` apart.
+        Expr::Ident(id) => Some(&id.name),
         Expr::Index { recv, .. } | Expr::Field { recv, .. } => match &**recv {
             Expr::Ident(id) => Some(&id.name),
             inner => binding_root(inner),

@@ -97,10 +97,25 @@ pub fn check_program(program: &crate::loader::Program) -> Analysis {
             imports: f.imports.clone(),
         })
         .collect();
-    check_modules(&files)
+    check_modules_in(&files, &program.deps.iter().cloned().collect())
 }
 
 fn check_modules(files: &[ModuleView]) -> Analysis {
+    check_modules_in(files, &std::collections::BTreeSet::new())
+}
+
+/// `check_modules`, told which module names are dependency packages.
+///
+/// Only the effect pass needs it, and only to decide where a handler's own
+/// effects are charged: a handler written by a *consumer* runs on the
+/// consumer's authority ([E-HANDLER-OWN-ROW]). The capability pass was told
+/// and the row pass was not, so one `grasm deps` run reported
+/// `lib performs []  permits []` — no violation — while refusing the same
+/// function's declared row for a `print` written entirely in the consumer.
+fn check_modules_in(
+    files: &[ModuleView],
+    packages: &std::collections::BTreeSet<String>,
+) -> Analysis {
     let mut c = Checker::new();
     // The effect fixpoint runs first: a function's row is part of its type,
     // and nothing can be typed until the rows are known ([T-FN-TYPE-ROW]).
@@ -196,7 +211,7 @@ fn check_modules(files: &[ModuleView]) -> Analysis {
         );
     }
     let mut diagnostics = c.diags;
-    diagnostics.extend(crate::effects::check_effects_multi(files));
+    diagnostics.extend(crate::effects::check_effects_multi_in(files, packages));
     // Source order. The effect pass walks a hash map, so the *same* file
     // reported its errors in a different order on every run — and `grasm run`
     // and `grasm build` could disagree about the order of the same two — which
@@ -1489,7 +1504,10 @@ different name, or call it as a method if you meant to extend a type (UFCS)",
         // `T ! E` is what every branch builds, so it is what reaches them.
         ) || matches!(
             f.body.stmts.last(),
-            Some(Stmt::Expr(e)) if yields_whole(e)
+            // Or one where *some* branch does: a mixing `if`/`match`, however
+            // it is nested, merges to the whole `T ! E` and each of its own
+            // branches may then give either half ([T-OK-ERR-RETURN]).
+            Some(Stmt::Expr(e)) if yields_whole(e) || yields_some_whole(e)
         );
         let want_tail = if ret == Type::Unit {
             None
@@ -2872,7 +2890,11 @@ afterwards has nowhere to send the effect — call it here, or return what it co
             return want.clone();
         };
         match tail {
-            Some(Stmt::Expr(e)) if yields_whole_expr(e) || self.branch_calls_fallible(e) => {
+            Some(Stmt::Expr(e))
+                if yields_whole_expr(e)
+                    || yields_some_whole(e)
+                    || self.branch_calls_fallible(e) =>
+            {
                 want.clone()
             }
             // This branch gives the bare half, so its value has to be wrapped
@@ -6081,6 +6103,18 @@ bind the component to a `var`, or use a struct when the parts have names worth w
             self.scopes.pop();
             arm_states.push(self.moved_snapshot());
         }
+        // A body that *builds* the whole `T ! E` decides the match's type; a
+        // bare one adopts whatever that turns out to be. Both defer — `Ok(2)`
+        // is a carrier of literals like `[2]` is — so with every arm deferred
+        // the bare one went first, fixed the result to the ok half, and the
+        // `Ok` arm was then refused against it. Only nesting reached this:
+        // written directly at a fallible position the result is seeded from
+        // the outside and there is nothing left to decide.
+        deferred_literals.sort_by_key(|body| {
+            !matches!(body, Expr::Call { callee, .. }
+                if matches!(&**callee, Expr::Ident(id)
+                    if matches!(id.name.as_str(), "Ok" | "Err")))
+        });
         for body in deferred_literals {
             // As above: a literal arm beside an `Err(e)` arm is the ok half —
             // unless it *is* the whole fallible, which `Ok(3)` is. A body may
@@ -6668,6 +6702,45 @@ fn yields_whole_expr(e: &Expr) -> bool {
             if id.name == "Ok" || id.name == "Err" || id.name == "fail"),
         Expr::If { .. } | Expr::Match { .. } => yields_whole(e),
         Expr::Try { .. } => false,
+        // A branch whose tail is a block is worth what the block is worth.
+        Expr::Block(b) => match b.stmts.last() {
+            Some(Stmt::Expr(inner)) => yields_whole_expr(inner),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Whether *some* branch inside `e` builds the whole `T ! E`.
+///
+/// `yields_whole` asks whether every branch does, which is the question for
+/// "is this expression already the whole thing". This is the question for
+/// "does the expected type have to reach it as the whole thing": an `if` or
+/// `match` that mixes the halves merges to the whole, and each of its own
+/// branches may then give either ([T-OK-ERR-RETURN]). Asked the first
+/// question, a *nested* mixing branch was handed the ok half and its `Ok(2)`
+/// was refused — while the same computation with the two constructs swapped
+/// was accepted, one keyword apart.
+fn yields_some_whole(e: &Expr) -> bool {
+    fn tail(b: &Block) -> Option<&Expr> {
+        match b.stmts.last() {
+            Some(Stmt::Expr(e)) => Some(e),
+            _ => None,
+        }
+    }
+    match e {
+        Expr::Call { callee, .. } => matches!(&**callee, Expr::Ident(id)
+            if id.name == "Ok" || id.name == "Err" || id.name == "fail"),
+        Expr::If { then_block, else_branch, .. } => {
+            tail(then_block).is_some_and(yields_some_whole)
+                || match else_branch.as_deref() {
+                    Some(ElseBranch::Else(b)) => tail(b).is_some_and(yields_some_whole),
+                    Some(ElseBranch::ElseIf(inner)) => yields_some_whole(inner),
+                    None => false,
+                }
+        }
+        Expr::Match { arms, .. } => arms.iter().any(|a| yields_some_whole(&a.body)),
+        Expr::Block(b) => tail(b).is_some_and(yields_some_whole),
         _ => false,
     }
 }

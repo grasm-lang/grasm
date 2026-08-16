@@ -212,7 +212,7 @@ package's own directory, and a file outside it is in none of them"
             // the digest — `--locked` reported "up to date" after it changed —
             // and outside the published set, which shipped a package that
             // could not build into a slot that cannot be republished.
-            if !entry.ends_with(".gr") {
+            if !is_grasm_source(p) {
                 return Err(format!(
                     "`entry` must name a `.gr` file: `{entry}` is not one, and the \
 lockfile's checksum and `grasm publish` both cover this package's `.gr` sources — a file \
@@ -1142,7 +1142,7 @@ pub fn effect_sites_of_package(
     let mut out = grasm_sema::effects::effect_sites(&program);
     // The same whole-package scan the ceiling uses, so a breach in an
     // unimported sibling module still says where it is.
-    for extra in package_modules(&entry) {
+    for extra in package_modules(manifest, &entry) {
         if let Ok(p) = grasm_sema::loader::load_from_disk_with(&extra, &resolved) {
             for (k, v) in grasm_sema::effects::effect_sites(&p) {
                 out.entry(k).or_insert(v);
@@ -1184,7 +1184,7 @@ pub fn effects_of_package(manifest: &Manifest) -> Result<BTreeSet<String>, Strin
     // on the *consumer*, at a source location inside the dependency that the
     // consumer cannot fix, and if the consumer already declared `io` for its
     // own reasons, nothing was reported at all.
-    for extra in package_modules(&entry) {
+    for extra in package_modules(manifest, &entry) {
         let p = grasm_sema::loader::load_from_disk_with(&extra, &resolved).map_err(|e| {
             format!("package `{}`: {}", manifest.name, e)
         })?;
@@ -1242,11 +1242,15 @@ fn first_failure(program: &grasm_sema::loader::Program, entry: &Path) -> Option<
 }
 
 /// Every `.gr` file in a package's source tree apart from its entry.
-fn package_modules(entry: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let Some(dir) = entry.parent() else {
-        return Vec::new();
-    };
-    source_files(dir)
+fn package_modules(manifest: &Manifest, entry: &std::path::Path) -> Vec<std::path::PathBuf> {
+    // From the *package* directory, which is what the checksum and
+    // `grasm publish` cover. Walking from the entry's directory instead meant
+    // a `.gr` file elsewhere in the package — `tests/t.gr` beside `src/` — was
+    // checksummed and shipped and never held to the ceiling, nor even parsed:
+    // a `capabilities = []` package could keep a filesystem reader there and
+    // be reported as performing nothing, which is the failure this whole-
+    // package scan exists to prevent.
+    source_files(&manifest.dir)
         .unwrap_or_default()
         .into_iter()
         .filter(|p| p != entry)

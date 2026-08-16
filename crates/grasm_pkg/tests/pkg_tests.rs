@@ -1680,3 +1680,95 @@ fn add_refuses_a_name_a_manifest_cannot_hold() {
     // A usable name still works.
     assert!(grasm_pkg::add_dependency(&dir, "util", &req).is_ok());
 }
+
+/// The capability scan reads every source in the package, not only the ones
+/// beside the entry.
+///
+/// `package_modules` enumerated from the entry file's *directory*, so a
+/// `capabilities = []` package could print from `tests/helper.gr` or from a
+/// `src/deep/` subdirectory and the ceiling saw nothing — while the checksum
+/// and `publish`, which walk the package root, shipped the file. Three
+/// enumerations of one file set is one too many.
+#[test]
+fn the_ceiling_sees_every_source_in_the_package() {
+    for at in ["tests/helper.gr", "helper.gr", "src/deep/helper.gr", "src/HELPER.GR"] {
+        let ws = Workspace::new("scan_all");
+        let dir = ws.package("probe", &manifest("probe", Some(""), &[]), PURE_SRC);
+        let file = dir.join(at);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, IO_SRC).unwrap();
+        let m = Manifest::load(&dir).expect("manifest loads");
+        let effects = grasm_pkg::effects_of_package(&m).expect("effects are inferred");
+        assert!(
+            effects.contains("io"),
+            "`io` performed in {at} escaped the scan: {effects:?}"
+        );
+        assert!(grasm_pkg::check_capabilities(&m, &effects).is_some(), "{at}");
+    }
+}
+
+/// `entry` is recognised by the same rule that recognises a source file.
+///
+/// The check was a case-sensitive `ends_with(".gr")` while `source_files`
+/// matched the extension case-insensitively, so `entry = "src/Main.GR"` was
+/// refused with the reason "must name a `.gr` file" — about a file that is
+/// one.
+#[test]
+fn entry_uses_the_same_rule_as_the_source_scan() {
+    let ws = Workspace::new("entry_case");
+    for (entry, ok) in [("src/Main.GR", true), ("src/main.gr", true), ("src/lib.txt", false)] {
+        let dir = ws.package(
+            "probe",
+            &format!("[package]\nname = \"probe\"\nversion = \"0.1.0\"\nentry = \"{entry}\"\n"),
+            PURE_SRC,
+        );
+        let loaded = Manifest::load(&dir);
+        assert_eq!(loaded.is_ok(), ok, "entry = {entry:?}: {loaded:?}");
+        if let Err(e) = loaded {
+            assert!(e.contains("must name a `.gr` file"), "{e}");
+        }
+    }
+}
+
+/// A library that takes a handler from its consumer performs no effect of its
+/// own — and the row check must draw the package boundary where the ceiling
+/// draws it.
+///
+/// The ceiling charges a `with` to the module that *writes* it, so a
+/// `capabilities = []` library declaring `/ {Log}` and a consumer installing a
+/// printing handler is the intended shape. The row check saw one flat program
+/// instead: every handler in the loaded set, whichever package wrote it, was
+/// folded into every module's rows, so the library was charged the consumer's
+/// `io` and the build failed with an error naming a package that permits it.
+#[test]
+fn a_consumer_supplied_handler_is_charged_to_the_consumer() {
+    let ws = Workspace::new("consumer_handler");
+    ws.package(
+        "logging",
+        &manifest("logging", Some(""), &[]),
+        "effect Log {\n    fn write(s: str)\n}\n\n\
+pub fn work(h: LogHandler, s: str) / {} {\n    with Log handled_by h {\n        \
+Log.write(s)\n    }\n}\n",
+    );
+    let app = ws.package(
+        "app",
+        &manifest("app", Some("\"io\""), &[("logging", "../logging")]),
+        "import logging\n\nfn main() {\n    \
+lib_run()\n}\n\nfn lib_run() {\n    \
+logging.work(LogHandler{ write: |s| print(s) }, \"x\")\n}\n",
+    );
+
+    let program = grasm_sema::loader::load_from_disk(&app.join("src/main.gr"))
+        .expect("the entry file loads");
+    let diags = grasm_sema::check::check_program(&program).diagnostics;
+    assert!(diags.is_empty(), "{diags:#?}");
+
+    let mut out = Vec::new();
+    assert_eq!(grasm_interp::run_program(&program, &[], &mut out), 0);
+    assert_eq!(String::from_utf8(out).unwrap(), "x\n");
+
+    // The library still permits nothing of its own.
+    let m = Manifest::load(&ws.path().join("logging")).expect("manifest loads");
+    let effects = grasm_pkg::effects_of_package(&m).expect("effects are inferred");
+    assert!(grasm_pkg::check_capabilities(&m, &effects).is_none(), "{effects:?}");
+}

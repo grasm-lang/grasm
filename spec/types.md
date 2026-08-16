@@ -453,7 +453,14 @@ position with no field name — its list elements, its tuple components, its
 wider pool charged `io` to a function whose own element type declares no
 effects, on the strength of an unrelated declaration elsewhere in the file.
 
-Reading a part out of a binding hands on *that* binding's sources. `let g =
+Reading a part out of a binding hands on *that* binding's sources, and so does
+copying one whole: `let f = step` is `step`'s row, not the pool. A plain named
+parameter is not a position "with no field name", but the copy fell through to
+the fallback anyway, so an unrelated `log: fn(str) / {io}` in the same
+signature charged `io` to a call through a pure `step` — while `xs.map(step)`
+written directly was accepted. The same program one `let` apart, again.
+
+`let g =
 fs[0]` fell through to the pool of every function value in the function, so an
 unrelated closure elsewhere charged its effect to a call through `g` — while
 the same program written `for g in fs` was accepted, which is the pair this
@@ -573,6 +580,12 @@ so it printed as `1`, compared unequal to `Ok(1)`, and matched no arm of a
 `match` over it. A native build, which wraps by produced type, answered
 correctly — the normative engine was the wrong one, at exit 0 with nothing on
 stderr.
+
+Nesting does not change the position. A branch whose own body branches is at
+the fallible position too, so `if a { if b { 1 } else { Ok(2) } } else { Ok(3) }`
+merges to `i64 ! E` exactly as the flat form does; the expected type reached
+only the *immediate* expression, so the same computation was accepted written
+with `match` on the outside and refused written with `if`, one keyword apart.
 
 This is a rule about the *position*, not about how it was reached: an
 annotation naming `T ! E` — a `let`, a struct field, a parameter — accepts the
@@ -732,6 +745,16 @@ Omitting the key means **unrestricted**, not empty. `capabilities = []` says
 "performs nothing"; leaving it out says "do not check me". That difference is
 why a key or table the manifest does not recognise is refused rather than
 ignored — a typo would otherwise spend the whole guarantee silently.
+
+The package is the unit on both sides of that boundary. Its sources are every
+`.gr` file under the package root — not only those beside the entry file, since
+a `tests/` or a `src/deep/` directory is as much the package as `src/` is — and
+its rows are inferred with only its own handlers in scope, so a library taking
+a handler from its consumer performs nothing of its own. Charging every handler
+in the loaded set to every module made that shape a build error naming a
+package that permits the effect; enumerating from the entry's directory let a
+`capabilities = []` package print from a file the checksum and `publish` both
+shipped.
 
 A package that exceeds its ceiling fails to build **in every consumer**, not
 only in `grasm deps`: because effects are inferred from source rather than

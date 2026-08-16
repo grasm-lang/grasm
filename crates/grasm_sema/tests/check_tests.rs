@@ -2495,3 +2495,56 @@ match b {{\n        Ok(n) -> print(\"Ok({{n}})\")\n        Err(x) -> print(\"Err
 fn main() {{\n    print(\"{{f(1) ?? 0 - 1}}\")\n}}\n"
     ));
 }
+
+/// A mixing `if`/`match` merges to the whole `T ! E` however deeply it is
+/// nested ([T-OK-ERR-RETURN]: "a rule about the *position*, not about how it
+/// was reached").
+///
+/// The expected type reached only the *immediate* expression at the fallible
+/// position, so the same computation was accepted written
+/// `match a { true -> if b { 1 } else { Ok(2) } … }` and refused written
+/// `if a { if b { 1 } else { Ok(2) } } else { Ok(3) }` — one keyword apart.
+#[test]
+fn a_mixing_branch_merges_however_it_is_nested() {
+    let e = "type E = | Bad\n";
+    for body in [
+        "if a {\n        if b { 1 } else { Ok(2) }\n    } else {\n        Ok(3)\n    }",
+        "if a {\n        match b {\n            true -> 1\n            false -> Ok(2)\n        }\n    } else {\n        Ok(3)\n    }",
+        "match a {\n        true -> match b {\n            true -> 1\n            false -> Ok(2)\n        }\n        false -> Ok(3)\n    }",
+        "match a {\n        true -> if b { 1 } else { Ok(2) }\n        false -> Ok(3)\n    }",
+        "{\n        match b {\n            true -> 1\n            false -> Ok(2)\n        }\n    }",
+    ] {
+        check_ok(&format!(
+            "{e}fn f(a: bool, b: bool) -> i64 ! E {{\n    {body}\n}}\n\n\
+fn main() {{\n    print(\"{{f(true, true) ?? 0 - 1}}\")\n}}\n"
+        ));
+    }
+}
+
+/// A `let` copy of a parameter hands on *that* parameter's row, not a
+/// sibling's.
+///
+/// [T-FN-TYPE-ROW-CARRIED] scopes the fallback to positions "with no field
+/// name", and a plain named parameter is not one — but `let f = step` fell
+/// through to it, so an unrelated `log: fn(str) / {io}` in the same signature
+/// charged `io` to a call through `step`. Writing `xs.map(step)` was accepted:
+/// the same program one `let` apart, which is the pair this clause exists to
+/// close.
+#[test]
+fn a_let_copy_of_a_parameter_keeps_that_parameters_row() {
+    let tail = "fn shout(m: str) {\n    print(m)\n}\n\nfn dbl(n: i64) -> i64 {\n    n * 2\n}\n\n\
+fn main() {\n    print(\"{run(shout, dbl, [1, 2, 3])}\")\n}\n";
+    for body in ["let f = step\n    xs.map(f)", "xs.map(step)", "let f = step\n    xs.par_map(f)"] {
+        check_ok(&format!(
+            "fn run(log: fn(str) / {{io}}, step: fn(i64) -> i64, xs: [i64]) -> [i64] / {{}} {{\n    \
+{body}\n}}\n\n{tail}"
+        ));
+    }
+    // An effectful parameter copied the same way is still charged.
+    check_err(
+        "fn run(step: fn(i64) -> i64 / {io}, xs: [i64]) -> [i64] / {} {\n    \
+let f = step\n    xs.map(f)\n}\n\nfn shout(n: i64) -> i64 {\n    print(\"x\")\n    n\n}\n\n\
+fn main() {\n    print(\"{run(shout, [1])}\")\n}\n",
+        "not in its declared row",
+    );
+}
