@@ -52,6 +52,9 @@ struct Ctx<'a> {
     /// with the value everywhere else and stopped at the one place a handler
     /// hands one over.
     op_rows: HashMap<String, BTreeSet<String>>,
+    /// What the type checker worked out, keyed by whole span. Authoritative
+    /// wherever it has an entry.
+    value_rows: HashMap<(u32, u32), BTreeSet<String>>,
     /// Operation result types, held until the alias and type-row tables that
     /// resolve them are built.
     pending_op_rets: Vec<(String, TypeExpr)>,
@@ -267,6 +270,7 @@ pub fn effects_of_program(program: &crate::loader::Program) -> BTreeSet<String> 
         fns: HashMap::new(),
         effect_names: HashSet::new(),
         op_rows: HashMap::new(),
+        value_rows: HashMap::new(),
         pending_op_rets: Vec::new(),
         externs: HashSet::new(),
         rows: HashMap::new(),
@@ -485,6 +489,7 @@ fn build_ctx_in<'a>(files: &'a [ModuleView<'a>], packages: &BTreeSet<String>) ->
         fns: HashMap::new(),
         effect_names: HashSet::new(),
         op_rows: HashMap::new(),
+        value_rows: HashMap::new(),
         pending_op_rets: Vec::new(),
         externs: HashSet::new(),
         rows: HashMap::new(),
@@ -920,7 +925,26 @@ pub fn check_effects_multi_in(
     files: &[ModuleView],
     packages: &BTreeSet<String>,
 ) -> Vec<Diagnostic> {
+    check_effects_multi_with(files, packages, &HashMap::new())
+}
+
+/// As above, given the rows the *type checker* worked out for every
+/// function-valued expression.
+///
+/// The checker already carries a function's own row in its type and
+/// propagates it through every carrier by unification. This pass used to
+/// derive the same fact a second time, syntactically, by guessing which
+/// binder a value came out of — and that guess is where nearly every defect
+/// of the last two weeks lived. Where the table has an answer it is *the*
+/// answer; the syntactic path remains only for what the checker could not
+/// type.
+pub fn check_effects_multi_with(
+    files: &[ModuleView],
+    packages: &BTreeSet<String>,
+    value_rows: &HashMap<(u32, u32), BTreeSet<String>>,
+) -> Vec<Diagnostic> {
     let mut ctx = build_ctx_in(files, packages);
+    ctx.value_rows = value_rows.clone();
     solve_rows(&mut ctx);
 
     let mut diags = Vec::new();
@@ -1123,6 +1147,13 @@ fn par_fn_row(
     active: &mut Vec<String>,
     out: &mut BTreeSet<String>,
 ) {
+    // What the type checker worked out for this very expression, if it could
+    // type it. That answer already went through every carrier by unification,
+    // so it needs no binder to be modelled here.
+    if let Some(row) = ctx.value_row_of(func) {
+        out.extend(row.iter().filter(|e| !active.contains(e)).cloned());
+        return;
+    }
     if let Expr::Block(b) | Expr::Unsafe(b) | Expr::Region(b) = func {
         if let Some(Stmt::Expr(t)) = b.stmts.last() {
             par_fn_row(t, current, ctx, fnb, active, out);
@@ -2760,6 +2791,15 @@ fn computed_callee_row(
     }
 }
 
+impl Ctx<'_> {
+    /// The row the type checker gave this expression, when it is a function
+    /// value it could type.
+    fn value_row_of(&self, e: &Expr) -> Option<&BTreeSet<String>> {
+        let span = e.span();
+        self.value_rows.get(&(span.start, span.end))
+    }
+}
+
 fn contribute(qual: &str, active: &[String], ctx: &Ctx, out: &mut BTreeSet<String>) {
     if let Some(row) = ctx.rows.get(qual) {
         for e in row {
@@ -2905,7 +2945,9 @@ fn walk_expr(
             if let Some(row) = fnb.carried_rows.get(&id.name) {
                 out.extend(row.iter().filter(|e| !active.contains(e)).cloned());
             }
-            if fnb.knows(&id.name) {
+            if let Some(row) = ctx.value_row_of(e) {
+                out.extend(row.iter().filter(|x| !active.contains(x)).cloned());
+            } else if fnb.knows(&id.name) {
                 // A *local* holding a function value — most often a parameter
                 // whose type wrote the row. The direct call `f(x)` was
                 // charged and the mention was not, so handing the same `f` to
@@ -2965,6 +3007,12 @@ fn walk_expr(
                     (shadowed, ctx.resolve_call(current, &id.name))
                 {
                     contribute(&qual, active, ctx, out);
+                } else if let Some(row) = ctx.value_row_of(callee) {
+                    // The checker typed the callee, so the row is on its type
+                    // and no binder has to be modelled: a `match` payload, a
+                    // tuple destructuring and a closure parameter all arrive
+                    // here already carrying it.
+                    out.extend(row.iter().filter(|x| !active.contains(x)).cloned());
                 } else if fnb.knows(&id.name) || !is_builtin_name(&id.name) {
                     // A call through a name that is not a top-level function:
                     // a local holding a function value. Whatever that value
@@ -2979,6 +3027,9 @@ fn walk_expr(
                     // `with` that handles it ([T-EFFECT-DISCHARGE]).
                     indirect_row(&id.name, current, active, ctx, fnb, out);
                 }
+            } else if let Some(row) = ctx.value_row_of(callee) {
+                out.extend(row.iter().filter(|e| !active.contains(e)).cloned());
+                walk_expr(callee, current, active, ctx, fnb, out);
             } else {
                 // A call through something that is not a name: a struct
                 // field, a list element, a map value. The row is on the type

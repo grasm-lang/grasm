@@ -5,34 +5,22 @@ Every defect that is known and not fixed, with its severity from
 to paste. S1 and S2 block a release; S3 and S4 do not, and this file is what
 makes shipping them honest rather than quiet.
 
-**Open S1: none. Open S2: none.**
+**Open S1: none. Open S2: none.** One S3 closed on 2026-08-16.
 
 ## S3 — over-strict, effect-row inference
 
-### The fallback pool still charges a part nothing is known about
+### The fallback pool still charges a part nothing is known about — *closed*
 
-[T-FN-TYPE-ROW-CARRIED] (`experimental`). Where a function value is bound by a
-binder this pass does not model — a `match` payload, a tuple destructuring, a
-closure parameter — the row charged is every row written in the enclosing
-function's own signature at a position with no field name. That is deliberate
-and documented, and it is conservative in the safe direction, but it means a
-program can be refused for a row it does not perform:
+[T-FN-TYPE-ROW-CARRIED] (`experimental`). Closed on 2026-08-16 by the first
+stage of the effect-row rewrite: the type checker now publishes the row of
+every function-valued expression it types, and the effect pass reads that
+instead of guessing which binder a value came out of. A `match` payload, a
+tuple destructuring and a `for` variable are now charged by their type, so a
+`/ {}` body that performs nothing is no longer refused because an unrelated
+parameter of the same function declares `io`.
 
-```
-type Cb = fn(i64) -> i64
-type Loud = fn(i64) -> i64 / {io}
-
-fn go(v: V, l: Loud) -> i64 / {} {   // `l` is never called
-    match v {
-        Hold(f) -> f(1)              // `f` is pure, and is charged `io`
-        Nil -> 0
-    }
-}
-```
-
-The fix is not another cell of the grid: it is rows travelling through the type
-checker's unification, so a binder does not have to be modelled at all. Until
-then this is the known cost of the approximation.
+The syntactic path remains as a fallback for expressions the checker could not
+type. Removing it entirely is the rest of the rewrite.
 
 ### `--native` refuses shapes the interpreter accepts
 

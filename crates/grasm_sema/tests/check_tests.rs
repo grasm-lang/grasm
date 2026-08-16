@@ -2852,3 +2852,68 @@ fn main() {\n    print(\"{quiet()}\")\n}\n",
         "effect-free function",
     );
 }
+
+/// A binder the effect pass does not model is still charged correctly,
+/// because the row comes from the type rather than from the binder.
+///
+/// The pass used to guess where a function value came from, and reached for a
+/// fallback pool wherever it could not: a `match` payload, a tuple
+/// destructuring and a closure parameter were charged every row written
+/// anywhere in the enclosing signature. So a `/ {}` body performing nothing
+/// was refused because an unrelated parameter of the same function declared
+/// `io`. The checker already carries a function's row in its type and
+/// propagates it through every carrier by unification; asking it is one
+/// answer instead of two.
+#[test]
+fn a_binder_the_effect_pass_does_not_model_is_charged_by_type() {
+    let pure = "type Cb = fn(i64) -> i64\ntype Loud = fn(i64) -> i64 / {io}\n\
+type V = | Hold(f: Cb) | Nil\n\nfn inc(n: i64) -> i64 {\n    n + 1\n}\n\n";
+    for (sig, body, arg) in [
+        (
+            "fn go(v: V, l: Loud) -> i64 / {} {",
+            "match v {\n        Hold(f) -> f(1)\n        Nil -> 0\n    }",
+            "Hold(inc), inc",
+        ),
+        (
+            "fn go(p: (Cb, i64), l: Loud) -> i64 / {} {",
+            "let (f, n) = p\n    f(n)",
+            "(inc, 1), inc",
+        ),
+        (
+            "fn go(fs: [Cb], l: Loud) -> i64 / {} {",
+            "var t = 0\n    for f in fs {\n        t = t + f(1)\n    }\n    t",
+            "[inc], inc",
+        ),
+    ] {
+        check_ok(&format!(
+            "{pure}{sig}\n    {body}\n}}\n\nfn main() {{\n    print(\"{{go({arg})}}\")\n}}\n"
+        ));
+    }
+    // The same binders carrying an effectful value are still charged.
+    let loud = "type Cb = fn(i64) -> i64 / {io}\ntype V = | Hold(f: Cb) | Nil\n\n\
+fn shout(n: i64) -> i64 {\n    print(\"{n}\")\n    n\n}\n\n";
+    for (sig, body, arg) in [
+        (
+            "fn go(v: V) -> i64 / {} {",
+            "match v {\n        Hold(f) -> f(1)\n        Nil -> 0\n    }",
+            "Hold(shout)",
+        ),
+        (
+            "fn go(p: (Cb, i64)) -> i64 / {} {",
+            "let (f, n) = p\n    f(n)",
+            "(shout, 1)",
+        ),
+        (
+            "fn go(fs: [Cb]) -> i64 / {} {",
+            "var t = 0\n    for f in fs {\n        t = t + f(1)\n    }\n    t",
+            "[shout]",
+        ),
+    ] {
+        check_err(
+            &format!(
+                "{loud}{sig}\n    {body}\n}}\n\nfn main() {{\n    print(\"{{go({arg})}}\")\n}}\n"
+            ),
+            "not in its declared row",
+        );
+    }
+}

@@ -211,7 +211,11 @@ fn check_modules_in(
         );
     }
     let mut diagnostics = c.diags;
-    diagnostics.extend(crate::effects::check_effects_multi_in(files, packages));
+    diagnostics.extend(crate::effects::check_effects_multi_with(
+        files,
+        packages,
+        &c.value_rows,
+    ));
     // Source order. The effect pass walks a hash map, so the *same* file
     // reported its errors in a different order on every run — and `grasm run`
     // and `grasm build` could disagree about the order of the same two — which
@@ -349,6 +353,9 @@ struct Checker {
     /// Integer literals promoted to `f64`, by span start. See
     /// `Analysis::float_literals`.
     float_literals: std::collections::HashSet<u32>,
+    /// The effect row of every expression whose type is a function, keyed by
+    /// its whole span. See `record_value_row`.
+    value_rows: std::collections::HashMap<(u32, u32), std::collections::BTreeSet<String>>,
     /// See `Analysis::empty_types`. Collected as type variables and resolved
     /// once checking is over, since that is when they have answers.
     /// (start offset, length, element type) — the length so the
@@ -486,6 +493,7 @@ impl Checker {
             region_floors: Vec::new(),
             extern_names: std::collections::HashSet::new(),
             float_literals: std::collections::HashSet::new(),
+            value_rows: std::collections::HashMap::new(),
             empty_lits: Vec::new(),
             float_sums: std::collections::HashSet::new(),
             effects: HashMap::new(),
@@ -3296,6 +3304,7 @@ write back to — copy it into a local first, as in `var {} = {}`",
     /// ([T-REGION-REF]).
     fn infer_expr(&mut self, e: &Expr) -> Type {
         let t = self.infer_expr_inner(e);
+        self.record_value_row(e, &t);
         // A closure written *here* can only capture what a region already
         // allows, and so can one bound to a name declared here. One that
         // arrived from *outside* carries its captures, and running it inside
@@ -3320,6 +3329,26 @@ allocates could outlive it — move the work out of the region, or yield a numbe
             return Type::Error;
         }
         t
+    }
+
+    /// Records the effect row of any expression whose type is a function.
+    ///
+    /// The checker already carries a function's own row in its type
+    /// ([T-FN-TYPE-ROW]) and propagates it through every carrier by ordinary
+    /// unification. The effect pass was deriving the same fact a second time,
+    /// syntactically — by guessing which binder a function value came out of —
+    /// and that guess is where nearly every defect of the last two weeks
+    /// lived: a `for` instead of a `let`, a block around the initializer, a
+    /// name spelled like an imported module. One answer, computed once, in
+    /// the pass that has the types.
+    ///
+    /// Keyed by the whole span, for the reason [T-OK-ERR-RETURN]'s table is:
+    /// a binary expression and its leftmost leaf start at the same offset.
+    fn record_value_row(&mut self, e: &Expr, t: &Type) {
+        if let Type::Fn { row: Some(r), .. } = self.uni.resolve(t) {
+            let span = e.span();
+            self.value_rows.insert((span.start, span.end), r);
+        }
     }
 
     fn infer_expr_inner(&mut self, e: &Expr) -> Type {
