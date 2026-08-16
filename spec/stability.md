@@ -241,6 +241,7 @@ May change or be removed in any release. New surface starts here.
 - `G-TEST-PARAMS` — experimental
 - `L-LIB-SUM` — experimental
 - `T-ALIAS-NOT-RECURSIVE` — experimental
+- `T-CAPABILITY` — experimental
 - `T-EFFECT-BUILTIN` — experimental
 - `T-EFFECT-RESERVED` — experimental
 - `T-ERR-UNION-OPAQUE` — experimental

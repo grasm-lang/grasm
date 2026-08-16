@@ -1730,3 +1730,24 @@ pub fn add(a: i64, b: i64) -> i64 {\n    a + b\n}\n",
     assert_eq!(out.status.code(), Some(0), "{text}");
     assert!(text.contains("app              performs []"), "{text}");
 }
+
+/// A directory given where a file belongs is named in the refusal.
+///
+/// The path was collapsed for display and `.` is all current-dir components,
+/// so nothing survived: `error: cannot read ``: Is a directory` — a message
+/// naming nothing, which is the failure [L-ENCODING] records for the BOM.
+#[test]
+fn a_directory_where_a_file_belongs_is_named() {
+    let w = Work::new("dirarg");
+    let dir = w.0.to_str().unwrap().to_string();
+    for cmd in ["run", "check", "test", "doc", "fmt"] {
+        let (code, out) = run(&[cmd, "."]);
+        assert_eq!(code, 1, "{cmd}: {out}");
+        assert!(!out.contains("``"), "{cmd} names nothing:\n{out}");
+        assert!(out.contains("`.`"), "{cmd}: {out}");
+        // And with a real directory path, not just `.`.
+        let (code, out) = run(&[cmd, dir.as_str()]);
+        assert_eq!(code, 1, "{cmd}: {out}");
+        assert!(!out.contains("``"), "{cmd} names nothing:\n{out}");
+    }
+}

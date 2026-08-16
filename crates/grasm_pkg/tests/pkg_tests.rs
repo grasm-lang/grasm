@@ -1494,3 +1494,33 @@ fn a_package_name_has_to_be_an_identifier() {
         assert!(Manifest::load(&dir).is_ok(), "{name} should load");
     }
 }
+
+/// A table the manifest does not recognise is refused, the same way an
+/// unrecognised key is.
+///
+/// `[capabilities]` instead of `capabilities = []` left the package
+/// *unrestricted* — the same thing the key typo used to spend, and unlike that
+/// one it left no trace in the lockfile at all.
+#[test]
+fn an_unknown_manifest_table_is_refused() {
+    let ws = Workspace::new("unknown_table");
+    let dir = ws.package("ut", &manifest("ut", Some(""), &[]), PURE_SRC);
+    for text in [
+        "[package]\nname = \"ut\"\nversion = \"0.1.0\"\n\n[capabilities]\nio = false\n",
+        "[package]\nname = \"ut\"\nversion = \"0.1.0\"\n\n[package.metadata]\nx = \"y\"\n",
+        "[package]\nname = \"ut\"\nversion = \"0.1.0\"\n\n[registry]\nurl = \"x\"\n",
+    ] {
+        std::fs::write(dir.join("grasm.toml"), text).unwrap();
+        let err = Manifest::load(&dir).expect_err("an unknown table cannot load");
+        assert!(err.contains("is not a table this manifest has"), "{text:?}: {err}");
+    }
+    // The tables it does have still load, dependencies included.
+    std::fs::write(
+        dir.join("grasm.toml"),
+        "[package]\nname = \"ut\"\nversion = \"0.1.0\"\ncapabilities = []\n\n\
+[dependencies.other]\npath = \"../other\"\n",
+    )
+    .unwrap();
+    let m = Manifest::load(&dir).expect("loads");
+    assert_eq!(m.dependencies.len(), 1);
+}

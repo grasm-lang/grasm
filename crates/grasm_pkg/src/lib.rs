@@ -263,6 +263,22 @@ table — put it under `[package]`"
                 ));
             }
         }
+        // A table nobody recognises is the same typo one level up, and it
+        // spent the same thing: `[capabilities]` instead of
+        // `capabilities = []` left the package *unrestricted*, and unlike the
+        // key spelling it left no trace in the lockfile at all.
+        for name in doc.tables.keys() {
+            if name.is_empty() || name == "package" || name == "dependencies" {
+                continue;
+            }
+            if name.strip_prefix("dependencies.").is_some_and(|d| !d.is_empty()) {
+                continue;
+            }
+            return Err(format!(
+                "`[{name}]` is not a table this manifest has — it takes `[package]` and \
+`[dependencies.<name>]`"
+            ));
+        }
         const DEP_KEYS: &[&str] = &["path", "version"];
         for (dep_name, table) in doc.subtables("dependencies") {
             if let Some(k) = table.keys().find(|k| !DEP_KEYS.contains(&k.as_str())) {

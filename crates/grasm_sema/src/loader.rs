@@ -311,6 +311,13 @@ pub fn tidy(path: &std::path::Path) -> String {
             other => parts.push(other.as_os_str().to_os_string()),
         }
     }
+    if parts.is_empty() {
+        // Nothing survived the collapse: `.` is all `CurDir`, and dropping it
+        // left `error: cannot read ``: Is a directory` — a message naming
+        // nothing, which is the failure [L-ENCODING] records for the BOM.
+        // What a reader typed is better than nothing at all.
+        return path.display().to_string();
+    }
     let mut out = std::path::PathBuf::new();
     for p in parts {
         out.push(p);

@@ -1,0 +1,18 @@
+//! tag: T-CAPABILITY
+//! expect: error
+//! performs effect(s) `io` not in its declared row
+// A capability ceiling is a statement about what escapes a package.
+//
+// The single-file half of the rule is the effect row: what a function
+// performs is inferred from its source, not declared by hand, so a function
+// that quietly starts printing is a compile error rather than a reviewer's
+// problem. `crates/grasm/tests/cli_tests.rs` holds the package half, which
+// needs a manifest and a consumer and so cannot be one file.
+fn quiet() -> i64 / {} {
+    print("this escapes")
+    1
+}
+
+fn main() {
+    print("{quiet()}")
+}

@@ -2278,3 +2278,44 @@ print(\"{t}\")\n}\n",
         "type mismatch",
     );
 }
+
+/// `??` carries a function value's effect row like every other route
+/// ([T-FN-VALUE-ROW], [T-FN-TYPE-ROW-CARRIED]).
+///
+/// A binding with *some* recognised source and one unrecognised operand
+/// looked fully accounted for, so the signature fallback never fired:
+/// `let g = o ?? nop` recorded only the pure `nop` and charged nothing, while
+/// `o.unwrap_or(nop)` and the `match` spelling of the same thing were both
+/// charged. One operator erased a row that `/ {}`, [T-PAR-MAP-PURE] and a
+/// package's `capabilities = []` all rest on.
+#[test]
+fn a_coalesced_function_value_keeps_its_row() {
+    let head = "fn nop(x: i64) {\n}\n\n";
+    for body in [
+        "let g = o ?? nop\n    g(1)",
+        "let g = o.unwrap_or(nop)\n    g(1)",
+        "match o {\n        Some(g) -> g(1)\n        None -> nop(1)\n    }",
+    ] {
+        check_err(
+            &format!(
+                "{head}fn pure(o: Option[fn(i64) -> () / {{io}}]) / {{}} {{\n    {body}\n}}\n\n\
+fn main() {{\n    pure(Some(|x| print(\"{{x}}\")))\n}}\n"
+            ),
+            "not in its declared row",
+        );
+    }
+    // And through a parallel operation, where the row comes from a `let`
+    // annotation rather than from the signature.
+    check_err(
+        "fn nop(x: i64) -> i64 {\n    x\n}\n\nfn main() {\n    \
+let o: Option[fn(i64) -> i64 / {io}] = Some(|x| {\n        print(\"{x}\")\n        x\n    })\n    \
+let g = o ?? nop\n    print(\"{[1, 2].par_map(g)}\")\n}\n",
+        "effect-free function",
+    );
+    // A pure option coalesced with a pure default is charged nothing.
+    check_ok(
+        "fn dbl(n: i64) -> i64 {\n    n * 2\n}\n\n\
+fn pure(o: Option[fn(i64) -> i64]) -> i64 / {} {\n    let g = o ?? dbl\n    g(3)\n}\n\n\
+fn main() {\n    print(\"{pure(None)}\")\n}\n",
+    );
+}

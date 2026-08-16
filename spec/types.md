@@ -683,6 +683,28 @@ against a package's capability ceiling and disqualifies a function from
 `par_map`. Without that rule, `xs.par_map(sqrt)` typechecked and the ceiling
 had a door straight through it.
 
+**[T-CAPABILITY]** A package's manifest may declare `capabilities`: the set of
+effects it is permitted to perform. What counts against it is what *escapes*
+the package — the effects `main` performs, the effects left in a `pub`
+function's row for a consumer to handle, and the effects its own `test`, `bench`
+and doc-example bodies perform, since a consumer's `grasm test` runs those too.
+A dependency's `pub` rows do not count toward its consumer, whose ceiling is
+what it needs rather than what everything it depends on offers, and a
+handler's effects are counted where the handler was *written*
+([E-HANDLER-OWN-ROW]).
+
+Omitting the key means **unrestricted**, not empty. `capabilities = []` says
+"performs nothing"; leaving it out says "do not check me". That difference is
+why a key or table the manifest does not recognise is refused rather than
+ignored — a typo would otherwise spend the whole guarantee silently.
+
+A package that exceeds its ceiling fails to build **in every consumer**, not
+only in `grasm deps`: because effects are inferred from source rather than
+declared by hand, a dependency that quietly starts reading the filesystem is a
+compile error wherever it is used, and not something a reviewer has to happen
+to notice. This clause was cited by others for some time before it was written
+down, which for the rule the security story rests on is the wrong way round.
+
 **[T-CONST-PUB]** `pub let` exports a constant; a bare `let` keeps it to its
 own module, like a function. Reaching a private one through its module is the
 same error a private function gives.

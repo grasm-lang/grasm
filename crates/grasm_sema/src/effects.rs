@@ -1574,6 +1574,16 @@ enum FnSource<'a> {
     /// there is no body here to infer one from — that declaration is the
     /// contract the caller is held to.
     Declared(BTreeSet<String>),
+    /// A function value this pass could not pin to any of the above.
+    ///
+    /// Recorded rather than dropped: a binding with *some* recognised source
+    /// and one unrecognised operand looked fully accounted for, so the
+    /// signature fallback never fired. `let g = o ?? nop` recorded only the
+    /// pure `nop` and charged nothing, while `o.unwrap_or(nop)` and the
+    /// `match` spelling of the same thing were both charged — so one operator
+    /// erased a row that defeats `/ {}`, [T-PAR-MAP-PURE] and a package's
+    /// `capabilities = []`.
+    Unknown,
 }
 
 /// Function values bound to names in one function body.
@@ -1652,6 +1662,11 @@ fn fn_sources<'a>(e: &'a Expr, ctx: &Ctx, current: &str, out: &mut Vec<FnSource<
         Expr::Ident(id) => {
             if ctx.resolve_call(current, &id.name).is_some() {
                 out.push(FnSource::Named(id.name.clone()));
+            } else {
+                // A local holding a function value, or a parameter. Which one
+                // is settled by `sources_for`; what matters here is that this
+                // operand was *not* accounted for.
+                out.push(FnSource::Unknown);
             }
         }
         Expr::Closure { .. } => out.push(FnSource::Closure(e)),
@@ -2062,7 +2077,19 @@ fn walk_exprs_shallow(e: &Expr, f: &mut impl FnMut(&Expr)) {
 fn collect_fn_bindings<'a>(b: &'a Block, ctx: &Ctx, current: &str, fnb: &mut FnBindings<'a>) {
     for stmt in &b.stmts {
         match stmt {
-            Stmt::Let { name, init, .. } => {
+            Stmt::Let { name, ty, init, .. } => {
+                // An annotation is a written type in this function, exactly as
+                // a parameter's is, and the fallback pool was seeded only from
+                // the signature. So `let o: Option[fn(i64) -> i64 / {io}]` in
+                // a `main` that takes nothing left the pool empty, and the
+                // value it held reached `par_map` uncharged.
+                if let Some(te) = ty {
+                    if let Some(row) =
+                        declared_row_within(te, &ctx.type_aliases, &ctx.type_rows)
+                    {
+                        fnb.signature_rows.extend(row);
+                    }
+                }
                 fnb.bind_name(&name.name, name.span.start);
                 seed_closure_params(init, fnb);
                 let mut found = Vec::new();
@@ -2106,6 +2133,7 @@ impl<'a> FnSource<'a> {
             FnSource::Named(n) => FnSource::Named(n.clone()),
             FnSource::Closure(e) => FnSource::Closure(e),
             FnSource::Declared(r) => FnSource::Declared(r.clone()),
+            FnSource::Unknown => FnSource::Unknown,
         }
     }
 }
@@ -2127,7 +2155,12 @@ fn indirect_row(
     // `let f = fs[0]` one line away was charged correctly. Falling back to
     // every row the program writes without a field name is the same
     // conservatism `let f = fs[0]` already uses, and it errs toward refusing.
-    if fnb.sources_for(name).is_empty() && !fnb.signature_rows.is_empty() {
+    let unaccounted = fnb.sources_for(name).is_empty()
+        || fnb
+            .sources_for(name)
+            .iter()
+            .any(|s| matches!(s, FnSource::Unknown));
+    if unaccounted && !fnb.signature_rows.is_empty() {
         out.extend(
             fnb.signature_rows
                 .iter()
@@ -2156,6 +2189,8 @@ fn indirect_row(
             FnSource::Declared(row) => {
                 out.extend(row.iter().filter(|e| !active.contains(e)).cloned())
             }
+            // Accounted for by the fallback above.
+            FnSource::Unknown => {}
             FnSource::Closure(e) => {
                 // A closure has no name to guard recursion with, so its
                 // identity stands in for one.
