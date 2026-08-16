@@ -9,6 +9,9 @@ a tag like `[E-MAP-ORDER]`, and every tag has a stability level recorded in
 this document cannot drift out of sync with the specification the way a
 hand-maintained list would.
 
+`docs/release-scope.md` says which of these levels a release is allowed to have
+open defects in, and `docs/known-issues.md` lists the ones that are open today.
+
 ## Levels
 
 **`stable`** — will not change incompatibly before 2.0. A program relying on a

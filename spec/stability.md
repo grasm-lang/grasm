@@ -7,7 +7,17 @@ before it is listed as stable.
 `crates/grasm_spec` fails if a clause here is missing, unknown, or listed twice,
 so this file cannot drift away from the specification it describes.
 
-Today: 115 stable, 75 provisional, 23 experimental, of 213.
+**Five clauses were demoted from `stable` to `experimental` on 2026-08-16**:
+`T-FN-TYPE-ROW`, `T-FN-TYPE-ROW-PARAM`, `T-FN-TYPE-ROW-CARRIED`,
+`T-FN-VALUE-ROW` and `T-UNSAFE-UFCS`. They were listed stable while their
+*implementation* changed in nearly every evaluation round of the last two
+weeks — which is exactly what promotion criterion 5 forbids ("a clause is
+unsettled if the thing around it is moving"). Nothing about the intended
+meaning changed; the listing was wrong about how settled the area is, and
+saying so is cheaper than defending it. See `docs/release-scope.md` for what
+that means for a release.
+
+Today: 112 stable, 76 provisional, 32 experimental, of 220.
 
 ## Stable
 
@@ -93,10 +103,6 @@ Will not change incompatibly before 2.0.
 - `T-FALLIBLE` — stable
 - `T-FALLIBLE-UNHANDLED` — stable
 - `T-FIELD-CALL` — stable
-- `T-FN-TYPE-ROW` — stable
-- `T-FN-TYPE-ROW-PARAM` — stable
-- `T-FN-TYPE-ROW-CARRIED` — stable
-- `T-FN-VALUE-ROW` — stable
 - `T-INFER-LOCAL` — stable
 - `T-INOUT-EXCLUSIVE` — stable
 - `T-INOUT-MUTABLE` — stable
@@ -127,7 +133,6 @@ Will not change incompatibly before 2.0.
 - `T-TRY` — stable
 - `T-TUPLE` — stable
 - `T-TYPE-NO-PUB` — stable
-- `T-UNSAFE-UFCS` — stable
 - `T-USE-AFTER-MOVE` — stable
 - `T-VAR-MUTABLE` — stable
 
@@ -248,5 +253,10 @@ May change or be removed in any release. New surface starts here.
 - `T-EXTERN` — experimental
 - `T-EFFECT-OP-RESULT` — experimental
 - `T-EXTERN-VALUE` — experimental
+- `T-FN-TYPE-ROW` — experimental
+- `T-FN-TYPE-ROW-CARRIED` — experimental
+- `T-FN-TYPE-ROW-PARAM` — experimental
+- `T-FN-VALUE-ROW` — experimental
+- `T-UNSAFE-UFCS` — experimental
 - `T-PAR-MAP-PURE` — experimental
 - `T-TASK-CAPTURE` — experimental
