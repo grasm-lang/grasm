@@ -171,6 +171,72 @@ def build(carrier, site, fn):
     return src
 
 
+LIB_MANIFEST = """\
+[package]
+name = "lib"
+version = "0.1.0"
+capabilities = []
+"""
+
+APP_MANIFEST = """\
+[package]
+name = "app"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.lib]
+path = "../lib"
+"""
+
+APP_SRC = """\
+import lib
+
+fn main() {
+    print("{lib.quiet()}")
+}
+"""
+
+
+def build_package(carrier, fn, root):
+    """The same carrier, exported from a `capabilities = []` package.
+
+    The single-file half asks whether a declared `/ {}` row holds. This asks
+    the question the ceiling is actually for: a dependency that quietly starts
+    performing an effect has to fail the build in its *consumer*.
+    """
+    name, decls, held, taken = carrier
+    row = " / {io}" if fn == "shout" else ""
+    src = FNS
+    if decls:
+        src += "\n" + decls.format(row=row)
+    src += "\npub fn quiet() -> i64 {\n    "
+    src += held.format(fn=fn, row=row) + "\n    "
+    src += taken.format(row=row) + "\n"
+    src += "    g(1)\n}\n"
+    for pkg, manifest, entry in (
+        ("lib", LIB_MANIFEST, src),
+        ("app", APP_MANIFEST, APP_SRC),
+    ):
+        d = os.path.join(root, pkg, "src")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(root, pkg, "grasm.toml"), "w") as f:
+            f.write(manifest)
+        with open(os.path.join(d, "main.gr"), "w") as f:
+            f.write(entry)
+    return src
+
+
+def check_package(root):
+    p = subprocess.run(
+        [GRASM, "deps", "app"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    return p.returncode == 0, (p.stdout + p.stderr).strip()
+
+
 def check(src, path):
     with open(path, "w") as f:
         f.write(src)
@@ -184,6 +250,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--count", type=int, default=0, help="0 runs the whole grid")
     ap.add_argument("--seed", type=int, default=None)
+    ap.add_argument(
+        "--packages",
+        action="store_true",
+        help="also run each carrier across a package boundary",
+    )
     args = ap.parse_args()
 
     grid = [(c, s) for c in CARRIERS for s in SITES]
@@ -213,6 +284,28 @@ def main():
             if not ok:
                 false_positives.append((where, src, out))
                 print(f"FALSE POSITIVE {where}: {out.splitlines()[0]}\n{src}")
+
+        # The same carriers across a package boundary, once each: the call
+        # site does not vary the answer there, and a workspace costs more to
+        # build than a file.
+        if args.packages:
+            for carrier, _ in {(c, None) for c, _ in grid}:
+                where = f"{carrier[0]}/package"
+                root = os.path.join(work, "ws")
+                shutil.rmtree(root, ignore_errors=True)
+                src = build_package(carrier, "shout", root)
+                ok, out = check_package(root)
+                checked += 1
+                if ok:
+                    leaks.append((where, src))
+                    print(f"LEAK {where}: a `capabilities = []` package performs `io`\n{src}")
+                shutil.rmtree(root, ignore_errors=True)
+                src = build_package(carrier, "dbl", root)
+                ok, out = check_package(root)
+                checked += 1
+                if not ok:
+                    false_positives.append((where, src, out))
+                    print(f"FALSE POSITIVE {where}: {out.splitlines()[0]}\n{src}")
 
         print(
             f"programs: {checked}   leaked: {len(leaks)}   "

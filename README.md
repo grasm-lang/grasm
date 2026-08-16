@@ -263,6 +263,9 @@ direct call, `map`, `par_map`, a helper, a closure) — and checks both
 directions: an effectful value must be refused inside a `/ {}` function, and a
 pure one must be accepted. Five consecutive cold-evaluation rounds found a hole
 in that property, and each was one cell of a grid nobody had written down.
+`--packages` runs each carrier again across a package boundary, which is the
+question the ceiling is actually for: a `capabilities = []` dependency that
+holds an effectful function value has to fail the build in its *consumer*.
 
 `scripts/crosstest.sh` runs the same gate against a *cross-compiled* target to
 prove the backend isn't accidentally host-specific — currently **130 identical,
