@@ -1524,3 +1524,53 @@ fn an_unknown_manifest_table_is_refused() {
     let m = Manifest::load(&dir).expect("loads");
     assert_eq!(m.dependencies.len(), 1);
 }
+
+/// An `entry` that is not a `.gr` file is refused.
+///
+/// The lockfile's checksum and `grasm publish` both collect `.gr` files, so an
+/// entry named anything else left the package's *executed source* outside the
+/// digest — `--locked` reported "up to date" after it changed — and outside
+/// the published set, which shipped a package that could not build into a slot
+/// that cannot be republished.
+#[test]
+fn an_entry_has_to_be_a_grasm_source_file() {
+    let ws = Workspace::new("entry_ext");
+    let dir = ws.package("ee", &manifest("ee", Some(""), &[]), PURE_SRC);
+    for entry in ["src/lib.txt", "src/main", "README.md"] {
+        std::fs::write(
+            dir.join("grasm.toml"),
+            format!(
+                "[package]\nname = \"ee\"\nversion = \"0.1.0\"\ncapabilities = []\nentry = \"{entry}\"\n"
+            ),
+        )
+        .unwrap();
+        let err = Manifest::load(&dir).expect_err("a non-`.gr` entry cannot load");
+        assert!(err.contains("must name a `.gr` file"), "{entry}: {err}");
+    }
+    // A `.gr` entry elsewhere in the package still loads.
+    std::fs::write(
+        dir.join("grasm.toml"),
+        "[package]\nname = \"ee\"\nversion = \"0.1.0\"\ncapabilities = []\nentry = \"src/lib.gr\"\n",
+    )
+    .unwrap();
+    assert!(Manifest::load(&dir).is_ok());
+}
+
+/// `true` and `false` are reserved words, so they are not usable package
+/// names either.
+///
+/// The keyword list the name check consults had every other one.
+#[test]
+fn the_boolean_literals_are_not_package_names() {
+    let ws = Workspace::new("boolname");
+    let dir = ws.package("bn", &manifest("bn", Some(""), &[]), PURE_SRC);
+    for name in ["true", "false"] {
+        std::fs::write(
+            dir.join("grasm.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\ncapabilities = []\n"),
+        )
+        .unwrap();
+        let err = Manifest::load(&dir).expect_err("`{name}` cannot load");
+        assert!(err.contains("not a usable package name"), "{name}: {err}");
+    }
+}

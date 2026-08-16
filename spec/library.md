@@ -16,7 +16,7 @@ came to be documented as returning `Option[str]` when it is fallible.
 |------|------|-------|
 | `print(x)` | `(T)` | writes `x` then a newline; performs `io` |
 | `input()` | `() -> str` | one line from stdin, without the newline; `io` |
-| `args()` | `() -> [str]` | arguments after `--` |
+| `args()` | `() -> [str]` | arguments after `--`; performs `io` |
 | `panic(msg)` | `(str)` | prints `panic: msg`, exits 101 |
 | `assert(c)` | `(bool)` | panics when `c` is false |
 | `assert_eq(a, b)` | `(T, T)` | panics when `a != b` |

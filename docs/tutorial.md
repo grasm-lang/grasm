@@ -442,7 +442,11 @@ It has to name a file *inside* the package: the lockfile's checksum, the
 capability ceiling and `grasm publish` all cover the package's own directory,
 so an `entry` reaching out of it with `..` — or an absolute path — is refused
 rather than silently leaving all three describing a tree the program does not
-use.
+use. It has to end in `.gr` for the same reason: those three collect the
+package's `.gr` files, and an entry named anything else was executed but
+recorded nowhere — `--locked` reported "up to date" after it changed, and
+`grasm publish` shipped a package that could not build into a slot that cannot
+be republished.
 Everything a package exports lives behind that one file, so a dependency's
 other modules are reached as `import mathlib.helpers`.
 

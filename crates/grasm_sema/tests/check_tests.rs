@@ -2428,3 +2428,41 @@ print(\"{y}\")\n}\n",
         "different types",
     );
 }
+
+/// `??` carries a row whatever its left operand is, and wherever the result
+/// goes ([T-FN-VALUE-ROW], [T-FN-TYPE-ROW-CARRIED]).
+///
+/// Only a bare identifier on the left was marked as unaccounted, so a field
+/// read or a method call there left the pure default on the right looking like
+/// the whole story — and a `??` handed straight to `map` or `par_map`, without
+/// a `let` in between, was not looked at as a function value at all.
+#[test]
+fn a_coalesce_carries_its_row_from_every_operand() {
+    let head = "fn shout(n: i64) -> i64 {\n    print(\"shout {n}\")\n    n\n}\n\n\
+fn dflt(n: i64) -> i64 {\n    n\n}\n\n";
+    // A field read on the left.
+    check_err(
+        &format!(
+            "{head}type Bx = {{ opt: Option[fn(i64) -> i64 / {{io}}] }}\n\n\
+fn pure(b: Bx) / {{}} {{\n    let f = b.opt ?? dflt\n    let r = f(1)\n}}\n\n\
+fn main() {{\n    pure(Bx{{ opt: Some(shout) }})\n}}\n"
+        ),
+        "not in its declared row",
+    );
+    // Straight into a higher-order method, with no binding in between.
+    for m in ["map", "par_map"] {
+        check_err(
+            &format!(
+                "{head}fn pure(o: Option[fn(i64) -> i64 / {{io}}]) / {{}} {{\n    \
+let r = [1, 2].{m}(o ?? dflt)\n}}\n\nfn main() {{\n    pure(Some(shout))\n}}\n"
+            ),
+            "performs",
+        );
+    }
+    // A pure option coalesced with a pure default, through a field, is fine.
+    check_ok(
+        "fn dflt(n: i64) -> i64 {\n    n\n}\n\ntype Bx = { opt: Option[fn(i64) -> i64] }\n\n\
+fn pure(b: Bx) -> i64 / {} {\n    let f = b.opt ?? dflt\n    f(1)\n}\n\n\
+fn main() {\n    print(\"{pure(Bx{ opt: None })}\")\n}\n",
+    );
+}

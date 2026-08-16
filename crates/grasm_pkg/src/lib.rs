@@ -206,6 +206,19 @@ impl Manifest {
 package's own directory, and a file outside it is in none of them"
                 ));
             }
+            // And it has to be a Grasm source file. The lockfile's checksum
+            // and `grasm publish` both collect `.gr` files, so an `entry`
+            // named anything else left the package's *executed source* outside
+            // the digest — `--locked` reported "up to date" after it changed —
+            // and outside the published set, which shipped a package that
+            // could not build into a slot that cannot be republished.
+            if !entry.ends_with(".gr") {
+                return Err(format!(
+                    "`entry` must name a `.gr` file: `{entry}` is not one, and the \
+lockfile's checksum and `grasm publish` both cover this package's `.gr` sources — a file \
+outside that set is executed but recorded nowhere"
+                ));
+            }
         }
 
         let mut dependencies = Vec::new();
@@ -332,9 +345,10 @@ fn is_identifier(name: &str) -> bool {
     // parses as that keyword in the consumer's `import` line.
     const KEYWORDS: &[&str] = &[
         "and", "as", "bench", "break", "const", "continue", "effect", "else", "extern", "fail",
-        "fn", "for", "handled_by", "if", "import", "in", "inout", "let", "match", "not", "or",
-        "own", "parallel", "pub", "ref", "region", "return", "spawn", "test", "try", "type",
-        "unsafe", "var", "while", "with",
+        "false", "fn", "for", "handled_by", "if", "import", "in", "inout", "let", "match", "not",
+        "or",
+        "own", "parallel", "pub", "ref", "region", "return", "spawn", "test", "true", "try",
+        "type", "unsafe", "var", "while", "with",
     ];
     let mut chars = name.chars();
     let Some(first) = chars.next() else {

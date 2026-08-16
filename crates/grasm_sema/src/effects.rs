@@ -1103,6 +1103,11 @@ fn par_fn_row(
             }
             return;
         }
+        // A name whose written type *carries* a row — `o: Option[fn / {io}]`
+        // handed to `par_map` through `o ?? dflt`.
+        if let Some(row) = fnb.carried_rows.get(&id.name) {
+            out.extend(row.iter().filter(|e| !active.contains(e)).cloned());
+        }
         // Not a top-level function: a local holding one, or holding several.
         indirect_row(&id.name, current, active, ctx, fnb, out);
         return;
@@ -1127,6 +1132,15 @@ fn par_fn_row(
                 }
             }
         }
+    }
+    // `xs.par_map(o ?? dflt)` — each side is a candidate function value, and
+    // walking the expression as an ordinary one reached neither: the left is a
+    // name whose *type* carries the row, and the right is a pure default that
+    // explained nothing.
+    if let Expr::Binary { lhs, rhs, .. } = func {
+        par_fn_row(lhs, current, ctx, fnb, active, out);
+        par_fn_row(rhs, current, ctx, fnb, active, out);
+        return;
     }
     walk_expr(func, current, active, ctx, fnb, out);
 }
@@ -1613,6 +1627,12 @@ struct FnBindings<'a> {
     /// cannot be pinned to one binding: over-approximating there is the whole
     /// point, since under-approximating is what let effects escape.
     any: Vec<FnSource<'a>>,
+    /// The row a parameter *carries* — written inside its type rather than on
+    /// it. `o: Option[fn(i64) -> i64 / {io}]` is not a function, so nothing
+    /// recorded it, and `[1, 2].map(o ?? dflt)` charged only the pure default
+    /// on the right: the same program with the `??` bound to a `let` first was
+    /// charged correctly.
+    carried_rows: HashMap<String, BTreeSet<String>>,
     /// Rows written on function types inside *this function's own signature*,
     /// at positions with no field name to key on — a list element, a tuple
     /// component, an `Option`'s payload.
@@ -1706,11 +1726,18 @@ fn fn_sources<'a>(e: &'a Expr, ctx: &Ctx, current: &str, out: &mut Vec<FnSource<
                 }
             } else if let Some(row) = ctx.field_rows.get(&name.name) {
                 out.push(FnSource::Declared(row.clone()));
+            } else {
+                // A field this pass has no row for. Unaccounted, not absent:
+                // dropping it left `b.opt ?? dflt` looking fully explained by
+                // the pure default on the right.
+                out.push(FnSource::Unknown);
             }
         }
         // `let g = fs[0]` names no field; every nameless row is a candidate.
         Expr::Index { .. } => {
-            if !ctx.elem_rows.is_empty() {
+            if ctx.elem_rows.is_empty() {
+                out.push(FnSource::Unknown);
+            } else {
                 out.push(FnSource::Declared(ctx.elem_rows.clone()));
             }
         }
@@ -1725,6 +1752,10 @@ fn fn_sources<'a>(e: &'a Expr, ctx: &Ctx, current: &str, out: &mut Vec<FnSource<
                 fn_sources(v, ctx, current, out);
             }
         }
+        // A call this pass does not read through — `fs.get(0)`, `xs.first()`.
+        // Unaccounted, not absent: `fs.get(0) ?? dflt` was one `??` away from
+        // a `/ {}` function performing `io`.
+        Expr::MethodCall { .. } => out.push(FnSource::Unknown),
         // Every shape that hands a function value through: `Some(f) ?? f`
         // laundered a printing function past [T-PAR-MAP-PURE], which the
         // clause calls "a compile error, not a race".
@@ -2015,6 +2046,9 @@ fn seed_params<'a>(
 ) {
     for p in params {
         if let Some(row) = declared_row_within(&p.ty, aliases, type_rows) {
+            if !row.is_empty() {
+                fnb.carried_rows.insert(p.name.name.clone(), row.clone());
+            }
             fnb.signature_rows.extend(row);
         }
     }
@@ -2674,6 +2708,15 @@ fn walk_expr(
                 if let Some(qual) = ctx.resolve_call(current, &id.name) {
                     contribute(&qual, active, ctx, out);
                 }
+            }
+            // A name whose written type *carries* a row: `o` for
+            // `o: Option[fn(i64) -> i64 / {io}]` is not itself a function, so
+            // nothing recorded it and `[1, 2].map(o ?? dflt)` charged only the
+            // pure default. Mentioning one is the same permission as
+            // mentioning a function ([T-FN-VALUE-ROW]), and the rule is
+            // deliberately conservative in that direction.
+            if let Some(row) = fnb.carried_rows.get(&id.name) {
+                out.extend(row.iter().filter(|e| !active.contains(e)).cloned());
             }
             if fnb.knows(&id.name) {
                 // A *local* holding a function value — most often a parameter

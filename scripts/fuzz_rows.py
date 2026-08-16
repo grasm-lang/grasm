@@ -125,6 +125,29 @@ CARRIERS = [
         "let box: fn(i64) -> i64 {row} = {fn}",
         "let g = box",
     ),
+    # A field read on the left of `??`. Only a bare identifier there was
+    # marked unaccounted, so the pure default on the right looked like the
+    # whole story.
+    (
+        "field-coalesce",
+        "type Bx = {{ opt: Option[fn(i64) -> i64 {row}] }}\n",
+        "let box = Bx{{ opt: Some({fn}) }}",
+        "let g = box.opt ?? dbl",
+    ),
+    # A method call on the left, for the same reason.
+    (
+        "method-coalesce",
+        "",
+        "let box: [fn(i64) -> i64 {row}] = [{fn}]",
+        "let g = box.first() ?? dbl",
+    ),
+    # A `??` with no binding at all between it and the call site.
+    (
+        "inline-coalesce",
+        "",
+        "let box: Option[fn(i64) -> i64 {row}] = Some({fn})",
+        "let g = box ?? dbl",
+    ),
 ]
 
 # How `g` is finally called, inside a function declaring `/ {}`.
