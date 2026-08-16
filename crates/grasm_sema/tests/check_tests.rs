@@ -2712,6 +2712,46 @@ fn inc(n: i64) -> i64 {\n    n + 1\n}\n\n";
     ] {
         check_ok(&format!("{decls}{sig}{body}{tail}"));
     }
+    // A declared type that holds no row says so, rather than saying nothing:
+    // the program-wide field table keys `f` across every type that has one,
+    // so a pure `B { f: ... }` was charged an unrelated `A { f: ... / {io} }`.
+    check_ok(
+        "type A = { f: fn(i64) -> i64 / {io} }\ntype B = { f: fn(i64) -> i64 }\n\n\
+fn inc(n: i64) -> i64 {\n    n + 1\n}\n\n\
+fn ok(b: B) -> i64 / {} {\n    b.f(1)\n}\n\n\
+fn main() {\n    print(\"{ok(B{ f: inc })}\")\n}\n",
+    );
+    // …and the type that does hold one is still charged, through a generic
+    // carrier and a sum payload as well as directly.
+    for (decls, sig, body, arg) in [
+        (
+            "type A = { f: fn(i64) -> i64 / {io} }\n",
+            "fn go(a: A) -> i64 / {} {",
+            "a.f(1)",
+            "A{ f: shout }",
+        ),
+        (
+            "type Cb = fn(i64) -> i64 / {io}\ntype Box[T] = { v: T }\n",
+            "fn go(b: Box[Cb]) -> i64 / {} {",
+            "b.v(1)",
+            "Box{ v: shout }",
+        ),
+        (
+            "type V = | Hold(f: fn(i64) -> i64 / {io}) | Nil\n",
+            "fn go(v: V) -> i64 / {} {",
+            "match v {\n        Hold(f) -> f(1)\n        Nil -> 0\n    }",
+            "Hold(shout)",
+        ),
+    ] {
+        check_err(
+            &format!(
+                "{decls}\nfn shout(n: i64) -> i64 {{\n    print(\"{{n}}\")\n    n\n}}\n\n\
+{sig}\n    {body}\n}}\n\nfn main() {{\n    print(\"{{go({arg})}}\")\n}}\n"
+            ),
+            "not in its declared row",
+        );
+    }
+
     // The same reads through an effectful carrier are still charged.
     let loud = "type Cb = fn(i64) -> i64 / {io}\n\n\
 fn shout(n: i64) -> i64 {\n    print(\"{n}\")\n    n\n}\n\n";

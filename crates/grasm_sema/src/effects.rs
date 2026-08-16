@@ -1964,10 +1964,15 @@ fn declared_row_within_at(
         TypeExpr::Name { path, args, .. } => {
             let mut found: Option<BTreeSet<String>> = None;
             if let Some(seg) = path.segments.last() {
+                // A declared type has an entry whether or not it holds a row,
+                // and the empty one is an answer: "this type carries no
+                // effects" is what lets a read out of it be charged by its own
+                // type rather than by the pool. Treating empty as *unknown*
+                // sent `b.f(1)` for a pure `type B = { f: fn(i64) -> i64 }`
+                // to the program-wide field table, where an unrelated type's
+                // field of the same name charged `io`.
                 if let Some(r) = type_rows.get(&seg.name) {
-                    if !r.is_empty() {
-                        found = Some(r.clone());
-                    }
+                    found = Some(r.clone());
                 }
             }
             for a in args {
