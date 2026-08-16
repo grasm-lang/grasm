@@ -108,6 +108,8 @@ pub struct Interp<'a, W: Write> {
     sums: HashMap<String, Vec<(String, usize)>>,
     /// variant name → (owning type, arity); only unambiguous entries.
     variants: HashMap<String, Option<(String, usize)>>,
+    /// Declared field order per struct type. See the `Decl::Type` arm.
+    struct_fields: HashMap<String, Vec<String>>,
     /// Span offsets of statements that executed, when coverage is on.
     /// `None` keeps the hot path free of the bookkeeping entirely.
     pub(crate) coverage: Option<std::collections::BTreeSet<u32>>,
@@ -619,6 +621,20 @@ impl<'a, W: Write> Interp<'a, W> {
                     }
                 }
                 Decl::Type(t) => {
+                    // Field order, so a value's fields sit in *declaration*
+                    // order however its literal was written. Stored in written
+                    // order instead, `P{ z: 1, m: "a" }` and `P{ m: "a", z: 1 }`
+                    // rendered two different ways and compared unequal — and
+                    // [E-EQ-STRUCTURAL] compares "structurally and
+                    // recursively: two values of the same shape and contents
+                    // are equal". The inequality spread to `contains`, to a
+                    // list of them, to an `Option` of one, and to `assert_eq`.
+                    if let TypeBody::Struct(fs) = &t.body {
+                        self.struct_fields.insert(
+                            t.name.name.clone(),
+                            fs.iter().map(|f| f.name.name.clone()).collect(),
+                        );
+                    }
                     if let TypeBody::Sum(vs) = &t.body {
                         let list: Vec<(String, usize)> = vs
                             .iter()
@@ -683,6 +699,7 @@ impl<'a, W: Write> Interp<'a, W> {
             imports: HashMap::new(),
             sums,
             variants,
+            struct_fields: HashMap::new(),
             coverage: None,
             scopes: Vec::new(),
             effect_names,
@@ -1755,6 +1772,12 @@ impl<'a, W: Write> Interp<'a, W> {
                         Some(slot) => slot.1 = v,
                         None => vs.push((fname.name.clone(), v)),
                     }
+                }
+                // Into declaration order, whatever order the literal wrote.
+                if let Some(order) = self.struct_fields.get(&name.segments[0].name) {
+                    vs.sort_by_key(|(n, _)| {
+                        order.iter().position(|d| d == n).unwrap_or(usize::MAX)
+                    });
                 }
                 Ok(Value::Struct {
                     name: Rc::new(name.segments[0].name.clone()),

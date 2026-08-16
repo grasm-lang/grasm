@@ -4,6 +4,7 @@ This directory is the normative description of Grasm-Core.
 
 | File | Contents |
 |---|---|
+| [`core.md`](core.md) | The Core/Full split: which forms are the kernel, and the rewrite for every form that is not |
 | [`grammar.md`](grammar.md) | Lexical structure and EBNF grammar |
 | [`types.md`](types.md) | Type system, inference, and subtyping rules |
 | [`semantics.md`](semantics.md) | Evaluation, ownership, effects, and concurrency |
@@ -29,9 +30,15 @@ cargo test -p grasm_spec
 
 ## Status
 
-This describes **Grasm-Core** — the kernel language of MASTERPLAN §19.2. It is
-complete for what the implementation supports today and explicitly marks what
-is designed but unimplemented. It is not yet a frozen 1.0 specification; see
+This directory describes the language the implementation supports today. The
+**Grasm-Core / Grasm-Full split** that MASTERPLAN §19.2 makes binding is defined
+in [`core.md`](core.md), with a rewrite for every Full form and a test that fails
+when a new syntactic form is classified as neither.
+
+That document also records what is *not* met: Core is 37 forms against a budget
+of 30, the reference interpreter is 6,009 lines against 5,000, and this
+specification is about 55 pages against 50. Those three numbers were asserted as
+met for a long time before anybody measured them. It is not yet a frozen 1.0 specification; see
 `STABILITY.md` in the repository root for what stability guarantees exist.
 
 ## Conformance program format

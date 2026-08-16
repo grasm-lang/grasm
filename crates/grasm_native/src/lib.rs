@@ -7435,6 +7435,12 @@ impl FnCx<'_, '_> {
             }
         };
         let mut sv = sv;
+        // Evaluated in written order ([E-ORDER-LTR]) and *stored* in declared
+        // order. Stored as written instead, `P{ z: 1, m: "a" }` and
+        // `P{ m: "a", z: 1 }` were two different values: they rendered
+        // differently and compared unequal, against [E-EQ-STRUCTURAL]'s "two
+        // values of the same shape and contents are equal".
+        let mut built: Vec<(String, Value)> = Vec::with_capacity(fields.len());
         for (fname, fexpr) in fields {
             let ft = self.struct_field_type(&sname, &fname.name, span)?;
             let (mut fv, fvt) = self.eval_expr_expecting(fexpr, Some(&ft))?;
@@ -7449,8 +7455,22 @@ impl FnCx<'_, '_> {
                     .unwrap();
                 continue;
             }
-            let (fp, fl) = self.str_ptr_len(&fname.name);
-            self.call_rt("grasm_struct_push_field", &[sv, fp, fl, boxed]);
+            built.push((fname.name.clone(), boxed));
+        }
+        if base.is_none() {
+            let order: Vec<String> = self
+                .cg
+                .structs
+                .get(&sname)
+                .map(|fs| fs.iter().map(|(n, _)| n.clone()).collect())
+                .unwrap_or_default();
+            built.sort_by_key(|(n, _)| {
+                order.iter().position(|d| d == n).unwrap_or(usize::MAX)
+            });
+            for (n, boxed) in built {
+                let (fp, fl) = self.str_ptr_len(&n);
+                self.call_rt("grasm_struct_push_field", &[sv, fp, fl, boxed]);
+            }
         }
         Ok((sv, VType::Struct(sname)))
     }
