@@ -141,6 +141,31 @@ CARRIERS = [
         "let box: [fn(i64) -> i64 {row}] = [{fn}]",
         "let g = box.first() ?? dbl",
     ),
+    # A block hands its tail through, and so does `unsafe` and a region.
+    # These recorded no source at all — not even an unaccounted one — so the
+    # purity proof saw an empty row and `print` ran on `par_map`'s workers.
+    (
+        "block",
+        "",
+        "let box: fn(i64) -> i64 {row} = {{ {fn} }}",
+        "let g = box",
+    ),
+    (
+        "block-inline",
+        "",
+        "let box: fn(i64) -> i64 {row} = {fn}",
+        "let g = {{ box }}",
+    ),
+    # (`unsafe { … }` is deliberately absent: an `unsafe` block performs the
+    # `unsafe` effect in its own right, so the pure half of this experiment
+    # would be charged a row the language really does require and the oracle
+    # would be measuring the generator rather than the compiler.)
+    (
+        "block-in-list",
+        "",
+        "let box: [fn(i64) -> i64 {row}] = [{{ {fn} }}]",
+        "let g = box[0]",
+    ),
     # A `??` with no binding at all between it and the call site.
     (
         "inline-coalesce",
