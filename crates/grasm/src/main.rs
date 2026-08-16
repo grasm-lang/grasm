@@ -1539,11 +1539,40 @@ fn module_cache_key(program: &Program, index: usize, world_sig: &str) -> String 
 }
 
 /// The program's whole signature surface, in a stable order.
+///
+/// A module's cached object is keyed on its own source *and* on this, so this
+/// has to carry everything one module's object can depend on in another. A
+/// signature is not enough: [E-CONST] makes a module-level `let` "one value for
+/// the whole program", and the importer's object materialises that value —
+/// so changing `pub let K = 10` to `999` left the importer's cache entry valid
+/// and the rebuilt binary printed `10`, while `grasm run` and the bundle
+/// printed `999`. Bump a dependency, rebuild, ship the old constant.
+///
+/// The rule this follows is the one rustc's incremental engine uses: a cache
+/// entry is keyed on a fingerprint of everything the artifact *read*, not on
+/// the file it was written in.
 fn world_signature(program: &Program) -> String {
     let mut sigs: Vec<String> = program
         .files
         .iter()
-        .map(|f| format!("{}\n{}", f.name, grasm_sema::docs::module_signature(&f.module)))
+        .map(|f| {
+            let mut s = format!("{}\n{}", f.name, grasm_sema::docs::module_signature(&f.module));
+            // Constant *values*, which the signature deliberately omits — a
+            // constant changing value is not an API break, so `grasm api` is
+            // right to ignore it, and a cache key is wrong to.
+            for d in &f.module.decls {
+                if let grasm_syntax::ast::Decl::Const(c) = d {
+                    let sp = c.init.span();
+                    let lo = sp.start.saturating_sub(f.base) as usize;
+                    let hi = sp.end.saturating_sub(f.base) as usize;
+                    if lo <= hi && hi <= f.src.len() {
+                        s.push_str("\n= ");
+                        s.push_str(&f.src[lo..hi]);
+                    }
+                }
+            }
+            s
+        })
         .collect();
     sigs.sort();
     sigs.join("\n")

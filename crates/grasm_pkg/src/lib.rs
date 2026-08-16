@@ -407,7 +407,18 @@ impl Registry {
         if let Some(dir) = std::env::var_os("GRASM_REGISTRY") {
             return Some(Registry::new(PathBuf::from(dir)));
         }
-        let mut here = Some(from.to_path_buf());
+        // Absolute first, because the walk is by `parent()` and a relative
+        // path runs out of parents immediately: `.` has none, and `user` has
+        // one empty one. So the registry was found only when the working
+        // directory was *exactly* the one holding `.grasm/`, and the same
+        // package built or did not build depending on where the shell happened
+        // to be — while the error told the reader to put `.grasm/registry`
+        // beside the package, which is where it already was.
+        let start = from
+            .canonicalize()
+            .or_else(|_| std::env::current_dir().map(|c| c.join(from)))
+            .unwrap_or_else(|_| from.to_path_buf());
+        let mut here = Some(start);
         while let Some(d) = here {
             let candidate = d.join(".grasm").join("registry");
             if candidate.is_dir() {

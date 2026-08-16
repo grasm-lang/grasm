@@ -82,6 +82,49 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   [L-UFCS] now says the language's own free functions are not methods of any
   type, and the help names the spelling that works: `"hi" |> print`.
 
+### Fixed — the round-44 list
+
+- **An incremental `--native` rebuild shipped a stale imported constant.** A
+  module's cached object was keyed on its own source and on the program's
+  *signature* surface — and a signature omits a constant's value, correctly, since
+  a constant changing value is not an API break. A cache key is wrong to omit it:
+  [E-CONST] makes a module-level `let` one value for the whole program, the
+  importer's object materialises it, and changing `pub let K = 10` to `999` left
+  the importer's entry valid. Bump a dependency, rebuild, ship the old value —
+  across a package boundary too. Now keyed on a fingerprint of everything the
+  object read, which is the rule rustc's incremental engine uses.
+- **An effect operation's result was not row-checked.** `check_expr` returned
+  early for a closure once its *own* row was checked, so rows nested in its
+  result type never were — every other expression got that check one line
+  further down. `MkHandler{ make: || shout }` for `fn make() -> fn(i64) -> i64`
+  handed a printing function through an empty-row result, so a function
+  declaring `/ {Mk}` printed and a `capabilities = []` package reached `io`,
+  while the same signature written as an ordinary `fn` was refused.
+- **The registry was found only from one directory.** [T-MODULE-DEP] says "the
+  nearest enclosing `.grasm/registry`" and the walk was written to do that — but
+  it walked by `parent()` from a relative path, which has no parents. The same
+  package built or did not build depending on where the shell was, and the error
+  told the reader to put the registry beside the package, where it already was.
+- **A deeply nested tuple literal cost O(n³) to check** — 1000 levels took 7.8
+  seconds, now 31 ms. `record_value_row` runs on every expression and copied the
+  whole type to look at its head.
+- **Two specification statements were false.** [L-LIB-SORT-BY] said a sort key
+  "must be `i64`, `f64` or `str`" while tuple keys worked in all three engines
+  and [L-LIB-TUPLE] said so; [T-REF-WRITE] said the compiled backend refuses
+  writes through a reference, one day after it stopped.
+
+### Added
+
+- **`spec/core.md` — the Grasm-Core / Grasm-Full split**, the commitment
+  MASTERPLAN §19.2 makes binding and that four places in the repository asserted
+  while none was true. One rule (a form is Full if and only if a
+  meaning-preserving rewrite into other forms is written down), applied: 37 Core,
+  18 Full, a rewrite beside every Full form. Thirty-seven is not thirty, and the
+  document says so and names the seven forms that would close the gap.
+  `cargo test -p grasm_spec --test core` reads the AST rather than a list, so a
+  new construct that is neither kernel nor sugar fails the build; it also prints
+  all three §19.2 budgets on every run.
+
 ## 0.9.0 — 2026-08-16
 
 The first release with a scope. Everything below `1.0` is still pre-1.0 by the

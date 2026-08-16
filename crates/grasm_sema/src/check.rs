@@ -3318,6 +3318,22 @@ write back to — copy it into a local first, as in `var {} = {}`",
             }
             let got = self.infer_closure(e, Some(&want));
             self.unify_or_report(e.span(), &got, &want);
+            // The rows *inside* the type as well as the closure's own. The
+            // check above compares what this closure performs; this compares
+            // what it hands back, and every other expression already got it by
+            // falling through to the line below.
+            //
+            // A handler operation is the position where that mattered: its
+            // field type carries `row: None` — unconstrained, which is what
+            // [E-HANDLER-OWN-ROW] requires, since a handler's operations are
+            // charged to whoever wrote the handler. That exemption is about
+            // the operation, not about the value it returns, and returning
+            // early took both. `MkHandler{ make: || shout }` for
+            // `fn make() -> fn(i64) -> i64` handed a printing function through
+            // an empty-row result: a function declaring `/ {Mk}` printed, and
+            // a `capabilities = []` package reached `io`, while the same
+            // signature written as an ordinary `fn` was refused.
+            self.check_row_fits(&got, &want, e.span());
             return;
         }
         let got = self.infer_expr(e);
@@ -3544,6 +3560,15 @@ allocates could outlive it — move the work out of the region, or yield a numbe
     /// Keyed by the whole span, for the reason [T-OK-ERR-RETURN]'s table is:
     /// a binary expression and its leftmost leaf start at the same offset.
     fn record_value_row(&mut self, e: &Expr, t: &Type) {
+        // Shallow first. `resolve` copies the whole type, and this runs on
+        // every expression — so for a value whose type is deep, such as a
+        // nested tuple literal, the copy at each of n levels cost O(n) and the
+        // walk cost O(n^2) on top of an already superlinear check. Only a
+        // function type is wanted here, and its head is visible without
+        // copying anything below it.
+        if !matches!(self.uni.shallow_resolve(t), Type::Fn { .. }) {
+            return;
+        }
         if let Type::Fn { row: Some(r), .. } = self.uni.resolve(t) {
             let span = e.span();
             self.value_rows.insert((span.start, span.end), r);

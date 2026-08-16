@@ -350,8 +350,12 @@ them:
 
 **[L-LIB-SORT-BY]** `xs.sort_by(key)` sorts by what `key` returns for each
 element, which is where a list of structs gets its order from — `sort` needs
-the *elements* ordered, and a struct is not. The key must be `i64`, `f64` or
-`str`. The sort is stable: elements with equal keys stay in the order they
+the *elements* ordered, and a struct is not. The key is `i64`, `f64`, `str`, or
+a **tuple** of those, which is what makes
+`xs.sort_by(|p| (p.dept, p.age, p.name))` a multi-key sort rather than an error
+([L-LIB-TUPLE]). This clause said "must be `i64`, `f64` or `str`" while tuple
+keys worked in all three engines — two clauses of one document disagreeing, and
+the one that was wrong was the one a reader would find first. The sort is stable: elements with equal keys stay in the order they
 were written. It sorts **ascending**, always; descending is
 `xs.sort_by(k)` followed by `xs = xs.rev()`. Negating the key works for a
 number and has no counterpart for a `str`, so the reversal is the general

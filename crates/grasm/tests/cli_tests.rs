@@ -1839,3 +1839,85 @@ match c {\n        Ok(n) -> print(\"Ok({n})\")\n        Err(x) -> print(\"Err\")
         let _ = std::fs::remove_file(&bin);
     }
 }
+
+/// An incremental `--native` rebuild picks up a changed constant in a module it
+/// imports.
+///
+/// A module's cached object is keyed on its own source and on the program's
+/// signature surface — and a signature deliberately omits a constant's *value*,
+/// because a constant changing value is not an API break and `grasm api` is
+/// right to ignore it. The cache key was wrong to: [E-CONST] makes a
+/// module-level `let` "one value for the whole program", the importer's object
+/// materialises that value, and changing `pub let K = 10` to `999` left the
+/// importer's entry valid. The rebuilt binary printed `10` while `grasm run`
+/// and the bundle printed `999` — bump a dependency, rebuild, ship the old
+/// constant, across a package boundary too.
+///
+/// The rule the fix follows is rustc's: key an artifact on a fingerprint of
+/// everything it *read*, not on the file it was written in.
+#[test]
+fn an_incremental_rebuild_sees_a_changed_constant() {
+    let w = Work::new("inccache");
+    let dir = w.0.join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let helper = dir.join("helper.gr");
+    let main = dir.join("main.gr");
+    let out = dir.join("app");
+    std::fs::write(
+        &main,
+        "import helper\n\nfn main() {\n    print(\"{helper.K} {helper.L} {helper.f()}\")\n}\n",
+    )
+    .unwrap();
+
+    let build_and_run = |expect: &str, what: &str| {
+        let (code, msg) = run(&[
+            "build",
+            main.to_str().unwrap(),
+            "--native",
+            "-o",
+            out.to_str().unwrap(),
+        ]);
+        assert_eq!(code, 0, "{what}: {msg}");
+        let got = Command::new(&out).output().expect("runs");
+        assert_eq!(
+            String::from_utf8_lossy(&got.stdout).trim(),
+            expect,
+            "{what}"
+        );
+    };
+
+    std::fs::write(
+        &helper,
+        "pub let K = 10\npub let L = [1, 2]\n\npub fn f() -> i64 {\n    5\n}\n",
+    )
+    .unwrap();
+    build_and_run("10 [1, 2] 5", "first build");
+
+    // Only the dependency changes; the importer's source is untouched, which is
+    // exactly the case its cache entry survived.
+    std::fs::write(
+        &helper,
+        "pub let K = 999\npub let L = [7, 8, 9]\n\npub fn f() -> i64 {\n    101\n}\n",
+    )
+    .unwrap();
+    build_and_run("999 [7, 8, 9] 101", "after the dependency changed");
+
+    // And the cache must still *be* a cache: a rebuild that changes nothing
+    // reuses every object rather than writing new ones.
+    let cache = dir.join(".grasm-cache");
+    let before: Vec<_> = std::fs::read_dir(&cache)
+        .expect("the cache should exist")
+        .filter_map(|e| e.ok().map(|e| e.file_name()))
+        .collect();
+    assert!(!before.is_empty(), "the incremental build wrote no objects");
+    build_and_run("999 [7, 8, 9] 101", "no-op rebuild");
+    let after: Vec<_> = std::fs::read_dir(&cache)
+        .expect("the cache should exist")
+        .filter_map(|e| e.ok().map(|e| e.file_name()))
+        .collect();
+    assert_eq!(
+        before.len(),
+        after.len(),
+        "a rebuild that changed nothing did not reuse its objects"
+    );
+}

@@ -1801,3 +1801,97 @@ fn a_c_function_in_method_position_counts_against_the_ceiling() {
         );
     }
 }
+
+/// A package cannot reach an effect through an operation's result type.
+///
+/// The consequence [T-EFFECT-OP-RESULT] names: a library declaring
+/// `capabilities = []`, containing no `print` of its own, taking a handler from
+/// its consumer and calling what the operation hands back. The operation's
+/// result was not row-checked at the handler, so `grasm deps` certified the
+/// library as performing nothing and it then ran the consumer's printing
+/// function.
+#[test]
+fn an_operation_result_cannot_carry_an_effect_past_a_ceiling() {
+    let ws = Workspace::new("opresult");
+    let dir = ws.package(
+        "quiet",
+        &manifest("quiet", Some("\"Mk\""), &[]),
+        "effect Mk {\n    fn make() -> fn(i64) -> i64\n}\n\n\
+pub fn go(xs: [i64]) -> [i64] / {Mk} {\n    let f = Mk.make()\n    xs.map(f)\n}\n\n\
+fn main() {\n}\n",
+    );
+    // The library permits exactly `Mk` and performs exactly `Mk` — no `io`.
+    let m = Manifest::load(&dir).expect("manifest loads");
+    let effects = grasm_pkg::effects_of_package(&m).expect("effects are inferred");
+    assert!(grasm_pkg::check_capabilities(&m, &effects).is_none(), "{effects:?}");
+
+    // And a consumer cannot hand it a printing function through the result:
+    // the handler literal is refused where it is written.
+    let (_, diags) = {
+        let src = "effect Mk {\n    fn make() -> fn(i64) -> i64\n}\n\n\
+fn shout(n: i64) -> i64 {\n    print(\"x\")\n    n\n}\n\n\
+fn go(xs: [i64]) -> [i64] / {Mk} {\n    let f = Mk.make()\n    xs.map(f)\n}\n\n\
+fn main() {\n    with Mk handled_by MkHandler{ make: || shout } {\n        \
+print(\"{go([1])}\")\n    }\n}\n";
+        let map: std::collections::HashMap<String, String> =
+            [("main".to_string(), src.to_string())].into();
+        let provider = move |n: &str| map.get(n).cloned();
+        let program = grasm_sema::loader::load_with("main", "main.gr", &provider);
+        let d = grasm_sema::check::check_program(&program).diagnostics;
+        ((), d)
+    };
+    assert!(
+        diags.iter().any(|d| d.message.contains("performs `io`")),
+        "the handler must be refused where it is written: {diags:#?}"
+    );
+}
+
+/// The registry is found by walking up, from wherever the command was run.
+///
+/// [T-MODULE-DEP] says "the **nearest enclosing** `.grasm/registry`", and the
+/// walk was written to do that — but it walked by `parent()` from a path that
+/// was usually relative, and a relative path runs out of parents at once: `.`
+/// has none. So the registry was found only when the working directory was
+/// exactly the one holding `.grasm/`, and the same package built or did not
+/// build depending on where the shell happened to be. The error told the reader
+/// to put `.grasm/registry` beside the package — which is where it already was.
+#[test]
+fn the_registry_is_found_from_any_directory_below_it() {
+    let ws = Workspace::new("regwalk");
+    // A registry at the workspace root, and a package in a subdirectory.
+    let reg = ws.path().join(".grasm/registry/greet/0.1.0");
+    std::fs::create_dir_all(reg.join("src")).unwrap();
+    std::fs::write(
+        reg.join(MANIFEST_NAME),
+        "[package]\nname = \"greet\"\nversion = \"0.1.0\"\ncapabilities = []\n",
+    )
+    .unwrap();
+    std::fs::write(
+        reg.join("src/main.gr"),
+        "pub fn hi() -> str {\n    \"hello\"\n}\n\nfn main() {\n}\n",
+    )
+    .unwrap();
+    let user = ws.package(
+        "user",
+        "[package]\nname = \"user\"\nversion = \"0.1.0\"\ncapabilities = [\"io\"]\n\n\
+[dependencies.greet]\nversion = \"0.1.0\"\n",
+        "import greet\n\nfn main() {\n    print(\"{greet.hi()}\")\n}\n",
+    );
+
+    // Discovery from the package directory must reach the registry two levels
+    // up, and from a directory below it as well.
+    let deep = user.join("src");
+    for from in [ws.path().to_path_buf(), user.clone(), deep] {
+        assert!(
+            grasm_pkg::Registry::discover(&from).is_some(),
+            "no registry found walking up from {}",
+            from.display()
+        );
+    }
+    // And a *relative* path, which is what a command line usually supplies.
+    let cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(&user).unwrap();
+    let found = grasm_pkg::Registry::discover(std::path::Path::new("."));
+    std::env::set_current_dir(cwd).unwrap();
+    assert!(found.is_some(), "no registry found walking up from `.`");
+}

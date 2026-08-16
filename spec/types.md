@@ -879,8 +879,12 @@ required.
 
 Without this a `ref` graph was **write-once**: closing a cycle needs one write
 after both nodes exist, and that write typechecked and then panicked. The
-compiled backend refuses the shape by name for now (§11), so it is one of the
-places the two engines differ in what they accept rather than in what they do.
+compiled backend refused the shape for a while and no longer does — it writes
+into the slab rather than rebuilding the referent, which is what a cycle
+requires, and §11 no longer lists it. This paragraph said otherwise for a day
+after it stopped being true, which is the failure mode a documented gap has:
+the table is checked against the compiler on every run, and prose beside it is
+not.
 
 Anywhere on the path, not only at the root. A node held in a list or in a
 struct field is the ordinary Tier 2 arena — `[T-REF-GENERATIONAL]` names

@@ -3210,3 +3210,95 @@ fn main() {\n    let b = build() ?? Box{ f: |x| x }\n    print(\"{b.f(0)}\")\n}\
         "declares no error type",
     );
 }
+
+/// A handler operation's *result* is row-checked, even though the operation
+/// itself is not.
+///
+/// A handler field's type carries an unconstrained row, which is what
+/// [E-HANDLER-OWN-ROW] requires: a handler's operations are charged to whoever
+/// wrote the handler, not to whoever installs it. That exemption is about the
+/// operation; it is not about the value the operation hands back
+/// ([T-EFFECT-OP-RESULT]).
+///
+/// `check_expr` returned early for a closure after checking the closure's *own*
+/// row, so the rows nested in its result type were never compared — every other
+/// expression got that check by falling through one line further. So
+/// `MkHandler{ make: || shout }` for `fn make() -> fn(i64) -> i64` handed a
+/// printing function through an empty-row result: a function declaring `/ {Mk}`
+/// printed, and a `capabilities = []` package reached `io`, while the same
+/// signature written as an ordinary `fn` was refused.
+#[test]
+fn a_handler_operations_result_carries_its_row() {
+    let base = "fn shout(n: i64) -> i64 {\n    print(\"x\")\n    n\n}\n\n\
+fn quiet(n: i64) -> i64 {\n    n * 2\n}\n\n";
+    for (ret, give) in [
+        ("fn(i64) -> i64", "shout"),
+        ("[fn(i64) -> i64]", "[shout]"),
+        ("Option[fn(i64) -> i64]", "Some(shout)"),
+        ("(fn(i64) -> i64, i64)", "(shout, 1)"),
+    ] {
+        check_err(
+            &format!(
+                "{base}effect Mk {{\n    fn make() -> {ret}\n}}\n\n\
+fn main() {{\n    with Mk handled_by MkHandler{{ make: || {give} }} {{\n        \
+print(\"in\")\n    }}\n}}\n"
+            ),
+            "performs nothing, but this one performs `io`",
+        );
+        // The pure value through the same result type is accepted.
+        check_ok(&format!(
+            "{base}effect Mk {{\n    fn make() -> {ret}\n}}\n\n\
+fn main() {{\n    with Mk handled_by MkHandler{{ make: || {} }} {{\n        \
+print(\"in\")\n    }}\n}}\n",
+            give.replace("shout", "quiet")
+        ));
+    }
+    // A handler whose *operation* performs `io` is still fine — that is the
+    // exemption, and it is the whole reason handlers exist.
+    check_ok(
+        "effect Log {\n    fn write(s: str)\n}\n\nfn main() {\n    \
+with Log handled_by LogHandler{ write: |s| print(s) } {\n        \
+Log.write(\"hello\")\n    }\n}\n",
+    );
+    // …and a result that *declares* the row accepts the effectful value.
+    check_ok(&format!(
+        "{base}effect Mk {{\n    fn make() -> fn(i64) -> i64 / {{io}}\n}}\n\n\
+fn main() {{\n    with Mk handled_by MkHandler{{ make: || shout }} {{\n        \
+print(\"in\")\n    }}\n}}\n"
+    ));
+}
+
+/// A deeply nested tuple literal is checked in near-linear time.
+///
+/// `record_value_row` runs on every expression and called `resolve`, which
+/// copies the whole type. For a value whose type is deep — a nested tuple
+/// literal is the natural way to get one — that copy costs O(n) at each of n
+/// levels, on top of a check that was already superlinear: 400 deep took 0.46
+/// seconds, 800 took 3.9, 1000 took 7.8. Only a function type is wanted there,
+/// and its head is visible without copying anything below it.
+///
+/// A thousand levels now checks in about 30 ms. Like the field- and
+/// method-chain tests, this is a timing test only in the sense that the old
+/// code could not have passed it.
+/// Run on a thread with the stack the CLI's main thread has. A test harness
+/// thread gets 2 MiB and `main` gets 8, so a depth the toolchain handles in
+/// all three engines aborts the test binary — which would be the test
+/// measuring the harness rather than the compiler. The deepest nesting the
+/// language accepts is 1022; 1023 is a clean `code is nested too deeply`
+/// ([G-NEST-LIMIT]), and both were checked by hand against `check`, `run` and
+/// `build --native` when this was written.
+#[test]
+fn a_deeply_nested_tuple_literal_is_near_linear() {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut e = String::from("1");
+            for _ in 0..1000 {
+                e = format!("({e}, 2)");
+            }
+            check_ok(&format!("fn main() {{\n    let t = {e}\n    print(\"ok\")\n}}\n"));
+        })
+        .expect("spawns")
+        .join()
+        .expect("the checker should not abort at a depth the language accepts");
+}

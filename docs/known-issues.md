@@ -15,6 +15,28 @@ This file is not empty because nothing is wrong — it is empty because what was
 wrong is listed above as closed. The next round of evaluation is what refills
 it.
 
+## Nothing open
+
+The six defects that were open on 2026-08-17 are closed:
+
+* an incremental `--native` rebuild shipped a **stale imported constant** — the
+  cache keyed a module's object on its own source and on the program's
+  *signature* surface, and a signature omits a constant's value. Now keyed on a
+  fingerprint of everything the object read, which is the rule rustc's
+  incremental engine uses.
+* an **effect operation's result** was not row-checked, so a handler could hand
+  a printing function through an empty-row result and a `capabilities = []`
+  package reached `io`. `check_expr` returned early for a closure after
+  checking the closure's own row.
+* the **registry** was found only when the working directory was exactly the one
+  holding `.grasm/` — the walk up was by `parent()` from a relative path, which
+  has no parents.
+* [L-LIB-SORT-BY] said a sort key "must be `i64`, `f64` or `str`" while tuple
+  keys worked; [T-REF-WRITE] said the compiled backend refuses writes through a
+  reference, a day after it stopped doing so.
+* a **deeply nested tuple literal** cost O(n³) to check — 1000 levels took 7.8
+  seconds, now 31 ms.
+
 ## S3 — over-strict, effect-row inference
 
 ### The fallback pool — *removed*
