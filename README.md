@@ -257,8 +257,9 @@ reads it; in these four shapes it probes for one, and a probe is a guess.
 `scripts/fuzz_rows.py` is not a differential test but a *soundness* one, over
 the property the capability ceiling rests on: a function value's effect row
 travels with it, whatever carries it and whatever binds it. It enumerates the
-grid — eleven carriers (a list, a tuple, a struct field, a sum payload, a map
-value, an `Option`, a `type` alias, a bare binding) against five call sites (a
+grid — fourteen carriers (a list, a tuple, a struct field, a sum payload, a map
+value, an `Option`, a `type` alias, a block-valued initializer, a bare
+binding) against five call sites (a
 direct call, `map`, `par_map`, a helper, a closure) — and checks both
 directions: an effectful value must be refused inside a `/ {}` function, and a
 pure one must be accepted. Five consecutive cold-evaluation rounds found a hole
@@ -274,6 +275,16 @@ gave the bare `()` half, and a bare identifier in a pattern that happened to
 name a nullary variant of another type. It varies where the handler literal is
 written, whether a captured binding changes between that point and the `with`,
 what the operation returns, and which pattern shapes the body matches.
+
+`scripts/fuzz_extern.py` enumerates the other half of that property: every
+spelling by which a declared C function can be named or called. Naming one is
+the permission to call it, so each spelling costs the same row — but only some
+were charged. `n.labs()` charged nothing while `labs(n)` charged `io`, so a
+package declaring `capabilities = ["unsafe"]` was reported as reaching no `io`
+while its binary called libc; and `unsafe { sqrt }` carried one onto
+`par_map`'s workers. Eighteen spellings, each checked against a row missing
+`io` (which must fail) and against the complete row (which must compile and
+run).
 
 `scripts/crosstest.sh` runs the same gate against a *cross-compiled* target to
 prove the backend isn't accidentally host-specific — currently **130 identical,
@@ -483,7 +494,7 @@ Currently **65 normative clauses, 65 conformance programs**.
 | `projects/advanced` | validation: router+middleware, scheduler, WAL mini-DB, **Mini-Grasm interpreter written in Grasm** |
 | `spec/` | normative specification + one conformance program per clause |
 | `editors/` | VS Code extension and LSP setup for other editors |
-| `scripts/` | `difftest.sh` (native vs interpreter), `crosstest.sh` (cross-target), `fuzz_differential.py`, `fuzz_fallible.py`, `fuzz_generics.py`, `fuzz_rows.py` and `fuzz_handlers.py` (generated programs) |
+| `scripts/` | `difftest.sh` (native vs interpreter), `crosstest.sh` (cross-target), `fuzz_differential.py`, `fuzz_fallible.py`, `fuzz_generics.py`, `fuzz_rows.py`, `fuzz_handlers.py` and `fuzz_extern.py` (generated programs) |
 | `MASTERPLAN.md` | the full v0.3 strategic blueprint this implements Phase 0–1 of |
 
 ## Status
