@@ -18,6 +18,13 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   one reference per level (the setters skip their release when handed back the
   pointer they already hold). 203 programs identical across all three engines,
   203 leak-free.
+- **`--native` compiles returning a closure.** The refusal named the return,
+  while what was actually missing was the closure's *parameter* types — which
+  the declared return type had already written down. Taking them from there
+  compiles the shape, capturing values of any type and capturing a function
+  value to call inside. With this and the `ref` writes, **every program in the
+  repository compiles natively: 204 identical across all three engines, 0
+  unsupported, 0 leaking.**
 - **The UFCS help no longer promises a call the compiler will not make.**
   `"hi".print()` was refused with "a free function `fn print(str, ...)` would
   also work here (UFCS)" — exactly the call that had just been refused.

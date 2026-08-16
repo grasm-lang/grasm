@@ -9386,17 +9386,15 @@ impl FnCx<'_, '_> {
                 .find_map(|scope| scope.calls.get(name).cloned())
         });
         let Some(args) = hint else {
-            // Name the shape §11 names. A function whose declared return type
-            // *is* a function type says exactly what the parameters are, so
-            // "no type says what its parameters are" was about a different
-            // program — the reader was sent to annotate a binding that the
-            // return type had already annotated.
-            if matches!(self.ret, VType::Fn(..)) {
-                return nope(
-                    span,
-                    "returning a closure (a top-level `fn` works, and so does returning \
-what the closure computes)",
-                );
+            // A function whose declared return type *is* a function type says
+            // exactly what the parameters are, and saying so is all this shape
+            // ever needed: the refusal named the return, while what was
+            // missing was the parameter types the return had already written
+            // down.
+            if let VType::Fn(ps, _) = &self.ret {
+                if ps.len() == params.len() {
+                    return Ok(ps.clone());
+                }
             }
             return nope(
                 span,

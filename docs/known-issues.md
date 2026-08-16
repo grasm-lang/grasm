@@ -5,10 +5,15 @@ Every defect that is known and not fixed, with its severity from
 to paste. S1 and S2 block a release; S3 and S4 do not, and this file is what
 makes shipping them honest rather than quiet.
 
-**Open S1: none. Open S2: none. One S3 and no S4 remain open.**
+**Open S1: none. Open S2: none. Open S3: none. Open S4: none.**
 
 Closed on 2026-08-16: the effect-row fallback pool (and the mechanism behind
-it), writes through a `ref` under `--native`, and the UFCS help text.
+it), writes through a `ref` under `--native`, returning a closure under
+`--native`, and the UFCS help text.
+
+This file is not empty because nothing is wrong — it is empty because what was
+wrong is listed above as closed. The next round of evaluation is what refills
+it.
 
 ## S3 — over-strict, effect-row inference
 
@@ -25,18 +30,18 @@ per-binder special cases that fed them — is gone, 511 lines of it.
 There is no fallback pool to be over-strict any more, so the shape recorded
 here (a `match` payload charged a sibling parameter's row) cannot recur.
 
-### `--native` refuses one shape the interpreter accepts
+### `--native` — *no gaps in the repository's programs*
 
-The §11 table in the specification lists it, `scripts/nativegaps.sh` proves the
-list matches the compiler in both directions, and the refusal names itself and
-points at `grasm run`. One conformance program is in this state today
-(`T-EFFECT-OP-RESULT`, which returns a closure). A refusal, not a miscompile.
+Every program in `spec/conformance/`, `examples/`, `projects/` and
+`benchmarks/` compiles natively: **204 identical across all three engines, 0
+unsupported, 0 leaking.** The §11 table still lists shapes the backend refuses
+— a generic `type` declaration, a handler used as a value, calling a function
+value through anything but a name, and others — and
+`scripts/nativegaps.sh` proves that list matches the compiler in both
+directions. Each is a refusal by name at build time, never a miscompile.
 
-Two others closed on 2026-08-16: writes through a `ref` now compile, so
-`T-REF-WRITE` and `T-REF-CAPTURE` run under all three engines. The write lands
-in the slab rather than rebuilding the referent, which is what a cycle
-requires — `a.out[0].out[0].name` arrives back at `a`, and an outer copy stored
-afterwards erased the inner write.
+Closed on 2026-08-16: writes through a `ref` (including around a cycle) and
+returning a closure.
 
 ## S4 — diagnostics
 

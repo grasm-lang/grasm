@@ -315,13 +315,22 @@ fn main() {
     print("{b.items}")
 }'
 
-expect_refused "returning a closure" 'fn mk_adder(n: i64) -> fn(i64) -> i64 {
+expect_compiles "returning a closure" 'fn mk(n: i64) -> fn(i64) -> i64 {
     |x| x + n
 }
 
+fn twice(f: fn(i64) -> i64) -> fn(i64) -> i64 {
+    |x| f(f(x))
+}
+
+fn dbl(n: i64) -> i64 {
+    n * 2
+}
+
 fn main() {
-    let f = mk_adder(10)
-    print("{f(5)}")
+    let add5 = mk(5)
+    let g = twice(dbl)
+    print("{add5(3)} {g(3)}")
 }'
 
 expect_refused "a handler bound by a for loop" 'effect Src {

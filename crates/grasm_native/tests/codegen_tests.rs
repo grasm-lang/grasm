@@ -455,3 +455,27 @@ a.out[0].out[0].name = \"A!\"\n    print(\"{b.name} {a.name}\")\n}\n",
         compile(src).unwrap_or_else(|e| panic!("{src}\n{e}"));
     }
 }
+
+/// A function whose declared return type *is* a function type says what the
+/// closure's parameters are.
+///
+/// The backend refused the shape outright, and §11 listed it. What was missing
+/// was only the parameter types — and the return type had already written them
+/// down; the refusal named the return instead, which sent a reader to annotate
+/// something that was already annotated.
+#[test]
+fn returning_a_closure_compiles() {
+    for src in [
+        "fn mk(n: i64) -> fn(i64) -> i64 {\n    |x| x + n\n}\n\nfn main() {\n    \
+let add5 = mk(5)\n    print(\"{add5(3)}\")\n}\n",
+        // Capturing more than one value, and of more than one type.
+        "fn adder(a: i64, b: str) -> fn(i64) -> str {\n    |x| \"{b}{x + a}\"\n}\n\n\
+fn main() {\n    let f = adder(2, \"v\")\n    print(\"{f(3)}\")\n}\n",
+        // Capturing a function *value* and calling it inside.
+        "fn twice(f: fn(i64) -> i64) -> fn(i64) -> i64 {\n    |x| f(f(x))\n}\n\n\
+fn dbl(n: i64) -> i64 {\n    n * 2\n}\n\nfn main() {\n    let g = twice(dbl)\n    \
+print(\"{g(3)}\")\n}\n",
+    ] {
+        compile(src).unwrap_or_else(|e| panic!("{src}\n{e}"));
+    }
+}
