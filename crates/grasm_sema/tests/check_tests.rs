@@ -2403,3 +2403,28 @@ fn main() {\n    print(\"{take(|x| \"oops\")}\")\n}\n",
         "type mismatch",
     );
 }
+
+/// An `if` merges an integer literal against a float branch, the way a
+/// `match` already does ([T-INT-TO-FLOAT-CARRIED]).
+///
+/// With no expected type the branches have only each other, and the literal
+/// is the one that adopts — but only a `match`'s arms did, so a two-arm
+/// `match` on a `bool` and the `if` that says the same thing disagreed.
+#[test]
+fn an_if_merges_a_literal_branch_against_a_float() {
+    check_ok(
+        "fn main() {\n    let y = if true {\n        3\n    } else {\n        2.5\n    }\n    \
+let z = match 1 {\n        1 -> 3\n        _ -> 2.5\n    }\n    print(\"{y} {z}\")\n}\n",
+    );
+    // Either side.
+    check_ok(
+        "fn main() {\n    let y = if true {\n        2.5\n    } else {\n        3\n    }\n    \
+print(\"{y}\")\n}\n",
+    );
+    // A genuinely different type is still a mismatch.
+    check_err(
+        "fn main() {\n    let y = if true {\n        3\n    } else {\n        \"x\"\n    }\n    \
+print(\"{y}\")\n}\n",
+        "different types",
+    );
+}

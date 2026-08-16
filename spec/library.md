@@ -76,6 +76,13 @@ is judged on.
 | a handler | a struct with the operation names as fields | `CHandler{now: <closure>}` |
 | a range | `start..end`, as written | `1..5` |
 
+Unquoted means a one-element list holding the empty string renders exactly as
+an empty list does: `[""]` and `[]` are both `[]`, and `"".split(",")` — one
+field, per the table above — looks like no fields at all. That is the price of
+a rendering meant to be read rather than parsed, and it is stated because the
+alternative is a reader concluding the library is wrong. `len()` tells them
+apart.
+
 Strings nested inside a collection are **not** quoted, so `[a, b c]` is a
 two-element list whose second element contains a space. Rendering is for people
 reading output; it is not a serialisation format and does not round-trip.

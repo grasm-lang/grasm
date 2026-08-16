@@ -3456,6 +3456,26 @@ allocates could outlive it — move the work out of the region, or yield a numbe
                             ) {
                                 return t;
                             }
+                            // An integer literal branch adopts the other's
+                            // float, the way a `match`'s arms already do —
+                            // and a two-arm `match` on a `bool` is the same
+                            // program. [T-INT-TO-FLOAT-CARRIED] names "an
+                            // `if`'s branches" among the shapes an expected
+                            // type reaches through; with no expected type at
+                            // all the branches have only each other, and one
+                            // of them is a literal that adopts.
+                            for (lit_ty, lit_at, other) in
+                                [(&then_ty, then_at, &else_ty), (&else_ty, else_at, &then_ty)]
+                            {
+                                if matches!(self.uni.shallow_resolve(lit_ty), Type::I64)
+                                    && matches!(self.uni.shallow_resolve(other), Type::F64)
+                                {
+                                    if let Some(lit) = lit_at.and_then(Self::int_literal_tail) {
+                                        self.float_literals.insert(lit.span().start);
+                                        return Type::F64;
+                                    }
+                                }
+                            }
                             let t = self.show(&then_ty);
                             let e = self.show(&else_ty);
                             self.error_help(

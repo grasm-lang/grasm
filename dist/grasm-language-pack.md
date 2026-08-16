@@ -508,9 +508,12 @@ the same one twice.
 
 Order does not matter, and neither does position. A `fold`'s seed adopts the
 element type, so `[1.5, 2.5].fold(0, |a, b| a + b)` needs no `0.0`. A list, a
-map's values, and a `match`'s arms are checked with their integer literals
-*last*, so whatever fixes the type does it
-first: `[1, 2.5]` and `[2.5, 1]` are both `[f64]`. Checking left to right made
+map's values, an `if`'s branches and a `match`'s arms are checked with their
+integer literals *last*, so whatever fixes the type does it
+first: `[1, 2.5]` and `[2.5, 1]` are both `[f64]`. With no expected type at all
+the branches have only each other, and the literal is the one that adopts:
+`let y = if c { 3 } else { 2.5 }` is a `f64`, which it was not — while the
+two-arm `match` on a `bool` that says the same thing was. Checking left to right made
 the first element decide, which is the asymmetry `[E-NUM-PROMOTE]` records as
 fixed for comparisons, still present one level up.
 
@@ -2020,6 +2023,13 @@ is judged on.
 | a closure | `<closure>` — it has no name to show | |
 | a handler | a struct with the operation names as fields | `CHandler{now: <closure>}` |
 | a range | `start..end`, as written | `1..5` |
+
+Unquoted means a one-element list holding the empty string renders exactly as
+an empty list does: `[""]` and `[]` are both `[]`, and `"".split(",")` — one
+field, per the table above — looks like no fields at all. That is the price of
+a rendering meant to be read rather than parsed, and it is stated because the
+alternative is a reader concluding the library is wrong. `len()` tells them
+apart.
 
 Strings nested inside a collection are **not** quoted, so `[a, b c]` is a
 two-element list whose second element contains a space. Rendering is for people
