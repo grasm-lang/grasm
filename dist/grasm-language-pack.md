@@ -2140,6 +2140,14 @@ Method syntax is resolved against the built-in methods for the receiver's type
 first, and a free function is considered only when no built-in matches. So
 declaring a function named `len` does not change what `xs.len()` means.
 
+The language's *own* free functions — `print`, `read_file`, `write_file`,
+`file_exists`, `input`, `args`, `now_millis`, `env`, `exit`, `panic`, `assert`,
+`assert_eq` — are not reached this way. They are not methods of any type, and a
+second spelling for each of them buys nothing: `x |> print` already applies a
+free function to a value ([G-PIPE]), and it is charged the same row a call is.
+`"hi".print()` is refused, and the refusal says so and points at the pipeline —
+it used to offer UFCS for `print`, which is the call it had just refused.
+
 ## 2. `i64` and `f64`
 
 **[L-LIB-FIXED]** `x.to_fixed(places)` is `f64` as text with exactly that
@@ -3145,7 +3153,6 @@ runs only under `grasm run`:
 | an `inout` argument that is not a plain variable | `push_one(b.items)`, `add(xs[0], 5)` — bind it to a `var` first |
 | returning a closure | `fn mk(n: i64) -> fn(i64) -> i64 { \|x\| x + n }` — a top-level `fn` works |
 | a handler that is a loop variable or a list element | `for h in hs { with Src handled_by h { … } }` — a `let`-bound handler compiles |
-| writing *through* a `ref` | `r.field = v`, `r.items.push(x)` — reading through one compiles |
 | a handler operation that is a named `fn` | `SrcHandler{ get: named }` — write the closure inline |
 | `==` on two bare `ref`s | `a == b` — comparing structs or lists *containing* refs compiles |
 | calling a function value through anything but a name | `TABLE[0](21)`, `(m.get(k) ?? d)(x)` — bind it with `let` first, then call it |

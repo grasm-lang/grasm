@@ -339,12 +339,27 @@ fn main() {
 
 # The neighbouring shapes that must keep compiling, so the three rows above
 # stay as narrow as they claim to be.
-expect_refused "writing through a ref" 'type Node = { v: i64 }
+expect_compiles "writing through a ref" 'type Node = { v: i64, kids: [i64] }
 
 fn main() {
-    let r = ref(Node{ v: 1 })
+    let r = ref(Node{ v: 1, kids: [] })
     r.v = 42
-    print("{r.v}")
+    r.kids.push(7)
+    print("{r.v} {r.kids}")
+}'
+
+# Through a cycle, which is what proved the first implementation wrong: the
+# write has to land in the slab, not in a rebuilt copy stored over it.
+expect_compiles "writing through a ref around a cycle" 'type G = { name: str, out: [ref G] }
+
+fn main() {
+    let a = ref(G{ name: "A", out: [] })
+    let b = ref(G{ name: "B", out: [] })
+    a.out.push(b)
+    b.out.push(a)
+    a.out[0].name = "B!"
+    a.out[0].out[0].name = "A!"
+    print("{b.name} {a.name}")
 }'
 
 expect_refused "a handler op that is a named fn" 'effect Src {

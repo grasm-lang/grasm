@@ -3,6 +3,27 @@
 Grasm is pre-1.0: minor releases may break anything not marked `stable` in
 `spec/stability.md`. See `docs/stability.md`.
 
+## Unreleased (0.9.1)
+
+### Fixed
+
+- **`--native` compiles writes through a `ref`.** The backend refused every one
+  of them, so §11 listed the shape and two conformance programs ran under the
+  interpreter alone. The write now lands in the slab rather than rebuilding the
+  referent and storing it back — which a cycle proves is not the same thing:
+  `a.out[0].out[0].name` arrives back at `a`, and the outer copy, stored
+  afterwards, erased the inner write. `grasm_ref_make_unique` gives the slab
+  sole ownership so the existing mutators write in place, and the walk
+  short-circuits above the reference, since a chain of no-op write-backs leaked
+  one reference per level (the setters skip their release when handed back the
+  pointer they already hold). 203 programs identical across all three engines,
+  203 leak-free.
+- **The UFCS help no longer promises a call the compiler will not make.**
+  `"hi".print()` was refused with "a free function `fn print(str, ...)` would
+  also work here (UFCS)" — exactly the call that had just been refused.
+  [L-UFCS] now says the language's own free functions are not methods of any
+  type, and the help names the spelling that works: `"hi" |> print`.
+
 ## 0.9.0 — 2026-08-16
 
 The first release with a scope. Everything below `1.0` is still pre-1.0 by the

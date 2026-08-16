@@ -109,6 +109,24 @@ pub fn value_tables(program: &crate::loader::Program) -> ValueTables {
     (a.value_rows, a.callee_rows)
 }
 
+/// The language's own free functions. Not methods: [L-UFCS] resolves method
+/// syntax against the receiver type's methods and then against functions a
+/// *program* declares, and `print` is a method of nothing.
+const BUILTIN_FREE_FNS: &[&str] = &[
+    "print",
+    "read_file",
+    "write_file",
+    "file_exists",
+    "input",
+    "args",
+    "now_millis",
+    "env",
+    "exit",
+    "panic",
+    "assert",
+    "assert_eq",
+];
+
 pub fn check_program(program: &crate::loader::Program) -> Analysis {
     let files: Vec<ModuleView> = program
         .files
@@ -4964,6 +4982,19 @@ Perform the effect after the closing brace, or yield a number and do the work ou
             return self.uni.fresh();
         }
         let shown = self.show(&recv_ty);
+        // A *built-in* free function is not a method of every type, and
+        // offering UFCS for one promised a call the compiler will not make:
+        // the help said "a free function `fn print(str, ...)` would also work
+        // here" about `print`, which is exactly what had just been refused.
+        // `|>` is the spelling for applying a free function to a value
+        // ([G-PIPE]), and it is the one that works.
+        if BUILTIN_FREE_FNS.contains(&name.name.as_str()) {
+            return self.error_help(
+                name.span,
+                format!("`{}` is a built-in function, not a method on `{shown}`", name.name),
+                format!("write `x |> {}` to pass a value to it, or `{}(x)`", name.name, name.name),
+            );
+        }
         self.error_help(
             name.span,
             format!("no method `{}` on `{shown}`", name.name),

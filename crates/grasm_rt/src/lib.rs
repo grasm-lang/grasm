@@ -2538,6 +2538,80 @@ pub unsafe extern "C" fn grasm_ref_set(r: i64, v: *mut RtVal) {
     }
 }
 
+/// Borrows what a reference points at, having first made the slab its only
+/// owner. Panics if the reference is stale.
+///
+/// A write through a reference has to be seen by every other holder of it
+/// ([T-REF-GENERATIONAL]), which means mutating the value in the slot rather
+/// than rebuilding a copy and storing it back. The mutators do that already —
+/// `grasm_struct_set_field` and `cow_list` both mutate in place when the value
+/// has one owner — so the only thing needed is to make that true, and to hand
+/// back a pointer the caller must *not* release.
+///
+/// Rebuilding instead was wrong in a way only a cycle showed: `a.out[0].name`
+/// and `a.out[0].out[0].name`, where the second path arrives back at `a`, took
+/// a copy of `a` at the outer hop, wrote the inner name into the slab, and
+/// then stored the outer copy over it. The inner write vanished.
+///
+/// # Safety: the returned pointer is borrowed — the slab keeps ownership.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_ref_make_unique(r: i64) -> *mut RtVal {
+    let (i, gen) = unpack_ref(r);
+    let mut s = SLAB.lock().expect("slab");
+    let idx = i as usize;
+    if idx >= s.slots.len() || s.gens[idx] != gen {
+        drop(s);
+        rt_panic("stale reference: the value it pointed to was released");
+    }
+    let Some(p) = s.slots[idx] else {
+        drop(s);
+        rt_panic("stale reference: the value it pointed to was released");
+    };
+    if (*p).rc.get() == 1 {
+        return p;
+    }
+    // Someone else is holding this value, so mutating it in place would be
+    // visible to them as well — and value semantics say it must not be
+    // ([E-VALUE-SEMANTICS]). Clone into the slot; the reference still names
+    // the same slot, so every holder of the *reference* sees what follows.
+    let fresh = match &(*p).payload {
+        RtPayload::Struct { name, fields } => {
+            let cloned: Vec<(String, *mut RtVal)> = fields
+                .iter()
+                .map(|(k, v)| {
+                    inc(*v);
+                    (k.clone(), *v)
+                })
+                .collect();
+            alloc(RtPayload::Struct {
+                name: name.clone(),
+                fields: cloned,
+            })
+        }
+        RtPayload::List(items) => {
+            let cloned: Vec<*mut RtVal> = items
+                .iter()
+                .map(|&it| {
+                    inc(it);
+                    it
+                })
+                .collect();
+            alloc(RtPayload::List(cloned))
+        }
+        RtPayload::ListScalar { kind, data } => alloc(RtPayload::ListScalar {
+            kind: *kind,
+            data: data.duplicate(),
+        }),
+        // Nothing else is written *into*: a reference to a scalar is replaced
+        // whole, which `grasm_ref_set` already does.
+        _ => return p,
+    };
+    s.slots[idx] = Some(fresh);
+    drop(s);
+    dec(p);
+    fresh
+}
+
 /// Releases a slot. Every reference to it becomes stale.
 ///
 /// Releasing an already-released slot is a no-op, not a panic: a double

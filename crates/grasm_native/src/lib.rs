@@ -692,6 +692,7 @@ impl<'m> Codegen<'m> {
             ("grasm_ref_new", vec![i64t], Some(i64t)),
             ("grasm_ref_get", vec![i64t], Some(i64t)),
             ("grasm_ref_set", vec![i64t, i64t], None),
+            ("grasm_ref_make_unique", vec![i64t], Some(i64t)),
             ("grasm_ref_release", vec![i64t], None),
             ("grasm_ref_alive", vec![i64t], Some(i8t)),
             ("grasm_env", vec![i64t], Some(i64t)),
@@ -1394,6 +1395,7 @@ impl<'m> Codegen<'m> {
             probe_types: Vec::new(),
             probing_args: false,
             index_vals: HashMap::new(),
+            wrote_through_ref: false,
             task_scopes: Vec::new(),
         };
 
@@ -1804,6 +1806,7 @@ to one — a loop variable or a list element is this case",
             probe_types: Vec::new(),
             probing_args: false,
             index_vals: HashMap::new(),
+            wrote_through_ref: false,
             task_scopes: Vec::new(),
         };
         let entry = fcx.b.create_block();
@@ -1885,6 +1888,7 @@ to one — a loop variable or a list element is this case",
             probe_types: Vec::new(),
             probing_args: false,
             index_vals: HashMap::new(),
+            wrote_through_ref: false,
             task_scopes: Vec::new(),
         };
         let entry = fcx.b.create_block();
@@ -2014,6 +2018,7 @@ to one — a loop variable or a list element is this case",
             probe_types: Vec::new(),
             probing_args: false,
             index_vals: HashMap::new(),
+            wrote_through_ref: false,
             task_scopes: Vec::new(),
         };
         let entry = fcx.b.create_block();
@@ -2217,6 +2222,9 @@ struct FnCx<'a, 'm> {
     /// that writes the value is what evaluates the indices — so doing it
     /// after left the order reversed. Keyed by span, cleared per statement.
     index_vals: HashMap<u32, (Value, VType)>,
+    /// Set when a write reached the slab through a `ref`, so no enclosing
+    /// container needs updating. See `begin_write`.
+    wrote_through_ref: bool,
     /// One entry per enclosing `parallel` block: the runtime list that records
     /// which spawn sites fired, and how many sites have been lowered so far.
     ///
@@ -3970,6 +3978,7 @@ impl FnCx<'_, '_> {
                     };
                     let boxed = self.box_value(final_v, &elem_t);
                     let cur = self.b.use_var(var);
+                    self.begin_write();
                     let updated = self.write_place(*span, cur, &path, &root_t, boxed)?;
                     self.b.def_var(var, updated);
                     return Ok(StmtOut::Value(None));
@@ -5242,6 +5251,7 @@ impl FnCx<'_, '_> {
                     let mapv = self.read_place_boxed(cur, &path, &root_t, true)?;
                     let newmap = self.call_rt("grasm_map_set", &[mapv, kb, vb]).unwrap();
                     let cur2 = self.b.use_var(var);
+                    self.begin_write();
                     let updated = self.write_place(span, cur2, &path, &root_t, newmap)?;
                     self.b.def_var(var, updated);
                     return Ok(None);
@@ -5262,6 +5272,7 @@ impl FnCx<'_, '_> {
                     let mapv = self.read_place_boxed(cur, &path, &root_t, true)?;
                     let newmap = self.call_rt("grasm_map_delete", &[mapv, kb, addr]).unwrap();
                     let cur2 = self.b.use_var(var);
+                    self.begin_write();
                     let updated = self.write_place(span, cur2, &path, &root_t, newmap)?;
                     self.b.def_var(var, updated);
                     self.call_rt("grasm_val_dec", &[kb]);
@@ -5273,6 +5284,7 @@ impl FnCx<'_, '_> {
                     let listv = self.read_place_boxed(cur, &path, &root_t, true)?;
                     let newlist = self.call_rt("grasm_list_sort", &[listv]).unwrap();
                     let cur2 = self.b.use_var(var);
+                    self.begin_write();
                     let updated = self.write_place(span, cur2, &path, &root_t, newlist)?;
                     self.b.def_var(var, updated);
                     return Ok(None);
@@ -5309,6 +5321,7 @@ impl FnCx<'_, '_> {
                     let newlist = self.call_rt("grasm_list_sort_by", &[listv, keys]).unwrap();
                     self.call_rt("grasm_val_dec", &[keys]);
                     let cur2 = self.b.use_var(var);
+                    self.begin_write();
                     let updated = self.write_place(span, cur2, &path, &root_t, newlist)?;
                     self.b.def_var(var, updated);
                     return Ok(None);
@@ -5328,6 +5341,7 @@ impl FnCx<'_, '_> {
                     let listv = self.read_place_boxed(cur, &path, &root_t, true)?;
                     let newlist = self.call_rt("grasm_list_pop", &[listv, addr]).unwrap();
                     let cur2 = self.b.use_var(var);
+                    self.begin_write();
                     let updated = self.write_place(span, cur2, &path, &root_t, newlist)?;
                     self.b.def_var(var, updated);
                     let opt = self.b.ins().stack_load(types::I64, slot, 0);
@@ -5351,6 +5365,7 @@ impl FnCx<'_, '_> {
                         .call_rt("grasm_list_remove", &[listv, idx, addr])
                         .unwrap();
                     let cur2 = self.b.use_var(var);
+                    self.begin_write();
                     let updated = self.write_place(span, cur2, &path, &root_t, newlist)?;
                     self.b.def_var(var, updated);
                     let boxed = self.b.ins().stack_load(types::I64, slot, 0);
@@ -5377,6 +5392,7 @@ impl FnCx<'_, '_> {
             let list_val = self.read_place_boxed(cur, &path, &root_t, true)?;
             let newlist = self.call_rt("grasm_list_push", &[list_val, boxed]).unwrap();
             let cur2 = self.b.use_var(var);
+            self.begin_write();
             let updated = self.write_place(span, cur2, &path, &root_t, newlist)?;
             self.b.def_var(var, updated);
             return Ok(None);
@@ -8714,6 +8730,14 @@ impl FnCx<'_, '_> {
         self.eval_expr_val(ix)
     }
 
+    /// Whether the write just performed landed in the slab through a
+    /// reference, so no enclosing container needs updating. Set by
+    /// `write_place`, read by the level above it, and cleared before each
+    /// top-level write.
+    fn begin_write(&mut self) {
+        self.wrote_through_ref = false;
+    }
+
     fn place_path<'e>(&mut self, e: &'e Expr) -> CResult<(&'e Ident, Vec<PlaceSeg<'e>>)> {
         let mut segs: Vec<PlaceSeg<'e>> = Vec::new();
         let mut cur = e;
@@ -8740,6 +8764,12 @@ impl FnCx<'_, '_> {
     fn place_type(&mut self, root_t: &VType, path: &[PlaceSeg<'_>], span: Span) -> CResult<VType> {
         let mut t = root_t.clone();
         for seg in path {
+            // A reference reads as the value it points at ([T-REF-READ]), and
+            // it consumes no segment of the path: `h.r.v` is the field `v` of
+            // what `h.r` points at.
+            while let VType::Ref(inner) = &t {
+                t = (**inner).clone();
+            }
             t = match (&t, seg) {
                 (VType::Struct(sname), PlaceSeg::Field(f)) => {
                     let sname = sname.clone();
@@ -8769,6 +8799,25 @@ impl FnCx<'_, '_> {
         let mut owned = false;
         for (i, seg) in path.iter().enumerate() {
             let is_last = i + 1 == path.len();
+            // A reference reads as what it points at and consumes no segment.
+            // Before `prev` is taken, because `grasm_ref_get` increments what
+            // it hands back: recorded as owned, the walk releases it a step
+            // later like any other intermediate. Left out of that bookkeeping
+            // it leaked the referent on every `r.items.push(x)`.
+            while let VType::Ref(inner) = &cur_t {
+                let inner = (**inner).clone();
+                // Raw at the root, boxed once a getter has handed it over.
+                let raw = if owned {
+                    let r = self.call_rt("grasm_unbox_i64", &[cur]).unwrap();
+                    self.call_rt("grasm_val_dec", &[cur]);
+                    r
+                } else {
+                    cur
+                };
+                cur = self.call_rt("grasm_ref_get", &[raw]).unwrap();
+                cur_t = inner;
+                owned = true;
+            }
             let prev = cur;
             let prev_owned = owned;
             let prev_t = cur_t.clone();
@@ -8871,6 +8920,21 @@ impl FnCx<'_, '_> {
             // that walk and still holds the placeholder, which is exactly
             // what the write replaces.
             let take = take && i + 1 == path.len();
+            // As in `read_place`: dereference before `prev` is taken, and
+            // record the result as owned so it is released a step later.
+            while let VType::Ref(inner) = &cur_t {
+                let inner = (**inner).clone();
+                let raw = if owned {
+                    let r = self.call_rt("grasm_unbox_i64", &[cur]).unwrap();
+                    self.call_rt("grasm_val_dec", &[cur]);
+                    r
+                } else {
+                    cur
+                };
+                cur = self.call_rt("grasm_ref_get", &[raw]).unwrap();
+                cur_t = inner;
+                owned = true;
+            }
             let prev = cur;
             let prev_owned = owned;
             let prev_t = cur_t.clone();
@@ -8923,6 +8987,33 @@ impl FnCx<'_, '_> {
         root_t: &VType,
         boxed_val: Value,
     ) -> CResult<Value> {
+        // A write whose path passes through a reference has to land in the
+        // slab, not in a rebuilt copy: every other holder of that reference
+        // must see it ([T-REF-GENERATIONAL]). The reference consumes no
+        // segment — it reads as the value it points at — so the whole
+        // remaining path is applied to the referent, and the reference itself
+        // is what the caller stores back, unchanged.
+        if let VType::Ref(inner) = root_t {
+            let inner = (**inner).clone();
+            if path.is_empty() {
+                // `r = ref(...)` — rebinding the reference itself.
+                return Ok(boxed_val);
+            }
+            // `root` is a local's own value here, which for a reference is
+            // the packed slot-and-generation word itself. A reference read out
+            // of a struct or a list arrives boxed instead, and that case is
+            // unboxed where it is read, below.
+            //
+            // The referent is made unique and then written *in place*: every
+            // other holder of the reference has to see the write, and a cycle
+            // proves that rebuilding is not enough — `a.out[0].out[0].name`
+            // comes back to `a`, so an outer copy stored afterwards erased the
+            // inner write.
+            let referent = self.call_rt("grasm_ref_make_unique", &[root]).unwrap();
+            self.write_place(span, referent, path, &inner, boxed_val)?;
+            self.wrote_through_ref = true;
+            return Ok(root);
+        }
         match path.split_first() {
             None => Ok(boxed_val),
             Some((seg, [])) => match (root_t, seg) {
@@ -8960,7 +9051,34 @@ impl FnCx<'_, '_> {
                         }
                         _ => return nope(span, place_shape(root_t, seg)),
                     };
+                // A reference child is written *through*: the write lands in
+                // the slab, so every other holder of it sees the change and
+                // nothing above needs updating — not this parent, and not any
+                // of its own. Saying so is what keeps the walk balanced: the
+                // setters skip their release when handed back the pointer they
+                // already hold, so a chain of no-op write-backs leaked one
+                // reference per level.
+                if let VType::Ref(inner) = &child_t {
+                    let inner = (**inner).clone();
+                    let raw = self.call_rt("grasm_unbox_i64", &[child]).unwrap();
+                    self.call_rt("grasm_val_dec", &[child]);
+                    let referent = self.call_rt("grasm_ref_make_unique", &[raw]).unwrap();
+                    self.write_place(span, referent, rest, &inner, boxed_val)?;
+                    self.wrote_through_ref = true;
+                    return Ok(root);
+                }
                 let new_child = self.write_place(span, child, rest, &child_t, boxed_val)?;
+                if self.wrote_through_ref {
+                    // Something below reached a reference and wrote through
+                    // it, so this level's child is unchanged and there is
+                    // nothing to write back — but the getter that produced it
+                    // incremented, and only the write-back would have released
+                    // it. One leaked reference per level of the path.
+                    if child_t.boxed() {
+                        self.call_rt("grasm_val_dec", &[new_child]);
+                    }
+                    return Ok(root);
+                }
                 match (root_t, writeback) {
                     (VType::Struct(_), PlaceSeg::Field(f)) => {
                         let (fp, fl) = self.str_ptr_len(f);

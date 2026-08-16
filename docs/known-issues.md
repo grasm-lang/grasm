@@ -5,8 +5,10 @@ Every defect that is known and not fixed, with its severity from
 to paste. S1 and S2 block a release; S3 and S4 do not, and this file is what
 makes shipping them honest rather than quiet.
 
-**Open S1: none. Open S2: none.** One S3 closed on 2026-08-16, and the
-mechanism that produced it was removed.
+**Open S1: none. Open S2: none. One S3 and no S4 remain open.**
+
+Closed on 2026-08-16: the effect-row fallback pool (and the mechanism behind
+it), writes through a `ref` under `--native`, and the UFCS help text.
 
 ## S3 — over-strict, effect-row inference
 
@@ -23,35 +25,26 @@ per-binder special cases that fed them — is gone, 511 lines of it.
 There is no fallback pool to be over-strict any more, so the shape recorded
 here (a `match` payload charged a sibling parameter's row) cannot recur.
 
-### `--native` refuses shapes the interpreter accepts
+### `--native` refuses one shape the interpreter accepts
 
-The §11 table in the specification lists them, `scripts/nativegaps.sh` proves
-the list matches the compiler in both directions, and every refusal names
-itself and points at `grasm run`. Three conformance programs are in this state
-today (`T-REF-CAPTURE`, `T-REF-WRITE`, `T-EFFECT-OP-RESULT`). Refusals, not
-miscompiles.
+The §11 table in the specification lists it, `scripts/nativegaps.sh` proves the
+list matches the compiler in both directions, and the refusal names itself and
+points at `grasm run`. One conformance program is in this state today
+(`T-EFFECT-OP-RESULT`, which returns a closure). A refusal, not a miscompile.
+
+Two others closed on 2026-08-16: writes through a `ref` now compile, so
+`T-REF-WRITE` and `T-REF-CAPTURE` run under all three engines. The write lands
+in the slab rather than rebuilding the referent, which is what a cycle
+requires — `a.out[0].out[0].name` arrives back at `a`, and an outer copy stored
+afterwards erased the inner write.
 
 ## S4 — diagnostics
 
-### `x.f()` does not reach a library free function
+### `x.f()` does not reach a library free function — *closed*
 
-[L-UFCS] (`stable`) says a free function whose first parameter accepts the
-receiver may be called in method position, and that this "applies to functions
-a program declares, not only to the library". Functions a program declares do
-work (`5.double()`); the built-in library ones do not:
-
-```
-fn main() {
-    "hi".print()
-}
-```
-
-```
-error: no method `print` on `str`
-  help: a free function `fn print(str, ...)` would also work here (UFCS)
-```
-
-The help describes exactly the call that was refused. `"hi" |> print` works and
-is charged `io` correctly, so nothing is unreachable — but either the clause
-should exclude the built-ins or the resolution should include them, and the
-help should not promise what the compiler will not do.
+Closed on 2026-08-16 by narrowing the clause rather than widening the
+implementation. [L-UFCS] now says the language's own free functions are not
+methods of any type, and `"hi".print()` is refused with help that names the
+spelling that works — `"hi" |> print`, which was always there and is charged
+the same row a call is. The old help offered UFCS for `print`, which is the
+call it had just refused.

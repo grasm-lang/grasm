@@ -2915,3 +2915,39 @@ fn shout(n: i64) -> i64 {\n    print(\"{n}\")\n    n\n}\n\n";
         );
     }
 }
+
+/// A built-in free function is not a method, and the refusal says which
+/// spelling does work.
+///
+/// [L-UFCS] resolves method syntax against the receiver type's methods and
+/// then against functions a *program* declares. `print` is a method of
+/// nothing — but the help offered "a free function `fn print(str, ...)` would
+/// also work here (UFCS)", which is exactly the call it had just refused.
+/// Following help that cannot work is worse than no help.
+#[test]
+fn a_builtin_is_not_offered_as_a_method() {
+    for (name, call) in [
+        ("print", "\"hi\".print()"),
+        ("read_file", "\"p\".read_file()"),
+        ("panic", "\"boom\".panic()"),
+        ("exit", "1.exit()"),
+    ] {
+        let (_, diags) = analyze(&format!("fn main() {{\n    let x = {call}\n}}\n"));
+        let d = &diags[0];
+        assert!(
+            d.message.contains("built-in function, not a method"),
+            "{call}: {}",
+            d.message
+        );
+        let help = d.help.clone().unwrap_or_default();
+        assert!(help.contains(&format!("|> {name}")), "{call}: {help}");
+        assert!(!help.contains("UFCS"), "{call}: {help}");
+    }
+    // The pipeline the help names compiles and runs.
+    check_ok("fn main() {\n    \"hi\" |> print\n}\n");
+    // A function the *program* declares is still reachable in method position.
+    check_ok(
+        "fn double(n: i64) -> i64 {\n    n * 2\n}\n\nfn main() {\n    \
+print(\"{5.double()}\")\n}\n",
+    );
+}

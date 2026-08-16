@@ -426,3 +426,32 @@ fn par_filter_over_boxed_elements_falls_back() {
     )
     .expect("boxed elements should fall back, not error");
 }
+
+/// A write through a `ref` compiles.
+///
+/// [T-REF-GENERATIONAL] makes a reference "a plain word: it copies, and it can
+/// be stored in a struct, a list or a map". The backend refused every write
+/// through one, so §11 listed the shape and two conformance programs ran under
+/// the interpreter alone. The output is held identical to the interpreter's by
+/// `scripts/difftest.sh` and the reference counting by `scripts/leakcheck.sh`;
+/// what this pins is that the shapes reach the backend at all — including the
+/// cycle, where rebuilding the referent and storing it back erased the inner
+/// write.
+#[test]
+fn a_write_through_a_ref_compiles() {
+    for src in [
+        "type Node = { v: i64, kids: [i64] }\n\nfn main() {\n    \
+let r = ref(Node{ v: 1, kids: [] })\n    r.v = 42\n    r.kids.push(7)\n    \
+print(\"{r.v} {r.kids}\")\n}\n",
+        "type Node = { v: i64 }\ntype Holder = { r: ref Node }\n\nfn main() {\n    \
+let h = Holder{ r: ref(Node{ v: 2 }) }\n    h.r.v = 9\n    print(\"{h.r.v}\")\n}\n",
+        "type Node = { v: i64 }\n\nfn main() {\n    \
+let rs = [ref(Node{ v: 1 })]\n    rs[0].v = 5\n    print(\"{rs[0].v}\")\n}\n",
+        "type G = { name: str, out: [ref G] }\n\nfn main() {\n    \
+let a = ref(G{ name: \"A\", out: [] })\n    let b = ref(G{ name: \"B\", out: [] })\n    \
+a.out.push(b)\n    b.out.push(a)\n    a.out[0].name = \"B!\"\n    \
+a.out[0].out[0].name = \"A!\"\n    print(\"{b.name} {a.name}\")\n}\n",
+    ] {
+        compile(src).unwrap_or_else(|e| panic!("{src}\n{e}"));
+    }
+}
