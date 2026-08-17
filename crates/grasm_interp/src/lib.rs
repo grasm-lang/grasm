@@ -100,12 +100,28 @@ pub fn run_src_capturing_fault<W: Write + Send>(
     src: &str,
     out: &mut W,
 ) -> (i32, Option<String>, Vec<grasm_syntax::Diagnostic>) {
+    run_src_capturing_fault_with_stdin(src, out, None)
+}
+
+/// The same, with the lines `input()` should read supplied by the caller.
+///
+/// `None` uses the process's stdin, which is what the command line wants.
+/// `Some` is for a host that has none — a wasm module in a browser — where the
+/// alternative is that no program using `input()` can run at all.
+pub fn run_src_capturing_fault_with_stdin<W: Write + Send>(
+    src: &str,
+    out: &mut W,
+    stdin: Option<Vec<String>>,
+) -> (i32, Option<String>, Vec<grasm_syntax::Diagnostic>) {
     on_deep_stack(move || {
         let (module, diags) = grasm_sema::analyze(src);
         if !diags.is_empty() {
             return (1, None, diags);
         }
         let mut interp = Interp::new(&module, out);
+        if let Some(lines) = stdin {
+            interp.set_stdin(lines);
+        }
         let code = interp.run_main();
         (code, interp.fault.clone(), vec![])
     })

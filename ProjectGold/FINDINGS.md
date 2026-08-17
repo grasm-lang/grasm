@@ -273,3 +273,22 @@ handler that decides what that means, and `par_map`'s refusal narrowed from "any
 effect" to "any effect that is not `async`" is a design that fits the existing
 type system — and is close to how WebAssembly's stack-switching proposal is
 specified, which is the same bet `docs/wasm.md` argues for.
+
+## F15 — a wasm trap poisons the instance, and the docs did not say so (S4, docs)
+
+Found by clicking "Run all" on the browser showcase, not by any harness.
+
+Project 08 recurses 50,000 deep. A wasm module's stack is fixed at link time, so
+it traps — which `docs/wasm.md` already records. What was not recorded is that
+the trap leaves **the whole instance unusable**: every program run afterwards in
+that same instance failed too, so one program taking the stack down turned into
+sixteen "TRAPPED" lines.
+
+The command-line harness never saw it, because `scripts/wasmtest.sh` runs each
+program in its own node process.
+
+Not a defect in the language or in the wasm build — it is how WebAssembly is
+specified to behave. It is a defect in the *embedding guidance*: an embedder
+running more than one program must instantiate per run, and `docs/wasm.md` now
+says so. `WebAssembly.compile` once and `new WebAssembly.Instance` per program
+costs about a millisecond and confines a trap to the program that caused it.

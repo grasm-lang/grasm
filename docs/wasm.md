@@ -37,6 +37,20 @@ program's output with it. A browser has a perfectly good clock, so the module
 imports one rather than faking a zero. This was found by running
 `examples/stdlib_tour.gr`, which ends by asking what time it is.
 
+## One instance per program
+
+An embedder that runs more than one program must **instantiate per run**, not
+per page. A wasm trap leaves its instance unusable, so a single program that
+exhausts the stack takes every later run down with it — which is exactly what
+happened the first time the showcase ran all twenty-six: project 08 traps by
+design, and the sixteen programs after it reported failures they had not caused.
+
+`WebAssembly.compile` once and `new WebAssembly.Instance(module, imports)` per
+program costs about a millisecond and confines a trap to the program that
+caused it. `ProjectGold/web/index.html` is the reference for this;
+`scripts/wasm/run.mjs` gets away with a single instance only because it runs one
+program per process.
+
 ## The ABI
 
 Three exports and no binding generator. `wasm-bindgen` would work and is

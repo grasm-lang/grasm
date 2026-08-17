@@ -23,12 +23,18 @@ const { instance } = await WebAssembly.instantiate(readFileSync(wasmPath), {
 const ex = instance.exports;
 const bytes = () => new Uint8Array(ex.memory.buffer);
 
-export function run(source) {
-  const encoded = new TextEncoder().encode(source);
+export function run(source, stdin = "") {
+  const enc = new TextEncoder();
+  const encoded = enc.encode(source);
   const src = ex.grasm_alloc(encoded.length);
   bytes().set(encoded, src);
-  const res = ex.grasm_run(src, encoded.length);
+  // `input()` has no stdin on wasm32, so the lines are handed in.
+  const inBytes = enc.encode(stdin);
+  const inPtr = inBytes.length ? ex.grasm_alloc(inBytes.length) : 0;
+  if (inBytes.length) bytes().set(inBytes, inPtr);
+  const res = ex.grasm_run_with_stdin(src, encoded.length, inPtr, inBytes.length);
   ex.grasm_free(src, encoded.length);
+  if (inBytes.length) ex.grasm_free(inPtr, inBytes.length);
 
   // Read the frame the ABI documents: total, exit code, stdout, diagnostics.
   const view = new DataView(ex.memory.buffer);
@@ -44,7 +50,9 @@ export function run(source) {
   return { code, out, err };
 }
 
-const { code, out, err } = run(readFileSync(srcPath, "utf8"));
+const stdinPath = process.argv[4];
+const stdinText = stdinPath ? readFileSync(stdinPath, "utf8") : "";
+const { code, out, err } = run(readFileSync(srcPath, "utf8"), stdinText);
 process.stdout.write(out);
 if (err) process.stderr.write(err.endsWith("\n") ? err : err + "\n");
 process.exit(code & 0xff);

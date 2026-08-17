@@ -23,12 +23,15 @@
 //!
 //! # The ABI
 //!
-//! Three exports, and no dependency on a binding generator.
+//! Four exports, and no dependency on a binding generator.
 //!
 //! * `grasm_alloc(len) -> ptr` — reserve `len` bytes for the caller to write.
 //! * `grasm_free(ptr, len)` — release what `grasm_alloc` or `grasm_run` gave.
 //! * `grasm_run(ptr, len) -> ptr` — run the UTF-8 source at `ptr`, and answer
 //!   with a buffer laid out as little-endian `u32`s:
+//! * `grasm_run_with_stdin(ptr, len, in_ptr, in_len) -> ptr` — the same, with
+//!   the lines `input()` should read. wasm32 has no stdin, so without this an
+//!   interactive program cannot run in a browser at all.
 //!
 //! ```text
 //! [0..4)   total byte length of this buffer, including these four
@@ -74,12 +77,55 @@ pub unsafe extern "C" fn grasm_free(ptr: *mut u8, len: usize) {
 /// `ptr` must point at `len` initialised bytes of UTF-8.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_run(ptr: *const u8, len: usize) -> *mut u8 {
+    run_with(ptr, len, std::ptr::null(), 0)
+}
+
+/// Runs Grasm source with the lines `input()` should read.
+///
+/// wasm32 has no stdin, so without this every program built around `input()` is
+/// unrunnable in a browser — which is most of the interactive ones. The lines
+/// are a single UTF-8 buffer split on `\n`, because that is what a `<textarea>`
+/// hands over and a second length-prefixed array would buy nothing.
+///
+/// # Safety
+/// Both pointers must point at that many initialised bytes of UTF-8; the stdin
+/// pointer may be null when `stdin_len` is 0.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_run_with_stdin(
+    ptr: *const u8,
+    len: usize,
+    stdin_ptr: *const u8,
+    stdin_len: usize,
+) -> *mut u8 {
+    run_with(ptr, len, stdin_ptr, stdin_len)
+}
+
+unsafe fn run_with(
+    ptr: *const u8,
+    len: usize,
+    stdin_ptr: *const u8,
+    stdin_len: usize,
+) -> *mut u8 {
     let src = std::slice::from_raw_parts(ptr, len);
     // Invalid UTF-8 is replaced rather than refused, for the same reason
     // `tcp_read` replaces it ([L-LIB-NET]): the caller is a browser and a
     // mangled byte should produce a diagnostic, not a trap with no message.
     let src = String::from_utf8_lossy(src).into_owned();
-    let (code, out, diags) = run_to_strings(&src);
+    // Always `Some`, even when empty. This embedder has no stdin to fall back
+    // to — on wasm32 there is none, and on the host a test would block on the
+    // real one — so "no lines supplied" must mean end of input, not "go and
+    // read the process's stdin".
+    let stdin = if stdin_ptr.is_null() || stdin_len == 0 {
+        Some(Vec::new())
+    } else {
+        let raw = std::slice::from_raw_parts(stdin_ptr, stdin_len);
+        let text = String::from_utf8_lossy(raw).into_owned();
+        // A trailing newline would otherwise add an empty final line, which
+        // every program in the corpus reads as "stop" one line early.
+        let text = text.strip_suffix('\n').unwrap_or(&text).to_string();
+        Some(text.split('\n').map(|l| l.to_string()).collect())
+    };
+    let (code, out, diags) = run_to_strings(&src, stdin);
     frame(code, &out, &diags)
 }
 
@@ -89,9 +135,10 @@ pub unsafe extern "C" fn grasm_run(ptr: *const u8, len: usize) -> *mut u8 {
 /// a Grasm program is *allowed* to panic — that is what [E-PANIC] specifies. So
 /// the fault is caught and returned as text, exactly as the conformance harness
 /// reads it, rather than being allowed to reach the boundary.
-fn run_to_strings(src: &str) -> (i32, String, String) {
+fn run_to_strings(src: &str, stdin: Option<Vec<String>>) -> (i32, String, String) {
     let mut out: Vec<u8> = Vec::new();
-    let (code, fault, diags) = grasm_interp::run_src_capturing_fault(src, &mut out);
+    let (code, fault, diags) =
+        grasm_interp::run_src_capturing_fault_with_stdin(src, &mut out, stdin);
     let stdout = String::from_utf8_lossy(&out).into_owned();
     if !diags.is_empty() {
         let index = LineIndex::new(src);
@@ -155,6 +202,35 @@ mod tests {
 
     fn run(src: &str) -> (i32, String, String) {
         unsafe { unframe(grasm_run(src.as_ptr(), src.len())) }
+    }
+
+    /// `input()` reads the lines the embedder supplied.
+    ///
+    /// wasm32 has no stdin. Checked here on the host, because the alternative
+    /// is finding out in a browser that half the corpus cannot run.
+    #[test]
+    fn supplied_stdin_reaches_input() {
+        let src = "fn main() {\n    var going = true\n    while going {\n        \
+let line = input()\n        if line == \"\" {\n            going = false\n        \
+} else {\n            print(\"got {line}\")\n        }\n    }\n}\n";
+        let stdin = "one\ntwo\nthree\n";
+        let ptr = unsafe {
+            grasm_run_with_stdin(src.as_ptr(), src.len(), stdin.as_ptr(), stdin.len())
+        };
+        let (code, out, err) = unframe(ptr);
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(out, "got one\ngot two\ngot three\n");
+    }
+
+    /// With no stdin supplied, `input()` sees end of input rather than hanging
+    /// or trapping.
+    #[test]
+    fn absent_stdin_is_end_of_input() {
+        let src = "fn main() {\n    let line = input()\n    print(\"[{line}]\")\n}\n";
+        let ptr = unsafe { grasm_run(src.as_ptr(), src.len()) };
+        let (code, out, _) = unframe(ptr);
+        assert_eq!(code, 0);
+        assert_eq!(out, "[]\n");
     }
 
     #[test]

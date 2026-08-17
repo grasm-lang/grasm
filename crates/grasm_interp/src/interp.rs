@@ -60,6 +60,14 @@ enum NetSocket {
 }
 
 pub struct Interp<'a, W: Write> {
+    /// Lines an embedder supplied in place of the process's stdin, and how far
+    /// `input()` has read into them.
+    ///
+    /// `None` means "use the real stdin", which is what a command-line run
+    /// does. `Some` is for hosts that have no stdin at all — a wasm module in a
+    /// browser being the one that matters — so that a program built around
+    /// `input()` can still be run there rather than being unrunnable.
+    stdin_lines: Option<(std::cell::RefCell<usize>, Vec<String>)>,
     /// qualified `mod::fn` → decl
     fns: HashMap<String, &'a FnDecl>,
     current_module: String,
@@ -835,6 +843,7 @@ impl<'a, W: Write> Interp<'a, W> {
         variants.insert("IoFailed".into(), Some(("IoError".into(), 1)));
         let effect_names = std::collections::HashSet::new();
         Interp {
+            stdin_lines: None,
             fns,
             current_module: "main".to_string(),
             consts: HashMap::new(),
@@ -900,6 +909,16 @@ impl<'a, W: Write> Interp<'a, W> {
             Err(Flow::Exit(code)) => code,
             Err(_) => 1,
         }
+    }
+
+    /// Supplies the lines `input()` will read, in place of the process's stdin.
+    ///
+    /// For hosts that have none. A wasm module in a browser is the case this
+    /// exists for: without it, every program built around `input()` is simply
+    /// unrunnable there, which is a poor reason for a language to be
+    /// undemonstrable.
+    pub fn set_stdin(&mut self, lines: Vec<String>) {
+        self.stdin_lines = Some((std::cell::RefCell::new(0), lines));
     }
 
     /// Runs subsequent top-level bodies as though they were written in
@@ -2410,6 +2429,24 @@ build links it, `grasm run` can only reach what is already loaded",
                         return Err(Flow::Exit((code & 0xff) as i32));
                     }
                     "input" => {
+                        // An embedder may supply the input instead of the
+                        // process's stdin — which is the only way `input()` can
+                        // work at all on wasm32, where there is no stdin. When
+                        // no lines were supplied this falls through to the real
+                        // one, so a command-line run is unchanged.
+                        if let Some(lines) = self.stdin_lines.as_mut() {
+                            let next = if *lines.0.borrow() < lines.1.len() {
+                                let i = *lines.0.borrow();
+                                *lines.0.borrow_mut() = i + 1;
+                                lines.1[i].clone()
+                            } else {
+                                // End of input is an empty line, which is what
+                                // a closed stdin gives and what every program
+                                // in the corpus treats as "stop".
+                                String::new()
+                            };
+                            return Ok(Value::str(next));
+                        }
                         let mut line = String::new();
                         let _ = std::io::BufRead::read_line(
                             &mut std::io::stdin().lock(),

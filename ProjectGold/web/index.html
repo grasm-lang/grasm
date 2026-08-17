@@ -1,0 +1,366 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ProjectGold — Grasm in the browser</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #fff; --ink: #14171c; --dim: #666e7a;
+    --line: #e2e5ea; --accent: #2f6fed; --ok: #1a7f4b; --bad: #c23934;
+    --warn: #9a6700; --code-bg: #0d1117; --code-fg: #e6edf3;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0e1116; --panel: #161b22; --ink: #e6edf3; --dim: #8b949e;
+      --line: #262c36; --accent: #5b9bff; --ok: #4ac07a; --bad: #ff7b72;
+      --warn: #d4a017; --code-bg: #0a0d12; --code-fg: #e6edf3;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  header {
+    border-bottom: 1px solid var(--line); background: var(--panel);
+    padding: 1.4rem 1.25rem;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; }
+  h1 { margin: 0 0 .3rem; font-size: 1.3rem; letter-spacing: -.01em; }
+  header p { margin: 0; color: var(--dim); font-size: .9rem; max-width: 62ch; }
+  .status {
+    margin-top: .8rem; font: .82rem var(--mono); color: var(--dim);
+    display: flex; gap: 1.2rem; flex-wrap: wrap;
+  }
+  .status b { color: var(--ink); font-weight: 600; }
+
+  main { max-width: 1180px; margin: 0 auto; padding: 1.25rem;
+         display: grid; grid-template-columns: 290px 1fr; gap: 1.25rem; }
+  @media (max-width: 860px) { main { grid-template-columns: 1fr; } }
+
+  .list { background: var(--panel); border: 1px solid var(--line);
+          border-radius: 10px; overflow: hidden; align-self: start; }
+  .list h2 { margin: 0; padding: .7rem .85rem; font-size: .72rem;
+             text-transform: uppercase; letter-spacing: .07em; color: var(--dim);
+             border-bottom: 1px solid var(--line); }
+  .list button {
+    display: block; width: 100%; text-align: left; border: 0; background: none;
+    color: var(--ink); padding: .5rem .85rem; cursor: pointer;
+    border-bottom: 1px solid var(--line); font-size: .87rem;
+  }
+  .list button:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+  .list button[aria-current="true"] {
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+    font-weight: 600; box-shadow: inset 3px 0 0 var(--accent);
+  }
+  .list .num { color: var(--dim); font: .8rem var(--mono); margin-right: .45rem; }
+  .tag { float: right; font: .68rem var(--mono); padding: .05rem .35rem;
+         border-radius: 4px; margin-top: .12rem; }
+  .tag.host { background: color-mix(in srgb, var(--warn) 20%, transparent); color: var(--warn); }
+
+  .panel { background: var(--panel); border: 1px solid var(--line);
+           border-radius: 10px; padding: 1rem 1.1rem; margin-bottom: 1.1rem; }
+  .panel h3 { margin: 0 0 .35rem; font-size: 1.02rem; }
+  .panel .blurb { margin: 0 0 .9rem; color: var(--dim); font-size: .9rem; }
+  .row { display: flex; gap: .6rem; align-items: center; flex-wrap: wrap; }
+  button.go {
+    border: 0; background: var(--accent); color: #fff; padding: .5rem 1.1rem;
+    border-radius: 7px; font-size: .9rem; font-weight: 600; cursor: pointer;
+  }
+  button.go:disabled { opacity: .5; cursor: default; }
+  button.ghost {
+    border: 1px solid var(--line); background: none; color: var(--ink);
+    padding: .5rem .9rem; border-radius: 7px; font-size: .9rem; cursor: pointer;
+  }
+  .verdict { font: .84rem var(--mono); padding: .28rem .6rem; border-radius: 6px; }
+  .verdict.ok { background: color-mix(in srgb, var(--ok) 16%, transparent); color: var(--ok); }
+  .verdict.bad { background: color-mix(in srgb, var(--bad) 16%, transparent); color: var(--bad); }
+  .verdict.warn { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
+  .verdict.busy { background: color-mix(in srgb, var(--dim) 16%, transparent); color: var(--dim); }
+
+  pre {
+    background: var(--code-bg); color: var(--code-fg); border-radius: 8px;
+    padding: .85rem 1rem; overflow: auto; max-height: 460px;
+    font: .82rem/1.5 var(--mono); margin: .6rem 0 0;
+  }
+  textarea {
+    width: 100%; min-height: 74px; background: var(--code-bg); color: var(--code-fg);
+    border: 1px solid var(--line); border-radius: 8px; padding: .6rem .8rem;
+    font: .82rem var(--mono); resize: vertical;
+  }
+  label.small { font-size: .78rem; color: var(--dim); display: block; margin: .7rem 0 .25rem; }
+  details summary { cursor: pointer; font-size: .88rem; color: var(--dim); }
+  .note { font-size: .84rem; color: var(--dim); margin: .6rem 0 0; }
+  footer { max-width: 1180px; margin: 0 auto; padding: 0 1.25rem 3rem;
+           color: var(--dim); font-size: .84rem; }
+  code { font: .93em var(--mono); }
+</style>
+</head>
+<body>
+
+<header><div class="wrap">
+  <h1>ProjectGold — running in your browser</h1>
+  <p>Twenty-six Grasm programs, executed here by the Grasm reference interpreter
+     compiled to WebAssembly. Not a transcript and not a reimplementation: this
+     is the same engine <code>grasm run</code> uses, on a different machine.</p>
+  <div class="status">
+    <span>engine <b id="engine">loading…</b></span>
+    <span>programs <b id="count">—</b></span>
+    <span>matching their committed output <b id="tally">—</b></span>
+  </div>
+</div></header>
+
+<main>
+  <nav class="list">
+    <h2>Programs</h2>
+    <div id="list"></div>
+  </nav>
+
+  <section>
+    <div class="panel">
+      <h3 id="title">—</h3>
+      <p class="blurb" id="blurb"></p>
+      <div class="row">
+        <button class="go" id="run" disabled>Run</button>
+        <button class="ghost" id="runAll" disabled>Run all 26</button>
+        <span class="verdict busy" id="verdict">waiting for the engine</span>
+      </div>
+      <div id="stdinBox" hidden>
+        <label class="small" for="stdin">stdin — this program reads <code>input()</code></label>
+        <textarea id="stdin" spellcheck="false"></textarea>
+      </div>
+      <p class="note" id="hostNote" hidden></p>
+    </div>
+
+    <div class="panel">
+      <h3>Output</h3>
+      <pre id="out">Pick a program and press Run.</pre>
+    </div>
+
+    <div class="panel">
+      <details>
+        <summary>Source</summary>
+        <pre id="src"></pre>
+      </details>
+    </div>
+  </section>
+</main>
+
+<footer>
+  Three programs need something <code>wasm32-unknown-unknown</code> does not have
+  — a filesystem, or a stack deeper than a wasm module is given — and are marked
+  <span class="tag host">host</span>. Each fails by refusing, never by answering
+  wrongly. Everything else produces byte-identical output to the committed
+  <code>expected.txt</code>, which was itself produced by the native build.
+</footer>
+
+<script>
+const els = {
+  list: document.getElementById("list"),
+  title: document.getElementById("title"),
+  blurb: document.getElementById("blurb"),
+  out: document.getElementById("out"),
+  src: document.getElementById("src"),
+  run: document.getElementById("run"),
+  runAll: document.getElementById("runAll"),
+  verdict: document.getElementById("verdict"),
+  engine: document.getElementById("engine"),
+  count: document.getElementById("count"),
+  tally: document.getElementById("tally"),
+  stdinBox: document.getElementById("stdinBox"),
+  stdin: document.getElementById("stdin"),
+  hostNote: document.getElementById("hostNote"),
+};
+
+/* Programs that cannot run here, and exactly why. Named rather than hidden:
+   a demo that quietly omits its failures is a brochure. */
+const HOST_LIMITS = {
+  "11-todo-file-storage":
+    "Needs a filesystem. wasm32-unknown-unknown has none, so read_file and " +
+    "write_file fail the way they would on a machine with no such file — an " +
+    "Err value, not a wrong answer.",
+  "29-self-hosting-lexer":
+    "Needs a filesystem: it reads every other program's source to compare its " +
+    "token counts against the reference lexer.",
+  "08-fibonacci":
+    "Recurses 50,000 deep. A wasm module's stack is fixed at link time and " +
+    "cannot be enlarged from inside, so this traps where a native build " +
+    "returns. The rest of the program — including detecting the i64 wrap at " +
+    "F(93) — runs fine up to that point.",
+};
+
+let wasm = null, programs = [], current = null;
+
+async function boot() {
+  const [bytes, list] = await Promise.all([
+    fetch("grasm.wasm", { cache: "no-store" }).then(r => r.arrayBuffer()),
+    fetch("programs.json", { cache: "no-store" }).then(r => r.json()),
+  ]);
+
+  /* Compiled once, instantiated per run.
+   *
+   * This is not an optimisation — it is required for correctness. A wasm trap
+   * leaves its instance unusable: after project 08 exhausts the stack, every
+   * later call into that same instance fails too. Running each program in a
+   * fresh instance costs about a millisecond and confines a trap to the program
+   * that caused it.
+   *
+   * The command-line harness never saw this, because it runs each program in
+   * its own process. Found by clicking "Run all". */
+  const compiled = await WebAssembly.compile(bytes);
+  const imports = {
+    env: {
+      // std::time panics on this target, and a panic with no unwinding is an
+      // abort — so the clock is imported rather than faked.
+      grasm_now_millis: () => Date.now(),
+      // Reached through Rust's std and never callable from Grasm.
+      dlsym: () => 0,
+    },
+  };
+
+  wasm = (source, stdin) => {
+    const ex = new WebAssembly.Instance(compiled, imports).exports;
+    const mem = () => new Uint8Array(ex.memory.buffer);
+    const enc = new TextEncoder();
+    const s = enc.encode(source);
+    const sp = ex.grasm_alloc(s.length);
+    mem().set(s, sp);
+    const i = enc.encode(stdin || "");
+    const ip = i.length ? ex.grasm_alloc(i.length) : 0;
+    if (i.length) mem().set(i, ip);
+
+    const res = ex.grasm_run_with_stdin(sp, s.length, ip, i.length);
+    ex.grasm_free(sp, s.length);
+    if (i.length) ex.grasm_free(ip, i.length);
+
+    // The frame the ABI documents: total, exit code, stdout, diagnostics.
+    const v = new DataView(ex.memory.buffer);
+    const total = v.getUint32(res, true);
+    const code = v.getInt32(res + 4, true);
+    const outLen = v.getUint32(res + 8, true);
+    const dec = new TextDecoder();
+    const out = dec.decode(mem().slice(res + 12, res + 12 + outLen));
+    const eo = res + 12 + outLen;
+    const errLen = v.getUint32(eo, true);
+    const err = dec.decode(mem().slice(eo + 4, eo + 4 + errLen));
+    ex.grasm_free(res, total);
+    return { code, out, err };
+  };
+
+  programs = list;
+  els.engine.textContent = (bytes.byteLength / 1048576).toFixed(1) + " MB wasm";
+  els.count.textContent = String(programs.length);
+  renderList();
+  select(programs[0].id);
+  els.run.disabled = false;
+  els.runAll.disabled = false;
+  setVerdict("busy", "ready");
+}
+
+function renderList() {
+  els.list.innerHTML = "";
+  for (const p of programs) {
+    const b = document.createElement("button");
+    b.dataset.id = p.id;
+    const n = p.id.slice(0, 2);
+    b.innerHTML = `<span class="num">${n}</span>${p.title}` +
+      (HOST_LIMITS[p.id] ? `<span class="tag host">host</span>` : "");
+    b.addEventListener("click", () => select(p.id));
+    els.list.appendChild(b);
+  }
+}
+
+function setVerdict(kind, text) {
+  els.verdict.className = "verdict " + kind;
+  els.verdict.textContent = text;
+}
+
+function select(id) {
+  current = programs.find(p => p.id === id);
+  for (const b of els.list.children) {
+    b.setAttribute("aria-current", String(b.dataset.id === id));
+  }
+  els.title.textContent = current.title;
+  els.blurb.textContent = current.blurb || "";
+  els.src.textContent = current.src;
+  els.out.textContent = "Press Run.";
+  const limit = HOST_LIMITS[id];
+  els.hostNote.hidden = !limit;
+  els.hostNote.textContent = limit || "";
+  const wantsStdin = current.stdin !== undefined;
+  els.stdinBox.hidden = !wantsStdin;
+  if (wantsStdin) els.stdin.value = current.stdin;
+  setVerdict("busy", "ready");
+}
+
+function runOne(p, stdin) {
+  const t = performance.now();
+  const r = wasm(p.src, stdin !== undefined ? stdin : (p.stdin || ""));
+  const ms = performance.now() - t;
+  const matches = p.expected !== undefined && r.out === p.expected;
+  return { ...r, ms, matches };
+}
+
+els.run.addEventListener("click", () => {
+  if (!current) return;
+  setVerdict("busy", "running…");
+  // Yield once so the label paints before a long program blocks the thread.
+  setTimeout(() => {
+    let r;
+    try {
+      r = runOne(current, els.stdinBox.hidden ? undefined : els.stdin.value);
+    } catch (e) {
+      els.out.textContent = String(e);
+      setVerdict("bad", "trapped — see the note above");
+      return;
+    }
+    els.out.textContent = (r.out || "(no output)") + (r.err ? "\n\n" + r.err : "");
+    const ms = r.ms.toFixed(0);
+    if (r.matches) setVerdict("ok", `matches expected · exit ${r.code} · ${ms} ms`);
+    else if (r.err) setVerdict("warn", `exit ${r.code} · ${ms} ms · see output`);
+    else setVerdict("bad", `differs from expected · exit ${r.code} · ${ms} ms`);
+  }, 0);
+});
+
+els.runAll.addEventListener("click", () => {
+  setVerdict("busy", "running all…");
+  setTimeout(() => {
+    const lines = [];
+    let ok = 0, host = 0, bad = 0;
+    for (const p of programs) {
+      let verdict, ms = 0;
+      try {
+        const r = runOne(p);
+        ms = r.ms;
+        if (r.matches) { verdict = "match"; ok++; }
+        else if (HOST_LIMITS[p.id]) { verdict = "host limit"; host++; }
+        else { verdict = "DIFFERS"; bad++; }
+      } catch (e) {
+        verdict = HOST_LIMITS[p.id] ? "host limit (trap)" : "TRAPPED";
+        if (HOST_LIMITS[p.id]) host++; else bad++;
+      }
+      lines.push(
+        p.id.padEnd(26) + verdict.padEnd(18) + (ms ? ms.toFixed(0) + " ms" : "")
+      );
+    }
+    lines.push("");
+    lines.push(`${ok} match their committed output, ${host} limited by the host, ${bad} unexplained`);
+    els.out.textContent = lines.join("\n");
+    els.tally.textContent = `${ok} / ${programs.length}`;
+    setVerdict(bad === 0 ? "ok" : "bad",
+      bad === 0 ? `${ok} match, ${host} host-limited` : `${bad} unexplained`);
+  }, 0);
+});
+
+boot().catch(e => {
+  setVerdict("bad", "could not load");
+  els.out.textContent =
+    "Failed to load grasm.wasm.\n\nThis page must be served over http — a " +
+    "browser blocks fetch() from file://.\n\n    python3 -m http.server 8080\n\n" +
+    String(e);
+});
+</script>
+</body>
+</html>
