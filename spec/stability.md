@@ -17,7 +17,7 @@ meaning changed; the listing was wrong about how settled the area is, and
 saying so is cheaper than defending it. See `docs/release-scope.md` for what
 that means for a release.
 
-Today: 112 stable, 76 provisional, 36 experimental, of 224.
+Today: 112 stable, 76 provisional, 38 experimental, of 226.
 
 ## Stable
 
@@ -253,6 +253,8 @@ May change or be removed in any release. New surface starts here.
 - `T-EXTERN` — experimental
 - `G-WILDCARD-BINDING` — experimental
 - `L-LIB-BITS` — experimental
+- `L-LIB-EPRINT` — experimental
+- `L-LIB-FS` — experimental
 - `L-LIB-NET` — experimental
 - `L-LIB-RANGE-OPS` — experimental
 - `T-EFFECT-OP-RESULT` — experimental

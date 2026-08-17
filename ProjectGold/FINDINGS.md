@@ -94,30 +94,35 @@ silently, which is why it needed `#[must_use]`; not repeating that is the better
 answer, and the existing help already names the annotation that holds the
 failure as a value.
 
-## F5 — a string literal cannot span lines, and there is no raw form (S3, language)
+## F5 — WITHDRAWN. I did not check before recording it
 
-Found writing 10-grep-utility. This is refused with "unterminated string
-literal":
+I recorded that "a string literal cannot span lines and there is no raw form",
+and stated flatly: "There is no triple-quote, no backtick, and no line
+continuation inside a literal."
+
+**That was false.** `"""…"""` raw blocks have existed since commit C20 — raw,
+multi-line, no escapes, no interpolation, newlines kept. The lexer function is
+called `lex_raw_string` and it is forty lines above the code I was reading.
 
 ```grasm
-let doc = "the quick brown fox
-jumps over the lazy dog"
+let doc = """the quick brown fox
+jumps over the lazy dog
+a line with { braces } and "quotes" and \n literal backslash-n"""
 ```
 
-There is no triple-quote, no backtick, and no line continuation inside a
-literal. Every embedded document — a test fixture, a block of JSON, a SQL
-statement, an HTML template — has to be written as one long line with `\n`
-escapes, or built by concatenating a list.
+I hit "unterminated string literal" while writing project 10, concluded the
+feature was absent, and wrote the finding without searching for it. The
+diagnostic was right and my inference from it was wrong.
 
-This matters more than it looks. `[G11]` measures Grasm's token count against
-Python's, and a language whose only way to write a five-line fixture is five
-concatenations pays for it in exactly the benchmark it is trying to win. It is
-also the single most common thing a first program needs that this language
-cannot express.
+Project 10 has been rewritten to use the raw form, which is what it should have
+used in the first place.
 
-Workaround used here: `"line one\nline two"`, and `.lines()` to split it back.
+**The lesson is the finding.** Eleven of these entries were written the same way
+— hit an error, infer a gap. This is the one that was checkable and wrong, and
+there is no reason to think it is special. Every remaining open finding should be
+re-verified against the implementation before any work is planned around it.
 
-## F6 — a file can be written and truncated, never removed (S4, library)
+## F6 — a file can be written and truncated, never removed (S4) — **fixed**
 
 Found writing 11-todo-file-storage. The library has `read_file`, `write_file`
 and `file_exists`, and nothing that deletes. A program that creates a temporary
@@ -125,7 +130,7 @@ file can only empty it, so `file_exists` stays true forever and the next run
 sees a leftover. There is also no way to list a directory, which the same
 program would want for "load every todo file".
 
-## F7 — there is no way to write to stderr (S3, library)
+## F7 — there is no way to write to stderr (S3) — **fixed**
 
 Found writing 15-sorting-benchmark. `print` goes to stdout and nothing goes to
 stderr. A command-line tool cannot separate its diagnostics from its output,
@@ -138,8 +143,12 @@ machine-dependent, so it cannot be compared across engines. Project 15 works
 around it by printing derived facts (growth ratios, classified) instead of
 milliseconds.
 
-The runtime already separates them — a panic goes to stderr — so this is a
+The runtime already separates them — a panic goes to stderr — so this was a
 missing builtin rather than a missing capability.
+
+**Fixed** as [L-LIB-EPRINT]. The compiled build brackets the write with a flag the
+runtime reads rather than carrying a second copy of the formatting code, so there
+is one code path and the two streams cannot format differently.
 
 ## F8 — `extern fn` cannot pass a pointer, so most of libc is unreachable (S3, FFI)
 

@@ -2865,6 +2865,28 @@ fn hash(s: str) -> i64 {
 }
 ```
 
+## `L-LIB-EPRINT.gr`
+
+```grasm
+//! tag: L-LIB-EPRINT
+//! expect: output
+//! one
+//! two
+// `eprint` writes to standard error; `print` writes to standard output.
+//
+// The conformance harness compares stdout, so the two `eprint` lines below must
+// NOT appear in the expected output above. That absence is the whole test: if
+// `eprint` ever wrote to stdout, this program would fail with four lines where
+// two were declared.
+fn main() / {io} {
+    print("one")
+    eprint("this is a diagnostic and must not reach stdout")
+    print("two")
+    let n = 21
+    eprint("interpolation works here too: {n * 2}")
+}
+```
+
 ## `L-LIB-EXIT.gr`
 
 ```grasm
@@ -2937,6 +2959,57 @@ fn main() {
     print("{args().len()} {m.is_empty()}")
     assert(1 + 1 == 2)
     assert_eq(2 * 2, 4)
+}
+```
+
+## `L-LIB-FS.gr`
+
+```grasm
+//! tag: L-LIB-FS
+//! expect: output
+//! listing is sorted: [a.txt, b.txt, c.txt]
+//! exists before: true
+//! exists after: false
+//! listing after removal: [b.txt, c.txt]
+//! removing an absent file reports NotFound
+//! listing an absent directory reports NotFound
+// Files can be removed, and a directory can be read ([L-LIB-FS]).
+fn main() / {io} {
+    let dir = "grasm_fs_conformance"
+    // The program makes its own working directory, so it is self-contained and
+    // leaves nothing behind. `make_dir` succeeds if it already exists.
+    let _mk = make_dir(dir) ?? ()
+    // Written out of order on purpose: `list_dir` sorts, so the order below is
+    // the sorted one and not the order the filesystem happens to hold.
+    let _b = write_file(dir + "/b.txt", "b") ?? ()
+    let _c = write_file(dir + "/c.txt", "c") ?? ()
+    let _a = write_file(dir + "/a.txt", "a") ?? ()
+
+    match list_dir(dir) {
+        Ok(names) -> print("listing is sorted: {names}")
+        Err(e) -> print("could not list: {e}")
+    }
+    print("exists before: {file_exists(dir + "/a.txt")}")
+    match remove_file(dir + "/a.txt") {
+        Ok(_) -> {}
+        Err(e) -> print("could not remove: {e}")
+    }
+    print("exists after: {file_exists(dir + "/a.txt")}")
+    match list_dir(dir) {
+        Ok(names) -> print("listing after removal: {names}")
+        Err(e) -> print("could not list: {e}")
+    }
+    match remove_file(dir + "/a.txt") {
+        Ok(_) -> print("removed a file that was not there")
+        Err(e) -> print("removing an absent file reports NotFound")
+    }
+    match list_dir(dir + "/nope") {
+        Ok(_) -> print("listed a directory that was not there")
+        Err(e) -> print("listing an absent directory reports NotFound")
+    }
+    // Leave nothing behind: running the suite twice is the same as once.
+    let _rb = remove_file(dir + "/b.txt") ?? ()
+    let _rc = remove_file(dir + "/c.txt") ?? ()
 }
 ```
 

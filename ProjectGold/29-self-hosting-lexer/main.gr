@@ -123,9 +123,40 @@ fn skip_trivia(inout lx: Lexer) {
     }
 }
 
+/// A raw block: `"""..."""`. No escapes, no interpolation, newlines kept.
+///
+/// Missing from this lexer until project 10 started using one, at which point
+/// the reference comparison reported 970 tokens against the reference's 947 —
+/// because every line of the fixture was being lexed as code. That is exactly
+/// what the comparison is for: the self-hosted lexer fell behind the language
+/// and the diff said so on the next run.
+fn lex_raw_string(inout lx: Lexer) -> Tok {
+    lx.i = lx.i + 3
+    var text = ""
+    var closed = false
+    while lx.i < lx.cs.len() and not closed {
+        if peek_at(lx, 0) == "\"" and peek_at(lx, 1) == "\"" and peek_at(lx, 2) == "\"" {
+            lx.i = lx.i + 3
+            closed = true
+        } else {
+            text = text + lx.cs[lx.i]
+            lx.i = lx.i + 1
+        }
+    }
+    if not closed {
+        return TError("unterminated raw string literal")
+    }
+    TStr(text)
+}
+
 /// A string literal, including interpolation. `{` opens an expression and the
 /// characters inside it are *not* string content; `\{` is a literal brace.
 fn lex_string(inout lx: Lexer) -> Tok {
+    // Three quotes open a raw block, and it must be checked first — otherwise
+    // the opening `"""` lexes as an empty string followed by a stray quote.
+    if peek_at(lx, 0) == "\"" and peek_at(lx, 1) == "\"" and peek_at(lx, 2) == "\"" {
+        return lex_raw_string(lx)
+    }
     var text = ""
     lx.i = lx.i + 1
     var closed = false

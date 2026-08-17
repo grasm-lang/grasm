@@ -144,8 +144,17 @@ fn report(label: str, text: str, needle: str) {
 }
 
 fn main() {
-    // One line with `\n` escapes: a literal cannot span lines (FINDINGS.md, F5).
-    let doc = "the quick brown fox\njumps over the lazy dog\nTHE QUICK BROWN FOX\na line with the word the twice\n"
+    // A raw block. `"""..."""` keeps newlines, takes no escapes and does no
+    // interpolation — which is what a fixture wants.
+    //
+    // This file previously wrote the fixture as one long line of `\n` escapes,
+    // on the strength of a finding that said no raw form existed. It did, and
+    // had since commit C20. The finding was withdrawn (FINDINGS.md, F5).
+    let doc = """the quick brown fox
+jumps over the lazy dog
+THE QUICK BROWN FOX
+a line with the word the twice
+"""
 
     report("search", doc, "the")
     report("search", doc, "THE")

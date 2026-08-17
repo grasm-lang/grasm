@@ -34,9 +34,13 @@ const NET_BUILTINS: &[&str] = &[
 
 const IO_BUILTINS: &[&str] = &[
     "print",
+    "eprint",
     "read_file",
     "write_file",
     "file_exists",
+    "remove_file",
+    "make_dir",
+    "list_dir",
     "input",
     "args",
     "now_millis",

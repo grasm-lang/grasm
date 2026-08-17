@@ -547,6 +547,7 @@ impl<'m> Codegen<'m> {
             ("grasm_out_bool", vec![i8t], None),
             ("grasm_out_val", vec![i64t], None),
             ("grasm_out_nl", vec![], None),
+            ("grasm_out_to_stderr", vec![i8t], None),
             ("grasm_panic_div_zero", vec![], None),
             ("grasm_panic_rem_zero", vec![], None),
             ("grasm_panic_assert", vec![], None),
@@ -694,6 +695,9 @@ impl<'m> Codegen<'m> {
             ("grasm_tcp_close", vec![i64t], None),
             ("grasm_write_file", vec![i64t, i64t], Some(i64t)),
             ("grasm_file_exists", vec![i64t], Some(i8t)),
+            ("grasm_remove_file", vec![i64t], Some(i64t)),
+            ("grasm_make_dir", vec![i64t], Some(i64t)),
+            ("grasm_list_dir", vec![i64t], Some(i64t)),
             ("grasm_set_args", vec![i64t, ptr], None),
             ("grasm_now_millis", vec![], Some(i64t)),
             ("grasm_check_leaks", vec![], None),
@@ -7128,6 +7132,18 @@ checker did",
                 self.lower_print(&args[0])?;
                 return Ok(None);
             }
+            // The same lowering, bracketed by a flag the runtime reads
+            // ([L-LIB-EPRINT]). One bit of difference, so there is one code
+            // path and no second copy of the interpolation logic to drift.
+            "eprint" => {
+                let on = self.b.ins().iconst(types::I8, 1);
+                self.call_rt("grasm_out_to_stderr", &[on]);
+                let r = self.lower_print(&args[0]);
+                let off = self.b.ins().iconst(types::I8, 0);
+                self.call_rt("grasm_out_to_stderr", &[off]);
+                r?;
+                return Ok(None);
+            }
             "assert" => {
                 let (c, ct) = self.eval_expr_val(&args[0])?;
                 if ct != VType::Bool {
@@ -7307,6 +7323,30 @@ checker did",
                 self.call_rt("grasm_val_dec", &[pv]);
                 self.call_rt("grasm_val_dec", &[cv]);
                 return Ok(Some((v, VType::Fallible(Box::new(VType::Unit), Box::new(VType::Sum("IoError".into()))))));
+            }
+            // [L-LIB-FS]. Both answer with the sorted listing / unit the
+            // runtime produces, so the two engines cannot disagree on order.
+            "make_dir" | "remove_file" => {
+                let (pv, _) = self.eval_expr_val(&args[0])?;
+                let sym = if id.name == "make_dir" { "grasm_make_dir" } else { "grasm_remove_file" };
+                let v = self.call_rt(sym, &[pv]).unwrap();
+                self.call_rt("grasm_val_dec", &[pv]);
+                return Ok(Some((
+                    v,
+                    VType::Fallible(Box::new(VType::Unit), Box::new(VType::Sum("IoError".into()))),
+                )));
+            }
+            "list_dir" => {
+                let (pv, _) = self.eval_expr_val(&args[0])?;
+                let v = self.call_rt("grasm_list_dir", &[pv]).unwrap();
+                self.call_rt("grasm_val_dec", &[pv]);
+                return Ok(Some((
+                    v,
+                    VType::Fallible(
+                        Box::new(VType::List(Box::new(VType::Str))),
+                        Box::new(VType::Sum("IoError".into())),
+                    ),
+                )));
             }
             "file_exists" => {
                 let (pv, _) = self.eval_expr_val(&args[0])?;
@@ -8359,8 +8399,12 @@ checker did",
                                 Box::new(VType::Str),
                                 Box::new(VType::Sum("IoError".into())),
                             )),
-                            "write_file" => Some(VType::Fallible(
+                            "write_file" | "remove_file" | "make_dir" => Some(VType::Fallible(
                                 Box::new(VType::Unit),
+                                Box::new(VType::Sum("IoError".into())),
+                            )),
+                            "list_dir" => Some(VType::Fallible(
+                                Box::new(VType::List(Box::new(VType::Str))),
                                 Box::new(VType::Sum("IoError".into())),
                             )),
                             _ => None,

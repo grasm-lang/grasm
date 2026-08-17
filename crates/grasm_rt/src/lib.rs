@@ -15,20 +15,59 @@ use std::io::Write;
 // Output (print / interpolation are lowered to piecewise `out` calls)
 // ---------------------------------------------------------------------------
 
+/// Which stream the `grasm_out_*` family is currently writing to.
+///
+/// A thread-local flag rather than a second copy of every output function.
+/// `print` and `eprint` differ in one bit and in nothing else — same
+/// interpolation, same formatting, same flushing — so duplicating six
+/// functions to change a destination would be six places for them to drift
+/// apart ([L-LIB-EPRINT]).
+mod sink {
+    use std::cell::Cell;
+    thread_local! {
+        pub static TO_STDERR: Cell<bool> = const { Cell::new(false) };
+    }
+    pub fn on() -> bool {
+        TO_STDERR.with(|f| f.get())
+    }
+}
+
+/// Directs the next `grasm_out_*` calls at stderr (`1`) or stdout (`0`).
+///
+/// The compiler brackets one `eprint` with a pair of these. Nothing else may
+/// run between them, so the flag cannot be observed in the wrong state.
+#[no_mangle]
+pub extern "C" fn grasm_out_to_stderr(on: i8) {
+    sink::TO_STDERR.with(|f| f.set(on != 0));
+}
+
+/// Writes to whichever stream is currently selected.
+fn emit(f: impl Fn(&mut dyn Write)) {
+    if sink::on() {
+        let mut out = std::io::stderr().lock();
+        f(&mut out);
+    } else {
+        let mut out = std::io::stdout().lock();
+        f(&mut out);
+    }
+}
+
 /// # Safety
 /// `ptr` must point to `len` bytes of valid UTF-8 (guaranteed: the compiler
 /// only passes string-literal data it embedded itself).
 #[no_mangle]
 pub unsafe extern "C" fn grasm_out_text(ptr: *const u8, len: u64) {
     let bytes = std::slice::from_raw_parts(ptr, len as usize);
-    let mut out = std::io::stdout().lock();
-    let _ = out.write_all(bytes);
+    emit(|out| {
+        let _ = out.write_all(bytes);
+    });
 }
 
 #[no_mangle]
 pub extern "C" fn grasm_out_i64(v: i64) {
-    let mut out = std::io::stdout().lock();
-    let _ = write!(out, "{v}");
+    emit(|out| {
+        let _ = write!(out, "{v}");
+    });
 }
 
 /// A float, always distinguishable from an integer.
@@ -51,21 +90,24 @@ pub fn float_text(v: f64) -> String {
 
 #[no_mangle]
 pub extern "C" fn grasm_out_f64(v: f64) {
-    let mut out = std::io::stdout().lock();
-    let _ = write!(out, "{}", float_text(v));
+    emit(|out| {
+        let _ = write!(out, "{}", float_text(v));
+    });
 }
 
 #[no_mangle]
 pub extern "C" fn grasm_out_bool(v: i8) {
-    let mut out = std::io::stdout().lock();
-    let _ = write!(out, "{}", v != 0);
+    emit(|out| {
+        let _ = write!(out, "{}", v != 0);
+    });
 }
 
 #[no_mangle]
 pub extern "C" fn grasm_out_nl() {
-    let mut out = std::io::stdout().lock();
-    let _ = out.write_all(b"\n");
-    let _ = out.flush();
+    emit(|out| {
+        let _ = out.write_all(b"\n");
+        let _ = out.flush();
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -614,8 +656,9 @@ thread_local! {
 #[no_mangle]
 pub extern "C" fn grasm_out_ref(r: i64) {
     let (i, gen) = unpack_ref(r);
-    let mut out = std::io::stdout().lock();
-    let _ = write!(out, "ref#{i}.{gen}");
+    emit(|out| {
+        let _ = write!(out, "ref#{i}.{gen}");
+    });
 }
 
 /// Allocations still live on this thread.
@@ -1631,8 +1674,10 @@ pub unsafe extern "C" fn grasm_unbox_bool(v: *mut RtVal) -> i8 {
 /// live runtime pointer.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_out_val(v: *mut RtVal) {
-    let mut out = std::io::stdout().lock();
-    let _ = write!(out, "{}", display(v));
+    let text = display(v);
+    emit(|out| {
+        let _ = write!(out, "{text}");
+    });
 }
 
 unsafe fn display(v: *mut RtVal) -> String {
@@ -3899,6 +3944,57 @@ pub unsafe extern "C" fn grasm_write_file(path: *mut RtVal, content: *mut RtVal)
 #[no_mangle]
 pub unsafe extern "C" fn grasm_file_exists(path: *mut RtVal) -> i8 {
     i8::from(std::path::Path::new(as_str(path)).exists())
+}
+
+/// Creates the whole path, and succeeds if it already exists ([L-LIB-FS]).
+///
+/// # Safety: called from compiled Grasm with a boxed value.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_make_dir(path: *mut RtVal) -> *mut RtVal {
+    match std::fs::create_dir_all(as_str(path)) {
+        Ok(()) => ok_of(alloc(RtPayload::I64(0))),
+        Err(e) => err_of(io_err("IoFailed", e.to_string())),
+    }
+}
+
+/// # Safety: called from compiled Grasm with a boxed value.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_remove_file(path: *mut RtVal) -> *mut RtVal {
+    let p = as_str(path).to_string();
+    match std::fs::remove_file(&p) {
+        Ok(()) => ok_of(alloc(RtPayload::I64(0))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => err_of(io_err("NotFound", p)),
+        Err(e) => err_of(io_err("IoFailed", e.to_string())),
+    }
+}
+
+/// A directory's entries, by name, **sorted**.
+///
+/// The filesystem's own order differs between machines and between runs, and
+/// principle 6 makes determinism a feature. Both engines sort, and identically
+/// ([L-LIB-FS]) — an unsorted listing would make any program that prints one
+/// untestable and would break the three-engine agreement on the first run.
+///
+/// # Safety: called from compiled Grasm with a boxed value.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_list_dir(path: *mut RtVal) -> *mut RtVal {
+    let p = as_str(path).to_string();
+    match std::fs::read_dir(&p) {
+        Ok(entries) => {
+            let mut names: Vec<String> = entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            let items: Vec<*mut RtVal> = names
+                .into_iter()
+                .map(|n| alloc(RtPayload::Str(RtStr::new(n))))
+                .collect();
+            ok_of(alloc(RtPayload::List(items)))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => err_of(io_err("NotFound", p)),
+        Err(e) => err_of(io_err("IoFailed", e.to_string())),
+    }
 }
 
 /// `xs[i] = v` honoring copy-on-write; `val` ownership transfers.

@@ -216,6 +216,7 @@ fn looks_like(candidate: &str, written: &str) -> bool {
 /// *program* declares, and `print` is a method of nothing.
 const BUILTIN_FREE_FNS: &[&str] = &[
     "print",
+    "eprint",
     "tcp_listen",
     "tcp_connect",
     "tcp_accept",
@@ -225,6 +226,9 @@ const BUILTIN_FREE_FNS: &[&str] = &[
     "read_file",
     "write_file",
     "file_exists",
+    "remove_file",
+    "make_dir",
+    "list_dir",
     "input",
     "args",
     "now_millis",
@@ -4229,15 +4233,21 @@ only a number or a `bool` can come out — compute what you need and yield that"
             if self.lookup(&id.name).is_none() {
                 // Builtin free functions.
                 match id.name.as_str() {
-                    "print" => {
+                    // `eprint` is `print` to the other stream ([L-LIB-EPRINT]).
+                    // Same arity, same refusal for a fallible value, same `io`
+                    // — a tool that cannot separate its diagnostics from its
+                    // output cannot be used in a pipeline, which is most of
+                    // what a command-line tool is for.
+                    "print" | "eprint" => {
                         if args.len() != 1 {
-                            return self.error(span, "print takes exactly 1 argument");
+                            return self
+                                .error(span, format!("{} takes exactly 1 argument", id.name));
                         }
                         let t = self.infer_expr(&args[0]);
                         if let Type::Fallible(..) = self.uni.shallow_resolve(&t) {
                             self.error_help(
                                 args[0].span(),
-                                "cannot print a fallible value",
+                                format!("cannot {} a fallible value", id.name),
                                 "handle the error first with `try` or `match`",
                             );
                         }
@@ -4353,6 +4363,36 @@ only a number or a `bool` can come out — compute what you need and yield that"
                         }
                         self.check_expr(&args[0], &Type::Str);
                         return Type::Bool;
+                    }
+                    // A file could be written and truncated and never removed,
+                    // and a directory could not be read at all ([L-LIB-FS]).
+                    // A program that creates a temporary file could only empty
+                    // it, so the next run saw a leftover.
+                    "make_dir" | "remove_file" => {
+                        if args.len() != 1 {
+                            return self
+                                .error(span, format!("{} takes exactly 1 argument (path)", id.name));
+                        }
+                        self.check_expr(&args[0], &Type::Str);
+                        let io_err = Type::Named {
+                            id: self.defs.io_error_id,
+                            args: vec![],
+                        };
+                        return Type::Fallible(Box::new(Type::Unit), Box::new(io_err));
+                    }
+                    "list_dir" => {
+                        if args.len() != 1 {
+                            return self.error(span, "list_dir takes exactly 1 argument (path)");
+                        }
+                        self.check_expr(&args[0], &Type::Str);
+                        let io_err = Type::Named {
+                            id: self.defs.io_error_id,
+                            args: vec![],
+                        };
+                        return Type::Fallible(
+                            Box::new(Type::List(Box::new(Type::Str))),
+                            Box::new(io_err),
+                        );
                     }
                     "args" => {
                         if !args.is_empty() {

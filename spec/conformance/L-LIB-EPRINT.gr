@@ -1,0 +1,17 @@
+//! tag: L-LIB-EPRINT
+//! expect: output
+//! one
+//! two
+// `eprint` writes to standard error; `print` writes to standard output.
+//
+// The conformance harness compares stdout, so the two `eprint` lines below must
+// NOT appear in the expected output above. That absence is the whole test: if
+// `eprint` ever wrote to stdout, this program would fail with four lines where
+// two were declared.
+fn main() / {io} {
+    print("one")
+    eprint("this is a diagnostic and must not reach stdout")
+    print("two")
+    let n = 21
+    eprint("interpolation works here too: {n * 2}")
+}

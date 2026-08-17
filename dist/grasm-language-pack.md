@@ -2588,6 +2588,51 @@ There is no unsigned integer type, so a program working in 32 bits masks with
 `0xFFFFFFFF` itself. `spec/conformance/L-LIB-BITS.gr` shows the rotation that
 SHA-256 needs, written that way.
 
+## The other stream — [L-LIB-EPRINT]
+
+**[L-LIB-EPRINT]** `eprint(v)` writes to standard error. It is `print` in every
+other respect: same single argument, same interpolation, same refusal to take a
+fallible value, same `io` effect.
+
+It exists because a program that cannot separate its diagnostics from its output
+cannot be used in a pipeline, and being usable in a pipeline is most of what a
+command-line tool is for. A benchmark's timings, a compiler's warnings and a
+tool's progress are all diagnostics; sending them to stdout puts them in the
+middle of the data, which is the one place they cannot be noticed and the one
+place they do damage. It is the same reason a panic does not go there
+([E-PANIC-EXIT]).
+
+Both engines write the two streams independently and identically. The compiled
+build brackets the write with a flag the runtime reads, rather than carrying a
+second copy of the formatting code — one code path, so the two streams cannot
+format differently.
+
+## Files and directories — [L-LIB-FS]
+
+**[L-LIB-FS]** Two additions to the file surface:
+
+| | type | |
+|---|---|---|
+| `make_dir(path)` | `(str) -> () ! IoError` | creates the whole path; already existing is success |
+| `remove_file(path)` | `(str) -> () ! IoError` | deletes; a missing path is `NotFound` |
+| `list_dir(path)` | `(str) -> [str] ! IoError` | entry names, **sorted** |
+
+`make_dir` creates every missing component and treats an existing directory as
+success, so a program can prepare its own working directory without first asking
+whether one is there.
+
+Without these a file could be created and truncated but never removed, a
+directory could not be read at all, and a program could not make one — so a program that made a temporary file
+could only empty it, and the next run saw a leftover.
+
+**`list_dir` sorts.** A filesystem's own order differs between machines and
+between runs, and principle 6 makes determinism a feature: an unsorted listing
+would make any program that printed one untestable, and would break three-engine
+agreement on the first run. Both engines sort, and identically.
+
+Names are returned, not paths — the caller already knows the directory it asked
+about, and joining is one concatenation.
+
 
 <!-- ===== docs/tutorial.md ===== -->
 

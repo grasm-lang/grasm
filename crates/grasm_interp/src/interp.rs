@@ -2245,6 +2245,18 @@ build links it, `grasm run` can only reach what is already loaded",
                         let _ = writeln!(self.out, "{v}");
                         return Ok(Value::Unit);
                     }
+                    // The other stream ([L-LIB-EPRINT]). Not `self.out`: that
+                    // is the program's output, which an embedder captures and
+                    // a harness compares. A diagnostic written into it is a
+                    // diagnostic in the middle of the data, which is the one
+                    // place it cannot be noticed and the one place it does
+                    // damage — the same reason a panic does not go there
+                    // ([E-PANIC-EXIT]).
+                    "eprint" => {
+                        let v = self.eval_expr(&args[0])?;
+                        eprintln!("{v}");
+                        return Ok(Value::Unit);
+                    }
                     "assert" => {
                         let v = self.eval_expr(&args[0])?;
                         return match v {
@@ -2301,6 +2313,43 @@ build links it, `grasm run` can only reach what is already loaded",
                         let content = self.eval_expr(&args[1])?.to_string();
                         return Ok(match std::fs::write(&p, content) {
                             Ok(()) => Value::Ok(Rc::new(Value::Unit)),
+                            Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
+                        });
+                    }
+                    // Creates the whole path, and succeeds if it is already
+                    // there — so a program can make its own working directory
+                    // without first asking whether it exists ([L-LIB-FS]).
+                    "make_dir" => {
+                        let p = self.eval_expr(&args[0])?.to_string();
+                        return Ok(match std::fs::create_dir_all(&p) {
+                            Ok(()) => Value::Ok(Rc::new(Value::Unit)),
+                            Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
+                        });
+                    }
+                    "remove_file" => {
+                        let p = self.eval_expr(&args[0])?.to_string();
+                        return Ok(match std::fs::remove_file(&p) {
+                            Ok(()) => Value::Ok(Rc::new(Value::Unit)),
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                Value::Err(Rc::new(io_error("NotFound", p)))
+                            }
+                            Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
+                        });
+                    }
+                    // Sorted, because a directory's order is the filesystem's
+                    // and differs between machines and between runs — and
+                    // principle 6 says determinism is a feature. An unsorted
+                    // listing would make any program that prints one
+                    // untestable ([L-LIB-FS]).
+                    "list_dir" => {
+                        let p = self.eval_expr(&args[0])?.to_string();
+                        return Ok(match list_dir_sorted(&p) {
+                            Ok(names) => Value::Ok(Rc::new(Value::List(Rc::new(
+                                names.into_iter().map(Value::str).collect(),
+                            )))),
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                Value::Err(Rc::new(io_error("NotFound", p)))
+                            }
                             Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
                         });
                     }
@@ -3845,6 +3894,20 @@ fn is_float_type(t: &TypeExpr) -> bool {
                 path.segments.last().map(|s| s.name.as_str()),
                 Some("f64") | Some("f32") | Some("float")
             ))
+}
+
+/// A directory's entries, by name, sorted.
+///
+/// The filesystem's own order differs between machines and between runs, and
+/// principle 6 makes determinism a feature — so this sorts, and both engines
+/// sort the same way ([L-LIB-FS]).
+fn list_dir_sorted(path: &str) -> std::io::Result<Vec<String>> {
+    let mut names: Vec<String> = std::fs::read_dir(path)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    Ok(names)
 }
 
 fn io_error(variant: &str, payload: impl Into<String>) -> Value {
