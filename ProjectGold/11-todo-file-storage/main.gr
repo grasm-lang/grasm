@@ -1,0 +1,182 @@
+// Todo list with file storage — file I/O, serialization, and round-tripping.
+//
+// The stated goal is persistence, and the part worth testing is not "does
+// write_file work" but whether a value survives being written and read back.
+// So every case here is a round trip: build a list, serialise it, parse it, and
+// compare field by field. A serialiser that loses a field, or an escape that
+// does not survive its own parser, shows up as a mismatch rather than as
+// plausible-looking output.
+//
+// The escaping is the real subject. A todo's text can contain the delimiter, a
+// newline, or a backslash, and each of those breaks a naive line-per-record
+// format. Those three cases are in the fixture deliberately.
+
+type Todo = {
+    id: i64,
+    text: str,
+    done: bool,
+}
+
+/// One record per line, fields separated by `|`. Anything that would confuse
+/// that is escaped: backslash first, so unescaping is unambiguous.
+fn escape(s: str) -> str {
+    var out = ""
+    for c in s.chars() {
+        if c == "\\" { out = out + "\\\\" }
+        else if c == "|" { out = out + "\\p" }
+        else if c == "\n" { out = out + "\\n" }
+        else { out = out + c }
+    }
+    out
+}
+
+fn unescape(s: str) -> str {
+    var out = ""
+    let cs = s.chars()
+    var i = 0
+    while i < cs.len() {
+        if cs[i] == "\\" and i + 1 < cs.len() {
+            let n = cs[i + 1]
+            if n == "\\" { out = out + "\\" }
+            else if n == "p" { out = out + "|" }
+            else if n == "n" { out = out + "\n" }
+            else { out = out + n }
+            i = i + 2
+        } else {
+            out = out + cs[i]
+            i = i + 1
+        }
+    }
+    out
+}
+
+fn serialize(items: [Todo]) -> str {
+    var out = ""
+    for t in items {
+        let flag = if t.done { "1" } else { "0" }
+        out = out + "{t.id}|{flag}|{escape(t.text)}\n"
+    }
+    out
+}
+
+fn parse(text: str) -> [Todo] {
+    var out: [Todo] = []
+    for line in text.lines() {
+        if line.trim() == "" {
+            // A trailing newline makes a final empty line; it is not a record.
+        } else {
+            let parts = line.split("|")
+            if parts.len() >= 3 {
+                match parts[0].parse_int() {
+                    None -> {}
+                    Some(id) -> {
+                        // The text may itself have held a `|` before escaping,
+                        // so everything from field 2 onward is rejoined.
+                        var text_parts: [str] = []
+                        for i in 2..parts.len() {
+                            text_parts.push(parts[i])
+                        }
+                        out.push(Todo{
+                            id: id,
+                            done: parts[1] == "1",
+                            text: unescape(text_parts.join("|")),
+                        })
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn same(a: [Todo], b: [Todo]) -> bool {
+    if a.len() != b.len() {
+        return false
+    }
+    for i in 0..a.len() {
+        if a[i].id != b[i].id or a[i].done != b[i].done or a[i].text != b[i].text {
+            return false
+        }
+    }
+    true
+}
+
+fn show(items: [Todo]) {
+    for t in items {
+        let mark = if t.done { "x" } else { " " }
+        // The text is shown escaped, so a newline inside one does not break
+        // the display and hide what happened.
+        print("  [{mark}] {t.id}: {escape(t.text)}")
+    }
+}
+
+fn main() {
+    let path = "projectgold_todo.txt"
+
+    var items: [Todo] = []
+    items.push(Todo{ id: 1, text: "buy milk", done: false })
+    items.push(Todo{ id: 2, text: "write the parser", done: true })
+    // The three cases that break a naive format.
+    items.push(Todo{ id: 3, text: "pipe | inside", done: false })
+    items.push(Todo{ id: 4, text: "two\nlines", done: false })
+    items.push(Todo{ id: 5, text: "back\\slash", done: true })
+    items.push(Todo{ id: 6, text: "", done: false })
+
+    print("original ({items.len()} items):")
+    show(items)
+
+    // --- write, read back, compare ---
+    let text = serialize(items)
+    match write_file(path, text) {
+        Err(e) -> print("could not write: {e}")
+        Ok(_) -> {
+            match read_file(path) {
+                Err(e) -> print("could not read back: {e}")
+                Ok(back) -> {
+                    let reloaded = parse(back)
+                    print("reloaded ({reloaded.len()} items):")
+                    show(reloaded)
+                    print("round trip preserved every field: {same(items, reloaded)}")
+                    print("bytes written and read match: {back == text}")
+                }
+            }
+        }
+    }
+
+    // --- mutate and persist again, which is what "loads on boot" means ---
+    var loaded = parse(read_file(path) ?? "")
+    loaded.push(Todo{ id: 7, text: "added after reload", done: false })
+    for i in 0..loaded.len() {
+        if loaded[i].id == 1 {
+            loaded[i].done = true
+        }
+    }
+    match write_file(path, serialize(loaded)) {
+        Err(e) -> print("could not rewrite: {e}")
+        Ok(_) -> {
+            let again = parse(read_file(path) ?? "")
+            print("after mutate and reload ({again.len()} items):")
+            show(again)
+            print("second round trip: {same(loaded, again)}")
+        }
+    }
+
+    // --- the failure paths ---
+    print("--- failures ---")
+    match read_file("projectgold_does_not_exist.txt") {
+        Ok(_) -> print("read a file that should not exist")
+        Err(e) -> print("missing file: {e}")
+    }
+    print("file_exists on ours:   {file_exists(path)}")
+    print("file_exists on absent: {file_exists("projectgold_does_not_exist.txt")}")
+
+    // Parsing junk must give a list, not a panic.
+    print("parse of junk:       {parse("not a record\n\n|||\nabc|1|x\n").len()} item(s)")
+    print("parse of empty:      {parse("").len()} item(s)")
+
+    // Clean up, so running the suite twice is the same as running it once.
+    match write_file(path, "") {
+        Ok(_) -> print("cleaned up")
+        Err(e) -> print("could not clean up: {e}")
+    }
+}

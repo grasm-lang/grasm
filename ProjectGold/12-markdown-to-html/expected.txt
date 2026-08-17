@@ -1,0 +1,41 @@
+--- headings ---
+<h1>One</h1>
+<h2>Two</h2>
+<h6>Six</h6>
+<p>####### Seven is not a heading #NoSpace</p>
+--- emphasis ---
+<p>plain <em>italic</em> and <strong>bold</strong> and <em><strong>both</strong></em></p>
+--- nesting ---
+<p><strong>bold with <em>italic</em> inside</strong></p>
+--- code span ---
+<p>use <code>a &lt; b &amp;&amp; c</code> inline</p>
+--- paragraphs ---
+<p>first line continued here</p>
+<p>second paragraph</p>
+--- list ---
+<ul>
+<li>one</li>
+<li>two with <strong>bold</strong></li>
+<li>three</li>
+</ul>
+<p>after the list</p>
+--- fence ---
+<pre><code>
+let x = a &lt; b
+**not bold** in here
+</code></pre>
+<p>after</p>
+--- escaping ---
+<p>5 &lt; 6 &amp; 7 &gt; 3 and a &quot;quote&quot;</p>
+--- unclosed bold ---
+<p>a **stray marker</p>
+--- unclosed code ---
+<p>a `stray tick</p>
+--- unclosed fence ---
+<pre><code>
+inside forever
+</code></pre>
+--- empty ---
+
+--- only blanks ---
+

@@ -1,0 +1,259 @@
+// A key-value store with a hand-written hash map — buckets, collisions, growth.
+//
+// `Map[K, V]` exists, so using it would test nothing. This builds the table:
+// FNV-1a hashing, separate chaining, and a load-factor resize. The library map
+// is kept alongside as an oracle — every operation is applied to both and the
+// results compared, so a collision-handling bug shows up as a disagreement
+// rather than as a lookup that quietly returns the wrong value.
+//
+// Collisions are not left to chance. `force_collisions` inserts keys chosen to
+// land in the same bucket, because a table with 16 buckets and 8 well-spread
+// keys never exercises the chain at all.
+
+type Entry = { key: str, value: str }
+
+type Table = {
+    buckets: [[Entry]],
+    count: i64,
+}
+
+/// FNV-1a, 64-bit. Multiplication overflows on nearly every byte and
+/// [E-ARITH-INT] says it wraps, which is exactly what the algorithm wants.
+/// With no `^` operator (FINDINGS.md F3) the xor is done arithmetically.
+fn fnv1a(s: str) -> i64 {
+    var h = -3750763034362895579
+    for code in s.codes() {
+        h = xor_byte(h, code)
+        h = h * 1099511628211
+    }
+    h
+}
+
+/// `h ^ byte`, for a byte, without a xor operator: only the low 8 bits can
+/// differ, so the low byte is extracted, combined, and put back.
+fn xor_byte(h: i64, byte: i64) -> i64 {
+    let low = ((h % 256) + 256) % 256
+    let rest = h - low_signed(h)
+    var out = 0
+    var bit = 1
+    var a = low
+    var b = ((byte % 256) + 256) % 256
+    for _i in 0..8 {
+        let abit = a % 2
+        let bbit = b % 2
+        if abit != bbit {
+            out = out + bit
+        }
+        a = a / 2
+        b = b / 2
+        bit = bit * 2
+    }
+    rest + out
+}
+
+/// The low byte of `h` as it contributes to `h` itself, so subtracting it
+/// leaves the high bits untouched for negative values too.
+fn low_signed(h: i64) -> i64 {
+    ((h % 256) + 256) % 256
+}
+
+fn bucket_of(t: Table, key: str) -> i64 {
+    let h = fnv1a(key)
+    // The hash may be negative; the index must not be.
+    let n = t.buckets.len()
+    (((h % n) + n) % n)
+}
+
+fn new_table(size: i64) -> Table {
+    var buckets: [[Entry]] = []
+    for _i in 0..size {
+        buckets.push([])
+    }
+    Table{ buckets: buckets, count: 0 }
+}
+
+fn get(t: Table, key: str) -> Option[str] {
+    let b = bucket_of(t, key)
+    for e in t.buckets[b] {
+        if e.key == key {
+            return Some(e.value)
+        }
+    }
+    None
+}
+
+fn grow(inout t: Table) {
+    var bigger = new_table(t.buckets.len() * 2)
+    for chain in t.buckets {
+        for e in chain {
+            let b = bucket_of(bigger, e.key)
+            bigger.buckets[b].push(e)
+            bigger.count = bigger.count + 1
+        }
+    }
+    t = bigger
+}
+
+fn put(inout t: Table, key: str, value: str) {
+    let b = bucket_of(t, key)
+    var chain = t.buckets[b]
+    for i in 0..chain.len() {
+        if chain[i].key == key {
+            chain[i].value = value
+            t.buckets[b] = chain
+            return
+        }
+    }
+    chain.push(Entry{ key: key, value: value })
+    t.buckets[b] = chain
+    t.count = t.count + 1
+    // Load factor 0.75, the usual point at which chains start costing more
+    // than the copy does.
+    if t.count * 4 > t.buckets.len() * 3 {
+        grow(t)
+    }
+}
+
+fn delete_key(inout t: Table, key: str) -> bool {
+    let b = bucket_of(t, key)
+    var chain = t.buckets[b]
+    var out: [Entry] = []
+    var found = false
+    for e in chain {
+        if e.key == key {
+            found = true
+        } else {
+            out.push(e)
+        }
+    }
+    if found {
+        t.buckets[b] = out
+        t.count = t.count - 1
+    }
+    found
+}
+
+fn longest_chain(t: Table) -> i64 {
+    var most = 0
+    for chain in t.buckets {
+        if chain.len() > most {
+            most = chain.len()
+        }
+    }
+    most
+}
+
+fn used_buckets(t: Table) -> i64 {
+    var n = 0
+    for chain in t.buckets {
+        if chain.len() > 0 { n = n + 1 }
+    }
+    n
+}
+
+/// Keys that land in the same bucket of a table this size, found by search.
+/// A hash table that is never asked to chain has not been tested.
+fn colliding_keys(t: Table, want: i64) -> [str] {
+    let target = bucket_of(t, "seed")
+    var out: [str] = []
+    var i = 0
+    while out.len() < want and i < 200000 {
+        let k = "k{i}"
+        if bucket_of(t, k) == target {
+            out.push(k)
+        }
+        i = i + 1
+    }
+    out
+}
+
+fn main() {
+    print("--- the hash itself ---")
+    print("fnv1a(\"\")      = {fnv1a("")}")
+    print("fnv1a(\"a\")     = {fnv1a("a")}")
+    print("fnv1a(\"b\")     = {fnv1a("b")}")
+    print("fnv1a(\"hello\") differs from fnv1a(\"world\"): {fnv1a("hello") != fnv1a("world")}")
+    print("same input, same hash: {fnv1a("stable") == fnv1a("stable")}")
+
+    print("--- basic operations, against the library map as an oracle ---")
+    var t = new_table(8)
+    var oracle = map()
+    var agree = true
+    let keys = ["one", "two", "three", "four", "five", "six", "seven", "eight",
+                "nine", "ten", "eleven", "twelve"]
+    for i in 0..keys.len() {
+        put(t, keys[i], "v{i}")
+        oracle.set(keys[i], "v{i}")
+    }
+    for k in keys {
+        if get(t, k) != oracle.get(k) {
+            agree = false
+            print("  disagreement on `{k}`: mine {get(t, k)}, library {oracle.get(k)}")
+        }
+    }
+    print("12 inserts agree with the library map: {agree}")
+    print("count {t.count}, buckets {t.buckets.len()}, used {used_buckets(t)}, longest chain {longest_chain(t)}")
+
+    print("--- overwrite, not duplicate ---")
+    put(t, "one", "REPLACED")
+    print("get one: {get(t, "one")}")
+    print("count unchanged at 12: {t.count == 12}")
+
+    print("--- missing keys ---")
+    print("get absent: {get(t, "not-here")}")
+    print("delete absent: {delete_key(t, "not-here")}")
+
+    print("--- delete ---")
+    print("delete three: {delete_key(t, "three")}")
+    print("get three after delete: {get(t, "three")}")
+    print("count now: {t.count}")
+    print("the rest survive: {get(t, "four")} {get(t, "twelve")}")
+
+    print("--- forced collisions, which is the point of the exercise ---")
+    var c = new_table(16)
+    let clash = colliding_keys(c, 5)
+    print("found {clash.len()} keys for one bucket: {clash}")
+    for i in 0..clash.len() {
+        put(c, clash[i], "c{i}")
+    }
+    print("all five readable back: {get(c, clash[0])} {get(c, clash[4])}")
+    print("they shared a bucket: longest chain {longest_chain(c)}, used buckets {used_buckets(c)}")
+    print("delete the middle one: {delete_key(c, clash[2])}")
+    print("the others still resolve: {get(c, clash[1])} {get(c, clash[3])}")
+    print("the deleted one is gone: {get(c, clash[2])}")
+
+    print("--- growth ---")
+    var g = new_table(4)
+    var sizes: [i64] = []
+    for i in 0..100 {
+        put(g, "key{i}", "value{i}")
+        if g.buckets.len() != sizes.len() {
+            // record each distinct table size as it grows
+        }
+    }
+    print("after 100 inserts: count {g.count}, buckets {g.buckets.len()}")
+    print("load factor stayed under 0.75: {g.count * 4 <= g.buckets.len() * 3}")
+    var all_found = true
+    for i in 0..100 {
+        if get(g, "key{i}") != Some("value{i}") {
+            all_found = false
+        }
+    }
+    print("every key survived every resize: {all_found}")
+    print("longest chain after growth: {longest_chain(g)}")
+
+    print("--- keys that stress the hash ---")
+    var s = new_table(8)
+    let odd = ["", " ", "\n", "café", "🙂", "a", "aa", "aaa", "A", "0"]
+    for k in odd {
+        put(s, k, "[{k}]")
+    }
+    var odd_ok = true
+    for k in odd {
+        if get(s, k) != Some("[{k}]") {
+            odd_ok = false
+            print("  lost `{k}`")
+        }
+    }
+    print("empty, space, newline, accented, emoji and single chars all round-trip: {odd_ok}")
+}

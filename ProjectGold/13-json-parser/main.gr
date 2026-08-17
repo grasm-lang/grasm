@@ -1,0 +1,375 @@
+// A JSON parser — recursive descent, a recursive value type, and round-tripping.
+//
+// This is the project that most tests the type system, because JSON's value is
+// genuinely recursive and genuinely heterogeneous: an array of objects of arrays.
+// In Grasm that is a sum type whose variants hold `ref Json`, and getting it to
+// typecheck at all is most of the exercise.
+//
+// Correctness is checked by round trip rather than by eye: parse, re-serialise,
+// parse again, and compare the two trees structurally. A parser that loses a
+// field or mis-orders an array produces a mismatch instead of output that looks
+// about right.
+
+type Json =
+    | JNull
+    | JBool(b: bool)
+    | JNum(n: f64)
+    | JStr(s: str)
+    | JList(items: [ref Json])
+    | JObj(keys: [str], values: [ref Json])
+
+type Bad = { why: str, at: i64 }
+
+type P = { cs: [str], i: i64 }
+
+fn peek(p: P) -> str {
+    if p.i < p.cs.len() { p.cs[p.i] } else { "" }
+}
+
+fn skip_ws(inout p: P) {
+    var going = true
+    while going {
+        let c = peek(p)
+        if c == " " or c == "\n" or c == "\t" or c == "\r" {
+            p.i = p.i + 1
+        } else {
+            going = false
+        }
+    }
+}
+
+fn expect(inout p: P, c: str) -> bool ! Bad {
+    if peek(p) != c {
+        fail(Bad{ why: "expected `{c}` but found `{peek(p)}`", at: p.i })
+    }
+    p.i = p.i + 1
+    true
+}
+
+fn parse_string(inout p: P) -> str ! Bad {
+    let _ok = try expect(p, "\"")
+    var out = ""
+    var going = true
+    while going {
+        if p.i >= p.cs.len() {
+            fail(Bad{ why: "unterminated string", at: p.i })
+        }
+        let c = p.cs[p.i]
+        if c == "\"" {
+            p.i = p.i + 1
+            going = false
+        } else if c == "\\" {
+            p.i = p.i + 1
+            if p.i >= p.cs.len() {
+                fail(Bad{ why: "unterminated escape", at: p.i })
+            }
+            let e = p.cs[p.i]
+            if e == "n" { out = out + "\n" }
+            else if e == "t" { out = out + "\t" }
+            else if e == "r" { out = out + "\r" }
+            else if e == "\"" { out = out + "\"" }
+            else if e == "\\" { out = out + "\\" }
+            else if e == "/" { out = out + "/" }
+            else if e == "u" {
+                // \uXXXX. Only the BMP, and only as a code point — enough to
+                // prove the four hex digits are read and converted.
+                var code = 0
+                for k in 1..5 {
+                    if p.i + k >= p.cs.len() {
+                        fail(Bad{ why: "truncated \\u escape", at: p.i })
+                    }
+                    let h = p.cs[p.i + k].code_at(0)
+                    var v = 0
+                    if h >= 48 and h <= 57 { v = h - 48 }
+                    else if h >= 97 and h <= 102 { v = h - 87 }
+                    else if h >= 65 and h <= 70 { v = h - 55 }
+                    else { fail(Bad{ why: "bad hex digit in \\u escape", at: p.i + k }) }
+                    code = code * 16 + v
+                }
+                out = out + code.to_char()
+                p.i = p.i + 4
+            }
+            else { fail(Bad{ why: "unknown escape `\\{e}`", at: p.i }) }
+            p.i = p.i + 1
+        } else {
+            out = out + c
+            p.i = p.i + 1
+        }
+    }
+    out
+}
+
+fn parse_number(inout p: P) -> f64 ! Bad {
+    let start = p.i
+    if peek(p) == "-" {
+        p.i = p.i + 1
+    }
+    var digits = 0
+    var going = true
+    while going {
+        let c = peek(p)
+        let code = if c == "" { 0 } else { c.code_at(0) }
+        if (code >= 48 and code <= 57) or c == "." or c == "e" or c == "E" {
+            if code >= 48 and code <= 57 {
+                digits = digits + 1
+            }
+            p.i = p.i + 1
+        } else if (c == "+" or c == "-") and p.i > start {
+            let prev = p.cs[p.i - 1]
+            if prev == "e" or prev == "E" {
+                p.i = p.i + 1
+            } else {
+                going = false
+            }
+        } else {
+            going = false
+        }
+    }
+    if digits == 0 {
+        fail(Bad{ why: "expected a number", at: start })
+    }
+    var text = ""
+    for k in start..p.i {
+        text = text + p.cs[k]
+    }
+    match text.parse_float() {
+        Some(v) -> v
+        None -> fail(Bad{ why: "`{text}` is not a number", at: start })
+    }
+}
+
+fn parse_value(inout p: P) -> ref Json ! Bad {
+    skip_ws(p)
+    let c = peek(p)
+    if c == "" {
+        fail(Bad{ why: "unexpected end of input", at: p.i })
+    }
+    if c == "\{" {
+        p.i = p.i + 1
+        var keys: [str] = []
+        var values: [ref Json] = []
+        skip_ws(p)
+        if peek(p) == "\}" {
+            p.i = p.i + 1
+            return ref(JObj(keys, values))
+        }
+        var going = true
+        while going {
+            skip_ws(p)
+            let k = try parse_string(p)
+            skip_ws(p)
+            let _c = try expect(p, ":")
+            let v = try parse_value(p)
+            keys.push(k)
+            values.push(v)
+            skip_ws(p)
+            if peek(p) == "," {
+                p.i = p.i + 1
+            } else {
+                going = false
+            }
+        }
+        skip_ws(p)
+        let _e = try expect(p, "\}")
+        return ref(JObj(keys, values))
+    }
+    if c == "[" {
+        p.i = p.i + 1
+        var items: [ref Json] = []
+        skip_ws(p)
+        if peek(p) == "]" {
+            p.i = p.i + 1
+            return ref(JList(items))
+        }
+        var going = true
+        while going {
+            let v = try parse_value(p)
+            items.push(v)
+            skip_ws(p)
+            if peek(p) == "," {
+                p.i = p.i + 1
+            } else {
+                going = false
+            }
+        }
+        skip_ws(p)
+        let _e = try expect(p, "]")
+        return ref(JList(items))
+    }
+    if c == "\"" {
+        let s = try parse_string(p)
+        return ref(JStr(s))
+    }
+    if c == "t" {
+        for ch in "true".chars() {
+            let _e = try expect(p, ch)
+        }
+        return ref(JBool(true))
+    }
+    if c == "f" {
+        for ch in "false".chars() {
+            let _e = try expect(p, ch)
+        }
+        return ref(JBool(false))
+    }
+    if c == "n" {
+        for ch in "null".chars() {
+            let _e = try expect(p, ch)
+        }
+        return ref(JNull)
+    }
+    let n = try parse_number(p)
+    ref(JNum(n))
+}
+
+fn parse_json(src: str) -> ref Json ! Bad {
+    var p = P{ cs: src.chars(), i: 0 }
+    let v = try parse_value(p)
+    skip_ws(p)
+    if p.i < p.cs.len() {
+        fail(Bad{ why: "trailing input after the value", at: p.i })
+    }
+    v
+}
+
+fn escape_json(s: str) -> str {
+    var out = ""
+    for c in s.chars() {
+        if c == "\"" { out = out + "\\\"" }
+        else if c == "\\" { out = out + "\\\\" }
+        else if c == "\n" { out = out + "\\n" }
+        else if c == "\t" { out = out + "\\t" }
+        else if c == "\r" { out = out + "\\r" }
+        else { out = out + c }
+    }
+    out
+}
+
+/// A number that is a whole value prints without its `.0`, which is what makes
+/// the round trip textually stable as well as structurally equal.
+fn number_text(n: f64) -> str {
+    if n == n.as_i64().as_f64() {
+        return "{n.as_i64()}"
+    }
+    "{n}"
+}
+
+fn to_text(v: ref Json) -> str {
+    match v {
+        JNull -> "null"
+        JBool(b) -> if b { "true" } else { "false" }
+        JNum(n) -> number_text(n)
+        JStr(s) -> "\"" + escape_json(s) + "\""
+        JList(items) -> {
+            var parts: [str] = []
+            for it in items {
+                parts.push(to_text(it))
+            }
+            "[" + parts.join(",") + "]"
+        }
+        JObj(keys, values) -> {
+            var parts: [str] = []
+            for i in 0..keys.len() {
+                parts.push("\"" + escape_json(keys[i]) + "\":" + to_text(values[i]))
+            }
+            "\{" + parts.join(",") + "\}"
+        }
+    }
+}
+
+fn equal(a: ref Json, b: ref Json) -> bool {
+    match a {
+        JNull -> match b { JNull -> true  _ -> false }
+        JBool(x) -> match b { JBool(y) -> x == y  _ -> false }
+        JNum(x) -> match b { JNum(y) -> x == y  _ -> false }
+        JStr(x) -> match b { JStr(y) -> x == y  _ -> false }
+        JList(xs) -> match b {
+            JList(ys) -> {
+                if xs.len() != ys.len() {
+                    return false
+                }
+                for i in 0..xs.len() {
+                    if not equal(xs[i], ys[i]) {
+                        return false
+                    }
+                }
+                true
+            }
+            _ -> false
+        }
+        JObj(xk, xv) -> match b {
+            JObj(yk, yv) -> {
+                if xk.len() != yk.len() {
+                    return false
+                }
+                for i in 0..xk.len() {
+                    if xk[i] != yk[i] or not equal(xv[i], yv[i]) {
+                        return false
+                    }
+                }
+                true
+            }
+            _ -> false
+        }
+    }
+}
+
+fn check(label: str, src: str) {
+    match parse_json(src) {
+        Err(e) -> print("{label}: error: {e.why} (at {e.at})")
+        Ok(v) -> {
+            let text = to_text(v)
+            // Parse the output again and compare trees. Textual equality is a
+            // weaker claim, so both are reported.
+            match parse_json(text) {
+                Err(e) -> print("{label}: re-parse failed: {e.why}")
+                Ok(v2) -> print("{label}: {text}  [stable {text == to_text(v2)}, equal {equal(v, v2)}]")
+            }
+        }
+    }
+}
+
+fn main() {
+    print("--- scalars ---")
+    check("null", "null")
+    check("true", "true")
+    check("int", "42")
+    check("negative", "-17")
+    check("float", "3.25")
+    check("exponent", "1.5e3")
+    check("neg exponent", "2e-2")
+    check("string", "\"hello\"")
+
+    print("--- containers ---")
+    check("empty list", "[]")
+    check("empty object", "\{\}")
+    check("list", "[1,2,3]")
+    check("mixed list", "[1,\"two\",true,null,[4]]")
+    check("object", "\{\"a\":1,\"b\":\"two\"\}")
+    check("nested", "\{\"outer\":\{\"inner\":[1,\{\"deep\":true\}]\}\}")
+    check("whitespace", "  \{ \"a\" : [ 1 , 2 ] \}  ")
+
+    print("--- strings and escapes ---")
+    check("escapes", "\"a\\nb\\tc\"")
+    check("quote", "\"say \\\"hi\\\"\"")
+    check("backslash", "\"back\\\\slash\"")
+    check("unicode", "\"\\u0041\\u00e9\"")
+    check("empty string", "\"\"")
+
+    print("--- malformed, which must be errors and not panics ---")
+    check("trailing comma", "[1,2,]")
+    check("unclosed list", "[1,2")
+    check("unclosed object", "\{\"a\":1")
+    check("unquoted key", "\{a:1\}")
+    check("missing colon", "\{\"a\" 1\}")
+    check("trailing junk", "1 2")
+    check("bare word", "hello")
+    check("empty input", "")
+    check("lone minus", "-")
+    check("unterminated string", "\"abc")
+    check("bad escape", "\"a\\qb\"")
+    check("bad hex", "\"\\u00zz\"")
+
+    print("--- a document ---")
+    check("document", "\{\"name\":\"grasm\",\"version\":0.9,\"tags\":[\"systems\",\"effects\"],\"meta\":\{\"stable\":false,\"goals\":[3,5,11]\}\}")
+}

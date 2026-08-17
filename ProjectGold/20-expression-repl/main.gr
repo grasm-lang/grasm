@@ -1,0 +1,249 @@
+// An expression REPL — a read-eval-print loop with variables and scope.
+//
+// The list calls this "REPL architectures, scope handling, dynamic memory
+// safety". The part that makes it more than project 01 with a prompt is
+// *state*: a session has variables, they persist between lines, and a line can
+// refer to one defined three lines ago or fail because it was never defined.
+//
+// So the environment is threaded through as `inout`, and every error — parse,
+// name, arithmetic — is a value that ends the line and leaves the session
+// intact. A REPL that dies on a typo is not a REPL.
+
+type Tok =
+    | TNum(v: f64)
+    | TName(s: str)
+    | TOp(s: str)
+    | TLParen
+    | TRParen
+    | TAssign
+
+type Fault = { why: str }
+
+type Env = { names: Map[str, f64], history: [f64] }
+
+fn is_digit(c: str) -> bool {
+    let n = c.code_at(0)
+    n >= 48 and n <= 57
+}
+
+fn is_alpha(c: str) -> bool {
+    let n = c.code_at(0)
+    (n >= 97 and n <= 122) or (n >= 65 and n <= 90) or c == "_"
+}
+
+fn lex(src: str) -> [Tok] ! Fault {
+    var out: [Tok] = []
+    let cs = src.chars()
+    var i = 0
+    while i < cs.len() {
+        let c = cs[i]
+        if c == " " or c == "\t" {
+            i = i + 1
+        } else if is_digit(c) or c == "." {
+            var text = ""
+            while i < cs.len() and (is_digit(cs[i]) or cs[i] == ".") {
+                text = text + cs[i]
+                i = i + 1
+            }
+            match text.parse_float() {
+                Some(v) -> out.push(TNum(v))
+                None -> fail(Fault{ why: "`{text}` is not a number" })
+            }
+        } else if is_alpha(c) {
+            var name = ""
+            while i < cs.len() and (is_alpha(cs[i]) or is_digit(cs[i])) {
+                name = name + cs[i]
+                i = i + 1
+            }
+            out.push(TName(name))
+        } else if c == "(" {
+            out.push(TLParen)
+            i = i + 1
+        } else if c == ")" {
+            out.push(TRParen)
+            i = i + 1
+        } else if c == "=" {
+            out.push(TAssign)
+            i = i + 1
+        } else if c == "+" or c == "-" or c == "*" or c == "/" or c == "%" {
+            out.push(TOp(c))
+            i = i + 1
+        } else {
+            fail(Fault{ why: "unexpected character `{c}`" })
+        }
+    }
+    out
+}
+
+fn at(ts: [Tok], i: i64) -> bool {
+    i < ts.len()
+}
+
+fn parse_primary(ts: [Tok], inout i: i64, env: Env) -> f64 ! Fault {
+    if not at(ts, i) {
+        fail(Fault{ why: "expected a value" })
+    }
+    match ts[i] {
+        TNum(v) -> {
+            i = i + 1
+            v
+        }
+        TName(n) -> {
+            i = i + 1
+            match env.names.get(n) {
+                Some(v) -> v
+                None -> fail(Fault{ why: "`{n}` is not defined" })
+            }
+        }
+        TOp(o) -> {
+            if o == "-" {
+                i = i + 1
+                let inner = try parse_primary(ts, i, env)
+                0.0 - inner
+            } else {
+                fail(Fault{ why: "`{o}` needs a value on its left" })
+            }
+        }
+        TLParen -> {
+            i = i + 1
+            let v = try parse_sum(ts, i, env)
+            if not at(ts, i) {
+                fail(Fault{ why: "missing `)`" })
+            }
+            match ts[i] {
+                TRParen -> { i = i + 1 }
+                _ -> fail(Fault{ why: "missing `)`" })
+            }
+            v
+        }
+        _ -> fail(Fault{ why: "expected a value" })
+    }
+}
+
+fn parse_product(ts: [Tok], inout i: i64, env: Env) -> f64 ! Fault {
+    var left = try parse_primary(ts, i, env)
+    var going = true
+    while going {
+        if not at(ts, i) {
+            going = false
+        } else {
+            match ts[i] {
+                TOp(o) -> {
+                    if o == "*" or o == "/" or o == "%" {
+                        i = i + 1
+                        let r = try parse_primary(ts, i, env)
+                        if (o == "/" or o == "%") and r == 0.0 {
+                            fail(Fault{ why: "division by zero" })
+                        }
+                        if o == "*" { left = left * r }
+                        else if o == "/" { left = left / r }
+                        else { left = left - ((left / r).as_i64().as_f64() * r) }
+                    } else {
+                        going = false
+                    }
+                }
+                _ -> going = false
+            }
+        }
+    }
+    left
+}
+
+fn parse_sum(ts: [Tok], inout i: i64, env: Env) -> f64 ! Fault {
+    var left = try parse_product(ts, i, env)
+    var going = true
+    while going {
+        if not at(ts, i) {
+            going = false
+        } else {
+            match ts[i] {
+                TOp(o) -> {
+                    if o == "+" or o == "-" {
+                        i = i + 1
+                        let r = try parse_product(ts, i, env)
+                        if o == "+" { left = left + r } else { left = left - r }
+                    } else {
+                        going = false
+                    }
+                }
+                _ -> going = false
+            }
+        }
+    }
+    left
+}
+
+/// One line. `name = expr` defines; anything else evaluates. Both give back a
+/// value, so `x = 2 + 3` prints 5 the way a real REPL does.
+fn eval_line(src: str, inout env: Env) -> f64 ! Fault {
+    let ts = try lex(src)
+    if ts.len() == 0 {
+        fail(Fault{ why: "empty line" })
+    }
+    // `name = ...` is an assignment; `name` alone is a lookup.
+    var assign_to = ""
+    var start = 0
+    if ts.len() >= 2 {
+        match ts[0] {
+            TName(n) -> match ts[1] {
+                TAssign -> {
+                    assign_to = n
+                    start = 2
+                }
+                _ -> {}
+            }
+            _ -> {}
+        }
+    }
+    var i = start
+    let v = try parse_sum(ts, i, env)
+    if i < ts.len() {
+        fail(Fault{ why: "unexpected trailing input" })
+    }
+    if assign_to != "" {
+        env.names.set(assign_to, v)
+    }
+    env.history.push(v)
+    v
+}
+
+fn main() {
+    var env = Env{ names: map(), history: [] }
+    // `ans` starts defined, so a session can refer to the last answer.
+    env.names.set("ans", 0.0)
+
+    var going = true
+    while going {
+        let line = input()
+        if line == "" {
+            going = false
+        } else {
+            let src = line.trim()
+            if src == "" {
+                // a blank line is not an error, it is nothing
+            } else if src == ":vars" {
+                var names = env.names.keys()
+                names.sort()
+                var parts: [str] = []
+                for n in names {
+                    parts.push("{n}={env.names.get(n) ?? 0.0}")
+                }
+                print("> {src}")
+                print("  {parts.join(" ")}")
+            } else if src == ":count" {
+                print("> {src}")
+                print("  {env.history.len()} value(s) so far")
+            } else {
+                print("> {src}")
+                match eval_line(src, env) {
+                    Ok(v) -> {
+                        env.names.set("ans", v)
+                        print("  {v}")
+                    }
+                    Err(e) -> print("  error: {e.why}")
+                }
+            }
+        }
+    }
+    print("session ended with {env.history.len()} value(s)")
+}

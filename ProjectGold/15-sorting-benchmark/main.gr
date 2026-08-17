@@ -1,0 +1,279 @@
+// Sorting benchmark — three algorithms, checked against each other, then timed.
+//
+// A benchmark that does not verify its answers measures how fast a program
+// produces the wrong result. So every sort here is checked twice before any
+// timing is reported: the output must be ordered, and it must be a permutation
+// of the input. Quicksort in particular is easy to write in a way that sorts
+// most inputs and silently drops duplicates.
+//
+// The timing uses `now_millis()`, which is an `io` effect — so `main` declares
+// `/ {io}` and the whole program is charged for reading a clock. That is the
+// capability system doing its job on a program that has nothing to do with
+// capabilities.
+
+fn is_sorted(xs: [i64]) -> bool {
+    for i in 1..xs.len() {
+        if xs[i - 1] > xs[i] {
+            return false
+        }
+    }
+    true
+}
+
+/// Same multiset, not just same length — this is what catches a quicksort that
+/// loses elements equal to the pivot.
+fn same_elements(a: [i64], b: [i64]) -> bool {
+    if a.len() != b.len() {
+        return false
+    }
+    var x = a
+    var y = b
+    x.sort()
+    y.sort()
+    for i in 0..x.len() {
+        if x[i] != y[i] {
+            return false
+        }
+    }
+    true
+}
+
+fn bubble(xs: [i64]) -> [i64] {
+    var a = xs
+    let n = a.len()
+    var pass = 0
+    var swapped = true
+    while swapped and pass < n {
+        swapped = false
+        for i in 1..(n - pass) {
+            if a[i - 1] > a[i] {
+                let t = a[i - 1]
+                a[i - 1] = a[i]
+                a[i] = t
+                swapped = true
+            }
+        }
+        pass = pass + 1
+    }
+    a
+}
+
+fn insertion(xs: [i64]) -> [i64] {
+    var a = xs
+    for i in 1..a.len() {
+        let key = a[i]
+        var j = i - 1
+        var going = true
+        while going {
+            if j >= 0 and a[j] > key {
+                a[j + 1] = a[j]
+                j = j - 1
+            } else {
+                going = false
+            }
+        }
+        a[j + 1] = key
+    }
+    a
+}
+
+/// Quicksort, written the allocating way. Three-way partitioning, because
+/// two-way on an array of equal keys is the quadratic case and this benchmark
+/// includes exactly that input.
+fn quick(xs: [i64]) -> [i64] {
+    if xs.len() <= 1 {
+        return xs
+    }
+    let pivot = xs[xs.len() / 2]
+    var lo: [i64] = []
+    var eq: [i64] = []
+    var hi: [i64] = []
+    for v in xs {
+        if v < pivot { lo.push(v) }
+        else if v > pivot { hi.push(v) }
+        else { eq.push(v) }
+    }
+    var out = quick(lo)
+    for v in eq { out.push(v) }
+    for v in quick(hi) { out.push(v) }
+    out
+}
+
+fn merge_two(a: [i64], b: [i64]) -> [i64] {
+    var out: [i64] = []
+    var i = 0
+    var j = 0
+    while i < a.len() and j < b.len() {
+        // `<=` and not `<`: taking from the left on a tie is what makes this
+        // stable, and stability is the property merge sort is chosen for.
+        if a[i] <= b[j] {
+            out.push(a[i])
+            i = i + 1
+        } else {
+            out.push(b[j])
+            j = j + 1
+        }
+    }
+    while i < a.len() {
+        out.push(a[i])
+        i = i + 1
+    }
+    while j < b.len() {
+        out.push(b[j])
+        j = j + 1
+    }
+    out
+}
+
+fn merge_sort(xs: [i64]) -> [i64] {
+    if xs.len() <= 1 {
+        return xs
+    }
+    let mid = xs.len() / 2
+    var left: [i64] = []
+    var right: [i64] = []
+    for i in 0..mid { left.push(xs[i]) }
+    for i in mid..xs.len() { right.push(xs[i]) }
+    merge_two(merge_sort(left), merge_sort(right))
+}
+
+type Rng = { seed: i64 }
+
+fn next(inout r: Rng) -> i64 {
+    r.seed = r.seed * 6364136223846793005 + 1442695040888963407
+    if r.seed < 0 { 0 - (r.seed + 1) } else { r.seed }
+}
+
+fn random_list(n: i64, seed: i64, spread: i64) -> [i64] {
+    var r = Rng{ seed: seed }
+    var out: [i64] = []
+    for _i in 0..n {
+        out.push(next(r) % spread)
+    }
+    out
+}
+
+fn sorted_list(n: i64) -> [i64] {
+    var out: [i64] = []
+    for i in 0..n { out.push(i) }
+    out
+}
+
+fn reversed_list(n: i64) -> [i64] {
+    var out: [i64] = []
+    for i in 0..n { out.push(n - i) }
+    out
+}
+
+fn all_same(n: i64) -> [i64] {
+    var out: [i64] = []
+    for _i in 0..n { out.push(7) }
+    out
+}
+
+fn verify(name: str, input: [i64], got: [i64]) -> bool {
+    let ordered = is_sorted(got)
+    let complete = same_elements(input, got)
+    if not ordered or not complete {
+        print("  {name}: WRONG (ordered {ordered}, permutation {complete})")
+        return false
+    }
+    true
+}
+
+fn check_all(label: str, input: [i64]) {
+    var ok = true
+    ok = verify("bubble", input, bubble(input)) and ok
+    ok = verify("insertion", input, insertion(input)) and ok
+    ok = verify("quick", input, quick(input)) and ok
+    ok = verify("merge", input, merge_sort(input)) and ok
+    ok = verify("library", input, {
+        var a = input
+        a.sort()
+        a
+    }) and ok
+    // All five must produce the identical list, not merely a sorted one.
+    let b = bubble(input)
+    let q = quick(input)
+    let m = merge_sort(input)
+    var agree = true
+    for i in 0..b.len() {
+        if b[i] != q[i] or b[i] != m[i] {
+            agree = false
+        }
+    }
+    print("{label} (n={input.len()}): all correct {ok}, all identical {agree}")
+}
+
+fn time_of(f: fn([i64]) -> [i64], xs: [i64]) -> i64 / {io} {
+    let start = now_millis()
+    let out = f(xs)
+    // The result is used, so nothing can be optimised away as dead.
+    let guard = if out.len() > 0 { out[0] } else { 0 }
+    let elapsed = now_millis() - start
+    if guard == 123456789 { 0 - 1 } else { elapsed }
+}
+
+fn main() / {io} {
+    print("--- correctness first, on the inputs that break sorts ---")
+    check_all("random", random_list(200, 1, 1000))
+    check_all("already sorted", sorted_list(200))
+    check_all("reversed", reversed_list(200))
+    check_all("all equal", all_same(200))
+    check_all("many duplicates", random_list(200, 2, 5))
+    check_all("empty", [])
+    check_all("one", [42])
+    check_all("two ordered", [1, 2])
+    check_all("two reversed", [2, 1])
+    check_all("negatives", [3, -1, 4, -1, 5, -9, 2, -6])
+
+    print("--- stability, which only merge sort promises ---")
+    // Encoded as value*10 + index: after a stable sort by value, the indices
+    // within an equal group must still ascend.
+    var tagged: [i64] = []
+    for i in 0..8 {
+        tagged.push((i % 3) * 10 + i)
+    }
+    let by_value = merge_sort(tagged)
+    print("input:  {tagged}")
+    print("merged: {by_value}")
+    var stable = true
+    for i in 1..by_value.len() {
+        if by_value[i - 1] / 10 == by_value[i] / 10 and by_value[i - 1] > by_value[i] {
+            stable = false
+        }
+    }
+    print("merge sort kept equal keys in order: {stable}")
+
+    // Timings themselves are machine-dependent and cannot be compared across
+    // engines, and there is nowhere to put them but stdout (FINDINGS.md, F7).
+    // So what is printed is the *shape* of the curve, which is the actual
+    // claim: an O(n^2) sort roughly quadruples when n doubles, an O(n log n)
+    // one roughly doubles.
+    //
+    // `n` grows until the baseline is big enough to measure, so a fast native
+    // build and a slow interpreter reach the same conclusion rather than
+    // dividing by zero.
+    print("--- growth ---")
+
+    var n = 500
+    var base = 0
+    while base < 25 and n <= 8000 {
+        n = n * 2
+        base = time_of(bubble, random_list(n, 9, 100000))
+    }
+
+    let bubble_1 = time_of(bubble, random_list(n, 9, 100000))
+    let bubble_2 = time_of(bubble, random_list(n * 2, 9, 100000))
+    let merge_1 = time_of(merge_sort, random_list(n * 8, 9, 100000))
+    let merge_2 = time_of(merge_sort, random_list(n * 16, 9, 100000))
+
+    // Ratios as tenths, to avoid float formatting differences.
+    let bubble_ratio = if bubble_1 > 0 { (bubble_2 * 10) / bubble_1 } else { 0 }
+    let merge_ratio = if merge_1 > 0 { (merge_2 * 10) / merge_1 } else { 0 }
+
+    print("bubble doubles n: at least 3x slower: {bubble_ratio >= 30}")
+    print("merge doubles n:  under 3x slower:    {merge_ratio > 0 and merge_ratio < 30}")
+    print("quick beats bubble on the same input: {time_of(quick, random_list(n, 9, 100000)) < bubble_1}")
+    print("merge beats bubble on the same input: {time_of(merge_sort, random_list(n, 9, 100000)) < bubble_1}")
+}

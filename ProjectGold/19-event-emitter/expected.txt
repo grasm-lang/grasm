@@ -1,0 +1,22 @@
+--- registration and emission ---
+listeners: save 2, load 1
+  [A] save: doc.txt
+  [B] save: doc.txt
+emit save -> 2 listener(s) ran
+  [C] load: doc.txt
+emit load -> 1 listener(s) ran
+emit quit -> 0 listener(s) ran
+--- removal ---
+off(A): true
+off(A) again: false
+  [B] save: again.txt
+emit save -> 1 listener(s) ran
+--- a listener that closes over state ---
+the closure counted: 5
+--- order is registration order ---
+fired in order: 123
+--- the pure pipeline: listeners that cannot perform io ---
+apply_all(1)  = 24
+apply_all(10) = 60
+rule count: 3
+a printing rule is refused at compile time — see the comment above

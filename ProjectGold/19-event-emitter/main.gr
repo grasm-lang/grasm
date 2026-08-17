@@ -1,0 +1,175 @@
+// Event emitter — function values, callback lists, and effect rows.
+//
+// This is the project where Grasm's type system says something no mainstream
+// language says. A listener is a function value, and in Grasm a function value
+// carries its **effect row** in its type ([T-FN-TYPE-ROW]). So an emitter
+// declared to hold `fn(str) -> ()` — a written empty row — cannot be handed a
+// listener that prints, and the compiler says so at the registration site
+// rather than at the call.
+//
+// That is checked here two ways: an emitter whose listeners may perform `io`,
+// and a pure one whose listeners may not. The second is the interesting one,
+// because "this callback cannot do I/O" is a claim most languages cannot make
+// at all.
+
+/// A one-field wrapper, because a `ref` needs a field to be read through
+/// (FINDINGS.md, F10).
+type Cell = { n: i64 }
+
+type Log = { text: str }
+
+type Listener = { id: i64, event: str, f: fn(str) -> () / {io} }
+
+type Emitter = {
+    listeners: [Listener],
+    next_id: i64,
+}
+
+fn new_emitter() -> Emitter {
+    Emitter{ listeners: [], next_id: 1 }
+}
+
+fn on(inout e: Emitter, event: str, f: fn(str) -> () / {io}) -> i64 {
+    let id = e.next_id
+    e.listeners.push(Listener{ id: id, event: event, f: f })
+    e.next_id = id + 1
+    id
+}
+
+fn off(inout e: Emitter, id: i64) -> bool {
+    var kept: [Listener] = []
+    var found = false
+    for l in e.listeners {
+        if l.id == id {
+            found = true
+        } else {
+            kept.push(l)
+        }
+    }
+    e.listeners = kept
+    found
+}
+
+/// Emit to every listener registered for this event, in registration order.
+/// Returns how many ran, which is what a caller needs to know whether anything
+/// was listening at all.
+fn emit(e: Emitter, event: str, payload: str) -> i64 / {io} {
+    var n = 0
+    for l in e.listeners {
+        if l.event == event {
+            l.f(payload)
+            n = n + 1
+        }
+    }
+    n
+}
+
+fn listener_count(e: Emitter, event: str) -> i64 {
+    var n = 0
+    for l in e.listeners {
+        if l.event == event { n = n + 1 }
+    }
+    n
+}
+
+// --- the pure emitter -------------------------------------------------------
+//
+// The row here is written empty: `fn(i64) -> i64` with no `/ {…}` means "this
+// function performs nothing". A listener that prints cannot be registered, and
+// the refusal happens where the mistake is.
+
+type PureRule = { name: str, f: fn(i64) -> i64 }
+
+type Pipeline = { rules: [PureRule] }
+
+fn add_rule(inout p: Pipeline, name: str, f: fn(i64) -> i64) {
+    p.rules.push(PureRule{ name: name, f: f })
+}
+
+fn apply_all(p: Pipeline, v: i64) -> i64 {
+    var out = v
+    for r in p.rules {
+        out = r.f(out)
+    }
+    out
+}
+
+fn double(n: i64) -> i64 {
+    n * 2
+}
+
+fn add_ten(n: i64) -> i64 {
+    n + 10
+}
+
+fn main() / {io} {
+    print("--- registration and emission ---")
+    var e = new_emitter()
+
+    let a = on(e, "save", |payload| print("  [A] save: {payload}"))
+    let b = on(e, "save", |payload| print("  [B] save: {payload}"))
+    let c = on(e, "load", |payload| print("  [C] load: {payload}"))
+
+    print("listeners: save {listener_count(e, "save")}, load {listener_count(e, "load")}")
+    print("emit save -> {emit(e, "save", "doc.txt")} listener(s) ran")
+    print("emit load -> {emit(e, "load", "doc.txt")} listener(s) ran")
+    print("emit quit -> {emit(e, "quit", "now")} listener(s) ran")
+
+    print("--- removal ---")
+    print("off(A): {off(e, a)}")
+    print("off(A) again: {off(e, a)}")
+    print("emit save -> {emit(e, "save", "again.txt")} listener(s) ran")
+
+    print("--- a listener that closes over state ---")
+    // The counter has to live outside the closure and be reachable from it,
+    // which is what `ref` is for: a copyable handle into the shared heap.
+    //
+    // It has to point at a *struct*: a `ref` is read and written through a
+    // field ([T-REF-READ], [T-REF-WRITE]), and a scalar has none, so `ref(0)`
+    // can be built and never read (FINDINGS.md, F10).
+    let hits = ref(Cell{ n: 0 })
+    let d = on(e, "tick", |payload| {
+        hits.n += 1
+    })
+    for _i in 0..5 {
+        let _n = emit(e, "tick", "t")
+    }
+    print("the closure counted: {hits.n}")
+
+    print("--- order is registration order ---")
+    var ordered = new_emitter()
+    let log = ref(Log{ text: "" })
+    let _1 = on(ordered, "e", |p| { log.text = log.text + "1" })
+    let _2 = on(ordered, "e", |p| { log.text = log.text + "2" })
+    let _3 = on(ordered, "e", |p| { log.text = log.text + "3" })
+    let _n2 = emit(ordered, "e", "x")
+    print("fired in order: {log.text}")
+
+    print("--- the pure pipeline: listeners that cannot perform io ---")
+    var p = Pipeline{ rules: [] }
+    add_rule(p, "double", double)
+    add_rule(p, "add ten", add_ten)
+    add_rule(p, "double again", |n| n * 2)
+    print("apply_all(1)  = {apply_all(p, 1)}")
+    print("apply_all(10) = {apply_all(p, 10)}")
+    print("rule count: {p.rules.len()}")
+
+    // A printing rule cannot be added. The line below is what the compiler
+    // refuses, and the refusal is the feature:
+    //
+    //     add_rule(p, "logger", |n| {
+    //         print("{n}")
+    //         n
+    //     })
+    //
+    //     error: this closure performs `io`, which the expected type does not allow
+    //       help: widen the type's effect row, or move the effect out of the closure
+    //     error: this expects a function that performs nothing, but this one performs `io`
+    //
+    // That is the verbatim output, checked rather than imagined.
+    //
+    // `PureRule.f` is `fn(i64) -> i64` — a written empty row — so a closure
+    // that prints is rejected at the call to `add_rule`, not when the pipeline
+    // eventually runs. Most languages cannot state this at all.
+    print("a printing rule is refused at compile time — see the comment above")
+}

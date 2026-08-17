@@ -1,0 +1,38 @@
+--- scalars ---
+null: null  [stable true, equal true]
+true: true  [stable true, equal true]
+int: 42  [stable true, equal true]
+negative: -17  [stable true, equal true]
+float: 3.25  [stable true, equal true]
+exponent: 1500  [stable true, equal true]
+neg exponent: 0.02  [stable true, equal true]
+string: "hello"  [stable true, equal true]
+--- containers ---
+empty list: []  [stable true, equal true]
+empty object: {}  [stable true, equal true]
+list: [1,2,3]  [stable true, equal true]
+mixed list: [1,"two",true,null,[4]]  [stable true, equal true]
+object: {"a":1,"b":"two"}  [stable true, equal true]
+nested: {"outer":{"inner":[1,{"deep":true}]}}  [stable true, equal true]
+whitespace: {"a":[1,2]}  [stable true, equal true]
+--- strings and escapes ---
+escapes: "a\nb\tc"  [stable true, equal true]
+quote: "say \"hi\""  [stable true, equal true]
+backslash: "back\\slash"  [stable true, equal true]
+unicode: "Aé"  [stable true, equal true]
+empty string: ""  [stable true, equal true]
+--- malformed, which must be errors and not panics ---
+trailing comma: error: expected a number (at 5)
+unclosed list: error: expected `]` but found `` (at 4)
+unclosed object: error: expected `}` but found `` (at 6)
+unquoted key: error: expected `"` but found `a` (at 1)
+missing colon: error: expected `:` but found `1` (at 5)
+trailing junk: error: trailing input after the value (at 2)
+bare word: error: expected a number (at 0)
+empty input: error: unexpected end of input (at 0)
+lone minus: error: expected a number (at 0)
+unterminated string: error: unterminated string (at 4)
+bad escape: error: unknown escape `\q` (at 3)
+bad hex: error: bad hex digit in \u escape (at 5)
+--- a document ---
+document: {"name":"grasm","version":0.9,"tags":["systems","effects"],"meta":{"stable":false,"goals":[3,5,11]}}  [stable true, equal true]

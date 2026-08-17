@@ -1,0 +1,37 @@
+> 1 + 2 * 3
+  7.0
+> x = 10
+  10.0
+> y = x * 2
+  20.0
+> x + y
+  30.0
+> ans
+  30.0
+> ans + 1
+  31.0
+> :vars
+  ans=31.0 x=10.0 y=20.0
+> (x + y) / 3
+  10.0
+> -x
+  -10.0
+> 7 % 4
+  3.0
+> z
+  error: `z` is not defined
+> 1 / 0
+  error: division by zero
+> 2 +
+  error: expected a value
+> 4 $ 5
+  error: unexpected character `$`
+> x = x + 5
+  15.0
+> x
+  15.0
+> :count
+  11 value(s) so far
+> :vars
+  ans=15.0 x=15.0 y=20.0
+session ended with 11 value(s)

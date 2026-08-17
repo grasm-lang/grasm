@@ -1,0 +1,20 @@
+--- correctness first, on the inputs that break sorts ---
+random (n=200): all correct true, all identical true
+already sorted (n=200): all correct true, all identical true
+reversed (n=200): all correct true, all identical true
+all equal (n=200): all correct true, all identical true
+many duplicates (n=200): all correct true, all identical true
+empty (n=0): all correct true, all identical true
+one (n=1): all correct true, all identical true
+two ordered (n=2): all correct true, all identical true
+two reversed (n=2): all correct true, all identical true
+negatives (n=8): all correct true, all identical true
+--- stability, which only merge sort promises ---
+input:  [0, 11, 22, 3, 14, 25, 6, 17]
+merged: [0, 3, 6, 11, 14, 17, 22, 25]
+merge sort kept equal keys in order: true
+--- growth ---
+bubble doubles n: at least 3x slower: true
+merge doubles n:  under 3x slower:    true
+quick beats bubble on the same input: true
+merge beats bubble on the same input: true

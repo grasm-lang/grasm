@@ -25,16 +25,18 @@ declare -a FAILED=() BLOCKED=()
 
 for dir in [0-9]*/; do
     name=${dir%/}
-    [ -f "$dir/main.gr" ] || continue
-
     # A project may declare itself blocked on a missing language feature. It
     # still gets a directory and a README saying what it needed, because a gap
-    # nobody wrote down is a gap nobody fixes.
+    # nobody wrote down is a gap nobody fixes — and it is counted here rather
+    # than skipped, so "thirty projects" stays an honest number.
+    #
+    # Checked before `main.gr`, since a blocked project has none to check.
     if [ -f "$dir/BLOCKED" ]; then
         blocked=$((blocked + 1))
         BLOCKED+=("$name — $(head -1 "$dir/BLOCKED")")
         continue
     fi
+    [ -f "$dir/main.gr" ] || continue
 
     stdin_file="$dir/input.txt"
     [ -f "$stdin_file" ] || stdin_file=/dev/null

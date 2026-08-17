@@ -1,0 +1,204 @@
+// Conway's Game of Life — grid state, generation stepping, and the boundary.
+//
+// Two things make this a real test rather than a demo. The first is that a
+// generation must be computed from a *snapshot*: updating cells in place makes
+// the top-left corner see next-generation neighbours and the bottom-right see
+// this-generation ones, which produces plausible garbage that survives casual
+// inspection. The second is the boundary — a cell at the edge has fewer
+// neighbours, and reading off the grid is exactly the bounds error this
+// exercise exists to catch.
+//
+// Correctness is checked against known results rather than by eye: a block must
+// never change, a blinker must have period 2, a glider must return to its own
+// shape displaced by one square after four generations.
+
+type Grid = { w: i64, h: i64, cells: [bool] }
+
+fn make(w: i64, h: i64) -> Grid {
+    var cells: [bool] = []
+    for _i in 0..(w * h) {
+        cells.push(false)
+    }
+    Grid{ w: w, h: h, cells: cells }
+}
+
+fn at(g: Grid, x: i64, y: i64) -> bool {
+    // Off the grid is dead. This is the whole boundary policy, in one place,
+    // so no caller has to remember it.
+    if x < 0 or x >= g.w or y < 0 or y >= g.h {
+        return false
+    }
+    g.cells[y * g.w + x]
+}
+
+fn set(inout g: Grid, x: i64, y: i64, alive: bool) {
+    if x >= 0 and x < g.w and y >= 0 and y < g.h {
+        g.cells[y * g.w + x] = alive
+    }
+}
+
+fn neighbours(g: Grid, x: i64, y: i64) -> i64 {
+    var n = 0
+    for dy in -1..2 {
+        for dx in -1..2 {
+            if not (dx == 0 and dy == 0) {
+                if at(g, x + dx, y + dy) {
+                    n = n + 1
+                }
+            }
+        }
+    }
+    n
+}
+
+/// One generation. The new grid is built separately and returned, so nothing
+/// can read a half-updated state.
+fn step(g: Grid) -> Grid {
+    var next = make(g.w, g.h)
+    for y in 0..g.h {
+        for x in 0..g.w {
+            let n = neighbours(g, x, y)
+            let alive = at(g, x, y)
+            // B3/S23.
+            let lives = if alive { n == 2 or n == 3 } else { n == 3 }
+            set(next, x, y, lives)
+        }
+    }
+    next
+}
+
+fn render(g: Grid) -> str {
+    var rows: [str] = []
+    for y in 0..g.h {
+        var row = ""
+        for x in 0..g.w {
+            row = row + (if at(g, x, y) { "#" } else { "." })
+        }
+        rows.push(row)
+    }
+    rows.join("\n")
+}
+
+fn same(a: Grid, b: Grid) -> bool {
+    if a.w != b.w or a.h != b.h {
+        return false
+    }
+    for i in 0..a.cells.len() {
+        if a.cells[i] != b.cells[i] {
+            return false
+        }
+    }
+    true
+}
+
+fn population(g: Grid) -> i64 {
+    var n = 0
+    for c in g.cells {
+        if c { n = n + 1 }
+    }
+    n
+}
+
+fn from_rows(rows: [str]) -> Grid {
+    let h = rows.len()
+    let w = if h == 0 { 0 } else { rows[0].len() }
+    var g = make(w, h)
+    for y in 0..h {
+        let cs = rows[y].chars()
+        for x in 0..cs.len() {
+            set(g, x, y, cs[x] == "#")
+        }
+    }
+    g
+}
+
+fn show(label: str, g: Grid) {
+    print("{label} (pop {population(g)}):")
+    print(render(g))
+}
+
+fn main() {
+    print("--- still life: a block never changes ---")
+    let block = from_rows(["....", ".##.", ".##.", "...."])
+    let block1 = step(block)
+    show("block gen 0", block)
+    print("unchanged after one generation: {same(block, block1)}")
+    print("unchanged after five: {same(block, step(step(step(step(step(block))))))}")
+
+    print("--- oscillator: a blinker has period 2 ---")
+    let blinker = from_rows([".....", ".....", ".###.", ".....", "....."])
+    let b1 = step(blinker)
+    let b2 = step(b1)
+    show("blinker gen 0", blinker)
+    show("blinker gen 1", b1)
+    print("gen 1 differs from gen 0: {not same(blinker, b1)}")
+    print("gen 2 equals gen 0:      {same(blinker, b2)}")
+
+    print("--- spaceship: a glider moves one square diagonally every four ---")
+    var glider = from_rows([
+        ".#........",
+        "..#.......",
+        "###.......",
+        "..........",
+        "..........",
+        "..........",
+    ])
+    show("glider gen 0", glider)
+    var g4 = glider
+    for _i in 0..4 {
+        g4 = step(g4)
+    }
+    show("glider gen 4", g4)
+    // The shape must be the original, shifted by (1, 1).
+    var shifted = make(glider.w, glider.h)
+    for y in 0..glider.h {
+        for x in 0..glider.w {
+            if at(glider, x, y) {
+                set(shifted, x + 1, y + 1, true)
+            }
+        }
+    }
+    print("gen 4 is gen 0 shifted by (1,1): {same(g4, shifted)}")
+    print("population is conserved: {population(glider) == population(g4)}")
+
+    print("--- the boundary ---")
+    // A block pushed into the corner has fewer neighbours, and the rule that
+    // keeps it alive in the middle kills part of it at the edge. Reading off
+    // the grid instead of treating it as dead would keep it whole.
+    let corner = from_rows(["##..", "##..", "....", "...."])
+    show("corner block gen 0", corner)
+    show("corner block gen 1", step(corner))
+    print("a block survives at the corner too: {same(corner, step(corner))}")
+
+    // A single cell at (0,0) has three in-grid neighbours and five off-grid
+    // ones. It must die of loneliness, not survive on phantom neighbours.
+    var lonely = make(3, 3)
+    set(lonely, 0, 0, true)
+    print("neighbours of the corner cell: {neighbours(lonely, 0, 0)}")
+    print("population after one step: {population(step(lonely))}")
+
+    print("--- degenerate grids ---")
+    let empty = make(0, 0)
+    print("0x0 steps without dividing by zero: pop {population(step(empty))}")
+    var one = make(1, 1)
+    set(one, 0, 0, true)
+    print("1x1 live cell dies: pop {population(step(one))}")
+
+    print("--- an r-pentomino, ten generations ---")
+    var r = from_rows([
+        ".........",
+        ".........",
+        "...##....",
+        "..##.....",
+        "...#.....",
+        ".........",
+        ".........",
+        ".........",
+    ])
+    var line = "populations:"
+    for _i in 0..10 {
+        line = line + " {population(r)}"
+        r = step(r)
+    }
+    print("{line}")
+}

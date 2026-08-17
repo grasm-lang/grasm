@@ -1,0 +1,34 @@
+--- the hash itself ---
+fnv1a("")      = -3750763034362895579
+fnv1a("a")     = -5808556873153909620
+fnv1a("b")     = -5808553574619024987
+fnv1a("hello") differs from fnv1a("world"): true
+same input, same hash: true
+--- basic operations, against the library map as an oracle ---
+12 inserts agree with the library map: true
+count 12, buckets 16, used 8, longest chain 3
+--- overwrite, not duplicate ---
+get one: Some(REPLACED)
+count unchanged at 12: true
+--- missing keys ---
+get absent: None
+delete absent: false
+--- delete ---
+delete three: true
+get three after delete: None
+count now: 11
+the rest survive: Some(v3) Some(v11)
+--- forced collisions, which is the point of the exercise ---
+found 5 keys for one bucket: [k15, k59, k60, k73, k82]
+all five readable back: Some(c0) Some(c4)
+they shared a bucket: longest chain 5, used buckets 1
+delete the middle one: true
+the others still resolve: Some(c1) Some(c3)
+the deleted one is gone: None
+--- growth ---
+after 100 inserts: count 100, buckets 256
+load factor stayed under 0.75: true
+every key survived every resize: true
+longest chain after growth: 3
+--- keys that stress the hash ---
+empty, space, newline, accented, emoji and single chars all round-trip: true

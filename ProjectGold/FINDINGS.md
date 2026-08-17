@@ -99,3 +99,82 @@ also the single most common thing a first program needs that this language
 cannot express.
 
 Workaround used here: `"line one\nline two"`, and `.lines()` to split it back.
+
+## F6 — a file can be written and truncated, never removed (S4, library)
+
+Found writing 11-todo-file-storage. The library has `read_file`, `write_file`
+and `file_exists`, and nothing that deletes. A program that creates a temporary
+file can only empty it, so `file_exists` stays true forever and the next run
+sees a leftover. There is also no way to list a directory, which the same
+program would want for "load every todo file".
+
+## F7 — there is no way to write to stderr (S3, library)
+
+Found writing 15-sorting-benchmark. `print` goes to stdout and nothing goes to
+stderr. A command-line tool cannot separate its diagnostics from its output,
+which is the entire basis of `prog | filter` on any Unix system — and this
+directory's own grep (project 10) would want it.
+
+It also has a testing cost. A benchmark's timings are diagnostics, not results;
+with only one stream they land in stdout and make the program's output
+machine-dependent, so it cannot be compared across engines. Project 15 works
+around it by printing derived facts (growth ratios, classified) instead of
+milliseconds.
+
+The runtime already separates them — a panic goes to stderr — so this is a
+missing builtin rather than a missing capability.
+
+## F8 — `extern fn` cannot pass a pointer, so most of libc is unreachable (S3, FFI)
+
+Found trying to write 17-simple-shell.
+
+```grasm
+extern fn system(cmd: str) -> i32
+// error: `str` has no C representation
+// help: an `extern fn` takes and returns `i64` or `f64`
+```
+
+The C boundary carries scalars only. That excludes `system`, `open`, `read`,
+`write`, `printf`, `socket`, `getaddrinfo` — every libc function that takes a
+pointer, which is nearly all of the useful ones. What `extern fn` can reach
+today is `abs`, `sqrt`, `pow` and their kind.
+
+MASTERPLAN G9 promises "C ABI import overhead: zero-cost" and `docs/northstar.md`
+records it as *partly met*. This is how partial: the overhead is indeed zero, and
+the set of functions you can call is arithmetic.
+
+It is also the reason several projects on this list cannot be written. A byte
+type would fix the FFI and the binary-I/O gap (F9) at the same time, since both
+want the same thing: a contiguous run of bytes with a length, that a C function
+can be handed a pointer to.
+
+## F9 — no byte type, so binary formats and binary I/O are unwritable (S3, language)
+
+A socket carries `str` ([L-LIB-NET]) and so does a file. There is no `[u8]`, no
+`bytes`, and `str.len()` counts code points rather than bytes (F2), so even
+measuring a payload is not possible.
+
+Blocks 18 (read a BMP), 25 (DNS packets), and the binary half of 21 and 30. It
+is also why `server.gr` cannot serve `grasm.wasm` — noted already in
+`docs/wasm.md`.
+
+## F10 — a `ref` to a scalar can be made but never read (S3, language)
+
+Found writing 19-event-emitter. `ref(0)` typechecks and produces a `ref i64`,
+and there is no expression that reads it. [T-REF-READ] and [T-REF-WRITE] both
+define access through a *field* — `r.field`, `r.items.push(x)`, `r.n += 1` — and
+a scalar has no field. `.get()`/`.set()` do not exist. Printing one gives
+`ref#1.0`, the handle rather than the value.
+
+So `ref` is usable only when it points at a struct or a list. The workaround is
+a one-field wrapper:
+
+```grasm
+type Cell = { n: i64 }
+let c = ref(Cell{ n: 0 })
+c.n += 1
+```
+
+which is what this project uses. The gap is that `ref(0)` is accepted at all: a
+value that can be constructed and never observed should either be refused at the
+point of construction, or given the dereference that would make it useful.

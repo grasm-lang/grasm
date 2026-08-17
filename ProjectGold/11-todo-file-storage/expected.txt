@@ -1,0 +1,32 @@
+original (6 items):
+  [ ] 1: buy milk
+  [x] 2: write the parser
+  [ ] 3: pipe \p inside
+  [ ] 4: two\nlines
+  [x] 5: back\\slash
+  [ ] 6: 
+reloaded (6 items):
+  [ ] 1: buy milk
+  [x] 2: write the parser
+  [ ] 3: pipe \p inside
+  [ ] 4: two\nlines
+  [x] 5: back\\slash
+  [ ] 6: 
+round trip preserved every field: true
+bytes written and read match: true
+after mutate and reload (7 items):
+  [x] 1: buy milk
+  [x] 2: write the parser
+  [ ] 3: pipe \p inside
+  [ ] 4: two\nlines
+  [x] 5: back\\slash
+  [ ] 6: 
+  [ ] 7: added after reload
+second round trip: true
+--- failures ---
+missing file: NotFound(projectgold_does_not_exist.txt)
+file_exists on ours:   true
+file_exists on absent: false
+parse of junk:       0 item(s)
+parse of empty:      0 item(s)
+cleaned up
