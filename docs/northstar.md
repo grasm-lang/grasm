@@ -95,9 +95,23 @@ Per program, by each language's own lexer:
 `parmap` is the number to read: **0.29× of Go and 0.79× of Python** — a
 compiled, statically safe, GC-free language at four fifths of Python's length on
 the concurrency program. That is the thesis holding where it is tested hardest.
-What is still long is the plain loop over an array, where Grasm pays ordinary
-typed-language costs — so the remaining 4% is a syntax question, which is what
-§19.3 made it a hard KPI for.
+
+**The remaining 4% is 19 tokens across six programs, and all of it is the entry
+point.** `fn main() { … }` costs six tokens — `fn`, the name, two parentheses,
+two braces — and six programs pay it: 36 tokens. Grasm's actual code is 521
+against Python's 538, or **0.97×**.
+
+That figure is *not* the one reported above, and deliberately. A Python
+benchmark is a script and has no entry point; a compiled systems language names
+where a program starts. Comparing the two without the entry point is comparing
+different things — but so is quietly dropping it because the number comes out
+better, which is the move this file exists to refuse. The goal is missed by 4%,
+the 4% is entirely `fn main`, and both sentences are true.
+
+Allowing top-level statements as an implicit `main` would close it and is an
+exact rewrite, so it would cost no kernel form. It is not done, because it gives
+a language two ways to write a program to win a metric by 19 tokens, and
+principle 5 of the master plan is "one way to do it".
 
 **G5 is missed by 9%**, down from 46%. The binary went 437 KB → 328 KB by
 stripping the symbol table, which nothing reads at run time: a compiled program
