@@ -309,3 +309,83 @@ grown past the point where the gap is worth recording rather than closing."
         "kernel budgets — interpreter {interp_lines}/5000 lines, spec ~{pages}/50 pages"
     );
 }
+
+/// The route to 30 must be as long as the distance to 30.
+///
+/// `spec/core.md` states its Core count in a table, and then *talks about* that
+/// count in prose — "the count is N", "six forms would close the gap". Only the
+/// table was checked, so the prose drifted: the document said 36 in the place a
+/// test read and 37 in the place a person read, and the README said 37 with
+/// seven forms named where the list had six.
+///
+/// A specification that gives two answers to "how many constructs" is worse
+/// than one that gives a wrong answer, because a reader cannot tell which half
+/// to trust. So the arithmetic is checked wherever it is written down.
+#[test]
+fn the_route_to_thirty_is_as_long_as_the_gap() {
+    let doc = core_doc();
+    let (core, _) = declared_totals(&doc);
+
+    // The numbered entries under "What would have to move, to reach 30".
+    let start = doc
+        .find("## What would have to move")
+        .expect("the route to 30 should be written down");
+    let end = doc[start..]
+        .find("## What the gate checks")
+        .map(|i| start + i)
+        .unwrap_or(doc.len());
+    let section = &doc[start..end];
+    // Each entry opens `N. **…**` at the left margin, and states in its own
+    // parentheses how many forms it removes.
+    let removed: usize = section
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            l.starts_with(char::is_numeric) && t.contains("**")
+        })
+        .filter_map(|l| {
+            // The parenthesised figure is the *net* saving — what the change
+            // removes minus what it adds back. Stated as net because the first
+            // entry takes two forms out and puts one in, and reading the raw
+            // "2" there made this test land on 29 the first time it ran. The
+            // document now says "net 1" and explains why.
+            let open = l.rfind('(')?;
+            let close = l[open..].find(')')? + open;
+            let inner = l[open + 1..close].trim();
+            inner
+                .strip_prefix("net ")
+                .unwrap_or(inner)
+                .trim()
+                .parse::<usize>()
+                .ok()
+        })
+        .sum();
+
+    assert!(
+        removed > 0,
+        "no entry in the route to 30 says how many forms it removes"
+    );
+    assert_eq!(
+        core - removed,
+        30,
+        "spec/core.md claims {core} Core forms and names a route that removes \
+{removed}, which lands on {}. The route and the count have to agree, or one of \
+them is being kept up to date and the other is not.",
+        core - removed
+    );
+
+    // The same number, in the same document, stated in prose.
+    assert!(
+        doc.contains(&format!("The count is {core}")),
+        "spec/core.md's table says {core} Core forms, but its prose does not say \
+the same number — that is exactly the drift this test exists for"
+    );
+
+    // And in the README, which is what a reader meets first.
+    let readme = std::fs::read_to_string(repo_root().join("README.md"))
+        .expect("README.md should exist");
+    assert!(
+        readme.contains(&format!("{core} constructs against a budget of 30")),
+        "README.md disagrees with spec/core.md about the Core count ({core})"
+    );
+}

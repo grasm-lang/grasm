@@ -38,7 +38,7 @@ fn main() {
 measurements, taken by `./scripts/northstar.sh` rather than remembered. Three
 are met, three are missed with numbers attached, and four measure features that
 are not built. `spec/core.md` does the same for the kernel-language commitment:
-37 constructs against a budget of 30, with the seven that would close the gap
+36 constructs against a budget of 30, with the six that would close the gap
 named.
 
 ## Install

@@ -172,9 +172,12 @@ String **interpolation** — `"a{e}b"` — is Full within form 1: it rewrites to
 
 ## What would have to move, to reach 30
 
-Six forms, in the order they are least defensible as Core:
+Six forms, in the order they are least defensible as Core. The number in
+parentheses is the **net** saving — what a change removes minus what it adds
+back — because that is the only figure the arithmetic below can use. The first
+entry is the reason to say so: it takes two forms out and puts one in.
 
-1. **`break` and `continue`** (2). Rewritable if `while` carried a result and
+1. **`break` and `continue`** (net 1). Rewritable if `while` carried a result and
    bodies could yield — a labelled-block form. That is one construct in and two
    out, a net saving of one, and it makes every loop harder to read. Not worth
    it for the count alone.
@@ -201,7 +204,7 @@ by writing a program both ways and running it, on the ok branch and the failing
 one, rather than by reasoning about it — which is how the other six will have to
 be settled too.
 
-Four of those six are real design work, not bookkeeping. The count is 37 and the
+Four of those six are real design work, not bookkeeping. The count is 36 and the
 route to 30 is written down; claiming 30 today would be false.
 
 ## What the gate checks
