@@ -551,6 +551,13 @@ impl<'a> Lexer<'a> {
                     self.bump();
                     PipeGt
                 } else {
+                    // Deliberately *not* merged with a following `|` into a `||`
+                    // token. `||` is also how a closure with no parameters is
+                    // written — `|| { print("x") }` — and the lexer cannot tell
+                    // the two apart, so merging them broke every zero-argument
+                    // closure in the language. The parser separates them,
+                    // because it knows whether an operator or an expression is
+                    // expected here; see `wrong_bool_spelling`.
                     Pipe
                 }
             }
@@ -633,6 +640,29 @@ impl<'a> Lexer<'a> {
                         Error(
                             "unexpected character `\\` — a nested string inside a \
 `{...}` interpolation needs no escaping; write the quotes plainly"
+                                .to_string(),
+                        ),
+                        start,
+                    );
+                }
+                // `&&` is the first thing anyone arriving from C, Rust, Go,
+                // JavaScript or Java types, and the spelling here is `and`
+                // ([G-BOOL-OPS]). Saying only "unexpected character `&`" makes a
+                // reader hunt for a typo they did not make: nothing is
+                // misspelled, the operator has a different name. Found by
+                // writing a real program in the language. (`||` is handled where
+                // `|` is lexed, since that one is a token of its own.)
+                if text == "&" {
+                    if self.peek() == b'&' {
+                        self.bump();
+                        return self.tok(AmpAmp, start);
+                    }
+                    // A lone `&` is a reference sigil in most of the languages a
+                    // reader is coming from, and Grasm writes that `ref T`.
+                    return self.tok(
+                        Error(
+                            "unexpected character `&` — a reference is written \
+`ref T`, and `&&` is written `and`"
                                 .to_string(),
                         ),
                         start,

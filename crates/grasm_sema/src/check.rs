@@ -165,6 +165,52 @@ pub fn value_tables(program: &crate::loader::Program) -> ValueTables {
     (a.value_rows, a.callee_rows)
 }
 
+/// Every method a range answers, for the diagnostic that names them.
+///
+/// A range is the one receiver whose type cannot be written down — `fn f(r:
+/// range)` is "unknown type `range`" — so the ordinary "a free function `fn
+/// f(range, ...)` would also work" help proposes an impossible signature. This
+/// list is what it says instead, and `crates/grasm_sema/tests/check_tests.rs`
+/// checks that each name here really does type against a range.
+const RANGE_METHODS: &[&str] = &["to_list", "map", "filter", "sum", "len"];
+
+/// Whether a wrong name is close enough to a right one to suggest it.
+///
+/// A prefix, a suffix, or one edit apart. Deliberately not a full edit-distance
+/// table: the point is to catch `count` for `len` and `collect` for `to_list`,
+/// and a suggestion that is merely *nearest* among five candidates is a guess
+/// dressed as help.
+fn looks_like(candidate: &str, written: &str) -> bool {
+    if candidate == written {
+        return false;
+    }
+    if candidate.starts_with(written) || written.starts_with(candidate) {
+        return true;
+    }
+    // One insertion, deletion or substitution.
+    let (a, b): (Vec<char>, Vec<char>) = (candidate.chars().collect(), written.chars().collect());
+    if a.len().abs_diff(b.len()) > 1 {
+        return false;
+    }
+    let (long, short) = if a.len() >= b.len() { (&a, &b) } else { (&b, &a) };
+    let mut skipped = false;
+    let mut i = 0;
+    for &c in long.iter() {
+        if i < short.len() && short[i] == c {
+            i += 1;
+        } else if skipped {
+            return false;
+        } else {
+            skipped = true;
+            // A substitution consumes a character on both sides.
+            if long.len() == short.len() {
+                i += 1;
+            }
+        }
+    }
+    true
+}
+
 /// The language's own free functions. Not methods: [L-UFCS] resolves method
 /// syntax against the receiver type's methods and then against functions a
 /// *program* declares, and `print` is a method of nothing.
@@ -5303,6 +5349,36 @@ Perform the effect after the closing brace, or yield a number and do the work ou
                 format!("write `x |> {}` to pass a value to it, or `{}(x)`", name.name, name.name),
             );
         }
+        // A range has no name in the type grammar — `fn f(r: range)` is
+        // "unknown type `range`" — so offering UFCS for it is the third
+        // instance of the same mistake as the two guarded above: help that
+        // proposes a signature nobody can write. What a reader wants here is
+        // the method they meant, so name the ones that exist.
+        //
+        // The list is checked against the implementation by
+        // `range_methods_are_the_ones_the_help_names` rather than remembered,
+        // since a help text that names a method the compiler dropped is worse
+        // than no help.
+        if matches!(self.uni.resolve(&recv_ty), Type::Range) {
+            let have = RANGE_METHODS;
+            let near = have
+                .iter()
+                .find(|m| looks_like(m, &name.name))
+                .map(|m| format!("did you mean `{m}`?"));
+            return self.error_help(
+                name.span,
+                format!("no method `{}` on a range", name.name),
+                near.unwrap_or_else(|| {
+                    format!(
+                        "a range has {} — or `.to_list()` first, for anything a list can do",
+                        have.iter()
+                            .map(|m| format!("`{m}`"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                }),
+            );
+        }
         self.error_help(
             name.span,
             format!("no method `{}` on `{shown}`", name.name),
@@ -6711,6 +6787,19 @@ bind the component to a `var`, or use a struct when the parts have names worth w
             // them runs, so a move in an earlier arm has not happened here.
             self.restore_moved(&before);
             self.scopes.push(HashMap::new());
+            // Closures deferred by this arm belong to *this* scope, where the
+            // arm's pattern bindings live. Left on the enclosing block's list
+            // they were checked after this scope was popped, so
+            // `match o { Some(n) -> |x| x + n  ... }` reported "unknown name
+            // `n`" about the binding two tokens to its left, and a correct
+            // program had no spelling ([E-CLOSURE-CAPTURE]).
+            //
+            // The same defect, in the same words, was already fixed twice: once
+            // for a closure nested in a closure body, once for a block. A match
+            // arm is the third place that opens a scope, and it was the one
+            // that never got a frame of its own.
+            self.deferred_closures.push(Vec::new());
+            self.deferred_fields.push(Vec::new());
             let tag = self.check_pattern(&arm.pattern, &scrut_ty);
             if let Some(guard) = &arm.guard {
                 self.check_expr(guard, &Type::Bool);
@@ -6769,6 +6858,14 @@ bind the component to a `var`, or use a struct when the parts have names worth w
                     }
                 }
             }
+            // Drained before the scope goes, as in a block and in a closure
+            // body. Checking one deferred body can defer another, so this is a
+            // loop rather than a pass.
+            while let Some(next) = self.deferred_closures.last_mut().and_then(|v| v.pop()) {
+                self.check_deferred_closure(next);
+            }
+            self.deferred_closures.pop();
+            self.settle_deferred_fields();
             self.scopes.pop();
             arm_states.push(self.moved_snapshot());
         }

@@ -2601,8 +2601,8 @@ fn collect_block_hints(blk: &grasm_syntax::ast::Block) -> BlockHints {
             // exactly that, and its suggested fix was what the source already
             // contained.
             if let Some(t) = ty {
-                for at in arm_closure_spans(init) {
-                    hints.declared_at.entry(at).or_insert_with(|| t.clone());
+                for (at, want) in arm_closure_hints(init, t) {
+                    hints.declared_at.entry(at).or_insert(want);
                 }
             }
         }
@@ -3046,14 +3046,57 @@ fn unify_generic(
 /// Start offsets of closure literals sitting in the arms of a `match` or an
 /// `if` that is the whole of an expression — the positions where the type is
 /// written on what *holds* the closure rather than beside it.
-fn arm_closure_spans(e: &Expr) -> Vec<u32> {
+/// The payload type a `Some`/`Ok`/`Err` constructor puts its argument at.
+///
+/// `Some(|x| …)` against `Option[fn(i64) -> i64]` puts the closure at
+/// `fn(i64) -> i64`, and it is that type the closure's parameters come from —
+/// not the annotation as written, which is an `Option`. Without the unwrap the
+/// hint recorded `Option[fn(i64) -> i64]` for the closure and the backend, on
+/// finding no parameters in it, refused with the message this exists to stop.
+fn carrier_payload(callee: &Expr, ty: &TypeExpr) -> Option<TypeExpr> {
+    let Expr::Ident(id) = callee else {
+        return None;
+    };
+    match (id.name.as_str(), ty) {
+        ("Some", TypeExpr::Name { path, args, .. })
+            if path.segments.len() == 1
+                && path.segments[0].name == "Option"
+                && args.len() == 1 =>
+        {
+            Some(args[0].clone())
+        }
+        ("Ok", TypeExpr::Fallible(ok, _, _)) => Some((**ok).clone()),
+        ("Err", TypeExpr::Fallible(_, err, _)) => Some((**err).clone()),
+        _ => None,
+    }
+}
+
+/// Closures inside a branching initialiser, each paired with the type the
+/// binding's annotation says it has.
+///
+/// The annotation is on the binding and the closures are in the arms, so
+/// nothing connects the two by name — this is what connects them by position.
+fn arm_closure_hints(e: &Expr, ty: &TypeExpr) -> Vec<(u32, TypeExpr)> {
     let mut out = Vec::new();
-    fn walk(e: &Expr, out: &mut Vec<u32>) {
+    fn walk(e: &Expr, ty: &TypeExpr, out: &mut Vec<(u32, TypeExpr)>) {
         match e {
-            Expr::Closure { params, span, .. } if !params.is_empty() => out.push(span.start),
+            Expr::Closure { params, span, .. } if !params.is_empty() => {
+                out.push((span.start, ty.clone()))
+            }
             Expr::Match { arms, .. } => {
                 for a in arms {
-                    walk(&a.body, out);
+                    walk(&a.body, ty, out);
+                }
+            }
+            // `Some(|x| x + n)` in an arm. The closure is one level inside the
+            // constructor, so the annotation has to come one level in with it:
+            // `Option[fn(i64) -> i64]` becomes `fn(i64) -> i64`. Without this
+            // the refusal said "no type says what its parameters are" about a
+            // program whose binding said exactly that, and offered as its fix
+            // the annotation the source already had.
+            Expr::Call { callee, args, .. } if args.len() == 1 => {
+                if let Some(inner) = carrier_payload(callee, ty) {
+                    walk(&args[0], &inner, out);
                 }
             }
             Expr::If {
@@ -3062,21 +3105,21 @@ fn arm_closure_spans(e: &Expr) -> Vec<u32> {
                 ..
             } => {
                 if let Some(Stmt::Expr(t)) = then_block.stmts.last() {
-                    walk(t, out);
+                    walk(t, ty, out);
                 }
                 match else_branch.as_deref() {
                     Some(ElseBranch::Else(b)) => {
                         if let Some(Stmt::Expr(t)) = b.stmts.last() {
-                            walk(t, out);
+                            walk(t, ty, out);
                         }
                     }
-                    Some(ElseBranch::ElseIf(inner)) => walk(inner, out),
+                    Some(ElseBranch::ElseIf(inner)) => walk(inner, ty, out),
                     None => {}
                 }
             }
             Expr::Block(b) => {
                 if let Some(Stmt::Expr(t)) = b.stmts.last() {
-                    walk(t, out);
+                    walk(t, ty, out);
                 }
             }
             _ => {}
@@ -3085,7 +3128,7 @@ fn arm_closure_spans(e: &Expr) -> Vec<u32> {
     // Only *inside* a branching shape: a closure written directly is already
     // connected to its binding by name.
     match e {
-        Expr::Match { .. } | Expr::If { .. } | Expr::Block(_) => walk(e, &mut out),
+        Expr::Match { .. } | Expr::If { .. } | Expr::Block(_) => walk(e, ty, &mut out),
         _ => {}
     }
     out

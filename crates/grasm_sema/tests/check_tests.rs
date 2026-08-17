@@ -3334,3 +3334,209 @@ let b = Box{{ step: twice }}\n    print(\"{{b.step(5)}}\")\n}}\n"
 let r = ref(Box{{ step: twice }})\n    print(\"{{r.step(5)}}\")\n}}\n"
     ));
 }
+
+/// The methods a range answers are the ones its diagnostic names.
+///
+/// `RANGE_METHODS` in the checker is a hand-written list, and a help text that
+/// names a method the compiler dropped is worse than no help at all. So each
+/// name in it is typed against a real range here. The list is not importable —
+/// it is private — which is the point: this test would fail if the two drifted.
+#[test]
+fn range_methods_are_the_ones_the_help_names() {
+    // Named exactly as the diagnostic names them, so a rename in one place
+    // fails here rather than going out in a help text.
+    for (call, ok) in [
+        ("(0..3).to_list()", true),
+        ("(0..3).map(|x| x + 1)", true),
+        ("(0..3).filter(|x| x > 1)", true),
+        ("(0..3).sum()", true),
+        ("(0..3).len()", true),
+    ] {
+        let src = format!("fn main() {{\n    let v = {call}\n    print(\"{{v}}\")\n}}\n");
+        let (_, diags) = grasm_sema::analyze(&src);
+        assert_eq!(
+            diags.is_empty(),
+            ok,
+            "`{call}` is named by the range help, so it must type; got:\n{diags:#?}"
+        );
+    }
+}
+
+/// A range's "no method" help must not name a type nobody can write.
+///
+/// `range` is not in the type grammar — `fn f(r: range)` is "unknown type
+/// `range`" — so the ordinary UFCS help proposed a signature that cannot be
+/// typed. Third instance of that mistake; the first two are guarded beside it.
+#[test]
+fn the_range_help_does_not_propose_an_unwriteable_signature() {
+    let (_, diags) = grasm_sema::analyze(
+        "fn main() {\n    let r = 0..3\n    print(\"{r.count()}\")\n}\n",
+    );
+    let d = diags
+        .iter()
+        .find(|d| d.message.contains("count"))
+        .expect("a range has no `count`, so this must be refused");
+    let help = d.help.clone().unwrap_or_default();
+    assert!(
+        !help.contains("fn count(range"),
+        "the help proposes `fn count(range, ...)`, a signature nobody can write: {help}"
+    );
+    assert!(
+        help.contains("to_list") && help.contains("len"),
+        "the help should name the methods a range does have: {help}"
+    );
+    // And the message itself should not print `range` as if it were a type
+    // name a reader could use.
+    assert!(
+        d.message.contains("on a range"),
+        "the message should say `on a range`, not name it as a written type: {}",
+        d.message
+    );
+}
+
+/// A match arm's pattern bindings are in scope for closures written in it.
+///
+/// Closure bodies are checked at the end of the scope that holds them, and a
+/// match arm opens a scope without opening a frame for them — so they were
+/// drained after the arm's bindings were gone and `Some(n) -> |x| x + n` said
+/// "unknown name `n`" about the binding two tokens to its left. A correct
+/// program had no spelling at all.
+///
+/// The same defect was fixed twice before, for a closure nested in a closure
+/// and for one in a block. This is the third scope-opener.
+#[test]
+fn a_closure_in_a_match_arm_sees_the_arms_bindings() {
+    // Bare closure as the arm body.
+    check_ok(
+        "fn main() {\n    let o: Option[i64] = Some(3)\n    \
+let g: fn(i64) -> i64 = match o { Some(n) -> |x| x + n  None -> |x| x }\n    \
+print(\"{g(1)}\")\n}\n",
+    );
+    // Closure inside a variant constructor in the arm body.
+    check_ok(
+        "fn main() {\n    let o: Option[i64] = Some(3)\n    \
+let g: Option[fn(i64) -> i64] = match o {\n        Some(n) -> Some(|x| x + n)\n        \
+None -> None\n    }\n    \
+match g { Some(f) -> print(\"{f(1)}\")  None -> print(\"none\") }\n}\n",
+    );
+    // Closure as an argument in the arm body — this one always worked, and is
+    // here so a fix that breaks it is caught.
+    check_ok(
+        "fn take(f: fn(i64) -> i64) -> i64 {\n    f(1)\n}\n\nfn main() {\n    \
+let o: Option[i64] = Some(3)\n    \
+let r = match o { Some(n) -> take(|x| x + n)  None -> 0 }\n    print(\"{r}\")\n}\n",
+    );
+    // Nested one level further: a closure inside a closure inside an arm.
+    check_ok(
+        "fn main() {\n    let o: Option[i64] = Some(3)\n    \
+let g: fn(i64) -> fn(i64) -> i64 = match o {\n        Some(n) -> |x| |y| x + y + n\n        \
+None -> |x| |y| x + y\n    }\n    print(\"{g(1)(2)}\")\n}\n",
+    );
+}
+
+/// `&&` and `||` are refused, and say what to write instead.
+///
+/// The first thing anyone arriving from C, Rust, Go, JavaScript or Java types.
+/// It used to be "unexpected character `&`", which sends a reader hunting for a
+/// typo they did not make — nothing is misspelled, the operator has a different
+/// name.
+#[test]
+fn the_c_spellings_of_and_or_name_the_grasm_ones() {
+    for (wrote, meant) in [("&&", "and"), ("||", "or")] {
+        let src = format!(
+            "fn main() {{\n    let x = 1\n    if x > 0 {wrote} x < 5 {{\n        \
+print(\"yes\")\n    }}\n}}\n"
+        );
+        let (_, diags) = grasm_sema::analyze(&src);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains(&format!("`{wrote}` is written `{meant}`"))),
+            "`{wrote}` should name `{meant}`; got:\n{diags:#?}"
+        );
+        // And exactly one error: reported where the precedence is known, the
+        // operator is consumed as the one it means and the rest of the file
+        // parses. Rejected as a character it left the parser hunting for the
+        // `{` of the `if` and inventing a second error at the closing brace.
+        assert_eq!(
+            diags.len(),
+            1,
+            "one mistake should give one error, not a cascade; got:\n{diags:#?}"
+        );
+    }
+    // Both spellings in one condition: two mistakes, two errors, nothing else.
+    let (_, diags) = grasm_sema::analyze(
+        "fn main() {\n    let x = 1\n    let y = 9\n    if x > 0 && x < 5 || y == 9 {\n        \
+print(\"yes\")\n    }\n}\n",
+    );
+    assert_eq!(diags.len(), 2, "expected exactly two; got:\n{diags:#?}");
+    // The correct spellings still work, and `|` is still a token: a sum type
+    // and a pipe both parse.
+    check_ok(
+        "type S = | A(v: i64) | B\n\nfn double(n: i64) -> i64 {\n    n * 2\n}\n\n\
+fn main() {\n    let x = 1\n    if x > 0 and x < 5 or x == 9 {\n        \
+print(\"{2 |> double}\")\n    }\n    match A(1) { A(v) -> print(\"{v}\")  B -> print(\"b\") }\n}\n",
+    );
+}
+
+/// Every diagnostic points at real, non-whitespace source.
+///
+/// A span that is empty, reversed, past the end of the file, or sitting on a
+/// space is an off-by-one, and an off-by-one in a span is invisible in a test
+/// that only asserts on the message. This checks the property directly over a
+/// corpus of wrong programs, so the whole class is caught rather than the one
+/// instance somebody happened to notice.
+#[test]
+fn every_diagnostic_span_covers_real_source() {
+    let wrong = [
+        "fn main() {\n    let x: i64 = \"s\"\n}\n",
+        "fn main() {\n    let x = 1 + \"a\"\n}\n",
+        "fn main() {\n    print(\"{nope}\")\n}\n",
+        "fn main() {\n    let r = 0..3\n    print(\"{r.count()}\")\n}\n",
+        "fn main() {\n    let x = 1\n    if x > 0 && x < 5 {\n        print(\"y\")\n    }\n}\n",
+        "fn main() {\n    let t = (1, \"a\")\n    print(\"{t.9}\")\n}\n",
+        "fn main() {\n    let d = \"abc\".index_of(\"b\", 1)\n    print(\"{d}\")\n}\n",
+        "fn g() -> i64 ! IoError {\n    Ok(1)\n}\n\nfn main() {\n    let c = g()\n    print(\"{c}\")\n}\n",
+        "fn main() {\n    var xs = [1]\n    xs.nope()\n}\n",
+        "type S = { a: i64 }\n\nfn main() {\n    let s = S{ a: 1 }\n    print(\"{s.b}\")\n}\n",
+        "fn main() {\n    \"hi\".print()\n}\n",
+        "fn f(n: i64) -> i64 {\n    n\n}\n\nfn main() {\n    print(\"{f(1, 2)}\")\n}\n",
+    ];
+    for src in wrong {
+        let (_, diags) = grasm_sema::analyze(src);
+        assert!(
+            !diags.is_empty(),
+            "this program is wrong and should be refused:\n{src}"
+        );
+        for d in &diags {
+            let (lo, hi) = (d.span.start as usize, d.span.end as usize);
+            assert!(
+                lo < hi,
+                "empty or reversed span {lo}..{hi} for `{}` in:\n{src}",
+                d.message
+            );
+            assert!(
+                hi <= src.len(),
+                "span {lo}..{hi} runs past the {} bytes of:\n{src}",
+                src.len()
+            );
+            assert!(
+                src.is_char_boundary(lo) && src.is_char_boundary(hi),
+                "span {lo}..{hi} splits a character in:\n{src}"
+            );
+            let text = &src[lo..hi];
+            assert!(
+                text.chars().any(|c| !c.is_whitespace()),
+                "span for `{}` covers only whitespace ({text:?}) in:\n{src}",
+                d.message
+            );
+            // A caret is drawn under one line. A span crossing a newline draws
+            // it under text the reader is not being pointed at.
+            assert!(
+                !text.contains('\n') || text.trim_end().contains('\n'),
+                "span for `{}` ends on a newline in:\n{src}",
+                d.message
+            );
+        }
+    }
+}

@@ -1291,6 +1291,38 @@ impl Parser {
         r
     }
 
+    /// Two `|` tokens written side by side, which is `||`.
+    ///
+    /// Two tokens rather than one, because the lexer must not merge them: `||`
+    /// is also a closure with no parameters. Adjacency is required — `| |` with
+    /// a space is not what anybody types for `or`, and in operator position it
+    /// is a different mistake.
+    fn at_double_pipe(&mut self) -> bool {
+        if !self.at(&TokenKind::Pipe) {
+            return false;
+        }
+        let here = self.toks[self.i].span;
+        matches!(self.toks.get(self.i + 1),
+            Some(t) if t.kind == TokenKind::Pipe && t.span.start == here.end)
+    }
+
+    /// Reports `&&`/`||` where `and`/`or` was meant, if that is what is here.
+    ///
+    /// An error, not a warning: accepting both spellings would give the language
+    /// two ways to write one thing, which principle 5 of the master plan
+    /// forbids. But it is a *recoverable* error — the operator is consumed as
+    /// the one it plainly means, so a file full of `&&` reports one mistake per
+    /// `&&` and nothing else.
+    fn wrong_bool_spelling(&mut self, kind: &TokenKind, wrote: &str, meant: &str) {
+        if self.at(kind) {
+            let span = self.cur_span();
+            self.diags.push(
+                Diagnostic::error(span, format!("`{wrote}` is written `{meant}` in Grasm"))
+                    .with_help(format!("replace `{wrote}` with `{meant}`")),
+            );
+        }
+    }
+
     /// Charges one level of tree depth for a folded binary operator.
     fn fold(&mut self, e: Expr) -> PResult<Expr> {
         self.enter_nested()?;
@@ -1299,7 +1331,23 @@ impl Parser {
 
     fn parse_or(&mut self) -> PResult<Expr> {
         let mut lhs = self.parse_and()?;
-        while self.at(&TokenKind::KwOr) {
+        while self.at(&TokenKind::KwOr) || self.at_double_pipe() {
+            // `||` is caught here rather than in the lexer for two reasons. It
+            // can be *recovered* from: the operator it means is unambiguous and
+            // its precedence is this one, so the mistake is reported once and
+            // the rest of the file parses — rejected as a character it left the
+            // parser looking for the `{` of an `if` and inventing a second error
+            // at the closing brace. And it can be *told apart* here: `||` is
+            // also a closure with no parameters, and only a parser that knows
+            // an operator is expected can say which this is.
+            if self.at_double_pipe() {
+                let span = self.cur_span().merge(self.toks[self.i + 1].span);
+                self.diags.push(
+                    Diagnostic::error(span, "`||` is written `or` in Grasm")
+                        .with_help("replace `||` with `or`"),
+                );
+                self.bump();
+            }
             self.bump();
             self.skip_newlines_if_continuation();
             let rhs = self.parse_and()?;
@@ -1316,7 +1364,10 @@ impl Parser {
 
     fn parse_and(&mut self) -> PResult<Expr> {
         let mut lhs = self.parse_comparison()?;
-        while self.at(&TokenKind::KwAnd) {
+        while self.at(&TokenKind::KwAnd) || self.at(&TokenKind::AmpAmp) {
+            // `&&` *is* merged by the lexer, unlike `||`: `&` has no other use
+            // anywhere in Grasm, so there is nothing for it to be confused with.
+            self.wrong_bool_spelling(&TokenKind::AmpAmp, "&&", "and");
             self.bump();
             self.skip_newlines_if_continuation();
             let rhs = self.parse_comparison()?;

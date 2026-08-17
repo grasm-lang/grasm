@@ -62,6 +62,14 @@ pub enum TokenKind {
     FatArrow,   // =>
     Pipe,       // |
     PipeGt,     // |>
+    /// `&&` and `||`, which Grasm spells `and` and `or` ([G-BOOL-OPS]).
+    ///
+    /// Lexed as tokens of their own rather than rejected as characters, so the
+    /// error can be raised where the operator's *precedence* is known — the
+    /// parser then consumes it as the operator it obviously is and keeps going,
+    /// reporting one mistake instead of desyncing and reporting two.
+    AmpAmp,     // &&
+    PipePipe,   // ||
     Plus,
     Minus,
     Star,
@@ -213,6 +221,8 @@ impl TokenKind {
             FatArrow => "=>",
             Pipe => "|",
             PipeGt => "|>",
+            AmpAmp => "&&",
+            PipePipe => "||",
             Plus => "+",
             Minus => "-",
             Star => "*",

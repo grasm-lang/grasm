@@ -7,6 +7,14 @@ makes shipping them honest rather than quiet.
 
 **Open S1: none. Open S2: none. Open S3: none. Open S4: none.**
 
+Closed on 2026-08-17, all four found by writing a calculator in the language
+rather than by a test: a closure in a `match` arm could not see the arm's own
+pattern binding (S3 — a correct program had no spelling); the `--native` refusal
+for a closure inside `Some(...)` in an arm stated a false reason and offered a
+fix the source already contained; `&&` and `||` were reported as "unexpected
+character `&`" with no mention of `and` and `or`; and a range's "no method" help
+proposed `fn count(range, ...)`, a signature nobody can write.
+
 Closed on 2026-08-16: the effect-row fallback pool (and the mechanism behind
 it), writes through a `ref` under `--native`, returning a closure under
 `--native`, and the UFCS help text.
