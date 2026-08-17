@@ -1,0 +1,323 @@
+// A compiler written in Grasm that emits C — the bootstrap path, tested.
+//
+// The previous conclusion was that Grasm cannot host its own back end because
+// it cannot write the byte 0xC7: asked for seven bytes of x86, nine bytes of
+// mangled UTF-8 land on disk. That is true, and it is only true of *direct*
+// machine-code emission.
+//
+// Nim, Vala, Haxe, Eiffel and the first Go frontend all take the other route:
+// emit C, and let a C compiler do code generation. Under that model a compiler
+// only has to produce *text* — which is the one thing this language is
+// demonstrably good at (projects 12, 13, 21 and 29 are all text producers).
+//
+// So this program is the experiment. It compiles a small expression language
+// with variables and print statements into C, writes the C out, and the C is
+// then compiled by `cc` and run. If the answers match the interpreter's, the
+// route is open and no byte type is needed to reach self-hosting.
+
+type Tok =
+    | TNum(v: i64)
+    | TName(s: str)
+    | TOp(s: str)
+    | TLParen
+    | TRParen
+    | TAssign
+    | TPrint
+    | TSemi
+
+type Fault = { why: str }
+
+// The AST. `ref Node` for the recursive positions, as in project 01.
+type Node =
+    | Num(v: i64)
+    | Var(name: str)
+    | Bin(op: str, l: ref Node, r: ref Node)
+
+type Stmt =
+    | Assign(name: str, value: ref Node)
+    | Emit(value: ref Node)
+
+fn is_digit(c: str) -> bool {
+    let n = c.code_at(0)
+    n >= 48 and n <= 57
+}
+
+fn is_alpha(c: str) -> bool {
+    let n = c.code_at(0)
+    (n >= 97 and n <= 122) or (n >= 65 and n <= 90) or c == "_"
+}
+
+fn lex(src: str) -> [Tok] ! Fault {
+    var out: [Tok] = []
+    let cs = src.chars()
+    var i = 0
+    while i < cs.len() {
+        let c = cs[i]
+        if c == " " or c == "\n" or c == "\t" {
+            i = i + 1
+        } else if is_digit(c) {
+            var text = ""
+            while i < cs.len() and is_digit(cs[i]) {
+                text = text + cs[i]
+                i = i + 1
+            }
+            out.push(TNum(text.parse_int() ?? 0))
+        } else if is_alpha(c) {
+            var name = ""
+            while i < cs.len() and (is_alpha(cs[i]) or is_digit(cs[i])) {
+                name = name + cs[i]
+                i = i + 1
+            }
+            if name == "print" { out.push(TPrint) } else { out.push(TName(name)) }
+        } else if c == "(" {
+            out.push(TLParen)
+            i = i + 1
+        }
+        else if c == ")" {
+            out.push(TRParen)
+            i = i + 1
+        }
+        else if c == "=" {
+            out.push(TAssign)
+            i = i + 1
+        }
+        else if c == ";" {
+            out.push(TSemi)
+            i = i + 1
+        }
+        else if c == "+" or c == "-" or c == "*" or c == "/" {
+            out.push(TOp(c))
+            i = i + 1
+        } else {
+            fail(Fault{ why: "unexpected character `{c}`" })
+        }
+    }
+    out
+}
+
+fn at(ts: [Tok], i: i64) -> bool {
+    i < ts.len()
+}
+
+fn parse_primary(ts: [Tok], inout i: i64) -> ref Node ! Fault {
+    if not at(ts, i) {
+        fail(Fault{ why: "expected a value" })
+    }
+    match ts[i] {
+        TNum(v) -> {
+            i = i + 1
+            ref(Num(v))
+        }
+        TName(n) -> {
+            i = i + 1
+            ref(Var(n))
+        }
+        TLParen -> {
+            i = i + 1
+            let inner = try parse_sum(ts, i)
+            if not at(ts, i) {
+                fail(Fault{ why: "missing `)`" })
+            }
+            match ts[i] {
+                TRParen -> { i = i + 1 }
+                _ -> fail(Fault{ why: "missing `)`" })
+            }
+            inner
+        }
+        _ -> fail(Fault{ why: "expected a value" })
+    }
+}
+
+fn parse_product(ts: [Tok], inout i: i64) -> ref Node ! Fault {
+    var left = try parse_primary(ts, i)
+    var going = true
+    while going {
+        if not at(ts, i) {
+            going = false
+        } else {
+            match ts[i] {
+                TOp(o) -> {
+                    if o == "*" or o == "/" {
+                        i = i + 1
+                        let r = try parse_primary(ts, i)
+                        left = ref(Bin(o, left, r))
+                    } else {
+                        going = false
+                    }
+                }
+                _ -> going = false
+            }
+        }
+    }
+    left
+}
+
+fn parse_sum(ts: [Tok], inout i: i64) -> ref Node ! Fault {
+    var left = try parse_product(ts, i)
+    var going = true
+    while going {
+        if not at(ts, i) {
+            going = false
+        } else {
+            match ts[i] {
+                TOp(o) -> {
+                    if o == "+" or o == "-" {
+                        i = i + 1
+                        let r = try parse_product(ts, i)
+                        left = ref(Bin(o, left, r))
+                    } else {
+                        going = false
+                    }
+                }
+                _ -> going = false
+            }
+        }
+    }
+    left
+}
+
+fn parse(src: str) -> [Stmt] ! Fault {
+    let ts = try lex(src)
+    var out: [Stmt] = []
+    var i = 0
+    while i < ts.len() {
+        match ts[i] {
+            TPrint -> {
+                i = i + 1
+                let v = try parse_sum(ts, i)
+                out.push(Emit(v))
+            }
+            TName(n) -> {
+                i = i + 1
+                if not at(ts, i) {
+                    fail(Fault{ why: "expected `=` after `{n}`" })
+                }
+                match ts[i] {
+                    TAssign -> { i = i + 1 }
+                    _ -> fail(Fault{ why: "expected `=` after `{n}`" })
+                }
+                let v = try parse_sum(ts, i)
+                out.push(Assign(n, v))
+            }
+            _ -> fail(Fault{ why: "expected a statement" })
+        }
+        if at(ts, i) {
+            match ts[i] {
+                TSemi -> { i = i + 1 }
+                _ -> fail(Fault{ why: "expected `;`" })
+            }
+        }
+    }
+    out
+}
+
+// --- the back end: emit C ----------------------------------------------------
+//
+// This is the whole point. Every value produced here is text, and text is what
+// `write_file` takes. No byte type is required anywhere.
+
+fn c_expr(n: ref Node) -> str {
+    match n {
+        Num(v) -> "{v}"
+        Var(name) -> name
+        // Fully parenthesised, so C's precedence cannot disagree with the tree
+        // this compiler already built. Getting that wrong is the classic
+        // transpiler bug, and parentheses cost nothing.
+        Bin(op, l, r) -> "(" + c_expr(l) + " " + op + " " + c_expr(r) + ")"
+    }
+}
+
+fn declared_names(prog: [Stmt]) -> [str] {
+    var seen: [str] = []
+    for s in prog {
+        match s {
+            Assign(name, _v) -> {
+                if not seen.contains(name) {
+                    seen.push(name)
+                }
+            }
+            Emit(_v) -> {}
+        }
+    }
+    seen
+}
+
+fn to_c(prog: [Stmt]) -> str {
+    var lines: [str] = []
+    lines.push("/* Generated by a compiler written in Grasm. */")
+    lines.push("#include <stdio.h>")
+    lines.push("")
+    lines.push("int main(void) \{")
+    for name in declared_names(prog) {
+        lines.push("    long {name} = 0;")
+    }
+    for s in prog {
+        match s {
+            Assign(name, v) -> lines.push("    {name} = {c_expr(v)};")
+            Emit(v) -> lines.push("    printf(\"%ld\\n\", (long){c_expr(v)});")
+        }
+    }
+    lines.push("    return 0;")
+    lines.push("\}")
+    lines.push("")
+    lines.join("\n")
+}
+
+// --- an interpreter for the same language, as the oracle ---------------------
+//
+// The C output is only trustworthy if it agrees with something. So the same AST
+// is also evaluated directly here, and the two answers are compared — the same
+// discipline `scripts/difftest.sh` applies to the three real engines.
+
+fn eval_node(n: ref Node, env: Map[str, i64]) -> i64 {
+    match n {
+        Num(v) -> v
+        Var(name) -> env.get(name) ?? 0
+        Bin(op, l, r) -> {
+            let a = eval_node(l, env)
+            let b = eval_node(r, env)
+            if op == "+" { a + b }
+            else if op == "-" { a - b }
+            else if op == "*" { a * b }
+            else { if b == 0 { 0 } else { a / b } }
+        }
+    }
+}
+
+fn interpret(prog: [Stmt]) -> [str] {
+    var env = map()
+    var out: [str] = []
+    for s in prog {
+        match s {
+            Assign(name, v) -> env.set(name, eval_node(v, env))
+            Emit(v) -> out.push("{eval_node(v, env)}")
+        }
+    }
+    out
+}
+
+fn main() / {io} {
+    let source = "x = 2 + 3 * 4; y = (x - 4) / 2; print x; print y; print x * y + 1; z = 0 - 7; print z * z;"
+
+    print("--- source ---")
+    print(source)
+
+    match parse(source) {
+        Err(e) -> print("compile error: {e.why}")
+        Ok(prog) -> {
+            let c = to_c(prog)
+            print("--- emitted C ---")
+            print(c)
+
+            print("--- what the interpreter says the answers are ---")
+            for line in interpret(prog) {
+                print("  {line}")
+            }
+
+            match write_file("out.c", c) {
+                Err(e) -> print("could not write out.c: {e}")
+                Ok(_) -> print("--- wrote out.c ({c.len()} characters) ---")
+            }
+        }
+    }
+}

@@ -292,3 +292,24 @@ specified to behave. It is a defect in the *embedding guidance*: an embedder
 running more than one program must instantiate per run, and `docs/wasm.md` now
 says so. `WebAssembly.compile` once and `new WebAssembly.Instance` per program
 costs about a millisecond and confines a trap to the program that caused it.
+
+## Correction to F9 — it blocks code *generation*, not self-hosting
+
+Recorded here because it reverses a conclusion this file previously supported.
+
+F9 (no byte type) was read as "Grasm cannot host its own back end", on the
+strength of a real demonstration: asked to write seven bytes of x86, the
+language put nine bytes of mangled UTF-8 on disk, because `str` re-encodes
+anything above 127.
+
+That demonstration is correct and the conclusion drawn from it was too wide.
+It blocks **direct machine-code emission**. It does not block a back end that
+emits **C**, which is the route Nim, Vala, Haxe and the original Go frontend
+take, and which needs only text.
+
+Project 31 tests it rather than arguing it: a compiler written in Grasm emits C,
+`cc -Wall -Wextra` accepts it without a warning, and the resulting native binary
+agrees with the interpreter. So the self-hosting path is open today, and F9's
+real cost is narrower than recorded — it blocks reading a BMP (18), building a
+DNS packet (25), and serving binary over a socket, which are what it was
+originally found for.
