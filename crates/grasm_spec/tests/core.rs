@@ -187,7 +187,7 @@ fn every_ast_form_is_classified() {
         ("Match", "match e"),
         ("Block", "sequencing and scope"),
         ("Closure", "abstraction"),
-        ("Try", "try e"),
+        ("Try", "`try e` | `match e"),
         ("Region", "region { … }"),
         ("Unsafe", "unsafe { … }"),
         ("List", "[a, b, c]"),

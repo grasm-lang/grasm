@@ -45,11 +45,11 @@ Two consequences worth stating, because both were tempting and both are wrong:
 
 ## Where the split falls today
 
-**Core: 37 forms. Full: 18 forms.**
+**Core: 36 forms. Full: 19 forms.**
 
-Thirty-seven is not thirty. §19.2 says "≤ ~30", and this is over it. The gap is
+Thirty-six is not thirty. §19.2 says "≤ ~30", and this is over it. The gap is
 recorded rather than closed by re-counting: §"What would have to move" below
-names the seven forms that would take Core to 30 and what each would cost. A
+names the six forms that would take Core to 30 and what each would cost. A
 number that is met by redefining what counts is not a number.
 
 The literal forms — `1`, `1.0`, `true`, `"s"` — are counted as **one** construct
@@ -58,7 +58,7 @@ That is the only collapse taken, and it is stated so the count can be audited.
 
 ## Core
 
-### Expressions (15)
+### Expressions (14)
 
 | # | Form | Why it cannot be rewritten |
 |---|---|---|
@@ -74,58 +74,57 @@ That is the only collapse taken, and it is stated so the count can be audited.
 | 10 | `match e { … }` | ADT elimination |
 | 11 | `{ … }` | sequencing and scope |
 | 12 | a closure literal, `x` to `e` | abstraction |
-| 13 | `try e` | error-union elimination |
-| 14 | `region { … }` | tiered ownership: a scope with an allocation discipline |
-| 15 | `unsafe { … }` | the capability gate; nothing else can express it |
+| 13 | `region { … }` | tiered ownership: a scope with an allocation discipline |
+| 14 | `unsafe { … }` | the capability gate; nothing else can express it |
 
 ### Statements (8)
 
 | # | Form | Why |
 |---|---|---|
-| 16 | `let x = e` / `var x = e` | binding |
-| 17 | `x = e` | assignment to a place |
-| 18 | `e` | expression statement |
-| 19 | `return e` | non-local exit |
-| 20 | `while c { … }` | iteration |
-| 21 | `break` | loop exit |
-| 22 | `continue` | loop restart |
-| 23 | `with E handled_by h { … }` | effect handler installation |
+| 15 | `let x = e` / `var x = e` | binding |
+| 16 | `x = e` | assignment to a place |
+| 17 | `e` | expression statement |
+| 18 | `return e` | non-local exit |
+| 19 | `while c { … }` | iteration |
+| 20 | `break` | loop exit |
+| 21 | `continue` | loop restart |
+| 22 | `with E handled_by h { … }` | effect handler installation |
 
 ### Declarations (5)
 
 | # | Form | Why |
 |---|---|---|
-| 24 | `fn f(…) -> T / {…} { … }` | function definition |
-| 25 | `type T = …` | ADT and alias definition |
-| 26 | `effect E { … }` | effect declaration |
-| 27 | `extern fn f(…)` | the C boundary; no Grasm form denotes it |
-| 28 | `import m` | module reference |
+| 23 | `fn f(…) -> T / {…} { … }` | function definition |
+| 24 | `type T = …` | ADT and alias definition |
+| 25 | `effect E { … }` | effect declaration |
+| 26 | `extern fn f(…)` | the C boundary; no Grasm form denotes it |
+| 27 | `import m` | module reference |
 
 ### Types (6)
 
 | # | Form | Why |
 |---|---|---|
-| 29 | `T`, `T[A]` | named type, applied |
-| 30 | `fn(A) -> B / {E}` | function type, carrying its row |
-| 31 | `T ! E` | error union |
-| 32 | `ref T` | generational reference |
-| 33 | `(A, B)` | product type |
-| 34 | `(A or B)` written with a bar | error-union member set |
+| 28 | `T`, `T[A]` | named type, applied |
+| 29 | `fn(A) -> B / {E}` | function type, carrying its row |
+| 30 | `T ! E` | error union |
+| 31 | `ref T` | generational reference |
+| 32 | `(A, B)` | product type |
+| 33 | `(A or B)` written with a bar | error-union member set |
 
 ### Patterns (3)
 
 | # | Form | Why |
 |---|---|---|
-| 35 | `_` | ignore |
-| 36 | `x` | bind |
-| 37 | `V(a, b)` | ADT elimination |
+| 34 | `_` | ignore |
+| 35 | `x` | bind |
+| 36 | `V(a, b)` | ADT elimination |
 
 ## Full — and the rewrite for each
 
 Each row is a rewrite that must preserve meaning. Where a rewrite introduces a
 name, that name is fresh and cannot capture (`§ fresh`).
 
-### Expressions (5)
+### Expressions (6)
 
 | Form | Rewrite into Core |
 |---|---|
@@ -135,6 +134,7 @@ name, that name is fresh and cannot capture (`§ fresh`).
 | `-e` | `0 - e` |
 | `!e` | `e == false` |
 | `a..b` | `Range.new(a, b)` |
+| `try e` | `match e { Ok(v) -> v  Err(er) -> return Err(er) }` — verified by running both spellings against each other, on the ok branch and the failing one |
 
 String **interpolation** — `"a{e}b"` — is Full within form 1: it rewrites to
 `"a" + to_str(e) + "b"`. The literal itself is Core.
@@ -172,7 +172,7 @@ String **interpolation** — `"a{e}b"` — is Full within form 1: it rewrites to
 
 ## What would have to move, to reach 30
 
-Seven forms, in the order they are least defensible as Core:
+Six forms, in the order they are least defensible as Core:
 
 1. **`break` and `continue`** (2). Rewritable if `while` carried a result and
    bodies could yield — a labelled-block form. That is one construct in and two
@@ -189,7 +189,17 @@ Seven forms, in the order they are least defensible as Core:
 5. **`(A | B)` error-union member sets** (1). Removable if unions are ordinary
    ADTs, which costs inference precision at `try`.
 6. **`e[i]`** (1). Removable if places are first-class, which is a bigger idea
-   than the saving.
+   than the saving. It is *not* removable by giving lists an `at` and a
+   `set_at` and calling indexing sugar for them: nobody would write those
+   methods, and inventing surface so a count comes out right is the thing this
+   document exists to prevent.
+
+`try` used to be the seventh entry here and is now in the Full table, because
+the rewrite turned out to exist and to be exact:
+`try e` is `match e { Ok(v) -> v  Err(er) -> return Err(er) }`. That was checked
+by writing a program both ways and running it, on the ok branch and the failing
+one, rather than by reasoning about it — which is how the other six will have to
+be settled too.
 
 Four of those six are real design work, not bookkeeping. The count is 37 and the
 route to 30 is written down; claiming 30 today would be false.
@@ -209,7 +219,7 @@ The budgets, measured rather than asserted:
 
 | Budget | §19.2 target | Today |
 |---|---|---|
-| Core constructs | ≤ 30 | **37** |
+| Core constructs | ≤ 30 | **36** |
 | Reference interpreter | ≤ 5,000 lines | **6,009** |
 | Specification | ≤ 50 pages | ~55 pages |
 
