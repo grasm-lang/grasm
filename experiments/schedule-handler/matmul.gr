@@ -1,0 +1,141 @@
+// Falsification test: can a schedule be an effect handler?
+//
+// The claim under test is that the "what" and the "how fast" can be separated
+// without a second language — that the algorithm is written once and a handler
+// decides how it runs. This program is built so the claim can fail.
+//
+// One algorithm text. The tile size comes from the `Schedule` effect. A tile of
+// `n` degenerates to the naive triple loop exactly (one tile covering the whole
+// matrix), so both schedules run the *same source*, and any difference in time
+// is the schedule and nothing else.
+//
+// It fails if the tiled schedule is not meaningfully faster, or if expressing
+// the tiling needs syntax the language does not have, or if the three engines
+// stop agreeing on the answer.
+
+effect Schedule {
+    fn tile() -> i64
+}
+
+/// Row-major n x n matmul, tiled. `Schedule.tile()` decides the block size.
+///
+/// This is the whole algorithm, and it is not edited between runs. With
+/// `tile = n` the outer three loops each run once and this is precisely the
+/// naive `i, j, k` nest.
+fn matmul(a: [f64], b: [f64], n: i64) -> [f64] / {Schedule} {
+    let t = Schedule.tile()
+    var out: [f64] = []
+    for _i in 0..(n * n) {
+        out.push(0.0)
+    }
+    var i0 = 0
+    while i0 < n {
+        var j0 = 0
+        while j0 < n {
+            var k0 = 0
+            while k0 < n {
+                let i_end = (i0 + t).min(n)
+                let j_end = (j0 + t).min(n)
+                let k_end = (k0 + t).min(n)
+                for i in i0..i_end {
+                    for k in k0..k_end {
+                        // `a[i][k]` hoisted out of the innermost loop: it does
+                        // not depend on j, and leaving it inside measures the
+                        // index arithmetic rather than the memory behaviour.
+                        let aik = a[i * n + k]
+                        for j in j0..j_end {
+                            out[i * n + j] = out[i * n + j] + aik * b[k * n + j]
+                        }
+                    }
+                }
+                k0 = k0 + t
+            }
+            j0 = j0 + t
+        }
+        i0 = i0 + t
+    }
+    out
+}
+
+fn build(n: i64, seed: i64) -> [f64] {
+    var out: [f64] = []
+    var s = seed
+    for _i in 0..(n * n) {
+        s = (s * 1103515245 + 12345) % 2147483648
+        out.push((s % 100).as_f64() / 10.0)
+    }
+    out
+}
+
+fn checksum(m: [f64]) -> i64 {
+    var acc = 0
+    for v in m {
+        acc = (acc + (v * 1000.0).as_i64()) % 1000000007
+    }
+    acc
+}
+
+fn main() / {io} {
+    // Size from the command line, so the same binary can be swept across the
+    // point where the working set stops fitting in cache — which is the only
+    // place tiling can possibly pay.
+    var n = 192
+    let argv = args()
+    if argv.len() > 0 {
+        n = argv[0].parse_int() ?? 192
+    }
+    let a = build(n, 1)
+    let b = build(n, 2)
+
+    print("--- correctness first: every schedule must give the same answer ---")
+    var answers: [i64] = []
+    for t in [n, 128, 64, 32] {
+        // The handler is a value. This is the whole point of the design: the
+        // schedule is chosen here and the algorithm above never changes.
+        with Schedule handled_by ScheduleHandler{ tile: || t } {
+            answers.push(checksum(matmul(a, b, n)))
+        }
+    }
+    print("checksums: {answers}")
+    var all_same = true
+    for c in answers {
+        if c != answers[0] {
+            all_same = false
+        }
+    }
+    print("every schedule agrees on the answer: {all_same}")
+
+    print("--- timing: same source, different schedule ---")
+    var results: [i64] = []
+    for t in [n, 128, 64, 32] {
+        let start = now_millis()
+        with Schedule handled_by ScheduleHandler{ tile: || t } {
+            let m = matmul(a, b, n)
+            // Used, so nothing can be eliminated as dead.
+            if checksum(m) == -1 {
+                print("unreachable")
+            }
+        }
+        results.push(now_millis() - start)
+    }
+    print("n = {n}, working set {(3 * n * n * 8) / 1024} KB")
+    print("tile {n} (naive): {results[0]} ms")
+    print("tile 128: {results[1]} ms")
+    print("tile 64:  {results[2]} ms")
+    print("tile 32:  {results[3]} ms")
+
+    var best = results[0]
+    var best_t = n
+    let tiles = [n, 128, 64, 32]
+    for i in 0..results.len() {
+        if results[i] < best {
+            best = results[i]
+            best_t = tiles[i]
+        }
+    }
+    print("--- verdict ---")
+    print("naive {results[0]} ms, best {best} ms at tile {best_t}")
+    if results[0] > 0 {
+        print("speedup x100: {(results[0] * 100) / best.max(1)}")
+    }
+}
