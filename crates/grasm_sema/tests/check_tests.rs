@@ -3302,3 +3302,35 @@ fn a_deeply_nested_tuple_literal_is_near_linear() {
         .join()
         .expect("the checker should not abort at a depth the language accepts");
 }
+
+/// A `ref` receiver does not make a free function a UFCS candidate.
+///
+/// [L-UFCS] takes a free function in method position only when "its first
+/// parameter accepts the receiver", and [T-FIELD-CALL] says "a `ref` is read
+/// through, so `c.f(3)` calls the field of the referent". Reading through one
+/// is [T-REF-READ]; being *passed* as one is not, and `fn step(b: Box, …)`
+/// cannot take a `ref Box`. Treating them as interchangeable made that function
+/// a candidate, which then failed its own argument check — so a field call
+/// through a reference was refused with "expected `Box`, found `ref Box`"
+/// rather than falling back to the field.
+#[test]
+fn a_ref_receiver_does_not_make_a_free_function_a_candidate() {
+    let base = "type Box = { step: fn(i64) -> i64 }\n\nfn twice(n: i64) -> i64 {\n    n * 2\n}\n\n";
+    // The free function takes the referent, so it is not a candidate for a
+    // `ref` receiver: the field answers.
+    check_ok(&format!(
+        "{base}fn step(b: Box, x: i64) -> i64 {{\n    x + 2\n}}\n\nfn main() {{\n    \
+let r = ref(Box{{ step: twice }})\n    print(\"{{r.step(5)}}\")\n}}\n"
+    ));
+    // The mirror: a free function over `ref Box` is not a candidate for a plain
+    // receiver either.
+    check_ok(&format!(
+        "{base}fn step(b: ref Box, x: i64) -> i64 {{\n    x + 2\n}}\n\nfn main() {{\n    \
+let b = Box{{ step: twice }}\n    print(\"{{b.step(5)}}\")\n}}\n"
+    ));
+    // And when it *does* accept the receiver, it still wins.
+    check_ok(&format!(
+        "{base}fn step(b: ref Box, x: i64) -> i64 {{\n    x + 2\n}}\n\nfn main() {{\n    \
+let r = ref(Box{{ step: twice }})\n    print(\"{{r.step(5)}}\")\n}}\n"
+    ));
+}

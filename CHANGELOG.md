@@ -82,6 +82,27 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   [L-UFCS] now says the language's own free functions are not methods of any
   type, and the help names the spelling that works: `"hi" |> print`.
 
+### Fixed — verification of the day's changes
+
+- **The backend resolved a method call differently from the checker, and
+  printed a heap address.** The checker records which method calls it resolved
+  to a struct field; the backend read that table only to *suppress* its
+  field-call path, which is half a rule. It resolves a free function with a
+  lookup that does not carry generics, so a *generic* free function sharing a
+  name with a function-typed field left the lookup empty and the call fell
+  through to the field — while the checker had resolved it to the function.
+  `grasm run` printed `77`; the compiled binary printed a string and then
+  multiplied its heap address by two. Exit 0, nothing on stderr, a different
+  number every run. The table is authoritative in both directions now: it
+  suppresses and it permits, and a call the backend cannot resolve the checker's
+  way is refused by name, as §11 promises.
+- **A field reached through a `ref` was refused** when a same-named free
+  function could not accept the receiver. Reading through a reference is
+  [T-REF-READ]; being *passed* as one is not, and `fn step(b: Box, …)` cannot
+  take a `ref Box`. Treating them as interchangeable made that function a UFCS
+  candidate which then failed its own argument check, so the call reported
+  "expected `Box`, found `ref Box`" instead of falling back to the field.
+
 ### Fixed — the round-44 list
 
 - **An incremental `--native` rebuild shipped a stale imported constant.** A

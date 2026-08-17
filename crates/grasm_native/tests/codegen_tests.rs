@@ -505,3 +505,37 @@ let b = Box{ f: |k| [1, 2, 3].par_filter(|x| x > 1).len() + k }\n    print(\"{b.
         compile(src).unwrap_or_else(|e| panic!("{src}\n{e}"));
     }
 }
+
+/// The backend resolves a method call the way the checker did, or refuses.
+///
+/// The checker records which method calls it resolved to a struct field. That
+/// table was read only to *suppress* the backend's field-call path, which is
+/// half a rule: this backend resolves a free function with `lookup_fn`, which
+/// does not carry generics, so a *generic* free function of the same name as a
+/// function-typed field left the lookup empty and the call fell through to the
+/// field — while the checker had resolved it to the function.
+///
+/// `grasm run` printed `77`; the compiled binary printed a string and then
+/// multiplied its heap address by two. Exit 0, nothing on stderr, a different
+/// number every run. §11 promises this backend "never miscompiles" what it
+/// cannot do, so it refuses by name instead.
+#[test]
+fn the_backend_resolves_a_method_the_way_the_checker_did() {
+    // The generic free function wins in the checker; the backend cannot see it,
+    // so it must refuse rather than call the field.
+    let crossed = "type Box = { tag: fn() -> str }\n\nfn tag[T](x: T) -> i64 {\n    77\n}\n\n\
+fn main() {\n    let b = Box{ tag: || \"a string\" }\n    let v = b.tag()\n    \
+print(\"{v}\")\n}\n";
+    let err = compile(crossed).expect_err("a call the backend cannot resolve must be refused");
+    assert!(err.contains("cannot resolve the way the checker did"), "{err}");
+
+    // A field call the checker *did* resolve to the field still compiles.
+    for src in [
+        "type Box = { tag: fn() -> str }\n\nfn tag(xs: [i64]) -> i64 {\n    9\n}\n\n\
+fn main() {\n    let b = Box{ tag: || \"f\" }\n    print(\"{b.tag()}\")\n}\n",
+        "type Box = { tag: fn() -> str }\n\nfn main() {\n    \
+let b = Box{ tag: || \"f\" }\n    print(\"{b.tag()}\")\n}\n",
+    ] {
+        compile(src).unwrap_or_else(|e| panic!("{src}\n{e}"));
+    }
+}

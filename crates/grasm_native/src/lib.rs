@@ -6497,9 +6497,31 @@ impl FnCx<'_, '_> {
                         Some((results[0], ret))
                     });
                 }
-                // A field holding a function, called through the field. The
-                // checker accepts it, so this backend has to compile it or
-                // the two disagree about what the language is.
+                // A field holding a function, called through the field —
+                // *only* when the checker resolved this call that way.
+                //
+                // The table is authoritative in both directions, and it has to
+                // be. This backend resolves a free function with `lookup_fn`,
+                // which does not carry generics: a *generic* free function of
+                // the same name as a function-typed field left `lookup_fn`
+                // empty, so the call fell through to here and ran the field,
+                // while the checker had resolved it to the function. `grasm
+                // run` printed `77` and the compiled binary printed a string
+                // and then multiplied its heap address by two — exit 0, a
+                // different number every run, nothing on stderr.
+                //
+                // Reading the table only to *suppress* this arm was half a
+                // rule. It suppresses and it permits.
+                if !self.cg.field_calls.contains(&(span.start, span.end)) {
+                    return nope(
+                        span,
+                        format!(
+                            "a call of `{}` that this backend cannot resolve the way the \
+checker did",
+                            name.name
+                        ),
+                    );
+                }
                 //
                 // The receiver was already evaluated above for method
                 // dispatch, and `eval_field` evaluates it again — so the first

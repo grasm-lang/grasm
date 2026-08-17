@@ -5281,9 +5281,16 @@ Perform the effect after the closing brace, or yield a number and do the work ou
                 (Error, _) | (_, Error) => true,
                 (List(x), List(y)) => compatible(x, y),
                 (Ref(x), Ref(y)) => compatible(x, y),
-                // A reference reads as what it points at ([T-REF-READ]), so a
-                // function over the pointee still takes one.
-                (Ref(x), other) | (other, Ref(x)) => compatible(x, other),
+                // A reference is *not* interchangeable with what it points at
+                // here. Reading through one is [T-REF-READ]; being *passed* as
+                // one is not, and `fn step(b: Box, …)` cannot take a
+                // `ref Box`. Treating them as compatible made that function a
+                // UFCS candidate for `r.step(5)`, which then failed its
+                // argument check — so a field call through a reference was
+                // refused with "expected `Box`, found `ref Box`" instead of
+                // falling back to the field, which is what [T-FIELD-CALL]
+                // promises when no candidate accepts the receiver.
+                (Ref(_), _) | (_, Ref(_)) => false,
                 (Map(k1, v1), Map(k2, v2)) => compatible(k1, k2) && compatible(v1, v2),
                 (Tuple(x), Tuple(y)) => {
                     x.len() == y.len() && x.iter().zip(y).all(|(p, q)| compatible(p, q))
