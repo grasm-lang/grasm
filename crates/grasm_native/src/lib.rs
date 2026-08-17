@@ -684,6 +684,13 @@ impl<'m> Codegen<'m> {
             ("grasm_args", vec![], Some(i64t)),
             ("grasm_input", vec![], Some(i64t)),
             ("grasm_read_file", vec![i64t], Some(i64t)),
+            // The `net` capability. Handles and payloads are ordinary boxed
+            // values, so these look like any other runtime call.
+            ("grasm_tcp_listen", vec![i64t], Some(i64t)),
+            ("grasm_tcp_accept", vec![i64t], Some(i64t)),
+            ("grasm_tcp_read", vec![i64t], Some(i64t)),
+            ("grasm_tcp_write", vec![i64t, i64t], Some(i64t)),
+            ("grasm_tcp_close", vec![i64t], None),
             ("grasm_write_file", vec![i64t, i64t], Some(i64t)),
             ("grasm_file_exists", vec![i64t], Some(i8t)),
             ("grasm_set_args", vec![i64t, ptr], None),
@@ -7155,6 +7162,43 @@ checker did",
                 self.goto_block(dead);
                 return Ok(None);
             }
+            // The five `net` builtins. A handle is an `i64` and a payload is a
+            // `str`, so nothing here needs a pointer type — which is why the
+            // network could be added to the language without adding one.
+            "tcp_listen" | "tcp_accept" | "tcp_read" => {
+                let (hv, ht) = self.eval_expr_val(&args[0])?;
+                let boxed = self.box_value(hv, &ht);
+                let (sym, ok_t) = match id.name.as_str() {
+                    "tcp_listen" => ("grasm_tcp_listen", VType::I64),
+                    "tcp_accept" => ("grasm_tcp_accept", VType::I64),
+                    _ => ("grasm_tcp_read", VType::Str),
+                };
+                let v = self.call_rt(sym, &[boxed]).unwrap();
+                self.call_rt("grasm_val_dec", &[boxed]);
+                return Ok(Some((
+                    v,
+                    VType::Fallible(Box::new(ok_t), Box::new(VType::Sum("IoError".into()))),
+                )));
+            }
+            "tcp_write" => {
+                let (hv, ht) = self.eval_expr_val(&args[0])?;
+                let boxed_h = self.box_value(hv, &ht);
+                let (dv, _) = self.eval_expr_val(&args[1])?;
+                let v = self.call_rt("grasm_tcp_write", &[boxed_h, dv]).unwrap();
+                self.call_rt("grasm_val_dec", &[boxed_h]);
+                self.call_rt("grasm_val_dec", &[dv]);
+                return Ok(Some((
+                    v,
+                    VType::Fallible(Box::new(VType::Unit), Box::new(VType::Sum("IoError".into()))),
+                )));
+            }
+            "tcp_close" => {
+                let (hv, ht) = self.eval_expr_val(&args[0])?;
+                let boxed = self.box_value(hv, &ht);
+                self.call_rt("grasm_tcp_close", &[boxed]);
+                self.call_rt("grasm_val_dec", &[boxed]);
+                return Ok(None);
+            }
             "read_file" => {
                 let (pv, _) = self.eval_expr_val(&args[0])?;
                 let v = self.call_rt("grasm_read_file", &[pv]).unwrap();
@@ -8204,6 +8248,18 @@ checker did",
                             "file_exists" => Some(VType::Bool),
                             "args" => Some(VType::List(Box::new(VType::Str))),
                             "env" => Some(VType::Option(Box::new(VType::Str))),
+                            "tcp_listen" | "tcp_accept" => Some(VType::Fallible(
+                                Box::new(VType::I64),
+                                Box::new(VType::Sum("IoError".into())),
+                            )),
+                            "tcp_read" => Some(VType::Fallible(
+                                Box::new(VType::Str),
+                                Box::new(VType::Sum("IoError".into())),
+                            )),
+                            "tcp_write" => Some(VType::Fallible(
+                                Box::new(VType::Unit),
+                                Box::new(VType::Sum("IoError".into())),
+                            )),
                             "read_file" => Some(VType::Fallible(
                                 Box::new(VType::Str),
                                 Box::new(VType::Sum("IoError".into())),

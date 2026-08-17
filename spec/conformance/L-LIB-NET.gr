@@ -1,0 +1,30 @@
+//! tag: L-LIB-NET
+//! expect: output
+//! listening
+//! closed twice is fine
+//! a closed handle reports rather than panics
+// The `net` capability: handles are integers, payloads are text.
+//
+// Port 0 asks the system to choose, so this program can run anywhere without
+// colliding with whatever else holds a port. It does not accept a connection —
+// that would need a second process — and the shapes it does check are the ones
+// with an answer that does not depend on the machine.
+fn main() / {io, net} {
+    match tcp_listen(0) {
+        Err(e) -> print("could not listen")
+        Ok(listener) -> {
+            print("listening")
+            // Closing twice is not an error, for the same reason releasing a
+            // `ref` twice is not: cleanup order is not the caller's to track.
+            tcp_close(listener)
+            tcp_close(listener)
+            print("closed twice is fine")
+            // Using a closed handle is an ordinary failure, never a panic and
+            // never a wrong answer.
+            match tcp_read(listener) {
+                Ok(_) -> print("a closed handle answered, which it must not")
+                Err(e) -> print("a closed handle reports rather than panics")
+            }
+        }
+    }
+}

@@ -590,15 +590,25 @@ fn the_stability_policy_and_the_table_agree_on_the_levels() {
 
 #[test]
 fn the_language_pack_is_current_and_complete() {
-    // dist/grasm-language-pack.md is the whole language in one file — the
-    // answer to a new language being absent from AI training data is that it
-    // fits in a context window. It is generated, so it can go stale; this
-    // fails if it has, or if it has lost a clause.
+    // The two packs under dist/ are the whole language in a form a model can be
+    // handed — the answer to a new language being absent from AI training data
+    // is that it fits in a context window. They are generated, so they can go
+    // stale; this fails if they have, or if either has lost a clause.
+    //
+    // It is two files because it outgrew one. The combined pack reached 321 KB
+    // against a 320 KB bound, and the note beside that bound said what to do:
+    // split the conformance programs out rather than raise the number. Which
+    // also turned out to be the better shape — the definition, which is what a
+    // reader needs to write Grasm, no longer carries 143 KB of evidence that a
+    // reader only wants when a rule is in dispute.
     let root = spec_dir().parent().unwrap().to_path_buf();
-    let pack = match std::fs::read_to_string(root.join("dist/grasm-language-pack.md")) {
+    let read = |name: &str| match std::fs::read_to_string(root.join("dist").join(name)) {
         Ok(p) => p,
-        Err(e) => panic!("dist/grasm-language-pack.md is missing ({e}) — regenerate it"),
+        Err(e) => panic!("dist/{name} is missing ({e}) — regenerate it with scripts/language_pack.sh"),
     };
+    let pack = read("grasm-language-pack.md");
+    let conf = read("grasm-conformance-pack.md");
+
     for tag in declared_tags() {
         assert!(
             pack.contains(&format!("[{tag}]")),
@@ -607,26 +617,40 @@ fn the_language_pack_is_current_and_complete() {
     }
     for case in all_cases() {
         assert!(
-            pack.contains(&format!("`{}`", case.name)),
-            "the language pack is missing conformance program `{}` — regenerate it",
+            conf.contains(&format!("`{}`", case.name)),
+            "the conformance pack is missing program `{}` — regenerate it",
             case.name
         );
     }
-    // Small enough to hand to a model whole, with room left to work in — the
-    // claim is load-bearing, since every cold evaluation of this language is
-    // run by giving an agent the pack and nothing else.
+    // The definition must stay small enough to hand to a model whole, with room
+    // left to work in: every cold evaluation of this language is run by giving
+    // an agent the pack and nothing else, so the claim is load-bearing.
     //
-    // The bound was 200 KB and the pack crossed it when Tier 2 landed. Raising
-    // a limit because you have hit it is how a limit stops meaning anything,
-    // so: 320 KB is about 80k tokens, which leaves three quarters of a 300k
-    // window for the reader's own work. That is the property worth holding,
-    // and it is what this number is derived from rather than from the current
-    // size. If the pack approaches it again, the answer is to split the
-    // conformance programs into a second file, not to move this.
+    // 200 KB is about 50k tokens. Derived from the property rather than from
+    // today's size, which is 160 KB — and derived once, since raising a limit
+    // because you have hit it is how a limit stops meaning anything. If the
+    // definition approaches it, the answer is that the language has too many
+    // clauses, which is a real finding and not a formatting problem.
     assert!(
-        pack.len() < 320_000,
-        "the language pack has grown to {} bytes — it must stay context-sized",
+        pack.len() < 200_000,
+        "the language definition has grown to {} bytes — it must stay context-sized",
         pack.len()
+    );
+    // The conformance pack holds to the same 200 KB, for the same reason and by
+    // the same derivation: it is loaded on its own, when a rule is in dispute.
+    //
+    // The first version of this assertion bounded the *sum* of the two files at
+    // the old 320 KB, and it failed the moment it was written, at 321,769 bytes.
+    // The bound was wrong in kind rather than merely too tight: the two files
+    // exist precisely so that a reader loads one of them, and a ceiling on their
+    // sum is a ceiling on how many clauses the language may ever have. That is
+    // not a property worth holding. Per-file is.
+    assert!(
+        conf.len() < 200_000,
+        "the conformance pack has grown to {} bytes — it must stay context-sized \
+on its own. At that point split it by area (types, effects, library) rather than \
+moving this.",
+        conf.len()
     );
 }
 

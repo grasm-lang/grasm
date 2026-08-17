@@ -78,9 +78,11 @@ grasm build hello.gr --native -o hello && ./hello
 ```
 
 `dist/grasm-language-pack.md` is the whole language — grammar, types,
-semantics, a tutorial, and a runnable program for every rule — in about 17k
-tokens. It is small enough to hand to an AI assistant in full, which is how
-you get useful completions for a language it has never seen.
+semantics and a tutorial — in about 40k tokens. It is small enough to hand to an
+AI assistant in full, which is how you get useful completions for a language it
+has never seen. `dist/grasm-conformance-pack.md` carries the runnable program for
+every rule, another 37k tokens; you need it when a rule is in dispute and you
+want it settled by a program rather than by prose.
 
 ## Toolchain
 

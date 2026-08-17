@@ -424,3 +424,43 @@ list from a count. [G11] budgets Grasm at or below Python's token count and it
 measured 1.41×; this is most of the difference, and adding it moved the figure
 to 1.22× without adding a syntactic form — a call is a call, so the kernel's
 count in [`core.md`](core.md) does not move.
+
+## Network — the `net` capability
+
+**[L-LIB-NET]** Five builtins reach the network, and each performs `net`:
+
+| | type | |
+|---|---|---|
+| `tcp_listen(port)` | `(i64) -> i64 ! IoError` | listens on `127.0.0.1:port`; `0` asks the system to choose |
+| `tcp_accept(h)` | `(i64) -> i64 ! IoError` | waits for a connection, answering with a handle for it |
+| `tcp_read(h)` | `(i64) -> str ! IoError` | what has arrived, as text |
+| `tcp_write(h, text)` | `(i64, str) -> () ! IoError` | writes and flushes |
+| `tcp_close(h)` | `(i64) -> ()` | closes a listener or a connection |
+
+A handle is an integer and a payload is text, so reaching the network needed no
+pointer type and no byte buffer. That is the reason the surface looks like this:
+adding either to the language would have been a far larger change than adding
+the network, and `extern fn` could already call `socket()` and `listen()` —
+what it could not do was pass a `sockaddr` or a buffer.
+
+`tcp_read` performs **one** read rather than looping to end-of-stream, because
+an HTTP client holds the connection open after its request and reading to the
+end would wait forever. A caller that needs more reads again. Bytes that are not
+valid UTF-8 are replaced rather than refused: a socket carries bytes, a `str`
+carries text, and a client's mistake should not end a server.
+
+Closing a handle twice is not an error, for the same reason releasing a `ref`
+twice is not ([T-REF-GENERATIONAL]) — cleanup order is not something a caller
+should have to track. Using a closed handle *is* an error, and an ordinary one:
+`tcp_read` on it answers `Err`, never a panic and never a wrong answer.
+
+**`net` is a capability of its own, not part of `io`.** That distinction is the
+whole point. [T-CAPABILITY]'s headline example is a package permitted to read a
+file and forbidden to open a socket, and until there was a network to gate, that
+example could not be shown to anybody:
+
+```
+error: package `lib` performs `net` but its manifest only permits `io`
+  help: either add the capability to that package's manifest, or stop it from
+        performing the effect
+```

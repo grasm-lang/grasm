@@ -16,6 +16,20 @@ use crate::check::ModuleView;
 pub const IO: &str = "io";
 pub const UNSAFE: &str = "unsafe";
 pub const ASYNC: &str = "async";
+/// Network access. A capability of its own rather than part of `io`, because
+/// the distinction is the whole point: [T-CAPABILITY]'s headline example is a
+/// package that may read a file and may not open a socket, and folding the two
+/// together would make that sentence unsayable.
+pub const NET: &str = "net";
+
+/// The builtins that perform `net`.
+const NET_BUILTINS: &[&str] = &[
+    "tcp_listen",
+    "tcp_accept",
+    "tcp_read",
+    "tcp_write",
+    "tcp_close",
+];
 
 const IO_BUILTINS: &[&str] = &[
     "print",
@@ -162,7 +176,13 @@ pub fn check_effects(module: &Module) -> Vec<Diagnostic> {
 /// code cannot mean.
 pub fn effect_vocabulary(program: &crate::loader::Program) -> BTreeSet<String> {
     let mut names: BTreeSet<String> =
-        [IO.to_string(), ASYNC.to_string(), UNSAFE.to_string()].into();
+        [
+            IO.to_string(),
+            ASYNC.to_string(),
+            NET.to_string(),
+            UNSAFE.to_string(),
+        ]
+        .into();
     for file in &program.files {
         for decl in &file.module.decls {
             if let Decl::Effect(e) = decl {
@@ -1008,7 +1028,12 @@ once inside `main`",
             let declared_set: BTreeSet<String> = declared.iter().map(|p| p.dotted()).collect();
             for d in &declared_set {
                 let base = d.split('.').next().unwrap_or(d);
-                if base != IO && base != ASYNC && base != UNSAFE && !ctx.effect_names.contains(base) {
+                if base != IO
+                    && base != ASYNC
+                    && base != UNSAFE
+                    && base != NET
+                    && !ctx.effect_names.contains(base)
+                {
                     diags.push(Diagnostic::error(
                         f.name.span,
                         format!("function `{}` declares unknown effect `{d}`", f.name.name),
@@ -1049,7 +1074,7 @@ once inside `main`",
     if let Some(main) = ctx.fns.get("main::main") {
         let leftover: Vec<&String> = ctx.rows["main::main"]
             .iter()
-            .filter(|e| *e != IO && *e != ASYNC && *e != UNSAFE)
+            .filter(|e| *e != IO && *e != ASYNC && *e != UNSAFE && *e != NET)
             .collect();
         if !leftover.is_empty() {
             let list = leftover
@@ -1083,7 +1108,7 @@ is installed, not around the calls to it ([E-HANDLER-OWN-ROW])",
                 collect_fn_bindings(body, &ctx, &f.name, &mut fnb);
                 walk_block(body, &f.name, &mut active, &ctx, &fnb, &mut row);
                 let leftover: Vec<&String> =
-                    row.iter().filter(|e| *e != IO && *e != ASYNC && *e != UNSAFE).collect();
+                    row.iter().filter(|e| *e != IO && *e != ASYNC && *e != UNSAFE && *e != NET).collect();
                 if !leftover.is_empty() {
                     let list = leftover
                         .iter()
@@ -2493,6 +2518,9 @@ fn walk_expr(
             if let Expr::Ident(id) = &**callee {
                 if IO_BUILTINS.contains(&id.name.as_str()) && !active.iter().any(|a| a == IO) {
                     out.insert(IO.to_string());
+                }
+                if NET_BUILTINS.contains(&id.name.as_str()) && !active.iter().any(|a| a == NET) {
+                    out.insert(NET.to_string());
                 }
                 // A C function's effects are unknowable, so it performs `io`.
                 if ctx.externs.contains(&format!("{current}::{}", id.name))

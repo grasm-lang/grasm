@@ -51,6 +51,14 @@ pub struct Frame {
     pub at: grasm_syntax::span::Span,
 }
 
+/// A listener or a connection, held by the reference engine for the `net`
+/// builtins. A handle is an index into a table of these, so what crosses into
+/// Grasm is an integer and a program never sees an address.
+enum NetSocket {
+    Listener(std::net::TcpListener),
+    Stream(std::net::TcpStream),
+}
+
 pub struct Interp<'a, W: Write> {
     /// qualified `mod::fn` → decl
     fns: HashMap<String, &'a FnDecl>,
@@ -76,6 +84,8 @@ pub struct Interp<'a, W: Write> {
     /// Method calls the checker resolved to a struct field. See
     /// `set_field_calls`.
     field_calls: grasm_sema::check::SpanSet,
+    /// Listeners and connections opened by the `net` builtins, by handle.
+    sockets: Vec<Option<NetSocket>>,
     /// Closure literals whose own type is fallible, by start offset.
     ///
     /// `fail(e)` raises the error branch of the enclosing fallible function,
@@ -559,6 +569,91 @@ impl<'a, W: Write> Interp<'a, W> {
         self.ok_wrapped = spans;
     }
 
+    /// One of the five `net` builtins, against this engine's socket table.
+    ///
+    /// Handles are indices, so what crosses into Grasm is an `i64` and a
+    /// program never sees an address. A handle that names nothing is an
+    /// ordinary failure rather than a panic: it is what a program gets for
+    /// using a connection after closing it.
+    fn net_call(&mut self, which: &str, handle: &Value, text: Option<String>) -> Value {
+        use std::io::{Read, Write};
+        let as_int = |v: &Value| match v {
+            Value::Int(n) => Some(*n),
+            _ => None,
+        };
+        let fail = |m: String| Value::Err(Rc::new(io_error("IoFailed", m)));
+
+        if which == "tcp_listen" {
+            let Some(port) = as_int(handle) else {
+                return fail("port must be an integer".to_string());
+            };
+            if !(0..=65535).contains(&port) {
+                return fail(format!("port {port} is out of range"));
+            }
+            return match std::net::TcpListener::bind(("127.0.0.1", port as u16)) {
+                Ok(l) => {
+                    self.sockets.push(Some(NetSocket::Listener(l)));
+                    Value::Ok(Rc::new(Value::Int((self.sockets.len() - 1) as i64)))
+                }
+                Err(e) => fail(e.to_string()),
+            };
+        }
+
+        let Some(h) = as_int(handle) else {
+            return fail("handle must be an integer".to_string());
+        };
+        if which == "tcp_close" {
+            if let Some(slot) = self.sockets.get_mut(h as usize) {
+                *slot = None;
+            }
+            return Value::Unit;
+        }
+        let Some(socket) = self.sockets.get_mut(h as usize).and_then(Option::as_mut) else {
+            return fail(format!("socket {h} is not open"));
+        };
+        match (which, socket) {
+            ("tcp_accept", NetSocket::Listener(l)) => match l.accept() {
+                Ok((stream, _)) => {
+                    self.sockets.push(Some(NetSocket::Stream(stream)));
+                    Value::Ok(Rc::new(Value::Int((self.sockets.len() - 1) as i64)))
+                }
+                Err(e) => fail(e.to_string()),
+            },
+            // One read, not a loop to end-of-stream: an HTTP client holds the
+            // connection open after its request, so reading to the end waits
+            // forever. A caller that needs more reads again.
+            ("tcp_read", NetSocket::Stream(stream)) => {
+                let mut buf = vec![0u8; 65536];
+                match stream.read(&mut buf) {
+                    Ok(n) => {
+                        buf.truncate(n);
+                        Value::Ok(Rc::new(Value::str(
+                            String::from_utf8_lossy(&buf).into_owned(),
+                        )))
+                    }
+                    Err(e) => fail(e.to_string()),
+                }
+            }
+            ("tcp_write", NetSocket::Stream(stream)) => {
+                let body = text.unwrap_or_default();
+                match stream
+                    .write_all(body.as_bytes())
+                    .and_then(|()| stream.flush())
+                {
+                    Ok(()) => Value::Ok(Rc::new(Value::Unit)),
+                    Err(e) => fail(e.to_string()),
+                }
+            }
+            ("tcp_accept", NetSocket::Stream(_)) => {
+                fail(format!("socket {h} is a connection, not a listener"))
+            }
+            (_, NetSocket::Listener(_)) => {
+                fail(format!("socket {h} is a listener, not a connection"))
+            }
+            _ => fail(format!("`{which}` is not a network operation")),
+        }
+    }
+
     /// The method calls the checker resolved to a struct field holding a
     /// function, from `Analysis`.
     ///
@@ -689,6 +784,7 @@ impl<'a, W: Write> Interp<'a, W> {
             float_literals: std::collections::HashSet::new(),
             ok_wrapped: std::collections::HashSet::new(),
             field_calls: Default::default(),
+            sockets: Vec::new(),
             fallible_closures: std::collections::HashSet::new(),
             float_sums: std::collections::HashSet::new(),
             slab: Vec::new(),
@@ -2097,6 +2193,20 @@ build links it, `grasm run` can only reach what is already loaded",
                     "fail" => {
                         let v = self.eval_expr(&args[0])?;
                         return Err(Flow::Err(v));
+                    }
+                    // The `net` capability. Handles are integers and payloads
+                    // are text, so the boundary needs no pointer type
+                    // ([L-LIB-NET]). The reference engine owns the sockets;
+                    // a compiled build calls the runtime, and both keep the
+                    // same table shape so a handle means the same thing.
+                    "tcp_listen" | "tcp_accept" | "tcp_read" | "tcp_write" | "tcp_close" => {
+                        let h = self.eval_expr(&args[0])?;
+                        let extra = if id.name == "tcp_write" {
+                            Some(self.eval_expr(&args[1])?.to_string())
+                        } else {
+                            None
+                        };
+                        return Ok(self.net_call(&id.name, &h, extra));
                     }
                     "read_file" => {
                         let p = self.eval_expr(&args[0])?.to_string();

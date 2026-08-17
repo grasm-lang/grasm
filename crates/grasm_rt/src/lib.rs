@@ -3675,6 +3675,175 @@ fn ok_of(v: *mut RtVal) -> *mut RtVal {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Network — the `net` capability
+// ---------------------------------------------------------------------------
+//
+// Sockets are handles, and everything crossing the boundary is an `i64` or a
+// `str`. That is deliberate: Grasm has no pointer type and no byte buffer, and
+// adding one to reach the network would have been a much larger change to the
+// language than adding the network itself.
+//
+// The capability story's headline example is "a package that never declared
+// network access can never touch the network" — which could not be shown at all
+// while there was no network to gate.
+
+thread_local! {
+    /// Open listeners and connections, by handle. A handle is an index, so it
+    /// is an `i64` at the boundary and the caller never sees an address.
+    static SOCKETS: std::cell::RefCell<Vec<Option<Socket>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+enum Socket {
+    Listener(std::net::TcpListener),
+    Stream(std::net::TcpStream),
+}
+
+fn socket_put(s: Socket) -> i64 {
+    SOCKETS.with(|table| {
+        let mut table = table.borrow_mut();
+        // A freed slot is reused, so a long-running server does not grow the
+        // table once per connection.
+        if let Some(i) = table.iter().position(Option::is_none) {
+            table[i] = Some(s);
+            return i as i64;
+        }
+        table.push(Some(s));
+        (table.len() - 1) as i64
+    })
+}
+
+/// Runs `f` against the socket a handle names.
+///
+/// A handle that names nothing is an ordinary failure, not a panic: it is what
+/// a program gets for using a connection after closing it, and a wrong answer
+/// is worse than an error.
+fn socket_with<T>(h: i64, f: impl FnOnce(&mut Socket) -> Result<T, String>) -> Result<T, String> {
+    SOCKETS.with(|table| {
+        let mut table = table.borrow_mut();
+        match table.get_mut(h as usize).and_then(Option::as_mut) {
+            Some(s) => f(s),
+            None => Err(format!("socket {h} is not open")),
+        }
+    })
+}
+
+/// Listens on a TCP port, answering with a handle.
+///
+/// # Safety: called from compiled Grasm with a boxed value.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_tcp_listen(port: *mut RtVal) -> *mut RtVal {
+    let port = match &(*port).payload {
+        RtPayload::I64(n) => *n,
+        _ => return err_of(io_err("IoFailed", "port must be an integer".to_string())),
+    };
+    if !(0..=65535).contains(&port) {
+        return err_of(io_err("IoFailed", format!("port {port} is out of range")));
+    }
+    match std::net::TcpListener::bind(("127.0.0.1", port as u16)) {
+        Ok(l) => ok_of(alloc(RtPayload::I64(socket_put(Socket::Listener(l))))),
+        Err(e) => err_of(io_err("IoFailed", e.to_string())),
+    }
+}
+
+/// Waits for a connection, answering with a handle for it.
+///
+/// # Safety: called from compiled Grasm with a boxed value.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_tcp_accept(handle: *mut RtVal) -> *mut RtVal {
+    let h = match &(*handle).payload {
+        RtPayload::I64(n) => *n,
+        _ => return err_of(io_err("IoFailed", "handle must be an integer".to_string())),
+    };
+    let accepted = socket_with(h, |s| match s {
+        Socket::Listener(l) => l.accept().map(|(stream, _)| stream).map_err(|e| e.to_string()),
+        Socket::Stream(_) => Err(format!("socket {h} is a connection, not a listener")),
+    });
+    match accepted {
+        Ok(stream) => ok_of(alloc(RtPayload::I64(socket_put(Socket::Stream(stream))))),
+        Err(e) => err_of(io_err("IoFailed", e)),
+    }
+}
+
+/// Reads what has arrived on a connection, as text.
+///
+/// One read, not a loop to end-of-stream: an HTTP client keeps the connection
+/// open after its request, so reading to the end would wait forever. A caller
+/// that needs more calls again.
+///
+/// # Safety: called from compiled Grasm with a boxed value.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_tcp_read(handle: *mut RtVal) -> *mut RtVal {
+    use std::io::Read;
+    let h = match &(*handle).payload {
+        RtPayload::I64(n) => *n,
+        _ => return err_of(io_err("IoFailed", "handle must be an integer".to_string())),
+    };
+    let read = socket_with(h, |s| match s {
+        Socket::Stream(stream) => {
+            let mut buf = vec![0u8; 65536];
+            match stream.read(&mut buf) {
+                Ok(n) => {
+                    buf.truncate(n);
+                    // Lossy, because a socket carries bytes and a Grasm `str`
+                    // is text: a client that sends invalid UTF-8 gets its bytes
+                    // replaced rather than crashing the server.
+                    Ok(String::from_utf8_lossy(&buf).into_owned())
+                }
+                Err(e) => Err(e.to_string()),
+            }
+        }
+        Socket::Listener(_) => Err(format!("socket {h} is a listener, not a connection")),
+    });
+    match read {
+        Ok(text) => ok_of(alloc(RtPayload::Str(RtStr::new(text)))),
+        Err(e) => err_of(io_err("IoFailed", e)),
+    }
+}
+
+/// Writes text to a connection.
+///
+/// # Safety: called from compiled Grasm with boxed values.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_tcp_write(handle: *mut RtVal, data: *mut RtVal) -> *mut RtVal {
+    use std::io::Write;
+    let h = match &(*handle).payload {
+        RtPayload::I64(n) => *n,
+        _ => return err_of(io_err("IoFailed", "handle must be an integer".to_string())),
+    };
+    let text = as_str(data).to_string();
+    let wrote = socket_with(h, |s| match s {
+        Socket::Stream(stream) => stream
+            .write_all(text.as_bytes())
+            .and_then(|()| stream.flush())
+            .map_err(|e| e.to_string()),
+        Socket::Listener(_) => Err(format!("socket {h} is a listener, not a connection")),
+    });
+    match wrote {
+        Ok(()) => ok_of(alloc(RtPayload::I64(0))),
+        Err(e) => err_of(io_err("IoFailed", e)),
+    }
+}
+
+/// Closes a listener or a connection. Closing one twice is not an error, for
+/// the same reason releasing a `ref` twice is not: cleanup order is not
+/// something a caller should have to track.
+///
+/// # Safety: called from compiled Grasm with a boxed value.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_tcp_close(handle: *mut RtVal) {
+    if let RtPayload::I64(h) = &(*handle).payload {
+        let h = *h;
+        SOCKETS.with(|table| {
+            let mut table = table.borrow_mut();
+            if let Some(slot) = table.get_mut(h as usize) {
+                *slot = None;
+            }
+        });
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn grasm_read_file(path: *mut RtVal) -> *mut RtVal {
     let p = as_str(path).to_string();

@@ -21,7 +21,7 @@ pub const LOCKFILE_NAME: &str = "grasm.lock";
 /// `unsafe` is Tier 3: it is not something the runtime does for you, it is
 /// permission to leave the safe tiers. It belongs here because it must be
 /// declarable without a matching `effect` declaration in the source.
-pub const BUILTIN_CAPABILITIES: &[&str] = &["io", "async", "unsafe"];
+pub const BUILTIN_CAPABILITIES: &[&str] = &["io", "async", "net", "unsafe"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Dependency {

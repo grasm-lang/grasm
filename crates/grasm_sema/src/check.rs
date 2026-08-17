@@ -170,6 +170,11 @@ pub fn value_tables(program: &crate::loader::Program) -> ValueTables {
 /// *program* declares, and `print` is a method of nothing.
 const BUILTIN_FREE_FNS: &[&str] = &[
     "print",
+    "tcp_listen",
+    "tcp_accept",
+    "tcp_read",
+    "tcp_write",
+    "tcp_close",
     "read_file",
     "write_file",
     "file_exists",
@@ -4213,6 +4218,49 @@ only a number or a `bool` can come out — compute what you need and yield that"
                         }
                         self.check_expr(&args[0], &Type::Str);
                         return self.uni.fresh(); // bottom: fits anywhere
+                    }
+                    // The `net` capability. Handles are `i64` and payloads are
+                    // `str`, so reaching the network needed no pointer type —
+                    // which would have been a far larger change to the language
+                    // than the network itself ([L-LIB-NET]).
+                    "tcp_listen" | "tcp_accept" | "tcp_read" => {
+                        let (want, gives) = match id.name.as_str() {
+                            "tcp_listen" => (Type::I64, Type::I64),
+                            "tcp_accept" => (Type::I64, Type::I64),
+                            _ => (Type::I64, Type::Str),
+                        };
+                        if args.len() != 1 {
+                            return self.error(
+                                span,
+                                format!("{} takes exactly 1 argument", id.name),
+                            );
+                        }
+                        self.check_expr(&args[0], &want);
+                        let io_err = Type::Named {
+                            id: self.defs.io_error_id,
+                            args: vec![],
+                        };
+                        return Type::Fallible(Box::new(gives), Box::new(io_err));
+                    }
+                    "tcp_write" => {
+                        if args.len() != 2 {
+                            return self
+                                .error(span, "tcp_write takes 2 arguments (handle, text)");
+                        }
+                        self.check_expr(&args[0], &Type::I64);
+                        self.check_expr(&args[1], &Type::Str);
+                        let io_err = Type::Named {
+                            id: self.defs.io_error_id,
+                            args: vec![],
+                        };
+                        return Type::Fallible(Box::new(Type::Unit), Box::new(io_err));
+                    }
+                    "tcp_close" => {
+                        if args.len() != 1 {
+                            return self.error(span, "tcp_close takes exactly 1 argument");
+                        }
+                        self.check_expr(&args[0], &Type::I64);
+                        return Type::Unit;
                     }
                     "read_file" => {
                         if args.len() != 1 {
