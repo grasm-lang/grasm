@@ -81,3 +81,24 @@ and lied".
 Every blocked project is blocked on a *missing feature*, and every finding is a
 gap rather than a defect. That is a different and much better failure mode than
 the alternative, and it is the strongest single statement this directory makes.
+
+## Running them in a browser
+
+`ProjectGold/web/` runs every program in a tab, using the reference interpreter
+compiled to `wasm32-unknown-unknown` — the same engine `grasm run` uses, not a
+transcript and not a reimplementation. Each result is compared against the
+committed `expected.txt`.
+
+```
+cd ProjectGold/web && python3 -m http.server 8123
+# then open http://localhost:8123 and press "Run all 26"
+```
+
+**23 of 26 match byte for byte, 3 are limited by the host, 0 unexplained.** The
+three are a filesystem (11, 29) and a stack deeper than a wasm module is given
+(08). Each fails by refusing, never by answering wrongly.
+
+Timings from one run, which include re-lexing and re-typechecking the whole
+program each time: most under 10 ms; SHA-256 66 ms; the micro VM 545 ms; the
+sorting benchmark 3.7 s, which is dominated by bubble sort at the size it grows
+to before it can be measured.
