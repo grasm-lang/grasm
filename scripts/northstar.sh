@@ -102,29 +102,61 @@ else
 fi
 
 # ---------------------------------------------------------------- G11: concision
-python3 - <<'PY'
-import os, re
+# Each language counted by its *own* lexer. A regular expression cannot do this
+# fairly: Python's grammar has INDENT, DEDENT and NEWLINE tokens and Go's
+# inserts semicolons, so a regex over punctuation gives both of those away free
+# and charges Grasm for every brace. Measured that way Grasm read 1.22x of
+# Python; measured properly it reads 1.04x. The difference was the ruler.
+GOTOK=""
+if command -v go >/dev/null 2>&1; then
+    # Built in a scratch module of its own: this repository is not a Go module,
+    # and `go build` refuses a bare file inside one that is not.
+    mkdir -p "$WORK/gotok"
+    cp scripts/gotok/main.go "$WORK/gotok/main.go"
+    if (cd "$WORK/gotok" && go mod init gotok >/dev/null 2>&1 \
+        && go build -o gotok main.go >/dev/null 2>&1); then
+        GOTOK="$WORK/gotok/gotok"
+    fi
+fi
+GRASM="$GRASM" GOTOK="$GOTOK" python3 - <<'G11PY'
+import io, os, subprocess, tokenize
+
+grasm = os.environ["GRASM"]
+gotok = os.environ.get("GOTOK") or None
 progs = ["fib", "sieve", "matmul", "wordfreq", "sort", "parmap"]
 
-def toks(path):
-    if not os.path.exists(path):
+def grasm_tokens(path):
+    out = subprocess.run([grasm, "tokens", path], capture_output=True, text=True).stdout
+    return sum(1 for l in out.splitlines() if l.strip() and not l.endswith("Eof"))
+
+def python_tokens(path):
+    skip = {tokenize.ENCODING, tokenize.ENDMARKER, tokenize.NL, tokenize.COMMENT}
+    with open(path, "rb") as f:
+        return sum(1 for t in tokenize.tokenize(f.readline) if t.type not in skip)
+
+def go_tokens(path):
+    if not gotok:
         return None
-    s = open(path).read()
-    s = re.sub(r"//.*|#.*", "", s)
-    return len(re.findall(r"[A-Za-z_]\w*|\d+\.?\d*|[^\sA-Za-z_0-9]", s))
+    out = subprocess.run([gotok, path], capture_output=True, text=True).stdout.strip()
+    return int(out) if out.isdigit() else None
 
 g = p = o = 0
 for name in progs:
-    a, b, c = (toks(f"benchmarks/grasm/{name}.gr"),
-               toks(f"benchmarks/python/{name}.py"),
-               toks(f"benchmarks/go/{name}.go"))
-    if a and b and c:
-        g += a; p += b; o += c
-if not (g and p and o):
-    raise SystemExit("error: the benchmark programs needed for G11 are missing")
+    a = grasm_tokens(f"benchmarks/grasm/{name}.gr")
+    b = python_tokens(f"benchmarks/python/{name}.py")
+    c = go_tokens(f"benchmarks/go/{name}.go")
+    if not (a and b):
+        raise SystemExit("error: the benchmark programs needed for G11 are missing")
+    g += a
+    p += b
+    if c:
+        o += c
 print(f"{'G11':<4} {'tokens vs Python':<34} {'<= 1.00x':<22} {g/p:.2f}x")
-print(f"{'':<4} {'tokens vs Go':<34} {'<= 0.60x':<22} {g/o:.2f}x")
-PY
+if o:
+    print(f"{'':<4} {'tokens vs Go':<34} {'<= 0.60x':<22} {g/o:.2f}x")
+else:
+    print(f"{'':<4} {'tokens vs Go':<34} {'<= 0.60x':<22} skipped (no Go toolchain)")
+G11PY
 
 # ---------------------------------------------------------------- G1
 printf '%-4s %-34s %-22s %s\n' "G1" "time for a Go/TS dev to ship" "<= 1 week" "unmeasurable without users"
