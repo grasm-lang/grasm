@@ -1,0 +1,17 @@
+[package]
+name = "grasm_wasm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# A `cdylib` so the wasm32 target emits a module with exported functions.
+# Deliberately no `wasm-bindgen`: the ABI below is small enough to write by
+# hand, and a build tool nobody has installed is a barrier between a reader and
+# a running program. `cargo build --target wasm32-unknown-unknown` is the whole
+# build.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+grasm_interp = { path = "../grasm_interp" }
+grasm_syntax = { path = "../grasm_syntax" }

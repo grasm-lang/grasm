@@ -55,6 +55,21 @@ fn run_src_here(
 ///
 /// The stack is reserved, not committed: a program that does not recurse
 /// deeply pays nothing.
+/// On wasm there are no threads, so the interpreter runs on the stack it was
+/// given.
+///
+/// This is a real difference and not a papered-over one: a wasm module's stack
+/// is fixed at link time (1 MiB by default) and cannot be enlarged from inside,
+/// so [E-RECURSION-DEPTH]'s promised depth is *not* available there. A program
+/// that recurses deeply gets a wasm stack exhaustion — a trap, not a Grasm
+/// panic with a sentence. Recorded in the §11 gap table rather than hidden,
+/// because the alternative is a browser tab that dies without saying why.
+#[cfg(target_arch = "wasm32")]
+fn on_deep_stack<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    f()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn on_deep_stack<T: Send>(f: impl FnOnce() -> T + Send) -> T {
     // Reserved, not committed — see `STACK_BUDGET`, which this must exceed.
     #[cfg(debug_assertions)]

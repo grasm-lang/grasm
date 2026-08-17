@@ -84,6 +84,13 @@ has never seen. `dist/grasm-conformance-pack.md` carries the runnable program fo
 every rule, another 37k tokens; you need it when a rule is in dispute and you
 want it settled by a program rather than by prose.
 
+`grasm_wasm` builds the interpreter for `wasm32-unknown-unknown`, so a Grasm
+program runs in a browser tab with no server: `cargo build --release --target
+wasm32-unknown-unknown -p grasm_wasm`, then see [docs/wasm.md](docs/wasm.md).
+It is the reference interpreter rather than a second implementation, and
+`scripts/wasmtest.sh` holds it to the same agreement gate as everything else —
+183 identical, 0 mismatched.
+
 ## Toolchain
 
 ```

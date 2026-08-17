@@ -523,11 +523,49 @@ enum PathSeg {
     Index(i64),
 }
 
+/// Milliseconds since the Unix epoch, from whatever clock the host has.
+///
+/// `std::time::SystemTime::now()` is not merely unavailable on
+/// wasm32-unknown-unknown — it *panics*, and on a target with no unwinding a
+/// panic is an abort, which takes the whole module down and loses the program's
+/// output with it. So the clock is asked for through an import there, and the
+/// embedder supplies it: a browser has `Date.now()`, and the one thing it must
+/// not do is pretend the time is zero.
+#[cfg(target_arch = "wasm32")]
+fn host_now_millis() -> i64 {
+    extern "C" {
+        /// Supplied by the embedder as `env.grasm_now_millis`.
+        fn grasm_now_millis() -> f64;
+    }
+    // `f64` rather than `i64`, because that is the type a JavaScript number
+    // arrives as, and milliseconds since 1970 are exactly representable in one
+    // until the year 287396.
+    unsafe { grasm_now_millis() as i64 }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn host_now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 /// The largest string this implementation will build.
 ///
 /// A `repeat` past it is a panic with a sentence, not a Rust allocator
 /// message or `capacity overflow` with a backtrace.
+///
+/// 8 GiB where a pointer is 64 bits. On wasm32 a `usize` is 32 bits and the
+/// whole address space is 4 GiB, so `1 << 33` is not merely unreachable there —
+/// it does not fit in the type, and the shift is a compile error. Half the
+/// address space is the same *rule* stated in terms the target can hold: past
+/// it, the allocation cannot succeed, so refusing it with a sentence is
+/// strictly better than trying.
+#[cfg(target_pointer_width = "64")]
 const MAX_ALLOC: usize = 1 << 33;
+#[cfg(not(target_pointer_width = "64"))]
+const MAX_ALLOC: usize = 1 << (usize::BITS - 1);
 
 impl<'a, W: Write> Interp<'a, W> {
     pub fn new(module: &'a Module, out: &'a mut W) -> Self {
@@ -2328,11 +2366,7 @@ build links it, `grasm run` can only reach what is already loaded",
                         }));
                     }
                     "now_millis" => {
-                        let ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis() as i64)
-                            .unwrap_or(0);
-                        return Ok(Value::Int(ms));
+                        return Ok(Value::Int(host_now_millis()));
                     }
                     "env" => {
                         let name = self.eval_expr(&args[0])?.to_string();
