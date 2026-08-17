@@ -361,6 +361,23 @@ interpreter printed the answer. Nothing in the program has to declare the
 colliding type: `None` is in the prelude, so the shape is one variable name
 away in any program at all.
 
+
+## Wildcard bindings
+
+**[G-WILDCARD-BINDING]** `_` in binding position means "do not name this". It is
+accepted wherever a name is bound — `let _ = e`, `let (_, b) = e`, `for _ in e`,
+`for (_, v) in e` — and not only in a `match` pattern.
+
+Each `_` is a distinct binding, so `let (_, _) = pair` is legal and binds
+nothing twice. None can be read back: there is no expression that names one.
+
+`_` is **not** a way to discard a failure. [T-FALLIBLE-UNHANDLED] applies to a
+wildcard binding exactly as it does to a named one, so `let _ = risky()` is
+still refused and the annotation `let _: T ! E = risky()` is still what holds
+the failure as a value. A binding being unnamed says nothing about whether its
+error was considered.
+
+
 ## 11. Nesting limit
 
 **[G-NEST-LIMIT]** The depth of the syntax tree is capped. Exceeding the cap

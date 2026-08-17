@@ -311,11 +311,59 @@ impl Parser {
         } else {
             let span = self.cur_span();
             let found = self.cur().describe();
-            self.diags.push(Diagnostic::error(
+            let mut d = Diagnostic::error(
                 span,
                 format!("expected {} but found {}", kind.describe(), found),
-            ));
+            );
+            if let Some(op) = self.wrapped_operator_ahead() {
+                d = d.with_help(format!(
+                    "the next line starts with `{op}`, so this statement ended here — a newline ends a statement unless the line *ends* in an operator. Move the `{op}` up to the end of this line, or wrap the whole expression in parentheses"
+                ));
+            }
+            self.diags.push(d);
             Err(())
+        }
+    }
+
+    /// The binary operator that begins the next line, if one does.
+    ///
+    /// A newline ends a statement unless the line ends in an operator or a
+    /// bracket is open — the same rule Go uses, and a consistent one. What was
+    /// missing was any way for a reader to find that out: wrapping a long
+    /// condition the natural way
+    ///
+    /// ```text
+    /// if a.contains(x)
+    ///     or b.contains(x) {
+    /// ```
+    ///
+    /// reported "expected `{` but found end of line" and then a second,
+    /// invented error at the `or`. Neither said what to move. Found by writing
+    /// an ordinary program (ProjectGold 06).
+    fn wrapped_operator_ahead(&self) -> Option<&'static str> {
+        if !matches!(self.toks.get(self.i).map(|t| &t.kind), Some(TokenKind::Newline)) {
+            return None;
+        }
+        let mut j = self.i;
+        while matches!(self.toks.get(j).map(|t| &t.kind), Some(TokenKind::Newline)) {
+            j += 1;
+        }
+        match self.toks.get(j).map(|t| &t.kind)? {
+            TokenKind::KwAnd => Some("and"),
+            TokenKind::KwOr => Some("or"),
+            TokenKind::Plus => Some("+"),
+            TokenKind::Minus => Some("-"),
+            TokenKind::Star => Some("*"),
+            TokenKind::Slash => Some("/"),
+            TokenKind::Percent => Some("%"),
+            TokenKind::EqEq => Some("=="),
+            TokenKind::NotEq => Some("!="),
+            TokenKind::Lt => Some("<"),
+            TokenKind::Gt => Some(">"),
+            TokenKind::LtEq => Some("<="),
+            TokenKind::GtEq => Some(">="),
+            TokenKind::PipeGt => Some("|>"),
+            _ => None,
         }
     }
 
@@ -405,6 +453,35 @@ impl Parser {
             ));
             Err(())
         }
+    }
+
+    /// A name in *binding* position, where `_` means "do not name this".
+    ///
+    /// `_` was accepted in a `match` pattern and refused everywhere else, so
+    /// `for _ in 0..n`, `let _ = f()` and `let (_, b) = pair` were all errors —
+    /// while `spec/core.md` classifies `_` as a pattern form and `let (a, b)` as
+    /// sugar for projections, which is exactly what leads a reader to expect it
+    /// to work in all four places.
+    ///
+    /// It matters beyond tidiness. [T-FALLIBLE-UNHANDLED] requires a failure to
+    /// be handled, and `let _ = risky()` is how a reader writes "I have seen
+    /// this and I am dropping it on purpose". Without it the only option is to
+    /// invent a name, which reads identically to having forgotten one.
+    ///
+    /// Each `_` becomes a distinct unwritable name, using the same `\u{1}`
+    /// convention as the `for (a, b)` desugaring below: distinct so that
+    /// `let (_, _) = pair` does not bind one name twice, and unwritable so that
+    /// nothing can read the value back.
+    fn binding_ident(&mut self) -> PResult<Ident> {
+        if self.at(&TokenKind::Underscore) {
+            let span = self.cur_span();
+            self.bump();
+            return Ok(Ident {
+                name: format!("\u{1}wild{}", span.start),
+                span,
+            });
+        }
+        self.ident()
     }
 
     // ------------------------------------------------------------------
@@ -1097,7 +1174,7 @@ impl Parser {
                         if self.at(&TokenKind::RParen) {
                             break;
                         }
-                        names.push(self.ident()?);
+                        names.push(self.binding_ident()?);
                         if !self.eat(&TokenKind::Comma) {
                             break;
                         }
@@ -1114,7 +1191,7 @@ impl Parser {
                         span,
                     });
                 }
-                let name = self.ident()?;
+                let name = self.binding_ident()?;
                 let ty = if self.eat(&TokenKind::Colon) {
                     Some(self.parse_type_nested()?)
                 } else {
@@ -1175,7 +1252,7 @@ impl Parser {
                         if self.at(&TokenKind::RParen) {
                             break;
                         }
-                        names.push(self.ident()?);
+                        names.push(self.binding_ident()?);
                         if !self.eat(&TokenKind::Comma) {
                             break;
                         }
@@ -1189,7 +1266,7 @@ impl Parser {
                         span: rp,
                     }
                 } else {
-                    self.ident()?
+                    self.binding_ident()?
                 };
                 self.expect(&TokenKind::KwIn)?;
                 let iter = self.parse_cond_expr()?;

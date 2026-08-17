@@ -3,7 +3,7 @@
 Running list. Each entry gets a severity from `docs/release-scope.md` and either
 a fix or a reason it is not fixed.
 
-## F1 — a wrapped condition must end the line with the operator (S4, diagnostics)
+## F1 — a wrapped condition must end the line with the operator (S4) — **fixed**
 
 Found writing 06-contact-book. This is refused:
 
@@ -21,9 +21,17 @@ if c.name.contains(needle) or
 
 The rule is consistent — a newline ends a statement unless the line *ends* in an
 operator, or you are inside brackets — and it is the same rule Go uses. The
-defect is the diagnostic, which says `expected `{` but found end of line` and
-then reports a second, invented error at the leading `or`. Nothing tells the
-reader that moving the operator up one line works.
+defect was the diagnostic, which said `expected `{` but found end of line` and
+nothing else. Nothing told the reader what to move.
+
+**Fixed.** When the next line begins with a binary operator, the help now says
+so and names it:
+
+```
+help: the next line starts with `or`, so this statement ended here — a newline
+      ends a statement unless the line *ends* in an operator. Move the `or` up
+      to the end of this line, or wrap the whole expression in parentheses
+```
 
 ## F2 — `str.len()` counts code points, and byte length is unaskable (S4, library)
 
@@ -38,7 +46,7 @@ No `>>`, `<<`, `&`, `|`, `^` on `i64`. Blocks 18 (BMP), 25 (DNS), 27 (SHA-256)
 outright, and forces division-by-power-of-two in place of shifts everywhere
 else. Hex literals (`0xFF`) do parse.
 
-## F4 — `_` is a pattern in `match` and nowhere else (S3, language)
+## F4 — `_` is a pattern in `match` and nowhere else (S3) — **fixed**
 
 Found writing 08-fibonacci. All three of these are refused:
 
@@ -57,9 +65,17 @@ The cost is not only cosmetic. [T-FALLIBLE-UNHANDLED] requires a failure to be
 handled, and `let _ = risky()` is the natural way to write "I have read this and
 I am deliberately dropping it". There is no spelling for that.
 
-Workaround: invent a name. The language does not warn about an unused binding,
-so `let ignored = f()` compiles — which is worse than `_`, because now the
-reader cannot tell a deliberate discard from a forgotten one.
+**Fixed**, as [G-WILDCARD-BINDING]. `_` is now accepted wherever a name is
+bound, and each one is a distinct unwritable binding, so `let (_, _) = pair`
+binds nothing twice and none of them can be read back.
+
+One part of the finding was **wrong and is not fixed, deliberately**. `let _ =
+risky()` is still refused. [T-FALLIBLE-UNHANDLED] applies to a wildcard exactly
+as to a named binding, and it should: a binding being unnamed says nothing about
+whether its error was considered. Rust allows `let _ =` to drop a `Result`
+silently, which is why it needed `#[must_use]`; not repeating that is the better
+answer, and the existing help already names the annotation that holds the
+failure as a value.
 
 ## F5 — a string literal cannot span lines, and there is no raw form (S3, language)
 

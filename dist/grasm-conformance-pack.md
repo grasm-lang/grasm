@@ -2360,6 +2360,49 @@ fn main() {
 }
 ```
 
+## `G-WILDCARD-BINDING.gr`
+
+```grasm
+//! tag: G-WILDCARD-BINDING
+//! expect: output
+//! discarded
+//! 2
+//! two wildcards bind separately
+//! 3
+//! b
+// `_` in binding position means "do not name this".
+//
+// It is accepted anywhere a name is bound — `let`, a tuple `let`, and `for` —
+// and not only in a `match` pattern. Each `_` is a distinct binding, so a tuple
+// may ignore both halves, and none of them can be read back.
+fn seven() -> i64 {
+    7
+}
+
+fn main() {
+    let _ = seven()
+    print("discarded")
+
+    let (_, b) = (1, 2)
+    print("{b}")
+
+    let (_, _) = (3, 4)
+    print("two wildcards bind separately")
+
+    var n = 0
+    for _ in 0..3 {
+        n = n + 1
+    }
+    print("{n}")
+
+    for (_, v) in [(1, "a"), (2, "b")] {
+        if v == "b" {
+            print("{v}")
+        }
+    }
+}
+```
+
 ## `L-BOOL.gr`
 
 ```grasm
