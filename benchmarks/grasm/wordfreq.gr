@@ -5,9 +5,5 @@ fn main() {
         let w = words[i % 8] + "{i % 97}"
         counts.set(w, (counts.get(w) ?? 0) + 1)
     }
-    var total = 0
-    for k in counts.keys() {
-        total = total + (counts.get(k) ?? 0)
-    }
-    print("{counts.len()} {total}")
+    print("{counts.len()} {counts.values().sum()}")
 }

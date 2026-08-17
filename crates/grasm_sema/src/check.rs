@@ -5709,6 +5709,54 @@ Perform the effect after the closing brace, or yield a number and do the work ou
                 }
                 _ => return None,
             },
+            // A range answers the list combinators by producing a list.
+            //
+            // Without them, every program that builds a list from a count had
+            // to write `var xs: [i64] = []`, a `for`, a `push` and two braces —
+            // four lines and a dozen tokens where `(0..n).map(f)` says the same
+            // thing. [G11] budgets Grasm at or below Python's token count and it
+            // was 1.41×, and this pattern is where the difference was.
+            //
+            // These are methods rather than new syntax: the kernel's form count
+            // ([spec/core.md]) does not move, because a call is a call.
+            Type::Range => match name.name.as_str() {
+                "to_list" => {
+                    check_arity(self, 0);
+                    Type::List(Box::new(Type::I64))
+                }
+                "map" => {
+                    let out = self.uni.fresh();
+                    if check_arity(self, 1) {
+                        let f = Type::Fn {
+                            params: vec![Type::I64],
+                            ret: Box::new(out.clone()),
+                            row: None,
+                        };
+                        self.check_expr(&args[0], &f);
+                    }
+                    Type::List(Box::new(out))
+                }
+                "filter" => {
+                    if check_arity(self, 1) {
+                        let f = Type::Fn {
+                            params: vec![Type::I64],
+                            ret: Box::new(Type::Bool),
+                            row: None,
+                        };
+                        self.check_expr(&args[0], &f);
+                    }
+                    Type::List(Box::new(Type::I64))
+                }
+                "sum" => {
+                    check_arity(self, 0);
+                    Type::I64
+                }
+                "len" => {
+                    check_arity(self, 0);
+                    Type::I64
+                }
+                _ => return None,
+            },
             Type::Tuple(_) if name.name == "cmp" => return self.check_cmp(recv, args, span),
             Type::I64 => match name.name.as_str() {
                 "cmp" => return self.check_cmp(recv, args, span),

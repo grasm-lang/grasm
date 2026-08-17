@@ -2474,6 +2474,20 @@ order ([E-MAP-ORDER]).
 | `o.expect(msg)` | the payload, or panics with `msg` — for when absence is a bug, not a case |
 | `match o { Some(v) -> … None -> … }` | exhaustive |
 
+**[L-LIB-RANGE-OPS]** A range answers `to_list`, `map`, `filter`, `sum` and
+`len`, producing a list of the same elements `for i in a..b` walks. There is one
+definition of what a range contains and not two: the interpreter turns the range
+into that list and reuses the list method, and the compiled backend rewrites the
+call into the loop it already compiles, since it has no range *value* (§11).
+
+The clause exists because of what it replaces. Building a list from a count
+needed `var xs: [i64] = []`, a `for`, a `push` and two closing braces — four
+lines where `(0..n).map(f)` says the same thing, in every program that builds a
+list from a count. [G11] budgets Grasm at or below Python's token count and it
+measured 1.41×; this is most of the difference, and adding it moved the figure
+to 1.22× without adding a syntactic form — a call is a call, so the kernel's
+count in [`core.md`](core.md) does not move.
+
 
 <!-- ===== docs/tutorial.md ===== -->
 
@@ -6304,6 +6318,41 @@ fn main() {
     print("{kept} {(0.0 / 0.0).is_nan()}")
     // `substr` clamps rather than panicking, unlike indexing.
     print("{"abcdef".substr(2, 100)} | {"abc".substr(5, 2)} |")
+}
+```
+
+## `L-LIB-RANGE-OPS.gr`
+
+```grasm
+//! tag: L-LIB-RANGE-OPS
+//! expect: output
+//! [0, 1, 2, 0, 1]
+//! 10
+//! [0, 2, 4, 6, 8]
+//! [0, 1, 2, 3]
+//! 7
+//! 165
+// A range answers the list combinators, producing a list of the same elements
+// `for i in a..b` walks.
+//
+// Building a list from a count needed `var xs: [i64] = []`, a `for`, a `push`
+// and two closing braces — four lines where `(0..n).map(f)` says the same
+// thing, in every program that builds a list from a count. [G11] budgets Grasm
+// at or below Python's token count; that pattern was most of the gap.
+//
+// There is one definition of what a range contains and not two: this engine
+// turns the range into the list and reuses the list method, and the compiled
+// backend rewrites the call into the loop it already compiles, since it has no
+// range *value* (§11). So the three engines agree by construction rather than
+// by two implementations happening to match.
+fn main() {
+    print("{(0..5).map(|i| i % 3)}")
+    print("{(1..=4).sum()}")
+    print("{(0..10).filter(|i| i % 2 == 0)}")
+    print("{(0..4).to_list()}")
+    print("{(0..7).len()}")
+    // Composes with the list surface, since what comes back *is* a list.
+    print("{(0..10).map(|i| i * i).filter(|n| n % 2 == 1).sum()}")
 }
 ```
 

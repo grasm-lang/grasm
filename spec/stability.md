@@ -17,7 +17,7 @@ meaning changed; the listing was wrong about how settled the area is, and
 saying so is cheaper than defending it. See `docs/release-scope.md` for what
 that means for a release.
 
-Today: 112 stable, 76 provisional, 32 experimental, of 220.
+Today: 112 stable, 76 provisional, 33 experimental, of 221.
 
 ## Stable
 
@@ -251,6 +251,7 @@ May change or be removed in any release. New surface starts here.
 - `T-EFFECT-RESERVED` — experimental
 - `T-ERR-UNION-OPAQUE` — experimental
 - `T-EXTERN` — experimental
+- `L-LIB-RANGE-OPS` — experimental
 - `T-EFFECT-OP-RESULT` — experimental
 - `T-EXTERN-VALUE` — experimental
 - `T-FN-TYPE-ROW` — experimental

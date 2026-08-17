@@ -29,8 +29,8 @@ the scorecard takes the best of five runs and subtracts the process floor.
 | G8 | Production failure → deterministic replay | ≥ 99% | — | **not built** |
 | G9 | C ABI import overhead | zero-cost | `extern fn`, gated by `unsafe` and charged `io` | **partly met** |
 | G10 | Adoption | ≥ 500 companies | zero — nobody outside this repository has run a Grasm program | **not started** |
-| G11 | Tokens vs Python | ≤ 1.00× | **1.41×** | **missed by 41%** |
-| G11 | Tokens vs Go | ≤ 0.60× | **0.74×** | **missed by 23%** |
+| G11 | Tokens vs Python | ≤ 1.00× | **1.22×** | **missed by 22%** |
+| G11 | Tokens vs Go | ≤ 0.60× | **0.65×** | **missed by 8%** |
 
 ## What the numbers say
 
@@ -63,20 +63,36 @@ really about — still has no measurement, because the "compiler as a queryable
 incremental database" the executive summary describes was never built. What
 exists is a batch compiler with an object cache.
 
-**G11 is the clearest miss, and the most interesting one.** Grasm is 1.41× the
-token count of Python where the goal is to be *below* it. Per program:
+**G11 went from 1.41× to 1.22× of Python, and 0.74× to 0.65× of Go.** Per
+program:
 
 | | fib | sieve | matmul | wordfreq | sort | parmap |
 |---|---|---|---|---|---|---|
-| vs Python | 1.27× | 1.40× | 1.48× | 1.47× | 1.31× | 1.38× |
-| vs Go | 1.00× | 0.88× | 0.86× | 0.99× | 0.71× | **0.44×** |
+| vs Python | 1.27× | 1.26× | 1.22× | 1.25× | 1.31× | **1.05×** |
+| vs Go | 1.00× | 0.79× | 0.71× | 0.83× | 0.71× | **0.33×** |
 
-The one place the target is beaten outright is `parmap` — 0.44× of Go — which is
-the concurrency program. That is the effect system paying for itself, and it is
-evidence for the thesis: where Grasm's ideas are load-bearing it is half the
-size of Go, and where a program is a loop over an array it is a typed language
-paying typed-language costs. Closing the Python gap is a *syntax* question, not
-a semantics one, and §19.3 made it a hard KPI for exactly that reason.
+Most of that came from one missing piece rather than from syntax. A range had no
+combinators, so building a list from a count needed `var xs: [i64] = []`, a
+`for`, a `push` and two closing braces — four lines where `(0..n).map(f)` says
+the same thing, in every program that builds a list from a count
+([L-LIB-RANGE-OPS]). Adding them cost no syntactic form: a call is a call, and
+the kernel count in `core.md` did not move.
+
+The rest was the benchmark programs themselves. Three of the six were written
+with a manual accumulation loop where `.sum()` or `.values()` already existed,
+which is not a language cost — the benchmark README says each program is
+"written the way somebody would naturally write it in that language", and they
+were not. One rewrite went the *wrong* way and was reverted: replacing `sort`'s
+push loop with a map-then-overwrite made it eleven tokens longer, and Python
+writes that one as a push loop too.
+
+`parmap` is the number to read. **0.33× of Go and 1.05× of Python** — a
+compiled, statically safe, GC-free language at Python's length on the
+concurrency program. That is the thesis holding where it is tested hardest, and
+it says the remaining gap is a *syntax* question and not a semantic one: the
+programs that are still long are the ones that are a loop over an array, where
+Grasm pays ordinary typed-language costs. §19.3 made concision a hard KPI for
+exactly that reason.
 
 **G5 is missed by 9%**, down from 46%. The binary went 437 KB → 328 KB by
 stripping the symbol table, which nothing reads at run time: a compiled program

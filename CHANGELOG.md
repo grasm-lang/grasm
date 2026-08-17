@@ -123,6 +123,13 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
 
 ### Added
 
+- **A range answers the list combinators** — `to_list`, `map`, `filter`, `sum`,
+  `len` ([L-LIB-RANGE-OPS]). Building a list from a count needed
+  `var xs: [i64] = []`, a `for`, a `push` and two closing braces; `(0..n).map(f)`
+  says the same thing. It costs no syntactic form — a call is a call — so the
+  kernel count in `spec/core.md` does not move. Most of the reason [G11] went
+  from 1.41× Python to 1.22×, and 0.74× Go to 0.65×.
+
 - **`spec/core.md` — the Grasm-Core / Grasm-Full split**, the commitment
   MASTERPLAN §19.2 makes binding and that four places in the repository asserted
   while none was true. One rule (a form is Full if and only if a

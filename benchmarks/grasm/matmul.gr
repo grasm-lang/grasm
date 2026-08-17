@@ -1,28 +1,17 @@
 fn main() {
     let n = 200
-    var a: [i64] = []
-    var b: [i64] = []
-    for i in 0..n * n {
-        a.push(i % 7)
-        b.push(i % 5)
-    }
-    var c: [i64] = []
-    for _slot in 0..n * n {
-        c.push(0)
-    }
+    let a = (0..n * n).map(|i| i % 7)
+    let b = (0..n * n).map(|i| i % 5)
+    var c = (0..n * n).map(|_i| 0)
     for i in 0..n {
         for k in 0..n {
             let aik = a[i * n + k]
             if aik != 0 {
                 for j in 0..n {
-                    c[i * n + j] = c[i * n + j] + aik * b[k * n + j]
+                    c[i * n + j] += aik * b[k * n + j]
                 }
             }
         }
     }
-    var total = 0
-    for v in c {
-        total = total + v
-    }
-    print("{total}")
+    print("{c.sum()}")
 }

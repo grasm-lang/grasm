@@ -2877,6 +2877,27 @@ build links it, `grasm run` can only reach what is already loaded",
         name: &Ident,
         args: &[Expr],
     ) -> Result<Option<Value>, Flow> {
+        // A range answers the list combinators by becoming a list first. The
+        // elements are the same ones `for i in 0..n` walks, so there is one
+        // definition of what a range contains and not two.
+        if let Value::Range(a, b, incl) = &recv {
+            if matches!(
+                name.name.as_str(),
+                "to_list" | "map" | "filter" | "sum" | "len"
+            ) {
+                let (a, b, incl) = (*a, *b, *incl);
+                let items: Vec<Value> = if incl {
+                    (a..=b).map(Value::Int).collect()
+                } else {
+                    (a..b).map(Value::Int).collect()
+                };
+                let as_list = Value::List(Rc::new(items));
+                if name.name == "to_list" {
+                    return Ok(Some(as_list));
+                }
+                return self.builtin_method(as_list, name, args);
+            }
+        }
         let v = match (&recv, name.name.as_str()) {
             (Value::List(items), "len") => Value::Int(items.len() as i64),
             (Value::List(items), "get") => {

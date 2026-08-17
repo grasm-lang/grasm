@@ -5153,6 +5153,67 @@ impl FnCx<'_, '_> {
         Ok((v, VType::Str))
     }
 
+    /// `a..b` as the expression `{ var §: [i64] = []; for § in a..b { §.push(§) }; § }`.
+    ///
+    /// Synthesised rather than emitted by hand so that the loop, the list and
+    /// the push are the ones this backend already compiles and the differential
+    /// gate already covers. The names carry the receiver's span, so a
+    /// diagnostic inside points at the range the reader wrote.
+    fn range_to_list_expr(&self, range: &Expr, span: Span) -> Expr {
+        let acc = Ident {
+            name: "__range_list".to_string(),
+            span,
+        };
+        let item = Ident {
+            name: "__range_item".to_string(),
+            span,
+        };
+        let elem_ty = grasm_syntax::ast::TypeExpr::List(
+            Box::new(grasm_syntax::ast::TypeExpr::Name {
+                path: grasm_syntax::ast::Path {
+                    segments: vec![Ident {
+                        name: "i64".to_string(),
+                        span,
+                    }],
+                    span,
+                },
+                args: Vec::new(),
+                span,
+            }),
+            span,
+        );
+        Expr::Block(grasm_syntax::ast::Block {
+            stmts: vec![
+                Stmt::Let {
+                    mutable: true,
+                    name: acc.clone(),
+                    ty: Some(elem_ty),
+                    init: Expr::List(Vec::new(), span),
+                    span,
+                },
+                Stmt::For {
+                    var: item.clone(),
+                    iter: range.clone(),
+                    body: grasm_syntax::ast::Block {
+                        stmts: vec![Stmt::Expr(Expr::MethodCall {
+                            recv: Box::new(Expr::Ident(acc.clone())),
+                            name: Ident {
+                                name: "push".to_string(),
+                                span,
+                            },
+                            args: vec![Expr::Ident(item)],
+                            span,
+                        })],
+                        span,
+                    },
+                    span,
+                },
+                Stmt::Expr(Expr::Ident(acc)),
+            ],
+            span,
+        })
+    }
+
     fn eval_method(
         &mut self,
         recv: &Expr,
@@ -5160,6 +5221,33 @@ impl FnCx<'_, '_> {
         args: &[Expr],
         span: Span,
     ) -> CResult<Option<(Value, VType)>> {
+        // A combinator on a range: `(0..n).map(f)`. The backend has no range
+        // *value* (§11), and it does not need one — a range is the bounds of a
+        // loop, and the loop that builds a list from those bounds is a shape
+        // this backend already compiles. So the call is rewritten into it and
+        // the list methods take it from there.
+        //
+        // [G11] budgets Grasm at or below Python's token count and it was
+        // 1.41×; the pattern this replaces — `var xs: [i64] = []`, a `for`, a
+        // `push` and two braces — is where most of the difference was.
+        if matches!(recv, Expr::Range { .. })
+            && matches!(
+                name.name.as_str(),
+                "to_list" | "map" | "filter" | "sum" | "len"
+            )
+        {
+            let as_list = self.range_to_list_expr(recv, span);
+            if name.name == "to_list" {
+                return self.eval_expr(&as_list);
+            }
+            let call = Expr::MethodCall {
+                recv: Box::new(as_list),
+                name: name.clone(),
+                args: args.to_vec(),
+                span,
+            };
+            return self.eval_expr(&call);
+        }
         // Mutating map/list methods on a variable receiver.
         if matches!(name.name.as_str(), "set" | "delete" | "pop" | "sort" | "sort_by" | "remove") {
             if let Expr::Ident(id) = recv {

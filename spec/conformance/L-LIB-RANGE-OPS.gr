@@ -1,0 +1,30 @@
+//! tag: L-LIB-RANGE-OPS
+//! expect: output
+//! [0, 1, 2, 0, 1]
+//! 10
+//! [0, 2, 4, 6, 8]
+//! [0, 1, 2, 3]
+//! 7
+//! 165
+// A range answers the list combinators, producing a list of the same elements
+// `for i in a..b` walks.
+//
+// Building a list from a count needed `var xs: [i64] = []`, a `for`, a `push`
+// and two closing braces — four lines where `(0..n).map(f)` says the same
+// thing, in every program that builds a list from a count. [G11] budgets Grasm
+// at or below Python's token count; that pattern was most of the gap.
+//
+// There is one definition of what a range contains and not two: this engine
+// turns the range into the list and reuses the list method, and the compiled
+// backend rewrites the call into the loop it already compiles, since it has no
+// range *value* (§11). So the three engines agree by construction rather than
+// by two implementations happening to match.
+fn main() {
+    print("{(0..5).map(|i| i % 3)}")
+    print("{(1..=4).sum()}")
+    print("{(0..10).filter(|i| i % 2 == 0)}")
+    print("{(0..4).to_list()}")
+    print("{(0..7).len()}")
+    // Composes with the list surface, since what comes back *is* a list.
+    print("{(0..10).map(|i| i * i).filter(|n| n % 2 == 1).sum()}")
+}
