@@ -1,0 +1,124 @@
+// Unit converter — floating-point precision, constants, and argument parsing.
+//
+// The list says this tests "floating-point precision", and the honest way to
+// test that is to convert a value and convert it back, then say by how much it
+// moved. Printing `100 C = 212 F` proves the multiplier was typed correctly and
+// nothing else. A round trip proves the arithmetic is associative enough to
+// trust, and shows where it is not.
+
+type Unit = { name: str, to_base: f64, offset: f64 }
+
+/// Every unit in a family is defined as `base = value * to_base + offset`, so
+/// one pair of functions converts anything to anything within the family —
+/// including temperature, where the offset is what makes Fahrenheit awkward.
+fn to_base(u: Unit, v: f64) -> f64 {
+    v * u.to_base + u.offset
+}
+
+fn from_base(u: Unit, v: f64) -> f64 {
+    (v - u.offset) / u.to_base
+}
+
+fn convert(from: Unit, to: Unit, v: f64) -> f64 {
+    from_base(to, to_base(from, v))
+}
+
+fn lengths() -> Map[str, Unit] {
+    var m = map()
+    m.set("m", Unit{ name: "m", to_base: 1.0, offset: 0.0 })
+    m.set("km", Unit{ name: "km", to_base: 1000.0, offset: 0.0 })
+    m.set("cm", Unit{ name: "cm", to_base: 0.01, offset: 0.0 })
+    m.set("mi", Unit{ name: "mi", to_base: 1609.344, offset: 0.0 })
+    m.set("ft", Unit{ name: "ft", to_base: 0.3048, offset: 0.0 })
+    m.set("in", Unit{ name: "in", to_base: 0.0254, offset: 0.0 })
+    m
+}
+
+fn temps() -> Map[str, Unit] {
+    var m = map()
+    m.set("K", Unit{ name: "K", to_base: 1.0, offset: 0.0 })
+    m.set("C", Unit{ name: "C", to_base: 1.0, offset: 273.15 })
+    // 1 F is 5/9 K, offset so that 32 F is 273.15 K.
+    m.set("F", Unit{ name: "F", to_base: 0.5555555555555556, offset: 255.3722222222222 })
+    m
+}
+
+fn weights() -> Map[str, Unit] {
+    var m = map()
+    m.set("kg", Unit{ name: "kg", to_base: 1.0, offset: 0.0 })
+    m.set("g", Unit{ name: "g", to_base: 0.001, offset: 0.0 })
+    m.set("lb", Unit{ name: "lb", to_base: 0.45359237, offset: 0.0 })
+    m.set("oz", Unit{ name: "oz", to_base: 0.028349523125, offset: 0.0 })
+    m
+}
+
+fn show(table: Map[str, Unit], v: f64, from: str, to: str) {
+    match table.get(from) {
+        None -> print("unknown unit `{from}`")
+        Some(f) -> match table.get(to) {
+            None -> print("unknown unit `{to}`")
+            Some(t) -> print("{v} {from} = {convert(f, t, v).to_fixed(4)} {to}")
+        }
+    }
+}
+
+/// Convert there and back, and report the drift. This is the actual precision
+/// test: the answer should be the input, and where it is not, by how much.
+fn round_trip(table: Map[str, Unit], v: f64, from: str, to: str) {
+    match table.get(from) {
+        None -> print("unknown unit `{from}`")
+        Some(f) -> match table.get(to) {
+            None -> print("unknown unit `{to}`")
+            Some(t) -> {
+                let there = convert(f, t, v)
+                let back = convert(t, f, there)
+                let drift = back - v
+                let exact = drift == 0.0
+                print("{v} {from} -> {to} -> {from} = {back.to_fixed(10)}  exact: {exact}")
+            }
+        }
+    }
+}
+
+fn main() {
+    let L = lengths()
+    let T = temps()
+    let W = weights()
+
+    print("--- temperature ---")
+    show(T, 100.0, "C", "F")
+    show(T, 0.0, "C", "F")
+    show(T, -40.0, "C", "F")
+    show(T, 98.6, "F", "C")
+    show(T, 0.0, "K", "C")
+
+    print("--- length ---")
+    show(L, 1.0, "km", "mi")
+    show(L, 1.0, "mi", "km")
+    show(L, 12.0, "in", "ft")
+    show(L, 100.0, "cm", "m")
+
+    print("--- weight ---")
+    show(W, 1.0, "kg", "lb")
+    show(W, 16.0, "oz", "lb")
+    show(W, 2.20462262, "lb", "kg")
+
+    print("--- unknown units ---")
+    show(L, 1.0, "furlong", "m")
+    show(L, 1.0, "m", "furlong")
+
+    print("--- round trips (the precision test) ---")
+    round_trip(T, 100.0, "C", "F")
+    round_trip(T, 37.0, "C", "F")
+    round_trip(L, 1.0, "km", "mi")
+    round_trip(L, 26.2, "mi", "km")
+    round_trip(W, 1.0, "kg", "lb")
+    round_trip(L, 0.1, "m", "in")
+
+    // The classic. Not a bug in the converter — a fact about binary floats,
+    // and a language that hides it is lying.
+    print("--- what f64 is ---")
+    print("0.1 + 0.2 = {0.1 + 0.2}")
+    print("0.1 + 0.2 == 0.3: {0.1 + 0.2 == 0.3}")
+    print("to 10 places: {(0.1 + 0.2).to_fixed(10)}")
+}

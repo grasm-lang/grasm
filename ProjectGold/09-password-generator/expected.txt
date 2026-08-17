@@ -1,0 +1,18 @@
+--- same seed, same password ---
+full  seed 1: mK$*pG]jlZPch36{  (len 16, satisfies true)
+full  seed 1: mK$*pG]jlZPch36{  (len 16, satisfies true)
+--- different seeds ---
+full  seed 2: MRCM94)fbZKb6}qs  (len 16, satisfies true)
+full  seed 3: gD)hLXJ+b=Fa%M+8  (len 16, satisfies true)
+--- other policies ---
+alnum seed 1: Icxl7eB3VjRa  (len 12, satisfies true)
+pin   seed 1: 265952  (len 6, satisfies true)
+pin   seed 7: 003341  (len 6, satisfies true)
+len 1 seed 1: q  (len 1, satisfies true)
+--- refusals ---
+zero length: error: length must be positive, got 0
+negative: error: length must be positive, got -5
+no classes: error: no character classes were enabled
+--- how often a policy is actually met ---
+200 seeds, length 16, all four classes present: 172
+200 seeds, length 4,  all four classes present: 8

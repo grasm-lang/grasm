@@ -1,0 +1,68 @@
+// Guess the Number — pseudo-random generation, an input loop, and comparison.
+//
+// There is no `rand` in the library, which turns out to be the more interesting
+// version of this exercise: the generator has to be written in Grasm, and a
+// linear congruential generator is exactly the shape that depends on what the
+// language does when an integer runs off the end.
+//
+// [E-ARITH-INT] says `+ - *` on `i64` wrap on overflow, two's complement. So
+// the textbook constants work as written, and this program is also a test of
+// that clause: an LCG whose products overflow on nearly every step has to
+// produce the *same sequence* under the interpreter, the bundle and the native
+// build, or one of the three is not wrapping the way the specification says.
+
+type Rng = { seed: i64 }
+
+/// Numerical Recipes' 64-bit LCG. Both constants are chosen so the product
+/// overflows and is truncated — which is the point: `[E-ARITH-INT]`.
+fn next(inout r: Rng) -> i64 {
+    r.seed = r.seed * 6364136223846793005 + 1442695040888963407
+    // The low bits of an LCG are the worst ones, so the top 31 are taken. No
+    // shift operator exists, so this divides — which is the same thing for a
+    // non-negative value, and this one is made non-negative first.
+    let positive = if r.seed < 0 { 0 - (r.seed + 1) } else { r.seed }
+    positive / 4294967296
+}
+
+fn between(inout r: Rng, lo: i64, hi: i64) -> i64 {
+    lo + (next(r) % (hi - lo + 1))
+}
+
+fn main() {
+    // Fixed seed, because a test whose output changes per run cannot be
+    // compared across three engines. `now_millis()` is what a real game uses
+    // and is exercised by project 15.
+    var rng = Rng{ seed: 42 }
+
+    let secret = between(rng, 1, 100)
+    print("I am thinking of a number between 1 and 100.")
+
+    var guesses = 0
+    var found = false
+    var going = true
+    while going {
+        let line = input()
+        if line == "" {
+            going = false
+        } else {
+            match line.trim().parse_int() {
+                None -> print("`{line.trim()}` is not a number.")
+                Some(g) -> {
+                    guesses = guesses + 1
+                    if g < secret {
+                        print("{g} is too low.")
+                    } else if g > secret {
+                        print("{g} is too high.")
+                    } else {
+                        print("{g} is right, in {guesses} guesses.")
+                        found = true
+                        going = false
+                    }
+                }
+            }
+        }
+    }
+    if not found {
+        print("The number was {secret}.")
+    }
+}

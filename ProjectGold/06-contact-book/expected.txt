@@ -1,0 +1,19 @@
+added ada: true
+added bob: true
+added cyd: true
+added ada twice: false
+count: 3
+read Ada: Ada <ada@example.com> 1 tags [work, math]
+read Zoe: not found
+update Bob: true
+update Zoe: false
+read Bob: Bob <robert@example.com> 2 tags [work]
+tag work: [Ada, Bob]
+tag family: [Cyd]
+tag none: []
+search 'example': [Ada, Bob]
+search 'AD': [Ada]
+remove Cyd: true
+remove Cyd again: false
+count: 2
+Ada after mutating a copy: Ada <ada@example.com> 1 tags [work, math]

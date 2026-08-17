@@ -1,0 +1,18 @@
+empty: "" -> ""  strict true  normalized true
+one: "x" -> "x"  strict true  normalized true
+two same: "aa" -> "aa"  strict true  normalized true
+two different: "ab" -> "ba"  strict false  normalized false
+odd: "racecar" -> "racecar"  strict true  normalized true
+even: "abba" -> "abba"  strict true  normalized true
+sentence: "A man, a plan, a canal: Panama" -> "amanaP :lanac a ,nalp a ,nam A"  strict false  normalized true
+not one: "hello" -> "olleh"  strict false  normalized false
+digits: "12321" -> "12321"  strict true  normalized true
+mixed: "Was it a car or a cat I saw?" -> "?was I tac a ro rac a ti saW"  strict false  normalized true
+accented: "añb" -> "bña"  strict false  normalized false
+greek: "αβγ" -> "γβα"  strict false  normalized false
+emoji: "ab🙂ba" -> "ab🙂ba"  strict true  normalized true
+emoji palindrome: "🙂ab🙂ba🙂" -> "🙂ab🙂ba🙂"  strict true  normalized true
+"abc": len 3  chars 3
+"añb": len 3  chars 3
+"αβγ": len 3  chars 3
+"🙂": len 1  chars 1

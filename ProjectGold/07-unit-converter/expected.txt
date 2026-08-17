@@ -1,0 +1,29 @@
+--- temperature ---
+100.0 C = 212.0000 F
+0.0 C = 32.0000 F
+-40.0 C = -40.0000 F
+98.6 F = 37.0000 C
+0.0 K = -273.1500 C
+--- length ---
+1.0 km = 0.6214 mi
+1.0 mi = 1.6093 km
+12.0 in = 1.0000 ft
+100.0 cm = 1.0000 m
+--- weight ---
+1.0 kg = 2.2046 lb
+16.0 oz = 1.0000 lb
+2.20462262 lb = 1.0000 kg
+--- unknown units ---
+unknown unit `furlong`
+unknown unit `furlong`
+--- round trips (the precision test) ---
+100.0 C -> F -> C = 100.0000000000  exact: true
+37.0 C -> F -> C = 37.0000000000  exact: true
+1.0 km -> mi -> km = 1.0000000000  exact: true
+26.2 mi -> km -> mi = 26.2000000000  exact: true
+1.0 kg -> lb -> kg = 1.0000000000  exact: true
+0.1 m -> in -> m = 0.1000000000  exact: true
+--- what f64 is ---
+0.1 + 0.2 = 0.30000000000000004
+0.1 + 0.2 == 0.3: false
+to 10 places: 0.3000000000

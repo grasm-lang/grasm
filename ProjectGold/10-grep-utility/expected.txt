@@ -1,0 +1,31 @@
+search `the`: 3 hit(s)
+  1:1: the quick brown fox
+  2:12: jumps over the lazy dog
+  4:13: a line with the word the twice
+search `THE`: 1 hit(s)
+  3:1: THE QUICK BROWN FOX
+search `fox`: 1 hit(s)
+  1:17: the quick brown fox
+search `missing`: 0 hit(s)
+search `o`: 3 hit(s)
+  1:13: the quick brown fox
+  2:7: jumps over the lazy dog
+  4:18: a line with the word the twice
+--- every occurrence on one line ---
+`the` in 'a line with the word the twice': [12, 21]
+`aa` in 'aaaa': [0, 1, 2]
+`ab` in 'ababab': [0, 2, 4]
+--- the cases that break naive matchers ---
+`aaab` in `aaaaaaaaab`: naive 6 kmp 6
+`aaac` in `aaaaaaaaab`: naive -1 kmp -1
+--- boundaries ---
+empty needle in `abc`:   naive 0 kmp 0
+needle longer than hay:  naive -1 kmp -1
+needle equals hay:       naive 0 kmp 0
+empty haystack:          naive -1 kmp -1
+both empty:              naive 0 kmp 0
+match at the very end:   naive 3 kmp 3
+--- multi-byte, where a byte-wise grep reports the wrong column ---
+`café` in `naïve café`: 6
+`ve` in `naïve café`:   3
+library index_of:  Some(6)

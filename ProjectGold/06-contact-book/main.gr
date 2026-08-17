@@ -1,0 +1,144 @@
+// Static contact book — structs, a map keyed by string, and CRUD.
+//
+// The interesting part is not create-read-update-delete; it is that a contact
+// is a *value*. Grasm has value semantics, so handing a `Contact` to a function
+// hands it a copy, and a function that means to modify one has to say `inout`.
+// This program checks that both directions actually behave that way, because a
+// language that quietly shares a struct will pass every test here except the
+// one at the bottom.
+
+type Contact = {
+    name: str,
+    email: str,
+    phone: str,
+    tags: [str],
+}
+
+type Book = { by_name: Map[str, Contact] }
+
+fn empty_book() -> Book {
+    Book{ by_name: map() }
+}
+
+fn add(inout b: Book, c: Contact) -> bool {
+    if b.by_name.has(c.name) {
+        return false
+    }
+    b.by_name.set(c.name, c)
+    true
+}
+
+fn find(b: Book, name: str) -> Option[Contact] {
+    b.by_name.get(name)
+}
+
+fn update_email(inout b: Book, name: str, email: str) -> bool {
+    match b.by_name.get(name) {
+        None -> false
+        Some(c) -> {
+            // A copy came back from the map; changing it changes the copy, so
+            // it has to be put back. That is the value semantics being tested.
+            var updated = c
+            updated.email = email
+            b.by_name.set(name, updated)
+            true
+        }
+    }
+}
+
+fn remove(inout b: Book, name: str) -> bool {
+    if b.by_name.has(name) {
+        b.by_name.delete(name)
+        return true
+    }
+    false
+}
+
+/// Everyone carrying a tag, in insertion-independent order.
+fn with_tag(b: Book, tag: str) -> [str] {
+    var out: [str] = []
+    for name in b.by_name.keys() {
+        match b.by_name.get(name) {
+            None -> {}
+            Some(c) -> {
+                if c.tags.contains(tag) {
+                    out.push(c.name)
+                }
+            }
+        }
+    }
+    // `sort` orders in place and gives back `()`, so it is a statement and the
+    // list is the value.
+    out.sort()
+    out
+}
+
+fn search(b: Book, needle: str) -> [str] {
+    var out: [str] = []
+    for name in b.by_name.keys() {
+        match b.by_name.get(name) {
+            None -> {}
+            Some(c) -> {
+                // The operator ends the line rather than starting the next
+                // one: a newline finishes a statement unless the line ends in
+                // an operator. Written the other way round this does not parse
+                // (FINDINGS.md, F1).
+                if c.name.to_lower().contains(needle.to_lower()) or
+                    c.email.to_lower().contains(needle.to_lower()) {
+                    out.push(c.name)
+                }
+            }
+        }
+    }
+    // `sort` orders in place and gives back `()`, so it is a statement and the
+    // list is the value.
+    out.sort()
+    out
+}
+
+fn show(label: str, o: Option[Contact]) {
+    match o {
+        None -> print("{label}: not found")
+        Some(c) -> print("{label}: {c.name} <{c.email}> {c.phone} tags {c.tags}")
+    }
+}
+
+fn main() {
+    var book = empty_book()
+
+    print("added ada: {add(book, Contact{ name: "Ada", email: "ada@example.com", phone: "1", tags: ["work", "math"] })}")
+    print("added bob: {add(book, Contact{ name: "Bob", email: "bob@example.com", phone: "2", tags: ["work"] })}")
+    print("added cyd: {add(book, Contact{ name: "Cyd", email: "cyd@elsewhere.org", phone: "3", tags: ["family"] })}")
+    print("added ada twice: {add(book, Contact{ name: "Ada", email: "other@example.com", phone: "9", tags: [] })}")
+    print("count: {book.by_name.len()}")
+
+    show("read Ada", find(book, "Ada"))
+    show("read Zoe", find(book, "Zoe"))
+
+    print("update Bob: {update_email(book, "Bob", "robert@example.com")}")
+    print("update Zoe: {update_email(book, "Zoe", "nobody@example.com")}")
+    show("read Bob", find(book, "Bob"))
+
+    print("tag work: {with_tag(book, "work")}")
+    print("tag family: {with_tag(book, "family")}")
+    print("tag none: {with_tag(book, "sports")}")
+
+    print("search 'example': {search(book, "example")}")
+    print("search 'AD': {search(book, "AD")}")
+
+    print("remove Cyd: {remove(book, "Cyd")}")
+    print("remove Cyd again: {remove(book, "Cyd")}")
+    print("count: {book.by_name.len()}")
+
+    // The value-semantics check. `taken` is a copy; mutating it must not reach
+    // the book. A language that shares the struct prints the mutated address.
+    match find(book, "Ada") {
+        None -> print("Ada vanished")
+        Some(c) -> {
+            var taken = c
+            taken.email = "MUTATED"
+            taken.tags.push("MUTATED")
+            show("Ada after mutating a copy", find(book, "Ada"))
+        }
+    }
+}

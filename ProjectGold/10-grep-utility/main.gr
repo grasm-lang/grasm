@@ -1,0 +1,180 @@
+// A grep — substring search, line indexing, and the boundary cases that make
+// naive implementations wrong.
+//
+// The list says "raw string searching algorithms and sequential index parsing".
+// So this implements the search itself rather than calling `.contains()`: a
+// hand-written naive matcher, and Knuth-Morris-Pratt beside it, checked against
+// each other and against the library on every input. Three implementations that
+// must agree is a much better test than one that must work.
+
+/// Naive search: try every starting offset. Returns the first index, or -1.
+fn find_naive(haystack: [str], needle: [str]) -> i64 {
+    let n = haystack.len()
+    let m = needle.len()
+    if m == 0 {
+        return 0
+    }
+    if m > n {
+        return -1
+    }
+    for start in 0..(n - m + 1) {
+        var k = 0
+        var same = true
+        while k < m and same {
+            if haystack[start + k] != needle[k] {
+                same = false
+            }
+            k = k + 1
+        }
+        if same {
+            return start
+        }
+    }
+    -1
+}
+
+/// The KMP failure table: for each prefix, the length of the longest proper
+/// prefix that is also a suffix.
+fn failure_table(needle: [str]) -> [i64] {
+    var table: [i64] = []
+    for _i in 0..needle.len() {
+        table.push(0)
+    }
+    var len = 0
+    var i = 1
+    while i < needle.len() {
+        if needle[i] == needle[len] {
+            len = len + 1
+            table[i] = len
+            i = i + 1
+        } else if len > 0 {
+            len = table[len - 1]
+        } else {
+            table[i] = 0
+            i = i + 1
+        }
+    }
+    table
+}
+
+fn find_kmp(haystack: [str], needle: [str]) -> i64 {
+    let n = haystack.len()
+    let m = needle.len()
+    if m == 0 {
+        return 0
+    }
+    if m > n {
+        return -1
+    }
+    let table = failure_table(needle)
+    var i = 0
+    var j = 0
+    while i < n {
+        if haystack[i] == needle[j] {
+            i = i + 1
+            j = j + 1
+            if j == m {
+                return i - m
+            }
+        } else if j > 0 {
+            j = table[j - 1]
+        } else {
+            i = i + 1
+        }
+    }
+    -1
+}
+
+type Hit = { line: i64, col: i64, text: str }
+
+fn grep(text: str, needle: str) -> [Hit] {
+    var hits: [Hit] = []
+    let pat = needle.chars()
+    var line_no = 0
+    for line in text.lines() {
+        line_no = line_no + 1
+        let hay = line.chars()
+        let a = find_naive(hay, pat)
+        let b = find_kmp(hay, pat)
+        // Every search runs both ways on every line. A disagreement is a bug in
+        // one of them and is reported rather than hidden.
+        if a != b {
+            print("!! naive {a} and kmp {b} disagree on line {line_no}")
+        }
+        if a >= 0 {
+            hits.push(Hit{ line: line_no, col: a + 1, text: line })
+        }
+    }
+    hits
+}
+
+/// Every occurrence on one line, not just the first — which is where an
+/// off-by-one in the restart position shows up.
+fn find_all(line: str, needle: str) -> [i64] {
+    var out: [i64] = []
+    let hay = line.chars()
+    let pat = needle.chars()
+    if pat.len() == 0 {
+        return out
+    }
+    var from = 0
+    var going = true
+    while going {
+        var rest: [str] = []
+        for i in from..hay.len() {
+            rest.push(hay[i])
+        }
+        let at = find_kmp(rest, pat)
+        if at < 0 {
+            going = false
+        } else {
+            out.push(from + at)
+            from = from + at + 1
+        }
+    }
+    out
+}
+
+fn report(label: str, text: str, needle: str) {
+    let hits = grep(text, needle)
+    print("{label} `{needle}`: {hits.len()} hit(s)")
+    for h in hits {
+        print("  {h.line}:{h.col}: {h.text}")
+    }
+}
+
+fn main() {
+    // One line with `\n` escapes: a literal cannot span lines (FINDINGS.md, F5).
+    let doc = "the quick brown fox\njumps over the lazy dog\nTHE QUICK BROWN FOX\na line with the word the twice\n"
+
+    report("search", doc, "the")
+    report("search", doc, "THE")
+    report("search", doc, "fox")
+    report("search", doc, "missing")
+    report("search", doc, "o")
+
+    print("--- every occurrence on one line ---")
+    print("`the` in 'a line with the word the twice': {find_all("a line with the word the twice", "the")}")
+    print("`aa` in 'aaaa': {find_all("aaaa", "aa")}")
+    print("`ab` in 'ababab': {find_all("ababab", "ab")}")
+
+    print("--- the cases that break naive matchers ---")
+    // KMP exists for this shape: a pattern that nearly matches, repeatedly.
+    let hard = "aaaaaaaaab"
+    print("`aaab` in `{hard}`: naive {find_naive(hard.chars(), "aaab".chars())} kmp {find_kmp(hard.chars(), "aaab".chars())}")
+    print("`aaac` in `{hard}`: naive {find_naive(hard.chars(), "aaac".chars())} kmp {find_kmp(hard.chars(), "aaac".chars())}")
+
+    print("--- boundaries ---")
+    print("empty needle in `abc`:   naive {find_naive("abc".chars(), "".chars())} kmp {find_kmp("abc".chars(), "".chars())}")
+    print("needle longer than hay:  naive {find_naive("ab".chars(), "abc".chars())} kmp {find_kmp("ab".chars(), "abc".chars())}")
+    print("needle equals hay:       naive {find_naive("abc".chars(), "abc".chars())} kmp {find_kmp("abc".chars(), "abc".chars())}")
+    print("empty haystack:          naive {find_naive("".chars(), "a".chars())} kmp {find_kmp("".chars(), "a".chars())}")
+    print("both empty:              naive {find_naive("".chars(), "".chars())} kmp {find_kmp("".chars(), "".chars())}")
+    print("match at the very end:   naive {find_naive("xyzabc".chars(), "abc".chars())} kmp {find_kmp("xyzabc".chars(), "abc".chars())}")
+
+    print("--- multi-byte, where a byte-wise grep reports the wrong column ---")
+    let uni = "naïve café"
+    print("`café` in `{uni}`: {find_kmp(uni.chars(), "café".chars())}")
+    print("`ve` in `{uni}`:   {find_kmp(uni.chars(), "ve".chars())}")
+    print("library index_of:  {uni.index_of("café")}")
+}

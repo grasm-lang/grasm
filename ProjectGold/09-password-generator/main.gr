@@ -1,0 +1,149 @@
+// Password generator — character sets, seeded lookups, string building.
+//
+// The list says "seed-based random lookups", and the seed is what makes this
+// testable: the same seed must give the same password under all three engines,
+// which is a stronger claim than "it produced something random-looking". If the
+// interpreter and the native build disagree here, the arithmetic in the
+// generator differs between them, and that would not show up in a program that
+// only prints one password.
+//
+// The generator is the same wrapping LCG as 02, for the same reason
+// ([E-ARITH-INT]).
+
+type Rng = { seed: i64 }
+
+fn next(inout r: Rng) -> i64 {
+    r.seed = r.seed * 6364136223846793005 + 1442695040888963407
+    if r.seed < 0 { 0 - (r.seed + 1) } else { r.seed }
+}
+
+fn pick(inout r: Rng, from: [str]) -> str {
+    from[next(r) % from.len()]
+}
+
+type Policy = {
+    length: i64,
+    lower: bool,
+    upper: bool,
+    digits: bool,
+    symbols: bool,
+}
+
+fn charset(p: Policy) -> [str] {
+    var out: [str] = []
+    if p.lower {
+        for c in "abcdefghijklmnopqrstuvwxyz".chars() { out.push(c) }
+    }
+    if p.upper {
+        for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ".chars() { out.push(c) }
+    }
+    if p.digits {
+        for c in "0123456789".chars() { out.push(c) }
+    }
+    if p.symbols {
+        // `{` opens an interpolation even in an ordinary string, so a literal
+        // brace is `\{`. The diagnostic says so exactly, which is the reason
+        // this is a note and not a finding.
+        for c in "!@#$%^&*()-_=+[]\{\}".chars() { out.push(c) }
+    }
+    out
+}
+
+type Bad = { why: str }
+
+fn generate(inout r: Rng, p: Policy) -> str ! Bad {
+    if p.length <= 0 {
+        fail(Bad{ why: "length must be positive, got {p.length}" })
+    }
+    let pool = charset(p)
+    if pool.len() == 0 {
+        fail(Bad{ why: "no character classes were enabled" })
+    }
+    var out = ""
+    for _i in 0..p.length {
+        out = out + pick(r, pool)
+    }
+    out
+}
+
+/// Whether the result actually satisfies the policy it was generated from. A
+/// generator that samples uniformly can produce a password with no digit in it,
+/// so this is the check that says whether that happened.
+fn satisfies(pw: str, p: Policy) -> bool {
+    var has_lower = false
+    var has_upper = false
+    var has_digit = false
+    var has_symbol = false
+    for c in pw.chars() {
+        let code = c.code_at(0)
+        if code >= 97 and code <= 122 { has_lower = true }
+        else if code >= 65 and code <= 90 { has_upper = true }
+        else if code >= 48 and code <= 57 { has_digit = true }
+        else { has_symbol = true }
+    }
+    // Operators end the lines rather than starting them (FINDINGS.md, F1).
+    (not p.lower or has_lower) and
+        (not p.upper or has_upper) and
+        (not p.digits or has_digit) and
+        (not p.symbols or has_symbol)
+}
+
+fn show(label: str, seed: i64, p: Policy) {
+    var r = Rng{ seed: seed }
+    match generate(r, p) {
+        Ok(pw) -> print("{label}: {pw}  (len {pw.len()}, satisfies {satisfies(pw, p)})")
+        Err(e) -> print("{label}: error: {e.why}")
+    }
+}
+
+fn main() {
+    let full = Policy{ length: 16, lower: true, upper: true, digits: true, symbols: true }
+    let alnum = Policy{ length: 12, lower: true, upper: true, digits: true, symbols: false }
+    let pin = Policy{ length: 6, lower: false, upper: false, digits: true, symbols: false }
+
+    print("--- same seed, same password ---")
+    show("full  seed 1", 1, full)
+    show("full  seed 1", 1, full)
+    print("--- different seeds ---")
+    show("full  seed 2", 2, full)
+    show("full  seed 3", 3, full)
+    print("--- other policies ---")
+    show("alnum seed 1", 1, alnum)
+    show("pin   seed 1", 1, pin)
+    show("pin   seed 7", 7, pin)
+    show("len 1 seed 1", 1, Policy{ length: 1, lower: true, upper: false, digits: false, symbols: false })
+
+    print("--- refusals ---")
+    show("zero length", 1, Policy{ length: 0, lower: true, upper: true, digits: true, symbols: true })
+    show("negative", 1, Policy{ length: -5, lower: true, upper: true, digits: true, symbols: true })
+    show("no classes", 1, Policy{ length: 8, lower: false, upper: false, digits: false, symbols: false })
+
+    print("--- how often a policy is actually met ---")
+    // Uniform sampling does not guarantee one of each class. Over 200 seeds,
+    // this counts how often a 16-character full-policy password happens to
+    // contain all four — the number a real generator would use to decide
+    // whether to reject and resample.
+    var met = 0
+    for seed in 1..201 {
+        var r = Rng{ seed: seed }
+        match generate(r, full) {
+            Ok(pw) -> {
+                if satisfies(pw, full) { met = met + 1 }
+            }
+            Err(e) -> {}
+        }
+    }
+    print("200 seeds, length 16, all four classes present: {met}")
+
+    var met_short = 0
+    for seed in 1..201 {
+        var r = Rng{ seed: seed }
+        match generate(r, Policy{ length: 4, lower: true, upper: true, digits: true, symbols: true }) {
+            Ok(pw) -> {
+                if satisfies(pw, full) { met_short = met_short + 1 }
+            }
+            Err(e) -> {}
+        }
+    }
+    print("200 seeds, length 4,  all four classes present: {met_short}")
+}

@@ -1,0 +1,19 @@
+--- the first twenty, three ways ---
+all three agree for 0..19: true
+0 1 1 2 3 5 8 13 21 34 55 89 144 233 377
+--- the large ones ---
+F(50)  = 12586269025
+F(90)  = 2880067194370816120
+F(92)  = 7540113804746346429
+--- where i64 runs out ---
+first term that wrapped: F(93)
+F(92) fits:   7540113804746346429
+F(93) wraps:  -6246583658587674878
+i64 max:      9223372036854775807
+--- memoization is the same function, faster ---
+F(80) memoized  = 23416728348467685
+F(80) iterative = 23416728348467685
+memo table holds 79 entries
+--- recursion depth ---
+depth(1000)   = 1000
+depth(50000)  = 50000

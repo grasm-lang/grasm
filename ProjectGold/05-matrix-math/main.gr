@@ -1,0 +1,152 @@
+// Matrix math — nested lists, index bounds, and shape errors as values.
+//
+// Two-dimensional data in Grasm is `[[f64]]`, a list of lists. That is the
+// thing under test: whether nesting allocates correctly, whether indexing two
+// levels deep is checked, and whether a shape mismatch can be reported instead
+// of read off the end of a row.
+//
+// Every operation here returns `T ! Shape` rather than panicking on a bad
+// shape, because "add a 2x3 to a 3x2" is a caller's mistake and not a bug in
+// the matrix code — and a language with typed error unions should make that
+// distinction cost nothing.
+
+type Shape = { why: str }
+
+fn rows(m: [[f64]]) -> i64 {
+    m.len()
+}
+
+fn cols(m: [[f64]]) -> i64 {
+    if m.len() == 0 { 0 } else { m[0].len() }
+}
+
+/// Every row the same length. A ragged list is a legal Grasm value and is not a
+/// legal matrix, so it is checked once here rather than assumed everywhere.
+fn rectangular(m: [[f64]]) -> bool {
+    if m.len() == 0 {
+        return true
+    }
+    let w = m[0].len()
+    for row in m {
+        if row.len() != w {
+            return false
+        }
+    }
+    true
+}
+
+fn add(a: [[f64]], b: [[f64]]) -> [[f64]] ! Shape {
+    if not rectangular(a) or not rectangular(b) {
+        fail(Shape{ why: "a ragged list is not a matrix" })
+    }
+    if rows(a) != rows(b) or cols(a) != cols(b) {
+        fail(Shape{ why: "cannot add {rows(a)}x{cols(a)} to {rows(b)}x{cols(b)}" })
+    }
+    var out: [[f64]] = []
+    for i in 0..rows(a) {
+        var row: [f64] = []
+        for j in 0..cols(a) {
+            row.push(a[i][j] + b[i][j])
+        }
+        out.push(row)
+    }
+    out
+}
+
+fn multiply(a: [[f64]], b: [[f64]]) -> [[f64]] ! Shape {
+    if not rectangular(a) or not rectangular(b) {
+        fail(Shape{ why: "a ragged list is not a matrix" })
+    }
+    if cols(a) != rows(b) {
+        fail(Shape{ why: "cannot multiply {rows(a)}x{cols(a)} by {rows(b)}x{cols(b)}" })
+    }
+    var out: [[f64]] = []
+    for i in 0..rows(a) {
+        var row: [f64] = []
+        for j in 0..cols(b) {
+            var acc = 0.0
+            for k in 0..cols(a) {
+                acc = acc + a[i][k] * b[k][j]
+            }
+            row.push(acc)
+        }
+        out.push(row)
+    }
+    out
+}
+
+fn transpose(m: [[f64]]) -> [[f64]] ! Shape {
+    if not rectangular(m) {
+        fail(Shape{ why: "a ragged list is not a matrix" })
+    }
+    var out: [[f64]] = []
+    for j in 0..cols(m) {
+        var row: [f64] = []
+        for i in 0..rows(m) {
+            row.push(m[i][j])
+        }
+        out.push(row)
+    }
+    out
+}
+
+fn identity(n: i64) -> [[f64]] {
+    var out: [[f64]] = []
+    for i in 0..n {
+        var row: [f64] = []
+        for j in 0..n {
+            row.push(if i == j { 1.0 } else { 0.0 })
+        }
+        out.push(row)
+    }
+    out
+}
+
+fn show(label: str, m: [[f64]]) {
+    print("{label} ({rows(m)}x{cols(m)}):")
+    for row in m {
+        var line = ""
+        for v in row {
+            line = line + "{v.to_fixed(1)} "
+        }
+        print("  {line.trim()}")
+    }
+}
+
+fn show_result(label: str, r: [[f64]] ! Shape) {
+    match r {
+        Ok(m) -> show(label, m)
+        Err(e) -> print("{label}: error: {e.why}")
+    }
+}
+
+fn main() {
+    let a = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+    let b = [[10.0, 20.0, 30.0], [40.0, 50.0, 60.0]]
+    let c = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]
+
+    show("A", a)
+    show("B", b)
+    show("C", c)
+
+    show_result("A + B", add(a, b))
+    show_result("A * C", multiply(a, c))
+    show_result("C * A", multiply(c, a))
+    show_result("A transposed", transpose(a))
+
+    // Identity is the property that catches a transposed loop index: A * I
+    // must be A, and a swapped i/j gives the transpose instead.
+    show_result("A * I(3)", multiply(a, identity(3)))
+    show_result("I(2) * A", multiply(identity(2), a))
+
+    // Shape errors, as values.
+    show_result("A + C", add(a, c))
+    show_result("A * B", multiply(a, b))
+    show_result("ragged", add([[1.0, 2.0], [3.0]], [[1.0, 2.0], [3.0, 4.0]]))
+
+    // Degenerate shapes: an empty matrix is rectangular and must not divide by
+    // zero anywhere.
+    show_result("empty + empty", add([], []))
+    show("I(0)", identity(0))
+    show("I(1)", identity(1))
+}

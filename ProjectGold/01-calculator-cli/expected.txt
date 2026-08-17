@@ -1,0 +1,17 @@
+(3 + 5) * 2 = 16.0
+3 + 5 * 2 = 13.0
+2 ^ 3 ^ 2 = 512.0
+100 / 10 / 2 = 5.0
+1 - 2 - 3 = -4.0
+-4 + 10 = 6.0
+2 * -3 = -6.0
+10 % 3 = 1.0
+(1 + 2) * (3 + 4) = 21.0
+((((5)))) = 5.0
+3.5 * 2 = 7.0
+2 ^ -2 = 0.25
+1 / 0 -> error: division by zero (at 0)
+(1 + 2 -> error: missing `)` (at 4)
+1 + -> error: expected a number (at 2)
+ -> error: empty expression (at 0)
+4 $ 2 -> error: unexpected character `$` (at 2)

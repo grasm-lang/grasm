@@ -1,0 +1,9 @@
+I am thinking of a number between 1 and 100.
+50 is too high.
+25 is too low.
+`nope` is not a number.
+37 is too high.
+31 is too high.
+28 is too high.
+26 is too low.
+27 is right, in 7 guesses.

@@ -1,0 +1,279 @@
+// Calculator CLI — operator precedence, an explicit AST, and evaluation.
+//
+// The point of building an AST rather than evaluating while parsing is that it
+// separates the two things being tested: whether the grammar binds `*` tighter
+// than `+`, and whether the evaluator walks a tree correctly. A one-pass
+// evaluator can get the right answer with the wrong precedence and nobody finds
+// out until the expressions get longer.
+
+type Tok =
+    | TNum(v: f64)
+    | TPlus
+    | TMinus
+    | TStar
+    | TSlash
+    | TPercent
+    | TCaret
+    | TLParen
+    | TRParen
+
+// The tree. Recursive sum types need `ref` here: a variant that holds another
+// node of its own type has no fixed size, and `ref T` is the copyable
+// generational handle that gives it one ([T-REF-GENERATIONAL]).
+type Node =
+    | Num(v: f64)
+    | Neg(e: ref Node)
+    | Bin(op: str, l: ref Node, r: ref Node)
+
+type Fault = { why: str, at: i64 }
+
+fn digit_at(s: str, i: i64) -> bool {
+    let c = s.code_at(i)
+    c >= 48 and c <= 57
+}
+
+fn lex(src: str) -> [Tok] ! Fault {
+    var out: [Tok] = []
+    var i = 0
+    let n = src.len()
+    while i < n {
+        let c = src.code_at(i)
+        if c == 32 or c == 9 {
+            i = i + 1
+        } else if digit_at(src, i) or c == 46 {
+            var j = i
+            var seen_dot = false
+            while j < n and (digit_at(src, j) or (src.code_at(j) == 46 and not seen_dot)) {
+                if src.code_at(j) == 46 {
+                    seen_dot = true
+                }
+                j = j + 1
+            }
+            let text = src.substr(i, j - i)
+            match text.parse_float() {
+                Some(v) -> out.push(TNum(v))
+                None -> fail(Fault{ why: "not a number: {text}", at: i })
+            }
+            i = j
+        } else {
+            let one = src.substr(i, 1)
+            if one == "+" { out.push(TPlus) }
+            else if one == "-" { out.push(TMinus) }
+            else if one == "*" { out.push(TStar) }
+            else if one == "/" { out.push(TSlash) }
+            else if one == "%" { out.push(TPercent) }
+            else if one == "^" { out.push(TCaret) }
+            else if one == "(" { out.push(TLParen) }
+            else if one == ")" { out.push(TRParen) }
+            else { fail(Fault{ why: "unexpected character `{one}`", at: i }) }
+            i = i + 1
+        }
+    }
+    out
+}
+
+fn peek(ts: [Tok], i: i64) -> Tok {
+    if i < ts.len() { ts[i] } else { TRParen }
+}
+
+fn at_end(ts: [Tok], i: i64) -> bool {
+    i >= ts.len()
+}
+
+// primary := number | '(' sum ')' | '-' primary
+fn parse_primary(ts: [Tok], inout i: i64) -> ref Node ! Fault {
+    if at_end(ts, i) {
+        fail(Fault{ why: "expected a number", at: i })
+    }
+    match ts[i] {
+        TNum(v) -> {
+            i = i + 1
+            ref(Num(v))
+        }
+        TMinus -> {
+            i = i + 1
+            let inner = try parse_primary(ts, i)
+            ref(Neg(inner))
+        }
+        TLParen -> {
+            i = i + 1
+            let inner = try parse_sum(ts, i)
+            if at_end(ts, i) {
+                fail(Fault{ why: "missing `)`", at: i })
+            }
+            match ts[i] {
+                TRParen -> { i = i + 1 }
+                _ -> fail(Fault{ why: "missing `)`", at: i })
+            }
+            inner
+        }
+        _ -> fail(Fault{ why: "expected a number", at: i })
+    }
+}
+
+// power := primary ('^' power)?   — right-associative, unlike the rest.
+fn parse_power(ts: [Tok], inout i: i64) -> ref Node ! Fault {
+    let base = try parse_primary(ts, i)
+    if at_end(ts, i) {
+        return base
+    }
+    match ts[i] {
+        TCaret -> {
+            i = i + 1
+            let exp = try parse_power(ts, i)
+            ref(Bin("^", base, exp))
+        }
+        _ -> base
+    }
+}
+
+// product := power (('*' | '/' | '%') power)*
+fn parse_product(ts: [Tok], inout i: i64) -> ref Node ! Fault {
+    var left = try parse_power(ts, i)
+    var going = true
+    while going {
+        if at_end(ts, i) {
+            going = false
+        } else {
+            match ts[i] {
+                TStar -> {
+                    i = i + 1
+                    let r = try parse_power(ts, i)
+                    left = ref(Bin("*", left, r))
+                }
+                TSlash -> {
+                    i = i + 1
+                    let r = try parse_power(ts, i)
+                    left = ref(Bin("/", left, r))
+                }
+                TPercent -> {
+                    i = i + 1
+                    let r = try parse_power(ts, i)
+                    left = ref(Bin("%", left, r))
+                }
+                _ -> going = false
+            }
+        }
+    }
+    left
+}
+
+// sum := product (('+' | '-') product)*
+fn parse_sum(ts: [Tok], inout i: i64) -> ref Node ! Fault {
+    var left = try parse_product(ts, i)
+    var going = true
+    while going {
+        if at_end(ts, i) {
+            going = false
+        } else {
+            match ts[i] {
+                TPlus -> {
+                    i = i + 1
+                    let r = try parse_product(ts, i)
+                    left = ref(Bin("+", left, r))
+                }
+                TMinus -> {
+                    i = i + 1
+                    let r = try parse_product(ts, i)
+                    left = ref(Bin("-", left, r))
+                }
+                _ -> going = false
+            }
+        }
+    }
+    left
+}
+
+fn power_of(base: f64, exp: f64) -> f64 {
+    // Integer exponents only, by repeated multiplication: there is no `pow` in
+    // the library, and the alternative — exp(ln(x) * y) — is wrong for a
+    // negative base and imprecise for an exact one.
+    var n = exp.as_i64()
+    if n < 0 {
+        var acc = 1.0
+        var k = 0
+        while k < 0 - n {
+            acc = acc * base
+            k = k + 1
+        }
+        return 1.0 / acc
+    }
+    var acc = 1.0
+    var k = 0
+    while k < n {
+        acc = acc * base
+        k = k + 1
+    }
+    acc
+}
+
+fn eval(n: ref Node) -> f64 ! Fault {
+    match n {
+        Num(v) -> v
+        Neg(e) -> 0.0 - (try eval(e))
+        Bin(op, l, r) -> {
+            let a = try eval(l)
+            let b = try eval(r)
+            if op == "+" { a + b }
+            else if op == "-" { a - b }
+            else if op == "*" { a * b }
+            else if op == "^" { power_of(a, b) }
+            else if op == "/" {
+                if b == 0.0 {
+                    fail(Fault{ why: "division by zero", at: 0 })
+                }
+                a / b
+            }
+            else {
+                if b == 0.0 {
+                    fail(Fault{ why: "modulo by zero", at: 0 })
+                }
+                // `%` on floats, by definition rather than by a builtin.
+                let q = (a / b).as_i64()
+                a - (q.as_f64() * b)
+            }
+        }
+    }
+}
+
+fn calculate(src: str) -> f64 ! Fault {
+    let ts = try lex(src)
+    if ts.len() == 0 {
+        fail(Fault{ why: "empty expression", at: 0 })
+    }
+    var i = 0
+    let tree = try parse_sum(ts, i)
+    if i < ts.len() {
+        fail(Fault{ why: "unexpected trailing input", at: i })
+    }
+    try eval(tree)
+}
+
+fn show(src: str) {
+    match calculate(src) {
+        Ok(v) -> print("{src} = {v}")
+        Err(e) -> print("{src} -> error: {e.why} (at {e.at})")
+    }
+}
+
+fn main() {
+    // Precedence, which is the thing under test.
+    show("(3 + 5) * 2")
+    show("3 + 5 * 2")
+    show("2 ^ 3 ^ 2")
+    show("100 / 10 / 2")
+    show("1 - 2 - 3")
+    show("-4 + 10")
+    show("2 * -3")
+    show("10 % 3")
+    show("(1 + 2) * (3 + 4)")
+    show("((((5))))")
+    show("3.5 * 2")
+    show("2 ^ -2")
+    // Failures, which must be values and not crashes.
+    show("1 / 0")
+    show("(1 + 2")
+    show("1 +")
+    show("")
+    show("4 $ 2")
+}

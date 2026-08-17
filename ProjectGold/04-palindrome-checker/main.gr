@@ -1,0 +1,72 @@
+// String reverser and palindrome checker — encoding, bounds, and what a
+// "character" is.
+//
+// This is the project on the list most likely to be wrong in a language that
+// has not thought about text. Reversing by byte is correct for ASCII and
+// produces mojibake for anything else; reversing by *code point* is what a
+// reader means. Grasm's `.chars()` yields code points, so the multi-byte cases
+// below are the real test — a byte-wise implementation gets `añb` wrong and
+// gets the emoji catastrophically wrong.
+
+fn reverse(s: str) -> str {
+    var out = ""
+    for c in s.chars().rev() {
+        out = out + c
+    }
+    out
+}
+
+fn is_palindrome(s: str) -> bool {
+    s == reverse(s)
+}
+
+/// Letters and digits only, folded to one case — the version people mean when
+/// they ask whether "A man, a plan, a canal: Panama" is a palindrome.
+fn normalize(s: str) -> str {
+    var out = ""
+    for c in s.to_lower().chars() {
+        let code = c.code_at(0)
+        let is_digit = code >= 48 and code <= 57
+        let is_letter = code >= 97 and code <= 122
+        // Anything outside ASCII is kept: dropping it would silently change
+        // the answer for text this program claims to handle.
+        let is_ascii = code < 128
+        if is_digit or is_letter or (not is_ascii) {
+            out = out + c
+        }
+    }
+    out
+}
+
+fn check(label: str, s: str) {
+    let r = reverse(s)
+    let strict = is_palindrome(s)
+    let loose = is_palindrome(normalize(s))
+    print("{label}: \"{s}\" -> \"{r}\"  strict {strict}  normalized {loose}")
+}
+
+fn main() {
+    check("empty", "")
+    check("one", "x")
+    check("two same", "aa")
+    check("two different", "ab")
+    check("odd", "racecar")
+    check("even", "abba")
+    check("sentence", "A man, a plan, a canal: Panama")
+    check("not one", "hello")
+    check("digits", "12321")
+    check("mixed", "Was it a car or a cat I saw?")
+
+    // Multi-byte. A byte-wise reverse produces invalid UTF-8 here; a
+    // code-point reverse does not.
+    check("accented", "añb")
+    check("greek", "αβγ")
+    check("emoji", "ab🙂ba")
+    check("emoji palindrome", "🙂ab🙂ba🙂")
+
+    // Lengths, so the difference between bytes and characters is on the record
+    // rather than implied.
+    for s in ["abc", "añb", "αβγ", "🙂"] {
+        print("\"{s}\": len {s.len()}  chars {s.chars().len()}")
+    }
+}
