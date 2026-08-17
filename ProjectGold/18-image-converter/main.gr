@@ -1,0 +1,249 @@
+// An image format converter — binary parsing, byte arrays, bit manipulation.
+//
+// This project was blocked on F9 and is the reason `bytes` exists. The
+// demonstration that made the case was seven bytes of x86 becoming nine on
+// disk: `str` is text, and re-encodes anything above 127 as UTF-8. A BMP header
+// is not text.
+//
+// It writes a BMP, reads it back, parses the header field by field, converts
+// the pixels to greyscale, and writes a second BMP — then reads *that* back and
+// checks the arithmetic. Everything is verified against values computed here
+// rather than against the program's own output.
+
+let HEADER_SIZE = 54
+
+// --- little-endian integers, which is how a BMP stores everything ------------
+
+fn le16(v: i64) -> [i64] {
+    [v.bit_and(0xFF), (v.ushr(8)).bit_and(0xFF)]
+}
+
+fn le32(v: i64) -> [i64] {
+    [
+        v.bit_and(0xFF),
+        (v.ushr(8)).bit_and(0xFF),
+        (v.ushr(16)).bit_and(0xFF),
+        (v.ushr(24)).bit_and(0xFF),
+    ]
+}
+
+fn read_le16(b: bytes, at: i64) -> i64 {
+    b.at(at) + b.at(at + 1).shl(8)
+}
+
+fn read_le32(b: bytes, at: i64) -> i64 {
+    b.at(at) + b.at(at + 1).shl(8) + b.at(at + 2).shl(16) + b.at(at + 3).shl(24)
+}
+
+// --- writing a BMP -----------------------------------------------------------
+
+/// Each row is padded to a multiple of four bytes. Getting this wrong is the
+/// classic BMP bug: the image looks correct at width 4 and skews at width 3.
+fn row_stride(width: i64) -> i64 {
+    let raw = width * 3
+    raw + ((4 - (raw % 4)) % 4)
+}
+
+fn build_bmp(width: i64, height: i64, pixels: [i64]) -> bytes {
+    let stride = row_stride(width)
+    let pixel_bytes = stride * height
+    let total = HEADER_SIZE + pixel_bytes
+
+    var header: [i64] = []
+    // File header, 14 bytes.
+    header.push(0x42)                       // 'B'
+    header.push(0x4D)                       // 'M'
+    for b in le32(total) { header.push(b) }
+    for b in le32(0) { header.push(b) }      // reserved
+    for b in le32(HEADER_SIZE) { header.push(b) }
+    // Info header, 40 bytes.
+    for b in le32(40) { header.push(b) }
+    for b in le32(width) { header.push(b) }
+    for b in le32(height) { header.push(b) }
+    for b in le16(1) { header.push(b) }      // planes
+    for b in le16(24) { header.push(b) }     // bits per pixel
+    for b in le32(0) { header.push(b) }      // no compression
+    for b in le32(pixel_bytes) { header.push(b) }
+    for b in le32(2835) { header.push(b) }   // 72 dpi, horizontal
+    for b in le32(2835) { header.push(b) }   // 72 dpi, vertical
+    for b in le32(0) { header.push(b) }      // palette colours
+    for b in le32(0) { header.push(b) }      // important colours
+
+    // Pixel data. BMP rows run bottom to top, and each pixel is B, G, R.
+    var body: [i64] = []
+    var row = height - 1
+    while row >= 0 {
+        for col in 0..width {
+            let i = (row * width + col) * 3
+            body.push(pixels[i + 2])   // blue
+            body.push(pixels[i + 1])   // green
+            body.push(pixels[i])       // red
+        }
+        for _pad in 0..(stride - width * 3) {
+            body.push(0)
+        }
+        row = row - 1
+    }
+    bytes_of(header).concat(bytes_of(body))
+}
+
+// --- reading a BMP -----------------------------------------------------------
+
+type Bmp = {
+    width: i64,
+    height: i64,
+    bits: i64,
+    pixels: [i64],   // row-major from the top, R G B per pixel
+    why: str,
+}
+
+fn bad(why: str) -> Bmp {
+    Bmp{ width: 0, height: 0, bits: 0, pixels: [], why: why }
+}
+
+fn parse_bmp(b: bytes) -> Bmp {
+    if b.len() < HEADER_SIZE {
+        return bad("shorter than a BMP header ({b.len()} bytes)")
+    }
+    if b.at(0) != 0x42 or b.at(1) != 0x4D {
+        return bad("not a BMP: magic is {b.at(0)},{b.at(1)} and not 66,77")
+    }
+    let offset = read_le32(b, 10)
+    let width = read_le32(b, 18)
+    let height = read_le32(b, 22)
+    let bits = read_le16(b, 28)
+    if bits != 24 {
+        return bad("only 24-bit BMPs are read, found {bits}")
+    }
+    let stride = row_stride(width)
+    if b.len() < offset + stride * height {
+        return bad("truncated: {b.len()} bytes, header says {offset + stride * height}")
+    }
+
+    var pixels: [i64] = []
+    for y in 0..height {
+        // Rows are stored bottom-up, so the top row is the last one.
+        let src_row = height - 1 - y
+        for x in 0..width {
+            let at = offset + src_row * stride + x * 3
+            pixels.push(b.at(at + 2))   // red
+            pixels.push(b.at(at + 1))   // green
+            pixels.push(b.at(at))       // blue
+        }
+    }
+    Bmp{ width: width, height: height, bits: bits, pixels: pixels, why: "" }
+}
+
+/// Rec. 601 luma, in integers: the weights are scaled by 1000 and divided back,
+/// so the answer does not depend on float rounding and is identical on every
+/// engine.
+fn greyscale(p: [i64]) -> [i64] {
+    var out: [i64] = []
+    var i = 0
+    while i < p.len() {
+        let g = (p[i] * 299 + p[i + 1] * 587 + p[i + 2] * 114) / 1000
+        out.push(g)
+        out.push(g)
+        out.push(g)
+        i = i + 3
+    }
+    out
+}
+
+fn show(label: str, m: Bmp) {
+    if m.why != "" {
+        print("{label}: rejected — {m.why}")
+    } else {
+        print("{label}: {m.width}x{m.height}, {m.bits}-bit, {m.pixels.len() / 3} pixels")
+    }
+}
+
+fn main() / {io} {
+    let dir = "projectgold_bmp"
+    let _mk = make_dir(dir) ?? ()
+
+    // A 3x2 image, chosen because 3*3 = 9 bytes per row, which needs three
+    // bytes of padding — the case a stride bug gets wrong.
+    let width = 3
+    let height = 2
+    let pixels = [
+        255, 0, 0,     0, 255, 0,     0, 0, 255,
+        255, 255, 255, 0, 0, 0,       128, 64, 32,
+    ]
+    print("--- writing ---")
+    print("row stride for width {width}: {row_stride(width)} bytes (3 of padding)")
+    let raw = build_bmp(width, height, pixels)
+    print("file is {raw.len()} bytes: {HEADER_SIZE} header + {raw.len() - HEADER_SIZE} pixel data")
+    print("magic: {raw.at(0)},{raw.at(1)}  ('B' is 66, 'M' is 77)")
+
+    let path = dir + "/out.bmp"
+    match write_bytes(path, raw) {
+        Err(e) -> print("could not write: {e}")
+        Ok(_) -> print("wrote {path}")
+    }
+
+    print("--- reading it back ---")
+    match read_bytes(path) {
+        Err(e) -> print("could not read: {e}")
+        Ok(back) -> {
+            print("bytes identical on the round trip: {back.to_list() == raw.to_list()}")
+            let img = parse_bmp(back)
+            show("parsed", img)
+            print("pixels identical to what was written: {img.pixels == pixels}")
+            print("first pixel R,G,B: {img.pixels[0]},{img.pixels[1]},{img.pixels[2]}")
+            print("last  pixel R,G,B: {img.pixels[15]},{img.pixels[16]},{img.pixels[17]}")
+
+            print("--- converting to greyscale ---")
+            let grey = greyscale(img.pixels)
+            // Checked against the arithmetic, not against the output:
+            // 255,0,0 -> 255*299/1000 = 76.  128,64,32 -> (38272+37568+3648)/1000 = 79.
+            print("red   255,0,0   -> {grey[0]} (expected 76)")
+            print("white 255,255,255 -> {grey[9]} (expected 255)")
+            print("black 0,0,0     -> {grey[12]} (expected 0)")
+            print("brown 128,64,32 -> {grey[15]} (expected 79)")
+
+            let grey_bmp = build_bmp(img.width, img.height, grey)
+            let grey_path = dir + "/grey.bmp"
+            let _w = write_bytes(grey_path, grey_bmp) ?? ()
+            match read_bytes(grey_path) {
+                Err(e) -> print("could not read the greyscale file: {e}")
+                Ok(gb) -> {
+                    let g2 = parse_bmp(gb)
+                    show("greyscale", g2)
+                    var all_grey = true
+                    var i = 0
+                    while i < g2.pixels.len() {
+                        if g2.pixels[i] != g2.pixels[i + 1] or g2.pixels[i] != g2.pixels[i + 2] {
+                            all_grey = false
+                        }
+                        i = i + 3
+                    }
+                    print("every pixel has R = G = B: {all_grey}")
+                    print("survived a second round trip: {g2.pixels == grey}")
+                }
+            }
+            let _r1 = remove_file(grey_path) ?? ()
+        }
+    }
+
+    print("--- malformed input, which must be refused and not crash ---")
+    show("empty", parse_bmp(bytes_of([])))
+    show("too short", parse_bmp(bytes_of([0x42, 0x4D, 1, 2])))
+    var not_bmp: [i64] = []
+    for _i in 0..HEADER_SIZE { not_bmp.push(0x41) }
+    show("wrong magic", parse_bmp(bytes_of(not_bmp)))
+    // A valid header claiming 8-bit colour.
+    var eight = build_bmp(1, 1, [1, 2, 3]).to_list()
+    eight[28] = 8
+    show("8-bit", parse_bmp(bytes_of(eight)))
+    // A valid header whose pixel data was cut off.
+    show("truncated", parse_bmp(build_bmp(4, 4, greyscale_fill(48)).slice(0, 60)))
+
+    let _r2 = remove_file(path) ?? ()
+}
+
+fn greyscale_fill(n: i64) -> [i64] {
+    var out: [i64] = []
+    for i in 0..n { out.push(i % 256) }
+    out
+}

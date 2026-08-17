@@ -79,6 +79,12 @@ pub enum Value {
     Float(f64),
     Bool(bool),
     Str(Rc<GStr>),
+    /// A contiguous run of bytes ([L-LIB-BYTES]).
+    ///
+    /// Stored as `Vec<u8>` rather than as a list of `Value::Int`, because the
+    /// promise this type makes — every element is a byte — is exactly what the
+    /// representation should carry. It is also eight times smaller.
+    Bytes(Rc<Vec<u8>>),
     Unit,
     Range(i64, i64, bool),
     List(Rc<Vec<Value>>),
@@ -424,6 +430,16 @@ impl fmt::Display for Value {
             Value::Float(v) => write!(f, "{}", crate::value::float_text(*v)),
             Value::Bool(v) => write!(f, "{v}"),
             Value::Str(s) => write!(f, "{s}"),
+            // Hex, two digits per byte, no separator. Not the text it might
+            // decode to: a `bytes` is shown as bytes, which is the whole point
+            // of it being a different type from `str` ([L-LIB-BYTES]).
+            Value::Bytes(b) => {
+                write!(f, "0x")?;
+                for byte in b.iter() {
+                    write!(f, "{byte:02x}")?;
+                }
+                Ok(())
+            }
             Value::Unit => write!(f, "()"),
             Value::Range(a, b, incl) => {
                 write!(f, "{a}..{}{b}", if *incl { "=" } else { "" })

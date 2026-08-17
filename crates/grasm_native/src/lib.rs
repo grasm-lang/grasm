@@ -89,6 +89,9 @@ enum VType {
     Bool,
     Unit,
     Str,
+    /// A contiguous run of bytes ([L-LIB-BYTES]). Carried as a boxed runtime
+    /// value, like `Str` — a byte buffer has no scalar representation.
+    Bytes,
     List(Box<VType>),
     /// Tier 2 — a generational reference, one i64: slot index in the high
     /// half, generation in the low half. A plain scalar, so it copies freely
@@ -138,6 +141,7 @@ impl VType {
             VType::Bool => "bool".into(),
             VType::Unit => "unit".into(),
             VType::Str => "str".into(),
+            VType::Bytes => "bytes".into(),
             VType::Any => "any".into(),
             VType::List(e) => format!("l{}", e.mangle()),
             VType::Option(e) => format!("o{}", e.mangle()),
@@ -166,6 +170,7 @@ impl VType {
             VType::Bool => "bool".into(),
             VType::Unit => "()".into(),
             VType::Str => "str".into(),
+            VType::Bytes => "bytes".into(),
             VType::Any => "an inferred type".into(),
             VType::Ref(inner) => format!("ref {}", inner.show()),
             VType::List(e) => format!("[{}]", e.show()),
@@ -195,6 +200,7 @@ impl VType {
             VType::Unit => types::I8,
             // Boxed values travel as 64-bit pointers.
             VType::Str
+            | VType::Bytes
             | VType::List(_)
             | VType::Struct(_)
             | VType::Sum(_)
@@ -211,6 +217,7 @@ impl VType {
         matches!(
             self,
             VType::Str
+                | VType::Bytes
                 | VType::List(_)
                 | VType::Struct(_)
                 | VType::Sum(_)
@@ -697,6 +704,16 @@ impl<'m> Codegen<'m> {
             ("grasm_file_exists", vec![i64t], Some(i8t)),
             ("grasm_remove_file", vec![i64t], Some(i64t)),
             ("grasm_make_dir", vec![i64t], Some(i64t)),
+            ("grasm_bytes_of", vec![i64t], Some(i64t)),
+            ("grasm_bytes_len", vec![i64t], Some(i64t)),
+            ("grasm_bytes_at", vec![i64t, i64t], Some(i64t)),
+            ("grasm_bytes_slice", vec![i64t, i64t, i64t], Some(i64t)),
+            ("grasm_bytes_concat", vec![i64t, i64t], Some(i64t)),
+            ("grasm_bytes_to_list", vec![i64t], Some(i64t)),
+            ("grasm_bytes_to_str", vec![i64t], Some(i64t)),
+            ("grasm_str_to_bytes", vec![i64t], Some(i64t)),
+            ("grasm_read_bytes", vec![i64t], Some(i64t)),
+            ("grasm_write_bytes", vec![i64t, i64t], Some(i64t)),
             ("grasm_list_dir", vec![i64t], Some(i64t)),
             ("grasm_set_args", vec![i64t, ptr], None),
             ("grasm_now_millis", vec![], Some(i64t)),
@@ -764,6 +781,7 @@ impl<'m> Codegen<'m> {
                             "f32" | "f64" | "float" => return Ok(VType::F64),
                             "bool" => return Ok(VType::Bool),
                             "str" => return Ok(VType::Str),
+                            "bytes" => return Ok(VType::Bytes),
                             _ => {}
                         }
                         // An alias is its target, resolved here so nothing
@@ -6389,6 +6407,63 @@ impl FnCx<'_, '_> {
             // answer under `grasm run` and whatever the hardware happened to do
             // under `--native`, which is precisely the class of disagreement
             // this project exists to prevent.
+            // Methods on `bytes` ([L-LIB-BYTES]). Each is one runtime call, and
+            // the receiver is already a boxed pointer, so there is nothing to
+            // box or unbox here.
+            // Each of these reads the receiver and keeps nothing, so each
+            // releases it — the convention every other boxed-receiver arm
+            // above follows. Omitting it leaks one allocation per call, which
+            // is invisible in the output and which `scripts/leakcheck.sh`
+            // caught on the first run.
+            (VType::Bytes, "len") => {
+                let n = self.call_rt("grasm_bytes_len", &[rv]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                (n, VType::I64)
+            }
+            (VType::Bytes, "is_empty") => {
+                let n = self.call_rt("grasm_bytes_len", &[rv]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                let zero = self.b.ins().iconst(types::I64, 0);
+                let eq = self.b.ins().icmp(IntCC::Equal, n, zero);
+                (self.b.ins().uextend(types::I8, eq), VType::Bool)
+            }
+            (VType::Bytes, "at") => {
+                let i = arg_scalar!(0, VType::I64);
+                let v = self.call_rt("grasm_bytes_at", &[rv, i]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                (v, VType::I64)
+            }
+            (VType::Bytes, "slice") => {
+                let from = arg_scalar!(0, VType::I64);
+                let count = arg_scalar!(1, VType::I64);
+                let v = self
+                    .call_rt("grasm_bytes_slice", &[rv, from, count])
+                    .unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                (v, VType::Bytes)
+            }
+            (VType::Bytes, "concat") => {
+                let (other, _) = self.eval_expr_val(&args[0])?;
+                let out = self.call_rt("grasm_bytes_concat", &[rv, other]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                self.call_rt("grasm_val_dec", &[other]);
+                (out, VType::Bytes)
+            }
+            (VType::Bytes, "to_list") => {
+                let v = self.call_rt("grasm_bytes_to_list", &[rv]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                (v, VType::List(Box::new(VType::I64)))
+            }
+            (VType::Bytes, "to_str") => {
+                let v = self.call_rt("grasm_bytes_to_str", &[rv]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                (v, VType::Str)
+            }
+            (VType::Str, "to_bytes") => {
+                let v = self.call_rt("grasm_str_to_bytes", &[rv]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                (v, VType::Bytes)
+            }
             (VType::I64, "bit_and" | "bit_or" | "bit_xor") => {
                 let a = arg_scalar!(0, VType::I64);
                 let out = match m {
@@ -7326,6 +7401,32 @@ checker did",
             }
             // [L-LIB-FS]. Both answer with the sorted listing / unit the
             // runtime produces, so the two engines cannot disagree on order.
+            "bytes_of" => {
+                let (lv, _) = self.eval_expr_val(&args[0])?;
+                let v = self.call_rt("grasm_bytes_of", &[lv]).unwrap();
+                self.call_rt("grasm_val_dec", &[lv]);
+                return Ok(Some((v, VType::Bytes)));
+            }
+            "read_bytes" => {
+                let (pv, _) = self.eval_expr_val(&args[0])?;
+                let v = self.call_rt("grasm_read_bytes", &[pv]).unwrap();
+                self.call_rt("grasm_val_dec", &[pv]);
+                return Ok(Some((
+                    v,
+                    VType::Fallible(Box::new(VType::Bytes), Box::new(VType::Sum("IoError".into()))),
+                )));
+            }
+            "write_bytes" => {
+                let (pv, _) = self.eval_expr_val(&args[0])?;
+                let (bv, _) = self.eval_expr_val(&args[1])?;
+                let v = self.call_rt("grasm_write_bytes", &[pv, bv]).unwrap();
+                self.call_rt("grasm_val_dec", &[pv]);
+                self.call_rt("grasm_val_dec", &[bv]);
+                return Ok(Some((
+                    v,
+                    VType::Fallible(Box::new(VType::Unit), Box::new(VType::Sum("IoError".into()))),
+                )));
+            }
             "make_dir" | "remove_file" => {
                 let (pv, _) = self.eval_expr_val(&args[0])?;
                 let sym = if id.name == "make_dir" { "grasm_make_dir" } else { "grasm_remove_file" };
@@ -8403,6 +8504,15 @@ checker did",
                                 Box::new(VType::Unit),
                                 Box::new(VType::Sum("IoError".into())),
                             )),
+                            "bytes_of" => Some(VType::Bytes),
+                            "read_bytes" => Some(VType::Fallible(
+                                Box::new(VType::Bytes),
+                                Box::new(VType::Sum("IoError".into())),
+                            )),
+                            "write_bytes" => Some(VType::Fallible(
+                                Box::new(VType::Unit),
+                                Box::new(VType::Sum("IoError".into())),
+                            )),
                             "list_dir" => Some(VType::Fallible(
                                 Box::new(VType::List(Box::new(VType::Str))),
                                 Box::new(VType::Sum("IoError".into())),
@@ -8707,6 +8817,17 @@ checker did",
                 "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "exp" | "ln" | "log2" | "log10" | "cbrt" | "to_radians" | "to_degrees" => VType::F64,
                 "atan2" | "hypot" | "log" => VType::F64,
                 "abs" => self.probe_type(recv)?,
+                // Bit manipulation always answers `i64` ([L-LIB-BITS]).
+                // Without this the probe could not type `(v.ushr(8)).bit_and(0xFF)`
+                // — a chain that every little-endian field in a binary format
+                // is built from.
+                "bit_and" | "bit_or" | "bit_xor" | "bit_not" | "shl" | "shr" | "ushr" => {
+                    VType::I64
+                }
+                // Bytes ([L-LIB-BYTES]).
+                "to_bytes" => VType::Bytes,
+                "at" => VType::I64,
+                "concat" => VType::Bytes,
                 "chars" | "lines" | "split" | "words" | "keys" => VType::List(Box::new(VType::Str)),
                 "entries" => match self.probe_type(recv)? {
                     VType::Map(k, v) => VType::List(Box::new(VType::Tuple(vec![*k, *v]))),

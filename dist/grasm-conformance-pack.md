@@ -2763,6 +2763,49 @@ fn hex(v: i64) -> str {
 }
 ```
 
+## `L-LIB-BYTES.gr`
+
+```grasm
+//! tag: L-LIB-BYTES
+//! expect: output
+//! 0x48c7c001000000
+//! 7 bytes, first 72, third 192
+//! 0x48c7c0 and 0x48c7ff
+//! [72, 199, 192, 1, 0, 0, 0]
+//! text is 5 characters and 6 bytes
+//! round trip: héllo
+//! written and read back identically: true
+// `bytes` is the type `str` deliberately is not ([L-LIB-BYTES]).
+//
+// The sequence below is x86-64 `mov rax, 1`. Written through a `str` it lands
+// on disk as nine bytes, because 0xC7 is re-encoded as UTF-8 — which is the
+// reason this type exists.
+fn main() / {io} {
+    let code = bytes_of([0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00])
+    print("{code}")
+    print("{code.len()} bytes, first {code.at(0)}, third {code.at(2)}")
+    print("{code.slice(0, 3)} and {code.slice(0, 2).concat(bytes_of([0xFF]))}")
+    print("{code.to_list()}")
+
+    // A byte is not a character.
+    let text = "héllo"
+    print("text is {text.len()} characters and {text.to_bytes().len()} bytes")
+    print("round trip: {text.to_bytes().to_str()}")
+
+    let dir = "grasm_bytes_conformance"
+    let _mk = make_dir(dir) ?? ()
+    let path = dir + "/code.bin"
+    match write_bytes(path, code) {
+        Err(e) -> print("could not write: {e}")
+        Ok(_) -> match read_bytes(path) {
+            Err(e) -> print("could not read: {e}")
+            Ok(back) -> print("written and read back identically: {back.to_list() == code.to_list()}")
+        }
+    }
+    let _rm = remove_file(path) ?? ()
+}
+```
+
 ## `L-LIB-CMP.gr`
 
 ```grasm

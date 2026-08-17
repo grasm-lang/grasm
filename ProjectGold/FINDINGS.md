@@ -174,15 +174,26 @@ type would fix the FFI and the binary-I/O gap (F9) at the same time, since both
 want the same thing: a contiguous run of bytes with a length, that a C function
 can be handed a pointer to.
 
-## F9 — no byte type, so binary formats and binary I/O are unwritable (S3, language)
+## F9 — no byte type, so binary formats and binary I/O are unwritable (S3) — **fixed**
 
 A socket carries `str` ([L-LIB-NET]) and so does a file. There is no `[u8]`, no
 `bytes`, and `str.len()` counts code points rather than bytes (F2), so even
 measuring a payload is not possible.
 
-Blocks 18 (read a BMP), 25 (DNS packets), and the binary half of 21 and 30. It
-is also why `server.gr` cannot serve `grasm.wasm` — noted already in
-`docs/wasm.md`.
+Blocked 18 (read a BMP), 25 (DNS packets), and the binary half of 21 and 30. It
+was also why `server.gr` could not serve `grasm.wasm`.
+
+**Fixed** as [L-LIB-BYTES]. `bytes` is a contiguous run of bytes, distinct from
+`[i64]` because a list of integers cannot promise its elements are bytes and
+stores eight bytes per element. It prints as hex rather than as the text it might
+decode to, which would undo the distinction the type exists to make.
+
+The proof is project 18: it writes a real BMP that `file` identifies as
+"PC bitmap, Windows 3.x format, 3 x 2 x 24" and that an independent Python
+decoder reads back pixel for pixel.
+
+Still open for 25 (which also needs UDP, F12) and for `extern fn` (F8), which
+needs a pointer representation on top of this.
 
 ## F10 — a `ref` to a scalar can be made but never read (S3, language)
 

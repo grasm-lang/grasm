@@ -243,6 +243,7 @@ fn type_name(value: &grasm_interp::Value) -> &'static str {
         Value::Float(_) => "f64",
         Value::Bool(_) => "bool",
         Value::Str(_) => "str",
+        Value::Bytes(_) => "bytes",
         Value::List(_) => "list",
         Value::Map(_) => "map",
         Value::Tuple(_) => "tuple",

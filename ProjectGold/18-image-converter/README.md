@@ -1,32 +1,50 @@
-# 18 — Image Format Converter — **blocked**
+# 18 — Image Format Converter
 
 **Tests:** binary stream reading, byte arrays, bitwise manipulation.
+**Result:** works, all three engines agree. **Was blocked; is the reason `bytes`
+exists.**
 
-**Result:** cannot be written in Grasm today.
+## What unblocked it
 
-## Why
+F9 — no byte type. The demonstration that made the case was seven bytes of x86
+`mov rax, 1` becoming **nine** bytes on disk, because `str` is text and re-encodes
+anything above 127 as UTF-8. A BMP header is not text.
 
-Three separate gaps, each sufficient on its own:
+[L-LIB-BYTES] fixed that, and this project is the proof it was the right fix.
 
-1. **No byte type** (FINDINGS.md F9). `read_file` returns `str`. A BMP is not
-   text, and a `str` in Grasm is UTF-8 — so the header bytes of a real BMP would
-   either fail to decode or be silently replaced.
-2. **No byte length** (F2). `str.len()` counts code points, so even if the bytes
-   arrived intact, the width and height fields could not be located by offset.
-3. **No bitwise operators** (F3). A BMP's pixel data is packed; extracting a
-   5-bit channel from a 16-bit word needs `>>` and `&`, and neither exists.
-   Division and modulo can stand in for shifts and masks on non-negative values,
-   which is what project 16's hash had to do — but that is a workaround for
-   arithmetic, and there is nothing to work around here, because the bytes
-   never arrive.
+## What it does
 
-## What would unblock it
+Writes a 24-bit BMP, reads it back, parses the header field by field, converts to
+greyscale, writes a second BMP, reads *that* back, and checks the arithmetic.
 
-A byte type with `read_bytes`/`write_bytes`, and bitwise operators. Both are
-ordinary work with no design questions attached — a `bytes` value is a list of
-`i64` in the range 0..255 as far as the type system is concerned, and the
-operators are five new tokens and five new `BinaryOp` variants.
+**The image is a real BMP, and an outside tool says so:**
 
-The image *algorithm* — reading a header, walking a pixel array, writing a new
-one — needs nothing else the language lacks. Project 05 already does
-two-dimensional indexing, and project 11 already does a file round trip.
+```
+$ file out.bmp
+out.bmp: PC bitmap, Windows 3.x format, 3 x 2 x 24, image size 24,
+         resolution 2835 x 2835 px/m, cbSize 78, bits offset 54
+```
+
+An independent Python decoder reads the top row back as
+`[(255,0,0), (0,255,0), (0,0,255)]` — exactly what was written.
+
+## The parts that are actually hard
+
+* **Row stride.** BMP pads every row to a multiple of four bytes. The image is
+  3 pixels wide — 9 bytes per row, needing 3 of padding — chosen because that is
+  the case a stride bug gets wrong. At width 4 the bug is invisible.
+* **Bottom-up rows and BGR order.** BMP stores the last row first and each pixel
+  as blue, green, red. Both are inverted on read and on write.
+* **Little-endian fields** built and parsed with `shl`/`ushr`/`bit_and`
+  ([L-LIB-BITS]), which is the other clause this project needed.
+* **Integer greyscale.** Rec. 601 luma with weights scaled by 1000 and divided
+  back, so the answer does not depend on float rounding and is identical on
+  every engine. Checked against arithmetic done by hand — `255,0,0` → 76,
+  `128,64,32` → 79 — not against the program's own output.
+
+Five malformed inputs are refused with a reason rather than crashing: empty, too
+short, wrong magic, 8-bit colour, and a valid header whose pixel data was cut off.
+
+## Findings
+
+None. This project consumed F9 rather than producing a finding.

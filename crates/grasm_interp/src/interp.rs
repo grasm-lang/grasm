@@ -2319,6 +2319,47 @@ build links it, `grasm run` can only reach what is already loaded",
                     // Creates the whole path, and succeeds if it is already
                     // there — so a program can make its own working directory
                     // without first asking whether it exists ([L-LIB-FS]).
+                    // [L-LIB-BYTES]
+                    "bytes_of" => {
+                        let v = self.eval_expr(&args[0])?;
+                        let Value::List(items) = v else {
+                            return Err(Flow::Panic("bytes_of expects a list".into()));
+                        };
+                        let mut out = Vec::with_capacity(items.len());
+                        for it in items.iter() {
+                            let Value::Int(n) = it else {
+                                return Err(Flow::Panic("bytes_of expects a list of integers".into()));
+                            };
+                            if !(0..=255).contains(n) {
+                                return Err(Flow::Panic(format!(
+                                    "{n} is not a byte — bytes_of takes values in 0..255"
+                                )));
+                            }
+                            out.push(*n as u8);
+                        }
+                        return Ok(Value::Bytes(Rc::new(out)));
+                    }
+                    "read_bytes" => {
+                        let p = self.eval_expr(&args[0])?.to_string();
+                        return Ok(match std::fs::read(&p) {
+                            Ok(b) => Value::Ok(Rc::new(Value::Bytes(Rc::new(b)))),
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                Value::Err(Rc::new(io_error("NotFound", p)))
+                            }
+                            Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
+                        });
+                    }
+                    "write_bytes" => {
+                        let p = self.eval_expr(&args[0])?.to_string();
+                        let v = self.eval_expr(&args[1])?;
+                        let Value::Bytes(b) = v else {
+                            return Err(Flow::Panic("write_bytes expects bytes".into()));
+                        };
+                        return Ok(match std::fs::write(&p, b.as_slice()) {
+                            Ok(()) => Value::Ok(Rc::new(Value::Unit)),
+                            Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
+                        });
+                    }
                     "make_dir" => {
                         let p = self.eval_expr(&args[0])?.to_string();
                         return Ok(match std::fs::create_dir_all(&p) {
@@ -3536,6 +3577,54 @@ build links it, `grasm run` can only reach what is already loaded",
                     std::cmp::Ordering::Equal => 0,
                     std::cmp::Ordering::Greater => 1,
                 })
+            }
+            (Value::Bytes(b), "len") => Value::Int(b.len() as i64),
+            (Value::Bytes(b), "is_empty") => Value::Bool(b.is_empty()),
+            (Value::Bytes(b), "at") => {
+                let Value::Int(i) = self.eval_expr(&args[0])? else {
+                    return Err(Flow::Panic("at expects an integer".into()));
+                };
+                if i < 0 || i as usize >= b.len() {
+                    return Err(Flow::Panic(format!(
+                        "index {i} out of bounds (len {})",
+                        b.len()
+                    )));
+                }
+                Value::Int(b[i as usize] as i64)
+            }
+            (Value::Bytes(b), "slice") => {
+                let Value::Int(from) = self.eval_expr(&args[0])? else {
+                    return Err(Flow::Panic("slice expects an integer".into()));
+                };
+                let Value::Int(count) = self.eval_expr(&args[1])? else {
+                    return Err(Flow::Panic("slice expects an integer".into()));
+                };
+                if from < 0 || count < 0 || (from + count) as usize > b.len() {
+                    return Err(Flow::Panic(format!(
+                        "slice {from}..{} out of bounds (len {})",
+                        from + count,
+                        b.len()
+                    )));
+                }
+                Value::Bytes(Rc::new(b[from as usize..(from + count) as usize].to_vec()))
+            }
+            (Value::Bytes(b), "concat") => {
+                let Value::Bytes(other) = self.eval_expr(&args[0])? else {
+                    return Err(Flow::Panic("concat expects bytes".into()));
+                };
+                let mut out = b.as_ref().clone();
+                out.extend_from_slice(&other);
+                Value::Bytes(Rc::new(out))
+            }
+            (Value::Bytes(b), "to_list") => {
+                Value::List(Rc::new(b.iter().map(|x| Value::Int(*x as i64)).collect()))
+            }
+            // Lossy, as `tcp_read` is: a buffer carries bytes and a `str`
+            // carries text, and a malformed byte should not end a program that
+            // is inspecting one.
+            (Value::Bytes(b), "to_str") => Value::str(String::from_utf8_lossy(b).into_owned()),
+            (Value::Str(s), "to_bytes") => {
+                Value::Bytes(Rc::new(s.to_string().into_bytes()))
             }
             (Value::Int(i), "as_f64") => Value::Float(*i as f64),
             (Value::Int(i), "abs") => Value::Int(i.wrapping_abs()),

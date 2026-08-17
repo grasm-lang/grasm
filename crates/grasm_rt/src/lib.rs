@@ -573,6 +573,10 @@ pub enum RtPayload {
     F64(f64),
     Bool(bool),
     Str(RtStr),
+    /// A contiguous run of bytes ([L-LIB-BYTES]). `Vec<u8>`, not a list of
+    /// boxed integers: the promise the type makes is that every element is a
+    /// byte, and the representation should carry that promise.
+    Bytes(std::rc::Rc<Vec<u8>>),
     List(Vec<*mut RtVal>),
     /// Same shape as a list, rendered with parentheses.
     ///
@@ -1684,6 +1688,16 @@ unsafe fn display(v: *mut RtVal) -> String {
     rt_stack_check();
     match &(*v).payload {
         RtPayload::Unit => "()".to_string(),
+        // Hex, two digits per byte — the same form the interpreter prints, so
+        // the two engines agree on what a `bytes` looks like ([L-LIB-BYTES]).
+        RtPayload::Bytes(b) => {
+            let mut out = String::with_capacity(2 + b.len() * 2);
+            out.push_str("0x");
+            for byte in b.iter() {
+                out.push_str(&format!("{byte:02x}"));
+            }
+            out
+        }
         // The slot it names, not what it points at — the value may already be
         // gone, and reading it to render would be the use-after-free the tier
         // exists to prevent.
@@ -3944,6 +3958,137 @@ pub unsafe extern "C" fn grasm_write_file(path: *mut RtVal, content: *mut RtVal)
 #[no_mangle]
 pub unsafe extern "C" fn grasm_file_exists(path: *mut RtVal) -> i8 {
     i8::from(std::path::Path::new(as_str(path)).exists())
+}
+
+// ---------------------------------------------------------------------------
+// bytes ([L-LIB-BYTES])
+
+unsafe fn as_bytes(v: *mut RtVal) -> std::rc::Rc<Vec<u8>> {
+    match &(*v).payload {
+        RtPayload::Bytes(b) => b.clone(),
+        _ => std::rc::Rc::new(Vec::new()),
+    }
+}
+
+/// # Safety: `list` is a boxed list of integers.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_bytes_of(list: *mut RtVal) -> *mut RtVal {
+    // Both list representations. A `[i64]` reaching here from compiled code is
+    // a *scalar* list — elements stored inline, eight bytes each, no boxes —
+    // while the same list built through a boxed path is `List`. Handling only
+    // one of them is how a runtime function works under one engine and panics
+    // under the other.
+    let values: Vec<i64> = match &(*list).payload {
+        RtPayload::ListScalar { data, .. } => (0..data.len()).map(|i| data.get(i)).collect(),
+        RtPayload::List(items) => items
+            .iter()
+            .map(|it| match (**it).payload {
+                RtPayload::I64(n) => n,
+                _ => {
+                    let m = "bytes_of expects a list of integers";
+                    rt_panic(m);
+                }
+            })
+            .collect(),
+        _ => rt_panic("bytes_of expects a list"),
+    };
+    let mut out = Vec::with_capacity(values.len());
+    for n in values {
+        if !(0..=255).contains(&n) {
+            rt_panic(&format!(
+                "{n} is not a byte — bytes_of takes values in 0..255"
+            ));
+        }
+        out.push(n as u8);
+    }
+    alloc(RtPayload::Bytes(std::rc::Rc::new(out)))
+}
+
+/// # Safety: boxed values.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_bytes_len(v: *mut RtVal) -> i64 {
+    as_bytes(v).len() as i64
+}
+
+/// # Safety: boxed values.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_bytes_at(v: *mut RtVal, i: i64) -> i64 {
+    let b = as_bytes(v);
+    if i < 0 || i as usize >= b.len() {
+        rt_panic(&format!("index {i} out of bounds (len {})", b.len()));
+    }
+    b[i as usize] as i64
+}
+
+/// # Safety: boxed values.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_bytes_slice(v: *mut RtVal, from: i64, count: i64) -> *mut RtVal {
+    let b = as_bytes(v);
+    if from < 0 || count < 0 || (from + count) as usize > b.len() {
+        rt_panic(&format!(
+            "slice {from}..{} out of bounds (len {})",
+            from + count,
+            b.len()
+        ));
+    }
+    alloc(RtPayload::Bytes(std::rc::Rc::new(
+        b[from as usize..(from + count) as usize].to_vec(),
+    )))
+}
+
+/// # Safety: boxed values.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_bytes_concat(a: *mut RtVal, b: *mut RtVal) -> *mut RtVal {
+    let mut out = as_bytes(a).as_ref().clone();
+    out.extend_from_slice(&as_bytes(b));
+    alloc(RtPayload::Bytes(std::rc::Rc::new(out)))
+}
+
+/// # Safety: boxed values.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_bytes_to_list(v: *mut RtVal) -> *mut RtVal {
+    let items: Vec<*mut RtVal> = as_bytes(v)
+        .iter()
+        .map(|x| alloc(RtPayload::I64(*x as i64)))
+        .collect();
+    alloc(RtPayload::List(items))
+}
+
+/// Lossy, as `tcp_read` is: a buffer carries bytes, a `str` carries text.
+///
+/// # Safety: boxed values.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_bytes_to_str(v: *mut RtVal) -> *mut RtVal {
+    let text = String::from_utf8_lossy(&as_bytes(v)).into_owned();
+    alloc(RtPayload::Str(RtStr::new(text)))
+}
+
+/// # Safety: boxed values.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_to_bytes(v: *mut RtVal) -> *mut RtVal {
+    let bytes = as_str(v).to_string().into_bytes();
+    alloc(RtPayload::Bytes(std::rc::Rc::new(bytes)))
+}
+
+/// # Safety: boxed values.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_read_bytes(path: *mut RtVal) -> *mut RtVal {
+    let p = as_str(path).to_string();
+    match std::fs::read(&p) {
+        Ok(b) => ok_of(alloc(RtPayload::Bytes(std::rc::Rc::new(b)))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => err_of(io_err("NotFound", p)),
+        Err(e) => err_of(io_err("IoFailed", e.to_string())),
+    }
+}
+
+/// # Safety: boxed values.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_write_bytes(path: *mut RtVal, data: *mut RtVal) -> *mut RtVal {
+    let p = as_str(path).to_string();
+    match std::fs::write(&p, as_bytes(data).as_slice()) {
+        Ok(()) => ok_of(alloc(RtPayload::I64(0))),
+        Err(e) => err_of(io_err("IoFailed", e.to_string())),
+    }
 }
 
 /// Creates the whole path, and succeeds if it already exists ([L-LIB-FS]).

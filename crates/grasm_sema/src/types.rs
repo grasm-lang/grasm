@@ -12,6 +12,17 @@ pub enum Type {
     F64,
     Bool,
     Str,
+    /// A contiguous run of bytes — `bytes`.
+    ///
+    /// Distinct from `[i64]` on purpose. A list of integers cannot promise its
+    /// elements are in 0..255, cannot be stored one byte per element, and
+    /// cannot be handed to anything that wants a buffer. The whole reason this
+    /// type exists is the promise: a `bytes` is bytes.
+    ///
+    /// It is also the type `str` deliberately is not. `str` is text and
+    /// re-encodes anything above 127 as UTF-8, which is correct for text and
+    /// fatal for a BMP header or a machine instruction ([L-LIB-BYTES]).
+    Bytes,
     Unit,
     /// `0..n` — iterable of i64.
     Range,
@@ -255,6 +266,7 @@ impl Unifier {
             | (Type::F64, Type::F64)
             | (Type::Bool, Type::Bool)
             | (Type::Str, Type::Str)
+            | (Type::Bytes, Type::Bytes)
             | (Type::Unit, Type::Unit)
             | (Type::Range, Type::Range) => true,
             (Type::Generic(x), Type::Generic(y)) => x == y,
@@ -361,6 +373,7 @@ fn write_type(f: &mut fmt::Formatter<'_>, ty: &Type, defs: &TypeDefs) -> fmt::Re
         Type::F64 => write!(f, "f64"),
         Type::Bool => write!(f, "bool"),
         Type::Str => write!(f, "str"),
+        Type::Bytes => write!(f, "bytes"),
         Type::Unit => write!(f, "()"),
         Type::Range => write!(f, "range"),
         Type::Tuple(items) => {

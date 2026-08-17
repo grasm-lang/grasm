@@ -228,6 +228,9 @@ const BUILTIN_FREE_FNS: &[&str] = &[
     "file_exists",
     "remove_file",
     "make_dir",
+    "bytes_of",
+    "read_bytes",
+    "write_bytes",
     "list_dir",
     "input",
     "args",
@@ -1403,6 +1406,7 @@ different name, or call it as a method if you meant to extend a type (UFCS)",
                     "f32" | "f64" | "float" => Some(Type::F64),
                     "bool" => Some(Type::Bool),
                     "str" => Some(Type::Str),
+                    "bytes" => Some(Type::Bytes),
                     _ => None,
                 };
                 if let Some(p) = prim {
@@ -4368,6 +4372,44 @@ only a number or a `bool` can come out — compute what you need and yield that"
                     // and a directory could not be read at all ([L-LIB-FS]).
                     // A program that creates a temporary file could only empty
                     // it, so the next run saw a leftover.
+                    // [L-LIB-BYTES]. `bytes` is the type `str` deliberately is
+                    // not: `str` re-encodes anything above 127 as UTF-8, which
+                    // is correct for text and fatal for a BMP header or a
+                    // machine instruction.
+                    "bytes_of" => {
+                        if args.len() != 1 {
+                            return self.error(
+                                span,
+                                "bytes_of takes exactly 1 argument (a list of 0..255)",
+                            );
+                        }
+                        self.check_expr(&args[0], &Type::List(Box::new(Type::I64)));
+                        return Type::Bytes;
+                    }
+                    "read_bytes" => {
+                        if args.len() != 1 {
+                            return self.error(span, "read_bytes takes exactly 1 argument (path)");
+                        }
+                        self.check_expr(&args[0], &Type::Str);
+                        let io_err = Type::Named {
+                            id: self.defs.io_error_id,
+                            args: vec![],
+                        };
+                        return Type::Fallible(Box::new(Type::Bytes), Box::new(io_err));
+                    }
+                    "write_bytes" => {
+                        if args.len() != 2 {
+                            return self
+                                .error(span, "write_bytes takes 2 arguments (path, bytes)");
+                        }
+                        self.check_expr(&args[0], &Type::Str);
+                        self.check_expr(&args[1], &Type::Bytes);
+                        let io_err = Type::Named {
+                            id: self.defs.io_error_id,
+                            args: vec![],
+                        };
+                        return Type::Fallible(Box::new(Type::Unit), Box::new(io_err));
+                    }
                     "make_dir" | "remove_file" => {
                         if args.len() != 1 {
                             return self
@@ -5853,6 +5895,13 @@ Perform the effect after the closing brace, or yield a number and do the work ou
                     check_arity(self, 0);
                     Type::List(Box::new(Type::I64))
                 }
+                // The other direction from `bytes.to_str()`: text to its UTF-8
+                // encoding ([L-LIB-BYTES]). This is where a program working in
+                // bytes gets them from a literal.
+                "to_bytes" => {
+                    check_arity(self, 0);
+                    Type::Bytes
+                }
                 // Splitting on runs of whitespace. `split(" ")` cannot do it:
                 // aligned columns give `["INFO", "", "", "", "server"]`, so
                 // every call site grew a `.filter(|s| not s.is_empty())`.
@@ -5941,6 +5990,51 @@ Perform the effect after the closing brace, or yield a number and do the work ou
                 "len" => {
                     check_arity(self, 0);
                     Type::I64
+                }
+                _ => return None,
+            },
+            // Methods on `bytes` ([L-LIB-BYTES]). Indexing gives an `i64` in
+            // 0..255 rather than a one-byte value type: the language has one
+            // integer, and a byte is a number.
+            Type::Bytes => match name.name.as_str() {
+                "len" => {
+                    check_arity(self, 0);
+                    Type::I64
+                }
+                "at" => {
+                    if check_arity(self, 1) {
+                        self.check_expr(&args[0], &Type::I64);
+                    }
+                    Type::I64
+                }
+                "slice" => {
+                    if check_arity(self, 2) {
+                        self.check_expr(&args[0], &Type::I64);
+                        self.check_expr(&args[1], &Type::I64);
+                    }
+                    Type::Bytes
+                }
+                "concat" => {
+                    if check_arity(self, 1) {
+                        self.check_expr(&args[0], &Type::Bytes);
+                    }
+                    Type::Bytes
+                }
+                "to_list" => {
+                    check_arity(self, 0);
+                    Type::List(Box::new(Type::I64))
+                }
+                // Lossy, for the same reason `tcp_read` is ([L-LIB-NET]): a
+                // buffer carries bytes and a `str` carries text, and a
+                // malformed byte should not end a program that is inspecting
+                // one.
+                "to_str" => {
+                    check_arity(self, 0);
+                    Type::Str
+                }
+                "is_empty" => {
+                    check_arity(self, 0);
+                    Type::Bool
                 }
                 _ => return None,
             },

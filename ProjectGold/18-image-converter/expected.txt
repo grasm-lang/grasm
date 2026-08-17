@@ -1,0 +1,25 @@
+--- writing ---
+row stride for width 3: 12 bytes (3 of padding)
+file is 78 bytes: 54 header + 24 pixel data
+magic: 66,77  ('B' is 66, 'M' is 77)
+wrote projectgold_bmp/out.bmp
+--- reading it back ---
+bytes identical on the round trip: true
+parsed: 3x2, 24-bit, 6 pixels
+pixels identical to what was written: true
+first pixel R,G,B: 255,0,0
+last  pixel R,G,B: 128,64,32
+--- converting to greyscale ---
+red   255,0,0   -> 76 (expected 76)
+white 255,255,255 -> 255 (expected 255)
+black 0,0,0     -> 0 (expected 0)
+brown 128,64,32 -> 79 (expected 79)
+greyscale: 3x2, 24-bit, 6 pixels
+every pixel has R = G = B: true
+survived a second round trip: true
+--- malformed input, which must be refused and not crash ---
+empty: rejected — shorter than a BMP header (0 bytes)
+too short: rejected — shorter than a BMP header (4 bytes)
+wrong magic: rejected — not a BMP: magic is 65,65 and not 66,77
+8-bit: rejected — only 24-bit BMPs are read, found 8
+truncated: rejected — truncated: 60 bytes, header says 102

@@ -553,3 +553,44 @@ agreement on the first run. Both engines sort, and identically.
 
 Names are returned, not paths — the caller already knows the directory it asked
 about, and joining is one concatenation.
+
+## Bytes — [L-LIB-BYTES]
+
+**[L-LIB-BYTES]** `bytes` is a contiguous run of bytes, and it is the type `str`
+deliberately is not.
+
+A `str` is *text*: it holds UTF-8, and anything above 127 is re-encoded on the
+way out. That is correct for text and fatal for anything else. Asked to write the
+seven bytes of `mov rax, 1` — `48 c7 c0 01 00 00 00` — a `str` put **nine** bytes
+on disk, because `0xC7` became `c3 87`. A language whose only sequence type does
+that cannot read an image, build a network packet, or emit an object file.
+
+| | type | |
+|---|---|---|
+| `bytes_of(list)` | `([i64]) -> bytes` | every element must be in `0..255` |
+| `s.to_bytes()` | `(str) -> bytes` | the UTF-8 encoding of the text |
+| `b.to_str()` | `(bytes) -> str` | lossy, as `tcp_read` is |
+| `b.len()` | `(bytes) -> i64` | count of bytes |
+| `b.is_empty()` | `(bytes) -> bool` | |
+| `b.at(i)` | `(bytes, i64) -> i64` | one byte, `0..255`; out of range panics |
+| `b.slice(from, count)` | `(bytes, i64, i64) -> bytes` | out of range panics |
+| `b.concat(other)` | `(bytes, bytes) -> bytes` | |
+| `b.to_list()` | `(bytes) -> [i64]` | |
+| `read_bytes(path)` | `(str) -> bytes ! IoError` | |
+| `write_bytes(path, b)` | `(str, bytes) -> () ! IoError` | |
+
+**`bytes` is distinct from `[i64]` on purpose.** A list of integers cannot
+promise its elements are bytes, stores eight bytes per element, and cannot be
+handed to anything that wants a buffer. The promise is the type.
+
+**A byte is an `i64`.** `at` gives a number in `0..255` rather than a one-byte
+value type, because the language has one integer type and adding a second to
+describe an element would be a worse trade than the range check.
+
+**A `bytes` prints as hex**, `0x` then two digits per byte, and not as the text
+it might decode to. Showing it as text would undo the distinction the type
+exists to make.
+
+`to_str` is lossy for the same reason `tcp_read` is ([L-LIB-NET]): a buffer
+carries bytes and a `str` carries text, and a malformed byte should not end a
+program that is inspecting one.
