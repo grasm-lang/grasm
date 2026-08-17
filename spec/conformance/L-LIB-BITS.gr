@@ -1,0 +1,43 @@
+//! tag: L-LIB-BITS
+//! expect: output
+//! and 48 or 252 xor 204 not -241
+//! shl 3840 shr 15
+//! -4 15
+//! 1 -9223372036854775808 0
+//! rotr32 of 0x12345678 by 8 = 0x78123456
+//! masked to 32 bits: 4294967295
+// Bit manipulation on `i64`, as methods ([L-LIB-BITS]).
+fn main() {
+    let a = 0xF0
+    let b = 0x3C
+    print("and {a.bit_and(b)} or {a.bit_or(b)} xor {a.bit_xor(b)} not {a.bit_not()}")
+    print("shl {a.shl(4)} shr {a.shr(4)}")
+
+    // `shr` keeps the sign, `ushr` fills with zero. That is the whole reason
+    // both exist.
+    print("{(0 - 16).shr(2)} {(0 - 16).ushr(60)}")
+
+    // The shift count is masked to 0..63, so none of these traps.
+    print("{1.shl(64)} {1.shl(63)} {256.shr(0 - 1)}")
+
+    // A 32-bit rotate, which is what SHA-256 is built from. There is no
+    // unsigned 32-bit type, so the mask is written out.
+    let mask32 = 0xFFFFFFFF
+    let v = 0x12345678
+    let n = 8
+    let rotated = (v.ushr(n)).bit_or(v.shl(32 - n)).bit_and(mask32)
+    print("rotr32 of 0x12345678 by 8 = 0x{hex(rotated)}")
+    print("masked to 32 bits: {mask32.bit_and(0 - 1)}")
+}
+
+fn hex(v: i64) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 7
+    while i >= 0 {
+        let nibble = (v.ushr(i * 4)).bit_and(15)
+        out = out + digits.substr(nibble, 1)
+        i = i - 1
+    }
+    out
+}

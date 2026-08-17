@@ -1,0 +1,22 @@
+--- published test vectors ---
+empty: ok
+abc: ok
+448 bits: ok
+896 bits: ok
+a: ok
+--- length boundaries, where padding goes wrong ---
+55 bytes: ok
+56 bytes: ok
+63 bytes: ok
+64 bytes: ok
+65 bytes: ok
+--- non-ASCII, where a code-point implementation diverges ---
+e-acute: ok
+hello: ok
+--- the avalanche property ---
+one letter changed:
+  d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592
+  e4c4d8f3bf76b692de791a173e05321150f7a345b46484fe427f6acc7ecc81be
+hex digits differing: 59 of 64
+--- determinism ---
+same input twice: true

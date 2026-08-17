@@ -1,0 +1,235 @@
+// SHA-256, zero dependencies — bit manipulation, 32-bit arithmetic in a
+// 64-bit language, and known-answer tests.
+//
+// This project was blocked until [L-LIB-BITS] existed. It is the reason that
+// clause was added, and it is the strongest possible test of it: SHA-256 is
+// nothing but rotations, shifts, xors and truncated addition, and every one of
+// the published test vectors either matches exactly or does not. There is no
+// partial credit and no plausible-looking wrong answer.
+//
+// Grasm has no unsigned 32-bit type, so every operation masks to 32 bits by
+// hand. That is verbose and it is honest: the masking is where a
+// reimplementation actually goes wrong, and writing it out makes it checkable.
+
+let MASK32 = 0xFFFFFFFF
+
+fn m32(v: i64) -> i64 {
+    v.bit_and(MASK32)
+}
+
+fn add32(a: i64, b: i64) -> i64 {
+    m32(a + b)
+}
+
+/// Rotate right, within 32 bits. `ushr` and not `shr`: an arithmetic shift
+/// would smear the sign bit across the top and every hash would be wrong.
+fn rotr32(v: i64, n: i64) -> i64 {
+    m32((v.ushr(n)).bit_or(v.shl(32 - n)))
+}
+
+fn shr32(v: i64, n: i64) -> i64 {
+    m32(v.ushr(n))
+}
+
+fn k_table() -> [i64] {
+    [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
+        0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+        0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
+        0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
+        0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+        0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
+        0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+        0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    ]
+}
+
+/// The message as bytes. `str` is UTF-8 and `code_at` gives code points, so a
+/// non-ASCII character has to be encoded here — otherwise "é" would hash as
+/// one byte 0xE9 rather than the two bytes 0xC3 0xA9 that it actually is, and
+/// the digest would silently disagree with every other implementation.
+fn utf8_bytes(s: str) -> [i64] {
+    var out: [i64] = []
+    for cp in s.codes() {
+        if cp < 0x80 {
+            out.push(cp)
+        } else if cp < 0x800 {
+            out.push(0xC0.bit_or(cp.ushr(6)))
+            out.push(0x80.bit_or(cp.bit_and(0x3F)))
+        } else if cp < 0x10000 {
+            out.push(0xE0.bit_or(cp.ushr(12)))
+            out.push(0x80.bit_or((cp.ushr(6)).bit_and(0x3F)))
+            out.push(0x80.bit_or(cp.bit_and(0x3F)))
+        } else {
+            out.push(0xF0.bit_or(cp.ushr(18)))
+            out.push(0x80.bit_or((cp.ushr(12)).bit_and(0x3F)))
+            out.push(0x80.bit_or((cp.ushr(6)).bit_and(0x3F)))
+            out.push(0x80.bit_or(cp.bit_and(0x3F)))
+        }
+    }
+    out
+}
+
+fn sha256_bytes(msg: [i64]) -> [i64] {
+    var h = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    ]
+    let k = k_table()
+
+    // Padding: a 1 bit, then zeros, then the length in bits as 64 bits big-endian.
+    var data = msg
+    let bit_len = msg.len() * 8
+    data.push(0x80)
+    while data.len() % 64 != 56 {
+        data.push(0)
+    }
+    var i = 7
+    while i >= 0 {
+        data.push((bit_len.ushr(i * 8)).bit_and(0xFF))
+        i = i - 1
+    }
+
+    var block = 0
+    while block < data.len() {
+        var w: [i64] = []
+        for t in 0..16 {
+            let base = block + t * 4
+            w.push(m32(
+                data[base].shl(24)
+                    .bit_or(data[base + 1].shl(16))
+                    .bit_or(data[base + 2].shl(8))
+                    .bit_or(data[base + 3])
+            ))
+        }
+        for t in 16..64 {
+            let s0 = (rotr32(w[t - 15], 7)).bit_xor(rotr32(w[t - 15], 18)).bit_xor(shr32(w[t - 15], 3))
+            let s1 = (rotr32(w[t - 2], 17)).bit_xor(rotr32(w[t - 2], 19)).bit_xor(shr32(w[t - 2], 10))
+            w.push(add32(add32(w[t - 16], s0), add32(w[t - 7], s1)))
+        }
+
+        var a = h[0]
+        var b = h[1]
+        var c = h[2]
+        var d = h[3]
+        var e = h[4]
+        var f = h[5]
+        var g = h[6]
+        var hh = h[7]
+
+        for t in 0..64 {
+            let S1 = (rotr32(e, 6)).bit_xor(rotr32(e, 11)).bit_xor(rotr32(e, 25))
+            let ch = (e.bit_and(f)).bit_xor((e.bit_not().bit_and(MASK32)).bit_and(g))
+            let temp1 = add32(add32(add32(hh, S1), add32(ch, k[t])), w[t])
+            let S0 = (rotr32(a, 2)).bit_xor(rotr32(a, 13)).bit_xor(rotr32(a, 22))
+            let maj = (a.bit_and(b)).bit_xor(a.bit_and(c)).bit_xor(b.bit_and(c))
+            let temp2 = add32(S0, maj)
+
+            hh = g
+            g = f
+            f = e
+            e = add32(d, temp1)
+            d = c
+            c = b
+            b = a
+            a = add32(temp1, temp2)
+        }
+
+        h[0] = add32(h[0], a)
+        h[1] = add32(h[1], b)
+        h[2] = add32(h[2], c)
+        h[3] = add32(h[3], d)
+        h[4] = add32(h[4], e)
+        h[5] = add32(h[5], f)
+        h[6] = add32(h[6], g)
+        h[7] = add32(h[7], hh)
+
+        block = block + 64
+    }
+    h
+}
+
+fn hex8(v: i64) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 7
+    while i >= 0 {
+        out = out + digits.substr((v.ushr(i * 4)).bit_and(15), 1)
+        i = i - 1
+    }
+    out
+}
+
+fn sha256(s: str) -> str {
+    var out = ""
+    for word in sha256_bytes(utf8_bytes(s)) {
+        out = out + hex8(word)
+    }
+    out
+}
+
+fn check(label: str, input: str, want: str) {
+    let got = sha256(input)
+    let ok = got == want
+    if ok {
+        print("{label}: ok")
+    } else {
+        print("{label}: WRONG")
+        print("  got  {got}")
+        print("  want {want}")
+    }
+}
+
+fn main() {
+    // Every expected digest below was taken from an independent implementation
+    // (Python's `hashlib`), not from this program's own output. Two of them
+    // were typed wrongly the first time and this program disagreed with them —
+    // it was right and the constants were wrong, which is the correct way round
+    // for a known-answer test to fail.
+    print("--- published test vectors ---")
+    check("empty", "", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    check("abc", "abc", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+    // 56 bytes: exactly the length that forces a second block after padding.
+    check("448 bits", "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+          "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1")
+    // 112 bytes: two full blocks plus padding into a third.
+    check("896 bits", "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu",
+          "cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1")
+    check("a", "a", "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb")
+
+    print("--- length boundaries, where padding goes wrong ---")
+    // 55, 56, 63, 64, 65 bytes: the four places a padding bug lives.
+    check("55 bytes", "a".repeat(55), "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318")
+    check("56 bytes", "a".repeat(56), "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a")
+    check("63 bytes", "a".repeat(63), "7d3e74a05d7db15bce4ad9ec0658ea98e3f06eeecf16b4c6fff2da457ddc2f34")
+    check("64 bytes", "a".repeat(64), "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb")
+    check("65 bytes", "a".repeat(65), "635361c48bb9eab14198e76ea8ab7f1a41685d6ad62aa9146d301d4f17eb0ae0")
+
+    print("--- non-ASCII, where a code-point implementation diverges ---")
+    // "é" is one code point and two UTF-8 bytes. Hashing the code point gives
+    // a different digest from every other SHA-256 in the world.
+    check("e-acute", "é", "4a99557e4033c3539de2eb65472017cad5f9557f7a0625a09f1c3f6e2ba69c4c")
+    check("hello", "hello", "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824")
+
+    print("--- the avalanche property ---")
+    let h1 = sha256("The quick brown fox jumps over the lazy dog")
+    let h2 = sha256("The quick brown fox jumps over the lazy cog")
+    print("one letter changed:")
+    print("  {h1}")
+    print("  {h2}")
+    var differing = 0
+    let c1 = h1.chars()
+    let c2 = h2.chars()
+    for i in 0..c1.len() {
+        if c1[i] != c2[i] {
+            differing = differing + 1
+        }
+    }
+    print("hex digits differing: {differing} of {c1.len()}")
+
+    print("--- determinism ---")
+    print("same input twice: {sha256("repeat") == sha256("repeat")}")
+}

@@ -6374,6 +6374,37 @@ impl FnCx<'_, '_> {
                 VType::Str,
             ),
             (VType::I64, "abs") => (self.call_rt("grasm_i64_abs", &[rv]).unwrap(), VType::I64),
+            // [L-LIB-BITS]. Emitted as instructions rather than runtime calls:
+            // these are single machine operations and a call would cost more
+            // than the work.
+            //
+            // The shift count is masked to 0..63 first. Cranelift's shifts
+            // leave an out-of-range count as undefined behaviour, and the
+            // interpreter masks — so without this, `1.shl(64)` would be one
+            // answer under `grasm run` and whatever the hardware happened to do
+            // under `--native`, which is precisely the class of disagreement
+            // this project exists to prevent.
+            (VType::I64, "bit_and" | "bit_or" | "bit_xor") => {
+                let a = arg_scalar!(0, VType::I64);
+                let out = match m {
+                    "bit_and" => self.b.ins().band(rv, a),
+                    "bit_or" => self.b.ins().bor(rv, a),
+                    _ => self.b.ins().bxor(rv, a),
+                };
+                (out, VType::I64)
+            }
+            (VType::I64, "bit_not") => (self.b.ins().bnot(rv), VType::I64),
+            (VType::I64, "shl" | "shr" | "ushr") => {
+                let a = arg_scalar!(0, VType::I64);
+                let sixty_three = self.b.ins().iconst(types::I64, 63);
+                let count = self.b.ins().band(a, sixty_three);
+                let out = match m {
+                    "shl" => self.b.ins().ishl(rv, count),
+                    "shr" => self.b.ins().sshr(rv, count),
+                    _ => self.b.ins().ushr(rv, count),
+                };
+                (out, VType::I64)
+            }
             (VType::I64, "min" | "max") => {
                 let a = arg_scalar!(0, VType::I64);
                 let f = if m == "min" {

@@ -3432,6 +3432,28 @@ build links it, `grasm run` can only reach what is already loaded",
             }
             (Value::Int(i), "as_f64") => Value::Float(*i as f64),
             (Value::Int(i), "abs") => Value::Int(i.wrapping_abs()),
+            // [L-LIB-BITS]. Shift counts are masked to 0..63 rather than
+            // trapping: `1.shl(64)` is a question a program can ask by
+            // accident, and Rust's `<<` panics in debug and wraps in release,
+            // which is exactly the kind of difference between builds this
+            // project refuses to ship. Masking is what the hardware does and
+            // is the same answer under every engine.
+            (Value::Int(i), op @ ("bit_and" | "bit_or" | "bit_xor" | "shl" | "shr" | "ushr")) => {
+                let o = self.eval_expr(&args[0])?;
+                let Value::Int(j) = o else {
+                    return Err(Flow::Panic(format!("`{op}` expects an int")));
+                };
+                let a = *i;
+                Value::Int(match op {
+                    "bit_and" => a & j,
+                    "bit_or" => a | j,
+                    "bit_xor" => a ^ j,
+                    "shl" => a.wrapping_shl(j as u32),
+                    "shr" => a.wrapping_shr(j as u32),
+                    _ => ((a as u64).wrapping_shr(j as u32)) as i64,
+                })
+            }
+            (Value::Int(i), "bit_not") => Value::Int(!*i),
             (Value::Int(i), "to_str") => Value::str(i.to_string()),
             (Value::Int(i), "min") => {
                 let o = self.eval_expr(&args[0])?;

@@ -5910,6 +5910,23 @@ Perform the effect after the closing brace, or yield a number and do the work ou
                     }
                     Type::I64
                 }
+                // Bit manipulation, as methods rather than operators
+                // ([L-LIB-BITS]). The three obvious symbols are all taken or
+                // ambiguous: `^` is exponentiation, `|` begins a closure and
+                // separates sum-type variants, and `&&` is already reported as
+                // "written `and`". Words would collide with the logical
+                // operators, which are `and`/`or`/`not` — so methods, which is
+                // what `.abs()` and `.cmp()` already are.
+                "bit_and" | "bit_or" | "bit_xor" | "shl" | "shr" | "ushr" => {
+                    if check_arity(self, 1) {
+                        self.check_expr(&args[0], &Type::I64);
+                    }
+                    Type::I64
+                }
+                "bit_not" => {
+                    check_arity(self, 0);
+                    Type::I64
+                }
                 "to_str" => {
                     check_arity(self, 0);
                     Type::Str

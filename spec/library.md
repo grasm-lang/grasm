@@ -464,3 +464,39 @@ error: package `lib` performs `net` but its manifest only permits `io`
   help: either add the capability to that package's manifest, or stop it from
         performing the effect
 ```
+
+## Bit manipulation — [L-LIB-BITS]
+
+**[L-LIB-BITS]** Seven methods on `i64`:
+
+| | | |
+|---|---|---|
+| `a.bit_and(b)` | `(i64, i64) -> i64` | bitwise and |
+| `a.bit_or(b)` | `(i64, i64) -> i64` | bitwise or |
+| `a.bit_xor(b)` | `(i64, i64) -> i64` | bitwise exclusive or |
+| `a.bit_not()` | `(i64) -> i64` | ones' complement |
+| `a.shl(n)` | `(i64, i64) -> i64` | shift left |
+| `a.shr(n)` | `(i64, i64) -> i64` | shift right, **sign-preserving** |
+| `a.ushr(n)` | `(i64, i64) -> i64` | shift right, **zero-filling** |
+
+**Methods rather than operators**, and the reason is that every symbol is
+already taken or ambiguous. `^` is exponentiation. `|` begins a closure and
+separates sum-type variants, so `a | b` cannot be told from the start of one.
+`&&` is already reported as "written `and`". And words would collide with the
+logical operators, which in this language are `and`, `or` and `not` — so
+`a and b` would be boolean and `a band b` bitwise, one letter apart. Methods are
+what `.abs()` and `.cmp()` already are, and they carry their own precedence.
+
+**The shift count is masked to `0..63`.** `1.shl(64)` is `1`, not `0` and not a
+trap, and `256.shr(-1)` is `256.shr(63)`, which is `0`. This is what the
+hardware does, and it is stated because the alternatives are worse: Rust's `<<`
+panics in a debug build and wraps in a release one, which is the class of
+difference-between-builds this project refuses to ship, and Cranelift leaves an
+out-of-range count undefined, which would make the two engines disagree.
+
+`shr` preserves the sign and `ushr` does not, which is the only reason both
+exist: `(-16).shr(2)` is `-4` and `(-16).ushr(60)` is `15`.
+
+There is no unsigned integer type, so a program working in 32 bits masks with
+`0xFFFFFFFF` itself. `spec/conformance/L-LIB-BITS.gr` shows the rotation that
+SHA-256 needs, written that way.

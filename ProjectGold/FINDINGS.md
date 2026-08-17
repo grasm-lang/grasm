@@ -40,11 +40,28 @@ Consistent and probably right for a high-level language, but there is no way to
 ask how many *bytes* a string occupies — which matters the moment a program
 writes one to a socket or a file and has to say how long it is.
 
-## F3 — no bitwise operators at all (S3, language)
+## F3 — no bitwise operators at all (S3) — **fixed as [L-LIB-BITS]**
 
-No `>>`, `<<`, `&`, `|`, `^` on `i64`. Blocks 18 (BMP), 25 (DNS), 27 (SHA-256)
-outright, and forces division-by-power-of-two in place of shifts everywhere
-else. Hex literals (`0xFF`) do parse.
+No `>>`, `<<`, `&`, `|`, `^` on `i64`. Blocked 18 (BMP), 25 (DNS) and 27
+(SHA-256) outright, and forced division-by-power-of-two in place of shifts
+everywhere else. Hex literals (`0xFF` ) did parse.
+
+**Fixed** — as seven methods, not operators: `bit_and`, `bit_or`, `bit_xor`,
+`bit_not`, `shl`, `shr`, `ushr`. Every symbol was already taken or ambiguous:
+`^` is exponentiation, `|` begins a closure and separates sum-type variants, and
+`&&` is already reported as "written `and`". Words would collide with the
+logical operators, which are `and`/`or`/`not` — `a and b` boolean and `a band b`
+bitwise, one letter apart, is worse than either. Methods are what `.abs()` and
+`.cmp()` already are.
+
+The shift count is masked to `0..63` rather than trapping or being left
+undefined. Rust's `<<` panics in debug and wraps in release, which is the
+class of difference-between-builds this project refuses to ship; Cranelift
+leaves an out-of-range count undefined, which would make the engines disagree.
+Masking is what the hardware does and it is the same answer everywhere —
+verified: `1.shl(64)` is `1` and `256.shr(-1)` is `0` under both engines.
+
+This unblocked project 27, which now passes 12 of 12 SHA-256 vectors.
 
 ## F4 — `_` is a pattern in `match` and nowhere else (S3) — **fixed**
 
