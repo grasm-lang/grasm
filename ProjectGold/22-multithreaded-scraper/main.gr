@@ -1,0 +1,267 @@
+// A concurrent fetcher — `tcp_connect`, `par_map`, and shared-state safety.
+//
+// This project was blocked until [L-LIB-NET] grew a client half. It is the
+// reason `tcp_connect` was added.
+//
+// The list calls for "thread-safe memory sharing, mutexes, or lock mechanisms".
+// Grasm has no mutex and does not need one here, and that is the interesting
+// part: `par_map` **refuses at compile time** to capture a `ref`, so the data
+// race the exercise is about cannot be written. The refusal is demonstrated in
+// a comment at the bottom, with the compiler's own words.
+//
+// The default run is offline and deterministic: it parses and merges responses
+// that are supplied as text, which is the part that can be compared across
+// three engines. `-- fetch` does the real thing against a server, and the
+// harness that starts one is in README.md.
+
+type Page = {
+    url: str,
+    status: i64,
+    bytes: i64,
+    title: str,
+    links: [str],
+    error: str,
+}
+
+fn failed(url: str, why: str) -> Page {
+    Page{ url: url, status: 0, bytes: 0, title: "", links: [], error: why }
+}
+
+// --- parsing, which is the testable half --------------------------------------
+
+fn status_of(resp: str) -> i64 {
+    let lines = resp.lines()
+    if lines.len() == 0 {
+        return 0
+    }
+    let parts = lines[0].split(" ")
+    if parts.len() < 2 {
+        return 0
+    }
+    parts[1].trim().parse_int() ?? 0
+}
+
+fn body_of(resp: str) -> str {
+    match resp.index_of("\r\n\r\n") {
+        Some(at) -> resp.substr(at + 4, resp.len() - at - 4)
+        None -> match resp.index_of("\n\n") {
+            Some(at) -> resp.substr(at + 2, resp.len() - at - 2)
+            None -> ""
+        }
+    }
+}
+
+/// Text between the first `<tag>` and its `</tag>`, tags stripped.
+fn between_tags(html: str, tag: str) -> str {
+    let open = "<" + tag + ">"
+    let close = "</" + tag + ">"
+    match html.to_lower().index_of(open) {
+        None -> ""
+        Some(a) -> match html.to_lower().index_of(close) {
+            None -> ""
+            Some(b) -> {
+                if b <= a + open.len() {
+                    ""
+                } else {
+                    html.substr(a + open.len(), b - a - open.len()).trim()
+                }
+            }
+        }
+    }
+}
+
+/// Every `href="..."`, in document order. Deliberately simple-minded: this is a
+/// scraper, not an HTML parser, and it says so rather than pretending.
+fn links_in(html: str) -> [str] {
+    var out: [str] = []
+    let lower = html.to_lower()
+    let cs = html.chars()
+    let lcs = lower.chars()
+    var i = 0
+    while i < lcs.len() {
+        var matched = true
+        let needle = "href=\"".chars()
+        if i + needle.len() <= lcs.len() {
+            for k in 0..needle.len() {
+                if lcs[i + k] != needle[k] {
+                    matched = false
+                }
+            }
+        } else {
+            matched = false
+        }
+        if matched {
+            var j = i + needle.len()
+            var url = ""
+            while j < cs.len() and cs[j] != "\"" {
+                url = url + cs[j]
+                j = j + 1
+            }
+            out.push(url)
+            i = j
+        } else {
+            i = i + 1
+        }
+    }
+    out
+}
+
+fn parse_response(url: str, resp: str) -> Page {
+    if resp == "" {
+        return failed(url, "empty response")
+    }
+    let status = status_of(resp)
+    if status == 0 {
+        return failed(url, "not an HTTP response")
+    }
+    let body = body_of(resp)
+    Page{
+        url: url,
+        status: status,
+        bytes: body.len(),
+        title: between_tags(body, "title"),
+        links: links_in(body),
+        error: "",
+    }
+}
+
+// --- the concurrent half ------------------------------------------------------
+
+fn request_for(path: str) -> str {
+    "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+}
+
+fn fetch_one(port: i64, path: str) -> Page / {io, net} {
+    match tcp_connect("127.0.0.1", port) {
+        Err(e) -> failed(path, "connect: {e}")
+        Ok(conn) -> {
+            match tcp_write(conn, request_for(path)) {
+                Err(e) -> {
+                    tcp_close(conn)
+                    failed(path, "write: {e}")
+                }
+                Ok(_) -> {
+                    let raw = tcp_read(conn) ?? ""
+                    tcp_close(conn)
+                    parse_response(path, raw)
+                }
+            }
+        }
+    }
+}
+
+fn show(p: Page) {
+    if p.error != "" {
+        print("  {p.url}: error: {p.error}")
+    } else {
+        print("  {p.url}: {p.status}, {p.bytes} byte(s), title \"{p.title}\", {p.links.len()} link(s)")
+    }
+}
+
+fn main() / {io, net} {
+    if args().contains("fetch") {
+        print("--- fetching (sequentially — see F14) ---")
+        let paths = ["/", "/hello", "/hello?name=one", "/echo", "/nope", "/"]
+        // Sequential, and not by choice. `par_map` is the only multicore path
+        // in the language and it refuses any closure that performs an effect:
+        //
+        //     error: this parallel operation needs an effect-free function, but
+        //            the one given performs `net`
+        //
+        // The reasoning is sound — effects on several cores would interleave
+        // differently between runs, and `par_map` promises a deterministic
+        // answer. But `spawn` is deliberately single-core ([E-NOT-PARALLEL]),
+        // so between them there is no way to do concurrent I/O at all, and the
+        // "multithreaded" in this project's title is currently unwritable.
+        // FINDINGS.md, F14 — the largest gap this directory found.
+        var pages: [Page] = []
+        for p in paths {
+            pages.push(fetch_one(8971, p))
+        }
+        for p in pages {
+            show(p)
+        }
+        var ok = 0
+        for p in pages {
+            if p.status == 200 { ok = ok + 1 }
+        }
+        print("  {ok} of {pages.len()} returned 200")
+        return
+    }
+
+    // Canned responses, so the parsing half is deterministic and comparable
+    // across all three engines.
+    let canned = [
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html><title>First</title><a href=\"/a\">a</a><a href=\"/b\">b</a></html>",
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html><title>No links</title><p>nothing here</p></html>",
+        "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\n\r\n<h1>404</h1>",
+        "HTTP/1.1 500 Internal Server Error\r\n\r\n",
+        "HTTP/1.1 200 OK\r\n\r\n<TITLE>Upper Case</TITLE><A HREF=\"/c\">c</A>",
+        "not an http response at all",
+        "",
+    ]
+    let names = ["/first", "/nolinks", "/missing", "/broken", "/uppercase", "/garbage", "/empty"]
+
+    print("--- parsing responses ---")
+    var pages: [Page] = []
+    for i in 0..canned.len() {
+        let p = parse_response(names[i], canned[i])
+        pages.push(p)
+        show(p)
+    }
+
+    print("--- the same work through par_map ---")
+    // Identical inputs, run in parallel. The results must be the same and in
+    // the same order — [E-PAR-MAP-ORDER] says `par_map` preserves it, and a
+    // scraper that returns pages in completion order is a scraper whose output
+    // changes between runs.
+    let indexes = [0, 1, 2, 3, 4, 5, 6]
+    let parallel_pages = indexes.par_map(|i| parse_response(names[i], canned[i]))
+    var same = true
+    for i in 0..pages.len() {
+        if pages[i].url != parallel_pages[i].url or
+            pages[i].status != parallel_pages[i].status or
+            pages[i].bytes != parallel_pages[i].bytes or
+            pages[i].title != parallel_pages[i].title or
+            pages[i].links.len() != parallel_pages[i].links.len() {
+            same = false
+        }
+    }
+    print("  par_map gave identical results, in order: {same}")
+
+    print("--- aggregate ---")
+    var total_bytes = 0
+    var total_links = 0
+    var ok = 0
+    var errors = 0
+    for p in pages {
+        total_bytes = total_bytes + p.bytes
+        total_links = total_links + p.links.len()
+        if p.status == 200 { ok = ok + 1 }
+        if p.error != "" { errors = errors + 1 }
+    }
+    print("  {pages.len()} pages, {ok} ok, {errors} unusable, {total_bytes} bytes, {total_links} links")
+
+    print("--- link extraction ---")
+    for html in ["<a href=\"/one\">x</a>", "<a href=''>x</a>", "no links",
+                 "<a href=\"/a\"><a href=\"/b\">", "<a href=\"\">", "href=\"/bare\""] {
+        print("  {links_in(html)}")
+    }
+
+    print("--- why there is no mutex here ---")
+    // A shared counter would be the classic race, and `par_map` will not let
+    // one be written. This is refused at compile time:
+    //
+    //     let hits = ref(Cell{ n: 0 })
+    //     let _ = paths.par_map(|p| { hits.n += 1  p })
+    //
+    //     error: a `par_map` closure may not reach a `ref` declared outside it
+    //       help: `par_map` runs its closure on several threads at once, and a
+    //             `ref` is a handle into one shared heap
+    //
+    // So the data race this project is nominally about cannot be expressed.
+    // The results are collected by `par_map` itself and merged afterwards,
+    // which is the shape the refusal pushes you into.
+    print("  a par_map closure cannot capture a `ref` — see the comment above")
+    print("  run `grasm run main.gr -- fetch` with the server up for the real thing")
+}

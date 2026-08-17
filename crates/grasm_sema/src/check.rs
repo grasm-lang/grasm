@@ -217,6 +217,7 @@ fn looks_like(candidate: &str, written: &str) -> bool {
 const BUILTIN_FREE_FNS: &[&str] = &[
     "print",
     "tcp_listen",
+    "tcp_connect",
     "tcp_accept",
     "tcp_read",
     "tcp_write",
@@ -4287,6 +4288,21 @@ only a number or a `bool` can come out — compute what you need and yield that"
                             args: vec![],
                         };
                         return Type::Fallible(Box::new(gives), Box::new(io_err));
+                    }
+                    // The other half of [L-LIB-NET]: without it a program could
+                    // be a server and could not be a client.
+                    "tcp_connect" => {
+                        if args.len() != 2 {
+                            return self
+                                .error(span, "tcp_connect takes 2 arguments (host, port)");
+                        }
+                        self.check_expr(&args[0], &Type::Str);
+                        self.check_expr(&args[1], &Type::I64);
+                        let io_err = Type::Named {
+                            id: self.defs.io_error_id,
+                            args: vec![],
+                        };
+                        return Type::Fallible(Box::new(Type::I64), Box::new(io_err));
                     }
                     "tcp_write" => {
                         if args.len() != 2 {

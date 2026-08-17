@@ -637,6 +637,26 @@ impl<'a, W: Write> Interp<'a, W> {
             };
         }
 
+        // `tcp_connect` takes a host in the first position rather than a
+        // handle, which is why it is settled here beside `tcp_listen` and
+        // before the handle is read.
+        if which == "tcp_connect" {
+            let host = handle.to_string();
+            let Some(port) = text.as_ref().and_then(|t| t.parse::<i64>().ok()) else {
+                return fail("port must be an integer".to_string());
+            };
+            if !(1..=65535).contains(&port) {
+                return fail(format!("port {port} is out of range"));
+            }
+            return match std::net::TcpStream::connect((host.as_str(), port as u16)) {
+                Ok(stream) => {
+                    self.sockets.push(Some(NetSocket::Stream(stream)));
+                    Value::Ok(Rc::new(Value::Int((self.sockets.len() - 1) as i64)))
+                }
+                Err(e) => fail(e.to_string()),
+            };
+        }
+
         let Some(h) = as_int(handle) else {
             return fail("handle must be an integer".to_string());
         };
@@ -2237,9 +2257,10 @@ build links it, `grasm run` can only reach what is already loaded",
                     // ([L-LIB-NET]). The reference engine owns the sockets;
                     // a compiled build calls the runtime, and both keep the
                     // same table shape so a handle means the same thing.
-                    "tcp_listen" | "tcp_accept" | "tcp_read" | "tcp_write" | "tcp_close" => {
+                    "tcp_listen" | "tcp_connect" | "tcp_accept" | "tcp_read"
+                    | "tcp_write" | "tcp_close" => {
                         let h = self.eval_expr(&args[0])?;
-                        let extra = if id.name == "tcp_write" {
+                        let extra = if id.name == "tcp_write" || id.name == "tcp_connect" {
                             Some(self.eval_expr(&args[1])?.to_string())
                         } else {
                             None

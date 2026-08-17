@@ -25,6 +25,7 @@ pub const NET: &str = "net";
 /// The builtins that perform `net`.
 const NET_BUILTINS: &[&str] = &[
     "tcp_listen",
+    "tcp_connect",
     "tcp_accept",
     "tcp_read",
     "tcp_write",

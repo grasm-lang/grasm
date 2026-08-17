@@ -233,3 +233,43 @@ so neither gives a connection its own thread of control today.
 This is the one gap on the list that is a genuine design question rather than a
 missing builtin, because the answer interacts with the effect system: an `async`
 row already exists in the vocabulary and nothing performs it.
+
+## F14 — there is no way to do concurrent I/O (S3, language) — the biggest one
+
+Found writing 22-multithreaded-scraper, after `tcp_connect` unblocked it.
+
+```grasm
+let pages = paths.par_map(|p| fetch_one(8971, p))
+```
+```
+error: this parallel operation needs an effect-free function, but the one given
+       performs `net`
+  help: elements are processed on several cores, so an effect would interleave
+        differently between runs — use `map` for effectful work
+```
+
+The reasoning is sound: `par_map` promises a deterministic result, and effects
+running on several cores would interleave differently between runs. But taken
+together with the other half of the story it leaves nothing:
+
+* `par_map` is the only multicore path, and it **refuses every effect**.
+* `spawn` / `parallel` are documented as **deliberately single-core**
+  ([E-NOT-PARALLEL]), so they give concurrency but not parallelism.
+
+So a Grasm program can compute on many cores, and can perform I/O, and **cannot
+do both at once**. Every concurrent server, every parallel fetcher, every
+pipeline that reads while it computes is unwritable. Project 22 falls back to
+fetching sequentially; project 30 is blocked outright.
+
+This is the largest gap in this directory, and it sits directly under the
+north-star goal that claims the most. MASTERPLAN G6 asks for "structured,
+uncolored concurrency, 1M+ tasks/node"; `docs/northstar.md` already records it
+as **retreated**. This is what that retreat costs in practice.
+
+It is also the one gap whose fix is *interesting* rather than mechanical, and
+the language already contains the shape of it. `async` is in the effect
+vocabulary and nothing performs it. An I/O operation that performs `async`, a
+handler that decides what that means, and `par_map`'s refusal narrowed from "any
+effect" to "any effect that is not `async`" is a design that fits the existing
+type system — and is close to how WebAssembly's stack-switching proposal is
+specified, which is the same bet `docs/wasm.md` argues for.

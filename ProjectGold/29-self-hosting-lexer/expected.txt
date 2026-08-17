@@ -19,9 +19,8 @@ multiline string: ERROR(unterminated string literal) nl ident(def) ERROR(untermi
 unterminated comment: ERROR(unterminated block comment)
 stray character: ident(a) ERROR(unexpected character `$`) ident(b)
 --- against the reference implementation ---
-  files where the token count matches the reference exactly: 25
-  files where it does not: 0
+  files whose token count differs from the reference: 0
 --- lexing itself ---
-  own source: 14706 characters, 2797 tokens, 12 doc line(s)
-  ident 760, int 82, keyword 220, newline 339, op 1217, str 179
+  own source: 15025 characters, 2797 tokens, 12 doc line(s)
+  ident 761, int 82, keyword 221, newline 339, op 1216, str 178
   lexical errors in its own source: 0

@@ -687,6 +687,7 @@ impl<'m> Codegen<'m> {
             // The `net` capability. Handles and payloads are ordinary boxed
             // values, so these look like any other runtime call.
             ("grasm_tcp_listen", vec![i64t], Some(i64t)),
+            ("grasm_tcp_connect", vec![i64t, i64t], Some(i64t)),
             ("grasm_tcp_accept", vec![i64t], Some(i64t)),
             ("grasm_tcp_read", vec![i64t], Some(i64t)),
             ("grasm_tcp_write", vec![i64t, i64t], Some(i64t)),
@@ -7254,6 +7255,26 @@ checker did",
                     VType::Fallible(Box::new(ok_t), Box::new(VType::Sum("IoError".into()))),
                 )));
             }
+            // Two boxed arguments, a host and a port, and an `i64` handle
+            // back — the same shape as `tcp_write` rather than `tcp_listen`.
+            "tcp_connect" => {
+                let (hostv, hostt) = self.eval_expr_val(&args[0])?;
+                let boxed_host = self.box_value(hostv, &hostt);
+                let (portv, portt) = self.eval_expr_val(&args[1])?;
+                let boxed_port = self.box_value(portv, &portt);
+                let v = self
+                    .call_rt("grasm_tcp_connect", &[boxed_host, boxed_port])
+                    .unwrap();
+                self.call_rt("grasm_val_dec", &[boxed_host]);
+                self.call_rt("grasm_val_dec", &[boxed_port]);
+                return Ok(Some((
+                    v,
+                    VType::Fallible(
+                        Box::new(VType::I64),
+                        Box::new(VType::Sum("IoError".into())),
+                    ),
+                )));
+            }
             "tcp_write" => {
                 let (hv, ht) = self.eval_expr_val(&args[0])?;
                 let boxed_h = self.box_value(hv, &ht);
@@ -8322,7 +8343,7 @@ checker did",
                             "file_exists" => Some(VType::Bool),
                             "args" => Some(VType::List(Box::new(VType::Str))),
                             "env" => Some(VType::Option(Box::new(VType::Str))),
-                            "tcp_listen" | "tcp_accept" => Some(VType::Fallible(
+                            "tcp_listen" | "tcp_connect" | "tcp_accept" => Some(VType::Fallible(
                                 Box::new(VType::I64),
                                 Box::new(VType::Sum("IoError".into())),
                             )),

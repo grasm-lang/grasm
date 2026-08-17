@@ -2511,10 +2511,18 @@ count in [`core.md`](core.md) does not move.
 | | type | |
 |---|---|---|
 | `tcp_listen(port)` | `(i64) -> i64 ! IoError` | listens on `127.0.0.1:port`; `0` asks the system to choose |
+| `tcp_connect(host, port)` | `(str, i64) -> i64 ! IoError` | dials `host:port`; a name is resolved |
 | `tcp_accept(h)` | `(i64) -> i64 ! IoError` | waits for a connection, answering with a handle for it |
 | `tcp_read(h)` | `(i64) -> str ! IoError` | what has arrived, as text |
 | `tcp_write(h, text)` | `(i64, str) -> () ! IoError` | writes and flushes |
 | `tcp_close(h)` | `(i64) -> ()` | closes a listener or a connection |
+
+`tcp_connect` is the half that makes a program a *client*. Without it a Grasm
+program could listen and accept and never dial — no fetching a URL, no calling
+an API, no talking to a database — which is a gap invisible until somebody tries
+to write an ordinary program. Resolution failure and connection failure are the
+same `IoFailed` to a caller, because both mean "there is nothing to talk to",
+and the message carries the difference.
 
 A handle is an integer and a payload is text, so reaching the network needed no
 pointer type and no byte buffer. That is the reason the surface looks like this:

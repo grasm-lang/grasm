@@ -3,6 +3,8 @@
 //! listening
 //! closed twice is fine
 //! a closed handle reports rather than panics
+//! nothing is listening there, and that is an Err
+//! an unresolvable name is an Err too
 // The `net` capability: handles are integers, payloads are text.
 //
 // Port 0 asks the system to choose, so this program can run anywhere without
@@ -24,6 +26,17 @@ fn main() / {io, net} {
             match tcp_read(listener) {
                 Ok(_) -> print("a closed handle answered, which it must not")
                 Err(e) -> print("a closed handle reports rather than panics")
+            }
+            // `tcp_connect` is the client half. Port 1 is privileged and
+            // nothing listens there, so this is a refusal rather than a
+            // machine-dependent answer.
+            match tcp_connect("127.0.0.1", 1) {
+                Ok(_) -> print("something answered on port 1, which it must not")
+                Err(e) -> print("nothing is listening there, and that is an Err")
+            }
+            match tcp_connect("no.such.host.invalid", 80) {
+                Ok(_) -> print("an invalid name resolved, which it must not")
+                Err(e) -> print("an unresolvable name is an Err too")
             }
         }
     }

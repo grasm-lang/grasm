@@ -378,8 +378,13 @@ fn main() / {io} {
                     }
                 }
             }
-            print("  files where the token count matches the reference exactly: {agree}")
-            print("  files where it does not: {differ}")
+            // Only the disagreements are printed, and the count of files is
+            // deliberately not. Adding a program to this directory would
+            // otherwise change this program's output and fail the gate, which
+            // would report "the self-hosted lexer regressed" about somebody
+            // writing an unrelated project.
+            let _seen = agree
+            print("  files whose token count differs from the reference: {differ}")
         }
     }
 

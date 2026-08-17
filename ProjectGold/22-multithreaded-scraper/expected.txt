@@ -1,0 +1,22 @@
+--- parsing responses ---
+  /first: 200, 69 byte(s), title "First", 2 link(s)
+  /nolinks: 200, 55 byte(s), title "No links", 0 link(s)
+  /missing: 404, 12 byte(s), title "", 0 link(s)
+  /broken: 500, 0 byte(s), title "", 0 link(s)
+  /uppercase: 200, 43 byte(s), title "Upper Case", 1 link(s)
+  /garbage: error: not an HTTP response
+  /empty: error: empty response
+--- the same work through par_map ---
+  par_map gave identical results, in order: true
+--- aggregate ---
+  7 pages, 3 ok, 2 unusable, 179 bytes, 3 links
+--- link extraction ---
+  [/one]
+  []
+  []
+  [/a, /b]
+  []
+  [/bare]
+--- why there is no mutex here ---
+  a par_map closure cannot capture a `ref` — see the comment above
+  run `grasm run main.gr -- fetch` with the server up for the real thing

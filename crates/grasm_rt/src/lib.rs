@@ -3747,6 +3747,38 @@ pub unsafe extern "C" fn grasm_tcp_listen(port: *mut RtVal) -> *mut RtVal {
     }
 }
 
+/// Opens a connection to `host:port`, answering with a handle for it.
+///
+/// The other half of [L-LIB-NET]. Without it a Grasm program could be a server
+/// and could not be a client — no fetching a URL, no calling an API, no talking
+/// to a database — which is the shape of gap that is invisible until somebody
+/// tries to write an ordinary program (ProjectGold 22).
+///
+/// The host is resolved by the standard library, so a name works as well as an
+/// address. Resolution failure and connection failure are the same `IoFailed`
+/// to a caller, because both mean "there is nothing to talk to" and the message
+/// carries the difference.
+///
+/// # Safety: called from compiled Grasm with boxed values.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_tcp_connect(host: *mut RtVal, port: *mut RtVal) -> *mut RtVal {
+    let host = match &(*host).payload {
+        RtPayload::Str(s) => s.to_string(),
+        _ => return err_of(io_err("IoFailed", "host must be text".to_string())),
+    };
+    let port = match &(*port).payload {
+        RtPayload::I64(n) => *n,
+        _ => return err_of(io_err("IoFailed", "port must be an integer".to_string())),
+    };
+    if !(1..=65535).contains(&port) {
+        return err_of(io_err("IoFailed", format!("port {port} is out of range")));
+    }
+    match std::net::TcpStream::connect((host.as_str(), port as u16)) {
+        Ok(stream) => ok_of(alloc(RtPayload::I64(socket_put(Socket::Stream(stream))))),
+        Err(e) => err_of(io_err("IoFailed", e.to_string())),
+    }
+}
+
 /// Waits for a connection, answering with a handle for it.
 ///
 /// # Safety: called from compiled Grasm with a boxed value.
