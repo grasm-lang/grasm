@@ -20,6 +20,14 @@ WORK="${TMPDIR:-/tmp}/projectgold_$$"
 mkdir -p "$WORK"
 trap 'rm -rf "$WORK"' EXIT
 
+# Project 29 compares its own Grasm-written lexer against the reference lexer's
+# token counts. Those counts are regenerated here rather than committed stale:
+# otherwise editing any program in this directory turns into "the self-hosted
+# lexer disagrees", which is a different finding entirely.
+if [ -x 29-self-hosting-lexer/refresh.sh ]; then
+    GRASM="$GRASM" bash 29-self-hosting-lexer/refresh.sh
+fi
+
 pass=0; fail=0; blocked=0
 declare -a FAILED=() BLOCKED=()
 

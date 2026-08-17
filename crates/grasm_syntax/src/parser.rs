@@ -325,6 +325,22 @@ impl Parser {
         }
     }
 
+    /// Whether the token just consumed began a line — i.e. a newline token sits
+    /// immediately before it.
+    fn at_line_start(&self) -> bool {
+        let mut j = self.i;
+        // `self.i` has already advanced past the offending token.
+        while j > 0 {
+            j -= 1;
+            match self.toks.get(j).map(|t| &t.kind) {
+                Some(TokenKind::Newline) => return true,
+                Some(_) if j + 1 == self.i => continue,
+                _ => return false,
+            }
+        }
+        false
+    }
+
     /// The binary operator that begins the next line, if one does.
     ///
     /// A newline ends a statement unless the line ends in an operator or a
@@ -341,6 +357,7 @@ impl Parser {
     /// invented error at the `or`. Neither said what to move. Found by writing
     /// an ordinary program (ProjectGold 06).
     fn wrapped_operator_ahead(&self) -> Option<&'static str> {
+        // Shared with the expression-position diagnostic below.
         if !matches!(self.toks.get(self.i).map(|t| &t.kind), Some(TokenKind::Newline)) {
             return None;
         }
@@ -1930,8 +1947,25 @@ impl Parser {
                 // Operators other languages spell differently are the ones a
                 // newcomer types by reflex, and "expected an expression" says
                 // nothing about which word to reach for instead.
-                let hint = match other {
-                    TokenKind::Bang => Some("negation is `not`, as in `not done`"),
+                let hint: Option<String> = match other {
+                    TokenKind::Bang => {
+                        Some("negation is `not`, as in `not done`".to_string())
+                    }
+                    // A binary operator where an expression belongs, at the
+                    // start of a line, is a wrapped expression written the way
+                    // most languages allow and this one does not: a newline ends
+                    // a statement unless the line *ends* in an operator.
+                    //
+                    // This is the common shape of that mistake — the previous
+                    // line parsed cleanly as a complete statement, so nothing
+                    // failed until the operator itself. The `expect` path
+                    // catches the other shape, where the statement was still
+                    // open.
+                    _ if self.at_line_start() => binary_operator_name(&other).map(|op| {
+                        format!(
+                            "a newline ends a statement unless the line *ends* in an operator, so the previous line was complete. Move this `{op}` up to the end of it, or wrap the whole expression in parentheses"
+                        )
+                    }),
                     _ => None,
                 };
                 let mut d = Diagnostic::error(
@@ -2410,4 +2444,30 @@ fn is_place_expr(e: &Expr) -> bool {
         e,
         Expr::Ident(_) | Expr::Field { .. } | Expr::Index { .. }
     )
+}
+
+/// The spelling of a binary operator token, for diagnostics.
+///
+/// Kept beside the parser rather than on `TokenKind`, because it answers a
+/// narrower question than `describe()` does: not "what is this token" but
+/// "is this a binary operator, and what does it look like".
+fn binary_operator_name(kind: &TokenKind) -> Option<&'static str> {
+    match kind {
+        TokenKind::KwAnd => Some("and"),
+        TokenKind::KwOr => Some("or"),
+        TokenKind::Plus => Some("+"),
+        TokenKind::Star => Some("*"),
+        TokenKind::Slash => Some("/"),
+        TokenKind::Percent => Some("%"),
+        TokenKind::EqEq => Some("=="),
+        TokenKind::NotEq => Some("!="),
+        TokenKind::Lt => Some("<"),
+        TokenKind::Gt => Some(">"),
+        TokenKind::LtEq => Some("<="),
+        TokenKind::GtEq => Some(">="),
+        TokenKind::PipeGt => Some("|>"),
+        // `-` is deliberately absent: it is also unary, so a line starting with
+        // one is at least as likely to be a negation as a continuation.
+        _ => None,
+    }
 }

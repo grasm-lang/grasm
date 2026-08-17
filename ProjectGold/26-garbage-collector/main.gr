@@ -1,0 +1,270 @@
+// A garbage collector — a simulated heap, reference counting, and mark-sweep.
+//
+// Both algorithms are implemented over the same heap, and the point of the
+// project is the case where they *disagree*: a cycle. Reference counting
+// cannot collect one and mark-and-sweep can, which is the single most important
+// fact about the two techniques and is invisible in a program that only ever
+// builds trees.
+//
+// So the test set includes a self-cycle, a two-node cycle, a longer cycle, and
+// an unreachable cycle hanging off a reachable graph. The counts from the two
+// collectors are compared on every case, and the difference is exactly the
+// garbage that refcounting leaks.
+
+type Object = {
+    id: i64,
+    name: str,
+    refs: [i64],       // outgoing edges, by id
+    rc: i64,           // reference count
+    marked: bool,
+    freed: bool,
+}
+
+type Heap = {
+    objects: [Object],
+    roots: [i64],
+}
+
+fn new_heap() -> Heap {
+    Heap{ objects: [], roots: [] }
+}
+
+fn alloc(inout h: Heap, name: str) -> i64 {
+    let id = h.objects.len()
+    h.objects.push(Object{ id: id, name: name, refs: [], rc: 0, marked: false, freed: false })
+    id
+}
+
+fn point(inout h: Heap, from: i64, to: i64) {
+    h.objects[from].refs.push(to)
+    h.objects[to].rc = h.objects[to].rc + 1
+}
+
+fn add_root(inout h: Heap, id: i64) {
+    h.roots.push(id)
+    h.objects[id].rc = h.objects[id].rc + 1
+}
+
+fn drop_root(inout h: Heap, id: i64) {
+    var kept: [i64] = []
+    var dropped = false
+    for r in h.roots {
+        if r == id and not dropped {
+            dropped = true
+        } else {
+            kept.push(r)
+        }
+    }
+    h.roots = kept
+    if dropped {
+        h.objects[id].rc = h.objects[id].rc - 1
+    }
+}
+
+fn live_count(h: Heap) -> i64 {
+    var n = 0
+    for o in h.objects {
+        if not o.freed { n = n + 1 }
+    }
+    n
+}
+
+fn live_names(h: Heap) -> [str] {
+    var out: [str] = []
+    for o in h.objects {
+        if not o.freed { out.push(o.name) }
+    }
+    out.sort()
+    out
+}
+
+// --- reference counting -----------------------------------------------------
+//
+// Free anything whose count reached zero, then decrement what it pointed at,
+// repeatedly, until nothing more falls to zero. Cascading is the whole point:
+// freeing a list head must free its tail.
+fn collect_refcount(inout h: Heap) -> i64 {
+    var freed_now = 0
+    var going = true
+    while going {
+        going = false
+        for i in 0..h.objects.len() {
+            if not h.objects[i].freed and h.objects[i].rc <= 0 {
+                h.objects[i].freed = true
+                freed_now = freed_now + 1
+                going = true
+                for target in h.objects[i].refs {
+                    h.objects[target].rc = h.objects[target].rc - 1
+                }
+            }
+        }
+    }
+    freed_now
+}
+
+// --- mark and sweep ---------------------------------------------------------
+fn mark_from(inout h: Heap, id: i64) {
+    if h.objects[id].marked or h.objects[id].freed {
+        return
+    }
+    h.objects[id].marked = true
+    // A copy, because the walk mutates `h` and the edges must not be read out
+    // of a value being written.
+    let edges = h.objects[id].refs
+    for t in edges {
+        mark_from(h, t)
+    }
+}
+
+fn collect_mark_sweep(inout h: Heap) -> i64 {
+    for i in 0..h.objects.len() {
+        h.objects[i].marked = false
+    }
+    for r in h.roots {
+        mark_from(h, r)
+    }
+    var freed_now = 0
+    for i in 0..h.objects.len() {
+        if not h.objects[i].marked and not h.objects[i].freed {
+            h.objects[i].freed = true
+            freed_now = freed_now + 1
+        }
+    }
+    freed_now
+}
+
+/// Build the same heap twice and collect it each way, so the two answers can be
+/// compared on identical input.
+fn compare(label: str, build: fn() -> Heap) {
+    var a = build()
+    var b = build()
+    let before = live_count(a)
+    let rc_freed = collect_refcount(a)
+    let ms_freed = collect_mark_sweep(b)
+    let leaked = ms_freed - rc_freed
+    var note = ""
+    if leaked > 0 {
+        note = "  <- refcounting leaked {leaked}"
+    }
+    print("{label}: {before} allocated, refcount freed {rc_freed}, mark-sweep freed {ms_freed}{note}")
+    print("    refcount left:   {live_names(a)}")
+    print("    mark-sweep left: {live_names(b)}")
+}
+
+fn tree() -> Heap {
+    var h = new_heap()
+    let root = alloc(h, "root")
+    let l = alloc(h, "left")
+    let r = alloc(h, "right")
+    let leaf = alloc(h, "leaf")
+    point(h, root, l)
+    point(h, root, r)
+    point(h, l, leaf)
+    add_root(h, root)
+    h
+}
+
+fn dropped_tree() -> Heap {
+    var h = tree()
+    drop_root(h, 0)
+    h
+}
+
+fn self_cycle() -> Heap {
+    var h = new_heap()
+    let live = alloc(h, "live")
+    let loop_obj = alloc(h, "self-cycle")
+    point(h, loop_obj, loop_obj)
+    add_root(h, live)
+    h
+}
+
+fn two_cycle() -> Heap {
+    var h = new_heap()
+    let keep = alloc(h, "keep")
+    let a = alloc(h, "cycle-a")
+    let b = alloc(h, "cycle-b")
+    point(h, a, b)
+    point(h, b, a)
+    add_root(h, keep)
+    h
+}
+
+fn long_cycle() -> Heap {
+    var h = new_heap()
+    let keep = alloc(h, "keep")
+    add_root(h, keep)
+    var ids: [i64] = []
+    for i in 0..5 {
+        ids.push(alloc(h, "ring{i}"))
+    }
+    for i in 0..5 {
+        point(h, ids[i], ids[(i + 1) % 5])
+    }
+    h
+}
+
+fn reachable_with_garbage_cycle() -> Heap {
+    var h = new_heap()
+    let root = alloc(h, "root")
+    let kept = alloc(h, "kept")
+    let a = alloc(h, "garbage-a")
+    let b = alloc(h, "garbage-b")
+    point(h, root, kept)
+    point(h, a, b)
+    point(h, b, a)
+    add_root(h, root)
+    h
+}
+
+fn shared() -> Heap {
+    // Two roots pointing at one object: it must survive dropping either one,
+    // and die only when both are gone. This is the case a naive refcount that
+    // decrements to zero too early gets wrong.
+    var h = new_heap()
+    let r1 = alloc(h, "root-1")
+    let r2 = alloc(h, "root-2")
+    let sh = alloc(h, "shared")
+    point(h, r1, sh)
+    point(h, r2, sh)
+    add_root(h, r1)
+    add_root(h, r2)
+    h
+}
+
+fn shared_one_dropped() -> Heap {
+    var h = shared()
+    drop_root(h, 0)
+    h
+}
+
+fn shared_both_dropped() -> Heap {
+    var h = shared()
+    drop_root(h, 0)
+    drop_root(h, 1)
+    h
+}
+
+fn main() {
+    print("--- trees: both collectors agree ---")
+    compare("live tree", tree)
+    compare("dropped tree", dropped_tree)
+
+    print("--- sharing ---")
+    compare("two roots", shared)
+    compare("one root dropped", shared_one_dropped)
+    compare("both dropped", shared_both_dropped)
+
+    print("--- cycles: where refcounting loses ---")
+    compare("self cycle", self_cycle)
+    compare("two-node cycle", two_cycle)
+    compare("five-node ring", long_cycle)
+    compare("garbage cycle beside live data", reachable_with_garbage_cycle)
+
+    print("--- the summary ---")
+    print("Reference counting freed everything mark-and-sweep did, except a cycle.")
+    print("That is the whole difference between the two algorithms, and it is why")
+    print("Grasm's own `ref` is generational rather than counted: a generation")
+    print("check catches a stale handle without needing to know whether anything")
+    print("still points at the slot ([T-REF-GENERATIONAL]).")
+}

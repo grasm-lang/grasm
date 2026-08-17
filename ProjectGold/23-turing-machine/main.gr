@@ -1,0 +1,245 @@
+// A Turing machine — an expanding tape, a transition table, and halting.
+//
+// The tape is the subject. A real Turing machine's tape is infinite in both
+// directions, and a list is not, so the implementation has to grow it on demand
+// at both ends — and growing it on the *left* shifts every index, which is
+// where this is usually got wrong. The head position is kept as an absolute
+// coordinate and translated on access, so nothing outside `read`/`write` ever
+// has to know the tape moved.
+//
+// Correctness is by known results: a binary increment, a busy beaver whose
+// score is published, and a palindrome recogniser that must accept and reject
+// the right strings.
+
+type Rule = {
+    state: str,
+    read: str,
+    write: str,
+    move: i64,     // -1 left, +1 right, 0 stay
+    next: str,
+}
+
+type Machine = {
+    tape: [str],
+    origin: i64,   // the absolute coordinate of tape[0]
+    head: i64,     // absolute
+    state: str,
+    blank: str,
+    steps: i64,
+}
+
+fn new_machine(input: str, blank: str, start: str) -> Machine {
+    var tape = input.chars()
+    if tape.len() == 0 {
+        tape.push(blank)
+    }
+    Machine{ tape: tape, origin: 0, head: 0, state: start, blank: blank, steps: 0 }
+}
+
+/// Make sure absolute position `at` is addressable, growing either end.
+fn ensure(inout m: Machine, at: i64) {
+    while at < m.origin {
+        // Growing left moves index 0, so the origin moves with it. Every other
+        // coordinate in the machine is absolute and therefore unaffected —
+        // which is the reason for keeping them that way.
+        var grown = [m.blank]
+        for c in m.tape {
+            grown.push(c)
+        }
+        m.tape = grown
+        m.origin = m.origin - 1
+    }
+    while at - m.origin >= m.tape.len() {
+        m.tape.push(m.blank)
+    }
+}
+
+fn read_at(inout m: Machine, at: i64) -> str {
+    ensure(m, at)
+    m.tape[at - m.origin]
+}
+
+fn write_at(inout m: Machine, at: i64, v: str) {
+    ensure(m, at)
+    m.tape[at - m.origin] = v
+}
+
+fn find_rule(rules: [Rule], state: str, sym: str) -> Option[Rule] {
+    for r in rules {
+        if r.state == state and r.read == sym {
+            return Some(r)
+        }
+    }
+    None
+}
+
+/// Run until no rule applies or the step limit is reached. The limit is what
+/// makes this total: a Turing machine may not halt, and a program that hangs is
+/// not a test result.
+fn run(inout m: Machine, rules: [Rule], limit: i64) -> str {
+    var going = true
+    while going {
+        if m.steps >= limit {
+            return "step limit"
+        }
+        let sym = read_at(m, m.head)
+        match find_rule(rules, m.state, sym) {
+            None -> {
+                going = false
+            }
+            Some(r) -> {
+                write_at(m, m.head, r.write)
+                m.head = m.head + r.move
+                m.state = r.next
+                m.steps = m.steps + 1
+            }
+        }
+    }
+    "halted"
+}
+
+/// The tape with blanks trimmed from both ends, which is what a reader means by
+/// "the output".
+fn tape_text(m: Machine) -> str {
+    var lo = 0
+    var hi = m.tape.len() - 1
+    while lo <= hi and m.tape[lo] == m.blank {
+        lo = lo + 1
+    }
+    while hi >= lo and m.tape[hi] == m.blank {
+        hi = hi - 1
+    }
+    if lo > hi {
+        return ""
+    }
+    var out = ""
+    for i in lo..(hi + 1) {
+        out = out + m.tape[i]
+    }
+    out
+}
+
+fn nonblank_count(m: Machine) -> i64 {
+    var n = 0
+    for c in m.tape {
+        if c != m.blank { n = n + 1 }
+    }
+    n
+}
+
+// --- binary increment -------------------------------------------------------
+fn increment_rules() -> [Rule] {
+    [
+        // Walk right to the end.
+        Rule{ state: "right", read: "0", write: "0", move: 1, next: "right" },
+        Rule{ state: "right", read: "1", write: "1", move: 1, next: "right" },
+        Rule{ state: "right", read: "_", write: "_", move: -1, next: "add" },
+        // Add one, carrying leftwards.
+        Rule{ state: "add", read: "1", write: "0", move: -1, next: "add" },
+        Rule{ state: "add", read: "0", write: "1", move: -1, next: "done" },
+        Rule{ state: "add", read: "_", write: "1", move: -1, next: "done" },
+    ]
+}
+
+fn increment(bits: str) -> str {
+    var m = new_machine(bits, "_", "right")
+    let _r = run(m, increment_rules(), 1000)
+    tape_text(m)
+}
+
+// --- palindrome recogniser over {a, b} --------------------------------------
+fn palindrome_rules() -> [Rule] {
+    [
+        Rule{ state: "start", read: "a", write: "_", move: 1, next: "seek_a" },
+        Rule{ state: "start", read: "b", write: "_", move: 1, next: "seek_b" },
+        Rule{ state: "start", read: "_", write: "_", move: 0, next: "accept" },
+
+        Rule{ state: "seek_a", read: "a", write: "a", move: 1, next: "seek_a" },
+        Rule{ state: "seek_a", read: "b", write: "b", move: 1, next: "seek_a" },
+        Rule{ state: "seek_a", read: "_", write: "_", move: -1, next: "match_a" },
+        Rule{ state: "match_a", read: "a", write: "_", move: -1, next: "back" },
+        Rule{ state: "match_a", read: "b", write: "b", move: 0, next: "reject" },
+        Rule{ state: "match_a", read: "_", write: "_", move: 0, next: "accept" },
+
+        Rule{ state: "seek_b", read: "a", write: "a", move: 1, next: "seek_b" },
+        Rule{ state: "seek_b", read: "b", write: "b", move: 1, next: "seek_b" },
+        Rule{ state: "seek_b", read: "_", write: "_", move: -1, next: "match_b" },
+        Rule{ state: "match_b", read: "b", write: "_", move: -1, next: "back" },
+        Rule{ state: "match_b", read: "a", write: "a", move: 0, next: "reject" },
+        Rule{ state: "match_b", read: "_", write: "_", move: 0, next: "accept" },
+
+        Rule{ state: "back", read: "a", write: "a", move: -1, next: "back" },
+        Rule{ state: "back", read: "b", write: "b", move: -1, next: "back" },
+        Rule{ state: "back", read: "_", write: "_", move: 1, next: "start" },
+    ]
+}
+
+fn is_palindrome(s: str) -> str {
+    var m = new_machine(s, "_", "start")
+    let outcome = run(m, palindrome_rules(), 10000)
+    if outcome == "step limit" {
+        return "step limit"
+    }
+    m.state
+}
+
+// --- the 3-state busy beaver ------------------------------------------------
+//
+// Published result: it halts after 14 steps having written six 1s. Both numbers
+// are checked, because a machine that halts at the right time with the wrong
+// tape is still wrong.
+fn beaver_rules() -> [Rule] {
+    // Rado's original 3-state machine, transcribed exactly. An earlier version
+    // of this file used a *different* 3-state machine and then compared its
+    // step count to the published one — it scored the right six ones in
+    // thirteen steps, and the published fourteen belonged to a machine that
+    // was not being run. A known-answer test against the wrong machine is not
+    // a known-answer test.
+    [
+        Rule{ state: "A", read: "0", write: "1", move: 1, next: "B" },
+        Rule{ state: "A", read: "1", write: "1", move: 1, next: "HALT" },
+        Rule{ state: "B", read: "0", write: "0", move: 1, next: "C" },
+        Rule{ state: "B", read: "1", write: "1", move: 1, next: "B" },
+        Rule{ state: "C", read: "0", write: "1", move: -1, next: "C" },
+        Rule{ state: "C", read: "1", write: "1", move: -1, next: "A" },
+    ]
+}
+
+fn main() {
+    print("--- binary increment ---")
+    for bits in ["0", "1", "10", "11", "111", "1011", "0111", "11111111"] {
+        print("  {bits} + 1 = {increment(bits)}")
+    }
+
+    print("--- palindromes over ab ---")
+    for s in ["", "a", "aa", "ab", "aba", "abba", "abab", "abcba", "aabaa", "aabb"] {
+        print("  \"{s}\" -> {is_palindrome(s)}")
+    }
+
+    print("--- the 3-state busy beaver ---")
+    var bb = new_machine("0", "0", "A")
+    let outcome = run(bb, beaver_rules(), 100)
+    print("  outcome: {outcome}")
+    print("  steps: {bb.steps} (published answer: 14)")
+    print("  ones written: {nonblank_count(bb)} (published answer: 6)")
+    print("  tape: {tape_text(bb)}")
+    print("  final state: {bb.state}")
+
+    print("--- the tape really does grow both ways ---")
+    // A machine that only walks left, from a one-cell tape.
+    var walker = new_machine("x", "_", "go")
+    let walk = [
+        Rule{ state: "go", read: "x", write: "L", move: -1, next: "go" },
+        Rule{ state: "go", read: "_", write: "L", move: -1, next: "go" },
+    ]
+    var m2 = walker
+    m2.steps = 0
+    let _w = run(m2, walk, 10)
+    print("  after 10 left steps: tape length {m2.tape.len()}, origin {m2.origin}, head {m2.head}")
+    print("  tape: {tape_text(m2)}")
+
+    print("--- non-termination is bounded, not hung ---")
+    var loop_m = new_machine("a", "_", "spin")
+    let spin = [Rule{ state: "spin", read: "a", write: "a", move: 0, next: "spin" }]
+    print("  {run(loop_m, spin, 500)} after {loop_m.steps} steps")
+}

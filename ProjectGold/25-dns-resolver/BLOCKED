@@ -1,0 +1,1 @@
+no UDP and no byte type — a DNS query is a packed binary datagram (F9, F12)

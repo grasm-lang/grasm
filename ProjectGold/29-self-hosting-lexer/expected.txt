@@ -1,0 +1,27 @@
+--- the basics ---
+declaration: kw(fn) ident(add) op(() ident(a) op(:) ident(i64) op(,) ident(b) op(:) ident(i64) op()) op(->) ident(i64) op({) ident(a) op(+) ident(b) op(})
+keywords vs idents: kw(let) ident(letter) op(=) kw(if) ident(iffy) op({) int(1) op(}) kw(else) op({) int(2) op(})
+numbers: int(1) int(42) int(0xFF) float(3.14) int(1_000) float(0.5)
+operators: ident(a) op(->) ident(b) op(|>) ident(c) op(..) ident(d) op(..=) ident(e) op(==) ident(f) op(!=) ident(g) op(<=) ident(h)
+--- the cases that were defects in the real lexer ---
+tuple component: ident(t) op(.) int(1) op(.) int(0)
+range not float: int(1) op(..) int(2)
+nested comment: ident(a) ident(b)
+doc comment: nl kw(fn) ident(f) op(() op()) op({) op(})   docs: [docs here]
+plain comment: nl kw(fn) ident(f) op(() op()) op({) op(})
+four slashes: nl kw(fn) ident(f) op(() op()) op({) op(})
+interpolation: str(a{b + c}d)
+escaped brace: str(a\{b)
+newline runs collapse: ident(a) nl ident(b)
+--- malformed ---
+unterminated string: ERROR(unterminated string literal)
+multiline string: ERROR(unterminated string literal) nl ident(def) ERROR(unterminated string literal)
+unterminated comment: ERROR(unterminated block comment)
+stray character: ident(a) ERROR(unexpected character `$`) ident(b)
+--- against the reference implementation ---
+  files where the token count matches the reference exactly: 25
+  files where it does not: 0
+--- lexing itself ---
+  own source: 14706 characters, 2797 tokens, 12 doc line(s)
+  ident 760, int 82, keyword 220, newline 339, op 1217, str 179
+  lexical errors in its own source: 0

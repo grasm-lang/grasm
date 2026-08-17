@@ -195,3 +195,41 @@ c.n += 1
 which is what this project uses. The gap is that `ref(0)` is accepted at all: a
 value that can be constructed and never observed should either be refused at the
 point of construction, or given the dereference that would make it useful.
+
+## F11 — `net` can listen and accept, never dial (S3, library)
+
+Found writing 22-multithreaded-scraper. [L-LIB-NET] gives `tcp_listen`,
+`tcp_accept`, `tcp_read`, `tcp_write` and `tcp_close`. There is no
+`tcp_connect`. A Grasm program can be a server and cannot be a client, so it
+cannot fetch a URL, call an API, or talk to a database.
+
+The missing piece is one builtin with the same shape as the others —
+`tcp_connect(host: str, port: i64) -> i64 ! IoError` — and the capability, the
+handle table and the read/write paths all already exist. This is the smallest of
+the outstanding gaps and it blocks the most.
+
+`par_map` would supply the concurrency the project asks for; the threads are not
+the problem.
+
+## F12 — no UDP (S4, library)
+
+Found writing 25-dns-resolver. Only TCP exists. DNS is a UDP protocol, and
+while it can be done over TCP, the project as stated is a datagram exercise.
+Blocked behind F9 in any case: a DNS query is a packed binary structure with
+bit-level flags, and there is no byte type to build one in.
+
+## F13 — every socket operation blocks (S3, library)
+
+Found writing 30-async-chat. `tcp_accept` and `tcp_read` both block, and there
+is no `select`, no poll, no timeout, and no way to ask whether a handle is
+ready. A single-threaded server can therefore serve exactly one connection at a
+time — which is what project 21 does, correctly and deliberately.
+
+Multiple simultaneous connections would need either non-blocking handles with a
+readiness check, or a thread per connection. `spawn` is documented as
+single-core ([E-NOT-PARALLEL]) and `par_map` runs a fixed batch to completion,
+so neither gives a connection its own thread of control today.
+
+This is the one gap on the list that is a genuine design question rather than a
+missing builtin, because the answer interacts with the effect system: an `async`
+row already exists in the vocabulary and nothing performs it.

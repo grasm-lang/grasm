@@ -1,0 +1,107 @@
+--- projection ---
+SELECT name FROM users WHERE id = 1
+    ada
+SELECT * FROM users WHERE id = 3
+    3 | cyd | 41 | london
+SELECT name, city FROM users WHERE age > 30
+    ada | london
+    cyd | london
+--- comparison operators ---
+SELECT name FROM users WHERE age >= 36
+    ada
+    cyd
+SELECT name FROM users WHERE age != 25
+    ada
+    cyd
+SELECT name FROM users WHERE name < 'c'
+    ada
+    bob
+SELECT name FROM users WHERE city = 'london'
+    ada
+    cyd
+--- AND, OR, and precedence ---
+SELECT name FROM users WHERE age > 30 AND city = 'london'
+    ada
+    cyd
+SELECT name FROM users WHERE age < 26 OR age > 40
+    bob
+    cyd
+    eve
+SELECT name FROM users WHERE city = 'paris' OR age > 30 AND city = 'london'
+    ada
+    bob
+    cyd
+--- ORDER BY and LIMIT ---
+SELECT name, age FROM users ORDER BY age
+    bob | 25
+    eve | 25
+    ada | 36
+    cyd | 41
+    dee | NULL
+SELECT name, age FROM users ORDER BY age DESC
+    cyd | 41
+    ada | 36
+    bob | 25
+    eve | 25
+    dee | NULL
+SELECT name FROM users ORDER BY name DESC LIMIT 2
+    eve
+    dee
+SELECT name FROM users LIMIT 0
+    (no rows)
+--- aggregates ---
+SELECT COUNT(*) FROM users
+    5
+SELECT COUNT(age) FROM users
+    4
+SELECT SUM(age) FROM users
+    127
+SELECT AVG(age) FROM users
+    31.75
+SELECT MIN(age) FROM users
+    25
+SELECT MAX(age) FROM users
+    41
+SELECT MIN(name) FROM users
+    ada
+SELECT COUNT(*) FROM users WHERE city = 'london'
+    2
+--- NULL, and three-valued logic ---
+SELECT name FROM users WHERE age = NULL
+    (no rows)
+SELECT name FROM users WHERE age != NULL
+    (no rows)
+SELECT name FROM users WHERE city = NULL
+    (no rows)
+SELECT name FROM users WHERE age > 20 AND city = NULL
+    (no rows)
+SELECT name FROM users WHERE age > 20 OR city = NULL
+    ada
+    bob
+    cyd
+    eve
+SELECT COUNT(city) FROM users
+    4
+--- errors, which must be values ---
+SELECT name FROM missing WHERE id = 1
+    error: no such table `missing`
+SELECT nope FROM users
+    error: no such column `nope`
+DELETE FROM users
+    error: a query must begin with SELECT, found `DELETE`
+SELECT FROM users
+    error: no columns selected
+SELECT name users
+    error: expected FROM
+SELECT name FROM users WHERE
+    error: WHERE with no condition
+SELECT name FROM users WHERE age >
+    error: a condition must be `column op value`, found 2 token(s)
+SELECT name FROM users LIMIT abc
+    error: LIMIT wants a number, found `abc`
+SELECT name FROM users ORDER BY nope
+    error: no such column `nope`
+SELECT name FROM users WHERE name = 'unterminated
+    error: unterminated string literal
+
+    error: empty query

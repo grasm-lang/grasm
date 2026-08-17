@@ -1,0 +1,50 @@
+--- well-formed requests ---
+root: HTTP/1.1 200 OK  [GET / q="" h=1 framed=true]
+hello: HTTP/1.1 200 OK  [GET /hello q="" h=1 framed=true]
+hello named: HTTP/1.1 200 OK  [GET /hello q="name=ada" h=1 framed=true]
+echo: HTTP/1.1 200 OK  [GET /echo q="a=1&b=2" h=2 framed=true]
+missing route: HTTP/1.1 404 Not Found  [GET /nope q="" h=1 framed=true]
+head: HTTP/1.1 200 OK  [HEAD / q="" h=1 framed=true]
+post: HTTP/1.1 405 Method Not Allowed  [POST / q="" h=1 framed=true]
+http/1.0: HTTP/1.1 200 OK  [GET / q="" h=0 framed=true]
+no headers: HTTP/1.1 200 OK  [GET / q="" h=0 framed=true]
+--- malformed, which must be 400 and not a crash ---
+empty: HTTP/1.1 400 Bad Request  [rejected: empty request]
+whitespace: HTTP/1.1 400 Bad Request  [rejected: empty request]
+two parts: HTTP/1.1 400 Bad Request  [rejected: a request line has three parts, found 2]
+four parts: HTTP/1.1 400 Bad Request  [rejected: a request line has three parts, found 4]
+no version: HTTP/1.1 400 Bad Request  [rejected: `XYZ` is not an HTTP version]
+unknown method: HTTP/1.1 400 Bad Request  [rejected: unknown method `BREW`]
+relative target: HTTP/1.1 400 Bad Request  [rejected: target must be an absolute path, found `index.html`]
+bad header: HTTP/1.1 400 Bad Request  [rejected: header without a colon: `not-a-header`]
+lowercase method: HTTP/1.1 400 Bad Request  [rejected: unknown method `get`]
+--- query parsing ---
+  "name=ada" -> name = Some(ada)
+  "name=" -> name = Some()
+  "name" -> name = Some()
+  "a=1&name=bob&c=3" -> name = Some(bob)
+  "name=a%20b" -> name = Some(a b)
+  "name=a+b" -> name = Some(a b)
+  "name=%41%42" -> name = Some(AB)
+  "name=%zz" -> name = Some(%zz)
+  "other=1" -> name = None
+  "" -> name = None
+--- percent decoding ---
+  "plain" -> "plain"
+  "a%20b" -> "a b"
+  "a+b" -> "a b"
+  "%41%42%43" -> "ABC"
+  "100%25" -> "100%"
+  "%2F" -> "/"
+  "%" -> "%"
+  "%4" -> "%4"
+  "%zz" -> "%zz"
+  "caf%C3%A9" -> "cafÃ©"
+--- response framing ---
+  status: HTTP/1.1 200 OK
+  declared length: 11
+  actual body length: 11
+  header/body separator present: true
+  HEAD body is empty: true
+  HEAD keeps its Content-Length: true
+--- run `grasm run main.gr -- serve` to serve on 8971 ---

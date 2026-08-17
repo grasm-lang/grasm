@@ -1,0 +1,25 @@
+--- arithmetic ---
+2+3: [5]  steps 5  stack empty
+precedence 2+3*4: [14]  steps 7  stack empty
+10-3-2: [5]  steps 7  stack empty
+stack ops: [1 2]  steps 6  stack empty
+dup: [49]  steps 5  stack empty
+negate: [-5]  steps 4  stack empty
+--- control flow: count down from 5 ---
+countdown: [5 4 3 2 1]  steps 50  stack empty
+--- functions ---
+calls: [49 7]  steps 16  stack empty
+--- recursion: factorial ---
+factorial 10: [3628800]  steps 109  stack empty
+--- recursion: fibonacci, which exercises the frame stack ---
+fib 15: [610]  steps 19730  stack empty
+--- faults, which must be values ---
+underflow: fault: stack underflow (at ip 1) after 1 steps
+divide by zero: fault: division by zero (at ip 2) after 3 steps
+bad jump: fault: instruction pointer out of range (at ip 99) after 1 steps
+bad local: fault: local 99 out of range (at ip 0) after 1 steps
+runs off the end: fault: instruction pointer out of range (at ip 1) after 1 steps
+infinite loop: fault: step limit reached (at ip 0) after 100000 steps
+return from top: fault: return from the outermost frame (at ip 1) after 2 steps
+unbalanced callee: fault: unbalanced stack on return: 1 value(s) left behind (at ip 6) after 5 steps
+runaway recursion: fault: call depth exceeded (at ip 5) after 128 steps

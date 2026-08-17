@@ -1,0 +1,36 @@
+--- trees: both collectors agree ---
+live tree: 4 allocated, refcount freed 0, mark-sweep freed 0
+    refcount left:   [leaf, left, right, root]
+    mark-sweep left: [leaf, left, right, root]
+dropped tree: 4 allocated, refcount freed 4, mark-sweep freed 4
+    refcount left:   []
+    mark-sweep left: []
+--- sharing ---
+two roots: 3 allocated, refcount freed 0, mark-sweep freed 0
+    refcount left:   [root-1, root-2, shared]
+    mark-sweep left: [root-1, root-2, shared]
+one root dropped: 3 allocated, refcount freed 1, mark-sweep freed 1
+    refcount left:   [root-2, shared]
+    mark-sweep left: [root-2, shared]
+both dropped: 3 allocated, refcount freed 3, mark-sweep freed 3
+    refcount left:   []
+    mark-sweep left: []
+--- cycles: where refcounting loses ---
+self cycle: 2 allocated, refcount freed 0, mark-sweep freed 1  <- refcounting leaked 1
+    refcount left:   [live, self-cycle]
+    mark-sweep left: [live]
+two-node cycle: 3 allocated, refcount freed 0, mark-sweep freed 2  <- refcounting leaked 2
+    refcount left:   [cycle-a, cycle-b, keep]
+    mark-sweep left: [keep]
+five-node ring: 6 allocated, refcount freed 0, mark-sweep freed 5  <- refcounting leaked 5
+    refcount left:   [keep, ring0, ring1, ring2, ring3, ring4]
+    mark-sweep left: [keep]
+garbage cycle beside live data: 4 allocated, refcount freed 0, mark-sweep freed 2  <- refcounting leaked 2
+    refcount left:   [garbage-a, garbage-b, kept, root]
+    mark-sweep left: [kept, root]
+--- the summary ---
+Reference counting freed everything mark-and-sweep did, except a cycle.
+That is the whole difference between the two algorithms, and it is why
+Grasm's own `ref` is generational rather than counted: a generation
+check catches a stale handle without needing to know whether anything
+still points at the slot ([T-REF-GENERATIONAL]).

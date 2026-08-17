@@ -1,0 +1,417 @@
+// A Grasm lexer, written in Grasm.
+//
+// The bootstrapping test: this tokenizes the language it is written in, and the
+// file it is best tested against is itself. It is not a toy subset — it handles
+// the things that actually make Grasm's lexer non-trivial:
+//
+//   * nested block comments, which `/* a /* b */` gets wrong if you scan for
+//     the first `*/`;
+//   * `///` documentation lines, which are not ordinary comments;
+//   * string interpolation, where `{` opens an expression and `\{` does not;
+//   * `t.1.0`, where a float would be lexed if the previous token was `.`;
+//   * newlines as significant tokens, collapsed in runs.
+//
+// Each of those was a defect in the real lexer at some point, and each has a
+// comment in `crates/grasm_syntax/src/lexer.rs` saying so. Re-deriving them
+// from the specification is what makes this a compiler-maturity test rather
+// than a string-splitting exercise.
+
+type Tok =
+    | TInt(text: str)
+    | TFloat(text: str)
+    | TStr(text: str)
+    | TIdent(name: str)
+    | TKeyword(name: str)
+    | TOp(sym: str)
+    | TNewline
+    | TDoc(text: str)
+    | TError(why: str)
+
+fn keywords() -> [str] {
+    ["fn", "let", "var", "if", "else", "match", "while", "for", "in", "return",
+     "break", "continue", "type", "effect", "extern", "import", "test", "bench",
+     "pub", "and", "or", "not", "try", "fail", "with", "handled_by", "spawn",
+     "parallel", "region", "unsafe", "ref", "own", "inout", "true", "false"]
+}
+
+fn is_digit(c: str) -> bool {
+    let n = c.code_at(0)
+    n >= 48 and n <= 57
+}
+
+fn is_hex(c: str) -> bool {
+    let n = c.code_at(0)
+    is_digit(c) or (n >= 97 and n <= 102) or (n >= 65 and n <= 70)
+}
+
+fn is_ident_start(c: str) -> bool {
+    let n = c.code_at(0)
+    (n >= 97 and n <= 122) or (n >= 65 and n <= 90) or c == "_"
+}
+
+fn is_ident_continue(c: str) -> bool {
+    is_ident_start(c) or is_digit(c)
+}
+
+type Lexer = {
+    cs: [str],
+    i: i64,
+    after_dot: bool,
+    toks: [Tok],
+    /// Documentation lines, kept *out* of the token stream.
+    ///
+    /// This is not a stylistic choice — it is what the real lexer does, and
+    /// getting it wrong is measurable. Emitting a `TDoc` into the stream also
+    /// stops consecutive newlines from collapsing across it, so a two-line
+    /// doc comment produced five tokens where the reference produces two. On
+    /// files with no doc comments the two lexers already agreed exactly; this
+    /// is what makes them agree on the rest.
+    docs: [str],
+}
+
+fn peek_at(lx: Lexer, off: i64) -> str {
+    let at = lx.i + off
+    if at < lx.cs.len() { lx.cs[at] } else { "" }
+}
+
+/// Spaces, tabs, line comments, doc comments and *nested* block comments.
+/// Newlines are not trivia — they are tokens.
+fn skip_trivia(inout lx: Lexer) {
+    var going = true
+    while going {
+        let c = peek_at(lx, 0)
+        if c == " " or c == "\t" or c == "\r" {
+            lx.i = lx.i + 1
+        } else if c == "/" and peek_at(lx, 1) == "/" {
+            // `///` is documentation; `//` and `////` are ordinary comments.
+            let is_doc = peek_at(lx, 2) == "/" and peek_at(lx, 3) != "/"
+            let start = lx.i
+            while lx.i < lx.cs.len() and lx.cs[lx.i] != "\n" {
+                lx.i = lx.i + 1
+            }
+            if is_doc {
+                var text = ""
+                for k in (start + 3)..lx.i {
+                    text = text + lx.cs[k]
+                }
+                lx.docs.push(text.trim())
+            }
+        } else if c == "/" and peek_at(lx, 1) == "*" {
+            // Nested. Scanning for the first `*/` swallows the rest of the
+            // file when the comment contains another comment — which is easy
+            // to write, since these nest by design.
+            lx.i = lx.i + 2
+            var depth = 1
+            while depth > 0 and lx.i < lx.cs.len() {
+                if peek_at(lx, 0) == "/" and peek_at(lx, 1) == "*" {
+                    depth = depth + 1
+                    lx.i = lx.i + 2
+                } else if peek_at(lx, 0) == "*" and peek_at(lx, 1) == "/" {
+                    depth = depth - 1
+                    lx.i = lx.i + 2
+                } else {
+                    lx.i = lx.i + 1
+                }
+            }
+            if depth > 0 {
+                // Running out of file is not a way to end a comment.
+                lx.toks.push(TError("unterminated block comment"))
+            }
+        } else {
+            going = false
+        }
+    }
+}
+
+/// A string literal, including interpolation. `{` opens an expression and the
+/// characters inside it are *not* string content; `\{` is a literal brace.
+fn lex_string(inout lx: Lexer) -> Tok {
+    var text = ""
+    lx.i = lx.i + 1
+    var closed = false
+    var depth = 0
+    while lx.i < lx.cs.len() and not closed {
+        let c = lx.cs[lx.i]
+        if c == "\\" and lx.i + 1 < lx.cs.len() {
+            text = text + c + lx.cs[lx.i + 1]
+            lx.i = lx.i + 2
+        } else if c == "\{" {
+            depth = depth + 1
+            text = text + c
+            lx.i = lx.i + 1
+        } else if c == "\}" and depth > 0 {
+            depth = depth - 1
+            text = text + c
+            lx.i = lx.i + 1
+        } else if c == "\"" and depth == 0 {
+            closed = true
+            lx.i = lx.i + 1
+        } else if c == "\n" and depth == 0 {
+            // A literal may not span lines.
+            return TError("unterminated string literal")
+        } else {
+            text = text + c
+            lx.i = lx.i + 1
+        }
+    }
+    if not closed {
+        return TError("unterminated string literal")
+    }
+    TStr(text)
+}
+
+fn lex_number(inout lx: Lexer) -> Tok {
+    var text = ""
+    // Hex.
+    if lx.cs[lx.i] == "0" and (peek_at(lx, 1) == "x" or peek_at(lx, 1) == "X") {
+        text = "0" + peek_at(lx, 1)
+        lx.i = lx.i + 2
+        while lx.i < lx.cs.len() and (is_hex(lx.cs[lx.i]) or lx.cs[lx.i] == "_") {
+            text = text + lx.cs[lx.i]
+            lx.i = lx.i + 1
+        }
+        return TInt(text)
+    }
+    while lx.i < lx.cs.len() and (is_digit(lx.cs[lx.i]) or lx.cs[lx.i] == "_") {
+        text = text + lx.cs[lx.i]
+        lx.i = lx.i + 1
+    }
+    // A `.` after a number is a fraction — unless the token before the number
+    // was itself a `.`, in which case this is a tuple component and the `.`
+    // starts the next one. Max-munch read `t.1.0` as `t . 1.0`, so a nested
+    // tuple component had no unparenthesised spelling at all.
+    if not lx.after_dot and peek_at(lx, 0) == "." and is_digit(peek_at(lx, 1)) {
+        text = text + "."
+        lx.i = lx.i + 1
+        while lx.i < lx.cs.len() and is_digit(lx.cs[lx.i]) {
+            text = text + lx.cs[lx.i]
+            lx.i = lx.i + 1
+        }
+        return TFloat(text)
+    }
+    TInt(text)
+}
+
+fn lex_operator(inout lx: Lexer) -> Tok {
+    // Longest match first, so `..` does not lex as two `.` and `->` not as `-`.
+    let three = ["..="]
+    // `??` was missing from this list at first, and the omission was found by
+    // diffing against the reference rather than by reading: three files lexed
+    // two or three tokens longer than they should have, and the counts matched
+    // the number of `??` in each exactly. That is what the comparison is for.
+    let two = ["->", "=>", "==", "!=", "<=", ">=", "|>", "..", "+=", "-=", "*=",
+               "/=", "%=", "&&", "||", "::", "??"]
+    var got = ""
+    for t in three {
+        if got == "" and peek_at(lx, 0) + peek_at(lx, 1) + peek_at(lx, 2) == t {
+            got = t
+        }
+    }
+    if got == "" {
+        for t in two {
+            if got == "" and peek_at(lx, 0) + peek_at(lx, 1) == t {
+                got = t
+            }
+        }
+    }
+    if got != "" {
+        lx.i = lx.i + got.len()
+        return TOp(got)
+    }
+    let single = "+-*/%<>=!&|^()\{\}[],.:;?@#~"
+    let c = lx.cs[lx.i]
+    lx.i = lx.i + 1
+    if single.contains(c) {
+        return TOp(c)
+    }
+    TError("unexpected character `{c}`")
+}
+
+fn lex(src: str) -> [Tok] {
+    var lx = Lexer{ cs: src.chars(), i: 0, after_dot: false, toks: [], docs: [] }
+    run_lexer(lx)
+    lx.toks
+}
+
+fn run_lexer(inout lx: Lexer) {
+    var going = true
+    while going {
+        skip_trivia(lx)
+        if lx.i >= lx.cs.len() {
+            going = false
+        } else {
+            let c = lx.cs[lx.i]
+            var tok = TError("unreachable")
+            if c == "\n" {
+                lx.i = lx.i + 1
+                tok = TNewline
+            } else if c == "\"" {
+                tok = lex_string(lx)
+            } else if is_digit(c) {
+                tok = lex_number(lx)
+            } else if is_ident_start(c) {
+                var name = ""
+                while lx.i < lx.cs.len() and is_ident_continue(lx.cs[lx.i]) {
+                    name = name + lx.cs[lx.i]
+                    lx.i = lx.i + 1
+                }
+                tok = if keywords().contains(name) { TKeyword(name) } else { TIdent(name) }
+            } else {
+                tok = lex_operator(lx)
+            }
+
+            // Runs of newlines collapse to one, as the real lexer does.
+            let is_nl = match tok { TNewline -> true  _ -> false }
+            let last_nl = if lx.toks.len() == 0 { false } else {
+                match lx.toks[lx.toks.len() - 1] { TNewline -> true  _ -> false }
+            }
+            if not (is_nl and last_nl) {
+                lx.toks.push(tok)
+            }
+            lx.after_dot = match tok { TOp(s) -> s == "."  _ -> false }
+        }
+    }
+}
+
+fn describe(t: Tok) -> str {
+    match t {
+        TInt(s) -> "int({s})"
+        TFloat(s) -> "float({s})"
+        TStr(s) -> "str({s})"
+        TIdent(s) -> "ident({s})"
+        TKeyword(s) -> "kw({s})"
+        TOp(s) -> "op({s})"
+        TNewline -> "nl"
+        TDoc(s) -> "doc({s})"
+        TError(s) -> "ERROR({s})"
+    }
+}
+
+fn lex_with_docs(src: str) -> ([Tok], [str]) {
+    var lx = Lexer{ cs: src.chars(), i: 0, after_dot: false, toks: [], docs: [] }
+    run_lexer(lx)
+    (lx.toks, lx.docs)
+}
+
+fn show(label: str, src: str) {
+    let (toks, docs) = lex_with_docs(src)
+    var parts: [str] = []
+    for t in toks {
+        parts.push(describe(t))
+    }
+    var suffix = ""
+    if docs.len() > 0 {
+        suffix = "   docs: {docs}"
+    }
+    print("{label}: {parts.join(" ")}{suffix}")
+}
+
+fn count_errors(toks: [Tok]) -> i64 {
+    var n = 0
+    for t in toks {
+        match t {
+            TError(_e) -> n = n + 1
+            _ -> {}
+        }
+    }
+    n
+}
+
+fn main() / {io} {
+    print("--- the basics ---")
+    show("declaration", "fn add(a: i64, b: i64) -> i64 \{ a + b \}")
+    show("keywords vs idents", "let letter = if iffy \{ 1 \} else \{ 2 \}")
+    show("numbers", "1 42 0xFF 3.14 1_000 0.5")
+    show("operators", "a -> b |> c .. d ..= e == f != g <= h")
+
+    print("--- the cases that were defects in the real lexer ---")
+    show("tuple component", "t.1.0")
+    show("range not float", "1..2")
+    show("nested comment", "a /* outer /* inner */ still */ b")
+    show("doc comment", "/// docs here\nfn f() \{\}")
+    show("plain comment", "// not docs\nfn f() \{\}")
+    show("four slashes", "//// also not docs\nfn f() \{\}")
+    show("interpolation", "\"a\{b + c\}d\"")
+    show("escaped brace", "\"a\\\{b\"")
+    show("newline runs collapse", "a\n\n\n\nb")
+
+    print("--- malformed ---")
+    show("unterminated string", "\"abc")
+    show("multiline string", "\"abc\ndef\"")
+    show("unterminated comment", "/* never closed")
+    show("stray character", "a $ b")
+
+    print("--- against the reference implementation ---")
+    // The bootstrapping check, and the reason this project is worth writing:
+    // every Grasm file to hand is lexed by this lexer and by the real one
+    // (`grasm tokens`, whose counts are recorded in counts.txt), and the totals
+    // are compared. A self-hosted component that has not been diffed against
+    // the thing it replaces is a rewrite, not a bootstrap.
+    // Runnable from this directory or from ProjectGold/ — the gate does the
+    // latter. Two prefixes, because they answer different questions: where this
+    // project's own files are, and where the listed programs are. The listed
+    // paths in counts.txt are relative to ProjectGold/.
+    let own_dir = file_exists("counts.txt")
+    let here = if own_dir { "" } else { "29-self-hosting-lexer/" }
+    let listed = if own_dir { "../" } else { "" }
+    match read_file(here + "counts.txt") {
+        Err(e) -> print("  counts.txt missing — regenerate it, see README")
+        Ok(table) -> {
+            var agree = 0
+            var differ = 0
+            for line in table.lines() {
+                if line.trim() != "" {
+                    let parts = line.split(" ")
+                    let path = parts[0]
+                    let want = parts[1].parse_int() ?? -1
+                    match read_file(listed + path) {
+                        Err(e) -> print("  {path}: cannot read")
+                        Ok(src) -> {
+                            let got = lex(src).len()
+                            if got == want {
+                                agree = agree + 1
+                            } else {
+                                differ = differ + 1
+                                print("  {path}: mine {got}, reference {want}")
+                            }
+                        }
+                    }
+                }
+            }
+            print("  files where the token count matches the reference exactly: {agree}")
+            print("  files where it does not: {differ}")
+        }
+    }
+
+    print("--- lexing itself ---")
+    match read_file(here + "main.gr") {
+        Err(e) -> print("could not read own source: {e}")
+        Ok(src) -> {
+            let (toks, docs) = lex_with_docs(src)
+            var kinds = map()
+            for t in toks {
+                let k = match t {
+                    TInt(_a) -> "int"
+                    TFloat(_a) -> "float"
+                    TStr(_a) -> "str"
+                    TIdent(_a) -> "ident"
+                    TKeyword(_a) -> "keyword"
+                    TOp(_a) -> "op"
+                    TNewline -> "newline"
+                    TDoc(_a) -> "doc"
+                    TError(_a) -> "error"
+                }
+                kinds.set(k, (kinds.get(k) ?? 0) + 1)
+            }
+            var names = kinds.keys()
+            names.sort()
+            var parts: [str] = []
+            for n in names {
+                parts.push("{n} {kinds.get(n) ?? 0}")
+            }
+            print("  own source: {src.len()} characters, {toks.len()} tokens, {docs.len()} doc line(s)")
+            print("  {parts.join(", ")}")
+            print("  lexical errors in its own source: {count_errors(toks)}")
+        }
+    }
+}

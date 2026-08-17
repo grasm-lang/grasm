@@ -1,0 +1,31 @@
+--- binary increment ---
+  0 + 1 = 1
+  1 + 1 = 10
+  10 + 1 = 11
+  11 + 1 = 100
+  111 + 1 = 1000
+  1011 + 1 = 1100
+  0111 + 1 = 1000
+  11111111 + 1 = 100000000
+--- palindromes over ab ---
+  "" -> accept
+  "a" -> accept
+  "aa" -> accept
+  "ab" -> reject
+  "aba" -> accept
+  "abba" -> accept
+  "abab" -> reject
+  "abcba" -> seek_a
+  "aabaa" -> accept
+  "aabb" -> reject
+--- the 3-state busy beaver ---
+  outcome: halted
+  steps: 14 (published answer: 14)
+  ones written: 6 (published answer: 6)
+  tape: 111111
+  final state: HALT
+--- the tape really does grow both ways ---
+  after 10 left steps: tape length 10, origin -9, head -10
+  tape: LLLLLLLLLL
+--- non-termination is bounded, not hung ---
+  step limit after 500 steps

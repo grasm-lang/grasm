@@ -1,0 +1,317 @@
+// A micro virtual machine — bytecode, a stack, an instruction pointer, calls.
+//
+// The list asks for PUSH/ADD/POP. That is an afternoon and proves little, so
+// this goes as far as *calls*: a call stack with frames, locals, arguments and
+// returns, which is where a stack machine actually gets hard. A return that
+// leaves the operand stack unbalanced corrupts the caller in a way that shows
+// up several instructions later, so the VM checks the invariant on every
+// return rather than trusting it.
+//
+// Every fault is a value. A VM that panics on bad bytecode is a VM you cannot
+// run untrusted code on, and the whole reason to write one is to run code you
+// do not trust.
+
+type Op =
+    | Push(v: i64)
+    | Pop
+    | Dup
+    | Swap
+    | Add
+    | Sub
+    | Mul
+    | Div
+    | Mod
+    | Neg
+    | Lt
+    | Eq
+    | Not
+    | Jmp(to: i64)
+    | Jz(to: i64)
+    | Load(slot: i64)
+    | Store(slot: i64)
+    | Call(to: i64, argc: i64)
+    | Ret
+    | Print
+    | Halt
+
+type Frame = {
+    return_to: i64,
+    base: i64,        // operand-stack height on entry, for the balance check
+    locals: [i64],
+}
+
+type Vm = {
+    code: [Op],
+    stack: [i64],
+    frames: [Frame],
+    ip: i64,
+    steps: i64,
+    output: [str],
+}
+
+type Fault = { why: str, ip: i64 }
+
+fn new_vm(code: [Op]) -> Vm {
+    var locals: [i64] = []
+    for _i in 0..8 {
+        locals.push(0)
+    }
+    Vm{
+        code: code,
+        stack: [],
+        frames: [Frame{ return_to: -1, base: 0, locals: locals }],
+        ip: 0,
+        steps: 0,
+        output: [],
+    }
+}
+
+fn pop(inout vm: Vm) -> i64 ! Fault {
+    if vm.stack.len() == 0 {
+        fail(Fault{ why: "stack underflow", ip: vm.ip })
+    }
+    match vm.stack.pop() {
+        Some(v) -> v
+        None -> fail(Fault{ why: "stack underflow", ip: vm.ip })
+    }
+}
+
+fn run(inout vm: Vm, limit: i64) -> str ! Fault {
+    var going = true
+    while going {
+        if vm.steps >= limit {
+            fail(Fault{ why: "step limit reached", ip: vm.ip })
+        }
+        if vm.ip < 0 or vm.ip >= vm.code.len() {
+            fail(Fault{ why: "instruction pointer out of range", ip: vm.ip })
+        }
+        let op = vm.code[vm.ip]
+        vm.ip = vm.ip + 1
+        vm.steps = vm.steps + 1
+
+        match op {
+            Push(v) -> vm.stack.push(v)
+            Pop -> {
+                let _v = try pop(vm)
+            }
+            Dup -> {
+                let v = try pop(vm)
+                vm.stack.push(v)
+                vm.stack.push(v)
+            }
+            Swap -> {
+                let b = try pop(vm)
+                let a = try pop(vm)
+                vm.stack.push(b)
+                vm.stack.push(a)
+            }
+            Add -> {
+                let b = try pop(vm)
+                let a = try pop(vm)
+                vm.stack.push(a + b)
+            }
+            Sub -> {
+                let b = try pop(vm)
+                let a = try pop(vm)
+                vm.stack.push(a - b)
+            }
+            Mul -> {
+                let b = try pop(vm)
+                let a = try pop(vm)
+                vm.stack.push(a * b)
+            }
+            Div -> {
+                let b = try pop(vm)
+                let a = try pop(vm)
+                if b == 0 {
+                    fail(Fault{ why: "division by zero", ip: vm.ip - 1 })
+                }
+                vm.stack.push(a / b)
+            }
+            Mod -> {
+                let b = try pop(vm)
+                let a = try pop(vm)
+                if b == 0 {
+                    fail(Fault{ why: "modulo by zero", ip: vm.ip - 1 })
+                }
+                vm.stack.push(a % b)
+            }
+            Neg -> {
+                let a = try pop(vm)
+                vm.stack.push(0 - a)
+            }
+            Lt -> {
+                let b = try pop(vm)
+                let a = try pop(vm)
+                vm.stack.push(if a < b { 1 } else { 0 })
+            }
+            Eq -> {
+                let b = try pop(vm)
+                let a = try pop(vm)
+                vm.stack.push(if a == b { 1 } else { 0 })
+            }
+            Not -> {
+                let a = try pop(vm)
+                vm.stack.push(if a == 0 { 1 } else { 0 })
+            }
+            Jmp(to) -> vm.ip = to
+            Jz(to) -> {
+                let c = try pop(vm)
+                if c == 0 {
+                    vm.ip = to
+                }
+            }
+            Load(slot) -> {
+                let f = vm.frames[vm.frames.len() - 1]
+                if slot < 0 or slot >= f.locals.len() {
+                    fail(Fault{ why: "local {slot} out of range", ip: vm.ip - 1 })
+                }
+                vm.stack.push(f.locals[slot])
+            }
+            Store(slot) -> {
+                let v = try pop(vm)
+                let top = vm.frames.len() - 1
+                if slot < 0 or slot >= vm.frames[top].locals.len() {
+                    fail(Fault{ why: "local {slot} out of range", ip: vm.ip - 1 })
+                }
+                vm.frames[top].locals[slot] = v
+            }
+            Call(to, argc) -> {
+                if vm.frames.len() >= 64 {
+                    fail(Fault{ why: "call depth exceeded", ip: vm.ip - 1 })
+                }
+                var locals: [i64] = []
+                for _i in 0..8 {
+                    locals.push(0)
+                }
+                // Arguments come off the caller's stack in reverse, so slot 0
+                // is the first argument as written.
+                var i = argc - 1
+                while i >= 0 {
+                    locals[i] = try pop(vm)
+                    i = i - 1
+                }
+                vm.frames.push(Frame{
+                    return_to: vm.ip,
+                    base: vm.stack.len(),
+                    locals: locals,
+                })
+                vm.ip = to
+            }
+            Ret -> {
+                let v = try pop(vm)
+                let f = vm.frames[vm.frames.len() - 1]
+                // The invariant: a callee must leave the operand stack exactly
+                // as it found it, apart from its own return value. Checking
+                // here turns a corrupted caller into a named fault.
+                if vm.stack.len() != f.base {
+                    fail(Fault{
+                        why: "unbalanced stack on return: {vm.stack.len() - f.base} value(s) left behind",
+                        ip: vm.ip - 1,
+                    })
+                }
+                if vm.frames.len() <= 1 {
+                    fail(Fault{ why: "return from the outermost frame", ip: vm.ip - 1 })
+                }
+                let _dropped = vm.frames.pop()
+                vm.ip = f.return_to
+                vm.stack.push(v)
+            }
+            Print -> {
+                let v = try pop(vm)
+                vm.output.push("{v}")
+            }
+            Halt -> going = false
+        }
+    }
+    "halted"
+}
+
+fn execute(label: str, code: [Op]) {
+    var vm = new_vm(code)
+    match run(vm, 100000) {
+        Ok(_) -> {
+            let left = if vm.stack.len() == 0 { "empty" } else { "{vm.stack}" }
+            print("{label}: [{vm.output.join(" ")}]  steps {vm.steps}  stack {left}")
+        }
+        Err(e) -> print("{label}: fault: {e.why} (at ip {e.ip}) after {vm.steps} steps")
+    }
+}
+
+fn main() {
+    print("--- arithmetic ---")
+    execute("2+3", [Push(2), Push(3), Add, Print, Halt])
+    execute("precedence 2+3*4", [Push(2), Push(3), Push(4), Mul, Add, Print, Halt])
+    execute("10-3-2", [Push(10), Push(3), Sub, Push(2), Sub, Print, Halt])
+    execute("stack ops", [Push(1), Push(2), Swap, Print, Print, Halt])
+    execute("dup", [Push(7), Dup, Mul, Print, Halt])
+    execute("negate", [Push(5), Neg, Print, Halt])
+
+    print("--- control flow: count down from 5 ---")
+    execute("countdown", [
+        Push(5), Store(0),           // 0,1     i = 5
+        Load(0), Jz(11),             // 2,3     while i != 0
+        Load(0), Print,              // 4,5       print i
+        Load(0), Push(1), Sub, Store(0), // 6..9   i = i - 1
+        Jmp(2),                      // 10
+        Halt,                        // 11
+    ])
+
+    print("--- functions ---")
+    // main: print(square(7)); print(add(3, 4)); halt
+    //
+    // The first version of this had the caller fall straight into `square`'s
+    // body after the second call returned, because the `Halt` was in the wrong
+    // place. The balance check found it — "unbalanced stack on return, 1 value
+    // left behind" — which is exactly the bug class it exists for, and is why
+    // it is checked on every return rather than assumed.
+    execute("calls", [
+        Push(7), Call(8, 1), Print,        // 0,1,2
+        Push(3), Push(4), Call(12, 2),     // 3,4,5
+        Print,                             // 6
+        Halt,                              // 7
+        Load(0), Load(0), Mul, Ret,        // 8..11    <- square (entry 8)
+        Load(0), Load(1), Add, Ret,        // 12..15   <- add (entry 12)
+    ])
+
+    print("--- recursion: factorial ---")
+    // fact(n) = if n < 2 { 1 } else { n * fact(n-1) }
+    // entry at 4
+    execute("factorial 10", [
+        Push(10), Call(4, 1), Print, Halt,          // 0,1,2,3
+        Load(0), Push(2), Lt, Jz(11),               // 4..7   if n < 2
+        Push(1), Ret,                               // 8,9
+        Halt,                                       // 10 (unreachable)
+        Load(0), Load(0), Push(1), Sub, Call(4, 1), Mul, Ret,  // 11..17
+    ])
+
+    print("--- recursion: fibonacci, which exercises the frame stack ---")
+    execute("fib 15", [
+        Push(15), Call(4, 1), Print, Halt,          // 0..3
+        Load(0), Push(2), Lt, Jz(11),               // 4..7
+        Load(0), Ret,                               // 8,9
+        Halt,                                       // 10
+        Load(0), Push(1), Sub, Call(4, 1),          // 11..14
+        Load(0), Push(2), Sub, Call(4, 1),          // 15..18
+        Add, Ret,                                   // 19,20
+    ])
+
+    print("--- faults, which must be values ---")
+    execute("underflow", [Add, Halt])
+    execute("divide by zero", [Push(1), Push(0), Div, Print, Halt])
+    execute("bad jump", [Jmp(99), Halt])
+    execute("bad local", [Load(99), Halt])
+    execute("runs off the end", [Push(1)])
+    execute("infinite loop", [Jmp(0)])
+    execute("return from top", [Push(1), Ret])
+    // A callee that leaves rubbish on the stack. Without the balance check the
+    // caller silently reads it as its own value.
+    execute("unbalanced callee", [
+        Push(1), Call(4, 1), Print, Halt,
+        Push(99), Push(1), Ret,
+    ])
+    execute("runaway recursion", [
+        Push(1), Call(4, 1), Print, Halt,
+        Load(0), Call(4, 1), Ret,
+    ])
+}

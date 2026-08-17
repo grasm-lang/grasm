@@ -1,0 +1,583 @@
+// A SQL query engine — parsing, typed columns, filtering, and aggregation.
+//
+// The list asks for `SELECT name FROM users WHERE id = 1`. That is one query
+// shape and a `split(" ")` handles it, which tests nothing. So this parses a
+// grammar: projection lists, `WHERE` with `AND`/`OR` and comparison operators,
+// `ORDER BY ... ASC|DESC`, `LIMIT`, and the five aggregates — over typed cells,
+// so `WHERE age > 30` compares numbers and `WHERE name > 'm'` compares text and
+// the engine knows which is which.
+//
+// The interesting part is NULL. Three-valued logic is where every hand-written
+// query engine is wrong: `NULL = NULL` is not true, `NOT (NULL = 1)` is not
+// true either, and a row is returned only when the predicate is *definitely*
+// true. Those cases are tested explicitly.
+
+type Cell =
+    | Num(v: f64)
+    | Text(s: str)
+    | Null
+
+type Table = {
+    name: str,
+    columns: [str],
+    rows: [[Cell]],
+}
+
+// Three-valued logic: unknown is a third answer, not a kind of false.
+type Truth = | True | False | Unknown
+
+type Query = {
+    select: [str],        // column names, or ["*"], or one aggregate
+    agg: str,             // "", "COUNT", "SUM", "AVG", "MIN", "MAX"
+    agg_col: str,
+    from: str,
+    where_clause: [str],  // tokens, empty if absent
+    order_by: str,
+    descending: bool,
+    limit: i64,
+}
+
+type Bad = { why: str }
+
+fn cell_text(c: Cell) -> str {
+    match c {
+        Num(v) -> if v == v.as_i64().as_f64() { "{v.as_i64()}" } else { "{v}" }
+        Text(s) -> s
+        Null -> "NULL"
+    }
+}
+
+fn column_index(t: Table, name: str) -> i64 {
+    for i in 0..t.columns.len() {
+        if t.columns[i] == name {
+            return i
+        }
+    }
+    -1
+}
+
+// --- tokenizing -------------------------------------------------------------
+fn tokenize(src: str) -> [str] ! Bad {
+    var out: [str] = []
+    let cs = src.chars()
+    var i = 0
+    while i < cs.len() {
+        let c = cs[i]
+        if c == " " or c == "\n" or c == "\t" {
+            i = i + 1
+        } else if c == "'" {
+            var s = "'"
+            i = i + 1
+            var closed = false
+            while i < cs.len() and not closed {
+                if cs[i] == "'" {
+                    closed = true
+                } else {
+                    s = s + cs[i]
+                }
+                i = i + 1
+            }
+            if not closed {
+                fail(Bad{ why: "unterminated string literal" })
+            }
+            out.push(s)
+        } else if c == "<" or c == ">" or c == "!" {
+            if i + 1 < cs.len() and cs[i + 1] == "=" {
+                out.push(c + "=")
+                i = i + 2
+            } else {
+                out.push(c)
+                i = i + 1
+            }
+        } else if c == "=" or c == "," or c == "(" or c == ")" or c == "*" {
+            out.push(c)
+            i = i + 1
+        } else {
+            var word = ""
+            var breaking = false
+            var at = i
+            while i < cs.len() {
+                at = i
+                let d = cs[i]
+                // Operators end the lines rather than starting them: a newline
+                // ends a statement unless the line ends in one.
+                let stop = d == " " or d == "," or d == "(" or d == ")" or
+                    d == "=" or d == "<" or d == ">" or d == "!" or
+                    d == "\n" or d == "\t"
+                if stop {
+                    breaking = true
+                    i = cs.len()
+                } else {
+                    word = word + d
+                    i = i + 1
+                }
+            }
+            if breaking {
+                i = at
+            }
+            out.push(word)
+        }
+    }
+    out
+}
+
+fn upper(s: str) -> str {
+    s.to_upper()
+}
+
+fn parse(src: str) -> Query ! Bad {
+    let ts = try tokenize(src)
+    if ts.len() == 0 {
+        fail(Bad{ why: "empty query" })
+    }
+    if upper(ts[0]) != "SELECT" {
+        fail(Bad{ why: "a query must begin with SELECT, found `{ts[0]}`" })
+    }
+    var q = Query{
+        select: [], agg: "", agg_col: "", from: "",
+        where_clause: [], order_by: "", descending: false, limit: -1,
+    }
+    var i = 1
+
+    // Projection: `*`, a column list, or one aggregate call.
+    let aggs = ["COUNT", "SUM", "AVG", "MIN", "MAX"]
+    if i + 3 < ts.len() and aggs.contains(upper(ts[i])) and ts[i + 1] == "(" {
+        q.agg = upper(ts[i])
+        q.agg_col = ts[i + 2]
+        if ts[i + 3] != ")" {
+            fail(Bad{ why: "missing `)` after {q.agg}(" })
+        }
+        i = i + 4
+    } else {
+        var going = true
+        while going and i < ts.len() {
+            if upper(ts[i]) == "FROM" {
+                going = false
+            } else if ts[i] == "," {
+                i = i + 1
+            } else {
+                q.select.push(ts[i])
+                i = i + 1
+            }
+        }
+        if q.select.len() == 0 {
+            fail(Bad{ why: "no columns selected" })
+        }
+    }
+
+    if i >= ts.len() or upper(ts[i]) != "FROM" {
+        fail(Bad{ why: "expected FROM" })
+    }
+    i = i + 1
+    if i >= ts.len() {
+        fail(Bad{ why: "expected a table name after FROM" })
+    }
+    q.from = ts[i]
+    i = i + 1
+
+    while i < ts.len() {
+        let kw = upper(ts[i])
+        if kw == "WHERE" {
+            i = i + 1
+            while i < ts.len() and upper(ts[i]) != "ORDER" and upper(ts[i]) != "LIMIT" {
+                q.where_clause.push(ts[i])
+                i = i + 1
+            }
+            if q.where_clause.len() == 0 {
+                fail(Bad{ why: "WHERE with no condition" })
+            }
+        } else if kw == "ORDER" {
+            i = i + 1
+            if i >= ts.len() or upper(ts[i]) != "BY" {
+                fail(Bad{ why: "expected BY after ORDER" })
+            }
+            i = i + 1
+            if i >= ts.len() {
+                fail(Bad{ why: "expected a column after ORDER BY" })
+            }
+            q.order_by = ts[i]
+            i = i + 1
+            if i < ts.len() and (upper(ts[i]) == "ASC" or upper(ts[i]) == "DESC") {
+                q.descending = upper(ts[i]) == "DESC"
+                i = i + 1
+            }
+        } else if kw == "LIMIT" {
+            i = i + 1
+            if i >= ts.len() {
+                fail(Bad{ why: "expected a number after LIMIT" })
+            }
+            match ts[i].parse_int() {
+                Some(n) -> q.limit = n
+                None -> fail(Bad{ why: "LIMIT wants a number, found `{ts[i]}`" })
+            }
+            i = i + 1
+        } else {
+            fail(Bad{ why: "unexpected `{ts[i]}`" })
+        }
+    }
+    q
+}
+
+// --- evaluation -------------------------------------------------------------
+fn literal_of(tok: str) -> Cell {
+    if tok.starts_with("'") {
+        return Text(tok.substr(1, tok.len() - 1))
+    }
+    if upper(tok) == "NULL" {
+        return Null
+    }
+    match tok.parse_float() {
+        Some(v) -> Num(v)
+        None -> Text(tok)
+    }
+}
+
+fn value_of(tok: str, t: Table, row: [Cell]) -> Cell {
+    let idx = column_index(t, tok)
+    if idx >= 0 {
+        return row[idx]
+    }
+    literal_of(tok)
+}
+
+/// Compare two cells. `None` means the comparison is unknown, which is what
+/// NULL makes it — and is why this returns an Option rather than an i64.
+fn compare_cells(a: Cell, b: Cell) -> Option[i64] {
+    match a {
+        Null -> None
+        Num(x) -> match b {
+            Num(y) -> Some(if x < y { 0 - 1 } else if x > y { 1 } else { 0 })
+            Text(y) -> None
+            Null -> None
+        }
+        Text(x) -> match b {
+            Text(y) -> Some(x.cmp(y))
+            Num(y) -> None
+            Null -> None
+        }
+    }
+}
+
+fn apply_op(op: str, a: Cell, b: Cell) -> Truth {
+    match compare_cells(a, b) {
+        None -> Unknown
+        Some(c) -> {
+            let yes = if op == "=" { c == 0 }
+                else if op == "!=" { c != 0 }
+                else if op == "<" { c < 0 }
+                else if op == ">" { c > 0 }
+                else if op == "<=" { c <= 0 }
+                else { c >= 0 }
+            if yes { True } else { False }
+        }
+    }
+}
+
+fn and_truth(a: Truth, b: Truth) -> Truth {
+    match a {
+        False -> False
+        True -> b
+        Unknown -> match b { False -> False  _ -> Unknown }
+    }
+}
+
+fn or_truth(a: Truth, b: Truth) -> Truth {
+    match a {
+        True -> True
+        False -> b
+        Unknown -> match b { True -> True  _ -> Unknown }
+    }
+}
+
+/// The predicate, left to right with AND binding tighter than OR.
+fn eval_where(tokens: [str], t: Table, row: [Cell]) -> Truth ! Bad {
+    // Split on OR at the top level, then on AND.
+    var or_groups: [[str]] = []
+    var current: [str] = []
+    for tok in tokens {
+        if upper(tok) == "OR" {
+            or_groups.push(current)
+            current = []
+        } else {
+            current.push(tok)
+        }
+    }
+    or_groups.push(current)
+
+    var result = False
+    for group in or_groups {
+        var and_terms: [[str]] = []
+        var term: [str] = []
+        for tok in group {
+            if upper(tok) == "AND" {
+                and_terms.push(term)
+                term = []
+            } else {
+                term.push(tok)
+            }
+        }
+        and_terms.push(term)
+
+        var group_truth = True
+        for cmp in and_terms {
+            if cmp.len() != 3 {
+                fail(Bad{ why: "a condition must be `column op value`, found {cmp.len()} token(s)" })
+            }
+            let a = value_of(cmp[0], t, row)
+            let b = value_of(cmp[2], t, row)
+            group_truth = and_truth(group_truth, apply_op(cmp[1], a, b))
+        }
+        result = or_truth(result, group_truth)
+    }
+    result
+}
+
+fn run_query(src: str, tables: [Table]) -> [str] ! Bad {
+    let q = try parse(src)
+    var found = -1
+    for i in 0..tables.len() {
+        if tables[i].name == q.from {
+            found = i
+        }
+    }
+    if found < 0 {
+        fail(Bad{ why: "no such table `{q.from}`" })
+    }
+    let t = tables[found]
+
+    // WHERE. A row is kept only when the predicate is definitely True —
+    // Unknown is not a kind of true.
+    var kept: [[Cell]] = []
+    for row in t.rows {
+        if q.where_clause.len() == 0 {
+            kept.push(row)
+        } else {
+            match try eval_where(q.where_clause, t, row) {
+                True -> kept.push(row)
+                False -> {}
+                Unknown -> {}
+            }
+        }
+    }
+
+    // ORDER BY, before LIMIT, which is the only order that gives a stable answer.
+    if q.order_by != "" {
+        let idx = column_index(t, q.order_by)
+        if idx < 0 {
+            fail(Bad{ why: "no such column `{q.order_by}`" })
+        }
+        // Insertion sort, so equal keys keep their original order.
+        var sorted: [[Cell]] = []
+        for row in kept {
+            var at = sorted.len()
+            var i = 0
+            var placed = false
+            while i < sorted.len() and not placed {
+                // NULLs sort together at the end, in both directions. Left to
+                // the comparison alone they scatter: every comparison
+                // involving one is unknown, so a NULL row never displaces
+                // anything and nothing displaces it either, and `ORDER BY age
+                // DESC` put the NULL between two 25s.
+                let mine_null = match row[idx] { Null -> true  _ -> false }
+                let theirs_null = match sorted[i][idx] { Null -> true  _ -> false }
+                let before = if mine_null {
+                    false
+                } else if theirs_null {
+                    true
+                } else {
+                    match compare_cells(row[idx], sorted[i][idx]) {
+                        None -> false
+                        Some(v) -> if q.descending { v > 0 } else { v < 0 }
+                    }
+                }
+                if before {
+                    at = i
+                    placed = true
+                }
+                i = i + 1
+            }
+            var out: [[Cell]] = []
+            for k in 0..at { out.push(sorted[k]) }
+            out.push(row)
+            for k in at..sorted.len() { out.push(sorted[k]) }
+            sorted = out
+        }
+        kept = sorted
+    }
+
+    if q.limit >= 0 and kept.len() > q.limit {
+        var cut: [[Cell]] = []
+        for i in 0..q.limit { cut.push(kept[i]) }
+        kept = cut
+    }
+
+    // Aggregates.
+    if q.agg != "" {
+        if q.agg == "COUNT" and q.agg_col == "*" {
+            return ["{kept.len()}"]
+        }
+        let idx = column_index(t, q.agg_col)
+        if idx < 0 {
+            fail(Bad{ why: "no such column `{q.agg_col}`" })
+        }
+        var nums: [f64] = []
+        var texts: [str] = []
+        var non_null = 0
+        for row in kept {
+            match row[idx] {
+                Null -> {}
+                Num(v) -> {
+                    nums.push(v)
+                    non_null = non_null + 1
+                }
+                Text(s) -> {
+                    texts.push(s)
+                    non_null = non_null + 1
+                }
+            }
+        }
+        // COUNT(col) counts non-NULL values, which is the SQL rule people are
+        // most often surprised by.
+        if q.agg == "COUNT" {
+            return ["{non_null}"]
+        }
+        if nums.len() == 0 and texts.len() == 0 {
+            return ["NULL"]
+        }
+        if q.agg == "SUM" or q.agg == "AVG" {
+            if nums.len() == 0 {
+                fail(Bad{ why: "{q.agg} needs a numeric column" })
+            }
+            var total = 0.0
+            for v in nums { total = total + v }
+            let answer = if q.agg == "SUM" { total } else { total / nums.len().as_f64() }
+            return [cell_text(Num(answer))]
+        }
+        // MIN / MAX work on either type.
+        if nums.len() > 0 {
+            var best = nums[0]
+            for v in nums {
+                if (q.agg == "MIN" and v < best) or (q.agg == "MAX" and v > best) {
+                    best = v
+                }
+            }
+            return [cell_text(Num(best))]
+        }
+        var best = texts[0]
+        for v in texts {
+            if (q.agg == "MIN" and v.cmp(best) < 0) or (q.agg == "MAX" and v.cmp(best) > 0) {
+                best = v
+            }
+        }
+        return [best]
+    }
+
+    // Projection.
+    var want: [i64] = []
+    if q.select.len() == 1 and q.select[0] == "*" {
+        for i in 0..t.columns.len() { want.push(i) }
+    } else {
+        for name in q.select {
+            let idx = column_index(t, name)
+            if idx < 0 {
+                fail(Bad{ why: "no such column `{name}`" })
+            }
+            want.push(idx)
+        }
+    }
+    var out: [str] = []
+    for row in kept {
+        var parts: [str] = []
+        for i in want {
+            parts.push(cell_text(row[i]))
+        }
+        out.push(parts.join(" | "))
+    }
+    out
+}
+
+fn users() -> Table {
+    Table{
+        name: "users",
+        columns: ["id", "name", "age", "city"],
+        rows: [
+            [Num(1.0), Text("ada"), Num(36.0), Text("london")],
+            [Num(2.0), Text("bob"), Num(25.0), Text("paris")],
+            [Num(3.0), Text("cyd"), Num(41.0), Text("london")],
+            [Num(4.0), Text("dee"), Null, Text("berlin")],
+            [Num(5.0), Text("eve"), Num(25.0), Null],
+        ],
+    }
+}
+
+fn show(src: str) {
+    match run_query(src, [users()]) {
+        Err(e) -> print("{src}\n    error: {e.why}")
+        Ok(rows) -> {
+            if rows.len() == 0 {
+                print("{src}\n    (no rows)")
+            } else {
+                print("{src}")
+                for r in rows {
+                    print("    {r}")
+                }
+            }
+        }
+    }
+}
+
+fn main() {
+    print("--- projection ---")
+    show("SELECT name FROM users WHERE id = 1")
+    show("SELECT * FROM users WHERE id = 3")
+    show("SELECT name, city FROM users WHERE age > 30")
+
+    print("--- comparison operators ---")
+    show("SELECT name FROM users WHERE age >= 36")
+    show("SELECT name FROM users WHERE age != 25")
+    show("SELECT name FROM users WHERE name < 'c'")
+    show("SELECT name FROM users WHERE city = 'london'")
+
+    print("--- AND, OR, and precedence ---")
+    show("SELECT name FROM users WHERE age > 30 AND city = 'london'")
+    show("SELECT name FROM users WHERE age < 26 OR age > 40")
+    show("SELECT name FROM users WHERE city = 'paris' OR age > 30 AND city = 'london'")
+
+    print("--- ORDER BY and LIMIT ---")
+    show("SELECT name, age FROM users ORDER BY age")
+    show("SELECT name, age FROM users ORDER BY age DESC")
+    show("SELECT name FROM users ORDER BY name DESC LIMIT 2")
+    show("SELECT name FROM users LIMIT 0")
+
+    print("--- aggregates ---")
+    show("SELECT COUNT(*) FROM users")
+    show("SELECT COUNT(age) FROM users")
+    show("SELECT SUM(age) FROM users")
+    show("SELECT AVG(age) FROM users")
+    show("SELECT MIN(age) FROM users")
+    show("SELECT MAX(age) FROM users")
+    show("SELECT MIN(name) FROM users")
+    show("SELECT COUNT(*) FROM users WHERE city = 'london'")
+
+    print("--- NULL, and three-valued logic ---")
+    // Every one of these is a place a hand-written engine goes wrong.
+    show("SELECT name FROM users WHERE age = NULL")
+    show("SELECT name FROM users WHERE age != NULL")
+    show("SELECT name FROM users WHERE city = NULL")
+    show("SELECT name FROM users WHERE age > 20 AND city = NULL")
+    show("SELECT name FROM users WHERE age > 20 OR city = NULL")
+    show("SELECT COUNT(city) FROM users")
+
+    print("--- errors, which must be values ---")
+    show("SELECT name FROM missing WHERE id = 1")
+    show("SELECT nope FROM users")
+    show("DELETE FROM users")
+    show("SELECT FROM users")
+    show("SELECT name users")
+    show("SELECT name FROM users WHERE")
+    show("SELECT name FROM users WHERE age >")
+    show("SELECT name FROM users LIMIT abc")
+    show("SELECT name FROM users ORDER BY nope")
+    show("SELECT name FROM users WHERE name = 'unterminated")
+    show("")
+}
