@@ -140,7 +140,37 @@ construction to one interpolation instead of a concatenation changed the time by
 nothing; and replacing the `RefCell` borrow that every allocation makes with a
 plain counter measured **zero** on a benchmark that allocates 800,000 times.
 
-What is left is that every string is a refcounted box and this benchmark builds
+**Measured decomposition, 2026-08-18.** The claim above — that what is left is
+string boxing — is only half right, and the half it gets wrong matters. Splitting
+the benchmark into its parts and timing each back to back:
+
+| part | time |
+|---|---|
+| whole benchmark | 123–148 ms |
+| building the strings, no map at all | ~58 ms |
+| the map work, with only 8 distinct keys | ~74 ms |
+| interpolation alone | ~21 ms |
+| the loop and arithmetic alone | ~1 ms |
+
+**The map is at least as expensive as the strings**, on a map that never exceeds
+eight entries. At 800,000 operations that is ~90 ns each, and most of it is
+hashing — which is a *deliberate* cost, for the reason recorded below: map keys
+are user data and the default hasher is what stops a program reading untrusted
+input from being hash-flooded. It is not a defect to be optimised away.
+
+**One attempt, measured and reverted.** `MapKey::of` calls `to_string()` on the
+key, so `set` allocates a `String` purely to look something up. Making `RtStr`
+hold `Arc<str>` so that becomes a refcount bump did work — map operations fell
+from ~74 ms to ~68 ms. It also made string *creation* 32% slower (58 → 77 ms),
+because `Arc::from(String)` allocates a second buffer and copies the bytes into
+it. This benchmark creates more strings than it looks up, so the trade was a net
+loss and the change was reverted.
+
+Note also that the `get` path was already allocation-free: `with_key` borrows a
+thread-local scratch `String`. The optimisation was only ever available on `set`.
+
+What is left after that is that every string is a refcounted box and this
+benchmark builds
 two per iteration. Closing it means small-string optimisation or interning —
 changing the representation of every value in the language. The map's hasher is
 *not* a candidate: map keys are user data, and Rust's default hasher is what
