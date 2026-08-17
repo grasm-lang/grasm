@@ -131,6 +131,21 @@ reimplementing float formatting, allocation and threads. That is a real project
 with a known shape, not an open question — and it is the only thing between here
 and the goal.
 
+**G2's one real gap is the value representation, and it is not a missing
+optimisation.** `wordfreq` is 2.5× behind Rust; every other program is within
+1.2× of the fastest. Three candidate causes were checked and none of them was
+it: the map is already a `HashMap` with sorting deferred to iteration, so
+[E-MAP-ORDER] costs nothing on insert; rewriting the program's string
+construction to one interpolation instead of a concatenation changed the time by
+nothing; and replacing the `RefCell` borrow that every allocation makes with a
+plain counter measured **zero** on a benchmark that allocates 800,000 times.
+
+What is left is that every string is a refcounted box and this benchmark builds
+two per iteration. Closing it means small-string optimisation or interning —
+changing the representation of every value in the language. The map's hasher is
+*not* a candidate: map keys are user data, and Rust's default hasher is what
+stops a program that reads untrusted input from being hash-flooded.
+
 **G1 and G10 cannot be moved from inside this repository.** No human has run a
 Grasm program. Every signal the project has is model-generated, and the two
 goals that measure whether the language is *good to use* are the two with no

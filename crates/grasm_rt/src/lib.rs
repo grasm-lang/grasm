@@ -692,6 +692,10 @@ fn is_counted(rc: i64) -> bool {
     rc != IMMORTAL && rc != ARENA
 }
 
+// A `Cell<usize>` depth counter was tried beside this, so that an allocation
+// could ask "am I inside a region" with a load rather than a `RefCell` borrow.
+// It measured **zero** on a benchmark that allocates 800,000 times, and was
+// reverted: the borrow is not what costs.
 thread_local! {
     /// One list of allocations per open region, innermost last.
     static REGIONS: std::cell::RefCell<Vec<Vec<*mut RtVal>>> =
