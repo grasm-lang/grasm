@@ -6013,6 +6013,12 @@ Perform the effect after the closing brace, or yield a number and do the work ou
                         };
                         self.check_expr(&args[0], &f);
                     }
+                    // The element type, for the backend's fused
+                    // `(a..b).map(f)` loop. Recorded unresolved and decoded
+                    // once inference ends, for the same reason
+                    // `map_get_pending` is.
+                    self.map_get_pending
+                        .push(((span.start, span.end), out.clone()));
                     Type::List(Box::new(out))
                 }
                 "filter" => {

@@ -140,6 +140,25 @@ construction to one interpolation instead of a concatenation changed the time by
 nothing; and replacing the `RefCell` borrow that every allocation makes with a
 plain counter measured **zero** on a benchmark that allocates 800,000 times.
 
+**Fixed, 2026-08-18: `(a..b).map(f)` is one loop, not two passes.** `sieve` 52 ms
+to 39 ms, and `range.map` on two million elements 20 ms to 7 ms — faster than the
+hand-written `push` loop it replaces.
+
+A range combinator was lowered by first turning the range into a list and then
+running the list method over it: two passes and an allocation the size of the
+input. Decomposing the sieve showed the flags cost more to *build* than the
+sieving cost to run — 20 ms against 5 ms of reads and 3 ms of writes.
+
+When the function is a closure written at the call site, the loop now binds its
+parameter and its body becomes the loop body, so there is no intermediate list
+and no call at all. A named function takes the ordinary path, where the call has
+to happen anyway.
+
+This needed the same help from the checker as the map fusion below: the
+accumulator needs a written element type, and the closure body's type is not
+knowable at the point the loop is synthesised, because the loop variable it
+mentions is not bound yet.
+
 **Fixed, 2026-08-18: `m.get(k) ?? d` no longer builds an `Option`.** 149 ms to
 116 ms on `wordfreq`, and the gap to the fastest implementation narrows from
 4.6x to 3.6x.

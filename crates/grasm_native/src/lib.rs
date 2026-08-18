@@ -5293,6 +5293,102 @@ impl FnCx<'_, '_> {
         })
     }
 
+    /// `(a..b).map(f)` and `(a..b).filter(p)` as one loop, with no intermediate
+    /// list of the range's own elements.
+    ///
+    /// Only for a closure written at the call site: the parameter is bound by
+    /// the `for`, so the closure body becomes the loop body and there is no
+    /// call at all. A named function or a stored closure takes the ordinary
+    /// path, where the call has to happen anyway.
+    ///
+    /// Returns `None` whenever the shape does not match, so nothing here can
+    /// change what a program means — only how long it takes.
+    fn fused_range_build(
+        &self,
+        range: &Expr,
+        which: &str,
+        f: &Expr,
+        span: Span,
+    ) -> Option<Expr> {
+        let Expr::Closure { params, body, .. } = f else {
+            return None;
+        };
+        if params.len() != 1 {
+            return None;
+        }
+        // The accumulator needs a written element type: an empty list literal
+        // with nothing in view is refused, and the closure body's type is not
+        // knowable here — the loop variable it mentions is not bound yet. The
+        // checker knows it and publishes it.
+        let elem_name = if which == "filter" {
+            "i64"
+        } else {
+            match self.cg.map_get_value_kind.get(&(span.start, span.end))? {
+                0 => "i64",
+                1 => "f64",
+                2 => "bool",
+                3 => "str",
+                4 => "bytes",
+                _ => return None,
+            }
+        };
+        let elem_ty = grasm_syntax::ast::TypeExpr::List(
+            Box::new(grasm_syntax::ast::TypeExpr::Name {
+                path: grasm_syntax::ast::Path {
+                    segments: vec![Ident { name: elem_name.to_string(), span }],
+                    span,
+                },
+                args: Vec::new(),
+                span,
+            }),
+            span,
+        );
+        let acc = Ident { name: "__fused_acc".to_string(), span };
+        let item = params[0].clone();
+
+        // `acc.push(<body>)` for map; `if <body> { acc.push(item) }` for filter.
+        let push_mapped = Stmt::Expr(Expr::MethodCall {
+            recv: Box::new(Expr::Ident(acc.clone())),
+            name: Ident { name: "push".to_string(), span },
+            args: vec![if which == "map" {
+                (**body).clone()
+            } else {
+                Expr::Ident(item.clone())
+            }],
+            span,
+        });
+        let body_stmt = if which == "map" {
+            push_mapped
+        } else {
+            Stmt::Expr(Expr::If {
+                cond: Box::new((**body).clone()),
+                then_block: grasm_syntax::ast::Block { stmts: vec![push_mapped], span },
+                else_branch: None,
+                span,
+            })
+        };
+
+        Some(Expr::Block(grasm_syntax::ast::Block {
+            stmts: vec![
+                Stmt::Let {
+                    mutable: true,
+                    name: acc.clone(),
+                    ty: Some(elem_ty),
+                    init: Expr::List(Vec::new(), span),
+                    span,
+                },
+                Stmt::For {
+                    var: item,
+                    iter: range.clone(),
+                    body: grasm_syntax::ast::Block { stmts: vec![body_stmt], span },
+                    span,
+                },
+                Stmt::Expr(Expr::Ident(acc)),
+            ],
+            span,
+        }))
+    }
+
     fn eval_method(
         &mut self,
         recv: &Expr,
@@ -5318,6 +5414,17 @@ impl FnCx<'_, '_> {
             let as_list = self.range_to_list_expr(recv, span);
             if name.name == "to_list" {
                 return self.eval_expr(&as_list);
+            }
+            // `map` and `filter` are *fused* into the same loop rather than
+            // run over the list the range was first turned into. Building the
+            // intermediate is two passes and an allocation the size of the
+            // input: on `(0..=2_000_000).map(|_| true)` — how a sieve makes its
+            // flags — the intermediate cost more than the sieve that followed
+            // it, 20 ms against 5 ms of reading and 3 ms of writing.
+            if name.name == "map" || name.name == "filter" {
+                if let Some(fused) = self.fused_range_build(recv, &name.name, &args[0], span) {
+                    return self.eval_expr(&fused);
+                }
             }
             let call = Expr::MethodCall {
                 recv: Box::new(as_list),
