@@ -392,6 +392,48 @@ available. A test asserts that: `run`, `send`, `open`, `close`, `read`, `write`,
 `start`, `stop`, `wait`, `execute` and twenty more must never appear in the
 builtin list.
 
+## F25 — three checks in `nativegaps.sh` had never run (S2, tests) — **fixed**
+
+Found while running the gap gate after F24. Three call sites spelled the helper
+`expect_compiles`; the function is `expect_compiled`. The shell printed
+`command not found`, the script does not use `set -e`, and nothing set the
+failure flag — so the gate passed while three of its checks did nothing.
+
+A gate that silently skips part of itself is worse than one that is missing it,
+because the report says the check ran.
+
+**Fixed** — the names match, all five `expect_compiled` checks run, and all
+pass.
+
+## F24 — `inout` through a place ran interpreted and would not compile (S2, backend) — **fixed**
+
+Found by `scripts/fuzz_places.py`, written for this purpose: it enumerates the
+shapes a place can take — local, field, element, field of an element, list in a
+struct, reference at the root, reference in a field, reference in a list — and
+crosses them with read, write, compound assignment, and the mutating list
+methods. Eighty-four programs, interpreter against native.
+
+Everything agreed except three, and all three were the same thing:
+
+```grasm
+fn bump(inout ys: [i64]) { ys.push(1) }
+bump(s.xs)      // runs under `grasm run`, refused by the native backend
+```
+
+The `inout` ABI passes a pointer to the caller's slot, which exists for a local
+and not for a place inside something. `grasm run` reads the place, calls, and
+writes back — which is exactly what the mutating methods already do through a
+place, so the machinery was there and this one path did not use it.
+
+**Fixed** — the backend reads the place (taking rather than copying, so an
+`inout` through a place is not O(n) in what it points at), passes the slot's
+address, and writes back through `write_place`. Twenty thousand iterations
+through a struct field, a nested field and a list element: leak-free.
+
+It was a refusal and not a wrong answer, so S2. It was also a *documented* gap —
+`docs/tutorial.md` §11 listed it — which is the honest way to carry a hole, and
+`scripts/nativegaps.sh` now asserts it compiles instead.
+
 ## F23 — a C function reached any way but directly was handed the wrong pointer (S1, backend) — **fixed**
 
 Found by extending `scripts/fuzz_extern.py` to the pointer boundary, which is

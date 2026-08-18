@@ -7882,8 +7882,44 @@ checker did",
         // (arg index, boxed value, its type, the C pointer) for a C call's
         // pointer arguments, cleaned up after the call returns.
         let mut c_args: Vec<(usize, Value, VType, Value)> = Vec::new();
+        // (arg index, slot, root variable, root type, path) for an `inout`
+        // argument that is a *place* rather than a plain variable.
+        let mut inout_places: Vec<(
+            cranelift_codegen::ir::StackSlot,
+            Variable,
+            VType,
+            Vec<PlaceSeg<'_>>,
+        )> = Vec::new();
         for (i, (a, want)) in args.iter().zip(&params).enumerate() {
             if modes.get(i).copied() == Some(ParamMode::Inout) {
+                // `bump(s.xs)` — the argument names a place inside something,
+                // not a binding of its own. `grasm run` reads the place, calls,
+                // and writes back; this did not, and refused to compile a
+                // program the interpreter ran, which is the same read-modify-
+                // write the mutating methods already do through a place.
+                if !matches!(a, Expr::Ident(_)) {
+                    let (root_id, path) = self.place_path(a)?;
+                    let Some((var, root_t)) = self.lookup(&root_id.name) else {
+                        return nope(root_id.span, "an unknown `inout` argument");
+                    };
+                    let cur = self.b.use_var(var);
+                    // Taken rather than copied: the write-back below puts it
+                    // straight back, and a copy would make every `inout`
+                    // through a place O(n) in the thing it points at.
+                    let held = self.read_place_boxed(cur, &path, &root_t, true)?;
+                    let slot = self.b.create_sized_stack_slot(
+                        cranelift_codegen::ir::StackSlotData::new(
+                            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                            8,
+                            3,
+                        ),
+                    );
+                    self.b.ins().stack_store(held, slot, 0);
+                    let addr = self.b.ins().stack_addr(ptr_ty, slot, 0);
+                    vals.push(addr);
+                    inout_places.push((slot, var, root_t, path));
+                    continue;
+                }
                 let Expr::Ident(id) = a else {
                     return nope(a.span(), "`inout` arguments that aren't plain variables");
                 };
@@ -7949,6 +7985,15 @@ checker did",
         for (_, slot, var, vt) in inout_args {
             let updated = self.b.ins().stack_load(vt.cl(), slot, 0);
             self.b.def_var(var, updated);
+        }
+        // An `inout` place is written back where it came from, the same way a
+        // mutating method through a place is.
+        for (slot, var, root_t, path) in inout_places {
+            let updated = self.b.ins().stack_load(types::I64, slot, 0);
+            let cur = self.b.use_var(var);
+            self.begin_write();
+            let new_root = self.write_place(id.span, cur, &path, &root_t, updated)?;
+            self.b.def_var(var, new_root);
         }
         // The C call is over, so the temporary string copies are freed and the
         // boxed values that backed the pointers are released. A Grasm callee

@@ -199,7 +199,7 @@ expect_compiled "a closure called with a for variable" 'fn main() {
     }
 }'
 
-expect_compiles "a closure literal in a match arm" 'fn main() {
+expect_compiled "a closure literal in a match arm" 'fn main() {
     let n = 1
     let f: fn(i64) -> i64 = match n {
         1 -> |x| x + 1
@@ -267,7 +267,7 @@ expect_refused "a range held as a value" 'fn main() {
     print("{t}")
 }'
 
-expect_compiles "par_map with a closure bound to a name" 'fn sq(n: i64) -> i64 {
+expect_compiled "par_map with a closure bound to a name" 'fn sq(n: i64) -> i64 {
     n * n
 }
 
@@ -313,7 +313,10 @@ fn main() {
 
 # The half that must keep working: builtins the probe *does* know. Every one of
 # these compiled to a silent `0` before, which no refusal would have caught.
-expect_refused "an inout argument that is not a plain variable" 'type Bag = { items: [i64] }
+# Was a documented gap. `scripts/fuzz_places.py` found it by enumerating the
+# place shapes, and the backend now reads the place, calls, and writes back —
+# the same read-modify-write the mutating methods already did through a place.
+expect_compiled "an inout argument that is not a plain variable" 'type Bag = { items: [i64] }
 
 fn push_one(inout xs: [i64]) {
     xs.push(1)
@@ -325,7 +328,7 @@ fn main() {
     print("{b.items}")
 }'
 
-expect_compiles "returning a closure" 'fn mk(n: i64) -> fn(i64) -> i64 {
+expect_compiled "returning a closure" 'fn mk(n: i64) -> fn(i64) -> i64 {
     |x| x + n
 }
 
@@ -358,7 +361,7 @@ fn main() {
 
 # The neighbouring shapes that must keep compiling, so the three rows above
 # stay as narrow as they claim to be.
-expect_compiles "writing through a ref" 'type Node = { v: i64, kids: [i64] }
+expect_compiled "writing through a ref" 'type Node = { v: i64, kids: [i64] }
 
 fn main() {
     let r = ref(Node{ v: 1, kids: [] })
@@ -369,7 +372,7 @@ fn main() {
 
 # Through a cycle, which is what proved the first implementation wrong: the
 # write has to land in the slab, not in a rebuilt copy stored over it.
-expect_compiles "writing through a ref around a cycle" 'type G = { name: str, out: [ref G] }
+expect_compiled "writing through a ref around a cycle" 'type G = { name: str, out: [ref G] }
 
 fn main() {
     let a = ref(G{ name: "A", out: [] })
