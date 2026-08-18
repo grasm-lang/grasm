@@ -2879,6 +2879,7 @@ fn hex(v: i64) -> str {
 //! text is 5 characters and 6 bytes
 //! round trip: héllo
 //! written and read back identically: true
+//! empty is empty, seven bytes are not: true false
 // `bytes` is the type `str` deliberately is not ([L-LIB-BYTES]).
 //
 // The sequence below is x86-64 `mov rax, 1`. Written through a `str` it lands
@@ -2907,6 +2908,11 @@ fn main() / {io} {
         }
     }
     let _rm = remove_file(path) ?? ()
+
+    // `is_empty` was the one method here the compiled backend could not build:
+    // it widened `icmp`'s answer to the width it already had, which Cranelift
+    // rejects, so every `b.is_empty()` in the language was a "codegen bug".
+    print("empty is empty, seven bytes are not: {bytes_of([]).is_empty()} {code.is_empty()}")
 }
 ```
 

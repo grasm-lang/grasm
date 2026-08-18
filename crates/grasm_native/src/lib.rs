@@ -6632,12 +6632,16 @@ impl FnCx<'_, '_> {
                 self.call_rt("grasm_val_dec", &[rv]);
                 (n, VType::I64)
             }
+            // No `uextend` here: `icmp` already answers in `i8`, which is what
+            // a `bool` is, and widening to the width it already has is a
+            // verifier error rather than a no-op. Every `b.is_empty()` in the
+            // language failed to compile — reported as a "codegen bug", which
+            // is the backend's own word for "not a missing feature".
             (VType::Bytes, "is_empty") => {
                 let n = self.call_rt("grasm_bytes_len", &[rv]).unwrap();
                 self.call_rt("grasm_val_dec", &[rv]);
                 let zero = self.b.ins().iconst(types::I64, 0);
-                let eq = self.b.ins().icmp(IntCC::Equal, n, zero);
-                (self.b.ins().uextend(types::I8, eq), VType::Bool)
+                (self.b.ins().icmp(IntCC::Equal, n, zero), VType::Bool)
             }
             (VType::Bytes, "at") => {
                 let i = arg_scalar!(0, VType::I64);

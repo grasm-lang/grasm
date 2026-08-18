@@ -392,6 +392,40 @@ available. A test asserts that: `run`, `send`, `open`, `close`, `read`, `write`,
 `start`, `stop`, `wait`, `execute` and twenty more must never appear in the
 builtin list.
 
+## F26 — `bytes.is_empty()` could not be compiled at all (S1, backend) — **fixed**
+
+Found by `scripts/fuzz_methods.py`, written for this purpose: it crosses every
+builtin method with every *shape* of receiver — literal, `let`, `var`, loop
+variable, struct field, list element — because F17 only appeared on a loop
+variable and passed every test written against a literal.
+
+The grid found something simpler and worse. **Every** `b.is_empty()` in the
+language failed to compile, on every receiver shape:
+
+```rust
+let eq = self.b.ins().icmp(IntCC::Equal, n, zero);
+(self.b.ins().uextend(types::I8, eq), VType::Bool)
+```
+
+`icmp` already answers in `i8`, which is what a `bool` is, so the `uextend`
+widens a value to the width it already has — which Cranelift's verifier
+rejects. Every other `is_empty` in the backend calls a runtime function that
+returns `i8`; this one was written inline and got it wrong.
+
+**Fixed** by deleting the `uextend`, and the conformance program for
+[L-LIB-BYTES] now calls the method.
+
+### The gate was reporting it as an honest refusal
+
+Worse than the defect: the backend distinguishes "does not yet support X" —
+a named, documented gap — from "codegen bug", which is the compiler reporting a
+verifier failure against itself. The first version of this fuzzer counted both
+as declines, so it printed six of these and called them "not a defect".
+
+The fuzzer now treats "codegen bug" as a failure. That distinction was already
+in the backend's own error text and in the comment beside it; the gate simply
+was not reading it.
+
 ## F25 — three checks in `nativegaps.sh` had never run (S2, tests) — **fixed**
 
 Found while running the gap gate after F24. Three call sites spelled the helper
