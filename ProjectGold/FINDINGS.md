@@ -157,7 +157,7 @@ missing builtin rather than a missing capability.
 runtime reads rather than carrying a second copy of the formatting code, so there
 is one code path and the two streams cannot format differently.
 
-## F8 — `extern fn` cannot pass a pointer, so most of libc is unreachable (S3, FFI)
+## F8 — `extern fn` cannot pass a pointer, so most of libc is unreachable (S3, FFI) — **fixed**
 
 Found trying to write 17-simple-shell.
 
@@ -176,14 +176,36 @@ MASTERPLAN G9 promises "C ABI import overhead: zero-cost" and `docs/northstar.md
 records it as *partly met*. This is how partial: the overhead is indeed zero, and
 the set of functions you can call is arithmetic.
 
-**Still open, and no longer blocking anything on this list.** 17-simple-shell
-was the project that found it, and it is now written — not by widening the C
-boundary but by adding the operation it needed to the language, under a
-capability of its own ([L-LIB-PROC]). That is the right resolution for *that*
-project and it is not a fix for this finding: every C function taking a pointer
-is still unreachable, and the next program that wants one will find it again.
-The difference is that the gap is now about reaching C rather than about what
-Grasm can do.
+**Fixed** — [T-EXTERN-POINTER]. An `extern fn` parameter may now be `str` or
+`bytes`, and crosses as a pointer. `strlen`, `atoi`, `memcmp`, `open`, `write`,
+`getenv` and the rest of the pointer-taking half of libc are reachable.
+
+This finding predicted its own fix: "A byte type would fix the FFI and the
+binary-I/O gap (F9) at the same time." It did, and it took a year of this
+repository's time in between — F9 shipped `bytes` for the binary-I/O half and
+nothing then connected it to the boundary.
+
+Three decisions, and the asymmetry between them is the whole design:
+
+* A `str` crosses as a **NUL-terminated copy**, because Grasm strings carry
+  their length and C looks for a terminator. A string containing a NUL panics
+  rather than being silently cut short at it.
+* `bytes` crosses as a pointer with **no copy and no length**. The buffer is
+  already contiguous and appending a NUL would change its length, so how long
+  it is stays the program's to pass — `memcmp(a, b, a.len())`.
+* A pointer may **not come back**. Nothing about a returned pointer says who
+  owns it, how long it lives, or how long it is, and there is no answer to
+  invent. Passing one is expressible precisely because the buffer belongs to
+  Grasm and is alive for the call.
+
+The safety story needed nothing new. A declared C function's row was already
+`{io, unsafe}` and every use already sits inside `unsafe`, so widening what may
+cross did not widen what a package can hide.
+
+17-simple-shell, the project that found this, was unblocked earlier and by a
+different route — `run_program` under the `proc` capability ([L-LIB-PROC]) —
+because a shell wants to *start a program*, not to reach C. That was the right
+call for that project and it is not what closed this.
 
 It is also the reason several projects on this list cannot be written. A byte
 type would fix the FFI and the binary-I/O gap (F9) at the same time, since both

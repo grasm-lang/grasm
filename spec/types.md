@@ -782,6 +782,47 @@ including a function type, a map, and a fallible one — and when a function's
 declared return type resolves to `T ! E`, the function is fallible even though
 its declaration does not spell the `!` out.
 
+**[T-EXTERN-POINTER]** An `extern fn` **parameter** may be `i64`, `f64`, `str`
+or `bytes`. A `str` or `bytes` argument crosses as a pointer:
+
+```grasm
+extern fn strlen(s: str) -> i64
+extern fn memcmp(a: bytes, b: bytes, n: i64) -> i64
+```
+
+Without this the C boundary carried scalars only, which excluded `open`, `read`,
+`write`, `system`, `getenv`, `socket` — every libc function taking a pointer,
+which is nearly all of the useful ones. What could be called was `abs`, `sqrt`,
+`pow` and their kind, so "C ABI import overhead: zero-cost" was true and
+described arithmetic.
+
+A `str` crosses as a **NUL-terminated copy**. Grasm strings carry their length
+and are not terminated; C decides where a string ends by looking for the NUL,
+so handing over the raw bytes would have the callee read past the end of the
+buffer. A string containing a NUL byte panics rather than being silently cut
+short at it — the two engines say the same words, because the compiled build
+sees a pointer and not a declaration.
+
+`bytes` crosses as a pointer to the buffer itself, with no copy and no
+terminator: it is already contiguous, it is not text, and appending a NUL would
+change its length. **How long it is stays the program's to pass**, because C has
+no way to ask — `memcmp(a, b, a.len())`, not `memcmp(a, b)`.
+
+The pointer is valid **for the duration of the call** and the buffer belongs to
+Grasm. That is the whole reason this is expressible: nothing about ownership has
+to be decided at the boundary.
+
+**A pointer may not come back.** A returned `str` or `bytes` is refused, and the
+asymmetry is the point: nothing about a returned pointer says who owns it, how
+long it lives, or how long it is. An `extern fn` returns `i64`, `f64` or
+nothing.
+
+None of this makes the boundary safe, and none of it is meant to. C may write
+through a pointer it was handed, and Grasm cannot see that. This is why a
+declared C function's row is `{io, unsafe}` and every use sits inside `unsafe`
+([T-EXTERN-VALUE]) — the capability was already there, and widening what may
+cross did not widen what a package can hide.
+
 **[T-EXTERN-VALUE]** A C function may be named without being called, the way
 any function may. Naming one carries the same `io` a call does: holding a
 reference to it *is* the permission to call it, so a bare mention counts

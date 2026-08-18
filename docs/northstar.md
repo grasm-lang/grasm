@@ -27,7 +27,7 @@ the scorecard takes the best of five runs and subtracts the process floor.
 | G6 | Structured, uncolored concurrency | 1M+ tasks/node | `net_wait` gives concurrent I/O on one thread ([L-LIB-NET]); `spawn` is still single-core ([E-NOT-PARALLEL]) and `par_map` still refuses every effect | **partly met** |
 | G7 | Capability-sandboxed dependencies | 100% | the supply-chain benchmark's tamper is refused as `performs [io] permits []` | **met, for what exists** |
 | G8 | Production failure → deterministic replay | ≥ 99% | — | **not built** |
-| G9 | C ABI import overhead | zero-cost | `extern fn`, gated by `unsafe` and charged `io` | **partly met** |
+| G9 | C ABI import overhead | zero-cost | `extern fn` takes `i64`, `f64`, `str` and `bytes` ([T-EXTERN-POINTER]), gated by `unsafe` and charged `io`; a pointer may not be *returned* | **met** |
 | G10 | Adoption | ≥ 500 companies | zero — nobody outside this repository has run a Grasm program | **not started** |
 | G11 | Tokens vs Python | ≤ 1.00× | **1.04×** | **4% over** |
 | G11 | Tokens vs Go | ≤ 0.60× | **0.61×** | **2% over** |

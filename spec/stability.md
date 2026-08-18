@@ -252,6 +252,7 @@ May change or be removed in any release. New surface starts here.
 - `T-EFFECT-RESERVED` — experimental
 - `T-ERR-UNION-OPAQUE` — experimental
 - `T-EXTERN` — experimental
+- `T-EXTERN-POINTER` — experimental
 - `G-WILDCARD-BINDING` — experimental
 - `L-LEADING-DOT` — experimental
 - `L-LIB-BASE` — experimental

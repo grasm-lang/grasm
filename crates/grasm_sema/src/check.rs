@@ -1276,22 +1276,27 @@ capability visible to everyone who depends on you",
                 .map(|t| self.resolve_type(t, &[]))
                 .unwrap_or(Type::Unit);
             for (p, t) in e.params.iter().zip(&params) {
-                if !Self::is_c_abi_type(t) {
+                if !Self::is_c_param_type(t) {
                     let shown = self.show(t);
                     self.error_help(
                         p.ty.span(),
                         format!("`{shown}` has no C representation"),
-                        "an `extern fn` takes and returns `i64` or `f64`",
+                        "an `extern fn` parameter is `i64`, `f64`, `str` or `bytes`",
                     );
                 }
             }
             if ret != Type::Unit && !Self::is_c_abi_type(&ret) {
                 let shown = self.show(&ret);
-                self.error_help(
-                    e.span,
-                    format!("`{shown}` has no C representation"),
-                    "an `extern fn` takes and returns `i64` or `f64`",
-                );
+                // A returned pointer is a different question from a passed one
+                // and is deliberately still refused ([T-EXTERN-POINTER]).
+                let help = if matches!(ret, Type::Str | Type::Bytes) {
+                    "an `extern fn` may *take* `str` and `bytes` — the pointer is \
+valid for the call and the buffer belongs to Grasm. It may not *return* one: \
+nothing says who owns it, how long it lives, or how long it is"
+                } else {
+                    "an `extern fn` returns `i64`, `f64` or nothing"
+                };
+                self.error_help(e.span, format!("`{shown}` has no C representation"), help);
             }
             self.fns.insert(
                 key,
@@ -1314,6 +1319,17 @@ capability visible to everyone who depends on you",
     /// bug that shows up as garbage three calls later.
     fn is_c_abi_type(t: &Type) -> bool {
         matches!(t, Type::I64 | Type::F64)
+    }
+
+    /// What may cross *into* C.
+    ///
+    /// Wider than what may come back. A `str` or `bytes` argument is passed as
+    /// a pointer, and the buffer it points at is Grasm's: it is alive for the
+    /// duration of the call and nothing about ownership has to be decided. A
+    /// returned pointer is the opposite — nothing says who owns it, how long it
+    /// lives, or how long it is — so that stays refused ([T-EXTERN-POINTER]).
+    fn is_c_param_type(t: &Type) -> bool {
+        matches!(t, Type::I64 | Type::F64 | Type::Str | Type::Bytes)
     }
 
     fn collect_fns(&mut self, module: &Module) {

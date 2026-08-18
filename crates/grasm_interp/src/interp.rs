@@ -2414,10 +2414,45 @@ build links it, `grasm run` can only reach what is already loaded",
             )));
         };
         let mut cargs = Vec::with_capacity(args.len());
+        // Temporaries that the pointers below point *into*. They are dropped
+        // when this function returns, which is after the call — a `CString`
+        // built inline in the loop would be freed before the callee ever saw
+        // it, and the C function would read whatever took its place.
+        let mut owned: Vec<std::ffi::CString> = Vec::new();
+        let mut buffers: Vec<std::rc::Rc<Vec<u8>>> = Vec::new();
         for a in args {
             cargs.push(match a {
                 Value::Int(i) => CArg::I64(i),
                 Value::Float(f) => CArg::F64(f),
+                // A `str` crosses as a **NUL-terminated copy**. Grasm strings
+                // carry their length and are not terminated, and C decides
+                // where a string ends by looking for the NUL — handing over the
+                // raw bytes would read past the end of the buffer.
+                Value::Str(sv) => {
+                    // Worded without the function's name so the compiled build
+                    // can say the same thing: the runtime sees a pointer, not a
+                    // declaration, and two engines disagreeing about a panic
+                    // message is a disagreement.
+                    let Ok(c) = std::ffi::CString::new(sv.as_bytes()) else {
+                        return Err(Flow::Panic(
+                            "a `str` passed to C contains a NUL byte, which is what C \
+uses to mark the end of a string"
+                                .to_string(),
+                        ));
+                    };
+                    let p = c.as_ptr() as i64;
+                    owned.push(c);
+                    CArg::I64(p)
+                }
+                // `bytes` crosses as a pointer to the buffer itself: it is
+                // already contiguous, it is not text, and nothing is appended.
+                // The length is the program's to pass, because C has no way to
+                // ask for it.
+                Value::Bytes(b) => {
+                    let p = b.as_ptr() as i64;
+                    buffers.push(b);
+                    CArg::I64(p)
+                }
                 other => {
                     return Err(Flow::Panic(format!(
                         "`{}` cannot take `{other}` across the C boundary",

@@ -1,0 +1,42 @@
+//! tag: T-EXTERN-POINTER
+//! expect: output
+//! strlen: 5 0 11
+//! atoi: 42 -7 0
+//! memcmp equal: 0
+//! memcmp orders: true true
+//! the length is the program's to pass: 0 true
+//! a str is copied, so the original is untouched: hello 5
+// A `str` or `bytes` argument to an `extern fn` crosses as a pointer.
+//
+// The functions used here are the ones every C library has and whose answers
+// do not depend on the machine.
+extern fn strlen(s: str) -> i64
+extern fn atoi(s: str) -> i64
+extern fn memcmp(a: bytes, b: bytes, n: i64) -> i64
+
+fn main() / {io, unsafe} {
+    unsafe {
+        // A `str` crosses NUL-terminated, so C finds the end where Grasm says
+        // the string ends — including for the empty one.
+        print("strlen: {strlen("hello")} {strlen("")} {strlen("hello world")}")
+        print("atoi: {atoi("  42abc")} {atoi("-7")} {atoi("nope")}")
+
+        let a = bytes_of([1, 2, 3])
+        let b = bytes_of([1, 2, 3])
+        let c = bytes_of([1, 2, 4])
+        print("memcmp equal: {memcmp(a, b, 3)}")
+        print("memcmp orders: {memcmp(a, c, 3) < 0} {memcmp(c, a, 3) > 0}")
+
+        // `bytes` crosses without a terminator and without a length, so the
+        // length is an ordinary argument. Comparing zero bytes compares
+        // nothing, which is how a caller can tell C is being given the count
+        // rather than finding one.
+        print("the length is the program's to pass: {memcmp(a, c, 0)} {memcmp(a, c, 2) == 0}")
+
+        // The copy handed to C is a copy: the Grasm string is not modified,
+        // not terminated in place, and still its own length afterwards.
+        let s = "hello"
+        let n = strlen(s)
+        print("a str is copied, so the original is untouched: {s} {s.len()}")
+    }
+}

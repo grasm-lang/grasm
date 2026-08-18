@@ -4337,6 +4337,56 @@ pub unsafe extern "C" fn grasm_tcp_write(handle: *mut RtVal, data: *mut RtVal) -
     }
 }
 
+// --- the C boundary --------------------------------------------------------
+//
+// A `str` or `bytes` argument to an `extern fn` crosses as a pointer
+// ([T-EXTERN-POINTER]). The buffer belongs to Grasm and is alive for the
+// duration of the call, so nothing about ownership has to be decided at the
+// boundary — which is exactly why a *returned* pointer is still refused.
+
+/// A NUL-terminated copy of a string, for C.
+///
+/// Grasm strings carry their length and are not terminated; C decides where a
+/// string ends by looking for the NUL. Handing over the raw bytes would have
+/// the callee read past the end of the buffer, so this copies.
+///
+/// The caller frees it with `grasm_str_c_free` after the call.
+///
+/// # Safety: called from compiled Grasm with a boxed value.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_c_new(v: *mut RtVal) -> *mut std::ffi::c_char {
+    match std::ffi::CString::new(as_str(v).as_bytes()) {
+        Ok(c) => c.into_raw(),
+        Err(_) => rt_panic(
+            "a `str` passed to C contains a NUL byte, which is what C uses to mark the end of a string",
+        ),
+    }
+}
+
+/// # Safety: `p` came from `grasm_str_c_new` and is freed once.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_c_free(p: *mut std::ffi::c_char) {
+    if !p.is_null() {
+        drop(std::ffi::CString::from_raw(p));
+    }
+}
+
+/// A pointer to a `bytes` buffer.
+///
+/// No copy and no terminator: the buffer is already contiguous, it is not text,
+/// and appending a NUL would change its length. How long it is stays the
+/// program's to pass, because C has no way to ask.
+///
+/// # Safety: called from compiled Grasm with a boxed value that outlives the
+/// call the pointer is passed to.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_bytes_ptr(v: *mut RtVal) -> *mut u8 {
+    match &(*v).payload {
+        RtPayload::Bytes(b) => b.as_ptr() as *mut u8,
+        _ => rt_panic("bytes_ptr on a value that is not bytes"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Processes — the `proc` capability
 // ---------------------------------------------------------------------------

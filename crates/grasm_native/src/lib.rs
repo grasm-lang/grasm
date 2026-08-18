@@ -235,6 +235,9 @@ impl VType {
 #[derive(Clone)]
 struct FnSig {
     params: Vec<VType>,
+    /// A declared C function. Its arguments cross as C representations rather
+    /// than as boxed values, and it releases nothing, so the caller does.
+    is_extern: bool,
     /// `inout` params are passed as pointers to the caller's slot.
     modes: Vec<ParamMode>,
     ret: VType,
@@ -712,6 +715,10 @@ impl<'m> Codegen<'m> {
             ("grasm_net_wait", vec![i64t, i64t], Some(i64t)),
             ("grasm_net_port", vec![i64t], Some(i64t)),
             ("grasm_proc_run", vec![i64t, i64t], Some(i64t)),
+            // The C boundary ([T-EXTERN-POINTER]).
+            ("grasm_str_c_new", vec![i64t], Some(i64t)),
+            ("grasm_str_c_free", vec![i64t], None),
+            ("grasm_bytes_ptr", vec![i64t], Some(i64t)),
             ("grasm_udp_bind", vec![i64t], Some(i64t)),
             ("grasm_udp_recv", vec![i64t], Some(i64t)),
             ("grasm_udp_send", vec![i64t, i64t, i64t, i64t], Some(i64t)),
@@ -1180,6 +1187,7 @@ impl<'m> Codegen<'m> {
         self.fns.insert(
             key.clone(),
             FnSig {
+                is_extern: false,
                 params,
                 modes,
                 ret,
@@ -1246,6 +1254,7 @@ impl<'m> Codegen<'m> {
                         format!("{}::{}", self.current_module, e.name.name),
                         FnSig {
                             id,
+                            is_extern: true,
                             params: param_ts,
                             modes: e.params.iter().map(|p| p.mode).collect(),
                             ret: ret_t,
@@ -1315,6 +1324,7 @@ impl<'m> Codegen<'m> {
                     self.fns.insert(
                         key,
                         FnSig {
+                            is_extern: false,
                             params,
                             modes,
                             ret,
@@ -7751,11 +7761,12 @@ checker did",
         let Some(sig) = sig else {
             return nope(id.span, format!("the function `{}` here", id.name));
         };
-        let (fid, params, modes, ret) = (
+        let (fid, params, modes, ret, is_extern) = (
             sig.id,
             sig.params.clone(),
             sig.modes.clone(),
             sig.ret.clone(),
+            sig.is_extern,
         );
         let ptr_ty = self.cg.module.target_config().pointer_type();
         let mut vals = Vec::with_capacity(args.len());
@@ -7770,6 +7781,9 @@ checker did",
         // (arg index, stack slot, variable to refresh) for inout write-back.
         let mut inout_args: Vec<(usize, cranelift_codegen::ir::StackSlot, Variable, VType)> =
             Vec::new();
+        // (arg index, boxed value, its type, the C pointer) for a C call's
+        // pointer arguments, cleaned up after the call returns.
+        let mut c_args: Vec<(usize, Value, VType, Value)> = Vec::new();
         for (i, (a, want)) in args.iter().zip(&params).enumerate() {
             if modes.get(i).copied() == Some(ParamMode::Inout) {
                 let Expr::Ident(id) = a else {
@@ -7796,6 +7810,28 @@ checker did",
             if *want == VType::F64 && vt == VType::I64 {
                 v = self.b.ins().fcvt_from_sint(types::F64, v);
             }
+            // A `str` or `bytes` argument to a C function crosses as a pointer
+            // ([T-EXTERN-POINTER]). The boxed value stays held in the argument
+            // scope so it outlives the call, and — unlike a Grasm callee, which
+            // releases what it was handed — nothing on the other side releases
+            // anything, so the release happens here afterwards.
+            if is_extern && matches!(want, VType::Str | VType::Bytes) {
+                let hold = self.new_var(&vt);
+                self.b.def_var(hold, v);
+                self.bind(&format!(" cptr{i}"), hold, vt.clone());
+                let boxed = self.b.use_var(hold);
+                let p = match want {
+                    // A NUL-terminated copy: Grasm strings carry their length
+                    // and C looks for the terminator. Freed after the call.
+                    VType::Str => self.call_rt("grasm_str_c_new", &[boxed]).unwrap(),
+                    // No copy: the buffer is already contiguous and appending a
+                    // NUL would change its length.
+                    _ => self.call_rt("grasm_bytes_ptr", &[boxed]).unwrap(),
+                };
+                c_args.push((i, boxed, want.clone(), p));
+                vals.push(p);
+                continue;
+            }
             // Boxed args transfer ownership to the callee (it decs at exit),
             // but are held in scope until then so a diverging later argument
             // releases them.
@@ -7815,6 +7851,15 @@ checker did",
         for (_, slot, var, vt) in inout_args {
             let updated = self.b.ins().stack_load(vt.cl(), slot, 0);
             self.b.def_var(var, updated);
+        }
+        // The C call is over, so the temporary string copies are freed and the
+        // boxed values that backed the pointers are released. A Grasm callee
+        // would have done the second half itself; C does not know how.
+        for (_, boxed, vt, p) in c_args {
+            if vt == VType::Str {
+                self.call_rt("grasm_str_c_free", &[p]);
+            }
+            self.call_rt("grasm_val_dec", &[boxed]);
         }
         if ret == VType::Unit {
             Ok(None)
