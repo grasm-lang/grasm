@@ -232,6 +232,29 @@ The lesson is the same one the `i64_text` attempt taught: *the digits were never
 the cost, the allocation was* — and an optimisation that changes where a value
 is stored buys nothing until the code that produces the value stops allocating.
 
+**Short map keys, measured and kept.** With inline storage in place, the same
+trick applies to the key: `MapKey::of` called `to_string()` on every key on every
+`set`, including a key already in the table — four hundred thousand allocations
+for eight distinct one-byte keys. `MapKey::Str` now holds the inline
+representation, so a short key allocates nothing, and the probe buffer is only
+needed for long ones.
+
+Measured on one machine, minutes apart: the map half of wordfreq 44.6 → 41.5 ms,
+and wordfreq itself 73 → 70 ms. Small, and positive: comparing and hashing now
+go through a match instead of a `String` deref, and that costs less than the
+allocation it replaces.
+
+It is the same shape as the `Arc<str>` attempt that was reverted, and it works
+where that failed for a specific reason — `Arc::from(String)` allocated a
+*second* buffer, so the key got cheaper and creating a string got 32% dearer.
+Inline storage adds no allocation to either side.
+
+Correctness mattered more than the 4%. `MapKey` derives `Hash`, `Eq` and `Ord`,
+and [E-MAP-ORDER] rests on the derived `Ord` being lexicographic, so `StrData`
+implements all four **by content**. Deriving them would have made `Inline("a")`
+and `Heap("a")` different keys — the same text reached two ways landing in two
+slots, which is a wrong answer rather than a slow one.
+
 The map's hasher is *not* a candidate: map keys are user data, and Rust's default
 hasher is what stops a program that reads untrusted input from being hash-flooded.
 

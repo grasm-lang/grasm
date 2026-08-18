@@ -2,6 +2,8 @@
 //! expect: output
 //! [alpha, beta, zulu]
 //! {alpha: 1, beta: 2, zulu: 3}
+//! across the inline boundary: [, 0123456789abcde, 0123456789abcdef, a, b]
+//! the same text two ways is one key: 2 entries
 fn main() {
     var m = map()
     m.set("zulu", 3)
@@ -9,4 +11,23 @@ fn main() {
     m.set("beta", 2)
     print("{m.keys()}")
     print("{m}")
+
+    // Short keys are held inline and long ones on the heap, so ordering has to
+    // be by *content* and not by which of the two a key happens to be. Sorting
+    // by representation would put every long key after every short one, and
+    // this is the clause that would silently stop being true.
+    var wide = map()
+    for w in ["b", "a", "0123456789abcdef", "0123456789abcde", ""] {
+        wide.set(w, w.len())
+    }
+    print("across the inline boundary: {wide.keys()}")
+
+    // And equality by content: text built up piece by piece is the same key as
+    // the identical literal, whichever side of the boundary it lands on.
+    var same = map()
+    same.set("0123456789abcde", 1)
+    same.set("0123456789abcd" + "e", 2)
+    same.set("0123456789abcdef", 1)
+    same.set("0123456789abcde" + "f", 2)
+    print("the same text two ways is one key: {same.len()} entries")
 }

@@ -249,7 +249,11 @@ impl Iterator for ScalarIter<'_> {
 pub enum MapKey {
     Bool(bool),
     I64(i64),
-    Str(String),
+    /// Short keys are held inline, so `m.set("a", v)` allocates nothing at all.
+    /// `MapKey::of` used to call `to_string()` on every key on every `set`,
+    /// including one already in the table — four hundred thousand allocations
+    /// for eight distinct one-byte keys.
+    Str(StrData),
 }
 
 thread_local! {
@@ -283,13 +287,17 @@ unsafe fn with_key<R>(v: *mut RtVal, f: impl FnOnce(&MapKey) -> R) -> R {
     match &(*v).payload {
         RtPayload::Bool(b) => f(&MapKey::Bool(*b)),
         RtPayload::I64(n) => f(&MapKey::I64(*n)),
+        // Short text needs no buffer at all: the inline form *is* the key.
+        // Long text still borrows the scratch buffer, so a probe with a long
+        // key does not allocate either.
+        RtPayload::Str(s) if s.len() <= 15 => f(&MapKey::Str(StrData::of(s))),
         RtPayload::Str(s) => PROBE.with(|cell| {
             let mut buf = cell.borrow_mut();
             buf.clear();
             buf.push_str(s);
-            let key = MapKey::Str(std::mem::take(&mut buf));
+            let key = MapKey::Str(StrData::Heap(std::mem::take(&mut buf)));
             let out = f(&key);
-            let MapKey::Str(returned) = key else {
+            let MapKey::Str(StrData::Heap(returned)) = key else {
                 unreachable!()
             };
             *buf = returned;
@@ -308,7 +316,7 @@ impl MapKey {
         match &(*v).payload {
             RtPayload::Bool(b) => MapKey::Bool(*b),
             RtPayload::I64(n) => MapKey::I64(*n),
-            RtPayload::Str(s) => MapKey::Str(s.to_string()),
+            RtPayload::Str(s) => MapKey::Str(StrData::of(s)),
             _ => rt_panic(&format!("invalid map key `{}`", display(v))),
         }
     }
@@ -317,7 +325,7 @@ impl MapKey {
         match self {
             MapKey::Bool(b) => interned_bool(*b),
             MapKey::I64(n) => grasm_box_i64(*n),
-            MapKey::Str(s) => alloc(RtPayload::Str(RtStr::of(s))),
+            MapKey::Str(s) => alloc(RtPayload::Str(RtStr::of(s.as_str()))),
         }
     }
 }
@@ -489,8 +497,36 @@ pub struct RtStr {
 /// runtime stays 64. A larger inline buffer would make every integer and bool
 /// pay for it. Fifteen covers what short text actually is: a map key, a word,
 /// a number, a field name.
-#[derive(Debug)]
-enum StrData {
+/// Compared, ordered and hashed **by content**, so the inline and heap forms
+/// of the same text are the same key. Deriving these instead would make
+/// `Inline("a")` and `Heap("a")` different, which is a wrong answer in a map.
+impl PartialEq for StrData {
+    fn eq(&self, other: &StrData) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+impl Eq for StrData {}
+impl std::hash::Hash for StrData {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_str().hash(state);
+    }
+}
+impl PartialOrd for StrData {
+    fn partial_cmp(&self, other: &StrData) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for StrData {
+    fn cmp(&self, other: &StrData) -> std::cmp::Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+
+/// Public only because `RtPayload` is, and a map key holds one. Nothing
+/// outside this crate has any use for it: the interpreter has its own value
+/// representation and never links the runtime.
+#[derive(Debug, Clone)]
+pub enum StrData {
     Inline { bytes: [u8; 15], len: u8 },
     Heap(String),
 }
