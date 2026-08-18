@@ -392,6 +392,36 @@ available. A test asserts that: `run`, `send`, `open`, `close`, `read`, `write`,
 `start`, `stop`, `wait`, `execute` and twenty more must never appear in the
 builtin list.
 
+## F22 — `.value` was handled at the root of a place and not inside one (S2, backend) — **fixed**
+
+Found by probing the surface shipped this session rather than by any harness.
+Eight features had landed in a few hours, each with a conformance program
+written by the same hand that wrote the feature, which is exactly the shape of
+coverage that agrees with itself.
+
+```grasm
+var cells: [ref i64] = []
+cells.push(ref(0))
+cells[0].value = 100
+```
+
+`grasm run` accepted it. The native backend refused with "does not yet support
+a write to field `value` of this type". [T-REF-VALUE] had been implemented where
+a place *starts* at a reference, and a reference reached through a list or a
+struct field is met halfway down `write_place` instead — a second arm, which the
+first patch did not know about.
+
+A refusal rather than a miscompile, so it is S2 and not S1: the compiled build
+declines to build instead of building something that disagrees. But it is still
+two engines disagreeing about what is a legal program, and the conformance
+program did not catch it because it only wrote through a reference held in a
+local.
+
+**Fixed**, and the conformance program now writes through a list element and a
+struct field as well. The general lesson is the same one F17 taught: this
+backend handles a place at more than one site, and a rule added at one of them
+is not added to the language.
+
 ## F20 — `run_program` captures both streams, so there can be no pipeline (S4, library)
 
 Found writing 17-simple-shell after [L-LIB-PROC] unblocked it. `run_program` waits for
@@ -586,7 +616,7 @@ What is different is the size of the prize. The concrete programs that motivated
 this finding are written; what remains is a real capability and no longer a
 blocker.
 
-## F15 — a wasm trap poisons the instance, and the docs did not say so (S4, docs)
+## F15 — a wasm trap poisons the instance, and the docs did not say so (S4, docs) — **fixed**
 
 Found by clicking "Run all" on the browser showcase, not by any harness.
 

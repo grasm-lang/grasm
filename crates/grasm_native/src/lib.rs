@@ -10035,6 +10035,20 @@ checker did",
                     let inner = (**inner).clone();
                     let raw = self.call_rt("grasm_unbox_i64", &[child]).unwrap();
                     self.call_rt("grasm_val_dec", &[child]);
+                    // `xs[i].value = v` replaces the referent itself
+                    // ([T-REF-VALUE]), the same as `r.value = v` does at the
+                    // root. A reference reached through a list or a struct is
+                    // still a reference, and this is the same slab write — no
+                    // `make_unique`, because nothing inside the referent is
+                    // being edited.
+                    if rest.len() == 1
+                        && matches!(rest[0], PlaceSeg::Field("value"))
+                        && !matches!(inner, VType::Struct(_) | VType::Tuple(_))
+                    {
+                        self.call_rt("grasm_ref_set", &[raw, boxed_val]);
+                        self.wrote_through_ref = true;
+                        return Ok(root);
+                    }
                     let referent = self.call_rt("grasm_ref_make_unique", &[raw]).unwrap();
                     self.write_place(span, referent, rest, &inner, boxed_val)?;
                     self.wrote_through_ref = true;

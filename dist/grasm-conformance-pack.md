@@ -6502,6 +6502,8 @@ fn main() {
 //! true false
 //! 7.5
 //! shared through a copy: 99 99
+//! through a list: 100 6 2
+//! through a struct field, shared both ways: 9 9
 //! a struct referent still uses its own field names: 5
 //! released, and the reference knows: false
 // `r.value` reads and writes what a reference points at.
@@ -6509,6 +6511,7 @@ fn main() {
 // Without it `ref(0)` typechecked and nothing in the language could observe
 // the result — a value that could be constructed and never used.
 type Point = { x: i64 }
+type Held = { cell: ref i64 }
 
 fn bump(r: ref i64) {
     r.value += 1
@@ -6556,6 +6559,23 @@ fn main() / {io} {
     bump(counter)
     bump(counter)
 
+    // A reference reached through a container is still a reference, and
+    // `.value` still writes the slab. The native backend refused this at
+    // first while `grasm run` accepted it — a whole-referent write was
+    // handled at the root of a place and not in the middle of one.
+    var cells: [ref i64] = []
+    for i in 0..3 {
+        cells.push(ref(i))
+    }
+    cells[0].value = 100
+    cells[1].value += 5
+    print("through a list: {cells[0].value} {cells[1].value} {cells[2].value}")
+
+    let shared = ref(1)
+    let holder = Held{ cell: shared }
+    holder.cell.value = 9
+    print("through a struct field, shared both ways: {holder.cell.value} {shared.value}")
+
     // A struct referent keeps its own field names; `.value` is not offered
     // there, because it would shadow a real field or start meaning something
     // different the day one was added.
@@ -6570,6 +6590,10 @@ fn main() / {io} {
     release(a)
     release(counter)
     release(p)
+    for c in cells {
+        release(c)
+    }
+    release(shared)
     print("released, and the reference knows: {alive(n)}")
 }
 ```
