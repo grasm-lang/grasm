@@ -461,20 +461,45 @@ pub struct RtStr {
     /// several workers, and two of them asking a string its length at the
     /// same moment is an ordinary thing to write. A `Cell` would have been a
     /// data race that happened to print the right answer.
-    chars: std::sync::atomic::AtomicU32,
-    /// Byte offset of each character, built the first time one is asked for
-    /// by index and only when the text is not ASCII. ASCII needs no index,
-    /// because there the offset *is* the index.
-    offsets: std::sync::OnceLock<Vec<u32>>,
+    /// The character index, built only for text that needs one.
+    ///
+    /// Boxed, and behind one `OnceLock` rather than two fields, because this
+    /// is where `RtStr`'s size came from: a `OnceLock<Vec<u32>>` is 32 bytes
+    /// and an `AtomicU32` another 8 with padding, so 36 of `RtStr`'s 64 were
+    /// an index most strings never build. `RtStr` is the largest `RtPayload`
+    /// variant, so those bytes were charged to *every* boxed value in the
+    /// runtime — every integer, every bool.
+    ///
+    /// ASCII text needs no index at all: there the byte offset is the index
+    /// and the character count is the byte count, which `char_len` answers
+    /// without touching this.
+    index: std::sync::OnceLock<Box<CharIndex>>,
+}
+
+/// Character offsets for text that is not ASCII.
+#[derive(Debug)]
+struct CharIndex {
+    count: u32,
+    offsets: Vec<u32>,
 }
 
 impl RtStr {
     pub fn new(s: String) -> RtStr {
         RtStr {
             s,
-            chars: std::sync::atomic::AtomicU32::new(u32::MAX),
-            offsets: std::sync::OnceLock::new(),
+            index: std::sync::OnceLock::new(),
         }
+    }
+
+    /// The character index, built on first use. Only reached for non-ASCII.
+    fn index(&self) -> &CharIndex {
+        self.index.get_or_init(|| {
+            let offsets: Vec<u32> = self.s.char_indices().map(|(o, _)| o as u32).collect();
+            Box::new(CharIndex {
+                count: offsets.len() as u32,
+                offsets,
+            })
+        })
     }
 
     /// The byte offset of character `i`, in constant time after the first
@@ -483,9 +508,7 @@ impl RtStr {
         if self.is_flat() {
             return (i <= self.s.len()).then_some(i);
         }
-        let offs = self
-            .offsets
-            .get_or_init(|| self.s.char_indices().map(|(o, _)| o as u32).collect());
+        let offs = &self.index().offsets;
         match i.cmp(&offs.len()) {
             std::cmp::Ordering::Less => Some(offs[i] as usize),
             std::cmp::Ordering::Equal => Some(self.s.len()),
@@ -498,31 +521,25 @@ impl RtStr {
         if self.is_flat() {
             return self.s.as_bytes().get(i).map(|b| *b as char);
         }
-        let offs = self
-            .offsets
-            .get_or_init(|| self.s.char_indices().map(|(o, _)| o as u32).collect());
+        let offs = &self.index().offsets;
         let start = *offs.get(i)? as usize;
         self.s[start..].chars().next()
     }
 
     pub fn char_len(&self) -> usize {
-        use std::sync::atomic::Ordering::Relaxed;
-        let c = self.chars.load(Relaxed);
-        if c != u32::MAX {
-            return c as usize;
+        // ASCII is the overwhelmingly common case and needs nothing built:
+        // one byte per character, so the count *is* the length. `is_ascii` is
+        // a vectorised scan in `std`, far cheaper than counting characters and
+        // cheaper than the cache lookup it replaces.
+        if self.s.is_ascii() {
+            return self.s.len();
         }
-        let n = self.s.chars().count();
-        // Two threads may both compute it; they compute the same number, so
-        // whichever stores last stores the same bytes.
-        if n < u32::MAX as usize {
-            self.chars.store(n as u32, Relaxed);
-        }
-        n
+        self.index().count as usize
     }
 
     /// Every character one byte, so an index is an index.
     pub fn is_flat(&self) -> bool {
-        self.char_len() == self.s.len()
+        self.s.is_ascii()
     }
 }
 
@@ -916,7 +933,14 @@ pub unsafe extern "C" fn grasm_str_concat(a: *mut RtVal, b: *mut RtVal) -> *mut 
     let (RtPayload::Str(sa), RtPayload::Str(sb)) = (&(*a).payload, &(*b).payload) else {
         grasm_panic_msg_str("concat on non-strings");
     };
-    alloc(RtPayload::Str(RtStr::new(format!("{sa}{sb}"))))
+    // `format!` for two strings runs the whole formatting machinery — build
+    // `Arguments`, dispatch through `Display`, grow the buffer as it goes — to
+    // do what two `push_str` calls into a correctly sized buffer do directly.
+    // Concatenation is on the hot path of every program that builds text.
+    let mut out = String::with_capacity(sa.len() + sb.len());
+    out.push_str(sa);
+    out.push_str(sb);
+    alloc(RtPayload::Str(RtStr::new(out)))
 }
 
 #[no_mangle]
@@ -4365,3 +4389,4 @@ pub unsafe extern "C" fn grasm_list_min_max(v: *mut RtVal, want_max: i8) -> *mut
         }
     }
 }
+
