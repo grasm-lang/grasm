@@ -62,13 +62,17 @@ right answer — a crash and an engine disagreement from one missing table row.
 The catch-all is gone; every method is named, and an unlisted one now falls
 through to the slower owning path instead of miscompiling.
 
-**Two smaller gaps, worked around in the program.** A `.concat(...)` chain
-cannot be split across lines, because a statement ends at the newline and a
-leading `.` starts a new one — so building a packet needs a `join([...])` helper
-or one very long line. And there is no way to format an integer in hex: a
-`bytes` prints as hex and an `i64` prints as decimal, with no radix option, so
-printing a packet ID the way every other DNS tool prints it needs a
-hand-written `hex_digit`. Both are recorded as findings.
+**A grammar gap, since fixed.** A `.concat(...)` chain could not be split across
+lines — a statement ends at the newline, so a leading `.` began a new one — and
+building a packet is nine concatenations. The first version of this file used a
+`join([...])` helper to work around it. [L-LEADING-DOT] now absorbs a newline
+before a leading `.`, and the packet builders here are written as ordinary
+chains, which is what found the gap and then proved the fix.
+
+**No way to format an integer in hex.** A `bytes` prints as hex and an `i64`
+prints as decimal, with no radix option, so printing a packet ID the way every
+other DNS tool prints it needs a hand-written `hex_digit`. Recorded as a
+finding.
 
 ## What it did not need
 

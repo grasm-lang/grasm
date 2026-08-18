@@ -2697,6 +2697,58 @@ fn main() {
 }
 ```
 
+## `L-LEADING-DOT.gr`
+
+```grasm
+//! tag: L-LEADING-DOT
+//! expect: output
+//! hello; world
+//! 5
+//! 3 3
+//! 5 chained across five lines
+//! 10
+// A newline before a leading `.` does not end the statement, so a chain reads
+// down the left margin instead of along one unreadable line.
+//
+// Safe for exactly one reason: no statement may begin with a `.`, so a newline
+// in front of one was never separating two statements.
+fn main() / {io} {
+    let cleaned = "  Hello, World  "
+        .trim()
+        .to_lower()
+        .replace(",", ";")
+    print(cleaned)
+
+    // Bytes, which is where this was first missed: a packet is built out of
+    // one `concat` per field.
+    let packet = bytes_of([1, 2])
+        .concat(bytes_of([3]))
+        .concat(bytes_of([4, 5]))
+    print("{packet.len()}")
+
+    // Blank lines and comments between the links are fine — consecutive
+    // newlines collapse into one, and one is absorbed.
+    let parts = "x,y,z"
+        .split(",")
+
+        // still the same statement
+        .len()
+    print("{parts} {"a b c".words().len()}")
+
+    // A chain that spans more lines than it has calls.
+    let long = "  MIXED  "
+        .trim()
+        .to_lower()
+        .repeat(1)
+        .len()
+    print("{long} chained across five lines")
+
+    // The rule is about the newline, not about chaining: a chain on one line
+    // means the same thing.
+    print("{"aaaaa".repeat(2).len()}")
+}
+```
+
 ## `L-LIB-AS-I64.gr`
 
 ```grasm

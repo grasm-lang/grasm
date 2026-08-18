@@ -23,7 +23,7 @@ which was a defect in it at some point and carries a comment saying so.
 
 `counts.txt` holds the reference lexer's token count (`grasm tokens`) for every
 program in this directory, and the program compares its own count against it.
-**25 of 25 match exactly.** `run.sh` regenerates that table before every gate
+**All match exactly.** `run.sh` regenerates that table before every gate
 run, because a stale table turns "the self-hosted lexer disagrees" into
 "somebody edited a program", and those are not the same finding.
 

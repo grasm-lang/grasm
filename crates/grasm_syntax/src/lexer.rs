@@ -50,10 +50,33 @@ impl<'a> Lexer<'a> {
             let tok = self.next_token();
             self.after_dot = tok.kind == TokenKind::Dot;
             let is_eof = tok.kind == TokenKind::Eof;
-            // Collapse consecutive newlines into one.
-            if tok.kind == TokenKind::Newline
+            // A newline before a leading `.` is not a statement boundary.
+            //
+            // Statements end at the newline, which is why Grasm needs no
+            // semicolons. That rule alone makes a method chain unwritable
+            // across lines: the second line begins with a `.` and parses as a
+            // new statement, so building a DNS packet out of nine `concat`
+            // calls means one very long line or a helper function.
+            //
+            // Absorbing the newline is unambiguous, and that is the whole
+            // argument for it: **no statement in the language may begin with a
+            // `.` or a `?.`**, so a newline in front of one cannot have been
+            // separating two statements. `..` and `..=` are their own tokens
+            // and are untouched, so a range still cannot straddle a line.
+            //
+            // This is the same rule Go reaches by requiring the `.` to end the
+            // line rather than begin the next; putting it on the leading token
+            // instead means the chain reads down the left margin, which is
+            // where every other language that solved this ended up.
+            if matches!(tok.kind, TokenKind::Dot | TokenKind::QuestionDot)
                 && matches!(out.last().map(|t: &Token| &t.kind), Some(TokenKind::Newline))
             {
+                out.pop();
+                out.push(tok);
+            } else if tok.kind == TokenKind::Newline
+                && matches!(out.last().map(|t: &Token| &t.kind), Some(TokenKind::Newline))
+            {
+                // Collapse consecutive newlines into one.
                 if let Some(last) = out.last_mut() {
                     last.span = last.span.merge(tok.span);
                 }

@@ -21,10 +21,10 @@
 22-multithreaded-scraper/main.gr 1417
 23-turing-machine/main.gr 1857
 24-micro-vm/main.gr 2257
-25-dns-resolver/main.gr 2270
+25-dns-resolver/main.gr 2256
 26-garbage-collector/main.gr 1575
-27-sha256/main.gr 1757
+27-sha256/main.gr 1754
 28-sql-engine/main.gr 3743
-29-self-hosting-lexer/main.gr 2977
+29-self-hosting-lexer/main.gr 3025
 30-async-chat/main.gr 1232
 31-grasm-emits-c/main.gr 1933

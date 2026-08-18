@@ -21,6 +21,6 @@ stray character: ident(a) ERROR(unexpected character `$`) ident(b)
 --- against the reference implementation ---
   files whose token count differs from the reference: 0
 --- lexing itself ---
-  own source: 16239 characters, 2977 tokens, 19 doc line(s)
-  ident 810, int 91, keyword 241, newline 360, op 1289, str 186
+  own source: 16707 characters, 3025 tokens, 19 doc line(s)
+  ident 825, int 92, keyword 248, newline 363, op 1309, str 188
   lexical errors in its own source: 0

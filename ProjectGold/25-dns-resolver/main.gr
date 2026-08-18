@@ -31,20 +31,6 @@ let PORT_DNS = 53
 // of nine is the classic way a hand-rolled packet parses as something else
 // entirely.
 
-/// Every piece joined in order.
-///
-/// A chain of `.concat(...)` calls cannot be split across lines — a statement
-/// ends at the newline, so a leading `.` starts a new one and does not parse.
-/// Writing a packet as one very long line would be worse than this, and this
-/// also names what is being built.
-fn join(parts: [bytes]) -> bytes {
-    var out = bytes_of([])
-    for p in parts {
-        out = out.concat(p)
-    }
-    out
-}
-
 fn u16_bytes(n: i64) -> bytes {
     bytes_of([n.ushr(8).bit_and(255), n.bit_and(255)])
 }
@@ -67,7 +53,9 @@ fn encode_name(name: str) -> bytes {
     var out = bytes_of([])
     for label in name.split(".") {
         if label.len() > 0 {
-                out = join([out, bytes_of([label.byte_len()]), label.to_bytes()])
+                out = out
+                .concat(bytes_of([label.byte_len()]))
+                .concat(label.to_bytes())
         }
     }
     out.concat(bytes_of([0]))
@@ -80,17 +68,15 @@ fn encode_name(name: str) -> bytes {
 /// OPCODE=0 (standard), RD=1 (please recurse).
 fn build_query(id: i64, name: str) -> bytes {
     let flags = 0.shl(15).bit_or(0.shl(11)).bit_or(1.shl(8))
-    join([
-        u16_bytes(id),
-        u16_bytes(flags),
-        u16_bytes(1),                  // QDCOUNT — one question
-        u16_bytes(0),                  // ANCOUNT
-        u16_bytes(0),                  // NSCOUNT
-        u16_bytes(0),                  // ARCOUNT
-        encode_name(name),
-        u16_bytes(TYPE_A),
-        u16_bytes(CLASS_IN),
-    ])
+    u16_bytes(id)
+        .concat(u16_bytes(flags))
+        .concat(u16_bytes(1))          // QDCOUNT — one question
+        .concat(u16_bytes(0))          // ANCOUNT
+        .concat(u16_bytes(0))          // NSCOUNT
+        .concat(u16_bytes(0))          // ARCOUNT
+        .concat(encode_name(name))
+        .concat(u16_bytes(TYPE_A))
+        .concat(u16_bytes(CLASS_IN))
 }
 
 /// A response carrying one A record, as a real server would send it.
@@ -101,25 +87,23 @@ fn build_query(id: i64, name: str) -> bytes {
 /// answer it ever saw.
 fn build_response(id: i64, name: str, ttl: i64, ip: [i64]) -> bytes {
     let flags = 1.shl(15).bit_or(1.shl(8)).bit_or(1.shl(7))   // QR=1, RD=1, RA=1
-    let question = join([encode_name(name), u16_bytes(TYPE_A), u16_bytes(CLASS_IN)])
-    let answer = join([
-        u16_bytes(0xC00C),
-        u16_bytes(TYPE_A),
-        u16_bytes(CLASS_IN),
-        u32_bytes(ttl),
-        u16_bytes(4),
-        bytes_of(ip),
-    ])
-    join([
-        u16_bytes(id),
-        u16_bytes(flags),
-        u16_bytes(1),
-        u16_bytes(1),
-        u16_bytes(0),
-        u16_bytes(0),
-        question,
-        answer,
-    ])
+    let question = encode_name(name)
+        .concat(u16_bytes(TYPE_A))
+        .concat(u16_bytes(CLASS_IN))
+    let answer = u16_bytes(0xC00C)
+        .concat(u16_bytes(TYPE_A))
+        .concat(u16_bytes(CLASS_IN))
+        .concat(u32_bytes(ttl))
+        .concat(u16_bytes(4))
+        .concat(bytes_of(ip))
+    u16_bytes(id)
+        .concat(u16_bytes(flags))
+        .concat(u16_bytes(1))
+        .concat(u16_bytes(1))
+        .concat(u16_bytes(0))
+        .concat(u16_bytes(0))
+        .concat(question)
+        .concat(answer)
 }
 
 // --- reading ---------------------------------------------------------------
@@ -347,29 +331,27 @@ fn demo() / {io, net} {
 fn two_answers() -> bytes {
     let name = "dual.example"
     let flags = 1.shl(15).bit_or(1.shl(8)).bit_or(1.shl(7))
-    let question = join([encode_name(name), u16_bytes(TYPE_A), u16_bytes(CLASS_IN)])
+    let question = encode_name(name)
+        .concat(u16_bytes(TYPE_A))
+        .concat(u16_bytes(CLASS_IN))
     var answers = bytes_of([])
     for last in [1, 2] {
-        answers = join([
-            answers,
-            u16_bytes(0xC00C),
-            u16_bytes(TYPE_A),
-            u16_bytes(CLASS_IN),
-            u32_bytes(60 * last),
-            u16_bytes(4),
-            bytes_of([10, 0, 0, last]),
-        ])
+        answers = answers
+            .concat(u16_bytes(0xC00C))
+            .concat(u16_bytes(TYPE_A))
+            .concat(u16_bytes(CLASS_IN))
+            .concat(u32_bytes(60 * last))
+            .concat(u16_bytes(4))
+            .concat(bytes_of([10, 0, 0, last]))
     }
-    join([
-        u16_bytes(0x7f7f),
-        u16_bytes(flags),
-        u16_bytes(1),
-        u16_bytes(2),
-        u16_bytes(0),
-        u16_bytes(0),
-        question,
-        answers,
-    ])
+    u16_bytes(0x7f7f)
+        .concat(u16_bytes(flags))
+        .concat(u16_bytes(1))
+        .concat(u16_bytes(2))
+        .concat(u16_bytes(0))
+        .concat(u16_bytes(0))
+        .concat(question)
+        .concat(answers)
 }
 
 fn report(resp: bytes) / {io} {

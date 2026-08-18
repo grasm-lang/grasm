@@ -32,6 +32,29 @@ statement. Consecutive newlines are equivalent to one. Inside `(` … `)` and
 `[` … `]` newlines are insignificant; inside `{` … `}` they are significant
 again.
 
+**[L-LEADING-DOT]** A newline immediately before a `.` or a `?.` is **not** a
+statement terminator, so a method chain may be written down the left margin:
+
+```grasm
+let cleaned = raw
+    .trim()
+    .to_lower()
+    .replace(",", ";")
+```
+
+This is safe for one reason, and only that reason: **no statement in the
+language may begin with a `.` or a `?.`**, so a newline in front of one cannot
+have been separating two statements. `..` and `..=` are distinct tokens, so a
+range still cannot straddle a line, and a leading `+` is still an error — the
+existing rule is that a line *ending* in an operator continues, and that rule is
+unchanged.
+
+Every language that terminates statements at the newline has had to answer this,
+because a chain of five calls on one line is unreadable and a chain that cannot
+be broken is unwritable. Go requires the `.` to end the line instead. Putting
+the allowance on the *leading* token is the same rule seen from the other side,
+and it is the side where the chain lines up under itself.
+
 **[L-WHITESPACE]** Spaces (U+0020) and tabs (U+0009) separate tokens and are
 otherwise ignored.
 

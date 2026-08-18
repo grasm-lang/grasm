@@ -261,7 +261,7 @@ The general operations were renamed from `tcp_close`/`tcp_port` to
 `net_close`/`net_port` at the same time. They were never TCP-specific, and a
 `tcp_close` that closes a UDP socket is a name that lies.
 
-## F16 — a method chain cannot be split across lines (S4, grammar)
+## F16 — a method chain cannot be split across lines (S4, grammar) — **fixed**
 
 Found writing 25-dns-resolver. A statement ends at the newline, so
 
@@ -277,10 +277,36 @@ line or a `join([...])` helper.
 Not a defect — newline termination is a deliberate choice and it is why Grasm
 needs no semicolons. But every language with newline termination and method
 chaining has had to answer this (Python's parentheses, Swift's and Kotlin's
-continuation rules, Go's rule that the `.` must end the line), and Grasm has
-not. The narrowest fix is to let a newline be absorbed when the next
-non-whitespace character is a `.`, which is unambiguous because no statement
-may begin with one.
+continuation rules, Go's rule that the `.` must end the line), and Grasm had
+not.
+
+**Fixed** — [L-LEADING-DOT]. A newline immediately before a `.` or a `?.` is
+absorbed. This is safe for one reason and only that reason: no statement in the
+language may begin with a `.`, so a newline in front of one cannot have been
+separating two statements. `..` and `..=` are distinct tokens, so a range still
+cannot straddle a line, and a leading `+` is still an error — the existing rule
+that a line *ending* in an operator continues is unchanged.
+
+Project 25's packet builders were rewritten as ordinary chains, which is the
+only honest test of the fix: the program that found the gap now reads the way it
+wanted to, and its output is byte-identical.
+
+## F19 — an integer cannot be formatted in any base but ten (S4, library)
+
+Found writing 25-dns-resolver. A `bytes` prints as hex and an `i64` prints as
+decimal, and there is no way to ask for a different radix. Every DNS tool prints
+a packet ID as `0x1234`; doing that in Grasm means
+
+```grasm
+fn hex_digit(n: i64) -> str {
+    "0123456789abcdef".substr(n.bit_and(15), 1)
+}
+```
+
+Small, and it appears in every program that touches a protocol, a hash, a colour
+or a permission mask — the same programs that needed [L-LIB-BITS], which is the
+tell. The natural shape is `n.to_base(16)` and `n.to_base(2)` with a matching
+`s.parse_int_base(16)`, since `parse_int` already refuses `0xFF` ([L-LIB-PARSE]).
 
 ## F17 — a native-backend catch-all silently miscompiled a new method (S1, backend) — **fixed**
 

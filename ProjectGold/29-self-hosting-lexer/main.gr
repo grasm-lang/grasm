@@ -296,7 +296,14 @@ fn run_lexer(inout lx: Lexer) {
             let last_nl = if lx.toks.len() == 0 { false } else {
                 match lx.toks[lx.toks.len() - 1] { TNewline -> true  _ -> false }
             }
-            if not (is_nl and last_nl) {
+            // And a newline before a leading `.` or `?.` is absorbed, so a
+            // method chain may be written down the left margin ([L-LEADING-DOT]).
+            // No statement may begin with a dot, so the newline cannot have
+            // been separating two statements.
+            let leads_chain = match tok { TOp(s) -> s == "." or s == "?."  _ -> false }
+            if leads_chain and last_nl {
+                lx.toks[lx.toks.len() - 1] = tok
+            } else if not (is_nl and last_nl) {
                 lx.toks.push(tok)
             }
             lx.after_dot = match tok { TOp(s) -> s == "."  _ -> false }
