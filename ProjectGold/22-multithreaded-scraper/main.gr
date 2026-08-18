@@ -1,18 +1,29 @@
-// A concurrent fetcher — `tcp_connect`, `par_map`, and shared-state safety.
+// A concurrent fetcher — many requests in flight on one thread.
 //
-// This project was blocked until [L-LIB-NET] grew a client half. It is the
-// reason `tcp_connect` was added.
+// This project was blocked until [L-LIB-NET] grew a client half, and it is the
+// reason `tcp_connect` was added. It then found the largest gap in this
+// directory: `par_map` is the only multicore path in the language and it
+// refuses any closure that performs an effect, while `spawn` is deliberately
+// single-core ([E-NOT-PARALLEL]). Between them, a program could compute on many
+// cores or perform I/O, and not both (FINDINGS.md **F14**).
 //
-// The list calls for "thread-safe memory sharing, mutexes, or lock mechanisms".
-// Grasm has no mutex and does not need one here, and that is the interesting
-// part: `par_map` **refuses at compile time** to capture a `ref`, so the data
-// race the exercise is about cannot be written. The refusal is demonstrated in
-// a comment at the bottom, with the compiler's own words.
+// That is still true of *compute*. It is no longer true of I/O. `net_wait`
+// ([L-LIB-NET]) answers with the handles that can be read without blocking, so
+// one thread can hold every request open at once — which is what "concurrent
+// fetching" means in practice, and what every real client does underneath.
+// Threads were never the point; not blocking on the first response was.
 //
-// The default run is offline and deterministic: it parses and merges responses
-// that are supplied as text, which is the part that can be compared across
-// three engines. `-- fetch` does the real thing against a server, and the
-// harness that starts one is in README.md.
+// The default run proves it without needing anything outside the program. It
+// starts a server, dials six clients at it, and drives *both halves from a
+// single wait loop* — so the responses are genuinely interleaved and the whole
+// exchange is deterministic enough to compare across three engines. `-- fetch`
+// does the same thing against project 21's server.
+//
+// The list also calls for "thread-safe memory sharing, mutexes, or lock
+// mechanisms". Grasm has no mutex and does not need one here, and that is the
+// interesting part: `par_map` refuses at compile time to capture a `ref`, so
+// the data race the exercise is about cannot be written. The refusal is
+// demonstrated at the bottom, in the compiler's own words.
 
 type Page = {
     url: str,
@@ -150,6 +161,137 @@ fn fetch_one(port: i64, path: str) -> Page / {io, net} {
     }
 }
 
+/// Every request in flight at once, on one thread.
+///
+/// The three phases are the whole idea. *Connect* and *write* every request
+/// before reading any of them, so the last request is on the wire before the
+/// first response is waited for. Then read whatever is ready, in whatever order
+/// it arrives — which is what `net_wait` reports, and what a sequential loop
+/// cannot use because it is already blocked on the first socket.
+///
+/// The answer is in **request order**, not arrival order. Concurrency is a
+/// property of the fetching; a caller that got its results shuffled would have
+/// to sort them back, and every caller would.
+fn fetch_all(port: i64, paths: [str]) -> [Page] / {io, net} {
+    var handles: [i64] = []
+    var results: [str] = []
+    var errors: [str] = []
+
+    // Phase 1 and 2: connect and send. A handle of -1 marks a path that never
+    // got off the ground, so the result list stays aligned with the input.
+    for path in paths {
+        results.push("")
+        match tcp_connect("127.0.0.1", port) {
+            Err(e) -> {
+                handles.push(0 - 1)
+                errors.push("connect: {e}")
+            }
+            Ok(conn) -> {
+                match tcp_write(conn, request_for(path)) {
+                    Err(e) -> {
+                        net_close(conn)
+                        handles.push(0 - 1)
+                        errors.push("write: {e}")
+                    }
+                    Ok(_) -> {
+                        handles.push(conn)
+                        errors.push("")
+                    }
+                }
+            }
+        }
+    }
+
+    // Phase 3: read as they become ready.
+    var outstanding = 0
+    for h in handles {
+        if h >= 0 { outstanding = outstanding + 1 }
+    }
+    var turns = 0
+    while outstanding > 0 and turns < 200 {
+        var waiting: [i64] = []
+        for i in 0..handles.len() {
+            if handles[i] >= 0 and results[i] == "" {
+                waiting.push(handles[i])
+            }
+        }
+        if waiting.len() == 0 {
+            outstanding = 0
+        } else {
+            let ready = net_wait(waiting, 2000) ?? []
+            if ready.len() == 0 {
+                // Nothing arrived in two seconds. Something is wrong with the
+                // server, not with this loop, and waiting forever would hide it.
+                outstanding = 0
+            } else {
+                for h in ready {
+                    var i = 0
+                    while i < handles.len() {
+                        if handles[i] == h and results[i] == "" {
+                            let chunk = tcp_read(h) ?? ""
+                            if chunk == "" {
+                                results[i] = "(closed with nothing)"
+                            } else {
+                                results[i] = chunk
+                            }
+                            outstanding = outstanding - 1
+                        }
+                        i = i + 1
+                    }
+                }
+            }
+        }
+        turns = turns + 1
+    }
+
+    var pages: [Page] = []
+    for i in 0..paths.len() {
+        if handles[i] >= 0 {
+            net_close(handles[i])
+        }
+        if errors[i] != "" {
+            pages.push(failed(paths[i], errors[i]))
+        } else {
+            pages.push(parse_response(paths[i], results[i]))
+        }
+    }
+    pages
+}
+
+/// A server that answers a handful of paths, multiplexed with everything else.
+///
+/// It exists so the demonstration needs nothing outside this program. It is not
+/// an HTTP server — project 21 is that — it is the smallest thing that answers
+/// well-formed responses to the paths the fetcher asks for.
+fn response_for(path: str) -> str {
+    let body = if path == "/" {
+        "<html><head><title>Home</title></head><body><a href=\"/one\">one</a><a href=\"/two\">two</a></body></html>"
+    } else if path == "/hello" {
+        "<html><head><title>Hello</title></head><body>hi</body></html>"
+    } else if path == "/echo" {
+        "<html><head><title>Echo</title></head><body><a href=\"/back\">back</a></body></html>"
+    } else {
+        ""
+    }
+    if body == "" {
+        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
+    } else {
+        "HTTP/1.1 200 OK\r\nContent-Length: {body.byte_len()}\r\n\r\n{body}"
+    }
+}
+
+fn path_of(request: str) -> str {
+    let lines = request.lines()
+    if lines.len() == 0 {
+        return "/"
+    }
+    let parts = lines[0].split(" ")
+    if parts.len() < 2 {
+        return "/"
+    }
+    parts[1]
+}
+
 fn show(p: Page) {
     if p.error != "" {
         print("  {p.url}: error: {p.error}")
@@ -158,26 +300,118 @@ fn show(p: Page) {
     }
 }
 
+/// Server and clients in one wait loop.
+///
+/// This is the part that could not be written before `net_wait`. Both halves
+/// are in the same wait set, so a request arriving and a response arriving are
+/// the same kind of event, and neither side ever blocks on the other. A
+/// blocking accept here would deadlock the program against itself on the first
+/// dial — the same reason project 30's chat demo works.
+fn concurrent_demo(paths: [str]) / {io, net} {
+    let listener = match tcp_listen(0) {
+        Ok(l) -> l
+        Err(e) -> {
+            print("  cannot listen: {e}")
+            return
+        }
+    }
+    let port = net_port(listener) ?? 0
+
+    // Every request goes out before any response is waited for. That is what
+    // makes this concurrent: the sixth request is on the wire while the first
+    // is still being answered.
+    var conns: [i64] = []
+    for path in paths {
+        match tcp_connect("127.0.0.1", port) {
+            Err(e) -> print("  dial failed: {e}")
+            Ok(c) -> {
+                match tcp_write(c, request_for(path)) {
+                    Ok(_) -> conns.push(c)
+                    Err(e) -> print("  send failed: {e}")
+                }
+            }
+        }
+    }
+    print("  {conns.len()} requests in flight before any reply was read")
+
+    // The server half: accept, answer, close. Interleaved with the client half
+    // below by the single `net_wait` that drives both.
+    var served: [i64] = []
+    var answered = 0
+    var replies: [str] = []
+    for c in conns {
+        replies.push("")
+    }
+    var turns = 0
+    while answered < conns.len() and turns < 400 {
+        var waiting: [i64] = [listener]
+        for h in served {
+            waiting.push(h)
+        }
+        for i in 0..conns.len() {
+            if replies[i] == "" {
+                waiting.push(conns[i])
+            }
+        }
+        let ready = net_wait(waiting, 2000) ?? []
+        if ready.len() == 0 {
+            answered = conns.len()
+        }
+        for h in ready {
+            if h == listener {
+                match tcp_accept(listener) {
+                    Err(e) -> {}
+                    Ok(conn) -> served.push(conn)
+                }
+            } else {
+                var is_server_side = false
+                for sh in served {
+                    if sh == h { is_server_side = true }
+                }
+                if is_server_side {
+                    let request = tcp_read(h) ?? ""
+                    if request != "" {
+                        match tcp_write(h, response_for(path_of(request))) {
+                            Ok(_) -> {}
+                            Err(e) -> {}
+                        }
+                    }
+                } else {
+                    var i = 0
+                    while i < conns.len() {
+                        if conns[i] == h and replies[i] == "" {
+                            let chunk = tcp_read(h) ?? ""
+                            replies[i] = if chunk == "" { "(nothing)" } else { chunk }
+                            answered = answered + 1
+                        }
+                        i = i + 1
+                    }
+                }
+            }
+        }
+        turns = turns + 1
+    }
+
+    for i in 0..conns.len() {
+        show(parse_response(paths[i], replies[i]))
+    }
+    for h in served {
+        net_close(h)
+    }
+    for h in conns {
+        net_close(h)
+    }
+    net_close(listener)
+}
+
 fn main() / {io, net} {
     if args().contains("fetch") {
-        print("--- fetching (sequentially — see F14) ---")
+        // The real thing, against project 21's server. Every request is in
+        // flight at once; the server answers them one at a time because it is
+        // single-threaded, which is its business and not the client's.
+        print("--- fetching concurrently ---")
         let paths = ["/", "/hello", "/hello?name=one", "/echo", "/nope", "/"]
-        // Sequential, and not by choice. `par_map` is the only multicore path
-        // in the language and it refuses any closure that performs an effect:
-        //
-        //     error: this parallel operation needs an effect-free function, but
-        //            the one given performs `net`
-        //
-        // The reasoning is sound — effects on several cores would interleave
-        // differently between runs, and `par_map` promises a deterministic
-        // answer. But `spawn` is deliberately single-core ([E-NOT-PARALLEL]),
-        // so between them there is no way to do concurrent I/O at all, and the
-        // "multithreaded" in this project's title is currently unwritable.
-        // FINDINGS.md, F14 — the largest gap this directory found.
-        var pages: [Page] = []
-        for p in paths {
-            pages.push(fetch_one(8971, p))
-        }
+        let pages = fetch_all(8971, paths)
         for p in pages {
             show(p)
         }
@@ -188,6 +422,9 @@ fn main() / {io, net} {
         print("  {ok} of {pages.len()} returned 200")
         return
     }
+
+    print("--- six requests, one thread, no blocking ---")
+    concurrent_demo(["/", "/hello", "/echo", "/nope", "/hello", "/"])
 
     // Canned responses, so the parsing half is deterministic and comparable
     // across all three engines.

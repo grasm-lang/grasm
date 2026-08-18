@@ -24,7 +24,7 @@ the scorecard takes the best of five runs and subtracts the process floor.
 | G3 | Incremental edit-to-diagnostic | ≤ 50 ms | — | **not built** — there is no query engine |
 | G4 | Safe-subset guarantees | 100% | 204 programs identical across three engines, 204 leak-free, row and FFI soundness fuzzers clean | **strongest area** |
 | G5 | Hello-world static binary | ≤ 300 KB | 328 KB | **missed by 9%** |
-| G6 | Structured, uncolored concurrency | 1M+ tasks/node | `spawn` is deliberately single-core ([E-NOT-PARALLEL]); `par_map` is the only multicore path | **retreated** |
+| G6 | Structured, uncolored concurrency | 1M+ tasks/node | `net_wait` gives concurrent I/O on one thread ([L-LIB-NET]); `spawn` is still single-core ([E-NOT-PARALLEL]) and `par_map` still refuses every effect | **partly met** |
 | G7 | Capability-sandboxed dependencies | 100% | the supply-chain benchmark's tamper is refused as `performs [io] permits []` | **met, for what exists** |
 | G8 | Production failure → deterministic replay | ≥ 99% | — | **not built** |
 | G9 | C ABI import overhead | zero-cost | `extern fn`, gated by `unsafe` and charged `io` | **partly met** |

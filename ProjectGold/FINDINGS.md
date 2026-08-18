@@ -473,7 +473,7 @@ blocking read; it simply cannot block, because the bytes are already there. The
 `async` row still exists in the vocabulary with nothing performing it, and F14
 below — that `spawn` cannot perform I/O at all — is untouched.
 
-## F14 — there is no way to do concurrent I/O (S3, language) — the biggest one
+## F14 — there is no way to do concurrent I/O (S3, language) — **half fixed**
 
 Found writing 22-multithreaded-scraper, after `tcp_connect` unblocked it.
 
@@ -505,13 +505,38 @@ north-star goal that claims the most. MASTERPLAN G6 asks for "structured,
 uncolored concurrency, 1M+ tasks/node"; `docs/northstar.md` already records it
 as **retreated**. This is what that retreat costs in practice.
 
-It is also the one gap whose fix is *interesting* rather than mechanical, and
-the language already contains the shape of it. `async` is in the effect
-vocabulary and nothing performs it. An I/O operation that performs `async`, a
-handler that decides what that means, and `par_map`'s refusal narrowed from "any
-effect" to "any effect that is not `async`" is a design that fits the existing
-type system — and is close to how WebAssembly's stack-switching proposal is
-specified, which is the same bet `docs/wasm.md` argues for.
+### The I/O half, fixed — and it did not need threads
+
+The finding conflated two things that turned out to be separable: doing many I/O
+operations at once, and doing computation on many cores. Only the second needs
+threads.
+
+`net_wait` ([L-LIB-NET]) closed the first. One thread holds every request open
+at once: connect and send them all, then read whichever is ready. Project 22
+does that now, and its demonstration runs a server *and* six clients from a
+single wait loop, which a blocking accept would deadlock — so the transcript is
+the evidence. Project 30 was unblocked the same way. Neither needed a thread,
+and looking for one was the wrong instinct: the thing a sequential fetcher gets
+wrong is not that it uses one core, it is that it blocks on the first response.
+
+### The compute half, still open
+
+`par_map` still refuses an effectful closure, and it is still right to: results
+would interleave differently between runs and it promises a deterministic
+answer. A program that wants to fetch on many cores *and* parse on many cores
+still cannot, and MASTERPLAN G6's "structured, uncolored concurrency" is still
+what `docs/northstar.md` records it as — *retreated*.
+
+The shape of that fix is unchanged and the language already contains it. `async`
+is in the effect vocabulary and nothing performs it. An I/O operation that
+performs `async`, a handler that decides what that means, and `par_map`'s
+refusal narrowed from "any effect" to "any effect that is not `async`" fits the
+existing type system, and is close to how WebAssembly's stack-switching proposal
+is specified — the same bet `docs/wasm.md` argues for.
+
+What is different is the size of the prize. The concrete programs that motivated
+this finding are written; what remains is a real capability and no longer a
+blocker.
 
 ## F15 — a wasm trap poisons the instance, and the docs did not say so (S4, docs)
 

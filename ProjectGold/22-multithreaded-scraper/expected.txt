@@ -1,3 +1,11 @@
+--- six requests, one thread, no blocking ---
+  6 requests in flight before any reply was read
+  /: 200, 102 byte(s), title "Home", 2 link(s)
+  /hello: 200, 61 byte(s), title "Hello", 0 link(s)
+  /echo: 200, 82 byte(s), title "Echo", 1 link(s)
+  /nope: 404, 0 byte(s), title "", 0 link(s)
+  /hello: 200, 61 byte(s), title "Hello", 0 link(s)
+  /: 200, 102 byte(s), title "Home", 2 link(s)
 --- parsing responses ---
   /first: 200, 69 byte(s), title "First", 2 link(s)
   /nolinks: 200, 55 byte(s), title "No links", 0 link(s)

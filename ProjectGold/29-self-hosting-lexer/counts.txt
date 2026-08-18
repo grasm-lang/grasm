@@ -19,7 +19,7 @@
 19-event-emitter/main.gr 867
 20-expression-repl/main.gr 1592
 21-http-server/main.gr 2124
-22-multithreaded-scraper/main.gr 1417
+22-multithreaded-scraper/main.gr 2663
 23-turing-machine/main.gr 1857
 24-micro-vm/main.gr 2257
 25-dns-resolver/main.gr 2227
