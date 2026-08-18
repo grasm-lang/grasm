@@ -1,0 +1,248 @@
+// A chat server that serves every client at once, on one thread.
+//
+// Project 21 is a server that holds one conversation at a time: it blocks in
+// `tcp_accept`, blocks again in `tcp_read`, and the second visitor waits for
+// the first to hang up. That is the correct shape for a request/response
+// server and it is useless for a chat room, where every client is idle almost
+// all of the time and may speak at any moment.
+//
+// The missing piece was never threads — a Grasm `spawn` cannot touch the
+// network, because `spawn` does not carry the `net` capability. It was
+// *readiness*: `net_wait(handles, ms)` answers with the handles that can be
+// read without blocking ([L-LIB-NET]). With it, one thread multiplexes any
+// number of connections, which is what every real server does underneath.
+//
+// Run with no arguments and the program is its own proof: it opens a listener,
+// dials three clients to itself, and runs server and clients in a single
+// thread through one wait loop. Nothing blocks, and the transcript is fixed,
+// so all three engines print the same thing.
+//
+//     grasm run main.gr             the self-contained demonstration
+//     grasm run main.gr -- serve    a real chat server on port 8994
+//
+// The room is deliberately small — join, say, leave, broadcast. What is being
+// shown is the concurrency, not the protocol.
+
+let PORT = 8994
+
+// --- the room ------------------------------------------------------------
+//
+// A room is the connections currently in it and the name each one chose. Both
+// are plain lists indexed together: a connection's handle is an `i64`, so a
+// map would buy nothing over a scan of a list this size.
+
+type Room = {
+    conns: [i64],
+    names: [str],
+}
+
+fn empty_room() -> Room {
+    Room{ conns: [], names: [] }
+}
+
+fn joined(r: Room, h: i64, who: str) -> Room {
+    Room{ conns: r.conns + [h], names: r.names + [who] }
+}
+
+fn name_of(r: Room, h: i64) -> str {
+    var i = 0
+    while i < r.conns.len() {
+        if r.conns[i] == h {
+            return r.names[i]
+        }
+        i = i + 1
+    }
+    "?"
+}
+
+fn left(r: Room, h: i64) -> Room {
+    var conns = []
+    var names = []
+    var i = 0
+    while i < r.conns.len() {
+        if r.conns[i] != h {
+            conns = conns + [r.conns[i]]
+            names = names + [r.names[i]]
+        }
+        i = i + 1
+    }
+    Room{ conns: conns, names: names }
+}
+
+/// Sends to everyone except the speaker. A write that fails is ignored on
+/// purpose: a client that vanished mid-broadcast must not end the room, and
+/// the wait loop will notice the hangup on its next turn.
+fn broadcast(r: Room, from: i64, line: str) / {net} {
+    for h in r.conns {
+        if h != from {
+            match tcp_write(h, line) {
+                Ok(_) -> {}
+                Err(e) -> {}
+            }
+        }
+    }
+}
+
+// --- the demonstration ---------------------------------------------------
+
+/// One turn of the server: wait for anything to happen, then handle it.
+///
+/// The listener is in the same wait set as the connections, so a new arrival
+/// and a message from an existing client are the same kind of event. That is
+/// the whole trick, and it is why the loop never blocks on one client while
+/// another is waiting.
+fn server_turn(r: Room, listener: i64, timeout: i64) -> Room / {io, net} {
+    var room = r
+    let ready = net_wait([listener] + room.conns, timeout) ?? []
+    for h in ready {
+        if h == listener {
+            match tcp_accept(listener) {
+                Err(e) -> {}
+                Ok(conn) -> {
+                    room = joined(room, conn, "guest{conn}")
+                    print("  server: accepted {name_of(room, conn)}")
+                }
+            }
+        } else {
+            let msg = tcp_read(h) ?? ""
+            if msg == "" {
+                // Zero bytes from a ready handle means the peer hung up. The
+                // handle stays ready forever until it is dropped, so a loop
+                // that ignored this would spin.
+                print("  server: {name_of(room, h)} left")
+                tcp_close(h)
+                room = left(room, h)
+            } else {
+                let who = name_of(room, h)
+                print("  server: {who} said {msg}")
+                broadcast(room, h, "{who}: {msg}")
+            }
+        }
+    }
+    room
+}
+
+/// Everything a client has been sent and has not read yet, in order.
+fn drain(label: str, h: i64) / {io, net} {
+    var going = true
+    while going {
+        let ready = net_wait([h], 50) ?? []
+        if ready.len() == 0 {
+            going = false
+        } else {
+            let msg = tcp_read(h) ?? ""
+            if msg == "" {
+                going = false
+            } else {
+                print("  {label} heard {msg}")
+            }
+        }
+    }
+}
+
+fn demo() / {io, net} {
+    print("--- one thread, three clients ---")
+
+    // Port 0 asks the system to choose, so the demonstration runs on a machine
+    // where something else already holds whatever port it would have picked.
+    let listener = match tcp_listen(0) {
+        Ok(l) -> l
+        Err(e) -> {
+            print("cannot listen: {e}")
+            return
+        }
+    }
+    let port = tcp_port(listener) ?? 0
+
+    // Three clients, dialled from the same thread that is about to serve them.
+    // This is only possible because nothing here blocks: a blocking accept
+    // would deadlock the program against itself on the very first dial.
+    var clients = []
+    var labels = []
+    for i in 0..3 {
+        match tcp_connect("127.0.0.1", port) {
+            Err(e) -> print("cannot dial: {e}")
+            Ok(c) -> {
+                clients = clients + [c]
+                labels = labels + ["client{i}"]
+            }
+        }
+    }
+    print("dialled {clients.len()} clients")
+
+    // Accept all three. Each turn takes whatever is ready, so this is one pass
+    // in practice rather than three.
+    var room = empty_room()
+    var turns = 0
+    while room.conns.len() < clients.len() and turns < 10 {
+        room = server_turn(room, listener, 200)
+        turns = turns + 1
+    }
+    print("room holds {room.conns.len()}")
+
+    // Each client speaks in turn and the other two hear it. The order is fixed
+    // because each message is pumped through before the next one is sent —
+    // what is being demonstrated is that the server never blocked, not that
+    // the network is ordered across senders.
+    let said = ["hello", "hi there", "good morning"]
+    var s = 0
+    while s < clients.len() {
+        match tcp_write(clients[s], said[s]) {
+            Ok(_) -> {}
+            Err(e) -> print("send failed: {e}")
+        }
+        room = server_turn(room, listener, 500)
+        var d = 0
+        while d < clients.len() {
+            if d != s {
+                drain(labels[d], clients[d])
+            }
+            d = d + 1
+        }
+        s = s + 1
+    }
+
+    // One client leaves. The server learns about it through the same wait
+    // loop, with no separate disconnect channel.
+    print("--- {labels[0]} leaves ---")
+    tcp_close(clients[0])
+    room = server_turn(room, listener, 500)
+    print("room holds {room.conns.len()}")
+
+    var k = 1
+    while k < clients.len() {
+        tcp_close(clients[k])
+        k = k + 1
+    }
+    room = server_turn(room, listener, 500)
+    print("room holds {room.conns.len()}")
+    tcp_close(listener)
+}
+
+// --- the real server -----------------------------------------------------
+
+fn serve() / {io, net} {
+    match tcp_listen(PORT) {
+        Err(e) -> print("cannot listen on {PORT}: {e}")
+        Ok(listener) -> {
+            print("chat on 127.0.0.1:{PORT}  (nc 127.0.0.1 {PORT}, ctrl-c to stop)")
+            var room = empty_room()
+            var going = true
+            while going {
+                // A negative timeout waits indefinitely, so an idle server
+                // uses no CPU at all — which is the other half of what
+                // readiness buys over polling in a loop.
+                room = server_turn(room, listener, -1)
+            }
+            tcp_close(listener)
+        }
+    }
+}
+
+fn main() / {io, net} {
+    if args().contains("serve") {
+        serve()
+        return
+    }
+    demo()
+}

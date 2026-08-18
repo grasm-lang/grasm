@@ -615,6 +615,121 @@ impl<'a, W: Write> Interp<'a, W> {
         self.ok_wrapped = spans;
     }
 
+    /// Which of these handles can be read from without waiting.
+    ///
+    /// This is the primitive that lets one thread serve many connections.
+    /// Without it every accept and every read blocks, so a server holds one
+    /// conversation at a time, and holding two would need a thread per
+    /// connection — which Grasm cannot spawn, because `spawn` does not carry
+    /// `net` ([L-LIB-NET]).
+    ///
+    /// `poll(2)` is declared here rather than taken from a crate, and declared
+    /// again in the runtime, because neither engine depends on the other and
+    /// the alternative is a dependency in every binary the language produces.
+    fn net_wait(&mut self, handles: &Value, timeout: &Value) -> Value {
+        #[cfg(unix)]
+        mod sys_poll {
+            #[cfg(target_os = "linux")]
+            pub type NfdsT = u64;
+            #[cfg(not(target_os = "linux"))]
+            pub type NfdsT = u32;
+
+            pub const POLLIN: i16 = 0x0001;
+            pub const POLLHUP: i16 = 0x0010;
+            pub const POLLNVAL: i16 = 0x0020;
+
+            #[repr(C)]
+            pub struct PollFd {
+                pub fd: i32,
+                pub events: i16,
+                pub revents: i16,
+            }
+
+            extern "C" {
+                pub fn poll(fds: *mut PollFd, nfds: NfdsT, timeout: i32) -> i32;
+            }
+        }
+
+        let fail = |m: String| Value::Err(Rc::new(io_error("IoFailed", m)));
+
+        let Value::Int(timeout_ms) = timeout else {
+            return fail("timeout must be an integer".to_string());
+        };
+        // Anything past `i32` is "wait forever" spelled at length, and `-1` is
+        // how a caller asks for that directly.
+        let timeout_ms = if *timeout_ms < 0 {
+            -1
+        } else {
+            (*timeout_ms).min(i64::from(i32::MAX)) as i32
+        };
+
+        let Value::List(items) = handles else {
+            return fail("net_wait takes a list of handles".to_string());
+        };
+        let mut wanted = Vec::with_capacity(items.len());
+        for it in items.iter() {
+            match it {
+                Value::Int(n) => wanted.push(*n),
+                _ => return fail("net_wait takes a list of handles".to_string()),
+            }
+        }
+        if wanted.is_empty() {
+            return Value::Ok(Rc::new(Value::List(Rc::new(Vec::new()))));
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            use sys_poll::*;
+
+            let mut set = Vec::with_capacity(wanted.len());
+            for &h in &wanted {
+                let fd = match self.sockets.get(h as usize).and_then(Option::as_ref) {
+                    Some(NetSocket::Listener(l)) => l.as_raw_fd(),
+                    Some(NetSocket::Stream(st)) => st.as_raw_fd(),
+                    None => return fail(format!("socket {h} is not open")),
+                };
+                set.push(PollFd {
+                    fd,
+                    events: POLLIN,
+                    revents: 0,
+                });
+            }
+
+            loop {
+                let n = unsafe { poll(set.as_mut_ptr(), set.len() as NfdsT, timeout_ms) };
+                if n < 0 {
+                    let e = std::io::Error::last_os_error();
+                    // A signal arriving is not a failure — it is a delivery
+                    // that landed mid-wait, and the caller asked to wait.
+                    if e.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return fail(e.to_string());
+                }
+                // The answer keeps the order it was asked in, so a program that
+                // walks the result serves its connections in a fixed order
+                // rather than whichever one the kernel happened to list first.
+                //
+                // A hung-up peer counts as ready: the read that follows returns
+                // nothing, which is how a caller learns the connection ended.
+                // Reporting it as not-ready would leave it in the wait set
+                // forever.
+                let ready: Vec<Value> = wanted
+                    .iter()
+                    .zip(set.iter())
+                    .filter(|(_, p)| p.revents & (POLLIN | POLLHUP | POLLNVAL) != 0)
+                    .map(|(&h, _)| Value::Int(h))
+                    .collect();
+                return Value::Ok(Rc::new(Value::List(Rc::new(ready))));
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            fail("net_wait needs poll(2), which this platform does not provide".to_string())
+        }
+    }
+
     /// One of the five `net` builtins, against this engine's socket table.
     ///
     /// Handles are indices, so what crosses into Grasm is an `i64` and a
@@ -710,6 +825,17 @@ impl<'a, W: Write> Interp<'a, W> {
                     Err(e) => fail(e.to_string()),
                 }
             }
+            // `tcp_listen(0)` asks the system to choose a free port; without a
+            // way to read the choice back, a program could bind a port it was
+            // unable to name, dial, or print.
+            ("tcp_port", NetSocket::Listener(l)) => match l.local_addr() {
+                Ok(a) => Value::Ok(Rc::new(Value::Int(i64::from(a.port())))),
+                Err(e) => fail(e.to_string()),
+            },
+            ("tcp_port", NetSocket::Stream(st)) => match st.local_addr() {
+                Ok(a) => Value::Ok(Rc::new(Value::Int(i64::from(a.port())))),
+                Err(e) => fail(e.to_string()),
+            },
             ("tcp_accept", NetSocket::Stream(_)) => {
                 fail(format!("socket {h} is a connection, not a listener"))
             }
@@ -2288,8 +2414,13 @@ build links it, `grasm run` can only reach what is already loaded",
                     // ([L-LIB-NET]). The reference engine owns the sockets;
                     // a compiled build calls the runtime, and both keep the
                     // same table shape so a handle means the same thing.
+                    "net_wait" => {
+                        let handles = self.eval_expr(&args[0])?;
+                        let timeout = self.eval_expr(&args[1])?;
+                        return Ok(self.net_wait(&handles, &timeout));
+                    }
                     "tcp_listen" | "tcp_connect" | "tcp_accept" | "tcp_read"
-                    | "tcp_write" | "tcp_close" => {
+                    | "tcp_write" | "tcp_close" | "tcp_port" => {
                         let h = self.eval_expr(&args[0])?;
                         let extra = if id.name == "tcp_write" || id.name == "tcp_connect" {
                             Some(self.eval_expr(&args[1])?.to_string())

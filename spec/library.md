@@ -427,7 +427,7 @@ count in [`core.md`](core.md) does not move.
 
 ## Network — the `net` capability
 
-**[L-LIB-NET]** Five builtins reach the network, and each performs `net`:
+**[L-LIB-NET]** Eight builtins reach the network, and each performs `net`:
 
 | | type | |
 |---|---|---|
@@ -437,6 +437,8 @@ count in [`core.md`](core.md) does not move.
 | `tcp_read(h)` | `(i64) -> str ! IoError` | what has arrived, as text |
 | `tcp_write(h, text)` | `(i64, str) -> () ! IoError` | writes and flushes |
 | `tcp_close(h)` | `(i64) -> ()` | closes a listener or a connection |
+| `net_wait(hs, ms)` | `([i64], i64) -> [i64] ! IoError` | the handles that can be read without waiting |
+| `tcp_port(h)` | `(i64) -> i64 ! IoError` | the local port a handle is bound to |
 
 `tcp_connect` is the half that makes a program a *client*. Without it a Grasm
 program could listen and accept and never dial — no fetching a URL, no calling
@@ -456,6 +458,36 @@ an HTTP client holds the connection open after its request and reading to the
 end would wait forever. A caller that needs more reads again. Bytes that are not
 valid UTF-8 are replaced rather than refused: a socket carries bytes, a `str`
 carries text, and a client's mistake should not end a server.
+
+`tcp_port` is what makes `tcp_listen(0)` usable. Asking the system to choose a
+free port is the only way to write a program that runs on a machine where
+something else already holds the port it wanted — and with no way to read the
+choice back, a program could bind a port it was then unable to name, dial, or
+print.
+
+`net_wait` is what lets one thread hold many conversations. Every other call
+here blocks: without it a server serves one client at a time, and serving two
+would need a thread per connection — which a Grasm program cannot spawn, because
+`spawn` does not carry `net`. So the language had a network a program could not
+usefully *serve* on, and the missing piece was readiness, not threads.
+
+It answers with the subset of `hs` that will not block, **in the order they were
+asked in** rather than whichever order the kernel reports, so a program that
+walks the result serves its connections in a fixed order ([L-DETERMINISM]). A
+timeout of `0` asks without waiting, a negative timeout waits indefinitely, and
+an empty wait set is answered immediately with an empty list rather than an
+error — a server that has just closed its last connection asks exactly that on
+its next turn. A handle that names nothing is an `IoFailed`, the same as using a
+connection after closing it.
+
+A hung-up peer is reported as **ready**. The read that follows returns nothing,
+which is how a caller learns the conversation ended; reporting it as not-ready
+would leave a dead connection in the wait set forever, and the loop would never
+notice it should be dropped.
+
+Readiness needed no new type: the wait set is an ordinary `[i64]` and the
+timeout an ordinary `i64`, which is the same reason the rest of this surface
+looks the way it does.
 
 Closing a handle twice is not an error, for the same reason releasing a `ref`
 twice is not ([T-REF-GENERATIONAL]) — cleanup order is not something a caller

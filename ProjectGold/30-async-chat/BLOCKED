@@ -1,1 +1,0 @@
-no non-blocking I/O — tcp_accept and tcp_read both block (F13)

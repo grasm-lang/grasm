@@ -706,6 +706,8 @@ impl<'m> Codegen<'m> {
             ("grasm_tcp_read", vec![i64t], Some(i64t)),
             ("grasm_tcp_write", vec![i64t, i64t], Some(i64t)),
             ("grasm_tcp_close", vec![i64t], None),
+            ("grasm_net_wait", vec![i64t, i64t], Some(i64t)),
+            ("grasm_tcp_port", vec![i64t], Some(i64t)),
             ("grasm_write_file", vec![i64t, i64t], Some(i64t)),
             ("grasm_file_exists", vec![i64t], Some(i8t)),
             ("grasm_remove_file", vec![i64t], Some(i64t)),
@@ -7444,12 +7446,13 @@ checker did",
             // The five `net` builtins. A handle is an `i64` and a payload is a
             // `str`, so nothing here needs a pointer type — which is why the
             // network could be added to the language without adding one.
-            "tcp_listen" | "tcp_accept" | "tcp_read" => {
+            "tcp_listen" | "tcp_accept" | "tcp_read" | "tcp_port" => {
                 let (hv, ht) = self.eval_expr_val(&args[0])?;
                 let boxed = self.box_value(hv, &ht);
                 let (sym, ok_t) = match id.name.as_str() {
                     "tcp_listen" => ("grasm_tcp_listen", VType::I64),
                     "tcp_accept" => ("grasm_tcp_accept", VType::I64),
+                    "tcp_port" => ("grasm_tcp_port", VType::I64),
                     _ => ("grasm_tcp_read", VType::Str),
                 };
                 let v = self.call_rt(sym, &[boxed]).unwrap();
@@ -7475,6 +7478,26 @@ checker did",
                     v,
                     VType::Fallible(
                         Box::new(VType::I64),
+                        Box::new(VType::Sum("IoError".into())),
+                    ),
+                )));
+            }
+            // Readiness. The handles arrive as an ordinary `[i64]`, which the
+            // backend represents as an *unboxed scalar* list, and the runtime
+            // hands one back in the same shape — so the answer can be indexed
+            // and iterated like any other list a program built itself.
+            "net_wait" => {
+                let (hsv, hst) = self.eval_expr_val(&args[0])?;
+                let boxed_h = self.box_value(hsv, &hst);
+                let (tv, tt) = self.eval_expr_val(&args[1])?;
+                let boxed_t = self.box_value(tv, &tt);
+                let v = self.call_rt("grasm_net_wait", &[boxed_h, boxed_t]).unwrap();
+                self.call_rt("grasm_val_dec", &[boxed_h]);
+                self.call_rt("grasm_val_dec", &[boxed_t]);
+                return Ok(Some((
+                    v,
+                    VType::Fallible(
+                        Box::new(VType::List(Box::new(VType::I64))),
                         Box::new(VType::Sum("IoError".into())),
                     ),
                 )));
@@ -8704,12 +8727,16 @@ checker did",
                             "file_exists" => Some(VType::Bool),
                             "args" => Some(VType::List(Box::new(VType::Str))),
                             "env" => Some(VType::Option(Box::new(VType::Str))),
-                            "tcp_listen" | "tcp_connect" | "tcp_accept" => Some(VType::Fallible(
+                            "tcp_listen" | "tcp_connect" | "tcp_accept" | "tcp_port" => Some(VType::Fallible(
                                 Box::new(VType::I64),
                                 Box::new(VType::Sum("IoError".into())),
                             )),
                             "tcp_read" => Some(VType::Fallible(
                                 Box::new(VType::Str),
+                                Box::new(VType::Sum("IoError".into())),
+                            )),
+                            "net_wait" => Some(VType::Fallible(
+                                Box::new(VType::List(Box::new(VType::I64))),
                                 Box::new(VType::Sum("IoError".into())),
                             )),
                             "tcp_write" => Some(VType::Fallible(

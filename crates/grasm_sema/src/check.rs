@@ -237,6 +237,8 @@ const BUILTIN_FREE_FNS: &[&str] = &[
     "tcp_read",
     "tcp_write",
     "tcp_close",
+    "net_wait",
+    "tcp_port",
     "read_file",
     "write_file",
     "file_exists",
@@ -4327,10 +4329,11 @@ only a number or a `bool` can come out — compute what you need and yield that"
                     // `str`, so reaching the network needed no pointer type —
                     // which would have been a far larger change to the language
                     // than the network itself ([L-LIB-NET]).
-                    "tcp_listen" | "tcp_accept" | "tcp_read" => {
+                    "tcp_listen" | "tcp_accept" | "tcp_read" | "tcp_port" => {
                         let (want, gives) = match id.name.as_str() {
                             "tcp_listen" => (Type::I64, Type::I64),
                             "tcp_accept" => (Type::I64, Type::I64),
+                            "tcp_port" => (Type::I64, Type::I64),
                             _ => (Type::I64, Type::Str),
                         };
                         if args.len() != 1 {
@@ -4345,6 +4348,26 @@ only a number or a `bool` can come out — compute what you need and yield that"
                             args: vec![],
                         };
                         return Type::Fallible(Box::new(gives), Box::new(io_err));
+                    }
+                    // The primitive that lets one thread hold many
+                    // conversations. Both arguments are ordinary values — a
+                    // list of handles and a millisecond timeout — so readiness
+                    // needed no new type either ([L-LIB-NET]).
+                    "net_wait" => {
+                        if args.len() != 2 {
+                            return self.error(
+                                span,
+                                "net_wait takes 2 arguments (handles, timeout_ms)",
+                            );
+                        }
+                        let handles = Type::List(Box::new(Type::I64));
+                        self.check_expr(&args[0], &handles);
+                        self.check_expr(&args[1], &Type::I64);
+                        let io_err = Type::Named {
+                            id: self.defs.io_error_id,
+                            args: vec![],
+                        };
+                        return Type::Fallible(Box::new(handles), Box::new(io_err));
                     }
                     // The other half of [L-LIB-NET]: without it a program could
                     // be a server and could not be a client.

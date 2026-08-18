@@ -1,9 +1,13 @@
 # ProjectGold — phase 1 results
 
-Thirty programs written to a list this project did not write. **26 work and
-agree byte for byte across all three engines** — `grasm run`, `grasm build`, and
-`grasm build --native`. **4 are blocked**, each with the missing language
-feature named and a note on what would unblock it.
+Thirty programs written to a list this project did not write, plus one
+experiment. **29 work and agree byte for byte across all three engines** —
+`grasm run`, `grasm build`, and `grasm build --native`. **2 are blocked**, each
+with the missing language feature named and a note on what would unblock it.
+
+The count moved because the findings were acted on: 15, 18 and 30 were each
+blocked on something this list exposed, and each was unblocked by shipping the
+feature rather than by rewriting the program around the gap.
 
 Re-run with `./run.sh`.
 
@@ -38,7 +42,7 @@ Re-run with `./run.sh`.
 | 27 | SHA-256 | ✅ | consumed **F3**; 12/12 vectors |
 | 28 | SQL Engine | ✅ | — |
 | 29 | Self-Hosting Lexer | ✅ | **25/25 files match the reference lexer** |
-| 30 | Async Chat | ⛔ | **F13** every socket operation blocks |
+| 30 | Async Chat | ✅ | consumed **F13**; one thread, three clients |
 
 ## Fixed while writing these
 
@@ -65,9 +69,9 @@ hitting them:
 2. ~~**F9 — no byte type.**~~ **Fixed.** `bytes` shipped as `[L-LIB-BYTES]`,
    which unblocked 18 — it now writes a BMP that `file(1)` identifies as
    "PC bitmap, Windows 3.x format, 3 x 2 x 24". 25 stays blocked on F12 alone.
-3. **F13 — blocking sockets.** The other half of F14: even single-threaded
-   multiplexing is impossible, because nothing can ask whether a handle is
-   ready.
+3. ~~**F13 — blocking sockets.**~~ **Fixed.** `net_wait` shipped as part of
+   [L-LIB-NET], which unblocked 30 — one thread now serves every client at
+   once. F14 stands: this is readiness, not asynchrony.
 4. **F7 — no stderr.** A tool cannot separate diagnostics from output.
 5. ~~**F5 — no multi-line strings.**~~ **Withdrawn** — `"""` blocks have existed
    since C20; the finding was wrong, not fixed.

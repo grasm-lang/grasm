@@ -25,4 +25,5 @@
 27-sha256/main.gr 1757
 28-sql-engine/main.gr 3743
 29-self-hosting-lexer/main.gr 2977
+30-async-chat/main.gr 1126
 31-grasm-emits-c/main.gr 1933

@@ -1,6 +1,16 @@
 //! tag: L-LIB-NET
 //! expect: output
 //! listening
+//! a chosen port is in range
+//! empty wait set: 0 ready
+//! a handle that names nothing is an Err
+//! before dial: nothing ready
+//! after dial: the listener
+//! before send: nothing ready
+//! after send: the connection
+//! read: ping
+//! after hangup: the connection
+//! read at end: 0 bytes
 //! closed twice is fine
 //! a closed handle reports rather than panics
 //! nothing is listening there, and that is an Err
@@ -11,11 +21,105 @@
 // colliding with whatever else holds a port. It does not accept a connection —
 // that would need a second process — and the shapes it does check are the ones
 // with an answer that does not depend on the machine.
+/// Names the ready handles by their role, so the transcript does not depend on
+/// which numbers this machine's socket table happened to hand out.
+fn report(step: str, ready: [i64], listener: i64, conn: i64) / {io} {
+    var out = ""
+    for h in ready {
+        if h == listener {
+            out = out + "the listener "
+        } else if h == conn {
+            out = out + "the connection "
+        } else {
+            out = out + "handle {h} "
+        }
+    }
+    if out == "" {
+        print("{step}: nothing ready")
+    } else {
+        print("{step}: {out.trim()}")
+    }
+}
+
 fn main() / {io, net} {
     match tcp_listen(0) {
         Err(e) -> print("could not listen")
         Ok(listener) -> {
             print("listening")
+
+            // Port 0 asked the system to choose. Reading the choice back is
+            // what makes that spelling usable: the rest of this program dials
+            // the listener it just opened, on a machine where the port it
+            // would otherwise have picked may already be held.
+            let port = tcp_port(listener) ?? 0
+            if port > 0 and port <= 65535 {
+                print("a chosen port is in range")
+            } else {
+                print("a chosen port is NOT in range: {port}")
+            }
+
+            // --- readiness --------------------------------------------------
+            //
+            // `net_wait` is what lets one thread hold many conversations.
+            // Each step checks readiness *before* the event that causes it as
+            // well as after: a `net_wait` that always answered "ready" would
+            // pass a test that only looked at the second half, and would make
+            // every server written against it busy-spin.
+
+            // An empty wait set is answered immediately and is not an error —
+            // a server that has just closed its last connection asks exactly
+            // this on its next turn.
+            match net_wait([], 0) {
+                Ok(r) -> print("empty wait set: {r.len()} ready")
+                Err(e) -> print("empty wait set: FAILED")
+            }
+
+            // A handle that names nothing is an ordinary failure, the same as
+            // using a connection after closing it — never a panic.
+            match net_wait([4242], 0) {
+                Ok(r) -> print("a handle that names nothing was accepted, which it must not")
+                Err(e) -> print("a handle that names nothing is an Err")
+            }
+
+            report("before dial", net_wait([listener], 0) ?? [], listener, -1)
+
+            match tcp_connect("127.0.0.1", port) {
+                Err(e) -> print("could not dial the listener")
+                Ok(client) -> {
+                    // The handshake completed, so accepting will not block.
+                    report("after dial", net_wait([listener], 1000) ?? [], listener, -1)
+
+                    match tcp_accept(listener) {
+                        Err(e) -> print("could not accept")
+                        Ok(conn) -> {
+                            // Accepted, but the client has said nothing yet.
+                            report("before send", net_wait([conn], 0) ?? [], listener, conn)
+
+                            match tcp_write(client, "ping") {
+                                Ok(_) -> {}
+                                Err(e) -> print("could not write")
+                            }
+
+                            // Both handles in one call, so the answer also
+                            // shows the ready ones being picked out rather
+                            // than the whole set coming back.
+                            report("after send", net_wait([listener, conn], 1000) ?? [], listener, conn)
+                            print("read: {tcp_read(conn) ?? "(nothing)"}")
+
+                            // A hung-up peer is ready: the read that follows
+                            // returns nothing, which is how a caller learns
+                            // the conversation ended. Reporting it as
+                            // not-ready would leave a dead connection in the
+                            // wait set forever.
+                            tcp_close(client)
+                            report("after hangup", net_wait([conn], 1000) ?? [], listener, conn)
+                            print("read at end: {(tcp_read(conn) ?? "").len()} bytes")
+                            tcp_close(conn)
+                        }
+                    }
+                }
+            }
+
             // Closing twice is not an error, for the same reason releasing a
             // `ref` twice is not: cleanup order is not the caller's to track.
             tcp_close(listener)

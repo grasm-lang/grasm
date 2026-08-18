@@ -238,7 +238,7 @@ while it can be done over TCP, the project as stated is a datagram exercise.
 Blocked behind F9 in any case: a DNS query is a packed binary structure with
 bit-level flags, and there is no byte type to build one in.
 
-## F13 — every socket operation blocks (S3, library)
+## F13 — every socket operation blocks (S3, library) — **fixed**
 
 Found writing 30-async-chat. `tcp_accept` and `tcp_read` both block, and there
 is no `select`, no poll, no timeout, and no way to ask whether a handle is
@@ -250,9 +250,31 @@ readiness check, or a thread per connection. `spawn` is documented as
 single-core ([E-NOT-PARALLEL]) and `par_map` runs a fixed batch to completion,
 so neither gives a connection its own thread of control today.
 
-This is the one gap on the list that is a genuine design question rather than a
-missing builtin, because the answer interacts with the effect system: an `async`
-row already exists in the vocabulary and nothing performs it.
+### What it turned out to be
+
+The design question was smaller than it looked, and asking it the other way
+around answered it. A thread per connection is *unavailable by construction*:
+`spawn` does not carry `net`, so a spawned task cannot touch a socket, and that
+is [T-CAPABILITY] working as designed rather than a limitation to route around.
+So the answer had to be readiness, and readiness is a builtin.
+
+`net_wait(handles, timeout_ms)` was added ([L-LIB-NET]): it answers with the
+subset of handles that can be read without blocking, in the order they were
+asked in. The listener goes in the same wait set as the connections, so a new
+arrival and a message from an existing client are the same kind of event. One
+thread now multiplexes any number of connections, which is what every real
+server does underneath. 30-async-chat is no longer blocked, and its
+demonstration dials its own clients from the thread that then serves them —
+which only runs at all because nothing blocks.
+
+Adding it also exposed a smaller gap on the way: `tcp_listen(0)` asks the system
+to choose a port, and nothing could read the choice back, so that spelling could
+not be used for anything. `tcp_port(h)` was added with it.
+
+This is readiness, not asynchrony. `tcp_read` on a ready handle still performs a
+blocking read; it simply cannot block, because the bytes are already there. The
+`async` row still exists in the vocabulary with nothing performing it, and F14
+below — that `spawn` cannot perform I/O at all — is untouched.
 
 ## F14 — there is no way to do concurrent I/O (S3, language) — the biggest one
 

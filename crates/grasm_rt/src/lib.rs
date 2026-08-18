@@ -3945,6 +3945,179 @@ fn socket_with<T>(h: i64, f: impl FnOnce(&mut Socket) -> Result<T, String>) -> R
     })
 }
 
+/// `poll(2)`, declared here rather than taken from a crate.
+///
+/// The runtime has no dependencies — it is the thing every compiled Grasm
+/// program links, and a dependency there is a dependency in every binary the
+/// language produces. Three constants and one function signature is a smaller
+/// price than that.
+///
+/// `nfds_t` is not the same width everywhere: an `unsigned long` on Linux, an
+/// `unsigned int` on macOS and the BSDs. Getting it wrong passes garbage in the
+/// high half of the register on one platform and works on the other, which is
+/// the kind of defect that only appears on somebody else's machine.
+#[cfg(unix)]
+mod sys_poll {
+    #[cfg(target_os = "linux")]
+    pub type NfdsT = u64;
+    #[cfg(not(target_os = "linux"))]
+    pub type NfdsT = u32;
+
+    /// There is something to read — or, for a listener, something to accept.
+    pub const POLLIN: i16 = 0x0001;
+    /// The peer hung up. Reported in `revents` whether or not it was asked for.
+    pub const POLLHUP: i16 = 0x0010;
+    /// The descriptor is not open. Also unsolicited.
+    pub const POLLNVAL: i16 = 0x0020;
+
+    #[repr(C)]
+    pub struct PollFd {
+        pub fd: i32,
+        pub events: i16,
+        pub revents: i16,
+    }
+
+    extern "C" {
+        pub fn poll(fds: *mut PollFd, nfds: NfdsT, timeout: i32) -> i32;
+    }
+}
+
+/// Which of these descriptors can be read from without waiting.
+///
+/// A closed peer counts as ready: the read that follows returns zero bytes,
+/// which is how a caller learns the connection ended. Reporting it as *not*
+/// ready would leave a hung-up connection in the wait set forever.
+#[cfg(unix)]
+fn wait_readable(fds: &[i32], timeout_ms: i32) -> Result<Vec<bool>, String> {
+    use sys_poll::*;
+    let mut set: Vec<PollFd> = fds
+        .iter()
+        .map(|&fd| PollFd {
+            fd,
+            events: POLLIN,
+            revents: 0,
+        })
+        .collect();
+    loop {
+        let n = unsafe { poll(set.as_mut_ptr(), set.len() as NfdsT, timeout_ms) };
+        if n >= 0 {
+            return Ok(set
+                .iter()
+                .map(|p| p.revents & (POLLIN | POLLHUP | POLLNVAL) != 0)
+                .collect());
+        }
+        let e = std::io::Error::last_os_error();
+        // A signal arriving is not a failure — it is a delivery that happened to
+        // land mid-wait, and the caller asked to wait. Retrying here is what
+        // stops an ordinary `SIGWINCH` from looking like a network error.
+        if e.kind() != std::io::ErrorKind::Interrupted {
+            return Err(e.to_string());
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn wait_readable(_fds: &[i32], _timeout_ms: i32) -> Result<Vec<bool>, String> {
+    Err("net_wait needs poll(2), which this platform does not provide".to_string())
+}
+
+/// The local port a handle is bound to.
+///
+/// `tcp_listen(0)` asks the system to choose a free port, which is the only way
+/// to write a program that runs on a machine where something else already holds
+/// the port it wanted. Without a way to read the choice back, that spelling
+/// could not be used for anything — a program could bind a port it was unable
+/// to name, dial, or print.
+///
+/// # Safety: called from compiled Grasm with a boxed value.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_tcp_port(handle: *mut RtVal) -> *mut RtVal {
+    let h = match &(*handle).payload {
+        RtPayload::I64(n) => *n,
+        _ => return err_of(io_err("IoFailed", "handle must be an integer".to_string())),
+    };
+    let port = socket_with(h, |s| {
+        let addr = match s {
+            Socket::Listener(l) => l.local_addr(),
+            Socket::Stream(st) => st.local_addr(),
+        };
+        addr.map(|a| i64::from(a.port())).map_err(|e| e.to_string())
+    });
+    match port {
+        Ok(p) => ok_of(alloc(RtPayload::I64(p))),
+        Err(e) => err_of(io_err("IoFailed", e)),
+    }
+}
+
+/// Waits until one of these handles has something to read, or the timeout runs
+/// out, and answers with the handles that are ready.
+///
+/// This is the primitive that lets one thread serve many connections. Without
+/// it every `tcp_accept` and every `tcp_read` blocks, so a server can hold one
+/// conversation at a time, and holding two needs a thread per connection —
+/// which Grasm cannot spawn, because `spawn` does not carry `net`.
+///
+/// # Safety: called from compiled Grasm with boxed values.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_net_wait(handles: *mut RtVal, timeout: *mut RtVal) -> *mut RtVal {
+    use std::os::fd::AsRawFd;
+
+    let timeout_ms = match &(*timeout).payload {
+        RtPayload::I64(n) => *n,
+        _ => return err_of(io_err("IoFailed", "timeout must be an integer".to_string())),
+    };
+    // Anything past `i32` is "wait forever" spelled at length, and `-1` is how
+    // a caller asks for that directly.
+    let timeout_ms = if timeout_ms < 0 {
+        -1
+    } else {
+        timeout_ms.min(i64::from(i32::MAX)) as i32
+    };
+
+    let wanted = scalar_words(handles, "net_wait");
+    if wanted.is_empty() {
+        return ok_of(alloc(RtPayload::ListScalar {
+            kind: ScalarKind::I64,
+            data: ScalarData::new(ScalarKind::I64),
+        }));
+    }
+
+    let fds = SOCKETS.with(|table| {
+        let table = table.borrow();
+        wanted
+            .iter()
+            .map(|&h| match table.get(h as usize).and_then(Option::as_ref) {
+                Some(Socket::Listener(l)) => Ok(l.as_raw_fd()),
+                Some(Socket::Stream(st)) => Ok(st.as_raw_fd()),
+                None => Err(format!("socket {h} is not open")),
+            })
+            .collect::<Result<Vec<i32>, String>>()
+    });
+    let fds = match fds {
+        Ok(fds) => fds,
+        Err(e) => return err_of(io_err("IoFailed", e)),
+    };
+
+    let ready = match wait_readable(&fds, timeout_ms) {
+        Ok(r) => r,
+        Err(e) => return err_of(io_err("IoFailed", e)),
+    };
+
+    // The answer keeps the order it was asked in, so a program that walks the
+    // result serves its connections in a fixed order rather than whichever one
+    // the kernel happened to list first ([L-DETERMINISM]).
+    let mut out = ScalarData::new(ScalarKind::I64);
+    for (i, &h) in wanted.iter().enumerate() {
+        if ready[i] {
+            out.push(h);
+        }
+    }
+    ok_of(alloc(RtPayload::ListScalar {
+        kind: ScalarKind::I64,
+        data: out,
+    }))
+}
+
 /// Listens on a TCP port, answering with a handle.
 ///
 /// # Safety: called from compiled Grasm with a boxed value.

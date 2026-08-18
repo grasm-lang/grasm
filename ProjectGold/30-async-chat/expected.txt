@@ -1,0 +1,21 @@
+--- one thread, three clients ---
+dialled 3 clients
+  server: accepted guest4
+  server: accepted guest5
+  server: accepted guest6
+room holds 3
+  server: guest4 said hello
+  client1 heard guest4: hello
+  client2 heard guest4: hello
+  server: guest5 said hi there
+  client0 heard guest5: hi there
+  client2 heard guest5: hi there
+  server: guest6 said good morning
+  client0 heard guest6: good morning
+  client1 heard guest6: good morning
+--- client0 leaves ---
+  server: guest4 left
+room holds 2
+  server: guest5 left
+  server: guest6 left
+room holds 0

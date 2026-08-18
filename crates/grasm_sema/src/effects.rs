@@ -30,6 +30,8 @@ const NET_BUILTINS: &[&str] = &[
     "tcp_read",
     "tcp_write",
     "tcp_close",
+    "net_wait",
+    "tcp_port",
 ];
 
 const IO_BUILTINS: &[&str] = &[
