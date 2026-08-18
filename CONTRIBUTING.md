@@ -13,14 +13,40 @@ Everything below follows from that.
 
 ```
 cargo build --release --workspace
-cargo test --workspace                # all tests
+cargo test --workspace                   # all tests
 cargo clippy --workspace --all-targets   # must be silent
-./scripts/difftest.sh                 # native output must equal interpreter output
-cargo test -p grasm_spec              # specification conformance
+cargo test -p grasm_spec                 # specification conformance
+
+./scripts/difftest.sh                    # native output must equal interpreter output
+./scripts/leakcheck.sh                   # no program leaks
+./scripts/agreetest.sh                   # interpreter, bundle and native agree
+./scripts/nativegaps.sh                  # the documented gap list matches the compiler
+./ProjectGold/run.sh                     # thirty-one whole programs, three engines
 ```
 
-CI runs the same four on macOS, Linux, and Windows, plus a cross-compilation
-job. A pull request that does not pass locally will not pass there.
+And the generators, which find what nobody thought to write down:
+
+```
+python3 scripts/fuzz_differential.py --count 150
+python3 scripts/fuzz_fallible.py 100
+python3 scripts/fuzz_generics.py --count 100
+python3 scripts/fuzz_handlers.py --count 120
+python3 scripts/fuzz_rows.py
+python3 scripts/fuzz_extern.py
+python3 scripts/fuzz_places.py           # every shape of place, read and written
+python3 scripts/fuzz_methods.py          # every builtin method, every receiver shape
+python3 scripts/fuzz_fusions.py          # the compiled shortcuts against the interpreter
+```
+
+The last three enumerate an axis along which the native backend has more than
+one implementation site. Every one of F17, F22, F23, F24 and F26 in
+`ProjectGold/FINDINGS.md` was a rule added at one site and not the others, so
+that axis is where the defects are.
+
+`.github/workflows/ci.yml` runs all of this on macOS, Linux and Windows, plus a
+cross-compilation job. **It has never run**: this repository has no remote, so
+no push has ever triggered it. Until that changes, the list above is the whole
+of the evidence, and it is only as good as the machine you ran it on.
 
 ## Changing behaviour
 
