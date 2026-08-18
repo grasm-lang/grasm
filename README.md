@@ -120,28 +120,45 @@ runtime into one distributable executable).
 
 ### Performance
 
-Six programs written the same way in Grasm, C, Rust, Go, and Python. Best of
-5, milliseconds, Apple M-series:
+Six programs written the same way in Grasm, C, Rust, Go, Nim, Zig and Python.
+Best of 5, milliseconds, Apple M-series. Nim and Zig implement the four
+programs where the comparison is about the language rather than about which
+concurrency primitive each one reaches for.
 
-| program  |   C |  Rust |  Go | grasm-native | Python |
-|----------|----:|------:|----:|-------------:|-------:|
-| fib      |  25 |    26 |  28 |       **27** |    153 |
-| sieve    |  28 |    28 |  29 |           39 |    370 |
-| matmul   |  25 |    26 |  29 |           32 |    974 |
-| wordfreq |  54 |    48 |  39 |          117 |    153 |
-| sort     |  58 |    33 |  70 |       **47** |    237 |
-| parmap   |  69 |    72 | 112 |          128 |  3,521 |
+| program  |   C |  Rust |  Go | Nim | Zig | grasm-native | Python |
+|----------|----:|------:|----:|----:|----:|-------------:|-------:|
+| fib      |  28 |    30 |  31 |  29 |  29 |           34 |    156 |
+| sieve    |  29 |    29 |  30 |  32 |  31 |           41 |    399 |
+| matmul   |  29 |    28 |  30 |  31 |  29 |           33 |    939 |
+| wordfreq |  54 |    49 |  40 |  45 |  34 |           98 |    156 |
+| sort     |  61 |    34 |  72 |   — |   — |       **44** |    246 |
+| parmap   |  75 |    74 | 116 |   — |   — |          131 |  3,716 |
 
 `./scripts/bench.sh` builds every implementation, checks each one against the
-interpreter's answer, and refuses to report a timing for a wrong one. Native
-Grasm matches C on call-and-arithmetic work and **beats C and Go on sort**;
-scalar lists store elements inline, and a list a loop only indexes is reached
-through its data pointer, so `matmul`'s innermost loop is 17 instructions with
-no calls. What is left is allocation: `wordfreq` builds two strings per
-iteration and boxes every value, which is most of its remaining 2.2x.
-`benchmarks/README.md` records two things this table used to blame that
-measurement cleared — the bounds check and the absence of SIMD, each worth
-0ms.
+interpreter's answer, and refuses to report a timing for a wrong one — an
+optimiser that deletes the work being measured is the classic way a benchmark
+lies. It also refuses to run at all when the machine's load average is above a
+third of its core count, because a busy machine does not just make everything
+slower, it makes everything slower *unevenly*, and the multi-core rows collapse
+in a way that reads as a regression that is not there. **The table above is one
+run; a second run taken hours apart at a different starting load agreed within
+3 ms on every cell.**
+
+Against C on the four scalar programs, native Grasm is 14% behind on `matmul`,
+21% on `fib`, 41% on `sieve`, and 81% on `wordfreq` — and it **beats C and Go on
+sort**, where Rust is still ahead. Scalar lists store elements inline and a list
+a loop only indexes is reached through its data pointer, so `matmul`'s innermost
+loop is 17 instructions with no calls, which is why that is the closest row.
+
+`wordfreq` is the honest weak spot at 1.8x C and 2.9x Zig. It is allocation:
+every value is a refcounted box and the loop builds a string per iteration.
+Small-string optimisation took it from 117 ms to 98 ms by removing the *second*
+allocation for text under sixteen bytes — the storage change alone made it
+slower, and the win came from the constructors that stopped building a `String`
+only to copy it (`docs/northstar.md` records the measurements, including the
+attempts that were reverted). `benchmarks/README.md` records two things this
+table used to blame that measurement cleared — the bounds check and the absence
+of SIMD, each worth 0 ms.
 
 Compile time is ~66 ms/program — about Go's with a warm cache, faster than C,
 roughly 4× faster than Rust. Binaries are ~457 KB after link-time

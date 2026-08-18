@@ -58,34 +58,44 @@ codegen, and allocation, and nothing at all about how a large program behaves.
 Apple M-series, macOS 25.1, best of 5 runs, wall clock in milliseconds. Lower
 is better. Reproduce with `./scripts/bench.sh`.
 
-| program  |   C |  Rust |  Go | grasm-native | grasm-interp | Python |
-|----------|----:|------:|----:|-------------:|-------------:|-------:|
-| fib      |  26 |    26 |  27 |       **27** |         1205 |    153 |
-| sieve    |  28 |    28 |  29 |           39 |         2229 |    370 |
-| matmul   |  25 |    26 |  29 |           32 |         5795 |    974 |
-| wordfreq |  54 |    48 |  39 |          117 |          472 |    153 |
-| sort     |  58 |    33 |  70 |       **47** |          323 |    237 |
-| parmap   |  69 |    72 | 112 |          128 |        32787 |  3,521 |
-| mandelbrot |  36 |   —  |  —  |       **14** |            — |  1,457 |
+All seven implementations in one table. Nim and Zig implement the four programs
+where the comparison is about the language rather than about which concurrency
+primitive each one reaches for.
 
-### Against Nim and Zig
+| program  |   C |  Rust |  Go | Nim | Zig | grasm-native | grasm-interp | Python |
+|----------|----:|------:|----:|----:|----:|-------------:|-------------:|-------:|
+| fib      |  28 |    30 |  31 |  29 |  29 |           34 |         1646 |    156 |
+| sieve    |  29 |    29 |  30 |  32 |  31 |           41 |         2906 |    399 |
+| matmul   |  29 |    28 |  30 |  31 |  29 |           33 |         6049 |    939 |
+| wordfreq |  54 |    49 |  40 |  45 |  34 |           98 |          516 |    156 |
+| sort     |  61 |    34 |  72 |   — |   — |       **44** |          395 |    246 |
+| parmap   |  75 |    74 | 116 |   — |   — |          131 |        55036 |  3,716 |
+| mandelbrot |  36 |  —  |  —  |  —  |  —  |       **14** |            — |  1,457 |
 
-The four programs that have implementations in every language, on one idle
-machine, best of five:
+**This table is one run.** A second run, taken hours apart at a different
+starting load average, agreed within 3 ms on every cell — which is the only
+reason to believe any of it. Timings from different sessions are not
+comparable: earlier editions of this file recorded `fib` at 26 ms for C and
+27 ms for Grasm, and the ratio has moved from 1.04x to 1.21x without either
+implementation changing. Compare rows within a table, never numbers across
+them.
 
-| program  | grasm |   C | Zig | Nim | Rust |  Go |
-|----------|------:|----:|----:|----:|-----:|----:|
-| fib      |    31 |  26 |  29 |  29 |   29 |  29 |
-| sieve    |    43 |  30 |  31 |  33 |   30 |  29 |
-| matmul   |    31 |  25 |  27 |  31 |   25 |  32 |
-| wordfreq |   120 |  53 |  33 |  44 |   48 |  40 |
+### Reading it
 
-On arithmetic and loops Grasm is within about 1.2× of the fastest and level
-with Go. On `wordfreq` it is 2.3–3.6× behind everyone, and Zig — with an
-arena allocator and no refcounting — is fastest of all at 33ms. That gap is
-the price of the value representation: every string is a refcounted box, and
-this benchmark allocates two per iteration. It is a design cost, not a
-missing optimisation.
+Against C on the scalar programs: 14% behind on `matmul`, 21% on `fib`, 41% on
+`sieve`, 81% on `wordfreq` — and **ahead of C and Go on `sort`**, where Rust
+still wins. `matmul` is the closest row because a list a loop only indexes is
+reached through its data pointer, so its innermost loop is 17 instructions with
+no calls.
+
+`wordfreq` is the weak row and the interesting one. Zig is fastest of everyone
+at 34 ms with an arena allocator and no refcounting; Grasm is 2.9x behind it.
+That is the value representation: every string is a refcounted box and the loop
+builds one per iteration. Small-string optimisation moved it from 117 ms to
+98 ms by removing the *second* allocation for text under sixteen bytes — and the
+inline storage alone made things **slower**, because the constructors still
+built a `String` and copied it. The win was in the constructors. `docs/northstar.md`
+records that, along with the attempts that were measured and reverted.
 
 Binary size, release settings, KB:
 
