@@ -255,6 +255,53 @@ implements all four **by content**. Deriving them would have made `Inline("a")`
 and `Heap("a")` different keys — the same text reached two ways landing in two
 slots, which is a wrong answer rather than a slow one.
 
+**Half of every recursive call is the guard that makes deep recursion safe.**
+
+[E-RECURSION-DEPTH] requires that recursing too deeply *panics* with exit 101
+and "does not abort, crash, or corrupt the process". The backend implements it
+by calling `grasm_stack_check` on entry to every function that can recurse.
+
+Measured on `fib(32)`, which is nothing but calls and additions:
+
+| | |
+|---|---:|
+| with the check | 22.9 ms |
+| call kept, check's body emptied | 20.4 ms |
+| no call at all | 11.6 ms |
+| the same program in C | 8.4 ms |
+
+**The call is 8.8 ms of that and the check itself is 2.4 ms.** An opaque call at
+function entry forces the register allocator to spill everything live across
+it — in `fib` that is the argument — so the cost is not the work the callee
+does, it is that a callee exists. Grasm is 3.3x C on this program with the
+guard and about 1.4x without it, which makes this the largest single
+performance item in the language for recursive code.
+
+Three ways out, and none is free:
+
+* **Cranelift's own `ir::Function::stack_limit`** emits the comparison in the
+  prologue with no call at all — and **traps**. A trap is `brk` on aarch64,
+  which is the crash the clause exists to prevent. It is the right mechanism
+  with the wrong failure behaviour.
+* **A `SIGSEGV` handler on an alternate stack**, turning the guard page into
+  the required message and exit status, which is what Rust itself does. That
+  deletes the per-call cost entirely and moves a safety guarantee into an
+  async-signal-safe handler, which is a much larger change than it looks.
+* **Inlining the comparison** needs the per-thread floor readable from
+  generated code. A plain global is wrong the moment a `par_map` worker
+  recurses on its own stack, and Cranelift has no portable thread-local read.
+
+Recorded rather than rushed: the guard is a *correctness* guarantee, and
+trading it for 8.8 ms without a design is how a language gets a footnote
+saying deep recursion sometimes segfaults.
+
+**Runtime calls are colocated now, which was measured and kept.** The runtime is
+a static archive linked into the same binary, but every call to it was declared
+`Import` and went through the PLT. Marking them colocated makes each a
+PC-relative branch: `sieve` 17 to 15.3 ms, `sort` 20 to 19.2, `wordfreq` 54 to
+53.7. It does *not* help `fib` at all — 22.9 to 22.6 — which is the evidence
+that the indirection was never the cost there, the clobber was.
+
 **The counting idiom hashed twice, and now hashes once.**
 
 ```grasm

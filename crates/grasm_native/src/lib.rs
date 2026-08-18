@@ -1605,6 +1605,12 @@ impl<'m> Codegen<'m> {
         fcx.b.seal_all_blocks();
         fcx.b.finalize();
 
+        // The IR a function compiled to, for reading what the backend actually
+        // emitted rather than guessing from a timing. On demand, because it is
+        // thousands of lines for a real program.
+        if std::env::var("GRASM_DUMP_IR").is_ok() {
+            eprintln!("--- {} ---\n{}", f.name.name, ctx.func);
+        }
         self.module
             .define_function(func_id, &mut ctx)
             .map_err(|e| Unsupported {
@@ -3870,6 +3876,18 @@ impl FnCx<'_, '_> {
     fn call_rt(&mut self, name: &'static str, args: &[Value]) -> Option<Value> {
         let id = self.cg.runtime[name];
         let fref = self.cg.module.declare_func_in_func(id, self.b.func);
+        // The runtime is a static archive linked into this same binary, so
+        // every one of these is a PC-relative branch and not a hop through the
+        // PLT. Declared `Import`, cranelift-module assumes the other side may
+        // be in another object and emits the indirection — which is a load, a
+        // dependent branch, and a full clobber the register allocator has to
+        // spill around.
+        //
+        // Measured on `fib(32)`, which calls `grasm_stack_check` once per
+        // invocation: the whole program is 22.9 ms with the indirect call and
+        // 11.6 ms with no call at all, so the call — not the check it performs
+        // — was half the runtime of every recursive function in the language.
+        self.b.func.dfg.ext_funcs[fref].colocated = true;
         let inst = self.b.ins().call(fref, args);
         self.b.inst_results(inst).first().copied()
     }
