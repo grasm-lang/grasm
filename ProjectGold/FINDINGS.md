@@ -291,7 +291,7 @@ Project 25's packet builders were rewritten as ordinary chains, which is the
 only honest test of the fix: the program that found the gap now reads the way it
 wanted to, and its output is byte-identical.
 
-## F19 — an integer cannot be formatted in any base but ten (S4, library)
+## F19 — an integer cannot be formatted in any base but ten (S4, library) — **fixed**
 
 Found writing 25-dns-resolver. A `bytes` prints as hex and an `i64` prints as
 decimal, and there is no way to ask for a different radix. Every DNS tool prints
@@ -305,8 +305,21 @@ fn hex_digit(n: i64) -> str {
 
 Small, and it appears in every program that touches a protocol, a hash, a colour
 or a permission mask — the same programs that needed [L-LIB-BITS], which is the
-tell. The natural shape is `n.to_base(16)` and `n.to_base(2)` with a matching
-`s.parse_int_base(16)`, since `parse_int` already refuses `0xFF` ([L-LIB-PARSE]).
+tell.
+
+**Fixed** — `n.to_base(b)` and `s.parse_int_base(b)` ([L-LIB-BASE]). Both
+directions, because `parse_int` refuses `0xFF` ([L-LIB-PARSE]) and a language
+that can write hex and not read it back has only done half the job. Neither
+side accepts a prefix: the base is the argument, not something to be guessed
+from the text.
+
+A base outside `2..36` panics rather than answering, for the same reason
+`code_at` panics out of range — there is no right answer and a wrong one would
+be silently wrong. `i64::MIN` converts through its unsigned magnitude, which is
+the place a hand-written version is usually wrong.
+
+Project 25's `hex_digit` table is gone; it now writes `n.to_base(16).pad_start(2, "0")`
+and its output is byte-identical.
 
 ## F17 — a native-backend catch-all silently miscompiled a new method (S1, backend) — **fixed**
 

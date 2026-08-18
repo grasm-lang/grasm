@@ -54,6 +54,31 @@ pub struct Frame {
 /// A listener or a connection, held by the reference engine for the `net`
 /// builtins. A handle is an index into a table of these, so what crosses into
 /// Grasm is an integer and a program never sees an address.
+/// An integer's text in a given base, digits `0-9a-z`.
+///
+/// `i64::MIN` goes through the unsigned magnitude, because negating it
+/// overflows.
+fn int_in_base(v: i64, base: i64) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let base = base as u64;
+    let mut n = v.unsigned_abs();
+    let mut buf = [0u8; 65];
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = DIGITS[(n % base) as usize];
+        n /= base;
+        if n == 0 {
+            break;
+        }
+    }
+    if v < 0 {
+        i -= 1;
+        buf[i] = b'-';
+    }
+    String::from_utf8_lossy(&buf[i..]).into_owned()
+}
+
 enum NetSocket {
     Listener(std::net::TcpListener),
     Stream(std::net::TcpStream),
@@ -3738,6 +3763,23 @@ build links it, `grasm run` can only reach what is already loaded",
                 Ok(v) => Value::some(Value::Int(v)),
                 Err(_) => Value::none(),
             },
+            // `parse_int` deliberately refuses `0xFF` ([L-LIB-PARSE]), so
+            // without this a program could write hex and not read it back.
+            (Value::Str(s), "parse_int_base") => {
+                let base = match self.eval_expr(&args[0])? {
+                    Value::Int(n) => n,
+                    _ => 10,
+                };
+                if !(2..=36).contains(&base) {
+                    return Err(Flow::Panic(format!(
+                        "parse_int_base takes a base in 2..36, not {base}"
+                    )));
+                }
+                match i64::from_str_radix(s.trim(), base as u32) {
+                    Ok(v) => Value::some(Value::Int(v)),
+                    Err(_) => Value::none(),
+                }
+            }
             (Value::Str(s), "parse_float") => match s.trim().parse::<f64>() {
                 Ok(v) => Value::some(Value::Float(v)),
                 Err(_) => Value::none(),
@@ -3841,6 +3883,19 @@ build links it, `grasm run` can only reach what is already loaded",
                 Value::Bytes(Rc::new(s.to_string().into_bytes()))
             }
             (Value::Int(i), "as_f64") => Value::Float(*i as f64),
+            // Base ten is not the only base a systems program needs.
+            (Value::Int(i), "to_base") => {
+                let base = match self.eval_expr(&args[0])? {
+                    Value::Int(n) => n,
+                    _ => 10,
+                };
+                if !(2..=36).contains(&base) {
+                    return Err(Flow::Panic(format!(
+                        "to_base takes a base in 2..36, not {base}"
+                    )));
+                }
+                Value::str(int_in_base(*i, base))
+            }
             (Value::Int(i), "abs") => Value::Int(i.wrapping_abs()),
             // [L-LIB-BITS]. Shift counts are masked to 0..63 rather than
             // trapping: `1.shl(64)` is a question a program can ask by

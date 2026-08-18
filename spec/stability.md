@@ -253,6 +253,7 @@ May change or be removed in any release. New surface starts here.
 - `T-EXTERN` — experimental
 - `G-WILDCARD-BINDING` — experimental
 - `L-LEADING-DOT` — experimental
+- `L-LIB-BASE` — experimental
 - `L-LIB-BITS` — experimental
 - `L-LIB-BYTES` — experimental
 - `L-LIB-EPRINT` — experimental

@@ -21,7 +21,7 @@
 22-multithreaded-scraper/main.gr 1417
 23-turing-machine/main.gr 1857
 24-micro-vm/main.gr 2257
-25-dns-resolver/main.gr 2256
+25-dns-resolver/main.gr 2227
 26-garbage-collector/main.gr 1575
 27-sha256/main.gr 1754
 28-sql-engine/main.gr 3743

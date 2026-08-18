@@ -37,7 +37,7 @@ Re-run with `./run.sh`.
 | 22 | Multithreaded Scraper | ✅ | consumed **F11**; found **F14** no concurrent I/O |
 | 23 | Turing Machine | ✅ | — |
 | 24 | Micro VM | ✅ | — |
-| 25 | DNS Resolver | ✅ | consumed **F12**; resolves against 8.8.8.8; found **F16**, **F17** |
+| 25 | DNS Resolver | ✅ | consumed **F12**; resolves against 8.8.8.8; found **F16**, **F17**, **F19** |
 | 26 | Garbage Collector | ✅ | — |
 | 27 | SHA-256 | ✅ | consumed **F3**; 12/12 vectors |
 | 28 | SQL Engine | ✅ | — |

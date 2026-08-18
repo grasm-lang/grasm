@@ -3200,6 +3200,68 @@ pub unsafe extern "C" fn grasm_str_parse_int(s: *mut RtVal) -> *mut RtVal {
     }
 }
 
+/// An integer's text in a given base, digits `0-9a-z`.
+///
+/// Base ten is not the only base a systems program needs: every protocol,
+/// hash, colour and permission mask is read and written in hex or binary. A
+/// base outside 2..=36 panics rather than answering, for the same reason
+/// `code_at` panics out of range — there is no right answer to return and a
+/// wrong one would be silently wrong.
+///
+/// `i64::MIN` is handled through the unsigned magnitude, because negating it
+/// overflows.
+///
+/// # Safety: live pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_i64_to_base(v: i64, base: i64) -> *mut RtVal {
+    alloc(RtPayload::Str(RtStr::of(&i64_in_base(v, base))))
+}
+
+fn i64_in_base(v: i64, base: i64) -> String {
+    if !(2..=36).contains(&base) {
+        rt_panic(&format!("to_base takes a base in 2..36, not {base}"));
+    }
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let base = base as u64;
+    let mut n = v.unsigned_abs();
+    // Longest possible: 64 binary digits plus a sign.
+    let mut buf = [0u8; 65];
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = DIGITS[(n % base) as usize];
+        n /= base;
+        if n == 0 {
+            break;
+        }
+    }
+    if v < 0 {
+        i -= 1;
+        buf[i] = b'-';
+    }
+    // ASCII by construction.
+    unsafe { std::str::from_utf8_unchecked(&buf[i..]) }.to_string()
+}
+
+/// Reads an integer written in a given base.
+///
+/// `parse_int` deliberately refuses `0xFF` ([L-LIB-PARSE]), so without this a
+/// program could write hex and not read it back. No prefix is accepted or
+/// required: the base is the argument, not something to be guessed from the
+/// text.
+///
+/// # Safety: live pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_parse_int_base(s: *mut RtVal, base: i64) -> *mut RtVal {
+    if !(2..=36).contains(&base) {
+        rt_panic(&format!("parse_int_base takes a base in 2..36, not {base}"));
+    }
+    match i64::from_str_radix(as_str(s).trim(), base as u32) {
+        Ok(v) => some_of(alloc(RtPayload::I64(v))),
+        Err(_) => none_val(),
+    }
+}
+
 /// # Safety: live pointer.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_str_parse_float(s: *mut RtVal) -> *mut RtVal {

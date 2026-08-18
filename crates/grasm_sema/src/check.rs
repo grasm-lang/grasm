@@ -6040,6 +6040,15 @@ Perform the effect after the closing brace, or yield a number and do the work ou
                     check_arity(self, 0);
                     self.defs.option_some(Type::I64)
                 }
+                // The other direction. `parse_int` deliberately refuses `0xFF`
+                // ([L-LIB-PARSE]), so without this a program could write hex
+                // and not read it back.
+                "parse_int_base" => {
+                    if check_arity(self, 1) {
+                        self.check_expr(&args[0], &Type::I64);
+                    }
+                    self.defs.option_some(Type::I64)
+                }
                 "parse_float" => {
                     check_arity(self, 0);
                     self.defs.option_some(Type::F64)
@@ -6186,6 +6195,16 @@ Perform the effect after the closing brace, or yield a number and do the work ou
                 }
                 "to_str" => {
                     check_arity(self, 0);
+                    Type::Str
+                }
+                // Base ten is not the only base a systems program needs. Every
+                // protocol, hash, colour and permission mask is read and
+                // written in hex or binary, and those are the same programs
+                // that needed [L-LIB-BITS].
+                "to_base" => {
+                    if check_arity(self, 1) {
+                        self.check_expr(&args[0], &Type::I64);
+                    }
                     Type::Str
                 }
                 _ => return None,

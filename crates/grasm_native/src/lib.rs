@@ -591,6 +591,8 @@ impl<'m> Codegen<'m> {
             ("grasm_str_from_bool", vec![i8t], Some(i64t)),
             ("grasm_str_len", vec![i64t], Some(i64t)),
             ("grasm_str_byte_len", vec![i64t], Some(i64t)),
+            ("grasm_i64_to_base", vec![i64t, i64t], Some(i64t)),
+            ("grasm_str_parse_int_base", vec![i64t, i64t], Some(i64t)),
             ("grasm_str_eq", vec![i64t, i64t], Some(i8t)),
             ("grasm_str_cmp", vec![i64t, i64t], Some(i64t)),
             ("grasm_list_new", vec![], Some(i64t)),
@@ -6258,6 +6260,14 @@ impl FnCx<'_, '_> {
                 self.call_rt("grasm_val_dec", &[rv]);
                 (v, VType::Option(Box::new(VType::I64)))
             }
+            (VType::Str, "parse_int_base") => {
+                let base = arg_scalar!(0, VType::I64);
+                let v = self
+                    .call_rt("grasm_str_parse_int_base", &[rv, base])
+                    .unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                (v, VType::Option(Box::new(VType::I64)))
+            }
             (VType::Str, "parse_float") => {
                 let v = self.call_rt("grasm_str_parse_float", &[rv]).unwrap();
                 self.call_rt("grasm_val_dec", &[rv]);
@@ -6533,6 +6543,13 @@ impl FnCx<'_, '_> {
                 self.call_rt("grasm_str_from_i64", &[rv]).unwrap(),
                 VType::Str,
             ),
+            (VType::I64, "to_base") => {
+                let base = arg_scalar!(0, VType::I64);
+                (
+                    self.call_rt("grasm_i64_to_base", &[rv, base]).unwrap(),
+                    VType::Str,
+                )
+            }
             (VType::I64, "abs") => (self.call_rt("grasm_i64_abs", &[rv]).unwrap(), VType::I64),
             // [L-LIB-BITS]. Emitted as instructions rather than runtime calls:
             // these are single machine operations and a call would cost more
@@ -9099,6 +9116,7 @@ checker did",
                 "is_nan" | "is_finite" => VType::Bool,
                 "is_some" | "is_none" | "is_empty" | "contains" | "starts_with"
                 | "ends_with" | "has" | "delete" | "any" | "all" => VType::Bool,
+                "to_base" => VType::Str,
                 "to_str" | "join" | "trim" | "trim_start" | "trim_end"
                 | "to_upper" | "to_lower" | "replace"
                 | "substr" | "repeat" | "pad_start" | "pad_end" | "to_char"

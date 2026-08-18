@@ -231,19 +231,14 @@ fn parse_answers(b: bytes) -> [Answer] {
     out
 }
 
-/// One hex digit. The language formats an integer in decimal and a `bytes` in
-/// hex, and offers no way to ask for a different radix, so a program that wants
-/// to print a packet ID the way every other DNS tool prints it writes this.
-fn hex_digit(n: i64) -> str {
-    "0123456789abcdef".substr(n.bit_and(15), 1)
-}
-
+/// Two hex digits, zero-padded. `to_base` gives the digits ([L-LIB-BASE]); the
+/// padding is what a packet dump needs and a number does not have.
 fn hex_byte(n: i64) -> str {
-    hex_digit(n.ushr(4)) + hex_digit(n)
+    n.to_base(16).pad_start(2, "0")
 }
 
 fn hex16(n: i64) -> str {
-    hex_byte(n.ushr(8)) + hex_byte(n)
+    n.to_base(16).pad_start(4, "0")
 }
 
 fn hex(b: bytes, count: i64) -> str {

@@ -2375,6 +2375,8 @@ and `trim` cannot tell you that.
 | `s.repeat(n)` | `(i64) -> str` | |
 | `s.pad_start(w, fill)`, `s.pad_end(w, fill)` | `(i64, str) -> str` | fill repeats and is cut to width ([E-PAD-CYCLE]) |
 | `s.parse_int()` | `-> Option[i64]` | surrounding space and a leading `+` are accepted; `1_000` and `0xFF` are **not** ([L-LIB-PARSE]) |
+| `n.to_base(b)` | `(i64) -> str` | digits `0-9a-z`; a base outside `2..36` panics ([L-LIB-BASE]) |
+| `s.parse_int_base(b)` | `(i64) -> Option[i64]` | the other direction; no prefix accepted ([L-LIB-BASE]) |
 | `s.parse_float()` | `-> Option[f64]` | accepts `inf`, `-inf`, `nan`; overflow gives an infinity, not `None` ([L-LIB-PARSE]) |
 | `x.is_nan()`, `x.is_finite()` | `-> bool` | what `parse_float` makes necessary ([L-LIB-PARSE]) |
 | `s.code_at(i)` | `(i64) -> i64` | Unicode code point of character `i`; panics out of range ([L-LIB-CODES]) |
@@ -2644,6 +2646,28 @@ error: package `lib` performs `net` but its manifest only permits `io`
   help: either add the capability to that package's manifest, or stop it from
         performing the effect
 ```
+
+**[L-LIB-BASE]** `n.to_base(b)` writes an integer in base `b` and
+`s.parse_int_base(b)` reads one back. Digits are `0-9a-z`, lower case, and a
+negative number gets a leading `-`.
+
+Base ten is not the only base a systems program needs. Every protocol, hash,
+colour and permission mask is read and written in hex or binary — the same
+programs that needed [L-LIB-BITS] — and without these, printing a packet ID the
+way every other tool prints it means hand-writing a digit table.
+
+A base outside `2..36` **panics** rather than answering. There is no right
+answer to return and a wrong one would be silently wrong, which is the same
+reasoning as `code_at` panicking out of range.
+
+Neither side writes or accepts a prefix. The base is the argument, not something
+to be guessed from the text: `"ff".parse_int_base(16)` is `Some(255)` and
+`"0xff".parse_int_base(16)` is `None`. That keeps it consistent with `parse_int`,
+which refuses `0xFF` ([L-LIB-PARSE]) — the difference is now that a program can
+say which base it means instead of being stuck with one.
+
+`to_base(10)` and `to_str` agree, including at `i64::MIN`, which is converted
+through its unsigned magnitude because negating it overflows.
 
 ## Bit manipulation — [L-LIB-BITS]
 
