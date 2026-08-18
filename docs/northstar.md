@@ -140,6 +140,28 @@ construction to one interpolation instead of a concatenation changed the time by
 nothing; and replacing the `RefCell` borrow that every allocation makes with a
 plain counter measured **zero** on a benchmark that allocates 800,000 times.
 
+**Fixed, 2026-08-18: `m.get(k) ?? d` no longer builds an `Option`.** 149 ms to
+116 ms on `wordfreq`, and the gap to the fastest implementation narrows from
+4.6x to 3.6x.
+
+`grasm_map_get` returned `Some(v)` — an `RtVal` *and* a `Vec` for its one field —
+which `??` unwrapped and freed on the very next instruction. Measured over two
+million lookups, that wrapper cost ~85 ns each, three times the lookup it wrapped.
+The runtime now answers with a null pointer when the key is absent and the
+backend branches on that, so nothing is allocated.
+
+The branch is kept deliberately. `??` is lazy, and a fused form that evaluated its
+default eagerly would change what `m.get(k) ?? fail(e)` means — which
+`spec/conformance/E-COALESCE-DIVERGE.gr` caught when a first version did exactly
+that.
+
+Getting it to fire needed the checker's help. The backend's type probe is
+structural, so for `var counts = map()` it sees `map()` and learns nothing; the
+value type comes from later use. The checker now publishes it, resolved *after*
+inference finishes rather than at the call site, where it is still a variable.
+Without that the optimisation fired on annotated maps and declined on inferred
+ones, which is the common case: 146 ms against 113 ms for the same program.
+
 **Measured decomposition, 2026-08-18.** The claim above — that what is left is
 string boxing — is only half right, and the half it gets wrong matters. Splitting
 the benchmark into its parts and timing each back to back:

@@ -96,6 +96,20 @@ pub struct Analysis {
     /// wrapped branch also matched the `0` inside it — and the interpreter
     /// wrapped that instead, then tried to subtract `7` from `Ok(0)`.
     pub ok_wrapped: std::collections::HashSet<(u32, u32)>,
+    /// For each `m.get(k)` whose receiver is a map, the map's **value type**,
+    /// encoded as one byte.
+    ///
+    /// The backend's own type probe is structural, so for `var m = map()` it
+    /// sees `map()` and learns nothing — the real type comes from how the map
+    /// is used later, which only the checker knows. Without this the
+    /// `m.get(k) ?? d` fusion fires on annotated maps and silently declines on
+    /// inferred ones, which is the common case.
+    ///
+    /// One byte rather than a `Type`, so the backend needs no general
+    /// `Type` -> `VType` conversion for a table this narrow. `0` = i64,
+    /// `1` = f64, `2` = bool, `3` = str, `4` = bytes; anything else is absent
+    /// and the fusion declines.
+    pub map_get_value_kind: std::collections::HashMap<(u32, u32), u8>,
     /// The effect row of every function-valued expression, and of every call
     /// whose callee is not an expression of its own. See `value_tables`.
     pub value_rows: SpanMap<std::collections::BTreeSet<String>>,
@@ -242,6 +256,23 @@ const BUILTIN_FREE_FNS: &[&str] = &[
     "assert_eq",
 ];
 
+/// The one-byte encoding of a map's value type, for `map_get_value_kind`.
+///
+/// Deliberately narrow: only the types the backend can carry through the fused
+/// `m.get(k) ?? d` path without a general `Type` -> `VType` conversion. Anything
+/// else answers `None` and the fusion declines, which costs an allocation and
+/// never a wrong answer.
+fn map_value_kind(t: &Type) -> Option<u8> {
+    Some(match t {
+        Type::I64 => 0,
+        Type::F64 => 1,
+        Type::Bool => 2,
+        Type::Str => 3,
+        Type::Bytes => 4,
+        _ => return None,
+    })
+}
+
 pub fn check_program(program: &crate::loader::Program) -> Analysis {
     let files: Vec<ModuleView> = program
         .files
@@ -381,6 +412,14 @@ fn check_modules_in(
     // sort is stable, so a diagnostic and the one deliberately emitted right
     // after it at the same span keep their order.
     diagnostics.sort_by_key(|d| d.span.start);
+    // Inference has finished, so the value types recorded at each `m.get(k)`
+    // can be resolved now. Doing it at the call site answers "unknown" for
+    // every map whose type comes from later use, which is most of them.
+    let map_get_value_kind: std::collections::HashMap<(u32, u32), u8> = c
+        .map_get_pending
+        .iter()
+        .filter_map(|(span, t)| map_value_kind(&c.uni.resolve(t)).map(|k| (*span, k)))
+        .collect();
     Analysis {
         const_types: c
             .consts
@@ -393,6 +432,7 @@ fn check_modules_in(
         callee_rows: c.callee_rows.clone(),
         field_calls: c.field_calls.clone(),
         ok_wrapped: c.ok_wrapped,
+        map_get_value_kind,
         fallible_closures: c
             .closure_types
             .iter()
@@ -462,6 +502,8 @@ struct Checker {
     closure_rows: HashMap<u32, std::collections::BTreeSet<String>>,
     /// See `Analysis::ok_wrapped`.
     ok_wrapped: std::collections::HashSet<(u32, u32)>,
+    /// `m.get(k)` sites and their value types, resolved once inference ends.
+    map_get_pending: Vec<((u32, u32), Type)>,
     /// Every closure literal's return type, by start offset, resolved once
     /// the whole program is typed.
     closure_types: HashMap<u32, Type>,
@@ -675,6 +717,7 @@ impl Checker {
             fn_rows: HashMap::new(),
             closure_rows: HashMap::new(),
             ok_wrapped: std::collections::HashSet::new(),
+            map_get_pending: Vec::new(),
             closure_types: HashMap::new(),
             hof_closures: std::collections::HashSet::new(),
             handler_ids: std::collections::HashSet::new(),
@@ -6153,6 +6196,17 @@ Perform the effect after the closing brace, or yield a number and do the work ou
                             self.check_expr(&args[0], &k);
                             self.require_map_key(&k, span);
                         }
+                        // Recorded for the backend, which cannot work this out
+                        // for itself: its type probe is structural, so a map
+                        // built by `var m = map()` and typed by later use looks
+                        // like nothing in particular. See `map_get_value_kind`.
+                        // The type is recorded, not yet decoded: for `var m =
+                        // map()` the value type is still an inference variable
+                        // here and only becomes `i64` once the rest of the
+                        // function has been seen. Decoding now would answer
+                        // "unknown" for exactly the case this table exists for.
+                        self.map_get_pending
+                            .push(((span.start, span.end), v.clone()));
                         self.defs.option_some(v)
                     }
                     "has" => {

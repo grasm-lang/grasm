@@ -307,6 +307,7 @@ fn compile_object_scoped(
     let mut cg = Codegen::new(&mut module);
     let analysis = grasm_sema::check::check_program(program);
     cg.float_literals = analysis.float_literals;
+    cg.map_get_value_kind = analysis.map_get_value_kind;
     cg.field_calls = analysis.field_calls;
     cg.fallible_closures = analysis.fallible_closures;
     cg.empty_types = analysis.empty_types;
@@ -444,6 +445,9 @@ struct Codegen<'m> {
     /// The checker already knows which literals are floats; asking it once is
     /// both correct and the same answer the interpreter gets.
     float_literals: std::collections::HashSet<u32>,
+    /// The value type of each `m.get(k)`, from the checker. See
+    /// `Analysis::map_get_value_kind`.
+    map_get_value_kind: std::collections::HashMap<(u32, u32), u8>,
     /// Method calls the checker resolved to a struct field holding a function.
     /// See the UFCS branch of the method-call lowering.
     field_calls: grasm_sema::check::SpanSet,
@@ -535,6 +539,7 @@ impl<'m> Codegen<'m> {
             pending_generics: Vec::new(),
             generic_subst: HashMap::new(),
             float_literals: std::collections::HashSet::new(),
+            map_get_value_kind: std::collections::HashMap::new(),
             field_calls: Default::default(),
             fallible_closures: std::collections::HashSet::new(),
             empty_types: std::collections::HashMap::new(),
@@ -621,6 +626,7 @@ impl<'m> Codegen<'m> {
             ("grasm_map_has", vec![i64t, i64t], Some(i8t)),
             ("grasm_map_delete", vec![i64t, i64t, ptr], Some(i64t)),
             ("grasm_map_len", vec![i64t], Some(i64t)),
+            ("grasm_map_get_ptr", vec![i64t, i64t], Some(i64t)),
             ("grasm_map_keys", vec![i64t], Some(i64t)),
             ("grasm_map_values", vec![i64t], Some(i64t)),
             ("grasm_map_entries", vec![i64t], Some(i64t)),
@@ -7999,6 +8005,15 @@ checker did",
     }
 
     fn eval_coalesce(&mut self, lhs: &Expr, rhs: &Expr, span: Span) -> CResult<(Value, VType)> {
+        // `m.get(k) ?? d` is fused into one call that never builds the
+        // `Option`. Constructing it costs an `RtVal` *and* a `Vec` for its one
+        // field, both freed again by the very next operation — measured at
+        // ~85 ns per lookup over two million of them, three times the cost of
+        // the lookup itself. Counting loops and table reads with a fallback are
+        // among the most common things anyone writes.
+        if let Some(fused) = self.fused_map_get_or(lhs, rhs)? {
+            return Ok(fused);
+        }
         let (lv, lt) = self.eval_expr_val(lhs)?;
         match lt {
             VType::Option(payload_t) => self.coalesce_values(lv, &payload_t, rhs),
@@ -8008,6 +8023,104 @@ checker did",
             VType::Fallible(ok_t, _) => self.coalesce_fallible(lv, &ok_t, rhs),
             _ => nope(span, "?? on values that are neither Option nor fallible"),
         }
+    }
+
+    /// Recognises `m.get(k) ?? d` and lowers it without building an `Option`.
+    ///
+    /// Returns `None` when the shape does not match, so every other `??` takes
+    /// the ordinary path. The receiver must actually be a map: `??` also applies
+    /// to fallible values and to `Option`s from elsewhere.
+    ///
+    /// The branch is kept. `??` is lazy — the ordinary lowering evaluates the
+    /// default only in the `none` block — so an eagerly evaluated default would
+    /// change what `m.get(k) ?? panic("missing")` does. The runtime answers with
+    /// a null pointer instead of an `Option`, and the branch is on that.
+    fn fused_map_get_or(
+        &mut self,
+        lhs: &Expr,
+        rhs: &Expr,
+    ) -> CResult<Option<(Value, VType)>> {
+        let Expr::MethodCall { recv, name, args, .. } = lhs else {
+            return Ok(None);
+        };
+        if name.name != "get" || args.len() != 1 {
+            return Ok(None);
+        }
+        // The checker's answer first: its type is the real one, and for a map
+        // built by `var m = map()` the structural probe below sees only
+        // `map()` and learns nothing.
+        let from_checker = self
+            .cg
+            .map_get_value_kind
+            .get(&(lhs.span().start, lhs.span().end))
+            .and_then(|k| match k {
+                0 => Some(VType::I64),
+                1 => Some(VType::F64),
+                2 => Some(VType::Bool),
+                3 => Some(VType::Str),
+                4 => Some(VType::Bytes),
+                _ => None,
+            });
+        let out_t = match from_checker {
+            Some(t) => t,
+            None => match self.probe_type(recv)? {
+                VType::Map(_, v) if *v != VType::Any => *v,
+                _ => return Ok(None),
+            },
+        };
+
+        let (mv, _) = self.eval_expr_val(recv)?;
+        let (kv, kt) = self.eval_expr_val(&args[0])?;
+        let boxed_k = self.box_value(kv, &kt);
+        let found = self
+            .call_rt("grasm_map_get_ptr", &[mv, boxed_k])
+            .unwrap();
+        self.call_rt("grasm_val_dec", &[mv]);
+        self.call_rt("grasm_val_dec", &[boxed_k]);
+
+        let present = self.b.create_block();
+        let absent = self.b.create_block();
+        let merge = self.b.create_block();
+        self.b.append_block_param(merge, out_t.cl());
+        let null = self.b.ins().iconst(types::I64, 0);
+        let is_some = self.b.ins().icmp(IntCC::NotEqual, found, null);
+        self.b.ins().brif(is_some, present, &[], absent, &[]);
+        self.filled = true;
+
+        self.goto_block(present);
+        let (v, _) = self.unbox(found, &out_t)?;
+        self.b.ins().jump(merge, &[v]);
+        self.filled = true;
+
+        // The default is lowered here and nowhere else, so it runs only when
+        // the key was missing.
+        //
+        // It may also *leave* rather than produce a value — `m.get(k) ?? fail(e)`
+        // and `?? return d` are the shape most fallible bodies take — in which
+        // case the block is already terminated and nothing reaches the merge.
+        // Emitting the jump anyway is a verifier error, which is what
+        // `spec/conformance/E-COALESCE-DIVERGE.gr` caught.
+        self.goto_block(absent);
+        match self.eval_expr_expecting_opt(rhs, Some(&out_t))? {
+            Some((mut dv, dvt)) => {
+                if out_t == VType::F64 && dvt == VType::I64 {
+                    dv = self.b.ins().fcvt_from_sint(types::F64, dv);
+                }
+                self.b.ins().jump(merge, &[dv]);
+                self.filled = true;
+            }
+            None => {
+                if !self.filled {
+                    let zero = self.zero_of(&out_t);
+                    self.b.ins().jump(merge, &[zero]);
+                    self.filled = true;
+                }
+            }
+        }
+
+        self.goto_block(merge);
+        let out = self.b.block_params(merge)[0];
+        Ok(Some((out, out_t)))
     }
 
     /// `e ?? d` where `e` is fallible. Consumes the owned value `lv`.

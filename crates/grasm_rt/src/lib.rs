@@ -2280,7 +2280,38 @@ pub unsafe extern "C" fn grasm_map_set(
     target
 }
 
-/// # Safety: live pointers; returns Option variant (+1).
+/// The value for `k`, or **null** when absent — no `Option` built.
+///
+/// `grasm_map_get` builds a `Some`: an `RtVal` *and* a `Vec` for its one field,
+/// both freed again by the very next operation. Measured over two million
+/// lookups the wrapper cost ~85 ns each, three times the lookup it wrapped, and
+/// `m.get(k) ?? d` is among the most common things anyone writes — counting,
+/// defaulting, reading a table with a fallback.
+///
+/// Null rather than an `Option` so the caller can branch on it and evaluate its
+/// default **only when the key is missing**. `??` is lazy, and a fused form that
+/// evaluated the default eagerly would change what `m.get(k) ?? panic("...")`
+/// means.
+///
+/// # Safety: called from compiled Grasm with boxed values.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_map_get_ptr(m: *mut RtVal, k: *mut RtVal) -> *mut RtVal {
+    let RtPayload::Map(entries) = &(*m).payload else {
+        grasm_panic_msg_str("get on non-map");
+    };
+    match with_key(k, |kk| entries.get(kk).copied()) {
+        Some(ev) => {
+            inc(ev);
+            ev
+        }
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// The value for `k` as an `Option`. Still needed: `m.get(k)` used on its own,
+/// bound to a name, or matched on takes this path.
+///
+/// # Safety: called from compiled Grasm with boxed values.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_map_get(m: *mut RtVal, k: *mut RtVal) -> *mut RtVal {
     let RtPayload::Map(entries) = &(*m).payload else {
