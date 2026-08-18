@@ -29,7 +29,7 @@ Re-run with `./run.sh`.
 | 14 | Game of Life | ✅ | — |
 | 15 | Sorting Benchmark | ✅ | consumed **F7**; `eprint` shipped |
 | 16 | Key-Value Database | ✅ | — |
-| 17 | Simple Shell | ⛔ | **F8** `extern fn` carries only `i64`/`f64` |
+| 17 | Simple Shell | ✅ | consumed **F8**'s blocker via `proc`; found **F20** |
 | 18 | Image Converter | ✅ | consumed **F9**; writes a BMP `file(1)` identifies |
 | 19 | Event Emitter | ✅ | **F10** a `ref` to a scalar can never be read |
 | 20 | Expression REPL | ✅ | — |

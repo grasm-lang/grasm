@@ -3540,3 +3540,54 @@ fn every_diagnostic_span_covers_real_source() {
         }
     }
 }
+
+/// Every callable builtin must also be a *reserved* name.
+///
+/// These were two hand-written lists. They drifted: the whole `tcp_*` family
+/// was callable and none of it was reserved, so a program could declare
+/// `fn tcp_read` and watch the builtin answer instead. Adding `run` for
+/// [L-LIB-PROC] hit the same seam from the other side — the name became
+/// callable, two programs that already had a `fn run` kept compiling, and their
+/// own function stopped being reached.
+///
+/// The lists are one list now, so this cannot drift again by construction. The
+/// test is here because "cannot drift by construction" is a property of today's
+/// code and this is what makes it a property of tomorrow's.
+#[test]
+fn every_callable_builtin_is_a_reserved_name() {
+    for name in grasm_sema::check::BUILTIN_FREE_FNS {
+        let src = format!("fn {name}() {{\n}}\n\nfn main() {{\n}}\n");
+        check_err(&src, "is built in");
+    }
+}
+
+/// A builtin's name must be one nobody would reasonably want.
+///
+/// Reserving a name is permanent and total: a program cannot declare it, cannot
+/// work around it, and gets a compile error rather than a deprecation. `run` was
+/// added as a builtin and immediately took a name two programs on this repo's
+/// own list were already using — which is the cheapest possible warning that the
+/// name was wrong, and it only arrived because those programs are in the gate.
+///
+/// So builtins are `verb_noun`: `read_file`, `write_bytes`, `tcp_listen`,
+/// `udp_bind`, `run_program`. The bare verbs a program is likely to want —
+/// `run`, `send`, `open`, `close`, `read`, `write`, `start`, `stop`, `wait`,
+/// `execute` — stay available.
+#[test]
+fn builtins_do_not_take_names_a_program_would_want() {
+    const WANTED: &[&str] = &[
+        "run", "send", "open", "close", "read", "write", "start", "stop", "wait", "execute",
+        "step", "next", "get", "set", "add", "push", "pop", "find", "parse", "format", "log",
+        "init", "update", "check", "process", "handle", "make", "build",
+    ];
+    let taken: Vec<&str> = WANTED
+        .iter()
+        .copied()
+        .filter(|w| grasm_sema::check::BUILTIN_FREE_FNS.contains(w))
+        .collect();
+    assert!(
+        taken.is_empty(),
+        "these builtin names are ordinary words a program would want for its \
+own functions, and reserving one is permanent: {taken:?}"
+    );
+}

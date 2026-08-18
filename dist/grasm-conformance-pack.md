@@ -3562,6 +3562,61 @@ fn main() {
 }
 ```
 
+## `L-LIB-PROC.gr`
+
+```grasm
+//! tag: L-LIB-PROC
+//! expect: output
+//! echo: code 0 out "hello world" err empty
+//! exit status is carried: 3
+//! stderr is separate from stdout: to-err
+//! arguments do not go through a shell: a b;c
+//! a program that cannot be started is an Err: true
+//! and that is different from one that ran and failed: 1
+// Running another program, under a capability of its own.
+//
+// `proc` is not `io` and not `net`. It is strictly larger than either: a
+// program that can run `curl` has the network whether or not it declared
+// `net`. The tools used here are the ones POSIX guarantees.
+fn main() / {io, proc} {
+    match run_program("echo", ["hello", "world"]) {
+        Err(e) -> print("echo failed")
+        Ok(r) -> print("echo: code {r.0} out \"{r.1.trim()}\" err {if r.2.len() == 0 { "empty" } else { r.2 }}")
+    }
+
+    match run_program("sh", ["-c", "exit 3"]) {
+        Err(e) -> print("sh failed")
+        Ok(r) -> print("exit status is carried: {r.0}")
+    }
+
+    // The two streams do not run together, which is the reason they are
+    // returned separately rather than joined.
+    match run_program("sh", ["-c", "echo to-err 1>&2"]) {
+        Err(e) -> print("sh failed")
+        Ok(r) -> print("stderr is separate from stdout: {r.2.trim()}{r.1.trim()}")
+    }
+
+    // Arguments are passed as a list, never through a shell, so a `;` in one of
+    // them is a character and not a command separator.
+    match run_program("echo", ["a", "b;c"]) {
+        Err(e) -> print("echo failed")
+        Ok(r) -> print("arguments do not go through a shell: {r.1.trim()}")
+    }
+
+    // Not being able to start a program is a different thing from a program
+    // that ran and returned a failure, and the two are not confusable.
+    let missing = match run_program("no-such-program-anywhere", []) {
+        Err(e) -> true
+        Ok(r) -> false
+    }
+    print("a program that cannot be started is an Err: {missing}")
+    match run_program("sh", ["-c", "exit 1"]) {
+        Err(e) -> print("sh failed")
+        Ok(r) -> print("and that is different from one that ran and failed: {r.0}")
+    }
+}
+```
+
 ## `L-LIB-RANGE-OPS.gr`
 
 ```grasm

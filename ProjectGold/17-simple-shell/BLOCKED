@@ -1,1 +1,0 @@
-extern fn takes only i64/f64, so libc's process functions are unreachable (F8)

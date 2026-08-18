@@ -711,6 +711,7 @@ impl<'m> Codegen<'m> {
             ("grasm_net_close", vec![i64t], None),
             ("grasm_net_wait", vec![i64t, i64t], Some(i64t)),
             ("grasm_net_port", vec![i64t], Some(i64t)),
+            ("grasm_proc_run", vec![i64t, i64t], Some(i64t)),
             ("grasm_udp_bind", vec![i64t], Some(i64t)),
             ("grasm_udp_recv", vec![i64t], Some(i64t)),
             ("grasm_udp_send", vec![i64t, i64t, i64t, i64t], Some(i64t)),
@@ -7524,6 +7525,22 @@ checker did",
                     ),
                 )));
             }
+            "run_program" => {
+                let (cv, ct) = self.eval_expr_val(&args[0])?;
+                let boxed_c = self.box_value(cv, &ct);
+                let (av, at) = self.eval_expr_val(&args[1])?;
+                let boxed_a = self.box_value(av, &at);
+                let v = self.call_rt("grasm_proc_run", &[boxed_c, boxed_a]).unwrap();
+                self.call_rt("grasm_val_dec", &[boxed_c]);
+                self.call_rt("grasm_val_dec", &[boxed_a]);
+                return Ok(Some((
+                    v,
+                    VType::Fallible(
+                        Box::new(VType::Tuple(vec![VType::I64, VType::Str, VType::Str])),
+                        Box::new(VType::Sum("IoError".into())),
+                    ),
+                )));
+            }
             // Readiness. The handles arrive as an ordinary `[i64]`, which the
             // backend represents as an *unboxed scalar* list, and the runtime
             // hands one back in the same shape — so the answer can be indexed
@@ -8798,6 +8815,14 @@ checker did",
                             )),
                             "tcp_read" => Some(VType::Fallible(
                                 Box::new(VType::Str),
+                                Box::new(VType::Sum("IoError".into())),
+                            )),
+                            "run_program" => Some(VType::Fallible(
+                                Box::new(VType::Tuple(vec![
+                                    VType::I64,
+                                    VType::Str,
+                                    VType::Str,
+                                ])),
                                 Box::new(VType::Sum("IoError".into())),
                             )),
                             "udp_recv" => Some(VType::Fallible(

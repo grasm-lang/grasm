@@ -1,0 +1,238 @@
+// A shell — command parsing, process execution, exit statuses, built-ins.
+//
+// A shell's one irreducible operation is starting another program, and this
+// project was blocked because Grasm had no way to. `extern fn` carries scalars
+// only, so `system`, `execv`, `fork` and `popen` — all of which take pointers —
+// were unreachable (FINDINGS.md F8).
+//
+// The answer was not to widen the C boundary. It was `run_program(program, args)` under
+// a capability of its own ([L-LIB-PROC]): `proc` is strictly larger than `io`
+// or `net`, because a program that can start `curl` has the network whether or
+// not it declared `net`. This file declares `/ {io, proc}`, and a package that
+// never asked for `proc` could not contain it.
+//
+//     grasm run main.gr            a fixed script, so all three engines agree
+//     grasm run main.gr -- repl    an interactive shell
+//
+// The parsing is the half most likely to be quietly wrong, so it is pure, and
+// tested here on every run against inputs chosen to break it.
+
+// --- parsing ---------------------------------------------------------------
+//
+// A shell that splits on spaces cannot open a file whose name has one in it,
+// which is most files a person actually has. So quoting is part of the parser
+// rather than something added later.
+
+type Line = {
+    words: [str],
+    ok: bool,
+    why: str,
+}
+
+fn parse(src: str) -> Line {
+    var words: [str] = []
+    var current = ""
+    var has_current = false
+    var quote = ""          // "" means not inside quotes
+    var escaped = false
+
+    for ch in src.chars() {
+        if escaped {
+            current = current + ch
+            has_current = true
+            escaped = false
+        } else if ch == "\\" and quote != "'" {
+            // A backslash is literal inside single quotes, as in POSIX.
+            escaped = true
+            has_current = true
+        } else if quote != "" {
+            if ch == quote {
+                quote = ""
+            } else {
+                current = current + ch
+            }
+        } else if ch == "\"" or ch == "'" {
+            quote = ch
+            has_current = true
+        } else if ch == " " or ch == "\t" {
+            if has_current {
+                words = words + [current]
+                current = ""
+                has_current = false
+            }
+        } else {
+            current = current + ch
+            has_current = true
+        }
+    }
+
+    if escaped {
+        return Line{ words: [], ok: false, why: "line ends in a backslash" }
+    }
+    if quote != "" {
+        return Line{ words: [], ok: false, why: "unclosed {quote} quote" }
+    }
+    if has_current {
+        words = words + [current]
+    }
+    Line{ words: words, ok: true, why: "" }
+}
+
+fn show(label: str, src: str) / {io} {
+    let line = parse(src)
+    if not line.ok {
+        print("  {label}: error — {line.why}")
+    } else {
+        var out = ""
+        for w in line.words {
+            out = out + "[" + w + "]"
+        }
+        print("  {label}: {line.words.len()} -> {if out == "" { "(nothing)" } else { out }}")
+    }
+}
+
+// --- running ---------------------------------------------------------------
+
+type Shell = {
+    cwd: str,
+    last_status: i64,
+    going: bool,
+}
+
+/// The built-ins, which exist because they *cannot* be programs.
+///
+/// `cd` has to change this process's idea of where it is, and a child process
+/// cannot do that for its parent — a `/bin/cd` would change its own directory
+/// and exit. `exit` and `status` are the same shape of thing.
+fn builtin(sh: Shell, words: [str]) -> (Shell, bool) / {io} {
+    let name = words[0]
+    if name == "exit" {
+        return (Shell{ cwd: sh.cwd, last_status: sh.last_status, going: false }, true)
+    }
+    if name == "status" {
+        print("{sh.last_status}")
+        return (sh, true)
+    }
+    if name == "cd" {
+        let target = if words.len() > 1 { words[1] } else { "/" }
+        // `cd` is tracked rather than performed: `run_program` starts each program in
+        // this process's directory, and nothing here can change that. What the
+        // shell can honestly offer is to pass it on, which the `pwd` built-in
+        // reports.
+        return (Shell{ cwd: target, last_status: 0, going: sh.going }, true)
+    }
+    if name == "pwd" {
+        print("{sh.cwd}")
+        return (sh, true)
+    }
+    (sh, false)
+}
+
+fn execute(sh: Shell, src: str) -> Shell / {io, proc} {
+    let line = parse(src)
+    if not line.ok {
+        print("parse error: {line.why}")
+        return Shell{ cwd: sh.cwd, last_status: 2, going: sh.going }
+    }
+    if line.words.len() == 0 {
+        return sh
+    }
+
+    let handled = builtin(sh, line.words)
+    if handled.1 {
+        return handled.0
+    }
+
+    var rest: [str] = []
+    for i in 1..line.words.len() {
+        rest = rest + [line.words[i]]
+    }
+
+    match run_program(line.words[0], rest) {
+        // A program that cannot be started is a different thing from one that
+        // ran and failed, and a shell that conflated them would report "command
+        // not found" for a command that ran and returned 127.
+        Err(e) -> {
+            print("{line.words[0]}: not found")
+            Shell{ cwd: sh.cwd, last_status: 127, going: sh.going }
+        }
+        Ok(r) -> {
+            // Output is captured, not inherited ([L-LIB-PROC]), so the shell
+            // decides where it goes — which is also what lets it be examined.
+            if r.1.len() > 0 {
+                print("{r.1.trim_end()}")
+            }
+            if r.2.len() > 0 {
+                eprint("{r.2.trim_end()}")
+            }
+            Shell{ cwd: sh.cwd, last_status: r.0, going: sh.going }
+        }
+    }
+}
+
+// --- the fixed script ------------------------------------------------------
+
+fn demo() / {io, proc} {
+    print("--- parsing ---")
+    show("plain", "ls -l /tmp")
+    show("extra space", "   echo    a     b   ")
+    show("empty", "")
+    show("double quotes", "echo \"hello world\"")
+    show("single quotes", "echo 'a b c'")
+    show("quote inside word", "echo pre\"fix and\"post")
+    show("escaped space", "echo one\\ word")
+    show("escaped quote", "echo \"say \\\"hi\\\"\"")
+    show("backslash in single quotes", "echo 'a\\b'")
+    show("unclosed double", "echo \"oops")
+    show("unclosed single", "echo 'oops")
+    show("trailing backslash", "echo a\\")
+
+    print("--- built-ins ---")
+    var sh = Shell{ cwd: "/", last_status: 0, going: true }
+    sh = execute(sh, "pwd")
+    sh = execute(sh, "cd /tmp")
+    sh = execute(sh, "pwd")
+    sh = execute(sh, "status")
+
+    print("--- running programs ---")
+    sh = execute(sh, "echo hello from a child process")
+    sh = execute(sh, "status")
+    sh = execute(sh, "sh -c 'exit 7'")
+    sh = execute(sh, "status")
+    sh = execute(sh, "no-such-program-anywhere")
+    sh = execute(sh, "status")
+
+    print("--- quoting reaches the child ---")
+    // The point of parsing quotes: this is one argument, and a shell that
+    // split on spaces would pass three.
+    sh = execute(sh, "echo \"a b c\"")
+    sh = execute(sh, "echo 'semi;colon'")
+
+    print("--- exit ---")
+    sh = execute(sh, "exit")
+    print("still going: {sh.going}")
+}
+
+fn repl() / {io, proc} {
+    print("grasm shell — `exit` to leave")
+    var sh = Shell{ cwd: "/", last_status: 0, going: true }
+    while sh.going {
+        // `input()` answers with the empty string at end of input, which is
+        // also what a blank line gives — a shell treats both as "carry on",
+        // and end of input is reached through `exit`.
+        let line = input()
+        if line == "" {
+            sh = Shell{ cwd: sh.cwd, last_status: sh.last_status, going: false }
+        } else {
+            sh = execute(sh, line)
+        }
+    }
+}
+
+fn main() / {io, proc} {
+    if args().contains("repl") {
+        repl()
+        return
+    }
+    demo()
+}

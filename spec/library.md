@@ -567,6 +567,39 @@ say which base it means instead of being stuck with one.
 `to_base(10)` and `to_str` agree, including at `i64::MIN`, which is converted
 through its unsigned magnitude because negating it overflows.
 
+## Processes — [L-LIB-PROC]
+
+**[L-LIB-PROC]** `run_program(program, args)` runs another program to completion and
+answers with `(exit code, stdout, stderr)`:
+
+| | type | |
+|---|---|---|
+| `run_program(prog, args)` | `(str, [str]) -> (i64, str, str) ! IoError` | performs `proc` |
+
+**`proc` is a capability of its own, and it is strictly larger than `io` or
+`net`.** A program that can run `curl` has the network whether or not it
+declared `net`; one that can run `rm` has the filesystem. Folding process
+execution into `io` would make every capability claim in the language weaker
+than it reads — a package's manifest could say `io` and mean everything.
+
+The result is a **tuple, not a new type**. Three values with obvious positions
+did not need a name, and inventing one would have put a type in the prelude that
+nothing else uses.
+
+**Output is captured, not inherited.** A builtin that wrote to the parent's
+stdout would make the three engines disagree about ordering, because the child's
+writes and the parent's go through different buffers. A caller that wants the
+output shown prints it, which also means it can be examined first.
+
+`args` are passed as a list and never through a shell, so a filename containing
+a space or a `;` is one argument and not an injection. A program that genuinely
+wants shell semantics asks for them: `run_program("sh", ["-c", line])`.
+
+An exit code of **`-1`** means a signal killed the process. No process can exit
+with `-1`, so it cannot be confused for a status the program chose. A program
+that could not be started at all is an `IoFailed` naming it, which is a
+different thing from a program that ran and failed.
+
 ## Bit manipulation — [L-LIB-BITS]
 
 **[L-LIB-BITS]** Seven methods on `i64`:

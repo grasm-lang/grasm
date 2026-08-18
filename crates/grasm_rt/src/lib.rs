@@ -4337,6 +4337,51 @@ pub unsafe extern "C" fn grasm_tcp_write(handle: *mut RtVal, data: *mut RtVal) -
     }
 }
 
+// ---------------------------------------------------------------------------
+// Processes — the `proc` capability
+// ---------------------------------------------------------------------------
+//
+// Running another program is not `io` and it is not `net`. It is strictly
+// larger than both: a program that can run `curl` has the network whether or
+// not it declared `net`, and a program that can run `rm` has the filesystem.
+// Folding it into `io` would have made every capability claim in the language
+// weaker than it reads, so it gets its own.
+
+/// Runs a program to completion, answering with `(exit code, stdout, stderr)`.
+///
+/// Output is captured rather than inherited, because a builtin that wrote to
+/// the parent's stdout would make the three engines disagree on ordering — the
+/// child's writes and the parent's go through different buffers. A caller that
+/// wants the output shown prints it.
+///
+/// # Safety: called from compiled Grasm with boxed values.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_proc_run(cmd: *mut RtVal, args: *mut RtVal) -> *mut RtVal {
+    let program = as_str(cmd).to_string();
+    let argv: Vec<String> = match &(*args).payload {
+        RtPayload::List(items) => items.iter().map(|&p| as_str(p).to_string()).collect(),
+        _ => return err_of(io_err("IoFailed", "run takes a list of arguments".to_string())),
+    };
+    match std::process::Command::new(&program).args(&argv).output() {
+        Ok(out) => {
+            // `None` means a signal killed it. `-1` is not a status any
+            // process can exit with, so it cannot be confused for one.
+            let code = out.status.code().map_or(-1, i64::from);
+            let fields = vec![
+                alloc(RtPayload::I64(code)),
+                alloc(RtPayload::Str(RtStr::of(&String::from_utf8_lossy(
+                    &out.stdout,
+                )))),
+                alloc(RtPayload::Str(RtStr::of(&String::from_utf8_lossy(
+                    &out.stderr,
+                )))),
+            ];
+            ok_of(alloc(RtPayload::Tuple(fields)))
+        }
+        Err(e) => err_of(io_err("IoFailed", format!("{program}: {e}"))),
+    }
+}
+
 // --- datagrams -------------------------------------------------------------
 //
 // UDP is not TCP with the reliability removed; it is a different shape. A

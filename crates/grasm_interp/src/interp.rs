@@ -2524,6 +2524,40 @@ build links it, `grasm run` can only reach what is already loaded",
                         let data = self.eval_expr(&args[3])?;
                         return Ok(self.udp_send(&h, &host, &port, &data));
                     }
+                    // Running another program. Output is captured rather than
+                    // inherited: a builtin that wrote to the parent's stdout
+                    // would make the three engines disagree on ordering,
+                    // because the child's writes and the parent's go through
+                    // different buffers ([L-LIB-PROC]).
+                    "run_program" => {
+                        let program = self.eval_expr(&args[0])?.to_string();
+                        let argv = match self.eval_expr(&args[1])? {
+                            Value::List(items) => {
+                                items.iter().map(|v| v.to_string()).collect::<Vec<String>>()
+                            }
+                            _ => Vec::new(),
+                        };
+                        let fail = |m: String| Value::Err(Rc::new(io_error("IoFailed", m)));
+                        return Ok(
+                            match std::process::Command::new(&program).args(&argv).output() {
+                                Ok(out) => {
+                                    // `None` means a signal killed it. `-1` is
+                                    // not a status any process can exit with.
+                                    let code = out.status.code().map_or(-1, i64::from);
+                                    Value::Ok(Rc::new(Value::Tuple(Rc::new(vec![
+                                        Value::Int(code),
+                                        Value::str(
+                                            String::from_utf8_lossy(&out.stdout).into_owned(),
+                                        ),
+                                        Value::str(
+                                            String::from_utf8_lossy(&out.stderr).into_owned(),
+                                        ),
+                                    ]))))
+                                }
+                                Err(e) => fail(format!("{program}: {e}")),
+                            },
+                        );
+                    }
                     "tcp_listen" | "tcp_connect" | "tcp_accept" | "tcp_read"
                     | "tcp_write" | "net_close" | "net_port" | "udp_bind"
                     | "udp_recv" => {

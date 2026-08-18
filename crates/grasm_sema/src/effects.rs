@@ -22,6 +22,15 @@ pub const ASYNC: &str = "async";
 /// together would make that sentence unsayable.
 pub const NET: &str = "net";
 
+/// Running another program. Strictly larger than either `io` or `net`: a
+/// program that can run `curl` has the network whether or not it declared
+/// `net`, and one that can run `rm` has the filesystem. Folding it into `io`
+/// would make every capability claim in the language weaker than it reads.
+pub const PROC: &str = "proc";
+
+/// The builtins that perform `proc`.
+const PROC_BUILTINS: &[&str] = &["run_program"];
+
 /// The builtins that perform `net`.
 const NET_BUILTINS: &[&str] = &[
     "tcp_listen",
@@ -190,6 +199,7 @@ pub fn effect_vocabulary(program: &crate::loader::Program) -> BTreeSet<String> {
             IO.to_string(),
             ASYNC.to_string(),
             NET.to_string(),
+            PROC.to_string(),
             UNSAFE.to_string(),
         ]
         .into();
@@ -1042,6 +1052,7 @@ once inside `main`",
                     && base != ASYNC
                     && base != UNSAFE
                     && base != NET
+                    && base != PROC
                     && !ctx.effect_names.contains(base)
                 {
                     diags.push(Diagnostic::error(
@@ -1084,7 +1095,7 @@ once inside `main`",
     if let Some(main) = ctx.fns.get("main::main") {
         let leftover: Vec<&String> = ctx.rows["main::main"]
             .iter()
-            .filter(|e| *e != IO && *e != ASYNC && *e != UNSAFE && *e != NET)
+            .filter(|e| *e != IO && *e != ASYNC && *e != UNSAFE && *e != NET && *e != PROC)
             .collect();
         if !leftover.is_empty() {
             let list = leftover
@@ -1118,7 +1129,7 @@ is installed, not around the calls to it ([E-HANDLER-OWN-ROW])",
                 collect_fn_bindings(body, &ctx, &f.name, &mut fnb);
                 walk_block(body, &f.name, &mut active, &ctx, &fnb, &mut row);
                 let leftover: Vec<&String> =
-                    row.iter().filter(|e| *e != IO && *e != ASYNC && *e != UNSAFE && *e != NET).collect();
+                    row.iter().filter(|e| *e != IO && *e != ASYNC && *e != UNSAFE && *e != NET && *e != PROC).collect();
                 if !leftover.is_empty() {
                     let list = leftover
                         .iter()
@@ -2531,6 +2542,9 @@ fn walk_expr(
                 }
                 if NET_BUILTINS.contains(&id.name.as_str()) && !active.iter().any(|a| a == NET) {
                     out.insert(NET.to_string());
+                }
+                if PROC_BUILTINS.contains(&id.name.as_str()) && !active.iter().any(|a| a == PROC) {
+                    out.insert(PROC.to_string());
                 }
                 // A C function's effects are unknowable, so it performs `io`.
                 if ctx.externs.contains(&format!("{current}::{}", id.name))

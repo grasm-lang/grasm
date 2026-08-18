@@ -176,6 +176,15 @@ MASTERPLAN G9 promises "C ABI import overhead: zero-cost" and `docs/northstar.md
 records it as *partly met*. This is how partial: the overhead is indeed zero, and
 the set of functions you can call is arithmetic.
 
+**Still open, and no longer blocking anything on this list.** 17-simple-shell
+was the project that found it, and it is now written — not by widening the C
+boundary but by adding the operation it needed to the language, under a
+capability of its own ([L-LIB-PROC]). That is the right resolution for *that*
+project and it is not a fix for this finding: every C function taking a pointer
+is still unreachable, and the next program that wants one will find it again.
+The difference is that the gap is now about reaching C rather than about what
+Grasm can do.
+
 It is also the reason several projects on this list cannot be written. A byte
 type would fix the FFI and the binary-I/O gap (F9) at the same time, since both
 want the same thing: a contiguous run of bytes with a length, that a C function
@@ -290,6 +299,68 @@ that a line *ending* in an operator continues is unchanged.
 Project 25's packet builders were rewritten as ordinary chains, which is the
 only honest test of the fix: the program that found the gap now reads the way it
 wanted to, and its output is byte-identical.
+
+## F21 — the callable builtins and the reserved names were two lists, and they had drifted (S2, checker) — **fixed**
+
+Found adding `run` for [L-LIB-PROC]. The checker had a list of builtin free
+functions a call resolves to, and a *separate*, hand-written list of names a
+program may not declare. They were meant to be the same list.
+
+They were not. The whole `tcp_*` family was callable and none of it was
+reserved, so a program could declare `fn tcp_read` and watch the builtin answer
+instead — the accepted-and-ignored failure the reserved-name rule exists to
+prevent, in the exact place it was supposed to work.
+
+Adding `run` hit the same seam from the other side: the name became callable
+and was still not reserved, so two programs on this list that already had a
+`fn run` kept compiling while their own function stopped being reached. The
+error they got was about argument counts and said nothing about a name being
+taken.
+
+**Fixed** — one list. `is_builtin_fn_name` is derived from `BUILTIN_FREE_FNS`
+rather than written out again, so the drift cannot recur, and a test asserts
+every callable builtin is reserved.
+
+### The wrong fix, and why it was reverted
+
+The first attempt made a program's own function *shadow* a builtin of the same
+name. It cost three separate edits — checker, effect pass, backend — and each
+one was a place the two could disagree. It also introduced an engine
+disagreement (`inout` write-back was lost on the shadowed path, so `grasm run`
+printed `1` where the native build printed `6`) and a performance collapse: the
+interpreter formatted a qualified name on *every* call to answer "is this
+shadowed?", and 08-fibonacci went from under a second to five minutes.
+
+All of that was solving a problem the language had already solved, better, with
+a rule and a clear error. The real defect was that `run` is a bad name for a
+builtin.
+
+### The rule that came out of it
+
+Reserving a name is permanent and total. So a builtin is named `verb_noun` —
+`read_file`, `write_bytes`, `tcp_listen`, `udp_bind`, and now `run_program` —
+and the bare verbs a program is likely to want for its own functions stay
+available. A test asserts that: `run`, `send`, `open`, `close`, `read`, `write`,
+`start`, `stop`, `wait`, `execute` and twenty more must never appear in the
+builtin list.
+
+## F20 — `run_program` captures both streams, so there can be no pipeline (S4, library)
+
+Found writing 17-simple-shell after [L-LIB-PROC] unblocked it. `run_program` waits for
+the program to finish and hands back its output, which is the right default for
+a builtin and the wrong primitive for a shell: a pipeline needs one child's
+stdout to *be* another's stdin, and redirection needs a child's descriptor
+pointed at a file. Neither is expressible when the only thing a caller gets is
+a string after the fact.
+
+So the shell has no `|`, no `>`, no `<`, no background `&` and no job control.
+
+The shape of an answer is a second builtin that starts a program without waiting
+— returning a handle the way `tcp_listen` does — with the streams as handles
+`net_wait` already understands. That would make a pipeline an ordinary program
+rather than a special form, and it is the same primitive F14 needs. It is
+deliberately not a widening of `run_program`: a call that sometimes waits and sometimes
+does not is two functions with one name.
 
 ## F19 — an integer cannot be formatted in any base but ten (S4, library) — **fixed**
 

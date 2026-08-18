@@ -228,7 +228,7 @@ fn looks_like(candidate: &str, written: &str) -> bool {
 /// The language's own free functions. Not methods: [L-UFCS] resolves method
 /// syntax against the receiver type's methods and then against functions a
 /// *program* declares, and `print` is a method of nothing.
-const BUILTIN_FREE_FNS: &[&str] = &[
+pub const BUILTIN_FREE_FNS: &[&str] = &[
     "print",
     "eprint",
     "tcp_listen",
@@ -242,6 +242,7 @@ const BUILTIN_FREE_FNS: &[&str] = &[
     "udp_bind",
     "udp_send",
     "udp_recv",
+    "run_program",
     "read_file",
     "write_file",
     "file_exists",
@@ -4355,6 +4356,27 @@ only a number or a `bool` can come out — compute what you need and yield that"
                         };
                         return Type::Fallible(Box::new(gives), Box::new(io_err));
                     }
+                    // Running another program. The result is a tuple rather
+                    // than a new struct type: three values with obvious
+                    // positions did not need a name, and inventing one would
+                    // have put a type in the prelude that nothing else uses
+                    // ([L-LIB-PROC]).
+                    "run_program" => {
+                        if args.len() != 2 {
+                            return self.error(
+                                span,
+                                "run_program takes 2 arguments (program, arguments)",
+                            );
+                        }
+                        self.check_expr(&args[0], &Type::Str);
+                        self.check_expr(&args[1], &Type::List(Box::new(Type::Str)));
+                        let io_err = Type::Named {
+                            id: self.defs.io_error_id,
+                            args: vec![],
+                        };
+                        let triple = Type::Tuple(vec![Type::I64, Type::Str, Type::Str]);
+                        return Type::Fallible(Box::new(triple), Box::new(io_err));
+                    }
                     // The primitive that lets one thread hold many
                     // conversations. Both arguments are ordinary values — a
                     // list of handles and a millisecond timeout — so readiness
@@ -8010,27 +8032,22 @@ enum PlaceSeg {
 /// Method names are deliberately absent: `xs.len()` is a method, and a free
 /// `fn len(xs: [i64])` is the ordinary UFCS extension [L-UFCS] describes.
 /// These are the names written as a plain call.
+/// Names a call resolves to before it consults any declaration.
+///
+/// Derived from `BUILTIN_FREE_FNS` rather than written out again. It *was*
+/// written out again, and the two lists drifted: `tcp_listen` and its whole
+/// family were callable builtins that a program was none the less allowed to
+/// declare, and adding `run` for [L-LIB-PROC] put a name in one list and not
+/// the other — so `fn run` compiled, was never called, and the program silently
+/// did something else. Two tables that must agree and nothing checking them is
+/// the same defect twice (see ProjectGold F17).
+///
+/// The few names here that are not free functions — `map`, `fail`, `ref`,
+/// `release`, `alive` — are handled elsewhere in `infer_call` and are listed
+/// because a call still reaches them first.
 fn is_builtin_fn_name(name: &str) -> bool {
-    matches!(
-        name,
-        "print"
-            | "assert"
-            | "assert_eq"
-            | "panic"
-            | "fail"
-            | "read_file"
-            | "write_file"
-            | "file_exists"
-            | "args"
-            | "map"
-            | "now_millis"
-            | "env"
-            | "exit"
-            | "input"
-            | "ref"
-            | "release"
-            | "alive"
-    )
+    BUILTIN_FREE_FNS.contains(&name)
+        || matches!(name, "fail" | "map" | "ref" | "release" | "alive")
 }
 
 /// Names `resolve_type` answers for before it consults any declaration.

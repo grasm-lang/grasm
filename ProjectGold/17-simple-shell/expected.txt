@@ -1,0 +1,28 @@
+--- parsing ---
+  plain: 3 -> [ls][-l][/tmp]
+  extra space: 3 -> [echo][a][b]
+  empty: 0 -> (nothing)
+  double quotes: 2 -> [echo][hello world]
+  single quotes: 2 -> [echo][a b c]
+  quote inside word: 2 -> [echo][prefix andpost]
+  escaped space: 2 -> [echo][one word]
+  escaped quote: 2 -> [echo][say "hi"]
+  backslash in single quotes: 2 -> [echo][a\b]
+  unclosed double: error — unclosed " quote
+  unclosed single: error — unclosed ' quote
+  trailing backslash: error — line ends in a backslash
+--- built-ins ---
+/
+/tmp
+0
+--- running programs ---
+hello from a child process
+0
+7
+no-such-program-anywhere: not found
+127
+--- quoting reaches the child ---
+a b c
+semi;colon
+--- exit ---
+still going: false
