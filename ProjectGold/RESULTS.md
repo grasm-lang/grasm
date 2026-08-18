@@ -1,11 +1,11 @@
 # ProjectGold — phase 1 results
 
 Thirty programs written to a list this project did not write, plus one
-experiment. **29 work and agree byte for byte across all three engines** —
-`grasm run`, `grasm build`, and `grasm build --native`. **2 are blocked**, each
-with the missing language feature named and a note on what would unblock it.
+experiment. **30 work and agree byte for byte across all three engines** —
+`grasm run`, `grasm build`, and `grasm build --native`. **1 is blocked**, with
+the missing language feature named and a note on what would unblock it.
 
-The count moved because the findings were acted on: 15, 18 and 30 were each
+The count moved because the findings were acted on: 15, 18, 25 and 30 were each
 blocked on something this list exposed, and each was unblocked by shipping the
 feature rather than by rewriting the program around the gap.
 
@@ -37,7 +37,7 @@ Re-run with `./run.sh`.
 | 22 | Multithreaded Scraper | ✅ | consumed **F11**; found **F14** no concurrent I/O |
 | 23 | Turing Machine | ✅ | — |
 | 24 | Micro VM | ✅ | — |
-| 25 | DNS Resolver | ⛔ | **F9**, **F12** no UDP |
+| 25 | DNS Resolver | ✅ | consumed **F12**; resolves against 8.8.8.8; found **F16**, **F17** |
 | 26 | Garbage Collector | ✅ | — |
 | 27 | SHA-256 | ✅ | consumed **F3**; 12/12 vectors |
 | 28 | SQL Engine | ✅ | — |
@@ -75,7 +75,8 @@ hitting them:
 4. **F7 — no stderr.** A tool cannot separate diagnostics from output.
 5. ~~**F5 — no multi-line strings.**~~ **Withdrawn** — `"""` blocks have existed
    since C20; the finding was wrong, not fixed.
-6. **F2, F6, F10, F12** — smaller.
+6. ~~**F2**~~ **fixed** (`byte_len`), ~~**F12**~~ **fixed** (UDP). **F6** and
+   **F10** remain, both smaller.
 
 ## What did not go wrong
 

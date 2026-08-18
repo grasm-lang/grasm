@@ -1,0 +1,82 @@
+//! tag: L-LIB-UDP
+//! expect: output
+//! bound two sockets
+//! sent 5 bytes
+//! ready: 1 of 1
+//! got 5 bytes: 1 2 255 0 65
+//! a stream operation on a datagram socket is an Err
+//! a datagram operation on a listener is an Err
+//! nothing more arrived
+// Datagrams: whole messages, to an address named at send time, carrying bytes.
+//
+// Both sockets ask for port 0 and read the choice back with `net_port`, so the
+// program runs on a machine where the ports it would otherwise have picked are
+// already held.
+fn spell(b: bytes) -> str {
+    var out = ""
+    for i in 0..b.len() {
+        out = out + "{b.at(i)} "
+    }
+    out.trim()
+}
+
+fn main() / {io, net} {
+    match udp_bind(0) {
+        Err(e) -> print("could not bind")
+        Ok(server) -> {
+            match udp_bind(0) {
+                Err(e) -> print("could not bind a second time")
+                Ok(client) -> {
+                    print("bound two sockets")
+                    let port = net_port(server) ?? 0
+
+                    // A packed binary payload, which is the reason the payload
+                    // type is `bytes` and not `str`: 255 and 0 are not text and
+                    // a lossy UTF-8 conversion would not return them.
+                    let msg = bytes_of([1, 2, 255, 0, 65])
+                    match udp_send(client, "127.0.0.1", port, msg) {
+                        Err(e) -> print("could not send")
+                        Ok(n) -> print("sent {n} bytes")
+                    }
+
+                    // Readiness works on a datagram handle exactly as it does
+                    // on a stream one, because they share the table.
+                    let ready = net_wait([server], 1000) ?? []
+                    print("ready: {ready.len()} of 1")
+
+                    match udp_recv(server) {
+                        Err(e) -> print("could not receive")
+                        Ok(got) -> print("got {got.len()} bytes: {spell(got)}")
+                    }
+
+                    // The kinds do not silently substitute for one another.
+                    match tcp_read(server) {
+                        Ok(_) -> print("a stream read on a datagram socket answered, which it must not")
+                        Err(e) -> print("a stream operation on a datagram socket is an Err")
+                    }
+                    match tcp_listen(0) {
+                        Err(e) -> print("could not listen")
+                        Ok(listener) -> {
+                            match udp_recv(listener) {
+                                Ok(_) -> print("a datagram read on a listener answered, which it must not")
+                                Err(e) -> print("a datagram operation on a listener is an Err")
+                            }
+                            net_close(listener)
+                        }
+                    }
+
+                    // One datagram was sent and one was received, so nothing is
+                    // left: a second `net_wait` finds the socket quiet.
+                    let again = net_wait([server], 100) ?? []
+                    if again.len() == 0 {
+                        print("nothing more arrived")
+                    } else {
+                        print("something arrived that was never sent")
+                    }
+                    net_close(client)
+                }
+            }
+            net_close(server)
+        }
+    }
+}

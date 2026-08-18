@@ -29,9 +29,12 @@ const NET_BUILTINS: &[&str] = &[
     "tcp_accept",
     "tcp_read",
     "tcp_write",
-    "tcp_close",
+    "net_close",
     "net_wait",
-    "tcp_port",
+    "net_port",
+    "udp_bind",
+    "udp_send",
+    "udp_recv",
 ];
 
 const IO_BUILTINS: &[&str] = &[

@@ -241,7 +241,12 @@ because the two disagree and only one of them stays ordered.
 ## 3. `str`
 
 **[L-LIB-STR]** Lengths and offsets are in **characters, not bytes**
-([E-STR-CHARS]).
+([E-STR-CHARS]). `s.byte_len()` is the one exception and is the only way to ask
+the other question: `"🙂".len()` is 1 and `"🙂".byte_len()` is 4. Characters are
+the right unit for a high-level language and the wrong one the moment a program
+writes a string to a socket or a file and has to say how long it is — a
+`Content-Length` counts bytes, and computing it from `len()` is wrong for every
+string that is not ASCII.
 
 **[L-LIB-TRIM-SIDES]** `trim_start` and `trim_end` remove whitespace from one
 end only; `trim` removes it from both. None of the three takes an argument —
@@ -252,6 +257,7 @@ and `trim` cannot tell you that.
 | method | type | notes |
 |--------|------|-------|
 | `s.len()` | `-> i64` | characters |
+| `s.byte_len()` | `-> i64` | bytes, for a length that goes on the wire ([L-LIB-STR]) |
 | `s.is_empty()` | `-> bool` | |
 | `s.substr(start, len)` | `(i64, i64) -> str` | **start and length**, not start and end; clamps past the end rather than panicking, unlike indexing |
 | `s.chars()` | `-> [str]` | one single-character string per element |
@@ -436,9 +442,9 @@ count in [`core.md`](core.md) does not move.
 | `tcp_accept(h)` | `(i64) -> i64 ! IoError` | waits for a connection, answering with a handle for it |
 | `tcp_read(h)` | `(i64) -> str ! IoError` | what has arrived, as text |
 | `tcp_write(h, text)` | `(i64, str) -> () ! IoError` | writes and flushes |
-| `tcp_close(h)` | `(i64) -> ()` | closes a listener or a connection |
+| `net_close(h)` | `(i64) -> ()` | closes a listener or a connection |
 | `net_wait(hs, ms)` | `([i64], i64) -> [i64] ! IoError` | the handles that can be read without waiting |
-| `tcp_port(h)` | `(i64) -> i64 ! IoError` | the local port a handle is bound to |
+| `net_port(h)` | `(i64) -> i64 ! IoError` | the local port a handle is bound to |
 
 `tcp_connect` is the half that makes a program a *client*. Without it a Grasm
 program could listen and accept and never dial — no fetching a URL, no calling
@@ -459,7 +465,7 @@ end would wait forever. A caller that needs more reads again. Bytes that are not
 valid UTF-8 are replaced rather than refused: a socket carries bytes, a `str`
 carries text, and a client's mistake should not end a server.
 
-`tcp_port` is what makes `tcp_listen(0)` usable. Asking the system to choose a
+`net_port` is what makes `tcp_listen(0)` usable. Asking the system to choose a
 free port is the only way to write a program that runs on a machine where
 something else already holds the port it wanted — and with no way to read the
 choice back, a program could bind a port it was then unable to name, dial, or
@@ -488,6 +494,38 @@ notice it should be dropped.
 Readiness needed no new type: the wait set is an ordinary `[i64]` and the
 timeout an ordinary `i64`, which is the same reason the rest of this surface
 looks the way it does.
+
+**[L-LIB-UDP]** Three more reach the network as **datagrams**, and each
+performs `net`:
+
+| | type | |
+|---|---|---|
+| `udp_bind(port)` | `(i64) -> i64 ! IoError` | binds a datagram socket; `0` asks the system to choose |
+| `udp_send(h, host, port, b)` | `(i64, str, i64, bytes) -> i64 ! IoError` | sends one datagram, answering with the bytes sent |
+| `udp_recv(h)` | `(i64) -> bytes ! IoError` | receives **one** datagram, whole |
+
+UDP is not TCP with the reliability removed; it is a different shape, and the
+signatures have to say so. A stream has no message boundaries and both ends are
+fixed at connect time, so `tcp_write(h, text)` is complete. A datagram is a
+*whole message* sent to an address named at send time, so `udp_send` takes the
+destination on every call. Giving the two the same shape would have lost exactly
+the information that makes UDP worth having.
+
+Payloads are `bytes`, not `str`. The protocols that use UDP are binary — a DNS
+query is a packed structure with bit-level flags — and routing one through the
+lossy UTF-8 conversion the stream operations use, correctly, for text would
+corrupt it ([L-LIB-BYTES]).
+
+`udp_recv` receives one datagram whole or fails. A read that returned half a
+message, or two joined together, would have destroyed the only thing UDP
+guarantees. Nothing past 65535 bytes can arrive over IPv4 in one piece, so the
+buffer cannot truncate a datagram that was deliverable.
+
+Datagram handles share the table with stream handles, so `net_wait`, `net_port`
+and `net_close` work on all three kinds unchanged. A program that speaks two
+protocols multiplexes them in one loop, which is the ordinary case rather than
+an advanced one. Using a stream operation on a datagram handle is an `IoFailed`
+naming the operation to use instead.
 
 Closing a handle twice is not an error, for the same reason releasing a `ref`
 twice is not ([T-REF-GENERATIONAL]) — cleanup order is not something a caller

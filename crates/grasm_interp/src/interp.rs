@@ -57,6 +57,9 @@ pub struct Frame {
 enum NetSocket {
     Listener(std::net::TcpListener),
     Stream(std::net::TcpStream),
+    /// A datagram socket, in the same table as the stream kinds so that
+    /// `net_wait`, `net_port` and `net_close` work on it unchanged.
+    Datagram(std::net::UdpSocket),
 }
 
 pub struct Interp<'a, W: Write> {
@@ -687,6 +690,7 @@ impl<'a, W: Write> Interp<'a, W> {
                 let fd = match self.sockets.get(h as usize).and_then(Option::as_ref) {
                     Some(NetSocket::Listener(l)) => l.as_raw_fd(),
                     Some(NetSocket::Stream(st)) => st.as_raw_fd(),
+                    Some(NetSocket::Datagram(d)) => d.as_raw_fd(),
                     None => return fail(format!("socket {h} is not open")),
                 };
                 set.push(PollFd {
@@ -727,6 +731,28 @@ impl<'a, W: Write> Interp<'a, W> {
         #[cfg(not(unix))]
         {
             fail("net_wait needs poll(2), which this platform does not provide".to_string())
+        }
+    }
+
+    /// Sends one datagram to an address named at send time.
+    fn udp_send(&mut self, handle: &Value, host: &str, port: &Value, data: &Value) -> Value {
+        let fail = |m: String| Value::Err(Rc::new(io_error("IoFailed", m)));
+        let (Value::Int(h), Value::Int(port)) = (handle, port) else {
+            return fail("handle and port must be integers".to_string());
+        };
+        if !(1..=65535).contains(port) {
+            return fail(format!("port {port} is out of range"));
+        }
+        let Value::Bytes(payload) = data else {
+            return fail("udp_send takes bytes".to_string());
+        };
+        match self.sockets.get(*h as usize).and_then(Option::as_ref) {
+            Some(NetSocket::Datagram(d)) => match d.send_to(payload, (host, *port as u16)) {
+                Ok(n) => Value::Ok(Rc::new(Value::Int(n as i64))),
+                Err(e) => fail(e.to_string()),
+            },
+            Some(_) => fail(format!("socket {h} is not a datagram socket")),
+            None => fail(format!("socket {h} is not open")),
         }
     }
 
@@ -780,10 +806,26 @@ impl<'a, W: Write> Interp<'a, W> {
             };
         }
 
+        if which == "udp_bind" {
+            let Some(port) = as_int(handle) else {
+                return fail("port must be an integer".to_string());
+            };
+            if !(0..=65535).contains(&port) {
+                return fail(format!("port {port} is out of range"));
+            }
+            return match std::net::UdpSocket::bind(("0.0.0.0", port as u16)) {
+                Ok(d) => {
+                    self.sockets.push(Some(NetSocket::Datagram(d)));
+                    Value::Ok(Rc::new(Value::Int((self.sockets.len() - 1) as i64)))
+                }
+                Err(e) => fail(e.to_string()),
+            };
+        }
+
         let Some(h) = as_int(handle) else {
             return fail("handle must be an integer".to_string());
         };
-        if which == "tcp_close" {
+        if which == "net_close" {
             if let Some(slot) = self.sockets.get_mut(h as usize) {
                 *slot = None;
             }
@@ -828,14 +870,42 @@ impl<'a, W: Write> Interp<'a, W> {
             // `tcp_listen(0)` asks the system to choose a free port; without a
             // way to read the choice back, a program could bind a port it was
             // unable to name, dial, or print.
-            ("tcp_port", NetSocket::Listener(l)) => match l.local_addr() {
+            ("net_port", NetSocket::Listener(l)) => match l.local_addr() {
                 Ok(a) => Value::Ok(Rc::new(Value::Int(i64::from(a.port())))),
                 Err(e) => fail(e.to_string()),
             },
-            ("tcp_port", NetSocket::Stream(st)) => match st.local_addr() {
+            ("net_port", NetSocket::Stream(st)) => match st.local_addr() {
                 Ok(a) => Value::Ok(Rc::new(Value::Int(i64::from(a.port())))),
                 Err(e) => fail(e.to_string()),
             },
+            ("net_port", NetSocket::Datagram(d)) => match d.local_addr() {
+                Ok(a) => Value::Ok(Rc::new(Value::Int(i64::from(a.port())))),
+                Err(e) => fail(e.to_string()),
+            },
+            // One datagram, whole. A read that returned half a message, or two
+            // joined, would have destroyed the only thing UDP guarantees.
+            // Nothing past 65535 bytes can arrive over IPv4 in one piece, so a
+            // buffer that size cannot truncate a deliverable datagram.
+            ("udp_recv", NetSocket::Datagram(d)) => {
+                let mut buf = vec![0u8; 65536];
+                match d.recv_from(&mut buf) {
+                    Ok((n, _)) => {
+                        buf.truncate(n);
+                        Value::Ok(Rc::new(Value::Bytes(Rc::new(buf))))
+                    }
+                    Err(e) => fail(e.to_string()),
+                }
+            }
+            ("udp_recv", _) => fail(format!("socket {h} is not a datagram socket")),
+            ("tcp_read", NetSocket::Datagram(_)) => fail(format!(
+                "socket {h} is a datagram socket — use udp_recv, which keeps message boundaries"
+            )),
+            ("tcp_write", NetSocket::Datagram(_)) => fail(format!(
+                "socket {h} is a datagram socket — use udp_send, which needs a destination"
+            )),
+            ("tcp_accept", NetSocket::Datagram(_)) => {
+                fail(format!("socket {h} is a datagram socket, not a listener"))
+            }
             ("tcp_accept", NetSocket::Stream(_)) => {
                 fail(format!("socket {h} is a connection, not a listener"))
             }
@@ -2419,8 +2489,19 @@ build links it, `grasm run` can only reach what is already loaded",
                         let timeout = self.eval_expr(&args[1])?;
                         return Ok(self.net_wait(&handles, &timeout));
                     }
+                    // Four arguments, because a datagram names its destination
+                    // at send time rather than at connect time, and its payload
+                    // is `bytes` because the protocols that use UDP are binary.
+                    "udp_send" => {
+                        let h = self.eval_expr(&args[0])?;
+                        let host = self.eval_expr(&args[1])?.to_string();
+                        let port = self.eval_expr(&args[2])?;
+                        let data = self.eval_expr(&args[3])?;
+                        return Ok(self.udp_send(&h, &host, &port, &data));
+                    }
                     "tcp_listen" | "tcp_connect" | "tcp_accept" | "tcp_read"
-                    | "tcp_write" | "tcp_close" | "tcp_port" => {
+                    | "tcp_write" | "net_close" | "net_port" | "udp_bind"
+                    | "udp_recv" => {
                         let h = self.eval_expr(&args[0])?;
                         let extra = if id.name == "tcp_write" || id.name == "tcp_connect" {
                             Some(self.eval_expr(&args[1])?.to_string())
@@ -3525,6 +3606,8 @@ build links it, `grasm run` can only reach what is already loaded",
                 None => Value::none(),
             },
             (Value::Str(s), "len") => Value::Int(s.char_len() as i64),
+            // Bytes, not code points: what a `Content-Length` needs.
+            (Value::Str(s), "byte_len") => Value::Int(s.len() as i64),
             (Value::Str(s), "contains") => {
                 let n = self.eval_expr(&args[0])?;
                 Value::Bool(s.contains(&n.to_string()))

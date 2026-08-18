@@ -137,12 +137,12 @@ fn fetch_one(port: i64, path: str) -> Page / {io, net} {
         Ok(conn) -> {
             match tcp_write(conn, request_for(path)) {
                 Err(e) -> {
-                    tcp_close(conn)
+                    net_close(conn)
                     failed(path, "write: {e}")
                 }
                 Ok(_) -> {
                     let raw = tcp_read(conn) ?? ""
-                    tcp_close(conn)
+                    net_close(conn)
                     parse_response(path, raw)
                 }
             }

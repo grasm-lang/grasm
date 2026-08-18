@@ -257,6 +257,7 @@ May change or be removed in any release. New surface starts here.
 - `L-LIB-EPRINT` — experimental
 - `L-LIB-FS` — experimental
 - `L-LIB-NET` — experimental
+- `L-LIB-UDP` — experimental
 - `L-LIB-RANGE-OPS` — experimental
 - `T-EFFECT-OP-RESULT` — experimental
 - `T-EXTERN-VALUE` — experimental

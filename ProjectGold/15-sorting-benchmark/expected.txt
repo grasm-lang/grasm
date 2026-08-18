@@ -14,7 +14,8 @@ input:  [0, 11, 22, 3, 14, 25, 6, 17]
 merged: [0, 3, 6, 11, 14, 17, 22, 25]
 merge sort kept equal keys in order: true
 --- growth ---
-bubble doubles n: at least 3x slower: true
-merge doubles n:  under 3x slower:    true
-quick beats bubble on the same input: true
-merge beats bubble on the same input: true
+bubble doubles n: at least 3x more comparisons: true
+merge doubles n:  under 3x more comparisons:    true
+quick compares less than bubble on the same input: true
+merge compares less than bubble on the same input: true
+the clock ran forwards: true

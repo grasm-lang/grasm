@@ -236,9 +236,12 @@ const BUILTIN_FREE_FNS: &[&str] = &[
     "tcp_accept",
     "tcp_read",
     "tcp_write",
-    "tcp_close",
+    "net_close",
     "net_wait",
-    "tcp_port",
+    "net_port",
+    "udp_bind",
+    "udp_send",
+    "udp_recv",
     "read_file",
     "write_file",
     "file_exists",
@@ -4329,11 +4332,14 @@ only a number or a `bool` can come out — compute what you need and yield that"
                     // `str`, so reaching the network needed no pointer type —
                     // which would have been a far larger change to the language
                     // than the network itself ([L-LIB-NET]).
-                    "tcp_listen" | "tcp_accept" | "tcp_read" | "tcp_port" => {
+                    "tcp_listen" | "tcp_accept" | "tcp_read" | "net_port"
+                    | "udp_bind" | "udp_recv" => {
                         let (want, gives) = match id.name.as_str() {
                             "tcp_listen" => (Type::I64, Type::I64),
+                            "udp_bind" => (Type::I64, Type::I64),
+                            "udp_recv" => (Type::I64, Type::Bytes),
                             "tcp_accept" => (Type::I64, Type::I64),
-                            "tcp_port" => (Type::I64, Type::I64),
+                            "net_port" => (Type::I64, Type::I64),
                             _ => (Type::I64, Type::Str),
                         };
                         if args.len() != 1 {
@@ -4369,6 +4375,28 @@ only a number or a `bool` can come out — compute what you need and yield that"
                         };
                         return Type::Fallible(Box::new(handles), Box::new(io_err));
                     }
+                    // A datagram is a whole message sent to an address named at
+                    // send time, so unlike `tcp_write` it cannot take just a
+                    // handle and a payload. The payload is `bytes` rather than
+                    // `str` because the protocols that use UDP are binary
+                    // ([L-LIB-UDP]).
+                    "udp_send" => {
+                        if args.len() != 4 {
+                            return self.error(
+                                span,
+                                "udp_send takes 4 arguments (handle, host, port, bytes)",
+                            );
+                        }
+                        self.check_expr(&args[0], &Type::I64);
+                        self.check_expr(&args[1], &Type::Str);
+                        self.check_expr(&args[2], &Type::I64);
+                        self.check_expr(&args[3], &Type::Bytes);
+                        let io_err = Type::Named {
+                            id: self.defs.io_error_id,
+                            args: vec![],
+                        };
+                        return Type::Fallible(Box::new(Type::I64), Box::new(io_err));
+                    }
                     // The other half of [L-LIB-NET]: without it a program could
                     // be a server and could not be a client.
                     "tcp_connect" => {
@@ -4397,9 +4425,9 @@ only a number or a `bool` can come out — compute what you need and yield that"
                         };
                         return Type::Fallible(Box::new(Type::Unit), Box::new(io_err));
                     }
-                    "tcp_close" => {
+                    "net_close" => {
                         if args.len() != 1 {
-                            return self.error(span, "tcp_close takes exactly 1 argument");
+                            return self.error(span, "net_close takes exactly 1 argument");
                         }
                         self.check_expr(&args[0], &Type::I64);
                         return Type::Unit;
@@ -5943,6 +5971,13 @@ Perform the effect after the closing brace, or yield a number and do the work ou
                 "is_empty" => {
                     check_arity(self, 0);
                     Type::Bool
+                }
+                // `len` counts code points, which is right for a high-level
+                // language and wrong the moment a program has to say how long
+                // a string is on the wire.
+                "byte_len" => {
+                    check_arity(self, 0);
+                    Type::I64
                 }
                 "trim" | "trim_start" | "trim_end" | "to_upper" | "to_lower" => {
                     check_arity(self, 0);

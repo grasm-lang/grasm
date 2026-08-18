@@ -1,0 +1,419 @@
+// A DNS client — binary packet construction, UDP datagrams, bit fields.
+//
+// DNS is the reason the `bytes` type and `udp_*` exist. A query is a packed
+// binary structure: a twelve-byte header whose second and third bytes are five
+// separate bit fields, then the name as length-prefixed labels, then a type and
+// a class. None of it is text, and building it out of `str` would have re-encoded
+// every byte above 127 as two.
+//
+// Two halves, separated deliberately.
+//
+// The *default run* is self-contained and deterministic: the program binds two
+// UDP sockets, sends itself a real query, answers it with a real response, and
+// parses that back. Nothing is stubbed — the bytes on the wire are the bytes
+// this code built — so all three engines print the same transcript and the
+// encoder and parser are checked on every run.
+//
+//     grasm run main.gr                     the self-contained exchange
+//     grasm run main.gr -- ask 8.8.8.8 example.com    a real resolver
+//
+// The second form is not part of the automated comparison, for the same reason
+// project 21's socket loop is not: its answer depends on the internet.
+
+let TYPE_A = 1
+let CLASS_IN = 1
+let PORT_DNS = 53
+
+// --- writing ---------------------------------------------------------------
+//
+// Every integer in a DNS packet is big-endian, which is why these exist rather
+// than the bytes being written inline: getting the order wrong in one field out
+// of nine is the classic way a hand-rolled packet parses as something else
+// entirely.
+
+/// Every piece joined in order.
+///
+/// A chain of `.concat(...)` calls cannot be split across lines — a statement
+/// ends at the newline, so a leading `.` starts a new one and does not parse.
+/// Writing a packet as one very long line would be worse than this, and this
+/// also names what is being built.
+fn join(parts: [bytes]) -> bytes {
+    var out = bytes_of([])
+    for p in parts {
+        out = out.concat(p)
+    }
+    out
+}
+
+fn u16_bytes(n: i64) -> bytes {
+    bytes_of([n.ushr(8).bit_and(255), n.bit_and(255)])
+}
+
+fn u32_bytes(n: i64) -> bytes {
+    bytes_of([
+        n.ushr(24).bit_and(255),
+        n.ushr(16).bit_and(255),
+        n.ushr(8).bit_and(255),
+        n.bit_and(255),
+    ])
+}
+
+/// A name as length-prefixed labels, terminated by a zero length.
+///
+/// `example.com` becomes `7 e x a m p l e 3 c o m 0`. There are no dots on the
+/// wire — the dot is a display convention, and a parser that looked for one
+/// would be reading a format that does not exist.
+fn encode_name(name: str) -> bytes {
+    var out = bytes_of([])
+    for label in name.split(".") {
+        if label.len() > 0 {
+                out = join([out, bytes_of([label.byte_len()]), label.to_bytes()])
+        }
+    }
+    out.concat(bytes_of([0]))
+}
+
+/// A standard recursive query for the A record of `name`.
+///
+/// The flag word is built field by field rather than written as `0x0100`, so
+/// what each bit means is in the code instead of in a comment: QR=0 (a query),
+/// OPCODE=0 (standard), RD=1 (please recurse).
+fn build_query(id: i64, name: str) -> bytes {
+    let flags = 0.shl(15).bit_or(0.shl(11)).bit_or(1.shl(8))
+    join([
+        u16_bytes(id),
+        u16_bytes(flags),
+        u16_bytes(1),                  // QDCOUNT — one question
+        u16_bytes(0),                  // ANCOUNT
+        u16_bytes(0),                  // NSCOUNT
+        u16_bytes(0),                  // ARCOUNT
+        encode_name(name),
+        u16_bytes(TYPE_A),
+        u16_bytes(CLASS_IN),
+    ])
+}
+
+/// A response carrying one A record, as a real server would send it.
+///
+/// The answer's name is a **compression pointer** — `0xC00C`, meaning "the name
+/// starting at offset 12", which is where the question's name sits. Real servers
+/// always do this, so a parser that could not follow one would fail on every
+/// answer it ever saw.
+fn build_response(id: i64, name: str, ttl: i64, ip: [i64]) -> bytes {
+    let flags = 1.shl(15).bit_or(1.shl(8)).bit_or(1.shl(7))   // QR=1, RD=1, RA=1
+    let question = join([encode_name(name), u16_bytes(TYPE_A), u16_bytes(CLASS_IN)])
+    let answer = join([
+        u16_bytes(0xC00C),
+        u16_bytes(TYPE_A),
+        u16_bytes(CLASS_IN),
+        u32_bytes(ttl),
+        u16_bytes(4),
+        bytes_of(ip),
+    ])
+    join([
+        u16_bytes(id),
+        u16_bytes(flags),
+        u16_bytes(1),
+        u16_bytes(1),
+        u16_bytes(0),
+        u16_bytes(0),
+        question,
+        answer,
+    ])
+}
+
+// --- reading ---------------------------------------------------------------
+
+fn u16_at(b: bytes, i: i64) -> i64 {
+    b.at(i).shl(8).bit_or(b.at(i + 1))
+}
+
+fn u32_at(b: bytes, i: i64) -> i64 {
+    u16_at(b, i).shl(16).bit_or(u16_at(b, i + 2))
+}
+
+type Header = {
+    id: i64,
+    is_response: bool,
+    recursion_desired: bool,
+    rcode: i64,
+    questions: i64,
+    answers: i64,
+}
+
+fn parse_header(b: bytes) -> Header {
+    let flags = u16_at(b, 2)
+    Header{
+        id: u16_at(b, 0),
+        is_response: flags.ushr(15).bit_and(1) == 1,
+        recursion_desired: flags.ushr(8).bit_and(1) == 1,
+        rcode: flags.bit_and(15),
+        questions: u16_at(b, 4),
+        answers: u16_at(b, 6),
+    }
+}
+
+fn rcode_name(c: i64) -> str {
+    if c == 0 { return "NOERROR" }
+    if c == 1 { return "FORMERR" }
+    if c == 2 { return "SERVFAIL" }
+    if c == 3 { return "NXDOMAIN" }
+    "RCODE{c}"
+}
+
+/// Reads a name, following compression pointers, and answers with the name and
+/// the offset *after* it in the original packet.
+///
+/// A pointer is a label whose top two length bits are set; the rest of the two
+/// bytes is an offset into the packet. Following one must not advance the
+/// caller's cursor past the pointer itself, which is the bug that makes a
+/// resolver read an answer's record type out of the middle of a hostname.
+fn read_name(b: bytes, start: i64) -> (str, i64) {
+    var out = ""
+    var i = start
+    var after = 0 - 1
+    var hops = 0
+    var going = true
+    while going {
+        let n = b.at(i)
+        if n == 0 {
+            i = i + 1
+            going = false
+        } else if n.bit_and(192) == 192 {
+            // A pointer. Note where the caller should resume before jumping,
+            // and only for the first one.
+            if after < 0 {
+                after = i + 2
+            }
+            i = u16_at(b, i).bit_and(16383)
+            hops = hops + 1
+            // A packet may point at itself. Real servers do not, and a
+            // resolver that trusted them would hang on the one that did.
+            if hops > 32 {
+                return ("<looping pointer>", b.len())
+            }
+        } else {
+            if out.len() > 0 {
+                out = out + "."
+            }
+            out = out + b.slice(i + 1, n).to_str()
+            i = i + 1 + n
+        }
+    }
+    if after < 0 {
+        (out, i)
+    } else {
+        (out, after)
+    }
+}
+
+type Answer = {
+    name: str,
+    kind: i64,
+    ttl: i64,
+    address: str,
+}
+
+fn parse_answers(b: bytes) -> [Answer] {
+    let h = parse_header(b)
+    var i = 12
+    // Skip the questions: each is a name, then a type and a class.
+    var q = 0
+    while q < h.questions {
+        let read = read_name(b, i)
+        i = read.1 + 4
+        q = q + 1
+    }
+    var out = []
+    var a = 0
+    while a < h.answers {
+        let read = read_name(b, i)
+        let name = read.0
+        var at = read.1
+        let kind = u16_at(b, at)
+        let ttl = u32_at(b, at + 4)
+        let rdlen = u16_at(b, at + 8)
+        let rdata = at + 10
+        var address = ""
+        if kind == TYPE_A and rdlen == 4 {
+            address = "{b.at(rdata)}.{b.at(rdata + 1)}.{b.at(rdata + 2)}.{b.at(rdata + 3)}"
+        } else {
+            address = "<{rdlen} bytes of type {kind}>"
+        }
+        out = out + [Answer{ name: name, kind: kind, ttl: ttl, address: address }]
+        i = rdata + rdlen
+        a = a + 1
+    }
+    out
+}
+
+/// One hex digit. The language formats an integer in decimal and a `bytes` in
+/// hex, and offers no way to ask for a different radix, so a program that wants
+/// to print a packet ID the way every other DNS tool prints it writes this.
+fn hex_digit(n: i64) -> str {
+    "0123456789abcdef".substr(n.bit_and(15), 1)
+}
+
+fn hex_byte(n: i64) -> str {
+    hex_digit(n.ushr(4)) + hex_digit(n)
+}
+
+fn hex16(n: i64) -> str {
+    hex_byte(n.ushr(8)) + hex_byte(n)
+}
+
+fn hex(b: bytes, count: i64) -> str {
+    var out = ""
+    var i = 0
+    while i < count and i < b.len() {
+        let v = b.at(i)
+        out = out + "{hex_byte(v)} "
+        i = i + 1
+    }
+    out.trim()
+}
+
+// --- the self-contained exchange ------------------------------------------
+
+fn demo() / {io, net} {
+    print("--- a query on the wire ---")
+    let query = build_query(0x1234, "example.com")
+    print("query is {query.len()} bytes")
+    print("header:   {hex(query, 12)}")
+    print("question: {hex(query.slice(12, query.len() - 12), 32)}")
+
+    // Both sockets ask for port 0, so this runs on a machine where whatever
+    // port it would otherwise have picked is already held.
+    let server = match udp_bind(0) {
+        Ok(h) -> h
+        Err(e) -> {
+            print("cannot bind: {e}")
+            return
+        }
+    }
+    let client = match udp_bind(0) {
+        Ok(h) -> h
+        Err(e) -> {
+            print("cannot bind: {e}")
+            return
+        }
+    }
+    let server_port = net_port(server) ?? 0
+
+    print("--- the exchange ---")
+    match udp_send(client, "127.0.0.1", server_port, query) {
+        Ok(n) -> print("client sent {n} bytes")
+        Err(e) -> print("client could not send: {e}")
+    }
+
+    // The server waits for readiness rather than blocking, so this loop is the
+    // same shape a real resolver's would be.
+    let ready = net_wait([server], 2000) ?? []
+    print("server sees {ready.len()} socket ready")
+    match udp_recv(server) {
+        Err(e) -> print("server could not receive: {e}")
+        Ok(got) -> {
+            let h = parse_header(got)
+            let asked = read_name(got, 12)
+            print("server got a query for {asked.0}, id 0x{hex16(h.id)}, rd {h.recursion_desired}")
+
+            let reply = build_response(h.id, asked.0, 300, [93, 184, 216, 34])
+            let client_port = net_port(client) ?? 0
+            match udp_send(server, "127.0.0.1", client_port, reply) {
+                Ok(n) -> print("server sent {n} bytes")
+                Err(e) -> print("server could not reply: {e}")
+            }
+        }
+    }
+
+    let back = net_wait([client], 2000) ?? []
+    print("client sees {back.len()} socket ready")
+    match udp_recv(client) {
+        Err(e) -> print("client could not receive: {e}")
+        Ok(resp) -> report(resp)
+    }
+
+    net_close(client)
+    net_close(server)
+
+    // The parser is the half most likely to be quietly wrong, so it is also
+    // run against a response the exchange never produces.
+    print("--- a two-answer response ---")
+    let multi = two_answers()
+    report(multi)
+}
+
+/// A response with two A records, built the same way a server would.
+fn two_answers() -> bytes {
+    let name = "dual.example"
+    let flags = 1.shl(15).bit_or(1.shl(8)).bit_or(1.shl(7))
+    let question = join([encode_name(name), u16_bytes(TYPE_A), u16_bytes(CLASS_IN)])
+    var answers = bytes_of([])
+    for last in [1, 2] {
+        answers = join([
+            answers,
+            u16_bytes(0xC00C),
+            u16_bytes(TYPE_A),
+            u16_bytes(CLASS_IN),
+            u32_bytes(60 * last),
+            u16_bytes(4),
+            bytes_of([10, 0, 0, last]),
+        ])
+    }
+    join([
+        u16_bytes(0x7f7f),
+        u16_bytes(flags),
+        u16_bytes(1),
+        u16_bytes(2),
+        u16_bytes(0),
+        u16_bytes(0),
+        question,
+        answers,
+    ])
+}
+
+fn report(resp: bytes) / {io} {
+    let h = parse_header(resp)
+    print("id 0x{hex16(h.id)} response {h.is_response} {rcode_name(h.rcode)} questions {h.questions} answers {h.answers}")
+    for a in parse_answers(resp) {
+        print("  {a.name} -> {a.address}  ttl {a.ttl}")
+    }
+}
+
+// --- a real resolver -------------------------------------------------------
+
+fn ask(server: str, name: str) / {io, net} {
+    match udp_bind(0) {
+        Err(e) -> print("cannot bind: {e}")
+        Ok(sock) -> {
+            let query = build_query(0x4321, name)
+            match udp_send(sock, server, PORT_DNS, query) {
+                Err(e) -> print("cannot send: {e}")
+                Ok(_) -> {
+                    // A resolver that blocked here would hang forever on a
+                    // server that never answers, which is the ordinary failure
+                    // rather than the exotic one.
+                    let ready = net_wait([sock], 3000) ?? []
+                    if ready.len() == 0 {
+                        print("{server} did not answer within 3 seconds")
+                    } else {
+                        match udp_recv(sock) {
+                            Err(e) -> print("cannot receive: {e}")
+                            Ok(resp) -> report(resp)
+                        }
+                    }
+                }
+            }
+            net_close(sock)
+        }
+    }
+}
+
+fn main() / {io, net} {
+    let a = args()
+    if a.len() >= 3 and a[0] == "ask" {
+        ask(a[1], a[2])
+        return
+    }
+    demo()
+}

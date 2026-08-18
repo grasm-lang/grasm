@@ -590,6 +590,7 @@ impl<'m> Codegen<'m> {
             ("grasm_str_from_f64", vec![f64t], Some(i64t)),
             ("grasm_str_from_bool", vec![i8t], Some(i64t)),
             ("grasm_str_len", vec![i64t], Some(i64t)),
+            ("grasm_str_byte_len", vec![i64t], Some(i64t)),
             ("grasm_str_eq", vec![i64t, i64t], Some(i8t)),
             ("grasm_str_cmp", vec![i64t, i64t], Some(i64t)),
             ("grasm_list_new", vec![], Some(i64t)),
@@ -705,9 +706,12 @@ impl<'m> Codegen<'m> {
             ("grasm_tcp_accept", vec![i64t], Some(i64t)),
             ("grasm_tcp_read", vec![i64t], Some(i64t)),
             ("grasm_tcp_write", vec![i64t, i64t], Some(i64t)),
-            ("grasm_tcp_close", vec![i64t], None),
+            ("grasm_net_close", vec![i64t], None),
             ("grasm_net_wait", vec![i64t, i64t], Some(i64t)),
-            ("grasm_tcp_port", vec![i64t], Some(i64t)),
+            ("grasm_net_port", vec![i64t], Some(i64t)),
+            ("grasm_udp_bind", vec![i64t], Some(i64t)),
+            ("grasm_udp_recv", vec![i64t], Some(i64t)),
+            ("grasm_udp_send", vec![i64t, i64t, i64t, i64t], Some(i64t)),
             ("grasm_write_file", vec![i64t, i64t], Some(i64t)),
             ("grasm_file_exists", vec![i64t], Some(i8t)),
             ("grasm_remove_file", vec![i64t], Some(i64t)),
@@ -6043,6 +6047,7 @@ impl FnCx<'_, '_> {
             (VType::Map(_, _), "len") => "grasm_map_len",
             (VType::Map(_, _), "is_empty") => "grasm_map_is_empty",
             (VType::Str, "len") => "grasm_str_len",
+            (VType::Str, "byte_len") => "grasm_str_byte_len",
             (VType::Str, "is_empty") => "grasm_str_is_empty",
             // Each of these takes the receiver, reads it, and keeps nothing.
             (VType::List(_), "rev") => "grasm_list_rev",
@@ -6062,8 +6067,17 @@ impl FnCx<'_, '_> {
         };
         let borrowed = self.b.use_var(var);
         let v = self.call_rt(f, &[borrowed]).unwrap();
+        // This match must name every method the table above accepts. It used to
+        // end in `(VType::Str, _) => VType::Str`, and that catch-all is a trap:
+        // `byte_len` was added to the table above, returned an `i64`, and was
+        // typed here as a boxed string. The compiled program then called `.len()`
+        // on the integer 10 as though it were a pointer and took SIGSEGV, while
+        // `grasm run` printed the right answer. Naming each method turns that
+        // silent miscompile into a fall-through to the owning path, which is
+        // slower and correct.
         let out_t = match (&vt, name.name.as_str()) {
             (_, "len") => VType::I64,
+            (VType::Str, "byte_len") => VType::I64,
             (_, "is_empty") => VType::Bool,
             (VType::List(_), "rev") => vt.clone(),
             (VType::Map(k, _), "keys") => VType::List(k.clone()),
@@ -6074,7 +6088,9 @@ impl FnCx<'_, '_> {
             ]))),
             (VType::Str, "chars" | "lines" | "words") => VType::List(Box::new(VType::Str)),
             (VType::Str, "codes") => VType::List(Box::new(VType::I64)),
-            (VType::Str, _) => VType::Str,
+            (VType::Str, "trim" | "trim_start" | "trim_end" | "to_upper" | "to_lower") => {
+                VType::Str
+            }
             _ => return Ok(None),
         };
         Ok(Some((v, out_t)))
@@ -6110,6 +6126,12 @@ impl FnCx<'_, '_> {
             // ---- str ----
             (VType::Str, "len") => {
                 let v = self.call_rt("grasm_str_len", &[rv]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                (v, VType::I64)
+            }
+            // Bytes, not code points: what a `Content-Length` needs.
+            (VType::Str, "byte_len") => {
+                let v = self.call_rt("grasm_str_byte_len", &[rv]).unwrap();
                 self.call_rt("grasm_val_dec", &[rv]);
                 (v, VType::I64)
             }
@@ -7446,13 +7468,16 @@ checker did",
             // The five `net` builtins. A handle is an `i64` and a payload is a
             // `str`, so nothing here needs a pointer type — which is why the
             // network could be added to the language without adding one.
-            "tcp_listen" | "tcp_accept" | "tcp_read" | "tcp_port" => {
+            "tcp_listen" | "tcp_accept" | "tcp_read" | "net_port" | "udp_bind"
+            | "udp_recv" => {
                 let (hv, ht) = self.eval_expr_val(&args[0])?;
                 let boxed = self.box_value(hv, &ht);
                 let (sym, ok_t) = match id.name.as_str() {
                     "tcp_listen" => ("grasm_tcp_listen", VType::I64),
                     "tcp_accept" => ("grasm_tcp_accept", VType::I64),
-                    "tcp_port" => ("grasm_tcp_port", VType::I64),
+                    "net_port" => ("grasm_net_port", VType::I64),
+                    "udp_bind" => ("grasm_udp_bind", VType::I64),
+                    "udp_recv" => ("grasm_udp_recv", VType::Bytes),
                     _ => ("grasm_tcp_read", VType::Str),
                 };
                 let v = self.call_rt(sym, &[boxed]).unwrap();
@@ -7502,6 +7527,28 @@ checker did",
                     ),
                 )));
             }
+            // Four arguments, because a datagram names its destination at send
+            // time rather than at connect time.
+            "udp_send" => {
+                let (hv, ht) = self.eval_expr_val(&args[0])?;
+                let boxed_h = self.box_value(hv, &ht);
+                let (host, hostt) = self.eval_expr_val(&args[1])?;
+                let boxed_host = self.box_value(host, &hostt);
+                let (pv, pt) = self.eval_expr_val(&args[2])?;
+                let boxed_p = self.box_value(pv, &pt);
+                let (dv, _) = self.eval_expr_val(&args[3])?;
+                let v = self
+                    .call_rt("grasm_udp_send", &[boxed_h, boxed_host, boxed_p, dv])
+                    .unwrap();
+                self.call_rt("grasm_val_dec", &[boxed_h]);
+                self.call_rt("grasm_val_dec", &[boxed_host]);
+                self.call_rt("grasm_val_dec", &[boxed_p]);
+                self.call_rt("grasm_val_dec", &[dv]);
+                return Ok(Some((
+                    v,
+                    VType::Fallible(Box::new(VType::I64), Box::new(VType::Sum("IoError".into()))),
+                )));
+            }
             "tcp_write" => {
                 let (hv, ht) = self.eval_expr_val(&args[0])?;
                 let boxed_h = self.box_value(hv, &ht);
@@ -7514,10 +7561,10 @@ checker did",
                     VType::Fallible(Box::new(VType::Unit), Box::new(VType::Sum("IoError".into()))),
                 )));
             }
-            "tcp_close" => {
+            "net_close" => {
                 let (hv, ht) = self.eval_expr_val(&args[0])?;
                 let boxed = self.box_value(hv, &ht);
-                self.call_rt("grasm_tcp_close", &[boxed]);
+                self.call_rt("grasm_net_close", &[boxed]);
                 self.call_rt("grasm_val_dec", &[boxed]);
                 return Ok(None);
             }
@@ -8727,12 +8774,17 @@ checker did",
                             "file_exists" => Some(VType::Bool),
                             "args" => Some(VType::List(Box::new(VType::Str))),
                             "env" => Some(VType::Option(Box::new(VType::Str))),
-                            "tcp_listen" | "tcp_connect" | "tcp_accept" | "tcp_port" => Some(VType::Fallible(
+                            "tcp_listen" | "tcp_connect" | "tcp_accept" | "net_port"
+                            | "udp_bind" | "udp_send" => Some(VType::Fallible(
                                 Box::new(VType::I64),
                                 Box::new(VType::Sum("IoError".into())),
                             )),
                             "tcp_read" => Some(VType::Fallible(
                                 Box::new(VType::Str),
+                                Box::new(VType::Sum("IoError".into())),
+                            )),
+                            "udp_recv" => Some(VType::Fallible(
+                                Box::new(VType::Bytes),
                                 Box::new(VType::Sum("IoError".into())),
                             )),
                             "net_wait" => Some(VType::Fallible(
@@ -9043,7 +9095,7 @@ checker did",
                 }
             }
             Expr::MethodCall { recv, name, args, .. } => match name.name.as_str() {
-                "len" => VType::I64,
+                "len" | "byte_len" => VType::I64,
                 "is_nan" | "is_finite" => VType::Bool,
                 "is_some" | "is_none" | "is_empty" | "contains" | "starts_with"
                 | "ends_with" | "has" | "delete" | "any" | "all" => VType::Bool,

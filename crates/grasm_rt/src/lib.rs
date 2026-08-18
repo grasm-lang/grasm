@@ -1068,6 +1068,20 @@ pub unsafe extern "C" fn grasm_str_len(v: *mut RtVal) -> i64 {
     }
 }
 
+/// How many *bytes* the text occupies, as distinct from how many characters.
+///
+/// `len` counts code points, which is the right answer for a high-level
+/// language and the wrong one the moment a program writes a string to a socket
+/// or a file and has to say how long it is. `"🙂".len()` is 1 and
+/// `"🙂".byte_len()` is 4, and a `Content-Length` needs the second.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_byte_len(v: *mut RtVal) -> i64 {
+    match &(*v).payload {
+        RtPayload::Str(s) => s.len() as i64,
+        _ => grasm_panic_msg_str("byte_len on non-string"),
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn grasm_str_eq(a: *mut RtVal, b: *mut RtVal) -> i8 {
     match (&(*a).payload, &(*b).payload) {
@@ -3914,6 +3928,11 @@ thread_local! {
 enum Socket {
     Listener(std::net::TcpListener),
     Stream(std::net::TcpStream),
+    /// A datagram socket. It sits in the same table as the stream kinds so
+    /// that `net_wait`, `net_port` and `net_close` work on it unchanged — a
+    /// program multiplexing a listener and a UDP socket in one loop is the
+    /// ordinary case for anything that speaks two protocols.
+    Datagram(std::net::UdpSocket),
 }
 
 fn socket_put(s: Socket) -> i64 {
@@ -4031,7 +4050,7 @@ fn wait_readable(_fds: &[i32], _timeout_ms: i32) -> Result<Vec<bool>, String> {
 ///
 /// # Safety: called from compiled Grasm with a boxed value.
 #[no_mangle]
-pub unsafe extern "C" fn grasm_tcp_port(handle: *mut RtVal) -> *mut RtVal {
+pub unsafe extern "C" fn grasm_net_port(handle: *mut RtVal) -> *mut RtVal {
     let h = match &(*handle).payload {
         RtPayload::I64(n) => *n,
         _ => return err_of(io_err("IoFailed", "handle must be an integer".to_string())),
@@ -4040,6 +4059,7 @@ pub unsafe extern "C" fn grasm_tcp_port(handle: *mut RtVal) -> *mut RtVal {
         let addr = match s {
             Socket::Listener(l) => l.local_addr(),
             Socket::Stream(st) => st.local_addr(),
+            Socket::Datagram(d) => d.local_addr(),
         };
         addr.map(|a| i64::from(a.port())).map_err(|e| e.to_string())
     });
@@ -4089,6 +4109,7 @@ pub unsafe extern "C" fn grasm_net_wait(handles: *mut RtVal, timeout: *mut RtVal
             .map(|&h| match table.get(h as usize).and_then(Option::as_ref) {
                 Some(Socket::Listener(l)) => Ok(l.as_raw_fd()),
                 Some(Socket::Stream(st)) => Ok(st.as_raw_fd()),
+                Some(Socket::Datagram(d)) => Ok(d.as_raw_fd()),
                 None => Err(format!("socket {h} is not open")),
             })
             .collect::<Result<Vec<i32>, String>>()
@@ -4180,6 +4201,7 @@ pub unsafe extern "C" fn grasm_tcp_accept(handle: *mut RtVal) -> *mut RtVal {
     let accepted = socket_with(h, |s| match s {
         Socket::Listener(l) => l.accept().map(|(stream, _)| stream).map_err(|e| e.to_string()),
         Socket::Stream(_) => Err(format!("socket {h} is a connection, not a listener")),
+        Socket::Datagram(_) => Err(format!("socket {h} is a datagram socket, not a listener")),
     });
     match accepted {
         Ok(stream) => ok_of(alloc(RtPayload::I64(socket_put(Socket::Stream(stream))))),
@@ -4216,6 +4238,9 @@ pub unsafe extern "C" fn grasm_tcp_read(handle: *mut RtVal) -> *mut RtVal {
             }
         }
         Socket::Listener(_) => Err(format!("socket {h} is a listener, not a connection")),
+        Socket::Datagram(_) => Err(format!(
+            "socket {h} is a datagram socket — use udp_recv, which keeps message boundaries"
+        )),
     });
     match read {
         Ok(text) => ok_of(alloc(RtPayload::Str(RtStr::new(text)))),
@@ -4240,9 +4265,120 @@ pub unsafe extern "C" fn grasm_tcp_write(handle: *mut RtVal, data: *mut RtVal) -
             .and_then(|()| stream.flush())
             .map_err(|e| e.to_string()),
         Socket::Listener(_) => Err(format!("socket {h} is a listener, not a connection")),
+        Socket::Datagram(_) => Err(format!(
+            "socket {h} is a datagram socket — use udp_send, which needs a destination"
+        )),
     });
     match wrote {
         Ok(()) => ok_of(alloc(RtPayload::I64(0))),
+        Err(e) => err_of(io_err("IoFailed", e)),
+    }
+}
+
+// --- datagrams -------------------------------------------------------------
+//
+// UDP is not TCP with the reliability removed; it is a different shape. A
+// stream has no message boundaries and both ends are fixed at connect time, so
+// `tcp_write(h, text)` is complete. A datagram is a *whole message* sent to an
+// address named at send time, and the address a reply came from is part of what
+// was received. So the operations cannot share signatures with the stream ones,
+// and pretending otherwise would lose exactly the information that makes UDP
+// worth having.
+//
+// Payloads are `bytes`, not `str`. A DNS query is a packed binary structure
+// with bit-level flags, and routing it through a lossy UTF-8 conversion — which
+// is what the stream operations do, correctly, for text — would corrupt it.
+
+/// Binds a UDP socket. Port `0` asks the system to choose; `net_port` reads the
+/// choice back.
+///
+/// # Safety: called from compiled Grasm with a boxed value.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_udp_bind(port: *mut RtVal) -> *mut RtVal {
+    let port = match &(*port).payload {
+        RtPayload::I64(n) => *n,
+        _ => return err_of(io_err("IoFailed", "port must be an integer".to_string())),
+    };
+    if !(0..=65535).contains(&port) {
+        return err_of(io_err("IoFailed", format!("port {port} is out of range")));
+    }
+    match std::net::UdpSocket::bind(("0.0.0.0", port as u16)) {
+        Ok(d) => ok_of(alloc(RtPayload::I64(socket_put(Socket::Datagram(d))))),
+        Err(e) => err_of(io_err("IoFailed", e.to_string())),
+    }
+}
+
+/// Sends one datagram to `host:port`, answering with the number of bytes sent.
+///
+/// # Safety: called from compiled Grasm with boxed values.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_udp_send(
+    handle: *mut RtVal,
+    host: *mut RtVal,
+    port: *mut RtVal,
+    data: *mut RtVal,
+) -> *mut RtVal {
+    let h = match &(*handle).payload {
+        RtPayload::I64(n) => *n,
+        _ => return err_of(io_err("IoFailed", "handle must be an integer".to_string())),
+    };
+    let port = match &(*port).payload {
+        RtPayload::I64(n) => *n,
+        _ => return err_of(io_err("IoFailed", "port must be an integer".to_string())),
+    };
+    if !(1..=65535).contains(&port) {
+        return err_of(io_err("IoFailed", format!("port {port} is out of range")));
+    }
+    let host = as_str(host).to_string();
+    let payload = match &(*data).payload {
+        RtPayload::Bytes(b) => b.clone(),
+        _ => return err_of(io_err("IoFailed", "udp_send takes bytes".to_string())),
+    };
+    let sent = socket_with(h, |s| match s {
+        Socket::Datagram(d) => d
+            .send_to(&payload, (host.as_str(), port as u16))
+            .map(|n| n as i64)
+            .map_err(|e| e.to_string()),
+        _ => Err(format!("socket {h} is not a datagram socket")),
+    });
+    match sent {
+        Ok(n) => ok_of(alloc(RtPayload::I64(n))),
+        Err(e) => err_of(io_err("IoFailed", e)),
+    }
+}
+
+/// Receives **one** datagram, whole.
+///
+/// A datagram is a message, not a position in a stream: a read that returned
+/// half of one, or two of them joined, would have destroyed the only thing UDP
+/// guarantees. Anything past 65535 bytes cannot arrive over IPv4 in one piece,
+/// so a buffer that size cannot truncate a datagram that was deliverable.
+///
+/// This blocks until a datagram arrives. `net_wait` is how a program asks first
+/// ([L-LIB-NET]).
+///
+/// # Safety: called from compiled Grasm with a boxed value.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_udp_recv(handle: *mut RtVal) -> *mut RtVal {
+    let h = match &(*handle).payload {
+        RtPayload::I64(n) => *n,
+        _ => return err_of(io_err("IoFailed", "handle must be an integer".to_string())),
+    };
+    let got = socket_with(h, |s| match s {
+        Socket::Datagram(d) => {
+            let mut buf = vec![0u8; 65536];
+            match d.recv_from(&mut buf) {
+                Ok((n, _)) => {
+                    buf.truncate(n);
+                    Ok(buf)
+                }
+                Err(e) => Err(e.to_string()),
+            }
+        }
+        _ => Err(format!("socket {h} is not a datagram socket")),
+    });
+    match got {
+        Ok(b) => ok_of(alloc(RtPayload::Bytes(std::rc::Rc::new(b)))),
         Err(e) => err_of(io_err("IoFailed", e)),
     }
 }
@@ -4253,7 +4389,7 @@ pub unsafe extern "C" fn grasm_tcp_write(handle: *mut RtVal, data: *mut RtVal) -
 ///
 /// # Safety: called from compiled Grasm with a boxed value.
 #[no_mangle]
-pub unsafe extern "C" fn grasm_tcp_close(handle: *mut RtVal) {
+pub unsafe extern "C" fn grasm_net_close(handle: *mut RtVal) {
     if let RtPayload::I64(h) = &(*handle).payload {
         let h = *h;
         SOCKETS.with(|table| {

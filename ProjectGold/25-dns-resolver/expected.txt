@@ -1,0 +1,16 @@
+--- a query on the wire ---
+query is 29 bytes
+header:   12 34 01 00 00 01 00 00 00 00 00 00
+question: 07 65 78 61 6d 70 6c 65 03 63 6f 6d 00 00 01 00 01
+--- the exchange ---
+client sent 29 bytes
+server sees 1 socket ready
+server got a query for example.com, id 0x1234, rd true
+server sent 45 bytes
+client sees 1 socket ready
+id 0x1234 response true NOERROR questions 1 answers 1
+  example.com -> 93.184.216.34  ttl 300
+--- a two-answer response ---
+id 0x7f7f response true NOERROR questions 1 answers 2
+  dual.example -> 10.0.0.1  ttl 60
+  dual.example -> 10.0.0.2  ttl 120

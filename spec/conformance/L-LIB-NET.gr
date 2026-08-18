@@ -51,7 +51,7 @@ fn main() / {io, net} {
             // what makes that spelling usable: the rest of this program dials
             // the listener it just opened, on a machine where the port it
             // would otherwise have picked may already be held.
-            let port = tcp_port(listener) ?? 0
+            let port = net_port(listener) ?? 0
             if port > 0 and port <= 65535 {
                 print("a chosen port is in range")
             } else {
@@ -111,10 +111,10 @@ fn main() / {io, net} {
                             // the conversation ended. Reporting it as
                             // not-ready would leave a dead connection in the
                             // wait set forever.
-                            tcp_close(client)
+                            net_close(client)
                             report("after hangup", net_wait([conn], 1000) ?? [], listener, conn)
                             print("read at end: {(tcp_read(conn) ?? "").len()} bytes")
-                            tcp_close(conn)
+                            net_close(conn)
                         }
                     }
                 }
@@ -122,8 +122,8 @@ fn main() / {io, net} {
 
             // Closing twice is not an error, for the same reason releasing a
             // `ref` twice is not: cleanup order is not the caller's to track.
-            tcp_close(listener)
-            tcp_close(listener)
+            net_close(listener)
+            net_close(listener)
             print("closed twice is fine")
             // Using a closed handle is an ordinary failure, never a panic and
             // never a wrong answer.

@@ -12,7 +12,7 @@
 12-markdown-to-html/main.gr 1321
 13-json-parser/main.gr 2620
 14-game-of-life/main.gr 1204
-15-sorting-benchmark/main.gr 1876
+15-sorting-benchmark/main.gr 2287
 16-kv-database/main.gr 1472
 18-image-converter/main.gr 1774
 19-event-emitter/main.gr 867
@@ -21,9 +21,10 @@
 22-multithreaded-scraper/main.gr 1417
 23-turing-machine/main.gr 1857
 24-micro-vm/main.gr 2257
+25-dns-resolver/main.gr 2270
 26-garbage-collector/main.gr 1575
 27-sha256/main.gr 1757
 28-sql-engine/main.gr 3743
 29-self-hosting-lexer/main.gr 2977
-30-async-chat/main.gr 1126
+30-async-chat/main.gr 1232
 31-grasm-emits-c/main.gr 1933

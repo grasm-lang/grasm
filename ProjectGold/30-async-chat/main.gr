@@ -85,15 +85,14 @@ fn broadcast(r: Room, from: i64, line: str) / {net} {
 
 // --- the demonstration ---------------------------------------------------
 
-/// One turn of the server: wait for anything to happen, then handle it.
+/// Handles everything that is ready right now.
 ///
 /// The listener is in the same wait set as the connections, so a new arrival
 /// and a message from an existing client are the same kind of event. That is
 /// the whole trick, and it is why the loop never blocks on one client while
 /// another is waiting.
-fn server_turn(r: Room, listener: i64, timeout: i64) -> Room / {io, net} {
+fn handle_ready(r: Room, listener: i64, ready: [i64]) -> Room / {io, net} {
     var room = r
-    let ready = net_wait([listener] + room.conns, timeout) ?? []
     for h in ready {
         if h == listener {
             match tcp_accept(listener) {
@@ -110,7 +109,7 @@ fn server_turn(r: Room, listener: i64, timeout: i64) -> Room / {io, net} {
                 // handle stays ready forever until it is dropped, so a loop
                 // that ignored this would spin.
                 print("  server: {name_of(room, h)} left")
-                tcp_close(h)
+                net_close(h)
                 room = left(room, h)
             } else {
                 let who = name_of(room, h)
@@ -122,21 +121,44 @@ fn server_turn(r: Room, listener: i64, timeout: i64) -> Room / {io, net} {
     room
 }
 
-/// Everything a client has been sent and has not read yet, in order.
-fn drain(label: str, h: i64) / {io, net} {
-    var going = true
-    while going {
-        let ready = net_wait([h], 50) ?? []
-        if ready.len() == 0 {
-            going = false
-        } else {
+/// One turn of the server: wait for something to happen, then handle it.
+///
+/// The wait is generous and the turn repeats until it actually handles
+/// something. An earlier version waited a fixed 200 ms and carried on
+/// regardless, which meant that on a machine busy for the wrong fifth of a
+/// second the server missed a message that was on its way — and the
+/// transcript, which is compared across three engines, came out different for
+/// reasons that had nothing to do with the engines. A test that fails when the
+/// machine is busy is a test nobody can trust when it fails for real.
+fn server_turn(r: Room, listener: i64) -> Room / {io, net} {
+    var room = r
+    var tries = 0
+    var idle = true
+    while idle and tries < 40 {
+        let ready = net_wait([listener] + room.conns, 1000) ?? []
+        if ready.len() > 0 {
+            room = handle_ready(room, listener, ready)
+            idle = false
+        }
+        tries = tries + 1
+    }
+    room
+}
+
+/// Waits for one broadcast to arrive, and prints it.
+fn hear_one(label: str, h: i64) / {io, net} {
+    var tries = 0
+    var waiting = true
+    while waiting and tries < 40 {
+        let ready = net_wait([h], 1000) ?? []
+        if ready.len() > 0 {
             let msg = tcp_read(h) ?? ""
-            if msg == "" {
-                going = false
-            } else {
+            if msg != "" {
                 print("  {label} heard {msg}")
             }
+            waiting = false
         }
+        tries = tries + 1
     }
 }
 
@@ -152,7 +174,7 @@ fn demo() / {io, net} {
             return
         }
     }
-    let port = tcp_port(listener) ?? 0
+    let port = net_port(listener) ?? 0
 
     // Three clients, dialled from the same thread that is about to serve them.
     // This is only possible because nothing here blocks: a blocking accept
@@ -174,8 +196,8 @@ fn demo() / {io, net} {
     // in practice rather than three.
     var room = empty_room()
     var turns = 0
-    while room.conns.len() < clients.len() and turns < 10 {
-        room = server_turn(room, listener, 200)
+    while room.conns.len() < clients.len() and turns < 20 {
+        room = server_turn(room, listener)
         turns = turns + 1
     }
     print("room holds {room.conns.len()}")
@@ -191,11 +213,11 @@ fn demo() / {io, net} {
             Ok(_) -> {}
             Err(e) -> print("send failed: {e}")
         }
-        room = server_turn(room, listener, 500)
+        room = server_turn(room, listener)
         var d = 0
         while d < clients.len() {
             if d != s {
-                drain(labels[d], clients[d])
+                hear_one(labels[d], clients[d])
             }
             d = d + 1
         }
@@ -205,18 +227,24 @@ fn demo() / {io, net} {
     // One client leaves. The server learns about it through the same wait
     // loop, with no separate disconnect channel.
     print("--- {labels[0]} leaves ---")
-    tcp_close(clients[0])
-    room = server_turn(room, listener, 500)
+    net_close(clients[0])
+    room = server_turn(room, listener)
     print("room holds {room.conns.len()}")
 
     var k = 1
     while k < clients.len() {
-        tcp_close(clients[k])
+        net_close(clients[k])
         k = k + 1
     }
-    room = server_turn(room, listener, 500)
+    // Both hangups may land in one turn or in two; keep going until the room
+    // is actually empty rather than assuming which.
+    var drain_turns = 0
+    while room.conns.len() > 0 and drain_turns < 20 {
+        room = server_turn(room, listener)
+        drain_turns = drain_turns + 1
+    }
     print("room holds {room.conns.len()}")
-    tcp_close(listener)
+    net_close(listener)
 }
 
 // --- the real server -----------------------------------------------------
@@ -229,12 +257,9 @@ fn serve() / {io, net} {
             var room = empty_room()
             var going = true
             while going {
-                // A negative timeout waits indefinitely, so an idle server
-                // uses no CPU at all — which is the other half of what
-                // readiness buys over polling in a loop.
-                room = server_turn(room, listener, -1)
+                room = server_turn(room, listener)
             }
-            tcp_close(listener)
+            net_close(listener)
         }
     }
 }

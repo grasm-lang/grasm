@@ -3199,6 +3199,16 @@ fn main() {
 //! tag: L-LIB-NET
 //! expect: output
 //! listening
+//! a chosen port is in range
+//! empty wait set: 0 ready
+//! a handle that names nothing is an Err
+//! before dial: nothing ready
+//! after dial: the listener
+//! before send: nothing ready
+//! after send: the connection
+//! read: ping
+//! after hangup: the connection
+//! read at end: 0 bytes
 //! closed twice is fine
 //! a closed handle reports rather than panics
 //! nothing is listening there, and that is an Err
@@ -3209,15 +3219,109 @@ fn main() {
 // colliding with whatever else holds a port. It does not accept a connection —
 // that would need a second process — and the shapes it does check are the ones
 // with an answer that does not depend on the machine.
+/// Names the ready handles by their role, so the transcript does not depend on
+/// which numbers this machine's socket table happened to hand out.
+fn report(step: str, ready: [i64], listener: i64, conn: i64) / {io} {
+    var out = ""
+    for h in ready {
+        if h == listener {
+            out = out + "the listener "
+        } else if h == conn {
+            out = out + "the connection "
+        } else {
+            out = out + "handle {h} "
+        }
+    }
+    if out == "" {
+        print("{step}: nothing ready")
+    } else {
+        print("{step}: {out.trim()}")
+    }
+}
+
 fn main() / {io, net} {
     match tcp_listen(0) {
         Err(e) -> print("could not listen")
         Ok(listener) -> {
             print("listening")
+
+            // Port 0 asked the system to choose. Reading the choice back is
+            // what makes that spelling usable: the rest of this program dials
+            // the listener it just opened, on a machine where the port it
+            // would otherwise have picked may already be held.
+            let port = net_port(listener) ?? 0
+            if port > 0 and port <= 65535 {
+                print("a chosen port is in range")
+            } else {
+                print("a chosen port is NOT in range: {port}")
+            }
+
+            // --- readiness --------------------------------------------------
+            //
+            // `net_wait` is what lets one thread hold many conversations.
+            // Each step checks readiness *before* the event that causes it as
+            // well as after: a `net_wait` that always answered "ready" would
+            // pass a test that only looked at the second half, and would make
+            // every server written against it busy-spin.
+
+            // An empty wait set is answered immediately and is not an error —
+            // a server that has just closed its last connection asks exactly
+            // this on its next turn.
+            match net_wait([], 0) {
+                Ok(r) -> print("empty wait set: {r.len()} ready")
+                Err(e) -> print("empty wait set: FAILED")
+            }
+
+            // A handle that names nothing is an ordinary failure, the same as
+            // using a connection after closing it — never a panic.
+            match net_wait([4242], 0) {
+                Ok(r) -> print("a handle that names nothing was accepted, which it must not")
+                Err(e) -> print("a handle that names nothing is an Err")
+            }
+
+            report("before dial", net_wait([listener], 0) ?? [], listener, -1)
+
+            match tcp_connect("127.0.0.1", port) {
+                Err(e) -> print("could not dial the listener")
+                Ok(client) -> {
+                    // The handshake completed, so accepting will not block.
+                    report("after dial", net_wait([listener], 1000) ?? [], listener, -1)
+
+                    match tcp_accept(listener) {
+                        Err(e) -> print("could not accept")
+                        Ok(conn) -> {
+                            // Accepted, but the client has said nothing yet.
+                            report("before send", net_wait([conn], 0) ?? [], listener, conn)
+
+                            match tcp_write(client, "ping") {
+                                Ok(_) -> {}
+                                Err(e) -> print("could not write")
+                            }
+
+                            // Both handles in one call, so the answer also
+                            // shows the ready ones being picked out rather
+                            // than the whole set coming back.
+                            report("after send", net_wait([listener, conn], 1000) ?? [], listener, conn)
+                            print("read: {tcp_read(conn) ?? "(nothing)"}")
+
+                            // A hung-up peer is ready: the read that follows
+                            // returns nothing, which is how a caller learns
+                            // the conversation ended. Reporting it as
+                            // not-ready would leave a dead connection in the
+                            // wait set forever.
+                            net_close(client)
+                            report("after hangup", net_wait([conn], 1000) ?? [], listener, conn)
+                            print("read at end: {(tcp_read(conn) ?? "").len()} bytes")
+                            net_close(conn)
+                        }
+                    }
+                }
+            }
+
             // Closing twice is not an error, for the same reason releasing a
             // `ref` twice is not: cleanup order is not the caller's to track.
-            tcp_close(listener)
-            tcp_close(listener)
+            net_close(listener)
+            net_close(listener)
             print("closed twice is fine")
             // Using a closed handle is an ordinary failure, never a panic and
             // never a wrong answer.
@@ -3538,6 +3642,7 @@ fn main() {
 //! ell abc 2
 //! true true true 6
 //! HeLLo,WorLd x HELLO,WORLD hello,world abab
+//! chars 1 3 3 | bytes 4 4 3
 //! 007 7.. 2 5 2.5
 fn main() {
     let s = "Hello,World"
@@ -3546,6 +3651,9 @@ fn main() {
     print("{s.substr(1, 3)} {"abcdef".substr(0, 3)} {s.split(",").len()}")
     print("{s.contains("World")} {s.starts_with("He")} {s.ends_with("ld")} {s.index_of("W") ?? 0 - 1}")
     print("{s.replace("l", "L")} {"  x ".trim()} {s.to_upper()} {s.to_lower()} {"ab".repeat(2)}")
+    // Characters and bytes are the same number only for ASCII, and a length
+    // that goes on the wire has to be the second one.
+    print("chars {"🙂".len()} {"añb".len()} {"abc".len()} | bytes {"🙂".byte_len()} {"añb".byte_len()} {"abc".byte_len()}")
     print("{"7".pad_start(3, "0")} {"7".pad_end(3, ".")} {"a\nb".lines().len()} {"5".parse_int() ?? 0} {"2.5".parse_float() ?? 0.0}")
 }
 ```
@@ -3665,6 +3773,93 @@ fn main() {
         n = n + i
     }
     print("{f} {g} {n}")
+}
+```
+
+## `L-LIB-UDP.gr`
+
+```grasm
+//! tag: L-LIB-UDP
+//! expect: output
+//! bound two sockets
+//! sent 5 bytes
+//! ready: 1 of 1
+//! got 5 bytes: 1 2 255 0 65
+//! a stream operation on a datagram socket is an Err
+//! a datagram operation on a listener is an Err
+//! nothing more arrived
+// Datagrams: whole messages, to an address named at send time, carrying bytes.
+//
+// Both sockets ask for port 0 and read the choice back with `net_port`, so the
+// program runs on a machine where the ports it would otherwise have picked are
+// already held.
+fn spell(b: bytes) -> str {
+    var out = ""
+    for i in 0..b.len() {
+        out = out + "{b.at(i)} "
+    }
+    out.trim()
+}
+
+fn main() / {io, net} {
+    match udp_bind(0) {
+        Err(e) -> print("could not bind")
+        Ok(server) -> {
+            match udp_bind(0) {
+                Err(e) -> print("could not bind a second time")
+                Ok(client) -> {
+                    print("bound two sockets")
+                    let port = net_port(server) ?? 0
+
+                    // A packed binary payload, which is the reason the payload
+                    // type is `bytes` and not `str`: 255 and 0 are not text and
+                    // a lossy UTF-8 conversion would not return them.
+                    let msg = bytes_of([1, 2, 255, 0, 65])
+                    match udp_send(client, "127.0.0.1", port, msg) {
+                        Err(e) -> print("could not send")
+                        Ok(n) -> print("sent {n} bytes")
+                    }
+
+                    // Readiness works on a datagram handle exactly as it does
+                    // on a stream one, because they share the table.
+                    let ready = net_wait([server], 1000) ?? []
+                    print("ready: {ready.len()} of 1")
+
+                    match udp_recv(server) {
+                        Err(e) -> print("could not receive")
+                        Ok(got) -> print("got {got.len()} bytes: {spell(got)}")
+                    }
+
+                    // The kinds do not silently substitute for one another.
+                    match tcp_read(server) {
+                        Ok(_) -> print("a stream read on a datagram socket answered, which it must not")
+                        Err(e) -> print("a stream operation on a datagram socket is an Err")
+                    }
+                    match tcp_listen(0) {
+                        Err(e) -> print("could not listen")
+                        Ok(listener) -> {
+                            match udp_recv(listener) {
+                                Ok(_) -> print("a datagram read on a listener answered, which it must not")
+                                Err(e) -> print("a datagram operation on a listener is an Err")
+                            }
+                            net_close(listener)
+                        }
+                    }
+
+                    // One datagram was sent and one was received, so nothing is
+                    // left: a second `net_wait` finds the socket quiet.
+                    let again = net_wait([server], 100) ?? []
+                    if again.len() == 0 {
+                        print("nothing more arrived")
+                    } else {
+                        print("something arrived that was never sent")
+                    }
+                    net_close(client)
+                }
+            }
+            net_close(server)
+        }
+    }
 }
 ```
 

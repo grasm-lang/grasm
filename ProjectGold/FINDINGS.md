@@ -33,12 +33,19 @@ help: the next line starts with `or`, so this statement ended here — a newline
       to the end of this line, or wrap the whole expression in parentheses
 ```
 
-## F2 — `str.len()` counts code points, and byte length is unaskable (S4, library)
+## F2 — `str.len()` counts code points, and byte length is unaskable (S4, library) — **fixed**
 
 Found writing 04-palindrome-checker. `"🙂".len()` is 1 and `"añb".len()` is 3.
 Consistent and probably right for a high-level language, but there is no way to
 ask how many *bytes* a string occupies — which matters the moment a program
 writes one to a socket or a file and has to say how long it is.
+
+**Fixed** — `s.byte_len()`, alongside `len()` rather than replacing it
+([L-LIB-STR]). Characters stay the default because they are the right unit for a
+high-level language; bytes are what a `Content-Length` counts, and computing one
+from `len()` is wrong for every string that is not ASCII.
+
+Adding it found an S1 in the native backend, which is recorded as F17.
 
 ## F3 — no bitwise operators at all (S3) — **fixed as [L-LIB-BITS]**
 
@@ -231,12 +238,92 @@ the outstanding gaps and it blocks the most.
 `par_map` would supply the concurrency the project asks for; the threads are not
 the problem.
 
-## F12 — no UDP (S4, library)
+## F12 — no UDP (S4, library) — **fixed**
 
 Found writing 25-dns-resolver. Only TCP exists. DNS is a UDP protocol, and
 while it can be done over TCP, the project as stated is a datagram exercise.
 Blocked behind F9 in any case: a DNS query is a packed binary structure with
 bit-level flags, and there is no byte type to build one in.
+
+**Fixed** — `udp_bind`, `udp_send` and `udp_recv` ([L-LIB-UDP]), once `bytes`
+existed to carry the payload. The signatures deliberately do not mirror the
+stream ones: a datagram is a whole message sent to an address named at send
+time, so `udp_send` takes the destination on every call, and giving the two
+operations the same shape would have thrown away the thing that makes UDP worth
+having.
+
+Datagram handles share the socket table with stream handles, so `net_wait`,
+`net_port` and `net_close` work on all three kinds. That is what lets the
+resolver time out on a server that never answers instead of hanging — the
+ordinary failure, not the exotic one. 25 now resolves against 8.8.8.8.
+
+The general operations were renamed from `tcp_close`/`tcp_port` to
+`net_close`/`net_port` at the same time. They were never TCP-specific, and a
+`tcp_close` that closes a UDP socket is a name that lies.
+
+## F16 — a method chain cannot be split across lines (S4, grammar)
+
+Found writing 25-dns-resolver. A statement ends at the newline, so
+
+```grasm
+u16_bytes(id)
+    .concat(u16_bytes(flags))
+```
+
+does not parse: the second line starts a new statement with a leading `.`.
+Building a DNS packet is nine concatenations, and the choice is one very long
+line or a `join([...])` helper.
+
+Not a defect — newline termination is a deliberate choice and it is why Grasm
+needs no semicolons. But every language with newline termination and method
+chaining has had to answer this (Python's parentheses, Swift's and Kotlin's
+continuation rules, Go's rule that the `.` must end the line), and Grasm has
+not. The narrowest fix is to let a newline be absorbed when the next
+non-whitespace character is a `.`, which is unambiguous because no statement
+may begin with one.
+
+## F17 — a native-backend catch-all silently miscompiled a new method (S1, backend) — **fixed**
+
+Found adding `byte_len` for F2. `borrowed_read` in the native backend chooses
+the runtime function to call in one table and the *type it returns* in another,
+and the second ended in
+
+```rust
+(VType::Str, _) => VType::Str,
+```
+
+So `byte_len`, which returns an `i64`, was typed as a boxed string. The compiled
+program called `.len()` on the integer 10 as though it were a pointer and took
+SIGSEGV, while `grasm run` printed the right answer: a crash *and* an engine
+disagreement, from one missing row.
+
+The literal test case passed, because a literal receiver takes a different path.
+It only appeared on a receiver that was a loop variable — which is why it was
+found by writing a real program and not by the unit test written alongside the
+feature.
+
+**Fixed** — the catch-all is gone and every method is named. An unlisted method
+now falls through to the owning path, which is slower and correct, instead of
+being miscompiled. This is the general shape: a permissive fallback in a table
+that must agree with another table is a defect waiting for the next addition.
+
+## F18 — two gate programs asserted on wall-clock time (S2, tests) — **fixed**
+
+Found when `ProjectGold/run.sh` failed twice in six runs on code that had not
+changed. 15-sorting-benchmark asserted that bubble sort's *elapsed time* grew at
+least 3x when `n` doubled, and 30-async-chat waited a fixed 200 ms for a message
+and carried on regardless. Both are true on an idle machine and neither is true
+on a busy one.
+
+A gate that fails when the machine is busy is worse than no gate, because it
+teaches you to re-run it — and re-running is exactly what you must not do when
+it fails for real.
+
+**Fixed** — 15 now counts *comparisons*, which is what the complexity claim is
+actually about and is identical on every engine and under any load; the clock is
+still read (that is what charges `main` with `io`) but nothing is asserted about
+how long anything took. 30 now waits until it has actually handled an event
+rather than for a fixed interval. Six consecutive gate runs, clean.
 
 ## F13 — every socket operation blocks (S3, library) — **fixed**
 

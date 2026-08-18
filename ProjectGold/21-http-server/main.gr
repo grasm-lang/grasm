@@ -284,12 +284,12 @@ fn serve() / {io, net} {
                             Ok(_) -> {}
                             Err(e) -> {}
                         }
-                        tcp_close(conn)
+                        net_close(conn)
                         print("{r.method} {r.path} -> {status_of(resp)}")
                     }
                 }
             }
-            tcp_close(listener)
+            net_close(listener)
         }
     }
 }

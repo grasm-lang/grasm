@@ -245,35 +245,117 @@ fn main() / {io} {
     }
     print("merge sort kept equal keys in order: {stable}")
 
-    // Timings themselves are machine-dependent and cannot be compared across
-    // engines, and there is nowhere to put them but stdout (FINDINGS.md, F7).
-    // So what is printed is the *shape* of the curve, which is the actual
-    // claim: an O(n^2) sort roughly quadruples when n doubles, an O(n log n)
-    // one roughly doubles.
+    // What the growth section claims is that one sort is quadratic and the
+    // other is not. Wall-clock time is a *proxy* for that, and a bad one: the
+    // assertions below used to compare elapsed milliseconds, and on a machine
+    // that was busy for the wrong two hundred milliseconds the ratio flipped
+    // and the gate failed on code that had not changed. A benchmark whose
+    // answer depends on what else the machine is doing is the same defect as a
+    // benchmark that does not check its answers.
     //
-    // `n` grows until the baseline is big enough to measure, so a fast native
-    // build and a slow interpreter reach the same conclusion rather than
-    // dividing by zero.
+    // So the curve is measured by *counting comparisons*, which is what the
+    // complexity claim is actually about. The count is a property of the
+    // algorithm and the input, so it is identical on every engine, on every
+    // machine, and under any load — and the same numbers still distinguish
+    // O(n^2) from O(n log n), which is the whole point.
+    //
+    // The clock is still read, and its result still printed, because a program
+    // that reads a clock is what charges `main` with `io`. It is reported and
+    // not asserted on.
     print("--- growth ---")
 
-    var n = 500
-    var base = 0
-    while base < 25 and n <= 8000 {
-        n = n * 2
-        base = time_of(bubble, random_list(n, 9, 100000))
-    }
+    let n = 400
+    let small = random_list(n, 9, 100000)
+    let large = random_list(n * 2, 9, 100000)
 
-    let bubble_1 = time_of(bubble, random_list(n, 9, 100000))
-    let bubble_2 = time_of(bubble, random_list(n * 2, 9, 100000))
-    let merge_1 = time_of(merge_sort, random_list(n * 8, 9, 100000))
-    let merge_2 = time_of(merge_sort, random_list(n * 16, 9, 100000))
+    let bubble_1 = bubble_ops(small)
+    let bubble_2 = bubble_ops(large)
+    let merge_1 = merge_ops(small)
+    let merge_2 = merge_ops(large)
 
     // Ratios as tenths, to avoid float formatting differences.
-    let bubble_ratio = if bubble_1 > 0 { (bubble_2 * 10) / bubble_1 } else { 0 }
-    let merge_ratio = if merge_1 > 0 { (merge_2 * 10) / merge_1 } else { 0 }
+    let bubble_ratio = (bubble_2 * 10) / bubble_1
+    let merge_ratio = (merge_2 * 10) / merge_1
 
-    print("bubble doubles n: at least 3x slower: {bubble_ratio >= 30}")
-    print("merge doubles n:  under 3x slower:    {merge_ratio > 0 and merge_ratio < 30}")
-    print("quick beats bubble on the same input: {time_of(quick, random_list(n, 9, 100000)) < bubble_1}")
-    print("merge beats bubble on the same input: {time_of(merge_sort, random_list(n, 9, 100000)) < bubble_1}")
+    print("bubble doubles n: at least 3x more comparisons: {bubble_ratio >= 30}")
+    print("merge doubles n:  under 3x more comparisons:    {merge_ratio > 0 and merge_ratio < 30}")
+    print("quick compares less than bubble on the same input: {quick_ops(small) < bubble_1}")
+    print("merge compares less than bubble on the same input: {merge_1 < bubble_1}")
+
+    // The clock is read, because reading one is what charges `main` with `io`
+    // and that is half of what this program demonstrates. Nothing is asserted
+    // about *how long* anything took: the first version of this line compared
+    // two elapsed times, and comparing elapsed times is exactly the thing that
+    // made this gate fail on code that had not changed.
+    let elapsed = time_of(merge_sort, small)
+    print("the clock ran forwards: {elapsed >= 0}")
+}
+
+// --- counting the work, instead of timing it ------------------------------
+//
+// Each of these mirrors the sort above it exactly and returns the number of
+// key comparisons instead of the sorted list. Duplicating the loop is the
+// price of not having a way to instrument a function from outside it, and it
+// buys an answer that does not depend on the machine.
+
+fn bubble_ops(xs: [i64]) -> i64 {
+    var a = xs
+    let n = a.len()
+    var pass = 0
+    var swapped = true
+    var ops = 0
+    while swapped and pass < n {
+        swapped = false
+        for i in 1..(n - pass) {
+            ops = ops + 1
+            if a[i - 1] > a[i] {
+                let t = a[i - 1]
+                a[i - 1] = a[i]
+                a[i] = t
+                swapped = true
+            }
+        }
+        pass = pass + 1
+    }
+    ops
+}
+
+fn merge_ops(xs: [i64]) -> i64 {
+    if xs.len() <= 1 {
+        return 0
+    }
+    let mid = xs.len() / 2
+    var left: [i64] = []
+    var right: [i64] = []
+    for i in 0..mid { left.push(xs[i]) }
+    for i in mid..xs.len() { right.push(xs[i]) }
+    var ops = merge_ops(left) + merge_ops(right)
+    let a = merge_sort(left)
+    let b = merge_sort(right)
+    var i = 0
+    var j = 0
+    while i < a.len() and j < b.len() {
+        ops = ops + 1
+        if a[i] <= b[j] { i = i + 1 } else { j = j + 1 }
+    }
+    ops
+}
+
+fn quick_ops(xs: [i64]) -> i64 {
+    if xs.len() <= 1 {
+        return 0
+    }
+    let pivot = xs[xs.len() / 2]
+    var lo: [i64] = []
+    var eq: [i64] = []
+    var hi: [i64] = []
+    var ops = 0
+    for v in xs {
+        // Two comparisons per element, the same two the sort performs.
+        ops = ops + 2
+        if v < pivot { lo.push(v) }
+        else if v > pivot { hi.push(v) }
+        else { eq.push(v) }
+    }
+    ops + quick_ops(lo) + quick_ops(hi)
 }
