@@ -26,7 +26,7 @@ no way to. `extern fn` carries scalars only, so `system`, `execv`, `fork`,
 `posix_spawn` and `popen` — every one of which takes a pointer — were all
 unreachable (**F8**).
 
-The fix was *not* to widen the C boundary. It was `run_program(program, args)` under a
+The fix was *not* to widen the C boundary. It was `proc_run(program, args)` under a
 capability of its own ([L-LIB-PROC]).
 
 **`proc` is strictly larger than `io` or `net`.** A program that can start
@@ -56,7 +56,7 @@ process half runs too, against `echo` and `sh`, which POSIX guarantees exist.
 
 `cd` cannot be a program: a child process changes its own directory and exits,
 which is not what anyone means. `exit` and `status` are the same shape of thing.
-`cd` here is *tracked rather than performed* — `run_program` starts each program in this
+`cd` here is *tracked rather than performed* — `proc_run` starts each program in this
 process's directory and nothing in the language can change that, so the shell
 reports what it was told rather than pretending. A shell that silently ignored
 `cd` would be worse than one that says what it does.
@@ -64,6 +64,6 @@ reports what it was told rather than pretending. A shell that silently ignored
 ## What it does not have
 
 No pipes, no redirection, no job control, no background `&`. Each needs the
-child's file descriptors, and `run_program` captures both streams and returns them —
+child's file descriptors, and `proc_run` captures both streams and returns them —
 which is the right default for a builtin and the wrong primitive for a pipeline.
 That is a real gap and it is recorded as a finding.

@@ -242,7 +242,8 @@ pub const BUILTIN_FREE_FNS: &[&str] = &[
     "udp_bind",
     "udp_send",
     "udp_recv",
-    "run_program",
+    "proc_run",
+    "proc_pipeline",
     "read_file",
     "write_file",
     "file_exists",
@@ -4377,15 +4378,36 @@ only a number or a `bool` can come out — compute what you need and yield that"
                     // positions did not need a name, and inventing one would
                     // have put a type in the prelude that nothing else uses
                     // ([L-LIB-PROC]).
-                    "run_program" => {
+                    "proc_run" => {
                         if args.len() != 2 {
                             return self.error(
                                 span,
-                                "run_program takes 2 arguments (program, arguments)",
+                                "proc_run takes 2 arguments (program, arguments)",
                             );
                         }
                         self.check_expr(&args[0], &Type::Str);
                         self.check_expr(&args[1], &Type::List(Box::new(Type::Str)));
+                        let io_err = Type::Named {
+                            id: self.defs.io_error_id,
+                            args: vec![],
+                        };
+                        let triple = Type::Tuple(vec![Type::I64, Type::Str, Type::Str]);
+                        return Type::Fallible(Box::new(triple), Box::new(io_err));
+                    }
+                    // A pipeline cannot be built out of `proc_run`: that
+                    // waits and hands back output, and a pipeline needs one
+                    // child's stdout to *be* another's stdin ([L-LIB-PROC]).
+                    "proc_pipeline" => {
+                        if args.len() != 2 {
+                            return self
+                                .error(span, "proc_pipeline takes 2 arguments (stages, input)");
+                        }
+                        let stage = Type::Tuple(vec![
+                            Type::Str,
+                            Type::List(Box::new(Type::Str)),
+                        ]);
+                        self.check_expr(&args[0], &Type::List(Box::new(stage)));
+                        self.check_expr(&args[1], &Type::Str);
                         let io_err = Type::Named {
                             id: self.defs.io_error_id,
                             args: vec![],

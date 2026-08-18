@@ -5,7 +5,7 @@
 // only, so `system`, `execv`, `fork` and `popen` — all of which take pointers —
 // were unreachable (FINDINGS.md F8).
 //
-// The answer was not to widen the C boundary. It was `run_program(program, args)` under
+// The answer was not to widen the C boundary. It was `proc_run(program, args)` under
 // a capability of its own ([L-LIB-PROC]): `proc` is strictly larger than `io`
 // or `net`, because a program that can start `curl` has the network whether or
 // not it declared `net`. This file declares `/ {io, proc}`, and a package that
@@ -115,7 +115,7 @@ fn builtin(sh: Shell, words: [str]) -> (Shell, bool) / {io} {
     }
     if name == "cd" {
         let target = if words.len() > 1 { words[1] } else { "/" }
-        // `cd` is tracked rather than performed: `run_program` starts each program in
+        // `cd` is tracked rather than performed: `proc_run` starts each program in
         // this process's directory, and nothing here can change that. What the
         // shell can honestly offer is to pass it on, which the `pwd` built-in
         // reports.
@@ -126,6 +126,37 @@ fn builtin(sh: Shell, words: [str]) -> (Shell, bool) / {io} {
         return (sh, true)
     }
     (sh, false)
+}
+
+/// Splits a parsed line at each `|`.
+///
+/// The split happens *after* quoting, which is the whole reason parsing is a
+/// separate step: `echo "a | b"` is one argument containing a pipe, not two
+/// commands, and a shell that split the raw text first could never tell.
+fn stages_of(words: [str]) -> [(str, [str])] {
+    var out: [(str, [str])] = []
+    var program = ""
+    var argv: [str] = []
+    var started = false
+    for w in words {
+        if w == "|" {
+            if started {
+                out = out + [(program, argv)]
+            }
+            program = ""
+            argv = []
+            started = false
+        } else if not started {
+            program = w
+            started = true
+        } else {
+            argv = argv + [w]
+        }
+    }
+    if started {
+        out = out + [(program, argv)]
+    }
+    out
 }
 
 fn execute(sh: Shell, src: str) -> Shell / {io, proc} {
@@ -143,12 +174,37 @@ fn execute(sh: Shell, src: str) -> Shell / {io, proc} {
         return handled.0
     }
 
+    // A pipeline is the general case and a single command is the one-stage
+    // version of it, so there is one path rather than two.
+    let stages = stages_of(line.words)
+    if stages.len() == 0 {
+        print("nothing to run")
+        return Shell{ cwd: sh.cwd, last_status: 2, going: sh.going }
+    }
+    if stages.len() > 1 {
+        match proc_pipeline(stages, "") {
+            Err(e) -> {
+                print("{stages[0].0}: not found")
+                return Shell{ cwd: sh.cwd, last_status: 127, going: sh.going }
+            }
+            Ok(r) -> {
+                if r.1.len() > 0 {
+                    print("{r.1.trim_end()}")
+                }
+                if r.2.len() > 0 {
+                    eprint("{r.2.trim_end()}")
+                }
+                return Shell{ cwd: sh.cwd, last_status: r.0, going: sh.going }
+            }
+        }
+    }
+
     var rest: [str] = []
     for i in 1..line.words.len() {
         rest = rest + [line.words[i]]
     }
 
-    match run_program(line.words[0], rest) {
+    match proc_run(line.words[0], rest) {
         // A program that cannot be started is a different thing from one that
         // ran and failed, and a shell that conflated them would report "command
         // not found" for a command that ran and returned 127.
@@ -201,6 +257,17 @@ fn demo() / {io, proc} {
     sh = execute(sh, "status")
     sh = execute(sh, "no-such-program-anywhere")
     sh = execute(sh, "status")
+
+    print("--- pipelines ---")
+    // `sort` and `tr` rather than `wc`: `wc` right-aligns its count on the BSD
+    // tools and does not on the GNU ones, and a demonstration whose output
+    // depends on which machine ran it cannot be compared across engines.
+    sh = execute(sh, "printf 'b\\na\\nb\\nc\\na\\n' | sort | uniq")
+    sh = execute(sh, "status")
+    sh = execute(sh, "echo one two three | tr 'a-z' 'A-Z'")
+    // A quoted pipe is a character, not a separator — which is why the line is
+    // split into stages after parsing rather than before.
+    sh = execute(sh, "echo \"a | b\"")
 
     print("--- quoting reaches the child ---")
     // The point of parsing quotes: this is one argument, and a shell that

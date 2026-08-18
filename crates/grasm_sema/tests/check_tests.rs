@@ -3561,6 +3561,78 @@ fn every_callable_builtin_is_a_reserved_name() {
     }
 }
 
+/// No builtin may take a name a program in this repository already uses.
+///
+/// The two rules above are judgement, and judgement missed twice. `run` was
+/// added and two ProjectGold programs already had a `fn run`. `run_pipeline`
+/// was added — `verb_noun`, which the rule below asks for — and
+/// `examples/function_values.gr` already had a `fn run_pipeline` folding a list
+/// of integers. "Pipeline" is a word programs use for their own abstractions,
+/// and no naming convention was going to predict that.
+///
+/// This one is not judgement. It reads the corpus.
+#[test]
+fn no_builtin_takes_a_name_the_corpus_already_uses() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("crates/grasm_sema is two levels down")
+        .to_path_buf();
+
+    let mut sources = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let path = e.path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            // `target` is build output and `.git` is history; neither is code
+            // anybody wrote.
+            if path.is_dir() {
+                if name != "target" && name != ".git" {
+                    stack.push(path);
+                }
+            } else if path.extension().is_some_and(|x| x == "gr") {
+                sources.push(path);
+            }
+        }
+    }
+    assert!(
+        sources.len() > 100,
+        "expected to find the .gr corpus, found {} file(s)",
+        sources.len()
+    );
+
+    let mut clashes = Vec::new();
+    for path in &sources {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        for line in text.lines() {
+            let t = line.trim_start();
+            let Some(rest) = t.strip_prefix("fn ").or_else(|| t.strip_prefix("pub fn ")) else {
+                continue;
+            };
+            let declared: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if grasm_sema::check::BUILTIN_FREE_FNS.contains(&declared.as_str()) {
+                let shown = path.strip_prefix(&root).unwrap_or(path);
+                clashes.push(format!("{}: fn {declared}", shown.display()));
+            }
+        }
+    }
+    assert!(
+        clashes.is_empty(),
+        "a builtin has taken a name a program already uses — the program stops \
+compiling and the error says nothing about a name being reserved:\n  {}",
+        clashes.join("\n  ")
+    );
+}
+
 /// A builtin's name must be one nobody would reasonably want.
 ///
 /// Reserving a name is permanent and total: a program cannot declare it, cannot
@@ -3569,16 +3641,22 @@ fn every_callable_builtin_is_a_reserved_name() {
 /// own list were already using — which is the cheapest possible warning that the
 /// name was wrong, and it only arrived because those programs are in the gate.
 ///
-/// So builtins are `verb_noun`: `read_file`, `write_bytes`, `tcp_listen`,
-/// `udp_bind`, `run_program`. The bare verbs a program is likely to want —
-/// `run`, `send`, `open`, `close`, `read`, `write`, `start`, `stop`, `wait`,
-/// `execute` — stay available.
+/// So a builtin names the thing outside the program that it touches, usually
+/// with a domain prefix: `tcp_listen`, `udp_bind`, `net_wait`, `proc_run`,
+/// `proc_pipeline`, `read_file`, `write_bytes`. The bare verbs a program is
+/// likely to want — `run`, `send`, `open`, `close`, `read`, `write`, `start`,
+/// `stop`, `wait`, `execute` — stay available.
+///
+/// `verb_noun` alone was not enough: `run_pipeline` fitted it and still took a
+/// name a program in this repository was using. The test above is what
+/// actually catches that.
 #[test]
 fn builtins_do_not_take_names_a_program_would_want() {
     const WANTED: &[&str] = &[
         "run", "send", "open", "close", "read", "write", "start", "stop", "wait", "execute",
         "step", "next", "get", "set", "add", "push", "pop", "find", "parse", "format", "log",
-        "init", "update", "check", "process", "handle", "make", "build",
+        "init", "update", "check", "process", "handle", "make", "build", "run_pipeline",
+        "pipeline", "emit", "apply", "reduce", "walk", "visit", "render",
     ];
     let taken: Vec<&str> = WANTED
         .iter()

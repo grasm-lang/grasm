@@ -21,6 +21,13 @@ hello from a child process
 7
 no-such-program-anywhere: not found
 127
+--- pipelines ---
+a
+b
+c
+0
+ONE TWO THREE
+a | b
 --- quoting reaches the child ---
 a b c
 semi;colon

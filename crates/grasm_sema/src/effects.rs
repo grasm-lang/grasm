@@ -29,7 +29,7 @@ pub const NET: &str = "net";
 pub const PROC: &str = "proc";
 
 /// The builtins that perform `proc`.
-const PROC_BUILTINS: &[&str] = &["run_program"];
+const PROC_BUILTINS: &[&str] = &["proc_run", "proc_pipeline"];
 
 /// The builtins that perform `net`.
 const NET_BUILTINS: &[&str] = &[

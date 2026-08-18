@@ -2569,7 +2569,113 @@ uses to mark the end of a string"
                     // would make the three engines disagree on ordering,
                     // because the child's writes and the parent's go through
                     // different buffers ([L-LIB-PROC]).
-                    "run_program" => {
+                    // A pipeline cannot be built out of `proc_run`: that
+                    // waits and hands back output, and a pipeline needs one
+                    // child's stdout to *be* another's stdin ([L-LIB-PROC]).
+                    "proc_pipeline" => {
+                        use std::io::Write;
+                        use std::process::{Command, Stdio};
+                        let fail = |m: String| Value::Err(Rc::new(io_error("IoFailed", m)));
+                        let stages = self.eval_expr(&args[0])?;
+                        let stdin_text = self.eval_expr(&args[1])?.to_string();
+                        let Value::List(items) = stages else {
+                            return Ok(fail("proc_pipeline takes a list of stages".to_string()));
+                        };
+                        if items.is_empty() {
+                            return Ok(fail("a pipeline needs at least one stage".to_string()));
+                        }
+                        let mut plan: Vec<(String, Vec<String>)> = Vec::new();
+                        for it in items.iter() {
+                            let Value::Tuple(fields) = it else {
+                                return Ok(fail(
+                                    "each stage is a (program, arguments) pair".to_string(),
+                                ));
+                            };
+                            let program = fields[0].to_string();
+                            let argv = match &fields[1] {
+                                Value::List(a) => {
+                                    a.iter().map(|v| v.to_string()).collect::<Vec<String>>()
+                                }
+                                _ => Vec::new(),
+                            };
+                            plan.push((program, argv));
+                        }
+
+                        let mut children: Vec<std::process::Child> = Vec::new();
+                        let mut prev: Option<std::process::ChildStdout> = None;
+                        for (i, (program, argv)) in plan.iter().enumerate() {
+                            let is_last = i + 1 == plan.len();
+                            let mut cmd = Command::new(program);
+                            cmd.args(argv);
+                            match prev.take() {
+                                Some(out) => {
+                                    cmd.stdin(Stdio::from(out));
+                                }
+                                None => {
+                                    cmd.stdin(Stdio::piped());
+                                }
+                            }
+                            cmd.stdout(Stdio::piped());
+                            // Only the last stage's stderr is answered with. An
+                            // earlier stage's goes to this program's own stderr
+                            // rather than being discarded: a diagnostic nobody
+                            // sees is worse than one in the wrong place.
+                            if is_last {
+                                cmd.stderr(Stdio::piped());
+                            } else {
+                                cmd.stderr(Stdio::inherit());
+                            }
+                            let mut child = match cmd.spawn() {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    for mut c in children {
+                                        let _ = c.kill();
+                                        let _ = c.wait();
+                                    }
+                                    return Ok(fail(format!("{program}: {e}")));
+                                }
+                            };
+                            if i == 0 && !stdin_text.is_empty() {
+                                // Written on a thread: a large input and a
+                                // chatty child deadlock if the parent writes
+                                // everything before it reads anything.
+                                if let Some(mut sink) = child.stdin.take() {
+                                    let text = stdin_text.clone();
+                                    std::thread::spawn(move || {
+                                        let _ = sink.write_all(text.as_bytes());
+                                    });
+                                }
+                            } else if i == 0 {
+                                // Closed, so a filter reading to end-of-input
+                                // does not wait for input that is never coming.
+                                drop(child.stdin.take());
+                            }
+                            if !is_last {
+                                prev = child.stdout.take();
+                            }
+                            children.push(child);
+                        }
+
+                        let last = children.pop().expect("at least one stage");
+                        let out = match last.wait_with_output() {
+                            Ok(o) => o,
+                            Err(e) => return Ok(fail(e.to_string())),
+                        };
+                        // The earlier stages are reaped so they do not become
+                        // zombies. Their statuses are deliberately not
+                        // reported: a pipeline's status is its last stage's,
+                        // which is what every shell means by it.
+                        for mut c in children {
+                            let _ = c.wait();
+                        }
+                        let code = out.status.code().map_or(-1, i64::from);
+                        return Ok(Value::Ok(Rc::new(Value::Tuple(Rc::new(vec![
+                            Value::Int(code),
+                            Value::str(String::from_utf8_lossy(&out.stdout).into_owned()),
+                            Value::str(String::from_utf8_lossy(&out.stderr).into_owned()),
+                        ])))));
+                    }
+                    "proc_run" => {
                         let program = self.eval_expr(&args[0])?.to_string();
                         let argv = match self.eval_expr(&args[1])? {
                             Value::List(items) => {

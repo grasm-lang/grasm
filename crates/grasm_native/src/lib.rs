@@ -715,6 +715,7 @@ impl<'m> Codegen<'m> {
             ("grasm_net_wait", vec![i64t, i64t], Some(i64t)),
             ("grasm_net_port", vec![i64t], Some(i64t)),
             ("grasm_proc_run", vec![i64t, i64t], Some(i64t)),
+            ("grasm_proc_pipeline", vec![i64t, i64t], Some(i64t)),
             // The C boundary ([T-EXTERN-POINTER]).
             ("grasm_str_c_new", vec![i64t], Some(i64t)),
             ("grasm_str_c_free", vec![i64t], None),
@@ -7535,7 +7536,25 @@ checker did",
                     ),
                 )));
             }
-            "run_program" => {
+            "proc_pipeline" => {
+                let (sv, st) = self.eval_expr_val(&args[0])?;
+                let boxed_s = self.box_value(sv, &st);
+                let (iv, it) = self.eval_expr_val(&args[1])?;
+                let boxed_i = self.box_value(iv, &it);
+                let v = self
+                    .call_rt("grasm_proc_pipeline", &[boxed_s, boxed_i])
+                    .unwrap();
+                self.call_rt("grasm_val_dec", &[boxed_s]);
+                self.call_rt("grasm_val_dec", &[boxed_i]);
+                return Ok(Some((
+                    v,
+                    VType::Fallible(
+                        Box::new(VType::Tuple(vec![VType::I64, VType::Str, VType::Str])),
+                        Box::new(VType::Sum("IoError".into())),
+                    ),
+                )));
+            }
+            "proc_run" => {
                 let (cv, ct) = self.eval_expr_val(&args[0])?;
                 let boxed_c = self.box_value(cv, &ct);
                 let (av, at) = self.eval_expr_val(&args[1])?;
@@ -8872,7 +8891,7 @@ checker did",
                                 Box::new(VType::Str),
                                 Box::new(VType::Sum("IoError".into())),
                             )),
-                            "run_program" => Some(VType::Fallible(
+                            "proc_run" | "proc_pipeline" => Some(VType::Fallible(
                                 Box::new(VType::Tuple(vec![
                                     VType::I64,
                                     VType::Str,

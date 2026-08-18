@@ -203,7 +203,7 @@ The safety story needed nothing new. A declared C function's row was already
 cross did not widen what a package can hide.
 
 17-simple-shell, the project that found this, was unblocked earlier and by a
-different route — `run_program` under the `proc` capability ([L-LIB-PROC]) —
+different route — `proc_run` under the `proc` capability ([L-LIB-PROC]) —
 because a shell wants to *start a program*, not to reach C. That was the right
 call for that project and it is not what closed this.
 
@@ -386,7 +386,7 @@ builtin.
 ### The rule that came out of it
 
 Reserving a name is permanent and total. So a builtin is named `verb_noun` —
-`read_file`, `write_bytes`, `tcp_listen`, `udp_bind`, and now `run_program` —
+`read_file`, `write_bytes`, `tcp_listen`, `udp_bind`, and now `proc_run` —
 and the bare verbs a program is likely to want for its own functions stay
 available. A test asserts that: `run`, `send`, `open`, `close`, `read`, `write`,
 `start`, `stop`, `wait`, `execute` and twenty more must never appear in the
@@ -422,9 +422,9 @@ struct field as well. The general lesson is the same one F17 taught: this
 backend handles a place at more than one site, and a rule added at one of them
 is not added to the language.
 
-## F20 — `run_program` captures both streams, so there can be no pipeline (S4, library)
+## F20 — `proc_run` captures both streams, so there can be no pipeline (S4, library) — **fixed**
 
-Found writing 17-simple-shell after [L-LIB-PROC] unblocked it. `run_program` waits for
+Found writing 17-simple-shell after [L-LIB-PROC] unblocked it. `proc_run` waits for
 the program to finish and hands back its output, which is the right default for
 a builtin and the wrong primitive for a shell: a pipeline needs one child's
 stdout to *be* another's stdin, and redirection needs a child's descriptor
@@ -437,7 +437,7 @@ The shape of an answer is a second builtin that starts a program without waiting
 — returning a handle the way `tcp_listen` does — with the streams as handles
 `net_wait` already understands. That would make a pipeline an ordinary program
 rather than a special form, and it is the same primitive F14 needs. It is
-deliberately not a widening of `run_program`: a call that sometimes waits and sometimes
+deliberately not a widening of `proc_run`: a call that sometimes waits and sometimes
 does not is two functions with one name.
 
 ## F19 — an integer cannot be formatted in any base but ten (S4, library) — **fixed**

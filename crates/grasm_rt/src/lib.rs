@@ -4337,6 +4337,124 @@ pub unsafe extern "C" fn grasm_tcp_write(handle: *mut RtVal, data: *mut RtVal) -
     }
 }
 
+/// Runs a chain of programs, each one's output feeding the next.
+///
+/// A pipeline cannot be built out of `proc_run`: that waits for a program to
+/// finish and hands back its output, and a pipeline needs one child's stdout to
+/// *be* another's stdin. Copying the bytes through Grasm instead would need
+/// concurrent reads and writes on pipe handles — a much larger surface for a
+/// smaller result, and the kernel already does this.
+///
+/// `input` feeds the first stage's stdin, which is the other thing
+/// `proc_run` could not do: a filter with nothing to filter is not a filter.
+///
+/// # Safety: called from compiled Grasm with boxed values.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_proc_pipeline(
+    stages: *mut RtVal,
+    input: *mut RtVal,
+) -> *mut RtVal {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let RtPayload::List(items) = &(*stages).payload else {
+        return err_of(io_err("IoFailed", "proc_pipeline takes a list of stages".to_string()));
+    };
+    if items.is_empty() {
+        return err_of(io_err("IoFailed", "a pipeline needs at least one stage".to_string()));
+    }
+    let mut plan: Vec<(String, Vec<String>)> = Vec::with_capacity(items.len());
+    for &it in items.iter() {
+        let RtPayload::Tuple(fields) = &(*it).payload else {
+            return err_of(io_err(
+                "IoFailed",
+                "each stage is a (program, arguments) pair".to_string(),
+            ));
+        };
+        let program = as_str(fields[0]).to_string();
+        let argv: Vec<String> = match &(*fields[1]).payload {
+            RtPayload::List(a) => a.iter().map(|&p| as_str(p).to_string()).collect(),
+            _ => Vec::new(),
+        };
+        plan.push((program, argv));
+    }
+    let stdin_text = as_str(input).to_string();
+
+    let mut children: Vec<std::process::Child> = Vec::with_capacity(plan.len());
+    let mut prev: Option<std::process::ChildStdout> = None;
+    for (i, (program, argv)) in plan.iter().enumerate() {
+        let is_last = i + 1 == plan.len();
+        let mut cmd = Command::new(program);
+        cmd.args(argv);
+        match prev.take() {
+            Some(out) => {
+                cmd.stdin(Stdio::from(out));
+            }
+            None => {
+                cmd.stdin(Stdio::piped());
+            }
+        }
+        cmd.stdout(Stdio::piped());
+        // Only the last stage's stderr is answered with. An earlier stage's
+        // goes to this program's own stderr rather than being discarded: a
+        // diagnostic nobody sees is worse than one in the wrong place.
+        if is_last {
+            cmd.stderr(Stdio::piped());
+        } else {
+            cmd.stderr(Stdio::inherit());
+        }
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                // Everything already started is killed and reaped, so a
+                // pipeline that fails halfway leaves nothing running.
+                for mut c in children {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
+                return err_of(io_err("IoFailed", format!("{program}: {e}")));
+            }
+        };
+        if i == 0 && !stdin_text.is_empty() {
+            // Written on a thread: a large input and a chatty child deadlock
+            // if the parent writes everything before it reads anything.
+            if let Some(mut sink) = child.stdin.take() {
+                let text = stdin_text.clone();
+                std::thread::spawn(move || {
+                    let _ = sink.write_all(text.as_bytes());
+                });
+            }
+        } else if i == 0 {
+            // Closed, so a filter reading to end-of-input does not wait
+            // forever for input that is never coming.
+            drop(child.stdin.take());
+        }
+        if !is_last {
+            prev = child.stdout.take();
+        }
+        children.push(child);
+    }
+
+    let last = children.pop().expect("at least one stage");
+    let out = match last.wait_with_output() {
+        Ok(o) => o,
+        Err(e) => return err_of(io_err("IoFailed", e.to_string())),
+    };
+    // The earlier stages are reaped so they do not become zombies. Their exit
+    // statuses are deliberately not reported: a pipeline's status is its last
+    // stage's, which is what every shell means by it.
+    for mut c in children {
+        let _ = c.wait();
+    }
+    let code = out.status.code().map_or(-1, i64::from);
+    let fields = vec![
+        alloc(RtPayload::I64(code)),
+        alloc(RtPayload::Str(RtStr::of(&String::from_utf8_lossy(&out.stdout)))),
+        alloc(RtPayload::Str(RtStr::of(&String::from_utf8_lossy(&out.stderr)))),
+    ];
+    ok_of(alloc(RtPayload::Tuple(fields)))
+}
+
 // --- the C boundary --------------------------------------------------------
 //
 // A `str` or `bytes` argument to an `extern fn` crosses as a pointer

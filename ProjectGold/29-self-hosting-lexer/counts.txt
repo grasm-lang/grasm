@@ -14,7 +14,7 @@
 14-game-of-life/main.gr 1204
 15-sorting-benchmark/main.gr 2287
 16-kv-database/main.gr 1472
-17-simple-shell/main.gr 1214
+17-simple-shell/main.gr 1581
 18-image-converter/main.gr 1774
 19-event-emitter/main.gr 867
 20-expression-repl/main.gr 1592

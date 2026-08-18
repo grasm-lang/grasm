@@ -2738,12 +2738,13 @@ through its unsigned magnitude because negating it overflows.
 
 ## Processes — [L-LIB-PROC]
 
-**[L-LIB-PROC]** `run_program(program, args)` runs another program to completion and
+**[L-LIB-PROC]** `proc_run(program, args)` runs another program to completion and
 answers with `(exit code, stdout, stderr)`:
 
 | | type | |
 |---|---|---|
-| `run_program(prog, args)` | `(str, [str]) -> (i64, str, str) ! IoError` | performs `proc` |
+| `proc_run(prog, args)` | `(str, [str]) -> (i64, str, str) ! IoError` | performs `proc` |
+| `proc_pipeline(stages, input)` | `([(str, [str])], str) -> (i64, str, str) ! IoError` | each stage's output feeds the next |
 
 **`proc` is a capability of its own, and it is strictly larger than `io` or
 `net`.** A program that can run `curl` has the network whether or not it
@@ -2762,7 +2763,29 @@ output shown prints it, which also means it can be examined first.
 
 `args` are passed as a list and never through a shell, so a filename containing
 a space or a `;` is one argument and not an injection. A program that genuinely
-wants shell semantics asks for them: `run_program("sh", ["-c", line])`.
+wants shell semantics asks for them: `proc_run("sh", ["-c", line])`.
+
+`proc_pipeline` exists because a pipeline **cannot be built out of
+`proc_run`**. That waits for a program to finish and hands back its output,
+and a pipeline needs one child's stdout to *be* another's stdin. Copying the
+bytes through Grasm instead would need concurrent reads and writes on pipe
+handles — a much larger surface for a smaller result, and the kernel already
+does this.
+
+`input` feeds the first stage's stdin, which is the other thing `proc_run`
+could not do: a filter with nothing to filter is not a filter. It is written on
+a thread, because a large input and a chatty child deadlock if the parent writes
+everything before it reads anything. An empty input closes stdin rather than
+leaving it open, so a stage reading to end-of-input does not wait for input that
+is never coming.
+
+The result is the **last stage's** exit code, stdout and stderr, which is what
+every shell means by a pipeline's status. An earlier stage's stderr goes to the
+program's own stderr rather than being discarded: a diagnostic nobody sees is
+worse than one in the wrong place. If any stage cannot be started, everything
+already running is killed and the whole call is an `IoFailed` — a pipeline that
+failed halfway leaves nothing behind. An empty pipeline is an error, not a
+silent success.
 
 An exit code of **`-1`** means a signal killed the process. No process can exit
 with `-1`, so it cannot be confused for a status the program chose. A program
