@@ -125,14 +125,25 @@ Best of 5, milliseconds, Apple M-series. Nim and Zig implement the four
 programs where the comparison is about the language rather than about which
 concurrency primitive each one reaches for.
 
-| program  |   C |  Rust |  Go | Nim | Zig | grasm-native | Python |
-|----------|----:|------:|----:|----:|----:|-------------:|-------:|
-| fib      |  28 |    30 |  31 |  29 |  29 |           34 |    156 |
-| sieve    |  29 |    29 |  30 |  32 |  31 |           41 |    399 |
-| matmul   |  29 |    28 |  30 |  31 |  29 |           33 |    939 |
-| wordfreq |  54 |    49 |  40 |  45 |  34 |           98 |    156 |
-| sort     |  61 |    34 |  72 |   — |   — |       **44** |    246 |
-| parmap   |  75 |    74 | 116 |   — |   — |          131 |  3,716 |
+> **The table that stood here is withdrawn.** `bench.sh` read the clock by
+> launching `python3` either side of the program it was timing, so the second
+> interpreter's own startup — about 21 ms — landed inside every measurement.
+> A constant added to every cell is the worst error a benchmark can have: it
+> does not look like noise, it compresses every ratio toward 1, and it made a
+> 5 ms program and a 10 ms program look like 26 ms and 32 ms. The harness is
+> fixed; the numbers are not republished until a run the load gate accepts.
+>
+> What the fix changes, from a run taken while the machine was too busy to
+> publish: Grasm is about **2 to 2.4x C** on the scalar programs rather than
+> the 1.2x the old table implied — and **`sort` is a much better result than
+> it looked**, at roughly half C's time rather than a tenth under it. The
+> direction of the correction is not uniform, which is what an additive error
+> does.
+>
+> Every millisecond figure written elsewhere in this repository *before* this
+> correction carries the same 21 ms. Differences between two of them are real —
+> both sides were measured the same way on the same machine — but the absolute
+> values are not, and `docs/northstar.md` records the ones that mattered.
 
 `./scripts/bench.sh` builds every implementation, checks each one against the
 interpreter's answer, and refuses to report a timing for a wrong one — an
@@ -140,18 +151,21 @@ optimiser that deletes the work being measured is the classic way a benchmark
 lies. It also refuses to run at all when the machine's load average is above a
 third of its core count, because a busy machine does not just make everything
 slower, it makes everything slower *unevenly*, and the multi-core rows collapse
-in a way that reads as a regression that is not there. **The table above is one
-run; a second run taken hours apart at a different starting load agreed within
-3 ms on every cell.**
+in a way that reads as a regression that is not there.
 
-Against C on the four scalar programs, native Grasm is 14% behind on `matmul`,
-21% on `fib`, 41% on `sieve`, and 81% on `wordfreq` — and it **beats C and Go on
-sort**, where Rust is still ahead. Scalar lists store elements inline and a list
-a loop only indexes is reached through its data pointer, so `matmul`'s innermost
-loop is 17 instructions with no calls, which is why that is the closest row.
+Neither of those caught the error above. Both are checks on the *inputs* to a
+measurement — is the answer right, is the machine quiet — and the timer itself
+was never checked against a program of known duration. It is now: the C sieve
+takes about 5 ms, and a harness that says 30 is measuring itself.
 
-`wordfreq` is the honest weak spot at 1.8x C and 2.9x Zig. It is allocation:
-every value is a refcounted box and the loop builds a string per iteration.
+Native Grasm beats C and Go on `sort`. Elsewhere it is behind, and by how much
+is exactly what the withdrawn table got wrong — the corrected figures follow a
+clean run. Scalar lists store elements inline and a list a loop only indexes is
+reached through its data pointer, so `matmul`'s innermost loop is 17
+instructions with no calls.
+
+`wordfreq` is the honest weak spot. It is allocation: every value is a
+refcounted box and the loop builds a string per iteration.
 Small-string optimisation took it from 117 ms to 98 ms by removing the *second*
 allocation for text under sixteen bytes — the storage change alone made it
 slower, and the win came from the constructors that stopped building a `String`

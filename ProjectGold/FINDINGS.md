@@ -392,6 +392,47 @@ available. A test asserts that: `run`, `send`, `open`, `close`, `read`, `write`,
 `start`, `stop`, `wait`, `execute` and twenty more must never appear in the
 builtin list.
 
+## F27 — the benchmark harness added 21 ms to every measurement it ever took (S2, benchmarks) — **fixed**
+
+Found while trying to explain why `sieve` was 37 ms in `bench.sh` and 16 ms
+when timed directly. Both were the same binary.
+
+`time_ms` read the clock by launching `python3` on either side of the program
+it was timing:
+
+```sh
+start=$(python3 -c '...perf_counter...')
+"$@" >"$WORK/out"
+end=$(python3 -c '...perf_counter...')
+```
+
+The **second** interpreter's own startup lands inside the interval. On this
+machine that is 21 ms, added to every cell of every table this script has ever
+printed. The C sieve takes about 5 ms and was reported at 30.
+
+A constant added to every measurement is the worst error a benchmark can have.
+It does not look like noise, it survives repetition, and it **compresses every
+ratio toward 1** — so it flatters whatever is slowest. Grasm is about 2 to 2.4x
+C on the scalar programs, not the 1.2x the published table implied. The
+correction is not uniformly unflattering: `sort` is a much better result than it
+looked, at roughly half C's time rather than a tenth under it.
+
+**Fixed** — one `python3` that spawns the program and times it, so the only
+thing in the interval is the program.
+
+### Two gates were watching and neither could see it
+
+`bench.sh` already refuses to report a timing for a wrong answer, and refuses to
+run at all on a busy machine. Both are checks on the *inputs* to a measurement.
+Nothing checked the timer itself against a program of known duration, and the
+published table had been *reproduced* — two runs hours apart agreeing within
+3 ms, which is exactly what a harness with a constant offset produces.
+Reproducibility is necessary and not sufficient.
+
+Both tables are withdrawn rather than corrected in place, because a number
+edited by hand is not a measurement, and `bench.sh` has refused every run since
+on load.
+
 ## F26 — `bytes.is_empty()` could not be compiled at all (S1, backend) — **fixed**
 
 Found by `scripts/fuzz_methods.py`, written for this purpose: it crosses every

@@ -62,19 +62,30 @@ All seven implementations in one table. Nim and Zig implement the four programs
 where the comparison is about the language rather than about which concurrency
 primitive each one reaches for.
 
-| program  |   C |  Rust |  Go | Nim | Zig | grasm-native | grasm-interp | Python |
-|----------|----:|------:|----:|----:|----:|-------------:|-------------:|-------:|
-| fib      |  28 |    30 |  31 |  29 |  29 |           34 |         1646 |    156 |
-| sieve    |  29 |    29 |  30 |  32 |  31 |           41 |         2906 |    399 |
-| matmul   |  29 |    28 |  30 |  31 |  29 |           33 |         6049 |    939 |
-| wordfreq |  54 |    49 |  40 |  45 |  34 |           98 |          516 |    156 |
-| sort     |  61 |    34 |  72 |   — |   — |       **44** |          395 |    246 |
-| parmap   |  75 |    74 | 116 |   — |   — |          131 |        55036 |  3,716 |
-| mandelbrot |  36 |  —  |  —  |  —  |  —  |       **14** |            — |  1,457 |
+> **The table that stood here is withdrawn.** `bench.sh` read the clock by
+> launching `python3` either side of the program it was timing, so the second
+> interpreter's own startup — about 21 ms — landed inside every measurement.
+> A constant added to every cell is the worst error a benchmark can have: it
+> does not look like noise, it compresses every ratio toward 1, and it made a
+> 5 ms program and a 10 ms program look like 26 ms and 32 ms. The harness is
+> fixed; the numbers are not republished until a run the load gate accepts.
+>
+> What the fix changes, from a run taken while the machine was too busy to
+> publish: Grasm is about **2 to 2.4x C** on the scalar programs rather than
+> the 1.2x the old table implied — and **`sort` is a much better result than
+> it looked**, at roughly half C's time rather than a tenth under it. The
+> direction of the correction is not uniform, which is what an additive error
+> does.
+>
+> Every millisecond figure written elsewhere in this repository *before* this
+> correction carries the same 21 ms. Differences between two of them are real —
+> both sides were measured the same way on the same machine — but the absolute
+> values are not, and `docs/northstar.md` records the ones that mattered.
 
-**This table is one run.** A second run, taken hours apart at a different
-starting load average, agreed within 3 ms on every cell — which is the only
-reason to believe any of it. Timings from different sessions are not
+The withdrawn table was one run, reproduced by a second taken hours apart —
+and both were wrong in the same way, which is exactly why reproducibility is
+necessary and not sufficient. Two runs of a harness that adds a constant agree
+with each other perfectly. Timings from different sessions are not
 comparable: earlier editions of this file recorded `fib` at 26 ms for C and
 27 ms for Grasm, and the ratio has moved from 1.04x to 1.21x without either
 implementation changing. Compare rows within a table, never numbers across

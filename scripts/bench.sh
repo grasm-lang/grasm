@@ -65,14 +65,27 @@ if [ "$1" = "0" ]; then
 fi
 
 # Milliseconds of wall clock for one run, or empty if it failed.
+#
+# One `python3` that spawns the program and times it — *not* two that read a
+# clock either side of it. Read either side, the second interpreter's own
+# startup lands inside the measured interval: about 21 ms on this machine,
+# added to every cell of every table this script has ever printed. A constant
+# added to every measurement is the worst error a benchmark can have, because
+# it does not look like noise — it compresses every ratio toward 1 and makes a
+# slow implementation look close to a fast one. The C sieve takes about 5 ms
+# and was reported at 30.
 time_ms() {
-    local start end code
-    start=$(python3 -c 'import time; print(int(time.perf_counter()*1000))')
-    "$@" >"$WORK/out" 2>"$WORK/err"
-    code=$?
-    end=$(python3 -c 'import time; print(int(time.perf_counter()*1000))')
-    [ $code -ne 0 ] && return 1
-    echo $((end - start))
+    python3 - "$WORK" "$@" <<'TIMER'
+import subprocess, sys, time
+
+work, cmd = sys.argv[1], sys.argv[2:]
+with open(work + "/out", "wb") as out, open(work + "/err", "wb") as err:
+    started = time.perf_counter()
+    done = subprocess.run(cmd, stdout=out, stderr=err)
+    elapsed = (time.perf_counter() - started) * 1000
+print(int(round(elapsed)))
+sys.exit(0 if done.returncode == 0 else 1)
+TIMER
 }
 
 # Best of REPS, the least noisy summary of a short run.
