@@ -287,6 +287,11 @@ fn assign_into(root: &mut Value, segs: &[Seg], v: Value) -> Result<(), Flow> {
                         None => return Err(Flow::Panic(format!("no field `{fname}`"))),
                     }
                 }
+                // `.value` writes what a reference points at, when that has
+                // no fields of its own ([T-REF-VALUE]). `slot` is already the
+                // pointee, so the write lands where it is: there is nothing to
+                // descend into past `.value`.
+                _ if fname == "value" && !matches!(slot, Value::Tuple(_)) => {}
                 other => {
                     return Err(Flow::Panic(format!(
                         "cannot access field `{fname}` of `{other}`"
@@ -2912,11 +2917,12 @@ build links it, `grasm run` can only reach what is already loaded",
                 }
             }
         }
-        let r = self.eval_expr(recv)?;
+        let raw = self.eval_expr(recv)?;
+        let through_ref = matches!(raw, Value::Ref(..));
         // Tier 2: reading through a reference checks the generation first. A
         // stale one panics here rather than reading whatever now occupies the
         // slot, which is the property that makes `ref` safe.
-        let r = self.deref_value(r)?;
+        let r = self.deref_value(raw)?;
         match r {
             // `pair.0` — components named by position.
             Value::Tuple(parts) => match name.name.parse::<usize>() {
@@ -2928,6 +2934,10 @@ build links it, `grasm run` can only reach what is already loaded",
                 .find(|(k, _)| k == &name.name)
                 .map(|(_, v)| Ok(v.clone()))
                 .unwrap_or_else(|| Err(Flow::Panic(format!("no field `{}`", name.name)))),
+            // `.value` reads what a reference points at, when that has no
+            // fields of its own ([T-REF-VALUE]). The struct and tuple arms are
+            // above, so this cannot shadow a real field or a component.
+            other if through_ref && name.name == "value" => Ok(other),
             other => Err(Flow::Panic(format!(
                 "`{other}` has no field `{}`",
                 name.name

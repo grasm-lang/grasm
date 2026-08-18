@@ -8130,6 +8130,7 @@ checker did",
         // Tier 2: reading through a reference goes via the slab, which checks
         // the generation and panics if the slot has been released. The value
         // comes back boxed, so it is unboxed to the pointee's own shape.
+        let through_ref = matches!(rt, VType::Ref(_));
         let (rv, rt) = match rt {
             VType::Ref(inner) => {
                 let boxed = self.call_rt("grasm_ref_get", &[rv]).unwrap();
@@ -8137,6 +8138,15 @@ checker did",
             }
             other => (rv, other),
         };
+        // `.value` reads what a reference points at, when that has no fields of
+        // its own ([T-REF-VALUE]). The slab read above already produced it, so
+        // there is nothing further to do.
+        if through_ref
+            && name.name == "value"
+            && !matches!(rt, VType::Struct(_) | VType::Tuple(_))
+        {
+            return Ok(Some((rv, rt)));
+        }
         // `pair.0` — a tuple's components are named by position.
         if let VType::Tuple(parts) = &rt {
             let Ok(i) = name.name.parse::<usize>() else {
@@ -9641,8 +9651,18 @@ checker did",
             // A reference reads as the value it points at ([T-REF-READ]), and
             // it consumes no segment of the path: `h.r.v` is the field `v` of
             // what `h.r` points at.
+            let mut was_ref = false;
             while let VType::Ref(inner) = &t {
                 t = (**inner).clone();
+                was_ref = true;
+            }
+            // `.value` names the referent itself ([T-REF-VALUE]), so it
+            // designates the type the dereference just produced.
+            if was_ref
+                && matches!(seg, PlaceSeg::Field("value"))
+                && !matches!(t, VType::Struct(_) | VType::Tuple(_))
+            {
+                continue;
             }
             t = match (&t, seg) {
                 (VType::Struct(sname), PlaceSeg::Field(f)) => {
@@ -9691,6 +9711,22 @@ checker did",
                 cur = self.call_rt("grasm_ref_get", &[raw]).unwrap();
                 cur_t = inner;
                 owned = true;
+            }
+            // `.value` names the referent itself, which the dereference above
+            // already produced ([T-REF-VALUE]) — so the segment consumes no
+            // accessor. As the last one it *is* the answer, unboxed the same
+            // way any other final step is.
+            if matches!(seg, PlaceSeg::Field("value"))
+                && !matches!(cur_t, VType::Struct(_) | VType::Tuple(_))
+            {
+                if is_last {
+                    let (v, _) = self.unbox(cur, elem_t)?;
+                    if elem_t.boxed() {
+                        self.call_rt("grasm_val_dec", &[cur]);
+                    }
+                    return Ok(v);
+                }
+                continue;
             }
             let prev = cur;
             let prev_owned = owned;
@@ -9809,6 +9845,13 @@ checker did",
                 cur_t = inner;
                 owned = true;
             }
+            // `.value` names the referent itself, which the dereference above
+            // already produced ([T-REF-VALUE]).
+            if matches!(seg, PlaceSeg::Field("value"))
+                && !matches!(cur_t, VType::Struct(_) | VType::Tuple(_))
+            {
+                continue;
+            }
             let prev = cur;
             let prev_owned = owned;
             let prev_t = cur_t.clone();
@@ -9883,6 +9926,17 @@ checker did",
             // proves that rebuilding is not enough — `a.out[0].out[0].name`
             // comes back to `a`, so an outer copy stored afterwards erased the
             // inner write.
+            // `r.value = x` replaces the referent itself ([T-REF-VALUE]).
+            // There is no field to descend into, so this is the slab write and
+            // not a write inside a struct that lives there.
+            if path.len() == 1
+                && matches!(path[0], PlaceSeg::Field("value"))
+                && !matches!(inner, VType::Struct(_) | VType::Tuple(_))
+            {
+                self.call_rt("grasm_ref_set", &[root, boxed_val]);
+                self.wrote_through_ref = true;
+                return Ok(root);
+            }
             let referent = self.call_rt("grasm_ref_make_unique", &[root]).unwrap();
             self.write_place(span, referent, path, &inner, boxed_val)?;
             self.wrote_through_ref = true;

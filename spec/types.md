@@ -853,6 +853,32 @@ hold about 180 MB. Nothing collects them, which is the point of the tier — the
 lifetime is the program's to state — but "reused immediately" describes what
 happens *after* a release, not a reason to skip one.
 
+**[T-REF-VALUE]** `r.value` reads and writes what a reference points at, when
+that has no fields of its own:
+
+```grasm
+let n = ref(0)
+n.value += 1
+print("{n.value}")        // 1
+```
+
+Without it `ref(0)` typechecked, produced a `ref i64`, and **no expression in
+the language could observe it** — a value that could be constructed and never
+used. The workaround was a one-field wrapper struct, which is the same thing
+with a name on it.
+
+It is *not* offered when the referent is a struct or a tuple. A struct already
+has field names, and `.value` would either shadow a real one or change meaning
+the day somebody added one; a tuple's components are `.0` and `.1`. So the rule
+is exactly "the referent has no way to name its parts, so this names the whole
+thing", and there is no case where both readings apply.
+
+`.value` consumes no more of a path than any other dereference: `r.value` is
+the referent, and `r.items.push(x)` still reaches through to a struct field
+without it. Writing through it lands **in the slab**, so every other holder of
+the reference sees it ([T-REF-GENERATIONAL]) — the same guarantee as writing to
+a field, and the reason a `ref i64` is a shared counter rather than a copy.
+
 **[T-REF-EQ]** Two references are equal when they name the same slot *and the
 same generation* — identity, not the equality of what they point at, which is
 what a graph walk needs to recognise a node it has already visited. Equality

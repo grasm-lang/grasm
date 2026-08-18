@@ -212,6 +212,7 @@ for "no problem found" to mean anything.
 - `T-PARAM-INOUT-PLACES` — provisional
 - `T-REF-CAPTURE` — provisional
 - `T-REF-EQ` — provisional
+- `T-REF-VALUE` — provisional
 - `T-REF-GENERATIONAL` — provisional
 - `T-REF-MATCH` — provisional
 - `T-REF-STALE` — provisional

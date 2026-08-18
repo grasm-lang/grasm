@@ -5240,10 +5240,26 @@ parts have names worth writing",
         // Tier 2: a `ref T` reads as the `T` it points at. The check happens
         // at run time, on the generation, so a reference to a released slot
         // panics rather than reading whatever occupies it now.
-        let recv_ty = match self.uni.resolve(recv_ty) {
-            Type::Ref(inner) => *inner,
-            other => other,
+        let (recv_ty, through_ref) = match self.uni.resolve(recv_ty) {
+            Type::Ref(inner) => (*inner, true),
+            other => (other, false),
         };
+        // `.value` is how a reference to something with no fields of its own is
+        // read and written ([T-REF-VALUE]). Without it `ref(0)` typechecked,
+        // produced a `ref i64`, and nothing in the language could observe it.
+        //
+        // Not offered for a struct or a tuple: a struct already has field names
+        // and `.value` would either shadow one or change meaning the day
+        // somebody added it, and a tuple has `.0` and `.1`.
+        if through_ref
+            && name.name == "value"
+            && !matches!(
+                self.uni.shallow_resolve(&recv_ty),
+                Type::Named { .. } | Type::Tuple(_)
+            )
+        {
+            return recv_ty;
+        }
         match self.uni.shallow_resolve(&recv_ty) {
             // `pair.0` — a tuple's components are named by position.
             Type::Tuple(parts) => match name.name.parse::<usize>() {
@@ -5660,7 +5676,25 @@ Perform the effect after the closing brace, or yield a number and do the work ou
             Type::Tuple(items) => field.parse::<usize>().ok().and_then(|i| items.get(i).cloned()),
             // Reading a field through a reference works, so calling one does
             // too ([T-REF-READ]).
-            Type::Ref(inner) => self.struct_field_type(&inner, field),
+            //
+            // `.value` is how a reference to something with no fields of its
+            // own is read and written ([T-REF-VALUE]). Without it `ref(0)`
+            // typechecked, produced a `ref i64`, and no expression in the
+            // language could observe it — a value that could be constructed
+            // and never used.
+            //
+            // Not offered for a struct or a tuple: a struct already has field
+            // names and `.value` would either shadow a real one or start
+            // meaning something different the day somebody added it, and a
+            // tuple has `.0` and `.1`.
+            Type::Ref(inner) => {
+                let inner = self.uni.resolve(&inner);
+                if field == "value" && !matches!(inner, Type::Named { .. } | Type::Tuple(_)) {
+                    Some(inner)
+                } else {
+                    self.struct_field_type(&inner, field)
+                }
+            }
             _ => None,
         }
     }

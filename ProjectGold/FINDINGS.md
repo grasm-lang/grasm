@@ -211,7 +211,7 @@ decoder reads back pixel for pixel.
 Still open for 25 (which also needs UDP, F12) and for `extern fn` (F8), which
 needs a pointer representation on top of this.
 
-## F10 — a `ref` to a scalar can be made but never read (S3, language)
+## F10 — a `ref` to a scalar can be made but never read (S3, language) — **fixed**
 
 Found writing 19-event-emitter. `ref(0)` typechecks and produces a `ref i64`,
 and there is no expression that reads it. [T-REF-READ] and [T-REF-WRITE] both
@@ -232,7 +232,24 @@ which is what this project uses. The gap is that `ref(0)` is accepted at all: a
 value that can be constructed and never observed should either be refused at the
 point of construction, or given the dereference that would make it useful.
 
-## F11 — `net` can listen and accept, never dial (S3, library)
+**Fixed** — the dereference, not the refusal ([T-REF-VALUE]). `r.value` reads
+and writes the referent, and a write lands in the slab, so a `ref i64` is a
+shared counter rather than a copy. That is the thing the wrapper struct was
+imitating.
+
+It is deliberately not offered when the referent is a struct or a tuple: a
+struct already has field names and `.value` would either shadow a real one or
+change meaning the day somebody added it, and a tuple has `.0` and `.1`. The
+rule is exactly "the referent has no way to name its parts, so this names the
+whole thing", which leaves no case where both readings apply.
+
+Four places had to learn it, which is the shape of this backend: the checker's
+field typing, the interpreter's read and its write, and — in the native backend
+— `place_type`, `read_place`, `read_place_boxed` and `write_place`. Each refusal
+came with its own message, so each was found by compiling the same nine-line
+program again.
+
+## F11 — `net` can listen and accept, never dial (S3, library) — **fixed**
 
 Found writing 22-multithreaded-scraper. [L-LIB-NET] gives `tcp_listen`,
 `tcp_accept`, `tcp_read`, `tcp_write` and `tcp_close`. There is no
@@ -244,8 +261,17 @@ The missing piece is one builtin with the same shape as the others —
 handle table and the read/write paths all already exist. This is the smallest of
 the outstanding gaps and it blocks the most.
 
-`par_map` would supply the concurrency the project asks for; the threads are not
-the problem.
+**Fixed** — `tcp_connect(host, port)` shipped as part of [L-LIB-NET], with the
+same shape as the rest of the surface. Resolution failure and connection failure
+are the same `IoFailed` to a caller, because both mean "there is nothing to talk
+to", and the message carries the difference.
+
+The last line of this finding, written before any of it was built, guessed
+wrong: "`par_map` would supply the concurrency the project asks for; the threads
+are not the problem." The threads were never available (F14) and were never
+needed — `net_wait` and one thread were. Left here rather than edited out,
+because a finding that records what was believed at the time is worth more than
+one that pretends it was always right.
 
 ## F12 — no UDP (S4, library) — **fixed**
 
