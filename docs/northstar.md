@@ -210,12 +210,30 @@ loss and the change was reverted.
 Note also that the `get` path was already allocation-free: `with_key` borrows a
 thread-local scratch `String`. The optimisation was only ever available on `set`.
 
-What is left after that is that every string is a refcounted box and this
-benchmark builds
-two per iteration. Closing it means small-string optimisation or interning —
-changing the representation of every value in the language. The map's hasher is
-*not* a candidate: map keys are user data, and Rust's default hasher is what
-stops a program that reads untrusted input from being hash-flooded.
+**Small-string optimisation, measured and kept — but only half of it.** Every
+string was a refcounted box holding a `String`: two allocations for text that is
+usually a word. `RtStr` now stores up to fifteen bytes inline. Fifteen because
+that is exactly the size of the `String` it replaces, so `RtStr` stays 40 bytes
+and every boxed value in the runtime stays 64; a larger buffer would make every
+integer and bool pay for it.
+
+The inline buffer *alone* made things **7% slower** (298 → 321 ms on a loop that
+builds two million short strings). Storage was never the cost. Every constructor
+still built a `String` first and then copied it inline, so the change added a
+copy and a branch to a path that already allocated.
+
+The win is in the constructors, not the storage. `RtStr::of_i64` writes decimal
+digits straight into the inline buffer, and `RtStr::of` takes borrowed text, so
+interpolation, `trim`, `substring` and the character methods stop allocating a
+`String` that exists only to be handed over one line later. With those, the same
+loop runs in **238 ms (−20%)** and wordfreq in **73 ms, down from 81**.
+
+The lesson is the same one the `i64_text` attempt taught: *the digits were never
+the cost, the allocation was* — and an optimisation that changes where a value
+is stored buys nothing until the code that produces the value stops allocating.
+
+The map's hasher is *not* a candidate: map keys are user data, and Rust's default
+hasher is what stops a program that reads untrusted input from being hash-flooded.
 
 **G1 and G10 cannot be moved from inside this repository.** No human has run a
 Grasm program. Every signal the project has is model-generated, and the two

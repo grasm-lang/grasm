@@ -317,7 +317,7 @@ impl MapKey {
         match self {
             MapKey::Bool(b) => interned_bool(*b),
             MapKey::I64(n) => grasm_box_i64(*n),
-            MapKey::Str(s) => alloc(RtPayload::Str(RtStr::new(s.clone()))),
+            MapKey::Str(s) => alloc(RtPayload::Str(RtStr::of(s))),
         }
     }
 }
@@ -453,7 +453,7 @@ impl ScalarData {
 /// index rather than a walk.
 #[derive(Debug)]
 pub struct RtStr {
-    s: String,
+    s: StrData,
     /// `u32::MAX` until asked for.
     ///
     /// Atomic, and the index below is a `OnceLock`, because a value crosses
@@ -476,6 +476,49 @@ pub struct RtStr {
     index: std::sync::OnceLock<Box<CharIndex>>,
 }
 
+/// Where a string's bytes live.
+///
+/// Short text is held **inline**, in the `RtVal` that already had to be
+/// allocated, rather than in a second heap buffer of its own. Building a string
+/// otherwise costs two allocations, and measurement said that was nearly the
+/// whole cost: converting two million integers to text took 105 ms, of which
+/// the digits were 4 ms and the rest was allocating.
+///
+/// Fifteen bytes because that makes `StrData` exactly the size of the `String`
+/// it replaces — 24 bytes — so `RtStr` stays 40 and every boxed value in the
+/// runtime stays 64. A larger inline buffer would make every integer and bool
+/// pay for it. Fifteen covers what short text actually is: a map key, a word,
+/// a number, a field name.
+#[derive(Debug)]
+enum StrData {
+    Inline { bytes: [u8; 15], len: u8 },
+    Heap(String),
+}
+
+impl StrData {
+    fn as_str(&self) -> &str {
+        match self {
+            // Valid UTF-8 by construction: every constructor either copies
+            // from an existing `str` or writes ASCII digits.
+            StrData::Inline { bytes, len } => unsafe {
+                std::str::from_utf8_unchecked(&bytes[..*len as usize])
+            },
+            StrData::Heap(s) => s,
+        }
+    }
+
+    /// Inline when the text fits, heap otherwise.
+    fn of(text: &str) -> StrData {
+        if text.len() <= 15 {
+            let mut bytes = [0u8; 15];
+            bytes[..text.len()].copy_from_slice(text.as_bytes());
+            StrData::Inline { bytes, len: text.len() as u8 }
+        } else {
+            StrData::Heap(text.to_string())
+        }
+    }
+}
+
 /// Character offsets for text that is not ASCII.
 #[derive(Debug)]
 struct CharIndex {
@@ -485,8 +528,71 @@ struct CharIndex {
 
 impl RtStr {
     pub fn new(s: String) -> RtStr {
+        // A short string is copied inline and the `String` released: the
+        // allocation has already happened here, but every later read avoids a
+        // pointer hop. The constructors that matter for speed —
+        // `concat` and `of_i64` — never build a `String` at all.
+        let data = if s.len() <= 15 { StrData::of(&s) } else { StrData::Heap(s) };
         RtStr {
-            s,
+            s: data,
+            index: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Borrowed text, with no allocation at all when it is short.
+    ///
+    /// Prefer this over `new(x.to_string())` wherever the `String` exists only
+    /// to be handed over: that spelling allocates a heap buffer and then frees
+    /// it again one line later.
+    pub fn of(text: &str) -> RtStr {
+        RtStr {
+            s: StrData::of(text),
+            index: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// An integer's decimal text, written straight into the inline buffer.
+    ///
+    /// Every `i64` whose magnitude is under 10^14 lands inline, which is every
+    /// integer a program is likely to interpolate. The rest fall back to
+    /// `to_string`. Interpolation is the most common way programs build text,
+    /// so this path skips the allocation that spelling would need.
+    pub fn of_i64(v: i64) -> RtStr {
+        let mut buf = [0u8; 20];
+        let mut n = v.unsigned_abs();
+        let mut i = buf.len();
+        loop {
+            i -= 1;
+            buf[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        if v < 0 {
+            i -= 1;
+            buf[i] = b'-';
+        }
+        // ASCII digits, so this is valid UTF-8.
+        RtStr::of(unsafe { std::str::from_utf8_unchecked(&buf[i..]) })
+    }
+
+    /// Two pieces joined, with no allocation at all when the result is short.
+    pub fn concat(a: &str, b: &str) -> RtStr {
+        let total = a.len() + b.len();
+        let data = if total <= 15 {
+            let mut bytes = [0u8; 15];
+            bytes[..a.len()].copy_from_slice(a.as_bytes());
+            bytes[a.len()..total].copy_from_slice(b.as_bytes());
+            StrData::Inline { bytes, len: total as u8 }
+        } else {
+            let mut out = String::with_capacity(total);
+            out.push_str(a);
+            out.push_str(b);
+            StrData::Heap(out)
+        };
+        RtStr {
+            s: data,
             index: std::sync::OnceLock::new(),
         }
     }
@@ -494,7 +600,7 @@ impl RtStr {
     /// The character index, built on first use. Only reached for non-ASCII.
     fn index(&self) -> &CharIndex {
         self.index.get_or_init(|| {
-            let offsets: Vec<u32> = self.s.char_indices().map(|(o, _)| o as u32).collect();
+            let offsets: Vec<u32> = self.s.as_str().char_indices().map(|(o, _)| o as u32).collect();
             Box::new(CharIndex {
                 count: offsets.len() as u32,
                 offsets,
@@ -506,12 +612,12 @@ impl RtStr {
     /// call. Shared with `substr`, which walked from the start otherwise.
     pub fn byte_at(&self, i: usize) -> Option<usize> {
         if self.is_flat() {
-            return (i <= self.s.len()).then_some(i);
+            return (i <= self.s.as_str().len()).then_some(i);
         }
         let offs = &self.index().offsets;
         match i.cmp(&offs.len()) {
             std::cmp::Ordering::Less => Some(offs[i] as usize),
-            std::cmp::Ordering::Equal => Some(self.s.len()),
+            std::cmp::Ordering::Equal => Some(self.s.as_str().len()),
             std::cmp::Ordering::Greater => None,
         }
     }
@@ -519,11 +625,11 @@ impl RtStr {
     /// The character at `i`, in constant time after the first call.
     pub fn char_at(&self, i: usize) -> Option<char> {
         if self.is_flat() {
-            return self.s.as_bytes().get(i).map(|b| *b as char);
+            return self.s.as_str().as_bytes().get(i).map(|b| *b as char);
         }
         let offs = &self.index().offsets;
         let start = *offs.get(i)? as usize;
-        self.s[start..].chars().next()
+        self.s.as_str()[start..].chars().next()
     }
 
     pub fn char_len(&self) -> usize {
@@ -531,21 +637,21 @@ impl RtStr {
         // one byte per character, so the count *is* the length. `is_ascii` is
         // a vectorised scan in `std`, far cheaper than counting characters and
         // cheaper than the cache lookup it replaces.
-        if self.s.is_ascii() {
-            return self.s.len();
+        if self.s.as_str().is_ascii() {
+            return self.s.as_str().len();
         }
         self.index().count as usize
     }
 
     /// Every character one byte, so an index is an index.
     pub fn is_flat(&self) -> bool {
-        self.s.is_ascii()
+        self.s.as_str().is_ascii()
     }
 }
 
 impl PartialEq for RtStr {
     fn eq(&self, other: &RtStr) -> bool {
-        self.s == other.s
+        self.s.as_str() == other.s.as_str()
     }
 }
 
@@ -559,20 +665,20 @@ impl PartialOrd for RtStr {
 
 impl Ord for RtStr {
     fn cmp(&self, other: &RtStr) -> std::cmp::Ordering {
-        self.s.cmp(&other.s)
+        self.s.as_str().cmp(other.s.as_str())
     }
 }
 
 impl std::ops::Deref for RtStr {
     type Target = str;
     fn deref(&self) -> &str {
-        &self.s
+        self.s.as_str()
     }
 }
 
 impl std::fmt::Display for RtStr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.s)
+        write!(f, "{}", self.s.as_str())
     }
 }
 
@@ -925,7 +1031,7 @@ pub unsafe extern "C" fn grasm_val_dec(v: *mut RtVal) {
 #[no_mangle]
 pub unsafe extern "C" fn grasm_str_lit(ptr: *const u8, len: u64) -> *mut RtVal {
     let bytes = std::slice::from_raw_parts(ptr, len as usize);
-    alloc(RtPayload::Str(RtStr::new(String::from_utf8_lossy(bytes).into_owned())))
+    alloc(RtPayload::Str(RtStr::of(&String::from_utf8_lossy(bytes))))
 }
 
 #[no_mangle]
@@ -933,19 +1039,15 @@ pub unsafe extern "C" fn grasm_str_concat(a: *mut RtVal, b: *mut RtVal) -> *mut 
     let (RtPayload::Str(sa), RtPayload::Str(sb)) = (&(*a).payload, &(*b).payload) else {
         grasm_panic_msg_str("concat on non-strings");
     };
-    // `format!` for two strings runs the whole formatting machinery — build
-    // `Arguments`, dispatch through `Display`, grow the buffer as it goes — to
-    // do what two `push_str` calls into a correctly sized buffer do directly.
-    // Concatenation is on the hot path of every program that builds text.
-    let mut out = String::with_capacity(sa.len() + sb.len());
-    out.push_str(sa);
-    out.push_str(sb);
-    alloc(RtPayload::Str(RtStr::new(out)))
+    // No intermediate `String` when the result is short: `RtStr::concat` writes
+    // both pieces straight into the inline buffer. Concatenation is on the hot
+    // path of every program that builds text.
+    alloc(RtPayload::Str(RtStr::concat(sa, sb)))
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn grasm_str_from_i64(v: i64) -> *mut RtVal {
-    alloc(RtPayload::Str(RtStr::new(v.to_string())))
+    alloc(RtPayload::Str(RtStr::of_i64(v)))
 }
 
 #[no_mangle]
@@ -955,7 +1057,7 @@ pub unsafe extern "C" fn grasm_str_from_f64(v: f64) -> *mut RtVal {
 
 #[no_mangle]
 pub unsafe extern "C" fn grasm_str_from_bool(v: i8) -> *mut RtVal {
-    alloc(RtPayload::Str(RtStr::new((v != 0).to_string())))
+    alloc(RtPayload::Str(RtStr::of(if v != 0 { "true" } else { "false" })))
 }
 
 #[no_mangle]
@@ -2499,11 +2601,11 @@ pub unsafe extern "C" fn grasm_str_split(s: *mut RtVal, sep: *mut RtVal) -> *mut
     let sp = as_str(sep);
     let parts: Vec<*mut RtVal> = if sp.is_empty() {
         text.chars()
-            .map(|c| alloc(RtPayload::Str(RtStr::new(c.to_string()))))
+            .map(|c| alloc(RtPayload::Str(RtStr::of(c.encode_utf8(&mut [0u8; 4])))))
             .collect()
     } else {
         text.split(sp)
-            .map(|p| alloc(RtPayload::Str(RtStr::new(p.to_string()))))
+            .map(|p| alloc(RtPayload::Str(RtStr::of(p))))
             .collect()
     };
     alloc(RtPayload::List(parts))
@@ -2936,7 +3038,7 @@ pub unsafe extern "C" fn grasm_str_code_at(s: *mut RtVal, i: i64) -> i64 {
 pub unsafe extern "C" fn grasm_str_words(s: *mut RtVal) -> *mut RtVal {
     let items: Vec<*mut RtVal> = as_str(s)
         .split_whitespace()
-        .map(|w| alloc(RtPayload::Str(RtStr::new(w.to_string()))))
+        .map(|w| alloc(RtPayload::Str(RtStr::of(w))))
         .collect();
     alloc(RtPayload::List(items))
 }
@@ -2960,7 +3062,7 @@ pub unsafe extern "C" fn grasm_str_codes(s: *mut RtVal) -> *mut RtVal {
 #[no_mangle]
 pub extern "C" fn grasm_i64_to_char(n: i64) -> *mut RtVal {
     match u32::try_from(n).ok().and_then(char::from_u32) {
-        Some(c) => alloc(RtPayload::Str(RtStr::new(c.to_string()))),
+        Some(c) => alloc(RtPayload::Str(RtStr::of(c.encode_utf8(&mut [0u8; 4])))),
         None => rt_panic(&format!("{n} is not a Unicode code point")),
     }
 }
@@ -2969,7 +3071,7 @@ pub extern "C" fn grasm_i64_to_char(n: i64) -> *mut RtVal {
 pub unsafe extern "C" fn grasm_str_chars(s: *mut RtVal) -> *mut RtVal {
     let items: Vec<*mut RtVal> = as_str(s)
         .chars()
-        .map(|c| alloc(RtPayload::Str(RtStr::new(c.to_string()))))
+        .map(|c| alloc(RtPayload::Str(RtStr::of(c.encode_utf8(&mut [0u8; 4])))))
         .collect();
     alloc(RtPayload::List(items))
 }
@@ -2977,19 +3079,19 @@ pub unsafe extern "C" fn grasm_str_chars(s: *mut RtVal) -> *mut RtVal {
 /// # Safety: live pointer.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_str_trim(s: *mut RtVal) -> *mut RtVal {
-    alloc(RtPayload::Str(RtStr::new(as_str(s).trim().to_string())))
+    alloc(RtPayload::Str(RtStr::of(as_str(s).trim())))
 }
 
 /// # Safety: live pointer.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_str_trim_start(s: *mut RtVal) -> *mut RtVal {
-    alloc(RtPayload::Str(RtStr::new(as_str(s).trim_start().to_string())))
+    alloc(RtPayload::Str(RtStr::of(as_str(s).trim_start())))
 }
 
 /// # Safety: live pointer.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_str_trim_end(s: *mut RtVal) -> *mut RtVal {
-    alloc(RtPayload::Str(RtStr::new(as_str(s).trim_end().to_string())))
+    alloc(RtPayload::Str(RtStr::of(as_str(s).trim_end())))
 }
 
 /// # Safety: live pointer.
@@ -3043,7 +3145,7 @@ pub unsafe extern "C" fn grasm_str_substr(s: *mut RtVal, start: i64, len: i64) -
     let end = (start as i64).saturating_add(len.max(0)).clamp(0, n) as usize;
     let a = gs.byte_at(start).unwrap_or(0);
     let b = gs.byte_at(end).unwrap_or(gs.len());
-    alloc(RtPayload::Str(RtStr::new(gs[a..b].to_string())))
+    alloc(RtPayload::Str(RtStr::of(&gs[a..b])))
 }
 
 /// # Safety: live pointers; returns Option[i64] (char index).
@@ -3746,7 +3848,7 @@ pub extern "C" fn grasm_args() -> *mut RtVal {
     let items: Vec<*mut RtVal> = PROGRAM_ARGS.with(|a| {
         a.borrow()
             .iter()
-            .map(|s| alloc(RtPayload::Str(RtStr::new(s.clone()))))
+            .map(|s| alloc(RtPayload::Str(RtStr::of(s))))
             .collect()
     });
     alloc(RtPayload::List(items))
@@ -4390,3 +4492,59 @@ pub unsafe extern "C" fn grasm_list_min_max(v: *mut RtVal, want_max: i8) -> *mut
     }
 }
 
+
+#[cfg(test)]
+mod small_string_tests {
+    use crate::RtStr;
+
+    /// The inline and heap paths must be indistinguishable to every reader.
+    #[test]
+    fn inline_and_heap_agree() {
+        let cases = [
+            "", "a", "abc", "0123456789abcde",        // 15 — the last inline size
+            "0123456789abcdef",                        // 16 — first heap
+            "a much longer string than fifteen bytes",
+            "héllo", "🙂", "αβγ", "naïve café",       // non-ASCII, both sides of 15
+        ];
+        for c in cases {
+            let s = RtStr::new(c.to_string());
+            assert_eq!(&*s, c, "round trip for {c:?}");
+            assert_eq!(s.char_len(), c.chars().count(), "char_len for {c:?}");
+            assert_eq!(s.is_flat(), c.is_ascii(), "is_flat for {c:?}");
+            for i in 0..c.chars().count() {
+                assert_eq!(s.char_at(i), c.chars().nth(i), "char {i} of {c:?}");
+            }
+        }
+    }
+
+    /// The integer path writes digits itself, so it has to agree with the
+    /// standard formatting it replaces — including at the boundaries.
+    #[test]
+    fn of_i64_agrees_with_to_string() {
+        let mut cases: Vec<i64> = (-3000..3000).collect();
+        cases.extend([
+            i64::MIN, i64::MIN + 1, i64::MAX, i64::MAX - 1,
+            -99_999_999_999_999, 99_999_999_999_999,     // last inline magnitudes
+            -100_000_000_000_000, 100_000_000_000_000,   // first heap magnitudes
+            10, -10, 100, -100, 1_000_000_000,
+        ]);
+        for v in cases {
+            assert_eq!(&*RtStr::of_i64(v), v.to_string().as_str(), "of_i64({v})");
+        }
+    }
+
+    /// Concatenation must agree with the obvious implementation, especially
+    /// across the boundary where the result stops fitting inline.
+    #[test]
+    fn concat_agrees_across_the_inline_boundary() {
+        let parts = ["", "a", "abcdefg", "0123456789abcde", "0123456789abcdef", "é", "🙂"];
+        for a in parts {
+            for b in parts {
+                let joined = RtStr::concat(a, b);
+                let want = format!("{a}{b}");
+                assert_eq!(&*joined, want.as_str(), "{a:?} + {b:?}");
+                assert_eq!(joined.char_len(), want.chars().count(), "{a:?} + {b:?}");
+            }
+        }
+    }
+}

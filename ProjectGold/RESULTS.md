@@ -23,10 +23,10 @@ Re-run with `./run.sh`.
 | 12 | Markdown → HTML | ✅ | — |
 | 13 | JSON Parser | ✅ | — |
 | 14 | Game of Life | ✅ | — |
-| 15 | Sorting Benchmark | ✅ | **F7** no stderr |
+| 15 | Sorting Benchmark | ✅ | consumed **F7**; `eprint` shipped |
 | 16 | Key-Value Database | ✅ | — |
 | 17 | Simple Shell | ⛔ | **F8** `extern fn` carries only `i64`/`f64` |
-| 18 | Image Converter | ⛔ | **F9** no byte type |
+| 18 | Image Converter | ✅ | consumed **F9**; writes a BMP `file(1)` identifies |
 | 19 | Event Emitter | ✅ | **F10** a `ref` to a scalar can never be read |
 | 20 | Expression REPL | ✅ | — |
 | 21 | HTTP Server | ✅ | — (verified live with `curl`) |
@@ -62,13 +62,15 @@ hitting them:
    found, it sits under the north-star goal that claims the most (G6), and it is
    the only one whose fix is interesting rather than mechanical — `async` is
    already in the effect vocabulary and nothing performs it.
-2. **F9 — no byte type.** Blocks 18 and 25, is the root cause of F8, and is why
-   `server.gr` cannot serve `grasm.wasm`. One type, and it fixes the FFI too.
+2. ~~**F9 — no byte type.**~~ **Fixed.** `bytes` shipped as `[L-LIB-BYTES]`,
+   which unblocked 18 — it now writes a BMP that `file(1)` identifies as
+   "PC bitmap, Windows 3.x format, 3 x 2 x 24". 25 stays blocked on F12 alone.
 3. **F13 — blocking sockets.** The other half of F14: even single-threaded
    multiplexing is impossible, because nothing can ask whether a handle is
    ready.
 4. **F7 — no stderr.** A tool cannot separate diagnostics from output.
-5. **F5 — no multi-line strings.** Every embedded fixture is one long line.
+5. ~~**F5 — no multi-line strings.**~~ **Withdrawn** — `"""` blocks have existed
+   since C20; the finding was wrong, not fixed.
 6. **F2, F6, F10, F12** — smaller.
 
 ## What did not go wrong
