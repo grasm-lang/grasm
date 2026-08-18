@@ -714,6 +714,7 @@ impl<'m> Codegen<'m> {
             ("grasm_net_close", vec![i64t], None),
             ("grasm_net_wait", vec![i64t, i64t], Some(i64t)),
             ("grasm_net_port", vec![i64t], Some(i64t)),
+            ("grasm_map_add_i64", vec![i64t, i64t, i64t, i64t], Some(i64t)),
             ("grasm_proc_run", vec![i64t, i64t], Some(i64t)),
             ("grasm_proc_pipeline", vec![i64t, i64t], Some(i64t)),
             // The C boundary ([T-EXTERN-POINTER]).
@@ -5369,6 +5370,80 @@ impl FnCx<'_, '_> {
     ///
     /// Returns `None` whenever the shape does not match, so nothing here can
     /// change what a program means — only how long it takes.
+    /// `m.set(k, (m.get(k) ?? D) + N)` — the counting idiom — as
+    /// `(delta, default)`, when fusing it into one lookup cannot change what
+    /// the program does.
+    ///
+    /// Deliberately narrow. It fires only when the map and the key are spelled
+    /// the same on both sides, the key is a *simple* expression, and both the
+    /// default and the addend are integer literals. Every one of those is
+    /// there so that evaluating the key once instead of twice, and evaluating
+    /// the default before the lookup instead of after it, cannot be observed:
+    /// a key expression that called something would run once instead of twice,
+    /// and a non-literal default would lose `??`'s laziness.
+    fn counter_bump(map_name: &str, key: &Expr, value: &Expr) -> Option<(i64, i64)> {
+        // A key whose evaluation nothing can notice happening once.
+        fn simple(e: &Expr) -> bool {
+            match e {
+                Expr::Ident(_) | Expr::Int(..) | Expr::Str(..) => true,
+                Expr::Index { recv, index, .. } => simple(recv) && simple(index),
+                Expr::Field { recv, .. } => simple(recv),
+                Expr::Binary { lhs, rhs, .. } => simple(lhs) && simple(rhs),
+                _ => false,
+            }
+        }
+        fn same(a: &Expr, b: &Expr) -> bool {
+            match (a, b) {
+                (Expr::Ident(x), Expr::Ident(y)) => x.name == y.name,
+                (Expr::Int(x, ..), Expr::Int(y, ..)) => x == y,
+                (Expr::Str(..), Expr::Str(..)) => format!("{a:?}") == format!("{b:?}"),
+                (
+                    Expr::Index { recv: r1, index: i1, .. },
+                    Expr::Index { recv: r2, index: i2, .. },
+                ) => same(r1, r2) && same(i1, i2),
+                (Expr::Field { recv: r1, name: n1, .. }, Expr::Field { recv: r2, name: n2, .. }) => {
+                    n1.name == n2.name && same(r1, r2)
+                }
+                (
+                    Expr::Binary { op: o1, lhs: l1, rhs: h1, .. },
+                    Expr::Binary { op: o2, lhs: l2, rhs: h2, .. },
+                ) => o1 == o2 && same(l1, l2) && same(h1, h2),
+                _ => false,
+            }
+        }
+
+        if !simple(key) {
+            return None;
+        }
+        // `<something> + N`, with N a literal.
+        let Expr::Binary { op: BinaryOp::Add, lhs, rhs, .. } = value else {
+            return None;
+        };
+        let Expr::Int(delta, ..) = &**rhs else {
+            return None;
+        };
+        // The left side is `m.get(k) ?? D`.
+        let Expr::Binary { op: BinaryOp::Coalesce, lhs: got, rhs: dflt, .. } = &**lhs else {
+            return None;
+        };
+        let Expr::Int(default, ..) = &**dflt else {
+            return None;
+        };
+        let Expr::MethodCall { recv, name, args, .. } = &**got else {
+            return None;
+        };
+        if name.name != "get" || args.len() != 1 {
+            return None;
+        }
+        let Expr::Ident(m) = &**recv else {
+            return None;
+        };
+        if m.name != map_name || !same(&args[0], key) {
+            return None;
+        }
+        Some((*delta, *default))
+    }
+
     fn fused_range_build(
         &self,
         range: &Expr,
@@ -5506,6 +5581,42 @@ impl FnCx<'_, '_> {
                 if let Some((var, vt)) = self.lookup(&id.name) {
                     match (&vt, name.name.as_str()) {
                         (VType::Map(k_t, v_t), "set") => {
+                            // The counting idiom, fused into one lookup. It
+                            // hashes the key once where writing it out hashes
+                            // twice, which is what the C program this is
+                            // measured against already did.
+                            if matches!(**v_t, VType::I64 | VType::Any) {
+                                if let Some((delta, default)) =
+                                    Self::counter_bump(&id.name, &args[0], &args[1])
+                                {
+                                    let want_k: Option<VType> = if **k_t == VType::Any {
+                                        None
+                                    } else {
+                                        Some((**k_t).clone())
+                                    };
+                                    let kt2 = k_t.clone();
+                                    let (kv, kvt) =
+                                        self.eval_expr_expecting(&args[0], want_k.as_ref())?;
+                                    let kb = self.box_value(kv, &kvt);
+                                    let d = self.b.ins().iconst(types::I64, delta);
+                                    let z = self.b.ins().iconst(types::I64, default);
+                                    let cur = self.b.use_var(var);
+                                    let np = self
+                                        .call_rt("grasm_map_add_i64", &[cur, kb, d, z])
+                                        .unwrap();
+                                    let refined = VType::Map(
+                                        if *kt2 == VType::Any {
+                                            Box::new(kvt)
+                                        } else {
+                                            kt2
+                                        },
+                                        Box::new(VType::I64),
+                                    );
+                                    self.rebind(&id.name, var, refined);
+                                    self.b.def_var(var, np);
+                                    return Ok(None);
+                                }
+                            }
                             let (kt, vt2) = (k_t.clone(), v_t.clone());
                             let want_k: Option<VType> = if **k_t == VType::Any { None } else { Some((**k_t).clone()) };
                             let want_v: Option<VType> = if **v_t == VType::Any { None } else { Some((**v_t).clone()) };

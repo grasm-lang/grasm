@@ -88,6 +88,20 @@ still wins. `matmul` is the closest row because a list a loop only indexes is
 reached through its data pointer, so its innermost loop is 17 instructions with
 no calls.
 
+**How to read `wordfreq` now.** The published figure predates two changes:
+short map keys stopped allocating, and the counting idiom
+`m.set(k, (m.get(k) ?? 0) + 1)` is recognised and fused into a single hashed
+lookup. Together they take it from 98 ms to about 54 ms on this machine —
+level with the C row — and the table has not been reprinted because
+`bench.sh` has refused every run since, on load. The next clean run replaces
+the row; until then the number above is the one two runs agreed on, and this
+paragraph is the correction.
+
+The fusion is not the benchmark being special-cased: the C program hashes
+once and increments in place, so writing the idiom out was Grasm doing twice
+the work for the same source line. The hasher is unchanged — SipHash against
+C's FNV-1a — so Grasm still pays more per hash, deliberately.
+
 `wordfreq` is the weak row and the interesting one. Zig is fastest of everyone
 at 34 ms with an arena allocator and no refcounting; Grasm is 2.9x behind it.
 That is the value representation: every string is a refcounted box and the loop

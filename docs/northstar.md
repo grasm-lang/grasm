@@ -255,8 +255,36 @@ implements all four **by content**. Deriving them would have made `Inline("a")`
 and `Heap("a")` different keys — the same text reached two ways landing in two
 slots, which is a wrong answer rather than a slow one.
 
-The map's hasher is *not* a candidate: map keys are user data, and Rust's default
-hasher is what stops a program that reads untrusted input from being hash-flooded.
+**The counting idiom hashed twice, and now hashes once.**
+
+```grasm
+counts.set(w, (counts.get(w) ?? 0) + 1)
+```
+
+Written out, that is two lookups of the same key: one to read and one to store.
+The C program this benchmark is measured against hashes once and increments the
+slot in place, so Grasm was paying a cost the comparison was not — and every
+language answers this idiom with one lookup (`m[k]++` in Go,
+`*m.entry(k).or_insert(0) += 1` in Rust, `Counter` in Python).
+
+The backend recognises the shape and calls one runtime operation that reads,
+adds and writes back under a single hash. Measured on one machine minutes
+apart: **wordfreq 70 → 53.7 ms**, with the same checksum — a fifth of the whole
+program.
+
+The recogniser is deliberately narrow, and every restriction buys a guarantee
+that fusing cannot change what the program does: the map and the key must be
+spelled the same on both sides, the key must be an expression whose evaluation
+nothing can notice happening once rather than twice, and the default and the
+addend must both be integer literals — a computed default would lose `??`'s
+laziness, which is a defect this repository has already had once. Two different
+maps, two different keys, a non-integer value type and a copy of the map
+watching are each checked in `scripts/fuzz_fusions.py`.
+
+**The hasher is untouched.** The saving is one hash, not a cheaper one. Map keys
+are user data, and Rust's default hasher is what stops a program that reads
+untrusted input from being hash-flooded — the C implementation uses FNV-1a and
+has no such protection, so Grasm is still paying more per hash on purpose.
 
 **G1 and G10 cannot be moved from inside this repository.** No human has run a
 Grasm program. Every signal the project has is model-generated, and the two

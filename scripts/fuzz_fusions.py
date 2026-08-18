@@ -116,6 +116,49 @@ def lazy_program():
     )
 
 
+def counter_program():
+    """`m.set(k, (m.get(k) ?? d) + n)` fused into one lookup.
+
+    The guards are the interesting part: the fusion must *not* fire when the
+    two maps differ, when the two keys differ, when the value type is not an
+    integer, or when a copy of the map is watching.
+    """
+    return (
+        PRELUDE
+        + "fn main() / {io} {\n"
+        + '    let keys = ["k0", "k1"]\n'
+        + "    var a = map()\n"
+        + '    for w in ["x", "y", "x", "x", "z"] {\n'
+        + "        a.set(w, (a.get(w) ?? 0) + 1)\n    }\n"
+        + '    print("counts {a}")\n'
+        + "    var b = map()\n"
+        + '    for w in ["p", "p"] {\n'
+        + "        b.set(w, (b.get(w) ?? 100) + 5)\n    }\n"
+        + '    print("default {b}")\n'
+        + "    var c = map()\n"
+        + "    for i in 0..4 {\n"
+        + "        c.set(keys[i % 2], (c.get(keys[i % 2]) ?? 0) + 1)\n    }\n"
+        + '    print("indexed {c}")\n'
+        # Guards.
+        + "    var d = map()\n    var e = map()\n"
+        + '    d.set("q", 7)\n    e.set("q", (d.get("q") ?? 0) + 1)\n'
+        + '    print("cross {d} {e}")\n'
+        + '    var f = map()\n    f.set("a", 3)\n'
+        + '    f.set("b", (f.get("a") ?? 0) + 1)\n'
+        + '    print("diffkey {f}")\n'
+        + '    var g = map()\n    g.set("n", 1)\n    let snap = g\n'
+        + '    g.set("n", (g.get("n") ?? 0) + 1)\n'
+        + '    print("alias {g} {snap}")\n'
+        + "    var h: Map[str, str] = map()\n"
+        + '    h.set("s", (h.get("s") ?? "") + "!")\n'
+        + '    print("strings {h}")\n'
+        + "    var j = map()\n    for i in 0..6 {\n"
+        + '        j.set("t", (j.get("t") ?? 0) + 1)\n'
+        + '        if i == 2 { j.delete("t") }\n    }\n'
+        + '    print("deleted {j}")\n}\n'
+    )
+
+
 def diverging_program():
     """A fused loop that panics part-way: same output before it, same status."""
     return (
@@ -142,7 +185,8 @@ def main():
     exe = os.path.join(work, "p.bin")
 
     cases = [("range-grid", range_program()), ("lazy-default", lazy_program()),
-             ("diverging-fused-map", diverging_program())]
+             ("diverging-fused-map", diverging_program()),
+             ("counter-bump", counter_program())]
     for ty, lit, key, default in MAP_KINDS:
         cases.append((f"map-get-or/{ty}", map_program(ty, lit, key, default)))
 

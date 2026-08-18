@@ -2428,6 +2428,47 @@ unsafe fn cow_map(m: *mut RtVal) -> *mut RtVal {
     alloc(RtPayload::Map(cloned))
 }
 
+/// `m.set(k, (m.get(k) ?? d) + n)` — read, add and write back, hashing **once**.
+///
+/// Written out, that idiom hashes the key twice: once for the lookup and once
+/// for the store. It is how counting is spelled in every language, and every
+/// language answers it with one lookup — `m[k]++` in Go, `*m.entry(k)
+/// .or_insert(0) += 1` in Rust, `Counter` in Python. The C program this
+/// benchmark compares against hashes once and increments the slot in place,
+/// so doing it twice was Grasm paying a cost the comparison did not.
+///
+/// The hasher is unchanged and still SipHash: the saving is one hash, not a
+/// cheaper one. Map keys are user data and flood resistance is deliberate.
+///
+/// # Safety: key ownership transfers; returns the (possibly new) map.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_map_add_i64(
+    m: *mut RtVal,
+    k: *mut RtVal,
+    delta: i64,
+    default: i64,
+) -> *mut RtVal {
+    let target = cow_map(m);
+    let RtPayload::Map(entries) = &mut (*target).payload else {
+        unreachable!()
+    };
+    let slot = with_key(k, |kk| entries.get_mut(kk).map(std::ptr::from_mut));
+    match slot {
+        Some(slot) => {
+            let old = match &(**slot).payload {
+                RtPayload::I64(n) => *n,
+                _ => rt_panic("map_add on a map whose values are not integers"),
+            };
+            dec(std::mem::replace(&mut *slot, grasm_box_i64(old + delta)));
+        }
+        None => {
+            entries.insert(MapKey::of(k), grasm_box_i64(default + delta));
+        }
+    }
+    dec(k);
+    target
+}
+
 /// # Safety: key/value ownership transfers; returns the (possibly new) map.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_map_set(
