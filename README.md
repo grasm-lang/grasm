@@ -125,25 +125,27 @@ Best of 5, milliseconds, Apple M-series. Nim and Zig implement the four
 programs where the comparison is about the language rather than about which
 concurrency primitive each one reaches for.
 
-> **The table that stood here is withdrawn.** `bench.sh` read the clock by
-> launching `python3` either side of the program it was timing, so the second
-> interpreter's own startup — about 21 ms — landed inside every measurement.
-> A constant added to every cell is the worst error a benchmark can have: it
-> does not look like noise, it compresses every ratio toward 1, and it made a
-> 5 ms program and a 10 ms program look like 26 ms and 32 ms. The harness is
-> fixed; the numbers are not republished until a run the load gate accepts.
->
-> What the fix changes, from a run taken while the machine was too busy to
-> publish: Grasm is about **2 to 2.4x C** on the scalar programs rather than
-> the 1.2x the old table implied — and **`sort` is a much better result than
-> it looked**, at roughly half C's time rather than a tenth under it. The
-> direction of the correction is not uniform, which is what an additive error
-> does.
->
-> Every millisecond figure written elsewhere in this repository *before* this
-> correction carries the same 21 ms. Differences between two of them are real —
-> both sides were measured the same way on the same machine — but the absolute
-> values are not, and `docs/northstar.md` records the ones that mattered.
+| program  |   C |  Rust |  Go | Nim | Zig | grasm-native | Python |
+|----------|----:|------:|----:|----:|----:|-------------:|-------:|
+| fib      |   5 |     5 |   6 |   6 |   5 |           11 |    131 |
+| sieve    |   7 |     7 |   8 |   9 |   7 |           17 |    365 |
+| matmul   |   5 |     5 |   8 |   9 |   6 |           10 |    942 |
+| wordfreq |  31 |    26 |  18 |  23 |  10 |           54 |    135 |
+| sort     |  37 |    12 |  50 |   — |   — |       **20** |    223 |
+| parmap   |  51 |    51 |  90 |   — |   — |          105 |  3,455 |
+
+Best of 7. **The harness floor is 2 ms** — that is what timing `/usr/bin/true`
+costs, and it is fork, exec and wait rather than anything a program did. So the
+top three rows are mostly floor: C's 5 ms `fib` is about 3 ms of work and
+Grasm's 11 ms is about 9 ms, which is nearer 3x than the 2.2x the raw numbers
+show. Subtract 2 from every cell before taking a ratio on a short row.
+
+Two runs an hour apart agreed within 2 ms on every cell — and that on its own
+proves nothing, which this file learned the hard way: the previous table was
+also reproduced, and was wrong by a constant 21 ms in every cell (F27). What
+makes these numbers believable is that the *timer* is now checked too. The
+harness measures a program that does nothing before it measures anything else,
+and refuses to run if that takes more than 10 ms.
 
 `./scripts/bench.sh` builds every implementation, checks each one against the
 interpreter's answer, and refuses to report a timing for a wrong one — an
@@ -158,15 +160,16 @@ measurement — is the answer right, is the machine quiet — and the timer itse
 was never checked against a program of known duration. It is now: the C sieve
 takes about 5 ms, and a harness that says 30 is measuring itself.
 
-Native Grasm beats C and Go on `sort`. Elsewhere it is behind, and by how much
-is exactly what the withdrawn table got wrong — the corrected figures follow a
-clean run. Scalar lists store elements inline and a list a loop only indexes is
+Native Grasm **beats C and Go on `sort`** — 20 ms against 37 and 50, with Rust
+ahead at 12. Everywhere else it is roughly **2x C** on the scalar programs.
+Scalar lists store elements inline and a list a loop only indexes is
 reached through its data pointer, so `matmul`'s innermost loop is 17
 instructions with no calls.
 
 `wordfreq` is the honest weak spot. It is allocation: every value is a
 refcounted box and the loop builds a string per iteration.
-Small-string optimisation took it from 117 ms to 98 ms by removing the *second*
+Small-string optimisation took it from 117 ms to 98 ms — both figures on the
+old harness, so both carry its 21 ms; the *difference* is real — by removing the *second*
 allocation for text under sixteen bytes — the storage change alone made it
 slower, and the win came from the constructors that stopped building a `String`
 only to copy it (`docs/northstar.md` records the measurements, including the

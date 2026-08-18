@@ -62,30 +62,33 @@ All seven implementations in one table. Nim and Zig implement the four programs
 where the comparison is about the language rather than about which concurrency
 primitive each one reaches for.
 
-> **The table that stood here is withdrawn.** `bench.sh` read the clock by
-> launching `python3` either side of the program it was timing, so the second
-> interpreter's own startup — about 21 ms — landed inside every measurement.
-> A constant added to every cell is the worst error a benchmark can have: it
-> does not look like noise, it compresses every ratio toward 1, and it made a
-> 5 ms program and a 10 ms program look like 26 ms and 32 ms. The harness is
-> fixed; the numbers are not republished until a run the load gate accepts.
->
-> What the fix changes, from a run taken while the machine was too busy to
-> publish: Grasm is about **2 to 2.4x C** on the scalar programs rather than
-> the 1.2x the old table implied — and **`sort` is a much better result than
-> it looked**, at roughly half C's time rather than a tenth under it. The
-> direction of the correction is not uniform, which is what an additive error
-> does.
->
-> Every millisecond figure written elsewhere in this repository *before* this
-> correction carries the same 21 ms. Differences between two of them are real —
-> both sides were measured the same way on the same machine — but the absolute
-> values are not, and `docs/northstar.md` records the ones that mattered.
+| program  |   C |  Rust |  Go | Nim | Zig | grasm-native | grasm-interp | Python |
+|----------|----:|------:|----:|----:|----:|-------------:|-------------:|-------:|
+| fib      |   5 |     5 |   6 |   6 |   5 |           11 |         1635 |    131 |
+| sieve    |   7 |     7 |   8 |   9 |   7 |           17 |         2870 |    365 |
+| matmul   |   5 |     5 |   8 |   9 |   6 |           10 |         6049 |    942 |
+| wordfreq |  31 |    26 |  18 |  23 |  10 |           54 |          500 |    135 |
+| sort     |  37 |    12 |  50 |   — |   — |       **20** |          373 |    223 |
+| parmap   |  51 |    51 |  90 |   — |   — |          105 |       54,395 |  3,455 |
 
-The withdrawn table was one run, reproduced by a second taken hours apart —
-and both were wrong in the same way, which is exactly why reproducibility is
-necessary and not sufficient. Two runs of a harness that adds a constant agree
-with each other perfectly. Timings from different sessions are not
+Best of 7. **The harness floor is 2 ms** — that is what timing `/usr/bin/true`
+costs, and it is fork, exec and wait rather than anything a program did. So the
+top three rows are mostly floor: C's 5 ms `fib` is about 3 ms of work and
+Grasm's 11 ms is about 9 ms, which is nearer 3x than the 2.2x the raw numbers
+show. Subtract 2 from every cell before taking a ratio on a short row.
+
+Two runs an hour apart agreed within 2 ms on every cell — and that on its own
+proves nothing, which this file learned the hard way: the previous table was
+also reproduced, and was wrong by a constant 21 ms in every cell (F27). What
+makes these numbers believable is that the *timer* is now checked too. The
+harness measures a program that does nothing before it measures anything else,
+and refuses to run if that takes more than 10 ms.
+
+### Reading it
+
+Grasm **beats C and Go on `sort`** and is roughly **2x C** on the other scalar
+programs. `wordfreq` is the weak row: Zig does it in 10 ms with an arena
+allocator and no refcounting, and Grasm takes 54. Timings from different sessions are not
 comparable: earlier editions of this file recorded `fib` at 26 ms for C and
 27 ms for Grasm, and the ratio has moved from 1.04x to 1.21x without either
 implementation changing. Compare rows within a table, never numbers across
@@ -99,14 +102,11 @@ still wins. `matmul` is the closest row because a list a loop only indexes is
 reached through its data pointer, so its innermost loop is 17 instructions with
 no calls.
 
-**How to read `wordfreq` now.** The published figure predates two changes:
-short map keys stopped allocating, and the counting idiom
-`m.set(k, (m.get(k) ?? 0) + 1)` is recognised and fused into a single hashed
-lookup. Together they take it from 98 ms to about 54 ms on this machine —
-level with the C row — and the table has not been reprinted because
-`bench.sh` has refused every run since, on load. The next clean run replaces
-the row; until then the number above is the one two runs agreed on, and this
-paragraph is the correction.
+**Two changes got `wordfreq` to the 54 ms above.** Short map keys stopped
+allocating, and the counting idiom `m.set(k, (m.get(k) ?? 0) + 1)` is
+recognised and fused into a single hashed lookup. On the old harness that was
+98 ms to 54 ms; both figures carry its 21 ms, so the *difference* is real and
+the absolutes were not.
 
 The fusion is not the benchmark being special-cased: the C program hashes
 once and increments in place, so writing the idiom out was Grasm doing twice
@@ -117,7 +117,7 @@ C's FNV-1a — so Grasm still pays more per hash, deliberately.
 at 34 ms with an arena allocator and no refcounting; Grasm is 2.9x behind it.
 That is the value representation: every string is a refcounted box and the loop
 builds one per iteration. Small-string optimisation moved it from 117 ms to
-98 ms by removing the *second* allocation for text under sixteen bytes — and the
+98 ms on the old harness — the difference is real, the absolutes are not — by removing the *second* allocation for text under sixteen bytes — and the
 inline storage alone made things **slower**, because the constructors still
 built a `String` and copied it. The win was in the constructors. `docs/northstar.md`
 records that, along with the attempts that were measured and reverted.

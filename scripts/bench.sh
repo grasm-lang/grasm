@@ -88,6 +88,41 @@ sys.exit(0 if done.returncode == 0 else 1)
 TIMER
 }
 
+# What the timer costs when there is nothing to time.
+#
+# This is the check that was missing when `time_ms` was measuring a Python
+# interpreter's startup and adding it to every cell (ProjectGold F27). Two
+# gates already watched the *inputs* to a measurement — is the answer right,
+# is the machine quiet — and neither could see a timer that was wrong, because
+# a constant offset reproduces perfectly.
+#
+# `true` does nothing, so the whole of this figure is fork, exec and wait. A
+# few milliseconds is the floor of any wall-clock measurement of a process and
+# is honest; anything more means the harness is timing itself again.
+timer_floor() {
+    local t best=""
+    for _ in 1 2 3; do
+        t=$(time_ms /usr/bin/true) || return 1
+        if [ -z "$best" ] || [ "$t" -lt "$best" ]; then best=$t; fi
+    done
+    echo "$best"
+}
+
+FLOOR=$(timer_floor)
+if [ -z "$FLOOR" ]; then
+    echo "refusing to benchmark: the timer could not measure /usr/bin/true"
+    exit 1
+fi
+if [ "$FLOOR" -gt 10 ]; then
+    echo "refusing to benchmark: timing /usr/bin/true takes ${FLOOR}ms"
+    echo
+    echo "A program that does nothing cannot take that long. The harness is"
+    echo "measuring itself, and every number it prints would carry the same"
+    echo "amount — which does not look like noise and does not go away when"
+    echo "the run is repeated. See ProjectGold/FINDINGS.md F27."
+    exit 1
+fi
+
 # Best of REPS, the least noisy summary of a short run.
 best_ms() {
     local best="" t i=0
