@@ -1826,8 +1826,54 @@ to one — a loop variable or a list element is this case",
         let dec_ref = self.module.declare_func_in_func(self.runtime["grasm_val_dec"], b.func);
         b.ins().call(dec_ref, &[env]);
         let target = self.module.declare_func_in_func(sig_info.id, b.func);
-        let inst = b.ins().call(target, &params[1..]);
+        // A C function reached through a value is the same call as a direct
+        // one, so a `str` or `bytes` parameter still crosses as a pointer
+        // ([T-EXTERN-POINTER]). Without this the wrapper forwarded the boxed
+        // value's own address: `[s].map(strlen)` handed C an `RtVal` to walk
+        // and answered 1 for every string, while `grasm run` answered
+        // correctly.
+        let mut call_args: Vec<Value> = Vec::with_capacity(params.len() - 1);
+        let mut c_temps: Vec<(Value, bool)> = Vec::new();
+        for (i, p) in params[1..].iter().enumerate() {
+            match sig_info.params.get(i) {
+                Some(VType::Str) if sig_info.is_extern => {
+                    let f = self
+                        .module
+                        .declare_func_in_func(self.runtime["grasm_str_c_new"], b.func);
+                    let call = b.ins().call(f, &[*p]);
+                    let ptr = b.inst_results(call)[0];
+                    call_args.push(ptr);
+                    c_temps.push((ptr, true));
+                    c_temps.push((*p, false));
+                }
+                Some(VType::Bytes) if sig_info.is_extern => {
+                    let f = self
+                        .module
+                        .declare_func_in_func(self.runtime["grasm_bytes_ptr"], b.func);
+                    let call = b.ins().call(f, &[*p]);
+                    call_args.push(b.inst_results(call)[0]);
+                    c_temps.push((*p, false));
+                }
+                _ => call_args.push(*p),
+            }
+        }
+        let inst = b.ins().call(target, &call_args);
         let results: Vec<Value> = b.inst_results(inst).to_vec();
+        // The wrapper owns the arguments it was handed, and C released
+        // nothing: free the string copies and release the boxes.
+        for (v, is_copy) in c_temps {
+            if is_copy {
+                let f = self
+                    .module
+                    .declare_func_in_func(self.runtime["grasm_str_c_free"], b.func);
+                b.ins().call(f, &[v]);
+            } else {
+                let f = self
+                    .module
+                    .declare_func_in_func(self.runtime["grasm_val_dec"], b.func);
+                b.ins().call(f, &[v]);
+            }
+        }
         if sig_info.ret == VType::Unit {
             b.ins().return_(&[]);
         } else {
@@ -6738,14 +6784,21 @@ impl FnCx<'_, '_> {
                     .lookup_fn(&name.name)
                     .filter(|_| !self.cg.field_calls.contains(&(span.start, span.end)))
                 {
-                    let (fid, params, modes, ret) = (
+                    let (fid, params, modes, ret, is_extern) = (
                         sig.id,
                         sig.params.clone(),
                         sig.modes.clone(),
                         sig.ret.clone(),
+                        sig.is_extern,
                     );
                     let ptr_ty = self.cg.module.target_config().pointer_type();
                     let mut vals: Vec<Value> = Vec::with_capacity(args.len() + 1);
+                    // `s.strlen()` is the same call as `strlen(s)` ([L-UFCS]),
+                    // so the pointer conversion has to happen here too. It did
+                    // not, and the boxed value's own address was handed to C:
+                    // `strlen` walked an `RtVal` and answered 1 for every
+                    // string, while `grasm run` answered correctly.
+                    let mut c_args: Vec<(Value, VType, Value)> = Vec::new();
                     // The receiver is the first parameter; honor `inout` by
                     // passing a pointer to the caller's slot.
                     let mut recv_slot: Option<(cranelift_codegen::ir::StackSlot, Variable, VType)> =
@@ -6771,6 +6824,15 @@ impl FnCx<'_, '_> {
                         let addr = self.b.ins().stack_addr(ptr_ty, slot, 0);
                         vals.push(addr);
                         recv_slot = Some((slot, rvar, rvt));
+                    } else if is_extern && matches!(params.first(), Some(VType::Str | VType::Bytes))
+                    {
+                        let want = params[0].clone();
+                        let p = match want {
+                            VType::Str => self.call_rt("grasm_str_c_new", &[rv]).unwrap(),
+                            _ => self.call_rt("grasm_bytes_ptr", &[rv]).unwrap(),
+                        };
+                        c_args.push((rv, want, p));
+                        vals.push(p);
                     } else {
                         vals.push(rv);
                     }
@@ -6805,6 +6867,15 @@ impl FnCx<'_, '_> {
                         if *want == VType::F64 && vt == VType::I64 {
                             v = self.b.ins().fcvt_from_sint(types::F64, v);
                         }
+                        if is_extern && matches!(want, VType::Str | VType::Bytes) {
+                            let p = match want {
+                                VType::Str => self.call_rt("grasm_str_c_new", &[v]).unwrap(),
+                                _ => self.call_rt("grasm_bytes_ptr", &[v]).unwrap(),
+                            };
+                            c_args.push((v, want.clone(), p));
+                            vals.push(p);
+                            continue;
+                        }
                         vals.push(v);
                     }
                     let fref = self.cg.module.declare_func_in_func(fid, self.b.func);
@@ -6817,6 +6888,14 @@ impl FnCx<'_, '_> {
                     for (slot, avar, avt) in arg_slots {
                         let updated = self.b.ins().stack_load(avt.cl(), slot, 0);
                         self.b.def_var(avar, updated);
+                    }
+                    // The C call is over: free the temporary copies and release
+                    // the boxed values that backed the pointers.
+                    for (boxed, vt, p) in c_args {
+                        if vt == VType::Str {
+                            self.call_rt("grasm_str_c_free", &[p]);
+                        }
+                        self.call_rt("grasm_val_dec", &[boxed]);
                     }
                     return Ok(if ret == VType::Unit {
                         None

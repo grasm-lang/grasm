@@ -392,6 +392,37 @@ available. A test asserts that: `run`, `send`, `open`, `close`, `read`, `write`,
 `start`, `stop`, `wait`, `execute` and twenty more must never appear in the
 builtin list.
 
+## F23 — a C function reached any way but directly was handed the wrong pointer (S1, backend) — **fixed**
+
+Found by extending `scripts/fuzz_extern.py` to the pointer boundary, which is
+the newest and most dangerous surface in the language and had exactly one
+conformance program covering it — one that only ever called `strlen(s)`.
+
+[L-UFCS] says `s.strlen()` is the same call as `strlen(s)`, and a function value
+is the same function. The pointer conversion lives at the *call site*, so every
+other spelling is a place it can be missed. Two were:
+
+* `s.strlen()` — the UFCS branch pushed the receiver unchanged;
+* `measure(strlen, s)` and `[s].map(strlen)[0]` — the wrapper that lets a named
+  function be used as a value forwarded its parameters unchanged.
+
+Both handed C **the boxed value's own address**. `strlen` walked an `RtVal`,
+found a zero byte one in, and answered `1` for every string in the language,
+while `grasm run` answered correctly. A wrong answer and an engine disagreement,
+from reading memory that was never the string — and with a different heap layout
+it reads until it finds a zero, wherever that is.
+
+**Fixed** in both places, with the temporaries freed and the boxes released on
+each new path (20,000 iterations through all four spellings, leak-free). The
+conformance program now exercises every spelling, and the fuzzer checks
+`strlen(s) == s.byte_len()` for strings on both sides of the fifteen-byte inline
+boundary and both sides of ASCII, on both engines.
+
+The lesson is the one this file keeps recording, now three times over (F17, F22,
+this): **a rule added at one site has not been added to the language.** What is
+new is the method. F17 and F22 were found by writing a program that happened to
+hit the second site; this was found by making the *test* enumerate the sites.
+
 ## F22 — `.value` was handled at the root of a place and not inside one (S2, backend) — **fixed**
 
 Found by probing the surface shipped this session rather than by any harness.
