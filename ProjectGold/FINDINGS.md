@@ -392,6 +392,45 @@ available. A test asserts that: `run`, `send`, `open`, `close`, `read`, `write`,
 `start`, `stop`, `wait`, `execute` and twenty more must never appear in the
 builtin list.
 
+## F29 — the bounds test never tested the boundary (S2, tests) — **fixed**
+
+Found by mutation testing: break the compiler on purpose, then ask which gate
+notices. Changing a list index check from `i >= len` to `i > len` — so
+`xs[len]` reads one element past the last instead of panicking — is the
+smallest wrong thing a bounds check can be.
+
+`E-INDEX-BOUNDS` read `xs[5]` on a list of two. Five is past the end by three,
+so it panics either way and the mutation survives: comparing what `difftest.sh`
+compares — stdout and exit code — both engines print nothing and exit 101.
+
+    old  xs[5] on len 2       interp 101, native 101   mutation survives
+    new  xs[xs.len()]         interp 101, native 134   mutation caught
+
+A bounds check is exactly the place where only the boundary is worth testing.
+The program now indexes at *precisely* `len`, on both list representations —
+a `[i64]` is stored unboxed and a `[str]` is a list of pointers, which are two
+different index paths — and checks the last valid index of each and a negative
+one on the way.
+
+### Three wrong measurements before a right one
+
+The technique exists to check whether measurements mean anything, and getting
+it working took three corrections:
+
+* The first mutation to *survive* was in `grasm_list_get`, the boxed path. It
+  survives because the backend emits its own inline bounds check first, so the
+  runtime one is a second line of defence and mutating it changes nothing
+  observable. An **equivalent mutant**, not a coverage hole — and it would have
+  been reported as one.
+* Verifying with `cargo test -p grasm_spec` reported nothing, because the
+  conformance suite runs the **interpreter** and the mutation was in the
+  runtime, which only compiled builds link. That suite cannot see a runtime
+  defect at all; only the gates that compile can.
+* Comparing with `2>&1` made every case look caught, because the interpreter
+  prints a stack trace and the native build does not — a difference that is
+  there with or without a mutation. `difftest.sh` compares stdout and the exit
+  code, and the check has to compare the same things.
+
 ## F28 — the conformance suite cannot test a multi-module program, and two module clauses pretended otherwise (S3, tests) — **fixed**
 
 Found probing modules for engine disagreements. There were none: ten shapes —

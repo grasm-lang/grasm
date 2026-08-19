@@ -1,7 +1,35 @@
 //! tag: E-INDEX-BOUNDS
 //! expect: panic
-//! index 5 out of bounds (len 2)
-fn main() {
-    let xs = [1, 2]
-    print("{xs[5]}")
+//! last of a scalar list: 3
+//! last of a boxed list: b
+//! a negative index is out of bounds, not counted from the end: true
+//! index 3 out of bounds (len 3)
+// Indexing past the end panics, and the interesting index is the *first* one
+// past it.
+//
+// This program used to read `xs[5]` on a list of two, which is past the end by
+// three and tests nothing an off-by-one would break. Changing the check from
+// `i >= len` to `i > len` — so `xs[len]` reads one element beyond the last —
+// left every gate in this repository green: 218 differential programs, the
+// leak check, 31 whole programs and this suite. A bounds check is exactly the
+// place where only the boundary is worth testing.
+//
+// Both representations are covered: a `[i64]` is stored unboxed and a `[str]`
+// is a list of pointers, and they are two different index paths in the
+// runtime.
+fn main() / {io} {
+    let xs = [1, 2, 3]
+    let ss = ["a", "b"]
+
+    // The last valid index of each, which must *not* panic.
+    print("last of a scalar list: {xs[xs.len() - 1]}")
+    print("last of a boxed list: {ss[ss.len() - 1]}")
+
+    // One before the beginning. There is no wrapping: a negative index is out
+    // of bounds rather than counting from the end, which `get` reports as
+    // `None` and indexing reports as a panic.
+    print("a negative index is out of bounds, not counted from the end: {xs.get(0 - 1) == None}")
+
+    // Exactly one past the end — the case an off-by-one lets through.
+    print("{xs[xs.len()]}")
 }
