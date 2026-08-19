@@ -120,32 +120,37 @@ runtime into one distributable executable).
 
 ### Performance
 
-Six programs written the same way in Grasm, C, Rust, Go, Nim, Zig and Python.
+Seven programs written the same way in Grasm, C, Rust, Go, Nim, Zig and Python.
 Best of 5, milliseconds, Apple M-series. Nim and Zig implement the four
 programs where the comparison is about the language rather than about which
 concurrency primitive each one reaches for.
 
 | program  |   C |  Rust |  Go | Nim | Zig | grasm-native | Python |
 |----------|----:|------:|----:|----:|----:|-------------:|-------:|
-| fib      |   5 |     5 |   6 |   6 |   5 |           11 |    131 |
-| sieve    |   7 |     7 |   8 |   9 |   7 |           17 |    365 |
-| matmul   |   5 |     5 |   8 |   9 |   6 |           10 |    942 |
-| wordfreq |  31 |    26 |  18 |  23 |  10 |           54 |    135 |
-| sort     |  37 |    12 |  50 |   — |   — |       **20** |    223 |
-| parmap   |  51 |    51 |  90 |   — |   — |          105 |  3,455 |
+| fib      |   5 |     5 |   6 |   6 |   5 |           10 |    128 |
+| sieve    |   7 |     7 |   7 |   9 |   7 |           15 |    360 |
+| matmul   |   5 |     5 |   8 |   9 |   6 |           10 |    889 |
+| wordfreq |  30 |    26 |  17 |  22 |   9 |           53 |    130 |
+| tree     |  20 |    10 |  21 |   — |   — |           97 |    329 |
+| sort     |  36 |    11 |  48 |   — |   — |       **19** |    206 |
+| parmap   |  48 |    47 |  86 |   — |   — |          104 |  3,455 |
 
-Best of 7. **The harness floor is 2 ms** — that is what timing `/usr/bin/true`
-costs, and it is fork, exec and wait rather than anything a program did. So the
-top three rows are mostly floor: C's 5 ms `fib` is about 3 ms of work and
-Grasm's 11 ms is about 9 ms, which is nearer 3x than the 2.2x the raw numbers
-show. Subtract 2 from every cell before taking a ratio on a short row.
+Best of 5. **The harness floor is 2 ms** — what timing `/usr/bin/true` costs,
+which is fork, exec and wait rather than anything a program did. The top three
+rows are mostly floor: C's 5 ms `fib` is about 3 ms of work and Grasm's 10 ms
+about 8, which is nearer 2.7x than the 2x the raw numbers show. Subtract 2 from
+every cell before taking a ratio on a short row.
 
-Two runs an hour apart agreed within 2 ms on every cell — and that on its own
-proves nothing, which this file learned the hard way: the previous table was
-also reproduced, and was wrong by a constant 21 ms in every cell (F27). What
-makes these numbers believable is that the *timer* is now checked too. The
-harness measures a program that does nothing before it measures anything else,
-and refuses to run if that takes more than 10 ms.
+This run reproduces the previous one within 2 ms on every cell except `sieve`,
+which went 17 to 15 for a reason — runtime calls are PC-relative now instead of
+going through the PLT. A benchmark that only ever agrees with itself is not
+measuring anything; one that agrees except where the code changed is.
+
+Reproducibility alone still proves nothing, which this file learned the hard
+way: the table before these was also reproduced, and was wrong by a constant
+21 ms in every cell (F27). What makes these believable is that the *timer* is
+checked as well — the harness times a program that does nothing before it times
+anything else, and refuses to run if that takes more than 10 ms.
 
 `./scripts/bench.sh` builds every implementation, checks each one against the
 interpreter's answer, and refuses to report a timing for a wrong one — an
@@ -160,20 +165,26 @@ measurement — is the answer right, is the machine quiet — and the timer itse
 was never checked against a program of known duration. It is now: the C sieve
 takes about 5 ms, and a harness that says 30 is measuring itself.
 
-Native Grasm **beats C and Go on `sort`** — 20 ms against 37 and 50, with Rust
-ahead at 12. Everywhere else it is roughly **2x C** on the scalar programs.
-Scalar lists store elements inline and a list a loop only indexes is
+Native Grasm **beats C and Go on `sort`** — 19 ms against 36 and 48, with Rust
+ahead at 11 — and is roughly **2x C** on the scalar programs. Scalar lists store elements inline and a list a loop only indexes is
 reached through its data pointer, so `matmul`'s innermost loop is 17
 instructions with no calls.
 
-`wordfreq` is the honest weak spot. It is allocation: every value is a
-refcounted box and the loop builds a string per iteration.
-Small-string optimisation took it from 117 ms to 98 ms — both figures on the
-old harness, so both carry its 21 ms; the *difference* is real — by removing the *second*
-allocation for text under sixteen bytes — the storage change alone made it
-slower, and the win came from the constructors that stopped building a `String`
-only to copy it (`docs/northstar.md` records the measurements, including the
-attempts that were reverted). `benchmarks/README.md` records two things this
+**The two weak rows are the two that allocate.** `wordfreq` builds a string per
+iteration and boxes every value; `tree` builds a small struct per node, and at
+97 ms against C's 20 and Rust's 10 it is the worst ratio here — and the one
+worth the most, because building small linked structures and walking them is
+what a parser, an interpreter or a compiler does all day.
+
+`tree` was 175 ms when it was written. Struct names stopped being copied on
+every value, and reading or writing a field became a load rather than a search
+through the field list. What is left is representation: Rust stores a child
+inline in its parent's vector and allocates about once per node, where Grasm
+allocates the box, the field vector, the child list and its storage.
+`docs/northstar.md` carries the measurements, including the attempts that were
+reverted.
+
+`benchmarks/README.md` records two things this
 table used to blame that measurement cleared — the bounds check and the absence
 of SIMD, each worth 0 ms.
 

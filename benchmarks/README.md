@@ -65,31 +65,45 @@ primitive each one reaches for.
 
 | program  |   C |  Rust |  Go | Nim | Zig | grasm-native | grasm-interp | Python |
 |----------|----:|------:|----:|----:|----:|-------------:|-------------:|-------:|
-| fib      |   5 |     5 |   6 |   6 |   5 |           11 |         1635 |    131 |
-| sieve    |   7 |     7 |   8 |   9 |   7 |           17 |         2870 |    365 |
-| matmul   |   5 |     5 |   8 |   9 |   6 |           10 |         6049 |    942 |
-| wordfreq |  31 |    26 |  18 |  23 |  10 |           54 |          500 |    135 |
-| sort     |  37 |    12 |  50 |   — |   — |       **20** |          373 |    223 |
-| parmap   |  51 |    51 |  90 |   — |   — |          105 |       54,395 |  3,455 |
+| fib      |   5 |     5 |   6 |   6 |   5 |           10 |         1616 |    128 |
+| sieve    |   7 |     7 |   7 |   9 |   7 |           15 |         2825 |    360 |
+| matmul   |   5 |     5 |   8 |   9 |   6 |           10 |         6002 |    889 |
+| wordfreq |  30 |    26 |  17 |  22 |   9 |           53 |          484 |    130 |
+| tree     |  20 |    10 |  21 |   — |   — |           97 |         1455 |    329 |
+| sort     |  36 |    11 |  48 |   — |   — |       **19** |          368 |    206 |
+| parmap   |  48 |    47 |  86 |   — |   — |          104 |       53,634 |  3,455 |
 
-Best of 7. **The harness floor is 2 ms** — that is what timing `/usr/bin/true`
-costs, and it is fork, exec and wait rather than anything a program did. So the
-top three rows are mostly floor: C's 5 ms `fib` is about 3 ms of work and
-Grasm's 11 ms is about 9 ms, which is nearer 3x than the 2.2x the raw numbers
-show. Subtract 2 from every cell before taking a ratio on a short row.
+Best of 5. **The harness floor is 2 ms** — what timing `/usr/bin/true` costs,
+which is fork, exec and wait rather than anything a program did. The top three
+rows are mostly floor: C's 5 ms `fib` is about 3 ms of work and Grasm's 10 ms
+about 8, which is nearer 2.7x than the 2x the raw numbers show. Subtract 2 from
+every cell before taking a ratio on a short row.
 
-Two runs an hour apart agreed within 2 ms on every cell — and that on its own
-proves nothing, which this file learned the hard way: the previous table was
-also reproduced, and was wrong by a constant 21 ms in every cell (F27). What
-makes these numbers believable is that the *timer* is now checked too. The
-harness measures a program that does nothing before it measures anything else,
-and refuses to run if that takes more than 10 ms.
+This run reproduces the previous one within 2 ms on every cell except `sieve`,
+which went 17 to 15 for a reason — runtime calls are PC-relative now instead of
+going through the PLT. A benchmark that only ever agrees with itself is not
+measuring anything; one that agrees except where the code changed is.
+
+Reproducibility alone still proves nothing, which this file learned the hard
+way: the table before these was also reproduced, and was wrong by a constant
+21 ms in every cell (F27). What makes these believable is that the *timer* is
+checked as well — the harness times a program that does nothing before it times
+anything else, and refuses to run if that takes more than 10 ms.
 
 ### Reading it
 
-Grasm **beats C and Go on `sort`** and is roughly **2x C** on the other scalar
-programs. `wordfreq` is the weak row: Zig does it in 10 ms with an arena
-allocator and no refcounting, and Grasm takes 54. Timings from different sessions are not
+Grasm **beats C and Go on `sort`** and is roughly **2x C** on the scalar
+programs.
+
+The two weak rows are the two that allocate. `wordfreq` is 53 against Zig's 9,
+which uses an arena and no refcounting. `tree` is 97 against C's 20 and Rust's
+10 — the worst ratio in the table, and the one worth the most, because building
+small linked structures and walking them is what a parser, an interpreter or a
+compiler does all day. It was 175 ms when the program was written; struct names
+stopped being copied and field access became a load rather than a search. What
+is left is that Rust stores a child inline in its parent's vector and allocates
+about once per node, where Grasm allocates the box, the field vector, the child
+list and its storage. Timings from different sessions are not
 comparable: earlier editions of this file recorded `fib` at 26 ms for C and
 27 ms for Grasm, and the ratio has moved from 1.04x to 1.21x without either
 implementation changing. Compare rows within a table, never numbers across
