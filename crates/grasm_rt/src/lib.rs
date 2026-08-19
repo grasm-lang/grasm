@@ -497,13 +497,6 @@ pub enum StructFields {
 }
 
 impl StructFields {
-    fn new() -> StructFields {
-        StructFields::Inline {
-            vals: [std::ptr::null_mut(); 4],
-            len: 0,
-        }
-    }
-
     fn len(&self) -> usize {
         match self {
             StructFields::Inline { len, .. } => *len as usize,
@@ -537,19 +530,20 @@ impl StructFields {
         self.as_mut_slice().get_mut(i)
     }
 
-    /// Spills to the heap on the fifth field, once.
-    fn push(&mut self, v: *mut RtVal) {
-        match self {
-            StructFields::Inline { vals, len } if (*len as usize) < 4 => {
-                vals[*len as usize] = v;
-                *len += 1;
+    /// The fields of a value the backend just built, taken from the stack
+    /// slot it stored them into. Four or fewer land in the box itself.
+    ///
+    /// # Safety: `argv` points at `n` values whose ownership transfers here.
+    unsafe fn from_ptrs(argv: *const *mut RtVal, n: usize) -> StructFields {
+        if n <= 4 {
+            let mut vals = [std::ptr::null_mut(); 4];
+            std::ptr::copy_nonoverlapping(argv, vals.as_mut_ptr(), n);
+            StructFields::Inline {
+                vals,
+                len: n as u8,
             }
-            StructFields::Inline { vals, len } => {
-                let mut heap: Vec<*mut RtVal> = vals[..*len as usize].to_vec();
-                heap.push(v);
-                *self = StructFields::Heap(heap);
-            }
-            StructFields::Heap(h) => h.push(v),
+        } else {
+            StructFields::Heap(std::slice::from_raw_parts(argv, n).to_vec())
         }
     }
 
@@ -569,64 +563,85 @@ impl StructFields {
 
 /// A struct type: its name, and its field names in declaration order.
 ///
-/// One of these per type, made the first time a value of it is built and
-/// living as long as the program. The backend sorts every struct literal into
-/// declaration order before storing anything, so the first construction fixes
-/// the order and every later one matches it — which is the same fact that lets
-/// a field be read by index instead of by name.
+/// One of these per type, built once from the descriptor the compiler emitted
+/// for it and living as long as the program. Immutable: the field names are
+/// known when the object file is written, so nothing here is discovered at run
+/// time and nothing has to guard against a second value of the type filling it
+/// in differently.
 pub struct StructTy {
     pub name: &'static str,
-    /// Appended to as the first value of this type is built. Every later value
-    /// pushes the same names in the same order, so this stops growing after
-    /// the first one.
-    pub fields: std::cell::RefCell<Vec<&'static str>>,
+    /// Declaration order. A field is read by index because of this: the
+    /// backend sorts every literal into this order before storing anything.
+    pub fields: Vec<&'static str>,
 }
 
-thread_local! {
-    /// Interned by name, so two values of one type share a `StructTy`.
-    static STRUCT_TYPES: std::cell::RefCell<
-        std::collections::HashMap<&'static str, &'static StructTy>,
-    > = std::cell::RefCell::new(std::collections::HashMap::new());
+/// The compiler's description of a struct type, one per type, sitting in the
+/// object file's data section.
+///
+/// The names of a type's fields are known when that object file is written, so
+/// they are written there — rather than rediscovered on the first construction
+/// by hashing the type name and pushing each field name in turn. Building a
+/// value now reads a pointer out of `cache` and is done.
+///
+/// Laid out by `struct_desc` in the backend, in this order and 8-byte aligned:
+///
+/// ```text
+///  +0  cache      the StructTy built from this descriptor, or 0
+///  +8  name_ptr   -> the type's name          (relocation)
+/// +16  name_len
+/// +24  nfields
+/// +32  field 0: ptr (relocation), len
+/// +48  field 1: ...
+/// ```
+#[repr(C)]
+pub struct StructDesc {
+    cache: std::sync::atomic::AtomicUsize,
+    name_ptr: *const u8,
+    name_len: u64,
+    nfields: u64,
+    // `nfields` (ptr, len) pairs follow.
 }
 
-/// The `StructTy` for a type name, made once.
-fn struct_ty(name: &'static str) -> &'static StructTy {
-    // A one-entry cache in front of the map. A loop building one kind of node
-    // asks for the same type every time, which is the case that matters.
-    LAST_TY.with(|c| {
-        if let Some((p, ty)) = c.get() {
-            if std::ptr::eq(p, name.as_ptr()) {
-                return Some(ty);
-            }
-        }
-        None
-    })
-    .unwrap_or_else(|| {
-        let ty = struct_ty_slow(name);
-        LAST_TY.with(|c| c.set(Some((name.as_ptr(), ty))));
-        ty
-    })
-}
-
-thread_local! {
-    static LAST_TY: std::cell::Cell<Option<(*const u8, &'static StructTy)>> =
-        const { std::cell::Cell::new(None) };
-}
-
-fn struct_ty_slow(name: &'static str) -> &'static StructTy {
-    STRUCT_TYPES.with(|t| {
-        if let Some(found) = t.borrow().get(name) {
-            return *found;
-        }
-        // Leaked on purpose: one per struct type in the program, and it has to
-        // outlive every value that points at it.
-        let fresh: &'static StructTy = Box::leak(Box::new(StructTy {
-            name,
-            fields: std::cell::RefCell::new(Vec::new()),
-        }));
-        t.borrow_mut().insert(name, fresh);
-        fresh
-    })
+/// The `StructTy` a descriptor stands for, built on first use.
+///
+/// The cache is process-wide rather than per-thread, so a `StructTy` can be
+/// read by any thread `spawn` starts — which is why it holds no `RefCell`.
+/// Two threads reaching an unbuilt descriptor at once both build one and one
+/// wins the exchange; the loser's is leaked, and nothing can tell, because
+/// every comparison of two struct values goes by type *name*, never by the
+/// address of the type.
+///
+/// # Safety: `desc` is a descriptor the backend emitted.
+unsafe fn desc_ty(desc: *const StructDesc) -> &'static StructTy {
+    use std::sync::atomic::Ordering;
+    let cached = (*desc).cache.load(Ordering::Acquire);
+    if cached != 0 {
+        return &*(cached as *const StructTy);
+    }
+    let n = (*desc).nfields as usize;
+    let pairs = (desc as *const u8).add(32) as *const u64;
+    let mut fields = Vec::with_capacity(n);
+    for i in 0..n {
+        let p = *pairs.add(i * 2) as *const u8;
+        let l = *pairs.add(i * 2 + 1);
+        fields.push(borrowed_str(p, l));
+    }
+    // Leaked on purpose: one per struct type, and it has to outlive every
+    // value that points at it.
+    let fresh: &'static StructTy = Box::leak(Box::new(StructTy {
+        name: borrowed_str((*desc).name_ptr, (*desc).name_len),
+        fields,
+    }));
+    let addr = fresh as *const StructTy as usize;
+    match (*desc).cache.compare_exchange(
+        0,
+        addr,
+        Ordering::Release,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => fresh,
+        Err(won) => &*(won as *const StructTy),
+    }
 }
 
 /// Where a string's bytes live.
@@ -2040,7 +2055,7 @@ unsafe fn display(v: *mut RtVal) -> String {
         }
         RtPayload::Struct { ty, fields } => {
             let name = ty.name;
-            let names = ty.fields.borrow();
+            let names = &ty.fields;
             let parts: Vec<String> = fields
                 .iter()
                 .enumerate()
@@ -2118,37 +2133,28 @@ unsafe fn borrowed_str(ptr: *const u8, len: u64) -> &'static str {
     }
 }
 
-/// # Safety: compiler-generated calls with interned name data.
+/// Build a struct value: one call, from the type's descriptor and the field
+/// values the caller stored into a stack slot.
+///
+/// This was three calls for a two-field value — make the box, then name and
+/// push each field — and each push validated a name as UTF-8, took a `RefCell`
+/// and compared lengths to decide whether the type still needed naming. None
+/// of that is work the program asked for: the names are the same every time
+/// and the compiler already knows them.
+///
+/// # Safety: `desc` is a descriptor the backend emitted; `argv` points at
+/// `desc.nfields` values whose ownership transfers into the struct.
 #[no_mangle]
-pub unsafe extern "C" fn grasm_struct_new(name: *const u8, len: u64) -> *mut RtVal {
+pub unsafe extern "C" fn grasm_struct_make(
+    desc: *const StructDesc,
+    argv: *const *mut RtVal,
+) -> *mut RtVal {
+    let ty = desc_ty(desc);
+    let n = (*desc).nfields as usize;
     alloc(RtPayload::Struct {
-        ty: struct_ty(borrowed_str(name, len)),
-        fields: StructFields::new(),
+        ty,
+        fields: StructFields::from_ptrs(argv, n),
     })
-
-}
-
-/// # Safety: as above; `val` ownership transfers into the struct.
-#[no_mangle]
-pub unsafe extern "C" fn grasm_struct_push_field(
-    s: *mut RtVal,
-    name: *const u8,
-    len: u64,
-    val: *mut RtVal,
-) {
-    let RtPayload::Struct { ty, fields } = &mut (*s).payload else {
-        grasm_panic_msg_str("push_field on non-struct");
-    };
-    // The first value of a type names its fields; every later one pushes the
-    // same names in the same order, so this appends only while that first
-    // value is being built.
-    {
-        let mut names = ty.fields.borrow_mut();
-        if names.len() == fields.len() {
-            names.push(borrowed_str(name, len));
-        }
-    }
-    fields.push(val);
 }
 
 /// A field by its position in the struct's declaration.
@@ -2194,7 +2200,7 @@ pub unsafe extern "C" fn grasm_struct_get(
     // `String` on *every field read* — three million of them for a loop that
     // reads one field three million times.
     let key = borrowed_str(name, len);
-    let idx = ty.fields.borrow().iter().position(|n| *n == key);
+    let idx = ty.fields.iter().position(|n| *n == key);
     if let Some(i) = idx {
         if let Some(v) = fields.get(i) {
             inc(*v);
@@ -2234,7 +2240,7 @@ pub unsafe extern "C" fn grasm_struct_take(
     // `String` on *every field read* — three million of them for a loop that
     // reads one field three million times.
     let key = borrowed_str(name, len);
-    let idx = ty.fields.borrow().iter().position(|n| *n == key);
+    let idx = ty.fields.iter().position(|n| *n == key);
     let hole = interned_bool(false);
     if let Some(i) = idx {
         if let Some(v) = fields.get_mut(i) {
@@ -2353,7 +2359,7 @@ pub unsafe extern "C" fn grasm_struct_set_field(
         unreachable!()
     };
     let key = borrowed_str(name, len);
-    let idx = ty.fields.borrow().iter().position(|n| *n == key);
+    let idx = ty.fields.iter().position(|n| *n == key);
     if let Some(i) = idx {
         if let Some(v) = fields.get_mut(i) {
             // A value returning to the field it was taken from carries no

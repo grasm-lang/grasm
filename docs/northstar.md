@@ -427,10 +427,44 @@ time — brought it to 98.4, and only removing the vector made it pay. Worth
 recording as a case where the enabling step had to be measured *and kept*
 despite being a regression on its own.
 
-What is left is the child list: Rust stores a node inline in its parent's
-vector where Grasm still allocates a list box and its storage. That needs the
-compiler to emit a type descriptor per struct rather than interning one at run
-time, which would also delete the lookup this commit had to cache around.
+**The type descriptor, done.** The next step named above: the compiler now
+emits one descriptor per struct type into the object file's data section — the
+type name, the field count, and a pointer and length per field name, with a
+cache word the runtime fills in the first time a value of that type is built.
+Building a value reads that word and is done. Nothing is interned at run time,
+so `STRUCT_TYPES`, the hash of the type name, and the one-entry cache the
+previous commit had to add in front of it are all gone.
+
+That also collapsed construction to a single call. A struct was three calls for
+two fields — make the box, then name and push each field — and every push
+validated a name as UTF-8, took a `RefCell` and compared lengths to work out
+whether the type still needed naming. The field values now go into a stack slot
+and one `grasm_struct_make` builds the whole value. `StructTy` holds no
+`RefCell` any more, which is also what makes it safe to share across the
+threads `spawn` starts; the descriptor cache is process-wide, and two threads
+racing to fill it both build one, one wins the exchange, and nothing can tell,
+because struct comparison goes by type *name* and never by the address of the
+type.
+
+`tree` **83.7 to 79.3 ms**, measured A/B interleaved, best of thirty each,
+against a binary built from the previous commit. The machine was not idle, so
+the ratio is what stands — 0.948 — rather than the absolute pair; the old
+binary's 83.7 matching the 83.0 recorded on an idle machine says the load was
+not distorting much.
+
+What is still left is the child list: Rust stores a node inline in its parent's
+vector where Grasm allocates a list box and its storage.
+
+**An S1 the fuzzer found on the way.** `fuzz_generics` reported 58 of 200
+programs disagreeing — present before this work, not caused by it. An `inout`
+argument naming a *place* (`bump(b.n)`) passed the field's **boxed** value where
+the callee expects a pointer to a slot holding its own type, so `n += 1`
+incremented the address of a box and wrote that back into the field. Reading the
+field then said `unbox: not an i64` on a program `grasm run` answered — a
+disagreement, not a refusal. Unboxed on the way in and boxed on the way back
+now, which is what a place holds. `spec/conformance/E-INOUT-PLACE-WRITEBACK.gr`
+covers it across a nested field, a list element, `str`, `f64` and `bool`,
+because the corpus had no program that passed a scalar field as `inout`.
 
 **The same defect in the interpreter, measured and reverted.** `Value::Struct`
 holds `name: Rc<String>` and `fields: Rc<Vec<(String, Value)>>`, so building one

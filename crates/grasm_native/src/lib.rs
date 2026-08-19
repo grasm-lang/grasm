@@ -380,6 +380,11 @@ struct Codegen<'m> {
     fns: HashMap<String, FnSig>,
     runtime: HashMap<&'static str, FuncId>,
     strings: HashMap<String, cranelift_module::DataId>,
+    /// One type descriptor per struct shape, keyed by the type name and the
+    /// field names it is built with. Keyed by both because a literal that does
+    /// not name every declared field has a different shape and would otherwise
+    /// read its names out of the wrong descriptor.
+    struct_descs: HashMap<String, cranelift_module::DataId>,
     /// struct name → ordered fields (name, type)
     structs: HashMap<String, Vec<(String, VType)>>,
     /// `type Name = str` — the aliased type expression, resolved on demand.
@@ -520,6 +525,7 @@ impl<'m> Codegen<'m> {
             fns: HashMap::new(),
             runtime: HashMap::new(),
             strings: HashMap::new(),
+            struct_descs: HashMap::new(),
             structs: HashMap::new(),
             aliases: HashMap::new(),
             sums: HashMap::new(),
@@ -611,8 +617,7 @@ impl<'m> Codegen<'m> {
             ("grasm_unbox_i64", vec![i64t], Some(i64t)),
             ("grasm_unbox_f64", vec![i64t], Some(f64t)),
             ("grasm_unbox_bool", vec![i64t], Some(i8t)),
-            ("grasm_struct_new", vec![ptr, i64t], Some(i64t)),
-            ("grasm_struct_push_field", vec![i64t, ptr, i64t, i64t], None),
+            ("grasm_struct_make", vec![ptr, ptr], Some(i64t)),
             ("grasm_struct_get", vec![i64t, ptr, i64t], Some(i64t)),
             ("grasm_struct_get_at", vec![i64t, i64t], Some(i64t)),
             ("grasm_struct_set_field", vec![i64t, ptr, i64t, i64t], Some(i64t)),
@@ -2280,6 +2285,58 @@ to one — a loop variable or a list element is this case",
                 what: format!("{INTERNAL}  {e}"),
             })?;
         Ok(())
+    }
+
+    /// The type descriptor for a struct shape: its name and its field names,
+    /// written into the object file's data section so that building a value
+    /// does not have to discover them.
+    ///
+    /// The layout is the one `StructDesc` in the runtime documents — a cache
+    /// word the runtime fills in on first use, the name, the field count, then
+    /// a pointer and a length per field. The pointers are relocations, so the
+    /// text itself is the same interned bytes every other mention of that name
+    /// uses.
+    fn struct_desc(
+        &mut self,
+        name: &str,
+        fields: &[String],
+    ) -> cranelift_module::DataId {
+        let key = format!("{name}\u{0}{}", fields.join("\u{0}"));
+        if let Some(id) = self.struct_descs.get(&key) {
+            return *id;
+        }
+        let name_id = self.intern_string(name);
+        let field_ids: Vec<cranelift_module::DataId> =
+            fields.iter().map(|f| self.intern_string(f)).collect();
+
+        let size = 32 + fields.len() * 16;
+        let mut bytes = vec![0u8; size];
+        // Little-endian: the backend targets the host, and every target it can
+        // reach is little-endian.
+        bytes[16..24].copy_from_slice(&(name.len() as u64).to_le_bytes());
+        bytes[24..32].copy_from_slice(&(fields.len() as u64).to_le_bytes());
+        for (i, f) in fields.iter().enumerate() {
+            let at = 32 + i * 16 + 8;
+            bytes[at..at + 8].copy_from_slice(&(f.len() as u64).to_le_bytes());
+        }
+
+        // Writable: the runtime stores the built `StructTy` into word 0.
+        let id = self
+            .module
+            .declare_anonymous_data(true, false)
+            .expect("data");
+        let mut d = DataDescription::new();
+        d.define(bytes.into_boxed_slice());
+        d.set_align(8);
+        let gv = self.module.declare_data_in_data(name_id, &mut d);
+        d.write_data_addr(8, gv, 0);
+        for (i, fid) in field_ids.iter().enumerate() {
+            let gv = self.module.declare_data_in_data(*fid, &mut d);
+            d.write_data_addr((32 + i * 16) as u32, gv, 0);
+        }
+        self.module.define_data(id, &d).expect("data define");
+        self.struct_descs.insert(key, id);
+        id
     }
 
     fn intern_string(&mut self, s: &str) -> cranelift_module::DataId {
@@ -8024,6 +8081,7 @@ checker did",
             Variable,
             VType,
             Vec<PlaceSeg<'_>>,
+            VType,
         )> = Vec::new();
         for (i, (a, want)) in args.iter().zip(&params).enumerate() {
             if modes.get(i).copied() == Some(ParamMode::Inout) {
@@ -8042,6 +8100,14 @@ checker did",
                     // straight back, and a copy would make every `inout`
                     // through a place O(n) in the thing it points at.
                     let held = self.read_place_boxed(cur, &path, &root_t, true)?;
+                    // A place holds a *boxed* value; an `inout` parameter is a
+                    // pointer to a slot holding what the callee's type is —
+                    // a raw integer for `inout n: i64`. Stored boxed, the
+                    // callee incremented the address of the box and wrote the
+                    // result back into the field, and reading the field then
+                    // said `unbox: not an i64`. `grasm run` printed the answer,
+                    // so this was a disagreement, not a refusal.
+                    let (raw, _) = self.unbox(held, want)?;
                     let slot = self.b.create_sized_stack_slot(
                         cranelift_codegen::ir::StackSlotData::new(
                             cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
@@ -8049,10 +8115,10 @@ checker did",
                             3,
                         ),
                     );
-                    self.b.ins().stack_store(held, slot, 0);
+                    self.b.ins().stack_store(raw, slot, 0);
                     let addr = self.b.ins().stack_addr(ptr_ty, slot, 0);
                     vals.push(addr);
-                    inout_places.push((slot, var, root_t, path));
+                    inout_places.push((slot, var, root_t, path, want.clone()));
                     continue;
                 }
                 let Expr::Ident(id) = a else {
@@ -8123,8 +8189,10 @@ checker did",
         }
         // An `inout` place is written back where it came from, the same way a
         // mutating method through a place is.
-        for (slot, var, root_t, path) in inout_places {
-            let updated = self.b.ins().stack_load(types::I64, slot, 0);
+        for (slot, var, root_t, path, want) in inout_places {
+            let updated = self.b.ins().stack_load(want.cl(), slot, 0);
+            // Boxed again on the way back, because that is what a place holds.
+            let updated = self.box_value(updated, &want);
             let cur = self.b.use_var(var);
             self.begin_write();
             let new_root = self.write_place(id.span, cur, &path, &root_t, updated)?;
@@ -8371,10 +8439,9 @@ checker did",
                 let (bv, _) = self.eval_expr_val(b)?;
                 bv
             }
-            None => {
-                let (np, nl) = self.str_ptr_len(&sname);
-                self.call_rt("grasm_struct_new", &[np, nl]).unwrap()
-            }
+            // No base: the value is built in one call once every field has
+            // been evaluated, so there is nothing to make yet.
+            None => self.b.ins().iconst(types::I64, 0),
         };
         let mut sv = sv;
         // Evaluated in written order ([E-ORDER-LTR]) and *stored* in declared
@@ -8409,10 +8476,28 @@ checker did",
             built.sort_by_key(|(n, _)| {
                 order.iter().position(|d| d == n).unwrap_or(usize::MAX)
             });
-            for (n, boxed) in built {
-                let (fp, fl) = self.str_ptr_len(&n);
-                self.call_rt("grasm_struct_push_field", &[sv, fp, fl, boxed]);
+            let names: Vec<String> =
+                built.iter().map(|(n, _)| n.clone()).collect();
+            // The field values go into a stack slot and the whole value is
+            // built by one call. A slot of nothing is not a slot, so an empty
+            // struct still gets a word; the callee reads none of it.
+            let ptr_ty = self.cg.module.target_config().pointer_type();
+            let words = built.len().max(1);
+            let slot = self.b.create_sized_stack_slot(
+                cranelift_codegen::ir::StackSlotData::new(
+                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                    (words * 8) as u32,
+                    3,
+                ),
+            );
+            for (i, (_, boxed)) in built.iter().enumerate() {
+                self.b.ins().stack_store(*boxed, slot, (i * 8) as i32);
             }
+            let argv = self.b.ins().stack_addr(ptr_ty, slot, 0);
+            let did = self.cg.struct_desc(&sname, &names);
+            let gv = self.cg.module.declare_data_in_func(did, self.b.func);
+            let dp = self.b.ins().global_value(ptr_ty, gv);
+            sv = self.call_rt("grasm_struct_make", &[dp, argv]).unwrap();
         }
         Ok((sv, VType::Struct(sname)))
     }
