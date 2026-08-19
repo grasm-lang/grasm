@@ -277,7 +277,24 @@ does, it is that a callee exists. Grasm is 3.3x C on this program with the
 guard and about 1.4x without it, which makes this the largest single
 performance item in the language for recursive code.
 
-Three ways out, and none is free:
+**And then the scale turned out to be an artifact of `fib`.** The same
+measurement on a realistic recursive workload — building a 3-ary tree nine deep
+and walking it, thirty times, which allocates and reads fields on every call —
+costs **1.9%** (316.8 ms with the guard, 310.9 ms without). Not 49%.
+
+`fib`'s body is one comparison and one addition, so a fixed per-call cost *is*
+the program. Nothing anybody writes looks like that. The guard is a per-call
+constant, and its share of a program is set by how little the program does per
+call — which makes `fib` the maximum, not the typical.
+
+That reordering matters more than the number did. On 49% a `SIGSEGV` handler
+looks worth the platform-specific unsafe code and the risk of misreporting a
+genuine null dereference as a stack overflow. On 1.9% it plainly is not, and
+the honest conclusion is that this is a microbenchmark artifact with a real but
+small tail — worth knowing, not worth trading a correctness guarantee for.
+
+Three ways out are recorded anyway, because the finding is still true and the
+next person to measure `fib` will find it again:
 
 * **Cranelift's own `ir::Function::stack_limit`** emits the comparison in the
   prologue with no call at all — and **traps**. A trap is `brk` on aarch64,
@@ -292,8 +309,16 @@ Three ways out, and none is free:
   recurses on its own stack, and Cranelift has no portable thread-local read.
 
 Recorded rather than rushed: the guard is a *correctness* guarantee, and
-trading it for 8.8 ms without a design is how a language gets a footnote
-saying deep recursion sometimes segfaults.
+trading it for 8.8 ms of a microbenchmark — 1.9% of anything real — is how a
+language gets a footnote saying deep recursion sometimes segfaults.
+
+Two cheaper things were tried and measured before the analysis above.
+Colocating the call changed nothing (22.9 to 22.6 ms), and making it take no
+argument at all — the callee's own frame standing in for the stack pointer, so
+no scratch slot and no argument setup — measured 23.0 ms and was reverted.
+Between them they establish that the cost is the *clobber*: an opaque call at
+entry makes the register allocator spill everything live across it, and nothing
+about the call's shape changes that.
 
 **Runtime calls are colocated now, which was measured and kept.** The runtime is
 a static archive linked into the same binary, but every call to it was declared
