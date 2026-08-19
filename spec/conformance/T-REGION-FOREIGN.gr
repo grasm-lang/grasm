@@ -1,6 +1,8 @@
 //! tag: T-REGION-FOREIGN
 //! expect: error
 //! cannot perform effect `Audit.record` inside a region
+//! cannot call `via_helper` inside a region — it performs `Audit`
+//! a function value cannot be used inside a region
 // Whose code runs inside the region, not just what the region's own text says.
 //
 // The handler is written outside and captures a reference. Calling the effect
@@ -13,6 +15,14 @@ effect Audit {
     fn record(e: str)
 }
 
+/// The same reach, one hop further away. Every one of these rules was written
+/// first against the syntax between the braces, and a one-line wrapper walked
+/// through it — so the rule is about what a call can *reach*, and a helper
+/// that performs the effect is refused exactly as the direct call is.
+fn via_helper(e: str) / {Audit} {
+    Audit.record(e)
+}
+
 fn main() {
     let sink = ref(Sink{ lines: [] })
     with Audit handled_by AuditHandler{ record: |e| sink.lines.push(e) } {
@@ -20,6 +30,20 @@ fn main() {
             let made = "inside"
             Audit.record(made)
         }
+        region {
+            via_helper("through a wrapper")
+        }
     }
+
+    // A closure carries its captures, so calling one written outside runs
+    // outside code with the region open — however indirectly it is reached.
+    // Taking it out of a container first is the spelling that walked past the
+    // rule when the rule named bindings instead of values.
+    let keepers: [fn(str) -> i64] = [|e| e.len()]
+    region {
+        let f = keepers[0]
+        let _n = f("carried")
+    }
+
     print("{sink.lines.len()}")
 }

@@ -392,6 +392,43 @@ available. A test asserts that: `run`, `send`, `open`, `close`, `read`, `write`,
 `start`, `stop`, `wait`, `execute` and twenty more must never appear in the
 builtin list.
 
+## The region rule, attacked and holding
+
+Not a finding — a confirmation, recorded because the claim it confirms is
+load-bearing. MASTERPLAN §8.3 calls Tier 1's escape rule "airtight as of this
+round" after four adversarial passes, and Tier 1 is the one tier that is only
+half in: the rule is enforced, the bulk-free arena it exists to make sound is
+not. If the rule leaks, the deferred half is unbuildable on it.
+
+Nineteen routes out of a region, every one refused **by the region rule**:
+assigning to an outer binding, pushing into an outer list, `return` through the
+brace, yielding a list, writing through a `ref` made outside, an `inout` call,
+a `ref` one field deep in a struct, an effect handled outside, a closure bound
+outside, `try` carrying an `Err` payload, an effect through a one-line helper,
+a closure taken from a list, from a struct field and from a map, a `ref` from a
+list and from an `Option`, a generic `inout`, a UFCS-spelled storing helper,
+and a qualified cross-module call — the last being the shape MASTERPLAN records
+as a real hole once, where the effect row was read under the calling module.
+
+### The first pass counted the wrong thing
+
+It reported all eighteen attempts refused. But it read the *exit code*, and a
+program that does not compile exits non-zero whatever the reason — several
+attempts had a two-statement closure body on one line, which is a syntax error
+in this language. Those were counted as the rule working.
+
+Re-run reading the error *message*, the tally was six by the region rule and
+one by "nothing says what `xs` is". Annotating the list literal turned that one
+into `a function value cannot be used inside a region`, which is the rule.
+
+This is the same defect as F25, F27 and F28, committed by the checker rather
+than found by it: a result that reports on something it cannot distinguish. It
+took twenty minutes to write the probe and an hour to make the probe honest.
+
+`T-REGION-FOREIGN` now covers the effect reached through a wrapper and the
+closure taken out of a container, which were the two indirections the earlier
+adversarial rounds found and no program pinned.
+
 ## F31 — two more clauses promised a panic no program triggered (S2, tests) — **fixed**
 
 After F29 and F30, both of which were "the first index past the end", the
