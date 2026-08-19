@@ -6,6 +6,36 @@ fn main() {
     let areas = all.map(|s| shapes.area(s))
     print("areas: {areas}")
     print("mean: {stats.mean(areas)}")
+
+    // A struct type from another module, named without a prefix.
+    let p = Point{ x: 1, y: 2 }
+    print("struct across modules: {p.x},{p.y} {shapes.moved(p, 10).x} {shapes.origin().x}")
+    print("constant across modules: {shapes.SIDES}")
+
+    // A generic instantiated here, from a function declared there.
+    let ps = [Point{ x: 4, y: 0 }, Point{ x: 9, y: 0 }]
+    print("generic across modules: {shapes.largest(ps, |q| q.x)}")
+
+    // `inout` writes through the caller's binding across the boundary.
+    var q = Point{ x: 1, y: 1 }
+    shapes.slide(q, 5)
+    print("inout across modules: {q.x}")
+
+    // A function value taken from another module, and imported structs in a
+    // container.
+    let f = shapes.area
+    var m: Map[str, Point] = map()
+    m.set("a", p)
+    let got = m.get("a") ?? p
+    print("fn value and container: {f(shapes.Circle(1.0)) > 3.0} {got.y}")
+
+    // A private function is reachable only through its module's public one.
+    print("private stays private: {shapes.via_private()}")
+
+    // An effect declared and performed there, handled here.
+    with Log handled_by LogHandler{ note: |msg| msg.len() } {
+        print("effect across modules: {shapes.described(42)}")
+    }
 }
 
 test "cross module" {

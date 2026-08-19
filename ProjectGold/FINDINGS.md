@@ -392,6 +392,39 @@ available. A test asserts that: `run`, `send`, `open`, `close`, `read`, `write`,
 `start`, `stop`, `wait`, `execute` and twenty more must never appear in the
 builtin list.
 
+## F28 — the conformance suite cannot test a multi-module program, and two module clauses pretended otherwise (S3, tests) — **fixed**
+
+Found probing modules for engine disagreements. There were none: ten shapes —
+a struct type declared in one module and constructed in another, a constant, a
+sum type matched across the boundary, a generic instantiated by the caller,
+`inout` writing through the boundary, a function value taken from another
+module, imported structs in a map, a private function reached only through its
+module's public one, and an effect declared and performed there but *handled*
+here — all agree across the interpreter, the bundle and the native build.
+
+The defect is in what was checking them. `spec/conformance/<TAG>.gr` is **one
+file**, and the harness compiles one file, so the suite structurally cannot
+express a program with two modules. Two clauses that are entirely about
+crossing that boundary had programs that did not:
+
+* `T-MODULE-NS` tests only the *error* — two types of the same name in one
+  file — and never that a type declared in one module is nameable, without a
+  prefix, from another. Which is the rule.
+* `T-MODULE-PUB` is a single-file program calling a private function *in the
+  same file*. `pub` does nothing there. The program passes whether or not
+  cross-module visibility works at all.
+
+**Fixed** where it can be: `examples/multi` is a real two-module program that
+`difftest.sh` already runs through all three engines, and it now exercises all
+ten shapes. The conformance programs stay as they are — they test what a single
+file can test — and the limitation is recorded here rather than left to look
+like coverage.
+
+The general shape is one this file keeps finding: a check that reports on
+something it cannot see. F25 was three checks that never ran; F27 was a timer
+measuring itself; this is a suite whose file format cannot hold the thing two of
+its clauses are about.
+
 ## F27 — the benchmark harness added 21 ms to every measurement it ever took (S2, benchmarks) — **fixed**
 
 Found while trying to explain why `sieve` was 37 ms in `bench.sh` and 16 ms

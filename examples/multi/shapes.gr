@@ -10,6 +10,51 @@ pub fn area(s: Shape) -> f64 {
     }
 }
 
+// A struct declared here and constructed in `app` — types are one namespace
+// across the program ([T-MODULE-NS]), so `app` names it without a prefix and
+// without this needing `pub`, which is an error on a type.
+type Point = { x: i64, y: i64 }
+
+// An effect declared here, performed here, and *handled* in `app`.
+effect Log {
+    fn note(msg: str) -> i64
+}
+
+pub let SIDES = 4
+
+pub fn origin() -> Point {
+    Point{ x: 0, y: 0 }
+}
+
+pub fn moved(p: Point, dx: i64) -> Point {
+    Point{ x: p.x + dx, y: p.y }
+}
+
+/// `inout` across a module boundary: the caller's binding is written through.
+pub fn slide(inout p: Point, by: i64) {
+    p.x = p.x + by
+}
+
+/// A generic instantiated by the caller, in another module.
+pub fn largest[T](xs: [T], key: fn(T) -> i64) -> i64 {
+    var best = 0
+    for x in xs {
+        let k = key(x)
+        if k > best { best = k }
+    }
+    best
+}
+
+pub fn described(n: i64) -> i64 / {Log} {
+    Log.note("saw {n}")
+}
+
 fn private_helper() -> i64 {
     42
+}
+
+/// The only way to reach `private_helper` from outside: `pub` is about
+/// functions, and a private one stays private ([T-MODULE-PUB]).
+pub fn via_private() -> i64 {
+    private_helper()
 }
