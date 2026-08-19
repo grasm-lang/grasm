@@ -1,11 +1,13 @@
 //! tag: L-LIB-CODES
-//! expect: output
+//! expect: panic
 //! 104 233
 //! [104, 233, 108, 108, 111]
 //! hé
 //! héllo
 //! 615042
 //! non-bytes: 1 [8364]
+//! last code point: 111
+//! code_at 5 out of bounds (len 5)
 fn main() {
     // Code points, counted in characters — `é` is one character, two bytes.
     print("{"héllo".code_at(0)} {"héllo".code_at(1)}")
@@ -22,6 +24,15 @@ fn main() {
     print("{hash("grasm")}")
     // Characters outside ASCII are one code point, not their byte count.
     print("non-bytes: {"€".len()} {"€".codes()}")
+
+    // The clause says `code_at` panics out of range, and the index worth
+    // testing is the first one that is: exactly `len`. Nothing here tested it,
+    // and changing the check from `i >= n` to `i > n` left every gate green
+    // while the compiled build read past the end of the string and died with
+    // SIGABRT where `grasm run` panicked. Reading one character too far is the
+    // only mistake a bounds check can make.
+    print("last code point: {"héllo".code_at("héllo".len() - 1)}")
+    print("{"héllo".code_at("héllo".len())}")
 }
 
 /// A string hash, which cannot be written without code points at all.

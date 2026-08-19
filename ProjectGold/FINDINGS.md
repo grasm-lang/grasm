@@ -392,6 +392,35 @@ available. A test asserts that: `run`, `send`, `open`, `close`, `read`, `write`,
 `start`, `stop`, `wait`, `execute` and twenty more must never appear in the
 builtin list.
 
+## F30 — `code_at` panics out of range, and nothing tested that (S2, tests) — **fixed**
+
+Found by the second round of mutation testing. `[L-LIB-CODES]` says
+`s.code_at(i)` "panics out of range"; the conformance program for it checked
+code points, the round trip through `to_char`, a hash built from them, and
+non-ASCII counting — and never once indexed out of range.
+
+Changing the check from `i >= n` to `i > n` left every gate green while
+`s.code_at(s.len())` read one character past the end: `grasm run` panicked with
+exit 101 and the compiled build died with **SIGABRT, exit 134**. The program now
+reads the last valid code point and then exactly `len`.
+
+### What the round taught about the method
+
+Two of the four mutations in the first batch "survived" and neither was a hole.
+`char_at` accepting one past the end is invisible because `grasm_str_code_at`
+bounds-checks before calling it; the boxed list index check in F29 is invisible
+because the backend emits its own inline check first. This runtime has defence
+in depth, so **mutating an inner check proves nothing** — the outer one already
+decided.
+
+The rule that came out of it: mutate the *outermost* decision on a path. Every
+survivor since has been checked against that before being believed, which is
+what turned "no gate noticed" from a claim into a finding.
+
+The map-ordering mutation was caught by `difftest.sh` immediately, which is the
+other half of the result: the gates are not blind in general, they were blind at
+two boundaries.
+
 ## F29 — the bounds test never tested the boundary (S2, tests) — **fixed**
 
 Found by mutation testing: break the compiler on purpose, then ask which gate
