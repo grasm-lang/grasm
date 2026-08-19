@@ -3,6 +3,9 @@
 //! 8
 //! 12
 //! 10 15
+//! held in a struct, a map and a tuple: 8 12 15
+//! returned from a function, and one built from another: 7 2
+//! captured by value, so a later write is not seen: 1
 //! -3 -1
 fn double(n: i64) -> i64 {
     n * 2
@@ -10,6 +13,16 @@ fn double(n: i64) -> i64 {
 
 fn triple(n: i64) -> i64 {
     n * 3
+}
+
+type Holder = { f: fn(i64) -> i64 }
+
+fn adder(k: i64) -> fn(i64) -> i64 {
+    |x| x + k
+}
+
+fn compose(f: fn(i64) -> i64) -> fn(i64) -> i64 {
+    |x| f(f(x))
 }
 
 fn main() {
@@ -28,6 +41,30 @@ fn main() {
         out = out + "{stage(5)} "
     }
     print(out.trim())
+
+    // One representation means a function value goes anywhere a value goes,
+    // not only into a list.
+    let boxed = Holder{ f: double }
+    var table: Map[str, fn(i64) -> i64] = map()
+    table.set("t", triple)
+    let pair = (triple, 0)
+    let from_map = table.get("t") ?? double
+    let from_pair = pair.0
+    print("held in a struct, a map and a tuple: {boxed.f(4)} {from_map(4)} {from_pair(5)}")
+
+    // A closure made by a function outlives the call that made it, and one
+    // closure may capture another.
+    let plus3 = adder(3)
+    let twice_plus1 = compose(adder(1))
+    print("returned from a function, and one built from another: {plus3(4)} {twice_plus1(0)}")
+
+    // Capture is by value and at the moment of creation, so a later write to
+    // the binding is not seen — the rule [E-CLOSURE-CAPTURE] states for a
+    // handler's operations, holding for an ordinary closure too.
+    var seen = 1
+    let snapshot = |x| x + seen
+    seen = 100
+    print("captured by value, so a later write is not seen: {snapshot(0)}")
 
     // Negative literals are written directly — no need for `0 - n`.
     let below = -3
