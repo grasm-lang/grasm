@@ -419,9 +419,23 @@ invisible to it entirely. [E-PANIC-TRACE] says the panic line is identical in
 all three engines, and the only gate that verifies that is `agreetest.sh` — on
 sixteen programs.
 
-Recorded rather than fixed: widening `difftest.sh` to compare stderr would make
-218 programs assert their stack traces, which is a different and much larger
-promise than the one the clause makes.
+### Fixed after all, in the gate built for it
+
+Widening `difftest.sh` to compare stderr would make 218 programs assert their
+own stack traces — a much larger promise than the clause makes. But
+`agreetest.sh` already captures stderr from all three modes, strips the trace
+block, and compares everything else including the panic line. It is the gate
+for this, and it was checking six panic shapes when the language has fourteen.
+
+Eleven more programs: indexing at exactly `len`, `code_at`, `bytes.at`,
+`bytes.slice`, `remove`, `to_char` on a non-code-point, `to_base` and
+`parse_int_base` on a bad base, a negative exponent, a failed `assert_eq`, and
+a stale `ref`. Sixteen programs became twenty-seven, and all agree.
+
+The `remove` mutant is the proof: it slipped past every gate when this finding
+was written, and now fails `panic_remove` — `bundle (101): panic: remove 2 out
+of bounds (len 2)` against the interpreter's `remove 1`. A redundant check
+whose only observable effect is what the panic says is now observable.
 
 ## Mutation testing — the whole tally
 

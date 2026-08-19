@@ -271,6 +271,70 @@ fn main() {
     print("{down(0)}")
 }'
 
+# Every other panic the library can raise, one program each.
+#
+# ProjectGold F31: `difftest.sh` compares stdout and the exit code, and a panic
+# goes to stderr, so *this* is the only gate that checks a compiled build says
+# the same words as the interpreter. It was doing that for six panic shapes and
+# the language has fourteen. `remove` is here because F31 found its message
+# unverified in exactly this way — its bounds check is redundant with
+# `grasm_list_get`'s, so getting it wrong changes only what the panic says.
+
+check panic_index_boundary 'fn main() {
+    let xs = [1, 2]
+    print("{xs[xs.len()]}")
+}'
+
+check panic_code_at 'fn main() {
+    let s = "abc"
+    print("{s.code_at(s.len())}")
+}'
+
+check panic_bytes_at 'fn main() {
+    let b = bytes_of([1, 2, 3])
+    print("{b.at(b.len())}")
+}'
+
+check panic_bytes_slice 'fn main() {
+    let b = bytes_of([1, 2, 3])
+    print("{b.slice(1, 9)}")
+}'
+
+check panic_remove 'fn main() {
+    var xs = [1, 2]
+    let gone = xs.remove(xs.len())
+    print("{gone}")
+}'
+
+check panic_to_char 'fn main() {
+    print("{1114112.to_char()}")
+}'
+
+check panic_to_base 'fn main() {
+    print("{255.to_base(1)}")
+}'
+
+check panic_parse_base 'fn main() {
+    print("{"ff".parse_int_base(99) ?? 0}")
+}'
+
+check panic_pow_negative 'fn main() {
+    var e = 0 - 1
+    print("{2 ^ e}")
+}'
+
+check panic_assert 'fn main() {
+    assert_eq(2 + 2, 5)
+}'
+
+check panic_stale_ref 'type Cell = { n: i64 }
+
+fn main() {
+    let r = ref(Cell{ n: 1 })
+    release(r)
+    print("{r.n}")
+}'
+
 check exit_code 'fn main() {
     print("before")
     exit(3)
