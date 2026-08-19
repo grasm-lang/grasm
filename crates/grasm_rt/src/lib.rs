@@ -878,6 +878,126 @@ impl std::fmt::Display for RtStr {
     }
 }
 
+/// The elements of a list or a tuple, held **in the box** when there are four
+/// or fewer.
+///
+/// A list was a `Vec`, so building `[a, b, c]` cost the box the value needs
+/// anyway plus a second allocation for three pointers. Small lists are most
+/// lists: the children of a tree node, the parts of a split, a pair returned
+/// from a function, every tuple a pattern takes apart.
+///
+/// Four for the same reason `StructFields` uses four — it is the largest run
+/// that leaves `RtVal` at 64 bytes, which the assertion below holds the file
+/// to. Beyond four the elements move to the heap once and stay there.
+pub enum ListData {
+    Inline { vals: [*mut RtVal; 4], len: u8 },
+    Heap(Vec<*mut RtVal>),
+}
+
+impl std::ops::Deref for ListData {
+    type Target = [*mut RtVal];
+    fn deref(&self) -> &[*mut RtVal] {
+        match self {
+            ListData::Inline { vals, len } => &vals[..*len as usize],
+            ListData::Heap(v) => v,
+        }
+    }
+}
+
+impl std::ops::DerefMut for ListData {
+    fn deref_mut(&mut self) -> &mut [*mut RtVal] {
+        match self {
+            ListData::Inline { vals, len } => &mut vals[..*len as usize],
+            ListData::Heap(v) => v,
+        }
+    }
+}
+
+impl Default for ListData {
+    fn default() -> ListData {
+        ListData::new()
+    }
+}
+
+impl<'a> IntoIterator for &'a ListData {
+    type Item = &'a *mut RtVal;
+    type IntoIter = std::slice::Iter<'a, *mut RtVal>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl From<Vec<*mut RtVal>> for ListData {
+    /// Kept on the heap as it arrives. A `Vec` that already exists has already
+    /// paid for its allocation, and copying it into the box to save an
+    /// allocation that happened would be work for nothing.
+    fn from(v: Vec<*mut RtVal>) -> ListData {
+        ListData::Heap(v)
+    }
+}
+
+impl ListData {
+    fn new() -> ListData {
+        ListData::Inline {
+            vals: [std::ptr::null_mut(); 4],
+            len: 0,
+        }
+    }
+
+    /// Spills to the heap on the fifth element, once.
+    fn push(&mut self, v: *mut RtVal) {
+        match self {
+            ListData::Inline { vals, len } if (*len as usize) < 4 => {
+                vals[*len as usize] = v;
+                *len += 1;
+            }
+            ListData::Inline { vals, len } => {
+                let mut heap: Vec<*mut RtVal> = Vec::with_capacity(8);
+                heap.extend_from_slice(&vals[..*len as usize]);
+                heap.push(v);
+                *self = ListData::Heap(heap);
+            }
+            ListData::Heap(h) => h.push(v),
+        }
+    }
+
+    /// Two elements, in the box. Every tuple this runtime builds internally
+    /// is a pair, and `vec![a, b]` allocated for it.
+    fn pair(a: *mut RtVal, b: *mut RtVal) -> ListData {
+        ListData::Inline {
+            vals: [a, b, std::ptr::null_mut(), std::ptr::null_mut()],
+            len: 2,
+        }
+    }
+
+    fn pop(&mut self) -> Option<*mut RtVal> {
+        match self {
+            ListData::Inline { vals, len } => {
+                if *len == 0 {
+                    return None;
+                }
+                *len -= 1;
+                Some(vals[*len as usize])
+            }
+            ListData::Heap(h) => h.pop(),
+        }
+    }
+
+    fn remove(&mut self, i: usize) -> *mut RtVal {
+        match self {
+            ListData::Inline { vals, len } => {
+                let n = *len as usize;
+                assert!(i < n, "index out of range");
+                let out = vals[i];
+                vals.copy_within(i + 1..n, i);
+                *len -= 1;
+                out
+            }
+            ListData::Heap(h) => h.remove(i),
+        }
+    }
+}
+
 pub enum RtPayload {
     I64(i64),
     /// The unit value. No payload, but it renders as `()` and a container can
@@ -896,14 +1016,14 @@ pub enum RtPayload {
     /// boxed integers: the promise the type makes is that every element is a
     /// byte, and the representation should carry that promise.
     Bytes(std::rc::Rc<Vec<u8>>),
-    List(Vec<*mut RtVal>),
+    List(ListData),
     /// Same shape as a list, rendered with parentheses.
     ///
     /// Tuples are built as lists and sealed, because every operation on them
     /// — refcounting, equality, reading an element out in a pattern — is a
     /// list operation. Only `display` differs, and it differs in a way a
     /// program's output is judged on, so it cannot be left to look the same.
-    Tuple(Vec<*mut RtVal>),
+    Tuple(ListData),
     /// Scalar elements stored inline — no per-element heap cell, no refcount
     /// traffic, no pointer chase. This is why `c[i] = c[i] + x` in a hot loop
     /// is a load and a store instead of an allocation.
@@ -948,6 +1068,15 @@ pub struct RtVal {
     pub rc: Cell<i64>,
     pub payload: RtPayload,
 }
+
+/// Sixty-four bytes, and every inline-storage decision in this file is sized
+/// against that: fifteen bytes of text in `StrData`, four fields in
+/// `StructFields`. Those numbers were chosen by measuring the size of this
+/// struct and stopping where it stopped growing, and until now that reasoning
+/// lived only in prose — a fifth inline field or a sixteenth inline byte would
+/// have widened every boxed integer in the program and nothing would have said
+/// so. Now the build says so.
+const _: () = assert!(std::mem::size_of::<RtVal>() == 64);
 
 fn alloc(payload: RtPayload) -> *mut RtVal {
     LIVE.with(|n| n.set(n.get() + 1));
@@ -1718,7 +1847,7 @@ fn scalar_display(kind: ScalarKind, bits: i64) -> String {
 
 /// A list's elements, whichever representation it has.
 enum Items<'a> {
-    Boxed(&'a Vec<*mut RtVal>),
+    Boxed(&'a [*mut RtVal]),
     Scalar(ScalarKind, &'a ScalarData),
 }
 
@@ -1726,7 +1855,7 @@ enum Items<'a> {
 unsafe fn items_of<'a>(v: *mut RtVal) -> Items<'a> {
     match &(*v).payload {
         RtPayload::List(items) => {
-            Items::Boxed(std::mem::transmute::<&Vec<*mut RtVal>, &'a Vec<*mut RtVal>>(items))
+            Items::Boxed(std::mem::transmute::<&[*mut RtVal], &'a [*mut RtVal]>(items))
         }
         RtPayload::ListScalar { kind, data } => {
             Items::Scalar(*kind, std::mem::transmute::<&ScalarData, &'a ScalarData>(data))
@@ -1864,7 +1993,7 @@ pub unsafe extern "C" fn grasm_fn_env(v: *mut RtVal) -> *mut RtVal {
 
 #[no_mangle]
 pub extern "C" fn grasm_list_new() -> *mut RtVal {
-    alloc(RtPayload::List(Vec::new()))
+    alloc(RtPayload::List(ListData::new()))
 }
 
 /// Push honoring copy-on-write: returns the (possibly new) list pointer.
@@ -1897,7 +2026,7 @@ unsafe fn cow_list(list: *mut RtVal) -> *mut RtVal {
                     it
                 })
                 .collect();
-            alloc(RtPayload::List(cloned))
+            alloc(RtPayload::List(cloned.into()))
         }
         // A scalar list clones as one memcpy: no per-element refcounts exist.
         RtPayload::ListScalar { kind, data } => alloc(RtPayload::ListScalar {
@@ -2863,7 +2992,7 @@ pub unsafe extern "C" fn grasm_map_keys(m: *mut RtVal) -> *mut RtVal {
     };
     // Iteration is where the ordering guarantee is paid for.
     let items: Vec<*mut RtVal> = sorted_keys(entries).iter().map(MapKey::boxed).collect();
-    alloc(RtPayload::List(items))
+    alloc(RtPayload::List(items.into()))
 }
 
 /// Panics with a message that is a runtime string rather than a literal.
@@ -2903,10 +3032,10 @@ pub unsafe extern "C" fn grasm_map_entries(m: *mut RtVal) -> *mut RtVal {
         .map(|k| {
             let v = entries[k];
             inc(v);
-            alloc(RtPayload::Tuple(vec![k.boxed(), v]))
+            alloc(RtPayload::Tuple(ListData::pair(k.boxed(), v)))
         })
         .collect();
-    alloc(RtPayload::List(items))
+    alloc(RtPayload::List(items.into()))
 }
 
 /// # Safety: live pointer; returns a fresh list (+1).
@@ -2923,7 +3052,7 @@ pub unsafe extern "C" fn grasm_map_values(m: *mut RtVal) -> *mut RtVal {
             v
         })
         .collect();
-    alloc(RtPayload::List(items))
+    alloc(RtPayload::List(items.into()))
 }
 
 // --- N4: full builtin method surface (str / list / numeric) ---
@@ -2965,7 +3094,7 @@ pub unsafe extern "C" fn grasm_str_split(s: *mut RtVal, sep: *mut RtVal) -> *mut
             .map(|p| alloc(RtPayload::Str(RtStr::of(p))))
             .collect()
     };
-    alloc(RtPayload::List(parts))
+    alloc(RtPayload::List(parts.into()))
 }
 
 /// # Safety: live pointer.
@@ -3173,7 +3302,7 @@ pub unsafe extern "C" fn grasm_ref_make_unique(r: i64) -> *mut RtVal {
                     it
                 })
                 .collect();
-            alloc(RtPayload::List(cloned))
+            alloc(RtPayload::List(cloned.into()))
         }
         RtPayload::ListScalar { kind, data } => alloc(RtPayload::ListScalar {
             kind: *kind,
@@ -3397,7 +3526,7 @@ pub unsafe extern "C" fn grasm_str_words(s: *mut RtVal) -> *mut RtVal {
         .split_whitespace()
         .map(|w| alloc(RtPayload::Str(RtStr::of(w))))
         .collect();
-    alloc(RtPayload::List(items))
+    alloc(RtPayload::List(items.into()))
 }
 
 /// Every code point, in order.
@@ -3430,7 +3559,7 @@ pub unsafe extern "C" fn grasm_str_chars(s: *mut RtVal) -> *mut RtVal {
         .chars()
         .map(|c| alloc(RtPayload::Str(RtStr::of(c.encode_utf8(&mut [0u8; 4])))))
         .collect();
-    alloc(RtPayload::List(items))
+    alloc(RtPayload::List(items.into()))
 }
 
 /// # Safety: live pointer.
@@ -3637,7 +3766,7 @@ pub unsafe extern "C" fn grasm_list_rev(v: *mut RtVal) -> *mut RtVal {
                 })
                 .collect();
             out.reverse();
-            alloc(RtPayload::List(out))
+            alloc(RtPayload::List(out.into()))
         }
         Items::Scalar(kind, data) => alloc(RtPayload::ListScalar {
             kind,
@@ -3751,9 +3880,9 @@ pub unsafe extern "C" fn grasm_list_remove(v: *mut RtVal, i: i64, out: *mut *mut
 pub unsafe extern "C" fn grasm_list_enumerate(v: *mut RtVal) -> *mut RtVal {
     let n = grasm_list_len(v);
     let items: Vec<*mut RtVal> = (0..n)
-        .map(|i| alloc(RtPayload::Tuple(vec![grasm_box_i64(i), grasm_list_get(v, i)])))
+        .map(|i| alloc(RtPayload::Tuple(ListData::pair(grasm_box_i64(i), grasm_list_get(v, i)))))
         .collect();
-    alloc(RtPayload::List(items))
+    alloc(RtPayload::List(items.into()))
 }
 
 /// `[(a, b)]` up to the shorter of the two — pairing past the end of one
@@ -3764,9 +3893,9 @@ pub unsafe extern "C" fn grasm_list_enumerate(v: *mut RtVal) -> *mut RtVal {
 pub unsafe extern "C" fn grasm_list_zip(a: *mut RtVal, b: *mut RtVal) -> *mut RtVal {
     let n = grasm_list_len(a).min(grasm_list_len(b));
     let items: Vec<*mut RtVal> = (0..n)
-        .map(|i| alloc(RtPayload::Tuple(vec![grasm_list_get(a, i), grasm_list_get(b, i)])))
+        .map(|i| alloc(RtPayload::Tuple(ListData::pair(grasm_list_get(a, i), grasm_list_get(b, i)))))
         .collect();
-    alloc(RtPayload::List(items))
+    alloc(RtPayload::List(items.into()))
 }
 
 /// Sorts `v` by a parallel list of keys, one per element, computed by the
@@ -3793,7 +3922,7 @@ pub unsafe extern "C" fn grasm_list_sort_by(v: *mut RtVal, keys: *mut RtVal) -> 
     let target = cow_list(v);
     match &mut (*target).payload {
         RtPayload::List(items) => {
-            let src = items.clone();
+            let src = items.to_vec();
             for (dst, &from) in order.iter().enumerate() {
                 items[dst] = src[from];
             }
@@ -3829,7 +3958,7 @@ pub unsafe extern "C" fn grasm_list_slice(v: *mut RtVal, a: i64, b: i64) -> *mut
             } else {
                 Vec::new()
             };
-            alloc(RtPayload::List(out))
+            alloc(RtPayload::List(out.into()))
         }
         Items::Scalar(kind, data) => {
             let len = data.len() as i64;
@@ -3877,7 +4006,7 @@ pub unsafe extern "C" fn grasm_list_concat(a: *mut RtVal, b: *mut RtVal) -> *mut
                     }
                 }
             }
-            alloc(RtPayload::List(out))
+            alloc(RtPayload::List(out.into()))
         }
     }
 }
@@ -4270,7 +4399,7 @@ pub extern "C" fn grasm_args() -> *mut RtVal {
             .map(|s| alloc(RtPayload::Str(RtStr::of(s))))
             .collect()
     });
-    alloc(RtPayload::List(items))
+    alloc(RtPayload::List(items.into()))
 }
 
 #[no_mangle]
@@ -4795,7 +4924,7 @@ pub unsafe extern "C" fn grasm_proc_pipeline(
         alloc(RtPayload::Str(RtStr::of(&String::from_utf8_lossy(&out.stdout)))),
         alloc(RtPayload::Str(RtStr::of(&String::from_utf8_lossy(&out.stderr)))),
     ];
-    ok_of(alloc(RtPayload::Tuple(fields)))
+    ok_of(alloc(RtPayload::Tuple(fields.into())))
 }
 
 // --- the C boundary --------------------------------------------------------
@@ -4887,7 +5016,7 @@ pub unsafe extern "C" fn grasm_proc_run(cmd: *mut RtVal, args: *mut RtVal) -> *m
                     &out.stderr,
                 )))),
             ];
-            ok_of(alloc(RtPayload::Tuple(fields)))
+            ok_of(alloc(RtPayload::Tuple(fields.into())))
         }
         Err(e) => err_of(io_err("IoFailed", format!("{program}: {e}"))),
     }
@@ -5135,7 +5264,7 @@ pub unsafe extern "C" fn grasm_bytes_to_list(v: *mut RtVal) -> *mut RtVal {
         .iter()
         .map(|x| alloc(RtPayload::I64(*x as i64)))
         .collect();
-    alloc(RtPayload::List(items))
+    alloc(RtPayload::List(items.into()))
 }
 
 /// Lossy, as `tcp_read` is: a buffer carries bytes, a `str` carries text.
@@ -5219,7 +5348,7 @@ pub unsafe extern "C" fn grasm_list_dir(path: *mut RtVal) -> *mut RtVal {
                 .into_iter()
                 .map(|n| alloc(RtPayload::Str(RtStr::new(n))))
                 .collect();
-            ok_of(alloc(RtPayload::List(items)))
+            ok_of(alloc(RtPayload::List(items.into())))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => err_of(io_err("NotFound", p)),
         Err(e) => err_of(io_err("IoFailed", e.to_string())),
@@ -5293,7 +5422,7 @@ pub unsafe extern "C" fn grasm_str_lines(s: *mut RtVal) -> *mut RtVal {
         .lines()
         .map(|l| alloc(RtPayload::Str(RtStr::new(l.to_string()))))
         .collect();
-    alloc(RtPayload::List(items))
+    alloc(RtPayload::List(items.into()))
 }
 
 /// # Safety: live runtime pointers.
