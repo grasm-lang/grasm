@@ -19,7 +19,7 @@ the scorecard takes the best of five runs and subtracts the process floor.
 | # | Goal | Target | Measured | |
 |---|---|---|---|---|
 | G1 | Time for a Go/TS dev to ship a real service | ≤ 1 week | — | **unmeasurable without users** |
-| G2 | Geomean vs Rust | ≥ 0.95× | **0.40×** — 0 of 7 programs at or above; geomean 2.49× behind, 2.92× with the harness floor subtracted | **missed, and by more than this row used to say** |
+| G2 | Geomean vs Rust | ≥ 0.95× | **0.41×** — 0 of 7 programs at or above; geomean 2.42× behind, 2.84× with the harness floor subtracted | **missed** — moved by `tree` alone, 7.5× behind Rust where the rest of the table is about 2× |
 | G3 | Frontend throughput | ≥ 500k LOC/s | **535–547k** across consecutive runs on one machine | **met** |
 | G3 | Incremental edit-to-diagnostic | ≤ 50 ms | — | **not built** — there is no query engine |
 | G4 | Safe-subset guarantees | 100% | 218 programs identical across three engines, 218 leak-free, 27 agreeing on panic messages, 31 whole programs, nine fuzzers clean | **strongest area** |
@@ -159,9 +159,10 @@ with a known shape, not an open question — and it is the only thing between he
 and the goal.
 
 **G2's one real gap is the value representation, and it is not a missing
-optimisation.** `wordfreq` is 2.5× behind Rust; every other program is within
-1.2× of the fastest. Three candidate causes were checked and none of them was
-it: the map is already a `HashMap` with sorting deferred to iteration, so
+optimisation.** As of the table above, six of the seven rows sit between 1.7×
+and 2.2× behind Rust and `tree` sits at 7.5×, so the geomean is one row's
+problem rather than a spread. Three candidate causes were checked on `wordfreq`
+and none of them was it: the map is already a `HashMap` with sorting deferred to iteration, so
 [E-MAP-ORDER] costs nothing on insert; rewriting the program's string
 construction to one interpolation instead of a concatenation changed the time by
 nothing; and replacing the `RefCell` borrow that every allocation makes with a
@@ -452,8 +453,34 @@ the ratio is what stands — 0.948 — rather than the absolute pair; the old
 binary's 83.7 matching the 83.0 recorded on an idle machine says the load was
 not distorting much.
 
-What is still left is the child list: Rust stores a node inline in its parent's
-vector where Grasm allocates a list box and its storage.
+**The child list, half of it.** A list was a `Vec`, so `[a, b, c]` cost the box
+the value needs anyway *plus* a second allocation for three pointers. Four or
+fewer elements now live in the box itself — the same bound as `StructFields`,
+for the same reason. `tree`'s nodes have three children, so every interior
+node's child list now fits: **77.0 to 73.8 ms**, A/B interleaved, best of
+thirty each, about 197k allocations gone from the run.
+
+`ListData` derefs to a slice, so every read the runtime already did — index,
+iterate, sort, first, last — is unchanged and untouched. Only push, pop and
+remove needed writing. A `Vec` that already exists is kept as it is: it has
+paid for its allocation, and copying it into the box to save an allocation that
+already happened would be work for nothing.
+
+What is still left is the *box*: Rust stores a node inline in its parent's
+vector, so a child costs no separate cell at all, where Grasm still allocates
+one boxed value per node. Closing that needs unboxed struct storage in lists —
+what `ListScalar` does for integers, done for a struct type — which is a
+larger change than either of the two above.
+
+**The layout argument is now checked.**
+
+    const _: () = assert!(std::mem::size_of::<RtVal>() == 64);
+
+Fifteen inline bytes of text, four inline struct fields, four inline list
+elements: each of those numbers was chosen by measuring this struct and
+stopping where it stopped growing, and that reasoning lived only in prose. A
+fifth inline field would have widened every boxed integer in the program and
+nothing would have said so.
 
 **An S1 the fuzzer found on the way.** `fuzz_generics` reported 58 of 200
 programs disagreeing — present before this work, not caused by it. An `inout`

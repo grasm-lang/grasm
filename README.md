@@ -127,13 +127,13 @@ concurrency primitive each one reaches for.
 
 | program  |   C |  Rust |  Go | Nim | Zig | grasm-native | Python |
 |----------|----:|------:|----:|----:|----:|-------------:|-------:|
-| fib      |   5 |     5 |   6 |   6 |   5 |           10 |    128 |
-| sieve    |   7 |     7 |   7 |   9 |   7 |           15 |    360 |
-| matmul   |   5 |     5 |   8 |   9 |   6 |           10 |    889 |
-| wordfreq |  30 |    26 |  17 |  22 |   9 |           53 |    130 |
-| tree     |  20 |    10 |  21 |   — |   — |           97 |    329 |
-| sort     |  36 |    11 |  48 |   — |   — |       **19** |    206 |
-| parmap   |  48 |    47 |  86 |   — |   — |          104 |  3,455 |
+| fib      |   5 |     5 |   6 |   5 |   5 |           10 |    128 |
+| sieve    |   7 |     7 |   8 |   9 |   7 |           15 |    349 |
+| matmul   |   5 |     5 |   8 |   9 |   6 |           10 |    886 |
+| wordfreq |  31 |    26 |  17 |  22 |   9 |           53 |    131 |
+| tree     |  20 |    10 |  20 |   — |   — |           75 |    328 |
+| sort     |  37 |    11 |  49 |   — |   — |       **19** |    205 |
+| parmap   |  51 |    49 |  86 |   — |   — |          105 |  3,461 |
 
 Best of 5. **The harness floor is 2 ms** — what timing `/usr/bin/true` costs,
 which is fork, exec and wait rather than anything a program did. The top three
@@ -141,10 +141,11 @@ rows are mostly floor: C's 5 ms `fib` is about 3 ms of work and Grasm's 10 ms
 about 8, which is nearer 2.7x than the 2x the raw numbers show. Subtract 2 from
 every cell before taking a ratio on a short row.
 
-This run reproduces the previous one within 2 ms on every cell except `sieve`,
-which went 17 to 15 for a reason — runtime calls are PC-relative now instead of
-going through the PLT. A benchmark that only ever agrees with itself is not
-measuring anything; one that agrees except where the code changed is.
+This run reproduces the previous one within 3 ms on every cell except `tree`,
+which went 97 to 75 for a reason — a struct's fields and a small list's
+elements now live in the box the value already needed, so a node costs one
+allocation where it cost four. A benchmark that only ever agrees with itself is
+not measuring anything; one that agrees except where the code changed is.
 
 Reproducibility alone still proves nothing, which this file learned the hard
 way: the table before these was also reproduced, and was wrong by a constant
@@ -172,17 +173,23 @@ instructions with no calls.
 
 **The two weak rows are the two that allocate.** `wordfreq` builds a string per
 iteration and boxes every value; `tree` builds a small struct per node, and at
-97 ms against C's 20 and Rust's 10 it is the worst ratio here — and the one
+75 ms against C's 20 and Rust's 10 it is the worst ratio here — and the one
 worth the most, because building small linked structures and walking them is
 what a parser, an interpreter or a compiler does all day.
 
-`tree` was 175 ms when it was written. Struct names stopped being copied on
-every value, and reading or writing a field became a load rather than a search
-through the field list. What is left is representation: Rust stores a child
-inline in its parent's vector and allocates about once per node, where Grasm
-allocates the box, the field vector, the child list and its storage.
-`docs/northstar.md` carries the measurements, including the attempts that were
-reverted.
+`tree` was 175 ms when it was written, and every step down was an allocation
+removed rather than a loop tightened. Struct names stopped being copied onto
+every value; reading or writing a field became a load rather than a search
+through the field list; a struct's fields, and then a list's elements, moved
+into the box the value already needed, so a node and its three children are one
+allocation each instead of four. The type descriptor that made the last of
+those possible is emitted by the compiler, so nothing about a struct type is
+discovered at run time any more.
+
+What is left is the box itself: Rust stores a child inline in its parent's
+vector and allocates about once per node, where Grasm still allocates one boxed
+value per node. `docs/northstar.md` carries the measurements, including the
+attempts that were reverted.
 
 `benchmarks/README.md` records two things this
 table used to blame that measurement cleared — the bounds check and the absence
