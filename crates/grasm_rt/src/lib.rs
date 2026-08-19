@@ -1988,6 +1988,34 @@ pub unsafe extern "C" fn grasm_struct_push_field(
     fields.push((borrowed_str(name, len), val));
 }
 
+/// A field by its position in the struct's declaration.
+///
+/// Fields are always stored in declaration order — the backend sorts a literal
+/// into that order before pushing, so `P{ b: 2, a: 1 }` and `P{ a: 1, b: 2 }`
+/// are laid out identically, which is also why they print identically. So the
+/// index is fixed at compile time and a read is a load rather than a walk
+/// comparing names.
+///
+/// Reading the *last* of six fields took twice as long as reading the first,
+/// which is what a linear scan looks like from the outside.
+///
+/// # Safety: `i` is a field index the compiler resolved for this struct type.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_struct_get_at(s: *mut RtVal, i: i64) -> *mut RtVal {
+    let RtPayload::Struct { fields, .. } = &(*s).payload else {
+        grasm_panic_msg_str("field access on non-struct");
+    };
+    match fields.get(i as usize) {
+        Some((_, v)) => {
+            inc(*v);
+            *v
+        }
+        // Not reachable from compiled code, and cheaper to say so than to
+        // return something wrong if it ever is.
+        None => grasm_panic_msg_str("no such field"),
+    }
+}
+
 /// # Safety: as above; returns +1.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_struct_get(
@@ -1998,7 +2026,11 @@ pub unsafe extern "C" fn grasm_struct_get(
     let RtPayload::Struct { fields, .. } = &(*s).payload else {
         grasm_panic_msg_str("field access on non-struct");
     };
-    let key = take_str(name, len);
+    // Borrowed, not copied: the name is in the binary's read-only data and
+    // the stored names are `&'static str`. This used to allocate a heap
+    // `String` on *every field read* — three million of them for a loop that
+    // reads one field three million times.
+    let key = borrowed_str(name, len);
     for (k, v) in fields {
         if *k == key {
             inc(*v);
@@ -2033,7 +2065,11 @@ pub unsafe extern "C" fn grasm_struct_take(
     let RtPayload::Struct { fields, .. } = &mut (*s).payload else {
         grasm_panic_msg_str("field access on non-struct");
     };
-    let key = take_str(name, len);
+    // Borrowed, not copied: the name is in the binary's read-only data and
+    // the stored names are `&'static str`. This used to allocate a heap
+    // `String` on *every field read* — three million of them for a loop that
+    // reads one field three million times.
+    let key = borrowed_str(name, len);
     let hole = interned_bool(false);
     for (k, v) in fields.iter_mut() {
         if *k == key {
@@ -2098,7 +2134,11 @@ pub unsafe extern "C" fn grasm_struct_set_field(
     let RtPayload::Struct { fields, .. } = &mut (*target).payload else {
         unreachable!()
     };
-    let key = take_str(name, len);
+    // Borrowed, not copied: the name is in the binary's read-only data and
+    // the stored names are `&'static str`. This used to allocate a heap
+    // `String` on *every field read* — three million of them for a loop that
+    // reads one field three million times.
+    let key = borrowed_str(name, len);
     for (k, v) in fields.iter_mut() {
         if *k == key {
             // A value returning to the field it was taken from carries no

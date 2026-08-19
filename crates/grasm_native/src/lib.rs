@@ -614,6 +614,7 @@ impl<'m> Codegen<'m> {
             ("grasm_struct_new", vec![ptr, i64t], Some(i64t)),
             ("grasm_struct_push_field", vec![i64t, ptr, i64t, i64t], None),
             ("grasm_struct_get", vec![i64t, ptr, i64t], Some(i64t)),
+            ("grasm_struct_get_at", vec![i64t, i64t], Some(i64t)),
             ("grasm_struct_set_field", vec![i64t, ptr, i64t, i64t], Some(i64t)),
             ("grasm_variant_new", vec![ptr, i64t, ptr, i64t], Some(i64t)),
             ("grasm_variant_push", vec![i64t, i64t], None),
@@ -8281,6 +8282,18 @@ checker did",
         }
     }
 
+    /// Where a field sits in its struct's declaration.
+    ///
+    /// Construction sorts a literal into this order, so the position is fixed
+    /// at compile time and a read needs no name comparison.
+    fn struct_field_index(&mut self, sname: &str, fname: &str) -> Option<i64> {
+        let fields = self.cg.structs.get(sname)?;
+        fields
+            .iter()
+            .position(|(n, _)| n == fname)
+            .map(|i| i as i64)
+    }
+
     fn struct_field_type(&mut self, sname: &str, fname: &str, span: Span) -> CResult<VType> {
         let Some(fields) = self.cg.structs.get(sname) else {
             return nope(span, format!("the struct `{sname}`"));
@@ -8498,8 +8511,21 @@ checker did",
             return nope(span, &what);
         };
         let ft = self.struct_field_type(&sname, &name.name, span)?;
-        let (fp, fl) = self.str_ptr_len(&name.name);
-        let boxed = self.call_rt("grasm_struct_get", &[rv, fp, fl]).unwrap();
+        // By position, not by name. Fields are stored in declaration order and
+        // the index is known here, so the read is a load instead of a walk
+        // comparing strings — the name form falls back only for a struct type
+        // this backend somehow has no table for, which the line above would
+        // already have refused.
+        let boxed = match self.struct_field_index(&sname, &name.name) {
+            Some(i) => {
+                let iv = self.b.ins().iconst(types::I64, i);
+                self.call_rt("grasm_struct_get_at", &[rv, iv]).unwrap()
+            }
+            None => {
+                let (fp, fl) = self.str_ptr_len(&name.name);
+                self.call_rt("grasm_struct_get", &[rv, fp, fl]).unwrap()
+            }
+        };
         self.call_rt("grasm_val_dec", &[rv]);
         let (v, vt) = self.unbox(boxed, &ft)?;
         Ok(Some((v, vt)))

@@ -350,10 +350,30 @@ already contained, before storing anything. The names come from the compiled
 binary's read-only data and live as long as the program, exactly as a variant's
 do.
 
-**175.1 to 132.6 ms**, same checksum. Still 6x C, and the rest is
-representation rather than waste: Rust stores child nodes inline in the
-parent's vector and allocates about once per node, where Grasm allocates the
-box, the field vector, the child list and its storage.
+**175.1 to 132.6 ms**, same checksum. Then reading a field turned out to be
+worse than building one.
+
+`grasm_struct_get` took the field name as a pointer and length and called
+`take_str` on it — **a heap allocation on every field read**, to hold a name
+the binary already contained. Borrowing instead took a loop reading one field
+three million times from 100 ms to 48 ms.
+
+What was left was the walk. Reading the *last* of six fields took 153 ms where
+the first took 100, which is what a linear scan looks like from outside. But
+the order is not arbitrary: the backend already sorts a struct literal into
+declaration order before it stores anything, which is why `P{ b: 2, a: 1 }` and
+`P{ a: 1, b: 2 }` print identically and compare equal. So the position of a
+field is known at compile time, and a read is a load.
+
+    reading the first of six fields    100.4 ms -> 35.1 ms
+    reading the last of six fields     152.7 ms -> 35.2 ms
+
+Flat, which is the point. `tree` is **175.1 to 97.1 ms**, and 4.8x C rather
+than 8.3x.
+
+What is left is representation rather than waste: Rust stores child nodes
+inline in the parent's vector and allocates about once per node, where Grasm
+allocates the box, the field vector, the child list and its storage.
 
 **The counting idiom hashed twice, and now hashes once.**
 
