@@ -493,6 +493,28 @@ own bookkeeping. At 65536 it recycles the whole tree; at 262144 nothing further
 happens. Four megabytes held, and the first measurement of the idea was a
 regression caused entirely by a constant.
 
+**The price of atomic reference counting, measured.** "Parallelism needs
+atomic refcounting, and atomic refcounting is expensive" is the sentence that
+kept `par_map` restricted to machine words — the workers share nothing because
+sharing would race on a `Cell<i64>`. Nobody here had priced it.
+
+    tree       63.3 -> 66.0 ms   (+4.3%)
+    wordfreq   46.7 -> 45.7 ms   (-2.1%)
+    sort       19.4 -> 19.3 ms
+    sieve      15.4 -> 15.5 ms
+
+About half a percent on the geometric mean. `tree` pays because it is the most
+reference-count-heavy program here and nothing else in it is slow; everything
+else does not move, on a machine whose uncontended atomics are one instruction.
+
+Taken, along with `Rc<Vec<u8>>` becoming `Arc<Vec<u8>>` — the one payload left
+that could not cross a thread, and exactly the kind of value a parallel worker
+would be handed. Single-threaded behaviour is identical: 218 identical, 218
+leak-free, 27 agreeing, 31 ProjectGold, clippy 0, `cargo test` green.
+
+This does not make `par_map` parallel over boxed values on its own. It removes
+the reason it could not be.
+
 **A copy-on-write clone was losing its inline storage.** `cow_list` collected
 the elements into a `Vec` and wrapped it, so a copied three-element list came
 back on the heap even though three elements fit in the box — and then allocated
