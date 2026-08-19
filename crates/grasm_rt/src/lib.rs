@@ -751,9 +751,15 @@ pub enum RtPayload {
     /// Hash table for lookup; iteration sorts, which is where the ordering
     /// guarantee is paid for rather than on every get and set.
     Map(std::collections::HashMap<MapKey, *mut RtVal>),
+    /// Names are `&'static str` for the same reason a variant's are: every one
+    /// is a pointer into the compiled binary's read-only data, and copying it
+    /// meant a heap allocation per name on every construction. A two-field
+    /// struct paid four — the type name, both field names, and the vector —
+    /// to say words the binary already contained, which is most of what
+    /// building a tree of small nodes costs.
     Struct {
-        name: String,
-        fields: Vec<(String, *mut RtVal)>,
+        name: &'static str,
+        fields: Vec<(&'static str, *mut RtVal)>,
     },
     /// Names are `&'static str` because every one of them is either a literal
     /// here or a pointer into the compiled binary's read-only data. Copying
@@ -1963,7 +1969,7 @@ unsafe fn borrowed_str(ptr: *const u8, len: u64) -> &'static str {
 #[no_mangle]
 pub unsafe extern "C" fn grasm_struct_new(name: *const u8, len: u64) -> *mut RtVal {
     alloc(RtPayload::Struct {
-        name: take_str(name, len),
+        name: borrowed_str(name, len),
         fields: Vec::new(),
     })
 }
@@ -1979,7 +1985,7 @@ pub unsafe extern "C" fn grasm_struct_push_field(
     let RtPayload::Struct { fields, .. } = &mut (*s).payload else {
         grasm_panic_msg_str("push_field on non-struct");
     };
-    fields.push((take_str(name, len), val));
+    fields.push((borrowed_str(name, len), val));
 }
 
 /// # Safety: as above; returns +1.
@@ -2073,15 +2079,17 @@ pub unsafe extern "C" fn grasm_struct_set_field(
         let RtPayload::Struct { name: sn, fields } = &(*s).payload else {
             grasm_panic_msg_str("set_field on non-struct");
         };
-        let cloned: Vec<(String, *mut RtVal)> = fields
+        // Copying a struct copies its field *pointers*; the names are static
+        // and cost nothing to carry.
+        let cloned: Vec<(&'static str, *mut RtVal)> = fields
             .iter()
             .map(|(k, v)| {
                 inc(*v);
-                (k.clone(), *v)
+                (*k, *v)
             })
             .collect();
         let nv = alloc(RtPayload::Struct {
-            name: sn.clone(),
+            name: sn,
             fields: cloned,
         });
         dec(s);
@@ -2887,15 +2895,15 @@ pub unsafe extern "C" fn grasm_ref_make_unique(r: i64) -> *mut RtVal {
     // the same slot, so every holder of the *reference* sees what follows.
     let fresh = match &(*p).payload {
         RtPayload::Struct { name, fields } => {
-            let cloned: Vec<(String, *mut RtVal)> = fields
+            let cloned: Vec<(&'static str, *mut RtVal)> = fields
                 .iter()
                 .map(|(k, v)| {
                     inc(*v);
-                    (k.clone(), *v)
+                    (*k, *v)
                 })
                 .collect();
             alloc(RtPayload::Struct {
-                name: name.clone(),
+                name,
                 fields: cloned,
             })
         }

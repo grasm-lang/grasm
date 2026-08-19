@@ -35,6 +35,7 @@ round: a program that crashes silently has no time to report.
 | `sieve`    | list indexing and tight loops                   |
 | `matmul`   | nested indexing over a flat list                |
 | `wordfreq` | hashing, string handling, map updates           |
+| `tree`     | allocating small linked structures and walking them |
 | `sort`     | comparison-heavy work over a large list         |
 | `parmap`   | multi-core throughput, each language's idiom    |
 | `mandelbrot` | a pure float kernel — the workload "N times faster than Python" claims come from |

@@ -1,0 +1,36 @@
+// Allocation-shaped work: build a tree, walk it, throw it away, repeat.
+//
+// The other programs here measure arithmetic, list indexing, strings and
+// threads. None of them measures what a parser, an interpreter or a compiler
+// actually spends its time on — allocating small linked structures and walking
+// them — which is the shape of most of the programs anybody writes in a
+// systems language, and the shape Grasm's refcounted boxes have to answer for.
+type Node = { value: i64, kids: [Node] }
+
+fn build(depth: i64, branch: i64, seed: i64) -> Node {
+    if depth <= 0 {
+        return Node{ value: seed % 1000, kids: [] }
+    }
+    var kids: [Node] = []
+    for i in 0..branch {
+        kids.push(build(depth - 1, branch, seed * 31 + i + 1))
+    }
+    Node{ value: seed % 1000, kids: kids }
+}
+
+fn total(n: Node) -> i64 {
+    var sum = n.value
+    for k in n.kids {
+        sum = sum + total(k)
+    }
+    sum
+}
+
+fn main() {
+    var acc = 0
+    for r in 0..20 {
+        let t = build(9, 3, r + 1)
+        acc = (acc + total(t)) % 1000000007
+    }
+    print("{acc}")
+}

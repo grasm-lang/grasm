@@ -327,6 +327,34 @@ PC-relative branch: `sieve` 17 to 15.3 ms, `sort` 20 to 19.2, `wordfreq` 54 to
 53.7. It does *not* help `fib` at all — 22.9 to 22.6 — which is the evidence
 that the indirection was never the cost there, the clobber was.
 
+**The benchmark suite had no allocation-shaped program, and adding one found
+the worst row in the language.**
+
+`fib`, `sieve` and `matmul` measure arithmetic and indexing; `wordfreq`
+measures strings and a map; `sort` a list; `parmap` threads. None of them
+measures what a parser, an interpreter or a compiler actually spends its time
+on — building small linked structures and walking them. So `tree` was written
+in five languages: build a 3-ary tree nine deep, sum it, drop it, twenty times.
+All five print `294954900`.
+
+On a machine too busy to publish absolute numbers, the ratios were stark:
+Rust 9.9 ms, Go 20.3, C 21.1, **Grasm 175.1** — eight times C and eighteen
+times Rust, where the worst existing row was 2.4x.
+
+The first cause was already solved elsewhere in the same file. `RtPayload::
+Variant` holds its names as `&'static str`, with a comment saying that copying
+them "made `Some(x)` cost two heap allocations before the payload".
+`RtPayload::Struct` still held a `String` for the type name *and for every
+field name* — so a two-field node allocated four times to say words the binary
+already contained, before storing anything. The names come from the compiled
+binary's read-only data and live as long as the program, exactly as a variant's
+do.
+
+**175.1 to 132.6 ms**, same checksum. Still 6x C, and the rest is
+representation rather than waste: Rust stores child nodes inline in the
+parent's vector and allocates about once per node, where Grasm allocates the
+box, the field vector, the child list and its storage.
+
 **The counting idiom hashed twice, and now hashes once.**
 
 ```grasm
