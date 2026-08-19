@@ -388,6 +388,22 @@ allocates the box, the field vector, the child list and its storage. Closing
 that means changing what a struct *is*, not what its accessors do — which is
 where this thread stops until there is a design for it.
 
+**The same defect in the interpreter, measured and reverted.** `Value::Struct`
+holds `name: Rc<String>` and `fields: Rc<Vec<(String, Value)>>`, so building one
+allocates a `String` per field name and a `String` *and* an `Rc` for the type
+name — exactly the waste that cost the compiled runtime a third of `tree`.
+Interning both as `Rc<str>` from a table made construction refcount bumps
+instead: **57 ms against 56**, on the same program, with all 218 difftest
+programs still identical.
+
+So the lesson did not transfer. In the compiled engine the allocation was most
+of what building a struct cost; in the tree-walker it is lost among the
+dispatch, the `Value` clones and the `Rc` traffic that interpreting anything
+costs. Fifteen edits to the *normative* engine for nothing measurable is churn
+in the one component every gate trusts, so it is reverted — and recorded,
+because "the runtime had this exact problem" is a compelling argument that
+happens to be wrong here.
+
 **The counting idiom hashed twice, and now hashes once.**
 
 ```grasm
