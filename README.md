@@ -127,13 +127,13 @@ concurrency primitive each one reaches for.
 
 | program  |   C |  Rust |  Go | Nim | Zig | grasm-native | Python |
 |----------|----:|------:|----:|----:|----:|-------------:|-------:|
-| fib      |   5 |     5 |   6 |   5 |   5 |           10 |    128 |
-| sieve    |   7 |     7 |   8 |   9 |   7 |           15 |    349 |
-| matmul   |   5 |     5 |   8 |   9 |   6 |           10 |    886 |
-| wordfreq |  31 |    26 |  17 |  22 |   9 |           53 |    131 |
-| tree     |  20 |    10 |  20 |   — |   — |           75 |    328 |
-| sort     |  37 |    11 |  49 |   — |   — |       **19** |    205 |
-| parmap   |  51 |    49 |  86 |   — |   — |          105 |  3,461 |
+| fib      |   5 |     5 |   6 |   5 |   5 |           11 |    128 |
+| sieve    |   7 |     7 |   8 |   9 |   7 |           16 |    336 |
+| matmul   |   5 |     5 |   8 |   9 |   5 |           10 |    897 |
+| wordfreq |  30 |    26 |  17 |  22 |   9 |           49 |    126 |
+| tree     |  20 |     9 |  20 |   — |   — |           63 |    327 |
+| sort     |  37 |    11 |  49 |   — |   — |       **19** |    204 |
+| parmap   |  51 |    51 |  87 |   — |   — |          104 |  3,412 |
 
 Best of 5. **The harness floor is 2 ms** — what timing `/usr/bin/true` costs,
 which is fork, exec and wait rather than anything a program did. The top three
@@ -141,10 +141,10 @@ rows are mostly floor: C's 5 ms `fib` is about 3 ms of work and Grasm's 10 ms
 about 8, which is nearer 2.7x than the 2x the raw numbers show. Subtract 2 from
 every cell before taking a ratio on a short row.
 
-This run reproduces the previous one within 3 ms on every cell except `tree`,
-which went 97 to 75 for a reason — a struct's fields and a small list's
-elements now live in the box the value already needed, so a node costs one
-allocation where it cost four. A benchmark that only ever agrees with itself is
+This run reproduces the previous one within 1 ms on every cell except `tree`,
+which went 75 to 63, and `wordfreq`, which went 53 to 49 — both for the same
+reason: freed 64-byte boxes are recycled instead of returned to the system, so
+an allocation is a pointer pop. A benchmark that only ever agrees with itself is
 not measuring anything; one that agrees except where the code changed is.
 
 Reproducibility alone still proves nothing, which this file learned the hard
@@ -166,14 +166,15 @@ measurement — is the answer right, is the machine quiet — and the timer itse
 was never checked against a program of known duration. It is now: the C sieve
 takes about 5 ms, and a harness that says 30 is measuring itself.
 
-Native Grasm **beats C and Go on `sort`** — 19 ms against 36 and 48, with Rust
-ahead at 11 — and is roughly **2x C** on the scalar programs. Scalar lists store elements inline and a list a loop only indexes is
-reached through its data pointer, so `matmul`'s innermost loop is 17
-instructions with no calls.
+Native Grasm **beats C and Go on `sort`** — 19 ms against 37 and 49, with Rust
+ahead at 11 — and is roughly **2x C** on the scalar programs, or 2.7–3.0x once
+the 2 ms process floor is subtracted from cells that small. Scalar lists store
+elements inline and a list a loop only indexes is reached through its data
+pointer, so `matmul`'s innermost loop is 17 instructions with no calls.
 
 **The two weak rows are the two that allocate.** `wordfreq` builds a string per
 iteration and boxes every value; `tree` builds a small struct per node, and at
-75 ms against C's 20 and Rust's 10 it is the worst ratio here — and the one
+63 ms against C's 20 and Rust's 9 it is the worst ratio here — and the one
 worth the most, because building small linked structures and walking them is
 what a parser, an interpreter or a compiler does all day.
 
@@ -184,7 +185,9 @@ through the field list; a struct's fields, and then a list's elements, moved
 into the box the value already needed, so a node and its three children are one
 allocation each instead of four. The type descriptor that made the last of
 those possible is emitted by the compiler, so nothing about a struct type is
-discovered at run time any more.
+discovered at run time any more. Then the allocations that remain got cheaper:
+every value is the same 64 bytes, so a freed box is recycled rather than
+returned to the system.
 
 What is left is the box itself: Rust stores a child inline in its parent's
 vector and allocates about once per node, where Grasm still allocates one boxed
