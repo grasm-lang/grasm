@@ -493,6 +493,20 @@ own bookkeeping. At 65536 it recycles the whole tree; at 262144 nothing further
 happens. Four megabytes held, and the first measurement of the idea was a
 regression caused entirely by a constant.
 
+**`dec`'s worklist, measured and reverted.** `dec` walks a structure
+iteratively with a `Vec` worklist, and that `Vec` is made fresh on every call —
+which reads like an allocation per value freed, on the path whose whole job is
+to give memory back. Keeping it in a thread-local and handing it back with its
+capacity measured **74.6 ms against 63.1** on `tree`, an 18% *regression*.
+
+The reasoning was wrong about how often the allocation happens. One `dec` call
+frees an entire structure: the tree's 29,524 nodes are released by the single
+call at `let t` going out of scope, and the worklist is reused within that walk.
+So there were twenty allocations to save across the whole run, and the price was
+two thread-local accesses and two `RefCell` borrows on *every* `dec` — including
+the great majority that only decrement a count and return. A saving spread over
+the wrong denominator.
+
 **The layout argument is now checked.**
 
     const _: () = assert!(std::mem::size_of::<RtVal>() == 64);
