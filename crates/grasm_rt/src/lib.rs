@@ -484,6 +484,151 @@ pub struct RtStr {
     index: std::sync::OnceLock<Box<CharIndex>>,
 }
 
+/// A struct's field values: inline when there are few, on the heap when not.
+///
+/// Four is the largest run that keeps `RtVal` at 64 bytes, which is the budget
+/// every other value in the runtime is already fitted to. Most structs have
+/// four fields or fewer, and for those a value is now *one* allocation instead
+/// of two — building a tree of two-field nodes was allocating the box, this
+/// vector, the child list and its storage.
+pub enum StructFields {
+    Inline { vals: [*mut RtVal; 4], len: u8 },
+    Heap(Vec<*mut RtVal>),
+}
+
+impl StructFields {
+    fn new() -> StructFields {
+        StructFields::Inline {
+            vals: [std::ptr::null_mut(); 4],
+            len: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            StructFields::Inline { len, .. } => *len as usize,
+            StructFields::Heap(v) => v.len(),
+        }
+    }
+
+    fn as_slice(&self) -> &[*mut RtVal] {
+        match self {
+            StructFields::Inline { vals, len } => &vals[..*len as usize],
+            StructFields::Heap(v) => v,
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [*mut RtVal] {
+        match self {
+            StructFields::Inline { vals, len } => &mut vals[..*len as usize],
+            StructFields::Heap(v) => v,
+        }
+    }
+
+    fn iter(&self) -> std::slice::Iter<'_, *mut RtVal> {
+        self.as_slice().iter()
+    }
+
+    fn get(&self, i: usize) -> Option<&*mut RtVal> {
+        self.as_slice().get(i)
+    }
+
+    fn get_mut(&mut self, i: usize) -> Option<&mut *mut RtVal> {
+        self.as_mut_slice().get_mut(i)
+    }
+
+    /// Spills to the heap on the fifth field, once.
+    fn push(&mut self, v: *mut RtVal) {
+        match self {
+            StructFields::Inline { vals, len } if (*len as usize) < 4 => {
+                vals[*len as usize] = v;
+                *len += 1;
+            }
+            StructFields::Inline { vals, len } => {
+                let mut heap: Vec<*mut RtVal> = vals[..*len as usize].to_vec();
+                heap.push(v);
+                *self = StructFields::Heap(heap);
+            }
+            StructFields::Heap(h) => h.push(v),
+        }
+    }
+
+    fn from_values(values: Vec<*mut RtVal>) -> StructFields {
+        if values.len() <= 4 {
+            let mut vals = [std::ptr::null_mut(); 4];
+            vals[..values.len()].copy_from_slice(&values);
+            StructFields::Inline {
+                vals,
+                len: values.len() as u8,
+            }
+        } else {
+            StructFields::Heap(values)
+        }
+    }
+}
+
+/// A struct type: its name, and its field names in declaration order.
+///
+/// One of these per type, made the first time a value of it is built and
+/// living as long as the program. The backend sorts every struct literal into
+/// declaration order before storing anything, so the first construction fixes
+/// the order and every later one matches it — which is the same fact that lets
+/// a field be read by index instead of by name.
+pub struct StructTy {
+    pub name: &'static str,
+    /// Appended to as the first value of this type is built. Every later value
+    /// pushes the same names in the same order, so this stops growing after
+    /// the first one.
+    pub fields: std::cell::RefCell<Vec<&'static str>>,
+}
+
+thread_local! {
+    /// Interned by name, so two values of one type share a `StructTy`.
+    static STRUCT_TYPES: std::cell::RefCell<
+        std::collections::HashMap<&'static str, &'static StructTy>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// The `StructTy` for a type name, made once.
+fn struct_ty(name: &'static str) -> &'static StructTy {
+    // A one-entry cache in front of the map. A loop building one kind of node
+    // asks for the same type every time, which is the case that matters.
+    LAST_TY.with(|c| {
+        if let Some((p, ty)) = c.get() {
+            if std::ptr::eq(p, name.as_ptr()) {
+                return Some(ty);
+            }
+        }
+        None
+    })
+    .unwrap_or_else(|| {
+        let ty = struct_ty_slow(name);
+        LAST_TY.with(|c| c.set(Some((name.as_ptr(), ty))));
+        ty
+    })
+}
+
+thread_local! {
+    static LAST_TY: std::cell::Cell<Option<(*const u8, &'static StructTy)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn struct_ty_slow(name: &'static str) -> &'static StructTy {
+    STRUCT_TYPES.with(|t| {
+        if let Some(found) = t.borrow().get(name) {
+            return *found;
+        }
+        // Leaked on purpose: one per struct type in the program, and it has to
+        // outlive every value that points at it.
+        let fresh: &'static StructTy = Box::leak(Box::new(StructTy {
+            name,
+            fields: std::cell::RefCell::new(Vec::new()),
+        }));
+        t.borrow_mut().insert(name, fresh);
+        fresh
+    })
+}
+
 /// Where a string's bytes live.
 ///
 /// Short text is held **inline**, in the `RtVal` that already had to be
@@ -751,15 +896,17 @@ pub enum RtPayload {
     /// Hash table for lookup; iteration sorts, which is where the ordering
     /// guarantee is paid for rather than on every get and set.
     Map(std::collections::HashMap<MapKey, *mut RtVal>),
-    /// Names are `&'static str` for the same reason a variant's are: every one
-    /// is a pointer into the compiled binary's read-only data, and copying it
-    /// meant a heap allocation per name on every construction. A two-field
-    /// struct paid four — the type name, both field names, and the vector —
-    /// to say words the binary already contained, which is most of what
-    /// building a tree of small nodes costs.
+    /// A struct value carries its field *pointers* and nothing else. The names
+    /// are identical for every value of a type, so they live once in a
+    /// `StructTy` the value points at rather than being repeated in each one.
+    ///
+    /// They were `String`s first — a heap allocation per name on every value.
+    /// Making them `&'static str` removed the allocations and left the width:
+    /// three words per field, where a field is one. Building a tree of
+    /// two-field nodes is mostly this vector.
     Struct {
-        name: &'static str,
-        fields: Vec<(&'static str, *mut RtVal)>,
+        ty: &'static StructTy,
+        fields: StructFields,
     },
     /// Names are `&'static str` because every one of them is either a literal
     /// here or a pointer into the compiled binary's read-only data. Copying
@@ -946,7 +1093,7 @@ pub unsafe extern "C" fn grasm_region_pop() {
             }
             RtPayload::Struct { fields, .. } => {
                 outside.extend(
-                    fields.iter().map(|(_, v)| *v).filter(|c| (**c).rc.get() != ARENA),
+                    fields.iter().copied().filter(|c| (**c).rc.get() != ARENA),
                 );
             }
             RtPayload::Variant { fields, .. } => {
@@ -1038,7 +1185,7 @@ unsafe fn dec(v: *mut RtVal) {
                             pending.extend(entries.values().copied());
                         }
                         RtPayload::Struct { fields, .. } => {
-                            pending.extend(fields.iter().map(|(_, fv)| *fv));
+                            pending.extend(fields.iter().copied());
                         }
                         RtPayload::Fn { env, .. } => {
                             if !env.is_null() {
@@ -1891,10 +2038,16 @@ unsafe fn display(v: *mut RtVal) -> String {
             let parts: Vec<String> = items.iter().map(|&i| display(i)).collect();
             format!("({})", parts.join(", "))
         }
-        RtPayload::Struct { name, fields } => {
+        RtPayload::Struct { ty, fields } => {
+            let name = ty.name;
+            let names = ty.fields.borrow();
             let parts: Vec<String> = fields
                 .iter()
-                .map(|(k, fv)| format!("{k}: {}", display(*fv)))
+                .enumerate()
+                .map(|(i, fv)| {
+                    let k = names.get(i).copied().unwrap_or("?");
+                    format!("{k}: {}", display(*fv))
+                })
                 .collect();
             format!("{name}{{{}}}", parts.join(", "))
         }
@@ -1969,8 +2122,8 @@ unsafe fn borrowed_str(ptr: *const u8, len: u64) -> &'static str {
 #[no_mangle]
 pub unsafe extern "C" fn grasm_struct_new(name: *const u8, len: u64) -> *mut RtVal {
     alloc(RtPayload::Struct {
-        name: borrowed_str(name, len),
-        fields: Vec::new(),
+        ty: struct_ty(borrowed_str(name, len)),
+        fields: StructFields::new(),
     })
 
 }
@@ -1983,10 +2136,19 @@ pub unsafe extern "C" fn grasm_struct_push_field(
     len: u64,
     val: *mut RtVal,
 ) {
-    let RtPayload::Struct { fields, .. } = &mut (*s).payload else {
+    let RtPayload::Struct { ty, fields } = &mut (*s).payload else {
         grasm_panic_msg_str("push_field on non-struct");
     };
-    fields.push((borrowed_str(name, len), val));
+    // The first value of a type names its fields; every later one pushes the
+    // same names in the same order, so this appends only while that first
+    // value is being built.
+    {
+        let mut names = ty.fields.borrow_mut();
+        if names.len() == fields.len() {
+            names.push(borrowed_str(name, len));
+        }
+    }
+    fields.push(val);
 }
 
 /// A field by its position in the struct's declaration.
@@ -2007,7 +2169,7 @@ pub unsafe extern "C" fn grasm_struct_get_at(s: *mut RtVal, i: i64) -> *mut RtVa
         grasm_panic_msg_str("field access on non-struct");
     };
     match fields.get(i as usize) {
-        Some((_, v)) => {
+        Some(v) => {
             inc(*v);
             *v
         }
@@ -2024,7 +2186,7 @@ pub unsafe extern "C" fn grasm_struct_get(
     name: *const u8,
     len: u64,
 ) -> *mut RtVal {
-    let RtPayload::Struct { fields, .. } = &(*s).payload else {
+    let RtPayload::Struct { ty, fields } = &(*s).payload else {
         grasm_panic_msg_str("field access on non-struct");
     };
     // Borrowed, not copied: the name is in the binary's read-only data and
@@ -2032,8 +2194,9 @@ pub unsafe extern "C" fn grasm_struct_get(
     // `String` on *every field read* — three million of them for a loop that
     // reads one field three million times.
     let key = borrowed_str(name, len);
-    for (k, v) in fields {
-        if *k == key {
+    let idx = ty.fields.borrow().iter().position(|n| *n == key);
+    if let Some(i) = idx {
+        if let Some(v) = fields.get(i) {
             inc(*v);
             return *v;
         }
@@ -2063,7 +2226,7 @@ pub unsafe extern "C" fn grasm_struct_take(
     if (*s).rc.get() != 1 {
         return std::ptr::null_mut();
     }
-    let RtPayload::Struct { fields, .. } = &mut (*s).payload else {
+    let RtPayload::Struct { ty, fields } = &mut (*s).payload else {
         grasm_panic_msg_str("field access on non-struct");
     };
     // Borrowed, not copied: the name is in the binary's read-only data and
@@ -2071,9 +2234,10 @@ pub unsafe extern "C" fn grasm_struct_take(
     // `String` on *every field read* — three million of them for a loop that
     // reads one field three million times.
     let key = borrowed_str(name, len);
+    let idx = ty.fields.borrow().iter().position(|n| *n == key);
     let hole = interned_bool(false);
-    for (k, v) in fields.iter_mut() {
-        if *k == key {
+    if let Some(i) = idx {
+        if let Some(v) = fields.get_mut(i) {
             return std::mem::replace(v, hole);
         }
     }
@@ -2119,19 +2283,19 @@ pub unsafe extern "C" fn grasm_struct_set_field_at(
     let target = if (*s).rc.get() == 1 {
         s
     } else {
-        let RtPayload::Struct { name: sn, fields } = &(*s).payload else {
+        let RtPayload::Struct { ty: sty, fields } = &(*s).payload else {
             grasm_panic_msg_str("set_field on non-struct");
         };
-        let cloned: Vec<(&'static str, *mut RtVal)> = fields
+        let cloned: Vec<*mut RtVal> = fields
             .iter()
-            .map(|(k, v)| {
+            .map(|v| {
                 inc(*v);
-                (*k, *v)
+                *v
             })
             .collect();
         let nv = alloc(RtPayload::Struct {
-            name: sn,
-            fields: cloned,
+            ty: sty,
+            fields: StructFields::from_values(cloned),
         });
         dec(s);
         nv
@@ -2140,7 +2304,7 @@ pub unsafe extern "C" fn grasm_struct_set_field_at(
         unreachable!()
     };
     match fields.get_mut(i as usize) {
-        Some((_, slot)) => {
+        Some(slot) => {
             // A value returning to the field it was taken from carries no new
             // reference, and the old one is the same object — decrementing
             // would free what is being stored.
@@ -2166,35 +2330,32 @@ pub unsafe extern "C" fn grasm_struct_set_field(
     let target = if (*s).rc.get() == 1 {
         s
     } else {
-        let RtPayload::Struct { name: sn, fields } = &(*s).payload else {
+        let RtPayload::Struct { ty: sty, fields } = &(*s).payload else {
             grasm_panic_msg_str("set_field on non-struct");
         };
-        // Copying a struct copies its field *pointers*; the names are static
-        // and cost nothing to carry.
-        let cloned: Vec<(&'static str, *mut RtVal)> = fields
+        // Copying a struct copies its field *pointers*; the names live once in
+        // the type and cost nothing to carry.
+        let cloned: Vec<*mut RtVal> = fields
             .iter()
-            .map(|(k, v)| {
+            .map(|v| {
                 inc(*v);
-                (*k, *v)
+                *v
             })
             .collect();
         let nv = alloc(RtPayload::Struct {
-            name: sn,
-            fields: cloned,
+            ty: sty,
+            fields: StructFields::from_values(cloned),
         });
         dec(s);
         nv
     };
-    let RtPayload::Struct { fields, .. } = &mut (*target).payload else {
+    let RtPayload::Struct { ty, fields } = &mut (*target).payload else {
         unreachable!()
     };
-    // Borrowed, not copied: the name is in the binary's read-only data and
-    // the stored names are `&'static str`. This used to allocate a heap
-    // `String` on *every field read* — three million of them for a loop that
-    // reads one field three million times.
     let key = borrowed_str(name, len);
-    for (k, v) in fields.iter_mut() {
-        if *k == key {
+    let idx = ty.fields.borrow().iter().position(|n| *n == key);
+    if let Some(i) = idx {
+        if let Some(v) = fields.get_mut(i) {
             // A value returning to the field it was taken from carries no
             // new reference, and the old one is the same object — decrementing
             // would free what is being stored.
@@ -2332,16 +2493,16 @@ unsafe fn val_eq_step(a: *mut RtVal, b: *mut RtVal, work: &mut Vec<(*mut RtVal, 
             true
         }
         (
-            RtPayload::Struct { name: n1, fields: f1 },
-            RtPayload::Struct { name: n2, fields: f2 },
+            RtPayload::Struct { ty: t1, fields: f1 },
+            RtPayload::Struct { ty: t2, fields: f2 },
         ) => {
-            if n1 != n2 || f1.len() != f2.len() {
+            // The type name decides; the field names follow from it, so two
+            // values of one type have the same names in the same order by
+            // construction and only the values need comparing.
+            if t1.name != t2.name || f1.len() != f2.len() {
                 return false;
             }
-            for ((k1, v1), (k2, v2)) in f1.iter().zip(f2) {
-                if k1 != k2 {
-                    return false;
-                }
+            for (v1, v2) in f1.iter().zip(f2.iter()) {
                 work.push((*v1, *v2));
             }
             true
@@ -2430,15 +2591,12 @@ unsafe fn val_eq(a: *mut RtVal, b: *mut RtVal) -> bool {
                     .all(|(k, &v)| y.get(k).is_some_and(|&w| val_eq(v, w)))
         }
         (
-            RtPayload::Struct { name: n1, fields: f1 },
-            RtPayload::Struct { name: n2, fields: f2 },
+            RtPayload::Struct { ty: t1, fields: f1 },
+            RtPayload::Struct { ty: t2, fields: f2 },
         ) => {
-            n1 == n2
+            t1.name == t2.name
                 && f1.len() == f2.len()
-                && f1
-                    .iter()
-                    .zip(f2)
-                    .all(|((k1, v1), (k2, v2))| k1 == k2 && val_eq(*v1, *v2))
+                && f1.iter().zip(f2.iter()).all(|(v1, v2)| val_eq(*v1, *v2))
         }
         (
             RtPayload::Variant { type_name: t1, name: n1, fields: f1 },
@@ -2988,17 +3146,17 @@ pub unsafe extern "C" fn grasm_ref_make_unique(r: i64) -> *mut RtVal {
     // ([E-VALUE-SEMANTICS]). Clone into the slot; the reference still names
     // the same slot, so every holder of the *reference* sees what follows.
     let fresh = match &(*p).payload {
-        RtPayload::Struct { name, fields } => {
-            let cloned: Vec<(&'static str, *mut RtVal)> = fields
+        RtPayload::Struct { ty, fields } => {
+            let cloned: Vec<*mut RtVal> = fields
                 .iter()
-                .map(|(k, v)| {
+                .map(|v| {
                     inc(*v);
-                    (*k, *v)
+                    *v
                 })
                 .collect();
             alloc(RtPayload::Struct {
-                name,
-                fields: cloned,
+                ty,
+                fields: StructFields::from_values(cloned),
             })
         }
         RtPayload::List(items) => {

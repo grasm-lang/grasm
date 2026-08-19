@@ -409,11 +409,28 @@ into an empty one and reallocating on the way. It measured 98.5 ms against
 either way. Reverted, and recorded here so the next person does not spend the
 afternoon on it.
 
-What is left is representation rather than waste: Rust stores child nodes
-inline in the parent's vector and allocates about once per node, where Grasm
-allocates the box, the field vector, the child list and its storage. Closing
-that means changing what a struct *is*, not what its accessors do — which is
-where this thread stops until there is a design for it.
+**The representation change, done.** A struct value was the box plus a vector of
+`(name, pointer)` pairs — and the names are the same for every value of a type,
+so they were being repeated once per value. They now live once in a `StructTy`
+the value points at, and the field *values* live inline in the box itself when
+there are four or fewer, which is most structs. Four is the largest run that
+keeps `RtVal` at 64 bytes, the budget every other value is already fitted to.
+
+A two-field node went from two allocations to one. `tree` **100.3 to 83.0 ms**,
+and 175 to 83 across the whole thread — 8.3x C down to 4.0x.
+
+The intermediate step measured *worse*: the type table alone, with the field
+vector still there, was 103.2 ms against 100.3, because a thread-local lookup
+per construction cost more than the narrower vector saved. A one-entry cache in
+front of it — a loop building one kind of node asks for the same type every
+time — brought it to 98.4, and only removing the vector made it pay. Worth
+recording as a case where the enabling step had to be measured *and kept*
+despite being a regression on its own.
+
+What is left is the child list: Rust stores a node inline in its parent's
+vector where Grasm still allocates a list box and its storage. That needs the
+compiler to emit a type descriptor per struct rather than interning one at run
+time, which would also delete the lookup this commit had to cache around.
 
 **The same defect in the interpreter, measured and reverted.** `Value::Struct`
 holds `name: Rc<String>` and `fields: Rc<Vec<(String, Value)>>`, so building one
