@@ -1,5 +1,5 @@
 //! tag: L-LIB-BYTES
-//! expect: output
+//! expect: panic
 //! 0x48c7c001000000
 //! 7 bytes, first 72, third 192
 //! 0x48c7c0 and 0x48c7ff
@@ -8,6 +8,8 @@
 //! round trip: héllo
 //! written and read back identically: true
 //! empty is empty, seven bytes are not: true false
+//! last byte and last slice: 0 0x00
+//! index 7 out of bounds (len 7)
 // `bytes` is the type `str` deliberately is not ([L-LIB-BYTES]).
 //
 // The sequence below is x86-64 `mov rax, 1`. Written through a `str` it lands
@@ -41,4 +43,10 @@ fn main() / {io} {
     // it widened `icmp`'s answer to the width it already had, which Cranelift
     // rejects, so every `b.is_empty()` in the language was a "codegen bug".
     print("empty is empty, seven bytes are not: {bytes_of([]).is_empty()} {code.is_empty()}")
+
+    // `at` and `slice` are specified to panic out of range, and the index
+    // worth testing is the first one that is. The last byte and the last
+    // one-byte slice must work; one past must not.
+    print("last byte and last slice: {code.at(code.len() - 1)} {code.slice(code.len() - 1, 1)}")
+    print("{code.at(code.len())}")
 }

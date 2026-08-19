@@ -392,6 +392,37 @@ available. A test asserts that: `run`, `send`, `open`, `close`, `read`, `write`,
 `start`, `stop`, `wait`, `execute` and twenty more must never appear in the
 builtin list.
 
+## F31 — two more clauses promised a panic no program triggered (S2, tests) — **fixed**
+
+After F29 and F30, both of which were "the first index past the end", the
+obvious question was how many other clauses promise a panic and never
+demonstrate one. Four operations are specified to panic out of range:
+`xs[i]` and `s.code_at(i)` — already fixed — plus `b.at(i)`/`b.slice(...)`
+([L-LIB-BYTES]) and `xs.remove(i)` ([L-LIB-REMOVE]).
+
+Both remaining programs were `expect: output`. Neither triggered the panic its
+own clause promises. Both now read the last valid element *and* one past it.
+
+The bytes boundary kills its mutant: with `i >= len` changed to `i > len`,
+`grasm run` panics and the compiled build dies with SIGABRT.
+
+**The `remove` boundary does not, and the reason is worth writing down.**
+`grasm_list_remove` checks the index and then calls `grasm_list_get`, which
+checks it again — so the outer check is redundant in the compiled build and
+mutating it changes only the panic *message*. The program still panics, still
+exits 101, still prints the same thing on stdout.
+
+Which exposes the real gap: **no broad gate checks a compiled build's panic
+message.** `difftest.sh` compares stdout and the exit code, and a panic goes to
+stderr; the conformance suite runs the interpreter, so a runtime defect is
+invisible to it entirely. [E-PANIC-TRACE] says the panic line is identical in
+all three engines, and the only gate that verifies that is `agreetest.sh` — on
+sixteen programs.
+
+Recorded rather than fixed: widening `difftest.sh` to compare stderr would make
+218 programs assert their stack traces, which is a different and much larger
+promise than the one the clause makes.
+
 ## Mutation testing — the whole tally
 
 Seven deliberate defects, each the smallest wrong thing its function could be,
