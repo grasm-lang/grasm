@@ -371,9 +371,22 @@ field is known at compile time, and a read is a load.
 Flat, which is the point. `tree` is **175.1 to 97.1 ms**, and 4.8x C rather
 than 8.3x.
 
+Writing a field was then the slowest thing left — three million writes took
+157 ms against 66 ms for six million reads, because the write still walked the
+names a read no longer did. Indexed the same way: **157.3 to 85.3 ms**.
+
+**One attempt, measured and reverted.** The compiler knows how many fields a
+struct has, so `grasm_struct_new` could size the vector once instead of pushing
+into an empty one and reallocating on the way. It measured 98.5 ms against
+97.1, and `alloconly` 137.0 against 132.6 — no better, and inside the noise
+either way. Reverted, and recorded here so the next person does not spend the
+afternoon on it.
+
 What is left is representation rather than waste: Rust stores child nodes
 inline in the parent's vector and allocates about once per node, where Grasm
-allocates the box, the field vector, the child list and its storage.
+allocates the box, the field vector, the child list and its storage. Closing
+that means changing what a struct *is*, not what its accessors do — which is
+where this thread stops until there is a design for it.
 
 **The counting idiom hashed twice, and now hashes once.**
 

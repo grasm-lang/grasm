@@ -1972,6 +1972,7 @@ pub unsafe extern "C" fn grasm_struct_new(name: *const u8, len: u64) -> *mut RtV
         name: borrowed_str(name, len),
         fields: Vec::new(),
     })
+
 }
 
 /// # Safety: as above; `val` ownership transfers into the struct.
@@ -2098,6 +2099,59 @@ pub unsafe extern "C" fn grasm_list_take(l: *mut RtVal, i: i64) -> *mut RtVal {
     }
     let hole = interned_bool(false);
     std::mem::replace(&mut items[i as usize], hole)
+}
+
+/// The same, by declared position rather than by name ([the reason is the same
+/// as `grasm_struct_get_at`'s]).
+///
+/// A write was the slowest thing left on a struct — three million of them took
+/// 157 ms, against 66 ms for six million reads — because it walked the fields
+/// comparing names while a read no longer did.
+///
+/// # Safety: `i` is a field index the compiler resolved for this struct type;
+/// `val` ownership transfers.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_struct_set_field_at(
+    s: *mut RtVal,
+    i: i64,
+    val: *mut RtVal,
+) -> *mut RtVal {
+    let target = if (*s).rc.get() == 1 {
+        s
+    } else {
+        let RtPayload::Struct { name: sn, fields } = &(*s).payload else {
+            grasm_panic_msg_str("set_field on non-struct");
+        };
+        let cloned: Vec<(&'static str, *mut RtVal)> = fields
+            .iter()
+            .map(|(k, v)| {
+                inc(*v);
+                (*k, *v)
+            })
+            .collect();
+        let nv = alloc(RtPayload::Struct {
+            name: sn,
+            fields: cloned,
+        });
+        dec(s);
+        nv
+    };
+    let RtPayload::Struct { fields, .. } = &mut (*target).payload else {
+        unreachable!()
+    };
+    match fields.get_mut(i as usize) {
+        Some((_, slot)) => {
+            // A value returning to the field it was taken from carries no new
+            // reference, and the old one is the same object — decrementing
+            // would free what is being stored.
+            if *slot != val {
+                dec(*slot);
+            }
+            *slot = val;
+        }
+        None => grasm_panic_msg_str("no such field"),
+    }
+    target
 }
 
 /// CoW field update: returns the (possibly new) struct pointer.

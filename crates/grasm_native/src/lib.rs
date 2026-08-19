@@ -616,6 +616,7 @@ impl<'m> Codegen<'m> {
             ("grasm_struct_get", vec![i64t, ptr, i64t], Some(i64t)),
             ("grasm_struct_get_at", vec![i64t, i64t], Some(i64t)),
             ("grasm_struct_set_field", vec![i64t, ptr, i64t, i64t], Some(i64t)),
+            ("grasm_struct_set_field_at", vec![i64t, i64t, i64t], Some(i64t)),
             ("grasm_variant_new", vec![ptr, i64t, ptr, i64t], Some(i64t)),
             ("grasm_variant_push", vec![i64t, i64t], None),
             ("grasm_variant_is", vec![i64t, ptr, i64t], Some(i8t)),
@@ -10292,11 +10293,23 @@ checker did",
         match path.split_first() {
             None => Ok(boxed_val),
             Some((seg, [])) => match (root_t, seg) {
-                (VType::Struct(_), PlaceSeg::Field(f)) => {
-                    let (fp, fl) = self.str_ptr_len(f);
-                    Ok(self
-                        .call_rt("grasm_struct_set_field", &[root, fp, fl, boxed_val])
-                        .unwrap())
+                // By position where the struct's type is known, which is
+                // everywhere the checker resolved a field — the name form
+                // stays for the case it did not.
+                (VType::Struct(sn), PlaceSeg::Field(f)) => {
+                    let sn = sn.clone();
+                    Ok(match self.struct_field_index(&sn, f) {
+                        Some(i) => {
+                            let iv = self.b.ins().iconst(types::I64, i);
+                            self.call_rt("grasm_struct_set_field_at", &[root, iv, boxed_val])
+                                .unwrap()
+                        }
+                        None => {
+                            let (fp, fl) = self.str_ptr_len(f);
+                            self.call_rt("grasm_struct_set_field", &[root, fp, fl, boxed_val])
+                                .unwrap()
+                        }
+                    })
                 }
                 (VType::List(_), PlaceSeg::Index(ix)) => {
                     let (iv, _) = self.index_value(ix)?;
@@ -10369,11 +10382,26 @@ checker did",
                     return Ok(root);
                 }
                 match (root_t, writeback) {
-                    (VType::Struct(_), PlaceSeg::Field(f)) => {
-                        let (fp, fl) = self.str_ptr_len(f);
-                        Ok(self
-                            .call_rt("grasm_struct_set_field", &[root, fp, fl, new_child])
-                            .unwrap())
+                    (VType::Struct(sn), PlaceSeg::Field(f)) => {
+                        let sn = sn.clone();
+                        Ok(match self.struct_field_index(&sn, f) {
+                            Some(i) => {
+                                let iv = self.b.ins().iconst(types::I64, i);
+                                self.call_rt(
+                                    "grasm_struct_set_field_at",
+                                    &[root, iv, new_child],
+                                )
+                                .unwrap()
+                            }
+                            None => {
+                                let (fp, fl) = self.str_ptr_len(f);
+                                self.call_rt(
+                                    "grasm_struct_set_field",
+                                    &[root, fp, fl, new_child],
+                                )
+                                .unwrap()
+                            }
+                        })
                     }
                     (VType::List(_), PlaceSeg::Index(ix)) => {
                         let (iv, _) = self.index_value(ix)?;
