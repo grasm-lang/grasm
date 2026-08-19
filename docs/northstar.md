@@ -493,6 +493,26 @@ own bookkeeping. At 65536 it recycles the whole tree; at 262144 nothing further
 happens. Four megabytes held, and the first measurement of the idea was a
 regression caused entirely by a constant.
 
+**A copy-on-write clone was losing its inline storage.** `cow_list` collected
+the elements into a `Vec` and wrapped it, so a copied three-element list came
+back on the heap even though three elements fit in the box — and then allocated
+again on the next push. Built by pushing instead. Worth nothing on `tree`,
+which never copies a list, and worth an allocation each to every program that
+does.
+
+**The empty list, interned and reverted.** Two thirds of a tree's nodes are
+leaves, and a leaf's child list is empty, so a shared immortal empty list would
+have removed a third of the run's boxes. Copy-on-write makes it safe — every
+in-place operation on an empty list is a no-op, a panic, or goes through
+`cow_list`, which copies anything whose count is not exactly 1.
+
+It measured **67.1 ms against 63.3**, and 62.4 once the clone above was fixed —
+1.4%, for a shared mutable value. The reason is that it moves the cost rather
+than removing it: a leaf saves one box, and every *interior* node now pays a
+full `cow_list` clone on its first `push` where it used to push in place. The
+tree has 9,841 interior nodes to 19,683 leaves, so most of the saving is spent
+again immediately.
+
 **`dec`'s worklist, measured and reverted.** `dec` walks a structure
 iteratively with a `Vec` worklist, and that `Vec` is made fresh on every call —
 which reads like an allocation per value freed, on the path whose whole job is

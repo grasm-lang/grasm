@@ -2108,14 +2108,17 @@ unsafe fn cow_list(list: *mut RtVal) -> *mut RtVal {
     }
     let fresh = match &(*list).payload {
         RtPayload::List(items) => {
-            let cloned: Vec<*mut RtVal> = items
-                .iter()
-                .map(|&it| {
-                    inc(it);
-                    it
-                })
-                .collect();
-            alloc(RtPayload::List(cloned.into()))
+            // Built by pushing rather than collected into a `Vec` and then
+            // wrapped: collecting allocates, and wrapping keeps the result on
+            // the heap even when it would have fitted in the box. A
+            // copy-on-write clone of a three-element list was losing its
+            // inline storage and allocating again on the next push.
+            let mut cloned = ListData::new();
+            for &it in items.iter() {
+                inc(it);
+                cloned.push(it);
+            }
+            alloc(RtPayload::List(cloned))
         }
         // A scalar list clones as one memcpy: no per-element refcounts exist.
         RtPayload::ListScalar { kind, data } => alloc(RtPayload::ListScalar {
