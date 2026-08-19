@@ -19,11 +19,11 @@ the scorecard takes the best of five runs and subtracts the process floor.
 | # | Goal | Target | Measured | |
 |---|---|---|---|---|
 | G1 | Time for a Go/TS dev to ship a real service | ≤ 1 week | — | **unmeasurable without users** |
-| G2 | Geomean vs Rust | ≥ 0.95× | 4 of 7 programs at or above; `wordfreq` 2.5× behind | **partly met** |
-| G3 | Frontend throughput | ≥ 500k LOC/s | **571k** | **met** |
+| G2 | Geomean vs Rust | ≥ 0.95× | **0.40×** — 0 of 7 programs at or above; geomean 2.49× behind, 2.92× with the harness floor subtracted | **missed, and by more than this row used to say** |
+| G3 | Frontend throughput | ≥ 500k LOC/s | **535–547k** across consecutive runs on one machine | **met** |
 | G3 | Incremental edit-to-diagnostic | ≤ 50 ms | — | **not built** — there is no query engine |
-| G4 | Safe-subset guarantees | 100% | 204 programs identical across three engines, 204 leak-free, row and FFI soundness fuzzers clean | **strongest area** |
-| G5 | Hello-world static binary | ≤ 300 KB | 328 KB | **missed by 9%** |
+| G4 | Safe-subset guarantees | 100% | 218 programs identical across three engines, 218 leak-free, 27 agreeing on panic messages, 31 whole programs, nine fuzzers clean | **strongest area** |
+| G5 | Hello-world static binary | ≤ 300 KB | 328 KB | **missed by 9%** — and unchanged after a session that added `bytes`, UDP, processes, pipelines, radix conversion and pointer FFI |
 | G6 | Structured, uncolored concurrency | 1M+ tasks/node | `net_wait` gives concurrent I/O on one thread ([L-LIB-NET]); `spawn` is still single-core ([E-NOT-PARALLEL]) and `par_map` still refuses every effect | **partly met** |
 | G7 | Capability-sandboxed dependencies | 100% | the supply-chain benchmark's tamper is refused as `performs [io] permits []` | **met, for what exists** |
 | G8 | Production failure → deterministic replay | ≥ 99% | — | **not built** |
@@ -31,6 +31,33 @@ the scorecard takes the best of five runs and subtracts the process floor.
 | G10 | Adoption | ≥ 500 companies | zero — nobody outside this repository has run a Grasm program | **not started** |
 | G11 | Tokens vs Python | ≤ 1.00× | **1.04×** | **4% over** |
 | G11 | Tokens vs Go | ≤ 0.60× | **0.61×** | **2% over** |
+
+### G2 moved because the measurement was wrong, not the compiler
+
+This row used to read "4 of 7 programs at or above" Rust. That was an artifact.
+`bench.sh` was adding a constant 21 ms to every cell (ProjectGold F27), and a
+constant added to every measurement compresses every ratio toward 1 — so a
+5 ms program and a 10 ms program read as 26 and 31, which is "at or above" if
+you squint. With the timer fixed, **no program is at or above Rust** and the
+geometric mean is 2.49× behind, or 2.92× once the harness's own 2 ms floor is
+taken out of both sides.
+
+Nothing got slower. Every performance change this session moved a number the
+right way — `wordfreq` 117 → 53 ms, `tree` 175 → 97, `sieve` 17 → 15. The
+scorecard was simply reporting a flattering error, and it reported it here
+because it read it from the benchmark.
+
+That is the third place the same 21 ms turned up: two published tables and this
+row. A wrong measurement does not stay where it was made.
+
+Two smaller rows were stale in the same way — recorded once and never
+re-read. G3 said 571k LOC/s where `scripts/northstar.sh` printed 547k and then 535k on
+the very next run — so it is recorded as the range it is rather than as
+whichever number was on screen when somebody wrote the row. And
+G5 said 328 KB, which is what the script prints, against the 329 KB a manual
+`ls` gives for the same binary. Both now say what the gate says, because a
+scorecard that disagrees with its own gate is the same defect as a gate that
+does not run.
 
 ## What the numbers say
 
