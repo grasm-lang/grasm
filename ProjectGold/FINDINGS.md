@@ -392,6 +392,41 @@ available. A test asserts that: `run`, `send`, `open`, `close`, `read`, `write`,
 `start`, `stop`, `wait`, `execute` and twenty more must never appear in the
 builtin list.
 
+## Mutation testing — the whole tally
+
+Seven deliberate defects, each the smallest wrong thing its function could be,
+with `difftest.sh` as the oracle.
+
+**Caught, no action needed**
+
+* map iteration order reversed — [E-MAP-ORDER]'s program sees it at once
+* `to_base`'s digit table wrong above 9 — decimal unaffected, hex changes, and
+  a program checks hex
+
+**Genuine holes, found and fixed**
+
+* a list index accepted at exactly `len` (F29)
+* `code_at` accepted at exactly `len` (F30)
+
+**Survived, and were not holes** — three of the four survivors
+
+* the boxed-list bounds check: the backend emits its own inline check first
+* `char_at` one past the end: `grasm_str_code_at` bounds-checks before calling it
+* `substr`'s end clamp: `byte_at(n + 1)` answers `None` and falls back to the
+  string's length, so clamping one further gives the identical answer
+
+**Three quarters of the survivors were equivalent mutants**, which is the
+result worth keeping. This runtime checks the same thing at more than one
+depth, so a mutation in an inner check is invisible *by construction* — not
+because a gate is missing. Every one of those three would have gone into this
+file as a coverage hole if "no gate noticed" had been treated as sufficient.
+
+So the method has two rules, both learned the hard way here: mutate the
+**outermost** decision on a path, and prove a survivor is **observable** before
+believing it. Both real holes were the same shape — the first index that is out
+of range — and both conformance programs tested well past the end instead of
+just past it.
+
 ## F30 — `code_at` panics out of range, and nothing tested that (S2, tests) — **fixed**
 
 Found by the second round of mutation testing. `[L-LIB-CODES]` says
