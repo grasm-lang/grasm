@@ -472,6 +472,27 @@ one boxed value per node. Closing that needs unboxed struct storage in lists —
 what `ListScalar` does for integers, done for a struct type — which is a
 larger change than either of the two above.
 
+**The allocator was the cost, not the copying.** Taking `wordfreq` apart said
+so: `s + t` in a loop, six bytes of text, cost 45 ns an iteration, which is a
+`malloc` and a `free` and almost nothing else. With a literal on one side it
+was 78 ns, because the literal was boxed and freed too.
+
+Every `RtVal` is the same 64 bytes, so a freed one is exactly what the next
+allocation wants. Freed boxes now go on a thread-local chain — threaded through
+the `rc` field of a box whose payload has already been dropped — and an
+allocation pops one instead of asking the system.
+
+    tree       73.8 -> 63.1 ms
+    wordfreq   54.7 -> 49.2 ms
+    s + "lit"  40.3 -> 30.2 ms per 400k
+
+The cap is what decides whether this pays. At 8192 boxes `tree` got **worse** —
+82.7 against 73.8 — because its working set is about 60,000 boxes, so nearly
+every free overflowed the cap and paid the allocator anyway *plus* the pool's
+own bookkeeping. At 65536 it recycles the whole tree; at 262144 nothing further
+happens. Four megabytes held, and the first measurement of the idea was a
+regression caused entirely by a constant.
+
 **The layout argument is now checked.**
 
     const _: () = assert!(std::mem::size_of::<RtVal>() == 64);

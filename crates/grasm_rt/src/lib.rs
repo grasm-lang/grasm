@@ -1078,15 +1078,102 @@ pub struct RtVal {
 /// so. Now the build says so.
 const _: () = assert!(std::mem::size_of::<RtVal>() == 64);
 
+/// Boxes that have been freed and are waiting to be used again.
+///
+/// Every `RtVal` is the same 64 bytes, so a freed one is exactly what the next
+/// allocation wants and handing it back is a pointer pop. Measurement said
+/// this was worth doing: a string concatenation is an allocation, a memcpy and
+/// a free, and the memcpy is not what it costs — `s + t` in a loop took 45 ns
+/// an iteration for six bytes of text, which is the allocator's round trip and
+/// almost nothing else.
+///
+/// The chain runs through the `rc` field of a freed box, whose payload has
+/// already been dropped and whose memory is otherwise uninitialised.
+struct Pool {
+    head: Cell<*mut RtVal>,
+    n: Cell<usize>,
+}
+
+/// Capped so a program that frees a million values at once does not hold the
+/// memory for all of them. Past the cap a free goes back to the allocator.
+const POOL_CAP: usize = 65536;
+
+impl Drop for Pool {
+    /// The thread is ending, so its cached boxes go back to the allocator
+    /// rather than leaking. They may have been allocated on another thread —
+    /// a value built by `spawn` and released by the parent lands here — which
+    /// the global allocator allows.
+    fn drop(&mut self) {
+        let mut cur = self.head.get();
+        while !cur.is_null() {
+            let next = unsafe { (*cur).rc.get() as usize as *mut RtVal };
+            drop(unsafe { Box::from_raw(cur as *mut std::mem::MaybeUninit<RtVal>) });
+            cur = next;
+        }
+    }
+}
+
+thread_local! {
+    static POOL: Pool = const {
+        Pool {
+            head: Cell::new(std::ptr::null_mut()),
+            n: Cell::new(0),
+        }
+    };
+}
+
+/// Sixty-four bytes to put an `RtVal` in, recycled if one is going spare.
+fn take_box() -> *mut RtVal {
+    POOL.with(|pool| {
+        let head = pool.head.get();
+        if head.is_null() {
+            let fresh: Box<std::mem::MaybeUninit<RtVal>> =
+                Box::new(std::mem::MaybeUninit::uninit());
+            Box::into_raw(fresh) as *mut RtVal
+        } else {
+            // Safety: a box on the chain has a dropped payload and holds its
+            // successor in `rc`.
+            let next = unsafe { (*head).rc.get() as usize as *mut RtVal };
+            pool.head.set(next);
+            pool.n.set(pool.n.get() - 1);
+            head
+        }
+    })
+}
+
+/// Drops what a box holds and keeps the box.
+///
+/// # Safety: `p` was allocated here, its refcount has reached zero, and
+/// nothing points at it any more.
+unsafe fn give_box(p: *mut RtVal) {
+    std::ptr::drop_in_place(&mut (*p).payload);
+    POOL.with(|pool| {
+        if pool.n.get() >= POOL_CAP {
+            drop(Box::from_raw(p as *mut std::mem::MaybeUninit<RtVal>));
+            return;
+        }
+        (*p).rc.set(pool.head.get() as usize as i64);
+        pool.head.set(p);
+        pool.n.set(pool.n.get() + 1);
+    })
+}
+
 fn alloc(payload: RtPayload) -> *mut RtVal {
     LIVE.with(|n| n.set(n.get() + 1));
     // Inside a region the value is arena-owned: no reference counting, and the
     // whole set is freed at the closing brace ([T-REGION]).
     let in_region = REGIONS.with(|r| !r.borrow().is_empty());
-    let p = Box::into_raw(Box::new(RtVal {
-        rc: Cell::new(if in_region { ARENA } else { 1 }),
-        payload,
-    }));
+    let p = take_box();
+    // Safety: `take_box` returns storage for exactly one `RtVal`, uninitialised.
+    unsafe {
+        std::ptr::write(
+            p,
+            RtVal {
+                rc: Cell::new(if in_region { ARENA } else { 1 }),
+                payload,
+            },
+        );
+    }
     if in_region {
         REGIONS.with(|r| {
             if let Some(top) = r.borrow_mut().last_mut() {
@@ -1249,7 +1336,7 @@ pub unsafe extern "C" fn grasm_region_pop() {
             dec(c);
         }
         LIVE.with(|n| n.set(n.get() - 1));
-        drop(Box::from_raw(p));
+        give_box(p);
     }
 }
 
@@ -1320,8 +1407,9 @@ unsafe fn dec(v: *mut RtVal) {
                 rc.set(rc.get() - 1);
                 if rc.get() <= 0 {
                     LIVE.with(|n| n.set(n.get() - 1));
-                    let boxed = Box::from_raw(cur);
-                    match &boxed.payload {
+                    // The children are read out *before* the payload is
+                    // dropped; the box itself goes back to the pool.
+                    match &(*cur).payload {
                         RtPayload::List(items) | RtPayload::Tuple(items) => {
                             pending.extend(items.iter().copied());
                         }
@@ -1341,6 +1429,7 @@ unsafe fn dec(v: *mut RtVal) {
                         }
                         _ => {}
                     }
+                    give_box(cur);
                 }
             }
         }

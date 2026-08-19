@@ -720,10 +720,38 @@ fn main() {
 ```grasm
 //! tag: E-INDEX-BOUNDS
 //! expect: panic
-//! index 5 out of bounds (len 2)
-fn main() {
-    let xs = [1, 2]
-    print("{xs[5]}")
+//! last of a scalar list: 3
+//! last of a boxed list: b
+//! a negative index is out of bounds, not counted from the end: true
+//! index 3 out of bounds (len 3)
+// Indexing past the end panics, and the interesting index is the *first* one
+// past it.
+//
+// This program used to read `xs[5]` on a list of two, which is past the end by
+// three and tests nothing an off-by-one would break. Changing the check from
+// `i >= len` to `i > len` — so `xs[len]` reads one element beyond the last —
+// left every gate in this repository green: 218 differential programs, the
+// leak check, 31 whole programs and this suite. A bounds check is exactly the
+// place where only the boundary is worth testing.
+//
+// Both representations are covered: a `[i64]` is stored unboxed and a `[str]`
+// is a list of pointers, and they are two different index paths in the
+// runtime.
+fn main() / {io} {
+    let xs = [1, 2, 3]
+    let ss = ["a", "b"]
+
+    // The last valid index of each, which must *not* panic.
+    print("last of a scalar list: {xs[xs.len() - 1]}")
+    print("last of a boxed list: {ss[ss.len() - 1]}")
+
+    // One before the beginning. There is no wrapping: a negative index is out
+    // of bounds rather than counting from the end, which `get` reports as
+    // `None` and indexing reports as a panic.
+    print("a negative index is out of bounds, not counted from the end: {xs.get(0 - 1) == None}")
+
+    // Exactly one past the end — the case an off-by-one lets through.
+    print("{xs[xs.len()]}")
 }
 ```
 
@@ -784,18 +812,54 @@ fn main() {
 //! tag: E-INOUT-WRITEBACK
 //! expect: output
 //! 3 [1, 2]
+//! 2 [2, 2, 9] a! 3.0 true
 fn bump(inout n: i64) {
     n += 1
 }
 fn add(inout xs: [i64], v: i64) {
     xs.push(v)
 }
+
+// The argument may name a *place* rather than a binding of its own
+// ([T-INOUT-PLACE]), and the write-back has to land back in that place. A
+// place holds a boxed value where an `inout` parameter is a pointer to a slot
+// of the callee's own type, so the two have to meet: passing the box straight
+// through, the compiled engine incremented its *address* and wrote the result
+// into the field, and reading the field back said `unbox: not an i64` for a
+// program `grasm run` answered. Every scalar type is here because the
+// conversion is per type, and a nested field and a list element because the
+// path is walked twice — once to read, once to write.
+type Inner = { v: i64 }
+type Outer = { i: Inner, xs: [i64], s: str, f: f64, b: bool }
+
+fn app(inout s: str) {
+    s = s + "!"
+}
+fn scale(inout x: f64) {
+    x = x * 2.0
+}
+fn flip(inout b: bool) {
+    b = not b
+}
+fn addall(inout xs: [i64]) {
+    xs.push(9)
+}
+
 fn main() {
     var n = 2
     bump(n)
     var xs = [1]
     add(xs, 2)
     print("{n} {xs}")
+
+    var o = Outer{ i: Inner{ v: 1 }, xs: [1, 2], s: "a", f: 1.5, b: false }
+    bump(o.i.v)
+    bump(o.xs[0])
+    app(o.s)
+    scale(o.f)
+    flip(o.b)
+    addall(o.xs)
+    print("{o.i.v} {o.xs} {o.s} {o.f} {o.b}")
 }
 ```
 
@@ -2892,7 +2956,7 @@ fn hex(v: i64) -> str {
 
 ```grasm
 //! tag: L-LIB-BYTES
-//! expect: output
+//! expect: panic
 //! 0x48c7c001000000
 //! 7 bytes, first 72, third 192
 //! 0x48c7c0 and 0x48c7ff
@@ -2901,6 +2965,8 @@ fn hex(v: i64) -> str {
 //! round trip: héllo
 //! written and read back identically: true
 //! empty is empty, seven bytes are not: true false
+//! last byte and last slice: 0 0x00
+//! index 7 out of bounds (len 7)
 // `bytes` is the type `str` deliberately is not ([L-LIB-BYTES]).
 //
 // The sequence below is x86-64 `mov rax, 1`. Written through a `str` it lands
@@ -2934,6 +3000,12 @@ fn main() / {io} {
     // it widened `icmp`'s answer to the width it already had, which Cranelift
     // rejects, so every `b.is_empty()` in the language was a "codegen bug".
     print("empty is empty, seven bytes are not: {bytes_of([]).is_empty()} {code.is_empty()}")
+
+    // `at` and `slice` are specified to panic out of range, and the index
+    // worth testing is the first one that is. The last byte and the last
+    // one-byte slice must work; one past must not.
+    print("last byte and last slice: {code.at(code.len() - 1)} {code.slice(code.len() - 1, 1)}")
+    print("{code.at(code.len())}")
 }
 ```
 
@@ -3004,13 +3076,15 @@ fn main() {
 
 ```grasm
 //! tag: L-LIB-CODES
-//! expect: output
+//! expect: panic
 //! 104 233
 //! [104, 233, 108, 108, 111]
 //! hé
 //! héllo
 //! 615042
 //! non-bytes: 1 [8364]
+//! last code point: 111
+//! code_at 5 out of bounds (len 5)
 fn main() {
     // Code points, counted in characters — `é` is one character, two bytes.
     print("{"héllo".code_at(0)} {"héllo".code_at(1)}")
@@ -3027,6 +3101,15 @@ fn main() {
     print("{hash("grasm")}")
     // Characters outside ASCII are one code point, not their byte count.
     print("non-bytes: {"€".len()} {"€".codes()}")
+
+    // The clause says `code_at` panics out of range, and the index worth
+    // testing is the first one that is: exactly `len`. Nothing here tested it,
+    // and changing the check from `i >= n` to `i > n` left every gate green
+    // while the compiled build read past the end of the string and died with
+    // SIGABRT where `grasm run` panicked. Reading one character too far is the
+    // only mistake a bounds check can make.
+    print("last code point: {"héllo".code_at("héllo".len() - 1)}")
+    print("{"héllo".code_at("héllo".len())}")
 }
 
 /// A string hash, which cannot be written without code points at all.
@@ -3724,11 +3807,13 @@ fn main() {
 
 ```grasm
 //! tag: L-LIB-REMOVE
-//! expect: output
+//! expect: panic
 //! 10 30 [20, 40]
 //! b [a, c]
 //! x 1
 //! [3, 1, 2]
+//! the last element can be removed: 2
+//! remove 1 out of bounds (len 1)
 // Taking an element out by index, which is what draining a queue from the
 // front needs.
 type Job = { id: i64, name: str }
@@ -3754,6 +3839,16 @@ fn main() {
         order.push(ready.remove(0))
     }
     print("{order}")
+
+    // The clause says `remove` panics out of range "like indexing", and the
+    // index worth testing is the first one that is: exactly `len`. Removing
+    // the *last* element must work, and removing one past it must not — the
+    // pair is the whole of what a bounds check can get wrong.
+    var last = [1, 2]
+    let two = last.remove(last.len() - 1)
+    print("the last element can be removed: {two}")
+    let _gone = last.remove(last.len())
+    print("unreachable {_gone}")
 }
 ```
 
@@ -5466,6 +5561,9 @@ fn main() {
 //! 8
 //! 12
 //! 10 15
+//! held in a struct, a map and a tuple: 8 12 15
+//! returned from a function, and one built from another: 7 2
+//! captured by value, so a later write is not seen: 1
 //! -3 -1
 fn double(n: i64) -> i64 {
     n * 2
@@ -5473,6 +5571,16 @@ fn double(n: i64) -> i64 {
 
 fn triple(n: i64) -> i64 {
     n * 3
+}
+
+type Holder = { f: fn(i64) -> i64 }
+
+fn adder(k: i64) -> fn(i64) -> i64 {
+    |x| x + k
+}
+
+fn compose(f: fn(i64) -> i64) -> fn(i64) -> i64 {
+    |x| f(f(x))
 }
 
 fn main() {
@@ -5491,6 +5599,30 @@ fn main() {
         out = out + "{stage(5)} "
     }
     print(out.trim())
+
+    // One representation means a function value goes anywhere a value goes,
+    // not only into a list.
+    let boxed = Holder{ f: double }
+    var table: Map[str, fn(i64) -> i64] = map()
+    table.set("t", triple)
+    let pair = (triple, 0)
+    let from_map = table.get("t") ?? double
+    let from_pair = pair.0
+    print("held in a struct, a map and a tuple: {boxed.f(4)} {from_map(4)} {from_pair(5)}")
+
+    // A closure made by a function outlives the call that made it, and one
+    // closure may capture another.
+    let plus3 = adder(3)
+    let twice_plus1 = compose(adder(1))
+    print("returned from a function, and one built from another: {plus3(4)} {twice_plus1(0)}")
+
+    // Capture is by value and at the moment of creation, so a later write to
+    // the binding is not seen — the rule [E-CLOSURE-CAPTURE] states for a
+    // handler's operations, holding for an ordinary closure too.
+    var seen = 1
+    let snapshot = |x| x + seen
+    seen = 100
+    print("captured by value, so a later write is not seen: {snapshot(0)}")
 
     // Negative literals are written directly — no need for `0 - n`.
     let below = -3
@@ -6786,6 +6918,8 @@ fn main() {
 //! tag: T-REGION-FOREIGN
 //! expect: error
 //! cannot perform effect `Audit.record` inside a region
+//! cannot call `via_helper` inside a region — it performs `Audit`
+//! a function value cannot be used inside a region
 // Whose code runs inside the region, not just what the region's own text says.
 //
 // The handler is written outside and captures a reference. Calling the effect
@@ -6798,6 +6932,14 @@ effect Audit {
     fn record(e: str)
 }
 
+/// The same reach, one hop further away. Every one of these rules was written
+/// first against the syntax between the braces, and a one-line wrapper walked
+/// through it — so the rule is about what a call can *reach*, and a helper
+/// that performs the effect is refused exactly as the direct call is.
+fn via_helper(e: str) / {Audit} {
+    Audit.record(e)
+}
+
 fn main() {
     let sink = ref(Sink{ lines: [] })
     with Audit handled_by AuditHandler{ record: |e| sink.lines.push(e) } {
@@ -6805,7 +6947,21 @@ fn main() {
             let made = "inside"
             Audit.record(made)
         }
+        region {
+            via_helper("through a wrapper")
+        }
     }
+
+    // A closure carries its captures, so calling one written outside runs
+    // outside code with the region open — however indirectly it is reached.
+    // Taking it out of a container first is the spelling that walked past the
+    // rule when the rule named bindings instead of values.
+    let keepers: [fn(str) -> i64] = [|e| e.len()]
+    region {
+        let f = keepers[0]
+        let _n = f("carried")
+    }
+
     print("{sink.lines.len()}")
 }
 ```
