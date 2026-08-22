@@ -1445,6 +1445,8 @@ fn main() {
 //! [5, 8, 9, 4]
 //! true
 //! true
+//! true
+//! true
 fn main() {
     // Survivors come back in input order, not completion order.
     print("{[5, 2, 8, 1, 9, 4].par_filter(|x| x > 3)}")
@@ -1458,6 +1460,16 @@ fn main() {
 
     let none: [i64] = []
     print("{none.par_filter(|x| x > 0).is_empty()}")
+
+    // The same promise where the elements and the captures are *boxed*. A
+    // survivor is a new reference to a value the input list still holds, so
+    // this is also where a miscounted reference would show up as a leak or a
+    // double free rather than as a wrong answer.
+    let texts = xs.map(|x| "t{x % 331}")
+    print("{texts.par_filter(|s| s.len() > 3) == texts.filter(|s| s.len() > 3)}")
+
+    let want = "t7"
+    print("{texts.par_filter(|s| s == want) == texts.filter(|s| s == want)}")
 }
 ```
 
@@ -1469,6 +1481,12 @@ fn main() {
 //! true
 //! [1, 4, 9, 16, 25]
 //! true
+//! true
+//! true
+//! true
+//! P{a: 9, b: v4}
+type P = { a: i64, b: str }
+
 fn main() {
     // Enough elements to cross the threshold where workers are used, so this
     // exercises the threaded path rather than the sequential fallback.
@@ -1483,6 +1501,23 @@ fn main() {
 
     let none: [i64] = []
     print("{none.par_map(|x| x + 1).is_empty()}")
+
+    // The same promise where the elements, the captures or the results are
+    // *boxed*. These ran sequentially until the reference count became
+    // atomic — which is invisible to a program by this clause, and is exactly
+    // why the clause is written about the answer rather than about threads.
+    let texts = xs.par_map(|x| "n{x % 13}")
+    print("{texts == xs.map(|x| "n{x % 13}")}")
+
+    // A boxed capture: every worker reads the same value.
+    let tag = "-t"
+    print("{texts.par_map(|s| s + tag) == texts.map(|s| s + tag)}")
+
+    // Boxed in, scalar out.
+    print("{texts.par_map(|s| s.len()) == texts.map(|s| s.len())}")
+
+    let ps = xs.par_map(|x| P{ a: x, b: "v{x % 5}" })
+    print("{ps[9]}")
 }
 ```
 

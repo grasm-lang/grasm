@@ -775,7 +775,9 @@ impl<'m> Codegen<'m> {
             ("grasm_list_pin", vec![i64t, i64t, ptr, ptr], Some(i64t)),
             ("grasm_panic_index", vec![i64t, i64t], None),
             ("grasm_par_map_scalar", vec![i64t, ptr, ptr, i64t, i64t], Some(i64t)),
+            ("grasm_par_map_mixed", vec![i64t, ptr, ptr, i64t, i64t, i64t], Some(i64t)),
             ("grasm_par_filter_scalar", vec![i64t, ptr, ptr, i64t], Some(i64t)),
+            ("grasm_par_filter_boxed", vec![i64t, ptr, ptr, i64t], Some(i64t)),
         ];
         for (name, params, ret) in decls {
             let mut sig = self.module.make_signature();
@@ -1951,15 +1953,24 @@ to one — a loop variable or a list element is this case",
                 ps[0],
                 (i * 8) as i32,
             );
-            let v = fcx.scalar_of_bits(bits, vt);
+            let v = fcx.bits_to_value(bits, vt);
             let var = fcx.new_var(vt);
             fcx.b.def_var(var, v);
             fcx.bind(name, var, vt.clone());
+            // A boxed capture is *borrowed*: the caller holds it for the whole
+            // of the parallel call, and every worker reads the same pointer.
+            // The scope decs at the end of this body would release one
+            // reference per element, so one is taken per element here. This is
+            // the traffic that made the count have to be atomic.
+            fcx.inc_if_boxed(v, vt);
         }
-        let x = fcx.scalar_of_bits(ps[1], &c.param_t);
+        let x = fcx.bits_to_value(ps[1], &c.param_t);
         let pvar = fcx.new_var(&c.param_t);
         fcx.b.def_var(pvar, x);
         fcx.bind(&c.param, pvar, c.param_t.clone());
+        // As above: the element belongs to the input list, which outlives the
+        // call, so this body borrows it and balances its own release.
+        fcx.inc_if_boxed(x, &c.param_t);
 
         let val = fcx.eval_expr(&c.body)?;
         let Some((mut r, rt)) = val else {
@@ -1968,7 +1979,7 @@ to one — a loop variable or a list element is this case",
         if c.ret == VType::F64 && rt == VType::I64 {
             r = fcx.b.ins().fcvt_from_sint(types::F64, r);
         }
-        let bits = fcx.scalar_bits_of(r, &c.ret);
+        let bits = fcx.value_to_bits(r, &c.ret);
         fcx.emit_scope_decs_all();
         if !fcx.is_filled() {
             fcx.b.ins().return_(&[bits]);
@@ -11059,10 +11070,16 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
             return self.emit_list_transform(list, elem_t, param, body, true);
         };
 
-        let elems_inline = scalar_kind_i64(elem_t).is_some();
-        let out_inline = scalar_kind_i64(&out_t).is_some();
-        let caps_inline = captures.iter().all(|(_, t)| scalar_kind_i64(t).is_some());
-        if !(elems_inline && out_inline && caps_inline) || body_can_fail(body) {
+        // A word or a pointer: either crosses a thread as eight bytes. Boxed
+        // elements were refused here until the reference count became atomic,
+        // which is the only thing that made a worker touching one unsafe.
+        let ok = |t: &VType| scalar_kind_i64(t).is_some() || t.boxed();
+        let all_scalar = scalar_kind_i64(elem_t).is_some()
+            && scalar_kind_i64(&out_t).is_some()
+            && captures.iter().all(|(_, t)| scalar_kind_i64(t).is_some());
+        if !(ok(elem_t) && ok(&out_t) && captures.iter().all(|(_, t)| ok(t)))
+            || body_can_fail(body)
+        {
             // Not parallelizable with this representation; the sequential
             // lowering produces the same list.
             return self.emit_list_transform(list, elem_t, param, body, true);
@@ -11110,20 +11127,40 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
         for (i, (name, vt)) in captures.iter().enumerate() {
             let (var, _) = self.lookup(name).expect("capture resolved above");
             let v = self.b.use_var(var);
-            let bits = self.scalar_bits_of(v, vt);
+            let bits = self.value_to_bits(v, vt);
             self.b.ins().stack_store(bits, slot, (i * 8) as i32);
         }
         let env_ptr = self.b.ins().stack_addr(ptr_ty, slot, 0);
         let fref = self.cg.module.declare_func_in_func(id, self.b.func);
         let code = self.b.ins().func_addr(ptr_ty, fref);
         let env_len = self.b.ins().iconst(types::I64, captures.len() as i64);
-        let out_kind = self
-            .b
-            .ins()
-            .iconst(types::I64, scalar_kind_i64(&out_t).expect("checked above"));
-        let out = self
-            .call_rt("grasm_par_map_scalar", &[list, code, env_ptr, env_len, out_kind])
-            .unwrap();
+        let out = if all_scalar {
+            let out_kind = self
+                .b
+                .ins()
+                .iconst(types::I64, scalar_kind_i64(&out_t).expect("checked above"));
+            self.call_rt(
+                "grasm_par_map_scalar",
+                &[list, code, env_ptr, env_len, out_kind],
+            )
+            .unwrap()
+        } else {
+            // Both representations are the compiler's to state: they follow
+            // the static type, and a boxed list of integers exists.
+            let in_boxed = self
+                .b
+                .ins()
+                .iconst(types::I64, i64::from(elem_t.boxed()));
+            let out_kind = self
+                .b
+                .ins()
+                .iconst(types::I64, scalar_kind_i64(&out_t).unwrap_or(-1));
+            self.call_rt(
+                "grasm_par_map_mixed",
+                &[list, code, env_ptr, env_len, in_boxed, out_kind],
+            )
+            .unwrap()
+        };
         self.call_rt("grasm_val_dec", &[list]);
         Ok((out, VType::List(Box::new(out_t))))
     }
@@ -11144,9 +11181,12 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
         span: Span,
     ) -> CResult<(Value, VType)> {
         let captures = self.closure_captures(std::slice::from_ref(param), body);
+        // As in `par_map`: a word or a pointer, either crosses a thread as
+        // eight bytes, and boxed elements stopped being unsafe when the
+        // reference count became atomic.
+        let ok = |t: &VType| scalar_kind_i64(t).is_some() || t.boxed();
         let elems_inline = scalar_kind_i64(elem_t).is_some();
-        let caps_inline = captures.iter().all(|(_, t)| scalar_kind_i64(t).is_some());
-        if !(elems_inline && caps_inline) || body_can_fail(body) {
+        if !(ok(elem_t) && captures.iter().all(|(_, t)| ok(t))) || body_can_fail(body) {
             return self.emit_list_transform(list, elem_t, param, body, false);
         }
 
@@ -11190,7 +11230,7 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
         for (i, (name, vt)) in captures.iter().enumerate() {
             let (var, _) = self.lookup(name).expect("capture resolved above");
             let v = self.b.use_var(var);
-            let bits = self.scalar_bits_of(v, vt);
+            let bits = self.value_to_bits(v, vt);
             self.b.ins().stack_store(bits, slot, (i * 8) as i32);
         }
         let env_ptr = self.b.ins().stack_addr(ptr_ty, slot, 0);
@@ -11198,7 +11238,14 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
         let code = self.b.ins().func_addr(ptr_ty, fref);
         let env_len = self.b.ins().iconst(types::I64, captures.len() as i64);
         let out = self
-            .call_rt("grasm_par_filter_scalar", &[list, code, env_ptr, env_len])
+            .call_rt(
+                if elems_inline {
+                    "grasm_par_filter_scalar"
+                } else {
+                    "grasm_par_filter_boxed"
+                },
+                &[list, code, env_ptr, env_len],
+            )
             .unwrap();
         self.call_rt("grasm_val_dec", &[list]);
         Ok((out, VType::List(Box::new(elem_t.clone()))))

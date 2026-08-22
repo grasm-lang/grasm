@@ -24,7 +24,7 @@ the scorecard takes the best of five runs and subtracts the process floor.
 | G3 | Incremental edit-to-diagnostic | ≤ 50 ms | — | **not built** — there is no query engine |
 | G4 | Safe-subset guarantees | 100% | 218 programs identical across three engines, 218 leak-free, 27 agreeing on panic messages, 31 whole programs, nine fuzzers clean | **strongest area** |
 | G5 | Hello-world static binary | ≤ 300 KB | 328 KB | **missed by 9%** — and unchanged after a session that added `bytes`, UDP, processes, pipelines, radix conversion and pointer FFI |
-| G6 | Structured, uncolored concurrency | 1M+ tasks/node | `net_wait` gives concurrent I/O on one thread ([L-LIB-NET]); `spawn` is still single-core ([E-NOT-PARALLEL]) and `par_map` still refuses every effect | **partly met** |
+| G6 | Structured, uncolored concurrency | 1M+ tasks/node | `net_wait` gives concurrent I/O on one thread ([L-LIB-NET]); `par_map`/`par_filter` are multi-core over **boxed** values too — 3.68× on 8 cores over strings — but still refuse every effect, and `spawn` is still single-core ([E-NOT-PARALLEL]) | **partly met** |
 | G7 | Capability-sandboxed dependencies | 100% | the supply-chain benchmark's tamper is refused as `performs [io] permits []` | **met, for what exists** |
 | G8 | Production failure → deterministic replay | ≥ 99% | — | **not built** |
 | G9 | C ABI import overhead | zero-cost | `extern fn` takes `i64`, `f64`, `str` and `bytes` ([T-EXTERN-POINTER]), gated by `unsafe` and charged `io`; a pointer may not be *returned* | **met** |
@@ -512,8 +512,33 @@ that could not cross a thread, and exactly the kind of value a parallel worker
 would be handed. Single-threaded behaviour is identical: 218 identical, 218
 leak-free, 27 agreeing, 31 ProjectGold, clippy 0, `cargo test` green.
 
-This does not make `par_map` parallel over boxed values on its own. It removes
-the reason it could not be.
+**And then `par_map` and `par_filter` took it.** With the count atomic, a
+worker touching a boxed value is safe, so the fallback to sequential for
+anything that is not a machine word is gone. Elements, captures and results may
+all be boxed; a pointer crosses a thread as eight bytes exactly as a word does.
+
+    8,000 strings, ~200 concatenations each, 8 cores
+    map      128.5 ms
+    par_map   34.9 ms      3.68x
+
+The calling convention is what makes the counting come out right: the lifted
+body **borrows what it is handed and owns what it returns**. It increments the
+element and each boxed capture on entry, so the releases it makes on the way
+out balance, and the caller holds the input list for the whole call. That is
+the traffic that made the count have to be atomic in the first place.
+
+One counter needed moving. `LIVE` — what the leak checker reads — is
+thread-local, so that allocating stays a load and a store rather than an
+atomic. That is right until a value crosses a thread: a worker builds a string
+and the main thread frees it, so one counter goes up and the other goes down,
+and the check would report a leak of minus four. A worker folds its balance
+into a global `ESCAPED` once, as it ends, and the exit check adds the two. No
+cost on the allocation path.
+
+`[E-PAR-MAP-ORDER]` and `[E-PAR-FILTER-ORDER]` needed no change, which is the
+point of how they are written: they promise that the answer does not depend on
+how many cores ran it. A sequential fallback honoured that promise and so does
+this. Their conformance programs now carry the boxed cases.
 
 **A copy-on-write clone was losing its inline storage.** `cow_list` collected
 the elements into a `Vec` and wrapped it, so a copied three-element list came

@@ -1217,6 +1217,23 @@ thread_local! {
     static LIVE: Cell<i64> = const { Cell::new(0) };
 }
 
+/// What worker threads allocated and did not free themselves.
+///
+/// `LIVE` is per-thread so that allocating stays a load and a store rather than
+/// an atomic. That is right until a value crosses a thread — a `par_map` worker
+/// builds a string and the main thread frees it — at which point one counter
+/// goes up and the other goes down. A worker folds its balance in here when it
+/// finishes, once, and the exit check adds the two.
+static ESCAPED: AtomicI64 = AtomicI64::new(0);
+
+/// Called by a worker as it ends: its balance becomes everyone's.
+fn hand_back_live() {
+    let n = LIVE.with(|l| l.replace(0));
+    if n != 0 {
+        ESCAPED.fetch_add(n, Relaxed);
+    }
+}
+
 /// Prints a reference as the slot it names.
 ///
 /// Not the value it points at: the value may already be gone, and reading it
@@ -1267,7 +1284,12 @@ pub extern "C" fn grasm_check_leaks() {
             unsafe { dec(p) };
         }
     }
-    let live = LIVE.with(Cell::get);
+    // Allocations a worker thread made and handed back live in `ESCAPED`: the
+    // counter is per-thread so that the hot path stays a plain load and store,
+    // and a thread folds its balance in when it ends. A value built on a
+    // worker and freed here would otherwise take this count negative and
+    // report a leak of minus four.
+    let live = LIVE.with(Cell::get) + ESCAPED.load(Relaxed);
     if live == 0 {
         return;
     }
@@ -1653,6 +1675,27 @@ pub unsafe extern "C" fn grasm_par_map_scalar(
     } else {
         Vec::new()
     };
+    let out = par_words(words, code, &env_owned);
+    let kind = ScalarKind::from_i64(out_kind);
+    alloc(RtPayload::ListScalar {
+        kind,
+        data: ScalarData::from_words(kind, out),
+    })
+}
+
+/// Runs `code` over every word, on as many cores as there is work for.
+///
+/// Everything crossing a thread here is an `i64`, which is what makes this one
+/// function serve both kinds of `par_map`: a scalar list's elements *are*
+/// words, and a boxed list's elements are pointers, which are words too.
+///
+/// # Safety: `code` is a compiler-emitted function with this ABI, and `env`
+/// holds `env.len()` words it may read.
+unsafe fn par_words(
+    words: &[i64],
+    code: extern "C" fn(*const i64, i64) -> i64,
+    env_owned: &[i64],
+) -> Vec<i64> {
     let n = words.len();
     let mut out: Vec<i64> = vec![0; n];
 
@@ -1669,46 +1712,103 @@ pub unsafe extern "C" fn grasm_par_map_scalar(
         for (o, &x) in out.iter_mut().zip(words.iter()) {
             *o = code(env_owned.as_ptr(), x);
         }
-    } else {
-        // Hand out many small pieces from a shared queue rather than giving
-        // each worker one big slice. Elements are not equally expensive — a
-        // mandelbrot row in the middle of the set costs far more than one at
-        // the edge — and splitting statically means every worker waits for
-        // whichever got the expensive half. Dynamic hand-out keeps them all
-        // busy until the work is actually gone.
-        let chunk = n.div_ceil(workers * 16).max(1);
-        let input: &[i64] = words;
-        let pieces: std::sync::Mutex<Vec<(usize, &mut [i64])>> =
-            std::sync::Mutex::new(out.chunks_mut(chunk).enumerate().collect());
-        std::thread::scope(|scope| {
-            let queue = &pieces;
-            let env_ref = &env_owned;
-            let drain = move || {
-                IN_PARALLEL.with(|f| f.set(true));
-                loop {
-                    let Some((ci, slot)) = queue.lock().expect("no panics inside").pop() else {
-                        return;
-                    };
-                    let src = &input[ci * chunk..ci * chunk + slot.len()];
-                    for (o, &x) in slot.iter_mut().zip(src.iter()) {
-                        *o = code(env_ref.as_ptr(), x);
-                    }
-                }
-            };
-            for _ in 0..workers {
-                // A worker that cannot be created is not an error: the queue
-                // is hand-out, so whatever it would have taken is still there
-                // for someone else. The calling thread drains the remainder
-                // below, which is why this result can be dropped and why the
-                // answer is complete even if every spawn fails.
-                let _ = std::thread::Builder::new()
-                    .stack_size(WORKER_STACK)
-                    .spawn_scoped(scope, drain);
-            }
-            drain();
-        });
+        return out;
     }
+    // Hand out many small pieces from a shared queue rather than giving each
+    // worker one big slice. Elements are not equally expensive — a mandelbrot
+    // row in the middle of the set costs far more than one at the edge — and
+    // splitting statically means every worker waits for whichever got the
+    // expensive half. Dynamic hand-out keeps them all busy until the work is
+    // actually gone.
+    let chunk = n.div_ceil(workers * 16).max(1);
+    let input: &[i64] = words;
+    let pieces: std::sync::Mutex<Vec<(usize, &mut [i64])>> =
+        std::sync::Mutex::new(out.chunks_mut(chunk).enumerate().collect());
+    std::thread::scope(|scope| {
+        let queue = &pieces;
+        let env_ref = env_owned;
+        let drain = move || {
+            IN_PARALLEL.with(|f| f.set(true));
+            loop {
+                let Some((ci, slot)) = queue.lock().expect("no panics inside").pop() else {
+                    return;
+                };
+                let src = &input[ci * chunk..ci * chunk + slot.len()];
+                for (o, &x) in slot.iter_mut().zip(src.iter()) {
+                    *o = code(env_ref.as_ptr(), x);
+                }
+            }
+        };
+        for _ in 0..workers {
+            // A worker that cannot be created is not an error: the queue is
+            // hand-out, so whatever it would have taken is still there for
+            // someone else. The calling thread drains the remainder below,
+            // which is why this result can be dropped and why the answer is
+            // complete even if every spawn fails.
+            let _ = std::thread::Builder::new()
+                .stack_size(WORKER_STACK)
+                .spawn_scoped(scope, move || {
+                    drain();
+                    // This thread is done, so what it allocated and handed
+                    // back stops being its business and starts being
+                    // everyone's.
+                    hand_back_live();
+                });
+        }
+        drain();
+    });
+    out
+}
 
+/// `par_map` where the elements or the results are boxed values.
+///
+/// The same machine as the scalar version — the elements are pointers, and a
+/// pointer is a word. What is new is that the workers now touch reference
+/// counts: the element and every captured value are shared between them, so
+/// this is only correct because `RtVal::rc` is atomic.
+///
+/// The lifted body *borrows* what it is handed and owns what it returns: it
+/// increments the element and each boxed capture on entry, so the releases it
+/// makes on the way out balance, and this function keeps its own reference to
+/// the input list for the whole call.
+///
+/// Both representations are told by the compiler rather than read off the
+/// value, because they follow the *static* type: `Map.values()` builds a boxed
+/// list even for integer elements, and a body compiled for `i64` wants the
+/// integer, not the box holding it. `out_kind` is -1 when the results are
+/// boxed.
+///
+/// # Safety: `list` is a live list; `code` and `env` are as above.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_par_map_mixed(
+    list: *mut RtVal,
+    code: extern "C" fn(*const i64, i64) -> i64,
+    env: *const i64,
+    env_len: i64,
+    in_boxed: i64,
+    out_kind: i64,
+) -> *mut RtVal {
+    let owned: Vec<i64> = if in_boxed != 0 {
+        let RtPayload::List(items) = &(*list).payload else {
+            grasm_panic_msg_str("par_map on a non-list");
+        };
+        items.iter().map(|&p| p as i64).collect()
+    } else {
+        scalar_words(list, "par_map")
+    };
+    let env_owned: Vec<i64> = if env_len > 0 {
+        std::slice::from_raw_parts(env, env_len as usize).to_vec()
+    } else {
+        Vec::new()
+    };
+    let out = par_words(&owned, code, &env_owned);
+    if out_kind < 0 {
+        let mut built = ListData::new();
+        for w in out {
+            built.push(w as *mut RtVal);
+        }
+        return alloc(RtPayload::List(built));
+    }
     let kind = ScalarKind::from_i64(out_kind);
     alloc(RtPayload::ListScalar {
         kind,
@@ -1898,6 +1998,45 @@ pub unsafe extern "C" fn grasm_par_filter_scalar(
         }
     }
     alloc(RtPayload::ListScalar { kind, data: out })
+}
+
+/// `par_filter` over a list of boxed elements.
+///
+/// The predicate half is the same machine as `par_map`'s: pointers are words,
+/// and the workers may touch reference counts because the count is atomic. The
+/// compaction is sequential and in input order, which is what makes the result
+/// independent of how many cores ran it.
+///
+/// A survivor is a *new* reference: it stays in the input list as well, and
+/// the caller releases that list when the call returns.
+///
+/// # Safety: `list` is a live boxed list; `code` and `env` are as in `par_map`.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_par_filter_boxed(
+    list: *mut RtVal,
+    code: extern "C" fn(*const i64, i64) -> i64,
+    env: *const i64,
+    env_len: i64,
+) -> *mut RtVal {
+    let RtPayload::List(items) = &(*list).payload else {
+        grasm_panic_msg_str("par_filter on a non-list");
+    };
+    let words: Vec<i64> = items.iter().map(|&p| p as i64).collect();
+    let env_owned: Vec<i64> = if env_len > 0 {
+        std::slice::from_raw_parts(env, env_len as usize).to_vec()
+    } else {
+        Vec::new()
+    };
+    let verdicts = par_words(&words, code, &env_owned);
+    let mut out = ListData::new();
+    for (&w, &k) in words.iter().zip(verdicts.iter()) {
+        if k != 0 {
+            let p = w as *mut RtVal;
+            inc(p);
+            out.push(p);
+        }
+    }
+    alloc(RtPayload::List(out))
 }
 
 // --- unboxed scalar lists ---
