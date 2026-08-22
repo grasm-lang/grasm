@@ -1,11 +1,15 @@
 // std::thread::scope — no external crates, so this stays comparable with the
 // others. (Rayon would be the idiomatic choice and is broadly similar.)
+//
+// The text is ASCII, so `len()` is the character count here as well as the
+// byte count, and every implementation in this set takes the O(1) answer its
+// own language gives.
 fn heavy(w: &str) -> String {
     let mut acc = String::from(w);
     for i in 0..200 {
-        acc.push_str(&(i % 7).to_string());
+        acc.push((b'0' + (i % 7) as u8) as char);
     }
-    format!("{}-{}", acc.chars().count(), w)
+    format!("{}-{}", acc.len(), w)
 }
 
 fn main() {
@@ -26,8 +30,8 @@ fn main() {
     });
     let mut h: i64 = 0;
     for s in &out {
-        for c in s.chars() {
-            h = (h * 131 + c as i64) % 1_000_000_007;
+        for b in s.bytes() {
+            h = (h * 131 + b as i64) % 1_000_000_007;
         }
     }
     println!("{h}");

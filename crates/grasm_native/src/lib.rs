@@ -580,6 +580,7 @@ impl<'m> Codegen<'m> {
             ("grasm_val_dec", vec![i64t], None),
             ("grasm_str_lit", vec![ptr, i64t], Some(i64t)),
             ("grasm_str_concat", vec![i64t, i64t], Some(i64t)),
+            ("grasm_str_append", vec![i64t, i64t], Some(i64t)),
             ("grasm_list_concat", vec![i64t, i64t], Some(i64t)),
             ("grasm_list_sort_by", vec![i64t, i64t], Some(i64t)),
             ("grasm_list_remove", vec![i64t, i64t, ptr], Some(i64t)),
@@ -4299,6 +4300,40 @@ impl FnCx<'_, '_> {
                 let Some((var, vt)) = self.lookup(&id.name) else {
                     return nope(id.span, "assignment to unknown variable");
                 };
+                // `acc = acc + piece` and `acc += piece` are the same
+                // statement, and both are the loop that builds a string. The
+                // variable's own reference is handed to the append rather than
+                // copied, so the accumulator grows in place instead of being
+                // copied whole every step.
+                if vt == VType::Str {
+                    let rhs = match (op, value) {
+                        (AssignOp::Add, v) => Some(v),
+                        (
+                            AssignOp::Assign,
+                            Expr::Binary {
+                                op: BinaryOp::Add,
+                                lhs,
+                                rhs,
+                                ..
+                            },
+                        ) if matches!(&**lhs, Expr::Ident(l) if l.name == id.name) => {
+                            Some(&**rhs)
+                        }
+                        _ => None,
+                    };
+                    if let Some(piece) = rhs {
+                        let (rv, rt) = self.eval_expr_val(piece)?;
+                        if rt != VType::Str {
+                            return nope(piece.span(), "adding a non-string to a string");
+                        }
+                        let old = self.b.use_var(var);
+                        let joined =
+                            self.call_rt("grasm_str_append", &[old, rv]).unwrap();
+                        self.call_rt("grasm_val_dec", &[rv]);
+                        self.b.def_var(var, joined);
+                        return Ok(StmtOut::Value(None));
+                    }
+                }
                 let (mut val, val_t) = self.eval_expr_val(value)?;
                 if vt == VType::F64 && val_t == VType::I64 {
                     val = self.b.ins().fcvt_from_sint(types::F64, val);
@@ -5370,8 +5405,11 @@ impl FnCx<'_, '_> {
             acc = Some(match acc {
                 None => part,
                 Some(prev) => {
-                    let joined = self.call_rt("grasm_str_concat", &[prev, part]).unwrap();
-                    self.call_rt("grasm_val_dec", &[prev]);
+                    // `prev` is this loop's own intermediate and nothing else
+                    // holds it, so it is handed over rather than copied:
+                    // `"{a}{b}{c}"` builds one string instead of one per
+                    // piece.
+                    let joined = self.call_rt("grasm_str_append", &[prev, part]).unwrap();
                     self.call_rt("grasm_val_dec", &[part]);
                     joined
                 }

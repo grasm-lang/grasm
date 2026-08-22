@@ -493,6 +493,32 @@ own bookkeeping. At 65536 it recycles the whole tree; at 262144 nothing further
 happens. Four megabytes held, and the first measurement of the idea was a
 regression caused entirely by a constant.
 
+**Building a string was quadratic, and it did not have to be.** Writing the
+`parwords` benchmark five times over is what found it: C came out at 8 ms
+against Grasm's 70, and the reason was not codegen. `acc = acc + piece` copied
+the whole accumulator every step, so a string built in a loop cost time
+proportional to the square of its length, while C — which makes you write the
+buffer yourself — was linear.
+
+`grasm_str_append` takes ownership of its left operand instead of borrowing it,
+so when the count is exactly 1 the text is appended in place and the same box
+comes back. A count of 1 is also what rules out `s = s + s`: two references to
+one box cannot both be the only one.
+
+The compiler hands over the variable's own reference for `acc += piece` and for
+`acc = acc + piece`, which are the same statement written two ways, and for the
+intermediate inside an interpolation — `"{a}{b}{c}"` built one string per piece
+before this and builds one string now.
+
+    parwords   69.7 -> 31.7 ms
+
+The benchmark's other four implementations were rewritten at the same time, and
+against this project's interest: Go was using `acc += piece`, which is
+quadratic in Go too and which no Go programmer would write — it now uses
+`strings.Builder`. Rust was allocating a `String` per digit and counting
+characters with an O(n) scan. A benchmark Grasm wins because the other
+implementations were written badly is worth nothing.
+
 **The price of atomic reference counting, measured.** "Parallelism needs
 atomic refcounting, and atomic refcounting is expensive" is the sentence that
 kept `par_map` restricted to machine words — the workers share nothing because

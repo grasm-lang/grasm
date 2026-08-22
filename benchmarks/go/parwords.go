@@ -4,15 +4,19 @@ import (
 	"fmt"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 )
 
+// strings.Builder, because `acc += piece` in a loop copies the accumulator
+// every step in Go and every Go programmer knows to reach for this instead.
 func heavy(w string) string {
-	acc := w
+	var acc strings.Builder
+	acc.WriteString(w)
 	for i := 0; i < 200; i++ {
-		acc += strconv.Itoa(i % 7)
+		acc.WriteByte(byte('0' + i%7))
 	}
-	return strconv.Itoa(len([]rune(acc))) + "-" + w
+	return strconv.Itoa(acc.Len()) + "-" + w
 }
 
 func main() {
@@ -45,8 +49,8 @@ func main() {
 	wg.Wait()
 	var h int64
 	for _, s := range out {
-		for _, c := range s {
-			h = (h*131 + int64(c)) % 1000000007
+		for i := 0; i < len(s); i++ {
+			h = (h*131 + int64(s[i])) % 1000000007
 		}
 	}
 	fmt.Println(h)

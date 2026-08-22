@@ -776,6 +776,43 @@ impl RtStr {
     }
 
     /// Two pieces joined, with no allocation at all when the result is short.
+    /// Appends to this string **in place**.
+    ///
+    /// Building text by `acc = acc + piece` copies the whole accumulator every
+    /// step, so a string built in a loop costs time proportional to the square
+    /// of its length. C does not, because C makes you write the buffer
+    /// yourself; the point of this is that the obvious Grasm loop should not
+    /// be quadratic either.
+    ///
+    /// Only reached when the caller has established that this value is the
+    /// *only* holder of the string, which is what makes mutating it invisible.
+    ///
+    /// The character index is thrown away: it described the old text.
+    fn push_str(&mut self, t: &str) {
+        self.index = std::sync::OnceLock::new();
+        let spill = match &mut self.s {
+            StrData::Inline { bytes, len } => {
+                let at = *len as usize;
+                if at + t.len() <= 15 {
+                    bytes[at..at + t.len()].copy_from_slice(t.as_bytes());
+                    *len = (at + t.len()) as u8;
+                    return;
+                }
+                // Doubling rather than exact: this is a loop, and the next
+                // call is going to ask for more.
+                let mut out = String::with_capacity(((at + t.len()) * 2).max(32));
+                out.push_str(std::str::from_utf8(&bytes[..at]).unwrap_or(""));
+                out.push_str(t);
+                out
+            }
+            StrData::Heap(h) => {
+                h.push_str(t);
+                return;
+            }
+        };
+        self.s = StrData::Heap(spill);
+    }
+
     pub fn concat(a: &str, b: &str) -> RtStr {
         let total = a.len() + b.len();
         let data = if total <= 15 {
@@ -1516,6 +1553,46 @@ pub unsafe extern "C" fn grasm_str_concat(a: *mut RtVal, b: *mut RtVal) -> *mut 
     // both pieces straight into the inline buffer. Concatenation is on the hot
     // path of every program that builds text.
     alloc(RtPayload::Str(RtStr::concat(sa, sb)))
+}
+
+/// `a + b` where `a` will not be used again: the result may reuse `a`'s box.
+///
+/// Ownership of `a` transfers here; `b` is borrowed. When `a` is the only
+/// holder of its string — which the caller arranges by handing over the
+/// reference it was keeping, rather than a copy of it — the text is appended
+/// in place and the same box comes back. Building a string in a loop is then
+/// linear rather than quadratic.
+///
+/// A count of exactly 1 is also what rules out `s = s + s`: two references to
+/// one box cannot both be the only one, so `a` and `b` are different values
+/// whenever the fast path is taken.
+///
+/// # Safety: both are live strings; `a`'s reference transfers to this call.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_append(a: *mut RtVal, b: *mut RtVal) -> *mut RtVal {
+    let (RtPayload::Str(_), RtPayload::Str(sb)) = (&(*a).payload, &(*b).payload) else {
+        grasm_panic_msg_str("concat on non-strings");
+    };
+    // Taken as a raw pointer and length: `a` and `b` are provably different
+    // boxes on this path, but the borrow checker cannot see that through raw
+    // pointers, and reborrowing after the mutable borrow starts would be the
+    // thing it is right to complain about.
+    let bt: &str = sb;
+    let (bp, bl) = (bt.as_ptr(), bt.len());
+    if (*a).rc.load(Relaxed) == 1 {
+        let RtPayload::Str(sa) = &mut (*a).payload else {
+            unreachable!()
+        };
+        let t = std::str::from_utf8_unchecked(std::slice::from_raw_parts(bp, bl));
+        sa.push_str(t);
+        return a;
+    }
+    let RtPayload::Str(sa) = &(*a).payload else {
+        unreachable!()
+    };
+    let out = alloc(RtPayload::Str(RtStr::concat(sa, bt)));
+    dec(a);
+    out
 }
 
 #[no_mangle]
