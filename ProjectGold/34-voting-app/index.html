@@ -1,0 +1,68 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Vote — JSON both ways</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font: 16px/1.55 system-ui, sans-serif;
+    max-width: 30rem; margin: 3.5rem auto; padding: 0 1.25rem;
+  }
+  h1 { font-size: 1.15rem; font-weight: 600; }
+  ol { list-style: none; padding: 0; margin: 1.5rem 0 0; }
+  li { display: grid; grid-template-columns: 8rem 1fr 3rem; gap: 0.75rem;
+       align-items: center; margin-bottom: 0.6rem; }
+  .bar { height: 0.6rem; border-radius: 3px; background: currentColor;
+         opacity: 0.25; min-width: 2px; transition: width 180ms ease; }
+  .n { text-align: right; font-variant-numeric: tabular-nums; opacity: 0.8; }
+  button { font: inherit; padding: 0.3rem 0.7rem; border: 1px solid currentColor;
+           border-radius: 6px; background: transparent; color: inherit; cursor: pointer; }
+  p.note { opacity: 0.7; font-size: 0.85rem; margin-top: 1.75rem; }
+  code { font-family: ui-monospace, monospace; font-size: 0.85em; }
+</style>
+
+<h1 id="q">…</h1>
+<ol id="options"></ol>
+<p class="note" id="status">Serving from <code>grasm run main.gr -- serve</code>.</p>
+
+<script>
+  const API = "http://localhost:8975";
+  const optionsEl = document.getElementById("options");
+  const statusEl = document.getElementById("status");
+  const qEl = document.getElementById("q");
+
+  function render(poll) {
+    qEl.textContent = poll.question;
+    const max = Math.max(1, ...poll.options.map(o => o.votes));
+    optionsEl.replaceChildren(...poll.options.map(o => {
+      const li = document.createElement("li");
+      const b = document.createElement("button");
+      b.textContent = o.name;
+      b.addEventListener("click", () => vote(o.name));
+      const bar = document.createElement("div");
+      bar.className = "bar";
+      bar.style.width = `${(o.votes / max) * 100}%`;
+      const n = document.createElement("span");
+      n.className = "n";
+      n.textContent = o.votes;
+      li.append(b, bar, n);
+      return li;
+    }));
+    statusEl.textContent = `${poll.total} vote(s)`;
+  }
+
+  function fail(e) {
+    statusEl.textContent = `no server: run \`grasm run main.gr -- serve\` (${e.message})`;
+  }
+
+  function vote(name) {
+    fetch(`${API}/vote`, {
+      method: "POST",
+      body: JSON.stringify({ option: name }),
+    }).then(r => r.json()).then(j => {
+      if (j.error) { statusEl.textContent = j.error; return; }
+      render(j);
+    }).catch(fail);
+  }
+
+  fetch(`${API}/poll`).then(r => r.json()).then(render).catch(fail);
+</script>

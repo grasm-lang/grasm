@@ -1,0 +1,37 @@
+--- reading a vote out of JSON ---
+  well-formed: option native
+  whitespace: option bundle
+  extra keys ignored: option interpreter
+  not JSON: refused — not JSON: expected a number at character 0
+  truncated: refused — not JSON: unexpected end of input at character 11
+  not an object: refused — expected an object, got ["native"]
+  no option key: refused — no "option" key
+  option is a number: refused — "option" must be a string, got 3
+  option is null: refused — "option" must be a string, got null
+--- casting ---
+  native: [0, 0, 1], err ""
+  native again: [0, 0, 2], err ""
+  wasm: [0, 0, 2], err "no such option: wasm"
+  total: 2
+  the ballot is unchanged: [0, 0, 0]
+--- routing ---
+  GET /poll: 200 {"question": "Which engine is normative?", "options": [{"name": "interpreter", "votes": 0}, {"name": "bundle", "votes": 0}, {"name": "native", "votes": 0}], "total": 0}
+  POST /vote: 200 {"question": "Which engine is normative?", "options": [{"name": "interpreter", "votes": 0}, {"name": "bundle", "votes": 1}, {"name": "native", "votes": 0}], "total": 1}
+  POST /vote unknown: 422 {"error": "no such option: wasm"}
+  POST /vote junk: 400 {"error": "not JSON: expected `u` but found `o` at character 1"}
+  POST /reset: 200 {"question": "Which engine is normative?", "options": [{"name": "interpreter", "votes": 0}, {"name": "bundle", "votes": 0}, {"name": "native", "votes": 0}], "total": 0}
+  GET /vote: 404 no route for GET /vote
+  POST /nowhere: 404 no route for POST /nowhere
+--- round trip through the module ---
+  reparsed and reserialised equal: true
+--- seven ballots, one box ---
+  7 ballots in flight before any was counted
+  ballot 0: HTTP/1.1 200 OK
+  ballot 1: HTTP/1.1 200 OK
+  ballot 2: HTTP/1.1 200 OK
+  ballot 3: HTTP/1.1 200 OK
+  ballot 4: HTTP/1.1 200 OK
+  ballot 5: HTTP/1.1 422 Unprocessable Entity
+  ballot 6: HTTP/1.1 400 Bad Request
+  final tallies: [1, 1, 3], total 5
+  five valid votes were counted: true

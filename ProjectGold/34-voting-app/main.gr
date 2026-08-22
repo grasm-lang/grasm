@@ -1,0 +1,473 @@
+// Phase 2, project 4 — Dynamic Voting App.
+//
+// JSON in and JSON out, and the first ProjectGold project made of more than one
+// file. `json.gr` beside this one is project 13's parser, extracted into a
+// module so a second project can use it instead of carrying a second copy — and
+// what a module exports is the one decision that extraction forces you to make.
+//
+// ```
+// grasm run main.gr              # the comparison the harness makes
+// grasm run main.gr -- serve     # then open index.html
+// ```
+//
+// Votes arrive as JSON and are parsed by that module. The poll is *rendered*
+// by hand, because rendering is a fold over three fields and reaching for a
+// parser's value type to do it would be building a tree in order to flatten it
+// immediately.
+
+import json
+
+let PORT = 8975
+
+// ---------------------------------------------------------------------------
+// The poll
+// ---------------------------------------------------------------------------
+
+type Poll = {
+    question: str,
+    options: [str],
+    votes: [i64],
+}
+
+fn fresh() -> Poll {
+    Poll{
+        question: "Which engine is normative?",
+        options: ["interpreter", "bundle", "native"],
+        votes: [0, 0, 0],
+    }
+}
+
+fn index_of_option(p: Poll, name: str) -> i64 {
+    for i in 0..p.options.len() {
+        if p.options[i] == name {
+            return i
+        }
+    }
+    -1
+}
+
+fn total(p: Poll) -> i64 {
+    var n = 0
+    for v in p.votes {
+        n = n + v
+    }
+    n
+}
+
+/// One vote. Returns the poll unchanged and an error when the option is not on
+/// the ballot — a vote for something that was never offered is a refusal, not a
+/// new option.
+fn cast(p: Poll, name: str) -> (Poll, str) {
+    let i = index_of_option(p, name)
+    if i < 0 {
+        return (p, "no such option: {name}")
+    }
+    var next = p
+    next.votes[i] = next.votes[i] + 1
+    (next, "")
+}
+
+// ---------------------------------------------------------------------------
+// Reading a vote out of JSON
+// ---------------------------------------------------------------------------
+
+/// The option named by `{"option": "native"}`.
+///
+/// Every way this can fail has its own message, because "bad request" tells a
+/// caller nothing it can act on.
+fn option_in(body: str) -> (str, str) {
+    match json.parse_json(body) {
+        Err(e) -> ("", "not JSON: {e.why} at character {e.at}")
+        Ok(v) -> match v {
+            JObj(keys, values) -> {
+                for i in 0..keys.len() {
+                    if keys[i] == "option" {
+                        return match values[i] {
+                            JStr(s) -> (s, "")
+                            _ -> ("", "\"option\" must be a string, got {json.to_text(values[i])}")
+                        }
+                    }
+                }
+                ("", "no \"option\" key")
+            }
+            _ -> ("", "expected an object, got {json.to_text(v)}")
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+
+fn quoted(s: str) -> str {
+    "\"" + json.escape_json(s) + "\""
+}
+
+fn poll_json(p: Poll) -> str {
+    var parts: [str] = []
+    for i in 0..p.options.len() {
+        parts.push("\{\"name\": {quoted(p.options[i])}, \"votes\": {p.votes[i]}\}")
+    }
+    "\{\"question\": {quoted(p.question)}, \"options\": [{parts.join(", ")}], \"total\": {total(p)}\}"
+}
+
+fn error_json(why: str) -> str {
+    "\{\"error\": {quoted(why)}\}"
+}
+
+fn page(p: Poll) -> str {
+    var rows = ""
+    for i in 0..p.options.len() {
+        rows += "<li>{p.options[i]}: {p.votes[i]}</li>"
+    }
+    "<!doctype html><meta charset=\"utf-8\"><title>Vote</title><h1>{p.question}</h1><ul>{rows}</ul><p>{total(p)} vote(s). POST /vote with \{\"option\": \"...\"\}.</p>"
+}
+
+fn response(status: str, content_type: str, body: str) -> str {
+    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {body.byte_len()}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{body}"
+}
+
+// ---------------------------------------------------------------------------
+// State that outlives the process
+// ---------------------------------------------------------------------------
+
+fn state_path() -> str / {io} {
+    let dir = env("TMPDIR") ?? "/tmp"
+    let trimmed = if dir.ends_with("/") { dir.substr(0, dir.len() - 1) } else { dir }
+    "{trimmed}/grasm_poll_state.txt"
+}
+
+/// The tallies, one per line, in ballot order. The *question* and the options
+/// are the program's, not the file's: a stored poll whose options no longer
+/// match the code is a poll nobody can read.
+fn load(path: str) -> Poll / {io} {
+    var p = fresh()
+    match read_file(path) {
+        Err(e) -> {}
+        Ok(text) -> {
+            let lines = text.lines()
+            for i in 0..p.options.len() {
+                if i < lines.len() {
+                    p.votes[i] = lines[i].trim().parse_int() ?? 0
+                }
+            }
+        }
+    }
+    p
+}
+
+fn save(path: str, p: Poll) / {io} {
+    var text = ""
+    for v in p.votes {
+        text += "{v}\n"
+    }
+    match write_file(path, text) {
+        Ok(_) -> {}
+        Err(e) -> eprint("cannot save poll: {e}")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Routing
+// ---------------------------------------------------------------------------
+
+type Req = { method: str, path: str, body: str }
+
+fn parse_req(raw: str) -> Req {
+    let head_end = raw.index_of("\r\n\r\n")
+    let head = match head_end {
+        Some(i) -> raw.substr(0, i)
+        None -> raw
+    }
+    let body = match head_end {
+        Some(i) -> raw.substr(i + 4, raw.len() - i - 4)
+        None -> ""
+    }
+    let lines = head.lines()
+    if lines.len() == 0 {
+        return Req{ method: "", path: "empty request", body: "" }
+    }
+    let parts = lines[0].split(" ")
+    if parts.len() != 3 or not parts[1].starts_with("/") {
+        return Req{ method: "", path: "malformed request line", body: "" }
+    }
+    Req{ method: parts[0], path: parts[1], body: body }
+}
+
+/// The new poll and the response. Split out from the socket loop so it can be
+/// checked without one.
+fn route(r: Req, p: Poll) -> (Poll, str) {
+    if r.method == "" {
+        return (p, response("400 Bad Request", "text/plain", "bad request: {r.path}\n"))
+    }
+    if r.path == "/" and r.method == "GET" {
+        return (p, response("200 OK", "text/html", page(p)))
+    }
+    if r.path == "/poll" and r.method == "GET" {
+        return (p, response("200 OK", "application/json", poll_json(p)))
+    }
+    if r.path == "/reset" and r.method == "POST" {
+        let cleared = fresh()
+        return (cleared, response("200 OK", "application/json", poll_json(cleared)))
+    }
+    if r.path == "/vote" and r.method == "POST" {
+        let (name, why) = option_in(r.body)
+        if why != "" {
+            return (p, response("400 Bad Request", "application/json", error_json(why)))
+        }
+        let (next, err) = cast(p, name)
+        if err != "" {
+            return (p, response("422 Unprocessable Entity", "application/json", error_json(err)))
+        }
+        return (next, response("200 OK", "application/json", poll_json(next)))
+    }
+    (p, response("404 Not Found", "text/plain", "no route for {r.method} {r.path}\n"))
+}
+
+// ---------------------------------------------------------------------------
+// The checks the harness compares across three engines
+// ---------------------------------------------------------------------------
+
+fn show_vote(label: str, body: str) / {io} {
+    let (name, why) = option_in(body)
+    if why == "" {
+        print("  {label}: option {name}")
+    } else {
+        print("  {label}: refused — {why}")
+    }
+}
+
+fn show_route(label: str, method: str, path: str, body: str, p: Poll) / {io} {
+    let raw = "{method} {path} HTTP/1.1\r\nHost: x\r\n\r\n{body}"
+    let (next, resp) = route(parse_req(raw), p)
+    let status = resp.lines()[0].split(" ")[1]
+    let at = resp.index_of("\r\n\r\n")
+    let out = match at {
+        Some(j) -> resp.substr(j + 4, resp.len() - j - 4)
+        None -> ""
+    }
+    print("  {label}: {status} {out.trim()}")
+}
+
+fn core_checks() / {io} {
+    print("--- reading a vote out of JSON ---")
+    show_vote("well-formed", "\{\"option\": \"native\"\}")
+    show_vote("whitespace", "  \{ \"option\" : \"bundle\" \}  ")
+    show_vote("extra keys ignored", "\{\"who\": \"ada\", \"option\": \"interpreter\"\}")
+    show_vote("not JSON", "option=native")
+    show_vote("truncated", "\{\"option\": ")
+    show_vote("not an object", "[\"native\"]")
+    show_vote("no option key", "\{\"choice\": \"native\"\}")
+    show_vote("option is a number", "\{\"option\": 3\}")
+    show_vote("option is null", "\{\"option\": null\}")
+
+    print("--- casting ---")
+    let p = fresh()
+    let (a, e1) = cast(p, "native")
+    print("  native: {a.votes}, err \"{e1}\"")
+    let (b, e2) = cast(a, "native")
+    print("  native again: {b.votes}, err \"{e2}\"")
+    let (c, e3) = cast(b, "wasm")
+    print("  wasm: {c.votes}, err \"{e3}\"")
+    print("  total: {total(b)}")
+    print("  the ballot is unchanged: {p.votes}")
+
+    print("--- routing ---")
+    let start = fresh()
+    show_route("GET /poll", "GET", "/poll", "", start)
+    show_route("POST /vote", "POST", "/vote", "\{\"option\": \"bundle\"\}", start)
+    show_route("POST /vote unknown", "POST", "/vote", "\{\"option\": \"wasm\"\}", start)
+    show_route("POST /vote junk", "POST", "/vote", "nope", start)
+    show_route("POST /reset", "POST", "/reset", "", start)
+    show_route("GET /vote", "GET", "/vote", "", start)
+    show_route("POST /nowhere", "POST", "/nowhere", "", start)
+
+    print("--- round trip through the module ---")
+    let rendered = poll_json(fresh())
+    match json.parse_json(rendered) {
+        Err(e) -> print("  our own output does not parse: {e.why}")
+        Ok(v) -> print("  reparsed and reserialised equal: {json.to_text(v) == json.to_text(json.parse_json(json.to_text(v)) ?? v)}")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A real exchange
+// ---------------------------------------------------------------------------
+
+/// Seven voters at once, one ballot box.
+///
+/// As in project 32, what is printed is what does not depend on the order the
+/// server got to the connections. A status is a property of one request. The
+/// *tallies in each reply* are not — a voter sees a different running total
+/// depending on when it was counted — but the **final tallies are**, because
+/// addition commutes. That is the invariant a ballot box has to have: seven
+/// ballots in, the five valid ones counted, whatever order they arrived in.
+fn exchange() / {io, net} {
+    let path = state_path()
+    save(path, fresh())
+
+    let listener = match tcp_listen(0) {
+        Err(e) -> {
+            print("  cannot listen: {e}")
+            return
+        }
+        Ok(l) -> l
+    }
+    let port = net_port(listener) ?? 0
+
+    let bodies = [
+        "\{\"option\": \"native\"\}",
+        "\{\"option\": \"native\"\}",
+        "\{\"option\": \"bundle\"\}",
+        "\{\"option\": \"interpreter\"\}",
+        "\{\"option\": \"native\"\}",
+        "\{\"option\": \"wasm\"\}",
+        "not json at all",
+    ]
+
+    var clients: [i64] = []
+    for body in bodies {
+        match tcp_connect("127.0.0.1", port) {
+            Err(e) -> print("  dial failed: {e}")
+            Ok(c) -> {
+                let req = "POST /vote HTTP/1.1\r\nHost: x\r\nContent-Length: {body.byte_len()}\r\n\r\n{body}"
+                match tcp_write(c, req) {
+                    Err(e) -> print("  send failed: {e}")
+                    Ok(_) -> clients.push(c)
+                }
+            }
+        }
+    }
+    print("  {clients.len()} ballots in flight before any was counted")
+
+    var replies: [str] = []
+    for c in clients {
+        replies.push("")
+    }
+    var served: [i64] = []
+    var answered = 0
+    var turns = 0
+    while answered < clients.len() and turns < 400 {
+        var waiting: [i64] = [listener]
+        for h in served {
+            waiting.push(h)
+        }
+        for i in 0..clients.len() {
+            if replies[i] == "" {
+                waiting.push(clients[i])
+            }
+        }
+        let ready = net_wait(waiting, 2000) ?? []
+        if ready.len() == 0 {
+            answered = clients.len()
+        }
+        for h in ready {
+            if h == listener {
+                match tcp_accept(listener) {
+                    Err(e) -> {}
+                    Ok(conn) -> served.push(conn)
+                }
+            } else {
+                var server_side = false
+                for sh in served {
+                    if sh == h { server_side = true }
+                }
+                if server_side {
+                    let raw = tcp_read(h) ?? ""
+                    if raw != "" {
+                        let (next, resp) = route(parse_req(raw), load(path))
+                        save(path, next)
+                        match tcp_write(h, resp) {
+                            Ok(_) -> {}
+                            Err(e) -> {}
+                        }
+                    }
+                } else {
+                    var i = 0
+                    while i < clients.len() {
+                        if clients[i] == h and replies[i] == "" {
+                            let chunk = tcp_read(h) ?? ""
+                            replies[i] = if chunk == "" { "(nothing)" } else { chunk }
+                            answered = answered + 1
+                        }
+                        i = i + 1
+                    }
+                }
+            }
+        }
+        turns = turns + 1
+    }
+
+    for i in 0..clients.len() {
+        let lines = replies[i].lines()
+        let status = if lines.len() > 0 { lines[0].trim() } else { "(no reply)" }
+        print("  ballot {i}: {status}")
+    }
+    let final = load(path)
+    print("  final tallies: {final.votes}, total {total(final)}")
+    print("  five valid votes were counted: {total(final) == 5}")
+
+    for h in served {
+        net_close(h)
+    }
+    for h in clients {
+        net_close(h)
+    }
+    net_close(listener)
+}
+
+fn serve() / {io, net} {
+    let path = state_path()
+    let listener = match tcp_listen(PORT) {
+        Err(e) -> {
+            print("cannot listen on {PORT}: {e}")
+            return
+        }
+        Ok(l) -> l
+    }
+    print("http://localhost:{PORT}  (ctrl-c to stop)")
+    print("poll: {path}, currently {load(path).votes}")
+    var open: [i64] = []
+    var going = true
+    while going {
+        var waiting: [i64] = [listener]
+        for h in open {
+            waiting.push(h)
+        }
+        let ready = net_wait(waiting, 60000) ?? []
+        for h in ready {
+            if h == listener {
+                match tcp_accept(listener) {
+                    Err(e) -> print("accept failed: {e}")
+                    Ok(conn) -> open.push(conn)
+                }
+            } else {
+                let raw = tcp_read(h) ?? ""
+                if raw != "" {
+                    let (next, resp) = route(parse_req(raw), load(path))
+                    save(path, next)
+                    match tcp_write(h, resp) {
+                        Ok(_) -> {}
+                        Err(e) -> {}
+                    }
+                }
+                net_close(h)
+                var still: [i64] = []
+                for k in open {
+                    if k != h { still.push(k) }
+                }
+                open = still
+            }
+        }
+    }
+}
+
+fn main() / {io, net} {
+    if args().len() > 0 and args()[0] == "serve" {
+        serve()
+        return
+    }
+    core_checks()
+    print("--- seven ballots, one box ---")
+    exchange()
+}
