@@ -1,0 +1,69 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Counter — Grasm full stack</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font: 16px/1.5 system-ui, sans-serif;
+    max-width: 34rem;
+    margin: 4rem auto;
+    padding: 0 1.25rem;
+  }
+  h1 { font-size: 1.1rem; font-weight: 600; letter-spacing: 0.01em; }
+  output {
+    display: block;
+    font-size: 4rem;
+    font-variant-numeric: tabular-nums;
+    line-height: 1.1;
+    margin: 1.5rem 0;
+  }
+  .row { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+  button {
+    font: inherit;
+    padding: 0.4rem 0.9rem;
+    border: 1px solid currentColor;
+    border-radius: 6px;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+  }
+  button:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+  p.note { opacity: 0.7; font-size: 0.85rem; }
+  code { font-family: ui-monospace, monospace; }
+</style>
+
+<h1>Counter</h1>
+<output id="value">…</output>
+<div class="row">
+  <button data-path="/inc" data-n="1">+1</button>
+  <button data-path="/inc" data-n="5">+5</button>
+  <button data-path="/dec" data-n="1">−1</button>
+  <button data-path="/reset">reset</button>
+</div>
+<p class="note" id="status">Serving from <code>grasm run main.gr -- serve</code>.</p>
+
+<script>
+  const API = "http://localhost:8973";
+  const value = document.getElementById("value");
+  const status = document.getElementById("status");
+
+  function show(data) {
+    value.textContent = data.value;
+    status.textContent = `last action: ${data.action}`;
+  }
+
+  function fail(e) {
+    value.textContent = "—";
+    status.textContent = `no server: run \`grasm run main.gr -- serve\` (${e.message})`;
+  }
+
+  fetch(`${API}/count`).then(r => r.json()).then(show).catch(fail);
+
+  for (const b of document.querySelectorAll("button")) {
+    b.addEventListener("click", () => {
+      const body = b.dataset.n ? `n=${b.dataset.n}` : "";
+      fetch(API + b.dataset.path, { method: "POST", body })
+        .then(r => r.json()).then(show).catch(fail);
+    });
+  }
+</script>

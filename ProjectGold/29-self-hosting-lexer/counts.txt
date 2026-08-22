@@ -29,3 +29,4 @@
 29-self-hosting-lexer/main.gr 3025
 30-async-chat/main.gr 1232
 31-grasm-emits-c/main.gr 1933
+32-fullstack-counter/main.gr 2304

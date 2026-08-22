@@ -1,0 +1,36 @@
+--- parsing ---
+  well-formed GET: GET /count, body 0 char(s)
+  well-formed POST: POST /inc, body 3 char(s)
+  empty: rejected — empty request
+  two parts: rejected — request line is not three parts
+  no version: rejected — no HTTP version
+  unknown method: rejected — unsupported method
+  relative target: rejected — target is not a path
+--- routing ---
+  GET /count: 200, 7 -> 7, body {"value": 7, "action": "get"}
+  POST /inc: 200, 7 -> 8, body {"value": 8, "action": "inc"}
+  POST /inc n=5: 200, 7 -> 12, body {"value": 12, "action": "inc"}
+  POST /dec: 200, 7 -> 6, body {"value": 6, "action": "dec"}
+  POST /reset: 200, 7 -> 0, body {"value": 0, "action": "reset"}
+  POST /nope: 404, 7 -> 7, body no route for POST /nope
+  GET on a POST route: 404, 7 -> 7, body no route for GET /inc
+  malformed: 400, 7 -> 7, body bad request: request line is not three parts
+--- amounts ---
+  empty body: 1
+  n=4: 4
+  n=0 clamps: 1
+  n=-2 clamps: 1
+  garbage: 1
+--- persistence ---
+  fresh: 0
+  after +5: 5
+  after -2: 3
+  after reset: 0
+--- five clients, one thread, one counter ---
+  5 requests in flight before any reply was read
+  request 0: HTTP/1.1 200 OK
+  request 1: HTTP/1.1 200 OK
+  request 2: HTTP/1.1 200 OK
+  request 3: HTTP/1.1 200 OK
+  request 4: HTTP/1.1 404 Not Found
+  final stored value: 3, expected 3, agrees: true

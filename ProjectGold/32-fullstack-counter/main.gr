@@ -1,0 +1,434 @@
+// Phase 2, project 1 — Full-Stack Counter.
+//
+// The smallest thing that is honestly full-stack: a browser, an HTTP server,
+// and state that outlives the process. It exists to establish the shape the
+// other twelve follow, so almost everything here is deliberately plain.
+//
+// Three halves, and they are separated on purpose.
+//
+//   * The **core** — parsing a request, applying an action, rendering JSON —
+//     is pure. It runs on every engine on every run, which is what makes it
+//     comparable across `grasm run`, the bundle and `--native`.
+//   * The **exchange** runs a real server and several real clients over real
+//     sockets, in one `net_wait` loop, inside this one process. That is the
+//     part that could not be written before [L-LIB-NET] grew readiness: a
+//     blocking accept would deadlock the program against itself on the first
+//     dial. It is deterministic, so it is also compared across engines.
+//   * The **live** half is `-- serve`, which needs a browser and cannot be
+//     part of an automated comparison.
+//
+// ```
+// grasm run main.gr -- serve      # then open index.html
+// ```
+//
+// State is a file, because a counter that forgets when the process ends is not
+// demonstrating persistence. The file is text holding one integer: this project
+// is about the stack, and project 4 is the one about JSON.
+
+let PORT = 8973
+
+// ---------------------------------------------------------------------------
+// The core: pure, and therefore checkable
+// ---------------------------------------------------------------------------
+
+type Req = {
+    method: str,
+    path: str,
+    body: str,
+}
+
+fn bad(why: str) -> Req {
+    Req{ method: "", path: why, body: "" }
+}
+
+/// Splits a request into the three things this server needs. Anything it
+/// cannot make sense of comes back with an empty method, which `route` answers
+/// 400 to — a malformed request is an answer, not a crash.
+fn parse_req(raw: str) -> Req {
+    let head_end = raw.index_of("\r\n\r\n")
+    let head = match head_end {
+        Some(i) -> raw.substr(0, i)
+        None -> raw
+    }
+    let body = match head_end {
+        Some(i) -> raw.substr(i + 4, raw.len() - i - 4)
+        None -> ""
+    }
+    let lines = head.lines()
+    if lines.len() == 0 {
+        return bad("empty request")
+    }
+    let parts = lines[0].split(" ")
+    if parts.len() != 3 {
+        return bad("request line is not three parts")
+    }
+    if parts[0] != "GET" and parts[0] != "POST" {
+        return bad("unsupported method")
+    }
+    if not parts[1].starts_with("/") {
+        return bad("target is not a path")
+    }
+    if not parts[2].starts_with("HTTP/") {
+        return bad("no HTTP version")
+    }
+    Req{ method: parts[0], path: parts[1], body: body }
+}
+
+/// One action against one value. The whole model of the application.
+fn apply(value: i64, action: str, amount: i64) -> i64 {
+    if action == "inc" {
+        value + amount
+    } else if action == "dec" {
+        value - amount
+    } else if action == "reset" {
+        0
+    } else {
+        value
+    }
+}
+
+fn json_of(value: i64, action: str) -> str {
+    "\{\"value\": {value}, \"action\": \"{action}\"\}"
+}
+
+fn response(status: str, content_type: str, body: str) -> str {
+    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {body.byte_len()}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{body}"
+}
+
+/// The amount a POST body asks for, defaulting to 1. The body is `n=3` or
+/// empty; anything else is 1, because a counter that refuses to count because
+/// somebody sent it nonsense is worse than one that counts by one.
+fn amount_of(body: str) -> i64 {
+    if not body.starts_with("n=") {
+        return 1
+    }
+    match body.substr(2, body.len() - 2).parse_int() {
+        Some(n) -> if n < 1 { 1 } else { n }
+        None -> 1
+    }
+}
+
+/// The whole routing table: the new value, and the response to send.
+fn route(r: Req, value: i64) -> (i64, str) {
+    if r.method == "" {
+        return (value, response("400 Bad Request", "text/plain", "bad request: {r.path}\n"))
+    }
+    if r.path == "/" and r.method == "GET" {
+        return (value, response("200 OK", "text/html", page(value)))
+    }
+    if r.path == "/count" and r.method == "GET" {
+        return (value, response("200 OK", "application/json", json_of(value, "get")))
+    }
+    if r.method == "POST" {
+        let action = if r.path == "/inc" {
+            "inc"
+        } else if r.path == "/dec" {
+            "dec"
+        } else if r.path == "/reset" {
+            "reset"
+        } else {
+            ""
+        }
+        if action != "" {
+            let next = apply(value, action, amount_of(r.body))
+            return (next, response("200 OK", "application/json", json_of(next, action)))
+        }
+    }
+    (value, response("404 Not Found", "text/plain", "no route for {r.method} {r.path}\n"))
+}
+
+/// The server-rendered page. The same numbers the JSON endpoint reports, so a
+/// reader can see that both halves are one application.
+fn page(value: i64) -> str {
+    "<!doctype html><meta charset=\"utf-8\"><title>Counter</title><h1>{value}</h1><p>POST /inc, /dec or /reset. GET /count for JSON.</p>"
+}
+
+// ---------------------------------------------------------------------------
+// State that outlives the process
+// ---------------------------------------------------------------------------
+
+fn state_path() -> str / {io} {
+    let dir = env("TMPDIR") ?? "/tmp"
+    let trimmed = if dir.ends_with("/") { dir.substr(0, dir.len() - 1) } else { dir }
+    "{trimmed}/grasm_counter_state.txt"
+}
+
+fn load(path: str) -> i64 / {io} {
+    match read_file(path) {
+        Err(e) -> 0
+        Ok(text) -> text.trim().parse_int() ?? 0
+    }
+}
+
+fn save(path: str, value: i64) / {io} {
+    match write_file(path, "{value}\n") {
+        Ok(_) -> {}
+        Err(e) -> eprint("cannot save state: {e}")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The checks the harness compares across three engines
+// ---------------------------------------------------------------------------
+
+fn check(label: str, raw: str) {
+    let r = parse_req(raw)
+    if r.method == "" {
+        print("  {label}: rejected — {r.path}")
+    } else {
+        print("  {label}: {r.method} {r.path}, body {r.body.len()} char(s)")
+    }
+}
+
+fn show_route(label: str, raw: str, from: i64) {
+    let (next, resp) = route(parse_req(raw), from)
+    let status = resp.lines()[0].split(" ")[1]
+    let body_at = resp.index_of("\r\n\r\n")
+    let body = match body_at {
+        Some(i) -> resp.substr(i + 4, resp.len() - i - 4)
+        None -> ""
+    }
+    print("  {label}: {status}, {from} -> {next}, body {body.trim()}")
+}
+
+fn core_checks() / {io} {
+    print("--- parsing ---")
+    check("well-formed GET", "GET /count HTTP/1.1\r\nHost: x\r\n\r\n")
+    check("well-formed POST", "POST /inc HTTP/1.1\r\nHost: x\r\n\r\nn=3")
+    check("empty", "")
+    check("two parts", "GET /count\r\n\r\n")
+    check("no version", "GET /count HTTP\r\n\r\n")
+    check("unknown method", "DELETE /count HTTP/1.1\r\n\r\n")
+    check("relative target", "GET count HTTP/1.1\r\n\r\n")
+
+    print("--- routing ---")
+    show_route("GET /count", "GET /count HTTP/1.1\r\n\r\n", 7)
+    show_route("POST /inc", "POST /inc HTTP/1.1\r\n\r\n", 7)
+    show_route("POST /inc n=5", "POST /inc HTTP/1.1\r\n\r\nn=5", 7)
+    show_route("POST /dec", "POST /dec HTTP/1.1\r\n\r\n", 7)
+    show_route("POST /reset", "POST /reset HTTP/1.1\r\n\r\n", 7)
+    show_route("POST /nope", "POST /nope HTTP/1.1\r\n\r\n", 7)
+    show_route("GET on a POST route", "GET /inc HTTP/1.1\r\n\r\n", 7)
+    show_route("malformed", "nonsense\r\n\r\n", 7)
+
+    print("--- amounts ---")
+    print("  empty body: {amount_of("")}")
+    print("  n=4: {amount_of("n=4")}")
+    print("  n=0 clamps: {amount_of("n=0")}")
+    print("  n=-2 clamps: {amount_of("n=-2")}")
+    print("  garbage: {amount_of("hello")}")
+}
+
+fn persistence_checks() / {io} {
+    print("--- persistence ---")
+    let path = state_path()
+    save(path, 0)
+    print("  fresh: {load(path)}")
+    save(path, apply(load(path), "inc", 5))
+    print("  after +5: {load(path)}")
+    save(path, apply(load(path), "dec", 2))
+    print("  after -2: {load(path)}")
+    save(path, apply(load(path), "reset", 1))
+    print("  after reset: {load(path)}")
+}
+
+// ---------------------------------------------------------------------------
+// A real exchange, over real sockets, in one process
+// ---------------------------------------------------------------------------
+
+/// Five clients and one server, driven by a single `net_wait`.
+///
+/// Every request goes out before any reply is read, so the fifth is on the wire
+/// while the first is still being answered. A blocking `tcp_accept` here would
+/// deadlock this program against itself on the first dial, which is why this
+/// could not be written before readiness existed.
+///
+/// The counter is the shared state, and there is exactly one thread touching
+/// it — so the sequence is deterministic and the file ends where arithmetic
+/// says it should.
+fn exchange() / {io, net} {
+    let path = state_path()
+    save(path, 0)
+
+    let listener = match tcp_listen(0) {
+        Err(e) -> {
+            print("  cannot listen: {e}")
+            return
+        }
+        Ok(l) -> l
+    }
+    let port = net_port(listener) ?? 0
+
+    let requests = [
+        "POST /inc HTTP/1.1\r\nHost: x\r\n\r\nn=4",
+        "POST /inc HTTP/1.1\r\nHost: x\r\n\r\n",
+        "POST /dec HTTP/1.1\r\nHost: x\r\n\r\nn=2",
+        "GET /count HTTP/1.1\r\nHost: x\r\n\r\n",
+        "GET /nowhere HTTP/1.1\r\nHost: x\r\n\r\n",
+    ]
+
+    var clients: [i64] = []
+    for r in requests {
+        match tcp_connect("127.0.0.1", port) {
+            Err(e) -> print("  dial failed: {e}")
+            Ok(c) -> match tcp_write(c, r) {
+                Err(e) -> print("  send failed: {e}")
+                Ok(_) -> clients.push(c)
+            }
+        }
+    }
+    print("  {clients.len()} requests in flight before any reply was read")
+
+    var replies: [str] = []
+    for c in clients {
+        replies.push("")
+    }
+    var served: [i64] = []
+    var answered = 0
+    var turns = 0
+    while answered < clients.len() and turns < 400 {
+        var waiting: [i64] = [listener]
+        for h in served {
+            waiting.push(h)
+        }
+        for i in 0..clients.len() {
+            if replies[i] == "" {
+                waiting.push(clients[i])
+            }
+        }
+        let ready = net_wait(waiting, 2000) ?? []
+        if ready.len() == 0 {
+            answered = clients.len()
+        }
+        for h in ready {
+            if h == listener {
+                match tcp_accept(listener) {
+                    Err(e) -> {}
+                    Ok(conn) -> served.push(conn)
+                }
+            } else {
+                var server_side = false
+                for sh in served {
+                    if sh == h { server_side = true }
+                }
+                if server_side {
+                    let raw = tcp_read(h) ?? ""
+                    if raw != "" {
+                        // The server's whole body: read the state, route,
+                        // write the state back. One connection at a time
+                        // *touches* the counter, however many are open.
+                        let (next, resp) = route(parse_req(raw), load(path))
+                        save(path, next)
+                        match tcp_write(h, resp) {
+                            Ok(_) -> {}
+                            Err(e) -> {}
+                        }
+                    }
+                } else {
+                    var i = 0
+                    while i < clients.len() {
+                        if clients[i] == h and replies[i] == "" {
+                            let chunk = tcp_read(h) ?? ""
+                            replies[i] = if chunk == "" { "(nothing)" } else { chunk }
+                            answered = answered + 1
+                        }
+                        i = i + 1
+                    }
+                }
+            }
+        }
+        turns = turns + 1
+    }
+
+    // What is reported here is exactly what does *not* depend on the order the
+    // server got to the connections.
+    //
+    // A status is a property of one request — `/nowhere` is 404 whenever it is
+    // served — so statuses are printed, in request order rather than arrival
+    // order. The *values* in the replies are not: three clients sending +4, +1
+    // and -2 to one counter see {4, 5, 3} in one order and {1, 5, 3} in
+    // another, and both are correct. Printing them would make this program
+    // disagree with itself between runs, and a test that is flaky about the
+    // thing it is demonstrating is worse than no test.
+    //
+    // The final value *is* order-independent, because addition is, and that is
+    // the invariant worth asserting: five concurrent clients, one counter, and
+    // no update lost.
+    for i in 0..clients.len() {
+        let line = replies[i].lines()
+        let status = if line.len() > 0 { line[0].trim() } else { "(no reply)" }
+        print("  request {i}: {status}")
+    }
+    let final = load(path)
+    print("  final stored value: {final}, expected 3, agrees: {final == 3}")
+
+    for h in served {
+        net_close(h)
+    }
+    for h in clients {
+        net_close(h)
+    }
+    net_close(listener)
+}
+
+// ---------------------------------------------------------------------------
+// The live half
+// ---------------------------------------------------------------------------
+
+/// Serves until interrupted. Many connections at once, one thread, one counter.
+fn serve() / {io, net} {
+    let path = state_path()
+    let listener = match tcp_listen(PORT) {
+        Err(e) -> {
+            print("cannot listen on {PORT}: {e}")
+            return
+        }
+        Ok(l) -> l
+    }
+    print("http://localhost:{PORT}  (ctrl-c to stop)")
+    print("state: {path}, currently {load(path)}")
+    var open: [i64] = []
+    var going = true
+    while going {
+        var waiting: [i64] = [listener]
+        for h in open {
+            waiting.push(h)
+        }
+        let ready = net_wait(waiting, 60000) ?? []
+        for h in ready {
+            if h == listener {
+                match tcp_accept(listener) {
+                    Err(e) -> print("accept failed: {e}")
+                    Ok(conn) -> open.push(conn)
+                }
+            } else {
+                let raw = tcp_read(h) ?? ""
+                if raw != "" {
+                    let (next, resp) = route(parse_req(raw), load(path))
+                    save(path, next)
+                    match tcp_write(h, resp) {
+                        Ok(_) -> {}
+                        Err(e) -> {}
+                    }
+                }
+                net_close(h)
+                var still: [i64] = []
+                for k in open {
+                    if k != h { still.push(k) }
+                }
+                open = still
+            }
+        }
+    }
+}
+
+fn main() / {io, net} {
+    if args().len() > 0 and args()[0] == "serve" {
+        serve()
+        return
+    }
+    core_checks()
+    persistence_checks()
+    print("--- five clients, one thread, one counter ---")
+    exchange()
+}
