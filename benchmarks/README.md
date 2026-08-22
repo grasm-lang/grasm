@@ -38,6 +38,7 @@ round: a program that crashes silently has no time to report.
 | `tree`     | allocating small linked structures and walking them |
 | `sort`     | comparison-heavy work over a large list         |
 | `parmap`   | multi-core throughput, each language's idiom    |
+| `parwords` | multi-core throughput over *text* — the workers share values, not words |
 | `mandelbrot` | a pure float kernel — the workload "N times faster than Python" claims come from |
 
 ## How to read the numbers
@@ -65,13 +66,14 @@ primitive each one reaches for.
 
 | program  |   C |  Rust |  Go | Nim | Zig | grasm-native | grasm-interp | Python |
 |----------|----:|------:|----:|----:|----:|-------------:|-------------:|-------:|
-| fib      |   5 |     5 |   6 |   5 |   5 |           11 |         1615 |    128 |
-| sieve    |   7 |     7 |   8 |   9 |   7 |           16 |         2804 |    336 |
-| matmul   |   5 |     5 |   8 |   9 |   5 |           10 |         5988 |    897 |
-| wordfreq |  30 |    26 |  17 |  22 |   9 |           49 |          483 |    126 |
-| tree     |  20 |     9 |  20 |   — |   — |           63 |         1449 |    327 |
-| sort     |  37 |    11 |  49 |   — |   — |       **19** |          368 |    204 |
-| parmap   |  51 |    51 |  87 |   — |   — |          104 |       53,550 |  3,412 |
+| fib      |   5 |     5 |   6 |   5 |   5 |           11 |         1621 |    129 |
+| sieve    |   7 |     7 |   7 |   9 |   7 |           16 |         2835 |    340 |
+| matmul   |   5 |     5 |   8 |   9 |   5 |           10 |         6021 |    891 |
+| wordfreq |  30 |    26 |  17 |  22 |   9 |           46 |          489 |    130 |
+| tree     |  20 |     9 |  20 |   — |   — |           62 |         1464 |    329 |
+| sort     |  36 |    11 |  49 |   — |   — |       **19** |          370 |    211 |
+| parmap   |  51 |    52 |  87 |   — |   — |          105 |       54,241 |  3,552 |
+| parwords |   8 |    11 |  10 |   — |   — |           32 |         1924 |    216 |
 
 Best of 5. **The harness floor is 2 ms** — what timing `/usr/bin/true` costs,
 which is fork, exec and wait rather than anything a program did. The top three
@@ -79,10 +81,11 @@ rows are mostly floor: C's 5 ms `fib` is about 3 ms of work and Grasm's 10 ms
 about 8, which is nearer 2.7x than the 2x the raw numbers show. Subtract 2 from
 every cell before taking a ratio on a short row.
 
-This run reproduces the previous one within 1 ms on every cell except `tree`,
-which went 75 to 63, and `wordfreq`, which went 53 to 49 — both for the same
-reason: freed 64-byte boxes are recycled instead of returned to the system, so
-an allocation is a pointer pop. A benchmark that only ever agrees with itself is
+This run reproduces the previous one within 3 ms on every cell, and adds
+`parwords` — parallel work over strings rather than over integers, which is the
+row that measures what `par_map` could not do until this month. Grasm's own
+figure for it moved 70 to 32 within the run that introduced it, because writing
+the benchmark is what found that building a string in a loop was quadratic. A benchmark that only ever agrees with itself is
 not measuring anything; one that agrees except where the code changed is.
 
 Reproducibility alone still proves nothing, which this file learned the hard
@@ -96,13 +99,15 @@ anything else, and refuses to run if that takes more than 10 ms.
 Grasm **beats C and Go on `sort`** and is roughly **2x C** on the scalar
 programs.
 
-The two weak rows are the two that allocate. `wordfreq` is 49 against Zig's 9,
-which uses an arena and no refcounting. `tree` is 63 against C's 20 and Rust's
-9 — the worst ratio in the table, and the one worth the most, because building
+The three weak rows are the three that allocate. `wordfreq` is 46 against Zig's 9,
+which uses an arena and no refcounting. `parwords` is 32 against C's 8 and Rust's
+11, and it is the row where Grasm is running on every core and still behind: the
+workers allocate, and allocation is what the language is slowest at. `tree` is
+62 against C's 20 and Rust's 9 — the worst ratio in the table, and the one worth the most, because building
 small linked structures and walking them is what a parser, an interpreter or a
 compiler does all day.
 
-It was 175 ms when the program was written, and every step down was an
+`tree` was 175 ms when the program was written, and every step down was an
 allocation removed rather than a loop tightened: struct names stopped being
 copied, field access became a load rather than a search, and a struct's fields
 and a list's elements moved into the box the value already needed. A node and

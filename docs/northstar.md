@@ -19,7 +19,7 @@ the scorecard takes the best of five runs and subtracts the process floor.
 | # | Goal | Target | Measured | |
 |---|---|---|---|---|
 | G1 | Time for a Go/TS dev to ship a real service | ≤ 1 week | — | **unmeasurable without users** |
-| G2 | Geomean vs Rust | ≥ 0.95× | **0.42×** — 0 of 7 programs at or above; geomean 2.41× behind, 2.84× with the harness floor subtracted | **missed** — moved by `tree` alone, 7.0× behind Rust where the rest of the table is 1.7–2.3× |
+| G2 | Geomean vs Rust | ≥ 0.95× | **0.41×** — 0 of 8 programs at or above; geomean 2.44× behind, 2.87× with the harness floor subtracted | **missed** — `tree` at 6.9× and `parwords` at 2.9× carry it; the other six are 1.7–2.3× |
 | G3 | Frontend throughput | ≥ 500k LOC/s | **535–547k** across consecutive runs on one machine | **met** |
 | G3 | Incremental edit-to-diagnostic | ≤ 50 ms | — | **not built** — there is no query engine |
 | G4 | Safe-subset guarantees | 100% | 218 programs identical across three engines, 218 leak-free, 27 agreeing on panic messages, 31 whole programs, nine fuzzers clean | **strongest area** |
@@ -160,8 +160,8 @@ and the goal.
 
 **G2's one real gap is the value representation, and it is not a missing
 optimisation.** As of the table above, six of the seven rows sit between 1.7×
-and 2.3× behind Rust and `tree` sits at 7.0×, so the geomean is one row's
-problem rather than a spread. Three candidate causes were checked on `wordfreq`
+and 2.3× behind Rust, `parwords` at 2.9× and `tree` at 6.9×, so the geomean is
+mostly one row's problem rather than a spread. Three candidate causes were checked on `wordfreq`
 and none of them was it: the map is already a `HashMap` with sorting deferred to iteration, so
 [E-MAP-ORDER] costs nothing on insert; rewriting the program's string
 construction to one interpolation instead of a concatenation changed the time by

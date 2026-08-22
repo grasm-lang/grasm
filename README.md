@@ -127,13 +127,14 @@ concurrency primitive each one reaches for.
 
 | program  |   C |  Rust |  Go | Nim | Zig | grasm-native | Python |
 |----------|----:|------:|----:|----:|----:|-------------:|-------:|
-| fib      |   5 |     5 |   6 |   5 |   5 |           11 |    128 |
-| sieve    |   7 |     7 |   8 |   9 |   7 |           16 |    336 |
-| matmul   |   5 |     5 |   8 |   9 |   5 |           10 |    897 |
-| wordfreq |  30 |    26 |  17 |  22 |   9 |           49 |    126 |
-| tree     |  20 |     9 |  20 |   — |   — |           63 |    327 |
-| sort     |  37 |    11 |  49 |   — |   — |       **19** |    204 |
-| parmap   |  51 |    51 |  87 |   — |   — |          104 |  3,412 |
+| fib      |   5 |     5 |   6 |   5 |   5 |           11 |    129 |
+| sieve    |   7 |     7 |   7 |   9 |   7 |           16 |    340 |
+| matmul   |   5 |     5 |   8 |   9 |   5 |           10 |    891 |
+| wordfreq |  30 |    26 |  17 |  22 |   9 |           46 |    130 |
+| tree     |  20 |     9 |  20 |   — |   — |           62 |    329 |
+| sort     |  36 |    11 |  49 |   — |   — |       **19** |    211 |
+| parmap   |  51 |    52 |  87 |   — |   — |          105 |  3,552 |
+| parwords |   8 |    11 |  10 |   — |   — |           32 |    216 |
 
 Best of 5. **The harness floor is 2 ms** — what timing `/usr/bin/true` costs,
 which is fork, exec and wait rather than anything a program did. The top three
@@ -141,10 +142,11 @@ rows are mostly floor: C's 5 ms `fib` is about 3 ms of work and Grasm's 10 ms
 about 8, which is nearer 2.7x than the 2x the raw numbers show. Subtract 2 from
 every cell before taking a ratio on a short row.
 
-This run reproduces the previous one within 1 ms on every cell except `tree`,
-which went 75 to 63, and `wordfreq`, which went 53 to 49 — both for the same
-reason: freed 64-byte boxes are recycled instead of returned to the system, so
-an allocation is a pointer pop. A benchmark that only ever agrees with itself is
+This run reproduces the previous one within 3 ms on every cell, and adds
+`parwords` — parallel work over strings rather than over integers, which is the
+row that measures what `par_map` could not do until this month. Grasm's own
+figure for it moved 70 to 32 within the run that introduced it, because writing
+the benchmark is what found that building a string in a loop was quadratic. A benchmark that only ever agrees with itself is
 not measuring anything; one that agrees except where the code changed is.
 
 Reproducibility alone still proves nothing, which this file learned the hard
@@ -172,9 +174,11 @@ the 2 ms process floor is subtracted from cells that small. Scalar lists store
 elements inline and a list a loop only indexes is reached through its data
 pointer, so `matmul`'s innermost loop is 17 instructions with no calls.
 
-**The two weak rows are the two that allocate.** `wordfreq` builds a string per
-iteration and boxes every value; `tree` builds a small struct per node, and at
-63 ms against C's 20 and Rust's 9 it is the worst ratio here — and the one
+**The three weak rows are the three that allocate.** `wordfreq` builds a string
+per iteration and boxes every value; `parwords` runs on every core and is still
+32 against C's 8, because its workers allocate and allocation is what the
+language is slowest at; `tree` builds a small struct per node, and at 62 ms
+against C's 20 and Rust's 9 it is the worst ratio here — and the one
 worth the most, because building small linked structures and walking them is
 what a parser, an interpreter or a compiler does all day.
 
