@@ -235,7 +235,9 @@ pub const BUILTIN_FREE_FNS: &[&str] = &[
     "tcp_connect",
     "tcp_accept",
     "tcp_read",
+    "tcp_read_bytes",
     "tcp_write",
+    "tcp_write_bytes",
     "net_close",
     "net_wait",
     "net_port",
@@ -4350,12 +4352,13 @@ only a number or a `bool` can come out — compute what you need and yield that"
                     // `str`, so reaching the network needed no pointer type —
                     // which would have been a far larger change to the language
                     // than the network itself ([L-LIB-NET]).
-                    "tcp_listen" | "tcp_accept" | "tcp_read" | "net_port"
-                    | "udp_bind" | "udp_recv" => {
+                    "tcp_listen" | "tcp_accept" | "tcp_read" | "tcp_read_bytes"
+                    | "net_port" | "udp_bind" | "udp_recv" => {
                         let (want, gives) = match id.name.as_str() {
                             "tcp_listen" => (Type::I64, Type::I64),
                             "udp_bind" => (Type::I64, Type::I64),
                             "udp_recv" => (Type::I64, Type::Bytes),
+                            "tcp_read_bytes" => (Type::I64, Type::Bytes),
                             "tcp_accept" => (Type::I64, Type::I64),
                             "net_port" => (Type::I64, Type::I64),
                             _ => (Type::I64, Type::Str),
@@ -4472,13 +4475,21 @@ only a number or a `bool` can come out — compute what you need and yield that"
                         };
                         return Type::Fallible(Box::new(Type::I64), Box::new(io_err));
                     }
-                    "tcp_write" => {
+                    "tcp_write" | "tcp_write_bytes" => {
+                        let what = if id.name == "tcp_write" { "text" } else { "bytes" };
                         if args.len() != 2 {
-                            return self
-                                .error(span, "tcp_write takes 2 arguments (handle, text)");
+                            return self.error(
+                                span,
+                                format!("{} takes 2 arguments (handle, {what})", id.name),
+                            );
                         }
                         self.check_expr(&args[0], &Type::I64);
-                        self.check_expr(&args[1], &Type::Str);
+                        let payload = if id.name == "tcp_write" {
+                            Type::Str
+                        } else {
+                            Type::Bytes
+                        };
+                        self.check_expr(&args[1], &payload);
                         let io_err = Type::Named {
                             id: self.defs.io_error_id,
                             args: vec![],

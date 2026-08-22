@@ -19,7 +19,17 @@ those are before writing any of them, rather than discovering it thirteen times.
 | **F9** | no byte type: a socket and a file both carry `str` |
 | **F7** | no stderr |
 
-Those four decide the whole phase.
+Those four decided the whole phase **when this file was written**, and three of
+them have since been closed. Kept above as they were, and corrected below,
+because a plan that quietly rewrites its own premises is a plan nobody can
+check.
+
+| | now |
+|---|---|
+| **F13** | **closed.** `net_wait` ([L-LIB-NET]) answers with the handles that can be read without blocking, so one thread holds many conversations. |
+| **F9** | **closed.** `bytes` exists ([L-LIB-BYTES]), and as of this phase `tcp_read_bytes` / `tcp_write_bytes` let a socket speak it. |
+| **F7** | **closed.** `eprint` ([L-LIB-EPRINT]). |
+| **F14** | **half closed.** `par_map` and `par_filter` are multi-core over boxed values now, so *parsing* on many cores works. They still refuse every effect, so *fetching* on many cores does not. |
 
 ## The thirteen, classified before starting
 
@@ -38,21 +48,25 @@ Those four decide the whole phase.
 Each is one `server.gr`, one `index.html`, and a `grasm.wasm` where the browser
 half needs Grasm rather than JavaScript.
 
-### Writable but degraded (3)
+### Writable but degraded (1, was 3)
 
 | # | Project | What it loses |
 |---|---|---|
-| 6 | Collaborative Todo | **F13/F14.** No WebSockets and no SSE, because both need a connection held open while others are served. Degrades to polling — which works, and is honestly worse. |
-| 10 | Weather Mashup | `tcp_connect` can dial, but there is no TLS, so it can fetch `http://` and not `https://` — which is most public APIs. Degrades to a local stand-in service. |
-| 13 | Real-Time Analytics | high-frequency streaming, one blocking connection at a time. Degrades to batched POSTs. |
+| 10 | Weather Mashup | `tcp_connect` can dial, but there is no TLS, so it can fetch `http://` and not `https://` — which is most public APIs. Degrades to a local stand-in service. **Unchanged: TLS is still absent.** |
 
-### Blocked (3)
+`6` and `13` were listed here because holding a connection open while serving
+others was impossible. `net_wait` made it possible, so **server-sent events are
+writable** and neither has to degrade to polling. They move up.
+
+### Blocked (1, was 3)
 
 | # | Project | On what |
 |---|---|---|
-| 8 | File Upload Gallery | **F9.** `multipart/form-data` is binary and a socket carries `str`. |
-| 9 | Chat Room Router | **F13.** Many simultaneous connections; the blocking accept serves one. |
-| 11 | E-Commerce Cart | **F14.** The project *is* race conditions and state synchronisation, and the language cannot express concurrent access to shared state — which is either a cheat or the point, depending on how honest the write-up is. |
+| 11 | E-Commerce Cart | **F14.** The project *is* race conditions and state synchronisation. `net_wait` gives many conversations on one thread, which makes the *interleaving* real and the shared state safe by construction — there is only one thread to race. That is a correct application and a dishonest demonstration of the thing the exercise is about, and the README has to say which it is. |
+
+`8` was blocked on F9 and is now writable: `tcp_read_bytes` reads a
+`multipart/form-data` body without turning the JPEG into U+FFFD. `9` was
+blocked on F13 and is now writable with `net_wait`.
 
 ## The order, and why
 
@@ -72,10 +86,20 @@ half needs Grasm rather than JavaScript.
 
 ## The honest headline, before any of it is written
 
-A "full-stack" claim usually implies serving many users at once. Grasm can serve
-**one connection at a time**, and can compute in parallel only when no I/O is
-involved. Every project below is therefore a correct single-user application and
-none of them is a concurrent server.
+*Written before phase 2 began, and now half wrong. Both versions are here.*
+
+**Then:** a "full-stack" claim usually implies serving many users at once.
+Grasm can serve **one connection at a time**, and can compute in parallel only
+when no I/O is involved. Every project below is therefore a correct single-user
+application and none of them is a concurrent server.
+
+**Now:** `net_wait` means a Grasm server holds many connections at once and
+answers whichever is ready, on one thread — which is what a concurrent server
+is, and what most of them are underneath. What is still true is the other half:
+the I/O and the computation cannot be spread across cores at the same time,
+because `par_map` refuses effects. So these are concurrent single-core servers,
+which is a smaller claim than "full-stack" usually carries and a much larger one
+than the paragraph above allowed.
 
 That is not a reason to skip the phase — a single-user full stack in one
 language, with the same engine on both sides and capabilities enforced across

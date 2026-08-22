@@ -5119,6 +5119,78 @@ pub unsafe extern "C" fn grasm_tcp_read(handle: *mut RtVal) -> *mut RtVal {
     }
 }
 
+/// What has arrived, as **bytes**.
+///
+/// `tcp_read` answers text, and does it lossily, because a `str` is text and a
+/// socket carries bytes ([L-LIB-NET]). That is right for a protocol made of
+/// text and wrong for one that is not: `multipart/form-data` carries a JPEG,
+/// and replacing every invalid sequence with U+FFFD corrupts the file in a way
+/// nothing downstream can detect. `bytes` already existed; this is the socket
+/// learning to speak it.
+///
+/// # Safety: called from compiled Grasm with boxed values.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_tcp_read_bytes(handle: *mut RtVal) -> *mut RtVal {
+    use std::io::Read;
+    let h = match &(*handle).payload {
+        RtPayload::I64(n) => *n,
+        _ => return err_of(io_err("IoFailed", "handle must be an integer".to_string())),
+    };
+    let read = socket_with(h, |s| match s {
+        Socket::Stream(stream) => {
+            let mut buf = vec![0u8; 65536];
+            match stream.read(&mut buf) {
+                Ok(n) => {
+                    buf.truncate(n);
+                    Ok(buf)
+                }
+                Err(e) => Err(e.to_string()),
+            }
+        }
+        Socket::Listener(_) => Err(format!("socket {h} is a listener, not a connection")),
+        Socket::Datagram(_) => Err(format!(
+            "socket {h} is a datagram socket — use udp_recv, which keeps message boundaries"
+        )),
+    });
+    match read {
+        Ok(b) => ok_of(alloc(RtPayload::Bytes(std::sync::Arc::new(b)))),
+        Err(e) => err_of(io_err("IoFailed", e)),
+    }
+}
+
+/// Writes **bytes** to a connection: `tcp_write`'s other half.
+///
+/// # Safety: called from compiled Grasm with boxed values.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_tcp_write_bytes(
+    handle: *mut RtVal,
+    data: *mut RtVal,
+) -> *mut RtVal {
+    use std::io::Write;
+    let h = match &(*handle).payload {
+        RtPayload::I64(n) => *n,
+        _ => return err_of(io_err("IoFailed", "handle must be an integer".to_string())),
+    };
+    let RtPayload::Bytes(payload) = &(*data).payload else {
+        return err_of(io_err("IoFailed", "tcp_write_bytes needs bytes".to_string()));
+    };
+    let payload = payload.clone();
+    let wrote = socket_with(h, |s| match s {
+        Socket::Stream(stream) => stream
+            .write_all(&payload)
+            .and_then(|()| stream.flush())
+            .map_err(|e| e.to_string()),
+        Socket::Listener(_) => Err(format!("socket {h} is a listener, not a connection")),
+        Socket::Datagram(_) => Err(format!(
+            "socket {h} is a datagram socket — use udp_send, which needs a destination"
+        )),
+    });
+    match wrote {
+        Ok(()) => ok_of(alloc(RtPayload::I64(0))),
+        Err(e) => err_of(io_err("IoFailed", e)),
+    }
+}
+
 /// Writes text to a connection.
 ///
 /// # Safety: called from compiled Grasm with boxed values.

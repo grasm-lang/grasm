@@ -443,7 +443,9 @@ count in [`core.md`](core.md) does not move.
 | `tcp_connect(host, port)` | `(str, i64) -> i64 ! IoError` | dials `host:port`; a name is resolved |
 | `tcp_accept(h)` | `(i64) -> i64 ! IoError` | waits for a connection, answering with a handle for it |
 | `tcp_read(h)` | `(i64) -> str ! IoError` | what has arrived, as text |
+| `tcp_read_bytes(h)` | `(i64) -> bytes ! IoError` | the same read, unconverted |
 | `tcp_write(h, text)` | `(i64, str) -> () ! IoError` | writes and flushes |
+| `tcp_write_bytes(h, b)` | `(i64, bytes) -> () ! IoError` | writes and flushes |
 | `net_close(h)` | `(i64) -> ()` | closes a listener or a connection |
 | `net_wait(hs, ms)` | `([i64], i64) -> [i64] ! IoError` | the handles that can be read without waiting |
 | `net_port(h)` | `(i64) -> i64 ! IoError` | the local port a handle is bound to |
@@ -466,6 +468,18 @@ an HTTP client holds the connection open after its request and reading to the
 end would wait forever. A caller that needs more reads again. Bytes that are not
 valid UTF-8 are replaced rather than refused: a socket carries bytes, a `str`
 carries text, and a client's mistake should not end a server.
+
+That replacement is right for a protocol made of text and wrong for one that is
+not. `multipart/form-data` carries a JPEG, and turning every invalid sequence
+into U+FFFD corrupts the file in a way nothing downstream can detect — the
+upload arrives, the length looks plausible, and the image is broken.
+`tcp_read_bytes` and `tcp_write_bytes` are the same two calls without the
+conversion. They needed no new type: `bytes` already existed ([L-LIB-BYTES]),
+and the socket simply had no way to speak it.
+
+Both pairs stay, rather than one replacing the other, because an HTTP header is
+text and a body may not be: a server reads the request as bytes and decodes the
+part it knows is text, and a program serving only text should not have to.
 
 `net_port` is what makes `tcp_listen(0)` usable. Asking the system to choose a
 free port is the only way to write a program that runs on a machine where

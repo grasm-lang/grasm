@@ -15,6 +15,8 @@
 //! a closed handle reports rather than panics
 //! nothing is listening there, and that is an Err
 //! an unresolvable name is an Err too
+//! as text, 0xff 0xfe became: [239, 191, 189, 239, 191, 189, 65, 66, 0, 67]
+//! as bytes, they survived: [255, 254, 65, 66, 0, 67]
 // The `net` capability: handles are integers, payloads are text.
 //
 // Port 0 asks the system to choose, so this program can run anywhere without
@@ -142,6 +144,56 @@ fn main() / {io, net} {
                 Ok(_) -> print("an invalid name resolved, which it must not")
                 Err(e) -> print("an unresolvable name is an Err too")
             }
+
+            // Text and bytes are two reads, not one with a flag, and the
+            // difference is visible: `tcp_read` replaces what is not valid
+            // UTF-8, which is right for a protocol made of text and destroys a
+            // JPEG. The same six bytes are sent twice and read both ways.
+            binary_round_trip()
+        }
+    }
+}
+
+/// The same payload read as text and as bytes. Sent twice over two fresh
+/// connections so neither read can see the other's data.
+fn binary_round_trip() / {net, io} {
+    let payload = [255, 254, 65, 66, 0, 67]
+    print("as text, 0xff 0xfe became: {echo_as(payload, true)}")
+    print("as bytes, they survived: {echo_as(payload, false)}")
+}
+
+/// Sends `payload` to a listener on this machine and reads it back, as text
+/// when `as_text` and as bytes otherwise. Answers with the byte values seen.
+fn echo_as(payload: [i64], as_text: bool) -> [i64] / {net} {
+    match tcp_listen(0) {
+        Err(e) -> []
+        Ok(srv) -> {
+            var seen: [i64] = []
+            match net_port(srv) {
+                Err(e) -> {}
+                Ok(port) -> match tcp_connect("127.0.0.1", port) {
+                    Err(e) -> {}
+                    Ok(cli) -> {
+                        match tcp_write_bytes(cli, bytes_of(payload)) {
+                            Err(e) -> {}
+                            Ok(_) -> match tcp_accept(srv) {
+                                Err(e) -> {}
+                                Ok(conn) -> {
+                                    if as_text {
+                                        seen = (tcp_read(conn) ?? "").to_bytes().to_list()
+                                    } else {
+                                        seen = (tcp_read_bytes(conn) ?? bytes_of([])).to_list()
+                                    }
+                                    net_close(conn)
+                                }
+                            }
+                        }
+                        net_close(cli)
+                    }
+                }
+            }
+            net_close(srv)
+            seen
         }
     }
 }

@@ -792,7 +792,13 @@ impl<'a, W: Write> Interp<'a, W> {
     /// program never sees an address. A handle that names nothing is an
     /// ordinary failure rather than a panic: it is what a program gets for
     /// using a connection after closing it.
-    fn net_call(&mut self, which: &str, handle: &Value, text: Option<String>) -> Value {
+    fn net_call(
+        &mut self,
+        which: &str,
+        handle: &Value,
+        text: Option<String>,
+        blob: Option<Rc<Vec<u8>>>,
+    ) -> Value {
         use std::io::{Read, Write};
         let as_int = |v: &Value| match v {
             Value::Int(n) => Some(*n),
@@ -887,6 +893,25 @@ impl<'a, W: Write> Interp<'a, W> {
                     Err(e) => fail(e.to_string()),
                 }
             }
+            // The same read without the lossy conversion: a socket carrying a
+            // JPEG cannot have its invalid sequences replaced ([L-LIB-NET]).
+            ("tcp_read_bytes", NetSocket::Stream(stream)) => {
+                let mut buf = vec![0u8; 65536];
+                match stream.read(&mut buf) {
+                    Ok(n) => {
+                        buf.truncate(n);
+                        Value::Ok(Rc::new(Value::Bytes(Rc::new(buf))))
+                    }
+                    Err(e) => fail(e.to_string()),
+                }
+            }
+            ("tcp_write_bytes", NetSocket::Stream(stream)) => {
+                let body = blob.unwrap_or_default();
+                match stream.write_all(&body).and_then(|()| stream.flush()) {
+                    Ok(()) => Value::Ok(Rc::new(Value::Unit)),
+                    Err(e) => fail(e.to_string()),
+                }
+            }
             ("tcp_write", NetSocket::Stream(stream)) => {
                 let body = text.unwrap_or_default();
                 match stream
@@ -927,10 +952,10 @@ impl<'a, W: Write> Interp<'a, W> {
                 }
             }
             ("udp_recv", _) => fail(format!("socket {h} is not a datagram socket")),
-            ("tcp_read", NetSocket::Datagram(_)) => fail(format!(
+            ("tcp_read" | "tcp_read_bytes", NetSocket::Datagram(_)) => fail(format!(
                 "socket {h} is a datagram socket — use udp_recv, which keeps message boundaries"
             )),
-            ("tcp_write", NetSocket::Datagram(_)) => fail(format!(
+            ("tcp_write" | "tcp_write_bytes", NetSocket::Datagram(_)) => fail(format!(
                 "socket {h} is a datagram socket — use udp_send, which needs a destination"
             )),
             ("tcp_accept", NetSocket::Datagram(_)) => {
@@ -2705,15 +2730,23 @@ uses to mark the end of a string"
                         );
                     }
                     "tcp_listen" | "tcp_connect" | "tcp_accept" | "tcp_read"
-                    | "tcp_write" | "net_close" | "net_port" | "udp_bind"
-                    | "udp_recv" => {
+                    | "tcp_read_bytes" | "tcp_write" | "tcp_write_bytes"
+                    | "net_close" | "net_port" | "udp_bind" | "udp_recv" => {
                         let h = self.eval_expr(&args[0])?;
                         let extra = if id.name == "tcp_write" || id.name == "tcp_connect" {
                             Some(self.eval_expr(&args[1])?.to_string())
                         } else {
                             None
                         };
-                        return Ok(self.net_call(&id.name, &h, extra));
+                        let blob = if id.name == "tcp_write_bytes" {
+                            match self.eval_expr(&args[1])? {
+                                Value::Bytes(b) => Some(b),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        return Ok(self.net_call(&id.name, &h, extra, blob));
                     }
                     "read_file" => {
                         let p = self.eval_expr(&args[0])?.to_string();

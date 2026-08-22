@@ -718,6 +718,8 @@ impl<'m> Codegen<'m> {
             ("grasm_tcp_connect", vec![i64t, i64t], Some(i64t)),
             ("grasm_tcp_accept", vec![i64t], Some(i64t)),
             ("grasm_tcp_read", vec![i64t], Some(i64t)),
+            ("grasm_tcp_read_bytes", vec![i64t], Some(i64t)),
+            ("grasm_tcp_write_bytes", vec![i64t, i64t], Some(i64t)),
             ("grasm_tcp_write", vec![i64t, i64t], Some(i64t)),
             ("grasm_net_close", vec![i64t], None),
             ("grasm_net_wait", vec![i64t, i64t], Some(i64t)),
@@ -7817,8 +7819,8 @@ checker did",
             // The five `net` builtins. A handle is an `i64` and a payload is a
             // `str`, so nothing here needs a pointer type — which is why the
             // network could be added to the language without adding one.
-            "tcp_listen" | "tcp_accept" | "tcp_read" | "net_port" | "udp_bind"
-            | "udp_recv" => {
+            "tcp_listen" | "tcp_accept" | "tcp_read" | "tcp_read_bytes"
+            | "net_port" | "udp_bind" | "udp_recv" => {
                 let (hv, ht) = self.eval_expr_val(&args[0])?;
                 let boxed = self.box_value(hv, &ht);
                 let (sym, ok_t) = match id.name.as_str() {
@@ -7827,6 +7829,7 @@ checker did",
                     "net_port" => ("grasm_net_port", VType::I64),
                     "udp_bind" => ("grasm_udp_bind", VType::I64),
                     "udp_recv" => ("grasm_udp_recv", VType::Bytes),
+                    "tcp_read_bytes" => ("grasm_tcp_read_bytes", VType::Bytes),
                     _ => ("grasm_tcp_read", VType::Str),
                 };
                 let v = self.call_rt(sym, &[boxed]).unwrap();
@@ -7932,11 +7935,16 @@ checker did",
                     VType::Fallible(Box::new(VType::I64), Box::new(VType::Sum("IoError".into()))),
                 )));
             }
-            "tcp_write" => {
+            "tcp_write" | "tcp_write_bytes" => {
                 let (hv, ht) = self.eval_expr_val(&args[0])?;
                 let boxed_h = self.box_value(hv, &ht);
                 let (dv, _) = self.eval_expr_val(&args[1])?;
-                let v = self.call_rt("grasm_tcp_write", &[boxed_h, dv]).unwrap();
+                let sym = if id.name == "tcp_write" {
+                    "grasm_tcp_write"
+                } else {
+                    "grasm_tcp_write_bytes"
+                };
+                let v = self.call_rt(sym, &[boxed_h, dv]).unwrap();
                 self.call_rt("grasm_val_dec", &[boxed_h]);
                 self.call_rt("grasm_val_dec", &[dv]);
                 return Ok(Some((
@@ -9309,6 +9317,10 @@ checker did",
                                 Box::new(VType::Str),
                                 Box::new(VType::Sum("IoError".into())),
                             )),
+                            "tcp_read_bytes" => Some(VType::Fallible(
+                                Box::new(VType::Bytes),
+                                Box::new(VType::Sum("IoError".into())),
+                            )),
                             "proc_run" | "proc_pipeline" => Some(VType::Fallible(
                                 Box::new(VType::Tuple(vec![
                                     VType::I64,
@@ -9325,7 +9337,7 @@ checker did",
                                 Box::new(VType::List(Box::new(VType::I64))),
                                 Box::new(VType::Sum("IoError".into())),
                             )),
-                            "tcp_write" => Some(VType::Fallible(
+                            "tcp_write" | "tcp_write_bytes" => Some(VType::Fallible(
                                 Box::new(VType::Unit),
                                 Box::new(VType::Sum("IoError".into())),
                             )),
