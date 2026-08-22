@@ -1,0 +1,41 @@
+--- decoding ---
+  plus: a b
+  percent: a b
+  at sign: ada@x.org
+  lone percent kept: 100%
+  bad escape kept: %zz
+  field present: a@b.org
+  field absent: ""
+  field empty: ""
+--- accepted ---
+  ordinary: {"ok": true, "errors": []}
+  long domain: {"ok": true, "errors": []}
+--- refused ---
+  all empty: {"ok": false, "errors": ["name: must not be empty", "email: must not be empty", "password: at least 8 characters, got 0", "password: needs a letter", "password: needs a digit"]}
+  no name: {"ok": false, "errors": ["name: must not be empty"]}
+  no at: {"ok": false, "errors": ["email: needs exactly one @, got 0"]}
+  two ats: {"ok": false, "errors": ["email: needs exactly one @, got 2"]}
+  nothing before at: {"ok": false, "errors": ["email: nothing before the @"]}
+  no dot in domain: {"ok": false, "errors": ["email: the domain needs a dot"]}
+  domain ends in dot: {"ok": false, "errors": ["email: the domain may not start or end with a dot"]}
+  space in email: {"ok": false, "errors": ["email: no spaces"]}
+  short password: {"ok": false, "errors": ["password: at least 8 characters, got 3"]}
+  no digit: {"ok": false, "errors": ["password: needs a digit"]}
+  no letter: {"ok": false, "errors": ["password: needs a letter"]}
+  every rule at once: {"ok": false, "errors": ["name: must not be empty", "email: needs exactly one @, got 0", "password: at least 8 characters, got 1", "password: needs a digit"]}
+--- case-insensitive addresses ---
+  Ada@X.org vs ada@x.org: true
+  a@x.org vs b@x.org: false
+--- the store ---
+  fresh: 0 account(s)
+  after one: 1
+  same address is taken: true
+  another is not: false
+  after two: 2, names [Ada, Bob]
+--- five registrations against one store ---
+  HTTP/1.1 201 Created {"ok": true, "errors": []}
+  HTTP/1.1 422 Unprocessable Entity {"ok": false, "errors": ["email: already registered"]}
+  HTTP/1.1 422 Unprocessable Entity {"ok": false, "errors": ["password: at least 8 characters, got 6"]}
+  HTTP/1.1 201 Created {"ok": true, "errors": []}
+  HTTP/1.1 422 Unprocessable Entity {"ok": false, "errors": ["name: must not be empty", "email: needs exactly one @, got 0", "password: at least 8 characters, got 1", "password: needs a digit"]}
+  registered: 2

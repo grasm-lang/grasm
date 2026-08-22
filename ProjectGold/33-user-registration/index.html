@@ -1,0 +1,144 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Register — one copy of the rules</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font: 16px/1.55 system-ui, sans-serif;
+    max-width: 32rem;
+    margin: 3.5rem auto;
+    padding: 0 1.25rem;
+  }
+  h1 { font-size: 1.15rem; font-weight: 600; }
+  p.lede { opacity: 0.75; font-size: 0.9rem; }
+  label { display: block; margin-top: 1rem; font-size: 0.85rem; opacity: 0.8; }
+  input {
+    font: inherit; width: 100%; box-sizing: border-box;
+    padding: 0.45rem 0.6rem; margin-top: 0.25rem;
+    border: 1px solid currentColor; border-radius: 6px;
+    background: transparent; color: inherit;
+  }
+  button {
+    font: inherit; margin-top: 1.25rem;
+    padding: 0.45rem 1.1rem;
+    border: 1px solid currentColor; border-radius: 6px;
+    background: transparent; color: inherit; cursor: pointer;
+  }
+  button[disabled] { opacity: 0.45; cursor: default; }
+  ul { margin: 1rem 0 0; padding-left: 1.1rem; }
+  li { font-size: 0.9rem; }
+  .ok { font-size: 0.9rem; }
+  code { font-family: ui-monospace, monospace; font-size: 0.85em; }
+</style>
+
+<h1>Register</h1>
+<p class="lede">
+  The messages below come from <code>main.gr</code> — the same file the server
+  runs — fetched as text and executed here by the wasm build. There is one copy
+  of the rules.
+</p>
+
+<form id="form">
+  <label>Name <input name="name" autocomplete="name"></label>
+  <label>Email <input name="email" type="email" autocomplete="email"></label>
+  <label>Password <input name="password" type="password" autocomplete="new-password"></label>
+  <button id="submit" type="submit" disabled>Loading rules…</button>
+</form>
+<ul id="errors"></ul>
+<p class="ok" id="ok"></p>
+
+<script>
+  const API = "http://localhost:8974";
+  const form = document.getElementById("form");
+  const errors = document.getElementById("errors");
+  const okLine = document.getElementById("ok");
+  const submit = document.getElementById("submit");
+
+  let compiled = null, source = null;
+
+  // The clock is imported because `std::time` panics on this target, and a
+  // panic with no unwinding is an abort. `dlsym` is reached through Rust's std
+  // and is never callable from Grasm.
+  const imports = {
+    env: {
+      grasm_now_millis: () => Date.now(),
+      dlsym: () => 0,
+    },
+  };
+
+  // Compiled once, instantiated per run: a wasm trap leaves its instance
+  // unusable, so a program that panics must not take the next one with it
+  // (docs/wasm.md).
+  Promise.all([
+    fetch("grasm.wasm", { cache: "no-store" }).then(r => r.arrayBuffer()),
+    fetch("main.gr", { cache: "no-store" }).then(r => r.text()),
+  ]).then(([bytes, text]) => {
+    compiled = new WebAssembly.Module(bytes);
+    source = text;
+    submit.disabled = false;
+    submit.textContent = "Register";
+  }).catch(e => {
+    submit.textContent = "rules unavailable";
+    okLine.textContent =
+      "This page must be served over http — a file:// page cannot fetch. " +
+      "Try: python3 -m http.server, then open this page from there. (" + e.message + ")";
+  });
+
+  // The ABI docs/wasm.md documents: total, exit code, stdout, diagnostics.
+  function runRules(body) {
+    const ex = new WebAssembly.Instance(compiled, imports).exports;
+    const mem = () => new Uint8Array(ex.memory.buffer);
+    const enc = new TextEncoder();
+    const s = enc.encode(source);
+    const sp = ex.grasm_alloc(s.length);
+    mem().set(s, sp);
+    const i = enc.encode(body || "");
+    const ip = i.length ? ex.grasm_alloc(i.length) : 0;
+    if (i.length) mem().set(i, ip);
+
+    const res = ex.grasm_run_with_stdin(sp, s.length, ip, i.length);
+    ex.grasm_free(sp, s.length);
+    if (i.length) ex.grasm_free(ip, i.length);
+
+    const v = new DataView(ex.memory.buffer);
+    const total = v.getUint32(res, true);
+    const outLen = v.getUint32(res + 8, true);
+    const out = new TextDecoder().decode(mem().slice(res + 12, res + 12 + outLen));
+    ex.grasm_free(res, total);
+    return out.trim();
+  }
+
+  function encodeForm(fd) {
+    return [...fd.entries()]
+      .map(([k, v]) => encodeURIComponent(k) + "=" + encodeURIComponent(v))
+      .join("&");
+  }
+
+  function render(verdict, sentTo) {
+    errors.replaceChildren();
+    okLine.textContent = "";
+    for (const e of verdict.errors) {
+      const li = document.createElement("li");
+      li.textContent = e;
+      errors.append(li);
+    }
+    if (verdict.ok) okLine.textContent = sentTo || "looks good — submitting…";
+  }
+
+  form.addEventListener("submit", ev => {
+    ev.preventDefault();
+    const body = encodeForm(new FormData(form));
+
+    // The browser's check: the server's own rules, in wasm, with no round trip.
+    const verdict = JSON.parse(runRules(body));
+    render(verdict);
+    if (!verdict.ok) return;
+
+    // The server's check: the same rules again, because a browser's verdict is
+    // never the one that counts.
+    fetch(API + "/register", { method: "POST", body })
+      .then(r => r.json().then(j => ({ status: r.status, j })))
+      .then(({ status, j }) => render(j, status === 201 ? "registered" : ""))
+      .catch(e => { okLine.textContent = "no server: run `grasm run main.gr -- serve`"; });
+  });
+</script>

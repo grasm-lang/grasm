@@ -1,0 +1,543 @@
+// Phase 2, project 2 — User Registration Form.
+//
+// Validation on both sides, and the interesting part is *how* both sides get
+// the rules. Normally a form is validated twice — once in JavaScript for the
+// message, once on the server for the truth — and the two copies drift. The
+// browser half here runs **this file**, fetched as text and executed by the
+// wasm build of the reference interpreter, with the form body on stdin. There
+// is one implementation of the rules and both sides call it.
+//
+// ```
+// grasm run main.gr                        # the comparison the harness makes
+// echo 'name=Ada&email=ada@x.org&password=hunter2!' | grasm run main.gr
+// grasm run main.gr -- serve               # then open index.html
+// ```
+//
+// A line on stdin is a form body to validate; no stdin runs the demonstration.
+// That is what lets the same file be the server, the checker and the page's
+// validator without a flag the browser would have to know about.
+//
+// **This project does not store passwords.** It validates one and throws it
+// away. Storing it would mean either plaintext — which is a bad example
+// somebody copies — or a hash, and hashing is project 7's subject, where
+// SHA-256 stops being an exercise. The store holds a name and an email.
+
+let PORT = 8974
+
+// ---------------------------------------------------------------------------
+// Form decoding
+// ---------------------------------------------------------------------------
+
+fn hex_value(c: str) -> i64 {
+    let digits = "0123456789abcdef"
+    let lower = c.to_lower()
+    match digits.index_of(lower) {
+        Some(i) -> i
+        None -> -1
+    }
+}
+
+/// `a+b%20c` back to `a b c`. A malformed escape is left alone rather than
+/// dropped: a form that mangles what the user typed is worse than one that
+/// shows it back unchanged.
+fn percent_decode(s: str) -> str {
+    var out = ""
+    var i = 0
+    while i < s.len() {
+        let c = s.substr(i, 1)
+        if c == "+" {
+            out += " "
+            i += 1
+        } else if c == "%" and i + 2 < s.len() {
+            let hi = hex_value(s.substr(i + 1, 1))
+            let lo = hex_value(s.substr(i + 2, 1))
+            if hi >= 0 and lo >= 0 {
+                out += (hi * 16 + lo).to_char()
+                i += 3
+            } else {
+                out += c
+                i += 1
+            }
+        } else {
+            out += c
+            i += 1
+        }
+    }
+    out
+}
+
+/// One field out of `name=Ada&email=ada%40x.org`. Absent is the empty string,
+/// because a form that omits a field and a form that sends it empty are the
+/// same thing to a validator.
+fn form_field(body: str, want: str) -> str {
+    for pair in body.split("&") {
+        let at = pair.index_of("=")
+        match at {
+            None -> {}
+            Some(i) -> {
+                if pair.substr(0, i) == want {
+                    return percent_decode(pair.substr(i + 1, pair.len() - i - 1))
+                }
+            }
+        }
+    }
+    ""
+}
+
+// ---------------------------------------------------------------------------
+// The rules — the one copy of them
+// ---------------------------------------------------------------------------
+
+type Account = {
+    name: str,
+    email: str,
+}
+
+/// Every reason this registration is refused, in a fixed order. Empty means
+/// accepted.
+///
+/// All of them, not the first: a form that reveals one problem per submission
+/// makes the user submit four times to learn four things.
+fn problems(name: str, email: str, password: str) -> [str] {
+    var out: [str] = []
+    if name.trim() == "" {
+        out.push("name: must not be empty")
+    } else if name.len() > 64 {
+        out.push("name: at most 64 characters, got {name.len()}")
+    }
+    for e in email_problems(email) {
+        out.push(e)
+    }
+    for e in password_problems(password) {
+        out.push(e)
+    }
+    out
+}
+
+fn email_problems(email: str) -> [str] {
+    var out: [str] = []
+    if email == "" {
+        out.push("email: must not be empty")
+        return out
+    }
+    let parts = email.split("@")
+    if parts.len() != 2 {
+        out.push("email: needs exactly one @, got {parts.len() - 1}")
+        return out
+    }
+    if parts[0] == "" {
+        out.push("email: nothing before the @")
+    }
+    let domain = parts[1]
+    if domain == "" {
+        out.push("email: nothing after the @")
+        return out
+    }
+    if not domain.contains(".") {
+        out.push("email: the domain needs a dot")
+    } else if domain.starts_with(".") or domain.ends_with(".") {
+        out.push("email: the domain may not start or end with a dot")
+    }
+    if email.contains(" ") {
+        out.push("email: no spaces")
+    }
+    out
+}
+
+fn password_problems(password: str) -> [str] {
+    var out: [str] = []
+    if password.len() < 8 {
+        out.push("password: at least 8 characters, got {password.len()}")
+    }
+    var has_letter = false
+    var has_digit = false
+    for c in password.codes() {
+        if (c >= 97 and c <= 122) or (c >= 65 and c <= 90) {
+            has_letter = true
+        }
+        if c >= 48 and c <= 57 {
+            has_digit = true
+        }
+    }
+    if not has_letter {
+        out.push("password: needs a letter")
+    }
+    if not has_digit {
+        out.push("password: needs a digit")
+    }
+    out
+}
+
+/// Two addresses that differ only in case are the same account. The local part
+/// is technically case-sensitive and no mail provider treats it that way, and a
+/// registration form that lets `Ada@x.org` and `ada@x.org` both exist has
+/// created a support ticket, not a feature.
+fn same_email(a: str, b: str) -> bool {
+    a.trim().to_lower() == b.trim().to_lower()
+}
+
+// ---------------------------------------------------------------------------
+// The store
+// ---------------------------------------------------------------------------
+
+fn store_path() -> str / {io} {
+    let dir = env("TMPDIR") ?? "/tmp"
+    let trimmed = if dir.ends_with("/") { dir.substr(0, dir.len() - 1) } else { dir }
+    "{trimmed}/grasm_accounts.tsv"
+}
+
+fn load_accounts(path: str) -> [Account] / {io} {
+    var out: [Account] = []
+    match read_file(path) {
+        Err(e) -> {}
+        Ok(text) -> {
+            for line in text.lines() {
+                if line.trim() != "" {
+                    let parts = line.split("\t")
+                    if parts.len() == 2 {
+                        out.push(Account{ name: parts[0], email: parts[1] })
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn save_accounts(path: str, accounts: [Account]) / {io} {
+    var text = ""
+    for a in accounts {
+        text += "{a.name}\t{a.email}\n"
+    }
+    match write_file(path, text) {
+        Ok(_) -> {}
+        Err(e) -> eprint("cannot save accounts: {e}")
+    }
+}
+
+fn taken(accounts: [Account], email: str) -> bool {
+    for a in accounts {
+        if same_email(a.email, email) {
+            return true
+        }
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+
+fn json_escape(s: str) -> str {
+    var out = ""
+    for c in s.codes() {
+        if c == 34 {
+            out += "\\\""
+        } else if c == 92 {
+            out += "\\\\"
+        } else if c < 32 {
+            out += " "
+        } else {
+            out += c.to_char()
+        }
+    }
+    out
+}
+
+fn json_list(items: [str]) -> str {
+    var parts: [str] = []
+    for i in items {
+        parts.push("\"{json_escape(i)}\"")
+    }
+    "[{parts.join(", ")}]"
+}
+
+fn result_json(ok: bool, errors: [str]) -> str {
+    "\{\"ok\": {ok}, \"errors\": {json_list(errors)}\}"
+}
+
+fn response(status: str, content_type: str, body: str) -> str {
+    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {body.byte_len()}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{body}"
+}
+
+// ---------------------------------------------------------------------------
+// stdin mode: the browser's validator
+// ---------------------------------------------------------------------------
+
+/// One form body in, one JSON verdict out. This is what the page runs in wasm,
+/// on the same source the server imports its rules from — which is the whole
+/// claim of this project.
+fn validate_line(body: str) -> str {
+    let errs = problems(
+        form_field(body, "name"),
+        form_field(body, "email"),
+        form_field(body, "password"),
+    )
+    result_json(errs.is_empty(), errs)
+}
+
+// ---------------------------------------------------------------------------
+// The checks the harness compares across three engines
+// ---------------------------------------------------------------------------
+
+fn show(label: str, body: str) / {io} {
+    print("  {label}: {validate_line(body)}")
+}
+
+fn core_checks() / {io} {
+    print("--- decoding ---")
+    print("  plus: {percent_decode("a+b")}")
+    print("  percent: {percent_decode("a%20b")}")
+    print("  at sign: {percent_decode("ada%40x.org")}")
+    print("  lone percent kept: {percent_decode("100%")}")
+    print("  bad escape kept: {percent_decode("%zz")}")
+    print("  field present: {form_field("name=Ada&email=a%40b.org", "email")}")
+    print("  field absent: \"{form_field("name=Ada", "email")}\"")
+    print("  field empty: \"{form_field("name=&email=x", "name")}\"")
+
+    print("--- accepted ---")
+    show("ordinary", "name=Ada&email=ada%40example.org&password=hunter2x")
+    show("long domain", "name=B&email=b%40a.b.c.example&password=passw0rd")
+
+    print("--- refused ---")
+    show("all empty", "")
+    show("no name", "name=&email=a%40b.org&password=passw0rd")
+    show("no at", "name=A&email=ab.org&password=passw0rd")
+    show("two ats", "name=A&email=a%40b%40c.org&password=passw0rd")
+    show("nothing before at", "name=A&email=%40b.org&password=passw0rd")
+    show("no dot in domain", "name=A&email=a%40borg&password=passw0rd")
+    show("domain ends in dot", "name=A&email=a%40b.org.&password=passw0rd")
+    show("space in email", "name=A&email=a+b%40c.org&password=passw0rd")
+    show("short password", "name=A&email=a%40b.org&password=pw1")
+    show("no digit", "name=A&email=a%40b.org&password=password")
+    show("no letter", "name=A&email=a%40b.org&password=12345678")
+    show("every rule at once", "name=&email=nope&password=x")
+
+    print("--- case-insensitive addresses ---")
+    print("  Ada@X.org vs ada@x.org: {same_email("Ada@X.org", "ada@x.org")}")
+    print("  a@x.org vs b@x.org: {same_email("a@x.org", "b@x.org")}")
+}
+
+fn store_checks() / {io} {
+    print("--- the store ---")
+    let path = store_path()
+    save_accounts(path, [])
+    print("  fresh: {load_accounts(path).len()} account(s)")
+    var accounts = load_accounts(path)
+    accounts.push(Account{ name: "Ada", email: "ada@example.org" })
+    save_accounts(path, accounts)
+    print("  after one: {load_accounts(path).len()}")
+    print("  same address is taken: {taken(load_accounts(path), "ADA@Example.ORG")}")
+    print("  another is not: {taken(load_accounts(path), "bob@example.org")}")
+    accounts = load_accounts(path)
+    accounts.push(Account{ name: "Bob", email: "bob@example.org" })
+    save_accounts(path, accounts)
+    let all = load_accounts(path)
+    print("  after two: {all.len()}, names {all.map(|a| a.name)}")
+}
+
+// ---------------------------------------------------------------------------
+// The server
+// ---------------------------------------------------------------------------
+
+type Req = {
+    method: str,
+    path: str,
+    body: str,
+}
+
+fn parse_req(raw: str) -> Req {
+    let head_end = raw.index_of("\r\n\r\n")
+    let head = match head_end {
+        Some(i) -> raw.substr(0, i)
+        None -> raw
+    }
+    let body = match head_end {
+        Some(i) -> raw.substr(i + 4, raw.len() - i - 4)
+        None -> ""
+    }
+    let lines = head.lines()
+    if lines.len() == 0 {
+        return Req{ method: "", path: "empty request", body: "" }
+    }
+    let parts = lines[0].split(" ")
+    if parts.len() != 3 or not parts[1].starts_with("/") {
+        return Req{ method: "", path: "malformed request line", body: "" }
+    }
+    Req{ method: parts[0], path: parts[1], body: body }
+}
+
+fn form_page() -> str {
+    "<!doctype html><meta charset=\"utf-8\"><title>Register</title><h1>Register</h1><p>POST name, email and password as a form body to /register. GET /users for the count.</p>"
+}
+
+/// The one route that matters. Validation first, then the store — an address
+/// already taken is a *refusal*, not a validation error, because the form was
+/// filled in correctly and the answer is still no.
+fn register(path: str, body: str) -> (bool, str) / {io} {
+    let errs = problems(
+        form_field(body, "name"),
+        form_field(body, "email"),
+        form_field(body, "password"),
+    )
+    if not errs.is_empty() {
+        return (false, result_json(false, errs))
+    }
+    let email = form_field(body, "email")
+    var accounts = load_accounts(path)
+    if taken(accounts, email) {
+        return (false, result_json(false, ["email: already registered"]))
+    }
+    accounts.push(Account{ name: form_field(body, "name"), email: email })
+    save_accounts(path, accounts)
+    (true, result_json(true, []))
+}
+
+fn route(r: Req, path: str) -> str / {io} {
+    if r.method == "" {
+        return response("400 Bad Request", "text/plain", "bad request: {r.path}\n")
+    }
+    if r.path == "/" and r.method == "GET" {
+        return response("200 OK", "text/html", form_page())
+    }
+    if r.path == "/users" and r.method == "GET" {
+        return response("200 OK", "application/json",
+            "\{\"count\": {load_accounts(path).len()}\}")
+    }
+    if r.path == "/validate" and r.method == "POST" {
+        return response("200 OK", "application/json", validate_line(r.body))
+    }
+    if r.path == "/register" and r.method == "POST" {
+        let (ok, body) = register(path, r.body)
+        let status = if ok { "201 Created" } else { "422 Unprocessable Entity" }
+        return response(status, "application/json", body)
+    }
+    response("404 Not Found", "text/plain", "no route for {r.method} {r.path}\n")
+}
+
+fn serve() / {io, net} {
+    let path = store_path()
+    let listener = match tcp_listen(PORT) {
+        Err(e) -> {
+            print("cannot listen on {PORT}: {e}")
+            return
+        }
+        Ok(l) -> l
+    }
+    print("http://localhost:{PORT}  (ctrl-c to stop)")
+    print("accounts: {path}, currently {load_accounts(path).len()}")
+    var open: [i64] = []
+    var going = true
+    while going {
+        var waiting: [i64] = [listener]
+        for h in open {
+            waiting.push(h)
+        }
+        let ready = net_wait(waiting, 60000) ?? []
+        for h in ready {
+            if h == listener {
+                match tcp_accept(listener) {
+                    Err(e) -> print("accept failed: {e}")
+                    Ok(conn) -> open.push(conn)
+                }
+            } else {
+                let raw = tcp_read(h) ?? ""
+                if raw != "" {
+                    match tcp_write(h, route(parse_req(raw), path)) {
+                        Ok(_) -> {}
+                        Err(e) -> {}
+                    }
+                }
+                net_close(h)
+                var still: [i64] = []
+                for k in open {
+                    if k != h { still.push(k) }
+                }
+                open = still
+            }
+        }
+    }
+}
+
+/// Six registrations against one store, over real sockets, in one process.
+///
+/// Order matters here and cannot be wished away: the second attempt at
+/// `ada@example.org` is refused *because* the first succeeded. So the requests
+/// are issued and answered one at a time — this is the project where the
+/// sequence is the point, and project 32 is the one that demonstrates
+/// concurrency.
+fn exchange() / {io, net} {
+    let path = store_path()
+    save_accounts(path, [])
+    let listener = match tcp_listen(0) {
+        Err(e) -> {
+            print("  cannot listen: {e}")
+            return
+        }
+        Ok(l) -> l
+    }
+    let port = net_port(listener) ?? 0
+    let bodies = [
+        "name=Ada&email=ada%40example.org&password=hunter2x",
+        "name=Ada+again&email=ADA%40Example.ORG&password=hunter2x",
+        "name=Bob&email=bob%40example.org&password=short1",
+        "name=Bob&email=bob%40example.org&password=passw0rd",
+        "name=&email=nope&password=x",
+    ]
+    for body in bodies {
+        match tcp_connect("127.0.0.1", port) {
+            Err(e) -> print("  dial failed: {e}")
+            Ok(c) -> {
+                let req = "POST /register HTTP/1.1\r\nHost: x\r\nContent-Length: {body.byte_len()}\r\n\r\n{body}"
+                match tcp_write(c, req) {
+                    Err(e) -> print("  send failed: {e}")
+                    Ok(_) -> {
+                        match tcp_accept(listener) {
+                            Err(e) -> print("  accept failed: {e}")
+                            Ok(conn) -> {
+                                let raw = tcp_read(conn) ?? ""
+                                match tcp_write(conn, route(parse_req(raw), path)) {
+                                    Ok(_) -> {}
+                                    Err(e) -> {}
+                                }
+                                let reply = tcp_read(c) ?? ""
+                                let status = if reply.lines().len() > 0 {
+                                    reply.lines()[0].trim()
+                                } else {
+                                    "(no reply)"
+                                }
+                                let at = reply.index_of("\r\n\r\n")
+                                let out = match at {
+                                    Some(j) -> reply.substr(j + 4, reply.len() - j - 4)
+                                    None -> ""
+                                }
+                                print("  {status} {out.trim()}")
+                                net_close(conn)
+                            }
+                        }
+                    }
+                }
+                net_close(c)
+            }
+        }
+    }
+    print("  registered: {load_accounts(path).len()}")
+    net_close(listener)
+}
+
+fn main() / {io, net} {
+    if args().len() > 0 and args()[0] == "serve" {
+        serve()
+        return
+    }
+    // A line on stdin is a form body: this is the mode the page runs in wasm.
+    let line = input()
+    if line.trim() != "" {
+        print(validate_line(line))
+        return
+    }
+    core_checks()
+    store_checks()
+    print("--- five registrations against one store ---")
+    exchange()
+}

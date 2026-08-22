@@ -1043,3 +1043,43 @@ agrees with the interpreter. So the self-hosting path is open today, and F9's
 real cost is narrower than recorded — it blocks reading a BMP (18), building a
 DNS packet (25), and serving binary over a socket, which are what it was
 originally found for.
+
+## F32 — the committed wasm module was four months behind the language (S2, tooling) — **fixed**
+
+Found writing phase 2's project 2, whose whole claim is that the browser runs
+the *server's own* validation rules: it fetches `main.gr` and executes it
+through the wasm build, so there is one copy of the rules rather than two that
+drift.
+
+The browser refused the file.
+
+```
+<browser>:214:19: error: unknown name `eprint`
+<browser>:260:81: error: no method `byte_len` on `str`
+```
+
+Both builtins had worked in every command-line engine for weeks. The module in
+`ProjectGold/web/grasm.wasm` was built on 18 August and never rebuilt, and
+nothing compared it against the compiler beside it. `scripts/wasmtest.sh` — the
+gate whose whole subject is the wasm engine — tests a **fresh** build, so it
+passed the entire time.
+
+An artifact that is committed and never checked is a fourth engine nobody is
+running. The gate now compares every committed `grasm.wasm` against a fresh
+build and fails on a difference, with the refresh command in the message.
+
+### And the same drift in the other direction
+
+Rebuilding turned up two conformance programs reported as *mismatches* rather
+than skips: `L-LIB-BYTES` and `L-LIB-PROC`. The harness carries a list of what
+`wasm32-unknown-unknown` cannot do — threads, sockets, a filesystem — and that
+list had not grown when the library did. `write_bytes` and `proc_pipeline`
+arrived after it was written, so programs correctly *refusing* on a target with
+no filesystem and no processes were being counted as disagreements.
+
+The list now covers `par_filter`, `spawn`, `tcp_connect`, `udp_bind`,
+`net_wait`, `read_bytes`, `write_bytes`, `list_dir`, `make_dir`, `proc_run` and
+`proc_pipeline`. `wasmtest.sh`: 181 identical, 0 mismatched, 38 skipped.
+
+Two defects of one shape: a harness's model of the world stops being updated,
+and it goes on reporting success.

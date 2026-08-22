@@ -760,6 +760,9 @@ impl<'a, W: Write> Interp<'a, W> {
         }
         #[cfg(not(unix))]
         {
+            // Read so that a build for a platform without `poll` — wasm32 is
+            // the one that matters here — does not warn about it.
+            let _ = timeout_ms;
             fail("net_wait needs poll(2), which this platform does not provide".to_string())
         }
     }

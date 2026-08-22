@@ -52,8 +52,18 @@ for src in $programs; do
         SKIPPED+=("$src — imports a module, and wasm32 has no filesystem")
         continue
     fi
-    for need in par_map:threads tcp_listen:sockets tcp_accept:sockets \
-                read_file:filesystem write_file:filesystem; do
+    # This list is the harness's model of what the target cannot do, and it
+    # has to grow when the library does. `write_bytes` and `proc_pipeline`
+    # arrived after it was written, so two conformance programs were reported
+    # as *mismatches* rather than skips — the same drift as the committed
+    # module below, in the other direction.
+    for need in par_map:threads par_filter:threads spawn:threads \
+                tcp_listen:sockets tcp_accept:sockets tcp_connect:sockets \
+                udp_bind:sockets net_wait:sockets \
+                read_file:filesystem write_file:filesystem \
+                read_bytes:filesystem write_bytes:filesystem \
+                list_dir:filesystem make_dir:filesystem \
+                proc_run:processes proc_pipeline:processes; do
         if grep -q "${need%%:*}" "$src"; then
             skip=$((skip + 1))
             SKIPPED+=("$src — needs ${need##*:}, which wasm32-unknown-unknown has none of")
@@ -104,5 +114,29 @@ if [ ${#FAILED[@]} -gt 0 ]; then
     echo
     echo "MISMATCHED:"
     printf '  %s\n' "${FAILED[@]}"
+    exit 1
+fi
+
+# The *committed* modules, not just the one just built.
+#
+# Everything above tests a fresh build. The pages under ProjectGold serve a
+# checked-in copy, and nothing was comparing the two — so that copy sat four
+# months behind the language, refusing `eprint` and `byte_len` in a browser
+# while every command-line engine accepted them. Found by a project trying to
+# run its own source in the browser; it would not have been found by this
+# script, which is the point of adding this to it.
+stale=0
+for committed in ProjectGold/web/grasm.wasm ProjectGold/*/grasm.wasm; do
+    [ -f "$committed" ] || continue
+    if ! cmp -s "$WASM" "$committed"; then
+        echo "stale: $committed differs from a fresh build of grasm_wasm"
+        stale=$((stale + 1))
+    fi
+done
+if [ "$stale" -gt 0 ]; then
+    echo
+    echo "$stale committed wasm module(s) are behind the language. Refresh with:"
+    echo "  cargo build --release --target wasm32-unknown-unknown -p grasm_wasm"
+    echo "  cp target/wasm32-unknown-unknown/release/grasm_wasm.wasm ProjectGold/web/grasm.wasm"
     exit 1
 fi
