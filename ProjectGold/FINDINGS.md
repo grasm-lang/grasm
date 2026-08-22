@@ -917,7 +917,7 @@ blocking read; it simply cannot block, because the bytes are already there. The
 `async` row still exists in the vocabulary with nothing performing it, and F14
 below — that `spawn` cannot perform I/O at all — is untouched.
 
-## F14 — there is no way to do concurrent I/O (S3, language) — **half fixed**
+## F14 — there is no way to do concurrent I/O (S3, language) — **mostly fixed**
 
 Found writing 22-multithreaded-scraper, after `tcp_connect` unblocked it.
 
@@ -963,13 +963,35 @@ the evidence. Project 30 was unblocked the same way. Neither needed a thread,
 and looking for one was the wrong instinct: the thing a sequential fetcher gets
 wrong is not that it uses one core, it is that it blocks on the first response.
 
-### The compute half, still open
+### The compute half, half of it
 
-`par_map` still refuses an effectful closure, and it is still right to: results
-would interleave differently between runs and it promises a deterministic
-answer. A program that wants to fetch on many cores *and* parse on many cores
-still cannot, and MASTERPLAN G6's "structured, uncolored concurrency" is still
-what `docs/northstar.md` records it as — *retreated*.
+There were two limits here, not one, and only the second was ever written down.
+
+The first was silent: `par_map` and `par_filter` ran on several cores **only
+when every element, capture and result was a machine word**. Anything boxed — a
+string, a list, a struct — fell back to a sequential `map` with no diagnostic,
+because a worker touching a boxed value would race on a `Cell<i64>` reference
+count. So "parse on many cores" was not refused, it just quietly did not
+happen, which is worse.
+
+That one is closed. The count is an `AtomicI64` now, which was measured before
+it was taken: about half a percent on the geometric mean of the benchmark set,
+4.3% on `tree` and nothing anywhere else. Boxed elements, boxed captures and
+boxed results all run on every core — 8,000 strings through a
+concatenation-heavy function took 128.5 ms as a `map` and 34.9 ms as a
+`par_map`, **3.68× on eight cores**. `docs/northstar.md` carries the numbers.
+
+The second limit is unchanged and still right: `par_map` refuses an effectful
+closure, because results would interleave differently between runs and it
+promises a deterministic answer. A program that wants to **fetch** on many
+cores still cannot, and MASTERPLAN G6's "structured, uncolored concurrency" is
+still what `docs/northstar.md` records it as — *retreated*.
+
+Note for honesty about this project: the `par_map` at the bottom of
+`22-multithreaded-scraper` has seven elements, and the threshold for spawning
+workers is 256. It now takes the parallel *path* where before it took the
+sequential fallback, and at seven elements it runs on one core either way. It
+demonstrates the ordering promise, not the parallelism.
 
 The shape of that fix is unchanged and the language already contains it. `async`
 is in the effect vocabulary and nothing performs it. An I/O operation that

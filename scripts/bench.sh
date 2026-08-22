@@ -21,7 +21,7 @@ mkdir -p "$WORK"
 export GOCACHE="$WORK/gocache"
 trap 'rm -rf "$WORK"' EXIT
 
-PROGRAMS="fib sieve matmul wordfreq tree sort parmap"
+PROGRAMS="fib sieve matmul wordfreq tree sort parmap parwords"
 LANGS="c rust go nim zig grasm-native grasm-interp python"
 # Repeats per program. Enough to smooth scheduler noise without making the
 # whole run take longer than anyone will wait for.
