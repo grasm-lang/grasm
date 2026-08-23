@@ -1,0 +1,91 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Chat — connections held open</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.55 system-ui, sans-serif; max-width: 34rem;
+         margin: 3rem auto; padding: 0 1.25rem; display: flex;
+         flex-direction: column; min-height: 80vh; }
+  h1 { font-size: 1.05rem; font-weight: 600; margin: 0 0 0.25rem; }
+  .note { opacity: 0.7; font-size: 0.82rem; margin: 0 0 1.25rem; }
+  .row { display: flex; gap: 0.5rem; margin-bottom: 1rem; }
+  input, button { font: inherit; padding: 0.35rem 0.6rem; border-radius: 6px;
+                  border: 1px solid currentColor; background: transparent; color: inherit; }
+  input { flex: 1; }
+  button { cursor: pointer; }
+  #log { flex: 1; overflow: auto; border-top: 1px solid color-mix(in srgb, currentColor 15%, transparent);
+         padding-top: 0.75rem; }
+  .msg { padding: 0.2rem 0; font-variant-numeric: tabular-nums; }
+  .msg .room { opacity: 0.55; }
+  .msg .who { font-weight: 600; }
+  #state { font-size: 0.8rem; opacity: 0.7; margin-top: 0.75rem; }
+  code { font-family: ui-monospace, monospace; font-size: 0.85em; }
+</style>
+
+<h1>Chat</h1>
+<p class="note">
+  The browser holds one <code>GET /room/&lt;name&gt;/events</code> open and the
+  server writes into it when anyone speaks. Before <code>net_wait</code>, a
+  blocking accept made that a deadlock rather than a slow server — the post that
+  would release a listener could never be accepted.
+</p>
+
+<div class="row">
+  <input id="room" value="general" aria-label="room">
+  <button id="join">Join</button>
+</div>
+<div class="row">
+  <input id="who" value="you" aria-label="name" style="flex:0 0 7rem">
+  <input id="text" placeholder="say something…" aria-label="message">
+  <button id="send">Send</button>
+</div>
+
+<div id="log"></div>
+<p id="state">not listening</p>
+
+<script>
+  const API = "http://localhost:8980";
+  const log = document.getElementById("log");
+  const state = document.getElementById("state");
+  const roomEl = document.getElementById("room");
+  const whoEl = document.getElementById("who");
+  const textEl = document.getElementById("text");
+
+  let stream = null;
+
+  function join() {
+    const room = roomEl.value.trim();
+    if (!room) return;
+    if (stream) stream.close();
+    // EventSource is the browser's half of server-sent events: it holds the
+    // connection and hands over each `data:` line as it arrives.
+    stream = new EventSource(`${API}/room/${encodeURIComponent(room)}/events`);
+    state.textContent = `listening to ${room}`;
+    stream.addEventListener("message", e => {
+      const div = document.createElement("div");
+      div.className = "msg";
+      div.textContent = e.data;
+      log.append(div);
+      log.scrollTop = log.scrollHeight;
+    });
+    stream.addEventListener("error", () => {
+      state.textContent = "no server: run `grasm run main.gr -- serve`";
+    });
+  }
+
+  function send() {
+    const room = roomEl.value.trim();
+    const text = textEl.value;
+    if (!room || !text) return;
+    const body = `who=${encodeURIComponent(whoEl.value)}&text=${encodeURIComponent(text)}`;
+    fetch(`${API}/room/${encodeURIComponent(room)}/say`, { method: "POST", body })
+      .then(() => { textEl.value = ""; })
+      .catch(() => { state.textContent = "send failed"; });
+  }
+
+  document.getElementById("join").addEventListener("click", join);
+  document.getElementById("send").addEventListener("click", send);
+  textEl.addEventListener("keydown", e => { if (e.key === "Enter") send(); });
+
+  join();
+</script>

@@ -1,0 +1,548 @@
+// Phase 2, project 9 — Chat Room Router.
+//
+// Listed as **blocked** in the phase 2 plan: "many simultaneous connections;
+// the blocking accept serves one". That was F13, and `net_wait` closed it.
+//
+// The thing this project exists to show is a connection **held open while
+// others are served**. A subscriber sends `GET /room/general/events` and gets
+// no reply — the server keeps the socket and writes to it later, when somebody
+// else posts. With a blocking `tcp_accept` that is not a slow server, it is a
+// deadlocked one: the accept never returns, so the post that would release the
+// subscriber never arrives.
+//
+// Server-sent events, because they are the smallest thing with that shape.
+// WebSockets would need a handshake, a frame format and a masking XOR, and
+// would demonstrate the same one fact about the language.
+//
+// ```
+// grasm run main.gr              # the comparison the harness makes
+// grasm run main.gr -- serve     # then open index.html
+// ```
+
+let PORT = 8980
+
+// ---------------------------------------------------------------------------
+// Requests
+// ---------------------------------------------------------------------------
+
+type Req = { method: str, path: str, body: str }
+
+fn parse_req(raw: str) -> Req {
+    let head_end = raw.index_of("\r\n\r\n")
+    let head = match head_end {
+        Some(i) -> raw.substr(0, i)
+        None -> raw
+    }
+    let body = match head_end {
+        Some(i) -> raw.substr(i + 4, raw.len() - i - 4)
+        None -> ""
+    }
+    let lines = head.lines()
+    if lines.len() == 0 {
+        return Req{ method: "", path: "empty request", body: "" }
+    }
+    let parts = lines[0].split(" ")
+    if parts.len() != 3 or not parts[1].starts_with("/") {
+        return Req{ method: "", path: "malformed request line", body: "" }
+    }
+    Req{ method: parts[0], path: parts[1], body: body }
+}
+
+/// `/room/general/events` -> `general`, and `""` for anything else.
+///
+/// The room name is part of the path, so it is attacker-controlled in exactly
+/// the way an uploaded filename is. It never reaches a filesystem here, but it
+/// does reach other users' screens, so it is restricted rather than trusted.
+fn room_of(path: str, suffix: str) -> str {
+    if not path.starts_with("/room/") {
+        return ""
+    }
+    let rest = path.substr(6, path.len() - 6)
+    if not rest.ends_with(suffix) {
+        return ""
+    }
+    let name = rest.substr(0, rest.len() - suffix.len())
+    if name == "" or name.len() > 32 {
+        return ""
+    }
+    for c in name.codes() {
+        let ok = (c >= 97 and c <= 122) or (c >= 48 and c <= 57) or c == 45
+        if not ok {
+            return ""
+        }
+    }
+    name
+}
+
+fn field(body: str, want: str) -> str {
+    for pair in body.split("&") {
+        match pair.index_of("=") {
+            None -> {}
+            Some(i) -> {
+                if pair.substr(0, i) == want {
+                    let raw = pair.substr(i + 1, pair.len() - i - 1)
+                    // `+` is a space in a form body. Not decoding it put
+                    // `hello+everyone` on three people's screens.
+                    var out = ""
+                    for c in raw.codes() {
+                        if c == 43 { out += " " } else { out += c.to_char() }
+                    }
+                    return out
+                }
+            }
+        }
+    }
+    ""
+}
+
+// ---------------------------------------------------------------------------
+// Messages
+// ---------------------------------------------------------------------------
+
+/// One line of an event stream.
+///
+/// A newline inside `text` would end the event early and let a message forge
+/// the ones after it — the event-stream equivalent of an injection. Replaced
+/// rather than rejected: a message with a newline in it is an ordinary thing
+/// for a person to send.
+fn event_line(room: str, who: str, text: str) -> str {
+    var flat = ""
+    for c in text.codes() {
+        if c == 10 or c == 13 {
+            flat += " "
+        } else {
+            flat += c.to_char()
+        }
+    }
+    "event: message\ndata: [{room}] {who}: {flat}\n\n"
+}
+
+fn sse_head() -> str {
+    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n"
+}
+
+fn text_response(status: str, content_type: str, body: str) -> str {
+    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {body.byte_len()}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{body}"
+}
+
+// ---------------------------------------------------------------------------
+// The router
+// ---------------------------------------------------------------------------
+
+/// A connection the server is holding open, waiting to write to.
+type Subscriber = { handle: i64, room: str }
+
+/// Everything the server knows. Passed around rather than global, so the
+/// routing can be tested without a socket.
+type Rooms = {
+    subscribers: [Subscriber],
+    history: [str],
+}
+
+fn subscribers_of(rooms: Rooms, room: str) -> [i64] {
+    var out: [i64] = []
+    for s in rooms.subscribers {
+        if s.room == room {
+            out.push(s.handle)
+        }
+    }
+    out
+}
+
+fn drop_handle(rooms: Rooms, h: i64) -> Rooms {
+    var next = rooms
+    var kept: [Subscriber] = []
+    for s in next.subscribers {
+        if s.handle != h {
+            kept.push(s)
+        }
+    }
+    next.subscribers = kept
+    next
+}
+
+/// What the server should do with one request.
+///
+/// Three answers, and the middle one is the project: **hold** means write the
+/// stream header and then keep the socket, with no reply and no close.
+type Action =
+    | Reply(text: str)
+    | Hold(room: str, head: str)
+    | Fanout(room: str, event: str, ack: str)
+
+fn decide(r: Req) -> Action {
+    if r.method == "" {
+        return Reply(text_response("400 Bad Request", "text/plain", "bad request: {r.path}\n"))
+    }
+    if r.path == "/" and r.method == "GET" {
+        return Reply(text_response("200 OK", "text/html",
+            "<!doctype html><meta charset=\"utf-8\"><title>Chat</title><h1>Chat</h1><p>GET /room/&lt;name&gt;/events to listen, POST /room/&lt;name&gt;/say to speak.</p>"))
+    }
+    let listen = room_of(r.path, "/events")
+    if listen != "" and r.method == "GET" {
+        return Hold(listen, sse_head())
+    }
+    let speak = room_of(r.path, "/say")
+    if speak != "" and r.method == "POST" {
+        let who = field(r.body, "who")
+        let text = field(r.body, "text")
+        if text == "" {
+            return Reply(text_response("422 Unprocessable Entity", "application/json",
+                "\{\"error\": \"a message needs text\"\}"))
+        }
+        let name = if who == "" { "anon" } else { who }
+        return Fanout(
+            speak,
+            event_line(speak, name, text),
+            text_response("202 Accepted", "application/json", "\{\"room\": \"{speak}\"\}"),
+        )
+    }
+    Reply(text_response("404 Not Found", "text/plain", "no route for {r.method} {r.path}\n"))
+}
+
+// ---------------------------------------------------------------------------
+// The checks the harness compares across three engines
+// ---------------------------------------------------------------------------
+
+fn describe(a: Action) -> str {
+    match a {
+        Reply(t) -> "reply {t.lines()[0].split(" ")[1]}"
+        Hold(room, head) -> "hold, room {room}"
+        Fanout(room, event, ack) -> "fanout to {room}"
+    }
+}
+
+fn show(label: str, method: str, path: str, body: str) / {io} {
+    let raw = "{method} {path} HTTP/1.1\r\nHost: x\r\n\r\n{body}"
+    print("  {label}: {describe(decide(parse_req(raw)))}")
+}
+
+fn routing_checks() / {io} {
+    print("--- routing ---")
+    show("listen", "GET", "/room/general/events", "")
+    show("speak", "POST", "/room/general/say", "who=ada&text=hello")
+    show("speak with no text", "POST", "/room/general/say", "who=ada")
+    show("index", "GET", "/", "")
+    show("listen with POST", "POST", "/room/general/events", "")
+    show("speak with GET", "GET", "/room/general/say", "")
+    show("no room", "GET", "/room//events", "")
+    show("unknown path", "GET", "/nowhere", "")
+
+    print("--- room names ---")
+    for n in ["general", "dev-2", "Général", "with space", "a/../b", "", "x"] {
+        let got = room_of("/room/{n}/events", "/events")
+        print("  \"{n}\" -> \"{got}\"")
+    }
+    let long = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    print("  36 characters -> \"{room_of("/room/{long}/events", "/events")}\"")
+
+    print("--- an event is one event ---")
+    let normal = event_line("general", "ada", "hello")
+    print("  {normal.lines().len() - 1} line(s), ends blank: {normal.ends_with("\n\n")}")
+    // A newline in the text would end the event early and let one message
+    // forge the ones after it.
+    let sneaky = event_line("general", "ada", "hi\n\nevent: message\ndata: [general] admin: you are banned")
+    print("  injected newlines removed: {sneaky.lines().len() - 1} line(s)")
+    print("  {sneaky.lines()[1]}")
+}
+
+// ---------------------------------------------------------------------------
+// The demonstration: three listeners held open while two people speak
+// ---------------------------------------------------------------------------
+
+/// Everything this project claims, in one process.
+///
+/// Three subscribers connect and are **held** — no reply, socket kept. Then two
+/// posts arrive on other connections and are fanned out to the subscribers of
+/// their own room. All of it is driven by one `net_wait`, so a held connection
+/// costs nothing while others are served.
+///
+/// A blocking `tcp_accept` would deadlock here on the first subscriber: the
+/// accept for the post that releases it never returns, because the server is
+/// inside the accept that is waiting for it.
+fn exchange() / {io, net} {
+    let listener = match tcp_listen(0) {
+        Err(e) -> {
+            print("  cannot listen: {e}")
+            return
+        }
+        Ok(l) -> l
+    }
+    let port = net_port(listener) ?? 0
+
+    // Three listeners: two in `general`, one in `dev`.
+    let rooms_wanted = ["general", "general", "dev"]
+    var listeners: [i64] = []
+    for room in rooms_wanted {
+        match tcp_connect("127.0.0.1", port) {
+            Err(e) -> print("  dial failed: {e}")
+            Ok(c) -> {
+                match tcp_write(c, "GET /room/{room}/events HTTP/1.1\r\nHost: x\r\n\r\n") {
+                    Ok(_) -> listeners.push(c)
+                    Err(e) -> print("  subscribe failed: {e}")
+                }
+            }
+        }
+    }
+    print("  {listeners.len()} subscribers connected")
+
+    var rooms = Rooms{ subscribers: [], history: [] }
+    var served: [i64] = []
+    var speakers: [i64] = []
+    var acked = 0
+
+    // Phase one: let the server accept and hold all three subscribers.
+    var turns = 0
+    while rooms.subscribers.len() < listeners.len() and turns < 200 {
+        var waiting: [i64] = [listener]
+        for h in served {
+            waiting.push(h)
+        }
+        let ready = net_wait(waiting, 1000) ?? []
+        if ready.len() == 0 {
+            turns = 200
+        }
+        for h in ready {
+            if h == listener {
+                match tcp_accept(listener) {
+                    Err(e) -> {}
+                    Ok(conn) -> served.push(conn)
+                }
+            } else {
+                let raw = tcp_read(h) ?? ""
+                if raw != "" {
+                    match decide(parse_req(raw)) {
+                        Hold(room, head) -> {
+                            match tcp_write(h, head) {
+                                Ok(_) -> rooms.subscribers.push(Subscriber{ handle: h, room: room })
+                                Err(e) -> {}
+                            }
+                        }
+                        Reply(t) -> {
+                            match tcp_write(h, t) { Ok(_) -> {}  Err(e) -> {} }
+                        }
+                        Fanout(room, event, ack) -> {}
+                    }
+                }
+            }
+        }
+        turns = turns + 1
+    }
+    print("  {rooms.subscribers.len()} held open, none answered yet")
+    print("  general has {subscribers_of(rooms, "general").len()}, dev has {subscribers_of(rooms, "dev").len()}")
+
+    // Phase two: two people speak, on their own connections.
+    let posts = [
+        ("general", "who=ada&text=hello+everyone"),
+        ("dev", "who=bob&text=build+is+green"),
+        ("general", "who=cy&text=second+line"),
+    ]
+    for (room, body) in posts {
+        match tcp_connect("127.0.0.1", port) {
+            Err(e) -> print("  dial failed: {e}")
+            Ok(c) -> {
+                let req = "POST /room/{room}/say HTTP/1.1\r\nHost: x\r\nContent-Length: {body.byte_len()}\r\n\r\n{body}"
+                match tcp_write(c, req) {
+                    Ok(_) -> speakers.push(c)
+                    Err(e) -> print("  post failed: {e}")
+                }
+            }
+        }
+    }
+
+    turns = 0
+    while acked < speakers.len() and turns < 400 {
+        var waiting: [i64] = [listener]
+        for h in served {
+            var is_held = false
+            for s in rooms.subscribers {
+                if s.handle == h { is_held = true }
+            }
+            // A held connection is not waited on for *reading* — the client
+            // has nothing more to say. It is only ever written to.
+            if not is_held {
+                waiting.push(h)
+            }
+        }
+        let ready = net_wait(waiting, 1000) ?? []
+        if ready.len() == 0 {
+            turns = 400
+        }
+        for h in ready {
+            if h == listener {
+                match tcp_accept(listener) {
+                    Err(e) -> {}
+                    Ok(conn) -> served.push(conn)
+                }
+            } else {
+                let raw = tcp_read(h) ?? ""
+                if raw != "" {
+                    match decide(parse_req(raw)) {
+                        Fanout(room, event, ack) -> {
+                            // The whole point: writing to sockets that have
+                            // been open, unanswered, since before this request
+                            // existed.
+                            for target in subscribers_of(rooms, room) {
+                                match tcp_write(target, event) { Ok(_) -> {}  Err(e) -> {} }
+                            }
+                            rooms.history.push(event)
+                            match tcp_write(h, ack) { Ok(_) -> {}  Err(e) -> {} }
+                            acked = acked + 1
+                        }
+                        Reply(t) -> {
+                            match tcp_write(h, t) { Ok(_) -> {}  Err(e) -> {} }
+                            acked = acked + 1
+                        }
+                        Hold(room, head) -> {}
+                    }
+                }
+            }
+        }
+        turns = turns + 1
+    }
+    print("  {acked} message(s) accepted, {rooms.history.len()} fanned out")
+
+    // What each subscriber actually received.
+    //
+    // Drained rather than read once. `tcp_read` performs a single read
+    // ([L-LIB-NET]), and two events written at different moments do not have to
+    // arrive in one — the first version of this took one read each and reported
+    // that one subscriber in `general` got one message and the other got two,
+    // which is a timing race, not a fact about the server.
+    for i in 0..listeners.len() {
+        var got = ""
+        var reading = true
+        var guard = 0
+        while reading and guard < 50 {
+            let ready = net_wait([listeners[i]], 200) ?? []
+            if ready.len() == 0 {
+                reading = false
+            } else {
+                let chunk = tcp_read(listeners[i]) ?? ""
+                if chunk == "" {
+                    reading = false
+                } else {
+                    got += chunk
+                }
+            }
+            guard = guard + 1
+        }
+        var events = 0
+        for line in got.lines() {
+            if line.starts_with("data: ") {
+                events = events + 1
+            }
+        }
+        print("  subscriber {i} ({rooms_wanted[i]}): {events} event(s)")
+        for line in got.lines() {
+            if line.starts_with("data: ") {
+                print("    {line}")
+            }
+        }
+    }
+
+    for h in served {
+        net_close(h)
+    }
+    for h in listeners {
+        net_close(h)
+    }
+    for h in speakers {
+        net_close(h)
+    }
+    net_close(listener)
+}
+
+/// The live server: many listeners held open, anyone may speak.
+fn serve() / {io, net} {
+    let listener = match tcp_listen(PORT) {
+        Err(e) -> {
+            print("cannot listen on {PORT}: {e}")
+            return
+        }
+        Ok(l) -> l
+    }
+    print("http://localhost:{PORT}  (ctrl-c to stop)")
+    var rooms = Rooms{ subscribers: [], history: [] }
+    var open: [i64] = []
+    var going = true
+    while going {
+        var waiting: [i64] = [listener]
+        for h in open {
+            var is_held = false
+            for s in rooms.subscribers {
+                if s.handle == h { is_held = true }
+            }
+            if not is_held {
+                waiting.push(h)
+            }
+        }
+        let ready = net_wait(waiting, 60000) ?? []
+        for h in ready {
+            if h == listener {
+                match tcp_accept(listener) {
+                    Err(e) -> print("accept failed: {e}")
+                    Ok(conn) -> open.push(conn)
+                }
+            } else {
+                let raw = tcp_read(h) ?? ""
+                if raw == "" {
+                    // The peer hung up. A held subscriber that vanished has to
+                    // be forgotten, or the next fanout writes to a closed
+                    // socket forever.
+                    rooms = drop_handle(rooms, h)
+                    net_close(h)
+                    var still: [i64] = []
+                    for k in open {
+                        if k != h { still.push(k) }
+                    }
+                    open = still
+                } else {
+                    match decide(parse_req(raw)) {
+                        Hold(room, head) -> {
+                            match tcp_write(h, head) {
+                                Ok(_) -> {
+                                    rooms.subscribers.push(Subscriber{ handle: h, room: room })
+                                    print("  + {room} ({rooms.subscribers.len()} listening)")
+                                }
+                                Err(e) -> {}
+                            }
+                        }
+                        Fanout(room, event, ack) -> {
+                            for target in subscribers_of(rooms, room) {
+                                match tcp_write(target, event) { Ok(_) -> {}  Err(e) -> {} }
+                            }
+                            rooms.history.push(event)
+                            match tcp_write(h, ack) { Ok(_) -> {}  Err(e) -> {} }
+                            net_close(h)
+                            var still: [i64] = []
+                            for k in open {
+                                if k != h { still.push(k) }
+                            }
+                            open = still
+                        }
+                        Reply(t) -> {
+                            match tcp_write(h, t) { Ok(_) -> {}  Err(e) -> {} }
+                            net_close(h)
+                            var still: [i64] = []
+                            for k in open {
+                                if k != h { still.push(k) }
+                            }
+                            open = still
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn main() / {io, net} {
+    if args().len() > 0 and args()[0] == "serve" {
+        serve()
+        return
+    }
+    routing_checks()
+    print("--- three held open while two speak ---")
+    exchange()
+}

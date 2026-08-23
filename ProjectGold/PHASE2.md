@@ -69,6 +69,7 @@ writable** and neither has to degrade to polling. They move up.
 | 5 | 35-blog-dashboard | `lib_json` became a package |
 | 7 | 37-user-auth | found F34 (no randomness) |
 | 8 | 38-upload-gallery | was blocked; `bytes` over TCP unblocked it |
+| 9 | 39-chat-router | was blocked; `net_wait` unblocked it |
 
 ### Blocked (1, was 3)
 
@@ -79,7 +80,8 @@ writable** and neither has to degrade to polling. They move up.
 `8` was blocked on F9 and is **written** — project 38. `tcp_read_bytes` reads a
 `multipart/form-data` body without turning the JPEG into U+FFFD, and the project
 prints the difference on every run: ten bytes become sixteen through a `str`.
-`9` was blocked on F13 and is writable with `net_wait`.
+`9` was blocked on F13 and is **written** — project 39, which holds three
+connections open while three other people post.
 
 ## The order, and why
 

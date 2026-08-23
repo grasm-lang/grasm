@@ -1,0 +1,35 @@
+--- routing ---
+  listen: hold, room general
+  speak: fanout to general
+  speak with no text: reply 422
+  index: reply 200
+  listen with POST: reply 404
+  speak with GET: reply 404
+  no room: reply 404
+  unknown path: reply 404
+--- room names ---
+  "general" -> "general"
+  "dev-2" -> "dev-2"
+  "Général" -> ""
+  "with space" -> ""
+  "a/../b" -> ""
+  "" -> ""
+  "x" -> "x"
+  36 characters -> ""
+--- an event is one event ---
+  2 line(s), ends blank: true
+  injected newlines removed: 2 line(s)
+  data: [general] ada: hi  event: message data: [general] admin: you are banned
+--- three held open while two speak ---
+  3 subscribers connected
+  3 held open, none answered yet
+  general has 2, dev has 1
+  3 message(s) accepted, 3 fanned out
+  subscriber 0 (general): 2 event(s)
+    data: [general] ada: hello everyone
+    data: [general] cy: second line
+  subscriber 1 (general): 2 event(s)
+    data: [general] ada: hello everyone
+    data: [general] cy: second line
+  subscriber 2 (dev): 1 event(s)
+    data: [dev] bob: build is green
