@@ -76,12 +76,25 @@ coalesces twelve events into three pushes.
 | 12 | 41-spa-router | one matcher, browser and server |
 | 13 | 42-realtime-analytics | was "degraded to batched POSTs"; it coalesces instead |
 | 10 | 43-weather-mashup | still degraded — no TLS, and nothing here fixes that |
+| 11 | 44-ecommerce-cart | was blocked; the reason it was blocked was wrong |
 
-### Blocked (1, was 3)
+### Blocked (0, was 3)
 
-| # | Project | On what |
-|---|---|---|
-| 11 | E-Commerce Cart | **F14.** The project *is* race conditions and state synchronisation. `net_wait` gives many conversations on one thread, which makes the *interleaving* real and the shared state safe by construction — there is only one thread to race. That is a correct application and a dishonest demonstration of the thing the exercise is about, and the README has to say which it is. |
+Nothing is blocked. `11` was the last one, and the reason it was listed as
+blocked was wrong.
+
+The claim above was that one thread makes the shared state "safe by
+construction", so the exercise would be a correct application and a dishonest
+demonstration. One thread removes *data* races — two cores writing one word. It
+does not remove **check-then-act** races, and `net_wait` is what makes them
+reachable: the server can serve another request in the gap between reading the
+stock and writing it back. Project 44 oversells the last unit on one core, with
+no locks anywhere and nothing a mutex would have fixed, and then does not, by
+making check-and-take one step.
+
+What is genuinely missing is the other half: on many cores the same code needs
+real locks, and `par_map` still refuses every effect. F14 is not closed. But the
+exercise was half writable all along and nobody had checked.
 
 `8` was blocked on F9 and is **written** — project 38. `tcp_read_bytes` reads a
 `multipart/form-data` body without turning the JPEG into U+FFFD, and the project

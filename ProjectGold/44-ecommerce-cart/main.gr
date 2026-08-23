@@ -1,0 +1,607 @@
+// Phase 2, project 11 — E-Commerce Cart.
+//
+// The phase 2 plan listed this as **blocked**, and said the write-up would
+// decide whether it was a cheat:
+//
+// > The project *is* race conditions and state synchronisation, and the
+// > language cannot express concurrent access to shared state — which is either
+// > a cheat or the point, depending on how honest the write-up is.
+//
+// The easy version of that write-up is "one thread, so no data race, so the
+// exercise is free". That would be true and useless. **It is also wrong**, and
+// finding out why is what this project turned out to be about.
+//
+// One thread removes *data* races — two cores writing one word. It does not
+// remove **check-then-act** races, and `net_wait` is exactly the thing that
+// makes them reachable: the server can serve somebody else's request in the gap
+// between reading the stock and writing it back. The last unit gets sold twice,
+// on one core, with no locks anywhere and nothing that a mutex would have
+// fixed.
+//
+// So this project does the thing the exercise asks for. It oversells, on
+// purpose, with the interleaving written out step by step — and then does not,
+// by making check-and-take one indivisible step, which is what a single thread
+// buys you *provided you do not yield inside the critical section*.
+//
+// What is still genuinely missing is in the README: this is concurrency, not
+// parallelism, and on many cores the same code needs real locks. That is F14
+// and it is not closed.
+//
+// ```
+// grasm run main.gr              # the comparison the harness makes
+// grasm run main.gr -- serve     # then serve index.html over http
+// ```
+
+import lib_json
+
+let PORT = 8987
+
+// ---------------------------------------------------------------------------
+// Inventory and carts
+// ---------------------------------------------------------------------------
+
+type Item = { sku: str, name: str, price: i64, stock: i64 }
+
+type Line = { sku: str, quantity: i64 }
+
+type Cart = { owner: str, lines: [Line] }
+
+type Shop = { items: [Item], carts: [Cart], sold: i64 }
+
+fn shop() -> Shop {
+    Shop{
+        items: [
+            Item{ sku: "gr-001", name: "Grasm mug", price: 1200, stock: 3 },
+            Item{ sku: "gr-002", name: "Sticker sheet", price: 300, stock: 10 },
+            // One left, which is where every oversell story starts.
+            Item{ sku: "gr-003", name: "Signed spec", price: 9900, stock: 1 },
+        ],
+        carts: [],
+        sold: 0,
+    }
+}
+
+fn item_at(s: Shop, sku: str) -> i64 {
+    for i in 0..s.items.len() {
+        if s.items[i].sku == sku {
+            return i
+        }
+    }
+    -1
+}
+
+fn cart_at(s: Shop, owner: str) -> i64 {
+    for i in 0..s.carts.len() {
+        if s.carts[i].owner == owner {
+            return i
+        }
+    }
+    -1
+}
+
+fn cart_of(s: Shop, owner: str) -> Cart {
+    let at = cart_at(s, owner)
+    if at < 0 {
+        Cart{ owner: owner, lines: [] }
+    } else {
+        s.carts[at]
+    }
+}
+
+fn put_cart(s: Shop, c: Cart) -> Shop {
+    var next = s
+    let at = cart_at(next, c.owner)
+    if at < 0 {
+        next.carts.push(c)
+    } else {
+        next.carts[at] = c
+    }
+    next
+}
+
+fn add_line(c: Cart, sku: str, quantity: i64) -> Cart {
+    var next = c
+    for i in 0..next.lines.len() {
+        if next.lines[i].sku == sku {
+            next.lines[i].quantity = next.lines[i].quantity + quantity
+            return next
+        }
+    }
+    next.lines.push(Line{ sku: sku, quantity: quantity })
+    next
+}
+
+fn cart_total(s: Shop, c: Cart) -> i64 {
+    var total = 0
+    for l in c.lines {
+        let at = item_at(s, l.sku)
+        if at >= 0 {
+            total = total + s.items[at].price * l.quantity
+        }
+    }
+    total
+}
+
+fn money(cents: i64) -> str {
+    let sign = if cents < 0 { "-" } else { "" }
+    let abs = if cents < 0 { 0 - cents } else { cents }
+    let minor = abs % 100
+    let pad = if minor < 10 { "0" } else { "" }
+    "{sign}{abs / 100}.{pad}{minor}"
+}
+
+fn quoted(s: str) -> str {
+    "\"" + lib_json.escape_json(s) + "\""
+}
+
+fn cart_json(s: Shop, c: Cart) -> str {
+    var parts: [str] = []
+    for l in c.lines {
+        let at = item_at(s, l.sku)
+        let name = if at < 0 { "unknown" } else { s.items[at].name }
+        parts.push("\{\"sku\": {quoted(l.sku)}, \"name\": {quoted(name)}, \"quantity\": {l.quantity}\}")
+    }
+    "\{\"owner\": {quoted(c.owner)}, \"lines\": [{parts.join(", ")}], \"total\": {quoted(money(cart_total(s, c)))}\}"
+}
+
+fn stock_json(s: Shop) -> str {
+    var parts: [str] = []
+    for it in s.items {
+        parts.push("\{\"sku\": {quoted(it.sku)}, \"name\": {quoted(it.name)}, \"price\": {quoted(money(it.price))}, \"stock\": {it.stock}\}")
+    }
+    "\{\"items\": [{parts.join(", ")}], \"sold\": {s.sold}\}"
+}
+
+// ---------------------------------------------------------------------------
+// The two checkouts
+// ---------------------------------------------------------------------------
+
+/// **The unsafe one.** Check, then act, with a gap in between.
+///
+/// Split deliberately into two functions so the gap is a place the server can
+/// be interrupted — which is exactly what happens when a request arrives on
+/// another connection while this one is half-done. Nothing here is wrong on its
+/// own; the wrongness is entirely in the gap.
+fn may_take(s: Shop, sku: str, want: i64) -> bool {
+    let at = item_at(s, sku)
+    if at < 0 {
+        return false
+    }
+    s.items[at].stock >= want
+}
+
+/// The other half. It does not check, because the caller already did — which is
+/// true at the moment the caller checked and not necessarily now.
+fn take_unchecked(s: Shop, sku: str, want: i64) -> Shop {
+    var next = s
+    let at = item_at(next, sku)
+    if at >= 0 {
+        next.items[at].stock = next.items[at].stock - want
+        next.sold = next.sold + want
+    }
+    next
+}
+
+/// **The safe one.** Check and take in one step, with nothing between them.
+///
+/// This is not a lock and it does not need to be. On one thread the gap is the
+/// only hazard, and a function with no gap in it has none. The whole fix is
+/// that nothing suspends between the read and the write — which is a property
+/// of *this* code rather than of the language, and would stop being enough the
+/// moment two cores ran it.
+fn take(s: Shop, sku: str, want: i64) -> (Shop, bool) {
+    let at = item_at(s, sku)
+    if at < 0 or s.items[at].stock < want {
+        return (s, false)
+    }
+    var next = s
+    next.items[at].stock = next.items[at].stock - want
+    next.sold = next.sold + want
+    (next, true)
+}
+
+// ---------------------------------------------------------------------------
+// The demonstration that matters
+// ---------------------------------------------------------------------------
+
+/// Two customers, one item in stock, and a server that yields in the gap.
+///
+/// This is written as a sequence rather than over sockets because the *point*
+/// is the interleaving, and a test that produced it only sometimes would be
+/// demonstrating luck. The order below is exactly what `net_wait` produces when
+/// two checkouts arrive close together and the server reads stock, serves the
+/// other connection, and then writes: an ordinary shape, not a contrived one.
+fn oversell_demo() / {io} {
+    print("--- check, yield, act: the last unit sold twice ---")
+    var s = shop()
+    let sku = "gr-003"
+    print("  stock before: {s.items[item_at(s, sku)].stock}")
+
+    // Ada's request arrives. The server checks.
+    let ada_ok = may_take(s, sku, 1)
+    print("  ada checks: may take = {ada_ok}")
+
+    // Before Ada's write, Bob's connection becomes ready. On one thread. This
+    // is the entire bug and there is no lock anywhere that would have helped,
+    // because nothing is running concurrently — the server simply did two
+    // things in an order that has a hole in it.
+    let bob_ok = may_take(s, sku, 1)
+    print("  bob checks:  may take = {bob_ok}   <- while ada is half-done")
+
+    if ada_ok {
+        s = take_unchecked(s, sku, 1)
+    }
+    if bob_ok {
+        s = take_unchecked(s, sku, 1)
+    }
+    print("  stock after: {s.items[item_at(s, sku)].stock}  <- negative: sold twice")
+    print("  sold: {s.sold} of 1")
+
+    print("--- check and take together: it cannot happen ---")
+    var t = shop()
+    print("  stock before: {t.items[item_at(t, sku)].stock}")
+    let (t1, ada) = take(t, sku, 1)
+    t = t1
+    print("  ada takes: {ada}")
+    let (t2, bob) = take(t, sku, 1)
+    t = t2
+    print("  bob takes: {bob}   <- refused, and the check is the same instruction as the write")
+    print("  stock after: {t.items[item_at(t, sku)].stock}")
+    print("  sold: {t.sold} of 1")
+}
+
+// ---------------------------------------------------------------------------
+// Requests
+// ---------------------------------------------------------------------------
+
+type Req = { method: str, path: str, body: str, who: str }
+
+fn parse_req(raw: str) -> Req {
+    let head_end = raw.index_of("\r\n\r\n")
+    let head = match head_end {
+        Some(i) -> raw.substr(0, i)
+        None -> raw
+    }
+    let body = match head_end {
+        Some(i) -> raw.substr(i + 4, raw.len() - i - 4)
+        None -> ""
+    }
+    let lines = head.lines()
+    if lines.len() == 0 {
+        return Req{ method: "", path: "empty request", body: "", who: "" }
+    }
+    let parts = lines[0].split(" ")
+    if parts.len() != 3 or not parts[1].starts_with("/") {
+        return Req{ method: "", path: "malformed request line", body: "", who: "" }
+    }
+    // Whose cart this is. A header rather than a cookie because a cookie is a
+    // header with rules this project is not about — and a real shop would want
+    // project 37's session token here rather than a name anyone can claim.
+    var who = "guest"
+    for line in lines {
+        if line.to_lower().starts_with("x-customer:") {
+            let v = line.substr(11, line.len() - 11).trim()
+            if v != "" {
+                who = v
+            }
+        }
+    }
+    Req{ method: parts[0], path: parts[1], body: body, who: who }
+}
+
+fn field(body: str, want: str) -> str {
+    for pair in body.split("&") {
+        match pair.index_of("=") {
+            None -> {}
+            Some(i) -> {
+                if pair.substr(0, i) == want {
+                    return pair.substr(i + 1, pair.len() - i - 1)
+                }
+            }
+        }
+    }
+    ""
+}
+
+fn response(status: str, content_type: str, body: str) -> str {
+    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {body.byte_len()}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{body}"
+}
+
+/// Every route, and the shop it leaves behind.
+///
+/// Checkout uses the safe `take`. There is no route that uses the unsafe pair —
+/// they exist to be demonstrated, not to be served, and a shop that shipped the
+/// broken one behind a flag would eventually have somebody set the flag.
+fn route(r: Req, s: Shop) -> (Shop, str) {
+    if r.method == "" {
+        return (s, response("400 Bad Request", "text/plain", "bad request: {r.path}\n"))
+    }
+    if r.path == "/" and r.method == "GET" {
+        var rows = ""
+        for it in s.items {
+            rows += "<tr><td>{it.name}</td><td>{money(it.price)}</td><td>{it.stock}</td></tr>"
+        }
+        return (s, response("200 OK", "text/html",
+            "<!doctype html><meta charset=\"utf-8\"><title>Shop</title><h1>Shop</h1><table>{rows}</table>"))
+    }
+    if r.path == "/stock" and r.method == "GET" {
+        return (s, response("200 OK", "application/json", stock_json(s)))
+    }
+    if r.path == "/cart" and r.method == "GET" {
+        return (s, response("200 OK", "application/json", cart_json(s, cart_of(s, r.who))))
+    }
+    if r.path == "/cart/add" and r.method == "POST" {
+        let sku = field(r.body, "sku")
+        let quantity = field(r.body, "quantity").parse_int() ?? 1
+        if item_at(s, sku) < 0 {
+            return (s, response("404 Not Found", "application/json",
+                "\{\"error\": \"no such item\"\}"))
+        }
+        if quantity < 1 {
+            return (s, response("422 Unprocessable Entity", "application/json",
+                "\{\"error\": \"quantity must be at least 1\"\}"))
+        }
+        // Adding to a cart takes nothing. Stock is decided at checkout, which
+        // is the only moment it can be decided correctly — a cart that reserved
+        // stock would let anyone empty the shop by filling a cart and leaving.
+        let next = put_cart(s, add_line(cart_of(s, r.who), sku, quantity))
+        return (next, response("200 OK", "application/json", cart_json(next, cart_of(next, r.who))))
+    }
+    if r.path == "/checkout" and r.method == "POST" {
+        let c = cart_of(s, r.who)
+        if c.lines.len() == 0 {
+            return (s, response("422 Unprocessable Entity", "application/json",
+                "\{\"error\": \"the cart is empty\"\}"))
+        }
+        var next = s
+        var taken: [str] = []
+        var refused: [str] = []
+        // Every line, each check-and-take indivisible. A partial checkout is
+        // reported rather than rolled back: telling somebody they got two of
+        // three things is better than telling them they got nothing.
+        for l in c.lines {
+            let (after, ok) = take(next, l.sku, l.quantity)
+            next = after
+            if ok {
+                taken.push("{quoted(l.sku)}")
+            } else {
+                refused.push("{quoted(l.sku)}")
+            }
+        }
+        next = put_cart(next, Cart{ owner: r.who, lines: [] })
+        let status = if refused.len() == 0 { "200 OK" } else { "409 Conflict" }
+        return (next, response(status, "application/json",
+            "\{\"bought\": [{taken.join(", ")}], \"unavailable\": [{refused.join(", ")}]\}"))
+    }
+    (s, response("404 Not Found", "text/plain", "no route for {r.method} {r.path}\n"))
+}
+
+// ---------------------------------------------------------------------------
+// The checks the harness compares across three engines
+// ---------------------------------------------------------------------------
+
+fn show(label: str, method: str, path: str, body: str, who: str, inout s: Shop) / {io} {
+    let raw = "{method} {path} HTTP/1.1\r\nHost: x\r\nX-Customer: {who}\r\n\r\n{body}"
+    let (next, resp) = route(parse_req(raw), s)
+    s = next
+    let status = resp.lines()[0].split(" ")[1]
+    let at = resp.index_of("\r\n\r\n")
+    let out = match at {
+        Some(j) -> resp.substr(j + 4, resp.len() - j - 4)
+        None -> ""
+    }
+    print("  {label}: {status} {out}")
+}
+
+fn cart_checks() / {io} {
+    print("--- carts are per customer ---")
+    var s = shop()
+    show("ada adds a mug", "POST", "/cart/add", "sku=gr-001&quantity=2", "ada", s)
+    show("bob adds stickers", "POST", "/cart/add", "sku=gr-002&quantity=1", "bob", s)
+    show("ada's cart", "GET", "/cart", "", "ada", s)
+    show("bob's cart", "GET", "/cart", "", "bob", s)
+    show("a stranger's cart", "GET", "/cart", "", "cy", s)
+    show("ada adds more mugs", "POST", "/cart/add", "sku=gr-001&quantity=1", "ada", s)
+    show("no such item", "POST", "/cart/add", "sku=nope", "ada", s)
+    show("nonsense quantity", "POST", "/cart/add", "sku=gr-001&quantity=0", "ada", s)
+
+    print("--- a cart reserves nothing ---")
+    // Adding three mugs to a cart leaves three mugs on the shelf. A cart that
+    // reserved stock would let anyone empty the shop by filling a cart and
+    // walking away.
+    print("  stock is still {s.items[item_at(s, "gr-001")].stock}")
+
+    print("--- checkout ---")
+    show("ada buys", "POST", "/checkout", "", "ada", s)
+    show("stock after", "GET", "/stock", "", "ada", s)
+    show("ada's cart is empty", "GET", "/cart", "", "ada", s)
+    show("buying nothing", "POST", "/checkout", "", "ada", s)
+
+    print("--- more than there is ---")
+    var t = shop()
+    show("ada wants five mugs", "POST", "/cart/add", "sku=gr-001&quantity=5", "ada", t)
+    show("and one sticker", "POST", "/cart/add", "sku=gr-002&quantity=1", "ada", t)
+    // A partial checkout is reported rather than rolled back: telling somebody
+    // they got one of two things is better than telling them they got nothing.
+    show("checkout", "POST", "/checkout", "", "ada", t)
+    show("stock after", "GET", "/stock", "", "ada", t)
+
+    print("--- money ---")
+    for c in [0, 5, 50, 300, 1200, 9900, 100000] {
+        print("  {c} -> {money(c)}")
+    }
+}
+
+fn main() / {io, net} {
+    if args().len() > 0 and args()[0] == "serve" {
+        serve()
+        return
+    }
+    oversell_demo()
+    cart_checks()
+    print("--- two customers over sockets, one item ---")
+    exchange()
+}
+
+// ---------------------------------------------------------------------------
+// The same thing over real sockets
+// ---------------------------------------------------------------------------
+
+/// Two customers race for the last signed spec, over real connections.
+///
+/// Both carts are filled, then both checkouts are put on the wire before either
+/// is served — so the server genuinely has two pending checkouts for one item.
+/// It uses the safe `take`, so exactly one wins, and the shop's stock never goes
+/// below zero.
+fn exchange() / {io, net} {
+    let listener = match tcp_listen(0) {
+        Err(e) -> {
+            print("  cannot listen: {e}")
+            return
+        }
+        Ok(l) -> l
+    }
+    let port = net_port(listener) ?? 0
+    var s = shop()
+
+    // Fill both carts first, one at a time — this part has no race in it.
+    for who in ["ada", "bob"] {
+        match tcp_connect("127.0.0.1", port) {
+            Err(e) -> {}
+            Ok(c) -> {
+                let body = "sku=gr-003&quantity=1"
+                let req = "POST /cart/add HTTP/1.1\r\nHost: x\r\nX-Customer: {who}\r\nContent-Length: {body.byte_len()}\r\n\r\n{body}"
+                match tcp_write(c, req) {
+                    Err(e) -> {}
+                    Ok(_) -> match tcp_accept(listener) {
+                        Err(e) -> {}
+                        Ok(conn) -> {
+                            let raw = tcp_read(conn) ?? ""
+                            let (next, resp) = route(parse_req(raw), s)
+                            s = next
+                            match tcp_write(conn, resp) { Ok(_) -> {}  Err(e) -> {} }
+                            net_close(conn)
+                        }
+                    }
+                }
+                net_close(c)
+            }
+        }
+    }
+    print("  both carts hold the last signed spec; stock is {s.items[item_at(s, "gr-003")].stock}")
+
+    // Both checkouts on the wire before either is served.
+    var clients: [i64] = []
+    for who in ["ada", "bob"] {
+        match tcp_connect("127.0.0.1", port) {
+            Err(e) -> {}
+            Ok(c) -> {
+                let req = "POST /checkout HTTP/1.1\r\nHost: x\r\nX-Customer: {who}\r\nContent-Length: 0\r\n\r\n"
+                match tcp_write(c, req) {
+                    Ok(_) -> clients.push(c)
+                    Err(e) -> {}
+                }
+            }
+        }
+    }
+    print("  {clients.len()} checkouts in flight before either was served")
+
+    var replies: [str] = []
+    for c in clients { replies.push("") }
+    var served: [i64] = []
+    var answered = 0
+    var turns = 0
+    while answered < clients.len() and turns < 400 {
+        var waiting: [i64] = [listener]
+        for h in served { waiting.push(h) }
+        for i in 0..clients.len() {
+            if replies[i] == "" { waiting.push(clients[i]) }
+        }
+        let ready = net_wait(waiting, 2000) ?? []
+        if ready.len() == 0 { turns = 400 }
+        for h in ready {
+            if h == listener {
+                match tcp_accept(listener) {
+                    Err(e) -> {}
+                    Ok(conn) -> served.push(conn)
+                }
+            } else {
+                var is_server = false
+                for k in served { if k == h { is_server = true } }
+                if is_server {
+                    let raw = tcp_read(h) ?? ""
+                    if raw != "" {
+                        let (next, resp) = route(parse_req(raw), s)
+                        s = next
+                        match tcp_write(h, resp) { Ok(_) -> {}  Err(e) -> {} }
+                    }
+                } else {
+                    for i in 0..clients.len() {
+                        if clients[i] == h and replies[i] == "" {
+                            let chunk = tcp_read(h) ?? ""
+                            replies[i] = if chunk == "" { "(nothing)" } else { chunk }
+                            answered = answered + 1
+                        }
+                    }
+                }
+            }
+        }
+        turns = turns + 1
+    }
+
+    // Statuses, not bodies: which of the two won depends on the order the
+    // kernel made them ready, and that is not a fact this program may print.
+    var wins = 0
+    var conflicts = 0
+    for r in replies {
+        let status = if r.lines().len() > 0 { r.lines()[0].trim() } else { "(none)" }
+        if status.contains("200") { wins = wins + 1 }
+        if status.contains("409") { conflicts = conflicts + 1 }
+    }
+    print("  {wins} bought it, {conflicts} were told it was gone")
+    print("  stock after: {s.items[item_at(s, "gr-003")].stock}, sold {s.sold}")
+    print("  never negative, and never sold twice: {s.items[item_at(s, "gr-003")].stock == 0 and s.sold == 1}")
+
+    for h in served { net_close(h) }
+    for h in clients { net_close(h) }
+    net_close(listener)
+}
+
+fn serve() / {io, net} {
+    let listener = match tcp_listen(PORT) {
+        Err(e) -> {
+            print("cannot listen on {PORT}: {e}")
+            return
+        }
+        Ok(l) -> l
+    }
+    print("http://localhost:{PORT}  (ctrl-c to stop)")
+    print("send X-Customer to say whose cart it is")
+    var s = shop()
+    var open: [i64] = []
+    var going = true
+    while going {
+        var waiting: [i64] = [listener]
+        for h in open { waiting.push(h) }
+        let ready = net_wait(waiting, 60000) ?? []
+        for h in ready {
+            if h == listener {
+                match tcp_accept(listener) {
+                    Err(e) -> print("accept failed: {e}")
+                    Ok(conn) -> open.push(conn)
+                }
+            } else {
+                let raw = tcp_read(h) ?? ""
+                if raw != "" {
+                    let (next, resp) = route(parse_req(raw), s)
+                    s = next
+                    match tcp_write(h, resp) { Ok(_) -> {}  Err(e) -> {} }
+                }
+                net_close(h)
+                var still: [i64] = []
+                for k in open { if k != h { still.push(k) } }
+                open = still
+            }
+        }
+    }
+}

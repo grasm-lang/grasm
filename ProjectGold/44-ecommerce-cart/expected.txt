@@ -1,0 +1,47 @@
+--- check, yield, act: the last unit sold twice ---
+  stock before: 1
+  ada checks: may take = true
+  bob checks:  may take = true   <- while ada is half-done
+  stock after: -1  <- negative: sold twice
+  sold: 2 of 1
+--- check and take together: it cannot happen ---
+  stock before: 1
+  ada takes: true
+  bob takes: false   <- refused, and the check is the same instruction as the write
+  stock after: 0
+  sold: 1 of 1
+--- carts are per customer ---
+  ada adds a mug: 200 {"owner": "ada", "lines": [{"sku": "gr-001", "name": "Grasm mug", "quantity": 2}], "total": "24.00"}
+  bob adds stickers: 200 {"owner": "bob", "lines": [{"sku": "gr-002", "name": "Sticker sheet", "quantity": 1}], "total": "3.00"}
+  ada's cart: 200 {"owner": "ada", "lines": [{"sku": "gr-001", "name": "Grasm mug", "quantity": 2}], "total": "24.00"}
+  bob's cart: 200 {"owner": "bob", "lines": [{"sku": "gr-002", "name": "Sticker sheet", "quantity": 1}], "total": "3.00"}
+  a stranger's cart: 200 {"owner": "cy", "lines": [], "total": "0.00"}
+  ada adds more mugs: 200 {"owner": "ada", "lines": [{"sku": "gr-001", "name": "Grasm mug", "quantity": 3}], "total": "36.00"}
+  no such item: 404 {"error": "no such item"}
+  nonsense quantity: 422 {"error": "quantity must be at least 1"}
+--- a cart reserves nothing ---
+  stock is still 3
+--- checkout ---
+  ada buys: 200 {"bought": ["gr-001"], "unavailable": []}
+  stock after: 200 {"items": [{"sku": "gr-001", "name": "Grasm mug", "price": "12.00", "stock": 0}, {"sku": "gr-002", "name": "Sticker sheet", "price": "3.00", "stock": 10}, {"sku": "gr-003", "name": "Signed spec", "price": "99.00", "stock": 1}], "sold": 3}
+  ada's cart is empty: 200 {"owner": "ada", "lines": [], "total": "0.00"}
+  buying nothing: 422 {"error": "the cart is empty"}
+--- more than there is ---
+  ada wants five mugs: 200 {"owner": "ada", "lines": [{"sku": "gr-001", "name": "Grasm mug", "quantity": 5}], "total": "60.00"}
+  and one sticker: 200 {"owner": "ada", "lines": [{"sku": "gr-001", "name": "Grasm mug", "quantity": 5}, {"sku": "gr-002", "name": "Sticker sheet", "quantity": 1}], "total": "63.00"}
+  checkout: 409 {"bought": ["gr-002"], "unavailable": ["gr-001"]}
+  stock after: 200 {"items": [{"sku": "gr-001", "name": "Grasm mug", "price": "12.00", "stock": 3}, {"sku": "gr-002", "name": "Sticker sheet", "price": "3.00", "stock": 9}, {"sku": "gr-003", "name": "Signed spec", "price": "99.00", "stock": 1}], "sold": 1}
+--- money ---
+  0 -> 0.00
+  5 -> 0.05
+  50 -> 0.50
+  300 -> 3.00
+  1200 -> 12.00
+  9900 -> 99.00
+  100000 -> 1000.00
+--- two customers over sockets, one item ---
+  both carts hold the last signed spec; stock is 1
+  2 checkouts in flight before either was served
+  1 bought it, 1 were told it was gone
+  stock after: 0, sold 1
+  never negative, and never sold twice: true
