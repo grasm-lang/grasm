@@ -1084,7 +1084,7 @@ The list now covers `par_filter`, `spawn`, `tcp_connect`, `udp_bind`,
 Two defects of one shape: a harness's model of the world stops being updated,
 and it goes on reporting success.
 
-## F33 — the wasm engine cannot run a program that has an `import` (S3, tooling) — **open**
+## F33 — the wasm engine cannot run a program that has an `import` (S3, tooling) — **fixed**
 
 Found writing phase 2's project 3, a live markdown editor. The design was the
 one project 33 had already proved: the browser fetches `main.gr` and runs it
@@ -1116,9 +1116,31 @@ fetches one file and the existing ABI is enough.
 An alternative — extending the ABI to accept named modules — puts the resolver
 in the embedder, which is the wrong place for it.
 
-### What project 36 does instead
+### Fixed: `grasm build --source`
 
-It asks the server to render, once per keystroke, debounced. That is not a
-workaround dressed as a design: the preview is then compiled not by the same
-*compiler* as the published page but by the same *process*, which is the
-stronger claim. What it costs is a round trip, and the page says so.
+A **source bundle** is a whole program as one `.gr` file — every module it
+imports, transitively, laid end to end behind `//!module <name>` lines, entry
+first. Nothing is renamed and nothing is rewritten, so the modules a bundle
+loads are the modules the disk would have loaded and a reader can still find the
+code they are looking at.
+
+It needed no new machinery. The disk loader already takes a `provider:
+&dyn Fn(&str) -> Option<String>` — a module name to its source — so a bundle
+loads by looking up in a table instead of reading a file, and every other
+decision about imports, aliases and spans is made by the same function.
+
+Detection sits in `load_from_disk_in`, so `run`, `build`, `check`, `test` and
+the language server all open a bundle without knowing the format exists. The
+wasm engine's single-source entry checks for it too, which is the point.
+
+    $ grasm build main.gr --source -o bundle.gr
+    wrote `bundle.gr`: 2 module(s), 16777 bytes
+
+Project 36's preview is back on the compiler it claims: the page fetches
+`bundle.gr`, runs it in wasm, and the HTML it shows was diffed against the
+HTML the server publishes for the same document — identical, byte for byte.
+
+An earlier draft of that page asked the server to render on every keystroke,
+which was honest and worse. It is kept in the history rather than the file,
+because what a project settles for when a tool is missing stops being
+interesting once the tool exists.

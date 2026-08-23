@@ -2889,6 +2889,20 @@ about, and joining is one concatenation.
 
 ## Bytes — [L-LIB-BYTES]
 
+**[L-BUNDLE-SOURCE]** A whole program may be written as **one source file**: a
+*source bundle*, in which each module is preceded by a line reading `//!module
+<name>` and the entry module comes first. Nothing is renamed and nothing is
+rewritten, so a bundle loads exactly the modules the filesystem would have, and
+a single-module program is a bundle of one.
+
+`grasm build <file> --source -o <out>.gr` writes one. Every command that opens a
+program opens a bundle, because the detection is in the loader they share.
+
+This exists for embedders that have no filesystem. The wasm engine takes one
+source string, and an `import` cannot be resolved by reading a file that is not
+there — so without this, a program with a single import could not run in a
+browser however small it was, and almost every real program has one.
+
 **[L-LIB-BYTES]** `bytes` is a contiguous run of bytes, and it is the type `str`
 deliberately is not.
 

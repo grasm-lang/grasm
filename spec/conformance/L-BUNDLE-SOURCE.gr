@@ -1,0 +1,26 @@
+//! tag: L-BUNDLE-SOURCE
+//! expect: output
+//! a program is its modules
+//! and a bundle is a program
+// A **source bundle** is a whole program as one file: every module it imports,
+// transitively, behind a `//!module <name>` line, entry first.
+//
+// It exists because an embedder may have no filesystem. The wasm engine takes
+// one source string, so before this a program with a single `import` could not
+// run in a browser however small it was — and every program worth writing has
+// imports, so the fourth engine could run almost nothing.
+//
+// Nothing in a bundle is renamed or rewritten. The modules it loads are the
+// modules the disk would have loaded, which is why this file can be a bundle
+// *of itself* and mean the same thing either way.
+//
+// Written by `grasm build <file> --source -o <out>.gr`, and opened by `run`,
+// `check`, `build`, `test` and the language server without any of them being
+// told the format exists: the detection is in the loader they all go through.
+//
+// This program has no import, so it is a bundle of one module — the case that
+// has to keep working, because it is what every single-file program becomes.
+fn main() {
+    print("a program is its modules")
+    print("and a bundle is a program")
+}

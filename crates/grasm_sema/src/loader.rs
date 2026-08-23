@@ -289,6 +289,105 @@ pub fn load_with_resolved_imports(
     }
 }
 
+/// The marker that separates modules in a **source bundle**.
+///
+/// A source bundle is a whole program — every module it imports, transitively —
+/// as one `.gr` file. It exists because an embedder may have no filesystem: the
+/// wasm engine takes one source string, so a program with an `import` could not
+/// be run in a browser at all, however small it was ([ProjectGold F33]).
+///
+/// The format is the least it could be. Each module is preceded by a line
+/// naming it, the entry module comes first, and everything else is the module's
+/// own source unchanged:
+///
+/// ```text
+/// //!module main
+/// import lib_markdown
+/// fn main() { ... }
+/// //!module lib_markdown
+/// pub fn compile(src: str) -> str { ... }
+/// ```
+///
+/// Unchanged is the point. Nothing is renamed and nothing is rewritten, so the
+/// modules a bundle loads are the modules the disk would have loaded, and a
+/// reader can still find the code they are looking at.
+pub const MODULE_MARKER: &str = "//!module ";
+
+/// Whether this text is a source bundle rather than a single module.
+pub fn is_source_bundle(src: &str) -> bool {
+    src.trim_start().starts_with(MODULE_MARKER)
+}
+
+/// The modules of a source bundle, entry first.
+pub fn split_source_bundle(src: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut name: Option<String> = None;
+    let mut body = String::new();
+    for line in src.lines() {
+        if let Some(rest) = line.strip_prefix(MODULE_MARKER) {
+            if let Some(prev) = name.take() {
+                out.push((prev, std::mem::take(&mut body)));
+            }
+            name = Some(rest.trim().to_string());
+        } else if name.is_some() {
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    if let Some(prev) = name {
+        out.push((prev, body));
+    }
+    out
+}
+
+/// A whole program out of one string.
+///
+/// The provider is a lookup in the bundle rather than a read from the disk,
+/// which is the only difference from loading the same program normally — every
+/// other decision about imports, aliases and spans is the disk loader's, made
+/// by the same function.
+pub fn load_from_source_bundle(src: &str) -> Program {
+    let modules = split_source_bundle(src);
+    let entry = modules
+        .first()
+        .map(|(n, _)| n.clone())
+        .unwrap_or_else(|| "main".to_string());
+    let table: HashMap<String, String> = modules.into_iter().collect();
+    let display = |n: &str| {
+        if n == "main" {
+            "<bundle>".to_string()
+        } else {
+            format!("<bundle>:{n}")
+        }
+    };
+    let entry_display = display(&entry);
+    load_with_resolved_imports(
+        &entry,
+        &entry_display,
+        &|n| table.get(n).cloned(),
+        &|_| Vec::new(),
+        &HashSet::new(),
+        None,
+        &|_, _| None,
+        &HashMap::new(),
+    )
+}
+
+/// A program written back out as one source bundle.
+pub fn to_source_bundle(program: &Program) -> String {
+    let mut out = String::new();
+    for f in &program.files {
+        out.push_str(MODULE_MARKER);
+        out.push_str(&f.name);
+        out.push('\n');
+        out.push_str(&f.src);
+        if !f.src.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// Disk loader: resolves module names relative to the entry file's directory.
 /// A path as a reader would write it.
 ///
@@ -374,6 +473,13 @@ pub fn load_from_disk_in(
         None => std::fs::read_to_string(entry_path)
             .map_err(|e| format!("cannot read `{entry_display}`: {e}"))?,
     };
+    // A source bundle carries its own modules, so there is nothing on disk to
+    // look for. Checked here rather than in each command, because `run`,
+    // `build`, `check`, `test` and the language server all arrive through this
+    // function and every one of them should be able to open a bundle.
+    if is_source_bundle(&entry_src) {
+        return Ok(load_from_source_bundle(&entry_src));
+    }
     // A file inside a package can import that package's dependencies by name,
     // not just its own sibling files.
     let mut deps = package_dependencies(&entry_src_dir);

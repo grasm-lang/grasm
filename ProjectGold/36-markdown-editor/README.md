@@ -1,8 +1,9 @@
 # 36 — Live Markdown Editor  *(phase 2, project 3)*
 
-**Tests:** a second shared package, a compiler used by two routes, and what
-happens when the browser cannot have it.
-**Result:** works, with the browser half redesigned mid-project — see below.
+**Tests:** a second shared package, a compiler used by two routes, and a
+browser running a multi-module Grasm program.
+**Result:** works. The browser half was redesigned twice — see below; the
+second redesign was to fix the language, not the project.
 
 ```
 grasm run main.gr < /dev/null      # the comparison the harness makes
@@ -28,31 +29,37 @@ asserting it:
   and the document was stored only by the second: true
 ```
 
-## The design changed while it was being written
+## The design changed twice while it was being written
 
 The plan said this was a project where "the browser half needs Grasm rather
-than JavaScript" — the page would fetch `main.gr` and run it in wasm, exactly as
-project 33 does for its validation rules.
+than JavaScript" — the page would fetch the source and run it in wasm, exactly
+as project 33 does for its validation rules.
 
-**It cannot.** `grasm_run_with_stdin` takes one source string, and
-`wasm32-unknown-unknown` has no filesystem, so a program with an `import`
-cannot be handed to the wasm engine at all. Project 33 worked because it is a
+**It could not.** `grasm_run_with_stdin` takes one source string and
+`wasm32-unknown-unknown` has no filesystem, so a program with an `import` could
+not be handed to the wasm engine at all. Project 33 worked because it is a
 single file. This one imports `lib_markdown`, which is the whole point of it.
 
-That is recorded as **F33** — it is much larger than this project, because every
-Grasm program worth writing has imports and the fourth engine can run none of
-them. The browser showcase works only because all 31 phase-1 programs happen to
-be single files, which was never a decision anyone made.
+That was **F33**, and it was much larger than this project: every Grasm program
+worth writing has imports, and the fourth engine could run none of them. The
+browser showcase worked only because all 31 phase-1 programs happen to be single
+files, which was never a decision anyone made.
 
-So the preview is a round trip to `/render`, debounced. This is not a workaround
-dressed up as a design: the preview is then compiled not by the same *compiler*
-as the published page but by the same *process*, and there is nothing left for
-the two to disagree about. What it costs is a request per keystroke, and the
-page says so where a reader will see it.
+So the second design asked the server to render on every keystroke. Honest, and
+worse.
 
-The honest way to get the browser back is `grasm build --source` — one `.gr`
-file with the import graph inlined. The loader already resolves and holds every
-file, so it is a pass over a structure that exists.
+The third is the first one, because F33 is fixed. `grasm build --source` writes
+a **source bundle** — the whole program as one `.gr`, modules laid end to end
+behind `//!module` lines — and the page fetches that. The preview is compiled by
+the server's own compiler, in the browser, and the HTML it produces was diffed
+against the HTML the server publishes for the same document:
+
+```
+BROWSER PREVIEW == SERVER PUBLISH, byte for byte
+```
+
+Publishing is now the only round trip, and the page reports whether the server
+agreed with what the writer was shown.
 
 ## The wire format
 

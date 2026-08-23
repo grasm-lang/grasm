@@ -103,7 +103,7 @@ fn run() -> ExitCode {
             "bench" => (&[], &["--filter"]),
             "check" => (&[], &[]),
             "build" => (
-                &["--native", "--no-incremental"],
+                &["--native", "--no-incremental", "--source"],
                 &["-o", "--target"],
             ),
             "doc" => (&[], &["-o"]),
@@ -396,7 +396,8 @@ fn run() -> ExitCode {
                 eprintln!("  help: name the output something else, or drop `-o` to use the file's stem");
                 return ExitCode::FAILURE;
             }
-            if out_path.ends_with(".gr") {
+            let want_source = args.iter().any(|a| a == "--source");
+            if out_path.ends_with(".gr") && !want_source {
                 eprintln!("error: `{out_path}` ends in `.gr`, and a build writes an executable there");
                 eprintln!("  help: name the output without the `.gr` suffix");
                 return ExitCode::FAILURE;
@@ -427,6 +428,29 @@ fn run() -> ExitCode {
             }) {
                 eprintln!("error: no `main` function");
                 return ExitCode::FAILURE;
+            }
+            // One `.gr` holding the whole program, for an embedder that cannot
+            // read the files an `import` names. The wasm engine takes a single
+            // source string and `wasm32-unknown-unknown` has no filesystem, so
+            // before this a program with one import could not run in a browser
+            // however small it was (ProjectGold F33).
+            if want_source {
+                let text = grasm_sema::loader::to_source_bundle(&program);
+                let dest = if out_path.is_empty() {
+                    format!("{}.bundle.gr", path.trim_end_matches(".gr"))
+                } else {
+                    out_path.clone()
+                };
+                if let Err(e) = std::fs::write(&dest, &text) {
+                    eprintln!("error: cannot write `{dest}`: {e}");
+                    return ExitCode::FAILURE;
+                }
+                println!(
+                    "wrote `{dest}`: {} module(s), {} bytes",
+                    program.files.len(),
+                    text.len()
+                );
+                return ExitCode::SUCCESS;
             }
             if args.iter().any(|a| a == "--native") {
                 let target = args
@@ -744,7 +768,9 @@ fn run() -> ExitCode {
             eprintln!("  bench <file.gr>              run bench blocks, report time per op");
             eprintln!("      --filter TEXT            only benchmarks whose name contains TEXT");
             eprintln!("  check <file.gr>              parse + typecheck");
-            eprintln!("  build <file.gr> [-o out]     self-contained executable");
+            eprintln!("  build <file.gr> [-o out]     self-contained executable
+      --source                 one .gr holding the whole program, for an
+                               embedder with no filesystem");
             eprintln!("      --native                 compile to machine code (Cranelift)");
             eprintln!("      --target <triple>        emit a cross-target object file");
             eprintln!("      --no-incremental         one object, no cache (best for a single build)");

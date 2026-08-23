@@ -34,13 +34,12 @@
 <main>
   <textarea id="src" spellcheck="false"># Live
 
-Type on the left. The preview is compiled by the *same process*
-that publishes — one `lib_markdown`, one call, no second
-implementation to disagree with.
+Type on the left. The preview is compiled by the *same* Grasm
+compiler the server publishes with — `lib_markdown`, running here
+in wasm.
 
-- the browser cannot run it: the wasm engine takes one source
-  string, and this program has an `import`
-- so the preview is a round trip, debounced
+- the preview runs in wasm, from `bundle.gr`
+- publishing is the only round trip, and it must agree
 </textarea>
   <div id="preview"></div>
 </main>
@@ -52,54 +51,71 @@ implementation to disagree with.
   const status = document.getElementById("status");
   const publish = document.getElementById("publish");
 
-  // The preview is rendered by asking the server, once per keystroke.
-  //
-  // The first version of this page ran the compiler here, in wasm, on the
-  // source of main.gr — and it could not. `grasm_run_with_stdin` takes one
-  // source string and the wasm target has no filesystem, so a program with an
-  // `import` cannot be handed to it at all. main.gr imports `lib_markdown`,
-  // which is the whole point of this project, so the browser is out.
-  //
-  // Asking the server is not a workaround dressed up as a design: it is the
-  // *stronger* version of the claim. The preview is not compiled by the same
-  // compiler as the published page — it is compiled by the same *process*, and
-  // there is nothing left for the two to disagree about. What it costs is a
-  // round trip per keystroke, which is why the request is debounced.
-  let timer = null, inFlight = false, again = false;
+  let compiled = null, source = null;
 
+  // The clock is imported because `std::time` panics on this target and a
+  // panic with no unwinding is an abort. `dlsym` is reached through Rust's std.
+  const imports = { env: { grasm_now_millis: () => Date.now(), dlsym: () => 0 } };
+
+  // A document travels as one line, because `input()` reads one line. This is
+  // the encoding `decode_line` in main.gr undoes.
+  const encodeDoc = d => d.replace(/\\/g, "\\\\").replace(/\n/g, "\\n");
+
+  // `bundle.gr` is this project's whole program — main.gr and lib_markdown —
+  // as one file, written by `grasm build --source`.
+  //
+  // The first version of this page fetched `main.gr` and could not run it:
+  // `grasm_run_with_stdin` takes one source string and wasm32 has no
+  // filesystem, so an `import` cannot be resolved. That was ProjectGold F33,
+  // and closing it is what put this preview back on the compiler it claims.
   function render() {
-    if (inFlight) { again = true; return; }
-    inFlight = true;
-    fetch(`${API}/render`, { method: "POST", body: src.value })
-      .then(r => r.text())
-      .then(html => {
-        preview.innerHTML = html;
-        status.textContent = "preview compiled by the server, same code as publish";
-      })
-      .catch(() => {
-        status.textContent = "no server: run `grasm run main.gr -- serve`";
-      })
-      .finally(() => {
-        inFlight = false;
-        if (again) { again = false; render(); }
-      });
+    if (!compiled) return;
+    const ex = new WebAssembly.Instance(compiled, imports).exports;
+    const mem = () => new Uint8Array(ex.memory.buffer);
+    const enc = new TextEncoder();
+    const s = enc.encode(source);
+    const sp = ex.grasm_alloc(s.length);
+    mem().set(s, sp);
+    const i = enc.encode(encodeDoc(src.value) + "\n");
+    const ip = ex.grasm_alloc(i.length);
+    mem().set(i, ip);
+    const res = ex.grasm_run_with_stdin(sp, s.length, ip, i.length);
+    ex.grasm_free(sp, s.length);
+    ex.grasm_free(ip, i.length);
+    const v = new DataView(ex.memory.buffer);
+    const total = v.getUint32(res, true);
+    const outLen = v.getUint32(res + 8, true);
+    const html = new TextDecoder().decode(mem().slice(res + 12, res + 12 + outLen));
+    ex.grasm_free(res, total);
+    preview.innerHTML = html;
   }
 
-  src.addEventListener("input", () => {
-    clearTimeout(timer);
-    timer = setTimeout(render, 90);
+  Promise.all([
+    fetch("grasm.wasm", { cache: "no-store" }).then(r => r.arrayBuffer()),
+    fetch("bundle.gr", { cache: "no-store" }).then(r => r.text()),
+  ]).then(([bytes, text]) => {
+    compiled = new WebAssembly.Module(bytes);
+    source = text;
+    publish.disabled = false;
+    status.textContent = "preview compiled here, by the server's own compiler";
+    render();
+  }).catch(e => {
+    status.textContent =
+      "must be served over http — a file:// page cannot fetch (" + e.message + ")";
   });
 
-  publish.disabled = false;
+  src.addEventListener("input", render);
+
+  // Publishing is the only round trip. The server compiles the same document
+  // with the same code, so the two must agree — and the page says which.
   publish.addEventListener("click", () => {
     fetch(`${API}/save`, { method: "POST", body: src.value })
       .then(r => r.text())
       .then(html => {
-        preview.innerHTML = html;
-        status.textContent = "published — /source now serves this document";
+        status.textContent = html.trim() === preview.innerHTML.trim()
+          ? "published — the server's html matched the preview exactly"
+          : "published — but the server's html differs from the preview";
       })
       .catch(() => { status.textContent = "no server: run `grasm run main.gr -- serve`"; });
   });
-
-  render();
 </script>

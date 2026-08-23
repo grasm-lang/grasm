@@ -114,6 +114,39 @@ pub fn run_src_capturing_fault_with_stdin<W: Write + Send>(
     stdin: Option<Vec<String>>,
 ) -> (i32, Option<String>, Vec<grasm_syntax::Diagnostic>) {
     on_deep_stack(move || {
+        // A whole program may arrive as one string. An embedder with no
+        // filesystem — the wasm engine is the one that matters — cannot
+        // resolve an `import` by reading the file it names, so a program with
+        // one could not be run in a browser at all. A source bundle is that
+        // program with its modules laid end to end, and it loads through the
+        // same function the disk does.
+        if grasm_sema::loader::is_source_bundle(src) {
+            let program = grasm_sema::loader::load_from_source_bundle(src);
+            if !program.diagnostics.is_empty() {
+                return (1, None, program.diagnostics);
+            }
+            let analysis = grasm_sema::check::check_program(&program);
+            if !analysis.diagnostics.is_empty() {
+                return (1, None, analysis.diagnostics);
+            }
+            let files: Vec<(String, &Module, std::collections::HashMap<String, String>)> =
+                program
+                    .files
+                    .iter()
+                    .map(|f| (f.name.clone(), &f.module, f.imports.clone()))
+                    .collect();
+            let mut interp = Interp::new_program(&files, out);
+            interp.set_float_literals(analysis.float_literals);
+            interp.set_ok_wrapped(analysis.ok_wrapped);
+            interp.set_field_calls(analysis.field_calls);
+            interp.set_fallible_closures(analysis.fallible_closures);
+            interp.set_float_sums(analysis.float_sums);
+            if let Some(lines) = stdin {
+                interp.set_stdin(lines);
+            }
+            let code = interp.run_main();
+            return (code, interp.fault.clone(), vec![]);
+        }
         let (module, diags) = grasm_sema::analyze(src);
         if !diags.is_empty() {
             return (1, None, diags);
