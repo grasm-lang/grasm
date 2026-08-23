@@ -1,0 +1,34 @@
+--- merging two upstreams ---
+  both present: {"city": "lisbon", "temp_c": 22, "conditions": "clear", "aqi": 31, "missing": []}
+  air missing: {"city": "cairo", "temp_c": 0, "conditions": "dust", "aqi": 0, "missing": ["weather.temp_c", "air.aqi"]}
+  both missing: {"city": "nowhere", "temp_c": 0, "conditions": "unknown", "aqi": 0, "missing": ["weather.temp_c", "weather.conditions", "air.aqi"]}
+  upstream not JSON: {"city": "x", "temp_c": 0, "conditions": "unknown", "aqi": 5, "missing": ["weather.temp_c", "weather.conditions"]}
+  upstream wrong type: {"city": "x", "temp_c": 0, "conditions": "unknown", "aqi": 5, "missing": ["weather.temp_c", "weather.conditions"]}
+--- reading fields out of somebody else's json ---
+  int present: Some(22)
+  str present: Some(clear)
+  absent: None
+  wrong type: None
+  not json: None
+  not an object: None
+--- city names ---
+  /forecast?city=lisbon -> "lisbon"
+  /forecast?city=Bergen -> "bergen"
+  /forecast?city=a-b -> "ab"
+  /forecast -> ""
+  /forecast?city= -> ""
+--- response bodies ---
+  200: {"aqi": 1}
+  404: ""
+  garbage: ""
+--- three cities, two upstreams, one thread ---
+  two upstreams listening
+  lisbon: fetched from two upstreams at once
+    {"city": "lisbon", "temp_c": 22, "conditions": "clear", "aqi": 31, "missing": []}
+  bergen: fetched from two upstreams at once
+    {"city": "bergen", "temp_c": 9, "conditions": "rain", "aqi": 12, "missing": []}
+  cairo: fetched from two upstreams at once
+    {"city": "cairo", "temp_c": 0, "conditions": "dust", "aqi": 0, "missing": ["weather.temp_c", "air.aqi"]}
+  lisbon: from cache, no round trip
+    {"city": "lisbon", "temp_c": 22, "conditions": "clear", "aqi": 31, "missing": []}
+  cache holds 3 city/cities

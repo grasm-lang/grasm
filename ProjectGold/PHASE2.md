@@ -52,7 +52,7 @@ half needs Grasm rather than JavaScript.
 
 | # | Project | What it loses |
 |---|---|---|
-| 10 | Weather Mashup | `tcp_connect` can dial, but there is no TLS, so it can fetch `http://` and not `https://` — which is most public APIs. Degrades to a local stand-in service. **Unchanged: TLS is still absent.** |
+| 10 | Weather Mashup | `tcp_connect` can dial, but there is no TLS, so it can fetch `http://` and not `https://` — which is most public APIs. Degrades to a local stand-in service. **Unchanged: TLS is still absent**, and project 43 says so first rather than last. It is the largest single thing standing between this language and ordinary web work. |
 
 `6` and `13` were listed here because holding a connection open while serving
 others was impossible. `net_wait` made it possible, so **server-sent events are
@@ -75,6 +75,7 @@ coalesces twelve events into three pushes.
 | 6 | 40-collaborative-todo | was "degraded to polling"; it is not |
 | 12 | 41-spa-router | one matcher, browser and server |
 | 13 | 42-realtime-analytics | was "degraded to batched POSTs"; it coalesces instead |
+| 10 | 43-weather-mashup | still degraded — no TLS, and nothing here fixes that |
 
 ### Blocked (1, was 3)
 

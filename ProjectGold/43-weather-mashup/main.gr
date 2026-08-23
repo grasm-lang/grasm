@@ -1,0 +1,469 @@
+// Phase 2, project 10 — Weather Mashup.
+//
+// The one project of this phase that is still **degraded**, and the degradation
+// is not one `net_wait` or a byte socket can fix: Grasm has no TLS. It can dial
+// `http://` and not `https://`, which is most public APIs.
+//
+// So the upstreams here are stand-ins, served by this same program on their own
+// ports. That is a real limitation dressed in the smallest possible costume:
+// the client half is exactly what a real one would be — dial, send a request,
+// read a response, parse the JSON — and the only untrue thing about it is where
+// it points.
+//
+// What *is* real, and is the point:
+//
+//   * **Two upstreams are fetched concurrently**, both requests on the wire
+//     before either reply is read. A sequential mashup waits for the slowest
+//     twice; this waits once.
+//   * **A slow or broken upstream degrades the page** rather than failing it.
+//     A mashup whose weather is missing because the air-quality service is down
+//     is worse than no mashup.
+//   * **Answers are cached**, because two people asking about the same city a
+//     second apart should not be two round trips.
+//
+// ```
+// grasm run main.gr              # the comparison the harness makes
+// grasm run main.gr -- serve     # then serve index.html over http
+// ```
+
+import lib_json
+
+let PORT = 8984
+let WEATHER_PORT = 8985
+let AIR_PORT = 8986
+
+// ---------------------------------------------------------------------------
+// The merged view
+// ---------------------------------------------------------------------------
+
+type Reading = {
+    city: str,
+    temp_c: i64,
+    conditions: str,
+    aqi: i64,
+    /// What could not be reached, so the page can say so rather than imply the
+    /// numbers it *did* get are the whole story.
+    missing: [str],
+}
+
+fn quoted(s: str) -> str {
+    "\"" + lib_json.escape_json(s) + "\""
+}
+
+fn reading_json(r: Reading) -> str {
+    var missing: [str] = []
+    for m in r.missing {
+        missing.push(quoted(m))
+    }
+    "\{\"city\": {quoted(r.city)}, \"temp_c\": {r.temp_c}, \"conditions\": {quoted(r.conditions)}, \"aqi\": {r.aqi}, \"missing\": [{missing.join(", ")}]\}"
+}
+
+/// A field out of an upstream's JSON, by key.
+///
+/// The upstream is somebody else's service, so every one of these may be
+/// absent, the wrong type, or not JSON at all — and all three are the same
+/// thing to a mashup: a value it does not have.
+fn str_field(body: str, key: str) -> Option[str] {
+    match lib_json.parse_json(body) {
+        Err(e) -> None
+        Ok(v) -> pick_str(v, key)
+    }
+}
+
+fn pick_str(v: ref Json, key: str) -> Option[str] {
+    match v {
+        JObj(keys, values) -> {
+            for i in 0..keys.len() {
+                if keys[i] == key {
+                    return match values[i] {
+                        JStr(s) -> Some(s)
+                        _ -> None
+                    }
+                }
+            }
+            None
+        }
+        _ -> None
+    }
+}
+
+fn int_field(body: str, key: str) -> Option[i64] {
+    match lib_json.parse_json(body) {
+        Err(e) -> None
+        Ok(v) -> pick_int(v, key)
+    }
+}
+
+fn pick_int(v: ref Json, key: str) -> Option[i64] {
+    match v {
+        JObj(keys, values) -> {
+            for i in 0..keys.len() {
+                if keys[i] == key {
+                    return match values[i] {
+                        JNum(n) -> Some(n.as_i64())
+                        _ -> None
+                    }
+                }
+            }
+            None
+        }
+        _ -> None
+    }
+}
+
+/// Two upstream bodies merged into one answer.
+///
+/// Either may be empty — the service was down, or slow, or said something this
+/// does not understand. The merge fills in what it can and records what it
+/// could not, which is the difference between a degraded page and a broken one.
+fn merge(city: str, weather: str, air: str) -> Reading {
+    var missing: [str] = []
+    var temp = 0
+    var conditions = "unknown"
+    match int_field(weather, "temp_c") {
+        Some(t) -> temp = t
+        None -> missing.push("weather.temp_c")
+    }
+    match str_field(weather, "conditions") {
+        Some(c) -> conditions = c
+        None -> missing.push("weather.conditions")
+    }
+    var aqi = 0
+    match int_field(air, "aqi") {
+        Some(a) -> aqi = a
+        None -> missing.push("air.aqi")
+    }
+    Reading{ city: city, temp_c: temp, conditions: conditions, aqi: aqi, missing: missing }
+}
+
+// ---------------------------------------------------------------------------
+// The stand-in upstreams
+// ---------------------------------------------------------------------------
+
+/// What a weather service would say. Fixed data, because a mashup's test should
+/// fail when the *mashup* changes and not when the weather does.
+fn weather_body(city: str) -> str {
+    if city == "lisbon" {
+        "\{\"temp_c\": 22, \"conditions\": \"clear\"\}"
+    } else if city == "bergen" {
+        "\{\"temp_c\": 9, \"conditions\": \"rain\"\}"
+    } else if city == "cairo" {
+        // A real upstream that knows the city but not the weather. The mashup
+        // has to survive a *partial* answer, which is more common than a total
+        // failure and easier to get wrong.
+        "\{\"conditions\": \"dust\"\}"
+    } else {
+        ""
+    }
+}
+
+fn air_body(city: str) -> str {
+    if city == "lisbon" {
+        "\{\"aqi\": 31\}"
+    } else if city == "bergen" {
+        "\{\"aqi\": 12\}"
+    } else {
+        ""
+    }
+}
+
+fn http_ok(body: str) -> str {
+    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {body.byte_len()}\r\n\r\n{body}"
+}
+
+fn http_404() -> str {
+    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
+}
+
+fn city_of(path: str) -> str {
+    match path.index_of("?city=") {
+        None -> ""
+        Some(i) -> {
+            let rest = path.substr(i + 6, path.len() - i - 6)
+            var out = ""
+            for c in rest.codes() {
+                if (c >= 97 and c <= 122) or (c >= 65 and c <= 90) {
+                    out += c.to_char()
+                }
+            }
+            out.to_lower()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The client half — real, and pointed at a stand-in
+// ---------------------------------------------------------------------------
+
+/// The body of an HTTP response, or "" if there is not one.
+fn body_of(response: str) -> str {
+    if not response.starts_with("HTTP/1.1 200") {
+        return ""
+    }
+    match response.index_of("\r\n\r\n") {
+        None -> ""
+        Some(i) -> response.substr(i + 4, response.len() - i - 4)
+    }
+}
+
+fn request_for(path: str) -> str {
+    "GET {path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
+}
+
+/// Two upstreams, fetched at once.
+///
+/// Both requests go out before either reply is read, so the wait is the slower
+/// of the two rather than their sum. This is the shape every mashup wants and
+/// the shape a blocking client cannot have.
+fn fetch_both(city: str, weather_port: i64, air_port: i64) -> (str, str) / {net} {
+    var handles: [i64] = []
+    var bodies: [str] = ["", ""]
+    let ports = [weather_port, air_port]
+    let paths = ["/weather?city={city}", "/air?city={city}"]
+
+    for i in 0..2 {
+        match tcp_connect("127.0.0.1", ports[i]) {
+            Err(e) -> handles.push(-1)
+            Ok(c) -> match tcp_write(c, request_for(paths[i])) {
+                Ok(_) -> handles.push(c)
+                Err(e) -> {
+                    net_close(c)
+                    handles.push(-1)
+                }
+            }
+        }
+    }
+
+    var answered = 0
+    var wanted = 0
+    for h in handles {
+        if h >= 0 {
+            wanted = wanted + 1
+        }
+    }
+    var turns = 0
+    while answered < wanted and turns < 200 {
+        var waiting: [i64] = []
+        for i in 0..handles.len() {
+            if handles[i] >= 0 and bodies[i] == "" {
+                waiting.push(handles[i])
+            }
+        }
+        if waiting.len() == 0 {
+            turns = 200
+        } else {
+            let ready = net_wait(waiting, 2000) ?? []
+            // Nothing ready before the timeout is a *degraded* answer, not a
+            // failure: whatever did arrive is still worth showing.
+            if ready.len() == 0 {
+                turns = 200
+            }
+            for h in ready {
+                for i in 0..handles.len() {
+                    if handles[i] == h and bodies[i] == "" {
+                        let raw = tcp_read(h) ?? ""
+                        bodies[i] = if raw == "" { "(empty)" } else { raw }
+                        answered = answered + 1
+                    }
+                }
+            }
+        }
+        turns = turns + 1
+    }
+
+    for h in handles {
+        if h >= 0 {
+            net_close(h)
+        }
+    }
+    (body_of(bodies[0]), body_of(bodies[1]))
+}
+
+// ---------------------------------------------------------------------------
+// The cache
+// ---------------------------------------------------------------------------
+
+type Entry = { city: str, json: str }
+
+fn cached(entries: [Entry], city: str) -> str {
+    for e in entries {
+        if e.city == city {
+            return e.json
+        }
+    }
+    ""
+}
+
+// ---------------------------------------------------------------------------
+// The checks the harness compares across three engines
+// ---------------------------------------------------------------------------
+
+fn merge_checks() / {io} {
+    print("--- merging two upstreams ---")
+    print("  both present: {reading_json(merge("lisbon", weather_body("lisbon"), air_body("lisbon")))}")
+    print("  air missing: {reading_json(merge("cairo", weather_body("cairo"), air_body("cairo")))}")
+    print("  both missing: {reading_json(merge("nowhere", "", ""))}")
+    print("  upstream not JSON: {reading_json(merge("x", "<html>503</html>", "\{\"aqi\": 5\}"))}")
+    print("  upstream wrong type: {reading_json(merge("x", "\{\"temp_c\": \"warm\"\}", "\{\"aqi\": 5\}"))}")
+
+    print("--- reading fields out of somebody else's json ---")
+    let good = "\{\"temp_c\": 22, \"conditions\": \"clear\"\}"
+    print("  int present: {int_field(good, "temp_c")}")
+    print("  str present: {str_field(good, "conditions")}")
+    print("  absent: {int_field(good, "humidity")}")
+    print("  wrong type: {int_field(good, "conditions")}")
+    print("  not json: {int_field("nope", "temp_c")}")
+    print("  not an object: {int_field("[1, 2]", "temp_c")}")
+
+    print("--- city names ---")
+    for p in ["/forecast?city=lisbon", "/forecast?city=Bergen", "/forecast?city=a-b", "/forecast", "/forecast?city="] {
+        print("  {p} -> \"{city_of(p)}\"")
+    }
+
+    print("--- response bodies ---")
+    print("  200: {body_of(http_ok("\{\"aqi\": 1\}"))}")
+    print("  404: \"{body_of(http_404())}\"")
+    print("  garbage: \"{body_of("not a response")}\"")
+}
+
+// ---------------------------------------------------------------------------
+// All three servers, one thread, one process
+// ---------------------------------------------------------------------------
+
+/// The demonstration: two upstreams and a mashup, all served by this program,
+/// with a client asking the mashup for three cities.
+///
+/// Everything is driven by one `net_wait`, which is what lets a program be its
+/// own upstream without deadlocking against itself — the mashup's outbound
+/// request has to be accepted by a listener in the same loop that is waiting
+/// for the mashup's reply.
+fn exchange() / {io, net} {
+    let wl = match tcp_listen(0) {
+        Err(e) -> {
+            print("  cannot listen: {e}")
+            return
+        }
+        Ok(l) -> l
+    }
+    let al = match tcp_listen(0) {
+        Err(e) -> {
+            print("  cannot listen: {e}")
+            return
+        }
+        Ok(l) -> l
+    }
+    let wport = net_port(wl) ?? 0
+    let aport = net_port(al) ?? 0
+    print("  two upstreams listening")
+
+    var cache: [Entry] = []
+    let cities = ["lisbon", "bergen", "cairo", "lisbon"]
+
+    for city in cities {
+        let hit = cached(cache, city)
+        if hit != "" {
+            print("  {city}: from cache, no round trip")
+            print("    {hit}")
+        } else {
+            // The mashup's outbound requests and the upstreams' accepts are
+            // interleaved by one loop. A blocking client here would hang: it
+            // would be waiting for a reply from a server that cannot accept
+            // until the client stops waiting.
+            var done = false
+            var turns = 0
+            var weather = ""
+            var air = ""
+            var pending: [i64] = []
+
+            match tcp_connect("127.0.0.1", wport) {
+                Err(e) -> {}
+                Ok(c) -> match tcp_write(c, request_for("/weather?city={city}")) {
+                    Ok(_) -> pending.push(c)
+                    Err(e) -> net_close(c)
+                }
+            }
+            match tcp_connect("127.0.0.1", aport) {
+                Err(e) -> {}
+                Ok(c) -> match tcp_write(c, request_for("/air?city={city}")) {
+                    Ok(_) -> pending.push(c)
+                    Err(e) -> net_close(c)
+                }
+            }
+
+            var served: [i64] = []
+            var got = 0
+            while got < pending.len() and turns < 400 {
+                var waiting: [i64] = [wl, al]
+                for h in served { waiting.push(h) }
+                for h in pending { waiting.push(h) }
+                let ready = net_wait(waiting, 2000) ?? []
+                if ready.len() == 0 { turns = 400 }
+                for h in ready {
+                    if h == wl or h == al {
+                        let which = h
+                        match tcp_accept(which) {
+                            Err(e) -> {}
+                            Ok(conn) -> served.push(conn)
+                        }
+                    } else {
+                        var is_upstream = false
+                        for s in served {
+                            if s == h { is_upstream = true }
+                        }
+                        if is_upstream {
+                            let raw = tcp_read(h) ?? ""
+                            if raw != "" {
+                                let lines = raw.lines()
+                                let target = if lines.len() > 0 { lines[0].split(" ")[1] } else { "" }
+                                let asked = city_of(target)
+                                let body = if target.starts_with("/weather") {
+                                    weather_body(asked)
+                                } else {
+                                    air_body(asked)
+                                }
+                                let resp = if body == "" { http_404() } else { http_ok(body) }
+                                match tcp_write(h, resp) { Ok(_) -> {}  Err(e) -> {} }
+                            }
+                        } else {
+                            for i in 0..pending.len() {
+                                if pending[i] == h {
+                                    let raw = tcp_read(h) ?? ""
+                                    if raw != "" {
+                                        if i == 0 { weather = body_of(raw) } else { air = body_of(raw) }
+                                        got = got + 1
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                turns = turns + 1
+            }
+
+            for h in served { net_close(h) }
+            for h in pending { net_close(h) }
+
+            let reading = merge(city, weather, air)
+            let text = reading_json(reading)
+            cache.push(Entry{ city: city, json: text })
+            print("  {city}: fetched from two upstreams at once")
+            print("    {text}")
+        }
+    }
+
+    net_close(wl)
+    net_close(al)
+    print("  cache holds {cache.len()} city/cities")
+}
+
+fn main() / {io, net} {
+    if args().len() > 0 and args()[0] == "serve" {
+        print("This project's upstreams are stand-ins served by the same program.")
+        print("Grasm has no TLS, so a real https:// API cannot be reached at all.")
+        print("Run without arguments to see the whole exchange.")
+        return
+    }
+    merge_checks()
+    print("--- three cities, two upstreams, one thread ---")
+    exchange()
+}
