@@ -6,9 +6,9 @@ concurrent voters.
 
 ## The first project made of more than one file
 
-Thirty-three projects before this one were a single `main.gr`. This one is two:
-`json.gr` beside it is **project 13's parser, extracted into a module** so a
-second project can use it rather than carry a second copy.
+Thirty-three projects before this one were a single `main.gr`. This one imports
+**project 13's parser, extracted into a package** so a second project can use it
+rather than carry a second copy.
 
 What a module exports is the one decision extraction forces you to make. The
 answer here is `parse_json`, `to_text`, `equal`, `escape_json`, `number_text`
@@ -19,11 +19,15 @@ descent parser is what is behind the door.
 All three engines agree on it, which is the thing worth checking: `grasm run`,
 the bundle and `--native` each resolve the import and produce identical output.
 
-It is a **copy** of project 13's code, not a shared dependency, and the reason
-belongs here rather than in a footnote: ProjectGold's harness runs
-`<dir>/main.gr`, and Grasm resolves `import json` as a sibling of the importing
-file. Sharing one file across two directories needs a package with a
-`grasm.toml`, which is what project 5 is for.
+It started as a **copy** of project 13's code. Project 35 needed the same
+parser, and two copies is where a shared library stops being a nicety — so it is
+a package now, `../lib-json`, and both projects import the same file. This
+project's output did not change by a byte when it moved.
+
+The reason it could not simply be a sibling file belongs here rather than in a
+footnote: Grasm resolves `import json` as a sibling of the importing file, so
+sharing across directories needs a package with a `grasm.toml` and a path
+dependency. That is what project 5 was scheduled to prove, and it did.
 
 ## JSON in, JSON out — but not symmetrically
 

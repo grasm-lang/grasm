@@ -1,0 +1,562 @@
+// Phase 2, project 5 — Simple Blog Dashboard.
+//
+// The same posts rendered **twice**: once by the server into HTML, once by the
+// browser from JSON. The point is not that both work — it is that they are the
+// same data through two paths, so the project can *compare* them and say where
+// each one is the better answer.
+//
+// It is also the second consumer of `lib_json`. Project 34 carried a copy of
+// project 13's parser; two copies is where a shared library stops being a
+// nicety, so the parser is a package now and both projects import the same
+// file. That is what project 5 was for.
+//
+// ```
+// grasm run main.gr              # the comparison the harness makes
+// grasm run main.gr -- serve     # then open index.html
+// ```
+
+import lib_json
+
+let PORT = 8976
+
+// ---------------------------------------------------------------------------
+// Posts
+// ---------------------------------------------------------------------------
+
+type Post = {
+    id: i64,
+    title: str,
+    body: str,
+    published: bool,
+}
+
+fn seed() -> [Post] {
+    [
+        Post{ id: 1, title: "Three engines", body: "The interpreter is normative. The other two agree or there is a defect.", published: true },
+        Post{ id: 2, title: "Why a benchmark can lie", body: "The harness added 21ms to every cell and reproduced perfectly.", published: true },
+        Post{ id: 3, title: "Notes on regions", body: "Unfinished.", published: false },
+    ]
+}
+
+fn published(posts: [Post]) -> [Post] {
+    var out: [Post] = []
+    for p in posts {
+        if p.published {
+            out.push(p)
+        }
+    }
+    out
+}
+
+fn find(posts: [Post], id: i64) -> i64 {
+    for i in 0..posts.len() {
+        if posts[i].id == id {
+            return i
+        }
+    }
+    -1
+}
+
+fn next_id(posts: [Post]) -> i64 {
+    var top = 0
+    for p in posts {
+        if p.id > top {
+            top = p.id
+        }
+    }
+    top + 1
+}
+
+// ---------------------------------------------------------------------------
+// Two renderings of one list
+// ---------------------------------------------------------------------------
+
+fn escape_html(s: str) -> str {
+    var out = ""
+    for c in s.codes() {
+        if c == 38 {
+            out += "&amp;"
+        } else if c == 60 {
+            out += "&lt;"
+        } else if c == 62 {
+            out += "&gt;"
+        } else if c == 34 {
+            out += "&quot;"
+        } else {
+            out += c.to_char()
+        }
+    }
+    out
+}
+
+/// The server's answer: HTML, complete, no scripting required.
+fn render_html(posts: [Post]) -> str {
+    var items = ""
+    for p in published(posts) {
+        items += "<article><h2>{escape_html(p.title)}</h2><p>{escape_html(p.body)}</p></article>"
+    }
+    "<!doctype html><meta charset=\"utf-8\"><title>Blog</title><h1>Blog</h1>{items}"
+}
+
+fn quoted(s: str) -> str {
+    "\"" + lib_json.escape_json(s) + "\""
+}
+
+/// The browser's answer: the same list as data, for a page that renders it.
+fn render_json(posts: [Post]) -> str {
+    var parts: [str] = []
+    for p in posts {
+        parts.push("\{\"id\": {p.id}, \"title\": {quoted(p.title)}, \"body\": {quoted(p.body)}, \"published\": {p.published}\}")
+    }
+    "\{\"posts\": [{parts.join(", ")}]\}"
+}
+
+/// Every piece of text a reader would see, from the HTML.
+///
+/// This exists so the two renderings can be compared rather than asserted to
+/// match: strip the tags from what the server sent and the words left over
+/// must be the words the JSON carries.
+fn text_of_html(html: str) -> [str] {
+    var out: [str] = []
+    var buf = ""
+    var in_tag = false
+    for c in html.codes() {
+        if c == 60 {
+            in_tag = true
+            if buf.trim() != "" {
+                out.push(buf.trim())
+            }
+            buf = ""
+        } else if c == 62 {
+            in_tag = false
+        } else if not in_tag {
+            buf += c.to_char()
+        }
+    }
+    if buf.trim() != "" {
+        out.push(buf.trim())
+    }
+    out
+}
+
+/// The same, from the JSON — using the shared parser rather than a second
+/// scanner, which is the whole reason the parser is a package.
+fn text_of_json(body: str) -> [str] {
+    var out: [str] = []
+    match lib_json.parse_json(body) {
+        Err(e) -> out.push("unparseable: {e.why}")
+        Ok(v) -> match v {
+            JObj(keys, values) -> {
+                for i in 0..keys.len() {
+                    if keys[i] == "posts" {
+                        match values[i] {
+                            JList(items) -> {
+                                for it in items {
+                                    collect_post_text(it, out)
+                                }
+                            }
+                            _ -> out.push("posts is not a list")
+                        }
+                    }
+                }
+            }
+            _ -> out.push("not an object")
+        }
+    }
+    out
+}
+
+fn collect_post_text(p: ref Json, inout out: [str]) {
+    match p {
+        JObj(keys, values) -> {
+            var is_published = false
+            for i in 0..keys.len() {
+                if keys[i] == "published" {
+                    match values[i] {
+                        JBool(b) -> is_published = b
+                        _ -> {}
+                    }
+                }
+            }
+            if is_published {
+                for i in 0..keys.len() {
+                    if keys[i] == "title" or keys[i] == "body" {
+                        match values[i] {
+                            JStr(s) -> out.push(s)
+                            _ -> {}
+                        }
+                    }
+                }
+            }
+        }
+        _ -> {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Storage
+// ---------------------------------------------------------------------------
+
+fn state_path() -> str / {io} {
+    let dir = env("TMPDIR") ?? "/tmp"
+    let trimmed = if dir.ends_with("/") { dir.substr(0, dir.len() - 1) } else { dir }
+    "{trimmed}/grasm_blog_posts.json"
+}
+
+/// Posts are stored as the same JSON the API serves, and read back with the
+/// same parser the API's clients would use. A store whose format only its own
+/// writer can read is a store that cannot be inspected when something is wrong.
+fn load(path: str) -> [Post] / {io} {
+    match read_file(path) {
+        Err(e) -> seed()
+        Ok(text) -> posts_of_json(text)
+    }
+}
+
+/// Posts out of the stored JSON, or the seed when the file is not JSON at all.
+///
+/// Written as arms that both produce nothing, filling `out` by effect, rather
+/// than as arms that produce a value. The native backend refuses a `match`
+/// whose arms it cannot give one type — here an `Err` arm that returns and an
+/// `Ok` arm that evaluates a nested match — and this project has to run on all
+/// three engines. The shape below is not worse; it is just the one the whole
+/// language accepts rather than two thirds of it.
+fn posts_of_json(text: str) -> [Post] {
+    var out: [Post] = []
+    var parsed = false
+    match lib_json.parse_json(text) {
+        Err(e) -> {}
+        Ok(v) -> {
+            parsed = true
+            fill_posts(v, out)
+        }
+    }
+    if parsed { out } else { seed() }
+}
+
+fn fill_posts(v: ref Json, inout out: [Post]) {
+    match v {
+        JObj(keys, values) -> {
+            for i in 0..keys.len() {
+                if keys[i] == "posts" {
+                    fill_from_list(values[i], out)
+                }
+            }
+        }
+        _ -> {}
+    }
+}
+
+fn fill_from_list(v: ref Json, inout out: [Post]) {
+    match v {
+        JList(items) -> {
+            for it in items {
+                match post_of(it) {
+                    Some(p) -> out.push(p)
+                    None -> {}
+                }
+            }
+        }
+        _ -> {}
+    }
+}
+
+fn post_of(v: ref Json) -> Option[Post] {
+    match v {
+        JObj(keys, values) -> {
+            var id = 0
+            var title = ""
+            var body = ""
+            var pub_ = false
+            for i in 0..keys.len() {
+                let k = keys[i]
+                match values[i] {
+                    JNum(n) -> if k == "id" { id = n.as_i64() }
+                    JStr(s) -> {
+                        if k == "title" { title = s }
+                        if k == "body" { body = s }
+                    }
+                    JBool(b) -> if k == "published" { pub_ = b }
+                    _ -> {}
+                }
+            }
+            if id == 0 or title == "" {
+                None
+            } else {
+                Some(Post{ id: id, title: title, body: body, published: pub_ })
+            }
+        }
+        _ -> None
+    }
+}
+
+fn save(path: str, posts: [Post]) / {io} {
+    match write_file(path, render_json(posts)) {
+        Ok(_) -> {}
+        Err(e) -> eprint("cannot save posts: {e}")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Routing
+// ---------------------------------------------------------------------------
+
+fn response(status: str, content_type: str, body: str) -> str {
+    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {body.byte_len()}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{body}"
+}
+
+type Req = { method: str, path: str, body: str }
+
+fn parse_req(raw: str) -> Req {
+    let head_end = raw.index_of("\r\n\r\n")
+    let head = match head_end {
+        Some(i) -> raw.substr(0, i)
+        None -> raw
+    }
+    let body = match head_end {
+        Some(i) -> raw.substr(i + 4, raw.len() - i - 4)
+        None -> ""
+    }
+    let lines = head.lines()
+    if lines.len() == 0 {
+        return Req{ method: "", path: "empty request", body: "" }
+    }
+    let parts = lines[0].split(" ")
+    if parts.len() != 3 or not parts[1].starts_with("/") {
+        return Req{ method: "", path: "malformed request line", body: "" }
+    }
+    Req{ method: parts[0], path: parts[1], body: body }
+}
+
+fn route(r: Req, posts: [Post]) -> ([Post], str) {
+    if r.method == "" {
+        return (posts, response("400 Bad Request", "text/plain", "bad request: {r.path}\n"))
+    }
+    // The two renderings, side by side in the routing table.
+    if r.path == "/" and r.method == "GET" {
+        return (posts, response("200 OK", "text/html", render_html(posts)))
+    }
+    if r.path == "/api/posts" and r.method == "GET" {
+        return (posts, response("200 OK", "application/json", render_json(posts)))
+    }
+    if r.path == "/api/posts" and r.method == "POST" {
+        return create_or_update(posts, r.body)
+    }
+    response_404(posts, r)
+}
+
+/// A post created or replaced.
+///
+/// Flat, with early returns, rather than four nested matches. The nesting was
+/// the natural way to write it and the native backend cannot type a `match`
+/// whose arms disagree — an arm that returns beside an arm that evaluates
+/// another match — so this project would have run on two engines out of three.
+///
+/// A body with no `id` is a *new* post, so it is parsed twice: once as sent,
+/// and once with the next id put in front of it. Two parses of a small object
+/// is cheaper than a second parser that knows about optional fields.
+fn create_or_update(posts: [Post], body: str) -> ([Post], str) {
+    var found = false
+    var post = Post{ id: 0, title: "", body: "", published: false }
+    var bad = ""
+
+    match lib_json.parse_json(body) {
+        Err(e) -> bad = "not JSON: {e.why}"
+        Ok(v) -> match post_of(v) {
+            Some(p) -> {
+                found = true
+                post = p
+            }
+            None -> {}
+        }
+    }
+    if bad != "" {
+        return (posts, error_response("400 Bad Request", bad))
+    }
+    if not found {
+        let with_id = "\{\"id\": {next_id(posts)}, {trimmed_object(body)}"
+        match lib_json.parse_json(with_id) {
+            Err(e) -> {}
+            Ok(v2) -> match post_of(v2) {
+                Some(p) -> {
+                    found = true
+                    post = p
+                }
+                None -> {}
+            }
+        }
+    }
+    if not found {
+        return (posts, error_response("422 Unprocessable Entity", "a post needs a title"))
+    }
+
+    var next = posts
+    let at = find(next, post.id)
+    if at >= 0 {
+        next[at] = post
+        return (next, response("200 OK", "application/json", render_json(next)))
+    }
+    next.push(post)
+    (next, response("201 Created", "application/json", render_json(next)))
+}
+
+fn error_response(status: str, why: str) -> str {
+    response(status, "application/json", "\{\"error\": {quoted(why)}\}")
+}
+
+fn response_404(posts: [Post], r: Req) -> ([Post], str) {
+    (posts, response("404 Not Found", "text/plain", "no route for {r.method} {r.path}\n"))
+}
+
+/// `{"title": ...}` without its opening brace, so an id can be put in front.
+fn trimmed_object(body: str) -> str {
+    let t = body.trim()
+    if t.starts_with("\{") {
+        t.substr(1, t.len() - 1)
+    } else {
+        t
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The checks the harness compares across three engines
+// ---------------------------------------------------------------------------
+
+fn compare_renderings() / {io} {
+    print("--- the same posts, two renderings ---")
+    let posts = seed()
+    let html = render_html(posts)
+    let body = render_json(posts)
+    print("  html: {html.len()} characters")
+    print("  json: {body.len()} characters")
+
+    // Not "both work" — the same words, reached two ways.
+    let from_html = text_of_html(html)
+    let from_json = text_of_json(body)
+    print("  words from html: {from_html}")
+    print("  words from json: {from_json}")
+    // The page's own furniture comes first — a `<title>` and an `<h1>`, both
+    // saying "Blog" — and the posts follow. So the relation to check is that
+    // the *tail* matches, not that the lists are the same length: counting the
+    // chrome would mean this test knew how many headings the template has,
+    // which is exactly the thing a template is allowed to change.
+    let skip = from_html.len() - from_json.len()
+    var same = skip >= 0
+    if same {
+        for i in 0..from_json.len() {
+            if from_html[i + skip] != from_json[i] {
+                same = false
+            }
+        }
+    }
+    print("  {skip} word(s) of page furniture, then the posts")
+    print("  the readable text agrees once the furniture is set aside: {same}")
+
+    print("--- the unpublished post ---")
+    print("  posts: {posts.len()}, published: {published(posts).len()}")
+    print("  html mentions the draft: {html.contains("Notes on regions")}")
+    print("  json carries it: {body.contains("Notes on regions")}")
+}
+
+fn show_route(label: str, method: str, path: str, body: str, posts: [Post]) / {io} {
+    let raw = "{method} {path} HTTP/1.1\r\nHost: x\r\n\r\n{body}"
+    let (next, resp) = route(parse_req(raw), posts)
+    let status = resp.lines()[0].split(" ")[1]
+    print("  {label}: {status}, {posts.len()} -> {next.len()} post(s)")
+}
+
+fn routing_checks() / {io} {
+    print("--- routing ---")
+    let posts = seed()
+    show_route("GET /", "GET", "/", "", posts)
+    show_route("GET /api/posts", "GET", "/api/posts", "", posts)
+    show_route("POST a new post", "POST", "/api/posts",
+        "\{\"title\": \"Four\", \"body\": \"new\", \"published\": true\}", posts)
+    show_route("POST an existing id", "POST", "/api/posts",
+        "\{\"id\": 2, \"title\": \"Edited\", \"body\": \"changed\", \"published\": true\}", posts)
+    show_route("POST junk", "POST", "/api/posts", "nope", posts)
+    show_route("POST no title", "POST", "/api/posts", "\{\"body\": \"orphan\"\}", posts)
+    show_route("GET /nowhere", "GET", "/nowhere", "", posts)
+}
+
+fn storage_checks() / {io} {
+    print("--- storage round trip ---")
+    let path = state_path()
+    let posts = seed()
+    save(path, posts)
+    let back = load(path)
+    print("  wrote {posts.len()}, read {back.len()}")
+    var identical = back.len() == posts.len()
+    if identical {
+        for i in 0..posts.len() {
+            if back[i].id != posts[i].id or
+                back[i].title != posts[i].title or
+                back[i].body != posts[i].body or
+                back[i].published != posts[i].published {
+                identical = false
+            }
+        }
+    }
+    print("  every field survived: {identical}")
+    print("  the store is the API's own format: {render_json(back) == render_json(posts)}")
+}
+
+// ---------------------------------------------------------------------------
+// The live half
+// ---------------------------------------------------------------------------
+
+fn serve() / {io, net} {
+    let path = state_path()
+    let listener = match tcp_listen(PORT) {
+        Err(e) -> {
+            print("cannot listen on {PORT}: {e}")
+            return
+        }
+        Ok(l) -> l
+    }
+    print("http://localhost:{PORT}  (ctrl-c to stop)")
+    print("posts: {path}, currently {load(path).len()}")
+    var open: [i64] = []
+    var going = true
+    while going {
+        var waiting: [i64] = [listener]
+        for h in open {
+            waiting.push(h)
+        }
+        let ready = net_wait(waiting, 60000) ?? []
+        for h in ready {
+            if h == listener {
+                match tcp_accept(listener) {
+                    Err(e) -> print("accept failed: {e}")
+                    Ok(conn) -> open.push(conn)
+                }
+            } else {
+                let raw = tcp_read(h) ?? ""
+                if raw != "" {
+                    let (next, resp) = route(parse_req(raw), load(path))
+                    save(path, next)
+                    match tcp_write(h, resp) {
+                        Ok(_) -> {}
+                        Err(e) -> {}
+                    }
+                }
+                net_close(h)
+                var still: [i64] = []
+                for k in open {
+                    if k != h { still.push(k) }
+                }
+                open = still
+            }
+        }
+    }
+}
+
+fn main() / {io, net} {
+    if args().len() > 0 and args()[0] == "serve" {
+        serve()
+        return
+    }
+    compare_renderings()
+    routing_checks()
+    storage_checks()
+}

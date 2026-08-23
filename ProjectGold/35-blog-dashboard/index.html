@@ -1,0 +1,51 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Blog — client-rendered</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 16px/1.6 system-ui, sans-serif; max-width: 38rem;
+         margin: 3.5rem auto; padding: 0 1.25rem; }
+  h1 { font-size: 1.2rem; font-weight: 600; }
+  article { margin: 1.75rem 0; padding-bottom: 1.25rem;
+            border-bottom: 1px solid color-mix(in srgb, currentColor 15%, transparent); }
+  article h2 { font-size: 1rem; font-weight: 600; margin: 0 0 0.35rem; }
+  article p { margin: 0; }
+  .draft { opacity: 0.55; }
+  .draft h2::after { content: " · draft"; font-weight: 400; font-size: 0.8em; }
+  p.note { opacity: 0.7; font-size: 0.85rem; }
+  a { color: inherit; }
+  code { font-family: ui-monospace, monospace; font-size: 0.85em; }
+</style>
+
+<h1>Blog</h1>
+<div id="posts"></div>
+<p class="note" id="status">…</p>
+<p class="note">
+  This page renders from <code>/api/posts</code>. The same posts server-rendered
+  are at <a href="http://localhost:8976/">localhost:8976/</a> — same data, two
+  paths. This one can show drafts; that one never sends them.
+</p>
+
+<script>
+  const API = "http://localhost:8976";
+  const postsEl = document.getElementById("posts");
+  const statusEl = document.getElementById("status");
+
+  fetch(`${API}/api/posts`).then(r => r.json()).then(data => {
+    postsEl.replaceChildren(...data.posts.map(p => {
+      const art = document.createElement("article");
+      if (!p.published) art.className = "draft";
+      const h = document.createElement("h2");
+      h.textContent = p.title;
+      const b = document.createElement("p");
+      b.textContent = p.body;
+      art.append(h, b);
+      return art;
+    }));
+    const drafts = data.posts.filter(p => !p.published).length;
+    statusEl.textContent =
+      `${data.posts.length} post(s), ${drafts} of them draft — the server-rendered page shows ${data.posts.length - drafts}.`;
+  }).catch(e => {
+    statusEl.textContent = `no server: run \`grasm run main.gr -- serve\` (${e.message})`;
+  });
+</script>

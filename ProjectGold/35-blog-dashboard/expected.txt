@@ -1,0 +1,23 @@
+--- the same posts, two renderings ---
+  html: 308 characters
+  json: 373 characters
+  words from html: [Blog, Blog, Three engines, The interpreter is normative. The other two agree or there is a defect., Why a benchmark can lie, The harness added 21ms to every cell and reproduced perfectly.]
+  words from json: [Three engines, The interpreter is normative. The other two agree or there is a defect., Why a benchmark can lie, The harness added 21ms to every cell and reproduced perfectly.]
+  2 word(s) of page furniture, then the posts
+  the readable text agrees once the furniture is set aside: true
+--- the unpublished post ---
+  posts: 3, published: 2
+  html mentions the draft: false
+  json carries it: true
+--- routing ---
+  GET /: 200, 3 -> 3 post(s)
+  GET /api/posts: 200, 3 -> 3 post(s)
+  POST a new post: 201, 3 -> 4 post(s)
+  POST an existing id: 200, 3 -> 3 post(s)
+  POST junk: 400, 3 -> 3 post(s)
+  POST no title: 422, 3 -> 3 post(s)
+  GET /nowhere: 404, 3 -> 3 post(s)
+--- storage round trip ---
+  wrote 3, read 3
+  every field survived: true
+  the store is the API's own format: true

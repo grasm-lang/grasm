@@ -1,0 +1,9 @@
+[package]
+name = "lib_json"
+version = "1.0.0"
+entry = "src/main.gr"
+
+# A parser reads text and answers with a value. It opens no files, dials
+# nothing, and starts no processes — so it declares nothing, and a consumer
+# that imports it cannot acquire a capability by doing so ([T-CAPABILITY]).
+capabilities = []

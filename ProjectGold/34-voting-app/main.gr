@@ -1,9 +1,10 @@
 // Phase 2, project 4 — Dynamic Voting App.
 //
-// JSON in and JSON out, and the first ProjectGold project made of more than one
-// file. `json.gr` beside this one is project 13's parser, extracted into a
-// module so a second project can use it instead of carrying a second copy — and
-// what a module exports is the one decision that extraction forces you to make.
+// JSON in and JSON out, and the first ProjectGold project to depend on another.
+// `lib_json` is project 13's parser as a package — the same file project 35
+// imports, not a second copy of it. What a module exports is the one decision
+// extraction forces you to make, and `../lib-json/README.md` records the
+// answer.
 //
 // ```
 // grasm run main.gr              # the comparison the harness makes
@@ -15,7 +16,7 @@
 // parser's value type to do it would be building a tree in order to flatten it
 // immediately.
 
-import json
+import lib_json
 
 let PORT = 8975
 
@@ -76,7 +77,7 @@ fn cast(p: Poll, name: str) -> (Poll, str) {
 /// Every way this can fail has its own message, because "bad request" tells a
 /// caller nothing it can act on.
 fn option_in(body: str) -> (str, str) {
-    match json.parse_json(body) {
+    match lib_json.parse_json(body) {
         Err(e) -> ("", "not JSON: {e.why} at character {e.at}")
         Ok(v) -> match v {
             JObj(keys, values) -> {
@@ -84,13 +85,13 @@ fn option_in(body: str) -> (str, str) {
                     if keys[i] == "option" {
                         return match values[i] {
                             JStr(s) -> (s, "")
-                            _ -> ("", "\"option\" must be a string, got {json.to_text(values[i])}")
+                            _ -> ("", "\"option\" must be a string, got {lib_json.to_text(values[i])}")
                         }
                     }
                 }
                 ("", "no \"option\" key")
             }
-            _ -> ("", "expected an object, got {json.to_text(v)}")
+            _ -> ("", "expected an object, got {lib_json.to_text(v)}")
         }
     }
 }
@@ -100,7 +101,7 @@ fn option_in(body: str) -> (str, str) {
 // ---------------------------------------------------------------------------
 
 fn quoted(s: str) -> str {
-    "\"" + json.escape_json(s) + "\""
+    "\"" + lib_json.escape_json(s) + "\""
 }
 
 fn poll_json(p: Poll) -> str {
@@ -284,9 +285,9 @@ fn core_checks() / {io} {
 
     print("--- round trip through the module ---")
     let rendered = poll_json(fresh())
-    match json.parse_json(rendered) {
+    match lib_json.parse_json(rendered) {
         Err(e) -> print("  our own output does not parse: {e.why}")
-        Ok(v) -> print("  reparsed and reserialised equal: {json.to_text(v) == json.to_text(json.parse_json(json.to_text(v)) ?? v)}")
+        Ok(v) -> print("  reparsed and reserialised equal: {lib_json.to_text(v) == lib_json.to_text(lib_json.parse_json(lib_json.to_text(v)) ?? v)}")
     }
 }
 
