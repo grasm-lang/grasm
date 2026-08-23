@@ -1,0 +1,40 @@
+--- why this project was blocked ---
+  original: 10 bytes [255, 254, 65, 66, 0, 67, 137, 80, 78, 71]
+  through a str: 16 bytes [239, 191, 189, 239, 191, 189, 65, 66, 0, 67, 239, 191, 189, 80, 78, 71]
+  survived: false
+  through bytes: 10 bytes, survived: true
+--- parsing multipart ---
+  body: 255 bytes
+  parts: 2
+  field caption: a picture
+  file file: shot.png, image/png, 10 bytes
+  payload survived the round trip: true
+  and it is the awkward one: [255, 254, 65, 66, 0, 67, 137, 80, 78, 71]
+--- boundaries ---
+  from a header: ----abc
+  quoted: ----abc
+  with more after it: ----abc
+  absent: ""
+  a body with no boundary gives no parts: 0
+  a wrong boundary gives no parts: 0
+--- names that try to escape ---
+  shot.png -> shot.png
+  ../../etc/passwd -> upload.._.._etc_passwd
+  /etc/passwd -> _etc_passwd
+  .. -> upload..
+   -> upload
+  .hidden -> upload.hidden
+  a b.png -> a_b.png
+  sh ot.PNG -> sh_ot.PNG
+--- what a browser is told ---
+  a.png -> image/png
+  b.JPEG -> image/jpeg
+  c.gif -> image/gif
+  d.txt -> text/plain
+  e.html -> application/octet-stream
+  f -> application/octet-stream
+--- a real upload over a socket ---
+  server read 381 bytes
+  HTTP/1.1 201 Created
+  {"stored": ["wire.png"]}
+  stored 10 bytes, identical to the upload: true

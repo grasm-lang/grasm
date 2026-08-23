@@ -1,0 +1,95 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Gallery — bytes end to end</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.55 system-ui, sans-serif; max-width: 44rem;
+         margin: 3rem auto; padding: 0 1.25rem; }
+  h1 { font-size: 1.1rem; font-weight: 600; }
+  .drop { border: 1.5px dashed color-mix(in srgb, currentColor 35%, transparent);
+          border-radius: 10px; padding: 2rem; text-align: center; margin: 1.5rem 0;
+          transition: border-color 120ms ease, background 120ms ease; }
+  .drop.over { border-color: currentColor;
+               background: color-mix(in srgb, currentColor 6%, transparent); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(9rem, 1fr));
+          gap: 1rem; }
+  figure { margin: 0; }
+  figure img { width: 100%; height: 8rem; object-fit: cover; border-radius: 6px;
+               background: color-mix(in srgb, currentColor 8%, transparent); }
+  figcaption { font-size: 0.75rem; opacity: 0.7; margin-top: 0.35rem;
+               overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  p.note { opacity: 0.7; font-size: 0.85rem; }
+  code { font-family: ui-monospace, monospace; font-size: 0.85em; }
+  input[type=file] { font: inherit; }
+</style>
+
+<h1>Gallery</h1>
+
+<div class="drop" id="drop">
+  <p>Drop an image here, or <input type="file" id="picker" multiple></p>
+  <p class="note" id="status">…</p>
+</div>
+
+<div class="grid" id="grid"></div>
+
+<p class="note">
+  Uploads travel as <code>multipart/form-data</code> and the server reads them
+  with <code>tcp_read_bytes</code>. Before that existed, a socket carried
+  <code>str</code> and every byte that was not valid UTF-8 became U+FFFD — the
+  upload arrived, the length looked plausible, and the image was broken.
+</p>
+
+<script>
+  const API = "http://localhost:8979";
+  const grid = document.getElementById("grid");
+  const status = document.getElementById("status");
+  const drop = document.getElementById("drop");
+  const picker = document.getElementById("picker");
+
+  function refresh() {
+    fetch(`${API}/files`).then(r => r.json()).then(({ files }) => {
+      grid.replaceChildren(...files.map(n => {
+        const fig = document.createElement("figure");
+        const img = document.createElement("img");
+        img.src = `${API}/file/${encodeURIComponent(n)}`;
+        img.alt = n;
+        img.loading = "lazy";
+        const cap = document.createElement("figcaption");
+        cap.textContent = n;
+        fig.append(img, cap);
+        return fig;
+      }));
+      status.textContent = files.length
+        ? `${files.length} file(s)`
+        : "nothing uploaded yet";
+    }).catch(() => {
+      status.textContent = "no server: run `grasm run main.gr -- serve`";
+    });
+  }
+
+  function upload(files) {
+    if (!files.length) return;
+    const form = new FormData();
+    for (const f of files) form.append("file", f, f.name);
+    status.textContent = `uploading ${files.length} file(s)…`;
+    fetch(`${API}/upload`, { method: "POST", body: form })
+      .then(r => r.json())
+      .then(j => {
+        status.textContent = j.error ? j.error : `stored ${j.stored.join(", ")}`;
+        refresh();
+      })
+      .catch(() => { status.textContent = "upload failed"; });
+  }
+
+  picker.addEventListener("change", () => upload(picker.files));
+
+  for (const ev of ["dragenter", "dragover"]) {
+    drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add("over"); });
+  }
+  for (const ev of ["dragleave", "drop"]) {
+    drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove("over"); });
+  }
+  drop.addEventListener("drop", e => upload(e.dataTransfer.files));
+
+  refresh();
+</script>

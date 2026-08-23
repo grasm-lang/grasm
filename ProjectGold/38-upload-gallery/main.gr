@@ -1,0 +1,579 @@
+// Phase 2, project 8 — File Upload Gallery.
+//
+// This project was **blocked** in the phase 2 plan. `multipart/form-data` is
+// binary, a socket carried `str`, and a `str` is text: bytes that are not valid
+// UTF-8 were replaced with U+FFFD on the way in. An upload arrived, its length
+// looked plausible, and the image was broken in a way nothing downstream could
+// detect.
+//
+// `tcp_read_bytes` and `tcp_write_bytes` ([L-LIB-NET]) unblocked it. They
+// needed no new type — `bytes` already existed ([L-LIB-BYTES]) and the socket
+// simply had no way to speak it.
+//
+// So the first thing this program does is show the difference, because a fix
+// nobody can see the need for is a fix nobody keeps:
+//
+//   through a `str`:   6 bytes in, 10 bytes out, contents destroyed
+//   through `bytes`:   6 bytes in, 6 bytes out, contents identical
+//
+// ```
+// grasm run main.gr              # the comparison the harness makes
+// grasm run main.gr -- serve     # then open index.html
+// ```
+
+let PORT = 8979
+
+// ---------------------------------------------------------------------------
+// Searching bytes
+// ---------------------------------------------------------------------------
+
+/// The first offset at or after `from` where `needle` appears, or -1.
+///
+/// `str` has `index_of` and `bytes` does not, because a byte buffer is not text
+/// and the answer would be in the wrong units. Multipart parsing is entirely
+/// this operation, so it is written once here.
+fn find_bytes(hay: bytes, needle: bytes, from: i64) -> i64 {
+    if needle.len() == 0 or needle.len() > hay.len() {
+        return -1
+    }
+    var i = if from < 0 { 0 } else { from }
+    let last = hay.len() - needle.len()
+    while i <= last {
+        var j = 0
+        var same = true
+        while j < needle.len() and same {
+            if hay.at(i + j) != needle.at(j) {
+                same = false
+            }
+            j = j + 1
+        }
+        if same {
+            return i
+        }
+        i = i + 1
+    }
+    -1
+}
+
+fn bytes_eq(a: bytes, b: bytes) -> bool {
+    if a.len() != b.len() {
+        return false
+    }
+    var i = 0
+    while i < a.len() {
+        if a.at(i) != b.at(i) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+// ---------------------------------------------------------------------------
+// multipart/form-data
+// ---------------------------------------------------------------------------
+
+type Part = {
+    name: str,
+    filename: str,
+    content_type: str,
+    body: bytes,
+}
+
+fn empty_part() -> Part {
+    Part{ name: "", filename: "", content_type: "", body: bytes_of([]) }
+}
+
+/// The boundary out of `multipart/form-data; boundary=----abc`.
+fn boundary_of(content_type: str) -> str {
+    let key = "boundary="
+    match content_type.index_of(key) {
+        None -> ""
+        Some(i) -> {
+            let rest = content_type.substr(i + key.len(), content_type.len() - i - key.len())
+            // A boundary may be quoted, and may be followed by nothing else.
+            let cut = match rest.index_of(";") {
+                Some(j) -> rest.substr(0, j)
+                None -> rest
+            }
+            let t = cut.trim()
+            if t.starts_with("\"") and t.ends_with("\"") and t.len() >= 2 {
+                t.substr(1, t.len() - 2)
+            } else {
+                t
+            }
+        }
+    }
+}
+
+/// One part's headers, as text, and where its body begins.
+///
+/// The headers of a multipart part are text by specification, so decoding just
+/// them is correct — it is the *body* that must not be decoded, and it is not.
+fn header_text(body: bytes, at: i64, end: i64) -> str {
+    body.slice(at, end - at).to_str()
+}
+
+fn header_value(head: str, name: str) -> str {
+    for line in head.lines() {
+        let low = line.to_lower()
+        if low.starts_with(name.to_lower() + ":") {
+            return line.substr(name.len() + 1, line.len() - name.len() - 1).trim()
+        }
+    }
+    ""
+}
+
+/// A quoted parameter out of `form-data; name="file"; filename="a.png"`.
+fn param(disposition: str, key: str) -> str {
+    let want = "{key}=\""
+    match disposition.index_of(want) {
+        None -> ""
+        Some(i) -> {
+            let rest = disposition.substr(i + want.len(), disposition.len() - i - want.len())
+            match rest.index_of("\"") {
+                None -> ""
+                Some(j) -> rest.substr(0, j)
+            }
+        }
+    }
+}
+
+/// Every part of a multipart body.
+///
+/// The body is never turned into a `str`. Boundaries are searched for as bytes
+/// and payloads are sliced as bytes, so a JPEG passes through unchanged.
+fn parse_multipart(body: bytes, boundary: str) -> [Part] {
+    var out: [Part] = []
+    if boundary == "" {
+        return out
+    }
+    let sep = ("--" + boundary).to_bytes()
+    let crlf2 = "\r\n\r\n".to_bytes()
+    var at = find_bytes(body, sep, 0)
+    while at >= 0 {
+        let after = at + sep.len()
+        // `--boundary--` ends the body.
+        if after + 2 <= body.len() and body.at(after) == 45 and body.at(after + 1) == 45 {
+            return out
+        }
+        let head_end = find_bytes(body, crlf2, after)
+        if head_end < 0 {
+            return out
+        }
+        let head = header_text(body, after, head_end)
+        let body_start = head_end + 4
+        let next = find_bytes(body, sep, body_start)
+        if next < 0 {
+            return out
+        }
+        // The CRLF before the next boundary belongs to the delimiter, not to
+        // the payload. Off by two here and every uploaded file gains two bytes.
+        let body_end = if next - 2 >= body_start { next - 2 } else { body_start }
+        let disposition = header_value(head, "Content-Disposition")
+        out.push(Part{
+            name: param(disposition, "name"),
+            filename: param(disposition, "filename"),
+            content_type: header_value(head, "Content-Type"),
+            body: body.slice(body_start, body_end - body_start),
+        })
+        at = next
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// The gallery
+// ---------------------------------------------------------------------------
+
+fn tmp() -> str / {io} {
+    let dir = env("TMPDIR") ?? "/tmp"
+    if dir.ends_with("/") { dir.substr(0, dir.len() - 1) } else { dir }
+}
+
+fn gallery_dir() -> str / {io} {
+    "{tmp()}/grasm_gallery"
+}
+
+/// A stored name that cannot escape the gallery.
+///
+/// An uploaded filename is attacker-controlled, and `../../etc/passwd` is the
+/// oldest trick there is. Only these characters survive, so the result is a
+/// name and never a path.
+fn safe_name(raw: str) -> str {
+    var out = ""
+    for c in raw.codes() {
+        let ok = (c >= 97 and c <= 122) or
+            (c >= 65 and c <= 90) or
+            (c >= 48 and c <= 57) or
+            c == 46 or c == 45 or c == 95
+        if ok {
+            out += c.to_char()
+        } else {
+            out += "_"
+        }
+    }
+    // A leading dot would hide the file; a name of nothing is not a name.
+    if out == "" or out.starts_with(".") {
+        "upload" + out
+    } else {
+        out
+    }
+}
+
+/// What a browser should be told a file is.
+///
+/// Taken from the extension rather than from the upload's own `Content-Type`,
+/// which is attacker-controlled: a file claiming `text/html` and served as such
+/// is a stored cross-site scripting hole. Anything unrecognised is served as
+/// bytes, which no browser will execute.
+fn content_type_for(name: str) -> str {
+    let n = name.to_lower()
+    if n.ends_with(".png") {
+        "image/png"
+    } else if n.ends_with(".jpg") or n.ends_with(".jpeg") {
+        "image/jpeg"
+    } else if n.ends_with(".gif") {
+        "image/gif"
+    } else if n.ends_with(".txt") {
+        "text/plain"
+    } else {
+        "application/octet-stream"
+    }
+}
+
+fn store(name: str, payload: bytes) -> bool / {io} {
+    match make_dir(gallery_dir()) {
+        Ok(_) -> {}
+        Err(e) -> {}
+    }
+    match write_bytes("{gallery_dir()}/{name}", payload) {
+        Ok(_) -> true
+        Err(e) -> {
+            eprint("cannot store {name}: {e}")
+            false
+        }
+    }
+}
+
+fn stored_names() -> [str] / {io} {
+    var out: [str] = []
+    match list_dir(gallery_dir()) {
+        Err(e) -> {}
+        Ok(entries) -> {
+            for e in entries {
+                out.push(e)
+            }
+        }
+    }
+    out.sort()
+    out
+}
+
+// ---------------------------------------------------------------------------
+// The checks the harness compares across three engines
+// ---------------------------------------------------------------------------
+
+/// A run of bytes no `str` can carry unchanged: 0xff and 0xfe are not valid
+/// UTF-8 starts, and a NUL in the middle is legal in a file and not in text.
+fn awkward() -> bytes {
+    bytes_of([255, 254, 65, 66, 0, 67, 137, 80, 78, 71])
+}
+
+fn why_bytes() / {io} {
+    print("--- why this project was blocked ---")
+    let original = awkward()
+    // What `tcp_read` would have done: bytes in, text out, bytes back.
+    let through_text = original.to_str().to_bytes()
+    print("  original: {original.len()} bytes {original.to_list()}")
+    print("  through a str: {through_text.len()} bytes {through_text.to_list()}")
+    print("  survived: {bytes_eq(original, through_text)}")
+    // What `tcp_read_bytes` does: nothing.
+    print("  through bytes: {original.len()} bytes, survived: {bytes_eq(original, original)}")
+}
+
+/// One multipart body, built here so the test needs no browser.
+fn sample_body(boundary: str, filename: str, payload: bytes) -> bytes {
+    let head = "--{boundary}\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\na picture\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\nContent-Type: image/png\r\n\r\n"
+    let tail = "\r\n--{boundary}--\r\n"
+    head.to_bytes().concat(payload).concat(tail.to_bytes())
+}
+
+fn multipart_checks() / {io} {
+    print("--- parsing multipart ---")
+    let boundary = "----grasmBoundary7MA4YWxk"
+    let payload = awkward()
+    let body = sample_body(boundary, "shot.png", payload)
+    print("  body: {body.len()} bytes")
+
+    let parts = parse_multipart(body, boundary)
+    print("  parts: {parts.len()}")
+    for p in parts {
+        if p.filename == "" {
+            print("  field {p.name}: {p.body.to_str()}")
+        } else {
+            print("  file {p.name}: {p.filename}, {p.content_type}, {p.body.len()} bytes")
+        }
+    }
+    var file = empty_part()
+    for p in parts {
+        if p.filename != "" {
+            file = p
+        }
+    }
+    // The whole project in one line: the bytes that came out are the bytes
+    // that went in.
+    print("  payload survived the round trip: {bytes_eq(file.body, payload)}")
+    print("  and it is the awkward one: {file.body.to_list()}")
+
+    print("--- boundaries ---")
+    print("  from a header: {boundary_of("multipart/form-data; boundary=----abc")}")
+    print("  quoted: {boundary_of("multipart/form-data; boundary=\"----abc\"")}")
+    print("  with more after it: {boundary_of("multipart/form-data; boundary=----abc; charset=utf-8")}")
+    print("  absent: \"{boundary_of("application/json")}\"")
+    print("  a body with no boundary gives no parts: {parse_multipart(body, "").len()}")
+    print("  a wrong boundary gives no parts: {parse_multipart(body, "nope").len()}")
+}
+
+fn safety_checks() / {io} {
+    print("--- names that try to escape ---")
+    let tries = ["shot.png", "../../etc/passwd", "/etc/passwd", "..", "", ".hidden", "a b.png", "sh ot.PNG"]
+    for t in tries {
+        print("  {t} -> {safe_name(t)}")
+    }
+    print("--- what a browser is told ---")
+    // From the extension, never from the upload's own claim.
+    for n in ["a.png", "b.JPEG", "c.gif", "d.txt", "e.html", "f"] {
+        print("  {n} -> {content_type_for(n)}")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Serving
+// ---------------------------------------------------------------------------
+
+type Req = { method: str, path: str, content_type: str, body: bytes }
+
+/// A request read as **bytes**, with only its head decoded.
+///
+/// The head of an HTTP request is text by specification; a body may be
+/// anything. Decoding the whole thing is what destroyed uploads.
+fn parse_req(raw: bytes) -> Req {
+    let crlf2 = "\r\n\r\n".to_bytes()
+    let head_end = find_bytes(raw, crlf2, 0)
+    let head = if head_end < 0 {
+        raw.to_str()
+    } else {
+        raw.slice(0, head_end).to_str()
+    }
+    let body = if head_end < 0 {
+        bytes_of([])
+    } else {
+        raw.slice(head_end + 4, raw.len() - head_end - 4)
+    }
+    let lines = head.lines()
+    if lines.len() == 0 {
+        return Req{ method: "", path: "empty request", content_type: "", body: body }
+    }
+    let parts = lines[0].split(" ")
+    if parts.len() != 3 or not parts[1].starts_with("/") {
+        return Req{ method: "", path: "malformed request line", content_type: "", body: body }
+    }
+    Req{
+        method: parts[0],
+        path: parts[1],
+        content_type: header_value(head, "Content-Type"),
+        body: body,
+    }
+}
+
+fn text_response(status: str, content_type: str, body: str) -> bytes {
+    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {body.byte_len()}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{body}".to_bytes()
+}
+
+/// A response whose body is bytes. The head is built as text and the payload is
+/// concatenated, never decoded.
+fn bytes_response(status: str, content_type: str, payload: bytes) -> bytes {
+    let head = "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {payload.len()}\r\nAccess-Control-Allow-Origin: *\r\n\r\n"
+    head.to_bytes().concat(payload)
+}
+
+fn gallery_page(names: [str]) -> str {
+    var items = ""
+    for n in names {
+        items += "<figure><img src=\"/file/{n}\" alt=\"{n}\"><figcaption>{n}</figcaption></figure>"
+    }
+    let body = if names.len() == 0 { "<p>Nothing uploaded yet.</p>" } else { items }
+    "<!doctype html><meta charset=\"utf-8\"><title>Gallery</title><h1>Gallery</h1>{body}"
+}
+
+fn route(r: Req) -> bytes / {io} {
+    if r.method == "" {
+        return text_response("400 Bad Request", "text/plain", "bad request: {r.path}\n")
+    }
+    if r.path == "/" and r.method == "GET" {
+        return text_response("200 OK", "text/html", gallery_page(stored_names()))
+    }
+    if r.path == "/files" and r.method == "GET" {
+        var parts: [str] = []
+        for n in stored_names() {
+            parts.push("\"{n}\"")
+        }
+        return text_response("200 OK", "application/json", "\{\"files\": [{parts.join(", ")}]\}")
+    }
+    if r.path.starts_with("/file/") and r.method == "GET" {
+        let asked = r.path.substr(6, r.path.len() - 6)
+        let name = safe_name(asked)
+        match read_bytes("{gallery_dir()}/{name}") {
+            Err(e) -> return text_response("404 Not Found", "text/plain", "no such file\n")
+            Ok(payload) -> return bytes_response("200 OK", content_type_for(name), payload)
+        }
+    }
+    if r.path == "/upload" and r.method == "POST" {
+        let boundary = boundary_of(r.content_type)
+        if boundary == "" {
+            return text_response("400 Bad Request", "application/json",
+                "\{\"error\": \"not multipart/form-data\"\}")
+        }
+        var saved: [str] = []
+        for p in parse_multipart(r.body, boundary) {
+            if p.filename != "" and p.body.len() > 0 {
+                let name = safe_name(p.filename)
+                if store(name, p.body) {
+                    saved.push(name)
+                }
+            }
+        }
+        if saved.len() == 0 {
+            return text_response("422 Unprocessable Entity", "application/json",
+                "\{\"error\": \"no file part\"\}")
+        }
+        var parts: [str] = []
+        for n in saved {
+            parts.push("\"{n}\"")
+        }
+        return text_response("201 Created", "application/json",
+            "\{\"stored\": [{parts.join(", ")}]\}")
+    }
+    text_response("404 Not Found", "text/plain", "no route for {r.method} {r.path}\n")
+}
+
+// ---------------------------------------------------------------------------
+// A real upload, over a real socket
+// ---------------------------------------------------------------------------
+
+/// One client uploads a file with bytes in it no `str` can carry, and reads it
+/// back. Both directions use the byte calls, so the payload is never decoded.
+fn exchange() / {io, net} {
+    let boundary = "----grasmBoundary7MA4YWxk"
+    let payload = awkward()
+    let body = sample_body(boundary, "wire.png", payload)
+    let head = "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Type: multipart/form-data; boundary={boundary}\r\nContent-Length: {body.len()}\r\n\r\n"
+    let request = head.to_bytes().concat(body)
+
+    let listener = match tcp_listen(0) {
+        Err(e) -> {
+            print("  cannot listen: {e}")
+            return
+        }
+        Ok(l) -> l
+    }
+    let port = net_port(listener) ?? 0
+
+    match tcp_connect("127.0.0.1", port) {
+        Err(e) -> print("  dial failed: {e}")
+        Ok(client) -> {
+            match tcp_write_bytes(client, request) {
+                Err(e) -> print("  send failed: {e}")
+                Ok(_) -> {
+                    match tcp_accept(listener) {
+                        Err(e) -> print("  accept failed: {e}")
+                        Ok(conn) -> {
+                            let raw = tcp_read_bytes(conn) ?? bytes_of([])
+                            print("  server read {raw.len()} bytes")
+                            let resp = route(parse_req(raw))
+                            match tcp_write_bytes(conn, resp) {
+                                Ok(_) -> {}
+                                Err(e) -> {}
+                            }
+                            net_close(conn)
+                        }
+                    }
+                    let reply = tcp_read_bytes(client) ?? bytes_of([])
+                    let text = reply.to_str()
+                    print("  {text.lines()[0].trim()}")
+                    let at = text.index_of("\r\n\r\n")
+                    match at {
+                        Some(j) -> print("  {text.substr(j + 4, text.len() - j - 4).trim()}")
+                        None -> {}
+                    }
+                }
+            }
+            net_close(client)
+        }
+    }
+    net_close(listener)
+
+    // The file on disk, read back and compared with what was sent.
+    match read_bytes("{gallery_dir()}/wire.png") {
+        Err(e) -> print("  stored file unreadable: {e}")
+        Ok(back) -> {
+            print("  stored {back.len()} bytes, identical to the upload: {bytes_eq(back, payload)}")
+        }
+    }
+}
+
+fn serve() / {io, net} {
+    let listener = match tcp_listen(PORT) {
+        Err(e) -> {
+            print("cannot listen on {PORT}: {e}")
+            return
+        }
+        Ok(l) -> l
+    }
+    print("http://localhost:{PORT}  (ctrl-c to stop)")
+    print("gallery: {gallery_dir()}, {stored_names().len()} file(s)")
+    var open: [i64] = []
+    var going = true
+    while going {
+        var waiting: [i64] = [listener]
+        for h in open {
+            waiting.push(h)
+        }
+        let ready = net_wait(waiting, 60000) ?? []
+        for h in ready {
+            if h == listener {
+                match tcp_accept(listener) {
+                    Err(e) -> print("accept failed: {e}")
+                    Ok(conn) -> open.push(conn)
+                }
+            } else {
+                let raw = tcp_read_bytes(h) ?? bytes_of([])
+                if raw.len() > 0 {
+                    match tcp_write_bytes(h, route(parse_req(raw))) {
+                        Ok(_) -> {}
+                        Err(e) -> {}
+                    }
+                }
+                net_close(h)
+                var still: [i64] = []
+                for k in open {
+                    if k != h { still.push(k) }
+                }
+                open = still
+            }
+        }
+    }
+}
+
+fn main() / {io, net} {
+    if args().len() > 0 and args()[0] == "serve" {
+        serve()
+        return
+    }
+    why_bytes()
+    multipart_checks()
+    safety_checks()
+    print("--- a real upload over a socket ---")
+    exchange()
+}
