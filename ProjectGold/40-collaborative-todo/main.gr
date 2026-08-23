@@ -1,0 +1,640 @@
+// Phase 2, project 6 — Collaborative Todo.
+//
+// The phase 2 plan put this under "writable but degraded": *"No WebSockets and
+// no SSE, because both need a connection held open while others are served.
+// Degrades to polling — which works, and is honestly worse."*
+//
+// It does not degrade any more. `net_wait` closed F13, project 39 showed a
+// connection held open while others are served, and this one puts shared state
+// behind it: two people editing one list, each seeing the other's edits as they
+// happen rather than up to a poll interval later.
+//
+// What makes it *collaborative* rather than merely multi-user is that a change
+// made by one client is pushed to the others. Polling would produce the same
+// final list and a worse experience, and the difference is exactly the
+// connection the language could not hold.
+//
+// ```
+// grasm run main.gr              # the comparison the harness makes
+// grasm run main.gr -- serve     # then serve index.html over http
+// ```
+
+import lib_json
+
+let PORT = 8981
+
+// ---------------------------------------------------------------------------
+// The list
+// ---------------------------------------------------------------------------
+
+type Todo = {
+    id: i64,
+    text: str,
+    done: bool,
+}
+
+fn next_id(items: [Todo]) -> i64 {
+    var top = 0
+    for t in items {
+        if t.id > top {
+            top = t.id
+        }
+    }
+    top + 1
+}
+
+fn index_of(items: [Todo], id: i64) -> i64 {
+    for i in 0..items.len() {
+        if items[i].id == id {
+            return i
+        }
+    }
+    -1
+}
+
+fn quoted(s: str) -> str {
+    "\"" + lib_json.escape_json(s) + "\""
+}
+
+fn todos_json(items: [Todo]) -> str {
+    var parts: [str] = []
+    for t in items {
+        parts.push("\{\"id\": {t.id}, \"text\": {quoted(t.text)}, \"done\": {t.done}\}")
+    }
+    var open = 0
+    for t in items {
+        if not t.done {
+            open = open + 1
+        }
+    }
+    "\{\"todos\": [{parts.join(", ")}], \"open\": {open}\}"
+}
+
+// ---------------------------------------------------------------------------
+// Storage
+// ---------------------------------------------------------------------------
+
+fn state_path() -> str / {io} {
+    let dir = env("TMPDIR") ?? "/tmp"
+    let trimmed = if dir.ends_with("/") { dir.substr(0, dir.len() - 1) } else { dir }
+    "{trimmed}/grasm_todos.json"
+}
+
+fn load(path: str) -> [Todo] / {io} {
+    match read_file(path) {
+        Err(e) -> []
+        Ok(text) -> todos_of(text)
+    }
+}
+
+fn todos_of(text: str) -> [Todo] {
+    var out: [Todo] = []
+    match lib_json.parse_json(text) {
+        Err(e) -> {}
+        Ok(v) -> fill(v, out)
+    }
+    out
+}
+
+fn fill(v: ref Json, inout out: [Todo]) {
+    match v {
+        JObj(keys, values) -> {
+            for i in 0..keys.len() {
+                if keys[i] == "todos" {
+                    fill_list(values[i], out)
+                }
+            }
+        }
+        _ -> {}
+    }
+}
+
+fn fill_list(v: ref Json, inout out: [Todo]) {
+    match v {
+        JList(items) -> {
+            for it in items {
+                match one(it) {
+                    Some(t) -> out.push(t)
+                    None -> {}
+                }
+            }
+        }
+        _ -> {}
+    }
+}
+
+fn one(v: ref Json) -> Option[Todo] {
+    match v {
+        JObj(keys, values) -> {
+            var id = 0
+            var text = ""
+            var done = false
+            for i in 0..keys.len() {
+                let k = keys[i]
+                match values[i] {
+                    JNum(n) -> if k == "id" { id = n.as_i64() }
+                    JStr(s) -> if k == "text" { text = s }
+                    JBool(b) -> if k == "done" { done = b }
+                    _ -> {}
+                }
+            }
+            if id == 0 or text == "" { None } else { Some(Todo{ id: id, text: text, done: done }) }
+        }
+        _ -> None
+    }
+}
+
+fn save(path: str, items: [Todo]) / {io} {
+    match write_file(path, todos_json(items)) {
+        Ok(_) -> {}
+        Err(e) -> eprint("cannot save todos: {e}")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Requests
+// ---------------------------------------------------------------------------
+
+type Req = { method: str, path: str, body: str }
+
+fn parse_req(raw: str) -> Req {
+    let head_end = raw.index_of("\r\n\r\n")
+    let head = match head_end {
+        Some(i) -> raw.substr(0, i)
+        None -> raw
+    }
+    let body = match head_end {
+        Some(i) -> raw.substr(i + 4, raw.len() - i - 4)
+        None -> ""
+    }
+    let lines = head.lines()
+    if lines.len() == 0 {
+        return Req{ method: "", path: "empty request", body: "" }
+    }
+    let parts = lines[0].split(" ")
+    if parts.len() != 3 or not parts[1].starts_with("/") {
+        return Req{ method: "", path: "malformed request line", body: "" }
+    }
+    Req{ method: parts[0], path: parts[1], body: body }
+}
+
+fn field(body: str, want: str) -> str {
+    for pair in body.split("&") {
+        match pair.index_of("=") {
+            None -> {}
+            Some(i) -> {
+                if pair.substr(0, i) == want {
+                    let raw = pair.substr(i + 1, pair.len() - i - 1)
+                    var out = ""
+                    for c in raw.codes() {
+                        if c == 43 { out += " " } else { out += c.to_char() }
+                    }
+                    return out
+                }
+            }
+        }
+    }
+    ""
+}
+
+/// `/todos/12/toggle` -> 12, or -1.
+fn id_in(path: str, suffix: str) -> i64 {
+    if not path.starts_with("/todos/") or not path.ends_with(suffix) {
+        return -1
+    }
+    let mid = path.substr(7, path.len() - 7 - suffix.len())
+    mid.parse_int() ?? -1
+}
+
+fn text_response(status: str, content_type: str, body: str) -> str {
+    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {body.byte_len()}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{body}"
+}
+
+fn sse_head() -> str {
+    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n"
+}
+
+/// The whole list, pushed. A change event that carried only the *change* would
+/// need every client to have the same list already, and a client that missed
+/// one event would be quietly wrong from then on. Sending the state instead
+/// makes a dropped event cost latency rather than correctness.
+fn state_event(items: [Todo]) -> str {
+    var flat = ""
+    for c in todos_json(items).codes() {
+        if c == 10 or c == 13 { flat += " " } else { flat += c.to_char() }
+    }
+    "event: state\ndata: {flat}\n\n"
+}
+
+type Action =
+    | Reply(text: str)
+    | Hold(head: str, hello: str)
+    | Broadcast(items: [Todo], reply: str)
+
+fn decide(r: Req, items: [Todo]) -> Action {
+    if r.method == "" {
+        return Reply(text_response("400 Bad Request", "text/plain", "bad request: {r.path}\n"))
+    }
+    if r.path == "/" and r.method == "GET" {
+        var rows = ""
+        for t in items {
+            let mark = if t.done { "[x]" } else { "[ ]" }
+            rows += "<li>{mark} {t.text}</li>"
+        }
+        return Reply(text_response("200 OK", "text/html",
+            "<!doctype html><meta charset=\"utf-8\"><title>Todo</title><h1>Todo</h1><ul>{rows}</ul>"))
+    }
+    if r.path == "/todos" and r.method == "GET" {
+        return Reply(text_response("200 OK", "application/json", todos_json(items)))
+    }
+    // A subscriber is sent the current state immediately, then nothing until
+    // something changes. Without that first push a client would show an empty
+    // list until the first edit by somebody else.
+    if r.path == "/events" and r.method == "GET" {
+        return Hold(sse_head(), state_event(items))
+    }
+    if r.path == "/todos" and r.method == "POST" {
+        let text = field(r.body, "text").trim()
+        if text == "" {
+            return Reply(text_response("422 Unprocessable Entity", "application/json",
+                "\{\"error\": \"a todo needs text\"\}"))
+        }
+        if text.len() > 200 {
+            return Reply(text_response("422 Unprocessable Entity", "application/json",
+                "\{\"error\": \"at most 200 characters\"\}"))
+        }
+        var next = items
+        next.push(Todo{ id: next_id(next), text: text, done: false })
+        return Broadcast(next, text_response("201 Created", "application/json", todos_json(next)))
+    }
+    let toggle = id_in(r.path, "/toggle")
+    if toggle >= 0 and r.method == "POST" {
+        let at = index_of(items, toggle)
+        if at < 0 {
+            return Reply(text_response("404 Not Found", "application/json",
+                "\{\"error\": \"no todo {toggle}\"\}"))
+        }
+        var next = items
+        next[at].done = not next[at].done
+        return Broadcast(next, text_response("200 OK", "application/json", todos_json(next)))
+    }
+    let remove = id_in(r.path, "/delete")
+    if remove >= 0 and r.method == "POST" {
+        let at = index_of(items, remove)
+        if at < 0 {
+            return Reply(text_response("404 Not Found", "application/json",
+                "\{\"error\": \"no todo {remove}\"\}"))
+        }
+        var next: [Todo] = []
+        for t in items {
+            if t.id != remove {
+                next.push(t)
+            }
+        }
+        return Broadcast(next, text_response("200 OK", "application/json", todos_json(next)))
+    }
+    Reply(text_response("404 Not Found", "text/plain", "no route for {r.method} {r.path}\n"))
+}
+
+// ---------------------------------------------------------------------------
+// The checks the harness compares across three engines
+// ---------------------------------------------------------------------------
+
+fn describe(a: Action) -> str {
+    match a {
+        Reply(t) -> "reply {t.lines()[0].split(" ")[1]}"
+        Hold(head, hello) -> "hold, {hello.lines().len() - 1} line(s) of hello"
+        Broadcast(items, reply) -> "broadcast, {items.len()} todo(s)"
+    }
+}
+
+fn show(label: str, method: str, path: str, body: str, items: [Todo]) / {io} {
+    let raw = "{method} {path} HTTP/1.1\r\nHost: x\r\n\r\n{body}"
+    print("  {label}: {describe(decide(parse_req(raw), items))}")
+}
+
+fn routing_checks() / {io} {
+    print("--- routing ---")
+    let items = [
+        Todo{ id: 1, text: "write it", done: true },
+        Todo{ id: 2, text: "check it", done: false },
+    ]
+    show("list", "GET", "/todos", "", items)
+    show("subscribe", "GET", "/events", "", items)
+    show("add", "POST", "/todos", "text=ship+it", items)
+    show("add nothing", "POST", "/todos", "text=", items)
+    show("add whitespace", "POST", "/todos", "text=+++", items)
+    show("toggle", "POST", "/todos/2/toggle", "", items)
+    show("toggle a ghost", "POST", "/todos/99/toggle", "", items)
+    show("delete", "POST", "/todos/1/delete", "", items)
+    show("delete a ghost", "POST", "/todos/99/delete", "", items)
+    show("page", "GET", "/", "", items)
+    show("nowhere", "GET", "/nowhere", "", items)
+
+    print("--- ids out of a path ---")
+    for p in ["/todos/1/toggle", "/todos/42/delete", "/todos/x/toggle", "/todos//toggle", "/todos/1", "/nope/1/toggle"] {
+        print("  {p} -> toggle {id_in(p, "/toggle")}, delete {id_in(p, "/delete")}")
+    }
+}
+
+fn json_checks() / {io} {
+    print("--- the wire format ---")
+    let items = [
+        Todo{ id: 1, text: "write it", done: true },
+        Todo{ id: 2, text: "check \"it\"", done: false },
+    ]
+    let text = todos_json(items)
+    print("  {text}")
+    // Round-tripped through the shared parser, which is also what the store is
+    // read back with.
+    let back = todos_of(text)
+    var same = back.len() == items.len()
+    if same {
+        for i in 0..items.len() {
+            if back[i].id != items[i].id or back[i].text != items[i].text or back[i].done != items[i].done {
+                same = false
+            }
+        }
+    }
+    print("  survives a round trip: {same}")
+    print("  quotes in text survive: {back[1].text}")
+    print("  garbage gives an empty list: {todos_of("not json").len()}")
+
+    print("--- an event is one event ---")
+    let ev = state_event(items)
+    print("  {ev.lines().len() - 1} line(s), ends blank: {ev.ends_with("\n\n")}")
+    let sneaky = state_event([Todo{ id: 1, text: "a\nevent: state\ndata: forged", done: false }])
+    print("  a newline in a todo cannot forge an event: {sneaky.lines().len() - 1} line(s)")
+}
+
+// ---------------------------------------------------------------------------
+// Two people, one list
+// ---------------------------------------------------------------------------
+
+/// Two subscribers held open while three edits arrive from a third client.
+///
+/// This is the whole claim. Each edit is pushed to both subscribers as it
+/// happens, so neither has to ask — which is what separates *collaborative*
+/// from *multi-user*, and which is exactly the connection F13 made impossible.
+fn exchange() / {io, net} {
+    let path = state_path()
+    save(path, [])
+
+    let listener = match tcp_listen(0) {
+        Err(e) -> {
+            print("  cannot listen: {e}")
+            return
+        }
+        Ok(l) -> l
+    }
+    let port = net_port(listener) ?? 0
+
+    var watchers: [i64] = []
+    for i in 0..2 {
+        match tcp_connect("127.0.0.1", port) {
+            Err(e) -> print("  dial failed: {e}")
+            Ok(c) -> match tcp_write(c, "GET /events HTTP/1.1\r\nHost: x\r\n\r\n") {
+                Ok(_) -> watchers.push(c)
+                Err(e) -> print("  subscribe failed: {e}")
+            }
+        }
+    }
+
+    var held: [i64] = []
+    var served: [i64] = []
+    var items = load(path)
+    var turns = 0
+    while held.len() < watchers.len() and turns < 200 {
+        var waiting: [i64] = [listener]
+        for h in served {
+            var is_held = false
+            for k in held {
+                if k == h { is_held = true }
+            }
+            if not is_held {
+                waiting.push(h)
+            }
+        }
+        let ready = net_wait(waiting, 1000) ?? []
+        if ready.len() == 0 {
+            turns = 200
+        }
+        for h in ready {
+            if h == listener {
+                match tcp_accept(listener) {
+                    Err(e) -> {}
+                    Ok(conn) -> served.push(conn)
+                }
+            } else {
+                let raw = tcp_read(h) ?? ""
+                if raw != "" {
+                    match decide(parse_req(raw), items) {
+                        Hold(head, hello) -> {
+                            match tcp_write(h, head + hello) {
+                                Ok(_) -> held.push(h)
+                                Err(e) -> {}
+                            }
+                        }
+                        Reply(t) -> { match tcp_write(h, t) { Ok(_) -> {}  Err(e) -> {} } }
+                        Broadcast(next, reply) -> {}
+                    }
+                }
+            }
+        }
+        turns = turns + 1
+    }
+    print("  {held.len()} watchers held open")
+
+    let edits = [
+        ("POST", "/todos", "text=write+the+readme"),
+        ("POST", "/todos", "text=run+the+gates"),
+        ("POST", "/todos/1/toggle", ""),
+    ]
+    var editors: [i64] = []
+    for (method, epath, body) in edits {
+        match tcp_connect("127.0.0.1", port) {
+            Err(e) -> print("  dial failed: {e}")
+            Ok(c) -> {
+                let req = "{method} {epath} HTTP/1.1\r\nHost: x\r\nContent-Length: {body.byte_len()}\r\n\r\n{body}"
+                match tcp_write(c, req) {
+                    Ok(_) -> editors.push(c)
+                    Err(e) -> {}
+                }
+            }
+        }
+    }
+
+    var done = 0
+    turns = 0
+    while done < editors.len() and turns < 400 {
+        var waiting: [i64] = [listener]
+        for h in served {
+            var is_held = false
+            for k in held {
+                if k == h { is_held = true }
+            }
+            if not is_held {
+                waiting.push(h)
+            }
+        }
+        let ready = net_wait(waiting, 1000) ?? []
+        if ready.len() == 0 {
+            turns = 400
+        }
+        for h in ready {
+            if h == listener {
+                match tcp_accept(listener) {
+                    Err(e) -> {}
+                    Ok(conn) -> served.push(conn)
+                }
+            } else {
+                let raw = tcp_read(h) ?? ""
+                if raw != "" {
+                    match decide(parse_req(raw), items) {
+                        Broadcast(next, reply) -> {
+                            items = next
+                            save(path, items)
+                            // Pushed to everyone watching, before the editor is
+                            // even told its own edit landed.
+                            let ev = state_event(items)
+                            for w in held {
+                                match tcp_write(w, ev) { Ok(_) -> {}  Err(e) -> {} }
+                            }
+                            match tcp_write(h, reply) { Ok(_) -> {}  Err(e) -> {} }
+                            done = done + 1
+                        }
+                        Reply(t) -> {
+                            match tcp_write(h, t) { Ok(_) -> {}  Err(e) -> {} }
+                            done = done + 1
+                        }
+                        Hold(head, hello) -> {}
+                    }
+                }
+            }
+        }
+        turns = turns + 1
+    }
+    print("  {done} edit(s) accepted")
+
+    for i in 0..watchers.len() {
+        var got = ""
+        var reading = true
+        var guard = 0
+        while reading and guard < 50 {
+            let ready = net_wait([watchers[i]], 200) ?? []
+            if ready.len() == 0 {
+                reading = false
+            } else {
+                let chunk = tcp_read(watchers[i]) ?? ""
+                if chunk == "" { reading = false } else { got += chunk }
+            }
+            guard = guard + 1
+        }
+        var pushes: [str] = []
+        for line in got.lines() {
+            if line.starts_with("data: ") {
+                pushes.push(line)
+            }
+        }
+        print("  watcher {i}: {pushes.len()} push(es) — one hello and one per edit")
+        print("    first: {pushes[0]}")
+        print("    last:  {pushes[pushes.len() - 1]}")
+    }
+    print("  stored: {todos_json(load(path))}")
+
+    for h in served { net_close(h) }
+    for h in watchers { net_close(h) }
+    for h in editors { net_close(h) }
+    net_close(listener)
+}
+
+fn serve() / {io, net} {
+    let path = state_path()
+    let listener = match tcp_listen(PORT) {
+        Err(e) -> {
+            print("cannot listen on {PORT}: {e}")
+            return
+        }
+        Ok(l) -> l
+    }
+    print("http://localhost:{PORT}  (ctrl-c to stop)")
+    print("todos: {path}")
+    var held: [i64] = []
+    var open: [i64] = []
+    var going = true
+    while going {
+        var waiting: [i64] = [listener]
+        for h in open {
+            var is_held = false
+            for k in held {
+                if k == h { is_held = true }
+            }
+            if not is_held {
+                waiting.push(h)
+            }
+        }
+        let ready = net_wait(waiting, 60000) ?? []
+        for h in ready {
+            if h == listener {
+                match tcp_accept(listener) {
+                    Err(e) -> print("accept failed: {e}")
+                    Ok(conn) -> open.push(conn)
+                }
+            } else {
+                let raw = tcp_read(h) ?? ""
+                if raw == "" {
+                    var kept: [i64] = []
+                    for k in held { if k != h { kept.push(k) } }
+                    held = kept
+                    net_close(h)
+                    var still: [i64] = []
+                    for k in open { if k != h { still.push(k) } }
+                    open = still
+                } else {
+                    let items = load(path)
+                    match decide(parse_req(raw), items) {
+                        Hold(head, hello) -> {
+                            match tcp_write(h, head + hello) {
+                                Ok(_) -> {
+                                    held.push(h)
+                                    print("  + watcher ({held.len()} watching)")
+                                }
+                                Err(e) -> {}
+                            }
+                        }
+                        Broadcast(next, reply) -> {
+                            save(path, next)
+                            let ev = state_event(next)
+                            for w in held {
+                                match tcp_write(w, ev) { Ok(_) -> {}  Err(e) -> {} }
+                            }
+                            match tcp_write(h, reply) { Ok(_) -> {}  Err(e) -> {} }
+                            net_close(h)
+                            var still: [i64] = []
+                            for k in open { if k != h { still.push(k) } }
+                            open = still
+                        }
+                        Reply(t) -> {
+                            match tcp_write(h, t) { Ok(_) -> {}  Err(e) -> {} }
+                            net_close(h)
+                            var still: [i64] = []
+                            for k in open { if k != h { still.push(k) } }
+                            open = still
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn main() / {io, net} {
+    if args().len() > 0 and args()[0] == "serve" {
+        serve()
+        return
+    }
+    routing_checks()
+    json_checks()
+    print("--- two watching, three edits ---")
+    exchange()
+}

@@ -1,0 +1,87 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Todo — two tabs, one list</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.55 system-ui, sans-serif; max-width: 30rem;
+         margin: 3rem auto; padding: 0 1.25rem; }
+  h1 { font-size: 1.05rem; font-weight: 600; margin: 0 0 0.25rem; }
+  .note { opacity: 0.7; font-size: 0.82rem; margin: 0 0 1.5rem; }
+  .row { display: flex; gap: 0.5rem; margin-bottom: 1.25rem; }
+  input, button { font: inherit; padding: 0.35rem 0.6rem; border-radius: 6px;
+                  border: 1px solid currentColor; background: transparent; color: inherit; }
+  input { flex: 1; }
+  button { cursor: pointer; }
+  ul { list-style: none; padding: 0; margin: 0; }
+  li { display: flex; align-items: center; gap: 0.6rem; padding: 0.35rem 0;
+       border-bottom: 1px solid color-mix(in srgb, currentColor 10%, transparent); }
+  li .text { flex: 1; }
+  li.done .text { text-decoration: line-through; opacity: 0.5; }
+  li button { padding: 0.15rem 0.5rem; font-size: 0.8rem; }
+  #state { font-size: 0.8rem; opacity: 0.7; margin-top: 1rem; }
+  code { font-family: ui-monospace, monospace; font-size: 0.85em; }
+</style>
+
+<h1>Todo</h1>
+<p class="note">
+  Open this page in two tabs. An edit in one appears in the other immediately —
+  no polling. The server holds a <code>GET /events</code> open per tab and
+  pushes the whole list whenever it changes.
+</p>
+
+<div class="row">
+  <input id="text" placeholder="something to do…" aria-label="new todo">
+  <button id="add">Add</button>
+</div>
+
+<ul id="list"></ul>
+<p id="state">connecting…</p>
+
+<script>
+  const API = "http://localhost:8981";
+  const list = document.getElementById("list");
+  const state = document.getElementById("state");
+  const text = document.getElementById("text");
+
+  function render(data) {
+    list.replaceChildren(...data.todos.map(t => {
+      const li = document.createElement("li");
+      if (t.done) li.className = "done";
+      const tick = document.createElement("button");
+      tick.textContent = t.done ? "undo" : "done";
+      tick.addEventListener("click", () => post(`/todos/${t.id}/toggle`));
+      const span = document.createElement("span");
+      span.className = "text";
+      span.textContent = t.text;
+      const del = document.createElement("button");
+      del.textContent = "×";
+      del.setAttribute("aria-label", `delete ${t.text}`);
+      del.addEventListener("click", () => post(`/todos/${t.id}/delete`));
+      li.append(tick, span, del);
+      return li;
+    }));
+    state.textContent = `${data.open} open of ${data.todos.length}`;
+  }
+
+  function post(path, body) {
+    // No optimistic update and no re-fetch: the stream is the only thing that
+    // moves the list, so every tab — including this one — learns the same way.
+    fetch(API + path, { method: "POST", body: body || "" })
+      .catch(() => { state.textContent = "edit failed"; });
+  }
+
+  document.getElementById("add").addEventListener("click", () => {
+    if (!text.value.trim()) return;
+    post("/todos", `text=${encodeURIComponent(text.value)}`);
+    text.value = "";
+  });
+  text.addEventListener("keydown", e => {
+    if (e.key === "Enter") document.getElementById("add").click();
+  });
+
+  const stream = new EventSource(`${API}/events`);
+  stream.addEventListener("state", e => render(JSON.parse(e.data)));
+  stream.addEventListener("error", () => {
+    state.textContent = "no server: run `grasm run main.gr -- serve`";
+  });
+</script>

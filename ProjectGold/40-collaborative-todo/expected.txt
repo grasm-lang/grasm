@@ -1,0 +1,37 @@
+--- routing ---
+  list: reply 200
+  subscribe: hold, 2 line(s) of hello
+  add: broadcast, 3 todo(s)
+  add nothing: reply 422
+  add whitespace: reply 422
+  toggle: broadcast, 2 todo(s)
+  toggle a ghost: reply 404
+  delete: broadcast, 1 todo(s)
+  delete a ghost: reply 404
+  page: reply 200
+  nowhere: reply 404
+--- ids out of a path ---
+  /todos/1/toggle -> toggle 1, delete -1
+  /todos/42/delete -> toggle -1, delete 42
+  /todos/x/toggle -> toggle -1, delete -1
+  /todos//toggle -> toggle -1, delete -1
+  /todos/1 -> toggle -1, delete -1
+  /nope/1/toggle -> toggle -1, delete -1
+--- the wire format ---
+  {"todos": [{"id": 1, "text": "write it", "done": true}, {"id": 2, "text": "check \"it\"", "done": false}], "open": 1}
+  survives a round trip: true
+  quotes in text survive: check "it"
+  garbage gives an empty list: 0
+--- an event is one event ---
+  2 line(s), ends blank: true
+  a newline in a todo cannot forge an event: 2 line(s)
+--- two watching, three edits ---
+  2 watchers held open
+  3 edit(s) accepted
+  watcher 0: 4 push(es) — one hello and one per edit
+    first: data: {"todos": [], "open": 0}
+    last:  data: {"todos": [{"id": 1, "text": "write the readme", "done": true}, {"id": 2, "text": "run the gates", "done": false}], "open": 1}
+  watcher 1: 4 push(es) — one hello and one per edit
+    first: data: {"todos": [], "open": 0}
+    last:  data: {"todos": [{"id": 1, "text": "write the readme", "done": true}, {"id": 2, "text": "run the gates", "done": false}], "open": 1}
+  stored: {"todos": [{"id": 1, "text": "write the readme", "done": true}, {"id": 2, "text": "run the gates", "done": false}], "open": 1}
