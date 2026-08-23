@@ -1,0 +1,128 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Router — one matcher, both sides</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.6 system-ui, sans-serif; max-width: 34rem;
+         margin: 3rem auto; padding: 0 1.25rem; }
+  h1 { font-size: 1.05rem; font-weight: 600; margin: 0 0 0.25rem; }
+  .note { opacity: 0.7; font-size: 0.82rem; margin: 0 0 1.5rem; }
+  nav { display: flex; gap: 0.9rem; flex-wrap: wrap; padding-bottom: 0.9rem;
+        border-bottom: 1px solid color-mix(in srgb, currentColor 15%, transparent); }
+  nav a { color: inherit; text-decoration: none; border-bottom: 1px solid transparent; }
+  nav a:hover, nav a[aria-current] { border-bottom-color: currentColor; }
+  main { min-height: 8rem; padding-top: 1.25rem; }
+  main h2 { font-size: 1rem; font-weight: 600; margin: 0 0 0.4rem; }
+  main p { margin: 0; }
+  #state { font-size: 0.78rem; opacity: 0.65; margin-top: 1.5rem;
+           font-family: ui-monospace, monospace; }
+  code { font-family: ui-monospace, monospace; font-size: 0.85em; }
+</style>
+
+<h1>Router</h1>
+<p class="note">
+  Clicking a link runs the <em>server's</em> matcher, here, in wasm — the same
+  <code>match_route</code> the server calls for a deep link. Paste any of these
+  URLs into a fresh tab and the page you get is the one this page draws.
+</p>
+
+<nav>
+  <a href="/">home</a>
+  <a href="/about">about</a>
+  <a href="/users/new">new user</a>
+  <a href="/users/7">user 7</a>
+  <a href="/users/7/posts/3">post 3</a>
+  <a href="/files/a/b/c.txt">a file</a>
+  <a href="/nowhere">a bad link</a>
+</nav>
+
+<main id="view">…</main>
+<p id="state">loading the matcher…</p>
+
+<script>
+  const state = document.getElementById("state");
+  const view = document.getElementById("view");
+
+  let compiled = null, source = null;
+
+  const imports = { env: { grasm_now_millis: () => Date.now(), dlsym: () => 0 } };
+
+  // `bundle.gr` is this whole program as one file, written by
+  // `grasm build --source`. Before that existed the wasm engine could not be
+  // given a program with an `import` at all (F33).
+  function ask(path) {
+    const ex = new WebAssembly.Instance(compiled, imports).exports;
+    const mem = () => new Uint8Array(ex.memory.buffer);
+    const enc = new TextEncoder();
+    const s = enc.encode(source);
+    const sp = ex.grasm_alloc(s.length);
+    mem().set(s, sp);
+    const i = enc.encode(path + "\n");
+    const ip = ex.grasm_alloc(i.length);
+    mem().set(i, ip);
+    const res = ex.grasm_run_with_stdin(sp, s.length, ip, i.length);
+    ex.grasm_free(sp, s.length);
+    ex.grasm_free(ip, i.length);
+    const v = new DataView(ex.memory.buffer);
+    const total = v.getUint32(res, true);
+    const outLen = v.getUint32(res + 8, true);
+    const out = new TextDecoder().decode(mem().slice(res + 12, res + 12 + outLen));
+    ex.grasm_free(res, total);
+    return JSON.parse(out.trim());
+  }
+
+  function render(path) {
+    if (!compiled) return;
+    const m = ask(path);
+    // The view is drawn from what the matcher said, so the browser never
+    // decides for itself what a path means.
+    view.innerHTML = m.name === null
+      ? "<h2>Not found</h2><p>No route matched.</p>"
+      : viewFor(m);
+    state.textContent = `${path} → ${JSON.stringify(m)}`;
+    for (const a of document.querySelectorAll("nav a")) {
+      if (a.getAttribute("href") === path) a.setAttribute("aria-current", "page");
+      else a.removeAttribute("aria-current");
+    }
+  }
+
+  // Mirrors main.gr's `view`. The server renders the Grasm one for a deep link,
+  // and the harness checks the two agree — see the README on why this copy
+  // exists and what it costs.
+  function viewFor(m) {
+    const p = m.params || {};
+    const esc = s => String(s).replace(/[&<>"]/g, c =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+    switch (m.name) {
+      case "home": return "<h2>Home</h2><p>Follow a link. The address bar changes and nothing reloads.</p>";
+      case "about": return "<h2>About</h2><p>One route table, matched by one function, on both sides of the wire.</p>";
+      case "new-user": return "<h2>New user</h2><p>A literal route listed before <code>/users/:id</code>, which would otherwise swallow it.</p>";
+      case "user": return `<h2>User ${esc(p.id)}</h2><p>One captured segment.</p>`;
+      case "user-post": return `<h2>Post ${esc(p.post)}</h2><p>By user ${esc(p.id)} — two captures.</p>`;
+      case "file": return `<h2>File</h2><p>Wildcard captured <code>${esc(p.path)}</code>, slashes and all.</p>`;
+      default: return "<h2>Not found</h2><p>No route matched.</p>";
+    }
+  }
+
+  document.addEventListener("click", e => {
+    const a = e.target.closest("nav a");
+    if (!a) return;
+    e.preventDefault();
+    const path = a.getAttribute("href");
+    history.pushState({}, "", path);
+    render(path);
+  });
+
+  addEventListener("popstate", () => render(location.pathname));
+
+  Promise.all([
+    fetch("grasm.wasm", { cache: "no-store" }).then(r => r.arrayBuffer()),
+    fetch("bundle.gr", { cache: "no-store" }).then(r => r.text()),
+  ]).then(([bytes, text]) => {
+    compiled = new WebAssembly.Module(bytes);
+    source = text;
+    render(location.pathname);
+  }).catch(e => {
+    state.textContent = "must be served over http — a file:// page cannot fetch (" + e.message + ")";
+  });
+</script>

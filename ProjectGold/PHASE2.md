@@ -72,6 +72,7 @@ two watchers held open while three edits are pushed to both.
 | 8 | 38-upload-gallery | was blocked; `bytes` over TCP unblocked it |
 | 9 | 39-chat-router | was blocked; `net_wait` unblocked it |
 | 6 | 40-collaborative-todo | was "degraded to polling"; it is not |
+| 12 | 41-spa-router | one matcher, browser and server |
 
 ### Blocked (1, was 3)
 

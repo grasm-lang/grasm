@@ -1,0 +1,43 @@
+--- matching ---
+  / -> {"name": "home", "params": {}}
+  /about -> {"name": "about", "params": {}}
+  /users/new -> {"name": "new-user", "params": {}}
+  /users/7 -> {"name": "user", "params": {"id": "7"}}
+  /users/7/posts/3 -> {"name": "user-post", "params": {"id": "7", "post": "3"}}
+  /files/a/b/c.txt -> {"name": "file", "params": {"path": "a/b/c.txt"}}
+  /files/ -> {"name": "file", "params": {"path": ""}}
+  /nowhere -> {"name": null}
+  /users -> {"name": null}
+  /users/7/posts -> {"name": null}
+  /users/7/posts/3/extra -> {"name": null}
+--- slashes ---
+  /about/ -> {"name": "about", "params": {}}
+  //about -> {"name": "about", "params": {}}
+  /users//7 -> {"name": "user", "params": {"id": "7"}}
+--- order decides ---
+  /users/new is new-user, not user
+--- a wildcard must be last ---
+  /x/*rest/y against /x/a/y: ""
+--- one view for both sides ---
+  /: 79 characters, <h2>Home</h2><p>Follow a...
+  /users/7: 43 characters, <h2>User 7</h2><p>One ca...
+  /users/7/posts/3: 47 characters, <h2>Post 3</h2><p>By use...
+  /files/a/b.txt: 76 characters, <h2>File</h2><p>Wildcard...
+  /nope: 42 characters, <h2>Not found</h2><p>No ...
+--- escaping ---
+  id captured: <img src=x onerror=alert(1)>
+  rendered: <h2>User &lt;img src=x onerror=alert(1)&gt;</h2><p>One captured segment.</p>
+--- the server API agrees with the matcher ---
+  /: true
+  /about: true
+  /users/7: true
+  /users/7/posts/3: true
+  /files/a/b: true
+  /nope: true
+--- a deep link is a real request ---
+  /: 200, carries the client's own view: true
+  /users/7: 200, carries the client's own view: true
+  /users/7/posts/3: 200, carries the client's own view: true
+  /files/a/b.txt: 200, carries the client's own view: true
+  /nope: 404, carries the client's own view: true
+  a query string is stripped: /users/7, route user

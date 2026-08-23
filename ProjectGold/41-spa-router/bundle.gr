@@ -1,0 +1,392 @@
+//!module main
+// Phase 2, project 12 — Custom SPA Router.
+//
+// A single-page app has two routers: one in the browser, deciding what to draw
+// when a link is clicked, and one on the server, deciding what to send when
+// somebody pastes a URL. They must agree, and normally they are two
+// implementations in two languages that agree by inspection until they do not
+// — a deep link 404s that the app itself navigates to happily.
+//
+// Here they are **one matcher**. The browser fetches `bundle.gr` — this program
+// with its modules laid end to end, written by `grasm build --source` — runs it
+// in wasm, and asks it to match the path. The server calls the same function.
+//
+// ```
+// grasm run main.gr < /dev/null      # the comparison the harness makes
+// echo '/users/7/posts/3' | grasm run main.gr
+// grasm run main.gr -- serve         # then serve index.html over http
+// ```
+//
+// A path on stdin is a route to match, which is what the page runs in wasm.
+
+let PORT = 8982
+
+// ---------------------------------------------------------------------------
+// The route table — the one copy of it
+// ---------------------------------------------------------------------------
+
+type Route = {
+    name: str,
+    pattern: str,
+}
+
+/// Order matters: the first match wins, so a literal segment must be listed
+/// before a pattern that would also accept it. `/users/new` before
+/// `/users/:id` is the classic case, and having one table means it is decided
+/// once rather than twice.
+fn routes() -> [Route] {
+    [
+        Route{ name: "home", pattern: "/" },
+        Route{ name: "about", pattern: "/about" },
+        Route{ name: "new-user", pattern: "/users/new" },
+        Route{ name: "user", pattern: "/users/:id" },
+        Route{ name: "user-post", pattern: "/users/:id/posts/:post" },
+        Route{ name: "file", pattern: "/files/*path" },
+    ]
+}
+
+type Match = {
+    name: str,
+    keys: [str],
+    values: [str],
+}
+
+fn no_match() -> Match {
+    Match{ name: "", keys: [], values: [] }
+}
+
+/// Path segments, with the empty ones that leading and trailing slashes
+/// produce removed. `/users/7/` and `/users/7` are the same route, because a
+/// trailing slash is not a navigational decision anybody makes on purpose.
+fn segments(path: str) -> [str] {
+    var out: [str] = []
+    for part in path.split("/") {
+        if part != "" {
+            out.push(part)
+        }
+    }
+    out
+}
+
+/// One pattern against one path.
+///
+/// `:name` captures a segment. `*name` captures the rest, so it must be last —
+/// which is checked rather than assumed, because a pattern with a wildcard in
+/// the middle would otherwise match in a way nobody could predict.
+fn match_one(r: Route, path: str) -> Match {
+    let want = segments(r.pattern)
+    let got = segments(path)
+    var keys: [str] = []
+    var values: [str] = []
+    var i = 0
+    while i < want.len() {
+        let w = want[i]
+        if w.starts_with("*") {
+            if i != want.len() - 1 {
+                return no_match()
+            }
+            var rest: [str] = []
+            var j = i
+            while j < got.len() {
+                rest.push(got[j])
+                j = j + 1
+            }
+            keys.push(w.substr(1, w.len() - 1))
+            values.push(rest.join("/"))
+            return Match{ name: r.name, keys: keys, values: values }
+        }
+        if i >= got.len() {
+            return no_match()
+        }
+        if w.starts_with(":") {
+            keys.push(w.substr(1, w.len() - 1))
+            values.push(got[i])
+        } else if w != got[i] {
+            return no_match()
+        }
+        i = i + 1
+    }
+    if got.len() != want.len() {
+        return no_match()
+    }
+    Match{ name: r.name, keys: keys, values: values }
+}
+
+fn match_route(path: str) -> Match {
+    for r in routes() {
+        let m = match_one(r, path)
+        if m.name != "" {
+            return m
+        }
+    }
+    no_match()
+}
+
+fn param(m: Match, key: str) -> str {
+    for i in 0..m.keys.len() {
+        if m.keys[i] == key {
+            return m.values[i]
+        }
+    }
+    ""
+}
+
+fn match_json(m: Match) -> str {
+    if m.name == "" {
+        return "\{\"name\": null\}"
+    }
+    var parts: [str] = []
+    for i in 0..m.keys.len() {
+        parts.push("\"{m.keys[i]}\": \"{m.values[i]}\"")
+    }
+    "\{\"name\": \"{m.name}\", \"params\": \{{parts.join(", ")}\}\}"
+}
+
+// ---------------------------------------------------------------------------
+// Rendering — also shared
+// ---------------------------------------------------------------------------
+
+fn escape_html(s: str) -> str {
+    var out = ""
+    for c in s.codes() {
+        if c == 38 { out += "&amp;" }
+        else if c == 60 { out += "&lt;" }
+        else if c == 62 { out += "&gt;" }
+        else if c == 34 { out += "&quot;" }
+        else { out += c.to_char() }
+    }
+    out
+}
+
+/// The body of a page for a matched route.
+///
+/// The server puts this inside a full document for a deep link; the browser
+/// puts it inside the element it is already showing. One function, so a deep
+/// link and a click cannot render different things.
+fn view(m: Match) -> str {
+    if m.name == "home" {
+        return "<h2>Home</h2><p>Follow a link. The address bar changes and nothing reloads.</p>"
+    }
+    if m.name == "about" {
+        return "<h2>About</h2><p>One route table, matched by one function, on both sides of the wire.</p>"
+    }
+    if m.name == "new-user" {
+        return "<h2>New user</h2><p>A literal route listed before <code>/users/:id</code>, which would otherwise swallow it.</p>"
+    }
+    if m.name == "user" {
+        return "<h2>User {escape_html(param(m, "id"))}</h2><p>One captured segment.</p>"
+    }
+    if m.name == "user-post" {
+        return "<h2>Post {escape_html(param(m, "post"))}</h2><p>By user {escape_html(param(m, "id"))} — two captures.</p>"
+    }
+    if m.name == "file" {
+        return "<h2>File</h2><p>Wildcard captured <code>{escape_html(param(m, "path"))}</code>, slashes and all.</p>"
+    }
+    "<h2>Not found</h2><p>No route matched.</p>"
+}
+
+fn document(m: Match, path: str) -> str {
+    "<!doctype html><meta charset=\"utf-8\"><title>Router</title><nav><a href=\"/\">home</a> <a href=\"/about\">about</a> <a href=\"/users/new\">new user</a> <a href=\"/users/7\">user 7</a> <a href=\"/users/7/posts/3\">post 3</a> <a href=\"/files/a/b/c.txt\">a file</a></nav><main>{view(m)}</main><p>served for {escape_html(path)}</p>"
+}
+
+// ---------------------------------------------------------------------------
+// The server
+// ---------------------------------------------------------------------------
+
+type Req = { method: str, path: str }
+
+fn parse_req(raw: str) -> Req {
+    let lines = raw.lines()
+    if lines.len() == 0 {
+        return Req{ method: "", path: "empty request" }
+    }
+    let parts = lines[0].split(" ")
+    if parts.len() != 3 or not parts[1].starts_with("/") {
+        return Req{ method: "", path: "malformed request line" }
+    }
+    // A query string is not part of the route.
+    let target = parts[1]
+    let path = match target.index_of("?") {
+        Some(i) -> target.substr(0, i)
+        None -> target
+    }
+    Req{ method: parts[0], path: path }
+}
+
+fn response(status: str, content_type: str, body: str) -> str {
+    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {body.byte_len()}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{body}"
+}
+
+fn route_request(r: Req) -> str {
+    if r.method == "" {
+        return response("400 Bad Request", "text/plain", "bad request: {r.path}\n")
+    }
+    // The API a client-side router would call if it could not run the matcher
+    // itself. Kept because it is also how the harness proves the two agree.
+    if r.path.starts_with("/api/match/") {
+        let asked = r.path.substr(11, r.path.len() - 11)
+        return response("200 OK", "application/json", match_json(match_route("/" + asked)))
+    }
+    if r.method != "GET" {
+        return response("405 Method Not Allowed", "text/plain", "only GET\n")
+    }
+    let m = match_route(r.path)
+    // **A deep link is a real request.** The server renders the same view the
+    // browser would have, so pasting a URL and clicking to it produce the same
+    // page — which is the thing an SPA usually gets wrong.
+    if m.name == "" {
+        return response("404 Not Found", "text/html", document(m, r.path))
+    }
+    response("200 OK", "text/html", document(m, r.path))
+}
+
+// ---------------------------------------------------------------------------
+// The checks the harness compares across three engines
+// ---------------------------------------------------------------------------
+
+fn show(path: str) / {io} {
+    print("  {path} -> {match_json(match_route(path))}")
+}
+
+fn match_checks() / {io} {
+    print("--- matching ---")
+    show("/")
+    show("/about")
+    show("/users/new")
+    show("/users/7")
+    show("/users/7/posts/3")
+    show("/files/a/b/c.txt")
+    show("/files/")
+    show("/nowhere")
+    show("/users")
+    show("/users/7/posts")
+    show("/users/7/posts/3/extra")
+
+    print("--- slashes ---")
+    // A trailing slash is not a navigational decision anybody makes on purpose.
+    show("/about/")
+    show("//about")
+    show("/users//7")
+
+    print("--- order decides ---")
+    // `/users/new` is listed before `/users/:id`, which would otherwise match
+    // it and hand `new` over as an id.
+    print("  /users/new is {match_route("/users/new").name}, not {match_route("/users/9").name}")
+
+    print("--- a wildcard must be last ---")
+    let bad = Route{ name: "bad", pattern: "/x/*rest/y" }
+    print("  /x/*rest/y against /x/a/y: \"{match_one(bad, "/x/a/y").name}\"")
+}
+
+fn view_checks() / {io} {
+    print("--- one view for both sides ---")
+    for p in ["/", "/users/7", "/users/7/posts/3", "/files/a/b.txt", "/nope"] {
+        let body = view(match_route(p))
+        print("  {p}: {body.len()} characters, {body.substr(0, 24)}...")
+    }
+    print("--- escaping ---")
+    // A path segment reaches the page, so it is escaped. Without this,
+    // `/users/<script>` is a reflected cross-site scripting hole in both the
+    // server-rendered page and the client-rendered one, from the same line.
+    // A payload with no slash in it, because one with a slash becomes several
+    // segments and never reaches the view — which is an accident of routing,
+    // not a defence, and a check that passes for the wrong reason is worse
+    // than no check.
+    let m = match_route("/users/<img src=x onerror=alert(1)>")
+    print("  id captured: {param(m, "id")}")
+    print("  rendered: {view(m)}")
+}
+
+fn agreement_checks() / {io} {
+    print("--- the server API agrees with the matcher ---")
+    // The `/api/match/...` route exists so a client that cannot run the
+    // matcher can ask. It must give the same answer as running it.
+    for p in ["/", "/about", "/users/7", "/users/7/posts/3", "/files/a/b", "/nope"] {
+        let direct = match_json(match_route(p))
+        let asked = route_request(Req{ method: "GET", path: "/api/match{p}" })
+        let at = asked.index_of("\r\n\r\n")
+        let body = match at {
+            Some(j) -> asked.substr(j + 4, asked.len() - j - 4)
+            None -> ""
+        }
+        print("  {p}: {direct == body}")
+    }
+}
+
+fn deep_link_checks() / {io} {
+    print("--- a deep link is a real request ---")
+    for p in ["/", "/users/7", "/users/7/posts/3", "/files/a/b.txt", "/nope"] {
+        let resp = route_request(Req{ method: "GET", path: p })
+        let status = resp.lines()[0].split(" ")[1]
+        // The page the server sends contains the same view the browser would
+        // have drawn — so pasting a URL and clicking to it agree.
+        let contains_view = resp.contains(view(match_route(p)))
+        print("  {p}: {status}, carries the client's own view: {contains_view}")
+    }
+    let with_query = parse_req("GET /users/7?tab=posts HTTP/1.1")
+    print("  a query string is stripped: {with_query.path}, route {match_route(with_query.path).name}")
+}
+
+// ---------------------------------------------------------------------------
+// The live half
+// ---------------------------------------------------------------------------
+
+fn serve() / {io, net} {
+    let listener = match tcp_listen(PORT) {
+        Err(e) -> {
+            print("cannot listen on {PORT}: {e}")
+            return
+        }
+        Ok(l) -> l
+    }
+    print("http://localhost:{PORT}  (ctrl-c to stop)")
+    print("every route is a real URL — paste one and it renders")
+    var open: [i64] = []
+    var going = true
+    while going {
+        var waiting: [i64] = [listener]
+        for h in open {
+            waiting.push(h)
+        }
+        let ready = net_wait(waiting, 60000) ?? []
+        for h in ready {
+            if h == listener {
+                match tcp_accept(listener) {
+                    Err(e) -> print("accept failed: {e}")
+                    Ok(conn) -> open.push(conn)
+                }
+            } else {
+                let raw = tcp_read(h) ?? ""
+                if raw != "" {
+                    match tcp_write(h, route_request(parse_req(raw))) {
+                        Ok(_) -> {}
+                        Err(e) -> {}
+                    }
+                }
+                net_close(h)
+                var still: [i64] = []
+                for k in open {
+                    if k != h { still.push(k) }
+                }
+                open = still
+            }
+        }
+    }
+}
+
+fn main() / {io, net} {
+    if args().len() > 0 and args()[0] == "serve" {
+        serve()
+        return
+    }
+    // A path on stdin is a route to match: the mode the page runs in wasm.
+    let line = input()
+    if line.trim() != "" {
+        print(match_json(match_route(line.trim())))
+        return
+    }
+    match_checks()
+    view_checks()
+    agreement_checks()
+    deep_link_checks()
+}

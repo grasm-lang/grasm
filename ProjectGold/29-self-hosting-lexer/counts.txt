@@ -38,3 +38,4 @@
 38-upload-gallery/main.gr 3277
 39-chat-router/main.gr 3085
 40-collaborative-todo/main.gr 4144
+41-spa-router/main.gr 2047
