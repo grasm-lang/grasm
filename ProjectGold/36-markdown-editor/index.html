@@ -1,0 +1,105 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Editor — one compiler</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.55 system-ui, sans-serif; margin: 0; height: 100vh;
+         display: flex; flex-direction: column; }
+  header { padding: 0.75rem 1.25rem; display: flex; align-items: baseline;
+           gap: 1rem; border-bottom: 1px solid color-mix(in srgb, currentColor 15%, transparent); }
+  h1 { font-size: 0.95rem; font-weight: 600; margin: 0; }
+  .note { opacity: 0.7; font-size: 0.8rem; }
+  button { font: inherit; padding: 0.25rem 0.8rem; border: 1px solid currentColor;
+           border-radius: 6px; background: transparent; color: inherit; cursor: pointer; }
+  button[disabled] { opacity: 0.45; cursor: default; }
+  main { flex: 1; display: grid; grid-template-columns: 1fr 1fr; min-height: 0; }
+  textarea { font: 14px/1.6 ui-monospace, monospace; border: 0; resize: none;
+             padding: 1.25rem; background: transparent; color: inherit; outline: none;
+             border-right: 1px solid color-mix(in srgb, currentColor 15%, transparent); }
+  #preview { padding: 1.25rem; overflow: auto; }
+  #preview h1 { font-size: 1.4rem; margin: 0 0 0.5rem; }
+  #preview h2 { font-size: 1.15rem; }
+  #preview code { font-family: ui-monospace, monospace;
+                  background: color-mix(in srgb, currentColor 10%, transparent);
+                  padding: 0.1em 0.3em; border-radius: 3px; }
+  @media (max-width: 40rem) { main { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; } }
+</style>
+
+<header>
+  <h1>Editor</h1>
+  <span class="note" id="status">connecting…</span>
+  <span style="flex:1"></span>
+  <button id="publish" disabled>Publish</button>
+</header>
+<main>
+  <textarea id="src" spellcheck="false"># Live
+
+Type on the left. The preview is compiled by the *same process*
+that publishes — one `lib_markdown`, one call, no second
+implementation to disagree with.
+
+- the browser cannot run it: the wasm engine takes one source
+  string, and this program has an `import`
+- so the preview is a round trip, debounced
+</textarea>
+  <div id="preview"></div>
+</main>
+
+<script>
+  const API = "http://localhost:8977";
+  const src = document.getElementById("src");
+  const preview = document.getElementById("preview");
+  const status = document.getElementById("status");
+  const publish = document.getElementById("publish");
+
+  // The preview is rendered by asking the server, once per keystroke.
+  //
+  // The first version of this page ran the compiler here, in wasm, on the
+  // source of main.gr — and it could not. `grasm_run_with_stdin` takes one
+  // source string and the wasm target has no filesystem, so a program with an
+  // `import` cannot be handed to it at all. main.gr imports `lib_markdown`,
+  // which is the whole point of this project, so the browser is out.
+  //
+  // Asking the server is not a workaround dressed up as a design: it is the
+  // *stronger* version of the claim. The preview is not compiled by the same
+  // compiler as the published page — it is compiled by the same *process*, and
+  // there is nothing left for the two to disagree about. What it costs is a
+  // round trip per keystroke, which is why the request is debounced.
+  let timer = null, inFlight = false, again = false;
+
+  function render() {
+    if (inFlight) { again = true; return; }
+    inFlight = true;
+    fetch(`${API}/render`, { method: "POST", body: src.value })
+      .then(r => r.text())
+      .then(html => {
+        preview.innerHTML = html;
+        status.textContent = "preview compiled by the server, same code as publish";
+      })
+      .catch(() => {
+        status.textContent = "no server: run `grasm run main.gr -- serve`";
+      })
+      .finally(() => {
+        inFlight = false;
+        if (again) { again = false; render(); }
+      });
+  }
+
+  src.addEventListener("input", () => {
+    clearTimeout(timer);
+    timer = setTimeout(render, 90);
+  });
+
+  publish.disabled = false;
+  publish.addEventListener("click", () => {
+    fetch(`${API}/save`, { method: "POST", body: src.value })
+      .then(r => r.text())
+      .then(html => {
+        preview.innerHTML = html;
+        status.textContent = "published — /source now serves this document";
+      })
+      .catch(() => { status.textContent = "no server: run `grasm run main.gr -- serve`"; });
+  });
+
+  render();
+</script>

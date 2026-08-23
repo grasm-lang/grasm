@@ -33,3 +33,4 @@
 33-user-registration/main.gr 2965
 34-voting-app/main.gr 2761
 35-blog-dashboard/main.gr 3153
+36-markdown-editor/main.gr 1736

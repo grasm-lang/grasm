@@ -1,0 +1,30 @@
+--- the shared compiler ---
+  heading: <h1>Title</h1>
+  deeper heading: <h3>Three</h3>
+  paragraph: <p>just words</p>
+  emphasis: <p><em>one</em> and <strong>two</strong></p>
+  code span: <p><code>let x = 1</code></p>
+  list: <ul>
+<li>a</li>
+<li>b</li>
+</ul>
+  escaped html: <p>&lt;script&gt;alert(1)&lt;/script&gt;</p>
+  ampersand: <p>a &amp; b</p>
+  empty: 
+--- the wire format ---
+  21 chars survive: true
+  17 chars survive: true
+  28 chars survive: true
+  0 chars survive: true
+  18 chars survive: true
+  an encoded document is one line: true
+--- routing ---
+  GET /: 200, document unchanged, 87 chars out
+  GET /source: 200, document unchanged, 14 chars out
+  POST /render: 200, document unchanged, 16 chars out
+  POST /save: 200, document stored, 14 chars out
+  GET /render: 404, document unchanged, 24 chars out
+  POST /nowhere: 404, document unchanged, 26 chars out
+--- preview and publish agree ---
+  identical html: true
+  and the document was stored only by the second: true

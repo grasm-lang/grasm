@@ -1,0 +1,299 @@
+// Phase 2, project 3 — Live Markdown Editor.
+//
+// The project where the browser half has real work. Project 32's page sent an
+// HTTP request, which `fetch` already does; this one **compiles markdown on
+// every keystroke**, and it does that by running the server's own compiler in
+// wasm rather than by carrying a JavaScript one beside it.
+//
+// That matters more than it looks. An editor whose preview is rendered by a
+// different implementation from the one that publishes is an editor that lies:
+// the writer sees one document and the reader gets another, and the difference
+// only shows up on the constructs where two markdown implementations disagree
+// — which is most of the interesting ones.
+//
+// So there is one compiler, `lib_markdown`, and both sides call it.
+//
+// ```
+// grasm run main.gr < /dev/null    # the comparison the harness makes
+// echo '# hi' | grasm run main.gr  # one document in, HTML out
+// grasm run main.gr -- serve       # then serve index.html over http
+// ```
+//
+// A line on stdin is a document to compile, as in project 33 — that is what
+// lets the page run this same file through `grasm_run_with_stdin`.
+
+import lib_markdown
+
+let PORT = 8977
+
+// ---------------------------------------------------------------------------
+// Documents
+// ---------------------------------------------------------------------------
+
+fn state_path() -> str / {io} {
+    let dir = env("TMPDIR") ?? "/tmp"
+    let trimmed = if dir.ends_with("/") { dir.substr(0, dir.len() - 1) } else { dir }
+    "{trimmed}/grasm_editor_doc.md"
+}
+
+fn load(path: str) -> str / {io} {
+    read_file(path) ?? "# Untitled\n\nStart typing."
+}
+
+fn save(path: str, doc: str) / {io} {
+    match write_file(path, doc) {
+        Ok(_) -> {}
+        Err(e) -> eprint("cannot save document: {e}")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A document arrives as one line
+// ---------------------------------------------------------------------------
+
+/// Newlines as `\n` two characters, because the browser sends the buffer on one
+/// line and a markdown document is mostly newlines.
+///
+/// This is the editor's wire format and it is deliberately the dullest thing
+/// that works: a document that survives the trip unchanged matters more than a
+/// clever encoding, and every clever encoding this project tried first had a
+/// document that did not survive it.
+fn decode_line(line: str) -> str {
+    var out = ""
+    var i = 0
+    while i < line.len() {
+        let c = line.substr(i, 1)
+        if c == "\\" and i + 1 < line.len() {
+            let n = line.substr(i + 1, 1)
+            if n == "n" {
+                out += "\n"
+                i += 2
+            } else if n == "\\" {
+                out += "\\"
+                i += 2
+            } else {
+                out += c
+                i += 1
+            }
+        } else {
+            out += c
+            i += 1
+        }
+    }
+    out
+}
+
+fn encode_line(doc: str) -> str {
+    var out = ""
+    for c in doc.codes() {
+        if c == 10 {
+            out += "\\n"
+        } else if c == 92 {
+            out += "\\\\"
+        } else {
+            out += c.to_char()
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Routing
+// ---------------------------------------------------------------------------
+
+fn response(status: str, content_type: str, body: str) -> str {
+    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {body.byte_len()}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{body}"
+}
+
+type Req = { method: str, path: str, body: str }
+
+fn parse_req(raw: str) -> Req {
+    let head_end = raw.index_of("\r\n\r\n")
+    let head = match head_end {
+        Some(i) -> raw.substr(0, i)
+        None -> raw
+    }
+    let body = match head_end {
+        Some(i) -> raw.substr(i + 4, raw.len() - i - 4)
+        None -> ""
+    }
+    let lines = head.lines()
+    if lines.len() == 0 {
+        return Req{ method: "", path: "empty request", body: "" }
+    }
+    let parts = lines[0].split(" ")
+    if parts.len() != 3 or not parts[1].starts_with("/") {
+        return Req{ method: "", path: "malformed request line", body: "" }
+    }
+    Req{ method: parts[0], path: parts[1], body: body }
+}
+
+/// The published page: the stored document, compiled.
+fn published(doc: str) -> str {
+    "<!doctype html><meta charset=\"utf-8\"><title>Document</title>{lib_markdown.compile(doc)}"
+}
+
+fn route(r: Req, doc: str) -> (str, str) {
+    if r.method == "" {
+        return (doc, response("400 Bad Request", "text/plain", "bad request: {r.path}\n"))
+    }
+    if r.path == "/" and r.method == "GET" {
+        return (doc, response("200 OK", "text/html", published(doc)))
+    }
+    if r.path == "/source" and r.method == "GET" {
+        return (doc, response("200 OK", "text/plain", doc))
+    }
+    // Compile without storing: what a preview asks for.
+    if r.path == "/render" and r.method == "POST" {
+        return (doc, response("200 OK", "text/html", lib_markdown.compile(r.body)))
+    }
+    // Compile *and* store: what publishing is.
+    if r.path == "/save" and r.method == "POST" {
+        return (r.body, response("200 OK", "text/html", lib_markdown.compile(r.body)))
+    }
+    (doc, response("404 Not Found", "text/plain", "no route for {r.method} {r.path}\n"))
+}
+
+// ---------------------------------------------------------------------------
+// The checks the harness compares across three engines
+// ---------------------------------------------------------------------------
+
+fn show(label: str, src: str) / {io} {
+    print("  {label}: {lib_markdown.compile(src)}")
+}
+
+fn compile_checks() / {io} {
+    print("--- the shared compiler ---")
+    show("heading", "# Title")
+    show("deeper heading", "### Three")
+    show("paragraph", "just words")
+    show("emphasis", "*one* and **two**")
+    show("code span", "`let x = 1`")
+    show("list", "- a\n- b")
+    show("escaped html", "<script>alert(1)</script>")
+    show("ampersand", "a & b")
+    show("empty", "")
+}
+
+fn roundtrip_checks() / {io} {
+    print("--- the wire format ---")
+    let docs = [
+        "# Title\n\nA paragraph.",
+        "line one\nline two",
+        "a backslash \\ and a newline\n",
+        "",
+        "trailing newline\n\n",
+    ]
+    for d in docs {
+        let there_and_back = decode_line(encode_line(d))
+        print("  {d.len()} chars survive: {there_and_back == d}")
+    }
+    print("  an encoded document is one line: {encode_line("a\nb\nc").contains("\n") == false}")
+}
+
+fn routing_checks() / {io} {
+    print("--- routing ---")
+    let doc = "# Stored\n\nbody"
+    show_route("GET /", "GET", "/", "", doc)
+    show_route("GET /source", "GET", "/source", "", doc)
+    show_route("POST /render", "POST", "/render", "# Preview", doc)
+    show_route("POST /save", "POST", "/save", "# Saved", doc)
+    show_route("GET /render", "GET", "/render", "", doc)
+    show_route("POST /nowhere", "POST", "/nowhere", "", doc)
+}
+
+fn show_route(label: str, method: str, path: str, body: str, doc: str) / {io} {
+    let raw = "{method} {path} HTTP/1.1\r\nHost: x\r\n\r\n{body}"
+    let (next, resp) = route(parse_req(raw), doc)
+    let status = resp.lines()[0].split(" ")[1]
+    let changed = if next == doc { "unchanged" } else { "stored" }
+    let at = resp.index_of("\r\n\r\n")
+    let out = match at {
+        Some(j) -> resp.substr(j + 4, resp.len() - j - 4)
+        None -> ""
+    }
+    print("  {label}: {status}, document {changed}, {out.trim().len()} chars out")
+}
+
+/// The claim this project exists to make, checked rather than asserted: the
+/// preview route and the publish route compile the same source to the same
+/// HTML, because they call the same function.
+fn one_compiler_check() / {io} {
+    print("--- preview and publish agree ---")
+    let src = "# Same\n\n*words* and `code`"
+    let (_, preview) = route(parse_req("POST /render HTTP/1.1\r\n\r\n{src}"), "")
+    let (stored, publish) = route(parse_req("POST /save HTTP/1.1\r\n\r\n{src}"), "")
+    let pa = preview.index_of("\r\n\r\n")
+    let pb = publish.index_of("\r\n\r\n")
+    let a = match pa { Some(i) -> preview.substr(i + 4, preview.len() - i - 4)  None -> "" }
+    let b = match pb { Some(i) -> publish.substr(i + 4, publish.len() - i - 4)  None -> "" }
+    print("  identical html: {a == b}")
+    print("  and the document was stored only by the second: {stored == src}")
+}
+
+// ---------------------------------------------------------------------------
+// The live half
+// ---------------------------------------------------------------------------
+
+fn serve() / {io, net} {
+    let path = state_path()
+    let listener = match tcp_listen(PORT) {
+        Err(e) -> {
+            print("cannot listen on {PORT}: {e}")
+            return
+        }
+        Ok(l) -> l
+    }
+    print("http://localhost:{PORT}  (ctrl-c to stop)")
+    print("document: {path}, {load(path).len()} character(s)")
+    var open: [i64] = []
+    var going = true
+    while going {
+        var waiting: [i64] = [listener]
+        for h in open {
+            waiting.push(h)
+        }
+        let ready = net_wait(waiting, 60000) ?? []
+        for h in ready {
+            if h == listener {
+                match tcp_accept(listener) {
+                    Err(e) -> print("accept failed: {e}")
+                    Ok(conn) -> open.push(conn)
+                }
+            } else {
+                let raw = tcp_read(h) ?? ""
+                if raw != "" {
+                    let (next, resp) = route(parse_req(raw), load(path))
+                    save(path, next)
+                    match tcp_write(h, resp) {
+                        Ok(_) -> {}
+                        Err(e) -> {}
+                    }
+                }
+                net_close(h)
+                var still: [i64] = []
+                for k in open {
+                    if k != h { still.push(k) }
+                }
+                open = still
+            }
+        }
+    }
+}
+
+fn main() / {io, net} {
+    if args().len() > 0 and args()[0] == "serve" {
+        serve()
+        return
+    }
+    // A line on stdin is a document: the mode the page runs in wasm.
+    let line = input()
+    if line != "" {
+        print(lib_markdown.compile(decode_line(line)))
+        return
+    }
+    compile_checks()
+    roundtrip_checks()
+    routing_checks()
+    one_compiler_check()
+}

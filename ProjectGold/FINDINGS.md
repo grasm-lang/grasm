@@ -1083,3 +1083,42 @@ The list now covers `par_filter`, `spawn`, `tcp_connect`, `udp_bind`,
 
 Two defects of one shape: a harness's model of the world stops being updated,
 and it goes on reporting success.
+
+## F33 — the wasm engine cannot run a program that has an `import` (S3, tooling) — **open**
+
+Found writing phase 2's project 3, a live markdown editor. The design was the
+one project 33 had already proved: the browser fetches `main.gr` and runs it
+through `grasm_run_with_stdin`, so the preview is compiled by the server's own
+compiler and the two cannot disagree about what a document means.
+
+It returned nothing. The reason is structural rather than a bug:
+
+* `grasm_run_with_stdin(src, len, stdin, len)` takes **one source string**.
+* `wasm32-unknown-unknown` has **no filesystem**, so an `import` cannot be
+  resolved by reading the file it names.
+
+Project 33 worked because it is a single file. Project 36 imports
+`lib_markdown` — which is the entire point of it, and of the package extraction
+in project 5 — so the browser is out.
+
+This is larger than one project. Every Grasm program worth writing has imports,
+and the fourth engine can run none of them. The browser showcase works only
+because all 31 phase-1 programs happen to be single files, which was never a
+design decision.
+
+### What would close it
+
+`grasm build --source -o one.gr`: the loader already resolves the whole import
+graph and holds every file, so emitting one source with module members
+qualified is a pass over a structure that already exists. The browser then
+fetches one file and the existing ABI is enough.
+
+An alternative — extending the ABI to accept named modules — puts the resolver
+in the embedder, which is the wrong place for it.
+
+### What project 36 does instead
+
+It asks the server to render, once per keystroke, debounced. That is not a
+workaround dressed as a design: the preview is then compiled not by the same
+*compiler* as the published page but by the same *process*, which is the
+stronger claim. What it costs is a round trip, and the page says so.

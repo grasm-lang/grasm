@@ -1,0 +1,193 @@
+// Markdown, as a package.
+//
+// Project 12 wrote this compiler. Phase 2's project 3 is a live editor and
+// needs the same one on both sides of the wire — the server's `/render` and
+// the browser's keystroke-by-keystroke preview must not disagree about what a
+// document means, and the only way to be sure of that is for there to be one
+// of them.
+//
+// What it exports is `compile` and `escape_html`. The line scanner, the inline
+// pass and the delimiter matching stay private: a caller wants a document
+// turned into HTML, and everything else here is how.
+
+pub fn escape_html(s: str) -> str {
+    var out = ""
+    for c in s.chars() {
+        if c == "&" { out = out + "&amp;" }
+        else if c == "<" { out = out + "&lt;" }
+        else if c == ">" { out = out + "&gt;" }
+        else if c == "\"" { out = out + "&quot;" }
+        else { out = out + c }
+    }
+    out
+}
+
+/// How many of `marker` start at `i`.
+fn run_length(cs: [str], i: i64, marker: str) -> i64 {
+    var n = 0
+    while i + n < cs.len() and cs[i + n] == marker {
+        n = n + 1
+    }
+    n
+}
+
+/// Find the closing run of `marker` of at least `want` characters, starting the
+/// search at `from`. Returns -1 when the span is never closed, which is the
+/// case that decides whether a stray `**` becomes literal text or eats the
+/// rest of the document.
+fn find_close(cs: [str], from: i64, marker: str, want: i64) -> i64 {
+    var i = from
+    while i < cs.len() {
+        if cs[i] == marker and run_length(cs, i, marker) >= want {
+            return i
+        }
+        i = i + 1
+    }
+    -1
+}
+
+fn inline(src: str) -> str {
+    var out = ""
+    let cs = src.chars()
+    var i = 0
+    while i < cs.len() {
+        let c = cs[i]
+        if c == "`" {
+            // Code spans win over everything: their contents are text, not
+            // markup, which is the whole point of them.
+            let close = find_close(cs, i + 1, "`", 1)
+            if close < 0 {
+                out = out + escape_html(c)
+                i = i + 1
+            } else {
+                var body = ""
+                for k in (i + 1)..close {
+                    body = body + cs[k]
+                }
+                out = out + "<code>" + escape_html(body) + "</code>"
+                i = close + 1
+            }
+        } else if c == "*" {
+            let n = run_length(cs, i, "*")
+            // Three or more means both, which is the case a `want = 2` rule
+            // gets wrong: it consumes two of the three stars and leaves the
+            // third as literal text, giving `<strong>*both</strong>*`.
+            let want = if n >= 3 { 3 } else if n == 2 { 2 } else { 1 }
+            let close = find_close(cs, i + want, "*", want)
+            if close < 0 {
+                out = out + escape_html(c)
+                i = i + 1
+            } else {
+                var body = ""
+                for k in (i + want)..close {
+                    body = body + cs[k]
+                }
+                // Recursion, so `**bold with *italic* inside**` nests.
+                let open_tags = if want == 3 { "<em><strong>" }
+                    else if want == 2 { "<strong>" }
+                    else { "<em>" }
+                let close_tags = if want == 3 { "</strong></em>" }
+                    else if want == 2 { "</strong>" }
+                    else { "</em>" }
+                out = out + open_tags + inline(body) + close_tags
+                i = close + want
+            }
+        } else {
+            out = out + escape_html(c)
+            i = i + 1
+        }
+    }
+    out
+}
+
+fn heading_level(line: str) -> i64 {
+    var n = 0
+    for c in line.chars() {
+        if c == "#" and n < 7 {
+            n = n + 1
+        } else {
+            return n
+        }
+    }
+    n
+}
+
+pub fn compile(src: str) -> str {
+    var out: [str] = []
+    var in_list = false
+    var in_code = false
+    var para: [str] = []
+
+    // A paragraph is closed by a blank line or by any block that follows it, so
+    // flushing is a step of its own rather than something each branch repeats.
+    for raw in src.lines() {
+        let line = raw.trim_end()
+        let level = heading_level(line)
+
+        if line.trim().starts_with("```") {
+            if in_code {
+                out.push("</code></pre>")
+                in_code = false
+            } else {
+                if para.len() > 0 {
+                    out.push("<p>" + inline(para.join(" ")) + "</p>")
+                    para = []
+                }
+                if in_list {
+                    out.push("</ul>")
+                    in_list = false
+                }
+                out.push("<pre><code>")
+                in_code = true
+            }
+        } else if in_code {
+            // Inside a fence nothing is markup, and everything is escaped.
+            out.push(escape_html(raw))
+        } else if line.trim() == "" {
+            if para.len() > 0 {
+                out.push("<p>" + inline(para.join(" ")) + "</p>")
+                para = []
+            }
+            if in_list {
+                out.push("</ul>")
+                in_list = false
+            }
+        } else if level > 0 and level <= 6 and line.substr(level, 1) == " " {
+            if para.len() > 0 {
+                out.push("<p>" + inline(para.join(" ")) + "</p>")
+                para = []
+            }
+            if in_list {
+                out.push("</ul>")
+                in_list = false
+            }
+            let body = line.substr(level + 1, line.len() - level - 1)
+            out.push("<h{level}>" + inline(body.trim()) + "</h{level}>")
+        } else if line.trim().starts_with("- ") {
+            if para.len() > 0 {
+                out.push("<p>" + inline(para.join(" ")) + "</p>")
+                para = []
+            }
+            if not in_list {
+                out.push("<ul>")
+                in_list = true
+            }
+            let t = line.trim()
+            out.push("<li>" + inline(t.substr(2, t.len() - 2)) + "</li>")
+        } else {
+            para.push(line.trim())
+        }
+    }
+    if para.len() > 0 {
+        out.push("<p>" + inline(para.join(" ")) + "</p>")
+    }
+    if in_list {
+        out.push("</ul>")
+    }
+    if in_code {
+        // An unclosed fence is a document error, and closing it is better than
+        // emitting a `<pre>` that never ends.
+        out.push("</code></pre>")
+    }
+    out.join("\n")
+}

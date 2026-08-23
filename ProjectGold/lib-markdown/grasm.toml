@@ -1,0 +1,8 @@
+[package]
+name = "lib_markdown"
+version = "1.0.0"
+entry = "src/main.gr"
+
+# Text in, text out. It opens nothing and dials nothing, so it declares
+# nothing — and a consumer cannot acquire a capability by importing it.
+capabilities = []
