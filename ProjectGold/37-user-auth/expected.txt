@@ -1,0 +1,33 @@
+--- the primitive ---
+  sha256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+  sha256("abc") = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+--- derivation ---
+  same salt and password agree: true
+  a different salt changes it: true
+  one character changes it: true
+  it is 600 rounds, not one: true
+  length: 64 hex characters
+--- comparison ---
+  equal: true
+  different: false
+  different lengths: false
+--- salts are unique ---
+  eight salts for one address, all different: true
+  each is 32 hex characters
+--- the flow ---
+  register: 201 {"registered": "ada@x.org"}
+  register again: 409 {"error": "that address is already registered"}
+  short password: 422 {"error": "password must be at least 8 characters"}
+  no name: 422 {"error": "name and email are required"}
+  wrong password: 401 {"error": "no such account, or wrong password"}
+  unknown account: 401 {"error": "no such account, or wrong password"}
+  me, no token: 401 {"error": "no bearer token"}
+  me, junk token: 401 {"error": "not a valid session"}
+  login: 200, token is 64 characters
+  me, with token: 200 {"email": "ada@x.org", "name": "Ada"}
+  logout: 200 {"ended": "1"}
+  me, after logout: 401 {"error": "not a valid session"}
+  logout again: 200 {"ended": "0"}
+  accounts: 1, sessions: 0
+  the stored value is not the password: true
+  and the salt is not either: true

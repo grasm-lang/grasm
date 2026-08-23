@@ -1,0 +1,562 @@
+// Phase 2, project 7 — User Authentication.
+//
+// The plan called this "the one that matters", and it is: a password hash, a
+// session token, and a route that refuses without one. It is also where
+// project 27's from-scratch SHA-256 stops being an exercise and becomes the
+// thing standing between a stolen file and every account in it.
+//
+// So the honest parts come first, before any of the code.
+//
+// **SHA-256 is not a password hashing function.** It is fast, and fast is the
+// wrong property here — it is what lets an attacker try billions of guesses a
+// second against a stolen file. A real system uses argon2 or scrypt, which are
+// deliberately slow and memory-hard. This one iterates, which is the only
+// defence available without those, and iterating is strictly weaker.
+//
+// **Grasm has no source of randomness** ([ProjectGold F34]). There is
+// `now_millis()` and nothing else. That is survivable for a *salt*, whose job
+// is uniqueness rather than unpredictability — two accounts must not share one,
+// and a clock plus a counter gives that. It is **not** survivable for a session
+// token, which is exactly a secret that must not be guessable. The tokens this
+// program issues are derived from the clock and are therefore predictable to
+// anyone who knows roughly when they were issued.
+//
+// That is stated rather than hidden, and it is why this project is a
+// demonstration of the *shape* of authentication and not something to deploy.
+//
+// ```
+// grasm run main.gr              # the comparison the harness makes
+// grasm run main.gr -- serve     # then talk to it with curl
+// ```
+
+import lib_sha256
+
+let PORT = 8978
+// Enough to be visibly slow per attempt and fast enough for a test suite. A
+// real system tunes this until a single verification takes ~100ms.
+let ITERATIONS = 600
+
+// ---------------------------------------------------------------------------
+// Password hashing
+// ---------------------------------------------------------------------------
+
+/// The stored verifier: `sha256^n(salt + password)`.
+///
+/// Iterated because a single SHA-256 is a rainbow-table lookup away from the
+/// password. Salted because without one, two accounts with the same password
+/// have the same hash — which tells an attacker who to try first, and turns one
+/// cracked password into two.
+fn derive(salt: str, password: str) -> str {
+    var h = lib_sha256.sha256(salt + password)
+    var i = 1
+    while i < ITERATIONS {
+        h = lib_sha256.sha256(salt + h)
+        i = i + 1
+    }
+    h
+}
+
+/// Constant-time-ish comparison.
+///
+/// Comparing hex with `==` returns as soon as two characters differ, so how
+/// long a wrong answer takes depends on how much of it was right — which is a
+/// timing oracle for the hash. This compares every character.
+///
+/// "-ish" because Grasm makes no promise about what the backend does with this
+/// loop, and a language without a `black_box` cannot make one. Written this way
+/// anyway: the intent is checkable even where the guarantee is not.
+fn same_digest(a: str, b: str) -> bool {
+    if a.len() != b.len() {
+        return false
+    }
+    var diff = 0
+    for i in 0..a.len() {
+        if a.substr(i, 1) != b.substr(i, 1) {
+            diff = diff + 1
+        }
+    }
+    diff == 0
+}
+
+// ---------------------------------------------------------------------------
+// Accounts
+// ---------------------------------------------------------------------------
+
+type Account = {
+    email: str,
+    name: str,
+    salt: str,
+    verifier: str,
+}
+
+fn accounts_path() -> str / {io} {
+    "{tmp()}/grasm_auth_accounts.tsv"
+}
+
+fn sessions_path() -> str / {io} {
+    "{tmp()}/grasm_auth_sessions.tsv"
+}
+
+fn tmp() -> str / {io} {
+    let dir = env("TMPDIR") ?? "/tmp"
+    if dir.ends_with("/") { dir.substr(0, dir.len() - 1) } else { dir }
+}
+
+fn load_accounts(path: str) -> [Account] / {io} {
+    var out: [Account] = []
+    match read_file(path) {
+        Err(e) -> {}
+        Ok(text) -> {
+            for line in text.lines() {
+                if line.trim() != "" {
+                    let p = line.split("\t")
+                    if p.len() == 4 {
+                        out.push(Account{ email: p[0], name: p[1], salt: p[2], verifier: p[3] })
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn save_accounts(path: str, accounts: [Account]) / {io} {
+    var text = ""
+    for a in accounts {
+        text += "{a.email}\t{a.name}\t{a.salt}\t{a.verifier}\n"
+    }
+    match write_file(path, text) {
+        Ok(_) -> {}
+        Err(e) -> eprint("cannot save accounts: {e}")
+    }
+}
+
+fn find_account(accounts: [Account], email: str) -> i64 {
+    for i in 0..accounts.len() {
+        if accounts[i].email.to_lower() == email.trim().to_lower() {
+            return i
+        }
+    }
+    -1
+}
+
+// ---------------------------------------------------------------------------
+// Salts and tokens — where the missing randomness bites
+// ---------------------------------------------------------------------------
+
+/// A salt: unique per account, and that is all a salt has to be.
+///
+/// Derived from the clock, a counter and the address, because there is nothing
+/// better available. Uniqueness is what defeats a rainbow table and what stops
+/// two identical passwords having identical hashes, and this gives both.
+/// Unpredictability would be better and is not required here.
+fn make_salt(email: str, counter: i64) -> str / {io} {
+    lib_sha256.sha256("{now_millis()}:{counter}:{email}").substr(0, 32)
+}
+
+/// A session token — and this one **should** be unpredictable, and is not.
+///
+/// An attacker who knows roughly when a session began can search a small space
+/// of clock values and find it. There is no way to fix that inside the
+/// language today, which is F34, and a project that quietly issued these
+/// without saying so would be teaching the wrong lesson to whoever read it.
+fn make_token(email: str, counter: i64) -> str / {io} {
+    lib_sha256.sha256("token:{now_millis()}:{counter}:{email}")
+}
+
+type Session = { token: str, email: str }
+
+fn load_sessions(path: str) -> [Session] / {io} {
+    var out: [Session] = []
+    match read_file(path) {
+        Err(e) -> {}
+        Ok(text) -> {
+            for line in text.lines() {
+                if line.trim() != "" {
+                    let p = line.split("\t")
+                    if p.len() == 2 {
+                        out.push(Session{ token: p[0], email: p[1] })
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn save_sessions(path: str, sessions: [Session]) / {io} {
+    var text = ""
+    for s in sessions {
+        text += "{s.token}\t{s.email}\n"
+    }
+    match write_file(path, text) {
+        Ok(_) -> {}
+        Err(e) -> eprint("cannot save sessions: {e}")
+    }
+}
+
+fn session_for(sessions: [Session], token: str) -> str {
+    for s in sessions {
+        if same_digest(s.token, token) {
+            return s.email
+        }
+    }
+    ""
+}
+
+// ---------------------------------------------------------------------------
+// HTTP
+// ---------------------------------------------------------------------------
+
+type Req = { method: str, path: str, body: str, token: str }
+
+fn parse_req(raw: str) -> Req {
+    let head_end = raw.index_of("\r\n\r\n")
+    let head = match head_end {
+        Some(i) -> raw.substr(0, i)
+        None -> raw
+    }
+    let body = match head_end {
+        Some(i) -> raw.substr(i + 4, raw.len() - i - 4)
+        None -> ""
+    }
+    let lines = head.lines()
+    if lines.len() == 0 {
+        return Req{ method: "", path: "empty request", body: "", token: "" }
+    }
+    let parts = lines[0].split(" ")
+    if parts.len() != 3 or not parts[1].starts_with("/") {
+        return Req{ method: "", path: "malformed request line", body: "", token: "" }
+    }
+    var token = ""
+    for line in lines {
+        let low = line.to_lower()
+        if low.starts_with("authorization:") {
+            let v = line.substr(14, line.len() - 14).trim()
+            if v.to_lower().starts_with("bearer ") {
+                token = v.substr(7, v.len() - 7).trim()
+            }
+        }
+    }
+    Req{ method: parts[0], path: parts[1], body: body, token: token }
+}
+
+fn field(body: str, want: str) -> str {
+    for pair in body.split("&") {
+        match pair.index_of("=") {
+            None -> {}
+            Some(i) -> {
+                if pair.substr(0, i) == want {
+                    return pair.substr(i + 1, pair.len() - i - 1)
+                }
+            }
+        }
+    }
+    ""
+}
+
+fn response(status: str, body: str) -> str {
+    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {body.byte_len()}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{body}"
+}
+
+fn json_msg(key: str, value: str) -> str {
+    "\{\"{key}\": \"{value}\"\}"
+}
+
+// ---------------------------------------------------------------------------
+// The routes
+// ---------------------------------------------------------------------------
+
+type World = { accounts: [Account], sessions: [Session], counter: i64 }
+
+fn route(r: Req, w: World) -> (World, str) / {io} {
+    if r.method == "" {
+        return (w, response("400 Bad Request", json_msg("error", r.path)))
+    }
+    if r.path == "/register" and r.method == "POST" {
+        return register(r, w)
+    }
+    if r.path == "/login" and r.method == "POST" {
+        return login(r, w)
+    }
+    if r.path == "/logout" and r.method == "POST" {
+        return logout(r, w)
+    }
+    if r.path == "/me" and r.method == "GET" {
+        return me(r, w)
+    }
+    (w, response("404 Not Found", json_msg("error", "no route for {r.method} {r.path}")))
+}
+
+fn register(r: Req, w: World) -> (World, str) / {io} {
+    let email = field(r.body, "email")
+    let name = field(r.body, "name")
+    let password = field(r.body, "password")
+    if email == "" or name == "" {
+        return (w, response("422 Unprocessable Entity", json_msg("error", "name and email are required")))
+    }
+    // Eight is the floor a demonstration should show, not the floor a system
+    // should have. Length is the only property here that reliably matters.
+    if password.len() < 8 {
+        return (w, response("422 Unprocessable Entity", json_msg("error", "password must be at least 8 characters")))
+    }
+    if find_account(w.accounts, email) >= 0 {
+        // The same message and status a *successful* registration would give
+        // would be better for privacy — this one tells an attacker which
+        // addresses have accounts. Said plainly rather than fixed, because
+        // fixing it means not telling the user why their form failed, and that
+        // trade is the project's to state and the reader's to make.
+        return (w, response("409 Conflict", json_msg("error", "that address is already registered")))
+    }
+    var next = w
+    next.counter = next.counter + 1
+    let salt = make_salt(email, next.counter)
+    next.accounts.push(Account{
+        email: email,
+        name: name,
+        salt: salt,
+        verifier: derive(salt, password),
+    })
+    (next, response("201 Created", json_msg("registered", email)))
+}
+
+fn login(r: Req, w: World) -> (World, str) / {io} {
+    let email = field(r.body, "email")
+    let password = field(r.body, "password")
+    let at = find_account(w.accounts, email)
+    // One message for "no such account" and for "wrong password", because
+    // telling them apart is telling an attacker which addresses are worth
+    // attacking. The cost is a worse error for an honest user, and that is the
+    // right way round.
+    if at < 0 {
+        return (w, response("401 Unauthorized", json_msg("error", "no such account, or wrong password")))
+    }
+    let a = w.accounts[at]
+    if not same_digest(derive(a.salt, password), a.verifier) {
+        return (w, response("401 Unauthorized", json_msg("error", "no such account, or wrong password")))
+    }
+    var next = w
+    next.counter = next.counter + 1
+    let token = make_token(a.email, next.counter)
+    next.sessions.push(Session{ token: token, email: a.email })
+    (next, response("200 OK", json_msg("token", token)))
+}
+
+fn logout(r: Req, w: World) -> (World, str) / {io} {
+    var next = w
+    var kept: [Session] = []
+    var removed = 0
+    for s in next.sessions {
+        if same_digest(s.token, r.token) {
+            removed = removed + 1
+        } else {
+            kept.push(s)
+        }
+    }
+    next.sessions = kept
+    // Logging out of a session that does not exist is not an error: the caller
+    // asked to hold no session and now holds none.
+    (next, response("200 OK", json_msg("ended", "{removed}")))
+}
+
+fn me(r: Req, w: World) -> (World, str) / {io} {
+    if r.token == "" {
+        return (w, response("401 Unauthorized", json_msg("error", "no bearer token")))
+    }
+    let email = session_for(w.sessions, r.token)
+    if email == "" {
+        return (w, response("401 Unauthorized", json_msg("error", "not a valid session")))
+    }
+    let at = find_account(w.accounts, email)
+    if at < 0 {
+        return (w, response("401 Unauthorized", json_msg("error", "session names an account that no longer exists")))
+    }
+    (w, response("200 OK", "\{\"email\": \"{w.accounts[at].email}\", \"name\": \"{w.accounts[at].name}\"\}"))
+}
+
+// ---------------------------------------------------------------------------
+// The checks the harness compares across three engines
+// ---------------------------------------------------------------------------
+
+fn hash_checks() / {io} {
+    print("--- the primitive ---")
+    // The two canonical vectors. A crypto implementation that is not checked
+    // against known answers is a random number generator with extra steps.
+    print("  sha256(\"\") = {lib_sha256.sha256("")}")
+    print("  sha256(\"abc\") = {lib_sha256.sha256("abc")}")
+
+    print("--- derivation ---")
+    let h1 = derive("salt-a", "correct horse")
+    let h2 = derive("salt-a", "correct horse")
+    let h3 = derive("salt-b", "correct horse")
+    let h4 = derive("salt-a", "correct horsf")
+    print("  same salt and password agree: {h1 == h2}")
+    print("  a different salt changes it: {h1 != h3}")
+    print("  one character changes it: {h1 != h4}")
+    print("  it is {ITERATIONS} rounds, not one: {h1 != lib_sha256.sha256("salt-a" + "correct horse")}")
+    print("  length: {h1.len()} hex characters")
+
+    print("--- comparison ---")
+    print("  equal: {same_digest(h1, h2)}")
+    print("  different: {same_digest(h1, h3)}")
+    print("  different lengths: {same_digest("abc", "abcd")}")
+}
+
+fn show(label: str, method: str, path: str, body: str, token: str, inout w: World) / {io} {
+    let auth = if token == "" { "" } else { "Authorization: Bearer {token}\r\n" }
+    let raw = "{method} {path} HTTP/1.1\r\nHost: x\r\n{auth}\r\n{body}"
+    let (next, resp) = route(parse_req(raw), w)
+    w = next
+    let status = resp.lines()[0].split(" ")[1]
+    let at = resp.index_of("\r\n\r\n")
+    let out = match at {
+        Some(j) -> resp.substr(j + 4, resp.len() - j - 4)
+        None -> ""
+    }
+    // A token is a secret, so its *length* is reported and its value is not —
+    // the harness compares output across engines and a clock-derived token
+    // differs on every run.
+    let shown = if out.contains("\"token\"") {
+        "\{\"token\": \"<{out.len() - 13} characters>\"\}"
+    } else {
+        out
+    }
+    print("  {label}: {status} {shown}")
+}
+
+fn token_of(resp: str) -> str {
+    let at = resp.index_of("\"token\": \"")
+    match at {
+        None -> ""
+        Some(i) -> {
+            let rest = resp.substr(i + 10, resp.len() - i - 10)
+            match rest.index_of("\"") {
+                None -> ""
+                Some(j) -> rest.substr(0, j)
+            }
+        }
+    }
+}
+
+fn flow_checks() / {io} {
+    print("--- the flow ---")
+    var w = World{ accounts: [], sessions: [], counter: 0 }
+
+    show("register", "POST", "/register", "name=Ada&email=ada@x.org&password=hunter2x", "", w)
+    show("register again", "POST", "/register", "name=Ada&email=ADA@X.ORG&password=hunter2x", "", w)
+    show("short password", "POST", "/register", "name=B&email=b@x.org&password=short", "", w)
+    show("no name", "POST", "/register", "email=c@x.org&password=hunter2x", "", w)
+
+    show("wrong password", "POST", "/login", "email=ada@x.org&password=nope1234", "", w)
+    show("unknown account", "POST", "/login", "email=nobody@x.org&password=hunter2x", "", w)
+
+    // The guarded route, before and after.
+    show("me, no token", "GET", "/me", "", "", w)
+    show("me, junk token", "GET", "/me", "", "0123456789abcdef", w)
+
+    let (after_login, login_resp) = route(
+        parse_req("POST /login HTTP/1.1\r\nHost: x\r\n\r\nemail=ada@x.org&password=hunter2x"), w)
+    w = after_login
+    let token = token_of(login_resp)
+    print("  login: {login_resp.lines()[0].split(" ")[1]}, token is {token.len()} characters")
+
+    show("me, with token", "GET", "/me", "", token, w)
+    show("logout", "POST", "/logout", "", token, w)
+    show("me, after logout", "GET", "/me", "", token, w)
+    show("logout again", "POST", "/logout", "", token, w)
+
+    print("  accounts: {w.accounts.len()}, sessions: {w.sessions.len()}")
+    print("  the stored value is not the password: {w.accounts[0].verifier != "hunter2x"}")
+    print("  and the salt is not either: {w.accounts[0].salt != "hunter2x"}")
+}
+
+fn salt_checks() / {io} {
+    print("--- salts are unique ---")
+    var seen: [str] = []
+    var i = 0
+    while i < 8 {
+        seen.push(make_salt("a@x.org", i))
+        i = i + 1
+    }
+    var unique = true
+    for a in 0..seen.len() {
+        for b in 0..seen.len() {
+            if a != b and seen[a] == seen[b] {
+                unique = false
+            }
+        }
+    }
+    print("  eight salts for one address, all different: {unique}")
+    print("  each is {seen[0].len()} hex characters")
+}
+
+// ---------------------------------------------------------------------------
+// The live half
+// ---------------------------------------------------------------------------
+
+fn serve() / {io, net} {
+    let apath = accounts_path()
+    let spath = sessions_path()
+    let listener = match tcp_listen(PORT) {
+        Err(e) -> {
+            print("cannot listen on {PORT}: {e}")
+            return
+        }
+        Ok(l) -> l
+    }
+    print("http://localhost:{PORT}  (ctrl-c to stop)")
+    print("accounts: {apath}")
+    print("sessions: {spath}")
+    var counter = 0
+    var open: [i64] = []
+    var going = true
+    while going {
+        var waiting: [i64] = [listener]
+        for h in open {
+            waiting.push(h)
+        }
+        let ready = net_wait(waiting, 60000) ?? []
+        for h in ready {
+            if h == listener {
+                match tcp_accept(listener) {
+                    Err(e) -> print("accept failed: {e}")
+                    Ok(conn) -> open.push(conn)
+                }
+            } else {
+                let raw = tcp_read(h) ?? ""
+                if raw != "" {
+                    counter = counter + 1
+                    let w = World{
+                        accounts: load_accounts(apath),
+                        sessions: load_sessions(spath),
+                        counter: counter,
+                    }
+                    let (next, resp) = route(parse_req(raw), w)
+                    save_accounts(apath, next.accounts)
+                    save_sessions(spath, next.sessions)
+                    counter = next.counter
+                    match tcp_write(h, resp) {
+                        Ok(_) -> {}
+                        Err(e) -> {}
+                    }
+                }
+                net_close(h)
+                var still: [i64] = []
+                for k in open {
+                    if k != h { still.push(k) }
+                }
+                open = still
+            }
+        }
+    }
+}
+
+fn main() / {io, net} {
+    if args().len() > 0 and args()[0] == "serve" {
+        serve()
+        return
+    }
+    hash_checks()
+    salt_checks()
+    flow_checks()
+}

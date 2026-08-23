@@ -1144,3 +1144,41 @@ An earlier draft of that page asked the server to render on every keystroke,
 which was honest and worse. It is kept in the history rather than the file,
 because what a project settles for when a tool is missing stops being
 interesting once the tool exists.
+
+## F34 — there is no source of randomness (S3, library) — **open**
+
+Found writing phase 2's project 7, which is authentication: a password hash, a
+session token, and a route that refuses without one.
+
+Grasm has `now_millis()` and nothing else. There is no `random()`, no
+`random_bytes(n)`, and no way to reach the operating system's entropy without
+`extern fn` — which needs `unsafe`, a C library on the link line, and is
+therefore not available to an ordinary program.
+
+The two halves of that project land on opposite sides of it.
+
+**A salt survives.** Its job is *uniqueness* — two accounts must not share one,
+so that a rainbow table cannot be reused and two identical passwords do not have
+identical hashes. A clock, a counter and the address give that, and the project
+checks it: eight salts for one address, all different.
+
+**A session token does not.** A token is exactly a secret that must not be
+guessable, and one derived from the clock is guessable by anyone who knows
+roughly when the session began — a search over a few million millisecond values
+against a live endpoint. The project issues them anyway, says so in its first
+paragraph and again in its README, and is explicitly not something to deploy.
+
+This is not only about authentication. Without randomness a program cannot
+shuffle, cannot pick a nonce, cannot make a UUID, cannot sample, and cannot seed
+its own property tests independently of the harness.
+
+### What would close it
+
+`random_bytes(n) -> bytes`, charged an effect — `io` is the honest one, since it
+reads from the operating system and two calls do not agree. Every platform this
+targets has `getrandom`, `getentropy` or `/dev/urandom`, and the last of those
+is reachable with the file surface that already exists.
+
+`wasm32-unknown-unknown` has none of them, which is a real constraint rather
+than an objection: the wasm engine already refuses `net` and the filesystem, and
+would refuse this the same way.
