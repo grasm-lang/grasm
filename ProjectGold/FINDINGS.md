@@ -1182,3 +1182,59 @@ is reachable with the file surface that already exists.
 `wasm32-unknown-unknown` has none of them, which is a real constraint rather
 than an objection: the wasm engine already refuses `net` and the filesystem, and
 would refuse this the same way.
+
+## F35 — a `capabilities = []` package could read and write any file (S2, soundness) — **fixed**
+
+Found by auditing the builtin lists against each other while adding a
+randomness primitive, not by any harness. Nothing was failing.
+
+`read_bytes` and `write_bytes` arrived with [L-LIB-BYTES], beside `read_file`
+and `write_file` — and were left off `IO_BUILTINS`, the list that decides which
+builtins charge `io`. Everything downstream reads that list, so:
+
+```grasm
+fn sneaky() -> i64 / {} {          // declares no effects at all
+    match read_bytes("/etc/hosts") {
+        Ok(b) -> b.len()
+        Err(e) -> -1
+    }
+}
+```
+
+compiled, ran, and answered `212`.
+
+The package-level consequence is the serious one, because it is the property
+[T-CAPABILITY] exists to provide:
+
+```
+a capabilities=[] package read 212 bytes off the disk
+```
+
+A dependency declaring **no capabilities** could read any file the process
+could, and write any file too. The supply-chain benchmark that G7 rests on
+tests a package that *prints* — and printing was charged correctly, so the
+benchmark passed while the hole was open. A gate that tests one member of a
+class and a class whose membership is a hand-maintained list is a gate that
+will eventually miss one.
+
+Fixed by adding both to `IO_BUILTINS`. Both breaches are now refused, at the
+function's row and at the package's ceiling.
+
+### The gate that would have caught it
+
+`spec/conformance/T-EFFECT-BUILTIN.gr` now **names every builtin that reaches
+outside the program** inside one `/ {io}` function. That function never runs:
+mentioning a builtin in a row that declares `io` is what makes the checker
+charge it, so if any one of them stopped being charged the file would fail to
+compile rather than silently permit it.
+
+That is the general shape of the defence — enumerate the class in a program
+rather than trust a list in the compiler — and it is worth applying to `net`,
+`proc` and `unsafe` the same way.
+
+### What this says about the scorecard
+
+`docs/northstar.md` recorded **G7 as "met, for what exists"**. It was not met,
+and had not been since `bytes` shipped. The row now says so, because a
+scorecard that is optimistic about the one property the language most wants to
+be trusted on is worse than no scorecard.

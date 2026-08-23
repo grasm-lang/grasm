@@ -57,6 +57,15 @@ const IO_BUILTINS: &[&str] = &[
     "remove_file",
     "make_dir",
     "list_dir",
+    // Added late, and missing from this list until then. `read_bytes` and
+    // `write_bytes` arrived with [L-LIB-BYTES] beside `read_file` and
+    // `write_file`, and every other reader of this list was written before they
+    // existed — so a function declaring `/ {}` could read any file on the disk,
+    // and a package declaring `capabilities = []` could too. That is the
+    // property [T-CAPABILITY] exists to provide, so it was not a gap in the
+    // effect system but a hole straight through it (ProjectGold F35).
+    "read_bytes",
+    "write_bytes",
     "input",
     "args",
     "now_millis",

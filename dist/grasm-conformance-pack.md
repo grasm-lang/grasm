@@ -4682,6 +4682,7 @@ fn main() {
 //! tag: T-EFFECT-BUILTIN
 //! expect: output
 //! io and async are built in
+//! every builtin that touches the world is charged io
 fn writes() / {io} {
     print("io and async are built in")
 }
@@ -4692,9 +4693,71 @@ fn concurrent() / {async} {
         }
     }
 }
-fn main() {
+
+// **Every** builtin that reaches outside the program is charged `io`, and the
+// list of them is the thing that has to stay complete.
+//
+// `read_bytes` and `write_bytes` arrived with [L-LIB-BYTES], beside `read_file`
+// and `write_file`, and were left off it. So a function declaring `/ {}` could
+// read any file on the disk, and — because a package's ceiling is computed from
+// the same rows — a package declaring `capabilities = []` could too. That is
+// exactly the property [T-CAPABILITY] exists to provide, so the omission was
+// not a gap in the effect system but a hole straight through it.
+//
+// This function names all of them. It never runs: mentioning a builtin inside a
+// row that declares `io` is what makes the checker charge it, and a build where
+// any one of these stopped being charged would fail to compile rather than
+// silently permitting it.
+fn every_world_touching_builtin(path: str) / {io} {
+    // Answers discarded with `match` rather than held as annotated `! IoError`
+    // values: what matters is that naming them charges `io`, and the native
+    // backend does not yet take `IoError` as a binding's declared type — so the
+    // annotated form would have made this program run on two engines of three.
+    match read_file(path) { Ok(v) -> {}  Err(e) -> {} }
+    match write_file(path, "") { Ok(v) -> {}  Err(e) -> {} }
+    match read_bytes(path) { Ok(v) -> {}  Err(e) -> {} }
+    match write_bytes(path, bytes_of([])) { Ok(v) -> {}  Err(e) -> {} }
+    match remove_file(path) { Ok(v) -> {}  Err(e) -> {} }
+    match make_dir(path) { Ok(v) -> {}  Err(e) -> {} }
+    match list_dir(path) { Ok(v) -> {}  Err(e) -> {} }
+    let _e = file_exists(path)
+    let _i = now_millis()
+    let _j = env(path)
+    let _k = args()
+    eprint("")
+}
+
+/// The same enumeration for `net`. Charged correctly today — checked by hand
+/// when F35 was found — and listed here so that the *next* one added is caught
+/// by a build failure rather than by an audit that happens to be run.
+fn every_net_builtin(host: str, port: i64) / {net} {
+    match tcp_listen(port) { Ok(v) -> {}  Err(e) -> {} }
+    match tcp_connect(host, port) { Ok(v) -> {}  Err(e) -> {} }
+    match tcp_accept(port) { Ok(v) -> {}  Err(e) -> {} }
+    match tcp_read(port) { Ok(v) -> {}  Err(e) -> {} }
+    match tcp_read_bytes(port) { Ok(v) -> {}  Err(e) -> {} }
+    match tcp_write(port, "") { Ok(v) -> {}  Err(e) -> {} }
+    match tcp_write_bytes(port, bytes_of([])) { Ok(v) -> {}  Err(e) -> {} }
+    match net_wait([], 0) { Ok(v) -> {}  Err(e) -> {} }
+    match net_port(port) { Ok(v) -> {}  Err(e) -> {} }
+    match udp_bind(port) { Ok(v) -> {}  Err(e) -> {} }
+    match udp_send(port, host, port, bytes_of([])) { Ok(v) -> {}  Err(e) -> {} }
+    match udp_recv(port) { Ok(v) -> {}  Err(e) -> {} }
+    net_close(port)
+}
+
+/// And for `proc`.
+fn every_proc_builtin(program: str) / {proc} {
+    match proc_run(program, []) { Ok(v) -> {}  Err(e) -> {} }
+    match proc_pipeline([], "") { Ok(v) -> {}  Err(e) -> {} }
+}
+
+fn main() / {io, async} {
     writes()
     concurrent()
+    // Not called — the point is that it *type-checks* as `/ {io}` and would
+    // not if any of those stopped being charged.
+    print("every builtin that touches the world is charged io")
 }
 ```
 

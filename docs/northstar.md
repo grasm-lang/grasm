@@ -25,7 +25,7 @@ the scorecard takes the best of five runs and subtracts the process floor.
 | G4 | Safe-subset guarantees | 100% | 218 programs identical across three engines, 218 leak-free, 27 agreeing on panic messages, 31 whole programs, nine fuzzers clean | **strongest area** |
 | G5 | Hello-world static binary | ≤ 300 KB | 328 KB | **missed by 9%** — and unchanged after a session that added `bytes`, UDP, processes, pipelines, radix conversion and pointer FFI |
 | G6 | Structured, uncolored concurrency | 1M+ tasks/node | `net_wait` gives concurrent I/O on one thread ([L-LIB-NET]); `par_map`/`par_filter` are multi-core over **boxed** values too — 3.68× on 8 cores over strings — but still refuse every effect, and `spawn` is still single-core ([E-NOT-PARALLEL]) | **partly met** |
-| G7 | Capability-sandboxed dependencies | 100% | the supply-chain benchmark's tamper is refused as `performs [io] permits []` | **met, for what exists** |
+| G7 | Capability-sandboxed dependencies | 100% | the supply-chain benchmark's tamper is refused as `performs [io] permits []`; **and it was not met between `bytes` shipping and 2026-08-24** — `read_bytes`/`write_bytes` were left off the list that charges `io`, so a `capabilities = []` package could read and write any file (F35) | **met now, and the claim was wrong before** |
 | G8 | Production failure → deterministic replay | ≥ 99% | — | **not built** |
 | G9 | C ABI import overhead | zero-cost | `extern fn` takes `i64`, `f64`, `str` and `bytes` ([T-EXTERN-POINTER]), gated by `unsafe` and charged `io`; a pointer may not be *returned* | **met** |
 | G10 | Adoption | ≥ 500 companies | zero — nobody outside this repository has run a Grasm program | **not started** |
