@@ -56,8 +56,9 @@ half needs Grasm rather than JavaScript.
 
 `6` and `13` were listed here because holding a connection open while serving
 others was impossible. `net_wait` made it possible, so **server-sent events are
-writable** and neither has to degrade to polling. `6` is written — project 40,
-two watchers held open while three edits are pushed to both.
+writable** and neither has to degrade to polling. Both are written — project 40, two
+watchers held open while three edits are pushed to both, and project 42, which
+coalesces twelve events into three pushes.
 
 ### Written so far
 
@@ -73,6 +74,7 @@ two watchers held open while three edits are pushed to both.
 | 9 | 39-chat-router | was blocked; `net_wait` unblocked it |
 | 6 | 40-collaborative-todo | was "degraded to polling"; it is not |
 | 12 | 41-spa-router | one matcher, browser and server |
+| 13 | 42-realtime-analytics | was "degraded to batched POSTs"; it coalesces instead |
 
 ### Blocked (1, was 3)
 

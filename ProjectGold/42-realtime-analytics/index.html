@@ -1,0 +1,101 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Analytics — coalesced, not streamed</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.55 system-ui, sans-serif; max-width: 36rem;
+         margin: 3rem auto; padding: 0 1.25rem; }
+  h1 { font-size: 1.05rem; font-weight: 600; margin: 0 0 0.25rem; }
+  .note { opacity: 0.7; font-size: 0.82rem; margin: 0 0 1.5rem; }
+  .total { font-size: 2.6rem; font-variant-numeric: tabular-nums; line-height: 1.1;
+           margin: 0.5rem 0 1.5rem; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th { text-align: left; font-weight: 600; font-size: 0.78rem; opacity: 0.65;
+       text-transform: uppercase; letter-spacing: 0.04em; padding-bottom: 0.4rem; }
+  td { padding: 0.35rem 0; border-top: 1px solid color-mix(in srgb, currentColor 12%, transparent); }
+  td.n, th.n { text-align: right; }
+  .bar { height: 0.35rem; border-radius: 2px; background: currentColor; opacity: 0.3; }
+  .row { display: flex; gap: 0.5rem; margin: 1.75rem 0 0; }
+  input, button { font: inherit; padding: 0.3rem 0.6rem; border-radius: 6px;
+                  border: 1px solid currentColor; background: transparent; color: inherit; }
+  button { cursor: pointer; }
+  #state { font-size: 0.78rem; opacity: 0.65; margin-top: 1rem; }
+  code { font-family: ui-monospace, monospace; font-size: 0.85em; }
+</style>
+
+<h1>Analytics</h1>
+<p class="note">
+  The server aggregates every event and pushes at most once per batch, so this
+  page sees <em>counts</em> and not <em>events</em>. Sending on every event
+  would be a write per dashboard per event to render a number a person reads
+  twice.
+</p>
+
+<div class="total" id="total">—</div>
+<table>
+  <thead><tr><th>event</th><th class="n">count</th><th class="n">total</th><th class="n">mean</th><th style="width:6rem"></th></tr></thead>
+  <tbody id="rows"></tbody>
+</table>
+
+<div class="row">
+  <input id="name" value="page.view" aria-label="event name">
+  <input id="value" value="1" style="flex:0 0 5rem" aria-label="value">
+  <button id="send">Collect</button>
+  <button id="burst">Send 10</button>
+</div>
+<p id="state">connecting…</p>
+
+<script>
+  const API = "http://localhost:8983";
+  const rows = document.getElementById("rows");
+  const total = document.getElementById("total");
+  const state = document.getElementById("state");
+  let pushes = 0, sent = 0;
+
+  function render(s) {
+    total.textContent = s.events.toLocaleString();
+    const max = Math.max(1, ...s.counters.map(c => c.count));
+    rows.replaceChildren(...s.counters.map(c => {
+      const tr = document.createElement("tr");
+      for (const [v, cls] of [[c.name, ""], [c.count, "n"], [c.total, "n"], [c.mean, "n"]]) {
+        const td = document.createElement("td");
+        td.className = cls;
+        td.textContent = v;
+        tr.append(td);
+      }
+      const td = document.createElement("td");
+      const bar = document.createElement("div");
+      bar.className = "bar";
+      bar.style.width = `${(c.count / max) * 100}%`;
+      td.append(bar);
+      tr.append(td);
+      return tr;
+    }));
+    pushes++;
+    state.textContent = `${sent} sent from this tab · ${pushes} push(es) received`;
+  }
+
+  function collect(name, value) {
+    sent++;
+    fetch(`${API}/collect`, {
+      method: "POST",
+      body: `name=${encodeURIComponent(name)}&value=${encodeURIComponent(value)}`,
+    }).catch(() => { state.textContent = "collect failed"; });
+  }
+
+  document.getElementById("send").addEventListener("click", () =>
+    collect(document.getElementById("name").value, document.getElementById("value").value));
+
+  // The point, made visible: ten events, far fewer than ten pushes.
+  document.getElementById("burst").addEventListener("click", () => {
+    const n = document.getElementById("name").value;
+    const v = document.getElementById("value").value;
+    for (let i = 0; i < 10; i++) collect(n, v);
+  });
+
+  const stream = new EventSource(`${API}/live`);
+  stream.addEventListener("stats", e => render(JSON.parse(e.data)));
+  stream.addEventListener("error", () => {
+    state.textContent = "no server: run `grasm run main.gr -- serve`";
+  });
+</script>

@@ -39,3 +39,4 @@
 39-chat-router/main.gr 3085
 40-collaborative-todo/main.gr 4144
 41-spa-router/main.gr 2047
+42-realtime-analytics/main.gr 3720

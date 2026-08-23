@@ -1,0 +1,9 @@
+[package]
+name = "realtime_analytics"
+version = "1.0.0"
+entry = "main.gr"
+capabilities = ["io", "net"]
+
+[dependencies.lib_json]
+path = "../lib-json"
+version = "^1.0.0"

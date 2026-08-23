@@ -1,0 +1,581 @@
+// Phase 2, project 13 — Real-Time Analytics.
+//
+// The plan put this under "writable but degraded": *"high-frequency streaming,
+// one blocking connection at a time. Degrades to batched POSTs."*
+//
+// It does not degrade. `net_wait` holds the dashboards open while the
+// collectors keep arriving, and the interesting engineering is not that — it is
+// what a dashboard should be sent.
+//
+// **Pushing on every event is the wrong answer.** A thousand events a second
+// times four dashboards is four thousand writes a second to render a number a
+// person reads twice. This coalesces: it aggregates every event and pushes at
+// most once per batch, so the dashboards see every *count* and not every
+// *event*. Fewer pushes than events, and the totals are still exact — which is
+// the property that makes coalescing safe and the reason the harness checks it.
+//
+// ```
+// grasm run main.gr              # the comparison the harness makes
+// grasm run main.gr -- serve     # then serve index.html over http
+// ```
+
+import lib_json
+
+let PORT = 8983
+// Push after this many events, or when the collectors go quiet. Small enough
+// that a demonstration shows several pushes; a real deployment would use a
+// clock as well, which this cannot do deterministically.
+let BATCH = 4
+
+// ---------------------------------------------------------------------------
+// The aggregate
+// ---------------------------------------------------------------------------
+
+type Counter = { name: str, count: i64, total: i64 }
+
+type Stats = {
+    counters: [Counter],
+    events: i64,
+    /// Events the server took but has not yet told anyone about.
+    pending: i64,
+}
+
+fn empty_stats() -> Stats {
+    Stats{ counters: [], events: 0, pending: 0 }
+}
+
+fn index_of(s: Stats, name: str) -> i64 {
+    for i in 0..s.counters.len() {
+        if s.counters[i].name == name {
+            return i
+        }
+    }
+    -1
+}
+
+/// One event folded in.
+///
+/// The aggregate is what is kept; the event is not. That is the whole
+/// difference between an analytics server and a log: a log grows with traffic
+/// and this does not.
+fn observe(s: Stats, name: str, value: i64) -> Stats {
+    var next = s
+    let at = index_of(next, name)
+    if at < 0 {
+        next.counters.push(Counter{ name: name, count: 1, total: value })
+    } else {
+        next.counters[at].count = next.counters[at].count + 1
+        next.counters[at].total = next.counters[at].total + value
+    }
+    next.events = next.events + 1
+    next.pending = next.pending + 1
+    next
+}
+
+/// Counters in a fixed order, so two servers that saw the same events in
+/// different orders report the same thing. Without this the output depends on
+/// which name happened to arrive first, which is not a fact anyone wants.
+fn sorted_names(s: Stats) -> [str] {
+    var names: [str] = []
+    for c in s.counters {
+        names.push(c.name)
+    }
+    names.sort()
+    names
+}
+
+fn quoted(x: str) -> str {
+    "\"" + lib_json.escape_json(x) + "\""
+}
+
+fn stats_json(s: Stats) -> str {
+    var parts: [str] = []
+    for name in sorted_names(s) {
+        let at = index_of(s, name)
+        let c = s.counters[at]
+        // Integer mean, rounded down. A float would be more precise and less
+        // comparable — a dashboard that shows 12.666666666666666 has told the
+        // reader nothing the integer did not.
+        let mean = if c.count == 0 { 0 } else { c.total / c.count }
+        parts.push("\{\"name\": {quoted(c.name)}, \"count\": {c.count}, \"total\": {c.total}, \"mean\": {mean}\}")
+    }
+    "\{\"events\": {s.events}, \"counters\": [{parts.join(", ")}]\}"
+}
+
+// ---------------------------------------------------------------------------
+// Requests
+// ---------------------------------------------------------------------------
+
+type Req = { method: str, path: str, body: str }
+
+fn parse_req(raw: str) -> Req {
+    let head_end = raw.index_of("\r\n\r\n")
+    let head = match head_end {
+        Some(i) -> raw.substr(0, i)
+        None -> raw
+    }
+    let body = match head_end {
+        Some(i) -> raw.substr(i + 4, raw.len() - i - 4)
+        None -> ""
+    }
+    let lines = head.lines()
+    if lines.len() == 0 {
+        return Req{ method: "", path: "empty request", body: "" }
+    }
+    let parts = lines[0].split(" ")
+    if parts.len() != 3 or not parts[1].starts_with("/") {
+        return Req{ method: "", path: "malformed request line", body: "" }
+    }
+    Req{ method: parts[0], path: parts[1], body: body }
+}
+
+fn field(body: str, want: str) -> str {
+    for pair in body.split("&") {
+        match pair.index_of("=") {
+            None -> {}
+            Some(i) -> {
+                if pair.substr(0, i) == want {
+                    let raw = pair.substr(i + 1, pair.len() - i - 1)
+                    var out = ""
+                    for c in raw.codes() {
+                        if c == 43 { out += " " } else { out += c.to_char() }
+                    }
+                    return out
+                }
+            }
+        }
+    }
+    ""
+}
+
+/// An event name that cannot break the dashboard or the wire format.
+///
+/// Names come from whatever is instrumented, which in practice means from a
+/// URL or a user action, which means from an attacker. A name is a label, so it
+/// gets label characters and nothing else.
+fn clean_name(raw: str) -> str {
+    var out = ""
+    for c in raw.codes() {
+        let ok = (c >= 97 and c <= 122) or (c >= 65 and c <= 90) or
+            (c >= 48 and c <= 57) or c == 46 or c == 45 or c == 95
+        if ok {
+            out += c.to_char()
+        }
+    }
+    if out == "" {
+        "unnamed"
+    } else if out.len() > 40 {
+        out.substr(0, 40)
+    } else {
+        out
+    }
+}
+
+fn text_response(status: str, content_type: str, body: str) -> str {
+    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {body.byte_len()}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{body}"
+}
+
+fn sse_head() -> str {
+    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n"
+}
+
+fn stats_event(s: Stats) -> str {
+    var flat = ""
+    for c in stats_json(s).codes() {
+        if c == 10 or c == 13 { flat += " " } else { flat += c.to_char() }
+    }
+    "event: stats\ndata: {flat}\n\n"
+}
+
+type Action =
+    | Reply(text: str)
+    | Watch(head: str, hello: str)
+    | Collect(next: Stats, reply: str)
+
+fn decide(r: Req, s: Stats) -> Action {
+    if r.method == "" {
+        return Reply(text_response("400 Bad Request", "text/plain", "bad request: {r.path}\n"))
+    }
+    if r.path == "/" and r.method == "GET" {
+        var rows = ""
+        for name in sorted_names(s) {
+            let c = s.counters[index_of(s, name)]
+            rows += "<tr><td>{c.name}</td><td>{c.count}</td><td>{c.total}</td></tr>"
+        }
+        return Reply(text_response("200 OK", "text/html",
+            "<!doctype html><meta charset=\"utf-8\"><title>Analytics</title><h1>Analytics</h1><p>{s.events} event(s)</p><table>{rows}</table>"))
+    }
+    if r.path == "/stats" and r.method == "GET" {
+        return Reply(text_response("200 OK", "application/json", stats_json(s)))
+    }
+    if r.path == "/live" and r.method == "GET" {
+        return Watch(sse_head(), stats_event(s))
+    }
+    if r.path == "/collect" and r.method == "POST" {
+        let name = clean_name(field(r.body, "name"))
+        let value = field(r.body, "value").parse_int() ?? 1
+        let next = observe(s, name, value)
+        // 202, not 200: the event has been taken, and what a dashboard makes of
+        // it happens later. Saying 200 would promise it had already been shown.
+        return Collect(next, text_response("202 Accepted", "application/json",
+            "\{\"taken\": {quoted(name)}\}"))
+    }
+    Reply(text_response("404 Not Found", "text/plain", "no route for {r.method} {r.path}\n"))
+}
+
+// ---------------------------------------------------------------------------
+// The checks the harness compares across three engines
+// ---------------------------------------------------------------------------
+
+fn aggregate_checks() / {io} {
+    print("--- folding events in ---")
+    var s = empty_stats()
+    print("  empty: {stats_json(s)}")
+    s = observe(s, "page.view", 1)
+    s = observe(s, "page.view", 1)
+    s = observe(s, "api.latency", 120)
+    s = observe(s, "api.latency", 80)
+    s = observe(s, "api.latency", 40)
+    print("  after five: {stats_json(s)}")
+    print("  pending: {s.pending}")
+
+    print("--- order does not matter ---")
+    // Counts and totals commute, which is what makes coalescing safe: a
+    // dashboard that missed the middle of a batch still ends up correct.
+    var a = empty_stats()
+    a = observe(a, "x", 3)
+    a = observe(a, "y", 5)
+    a = observe(a, "x", 7)
+    var b = empty_stats()
+    b = observe(b, "x", 7)
+    b = observe(b, "x", 3)
+    b = observe(b, "y", 5)
+    print("  same events, two orders, same json: {stats_json(a) == stats_json(b)}")
+
+    print("--- names are labels ---")
+    for n in ["page.view", "api-latency_2", "Ünicode", "a/../b", "<script>", "", "with space"] {
+        print("  \"{n}\" -> \"{clean_name(n)}\"")
+    }
+    let long = "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz"
+    print("  51 characters -> {clean_name(long).len()}")
+
+    print("--- the mean is an integer ---")
+    var m = empty_stats()
+    m = observe(m, "t", 10)
+    m = observe(m, "t", 11)
+    m = observe(m, "t", 17)
+    print("  10, 11, 17 -> {stats_json(m)}")
+}
+
+fn show(label: str, method: str, path: str, body: str, s: Stats) / {io} {
+    let raw = "{method} {path} HTTP/1.1\r\nHost: x\r\n\r\n{body}"
+    let d = match decide(parse_req(raw), s) {
+        Reply(t) -> "reply {t.lines()[0].split(" ")[1]}"
+        Watch(head, hello) -> "watch"
+        Collect(next, reply) -> "collect, {next.events} event(s) total"
+    }
+    print("  {label}: {d}")
+}
+
+fn routing_checks() / {io} {
+    print("--- routing ---")
+    var s = empty_stats()
+    s = observe(s, "page.view", 1)
+    show("collect", "POST", "/collect", "name=page.view&value=1", s)
+    show("collect, no value", "POST", "/collect", "name=click", s)
+    show("collect, no name", "POST", "/collect", "value=9", s)
+    show("stats", "GET", "/stats", "", s)
+    show("live", "GET", "/live", "", s)
+    show("dashboard", "GET", "/", "", s)
+    show("nowhere", "GET", "/nowhere", "", s)
+    show("collect by GET", "GET", "/collect", "", s)
+
+    print("--- an event is one event ---")
+    let ev = stats_event(s)
+    print("  {ev.lines().len() - 1} line(s), ends blank: {ev.ends_with("\n\n")}")
+}
+
+// ---------------------------------------------------------------------------
+// Many collectors, two dashboards, one thread
+// ---------------------------------------------------------------------------
+
+/// Twelve events from twelve collectors, two dashboards watching.
+///
+/// The dashboards are held open the whole time. Events are folded in as they
+/// arrive and a push happens only when `BATCH` of them have accumulated, so the
+/// dashboards see far fewer messages than there were events — and the totals
+/// they end on are exactly right, because counts commute.
+fn exchange() / {io, net} {
+    let listener = match tcp_listen(0) {
+        Err(e) -> {
+            print("  cannot listen: {e}")
+            return
+        }
+        Ok(l) -> l
+    }
+    let port = net_port(listener) ?? 0
+
+    var dashboards: [i64] = []
+    for i in 0..2 {
+        match tcp_connect("127.0.0.1", port) {
+            Err(e) -> print("  dial failed: {e}")
+            Ok(c) -> match tcp_write(c, "GET /live HTTP/1.1\r\nHost: x\r\n\r\n") {
+                Ok(_) -> dashboards.push(c)
+                Err(e) -> {}
+            }
+        }
+    }
+
+    var stats = empty_stats()
+    var held: [i64] = []
+    var served: [i64] = []
+    var turns = 0
+    while held.len() < dashboards.len() and turns < 200 {
+        var waiting: [i64] = [listener]
+        for h in served {
+            var is_held = false
+            for k in held { if k == h { is_held = true } }
+            if not is_held { waiting.push(h) }
+        }
+        let ready = net_wait(waiting, 1000) ?? []
+        if ready.len() == 0 { turns = 200 }
+        for h in ready {
+            if h == listener {
+                match tcp_accept(listener) {
+                    Err(e) -> {}
+                    Ok(conn) -> served.push(conn)
+                }
+            } else {
+                let raw = tcp_read(h) ?? ""
+                if raw != "" {
+                    match decide(parse_req(raw), stats) {
+                        Watch(head, hello) -> {
+                            match tcp_write(h, head + hello) {
+                                Ok(_) -> held.push(h)
+                                Err(e) -> {}
+                            }
+                        }
+                        Reply(t) -> { match tcp_write(h, t) { Ok(_) -> {}  Err(e) -> {} } }
+                        Collect(next, reply) -> {}
+                    }
+                }
+            }
+        }
+        turns = turns + 1
+    }
+    print("  {held.len()} dashboards watching")
+
+    let events = [
+        "name=page.view&value=1", "name=page.view&value=1", "name=api.latency&value=120",
+        "name=page.view&value=1", "name=api.latency&value=80", "name=click&value=1",
+        "name=api.latency&value=40", "name=page.view&value=1", "name=click&value=1",
+        "name=api.latency&value=160", "name=page.view&value=1", "name=click&value=1",
+    ]
+    var collectors: [i64] = []
+    for body in events {
+        match tcp_connect("127.0.0.1", port) {
+            Err(e) -> print("  dial failed: {e}")
+            Ok(c) -> {
+                let req = "POST /collect HTTP/1.1\r\nHost: x\r\nContent-Length: {body.byte_len()}\r\n\r\n{body}"
+                match tcp_write(c, req) {
+                    Ok(_) -> collectors.push(c)
+                    Err(e) -> {}
+                }
+            }
+        }
+    }
+    print("  {collectors.len()} collectors sent")
+
+    var taken = 0
+    var pushes = 0
+    turns = 0
+    while taken < collectors.len() and turns < 600 {
+        var waiting: [i64] = [listener]
+        for h in served {
+            var is_held = false
+            for k in held { if k == h { is_held = true } }
+            if not is_held { waiting.push(h) }
+        }
+        let ready = net_wait(waiting, 1000) ?? []
+        if ready.len() == 0 { turns = 600 }
+        for h in ready {
+            if h == listener {
+                match tcp_accept(listener) {
+                    Err(e) -> {}
+                    Ok(conn) -> served.push(conn)
+                }
+            } else {
+                let raw = tcp_read(h) ?? ""
+                if raw != "" {
+                    match decide(parse_req(raw), stats) {
+                        Collect(next, reply) -> {
+                            stats = next
+                            match tcp_write(h, reply) { Ok(_) -> {}  Err(e) -> {} }
+                            taken = taken + 1
+                            // The coalescing. Nothing is pushed until a batch
+                            // has built up, so the dashboards are told about
+                            // counts rather than about events.
+                            if stats.pending >= BATCH {
+                                stats.pending = 0
+                                let ev = stats_event(stats)
+                                for w in held {
+                                    match tcp_write(w, ev) { Ok(_) -> {}  Err(e) -> {} }
+                                }
+                                pushes = pushes + 1
+                            }
+                        }
+                        Reply(t) -> {
+                            match tcp_write(h, t) { Ok(_) -> {}  Err(e) -> {} }
+                            taken = taken + 1
+                        }
+                        Watch(head, hello) -> {}
+                    }
+                }
+            }
+        }
+        turns = turns + 1
+    }
+    // The collectors have gone quiet, so whatever is left is flushed. Without
+    // this the last partial batch would sit unseen until the next event, which
+    // on a quiet service could be a long time.
+    var flushed = false
+    if stats.pending > 0 {
+        stats.pending = 0
+        let ev = stats_event(stats)
+        for w in held {
+            match tcp_write(w, ev) { Ok(_) -> {}  Err(e) -> {} }
+        }
+        pushes = pushes + 1
+        flushed = true
+    }
+    let tail = if flushed { ", the last one a flush" } else { ", none left to flush" }
+    print("  {taken} event(s) taken, {pushes} push(es) at a batch of {BATCH}{tail}")
+
+    for i in 0..dashboards.len() {
+        var got = ""
+        var reading = true
+        var guard = 0
+        while reading and guard < 60 {
+            let ready = net_wait([dashboards[i]], 200) ?? []
+            if ready.len() == 0 {
+                reading = false
+            } else {
+                let chunk = tcp_read(dashboards[i]) ?? ""
+                if chunk == "" { reading = false } else { got += chunk }
+            }
+            guard = guard + 1
+        }
+        var lines: [str] = []
+        for line in got.lines() {
+            if line.starts_with("data: ") {
+                lines.push(line)
+            }
+        }
+        print("  dashboard {i}: {lines.len()} message(s) for {taken} events")
+        print("    last: {lines[lines.len() - 1]}")
+    }
+    print("  server total: {stats_json(stats)}")
+
+    for h in served { net_close(h) }
+    for h in dashboards { net_close(h) }
+    for h in collectors { net_close(h) }
+    net_close(listener)
+}
+
+fn serve() / {io, net} {
+    let listener = match tcp_listen(PORT) {
+        Err(e) -> {
+            print("cannot listen on {PORT}: {e}")
+            return
+        }
+        Ok(l) -> l
+    }
+    print("http://localhost:{PORT}  (ctrl-c to stop)")
+    print("POST /collect with name= and value=; GET /live for the stream")
+    var stats = empty_stats()
+    var held: [i64] = []
+    var open: [i64] = []
+    var going = true
+    while going {
+        var waiting: [i64] = [listener]
+        for h in open {
+            var is_held = false
+            for k in held { if k == h { is_held = true } }
+            if not is_held { waiting.push(h) }
+        }
+        // A short wait so a quiet service still flushes its last partial batch
+        // rather than holding it until the next event.
+        let ready = net_wait(waiting, 500) ?? []
+        if ready.len() == 0 and stats.pending > 0 {
+            stats.pending = 0
+            let ev = stats_event(stats)
+            for w in held {
+                match tcp_write(w, ev) { Ok(_) -> {}  Err(e) -> {} }
+            }
+        }
+        for h in ready {
+            if h == listener {
+                match tcp_accept(listener) {
+                    Err(e) -> print("accept failed: {e}")
+                    Ok(conn) -> open.push(conn)
+                }
+            } else {
+                let raw = tcp_read(h) ?? ""
+                if raw == "" {
+                    var kept: [i64] = []
+                    for k in held { if k != h { kept.push(k) } }
+                    held = kept
+                    net_close(h)
+                    var still: [i64] = []
+                    for k in open { if k != h { still.push(k) } }
+                    open = still
+                } else {
+                    match decide(parse_req(raw), stats) {
+                        Watch(head, hello) -> {
+                            match tcp_write(h, head + hello) {
+                                Ok(_) -> {
+                                    held.push(h)
+                                    print("  + dashboard ({held.len()} watching)")
+                                }
+                                Err(e) -> {}
+                            }
+                        }
+                        Collect(next, reply) -> {
+                            stats = next
+                            match tcp_write(h, reply) { Ok(_) -> {}  Err(e) -> {} }
+                            if stats.pending >= BATCH {
+                                stats.pending = 0
+                                let ev = stats_event(stats)
+                                for w in held {
+                                    match tcp_write(w, ev) { Ok(_) -> {}  Err(e) -> {} }
+                                }
+                            }
+                            net_close(h)
+                            var still: [i64] = []
+                            for k in open { if k != h { still.push(k) } }
+                            open = still
+                        }
+                        Reply(t) -> {
+                            match tcp_write(h, t) { Ok(_) -> {}  Err(e) -> {} }
+                            net_close(h)
+                            var still: [i64] = []
+                            for k in open { if k != h { still.push(k) } }
+                            open = still
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn main() / {io, net} {
+    if args().len() > 0 and args()[0] == "serve" {
+        serve()
+        return
+    }
+    aggregate_checks()
+    routing_checks()
+    print("--- twelve events, two dashboards ---")
+    exchange()
+}
