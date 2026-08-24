@@ -12,7 +12,8 @@ once.
 
 A mismatch prints the seed and the whole program; the same seed reproduces it.
 """
-import os, random, subprocess, sys, tempfile
+import os
+import sys, random, subprocess, sys, tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Overridable, like the shell gates: a debug build keeps Cranelift's own
@@ -96,6 +97,10 @@ def main():
     d = tempfile.mkdtemp(prefix="merge_fuzz_")
     src, out = os.path.join(d, "p.gr"), os.path.join(d, "p")
     checked = mism = rejected = 0
+    # Programs the backend refused. They were skipped by `continue` and counted
+    # nowhere, so a change that made `--native` decline half the corpus looked
+    # exactly like a clean run.
+    declined = 0
     for s in range(base, base + count):
         open(src, "w").write(gen(s))
         _, rc = run([G, "check", src])
@@ -104,6 +109,7 @@ def main():
             continue
         _, rc = run([G, "build", src, "--native", "-o", out])
         if rc != 0:
+            declined += 1
             continue
         a, ra = run([G, "run", src])
         b, rb = run([out])
@@ -116,6 +122,15 @@ def main():
                 break
         if checked % 50 == 0:
             print(f"  {checked} compared, {mism} mismatched, {rejected} rejected", flush=True)
-    print(f"compared: {checked}   mismatched: {mism}   rejected: {rejected}")
+    print(
+        f"compared: {checked}   mismatched: {mism}   "
+        f"rejected: {rejected}   declined: {declined}"
+    )
+    # This printed MISMATCH and exited 0. Every other generator here ends with
+    # `sys.exit(1 if ... else 0)`; this one ended with the print, so a run that
+    # found a disagreement reported success — the finding was on stdout and
+    # nothing acted on it.
+    sys.exit(1 if mism else 0)
+
 
 main()

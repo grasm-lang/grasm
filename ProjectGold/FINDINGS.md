@@ -1555,3 +1555,46 @@ The second point is the general one: **a coverage count that derives both of its
 numbers from the same assumption cannot detect a broken assumption.** The first
 version counted `expect_(compiled|refused)`, which is the set of things that
 work by construction.
+
+## F41 — a generator that printed MISMATCH and exited 0 (S1, gate) — **fixed**
+
+`scripts/fuzz_fallible.py` ends by printing its tally. Every other generator
+here ends with `sys.exit(1 if ... else 0)`; this one ended with the print. A run
+that found a disagreement between the interpreter and `--native` printed the
+program, the two outputs and the seed — and exited 0.
+
+It is listed in `CONTRIBUTING.md` among the checks to run before a change. A
+person reading exit status, or any loop running these in sequence, would have
+been told the run was clean.
+
+Found by auditing the generators after F40, on the theory that the verification
+layer was where the risk was rather than the language. That was three for three
+in one day: F36 (a gate reading an artefact it did not build), F40 (a gate
+reporting cases it did not run), F41 (a gate finding a defect and reporting
+success).
+
+### And a second hole in the same file
+
+A program the native backend refused was skipped by a bare `continue` and
+counted nowhere — neither compared nor rejected. A change that made `--native`
+decline every generated program would have produced `compared: 0   mismatched:
+0` and looked like a clean run.
+
+Every generator now reports **declined**, and the number is not small:
+
+```
+fuzz_handlers: programs: 20   mismatched: 0   rejected: 0   declined: 9
+```
+
+Nine of twenty generated handler programs cannot be compiled natively. Those are
+the four handler shapes still on the gap list — a handler returned, stored in a
+struct, taken from a list, or printed — and the generator has been walking past
+them silently. It is the first measurement of how much of that surface is
+missing rather than a count of the shapes, and it is a better argument for
+finishing them than the list was.
+
+### Mutation-tested
+
+Forcing the comparison to fail gives exit 1; restoring it gives exit 0. The
+check that a gate can fail is the one thing that cannot be taken on faith, and
+not doing it is how F40 survived a day.

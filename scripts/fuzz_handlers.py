@@ -208,7 +208,11 @@ def check_one(src, work):
     rc, _, err = run([GRASM, "build", path, "--native", "-o", native])
     if rc != 0:
         if "does not yet support" in err:
-            return None
+            # Counted, not swallowed. An unlabelled `None` here is
+            # indistinguishable from a program that agreed on every engine, so a
+            # change that made `--native` decline the whole corpus would read as
+            # a clean run.
+            return ("declined", err.strip())
         return ("native build failed", err.strip())
     nr, no, ne = run([native])
     os.remove(native)
@@ -228,7 +232,7 @@ def main():
     args = ap.parse_args()
 
     base = args.seed if args.seed is not None else random.randrange(1 << 30)
-    failures, rejected = [], []
+    failures, rejected, declined = [], [], []
     work = tempfile.mkdtemp(prefix="grasm_fuzz_handlers_")
     try:
         for i in range(args.count):
@@ -238,7 +242,9 @@ def main():
             if verdict is None:
                 continue
             kind, detail = verdict
-            if kind == "rejected":
+            if kind == "declined":
+                declined.append(detail)
+            elif kind == "rejected":
                 rejected.append((seed, detail, src))
             else:
                 failures.append((seed, kind, detail))
@@ -251,7 +257,7 @@ def main():
             print(f"REJECTED seed={seed}: {first}\n--- source ---\n{src}")
         print(
             f"programs: {args.count}   mismatched: {len(failures)}   "
-            f"rejected: {len(rejected)}"
+            f"rejected: {len(rejected)}   declined: {len(declined)}"
         )
     finally:
         if not args.keep:
