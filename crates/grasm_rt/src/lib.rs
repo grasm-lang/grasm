@@ -10,6 +10,8 @@
 #![allow(clippy::missing_safety_doc)]
 
 use std::io::Write;
+
+pub mod replay;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 
@@ -5245,14 +5247,26 @@ pub unsafe extern "C" fn grasm_random_bytes(count: *mut RtVal) -> *mut RtVal {
             format!("random_bytes is capped at 1048576 bytes, asked for {n}"),
         ));
     }
+    // Entropy is the one thing a replay must reproduce exactly and can never
+    // obtain again: two runs disagree by construction.
+    if let Some(o) = replay::next("random_bytes") {
+        return match o {
+            replay::Outcome::Value(v) => ok_of(alloc(RtPayload::Bytes(std::sync::Arc::new(v)))),
+            replay::Outcome::Failed(m) => err_of(io_err("IoFailed", m)),
+        };
+    }
     let mut buf = vec![0u8; n as usize];
     if n == 0 {
+        replay::record("random_bytes", &replay::Outcome::Value(Vec::new()));
         return ok_of(alloc(RtPayload::Bytes(std::sync::Arc::new(buf))));
     }
     match std::fs::File::open("/dev/urandom") {
         Err(e) => err_of(io_err("IoFailed", format!("cannot open /dev/urandom: {e}"))),
         Ok(mut f) => match f.read_exact(&mut buf) {
-            Ok(()) => ok_of(alloc(RtPayload::Bytes(std::sync::Arc::new(buf)))),
+            Ok(()) => {
+                replay::record("random_bytes", &replay::Outcome::Value(buf.clone()));
+                ok_of(alloc(RtPayload::Bytes(std::sync::Arc::new(buf))))
+            }
             Err(e) => err_of(io_err("IoFailed", format!("short read: {e}"))),
         },
     }
@@ -5699,11 +5713,32 @@ pub unsafe extern "C" fn grasm_net_close(handle: *mut RtVal) {
 #[no_mangle]
 pub unsafe extern "C" fn grasm_read_file(path: *mut RtVal) -> *mut RtVal {
     let p = as_str(path).to_string();
-    match std::fs::read_to_string(&p) {
-        Ok(s) => ok_of(alloc(RtPayload::Str(RtStr::new(s)))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => err_of(io_err("NotFound", p)),
-        Err(e) => err_of(io_err("IoFailed", e.to_string())),
+    // Replay hands back what the recorded run read, without touching the disk:
+    // the file may be gone, or different, or on another machine entirely, and
+    // reproducing the failure must not depend on any of that.
+    if let Some(o) = replay::next("read_file") {
+        return match o {
+            replay::Outcome::Value(v) => ok_of(alloc(RtPayload::Str(RtStr::new(
+                String::from_utf8_lossy(&v).into_owned(),
+            )))),
+            replay::Outcome::Failed(m) => err_of(io_err("IoFailed", m)),
+        };
     }
+    let out = match std::fs::read_to_string(&p) {
+        Ok(s) => {
+            replay::record("read_file", &replay::Outcome::Value(s.as_bytes().to_vec()));
+            ok_of(alloc(RtPayload::Str(RtStr::new(s))))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            replay::record("read_file", &replay::Outcome::Failed(p.clone()));
+            err_of(io_err("NotFound", p))
+        }
+        Err(e) => {
+            replay::record("read_file", &replay::Outcome::Failed(e.to_string()));
+            err_of(io_err("IoFailed", e.to_string()))
+        }
+    };
+    out
 }
 
 #[no_mangle]
@@ -5936,19 +5971,44 @@ pub unsafe extern "C" fn grasm_list_set(v: *mut RtVal, i: i64, val: *mut RtVal) 
 
 #[no_mangle]
 pub extern "C" fn grasm_now_millis() -> i64 {
-    std::time::SystemTime::now()
+    // The clock is the clearest case for this: a program that behaves
+    // differently at midnight cannot be debugged without one that says what
+    // time it was.
+    if let Some(replay::Outcome::Value(v)) = replay::next("now_millis") {
+        return replay::bytes_i64(&v);
+    }
+    let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+        .unwrap_or(0);
+    replay::record(
+        "now_millis",
+        &replay::Outcome::Value(replay::i64_bytes(now)),
+    );
+    now
 }
 
 /// Returns `Option[str]` for an environment variable.
 /// # Safety: live runtime pointer.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_env(name: *mut RtVal) -> *mut RtVal {
+    if let Some(o) = replay::next("env") {
+        return match o {
+            replay::Outcome::Value(v) => some_of(alloc(RtPayload::Str(RtStr::new(
+                String::from_utf8_lossy(&v).into_owned(),
+            )))),
+            replay::Outcome::Failed(_) => none_val(),
+        };
+    }
     match std::env::var(as_str(name)) {
-        Ok(v) => some_of(alloc(RtPayload::Str(RtStr::new(v)))),
-        Err(_) => none_val(),
+        Ok(v) => {
+            replay::record("env", &replay::Outcome::Value(v.as_bytes().to_vec()));
+            some_of(alloc(RtPayload::Str(RtStr::new(v))))
+        }
+        Err(_) => {
+            replay::record("env", &replay::Outcome::Failed(String::new()));
+            none_val()
+        }
     }
 }
 

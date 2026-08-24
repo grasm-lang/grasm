@@ -26,7 +26,7 @@ the scorecard takes the best of five runs and subtracts the process floor.
 | G5 | Hello-world static binary | ≤ 300 KB | 328 KB | **missed by 9%** — and unchanged after a session that added `bytes`, UDP, processes, pipelines, radix conversion and pointer FFI |
 | G6 | Structured, uncolored concurrency | 1M+ tasks/node | `net_wait` gives concurrent I/O on one thread ([L-LIB-NET]); `par_map`/`par_filter` are multi-core over **boxed** values too — 3.68× on 8 cores over strings — but still refuse every effect, and `spawn` is still single-core ([E-NOT-PARALLEL]) | **partly met** |
 | G7 | Capability-sandboxed dependencies | 100% | the supply-chain benchmark's tamper is refused as `performs [io] permits []`; **and it was not met between `bytes` shipping and 2026-08-24** — `read_bytes`/`write_bytes` were left off the list that charges `io`, so a `capabilities = []` package could read and write any file (F35) | **met now, and the claim was wrong before** |
-| G8 | Production failure → deterministic replay | ≥ 99% | — | **not built** |
+| G8 | Production failure → deterministic replay | ≥ 99% | **first slice built** — `GRASM_RECORD` writes a journal of everything a run read from outside itself, `GRASM_REPLAY` hands it back. A run reading the clock, entropy and the environment reproduces exactly from 86 bytes; divergence stops the run rather than guessing. Covers `now_millis`, `env`, `read_file`, `random_bytes` on the compiled engines — not yet the network, processes, stdin, or `grasm run` | **started, and honestly partial** |
 | G9 | C ABI import overhead | zero-cost | `extern fn` takes `i64`, `f64`, `str` and `bytes` ([T-EXTERN-POINTER]), gated by `unsafe` and charged `io`; a pointer may not be *returned* | **met** |
 | G10 | Adoption | ≥ 500 companies | zero — nobody outside this repository has run a Grasm program | **not started** |
 | G11 | Tokens vs Python | ≤ 1.00× | **1.04×** | **4% over** |
@@ -566,6 +566,35 @@ Two of the four cancel exactly and the other two are one call:
 The second half was worth four times the first, which is the wrong way round
 from how they were found: the fused call is the clever one and the borrow is the
 obvious one.
+
+**G8: record and replay, and why the effect system made it cheap.** Knowing
+which calls are non-deterministic is normally the hard part of building a
+record-and-replay tool. Here it was already written down — a builtin either
+declares an effect row or it cannot read anything — so the journal is just
+"every call that has a row, in order, and what it answered".
+
+    $ GRASM_RECORD=j ./program      # 86 bytes for a clock, 4 bytes of entropy
+    $ GRASM_REPLAY=j ./program      # identical output, twice, on any machine
+
+**Divergence is an error rather than a guess.** On replay the recorded call name
+is checked against the call made. A different program against the same journal
+says so and stops:
+
+    at call 1 the recording says `now_millis` and this run asked for `env`
+
+The alternative — hand back the next record anyway — produces a run that looks
+like a replay and is not, and a tool whose whole promise is *this is what
+happened* must not be able to lie about it. A program that reads *more* than the
+recording holds is caught the same way.
+
+Writes are recorded and not replayed against the world: replaying a
+`write_file` would damage a disk to reproduce a bug, and replaying a `print`
+would hide the output the person is reading.
+
+What is not covered yet, and is more than what is: the network, other processes,
+stdin, `list_dir`, and the whole interpreter — `grasm run` has its own
+implementations of these builtins and none of them is hooked. So this is a first
+slice, not the goal, and G8's row says so.
 
 **Two of these four were worth nothing on the benchmark set, and that is the
 honest way round to say it.** After the literal cache and the borrowed field
