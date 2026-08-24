@@ -761,7 +761,6 @@ runs only under `grasm run`:
 | a handler operation that is a named `fn` | `SrcHandler{ get: named }` — write the closure inline |
 | a UFCS call of a *generic* free function | `[1, 2].describe()` for `fn describe[T](xs: [T])` — write `describe([1, 2])` |
 | an effect handler as a **struct field** type | `type Box = { h: CfgHandler }` — bind the handler with `let` instead |
-| an effect handler as a **parameter** type | `fn run(h: LogHandler) { with Log handled_by h { … } }` — the shape [E-HANDLER-OWN-ROW] documents; install the handler at the call site instead |
 | a generic instantiated at a handler type | `f(h)` for `fn f[T](x: T)` — pass what the handler computes instead |
 | a handler used as a *value* | `print("{h}")`, or storing one — install it with `with … handled_by` instead |
 | a `with` block inside `parallel`/`spawn` | install the handler around the `parallel` block instead |

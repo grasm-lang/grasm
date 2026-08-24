@@ -7,6 +7,17 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
 
 ### Fixed
 
+- **`--native` compiles an effect handler passed as a parameter.**
+  `fn run(h: LogHandler) { with Log handled_by h { … } }` — the shape
+  [E-HANDLER-OWN-ROW] documents. Smaller than it looked: effect *operation*
+  calls were already fully dynamic, a lookup by effect and operation name
+  followed by an indirect call, so nothing about dispatch changed. What was
+  missing was a way to *carry* a handler, because operations are lifted from a
+  literal at compile time and a `with` on a parameter has no literal to lift. A
+  handler value is now a block of `(code, env)` pairs built in the frame that
+  wrote the literal — which is exactly why one may be passed down, and still may
+  not be returned or stored in a struct: those outlive the frame, and stay
+  refused by name.
 - **`--native` compiles a type parameter that appears only in a function-typed
   parameter's result.** `fn key_by[T, K](xs: [T], f: fn(T) -> K) -> [K]`.
   Monomorphization binds a type parameter by matching each declared parameter

@@ -93,6 +93,14 @@ enum VType {
     /// value, like `Str` — a byte buffer has no scalar representation.
     Bytes,
     List(Box<VType>),
+    /// An effect handler carried as a value: a pointer to `(code, env)` pairs,
+    /// one per operation, in the effect's declared order.
+    ///
+    /// The block lives in the frame that *built* it, which is why this is
+    /// allowed as a parameter and nowhere else. Passing one down keeps that
+    /// frame alive for the whole call; returning one, or storing one in a
+    /// struct or a list, would outlive it, and those stay refused by name.
+    Handler(String),
     /// `a..b` held as a value, rather than walked by a `for`.
     ///
     /// Boxed: three fields do not fit a machine word, and a range is rare
@@ -150,6 +158,7 @@ impl VType {
             VType::Str => "str".into(),
             VType::Bytes => "bytes".into(),
             VType::Range => "range".into(),
+            VType::Handler(e) => format!("h{e}"),
             VType::Any => "any".into(),
             VType::List(e) => format!("l{}", e.mangle()),
             VType::Option(e) => format!("o{}", e.mangle()),
@@ -180,6 +189,7 @@ impl VType {
             VType::Str => "str".into(),
             VType::Bytes => "bytes".into(),
             VType::Range => "a range".into(),
+            VType::Handler(e) => format!("{e}Handler"),
             VType::Any => "an inferred type".into(),
             VType::Ref(inner) => format!("ref {}", inner.show()),
             VType::List(e) => format!("[{}]", e.show()),
@@ -208,7 +218,8 @@ impl VType {
             VType::Bool => types::I8,
             VType::Unit => types::I8,
             // Boxed values travel as 64-bit pointers.
-            VType::Str
+            VType::Handler(_)
+            | VType::Str
             | VType::Bytes
             | VType::Range
             | VType::List(_)
@@ -846,6 +857,14 @@ impl<'m> Codegen<'m> {
                             "str" => return Ok(VType::Str),
                             "bytes" => return Ok(VType::Bytes),
                             "range" => return Ok(VType::Range),
+                            _ if n
+                                .strip_suffix("Handler")
+                                .is_some_and(|e| self.effects.contains_key(e)) =>
+                            {
+                                return Ok(VType::Handler(
+                                    n.strip_suffix("Handler").expect("just checked").to_string(),
+                                ))
+                            }
                             _ => {}
                         }
                         // An alias is its target, resolved here so nothing
@@ -1511,6 +1530,7 @@ impl<'m> Codegen<'m> {
             vars: Vec::new(),
             var_count: 0,
             loops: Vec::new(),
+            handler_arg_held: Vec::new(),
             ret: sig_ret.clone(),
             inout_slots: Vec::new(),
             filled: false,
@@ -1726,6 +1746,84 @@ impl<'m> Codegen<'m> {
         }
     }
 
+    /// Lifts a handler literal's operations into top-level functions.
+    ///
+    /// Shared by a `with` site and by a handler literal passed as an argument,
+    /// because they need exactly the same thing: one function per operation,
+    /// plus the names its body reads from outside itself. Two copies of this
+    /// would be two places for the capture list to drift, and a capture list
+    /// that drifts is a handler reading the wrong value.
+    fn lift_handler_ops(
+        &mut self,
+        ename: &str,
+        ops: &[(String, Vec<VType>, VType)],
+        fields: &[(Ident, Expr)],
+        span: Span,
+    ) -> CResult<Vec<(String, FuncId, Vec<String>)>> {
+        let mut site = Vec::new();
+        for (fname, fexpr) in fields {
+            let Some((_, param_ts, ret_t)) =
+                ops.iter().find(|(o, _, _)| *o == fname.name).cloned()
+            else {
+                return nope(fname.span, format!("the operation `{}`", fname.name));
+            };
+            let Expr::Closure {
+                params: cparams,
+                body: cbody,
+                ..
+            } = fexpr
+            else {
+                return nope(fexpr.span(), "handler ops that aren't closures");
+            };
+            if cparams.len() != param_ts.len() {
+                return nope(fexpr.span(), "a handler op with the wrong arity");
+            }
+            let mut sig = self.module.make_signature();
+            for p in &param_ts {
+                sig.params.push(AbiParam::new(p.cl()));
+            }
+            if ret_t != VType::Unit {
+                sig.returns.push(AbiParam::new(ret_t.cl()));
+            }
+            let sym = format!(
+                "g_h_{}_{}_{}",
+                ename.replace('.', "_"),
+                fname.name,
+                self.pending_handlers.len()
+            );
+            let id = self
+                .module
+                .declare_function(&sym, Linkage::Local, &sig)
+                .map_err(|e| Unsupported {
+                    span,
+                    what: format!("(module error: {e})"),
+                })?;
+            let named_params: Vec<(String, VType)> = cparams
+                .iter()
+                .map(|p| p.name.clone())
+                .zip(param_ts.iter().cloned())
+                .collect();
+            // Names the body reads that are neither its parameters nor
+            // anything global. Their types are unknown at this pass —
+            // it runs before any function body is compiled — so they
+            // are recorded by name and typed at the `with` site.
+            let mut free = Vec::new();
+            collect_idents(cbody, &mut free);
+            free.retain(|n| !cparams.iter().any(|p| p.name == *n));
+            free.dedup();
+            self.pending_handlers.push(PendingHandler {
+                id,
+                module: self.current_module.clone(),
+                params: named_params,
+                captures: Vec::new(),
+                ret: ret_t,
+                body: (**cbody).clone(),
+            });
+            site.push((fname.name.clone(), id, free));
+        }
+        Ok(site)
+    }
+
     fn collect_handlers_stmt(&mut self, st: &Stmt) -> CResult<()> {
         match st {
             Stmt::With {
@@ -1740,73 +1838,16 @@ impl<'m> Codegen<'m> {
                 };
                 let resolved = self.handler_literal(handler);
                 let Some(Expr::StructLit { fields, .. }) = &resolved else {
-                    return nope(
-                        handler.span(),
-                        "a handler that is not a struct literal or a `let` bound \
-to one — a loop variable or a list element is this case",
-                    );
+                    // No literal to lift *here*. That is not yet an error: the
+                    // handler may have arrived as a value, whose operations
+                    // were lifted where the literal was written. This pass runs
+                    // before any body is typed and cannot tell the two apart,
+                    // so it says nothing and leaves the judgement to the point
+                    // that knows — which either finds a handler value or
+                    // refuses by name.
+                    return self.collect_handlers_block(body);
                 };
-                let mut site = Vec::new();
-                for (fname, fexpr) in fields {
-                    let Some((_, param_ts, ret_t)) =
-                        ops.iter().find(|(o, _, _)| *o == fname.name).cloned()
-                    else {
-                        return nope(fname.span, format!("the operation `{}`", fname.name));
-                    };
-                    let Expr::Closure {
-                        params: cparams,
-                        body: cbody,
-                        ..
-                    } = fexpr
-                    else {
-                        return nope(fexpr.span(), "handler ops that aren't closures");
-                    };
-                    if cparams.len() != param_ts.len() {
-                        return nope(fexpr.span(), "a handler op with the wrong arity");
-                    }
-                    let mut sig = self.module.make_signature();
-                    for p in &param_ts {
-                        sig.params.push(AbiParam::new(p.cl()));
-                    }
-                    if ret_t != VType::Unit {
-                        sig.returns.push(AbiParam::new(ret_t.cl()));
-                    }
-                    let sym = format!(
-                        "g_h_{}_{}_{}",
-                        ename.replace('.', "_"),
-                        fname.name,
-                        self.pending_handlers.len()
-                    );
-                    let id = self
-                        .module
-                        .declare_function(&sym, Linkage::Local, &sig)
-                        .map_err(|e| Unsupported {
-                            span: *span,
-                            what: format!("(module error: {e})"),
-                        })?;
-                    let named_params: Vec<(String, VType)> = cparams
-                        .iter()
-                        .map(|p| p.name.clone())
-                        .zip(param_ts.iter().cloned())
-                        .collect();
-                    // Names the body reads that are neither its parameters nor
-                    // anything global. Their types are unknown at this pass —
-                    // it runs before any function body is compiled — so they
-                    // are recorded by name and typed at the `with` site.
-                    let mut free = Vec::new();
-                    collect_idents(cbody, &mut free);
-                    free.retain(|n| !cparams.iter().any(|p| p.name == *n));
-                    free.dedup();
-                    self.pending_handlers.push(PendingHandler {
-                        id,
-                        module: self.current_module.clone(),
-                        params: named_params,
-                        captures: Vec::new(),
-                        ret: ret_t,
-                        body: (**cbody).clone(),
-                    });
-                    site.push((fname.name.clone(), id, free));
-                }
+                let site = self.lift_handler_ops(&ename, &ops, fields, *span)?;
                 self.handler_sites.insert(span.start, site);
                 self.collect_handlers_block(body)?;
                 Ok(())
@@ -1840,8 +1881,51 @@ to one — a loop variable or a list element is this case",
                 }
                 Ok(())
             }
+            // A handler literal passed as an argument. Its operations are
+            // lifted here, keyed by where the literal is written, so the call
+            // site can hand the callee code pointers rather than a syntax tree
+            // it has no way to compile.
+            Expr::Call { args, .. } | Expr::MethodCall { args, .. } => {
+                for a in args {
+                    // Resolved through a name, so a `let`-bound handler can be
+                    // passed as well as written inline. Lifted here rather than
+                    // at the `let`, because a handler that is only ever
+                    // *installed* is lifted at its `with` — and lifting it in
+                    // both places produced a second copy whose captures nothing
+                    // registered, which failed to compile by name.
+                    if let Some(lit) = self.handler_literal(a) {
+                        if self.is_handler_literal(&lit) {
+                            self.lift_handler_literal(&lit)?;
+                        }
+                    }
+                    self.collect_handlers_expr(a)?;
+                }
+                Ok(())
+            }
             _ => Ok(()),
         }
+    }
+
+    /// Lifts a handler literal written in a value position, keyed by its own
+    /// span rather than by a `with`.
+    fn lift_handler_literal(&mut self, lit: &Expr) -> CResult<()> {
+        let Expr::StructLit { name, fields, span, .. } = lit else {
+            return Ok(());
+        };
+        if self.handler_sites.contains_key(&span.start) {
+            return Ok(());
+        }
+        let ename = name.segments[0]
+            .name
+            .strip_suffix("Handler")
+            .unwrap_or_default()
+            .to_string();
+        let Some(ops) = self.effects.get(&ename).cloned() else {
+            return Ok(());
+        };
+        let site = self.lift_handler_ops(&ename, &ops, fields, *span)?;
+        self.handler_sites.insert(span.start, site);
+        Ok(())
     }
 
     /// Emits the wrapper that lets a named function be used as a value.
@@ -1974,6 +2058,7 @@ to one — a loop variable or a list element is this case",
             vars: Vec::new(),
             var_count: 0,
             loops: Vec::new(),
+            handler_arg_held: Vec::new(),
             ret: c.ret.clone(),
             inout_slots: Vec::new(),
             filled: false,
@@ -2065,6 +2150,7 @@ to one — a loop variable or a list element is this case",
             vars: Vec::new(),
             var_count: 0,
             loops: Vec::new(),
+            handler_arg_held: Vec::new(),
             ret: c.ret.clone(),
             inout_slots: Vec::new(),
             filled: false,
@@ -2195,6 +2281,7 @@ to one — a loop variable or a list element is this case",
             vars: Vec::new(),
             var_count: 0,
             loops: Vec::new(),
+            handler_arg_held: Vec::new(),
             ret: h.ret.clone(),
             inout_slots: Vec::new(),
             filled: false,
@@ -2446,6 +2533,13 @@ struct FnCx<'a, 'm> {
     /// scope decs — emitted only on the fall-through path — never ran, so
     /// every `break` past a boxed local leaked it.
     loops: Vec<(Block, Block, usize)>,
+    /// Capture slots built for handler arguments in this frame, and what is in
+    /// them, so the boxed ones can be released when the frame ends.
+    ///
+    /// Released at the end of the function rather than after the call: a
+    /// handler block is a pointer into *this* frame, and the frame outliving
+    /// every call it makes is exactly what makes passing one down sound.
+    handler_arg_held: Vec<(cranelift_codegen::ir::StackSlot, Vec<(String, VType)>)>,
     ret: VType,
     /// (caller pointer, local var, type) for `inout` params — stored back
     /// through the pointer before every return.
@@ -3768,6 +3862,22 @@ impl FnCx<'_, '_> {
     /// Before a `return`: release every boxed local in every scope.
     fn emit_scope_decs_all(&mut self) {
         self.emit_inout_writeback();
+        // Captures held for a handler passed to a call. They are released with
+        // the frame rather than after the call, because the block they live in
+        // is a pointer into this frame and stays reachable for as long as the
+        // callee can install it — which is the whole reason a handler may be
+        // passed down and not returned.
+        let held = std::mem::take(&mut self.handler_arg_held);
+        for (slot, captures) in &held {
+            for (i, (_, cvt)) in captures.iter().enumerate() {
+                if !cvt.boxed() {
+                    continue;
+                }
+                let bits = self.b.ins().stack_load(types::I64, *slot, (i * 8) as i32);
+                self.call_rt("grasm_val_dec", &[bits]);
+            }
+        }
+        self.handler_arg_held = held;
         let all: Vec<(Variable, VType)> = self
             .vars
             .iter()
@@ -4737,11 +4847,35 @@ impl FnCx<'_, '_> {
                     .handler_literal(handler)
                     .map(|lit| lit.span().start)
                     .unwrap_or(span.start);
+                // A handler that arrived as a *value* — a parameter. Its
+                // operations were lifted where the literal was written, in the
+                // caller, and it carries their code and environment pointers.
+                // Installing them needs no literal here, which is the whole
+                // point: this function does not know which handler it got.
+                if self.cg.handler_literal(handler).is_none() {
+                    if let Expr::Ident(hid) = handler {
+                        if let Some((hvar, VType::Handler(got))) = self.lookup(&hid.name) {
+                            if got == ename {
+                                return self.with_handler_value(&ename, hvar, body, *span);
+                            }
+                        }
+                    }
+                }
                 let Some(site) = self.cg.handler_sites.get(&span.start).cloned() else {
-                    // The only way a `with` reaches here without a lifted
-                    // handler is one inside a `parallel`/`spawn` body, whose
-                    // statements are compiled into a task rather than the
-                    // enclosing function. Say which effect, and where.
+                    // Two ways to get here, and they want different messages.
+                    // A handler expression that is not a literal and not a
+                    // handler value is the first; the second is a `with` inside
+                    // a `parallel`/`spawn` body, whose statements are compiled
+                    // into a task rather than into this function, so the
+                    // lifting pass never reached it.
+                    if self.cg.handler_literal(handler).is_none() {
+                        return nope(
+                            handler.span(),
+                            "a handler that is not a struct literal, a `let` bound \
+to one, or a parameter of handler type — a loop variable or a list element is \
+this case",
+                        );
+                    }
                     return nope(
                         *span,
                         format!("a `with {ename}` block inside `parallel` or `spawn`"),
@@ -4832,6 +4966,47 @@ impl FnCx<'_, '_> {
                 Ok(StmtOut::Value(None))
             }
         }
+    }
+
+    /// Installs a handler that arrived as a value, then runs the block.
+    ///
+    /// The pairs are read out of the block the caller built and handed to the
+    /// same runtime stack a literal handler uses, so an operation call inside
+    /// the body resolves identically either way — it was always a lookup by
+    /// effect and operation name, never a direct call.
+    fn with_handler_value(
+        &mut self,
+        ename: &str,
+        hvar: Variable,
+        body: &grasm_syntax::ast::Block,
+        span: Span,
+    ) -> CResult<StmtOut> {
+        let ops = self.cg.effects.get(ename).cloned().unwrap_or_default();
+        if ops.is_empty() {
+            return nope(span, format!("the effect `{ename}`"));
+        }
+        let (ep, el) = self.str_ptr_len(ename);
+        self.call_rt("grasm_handler_push", &[ep, el]);
+        let ptr_ty = self.cg.module.target_config().pointer_type();
+        let base = self.b.use_var(hvar);
+        for (i, (opname, _, _)) in ops.iter().enumerate() {
+            let code = self
+                .b
+                .ins()
+                .load(ptr_ty, cranelift_codegen::ir::MemFlags::trusted(), base, (i * 16) as i32);
+            let env = self
+                .b
+                .ins()
+                .load(ptr_ty, cranelift_codegen::ir::MemFlags::trusted(), base, (i * 16 + 8) as i32);
+            let (op_p, op_l) = self.str_ptr_len(opname);
+            self.call_rt("grasm_handler_op", &[op_p, op_l, code, env]);
+        }
+        let (_, mut terminated) = self.eval_block_inner(body)?;
+        terminated |= self.is_filled();
+        if !terminated {
+            self.call_rt("grasm_handler_pop", &[]);
+        }
+        Ok(StmtOut::Value(None))
     }
 
     /// The hidden local a handler literal's capture is copied into.
@@ -5124,6 +5299,106 @@ impl FnCx<'_, '_> {
 
     /// Like `eval_expr_val`, but an expected type supplies the element type
     /// for empty collection literals (`let xs: [i64] = []`).
+    /// Builds the `(code, env)` block a handler parameter is passed as.
+    ///
+    /// One pair per operation, in the effect's declared order, so the callee
+    /// can install them without knowing which handler it got. The captures go
+    /// into their own slots exactly as a `with` site fills them — the same
+    /// `lift_handler_ops` produced both — and are released after the call.
+    fn handler_block(&mut self, e: &Expr, eff: &str) -> CResult<(Value, VType)> {
+        // Already a handler value: a parameter passed straight on.
+        if let Expr::Ident(id) = e {
+            if let Some((var, VType::Handler(got))) = self.lookup(&id.name) {
+                if got == eff {
+                    let v = self.b.use_var(var);
+                    return Ok((v, VType::Handler(eff.to_string())));
+                }
+            }
+        }
+        let Some(lit) = self.cg.handler_literal(e) else {
+            return nope(
+                e.span(),
+                format!(
+                    "a `{eff}Handler` argument that is not a handler literal or a \
+`let` bound to one"
+                ),
+            );
+        };
+        let Expr::StructLit { fields, span: lit_span, .. } = &lit else {
+            return nope(e.span(), format!("a `{eff}Handler` argument"));
+        };
+        let Some(site) = self.cg.handler_sites.get(&lit_span.start).cloned() else {
+            return nope(e.span(), format!("a `{eff}Handler` argument that was not lifted"));
+        };
+        let ops = self
+            .cg
+            .effects
+            .get(eff)
+            .cloned()
+            .unwrap_or_default();
+        let _ = fields;
+        let ptr_ty = self.cg.module.target_config().pointer_type();
+        let block = self.b.create_sized_stack_slot(
+            cranelift_codegen::ir::StackSlotData::new(
+                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                (ops.len().max(1) * 16) as u32,
+                3,
+            ),
+        );
+        for (slot_i, (opname, _, _)) in ops.iter().enumerate() {
+            let Some((_, fid, free)) = site.iter().find(|(o, _, _)| o == opname).cloned() else {
+                return nope(
+                    e.span(),
+                    format!("a `{eff}Handler` missing the operation `{opname}`"),
+                );
+            };
+            let captures: Vec<(String, VType)> = free
+                .iter()
+                .filter_map(|n| {
+                    self.lookup(&Self::snapshot_name(lit_span.start, n))
+                        .or_else(|| self.lookup(n))
+                        .map(|(_, vt)| (n.clone(), vt))
+                })
+                .collect();
+            let env_slot = self.b.create_sized_stack_slot(
+                cranelift_codegen::ir::StackSlotData::new(
+                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                    (captures.len().max(1) * 8) as u32,
+                    3,
+                ),
+            );
+            for (i, (cname, cvt)) in captures.iter().enumerate() {
+                let Some((var, _)) = self
+                    .lookup(&Self::snapshot_name(lit_span.start, cname))
+                    .or_else(|| self.lookup(cname))
+                else {
+                    continue;
+                };
+                let v = self.b.use_var(var);
+                let bits = self.value_to_bits(v, cvt);
+                // A capture is a value, not a binding ([E-CLOSURE-CAPTURE]),
+                // so a boxed one is held for as long as the handler is.
+                if cvt.boxed() {
+                    self.call_rt("grasm_val_inc", &[v]);
+                }
+                self.b.ins().stack_store(bits, env_slot, (i * 8) as i32);
+            }
+            self.cg.handler_captures.insert(fid, captures.clone());
+            self.handler_arg_held.push((env_slot, captures));
+            let env = self.b.ins().stack_addr(ptr_ty, env_slot, 0);
+            let fref = self.cg.module.declare_func_in_func(fid, self.b.func);
+            let addr = self.b.ins().func_addr(ptr_ty, fref);
+            self.b
+                .ins()
+                .stack_store(addr, block, (slot_i * 16) as i32);
+            self.b
+                .ins()
+                .stack_store(env, block, (slot_i * 16 + 8) as i32);
+        }
+        let v = self.b.ins().stack_addr(ptr_ty, block, 0);
+        Ok((v, VType::Handler(eff.to_string())))
+    }
+
     fn eval_expr_expecting(
         &mut self,
         e: &Expr,
@@ -5144,6 +5419,15 @@ impl FnCx<'_, '_> {
         e: &Expr,
         expected: Option<&VType>,
     ) -> CResult<Option<(Value, VType)>> {
+        // A handler meeting a parameter of handler type. The block of
+        // `(code, env)` pairs is built here, in *this* frame, and the callee
+        // is handed a pointer to it — which is why a handler may be passed
+        // down and not returned or stored: this frame outlives the call and
+        // nothing else.
+        if let Some(VType::Handler(eff)) = expected {
+            let eff = eff.clone();
+            return self.handler_block(e, &eff).map(Some);
+        }
         // A closure literal in argument position gets its parameter types from
         // the parameter it is being passed to. Before function types existed
         // there was nowhere for them to come from, and the backend said so.

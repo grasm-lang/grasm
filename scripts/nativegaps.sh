@@ -160,7 +160,15 @@ expect_compiles "matching the prelude IoError's variants" 'fn main() {
     }
 }'
 
-expect_refused "an effect handler as a parameter type" 'effect Log {
+# Was a gap, and a smaller one than it looked. Effect *operation* calls were
+# already fully dynamic — `grasm_handler_lookup` by effect and operation name,
+# then an indirect call — so nothing about dispatch had to change. What was
+# missing was a way to carry a handler: the operations are lifted from a
+# literal at compile time, and a `with` on a parameter has no literal to lift.
+# A handler value is now a block of (code, env) pairs built in the frame that
+# wrote the literal, which is exactly why it may be passed down and still may
+# not be returned or stored.
+expect_compiles "an effect handler as a parameter type" 'effect Log {
     fn info(m: str)
 }
 fn run(h: LogHandler) / {io} {
