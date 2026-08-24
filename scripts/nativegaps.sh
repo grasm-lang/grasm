@@ -384,6 +384,39 @@ fn main() {
     print("{add5(3)} {g(3)}")
 }'
 
+# A handler value is a block of (code, env) pairs in the frame that wrote the
+# literal, so it may be passed *down* and must not escape. Returning one is the
+# shape that only exists because handler values do, and it is a refusal the
+# safety of the passing case depends on — not a gap waiting to be closed. If it
+# starts compiling because handler environments moved to the heap, this is where
+# that has to be argued for rather than noticed.
+expect_refused "returning a handler parameter" 'effect S {
+    fn a() -> i64
+}
+fn pass(h: SHandler) -> SHandler {
+    h
+}
+fn main() {
+    with S handled_by pass(SHandler{ a: || 1 }) {
+        print("{S.a()}")
+    }
+}'
+
+# Compiles, and is sound for the same reason passing is: `g` is a copy of a
+# pointer into the caller's frame, which outlives this one.
+expect_compiles "binding a handler parameter to a local" 'effect S {
+    fn a() -> i64
+}
+fn take(h: SHandler) / {io, S} {
+    let g = h
+    with S handled_by g {
+        print("{S.a()}")
+    }
+}
+fn main() {
+    take(SHandler{ a: || 1 })
+}'
+
 expect_refused "a handler bound by a for loop" 'effect Src {
     fn get() -> str
 }
