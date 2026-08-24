@@ -9513,8 +9513,17 @@ checker did",
             });
         let out_t = match from_checker {
             Some(t) => t,
-            None => match self.probe_type(recv)? {
-                VType::Map(_, v) if *v != VType::Any => *v,
+            // A receiver this cannot type is not this shape. Propagating the
+            // failure made an *optimization recogniser* refuse to compile the
+            // program: `Src.get(1) ?? 0` is an effect operation that happens to
+            // be called `get` and take one argument, so it reached here, and
+            // the probe of `Src` — which is an effect, not a value — became
+            // "does not yet support the type of `Src`".
+            //
+            // Nothing else could have caught it. `match Src.get(1)` compiled,
+            // an annotated `let` compiled, and only the fused spelling did not.
+            None => match self.probe_type(recv) {
+                Ok(VType::Map(_, v)) if *v != VType::Any => *v,
                 _ => return Ok(None),
             },
         };
@@ -10013,6 +10022,33 @@ checker did",
                 }
             },
             Expr::Call { callee, args, .. } => {
+                // `Src.get(1)` — an effect operation, which parses as a call
+                // through a field and not as a method call. The `MethodCall`
+                // arm below already handles the other spelling; this one was
+                // missing, so probing the call probed `Src` as if it were a
+                // value and refused with "the type of `Src`".
+                //
+                // It only showed where the probe has to run at all: `match
+                // Src.get(1)` and an annotated `let` both compiled, and
+                // `Src.get(1) ?? 0` did not.
+                if let Expr::Field { recv, name, .. } = &**callee {
+                    if let Expr::Ident(tid) = &**recv {
+                        if self.lookup(&tid.name).is_none() {
+                            if let Some(ops) = self.cg.effects.get(&tid.name).cloned() {
+                                return match ops.iter().find(|(o, _, _)| *o == name.name) {
+                                    Some((_, _, ret)) => Ok(ret.clone()),
+                                    None => nope(
+                                        name.span,
+                                        format!(
+                                            "`{}` is not an operation of effect `{}`",
+                                            name.name, tid.name
+                                        ),
+                                    ),
+                                };
+                            }
+                        }
+                    }
+                }
                 if let Expr::Ident(id) = &**callee {
                     // A local holding a function value shadows a function of
                     // the same name, so it is checked first.

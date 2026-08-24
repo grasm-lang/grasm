@@ -1598,3 +1598,47 @@ finishing them than the list was.
 Forcing the comparison to fail gives exit 1; restoring it gives exit 0. The
 check that a gate can fail is the one thing that cannot be taken on faith, and
 not doing it is how F40 survived a day.
+
+## F42 — an optimisation recogniser that refused to compile (S3, over-strict) — **fixed**
+
+```
+error: native backend does not yet support the type of `Src`
+```
+
+for this, where `Src` is an effect:
+
+```
+let v = Src.get(1) ?? 0
+```
+
+`m.get(k) ?? d` is fused into one call that never builds the `Option` — worth
+about 85 ns a lookup, on the most common shape anyone writes. The recogniser
+matches a method call named `get` with one argument, then probes the receiver to
+confirm it is a map.
+
+An effect operation named `get` taking one argument matches that shape. Probing
+`Src` — an effect, which is not a value — failed, and the failure was propagated
+with `?` rather than treated as *not this shape*.
+
+So a recogniser whose entire job is to notice an opportunity or decline it was
+able to refuse the program instead.
+
+### Why nothing caught it
+
+`match Src.get(1) { .. }` compiled. `let v: i64 ! Bad = Src.get(1)` compiled.
+Only the fused spelling did not, and only when the operation was named `get`
+and took exactly one argument. No conformance program had that combination.
+
+`scripts/fuzz_handlers.py` had been generating it and walking past it, because a
+program the backend declined was returned as an unlabelled `None` — the hole
+fixed in **F41** the same day. The first run after that fix reported
+`declined: 9` of 20 with a single reason, and this was it.
+
+### The rule
+
+An optimiser asks *is this the shape I can improve?* — a question with two
+answers, and "I could not tell" is one of them. It may never answer "this
+program cannot be compiled". Every probe inside a recogniser now declines on
+failure rather than propagating it.
+
+Handler programs the backend declines are now **0 of 40**, from 9 of 20.
