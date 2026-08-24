@@ -626,6 +626,7 @@ impl<'m> Codegen<'m> {
             ("grasm_struct_get", vec![i64t, ptr, i64t], Some(i64t)),
             ("grasm_struct_get_at", vec![i64t, i64t], Some(i64t)),
             ("grasm_struct_scalar_at", vec![i64t, i64t], Some(i64t)),
+            ("grasm_struct_borrow_at", vec![i64t, i64t], Some(i64t)),
             ("grasm_struct_set_field", vec![i64t, ptr, i64t, i64t], Some(i64t)),
             ("grasm_struct_set_field_at", vec![i64t, i64t, i64t], Some(i64t)),
             ("grasm_variant_new", vec![ptr, i64t, ptr, i64t], Some(i64t)),
@@ -4002,6 +4003,43 @@ impl FnCx<'_, '_> {
     fn inc_if_boxed(&mut self, v: Value, vt: &VType) {
         if vt.boxed() {
             self.call_rt("grasm_val_inc", &[v]);
+        }
+    }
+
+    /// A pure field path rooted at a plain local, borrowed at every step.
+    ///
+    /// `o.i.v` fetched `i` and incremented it, read `v`, then released `i` —
+    /// and that pair exists only to protect a value the root already protects.
+    /// Every intermediate in a path like this is reachable from the local, so
+    /// none of them can be freed during the read.
+    ///
+    /// Answers `None` for anything that is not a chain of field names over a
+    /// struct local. An index or a call in the middle could run code that frees
+    /// what an earlier step borrowed, so those keep the owning path.
+    fn borrow_struct_path(&mut self, e: &Expr) -> CResult<Option<(Value, String)>> {
+        match e {
+            Expr::Ident(id) => Ok(match self.lookup(&id.name) {
+                Some((var, VType::Struct(sn))) => Some((self.b.use_var(var), sn)),
+                _ => None,
+            }),
+            Expr::Field { recv, name, span } => {
+                let Some((base, sname)) = self.borrow_struct_path(recv)? else {
+                    return Ok(None);
+                };
+                let VType::Struct(inner) = self.struct_field_type(&sname, &name.name, *span)?
+                else {
+                    return Ok(None);
+                };
+                let Some(i) = self.struct_field_index(&sname, &name.name) else {
+                    return Ok(None);
+                };
+                let iv = self.b.ins().iconst(types::I64, i);
+                let v = self
+                    .call_rt("grasm_struct_borrow_at", &[base, iv])
+                    .unwrap();
+                Ok(Some((v, inner)))
+            }
+            _ => Ok(None),
         }
     }
 
@@ -8694,15 +8732,9 @@ checker did",
         //
         // Only a plain identifier. Anything else produced a temporary that this
         // expression owns and must release.
-        let borrowed_receiver = match recv {
-            Expr::Ident(id) => self.lookup(&id.name),
-            _ => None,
-        };
-        let (rv, rt, owned) = match &borrowed_receiver {
-            Some((var, vt)) if matches!(vt, VType::Struct(_)) => {
-                (self.b.use_var(*var), vt.clone(), false)
-            }
-            _ => {
+        let (rv, rt, owned) = match self.borrow_struct_path(recv)? {
+            Some((v, sname)) => (v, VType::Struct(sname), false),
+            None => {
                 let (v, t) = self.eval_expr_val(recv)?;
                 (v, t, true)
             }

@@ -1,9 +1,64 @@
 //! tag: T-STRUCT
 //! expect: output
 //! 3 4
+//! 7
+//! deep 4
+//! [1, 2, 3] 3
+//! deep [1, 2, 3] 99
+//! 1 42
+//! 1 42
 type Point = { x: i64, y: i64 }
+
+// A field path is read by **borrowing** every step of it. `o.i.v` used to fetch
+// `i` and increment it, read `v`, then release `i` — and that pair exists only
+// to protect a value the root already protects, because every intermediate in a
+// path rooted at a live local is reachable from that local.
+//
+// That is an optimisation, so it must be invisible, and these are the four ways
+// it could stop being:
+//
+//   * a chain ending in a **boxed** field has to hand out an owned value, or it
+//     dangles the moment the root changes;
+//   * a chain through a **shared** value must not let a write through one copy
+//     be seen through the other;
+//   * a chain under an **index** must not borrow at all — an index can run code
+//     that frees what an earlier step borrowed;
+//   * and the plain scalar read has to still answer correctly.
+type D = { n: i64, tag: str }
+type C = { d: D, xs: [i64] }
+type B = { c: C }
+type A = { b: B }
+
 fn main() {
     var p = Point{ x: 3, y: 0 }
     p.y = 4
     print("{p.x} {p.y}")
+
+    var a = A{ b: B{ c: C{ d: D{ n: 7, tag: "deep" }, xs: [1, 2, 3] } } }
+    print("{a.b.c.d.n}")
+
+    // Boxed results out of a borrowed chain are owned by whoever asked.
+    let t = a.b.c.d.tag
+    let l = a.b.c.xs
+    print("{t} {t.len()}")
+    print("{l} {l.len()}")
+
+    // Replacing the root must not disturb them. If the chain had handed out
+    // borrowed pointers these would now read freed memory.
+    a = A{ b: B{ c: C{ d: D{ n: 99, tag: "gone" }, xs: [] } } }
+    print("{t} {l} {a.b.c.d.n}")
+
+    // A copy shares structure, and a write through one copy is not visible
+    // through the other ([E-VALUE-SEMANTICS]) — which the borrow must not
+    // weaken, since it hands out the *same* interior pointer to both.
+    var one = A{ b: B{ c: C{ d: D{ n: 1, tag: "x" }, xs: [9] } } }
+    var two = one
+    two.b.c.d.n = 42
+    print("{one.b.c.d.n} {two.b.c.d.n}")
+
+    // Under an index the owning path is used instead, and answers the same.
+    var many: [A] = []
+    many.push(one)
+    many.push(two)
+    print("{many[0].b.c.d.n} {many[1].b.c.d.n}")
 }

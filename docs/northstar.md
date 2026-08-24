@@ -567,6 +567,22 @@ The second half was worth four times the first, which is the wrong way round
 from how they were found: the fused call is the clever one and the borrow is the
 obvious one.
 
+**And every step of a field path.** `o.i.v` fetched `i` and incremented it, read
+`v`, then released `i` — a pair that exists only to protect a value the *root*
+already protects. Every intermediate in a path rooted at a live local is
+reachable from that local, so none of them can be freed during the read.
+
+    two million `o.i.v`      23.8 -> 9.1 ms
+
+Only a chain of field names. An index or a call in the middle can run code that
+frees what an earlier step borrowed, so those keep the owning path — and
+`T-STRUCT.gr` checks that one answers the same as the other, along with the
+three ways this could stop being invisible: a chain ending in a boxed field has
+to hand out an owned value or it dangles when the root changes; a write through
+one copy of a shared value must not be visible through the other, even though
+the borrow hands both the same interior pointer; and the plain scalar read has
+to still be right.
+
 **And the same borrow on an index.** `xs[i]` evaluated `xs`, which increments,
 and released it after — the identical cancelling pair, in the identical shape.
 There was already a `pin` path that avoided it inside a `for` loop, and nothing

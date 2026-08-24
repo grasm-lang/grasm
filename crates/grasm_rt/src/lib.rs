@@ -2650,6 +2650,30 @@ pub unsafe extern "C" fn grasm_struct_make(
     })
 }
 
+/// A field pointer, **borrowed** — no reference count is touched.
+///
+/// Only sound while the struct holding it is alive, which the caller
+/// establishes rather than this function: the backend emits this only for a
+/// field path rooted at a live local, where every intermediate is reachable
+/// from that local and so cannot be freed during the read.
+///
+/// It exists for chains. `o.i.v` was three calls — fetch `i` and increment it,
+/// read `v` out of it, release `i` — and the increment and release exist only
+/// to protect a value the root already protects.
+///
+/// # Safety: `i` is a field index the compiler resolved for this struct type,
+/// and the caller keeps the struct alive for as long as it uses the result.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_struct_borrow_at(s: *mut RtVal, i: i64) -> *mut RtVal {
+    let RtPayload::Struct { fields, .. } = &(*s).payload else {
+        grasm_panic_msg_str("field access on non-struct");
+    };
+    match fields.get(i as usize) {
+        Some(v) => *v,
+        None => grasm_panic_msg_str("no such field"),
+    }
+}
+
 /// A **scalar** field's bits, touching no reference count.
 ///
 /// `p.a` for an `i64` field was four runtime calls: read the field and
