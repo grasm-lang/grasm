@@ -385,6 +385,8 @@ struct Codegen<'m> {
     /// not name every declared field has a different shape and would otherwise
     /// read its names out of the wrong descriptor.
     struct_descs: HashMap<String, cranelift_module::DataId>,
+    /// One cache slot per distinct string literal — see `str_lit_slot`.
+    str_lit_slots: HashMap<String, cranelift_module::DataId>,
     /// struct name → ordered fields (name, type)
     structs: HashMap<String, Vec<(String, VType)>>,
     /// `type Name = str` — the aliased type expression, resolved on demand.
@@ -526,6 +528,7 @@ impl<'m> Codegen<'m> {
             runtime: HashMap::new(),
             strings: HashMap::new(),
             struct_descs: HashMap::new(),
+            str_lit_slots: HashMap::new(),
             structs: HashMap::new(),
             aliases: HashMap::new(),
             sums: HashMap::new(),
@@ -579,6 +582,7 @@ impl<'m> Codegen<'m> {
             ("grasm_val_inc", vec![i64t], None),
             ("grasm_val_dec", vec![i64t], None),
             ("grasm_str_lit", vec![ptr, i64t], Some(i64t)),
+            ("grasm_str_lit_immortal", vec![ptr, i64t], Some(i64t)),
             ("grasm_str_concat", vec![i64t, i64t], Some(i64t)),
             ("grasm_str_append", vec![i64t, i64t], Some(i64t)),
             ("grasm_list_concat", vec![i64t, i64t], Some(i64t)),
@@ -2355,6 +2359,28 @@ to one — a loop variable or a list element is this case",
         id
     }
 
+    /// A one-word slot holding a literal's value once it has been made.
+    ///
+    /// One per distinct text, so `"hello"` written in ten places shares a
+    /// single value. The slot is zero until the first time that literal is
+    /// reached; after that every occurrence is a load and a branch, against the
+    /// 24 ns an allocation cost.
+    fn str_lit_slot(&mut self, s: &str) -> cranelift_module::DataId {
+        if let Some(id) = self.str_lit_slots.get(s) {
+            return *id;
+        }
+        let id = self
+            .module
+            .declare_anonymous_data(true, false)
+            .expect("data");
+        let mut d = DataDescription::new();
+        d.define(vec![0u8; 8].into_boxed_slice());
+        d.set_align(8);
+        self.module.define_data(id, &d).expect("data define");
+        self.str_lit_slots.insert(s.to_string(), id);
+        id
+    }
+
     fn intern_string(&mut self, s: &str) -> cranelift_module::DataId {
         if let Some(id) = self.strings.get(s) {
             return *id;
@@ -3979,6 +4005,36 @@ impl FnCx<'_, '_> {
         }
     }
 
+    /// A string literal, made once and cached in a slot of its own.
+    ///
+    /// The value is `IMMORTAL`, so the caller does not have to know it is
+    /// shared: `inc` and `dec` skip it, and nothing frees it. That is also what
+    /// makes this safe against `grasm_str_append`, which mutates in place only
+    /// when the count is exactly 1 — an immortal's never is, so appending to a
+    /// literal copies it.
+    fn str_literal(&mut self, text: &str) -> Value {
+        let ptr_ty = self.cg.module.target_config().pointer_type();
+        let slot_id = self.cg.str_lit_slot(text);
+        let gv = self.cg.module.declare_data_in_func(slot_id, self.b.func);
+        let slot = self.b.ins().global_value(ptr_ty, gv);
+        let flags = cranelift_codegen::ir::MemFlags::trusted();
+        let cached = self.b.ins().load(types::I64, flags, slot, 0);
+
+        let make_blk = self.b.create_block();
+        let done_blk = self.b.create_block();
+        self.b.append_block_param(done_blk, types::I64);
+        self.b.ins().brif(cached, done_blk, &[cached], make_blk, &[]);
+
+        self.goto_block(make_blk);
+        let (p, l) = self.str_ptr_len(text);
+        let made = self.call_rt("grasm_str_lit_immortal", &[p, l]).unwrap();
+        self.b.ins().store(flags, made, slot, 0);
+        self.b.ins().jump(done_blk, &[made]);
+
+        self.goto_block(done_blk);
+        self.b.block_params(done_blk)[0]
+    }
+
     fn str_ptr_len(&mut self, s: &str) -> (Value, Value) {
         let data_id = self.cg.intern_string(s);
         let gv = self.cg.module.declare_data_in_func(data_id, self.b.func);
@@ -5404,10 +5460,7 @@ impl FnCx<'_, '_> {
         let mut acc: Option<Value> = None;
         for piece in pieces {
             let part: Value = match piece {
-                StrPiece::Text(t) => {
-                    let (p, l) = self.str_ptr_len(t);
-                    self.call_rt("grasm_str_lit", &[p, l]).unwrap()
-                }
+                StrPiece::Text(t) => self.str_literal(t),
                 StrPiece::Expr(inner) => {
                     let (v, vt) = self.eval_expr_val(inner)?;
                     match vt {
@@ -5440,10 +5493,7 @@ impl FnCx<'_, '_> {
         }
         let v = match acc {
             Some(v) => v,
-            None => {
-                let (p, l) = self.str_ptr_len("");
-                self.call_rt("grasm_str_lit", &[p, l]).unwrap()
-            }
+            None => self.str_literal(""),
         };
         Ok((v, VType::Str))
     }

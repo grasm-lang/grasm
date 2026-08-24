@@ -1538,6 +1538,33 @@ pub unsafe extern "C" fn grasm_val_dec(v: *mut RtVal) {
     dec(v);
 }
 
+/// A string literal's value, made **once** and shared forever.
+///
+/// `"hello".len()` in a loop allocated a fresh box every time round: two
+/// million of them cost 24 ns each against nothing at all for the same text
+/// bound to a `let`. A literal cannot change, so there is no reason for a
+/// second one to exist.
+///
+/// `IMMORTAL`, so `inc` and `dec` skip it and nothing ever frees it — the
+/// caller does not have to know it is shared. Built with `Box::into_raw`
+/// rather than through `alloc`, for the same reason the small-integer table is:
+/// `alloc` counts a live value, and a value that is never freed would be
+/// reported as a leak at exit.
+///
+/// The *caching* is the backend's, one slot per distinct text, because a load
+/// and a branch beat a hash lookup — this call happens only the first time each
+/// literal is reached.
+///
+/// # Safety: compiler-generated calls with interned name data.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_lit_immortal(ptr: *const u8, len: u64) -> *mut RtVal {
+    let bytes = std::slice::from_raw_parts(ptr, len as usize);
+    Box::into_raw(Box::new(RtVal {
+        rc: AtomicI64::new(IMMORTAL),
+        payload: RtPayload::Str(RtStr::of(&String::from_utf8_lossy(bytes))),
+    }))
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn grasm_str_lit(ptr: *const u8, len: u64) -> *mut RtVal {
     let bytes = std::slice::from_raw_parts(ptr, len as usize);

@@ -1948,6 +1948,8 @@ fn main() {
 //! expect: output
 //! 2 3
 //! 1 99
+//! hi! hi hi
+//! hixxx hi
 type Box = { n: i64 }
 fn main() {
     var a = [1, 2]
@@ -1959,5 +1961,27 @@ fn main() {
     var q = p
     q.n = 99
     print("{p.n} {q.n}")
+
+    // A **string literal** is one shared value, made once and never freed —
+    // which is an implementation choice and must stay invisible. Value
+    // semantics is what makes it invisible: appending to a literal produces a
+    // new string rather than changing the one every other occurrence of that
+    // text is also using.
+    //
+    // Without this the first `s += "!"` in a program would rewrite every
+    // `"hi"` in it, which is the kind of defect that looks like the compiler
+    // going mad.
+    var s = "hi"
+    s += "!"
+    var t = "hi"
+    print("{s} {t} {"hi"}")
+
+    // The same, growing in a loop: `s + "x"` never touches the literal `s`
+    // started as.
+    var g = "hi"
+    for i in 0..3 {
+        g = g + "x"
+    }
+    print("{g} {"hi"}")
 }
 ```

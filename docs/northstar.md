@@ -519,6 +519,25 @@ quadratic in Go too and which no Go programmer would write — it now uses
 characters with an O(n) scan. A benchmark Grasm wins because the other
 implementations were written badly is worth nothing.
 
+**A string literal allocated on every occurrence.** `"hello".len()` in a loop
+cost 24 ns a time; the same text bound to a `let` cost nothing. Every mention of
+a literal was building a fresh box for text that cannot change.
+
+One shared `IMMORTAL` value per distinct text now, cached in a slot the backend
+emits — a load and a branch, and the runtime call happens the first time each
+literal is reached and never again. `Box::into_raw` rather than `alloc`, for the
+same reason the small-integer table uses it: `alloc` counts a live value and
+something never freed would be reported as a leak at exit.
+
+    two million `"hello".len()`      57.9 -> 18.1 ms
+
+Sharing it is safe because of the one place a `str` is mutated in place:
+`grasm_str_append` does that only when the count is exactly 1, and an immortal's
+never is — so appending to a literal copies it. Which is not a detail, it is the
+whole thing: without it, the first `s += "!"` in a program would rewrite every
+occurrence of that literal in it. `E-VALUE-SEMANTICS.gr` checks exactly that,
+because a shared literal is an implementation choice that has to stay invisible.
+
 **A struct field read was eight times a local read, and did not need to be.**
 Taking `tree` apart again: build and free is 33.5 ms of it and the *walk* is
 28.8, so half the program is reading two fields per node. Pricing that directly
