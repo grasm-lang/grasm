@@ -7,6 +7,13 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
 
 ### Fixed
 
+- **`--native` compiles a type parameter that appears only in a function-typed
+  parameter's result.** `fn key_by[T, K](xs: [T], f: fn(T) -> K) -> [K]`.
+  Monomorphization binds a type parameter by matching each declared parameter
+  against the argument's actual type, and that matcher had no case for a
+  *function* type — so `T` was bound from `xs` and `K` was determined by
+  nothing, though the closure passed for `f` had always known its own type.
+  `ref T` and `T ! E` were missing for the same reason and are handled now too.
 - **`--native` compiles a closure whose parameter types nothing local fixes.**
   `let f = |p| p.0 + p.1`, called as `f((i, v))` in a later statement. Such a
   closure learns its parameters from its call site and inference reaches both;

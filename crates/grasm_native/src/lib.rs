@@ -3256,6 +3256,32 @@ fn unify_generic(
                 }
             }
         }
+        // `fn(T) -> K`. Without this, a type parameter that appears only in a
+        // function-typed parameter's *result* was determined by nothing:
+        // `key_by[T, K](xs: [T], f: fn(T) -> K)` bound `T` from `xs` and left
+        // `K` unbound, so there was no type to monomorphize the return at.
+        //
+        // The closure passed for `f` has always known its own type; nothing
+        // looked inside it.
+        TypeExpr::Fn { params, ret, .. } => {
+            if let VType::Fn(ps, r) = actual {
+                for (d, a) in params.iter().zip(ps) {
+                    unify_generic(d, a, names, subst);
+                }
+                unify_generic(ret, r, names, subst);
+            }
+        }
+        TypeExpr::Ref(inner, _) => {
+            if let VType::Ref(t) = actual {
+                unify_generic(inner, t, names, subst);
+            }
+        }
+        TypeExpr::Fallible(ok, err, _) => {
+            if let VType::Fallible(o, e) = actual {
+                unify_generic(ok, o, names, subst);
+                unify_generic(err, e, names, subst);
+            }
+        }
         _ => {}
     }
 }

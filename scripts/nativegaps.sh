@@ -310,7 +310,13 @@ expect_compiles "map with a function that returns nothing" 'fn main() {
     print("{r.len()}")
 }'
 
-expect_refused "a type parameter only in a function result" 'fn key_by[T, K](xs: [T], f: fn(T) -> K) -> [K] {
+# Was a gap. Monomorphization binds a type parameter by matching each declared
+# parameter against the argument's actual type, and that matcher had no case for
+# a *function* type — so `f: fn(T) -> K` bound `T` from `xs` and left `K`
+# determined by nothing. The closure passed for `f` had always known its own
+# type; nothing looked inside it. `ref T` and `T ! E` were missing for the same
+# reason and are handled now too.
+expect_compiles "a type parameter only in a function result" 'fn key_by[T, K](xs: [T], f: fn(T) -> K) -> [K] {
     xs.map(f)
 }
 fn main() {

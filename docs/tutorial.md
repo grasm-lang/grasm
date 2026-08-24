@@ -757,7 +757,6 @@ runs only under `grasm run`:
 |-------|---------|
 | a generic **type** declaration | `type Pair[A, B] = { fst: A, snd: B }` |
 | an effect handler as a return type | `fn mk() -> ClockHandler { … }` |
-| a type parameter appearing **only** in a function-typed parameter's result | `fn key_by[T, K](xs: [T], f: fn(T) -> K) -> [K]` |
 | a handler that is a loop variable or a list element | `for h in hs { with Src handled_by h { … } }` — a `let`-bound handler compiles |
 | a handler operation that is a named `fn` | `SrcHandler{ get: named }` — write the closure inline |
 | a UFCS call of a *generic* free function | `[1, 2].describe()` for `fn describe[T](xs: [T])` — write `describe([1, 2])` |
