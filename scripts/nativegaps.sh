@@ -189,7 +189,13 @@ fn main() {
     }
 }'
 
-expect_refused "a closure whose parameter types nothing fixes" 'fn main() {
+# Was a gap, and the fix was to stop reconstructing an answer the checker had
+# already written down. A closure whose parameters nothing local fixes learns
+# them from its call site, inference reaches both, and the backend was rebuilding
+# that from the shapes visible at the closure — which cannot reach a call site in
+# another statement. It asks now, and the reconstruction stays as the fallback
+# for closures inference genuinely leaves unresolved.
+expect_compiles "a closure whose parameter types nothing fixes" 'fn main() {
     let f = |p| p.0 + p.1
     for (i, v) in [10, 20].enumerate() {
         print("{f((i, v))}")

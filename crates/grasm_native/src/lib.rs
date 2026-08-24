@@ -325,6 +325,7 @@ fn compile_object_scoped(
     cg.field_calls = analysis.field_calls;
     cg.fallible_closures = analysis.fallible_closures;
     cg.empty_types = analysis.empty_types;
+    cg.closure_param_types = analysis.closure_param_types;
     cg.only_module = only_module.map(str::to_string);
     cg.declare_runtime()?;
     let views: Vec<(String, &AstModule, std::collections::HashMap<String, String>)> = program
@@ -476,6 +477,7 @@ struct Codegen<'m> {
     fallible_closures: std::collections::HashSet<u32>,
     /// Start offset of each empty literal → the type the checker settled on.
     empty_types: std::collections::HashMap<u32, String>,
+    closure_param_types: std::collections::HashMap<u32, Vec<String>>,
 }
 
 /// One monomorphized copy of a generic function.
@@ -566,6 +568,7 @@ impl<'m> Codegen<'m> {
             field_calls: Default::default(),
             fallible_closures: std::collections::HashSet::new(),
             empty_types: std::collections::HashMap::new(),
+            closure_param_types: std::collections::HashMap::new(),
         }
     }
 
@@ -11150,6 +11153,39 @@ checker did",
     ) -> CResult<Vec<VType>> {
         if params.is_empty() {
             return Ok(Vec::new());
+        }
+        // The checker settled these, and asking it is not one more heuristic —
+        // it is the answer the rest of this function tries to reconstruct.
+        //
+        // A closure whose parameters nothing local fixes learns them from its
+        // call site, and inference reaches both. Everything below reconstructs
+        // that from the shapes it can see here, which is why `let f = |p| p.0 +
+        // p.1` called as `f((i, v))` was refused: the call site is in a
+        // different statement, and no shape here reaches it.
+        //
+        // Kept as a fallback rather than deleted. It handles closures the
+        // checker leaves with a type variable — genuinely unresolved, where a
+        // refusal is right — and it also runs while probing, where a partial
+        // answer is still useful.
+        if let Some(ts) = self.cg.closure_param_types.get(&span.start).cloned() {
+            if ts.len() == params.len() {
+                let mut out = Vec::with_capacity(ts.len());
+                let mut all = true;
+                for t in &ts {
+                    match grasm_syntax::parse_type_src(t)
+                        .and_then(|te| self.cg.vtype_of(&te).ok())
+                    {
+                        Some(vt) => out.push(vt),
+                        None => {
+                            all = false;
+                            break;
+                        }
+                    }
+                }
+                if all {
+                    return Ok(out);
+                }
+            }
         }
         // The parameter types come from a call site of whatever the closure
         // was bound to. Nothing else in the language says what they are.

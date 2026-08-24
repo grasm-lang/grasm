@@ -128,6 +128,17 @@ pub struct Analysis {
     /// `fail` inside `let f: fn(i64) -> str ! E = |n| …` unwind past the
     /// `??` written to handle it. Only the checker knows which is which.
     pub fallible_closures: std::collections::HashSet<u32>,
+    /// Start offset of each closure literal → the parameter types inference
+    /// settled on, written the way a person would.
+    ///
+    /// A closure whose parameters nothing local fixes learns them from the call
+    /// site, and the checker is the pass that reaches both. The compiled
+    /// backend probes the closure body instead, so `let f = |p| p.0 + p.1`
+    /// called as `f((i, v))` ran under `grasm run` and was refused by name.
+    ///
+    /// Present only when every parameter resolved: half an answer would turn a
+    /// refusal the backend can explain into a miscompile it cannot.
+    pub closure_param_types: std::collections::HashMap<u32, Vec<String>>,
     /// Start offset of each empty `[]` or `{}` literal → the type inference
     /// settled on for it, written the way a person would.
     ///
@@ -379,6 +390,20 @@ fn check_modules_in(
         .filter(|(_, _, t)| !c.show(t).contains('_'))
         .map(|(off, _, _)| *off)
         .collect();
+    // Only the ones inference actually settled. A type still holding a
+    // variable is not an answer, and handing the backend half of one would
+    // turn a refusal it can explain into a miscompile it cannot.
+    let closure_param_types: std::collections::HashMap<u32, Vec<String>> = c
+        .closure_params
+        .iter()
+        .filter_map(|(off, ts)| {
+            let shown: Vec<String> = ts.iter().map(|t| c.show(t)).collect();
+            if shown.iter().any(|s| s.contains('_')) {
+                return None;
+            }
+            Some((*off, shown))
+        })
+        .collect();
     let empty_types: std::collections::HashMap<u32, String> = c
         .empty_lits
         .clone()
@@ -449,6 +474,7 @@ fn check_modules_in(
             .filter(|(_, t)| matches!(c.uni.shallow_resolve(t), Type::Fallible(..)))
             .map(|(off, _)| *off)
             .collect(),
+        closure_param_types,
         empty_types,
         float_sums: c.float_sums,
         defs: c.defs,
@@ -517,6 +543,12 @@ struct Checker {
     /// Every closure literal's return type, by start offset, resolved once
     /// the whole program is typed.
     closure_types: HashMap<u32, Type>,
+    /// Every closure literal's start offset and its parameter types.
+    ///
+    /// Recorded as type *variables* and resolved at the end, because a closure
+    /// whose parameters nothing local fixes learns them from the call site —
+    /// which the checker reaches later. See `Analysis::closure_param_types`.
+    closure_params: Vec<(u32, Vec<Type>)>,
     /// Closure literals that a built-in higher-order method calls *now* —
     /// `xs.map(|x| …)` and its siblings.
     ///
@@ -729,6 +761,7 @@ impl Checker {
             ok_wrapped: std::collections::HashSet::new(),
             map_get_pending: Vec::new(),
             closure_types: HashMap::new(),
+            closure_params: Vec::new(),
             hof_closures: std::collections::HashSet::new(),
             handler_ids: std::collections::HashSet::new(),
             unsafe_depth: 0,
@@ -7683,6 +7716,11 @@ bind the component to a `var`, or use a struct when the parts have names worth w
             }) if want_params.len() == params.len() => want_params.clone(),
             _ => params.iter().map(|_| self.uni.fresh()).collect(),
         };
+        // Keyed by the closure and by its body, for the same reason the return
+        // type is: the backend identifies a closure by where its *body* starts,
+        // and one with parameters begins earlier than that.
+        self.closure_params.push((span.start, param_tys.clone()));
+        self.closure_params.push((body.span().start, param_tys.clone()));
         if let Some(Type::Fn {
             params: want_params, ..
         }) = expected

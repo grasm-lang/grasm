@@ -7,6 +7,15 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
 
 ### Fixed
 
+- **`--native` compiles a closure whose parameter types nothing local fixes.**
+  `let f = |p| p.0 + p.1`, called as `f((i, v))` in a later statement. Such a
+  closure learns its parameters from its call site and inference reaches both;
+  the backend was reconstructing that from the shapes visible *at the closure*,
+  which cannot reach a call site in another statement. The checker now exports
+  what it settled (`closure_param_types`), and the backend asks before
+  reconstructing. The reconstruction stays as the fallback, for closures
+  inference genuinely leaves unresolved — and those are refused by the checker
+  itself, so every engine refuses them with one message.
 - **`--native` compiles a `fold` seeded with an unannotated `map()`.** The
   cause was asymmetry rather than difficulty: an empty *list* asked the checker
   what it had resolved the literal to and an empty *map* did not, though the

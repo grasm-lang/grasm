@@ -359,19 +359,22 @@ fn a_function_value_printed_shows_what_it_is() {
 }
 
 #[test]
-fn an_uncalled_closure_with_parameters_is_reported() {
-    // Nothing says what `x` is, so the parameter type has nowhere to come
-    // from. Guessing would compile the wrong function.
-    let err = compile(
-        "fn main() {\n    let f = |x| x + 1\n    print(\"{f}\")\n}\n",
-    )
-    .expect_err("should be reported, not guessed");
-    assert!(
-        err.contains("nothing to come from")
-            || err.contains("no type says what its parameters are"),
-        "expected a clear reason, got: {err}"
-    );
+fn an_uncalled_closure_whose_parameter_inference_settles_compiles() {
+    // This asserted a refusal, on the grounds that nothing said what `x` was
+    // and guessing would compile the wrong function. Something does say:
+    // `x + 1` fixes `x` at `i64`, and the checker resolves it. The backend
+    // used to reconstruct parameter types from the shapes visible at the
+    // closure, could not see that, and refused — while `grasm run` printed
+    // `<closure>`. It reads the checker's answer now, and both engines print
+    // `<closure>`.
+    compile("fn main() {\n    let f = |x| x + 1\n    print(\"{f}\")\n}\n")
+        .expect("the checker resolves `x` to i64, so there is nothing to guess");
 }
+
+// The case this pair was written for — `|x| x`, which says nothing about `x`
+// anywhere and is never called — is refused by the *checker*, so every engine
+// refuses it with one message. It is tested where that refusal lives:
+// `an_unusable_closure_is_refused` in grasm_sema.
 
 // ---------------------------------------------------------------------------
 // par_map
