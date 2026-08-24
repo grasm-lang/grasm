@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::rc::Rc;
 
+use grasm_rt::replay;
 use grasm_syntax::ast::*;
 
 use crate::value::{ClosureBody, Value};
@@ -2753,12 +2754,43 @@ uses to mark the end of a string"
                     }
                     "read_file" => {
                         let p = self.eval_expr(&args[0])?.to_string();
+                        // The same journal the compiled engines use, so a
+                        // recording made by one engine replays under another —
+                        // which is what a debugger is for: the failure happened
+                        // in the native build and is being read in the
+                        // interpreter.
+                        if let Some(o) = replay::next("read_file") {
+                            return Ok(match o {
+                                replay::Outcome::Value(v) => Value::Ok(Rc::new(Value::str(
+                                    String::from_utf8_lossy(&v).into_owned(),
+                                ))),
+                                replay::Outcome::Failed(m) => {
+                                    Value::Err(Rc::new(io_error("IoFailed", m)))
+                                }
+                            });
+                        }
                         return Ok(match std::fs::read_to_string(&p) {
-                            Ok(s) => Value::Ok(Rc::new(Value::str(s))),
+                            Ok(s) => {
+                                replay::record(
+                                    "read_file",
+                                    &replay::Outcome::Value(s.as_bytes().to_vec()),
+                                );
+                                Value::Ok(Rc::new(Value::str(s)))
+                            }
                             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                replay::record(
+                                    "read_file",
+                                    &replay::Outcome::Failed(p.clone()),
+                                );
                                 Value::Err(Rc::new(io_error("NotFound", p)))
                             }
-                            Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
+                            Err(e) => {
+                                replay::record(
+                                    "read_file",
+                                    &replay::Outcome::Failed(e.to_string()),
+                                );
+                                Value::Err(Rc::new(io_error("IoFailed", e.to_string())))
+                            }
                         });
                     }
                     "write_file" => {
@@ -2810,8 +2842,19 @@ uses to mark the end of a string"
                                 format!("random_bytes is capped at 1048576 bytes, asked for {n}"),
                             ))));
                         }
+                        if let Some(o) = replay::next("random_bytes") {
+                            return Ok(match o {
+                                replay::Outcome::Value(v) => {
+                                    Value::Ok(Rc::new(Value::Bytes(Rc::new(v))))
+                                }
+                                replay::Outcome::Failed(m) => {
+                                    Value::Err(Rc::new(io_error("IoFailed", m)))
+                                }
+                            });
+                        }
                         let mut buf = vec![0u8; n as usize];
                         if n == 0 {
+                            replay::record("random_bytes", &replay::Outcome::Value(Vec::new()));
                             return Ok(Value::Ok(Rc::new(Value::Bytes(Rc::new(buf)))));
                         }
                         return Ok(match std::fs::File::open("/dev/urandom") {
@@ -2820,7 +2863,13 @@ uses to mark the end of a string"
                                 format!("cannot open /dev/urandom: {e}"),
                             ))),
                             Ok(mut f) => match f.read_exact(&mut buf) {
-                                Ok(()) => Value::Ok(Rc::new(Value::Bytes(Rc::new(buf)))),
+                                Ok(()) => {
+                                    replay::record(
+                                        "random_bytes",
+                                        &replay::Outcome::Value(buf.clone()),
+                                    );
+                                    Value::Ok(Rc::new(Value::Bytes(Rc::new(buf))))
+                                }
                                 Err(e) => Value::Err(Rc::new(io_error(
                                     "IoFailed",
                                     format!("short read: {e}"),
@@ -2985,13 +3034,38 @@ uses to mark the end of a string"
                         }));
                     }
                     "now_millis" => {
-                        return Ok(Value::Int(host_now_millis()));
+                        if let Some(replay::Outcome::Value(v)) = replay::next("now_millis") {
+                            return Ok(Value::Int(replay::bytes_i64(&v)));
+                        }
+                        let now = host_now_millis();
+                        replay::record(
+                            "now_millis",
+                            &replay::Outcome::Value(replay::i64_bytes(now)),
+                        );
+                        return Ok(Value::Int(now));
                     }
                     "env" => {
                         let name = self.eval_expr(&args[0])?.to_string();
+                        if let Some(o) = replay::next("env") {
+                            return Ok(match o {
+                                replay::Outcome::Value(v) => Value::some(Value::str(
+                                    String::from_utf8_lossy(&v).into_owned(),
+                                )),
+                                replay::Outcome::Failed(_) => Value::none(),
+                            });
+                        }
                         return Ok(match std::env::var(&name) {
-                            Ok(v) => Value::some(Value::str(v)),
-                            Err(_) => Value::none(),
+                            Ok(v) => {
+                                replay::record(
+                                    "env",
+                                    &replay::Outcome::Value(v.as_bytes().to_vec()),
+                                );
+                                Value::some(Value::str(v))
+                            }
+                            Err(_) => {
+                                replay::record("env", &replay::Outcome::Failed(String::new()));
+                                Value::none()
+                            }
                         });
                     }
                     "exit" => {
