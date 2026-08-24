@@ -758,7 +758,6 @@ runs only under `grasm run`:
 | a generic **type** declaration | `type Pair[A, B] = { fst: A, snd: B }` |
 | an effect handler as a return type | `fn mk() -> ClockHandler { … }` |
 | a handler that is a loop variable or a list element | `for h in hs { with Src handled_by h { … } }` — a `let`-bound handler compiles |
-| a handler operation that is a named `fn` | `SrcHandler{ get: named }` — write the closure inline |
 | a UFCS call of a *generic* free function | `[1, 2].describe()` for `fn describe[T](xs: [T])` — write `describe([1, 2])` |
 | an effect handler as a **struct field** type | `type Box = { h: CfgHandler }` — bind the handler with `let` instead |
 | a generic instantiated at a handler type | `f(h)` for `fn f[T](x: T)` — pass what the handler computes instead |

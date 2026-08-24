@@ -422,7 +422,13 @@ fn main() {
     print("{b.name} {a.name}")
 }'
 
-expect_refused "a handler op that is a named fn" 'effect Src {
+# Was a gap. A named function used as an operation needs only the wrapper that
+# gives it the `(env, params…)` shape every function value has — with one
+# difference that is not optional: a function value owns its environment and
+# releases it, while a handler operation is handed the address of a stack slot
+# in the frame that installed it. Sharing the wrapper decremented through a live
+# frame, which returned the right answer and then crashed.
+expect_compiles "a handler op that is a named fn" 'effect Src {
     fn get() -> str
 }
 

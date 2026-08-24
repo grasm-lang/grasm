@@ -1423,3 +1423,53 @@ annotated binding — compiles now too, for the same reason it did not before.
 
 Three engines agree on both variants, on a hand-built `NotFound("...")`, and on
 the `_` wildcard arm.
+
+## F39 — one wrapper, two meanings of "environment" (S1, would-be) — **caught before it shipped**
+
+A named function used as a handler operation needs the `(env, params…)` shape
+every function value has, and that wrapper already existed. Reusing it produced
+a program that printed the right answer and then died:
+
+```
+$ ./t
+2
+exit=138          # SIGBUS
+```
+
+The wrapper's first act is to release the environment it was handed, because a
+*function value's* environment is a reference it owns. A **handler
+operation's** environment is the address of a stack slot in the frame that
+installed the handler. The wrapper decremented a refcount through a pointer
+into a live frame.
+
+Two things about how it presented are worth keeping:
+
+**The answer was right.** The operation ran, returned `2`, and the damage was
+only read later. A test that checked the value and not the exit status would
+have passed.
+
+**It looked positional.** One named operation worked; a named operation at
+field index 1 crashed; a named operation at index 0 with a second operation
+after it crashed. That is not a real pattern — it is which stack addresses
+happened to matter — and it sent the first two hypotheses (a lifting-order
+problem, then emitting a function during the collection pass) in the wrong
+direction. The second hypothesis was implemented and changed nothing, which is
+what said the model was wrong rather than the code.
+
+### The fix
+
+`wrapper_for(key, span, owns_env)`, with `fn_value_wrapper` passing `true` and
+`handler_op_wrapper` passing `false`, and separate cache keys so the same
+function used both ways gets both wrappers. That last part is checked: `seven`
+is called through a function value, installed as a handler operation, and
+called through a value again, in one program.
+
+### What it says about the shape of the bug
+
+The two callers agreed on the *layout* of the ABI — a pointer, then the
+parameters — and disagreed about **who owns the pointer**. Nothing in the type
+of a `*const u8` says that, and both sides were written correctly against their
+own reading of it. An ownership convention that lives only in a comment is one
+the compiler cannot check, and this is the second time today that a mismatch
+between what two sides of an interface knew produced a defect — the other being
+the backend re-deriving what the checker had already settled.

@@ -398,6 +398,18 @@ fn compile_object_scoped(
     Ok(())
 }
 
+/// What a handler operation's code is.
+///
+/// A closure is lifted into a function of its own by the pass that walks the
+/// program. A named function already exists, and needs only the wrapper that
+/// gives it the `(env, params…)` shape every function value has — built where
+/// wrappers are built, not in the walking pass.
+#[derive(Clone)]
+enum HandlerOpCode {
+    Lifted(FuncId),
+    Named(String),
+}
+
 struct Codegen<'m> {
     module: &'m mut ObjectModule,
     fns: HashMap<String, FnSig>,
@@ -423,7 +435,7 @@ struct Codegen<'m> {
     /// effect name → ops (op name, param types, return type)
     effects: HashMap<String, Vec<(String, Vec<VType>, VType)>>,
     /// `with` site (by span start) → op name → lifted handler FuncId
-    handler_sites: HashMap<u32, Vec<(String, FuncId, Vec<String>)>>,
+    handler_sites: HashMap<u32, Vec<(String, HandlerOpCode, Vec<String>)>>,
     /// Captures each lifted handler operation ended up with, typed at the
     /// `with` site and read back when the operation itself is compiled.
     handler_captures: HashMap<FuncId, Vec<(String, VType)>>,
@@ -1759,7 +1771,7 @@ impl<'m> Codegen<'m> {
         ops: &[(String, Vec<VType>, VType)],
         fields: &[(Ident, Expr)],
         span: Span,
-    ) -> CResult<Vec<(String, FuncId, Vec<String>)>> {
+    ) -> CResult<Vec<(String, HandlerOpCode, Vec<String>)>> {
         let mut site = Vec::new();
         for (fname, fexpr) in fields {
             let Some((_, param_ts, ret_t)) =
@@ -1767,12 +1779,46 @@ impl<'m> Codegen<'m> {
             else {
                 return nope(fname.span, format!("the operation `{}`", fname.name));
             };
+            // A named function as an operation. Function values already travel
+            // as `(env, params…)`, and the wrapper that gives a named function
+            // that shape is the same one `[inc, inc]` uses — so the operation
+            // is that wrapper with an environment it never reads. Writing the
+            // closure out by hand was the advice, and it produced a different
+            // program only in how much of it there was.
             let Expr::Closure {
                 params: cparams,
                 body: cbody,
                 ..
             } = fexpr
             else {
+                if let Expr::Ident(fid) = fexpr {
+                    let key = format!("{}::{}", self.current_module, fid.name);
+                    if let Some(sig) = self.fns.get(&key).cloned() {
+                        if sig.params.len() != param_ts.len() || sig.ret != ret_t {
+                            return nope(
+                                fexpr.span(),
+                                format!(
+                                    "`{}` as the operation `{}` — its type is not the \
+operation's",
+                                    fid.name, fname.name
+                                ),
+                            );
+                        }
+                        // Recorded, not emitted. This pass runs before any body
+                        // is compiled, and emitting a function from inside it
+                        // left the next declaration compiling against a
+                        // half-written module: one named operation worked and
+                        // the second crashed the program it produced. The
+                        // wrapper is built where every other one is, when the
+                        // handler is installed.
+                        site.push((
+                            fname.name.clone(),
+                            HandlerOpCode::Named(key),
+                            Vec::new(),
+                        ));
+                        continue;
+                    }
+                }
                 return nope(fexpr.span(), "handler ops that aren't closures");
             };
             if cparams.len() != param_ts.len() {
@@ -1819,7 +1865,7 @@ impl<'m> Codegen<'m> {
                 ret: ret_t,
                 body: (**cbody).clone(),
             });
-            site.push((fname.name.clone(), id, free));
+            site.push((fname.name.clone(), HandlerOpCode::Lifted(id), free));
         }
         Ok(site)
     }
@@ -1934,7 +1980,29 @@ impl<'m> Codegen<'m> {
     /// takes the environment it will never use and forwards the rest. One per
     /// function, cached, so `[inc, inc]` does not emit two.
     fn fn_value_wrapper(&mut self, key: &str, span: Span) -> CResult<FuncId> {
-        if let Some(id) = self.fn_wrappers.get(key) {
+        self.wrapper_for(key, span, true)
+    }
+
+    /// The same wrapper, for a named function used as a *handler operation*.
+    ///
+    /// One difference, and it is not optional: a function value's environment
+    /// is a reference the wrapper owns and releases, while a handler
+    /// operation's is the address of a stack slot in the frame that installed
+    /// it. Releasing that is a decrement through a pointer into a live frame —
+    /// which produced the right answer and then SIGBUS, because the value came
+    /// back before the damage was read.
+    fn handler_op_wrapper(&mut self, key: &str, span: Span) -> CResult<FuncId> {
+        self.wrapper_for(key, span, false)
+    }
+
+    fn wrapper_for(&mut self, key: &str, span: Span, owns_env: bool) -> CResult<FuncId> {
+        let cache_key = if owns_env {
+            key.to_string()
+        } else {
+            format!("{key}#handlerop")
+        };
+        let key_for_sym = cache_key.clone();
+        if let Some(id) = self.fn_wrappers.get(&cache_key) {
             return Ok(*id);
         }
         let sig_info = self.fns[key].clone();
@@ -1950,7 +2018,7 @@ impl<'m> Codegen<'m> {
         if sig_info.ret != VType::Unit {
             sig.returns.push(AbiParam::new(sig_info.ret.cl()));
         }
-        let sym = format!("gv_{}", key.replace([':', '.', '[', ']', ','], "_"));
+        let sym = format!("gv_{}", key_for_sym.replace([':', '.', '[', ']', ',', '#'], "_"));
         let id = self
             .module
             .declare_function(&sym, Linkage::Local, &sig)
@@ -1968,9 +2036,16 @@ impl<'m> Codegen<'m> {
         b.switch_to_block(entry);
         let params: Vec<Value> = b.block_params(entry).to_vec();
         let env = params[0];
-        // The wrapper owns the environment reference it was handed.
-        let dec_ref = self.module.declare_func_in_func(self.runtime["grasm_val_dec"], b.func);
-        b.ins().call(dec_ref, &[env]);
+        // A function value's environment is a reference this wrapper owns.
+        // A handler operation's is a stack address, and releasing one of those
+        // is a decrement through a live frame.
+        if owns_env {
+            let dec_ref =
+                self.module.declare_func_in_func(self.runtime["grasm_val_dec"], b.func);
+            b.ins().call(dec_ref, &[env]);
+        } else {
+            let _ = env;
+        }
         let target = self.module.declare_func_in_func(sig_info.id, b.func);
         // A C function reached through a value is the same call as a direct
         // one, so a `str` or `bytes` parameter still crosses as a pointer
@@ -2037,7 +2112,7 @@ impl<'m> Codegen<'m> {
                 // has no name. Say which it is.
                 what: format!("{INTERNAL}  {e}"),
             })?;
-        self.fn_wrappers.insert(key.to_string(), id);
+        self.fn_wrappers.insert(cache_key, id);
         Ok(id)
     }
 
@@ -4886,7 +4961,8 @@ this case",
                 let ptr_ty = self.cg.module.target_config().pointer_type();
                 let mut held: Vec<(cranelift_codegen::ir::StackSlot, Vec<(String, VType)>)> =
                     Vec::new();
-                for (opname, fid, free) in site {
+                for (opname, opcode, free) in site {
+                    let fid = self.handler_op_func(&opcode, *span)?;
                     // Free names that resolve to something in scope here are
                     // the operation's captures. They are typed now, at the
                     // `with` site, because the pass that lifted the operation
@@ -5299,6 +5375,18 @@ this case",
 
     /// Like `eval_expr_val`, but an expected type supplies the element type
     /// for empty collection literals (`let xs: [i64] = []`).
+    /// The function that implements one handler operation.
+    ///
+    /// A lifted closure is already a function. A named one needs the wrapper
+    /// that gives it the `(env, params…)` shape, and this is where it is built
+    /// — during body compilation, like every other wrapper.
+    fn handler_op_func(&mut self, code: &HandlerOpCode, span: Span) -> CResult<FuncId> {
+        match code {
+            HandlerOpCode::Lifted(id) => Ok(*id),
+            HandlerOpCode::Named(key) => self.cg.handler_op_wrapper(key, span),
+        }
+    }
+
     /// Builds the `(code, env)` block a handler parameter is passed as.
     ///
     /// One pair per operation, in the effect's declared order, so the callee
@@ -5346,12 +5434,13 @@ this case",
             ),
         );
         for (slot_i, (opname, _, _)) in ops.iter().enumerate() {
-            let Some((_, fid, free)) = site.iter().find(|(o, _, _)| o == opname).cloned() else {
+            let Some((_, opcode, free)) = site.iter().find(|(o, _, _)| o == opname).cloned() else {
                 return nope(
                     e.span(),
                     format!("a `{eff}Handler` missing the operation `{opname}`"),
                 );
             };
+            let fid = self.handler_op_func(&opcode, e.span())?;
             let captures: Vec<(String, VType)> = free
                 .iter()
                 .filter_map(|n| {
