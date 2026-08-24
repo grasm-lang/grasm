@@ -34,7 +34,7 @@
 34-voting-app/main.gr 2761
 35-blog-dashboard/main.gr 3153
 36-markdown-editor/main.gr 1736
-37-user-auth/main.gr 3355
+37-user-auth/main.gr 3449
 38-upload-gallery/main.gr 3277
 39-chat-router/main.gr 3085
 40-collaborative-todo/main.gr 4144

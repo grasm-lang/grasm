@@ -1,0 +1,101 @@
+//! tag: L-LIB-RANDOM
+//! expect: output
+//! 32 bytes asked for, 32 given
+//! every byte is a byte: true
+//! two calls differ: true
+//! zero is empty, not an error: 0
+//! negative is refused
+//! past the cap is refused
+//! a byte in 0..5 without bias, 200 draws, every value seen: true
+// `random_bytes(n)` — the only source of entropy in the language, and the
+// primitive everything else is built from.
+//
+// Bytes rather than an integer or a float, because the conversions are where
+// the mistakes are: a number in a range wants rejection sampling, not a modulo,
+// and a language shipping `random_int(lo, hi)` with a modulo in it would have
+// shipped a bias. The last check below builds one correctly, in Grasm, to show
+// what the primitive is for.
+//
+// Charged `io`: it reaches outside the program and two calls do not agree.
+
+/// A number in `0..n` with no modulo bias, by rejection.
+///
+/// A byte is 0..255. Taking `b % n` makes the low values more likely whenever
+/// `n` does not divide 256 — for `n` of 5, the values 0 and 1 come up 52 times
+/// in 256 and the rest 51. So the top of the range is cut to a multiple of `n`
+/// and anything above it is drawn again.
+fn below(n: i64, source: bytes, inout at: i64) -> i64 {
+    let limit = 256 - (256 % n)
+    var going = true
+    var answer = 0
+    while going {
+        if at >= source.len() {
+            // Out of entropy: the caller gave a buffer too small. Answering
+            // anything here would be inventing a number.
+            going = false
+            answer = -1
+        } else {
+            let b = source.at(at)
+            at = at + 1
+            if b < limit {
+                answer = b % n
+                going = false
+            }
+        }
+    }
+    answer
+}
+
+fn main() / {io} {
+    match random_bytes(32) {
+        Err(e) -> print("random_bytes failed: {e}")
+        Ok(b) -> {
+            print("32 bytes asked for, {b.len()} given")
+            var all_bytes = true
+            for v in b.to_list() {
+                if v < 0 or v > 255 {
+                    all_bytes = false
+                }
+            }
+            print("every byte is a byte: {all_bytes}")
+        }
+    }
+
+    // Two draws of 32 bytes being equal has probability 2^-256. If this ever
+    // prints false, the entropy source is broken and that is worth failing on.
+    let a = random_bytes(32) ?? bytes_of([])
+    let c = random_bytes(32) ?? bytes_of([])
+    print("two calls differ: {a.to_list() != c.to_list()}")
+
+    print("zero is empty, not an error: {(random_bytes(0) ?? bytes_of([9])).len()}")
+
+    match random_bytes(-1) {
+        Ok(_) -> print("negative was accepted, which it must not be")
+        Err(e) -> print("negative is refused")
+    }
+    match random_bytes(2000000) {
+        Ok(_) -> print("past the cap was accepted, which it must not be")
+        Err(e) -> print("past the cap is refused")
+    }
+
+    // What the primitive is for: a fair number in a range, built here rather
+    // than shipped with a bias in it.
+    let pool = random_bytes(512) ?? bytes_of([])
+    var seen = [false, false, false, false, false]
+    var at = 0
+    var draws = 0
+    while draws < 200 {
+        let v = below(5, pool, at)
+        if v >= 0 {
+            seen[v] = true
+        }
+        draws = draws + 1
+    }
+    var every = true
+    for s in seen {
+        if not s {
+            every = false
+        }
+    }
+    print("a byte in 0..5 without bias, 200 draws, every value seen: {every}")
+}

@@ -62,6 +62,7 @@ for src in $programs; do
                 udp_bind:sockets net_wait:sockets \
                 read_file:filesystem write_file:filesystem \
                 read_bytes:filesystem write_bytes:filesystem \
+                random_bytes:filesystem \
                 list_dir:filesystem make_dir:filesystem \
                 proc_run:processes proc_pipeline:processes; do
         if grep -q "${need%%:*}" "$src"; then

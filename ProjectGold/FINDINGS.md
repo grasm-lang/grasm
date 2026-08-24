@@ -1145,7 +1145,7 @@ which was honest and worse. It is kept in the history rather than the file,
 because what a project settles for when a tool is missing stops being
 interesting once the tool exists.
 
-## F34 — there is no source of randomness (S3, library) — **open**
+## F34 — there is no source of randomness (S3, library) — **fixed**
 
 Found writing phase 2's project 7, which is authentication: a password hash, a
 session token, and a route that refuses without one.
@@ -1172,16 +1172,37 @@ This is not only about authentication. Without randomness a program cannot
 shuffle, cannot pick a nonce, cannot make a UUID, cannot sample, and cannot seed
 its own property tests independently of the harness.
 
-### What would close it
+### Fixed: `random_bytes(n)` ([L-LIB-RANDOM])
 
-`random_bytes(n) -> bytes`, charged an effect — `io` is the honest one, since it
-reads from the operating system and two calls do not agree. Every platform this
-targets has `getrandom`, `getentropy` or `/dev/urandom`, and the last of those
-is reachable with the file surface that already exists.
+`n` bytes from `/dev/urandom`, charged `io` — because it reaches outside the
+program and two calls do not agree, which is the same reason the clock is
+charged.
 
-`wasm32-unknown-unknown` has none of them, which is a real constraint rather
-than an objection: the wasm engine already refuses `net` and the filesystem, and
-would refuse this the same way.
+`/dev/urandom` rather than a userspace generator: it is seeded by the kernel, it
+needs no reseeding, and a language with no audited crypto has no business
+shipping its own. A short read is a failure rather than a short answer, because
+a caller asking for 32 bytes of key material and getting 12 must not proceed.
+
+**The primitive is bytes, deliberately.** Everything else is built from it and
+the conversions are where the mistakes live: a number in a range wants rejection
+sampling, not a modulo, and a language that shipped `random_int(lo, hi)` with a
+modulo in it would have shipped a bias. `L-LIB-RANDOM.gr` builds a fair one in
+Grasm to show what the primitive is for, and explains in a comment why `b % 5`
+makes 0 and 1 come up 52 times in 256 and the rest 51.
+
+`wasm32-unknown-unknown` has no filesystem, so the wasm engine refuses it the
+way it refuses `net` — a refusal, never a wrong answer.
+
+### Project 37's tokens are no longer guessable
+
+The finding's own example is closed. Session tokens were
+`sha256("token:" + now_millis() + ...)`; they are 256 bits of kernel entropy
+now. And if entropy is unavailable, `login` answers **500 rather than issuing
+one** — a token that might be guessable is worse than an error, because it looks
+exactly like a good one.
+
+The salt still uses the clock, and that is correct rather than left over: a
+salt's job is uniqueness, not unpredictability.
 
 ## F35 — a `capabilities = []` package could read and write any file (S2, soundness) — **fixed**
 

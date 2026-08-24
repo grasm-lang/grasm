@@ -5119,6 +5119,57 @@ pub unsafe extern "C" fn grasm_tcp_read(handle: *mut RtVal) -> *mut RtVal {
     }
 }
 
+/// `n` bytes from the operating system's entropy source.
+///
+/// Grasm had `now_millis()` and nothing else, so a program could not pick a
+/// nonce, make a UUID, shuffle a list, or issue a session token that was not
+/// guessable by anyone who knew roughly when it was issued (ProjectGold F34).
+///
+/// Charged `io`, because it reaches outside the program and two calls do not
+/// agree — the same reason the clock is charged. A pure function that answered
+/// differently each time would break every promise the effect row makes.
+///
+/// `/dev/urandom` rather than a userspace generator: it is seeded by the
+/// kernel, it does not need reseeding, and a language with no audited crypto
+/// has no business shipping its own. A short read is a failure rather than a
+/// short answer, because a caller asking for 32 bytes of key material and
+/// getting 12 must not proceed.
+///
+/// # Safety: called from compiled Grasm with boxed values.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_random_bytes(count: *mut RtVal) -> *mut RtVal {
+    use std::io::Read;
+    let n = match &(*count).payload {
+        RtPayload::I64(v) => *v,
+        _ => return err_of(io_err("IoFailed", "count must be an integer".to_string())),
+    };
+    if n < 0 {
+        return err_of(io_err(
+            "IoFailed",
+            format!("random_bytes needs a count of 0 or more, got {n}"),
+        ));
+    }
+    // A cap, because the argument is often a length somebody computed and a
+    // mistake there should be a refusal rather than a gigabyte.
+    if n > 1_048_576 {
+        return err_of(io_err(
+            "IoFailed",
+            format!("random_bytes is capped at 1048576 bytes, asked for {n}"),
+        ));
+    }
+    let mut buf = vec![0u8; n as usize];
+    if n == 0 {
+        return ok_of(alloc(RtPayload::Bytes(std::sync::Arc::new(buf))));
+    }
+    match std::fs::File::open("/dev/urandom") {
+        Err(e) => err_of(io_err("IoFailed", format!("cannot open /dev/urandom: {e}"))),
+        Ok(mut f) => match f.read_exact(&mut buf) {
+            Ok(()) => ok_of(alloc(RtPayload::Bytes(std::sync::Arc::new(buf)))),
+            Err(e) => err_of(io_err("IoFailed", format!("short read: {e}"))),
+        },
+    }
+}
+
 /// What has arrived, as **bytes**.
 ///
 /// `tcp_read` answers text, and does it lossily, because a `str` is text and a

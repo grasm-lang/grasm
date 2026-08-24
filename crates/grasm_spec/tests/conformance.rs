@@ -607,7 +607,20 @@ fn the_language_pack_is_current_and_complete() {
         Err(e) => panic!("dist/{name} is missing ({e}) — regenerate it with scripts/language_pack.sh"),
     };
     let pack = read("grasm-language-pack.md");
-    let conf = read("grasm-conformance-pack.md");
+    // The conformance programs are four files now, split by the area a clause
+    // belongs to — `G-` grammar, `T-` types, `E-` semantics, `L-` library.
+    //
+    // They were one file until it passed the 200 KB a reader can load on its
+    // own, and this test's own message said to split rather than raise the
+    // ceiling. Splitting was right for a second reason the message did not
+    // predict: a rule in dispute is about one of those four, and nobody needs
+    // all four at once.
+    let areas = ["grammar", "types", "semantics", "library"];
+    let conf: String = areas
+        .iter()
+        .map(|a| read(&format!("grasm-conformance-{a}.md")))
+        .collect::<Vec<_>>()
+        .join("\n");
 
     for tag in declared_tags() {
         assert!(
@@ -618,10 +631,20 @@ fn the_language_pack_is_current_and_complete() {
     for case in all_cases() {
         assert!(
             conf.contains(&format!("`{}`", case.name)),
-            "the conformance pack is missing program `{}` — regenerate it",
+            "no conformance part carries program `{}` — regenerate them, and if \
+             its tag starts with a letter other than G, T, E or L it landed in \
+             `misc` and needs an area",
             case.name
         );
     }
+    // Nothing may land in `misc`. A clause whose tag matches no area is a clause
+    // nobody will find when they go looking for its area.
+    assert!(
+        !root.join("dist/grasm-conformance-misc.md").exists(),
+        "dist/grasm-conformance-misc.md exists — some clause tag starts with a \
+         letter that is not G, T, E or L, so it is filed where no reader will \
+         look for it"
+    );
     // The definition must stay small enough to hand to a model whole, with room
     // left to work in: every cold evaluation of this language is run by giving
     // an agent the pack and nothing else, so the claim is load-bearing.
@@ -645,13 +668,23 @@ fn the_language_pack_is_current_and_complete() {
     // exist precisely so that a reader loads one of them, and a ceiling on their
     // sum is a ceiling on how many clauses the language may ever have. That is
     // not a property worth holding. Per-file is.
-    assert!(
-        conf.len() < 200_000,
-        "the conformance pack has grown to {} bytes — it must stay context-sized \
-on its own. At that point split it by area (types, effects, library) rather than \
-moving this.",
-        conf.len()
-    );
+    // Each *part* holds to the same 200 KB, for the same reason. The sum is
+    // deliberately not bounded: these exist so a reader loads one of them, and a
+    // ceiling on the sum would be a ceiling on how many clauses the language may
+    // ever have. That is not a property worth holding; per-file is.
+    //
+    // The split happened when the single file reached 203,203 bytes. If one
+    // *part* now approaches 200 KB, split that part further — by the same
+    // reasoning, and not by raising this.
+    for area in areas {
+        let part = read(&format!("grasm-conformance-{area}.md"));
+        assert!(
+            part.len() < 200_000,
+            "dist/grasm-conformance-{area}.md has grown to {} bytes — it must stay \
+             context-sized on its own. Split that area further rather than moving this.",
+            part.len()
+        );
+    }
 }
 
 #[test]

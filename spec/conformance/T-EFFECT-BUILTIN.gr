@@ -44,6 +44,7 @@ fn every_world_touching_builtin(path: str) / {io} {
     // type-checked and not called, which is the whole technique.
     let _l = input()
     let _i = now_millis()
+    match random_bytes(0) { Ok(v) -> {}  Err(e) -> {} }
     let _j = env(path)
     let _k = args()
     eprint("")

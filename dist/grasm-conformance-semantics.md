@@ -1,0 +1,1963 @@
+# Grasm — conformance programs: semantics
+
+Evaluation — what a program does when it runs. 66 executable program(s), one per normative clause of
+`grasm-language-pack.md`. Each header states the tag it demonstrates and the
+exact expected behaviour, and every one is run by `cargo test -p grasm_spec`, so
+a program here cannot describe behaviour the implementation does not have.
+
+This is the companion to the definition rather than part of it. Read the
+definition to write Grasm; read this when a rule is in dispute and you want to
+see it settled by a program.
+
+The programs are split by area because together they no longer fit in one
+context, and a reader with a rule in dispute needs one area rather than four.
+The other parts are `grasm-conformance-grammar`, `grasm-conformance-types`, `grasm-conformance-semantics`, `grasm-conformance-library`.
+
+## `E-ARGS.gr`
+
+```grasm
+//! tag: E-ARGS
+//! expect: output
+//! 0
+fn main() {
+    // No arguments were passed after `--`.
+    print("{args().len()}")
+}
+```
+
+## `E-ARITH-FLOAT.gr`
+
+```grasm
+//! tag: E-ARITH-FLOAT
+//! expect: output
+//! 0.30000000000000004
+//! inf
+fn main() {
+    print("{0.1 + 0.2}")
+    print("{1.0 / 0.0}")
+}
+```
+
+## `E-ARITH-INT.gr`
+
+```grasm
+//! tag: E-ARITH-INT
+//! expect: output
+//! 14
+//! -9223372036854775808
+//! -9223372036854775808
+//! 0
+//! 7 0 -7
+fn main() {
+    print("{2 + 3 * 4}")
+    // Wrapping on overflow, two's complement.
+    var max = 9223372036854775807
+    print("{max + 1}")
+
+    // `i64::MIN / -1` has no i64 result, so it wraps like any other overflow
+    // rather than trapping. The hardware divide instruction does trap on it,
+    // which is why this is worth a program: the native backend has to avoid
+    // handing the CPU that operand pair.
+    var min = -9223372036854775807
+    min = min - 1
+    print("{min / -1}")
+    print("{min % -1}")
+
+    print("{-7 / -1} {-7 % -1} {7 / -1}")
+}
+```
+
+## `E-BENCH-WARMUP.gr`
+
+```grasm
+//! tag: E-BENCH-WARMUP
+//! expect: output
+//! 4
+// A `bench` declaration is checked like any other body but is only executed by
+// `grasm bench`, so running this program prints only what `main` prints.
+bench "doubling" {
+    let x = 2 * 2
+    assert(x == 4)
+}
+
+fn main() {
+    print("{2 * 2}")
+}
+```
+
+## `E-BORROWED-READ.gr`
+
+```grasm
+//! tag: E-BORROWED-READ
+//! expect: output
+//! Hello World|15|[Hello, World]|15
+//! [2, 1, 3] 3 false
+//! [a, b] [1, 2] [(a, 1), (b, 2)] 2
+//! 15 3 2
+//! 2000 40000 1 20
+// A read-only method on a plain variable does not touch the value's
+// refcount: the variable already holds a reference for the whole call, so
+// the usual +1/-1 around it is traffic and nothing else.
+//
+// This program exists to prove the value survives it. Every receiver is read
+// several times and then used again, and the last block builds and keeps two
+// thousand lists while reading them, which is where an early free would show.
+fn main() {
+    let s = "  Hello World  "
+    let xs = [3, 1, 2]
+    var m: Map[str, i64] = {"a": 1, "b": 2}
+    print("{s.trim()}|{s.to_upper().len()}|{s.words()}|{s.chars().len()}")
+    print("{xs.rev()} {xs.len()} {xs.is_empty()}")
+    print("{m.keys()} {m.values()} {m.entries()} {m.len()}")
+    // Still usable after every one of those.
+    print("{s.len()} {xs.len()} {m.len()}")
+
+    var kept: [[i64]] = []
+    var i = 0
+    while i < 2000 {
+        var ys: [i64] = []
+        var j = 0
+        while j < 20 {
+            ys.push(j)
+            j = j + 1
+        }
+        if ys.len() > 0 and not ys.is_empty() {
+            kept.push(ys)
+        }
+        i = i + 1
+    }
+    var total = 0
+    for k in kept {
+        total = total + k.len()
+    }
+    var held: Map[str, [i64]] = {}
+    held.set("a", kept.get(0) ?? [])
+    print("{kept.len()} {total} {held.len()} {(held.get("a") ?? []).len()}")
+}
+```
+
+## `E-CLOSURE-CAPTURE.gr`
+
+```grasm
+//! tag: E-CLOSURE-CAPTURE
+//! expect: output
+//! 2 one
+//! 2 one
+//! 3 two
+// A closure captures values, at the moment it is created.
+//
+// A handler's operations are closures, so a handler cannot hold mutable
+// state: what it captured is what it keeps, however the binding moves on.
+// The compiled backend stored the pointer without holding a reference to it,
+// so the binding looked unshared, copy-on-write never fired, and the handler
+// saw every later mutation — a wrong answer, and a crash when the binding was
+// reassigned and freed what the handler still pointed at.
+effect Snap {
+    fn size() -> i64
+    fn text() -> str
+}
+
+fn main() {
+    var xs = [1, 2]
+    var s = "one"
+    with Snap handled_by SnapHandler{ size: || xs.len(), text: || s } {
+        print("{Snap.size()} {Snap.text()}")
+        xs.push(3)
+        s = "two"
+        print("{Snap.size()} {Snap.text()}")
+    }
+    print("{xs.len()} {s}")
+}
+```
+
+## `E-COALESCE-DIVERGE.gr`
+
+```grasm
+//! tag: E-COALESCE-DIVERGE
+//! expect: output
+//! 1 0
+//! 10 -1
+//! 7
+// `?? fail(e)` — absence turned into a failure, which is the shape most
+// fallible function bodies take.
+type E = { m: str }
+
+fn need(m: Map[str, i64], k: str) -> i64 ! E {
+    m.get(k) ?? fail(E{ m: "no {k}" })
+}
+
+fn doubled(o: Option[i64]) -> i64 ! E {
+    let v = o ?? fail(E{ m: "none" })
+    v * 2
+}
+
+fn main() {
+    let m = {"a": 1}
+    print("{need(m, "a") ?? 0} {need(m, "b") ?? 0}")
+    print("{doubled(Some(5)) ?? 0 - 1} {doubled(None) ?? 0 - 1}")
+    // A fallback that does produce a value still does.
+    print("{m.get("zz") ?? 7}")
+}
+```
+
+## `E-COALESCE-LAZY.gr`
+
+```grasm
+//! tag: E-COALESCE-LAZY
+//! expect: output
+//! evaluated 1
+//! evaluated 2
+//! 2
+//! 3
+//! 9
+// The right side runs only when it is needed, and defaults chain.
+//
+// `??` groups to the right, so each default may itself be absent. Grouping
+// left made the middle operand have to be a plain value, and
+// `first() ?? second() ?? fallback` did not compile.
+type E = | Bad
+
+fn loud(n: i64) -> Option[i64] {
+    print("evaluated {n}")
+    if n == 2 {
+        Some(n)
+    } else {
+        None
+    }
+}
+
+fn fallible(b: bool) -> i64 ! E {
+    if b {
+        Ok(9)
+    } else {
+        Err(Bad)
+    }
+}
+
+fn main() {
+    // `loud(3)` is never reached, and neither is the final `0`.
+    print("{loud(1) ?? loud(2) ?? loud(3) ?? 0}")
+    var m: Map[str, i64] = {}
+    m.set("c", 3)
+    print("{m.get("a") ?? m.get("b") ?? m.get("c") ?? 0}")
+    print("{fallible(false) ?? fallible(true) ?? 0}")
+}
+```
+
+## `E-CONST-REF.gr`
+
+```grasm
+//! tag: E-CONST-REF
+//! expect: error
+//! holds a reference
+// A constant may not hold a reference, however it got one.
+//
+// A constant is evaluated again at every mention, so a reference in one is a
+// fresh slot each time: two mentions on one line print two different
+// references, `release` gives up a slot nothing else names, and a loop leaks
+// one per iteration. The check looked for a literal `ref(...)` in the
+// initializer, so a helper returning one walked straight past it — and so
+// would a struct or a list holding one.
+type Node = { id: i64 }
+
+fn mk() -> ref Node {
+    ref(Node{ id: 1 })
+}
+
+let ROOT = mk()
+
+fn main() {
+    print("{ROOT} {ROOT}")
+}
+```
+
+## `E-CONST.gr`
+
+```grasm
+//! tag: E-CONST
+//! expect: output
+//! Sales report is 77 wide, tab 9
+//! #####
+//! [10, 20, 30] 3
+//! 77 154
+//! 4 6
+// A module-level `let` is a constant. Without them every layout constant had
+// to be a zero-argument function, which is what a program ends up full of.
+let TABLE_WIDTH = 77
+let TAB = 9
+let TITLE: str = "Sales report"
+let LIMITS = [10, 20, 30]
+/// A constant may be computed from another declared before it.
+let DOUBLE_WIDTH = TABLE_WIDTH * 2
+/// And from a function, or naming one as a value — a dispatch table is the
+/// shape this is for.
+let TWICE_TWO = two() * 2
+let AGGS: Map[str, fn([i64]) -> i64] = {"sum": total, "count": howmany}
+
+fn two() -> i64 {
+    2
+}
+
+fn total(xs: [i64]) -> i64 {
+    xs.sum()
+}
+
+fn howmany(xs: [i64]) -> i64 {
+    xs.len()
+}
+
+fn bar(n: i64) -> str {
+    "#".repeat(n.min(TABLE_WIDTH))
+}
+
+fn main() {
+    print("{TITLE} is {TABLE_WIDTH} wide, tab {TAB}")
+    print("{bar(5)}")
+    print("{LIMITS} {LIMITS.len()}")
+    print("{TABLE_WIDTH} {DOUBLE_WIDTH}")
+    let f = AGGS.get("sum") ?? howmany
+    print("{TWICE_TWO} {f([1, 2, 3])}")
+}
+```
+
+## `E-COW.gr`
+
+```grasm
+//! tag: E-COW
+//! expect: output
+//! 3 4
+fn main() {
+    // Copy-on-write is never observable: the copy is independent.
+    var xs = [1, 2, 3]
+    var ys = xs
+    ys.push(4)
+    print("{xs.len()} {ys.len()}")
+}
+```
+
+## `E-DIV-ZERO.gr`
+
+```grasm
+//! tag: E-DIV-ZERO
+//! expect: panic
+//! division by zero
+fn main() {
+    let a = 1
+    let b = 0
+    print("{a / b}")
+}
+```
+
+## `E-EFFECT-NO-INOUT.gr`
+
+```grasm
+//! tag: E-EFFECT-NO-INOUT
+//! expect: error
+//! cannot take an `inout` parameter
+// An effect operation cannot take `inout`.
+//
+// A handler runs through a function value, so the write landed in a copy the
+// caller never saw: the handler reported success, the caller read back an
+// empty list, and every engine agreed on the wrong answer — which is the one
+// shape no differential test can catch. It typechecked, so the only way to
+// learn this was to run it and disbelieve the result.
+effect Audit {
+    fn record(inout sink: [str], entry: str)
+}
+
+fn main() {
+    print("unreachable")
+}
+```
+
+## `E-ENTRY.gr`
+
+```grasm
+//! tag: E-ENTRY
+//! expect: output
+//! started
+fn main() {
+    print("started")
+}
+```
+
+## `E-EQ-STRUCTURAL.gr`
+
+```grasm
+//! tag: E-EQ-STRUCTURAL
+//! expect: output
+//! true true false
+type P = { x: i64, y: [str] }
+fn main() {
+    let a = P{ x: 1, y: ["k"] }
+    let b = P{ x: 1, y: ["k"] }
+    let c = P{ x: 2, y: ["k"] }
+    print("{a == b} {[1, 2] == [1, 2]} {a == c}")
+}
+```
+
+## `E-ERR-PROPAGATE.gr`
+
+```grasm
+//! tag: E-ERR-PROPAGATE
+//! expect: output
+//! caught Bad
+//! skipped rest
+type E = | Bad
+fn failing() -> i64 ! E {
+    fail(Bad)
+}
+fn caller(inout reached: bool) -> i64 ! E {
+    let v = try failing()
+    reached = true
+    v
+}
+fn main() {
+    var reached = false
+    match caller(reached) {
+        Ok(v) -> print("ok {v}")
+        Err(e) -> print("caught {e}")
+    }
+    if not reached {
+        print("skipped rest")
+    }
+}
+```
+
+## `E-HANDLER-INNERMOST.gr`
+
+```grasm
+//! tag: E-HANDLER-INNERMOST
+//! expect: output
+//! 1
+//! 2
+//! 1
+effect Clock {
+    fn now() -> i64
+}
+fn main() {
+    with Clock handled_by ClockHandler{ now: || 1 } {
+        print("{Clock.now()}")
+        with Clock handled_by ClockHandler{ now: || 2 } {
+            print("{Clock.now()}")
+        }
+        print("{Clock.now()}")
+    }
+}
+```
+
+## `E-HANDLER-MISSING.gr`
+
+```grasm
+//! tag: E-HANDLER-MISSING
+//! expect: error
+//! it was declared outside the `with` block
+// A handled effect cannot leave the block that handles it.
+//
+// The closure's `Cfg` is discharged where it is written, because that is
+// where the handler is. Storing it in `f`, which outlives the block, carried
+// the discharge along: `f()` afterwards found no handler and reached the
+// runtime panic this clause says well-typed programs never do.
+effect Cfg {
+    fn value() -> i64
+}
+
+fn main() {
+    var f: fn() -> i64 / {Cfg} = || 0
+    with Cfg handled_by CfgHandler{ value: || 1 } {
+        f = || Cfg.value()
+    }
+    print("{f()}")
+}
+```
+
+## `E-HANDLER-OPS.gr`
+
+```grasm
+//! tag: E-HANDLER-OPS
+//! expect: error
+//! is an operation of a handler
+// A handler's operations are called by performing the effect.
+//
+// They are the one function value with no row to check — that exemption is
+// what lets `LogHandler{ info: |m| print(m) }` be written at all. Reading one
+// back out turned the exemption into a laundry: this `quiet` declares the
+// empty row and prints, `par_map(h.info)` ran it on several cores, and one
+// carrying a handled effect escaped its `with` block.
+effect Log {
+    fn info(m: str)
+}
+
+fn quiet(h: LogHandler) / {} {
+    h.info("io from a function declaring nothing")
+}
+
+fn main() {
+    quiet(LogHandler{ info: |m| print("{m}") })
+}
+```
+
+## `E-HANDLER-OWN-ROW.gr`
+
+```grasm
+//! tag: E-HANDLER-OWN-ROW
+//! expect: error
+//! performs effect(s) `io` not in its declared row
+// A handler's own effects belong to whoever installs it.
+//
+// They were charged where the handler was *constructed*, which is the same
+// place only when the handler is written at the `with`. One function call
+// away, a declared row meant nothing: this `run` installs a printing handler
+// and claimed to perform nothing.
+effect Log {
+    fn info(m: str)
+}
+
+fn run(h: LogHandler) / {} {
+    with Log handled_by h {
+        Log.info("x")
+    }
+}
+
+fn main() {
+    run(LogHandler{ info: |m| print("{m}") })
+}
+```
+
+## `E-HANDLER-SCOPE.gr`
+
+```grasm
+//! tag: E-HANDLER-SCOPE
+//! expect: output
+//! 42
+effect Cfg {
+    fn value() -> i64
+}
+fn deep() -> i64 {
+    Cfg.value()
+}
+fn middle() -> i64 {
+    deep()
+}
+fn main() {
+    with Cfg handled_by CfgHandler{ value: || 42 } {
+        print("{middle()}")
+    }
+}
+```
+
+## `E-IF-DIVERGE.gr`
+
+```grasm
+//! tag: E-IF-DIVERGE
+//! expect: output
+//! 25 ok2 0.25 true
+//! N 7
+//! 15 -1
+//! 25
+//! 0 -> err z
+//! 1 -> 100
+//! 2 -> 50
+// A branch that leaves — `fail`, `panic`, `return` — has no value, so the
+// `if` is worth whatever the *other* branch produced.
+//
+// Taking the type from the then branch alone meant `if c { fail(e) } else
+// { v }` in tail position had no merge value at all: the compiled function
+// returned a zero, with exit 0 and nothing reported. For a boxed payload it
+// was a SIGSEGV later, in whichever code read the value back.
+type E = { c: str }
+type V = | N(n: i64) | S(s: str)
+
+fn fi(y: i64) -> i64 ! E {
+    if y == 0 { fail(E{ c: "z" }) } else { 100 / y }
+}
+
+fn fs(y: i64) -> str ! E {
+    if y == 0 { fail(E{ c: "z" }) } else { "ok{y}" }
+}
+
+fn ff(y: i64) -> f64 ! E {
+    if y == 0 { fail(E{ c: "z" }) } else { 1.0 / y.as_f64() }
+}
+
+fn fb(y: i64) -> bool ! E {
+    if y == 0 { fail(E{ c: "z" }) } else { y > 1 }
+}
+
+/// A boxed payload: this was the SIGSEGV.
+fn fv(y: i64) -> V ! E {
+    if y == 0 { fail(E{ c: "z" }) } else { V.N(y) }
+}
+
+/// An `else if` chain of failures ending at the one arm with a value.
+fn chain(y: i64) -> i64 ! E {
+    if y == 0 {
+        fail(E{ c: "a" })
+    } else if y == 1 {
+        fail(E{ c: "b" })
+    } else {
+        y * 3
+    }
+}
+
+fn main() {
+    print("{fi(4) ?? 0 - 1} {fs(2) ?? "?"} {ff(4) ?? 0.0} {fb(2) ?? false}")
+    match fv(7) {
+        Ok(V.N(n)) -> print("N {n}")
+        Ok(V.S(s)) -> print("S {s}")
+        Err(e) -> print("e {e.c}")
+    }
+    print("{chain(5) ?? 0 - 1} {chain(1) ?? 0 - 1}")
+    // Stored and read back, which is where the boxed case crashed.
+    var m: Map[str, i64 ! E] = {}
+    m.set("a", fi(4))
+    // `??` groups to the right, so the layered unwrap — an `Option` of a
+    // fallible value — says so with brackets.
+    print("{(m.get("a") ?? fi(1)) ?? 0 - 1}")
+    // And the whole shape end to end.
+    for n in [0, 1, 2] {
+        match fi(n) {
+            Ok(v) -> print("{n} -> {v}")
+            Err(e) -> print("{n} -> err {e.c}")
+        }
+    }
+}
+```
+
+## `E-IF-FALLIBLE-MERGE.gr`
+
+```grasm
+//! tag: E-IF-FALLIBLE-MERGE
+//! expect: output
+//! -1
+//! -1 3
+//! -1
+//! 9 7 -1
+//! 3
+// An `if` whose branches are `Err(e)` and `Ok(v)` is worth `T ! E`.
+//
+// `Err(e)` says nothing about the ok half — there is no value to read it off
+// — so a branch that is only `Err` cannot type the merge on its own. Taking
+// it anyway made `xs.map(|x| if p { Err(e) } else { Ok(x) })` produce a list
+// whose elements `??` then unboxed as the wrong thing: SIGSEGV, empty stderr,
+// exit 139, from a compiled build that had reported no problem at all.
+type E = | Bad
+
+fn main() {
+    let r = [2].map(|x| if x == 2 { Err(Bad) } else { Ok(x) })
+    print("{r[0] ?? 0 - 1}")
+    let p = [2, 3].par_map(|x| if x == 2 { Err(Bad) } else { Ok(x) })
+    print("{p[0] ?? 0 - 1} {p[1] ?? 0 - 1}")
+    var m: Map[str, i64] = {}
+    m.set("a", 2)
+    let v = m.values().map(|x| if x == 2 { Err(Bad) } else { Ok(x) })
+    print("{v[0] ?? 0 - 1}")
+    // Every arm that can say something, and no arm that leaves. Folding a
+    // `return` arm in made the inner match worth nothing, so the enclosing
+    // function returned whatever was in the register — `0` where the answer
+    // was `9`.
+    print("{g(true, 3) ?? -1} {g(true, 0) ?? -1} {g(false, 3) ?? -1}")
+    // One branch builds the whole `T ! E`, the other gives the ok half, which
+    // a fallible body may do either way ([T-OK-ERR-RETURN]).
+    print("{h(false) ?? -1}")
+}
+
+fn g(live: bool, x: i64) -> i64 ! E {
+    match live {
+        false -> fail(Bad)
+        _ -> match x {
+            0 -> return 7
+            _ -> x * 3
+        }
+    }
+}
+
+fn h(b: bool) -> i64 ! E {
+    if b {
+        Err(Bad)
+    } else {
+        3
+    }
+}
+```
+
+## `E-IF-VALUE.gr`
+
+```grasm
+//! tag: E-IF-VALUE
+//! expect: output
+//! big
+//! 0
+//! 1 true ()
+fn describe(n: i64) -> str {
+    if n > 10 {
+        "big"
+    } else {
+        "small"
+    }
+}
+fn takes_unit(u: ()) -> i64 {
+    1
+}
+
+fn noop() {
+}
+
+fn main() {
+    print(describe(50))
+    var count = 0
+    if false {
+        count = 1
+    }
+    print("{count}")
+    // `()` has one value, and that is the only thing of its type. It binds,
+    // compares, prints and crosses a function boundary like any other value —
+    // the compiled backend used to refuse each of those in turn.
+    let nothing: () = ()
+    let produced = noop()
+    print("{takes_unit(nothing)} {nothing == produced} {produced}")
+}
+```
+
+## `E-INDEX-BOUNDS.gr`
+
+```grasm
+//! tag: E-INDEX-BOUNDS
+//! expect: panic
+//! last of a scalar list: 3
+//! last of a boxed list: b
+//! a negative index is out of bounds, not counted from the end: true
+//! index 3 out of bounds (len 3)
+// Indexing past the end panics, and the interesting index is the *first* one
+// past it.
+//
+// This program used to read `xs[5]` on a list of two, which is past the end by
+// three and tests nothing an off-by-one would break. Changing the check from
+// `i >= len` to `i > len` — so `xs[len]` reads one element beyond the last —
+// left every gate in this repository green: 218 differential programs, the
+// leak check, 31 whole programs and this suite. A bounds check is exactly the
+// place where only the boundary is worth testing.
+//
+// Both representations are covered: a `[i64]` is stored unboxed and a `[str]`
+// is a list of pointers, and they are two different index paths in the
+// runtime.
+fn main() / {io} {
+    let xs = [1, 2, 3]
+    let ss = ["a", "b"]
+
+    // The last valid index of each, which must *not* panic.
+    print("last of a scalar list: {xs[xs.len() - 1]}")
+    print("last of a boxed list: {ss[ss.len() - 1]}")
+
+    // One before the beginning. There is no wrapping: a negative index is out
+    // of bounds rather than counting from the end, which `get` reports as
+    // `None` and indexing reports as a panic.
+    print("a negative index is out of bounds, not counted from the end: {xs.get(0 - 1) == None}")
+
+    // Exactly one past the end — the case an off-by-one lets through.
+    print("{xs[xs.len()]}")
+}
+```
+
+## `E-INOUT-FAIL.gr`
+
+```grasm
+//! tag: E-INOUT-FAIL
+//! expect: output
+//! 1 -1 [1, 2]
+//! -1 [1, 2]
+// A function that *fails* still returns, and the writes it made before
+// failing happened.
+//
+// The interpreter dropped `inout` writebacks on the error path, so a `push`
+// before a `fail` was silently undone — and the compiled binary kept it. The
+// two engines disagreed about what the program had *done*, not just what it
+// answered.
+type E = { m: str }
+type Box = { xs: [i64] }
+
+fn push_then_fail(inout xs: [i64], v: i64) -> i64 ! E {
+    xs.push(v)
+    if v > 1 {
+        fail(E{ m: "too big" })
+    }
+    v
+}
+
+fn add(inout b: Box, v: i64) -> i64 ! E {
+    b.xs.push(v)
+    if v > 1 {
+        fail(E{ m: "no" })
+    }
+    v
+}
+
+/// Through a `try` chain, where the failure crosses two frames.
+fn outer(inout b: Box) -> i64 ! E {
+    let a = try add(b, 1)
+    let c = try add(b, 2)
+    a + c
+}
+
+fn main() {
+    var xs: [i64] = []
+    let a = push_then_fail(xs, 1) ?? 0 - 1
+    let b = push_then_fail(xs, 2) ?? 0 - 1
+    print("{a} {b} {xs}")
+
+    var box = Box{ xs: [] }
+    print("{outer(box) ?? 0 - 1} {box.xs}")
+}
+```
+
+## `E-INOUT-WRITEBACK.gr`
+
+```grasm
+//! tag: E-INOUT-WRITEBACK
+//! expect: output
+//! 3 [1, 2]
+//! 2 [2, 2, 9] a! 3.0 true
+fn bump(inout n: i64) {
+    n += 1
+}
+fn add(inout xs: [i64], v: i64) {
+    xs.push(v)
+}
+
+// The argument may name a *place* rather than a binding of its own
+// ([T-INOUT-PLACE]), and the write-back has to land back in that place. A
+// place holds a boxed value where an `inout` parameter is a pointer to a slot
+// of the callee's own type, so the two have to meet: passing the box straight
+// through, the compiled engine incremented its *address* and wrote the result
+// into the field, and reading the field back said `unbox: not an i64` for a
+// program `grasm run` answered. Every scalar type is here because the
+// conversion is per type, and a nested field and a list element because the
+// path is walked twice — once to read, once to write.
+type Inner = { v: i64 }
+type Outer = { i: Inner, xs: [i64], s: str, f: f64, b: bool }
+
+fn app(inout s: str) {
+    s = s + "!"
+}
+fn scale(inout x: f64) {
+    x = x * 2.0
+}
+fn flip(inout b: bool) {
+    b = not b
+}
+fn addall(inout xs: [i64]) {
+    xs.push(9)
+}
+
+fn main() {
+    var n = 2
+    bump(n)
+    var xs = [1]
+    add(xs, 2)
+    print("{n} {xs}")
+
+    var o = Outer{ i: Inner{ v: 1 }, xs: [1, 2], s: "a", f: 1.5, b: false }
+    bump(o.i.v)
+    bump(o.xs[0])
+    app(o.s)
+    scale(o.f)
+    flip(o.b)
+    addall(o.xs)
+    print("{o.i.v} {o.xs} {o.s} {o.f} {o.b}")
+}
+```
+
+## `E-LIST-CONCAT.gr`
+
+```grasm
+//! tag: E-LIST-CONCAT
+//! expect: output
+//! [1, 2, 3]
+//! [a, b, c]
+//! [1.5, 2.5] [true, false]
+//! [1] [1] []
+//! [1, 2] [3] 3 kept
+//! [[1], [2], [3]]
+//! [0, 1, 4]
+fn main() {
+    print("{[1, 2] + [3]}")
+    print("{["a"] + ["b", "c"]}")
+    print("{[1.5] + [2.5]} {[true] + [false]}")
+    // An empty operand on either side, and both.
+    let e: [i64] = []
+    print("{e + [1]} {[1] + e} {e + e}")
+    // Neither operand is changed.
+    let a = [1, 2]
+    let b = [3]
+    let joined = a + b
+    print("{a} {b} {joined.len()} kept")
+    // Lists of lists concatenate as lists, not element-wise.
+    print("{[[1], [2]] + [[3]]}")
+    // Building up in a loop.
+    var acc: [i64] = []
+    for i in 0..3 {
+        acc = acc + [i * i]
+    }
+    print("{acc}")
+}
+```
+
+## `E-LOOP-LIST.gr`
+
+```grasm
+//! tag: E-LOOP-LIST
+//! expect: output
+//! alpha beta gamma
+//! 6
+//! 0
+fn main() {
+    // The loop variable is the element itself, not an index.
+    let words = ["alpha", "beta", "gamma"]
+    var joined = ""
+    for w in words {
+        joined = joined + w + " "
+    }
+    print(joined.trim())
+
+    var total = 0
+    for n in [1, 2, 3] {
+        total = total + n
+    }
+    print("{total}")
+
+    // An empty list runs the body zero times.
+    var count = 0
+    let none: [i64] = []
+    for _x in none {
+        count = count + 1
+    }
+    print("{count}")
+}
+```
+
+## `E-LOOP-RANGE-MAX.gr`
+
+```grasm
+//! tag: E-LOOP-RANGE-MAX
+//! expect: output
+//! 1 1 3
+//! 10 0 0
+// A range may reach the ends of `i64`.
+//
+// The interpreter built `a..=b` as `a..(b + 1)`, which wraps at the top of the
+// range: `mx..=mx` iterated over nothing. The compiled backend incremented
+// and then re-tested `i <= end`, so `i` wrapped and the loop never ended. One
+// program, an empty loop and an endless one, from an overflow neither engine
+// reported.
+fn main() {
+    let mx = 9223372036854775807
+    let mn = 0 - mx - 1
+    var a = 0
+    for i in mx..=mx {
+        a = a + 1
+    }
+    var b = 0
+    for i in mn..=mn {
+        b = b + 1
+    }
+    var c = 0
+    for i in (mx - 2)..=mx {
+        c = c + 1
+    }
+    print("{a} {b} {c}")
+    // The ordinary cases, unchanged: inclusive counts the end, exclusive does
+    // not, and a backwards range runs zero times rather than forever.
+    var d = 0
+    for i in 0..=4 {
+        d = d + i
+    }
+    var e2 = 0
+    for i in 3..3 {
+        e2 = e2 + 1
+    }
+    var f = 0
+    for i in 3..=2 {
+        f = f + 1
+    }
+    print("{d} {e2} {f}")
+}
+```
+
+## `E-LOOP-RANGE.gr`
+
+```grasm
+//! tag: E-LOOP-RANGE
+//! expect: output
+//! 0123
+//! 01234
+//! empty
+fn main() {
+    var a = ""
+    for i in 0..4 {
+        a += "{i}"
+    }
+    print(a)
+    var b = ""
+    for i in 0..=4 {
+        b += "{i}"
+    }
+    print(b)
+    var n = 0
+    for _i in 5..5 {
+        n += 1
+    }
+    if n == 0 {
+        print("empty")
+    }
+}
+```
+
+## `E-MAIN-ERR.gr`
+
+```grasm
+//! tag: E-MAIN-ERR
+//! expect: output-failing
+//! error: unhandled error from main: Bad
+type E = | Bad
+fn main() ! E {
+    fail(Bad)
+}
+```
+
+## `E-MAP-LIT.gr`
+
+```grasm
+//! tag: E-MAP-LIT
+//! expect: output
+//! {a: 1, b: 2}
+//! {a: 9}
+//! {} 0
+//! {k: 1} 3 ()
+//! 2 entries
+//! [k1, v1, k2, v2]
+fn main() {
+    // Written order does not matter: iteration is sorted (E-MAP-ORDER).
+    let ordered = {"b": 2, "a": 1}
+    print("{ordered}")
+    // A repeated key keeps the last value written.
+    let dup = {"a": 1, "a": 9}
+    print("{dup}")
+    // `{}` is the empty map where a map is expected...
+    var empty: Map[str, i64] = {}
+    print("{empty} {empty.len()}")
+    // ...including as a struct field, which supplies the type.
+    var b = Holder{ items: {} }
+    b.items.set("k", 1)
+    // Braces holding statements are still a block; `{}` is the empty map,
+    // and the empty block — being useless as an expression — is spelled `()`.
+    let block = { let n = 2
+        n + 1 }
+    print("{b.items} {block} {()}")
+    // Each key is evaluated before its own value, and entries left to right.
+    var log: [str] = []
+    let m = {key(log, "k1"): val(log, 1), key(log, "k2"): val(log, 2)}
+    print("{m.len()} entries")
+    print("{log}")
+}
+
+/// Records that it ran, then answers with the key it was given.
+fn key(inout log: [str], k: str) -> str {
+    log.push(k)
+    k
+}
+
+/// The same, for a value.
+fn val(inout log: [str], v: i64) -> i64 {
+    log.push("v{v}")
+    v
+}
+
+type Holder = { items: Map[str, i64] }
+```
+
+## `E-MAP-ORDER.gr`
+
+```grasm
+//! tag: E-MAP-ORDER
+//! expect: output
+//! [alpha, beta, zulu]
+//! {alpha: 1, beta: 2, zulu: 3}
+//! across the inline boundary: [, 0123456789abcde, 0123456789abcdef, a, b]
+//! the same text two ways is one key: 2 entries
+fn main() {
+    var m = map()
+    m.set("zulu", 3)
+    m.set("alpha", 1)
+    m.set("beta", 2)
+    print("{m.keys()}")
+    print("{m}")
+
+    // Short keys are held inline and long ones on the heap, so ordering has to
+    // be by *content* and not by which of the two a key happens to be. Sorting
+    // by representation would put every long key after every short one, and
+    // this is the clause that would silently stop being true.
+    var wide = map()
+    for w in ["b", "a", "0123456789abcdef", "0123456789abcde", ""] {
+        wide.set(w, w.len())
+    }
+    print("across the inline boundary: {wide.keys()}")
+
+    // And equality by content: text built up piece by piece is the same key as
+    // the identical literal, whichever side of the boundary it lands on.
+    var same = map()
+    same.set("0123456789abcde", 1)
+    same.set("0123456789abcd" + "e", 2)
+    same.set("0123456789abcdef", 1)
+    same.set("0123456789abcde" + "f", 2)
+    print("the same text two ways is one key: {same.len()} entries")
+}
+```
+
+## `E-MATCH-BUILTIN-ARMS.gr`
+
+```grasm
+//! tag: E-MATCH-BUILTIN-ARMS
+//! expect: output
+//! 2.718281828459045
+//! 0 false
+// A match whose every arm is a builtin call still yields a value.
+//
+// The compiled backend types a match by probing its arms, and no builtin free
+// function was in the probe's table. When *no* arm could be typed the result
+// was not a refusal: "nothing could be typed" and "every arm yields nothing"
+// were the same answer, so a value match compiled as a statement match and the
+// enclosing function returned whatever was there. `args()` in both arms of a
+// fallible function returned `0`. The fuzzer found it the day boolean
+// expressions started being generated at all.
+fn constant(p: i64) -> f64 ! str {
+    match p {
+        0 -> e()
+        _ -> pi()
+    }
+}
+
+fn from_env(p: i64) -> [str] ! str {
+    match p {
+        0 -> args()
+        _ -> args()
+    }
+}
+
+fn exists(p: i64) -> bool ! str {
+    match p {
+        0 -> file_exists("/definitely/not/here")
+        _ -> file_exists("/nor/here")
+    }
+}
+
+fn main() {
+    match constant(0) {
+        Ok(v) -> print("{v}")
+        Err(x) -> print("{x}")
+    }
+    let n = match from_env(0) {
+        Ok(v) -> v.len()
+        Err(_) -> -1
+    }
+    let b = match exists(0) {
+        Ok(v) -> v
+        Err(_) -> true
+    }
+    print("{n} {b}")
+}
+```
+
+## `E-MATCH-ORDER.gr`
+
+```grasm
+//! tag: E-MATCH-ORDER
+//! expect: output
+//! first
+fn main() {
+    let n = 5
+    let r = match n {
+        x if x > 0 -> "first"
+        5 -> "second"
+        _ -> "third"
+    }
+    print(r)
+}
+```
+
+## `E-MINMAX-OPTION.gr`
+
+```grasm
+//! tag: E-MINMAX-OPTION
+//! expect: output
+//! 1 9
+//! fig pear
+//! true true
+fn main() {
+    print("{[3, 1, 9].min() ?? 0} {[3, 1, 9].max() ?? 0}")
+    print("{["pear", "fig"].min() ?? "?"} {["pear", "fig"].max() ?? "?"}")
+    let none: [i64] = []
+    print("{none.min().is_none()} {none.max().is_none()}")
+}
+```
+
+## `E-NOT-PARALLEL.gr`
+
+```grasm
+//! tag: E-NOT-PARALLEL
+//! expect: output
+//! sequential
+fn main() {
+    // Tasks run one at a time, so a task always observes the previous
+    // task's completed writes — never a partial interleaving.
+    var log = ""
+    parallel {
+        spawn {
+            log += "seq"
+        }
+        spawn {
+            log += "uential"
+        }
+    }
+    print(log)
+}
+```
+
+## `E-NUM-PROMOTE.gr`
+
+```grasm
+//! tag: E-NUM-PROMOTE
+//! expect: output
+//! 5.5 5.5
+//! true true
+//! true true true
+//! 2.5 7.5
+//! 3.5
+// An integer *literal* meeting an `f64` becomes one — on either side, and for
+// arithmetic and comparison alike. The rule used to be written as "mixing
+// promotes", which is not what happens, and comparisons had an asymmetry
+// nothing recorded: `5.0 == 5` was accepted and `5 == 5.0` was not.
+fn main() {
+    let f = 2.5
+    print("{3 + f} {f + 3}")
+    // Equality, both ways round.
+    print("{5.0 == 5} {5 == 5.0}")
+    // Ordering, both ways round.
+    print("{5.5 < 6} {6 > 5.5} {6 >= 5.5}")
+    // A literal in any operand position.
+    print("{f * 1} {f * 3}")
+    // A non-literal `i64` is converted where the program says so, and only
+    // there ([T-INT-TO-FLOAT]).
+    let n = 1
+    print("{n.as_f64() + f}")
+}
+```
+
+## `E-ORDER-LTR.gr`
+
+```grasm
+//! tag: E-ORDER-LTR
+//! expect: output
+//! left
+//! right
+//! 3
+//! index
+//! value
+//! [[7], [0]]
+//! [15, 20, 30] 1
+//! [[10, 21], [30, 40]] 2
+//! recv
+//! arg
+//! [[1, 9]]
+//! 6 [[5], []] [0]
+// Subexpressions evaluate left to right — including an assignment's target.
+//
+// The walk that writes a value is what evaluates the target's index, so doing
+// it after the value ran `xs[f()] = g()` as `g` then `f`. Both engines agreed
+// on the wrong order, which is why no differential test could see it.
+fn note(tag: str, v: i64) -> i64 {
+    print("{tag}")
+    v
+}
+
+fn main() {
+    let sum = note("left", 1) + note("right", 2)
+    print("{sum}")
+    var rows = [[0], [0]]
+    rows[note("index", 0)] = [note("value", 7)]
+    print("{rows}")
+    // Once, and only once: a compound assignment reads and writes the same
+    // place, and the index that names it is one expression. The interpreter
+    // evaluated it twice and the compiled backend three times, so they wrote
+    // to different elements and disagreed about the answer.
+    var i = 0
+    var xs = [10, 20, 30]
+    xs[step(i)] += 5
+    print("{xs} {i}")
+    // Nested indices run outermost-first, which is leftmost-first.
+    var j = 0
+    var d = [[10, 20], [30, 40]]
+    d[step(j)][step(j)] += 1
+    print("{d} {j}")
+    // A mutating method names its receiver's place once too. Reading the
+    // receiver and then writing the result back walked the path twice, so
+    // `k[q.remove(0)].remove(0)` took an element from one list and deleted it
+    // from another.
+    var g = [[1]]
+    g[note("recv", 0)].push(note("arg", 9))
+    print("{g}")
+    var q = [1, 0]
+    var k = [[5], [6]]
+    let taken = k[q.remove(0)].remove(0)
+    print("{taken} {k} {q}")
+}
+
+fn step(inout n: i64) -> i64 {
+    let was = n
+    n = n + 1
+    was
+}
+```
+
+## `E-OWN-RUNTIME.gr`
+
+```grasm
+//! tag: E-OWN-RUNTIME
+//! expect: output
+//! 3 3
+fn consume(own xs: [i64]) -> i64 {
+    xs.len()
+}
+fn plain(xs: [i64]) -> i64 {
+    xs.len()
+}
+fn main() {
+    let a = [1, 2, 3]
+    let b = [1, 2, 3]
+    // `own` and a plain parameter behave identically at runtime.
+    print("{consume(a)} {plain(b)}")
+}
+```
+
+## `E-PAD-CYCLE.gr`
+
+```grasm
+//! tag: E-PAD-CYCLE
+//! expect: output
+//! [007]
+//! [ababx]
+//! [x-=-=-]
+//! [wide]
+fn main() {
+    print("[{"7".pad_start(3, "0")}]")
+    // A multi-character fill repeats and is cut to the exact width.
+    print("[{"x".pad_start(5, "ab")}]")
+    print("[{"x".pad_end(6, "-=")}]")
+    // Already wide enough: unchanged.
+    print("[{"wide".pad_start(2, "-")}]")
+}
+```
+
+## `E-PANIC-EXIT.gr`
+
+```grasm
+//! tag: E-PANIC-EXIT
+//! expect: output
+//! [c]
+//! [abcdef]
+//! []
+//! [2, 3]
+//! caught
+// A library argument no allocation can satisfy is a panic, not an abort.
+//
+// `substr(2, i64::MAX)` overflowed `start + len` to a negative end and
+// panicked inside Rust — a slice message carrying the developer's absolute
+// path, exit 1 in one engine and 134 in another. `repeat` and `pad` reached
+// the allocator's own failure message and SIGABRT. Every one of these is a
+// number a program can compute, so each answers with a sentence and exit 101,
+// or clamps where the clause says it clamps.
+fn main() {
+    let mx = 9223372036854775807
+    print("[{"abc".substr(2, mx)}]")
+    print("[{"abcdef".substr(0 - 9223372036854775807 - 1, mx)}]")
+    print("{[1, 2, 3].slice(mx, 2)}")
+    print("{[1, 2, 3].slice(1, mx)}")
+    // The ones that cannot clamp panic, and a panic is catchable only by not
+    // reaching it — so this program stops short and says so.
+    if mx < 0 {
+        print("{"ab".repeat(mx)}")
+        print("{"ab".pad_start(mx, "x")}")
+    }
+    print("caught")
+}
+```
+
+## `E-PANIC-TRACE.gr`
+
+```grasm
+//! tag: E-PANIC-TRACE
+//! expect: panic
+//! stack overflow: recursion too deep
+// The panic line is the same in every engine; only the trace after it differs.
+//
+// The two engines stop at different depths on purpose — one counts calls, the
+// other measures remaining stack — and both bounds are implementation-defined
+// ([E-RECURSION-DEPTH]). The interpreter used to name its own number here, so
+// the same failure read as two different failures depending on how you ran it.
+fn down(n: i64) -> i64 {
+    down(n + 1)
+}
+
+fn main() {
+    print("{down(0)}")
+}
+```
+
+## `E-PAR-FAIL.gr`
+
+```grasm
+//! tag: E-PAR-FAIL
+//! expect: output
+//! []
+//! []
+//! [1, 3]
+// A failure inside a parallel closure is the whole call's failure — not a
+// value in the result. The native backend runs such a closure sequentially,
+// because its workers have nowhere to put an error.
+type E = { m: str }
+
+fn doubled(xs: [i64]) -> [i64] ! E {
+    xs.par_map(|x| if x == 2 { fail(E{ m: "two" }) } else { x })
+}
+
+fn kept(xs: [i64]) -> [i64] ! E {
+    xs.par_filter(|x| if x == 2 { fail(E{ m: "two" }) } else { true })
+}
+
+fn main() {
+    print("{doubled([1, 2, 3]) ?? []}")
+    print("{kept([1, 2, 3]) ?? []}")
+    // Without a failing element the parallel path runs as usual.
+    print("{kept([1, 3]) ?? []}")
+}
+```
+
+## `E-PAR-FILTER-ORDER.gr`
+
+```grasm
+//! tag: E-PAR-FILTER-ORDER
+//! expect: output
+//! [5, 8, 9, 4]
+//! true
+//! true
+//! true
+//! true
+fn main() {
+    // Survivors come back in input order, not completion order.
+    print("{[5, 2, 8, 1, 9, 4].par_filter(|x| x > 3)}")
+
+    // Enough elements to cross the threshold where workers are used.
+    var xs: [i64] = []
+    for i in 0..20000 {
+        xs.push(i)
+    }
+    print("{xs.par_filter(|x| x % 7 == 3) == xs.filter(|x| x % 7 == 3)}")
+
+    let none: [i64] = []
+    print("{none.par_filter(|x| x > 0).is_empty()}")
+
+    // The same promise where the elements and the captures are *boxed*. A
+    // survivor is a new reference to a value the input list still holds, so
+    // this is also where a miscounted reference would show up as a leak or a
+    // double free rather than as a wrong answer.
+    let texts = xs.map(|x| "t{x % 331}")
+    print("{texts.par_filter(|s| s.len() > 3) == texts.filter(|s| s.len() > 3)}")
+
+    let want = "t7"
+    print("{texts.par_filter(|s| s == want) == texts.filter(|s| s == want)}")
+}
+```
+
+## `E-PAR-MAP-ORDER.gr`
+
+```grasm
+//! tag: E-PAR-MAP-ORDER
+//! expect: output
+//! true
+//! [1, 4, 9, 16, 25]
+//! true
+//! true
+//! true
+//! true
+//! P{a: 9, b: v4}
+type P = { a: i64, b: str }
+
+fn main() {
+    // Enough elements to cross the threshold where workers are used, so this
+    // exercises the threaded path rather than the sequential fallback.
+    var xs: [i64] = []
+    for i in 0..20000 {
+        xs.push(i)
+    }
+    // Same answer as `map`, in input order, however many cores ran it.
+    print("{xs.par_map(|x| x * 2) == xs.map(|x| x * 2)}")
+
+    print("{[1, 2, 3, 4, 5].par_map(|x| x * x)}")
+
+    let none: [i64] = []
+    print("{none.par_map(|x| x + 1).is_empty()}")
+
+    // The same promise where the elements, the captures or the results are
+    // *boxed*. These ran sequentially until the reference count became
+    // atomic — which is invisible to a program by this clause, and is exactly
+    // why the clause is written about the answer rather than about threads.
+    let texts = xs.par_map(|x| "n{x % 13}")
+    print("{texts == xs.map(|x| "n{x % 13}")}")
+
+    // A boxed capture: every worker reads the same value.
+    let tag = "-t"
+    print("{texts.par_map(|s| s + tag) == texts.map(|s| s + tag)}")
+
+    // Boxed in, scalar out.
+    print("{texts.par_map(|s| s.len()) == texts.map(|s| s.len())}")
+
+    let ps = xs.par_map(|x| P{ a: x, b: "v{x % 5}" })
+    print("{ps[9]}")
+}
+```
+
+## `E-PAR-VALUES.gr`
+
+```grasm
+//! tag: E-PAR-VALUES
+//! expect: output
+//! [6, 8]
+//! [4]
+//! [3.0, 5.0]
+//! [true]
+// A parallel operation works on any list, however the list was built.
+//
+// The compiled backend picks a representation from the *static* type, so a
+// `[i64]` is normally stored as raw words. `Map.values()` builds a boxed list
+// even when its elements are scalars, and every other operation copes with
+// both — `sum`, `sort`, indexing, `fold`, `map`, `filter`, `==`. The parallel
+// ones did not, so this built and then panicked `par_map on a non-scalar
+// list` while `grasm run` answered correctly: a miscompile, where §11
+// promises a refusal by name at build time.
+fn main() {
+    var m: Map[str, i64] = {}
+    m.set("a", 3)
+    m.set("b", 4)
+    print("{m.values().par_map(|x| x * 2)}")
+    print("{m.values().par_filter(|x| x > 3)}")
+    var f: Map[str, f64] = {}
+    f.set("a", 1.5)
+    f.set("b", 2.5)
+    print("{f.values().par_map(|x| x * 2.0)}")
+    var b: Map[str, bool] = {}
+    b.set("a", true)
+    b.set("b", false)
+    print("{b.values().par_filter(|x| x)}")
+}
+```
+
+## `E-PARALLEL-JOIN.gr`
+
+```grasm
+//! tag: E-PARALLEL-JOIN
+//! expect: output
+//! 3
+fn main() {
+    var done: [i64] = []
+    parallel {
+        spawn {
+            done.push(1)
+        }
+        spawn {
+            done.push(2)
+        }
+        spawn {
+            done.push(3)
+        }
+    }
+    print("{done.len()}")
+}
+```
+
+## `E-POW-NEG.gr`
+
+```grasm
+//! tag: E-POW-NEG
+//! expect: panic
+//! negative integer exponent
+fn main() {
+    let e = 0 - 1
+    print("{2 ^ e}")
+}
+```
+
+## `E-POW.gr`
+
+```grasm
+//! tag: E-POW
+//! expect: output
+//! 1024 1024.0
+//! 1.5 0.5 0.25
+// `^` is exponentiation, not xor.
+//
+// Coming from the C family, `^` reads as bitwise xor, and `2 ^ 10` being 1024
+// rather than 8 is the kind of difference that produces a wrong answer instead
+// of an error. It was in the grammar as an operator and nowhere as a meaning.
+fn main() {
+    print("{2 ^ 10} {2.0 ^ 10.0}")
+    // A float exponent may be fractional or negative; an integer one may not
+    // be negative, which is [E-POW-NEG].
+    print("{2.25 ^ 0.5} {2.0 ^ -1.0} {2.0 ^ -2.0}")
+}
+```
+
+## `E-PRINT-ATOMIC.gr`
+
+```grasm
+//! tag: E-PRINT-ATOMIC
+//! expect: output
+//!   side 3
+//!   side 4
+//! x=6 y=8
+// `print` evaluates every interpolation before it writes anything.
+//
+// Emitting each piece as it was computed saved an allocation and cost two
+// guarantees: a panic partway along a line left the earlier pieces on stdout,
+// against [E-PANIC-EXIT], and a nested `print` landed in the middle of the
+// outer line instead of before it. This program pins the second; the first is
+// in scripts/agreetest.sh, which can see stderr and the exit code.
+fn side(n: i64) -> i64 {
+    print("  side {n}")
+    n * 2
+}
+
+fn main() {
+    print("x={side(3)} y={side(4)}")
+}
+```
+
+## `E-RECURSION-DEPTH.gr`
+
+```grasm
+//! tag: E-RECURSION-DEPTH
+//! expect: output
+//! 10000
+//! 10000
+// Ten thousand nested calls is the guaranteed floor, so it has to work in
+// both engines. The interpreter recurses through its host's stack, and used
+// to exhaust it — aborting with no output — a thousand calls before its own
+// depth guard could report anything.
+fn down(n: i64) -> i64 {
+    if n <= 0 {
+        0
+    } else {
+        down(n - 1) + 1
+    }
+}
+
+/// Mutual recursion counts against the same bound.
+fn ping(n: i64) -> i64 {
+    if n <= 0 {
+        0
+    } else {
+        pong(n - 1) + 1
+    }
+}
+
+fn pong(n: i64) -> i64 {
+    if n <= 0 {
+        0
+    } else {
+        ping(n - 1) + 1
+    }
+}
+
+fn main() {
+    print("{down(10000)}")
+    print("{ping(10000)}")
+}
+```
+
+## `E-RECURSION-PARALLEL.gr`
+
+```grasm
+//! tag: E-RECURSION-PARALLEL
+//! expect: output
+//! 4000000
+// Deep recursion inside a parallel closure is bounded the same way.
+//
+// A `par_map` worker runs on its own stack, and it took the platform default —
+// small enough that the guard computed its floor below the end of it and could
+// never fire. Recursion this deep in a worker then ran off the stack for real:
+// SIGBUS, exit 138, nothing on stderr, in the one place [E-RECURSION-DEPTH]
+// promises a panic and exit 101. Inputs small enough to run sequentially were
+// unaffected, which is why it took a few hundred elements to see.
+fn descend(n: i64) -> i64 {
+    if n <= 0 {
+        0
+    } else {
+        descend(n - 1) + 1
+    }
+}
+
+fn main() {
+    var xs: [i64] = []
+    for i in 0..500 {
+        xs.push(8000)
+    }
+    print("{xs.par_map(|x| descend(x)).sum()}")
+}
+```
+
+## `E-SEARCH-SHORTCIRCUIT.gr`
+
+```grasm
+//! tag: E-SEARCH-SHORTCIRCUIT
+//! expect: output
+//! any saw 1
+//! any saw 2
+//! true
+//! all saw 1
+//! all saw 2
+//! all saw 3
+//! false
+fn main() {
+    let xs = [1, 2, 3, 4]
+    let hit = xs.any(|x| {
+        print("any saw {x}")
+        x == 2
+    })
+    print("{hit}")
+    let ok = xs.all(|x| {
+        print("all saw {x}")
+        x < 3
+    })
+    print("{ok}")
+}
+```
+
+## `E-SHORTCIRCUIT.gr`
+
+```grasm
+//! tag: E-SHORTCIRCUIT
+//! expect: output
+//! false
+//! true
+fn boom(inout hit: bool) -> bool {
+    hit = true
+    true
+}
+fn main() {
+    var hit = false
+    let r = false and boom(hit)
+    print("{hit}")
+    let r2 = true or boom(hit)
+    print("{r2}")
+}
+```
+
+## `E-SPAWN-ORDER.gr`
+
+```grasm
+//! tag: E-SPAWN-ORDER
+//! expect: output
+//! abc
+fn main() {
+    var log = ""
+    parallel {
+        spawn {
+            log += "a"
+        }
+        spawn {
+            log += "b"
+        }
+        spawn {
+            log += "c"
+        }
+    }
+    print(log)
+}
+```
+
+## `E-SPAWN-SHARED.gr`
+
+```grasm
+//! tag: E-SPAWN-SHARED
+//! expect: output
+//! 30
+fn main() {
+    let base = 10
+    var total = 0
+    parallel {
+        spawn {
+            total += base
+        }
+        spawn {
+            total += base * 2
+        }
+    }
+    print("{total}")
+}
+```
+
+## `E-STR-CHARS.gr`
+
+```grasm
+//! tag: E-STR-CHARS
+//! expect: output
+//! 3 3
+fn main() {
+    // Characters, not bytes: each of these is multi-byte in UTF-8.
+    let s = "héllo"
+    print("{"abc".len()} {s.substr(0, 3).len()}")
+}
+```
+
+## `E-STR-COMPARE.gr`
+
+```grasm
+//! tag: E-STR-COMPARE
+//! expect: output
+//! true false
+fn main() {
+    print("{"abc" < "abd"} {"b" < "a"}")
+}
+```
+
+## `E-STR-CONCAT.gr`
+
+```grasm
+//! tag: E-STR-CONCAT
+//! expect: output
+//! hello, world
+fn main() {
+    print("hello, " + "world")
+}
+```
+
+## `E-TASK-PANIC.gr`
+
+```grasm
+//! tag: E-TASK-PANIC
+//! expect: panic
+//! task exploded
+fn main() {
+    parallel {
+        spawn {
+            panic("task exploded")
+        }
+        spawn {
+            print("must not run")
+        }
+    }
+}
+```
+
+## `E-TEST-PROPERTY.gr`
+
+```grasm
+//! tag: E-TEST-PROPERTY
+//! expect: test-output
+//! test "addition commutes" ... ok (500 cases)
+//! test "every int is tiny" ... FAILED
+test "addition commutes" (a: i64, b: i64) {
+    assert(a + b == b + a)
+}
+
+// A property passes only if *every* generated case holds.
+test "every int is tiny" (n: i64) {
+    assert(n < 3)
+}
+
+fn main() {
+}
+```
+
+## `E-TEST-SEED.gr`
+
+```grasm
+//! tag: E-TEST-SEED
+//! expect: test-output
+//! counterexample: n = 1
+//! "never 2" ... FAILED counterexample: n = 2
+//! "never MIN" ... FAILED counterexample: n = -9223372036854775808
+// Generation is a pure function of the seed, so this report is identical on
+// every run and every machine.
+//
+// The default seed is fixed, which makes the opening cases the only ones a
+// reader can count on — so they walk the boundary list in order rather than
+// drawing from it. Drawn, each value was merely likely: `2` first appeared at
+// case 138 of the default seed and the default run is 100 cases, so a
+// property false at `2` was reported as holding.
+test "no positive ints" (n: i64) {
+    assert(n <= 0)
+}
+
+test "never 2" (n: i64) {
+    assert(n != 2)
+}
+
+test "never MIN" (n: i64) {
+    assert(n != 0 - 9223372036854775807 - 1)
+}
+
+fn main() {
+}
+```
+
+## `E-TEST-SHRINK.gr`
+
+```grasm
+//! tag: E-TEST-SHRINK
+//! expect: test-output
+//! counterexample: n = 3
+//! counterexample: xs = [0, 0]
+//! counterexample: s = "aaa"
+// The generator produces large values, but the reported counterexample is the
+// smallest one that still fails.
+test "under three" (n: i64) {
+    if n > 0 {
+        assert(n < 3)
+    }
+}
+
+test "at most one element" (xs: [i64]) {
+    assert(xs.len() < 2)
+}
+
+// A shrunk string is simple as well as short. Length was the only thing
+// reduced at first, so a property failing on any three characters reported
+// whichever three the generator produced — `s = "🙂/🙂"` is length-minimal
+// and says nothing about why the property failed.
+test "under three characters" (s: str) {
+    assert(s.len() < 3)
+}
+
+fn main() {
+}
+```
+
+## `E-VALUE-SEMANTICS.gr`
+
+```grasm
+//! tag: E-VALUE-SEMANTICS
+//! expect: output
+//! 2 3
+//! 1 99
+type Box = { n: i64 }
+fn main() {
+    var a = [1, 2]
+    var b = a
+    b.push(3)
+    print("{a.len()} {b.len()}")
+
+    var p = Box{ n: 1 }
+    var q = p
+    q.n = 99
+    print("{p.n} {q.n}")
+}
+```

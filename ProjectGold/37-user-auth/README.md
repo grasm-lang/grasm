@@ -1,9 +1,9 @@
 # 37 — User Authentication  *(phase 2, project 7)*
 
-**Tests:** a real password hash, a session token, a guarded route — and what a
-language without randomness can and cannot honestly claim.
-**Result:** works, and is **not something to deploy**. The reasons are below and
-they are the point of the project.
+**Tests:** a real password hash, an unguessable session token, a guarded route —
+and what a language can honestly claim about each.
+**Result:** works. Still **not something to deploy** — one reason closed since
+it was written, one remains, and both are below.
 
 ```
 grasm run main.gr              # the comparison the harness makes
@@ -52,17 +52,19 @@ A real system uses argon2 or scrypt, which are deliberately slow and
 memory-hard. Iterating is the only defence available here and is strictly
 weaker.
 
-**The session tokens are predictable.** Grasm has `now_millis()` and no other
-source of randomness (**F34**). That is survivable for a salt, whose job is
-uniqueness — and the project checks it, eight salts for one address, all
-different. It is not survivable for a token, which is exactly a secret that must
-not be guessable. An attacker who knows roughly when a session began can search
-a small space of clock values.
+**The session tokens *were* predictable, and are not any more.** When this was
+written Grasm had `now_millis()` and no other source of randomness (**F34**), so
+tokens were derived from the clock and guessable by anyone who knew roughly when
+a session began. That was in the source's first paragraph rather than hidden.
 
-There is no way to fix that inside the language today. A project that quietly
-issued these without saying so would be teaching the wrong lesson to whoever
-read it, so it is in the source's first paragraph, in this README, and in
-FINDINGS.md as the finding it is.
+`random_bytes` closed it. Tokens are 256 bits of kernel entropy, and if entropy
+is unavailable `login` answers **500 rather than issuing one** — a token that
+might be guessable is worse than an error, because it looks exactly like a good
+one.
+
+The salt still uses the clock, and that is correct rather than left over: a
+salt's job is uniqueness, and the project checks it — eight salts for one
+address, all different.
 
 **Registration reveals which addresses have accounts** — 409 rather than the
 201 a new address gets. Fixing it means not telling a user why their form
@@ -91,6 +93,12 @@ ada@x.org	Ada	217aa270e8e9991367dfd3616fc95420	f4f15b09e0d2...cc9f18a9
 ## The harness and the secret
 
 The comparison across three engines reports a token's **length** and not its
-value, because a clock-derived token differs on every run. That is the same
-reason the tokens are unsafe, showing up as a testing problem — which is a
-fair warning about the design.
+value, because a token differs on every run.
+
+That line used to be a warning: the tokens differed because they were derived
+from the clock, and the same fact that made them awkward to test made them
+guessable. It is now the opposite — they differ because they are 256 bits of
+kernel entropy, and a test that could predict one would mean the entropy was
+broken.
+
+The test did not change. What it was evidence *of* did.

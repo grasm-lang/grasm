@@ -13,16 +13,18 @@
 // deliberately slow and memory-hard. This one iterates, which is the only
 // defence available without those, and iterating is strictly weaker.
 //
-// **Grasm has no source of randomness** ([ProjectGold F34]). There is
-// `now_millis()` and nothing else. That is survivable for a *salt*, whose job
-// is uniqueness rather than unpredictability — two accounts must not share one,
-// and a clock plus a counter gives that. It is **not** survivable for a session
-// token, which is exactly a secret that must not be guessable. The tokens this
-// program issues are derived from the clock and are therefore predictable to
-// anyone who knows roughly when they were issued.
+// **Grasm had no source of randomness when this was written** ([ProjectGold
+// F34]) — `now_millis()` and nothing else. Session tokens were derived from the
+// clock and were therefore guessable by anyone who knew roughly when they were
+// issued, which this file said in this paragraph rather than hiding.
 //
-// That is stated rather than hidden, and it is why this project is a
-// demonstration of the *shape* of authentication and not something to deploy.
+// `random_bytes` closed it. Tokens are 256 bits of kernel entropy now, and if
+// entropy is unavailable `login` answers 500 rather than issuing one — a token
+// that might be guessable is worse than an error, because it looks exactly like
+// a good one.
+//
+// The salt still uses the clock, and that is correct rather than left over: a
+// salt's job is uniqueness, not unpredictability.
 //
 // ```
 // grasm run main.gr              # the comparison the harness makes
@@ -154,14 +156,34 @@ fn make_salt(email: str, counter: i64) -> str / {io} {
     lib_sha256.sha256("{now_millis()}:{counter}:{email}").substr(0, 32)
 }
 
-/// A session token — and this one **should** be unpredictable, and is not.
+/// A session token: 32 bytes from the operating system, as hex.
 ///
-/// An attacker who knows roughly when a session began can search a small space
-/// of clock values and find it. There is no way to fix that inside the
-/// language today, which is F34, and a project that quietly issued these
-/// without saying so would be teaching the wrong lesson to whoever read it.
+/// This was derived from the clock, and said so: an attacker who knew roughly
+/// when a session began could search a small space of millisecond values and
+/// find it. There was no way to fix it inside the language, which was F34.
+///
+/// `random_bytes` closed that. The token is now 256 bits of kernel entropy and
+/// the clock is not involved, so knowing when a session started tells an
+/// attacker nothing about it.
+///
+/// The fallback is the interesting line. If entropy is unavailable the old
+/// clock-derived token would be *worse than an error*, because it would look
+/// exactly like a good one — so this refuses instead, and `login` turns the
+/// refusal into a 500. A session token that might be guessable is not a session
+/// token.
 fn make_token(email: str, counter: i64) -> str / {io} {
-    lib_sha256.sha256("token:{now_millis()}:{counter}:{email}")
+    match random_bytes(32) {
+        Err(e) -> ""
+        Ok(b) -> {
+            var hex = ""
+            for v in b.to_list() {
+                let digits = "0123456789abcdef"
+                hex += digits.substr(v / 16, 1)
+                hex += digits.substr(v % 16, 1)
+            }
+            hex
+        }
+    }
 }
 
 type Session = { token: str, email: str }
@@ -338,6 +360,12 @@ fn login(r: Req, w: World) -> (World, str) / {io} {
     var next = w
     next.counter = next.counter + 1
     let token = make_token(a.email, next.counter)
+    // No entropy, no session. Issuing a guessable token would be worse than
+    // failing, because it would look exactly like a good one.
+    if token == "" {
+        return (w, response("500 Internal Server Error",
+            json_msg("error", "no entropy available; refusing to issue a session")))
+    }
     next.sessions.push(Session{ token: token, email: a.email })
     (next, response("200 OK", json_msg("token", token)))
 }

@@ -719,6 +719,7 @@ impl<'m> Codegen<'m> {
             ("grasm_tcp_accept", vec![i64t], Some(i64t)),
             ("grasm_tcp_read", vec![i64t], Some(i64t)),
             ("grasm_tcp_read_bytes", vec![i64t], Some(i64t)),
+            ("grasm_random_bytes", vec![i64t], Some(i64t)),
             ("grasm_tcp_write_bytes", vec![i64t, i64t], Some(i64t)),
             ("grasm_tcp_write", vec![i64t, i64t], Some(i64t)),
             ("grasm_net_close", vec![i64t], None),
@@ -7981,6 +7982,16 @@ checker did",
                 self.call_rt("grasm_val_dec", &[lv]);
                 return Ok(Some((v, VType::Bytes)));
             }
+            "random_bytes" => {
+                let (nv, nt) = self.eval_expr_val(&args[0])?;
+                let boxed = self.box_value(nv, &nt);
+                let v = self.call_rt("grasm_random_bytes", &[boxed]).unwrap();
+                self.call_rt("grasm_val_dec", &[boxed]);
+                return Ok(Some((
+                    v,
+                    VType::Fallible(Box::new(VType::Bytes), Box::new(VType::Sum("IoError".into()))),
+                )));
+            }
             "read_bytes" => {
                 let (pv, _) = self.eval_expr_val(&args[0])?;
                 let v = self.call_rt("grasm_read_bytes", &[pv]).unwrap();
@@ -9350,6 +9361,10 @@ checker did",
                                 Box::new(VType::Sum("IoError".into())),
                             )),
                             "bytes_of" => Some(VType::Bytes),
+                            "random_bytes" => Some(VType::Fallible(
+                                Box::new(VType::Bytes),
+                                Box::new(VType::Sum("IoError".into())),
+                            )),
                             "read_bytes" => Some(VType::Fallible(
                                 Box::new(VType::Bytes),
                                 Box::new(VType::Sum("IoError".into())),

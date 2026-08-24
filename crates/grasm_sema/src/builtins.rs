@@ -82,6 +82,11 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin { name: "args", row: IO_ROW },
     Builtin { name: "env", row: IO_ROW },
     Builtin { name: "now_millis", row: IO_ROW },
+    // Reading entropy is reaching outside the program, and two calls do not
+    // agree — which is the same reason `now_millis` is charged. A pure function
+    // that answered differently each time would break every promise the effect
+    // row makes.
+    Builtin { name: "random_bytes", row: IO_ROW },
     // --- the network ---
     Builtin { name: "tcp_listen", row: NET_ROW },
     Builtin { name: "tcp_connect", row: NET_ROW },

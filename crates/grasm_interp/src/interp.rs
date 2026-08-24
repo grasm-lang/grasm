@@ -2792,6 +2792,42 @@ uses to mark the end of a string"
                         }
                         return Ok(Value::Bytes(Rc::new(out)));
                     }
+                    "random_bytes" => {
+                        use std::io::Read;
+                        let n = match self.eval_expr(&args[0])? {
+                            Value::Int(v) => v,
+                            _ => -1,
+                        };
+                        if n < 0 {
+                            return Ok(Value::Err(Rc::new(io_error(
+                                "IoFailed",
+                                format!("random_bytes needs a count of 0 or more, got {n}"),
+                            ))));
+                        }
+                        if n > 1_048_576 {
+                            return Ok(Value::Err(Rc::new(io_error(
+                                "IoFailed",
+                                format!("random_bytes is capped at 1048576 bytes, asked for {n}"),
+                            ))));
+                        }
+                        let mut buf = vec![0u8; n as usize];
+                        if n == 0 {
+                            return Ok(Value::Ok(Rc::new(Value::Bytes(Rc::new(buf)))));
+                        }
+                        return Ok(match std::fs::File::open("/dev/urandom") {
+                            Err(e) => Value::Err(Rc::new(io_error(
+                                "IoFailed",
+                                format!("cannot open /dev/urandom: {e}"),
+                            ))),
+                            Ok(mut f) => match f.read_exact(&mut buf) {
+                                Ok(()) => Value::Ok(Rc::new(Value::Bytes(Rc::new(buf)))),
+                                Err(e) => Value::Err(Rc::new(io_error(
+                                    "IoFailed",
+                                    format!("short read: {e}"),
+                                ))),
+                            },
+                        });
+                    }
                     "read_bytes" => {
                         let p = self.eval_expr(&args[0])?.to_string();
                         return Ok(match std::fs::read(&p) {

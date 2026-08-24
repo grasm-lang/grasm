@@ -258,6 +258,7 @@ pub const BUILTIN_FREE_FNS: &[&str] = &[
     "input",
     "args",
     "now_millis",
+    "random_bytes",
     "env",
     "exit",
     "panic",
@@ -4550,6 +4551,18 @@ only a number or a `bool` can come out — compute what you need and yield that"
                         }
                         self.check_expr(&args[0], &Type::List(Box::new(Type::I64)));
                         return Type::Bytes;
+                    }
+                    "random_bytes" => {
+                        if args.len() != 1 {
+                            return self
+                                .error(span, "random_bytes takes exactly 1 argument (count)");
+                        }
+                        self.check_expr(&args[0], &Type::I64);
+                        let io_err = Type::Named {
+                            id: self.defs.io_error_id,
+                            args: vec![],
+                        };
+                        return Type::Fallible(Box::new(Type::Bytes), Box::new(io_err));
                     }
                     "read_bytes" => {
                         if args.len() != 1 {

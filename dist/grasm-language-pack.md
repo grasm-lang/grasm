@@ -4,7 +4,7 @@ Everything needed to write correct Grasm, in one file. No prior exposure
 required: the normative rules, then a guided tour.
 
 Each `[TAG]` below is a normative clause. Every clause has a corresponding
-executable program in `grasm-conformance-pack.md`, and `cargo test -p
+executable program in one of the `grasm-conformance-*.md` files, and `cargo test -p
 grasm_spec` fails if a clause has no program, if a program names a clause that
 does not exist, or if any program behaves differently from what it declares. So
 the rules and the examples cannot disagree.
@@ -2192,6 +2192,7 @@ came to be documented as returning `Option[str]` when it is fallible.
 | `fail(e)` | `(E)` | raises the error branch of a `T ! E` |
 | `map()` | `() -> Map[K, V]` | a new empty map |
 | `now_millis()` | `() -> i64` | milliseconds since the epoch; `io` |
+| `random_bytes(n)` | `(i64) -> bytes ! IoError` | `n` bytes from the operating system; `io` |
 | `env(name)` | `(str) -> Option[str]` | environment variable; `io` |
 | `exit(code)` | `(i64)` | ends the program with that status — its low eight bits ([L-LIB-EXIT]) |
 | `read_file(p)` | `(str) -> str ! IoError` | fallible, not `Option`; `io` ([L-LIB-IO]) |
@@ -2888,6 +2889,25 @@ Names are returned, not paths — the caller already knows the directory it aske
 about, and joining is one concatenation.
 
 ## Bytes — [L-LIB-BYTES]
+
+**[L-LIB-RANDOM]** `random_bytes(n)` answers `n` bytes from the operating
+system's entropy source, and performs `io`.
+
+It is charged `io` because it reaches outside the program and two calls do not
+agree — the same reason the clock is. A pure function that answered differently
+each time would break every promise an effect row makes.
+
+The primitive is bytes rather than an integer or a float because everything else
+is built from it and the conversions are where the mistakes are: a number in a
+range wants rejection sampling, not a modulo, and a language that shipped
+`random_int(lo, hi)` with a modulo in it would have shipped a bias.
+
+`n` of zero is an empty answer rather than an error. A negative count, or one
+past 1048576, is refused — a count is usually something a program computed, and
+a mistake there should be a refusal rather than a gigabyte.
+
+A short read is a failure, not a short answer: a caller asking for 32 bytes of
+key material and receiving 12 must not proceed.
 
 **[L-BUNDLE-SOURCE]** A whole program may be written as **one source file**: a
 *source bundle*, in which each module is preceded by a line reading `//!module

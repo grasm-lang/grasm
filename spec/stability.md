@@ -258,6 +258,7 @@ May change or be removed in any release. New surface starts here.
 - `L-LIB-BASE` — experimental
 - `L-LIB-BITS` — experimental
 - `L-BUNDLE-SOURCE` — experimental
+- `L-LIB-RANDOM` — experimental
 - `L-LIB-BYTES` — experimental
 - `L-LIB-EPRINT` — experimental
 - `L-LIB-FS` — experimental

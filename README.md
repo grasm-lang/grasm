@@ -80,9 +80,12 @@ grasm build hello.gr --native -o hello && ./hello
 `dist/grasm-language-pack.md` is the whole language — grammar, types,
 semantics and a tutorial — in about 40k tokens. It is small enough to hand to an
 AI assistant in full, which is how you get useful completions for a language it
-has never seen. `dist/grasm-conformance-pack.md` carries the runnable program for
-every rule, another 37k tokens; you need it when a rule is in dispute and you
-want it settled by a program rather than by prose.
+has never seen. The `dist/grasm-conformance-*.md` files — grammar, types,
+semantics, library — carry the runnable program for every rule, about 50k tokens
+across the four; you want one of them when a rule is in dispute and you would
+rather see it settled by a program than by prose. They are split by area because
+together they no longer fit in one context, and a rule in dispute belongs to one
+area rather than four.
 
 `grasm_wasm` builds the interpreter for `wasm32-unknown-unknown`, so a Grasm
 program runs in a browser tab with no server: `cargo build --release --target
