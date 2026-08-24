@@ -209,6 +209,17 @@ pub enum ScalarKind {
 }
 
 impl ScalarKind {
+    /// The number the compiled backend passes. The inverse of [`from_i64`], and
+    /// beside it so the two cannot drift.
+    pub fn to_i64(self) -> i64 {
+        match self {
+            ScalarKind::I64 => 0,
+            ScalarKind::F64 => 1,
+            ScalarKind::Ref => 3,
+            ScalarKind::Bool => 2,
+        }
+    }
+
     fn from_i64(k: i64) -> ScalarKind {
         match k {
             0 => ScalarKind::I64,
@@ -1058,6 +1069,13 @@ pub enum RtPayload {
     F64(f64),
     Bool(bool),
     Str(RtStr),
+    /// `a..b` or `a..=b`, held rather than walked.
+    ///
+    /// Three scalars, not the elements: `let r = 0..2_000_000` is two words
+    /// and a flag, and the interpreter's `Value::Range` is the same three
+    /// fields — so a range that crosses between engines is the same value on
+    /// both, and prints as `0..2000000` rather than as two million integers.
+    Range { start: i64, end: i64, inclusive: bool },
     /// A contiguous run of bytes ([L-LIB-BYTES]). `Vec<u8>`, not a list of
     /// boxed integers: the promise the type makes is that every element is a
     /// byte, and the representation should carry that promise.
@@ -2532,6 +2550,15 @@ unsafe fn display(v: *mut RtVal) -> String {
     rt_stack_check();
     match &(*v).payload {
         RtPayload::Unit => "()".to_string(),
+        // The bounds, not the elements. `0..2000000` is what the range *is*,
+        // and printing two million integers instead would be a different value.
+        RtPayload::Range { start, end, inclusive } => {
+            if *inclusive {
+                format!("{start}..={end}")
+            } else {
+                format!("{start}..{end}")
+            }
+        }
         // Hex, two digits per byte — the same form the interpreter prints, so
         // the two engines agree on what a `bytes` looks like ([L-LIB-BYTES]).
         RtPayload::Bytes(b) => {
@@ -3047,6 +3074,13 @@ pub unsafe extern "C" fn grasm_val_eq(a: *mut RtVal, b: *mut RtVal) -> i8 {
 /// One level of structural equality; children are pushed for the caller.
 unsafe fn val_eq_step(a: *mut RtVal, b: *mut RtVal, work: &mut Vec<(*mut RtVal, *mut RtVal)>) -> bool {
     match (&(*a).payload, &(*b).payload) {
+        // By the bounds. `0..3 == 0..3` is true and `0..3 == 0..=3` is false,
+        // which is what the interpreter answers — and comparing the elements
+        // instead would have made `0..0` equal to `5..5`.
+        (
+            RtPayload::Range { start: s1, end: e1, inclusive: i1 },
+            RtPayload::Range { start: s2, end: e2, inclusive: i2 },
+        ) => s1 == s2 && e1 == e2 && i1 == i2,
         (RtPayload::Map(x), RtPayload::Map(y)) => {
             if x.len() != y.len() {
                 return false;
@@ -6330,6 +6364,7 @@ unsafe fn wire_of(v: *mut RtVal) -> replay::Wire {
         },
         // A builtin answers with none of these. Reaching here means a hook was
         // put on the wrong call, and guessing an encoding would hide that.
+        RtPayload::Range { .. } => replay::Wire::of_unsupported("range"),
         RtPayload::Ref(_) => replay::Wire::of_unsupported("reference"),
         RtPayload::Map(_) => replay::Wire::of_unsupported("map"),
         RtPayload::Struct { .. } => replay::Wire::of_unsupported("struct"),
@@ -6428,6 +6463,118 @@ mod small_string_tests {
                 assert_eq!(&*joined, want.as_str(), "{a:?} + {b:?}");
                 assert_eq!(joined.char_len(), want.chars().count(), "{a:?} + {b:?}");
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ranges held as values
+//
+// `for i in 0..n` never builds one of these: the backend compiles that shape
+// into a counted loop, which is why it was fast before a range was a value and
+// stays fast now. These exist for the other case — a range bound to a name,
+// passed to a function, printed, compared — which was a build-time refusal.
+
+/// `a..b`, or `a..=b` when `inclusive` is non-zero.
+#[no_mangle]
+pub extern "C" fn grasm_range_new(start: i64, end: i64, inclusive: i8) -> *mut RtVal {
+    alloc(RtPayload::Range {
+        start,
+        end,
+        inclusive: inclusive != 0,
+    })
+}
+
+/// The elements, as a scalar list.
+///
+/// The combinators are answered by building this first, exactly as the
+/// interpreter does — so there is one definition of what a range contains and
+/// not two. An empty or backwards range gives an empty list rather than an
+/// error, which is what iterating one does.
+///
+/// # Safety: live runtime pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_range_to_list(r: *mut RtVal) -> *mut RtVal {
+    let RtPayload::Range { start, end, inclusive } = &(*r).payload else {
+        panic!("range_to_list: not a range");
+    };
+    let (start, end, inclusive) = (*start, *end, *inclusive);
+    let last = if inclusive { end } else { end - 1 };
+    let out = grasm_list_new_scalar(ScalarKind::I64.to_i64());
+    let mut i = start;
+    while i <= last {
+        grasm_list_push_scalar(out, i, ScalarKind::I64.to_i64());
+        // `i64::MAX` as the last element would wrap the counter back to
+        // `i64::MIN` and iterate forever, so the end is recognised as the end.
+        if i == last {
+            break;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// How many elements it has, without building them.
+///
+/// # Safety: live runtime pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_range_len(r: *mut RtVal) -> i64 {
+    let RtPayload::Range { start, end, inclusive } = &(*r).payload else {
+        panic!("range_len: not a range");
+    };
+    let span = if *inclusive {
+        (*end as i128) - (*start as i128) + 1
+    } else {
+        (*end as i128) - (*start as i128)
+    };
+    span.max(0).min(i64::MAX as i128) as i64
+}
+
+/// The three fields, for a compiled `for` over a range held as a value.
+///
+/// # Safety: live runtime pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_range_start(r: *mut RtVal) -> i64 {
+    match &(*r).payload {
+        RtPayload::Range { start, .. } => *start,
+        _ => panic!("range_start: not a range"),
+    }
+}
+
+/// # Safety: live runtime pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_range_end(r: *mut RtVal) -> i64 {
+    match &(*r).payload {
+        RtPayload::Range { end, .. } => *end,
+        _ => panic!("range_end: not a range"),
+    }
+}
+
+/// # Safety: live runtime pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_range_inclusive(r: *mut RtVal) -> i8 {
+    match &(*r).payload {
+        RtPayload::Range { inclusive, .. } => i8::from(*inclusive),
+        _ => panic!("range_inclusive: not a range"),
+    }
+}
+
+#[cfg(test)]
+mod scalar_kind_tests {
+    use super::ScalarKind;
+
+    /// The two directions agree. They are read by different sides of the ABI —
+    /// the backend writes a number, the runtime reads one — so a mapping that
+    /// drifted would put integers in a list of bools rather than fail to build.
+    #[test]
+    fn the_number_and_the_kind_round_trip() {
+        for k in [
+            ScalarKind::I64,
+            ScalarKind::F64,
+            ScalarKind::Bool,
+            ScalarKind::Ref,
+        ] {
+            assert_eq!(ScalarKind::from_i64(k.to_i64()), k, "{k:?} did not survive");
         }
     }
 }

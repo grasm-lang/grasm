@@ -7,6 +7,14 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
 
 ### Fixed
 
+- **`--native` compiles a range held as a value.** `let r = 0..n`, passed,
+  printed, compared, walked. `for i in 0..n` written literally is compiled into
+  a counted loop and never builds a range at all — which is why it costs
+  nothing, and it is unchanged — so there had been no range value for a binding
+  to hold. One exists now: three scalars, so `0..2_000_000` costs what `0..2`
+  does. It prints as its bounds rather than its elements, and two compare equal
+  when bounds and inclusiveness match, so `0..0` is not equal to `5..5` though
+  both are empty. `len` is answered from the bounds without building anything.
 - **`--native` compiles a match on `IoError`'s variants** (F38). `IoError` is in
   the prelude — nobody declares it in source — and the backend built its type
   table by walking each module's declarations, so there was never anything to

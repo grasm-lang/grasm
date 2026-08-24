@@ -93,6 +93,13 @@ enum VType {
     /// value, like `Str` — a byte buffer has no scalar representation.
     Bytes,
     List(Box<VType>),
+    /// `a..b` held as a value, rather than walked by a `for`.
+    ///
+    /// Boxed: three fields do not fit a machine word, and a range is rare
+    /// enough in a hot loop that it is not worth a second representation. The
+    /// counted-loop compilation of `for i in 0..n` does not go through this
+    /// and is unchanged.
+    Range,
     /// Tier 2 — a generational reference, one i64: slot index in the high
     /// half, generation in the low half. A plain scalar, so it copies freely
     /// and needs no refcount of its own; the slab owns what it points at.
@@ -142,6 +149,7 @@ impl VType {
             VType::Unit => "unit".into(),
             VType::Str => "str".into(),
             VType::Bytes => "bytes".into(),
+            VType::Range => "range".into(),
             VType::Any => "any".into(),
             VType::List(e) => format!("l{}", e.mangle()),
             VType::Option(e) => format!("o{}", e.mangle()),
@@ -171,6 +179,7 @@ impl VType {
             VType::Unit => "()".into(),
             VType::Str => "str".into(),
             VType::Bytes => "bytes".into(),
+            VType::Range => "a range".into(),
             VType::Any => "an inferred type".into(),
             VType::Ref(inner) => format!("ref {}", inner.show()),
             VType::List(e) => format!("[{}]", e.show()),
@@ -201,6 +210,7 @@ impl VType {
             // Boxed values travel as 64-bit pointers.
             VType::Str
             | VType::Bytes
+            | VType::Range
             | VType::List(_)
             | VType::Struct(_)
             | VType::Sum(_)
@@ -218,6 +228,7 @@ impl VType {
             self,
             VType::Str
                 | VType::Bytes
+                | VType::Range
                 | VType::List(_)
                 | VType::Struct(_)
                 | VType::Sum(_)
@@ -779,6 +790,12 @@ impl<'m> Codegen<'m> {
             ("grasm_map_is_empty", vec![i64t], Some(i8t)),
             ("grasm_list_min_max", vec![i64t, i8t], Some(i64t)),
             ("grasm_list_new_scalar", vec![i64t], Some(i64t)),
+            ("grasm_range_new", vec![i64t, i64t, i8t], Some(i64t)),
+            ("grasm_range_to_list", vec![i64t], Some(i64t)),
+            ("grasm_range_len", vec![i64t], Some(i64t)),
+            ("grasm_range_start", vec![i64t], Some(i64t)),
+            ("grasm_range_end", vec![i64t], Some(i64t)),
+            ("grasm_range_inclusive", vec![i64t], Some(i8t)),
             ("grasm_list_push_scalar", vec![i64t, i64t, i64t], Some(i64t)),
             ("grasm_list_get_scalar", vec![i64t, i64t, i64t], Some(i64t)),
             ("grasm_list_set_scalar", vec![i64t, i64t, i64t, i64t], Some(i64t)),
@@ -825,6 +842,7 @@ impl<'m> Codegen<'m> {
                             "bool" => return Ok(VType::Bool),
                             "str" => return Ok(VType::Str),
                             "bytes" => return Ok(VType::Bytes),
+                            "range" => return Ok(VType::Range),
                             _ => {}
                         }
                         // An alias is its target, resolved here so nothing
@@ -3762,6 +3780,19 @@ impl FnCx<'_, '_> {
             .insert(name.to_string(), (var, vt));
     }
 
+    /// Whether `e` is a name bound to a range.
+    ///
+    /// Deliberately only a name: it is asked *before* the receiver is
+    /// evaluated, so it cannot evaluate anything itself, and a name is the
+    /// shape a held range actually takes. Everything else falls through to the
+    /// paths that were already there.
+    fn holds_a_range(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Ident(id) => matches!(self.lookup(&id.name), Some((_, VType::Range))),
+            _ => false,
+        }
+    }
+
     fn lookup(&self, name: &str) -> Option<(Variable, VType)> {
         for scope in self.vars.iter().rev() {
             if let Some(v) = scope.get(name) {
@@ -3988,6 +4019,28 @@ impl FnCx<'_, '_> {
 
     fn is_filled(&self) -> bool {
         self.filled
+    }
+
+    /// `a..b` as a value: three scalars in one boxed cell.
+    ///
+    /// `for i in 0..n` never reaches here — the backend compiles that shape
+    /// into a counted loop, which is why it costs nothing and still does. This
+    /// is the other case: a range bound to a name, passed, printed, compared.
+    fn eval_range_value(
+        &mut self,
+        start: &Expr,
+        end: &Expr,
+        inclusive: bool,
+        span: Span,
+    ) -> CResult<(Value, VType)> {
+        let (s, st) = self.eval_expr_val(start)?;
+        let (e, et) = self.eval_expr_val(end)?;
+        if st != VType::I64 || et != VType::I64 {
+            return nope(span, "non-integer ranges");
+        }
+        let incl = self.b.ins().iconst(types::I8, i64::from(inclusive));
+        let v = self.call_rt("grasm_range_new", &[s, e, incl]).unwrap();
+        Ok((v, VType::Range))
     }
 
     fn call_rt(&mut self, name: &'static str, args: &[Value]) -> Option<Value> {
@@ -4889,7 +4942,18 @@ impl FnCx<'_, '_> {
         // temporary, so returning out of a `for` leaked the list being
         // iterated, which is the shape any search function has.
         self.push_scope();
-        let (list_v, list_t) = self.eval_expr_val(iter)?;
+        let (mut list_v, mut list_t) = self.eval_expr_val(iter)?;
+        // A range *held as a value* — `let r = 0..n` then `for i in r`. The
+        // literal `for i in 0..n` never gets here; it is compiled above into a
+        // counted loop, which is why it costs nothing and still does. Walking
+        // the elements this one names is the same thing the interpreter does,
+        // so the two agree on what the loop sees.
+        if list_t == VType::Range {
+            let elems = self.call_rt("grasm_range_to_list", &[list_v]).unwrap();
+            self.call_rt("grasm_val_dec", &[list_v]);
+            list_v = elems;
+            list_t = VType::List(Box::new(VType::I64));
+        }
         let VType::List(elem_t) = list_t.clone() else {
             return nope(iter.span(), "for over non-range, non-list iterables");
         };
@@ -5461,14 +5525,18 @@ impl FnCx<'_, '_> {
                 scrutinee, arms, span,
             } => self.eval_match(scrutinee, arms, *span),
             Expr::Try { expr, span } => self.eval_try(expr, *span).map(Some),
-            other => nope(
-                other.span(),
-                match other {
-                    Expr::Range { .. } => "range values outside for",
-                    Expr::Closure { .. } => "closures",
-                    _ => "this construct",
-                },
-            ),
+            Expr::Range {
+                start,
+                end,
+                inclusive,
+                span,
+            } => self
+                .eval_range_value(start, end, *inclusive, *span)
+                .map(Some),
+            // No catch-all. Every expression form the parser can produce has
+            // an arm above, and that is worth keeping: a new one added later
+            // has to be handled here rather than falling into a refusal that
+            // says "this construct" and names nothing.
         }
     }
 
@@ -5798,6 +5866,54 @@ impl FnCx<'_, '_> {
         // [G11] budgets Grasm at or below Python's token count and it was
         // 1.41×; the pattern this replaces — `var xs: [i64] = []`, a `for`, a
         // `push` and two braces — is where most of the difference was.
+        // A range *held as a value* — `let r = 0..n` then `r.map(f)`. The
+        // literal form below is fused into a single loop and this one is not:
+        // the elements are built first and the list methods take it from there,
+        // exactly as the interpreter does. So there is one definition of what a
+        // range contains, and the fast path stays on the shape that can use it.
+        if matches!(
+            name.name.as_str(),
+            "to_list" | "map" | "filter" | "sum" | "len"
+        ) && !matches!(recv, Expr::Range { .. })
+            && self.holds_a_range(recv)
+        {
+            let (rv, _) = self.eval_expr_val(recv)?;
+            if name.name == "len" {
+                // Answered from the bounds. Building five million integers in
+                // order to count them would be the one case where a range
+                // costs more than the list it replaced.
+                let n = self.call_rt("grasm_range_len", &[rv]).unwrap();
+                // Reading a name retains it; the count is a scalar and holds
+                // nothing, so the retained range goes back here.
+                self.call_rt("grasm_val_dec", &[rv]);
+                return Ok(Some((n, VType::I64)));
+            }
+            let list = self.call_rt("grasm_range_to_list", &[rv]).unwrap();
+            // The list is built from the bounds and does not borrow them.
+            self.call_rt("grasm_val_dec", &[rv]);
+            let lt = VType::List(Box::new(VType::I64));
+            if name.name == "to_list" {
+                return Ok(Some((list, lt)));
+            }
+            // Bound to a name the source cannot spell, so the list-method
+            // paths — which dispatch on the shape of the receiver expression,
+            // not on a value — take it from here unchanged.
+            let tmp = self.new_var(&lt);
+            self.b.def_var(tmp, list);
+            let hidden = format!("__range_list_{}", span.start);
+            self.push_scope();
+            self.bind(&hidden, tmp, lt);
+            let call = Expr::MethodCall {
+                recv: Box::new(Expr::Ident(Ident { name: hidden, span })),
+                name: name.clone(),
+                args: args.to_vec(),
+                span,
+            };
+            let out = self.eval_expr(&call);
+            self.pop_scope_with_decs();
+            return out;
+        }
+
         if matches!(recv, Expr::Range { .. })
             && matches!(
                 name.name.as_str(),

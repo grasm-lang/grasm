@@ -264,7 +264,10 @@ fn main() {
     print("{f(1, 40)}")
 }'
 
-expect_refused "a range held as a value" 'fn main() {
+# Was a gap. `for i in 0..n` is compiled into a counted loop and never builds
+# a range at all — which is why it costs nothing — so there was no range value
+# for a binding to hold. There is one now, and the counted loop is unchanged.
+expect_compiles "a range held as a value" 'fn main() {
     let r = 1..5
     var t = 0
     for i in r {

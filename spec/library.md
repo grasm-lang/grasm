@@ -422,9 +422,18 @@ order ([E-MAP-ORDER]).
 
 **[L-LIB-RANGE-OPS]** A range answers `to_list`, `map`, `filter`, `sum` and
 `len`, producing a list of the same elements `for i in a..b` walks. There is one
-definition of what a range contains and not two: the interpreter turns the range
-into that list and reuses the list method, and the compiled backend rewrites the
-call into the loop it already compiles, since it has no range *value* (§11).
+definition of what a range contains and not two: every engine builds that list
+and reuses the list method.
+
+A range is also a **value**: `let r = 0..n` binds one, it prints as `0..n`
+rather than as its elements, and two compare equal when their bounds and their
+inclusiveness match — so `0..3 == 0..3` and `0..3 != 0..=3`. It holds three
+numbers and not its elements, so `0..2_000_000` costs the same as `0..2`.
+
+`len` is answered from the bounds without building anything; the others build
+the list first. `for i in a..b` written literally never builds a range at all —
+it is compiled into a counted loop — and that is why the loop costs nothing and
+holding a range costs one allocation.
 
 The clause exists because of what it replaces. Building a list from a count
 needed `var xs: [i64] = []`, a `for`, a `push` and two closing braces — four
