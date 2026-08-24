@@ -1655,3 +1655,39 @@ real program; it was the same shape and cost nothing to close.
 rather than only in a finding.
 
 Handler programs the backend declines are now **0 of 40**, from 9 of 20.
+
+### After the day's backend changes: measured, not published
+
+Today changed a lot in the compiled backend — handler values, ranges as values,
+`boxed()` gaining two variants, a pass reordered, new arms in `probe_type` and
+`eval_method`. None of that is on a hot path by inspection, and inspection is
+not measurement.
+
+Best of three, load 0.21× cores, against the same reference programs:
+
+| | native/C before | native/C after |
+|---|---|---|
+| fib | 2.00 | 2.20 |
+| sieve | 2.14 | 2.29 |
+| matmul | 2.00 | 2.20 |
+| wordfreq | 1.47 | 1.38 |
+| tree | 2.45 | 2.43 |
+| sort | 0.53 | 0.53 |
+| parmap | 2.06 | 1.94 |
+| parwords | 3.88 | 3.25 |
+
+The reference languages moved by the same few percent in the same direction on
+this run — C's `wordfreq` 30→32 ms, `sort` 36→38, `parmap` 50→54 — so the
+absolute times are the machine, and the ratios are the answer: unchanged within
+noise, with `parwords` the only one that moved beyond it, and downward.
+
+**The scorecard was not updated.** Its numbers are best of *five* and this is
+best of three, and the re-run at five was refused:
+
+```
+refusing to benchmark: load average 4.40 on 8 cores
+```
+
+— by my own previous run. Publishing a best-of-three figure in a table that
+says best-of-five would be a comparison between two protocols presented as one.
+The check that mattered here is *did anything regress*, and it is answered.
