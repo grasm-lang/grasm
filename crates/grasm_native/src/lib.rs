@@ -5207,7 +5207,24 @@ impl FnCx<'_, '_> {
                         return Ok(Some((v, pt)));
                     }
                 }
-                let (rv, rt) = self.eval_expr_val(recv)?;
+                // As for a field read: indexing a plain local **borrows** it.
+                // The variable holds a reference for the whole of the read, so
+                // the increment and the release around it cancel exactly. Any
+                // other receiver produced a temporary this expression owns.
+                let borrowed = match &**recv {
+                    Expr::Ident(id) => match self.lookup(&id.name) {
+                        Some((var, vt @ VType::List(_))) => Some((var, vt)),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let (rv, rt, owned) = match borrowed {
+                    Some((var, vt)) => (self.b.use_var(var), vt, false),
+                    None => {
+                        let (v, t) = self.eval_expr_val(recv)?;
+                        (v, t, true)
+                    }
+                };
                 let VType::List(elem_t) = rt else {
                     return nope(*span, "indexing non-lists");
                 };
@@ -5216,7 +5233,9 @@ impl FnCx<'_, '_> {
                     return nope(index.span(), "non-integer index");
                 }
                 let (v, vt) = self.list_get_elem(rv, iv, &elem_t)?;
-                self.call_rt("grasm_val_dec", &[rv]);
+                if owned {
+                    self.call_rt("grasm_val_dec", &[rv]);
+                }
                 Ok(Some((v, vt)))
             }
             Expr::MethodCall {

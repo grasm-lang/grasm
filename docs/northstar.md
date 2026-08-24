@@ -548,6 +548,18 @@ The second half was worth four times the first, which is the wrong way round
 from how they were found: the fused call is the clever one and the borrow is the
 obvious one.
 
+**And the same borrow on an index.** `xs[i]` evaluated `xs`, which increments,
+and released it after — the identical cancelling pair, in the identical shape.
+There was already a `pin` path that avoided it inside a `for` loop, and nothing
+outside one.
+
+    three million `ps[i].a` reads      42.9 -> 27.8 ms
+
+Two places found by the same sentence, which is the argument for writing the
+sentence down: *a read through a plain local borrows it, because the variable
+holds a reference for the whole of the read.* [E-BORROWED-READ] said it about
+methods. It is true of every read.
+
 **The price of atomic reference counting, measured.** "Parallelism needs
 atomic refcounting, and atomic refcounting is expensive" is the sentence that
 kept `par_map` restricted to machine words — the workers share nothing because
