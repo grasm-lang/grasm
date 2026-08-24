@@ -519,6 +519,35 @@ quadratic in Go too and which no Go programmer would write — it now uses
 characters with an O(n) scan. A benchmark Grasm wins because the other
 implementations were written badly is worth nothing.
 
+**A struct field read was eight times a local read, and did not need to be.**
+Taking `tree` apart again: build and free is 33.5 ms of it and the *walk* is
+28.8, so half the program is reading two fields per node. Pricing that directly
+— three million reads of an `i64` field against three million reads of a local —
+said **12 ns against 1.5**.
+
+Four runtime calls were behind it. `p.a` fetched the field and incremented it,
+released the receiver, unboxed, then released the field.
+
+Two of the four cancel exactly and the other two are one call:
+
+* **The field's increment and decrement.** They exist so a boxed field handed
+  out can outlive the read. A scalar's *bits* cannot outlive anything — they are
+  copied on the spot — so `grasm_struct_scalar_at` returns them and never
+  touches the count.
+* **The receiver's.** `p.a` evaluated `p`, which increments, and released it
+  after. The variable holds a reference for the whole of the read, so the count
+  cannot reach zero during it. That is the argument [E-BORROWED-READ] already
+  makes for a read-only method, applied where it had not been — and only for a
+  plain identifier, because anything else produces a temporary this expression
+  owns.
+
+        three million i64 field reads    40.5 -> 9.6 ms   (12 ns -> 1.7 ns)
+        tree                             62.3 -> 50.5 ms
+
+The second half was worth four times the first, which is the wrong way round
+from how they were found: the fused call is the clever one and the borrow is the
+obvious one.
+
 **The price of atomic reference counting, measured.** "Parallelism needs
 atomic refcounting, and atomic refcounting is expensive" is the sentence that
 kept `par_map` restricted to machine words — the workers share nothing because

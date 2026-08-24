@@ -2623,6 +2623,43 @@ pub unsafe extern "C" fn grasm_struct_make(
     })
 }
 
+/// A **scalar** field's bits, touching no reference count.
+///
+/// `p.a` for an `i64` field was four runtime calls: read the field and
+/// increment it, release the receiver, unbox, release the field. Three million
+/// of them cost 12 ns each, against 1.5 ns for reading a local — and a struct
+/// field is not supposed to be eight times a local.
+///
+/// The increment and the decrement cancel exactly. They exist so a boxed field
+/// handed out can outlive the read, and a scalar's *bits* cannot outlive
+/// anything: they are copied out on the spot. So this returns the bits and the
+/// count is never touched.
+///
+/// Bits rather than a typed value because the backend already knows the type —
+/// it chose this call — and one entry point is one entry point.
+///
+/// # Safety: `i` is a field index the compiler resolved for this struct type,
+/// and the field's static type is a scalar.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_struct_scalar_at(s: *mut RtVal, i: i64) -> i64 {
+    let RtPayload::Struct { fields, .. } = &(*s).payload else {
+        grasm_panic_msg_str("field access on non-struct");
+    };
+    match fields.get(i as usize) {
+        Some(v) => match &(**v).payload {
+            RtPayload::I64(x) => *x,
+            RtPayload::Bool(b) => i64::from(*b),
+            RtPayload::F64(f) => f.to_bits() as i64,
+            RtPayload::Ref(r) => *r,
+            RtPayload::Unit => 0,
+            // The compiler picked this call from the field's static type, so a
+            // non-scalar here is a backend defect rather than a program's.
+            _ => grasm_panic_msg_str("scalar field access on a boxed field"),
+        },
+        None => grasm_panic_msg_str("no such field"),
+    }
+}
+
 /// A field by its position in the struct's declaration.
 ///
 /// Fields are always stored in declaration order — the backend sorts a literal

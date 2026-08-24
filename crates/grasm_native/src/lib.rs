@@ -621,6 +621,7 @@ impl<'m> Codegen<'m> {
             ("grasm_struct_make", vec![ptr, ptr], Some(i64t)),
             ("grasm_struct_get", vec![i64t, ptr, i64t], Some(i64t)),
             ("grasm_struct_get_at", vec![i64t, i64t], Some(i64t)),
+            ("grasm_struct_scalar_at", vec![i64t, i64t], Some(i64t)),
             ("grasm_struct_set_field", vec![i64t, ptr, i64t, i64t], Some(i64t)),
             ("grasm_struct_set_field_at", vec![i64t, i64t, i64t], Some(i64t)),
             ("grasm_variant_new", vec![ptr, i64t, ptr, i64t], Some(i64t)),
@@ -8614,7 +8615,29 @@ checker did",
                 }
             }
         }
-        let (rv, rt) = self.eval_expr_val(recv)?;
+        // A field read of a plain local **borrows** its receiver.
+        //
+        // `p.a` evaluated `p` — which increments — and released it again
+        // afterwards, a pair that cancels exactly. The variable holds a
+        // reference for the whole of the read, so the count cannot reach zero
+        // during it; this is the same argument [E-BORROWED-READ] already makes
+        // for a read-only method, applied where it was not.
+        //
+        // Only a plain identifier. Anything else produced a temporary that this
+        // expression owns and must release.
+        let borrowed_receiver = match recv {
+            Expr::Ident(id) => self.lookup(&id.name),
+            _ => None,
+        };
+        let (rv, rt, owned) = match &borrowed_receiver {
+            Some((var, vt)) if matches!(vt, VType::Struct(_)) => {
+                (self.b.use_var(*var), vt.clone(), false)
+            }
+            _ => {
+                let (v, t) = self.eval_expr_val(recv)?;
+                (v, t, true)
+            }
+        };
         // Tier 2: reading through a reference goes via the slab, which checks
         // the generation and panics if the slot has been released. The value
         // comes back boxed, so it is unboxed to the pointee's own shape.
@@ -8670,6 +8693,23 @@ checker did",
         // comparing strings — the name form falls back only for a struct type
         // this backend somehow has no table for, which the line above would
         // already have refused.
+        // A scalar field is read in one call and no reference counting. The
+        // general path is four calls — fetch and increment, release the
+        // receiver, unbox, release the field — and the increment and decrement
+        // on the field cancel exactly, because bits copied out cannot outlive
+        // anything.
+        if let (Some(i), true) = (
+            self.struct_field_index(&sname, &name.name),
+            scalar_kind_i64(&ft).is_some(),
+        ) {
+            let iv = self.b.ins().iconst(types::I64, i);
+            let bits = self.call_rt("grasm_struct_scalar_at", &[rv, iv]).unwrap();
+            if owned {
+                self.call_rt("grasm_val_dec", &[rv]);
+            }
+            let v = self.scalar_of_bits(bits, &ft);
+            return Ok(Some((v, ft)));
+        }
         let boxed = match self.struct_field_index(&sname, &name.name) {
             Some(i) => {
                 let iv = self.b.ins().iconst(types::I64, i);
@@ -8680,7 +8720,9 @@ checker did",
                 self.call_rt("grasm_struct_get", &[rv, fp, fl]).unwrap()
             }
         };
-        self.call_rt("grasm_val_dec", &[rv]);
+        if owned {
+            self.call_rt("grasm_val_dec", &[rv]);
+        }
         let (v, vt) = self.unbox(boxed, &ft)?;
         Ok(Some((v, vt)))
     }
