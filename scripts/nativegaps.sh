@@ -290,7 +290,11 @@ fn main() {
     print("{go([1, 2], sq)} {[1, 2].par_map(g)} {[1, 2].par_map(h)}")
 }'
 
-expect_refused "map with a function that returns nothing" 'fn main() {
+# Was a gap, and was never a limitation: `RtPayload::Unit` exists precisely so
+# a list of nothings prints as `[(), ()]`. The rest of the refusal was advice —
+# write a `for` loop — and advice that makes two engines disagree about which
+# programs exist is worse than no advice.
+expect_compiles "map with a function that returns nothing" 'fn main() {
     let r = ["a"].map(|s| print(s))
     print("{r.len()}")
 }'

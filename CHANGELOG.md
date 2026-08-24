@@ -7,6 +7,14 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
 
 ### Fixed
 
+- **`--native` compiles `map` with a function that returns nothing.** The
+  refusal was stale in one half and advice in the other. `RtPayload::Unit`
+  exists precisely so a list of nothings prints as `[(), ()]` rather than
+  `[0, 0]`, so there was a representation; the rest of the message — *write a
+  `for` loop, which is what a list of nothings was standing in for* — is good
+  advice, and advice that makes two engines disagree about which programs exist
+  is worse than no advice. Deleting the refusal was the whole fix; three
+  engines agree, including on printing the list.
 - **`--native` compiles a range held as a value.** `let r = 0..n`, passed,
   printed, compared, walked. `for i in 0..n` written literally is compiled into
   a counted loop and never builds a range at all — which is why it costs

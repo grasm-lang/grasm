@@ -11931,25 +11931,15 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
         // produces — probed so a scalar result gets inline storage. A body the
         // probe cannot type falls back to a boxed list rather than failing:
         // it compiled before this optimization existed.
-        // `xs.map(|x| print(x))` builds a list of nothings. The interpreter
-        // will do it; there is no native representation for it, and the thing
-        // the author wanted is a loop.
-        if is_map {
-            self.push_scope();
-            let dummy = self.new_var(elem_t);
-            let zero = self.zero_of(elem_t);
-            self.b.def_var(dummy, zero);
-            self.bind(&param.name, dummy, elem_t.clone());
-            let probed = self.probe_type(body);
-            self.pop_scope_no_decs();
-            if matches!(probed, Ok(VType::Unit)) {
-                return nope(
-                    body.span(),
-                    "`map` with a function that returns nothing (write a `for` loop, \
-which is what a list of nothings was standing in for)",
-                );
-            }
-        }
+        //
+        // `xs.map(|x| print(x))` builds a list of nothings, and that used to be
+        // refused here on the grounds that there was no native representation
+        // for one. There is — `RtPayload::Unit` exists precisely so that
+        // `[(), ()]` does not print as `[0, 0]` — and the rest of the refusal
+        // was advice: *write a `for` loop, which is what a list of nothings was
+        // standing in for*. That is good advice and it is not a limitation, and
+        // dressing one as the other made two engines disagree about which
+        // programs exist.
         let out_hint = if is_map {
             self.push_scope();
             let dummy = self.new_var(elem_t);
