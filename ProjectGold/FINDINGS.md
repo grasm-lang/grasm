@@ -1259,3 +1259,74 @@ rather than trust a list in the compiler — and it is worth applying to `net`,
 and had not been since `bytes` shipped. The row now says so, because a
 scorecard that is optimistic about the one property the language most wants to
 be trusted on is worse than no scorecard.
+
+## F36 — the wasm gate compared a module that no longer built (S1, gate) — **fixed**
+
+`scripts/wasmtest.sh` read `target/wasm32-unknown-unknown/release/grasm_wasm.wasm`
+and compared it against the interpreter. It never built it.
+
+So when `grasm_interp` grew a dependency on `grasm_rt` — done so the interpreter
+could share the record-and-replay journal — the wasm target stopped compiling
+entirely, and the gate went on reporting:
+
+```
+identical: 182   mismatched: 0   skipped: 39
+```
+
+against a module from the previous week. Two full gate runs passed with the
+browser build broken.
+
+The staleness check that already existed made this worse rather than better. It
+compares the *committed* copies in `ProjectGold/*/grasm.wasm` against the module
+in `target/`, and found them equal — because both were the same stale build. A
+freshness check whose reference is itself stale reports freshness.
+
+`grasm_rt` is written for a 64-bit host: `std::os::fd`, `1 << 33`, and a
+`size_of::<RtVal>() == 64` assertion that a 32-bit target fails at compile time.
+It cannot be a dependency of anything the browser build reaches.
+
+### Two fixes, and the second is the one that matters
+
+**The journal moved to its own crate.** `grasm_journal` is a format — an
+encoding three separate value representations agree on — and not a runtime. It
+has no dependencies and no host assumptions. `grasm_rt` re-exports it as
+`replay`, so every existing path is unchanged.
+
+**The gate builds the module it is about to test**, and fails if the build
+fails. Confirmed by breaking the wasm crate on purpose:
+
+```
+error: could not compile `grasm_wasm` (lib) due to 1 previous error
+error: the wasm build failed — the module below would be stale
+gate exit = 1
+```
+
+### The general shape, and the audit it prompted
+
+*A gate that reads an artefact must produce that artefact.*
+
+The sentence written here first was "every other gate in this repository builds
+what it tests" — and it was wrong, which is why it is quoted rather than
+deleted. **None of them did.** Every gate opened `./target/release/grasm` and
+none of them built it, so the identical failure was available to all nine:
+break the compiler, leave yesterday's binary on disk, and `difftest.sh` reports
+221 identical against a compiler that no longer compiles.
+
+`scripts/lib/fresh.sh` now stands at the top of all nine. Cargo is a no-op when
+nothing changed, so the whole class costs a tenth of a second per gate. It is
+skipped when the caller named its own binary through `GRASM=`, because then the
+artefact under test is theirs.
+
+Confirmed by breaking `grasm_sema` on purpose:
+
+```
+$ bash scripts/agreetest.sh
+error: could not compile `grasm_sema` (lib) due to 1 previous error
+error: the workspace does not build — every result below would be
+       measured against a stale binary, so there are none.
+agreetest exit = 1
+```
+
+The lesson is not about wasm. It is that a gate reporting a number is making a
+claim about *the code as it stands*, and reading an artefact it did not build
+is the one way to make that claim without checking it.

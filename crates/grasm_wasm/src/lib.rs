@@ -100,6 +100,40 @@ pub unsafe extern "C" fn grasm_run_with_stdin(
     run_with(ptr, len, stdin_ptr, stdin_len)
 }
 
+/// Runs Grasm source against a **recorded journal**, so a failure that happened
+/// somewhere else happens again here.
+///
+/// The journal is the bytes `GRASM_RECORD` wrote. On a host that path names a
+/// file; wasm32 has no filesystem, which is the only reason this export exists
+/// — and it is the reason worth having, because a browser tab is somewhere a
+/// person can be handed a production failure and step through it without
+/// installing anything.
+///
+/// A journal that cannot be read is a diagnostic rather than a silent normal
+/// run: a page that quietly ran the program against the real world while the
+/// reader believed they were watching a replay would be worse than an error.
+///
+/// # Safety
+/// `ptr` must point at `len` initialised bytes of UTF-8, and `jrnl_ptr` at
+/// `jrnl_len` initialised bytes.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_run_with_journal(
+    ptr: *const u8,
+    len: usize,
+    jrnl_ptr: *const u8,
+    jrnl_len: usize,
+) -> *mut u8 {
+    let raw = if jrnl_ptr.is_null() || jrnl_len == 0 {
+        &[][..]
+    } else {
+        std::slice::from_raw_parts(jrnl_ptr, jrnl_len)
+    };
+    if let Err(e) = grasm_journal::install(raw) {
+        return frame(7, "", &format!("cannot replay: {e}"));
+    }
+    run_with(ptr, len, std::ptr::null(), 0)
+}
+
 unsafe fn run_with(
     ptr: *const u8,
     len: usize,
@@ -282,3 +316,4 @@ let line = input()\n        if line == \"\" {\n            going = false\n      
         assert!(!err.is_empty());
     }
 }
+

@@ -1,5 +1,6 @@
 //! grasm_interp — the definitional tree-walking interpreter.
 
+pub mod journal;
 pub mod ffi;
 pub mod interp;
 pub mod testing;

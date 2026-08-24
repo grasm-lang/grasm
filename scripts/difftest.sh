@@ -10,6 +10,8 @@ cd "$(dirname "$0")/.."
 # Overridable so a gate can be run against a debug build, where Cranelift
 # keeps its own assertions on and the runtime checks integer overflow.
 GRASM=${GRASM:-./target/release/grasm}
+. "$(dirname "$0")/lib/fresh.sh"
+fresh_or_stop "./target/release/grasm"
 WORK="${TMPDIR:-/tmp}/grasm_difftest_$$"
 mkdir -p "$WORK"
 trap 'rm -rf "$WORK"' EXIT

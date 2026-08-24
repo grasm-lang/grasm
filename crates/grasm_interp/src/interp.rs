@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::rc::Rc;
 
-use grasm_rt::replay;
+use crate::journal;
 use grasm_syntax::ast::*;
 
 use crate::value::{ClosureBody, Value};
@@ -661,6 +661,14 @@ impl<'a, W: Write> Interp<'a, W> {
     /// again in the runtime, because neither engine depends on the other and
     /// the alternative is a dependency in every binary the language produces.
     fn net_wait(&mut self, handles: &Value, timeout: &Value) -> Value {
+        if let Some(v) = journal::gated("net_wait") {
+            return v;
+        }
+        let out = self.net_wait_now(handles, timeout);
+        journal::recorded("net_wait", out)
+    }
+
+    fn net_wait_now(&mut self, handles: &Value, timeout: &Value) -> Value {
         #[cfg(unix)]
         mod sys_poll {
             #[cfg(target_os = "linux")]
@@ -770,6 +778,20 @@ impl<'a, W: Write> Interp<'a, W> {
 
     /// Sends one datagram to an address named at send time.
     fn udp_send(&mut self, handle: &Value, host: &str, port: &Value, data: &Value) -> Value {
+        if let Some(v) = journal::gated("udp_send") {
+            return v;
+        }
+        let out = self.udp_send_now(handle, host, port, data);
+        journal::recorded("udp_send", out)
+    }
+
+    fn udp_send_now(
+        &mut self,
+        handle: &Value,
+        host: &str,
+        port: &Value,
+        data: &Value,
+    ) -> Value {
         let fail = |m: String| Value::Err(Rc::new(io_error("IoFailed", m)));
         let (Value::Int(h), Value::Int(port)) = (handle, port) else {
             return fail("handle and port must be integers".to_string());
@@ -796,7 +818,24 @@ impl<'a, W: Write> Interp<'a, W> {
     /// program never sees an address. A handle that names nothing is an
     /// ordinary failure rather than a panic: it is what a program gets for
     /// using a connection after closing it.
+    /// Journaled as a whole: a replay never opened the socket, so no operation
+    /// on one may reach a socket. Gating each of them in one place is what
+    /// makes that true by construction rather than by eleven separate hooks.
     fn net_call(
+        &mut self,
+        which: &str,
+        handle: &Value,
+        text: Option<String>,
+        blob: Option<Rc<Vec<u8>>>,
+    ) -> Value {
+        if let Some(v) = journal::gated(which) {
+            return v;
+        }
+        let out = self.net_call_now(which, handle, text, blob);
+        journal::recorded(which, out)
+    }
+
+    fn net_call_now(
         &mut self,
         which: &str,
         handle: &Value,
@@ -2607,18 +2646,22 @@ uses to mark the end of a string"
                         let fail = |m: String| Value::Err(Rc::new(io_error("IoFailed", m)));
                         let stages = self.eval_expr(&args[0])?;
                         let stdin_text = self.eval_expr(&args[1])?.to_string();
+                        if let Some(v) = journal::gated("proc_pipeline") {
+                            return Ok(v);
+                        }
+                        let done = |v: Value| journal::recorded("proc_pipeline", v);
                         let Value::List(items) = stages else {
-                            return Ok(fail("proc_pipeline takes a list of stages".to_string()));
+                            return Ok(done(fail("proc_pipeline takes a list of stages".to_string())));
                         };
                         if items.is_empty() {
-                            return Ok(fail("a pipeline needs at least one stage".to_string()));
+                            return Ok(done(fail("a pipeline needs at least one stage".to_string())));
                         }
                         let mut plan: Vec<(String, Vec<String>)> = Vec::new();
                         for it in items.iter() {
                             let Value::Tuple(fields) = it else {
-                                return Ok(fail(
+                                return Ok(done(fail(
                                     "each stage is a (program, arguments) pair".to_string(),
-                                ));
+                                )));
                             };
                             let program = fields[0].to_string();
                             let argv = match &fields[1] {
@@ -2661,7 +2704,7 @@ uses to mark the end of a string"
                                         let _ = c.kill();
                                         let _ = c.wait();
                                     }
-                                    return Ok(fail(format!("{program}: {e}")));
+                                    return Ok(done(fail(format!("{program}: {e}"))));
                                 }
                             };
                             if i == 0 && !stdin_text.is_empty() {
@@ -2688,7 +2731,7 @@ uses to mark the end of a string"
                         let last = children.pop().expect("at least one stage");
                         let out = match last.wait_with_output() {
                             Ok(o) => o,
-                            Err(e) => return Ok(fail(e.to_string())),
+                            Err(e) => return Ok(done(fail(e.to_string()))),
                         };
                         // The earlier stages are reaped so they do not become
                         // zombies. Their statuses are deliberately not
@@ -2698,11 +2741,11 @@ uses to mark the end of a string"
                             let _ = c.wait();
                         }
                         let code = out.status.code().map_or(-1, i64::from);
-                        return Ok(Value::Ok(Rc::new(Value::Tuple(Rc::new(vec![
+                        return Ok(done(Value::Ok(Rc::new(Value::Tuple(Rc::new(vec![
                             Value::Int(code),
                             Value::str(String::from_utf8_lossy(&out.stdout).into_owned()),
                             Value::str(String::from_utf8_lossy(&out.stderr).into_owned()),
-                        ])))));
+                        ]))))));
                     }
                     "proc_run" => {
                         let program = self.eval_expr(&args[0])?.to_string();
@@ -2713,7 +2756,11 @@ uses to mark the end of a string"
                             _ => Vec::new(),
                         };
                         let fail = |m: String| Value::Err(Rc::new(io_error("IoFailed", m)));
-                        return Ok(
+                        if let Some(v) = journal::gated("proc_run") {
+                            return Ok(v);
+                        }
+                        return Ok(journal::recorded(
+                            "proc_run",
                             match std::process::Command::new(&program).args(&argv).output() {
                                 Ok(out) => {
                                     // `None` means a signal killed it. `-1` is
@@ -2731,7 +2778,7 @@ uses to mark the end of a string"
                                 }
                                 Err(e) => fail(format!("{program}: {e}")),
                             },
-                        );
+                        ));
                     }
                     "tcp_listen" | "tcp_connect" | "tcp_accept" | "tcp_read"
                     | "tcp_read_bytes" | "tcp_write" | "tcp_write_bytes"
@@ -2754,52 +2801,27 @@ uses to mark the end of a string"
                     }
                     "read_file" => {
                         let p = self.eval_expr(&args[0])?.to_string();
-                        // The same journal the compiled engines use, so a
-                        // recording made by one engine replays under another —
-                        // which is what a debugger is for: the failure happened
-                        // in the native build and is being read in the
-                        // interpreter.
-                        if let Some(o) = replay::next("read_file") {
-                            return Ok(match o {
-                                replay::Outcome::Value(v) => Value::Ok(Rc::new(Value::str(
-                                    String::from_utf8_lossy(&v).into_owned(),
-                                ))),
-                                replay::Outcome::Failed(m) => {
-                                    Value::Err(Rc::new(io_error("IoFailed", m)))
-                                }
-                            });
+                        if let Some(v) = journal::gated("read_file") {
+                            return Ok(v);
                         }
-                        return Ok(match std::fs::read_to_string(&p) {
-                            Ok(s) => {
-                                replay::record(
-                                    "read_file",
-                                    &replay::Outcome::Value(s.as_bytes().to_vec()),
-                                );
-                                Value::Ok(Rc::new(Value::str(s)))
-                            }
+                        return Ok(journal::recorded("read_file", match std::fs::read_to_string(&p) {
+                            Ok(s) => Value::Ok(Rc::new(Value::str(s))),
                             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                                replay::record(
-                                    "read_file",
-                                    &replay::Outcome::Failed(p.clone()),
-                                );
                                 Value::Err(Rc::new(io_error("NotFound", p)))
                             }
-                            Err(e) => {
-                                replay::record(
-                                    "read_file",
-                                    &replay::Outcome::Failed(e.to_string()),
-                                );
-                                Value::Err(Rc::new(io_error("IoFailed", e.to_string())))
-                            }
-                        });
+                            Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
+                        }));
                     }
                     "write_file" => {
                         let p = self.eval_expr(&args[0])?.to_string();
                         let content = self.eval_expr(&args[1])?.to_string();
-                        return Ok(match std::fs::write(&p, content) {
+                        if let Some(v) = journal::gated("write_file") {
+                            return Ok(v);
+                        }
+                        return Ok(journal::recorded("write_file", match std::fs::write(&p, content) {
                             Ok(()) => Value::Ok(Rc::new(Value::Unit)),
                             Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
-                        });
+                        }));
                     }
                     // Creates the whole path, and succeeds if it is already
                     // there — so a program can make its own working directory
@@ -2830,62 +2852,54 @@ uses to mark the end of a string"
                             Value::Int(v) => v,
                             _ => -1,
                         };
+                        if let Some(v) = journal::gated("random_bytes") {
+                            return Ok(v);
+                        }
                         if n < 0 {
-                            return Ok(Value::Err(Rc::new(io_error(
+                            return Ok(journal::recorded("random_bytes", Value::Err(Rc::new(io_error(
                                 "IoFailed",
                                 format!("random_bytes needs a count of 0 or more, got {n}"),
-                            ))));
+                            )))));
                         }
                         if n > 1_048_576 {
-                            return Ok(Value::Err(Rc::new(io_error(
+                            return Ok(journal::recorded("random_bytes", Value::Err(Rc::new(io_error(
                                 "IoFailed",
                                 format!("random_bytes is capped at 1048576 bytes, asked for {n}"),
-                            ))));
-                        }
-                        if let Some(o) = replay::next("random_bytes") {
-                            return Ok(match o {
-                                replay::Outcome::Value(v) => {
-                                    Value::Ok(Rc::new(Value::Bytes(Rc::new(v))))
-                                }
-                                replay::Outcome::Failed(m) => {
-                                    Value::Err(Rc::new(io_error("IoFailed", m)))
-                                }
-                            });
+                            )))));
                         }
                         let mut buf = vec![0u8; n as usize];
                         if n == 0 {
-                            replay::record("random_bytes", &replay::Outcome::Value(Vec::new()));
-                            return Ok(Value::Ok(Rc::new(Value::Bytes(Rc::new(buf)))));
+                            return Ok(journal::recorded(
+                                "random_bytes",
+                                Value::Ok(Rc::new(Value::Bytes(Rc::new(buf)))),
+                            ));
                         }
-                        return Ok(match std::fs::File::open("/dev/urandom") {
+                        return Ok(journal::recorded("random_bytes", match std::fs::File::open("/dev/urandom") {
                             Err(e) => Value::Err(Rc::new(io_error(
                                 "IoFailed",
                                 format!("cannot open /dev/urandom: {e}"),
                             ))),
                             Ok(mut f) => match f.read_exact(&mut buf) {
-                                Ok(()) => {
-                                    replay::record(
-                                        "random_bytes",
-                                        &replay::Outcome::Value(buf.clone()),
-                                    );
-                                    Value::Ok(Rc::new(Value::Bytes(Rc::new(buf))))
-                                }
+                                Ok(()) => Value::Ok(Rc::new(Value::Bytes(Rc::new(buf)))),
                                 Err(e) => Value::Err(Rc::new(io_error(
                                     "IoFailed",
                                     format!("short read: {e}"),
                                 ))),
                             },
-                        });
+                        }));
                     }
                     "read_bytes" => {
                         let p = self.eval_expr(&args[0])?.to_string();
-                        return Ok(match std::fs::read(&p) {
+                        if let Some(v) = journal::gated("read_bytes") {
+                            return Ok(v);
+                        }
+                        return Ok(journal::recorded("read_bytes", match std::fs::read(&p) {
                             Ok(b) => Value::Ok(Rc::new(Value::Bytes(Rc::new(b)))),
                             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                                 Value::Err(Rc::new(io_error("NotFound", p)))
                             }
                             Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
-                        });
+                        }));
                     }
                     "write_bytes" => {
                         let p = self.eval_expr(&args[0])?.to_string();
@@ -2893,27 +2907,36 @@ uses to mark the end of a string"
                         let Value::Bytes(b) = v else {
                             return Err(Flow::Panic("write_bytes expects bytes".into()));
                         };
-                        return Ok(match std::fs::write(&p, b.as_slice()) {
+                        if let Some(v) = journal::gated("write_bytes") {
+                            return Ok(v);
+                        }
+                        return Ok(journal::recorded("write_bytes", match std::fs::write(&p, b.as_slice()) {
                             Ok(()) => Value::Ok(Rc::new(Value::Unit)),
                             Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
-                        });
+                        }));
                     }
                     "make_dir" => {
                         let p = self.eval_expr(&args[0])?.to_string();
-                        return Ok(match std::fs::create_dir_all(&p) {
+                        if let Some(v) = journal::gated("make_dir") {
+                            return Ok(v);
+                        }
+                        return Ok(journal::recorded("make_dir", match std::fs::create_dir_all(&p) {
                             Ok(()) => Value::Ok(Rc::new(Value::Unit)),
                             Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
-                        });
+                        }));
                     }
                     "remove_file" => {
                         let p = self.eval_expr(&args[0])?.to_string();
-                        return Ok(match std::fs::remove_file(&p) {
+                        if let Some(v) = journal::gated("remove_file") {
+                            return Ok(v);
+                        }
+                        return Ok(journal::recorded("remove_file", match std::fs::remove_file(&p) {
                             Ok(()) => Value::Ok(Rc::new(Value::Unit)),
                             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                                 Value::Err(Rc::new(io_error("NotFound", p)))
                             }
                             Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
-                        });
+                        }));
                     }
                     // Sorted, because a directory's order is the filesystem's
                     // and differs between machines and between runs — and
@@ -2922,7 +2945,10 @@ uses to mark the end of a string"
                     // untestable ([L-LIB-FS]).
                     "list_dir" => {
                         let p = self.eval_expr(&args[0])?.to_string();
-                        return Ok(match list_dir_sorted(&p) {
+                        if let Some(v) = journal::gated("list_dir") {
+                            return Ok(v);
+                        }
+                        return Ok(journal::recorded("list_dir", match list_dir_sorted(&p) {
                             Ok(names) => Value::Ok(Rc::new(Value::List(Rc::new(
                                 names.into_iter().map(Value::str).collect(),
                             )))),
@@ -2930,16 +2956,25 @@ uses to mark the end of a string"
                                 Value::Err(Rc::new(io_error("NotFound", p)))
                             }
                             Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
-                        });
+                        }));
                     }
                     "file_exists" => {
                         let p = self.eval_expr(&args[0])?.to_string();
-                        return Ok(Value::Bool(std::path::Path::new(&p).exists()));
+                        if let Some(v) = journal::gated("file_exists") {
+                            return Ok(v);
+                        }
+                        return Ok(journal::recorded(
+                            "file_exists",
+                            Value::Bool(std::path::Path::new(&p).exists()),
+                        ));
                     }
                     "args" => {
+                        if let Some(v) = journal::gated("args") {
+                            return Ok(v);
+                        }
                         let vs: Vec<Value> =
                             self.program_args.iter().map(|a| Value::str(a.clone())).collect();
-                        return Ok(Value::List(Rc::new(vs)));
+                        return Ok(journal::recorded("args", Value::List(Rc::new(vs))));
                     }
                     "Ok" | "Err" => {
                         let v = self.eval_expr(&args[0])?;
@@ -3034,39 +3069,20 @@ uses to mark the end of a string"
                         }));
                     }
                     "now_millis" => {
-                        if let Some(replay::Outcome::Value(v)) = replay::next("now_millis") {
-                            return Ok(Value::Int(replay::bytes_i64(&v)));
+                        if let Some(v) = journal::gated("now_millis") {
+                            return Ok(v);
                         }
-                        let now = host_now_millis();
-                        replay::record(
-                            "now_millis",
-                            &replay::Outcome::Value(replay::i64_bytes(now)),
-                        );
-                        return Ok(Value::Int(now));
+                        return Ok(journal::recorded("now_millis", Value::Int(host_now_millis())));
                     }
                     "env" => {
                         let name = self.eval_expr(&args[0])?.to_string();
-                        if let Some(o) = replay::next("env") {
-                            return Ok(match o {
-                                replay::Outcome::Value(v) => Value::some(Value::str(
-                                    String::from_utf8_lossy(&v).into_owned(),
-                                )),
-                                replay::Outcome::Failed(_) => Value::none(),
-                            });
+                        if let Some(v) = journal::gated("env") {
+                            return Ok(v);
                         }
-                        return Ok(match std::env::var(&name) {
-                            Ok(v) => {
-                                replay::record(
-                                    "env",
-                                    &replay::Outcome::Value(v.as_bytes().to_vec()),
-                                );
-                                Value::some(Value::str(v))
-                            }
-                            Err(_) => {
-                                replay::record("env", &replay::Outcome::Failed(String::new()));
-                                Value::none()
-                            }
-                        });
+                        return Ok(journal::recorded("env", match std::env::var(&name) {
+                            Ok(v) => Value::some(Value::str(v)),
+                            Err(_) => Value::none(),
+                        }));
                     }
                     "exit" => {
                         let code = match self.eval_expr(&args[0])? {
@@ -3087,6 +3103,9 @@ uses to mark the end of a string"
                         // work at all on wasm32, where there is no stdin. When
                         // no lines were supplied this falls through to the real
                         // one, so a command-line run is unchanged.
+                        if let Some(v) = journal::gated("input") {
+                            return Ok(v);
+                        }
                         if let Some(lines) = self.stdin_lines.as_mut() {
                             let next = if *lines.0.borrow() < lines.1.len() {
                                 let i = *lines.0.borrow();
@@ -3098,7 +3117,7 @@ uses to mark the end of a string"
                                 // in the corpus treats as "stop".
                                 String::new()
                             };
-                            return Ok(Value::str(next));
+                            return Ok(journal::recorded("input", Value::str(next)));
                         }
                         let mut line = String::new();
                         let _ = std::io::BufRead::read_line(
@@ -3108,7 +3127,7 @@ uses to mark the end of a string"
                         while line.ends_with('\n') || line.ends_with('\r') {
                             line.pop();
                         }
-                        return Ok(Value::str(line));
+                        return Ok(journal::recorded("input", Value::str(line)));
                     }
                     _ => {}
                 }

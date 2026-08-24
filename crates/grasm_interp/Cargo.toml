@@ -7,8 +7,9 @@ license.workspace = true
 [dependencies]
 grasm_syntax = { path = "../grasm_syntax" }
 grasm_sema = { path = "../grasm_sema" }
-# For the record-and-replay journal only. The interpreter has its own
-# implementation of every builtin, so it needs the *journal* rather than the
-# runtime — and sharing the journal is what makes a recording from one engine
-# replayable on another, which is the whole point of three engines agreeing.
-grasm_rt = { path = "../grasm_rt" }
+# The journal, not the runtime. The interpreter has its own implementation of
+# every builtin, so what it shares with the compiled engines is the *format* —
+# and sharing that is what lets a recording made by one engine replay under
+# another. It must not reach for `grasm_rt`: that runtime is written for a
+# 64-bit host, and this crate is also the browser build.
+grasm_journal = { path = "../grasm_journal" }

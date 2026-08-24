@@ -11,7 +11,12 @@
 
 use std::io::Write;
 
-pub mod replay;
+/// The record-and-replay journal.
+///
+/// Re-exported rather than defined here: the interpreter and the browser build
+/// share the journal and cannot link this runtime, so the format lives in its
+/// own crate. Every `replay::` path in this file is unchanged.
+pub use grasm_journal as replay;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 
@@ -4820,6 +4825,10 @@ pub unsafe extern "C" fn grasm_set_args(argc: i64, argv: *const *const u8) {
 
 #[no_mangle]
 pub extern "C" fn grasm_args() -> *mut RtVal {
+    unsafe { journaled("args", || grasm_args_now()) }
+}
+
+unsafe fn grasm_args_now() -> *mut RtVal {
     let items: Vec<*mut RtVal> = PROGRAM_ARGS.with(|a| {
         a.borrow()
             .iter()
@@ -4831,6 +4840,10 @@ pub extern "C" fn grasm_args() -> *mut RtVal {
 
 #[no_mangle]
 pub extern "C" fn grasm_input() -> *mut RtVal {
+    unsafe { journaled("input", || grasm_input_now()) }
+}
+
+unsafe fn grasm_input_now() -> *mut RtVal {
     let mut line = String::new();
     let _ = std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line);
     while line.ends_with('\n') || line.ends_with('\r') {
@@ -5012,6 +5025,10 @@ fn wait_readable(_fds: &[i32], _timeout_ms: i32) -> Result<Vec<bool>, String> {
 /// # Safety: called from compiled Grasm with a boxed value.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_net_port(handle: *mut RtVal) -> *mut RtVal {
+    journaled("net_port", || grasm_net_port_now(handle))
+}
+
+unsafe fn grasm_net_port_now(handle: *mut RtVal) -> *mut RtVal {
     let h = match &(*handle).payload {
         RtPayload::I64(n) => *n,
         _ => return err_of(io_err("IoFailed", "handle must be an integer".to_string())),
@@ -5041,6 +5058,10 @@ pub unsafe extern "C" fn grasm_net_port(handle: *mut RtVal) -> *mut RtVal {
 /// # Safety: called from compiled Grasm with boxed values.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_net_wait(handles: *mut RtVal, timeout: *mut RtVal) -> *mut RtVal {
+    journaled("net_wait", || grasm_net_wait_now(handles, timeout))
+}
+
+unsafe fn grasm_net_wait_now(handles: *mut RtVal, timeout: *mut RtVal) -> *mut RtVal {
     use std::os::fd::AsRawFd;
 
     let timeout_ms = match &(*timeout).payload {
@@ -5105,6 +5126,10 @@ pub unsafe extern "C" fn grasm_net_wait(handles: *mut RtVal, timeout: *mut RtVal
 /// # Safety: called from compiled Grasm with a boxed value.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_tcp_listen(port: *mut RtVal) -> *mut RtVal {
+    journaled("tcp_listen", || grasm_tcp_listen_now(port))
+}
+
+unsafe fn grasm_tcp_listen_now(port: *mut RtVal) -> *mut RtVal {
     let port = match &(*port).payload {
         RtPayload::I64(n) => *n,
         _ => return err_of(io_err("IoFailed", "port must be an integer".to_string())),
@@ -5133,6 +5158,10 @@ pub unsafe extern "C" fn grasm_tcp_listen(port: *mut RtVal) -> *mut RtVal {
 /// # Safety: called from compiled Grasm with boxed values.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_tcp_connect(host: *mut RtVal, port: *mut RtVal) -> *mut RtVal {
+    journaled("tcp_connect", || grasm_tcp_connect_now(host, port))
+}
+
+unsafe fn grasm_tcp_connect_now(host: *mut RtVal, port: *mut RtVal) -> *mut RtVal {
     let host = match &(*host).payload {
         RtPayload::Str(s) => s.to_string(),
         _ => return err_of(io_err("IoFailed", "host must be text".to_string())),
@@ -5155,6 +5184,10 @@ pub unsafe extern "C" fn grasm_tcp_connect(host: *mut RtVal, port: *mut RtVal) -
 /// # Safety: called from compiled Grasm with a boxed value.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_tcp_accept(handle: *mut RtVal) -> *mut RtVal {
+    journaled("tcp_accept", || grasm_tcp_accept_now(handle))
+}
+
+unsafe fn grasm_tcp_accept_now(handle: *mut RtVal) -> *mut RtVal {
     let h = match &(*handle).payload {
         RtPayload::I64(n) => *n,
         _ => return err_of(io_err("IoFailed", "handle must be an integer".to_string())),
@@ -5179,6 +5212,10 @@ pub unsafe extern "C" fn grasm_tcp_accept(handle: *mut RtVal) -> *mut RtVal {
 /// # Safety: called from compiled Grasm with a boxed value.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_tcp_read(handle: *mut RtVal) -> *mut RtVal {
+    journaled("tcp_read", || grasm_tcp_read_now(handle))
+}
+
+unsafe fn grasm_tcp_read_now(handle: *mut RtVal) -> *mut RtVal {
     use std::io::Read;
     let h = match &(*handle).payload {
         RtPayload::I64(n) => *n,
@@ -5228,6 +5265,10 @@ pub unsafe extern "C" fn grasm_tcp_read(handle: *mut RtVal) -> *mut RtVal {
 /// # Safety: called from compiled Grasm with boxed values.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_random_bytes(count: *mut RtVal) -> *mut RtVal {
+    journaled("random_bytes", || grasm_random_bytes_now(count))
+}
+
+unsafe fn grasm_random_bytes_now(count: *mut RtVal) -> *mut RtVal {
     use std::io::Read;
     let n = match &(*count).payload {
         RtPayload::I64(v) => *v,
@@ -5249,22 +5290,14 @@ pub unsafe extern "C" fn grasm_random_bytes(count: *mut RtVal) -> *mut RtVal {
     }
     // Entropy is the one thing a replay must reproduce exactly and can never
     // obtain again: two runs disagree by construction.
-    if let Some(o) = replay::next("random_bytes") {
-        return match o {
-            replay::Outcome::Value(v) => ok_of(alloc(RtPayload::Bytes(std::sync::Arc::new(v)))),
-            replay::Outcome::Failed(m) => err_of(io_err("IoFailed", m)),
-        };
-    }
     let mut buf = vec![0u8; n as usize];
     if n == 0 {
-        replay::record("random_bytes", &replay::Outcome::Value(Vec::new()));
         return ok_of(alloc(RtPayload::Bytes(std::sync::Arc::new(buf))));
     }
     match std::fs::File::open("/dev/urandom") {
         Err(e) => err_of(io_err("IoFailed", format!("cannot open /dev/urandom: {e}"))),
         Ok(mut f) => match f.read_exact(&mut buf) {
             Ok(()) => {
-                replay::record("random_bytes", &replay::Outcome::Value(buf.clone()));
                 ok_of(alloc(RtPayload::Bytes(std::sync::Arc::new(buf))))
             }
             Err(e) => err_of(io_err("IoFailed", format!("short read: {e}"))),
@@ -5284,6 +5317,10 @@ pub unsafe extern "C" fn grasm_random_bytes(count: *mut RtVal) -> *mut RtVal {
 /// # Safety: called from compiled Grasm with boxed values.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_tcp_read_bytes(handle: *mut RtVal) -> *mut RtVal {
+    journaled("tcp_read_bytes", || grasm_tcp_read_bytes_now(handle))
+}
+
+unsafe fn grasm_tcp_read_bytes_now(handle: *mut RtVal) -> *mut RtVal {
     use std::io::Read;
     let h = match &(*handle).payload {
         RtPayload::I64(n) => *n,
@@ -5319,6 +5356,13 @@ pub unsafe extern "C" fn grasm_tcp_write_bytes(
     handle: *mut RtVal,
     data: *mut RtVal,
 ) -> *mut RtVal {
+    journaled("tcp_write_bytes", || grasm_tcp_write_bytes_now(handle, data))
+}
+
+unsafe fn grasm_tcp_write_bytes_now(
+    handle: *mut RtVal,
+    data: *mut RtVal,
+) -> *mut RtVal {
     use std::io::Write;
     let h = match &(*handle).payload {
         RtPayload::I64(n) => *n,
@@ -5349,6 +5393,10 @@ pub unsafe extern "C" fn grasm_tcp_write_bytes(
 /// # Safety: called from compiled Grasm with boxed values.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_tcp_write(handle: *mut RtVal, data: *mut RtVal) -> *mut RtVal {
+    journaled("tcp_write", || grasm_tcp_write_now(handle, data))
+}
+
+unsafe fn grasm_tcp_write_now(handle: *mut RtVal, data: *mut RtVal) -> *mut RtVal {
     use std::io::Write;
     let h = match &(*handle).payload {
         RtPayload::I64(n) => *n,
@@ -5385,6 +5433,13 @@ pub unsafe extern "C" fn grasm_tcp_write(handle: *mut RtVal, data: *mut RtVal) -
 /// # Safety: called from compiled Grasm with boxed values.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_proc_pipeline(
+    stages: *mut RtVal,
+    input: *mut RtVal,
+) -> *mut RtVal {
+    journaled("proc_pipeline", || grasm_proc_pipeline_now(stages, input))
+}
+
+unsafe fn grasm_proc_pipeline_now(
     stages: *mut RtVal,
     input: *mut RtVal,
 ) -> *mut RtVal {
@@ -5559,6 +5614,10 @@ pub unsafe extern "C" fn grasm_bytes_ptr(v: *mut RtVal) -> *mut u8 {
 /// # Safety: called from compiled Grasm with boxed values.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_proc_run(cmd: *mut RtVal, args: *mut RtVal) -> *mut RtVal {
+    journaled("proc_run", || grasm_proc_run_now(cmd, args))
+}
+
+unsafe fn grasm_proc_run_now(cmd: *mut RtVal, args: *mut RtVal) -> *mut RtVal {
     let program = as_str(cmd).to_string();
     let argv: Vec<String> = match &(*args).payload {
         RtPayload::List(items) => items.iter().map(|&p| as_str(p).to_string()).collect(),
@@ -5604,6 +5663,10 @@ pub unsafe extern "C" fn grasm_proc_run(cmd: *mut RtVal, args: *mut RtVal) -> *m
 /// # Safety: called from compiled Grasm with a boxed value.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_udp_bind(port: *mut RtVal) -> *mut RtVal {
+    journaled("udp_bind", || grasm_udp_bind_now(port))
+}
+
+unsafe fn grasm_udp_bind_now(port: *mut RtVal) -> *mut RtVal {
     let port = match &(*port).payload {
         RtPayload::I64(n) => *n,
         _ => return err_of(io_err("IoFailed", "port must be an integer".to_string())),
@@ -5622,6 +5685,15 @@ pub unsafe extern "C" fn grasm_udp_bind(port: *mut RtVal) -> *mut RtVal {
 /// # Safety: called from compiled Grasm with boxed values.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_udp_send(
+    handle: *mut RtVal,
+    host: *mut RtVal,
+    port: *mut RtVal,
+    data: *mut RtVal,
+) -> *mut RtVal {
+    journaled("udp_send", || grasm_udp_send_now(handle, host, port, data))
+}
+
+unsafe fn grasm_udp_send_now(
     handle: *mut RtVal,
     host: *mut RtVal,
     port: *mut RtVal,
@@ -5669,6 +5741,10 @@ pub unsafe extern "C" fn grasm_udp_send(
 /// # Safety: called from compiled Grasm with a boxed value.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_udp_recv(handle: *mut RtVal) -> *mut RtVal {
+    journaled("udp_recv", || grasm_udp_recv_now(handle))
+}
+
+unsafe fn grasm_udp_recv_now(handle: *mut RtVal) -> *mut RtVal {
     let h = match &(*handle).payload {
         RtPayload::I64(n) => *n,
         _ => return err_of(io_err("IoFailed", "handle must be an integer".to_string())),
@@ -5699,6 +5775,15 @@ pub unsafe extern "C" fn grasm_udp_recv(handle: *mut RtVal) -> *mut RtVal {
 /// # Safety: called from compiled Grasm with a boxed value.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_net_close(handle: *mut RtVal) {
+    // Answers nothing, but is still a journal record: a replay never opened
+    // the socket, so closing it must not reach the socket table either, and
+    // the record keeps the call sequence lined up with the recording.
+    if replay::gate("net_close").is_some() {
+        return;
+    }
+    if replay::recording() {
+        replay::put("net_close", &replay::Wire::Unit);
+    }
     if let RtPayload::I64(h) = &(*handle).payload {
         let h = *h;
         SOCKETS.with(|table| {
@@ -5712,37 +5797,24 @@ pub unsafe extern "C" fn grasm_net_close(handle: *mut RtVal) {
 
 #[no_mangle]
 pub unsafe extern "C" fn grasm_read_file(path: *mut RtVal) -> *mut RtVal {
+    journaled("read_file", || grasm_read_file_now(path))
+}
+
+unsafe fn grasm_read_file_now(path: *mut RtVal) -> *mut RtVal {
     let p = as_str(path).to_string();
-    // Replay hands back what the recorded run read, without touching the disk:
-    // the file may be gone, or different, or on another machine entirely, and
-    // reproducing the failure must not depend on any of that.
-    if let Some(o) = replay::next("read_file") {
-        return match o {
-            replay::Outcome::Value(v) => ok_of(alloc(RtPayload::Str(RtStr::new(
-                String::from_utf8_lossy(&v).into_owned(),
-            )))),
-            replay::Outcome::Failed(m) => err_of(io_err("IoFailed", m)),
-        };
+    match std::fs::read_to_string(&p) {
+        Ok(s) => ok_of(alloc(RtPayload::Str(RtStr::new(s)))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => err_of(io_err("NotFound", p)),
+        Err(e) => err_of(io_err("IoFailed", e.to_string())),
     }
-    let out = match std::fs::read_to_string(&p) {
-        Ok(s) => {
-            replay::record("read_file", &replay::Outcome::Value(s.as_bytes().to_vec()));
-            ok_of(alloc(RtPayload::Str(RtStr::new(s))))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            replay::record("read_file", &replay::Outcome::Failed(p.clone()));
-            err_of(io_err("NotFound", p))
-        }
-        Err(e) => {
-            replay::record("read_file", &replay::Outcome::Failed(e.to_string()));
-            err_of(io_err("IoFailed", e.to_string()))
-        }
-    };
-    out
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn grasm_write_file(path: *mut RtVal, content: *mut RtVal) -> *mut RtVal {
+    journaled("write_file", || grasm_write_file_now(path, content))
+}
+
+unsafe fn grasm_write_file_now(path: *mut RtVal, content: *mut RtVal) -> *mut RtVal {
     let p = as_str(path).to_string();
     let c = as_str(content).to_string();
     match std::fs::write(&p, c) {
@@ -5753,7 +5825,14 @@ pub unsafe extern "C" fn grasm_write_file(path: *mut RtVal, content: *mut RtVal)
 
 #[no_mangle]
 pub unsafe extern "C" fn grasm_file_exists(path: *mut RtVal) -> i8 {
-    i8::from(std::path::Path::new(as_str(path)).exists())
+    if let Some(replay::Wire::Bool(b)) = replay::gate("file_exists") {
+        return i8::from(b);
+    }
+    let there = std::path::Path::new(as_str(path)).exists();
+    if replay::recording() {
+        replay::put("file_exists", &replay::Wire::Bool(there));
+    }
+    i8::from(there)
 }
 
 // ---------------------------------------------------------------------------
@@ -5869,6 +5948,10 @@ pub unsafe extern "C" fn grasm_str_to_bytes(v: *mut RtVal) -> *mut RtVal {
 /// # Safety: boxed values.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_read_bytes(path: *mut RtVal) -> *mut RtVal {
+    journaled("read_bytes", || grasm_read_bytes_now(path))
+}
+
+unsafe fn grasm_read_bytes_now(path: *mut RtVal) -> *mut RtVal {
     let p = as_str(path).to_string();
     match std::fs::read(&p) {
         Ok(b) => ok_of(alloc(RtPayload::Bytes(std::sync::Arc::new(b)))),
@@ -5880,6 +5963,10 @@ pub unsafe extern "C" fn grasm_read_bytes(path: *mut RtVal) -> *mut RtVal {
 /// # Safety: boxed values.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_write_bytes(path: *mut RtVal, data: *mut RtVal) -> *mut RtVal {
+    journaled("write_bytes", || grasm_write_bytes_now(path, data))
+}
+
+unsafe fn grasm_write_bytes_now(path: *mut RtVal, data: *mut RtVal) -> *mut RtVal {
     let p = as_str(path).to_string();
     match std::fs::write(&p, as_bytes(data).as_slice()) {
         Ok(()) => ok_of(alloc(RtPayload::I64(0))),
@@ -5892,6 +5979,10 @@ pub unsafe extern "C" fn grasm_write_bytes(path: *mut RtVal, data: *mut RtVal) -
 /// # Safety: called from compiled Grasm with a boxed value.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_make_dir(path: *mut RtVal) -> *mut RtVal {
+    journaled("make_dir", || grasm_make_dir_now(path))
+}
+
+unsafe fn grasm_make_dir_now(path: *mut RtVal) -> *mut RtVal {
     match std::fs::create_dir_all(as_str(path)) {
         Ok(()) => ok_of(alloc(RtPayload::I64(0))),
         Err(e) => err_of(io_err("IoFailed", e.to_string())),
@@ -5901,6 +5992,10 @@ pub unsafe extern "C" fn grasm_make_dir(path: *mut RtVal) -> *mut RtVal {
 /// # Safety: called from compiled Grasm with a boxed value.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_remove_file(path: *mut RtVal) -> *mut RtVal {
+    journaled("remove_file", || grasm_remove_file_now(path))
+}
+
+unsafe fn grasm_remove_file_now(path: *mut RtVal) -> *mut RtVal {
     let p = as_str(path).to_string();
     match std::fs::remove_file(&p) {
         Ok(()) => ok_of(alloc(RtPayload::I64(0))),
@@ -5919,6 +6014,10 @@ pub unsafe extern "C" fn grasm_remove_file(path: *mut RtVal) -> *mut RtVal {
 /// # Safety: called from compiled Grasm with a boxed value.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_list_dir(path: *mut RtVal) -> *mut RtVal {
+    journaled("list_dir", || grasm_list_dir_now(path))
+}
+
+unsafe fn grasm_list_dir_now(path: *mut RtVal) -> *mut RtVal {
     let p = as_str(path).to_string();
     match std::fs::read_dir(&p) {
         Ok(entries) => {
@@ -5974,17 +6073,16 @@ pub extern "C" fn grasm_now_millis() -> i64 {
     // The clock is the clearest case for this: a program that behaves
     // differently at midnight cannot be debugged without one that says what
     // time it was.
-    if let Some(replay::Outcome::Value(v)) = replay::next("now_millis") {
-        return replay::bytes_i64(&v);
+    if let Some(replay::Wire::Int(v)) = replay::gate("now_millis") {
+        return v;
     }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-    replay::record(
-        "now_millis",
-        &replay::Outcome::Value(replay::i64_bytes(now)),
-    );
+    if replay::recording() {
+        replay::put("now_millis", &replay::Wire::Int(now));
+    }
     now
 }
 
@@ -5992,21 +6090,15 @@ pub extern "C" fn grasm_now_millis() -> i64 {
 /// # Safety: live runtime pointer.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_env(name: *mut RtVal) -> *mut RtVal {
-    if let Some(o) = replay::next("env") {
-        return match o {
-            replay::Outcome::Value(v) => some_of(alloc(RtPayload::Str(RtStr::new(
-                String::from_utf8_lossy(&v).into_owned(),
-            )))),
-            replay::Outcome::Failed(_) => none_val(),
-        };
-    }
+    journaled("env", || grasm_env_now(name))
+}
+
+unsafe fn grasm_env_now(name: *mut RtVal) -> *mut RtVal {
     match std::env::var(as_str(name)) {
         Ok(v) => {
-            replay::record("env", &replay::Outcome::Value(v.as_bytes().to_vec()));
             some_of(alloc(RtPayload::Str(RtStr::new(v))))
         }
         Err(_) => {
-            replay::record("env", &replay::Outcome::Failed(String::new()));
             none_val()
         }
     }
@@ -6156,6 +6248,103 @@ pub unsafe extern "C" fn grasm_list_min_max(v: *mut RtVal, want_max: i8) -> *mut
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// The journal, in the runtime's own values
+//
+// One conversion each way, and every hook is then two lines. The alternative —
+// a bespoke encoder at each of the twenty-odd effectful builtins — is where
+// the bugs would be: `list_dir` recording its list in a different shape from
+// the one it returns is not something a test of `read_file` would ever catch.
+
+/// Names outlive the values that carry them, and a journal holds few of them.
+fn interned(text: &str) -> &'static str {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static NAMES: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
+    let mut map = NAMES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(s) = map.get(text) {
+        return s;
+    }
+    let leaked: &'static str = Box::leak(text.to_string().into_boxed_str());
+    map.insert(text.to_string(), leaked);
+    leaked
+}
+
+/// # Safety: a live value.
+unsafe fn wire_of(v: *mut RtVal) -> replay::Wire {
+    if v.is_null() {
+        return replay::Wire::Unit;
+    }
+    let items = |d: &ListData| d.iter().map(|&p| wire_of(p)).collect::<Vec<_>>();
+    match &(*v).payload {
+        RtPayload::Unit => replay::Wire::Unit,
+        RtPayload::I64(n) => replay::Wire::Int(*n),
+        RtPayload::F64(n) => replay::Wire::Float(*n),
+        RtPayload::Bool(b) => replay::Wire::Bool(*b),
+        RtPayload::Str(s) => replay::Wire::Str((**s).to_string()),
+        RtPayload::Bytes(b) => replay::Wire::Bytes(b.as_ref().clone()),
+        RtPayload::List(d) => replay::Wire::List(items(d)),
+        RtPayload::Tuple(d) => replay::Wire::Tuple(items(d)),
+        RtPayload::ListScalar { .. } => {
+            let n = grasm_list_len(v);
+            replay::Wire::List((0..n).map(|i| wire_of(grasm_list_get(v, i))).collect())
+        }
+        RtPayload::Variant { type_name, name, fields } => replay::Wire::Variant {
+            ty: (*type_name).to_string(),
+            name: (*name).to_string(),
+            fields: fields.iter().map(|&p| wire_of(p)).collect(),
+        },
+        // A builtin answers with none of these. Reaching here means a hook was
+        // put on the wrong call, and guessing an encoding would hide that.
+        RtPayload::Ref(_) => replay::Wire::of_unsupported("reference"),
+        RtPayload::Map(_) => replay::Wire::of_unsupported("map"),
+        RtPayload::Struct { .. } => replay::Wire::of_unsupported("struct"),
+        RtPayload::Fn { .. } => replay::Wire::of_unsupported("function"),
+    }
+}
+
+fn val_of(w: &replay::Wire) -> *mut RtVal {
+    let many = |items: &Vec<replay::Wire>| items.iter().map(val_of).collect::<Vec<_>>();
+    match w {
+        replay::Wire::Unit => alloc(RtPayload::Unit),
+        replay::Wire::Int(n) => alloc(RtPayload::I64(*n)),
+        replay::Wire::Float(n) => alloc(RtPayload::F64(*n)),
+        replay::Wire::Bool(b) => alloc(RtPayload::Bool(*b)),
+        replay::Wire::Str(s) => alloc(RtPayload::Str(RtStr::of(s))),
+        replay::Wire::Bytes(b) => alloc(RtPayload::Bytes(std::sync::Arc::new(b.clone()))),
+        replay::Wire::List(v) => alloc(RtPayload::List(many(v).into())),
+        replay::Wire::Tuple(v) => alloc(RtPayload::Tuple(many(v).into())),
+        replay::Wire::Variant { ty, name, fields } => alloc(RtPayload::Variant {
+            type_name: interned(ty),
+            name: interned(name),
+            fields: many(fields),
+        }),
+    }
+}
+
+/// Runs `body` unless the journal already knows what it answered.
+///
+/// On replay the effect does not happen at all — which is the whole reason the
+/// wrapper is shaped this way. Re-running a `write_file` to reproduce a bug
+/// would damage a disk, and re-running a `tcp_connect` would need the other end
+/// of the connection to still be there, which is exactly what it will not be.
+///
+/// # Safety: `body` returns a live value.
+unsafe fn journaled(name: &str, body: impl FnOnce() -> *mut RtVal) -> *mut RtVal {
+    if !replay::active() {
+        return body();
+    }
+    if let Some(w) = replay::gate(name) {
+        return val_of(&w);
+    }
+    let out = body();
+    replay::put(name, &wire_of(out));
+    out
+}
 
 #[cfg(test)]
 mod small_string_tests {

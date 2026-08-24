@@ -14,7 +14,9 @@
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
-GRASM=./target/release/grasm
+GRASM=${GRASM:-./target/release/grasm}
+. "$(dirname "$0")/lib/fresh.sh"
+fresh_or_stop "./target/release/grasm"
 BENCH=benchmarks
 WORK="${TMPDIR:-/tmp}/grasm_bench_$$"
 mkdir -p "$WORK"

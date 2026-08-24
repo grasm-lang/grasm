@@ -3748,3 +3748,56 @@ fn every_effectful_builtin_is_named_in_conformance() {
          stopped being charged:\n  {absent:?}"
     );
 }
+
+/// Every builtin that reaches the world is either journaled or deliberately
+/// repeated — never silently neither.
+///
+/// A new effectful builtin added without a thought about replay would default
+/// to `Untouched`, and a recording would then be quietly incomplete: the
+/// program would reach the world during a replay and nobody would be told. The
+/// classification is not optional, so the test makes it not optional.
+#[test]
+fn every_effectful_builtin_says_what_a_replay_owes_it() {
+    use grasm_sema::builtins::{Journal, BUILTINS};
+    for b in BUILTINS {
+        if b.row.is_empty() {
+            assert_eq!(
+                b.journal,
+                Journal::Untouched,
+                "`{}` reaches nothing outside the program, so a replay has \
+                 nothing to hand it back",
+                b.name
+            );
+        } else {
+            assert_ne!(
+                b.journal,
+                Journal::Untouched,
+                "`{}` performs {:?} but is marked as touching nothing — a \
+                 recording of a program that calls it would be incomplete, and \
+                 the replay would reach the world instead",
+                b.name,
+                b.row
+            );
+        }
+    }
+}
+
+/// Every journaled builtin has a program in the replay gate.
+///
+/// `scripts/replaytest.sh` proves a hook exists by running one call under an
+/// empty journal. A builtin with no program there is not checked by it, and
+/// the script's own count of "no test program" only appears when someone runs
+/// it — this fails in `cargo test`, where the gate list starts.
+#[test]
+fn every_journaled_builtin_is_named_in_the_replay_gate() {
+    use grasm_sema::builtins::recorded;
+    let script = include_str!("../../../scripts/replaytest.sh");
+    for b in recorded() {
+        assert!(
+            script.contains(&format!("    {})", b.name)),
+            "`{}` is journaled but has no program in scripts/replaytest.sh, so \
+             nothing checks that its hook is still there",
+            b.name
+        );
+    }
+}

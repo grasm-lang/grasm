@@ -94,6 +94,22 @@ It is the reference interpreter rather than a second implementation, and
 `scripts/wasmtest.sh` holds it to the same agreement gate as everything else —
 183 identical, 0 mismatched.
 
+A run can be **recorded and replayed**. `GRASM_RECORD=j ./prog` writes a journal
+of everything the program read from outside itself; `GRASM_REPLAY=j` makes a
+later run take its answers from that journal instead, and reach outside itself
+for nothing at all — not the reads and not the writes. The recording is portable
+between engines, which is the case that matters: the failure happens in the
+native build and the debugger is in `grasm run`. See
+[docs/replay.md](docs/replay.md); `scripts/replaytest.sh` proves every one of
+the 28 journaled builtins is still hooked, on both engines that implement them,
+by running each one under an empty journal and requiring it to refuse — and
+replays a native recording of a TCP session inside the browser build, which has
+no sockets at all.
+
+The effect system is what makes it cheap. Knowing which calls are
+non-deterministic is normally the hard part of building such a tool, and here it
+was already written down.
+
 ## Toolchain
 
 ```

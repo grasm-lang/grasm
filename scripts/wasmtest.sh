@@ -15,10 +15,30 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 GRASM=${GRASM:-./target/release/grasm}
+. "$(dirname "$0")/lib/fresh.sh"
+fresh_or_stop "./target/release/grasm"
 WASM=${WASM:-./target/wasm32-unknown-unknown/release/grasm_wasm.wasm}
 
 if [ ! -x "$GRASM" ]; then
     echo "error: $GRASM missing — run: cargo build --release --workspace"
+    exit 1
+fi
+# Built here rather than assumed, because the module on disk is not evidence
+# that the module still *builds*. It was not, once: `grasm_interp` grew a
+# dependency on the 64-bit runtime, wasm32 stopped compiling entirely, and this
+# gate went on comparing a module from the previous week and reporting 182
+# identical. A staleness check that trusts a stale reference is not one.
+#
+# Skipped when the target is not installed, with a message rather than a pass:
+# a machine without wasm32 cannot check this and should not pretend to.
+if rustc --print target-list 2>/dev/null | grep -qx wasm32-unknown-unknown; then
+    if ! cargo build --release --target wasm32-unknown-unknown -p grasm_wasm 2>&1 | tail -20; then
+        echo "error: the wasm build failed — the module below would be stale"
+        exit 1
+    fi
+elif [ ! -f "$WASM" ]; then
+    echo "error: wasm32-unknown-unknown is not installed and $WASM is missing — run:"
+    echo "  rustup target add wasm32-unknown-unknown"
     exit 1
 fi
 if [ ! -f "$WASM" ]; then

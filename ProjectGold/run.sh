@@ -10,6 +10,9 @@ set -uo pipefail
 cd "$(dirname "$0")"
 
 GRASM=${GRASM:-../target/release/grasm}
+# `cd` above already moved here, so this is relative to ProjectGold.
+. ../scripts/lib/fresh.sh
+fresh_or_stop "../target/release/grasm"
 if [ ! -x "$GRASM" ]; then
     echo "error: $GRASM missing — run: cargo build --release --workspace"
     exit 1

@@ -1,0 +1,17 @@
+[package]
+name = "grasm_journal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Its own crate, and deliberately a small one.
+#
+# The journal is a *format*, not a runtime: three engines with three separate
+# value representations have to agree on it, and one of them is a wasm module
+# that cannot link the compiled runtime at all. Leaving it inside `grasm_rt`
+# made `grasm_interp` — and through it the browser build — depend on a runtime
+# written for a 64-bit host, which stopped compiling for wasm32 the moment the
+# interpreter started sharing the journal.
+#
+# No dependencies, for the same reason `grasm_rt` has none.
+[dependencies]

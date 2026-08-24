@@ -26,7 +26,7 @@ the scorecard takes the best of five runs and subtracts the process floor.
 | G5 | Hello-world static binary | ≤ 300 KB | 328 KB | **missed by 9%** — and unchanged after a session that added `bytes`, UDP, processes, pipelines, radix conversion and pointer FFI |
 | G6 | Structured, uncolored concurrency | 1M+ tasks/node | `net_wait` gives concurrent I/O on one thread ([L-LIB-NET]); `par_map`/`par_filter` are multi-core over **boxed** values too — 3.68× on 8 cores over strings — but still refuse every effect, and `spawn` is still single-core ([E-NOT-PARALLEL]) | **partly met** |
 | G7 | Capability-sandboxed dependencies | 100% | the supply-chain benchmark's tamper is refused as `performs [io] permits []`; **and it was not met between `bytes` shipping and 2026-08-24** — `read_bytes`/`write_bytes` were left off the list that charges `io`, so a `capabilities = []` package could read and write any file (F35) | **met now, and the claim was wrong before** |
-| G8 | Production failure → deterministic replay | ≥ 99% | **first slice built** — `GRASM_RECORD` writes a journal of everything a run read from outside itself, `GRASM_REPLAY` hands it back. A run reading the clock, entropy and the environment reproduces exactly from 86 bytes; divergence stops the run rather than guessing. Covers `now_millis`, `env`, `read_file`, `random_bytes` on the compiled engines — not yet the network, processes, stdin, or `grasm run` | **started, and honestly partial** |
+| G8 | Production failure → deterministic replay | ≥ 99% | `GRASM_RECORD` writes a journal of everything a run read from outside itself; `GRASM_REPLAY` hands it back and the run reaches outside itself for **nothing** — not the reads and not the writes. All **28** journaled builtins on **all four engines** — interpreter, bundle, native and the browser build: the whole `io`, `net` and `proc` surface bar `print`/`eprint`, which are repeated on purpose. A recording made by the native build replays byte-identically under `grasm run` *and inside a wasm module that has no sockets, no processes and no filesystem* — TCP session and child process included. `scripts/replaytest.sh` runs each builtin under an empty journal and requires it to refuse. Not covered: recording in a browser (wasm32 has no filesystem to write to — replaying there works, and is checked) and worker threads (the journal is per-thread; `par_map` refuses effects, so nothing in the corpus can reach it) | **met for a single-threaded native or bundled run; the ≥99% number is unmeasured — nobody has run a Grasm program in production** |
 | G9 | C ABI import overhead | zero-cost | `extern fn` takes `i64`, `f64`, `str` and `bytes` ([T-EXTERN-POINTER]), gated by `unsafe` and charged `io`; a pointer may not be *returned* | **met** |
 | G10 | Adoption | ≥ 500 companies | zero — nobody outside this repository has run a Grasm program | **not started** |
 | G11 | Tokens vs Python | ≤ 1.00× | **1.04×** | **4% over** |
@@ -588,13 +588,42 @@ happened* must not be able to lie about it. A program that reads *more* than the
 recording holds is caught the same way.
 
 Writes are recorded and not replayed against the world: replaying a
-`write_file` would damage a disk to reproduce a bug, and replaying a `print`
-would hide the output the person is reading.
+`write_file` would damage a disk to reproduce a bug. `print` and `eprint` are
+the exception and are repeated for real — a replay whose output you cannot see
+is not worth running.
 
-What is not covered yet, and is more than what is: the network, other processes,
-stdin, `list_dir`, and the whole interpreter — `grasm run` has its own
-implementations of these builtins and none of them is hooked. So this is a first
-slice, not the goal, and G8's row says so.
+**The coverage is now the whole surface, and is checked rather than asserted.**
+Twenty-eight builtins — the filesystem, the clock, the environment, stdin,
+entropy, eleven socket operations, both ways of running another program —
+journaled on the interpreter and on both compiled engines. A recording made by
+the native build replays byte-identically under `grasm run`, including a TCP
+session and a child process, which is the case that matters: the failure happens
+in the fast engine and the debugger is in the other one.
+
+The check is behavioural rather than a grep for the hook. Under an *empty*
+journal a hooked call has nothing to hand back, so it must stop with exit 7; an
+unhooked call reaches the world and the program finishes. `scripts/replaytest.sh`
+runs all 28 that way on both engines, and two `cargo test` gates keep the list
+honest — one refuses a builtin with an effect row that says nothing about
+replay, the other refuses a journaled builtin with no program in the script.
+All three were confirmed by breaking them on purpose and watching them fail.
+
+And a demonstration that a replay really does not touch the world: record a
+program that writes a file, delete the file, replay it. The output is identical
+and the file is not there.
+
+**The browser engine replays too.** It cannot record — wasm32 has no filesystem
+to write a journal to — but a recording made by the native build replays inside
+a wasm module byte-identically, TCP socket and child process included, in a
+module that has neither. `scripts/replaytest.sh` runs that comparison every time.
+
+What is left: **recording** in a browser, and **worker threads**, because the
+journal is per-thread. `par_map` and `par_filter`
+refuse an effectful function, so no program that exists can reach the second one
+— but the honest statement is that the guarantee is single-threaded today.
+
+The ≥99% target is about crashes *in production*, and G10 is zero. That number
+cannot be claimed until somebody outside this repository runs a Grasm program.
 
 **Two of these four were worth nothing on the benchmark set, and that is the
 honest way round to say it.** After the literal cache and the borrowed field

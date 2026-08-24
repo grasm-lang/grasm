@@ -23,6 +23,22 @@ const { instance } = await WebAssembly.instantiate(readFileSync(wasmPath), {
 const ex = instance.exports;
 const bytes = () => new Uint8Array(ex.memory.buffer);
 
+// Replays a journal recorded elsewhere. `journal` is the bytes `GRASM_RECORD`
+// wrote — the same file a native build produces, handed over rather than read,
+// because wasm32 has no filesystem.
+export function replay(source, journal) {
+  const enc = new TextEncoder();
+  const encoded = enc.encode(source);
+  const src = ex.grasm_alloc(encoded.length);
+  bytes().set(encoded, src);
+  const jPtr = journal.length ? ex.grasm_alloc(journal.length) : 0;
+  if (journal.length) bytes().set(journal, jPtr);
+  const res = ex.grasm_run_with_journal(src, encoded.length, jPtr, journal.length);
+  ex.grasm_free(src, encoded.length);
+  if (journal.length) ex.grasm_free(jPtr, journal.length);
+  return frame(res);
+}
+
 export function run(source, stdin = "") {
   const enc = new TextEncoder();
   const encoded = enc.encode(source);
@@ -36,7 +52,11 @@ export function run(source, stdin = "") {
   ex.grasm_free(src, encoded.length);
   if (inBytes.length) ex.grasm_free(inPtr, inBytes.length);
 
-  // Read the frame the ABI documents: total, exit code, stdout, diagnostics.
+  return frame(res);
+}
+
+// The frame the ABI documents: total, exit code, stdout, diagnostics.
+function frame(res) {
   const view = new DataView(ex.memory.buffer);
   const total = view.getUint32(res, true);
   const code = view.getInt32(res + 4, true);
@@ -50,9 +70,13 @@ export function run(source, stdin = "") {
   return { code, out, err };
 }
 
-const stdinPath = process.argv[4];
-const stdinText = stdinPath ? readFileSync(stdinPath, "utf8") : "";
-const { code, out, err } = run(readFileSync(srcPath, "utf8"), stdinText);
+// `--journal <path>` replays instead of running; anything else is stdin.
+const fourth = process.argv[4];
+const source = readFileSync(srcPath, "utf8");
+const { code, out, err } =
+  fourth === "--journal"
+    ? replay(source, new Uint8Array(readFileSync(process.argv[5])))
+    : run(source, fourth ? readFileSync(fourth, "utf8") : "");
 process.stdout.write(out);
 if (err) process.stderr.write(err.endsWith("\n") ? err : err + "\n");
 process.exit(code & 0xff);

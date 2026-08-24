@@ -14,4 +14,6 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 grasm_interp = { path = "../grasm_interp" }
+# For `grasm_run_with_journal` — the journal decoder, nothing else.
+grasm_journal = { path = "../grasm_journal" }
 grasm_syntax = { path = "../grasm_syntax" }
