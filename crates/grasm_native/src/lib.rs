@@ -4320,7 +4320,12 @@ impl FnCx<'_, '_> {
                 let Some((base, sname)) = self.borrow_struct_path(recv)? else {
                     return Ok(None);
                 };
-                let VType::Struct(inner) = self.struct_field_type(&sname, &name.name, *span)?
+                // A field this cannot resolve is not this shape. Propagating
+                // the refusal would let a *borrowing optimisation* decide the
+                // program cannot be compiled, when the ordinary path below it
+                // both compiles the read and produces the right diagnostic if
+                // there is one — the same rule as F42.
+                let Ok(VType::Struct(inner)) = self.struct_field_type(&sname, &name.name, *span)
                 else {
                     return Ok(None);
                 };

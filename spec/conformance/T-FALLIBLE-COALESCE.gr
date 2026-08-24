@@ -5,8 +5,22 @@
 //! []
 //! 101
 //! evaluated once
+//! 2
+//! -1
 // `??` over a fallible value, which used to be a four-line `match`.
 type E = { m: str }
+
+// An *effect operation* under `??`, which is the same clause and a different
+// path through the backend. `m.get(k) ?? d` is fused into one call that never
+// builds an Option, and the recogniser for it matches a call named `get` taking
+// one argument — which an operation can also be. It probed the receiver to
+// confirm a map, `Src` is an effect rather than a value, and the failed probe
+// was propagated instead of meaning "not this shape": the program was refused
+// (F42). `match Src.get(1)` compiled and an annotated `let` compiled, so only
+// this spelling showed it.
+effect Src {
+    fn get(n: i64) -> i64 ! E
+}
 
 fn parse(s: str) -> i64 ! E {
     match s.parse_int() {
@@ -33,4 +47,9 @@ fn main() {
     // The success path does not evaluate the fallback; the failing one does.
     let _ok = parse("5") ?? fallback()
     let _bad = parse("z") ?? fallback()
+
+    with Src handled_by SrcHandler{ get: |n| if n > 0 { Ok(n * 2) } else { Err(E{ m: "low" }) } } {
+        print("{Src.get(1) ?? 0}")
+        print("{Src.get(0) ?? 0 - 1}")
+    }
 }

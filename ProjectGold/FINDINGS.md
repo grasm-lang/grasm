@@ -1641,4 +1641,17 @@ answers, and "I could not tell" is one of them. It may never answer "this
 program cannot be compiled". Every probe inside a recogniser now declines on
 failure rather than propagating it.
 
+The audit that followed found four recognisers in the backend. Two were safe by
+construction and it is worth saying how: `fused_range_build` returns a plain
+`Option<Expr>` and *cannot* propagate a refusal, and `pin_loop_lists` skips a
+shape it cannot use with `continue`. The type was doing the work.
+
+`borrow_struct_path` — the borrowed-read fast path — could propagate, from
+`struct_field_type`, and does not any more. It is not known to have refused a
+real program; it was the same shape and cost nothing to close.
+
+`spec/conformance/T-FALLIBLE-COALESCE.gr` now performs an effect operation under
+`??` on every engine, so the exact spelling that showed F42 is in the corpus
+rather than only in a finding.
+
 Handler programs the backend declines are now **0 of 40**, from 9 of 20.
