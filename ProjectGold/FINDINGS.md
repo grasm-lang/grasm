@@ -1473,3 +1473,60 @@ own reading of it. An ownership convention that lives only in a comment is one
 the compiler cannot check, and this is the second time today that a mismatch
 between what two sides of an interface knew produced a defect — the other being
 the backend re-deriving what the checker had already settled.
+
+## F40 — eleven gate cases that never ran, written by me, today (S1, gate) — **fixed**
+
+`scripts/nativegaps.sh` defines two functions: `expect_refused` and
+`expect_compiled`. Every gap closed today was recorded by calling
+**`expect_compiles`**, which is not a function.
+
+Bash wrote `expect_compiles: command not found` to stderr, returned 127, and —
+with no `set -e` — carried on. Nothing set `fail`. The script ended with:
+
+```
+the gap list matches the compiler
+```
+
+having run 28 of its 39 cases. The eleven that did nothing were exactly the
+eleven closures this session was built on.
+
+### What it did and did not cost
+
+The closures are almost certainly sound: each was checked by hand against the
+interpreter, for output and for leaks, before the gate line was written. What
+was lost is the *permanent* check — eleven shapes with no gate, and a gate
+reporting success for work it had not done.
+
+That is F36's defect in a second place, and this time self-inflicted: **a gate
+that reports a number it did not check.** F36 was a gate reading an artefact it
+did not build. The shape is the same one twice in one day.
+
+### The fix, and why it is not "rename the calls"
+
+Renaming them is the repair. The fix is that the script now counts what it
+declared and compares it with what it ran:
+
+```
+declared=$(grep -cE '^expect_(compiled|refused) "' "$0")
+...
+if [ "$ran" != "$declared" ]; then
+    echo "only $ran of $declared cases ran — the rest were never reached,"
+    echo "so this run checked less than it looks like it did."
+    exit 1
+fi
+```
+
+A misspelt case, a case after an early return, a case inside a branch that
+never fires — all of them now fail, whatever the reason. 39 declared, 39 ran.
+
+### Two holes in `expect_compiled` itself, found while it was being repaired
+
+**It compared output and discarded the exit code.** F39 printed the right value
+and took SIGBUS afterwards; that is agreement by this test's standard. It now
+compares both, and reintroducing F39 produces `DISAGREE: a handler op that is a
+named fn` — which is how the repair was verified.
+
+**It never leak-checked.** These programs are not in the corpus, so
+`scripts/leakcheck.sh` never sees them: every gap closed here was checked for
+agreement and not for whether it releases what it allocates. It runs them under
+`GRASM_LEAK_CHECK=1` now.

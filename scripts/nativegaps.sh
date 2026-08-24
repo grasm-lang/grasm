@@ -37,6 +37,7 @@ expect_refused() {
     else
         echo "  refused: $name"
     fi
+    ran=$((ran + 1))
     # Whatever happens, the interpreter must run it — that is what makes this
     # a gap in the backend rather than a limit of the language.
     if ! "$GRASM" run "$WORK/p.gr" >/dev/null 2>&1; then
@@ -58,9 +59,9 @@ expect_compiled() {
         fail=1
         return
     fi
-    local want got
-    want=$("$GRASM" run "$WORK/p.gr" 2>&1)
-    got=$("$WORK/out" 2>&1)
+    local want got want_code got_code
+    want=$("$GRASM" run "$WORK/p.gr" 2>&1); want_code=$?
+    got=$("$WORK/out" 2>&1); got_code=$?
     if [ "$want" != "$got" ]; then
         echo "  DISAGREE: $name"
         echo "    interp: $want"
@@ -68,9 +69,46 @@ expect_compiled() {
         fail=1
         return
     fi
+    # The exit code, not only the output. A program can answer correctly and
+    # then die: a named function used as a handler operation printed the right
+    # value and took SIGBUS on the way out (F39), because it released an
+    # environment that was a stack address. Comparing stdout alone called that
+    # agreement.
+    if [ "$want_code" != "$got_code" ]; then
+        echo "  DISAGREE ON EXIT: $name — interp $want_code, native $got_code"
+        echo "    output matched, so this is a fault after the answer"
+        fail=1
+        return
+    fi
+    # And it must not leak. These programs are not in the corpus, so
+    # scripts/leakcheck.sh never sees them — every gap closed here would
+    # otherwise be checked for agreement and not for whether it releases what
+    # it allocates.
+    local leaks
+    leaks=$(GRASM_LEAK_CHECK=1 "$WORK/out" 2>&1 | grep -c "^leak:")
+    if [ "$leaks" != "0" ]; then
+        echo "  LEAKS: $name"
+        GRASM_LEAK_CHECK=1 "$WORK/out" 2>&1 | grep "^leak:" | sed 's/^/    /'
+        fail=1
+        return
+    fi
+    ran=$((ran + 1))
     echo "  compiles: $name"
 }
 
+# Every case must actually run.
+#
+# `expect_compiles` is not a function — the function is `expect_compiled` — and
+# eleven cases were written with the wrong name. Bash reported each as a command
+# not found on stderr, nothing set `fail`, and this script printed "the gap list
+# matches the compiler" while a quarter of it did nothing. That is the same
+# defect as F36 in a different place: a gate that reports a number it did not
+# check.
+#
+# So the count is checked against the source. A case that does not run is a
+# failure, whatever the reason.
+declared=$(grep -cE '^expect_(compiled|refused) "' "$0")
+ran=0
 echo "checking the documented --native gaps ..."
 
 expect_refused "a generic type declaration" 'type Pair[A, B] = { fst: A, snd: B }
@@ -150,7 +188,7 @@ fn main() {
 # nobody's source, so nothing registered it in the backend's type table, and
 # every program that wanted to tell NotFound from IoFailed was refused. The
 # backend now reads the variant list from the checker's own table.
-expect_compiles "matching the prelude IoError's variants" 'fn main() {
+expect_compiled "matching the prelude IoError's variants" 'fn main() {
     match read_file("/no/such/file") {
         Ok(s) -> print("{s.len()}")
         Err(e) -> match e {
@@ -168,7 +206,7 @@ expect_compiles "matching the prelude IoError's variants" 'fn main() {
 # A handler value is now a block of (code, env) pairs built in the frame that
 # wrote the literal, which is exactly why it may be passed down and still may
 # not be returned or stored.
-expect_compiles "an effect handler as a parameter type" 'effect Log {
+expect_compiled "an effect handler as a parameter type" 'effect Log {
     fn info(m: str)
 }
 fn run(h: LogHandler) / {io} {
@@ -203,7 +241,7 @@ fn main() {
 # that from the shapes visible at the closure — which cannot reach a call site in
 # another statement. It asks now, and the reconstruction stays as the fallback
 # for closures inference genuinely leaves unresolved.
-expect_compiles "a closure whose parameter types nothing fixes" 'fn main() {
+expect_compiled "a closure whose parameter types nothing fixes" 'fn main() {
     let f = |p| p.0 + p.1
     for (i, v) in [10, 20].enumerate() {
         print("{f((i, v))}")
@@ -241,7 +279,7 @@ fn main() -> () ! E {
 # not, though the checker records both ([T-EMPTY-LIT]). So the seed arrived as a
 # map with unknown key and value, and the refusal said the seed and the function
 # differed when they were written identically.
-expect_compiles "a fold seeded with an unannotated map()" 'fn add(acc: Map[str, i64], n: i64) -> Map[str, i64] {
+expect_compiled "a fold seeded with an unannotated map()" 'fn add(acc: Map[str, i64], n: i64) -> Map[str, i64] {
     var a = acc
     a.set("k", n)
     a
@@ -286,7 +324,7 @@ fn main() {
 # Was a gap. `for i in 0..n` is compiled into a counted loop and never builds
 # a range at all — which is why it costs nothing — so there was no range value
 # for a binding to hold. There is one now, and the counted loop is unchanged.
-expect_compiles "a range held as a value" 'fn main() {
+expect_compiled "a range held as a value" 'fn main() {
     let r = 1..5
     var t = 0
     for i in r {
@@ -313,7 +351,7 @@ fn main() {
 # a list of nothings prints as `[(), ()]`. The rest of the refusal was advice —
 # write a `for` loop — and advice that makes two engines disagree about which
 # programs exist is worse than no advice.
-expect_compiles "map with a function that returns nothing" 'fn main() {
+expect_compiled "map with a function that returns nothing" 'fn main() {
     let r = ["a"].map(|s| print(s))
     print("{r.len()}")
 }'
@@ -324,7 +362,7 @@ expect_compiles "map with a function that returns nothing" 'fn main() {
 # determined by nothing. The closure passed for `f` had always known its own
 # type; nothing looked inside it. `ref T` and `T ! E` were missing for the same
 # reason and are handled now too.
-expect_compiles "a type parameter only in a function result" 'fn key_by[T, K](xs: [T], f: fn(T) -> K) -> [K] {
+expect_compiled "a type parameter only in a function result" 'fn key_by[T, K](xs: [T], f: fn(T) -> K) -> [K] {
     xs.map(f)
 }
 fn main() {
@@ -404,7 +442,7 @@ fn main() {
 
 # Compiles, and is sound for the same reason passing is: `g` is a copy of a
 # pointer into the caller's frame, which outlives this one.
-expect_compiles "binding a handler parameter to a local" 'effect S {
+expect_compiled "binding a handler parameter to a local" 'effect S {
     fn a() -> i64
 }
 fn take(h: SHandler) / {io, S} {
@@ -461,17 +499,22 @@ fn main() {
 # releases it, while a handler operation is handed the address of a stack slot
 # in the frame that installed it. Sharing the wrapper decremented through a live
 # frame, which returned the right answer and then crashed.
-expect_compiles "a handler op that is a named fn" 'effect Src {
+expect_compiled "a handler op that is a named fn" 'effect Src {
     fn get() -> str
+    fn tag() -> str
 }
 
 fn named() -> str {
     "x"
 }
 
+fn other() -> str {
+    "y"
+}
+
 fn main() {
-    with Src handled_by SrcHandler{ get: named } {
-        print("{Src.get()}")
+    with Src handled_by SrcHandler{ get: named, tag: other } {
+        print("{Src.get()}{Src.tag()}")
     }
 }'
 
@@ -480,7 +523,7 @@ fn main() {
 # comparison is the word. It compiled for a *list* of refs already, because the
 # runtime's deep equality reaches the same answer element by element; only two
 # bare ones had nowhere to go.
-expect_compiles "== on two bare refs" 'type N = { v: i64 }
+expect_compiled "== on two bare refs" 'type N = { v: i64 }
 
 fn main() {
     let a = ref(N{ v: 1 })
@@ -493,7 +536,7 @@ fn main() {
 # rather than calling in place because that path reads the value twice, once for
 # the code pointer and once for the environment, and evaluating the callee twice
 # would run its side effects twice.
-expect_compiles "a call through a non-name callee" 'fn double(n: i64) -> i64 {
+expect_compiled "a call through a non-name callee" 'fn double(n: i64) -> i64 {
     n * 2
 }
 
@@ -579,6 +622,12 @@ expect_compiled "an annotated empty list, however deeply nested" 'fn main() {
 echo
 if [ $fail -ne 0 ]; then
     echo "the documented gap list is out of date"
+    exit 1
+fi
+if [ "$ran" != "$declared" ]; then
+    echo
+    echo "only $ran of $declared cases ran — the rest were never reached,"
+    echo "so this run checked less than it looks like it did."
     exit 1
 fi
 echo "the gap list matches the compiler"
