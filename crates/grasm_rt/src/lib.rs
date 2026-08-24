@@ -1069,6 +1069,23 @@ pub enum RtPayload {
     F64(f64),
     Bool(bool),
     Str(RtStr),
+    /// A handler operation's captured environment, on the heap.
+    ///
+    /// The lifted operation reads its captures as machine words at `data + i*8`
+    /// — the same layout a stack slot gave it — so nothing about the operation
+    /// changes when the environment outlives the frame that built it. `boxed`
+    /// says which of those words are references, and is what lets releasing the
+    /// environment release them.
+    Env { words: Vec<i64>, boxed: Vec<bool> },
+    /// An effect handler as a value: its effect, and each operation's code and
+    /// environment.
+    ///
+    /// Held in the order the literal wrote its fields, because that is the
+    /// order the interpreter prints a handler in and the two must agree.
+    Handler {
+        effect: String,
+        ops: Vec<(String, *const u8, *mut RtVal)>,
+    },
     /// `a..b` or `a..=b`, held rather than walked.
     ///
     /// Three scalars, not the elements: `let r = 0..2_000_000` is two words
@@ -1435,6 +1452,23 @@ pub unsafe extern "C" fn grasm_region_pop() {
             RtPayload::Variant { fields, .. } => {
                 outside.extend(fields.iter().copied().filter(|c| (**c).rc.load(Relaxed) != ARENA));
             }
+            RtPayload::Handler { ops, .. } => {
+                outside.extend(
+                    ops.iter()
+                        .map(|(_, _, env)| *env)
+                        .filter(|e| !e.is_null() && (**e).rc.load(Relaxed) != ARENA),
+                );
+            }
+            RtPayload::Env { words, boxed } => {
+                for (w, is_boxed) in words.iter().zip(boxed.iter()) {
+                    if *is_boxed && *w != 0 {
+                        let c = *w as *mut RtVal;
+                        if (*c).rc.load(Relaxed) != ARENA {
+                            outside.push(c);
+                        }
+                    }
+                }
+            }
             _ => {}
         }
         for c in outside {
@@ -1539,6 +1573,23 @@ unsafe fn dec(v: *mut RtVal) {
                         }
                         RtPayload::Variant { fields, .. } => {
                             pending.extend(fields.iter().copied());
+                        }
+                        // A handler owns one environment per operation, and an
+                        // environment owns whichever of its words are
+                        // references. Without these two arms a handler that
+                        // escaped its frame would leak everything it captured —
+                        // which is the whole reason it is allowed to escape.
+                        RtPayload::Handler { ops, .. } => {
+                            pending.extend(
+                                ops.iter().map(|(_, _, env)| *env).filter(|e| !e.is_null()),
+                            );
+                        }
+                        RtPayload::Env { words, boxed } => {
+                            for (w, is_boxed) in words.iter().zip(boxed.iter()) {
+                                if *is_boxed && *w != 0 {
+                                    pending.push(*w as *mut RtVal);
+                                }
+                            }
                         }
                         _ => {}
                     }
@@ -2552,6 +2603,17 @@ unsafe fn display(v: *mut RtVal) -> String {
         RtPayload::Unit => "()".to_string(),
         // The bounds, not the elements. `0..2000000` is what the range *is*,
         // and printing two million integers instead would be a different value.
+        // `LogHandler{info: <closure>}` — what the interpreter prints, which
+        // holds a struct whose fields are the operations. A handler is not a
+        // useful thing to print, and the two engines still have to agree on it.
+        RtPayload::Handler { effect, ops } => {
+            let fields: Vec<String> = ops
+                .iter()
+                .map(|(name, _, _)| format!("{name}: <closure>"))
+                .collect();
+            format!("{effect}Handler{{{}}}", fields.join(", "))
+        }
+        RtPayload::Env { .. } => "<environment>".to_string(),
         RtPayload::Range { start, end, inclusive } => {
             if *inclusive {
                 format!("{start}..={end}")
@@ -6365,6 +6427,8 @@ unsafe fn wire_of(v: *mut RtVal) -> replay::Wire {
         // A builtin answers with none of these. Reaching here means a hook was
         // put on the wrong call, and guessing an encoding would hide that.
         RtPayload::Range { .. } => replay::Wire::of_unsupported("range"),
+        RtPayload::Handler { .. } => replay::Wire::of_unsupported("handler"),
+        RtPayload::Env { .. } => replay::Wire::of_unsupported("environment"),
         RtPayload::Ref(_) => replay::Wire::of_unsupported("reference"),
         RtPayload::Map(_) => replay::Wire::of_unsupported("map"),
         RtPayload::Struct { .. } => replay::Wire::of_unsupported("struct"),
@@ -6576,5 +6640,118 @@ mod scalar_kind_tests {
         ] {
             assert_eq!(ScalarKind::from_i64(k.to_i64()), k, "{k:?} did not survive");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Handlers as values
+//
+// A handler installed directly by `with E handled_by ELiteral{..}` never builds
+// one of these: its operations are lifted at compile time and its captures live
+// in the frame that ran the `with`, which cannot return while the handler is
+// installed. That path is unchanged and costs nothing.
+//
+// These are for a handler that outlives the expression that wrote it — returned
+// from a function, held in a struct or a list, passed around. The captures go
+// on the heap and are reference-counted like every other value, so the question
+// "is this environment still alive?" has the same answer here as everywhere.
+
+/// An environment of `n` machine words, all zero and none of them references.
+#[no_mangle]
+pub extern "C" fn grasm_env_new(n: i64) -> *mut RtVal {
+    let n = n.max(0) as usize;
+    alloc(RtPayload::Env {
+        words: vec![0; n],
+        boxed: vec![false; n],
+    })
+}
+
+/// Stores one capture. `is_boxed` says whether the word is a reference, and so
+/// whether releasing the environment must release it.
+///
+/// The caller has already retained a boxed word; this takes that reference.
+///
+/// # Safety: live runtime pointer, `i` within the length given to `env_new`.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_env_set(env: *mut RtVal, i: i64, bits: i64, is_boxed: i8) {
+    let RtPayload::Env { words, boxed } = &mut (*env).payload else {
+        rt_panic("env_set: not an environment");
+    };
+    let i = i.max(0) as usize;
+    if i < words.len() {
+        words[i] = bits;
+        boxed[i] = is_boxed != 0;
+    }
+}
+
+/// The address the lifted operation reads its captures from.
+///
+/// Stable for the life of the environment: the words are allocated once by
+/// `env_new` and never grow, so nothing can move them.
+///
+/// # Safety: live runtime pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_env_data(env: *mut RtVal) -> *const u8 {
+    match &(*env).payload {
+        RtPayload::Env { words, .. } => words.as_ptr() as *const u8,
+        _ => rt_panic("env_data: not an environment"),
+    }
+}
+
+/// An empty handler for `effect`.
+///
+/// # Safety: interned name data.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_handler_new(name: *const u8, len: u64) -> *mut RtVal {
+    alloc(RtPayload::Handler {
+        effect: take_str(name, len),
+        ops: Vec::new(),
+    })
+}
+
+/// Adds one operation. The handler takes the environment's reference.
+///
+/// # Safety: live runtime pointers and interned name data.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_handler_add(
+    h: *mut RtVal,
+    name: *const u8,
+    len: u64,
+    code: *const u8,
+    env: *mut RtVal,
+) {
+    let n = take_str(name, len);
+    let RtPayload::Handler { ops, .. } = &mut (*h).payload else {
+        rt_panic("handler_add: not a handler");
+    };
+    ops.push((n, code, env));
+}
+
+/// Installs a handler value, so operations performed inside the block resolve
+/// to it. Paired with `grasm_handler_pop` exactly as the literal path is.
+///
+/// The environment addresses handed to the handler stack stay good because the
+/// handler itself is a live value for the whole block — the reference the
+/// `with` holds is what keeps them alive.
+///
+/// # Safety: live runtime pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_handler_install(h: *mut RtVal) {
+    let (effect, ops) = match &(*h).payload {
+        RtPayload::Handler { effect, ops } => (effect.clone(), ops.clone()),
+        _ => rt_panic("handler_install: not a handler"),
+    };
+    HANDLERS.with(|st| st.borrow_mut().push((effect, Vec::new())));
+    for (name, code, env) in ops {
+        let data = if env.is_null() {
+            std::ptr::null()
+        } else {
+            grasm_env_data(env)
+        };
+        HANDLERS.with(|st| {
+            if let Some((_, list)) = st.borrow_mut().last_mut() {
+                list.push((name.clone(), code, data));
+            }
+        });
     }
 }

@@ -93,13 +93,14 @@ enum VType {
     /// value, like `Str` — a byte buffer has no scalar representation.
     Bytes,
     List(Box<VType>),
-    /// An effect handler carried as a value: a pointer to `(code, env)` pairs,
-    /// one per operation, in the effect's declared order.
+    /// An effect handler carried as a value.
     ///
-    /// The block lives in the frame that *built* it, which is why this is
-    /// allowed as a parameter and nowhere else. Passing one down keeps that
-    /// frame alive for the whole call; returning one, or storing one in a
-    /// struct or a list, would outlive it, and those stay refused by name.
+    /// A reference-counted value holding, per operation, a code pointer and a
+    /// heap environment. It was a pointer into the frame that built it, which
+    /// made passing one down sound and returning or storing one unsound — so
+    /// those were refused. The environment is on the heap now and counted like
+    /// anything else, and the question "is this still alive?" has the same
+    /// answer here as everywhere.
     Handler(String),
     /// `a..b` held as a value, rather than walked by a `for`.
     ///
@@ -237,7 +238,8 @@ impl VType {
     fn boxed(&self) -> bool {
         matches!(
             self,
-            VType::Str
+            VType::Handler(_)
+                | VType::Str
                 | VType::Bytes
                 | VType::Range
                 | VType::List(_)
@@ -817,6 +819,11 @@ impl<'m> Codegen<'m> {
             ("grasm_list_min_max", vec![i64t, i8t], Some(i64t)),
             ("grasm_list_new_scalar", vec![i64t], Some(i64t)),
             ("grasm_range_new", vec![i64t, i64t, i8t], Some(i64t)),
+            ("grasm_env_new", vec![i64t], Some(i64t)),
+            ("grasm_env_set", vec![i64t, i64t, i64t, i8t], None),
+            ("grasm_handler_new", vec![ptr, i64t], Some(i64t)),
+            ("grasm_handler_add", vec![i64t, ptr, i64t, ptr, i64t], None),
+            ("grasm_handler_install", vec![i64t], None),
             ("grasm_range_to_list", vec![i64t], Some(i64t)),
             ("grasm_range_len", vec![i64t], Some(i64t)),
             ("grasm_range_start", vec![i64t], Some(i64t)),
@@ -946,11 +953,16 @@ impl<'m> Codegen<'m> {
             self.collect_types(m)?;
             let _ = name;
         }
-        for (_, m, _) in views {
-            self.resolve_type_bodies(m)?;
-        }
+        // Effects before type bodies, because a field may be of handler type
+        // and `XHandler` only means something once the effect `X` is known.
+        // The other way round, `type B = { h: SHandler }` was refused as an
+        // unknown type. Effects need only type *names*, which `collect_types`
+        // has already registered.
         for (_, m, _) in views {
             self.collect_effects(m)?;
+        }
+        for (_, m, _) in views {
+            self.resolve_type_bodies(m)?;
         }
         for (name, m, _) in views {
             self.current_module = name.clone();
@@ -4927,14 +4939,30 @@ impl FnCx<'_, '_> {
                 // caller, and it carries their code and environment pointers.
                 // Installing them needs no literal here, which is the whole
                 // point: this function does not know which handler it got.
-                if self.cg.handler_literal(handler).is_none() {
-                    if let Expr::Ident(hid) = handler {
-                        if let Some((hvar, VType::Handler(got))) = self.lookup(&hid.name) {
-                            if got == ename {
-                                return self.with_handler_value(&ename, hvar, body, *span);
-                            }
-                        }
+                // Anything whose *type* is this effect's handler: a parameter,
+                // a loop variable, a list element, a field, the result of a
+                // call. Only a literal written here — or a name bound to one —
+                // takes the lifted path below, and that is the fast one.
+                if self.cg.handler_literal(handler).is_none()
+                    || !self.cg.handler_sites.contains_key(&span.start)
+                {
+                    let (hv, ht) = self.eval_expr_val(handler)?;
+                    if ht == VType::Handler(ename.clone()) {
+                        let hvar = self.new_var(&ht);
+                        self.b.def_var(hvar, hv);
+                        // Bound into a scope of its own so the reference is
+                        // released however the block is left — including by a
+                        // `return` from inside it.
+                        self.push_scope();
+                        self.bind(&format!(" with.handler{}", span.start), hvar, ht);
+                        let out = self.with_handler_value(&ename, hvar, body, *span);
+                        self.pop_scope_with_decs();
+                        return out;
                     }
+                    return nope(
+                        handler.span(),
+                        format!("a `with {ename}` whose handler is `{}`", ht.show()),
+                    );
                 }
                 let Some(site) = self.cg.handler_sites.get(&span.start).cloned() else {
                     // Two ways to get here, and they want different messages.
@@ -5046,10 +5074,12 @@ this case",
 
     /// Installs a handler that arrived as a value, then runs the block.
     ///
-    /// The pairs are read out of the block the caller built and handed to the
-    /// same runtime stack a literal handler uses, so an operation call inside
-    /// the body resolves identically either way — it was always a lookup by
-    /// effect and operation name, never a direct call.
+    /// The pairs go onto the same runtime stack a literal handler uses, so an
+    /// operation call inside the body resolves identically either way — it was
+    /// always a lookup by effect and operation name, never a direct call.
+    ///
+    /// The handler is a live value for the whole block, which is what keeps the
+    /// environment addresses the stack was handed good.
     fn with_handler_value(
         &mut self,
         ename: &str,
@@ -5057,26 +5087,11 @@ this case",
         body: &grasm_syntax::ast::Block,
         span: Span,
     ) -> CResult<StmtOut> {
-        let ops = self.cg.effects.get(ename).cloned().unwrap_or_default();
-        if ops.is_empty() {
+        if !self.cg.effects.contains_key(ename) {
             return nope(span, format!("the effect `{ename}`"));
         }
-        let (ep, el) = self.str_ptr_len(ename);
-        self.call_rt("grasm_handler_push", &[ep, el]);
-        let ptr_ty = self.cg.module.target_config().pointer_type();
-        let base = self.b.use_var(hvar);
-        for (i, (opname, _, _)) in ops.iter().enumerate() {
-            let code = self
-                .b
-                .ins()
-                .load(ptr_ty, cranelift_codegen::ir::MemFlags::trusted(), base, (i * 16) as i32);
-            let env = self
-                .b
-                .ins()
-                .load(ptr_ty, cranelift_codegen::ir::MemFlags::trusted(), base, (i * 16 + 8) as i32);
-            let (op_p, op_l) = self.str_ptr_len(opname);
-            self.call_rt("grasm_handler_op", &[op_p, op_l, code, env]);
-        }
+        let h = self.b.use_var(hvar);
+        self.call_rt("grasm_handler_install", &[h]);
         let (_, mut terminated) = self.eval_block_inner(body)?;
         terminated |= self.is_filled();
         if !terminated {
@@ -5387,18 +5402,21 @@ this case",
         }
     }
 
-    /// Builds the `(code, env)` block a handler parameter is passed as.
+    /// Builds a handler value: one code pointer and one heap environment per
+    /// operation.
     ///
-    /// One pair per operation, in the effect's declared order, so the callee
-    /// can install them without knowing which handler it got. The captures go
-    /// into their own slots exactly as a `with` site fills them — the same
-    /// `lift_handler_ops` produced both — and are released after the call.
-    fn handler_block(&mut self, e: &Expr, eff: &str) -> CResult<(Value, VType)> {
-        // Already a handler value: a parameter passed straight on.
+    /// The operations were lifted where the literal was written. What is built
+    /// here is the value that carries them, and it is reference-counted, so it
+    /// may be returned, stored or put in a list — the environment outlives this
+    /// frame because nothing about it is in this frame.
+    fn handler_value(&mut self, e: &Expr, eff: &str) -> CResult<(Value, VType)> {
+        // Already a handler value — a parameter passed straight on, or a name
+        // bound to one.
         if let Expr::Ident(id) = e {
             if let Some((var, VType::Handler(got))) = self.lookup(&id.name) {
                 if got == eff {
                     let v = self.b.use_var(var);
+                    self.call_rt("grasm_val_inc", &[v]);
                     return Ok((v, VType::Handler(eff.to_string())));
                 }
             }
@@ -5406,41 +5424,28 @@ this case",
         let Some(lit) = self.cg.handler_literal(e) else {
             return nope(
                 e.span(),
-                format!(
-                    "a `{eff}Handler` argument that is not a handler literal or a \
-`let` bound to one"
-                ),
+                format!("a `{eff}Handler` that is not a handler literal or a name bound to one"),
             );
         };
         let Expr::StructLit { fields, span: lit_span, .. } = &lit else {
-            return nope(e.span(), format!("a `{eff}Handler` argument"));
+            return nope(e.span(), format!("a `{eff}Handler` value"));
         };
+        self.cg.lift_handler_literal(&lit)?;
         let Some(site) = self.cg.handler_sites.get(&lit_span.start).cloned() else {
-            return nope(e.span(), format!("a `{eff}Handler` argument that was not lifted"));
+            return nope(e.span(), format!("a `{eff}Handler` that was not lifted"));
         };
-        let ops = self
-            .cg
-            .effects
-            .get(eff)
-            .cloned()
-            .unwrap_or_default();
-        let _ = fields;
         let ptr_ty = self.cg.module.target_config().pointer_type();
-        let block = self.b.create_sized_stack_slot(
-            cranelift_codegen::ir::StackSlotData::new(
-                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-                (ops.len().max(1) * 16) as u32,
-                3,
-            ),
-        );
-        for (slot_i, (opname, _, _)) in ops.iter().enumerate() {
-            let Some((_, opcode, free)) = site.iter().find(|(o, _, _)| o == opname).cloned() else {
-                return nope(
-                    e.span(),
-                    format!("a `{eff}Handler` missing the operation `{opname}`"),
-                );
+        let (ep, el) = self.str_ptr_len(eff);
+        let handler = self.call_rt("grasm_handler_new", &[ep, el]).unwrap();
+        // The literal's field order, which is the order the interpreter prints
+        // a handler in. Iterating the effect's declaration order instead would
+        // agree on behaviour and disagree on `print("{h}")`.
+        for (fname, _) in fields.iter() {
+            let Some((_, opcode, free)) = site.iter().find(|(o, _, _)| *o == fname.name).cloned()
+            else {
+                return nope(fname.span, format!("the operation `{}`", fname.name));
             };
-            let fid = self.handler_op_func(&opcode, e.span())?;
+            let fid = self.handler_op_func(&opcode, *lit_span)?;
             let captures: Vec<(String, VType)> = free
                 .iter()
                 .filter_map(|n| {
@@ -5449,13 +5454,8 @@ this case",
                         .map(|(_, vt)| (n.clone(), vt))
                 })
                 .collect();
-            let env_slot = self.b.create_sized_stack_slot(
-                cranelift_codegen::ir::StackSlotData::new(
-                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-                    (captures.len().max(1) * 8) as u32,
-                    3,
-                ),
-            );
+            let n = self.b.ins().iconst(types::I64, captures.len() as i64);
+            let env = self.call_rt("grasm_env_new", &[n]).unwrap();
             for (i, (cname, cvt)) in captures.iter().enumerate() {
                 let Some((var, _)) = self
                     .lookup(&Self::snapshot_name(lit_span.start, cname))
@@ -5465,27 +5465,24 @@ this case",
                 };
                 let v = self.b.use_var(var);
                 let bits = self.value_to_bits(v, cvt);
-                // A capture is a value, not a binding ([E-CLOSURE-CAPTURE]),
-                // so a boxed one is held for as long as the handler is.
+                // A capture is a value, not a binding ([E-CLOSURE-CAPTURE]), so
+                // a boxed one is held for as long as the environment is. The
+                // environment releases it, which is the difference from the
+                // frame-scoped path: there, the `with` released them.
                 if cvt.boxed() {
                     self.call_rt("grasm_val_inc", &[v]);
                 }
-                self.b.ins().stack_store(bits, env_slot, (i * 8) as i32);
+                let idx = self.b.ins().iconst(types::I64, i as i64);
+                let flag = self.b.ins().iconst(types::I8, i64::from(cvt.boxed()));
+                self.call_rt("grasm_env_set", &[env, idx, bits, flag]);
             }
-            self.cg.handler_captures.insert(fid, captures.clone());
-            self.handler_arg_held.push((env_slot, captures));
-            let env = self.b.ins().stack_addr(ptr_ty, env_slot, 0);
+            self.cg.handler_captures.insert(fid, captures);
+            let (op_p, op_l) = self.str_ptr_len(&fname.name);
             let fref = self.cg.module.declare_func_in_func(fid, self.b.func);
             let addr = self.b.ins().func_addr(ptr_ty, fref);
-            self.b
-                .ins()
-                .stack_store(addr, block, (slot_i * 16) as i32);
-            self.b
-                .ins()
-                .stack_store(env, block, (slot_i * 16 + 8) as i32);
+            self.call_rt("grasm_handler_add", &[handler, op_p, op_l, addr, env]);
         }
-        let v = self.b.ins().stack_addr(ptr_ty, block, 0);
-        Ok((v, VType::Handler(eff.to_string())))
+        Ok((handler, VType::Handler(eff.to_string())))
     }
 
     fn eval_expr_expecting(
@@ -5515,7 +5512,7 @@ this case",
         // nothing else.
         if let Some(VType::Handler(eff)) = expected {
             let eff = eff.clone();
-            return self.handler_block(e, &eff).map(Some);
+            return self.handler_value(e, &eff).map(Some);
         }
         // A closure literal in argument position gets its parameter types from
         // the parameter it is being passed to. Before function types existed
@@ -5729,14 +5726,18 @@ this case",
                         let v = self.make_variant("Option", "None", &[])?;
                         return Ok(Some((v, VType::Option(Box::new(VType::Any)))));
                     }
-                    // A handler bound to a name, used as a value rather
-                    // than installed. The message named the *variable*, which
-                    // says nothing about which shape was hit.
-                    if self.cg.handler_lits.contains_key(&id.name) {
-                        return nope(
-                            id.span,
-                            "a handler used as a value (install it with `with ... handled_by`; printing or storing one is not compiled yet)",
-                        );
+                    // A handler bound to a name, used as a value rather than
+                    // installed. It builds the value now — the literal is
+                    // recorded, and a handler value is a value like any other.
+                    if let Some(lit) = self.cg.handler_lits.get(&id.name).cloned() {
+                        if let Expr::StructLit { name, .. } = &lit {
+                            if let Some(eff) = name.segments[0].name.strip_suffix("Handler") {
+                                if self.cg.effects.contains_key(eff) {
+                                    let eff = eff.to_string();
+                                    return self.handler_value(&lit, &eff).map(Some);
+                                }
+                            }
+                        }
                     }
                     nope(id.span, format!("the name `{}` here", id.name))
                 }
@@ -9176,6 +9177,22 @@ checker did",
         span: Span,
     ) -> CResult<(Value, VType)> {
         let sname = name.segments[0].name.clone();
+        // A handler literal is not a struct, whatever it looks like. Written in
+        // a value position — returned, put in a list, stored in a field — it
+        // builds a handler value; written at a `with`, it never reaches here at
+        // all, because that path lifts it.
+        if let Some(eff) = sname.strip_suffix("Handler") {
+            if self.cg.effects.contains_key(eff) {
+                let eff = eff.to_string();
+                let lit = Expr::StructLit {
+                    name: name.clone(),
+                    base: base.cloned().map(Box::new),
+                    fields: fields.to_vec(),
+                    span,
+                };
+                return self.handler_value(&lit, &eff);
+            }
+        }
         // `Point{ ..p, x: 1 }` — start from a copy of `p` and overwrite. The
         // base is evaluated first, as it is written ([E-ORDER-LTR]).
         let sv = match base {
@@ -9976,16 +9993,20 @@ checker did",
                         VType::Option(Box::new(VType::Any))
                     } else if let Some(sig) = self.lookup_fn(&id.name) {
                         VType::Fn(sig.params.clone(), Box::new(sig.ret.clone()))
-                    } else if self.cg.handler_lits.contains_key(&id.name) {
-                        // A handler has no runtime value — its operations are
-                        // lifted into functions — so a name bound to one has
-                        // no type to hand anywhere a value is expected. §11
-                        // lists three shapes that end here; all of them are
-                        // this, and none of them said so.
-                        return nope(
-                            id.span,
-                            format!("the handler `{}` used as a value", id.name),
-                        );
+                    } else if let Some(eff) = self
+                        .cg
+                        .handler_lits
+                        .get(&id.name)
+                        .and_then(|lit| match lit {
+                            Expr::StructLit { name, .. } => name.segments[0]
+                                .name
+                                .strip_suffix("Handler")
+                                .map(str::to_string),
+                            _ => None,
+                        })
+                        .filter(|eff| self.cg.effects.contains_key(eff))
+                    {
+                        VType::Handler(eff)
                     } else {
                         return nope(id.span, format!("the type of `{}`", id.name));
                     }
@@ -10185,7 +10206,19 @@ checker did",
                 }
                 VType::Tuple(ts)
             }
-            Expr::StructLit { name, .. } => VType::Struct(name.segments[0].name.clone()),
+            Expr::StructLit { name, .. } => {
+                // A handler literal is a handler, not a struct with that name.
+                // Probed as a struct, a list of them took `Struct("SHandler")`
+                // as its element type, and the `with` that walked the list then
+                // refused a handler for not being one.
+                let n = name.segments[0].name.clone();
+                match n.strip_suffix("Handler") {
+                    Some(eff) if self.cg.effects.contains_key(eff) => {
+                        VType::Handler(eff.to_string())
+                    }
+                    _ => VType::Struct(n),
+                }
+            }
             Expr::Field { recv, name, span } => {
                 if let Expr::Ident(tid) = &**recv {
                     if self.lookup(&tid.name).is_none() {

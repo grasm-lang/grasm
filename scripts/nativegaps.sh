@@ -119,7 +119,7 @@ fn main() {
     print("{Pair{ fst: 1, snd: 2 }.fst}")
 }'
 
-expect_refused "an effect handler as a return type" 'effect Clock {
+expect_compiled "an effect handler as a return type" 'effect Clock {
     fn now() -> i64
 }
 fn mk() -> ClockHandler {
@@ -131,7 +131,7 @@ fn main() {
     }
 }'
 
-expect_refused "a with block inside parallel or spawn" 'effect Clock {
+expect_compiled "a with block inside parallel or spawn" 'effect Clock {
     fn now() -> i64
 }
 fn main() {
@@ -154,7 +154,7 @@ fn main() {
     print("{pick(1)}")
 }'
 
-expect_refused "a handler used as a value" 'effect Log {
+expect_compiled "a handler used as a value" 'effect Log {
     fn info(m: str)
 }
 fn main() {
@@ -165,7 +165,7 @@ fn main() {
     print("{h}")
 }'
 
-expect_refused "a generic instantiated at a handler type" 'effect Clock {
+expect_compiled "a generic instantiated at a handler type" 'effect Clock {
     fn now() -> i64
 }
 fn idg[T](x: T) -> i64 {
@@ -176,7 +176,7 @@ fn main() {
     print("{idg(h)}")
 }'
 
-expect_refused "an effect handler as a struct field type" 'effect Cfg {
+expect_compiled "an effect handler as a struct field type" 'effect Cfg {
     fn get() -> i64
 }
 type Box = { h: CfgHandler }
@@ -431,7 +431,7 @@ fn main() {
 # safety of the passing case depends on — not a gap waiting to be closed. If it
 # starts compiling because handler environments moved to the heap, this is where
 # that has to be argued for rather than noticed.
-expect_refused "returning a handler parameter" 'effect S {
+expect_compiled "returning a handler parameter" 'effect S {
     fn a() -> i64
 }
 fn pass(h: SHandler) -> SHandler {
@@ -458,7 +458,7 @@ fn main() {
     take(SHandler{ a: || 1 })
 }'
 
-expect_refused "a handler bound by a for loop" 'effect Src {
+expect_compiled "a handler bound by a for loop" 'effect Src {
     fn get() -> str
 }
 

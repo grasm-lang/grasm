@@ -7,6 +7,17 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
 
 ### Fixed
 
+- **`--native` compiles a handler that outlives the expression that wrote it.**
+  Returned from a function, stored in a struct field, held in a list, walked by
+  a `for`, printed, instantiated generically, installed inside `parallel` — six
+  shapes, one change. A handler value is reference-counted and its operations'
+  captured environments are on the heap, so the question *is this environment
+  still alive?* has the same answer as for every other value. A handler written
+  directly at a `with` never builds one: its operations are lifted at compile
+  time and its captures live in the frame that ran the `with`, and that path is
+  untouched.
+
+  Four refusals remain in §11, down from seventeen this morning.
 - **`--native` compiles an effect handler passed as a parameter.**
   `fn run(h: LogHandler) { with Log handled_by h { … } }` — the shape
   [E-HANDLER-OWN-ROW] documents. Smaller than it looked: effect *operation*
