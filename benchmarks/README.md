@@ -66,14 +66,14 @@ primitive each one reaches for.
 
 | program  |   C |  Rust |  Go | Nim | Zig | grasm-native | grasm-interp | Python |
 |----------|----:|------:|----:|----:|----:|-------------:|-------------:|-------:|
-| fib      |   5 |     5 |   6 |   5 |   5 |           11 |         1621 |    129 |
-| sieve    |   7 |     7 |   7 |   9 |   7 |           16 |         2835 |    340 |
-| matmul   |   5 |     5 |   8 |   9 |   5 |           10 |         6021 |    891 |
-| wordfreq |  30 |    26 |  17 |  22 |   9 |           46 |          489 |    130 |
-| tree     |  20 |     9 |  20 |   — |   — |           62 |         1464 |    329 |
-| sort     |  36 |    11 |  49 |   — |   — |       **19** |          370 |    211 |
-| parmap   |  51 |    52 |  87 |   — |   — |          105 |       54,241 |  3,552 |
-| parwords |   8 |    11 |  10 |   — |   — |           32 |         1924 |    216 |
+| fib      |   5 |     5 |   6 |   5 |   5 |           10 |         1632 |    129 |
+| sieve    |   7 |     7 |   7 |   9 |   7 |           15 |         2849 |    342 |
+| matmul   |   5 |     5 |   8 |   9 |   5 |           10 |         5998 |    900 |
+| wordfreq |  30 |    26 |  18 |  22 |   9 |           44 |          495 |    129 |
+| tree     |  20 |    10 |  20 |   — |   — |           49 |         1439 |    329 |
+| sort     |  36 |    11 |  48 |   — |   — |       **19** |          369 |    209 |
+| parmap   |  49 |    50 |  89 |   — |   — |          104 |       54,027 |  3,521 |
+| parwords |   8 |    11 |  10 |   — |   — |           32 |         1957 |    221 |
 
 Best of 5. **The harness floor is 2 ms** — what timing `/usr/bin/true` costs,
 which is fork, exec and wait rather than anything a program did. The top three
@@ -99,18 +99,21 @@ anything else, and refuses to run if that takes more than 10 ms.
 Grasm **beats C and Go on `sort`** and is roughly **2x C** on the scalar
 programs.
 
-The three weak rows are the three that allocate. `wordfreq` is 46 against Zig's 9,
+The three weak rows are the three that allocate. `wordfreq` is 44 against Zig's 9,
 which uses an arena and no refcounting. `parwords` is 32 against C's 8 and Rust's
 11, and it is the row where Grasm is running on every core and still behind: the
 workers allocate, and allocation is what the language is slowest at. `tree` is
-62 against C's 20 and Rust's 9 — the worst ratio in the table, and the one worth the most, because building
+49 against C's 20 and Rust's 10 — the worst ratio in the table, and the one worth the most, because building
 small linked structures and walking them is what a parser, an interpreter or a
 compiler does all day.
 
-`tree` was 175 ms when the program was written, and every step down was an
-allocation removed rather than a loop tightened: struct names stopped being
-copied, field access became a load rather than a search, and a struct's fields
-and a list's elements moved into the box the value already needed. A node and
+`tree` was 175 ms when the program was written. For most of the way down every
+step was an allocation removed rather than a loop tightened — struct names
+stopped being copied, field access became a load rather than a search, and a
+struct's fields and a list's elements moved into the box the value already
+needed. Then that stopped being the story: the last two steps, 63 ms to 49,
+removed no allocations and removed *reference counting* instead, because a read
+through a plain local was incrementing and releasing the thing it read through. A node and
 its three children now cost one allocation each instead of four, and the
 allocations that remain are cheaper — every value is the same 64 bytes, so a
 freed box is recycled rather than returned to the system. What is left is the

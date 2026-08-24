@@ -130,14 +130,14 @@ concurrency primitive each one reaches for.
 
 | program  |   C |  Rust |  Go | Nim | Zig | grasm-native | Python |
 |----------|----:|------:|----:|----:|----:|-------------:|-------:|
-| fib      |   5 |     5 |   6 |   5 |   5 |           11 |    129 |
-| sieve    |   7 |     7 |   7 |   9 |   7 |           16 |    340 |
-| matmul   |   5 |     5 |   8 |   9 |   5 |           10 |    891 |
-| wordfreq |  30 |    26 |  17 |  22 |   9 |           46 |    130 |
-| tree     |  20 |     9 |  20 |   — |   — |           62 |    329 |
-| sort     |  36 |    11 |  49 |   — |   — |       **19** |    211 |
-| parmap   |  51 |    52 |  87 |   — |   — |          105 |  3,552 |
-| parwords |   8 |    11 |  10 |   — |   — |           32 |    216 |
+| fib      |   5 |     5 |   6 |   5 |   5 |           10 |    129 |
+| sieve    |   7 |     7 |   7 |   9 |   7 |           15 |    342 |
+| matmul   |   5 |     5 |   8 |   9 |   5 |           10 |    900 |
+| wordfreq |  30 |    26 |  18 |  22 |   9 |           44 |    129 |
+| tree     |  20 |    10 |  20 |   — |   — |           49 |    329 |
+| sort     |  36 |    11 |  48 |   — |   — |       **19** |    209 |
+| parmap   |  49 |    50 |  89 |   — |   — |          104 |  3,521 |
+| parwords |   8 |    11 |  10 |   — |   — |           32 |    221 |
 
 Best of 5. **The harness floor is 2 ms** — what timing `/usr/bin/true` costs,
 which is fork, exec and wait rather than anything a program did. The top three
@@ -180,13 +180,20 @@ pointer, so `matmul`'s innermost loop is 17 instructions with no calls.
 **The three weak rows are the three that allocate.** `wordfreq` builds a string
 per iteration and boxes every value; `parwords` runs on every core and is still
 32 against C's 8, because its workers allocate and allocation is what the
-language is slowest at; `tree` builds a small struct per node, and at 62 ms
-against C's 20 and Rust's 9 it is the worst ratio here — and the one
+language is slowest at; `tree` builds a small struct per node, and at 49 ms
+against C's 20 and Rust's 10 it is the worst ratio here — and the one
 worth the most, because building small linked structures and walking them is
 what a parser, an interpreter or a compiler does all day.
 
-`tree` was 175 ms when it was written, and every step down was an allocation
-removed rather than a loop tightened. Struct names stopped being copied onto
+`tree` was 175 ms when it was written. For most of the way down, every step was
+an allocation removed rather than a loop tightened — **and then that stopped
+being true**, which is worth saying because the sentence stood here for a while
+after it was wrong. The last two steps removed no allocations at all: they
+removed *reference counting*. A read through a plain local no longer increments
+and releases the thing it read through, and a scalar field is fetched in one
+runtime call rather than four. That was 63 ms to 49.
+
+Before those: struct names stopped being copied onto
 every value; reading or writing a field became a load rather than a search
 through the field list; a struct's fields, and then a list's elements, moved
 into the box the value already needed, so a node and its three children are one
