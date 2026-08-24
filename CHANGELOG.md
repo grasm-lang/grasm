@@ -7,6 +7,12 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
 
 ### Fixed
 
+- **`--native` compiles a `fold` seeded with an unannotated `map()`.** The
+  cause was asymmetry rather than difficulty: an empty *list* asked the checker
+  what it had resolved the literal to and an empty *map* did not, though the
+  checker records both ([T-EMPTY-LIT]). So the seed arrived as a map with
+  unknown key and value, and the refusal said the seed and the function differed
+  when they were written identically.
 - **`--native` compiles a call through a callee that is not a name.**
   `TABLE[0](21)`, `fs[0](3)`, `b.f(6)` where `f` is a struct field of function
   type. The callee is evaluated **once**, bound to a name the source cannot

@@ -8319,10 +8319,18 @@ checker did",
             }
             "map" => {
                 let m = self.call_rt("grasm_map_new", &[]).unwrap();
-                return Ok(Some((
-                    m,
-                    VType::Map(Box::new(VType::Any), Box::new(VType::Any)),
-                )));
+                // An empty map has nothing to read a type off, exactly as an
+                // empty list does — and the checker already resolved it against
+                // the whole body and wrote the answer down ([T-EMPTY-LIT]). It
+                // was the list that asked and the map that did not, so
+                // `xs.fold(map(), add)` was refused with a message saying the
+                // seed and the function differed when they were written the
+                // same.
+                let ty = self
+                    .empty_vtype(_span)
+                    .filter(|t| matches!(t, VType::Map(_, _)))
+                    .unwrap_or(VType::Map(Box::new(VType::Any), Box::new(VType::Any)));
+                return Ok(Some((m, ty)));
             }
             "fail" => {
                 let (ev, evt) = self.eval_expr_val(&args[0])?;

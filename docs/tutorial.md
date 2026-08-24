@@ -768,7 +768,6 @@ runs only under `grasm run`:
 | a `with` block inside `parallel`/`spawn` | install the handler around the `parallel` block instead |
 | a closure with parameters whose types nothing fixes | `let f = \|x\| x * 2` then `f(p.0)` where `p` is destructured by a `for` — annotate the binding, as in `let f: fn(i64) -> i64 = \|x\| x * 2` |
 | `fail` inside a *fallible* closure passed to `map`, `filter` or `fold` | `xs.map(\|x\| fail(e))` where the result is held as `[T ! E]` — produce `Err(e)` instead of failing, or pass a named function |
-| a `fold` seeded with an unannotated `map()` | `xs.fold(map(), add)` — annotate the seed: `let seed: Map[str, i64] = map()` |
 | polymorphic recursion | `fn f[T](x: T) -> i64 { f([x]) }` — one compiled copy per type, and the types never stop growing |
 
 Each of these is a defect being worked off, not a design boundary. The list is

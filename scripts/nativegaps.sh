@@ -222,7 +222,12 @@ fn main() -> () ! E {
     print("{v}")
 }'
 
-expect_refused "a fold seeded with an unannotated map()" 'fn add(acc: Map[str, i64], n: i64) -> Map[str, i64] {
+# Was a gap, and the cause was asymmetry rather than difficulty: an empty *list*
+# asked the checker what it had resolved the literal to and an empty *map* did
+# not, though the checker records both ([T-EMPTY-LIT]). So the seed arrived as a
+# map with unknown key and value, and the refusal said the seed and the function
+# differed when they were written identically.
+expect_compiles "a fold seeded with an unannotated map()" 'fn add(acc: Map[str, i64], n: i64) -> Map[str, i64] {
     var a = acc
     a.set("k", n)
     a
