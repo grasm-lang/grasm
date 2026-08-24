@@ -21,8 +21,17 @@ cargo test -p grasm_spec                 # specification conformance
 ./scripts/leakcheck.sh                   # no program leaks
 ./scripts/agreetest.sh                   # interpreter, bundle and native agree
 ./scripts/nativegaps.sh                  # the documented gap list matches the compiler
-./ProjectGold/run.sh                     # thirty-one whole programs, three engines
+./scripts/replaytest.sh                  # every journaled builtin refuses under an empty journal
+./scripts/wasmtest.sh                    # the browser build agrees, and still builds
+./scripts/gatecheck.sh                   # the gates themselves call helpers that exist
+./ProjectGold/run.sh                     # forty-four whole programs, three engines
 ```
+
+`gatecheck.sh` is there because of what it is named after. `nativegaps.sh`
+defines `expect_compiled`, eleven cases were written as `expect_compiles`, and
+bash reported each as a command not found on stderr and carried on — so the
+script reported success having run 28 of its 39 cases (F40). A gate that can
+silently skip a quarter of itself is worse than no gate, because it is believed.
 
 And the generators, which find what nobody thought to write down:
 

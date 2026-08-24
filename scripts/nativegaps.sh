@@ -107,7 +107,10 @@ expect_compiled() {
 #
 # So the count is checked against the source. A case that does not run is a
 # failure, whatever the reason.
-declared=$(grep -cE '^expect_(compiled|refused) "' "$0")
+# Any `expect_` line counts as declared, whatever it is spelt. A misspelt one
+# is then declared and never runs, and the totals disagree — which is the case
+# F40 was, and which a regex naming only the two real helpers cannot see.
+declared=$(grep -cE '^expect_[a-z_]* "' "$0")
 ran=0
 echo "checking the documented --native gaps ..."
 

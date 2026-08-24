@@ -1530,3 +1530,28 @@ named fn` — which is how the repair was verified.
 `scripts/leakcheck.sh` never sees them: every gap closed here was checked for
 agreement and not for whether it releases what it allocates. It runs them under
 `GRASM_LEAK_CHECK=1` now.
+
+### F40's sequel: a gate for the gates
+
+`scripts/gatecheck.sh` reads every gate script and fails when a line at column 0
+calls an identifier that is neither a function that script defines (or sources)
+nor a real command. That is exactly the shape F40 took, and it is the check that
+would have caught it the moment it was written.
+
+`command_not_found_handle` would do this at run time in one line. Bash 3.2 is
+what macOS ships and what these run under, and it does not have it — so the
+check is static.
+
+Two mutation tests, because a gate that cannot fail is the thing being guarded
+against here:
+
+* Reintroducing the misspelling gives `undefined: 1` and exit 1.
+* `nativegaps.sh` catches it independently now as well. Its own count compared
+  *declared* against *ran*, and a misspelt case is neither — so the totals
+  agreed and it passed. Counting any `expect_` line as declared is what makes a
+  misspelt one show up as declared-but-never-ran.
+
+The second point is the general one: **a coverage count that derives both of its
+numbers from the same assumption cannot detect a broken assumption.** The first
+version counted `expect_(compiled|refused)`, which is the set of things that
+work by construction.
