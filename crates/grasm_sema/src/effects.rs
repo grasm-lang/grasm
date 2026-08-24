@@ -26,51 +26,13 @@ pub const NET: &str = "net";
 /// program that can run `curl` has the network whether or not it declared
 /// `net`, and one that can run `rm` has the filesystem. Folding it into `io`
 /// would make every capability claim in the language weaker than it reads.
-pub const PROC: &str = "proc";
+pub use crate::builtins::PROC;
 
-/// The builtins that perform `proc`.
-const PROC_BUILTINS: &[&str] = &["proc_run", "proc_pipeline"];
-
-/// The builtins that perform `net`.
-const NET_BUILTINS: &[&str] = &[
-    "tcp_listen",
-    "tcp_connect",
-    "tcp_accept",
-    "tcp_read",
-    "tcp_read_bytes",
-    "tcp_write",
-    "tcp_write_bytes",
-    "net_close",
-    "net_wait",
-    "net_port",
-    "udp_bind",
-    "udp_send",
-    "udp_recv",
-];
-
-const IO_BUILTINS: &[&str] = &[
-    "print",
-    "eprint",
-    "read_file",
-    "write_file",
-    "file_exists",
-    "remove_file",
-    "make_dir",
-    "list_dir",
-    // Added late, and missing from this list until then. `read_bytes` and
-    // `write_bytes` arrived with [L-LIB-BYTES] beside `read_file` and
-    // `write_file`, and every other reader of this list was written before they
-    // existed — so a function declaring `/ {}` could read any file on the disk,
-    // and a package declaring `capabilities = []` could too. That is the
-    // property [T-CAPABILITY] exists to provide, so it was not a gap in the
-    // effect system but a hole straight through it (ProjectGold F35).
-    "read_bytes",
-    "write_bytes",
-    "input",
-    "args",
-    "now_millis",
-    "env",
-];
+/// Which builtins perform what is **not written here**. It is in
+/// `crate::builtins`, once, with the names — because it used to be written in
+/// both places and the two disagreed for as long as `bytes` had existed
+/// (ProjectGold F35). A list that can drift from another list will.
+use crate::builtins::performs;
 
 struct Ctx<'a> {
     /// qualified name (`mod::fn`) → decl
@@ -2548,13 +2510,13 @@ fn walk_expr(
         }
         Expr::Call { callee, args, .. } => {
             if let Expr::Ident(id) = &**callee {
-                if IO_BUILTINS.contains(&id.name.as_str()) && !active.iter().any(|a| a == IO) {
+                if performs(&id.name, IO) && !active.iter().any(|a| a == IO) {
                     out.insert(IO.to_string());
                 }
-                if NET_BUILTINS.contains(&id.name.as_str()) && !active.iter().any(|a| a == NET) {
+                if performs(&id.name, NET) && !active.iter().any(|a| a == NET) {
                     out.insert(NET.to_string());
                 }
-                if PROC_BUILTINS.contains(&id.name.as_str()) && !active.iter().any(|a| a == PROC) {
+                if performs(&id.name, PROC) && !active.iter().any(|a| a == PROC) {
                     out.insert(PROC.to_string());
                 }
                 // A C function's effects are unknowable, so it performs `io`.
@@ -2834,8 +2796,12 @@ fn site_expr(
     match e {
         Expr::Call { callee, args, span } => {
             if let Expr::Ident(id) = &**callee {
-                if IO_BUILTINS.contains(&id.name.as_str()) {
-                    out.push((IO.to_string(), *span));
+                // Every row, not just `io`. This recorded only `io` sites, so a
+                // package refused for performing `net` was told *that* and not
+                // *where* — the diagnostic lost its one actionable line. Same
+                // root cause as F35: a second place that knew about effects.
+                for effect in crate::builtins::row_of(&id.name) {
+                    out.push(((*effect).to_string(), *span));
                 }
                 if externs.contains(&id.name) {
                     out.push((IO.to_string(), *span));

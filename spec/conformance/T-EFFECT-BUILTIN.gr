@@ -40,6 +40,9 @@ fn every_world_touching_builtin(path: str) / {io} {
     match make_dir(path) { Ok(v) -> {}  Err(e) -> {} }
     match list_dir(path) { Ok(v) -> {}  Err(e) -> {} }
     let _e = file_exists(path)
+    // Never reached, so this does not wait for a line — the function is
+    // type-checked and not called, which is the whole technique.
+    let _l = input()
     let _i = now_millis()
     let _j = env(path)
     let _k = args()

@@ -3669,3 +3669,82 @@ fn builtins_do_not_take_names_a_program_would_want() {
 own functions, and reserving one is permanent: {taken:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The builtin table is the only place a builtin's row is written down
+// ---------------------------------------------------------------------------
+//
+// `read_bytes` and `write_bytes` were in the checker's list of builtins and not
+// in the effect system's, so a function declaring `/ {}` could read any file on
+// the disk and a package declaring `capabilities = []` could too — for as long
+// as `bytes` had existed (ProjectGold F35). Two hand-maintained lists, and no
+// test could see the difference because each test was written against one of
+// them.
+//
+// These three make the second list impossible.
+
+#[test]
+fn builtin_names_agree_with_the_table() {
+    use std::collections::BTreeSet;
+    let listed: BTreeSet<&str> = grasm_sema::check::BUILTIN_FREE_FNS.iter().copied().collect();
+    let tabled: BTreeSet<&str> = grasm_sema::builtins::BUILTINS.iter().map(|b| b.name).collect();
+
+    let missing_row: Vec<&&str> = listed.difference(&tabled).collect();
+    assert!(
+        missing_row.is_empty(),
+        "these builtins have no row in crate::builtins, so nothing charges them \
+         an effect — which is exactly how F35 happened:\n  {missing_row:?}"
+    );
+    let missing_name: Vec<&&str> = tabled.difference(&listed).collect();
+    assert!(
+        missing_name.is_empty(),
+        "these have a row but are not builtins the checker knows:\n  {missing_name:?}"
+    );
+}
+
+#[test]
+fn every_builtin_that_reaches_the_world_is_charged() {
+    // A builtin whose name says it touches something, with an empty row, is
+    // either a mistake or a decision — and a decision belongs in the table's
+    // comment rather than in nobody's head.
+    let suspicious = [
+        "read", "write", "file", "dir", "tcp", "udp", "net", "proc", "env",
+        "now", "input", "print", "args",
+    ];
+    for b in grasm_sema::builtins::BUILTINS {
+        if b.row.is_empty() && suspicious.iter().any(|s| b.name.contains(s)) {
+            panic!(
+                "`{}` reaches outside the program by its name and has an empty \
+                 effect row. If that is deliberate, say why in the table.",
+                b.name
+            );
+        }
+    }
+}
+
+#[test]
+fn every_effectful_builtin_is_named_in_conformance() {
+    // T-EFFECT-BUILTIN.gr names each one inside a function declaring its row.
+    // Those functions never run: naming a builtin in a row that declares the
+    // effect is what makes the checker charge it, so a builtin that stopped
+    // being charged would make that file fail to compile.
+    //
+    // Which means this test's job is only to notice a builtin that was added to
+    // the table and never named there.
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../spec/conformance/T-EFFECT-BUILTIN.gr");
+    let src = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let mut absent = Vec::new();
+    for b in grasm_sema::builtins::effectful() {
+        if !src.contains(b.name) {
+            absent.push(b.name);
+        }
+    }
+    assert!(
+        absent.is_empty(),
+        "these builtins perform an effect and are not named in \
+         spec/conformance/T-EFFECT-BUILTIN.gr, so nothing would notice if they \
+         stopped being charged:\n  {absent:?}"
+    );
+}
