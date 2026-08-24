@@ -1330,3 +1330,55 @@ agreetest exit = 1
 The lesson is not about wasm. It is that a gate reporting a number is making a
 claim about *the code as it stands*, and reading an artefact it did not build
 is the one way to make that claim without checking it.
+
+## F37 — a recorded `()` came back as `0` on another engine (S1, replay) — **fixed**
+
+The compiled runtime answered `write_file`, `write_bytes`, `make_dir`,
+`remove_file` and both socket writes with `Ok(0)`, where the interpreter answers
+`Ok(())`.
+
+No direct run could tell those apart. The static type is `()`, and a compiled
+build prints unit from the type rather than from the value — so the shortcut had
+been correct for as long as the value never left the engine that made it.
+
+The journal is exactly a value leaving the engine that made it:
+
+```
+$ GRASM_RECORD=j ./program      # native
+()
+[(), ()]
+$ GRASM_REPLAY=j grasm run p    # the interpreter, given that recording
+0
+[0, 0]
+```
+
+An engine disagreement, and so S1 — scoped to replay, because nothing else could
+observe it.
+
+`RtPayload::Unit` already existed for precisely this, and its own doc comment
+names the same bug in a different place: *"boxing it as `I64(0)` made `[(), ()]`
+print `[0, 0]` under a compiled build"*. Six call sites had not been converted.
+They are now.
+
+### The gate that would have caught it
+
+`scripts/replaytest.sh` checked that every builtin's hook was still there. It did
+not check that the value coming back through the journal was the value that went
+in — because every program it ran printed `y` or `n` rather than what it got.
+
+It now records one program that **prints the values**, including a bare unit and
+a list of them, and replays it on all three engines that can replay, requiring
+byte-identical output. Confirmed by putting `I64(0)` back:
+
+```
+2c2
+< ()
+---
+> 0
+journaled: 28   unhooked: 2
+a native recording replayed elsewhere: DIFFERS under interp, wasm
+```
+
+The shape of the miss is worth keeping: a test that asserts *a call happened*
+will not notice that *the wrong value came back*. Both gates were needed, and
+the first one existing is what made the second easy to forget.

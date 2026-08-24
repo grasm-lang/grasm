@@ -231,6 +231,76 @@ impl Wire {
     }
 }
 
+impl Wire {
+    /// One line of it, for a person reading a recording.
+    ///
+    /// Long payloads are cut and say how much was cut, because the whole point
+    /// of looking at a journal is usually to see *which* call went wrong, and a
+    /// recorded file of half a megabyte would bury the other twenty.
+    pub fn render(&self, budget: usize) -> String {
+        match self {
+            Wire::Unit => "()".to_string(),
+            Wire::Int(v) => v.to_string(),
+            Wire::Float(v) => format!("{v}"),
+            Wire::Bool(v) => v.to_string(),
+            Wire::Str(s) => quoted(s, budget),
+            Wire::Bytes(b) => {
+                let shown = b.len().min(budget / 3);
+                let hex: Vec<String> = b[..shown].iter().map(|x| format!("{x:02x}")).collect();
+                let tail = if shown < b.len() {
+                    format!(" … {} more", b.len() - shown)
+                } else {
+                    String::new()
+                };
+                format!("{} byte(s) {}{}", b.len(), hex.join(" "), tail)
+            }
+            Wire::List(items) => bracketed(items, budget, '[', ']'),
+            Wire::Tuple(items) => bracketed(items, budget, '(', ')'),
+            Wire::Variant { name, fields, .. } if fields.is_empty() => name.clone(),
+            Wire::Variant { name, fields, .. } => {
+                let inner: Vec<String> = fields
+                    .iter()
+                    .map(|f| f.render(budget.saturating_sub(name.len() + 2)))
+                    .collect();
+                format!("{name}({})", inner.join(", "))
+            }
+        }
+    }
+}
+
+fn quoted(s: &str, budget: usize) -> String {
+    let mut out = String::from("\"");
+    for (n, c) in s.chars().enumerate() {
+        if n >= budget {
+            let left = s.chars().count() - n;
+            return format!("{out}\" … {left} more char(s)");
+        }
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '"' => out.push_str("\\\""),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn bracketed(items: &[Wire], budget: usize, open: char, close: char) -> String {
+    // Two elements and a count, rather than a hundred names on one line: a
+    // `list_dir` of a large directory is exactly what a recording holds.
+    let shown = items.len().min(3);
+    let mut parts: Vec<String> = items[..shown]
+        .iter()
+        .map(|i| i.render(budget / 3))
+        .collect();
+    if shown < items.len() {
+        parts.push(format!("… {} more", items.len() - shown));
+    }
+    format!("{open}{}{close}", parts.join(", "))
+}
+
 enum Mode {
     Off,
     Recording(std::fs::File),
@@ -268,6 +338,12 @@ fn open() -> Mode {
         };
     }
     Mode::Off
+}
+
+/// Reads a journal from disk. Public so a person can be shown what a recording
+/// holds — a file of framed bytes is evidence nobody can examine.
+pub fn read(path: &std::ffi::OsStr) -> Result<Vec<(String, Wire)>, String> {
+    read_journal(path)
 }
 
 fn read_journal(path: &std::ffi::OsStr) -> Result<Vec<(String, Wire)>, String> {

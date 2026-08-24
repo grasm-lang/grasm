@@ -7,6 +7,23 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
 
 ### Fixed
 
+- **A recorded `()` came back as `0` on another engine** (F37). The compiled
+  runtime answered `write_file`, `write_bytes`, `make_dir`, `remove_file` and
+  both socket writes with `Ok(0)` where the interpreter answers `Ok(())`. No
+  direct run could tell them apart — the static type is `()`, and a compiled
+  build prints unit from the type rather than from the value — but a journal is
+  exactly a value leaving the engine that made it, and a cross-engine replay
+  printed `0` and `[0, 0]`. `RtPayload::Unit` already existed for this; six call
+  sites had not been converted.
+- **Every gate now builds what it tests** (F36). `scripts/wasmtest.sh` read a
+  prebuilt wasm module it never built, so when the wasm target stopped
+  compiling it went on reporting `identical: 182` against a module from the
+  previous week — for two full runs. The audit that followed found the same
+  shape in all nine gates: each opened `./target/release/grasm` without
+  building it. A gate reporting a number is making a claim about the code as it
+  stands, and reading an artefact it did not build is the one way to make that
+  claim without checking it.
+
 - **`grasm check` no longer takes exponential time on a chain of method calls**
   either. The same defect as the field chain, one path over: a method call
   infers its receiver to resolve the method, and `check_fn_call` then checks
@@ -143,6 +160,35 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   *bigger* by blocking the inlining link-time optimisation needs.
 
 ### Added
+
+- **Record a run, and replay it.** `GRASM_RECORD=j ./prog` writes a journal of
+  everything the program read from outside itself; `GRASM_REPLAY=j` makes a
+  later run take its answers from that journal and reach outside itself for
+  **nothing** — not the reads and not the writes. Record a program that writes
+  a file, delete the file, replay: identical output, and the file stays
+  deleted. `print` and `eprint` are the deliberate exception, because a replay
+  whose output you cannot see is not worth running.
+
+  All **28** journaled builtins on **all four engines** — the whole `io`, `net`
+  and `proc` surface. A recording made by the native build replays
+  byte-identically under `grasm run` *and inside a wasm module that has no
+  sockets, no processes and no filesystem*, TCP session and child process
+  included. That is the case that matters: the failure happens in the fast
+  engine and the debugger is in the other one.
+
+  The effect system is what makes it cheap. Knowing which calls are
+  non-deterministic is normally the hard part of building such a tool; here it
+  was already written down, and `crates/grasm_sema/src/builtins.rs` says for
+  each builtin what a replay owes it. A builtin with an effect row that says
+  nothing about replay fails `cargo test`.
+
+  Divergence is refused rather than guessed: a run that takes a different path
+  from the recording stops with exit 7 and names the call that disagreed.
+
+- **`grasm journal <file>`** prints a recording back out — every call in order,
+  what it answered, and a tally of which builtins were reached. A journal is a
+  file of framed bytes, and evidence nobody can examine is not evidence.
+  `--full` stops truncating long payloads.
 
 - **A range answers the list combinators** — `to_list`, `map`, `filter`, `sum`,
   `len` ([L-LIB-RANGE-OPS]). Building a list from a count needed

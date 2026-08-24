@@ -5383,7 +5383,12 @@ unsafe fn grasm_tcp_write_bytes_now(
         )),
     });
     match wrote {
-        Ok(()) => ok_of(alloc(RtPayload::I64(0))),
+        // `Unit`, not `I64(0)`. The two are indistinguishable to a compiled
+        // build — the static type is `()` and the backend prints it from the
+        // type rather than the value — but they are not indistinguishable once
+        // the value is written to a journal and handed to another engine, which
+        // printed `0` where every direct run prints `()` (F37).
+        Ok(()) => ok_of(alloc(RtPayload::Unit)),
         Err(e) => err_of(io_err("IoFailed", e)),
     }
 }
@@ -5414,7 +5419,12 @@ unsafe fn grasm_tcp_write_now(handle: *mut RtVal, data: *mut RtVal) -> *mut RtVa
         )),
     });
     match wrote {
-        Ok(()) => ok_of(alloc(RtPayload::I64(0))),
+        // `Unit`, not `I64(0)`. The two are indistinguishable to a compiled
+        // build — the static type is `()` and the backend prints it from the
+        // type rather than the value — but they are not indistinguishable once
+        // the value is written to a journal and handed to another engine, which
+        // printed `0` where every direct run prints `()` (F37).
+        Ok(()) => ok_of(alloc(RtPayload::Unit)),
         Err(e) => err_of(io_err("IoFailed", e)),
     }
 }
@@ -5818,7 +5828,12 @@ unsafe fn grasm_write_file_now(path: *mut RtVal, content: *mut RtVal) -> *mut Rt
     let p = as_str(path).to_string();
     let c = as_str(content).to_string();
     match std::fs::write(&p, c) {
-        Ok(()) => ok_of(alloc(RtPayload::I64(0))),
+        // `Unit`, not `I64(0)`. The two are indistinguishable to a compiled
+        // build — the static type is `()` and the backend prints it from the
+        // type rather than the value — but they are not indistinguishable once
+        // the value is written to a journal and handed to another engine, which
+        // printed `0` where every direct run prints `()` (F37).
+        Ok(()) => ok_of(alloc(RtPayload::Unit)),
         Err(e) => err_of(io_err("IoFailed", e.to_string())),
     }
 }
@@ -5969,7 +5984,12 @@ pub unsafe extern "C" fn grasm_write_bytes(path: *mut RtVal, data: *mut RtVal) -
 unsafe fn grasm_write_bytes_now(path: *mut RtVal, data: *mut RtVal) -> *mut RtVal {
     let p = as_str(path).to_string();
     match std::fs::write(&p, as_bytes(data).as_slice()) {
-        Ok(()) => ok_of(alloc(RtPayload::I64(0))),
+        // `Unit`, not `I64(0)`. The two are indistinguishable to a compiled
+        // build — the static type is `()` and the backend prints it from the
+        // type rather than the value — but they are not indistinguishable once
+        // the value is written to a journal and handed to another engine, which
+        // printed `0` where every direct run prints `()` (F37).
+        Ok(()) => ok_of(alloc(RtPayload::Unit)),
         Err(e) => err_of(io_err("IoFailed", e.to_string())),
     }
 }
@@ -5984,7 +6004,12 @@ pub unsafe extern "C" fn grasm_make_dir(path: *mut RtVal) -> *mut RtVal {
 
 unsafe fn grasm_make_dir_now(path: *mut RtVal) -> *mut RtVal {
     match std::fs::create_dir_all(as_str(path)) {
-        Ok(()) => ok_of(alloc(RtPayload::I64(0))),
+        // `Unit`, not `I64(0)`. The two are indistinguishable to a compiled
+        // build — the static type is `()` and the backend prints it from the
+        // type rather than the value — but they are not indistinguishable once
+        // the value is written to a journal and handed to another engine, which
+        // printed `0` where every direct run prints `()` (F37).
+        Ok(()) => ok_of(alloc(RtPayload::Unit)),
         Err(e) => err_of(io_err("IoFailed", e.to_string())),
     }
 }
@@ -5998,7 +6023,12 @@ pub unsafe extern "C" fn grasm_remove_file(path: *mut RtVal) -> *mut RtVal {
 unsafe fn grasm_remove_file_now(path: *mut RtVal) -> *mut RtVal {
     let p = as_str(path).to_string();
     match std::fs::remove_file(&p) {
-        Ok(()) => ok_of(alloc(RtPayload::I64(0))),
+        // `Unit`, not `I64(0)`. The two are indistinguishable to a compiled
+        // build — the static type is `()` and the backend prints it from the
+        // type rather than the value — but they are not indistinguishable once
+        // the value is written to a journal and handed to another engine, which
+        // printed `0` where every direct run prints `()` (F37).
+        Ok(()) => ok_of(alloc(RtPayload::Unit)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => err_of(io_err("NotFound", p)),
         Err(e) => err_of(io_err("IoFailed", e.to_string())),
     }

@@ -109,6 +109,7 @@ fn run() -> ExitCode {
             "doc" => (&[], &["-o"]),
             "api" => (&[], &["--against"]),
             "fmt" => (&["--check"], &[]),
+            "journal" => (&["--full"], &[]),
             "deps" => (&["--locked"], &[]),
             "publish" => (&[], &["--registry"]),
             "add" => (&[], &["--registry"]),
@@ -709,6 +710,60 @@ fn run() -> ExitCode {
                 }
             }
         }
+        // A journal is a file of framed bytes, and evidence nobody can read is
+        // not evidence. This is the only way to answer "what did the program
+        // actually see?" without running it again — which is the one thing a
+        // recording exists so you do not have to do.
+        Some("journal") => {
+            let Some(path) = args.get(1).filter(|a| !a.starts_with("--")) else {
+                eprintln!("usage: grasm journal <file> [--full]");
+                return ExitCode::FAILURE;
+            };
+            // `--full` is opt-in rather than the default because the common
+            // reason to open a recording is to find which call went wrong, and
+            // one `read_bytes` of a large file would bury the other twenty.
+            let budget = if args.iter().any(|a| a == "--full") { usize::MAX } else { 48 };
+            let records = match grasm_journal::read(std::ffi::OsStr::new(path.as_str())) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("grasm: cannot read {path}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            println!("{path} — {} record(s), {bytes} bytes", records.len());
+            if records.is_empty() {
+                println!();
+                println!("The program read nothing from outside itself.");
+                return ExitCode::SUCCESS;
+            }
+            let width = records.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
+            let places = records.len().to_string().len();
+            println!();
+            for (i, (name, value)) in records.iter().enumerate() {
+                println!(
+                    "  {:>places$}  {name:<width$}  {}",
+                    i + 1,
+                    value.render(budget)
+                );
+            }
+            // Which builtins, and how often. A recording with four hundred
+            // `now_millis` calls in it is telling you something about the
+            // program before you read a single value.
+            let mut tally: std::collections::BTreeMap<&str, usize> = Default::default();
+            for (name, _) in &records {
+                *tally.entry(name.as_str()).or_default() += 1;
+            }
+            println!();
+            let summary: Vec<String> = tally.iter().map(|(n, c)| format!("{n} {c}")).collect();
+            println!(
+                "  {} call(s) across {} builtin(s): {}",
+                records.len(),
+                tally.len(),
+                summary.join(", ")
+            );
+            ExitCode::SUCCESS
+        }
         Some("tokens") => {
             let Some(path) = args.get(1) else {
                 eprintln!("usage: grasm tokens <file.gr>");
@@ -784,6 +839,7 @@ fn run() -> ExitCode {
             eprintln!("  publish [dir]                copy a package into a registry (versions are immutable)");
             eprintln!("      --registry <dir>         registry root (else GRASM_REGISTRY, else .grasm/registry)");
             eprintln!("  add <name> <version> [dir]   add a registry dependency to grasm.toml");
+            eprintln!("  journal <file> [--full]      what a recorded run read from outside itself");
             eprintln!("  tokens <file.gr>             dump lexer output (debug)");
             eprintln!("  version                      print version");
             if asked {

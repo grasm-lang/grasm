@@ -617,6 +617,13 @@ to write a journal to — but a recording made by the native build replays insid
 a wasm module byte-identically, TCP socket and child process included, in a
 module that has neither. `scripts/replaytest.sh` runs that comparison every time.
 
+And `grasm journal <file>` prints a recording back out — every call in order and
+what it answered. That is not a convenience: a journal is a file of framed bytes,
+and evidence nobody can examine is not evidence. It is also what found **F37**,
+where the compiled runtime answered `write_file` with `Ok(0)` and the interpreter
+with `Ok(())` — a difference no direct run could see, because a compiled build
+prints unit from the *type*, and one that a cross-engine replay printed as `0`.
+
 What is left: **recording** in a browser, and **worker threads**, because the
 journal is per-thread. `par_map` and `par_filter`
 refuse an effectful function, so no program that exists can reach the second one

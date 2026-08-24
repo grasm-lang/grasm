@@ -77,6 +77,37 @@ nothing of the machine it read it from.
 
 `scripts/replaytest.sh` runs exactly that comparison on every invocation.
 
+## Reading a recording
+
+```
+$ grasm journal j
+j — 13 record(s), 598 bytes
+
+   1  now_millis    1787562277933
+   2  random_bytes  Ok(3 byte(s) 2a 5e 25)
+   3  proc_run      Ok((0, "hi from a chil" … 2 more char(s), ""))
+   4  tcp_listen    Ok(0)
+   5  net_port      Ok(59989)
+   6  tcp_connect   Ok(1)
+   7  tcp_accept    Ok(2)
+   8  tcp_write     Ok(())
+   9  tcp_read      Ok("ping\n")
+  10  net_close     ()
+  ...
+  13  list_dir      Ok(["a.txt", "bun", "bundle.txt", … 6 more])
+
+  13 call(s) across 11 builtin(s): list_dir 1, net_close 3, net_port 1, ...
+```
+
+A file of framed bytes is evidence nobody can examine. This is the only way to
+answer *what did the program actually see?* without running it again — which is
+the one thing a recording exists so you do not have to do.
+
+Long payloads are cut and say how much was cut; `--full` prints all of it. The
+tally at the end is worth reading on its own: a recording with four hundred
+`now_millis` calls is telling you something about the program before you read a
+single value.
+
 ## What is not covered
 
 **Recording in the browser.** Only replaying. A journal is written to a file

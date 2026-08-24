@@ -9,6 +9,8 @@ name = "grasm"
 path = "src/main.rs"
 
 [dependencies]
+# For `grasm journal` — reading a recording back out.
+grasm_journal = { path = "../grasm_journal" }
 grasm_syntax = { path = "../grasm_syntax" }
 grasm_sema = { path = "../grasm_sema" }
 grasm_interp = { path = "../grasm_interp" }

@@ -81,16 +81,25 @@ for n in $NAMES; do
   fi
 done
 
-# And once end to end on the browser engine, which has no filesystem, no
-# sockets and no processes — so a recording of all three replaying there is the
-# clearest statement of what a journal is: everything the program read, and
-# nothing of the machine it read it from.
-wasm_note="skipped (no module or no node)"
-WASM=${WASM:-./target/wasm32-unknown-unknown/release/grasm_wasm.wasm}
-if [ -f "$WASM" ] && command -v node >/dev/null 2>&1; then
-  cat > "$WORK/cross.gr" <<'EOF'
+# And once end to end, on every engine, with the *values* on the page.
+#
+# The per-builtin checks above prove a hook exists; they do not prove the value
+# that came back through the journal is the value that went in. It was not once:
+# the compiled runtime answered `write_file` with `Ok(0)` where the interpreter
+# answers `Ok(())`, which no direct run could tell apart — the static type is
+# `()` and a compiled build prints it from the type — and which printed `0`
+# under a cross-engine replay (F37). So this program prints what it got.
+cat > "$WORK/cross.gr" <<'EOF'
 fn main() / {io, proc} {
   print("clock " + now_millis().to_str())
+  match write_file("/tmp/grasm-replay-cross.txt", "x") {
+    Ok(u) -> print(u)
+    Err(e) -> print("write failed")
+  }
+  match random_bytes(2) {
+    Ok(b) -> print(b.len().to_str())
+    Err(e) -> print("no entropy")
+  }
   match proc_run("echo", ["a child"]) {
     Ok(r) -> print("child: " + r.1.trim())
     Err(e) -> print("no child")
@@ -99,24 +108,43 @@ fn main() / {io, proc} {
     Ok(n) -> print("listed")
     Err(e) -> print("no listing")
   }
+  match make_dir("/tmp/grasm-replay-cross-dir") {
+    Ok(u) -> print([u, u])
+    Err(e) -> print("no dir")
+  }
 }
 EOF
-  if "$GRASM" build --native "$WORK/cross.gr" -o "$WORK/cross" >/dev/null 2>&1; then
-    GRASM_RECORD="$WORK/cross.jrnl" "$WORK/cross" > "$WORK/cross.native" 2>&1
+WASM=${WASM:-./target/wasm32-unknown-unknown/release/grasm_wasm.wasm}
+cross="skipped (native build unavailable)"
+if "$GRASM" build --native "$WORK/cross.gr" -o "$WORK/cross" >/dev/null 2>&1; then
+  GRASM_RECORD="$WORK/cross.jrnl" "$WORK/cross" > "$WORK/cross.native" 2>&1
+  GRASM_REPLAY="$WORK/cross.jrnl" "$WORK/cross" > "$WORK/r.native" 2>&1
+  GRASM_REPLAY="$WORK/cross.jrnl" "$GRASM" run "$WORK/cross.gr" > "$WORK/r.interp" 2>&1
+  if [ -f "$WASM" ] && command -v node >/dev/null 2>&1; then
     node scripts/wasm/run.mjs "$WASM" "$WORK/cross.gr" --journal "$WORK/cross.jrnl" \
-      > "$WORK/cross.wasm" 2>&1
-    if [ -s "$WORK/cross.native" ] && diff -q "$WORK/cross.native" "$WORK/cross.wasm" >/dev/null; then
-      wasm_note="identical"
-    else
-      wasm_note="DIFFERS"
-      diff "$WORK/cross.native" "$WORK/cross.wasm"
+      > "$WORK/r.wasm" 2>&1
+  else
+    cp "$WORK/cross.native" "$WORK/r.wasm"
+    echo "  note: the browser engine was not checked (no module, or no node)"
+  fi
+  cross="identical on every engine"
+  for who in native interp wasm; do
+    if ! diff -q "$WORK/cross.native" "$WORK/r.$who" >/dev/null 2>&1; then
+      echo "  a recorded value changed shape replaying under $who:"
+      diff "$WORK/cross.native" "$WORK/r.$who"
+      case "$cross" in
+        identical*) cross="DIFFERS under $who" ;;
+        *) cross="$cross, $who" ;;
+      esac
       unhooked=$((unhooked+1))
     fi
-  fi
+  done
+  rm -f /tmp/grasm-replay-cross.txt
+  rmdir /tmp/grasm-replay-cross-dir 2>/dev/null
 fi
 
 echo "=========================================="
 echo "journaled: $hooked   unhooked: $unhooked   no test program: $unwritten"
-echo "a native recording replayed in the browser engine: $wasm_note"
+echo "a native recording replayed elsewhere: $cross"
 echo "=========================================="
 [ "$unhooked" = 0 ] && [ "$unwritten" = 0 ]

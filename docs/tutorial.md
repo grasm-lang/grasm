@@ -687,6 +687,63 @@ that keeps its signature and starts returning something else is a `PATCH` here
 and a disaster for you. Deciding that automatically is undecidable, and a tool
 that claimed to would be worse than one that says where it stops.
 
+## 10c. Making a failure happen twice
+
+A program is a function of its code and everything it read from outside itself.
+The code is in the binary; the rest can be written down:
+
+```text
+$ GRASM_RECORD=j ./server          # the run that went wrong
+$ GRASM_REPLAY=j grasm run src/main.gr
+```
+
+The second run does not read the clock, the disk, the network or the
+environment. It takes every answer from `j` — so it behaves the same on your
+laptop as it did on the machine that failed, as many times as you need, under a
+debugger.
+
+It also does not *write*. Replaying a `write_file` to reproduce a bug would
+damage a disk. `print` is the deliberate exception: a replay whose output you
+cannot see is not worth running.
+
+`grasm journal` shows what was recorded:
+
+```text
+$ grasm journal j
+j — 5 record(s), 264 bytes
+
+  1  now_millis  1787564958324
+  2  env         Some("/home/dev")
+  3  read_file   Ok("port = 8080\n")
+  4  tcp_listen  Err(IoFailed("Permission denied (os error 13)"))
+  5  now_millis  1787564958324
+
+  5 call(s) across 4 builtin(s): env 1, now_millis 2, read_file 1, tcp_listen 1
+```
+
+**Why this is cheap here and expensive elsewhere.** Knowing which calls are
+non-deterministic is normally the hard part of building a record-and-replay
+tool. In Grasm it was already written down: a function that reaches outside the
+program declares an effect (§5), and one that does not *cannot*. The journal is
+"every call with a row, in order, and what it answered".
+
+**Divergence is refused, not guessed.** If the program takes a different path
+from the recorded one, the run stops and says which call disagreed:
+
+```text
+grasm: at call 3 the recording says `read_file` and this run asked for
+`env` — the program has taken a different path from the one recorded, so
+this is not a replay of it
+```
+
+Handing back the next record anyway would produce something that looks like a
+replay and is not, and a tool whose whole promise is *this is what happened*
+must not be able to lie about it.
+
+A recording is portable between engines, which is the case that matters: the
+failure happens in the compiled build and the debugger is in `grasm run`. It
+even replays in a browser tab — see [replay.md](replay.md).
+
 ## 11. What `--native` will not compile yet
 
 `grasm run` and `grasm build --native` are two implementations of one
@@ -730,4 +787,6 @@ starts compiling, this table is what has to change.
 - `examples/` — runnable programs, including `stdlib_tour.gr` and
   `testing_tour.gr`.
 - `projects/` — twelve larger programs, beginner through advanced.
+- `docs/replay.md` — recording a run and replaying it, in full.
+- `docs/wasm.md` — running a Grasm program in a browser tab.
 - `MASTERPLAN.md` — where the language is going and why.
