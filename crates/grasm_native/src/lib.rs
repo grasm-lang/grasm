@@ -1022,6 +1022,21 @@ impl<'m> Codegen<'m> {
     }
 
     fn collect_types(&mut self, module_ast: &AstModule) -> CResult<()> {
+        // The prelude's `IoError`, read from the checker's own table rather
+        // than copied. Nobody declares it in source, so nothing else here would
+        // ever register it — and matching its variants was a build-time
+        // refusal for that reason alone, in a language where every `io` call
+        // hands one back.
+        if !self.sums.contains_key("IoError") {
+            let mut vs = Vec::new();
+            for (name, _) in grasm_sema::types::IO_ERROR_VARIANTS {
+                self.variant_index
+                    .insert((*name).to_string(), ("IoError".to_string(), 1));
+                vs.push(((*name).to_string(), vec![VType::Str]));
+            }
+            self.sums.insert("IoError".to_string(), vs);
+        }
+
         // Pass 0: type declarations (structs + sums; aliases unsupported).
         for decl in &module_ast.decls {
             if let Decl::Type(t) = decl {

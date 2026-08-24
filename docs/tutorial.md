@@ -766,7 +766,6 @@ runs only under `grasm run`:
 | calling a function value through anything but a name | `TABLE[0](21)`, `(m.get(k) ?? d)(x)` — bind it with `let` first, then call it |
 | a UFCS call of a *generic* free function | `[1, 2].describe()` for `fn describe[T](xs: [T])` — write `describe([1, 2])` |
 | an effect handler as a **struct field** type | `type Box = { h: CfgHandler }` — bind the handler with `let` instead |
-| matching the prelude `IoError`'s variants | `match e { NotFound(p) -> … }` — [L-LIB-IO]'s way of reading *why* a read failed; compare `e` as a whole, or use `??`, until this compiles |
 | an effect handler as a **parameter** type | `fn run(h: LogHandler) { with Log handled_by h { … } }` — the shape [E-HANDLER-OWN-ROW] documents; install the handler at the call site instead |
 | a generic instantiated at a handler type | `f(h)` for `fn f[T](x: T)` — pass what the handler computes instead |
 | a handler used as a *value* | `print("{h}")`, or storing one — install it with `with … handled_by` instead |

@@ -97,6 +97,17 @@ pub struct TypeDefs {
     pub io_error_id: TypeDefId,
 }
 
+/// The prelude's `IoError`, once, so that every engine reads the same list.
+///
+/// The native backend used to have no declaration for it at all — `IoError` is
+/// not in anyone's source, so nothing put it in the backend's table — and
+/// matching its variants was a build-time refusal. Copying the list into the
+/// backend would have fixed that program and left the next divergence to
+/// whoever adds a third variant.
+///
+/// Every field is `str`; if that stops being true this becomes a list of pairs.
+pub const IO_ERROR_VARIANTS: &[(&str, &str)] = &[("NotFound", "path"), ("IoFailed", "msg")];
+
 impl TypeDefs {
     pub fn new() -> Self {
         let mut td = TypeDefs {
@@ -127,16 +138,13 @@ impl TypeDefs {
             name: "IoError".into(),
             generics: vec![],
             kind: TypeDefKind::Sum {
-                variants: vec![
-                    Variant {
-                        name: "NotFound".into(),
-                        fields: vec![("path".into(), Type::Str)],
-                    },
-                    Variant {
-                        name: "IoFailed".into(),
-                        fields: vec![("msg".into(), Type::Str)],
-                    },
-                ],
+                variants: IO_ERROR_VARIANTS
+                    .iter()
+                    .map(|(name, field)| Variant {
+                        name: (*name).into(),
+                        fields: vec![((*field).into(), Type::Str)],
+                    })
+                    .collect(),
             },
         });
         td

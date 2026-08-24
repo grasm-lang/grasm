@@ -29,9 +29,13 @@ fn concurrent() / {async} {
 // silently permitting it.
 fn every_world_touching_builtin(path: str) / {io} {
     // Answers discarded with `match` rather than held as annotated `! IoError`
-    // values: what matters is that naming them charges `io`, and the native
-    // backend does not yet take `IoError` as a binding's declared type — so the
-    // annotated form would have made this program run on two engines of three.
+    // values: what matters here is that naming a builtin charges `io`, and
+    // `match` says that with the least around it.
+    //
+    // It was once also a necessity — the native backend had no declaration for
+    // the prelude's `IoError` and refused the annotated form — and that is no
+    // longer true. Left as it is because the shape is right, not because it has
+    // to be.
     match read_file(path) { Ok(v) -> {}  Err(e) -> {} }
     match write_file(path, "") { Ok(v) -> {}  Err(e) -> {} }
     match read_bytes(path) { Ok(v) -> {}  Err(e) -> {} }

@@ -1382,3 +1382,44 @@ a native recording replayed elsewhere: DIFFERS under interp, wasm
 The shape of the miss is worth keeping: a test that asserts *a call happened*
 will not notice that *the wrong value came back*. Both gates were needed, and
 the first one existing is what made the second easy to forget.
+
+## F38 — the native backend had no declaration for `IoError` (S3, over-strict) — **fixed**
+
+```
+error: native backend does not yet support the sum type `IoError`
+```
+
+for this, which is the ordinary way to read *why* a file could not be read:
+
+```
+match read_file(path) {
+    Ok(s) -> ...
+    Err(e) -> match e {
+        NotFound(p) -> ...
+        IoFailed(m) -> ...
+    }
+}
+```
+
+The cause is small and the shape of it is not. `IoError` is in the **prelude** —
+nobody declares it in source — and the backend filled its type table by walking
+the declarations in each module. So there was never anything to find, and every
+program that wanted to tell a missing file from a broken one was refused at
+build time, in a language where every `io` call hands one of these back.
+
+It cost twice in one session before anyone looked at it: a ProjectGold project
+was restructured around it, and a conformance program carried a comment
+explaining why it could not write the annotated form.
+
+### Read from the checker's table, not copied into a second one
+
+`grasm_sema::types::IO_ERROR_VARIANTS` is now the list, and both the checker's
+prelude and the backend's type table are built from it. Copying it into the
+backend would have fixed this program and left the next divergence to whoever
+adds a third variant — the same reasoning as `builtins.rs` in **F35**.
+
+Two gaps closed for one fix: `let r: str ! IoError = read_file(p)` — the
+annotated binding — compiles now too, for the same reason it did not before.
+
+Three engines agree on both variants, on a hand-built `NotFound("...")`, and on
+the `_` wildcard arm.

@@ -7,6 +7,14 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
 
 ### Fixed
 
+- **`--native` compiles a match on `IoError`'s variants** (F38). `IoError` is in
+  the prelude — nobody declares it in source — and the backend built its type
+  table by walking each module's declarations, so there was never anything to
+  find. Telling a missing file from a broken one was a build-time refusal, in a
+  language where every `io` call hands one of these back. The variant list is
+  now read from the checker's own table rather than copied, so a third variant
+  cannot make the two disagree again. Two gaps for one fix: `let r: str !
+  IoError = read_file(p)` compiles too.
 - **A recorded `()` came back as `0` on another engine** (F37). The compiled
   runtime answered `write_file`, `write_bytes`, `make_dir`, `remove_file` and
   both socket writes with `Ok(0)` where the interpreter answers `Ok(())`. No

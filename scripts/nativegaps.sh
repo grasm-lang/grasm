@@ -146,7 +146,11 @@ fn main() {
     }
 }'
 
-expect_refused "matching the prelude IoError's variants" 'fn main() {
+# Was a gap, and the reason it was one is worth keeping: `IoError` is in
+# nobody's source, so nothing registered it in the backend's type table, and
+# every program that wanted to tell NotFound from IoFailed was refused. The
+# backend now reads the variant list from the checker's own table.
+expect_compiles "matching the prelude IoError's variants" 'fn main() {
     match read_file("/no/such/file") {
         Ok(s) -> print("{s.len()}")
         Err(e) -> match e {
