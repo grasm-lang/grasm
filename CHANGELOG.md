@@ -7,6 +7,21 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
 
 ### Fixed
 
+- **`--native` compiles a call through a callee that is not a name.**
+  `TABLE[0](21)`, `fs[0](3)`, `b.f(6)` where `f` is a struct field of function
+  type. The callee is evaluated **once**, bound to a name the source cannot
+  spell, and called by the path a named function value already used — bound
+  rather than called in place because that path reads the value twice, once for
+  the code pointer and once for the environment, and evaluating the callee twice
+  would run its side effects twice.
+- **`--native` compiles `==` on two bare `ref`s.** A `ref` is a slot and a
+  generation packed into one word, and two are equal when they name the same
+  slot at the same generation — identity, which is what the interpreter answers
+  and the only thing a reference can usefully be asked. So the comparison is the
+  word. It compiled for a *list* of refs already, because the runtime's deep
+  equality reaches the same answer element by element; only two bare ones had
+  nowhere to go. Slot reuse after `release` agrees too, which is what the
+  generation is for.
 - **`--native` compiles `map` with a function that returns nothing.** The
   refusal was stale in one half and advice in the other. `RtPayload::Unit`
   exists precisely so a list of nothings prints as `[(), ()]` rather than

@@ -7691,6 +7691,17 @@ checker did",
             }
             (VType::Bool, Eq) => (self.b.ins().icmp(IntCC::Equal, lv, rv), VType::Bool),
             (VType::Bool, NotEq) => (self.b.ins().icmp(IntCC::NotEqual, lv, rv), VType::Bool),
+            // Two `ref`s are equal when they name the same slot at the same
+            // generation — identity, not the values they point at, which is
+            // what the interpreter answers and the only thing a reference can
+            // usefully be asked. A `ref` is that pair packed into one word, so
+            // the comparison is the word.
+            //
+            // This compiled already for a *list* of refs, because the runtime's
+            // deep equality reaches the same conclusion element by element. It
+            // was only two bare ones that had nowhere to go.
+            (VType::Ref(_), Eq) => (self.b.ins().icmp(IntCC::Equal, lv, rv), VType::Bool),
+            (VType::Ref(_), NotEq) => (self.b.ins().icmp(IntCC::NotEqual, lv, rv), VType::Bool),
             _ => return nope(span, format!("`{}` on `{}`", opname, lt.show())),
         };
         Ok(out)
@@ -7920,7 +7931,23 @@ checker did",
             }
         }
         let Expr::Ident(id) = callee else {
-            return nope(callee.span(), "indirect calls");
+            // A callee that is not a name — `TABLE[0](21)`, `(m.get(k) ?? d)(x)`.
+            // Evaluated once, bound to a name the source cannot spell, and then
+            // called by the path a named function value already uses. Binding
+            // it is not ceremony: `call_fn_value` reads the value twice, once
+            // for the code pointer and once for the environment, and evaluating
+            // the callee twice would run its side effects twice.
+            let (fv, ft) = self.eval_expr_val(callee)?;
+            let VType::Fn(param_ts, ret_t) = ft.clone() else {
+                return nope(callee.span(), "calling a value that is not a function");
+            };
+            let tmp = self.new_var(&ft);
+            self.b.def_var(tmp, fv);
+            self.push_scope();
+            self.bind(&format!("__callee_{}", callee.span().start), tmp, ft);
+            let out = self.call_fn_value(tmp, &param_ts, &ret_t, args, callee.span());
+            self.pop_scope_with_decs();
+            return out;
         };
         // A local of function type is called indirectly; a local of any other
         // type is not callable at all.

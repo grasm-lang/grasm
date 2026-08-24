@@ -411,7 +411,12 @@ fn main() {
     }
 }'
 
-expect_refused "== on two bare refs" 'type N = { v: i64 }
+# Was a gap. A `ref` is a slot and a generation packed into one word, and two
+# are equal when they name the same slot at the same generation — so the
+# comparison is the word. It compiled for a *list* of refs already, because the
+# runtime's deep equality reaches the same answer element by element; only two
+# bare ones had nowhere to go.
+expect_compiles "== on two bare refs" 'type N = { v: i64 }
 
 fn main() {
     let a = ref(N{ v: 1 })
@@ -419,7 +424,12 @@ fn main() {
     print("{a == b}")
 }'
 
-expect_refused "a call through a non-name callee" 'fn double(n: i64) -> i64 {
+# Was a gap. The callee is evaluated once, bound to a name the source cannot
+# spell, and called by the path a named function value already used — binding it
+# rather than calling in place because that path reads the value twice, once for
+# the code pointer and once for the environment, and evaluating the callee twice
+# would run its side effects twice.
+expect_compiles "a call through a non-name callee" 'fn double(n: i64) -> i64 {
     n * 2
 }
 
