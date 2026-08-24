@@ -617,6 +617,21 @@ to write a journal to — but a recording made by the native build replays insid
 a wasm module byte-identically, TCP socket and child process included, in a
 module that has neither. `scripts/replaytest.sh` runs that comparison every time.
 
+**The debugger takes a journal.** `"journal": "production.jrnl"` in `launch.json`
+and the breakpoints, stepping and variables all work as they did — on the
+recorded run. Stop after `now_millis()` and the variable holds the time the
+failure happened, not the time you looked. An unreadable journal fails the
+launch rather than starting a live run, because a session that quietly ran
+against the real world while you believed you were watching a replay would be
+worse than an error.
+
+**And a journal does not have to have been recorded.** Written by hand it is a
+script of what the world will say — the disk full, the socket refusing,
+`read_file` answering something no file contains — and the program cannot tell,
+because the effect system says those are the only places the world reaches it.
+The failure paths become reachable without a broken machine to reach them from.
+The same property, used in the other direction.
+
 And `grasm journal <file>` prints a recording back out — every call in order and
 what it answered. That is not a convenience: a journal is a file of framed bytes,
 and evidence nobody can examine is not evidence. It is also what found **F37**,

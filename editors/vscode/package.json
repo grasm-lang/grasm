@@ -1,25 +1,42 @@
 {
   "name": "grasm",
   "displayName": "Grasm",
-  "description": "Grasm language support: syntax highlighting and language server",
+  "description": "Grasm language support: syntax highlighting, language server, and a debugger that can step through a recorded run",
   "version": "0.1.0",
   "publisher": "grasm",
-  "engines": { "vscode": "^1.75.0" },
-  "categories": ["Programming Languages"],
-  "activationEvents": ["onLanguage:grasm"],
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Debuggers"
+  ],
+  "activationEvents": [
+    "onLanguage:grasm",
+    "onDebugResolve:grasm"
+  ],
   "main": "./extension.js",
   "contributes": {
-    "languages": [{
-      "id": "grasm",
-      "aliases": ["Grasm", "grasm"],
-      "extensions": [".gr"],
-      "configuration": "./language-configuration.json"
-    }],
-    "grammars": [{
-      "language": "grasm",
-      "scopeName": "source.grasm",
-      "path": "./syntaxes/grasm.tmLanguage.json"
-    }],
+    "languages": [
+      {
+        "id": "grasm",
+        "aliases": [
+          "Grasm",
+          "grasm"
+        ],
+        "extensions": [
+          ".gr"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "grasm",
+        "scopeName": "source.grasm",
+        "path": "./syntaxes/grasm.tmLanguage.json"
+      }
+    ],
     "configuration": {
       "title": "Grasm",
       "properties": {
@@ -29,6 +46,76 @@
           "description": "Path to the grasm executable (must support `grasm lsp`)."
         }
       }
-    }
+    },
+    "breakpoints": [
+      {
+        "language": "grasm"
+      }
+    ],
+    "debuggers": [
+      {
+        "type": "grasm",
+        "label": "Grasm",
+        "languages": [
+          "grasm"
+        ],
+        "configurationAttributes": {
+          "launch": {
+            "required": [
+              "program"
+            ],
+            "properties": {
+              "program": {
+                "type": "string",
+                "description": "The .gr file whose `main` to run.",
+                "default": "${file}"
+              },
+              "stopOnEntry": {
+                "type": "boolean",
+                "description": "Suspend before the first statement.",
+                "default": false
+              },
+              "journal": {
+                "type": "string",
+                "description": "A recording (GRASM_RECORD) to step through instead of a live run. Every effect is answered from the journal and nothing reaches the world \u2014 not the reads and not the writes. An unreadable journal fails the launch rather than starting a live run."
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "grasm",
+            "request": "launch",
+            "name": "Run this file",
+            "program": "${file}",
+            "stopOnEntry": false
+          }
+        ],
+        "configurationSnippets": [
+          {
+            "label": "Grasm: run the current file",
+            "description": "Run and stop at breakpoints.",
+            "body": {
+              "type": "grasm",
+              "request": "launch",
+              "name": "Run this file",
+              "program": "^\"\\${file}\"",
+              "stopOnEntry": false
+            }
+          },
+          {
+            "label": "Grasm: replay a recorded run",
+            "description": "Step through a journal written by GRASM_RECORD. Nothing reaches the world.",
+            "body": {
+              "type": "grasm",
+              "request": "launch",
+              "name": "Replay a recording",
+              "program": "^\"\\${workspaceFolder}/src/main.gr\"",
+              "journal": "^\"\\${workspaceFolder}/production.jrnl\""
+            }
+          }
+        ]
+      }
+    ]
   }
 }

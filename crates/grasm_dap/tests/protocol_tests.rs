@@ -500,3 +500,153 @@ fn a_client_that_disconnects_mid_stop_ends_the_run() {
         "the adapter must finish rather than run on unsupervised"
     );
 }
+
+/// A program whose behaviour depends entirely on when it ran.
+const CLOCK: &str = "fn main() / {io} {\n    let t = now_millis()\n    let doubled = t * 2\n    print(\"{doubled}\")\n}\n";
+
+/// A program that reads a file it needs.
+const READER: &str = "fn main() / {io} {\n    match read_file(\"config.toml\") {\n        Ok(text) -> print(\"read {text.len()} bytes\")\n        Err(e) -> print(\"could not read it\")\n    }\n}\n";
+
+fn launch_with_journal(seq: i64, fixture: &Fixture, journal: &str) -> String {
+    request(
+        seq,
+        "launch",
+        Json::obj(vec![
+            ("program", Json::str(fixture.path())),
+            ("stopOnEntry", Json::Bool(false)),
+            ("journal", Json::str(journal)),
+        ]),
+    )
+}
+
+/// Writes a journal into the fixture's directory and answers its path.
+fn journal(fixture: &Fixture, records: &[(&str, grasm_journal::Wire)]) -> String {
+    let owned: Vec<(String, grasm_journal::Wire)> = records
+        .iter()
+        .map(|(n, w)| ((*n).to_string(), w.clone()))
+        .collect();
+    let path = fixture.dir.join("j");
+    std::fs::write(&path, grasm_journal::framed(&owned)).unwrap();
+    path.to_string_lossy().to_string()
+}
+
+/// Stepping through a *recorded* run: the two halves this was built for.
+///
+/// The failure happens on a machine you do not have, and the debugger is here.
+/// So the value a breakpoint shows must be the one from the journal, not the
+/// one this machine's clock would give — and a clock is the clearest case,
+/// because the two cannot coincide by accident.
+#[test]
+fn a_breakpoint_shows_the_recorded_value_and_not_this_machines() {
+    let fx = Fixture::new("replay", CLOCK);
+    let recorded = 1_700_000_000_000i64;
+    let j = journal(&fx, &[("now_millis", grasm_journal::Wire::Int(recorded))]);
+
+    let out = run(
+        &fx,
+        &[
+            init(1),
+            breakpoints(2, &fx, &[3]),
+            launch_with_journal(3, &fx, &j),
+            request(4, "configurationDone", Json::obj(vec![])),
+            request(5, "stackTrace", Json::obj(vec![])),
+            request(6, "scopes", Json::obj(vec![("frameId", Json::int(0))])),
+            request(
+                7,
+                "variables",
+                Json::obj(vec![("variablesReference", Json::int(1))]),
+            ),
+            request(8, "continue", Json::obj(vec![])),
+        ],
+    );
+
+    let Some(Json::Arr(vars)) = responses(&out, "variables")[0].path("body.variables") else {
+        panic!("variables must be an array: {out:?}");
+    };
+    let t = vars
+        .iter()
+        .find(|v| v.get("name").and_then(Json::as_str) == Some("t"))
+        .and_then(|v| v.get("value"))
+        .and_then(Json::as_str)
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(
+        t, "1700000000000",
+        "the breakpoint showed this machine's clock rather than the journal's"
+    );
+}
+
+/// A journal written by hand decides what the world says, and the disk does
+/// not get a vote.
+///
+/// The file named here does not exist, so a live run takes the `Err` branch.
+/// The journal says it read twelve bytes, so the run takes the `Ok` branch and
+/// prints twelve — which no live run on any machine could produce. That is the
+/// direction worth testing: a journal that merely *agreed* with the disk would
+/// pass whether or not it was consulted, and this one cannot.
+#[test]
+fn a_written_journal_decides_what_the_program_read() {
+    let fx = Fixture::new("inject", READER);
+    let j = journal(
+        &fx,
+        &[(
+            "read_file",
+            grasm_journal::Wire::ok(grasm_journal::Wire::Str("port = 8080\n".to_string())),
+        )],
+    );
+    let out = run(
+        &fx,
+        &[
+            init(1),
+            launch_with_journal(2, &fx, &j),
+            request(3, "configurationDone", Json::obj(vec![])),
+        ],
+    );
+    let printed: String = events(&out, "output")
+        .iter()
+        .filter_map(|e| e.path("body.output").and_then(Json::as_str))
+        .collect();
+    assert!(
+        printed.contains("read 12 bytes"),
+        "the journal, not the missing file, should have decided this: {printed:?}"
+    );
+}
+
+/// A journal that cannot be read fails the launch.
+///
+/// Not a live run with a warning: a session that quietly ran against the real
+/// world while the person believed they were watching a replay would be worse
+/// than an error, because they would trust what they saw.
+#[test]
+fn an_unreadable_journal_fails_the_launch() {
+    let fx = Fixture::new("badjournal", CLOCK);
+    let bad = fx.dir.join("not-a-journal");
+    std::fs::write(&bad, b"NOTAJOURNAL").unwrap();
+    let out = run(
+        &fx,
+        &[
+            init(1),
+            launch_with_journal(2, &fx, &bad.to_string_lossy()),
+            request(3, "configurationDone", Json::obj(vec![])),
+        ],
+    );
+    let launch = responses(&out, "launch");
+    assert_eq!(
+        launch[0].path("success"),
+        Some(&Json::Bool(false)),
+        "the launch must fail: {out:?}"
+    );
+    let message = launch[0]
+        .path("message")
+        .and_then(Json::as_str)
+        .unwrap_or_default();
+    assert!(
+        message.contains("not a Grasm journal"),
+        "the reason must say what was wrong with the journal: {message:?}"
+    );
+    assert_eq!(
+        events(&out, "terminated").len(),
+        1,
+        "a failed launch must terminate the session"
+    );
+}

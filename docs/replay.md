@@ -108,6 +108,47 @@ tally at the end is worth reading on its own: a recording with four hundred
 `now_millis` calls is telling you something about the program before you read a
 single value.
 
+## In a debugger
+
+`launch.json`:
+
+```json
+{
+  "type": "grasm",
+  "request": "launch",
+  "program": "${workspaceFolder}/src/main.gr",
+  "journal": "${workspaceFolder}/production.jrnl"
+}
+```
+
+Breakpoints, stepping and variables work as they always did — but the values
+are the recorded ones. Stop on the line after `now_millis()` and the variable
+holds the time the failure happened, not the time you looked.
+
+A journal that cannot be read **fails the launch** rather than starting a live
+run with a warning. A session that quietly ran against the real world while you
+believed you were watching a replay would be worse than an error, because you
+would trust what you saw.
+
+## Writing a journal by hand
+
+A journal does not have to have been recorded. Written by hand it is a *script
+of what the world will say*:
+
+```rust
+grasm_journal::framed(&[
+    ("read_file".into(), Wire::err(Wire::io_error("IoFailed", "disk quota exceeded"))),
+])
+```
+
+The program cannot tell the difference, because there is none — the effect
+system says those are the only places the world reaches it. So the failure
+paths become reachable without a broken machine to reach them from, which is
+otherwise the hardest kind of test to write. The disk full, the socket refusing,
+the clock jumping backwards, `read_file` returning something no file contains.
+
+This is the same property that makes replay work, used in the other direction.
+
 ## What is not covered
 
 **Recording in the browser.** Only replaying. A journal is written to a file

@@ -653,6 +653,31 @@ pub fn serve<I: BufRead + 'static, O: Write + 'static>(
                     msg.path("arguments.stopOnEntry"),
                     Some(Json::Bool(true))
                 );
+                // `"journal": "path"` in launch.json steps through a *recorded*
+                // run rather than a fresh one. This is the pair the two halves
+                // were built for: the failure happens in the compiled build on
+                // a machine you do not have, and the debugger is here.
+                //
+                // Installed before the program loads, so the first effect it
+                // reaches is already answered from the journal.
+                if let Some(j) = msg.path("arguments.journal").and_then(Json::as_str) {
+                    let installed = std::fs::read(j)
+                        .map_err(|e| e.to_string())
+                        .and_then(|raw| grasm_journal::install(&raw));
+                    if let Err(e) = installed {
+                        // A failed launch, not a silent live run. A session that
+                        // quietly ran against the real world while the person
+                        // believed they were watching a replay would be worse
+                        // than an error — they would trust what they saw.
+                        write_message(
+                            &mut output,
+                            &err_response(seq, &msg, &format!("cannot replay {j}: {e}")),
+                        );
+                        seq += 1;
+                        write_message(&mut output, &terminated_event(seq));
+                        return Ok(output);
+                    }
+                }
                 match load(path) {
                     Ok(p) => {
                         program = Some(p);

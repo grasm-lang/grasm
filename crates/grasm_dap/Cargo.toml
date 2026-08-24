@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# For stepping through a recorded run — see `journal` in launch arguments.
+grasm_journal = { path = "../grasm_journal" }
 grasm_syntax = { path = "../grasm_syntax" }
 grasm_sema = { path = "../grasm_sema" }
 grasm_interp = { path = "../grasm_interp" }

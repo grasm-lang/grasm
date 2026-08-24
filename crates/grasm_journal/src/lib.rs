@@ -340,6 +340,28 @@ fn open() -> Mode {
     Mode::Off
 }
 
+/// Builds a journal from records, in the format [`read`] reads.
+///
+/// A journal does not have to have been recorded. Written by hand it is a
+/// *script of what the world will say* — `read_file` fails, the disk is full,
+/// the socket answers this exact byte sequence — and the program has no way to
+/// tell the difference, because there is none: the effect system says those are
+/// the only places the world reaches it.
+///
+/// That makes the failure paths reachable without a broken machine to reach
+/// them from, which is otherwise the hardest kind of test to write.
+pub fn framed(records: &[(String, Wire)]) -> Vec<u8> {
+    let mut out = MAGIC.to_vec();
+    for (name, value) in records {
+        let payload = value.encode();
+        out.extend((name.len() as u32).to_le_bytes());
+        out.extend(name.as_bytes());
+        out.extend((payload.len() as u32).to_le_bytes());
+        out.extend(payload);
+    }
+    out
+}
+
 /// Reads a journal from disk. Public so a person can be shown what a recording
 /// holds — a file of framed bytes is evidence nobody can examine.
 pub fn read(path: &std::ffi::OsStr) -> Result<Vec<(String, Wire)>, String> {
@@ -520,6 +542,31 @@ mod tests {
             let round = Wire::decode(&c.encode()).expect("decodes");
             assert_eq!(round, c, "{c:?} did not survive the journal");
         }
+    }
+
+    /// A journal written by hand reads back as what was written.
+    ///
+    /// This is what makes fault injection work: a `read_file` that fails, with
+    /// no broken disk anywhere.
+    #[test]
+    fn a_hand_written_journal_reads_back() {
+        let records = vec![
+            ("now_millis".to_string(), Wire::Int(1_700_000_000_000)),
+            (
+                "read_file".to_string(),
+                Wire::err(Wire::io_error("IoFailed", "disk quota exceeded")),
+            ),
+        ];
+        let raw = super::framed(&records);
+        let dir = std::env::temp_dir().join(format!("grasm_journal_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("j");
+        std::fs::write(&path, &raw).unwrap();
+        let back = super::read(path.as_os_str()).expect("reads");
+        assert_eq!(back.len(), 2);
+        assert_eq!(back[0].0, "now_millis");
+        assert_eq!(back[1].1.render(usize::MAX), "Err(IoFailed(\"disk quota exceeded\"))");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A truncated journal is refused rather than read as a shorter value.
