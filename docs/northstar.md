@@ -567,6 +567,20 @@ The second half was worth four times the first, which is the wrong way round
 from how they were found: the fused call is the clever one and the borrow is the
 obvious one.
 
+**Two of these four were worth nothing on the benchmark set, and that is the
+honest way round to say it.** After the literal cache and the borrowed field
+path, the published table moved by at most 1 ms in any cell — `parmap` 104 to
+103, `parwords` 32 to 31, and the rest identical.
+
+Both are real: 57.9 ms to 18.1 on the literal loop, 23.8 to 9.1 on the chain,
+measured the same way as the two that *did* move the table. What they are not is
+*visible here*, because these eight programs do not put a string literal in a
+hot loop and do not have a nested struct. A benchmark set is a sample of program
+shapes, and a win outside the sample is invisible rather than absent.
+
+The temptation is to publish the microbenchmark and let a reader assume it
+compounded. It did not, and the table above is what the table above says.
+
 **And every step of a field path.** `o.i.v` fetched `i` and incremented it, read
 `v`, then released `i` — a pair that exists only to protect a value the *root*
 already protects. Every intermediate in a path rooted at a live local is
