@@ -3863,3 +3863,18 @@ fn a_body_that_does_not_fit_still_reads_from_its_own_type() {
         "expected `i64`, found `str`",
     );
 }
+
+/// A write to a captured binding is refused inside a *handler operation* too.
+///
+/// [T-CAPTURE-WRITE] says the rule exists because of "a handler that appears to
+/// accumulate state and accumulates none", and its conformance program uses an
+/// unannotated closure — which is deferred, and was checked. A handler
+/// operation has an expected type, which is the position F44 made deaf: this
+/// exact program compiled, and the handler quietly accumulated nothing.
+#[test]
+fn a_handler_operation_may_not_write_to_a_captured_binding() {
+    check_err(
+        "effect S {\n    fn put(k: str, v: i64)\n}\nfn main() {\n    var kv = map()\n    kv.set(\"seed\", 0)\n    with S handled_by SHandler{ put: |k, v| kv.set(k, v) } {\n        S.put(\"a\", 1)\n    }\n}\n",
+        "captured from outside",
+    );
+}

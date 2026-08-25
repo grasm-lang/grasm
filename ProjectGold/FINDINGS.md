@@ -1879,7 +1879,23 @@ to `cell.set(0, v)` on a list, which the checker accepts inside a handler
 operation and rejects three lines earlier in a statement. Following *that* found
 it had nothing to do with handlers.
 
-The stateful-handler surprise underneath is real and is not a defect: a closure
-captures values, not bindings ([E-CLOSURE-CAPTURE]), so two operations closing
-over the same `var` capture two copies and one cannot see the other's writes.
-That is worth its own entry when there is a fix worth proposing.
+There is no second entry underneath it, and the sentence that was here said
+there would be. The stateful handler failed *because of this bug*: the checker
+already refuses to mutate a captured binding — `cannot mutate `kv` inside a
+closure — it was captured from outside`, with help naming `ref` — and that
+diagnostic was one of the ones being deleted. Assignment, a field write, a
+`push` and a `set` are all covered, in a handler operation as anywhere else. The
+rule was sound and its message was good; it was inaudible.
+
+The fix the message recommends works, on all three engines and leaking nothing:
+a `ref` copies as a slot rather than as a value, so two operations closing over
+one share it. Both halves were already specified — [T-CAPTURE-WRITE] refuses the
+write, [T-REF-CAPTURE] shows the `ref` — and both conformance programs were
+green throughout.
+
+They were green because both use an *unannotated* closure, which is deferred and
+checked. [T-CAPTURE-WRITE]'s comment says the rule exists because of "a handler
+that appears to accumulate state and accumulates none", and its program has no
+handler in it: the clause's own stated motivation was untested in the one
+position where the check was deaf. That case is now a test in `grasm_sema`
+beside the other F44 regressions.
