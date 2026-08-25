@@ -35,9 +35,12 @@ fn main() {
 ## Where it actually stands
 
 `docs/northstar.md` records the MASTERPLAN's own measurable goals against
-measurements, taken by `./scripts/northstar.sh` rather than remembered. Three
-are met, three are missed with numbers attached, and four measure features that
-are not built. `spec/core.md` does the same for the kernel-language commitment:
+measurements, taken by `./scripts/northstar.sh` rather than remembered. Thirteen
+rows: four met, one met with the qualification written next to it, one partly,
+four missed with numbers attached, and three that cannot be measured from inside
+this repository at all — two of those need someone else to use the language.
+
+`spec/core.md` does the same for the kernel-language commitment:
 36 constructs against a budget of 30, with the six that would close the gap
 named.
 
@@ -78,10 +81,11 @@ grasm build hello.gr --native -o hello && ./hello
 ```
 
 `dist/grasm-language-pack.md` is the whole language — grammar, types,
-semantics and a tutorial — in about 40k tokens. It is small enough to hand to an
+semantics and a tutorial — in about 47k tokens; `scripts/language_pack.sh`
+prints the figure when it writes the file. It is small enough to hand to an
 AI assistant in full, which is how you get useful completions for a language it
 has never seen. The `dist/grasm-conformance-*.md` files — grammar, types,
-semantics, library — carry the runnable program for every rule, about 50k tokens
+semantics, library — carry the runnable program for every rule, about 52k tokens
 across the four; you want one of them when a rule is in dispute and you would
 rather see it settled by a program than by prose. They are split by area because
 together they no longer fit in one context, and a rule in dispute belongs to one
@@ -139,21 +143,24 @@ runtime into one distributable executable).
 
 ### Performance
 
-Seven programs written the same way in Grasm, C, Rust, Go, Nim, Zig and Python.
-Best of 5, milliseconds, Apple M-series. Nim and Zig implement the four
-programs where the comparison is about the language rather than about which
-concurrency primitive each one reaches for.
+Eight programs written the same way in Grasm, C, Rust, Go, Nim, Zig and Python.
+Best of 5, milliseconds, Apple M-series, on a machine the harness measured at
+0.26x of its cores — it refuses to run above 0.35x, because a busy machine
+inflates the absolute times and flattens the parallel rows into what looks like
+a regression. Nim and Zig implement the four programs where the comparison is
+about the language rather than about which concurrency primitive each one
+reaches for.
 
 | program  |   C |  Rust |  Go | Nim | Zig | grasm-native | Python |
 |----------|----:|------:|----:|----:|----:|-------------:|-------:|
-| fib      |   5 |     5 |   6 |   5 |   5 |           10 |    129 |
-| sieve    |   7 |     7 |   7 |   9 |   7 |           15 |    342 |
-| matmul   |   5 |     5 |   8 |   9 |   5 |           10 |    900 |
-| wordfreq |  30 |    26 |  18 |  22 |   9 |           44 |    129 |
-| tree     |  20 |    10 |  20 |   — |   — |           49 |    329 |
-| sort     |  36 |    11 |  48 |   — |   — |       **19** |    209 |
-| parmap   |  49 |    50 |  89 |   — |   — |          104 |  3,521 |
-| parwords |   8 |    11 |  10 |   — |   — |           32 |    221 |
+| fib      |   5 |     6 |   6 |   6 |   6 |           11 |    131 |
+| sieve    |   7 |     7 |   8 |   9 |   7 |           16 |    383 |
+| matmul   |   5 |     5 |   8 |  10 |   6 |           10 |    899 |
+| wordfreq |  31 |    27 |  18 |  22 |  10 |           44 |    133 |
+| tree     |  21 |    10 |  21 |   — |   — |           51 |    342 |
+| sort     |  37 |    11 |  49 |   — |   — |       **20** |    226 |
+| parmap   |  53 |    57 |  88 |   — |   — |          108 |  3,638 |
+| parwords |   8 |    11 |  10 |   — |   — |           28 |    222 |
 
 Best of 5. **The harness floor is 2 ms** — what timing `/usr/bin/true` costs,
 which is fork, exec and wait rather than anything a program did. The top three
@@ -161,11 +168,19 @@ rows are mostly floor: C's 5 ms `fib` is about 3 ms of work and Grasm's 10 ms
 about 8, which is nearer 2.7x than the 2x the raw numbers show. Subtract 2 from
 every cell before taking a ratio on a short row.
 
-This run reproduces the previous one within 3 ms on every cell, and adds
-`parwords` — parallel work over strings rather than over integers, which is the
-row that measures what `par_map` could not do until this month. Grasm's own
-figure for it moved 70 to 32 within the run that introduced it, because writing
-the benchmark is what found that building a string in a loop was quadratic. A benchmark that only ever agrees with itself is
+`scripts/bench.sh` prints the geometric mean against Rust from these numbers
+rather than leaving it to be worked out by hand: **0.45x**, or **0.39x** with
+the floor subtracted, against a target of 0.95x. `tree` alone is 5.1x behind and
+carries most of it.
+
+Against the previous run no compiled cell moved by more than 7 ms, and that one
+was Rust's `parmap` — the reference languages moved with Grasm rather than
+against it, C's `parmap` 49 to 53 alongside Grasm's 104 to 108, so the absolute
+times are the machine and the ratios are the answer. Python moved further, 3,521
+to 3,638 on the same row, which is what an interpreter on a shared machine does.
+The one row that moved against its neighbours is `parwords`, 32 to 28: parallel
+work over strings rather than integers, and the row that measures what `par_map`
+could not do until recently. A benchmark that only ever agrees with itself is
 not measuring anything; one that agrees except where the code changed is.
 
 Reproducibility alone still proves nothing, which this file learned the hard
