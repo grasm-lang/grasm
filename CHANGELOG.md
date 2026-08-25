@@ -7,6 +7,9 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
 
 ### Fixed
 
+- `return` of an `if` whose branches all fail compiles. It was rejected
+  by Cranelift's verifier; the same body without the `return` always
+  worked (F46).
 - Interpolating a unit compiles natively. It worked under a type
   annotation and was refused without one; both spellings now render `()`
   (F45).

@@ -107,9 +107,24 @@ def main():
         if rc != 0:
             rejected += 1
             continue
-        _, rc = run([G, "build", src, "--native", "-o", out])
+        why, rc = run([G, "build", src, "--native", "-o", out])
         if rc != 0:
+            first = why.strip().splitlines()[0] if why.strip() else "(silent)"
+            reason = first.split(": ", 1)[-1]
+            # "codegen bug" is the backend failing its own verifier, which is a
+            # defect and not a gap. Counted as a decline it read as a number
+            # that had always been 1, and hid `return if c { fail(e) } else {
+            # fail(e) }` failing to compile at all (F46). The methods fuzzer
+            # already draws this line; this one only counted.
+            if "codegen bug" in first:
+                mism += 1
+                print(f"CODEGEN BUG seed={s}: {reason}\n--- source ---\n{gen(s)}")
+                continue
+            # Named, not just counted: a decline that prints only a number
+            # cannot be told apart from a permanent gap, so a new one looks
+            # like the one that was always there.
             declined += 1
+            print(f"  declined seed={s}: {reason}")
             continue
         a, ra = run([G, "run", src])
         b, rb = run([out])

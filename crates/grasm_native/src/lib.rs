@@ -1724,6 +1724,7 @@ impl<'m> Codegen<'m> {
             ret: sig_ret.clone(),
             inout_slots: Vec::new(),
             filled: false,
+            dead: false,
             closure_hints: Vec::new(),
             pinned: Vec::new(),
             tail_hint: None,
@@ -2316,6 +2317,7 @@ operation's",
             ret: c.ret.clone(),
             inout_slots: Vec::new(),
             filled: false,
+            dead: false,
             closure_hints: Vec::new(),
             pinned: Vec::new(),
             tail_hint: None,
@@ -2409,6 +2411,7 @@ operation's",
             ret: c.ret.clone(),
             inout_slots: Vec::new(),
             filled: false,
+            dead: false,
             closure_hints: Vec::new(),
             pinned: Vec::new(),
             tail_hint: None,
@@ -2541,6 +2544,7 @@ operation's",
             ret: h.ret.clone(),
             inout_slots: Vec::new(),
             filled: false,
+            dead: false,
             closure_hints: Vec::new(),
             pinned: Vec::new(),
             tail_hint: None,
@@ -2816,6 +2820,13 @@ struct FnCx<'a, 'm> {
     /// `continue`, `return`, or `fail` was just emitted). Cleared whenever we
     /// switch to a fresh block.
     filled: bool,
+    /// True when the block being compiled into is one nothing can reach:
+    /// `fail`, `panic` and `exit` leave, then open a fresh block so the
+    /// statements after them still have somewhere to go. That switch clears
+    /// `filled`, which is how a branch ending in `fail` came back reported as
+    /// falling through. `filled` answers "is this block finished"; this
+    /// answers "did control already leave".
+    dead: bool,
     /// Per enclosing block: the argument expressions seen at call sites of a
     /// `let`-bound closure, and every binding's initializer.
     ///
@@ -4470,6 +4481,15 @@ impl FnCx<'_, '_> {
     fn goto_block(&mut self, blk: Block) {
         self.b.switch_to_block(blk);
         self.filled = false;
+        self.dead = false;
+    }
+
+    /// Opens a block nothing reaches, for the statements that follow a
+    /// construct control never returns from.
+    fn enter_dead_block(&mut self) {
+        let dead = self.b.create_block();
+        self.goto_block(dead);
+        self.dead = true;
     }
 
     fn is_filled(&self) -> bool {
@@ -5031,7 +5051,24 @@ impl FnCx<'_, '_> {
                             (VType::Fallible(ok, _), false) => (**ok).clone(),
                             (other, _) => other.clone(),
                         };
-                        let (mut val, vt) = self.eval_expr_expecting(e, Some(&expect))?;
+                        // Asked for the value without demanding one: the
+                        // operand may have left instead of producing anything.
+                        // `return if c { fail(e) } else { fail(e) }` has
+                        // nothing to return and nowhere to return it from, and
+                        // the form that demands a value invented a unit — an
+                        // `i8` zero, which the wrapping below then handed to
+                        // `grasm_box_f64`. Cranelift rejected the function and
+                        // the backend reported it against itself as "codegen
+                        // bug in `f`", naming nothing.
+                        let got = self.eval_expr_expecting_opt(e, Some(&expect))?;
+                        if self.is_filled() || self.dead {
+                            return Ok(StmtOut::Terminated);
+                        }
+                        // Still unit when the operand simply has no value.
+                        let (mut val, vt) = match got {
+                            Some(v) => v,
+                            None => (self.zero_of(&VType::Unit), VType::Unit),
+                        };
                         if self.ret == VType::F64 && vt == VType::I64 {
                             val = self.b.ins().fcvt_from_sint(types::F64, val);
                         }
@@ -8446,7 +8483,7 @@ checker did",
 
         self.goto_block(then_blk);
         let (then_val, mut then_term) = self.eval_block_inner(then_block)?;
-        then_term |= self.is_filled();
+        then_term |= self.is_filled() || self.dead;
         // Where the branch's conversion and jump go. The merge type is not
         // known until both branches have been compiled, so the jump cannot be
         // written yet — but leaving the branch's last block unterminated and
@@ -8479,7 +8516,7 @@ checker did",
             }
             None => {}
         }
-        else_term |= self.is_filled();
+        else_term |= self.is_filled() || self.dead;
         let else_fix = if else_term {
             None
         } else {
@@ -8609,6 +8646,19 @@ checker did",
         }
         self.filled = true;
         self.goto_block(merge);
+        // Both branches left, so nothing reaches the merge and the `if` has
+        // no value to give. Saying so is what matters: `return if c {
+        // fail(e) } else { fail(e) }` otherwise had the return statement
+        // invent a placeholder for a value that does not exist, and fed an
+        // `i8` zero to a function expecting an `f64` — a verifier error the
+        // backend reported against itself as "codegen bug in `f`". The merge
+        // is unreachable, so the trap is never executed; it is there to
+        // terminate the block honestly.
+        if then_term && else_term && merge_ty.is_none() {
+            self.trap_here();
+            self.filled = true;
+            return Ok(None);
+        }
         if let Some(vt) = merge_ty {
             let out = self.b.block_params(merge)[0];
             Ok(Some((out, vt)))
@@ -8709,8 +8759,7 @@ checker did",
                         self.call_rt("grasm_panic_msg", &[p, l]);
                         self.trap_here();
                         self.filled = true;
-                        let dead = self.b.create_block();
-                        self.goto_block(dead);
+                        self.enter_dead_block();
                         return Ok(None);
                     }
                 }
@@ -8719,8 +8768,7 @@ checker did",
                 self.call_rt("grasm_panic_value", &[msg]);
                 self.trap_here();
                 self.filled = true;
-                let dead = self.b.create_block();
-                self.goto_block(dead);
+                self.enter_dead_block();
                 return Ok(None);
             }
             "args" => {
@@ -8788,8 +8836,7 @@ checker did",
                 let (cv, _) = self.eval_expr_val(&args[0])?;
                 self.call_rt("grasm_exit", &[cv]);
                 self.trap_here();
-                let dead = self.b.create_block();
-                self.goto_block(dead);
+                self.enter_dead_block();
                 return Ok(None);
             }
             // The five `net` builtins. A handle is an `i64` and a payload is a
@@ -9056,8 +9103,7 @@ checker did",
                     self.b.def_var(slot, wrapped);
                     self.b.ins().jump(blk, &[]);
                     self.filled = true;
-                    let dead = self.b.create_block();
-                    self.goto_block(dead);
+                    self.enter_dead_block();
                     return Ok(None);
                 }
                 self.emit_scope_decs_all();
@@ -9073,8 +9119,7 @@ checker did",
                     self.trap_here();
                 }
                 self.filled = true;
-                let dead = self.b.create_block();
-                self.goto_block(dead);
+                self.enter_dead_block();
                 // fail() has bottom type; produce a dummy unit.
                 return Ok(None);
             }

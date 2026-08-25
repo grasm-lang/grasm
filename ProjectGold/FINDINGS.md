@@ -61,6 +61,7 @@ and the entries disagree.
 | [F43](#f43) | a fold whose accumulator is fallible disagreed | S1, engine disagreement | **fixed** |
 | [F44](#f44) | the checker threw away every error inside a typed closure | S2, soundness | **fixed** |
 | [F45](#f45) | interpolating a unit was refused when its type was inferred | S3, over-strict | **fixed** |
+| [F46](#f46) | `return` of an `if` that never comes back | S1, codegen bug | **fixed** |
 
 <!-- end index -->
 ## F1 — a wrapped condition must end the line with the operator (S4) — **fixed**
@@ -1973,3 +1974,50 @@ program someone tried to write.
 `map of tuple`, `option of unit`, `option of tuple`, `option of list` —
 carrying the count from 72 to 102 programs. The refusal was the last
 decline in the fuzzer; it now reports `declined: 0`.
+
+## F46 — `return` of an `if` that never comes back (S1, codegen bug) — **fixed**
+
+A function whose every branch fails did not compile:
+
+```
+fn f(n: i64) -> f64 ! E {
+    return if n == 0 {
+        fail(Bad)
+    } else {
+        fail(Bad)
+    }
+}
+```
+
+`native backend does not yet support (codegen bug in `f`: Compilation
+error: Verifier errors)` — the backend failing its own verifier, which
+is a defect and not a gap. The same body without the `return` always
+compiled, which made the refusal look like a property of `fail`.
+
+Three things had to line up:
+
+1. `fail` emits its return, sets the terminator flag, then opens a fresh
+   block so the statements after it have somewhere to go. That switch
+   clears the flag, so a branch ending in `fail` came back reported as
+   falling through. `filled` answers "is this block finished"; nothing
+   answered "did control already leave". A `dead` flag now does, set at
+   the five sites that open such a block and cleared by every real
+   switch.
+2. With both branches known to leave, the `if` reaches its merge block
+   with nothing to merge. It now traps there — the block is unreachable,
+   so the trap never runs; it is there to end the block honestly.
+3. `return` asked for its operand's value with the form that always
+   produces one, and that form treats "no value" as unit — an `i8` zero.
+   The fallible wrapping below then handed that `i8` to
+   `grasm_box_f64`. The Option-returning form already existed; `return`
+   now uses it and reports itself terminated when control has left.
+
+Found by making the fallible fuzzer name its declines instead of
+counting them. It had reported `declined: 1` for as long as the counter
+existed, and one is what a permanent gap looks like.
+
+**Gates**: `scripts/fuzz_fallible.py` now treats a `codegen bug` refusal
+as a mismatch rather than a decline — the rule `fuzz_methods.py` already
+followed — and prints the seed and reason for any decline that remains.
+It reports `declined: 0`. Two cases added to `scripts/nativegaps.sh`:
+the shape above, and the same body without the `return`.

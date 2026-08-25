@@ -740,6 +740,40 @@ fn main() {
     print("{t ?? -1}")
 }'
 
+# `return` of an `if` whose branches both leave. The `if` has no value, and the
+# form that asked for one invented a unit -- an `i8` zero -- which the fallible
+# wrapping then handed to `grasm_box_f64`. Cranelift rejected the function and
+# the backend reported it against itself as a codegen bug (F46).
+expect_compiled "return of an if where every branch fails" 'type E = | Bad
+
+fn f(n: i64) -> f64 ! E {
+    return if n == 0 {
+        fail(Bad)
+    } else {
+        fail(Bad)
+    }
+}
+
+fn main() {
+    print("{f(1) ?? 0.0}")
+}'
+
+# The same shape without the `return`. This one always compiled, which is what
+# made the refusal look like a property of `fail` rather than of `return`.
+expect_compiled "an if where every branch fails, in tail position" 'type E = | Bad
+
+fn f(n: i64) -> f64 ! E {
+    if n == 0 {
+        fail(Bad)
+    } else {
+        fail(Bad)
+    }
+}
+
+fn main() {
+    print("{f(1) ?? 0.0}")
+}'
+
 if [ "$ran" != "$declared" ]; then
     echo
     echo "only $ran of $declared cases ran — the rest were never reached,"
