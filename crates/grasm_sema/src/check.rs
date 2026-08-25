@@ -7899,8 +7899,24 @@ bind the component to a `var`, or use a struct when the parts have names worth w
                     if self.diags.len() > mark {
                         // Not a fit: report it the way the caller would, from
                         // the type the body actually has.
+                        //
+                        // Only when re-inferring actually says something. It is
+                        // memoized, so a second visit to the same expression
+                        // answers from the cache and reports nothing — and this
+                        // threw the first pass's diagnostics away regardless.
+                        // An unknown name inside a closure with an expected
+                        // type was reported, discarded, and never reported
+                        // again: `let f: fn(i64) -> () = |v| nosuchname(v)`
+                        // passed `grasm check`, panicked under `grasm run`, and
+                        // was refused by `--native` as a backend limitation
+                        // (F44).
+                        let checked = self.diags[mark..].to_vec();
                         self.diags.truncate(mark);
-                        self.infer_expr(body)
+                        let inferred = self.infer_expr(body);
+                        if self.diags.len() == mark {
+                            self.diags.extend(checked);
+                        }
+                        inferred
                     } else {
                         want
                     }

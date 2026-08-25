@@ -3825,3 +3825,41 @@ fn a_parameter_a_later_line_fixes_is_determined() {
         "type Res[T, E] = | Good(v: T) | Bad(e: E)\nfn take(r: Res[i64, str]) -> i64 {\n    match r {\n        Good(v) -> v\n        Bad(e) -> -1\n    }\n}\nfn main() {\n    let a = Good(1)\n    print(\"{take(a)}\")\n}\n",
     );
 }
+
+/// A closure with an *expected* type still has its body checked.
+///
+/// Checking the body against the wanted return type and then, on any
+/// diagnostic, discarding all of them and re-inferring — so the mismatch reads
+/// from the type the body actually has — lost every unrelated error with them.
+/// Inference is memoized, so the second visit answered from the cache and said
+/// nothing at all (F44).
+#[test]
+fn an_unknown_name_in_a_typed_closure_is_reported() {
+    for src in [
+        "fn main() {\n    let f: fn(i64) -> () = |v| nosuchname(v)\n    f(1)\n}\n",
+        "fn call(f: fn(i64) -> ()) {\n    f(1)\n}\nfn main() {\n    call(|v| nosuchname(v))\n}\n",
+        "type B = { f: fn(i64) -> () }\nfn main() {\n    let b = B{ f: |v| nosuchname(v) }\n    b.f(1)\n}\n",
+        "effect S {\n    fn put(v: i64)\n}\nfn main() {\n    with S handled_by SHandler{ put: |v| nosuchname(v) } {\n        S.put(1)\n    }\n}\n",
+    ] {
+        check_err(src, "unknown name `nosuchname`");
+    }
+}
+
+/// And an unknown *method*, which is the same hole one resolution apart.
+#[test]
+fn an_unknown_method_in_a_typed_closure_is_reported() {
+    check_err(
+        "fn main() {\n    let f: fn(i64) -> i64 = |v| v.nomethod()\n    print(\"{f(1)}\")\n}\n",
+        "no method `nomethod` on `i64`",
+    );
+}
+
+/// The reason the rollback existed is preserved: a body that does not fit is
+/// still reported from the type it actually has, not as a nested mismatch.
+#[test]
+fn a_body_that_does_not_fit_still_reads_from_its_own_type() {
+    check_err(
+        "fn main() {\n    let f: fn(i64) -> i64 = |v| v + \"s\"\n    print(\"{f(1)}\")\n}\n",
+        "expected `i64`, found `str`",
+    );
+}

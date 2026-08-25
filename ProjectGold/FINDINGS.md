@@ -59,6 +59,7 @@ and the entries disagree.
 | [F41](#f41) | a generator that printed MISMATCH and exited 0 | S1, gate | **fixed** |
 | [F42](#f42) | an optimisation recogniser that refused to compile | S3, over-strict | **fixed** |
 | [F43](#f43) | a fold whose accumulator is fallible disagreed | S1, engine disagreement | **fixed** |
+| [F44](#f44) | the checker threw away every error inside a typed closure | S2, soundness | **fixed** |
 
 <!-- end index -->
 ## F1 — a wrapped condition must end the line with the operator (S4) — **fixed**
@@ -1821,3 +1822,64 @@ bindings the ordinary path releases with `pop_scope_with_decs` were released on
 one path and not the other. Invisible with an `i64` element; one allocation with
 a `str`. The map loop had the same bug and no test that could show it, because
 every map case tried until then had scalar elements.
+
+## F44 — the checker threw away every error inside a typed closure (S2, soundness) — **fixed**
+
+```
+fn main() {
+    let f: fn(i64) -> () = |v| nosuchname(v)
+    f(1)
+}
+```
+
+```
+grasm check   ok: no errors
+grasm run     panic: unknown name `nosuchname`
+--native      error: does not yet support the function `nosuchname` here
+```
+
+Three engines, three behaviours, and not one of them says *this program does not
+compile*. The native message is the worst of them: it blames the backend for a
+name the program never defined.
+
+A closure whose type is known from context — an annotated `let`, a function
+parameter, a struct field, a handler operation — has its body checked against
+the wanted return type. If that produced any diagnostic, **all** of them were
+discarded and the body re-inferred, so a body that does not fit would be
+reported from the type it actually has rather than as a nested mismatch. That is
+a good reason and it is why the code was written that way.
+
+Inference is memoized. The second visit answered from the cache and reported
+nothing, so the diagnostics were not replaced — they were deleted. Every error
+inside such a closure vanished: unknown names, unknown methods, anything that is
+not itself a mismatch at the tail.
+
+### The fix keeps the reason
+
+The check now holds the first pass's diagnostics, re-infers, and puts them back
+only if re-inferring said nothing:
+
+```rust
+let checked = self.diags[mark..].to_vec();
+self.diags.truncate(mark);
+let inferred = self.infer_expr(body);
+if self.diags.len() == mark {
+    self.diags.extend(checked);
+}
+```
+
+A body that does not fit still reads from its own type — `expected `i64`, found
+`str`` — and a body with a real error in it now reports the error.
+
+### How it was found
+
+By writing a program, not by reading the checker. A handler holding a `map` as
+its state failed silently — the value never came back — and narrowing that led
+to `cell.set(0, v)` on a list, which the checker accepts inside a handler
+operation and rejects three lines earlier in a statement. Following *that* found
+it had nothing to do with handlers.
+
+The stateful-handler surprise underneath is real and is not a defect: a closure
+captures values, not bindings ([E-CLOSURE-CAPTURE]), so two operations closing
+over the same `var` capture two copies and one cannot see the other's writes.
+That is worth its own entry when there is a fix worth proposing.
