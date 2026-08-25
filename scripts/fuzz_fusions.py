@@ -29,6 +29,16 @@ import tempfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GRASM = os.environ.get("GRASM") or os.path.join(ROOT, "target", "release", "grasm")
 
+import importlib.util as _ilu
+_spec = _ilu.spec_from_file_location(
+    "grasm_fresh",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "fresh.py"),
+)
+_fresh = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_fresh)
+_fresh.fresh_or_stop(GRASM)
+
+
 RANGES = ["0..0", "0..1", "3..3", "0..5", "2..7", "0..20", "0 - 3..3", "0 - 5..0 - 2"]
 
 RANGE_OPS = [

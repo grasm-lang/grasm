@@ -151,9 +151,18 @@ fi
 # while every command-line engine accepted them. Found by a project trying to
 # run its own source in the browser; it would not have been found by this
 # script, which is the point of adding this to it.
+#
+# There is one real module and the pages that need it link to it, so a refresh
+# is one copy rather than four -- every change to the compiler made all four
+# stale, and a chore repeated every commit is one that eventually is not done.
+# `-h` skips the links; without it the glob also matched `web/grasm.wasm`
+# through its own name and the count said five stale modules where four exist.
 stale=0
-for committed in ProjectGold/web/grasm.wasm ProjectGold/*/grasm.wasm; do
-    [ -f "$committed" ] || continue
+# `web` is a child of ProjectGold, so the glob already names it; listing it
+# explicitly as well counted it twice and reported five stale modules where
+# four exist -- and then two where one did.
+for committed in ProjectGold/*/grasm.wasm; do
+    [ -f "$committed" ] && [ ! -h "$committed" ] || continue
     if ! cmp -s "$WASM" "$committed"; then
         echo "stale: $committed differs from a fresh build of grasm_wasm"
         stale=$((stale + 1))
@@ -162,6 +171,7 @@ done
 if [ "$stale" -gt 0 ]; then
     echo
     echo "$stale committed wasm module(s) are behind the language. Refresh with:"
+    echo "  (the pages under ProjectGold link to web/grasm.wasm, so this is all of them)"
     echo "  cargo build --release --target wasm32-unknown-unknown -p grasm_wasm"
     echo "  cp target/wasm32-unknown-unknown/release/grasm_wasm.wasm ProjectGold/web/grasm.wasm"
     exit 1

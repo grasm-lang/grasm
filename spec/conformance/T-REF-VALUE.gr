@@ -9,12 +9,15 @@
 //! through a list: 100 6 2
 //! through a struct field, shared both ways: 9 9
 //! a struct referent still uses its own field names: 5
+//! a sum referent, written through a copy: Green Green
+//! and an Option the same way: Some(2)
 //! released, and the reference knows: false
 // `r.value` reads and writes what a reference points at.
 //
 // Without it `ref(0)` typechecked and nothing in the language could observe
 // the result — a value that could be constructed and never used.
 type Point = { x: i64 }
+type Col = | Red | Green
 type Held = { cell: ref i64 }
 
 fn bump(r: ref i64) {
@@ -86,6 +89,23 @@ fn main() / {io} {
     let p = ref(Point{ x: 5 })
     print("a struct referent still uses its own field names: {p.x}")
 
+    // A sum has no field names either, so it is exactly the case `.value`
+    // describes. Asking whether the referent was a *named* type excluded it
+    // along with the structs, and since rebinding a `var` only moves the
+    // local, nothing could write through a `ref` to a sum at all: readable
+    // through `match`, never writable, on the tier that exists so a reference
+    // is a shared cell rather than a copy.
+    let col = ref(Red)
+    let col_copy = col
+    col_copy.value = Green
+    print("a sum referent, written through a copy: {col.value} {col_copy.value}")
+
+    let opt = ref(Some(1))
+    opt.value = Some(2)
+    print("and an Option the same way: {opt.value}")
+
+    release(col)
+    release(opt)
     release(n)
     release(s)
     release(xs)

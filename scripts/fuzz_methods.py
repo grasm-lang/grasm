@@ -30,6 +30,16 @@ import tempfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GRASM = os.environ.get("GRASM") or os.path.join(ROOT, "target", "release", "grasm")
 
+import importlib.util as _ilu
+_spec = _ilu.spec_from_file_location(
+    "grasm_fresh",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "fresh.py"),
+)
+_fresh = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_fresh)
+_fresh.fresh_or_stop(GRASM)
+
+
 # (type, a literal of that type, [method call written against `R`])
 GROUPS = [
     (
@@ -194,6 +204,60 @@ GROUPS = [
             "R.to_str().len()",
         ],
     ),
+    # A `str` and a `bytes` have no element type to vary, but they do have
+    # *contents*, and that is the axis: an operation that works on ASCII and
+    # not on a character outside it. `len` counts characters and `byte_len`
+    # counts bytes, so anything multibyte is where the two disagree if they
+    # are going to. The interpreter holds a Rust `String` and the compiled
+    # engines hold the runtime's, which is two implementations of the same
+    # promise.
+    (
+        "str empty",
+        '""',
+        [
+            "R.len()", "R.byte_len()", "R.is_empty()", "R.chars().len()",
+            "R.codes().len()", "R.lines().len()", 'R.split(",").len()',
+            "R.words().len()", "R.trim()", "R.to_upper()", "R.to_bytes().len()",
+            'R.contains("a")', 'R.pad_start(3, "-")', "R.repeat(2)", "R",
+        ],
+    ),
+    (
+        "str multibyte",
+        '"h\u00e9\u65e5\U0001d11ez"',
+        [
+            "R.len()", "R.byte_len()", "R.chars().len()", "R.codes().len()",
+            "R.code_at(0)", "R.code_at(2)", "R.substr(0, 2)", "R.to_upper()",
+            "R.to_lower()", "R.to_bytes().len()", "R.repeat(2).len()",
+            'R.contains("\u65e5")', 'R.index_of("z") ?? 0 - 1',
+            'R.replace("\u65e5", "X")', "R.trim()", "R",
+        ],
+    ),
+    (
+        "str whitespace",
+        '"  a\\tb\\nc  "',
+        [
+            "R.len()", "R.byte_len()", "R.lines().len()", "R.words().len()",
+            "R.trim()", "R.trim_start()", "R.trim_end()", 'R.split(" ").len()',
+            "R.to_bytes().len()", "R",
+        ],
+    ),
+    (
+        "bytes invalid utf8",
+        "bytes_of([255, 254, 65])",
+        [
+            "R.len()", "R.is_empty()", "R.at(0)", "R.to_list().len()",
+            "R.to_str().byte_len()", "R.slice(1, 2).len()",
+            "R.concat(bytes_of([0])).len()", "R",
+        ],
+    ),
+    (
+        "bytes with nul",
+        "bytes_of([0, 65, 0])",
+        [
+            "R.len()", "R.at(0)", "R.at(1)", "R.to_list().len()",
+            "R.to_str().byte_len()", "R.slice(0, 2).len()", "R",
+        ],
+    ),
 ]
 
 # How the receiver is spelled. `{lit}` is the literal, `{calls}` the printing
@@ -241,7 +305,11 @@ def build(ty, lit, calls, shape):
     if shape == "literal":
         # Every mention of the receiver, not only the ones a `.` follows:
         # `(R / 4.0).asin()` and `R ?? 0 - 1` name it bare.
-        lines = re.sub(r"\bR\b", f"({lit})", lines)
+        # A function replacement, not a string one. `re.sub` reads escapes in
+        # a string replacement, so a literal holding `\t` or `\u{65e5}` --
+        # which is what a content axis is made of -- was rewritten into a real
+        # tab, or raised "bad escape \u" and took the whole generator down.
+        lines = re.sub(r"\bR\b", lambda _m: f"({lit})", lines)
     body = SHAPES[shape].format(lit=lit, calls=lines)
     decl = f"type Box = {{ v: {ty_decl(ty)} }}\n\n" if shape == "field" else ""
     return PRELUDE + decl + "fn main() / {io} {\n" + body + "}\n"
@@ -254,6 +322,11 @@ def ty_decl(ty):
         "f64": "f64",
         "list": "[i64]",
         "bytes": "bytes",
+        "str empty": "str",
+        "str multibyte": "str",
+        "str whitespace": "str",
+        "bytes invalid utf8": "bytes",
+        "bytes with nul": "bytes",
         "map": "Map[str, i64]",
         "option": "Option[i64]",
         "map of unit": "Map[str, ()]",

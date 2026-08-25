@@ -34,6 +34,16 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # of which a release build compiles out.
 GRASM = os.environ.get("GRASM") or os.path.join(ROOT, "target", "release", "grasm")
 
+import importlib.util as _ilu
+_spec = _ilu.spec_from_file_location(
+    "grasm_fresh",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "fresh.py"),
+)
+_fresh = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_fresh)
+_fresh.fresh_or_stop(GRASM)
+
+
 INT, STR, BOOL = "i64", "str", "bool"
 
 # Generic and higher-order helpers, written once at the top of every program.

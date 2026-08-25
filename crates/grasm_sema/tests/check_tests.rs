@@ -3953,3 +3953,49 @@ place and not another is F44's shape\n  wanted: {needle}\n  got: {text:?}\n{src}
         }
     }
 }
+
+#[test]
+fn a_reference_to_a_sum_is_read_and_written_through_value() {
+    // [T-REF-VALUE] offers `.value` when the referent has no way to name its
+    // parts. A sum has none — but a sum is a `Named` type just as a struct is,
+    // and asking whether the referent was named excluded it along with the
+    // structs. Rebinding a `var` only moves the local, so nothing in the
+    // language could write through a `ref` to a sum at all (F48).
+    check_ok(
+        "type Col = | Red | Green\n\
+         fn main() {\n\
+         \x20   let r = ref(Red)\n\
+         \x20   let c = r\n\
+         \x20   c.value = Green\n\
+         \x20   match r.value {\n\
+         \x20       Red -> print(\"red\")\n\
+         \x20       Green -> print(\"green\")\n\
+         \x20   }\n\
+         }\n",
+    );
+    // An `Option` is a sum like any other.
+    check_ok(
+        "fn main() {\n\
+         \x20   let r = ref(Some(1))\n\
+         \x20   r.value = None\n\
+         \x20   print(\"{r.value}\")\n\
+         }\n",
+    );
+    // The two exclusions the clause does name still hold, so this widened the
+    // rule to what it says rather than to everything.
+    check_err(
+        "type P = { n: i64 }\n\
+         fn main() {\n\
+         \x20   let r = ref(P{ n: 1 })\n\
+         \x20   print(\"{r.value}\")\n\
+         }\n",
+        "has no field `value`",
+    );
+    check_err(
+        "fn main() {\n\
+         \x20   let r = ref((1, 2))\n\
+         \x20   print(\"{r.value}\")\n\
+         }\n",
+        "a tuple has no field `value`",
+    );
+}

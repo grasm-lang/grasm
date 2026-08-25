@@ -37,7 +37,18 @@ import tempfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GRASM = os.environ.get("GRASM") or os.path.join(ROOT, "target", "release", "grasm")
 
-PRELUDE = """type Inner = { n: i64, xs: [i64], s: str }
+import importlib.util as _ilu
+_spec = _ilu.spec_from_file_location(
+    "grasm_fresh",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "fresh.py"),
+)
+_fresh = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_fresh)
+_fresh.fresh_or_stop(GRASM)
+
+
+PRELUDE = """type Col = | Red | Green
+type Inner = { n: i64, xs: [i64], s: str }
 type Outer = { one: Inner, many: [Inner], cell: ref i64, cells: [ref i64] }
 
 fn fresh() -> Outer {
@@ -72,6 +83,14 @@ PLACES = [
     ("ref-in-list", "o.cells[1].value", "i64", "42"),
     ("ref-in-list-last", "o.cells[2].value", "i64", "42"),
     ("local-list", "xs[0]", "i64", "42"),
+    # A sum and an `Option` behind a reference. `.value` was refused for both
+    # because the check asked whether the referent was a *named* type, and a
+    # sum is named just as a struct is -- so a whole class of referent could
+    # be read through `match` and never written (F48). Everything below
+    # `ref-at-root` reached only `ref i64`.
+    ("ref-sum-at-root", "rc.value", "Col", "Green"),
+    ("ref-option-at-root", "ro.value", "Option[i64]", "Some(9)"),
+    ("ref-sum-in-list", "rcs[1].value", "Col", "Green"),
 ]
 
 # List-valued places, for the mutating methods. These reach `read_place_boxed`
@@ -104,6 +123,9 @@ OPS = [
 # `+=` is defined for numbers; a string place gets `+` with a string instead.
 STR_COMPOUND = '{p} = {p} + "!"\n    print("{{{p}}}")'
 
+# For a referent with no arithmetic: write the whole thing and read it back.
+WHOLE_COMPOUND = '{p} = {v}\n    print("{{{p}}}")'
+
 
 def build(place, ty, value, op_body):
     body = op_body.format(p=place, v=value)
@@ -115,8 +137,15 @@ def build(place, ty, value, op_body):
         + "    var n = 5\n"
         + "    var xs = [9, 8, 7]\n"
         + "    let r = ref(3)\n"
+        + "    let rc = ref(Red)\n"
+        + "    let ro = ref(Some(1))\n"
+        + "    var rcs: [ref Col] = []\n"
+        + "    for _i in 0..3 {\n        rcs.push(ref(Red))\n    }\n"
         + f"    {body}\n"
         + "    release(r)\n"
+        + "    release(rc)\n"
+        + "    release(ro)\n"
+        + "    for c in rcs {\n        release(c)\n    }\n"
         + "    release(o.cell)\n"
         + "    for c in o.cells {\n        release(c)\n    }\n"
         + "}\n"
@@ -142,6 +171,11 @@ def main():
             for oname, op in OPS:
                 if oname == "compound" and ty == "str":
                     op = STR_COMPOUND
+                # `+=` is arithmetic. A sum has none, and writing the whole
+                # value is the only compound assignment that means anything
+                # there -- which is the operation F48 was about.
+                elif oname == "compound" and ty not in ("i64", "f64"):
+                    op = WHOLE_COMPOUND
                 src = build(place, ty, value, op)
                 with open(path, "w") as f:
                     f.write(src)

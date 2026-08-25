@@ -5406,12 +5406,23 @@ parts have names worth writing",
         // Not offered for a struct or a tuple: a struct already has field names
         // and `.value` would either shadow one or change meaning the day
         // somebody added it, and a tuple has `.0` and `.1`.
+        //
+        // A *sum* has neither, so it is exactly the case the rule describes —
+        // but a sum is a `Named` type too, and asking whether the referent is
+        // named excluded it along with the structs. `ref(Red).value` was
+        // refused as a field access on a sum, and since rebinding a `var` only
+        // moves the local, nothing in the language could write through a `ref`
+        // to a sum at all: readable through `match`, never writable, on the
+        // tier that exists so a reference is a shared cell rather than a copy.
+        let referent_is_struct = matches!(
+            self.uni.shallow_resolve(&recv_ty),
+            Type::Named { id, .. } if matches!(
+                self.defs.get(id).kind, TypeDefKind::Struct { .. })
+        );
         if through_ref
             && name.name == "value"
-            && !matches!(
-                self.uni.shallow_resolve(&recv_ty),
-                Type::Named { .. } | Type::Tuple(_)
-            )
+            && !referent_is_struct
+            && !matches!(self.uni.shallow_resolve(&recv_ty), Type::Tuple(_))
         {
             return recv_ty;
         }

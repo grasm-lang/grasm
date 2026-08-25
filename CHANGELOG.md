@@ -7,6 +7,9 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
 
 ### Fixed
 
+- `r.value` reads and writes a reference to a sum, `Option` included.
+  It was refused because a sum is a named type just as a struct is, which
+  left a `ref` to a sum readable through `match` and never writable (F48).
 - `return` of an `if` whose branches all fail compiles. It was rejected
   by Cranelift's verifier; the same body without the `return` always
   worked (F46).

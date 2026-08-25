@@ -63,6 +63,8 @@ and the entries disagree.
 | [F45](#f45) | interpolating a unit was refused when its type was inferred | S3, over-strict | **fixed** |
 | [F46](#f46) | `return` of an `if` that never comes back | S1, codegen bug | **fixed** |
 | [F47](#f47) | a gate nobody ran, failing on a rule it had a stale copy of | S3, harness | **fixed** |
+| [F48](#f48) | a reference to a sum could be read but never written | S3, over-strict | **fixed** |
+| [F49](#f49) | nine generators measured whatever binary was lying there | S3, harness | **fixed** |
 
 <!-- end index -->
 ## F1 — a wrapped condition must end the line with the operator (S4) — **fixed**
@@ -2067,3 +2069,80 @@ three differed now.
 
 **Gate**: `scripts/allgates.sh`, and `scripts/gatecheck.sh` already
 covers the new lib.
+
+## F48 — a reference to a sum could be read but never written (S3, over-strict) — **fixed**
+
+[T-REF-VALUE] says `r.value` reads and writes what a reference points
+at "when that has no fields of its own", and names the two exclusions:
+a struct, which already has field names, and a tuple, whose components
+are `.0` and `.1`. A sum has neither, so it is exactly the case the rule
+describes. It was refused:
+
+```
+let r = ref(Red)
+r.value = Green     // `Col` is a sum type — fields are accessed via `match`
+```
+
+The check asked whether the referent was a `Named` type. A sum is named
+just as a struct is, so it was excluded by an accident of representation
+rather than by the rule.
+
+That left a `ref` to a sum readable and unwritable. `match r` reaches the
+referent, so it could be read; `r.value = ...` was refused, and rebinding
+a `var` only moves the local, which no other holder of the reference
+sees. So on the tier that exists so a reference is a shared cell rather
+than a copy — [T-REF-GENERATIONAL]'s "a `ref i64` is a shared counter" —
+a whole class of referent had no shared write at all. `Option` included,
+which is the sum people reach for first.
+
+The check now asks whether the referent is a *struct*, which is what the
+clause says. Both engines agree, and the two exclusions still hold.
+
+Found by crossing `ref` referent representations with reference
+operations — the same crossing as the list and map ones, on the tier
+those do not reach. Twelve representations by nine shapes; this was the
+only disagreement, and it disagreed with the spec rather than between
+engines.
+
+**Gates**: `spec/conformance/T-REF-VALUE.gr` gained a sum referent
+written through a copy and an `Option` written the same way — so
+`difftest`, `leakcheck`, `agreetest`, `wasmtest` and `crosstest` all
+carry it. `check_tests.rs` gained
+`a_reference_to_a_sum_is_read_and_written_through_value`, which asserts
+the struct and tuple exclusions in the same test: removing the struct
+exclusion fails it.
+
+## F49 — nine generators measured whatever binary was lying there (S3, harness) — **fixed**
+
+The shell gates build the compiler they test; `scripts/lib/fresh.sh`
+exists because of F36, where `wasmtest.sh` read a prebuilt module it
+never built and reported 182 identical against a week-old one for two
+full runs. The nine Python generators had the same shape: they resolve
+`target/release/grasm` and, at most, complain when it is absent.
+
+Caught while mutation-testing a new string group. The mutation did not
+compile, `cargo build` failed, the generator ran the compiler from
+*before* the mutation, and reported `disagreed: 0` — so a mutation test
+designed to prove a gate can fail was answered by a gate that had not
+seen the mutation. The false pass is the dangerous direction: it says a
+crossing is covered when nothing ran.
+
+`scripts/lib/fresh.py` is the counterpart, imported by all nine. A
+failing build stops the run with the same message the shell gates give,
+and the generator exits 1 rather than reporting a clean sweep.
+
+Two smaller faults fixed alongside:
+
+* `fuzz_methods.py` substituted the receiver with `re.sub` and a *string*
+  replacement, so any literal containing a backslash was rewritten by
+  `re`'s own escape rules — `"a\tb"` became a real tab, and
+  `"\u{65e5}"` raised `bad escape \u` and took the generator down. A
+  content axis is made of exactly such literals. It uses a function
+  replacement now.
+* `fuzz_places.py` applied `+=` to every place, which a sum has no
+  meaning for. A referent with no arithmetic gets a whole-value write
+  instead — which is the operation F48 was about.
+
+**Gate**: mutation-tested in both directions — a build that fails stops
+the generator with exit 1, and a clean build reports 132 programs, no
+disagreements.

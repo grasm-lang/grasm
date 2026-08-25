@@ -19,6 +19,16 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Overridable, like the shell gates: a debug build keeps Cranelift's own
 # assertions and the runtime's overflow checks, which release compiles out.
 G = os.environ.get("GRASM") or os.path.join(ROOT, "target", "release", "grasm")
+
+import importlib.util as _ilu
+_spec = _ilu.spec_from_file_location(
+    "grasm_fresh",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "fresh.py"),
+)
+_fresh = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_fresh)
+_fresh.fresh_or_stop(G)
+
 OK_TYPES = [
     ("i64", ["3", "n * 2", "0 - 7"], "0 - 1"),
     ("f64", ["3", "4.5", "n.as_f64()"], "0.0"),

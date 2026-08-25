@@ -96,7 +96,9 @@ as a value, a UFCS call of a generic free function, generic `type` declarations
 for both structs and sums, and `fail` inside a fallible closure passed to `map`. Closed on 2026-08-25:
 interpolating a unit whose type was inferred rather than annotated (F45), and
 `return` of an `if` whose every branch fails (F46) — the second a Cranelift
-verifier failure, so a defect rather than a gap.
+verifier failure, so a defect rather than a gap. Closed on 2026-08-26: a write
+through a `ref` to a sum, which [T-REF-VALUE] always described and the
+implementation excluded along with the structs (F48).
 
 ## S4 — diagnostics
 

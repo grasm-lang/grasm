@@ -49,6 +49,10 @@ bash reported each as a command not found on stderr and carried on — so the
 script reported success having run 28 of its 39 cases (F40). A gate that can
 silently skip a quarter of itself is worse than no gate, because it is believed.
 
+Each of those builds the compiler it tests (`scripts/lib/fresh.sh`), and so do
+the generators (`scripts/lib/fresh.py`) — a gate that reads a binary it did not
+produce measures whatever was lying there, which is F36 and F49.
+
 And the generators, which find what nobody thought to write down:
 
 ```
