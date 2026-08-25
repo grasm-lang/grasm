@@ -1691,3 +1691,29 @@ refusing to benchmark: load average 4.40 on 8 cores
 — by my own previous run. Publishing a best-of-three figure in a table that
 says best-of-five would be a comparison between two protocols presented as one.
 The check that mattered here is *did anything regress*, and it is answered.
+
+### G2, computed by the harness instead of by hand
+
+The scorecard carried `0.44×` for the geometric mean against Rust, and the
+calculation that produced it lived nowhere. It could be retyped and not
+reproduced — which is exactly how the G4 counts beside it went stale, 218 where
+the gates said 222.
+
+`scripts/bench.sh` computes it now, from the numbers it has just printed, and
+prints both the plain figure and the one with the process floor subtracted.
+Printing only one of those would hide a judgement: subtracting a 2 ms floor from
+a 10 ms program changes its ratio by a fifth, and which figure is "the" answer
+is a choice rather than a measurement.
+
+A clean best-of-five at load 0.26× cores:
+
+```
+G2  geomean of rust/native over 8 program(s):  0.45x   (floor 2ms subtracted: 0.39x)
+```
+
+So the published 0.44× was right and is now 0.45×, moved by `parmap` and
+`parwords` rather than by anything measured this session. Still missed, by a
+lot: the target is 0.95× and `tree` alone is 5.1× behind.
+
+Two runs were refused before this one landed — load 4.40 and 3.86 — and one of
+those was the harness catching my own previous run. The refusal is the feature.

@@ -19,7 +19,7 @@ the scorecard takes the best of five runs and subtracts the process floor.
 | # | Goal | Target | Measured | |
 |---|---|---|---|---|
 | G1 | Time for a Go/TS dev to ship a real service | ≤ 1 week | — | **unmeasurable without users** |
-| G2 | Geomean vs Rust | ≥ 0.95× | **0.44×** — 0 of 8 programs at or above; geomean 2.28× behind, 2.66× with the harness floor subtracted | **missed** — `tree` at 4.9× and `parwords` at 2.9× carry it; the other six are 1.7–2.1× |
+| G2 | Geomean vs Rust | ≥ 0.95× | **0.45×**, and **0.39×** with the process floor subtracted — 0 of 8 programs at or above. `scripts/bench.sh` computes both from the numbers it prints; the figure used to be worked out by hand and could only be retyped, not reproduced | **missed** — `tree` at 5.1× carries it; `parwords` 2.6×, the other six 1.6–2.3× |
 | G3 | Frontend throughput | ≥ 500k LOC/s | **535–547k** across consecutive runs on one machine | **met** |
 | G3 | Incremental edit-to-diagnostic | ≤ 50 ms | — | **not built** — there is no query engine |
 | G4 | Safe-subset guarantees | 100% | **222** programs identical across three engines, **222** leak-free, 27 agreeing on panic messages, **44** whole programs, 183 identical in the browser build, 28 builtins refusing under an empty journal, nine fuzzers clean — and the gap list the compiled backend refuses is down from 17 shapes to 3 | **strongest area** |

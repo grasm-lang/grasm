@@ -221,6 +221,52 @@ echo
 echo "best of $REPS runs, wall clock in milliseconds (lower is better)"
 echo "checksums verified against the interpreter before timing"
 
+# G2, computed here rather than by hand.
+#
+# The scorecard carried `0.44x` and the calculation that produced it lived
+# nowhere — so it could not be reproduced, only retyped, which is how the G4
+# counts beside it went stale. This is the same arithmetic every time, on the
+# numbers just printed, with the process floor reported both ways because
+# subtracting it is a judgement and printing only one of them hides it.
+BENCH_PROGRAMS="$PROGRAMS" python3 - "$WORK" "$FLOOR" <<'PYEOF'
+import math, os, sys
+
+work, floor = sys.argv[1], int(sys.argv[2])
+progs = os.environ.get("BENCH_PROGRAMS", "").split()
+if not progs:
+    progs = sorted({f.split("_", 2)[2] for f in os.listdir(work) if f.startswith("r_")})
+
+def read(lang, p):
+    try:
+        v = open(os.path.join(work, f"r_{lang}_{p}")).read().strip()
+        return int(v)
+    except (OSError, ValueError):
+        return None
+
+plain, subbed, missing = [], [], []
+for p in progs:
+    r, n = read("rust", p), read("grasm-native", p)
+    if r is None or n is None or n <= 0:
+        missing.append(p)
+        continue
+    plain.append(r / n)
+    rf, nf = max(r - floor, 1), max(n - floor, 1)
+    subbed.append(rf / nf)
+
+def geo(xs):
+    return math.exp(sum(math.log(x) for x in xs) / len(xs)) if xs else 0.0
+
+if plain:
+    print()
+    print(
+        f"G2  geomean of rust/native over {len(plain)} program(s):"
+        f"  {geo(plain):.2f}x   (floor {floor}ms subtracted: {geo(subbed):.2f}x)"
+    )
+    print("    target is >= 0.95x; higher is better, 1.00x is parity with Rust")
+if missing:
+    print(f"    not counted: {', '.join(missing)} — no Rust or no native time")
+PYEOF
+
 if [ $wrong -ne 0 ]; then
     echo
     echo "WRONG ANSWERS (not timed):"
