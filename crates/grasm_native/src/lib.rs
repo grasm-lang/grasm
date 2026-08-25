@@ -1717,6 +1717,7 @@ impl<'m> Codegen<'m> {
             var_count: 0,
             loops: Vec::new(),
             handler_arg_held: Vec::new(),
+            fail_redirect: Vec::new(),
             ret: sig_ret.clone(),
             inout_slots: Vec::new(),
             filled: false,
@@ -2308,6 +2309,7 @@ operation's",
             var_count: 0,
             loops: Vec::new(),
             handler_arg_held: Vec::new(),
+            fail_redirect: Vec::new(),
             ret: c.ret.clone(),
             inout_slots: Vec::new(),
             filled: false,
@@ -2400,6 +2402,7 @@ operation's",
             var_count: 0,
             loops: Vec::new(),
             handler_arg_held: Vec::new(),
+            fail_redirect: Vec::new(),
             ret: c.ret.clone(),
             inout_slots: Vec::new(),
             filled: false,
@@ -2531,6 +2534,7 @@ operation's",
             var_count: 0,
             loops: Vec::new(),
             handler_arg_held: Vec::new(),
+            fail_redirect: Vec::new(),
             ret: h.ret.clone(),
             inout_slots: Vec::new(),
             filled: false,
@@ -2789,6 +2793,18 @@ struct FnCx<'a, 'm> {
     /// handler block is a pointer into *this* frame, and the frame outliving
     /// every call it makes is exactly what makes passing one down sound.
     handler_arg_held: Vec<(cranelift_codegen::ir::StackSlot, Vec<(String, VType)>)>,
+    /// Where a `fail` should go instead of returning from this function.
+    ///
+    /// A closure passed to `map` is *inlined* into the loop, so a `fail` in its
+    /// body is lexically inside this function and belongs to the closure. It
+    /// lowered as a return, and `[0, 1].map(|x| fail(e))` held as `[i64 ! E]`
+    /// reported an unhandled error from `main` where the interpreter produced a
+    /// list of `Err`s.
+    ///
+    /// `scopes` is how deep the scope stack was when the redirect was
+    /// installed: a `fail` releases what the closure body bound and nothing
+    /// the loop owns, which it still needs.
+    fail_redirect: Vec<(Block, Variable, usize)>,
     ret: VType,
     /// (caller pointer, local var, type) for `inout` params — stored back
     /// through the pointer before every return.
@@ -4125,6 +4141,30 @@ impl FnCx<'_, '_> {
             .flat_map(|sc| sc.values().cloned())
             .collect();
         for (var, vt) in live {
+            if vt.boxed() {
+                let v = self.b.use_var(var);
+                self.call_rt("grasm_val_dec", &[v]);
+            }
+        }
+    }
+
+    /// Releases boxed locals in scopes deeper than `depth`, leaving the rest.
+    ///
+    /// A `return` releases everything; a `fail` that is a closure's own failure
+    /// releases only what the closure bound, because the loop around it still
+    /// owns the list it is walking and the one it is building.
+    fn emit_scope_decs_below(&mut self, depth: usize) {
+        let deeper: Vec<(Variable, VType)> = self
+            .vars
+            .iter()
+            .skip(depth)
+            .flat_map(|s| s.values().cloned())
+            .collect();
+        let inout_vars: Vec<Variable> = self.inout_slots.iter().map(|(_, v, _)| *v).collect();
+        for (var, vt) in deeper {
+            if inout_vars.contains(&var) {
+                continue;
+            }
             if vt.boxed() {
                 let v = self.b.use_var(var);
                 self.call_rt("grasm_val_dec", &[v]);
@@ -8999,6 +9039,19 @@ checker did",
                     return nope(args[0].span(), "failing with unboxed values");
                 }
                 let wrapped = self.call_rt("grasm_err_new", &[ev]).unwrap();
+                // Inside a closure that was inlined into a loop, this `fail` is
+                // the *closure's* — it produces an `Err` element and the loop
+                // goes on. Releasing every scope, as a return does, would free
+                // the list being built and the one being walked.
+                if let Some((blk, slot, depth)) = self.fail_redirect.last().copied() {
+                    self.emit_scope_decs_below(depth);
+                    self.b.def_var(slot, wrapped);
+                    self.b.ins().jump(blk, &[]);
+                    self.filled = true;
+                    let dead = self.b.create_block();
+                    self.goto_block(dead);
+                    return Ok(None);
+                }
                 self.emit_scope_decs_all();
                 if matches!(self.ret, VType::Fallible(_, _)) {
                     self.b.ins().return_(&[wrapped]);
@@ -12819,7 +12872,32 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
         self.push_scope();
         self.bind(&acc_param.name, bound_acc, acc_t.clone());
         self.bind(&elem_param.name, evar, evt.clone());
+        // A `fail` in a fold whose accumulator is fallible is the closure's own
+        // failure: it becomes the accumulator, and the next round receives it.
+        // Without this it lowered as a return from the enclosing function, so
+        // `[1, 2].fold(seed, |a, x| if x == 2 { fail(e) } else { a })` reported
+        // an unhandled error from `main` where the interpreter finished and
+        // printed the fallback (F43).
+        let fold_fail = matches!(acc_t, VType::Fallible(..))
+            && body_can_fail(body)
+            && self.cg.fallible_closures.contains(&body.span().start);
+        let fail_blk = if fold_fail {
+            let blk = self.b.create_block();
+            let slot = self.new_var(&VType::Any);
+            // One *below* the current depth, so the scope holding the
+            // closure's own bindings is released by the `fail` as well. The
+            // ordinary path releases it with `pop_scope_with_decs`, and a fail
+            // path that skipped it leaked whatever they held — invisible with
+            // an `i64` element and one allocation with a `str`.
+            self.fail_redirect.push((blk, slot, self.vars.len().saturating_sub(1)));
+            Some((blk, slot))
+        } else {
+            None
+        };
         let (bv, bvt) = self.eval_expr_val(body)?;
+        if fail_blk.is_some() {
+            self.fail_redirect.pop();
+        }
         if bvt != acc_t {
             // Naming both is the difference between a refusal a reader can
             // act on and one that is simply false: an unannotated `map()`
@@ -12841,6 +12919,19 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
         self.pop_scope_with_decs();
         self.b.ins().jump(step, &[]);
         self.filled = true;
+
+        if let Some((blk, slot)) = fail_blk {
+            // The failure is the new accumulator. The old one is released here
+            // for the same reason it is on the ordinary path: this round
+            // consumed it.
+            self.goto_block(blk);
+            let prev = self.b.use_var(acc_var);
+            self.dec_if_boxed(prev, &acc_t);
+            let errv = self.b.use_var(slot);
+            self.b.def_var(acc_var, errv);
+            self.b.ins().jump(step, &[]);
+            self.filled = true;
+        }
 
         self.goto_block(step);
         let iv3 = self.b.use_var(ivar);
@@ -12873,10 +12964,14 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
         // inside a closure is that closure's own failure, which needs a value
         // per element rather than a return; until the loop can carry one,
         // this is a refusal rather than a wrong answer.
-        if body_can_fail(body) && self.cg.fallible_closures.contains(&closure_at) {
+        // A `fail` in the body is the *closure's* failure and belongs in the
+        // element, which only `map` has: `filter` answers a bool and `fold` a
+        // single accumulator, and neither has a place to put an `Err` per item.
+        let redirect_fail = body_can_fail(body) && self.cg.fallible_closures.contains(&closure_at);
+        if redirect_fail && !is_map {
             return nope(
                 body.span(),
-                "`fail` inside a *fallible* closure passed to `map`, `filter` or `fold` (write the failing part as a named function and pass that, or produce `Err(e)` instead of failing)",
+                "`fail` inside a *fallible* closure passed to `filter` or `fold` (there is no per-element result to hold the failure — produce `Err(e)` instead of failing, or pass a named function)",
             );
         }
         let list_var = self.new_var(&VType::List(Box::new(elem_t.clone())));
@@ -12950,7 +13045,25 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
         self.b.def_var(evar, ev);
         self.push_scope();
         self.bind(&param.name, evar, evt.clone());
+        // The closure's own `fail` goes here rather than out of this function:
+        // it pushes an `Err` element and the loop carries on.
+        let fail_blk = if redirect_fail {
+            let blk = self.b.create_block();
+            let slot = self.new_var(&VType::Any);
+            // One *below* the current depth, so the scope holding the
+            // closure's own bindings is released by the `fail` as well. The
+            // ordinary path releases it with `pop_scope_with_decs`, and a fail
+            // path that skipped it leaked whatever they held — invisible with
+            // an `i64` element and one allocation with a `str`.
+            self.fail_redirect.push((blk, slot, self.vars.len().saturating_sub(1)));
+            Some((blk, slot))
+        } else {
+            None
+        };
         let (bv, bvt) = self.eval_expr_val(body)?;
+        if fail_blk.is_some() {
+            self.fail_redirect.pop();
+        }
         let out_elem_t = if is_map { bvt.clone() } else { elem_t.clone() };
         if is_map {
             let cur = self.b.use_var(out_var);
@@ -12959,6 +13072,17 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
             self.pop_scope_with_decs();
             self.b.ins().jump(step, &[]);
             self.filled = true;
+            if let Some((blk, slot)) = fail_blk {
+                // The element the failure produced. Boxed already — `fail`
+                // wraps it — so it is pushed as the boxed value it is.
+                self.goto_block(blk);
+                let errv = self.b.use_var(slot);
+                let cur = self.b.use_var(out_var);
+                let np = self.list_push_elem(cur, errv, &VType::Any);
+                self.b.def_var(out_var, np);
+                self.b.ins().jump(step, &[]);
+                self.filled = true;
+            }
         } else {
             if bvt != VType::Bool {
                 return nope(body.span(), "a non-bool filter predicate");

@@ -275,7 +275,13 @@ expect_compiled "a closure literal in a match arm" 'fn main() {
     print("{f(10)} {g(10)}")
 }'
 
-expect_refused "fail inside a fallible closure passed to map" 'type E = { m: str }
+# Was a gap. The closure is inlined into the loop, so its `fail` was lexically
+# inside the enclosing function and lowered as a return from it — `[0, 1].map(|x|
+# fail(e))` held as `[i64 ! E]` reported an unhandled error from `main` where the
+# interpreter produced a list of `Err`s. A `fail` there now goes to a block that
+# pushes the `Err` as the element and lets the loop carry on, releasing what the
+# closure body bound and nothing the loop still owns.
+expect_compiled "fail inside a fallible closure passed to map" 'type E = { m: str }
 fn main() -> () ! E {
     let ys: [i64 ! E] = [0, 1].map(|x| fail(E{ m: "d" }))
     let v = ys[0] ?? 4
@@ -713,6 +719,33 @@ fn main() {
         Good(v) -> print("{v}")
         Bad(e) -> print("bad")
     }
+}'
+
+
+# The conditional shape, which has to get both paths right: an element from the
+# ok branch and an element from the failing one, in one list.
+expect_compiled "a map closure that fails for some elements only" 'type E = { m: str }
+
+fn main() -> () ! E {
+    let ys: [i64 ! E] = [1, 2, 3].map(|x| if x == 2 { fail(E{ m: "two" }) } else { Ok(x * 10) })
+    var i = 0
+    while i < ys.len() {
+        print("{ys[i] ?? -1}")
+        i = i + 1
+    }
+}'
+
+# A `fold` whose accumulator is fallible: the failure becomes the accumulator
+# and the next round receives it. This disagreed — the interpreter finished and
+# printed the fallback, the compiled build reported an unhandled error from
+# `main` — and `eval_fold` has its own path that never had the guard the map
+# loop had (F43).
+expect_compiled "fail inside a fallible fold closure" 'type E = { m: str }
+
+fn main() {
+    let seed: i64 ! E = Ok(0)
+    let t: i64 ! E = [1, 2].fold(seed, |a, x| if x == 2 { fail(E{ m: "two" }) } else { a })
+    print("{t ?? -1}")
 }'
 
 if [ "$ran" != "$declared" ]; then

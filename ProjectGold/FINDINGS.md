@@ -1717,3 +1717,49 @@ lot: the target is 0.95× and `tree` alone is 5.1× behind.
 
 Two runs were refused before this one landed — load 4.40 and 3.86 — and one of
 those was the harness catching my own previous run. The refusal is the feature.
+
+## F43 — a fold whose accumulator is fallible disagreed (S1, engine disagreement) — **fixed**
+
+```
+let seed: i64 ! E = Ok(0)
+let t: i64 ! E = [1, 2].fold(seed, |a, x| if x == 2 { fail(E{ m: "two" }) } else { a })
+print("{t ?? -1}")
+```
+
+```
+grasm run   -1        exit 0
+--native    error: unhandled error from main: E{m: two}   exit 1
+```
+
+A `fail` inside a closure whose own type is fallible is *that closure's*
+failure. In a fold it becomes the accumulator, and the next round receives it.
+The compiled backend inlines the closure into the loop, so the `fail` was
+lexically inside the enclosing function and lowered as a return from it.
+
+### Why it was not the gap that was being worked on
+
+The refusal in §11 named "`fail` inside a *fallible* closure passed to `map`,
+`filter` or `fold`", and it lived in the *map* loop. `fold` has its own
+lowering, which never had the guard — so the shape the message named was
+refused for `map` and **miscompiled for `fold`**.
+
+Found while closing the `map` half: the message named three combinators, so
+each of the other two was tried, and `filter` turned out never to have been
+affected — a `filter` predicate is `fn(T) -> bool`, so a `fail` in it is not the
+closure's own and already propagated identically on both engines. The refusal
+named a class of three, one of which was fixed by it, one of which never needed
+it, and one of which it did not cover.
+
+### The fix, and the leak it hid
+
+A `fail` under a redirect goes to a block that makes the failure the result —
+an `Err` element for `map`, the new accumulator for `fold` — and the loop
+carries on.
+
+The first version leaked exactly one allocation per failing fold. A `fail`
+releases the scopes *deeper* than where the redirect was installed, and the
+redirect recorded the depth after the closure's own scope was pushed — so the
+bindings the ordinary path releases with `pop_scope_with_decs` were released on
+one path and not the other. Invisible with an `i64` element; one allocation with
+a `str`. The map loop had the same bug and no test that could show it, because
+every map case tried until then had scalar elements.
