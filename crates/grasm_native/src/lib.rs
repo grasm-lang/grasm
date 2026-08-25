@@ -7671,10 +7671,42 @@ this case",
                 // `n.len()` on a struct with a `len` field call the free
                 // function, so the three engines printed two different
                 // answers for a program that typechecks.
-                if let Some(sig) = self
-                    .lookup_fn(&name.name)
-                    .filter(|_| !self.cg.field_calls.contains(&(span.start, span.end)))
+                // A *generic* free function called this way has no symbol until
+                // the call site fixes its type parameters, and `lookup_fn` does
+                // not carry generics — so `[1, 2].describe()` fell past this
+                // arm and was refused while `describe([1, 2])` compiled. The
+                // receiver is the first argument ([L-UFCS]), which is exactly
+                // what the type parameters are read from.
+                let ufcs_generic = if self.lookup_fn(&name.name).is_none()
+                    && !self.cg.field_calls.contains(&(span.start, span.end))
                 {
+                    let generic_key = format!("{}::{}", self.cg.current_module, name.name);
+                    if self.cg.generic_fns.contains_key(&generic_key) {
+                        let mut all: Vec<Expr> = Vec::with_capacity(args.len() + 1);
+                        all.push(recv.clone());
+                        all.extend(args.iter().cloned());
+                        let arg_types = self.generic_arg_types(&generic_key, &all)?;
+                        let module = self.cg.current_module.clone();
+                        Some(self.cg.instantiate_generic(
+                            &module,
+                            &name.name,
+                            &arg_types,
+                            span,
+                        )?)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let resolved: Option<FnSig> = match &ufcs_generic {
+                    Some(k) => self.cg.fns.get(k).cloned(),
+                    None => self
+                        .lookup_fn(&name.name)
+                        .filter(|_| !self.cg.field_calls.contains(&(span.start, span.end)))
+                        .cloned(),
+                };
+                if let Some(sig) = resolved {
                     let (fid, params, modes, ret, is_extern) = (
                         sig.id,
                         sig.params.clone(),

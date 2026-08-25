@@ -524,13 +524,19 @@ let b = Box{ f: |k| [1, 2, 3].par_filter(|x| x > 1).len() + k }\n    print(\"{b.
 /// cannot do, so it refuses by name instead.
 #[test]
 fn the_backend_resolves_a_method_the_way_the_checker_did() {
-    // The generic free function wins in the checker; the backend cannot see it,
-    // so it must refuse rather than call the field.
+    // The generic free function wins in the checker, and this backend now
+    // resolves it the same way: a generic free function called UFCS-style is
+    // instantiated from the receiver and the arguments.
+    //
+    // This asserted a *refusal*, which was right while the backend could not
+    // see a generic through `lookup_fn` — refusing beat calling the field and
+    // printing a heap address. It can see one now, so refusing would be
+    // over-strict, and the shape is checked end to end in
+    // `scripts/nativegaps.sh`, which runs it and compares the answer.
     let crossed = "type Box = { tag: fn() -> str }\n\nfn tag[T](x: T) -> i64 {\n    77\n}\n\n\
 fn main() {\n    let b = Box{ tag: || \"a string\" }\n    let v = b.tag()\n    \
 print(\"{v}\")\n}\n";
-    let err = compile(crossed).expect_err("a call the backend cannot resolve must be refused");
-    assert!(err.contains("cannot resolve the way the checker did"), "{err}");
+    compile(crossed).expect("the generic free function resolves the way the checker resolved it");
 
     // A field call the checker *did* resolve to the field still compiles.
     for src in [

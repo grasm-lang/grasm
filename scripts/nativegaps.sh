@@ -549,7 +549,11 @@ fn main() {
     print("{TABLE[0](21)}")
 }'
 
-expect_refused "a UFCS call of a generic function" 'fn describe[T](xs: [T]) -> str {
+# Was a gap. `lookup_fn` does not carry generics, so a generic free function
+# called UFCS-style had no symbol and the call was refused. It is instantiated
+# from the receiver and the arguments now — the receiver is the first parameter
+# ([L-UFCS]), which is where the type parameters come from.
+expect_compiled "a UFCS call of a generic function" 'fn describe[T](xs: [T]) -> str {
     "n={xs.len()}"
 }
 
@@ -627,6 +631,36 @@ if [ $fail -ne 0 ]; then
     echo "the documented gap list is out of date"
     exit 1
 fi
+
+# The shape that made the refusal right in the first place: a generic free
+# function with the same name as a function-typed field. The checker resolves it
+# to the function, and this must too — calling the field printed a heap address
+# and multiplied it by two, at exit 0 with nothing on stderr. Run and compared
+# here, which a compile-only test cannot do.
+expect_compiled "a generic free function crossed with a field of the same name" 'type Box = { tag: fn() -> str }
+
+fn tag[T](x: T) -> i64 {
+    77
+}
+
+fn main() {
+    let b = Box{ tag: || "a string" }
+    print("{b.tag()}")
+}'
+
+# And the other direction: a *non-generic* free function of the same name must
+# not win, because the checker resolves that one to the field.
+expect_compiled "a field of the same name as a non-generic free function" 'type Box = { tag: fn() -> str }
+
+fn tag(xs: [i64]) -> i64 {
+    9
+}
+
+fn main() {
+    let b = Box{ tag: || "f" }
+    print("{b.tag()}")
+}'
+
 if [ "$ran" != "$declared" ]; then
     echo
     echo "only $ran of $declared cases ran — the rest were never reached,"

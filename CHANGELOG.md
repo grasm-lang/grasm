@@ -7,6 +7,20 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
 
 ### Fixed
 
+- **`--native` compiles a UFCS call of a generic free function.**
+  `[1, 2].describe()` for `fn describe[T](xs: [T])`. A generic function has no
+  symbol until a call site fixes its type parameters, and the lookup this path
+  used does not carry generics — so the call was refused while
+  `describe([1, 2])` compiled. The receiver is the first parameter ([L-UFCS]),
+  which is exactly where the type parameters are read from.
+
+  This also removes a refusal that had been *correct*: a generic free function
+  with the same name as a function-typed field. The checker resolves it to the
+  function; the backend could not see it, and calling the field printed a heap
+  address and multiplied it by two. It resolves the same way as the checker now,
+  and both directions of that crossing are gated.
+
+  Three refusals remain in §11, down from seventeen.
 - **`--native` compiles a handler that outlives the expression that wrote it.**
   Returned from a function, stored in a struct field, held in a list, walked by
   a `for`, printed, instantiated generically, installed inside `parallel` — six
