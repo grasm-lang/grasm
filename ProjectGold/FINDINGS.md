@@ -60,6 +60,7 @@ and the entries disagree.
 | [F42](#f42) | an optimisation recogniser that refused to compile | S3, over-strict | **fixed** |
 | [F43](#f43) | a fold whose accumulator is fallible disagreed | S1, engine disagreement | **fixed** |
 | [F44](#f44) | the checker threw away every error inside a typed closure | S2, soundness | **fixed** |
+| [F45](#f45) | interpolating a unit was refused when its type was inferred | S3, over-strict | **fixed** |
 
 <!-- end index -->
 ## F1 — a wrapped condition must end the line with the operator (S4) — **fixed**
@@ -1939,3 +1940,36 @@ parse-failure guard that matched the word "expected" inside a perfectly good
 `type mismatch: expected \`i64\`, found \`str\``. A harness that reports a defect
 it has manufactured is worse than no harness, so each was chased to the bottom
 before the result was believed.
+
+## F45 — interpolating a unit was refused when its type was inferred (S3, over-strict) — **fixed**
+
+`print("{o.unwrap_or(())}")` compiled when the binding carried an
+annotation and was refused when it did not:
+
+```
+let o: Option[()] = Some(())    // compiles
+let o = Some(())                // native backend does not yet support
+                                // interpolating unit
+```
+
+Both spellings are the same program. The difference was which arm of the
+interpolation dispatch the value reached. A boxed value is rendered by
+`grasm_str_from_val`, which handles a unit correctly and has since F37;
+the unboxed arm below it had no case for `VType::Unit` and returned a
+refusal. Under an annotation the unit stayed boxed and printed `()`;
+inferred, it arrived unboxed and hit the refusal.
+
+A unit carries nothing, so the text it renders to is a constant. The arm
+now emits the literal `"()"` — the same three characters the interpreter
+and the boxed path already produced.
+
+Found by crossing map and `Option` operations with the representations
+their values can take, the container-level counterpart of the list
+element crossing in the same fuzzer. It is the fourth defect this shape
+of crossing has surfaced, and the first found by an axis rather than by a
+program someone tried to write.
+
+**Gate**: `scripts/fuzz_methods.py` grew five groups — `map of unit`,
+`map of tuple`, `option of unit`, `option of tuple`, `option of list` —
+carrying the count from 72 to 102 programs. The refusal was the last
+decline in the fuzzer; it now reports `declined: 0`.

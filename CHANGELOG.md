@@ -7,6 +7,9 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
 
 ### Fixed
 
+- Interpolating a unit compiles natively. It worked under a type
+  annotation and was refused without one; both spellings now render `()`
+  (F45).
 - **`--native` compiles a generic struct declaration.**
   `type Pair[A, B] = { fst: A, snd: B }`, nested, in lists, through generic
   functions, compared, mutated and printed. A generic type is kept whole until a

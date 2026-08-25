@@ -6266,7 +6266,12 @@ this case",
                             self.call_rt("grasm_val_dec", &[v]);
                             sv
                         }
-                        VType::Unit => return nope(inner.span(), "interpolating unit"),
+                        // A unit carries nothing, so there is nothing to
+                        // read: the text is a constant. It reached here
+                        // unboxed — the boxed arm above runs first, which is
+                        // why the same expression under an annotation always
+                        // compiled and only the inferred one was refused.
+                        VType::Unit => self.str_literal("()"),
                         _ => unreachable!(),
                     }
                 }

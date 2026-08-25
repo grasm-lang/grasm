@@ -70,6 +70,41 @@ GROUPS = [
             "(R / 4.0).asin()", "(R / 4.0).acos()", "R.atan()",
         ],
     ),
+    # A map and an `Option` carry the same representations a list does, and the
+    # same question applies: an operation that works on one and not another.
+    # The container itself is interpolated — `m`, `m.values()`, `o` — because a
+    # count cannot show that a unit came back as `0`.
+    (
+        "map of unit",
+        "built_unit()",
+        [
+            "R.len()", "R.is_empty()", 'R.has("a")', 'R.get("a")',
+            'R.get("nope")', "R.keys()", "R.values()", "R.entries()", "R",
+        ],
+    ),
+    (
+        "map of tuple",
+        "built_tuple()",
+        [
+            "R.len()", 'R.has("a")', 'R.get("a")', "R.keys()", "R.values()",
+            "R.entries()", "R",
+        ],
+    ),
+    (
+        "option of unit",
+        "Some(())",
+        ["R.is_some()", "R.is_none()", "R", "R.unwrap_or(())"],
+    ),
+    (
+        "option of tuple",
+        'Some((1, "a"))',
+        ["R.is_some()", "R.is_none()", "R", 'R.unwrap_or((0, "z"))'],
+    ),
+    (
+        "option of list",
+        "Some([1, 2])",
+        ["R.is_some()", "R.is_none()", "R", "R.unwrap_or([0])"],
+    ),
     # The same list surface, once per *element representation* the runtime
     # distinguishes. A list of `i64` is stored inline and a list of tuples is
     # boxed, and an operation that works on one and not the other is how
@@ -182,6 +217,20 @@ PRELUDE = """fn built() -> Map[str, i64] {
     m
 }
 
+fn built_unit() -> Map[str, ()] {
+    var m: Map[str, ()] = map()
+    m.set("a", ())
+    m.set("b", ())
+    m
+}
+
+fn built_tuple() -> Map[str, (i64, str)] {
+    var m: Map[str, (i64, str)] = map()
+    m.set("a", (1, "x"))
+    m.set("b", (2, "y"))
+    m
+}
+
 """
 
 
@@ -207,6 +256,11 @@ def ty_decl(ty):
         "bytes": "bytes",
         "map": "Map[str, i64]",
         "option": "Option[i64]",
+        "map of unit": "Map[str, ()]",
+        "map of tuple": "Map[str, (i64, str)]",
+        "option of unit": "Option[()]",
+        "option of tuple": "Option[(i64, str)]",
+        "option of list": "Option[[i64]]",
         "list of unit": "[()]",
         "list of tuple": "[(i64, str)]",
         "list of option": "[Option[i64]]",
