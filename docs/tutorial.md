@@ -760,7 +760,7 @@ defect being worked off:
 | polymorphic recursion | `fn f[T](x: T) -> i64 { f([x]) }` needs one compiled copy per type and the types never stop growing. No amount of work removes this; it is what monomorphization is, and it is refused by name at build time |
 
 Everything else the interpreter accepts, the compiled backend compiles.
-`scripts/nativegaps.sh` holds that claim to 46 cases, running each under both
+`scripts/nativegaps.sh` holds that claim to 47 cases, running each under both
 engines and comparing output, exit code and leaks. Five of the nine generators
 in `scripts/` report how many of the programs they invented the backend turned
 away, and all five report `declined: 0`.

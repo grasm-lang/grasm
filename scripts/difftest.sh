@@ -11,6 +11,7 @@ cd "$(dirname "$0")/.."
 # keeps its own assertions on and the runtime checks integer overflow.
 GRASM=${GRASM:-./target/release/grasm}
 . "$(dirname "$0")/lib/fresh.sh"
+. "$(dirname "$0")/lib/trace.sh"
 fresh_or_stop "./target/release/grasm"
 WORK="${TMPDIR:-/tmp}/grasm_difftest_$$"
 mkdir -p "$WORK"
@@ -68,10 +69,7 @@ for src in $programs; do
     interp_code=$?
     native_out=$("$bin" 2>"$native_err")
     native_code=$?
-    interp_diag=$(grep -v \
-        -e '^stack trace (innermost first):$' \
-        -e '^  [A-Za-z_][A-Za-z0-9_:]* at ' \
-        -e '^  \.\.\. [0-9]* more frame(s)$' "$interp_err")
+    interp_diag=$(strip_trace "$(cat "$interp_err")")
     native_diag=$(cat "$native_err")
     rm -f "$interp_err" "$native_err"
 

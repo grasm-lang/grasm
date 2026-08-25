@@ -84,7 +84,7 @@ neither of which is a defect: a generic sum constructor that leaves a type
 parameter undetermined, which is the language's rule ([T-GENERIC-TYPE]) rather
 than one engine's, and polymorphic recursion, which is what monomorphization
 is. `scripts/nativegaps.sh` proves the list matches the compiler in both
-directions, over 46 cases, comparing output, exit code and leaks.
+directions, over 47 cases, comparing output, exit code and leaks.
 
 Closed on 2026-08-16: writes through a `ref` (including around a cycle) and
 returning a closure. Closed on 2026-08-24 and 25: the prelude's `IoError`
@@ -93,7 +93,10 @@ variants, a range held as a value, `map` with a function returning nothing,
 an unannotated `map()`, a closure whose parameter types nothing local fixes, a
 type parameter only in a function result, every way of using an effect handler
 as a value, a UFCS call of a generic free function, generic `type` declarations
-for both structs and sums, and `fail` inside a fallible closure passed to `map`.
+for both structs and sums, and `fail` inside a fallible closure passed to `map`. Closed on 2026-08-25:
+interpolating a unit whose type was inferred rather than annotated (F45), and
+`return` of an `if` whose every branch fails (F46) — the second a Cranelift
+verifier failure, so a defect rather than a gap.
 
 ## S4 — diagnostics
 

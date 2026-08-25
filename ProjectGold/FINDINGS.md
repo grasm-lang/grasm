@@ -62,6 +62,7 @@ and the entries disagree.
 | [F44](#f44) | the checker threw away every error inside a typed closure | S2, soundness | **fixed** |
 | [F45](#f45) | interpolating a unit was refused when its type was inferred | S3, over-strict | **fixed** |
 | [F46](#f46) | `return` of an `if` that never comes back | S1, codegen bug | **fixed** |
+| [F47](#f47) | a gate nobody ran, failing on a rule it had a stale copy of | S3, harness | **fixed** |
 
 <!-- end index -->
 ## F1 — a wrapped condition must end the line with the operator (S4) — **fixed**
@@ -2021,3 +2022,48 @@ as a mismatch rather than a decline — the rule `fuzz_methods.py` already
 followed — and prints the seed and reason for any decline that remains.
 It reports `declined: 0`. Two cases added to `scripts/nativegaps.sh`:
 the shape above, and the same body without the `return`.
+
+## F47 — a gate nobody ran, failing on a rule it had a stale copy of (S3, harness) — **fixed**
+
+`scripts/crosstest.sh` builds every program for a second architecture,
+links it against a runtime built for that architecture, runs it, and
+requires the output to equal the interpreter's. It was not in the sweep
+that was actually run before each commit, and it had stopped working:
+
+```
+error: runtime for x86_64-apple-darwin missing
+```
+
+A `cargo clean` during a full disk had removed the archive. The gate
+refused to start and said so clearly — to nobody, because nothing ran
+it. Three faults, one behind the other:
+
+1. **Nothing ran it.** The gates were run from a list typed by hand each
+   time, and this one was not on it. `scripts/allgates.sh` now runs every
+   gate and every generator, and judges each by its exit code alone.
+2. **It did not build what it tests.** `scripts/lib/fresh.sh` exists
+   because of F36 and says a gate must produce its own artefact; this gate
+   only complained that the artefact was absent or stale. It builds the
+   cross runtime now.
+3. **Its copy of the trace rule was a version behind.** With the runtime
+   restored it reported `E-PANIC-TRACE.gr` as a cross-architecture
+   mismatch. [E-PANIC-TRACE] lets the engines differ about the stack
+   trace and nothing else, so every cross-engine gate strips the trace
+   block before comparing stderr — and three gates had three copies of
+   that rule. `difftest.sh` and `agreetest.sh` strip three patterns;
+   `crosstest.sh` stripped two, so the interpreter's `... 99980 more
+   frame(s)` survived and looked like a disagreement. One definition now,
+   in `scripts/lib/trace.sh`, sourced by all three.
+
+Nothing was wrong with the compiler: 223 programs cross-compiled to
+x86_64-apple-darwin agree with the aarch64 interpreter byte for byte,
+which is what this gate was written to prove and had not proved in weeks.
+
+The reporting was also one-sided — the gate compares stdout, exit code
+and diagnostics, and printed a diff of stdout only. A mismatch in
+diagnostics showed as a failure with an empty diff beneath it, which
+reads as a broken harness rather than a finding. It names which of the
+three differed now.
+
+**Gate**: `scripts/allgates.sh`, and `scripts/gatecheck.sh` already
+covers the new lib.

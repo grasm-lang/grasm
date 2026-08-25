@@ -19,6 +19,7 @@ cd "$(dirname "$0")/.."
 # keeps its own assertions on and the runtime checks integer overflow.
 GRASM=${GRASM:-./target/release/grasm}
 . "$(dirname "$0")/lib/fresh.sh"
+. "$(dirname "$0")/lib/trace.sh"
 fresh_or_stop "./target/release/grasm"
 WORK="${TMPDIR:-/tmp}/grasm_agree_$$"
 mkdir -p "$WORK"
@@ -71,12 +72,6 @@ check() {
     # disagreement about what the program does, so the trace block is excluded
     # from both. Everything else, including the panic message and the exit
     # code, has to match exactly.
-    strip_trace() {
-        grep -v \
-            -e '^stack trace (innermost first):$' \
-            -e '^  [A-Za-z_][A-Za-z0-9_:]* at ' \
-            -e '^  \.\.\. [0-9]* more frame(s)$' <<<"$1"
-    }
     i_out=$(strip_trace "$i_out")
     b_out=$(strip_trace "$b_out")
 

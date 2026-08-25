@@ -85,7 +85,12 @@ for src in $programs; do
                 random_bytes:filesystem \
                 list_dir:filesystem make_dir:filesystem \
                 proc_run:processes proc_pipeline:processes; do
-        if grep -q "${need%%:*}" "$src"; then
+        # Code, not prose. The name was matched anywhere in the file, so
+        # `T-EXTERN-VALUE.gr` -- which mentions `par_map` in a comment
+        # explaining why a purity proof matters -- was skipped as needing
+        # threads it never asks for. A skip is coverage lost, and one taken
+        # for a facility the program does not use is lost for nothing.
+        if grep -vE '^\s*(//|#)' "$src" | grep -q "${need%%:*}"; then
             skip=$((skip + 1))
             SKIPPED+=("$src — needs ${need##*:}, which wasm32-unknown-unknown has none of")
             continue 2

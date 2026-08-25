@@ -11,6 +11,20 @@ Everything below follows from that.
 
 ## Before you open a pull request
 
+One command runs everything below and judges each by its exit code:
+
+```
+./scripts/allgates.sh                    # every gate and generator; exits 1 if any failed
+```
+
+It reads `$?` and nothing else. That is the whole point of it: `wasmtest.sh`
+prints `identical: 184   mismatched: 0` on a run that exits 1 over four stale
+committed modules, and reading the summary instead of the status reported a
+failing gate as green. The same mistake in another shape hid nine of eleven
+`agreetest` failures behind a `tail -2`.
+
+The individual gates, if you want to run one:
+
 ```
 cargo build --release --workspace
 cargo test --workspace                   # all tests
@@ -23,6 +37,7 @@ cargo test -p grasm_spec                 # specification conformance
 ./scripts/nativegaps.sh                  # the documented gap list matches the compiler
 ./scripts/replaytest.sh                  # every journaled builtin refuses under an empty journal
 ./scripts/wasmtest.sh                    # the browser build agrees, and still builds
+./scripts/crosstest.sh                   # the same programs, cross-compiled to another architecture
 ./scripts/gatecheck.sh                   # the gates themselves call helpers that exist
 ./scripts/findings_index.sh --check      # FINDINGS.md's index matches its entries
 ./ProjectGold/run.sh                     # forty-four whole programs, three engines

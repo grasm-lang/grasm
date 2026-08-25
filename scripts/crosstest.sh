@@ -10,6 +10,8 @@
 #   default target: x86_64-apple-darwin (runs under Rosetta on arm64 macOS)
 set -uo pipefail
 
+. "$(dirname "$0")/lib/trace.sh"
+. "$(dirname "$0")/lib/fresh.sh"
 cd "$(dirname "$0")/.."
 TARGET="${1:-x86_64-apple-darwin}"
 ARCH="${TARGET%%-*}"
@@ -19,22 +21,27 @@ WORK="${TMPDIR:-/tmp}/grasm_crosstest_$$"
 mkdir -p "$WORK"
 trap 'rm -rf "$WORK"' EXIT
 
+fresh_or_stop ./target/release/grasm
 if [ ! -x "$GRASM" ]; then
     echo "error: $GRASM missing — run: cargo build --release --workspace"
     exit 1
 fi
+# The runtime for the other target is this gate's own artefact, and a gate
+# builds what it tests. It used to only complain: a `cargo clean` removed the
+# archive, the gate refused to start, and — because it was not in the sweep
+# anyone actually ran — nothing cross-compiled for weeks. A runtime older than
+# its own source is the same failure more quietly, linking against yesterday's
+# symbol set so every program using anything added since fails to link.
+if [ "${GRASM_NO_BUILD:-}" != 1 ]; then
+    if ! cargo build --release -q -p grasm_rt --target "$TARGET"; then
+        echo "error: the runtime for $TARGET does not build. If the target is"
+        echo "       not installed: rustup target add $TARGET"
+        exit 1
+    fi
+fi
 if [ ! -f "$RT" ]; then
     echo "error: runtime for $TARGET missing — run:"
     echo "  rustup target add $TARGET && cargo build --release -p grasm_rt --target $TARGET"
-    exit 1
-fi
-# A runtime older than its own source links against yesterday's symbol set, so
-# every program using anything added since fails to link. That looked exactly
-# like "the backend cannot compile this" the one time it happened, and cost
-# seven programs of coverage without a word of complaint.
-if [ -n "$(find crates/grasm_rt/src -name '*.rs' -newer "$RT" 2>/dev/null)" ]; then
-    echo "error: $RT is older than crates/grasm_rt/src — rebuild it:"
-    echo "  cargo build --release -p grasm_rt --target $TARGET"
     exit 1
 fi
 
@@ -77,7 +84,7 @@ for src in $(find examples projects spec/conformance benchmarks/grasm -name '*.g
     native_code=$?
     interp_out=$("$GRASM" run "$src" 2>"$interp_err")
     interp_code=$?
-    interp_diag=$(grep -v -e '^stack trace (innermost first):$' -e '^  [A-Za-z_][A-Za-z0-9_:]* at ' "$interp_err")
+    interp_diag=$(strip_trace "$(cat "$interp_err")")
     native_diag=$(cat "$native_err")
     rm -f "$native_err" "$interp_err"
 
@@ -89,7 +96,18 @@ for src in $(find examples projects spec/conformance benchmarks/grasm -name '*.g
         fail=$((fail + 1))
         FAILED+=("$src")
         echo "MISMATCH: $src (exit $interp_code vs $native_code)"
-        diff <(echo "$interp_out") <(echo "$native_out") | head -10
+        # Three things are compared and only one was ever shown. A program
+        # whose stdout and exit code agree and whose *diagnostics* differ was
+        # reported as a mismatch with an empty diff under it, which reads as a
+        # harness fault rather than a finding.
+        if [ "$native_out" != "$interp_out" ]; then
+            echo "  stdout:"
+            diff <(echo "$interp_out") <(echo "$native_out") | head -10
+        fi
+        if [ "$interp_diag" != "$native_diag" ]; then
+            echo "  diagnostics:"
+            diff <(echo "$interp_diag") <(echo "$native_diag") | head -10
+        fi
     fi
 done
 
