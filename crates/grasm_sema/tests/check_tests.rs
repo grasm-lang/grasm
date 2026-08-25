@@ -3878,3 +3878,78 @@ fn a_handler_operation_may_not_write_to_a_captured_binding() {
         "captured from outside",
     );
 }
+
+/// Every rule, in every position a closure body can occupy.
+///
+/// F44 was one rule going quiet in one position: a closure whose type is known
+/// from context had its diagnostics discarded, so unknown names and unknown
+/// methods inside an annotated `let`, a function parameter, a struct field or a
+/// handler operation were accepted. Each of those rules was tested — in a
+/// *statement*, which was never the deaf position.
+///
+/// So the rules are crossed with the positions. A rule that fires in one place
+/// and not another is the shape of that defect, and this fails for any of them
+/// rather than for the one that happened to be found.
+#[test]
+fn a_rule_that_fires_anywhere_fires_everywhere() {
+    // (name, offending fragment, what the diagnostic must say, legal alone?)
+    let rules: &[(&str, &str, &str, bool)] = &[
+        ("unknown name", "nosuchname(1)", "unknown name", true),
+        ("unknown method", "(1).nomethod()", "no method", true),
+        ("type mismatch", "let z: i64 = \"s\"", "mismatch", true),
+        ("unhandled fallible", "risky()", "failure is discarded", true),
+        // Legal as a statement — it is only a defect when the binding is
+        // captured — so that position is not asked of it.
+        ("capture write", "cell.push(1)", "captured from outside", false),
+        ("undeclared effect", "print(\"x\")", "not in its declared row", false),
+    ];
+
+    const PRE: &str = "type E = { m: str }\nfn risky() -> i64 ! E {\n    Ok(1)\n}\n";
+
+    for (rule, frag, needle, in_statement) in rules {
+        // Every wrapper declares `/ {}`, so the effect rule has a row to break,
+        // and the fragment is never the tail — a tail propagates rather than
+        // discards, which is a different rule.
+        let mut cases: Vec<(&str, String)> = vec![
+            ("unannotated closure", format!("fn plain() / {{}} {{\n    var cell: [i64] = []\n    let f = || {{\n        {frag}\n        0\n    }}\n    let _r = f()\n}}\nfn main() {{ plain() }}\n")),
+            ("annotated closure", format!("fn plain() / {{}} {{\n    var cell: [i64] = []\n    let f: fn() -> i64 = || {{\n        {frag}\n        0\n    }}\n    let _r = f()\n}}\nfn main() {{ plain() }}\n")),
+            ("fn parameter", format!("fn call(f: fn() -> i64) -> i64 {{\n    f()\n}}\nfn plain() / {{}} {{\n    var cell: [i64] = []\n    let _r = call(|| {{\n        {frag}\n        0\n    }})\n}}\nfn main() {{ plain() }}\n")),
+            ("struct field", format!("type B = {{ f: fn() -> i64 }}\nfn plain() / {{}} {{\n    var cell: [i64] = []\n    let b = B{{ f: || {{\n        {frag}\n        0\n    }} }}\n    let _r = b.f()\n}}\nfn main() {{ plain() }}\n")),
+            ("handler operation", format!("effect S {{\n    fn op() -> i64\n}}\nfn plain() / {{}} {{\n    var cell: [i64] = []\n    with S handled_by SHandler{{ op: || {{\n        {frag}\n        0\n    }} }} {{\n        let _r = S.op()\n    }}\n}}\nfn main() {{ plain() }}\n")),
+            ("map closure", format!("fn plain() / {{}} {{\n    var cell: [i64] = []\n    let _r = [1].map(|x| {{\n        {frag}\n        x\n    }})\n}}\nfn main() {{ plain() }}\n")),
+        ];
+        if *in_statement {
+            cases.insert(0, ("statement", format!("fn plain() / {{}} {{\n    var cell: [i64] = []\n    {frag}\n    let _k = cell.len()\n}}\nfn main() {{ plain() }}\n")));
+        }
+
+        for (position, body) in cases {
+            let src = format!("{PRE}{body}");
+            let (_, diags) = analyze(&src);
+            let text = diags
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+                .join("\n");
+            // The needle first. A parse-failure guard that ran before it
+            // matched the word "expected" inside a perfectly good
+            // `type mismatch: expected \`i64\`, found \`str\`` and called the
+            // probe malformed.
+            if text.contains(needle) {
+                continue;
+            }
+            // A program that does not parse tests nothing. Say which, rather
+            // than reporting it as a missing rule.
+            assert!(
+                !text.contains("expected a declaration")
+                    && !text.contains("expected an expression")
+                    && !text.contains("expected end of line"),
+                "the probe for `{rule}` in {position} does not parse:\n{text}\n{src}"
+            );
+            assert!(
+                text.contains(needle),
+                "`{rule}` is not reported in {position} — a rule that fires in one \
+place and not another is F44's shape\n  wanted: {needle}\n  got: {text:?}\n{src}"
+            );
+        }
+    }
+}

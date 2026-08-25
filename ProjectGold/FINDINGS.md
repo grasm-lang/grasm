@@ -1899,3 +1899,28 @@ that appears to accumulate state and accumulates none", and its program has no
 handler in it: the clause's own stated motivation was untested in the one
 position where the check was deaf. That case is now a test in `grasm_sema`
 beside the other F44 regressions.
+
+### The general form, as a gate
+
+F44 was one rule going quiet in one position, and every test for it used a
+*statement* — which was never the deaf position. So the rules are crossed with
+the positions: six rules (unknown name, unknown method, type mismatch, a
+discarded failure, a write to a captured binding, an undeclared effect) against
+seven places a closure body can sit (statement, unannotated closure, annotated
+closure, function parameter, struct field, handler operation, `map` closure).
+
+All six fire in all seven. `a_rule_that_fires_anywhere_fires_everywhere` in
+`grasm_sema` keeps it that way, and reintroducing F44 makes it say
+
+```
+`unknown name` is not reported in annotated closure — a rule that fires in one
+place and not another is F44's shape
+```
+
+Building the probe took three tries and every failure was the probe: closures
+written inside a string interpolation, a fragment sitting where it was the
+function's tail and therefore propagating rather than being discarded, and a
+parse-failure guard that matched the word "expected" inside a perfectly good
+`type mismatch: expected \`i64\`, found \`str\``. A harness that reports a defect
+it has manufactured is worse than no harness, so each was chased to the bottom
+before the result was believed.
