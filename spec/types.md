@@ -164,20 +164,19 @@ arguments are inferred at the call site.
 inference variables; a generic body is checked once against its parameters.
 
 **[T-GENERIC-TYPE]** `type Pair[A, B] = { fst: A, snd: B }` and
-`type Opt[T] = | Has(v: T) | Nothing` declare *families* of types. A use fixes
-the parameters: a struct literal reads them off the fields it gives, and a sum
-constructor off its arguments, the same way a call reads a function's.
+`type Opt[T] = | Has(v: T) | Nothing` declare *families*. A use fixes the
+parameters: a struct literal reads them off its fields, a sum constructor off
+its arguments. Two members are two types — `Has(5)` and `Has("text")` are an
+`Opt[i64]` and an `Opt[str]`, and a `match` binds each payload at its own.
 
-Two members of one family are two types. `Has(5)` and `Has("text")` in one
-program are an `Opt[i64]` and an `Opt[str]`, and a `match` on either binds its
-payload at that member's type.
-
-A parameter that no argument mentions is not determined and must be written
-down: `Good(1)` for `type Res[T, E]` says what `T` is and nothing about `E`, so
-it needs `let r: Res[i64, str] = Good(1)`. The interpreter can leave such a
-parameter open because it carries types at runtime; a compiled build needs one
-machine representation, and there is no way to choose one from nothing. The
-requirement is therefore the language's and not one engine's.
+A parameter no argument mentions must be written down: `Good(1)` for
+`Res[T, E]` fixes `T` and not `E`, so it needs `let r: Res[i64, str] = Good(1)`.
+An engine carrying types at runtime can leave it open; one compiling ahead of
+time needs a single representation and has nothing to choose it from, so the
+requirement is the language's rather than either engine's. The checker does not
+enforce it yet — `let r = Good(1)` passes `grasm check` and `--native` refuses
+it — which is a missing check, not an over-strict backend, and is recorded in
+`docs/known-issues.md`.
 
 ## 5. Errors as values
 

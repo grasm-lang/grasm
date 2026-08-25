@@ -5,7 +5,7 @@ Every defect that is known and not fixed, with its severity from
 to paste. S1 and S2 block a release; S3 and S4 do not, and this file is what
 makes shipping them honest rather than quiet.
 
-**Open S1: none. Open S2: none. Open S3: none. Open S4: none.**
+**Open S1: none. Open S2: none. Open S3: one. Open S4: none.**
 
 Closed on 2026-08-17, all four found by writing a calculator in the language
 rather than by a test: a closure in a `match` arm could not see the arm's own
@@ -45,6 +45,33 @@ The six defects that were open on 2026-08-17 are closed:
 * a **deeply nested tuple literal** cost O(n³) to check — 1000 levels took 7.8
   seconds, now 31 ms.
 
+## S3 — the checker does not enforce [T-GENERIC-TYPE]'s annotation rule
+
+```
+type Res[T, E] = | Good(v: T) | Bad(e: E)
+
+fn main() {
+    let r = Good(1)
+    match r {
+        Good(v) -> print("{v}")
+        Bad(e) -> print("bad")
+    }
+}
+```
+
+`grasm check` passes, `grasm run` prints `1`, `grasm build --native` refuses:
+`Good` here — the arguments say nothing about `E`, so annotate the binding.
+
+[T-GENERIC-TYPE] says the annotation is required, and gives the reason: a
+constructor that mentions one type parameter and not the other leaves the other
+determined by nothing, and an engine that compiles ahead of time has to pick one
+machine representation. The clause is the language's rule; the checker has not
+been taught it, so the requirement is enforced by one engine out of three.
+
+Either fix closes it — teach the checker, or decide the clause is wrong — and
+the first is what the clause asks for. Adding `let r: Res[i64, str] = Good(1)`
+compiles everywhere today.
+
 ## S3 — over-strict, effect-row inference
 
 ### The fallback pool — *removed*
@@ -63,15 +90,24 @@ here (a `match` payload charged a sibling parameter's row) cannot recur.
 ### `--native` — *no gaps in the repository's programs*
 
 Every program in `spec/conformance/`, `examples/`, `projects/` and
-`benchmarks/` compiles natively: **204 identical across all three engines, 0
-unsupported, 0 leaking.** The §11 table still lists shapes the backend refuses
-— a generic `type` declaration, a handler used as a value, calling a function
-value through anything but a name, and others — and
-`scripts/nativegaps.sh` proves that list matches the compiler in both
-directions. Each is a refusal by name at build time, never a miscompile.
+`benchmarks/` compiles natively: **222 identical across all three engines, 0
+unsupported, 0 leaking.**
+
+The §11 table listed seventeen shapes the backend refused and now lists two,
+neither of which is a defect: a generic sum constructor that leaves a type
+parameter undetermined, which is the language's rule ([T-GENERIC-TYPE]) rather
+than one engine's, and polymorphic recursion, which is what monomorphization
+is. `scripts/nativegaps.sh` proves the list matches the compiler in both
+directions, over 46 cases, comparing output, exit code and leaks.
 
 Closed on 2026-08-16: writes through a `ref` (including around a cycle) and
-returning a closure.
+returning a closure. Closed on 2026-08-24 and 25: the prelude's `IoError`
+variants, a range held as a value, `map` with a function returning nothing,
+`==` on two bare `ref`s, a call through a non-name callee, a `fold` seeded with
+an unannotated `map()`, a closure whose parameter types nothing local fixes, a
+type parameter only in a function result, every way of using an effect handler
+as a value, a UFCS call of a generic free function, generic `type` declarations
+for both structs and sums, and `fail` inside a fallible closure passed to `map`.
 
 ## S4 — diagnostics
 

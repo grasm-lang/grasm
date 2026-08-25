@@ -605,20 +605,19 @@ arguments are inferred at the call site.
 inference variables; a generic body is checked once against its parameters.
 
 **[T-GENERIC-TYPE]** `type Pair[A, B] = { fst: A, snd: B }` and
-`type Opt[T] = | Has(v: T) | Nothing` declare *families* of types. A use fixes
-the parameters: a struct literal reads them off the fields it gives, and a sum
-constructor off its arguments, the same way a call reads a function's.
+`type Opt[T] = | Has(v: T) | Nothing` declare *families*. A use fixes the
+parameters: a struct literal reads them off its fields, a sum constructor off
+its arguments. Two members are two types — `Has(5)` and `Has("text")` are an
+`Opt[i64]` and an `Opt[str]`, and a `match` binds each payload at its own.
 
-Two members of one family are two types. `Has(5)` and `Has("text")` in one
-program are an `Opt[i64]` and an `Opt[str]`, and a `match` on either binds its
-payload at that member's type.
-
-A parameter that no argument mentions is not determined and must be written
-down: `Good(1)` for `type Res[T, E]` says what `T` is and nothing about `E`, so
-it needs `let r: Res[i64, str] = Good(1)`. The interpreter can leave such a
-parameter open because it carries types at runtime; a compiled build needs one
-machine representation, and there is no way to choose one from nothing. The
-requirement is therefore the language's and not one engine's.
+A parameter no argument mentions must be written down: `Good(1)` for
+`Res[T, E]` fixes `T` and not `E`, so it needs `let r: Res[i64, str] = Good(1)`.
+An engine carrying types at runtime can leave it open; one compiling ahead of
+time needs a single representation and has nothing to choose it from, so the
+requirement is the language's rather than either engine's. The checker does not
+enforce it yet — `let r = Good(1)` passes `grasm check` and `--native` refuses
+it — which is a missing check, not an over-strict backend, and is recorded in
+`docs/known-issues.md`.
 
 ## 5. Errors as values
 
@@ -3736,24 +3735,38 @@ A recording is portable between engines, which is the case that matters: the
 failure happens in the compiled build and the debugger is in `grasm run`. It
 even replays in a browser tab — see [replay.md](replay.md).
 
-## 11. What `--native` will not compile yet
+## 11. Where `--native` stops
 
-`grasm run` and `grasm build --native` are two implementations of one
-language, and `scripts/difftest.sh` holds them to identical output on every
-program in the repository. The compiled backend is nonetheless a *smaller*
-language than this document describes. It refuses what it cannot do, by name
-and at build time — it never miscompiles it — but a program using one of these
-runs only under `grasm run`:
+`grasm run` and `grasm build --native` are two implementations of one language,
+and `scripts/difftest.sh` holds them to identical output — and identical exit
+codes — on every program in the repository.
 
-| shape | example |
-|-------|---------|
-| a generic sum constructor that leaves a type parameter undetermined | `Good(1)` for `type Res[T, E]` — nothing says what `E` is, so annotate the binding: `let r: Res[i64, str] = Good(1)` |
-| `fail` inside a *fallible* closure passed to `map`, `filter` or `fold` | `xs.map(\|x\| fail(e))` where the result is held as `[T ! E]` — produce `Err(e)` instead of failing, or pass a named function |
-| polymorphic recursion | `fn f[T](x: T) -> i64 { f([x]) }` — one compiled copy per type, and the types never stop growing |
+For most of this project's life the compiled backend was the *smaller* of the
+two, and this section was a list of shapes that ran under `grasm run` and could
+not be built. That list was seventeen entries long and is now two, and neither
+of the two is a defect being worked off:
 
-Each of these is a defect being worked off, not a design boundary. The list is
-checked against the implementation rather than remembered: if one of them
-starts compiling, this table is what has to change.
+| shape | why |
+|-------|-----|
+| a generic sum constructor that leaves a type parameter undetermined | `Good(1)` for `type Res[T, E]` says what `T` is and nothing about `E`. A compiled build needs one machine representation and cannot choose it from nothing, so the binding is annotated: `let r: Res[i64, str] = Good(1)`. [T-GENERIC-TYPE] makes that the *language's* rule — but the checker does not enforce it yet, so this one program is accepted by `grasm run` and refused here. That gap is the open S3 in [known-issues.md](known-issues.md), and it is a missing check rather than a backend limitation |
+| polymorphic recursion | `fn f[T](x: T) -> i64 { f([x]) }` needs one compiled copy per type and the types never stop growing. No amount of work removes this; it is what monomorphization is |
+
+Everything else the interpreter accepts, the compiled backend compiles.
+`scripts/nativegaps.sh` holds that claim to 46 cases, running each under both
+engines and comparing output, exit code and leaks. Five of the nine generators
+in `scripts/` report how many of the programs they invented the backend turned
+away, and all five report `declined: 0`.
+
+That is a statement about what has been checked, not a proof. A shape nobody has
+written is a shape nobody has tried. What has changed is the direction the gate
+points: it used to record what the backend could not do, and now it mostly
+records what it can.
+
+A refusal, when one appears, is by name and at build time rather than a wrong
+answer. That is the promise, and it has been broken: a `fold` whose accumulator
+was fallible was named in this table as refused and was quietly miscompiled
+instead (F43). Both halves of that shape are in the gate list now — the one that
+works and the one that must not.
 
 ## Where to go next
 
