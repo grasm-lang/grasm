@@ -24,6 +24,7 @@ cargo test -p grasm_spec                 # specification conformance
 ./scripts/replaytest.sh                  # every journaled builtin refuses under an empty journal
 ./scripts/wasmtest.sh                    # the browser build agrees, and still builds
 ./scripts/gatecheck.sh                   # the gates themselves call helpers that exist
+./scripts/findings_index.sh --check      # FINDINGS.md's index matches its entries
 ./ProjectGold/run.sh                     # forty-four whole programs, three engines
 ```
 
