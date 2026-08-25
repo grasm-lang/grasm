@@ -1,6 +1,6 @@
 # Grasm — conformance programs: types
 
-The type and effect system — what a program means before it runs. 94 executable program(s), one per normative clause of
+The type and effect system — what a program means before it runs. 95 executable program(s), one per normative clause of
 `grasm-language-pack.md`. Each header states the tag it demonstrates and the
 exact expected behaviour, and every one is run by `cargo test -p grasm_spec`, so
 a program here cannot describe behaviour the implementation does not have.
@@ -263,9 +263,13 @@ fn concurrent() / {async} {
 // silently permitting it.
 fn every_world_touching_builtin(path: str) / {io} {
     // Answers discarded with `match` rather than held as annotated `! IoError`
-    // values: what matters is that naming them charges `io`, and the native
-    // backend does not yet take `IoError` as a binding's declared type — so the
-    // annotated form would have made this program run on two engines of three.
+    // values: what matters here is that naming a builtin charges `io`, and
+    // `match` says that with the least around it.
+    //
+    // It was once also a necessity — the native backend had no declaration for
+    // the prelude's `IoError` and refused the annotated form — and that is no
+    // longer true. Left as it is because the shape is right, not because it has
+    // to be.
     match read_file(path) { Ok(v) -> {}  Err(e) -> {} }
     match write_file(path, "") { Ok(v) -> {}  Err(e) -> {} }
     match read_bytes(path) { Ok(v) -> {}  Err(e) -> {} }
@@ -834,8 +838,22 @@ fn main() {
 //! []
 //! 101
 //! evaluated once
+//! 2
+//! -1
 // `??` over a fallible value, which used to be a four-line `match`.
 type E = { m: str }
+
+// An *effect operation* under `??`, which is the same clause and a different
+// path through the backend. `m.get(k) ?? d` is fused into one call that never
+// builds an Option, and the recogniser for it matches a call named `get` taking
+// one argument — which an operation can also be. It probed the receiver to
+// confirm a map, `Src` is an effect rather than a value, and the failed probe
+// was propagated instead of meaning "not this shape": the program was refused
+// (F42). `match Src.get(1)` compiled and an annotated `let` compiled, so only
+// this spelling showed it.
+effect Src {
+    fn get(n: i64) -> i64 ! E
+}
 
 fn parse(s: str) -> i64 ! E {
     match s.parse_int() {
@@ -862,6 +880,11 @@ fn main() {
     // The success path does not evaluate the fallback; the failing one does.
     let _ok = parse("5") ?? fallback()
     let _bad = parse("z") ?? fallback()
+
+    with Src handled_by SrcHandler{ get: |n| if n > 0 { Ok(n * 2) } else { Err(E{ m: "low" }) } } {
+        print("{Src.get(1) ?? 0}")
+        print("{Src.get(0) ?? 0 - 1}")
+    }
 }
 ```
 
@@ -1394,6 +1417,71 @@ fn count[T](xs: [T]) -> i64 {
 fn main() {
     // One generic body, two instantiations.
     print("{count([1, 2])} {count(["a", "b"])}")
+}
+```
+
+## `T-GENERIC-TYPE.gr`
+
+```grasm
+//! tag: T-GENERIC-TYPE
+//! expect: output
+//! 1 x
+//! a 2
+//! 2 deep
+//! Pair{fst: 1, snd: x}
+//! true false
+//! has 5
+//! str text
+//! none
+//! good 1
+// A generic type declares a family; a use fixes its parameters.
+//
+// The two-instantiations case is the one that has to work and the one that
+// broke first, as a wrong answer rather than a refusal: `Has(5)` and
+// `Has("text")` in one program, where a by-name index of variants held one
+// parent per name, so the second constructor built the first's type and the
+// match unboxed a string pointer as an integer.
+type Pair[A, B] = { fst: A, snd: B }
+type Opt[T] = | Has(v: T) | Nothing
+type Res[T, E] = | Good(v: T) | Bad(e: E)
+
+fn show(o: Opt[i64]) -> str {
+    match o {
+        Has(v) -> "has {v}"
+        Nothing -> "none"
+    }
+}
+
+fn main() {
+    // A struct literal reads its arguments off the fields it gives.
+    let p = Pair{ fst: 1, snd: "x" }
+    print("{p.fst} {p.snd}")
+    let q = Pair{ fst: "a", snd: 2 }
+    print("{q.fst} {q.snd}")
+    let nested = Pair{ fst: Pair{ fst: 1, snd: 2 }, snd: "deep" }
+    print("{nested.fst.snd} {nested.snd}")
+    // The member's name is how an implementation tells two apart. It is not
+    // what the type is called, and printing one says `Pair`.
+    print("{p}")
+    print("{p == Pair{ fst: 1, snd: "x" }} {p == Pair{ fst: 2, snd: "x" }}")
+
+    // A sum constructor reads them off its arguments. Two members of one
+    // family in one program are two types.
+    print("{show(Has(5))}")
+    let b = Has("text")
+    match b {
+        Has(v) -> print("str {v}")
+        Nothing -> print("none")
+    }
+    let n: Opt[i64] = Nothing
+    print("{show(n)}")
+
+    // A parameter no argument mentions has to be written down.
+    let r: Res[i64, str] = Good(1)
+    match r {
+        Good(v) -> print("good {v}")
+        Bad(e) -> print("bad {e}")
+    }
 }
 ```
 

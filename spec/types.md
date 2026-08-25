@@ -163,6 +163,22 @@ arguments are inferred at the call site.
 **[T-GENERIC-INST]** Each call instantiates the signature with fresh
 inference variables; a generic body is checked once against its parameters.
 
+**[T-GENERIC-TYPE]** `type Pair[A, B] = { fst: A, snd: B }` and
+`type Opt[T] = | Has(v: T) | Nothing` declare *families* of types. A use fixes
+the parameters: a struct literal reads them off the fields it gives, and a sum
+constructor off its arguments, the same way a call reads a function's.
+
+Two members of one family are two types. `Has(5)` and `Has("text")` in one
+program are an `Opt[i64]` and an `Opt[str]`, and a `match` on either binds its
+payload at that member's type.
+
+A parameter that no argument mentions is not determined and must be written
+down: `Good(1)` for `type Res[T, E]` says what `T` is and nothing about `E`, so
+it needs `let r: Res[i64, str] = Good(1)`. The interpreter can leave such a
+parameter open because it carries types at runtime; a compiled build needs one
+machine representation, and there is no way to choose one from nothing. The
+requirement is therefore the language's and not one engine's.
+
 ## 5. Errors as values
 
 **[T-FALLIBLE]** `T ! E` is the type of a computation yielding `T` or failing

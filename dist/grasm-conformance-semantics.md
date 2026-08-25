@@ -530,6 +530,17 @@ fn main() {
 //! tag: E-HANDLER-SCOPE
 //! expect: output
 //! 42
+//! 7
+//! 7
+// A handler installed by `with` is in scope for everything the block reaches,
+// however many calls deep — the operation is resolved where it is *performed*,
+// not where it is written.
+//
+// The second half is the same property approached from the other side: the
+// handler itself travels as a value, and the function that installs it never
+// saw the literal. An operation call cannot tell the difference, because it
+// was never a direct call — it is a lookup by effect and operation name, and
+// both halves of this program fill the same table.
 effect Cfg {
     fn value() -> i64
 }
@@ -539,10 +550,18 @@ fn deep() -> i64 {
 fn middle() -> i64 {
     deep()
 }
+fn install(h: CfgHandler) / {io, Cfg} {
+    with Cfg handled_by h {
+        print("{middle()}")
+    }
+}
 fn main() {
     with Cfg handled_by CfgHandler{ value: || 42 } {
         print("{middle()}")
     }
+    let seven = CfgHandler{ value: || 7 }
+    install(seven)
+    install(CfgHandler{ value: || 7 })
 }
 ```
 

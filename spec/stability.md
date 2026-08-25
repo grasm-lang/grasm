@@ -201,6 +201,7 @@ for "no problem found" to mean anything.
 - `T-FN-VALUE` — provisional
 - `T-GENERIC-FN` — provisional
 - `T-GENERIC-INST` — provisional
+- `T-GENERIC-TYPE` — provisional
 - `T-INOUT-REF` — provisional
 - `T-INT-ALIAS` — provisional
 - `T-MAP-KEY-GENERIC` — provisional

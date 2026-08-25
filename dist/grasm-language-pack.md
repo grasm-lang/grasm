@@ -604,6 +604,22 @@ arguments are inferred at the call site.
 **[T-GENERIC-INST]** Each call instantiates the signature with fresh
 inference variables; a generic body is checked once against its parameters.
 
+**[T-GENERIC-TYPE]** `type Pair[A, B] = { fst: A, snd: B }` and
+`type Opt[T] = | Has(v: T) | Nothing` declare *families* of types. A use fixes
+the parameters: a struct literal reads them off the fields it gives, and a sum
+constructor off its arguments, the same way a call reads a function's.
+
+Two members of one family are two types. `Has(5)` and `Has("text")` in one
+program are an `Opt[i64]` and an `Opt[str]`, and a `match` on either binds its
+payload at that member's type.
+
+A parameter that no argument mentions is not determined and must be written
+down: `Good(1)` for `type Res[T, E]` says what `T` is and nothing about `E`, so
+it needs `let r: Res[i64, str] = Good(1)`. The interpreter can leave such a
+parameter open because it carries types at runtime; a compiled build needs one
+machine representation, and there is no way to choose one from nothing. The
+requirement is therefore the language's and not one engine's.
+
 ## 5. Errors as values
 
 **[T-FALLIBLE]** `T ! E` is the type of a computation yielding `T` or failing
@@ -2591,9 +2607,18 @@ order ([E-MAP-ORDER]).
 
 **[L-LIB-RANGE-OPS]** A range answers `to_list`, `map`, `filter`, `sum` and
 `len`, producing a list of the same elements `for i in a..b` walks. There is one
-definition of what a range contains and not two: the interpreter turns the range
-into that list and reuses the list method, and the compiled backend rewrites the
-call into the loop it already compiles, since it has no range *value* (§11).
+definition of what a range contains and not two: every engine builds that list
+and reuses the list method.
+
+A range is also a **value**: `let r = 0..n` binds one, it prints as `0..n`
+rather than as its elements, and two compare equal when their bounds and their
+inclusiveness match — so `0..3 == 0..3` and `0..3 != 0..=3`. It holds three
+numbers and not its elements, so `0..2_000_000` costs the same as `0..2`.
+
+`len` is answered from the bounds without building anything; the others build
+the list first. `for i in a..b` written literally never builds a range at all —
+it is compiled into a counted loop — and that is why the loop costs nothing and
+holding a range costs one allocation.
 
 The clause exists because of what it replaces. Building a list from a count
 needed `var xs: [i64] = []`, a `for`, a `push` and two closing braces — four
@@ -3654,6 +3679,63 @@ that keeps its signature and starts returning something else is a `PATCH` here
 and a disaster for you. Deciding that automatically is undecidable, and a tool
 that claimed to would be worse than one that says where it stops.
 
+## 10c. Making a failure happen twice
+
+A program is a function of its code and everything it read from outside itself.
+The code is in the binary; the rest can be written down:
+
+```text
+$ GRASM_RECORD=j ./server          # the run that went wrong
+$ GRASM_REPLAY=j grasm run src/main.gr
+```
+
+The second run does not read the clock, the disk, the network or the
+environment. It takes every answer from `j` — so it behaves the same on your
+laptop as it did on the machine that failed, as many times as you need, under a
+debugger.
+
+It also does not *write*. Replaying a `write_file` to reproduce a bug would
+damage a disk. `print` is the deliberate exception: a replay whose output you
+cannot see is not worth running.
+
+`grasm journal` shows what was recorded:
+
+```text
+$ grasm journal j
+j — 5 record(s), 264 bytes
+
+  1  now_millis  1787564958324
+  2  env         Some("/home/dev")
+  3  read_file   Ok("port = 8080\n")
+  4  tcp_listen  Err(IoFailed("Permission denied (os error 13)"))
+  5  now_millis  1787564958324
+
+  5 call(s) across 4 builtin(s): env 1, now_millis 2, read_file 1, tcp_listen 1
+```
+
+**Why this is cheap here and expensive elsewhere.** Knowing which calls are
+non-deterministic is normally the hard part of building a record-and-replay
+tool. In Grasm it was already written down: a function that reaches outside the
+program declares an effect (§5), and one that does not *cannot*. The journal is
+"every call with a row, in order, and what it answered".
+
+**Divergence is refused, not guessed.** If the program takes a different path
+from the recorded one, the run stops and says which call disagreed:
+
+```text
+grasm: at call 3 the recording says `read_file` and this run asked for
+`env` — the program has taken a different path from the one recorded, so
+this is not a replay of it
+```
+
+Handing back the next record anyway would produce something that looks like a
+replay and is not, and a tool whose whole promise is *this is what happened*
+must not be able to lie about it.
+
+A recording is portable between engines, which is the case that matters: the
+failure happens in the compiled build and the debugger is in `grasm run`. It
+even replays in a browser tab — see [replay.md](replay.md).
+
 ## 11. What `--native` will not compile yet
 
 `grasm run` and `grasm build --native` are two implementations of one
@@ -3665,25 +3747,8 @@ runs only under `grasm run`:
 
 | shape | example |
 |-------|---------|
-| a generic **type** declaration | `type Pair[A, B] = { fst: A, snd: B }` |
-| an effect handler as a return type | `fn mk() -> ClockHandler { … }` |
-| a range held as a value | `let r = 1..5` (`for i in 0..5` is fine) |
-| `map` with a function that returns nothing | `xs.map(\|x\| print(x))` — a `for` loop is what that meant |
-| a type parameter appearing **only** in a function-typed parameter's result | `fn key_by[T, K](xs: [T], f: fn(T) -> K) -> [K]` |
-| a handler that is a loop variable or a list element | `for h in hs { with Src handled_by h { … } }` — a `let`-bound handler compiles |
-| a handler operation that is a named `fn` | `SrcHandler{ get: named }` — write the closure inline |
-| `==` on two bare `ref`s | `a == b` — comparing structs or lists *containing* refs compiles |
-| calling a function value through anything but a name | `TABLE[0](21)`, `(m.get(k) ?? d)(x)` — bind it with `let` first, then call it |
-| a UFCS call of a *generic* free function | `[1, 2].describe()` for `fn describe[T](xs: [T])` — write `describe([1, 2])` |
-| an effect handler as a **struct field** type | `type Box = { h: CfgHandler }` — bind the handler with `let` instead |
-| matching the prelude `IoError`'s variants | `match e { NotFound(p) -> … }` — [L-LIB-IO]'s way of reading *why* a read failed; compare `e` as a whole, or use `??`, until this compiles |
-| an effect handler as a **parameter** type | `fn run(h: LogHandler) { with Log handled_by h { … } }` — the shape [E-HANDLER-OWN-ROW] documents; install the handler at the call site instead |
-| a generic instantiated at a handler type | `f(h)` for `fn f[T](x: T)` — pass what the handler computes instead |
-| a handler used as a *value* | `print("{h}")`, or storing one — install it with `with … handled_by` instead |
-| a `with` block inside `parallel`/`spawn` | install the handler around the `parallel` block instead |
-| a closure with parameters whose types nothing fixes | `let f = \|x\| x * 2` then `f(p.0)` where `p` is destructured by a `for` — annotate the binding, as in `let f: fn(i64) -> i64 = \|x\| x * 2` |
+| a generic sum constructor that leaves a type parameter undetermined | `Good(1)` for `type Res[T, E]` — nothing says what `E` is, so annotate the binding: `let r: Res[i64, str] = Good(1)` |
 | `fail` inside a *fallible* closure passed to `map`, `filter` or `fold` | `xs.map(\|x\| fail(e))` where the result is held as `[T ! E]` — produce `Err(e)` instead of failing, or pass a named function |
-| a `fold` seeded with an unannotated `map()` | `xs.fold(map(), add)` — annotate the seed: `let seed: Map[str, i64] = map()` |
 | polymorphic recursion | `fn f[T](x: T) -> i64 { f([x]) }` — one compiled copy per type, and the types never stop growing |
 
 Each of these is a defect being worked off, not a design boundary. The list is
@@ -3697,4 +3762,6 @@ starts compiling, this table is what has to change.
 - `examples/` — runnable programs, including `stdlib_tour.gr` and
   `testing_tour.gr`.
 - `projects/` — twelve larger programs, beginner through advanced.
+- `docs/replay.md` — recording a run and replaying it, in full.
+- `docs/wasm.md` — running a Grasm program in a browser tab.
 - `MASTERPLAN.md` — where the language is going and why.

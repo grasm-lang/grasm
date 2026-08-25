@@ -1,0 +1,60 @@
+//! tag: T-GENERIC-TYPE
+//! expect: output
+//! 1 x
+//! a 2
+//! 2 deep
+//! Pair{fst: 1, snd: x}
+//! true false
+//! has 5
+//! str text
+//! none
+//! good 1
+// A generic type declares a family; a use fixes its parameters.
+//
+// The two-instantiations case is the one that has to work and the one that
+// broke first, as a wrong answer rather than a refusal: `Has(5)` and
+// `Has("text")` in one program, where a by-name index of variants held one
+// parent per name, so the second constructor built the first's type and the
+// match unboxed a string pointer as an integer.
+type Pair[A, B] = { fst: A, snd: B }
+type Opt[T] = | Has(v: T) | Nothing
+type Res[T, E] = | Good(v: T) | Bad(e: E)
+
+fn show(o: Opt[i64]) -> str {
+    match o {
+        Has(v) -> "has {v}"
+        Nothing -> "none"
+    }
+}
+
+fn main() {
+    // A struct literal reads its arguments off the fields it gives.
+    let p = Pair{ fst: 1, snd: "x" }
+    print("{p.fst} {p.snd}")
+    let q = Pair{ fst: "a", snd: 2 }
+    print("{q.fst} {q.snd}")
+    let nested = Pair{ fst: Pair{ fst: 1, snd: 2 }, snd: "deep" }
+    print("{nested.fst.snd} {nested.snd}")
+    // The member's name is how an implementation tells two apart. It is not
+    // what the type is called, and printing one says `Pair`.
+    print("{p}")
+    print("{p == Pair{ fst: 1, snd: "x" }} {p == Pair{ fst: 2, snd: "x" }}")
+
+    // A sum constructor reads them off its arguments. Two members of one
+    // family in one program are two types.
+    print("{show(Has(5))}")
+    let b = Has("text")
+    match b {
+        Has(v) -> print("str {v}")
+        Nothing -> print("none")
+    }
+    let n: Opt[i64] = Nothing
+    print("{show(n)}")
+
+    // A parameter no argument mentions has to be written down.
+    let r: Res[i64, str] = Good(1)
+    match r {
+        Good(v) -> print("good {v}")
+        Bad(e) -> print("bad {e}")
+    }
+}

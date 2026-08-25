@@ -169,5 +169,17 @@ echo "run on a loaded machine; G4 (safety) by difftest, leakcheck and the row"
 echo "and extern fuzzers; G7 (capability sandboxing) by security_bench.sh and"
 echo "the package tests; G6 (parallelism) partly, by the parmap and parwords"
 echo "rows of scripts/bench.sh — parwords is the one that shares values rather"
-echo "than words. G8, G9 and G10 have no measurement here because the features"
-echo "they measure are not built."
+echo "than words. G8 (record and replay) by scripts/replaytest.sh, which runs"
+echo "every journaled builtin under an empty journal and requires it to refuse."
+echo "G9 and G10 have no measurement here: G9's feature is built and has no"
+echo "number, and G10 needs someone outside this repository."
+echo
+# Printed rather than remembered. The G4 row in docs/northstar.md holds counts
+# that were typed by hand and had drifted — 218 programs where the gates say
+# 221, 31 whole programs where there are 44. A number that has to be kept in
+# step with a directory listing will not be.
+corpus_n=$(find examples projects spec/conformance benchmarks/grasm -name "*.gr" | wc -l | tr -d " ")
+echo "\`.gr\` files in the corpus:                  $corpus_n  (not all are whole programs)"
+echo "conformance programs:                     $(ls spec/conformance/*.gr | wc -l | tr -d ' ')"
+echo "ProjectGold whole programs:               $(ls -d ProjectGold/[0-9]* | wc -l | tr -d ' ')"
+echo "generators:                               $(ls scripts/fuzz_*.py | wc -l | tr -d ' ')"
