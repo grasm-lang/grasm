@@ -755,7 +755,7 @@ runs only under `grasm run`:
 
 | shape | example |
 |-------|---------|
-| a generic **type** declaration | `type Pair[A, B] = { fst: A, snd: B }` |
+| a variant of a *generic sum* type | `Has(5)` for `type Opt[T] = \| Has(v: T) \| Nothing` — a generic **struct** compiles; a generic sum's constructor does not yet fix its type parameters |
 | `fail` inside a *fallible* closure passed to `map`, `filter` or `fold` | `xs.map(\|x\| fail(e))` where the result is held as `[T ! E]` — produce `Err(e)` instead of failing, or pass a named function |
 | polymorphic recursion | `fn f[T](x: T) -> i64 { f([x]) }` — one compiled copy per type, and the types never stop growing |
 

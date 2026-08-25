@@ -7,6 +7,20 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
 
 ### Fixed
 
+- **`--native` compiles a generic struct declaration.**
+  `type Pair[A, B] = { fst: A, snd: B }`, nested, in lists, through generic
+  functions, compared, mutated and printed. A generic type is kept whole until a
+  use site fixes its parameters — the same treatment a generic function gets —
+  and each member is registered under a name built from its arguments. A literal
+  reads those arguments off the fields it gives, the same unification a generic
+  call does on its arguments.
+
+  The mangled name is how two members are told apart and is **not** what the
+  type is called: it stops at the value's edge, so `print` shows `Pair{..}`
+  rather than `Pair[i64,str]{..}`.
+
+  Generic *sums* are not done — a constructor has to fix the parameters the way
+  a struct literal does — and are refused by name, separately gated.
 - **`--native` compiles a UFCS call of a generic free function.**
   `[1, 2].describe()` for `fn describe[T](xs: [T])`. A generic function has no
   symbol until a call site fixes its type parameters, and the lookup this path

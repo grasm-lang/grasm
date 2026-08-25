@@ -114,7 +114,12 @@ declared=$(grep -cE '^expect_[a-z_]* "' "$0")
 ran=0
 echo "checking the documented --native gaps ..."
 
-expect_refused "a generic type declaration" 'type Pair[A, B] = { fst: A, snd: B }
+# Was a gap, for structs. A generic type is kept whole until a use site fixes
+# its parameters — the same treatment a generic function gets — and the member
+# is named for its arguments. That name is how two members are told apart and is
+# not what the type is called: it stops at the value's edge, so `print` shows
+# `Pair{..}` and not `Pair[i64,str]{..}`.
+expect_compiled "a generic type declaration" 'type Pair[A, B] = { fst: A, snd: B }
 fn main() {
     print("{Pair{ fst: 1, snd: 2 }.fst}")
 }'
@@ -659,6 +664,21 @@ fn tag(xs: [i64]) -> i64 {
 fn main() {
     let b = Box{ tag: || "f" }
     print("{b.tag()}")
+}'
+
+
+# Generic *sums* are not done. A constructor call — `Has(5)` — has to fix the
+# sum's parameters the way a struct literal fixes a struct's, and it does not.
+# Kept separate from the struct case so the boundary is a line rather than a
+# footnote.
+expect_refused "a variant of a generic sum type" 'type Opt[T] = | Has(v: T) | Nothing
+
+fn main() {
+    let o = Has(5)
+    match o {
+        Has(v) -> print("{v}")
+        Nothing -> print("none")
+    }
 }'
 
 if [ "$ran" != "$declared" ]; then

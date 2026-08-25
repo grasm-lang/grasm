@@ -469,6 +469,18 @@ struct Codegen<'m> {
     /// thing as a generic machine-code symbol, so each *instantiation* becomes
     /// its own concrete function.
     generic_fns: HashMap<String, FnDecl>,
+    /// Generic *type* declarations, kept whole until a use site fixes their
+    /// parameters — the same treatment generic functions get, for the same
+    /// reason: `type Pair[A, B]` describes a family, and a machine
+    /// representation needs one member of it.
+    generic_types: HashMap<String, grasm_syntax::ast::TypeDecl>,
+    /// An instantiated type's name → the arguments it was instantiated at.
+    ///
+    /// The name is mangled for uniqueness and is not meant to be read back, so
+    /// matching `Holder[T]` against `Holder[i64]` asks here rather than parsing
+    /// it. Without this, a generic function over a generic type had `T`
+    /// determined by nothing.
+    type_args: HashMap<String, (String, Vec<VType>)>,
     /// Module-level constants, by `module::NAME`. Their initializers are
     /// effect-free, so each use compiles the expression again rather than
     /// reading a global — which keeps the two engines doing the same thing.
@@ -584,6 +596,8 @@ impl<'m> Codegen<'m> {
             module_imports: HashMap::new(),
             only_module: None,
             generic_fns: HashMap::new(),
+            generic_types: HashMap::new(),
+            type_args: HashMap::new(),
             consts: HashMap::new(),
             recursive: std::collections::HashSet::new(),
             pending_generics: Vec::new(),
@@ -856,7 +870,7 @@ impl<'m> Codegen<'m> {
         Ok(())
     }
 
-    fn vtype_of(&self, te: &TypeExpr) -> CResult<VType> {
+    fn vtype_of(&mut self, te: &TypeExpr) -> CResult<VType> {
         match te {
             TypeExpr::Ref(inner, _) => Ok(VType::Ref(Box::new(self.vtype_of(inner)?))),
             TypeExpr::Name { path, args, span } => {
@@ -897,6 +911,25 @@ impl<'m> Codegen<'m> {
                         if self.sums.contains_key(n) {
                             return Ok(VType::Sum(n.to_string()));
                         }
+                    }
+                    // `Pair[i64, str]` — a member of a generic family, named
+                    // for its arguments and registered on demand.
+                    if !args.is_empty()
+                        && self
+                            .generic_types
+                            .contains_key(&format!("{}::{}", self.current_module, n))
+                    {
+                        let mut ats = Vec::with_capacity(args.len());
+                        for a in args {
+                            ats.push(self.vtype_of(a)?);
+                        }
+                        let module = self.current_module.clone();
+                        let key = self.instantiate_type(&module, n, &ats, *span)?;
+                        return Ok(if self.sums.contains_key(&key) {
+                            VType::Sum(key)
+                        } else {
+                            VType::Struct(key)
+                        });
                     }
                     if n == "Option" && args.len() == 1 {
                         return Ok(VType::Option(Box::new(self.vtype_of(&args[0])?)));
@@ -1105,7 +1138,14 @@ impl<'m> Codegen<'m> {
         for decl in &module_ast.decls {
             if let Decl::Type(t) = decl {
                 if !t.generics.is_empty() {
-                    return nope(t.span, "generic types");
+                    // Kept, not refused. A generic type has no layout until a
+                    // use site says what its parameters are, exactly as a
+                    // generic function has no symbol until a call site does.
+                    self.generic_types.insert(
+                        format!("{}::{}", self.current_module, t.name.name),
+                        t.clone(),
+                    );
+                    continue;
                 }
                 match &t.body {
                     TypeBody::Struct(_) => {
@@ -1133,6 +1173,12 @@ impl<'m> Codegen<'m> {
     fn resolve_type_bodies(&mut self, module_ast: &AstModule) -> CResult<()> {
         for decl in &module_ast.decls {
             if let Decl::Type(t) = decl {
+                // A generic declaration has no body to resolve until it is
+                // instantiated; `instantiate_type` resolves one per set of
+                // arguments.
+                if !t.generics.is_empty() {
+                    continue;
+                }
                 match &t.body {
                     TypeBody::Struct(fields) => {
                         let mut fs = Vec::new();
@@ -1182,7 +1228,7 @@ impl<'m> Codegen<'m> {
             decl.generics.iter().map(|g| g.name.as_str()).collect();
         let mut subst = HashMap::new();
         for (p, actual) in decl.params.iter().zip(arg_types) {
-            unify_generic(&p.ty, actual, &names, &mut subst);
+            unify_generic_with(&p.ty, actual, &names, &mut subst, &self.type_args);
         }
         for g in &decl.generics {
             if !subst.contains_key(&g.name) {
@@ -1200,6 +1246,109 @@ impl<'m> Codegen<'m> {
 
     /// Declares (once) the instantiation of `name` for `arg_types` and returns
     /// its key in `self.fns`.
+    /// One member of a generic type family, named for its arguments.
+    ///
+    /// `Pair[i64, str]` becomes a struct called `Pair[i64,str]` with its fields
+    /// resolved under that binding. The name is what every later stage keys on
+    /// — field lookup, equality, display — so nothing downstream has to know
+    /// that generic types exist.
+    fn instantiate_type(
+        &mut self,
+        module: &str,
+        name: &str,
+        args: &[VType],
+        span: Span,
+    ) -> CResult<String> {
+        let generic_key = format!("{module}::{name}");
+        let Some(decl) = self.generic_types.get(&generic_key).cloned() else {
+            return nope(span, format!("the type `{name}` here"));
+        };
+        if decl.generics.len() != args.len() {
+            return nope(
+                span,
+                format!(
+                    "`{name}` takes {} type argument(s) and was given {}",
+                    decl.generics.len(),
+                    args.len()
+                ),
+            );
+        }
+        if let Some(deep) = args.iter().find(|t| t.depth() > MAX_TYPE_DEPTH) {
+            return nope(
+                span,
+                format!(
+                    "a generic type whose argument keeps growing (`{name}` here, reached a type nested {} deep)",
+                    deep.depth()
+                ),
+            );
+        }
+        let suffix: Vec<String> = args.iter().map(VType::mangle).collect();
+        let key = format!("{name}[{}]", suffix.join(","));
+        self.type_args
+            .insert(key.clone(), (name.to_string(), args.to_vec()));
+        if self.structs.contains_key(&key) || self.sums.contains_key(&key) {
+            return Ok(key);
+        }
+        let subst: HashMap<String, VType> = decl
+            .generics
+            .iter()
+            .map(|g| g.name.clone())
+            .zip(args.iter().cloned())
+            .collect();
+        // Registered before the body is resolved, so a type that mentions
+        // itself — `type Node[T] = { next: Option[Node[T]] }` — finds the name
+        // rather than recursing forever.
+        match &decl.body {
+            TypeBody::Struct(_) => {
+                self.structs.insert(key.clone(), Vec::new());
+            }
+            TypeBody::Sum(_) => {
+                self.sums.insert(key.clone(), Vec::new());
+            }
+            TypeBody::Alias(_) => {}
+        }
+        let saved = std::mem::replace(&mut self.generic_subst, subst);
+        let resolved = (|| -> CResult<()> {
+            match &decl.body {
+                TypeBody::Struct(fields) => {
+                    let mut fs = Vec::new();
+                    for f in fields {
+                        fs.push((f.name.name.clone(), self.vtype_of(&f.ty)?));
+                    }
+                    self.structs.insert(key.clone(), fs);
+                }
+                TypeBody::Sum(variants) => {
+                    let mut vs = Vec::new();
+                    for v in variants {
+                        let mut fts = Vec::new();
+                        for f in &v.fields {
+                            fts.push(self.vtype_of(&f.ty)?);
+                        }
+                        self.variant_index
+                            .insert(v.name.name.clone(), (key.clone(), v.fields.len()));
+                        vs.push((v.name.name.clone(), fts));
+                    }
+                    self.sums.insert(key.clone(), vs);
+                }
+                TypeBody::Alias(te) => {
+                    let t = self.vtype_of(te)?;
+                    self.aliases.insert(key.clone(), grasm_syntax::ast::TypeExpr::Name {
+                        path: grasm_syntax::ast::Path {
+                            segments: vec![Ident { name: t.show(), span }],
+                            span,
+                        },
+                        args: Vec::new(),
+                        span,
+                    });
+                }
+            }
+            Ok(())
+        })();
+        self.generic_subst = saved;
+        resolved?;
+        Ok(key)
+    }
+
     fn instantiate_generic(
         &mut self,
         module: &str,
@@ -3407,6 +3556,21 @@ fn unify_generic(
     names: &std::collections::HashSet<&str>,
     subst: &mut HashMap<String, VType>,
 ) {
+    unify_generic_with(declared, actual, names, subst, &HashMap::new())
+}
+
+/// As [`unify_generic`], and able to see through an instantiated generic type.
+///
+/// `fn first[T](h: Holder[T])` called with a `Holder[i64]`: the declared side
+/// says `Holder` of one argument, the actual side is a struct whose name was
+/// mangled for uniqueness. `type_args` is what that name was instantiated at.
+fn unify_generic_with(
+    declared: &TypeExpr,
+    actual: &VType,
+    names: &std::collections::HashSet<&str>,
+    subst: &mut HashMap<String, VType>,
+    type_args: &HashMap<String, (String, Vec<VType>)>,
+) {
     match declared {
         TypeExpr::Name { path, args, .. } if path.segments.len() == 1 => {
             let n = path.segments[0].name.as_str();
@@ -3416,24 +3580,33 @@ fn unify_generic(
             }
             match (n, actual) {
                 ("Option", VType::Option(inner)) if args.len() == 1 => {
-                    unify_generic(&args[0], inner, names, subst)
+                    unify_generic_with(&args[0], inner, names, subst, type_args)
                 }
                 ("Map", VType::Map(k, v)) if args.len() == 2 => {
-                    unify_generic(&args[0], k, names, subst);
-                    unify_generic(&args[1], v, names, subst);
+                    unify_generic_with(&args[0], k, names, subst, type_args);
+                    unify_generic_with(&args[1], v, names, subst, type_args);
+                }
+                (_, VType::Struct(key) | VType::Sum(key)) if !args.is_empty() => {
+                    if let Some((base, ats)) = type_args.get(key) {
+                        if base == n && ats.len() == args.len() {
+                            for (d, a) in args.iter().zip(ats) {
+                                unify_generic_with(d, a, names, subst, type_args);
+                            }
+                        }
+                    }
                 }
                 _ => {}
             }
         }
         TypeExpr::List(inner, _) => {
             if let VType::List(e) = actual {
-                unify_generic(inner, e, names, subst);
+                unify_generic_with(inner, e, names, subst, type_args);
             }
         }
         TypeExpr::Tuple(items, _) => {
             if let VType::Tuple(ts) = actual {
                 for (d, a) in items.iter().zip(ts) {
-                    unify_generic(d, a, names, subst);
+                    unify_generic_with(d, a, names, subst, type_args);
                 }
             }
         }
@@ -3447,20 +3620,20 @@ fn unify_generic(
         TypeExpr::Fn { params, ret, .. } => {
             if let VType::Fn(ps, r) = actual {
                 for (d, a) in params.iter().zip(ps) {
-                    unify_generic(d, a, names, subst);
+                    unify_generic_with(d, a, names, subst, type_args);
                 }
-                unify_generic(ret, r, names, subst);
+                unify_generic_with(ret, r, names, subst, type_args);
             }
         }
         TypeExpr::Ref(inner, _) => {
             if let VType::Ref(t) = actual {
-                unify_generic(inner, t, names, subst);
+                unify_generic_with(inner, t, names, subst, type_args);
             }
         }
         TypeExpr::Fallible(ok, err, _) => {
             if let VType::Fallible(o, e) = actual {
-                unify_generic(ok, o, names, subst);
-                unify_generic(err, e, names, subst);
+                unify_generic_with(ok, o, names, subst, type_args);
+                unify_generic_with(err, e, names, subst, type_args);
             }
         }
         _ => {}
@@ -5949,9 +6122,9 @@ this case",
     }
 
     /// The type the checker recorded for an empty literal at this span.
-    fn empty_vtype(&self, span: Span) -> Option<VType> {
-        let text = self.cg.empty_types.get(&span.start)?;
-        let te = grasm_syntax::parse_type_src(text)?;
+    fn empty_vtype(&mut self, span: Span) -> Option<VType> {
+        let text = self.cg.empty_types.get(&span.start)?.clone();
+        let te = grasm_syntax::parse_type_src(&text)?;
         self.cg.vtype_of(&te).ok()
     }
 
@@ -8831,6 +9004,27 @@ checker did",
             None => self.lookup_fn(&id.name),
         };
         let Some(sig) = sig else {
+            // A variant of a *generic* sum. The declaration is kept whole
+            // until a use site fixes its parameters, and a bare constructor
+            // call does not: `Has(5)` says `T` is `i64`, and threading that
+            // through the variant index is not done. Named, because "the
+            // function `Has` here" says nothing about which shape was hit.
+            for (gkey, decl) in &self.cg.generic_types {
+                if let TypeBody::Sum(variants) = &decl.body {
+                    if variants.iter().any(|v| v.name.name == id.name) {
+                        let base = gkey.rsplit("::").next().unwrap_or(gkey);
+                        return nope(
+                            id.span,
+                            format!(
+                                "a variant of the generic sum type `{base}` (`{}` here) — \
+generic *structs* compile; a generic sum's constructor does not yet fix its \
+type parameters",
+                                id.name
+                            ),
+                        );
+                    }
+                }
+            }
             return nope(id.span, format!("the function `{}` here", id.name));
         };
         let (fid, params, modes, ret, is_extern) = (
@@ -9206,6 +9400,54 @@ checker did",
         self.make_variant(parent, vname, &boxed_fields)
     }
 
+    /// The instantiated name of a generic struct literal, from the fields it
+    /// gives.
+    ///
+    /// `Pair{ fst: 1, snd: "x" }` is `Pair[i64,str]`. Used both where the
+    /// literal is compiled and where it is probed: probing returned the written
+    /// name, so a nested literal came back as `Pair` — a family, not a type —
+    /// and the enclosing instantiation could not be resolved.
+    fn generic_struct_key(
+        &mut self,
+        sname: &str,
+        fields: &[(Ident, Expr)],
+        span: Span,
+    ) -> CResult<Option<String>> {
+        let gkey = format!("{}::{}", self.cg.current_module, sname);
+        if !self.cg.generic_types.contains_key(&gkey) {
+            return Ok(None);
+        }
+        let decl = self.cg.generic_types[&gkey].clone();
+        let TypeBody::Struct(decl_fields) = &decl.body else {
+            return nope(span, format!("`{sname}` as a struct literal"));
+        };
+        let names: std::collections::HashSet<&str> =
+            decl.generics.iter().map(|g| g.name.as_str()).collect();
+        let mut subst: HashMap<String, VType> = HashMap::new();
+        for (fname, fexpr) in fields {
+            let Some(df) = decl_fields.iter().find(|d| d.name.name == fname.name) else {
+                return nope(fname.span, format!("the field `{}`", fname.name));
+            };
+            if let Ok(t) = self.probe_type(fexpr) {
+                unify_generic(&df.ty, &t, &names, &mut subst);
+            }
+        }
+        let mut ats = Vec::with_capacity(decl.generics.len());
+        for g in &decl.generics {
+            match subst.get(&g.name) {
+                Some(t) => ats.push(t.clone()),
+                None => {
+                    return nope(
+                        span,
+                        format!("`{sname}` here — the fields say nothing about `{}`", g.name),
+                    )
+                }
+            }
+        }
+        let module = self.cg.current_module.clone();
+        Ok(Some(self.cg.instantiate_type(&module, sname, &ats, span)?))
+    }
+
     fn eval_struct_lit(
         &mut self,
         name: &Path,
@@ -9230,6 +9472,10 @@ checker did",
                 return self.handler_value(&lit, &eff);
             }
         }
+        let sname = match self.generic_struct_key(&sname, fields, span)? {
+            Some(k) => k,
+            None => sname,
+        };
         // `Point{ ..p, x: 1 }` — start from a copy of `p` and overwrite. The
         // base is evaluated first, as it is written ([E-ORDER-LTR]).
         let sv = match base {
@@ -9292,7 +9538,19 @@ checker did",
                 self.b.ins().stack_store(*boxed, slot, (i * 8) as i32);
             }
             let argv = self.b.ins().stack_addr(ptr_ty, slot, 0);
-            let did = self.cg.struct_desc(&sname, &names);
+            // The *written* name, not the instantiated one. `Pair[i64,str]` is
+            // how this backend keeps two members of a family apart; it is not
+            // what the type is called, and printing one showed
+            // `Pair[i64,str]{fst: 1, snd: x}` where every other engine shows
+            // `Pair{...}`. The mangling is an implementation detail and has to
+            // stop at the value's edge.
+            let display_name = self
+                .cg
+                .type_args
+                .get(&sname)
+                .map(|(base, _)| base.clone())
+                .unwrap_or_else(|| sname.clone());
+            let did = self.cg.struct_desc(&display_name, &names);
             let gv = self.cg.module.declare_data_in_func(did, self.b.func);
             let dp = self.b.ins().global_value(ptr_ty, gv);
             sv = self.call_rt("grasm_struct_make", &[dp, argv]).unwrap();
@@ -10279,7 +10537,7 @@ checker did",
                 }
                 VType::Tuple(ts)
             }
-            Expr::StructLit { name, .. } => {
+            Expr::StructLit { name, fields, .. } => {
                 // A handler literal is a handler, not a struct with that name.
                 // Probed as a struct, a list of them took `Struct("SHandler")`
                 // as its element type, and the `with` that walked the list then
@@ -10289,7 +10547,10 @@ checker did",
                     Some(eff) if self.cg.effects.contains_key(eff) => {
                         VType::Handler(eff.to_string())
                     }
-                    _ => VType::Struct(n),
+                    _ => match self.generic_struct_key(&n, fields, e.span())? {
+                        Some(k) => VType::Struct(k),
+                        None => VType::Struct(n),
+                    },
                 }
             }
             Expr::Field { recv, name, span } => {
