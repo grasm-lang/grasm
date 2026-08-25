@@ -19,8 +19,14 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   type is called: it stops at the value's edge, so `print` shows `Pair{..}`
   rather than `Pair[i64,str]{..}`.
 
-  Generic *sums* are not done — a constructor has to fix the parameters the way
-  a struct literal does — and are refused by name, separately gated.
+- **`--native` compiles a generic sum type.** `type Opt[T] = | Has(v: T) |
+  Nothing`, including two instantiations in one program. A constructor fixes the
+  sum's parameters from its arguments, the way a struct literal fixes a
+  struct's from its fields.
+
+  A type parameter no argument mentions still needs an annotation: `Good(1)` for
+  `Res[T, E]` says what `T` is and nothing about `E`, so one compiled copy
+  cannot be chosen. The refusal names the parameter.
 - **`--native` compiles a UFCS call of a generic free function.**
   `[1, 2].describe()` for `fn describe[T](xs: [T])`. A generic function has no
   symbol until a call site fixes its type parameters, and the lookup this path

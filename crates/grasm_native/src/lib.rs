@@ -481,6 +481,9 @@ struct Codegen<'m> {
     /// it. Without this, a generic function over a generic type had `T`
     /// determined by nothing.
     type_args: HashMap<String, (String, Vec<VType>)>,
+    /// A variant name → the generic sum that declares it. One variant belongs
+    /// to one family, and which *member* of it is a question for the use site.
+    generic_variant_owner: HashMap<String, String>,
     /// Module-level constants, by `module::NAME`. Their initializers are
     /// effect-free, so each use compiles the expression again rather than
     /// reading a global — which keeps the two engines doing the same thing.
@@ -598,6 +601,7 @@ impl<'m> Codegen<'m> {
             generic_fns: HashMap::new(),
             generic_types: HashMap::new(),
             type_args: HashMap::new(),
+            generic_variant_owner: HashMap::new(),
             consts: HashMap::new(),
             recursive: std::collections::HashSet::new(),
             pending_generics: Vec::new(),
@@ -1141,10 +1145,14 @@ impl<'m> Codegen<'m> {
                     // Kept, not refused. A generic type has no layout until a
                     // use site says what its parameters are, exactly as a
                     // generic function has no symbol until a call site does.
-                    self.generic_types.insert(
-                        format!("{}::{}", self.current_module, t.name.name),
-                        t.clone(),
-                    );
+                    let gkey = format!("{}::{}", self.current_module, t.name.name);
+                    if let TypeBody::Sum(variants) = &t.body {
+                        for v in variants {
+                            self.generic_variant_owner
+                                .insert(v.name.name.clone(), gkey.clone());
+                        }
+                    }
+                    self.generic_types.insert(gkey, t.clone());
                     continue;
                 }
                 match &t.body {
@@ -1324,8 +1332,13 @@ impl<'m> Codegen<'m> {
                         for f in &v.fields {
                             fts.push(self.vtype_of(&f.ty)?);
                         }
-                        self.variant_index
-                            .insert(v.name.name.clone(), (key.clone(), v.fields.len()));
+                        // Deliberately *not* in `variant_index`. That maps a
+                        // variant name to one parent, and a generic sum has one
+                        // parent per instantiation — registering them made
+                        // `Has("text")` find the `Opt[i64]` that `Has(5)` had
+                        // left there, build an `Opt[i64]` holding a string, and
+                        // print its address as an integer. Which member a
+                        // constructor names is a question for the use site.
                         vs.push((v.name.name.clone(), fts));
                     }
                     self.sums.insert(key.clone(), vs);
@@ -5683,6 +5696,41 @@ this case",
         e: &Expr,
         expected: Option<&VType>,
     ) -> CResult<Option<(Value, VType)>> {
+        // A variant of a generic sum with the member already decided by the
+        // type in view: `let r: Res[i64, str] = Good(1)`. The arguments alone
+        // cannot say — `Good` mentions `T` and never `E` — and an annotation
+        // is the only thing that can, which is why one is required there.
+        if let (Expr::Call { callee, args, .. }, Some(VType::Sum(key))) = (e, expected) {
+            if let Expr::Ident(id) = &**callee {
+                if self.lookup(&id.name).is_none()
+                    && self.cg.sums.get(key).is_some_and(|vs| {
+                        vs.iter().any(|(n, ts)| n == &id.name && ts.len() == args.len())
+                    })
+                {
+                    let key = key.clone();
+                    let args = args.clone();
+                    let v = self.build_variant_call(&key, &id.name, &args)?;
+                    return Ok(Some((v, VType::Sum(key))));
+                }
+            }
+        }
+        // A nullary variant of a generic sum, which member decided by the type
+        // in view: `let n: Opt[i64] = Nothing`. The by-name index cannot answer
+        // it — one name, one entry, many instantiations — so the expected type
+        // is the only thing that can.
+        if let (Expr::Ident(id), Some(VType::Sum(key))) = (e, expected) {
+            if self.lookup(&id.name).is_none()
+                && self
+                    .cg
+                    .sums
+                    .get(key)
+                    .is_some_and(|vs| vs.iter().any(|(n, ts)| n == &id.name && ts.is_empty()))
+            {
+                let key = key.clone();
+                let v = self.make_variant(&key, &id.name, &[])?;
+                return Ok(Some((v, VType::Sum(key))));
+            }
+        }
         // A handler meeting a parameter of handler type. The block of
         // `(code, env)` pairs is built here, in *this* frame, and the callee
         // is handed a pointer to it — which is why a handler may be passed
@@ -8972,6 +9020,10 @@ checker did",
             _ => {}
         }
         // Variant constructor call.
+        if let Some(key) = self.generic_variant_key(&id.name, args, id.span)? {
+            let val = self.build_variant_call(&key, &id.name, args)?;
+            return Ok(Some((val, VType::Sum(key))));
+        }
         if let Some((parent, arity)) = self.cg.variant_index.get(&id.name).cloned() {
             if args.len() == arity {
                 let v = self.build_variant_call(&parent, &id.name, args)?;
@@ -9407,6 +9459,61 @@ type parameters",
     /// literal is compiled and where it is probed: probing returned the written
     /// name, so a nested literal came back as `Pair` — a family, not a type —
     /// and the enclosing instantiation could not be resolved.
+    /// The instantiated sum a generic variant constructor names.
+    ///
+    /// `Has(5)` is `Opt[i64]`'s. Which member of the family it is comes from
+    /// the arguments, exactly as a generic struct literal reads it off the
+    /// fields — and for the same reason, that nothing else at this point says.
+    ///
+    /// `None` when the name is not a generic variant. An error when it is and
+    /// the arguments leave a parameter undetermined: `Good(1)` for
+    /// `Res[T, E]` says nothing about `E`, and only an annotation can.
+    fn generic_variant_key(
+        &mut self,
+        vname: &str,
+        args: &[Expr],
+        span: Span,
+    ) -> CResult<Option<String>> {
+        let Some(gkey) = self.cg.generic_variant_owner.get(vname).cloned() else {
+            return Ok(None);
+        };
+        let decl = self.cg.generic_types[&gkey].clone();
+        let TypeBody::Sum(variants) = &decl.body else {
+            return Ok(None);
+        };
+        let Some(v) = variants.iter().find(|v| v.name.name == vname) else {
+            return Ok(None);
+        };
+        if v.fields.len() != args.len() {
+            return Ok(None);
+        }
+        let names: std::collections::HashSet<&str> =
+            decl.generics.iter().map(|g| g.name.as_str()).collect();
+        let mut subst: HashMap<String, VType> = HashMap::new();
+        for (f, a) in v.fields.iter().zip(args) {
+            if let Ok(t) = self.probe_type(a) {
+                unify_generic_with(&f.ty, &t, &names, &mut subst, &self.cg.type_args);
+            }
+        }
+        let mut ats = Vec::with_capacity(decl.generics.len());
+        for g in &decl.generics {
+            let Some(t) = subst.get(&g.name) else {
+                return nope(
+                    span,
+                    format!(
+                        "`{vname}` here — the arguments say nothing about `{}`, so \
+annotate the binding",
+                        g.name
+                    ),
+                );
+            };
+            ats.push(t.clone());
+        }
+        let base = gkey.rsplit("::").next().unwrap_or(&gkey).to_string();
+        let module = self.cg.current_module.clone();
+        Ok(Some(self.cg.instantiate_type(&module, &base, &ats, span)?))
+    }
+
     fn generic_struct_key(
         &mut self,
         sname: &str,
@@ -10317,6 +10424,17 @@ type parameters",
                 }
             },
             Expr::Call { callee, args, .. } => {
+                // A variant of a generic sum, in a position where the type has
+                // to be worked out rather than read: a list element, say.
+                if let Expr::Ident(id) = &**callee {
+                    if self.lookup(&id.name).is_none() {
+                        if let Some(key) =
+                            self.generic_variant_key(&id.name, args, id.span)?
+                        {
+                            return Ok(VType::Sum(key));
+                        }
+                    }
+                }
                 // `Src.get(1)` — an effect operation, which parses as a call
                 // through a field and not as a method call. The `MethodCall`
                 // arm below already handles the other spelling; this one was
@@ -12899,10 +13017,15 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
         match st {
             VType::Option(_) => name == "None",
             VType::Fallible(..) => name == "Ok" || name == "Err",
-            VType::Sum(parent) => matches!(
-                self.cg.variant_index.get(name),
-                Some((p, 0)) if p == parent
-            ),
+            // Looked up inside *this* sum rather than in the by-name index.
+            // A generic sum has one entry per instantiation and the index holds
+            // one parent per variant name, so `Nothing` in an `Opt[i64]` was
+            // matched against whichever `Opt[..]` was registered last.
+            VType::Sum(parent) => self
+                .cg
+                .sums
+                .get(parent)
+                .is_some_and(|vs| vs.iter().any(|(n, ts)| n == name && ts.is_empty())),
             // A type the probe could not pin down. Every variant name is a
             // candidate, which is what this arm used to do for every
             // scrutinee.

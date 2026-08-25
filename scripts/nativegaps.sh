@@ -667,17 +667,51 @@ fn main() {
 }'
 
 
-# Generic *sums* are not done. A constructor call — `Has(5)` — has to fix the
-# sum's parameters the way a struct literal fixes a struct's, and it does not.
-# Kept separate from the struct case so the boundary is a line rather than a
-# footnote.
-expect_refused "a variant of a generic sum type" 'type Opt[T] = | Has(v: T) | Nothing
+# A constructor fixes the sum's parameters from its arguments, the way a struct
+# literal fixes a struct's from its fields. Two instantiations in one program is
+# the case that has to work and the one that broke first: the by-name variant
+# index holds one parent per name, so `Has("text")` found the `Opt[i64]` that
+# `Has(5)` left there and printed a pointer as an integer. Which member a
+# constructor names is a question for the use site, and generic instantiations
+# are not in that index at all now.
+expect_compiled "a variant of a generic sum type" 'type Opt[T] = | Has(v: T) | Nothing
 
 fn main() {
     let o = Has(5)
     match o {
         Has(v) -> print("{v}")
         Nothing -> print("none")
+    }
+}'
+
+
+# Two members of one family in one program, which is what the by-name index
+# could not represent.
+expect_compiled "two instantiations of one generic sum" 'type Opt[T] = | Has(v: T) | Nothing
+
+fn main() {
+    let a = Has(5)
+    let b = Has("text")
+    match a {
+        Has(v) -> print("{v}")
+        Nothing -> print("none")
+    }
+    match b {
+        Has(v) -> print("{v}")
+        Nothing -> print("none")
+    }
+}'
+
+# A type parameter no argument mentions. `Good(1)` says what `T` is and nothing
+# about `E`, so one compiled copy cannot be chosen without an annotation — the
+# refusal names the parameter and says so.
+expect_refused "a generic sum constructor that leaves a parameter undetermined" 'type Res[T, E] = | Good(v: T) | Bad(e: E)
+
+fn main() {
+    let r = Good(1)
+    match r {
+        Good(v) -> print("{v}")
+        Bad(e) -> print("bad")
     }
 }'
 
