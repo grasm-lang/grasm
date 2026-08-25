@@ -3801,3 +3801,27 @@ fn every_journaled_builtin_is_named_in_the_replay_gate() {
         );
     }
 }
+
+/// A constructor that mentions one type parameter and not the other has to be
+/// annotated ([T-GENERIC-TYPE]).
+///
+/// The clause said this was the language's rule while one engine of three
+/// enforced it: `grasm check` passed, `grasm run` ran it, and only the compiled
+/// backend refused — which made it look like a backend limitation rather than
+/// what the clause says it is.
+#[test]
+fn a_constructor_may_not_leave_a_parameter_open() {
+    check_err(
+        "type Res[T, E] = | Good(v: T) | Bad(e: E)\nfn main() {\n    let r = Good(1)\n    match r {\n        Good(v) -> print(\"{v}\")\n        Bad(e) -> print(\"bad\")\n    }\n}\n",
+        "leaves a type parameter undetermined",
+    );
+}
+
+/// Determined by a *later* line is determined. The check waits for inference to
+/// finish for the same reason the empty-literal one does.
+#[test]
+fn a_parameter_a_later_line_fixes_is_determined() {
+    check_ok(
+        "type Res[T, E] = | Good(v: T) | Bad(e: E)\nfn take(r: Res[i64, str]) -> i64 {\n    match r {\n        Good(v) -> v\n        Bad(e) -> -1\n    }\n}\nfn main() {\n    let a = Good(1)\n    print(\"{take(a)}\")\n}\n",
+    );
+}

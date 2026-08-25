@@ -708,18 +708,10 @@ fn main() {
     }
 }'
 
-# A type parameter no argument mentions. `Good(1)` says what `T` is and nothing
-# about `E`, so one compiled copy cannot be chosen without an annotation — the
-# refusal names the parameter and says so.
-expect_refused "a generic sum constructor that leaves a parameter undetermined" 'type Res[T, E] = | Good(v: T) | Bad(e: E)
+# `Good(1)` for `Res[T, E]` is no longer here: the *checker* refuses it on every
+# engine now ([T-GENERIC-TYPE]), so it is a language rule and not a backend gap.
+# Its test lives in grasm_sema, as `a_constructor_may_not_leave_a_parameter_open`.
 
-fn main() {
-    let r = Good(1)
-    match r {
-        Good(v) -> print("{v}")
-        Bad(e) -> print("bad")
-    }
-}'
 
 
 # The conditional shape, which has to get both paths right: an element from the

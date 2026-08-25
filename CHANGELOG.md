@@ -350,12 +350,8 @@ specification already labels experimental, over-strictness anywhere, and
 diagnostics — are changelog content, and every open one is listed with a
 reproducer in `docs/known-issues.md`.
 
-At this release: **no S1 and no S2 are open.** One S3 — the checker does not
-enforce [T-GENERIC-TYPE]'s rule that a constructor leaving a type parameter
-undetermined must be annotated, so `let r = Good(1)` for `type Res[T, E]` passes
-`grasm check`, runs under `grasm run` and is refused by `--native`. The clause
-says the requirement is the language's; one engine of three enforces it. And one
-S4 (the UFCS help text promises a call the compiler will not make).
+At this release: **no S1, no S2 and no S3 are open.** One S4 (the UFCS help text
+promises a call the compiler will not make).
 
 ### Effect rows come from the type, not from a guess
 

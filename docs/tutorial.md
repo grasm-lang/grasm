@@ -752,13 +752,12 @@ codes — on every program in the repository.
 
 For most of this project's life the compiled backend was the *smaller* of the
 two, and this section was a list of shapes that ran under `grasm run` and could
-not be built. That list was seventeen entries long and is now two, and neither
-of the two is a defect being worked off:
+not be built. That list was seventeen entries long. It is one, and it is not a
+defect being worked off:
 
 | shape | why |
 |-------|-----|
-| a generic sum constructor that leaves a type parameter undetermined | `Good(1)` for `type Res[T, E]` says what `T` is and nothing about `E`. A compiled build needs one machine representation and cannot choose it from nothing, so the binding is annotated: `let r: Res[i64, str] = Good(1)`. [T-GENERIC-TYPE] makes that the *language's* rule — but the checker does not enforce it yet, so this one program is accepted by `grasm run` and refused here. That gap is the open S3 in [known-issues.md](known-issues.md), and it is a missing check rather than a backend limitation |
-| polymorphic recursion | `fn f[T](x: T) -> i64 { f([x]) }` needs one compiled copy per type and the types never stop growing. No amount of work removes this; it is what monomorphization is |
+| polymorphic recursion | `fn f[T](x: T) -> i64 { f([x]) }` needs one compiled copy per type and the types never stop growing. No amount of work removes this; it is what monomorphization is, and it is refused by name at build time |
 
 Everything else the interpreter accepts, the compiled backend compiles.
 `scripts/nativegaps.sh` holds that claim to 46 cases, running each under both
@@ -776,6 +775,14 @@ answer. That is the promise, and it has been broken: a `fold` whose accumulator
 was fallible was named in this table as refused and was quietly miscompiled
 instead (F43). Both halves of that shape are in the gate list now — the one that
 works and the one that must not.
+
+One row left this table by being answered rather than implemented. A
+constructor that leaves a type parameter undetermined — `Good(1)` for
+`Res[T, E]` — was refused here and accepted by the other two engines, which
+made it look like a backend limitation. [T-GENERIC-TYPE] says it is the
+language's rule, so the *checker* enforces it now and all three engines agree.
+A shape on a list of backend gaps is worth asking about twice: whether the
+backend should accept it, or whether the others should not.
 
 ## Where to go next
 

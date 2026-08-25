@@ -5,7 +5,7 @@ Every defect that is known and not fixed, with its severity from
 to paste. S1 and S2 block a release; S3 and S4 do not, and this file is what
 makes shipping them honest rather than quiet.
 
-**Open S1: none. Open S2: none. Open S3: one. Open S4: none.**
+**Open S1: none. Open S2: none. Open S3: none. Open S4: none.**
 
 Closed on 2026-08-17, all four found by writing a calculator in the language
 rather than by a test: a closure in a `match` arm could not see the arm's own
@@ -45,32 +45,18 @@ The six defects that were open on 2026-08-17 are closed:
 * a **deeply nested tuple literal** cost O(n³) to check — 1000 levels took 7.8
   seconds, now 31 ms.
 
-## S3 — the checker does not enforce [T-GENERIC-TYPE]'s annotation rule
+## S3 — the checker did not enforce [T-GENERIC-TYPE] — *closed*
 
-```
-type Res[T, E] = | Good(v: T) | Bad(e: E)
+`let r = Good(1)` for `type Res[T, E]` passed `grasm check`, ran under `grasm
+run` and was refused by `--native`. The clause said the annotation was the
+language's rule and one engine of three enforced it.
 
-fn main() {
-    let r = Good(1)
-    match r {
-        Good(v) -> print("{v}")
-        Bad(e) -> print("bad")
-    }
-}
-```
-
-`grasm check` passes, `grasm run` prints `1`, `grasm build --native` refuses:
-`Good` here — the arguments say nothing about `E`, so annotate the binding.
-
-[T-GENERIC-TYPE] says the annotation is required, and gives the reason: a
-constructor that mentions one type parameter and not the other leaves the other
-determined by nothing, and an engine that compiles ahead of time has to pick one
-machine representation. The clause is the language's rule; the checker has not
-been taught it, so the requirement is enforced by one engine out of three.
-
-Either fix closes it — teach the checker, or decide the clause is wrong — and
-the first is what the clause asks for. Adding `let r: Res[i64, str] = Good(1)`
-compiles everywhere today.
+Closed on 2026-08-25 by teaching the checker, which is what the clause asked
+for. The check waits for inference to finish, so a parameter a *later* line
+fixes is still determined: `let a = Good(1)` followed by a call wanting
+`Res[i64, str]` compiles everywhere. The backend reads the checker's answer
+rather than inferring from the constructor's arguments alone, which is what it
+had been doing and why it refused a program the checker had settled.
 
 ## S3 — over-strict, effect-row inference
 

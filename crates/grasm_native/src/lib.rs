@@ -339,6 +339,7 @@ fn compile_object_scoped(
     cg.fallible_closures = analysis.fallible_closures;
     cg.empty_types = analysis.empty_types;
     cg.closure_param_types = analysis.closure_param_types;
+    cg.generic_ctor_types = analysis.generic_ctor_types;
     cg.only_module = only_module.map(str::to_string);
     cg.declare_runtime()?;
     let views: Vec<(String, &AstModule, std::collections::HashMap<String, String>)> = program
@@ -518,6 +519,7 @@ struct Codegen<'m> {
     /// Start offset of each empty literal → the type the checker settled on.
     empty_types: std::collections::HashMap<u32, String>,
     closure_param_types: std::collections::HashMap<u32, Vec<String>>,
+    generic_ctor_types: std::collections::HashMap<u32, String>,
 }
 
 /// One monomorphized copy of a generic function.
@@ -612,6 +614,7 @@ impl<'m> Codegen<'m> {
             fallible_closures: std::collections::HashSet::new(),
             empty_types: std::collections::HashMap::new(),
             closure_param_types: std::collections::HashMap::new(),
+            generic_ctor_types: std::collections::HashMap::new(),
         }
     }
 
@@ -9530,6 +9533,16 @@ type parameters",
         let Some(gkey) = self.cg.generic_variant_owner.get(vname).cloned() else {
             return Ok(None);
         };
+        // The checker's answer first. It reaches the whole program, so a
+        // constructor whose parameters a *later* line fixes — `let a = Good(1)`
+        // then `take(a)` — is determined there and determined by nothing here.
+        if let Some(text) = self.cg.generic_ctor_types.get(&span.start).cloned() {
+            if let Some(te) = grasm_syntax::parse_type_src(&text) {
+                if let Ok(VType::Sum(key)) = self.cg.vtype_of(&te) {
+                    return Ok(Some(key));
+                }
+            }
+        }
         let decl = self.cg.generic_types[&gkey].clone();
         let TypeBody::Sum(variants) = &decl.body else {
             return Ok(None);

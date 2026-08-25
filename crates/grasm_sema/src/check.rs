@@ -139,6 +139,14 @@ pub struct Analysis {
     /// Present only when every parameter resolved: half an answer would turn a
     /// refusal the backend can explain into a miscompile it cannot.
     pub closure_param_types: std::collections::HashMap<u32, Vec<String>>,
+    /// Start offset of each generic sum constructor → the type it built, once
+    /// inference settled it.
+    ///
+    /// `let a = Good(1)` followed by `take(a)` where `take` wants a
+    /// `Res[i64, str]` is determined — by the later line, which the checker
+    /// reaches and a backend inferring from the constructor's arguments alone
+    /// does not. Present only when every parameter resolved ([T-GENERIC-TYPE]).
+    pub generic_ctor_types: std::collections::HashMap<u32, String>,
     /// Start offset of each empty `[]` or `{}` literal → the type inference
     /// settled on for it, written the way a person would.
     ///
@@ -422,6 +430,42 @@ fn check_modules_in(
             Some((off, shown))
         })
         .collect();
+    // [T-GENERIC-TYPE]: a constructor that leaves a type parameter undetermined.
+    //
+    // Judged here rather than at the constructor, because a later line may fix
+    // it — `let r = Good(1)` followed by a use that needs `Res[i64, str]` is
+    // determined, just not yet. The same reason the empty literals below wait.
+    //
+    // This was the language's rule with one engine of three enforcing it: the
+    // checker passed the program, `grasm run` ran it, and `--native` refused it
+    // because a compiled build needs one machine representation and has nothing
+    // to choose it from.
+    let generic_ctor_types: std::collections::HashMap<u32, String> = c
+        .generic_ctors
+        .iter()
+        .filter_map(|(off, _, t)| {
+            let shown = c.show(t);
+            if shown.contains('_') {
+                return None;
+            }
+            Some((*off, shown))
+        })
+        .collect();
+    for (off, len, t) in c.generic_ctors.clone() {
+        let shown = c.show(&t);
+        if !shown.contains('_') {
+            continue;
+        }
+        c.diags.push(
+            Diagnostic::error(
+                Span::new(off, off + len),
+                format!("`{shown}` leaves a type parameter undetermined"),
+            )
+            .with_help(
+                "a constructor fixes only the parameters its arguments mention; annotate the binding, as in `let r: Res[i64, str] = Good(1)`",
+            ),
+        );
+    }
     for (off, len) in unresolved {
         c.diags.push(
             Diagnostic::error(
@@ -475,6 +519,7 @@ fn check_modules_in(
             .map(|(off, _)| *off)
             .collect(),
         closure_param_types,
+        generic_ctor_types,
         empty_types,
         float_sums: c.float_sums,
         defs: c.defs,
@@ -549,6 +594,12 @@ struct Checker {
     /// whose parameters nothing local fixes learns them from the call site —
     /// which the checker reaches later. See `Analysis::closure_param_types`.
     closure_params: Vec<(u32, Vec<Type>)>,
+    /// Every constructor of a generic sum, and the type it built.
+    ///
+    /// Held as inference variables and resolved at the end: `Good(1)` for
+    /// `Res[T, E]` fixes `T` at the call and leaves `E` to whatever else the
+    /// program says, which may be a later line. See [T-GENERIC-TYPE].
+    generic_ctors: Vec<(u32, u32, Type)>,
     /// Closure literals that a built-in higher-order method calls *now* —
     /// `xs.map(|x| …)` and its siblings.
     ///
@@ -762,6 +813,7 @@ impl Checker {
             map_get_pending: Vec::new(),
             closure_types: HashMap::new(),
             closure_params: Vec::new(),
+            generic_ctors: Vec::new(),
             hof_closures: std::collections::HashSet::new(),
             handler_ids: std::collections::HashSet::new(),
             unsafe_depth: 0,
@@ -4255,10 +4307,18 @@ only a number or a `bool` can come out — compute what you need and yield that"
             let want = substitute_generics(fty, &fresh);
             self.check_expr(arg, &want);
         }
-        Type::Named {
+        let built = Type::Named {
             id: def_id,
             args: fresh,
+        };
+        // [T-GENERIC-TYPE]: a parameter no argument mentions has to be written
+        // down. Recorded rather than judged here — a later use may still fix
+        // it, exactly as it may for an empty literal — and resolved at the end
+        // with the same machinery.
+        if generics > 0 {
+            self.generic_ctors.push((span.start, span.end - span.start, built.clone()));
         }
+        built
     }
 
     fn infer_struct_lit(

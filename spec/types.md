@@ -173,10 +173,9 @@ A parameter no argument mentions must be written down: `Good(1)` for
 `Res[T, E]` fixes `T` and not `E`, so it needs `let r: Res[i64, str] = Good(1)`.
 An engine carrying types at runtime can leave it open; one compiling ahead of
 time needs a single representation and has nothing to choose it from, so the
-requirement is the language's rather than either engine's. The checker does not
-enforce it yet — `let r = Good(1)` passes `grasm check` and `--native` refuses
-it — which is a missing check, not an over-strict backend, and is recorded in
-`docs/known-issues.md`.
+requirement is the language's rather than either engine's. The check waits for inference to
+finish, so a parameter a *later* line fixes is determined: `let a = Good(1)`
+followed by a use that needs `Res[i64, str]` is accepted.
 
 ## 5. Errors as values
 
