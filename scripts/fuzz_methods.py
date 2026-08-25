@@ -70,6 +70,53 @@ GROUPS = [
             "(R / 4.0).asin()", "(R / 4.0).acos()", "R.atan()",
         ],
     ),
+    # The same list surface, once per *element representation* the runtime
+    # distinguishes. A list of `i64` is stored inline and a list of tuples is
+    # boxed, and an operation that works on one and not the other is how
+    # `[(), ()]` came to print as `[0, 0]` (F37) and how a `write_file`'s unit
+    # came back from a journal as an integer. Only the methods that do not care
+    # what the element *is* — the rest are covered by the `list` group below.
+    (
+        "list of unit",
+        "[(), (), ()]",
+        [
+            "R.len()", "R.is_empty()", "R", "R.rev()", "R.slice(0, 2)",
+            "R.map(|v| v)", "R.first()", "R.last()", "R.get(0)",
+        ],
+    ),
+    (
+        "list of tuple",
+        '[(1, "a"), (2, "b")]',
+        [
+            "R.len()", "R.is_empty()", "R", "R.rev()", "R.slice(0, 1)",
+            "R.map(|v| v)", "R.first()", "R.last()", "R.get(0)",
+        ],
+    ),
+    (
+        "list of option",
+        "[Some(1), None, Some(3)]",
+        [
+            "R.len()", "R.is_empty()", "R", "R.rev()", "R.slice(0, 2)",
+            "R.map(|v| v)", "R.first()", "R.last()", "R.get(0)",
+        ],
+    ),
+    (
+        "list of bool",
+        "[true, false, true]",
+        [
+            "R.len()", "R.is_empty()", "R", "R.rev()", "R.slice(0, 2)",
+            "R.contains(true)", "R.any(|v| v)", "R.all(|v| v)",
+            "R.map(|v| v)", "R.first()", "R.get(0)",
+        ],
+    ),
+    (
+        "list of bytes",
+        "[bytes_of([1]), bytes_of([2])]",
+        [
+            "R.len()", "R.is_empty()", "R", "R.rev()", "R.slice(0, 1)",
+            "R.map(|v| v)", "R.first()", "R.get(0)",
+        ],
+    ),
     (
         "list",
         "[3, 1, 2]",
@@ -160,6 +207,11 @@ def ty_decl(ty):
         "bytes": "bytes",
         "map": "Map[str, i64]",
         "option": "Option[i64]",
+        "list of unit": "[()]",
+        "list of tuple": "[(i64, str)]",
+        "list of option": "[Option[i64]]",
+        "list of bool": "[bool]",
+        "list of bytes": "[bytes]",
     }[ty]
 
 

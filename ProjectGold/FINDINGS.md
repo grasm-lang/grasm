@@ -1917,6 +1917,21 @@ All six fire in all seven. `a_rule_that_fires_anywhere_fires_everywhere` in
 place and not another is F44's shape
 ```
 
+The same crossing, applied to the runtime, is element *representation* against
+list operation: eleven ways a list can hold its elements — inline `i64`, `f64`,
+`bool`, and boxed `str`, unit, `bytes`, list, tuple, `Option`, struct, generic
+struct — against every operation that does not care what the element is. All
+eleven agree on all of them.
+
+`scripts/fuzz_methods.py` carries five of those as groups now, and the first
+version of them found nothing because every call ended in `.len()`: a count
+cannot show that a unit printed as `0`. Interpolating the collection itself is
+what observes the representation, and reintroducing F37 now produces
+
+```
+DISAGREES list of unit/element at R.get(0): run='Some(())' native='Some(0)'
+```
+
 Building the probe took three tries and every failure was the probe: closures
 written inside a string interpolation, a fragment sitting where it was the
 function's tail and therefore propagating rather than being discarded, and a
