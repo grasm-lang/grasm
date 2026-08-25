@@ -96,7 +96,7 @@ program runs in a browser tab with no server: `cargo build --release --target
 wasm32-unknown-unknown -p grasm_wasm`, then see [docs/wasm.md](docs/wasm.md).
 It is the reference interpreter rather than a second implementation, and
 `scripts/wasmtest.sh` holds it to the same agreement gate as everything else —
-183 identical, 0 mismatched.
+184 identical, 0 mismatched.
 
 A run can be **recorded and replayed**. `GRASM_RECORD=j ./prog` writes a journal
 of everything the program read from outside itself; `GRASM_REPLAY=j` makes a

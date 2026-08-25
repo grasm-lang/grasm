@@ -1,0 +1,72 @@
+// Generic types: families of types, one member per use.
+//
+// `type Stack[T]` describes a family. A use fixes the parameter — a struct
+// literal reads it off the fields it gives, a sum constructor off its arguments
+// — and each member is its own type, so a `Stack[i64]` and a `Stack[str]` are
+// two of them ([T-GENERIC-TYPE]).
+type Stack[T] = { items: [T] }
+type Pair[A, B] = { fst: A, snd: B }
+type Opt[T] = | Has(v: T) | Nix
+type Tree[T] = | Leaf | Node(left: Tree[T], value: T, right: Tree[T])
+
+fn push[T](s: Stack[T], v: T) -> Stack[T] {
+    var xs = s.items
+    xs.push(v)
+    Stack{ items: xs }
+}
+
+fn firsts[A, B](ps: [Pair[A, B]]) -> [A] {
+    ps.map(|p| p.fst)
+}
+
+fn get_or[T](o: Opt[T], d: T) -> T {
+    match o {
+        Has(v) -> v
+        Nix -> d
+    }
+}
+
+// A generic type may mention itself. The name is registered before its fields
+// are resolved, so this describes a tree rather than recursing forever.
+fn depth[T](t: Tree[T]) -> i64 {
+    match t {
+        Leaf -> 0
+        Node(l, v, r) -> {
+            let a = depth(l)
+            let b = depth(r)
+            if a > b { a + 1 } else { b + 1 }
+        }
+    }
+}
+
+fn main() {
+    var s = Stack{ items: [1] }
+    s = push(s, 2)
+    print("{push(s, 3).items}")
+
+    // The same function, a different member of the family.
+    let words: Stack[str] = Stack{ items: ["a"] }
+    print("{push(words, "b").items}")
+
+    let ps = [Pair{ fst: 1, snd: "a" }, Pair{ fst: 2, snd: "b" }]
+    print("{firsts(ps)}")
+
+    // Two instantiations of one sum in one program, which is the case that
+    // has to work: `Has(5)` and `Has("s")` are an `Opt[i64]` and an `Opt[str]`.
+    print("{get_or(Has(5), 0)} {get_or(Nix, 9)}")
+    print("{get_or(Has("s"), "d")}")
+
+    let t: Tree[i64] = Node(Node(Leaf, 1, Leaf), 2, Leaf)
+    print("{depth(t)}")
+}
+
+test "a family's members are separate types" {
+    assert_eq(get_or(Has(5), 0), 5)
+    assert_eq(get_or(Has("s"), "d"), "s")
+    assert_eq(push(Stack{ items: [1] }, 2).items.len(), 2)
+}
+
+test "a generic type may mention itself" {
+    let t: Tree[str] = Node(Leaf, "root", Node(Leaf, "r", Leaf))
+    assert_eq(depth(t), 2)
+}

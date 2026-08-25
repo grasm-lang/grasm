@@ -76,7 +76,7 @@ here (a `match` payload charged a sibling parameter's row) cannot recur.
 ### `--native` — *no gaps in the repository's programs*
 
 Every program in `spec/conformance/`, `examples/`, `projects/` and
-`benchmarks/` compiles natively: **222 identical across all three engines, 0
+`benchmarks/` compiles natively: **223 identical across all three engines, 0
 unsupported, 0 leaking.**
 
 The §11 table listed seventeen shapes the backend refused and now lists two,
