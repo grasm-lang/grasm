@@ -68,11 +68,12 @@ python3 scripts/fuzz_fusions.py          # the compiled shortcuts against the in
 python3 scripts/fuzz_captures.py         # what a closure captures, once per representation
 python3 scripts/fuzz_operators.py        # every operator against every representation
 
-`fuzz_places.py` and `fuzz_captures.py` run every program they invent a second
-time under `GRASM_LEAK_CHECK=1`. A place is where reference counting is decided
-and an environment lends its captures, so a miscount is the failure those
-programs are most likely to have — and it produces exactly the right output
-while having it, which is why comparing engines cannot see it (F57).
+Every generator runs the programs it invents a second time under
+`GRASM_LEAK_CHECK=1`, through the one definition in `scripts/lib/leaks.py`. A
+miscounted reference produces exactly the right output while holding an
+allocation for the life of the process, so comparing engines cannot see it —
+`scripts/leakcheck.sh` asked that of the 226 hand-written programs and of none
+of the ~1,150 generated ones (F57).
 ```
 
 The last four enumerate an axis along which the native backend has more than

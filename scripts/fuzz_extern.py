@@ -43,6 +43,20 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GRASM = os.environ.get("GRASM") or os.path.join(ROOT, "target", "release", "grasm")
 
 import importlib.util as _ilu
+
+
+def _lib(name):
+    spec = _ilu.spec_from_file_location(
+        name,
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", f"{name}.py"),
+    )
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+leaked = _lib("leaks").leaked
+
 _spec = _ilu.spec_from_file_location(
     "grasm_fresh", os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "fresh.py")
 )
@@ -218,6 +232,14 @@ def main():
                     f"POINTER DISAGREES {name}:\n  interpreter: {interp}\n"
                     f"  native:      {out3.strip()} {err3.strip()}\n{src}"
                 )
+                continue
+            # The runtime's own allocations, not the C library's: a string
+            # handed to a C function is boxed on this side of the boundary and
+            # has to come back (F57).
+            held = leaked(exe)
+            if held:
+                false_positives.append(f"pointer/{name}/leak")
+                print(f"POINTER LEAKS {name}: {held}\n{src}")
         if declined:
             print(f"  native declined (not a defect): {', '.join(declined)}")
         print(

@@ -31,6 +31,20 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GRASM = os.environ.get("GRASM") or os.path.join(ROOT, "target", "release", "grasm")
 
 import importlib.util as _ilu
+
+
+def _lib(name):
+    spec = _ilu.spec_from_file_location(
+        name,
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", f"{name}.py"),
+    )
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+leaked = _lib("leaks").leaked
+
 _spec = _ilu.spec_from_file_location(
     "grasm_fresh",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "fresh.py"),
@@ -467,6 +481,13 @@ def main():
                         declined.append(f"{label}: {first}")
                     continue
                 rc3, got, err3 = run([exe])
+                if rc3 == 0 and got == want:
+                    # Every method that answers something boxed has to hand it
+                    # over exactly once (F57).
+                    held = leaked(exe)
+                    if held:
+                        disagreed.append(label)
+                        print(f"LEAKS {label}: {held}")
                 if rc3 != 0 or got != want:
                     disagreed.append(label)
                     # Name the position rather than dumping two long lines.

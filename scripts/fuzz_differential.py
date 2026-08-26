@@ -33,6 +33,20 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GRASM = os.environ.get("GRASM") or os.path.join(ROOT, "target", "release", "grasm")
 
 import importlib.util as _ilu
+
+
+def _lib(name):
+    spec = _ilu.spec_from_file_location(
+        name,
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", f"{name}.py"),
+    )
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+leaked = _lib("leaks").leaked
+
 _spec = _ilu.spec_from_file_location(
     "grasm_fresh", os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "fresh.py")
 )
@@ -550,6 +564,12 @@ def check(src_path, bin_path):
             f"--- interpreter ---\n{interp.stdout}"
             f"--- native ---\n{native.stdout}"
         )
+    # Whole random programs, which is the broadest sample of shapes there is.
+    # They were compared for what they print and never for what they keep
+    # (F57).
+    held = leaked(bin_path) if native.returncode == 0 else None
+    if held:
+        return False, f"native leaks: {held}"
     return True, ""
 
 

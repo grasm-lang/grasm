@@ -37,6 +37,20 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GRASM = os.environ.get("GRASM") or os.path.join(ROOT, "target", "release", "grasm")
 
 import importlib.util as _ilu
+
+
+def _lib(name):
+    spec = _ilu.spec_from_file_location(
+        name,
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", f"{name}.py"),
+    )
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+leaked = _lib("leaks").leaked
+
 _spec = _ilu.spec_from_file_location(
     "grasm_fresh",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "fresh.py"),
@@ -155,6 +169,11 @@ def main():
                     bad.append(
                         f"{label}: run={(out.strip(), rc)} native={(got.strip(), rc3)}"
                     )
+                    continue
+                # `==` on two boxed values compares them and owns neither (F57).
+                held = leaked(exe)
+                if held:
+                    bad.append(f"{label}: leaks -- {held}")
         for d in drifted:
             print(f"DRIFTED {d}")
         for b_ in bad:

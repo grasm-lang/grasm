@@ -35,6 +35,20 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GRASM = os.environ.get("GRASM") or os.path.join(ROOT, "target", "release", "grasm")
 
 import importlib.util as _ilu
+
+
+def _lib(name):
+    spec = _ilu.spec_from_file_location(
+        name,
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", f"{name}.py"),
+    )
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+leaked = _lib("leaks").leaked
+
 _spec = _ilu.spec_from_file_location(
     "grasm_fresh",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "fresh.py"),
@@ -97,6 +111,11 @@ RETURNS = [
     ("option", "-> Option[i64]", "        let v = Src.get(1)\n        print(\"{v}\")"),
     ("struct", "-> Pt", "        let v = Src.get(1)\n        print(\"{v}\")"),
     ("sum", "-> Col", "        let v = Src.get(1)\n        print(\"{v}\")"),
+    # The result *discarded*. Every shape above binds or prints it, so none of
+    # them could see F57: a `with` block's tail value was never released, and
+    # the output is identical either way. A boxed result is the only kind that
+    # can be lost this way.
+    ("discarded", "-> [i64]", "        Src.get(1)"),
 ]
 
 # The operation's body, by what its declared result allows.
@@ -132,6 +151,7 @@ BODIES = {
     "option": ["Some(n * 2)", "held_option"],
     "struct": ["Pt{ x: n, y: cap }", "held_struct"],
     "sum": ["if n > 0 { Red } else { Green }", "held_sum"],
+    "discarded": ["[n, cap]", "held_list"],
 }
 
 # Where the handler literal is written, relative to the `with` that installs
@@ -272,7 +292,13 @@ def check_one(src, work):
             return ("declined", err.strip())
         return ("native build failed", err.strip())
     nr, no, ne = run([native])
+    # Before the binary is removed: a handler's operations own an environment,
+    # and getting its reference count wrong by one in either direction is
+    # invisible in the output (F57).
+    held = leaked(native) if nr == 0 else None
     os.remove(native)
+    if held:
+        return ("native leaks", held)
 
     if (ir, io_, strip_trace(ie)) != (br, bo, strip_trace(be)):
         return ("bundle disagrees", f"run={ir},{io_!r},{ie!r}\nbundle={br},{bo!r},{be!r}")

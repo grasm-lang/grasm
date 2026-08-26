@@ -42,6 +42,20 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GRASM = os.environ.get("GRASM") or os.path.join(ROOT, "target", "release", "grasm")
 
 import importlib.util as _ilu
+
+
+def _lib(name):
+    spec = _ilu.spec_from_file_location(
+        name,
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", f"{name}.py"),
+    )
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+leaked = _lib("leaks").leaked
+
 _spec = _ilu.spec_from_file_location(
     "grasm_fresh",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "fresh.py"),
@@ -223,24 +237,6 @@ def run(cmd, timeout=180):
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     return p.returncode, p.stdout, p.stderr
 
-
-def leaked(exe):
-    """Whether the binary holds allocations at exit.
-
-    An environment lends its captures: the body takes a reference on the way
-    in and the scope releases it on the way out, and the two have to match.
-    Getting that wrong by one in either direction is invisible in the output
-    -- too few frees a value the next call still needs, too many keeps it for
-    ever -- so agreement alone cannot see it.
-    """
-    p = subprocess.run(
-        [exe],
-        capture_output=True,
-        text=True,
-        timeout=180,
-        env={**os.environ, "GRASM_LEAK_CHECK": "1"},
-    )
-    return p.stderr.strip().splitlines()[0] if p.returncode != 0 else None
 
 
 def main():

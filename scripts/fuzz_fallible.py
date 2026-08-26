@@ -21,6 +21,20 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 G = os.environ.get("GRASM") or os.path.join(ROOT, "target", "release", "grasm")
 
 import importlib.util as _ilu
+
+
+def _lib(name):
+    spec = _ilu.spec_from_file_location(
+        name,
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", f"{name}.py"),
+    )
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+leaked = _lib("leaks").leaked
+
 _spec = _ilu.spec_from_file_location(
     "grasm_fresh",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "fresh.py"),
@@ -138,6 +152,13 @@ def main():
             continue
         a, ra = run([G, "run", src])
         b, rb = run([out])
+        # An error path is the one a program takes least often and frees
+        # least carefully (F57).
+        held = leaked(out) if rb == 0 else None
+        if held:
+            mism += 1
+            print(f"LEAKS seed={s}: {held}")
+            continue
         os.path.exists(out) and os.remove(out)
         checked += 1
         if (a, ra) != (b, rb):

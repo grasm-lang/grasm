@@ -2507,6 +2507,27 @@ The literal path was covered by neither, so `examples/handler_captures.gr`
 gained a top-level `with` whose tail is a discarded boxed result.
 Removing that fix makes `leakcheck.sh` exit 1.
 
+**Then all of them.** Nine generators still never asked. They do now,
+through one shared `scripts/lib/leaks.py` rather than a copy each —
+`fuzz_places.py` and `fuzz_captures.py` had two copies of the rule
+between them, and F47 is what three copies of the trace filter came to.
+Roughly 1,150 more generated programs are now checked for what they keep
+as well as for what they print, and all of them are clean.
+
+`fuzz_handlers.py` needed a *shape* as well as an arm. Every one of its
+result types was bound or printed, so none could reach a discarded tail —
+adding `discarded` makes it catch the literal path with 22 leaks. Getting
+that shape right took two attempts: written as `Src.get(1)` followed by a
+`print`, the discarded call is not the block's tail and nothing leaks.
+
+Not every arm has been shown to catch a real defect, which is worth
+saying plainly rather than implying otherwise. Removing the reference
+count from a list's scope release is invisible to `fuzz_methods.py`,
+`fuzz_operators.py` and `fuzz_fusions.py` — their strings are interned
+and their lists are consumed — while `fuzz_generics.py` reports 388
+leaks for it. An arm that has never fired is coverage claimed and not
+yet demonstrated.
+
 Found by crossing mutating methods and compound assignment with places
 reached through references — 48 shapes, all agreeing and all leak-free,
 which is the answer that mattered for F56. The leak came from the arm

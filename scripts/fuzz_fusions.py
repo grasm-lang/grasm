@@ -30,6 +30,20 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GRASM = os.environ.get("GRASM") or os.path.join(ROOT, "target", "release", "grasm")
 
 import importlib.util as _ilu
+
+
+def _lib(name):
+    spec = _ilu.spec_from_file_location(
+        name,
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", f"{name}.py"),
+    )
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+leaked = _lib("leaks").leaked
+
 _spec = _ilu.spec_from_file_location(
     "grasm_fresh",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "fresh.py"),
@@ -213,6 +227,12 @@ def main():
                 print(f"WILL NOT BUILD {name}: {err2.strip().splitlines()[0]}")
                 continue
             rc3, got, err3 = run([exe])
+            # A fused loop builds no intermediate list, so what it does not
+            # build it must not release either (F57).
+            held = leaked(exe) if rc3 == 0 else None
+            if held:
+                bad.append(name)
+                print(f"LEAKS {name}: {held}")
             # The exit code matters as much as the output: a fused loop that
             # panics must panic.
             if got != out or rc3 != rc:

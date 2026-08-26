@@ -35,6 +35,20 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GRASM = os.environ.get("GRASM") or os.path.join(ROOT, "target", "release", "grasm")
 
 import importlib.util as _ilu
+
+
+def _lib(name):
+    spec = _ilu.spec_from_file_location(
+        name,
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", f"{name}.py"),
+    )
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+leaked = _lib("leaks").leaked
+
 _spec = _ilu.spec_from_file_location(
     "grasm_fresh",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "fresh.py"),
@@ -367,6 +381,12 @@ def check_one(src, work):
             return ("declined", err.strip())
         return ("native build failed", err.strip())
     nr, no, ne = run([native])
+    # A generic instantiation boxes and unboxes at each member's own
+    # representation, so a miscount is per-instantiation and invisible in the
+    # output (F57).
+    held = leaked(native) if nr == 0 else None
+    if held:
+        return ("native leaks", held)
 
     if (ir, io, ie) != (br, bo, be):
         return ("bundle disagrees", f"run={ir!r},{io!r},{ie!r}\nbundle={br!r},{bo!r},{be!r}")
