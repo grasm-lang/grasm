@@ -7,6 +7,9 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
 
 ### Fixed
 
+- `fold`, `unwrap_or`, `expect` and `parse_int_base` compile where the
+  backend has to name a call's result type — a list literal's element.
+  Each worked in every other position (F54).
 - A range's type is written `range`, so one can be a parameter, a result
   or a field; and a range reaches its methods from any shape that produces
   one, not only from a name (F53).

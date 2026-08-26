@@ -105,7 +105,9 @@ refused for every representation and had never been written down as a gap
 (F51), and an empty `map()` as an element of a list literal, which was the
 one position that asked the probe rather than the lowering (F52), and a range reaching a method from any shape that produces one rather
 than only from a name -- which also gave the range type the spelling `range`,
-so one can be a parameter, a result or a field (F53).
+so one can be a parameter, a result or a field (F53); and `fold`,
+`unwrap_or`, `expect` and `parse_int_base` where the backend has to name a
+call's result type rather than a receiver's (F54).
 
 ## S4 — diagnostics
 

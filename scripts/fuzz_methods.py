@@ -291,6 +291,13 @@ SHAPES = {
     "loop-var": "    for R in [{lit}] {{\n        let out = [\n{calls}\n        ]\n        print(out.join(\"|\"))\n    }}\n",
     "field": "    let holder = Box{{ v: {lit} }}\n    let R = holder.v\n    let out = [\n{calls}\n    ]\n    print(out.join(\"|\"))\n",
     "element": "    let holder = [{lit}]\n    let R = holder[0]\n    let out = [\n{calls}\n    ]\n    print(out.join(\"|\"))\n",
+    # The *call* in a probed position, rather than the receiver. A list
+    # literal's element is the one place the backend has to name a method's
+    # result type before it evaluates anything, and every arm of that dispatch
+    # is a place a method can be missing: `fold`, `unwrap_or`, `expect` and
+    # `parse_int_base` all were, while working in every other position (F54).
+    # A range's whole list surface was missing there too (F53).
+    "probed": "{calls}\n",
 }
 
 
@@ -329,10 +336,23 @@ fn built_tuple() -> Map[str, (i64, str)] {
 
 
 def build(ty, lit, calls, shape):
-    # Every result is interpolated, so one program covers every method and a
-    # disagreement names the position.
-    lines = ",\n".join(f'        "{{{c}}}"' for c in calls)
-    if shape == "literal":
+    if shape == "probed":
+        # Bare, not interpolated. Interpolating the call puts a *string* in the
+        # list, so the backend never has to name the call's own type -- which
+        # is the whole point of this shape. Written that way it reported
+        # success while the four missing arms it exists for stayed missing.
+        #
+        # One list per call, because the results do not share a type, and each
+        # is read back out so a wrong answer shows and not only a refusal.
+        lines = "\n".join(
+            f"    let probed{i} = [{c}]\n    print(\"{{probed{i}[0]}}\")"
+            for i, c in enumerate(calls)
+        )
+    else:
+        # Every result is interpolated, so one program covers every method and
+        # a disagreement names the position.
+        lines = ",\n".join(f'        "{{{c}}}"' for c in calls)
+    if shape in ("literal", "probed"):
         # Every mention of the receiver, not only the ones a `.` follows:
         # `(R / 4.0).asin()` and `R ?? 0 - 1` name it bare.
         # A function replacement, not a string one. `re.sub` reads escapes in
@@ -418,7 +438,7 @@ def main():
             for shape in SHAPES:
                 # Nothing binds the receiver in `literal`, so there is nowhere
                 # to put the annotation an empty literal needs.
-                if lit in ("map()", "[]") and shape == "literal":
+                if lit in ("map()", "[]") and shape in ("literal", "probed"):
                     continue
                 src = build(ty, lit, calls, shape)
                 with open(path, "w") as f:

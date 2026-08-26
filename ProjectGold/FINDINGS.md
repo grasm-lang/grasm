@@ -69,6 +69,7 @@ and the entries disagree.
 | [F51](#f51) | no closure could be declared inside another closure | S3, over-strict | **fixed** |
 | [F52](#f52) | an empty `map()` could not be an element of a list literal | S3, over-strict | **fixed** |
 | [F53](#f53) | a range had a type with no name and a method table that only knew names | S3, over-strict | **fixed** |
+| [F54](#f54) | four methods had no result type where the backend has to name one | S3, over-strict | **fixed** |
 
 <!-- end index -->
 ## F1 — a wrapped condition must end the line with the operator (S4) — **fixed**
@@ -2352,3 +2353,40 @@ list element, as a closure's result, and declared by name.
 `spec/conformance/L-LIB-RANGE-OPS.gr` gained the declared forms. Each of
 the three fixes was removed on its own and `nativegaps.sh` exits 1 for
 each.
+
+## F54 — four methods had no result type where the backend has to name one (S3, over-strict) — **fixed**
+
+The sweep F53 came out of said `probe_type` had an arm for every `Expr`
+variant. That is one table. The *method* dispatch inside it is another,
+and fifteen of its arms end in the same refusal — "`.x()` on a receiver
+whose type is not known here" — so a method missing from it reads as a
+receiver the backend could not type rather than a method nobody wrote
+down.
+
+Crossing every method in `fuzz_methods.py` against every receiver
+representation, with the **call** in a probed position rather than the
+receiver, found four:
+
+```
+[[1, 2].fold(0, |a, b| a + b)]      // `.fold()` on a receiver …
+[Some(1).unwrap_or(0 - 1)]          // `.unwrap_or()` on a receiver …
+[Some(1).expect("must")]            // `.expect()` on a receiver …
+["ff".parse_int_base(16) ?? 0 - 1]  // `.parse_int_base()` on a receiver …
+```
+
+Each works in every other position. `parse_int` and `parse_float` had
+arms and `parse_int_base` did not; `get` had one and `unwrap_or` did
+not. A fold is worth what it accumulates, which its seed says; `expect`
+and `unwrap_or` are worth what the `Option` holds, and differ in what
+happens rather than in what comes back.
+
+**Gate**: a seventh shape in `scripts/fuzz_methods.py`, `probed`, which
+puts the call — not the receiver — in a list literal's element. 142 to
+164 programs.
+
+Written the obvious way it caught nothing. The other six shapes
+interpolate every result, and interpolating a call puts a *string* in the
+list, so the backend never has to name the call's own type — which is the
+entire point of the shape. It reported success against a build with all
+four arms removed. One list per call, each read back out, and the same
+mutation now exits 1 with six declines.

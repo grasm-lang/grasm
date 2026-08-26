@@ -11052,7 +11052,29 @@ annotate the binding",
                     _ => return nope(e.span(), format!("`.{}()` on a receiver whose type is not known here", name.name)),
                 },
                 "parse_int" => VType::Option(Box::new(VType::I64)),
+                // Its sibling had an arm and it did not, so `"ff"` parsed in
+                // base sixteen was refused in the positions that ask the probe
+                // and accepted everywhere else (F54).
+                "parse_int_base" => VType::Option(Box::new(VType::I64)),
                 "parse_float" => VType::Option(Box::new(VType::F64)),
+                // What an `Option` holds. Both open one; `expect` panics where
+                // `unwrap_or` substitutes, which is a difference in what
+                // happens and not in what comes back.
+                "unwrap_or" | "expect" => match self.probe_type(recv)? {
+                    VType::Option(t) => *t,
+                    // A receiver whose own type is not known here can still be
+                    // answered by the default, which has to be the same type.
+                    _ => match args.first() {
+                        Some(d) => self.probe_type(d)?,
+                        None => return nope(e.span(), format!("`.{}()` on a receiver whose type is not known here", name.name)),
+                    },
+                },
+                // A fold is worth what it accumulates, and the seed is what
+                // says so -- the closure's result has to match it.
+                "fold" => match args.first() {
+                    Some(seed) => self.probe_type(seed)?,
+                    None => return nope(e.span(), format!("`.{}()` on a receiver whose type is not known here", name.name)),
+                },
                 "index_of" => VType::Option(Box::new(VType::I64)),
                 "to_list" => match self.probe_type(recv)? {
                     VType::Bytes | VType::Range => VType::List(Box::new(VType::I64)),
