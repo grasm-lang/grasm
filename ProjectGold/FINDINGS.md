@@ -2536,6 +2536,7 @@ be re-run:
 | `fuzz_operators` | both operands of a boxed `==` | 22 |
 | `fuzz_fallible` | the coalesced fallible's release | 196 |
 | `fuzz_extern` | the `grasm_str_c_free` after a C call | 8 copies |
+| `fuzz_captures` (spawn) | the task list's release after a `parallel` | 36 |
 
 Each mutation was chosen to fall in a path that generator exercises and
 another does not: only `fuzz_operators` catches the equality one, only
@@ -2554,6 +2555,16 @@ are one site each, so a counter between them is exact, and
 `grasm_check_leaks` reports it on its own line. All three `c_new` call
 sites in the backend do free — that was audited rather than assumed —
 and removing the free now makes `fuzz_extern` exit 1 naming eight copies.
+
+`fuzz_captures` gained three `spawn` shapes, which reach a value by a
+third route again: a `spawn` body *sees* the enclosing scope rather than
+capturing it ([E-SPAWN-SHARED]), so none of them touch the environment
+the `par` shapes do — removing the parallel capture's borrow leaves all
+three clean, and only the `par` shapes catch it. What they do catch is
+the task list's own release, which nothing else reaches: 12 leaks each,
+and no other shape in the file notices. Thirteen representations across
+`spawn`, two concurrent `spawn`s, and a value built on a worker and
+released on the main thread all agree and hold nothing.
 
 One arm remains undemonstrated: `fuzz_fusions` invents eight
 tightly-constrained programs and none of the six mutations tried reached

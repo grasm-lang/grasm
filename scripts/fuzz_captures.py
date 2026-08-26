@@ -128,6 +128,32 @@ def shapes(ty, lit):
             f"    let out = [1, 2, 3].par_map(|_x| held)\n"
             f'    print("{{out.len()}}")\n}}\n'
         ),
+        # A `spawn` body sees the enclosing scope and does not capture like a
+        # closure ([E-SPAWN-SHARED]), so it reaches a value by a third route
+        # again -- and it reaches it from another thread, where a reference
+        # count is the only thing keeping the value alive.
+        "spawn-reads": (
+            f"fn main() {{\n    let held = {lit}\n    var log = \"\"\n"
+            f"    parallel {{\n        spawn {{\n"
+            f"            log += \"{{held}}\"\n        }}\n    }}\n"
+            f'    print(log)\n}}\n'
+        ),
+        # Two of them, so the value is read from two threads at once.
+        "two-spawns": (
+            f"fn main() {{\n    let held = {lit}\n    var log = \"\"\n"
+            f"    parallel {{\n        spawn {{\n"
+            f"            log += \"{{held}}\"\n        }}\n"
+            f"        spawn {{\n            log += \"{{held}}\"\n        }}\n    }}\n"
+            f'    print(log)\n}}\n'
+        ),
+        # Built on a worker and printed there: its allocation is made on one
+        # thread and released on another, which is what `ESCAPED` is for.
+        "built-in-spawn": (
+            f"fn main() {{\n    var log = \"\"\n"
+            f"    parallel {{\n        spawn {{\n            let made = {lit}\n"
+            f"            log += \"{{made}}\"\n        }}\n    }}\n"
+            f'    print(log)\n}}\n'
+        ),
         # An effect handler's operation is a closure too, and it is the one
         # whose environment F50 was in.
         "handler": (
