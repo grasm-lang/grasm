@@ -49,7 +49,7 @@ _fresh.fresh_or_stop(GRASM)
 
 PRELUDE = """type Col = | Red | Green
 type Inner = { n: i64, xs: [i64], s: str }
-type Outer = { one: Inner, many: [Inner], cell: ref i64, cells: [ref i64] }
+type Outer = { one: Inner, many: [Inner], cell: ref i64, cells: [ref i64], cell_list: ref [i64] }
 
 fn fresh() -> Outer {
     var many: [Inner] = []
@@ -65,6 +65,7 @@ fn fresh() -> Outer {
         many: many,
         cell: ref(100),
         cells: cells,
+        cell_list: ref([1, 2, 3]),
     }
 }
 """
@@ -91,6 +92,14 @@ PLACES = [
     ("ref-sum-at-root", "rc.value", "Col", "Green"),
     ("ref-option-at-root", "ro.value", "Option[i64]", "Some(9)"),
     ("ref-sum-in-list", "rcs[1].value", "Col", "Green"),
+    # An *indexed* write through a reference. `.value` names the referent, so
+    # it is spent by reaching one -- and it was passed on whole instead, so the
+    # rest of the walk was asked for `list.value[0]` and refused. Twice, one
+    # level apart: at the root and through a list, by the same message from two
+    # different places (F56).
+    ("ref-elem-at-root", "rl.value[0]", "i64", "42"),
+    ("ref-elem-in-list", "rls[1].value[0]", "i64", "42"),
+    ("ref-elem-in-field", "o.cell_list.value[0]", "i64", "42"),
 ]
 
 # List-valued places, for the mutating methods. These reach `read_place_boxed`
@@ -137,12 +146,18 @@ def build(place, ty, value, op_body):
         + "    var n = 5\n"
         + "    var xs = [9, 8, 7]\n"
         + "    let r = ref(3)\n"
+        + "    let rl = ref([1, 2, 3])\n"
+        + "    var rls: [ref [i64]] = []\n"
+        + "    for _j in 0..2 {\n        rls.push(ref([4, 5, 6]))\n    }\n"
         + "    let rc = ref(Red)\n"
         + "    let ro = ref(Some(1))\n"
         + "    var rcs: [ref Col] = []\n"
         + "    for _i in 0..3 {\n        rcs.push(ref(Red))\n    }\n"
         + f"    {body}\n"
         + "    release(r)\n"
+        + "    release(rl)\n"
+        + "    release(o.cell_list)\n"
+        + "    for c in rls {\n        release(c)\n    }\n"
         + "    release(rc)\n"
         + "    release(ro)\n"
         + "    for c in rcs {\n        release(c)\n    }\n"

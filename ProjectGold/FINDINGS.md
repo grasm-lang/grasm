@@ -71,6 +71,7 @@ and the entries disagree.
 | [F53](#f53) | a range had a type with no name and a method table that only knew names | S3, over-strict | **fixed** |
 | [F54](#f54) | four methods had no result type where the backend has to name one | S3, over-strict | **fixed** |
 | [F55](#f55) | which types compare was written down nowhere | S3, unspecified | **fixed** |
+| [F56](#f56) | a write *inside* a referent was refused | S3, over-strict | **fixed** |
 
 <!-- end index -->
 ## F1 — a wrapped condition must end the line with the operator (S4) — **fixed**
@@ -2425,3 +2426,44 @@ disagreements.
 The specification is at its 70-page cap, so the clause is one sentence
 and two cosmetic double-blank lines in `spec/grammar.md` paid for it.
 That the budget forced the sentence to be short is the budget working.
+
+## F56 — a write *inside* a referent was refused (S3, over-strict) — **fixed**
+
+```
+let r = ref([1, 2])
+r.value[0] = 42     // a write to field `value` of this type
+```
+
+Reading the same place compiled. Replacing the whole referent —
+`r.value = [42]`, one line above in the same function — compiled.
+`grasm run` did all three.
+
+`.value` names the referent, so it is spent by reaching one: what follows
+applies to the referent itself. The walk passed the path on whole after
+resolving the reference, so the rest of it was asked for `list.value[0]`,
+and `Field("value")` on a list has no arm.
+
+The same omission twice, one level apart. `r.value[0] = v` refuses at the
+root, where the place *starts* at a reference; `rs[0].value[0] = v`
+refuses in the descend, where a reference is reached through a list —
+both with the same message, from two different places. That is the shape
+F17, F22, F23, F24 and F26 all had, and F22 was this same accessor: it
+was implemented where a place starts at a reference and a reference
+reached through a list is met halfway down `write_place`. This is the
+third time that exact sentence applies.
+
+Stripping is conditional on the referent: a struct is not offered
+`.value` at all ([T-REF-VALUE]), so there `.value` is a field of the
+struct's own and stays in the path.
+
+**Gates**: three cases in `scripts/fuzz_places.py` — an indexed write
+through a reference at the root, through a list, and through a struct
+field (99 to 114 programs). Each site was removed on its own and the
+generator exits 1 for each, with three declines for the root and six for
+the descend. `spec/conformance/T-REF-VALUE.gr` carries all three shapes,
+so `difftest`, `leakcheck`, `agreetest`, `wasmtest` and `crosstest` do
+too — the leak gate matters here, because these paths are where a
+write-back's reference counting lives.
+
+Found by crossing place shapes with mutating methods, the tables the
+`probe_type` sweeps had not touched.

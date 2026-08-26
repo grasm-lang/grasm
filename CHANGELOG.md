@@ -7,6 +7,9 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
 
 ### Fixed
 
+- A write *inside* a referent compiles: `r.value[0] = v`, and the same
+  through a list or a struct field. Reading it always worked, and so did
+  replacing the whole referent (F56).
 - [T-COMPARE] states which types compare. `==` and `!=` on any two values
   of one type; ordering on `i64`, `f64`, `str` and tuples of ordered
   components. It was true before and written down nowhere (F55).

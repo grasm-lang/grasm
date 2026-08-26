@@ -107,7 +107,9 @@ one position that asked the probe rather than the lowering (F52), and a range re
 than only from a name -- which also gave the range type the spelling `range`,
 so one can be a parameter, a result or a field (F53); and `fold`,
 `unwrap_or`, `expect` and `parse_int_base` where the backend has to name a
-call's result type rather than a receiver's (F54).
+call's result type rather than a receiver's (F54). And a write *inside* a referent, `r.value[0] = v`, refused
+at two sites one level apart while reading the same place always compiled
+(F56).
 
 ## S4 — diagnostics
 

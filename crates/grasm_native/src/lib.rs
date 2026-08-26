@@ -11851,7 +11851,25 @@ annotate the binding",
                 return Ok(root);
             }
             let referent = self.call_rt("grasm_ref_make_unique", &[root]).unwrap();
-            self.write_place(span, referent, path, &inner, boxed_val)?;
+            // `.value` *is* the referent, so it is spent by reaching it --
+            // what follows applies to the referent itself. Passed on whole,
+            // the rest of the walk was asked for `list.value[0]` and refused
+            // with "a write to field `value` of this type", so `r.value[0] =
+            // v` was rejected while reading the same place compiled and the
+            // whole-referent write one line above compiled (F56).
+            //
+            // Only when it is the reference's accessor: a struct referent is
+            // not offered one ([T-REF-VALUE]), so there `.value` is a field of
+            // the struct's own and has to stay in the path.
+            let rest = match path.split_first() {
+                Some((PlaceSeg::Field("value"), tail))
+                    if !matches!(inner, VType::Struct(_) | VType::Tuple(_)) =>
+                {
+                    tail
+                }
+                _ => path,
+            };
+            self.write_place(span, referent, rest, &inner, boxed_val)?;
             self.wrote_through_ref = true;
             return Ok(root);
         }
@@ -11930,7 +11948,20 @@ annotate the binding",
                         return Ok(root);
                     }
                     let referent = self.call_rt("grasm_ref_make_unique", &[raw]).unwrap();
-                    self.write_place(span, referent, rest, &inner, boxed_val)?;
+                    // As at the root: `.value` is spent by reaching the
+                    // referent, and what follows applies to the referent. The
+                    // same omission twice, one level apart -- `r.value[0] = v`
+                    // and `rs[0].value[0] = v` were refused by the same
+                    // message from two different places (F56).
+                    let tail = match rest.split_first() {
+                        Some((PlaceSeg::Field("value"), t))
+                            if !matches!(inner, VType::Struct(_) | VType::Tuple(_)) =>
+                        {
+                            t
+                        }
+                        _ => rest,
+                    };
+                    self.write_place(span, referent, tail, &inner, boxed_val)?;
                     self.wrote_through_ref = true;
                     return Ok(root);
                 }
