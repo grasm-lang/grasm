@@ -760,12 +760,15 @@ defect being worked off:
 | polymorphic recursion | `fn f[T](x: T) -> i64 { f([x]) }` needs one compiled copy per type and the types never stop growing. No amount of work removes this; it is what monomorphization is, and it is refused by name at build time |
 
 Everything else the interpreter accepts, the compiled backend compiles.
-`scripts/nativegaps.sh` holds that claim to 50 cases, running each under both
+`scripts/nativegaps.sh` holds that claim to 52 cases, running each under both
 engines and comparing output, exit code and leaks. Six of the ten generators in
 `scripts/` report how many of the programs they invented the backend turned
-away, and all six report `declined: 0`. In `scripts/fuzz_captures.py` a decline
-is a *failure* rather than a report: every shape it generates is one the
-backend compiles, so a refusal there is coverage lost rather than an honest no.
+away, and all six report `declined: 0` — and in all six a decline is a
+*failure* rather than a report. Every shape they generate is one the backend
+compiles, so a refusal is coverage lost rather than an honest no: it is either
+a new gap, which belongs in the table above, or a defect. Twice now a generator
+has counted one and exited 0, and both times the programs stopped running while
+the summary said nothing was wrong.
 
 That is a statement about what has been checked, not a proof. A shape nobody has
 written is a shape nobody has tried. What has changed is the direction the gate

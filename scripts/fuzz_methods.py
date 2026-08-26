@@ -250,6 +250,26 @@ GROUPS = [
             "R.concat(bytes_of([0])).len()", "R",
         ],
     ),
+    # The empty literals. They have nothing to read a type off and take one
+    # from the annotation the checker resolved, and the six positions below
+    # reach that answer by six different routes -- one of which is a list
+    # literal's element, where an empty `map()` was refused (F52).
+    (
+        "empty map",
+        "map()",
+        [
+            "R.len()", "R.is_empty()", 'R.has("a")', 'R.get("a")',
+            "R.keys().len()", "R.values().len()", "R.entries().len()", "R",
+        ],
+    ),
+    (
+        "empty list",
+        "[]",
+        [
+            "R.len()", "R.is_empty()", "R.first()", "R.last()",
+            "R.rev().len()", 'R.map(|v| v + 1).len()', "R",
+        ],
+    ),
     (
         "bytes with nul",
         "bytes_of([0, 65, 0])",
@@ -279,6 +299,16 @@ PRELUDE = """fn built() -> Map[str, i64] {
     m.set("a", 1)
     m.set("b", 2)
     m
+}
+
+fn empty_map() -> [Map[str, i64]] {
+    let one: Map[str, i64] = map()
+    [one]
+}
+
+fn empty_list() -> [[i64]] {
+    let one: [i64] = []
+    [one]
 }
 
 fn built_unit() -> Map[str, ()] {
@@ -311,6 +341,22 @@ def build(ty, lit, calls, shape):
         # tab, or raised "bad escape \u" and took the whole generator down.
         lines = re.sub(r"\bR\b", lambda _m: f"({lit})", lines)
     body = SHAPES[shape].format(lit=lit, calls=lines)
+    # An empty literal has nothing to read a type off, so the positions that
+    # bind it have to say. `literal` cannot say anything at all -- there is no
+    # binding to annotate -- so that one is skipped, and the empty literal is
+    # bound through a helper instead. This is the checker being right
+    # ([T-EMPTY-LIT]), not the backend refusing.
+    if lit in ("map()", "[]"):
+        t = ty_decl(ty)
+        body = body.replace(f"let R = {lit}", f"let R: {t} = {lit}")
+        body = body.replace(f"var R = {lit}", f"var R: {t} = {lit}")
+        body = body.replace(f"for R in [{lit}]", f"for R in empty_{ty.split()[1]}()")
+        # The list literal's element -- the position F52 was refused in. The
+        # holder is what says the type; without it the checker is right to
+        # refuse, and the shape would have been dropped rather than run.
+        body = body.replace(
+            f"let holder = [{lit}]", f"let holder: [{t}] = [{lit}]"
+        )
     decl = f"type Box = {{ v: {ty_decl(ty)} }}\n\n" if shape == "field" else ""
     return PRELUDE + decl + "fn main() / {io} {\n" + body + "}\n"
 
@@ -327,6 +373,8 @@ def ty_decl(ty):
         "str whitespace": "str",
         "bytes invalid utf8": "bytes",
         "bytes with nul": "bytes",
+        "empty map": "Map[str, i64]",
+        "empty list": "[i64]",
         "map": "Map[str, i64]",
         "option": "Option[i64]",
         "map of unit": "Map[str, ()]",
@@ -368,6 +416,10 @@ def main():
             for c in calls:
                 covered.update(re.findall(r"\.([a-z_0-9]+)\(", c))
             for shape in SHAPES:
+                # Nothing binds the receiver in `literal`, so there is nowhere
+                # to put the annotation an empty literal needs.
+                if lit in ("map()", "[]") and shape == "literal":
+                    continue
                 src = build(ty, lit, calls, shape)
                 with open(path, "w") as f:
                     f.write(src)
@@ -427,7 +479,13 @@ def main():
             print(f"kept: {work}")
         else:
             shutil.rmtree(work, ignore_errors=True)
-    sys.exit(1 if disagreed or rejected else 0)
+    # A decline is coverage lost, not an honest no. [§11] says the backend
+    # compiles everything the interpreter accepts bar polymorphic recursion,
+    # so a refusal here is either a new gap -- which belongs in
+    # `scripts/nativegaps.sh` and in the tutorial's table -- or a defect.
+    # Counted and not acted on, it reads as PASS while programs quietly stop
+    # running: removing the F52 fix left this at `declined: 1` and exit 0.
+    sys.exit(1 if disagreed or rejected or declined else 0)
 
 
 if __name__ == "__main__":

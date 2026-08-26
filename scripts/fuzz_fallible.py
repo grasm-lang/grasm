@@ -155,7 +155,13 @@ def main():
     # `sys.exit(1 if ... else 0)`; this one ended with the print, so a run that
     # found a disagreement reported success — the finding was on stdout and
     # nothing acted on it.
-    sys.exit(1 if mism else 0)
+    # A decline is coverage lost, not an honest no. [§11] says the backend
+    # compiles everything the interpreter accepts bar polymorphic recursion,
+    # so a refusal here is either a new gap -- which belongs in
+    # `scripts/nativegaps.sh` and in the tutorial's table -- or a defect.
+    # Counted and not acted on, it reads as PASS while programs quietly stop
+    # running: removing the F52 fix left this at `declined: 1` and exit 0.
+    sys.exit(1 if mism or declined else 0)
 
 
 main()

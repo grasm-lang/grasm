@@ -146,6 +146,53 @@ def shapes(ty, lit):
             f"    let f = || held\n    held = {lit}\n"
             f'    print("{{f()}}")\n}}\n'
         ),
+        # A handler installed inside a closure, so the operation's
+        # environment is built while another environment is being read.
+        "handler-in-closure": (
+            f"effect Src {{\n    fn get() -> {ty}\n}}\n"
+            f"fn main() {{\n    let held = {lit}\n"
+            f"    let outer = || {{\n"
+            f"        with Src handled_by SrcHandler{{ get: || held }} {{\n"
+            f"            Src.get()\n        }}\n    }}\n"
+            f'    print("{{outer()}}")\n}}\n'
+        ),
+        # Three environments deep: a closure inside a handler operation
+        # inside a closure.
+        "closure-in-handler-in-closure": (
+            f"effect Src {{\n    fn get() -> {ty}\n}}\n"
+            f"fn main() {{\n    let held = {lit}\n"
+            f"    let outer = || {{\n"
+            f"        with Src handled_by SrcHandler{{ get: || {{\n"
+            f"            let inner = || held\n            inner()\n        }} }} {{\n"
+            f"            Src.get()\n        }}\n    }}\n"
+            f'    print("{{outer()}}")\n}}\n'
+        ),
+        # A generic function returning a closure over its own parameter: the
+        # capture's representation is not known until the instantiation is.
+        "generic-returns-closure": (
+            f"fn hold[T](x: T) -> fn() -> T {{\n    || x\n}}\n"
+            f"fn main() {{\n    let f = hold({lit})\n"
+            f'    print("{{f()}} {{f()}}")\n}}\n'
+        ),
+        # A closure declared inside a generic function.
+        "closure-in-generic": (
+            f"fn use1[T](x: T) -> T {{\n    let inner = || x\n    inner()\n}}\n"
+            f"fn main() {{\n"
+            f'    print("{{use1({lit})}}")\n}}\n'
+        ),
+        # The capture reached through a generic struct's field.
+        "capture-through-generic": (
+            f"fn main() {{\n    let held = B{{ v: {lit} }}\n"
+            f"    let f = || held.v\n"
+            f'    print("{{f()}}")\n}}\n'
+        ),
+        # A generic function whose closure goes to `map`, so the element type
+        # and the capture type are the same parameter.
+        "generic-map-capture": (
+            f"fn each[T](x: T) -> [T] {{\n    [1, 2].map(|_i| x)\n}}\n"
+            f"fn main() {{\n"
+            f'    print("{{each({lit})}}")\n}}\n'
+        ),
         # The same, with the handler itself a value the block never saw
         # written -- a different path through the backend.
         "handler-as-value": (

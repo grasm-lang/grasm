@@ -810,6 +810,21 @@ fn main() {
     print("{g()} {g()}")
 }'
 
+# An empty `map()` as an element of a list literal. It has nothing to read a
+# type off, so it takes one from the annotation the checker already resolved --
+# which the lowering asks for and the probe did not. The same list built with
+# `push` compiled, and `[[]]` in the same position compiled, so the asymmetry
+# was between the two empty literals rather than the two spellings (F52).
+expect_compiled "an empty map in a list literal" 'fn main() {
+    let xs: [Map[str, i64]] = [map()]
+    print("{xs.len()}")
+}'
+
+expect_compiled "an empty map in a nested list literal" 'fn main() {
+    let xs: [[Map[str, i64]]] = [[map()]]
+    print("{xs.len()}")
+}'
+
 if [ "$ran" != "$declared" ]; then
     echo
     echo "only $ran of $declared cases ran — the rest were never reached,"

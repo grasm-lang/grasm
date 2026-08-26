@@ -10746,6 +10746,28 @@ annotate the binding",
                         let inner = self.probe_type(&args[0])?;
                         return Ok(VType::Option(Box::new(inner)));
                     }
+                    // An empty `map()`, which has nothing to read a type off
+                    // and so takes it from the annotation the checker already
+                    // resolved ([T-EMPTY-LIT]) -- exactly as the empty list
+                    // literal below does. The lowering asks; the probe did
+                    // not, so `let xs: [Map[str, i64]] = [map()]` was refused
+                    // while `[[]]` in the same position compiled and the same
+                    // list built with `push` compiled too (F52).
+                    if id.name == "map"
+                        && args.is_empty()
+                        && !self
+                            .cg
+                            .fns
+                            .contains_key(&format!("{}::map", self.cg.current_module))
+                    {
+                        return Ok(self
+                            .empty_vtype(e.span())
+                            .filter(|t| matches!(t, VType::Map(_, _)))
+                            .unwrap_or(VType::Map(
+                                Box::new(VType::Any),
+                                Box::new(VType::Any),
+                            )));
+                    }
                     // `Ok(v)` and `Err(e)` each name one half. Without these
                     // a closure returning them probed as `_ ! _`, so a caller
                     // that had to know the ok half — `??` does, `match` does

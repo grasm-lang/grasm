@@ -7,6 +7,9 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
 
 ### Fixed
 
+- An empty `map()` may be an element of a list literal. Every other
+  position accepted one; only that one asked the probe, which had no
+  answer for `map` (F52).
 - A closure may be declared inside another closure. Every nesting was
   refused natively — with a capture and without, annotated and not (F51).
 - A handler operation may capture a unit. It crashed the compiler — the

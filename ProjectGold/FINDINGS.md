@@ -67,6 +67,7 @@ and the entries disagree.
 | [F49](#f49) | nine generators measured whatever binary was lying there | S3, harness | **fixed** |
 | [F50](#f50) | a handler operation that captured a unit crashed the compiler | S1, compiler panic | **fixed** |
 | [F51](#f51) | no closure could be declared inside another closure | S3, over-strict | **fixed** |
+| [F52](#f52) | an empty `map()` could not be an element of a list literal | S3, over-strict | **fixed** |
 
 <!-- end index -->
 ## F1 — a wrapped condition must end the line with the operator (S4) — **fixed**
@@ -2256,3 +2257,39 @@ PASS, the same shape as reading a gate's summary instead of its status.
 `nativegaps.sh` caught it; this should not have needed it to. Every
 shape in `fuzz_captures.py` is one the backend compiles, so unlike the
 other generators a decline there is now a failure.
+
+## F52 — an empty `map()` could not be an element of a list literal (S3, over-strict) — **fixed**
+
+```
+let xs: [Map[str, i64]] = [map()]
+```
+
+`native backend does not yet support the result type of `map``. The same
+list built with `push` compiled, `[[]]` in the same position compiled,
+and an empty `map()` compiled everywhere else it can appear — a `let`, a
+map literal's value, a tuple, a struct field, a function argument,
+`Some(...)`. Only the list literal's element refused, because only that
+position asks `probe_type` what the element is.
+
+An empty literal has nothing to read a type off and takes one from the
+annotation the checker already resolved ([T-EMPTY-LIT]). The lowering
+asks for that; `probe_type` had arms for `ref`, `Ok`, `Err` and `Some`
+and none for `map`, so the probe fell through to "the result type of
+`map`". It is the fifth time a rule was implemented where a value is
+*built* and not where it is *probed*, and the third time specifically
+that it was the list that asked and the map that did not.
+
+**Gates**: two cases in `scripts/nativegaps.sh` — the list literal and a
+nested one. `scripts/fuzz_methods.py` gained `empty map` and `empty list`
+groups, which run through the five positions that can carry an
+annotation; its `element` position is a list literal's element, so that
+group *is* this repro. 132 to 142 programs.
+
+The generator reported the regression as `declined: 1` and exited **0**,
+exactly as `fuzz_captures.py` did for F51 a day earlier. §11 says the
+backend compiles everything the interpreter accepts bar polymorphic
+recursion, so a decline in one of these generators is either a new gap —
+which belongs in `nativegaps.sh` and in the tutorial's table — or a
+defect. Counted and not acted on it reads as PASS while programs quietly
+stop running. All six generators that report a decline count now exit 1
+on one.
