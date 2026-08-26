@@ -73,6 +73,7 @@ and the entries disagree.
 | [F55](#f55) | which types compare was written down nowhere | S3, unspecified | **fixed** |
 | [F56](#f56) | a write *inside* a referent was refused | S3, over-strict | **fixed** |
 | [F57](#f57) | a `with` block's discarded value was never released | S2, leak | **fixed** |
+| [F58](#f58) | a whole context did not run, twice, in a crossing of panic paths | S3, harness | **fixed** |
 
 <!-- end index -->
 ## F1 — a wrapped condition must end the line with the operator (S4) — **fixed**
@@ -2576,3 +2577,36 @@ Found by crossing mutating methods and compound assignment with places
 reached through references — 48 shapes, all agreeing and all leak-free,
 which is the answer that mattered for F56. The leak came from the arm
 added to the *generator* while doing it.
+
+## F58 — a whole context did not run, twice, in a crossing of panic paths (S3, harness) — **fixed**
+
+The value-representation axis had gone four crossings without a finding,
+so this changed axis: every way a program fails, from every place it can
+fail. Thirteen faults — out of range, negative, divide by zero, `expect`
+on `None`, a stated `panic` — across eight contexts: the top level, two
+calls deep, a closure, a `map` body, a `spawn`, a handler operation, a
+`with` block, and a fallible function.
+
+104 programs, all agreeing on stdout, exit status and diagnostics with
+the trace stripped ([E-PANIC-TRACE]). No defect in the language.
+
+Two faults in the *probe*, and both are the kind that reports success:
+
+**Far out of range is not a boundary.** The first version indexed `xs[5]`
+into a two-element list. Changing the runtime's `>=` to `>` — a textbook
+off-by-one, and a real miscompile: native reads past the end where the
+interpreter panics — leaves that case agreeing, because 5 is out of range
+either way. `xs[2]` catches it, and catches it in all eight contexts at
+once. Half the faults are at the boundary now, and the far ones are kept
+to show they are not enough alone.
+
+**A context that never ran.** `parallel` and `spawn` perform `async`, so
+`main` must declare it. Written `/ {io}`, the checker refuses every
+program in that context and thirteen of them quietly did not run. The
+generator counted them as "not a panic" — the checker's decision — which
+is exactly the shape of a decline counted and not acted on. It reports
+`not a panic: 0` now, and the concurrency context is the one that would
+have been missed.
+
+**Gate**: `scripts/fuzz_panics.py`, the twelfth generator. Mutation-tested
+against the off-by-one, which it catches with eight disagreements.

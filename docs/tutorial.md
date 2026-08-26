@@ -761,7 +761,7 @@ defect being worked off:
 
 Everything else the interpreter accepts, the compiled backend compiles.
 `scripts/nativegaps.sh` holds that claim to 55 cases, running each under both
-engines and comparing output, exit code and leaks. Six of the eleven generators in
+engines and comparing output, exit code and leaks. Six of the twelve generators in
 `scripts/` report how many of the programs they invented the backend turned
 away, and all six report `declined: 0` — and in all six a decline is a
 *failure* rather than a report. Every shape they generate is one the backend

@@ -67,6 +67,7 @@ python3 scripts/fuzz_methods.py          # every builtin method, every receiver 
 python3 scripts/fuzz_fusions.py          # the compiled shortcuts against the interpreter
 python3 scripts/fuzz_captures.py         # what a closure captures, once per representation
 python3 scripts/fuzz_operators.py        # every operator against every representation
+python3 scripts/fuzz_panics.py           # every way a program fails, from every place it can
 
 Every generator runs the programs it invents a second time under
 `GRASM_LEAK_CHECK=1`, through the one definition in `scripts/lib/leaks.py`. A
