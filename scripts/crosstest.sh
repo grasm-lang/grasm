@@ -117,10 +117,25 @@ echo "target: $TARGET"
 echo "identical: $pass   mismatched: $fail   unsupported: $skip"
 echo "=========================================="
 
+# "Coverage this run did not get" and then exit 0 was the same shape as a
+# generator counting a decline: a clean run against a corpus that mostly did
+# not run. It reported 60 identical and 166 unsupported once, and passed. A
+# clean tree cross-compiles all of them, so zero is the right expectation and
+# anything else is either a real gap -- which belongs in `nativegaps.sh` -- or
+# a broken run.
 if [ "$skip" -gt 0 ]; then
     echo
     echo "UNSUPPORTED (each one is coverage this run did not get):"
     printf '  %s\n' "${SKIPPED[@]}"
+    echo
+    echo "$skip program(s) did not cross-compile. That is coverage lost, not a"
+    echo "clean run: every program in the corpus builds for this target."
+    echo
+    echo "If the count is large and the reasons are blank, check the machine's"
+    echo "load before the compiler: this reported 60 identical and 166"
+    echo "unsupported once, at a load average of 132 on eight cores, and the"
+    echo "same tree was clean when the machine was idle."
+    exit 1
 fi
 
 if [ "$fail" -gt 0 ]; then

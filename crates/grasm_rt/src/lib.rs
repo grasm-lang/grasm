@@ -1325,6 +1325,13 @@ pub extern "C" fn grasm_out_ref(r: i64) {
     });
 }
 
+/// NUL-terminated copies handed to C and not yet freed.
+///
+/// Global rather than per-thread: a copy is made and freed around one call, so
+/// there is no hot path to protect, and a `parallel` body calling an `extern
+/// fn` would otherwise balance on the wrong thread.
+static C_COPIES: AtomicI64 = AtomicI64::new(0);
+
 /// Allocations still live on this thread.
 ///
 /// Zero at the end of `main` means every allocation was released. It is not
@@ -1369,12 +1376,21 @@ pub extern "C" fn grasm_check_leaks() {
     // worker and freed here would otherwise take this count negative and
     // report a leak of minus four.
     let live = LIVE.with(Cell::get) + ESCAPED.load(Relaxed);
-    if live == 0 {
+    let copies = C_COPIES.load(Relaxed);
+    if live == 0 && copies == 0 {
         return;
     }
     let _ = std::io::stdout().flush();
     let mut err = std::io::stderr().lock();
-    let _ = writeln!(err, "leak: {live} allocation(s) still live at exit");
+    if live != 0 {
+        let _ = writeln!(err, "leak: {live} allocation(s) still live at exit");
+    }
+    if copies != 0 {
+        let _ = writeln!(
+            err,
+            "leak: {copies} string copy/copies handed to C and never freed"
+        );
+    }
     let _ = err.flush();
     std::process::exit(7);
 }
@@ -5669,7 +5685,16 @@ unsafe fn grasm_proc_pipeline_now(
 #[no_mangle]
 pub unsafe extern "C" fn grasm_str_c_new(v: *mut RtVal) -> *mut std::ffi::c_char {
     match std::ffi::CString::new(as_str(v).as_bytes()) {
-        Ok(c) => c.into_raw(),
+        Ok(c) => {
+            // Counted, because nothing else counts it. `LIVE` tracks the
+            // runtime's own allocations, and this one is `CString`'s -- so a
+            // copy handed to C and never freed was invisible to
+            // `GRASM_LEAK_CHECK`, which is the one leak an `extern fn` is
+            // most likely to have. Deleting the free outright still reported
+            // a clean run (F57).
+            C_COPIES.fetch_add(1, Relaxed);
+            c.into_raw()
+        }
         Err(_) => rt_panic(
             "a `str` passed to C contains a NUL byte, which is what C uses to mark the end of a string",
         ),
@@ -5680,6 +5705,7 @@ pub unsafe extern "C" fn grasm_str_c_new(v: *mut RtVal) -> *mut std::ffi::c_char
 #[no_mangle]
 pub unsafe extern "C" fn grasm_str_c_free(p: *mut std::ffi::c_char) {
     if !p.is_null() {
+        C_COPIES.fetch_sub(1, Relaxed);
         drop(std::ffi::CString::from_raw(p));
     }
 }

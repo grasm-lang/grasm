@@ -2520,13 +2520,46 @@ adding `discarded` makes it catch the literal path with 22 leaks. Getting
 that shape right took two attempts: written as `Src.get(1)` followed by a
 `print`, the discarded call is not the block's tail and nothing leaks.
 
-Not every arm has been shown to catch a real defect, which is worth
-saying plainly rather than implying otherwise. Removing the reference
-count from a list's scope release is invisible to `fuzz_methods.py`,
-`fuzz_operators.py` and `fuzz_fusions.py` — their strings are interned
-and their lists are consumed — while `fuzz_generics.py` reports 388
-leaks for it. An arm that has never fired is coverage claimed and not
-yet demonstrated.
+**And each arm was then made to fire.** An arm that has never fired is
+coverage claimed, not coverage shown, so every one was given a mutation
+it should catch. Eight of them do, and the mutation is recorded so it can
+be re-run:
+
+| generator | mutation removed | leaks |
+|-----------|------------------|-------|
+| `fuzz_captures` | the `with_handler_value` release (F57) | 14 |
+| `fuzz_handlers` | the literal `with` release (F57) | 22 |
+| `fuzz_places` | the reference descend's release (F56) | 18 |
+| `fuzz_generics` | a `str`'s scope release | 388 |
+| `fuzz_differential` | a `str`'s scope release | 3 |
+| `fuzz_methods` | the release after `grasm_str_from_val` | 82 |
+| `fuzz_operators` | both operands of a boxed `==` | 22 |
+| `fuzz_fallible` | the coalesced fallible's release | 196 |
+| `fuzz_extern` | the `grasm_str_c_free` after a C call | 8 copies |
+
+Each mutation was chosen to fall in a path that generator exercises and
+another does not: only `fuzz_operators` catches the equality one, only
+`fuzz_methods` the interpolation one. Six mutations were tried and
+rejected first for reaching nothing.
+
+`fuzz_extern` could not be demonstrated at first, and the reason was the
+instrument rather than the generator. `GRASM_LEAK_CHECK` counts the
+*runtime's* allocations, and the leak an `extern fn` is most likely to
+have is the NUL-terminated copy handed to C — a `CString`, which is not
+one of them. Deleting `grasm_str_c_free` outright left every gate
+reporting a clean run.
+
+So the check counts those too. `grasm_str_c_new` and `grasm_str_c_free`
+are one site each, so a counter between them is exact, and
+`grasm_check_leaks` reports it on its own line. All three `c_new` call
+sites in the backend do free — that was audited rather than assumed —
+and removing the free now makes `fuzz_extern` exit 1 naming eight copies.
+
+One arm remains undemonstrated: `fuzz_fusions` invents eight
+tightly-constrained programs and none of the six mutations tried reached
+one. Its map keys are interned string literals and its maps are
+scope-bound locals, so there is little for it to lose. That is recorded
+rather than counted as coverage.
 
 Found by crossing mutating methods and compound assignment with places
 reached through references — 48 shapes, all agreeing and all leak-free,

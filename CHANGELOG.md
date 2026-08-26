@@ -7,6 +7,9 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
 
 ### Fixed
 
+- `GRASM_LEAK_CHECK` counts the NUL-terminated copies handed to C. They
+  are `CString` allocations rather than the runtime's, so one leaked was
+  invisible to every gate (F57).
 - A `with` block's discarded value is released. Every `with` whose body
   ended in a boxed value kept one allocation for the life of the process;
   the output was right either way (F57).
