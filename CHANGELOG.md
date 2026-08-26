@@ -7,6 +7,9 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
 
 ### Fixed
 
+- [T-COMPARE] states which types compare. `==` and `!=` on any two values
+  of one type; ordering on `i64`, `f64`, `str` and tuples of ordered
+  components. It was true before and written down nowhere (F55).
 - `fold`, `unwrap_or`, `expect` and `parse_int_base` compile where the
   backend has to name a call's result type — a list literal's element.
   Each worked in every other position (F54).

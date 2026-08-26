@@ -66,6 +66,7 @@ python3 scripts/fuzz_places.py           # every shape of place, read and writte
 python3 scripts/fuzz_methods.py          # every builtin method, every receiver shape
 python3 scripts/fuzz_fusions.py          # the compiled shortcuts against the interpreter
 python3 scripts/fuzz_captures.py         # what a closure captures, once per representation
+python3 scripts/fuzz_operators.py        # every operator against every representation
 ```
 
 The last four enumerate an axis along which the native backend has more than

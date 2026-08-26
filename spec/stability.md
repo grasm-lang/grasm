@@ -97,6 +97,7 @@ Will not change incompatibly before 2.0.
 - `L-WHITESPACE` — stable
 - `T-ARM-TYPES` — stable
 - `T-CAPTURE-WRITE` — stable
+- `T-COMPARE` — stable
 - `T-COPY` — stable
 - `T-ERR-SUBSET` — stable
 - `T-FAIL` — stable

@@ -384,7 +384,6 @@ interpreter printed the answer. Nothing in the program has to declare the
 colliding type: `None` is in the prelude, so the shape is one variable name
 away in any program at all.
 
-
 ## Wildcard bindings
 
 **[G-WILDCARD-BINDING]** `_` in binding position means "do not name this". It is
@@ -399,7 +398,6 @@ wildcard binding exactly as it does to a named one, so `let _ = risky()` is
 still refused and the annotation `let _: T ! E = risky()` is still what holds
 the failure as a value. A binding being unnamed says nothing about whether its
 error was considered.
-
 
 ## 11. Nesting limit
 

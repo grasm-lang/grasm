@@ -398,7 +398,6 @@ interpreter printed the answer. Nothing in the program has to declare the
 colliding type: `None` is in the prelude, so the shape is one variable name
 away in any program at all.
 
-
 ## Wildcard bindings
 
 **[G-WILDCARD-BINDING]** `_` in binding position means "do not name this". It is
@@ -413,7 +412,6 @@ wildcard binding exactly as it does to a named one, so `let _ = risky()` is
 still refused and the annotation `let _: T ! E = risky()` is still what holds
 the failure as a value. A binding being unnamed says nothing about whether its
 error was considered.
-
 
 ## 11. Nesting limit
 
@@ -548,13 +546,15 @@ the same one twice.
 Order does not matter, and neither does position. A `fold`'s seed adopts the
 element type, so `[1.5, 2.5].fold(0, |a, b| a + b)` needs no `0.0`. A list, a
 map's values, an `if`'s branches and a `match`'s arms are checked with their
-integer literals *last*, so whatever fixes the type does it
-first: `[1, 2.5]` and `[2.5, 1]` are both `[f64]`. With no expected type at all
-the branches have only each other, and the literal is the one that adopts:
-`let y = if c { 3 } else { 2.5 }` is a `f64`, which it was not — while the
-two-arm `match` on a `bool` that says the same thing was. Checking left to right made
-the first element decide, which is the asymmetry `[E-NUM-PROMOTE]` records as
-fixed for comparisons, still present one level up.
+integer literals *last*, so whatever fixes the type does it first: `[1, 2.5]`
+and `[2.5, 1]` are both `[f64]`. With no expected type at all the branches have
+only each other, and the literal is the one that adopts: `let y = if c { 3 }
+else { 2.5 }` is a `f64`, which it was not — while the two-arm `match` on a
+`bool` that says the same thing was. Checking left to right made the first
+element decide, which is the asymmetry `[E-NUM-PROMOTE]` records as fixed for
+comparisons, still present one level up.
+
+**[T-COMPARE]** `==` and `!=` compare any two values of one type; `<`, `<=`, `>`, `>=` need `i64`, `f64`, `str`, or a tuple of ordered components.
 
 The promotion crosses the two halves of a fallible value too. In
 `fn f(c: bool) -> f64 ! E { if c { 3 } else { Ok(4.5) } }` one branch gives the
@@ -2613,6 +2613,12 @@ rather than as its elements, and two compare equal when their bounds and their
 inclusiveness match — so `0..3 == 0..3` and `0..3 != 0..=3`. It holds three
 numbers and not its elements, so `0..2_000_000` costs the same as `0..2`.
 
+Its type is written **`range`**: `fn window(n: i64) -> range`, `type W = { span:
+range }`, `[range]`. That name reached the error messages before the syntax, so
+a range could be bound and never declared — a value you can hold and cannot
+pass is stuck in one function body. It reaches its methods from any shape that
+produces one, not only from a name: `[0..3][0].len()` and `window(2).sum()`.
+
 `len` is answered from the bounds without building anything; the others build
 the list first. `for i in a..b` written literally never builds a range at all —
 it is compiled into a counted loop — and that is why the loop costs nothing and
@@ -3750,10 +3756,15 @@ defect being worked off:
 | polymorphic recursion | `fn f[T](x: T) -> i64 { f([x]) }` needs one compiled copy per type and the types never stop growing. No amount of work removes this; it is what monomorphization is, and it is refused by name at build time |
 
 Everything else the interpreter accepts, the compiled backend compiles.
-`scripts/nativegaps.sh` holds that claim to 46 cases, running each under both
-engines and comparing output, exit code and leaks. Five of the nine generators
-in `scripts/` report how many of the programs they invented the backend turned
-away, and all five report `declined: 0`.
+`scripts/nativegaps.sh` holds that claim to 55 cases, running each under both
+engines and comparing output, exit code and leaks. Six of the ten generators in
+`scripts/` report how many of the programs they invented the backend turned
+away, and all six report `declined: 0` — and in all six a decline is a
+*failure* rather than a report. Every shape they generate is one the backend
+compiles, so a refusal is coverage lost rather than an honest no: it is either
+a new gap, which belongs in the table above, or a defect. Twice now a generator
+has counted one and exited 0, and both times the programs stopped running while
+the summary said nothing was wrong.
 
 That is a statement about what has been checked, not a proof. A shape nobody has
 written is a shape nobody has tried. What has changed is the direction the gate

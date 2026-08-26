@@ -1,0 +1,37 @@
+//! tag: T-COMPARE
+//! expect: output
+//! true false
+//! true false
+//! true false
+//! true false
+//! true false true false
+//! true false
+//! true true
+//! true false
+// `==` and `!=` are defined on any two values of one type; ordering needs a
+// type that has one.
+//
+// Which types those are lived in the code and nowhere else, so a change that
+// widened or narrowed the set would have looked exactly like a change that did
+// not. `scripts/fuzz_operators.py` holds every operator against every
+// representation — 176 cells — and this program is the part of it the
+// specification promises.
+type P = { n: i64 }
+type Col = | Red | Green
+
+fn main() {
+    // Equality reaches every representation, boxed or not.
+    print("{1 == 1} {1 == 2}")
+    print("{"a" == "a"} {"a" == "b"}")
+    print("{[1, 2] == [1, 2]} {[1, 2] == [3]}")
+    print("{P{ n: 1 } == P{ n: 1 }} {P{ n: 1 } == P{ n: 2 }}")
+    print("{Red == Red} {Red == Green} {Some(1) == Some(1)} {Some(1) == None}")
+    print("{0..3 == 0..3} {0..3 == 0..=3}")
+
+    // Ordering is lexicographic on a tuple, and needs every component to have
+    // an order of its own — which is why a tuple holding a `bool` has none.
+    let a: (i64, str) = (1, "z")
+    let b: (i64, str) = (2, "a")
+    print("{a < b} {(1, "a") < (1, "b")}")
+    print("{"a" < "b"} {2.5 < 1.5}")
+}

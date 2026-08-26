@@ -1,6 +1,6 @@
 # Grasm — conformance programs: types
 
-The type and effect system — what a program means before it runs. 95 executable program(s), one per normative clause of
+The type and effect system — what a program means before it runs. 96 executable program(s), one per normative clause of
 `grasm-language-pack.md`. Each header states the tag it demonstrates and the
 exact expected behaviour, and every one is run by `cargo test -p grasm_spec`, so
 a program here cannot describe behaviour the implementation does not have.
@@ -118,6 +118,48 @@ fn main() {
     remember(1)
     remember(2)
     print("{seen.len()}")
+}
+```
+
+## `T-COMPARE.gr`
+
+```grasm
+//! tag: T-COMPARE
+//! expect: output
+//! true false
+//! true false
+//! true false
+//! true false
+//! true false true false
+//! true false
+//! true true
+//! true false
+// `==` and `!=` are defined on any two values of one type; ordering needs a
+// type that has one.
+//
+// Which types those are lived in the code and nowhere else, so a change that
+// widened or narrowed the set would have looked exactly like a change that did
+// not. `scripts/fuzz_operators.py` holds every operator against every
+// representation — 176 cells — and this program is the part of it the
+// specification promises.
+type P = { n: i64 }
+type Col = | Red | Green
+
+fn main() {
+    // Equality reaches every representation, boxed or not.
+    print("{1 == 1} {1 == 2}")
+    print("{"a" == "a"} {"a" == "b"}")
+    print("{[1, 2] == [1, 2]} {[1, 2] == [3]}")
+    print("{P{ n: 1 } == P{ n: 1 }} {P{ n: 1 } == P{ n: 2 }}")
+    print("{Red == Red} {Red == Green} {Some(1) == Some(1)} {Some(1) == None}")
+    print("{0..3 == 0..3} {0..3 == 0..=3}")
+
+    // Ordering is lexicographic on a tuple, and needs every component to have
+    // an order of its own — which is why a tuple holding a `bool` has none.
+    let a: (i64, str) = (1, "z")
+    let b: (i64, str) = (2, "a")
+    print("{a < b} {(1, "a") < (1, "b")}")
+    print("{"a" < "b"} {2.5 < 1.5}")
 }
 ```
 
@@ -2540,12 +2582,15 @@ fn main() {
 //! through a list: 100 6 2
 //! through a struct field, shared both ways: 9 9
 //! a struct referent still uses its own field names: 5
+//! a sum referent, written through a copy: Green Green
+//! and an Option the same way: Some(2)
 //! released, and the reference knows: false
 // `r.value` reads and writes what a reference points at.
 //
 // Without it `ref(0)` typechecked and nothing in the language could observe
 // the result — a value that could be constructed and never used.
 type Point = { x: i64 }
+type Col = | Red | Green
 type Held = { cell: ref i64 }
 
 fn bump(r: ref i64) {
@@ -2617,6 +2662,23 @@ fn main() / {io} {
     let p = ref(Point{ x: 5 })
     print("a struct referent still uses its own field names: {p.x}")
 
+    // A sum has no field names either, so it is exactly the case `.value`
+    // describes. Asking whether the referent was a *named* type excluded it
+    // along with the structs, and since rebinding a `var` only moves the
+    // local, nothing could write through a `ref` to a sum at all: readable
+    // through `match`, never writable, on the tier that exists so a reference
+    // is a shared cell rather than a copy.
+    let col = ref(Red)
+    let col_copy = col
+    col_copy.value = Green
+    print("a sum referent, written through a copy: {col.value} {col_copy.value}")
+
+    let opt = ref(Some(1))
+    opt.value = Some(2)
+    print("and an Option the same way: {opt.value}")
+
+    release(col)
+    release(opt)
     release(n)
     release(s)
     release(xs)

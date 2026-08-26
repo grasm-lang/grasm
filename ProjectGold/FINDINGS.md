@@ -70,6 +70,7 @@ and the entries disagree.
 | [F52](#f52) | an empty `map()` could not be an element of a list literal | S3, over-strict | **fixed** |
 | [F53](#f53) | a range had a type with no name and a method table that only knew names | S3, over-strict | **fixed** |
 | [F54](#f54) | four methods had no result type where the backend has to name one | S3, over-strict | **fixed** |
+| [F55](#f55) | which types compare was written down nowhere | S3, unspecified | **fixed** |
 
 <!-- end index -->
 ## F1 — a wrapped condition must end the line with the operator (S4) — **fixed**
@@ -2390,3 +2391,37 @@ list, so the backend never has to name the call's own type — which is the
 entire point of the shape. It reported success against a build with all
 four arms removed. One list per call, each read back out, and the same
 mutation now exits 1 with six declines.
+
+## F55 — which types compare was written down nowhere (S3, unspecified) — **fixed**
+
+Continuing the sweep of the backend's refusing catch-alls. Two more came
+up clean, which is worth recording as much as a defect is: every operator
+against every representation (176 cells) and indexing, variant patterns
+and `??` across every shape they take. No engine disagreed anywhere.
+
+What the operator sweep did surface is that the *answer* existed only in
+the code. `==` and `!=` are defined on any two values of one type;
+ordering is defined on `i64`, `f64`, `str` and on a tuple whose every
+component is itself ordered — so `(i64, str)` orders and `(bool, i64)`
+does not, and a list does not order at all while a tuple does. None of
+that was in the specification. A user cannot find out whether
+`[1, 2] < [3]` is legal without trying it, and a change that widened or
+narrowed the set would have looked exactly like a change that did not:
+the checker decides, so every engine moves together and no cross-engine
+gate can see it.
+
+[T-COMPARE] states the rule, `spec/conformance/T-COMPARE.gr` exercises
+it, and it is filed stable.
+
+**Gate**: `scripts/fuzz_operators.py`, the tenth generator, holds all 176
+cells. It asks two questions rather than one — whether the engines agree
+where the operator is allowed, and whether it is allowed on the same
+types as before. The second is a recorded table, so a cell that changes
+is a decision someone made rather than a change nobody saw. Verified in
+both directions: recording `<` for lists exits 1 naming the drifted cell,
+and breaking `grasm_val_eq` in the compiled runtime exits 1 with two
+disagreements.
+
+The specification is at its 70-page cap, so the clause is one sentence
+and two cosmetic double-blank lines in `spec/grammar.md` paid for it.
+That the budget forced the sentence to be short is the budget working.
