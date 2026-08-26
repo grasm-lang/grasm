@@ -67,6 +67,12 @@ python3 scripts/fuzz_methods.py          # every builtin method, every receiver 
 python3 scripts/fuzz_fusions.py          # the compiled shortcuts against the interpreter
 python3 scripts/fuzz_captures.py         # what a closure captures, once per representation
 python3 scripts/fuzz_operators.py        # every operator against every representation
+
+`fuzz_places.py` and `fuzz_captures.py` run every program they invent a second
+time under `GRASM_LEAK_CHECK=1`. A place is where reference counting is decided
+and an environment lends its captures, so a miscount is the failure those
+programs are most likely to have — and it produces exactly the right output
+while having it, which is why comparing engines cannot see it (F57).
 ```
 
 The last four enumerate an axis along which the native backend has more than

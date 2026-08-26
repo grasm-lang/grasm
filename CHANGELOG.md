@@ -7,6 +7,9 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
 
 ### Fixed
 
+- A `with` block's discarded value is released. Every `with` whose body
+  ended in a boxed value kept one allocation for the life of the process;
+  the output was right either way (F57).
 - A write *inside* a referent compiles: `r.value[0] = v`, and the same
   through a list or a struct field. Reading it always worked, and so did
   replacing the whole referent (F56).

@@ -172,6 +172,25 @@ def run(cmd, timeout=180):
     return p.returncode, p.stdout, p.stderr
 
 
+def leaked(exe):
+    """Whether the binary holds allocations at exit.
+
+    A place is where reference counting is decided -- descending one reads
+    each intermediate with a +1 and has to put it back -- so this is the
+    failure these programs are most likely to have, and the one that produces
+    exactly the right output while having it. `scripts/leakcheck.sh` asks the
+    226 hand-written programs; the 114 invented here were never asked at all.
+    """
+    p = subprocess.run(
+        [exe],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        env={**os.environ, "GRASM_LEAK_CHECK": "1"},
+    )
+    return p.stderr.strip().splitlines()[0] if p.returncode != 0 else None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--keep", action="store_true")
@@ -216,6 +235,11 @@ def main():
                         f"DISAGREES {label}:\n  interpreter: {want.strip()!r}\n"
                         f"  native:      {got.strip()!r} {err3.strip()}\n{src}"
                     )
+                    continue
+                held = leaked(exe)
+                if held:
+                    disagreed.append(label)
+                    print(f"LEAKS {label}: {held}\n{src}")
         for pname, place in LIST_PLACES:
             for oname, op in LIST_OPS:
                 src = build(place, "list", "[]", op)
@@ -240,6 +264,11 @@ def main():
                         f"DISAGREES {label}:\n  interpreter: {want.strip()!r}\n"
                         f"  native:      {got.strip()!r} {err3.strip()}\n{src}"
                     )
+                    continue
+                held = leaked(exe)
+                if held:
+                    disagreed.append(label)
+                    print(f"LEAKS {label}: {held}\n{src}")
         if declined:
             print(f"  native declined (not a defect): {', '.join(sorted(set(declined)))}")
         print(

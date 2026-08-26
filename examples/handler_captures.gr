@@ -85,4 +85,13 @@ fn main() {
     } {
         print(ask())
     }
+
+    // A `with` is a statement, so its block's tail value is discarded — and
+    // discarding a boxed one means releasing it. Both `with` paths threw it
+    // away without doing so, and this program's output is exactly right
+    // either way, which is what a leak looks like. `scripts/leakcheck.sh` is
+    // what sees it.
+    with Src handled_by h {
+        Src.raw()
+    }
 }

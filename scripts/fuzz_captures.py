@@ -224,6 +224,25 @@ def run(cmd, timeout=180):
     return p.returncode, p.stdout, p.stderr
 
 
+def leaked(exe):
+    """Whether the binary holds allocations at exit.
+
+    An environment lends its captures: the body takes a reference on the way
+    in and the scope releases it on the way out, and the two have to match.
+    Getting that wrong by one in either direction is invisible in the output
+    -- too few frees a value the next call still needs, too many keeps it for
+    ever -- so agreement alone cannot see it.
+    """
+    p = subprocess.run(
+        [exe],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        env={**os.environ, "GRASM_LEAK_CHECK": "1"},
+    )
+    return p.stderr.strip().splitlines()[0] if p.returncode != 0 else None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--keep", action="store_true")
@@ -267,6 +286,11 @@ def main():
                         f"DISAGREES {label}: run={(out.strip(), rc)} "
                         f"native={(got.strip(), rc3)}"
                     )
+                    continue
+                held = leaked(exe)
+                if held:
+                    bad.append(label)
+                    print(f"LEAKS {label}: {held}")
         # Every shape here is one the backend compiles, so unlike the other
         # generators a decline is a failure rather than an honest refusal.
         # Removing the F51 fix made this report `declined: 12` and exit 0 --

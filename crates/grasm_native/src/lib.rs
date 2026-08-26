@@ -5324,8 +5324,20 @@ this case",
                     let addr = self.b.ins().func_addr(ptr_ty, fref);
                     self.call_rt("grasm_handler_op", &[op_p, op_l, addr, env]);
                 }
-                let (_, mut terminated) = self.eval_block_inner(body)?;
+                let (tail, mut terminated) = self.eval_block_inner(body)?;
                 terminated |= self.is_filled();
+                // A `with` is a statement, so the block's tail value is
+                // discarded -- and discarding a boxed one means releasing it.
+                // Both `with` paths threw it away with `let (_, ...)`, so
+                // `with … { Src.get() }` on an operation answering anything
+                // boxed kept its allocation for the life of the process. The
+                // output is exactly right either way, which is what a leak
+                // looks like (F57).
+                if !terminated {
+                    if let Some((v, vt)) = tail {
+                        self.dec_if_boxed(v, &vt);
+                    }
+                }
                 if !terminated {
                     self.call_rt("grasm_handler_pop", &[]);
                     for (slot, captures) in &held {
@@ -5364,9 +5376,14 @@ this case",
         }
         let h = self.b.use_var(hvar);
         self.call_rt("grasm_handler_install", &[h]);
-        let (_, mut terminated) = self.eval_block_inner(body)?;
+        let (tail, mut terminated) = self.eval_block_inner(body)?;
         terminated |= self.is_filled();
+        // As on the literal path: the statement discards the block's value, so
+        // a boxed one is released here (F57).
         if !terminated {
+            if let Some((v, vt)) = tail {
+                self.dec_if_boxed(v, &vt);
+            }
             self.call_rt("grasm_handler_pop", &[]);
         }
         Ok(StmtOut::Value(None))

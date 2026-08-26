@@ -72,6 +72,7 @@ and the entries disagree.
 | [F54](#f54) | four methods had no result type where the backend has to name one | S3, over-strict | **fixed** |
 | [F55](#f55) | which types compare was written down nowhere | S3, unspecified | **fixed** |
 | [F56](#f56) | a write *inside* a referent was refused | S3, over-strict | **fixed** |
+| [F57](#f57) | a `with` block's discarded value was never released | S2, leak | **fixed** |
 
 <!-- end index -->
 ## F1 — a wrapped condition must end the line with the operator (S4) — **fixed**
@@ -2467,3 +2468,46 @@ write-back's reference counting lives.
 
 Found by crossing place shapes with mutating methods, the tables the
 `probe_type` sweeps had not touched.
+
+## F57 — a `with` block's discarded value was never released (S2, leak) — **fixed**
+
+```
+with Src handled_by h {
+    Src.get()       // answers a [i64]; nothing takes it
+}
+```
+
+A `with` is a statement, so the block's tail value is discarded — and
+discarding a boxed one means releasing it. Both `with` paths took the
+block's result with `let (_, terminated) = …` and dropped it on the
+floor, so every such block kept one allocation for the life of the
+process.
+
+The output is exactly right either way. That is what a leak is, and it is
+why `scripts/leakcheck.sh` exists: no amount of comparing engines finds
+it, because both engines print the same correct answer.
+
+Bound (`let v = Src.get()`), scalar-valued, or reached through a plain
+function call instead of an operation: all clean. It is specific to a
+`with` block's own tail.
+
+Both paths needed it and each was checked alone: the literal path, where
+the handler is written in place, and `with_handler_value`, where the
+handler arrives as a value — which is also the path a `with` *inside a
+closure* takes, because the lifting pass does not register a site there.
+
+**Gates**: `scripts/fuzz_captures.py` and `scripts/fuzz_places.py` now run
+every program they invent a second time under `GRASM_LEAK_CHECK=1`. That
+is what found this: 318 generated programs had never been asked, while
+`leakcheck.sh` asked the 226 hand-written ones. Removing the
+handler-value fix makes `fuzz_captures.py` exit 1 with 14 leaks; removing
+the descend fix from F56 makes `fuzz_places.py` exit 1 with 18.
+
+The literal path was covered by neither, so `examples/handler_captures.gr`
+gained a top-level `with` whose tail is a discarded boxed result.
+Removing that fix makes `leakcheck.sh` exit 1.
+
+Found by crossing mutating methods and compound assignment with places
+reached through references — 48 shapes, all agreeing and all leak-free,
+which is the answer that mattered for F56. The leak came from the arm
+added to the *generator* while doing it.
