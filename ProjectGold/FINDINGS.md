@@ -66,6 +66,7 @@ and the entries disagree.
 | [F48](#f48) | a reference to a sum could be read but never written | S3, over-strict | **fixed** |
 | [F49](#f49) | nine generators measured whatever binary was lying there | S3, harness | **fixed** |
 | [F50](#f50) | a handler operation that captured a unit crashed the compiler | S1, compiler panic | **fixed** |
+| [F51](#f51) | no closure could be declared inside another closure | S3, over-strict | **fixed** |
 
 <!-- end index -->
 ## F1 — a wrapped condition must end the line with the operator (S4) — **fixed**
@@ -2199,3 +2200,59 @@ backend. It is in the corpus, so `difftest`, `leakcheck`, `agreetest`,
 `wasmtest` and `crosstest` all carry it. `fuzz_handlers.py` gained eight
 result representations and a captured binding per representation;
 removing the fix makes it exit 1 with two mismatches.
+
+## F51 — no closure could be declared inside another closure (S3, over-strict) — **fixed**
+
+```
+fn main() {
+    let held = 1
+    let outer = || {
+        let inner = || held
+        inner()
+    }
+    print("{outer()}")
+}
+```
+
+`native backend does not yet support the result type of `inner``. Every
+nesting, for every representation: with a capture and without one, with
+an annotation on the inner closure and without, and `|| (|| held)()`
+too. `grasm run` accepted all of them.
+
+Typing the outer closure means typing its body, and its body calls the
+inner one. Two things had to be true for that call to be typed and
+neither was:
+
+* `probe_block_tail` records the type of each `let` above the tail, but
+  only for an initialiser `is_probe_safe` allows — and a closure literal
+  was not on that list. It should have been: `probe_type` has an arm for
+  a closure that builds its `Fn` type without lifting anything, and says
+  so in its own comment.
+* The call arm consulted `lookup_fn`, which knows declared functions. A
+  name bound to a *function value* was not looked up at all, so even a
+  recorded type went unread.
+
+Both were needed: restoring either alone leaves the refusal in place,
+which is checked rather than assumed.
+
+§11 named one remaining gap, polymorphic recursion, and
+`scripts/nativegaps.sh` proves the list matches the compiler in both
+directions — over the cases it declares. A shape nobody had written down
+is not covered by that, which is what a crossing is for.
+
+Found by crossing value representations with *nested* captures, one
+level past the crossing that found F50. That one asked how a value
+reaches a closure; this asks how it reaches a closure inside a closure.
+
+**Gates**: three cases in `scripts/nativegaps.sh` — the nesting, the
+same nesting capturing nothing (which refused for the same reason and
+made the refusal look like it was about captures), and a closure
+returning a closure. `scripts/fuzz_captures.py` gained `nested`,
+`returned-twice` and `var-changed-after` shapes: 96 to 132 programs.
+
+That generator also reported this regression as `declined: 12` and
+exited **0** — twelve programs of coverage lost while the runner printed
+PASS, the same shape as reading a gate's summary instead of its status.
+`nativegaps.sh` caught it; this should not have needed it to. Every
+shape in `fuzz_captures.py` is one the backend compiles, so unlike the
+other generators a decline there is now a failure.

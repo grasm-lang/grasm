@@ -774,6 +774,42 @@ fn main() {
     print("{f(1) ?? 0.0}")
 }'
 
+# A closure declared inside another closure. The outer one cannot be typed
+# without typing its body, its body calls the inner one, and a call to a name
+# bound to a *function value* was not something the probe could type -- only
+# declared functions were consulted. So every nesting was refused, capture or
+# no capture, annotated or not (F51).
+expect_compiled "a closure declared inside a closure" 'fn main() {
+    let held = 1
+    let outer = || {
+        let inner = || held
+        inner()
+    }
+    print("{outer()}")
+}'
+
+# The same nesting with nothing captured, which refused for the same reason
+# and made the refusal look like it was about captures.
+expect_compiled "a nested closure that captures nothing" 'fn main() {
+    let outer = || {
+        let inner = || 5
+        inner()
+    }
+    print("{outer()}")
+}'
+
+# A closure returning a closure, twice over.
+expect_compiled "a closure returning a closure" 'fn make() -> fn() -> fn() -> i64 {
+    let held = 3
+    || || held
+}
+
+fn main() {
+    let f = make()
+    let g = f()
+    print("{g()} {g()}")
+}'
+
 if [ "$ran" != "$declared" ]; then
     echo
     echo "only $ran of $declared cases ran — the rest were never reached,"

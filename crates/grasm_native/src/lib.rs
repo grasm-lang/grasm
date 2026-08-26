@@ -3822,6 +3822,13 @@ fn is_probe_safe(e: &Expr) -> bool {
         Expr::Unary { expr, .. } => is_probe_safe(expr),
         Expr::Binary { lhs, rhs, .. } => is_probe_safe(lhs) && is_probe_safe(rhs),
         Expr::StructLit { .. } => true,
+        // A closure literal is a value, and `probe_type` types one without
+        // lifting anything -- the arm exists and says so. Left out, a
+        // `let`-bound closure had no type recorded, so a call to it one line
+        // later could not be typed; and since typing a closure means typing
+        // its body, that refused every closure declared inside another one
+        // (F51).
+        Expr::Closure { .. } => true,
         _ => false,
     }
 }
@@ -10702,6 +10709,24 @@ annotate the binding",
                     }
                     if let Some(sig) = self.lookup_fn(&id.name) {
                         return Ok(sig.ret.clone());
+                    }
+                    // A name bound to a *function value* — which is what a
+                    // `let`-bound closure is. Only declared functions were
+                    // consulted here, so any closure declared inside another
+                    // closure was refused with "does not yet support the
+                    // result type of `inner`": the outer closure cannot be
+                    // typed without typing its body, and its body calls the
+                    // inner one. Capture or no capture, annotated or not
+                    // (F51).
+                    let bound = self.lookup(&id.name).map(|(_, vt)| vt).or_else(|| {
+                        self.probe_types
+                            .iter()
+                            .rev()
+                            .find_map(|e| e.get(&id.name))
+                            .cloned()
+                    });
+                    if let Some(VType::Fn(_, ret)) = bound {
+                        return Ok(*ret);
                     }
                     // A generic call's type is its instantiation's return type,
                     // which means resolving the instantiation here too.

@@ -65,12 +65,19 @@ python3 scripts/fuzz_extern.py
 python3 scripts/fuzz_places.py           # every shape of place, read and written
 python3 scripts/fuzz_methods.py          # every builtin method, every receiver shape
 python3 scripts/fuzz_fusions.py          # the compiled shortcuts against the interpreter
+python3 scripts/fuzz_captures.py         # what a closure captures, once per representation
 ```
 
-The last three enumerate an axis along which the native backend has more than
+The last four enumerate an axis along which the native backend has more than
 one implementation site. Every one of F17, F22, F23, F24 and F26 in
 `ProjectGold/FINDINGS.md` was a rule added at one site and not the others, so
 that axis is where the defects are.
+
+`fuzz_captures.py` is the answer to a subtler version of the same thing. A
+value's *type* is one axis and how it reached the code is another, and the
+crossings that varied only the first found nothing for four rounds because
+they all built their values from literals — and a closure returning a literal
+never reads its environment. F50 was sitting behind that the whole time.
 
 `.github/workflows/ci.yml` runs all of this on macOS, Linux and Windows, plus a
 cross-compilation job. **It has never run**: this repository has no remote, so
