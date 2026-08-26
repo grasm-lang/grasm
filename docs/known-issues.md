@@ -98,7 +98,9 @@ interpolating a unit whose type was inferred rather than annotated (F45), and
 `return` of an `if` whose every branch fails (F46) — the second a Cranelift
 verifier failure, so a defect rather than a gap. Closed on 2026-08-26: a write
 through a `ref` to a sum, which [T-REF-VALUE] always described and the
-implementation excluded along with the structs (F48).
+implementation excluded along with the structs (F48), and a handler operation
+capturing a unit, which panicked inside Cranelift rather than refusing
+anything (F50).
 
 ## S4 — diagnostics
 

@@ -1,0 +1,88 @@
+// A handler operation is a closure, so it can capture — and what it captures
+// travels through an environment rather than a register.
+//
+// The environment stores eight bytes per capture, whatever the value is: a
+// pointer for anything boxed, and the scalar's own bits for anything not. So
+// the representation of a captured value decides how it is written and how it
+// is read back, and a representation missing from either half is a compiler
+// bug rather than a refusal. A captured `()` was missing from both, and
+// defining an `i8` variable with the raw word panicked inside Cranelift with
+// "declared type of variable var0 doesn't match type of value".
+//
+// Every representation the language has is captured here, unit included.
+type Pt = { x: i64, y: i64 }
+type Col = | Red | Green
+
+effect Src {
+    fn unit()
+    fn int() -> i64
+    fn float() -> f64
+    fn flag() -> bool
+    fn text() -> str
+    fn raw() -> bytes
+    fn items() -> [i64]
+    fn pair() -> (i64, str)
+    fn maybe() -> Option[i64]
+    fn point() -> Pt
+    fn colour() -> Col
+}
+
+fn ask() -> str / {Src} {
+    // Every operation performed one call away from the `with`, so the handler
+    // is found by lookup rather than by being in view.
+    Src.unit()
+    "{Src.int()} {Src.float()} {Src.flag()} {Src.text()} {Src.raw()}" +
+        " {Src.items()} {Src.pair()} {Src.maybe()} {Src.point()} {Src.colour()}"
+}
+
+fn main() {
+    let held_unit = ()
+    let held_int = 7
+    let held_float = 2.5
+    let held_flag = true
+    let held_text = "held"
+    let held_raw = bytes_of([1, 255])
+    let held_items = [1, 2]
+    let held_pair = (3, "three")
+    let held_maybe = Some(4)
+    let held_point = Pt{ x: 5, y: 6 }
+    let held_colour = Green
+
+    let h = SrcHandler{
+        unit: || held_unit,
+        int: || held_int,
+        float: || held_float,
+        flag: || held_flag,
+        text: || held_text,
+        raw: || held_raw,
+        items: || held_items,
+        pair: || held_pair,
+        maybe: || held_maybe,
+        point: || held_point,
+        colour: || held_colour,
+    }
+
+    // Installed from a value the block below never saw written.
+    with Src handled_by h {
+        print(ask())
+    }
+
+    // And again from a literal, which is a different path through the backend:
+    // the operations are lifted where they are written either way, but only
+    // one of them has a handler value to carry them.
+    with Src handled_by SrcHandler{
+        unit: || held_unit,
+        int: || held_int + 1,
+        float: || held_float,
+        flag: || not held_flag,
+        text: || held_text + "!",
+        raw: || held_raw,
+        items: || held_items,
+        pair: || held_pair,
+        maybe: || held_maybe,
+        point: || held_point,
+        colour: || held_colour,
+    } {
+        print(ask())
+    }
+}

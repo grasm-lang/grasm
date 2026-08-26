@@ -7,6 +7,9 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
 
 ### Fixed
 
+- A handler operation may capture a unit. It crashed the compiler — the
+  two halves that pack a capture into an environment listed every scalar
+  but that one (F50).
 - `r.value` reads and writes a reference to a sum, `Option` included.
   It was refused because a sum is a named type just as a struct is, which
   left a `ref` to a sum readable through `match` and never writable (F48).

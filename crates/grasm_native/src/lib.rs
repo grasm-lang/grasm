@@ -4438,7 +4438,10 @@ impl FnCx<'_, '_> {
                     .ins()
                     .bitcast(types::I64, cranelift_codegen::ir::MemFlags::new(), v)
             }
-            VType::Bool => self.b.ins().uextend(types::I64, v),
+            // A unit carries nothing, so what travels is the width, not a
+            // value: it is widened and narrowed like a bool so the round trip
+            // gives back something of the type the variable was declared with.
+            VType::Bool | VType::Unit => self.b.ins().uextend(types::I64, v),
             _ => unreachable!("only scalars are stored inline"),
         }
     }
@@ -4448,7 +4451,13 @@ impl FnCx<'_, '_> {
     /// flat slot array rather than a typed structure.
     fn value_to_bits(&mut self, v: Value, vt: &VType) -> Value {
         match vt {
-            VType::I64 | VType::F64 | VType::Bool | VType::Ref(_) => {
+            // Unit is a scalar too: `cl()` gives it `I8`, the same as a bool.
+            // Left out of this pair, a captured unit was stored as its `I8`
+            // and read back as the raw `I64` word, and defining an `I8`
+            // variable with it panicked inside Cranelift's frontend --
+            // "declared type of variable var0 doesn't match type of value"
+            // -- rather than refusing anything (F50).
+            VType::I64 | VType::F64 | VType::Bool | VType::Unit | VType::Ref(_) => {
                 self.scalar_bits_of(v, vt)
             }
             _ => v,
@@ -4457,7 +4466,7 @@ impl FnCx<'_, '_> {
 
     fn bits_to_value(&mut self, bits: Value, vt: &VType) -> Value {
         match vt {
-            VType::I64 | VType::F64 | VType::Bool | VType::Ref(_) => {
+            VType::I64 | VType::F64 | VType::Bool | VType::Unit | VType::Ref(_) => {
                 self.scalar_of_bits(bits, vt)
             }
             _ => bits,
@@ -4472,7 +4481,7 @@ impl FnCx<'_, '_> {
                     .ins()
                     .bitcast(types::F64, cranelift_codegen::ir::MemFlags::new(), bits)
             }
-            VType::Bool => self.b.ins().ireduce(types::I8, bits),
+            VType::Bool | VType::Unit => self.b.ins().ireduce(types::I8, bits),
             _ => unreachable!("only scalars are stored inline"),
         }
     }

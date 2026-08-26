@@ -65,6 +65,7 @@ and the entries disagree.
 | [F47](#f47) | a gate nobody ran, failing on a rule it had a stale copy of | S3, harness | **fixed** |
 | [F48](#f48) | a reference to a sum could be read but never written | S3, over-strict | **fixed** |
 | [F49](#f49) | nine generators measured whatever binary was lying there | S3, harness | **fixed** |
+| [F50](#f50) | a handler operation that captured a unit crashed the compiler | S1, compiler panic | **fixed** |
 
 <!-- end index -->
 ## F1 — a wrapped condition must end the line with the operator (S4) — **fixed**
@@ -2146,3 +2147,55 @@ Two smaller faults fixed alongside:
 **Gate**: mutation-tested in both directions — a build that fails stops
 the generator with exit 1, and a clean build reports 132 programs, no
 disagreements.
+
+## F50 — a handler operation that captured a unit crashed the compiler (S1, compiler panic) — **fixed**
+
+```
+effect Src {
+    fn get()
+}
+fn main() {
+    let held = ()
+    with Src handled_by SrcHandler{ get: || held } {
+        print("{Src.get()}")
+    }
+}
+```
+
+```
+thread '<unnamed>' panicked at cranelift-frontend-0.116.1/src/frontend.rs:519:21:
+declared type of variable var0 doesn't match type of value v2
+```
+
+A handler operation is a closure, and what it captures travels through an
+environment: eight bytes per capture, a pointer for anything boxed and the
+scalar's own bits for anything else. `value_to_bits` and `bits_to_value`
+are the two halves of that, and both listed `I64 | F64 | Bool | Ref` and
+fell through for everything else — correct for a boxed value, which is
+already a word, and wrong for a unit. `VType::Unit.cl()` is `I8`, the
+same as a bool. So a captured unit was stored as an `I8`, read back as
+the raw `I64`, and defining an `I8` variable with it was rejected by
+Cranelift's own frontend.
+
+Not a refusal — a panic. The backend has a named way to say it cannot
+compile something, and this reached none of it.
+
+Unit is in the scalar arm of both halves now, widened and narrowed like
+a bool. The blast radius was handler captures only: a plain closure
+capturing a unit takes a different path and always compiled.
+
+Found by crossing effect-operation result representations with handler
+shapes. The first six shapes all returned a *literal*, and every one of
+the twelve representations agreed — the environment is never read when
+there is nothing to read. Adding a shape whose operation returns a
+**captured** binding found it on the first run. `fuzz_handlers.py` had
+carried a `()` operation since it was written, for the same reason: its
+bodies returned literals too.
+
+**Gates**: `examples/handler_captures.gr` captures every representation
+the language has, unit included, and installs the handler twice — once
+as a value and once as a literal, which are different paths through the
+backend. It is in the corpus, so `difftest`, `leakcheck`, `agreetest`,
+`wasmtest` and `crosstest` all carry it. `fuzz_handlers.py` gained eight
+result representations and a captured binding per representation;
+removing the fix makes it exit 1 with two mismatches.

@@ -52,6 +52,10 @@ type Flag = | On | Off
 type Wrap = | Hold(v: i64) | Empty
 
 type Sub = { n: i64, tag: str }
+
+type Pt = { x: i64, y: i64 }
+
+type Col = | Red | Green
 """
 
 # What the effect operation answers, and how a caller consumes it. The `()`
@@ -80,13 +84,26 @@ RETURNS = [
         "        match Src.get(1) {\n            Ok(v) -> print(\"ok {v}\")\n"
         "            Err(e) -> print(\"err {e.why}\")\n        }",
     ),
+    # The representations the three above do not reach. An operation's result
+    # crosses the same boundaries a value ever crosses -- an env slot, a return
+    # register, a box -- and which of those it takes depends on what it is.
+    # `unit` was here already and still hid F50, because every operation
+    # returned a *literal*: the capture is the half with an address.
+    ("f64", "-> f64", "        let v = Src.get(1)\n        print(\"{v}\")"),
+    ("bool", "-> bool", "        let v = Src.get(1)\n        print(\"{v}\")"),
+    ("bytes", "-> bytes", "        let v = Src.get(1)\n        print(\"{v}\")"),
+    ("list", "-> [i64]", "        let v = Src.get(1)\n        print(\"{v}\")"),
+    ("tuple", "-> (i64, str)", "        let v = Src.get(1)\n        print(\"{v}\")"),
+    ("option", "-> Option[i64]", "        let v = Src.get(1)\n        print(\"{v}\")"),
+    ("struct", "-> Pt", "        let v = Src.get(1)\n        print(\"{v}\")"),
+    ("sum", "-> Col", "        let v = Src.get(1)\n        print(\"{v}\")"),
 ]
 
 # The operation's body, by what its declared result allows.
 BODIES = {
     "i64": ["n * 2", "n + cap", "if n > 0 { n } else { 0 - n }"],
     "str": ["\"got {n}\"", "\"{n}-{cap}\""],
-    "unit": ["()", "{ let ignored = n }"],
+    "unit": ["()", "{ let ignored = n }", "held_unit"],
     "fallible-i64": [
         "Ok(n * 2)",
         "if n > 0 { n * 2 } else { fail(Bad{ why: \"low\" }) }",
@@ -103,6 +120,18 @@ BODIES = {
         "Ok(n * 2)",
         "if n > 1 { n * 3 } else { fail(Bad{ why: \"low\" }) }",
     ],
+    # Each of these has one body that reads `n` or `cap` and one that returns
+    # a captured binding -- `held`, declared beside `cap`. Returning a literal
+    # never reads the environment, which is why an operation returning `()`
+    # had been in this table all along and F50 was still there.
+    "f64": ["n.as_f64() * 1.5", "held_f64"],
+    "bool": ["n > 0", "held_bool"],
+    "bytes": ["bytes_of([n, 2])", "held_bytes"],
+    "list": ["[n, cap]", "held_list"],
+    "tuple": ["(n, \"got {n}\")", "held_tuple"],
+    "option": ["Some(n * 2)", "held_option"],
+    "struct": ["Pt{ x: n, y: cap }", "held_struct"],
+    "sum": ["if n > 0 { Red } else { Green }", "held_sum"],
 }
 
 # Where the handler literal is written, relative to the `with` that installs
@@ -151,6 +180,23 @@ PATTERNS = [
 ]
 
 
+# One binding per representation, in scope for every body that names one. A
+# captured *unit* is the shape that panicked inside Cranelift's frontend, and
+# it is here for the same reason the others are: an operation returning a
+# literal never reads its environment (F50).
+HELD = (
+    "    let held_unit = ()\n"
+    "    let held_f64 = 2.5\n"
+    "    let held_bool = true\n"
+    "    let held_bytes = bytes_of([7])\n"
+    "    let held_list = [7, 8]\n"
+    "    let held_tuple = (7, \"held\")\n"
+    "    let held_option = Some(7)\n"
+    "    let held_struct = Pt{ x: 7, y: 8 }\n"
+    "    let held_sum = Green\n"
+)
+
+
 def build(rng):
     ret_name, ret_sig, consume = rng.choice(RETURNS)
     body = rng.choice(BODIES[ret_name])
@@ -161,6 +207,7 @@ def build(rng):
     src += "\neffect Src {\n    fn get(n: i64) " + ret_sig + "\n}\n"
     src += "\nfn main() {\n"
     src += "    var cap = 1\n"
+    src += HELD
     src += place.format(body=body) + "\n"
     src += consume + "\n"
     src += "    }\n"
