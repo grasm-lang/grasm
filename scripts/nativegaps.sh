@@ -825,6 +825,34 @@ expect_compiled "an empty map in a nested list literal" 'fn main() {
     print("{xs.len()}")
 }'
 
+# A range reaching a method from a shape that is not a name. The test for
+# "does this hold a range" recognised a bare `Ident` and nothing else, which
+# was every shape a range took when it was written (F53).
+expect_compiled "a range that is a list element" 'fn main() {
+    let xs = [0..3]
+    print("{xs[0].len()} {xs[0].sum()}")
+}'
+
+expect_compiled "a range returned by a closure" 'fn main() {
+    let f = || 2..6
+    print("{f().len()} {f().map(|v| v * 2)}")
+}'
+
+expect_compiled "a range declared by name" 'type W = { span: range }
+
+fn window(n: i64) -> range {
+    0..n
+}
+
+fn total(r: range) -> i64 {
+    r.sum()
+}
+
+fn main() {
+    let w = W{ span: window(4) }
+    print("{w.span} {total(w.span)}")
+}'
+
 if [ "$ran" != "$declared" ]; then
     echo
     echo "only $ran of $declared cases ran — the rest were never reached,"

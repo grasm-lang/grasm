@@ -7,6 +7,9 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
 
 ### Fixed
 
+- A range's type is written `range`, so one can be a parameter, a result
+  or a field; and a range reaches its methods from any shape that produces
+  one, not only from a name (F53).
 - An empty `map()` may be an element of a list literal. Every other
   position accepted one; only that one asked the probe, which had no
   answer for `map` (F52).

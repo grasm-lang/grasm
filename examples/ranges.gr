@@ -1,0 +1,56 @@
+// A range is a value, and `range` is its type.
+//
+// `let r = 0..n` binds one; it holds three numbers rather than its elements,
+// so `0..2_000_000` costs the same as `0..2` ([L-LIB-RANGE-OPS]). What was
+// missing was the *name*: `Type::Range` had displayed as `range` in error
+// messages since ranges became values, and nothing parsed it. So a range could
+// be bound and never declared — not a parameter, not a result, not a field —
+// and a value you can hold and cannot pass is stuck inside one function body.
+type Window = { span: range, label: str }
+
+fn window(start: i64, count: i64) -> range {
+    start..start + count
+}
+
+fn total(r: range) -> i64 {
+    r.sum()
+}
+
+// A range reaches a method by more shapes than a name. Each of these was
+// refused while `let r = 0..3` first compiled, because the test for "does this
+// hold a range" only recognised a bare name.
+fn main() {
+    let r = window(1, 3)
+    print("{r} {r.len()} {total(r)}")
+
+    let w = Window{ span: 0..3, label: "first" }
+    print("{w.label} {w.span} {w.span.to_list()}")
+
+    // An element of a list.
+    let rs: [range] = [0..2, 5..9]
+    print("{rs[1].len()} {rs[0].map(|v| v * 10)}")
+
+    // A closure's result.
+    let f = || 2..6
+    print("{f().len()} {f().sum()}")
+
+    // A function's result, straight into a method.
+    print("{window(10, 4).filter(|v| v > 11)}")
+
+    // And walked, from a shape that is not a name.
+    var seen = 0
+    for i in rs[0] {
+        seen = seen + i
+    }
+    print("{seen}")
+
+    // A range's list surface answers a *list*, so a chain leaves the range
+    // behind after the first call. Typing `filter` as the receiver's own type
+    // made the backend believe this still held one, and it aborted inside
+    // `range_to_list` on the list it was handed.
+    print("{(0..6).map(|v| v * 3).filter(|v| v > 4)}")
+    print("{rs[0].map(|v| v + 1).sum()} {window(1, 4).to_list()}")
+
+    // Two ranges compare by their bounds and their inclusiveness.
+    print("{0..3 == 0..3} {0..3 == 0..=3}")
+}

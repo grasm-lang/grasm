@@ -13,6 +13,9 @@
 //! 3
 //! [0, 1, 2]
 //! 0 1 2 
+//! w 0..4 6
+//! 4 [0, 10]
+//! 4 [2, 3]
 // A range answers the list combinators, producing a list of the same elements
 // `for i in a..b` walks.
 //
@@ -29,6 +32,16 @@
 // — `0..2000000` is two words and a flag, and printing two million integers
 // would be a different value — and two compare by their bounds, so `0..0` is
 // not equal to `5..5` even though both are empty.
+type Window = { span: range, label: str }
+
+fn window(n: i64) -> range {
+    0..n
+}
+
+fn total(r: range) -> i64 {
+    r.sum()
+}
+
 fn main() {
     print("{(0..5).map(|i| i % 3)}")
     print("{(1..=4).sum()}")
@@ -51,4 +64,17 @@ fn main() {
         line = line + "{i} "
     }
     print(line)
+
+    // Declared by name. `range` displayed in the language's error messages
+    // before it was in its syntax, so a range could be bound and never
+    // declared -- not a parameter, not a result, not a field.
+    let w = Window{ span: window(4), label: "w" }
+    print("{w.label} {w.span} {total(w.span)}")
+
+    // And reached from shapes that are not a name: the test for "does this
+    // hold a range" recognised a bare identifier and nothing else.
+    let rs: [range] = [0..2, 5..9]
+    print("{rs[1].len()} {rs[0].map(|v| v * 10)}")
+    let f = || 2..6
+    print("{f().len()} {window(4).filter(|v| v > 1)}")
 }

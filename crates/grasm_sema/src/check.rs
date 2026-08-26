@@ -1561,6 +1561,15 @@ different name, or call it as a method if you meant to extend a type (UFCS)",
                     "bool" => Some(Type::Bool),
                     "str" => Some(Type::Str),
                     "bytes" => Some(Type::Bytes),
+                    // `Type::Range` has displayed as `range` since ranges
+                    // became values, so the name was already in the language's
+                    // error messages -- and nowhere else. Nothing parsed it, so
+                    // a range could be bound and never declared: not a
+                    // parameter, not a result, not a field. A value you can
+                    // hold and cannot pass is stuck inside one function body,
+                    // and the native backend had accepted the spelling all
+                    // along (F53).
+                    "range" => Some(Type::Range),
                     _ => None,
                 };
                 if let Some(p) = prim {

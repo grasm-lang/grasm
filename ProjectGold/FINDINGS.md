@@ -68,6 +68,7 @@ and the entries disagree.
 | [F50](#f50) | a handler operation that captured a unit crashed the compiler | S1, compiler panic | **fixed** |
 | [F51](#f51) | no closure could be declared inside another closure | S3, over-strict | **fixed** |
 | [F52](#f52) | an empty `map()` could not be an element of a list literal | S3, over-strict | **fixed** |
+| [F53](#f53) | a range had a type with no name and a method table that only knew names | S3, over-strict | **fixed** |
 
 <!-- end index -->
 ## F1 — a wrapped condition must end the line with the operator (S4) — **fixed**
@@ -2293,3 +2294,61 @@ which belongs in `nativegaps.sh` and in the tutorial's table — or a
 defect. Counted and not acted on it reads as PASS while programs quietly
 stop running. All six generators that report a decline count now exit 1
 on one.
+
+## F53 — a range had a type with no name and a method table that only knew names (S3, over-strict) — **fixed**
+
+Found by sweeping `probe_type`'s arms against the `Expr` variants rather
+than waiting for another crossing to trip over the difference. Twenty-two
+of the twenty-three variants had an arm. `Expr::Range` did not, and
+pulling that thread found three faults in a row.
+
+**The probe had no arm.** `let xs = [0..3]` was refused with "working out
+the type of a range", while `let r = 0..3` first compiled. A range is one
+type however it is written and the lowering builds one —
+`eval_range_value` and `VType::Range` have been there since ranges became
+values. Sixth instance of a rule implemented where a value is *built* and
+not where it is *probed*.
+
+**The method table only knew names.** With the probe fixed the refusal
+moved one line down, to "a call of `len` that this backend cannot resolve
+the way the checker did". `holds_a_range` is asked *before* the receiver
+is evaluated, so it cannot evaluate — and it read a bare `Ident` and
+nothing else, with a comment saying "a name is the shape a held range
+actually takes". True when written. It stopped being true once a range
+could be an element, a field, or a call's result. The probe reads types
+and evaluates nothing, which is the property the test needs, so the four
+shapes that can produce a range ask it.
+
+**The type had no spelling.** `Type::Range` displayed as `range` in the
+checker's own error messages and nothing parsed it, so `fn window() ->
+range`, `type W = { span: range }` and `[range]` were all "unknown type
+`range`" — while the native backend had accepted that exact spelling all
+along. Two engines disagreed about what the language is. A range could be
+bound and never declared: not a parameter, not a result, not a field. A
+value you can hold and cannot pass is stuck inside one function body,
+which is the same shape of hole [T-REF-VALUE] was written to close.
+
+[L-LIB-RANGE-OPS] now states the name and the shapes.
+
+**A fourth, which the fix itself caused.** With the probe answering
+`Range`, `(0..6).map(f).filter(g)` typed `filter` as its receiver's own
+type — the general rule for `filter` — so the backend believed the value
+still held a range and `grasm_range_to_list` aborted on the list it was
+handed. A range's list surface answers a *list*: the chain leaves the
+range behind after the first call. `map`, `filter`, `sum` and `to_list`
+say so now, and `to_list` had had no arm at all. `scripts/fuzz_fusions.py`
+caught it within the same run that the fix went in — SIGABRT, six lines
+of output and then nothing — which is what that generator is for.
+
+Removing the catch-all was part of the fix. Every `Expr` variant now has
+an arm, so the compiler refuses a new variant that nobody probed; with
+the catch-all there it was a build-time refusal in whichever position
+happened to ask, which is how the range arm came to be missing at all.
+
+**Gates**: three cases in `scripts/nativegaps.sh` (55 now) — a range as a
+list element, as a closure's result, and declared by name.
+`examples/ranges.gr` is in the corpus, so `difftest`, `leakcheck`,
+`agreetest`, `wasmtest` and `crosstest` carry it, and
+`spec/conformance/L-LIB-RANGE-OPS.gr` gained the declared forms. Each of
+the three fixes was removed on its own and `nativegaps.sh` exits 1 for
+each.

@@ -48,33 +48,6 @@ pub struct Unsupported {
 
 type CResult<T> = Result<T, Unsupported>;
 
-/// What an expression is, in the words the tutorial uses for it. A refusal
-/// that says "inferring this type" tells the reader nothing they can act on;
-/// naming the shape at least says which line to rewrite.
-fn expr_kind(e: &Expr) -> &'static str {
-    match e {
-        Expr::Ident(_) => "a name",
-        Expr::Int(..) | Expr::Float(..) | Expr::Str(..) | Expr::Bool(..) => "a literal",
-        Expr::Call { .. } => "a call",
-        Expr::MethodCall { .. } => "a method call",
-        Expr::Field { .. } => "a field read",
-        Expr::Index { .. } => "an index",
-        Expr::Binary { .. } => "an operator expression",
-        Expr::Unary { .. } => "a unary expression",
-        Expr::Closure { .. } => "a closure",
-        Expr::StructLit { .. } => "a struct literal",
-        Expr::List(..) => "a list literal",
-        Expr::Map(..) => "a map literal",
-        Expr::Tuple(..) => "a tuple",
-        Expr::If { .. } => "an `if`",
-        Expr::Match { .. } => "a `match`",
-        Expr::Block(..) => "a block",
-        Expr::Try { .. } => "a `try`",
-        Expr::Range { .. } => "a range",
-        _ => "this expression",
-    }
-}
-
 fn nope<T>(span: Span, what: impl Into<String>) -> CResult<T> {
     Err(Unsupported {
         span,
@@ -4259,9 +4232,21 @@ impl FnCx<'_, '_> {
     /// evaluated, so it cannot evaluate anything itself, and a name is the
     /// shape a held range actually takes. Everything else falls through to the
     /// paths that were already there.
-    fn holds_a_range(&self, e: &Expr) -> bool {
+    fn holds_a_range(&mut self, e: &Expr) -> bool {
         match e {
             Expr::Ident(id) => matches!(self.lookup(&id.name), Some((_, VType::Range))),
+            // A name was the only shape a held range took when this was
+            // written, and it stopped being so once a range could be an
+            // element or a call's result: `[0..3][0].len()` and
+            // `(|| 0..3)().len()` were refused with "a call of `len` that
+            // this backend cannot resolve the way the checker did" (F53).
+            // These four ask the probe, which reads types and evaluates
+            // nothing -- the property this test needs, since it is asked
+            // before the receiver is evaluated.
+            Expr::Index { .. }
+            | Expr::Field { .. }
+            | Expr::Call { .. }
+            | Expr::MethodCall { .. } => matches!(self.probe_type(e), Ok(VType::Range)),
             _ => false,
         }
     }
@@ -11069,9 +11054,17 @@ annotate the binding",
                 "parse_int" => VType::Option(Box::new(VType::I64)),
                 "parse_float" => VType::Option(Box::new(VType::F64)),
                 "index_of" => VType::Option(Box::new(VType::I64)),
+                "to_list" => match self.probe_type(recv)? {
+                    VType::Bytes | VType::Range => VType::List(Box::new(VType::I64)),
+                    VType::List(t) => VType::List(t),
+                    _ => return nope(e.span(), format!("`.{}()` on a receiver whose type is not known here", name.name)),
+                },
                 // Element-wise: the result follows the receiver's elements.
                 "sum" => match self.probe_type(recv)? {
                     VType::List(elem) => *elem,
+                    // [L-LIB-RANGE-OPS]: a range answers the list surface by
+                    // building the list of its elements, which are `i64`.
+                    VType::Range => VType::I64,
                     _ => return nope(e.span(), format!("`.{}()` on a receiver whose type is not known here", name.name)),
                 },
                 // `min`/`max` are two methods sharing a name: the reduction
@@ -11088,7 +11081,17 @@ annotate the binding",
                         _ => return nope(e.span(), format!("`.{}()` on a receiver whose type is not known here", name.name)),
                     }
                 }
-                "rev" | "slice" | "filter" | "par_filter" => self.probe_type(recv)?,
+                "rev" | "slice" | "filter" | "par_filter" => {
+                    match self.probe_type(recv)? {
+                        // A range's `filter` answers a *list*, not a range.
+                        // Answering the receiver's own type made the backend
+                        // believe `(0..0).map(f).filter(g)` still held a
+                        // range, and `grasm_range_to_list` aborted on the
+                        // list it was handed.
+                        VType::Range => VType::List(Box::new(VType::I64)),
+                        other => other,
+                    }
+                }
                 // Mutating methods answer with nothing. `sort` used to probe
                 // as the list's own type, which is only harmless while the
                 // value is discarded.
@@ -11130,6 +11133,7 @@ annotate the binding",
                             // refused for a type one step away.
                             let elem = match self.probe_type(recv)? {
                                 VType::List(t) => Some(*t),
+                                VType::Range => Some(VType::I64),
                                 _ => None,
                             };
                             match (params.first(), elem) {
@@ -11191,9 +11195,19 @@ annotate the binding",
                     }
                 }
             },
-            other => {
-                return nope(e.span(), format!("working out the type of {}", expr_kind(other)))
-            }
+            // A range is one type however it is written, and the lowering
+            // builds one -- `eval_range_value` and `VType::Range` have been
+            // here since ranges became values. The probe had no arm, so a
+            // range refused in exactly the positions that ask the probe
+            // rather than the lowering: an element of a list literal, a
+            // closure's body, a component of a tuple in a list. The same
+            // range bound to a `let` first compiled (F53).
+            // Every `Expr` variant now has an arm, and the catch-all that
+            // refused the rest is gone -- with it there, adding a variant and
+            // forgetting to probe it produced a refusal at build time in the
+            // positions that ask the probe; without it the compiler says so.
+            // That catch-all is how the range arm came to be missing.
+            Expr::Range { .. } => VType::Range,
         })
     }
 

@@ -430,6 +430,12 @@ rather than as its elements, and two compare equal when their bounds and their
 inclusiveness match — so `0..3 == 0..3` and `0..3 != 0..=3`. It holds three
 numbers and not its elements, so `0..2_000_000` costs the same as `0..2`.
 
+Its type is written **`range`**: `fn window(n: i64) -> range`, `type W = { span:
+range }`, `[range]`. That name reached the error messages before the syntax, so
+a range could be bound and never declared — a value you can hold and cannot
+pass is stuck in one function body. It reaches its methods from any shape that
+produces one, not only from a name: `[0..3][0].len()` and `window(2).sum()`.
+
 `len` is answered from the bounds without building anything; the others build
 the list first. `for i in a..b` written literally never builds a range at all —
 it is compiled into a counted loop — and that is why the loop costs nothing and
