@@ -7,6 +7,9 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
 
 ### Fixed
 
+- A handler's captures are released when a `fail`, `return`, `break` or
+  `continue` leaves its `with` block. Each kept one allocation per boxed
+  capture (F62).
 - `break` and `continue` pop the handlers of the `with` blocks they leave.
   The third exit from a block, and the same fault as F59 (F61).
 - A handler is popped when a `fail` or `return` leaves its `with` block.

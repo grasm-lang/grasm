@@ -50,8 +50,40 @@ fn nested_fails(h: SrcHandler) -> i64 ! Bad / {Src} {
     0
 }
 
+// A handler literal's captures are copied into a stack slot and retained
+// there, and released where the block ends -- under the same guard the pop
+// was, so every early exit kept them. One allocation per boxed capture, with
+// the right answer printed, which is what a leak is.
+fn holds(kept: [i64], how: i64) -> i64 ! Bad / {Src} {
+    with Src handled_by SrcHandler{ get: || kept.len() } {
+        if how == 0 {
+            fail(Bad)
+        }
+        if how == 1 {
+            return 1
+        }
+        let v = Src.get()
+        v
+    }
+    2
+}
+
 fn main() {
     let inner = SrcHandler{ get: || 7 }
+
+    // Each way out, with something boxed to lose.
+    print("held: {holds([1, 2], 0) ?? 0 - 1} {holds([1, 2], 1) ?? 0 - 1} {holds([1, 2], 2) ?? 0 - 1}")
+    let kept = [3, 4]
+    for _i in 0..3 {
+        with Src handled_by SrcHandler{ get: || kept.len() } {
+            break
+        }
+    }
+    for _i in 0..3 {
+        with Src handled_by SrcHandler{ get: || kept.len() } {
+            continue
+        }
+    }
 
     // Each of these leaves a `with` some other way, and afterwards the outer
     // handler — not the inner one — has to be the one an operation finds.

@@ -113,7 +113,8 @@ at two sites one level apart while reading the same place always compiled
 `return` leaves its `with` block, which answered from the wrong handler and
 then from a dead frame (F59), and the `return` itself, whose following
 statement was emitted past the terminator (F60), and the same for `break`
-and `continue`, which leave the block without leaving the function (F61).
+and `continue`, which leave the block without leaving the function (F61); and the handler's
+captures, which every one of those four exits kept (F62).
 
 ## S4 — diagnostics
 

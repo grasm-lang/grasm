@@ -48,6 +48,11 @@ pub struct Unsupported {
 
 type CResult<T> = Result<T, Unsupported>;
 
+/// What one installed handler literal still owns: the stack slot its captures
+/// were copied into, and their names and types. A handler that arrived as a
+/// value owns nothing here -- its reference lives in a scope.
+type HandlerHeld = Vec<(cranelift_codegen::ir::StackSlot, Vec<(String, VType)>)>;
+
 fn nope<T>(span: Span, what: impl Into<String>) -> CResult<T> {
     Err(Unsupported {
         span,
@@ -1699,6 +1704,7 @@ impl<'m> Codegen<'m> {
             filled: false,
             dead: false,
             handlers_installed: 0,
+            handler_held: Vec::new(),
             closure_hints: Vec::new(),
             pinned: Vec::new(),
             tail_hint: None,
@@ -2293,6 +2299,7 @@ operation's",
             filled: false,
             dead: false,
             handlers_installed: 0,
+            handler_held: Vec::new(),
             closure_hints: Vec::new(),
             pinned: Vec::new(),
             tail_hint: None,
@@ -2388,6 +2395,7 @@ operation's",
             filled: false,
             dead: false,
             handlers_installed: 0,
+            handler_held: Vec::new(),
             closure_hints: Vec::new(),
             pinned: Vec::new(),
             tail_hint: None,
@@ -2522,6 +2530,7 @@ operation's",
             filled: false,
             dead: false,
             handlers_installed: 0,
+            handler_held: Vec::new(),
             closure_hints: Vec::new(),
             pinned: Vec::new(),
             tail_hint: None,
@@ -2814,6 +2823,16 @@ struct FnCx<'a, 'm> {
     /// found it: `42` in the interpreter, `7` in a compiled build, and a
     /// dangling stack address after a few rounds of it (F59).
     handlers_installed: usize,
+    /// Per installed handler: the stack slot holding its captures, and their
+    /// types. Empty for a handler that arrived as a value -- that one's
+    /// reference lives in a scope, which the ordinary scope releases cover.
+    ///
+    /// A literal's captures are copied into a slot and retained there, and
+    /// released where the block ends. Guarded by the same `!terminated` the
+    /// pop was, so every early exit kept them: `fail`, `return` and `break`
+    /// each leaked one allocation per boxed capture, with the right output
+    /// (F62).
+    handler_held: Vec<HandlerHeld>,
     /// True when the block being compiled into is one nothing can reach:
     /// `fail`, `panic` and `exit` leave, then open a fresh block so the
     /// statements after them still have somewhere to go. That switch clears
@@ -4193,9 +4212,26 @@ impl FnCx<'_, '_> {
     /// A `break` or a `continue` leaves the `with` blocks between itself and
     /// the loop without leaving the function, so the pop each of those blocks
     /// would have done at its own end never runs (F61).
+    /// Emits the pops without changing the count: this is one path out of the
+    /// block, and the others still have these handlers installed.
     fn pop_handlers_above(&mut self, installed: usize) {
-        for _ in installed..self.handlers_installed {
+        let held: Vec<_> = self.handler_held[installed..].to_vec();
+        for one in held.iter().rev() {
+            self.release_handler_captures(one);
             self.call_rt("grasm_handler_pop", &[]);
+        }
+    }
+
+    /// The captures a handler literal retained when it was installed.
+    fn release_handler_captures(&mut self, held: &HandlerHeld) {
+        for (slot, captures) in held {
+            for (i, (_, cvt)) in captures.iter().enumerate() {
+                if !cvt.boxed() {
+                    continue;
+                }
+                let bits = self.b.ins().stack_load(types::I64, *slot, (i * 8) as i32);
+                self.call_rt("grasm_val_dec", &[bits]);
+            }
         }
     }
 
@@ -4204,9 +4240,7 @@ impl FnCx<'_, '_> {
         // Every handler this function installed and has not popped. Leaving
         // by `return` or `fail` skips the `with` block's own pop, so this is
         // the only place they come off (F59).
-        for _ in 0..self.handlers_installed {
-            self.call_rt("grasm_handler_pop", &[]);
-        }
+        self.pop_handlers_above(0);
         // Captures held for a handler passed to a call. They are released with
         // the frame rather than after the call, because the block they live in
         // is a pointer into this frame and stays reachable for as long as the
@@ -5381,6 +5415,7 @@ this case",
                     let addr = self.b.ins().func_addr(ptr_ty, fref);
                     self.call_rt("grasm_handler_op", &[op_p, op_l, addr, env]);
                 }
+                self.handler_held.push(held.clone());
                 let (tail, mut terminated) = self.eval_block_inner(body)?;
                 terminated |= self.is_filled();
                 // A `with` is a statement, so the block's tail value is
@@ -5396,18 +5431,10 @@ this case",
                     }
                 }
                 self.handlers_installed -= 1;
+                self.handler_held.pop();
                 if !terminated {
                     self.call_rt("grasm_handler_pop", &[]);
-                    for (slot, captures) in &held {
-                        for (i, (_, cvt)) in captures.iter().enumerate() {
-                            if !cvt.boxed() {
-                                continue;
-                            }
-                            let bits =
-                                self.b.ins().stack_load(types::I64, *slot, (i * 8) as i32);
-                            self.call_rt("grasm_val_dec", &[bits]);
-                        }
-                    }
+                    self.release_handler_captures(&held);
                 }
                 // A body that left -- by `return`, `fail`, `break` -- closed
                 // this block, and saying so is what stops the next statement
@@ -5446,8 +5473,10 @@ this case",
         let h = self.b.use_var(hvar);
         self.call_rt("grasm_handler_install", &[h]);
         self.handlers_installed += 1;
+        self.handler_held.push(Vec::new());
         let (tail, mut terminated) = self.eval_block_inner(body)?;
         self.handlers_installed -= 1;
+        self.handler_held.pop();
         terminated |= self.is_filled();
         // As on the literal path: the statement discards the block's value, so
         // a boxed one is released here (F57).

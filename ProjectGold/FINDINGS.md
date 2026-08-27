@@ -77,6 +77,7 @@ and the entries disagree.
 | [F59](#f59) | a handler outlived the block it was installed for | S1, wrong answer and use-after-free | **fixed** |
 | [F60](#f60) | a `with` never said its body had left | S1, codegen bug | **fixed** |
 | [F61](#f61) | `break` and `continue` left the handler installed too | S1, wrong answer | **fixed** |
+| [F62](#f62) | a handler's captures were kept by every early exit | S2, leak | **fixed** |
 
 <!-- end index -->
 ## F1 — a wrapped condition must end the line with the operator (S4) — **fixed**
@@ -2721,3 +2722,39 @@ for them was the whole of this tick's crossing. Unwinding through a
 `break`, a `continue`, and a `break` from two `with` blocks deep in a
 `while` — and asks afterwards which handler answers. Removing the pop
 makes `difftest` exit 1 naming that program.
+
+## F62 — a handler's captures were kept by every early exit (S2, leak) — **fixed**
+
+```
+fn leaves(held: [i64]) -> i64 ! Bad / {Src} {
+    with Src handled_by SrcHandler{ get: || held.len() } {
+        fail(Bad)
+    }
+    0
+}
+```
+
+One allocation per boxed capture, for `fail`, `return`, `break` and
+`continue` alike. Falling out of the block normally was clean.
+
+The fourth fault in this one construct, and the same sentence as F59 and
+F61: a handler literal's captures are copied into a stack slot and
+retained there, released where the block ends — under the same
+`if !terminated` the pop was.
+
+The three fixes are now one mechanism rather than three. A function keeps
+a stack of what each installed handler still owns; `pop_handlers_above`
+releases those captures and pops the handler, and every exit goes through
+it — `emit_scope_decs_all` for `return` and `fail`, the loop's recorded
+depth for `break` and `continue`. It emits without changing the count,
+because an early exit is one path out and the others still have the
+handler installed.
+
+Predicted from F61 rather than found by a crossing: the pop and the
+capture releases sat under the same guard, and the guard was already
+known to be the wrong one.
+
+**Gate**: `examples/handler_exits.gr` gained a handler holding a list
+across each way out. Removing the release makes `leakcheck.sh` exit 1
+naming that program. The generators do not catch it — `fuzz_handlers`
+builds no early exit — which is why the corpus program carries it.
