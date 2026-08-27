@@ -8,3 +8,7 @@ entry = "src/main.gr"
 # capability by doing so ([T-CAPABILITY]). Serving is `http_server`, which is
 # a separate name a consumer has to ask for.
 capabilities = []
+
+[dependencies.url]
+path = "../url"
+version = "^1.0.0"

@@ -77,9 +77,9 @@ that used it as a field name, which is the compatibility this rule exists for.
 
 ## 4. Literals
 
-**[L-INT]** Integer literals are decimal (`42`), hexadecimal (`0xFF`), or
-binary (`0b1010`). Underscores may separate digits (`1_000_000`) and are
-ignored. Integers are 64-bit signed.
+**[L-INT]** Integer literals are decimal (`42`), hex (`0xFF`) or binary
+(`0b1010`); underscores are ignored. Decimal is a 64-bit signed magnitude,
+hex and binary a bit pattern — all 64 bits, so `0xffffffffffffffff` is -1.
 
 **[L-FLOAT]** Float literals contain a fractional part (`3.14`) or an exponent
 (`1e9`, `2.5e-3`). `1..5` is a range, not a float.

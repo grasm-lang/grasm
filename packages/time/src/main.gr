@@ -1,0 +1,268 @@
+// A calendar, not a clock.
+//
+// `now_millis()` performs `io`; everything above it is arithmetic, so this
+// package declares nothing and the current time comes in as an argument. That
+// is not only about the ceiling: a program whose clock is a parameter can be
+// run at midnight on the 29th of February without waiting for one.
+//
+// Proleptic Gregorian throughout, UTC only. A zone database is a file, and a
+// file is `io`; a package that says it declares nothing must not be quietly
+// reading one.
+//
+// The civil-from-days algorithm is Howard Hinnant's: shift the year to start
+// in March so the leap day lands at the end, and the month lengths fall into
+// a pattern with no table and no branch.
+
+type Date = { year: i64, month: i64, day: i64 }
+
+type Time = { hour: i64, minute: i64, second: i64, milli: i64 }
+
+type Stamp = { date: Date, time: Time }
+
+pub fn is_leap(year: i64) -> bool {
+    (year % 4 == 0 and year % 100 != 0) or year % 400 == 0
+}
+
+pub fn days_in_month(year: i64, month: i64) -> i64 {
+    if month == 2 {
+        return if is_leap(year) { 29 } else { 28 }
+    }
+    if month == 4 or month == 6 or month == 9 or month == 11 {
+        return 30
+    }
+    if month < 1 or month > 12 {
+        return 0
+    }
+    31
+}
+
+/// Days since 1970-01-01 for a civil date. Valid for any year, before 1970
+/// included.
+pub fn days_from_civil(d: Date) -> i64 {
+    let y = if d.month <= 2 { d.year - 1 } else { d.year }
+    let era = if y >= 0 { y / 400 } else { (y - 399) / 400 }
+    let yoe = y - era * 400
+    let m = d.month
+    let mp = (m + 9) % 12
+    let doy = (153 * mp + 2) / 5 + d.day - 1
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    era * 146097 + doe - 719468
+}
+
+/// The other direction.
+pub fn civil_from_days(days: i64) -> Date {
+    let z = days + 719468
+    let era = if z >= 0 { z / 146097 } else { (z - 146096) / 146097 }
+    let doe = z - era * 146097
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let y = yoe + era * 400
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp = (5 * doy + 2) / 153
+    let d = doy - (153 * mp + 2) / 5 + 1
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }
+    Date{ year: if m <= 2 { y + 1 } else { y }, month: m, day: d }
+}
+
+/// Monday is 1 and Sunday is 7, which is what ISO-8601 says and what every
+/// other numbering disagrees with.
+pub fn weekday(d: Date) -> i64 {
+    let days = days_from_civil(d)
+    let w = (days + 3) % 7
+    if w < 0 { w + 8 } else { w + 1 }
+}
+
+pub fn day_of_year(d: Date) -> i64 {
+    days_from_civil(d) - days_from_civil(Date{ year: d.year, month: 1, day: 1 }) + 1
+}
+
+/// A date and time from a millisecond count since the epoch. Negative counts
+/// — times before 1970 — floor rather than truncate, so 1969 is not off by a
+/// day for every instant that is not exactly midnight.
+pub fn from_millis(ms: i64) -> Stamp {
+    let day_ms = 86400000
+    var days = ms / day_ms
+    var rest = ms % day_ms
+    if rest < 0 {
+        days = days - 1
+        rest = rest + day_ms
+    }
+    Stamp{
+        date: civil_from_days(days),
+        time: Time{
+            hour: rest / 3600000,
+            minute: (rest / 60000) % 60,
+            second: (rest / 1000) % 60,
+            milli: rest % 1000,
+        },
+    }
+}
+
+pub fn to_millis(s: Stamp) -> i64 {
+    days_from_civil(s.date) * 86400000 + s.time.hour * 3600000 +
+        s.time.minute * 60000 + s.time.second * 1000 + s.time.milli
+}
+
+fn pad(n: i64, width: i64) -> str {
+    "{n}".pad_start(width, "0")
+}
+
+/// `2026-08-27`.
+pub fn format_date(d: Date) -> str {
+    // A year outside four digits is written with as many as it has rather
+    // than truncated: a date that cannot round-trip through its own text is
+    // worse than an ugly one.
+    let y = if d.year < 0 { "-" + pad(0 - d.year, 4) } else { pad(d.year, 4) }
+    "{y}-{pad(d.month, 2)}-{pad(d.day, 2)}"
+}
+
+/// `2026-08-27T13:04:05.006Z`. Milliseconds are always written, because a
+/// format that sometimes has them is two formats.
+pub fn format(s: Stamp) -> str {
+    "{format_date(s.date)}T{pad(s.time.hour, 2)}:{pad(s.time.minute, 2)}:" +
+        "{pad(s.time.second, 2)}.{pad(s.time.milli, 3)}Z"
+}
+
+fn number(cs: [str], from: i64, count: i64) -> i64 {
+    var n = 0
+    for i in from..(from + count) {
+        if i >= cs.len() {
+            return -1
+        }
+        let d = cs[i].parse_int() ?? -1
+        if d < 0 {
+            return -1
+        }
+        n = n * 10 + d
+    }
+    n
+}
+
+/// `2026-08-27T13:04:05Z`, with the milliseconds and the `Z` optional and a
+/// space accepted where the `T` goes. `None` for anything else — including a
+/// date that does not exist, which is the case a parser built on `substr` and
+/// hope accepts.
+pub fn parse(text: str) -> Option[Stamp] {
+    let t = text.trim()
+    let cs = t.chars()
+    if cs.len() < 10 {
+        return None
+    }
+    if cs[4] != "-" or cs[7] != "-" {
+        return None
+    }
+    let year = number(cs, 0, 4)
+    let month = number(cs, 5, 2)
+    let day = number(cs, 8, 2)
+    if year < 0 or month < 1 or month > 12 {
+        return None
+    }
+    if day < 1 or day > days_in_month(year, month) {
+        return None
+    }
+    let date = Date{ year: year, month: month, day: day }
+    if cs.len() == 10 {
+        return Some(Stamp{ date: date, time: Time{ hour: 0, minute: 0, second: 0, milli: 0 } })
+    }
+    if cs[10] != "T" and cs[10] != " " {
+        return None
+    }
+    if cs.len() < 19 or cs[13] != ":" or cs[16] != ":" {
+        return None
+    }
+    let hour = number(cs, 11, 2)
+    let minute = number(cs, 14, 2)
+    let second = number(cs, 17, 2)
+    // 23:59:60 is a leap second, which this calendar does not have. Refusing
+    // is honest; accepting it and calling it midnight is not.
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59 or second < 0 or second > 59 {
+        return None
+    }
+    var milli = 0
+    var i = 19
+    if i < cs.len() and cs[i] == "." {
+        var digits = 0
+        i = i + 1
+        while i < cs.len() and digits < 3 {
+            let d = cs[i].parse_int() ?? -1
+            // Stop at the first non-digit rather than refusing: `.6Z` has one
+            // fractional digit and then the zone, and a loop that demands
+            // three of them rejects a timestamp every other parser accepts.
+            if d < 0 {
+                break
+            }
+            milli = milli * 10 + d
+            digits = digits + 1
+            i = i + 1
+        }
+        if digits == 0 {
+            return None
+        }
+        // More precision than milliseconds is dropped, not refused — it is a
+        // valid timestamp this type cannot hold all of.
+        while i < cs.len() and (cs[i].parse_int() ?? -1) >= 0 {
+            i = i + 1
+        }
+        milli = milli * (10 ^ (3 - digits))
+    }
+    if i < cs.len() {
+        if cs[i] != "Z" or i + 1 != cs.len() {
+            return None
+        }
+    }
+    Some(Stamp{
+        date: date,
+        time: Time{ hour: hour, minute: minute, second: second, milli: milli },
+    })
+}
+
+// --- durations -------------------------------------------------------------
+
+pub fn seconds(n: i64) -> i64 {
+    n * 1000
+}
+
+pub fn minutes(n: i64) -> i64 {
+    n * 60000
+}
+
+pub fn hours(n: i64) -> i64 {
+    n * 3600000
+}
+
+pub fn days(n: i64) -> i64 {
+    n * 86400000
+}
+
+/// A duration in milliseconds as `1d2h3m4.005s`, shortest first-unit-that-
+/// applies. Zero is `0s` rather than the empty string.
+pub fn format_duration(ms: i64) -> str {
+    if ms == 0 {
+        return "0s"
+    }
+    let sign = if ms < 0 { "-" } else { "" }
+    var left = ms.abs()
+    var out = ""
+    let d = left / 86400000
+    if d > 0 {
+        out = out + "{d}d"
+        left = left % 86400000
+    }
+    let h = left / 3600000
+    if h > 0 or not out.is_empty() {
+        out = out + "{h}h"
+        left = left % 3600000
+    }
+    let m = left / 60000
+    if m > 0 or not out.is_empty() {
+        out = out + "{m}m"
+        left = left % 60000
+    }
+    let s = left / 1000
+    let milli = left % 1000
+    if milli == 0 {
+        out = out + "{s}s"
+    } else {
+        out = out + "{s}.{pad(milli, 3)}s"
+    }
+    sign + out
+}

@@ -1,0 +1,79 @@
+// The `bytes_codec` package: encode, decode, and refuse.
+//
+// The refusals are half the cases. A decoder is handed input somebody else
+// chose, and one that quietly accepts what no encoder produced makes two
+// different texts mean the same bytes.
+import bytes_codec
+
+fn show_hex(label: str, b: bytes) {
+    let e = bytes_codec.encode_hex(b)
+    let back = bytes_codec.decode_hex(e) ?? bytes_of([])
+    print("  {label}: {e}  round trip {back.to_list() == b.to_list()}")
+}
+
+fn try_hex(label: str, s: str) {
+    match bytes_codec.decode_hex(s) {
+        Some(b) -> print("  {label} \"{s}\" -> {b.to_list()}")
+        None -> print("  {label} \"{s}\" -> refused")
+    }
+}
+
+fn show_b64(label: str, b: bytes) {
+    let e = bytes_codec.encode_base64(b)
+    let u = bytes_codec.encode_base64_url(b)
+    let back = bytes_codec.decode_base64(e) ?? bytes_of([1])
+    let uback = bytes_codec.decode_base64_url(u) ?? bytes_of([1])
+    print("  {label}: {e}  url {u}  round trip {back.to_list() == b.to_list()} {uback.to_list() == b.to_list()}")
+}
+
+fn try_b64(label: str, s: str) {
+    match bytes_codec.decode_base64(s) {
+        Some(b) -> print("  {label} \"{s}\" -> {b.to_list()}")
+        None -> print("  {label} \"{s}\" -> refused")
+    }
+}
+
+fn main() {
+    print("-- hex")
+    show_hex("empty", bytes_of([]))
+    show_hex("one", bytes_of([0]))
+    show_hex("255", bytes_of([255]))
+    show_hex("ascii", "hi".to_bytes())
+    show_hex("non-ascii", "günaydin".to_bytes())
+    show_hex("every boundary", bytes_of([0, 1, 15, 16, 127, 128, 254, 255]))
+    print("  upper: {bytes_codec.encode_hex_upper(bytes_of([171, 205]))}")
+
+    print("-- hex, refused")
+    try_hex("odd length", "abc")
+    try_hex("not a digit", "zz")
+    try_hex("a space", "ab cd")
+    try_hex("upper is fine", "ABCD")
+    try_hex("empty is fine", "")
+
+    print("-- base64")
+    show_b64("empty", bytes_of([]))
+    show_b64("one byte", bytes_of([77]))
+    show_b64("two bytes", bytes_of([77, 97]))
+    show_b64("three bytes", bytes_of([77, 97, 110]))
+    show_b64("four bytes", bytes_of([77, 97, 110, 33]))
+    show_b64("high bytes", bytes_of([251, 255, 190]))
+    show_b64("text", "any carnal pleasure.".to_bytes())
+
+    print("-- base64, refused")
+    try_b64("one character", "A")
+    try_b64("not in the alphabet", "aa*a")
+    try_b64("three pad characters", "QQ===")
+    try_b64("padding in the wrong place", "QQ=A")
+    try_b64("leftover bits clear", "QQ==")
+    try_b64("leftover bits set", "QR==")
+    try_b64("unpadded is fine", "QQ")
+    try_b64("padded is fine", "QQ==")
+
+    print("-- constant-time compare")
+    let a = "secret".to_bytes()
+    print("  same: {bytes_codec.equal_constant_time(a, "secret".to_bytes())}")
+    print("  differs at the end: {bytes_codec.equal_constant_time(a, "secreT".to_bytes())}")
+    print("  differs at the start: {bytes_codec.equal_constant_time(a, "Secret".to_bytes())}")
+    print("  shorter: {bytes_codec.equal_constant_time(a, "sec".to_bytes())}")
+    print("  both empty: {bytes_codec.equal_constant_time(bytes_of([]), bytes_of([]))}")
+}

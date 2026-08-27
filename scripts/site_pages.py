@@ -793,7 +793,23 @@ grasm deps --locked   # fail rather than update the lockfile
 <tr><td><code>http_server</code></td><td><code>io</code>, <code>net</code></td><td>The accept loop, and many conversations on one thread. Depends on <code>http</code>.</td></tr>
 <tr><td><code>http_client</code></td><td><code>net</code></td><td>Dials, sends what <code>http</code> composed, reads until the declared frame arrives. Depends on <code>http</code>.</td></tr>
 <tr><td><code>json</code></td><td><i>none</i></td><td>Parse, render, reach into a document, build one. Six programs in <code>ProjectGold/</code> depend on it.</td></tr>
+<tr><td><code>bytes_codec</code></td><td><i>none</i></td><td>Hex, base64, url-safe, constant-time compare.</td></tr>
+<tr><td><code>time</code></td><td><i>none</i></td><td>Civil calendar, ISO-8601, durations. The clock is a parameter.</td></tr>
+<tr><td><code>random</code></td><td><i>none</i></td><td>Seeded generator, uniform without modulo bias, shuffle.</td></tr>
+<tr><td><code>uuid</code></td><td><i>none</i></td><td>v4 and v7. The entropy is a parameter.</td></tr>
+<tr><td><code>path</code></td><td><i>none</i></td><td>Join, normalise, split, containment. Touches no disk.</td></tr>
+<tr><td><code>url</code></td><td><i>none</i></td><td>Parse, build, resolve, percent code, query strings.</td></tr>
+<tr><td><code>log</code></td><td><code>io</code>, <code>Log</code></td><td>Logging as an <b>effect</b>: a library that logs declares <code>Log</code>, not <code>io</code>.</td></tr>
+<tr><td><code>csv</code></td><td><i>none</i></td><td>Quoting, embedded newlines, headers, any separator.</td></tr>
+<tr><td><code>cli</code></td><td><i>none</i></td><td>Flags, bundles, subcommands, <code>--</code>, a generated help page.</td></tr>
+<tr><td><code>testing</code></td><td><i>none</i></td><td>Cases as values, table-driven suites, a golden diff that names the line and column.</td></tr>
+<tr><td><code>toml</code></td><td><i>none</i></td><td>Tables, arrays, inline tables, reached by dotted path.</td></tr>
 </table></div>
+<p>Thirteen of the fifteen declare <em>nothing</em>. That is the pattern: reach is
+split from computation, so a program that joins paths, formats a date or
+builds a URL acquires no capability by doing so — and where a library really
+does need the world, it asks for it as an effect the consumer supplies, which
+is what <code>log</code> demonstrates.</p>
 <p>They are three packages because <code>http</code> <em>cannot</em> open a
 socket, and that is checked rather than claimed: its manifest declares no
 capability, effects are inferred from its source, and a version of it that
@@ -944,7 +960,7 @@ well as for what it prints.</p>
 <h2>What does not work</h2>
 <div class="scroll"><table>
 <tr><th>Limit</th><th>Detail</th></tr>
-<tr><td>Four libraries, all first-party</td><td><code>http</code>, <code>http_server</code>, <code>http_client</code>, <code>json</code>. Anything else you need, you write, or bind to C with <code>extern fn</code>.</td></tr>
+<tr><td>Fifteen libraries, all first-party</td><td>See <a href="packages.html">Packages</a>; the plan for the rest is in <code>docs/packages-plan.md</code>. Anything else you need, you write, or bind to C with <code>extern fn</code>.</td></tr>
 <tr><td>No remote registry</td><td>Path and local-registry dependencies work. Nothing fetches or publishes.</td></tr>
 <tr><td>No release binaries</td><td>Build from source with a Rust toolchain.</td></tr>
 <tr><td>0.45× native Rust</td><td>Measured, floor-subtracted 0.39×, against a 0.95× target.</td></tr>

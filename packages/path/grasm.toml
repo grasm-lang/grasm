@@ -1,0 +1,9 @@
+[package]
+name = "path"
+version = "1.0.0"
+entry = "src/main.gr"
+
+# Path arithmetic touches no disk, so it declares nothing. The half that does
+# — walking a tree, globbing, copying — is `fs`, and is a separate name a
+# consumer has to ask for.
+capabilities = []

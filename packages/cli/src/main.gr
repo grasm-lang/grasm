@@ -1,0 +1,425 @@
+// Command lines: flags, positionals, subcommands, and a help page.
+//
+// The arguments come in as a `[str]`. `args()` performs `io` and is the
+// consumer's line to write — which is not only about the ceiling: a test that
+// wants to know what `--verbose --count=3 file.txt` does should be able to say
+// exactly that, and not have to arrange for a process to be started with it.
+//
+// A bad command line is answered, not panicked on. Somebody typed it.
+
+type Kind = | Switch | Text | Number
+
+type Flag = {
+    name: str,
+    short: str,
+    kind: Kind,
+    help: str,
+    fallback: str,
+    required: bool,
+    repeated: bool,
+}
+
+type Positional = { name: str, help: str, required: bool, rest: bool }
+
+type Command = {
+    name: str,
+    about: str,
+    flags: [Flag],
+    positionals: [Positional],
+    subcommands: [Command],
+}
+
+type Parsed = {
+    command: str,
+    path: [str],
+    switches: Map[str, bool],
+    values: Map[str, str],
+    repeats: Map[str, [str]],
+    positionals: Map[str, str],
+    rest: [str],
+    ok: bool,
+    why: str,
+}
+
+pub fn switch_flag(name: str, short: str, help: str) -> Flag {
+    Flag{ name: name, short: short, kind: Switch, help: help,
+          fallback: "", required: false, repeated: false }
+}
+
+pub fn text_flag(name: str, short: str, help: str, fallback: str) -> Flag {
+    Flag{ name: name, short: short, kind: Text, help: help,
+          fallback: fallback, required: false, repeated: false }
+}
+
+pub fn number_flag(name: str, short: str, help: str, fallback: i64) -> Flag {
+    Flag{ name: name, short: short, kind: Number, help: help,
+          fallback: "{fallback}", required: false, repeated: false }
+}
+
+pub fn required(f: Flag) -> Flag {
+    Flag{ name: f.name, short: f.short, kind: f.kind, help: f.help,
+          fallback: f.fallback, required: true, repeated: f.repeated }
+}
+
+/// A flag that may be given more than once, gathering every value.
+///
+/// Without this, the second `--header` silently replaces the first — which is
+/// the behaviour every tool that takes headers, includes or excludes has had
+/// to fix after somebody lost data to it.
+pub fn repeated(f: Flag) -> Flag {
+    Flag{ name: f.name, short: f.short, kind: f.kind, help: f.help,
+          fallback: f.fallback, required: f.required, repeated: true }
+}
+
+pub fn positional(name: str, help: str) -> Positional {
+    Positional{ name: name, help: help, required: true, rest: false }
+}
+
+pub fn optional_positional(name: str, help: str) -> Positional {
+    Positional{ name: name, help: help, required: false, rest: false }
+}
+
+/// Everything left over, under one name.
+pub fn rest_positional(name: str, help: str) -> Positional {
+    Positional{ name: name, help: help, required: false, rest: true }
+}
+
+pub fn command(name: str, about: str, flags: [Flag], positionals: [Positional]) -> Command {
+    Command{ name: name, about: about, flags: flags,
+             positionals: positionals, subcommands: [] }
+}
+
+pub fn with_subcommands(c: Command, subs: [Command]) -> Command {
+    Command{ name: c.name, about: c.about, flags: c.flags,
+             positionals: c.positionals, subcommands: subs }
+}
+
+fn refused(why: str) -> Parsed {
+    Parsed{ command: "", path: [], switches: map(), values: map(),
+            repeats: map(), positionals: map(), rest: [], ok: false, why: why }
+}
+
+fn find_long(flags: [Flag], name: str) -> Option[Flag] {
+    for f in flags {
+        if f.name == name {
+            return Some(f)
+        }
+    }
+    None
+}
+
+fn find_short(flags: [Flag], c: str) -> Option[Flag] {
+    for f in flags {
+        if not f.short.is_empty() and f.short == c {
+            return Some(f)
+        }
+    }
+    None
+}
+
+/// Parse a command line against a specification.
+///
+/// `--name value`, `--name=value`, `-n value`, `-n=value`, `-abc` for bundled
+/// switches, and `--` for "everything after this is a positional, whatever it
+/// looks like". A `-` on its own is a positional, because that is what it
+/// conventionally means: standard input.
+pub fn parse(spec: Command, argv: [str]) -> Parsed {
+    var here = spec
+    var path: [str] = [spec.name]
+    // The flags in scope, which grow as subcommands are entered. A global
+    // flag stays legal after the command name — `tool build --verbose` is
+    // what everyone types — and, more importantly, a *required* one declared
+    // on the parent is still checked once a subcommand has been chosen.
+    // Checking only the innermost command's flags let `--root`, declared
+    // required on the parent, be left out entirely.
+    var known: [Flag] = spec.flags
+    var switches = map()
+    var values = map()
+    var repeats: Map[str, [str]] = map()
+    var taken: [str] = []
+    var rest: [str] = []
+    var only_positional = false
+    var i = 0
+
+    while i < argv.len() {
+        let a = argv[i]
+        i = i + 1
+
+        if only_positional {
+            taken.push(a)
+            continue
+        }
+        if a == "--" {
+            only_positional = true
+            continue
+        }
+        if a.starts_with("--") {
+            var name = a.substr(2, a.len() - 2)
+            var inline = ""
+            var has_inline = false
+            match name.index_of("=") {
+                Some(at) -> {
+                    inline = name.substr(at + 1, name.len() - at - 1)
+                    name = name.substr(0, at)
+                    has_inline = true
+                }
+                None -> {}
+            }
+            if name.is_empty() {
+                return refused("`{a}` has no flag name")
+            }
+            let found = find_long(known, name)
+            match found {
+                None -> return refused("unknown flag `--{name}`")
+                Some(f) -> {
+                    match f.kind {
+                        Switch -> {
+                            if has_inline {
+                                match inline.to_lower() {
+                                    "true" -> switches.set(f.name, true)
+                                    "false" -> switches.set(f.name, false)
+                                    _ -> return refused("`--{name}` is a switch, so `={inline}` means nothing")
+                                }
+                            } else {
+                                switches.set(f.name, true)
+                            }
+                        }
+                        _ -> {
+                            var v = inline
+                            if not has_inline {
+                                if i >= argv.len() {
+                                    return refused("`--{name}` needs a value")
+                                }
+                                v = argv[i]
+                                i = i + 1
+                            }
+                            match check_value(f, v) {
+                                Some(why) -> return refused(why)
+                                None -> {}
+                            }
+                            if f.repeated {
+                                var so_far = repeats.get(f.name) ?? []
+                                so_far.push(v)
+                                repeats.set(f.name, so_far)
+                            }
+                            values.set(f.name, v)
+                        }
+                    }
+                }
+            }
+            continue
+        }
+        if a.starts_with("-") and a.len() > 1 {
+            let cs = a.substr(1, a.len() - 1).chars()
+            var j = 0
+            while j < cs.len() {
+                let c = cs[j]
+                j = j + 1
+                match find_short(known, c) {
+                    None -> return refused("unknown flag `-{c}`")
+                    Some(f) -> {
+                        match f.kind {
+                            Switch -> switches.set(f.name, true)
+                            _ -> {
+                                // The rest of the bundle is the value if there
+                                // is any, so `-n3` is `-n 3`; otherwise the
+                                // next argument is.
+                                var v = ""
+                                if j < cs.len() {
+                                    var tail = ""
+                                    while j < cs.len() {
+                                        tail = tail + cs[j]
+                                        j = j + 1
+                                    }
+                                    v = if tail.starts_with("=") {
+                                        tail.substr(1, tail.len() - 1)
+                                    } else {
+                                        tail
+                                    }
+                                } else {
+                                    if i >= argv.len() {
+                                        return refused("`-{c}` needs a value")
+                                    }
+                                    v = argv[i]
+                                    i = i + 1
+                                }
+                                match check_value(f, v) {
+                                    Some(why) -> return refused(why)
+                                    None -> {}
+                                }
+                                if f.repeated {
+                                    var so_far = repeats.get(f.name) ?? []
+                                    so_far.push(v)
+                                    repeats.set(f.name, so_far)
+                                }
+                                values.set(f.name, v)
+                            }
+                        }
+                    }
+                }
+            }
+            continue
+        }
+        // A subcommand only counts before any positional has been taken:
+        // `run build` is two commands, `echo build` is a word.
+        if taken.is_empty() and not here.subcommands.is_empty() {
+            var matched = false
+            for sub in here.subcommands {
+                if sub.name == a {
+                    here = sub
+                    path.push(sub.name)
+                    for f in sub.flags {
+                        known.push(f)
+                    }
+                    matched = true
+                }
+            }
+            if matched {
+                continue
+            }
+            return refused("unknown command `{a}`")
+        }
+        taken.push(a)
+    }
+
+    if not here.subcommands.is_empty() and path.len() == 1 {
+        return refused("a command is needed: {names_of(here.subcommands)}")
+    }
+
+    var positionals = map()
+    var index = 0
+    for p in here.positionals {
+        if p.rest {
+            while index < taken.len() {
+                rest.push(taken[index])
+                index = index + 1
+            }
+            positionals.set(p.name, rest.join(" "))
+            continue
+        }
+        if index < taken.len() {
+            positionals.set(p.name, taken[index])
+            index = index + 1
+            continue
+        }
+        if p.required {
+            return refused("`{p.name}` is needed")
+        }
+    }
+    while index < taken.len() {
+        rest.push(taken[index])
+        index = index + 1
+    }
+
+    for f in known {
+        match f.kind {
+            Switch -> if not switches.has(f.name) { switches.set(f.name, false) }
+            _ -> {
+                if not values.has(f.name) {
+                    if f.required {
+                        return refused("`--{f.name}` is needed")
+                    }
+                    values.set(f.name, f.fallback)
+                }
+            }
+        }
+    }
+
+    Parsed{ command: here.name, path: path, switches: switches, values: values,
+            repeats: repeats, positionals: positionals, rest: rest,
+            ok: true, why: "" }
+}
+
+fn check_value(f: Flag, v: str) -> Option[str] {
+    match f.kind {
+        Number -> match v.parse_int() {
+            Some(n) -> None
+            None -> Some("`--{f.name}` takes a number, and `{v}` is not one")
+        }
+        _ -> None
+    }
+}
+
+fn names_of(cs: [Command]) -> str {
+    var out: [str] = []
+    for c in cs {
+        out.push(c.name)
+    }
+    out.join(", ")
+}
+
+// --- reading what came back ------------------------------------------------
+
+pub fn switch_of(p: Parsed, name: str) -> bool {
+    p.switches.get(name) ?? false
+}
+
+pub fn text_of(p: Parsed, name: str) -> str {
+    p.values.get(name) ?? ""
+}
+
+pub fn number_of(p: Parsed, name: str) -> i64 {
+    (p.values.get(name) ?? "").parse_int() ?? 0
+}
+
+pub fn all_of(p: Parsed, name: str) -> [str] {
+    p.repeats.get(name) ?? []
+}
+
+pub fn positional_of(p: Parsed, name: str) -> str {
+    p.positionals.get(name) ?? ""
+}
+
+// --- help ------------------------------------------------------------------
+
+/// The page `--help` prints. Generated, so it cannot describe a flag the
+/// parser does not have or miss one it does.
+pub fn help(spec: Command) -> str {
+    var out = "{spec.name} — {spec.about}\n\nusage: {spec.name}"
+    if not spec.flags.is_empty() {
+        out = out + " [options]"
+    }
+    if not spec.subcommands.is_empty() {
+        out = out + " <command>"
+    }
+    for p in spec.positionals {
+        out = out + (if p.required { " <{p.name}>" } else { " [{p.name}]" })
+        if p.rest {
+            out = out + "..."
+        }
+    }
+    if not spec.subcommands.is_empty() {
+        out = out + "\n\ncommands:"
+        for c in spec.subcommands {
+            out = out + "\n  {c.name.pad_end(14, " ")}{c.about}"
+        }
+    }
+    if not spec.positionals.is_empty() {
+        out = out + "\n\narguments:"
+        for p in spec.positionals {
+            out = out + "\n  {p.name.pad_end(14, " ")}{p.help}"
+        }
+    }
+    if not spec.flags.is_empty() {
+        out = out + "\n\noptions:"
+        for f in spec.flags {
+            var left = if f.short.is_empty() { "    " } else { "-{f.short}, " }
+            left = left + "--{f.name}"
+            match f.kind {
+                Switch -> {}
+                Number -> left = left + " <n>"
+                Text -> left = left + " <value>"
+            }
+            out = out + "\n  {left.pad_end(24, " ")}{f.help}"
+            if f.required {
+                out = out + " (needed)"
+            } else if not f.fallback.is_empty() {
+                out = out + " (default {f.fallback})"
+            }
+            if f.repeated {
+                out = out + " (may repeat)"
+            }
+        }
+    }
+    out
+}

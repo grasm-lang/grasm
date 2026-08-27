@@ -1,0 +1,194 @@
+// Logging as an effect.
+//
+// A library that logs by calling `print` must declare `io`, and every consumer
+// then depends on something that can write anywhere. A library that logs by
+// *performing* an effect declares `Log`, and the consumer decides what that
+// means — stderr, a file, a JSON stream, or a list a test reads afterwards.
+//
+// So the row of a function that logs is `/ {Log}` and nothing else. That is
+// the whole point of this package, and it is checked rather than claimed:
+// `packages/log-demo` has a function declaring exactly that, and the compiler
+// refuses it if it ever reaches further.
+//
+// Nothing here reads a clock either. A record carries the millisecond it was
+// made, and where that came from is the caller's business — which is what
+// makes a log line reproducible in a test.
+import json
+import time
+
+type Level = | Trace | Debug | Info | Warn | Error
+
+type Field = { name: str, value: str }
+
+type Record = {
+    level: Level,
+    message: str,
+    fields: [Field],
+    millis: i64,
+}
+
+effect Log {
+    fn record(entry: Record)
+}
+
+pub fn rank(l: Level) -> i64 {
+    match l {
+        Trace -> 0
+        Debug -> 1
+        Info -> 2
+        Warn -> 3
+        Error -> 4
+    }
+}
+
+pub fn level_name(l: Level) -> str {
+    match l {
+        Trace -> "trace"
+        Debug -> "debug"
+        Info -> "info"
+        Warn -> "warn"
+        Error -> "error"
+    }
+}
+
+pub fn level_from(name: str) -> Option[Level] {
+    match name.to_lower() {
+        "trace" -> Some(Trace)
+        "debug" -> Some(Debug)
+        "info" -> Some(Info)
+        "warn" -> Some(Warn)
+        "warning" -> Some(Warn)
+        "error" -> Some(Error)
+        _ -> None
+    }
+}
+
+// --- what a program calls --------------------------------------------------
+
+pub fn at(level: Level, message: str, fields: [Field], millis: i64) / {Log} {
+    Log.record(Record{ level: level, message: message, fields: fields, millis: millis })
+}
+
+pub fn trace(message: str) / {Log} {
+    at(Trace, message, [], 0)
+}
+
+pub fn debug(message: str) / {Log} {
+    at(Debug, message, [], 0)
+}
+
+pub fn info(message: str) / {Log} {
+    at(Info, message, [], 0)
+}
+
+pub fn warn(message: str) / {Log} {
+    at(Warn, message, [], 0)
+}
+
+pub fn error(message: str) / {Log} {
+    at(Error, message, [], 0)
+}
+
+pub fn field(name: str, value: str) -> Field {
+    Field{ name: name, value: value }
+}
+
+pub fn field_int(name: str, value: i64) -> Field {
+    Field{ name: name, value: "{value}" }
+}
+
+// --- rendering -------------------------------------------------------------
+
+/// `level=info msg="a thing happened" k=v`, logfmt-shaped.
+///
+/// A value is quoted when it contains a space, an equals sign or a quote, and
+/// never otherwise: quoting everything makes a log unreadable, quoting nothing
+/// makes it unparseable.
+pub fn render_text(e: Record) -> str {
+    var out = "level={level_name(e.level)}"
+    if e.millis != 0 {
+        out = out + " time={time.format(time.from_millis(e.millis))}"
+    }
+    out = out + " msg={quoted(e.message)}"
+    for f in e.fields {
+        out = out + " {f.name}={quoted(f.value)}"
+    }
+    out
+}
+
+fn quoted(v: str) -> str {
+    if v.is_empty() {
+        return "\"\""
+    }
+    if v.contains(" ") or v.contains("=") or v.contains("\"") or v.contains("\n") {
+        return "\"" + json.escape(v) + "\""
+    }
+    v
+}
+
+/// One JSON object per record, which is what a log shipper wants.
+pub fn render_json(e: Record) -> str {
+    var out = "\{\"level\":\"{level_name(e.level)}\""
+    if e.millis != 0 {
+        out = out + ",\"time\":\"{time.format(time.from_millis(e.millis))}\""
+    }
+    out = out + ",\"msg\":\"{json.escape(e.message)}\""
+    for f in e.fields {
+        out = out + ",\"{json.escape(f.name)}\":\"{json.escape(f.value)}\""
+    }
+    out + "}"
+}
+
+// --- sinks -----------------------------------------------------------------
+//
+// Each answers a handler. Installing one is `with Log handled_by …`, and every
+// function in the block — at any depth — logs through it without knowing.
+
+/// Text to standard error, at or above `min`.
+///
+/// Standard error rather than standard output, because a program's output is
+/// something else's input and a log line in the middle of it is a bug in two
+/// programs at once.
+pub fn to_lines(min: Level) -> LogHandler / {io} {
+    LogHandler{ record: |e| if rank(e.level) >= rank(min) { eprint(render_text(e)) } }
+}
+
+/// One JSON object per line, to standard error.
+pub fn to_json(min: Level) -> LogHandler / {io} {
+    LogHandler{ record: |e| if rank(e.level) >= rank(min) { eprint(render_json(e)) } }
+}
+
+/// To standard output. For a program whose output *is* its log.
+pub fn to_stdout(min: Level) -> LogHandler / {io} {
+    LogHandler{ record: |e| if rank(e.level) >= rank(min) { print(render_text(e)) } }
+}
+
+/// Into a list, for a test. Declares nothing — which is what lets a test of a
+/// logging library run in a package whose ceiling is empty.
+pub fn collecting(sink: ref [Record]) -> LogHandler {
+    LogHandler{ record: |e| sink.value.push(e) }
+}
+
+/// Nowhere.
+pub fn discarding() -> LogHandler {
+    LogHandler{ record: |e| {} }
+}
+
+/// Two sinks at once — a readable line for a person and a JSON object for a
+/// shipper, or a file and a screen.
+///
+/// A handler's operations cannot be called directly; they are reached by
+/// performing the effect inside a `with` that installs them, which is what
+/// makes a handler's own effects count where it was installed rather than
+/// where it was written. So this installs each in turn and performs the
+/// operation once under each.
+pub fn both(a: LogHandler, b: LogHandler) -> LogHandler {
+    LogHandler{ record: |e| {
+        with Log handled_by a {
+            Log.record(e)
+        }
+        with Log handled_by b {
+            Log.record(e)
+        }
+    } }
+}

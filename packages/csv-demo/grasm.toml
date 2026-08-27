@@ -1,0 +1,8 @@
+[package]
+name = "csv_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.csv]
+path = "../csv"
+version = "^1.0.0"

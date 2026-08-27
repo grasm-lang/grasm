@@ -1,0 +1,66 @@
+// The `testing` package, tested on failures as well as passes.
+//
+// A test framework whose demo only shows passing cases has shown the half
+// nobody needs to read. Every assertion below is exercised in both directions,
+// and the report is printed as a reader would see it.
+import testing
+
+fn double(n: i64) -> i64 {
+    n * 2
+}
+
+fn main() {
+    print("-- a table-driven suite, which is a `for` loop")
+    var cases: [Case] = []
+    for row in [(0, 0), (1, 2), (3, 6), (0 - 4, 0 - 8)] {
+        cases.push(testing.eq("double({row.0})", double(row.0), row.1))
+    }
+    let arithmetic = testing.suite("arithmetic", cases)
+    print(testing.report([arithmetic]))
+
+    print("")
+    print("-- every assertion, both ways")
+    let mixed = testing.suite("assertions", [
+        testing.eq("eq passes", 2, 2),
+        testing.eq("eq fails", 2, 3),
+        testing.eq("eq on text", "a", "a"),
+        testing.eq("eq on a list", [1, 2], [1, 2]),
+        testing.eq("eq on a list, differing", [1, 2], [1, 3]),
+        testing.not_eq("not_eq passes", 2, 3),
+        testing.not_eq("not_eq fails", 2, 2),
+        testing.is_true("is_true passes", 1 < 2),
+        testing.is_true("is_true fails", 1 > 2),
+        testing.is_false("is_false passes", 1 > 2),
+        testing.is_false("is_false fails", 1 < 2),
+        testing.near("near passes", 0.1 + 0.2, 0.3, 0.000001),
+        testing.near("near fails", 0.1 + 0.2, 0.4, 0.000001),
+        testing.contains("contains passes", "hello world", "lo w"),
+        testing.contains("contains fails", "hello world", "goodbye"),
+        testing.some("some passes", Some(1)),
+        testing.none("none fails", Some(1)),
+        testing.check("check passes", true, "unreachable"),
+        testing.check("check fails", false, "because it was told to"),
+    ])
+    print(testing.report([mixed]))
+
+    print("")
+    print("-- golden comparison, which says where")
+    let golden = testing.suite("golden", [
+        testing.golden("identical", "a\nb\nc", "a\nb\nc"),
+        testing.golden("one line differs", "a\nB\nc", "a\nb\nc"),
+        testing.golden("differs late in a line", "a\nhello world\nc", "a\nhello worlD\nc"),
+        testing.golden("a trailing space", "a\nb \nc", "a\nb\nc"),
+        testing.golden("too many lines", "a\nb\nc\nd", "a\nb\nc"),
+        testing.golden("too few lines", "a\nb", "a\nb\nc"),
+        testing.golden("a tab", "a\tb", "a b"),
+    ])
+    print(testing.report([golden]))
+
+    print("")
+    print("-- counting across suites")
+    let all = [arithmetic, mixed, golden]
+    print("  run {testing.count_run(all)}, failed {testing.count_failed(all)}, exit {testing.exit_code(all)}")
+    print("  a suite with nothing wrong: exit {testing.exit_code([arithmetic])}")
+    print("  no suites at all: exit {testing.exit_code([])}")
+    print(testing.report([]))
+}

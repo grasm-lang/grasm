@@ -1,0 +1,9 @@
+[package]
+name = "cli"
+version = "1.0.0"
+entry = "src/main.gr"
+
+# Parsing a list of strings is not reaching for anything. `args()` performs
+# `io` and is one line in the consumer's `main`, which is also what lets a test
+# hand this a list it wrote.
+capabilities = []

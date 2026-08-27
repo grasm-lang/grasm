@@ -87,6 +87,11 @@ and the entries disagree.
 | [F69](#f69) | percent decoding read one byte at a time, and the expected output recorded the result | S1, program | **fixed** |
 | [F70](#f70) | Content-Length was counted in characters, and the check that would have caught it counted the body the same way | S1, program | **fixed** |
 | [F71](#f71) | a generic type declared in one module could not be compiled in another | S2, backend | **fixed** |
+| [F72](#f72) | a 64-bit bit pattern could not be written | S3, lexical | **fixed** |
+| [F73](#f73) | a handler a call answers could not be passed as an argument | S3, backend | **fixed** |
+| [F74](#f74) | a match whose live arms all yield nothing could not be typed | S3, backend | **fixed** |
+| [F75](#f75) | a call into another module could not be typed where the type had to be worked out | S3, backend | **fixed** |
+| [F76](#f76) | two gates counted the programs they had not checked, and passed | S2, tests | **fixed** |
 
 <!-- end index -->
 ## F1 — a wrapped condition must end the line with the operator (S4) — **fixed**
@@ -3142,3 +3147,185 @@ program of more than one file, so nothing could have put it there.
 
 **Gate**: `scripts/fuzz_modules.py`. Restoring the module-keyed registration
 turns all 58 of its programs from passing to refused.
+
+## F72 — a 64-bit bit pattern could not be written (S3, lexical) — **fixed**
+
+```
+0xffffffffffffffff
+error: invalid numeric literal `0xffffffffffffffff`
+```
+
+Hex and binary literals went through `i64::from_str_radix`, so anything with
+the top bit set was refused — half the range, and the half every published
+constant lives in. splitmix64 has three multipliers and all three have it.
+So did every mask, every hash constant, and `0xffffffffffffffff` itself,
+which is the natural spelling of "every bit" and which [L-LIB-BITS]'s own
+prose in `spec/library.md` writes as `0xFFFFFFFF` because the 64-bit version
+would not lex.
+
+There was no workaround worth the name. The value has to be written as the
+signed decimal with the same bits — `-7046029254386353131` for
+`0x9e3779b97f4a7c15` — which no reference publishes, which no reader can
+check, and which a comment saying "this is 0x9e37…" does not make safe.
+
+Decimal and hex are different notations for different things, and the fix is
+to treat them that way. Decimal names a magnitude and keeps its range check:
+`18446744073709551615` is refused, and the message says the range and how to
+write the most negative value. Hex and binary name a *bit pattern*, so all 64
+bits are writable and `0xffffffffffffffff` is -1 — which is what
+`bit_and(0xff)` has always meant and what every other systems language with
+one integer width does.
+
+The diagnostic was also wrong in the ordinary way: "invalid numeric literal"
+and nothing else. It now says which — no digits, a digit not in the base
+(naming it), or more than 64 bits (counting them against what fits).
+
+Found by writing `packages/random`, whose first three lines are constants.
+
+**Gate**: `spec/conformance/L-INT.gr` covers `0xffffffffffffffff`,
+`0x8000000000000000`, `0x7fffffffffffffff`, a splitmix multiplier and 64
+binary ones; `packages/random` is in the corpus and its constants are
+written the way they are published.
+
+## F73 — a handler a call answers could not be passed as an argument (S3, backend) — **fixed**
+
+```
+with Cfg handled_by wrap(from_ref(x)) { … }
+error: native backend does not yet support a `CfgHandler` that is not a
+handler literal or a name bound to one
+```
+
+`with Cfg handled_by make()` compiled. `let h = make()` compiled. Only the
+*argument* position did not: `handler_value` accepted an `Ident` bound to a
+handler, or a handler literal, and refused everything else — so a handler
+that arrived by any other route reached a refusal rather than the ordinary
+expression path that `handled_by` was already using.
+
+It now evaluates the expression like any other and checks the type that comes
+back, which covers a call, an element of a list of handlers, a field, a
+`match`. No reference is taken: a call's answer is already owned by the
+frame, where the `Ident` arm borrows a live variable and has to.
+
+§11's list is meant to be one entry long. This was not on it, because
+nothing built the shape — every handler in the corpus was a literal or a
+name until a library started composing them.
+
+Found by writing `packages/log`, whose `both(a, b)` takes two handlers and
+answers a third.
+
+**Gate**: `scripts/nativegaps.sh`, "a handler a call answers, in an
+argument". Reverting the fallback turns it from compiled to refused, and the
+gate says the list is out of date.
+
+## F74 — a match whose live arms all yield nothing could not be typed (S3, backend) — **fixed**
+
+```
+match o {
+    None -> return "none"
+    Some(v) -> {
+        match word {
+            "a" -> m.set("k", true)
+            _ -> m.set("k", false)
+        }
+    }
+}
+error: a match here whose arms it cannot type
+```
+
+The inner match is a *statement* match: every arm calls something that
+yields nothing, so the match is worth `()`. `probe_type` skipped every unit
+arm looking for one that said more — which is right, and is why a mixed
+match works — and then refused when it found none, instead of answering
+`Unit`. So a block ending in one could not be typed, and the enclosing match
+failed about an arm that was plainly unit.
+
+It now answers `Unit` when every live arm was typed and all of them were
+unit. An arm the probe *could not read* is tracked separately and still
+refuses: turning that into `Unit` would trade a refusal for a wrong type,
+which is the worse of the two.
+
+Fifth finding where the probe knew less than the lowering about a shape the
+lowering handles — F48, F53, F67 and F52 are the others, and each was one
+step from the answer rather than far from it.
+
+Found by writing `packages/cli`, whose flag parser is `match kind { Switch ->
+… set a switch … _ -> … set a value … }`.
+
+**Gate**: `scripts/nativegaps.sh`, "a match whose live arms all yield
+nothing". Reverting the probe turns it from compiled to refused.
+
+## F75 — a call into another module could not be typed where the type had to be worked out (S3, backend) — **fixed**
+
+```
+far.suite("assertions", [
+    far.eq("one", 2, 2),
+])
+error: native backend does not yet support `.eq()` on a receiver whose type
+is not known here
+```
+
+`utils.helper(x)` parses as a method call on the alias, and the *lowering*
+resolves it — it has done since packages existed. `probe_type` did not, so a
+qualified call fell through to the builtin method table and was refused with
+a message naming a **module** as a receiver.
+
+It only showed where the probe has to run at all. `let c = far.eq(…)`
+compiled, because the type comes from the call. The identical call as an
+element of a list literal did not, because there the element type has to be
+worked out before the elements are built.
+
+The probe now resolves the alias the way the lowering does, and instantiates
+a generic the same way — a generic has no signature until the call site fixes
+its parameters, exactly as it has no symbol.
+
+Sixth finding where the probe knew less than the lowering, and the fourth
+this session. The pattern is stable enough to state: the lowering learns a
+resolution rule, the probe does not, and the gap appears only in positions
+where the type is inferred rather than read. Every one of those positions is
+a list element, a match arm, a `??`, or an argument.
+
+Found by writing `packages/testing`, whose assertions are gathered into a
+list and handed to `suite`.
+
+**Gate**: `scripts/fuzz_modules.py`, "generic call from another module, as a
+list element" — the shape needs two modules, which `nativegaps.sh` cannot
+build. Removing the probe arm turns three of its 72 programs from passing to
+refused.
+
+## F76 — two gates counted the programs they had not checked, and passed (S2, tests) — **fixed**
+
+```
+difftest         PASS  identical: 241   mismatched: 0   unsupported: 1
+leakcheck        PASS  leak-free: 241   leaking: 0   not compiled: 1
+```
+
+Both lines are true and both gates are green, and one program in the corpus
+had stopped compiling. F75's fix matched every `alias.name(...)` as a call
+into another module, which caught `shapes.Circle(2.0)` — a variant
+constructor of a sum declared elsewhere — and refused it. `examples/multi`
+went from *checked* to *skipped*, and nothing said so.
+
+`difftest.sh` did list the skips, after the summary. `allgates.sh` prints one
+line per gate and reads only `$?`, on purpose — so the listing had no reader,
+and the exit code did not carry it. `leakcheck.sh` did not even list them.
+
+§11's gap list is one entry long and no program in the corpus is on it. A
+program the backend declines is therefore a defect, not a fact about the
+language, and both gates now say which and exit 1. `crosstest.sh` has done
+this since the same mistake was made there.
+
+The shape is one this repository keeps finding in its own tools: a count
+that is printed and not acted on. F25 was three checks that had never run,
+F40 was eleven cases calling a helper that did not exist, F47 was a gate
+whose summary said "identical: 184 mismatched: 0" while it exited 1. Here it
+is the other way round — the summary was right and the *exit code* was
+wrong.
+
+**Gate**: both, verified by putting a program the backend cannot compile
+(polymorphic recursion) into `examples/` and confirming each turns from
+PASS to FAIL and names it.
+
+The regression itself is fixed too: the probe arm's guard now requires that
+the name really is a function in the target module, so a variant
+constructor, a struct name or anything else falls through to the arms that
+handle it.

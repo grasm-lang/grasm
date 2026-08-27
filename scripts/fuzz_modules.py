@@ -85,6 +85,10 @@ pub fn pair[A, B](a: A, b: B) -> (A, B) {
     (a, b)
 }
 
+pub fn total(xs: [i64]) -> i64 {
+    xs.sum()
+}
+
 // Performed here, handled by whoever calls it. [T-CAPABILITY] counts what is
 // left in a `pub` row for a consumer to handle, so `Cfg` is in this package's
 // ceiling -- which the second round below checks in both directions.
@@ -217,6 +221,9 @@ let answer = p.0 * 2"""),
      """""",
      """let t: Thing = far.same(far.make(21))
 let answer = t.n * 2"""),
+    ('generic call from another module, as a list element',
+     """""",
+     """let answer = far.total([far.same(21), far.same(0)]) * 2"""),
     ('effect performed in another module',
      """""",
      """var answer = 0
@@ -277,10 +284,12 @@ def tree(work, where, decls, stmts):
               "pub fn boxed(n: i64) -> Box[i64] {\n    far.boxed(n)\n}\n"
               "pub fn same[T](v: T) -> T {\n    far.same(v)\n}\n"
               "pub fn pair[A, B](a: A, b: B) -> (A, B) {\n    far.pair(a, b)\n}\n"
+              "pub fn total(xs: [i64]) -> i64 {\n    far.total(xs)\n}\n"
               "pub fn deep() -> i64 / {Cfg} {\n    far.deep()\n}\n", ["io", "Cfg"])
         reroute = lambda t: (t.replace("far.make", "mid.source").replace("far.boxed", "mid.boxed")
                              .replace("far.same", "mid.same").replace("far.pair", "mid.pair")
-                             .replace("far.deep", "mid.deep"))
+                             .replace("far.deep", "mid.deep")
+                             .replace("far.total", "mid.total"))
         write(work, "app", ["mid"],
               "import mid\n\n" + reroute(decls.strip("\n")) + "\n\nfn main() {\n"
               + ind(reroute(stmts)) + '\n    print("{answer}")\n}\n', ["io"])

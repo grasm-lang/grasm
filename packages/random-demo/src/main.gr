@@ -1,0 +1,126 @@
+// The `random` package. Every number here is determined by its seed, so three
+// engines print the same stream — which is the property the package exists
+// for, and the one a demo full of unpredictable numbers could not show.
+import random
+
+fn main() {
+    print("-- the same seed gives the same stream")
+    var a = random.seeded(42)
+    var b = random.seeded(42)
+    var same = true
+    for _i in 0..100 {
+        if random.next(a) != random.next(b) {
+            same = false
+        }
+    }
+    print("  100 draws identical: {same}")
+
+    print("-- a different seed does not")
+    var c = random.seeded(42)
+    var d = random.seeded(43)
+    var differs = 0
+    for _i in 0..100 {
+        if random.next(c) != random.next(d) {
+            differs = differs + 1
+        }
+    }
+    print("  of 100 draws, {differs} differ")
+
+    print("-- the first eight words of seed 1")
+    var r = random.seeded(1)
+    var words: [i64] = []
+    for _i in 0..8 {
+        words.push(random.next(r))
+    }
+    for w in words {
+        print("  {w}")
+    }
+
+    print("-- below(n) stays in range and covers it")
+    var g = random.seeded(7)
+    var counts = [0, 0, 0, 0, 0, 0]
+    var out_of_range = 0
+    for _i in 0..6000 {
+        let v = random.below(g, 6)
+        if v < 0 or v > 5 {
+            out_of_range = out_of_range + 1
+        } else {
+            counts[v] = counts[v] + 1
+        }
+    }
+    print("  6000 draws of a die: {counts}  sum {counts.sum()}  out of range {out_of_range}")
+    // A fair die over 6000 draws sits near 1000 each. The bound is loose on
+    // purpose: this is checking that nothing is *systematically* skewed, not
+    // running a statistical test.
+    let low = counts.min() ?? 0
+    let high = counts.max() ?? 0
+    print("  spread {high - low} — within 200 of fair: {high - low < 200}")
+
+    print("-- how much of the range is rejected, which is 2^64 mod n")
+    for n in [1, 2, 3, 6, 10, 100, 1000] {
+        print("  n={n}: {random.bias_threshold(n)}")
+    }
+
+    print("-- below(0) and below(-1)")
+    print("  {random.below(g, 0)} {random.below(g, -1)}")
+
+    print("-- between")
+    var h = random.seeded(99)
+    var seen: [i64] = []
+    for _i in 0..10 {
+        seen.push(random.between(h, 10, 20))
+    }
+    print("  {seen}")
+    print("  all in 10..20: {seen.all(|v| v >= 10 and v < 20)}")
+    print("  a backwards range: {random.between(h, 5, 5)} {random.between(h, 9, 2)}")
+
+    print("-- unit is in 0..1")
+    var u = random.seeded(3)
+    var floats: [f64] = []
+    var outside = 0
+    for _i in 0..1000 {
+        let v = random.unit(u)
+        if v < 0.0 or v >= 1.0 {
+            outside = outside + 1
+        }
+        if floats.len() < 4 {
+            floats.push(v)
+        }
+    }
+    print("  first four: {floats}")
+    print("  1000 draws outside 0..1: {outside}")
+
+    print("-- bytes")
+    var bg = random.seeded(5)
+    let bs = random.bytes_of_length(bg, 12)
+    print("  12 bytes: {bs.to_list()}")
+    print("  every one a byte: {bs.to_list().all(|v| v >= 0 and v <= 255)}")
+    print("  none at all: {random.bytes_of_length(bg, 0).len()}")
+
+    print("-- shuffled keeps every element")
+    var sg = random.seeded(11)
+    let xs = [1, 2, 3, 4, 5, 6, 7, 8]
+    let ys = random.shuffled(sg, xs)
+    var sorted_back = ys
+    sorted_back.sort()
+    print("  {xs} -> {ys}")
+    print("  same elements: {sorted_back == xs}")
+    let nothing: [i64] = []
+    print("  a list of one: {random.shuffled(sg, [1])}  and none: {random.shuffled(sg, nothing)}")
+
+    print("-- choice")
+    var cg = random.seeded(13)
+    var picks: [str] = []
+    for _i in 0..6 {
+        picks.push(random.choice(cg, ["a", "b", "c"]) ?? "(none)")
+    }
+    print("  {picks}")
+    print("  from nothing: {random.choice(cg, nothing) ?? -1}")
+
+    print("-- the unsigned arithmetic underneath")
+    print("  unsigned_less(-1, 1): {random.unsigned_less(0 - 1, 1)}")
+    print("  unsigned_less(1, -1): {random.unsigned_less(1, 0 - 1)}")
+    print("  unsigned_less(-2, -1): {random.unsigned_less(0 - 2, 0 - 1)}")
+    print("  unsigned_mod(-1, 10): {random.unsigned_mod(0 - 1, 10)}")
+    print("  unsigned_mod(10, 10): {random.unsigned_mod(10, 10)}")
+}

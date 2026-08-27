@@ -1,0 +1,175 @@
+// Random numbers, deterministic by default.
+//
+// `random_bytes` performs `io` and is unpredictable, which is what a key wants
+// and the opposite of what a test wants. This is the other one: seeded,
+// reproducible, and declaring nothing — so a program that shuffles a list does
+// not thereby acquire the ability to read the operating system's entropy pool,
+// and a failing test can be run again and fail the same way.
+//
+// splitmix64 for seeding and xoshiro256** for the stream. Both are small,
+// both pass the usual statistical batteries, and neither is a cryptographic
+// generator: `key`, `token` and anything else an attacker gets to see must
+// come from `random_bytes`, not from here. That is said once, here, because a
+// generator that is fast and reproducible is exactly the one somebody reaches
+// for by mistake.
+
+type Rng = { s0: i64, s1: i64, s2: i64, s3: i64 }
+
+// `i64` is signed and these algorithms are defined on unsigned words. Every
+// operation below is either a bit operation, which does not care, or a shift
+// written as `ushr` rather than `shr`, which is the one place it does.
+fn splitmix(inout seed: i64) -> i64 {
+    seed = seed + 0x9e3779b97f4a7c15
+    var z = seed
+    z = (z.bit_xor(z.ushr(30))) * 0xbf58476d1ce4e5b9
+    z = (z.bit_xor(z.ushr(27))) * 0x94d049bb133111eb
+    z.bit_xor(z.ushr(31))
+}
+
+/// A generator from a seed. The same seed gives the same stream, on every
+/// engine and every machine — which is the whole point, and is checked by the
+/// demo printing a stream three engines have to agree on.
+pub fn seeded(seed: i64) -> Rng {
+    var s = seed
+    let a = splitmix(s)
+    let b = splitmix(s)
+    let c = splitmix(s)
+    let d = splitmix(s)
+    Rng{ s0: a, s1: b, s2: c, s3: d }
+}
+
+fn rotl(x: i64, k: i64) -> i64 {
+    x.shl(k).bit_or(x.ushr(64 - k))
+}
+
+/// The next word. Every other function here is built on this one.
+pub fn next(inout r: Rng) -> i64 {
+    let result = rotl(r.s1 * 5, 7) * 9
+    let t = r.s1.shl(17)
+    r.s2 = r.s2.bit_xor(r.s0)
+    r.s3 = r.s3.bit_xor(r.s1)
+    r.s1 = r.s1.bit_xor(r.s2)
+    r.s0 = r.s0.bit_xor(r.s3)
+    r.s2 = r.s2.bit_xor(t)
+    r.s3 = rotl(r.s3, 45)
+    result
+}
+
+/// A number in `0..n`, without modulo bias.
+///
+/// `next() % n` is one character shorter and is not uniform unless `n` divides
+/// 2^64: the low values come up more often, by as much as one part in
+/// `2^64 / n`. Lemire's method rejects the short tail instead, which costs a
+/// second draw about `n / 2^64` of the time — never, in practice.
+pub fn below(inout r: Rng, n: i64) -> i64 {
+    if n <= 0 {
+        return 0
+    }
+    // 2^64 mod n. `0 - n` is the bit pattern 2^64 - n, and reading *that* as
+    // unsigned and taking it mod n gives what is wanted. Writing it as
+    // `(0 - n) % n` in signed arithmetic is always 0, which makes the loop
+    // below reject nothing and leaves the bias this function exists to remove.
+    let limit = bias_threshold(n)
+    var v = next(r)
+    while unsigned_less(v, limit) {
+        v = next(r)
+    }
+    unsigned_mod(v, n)
+}
+
+/// How much of the 64-bit range has to be thrown away for `below(n)` to be
+/// uniform: 2^64 mod n.
+///
+/// Exported because it is the one part of the rejection that has a value a
+/// test can check. Written the obvious way — `(0 - n) % n` in signed
+/// arithmetic — it is always zero, the loop rejects nothing, and the bias
+/// stays; and nothing about the numbers coming out would look wrong.
+pub fn bias_threshold(n: i64) -> i64 {
+    if n <= 0 {
+        return 0
+    }
+    unsigned_mod(0 - n, n)
+}
+
+/// `a` up to but excluding `b`. An empty or backwards range answers `a`.
+pub fn between(inout r: Rng, a: i64, b: i64) -> i64 {
+    if b <= a {
+        return a
+    }
+    a + below(r, b - a)
+}
+
+pub fn boolean(inout r: Rng) -> bool {
+    next(r).bit_and(1) == 1
+}
+
+/// A float in `0.0..1.0`, from the top 53 bits — the number of bits an `f64`
+/// actually has. Taking the low bits instead gives a value whose spacing is
+/// wrong at the small end.
+pub fn unit(inout r: Rng) -> f64 {
+    next(r).ushr(11).as_f64() * (1.0 / 9007199254740992.0)
+}
+
+pub fn bytes_of_length(inout r: Rng, n: i64) -> bytes {
+    var out: [i64] = []
+    var have = 0
+    var word = 0
+    for _i in 0..n {
+        if have == 0 {
+            word = next(r)
+            have = 8
+        }
+        out.push(word.bit_and(255))
+        word = word.ushr(8)
+        have = have - 1
+    }
+    bytes_of(out)
+}
+
+/// A list in a new order, by Fisher-Yates from the end. Going the other way
+/// — picking each position from the whole list — is the classic mistake: it
+/// produces `n^n` equally likely runs over `n!` orders, so some orders come up
+/// more often than others.
+pub fn shuffled[T](inout r: Rng, xs: [T]) -> [T] {
+    var out = xs
+    var i = out.len() - 1
+    while i > 0 {
+        let j = below(r, i + 1)
+        let tmp = out[i]
+        out[i] = out[j]
+        out[j] = tmp
+        i = i - 1
+    }
+    out
+}
+
+/// One element, or `None` from an empty list.
+pub fn choice[T](inout r: Rng, xs: [T]) -> Option[T] {
+    if xs.is_empty() {
+        return None
+    }
+    Some(xs[below(r, xs.len())])
+}
+
+// --- the unsigned arithmetic the above needs -------------------------------
+
+/// `a < b` with both read as unsigned.
+pub fn unsigned_less(a: i64, b: i64) -> bool {
+    if (a < 0) == (b < 0) {
+        return a < b
+    }
+    // Exactly one has the top bit set, and that one is the larger unsigned —
+    // so `a < b` holds exactly when `b` is the one with it.
+    b < 0
+}
+
+/// `a % n` with `a` read as unsigned and `n` positive.
+pub fn unsigned_mod(a: i64, n: i64) -> i64 {
+    if a >= 0 {
+        return a % n
+    }
+    // Split the value so neither half overflows: 2^63 mod n, plus the rest.
+    let low = a.bit_and(0x7fffffffffffffff)
+    let high = (0x7fffffffffffffff % n + 1) % n
+    (high + low % n) % n
+}

@@ -1,0 +1,177 @@
+// CSV, the awkward parts included.
+//
+// The naive parser is `text.lines()` then `line.split(",")`, and it is wrong
+// for every file anyone has ever exported from a spreadsheet: a field may be
+// quoted, a quoted field may contain the separator, a newline, or a quote
+// written as two quotes. Splitting first destroys all three before the parser
+// has a chance.
+//
+// So this reads character by character, and the state it carries is exactly
+// "am I inside quotes". RFC 4180 with the usual concessions: `\r\n` and `\n`
+// both end a record, a final newline is optional, and the separator is a
+// parameter because half the world exports semicolons.
+
+type Bad = { why: str, row: i64, column: i64 }
+
+/// Rows of fields. A blank line is a row with one empty field, which is what
+/// it is — dropping it silently is how a row count stops matching the file.
+pub fn parse(text: str) -> [[str]] ! Bad {
+    try parse_with(text, ",")
+}
+
+pub fn parse_with(text: str, separator: str) -> [[str]] ! Bad {
+    if separator.len() != 1 {
+        fail(Bad{ why: "the separator must be one character", row: 0, column: 0 })
+    }
+    var rows: [[str]] = []
+    var row: [str] = []
+    var field = ""
+    var quoted = false
+    var any = false
+    var line = 1
+    var column = 1
+    let cs = text.chars()
+    var i = 0
+    while i < cs.len() {
+        let c = cs[i]
+        if quoted {
+            if c == "\"" {
+                if i + 1 < cs.len() and cs[i + 1] == "\"" {
+                    field = field + "\""
+                    i = i + 2
+                    column = column + 2
+                    continue
+                }
+                quoted = false
+                i = i + 1
+                column = column + 1
+                continue
+            }
+            if c == "\n" {
+                line = line + 1
+                column = 1
+            } else {
+                column = column + 1
+            }
+            field = field + c
+            i = i + 1
+            continue
+        }
+        if c == "\"" {
+            if not field.is_empty() {
+                fail(Bad{ why: "a quote in the middle of an unquoted field",
+                          row: line, column: column })
+            }
+            quoted = true
+            any = true
+            i = i + 1
+            column = column + 1
+            continue
+        }
+        if c == separator {
+            row.push(field)
+            field = ""
+            any = true
+            i = i + 1
+            column = column + 1
+            continue
+        }
+        if c == "\r" or c == "\n" {
+            if c == "\r" and i + 1 < cs.len() and cs[i + 1] == "\n" {
+                i = i + 1
+            }
+            row.push(field)
+            rows.push(row)
+            row = []
+            field = ""
+            any = false
+            i = i + 1
+            line = line + 1
+            column = 1
+            continue
+        }
+        field = field + c
+        any = true
+        i = i + 1
+        column = column + 1
+    }
+    if quoted {
+        fail(Bad{ why: "the file ends inside a quoted field", row: line, column: column })
+    }
+    // A trailing newline ends the last record; without one, whatever has been
+    // gathered is still a record.
+    if any or not field.is_empty() or not row.is_empty() {
+        row.push(field)
+        rows.push(row)
+    }
+    rows
+}
+
+/// A field quoted only when it has to be: a separator, a quote, a carriage
+/// return or a newline in it, or leading or trailing space that would
+/// otherwise be lost.
+pub fn render_field(v: str, separator: str) -> str {
+    let needs = v.contains(separator) or v.contains("\"") or v.contains("\n") or
+        v.contains("\r") or v.starts_with(" ") or v.ends_with(" ")
+    if not needs {
+        return v
+    }
+    "\"" + v.replace("\"", "\"\"") + "\""
+}
+
+pub fn render(rows: [[str]]) -> str {
+    render_with(rows, ",")
+}
+
+/// `\r\n` between records, which is what RFC 4180 says and what a spreadsheet
+/// expects; a final one, so appending another file to this one works.
+pub fn render_with(rows: [[str]], separator: str) -> str {
+    var out = ""
+    for row in rows {
+        var parts: [str] = []
+        for v in row {
+            parts.push(render_field(v, separator))
+        }
+        out = out + parts.join(separator) + "\r\n"
+    }
+    out
+}
+
+// --- headers ---------------------------------------------------------------
+
+/// Rows keyed by the first row's names.
+///
+/// A short row leaves the missing keys absent rather than empty, because
+/// "no value" and "the empty value" are different answers and a CSV can
+/// carry both. A long one keeps the extra fields under their index.
+pub fn with_header(rows: [[str]]) -> [Map[str, str]] {
+    if rows.is_empty() {
+        return []
+    }
+    let names = rows[0]
+    var out: [Map[str, str]] = []
+    for r in 1..rows.len() {
+        var m = map()
+        for c in 0..rows[r].len() {
+            let key = if c < names.len() { names[c] } else { "{c}" }
+            m.set(key, rows[r][c])
+        }
+        out.push(m)
+    }
+    out
+}
+
+/// The other direction: a header row from the names given, then a row per map.
+/// A name a map does not have becomes an empty field, so every row has the
+/// same width — which is what makes the output readable by anything.
+pub fn from_maps(names: [str], entries: [Map[str, str]]) -> [[str]] {
+    var rows: [[str]] = [names]
+    for e in entries {
+        var row: [str] = []
+        for n in names {
+            row.push(e.get(n) ?? "")
+        }
+        rows.push(row)
+    }
+    rows
+}

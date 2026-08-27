@@ -1,0 +1,7 @@
+[package]
+name = "bytes_codec"
+version = "1.0.0"
+entry = "src/main.gr"
+
+# Bytes in, text out, and back. It opens nothing, so it declares nothing.
+capabilities = []

@@ -1,0 +1,13 @@
+[package]
+name = "uuid"
+version = "1.0.0"
+entry = "src/main.gr"
+
+# Sixteen bytes and their text. The entropy comes in as an argument, so this
+# declares nothing and a program that makes identifiers does not thereby
+# acquire the ability to read the operating system's entropy pool.
+capabilities = []
+
+[dependencies.random]
+path = "../random"
+version = "^1.0.0"

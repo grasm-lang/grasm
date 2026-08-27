@@ -170,6 +170,45 @@ fn main() {
     print("{h}")
 }'
 
+expect_compiled "a handler a call answers, in an argument" 'effect Cfg {
+    fn value() -> i64
+}
+fn from_ref(slot: ref i64) -> CfgHandler {
+    CfgHandler{ value: || slot.value }
+}
+fn wrap(a: CfgHandler) -> CfgHandler {
+    CfgHandler{ value: || {
+        var n = 0
+        with Cfg handled_by a {
+            n = Cfg.value()
+        }
+        n * 2
+    } }
+}
+fn main() {
+    let x = ref(21)
+    with Cfg handled_by wrap(from_ref(x)) {
+        print("{Cfg.value()}")
+    }
+}'
+
+expect_compiled "a match whose live arms all yield nothing" 'fn go(o: Option[i64], word: str) -> str {
+    var m = map()
+    match o {
+        None -> return "none"
+        Some(v) -> {
+            match word {
+                "a" -> m.set("k", true)
+                _ -> m.set("k", false)
+            }
+        }
+    }
+    "{m.get("k") ?? false}"
+}
+fn main() {
+    print("{go(Some(1), "a")} {go(Some(1), "z")} {go(None, "a")}")
+}'
+
 expect_compiled "a generic instantiated at a handler type" 'effect Clock {
     fn now() -> i64
 }

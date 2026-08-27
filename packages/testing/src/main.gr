@@ -1,0 +1,196 @@
+// A test suite that is a value.
+//
+// `test` blocks are in the language and `grasm test` runs them. What is
+// missing is everything that makes a hundred of them legible: a table of cases
+// rather than a hundred blocks, a comparison that says what differed rather
+// than that something did, and a report a person reads without counting.
+//
+// A case is a *value*, so a test is an ordinary function that answers one.
+// That means a table-driven test is a `for` loop, a helper that builds cases
+// is an ordinary function, and none of it needs the runner's cooperation.
+//
+// This declares nothing. A test that reads a file or dials something is doing
+// that in the consumer's code, where the ceiling can see it.
+
+type Case = { name: str, ok: bool, detail: str }
+
+type Suite = { name: str, cases: [Case] }
+
+pub fn passed(name: str) -> Case {
+    Case{ name: name, ok: true, detail: "" }
+}
+
+pub fn failed(name: str, detail: str) -> Case {
+    Case{ name: name, ok: false, detail: detail }
+}
+
+/// The general one: a condition and what to say when it does not hold.
+pub fn check(name: str, ok: bool, detail: str) -> Case {
+    if ok {
+        return passed(name)
+    }
+    failed(name, detail)
+}
+
+/// Equality, for any type. Structural, as `==` is, and the failure says both
+/// values rather than "not equal" — the second is a fact the reader already
+/// had.
+pub fn eq[T](name: str, got: T, want: T) -> Case {
+    if got == want {
+        return passed(name)
+    }
+    failed(name, "wanted {want}, got {got}")
+}
+
+pub fn not_eq[T](name: str, got: T, unwanted: T) -> Case {
+    if got != unwanted {
+        return passed(name)
+    }
+    failed(name, "did not want {unwanted}, and got it")
+}
+
+pub fn is_true(name: str, got: bool) -> Case {
+    check(name, got, "wanted true, got false")
+}
+
+pub fn is_false(name: str, got: bool) -> Case {
+    check(name, not got, "wanted false, got true")
+}
+
+/// Floats, within a tolerance.
+///
+/// `==` on two floats is a question almost nobody means to ask: `0.1 + 0.2` is
+/// not `0.3`, and a test that asserts it is testing the arithmetic rather than
+/// the program. The tolerance is a parameter because how close is close
+/// enough is the caller's to know.
+pub fn near(name: str, got: f64, want: f64, tolerance: f64) -> Case {
+    if (got - want).abs() <= tolerance {
+        return passed(name)
+    }
+    failed(name, "wanted {want} within {tolerance}, got {got} (off by {(got - want).abs()})")
+}
+
+pub fn contains(name: str, haystack: str, needle: str) -> Case {
+    if haystack.contains(needle) {
+        return passed(name)
+    }
+    failed(name, "wanted text containing \"{needle}\", got \"{haystack}\"")
+}
+
+/// A value that should be present, and is.
+pub fn some[T](name: str, got: Option[T]) -> Case {
+    check(name, got.is_some(), "wanted a value, got none")
+}
+
+pub fn none[T](name: str, got: Option[T]) -> Case {
+    check(name, got.is_none(), "wanted none, got a value")
+}
+
+// --- golden comparison -----------------------------------------------------
+
+/// Two blocks of text, with the first line that differs named.
+///
+/// "output did not match" sends the reader to a diff tool. This says which
+/// line, what was there and what was wanted, and — when the difference is
+/// inside a line — which column, because two lines that differ in a trailing
+/// space look identical in a terminal.
+pub fn golden(name: str, got: str, want: str) -> Case {
+    if got == want {
+        return passed(name)
+    }
+    let g = got.lines()
+    let w = want.lines()
+    var i = 0
+    while i < g.len() and i < w.len() {
+        if g[i] != w[i] {
+            return failed(name, "line {i + 1}{column_of(g[i], w[i])}:\n"
+                + "      wanted: {show(w[i])}\n"
+                + "         got: {show(g[i])}")
+        }
+        i = i + 1
+    }
+    if g.len() > w.len() {
+        return failed(name, "{g.len() - w.len()} line(s) too many, from line {w.len() + 1}:\n"
+            + "         got: {show(g[w.len()])}")
+    }
+    failed(name, "{w.len() - g.len()} line(s) missing, from line {g.len() + 1}:\n"
+        + "      wanted: {show(w[g.len()])}")
+}
+
+fn column_of(a: str, b: str) -> str {
+    let ac = a.chars()
+    let bc = b.chars()
+    var i = 0
+    while i < ac.len() and i < bc.len() {
+        if ac[i] != bc[i] {
+            return ", column {i + 1}"
+        }
+        i = i + 1
+    }
+    ", column {ac.len().min(bc.len()) + 1}"
+}
+
+/// A line with its whitespace made visible, because a trailing space is the
+/// difference a terminal hides.
+fn show(line: str) -> str {
+    "\"" + line.replace("\t", "\\t") + "\""
+}
+
+// --- suites ----------------------------------------------------------------
+
+pub fn suite(name: str, cases: [Case]) -> Suite {
+    Suite{ name: name, cases: cases }
+}
+
+pub fn failures(s: Suite) -> [Case] {
+    s.cases.filter(|c| not c.ok)
+}
+
+pub fn count_failed(suites: [Suite]) -> i64 {
+    var n = 0
+    for s in suites {
+        n = n + failures(s).len()
+    }
+    n
+}
+
+pub fn count_run(suites: [Suite]) -> i64 {
+    var n = 0
+    for s in suites {
+        n = n + s.cases.len()
+    }
+    n
+}
+
+/// The report. Passing cases are counted, not listed: a hundred lines saying
+/// `ok` is a hundred lines nobody reads, and the one that says `FAIL` is then
+/// somewhere in the middle of them.
+pub fn report(suites: [Suite]) -> str {
+    var out: [str] = []
+    for s in suites {
+        let bad = failures(s)
+        if bad.is_empty() {
+            out.push("ok    {s.name}  ({s.cases.len()} case(s))")
+            continue
+        }
+        out.push("FAIL  {s.name}  ({bad.len()} of {s.cases.len()} failed)")
+        for c in bad {
+            out.push("      - {c.name}: {c.detail}")
+        }
+    }
+    let run = count_run(suites)
+    let bad = count_failed(suites)
+    if bad == 0 {
+        out.push("")
+        out.push("{run} case(s), all passed")
+    } else {
+        out.push("")
+        out.push("{run} case(s), {bad} failed")
+    }
+    out.join("\n")
+}
+
+/// The exit code a runner should use: 0 when everything passed, 1 otherwise.
+pub fn exit_code(suites: [Suite]) -> i64 {
+    if count_failed(suites) == 0 { 0 } else { 1 }
+}

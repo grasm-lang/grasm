@@ -81,6 +81,7 @@ fi
 clean=0
 leaked=0
 skipped=0
+declare -a SKIPPED=()
 declare -a LEAKS=()
 
 programs=$(corpus_programs)
@@ -90,8 +91,13 @@ for src in $programs; do
     grep -q '^//! expect: error$' "$src" && continue
     name=$(echo "$src" | tr '/.' '__')
     bin="$WORK/$name"
-    if ! "$GRASM" build "$src" --native -o "$bin" >/dev/null 2>&1; then
+    if ! build_log=$("$GRASM" build "$src" --native -o "$bin" 2>&1); then
+        # Counted and passed over in silence, so a program that stopped
+        # compiling moved from "leak-free" to "not compiled" and the gate
+        # still said PASS — about a program it had not run (F76).
         skipped=$((skipped + 1))
+        reason=$(echo "$build_log" | grep -o "does not yet support [^—]*" | head -1)
+        SKIPPED+=("$src — ${reason:-$(echo "$build_log" | head -1)}")
         continue
     fi
     err=$(GRASM_LEAK_CHECK=1 "$bin" 2>&1 >/dev/null)
@@ -139,5 +145,15 @@ if [ "$leaked" -gt 0 ]; then
     fi
     echo
     echo "All of them are known. No new leak."
+fi
+
+# A program that did not compile is a program this gate did not run. §11's
+# list is one entry long and nothing in the corpus is on it, so a skip is a
+# defect rather than a fact about the language.
+if [ "$skipped" -gt 0 ]; then
+    echo
+    echo "the native backend declined these, so they were never run:"
+    printf '  %s\n' "${SKIPPED[@]}"
+    exit 1
 fi
 exit 0

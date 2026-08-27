@@ -1,0 +1,87 @@
+// The `csv` package. Every case here is one a spreadsheet actually exports.
+import csv
+
+fn show(label: str, text: str) {
+    match csv.parse(text) {
+        Ok(rows) -> {
+            var shapes: [i64] = []
+            for r in rows {
+                shapes.push(r.len())
+            }
+            print("  {label}: {rows.len()} rows, widths {shapes}")
+            for r in rows {
+                print("      {r}")
+            }
+        }
+        Err(e) -> print("  {label}: refused -- {e.why} at row {e.row} column {e.column}")
+    }
+}
+
+fn main() {
+    print("-- ordinary")
+    show("one row", "a,b,c")
+    show("two rows", "a,b\r\n1,2\r\n")
+    show("unix newlines", "a,b\n1,2\n")
+    show("no trailing newline", "a,b\n1,2")
+    show("empty fields", "a,,c")
+    show("an empty line", "a,b\n\nc,d")
+    show("ragged", "a,b,c\n1,2")
+    show("nothing at all", "")
+
+    print("-- quoted")
+    show("a quoted field", "\"a\",b")
+    show("a separator inside quotes", "\"a,b\",c")
+    show("a newline inside quotes", "\"line one\nline two\",c")
+    show("a quote inside quotes", "\"say \"\"hi\"\"\",c")
+    show("quoted empty", "\"\",b")
+    show("space kept by quoting", "\"  padded  \",b")
+
+    print("-- refused")
+    show("ends inside a quote", "\"unterminated,b")
+    show("a quote mid-field", "ab\"cd,e")
+
+    print("-- other separators")
+    match csv.parse_with("a;b;c\n1;2;3", ";") {
+        Ok(rows) -> print("  semicolons: {rows}")
+        Err(e) -> print("  semicolons: refused -- {e.why}")
+    }
+    match csv.parse_with("a,b", ",,") {
+        Ok(rows) -> print("  a two-character separator: {rows}")
+        Err(e) -> print("  a two-character separator: refused -- {e.why}")
+    }
+
+    print("-- rendering")
+    let rows = [
+        ["name", "note", "amount"],
+        ["plain", "nothing special", "1"],
+        ["comma", "a,b", "2"],
+        ["quote", "say \"hi\"", "3"],
+        ["newline", "line one\nline two", "4"],
+        ["padded", "  spaces  ", "5"],
+        ["empty", "", "6"],
+    ]
+    let text = csv.render(rows)
+    print("  rendered:")
+    for line in text.split("\r\n") {
+        if not line.is_empty() {
+            print("      {line}")
+        }
+    }
+    match csv.parse(text) {
+        Ok(back) -> print("  round trip: {back == rows}")
+        Err(e) -> print("  round trip refused: {e.why}")
+    }
+
+    print("-- headers")
+    match csv.parse("name,age\nada,36\nbob,\ncarol,41,extra") {
+        Err(e) -> print("  refused: {e.why}")
+        Ok(parsed) -> {
+            let entries = csv.with_header(parsed)
+            for e in entries {
+                print("      name {e.get("name") ?? "(absent)"}  age {e.get("age") ?? "(absent)"}  extra {e.get("2") ?? "(absent)"}")
+            }
+            let back = csv.from_maps(["name", "age"], entries)
+            print("  back to rows: {back}")
+        }
+    }
+}

@@ -1,0 +1,8 @@
+[package]
+name = "url"
+version = "1.0.0"
+entry = "src/main.gr"
+
+# Text in, text out. Nothing here dials anything — that is `http_client`, and
+# it is a separate name a consumer has to ask for.
+capabilities = []

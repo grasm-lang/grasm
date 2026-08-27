@@ -12,12 +12,18 @@
 // by the compiler, and `http_server`, which does own the socket, is a
 // separate name a consumer has to ask for.
 //
+// Percent coding and query parsing are `url`'s, not a second copy here: the
+// two would drift, and the byte-versus-character mistake that F69 found is
+// exactly the kind that drifts back in.
+//
 // Content-Length is in **bytes**. `str.len()` counts characters, so a body
 // with one non-ASCII character in it frames short by however many extra bytes
 // that character takes, and a client reading exactly Content-Length bytes gets
 // a truncated body and a desynchronised connection. That bug is invisible to a
 // test whose bodies are all ASCII, and invisible again to a check that
 // measures the body the same wrong way.
+
+import url
 
 type Header = { name: str, value: str }
 
@@ -127,80 +133,14 @@ pub fn header(r: Request, name: str) -> Option[str] {
     None
 }
 
-/// One parameter out of a query string, percent-decoded.
+/// One parameter out of a query string, percent-decoded, `+` read as a space.
 pub fn query_param(q: str, name: str) -> Option[str] {
-    for pair in q.split("&") {
-        if pair.is_empty() {
-            continue
-        }
-        match pair.index_of("=") {
-            Some(at) -> {
-                if percent_decode(pair.substr(0, at)) == name {
-                    return Some(percent_decode(
-                        pair.substr(at + 1, pair.len() - at - 1)))
-                }
-            }
-            None -> {
-                if percent_decode(pair) == name {
-                    return Some("")
-                }
-            }
-        }
-    }
-    None
+    url.query_get(q, name)
 }
 
-fn hex_value(c: str) -> i64 {
-    let d = c.to_lower()
-    match d.parse_int_base(16) {
-        Some(v) -> v
-        None -> -1
-    }
-}
-
-/// `%20` and `+` back to what they stood for.
-///
-/// The decoding is done in **bytes**, not characters. A percent escape names
-/// one byte, and a non-ASCII character is several of them: `%C3%BC` is the two
-/// bytes of `\u00fc`, and turning each into its own character gives `\u00c3\u00bc`
-/// -- text that renders as mojibake and frames two bytes longer than it should.
-/// So the escapes are gathered as bytes and the text is decoded once, at the
-/// end, which is the only point at which a multi-byte character exists.
-///
-/// A `%` that is not followed by two hex digits is left alone rather than
-/// dropped, so nothing is silently lost from input somebody else chose.
+/// Percent decoding for a path, where `+` means itself.
 pub fn percent_decode(s: str) -> str {
-    if not s.contains("%") and not s.contains("+") {
-        return s
-    }
-    var out: [i64] = []
-    let cs = s.chars()
-    var i = 0
-    while i < cs.len() {
-        let c = cs[i]
-        if c == "+" {
-            out.push(32)
-            i = i + 1
-        } else if c == "%" and i + 2 < cs.len() {
-            let hi = hex_value(cs[i + 1])
-            let lo = hex_value(cs[i + 2])
-            if hi >= 0 and lo >= 0 {
-                out.push(hi * 16 + lo)
-                i = i + 3
-            } else {
-                for b in c.to_bytes().to_list() {
-                    out.push(b)
-                }
-                i = i + 1
-            }
-        } else {
-            for b in c.to_bytes().to_list() {
-                out.push(b)
-            }
-            i = i + 1
-        }
-    }
-    bytes_of(out).to_str()
+    url.decode(s)
 }
 
 /// Text that is about to sit inside HTML. Five characters, in this order:

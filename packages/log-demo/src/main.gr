@@ -1,0 +1,93 @@
+// Logging as an effect, and what that buys.
+//
+// `work` below declares `/ {Log}`. Not `io`. It logs from three calls deep and
+// it cannot print, cannot open a file, cannot reach the network — the compiler
+// says so, and the row is inferred from the body rather than promised in a
+// comment. Whether any of those things happens is decided by whoever installs
+// the handler, which is the line above each block.
+//
+// Everything printed here goes through `to_stdout`, because a demo three
+// engines have to agree on byte for byte cannot write half its output to
+// standard error.
+import log
+
+fn deep(n: i64) / {Log} {
+    log.at(Debug, "deep", [log.field_int("n", n)], 0)
+}
+
+fn middle(n: i64) / {Log} {
+    log.info("middle")
+    deep(n)
+}
+
+/// The whole point: a function that logs, declaring only that it logs.
+fn work(n: i64) -> i64 / {Log} {
+    log.info("starting")
+    middle(n)
+    if n > 2 {
+        log.at(Warn, "n is large", [log.field_int("n", n), log.field("unit", "widgets")], 0)
+    }
+    log.at(Error, "a message with \"quotes\" and spaces", [log.field("path", "/a b")], 0)
+    n * 2
+}
+
+fn main() {
+    print("-- text, everything")
+    with Log handled_by log.to_stdout(Trace) {
+        print("  answer {work(3)}")
+    }
+
+    print("-- text, warnings and above")
+    with Log handled_by log.to_stdout(Warn) {
+        print("  answer {work(3)}")
+    }
+
+    print("-- nothing at all")
+    with Log handled_by log.discarding() {
+        print("  answer {work(1)}")
+    }
+
+    print("-- collected into a list, which is what a test does")
+    let empty: [Record] = []
+    let sink = ref(empty)
+    with Log handled_by log.collecting(sink) {
+        work(5)
+    }
+    print("  {sink.value.len()} records")
+    for e in sink.value {
+        print("  {log.level_name(e.level)}: {e.message}  fields {e.fields.len()}")
+    }
+    let errors = sink.value.filter(|e| log.rank(e.level) >= log.rank(Warn))
+    print("  of those, {errors.len()} at warn or above")
+
+    print("-- the same records, rendered both ways")
+    for e in sink.value {
+        print("  text: {log.render_text(e)}")
+        print("  json: {log.render_json(e)}")
+    }
+
+    print("-- a record carrying a time")
+    let stamped = Record{
+        level: Info, message: "with a clock", fields: [log.field("k", "v")],
+        millis: 1787000645006,
+    }
+    print("  {log.render_text(stamped)}")
+    print("  {log.render_json(stamped)}")
+
+    print("-- two sinks at once")
+    let a = ref(empty)
+    let b = ref(empty)
+    with Log handled_by log.both(log.collecting(a), log.collecting(b)) {
+        log.info("said once")
+        log.warn("said once")
+    }
+    print("  first sink {a.value.len()}, second sink {b.value.len()}")
+
+    print("-- level names")
+    for name in ["trace", "DEBUG", "info", "Warn", "warning", "error", "fatal"] {
+        match log.level_from(name) {
+            Some(l) -> print("  \"{name}\" -> {log.level_name(l)} (rank {log.rank(l)})")
+            None -> print("  \"{name}\" -> not a level")
+        }
+    }
+}

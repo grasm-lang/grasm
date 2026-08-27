@@ -1,0 +1,86 @@
+// The `cli` package. The command lines below are written out here rather than
+// taken from `args()`, which is the point: a test can say exactly what was
+// typed, and three engines print the same thing.
+import cli
+
+fn spec() -> Command {
+    let build = cli.command("build", "compile a program",
+        [cli.text_flag("out", "o", "where to write it", "a.out"),
+         cli.switch_flag("native", "", "compile ahead of time"),
+         cli.repeated(cli.text_flag("define", "D", "a name to define", ""))],
+        [cli.positional("source", "the file to compile")])
+    let run = cli.command("run", "run a program",
+        [cli.number_flag("times", "n", "how many times", 1)],
+        [cli.positional("source", "the file to run"),
+         cli.rest_positional("args", "arguments for the program")])
+    cli.with_subcommands(
+        cli.command("tool", "a small example",
+            [cli.switch_flag("verbose", "v", "say more"),
+             cli.switch_flag("quiet", "q", "say less"),
+             cli.required(cli.text_flag("root", "r", "where to work", ""))],
+            []),
+        [build, run])
+}
+
+fn show(argv: [str]) {
+    let p = cli.parse(spec(), argv)
+    if not p.ok {
+        print("  {argv} -> refused: {p.why}")
+        return
+    }
+    var out = "  {argv} -> {p.path.join(" ")}"
+    out = out + "  verbose={cli.switch_of(p, "verbose")}"
+    out = out + " root={cli.text_of(p, "root")}"
+    if p.command == "build" {
+        out = out + " out={cli.text_of(p, "out")} native={cli.switch_of(p, "native")}"
+        out = out + " define={cli.all_of(p, "define")}"
+        out = out + " source={cli.positional_of(p, "source")}"
+    }
+    if p.command == "run" {
+        out = out + " times={cli.number_of(p, "times")}"
+        out = out + " source={cli.positional_of(p, "source")}"
+        out = out + " rest={p.rest}"
+    }
+    print(out)
+}
+
+fn main() {
+    print("-- the help page")
+    print(cli.help(spec()))
+    print("")
+    print(cli.help(spec().subcommands[0]))
+
+    print("")
+    print("-- parsing")
+    show(["--root", "/tmp", "build", "main.gr"])
+    show(["--root=/tmp", "build", "main.gr"])
+    show(["-r", "/tmp", "-v", "build", "-o", "prog", "--native", "main.gr"])
+    show(["-r/tmp", "build", "-oprog", "main.gr"])
+    show(["-vr", "/tmp", "build", "main.gr"])
+    show(["--root", "/tmp", "build", "-D", "A", "-D", "B", "--define=C", "main.gr"])
+    show(["--root", "/tmp", "run", "main.gr"])
+    show(["--root", "/tmp", "run", "-n", "3", "main.gr", "extra", "args"])
+    show(["--root", "/tmp", "run", "main.gr", "--", "--not-a-flag", "-x"])
+    show(["--root", "/tmp", "run", "main.gr", "-"])
+    show(["--verbose=false", "--root", "/tmp", "build", "main.gr"])
+
+    print("")
+    print("-- refused")
+    show([])
+    show(["build", "main.gr"])
+    show(["--root", "/tmp", "build"])
+    show(["--root", "/tmp", "walk", "main.gr"])
+    show(["--root", "/tmp", "--nope", "build", "main.gr"])
+    show(["--root", "/tmp", "-z", "build", "main.gr"])
+    show(["--root"])
+    show(["--root", "/tmp", "run", "-n", "many", "main.gr"])
+    show(["--root", "/tmp", "build", "--native=1", "main.gr"])
+    show(["--root", "/tmp", "--", "build", "main.gr"])
+    show(["--=x", "build"])
+
+    print("")
+    print("-- a global flag after the command, which is what everyone types")
+    show(["build", "--root", "/tmp", "main.gr"])
+    show(["build", "-v", "--root=/tmp", "main.gr"])
+    show(["--root", "/tmp", "build", "main.gr", "-v"])
+}

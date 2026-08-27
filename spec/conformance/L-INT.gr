@@ -1,6 +1,14 @@
 //! tag: L-INT
 //! expect: output
 //! 255 10 1000000
+//! -1 -9223372036854775808 9223372036854775807
+//! -7046029254386353131 -1
 fn main() {
     print("{0xFF} {0b1010} {1_000_000}")
+    // Hex and binary name a bit pattern, so the whole 64-bit range is
+    // writable and the top bit is not special. Every hash constant, mask and
+    // generator multiplier is published this way, and none of them fits in
+    // the non-negative half.
+    print("{0xffffffffffffffff} {0x8000000000000000} {0x7fffffffffffffff}")
+    print("{0x9e3779b97f4a7c15} {0b1111111111111111111111111111111111111111111111111111111111111111}")
 }

@@ -1,0 +1,204 @@
+// Paths, as arithmetic.
+//
+// Nothing here touches a disk. `normalise` resolves `.` and `..` textually and
+// answers what the path *means*, not what exists — which is a different
+// question and one only `fs` can ask. Keeping them apart is what lets a
+// program that joins paths declare nothing.
+//
+// Separator: `/` is the separator, and `\` is accepted on input and never
+// produced. A Grasm program runs on POSIX today; writing the Windows half of
+// this as a guess would be worse than not writing it, so what is here is the
+// half that is the same everywhere.
+
+pub fn is_absolute(p: str) -> bool {
+    p.starts_with("/")
+}
+
+fn parts_of(p: str) -> [str] {
+    var out: [str] = []
+    for seg in p.replace("\\", "/").split("/") {
+        if not seg.is_empty() {
+            out.push(seg)
+        }
+    }
+    out
+}
+
+/// Two paths joined. An absolute second argument replaces the first rather
+/// than being appended to it, which is what every other language's join does
+/// and what a caller passing user input is relying on.
+pub fn join(a: str, b: str) -> str {
+    if b.is_empty() {
+        return a
+    }
+    if is_absolute(b) or a.is_empty() {
+        return b
+    }
+    if a.ends_with("/") {
+        return a + b
+    }
+    a + "/" + b
+}
+
+pub fn join_all(parts: [str]) -> str {
+    var out = ""
+    for p in parts {
+        out = join(out, p)
+    }
+    out
+}
+
+/// `.` and `..` resolved, repeated and trailing separators removed.
+///
+/// A `..` that would climb above the root of an absolute path is dropped,
+/// because `/..` is `/`. On a relative path it is kept, because `../a` means
+/// something and there is nothing to climb above.
+pub fn normalise(p: str) -> str {
+    let absolute = is_absolute(p)
+    var out: [str] = []
+    for seg in parts_of(p) {
+        if seg == "." {
+            continue
+        }
+        if seg == ".." {
+            if out.len() > 0 and out[out.len() - 1] != ".." {
+                out.pop()
+            } else if not absolute {
+                out.push("..")
+            }
+            continue
+        }
+        out.push(seg)
+    }
+    let joined = out.join("/")
+    if absolute {
+        return "/" + joined
+    }
+    if joined.is_empty() {
+        return "."
+    }
+    joined
+}
+
+/// Everything before the last separator. `/a/b` is `/a`, `a` is `.`, `/` is
+/// `/` — the answers `dirname` gives, which are not the answers a naive
+/// `index_of` gives for any of the three.
+pub fn dir_name(p: str) -> str {
+    let n = normalise(p)
+    if n == "/" or n == "." {
+        return n
+    }
+    match last_separator(n) {
+        Some(i) -> if i == 0 { "/" } else { n.substr(0, i) }
+        None -> "."
+    }
+}
+
+fn last_separator(p: str) -> Option[i64] {
+    var i = p.len() - 1
+    while i >= 0 {
+        if p.substr(i, 1) == "/" {
+            return Some(i)
+        }
+        i = i - 1
+    }
+    None
+}
+
+/// Everything after the last separator.
+pub fn base_name(p: str) -> str {
+    let n = normalise(p)
+    if n == "/" {
+        return "/"
+    }
+    match last_separator(n) {
+        Some(i) -> n.substr(i + 1, n.len() - i - 1)
+        None -> n
+    }
+}
+
+/// The extension, without its dot, or the empty string.
+///
+/// A leading dot is a hidden file and not an extension: `.bashrc` has none.
+/// `a.tar.gz` has `gz`, because an extension is the last one — `stem` is how
+/// to get at the rest.
+pub fn extension(p: str) -> str {
+    let b = base_name(p)
+    var i = b.len() - 1
+    while i > 0 {
+        if b.substr(i, 1) == "." {
+            return b.substr(i + 1, b.len() - i - 1)
+        }
+        i = i - 1
+    }
+    ""
+}
+
+/// The base name without its extension.
+pub fn stem(p: str) -> str {
+    let b = base_name(p)
+    let e = extension(p)
+    if e.is_empty() {
+        return b
+    }
+    b.substr(0, b.len() - e.len() - 1)
+}
+
+/// The same path with a different extension. An empty extension removes it.
+pub fn with_extension(p: str, ext: str) -> str {
+    let d = dir_name(p)
+    let s = stem(p)
+    let name = if ext.is_empty() { s } else { s + "." + ext }
+    if d == "." and not p.starts_with("./") {
+        return name
+    }
+    join(d, name)
+}
+
+/// `to` written relative to `from`, or `None` when one is absolute and the
+/// other is not — in which case there is no answer, and inventing one is how
+/// a path escapes the directory it was meant to stay in.
+pub fn relative_to(from: str, to: str) -> Option[str] {
+    if is_absolute(from) != is_absolute(to) {
+        return None
+    }
+    let a = parts_of(normalise(from))
+    let b = parts_of(normalise(to))
+    var same = 0
+    while same < a.len() and same < b.len() and a[same] == b[same] {
+        same = same + 1
+    }
+    var out: [str] = []
+    for _i in same..a.len() {
+        out.push("..")
+    }
+    for i in same..b.len() {
+        out.push(b[i])
+    }
+    if out.is_empty() {
+        return Some(".")
+    }
+    Some(out.join("/"))
+}
+
+/// Is `child` inside `parent`, once both are resolved?
+///
+/// This is the check that stops `../../etc/passwd` from being served, so it
+/// resolves first and compares whole segments: `/var/www2` is not inside
+/// `/var/www`, and a prefix comparison says it is.
+pub fn contains(parent: str, child: str) -> bool {
+    let a = parts_of(normalise(parent))
+    let b = parts_of(normalise(child))
+    if is_absolute(parent) != is_absolute(child) {
+        return false
+    }
+    if b.len() < a.len() {
+        return false
+    }
+    for i in 0..a.len() {
+        if a[i] != b[i] {
+            return false
+        }
+    }
+    true
+}

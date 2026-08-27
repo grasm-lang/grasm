@@ -19,6 +19,19 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   `site/facts.json`, which `scripts/allgates.sh` writes after every gate
   passes. `scripts/site.py --check` fails when the pages, the figures or the
   run disagree.
+- `packages/bytes_codec`, `packages/time`, `packages/random`,
+  `packages/uuid`, `packages/path`, `packages/url`, `packages/log`,
+  `packages/csv`, `packages/cli`, `packages/testing`, `packages/toml`: the
+  first
+  wave of the release library, planned in `docs/packages-plan.md`. All but
+  `log` declare **no capability at all** — a calendar, a seeded generator, path
+  arithmetic and URL text are computation, and the reach each one is usually
+  bundled with (the clock, the entropy pool, the disk, the socket) stays with
+  the consumer. `log` is the other lever: logging is an *effect*, so a library
+  that logs declares `Log` and not `io`, and what logging means is decided
+  where the handler is installed.
+- `packages/http` now takes its percent coding and query parsing from
+  `packages/url` rather than carrying a second copy.
 - `packages/json`: `ProjectGold/lib-json` moved here, renamed (`parse`,
   `render`, `escape`) and given what a library needs that a program does not —
   `get`, `at`, `path`, `as_str`, `as_int`, `as_num`, `as_bool`, `is_null`,
@@ -53,6 +66,25 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   rule that found a fifth copy in `northstar.sh` the first time it ran.
 
 ### Fixed
+- `scripts/difftest.sh` and `scripts/leakcheck.sh` fail when the native
+  backend declines a program, and say which. Both counted the skips and
+  passed — one printed them after the summary that `allgates.sh` reads, the
+  other not at all — so a program that stopped compiling stayed green (F76).
+- A call into another module can be typed where the type has to be worked out
+  — as a list element, say. The lowering resolved `utils.helper(x)`; the probe
+  did not, and refused it naming a *module* as a receiver (F75).
+- A handler a call answers may be passed as an argument.
+  `with Cfg handled_by make()` compiled and `install(make())` did not, because
+  the argument position accepted only a literal or a name (F73).
+- A `match` whose live arms all yield nothing is typed as `()` rather than
+  refused. The probe skipped unit arms looking for one that said more — right
+  for a mixed match — and then refused when every arm was unit (F74).
+- Hex and binary literals name a **bit pattern**, so all 64 bits are writable
+  and `0xffffffffffffffff` is -1. They went through `i64::from_str_radix`, so
+  the whole top half of the range was unwritable — which is where every
+  published hash constant lives. Decimal still names a magnitude and is still
+  range-checked. The diagnostic now says which fault: no digits, a digit not
+  in the base, or more than 64 bits (F72).
 - A type alias may name a type from another module, and a type an `effect`
   declares. `type Cb = fn(Thing) -> i64` was "unknown type `Thing`" while
   `fn f(t: Thing)` on the next line resolved, because aliases were resolved in

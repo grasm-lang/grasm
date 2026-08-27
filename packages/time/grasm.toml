@@ -1,0 +1,8 @@
+[package]
+name = "time"
+version = "1.0.0"
+entry = "src/main.gr"
+
+# A calendar is arithmetic. Reading the clock is `io` and is the caller's to
+# do — which is also what makes a program that uses this testable.
+capabilities = []

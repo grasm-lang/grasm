@@ -1,0 +1,8 @@
+[package]
+name = "cli_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.cli]
+path = "../cli"
+version = "^1.0.0"

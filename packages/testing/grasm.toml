@@ -1,0 +1,8 @@
+[package]
+name = "testing"
+version = "1.0.0"
+entry = "src/main.gr"
+
+# A case is a value and a report is text. A test that reaches for something
+# does that in the consumer's code, where its ceiling can see it.
+capabilities = []

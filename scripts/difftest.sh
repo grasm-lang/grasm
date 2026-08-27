@@ -88,9 +88,16 @@ echo "=========================================="
 echo "identical: $pass   mismatched: $fail   unsupported: $skip"
 echo "=========================================="
 
+# A program the backend declines is not a program this gate has checked, and
+# §11's list is one entry long with nothing in the corpus on it — so a skip
+# here is a defect. It was counted, listed *after* the summary, and passed
+# anyway; `allgates.sh` prints only the summary line, so the listing was never
+# read. A change that made `shapes.Circle(2.0)` uncompilable moved one program
+# from "identical" to "unsupported" and every gate still said PASS (F76).
+# `crosstest.sh` has treated a skip as a failure since the same mistake there.
 if [ "$skip" -gt 0 ]; then
     echo
-    echo "Not yet compilable natively (interpreter handles these):"
+    echo "the native backend declined these, and §11 lists none of them:"
     printf '  %s\n' "${SKIPPED[@]}"
 fi
 
@@ -98,6 +105,8 @@ if [ "$fail" -gt 0 ]; then
     echo
     echo "FAILURES:"
     printf '  %s\n' "${FAILED[@]}"
+fi
+if [ "$fail" -gt 0 ] || [ "$skip" -gt 0 ]; then
     exit 1
 fi
 exit 0

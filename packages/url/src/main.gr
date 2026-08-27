@@ -1,0 +1,439 @@
+// URLs: parse, build, encode, resolve.
+//
+// Percent coding lives here rather than in `http`, so there is one
+// implementation. It is done in **bytes**: an escape names one byte, a
+// character outside ASCII is several, and turning each escape into its own
+// character gives `Ã¼` for `ü` — text that renders wrong and, in a response
+// body, frames one byte longer than the header says (F69).
+//
+// The encoding sets are not one set. A character that is safe in a path is not
+// safe in a query value, `/` is a delimiter in one and data in the other, and
+// a single `encode` used everywhere is how a path segment containing a slash
+// becomes two segments.
+
+type Url = {
+    scheme: str,
+    user: str,
+    host: str,
+    port: i64,
+    path: str,
+    query: str,
+    fragment: str,
+    ok: bool,
+    why: str,
+}
+
+let UNRESERVED = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+let HEX = "0123456789ABCDEF"
+
+fn hex_value(c: str) -> i64 {
+    match "0123456789abcdef".index_of(c.to_lower()) {
+        Some(i) -> i
+        None -> -1
+    }
+}
+
+fn encode_with(s: str, extra_safe: str) -> str {
+    let digits = HEX.chars()
+    var out = ""
+    for c in s.chars() {
+        if UNRESERVED.contains(c) or extra_safe.contains(c) {
+            out = out + c
+            continue
+        }
+        for b in c.to_bytes().to_list() {
+            out = out + "%" + digits[b / 16] + digits[b % 16]
+        }
+    }
+    out
+}
+
+/// A path segment. `/` is escaped, because a segment containing one is one
+/// segment and not two.
+pub fn encode_segment(s: str) -> str {
+    encode_with(s, "")
+}
+
+/// A whole path. `/` is kept, since here it is the delimiter.
+pub fn encode_path(s: str) -> str {
+    encode_with(s, "/")
+}
+
+/// A query key or value. A space becomes `%20` rather than `+`: `+` is a
+/// form-encoding convention, and a `+` that meant itself in a query value is
+/// then read as a space by whoever receives it.
+pub fn encode_query(s: str) -> str {
+    encode_with(s, "")
+}
+
+/// `%20` and, where `plus_is_space`, `+` back to what they stood for.
+///
+/// A `%` not followed by two hex digits is left alone rather than dropped, so
+/// nothing is silently lost from input somebody else chose.
+pub fn decode_with(s: str, plus_is_space: bool) -> str {
+    if not s.contains("%") and not (plus_is_space and s.contains("+")) {
+        return s
+    }
+    var out: [i64] = []
+    let cs = s.chars()
+    var i = 0
+    while i < cs.len() {
+        let c = cs[i]
+        if plus_is_space and c == "+" {
+            out.push(32)
+            i = i + 1
+        } else if c == "%" and i + 2 < cs.len() {
+            let hi = hex_value(cs[i + 1])
+            let lo = hex_value(cs[i + 2])
+            if hi >= 0 and lo >= 0 {
+                out.push(hi * 16 + lo)
+                i = i + 3
+            } else {
+                for b in c.to_bytes().to_list() {
+                    out.push(b)
+                }
+                i = i + 1
+            }
+        } else {
+            for b in c.to_bytes().to_list() {
+                out.push(b)
+            }
+            i = i + 1
+        }
+    }
+    bytes_of(out).to_str()
+}
+
+/// Percent decoding for a path or a fragment, where `+` means itself.
+pub fn decode(s: str) -> str {
+    decode_with(s, false)
+}
+
+/// Percent decoding for a query, where `+` is a space.
+pub fn decode_query(s: str) -> str {
+    decode_with(s, true)
+}
+
+fn bad(why: str) -> Url {
+    Url{ scheme: "", user: "", host: "", port: 0, path: "", query: "",
+         fragment: "", ok: false, why: why }
+}
+
+/// An absolute or relative URL. Never fails outright: a malformed one comes
+/// back with `ok` false and `why` saying what was wrong.
+pub fn parse(text: str) -> Url {
+    var rest = text.trim()
+    if rest.is_empty() {
+        return bad("empty")
+    }
+    var scheme = ""
+    var user = ""
+    var host = ""
+    var port = 0
+
+    // A scheme is letters, digits, `+`, `-`, `.` before a `:` — and the `:`
+    // must come before any `/`, or `a/b:c` would be read as scheme `a/b`.
+    match rest.index_of(":") {
+        Some(at) -> {
+            let head = rest.substr(0, at)
+            let slash = rest.index_of("/") ?? rest.len()
+            if at < slash and not head.is_empty() and scheme_shaped(head) {
+                scheme = head.to_lower()
+                rest = rest.substr(at + 1, rest.len() - at - 1)
+            }
+        }
+        None -> {}
+    }
+
+    if rest.starts_with("//") {
+        rest = rest.substr(2, rest.len() - 2)
+        var authority = rest
+        let cut = first_of(rest, "/?#")
+        authority = rest.substr(0, cut)
+        rest = rest.substr(cut, rest.len() - cut)
+        match authority.index_of("@") {
+            Some(at) -> {
+                user = authority.substr(0, at)
+                authority = authority.substr(at + 1, authority.len() - at - 1)
+            }
+            None -> {}
+        }
+        // A colon inside brackets is part of an IPv6 literal, not a port.
+        let colon = if authority.starts_with("[") {
+            match authority.index_of("]") {
+                Some(close) -> {
+                    let after = authority.substr(close, authority.len() - close)
+                    match after.index_of(":") {
+                        Some(k) -> Some(close + k)
+                        None -> None
+                    }
+                }
+                None -> return bad("an IPv6 host with no closing bracket")
+            }
+        } else {
+            authority.index_of(":")
+        }
+        match colon {
+            Some(at) -> {
+                let text_port = authority.substr(at + 1, authority.len() - at - 1)
+                host = authority.substr(0, at)
+                if text_port.is_empty() {
+                    port = 0
+                } else {
+                    match text_port.parse_int() {
+                        Some(n) -> {
+                            if n < 0 or n > 65535 {
+                                return bad("port out of range: {n}")
+                            }
+                            port = n
+                        }
+                        None -> return bad("port is not a number: {text_port}")
+                    }
+                }
+            }
+            None -> host = authority
+        }
+        host = host.to_lower()
+    }
+
+    var fragment = ""
+    match rest.index_of("#") {
+        Some(at) -> {
+            fragment = rest.substr(at + 1, rest.len() - at - 1)
+            rest = rest.substr(0, at)
+        }
+        None -> {}
+    }
+    var query = ""
+    match rest.index_of("?") {
+        Some(at) -> {
+            query = rest.substr(at + 1, rest.len() - at - 1)
+            rest = rest.substr(0, at)
+        }
+        None -> {}
+    }
+    Url{ scheme: scheme, user: user, host: host, port: port, path: rest,
+         query: query, fragment: fragment, ok: true, why: "" }
+}
+
+fn scheme_shaped(s: str) -> bool {
+    let cs = s.chars()
+    if cs.is_empty() {
+        return false
+    }
+    if not "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ".contains(cs[0]) {
+        return false
+    }
+    for c in cs {
+        if not UNRESERVED.contains(c) and c != "+" {
+            return false
+        }
+    }
+    true
+}
+
+fn first_of(s: str, chars: str) -> i64 {
+    var best = s.len()
+    for c in chars.chars() {
+        match s.index_of(c) {
+            Some(i) -> if i < best { best = i }
+            None -> {}
+        }
+    }
+    best
+}
+
+/// The default port for a scheme, or 0.
+pub fn default_port(scheme: str) -> i64 {
+    match scheme {
+        "http" -> 80
+        "https" -> 443
+        "ws" -> 80
+        "wss" -> 443
+        "ftp" -> 21
+        "postgres" -> 5432
+        "redis" -> 6379
+        "mongodb" -> 27017
+        _ -> 0
+    }
+}
+
+/// The port to dial: the one written, or the scheme's default.
+pub fn effective_port(u: Url) -> i64 {
+    if u.port > 0 {
+        return u.port
+    }
+    default_port(u.scheme)
+}
+
+pub fn render(u: Url) -> str {
+    var out = ""
+    if not u.scheme.is_empty() {
+        out = out + u.scheme + ":"
+    }
+    if not u.host.is_empty() or not u.user.is_empty() {
+        out = out + "//"
+        if not u.user.is_empty() {
+            out = out + u.user + "@"
+        }
+        out = out + u.host
+        if u.port > 0 and u.port != default_port(u.scheme) {
+            out = out + ":{u.port}"
+        }
+    }
+    out = out + u.path
+    if not u.query.is_empty() {
+        out = out + "?" + u.query
+    }
+    if not u.fragment.is_empty() {
+        out = out + "#" + u.fragment
+    }
+    out
+}
+
+// --- query strings ---------------------------------------------------------
+
+type Pair = { name: str, value: str }
+
+/// Every `name=value` in a query, decoded, in the order written. A name with
+/// no `=` has the empty value; repeated names are all kept, because a form
+/// with two checkboxes of one name means two values and keeping the last is
+/// how one of them disappears.
+pub fn query_pairs(query: str) -> [Pair] {
+    var out: [Pair] = []
+    for part in query.split("&") {
+        if part.is_empty() {
+            continue
+        }
+        match part.index_of("=") {
+            Some(at) -> out.push(Pair{
+                name: decode_query(part.substr(0, at)),
+                value: decode_query(part.substr(at + 1, part.len() - at - 1)),
+            })
+            None -> out.push(Pair{ name: decode_query(part), value: "" })
+        }
+    }
+    out
+}
+
+/// The first value for a name, or `None`.
+pub fn query_get(query: str, name: str) -> Option[str] {
+    for p in query_pairs(query) {
+        if p.name == name {
+            return Some(p.value)
+        }
+    }
+    None
+}
+
+/// Every value for a name.
+pub fn query_all(query: str, name: str) -> [str] {
+    var out: [str] = []
+    for p in query_pairs(query) {
+        if p.name == name {
+            out.push(p.value)
+        }
+    }
+    out
+}
+
+pub fn build_query(pairs: [Pair]) -> str {
+    var parts: [str] = []
+    for p in pairs {
+        parts.push(encode_query(p.name) + "=" + encode_query(p.value))
+    }
+    parts.join("&")
+}
+
+// --- resolving -------------------------------------------------------------
+
+fn merge_path(base: str, rel: str) -> str {
+    var out: [str] = []
+    for seg in base.split("/") {
+        out.push(seg)
+    }
+    if out.len() > 0 {
+        out.pop()
+    }
+    for seg in rel.split("/") {
+        out.push(seg)
+    }
+    remove_dots(out.join("/"))
+}
+
+fn remove_dots(p: str) -> str {
+    var out: [str] = []
+    let absolute = p.starts_with("/")
+    let trailing = p.ends_with("/.") or p.ends_with("/..") or p.ends_with("/")
+    for seg in p.split("/") {
+        if seg.is_empty() or seg == "." {
+            continue
+        }
+        if seg == ".." {
+            if out.len() > 0 {
+                out.pop()
+            }
+            continue
+        }
+        out.push(seg)
+    }
+    var joined = out.join("/")
+    if absolute {
+        joined = "/" + joined
+    }
+    if trailing and not joined.ends_with("/") {
+        joined = joined + "/"
+    }
+    joined
+}
+
+/// A reference resolved against a base, as RFC 3986 section 5 describes it.
+///
+/// This is what a browser does with `href="../x"`, and what an HTTP client
+/// does with a `Location` header. Getting it wrong sends the request somewhere
+/// else, which is worth more care than string concatenation gives it.
+pub fn resolve(base_text: str, ref_text: str) -> Url {
+    let base = parse(base_text)
+    if not base.ok {
+        return bad("base: {base.why}")
+    }
+    // An empty reference is the base without its fragment (RFC 3986 §5.2.2),
+    // not an error. `parse` refuses the empty string because an empty *URL* is
+    // meaningless; an empty *reference* means "this document", which is what
+    // `href=""` on a page is.
+    if ref_text.trim().is_empty() {
+        return Url{ scheme: base.scheme, user: base.user, host: base.host,
+                    port: base.port, path: base.path, query: base.query,
+                    fragment: "", ok: true, why: "" }
+    }
+    let r = parse(ref_text)
+    if not r.ok {
+        return bad("reference: {r.why}")
+    }
+    if not r.scheme.is_empty() {
+        return Url{ scheme: r.scheme, user: r.user, host: r.host, port: r.port,
+                    path: remove_dots(r.path), query: r.query,
+                    fragment: r.fragment, ok: true, why: "" }
+    }
+    if not r.host.is_empty() {
+        return Url{ scheme: base.scheme, user: r.user, host: r.host, port: r.port,
+                    path: remove_dots(r.path), query: r.query,
+                    fragment: r.fragment, ok: true, why: "" }
+    }
+    var path = base.path
+    var query = base.query
+    if r.path.is_empty() {
+        if not r.query.is_empty() {
+            query = r.query
+        }
+    } else {
+        query = r.query
+        path = if r.path.starts_with("/") {
+            remove_dots(r.path)
+        } else {
+            merge_path(base.path, r.path)
+        }
+    }
+    Url{ scheme: base.scheme, user: base.user, host: base.host, port: base.port,
+         path: path, query: query, fragment: r.fragment, ok: true, why: "" }
+}

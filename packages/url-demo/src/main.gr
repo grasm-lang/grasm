@@ -1,0 +1,67 @@
+// The `url` package.
+//
+// The resolution cases are lifted from RFC 3986 section 5.4, which is the
+// list every implementation gets wrong in the same three places: an empty
+// reference, a reference that is only a query, and `..` climbing past the root.
+import url
+
+fn show(text: str) {
+    let u = url.parse(text)
+    if not u.ok {
+        print("  \"{text}\" -> refused: {u.why}")
+        return
+    }
+    print("  \"{text}\"")
+    print("      scheme {u.scheme}  user {u.user}  host {u.host}  port {u.port} (effective {url.effective_port(u)})")
+    print("      path {u.path}  query {u.query}  fragment {u.fragment}  back \"{url.render(u)}\"")
+}
+
+fn resolved(base: str, r: str) {
+    let u = url.resolve(base, r)
+    print("  \"{r}\" against base -> \"{url.render(u)}\"")
+}
+
+fn main() {
+    print("-- parsing")
+    show("http://example.test/a/b?x=1#top")
+    show("https://user@example.test:8443/p")
+    show("http://EXAMPLE.test:80/")
+    show("//example.test/p")
+    show("/just/a/path")
+    show("relative/path")
+    show("mailto:someone@example.test")
+    show("http://[2001:db8::1]:8080/p")
+    show("http://[2001:db8::1]/p")
+    show("postgres://db.internal/app")
+    show("")
+    show("http://example.test:99999/")
+    show("http://example.test:port/")
+    show("http://[2001:db8::1/p")
+
+    print("-- percent coding")
+    for s in ["plain", "a b", "a/b", "a+b", "ü", "€", "100%", "a?b#c", ""] {
+        print("  \"{s}\": segment \"{url.encode_segment(s)}\"  path \"{url.encode_path(s)}\"  query \"{url.encode_query(s)}\"")
+    }
+    for s in ["caf%C3%A9", "a%20b", "a+b", "%E2%82%AC", "%zz", "%", "%4"] {
+        print("  decode \"{s}\" -> path \"{url.decode(s)}\"  query \"{url.decode_query(s)}\"")
+    }
+
+    print("-- query strings")
+    let q = "a=1&b=&c=x+y&a=2&flag&d%3De=%C3%BC"
+    for p in url.query_pairs(q) {
+        print("  {p.name} = \"{p.value}\"")
+    }
+    print("  first a: {url.query_get(q, "a") ?? "(absent)"}")
+    print("  every a: {url.query_all(q, "a")}")
+    print("  absent: {url.query_get(q, "zz") ?? "(absent)"}")
+    print("  built: \"{url.build_query([Pair{ name: "n", value: "a b" }, Pair{ name: "ü", value: "1&2" }])}\"")
+
+    print("-- resolving against http://a/b/c/d;p?q")
+    let base = "http://a/b/c/d;p?q"
+    for r in ["g", "./g", "g/", "/g", "//g", "?y", "g?y", "#s", "g#s",
+              "", ".", "..", "../", "../g", "../..", "../../g",
+              "../../../g", "../../../../g", "/./g", "/../g",
+              "http://x/y", "g;x", "g:h"] {
+        resolved(base, r)
+    }
+}

@@ -1,0 +1,8 @@
+[package]
+name = "bytes_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.bytes_codec]
+path = "../bytes"
+version = "^1.0.0"

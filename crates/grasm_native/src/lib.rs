@@ -5840,6 +5840,22 @@ this case",
             }
         }
         let Some(lit) = self.cg.handler_literal(e) else {
+            // Neither a literal nor a name bound to one, so evaluate it like
+            // any other expression: a call that answers a handler, an element
+            // of a list of them, a field, a `match`. `with … handled_by
+            // make()` already took this route, and only the *argument*
+            // position came here — so `install(make())` was refused while
+            // `let h = make()` two lines above it compiled (F73).
+            //
+            // No reference is taken. The value a call answers is already
+            // owned by this frame; the `Ident` arm above borrows a live
+            // variable, which is why that one has to.
+            let (v, t) = self.eval_expr_val(e)?;
+            if let VType::Handler(got) = &t {
+                if got == eff {
+                    return Ok((v, VType::Handler(eff.to_string())));
+                }
+            }
             return nope(
                 e.span(),
                 format!("a `{eff}Handler` that is not a handler literal or a name bound to one"),
@@ -11125,6 +11141,20 @@ annotate the binding",
                 // `if`'s two branches: one arm's `Err(e)` and another's
                 // `Ok(v)` each know a different half.
                 let mut found: Option<VType> = None;
+                // Whether every live arm could be typed, and whether they all
+                // came back `Unit`. A match all of whose live arms yield
+                // nothing *is* a statement match worth `Unit` — refusing it
+                // instead made a block ending in `match w { "a" -> m.set(…)
+                // "b" -> m.set(…) }` untypeable, and the enclosing match then
+                // failed with "arms it cannot type" about an arm that was
+                // plainly unit (F74).
+                //
+                // An arm the probe could not read is *not* the same as a unit
+                // one, and is tracked separately: answering `Unit` for it
+                // would turn a refusal into a wrong type, which is the worse
+                // of the two.
+                let mut live = false;
+                let mut all_typed = true;
                 for arm in arms {
                     // An arm that leaves — `return`, `fail`, `panic` — never
                     // reaches the merge and says nothing about what the match
@@ -11135,7 +11165,9 @@ annotate the binding",
                     if arm_diverges(&arm.body) {
                         continue;
                     }
+                    live = true;
                     let Ok(t) = self.probe_type(&arm.body) else {
+                        all_typed = false;
                         continue;
                     };
                     if t == VType::Unit {
@@ -11157,6 +11189,7 @@ annotate the binding",
                 }
                 match found {
                     Some(t) => t,
+                    None if live && all_typed => VType::Unit,
                     None => {
                         return nope(e.span(), "a `match` whose arms say nothing about its type")
                     }
@@ -11189,6 +11222,59 @@ annotate the binding",
                             format!("`{}` is not an operation of effect `{}`", name.name, tid.name),
                         )
                     }
+                }
+            }
+            // `utils.helper(x)` — a call into another module, which parses
+            // as a method call on the alias. The lowering resolves it; the
+            // probe did not, so it fell through to the builtin table and was
+            // refused as "`.helper()` on a receiver whose type is not known
+            // here", naming a *module* a receiver.
+            //
+            // It only showed where the probe has to run at all: `let c =
+            // far.eq(…)` compiled and the same call as an element of a list
+            // literal did not (F75).
+            // The guard demands that the name really *is* a function over
+            // there. `shapes.Circle(2.0)` is a variant constructor of a sum
+            // declared in another module, and matching on the alias alone
+            // caught that too and refused it — a program that had compiled
+            // since modules existed.
+            Expr::MethodCall { recv, name, args, span }
+                if matches!(&**recv, Expr::Ident(tid)
+                    if self.lookup(&tid.name).is_none()
+                        && self
+                            .cg
+                            .module_imports
+                            .get(&self.cg.current_module)
+                            .and_then(|m| m.get(&tid.name))
+                            .is_some_and(|target| {
+                                let qual = format!("{target}::{}", name.name);
+                                self.cg.fns.contains_key(&qual)
+                                    || self.cg.generic_fns.contains_key(&qual)
+                            })) =>
+            {
+                let Expr::Ident(tid) = &**recv else {
+                    unreachable!("just matched")
+                };
+                let target = self
+                    .cg
+                    .module_imports
+                    .get(&self.cg.current_module)
+                    .and_then(|m| m.get(&tid.name))
+                    .cloned()
+                    .unwrap_or_default();
+                let qual = format!("{target}::{}", name.name);
+                if let Some(sig) = self.cg.fns.get(&qual) {
+                    sig.ret.clone()
+                } else if self.cg.generic_fns.contains_key(&qual) {
+                    // A generic has no signature until the call site fixes its
+                    // parameters, exactly as it has no symbol — so it is
+                    // instantiated here the way the lowering instantiates it,
+                    // and the instance's return type is the answer.
+                    let arg_types = self.generic_arg_types(&qual, args)?;
+                    let key = self.cg.instantiate_generic(&target, &name.name, &arg_types, *span)?;
+                    self.cg.fns[&key].ret.clone()
+                } else {
+                    unreachable!("the guard checked that this name is a function")
                 }
             }
             // `b.f(x)` where `f` is a struct field of function type

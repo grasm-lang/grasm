@@ -1,0 +1,8 @@
+[package]
+name = "toml_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.toml]
+path = "../toml"
+version = "^1.0.0"

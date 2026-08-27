@@ -1,0 +1,56 @@
+// The `path` package. Nothing here touches a disk, which is why it can all be
+// printed and compared byte for byte on three engines.
+import path
+
+fn row(p: str) {
+    print("  {p.pad_end(24, " ")} norm {path.normalise(p).pad_end(16, " ")} dir {path.dir_name(p).pad_end(12, " ")} base {path.base_name(p).pad_end(12, " ")} ext {path.extension(p)}")
+}
+
+fn main() {
+    print("-- the pieces")
+    row("/a/b/c.txt")
+    row("a/b/c.txt")
+    row("c.txt")
+    row("/")
+    row(".")
+    row("")
+    row("/a/")
+    row("a/b/")
+    row(".bashrc")
+    row("a.tar.gz")
+    row("/a/.hidden")
+    row("no-extension")
+
+    print("-- joining")
+    for pair in [("a", "b"), ("a/", "b"), ("/a", "b"), ("a", "/b"), ("", "b"),
+                 ("a", ""), ("/", "a"), ("a", "../b")] {
+        print("  join(\"{pair.0}\", \"{pair.1}\") -> \"{path.join(pair.0, pair.1)}\"")
+    }
+    print("  join_all: \"{path.join_all(["/var", "www", "..", "log", "app.log"])}\"")
+    print("  normalised: \"{path.normalise(path.join_all(["/var", "www", "..", "log", "app.log"]))}\"")
+
+    print("-- normalising")
+    for p in ["/a/./b", "/a/../b", "/a/b/../..", "/..", "/../..", "a/../..",
+              "../a", "a//b///c", "./a", "/a/b/./../c/", "a/b/../../../c"] {
+        print("  \"{p}\" -> \"{path.normalise(p)}\"")
+    }
+
+    print("-- extensions")
+    for p in ["a.txt", "a.tar.gz", ".bashrc", "a.", "a", "/x/y.md"] {
+        print("  \"{p}\": ext \"{path.extension(p)}\" stem \"{path.stem(p)}\" with .bak \"{path.with_extension(p, "bak")}\" bare \"{path.with_extension(p, "")}\"")
+    }
+
+    print("-- relative")
+    for pair in [("/a/b", "/a/b/c"), ("/a/b/c", "/a/b"), ("/a/b", "/a/b"),
+                 ("/a/b", "/x/y"), ("a/b", "a/c"), ("/a", "b")] {
+        print("  from \"{pair.0}\" to \"{pair.1}\" -> \"{path.relative_to(pair.0, pair.1) ?? "(no answer)"}\"")
+    }
+
+    print("-- containment, which is the check that stops a path escaping")
+    for pair in [("/var/www", "/var/www/index.html"), ("/var/www", "/var/www"),
+                 ("/var/www", "/var/www2/x"), ("/var/www", "/var"),
+                 ("/var/www", "/var/www/../../etc/passwd"),
+                 ("/var/www", "/var/www/a/../b"), ("/var/www", "relative")] {
+        print("  \"{pair.1}\" inside \"{pair.0}\": {path.contains(pair.0, pair.1)}")
+    }
+}

@@ -1,0 +1,89 @@
+// The `time` package. No clock is read, so this prints the same thing today
+// and in ten years — which is the point of the clock being a parameter.
+import time
+
+fn stamp(label: str, ms: i64) {
+    let s = time.from_millis(ms)
+    let back = time.to_millis(s)
+    print("  {label}: {time.format(s)}  weekday {time.weekday(s.date)}  doy {time.day_of_year(s.date)}  round trip {back == ms}")
+}
+
+fn round(label: str, text: str) {
+    match time.parse(text) {
+        Some(s) -> print("  {label} \"{text}\" -> {time.format(s)}")
+        None -> print("  {label} \"{text}\" -> refused")
+    }
+}
+
+fn main() {
+    print("-- instants")
+    stamp("epoch", 0)
+    stamp("one millisecond", 1)
+    stamp("one day before the epoch", 0 - 86400000)
+    stamp("one millisecond before", -1)
+    stamp("a leap day", time.to_millis(Stamp{
+        date: Date{ year: 2024, month: 2, day: 29 },
+        time: Time{ hour: 12, minute: 0, second: 0, milli: 0 },
+    }))
+    stamp("2026-08-27", time.to_millis(Stamp{
+        date: Date{ year: 2026, month: 8, day: 27 },
+        time: Time{ hour: 13, minute: 4, second: 5, milli: 6 },
+    }))
+    stamp("2000-03-01", 951868800000)
+    stamp("1900 was not a leap year", 0 - 2208988800000)
+
+    print("-- leap years")
+    for y in [1900, 1996, 2000, 2023, 2024, 2100, 2400] {
+        print("  {y}: {time.is_leap(y)}  february has {time.days_in_month(y, 2)}")
+    }
+
+    print("-- month lengths")
+    var lengths: [i64] = []
+    for m in 1..13 {
+        lengths.push(time.days_in_month(2023, m))
+    }
+    print("  2023: {lengths}  sum {lengths.sum()}")
+    print("  month 0: {time.days_in_month(2023, 0)}  month 13: {time.days_in_month(2023, 13)}")
+
+    print("-- every day of a year round-trips")
+    var bad = 0
+    var d = time.days_from_civil(Date{ year: 2024, month: 1, day: 1 })
+    let end = time.days_from_civil(Date{ year: 2025, month: 1, day: 1 })
+    while d < end {
+        let back = time.days_from_civil(time.civil_from_days(d))
+        if back != d {
+            bad = bad + 1
+        }
+        d = d + 1
+    }
+    print("  2024: {end - time.days_from_civil(Date{ year: 2024, month: 1, day: 1 })} days, {bad} wrong")
+
+    print("-- parsing")
+    round("date only", "2026-08-27")
+    round("with a time", "2026-08-27T13:04:05")
+    round("with a Z", "2026-08-27T13:04:05Z")
+    round("with milliseconds", "2026-08-27T13:04:05.006Z")
+    round("one fractional digit", "2026-08-27T13:04:05.6Z")
+    round("more precision than we hold", "2026-08-27T13:04:05.123456Z")
+    round("a space for the T", "2026-08-27 13:04:05")
+    round("surrounded by space", "  2026-08-27  ")
+
+    print("-- parsing, refused")
+    round("no such day", "2023-02-29")
+    round("a real one", "2024-02-29")
+    round("month zero", "2026-00-10")
+    round("month thirteen", "2026-13-10")
+    round("day zero", "2026-08-00")
+    round("hour 24", "2026-08-27T24:00:00")
+    round("a leap second", "2026-08-27T23:59:60")
+    round("truncated", "2026-08")
+    round("a dot with no digits", "2026-08-27T13:04:05.Z")
+    round("trailing rubbish", "2026-08-27T13:04:05Zzz")
+    round("not a date at all", "yesterday")
+
+    print("-- durations")
+    for ms in [0, 1, 999, 1000, 1500, 60000, 3600000, 86400000, 90061005, -1500] {
+        print("  {ms} -> {time.format_duration(ms)}")
+    }
+    print("  {time.days(1) + time.hours(2) + time.minutes(3) + time.seconds(4)} -> {time.format_duration(time.days(1) + time.hours(2) + time.minutes(3) + time.seconds(4))}")
+}

@@ -1,0 +1,18 @@
+[package]
+name = "log"
+version = "1.0.0"
+entry = "src/main.gr"
+
+# The sinks that write declare `io`; the effect, the levels and the formatting
+# do not. A *consumer* that only calls `log.info` inherits none of this — its
+# ceiling is what it needs, not what everything it depends on offers
+# ([T-CAPABILITY]) — so a library that logs declares `Log` and nothing more.
+capabilities = ["io", "Log"]
+
+[dependencies.json]
+path = "../json"
+version = "^1.0.0"
+
+[dependencies.time]
+path = "../time"
+version = "^1.0.0"

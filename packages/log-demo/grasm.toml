@@ -1,0 +1,12 @@
+[package]
+name = "log_demo"
+version = "0.1.0"
+
+# `io` because it prints its own headings, and `Log` because it installs
+# handlers. What it does *not* declare is anything the sinks need beyond that:
+# a consumer's ceiling is what it needs, not what its dependencies offer.
+capabilities = ["io", "Log"]
+
+[dependencies.log]
+path = "../log"
+version = "^1.0.0"

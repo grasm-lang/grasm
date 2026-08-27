@@ -1,0 +1,7 @@
+[package]
+name = "csv"
+version = "1.0.0"
+entry = "src/main.gr"
+
+# Text in, rows out. Reading the file is the consumer's `io`.
+capabilities = []

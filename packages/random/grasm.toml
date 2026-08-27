@@ -1,0 +1,9 @@
+[package]
+name = "random"
+version = "1.0.0"
+entry = "src/main.gr"
+
+# A seeded generator is arithmetic. `random_bytes` performs `io` and is the
+# caller's to call — one line, in the one place a program wants unpredictability
+# rather than reproducibility.
+capabilities = []

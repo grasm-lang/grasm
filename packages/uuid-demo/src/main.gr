@@ -1,0 +1,85 @@
+// The `uuid` package. Seeded, so the identifiers below are the same on every
+// engine and every run — which a demo drawing from the operating system could
+// not be, and which is exactly why the entropy is an argument.
+import random
+import uuid
+
+fn show(label: str, u: Uuid) {
+    print("  {label}: {uuid.format(u)}  v{uuid.version(u)} variant {uuid.variant(u)}")
+}
+
+fn round(label: str, text: str) {
+    match uuid.parse(text) {
+        Some(u) -> print("  {label} \"{text}\" -> {uuid.format(u)}")
+        None -> print("  {label} \"{text}\" -> refused")
+    }
+}
+
+fn main() {
+    print("-- version 4")
+    var r = random.seeded(2026)
+    var made: [str] = []
+    for _i in 0..4 {
+        let u = uuid.v4(r)
+        made.push(uuid.format(u))
+        show("v4", u)
+    }
+    print("  all different: {made.len() == 4 and made[0] != made[1] and made[1] != made[2] and made[2] != made[3]}")
+
+    print("-- version 7 sorts by time")
+    var r7 = random.seeded(7)
+    var stamps: [str] = []
+    var ordered = true
+    var last = ""
+    for i in 0..5 {
+        let u = uuid.v7(r7, 1787000645000 + i * 1000)
+        let t = uuid.format(u)
+        if not last.is_empty() and t < last {
+            ordered = false
+        }
+        last = t
+        stamps.push(t)
+        show("v7", u)
+        print("      timestamp {uuid.timestamp(u) ?? 0 - 1}")
+    }
+    print("  made in time order, sort in text order: {ordered}")
+    print("  the timestamp of a v4: {uuid.timestamp(uuid.v4(r)) ?? 0 - 1}")
+
+    print("-- the nil uuid")
+    let z = uuid.nil_uuid()
+    print("  {uuid.format(z)}  is_nil {uuid.is_nil(z)}  v{uuid.version(z)} variant {uuid.variant(z)}")
+    print("  is_nil of a v4: {uuid.is_nil(uuid.v4(r))}")
+
+    print("-- parsing")
+    round("canonical", "550e8400-e29b-41d4-a716-446655440000")
+    round("upper case", "550E8400-E29B-41D4-A716-446655440000")
+    round("braced", "\{550e8400-e29b-41d4-a716-446655440000}")
+    round("urn", "urn:uuid:550e8400-e29b-41d4-a716-446655440000")
+    round("surrounded by space", "  550e8400-e29b-41d4-a716-446655440000  ")
+
+    print("-- parsing, refused")
+    round("no hyphens", "550e8400e29b41d4a716446655440000")
+    round("hyphens in the wrong places", "550e840-0e29b-41d4-a716-4466554400000")
+    round("too short", "550e8400-e29b-41d4-a716-44665544000")
+    round("too long", "550e8400-e29b-41d4-a716-4466554400001")
+    round("not hex", "550e8400-e29b-41d4-a716-44665544zzzz")
+    round("empty", "")
+
+    print("-- round trip")
+    var rr = random.seeded(99)
+    var bad = 0
+    for _i in 0..200 {
+        let u = uuid.v4(rr)
+        match uuid.parse(uuid.format(u)) {
+            Some(back) -> if not uuid.equal(u, back) { bad = bad + 1 }
+            None -> bad = bad + 1
+        }
+    }
+    print("  200 identifiers, {bad} did not survive format then parse")
+
+    print("-- comparing")
+    let a = uuid.parse("00000000-0000-4000-8000-000000000001") ?? uuid.nil_uuid()
+    let b = uuid.parse("00000000-0000-4000-8000-000000000002") ?? uuid.nil_uuid()
+    print("  a<b {uuid.compare(a, b)}  b<a {uuid.compare(b, a)}  a=a {uuid.compare(a, a)}")
+    print("  equal: {uuid.equal(a, a)} {uuid.equal(a, b)}")
+}

@@ -1,0 +1,8 @@
+[package]
+name = "testing_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.testing]
+path = "../testing"
+version = "^1.0.0"

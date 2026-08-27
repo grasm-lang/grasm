@@ -13,6 +13,17 @@ gates as everything else: three engines, one answer.
 | `http_server` | `io`, `net` | The accept loop, and `net_wait` for many conversations on one thread. Depends on `http`. |
 | `http_client` | `net` | Dials, sends what `http` composed, reads until the declared frame has arrived. Depends on `http`. |
 | `json` | *none* | Parse, render, reach into a document, build one. |
+| `bytes_codec` | *none* | Hex, base64, url-safe base64, constant-time compare. |
+| `time` | *none* | Civil calendar, ISO-8601, durations. The clock is a parameter. |
+| `random` | *none* | Seeded xoshiro256\*\*, uniform `below(n)`, shuffle, choice. |
+| `uuid` | *none* | v4 and v7, parse, format, compare. The entropy is a parameter. |
+| `path` | *none* | Join, normalise, split, containment. Touches no disk. |
+| `url` | *none* | Parse, build, resolve, percent code, query strings. |
+| `log` | `io`, `Log` | Logging as an **effect**, and five sinks. |
+| `csv` | *none* | Quotes, embedded newlines, headers, any separator. |
+| `cli` | *none* | Flags, bundles, subcommands, `--`, a generated help page. |
+| `testing` | *none* | Cases as values, table-driven suites, a golden diff that says where. |
+| `toml` | *none* | Tables, arrays, inline tables, dotted paths. |
 
 Three packages rather than one, and the split is the same argument each time:
 a program that only needs to *build* a request never acquires the capability to
@@ -43,7 +54,37 @@ grasm run packages/http_server-demo/src/main.gr -- serve   # over a real socket
 grasm run packages/http_client-demo/src/main.gr
 grasm run packages/http_client-demo/src/main.gr -- serve   # client and server, both Grasm
 grasm run packages/json-demo/src/main.gr
+grasm run packages/bytes-demo/src/main.gr
+grasm run packages/time-demo/src/main.gr
+grasm run packages/random-demo/src/main.gr
+grasm run packages/uuid-demo/src/main.gr
+grasm run packages/path-demo/src/main.gr
+grasm run packages/url-demo/src/main.gr
+grasm run packages/log-demo/src/main.gr
+grasm run packages/csv-demo/src/main.gr
+grasm run packages/cli-demo/src/main.gr
+grasm run packages/testing-demo/src/main.gr
+grasm run packages/toml-demo/src/main.gr
 ```
+
+## The pattern every one of these follows
+
+**Split reach from computation.** `path` is arithmetic and declares nothing;
+walking a directory is `fs`. `url` is text and declares nothing; dialling is
+`http_client`. `time` is a calendar and declares nothing; reading the clock is
+one `io` call in the consumer's `main`. `random` is a seeded generator and
+declares nothing; entropy is `random_bytes`, which the consumer calls once.
+
+**Prefer an effect to a capability.** `log` is the clearest case. A library
+that logs by calling `print` declares `io`, and every consumer then depends on
+something that can write anywhere. A library that logs by performing `Log`
+declares `Log` — see `packages/log-demo`, whose `work` function logs from three
+calls deep with the row `/ {Log}` and therefore cannot print, cannot open a
+file, cannot reach the network. What logging *means* is decided by the line
+that installs the handler.
+
+**Every refusal is a value.** A URL, a UUID, a timestamp, a base64 string is
+input somebody else chose. Not one decoder here panics.
 
 The socket path is opt-in. The corpus does not open sockets by default: a gate
 that depends on the loopback network fails for reasons that have nothing to do

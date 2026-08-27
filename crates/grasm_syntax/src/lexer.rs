@@ -249,12 +249,42 @@ impl<'a> Lexer<'a> {
                 .chars()
                 .filter(|&c| c != '_')
                 .collect();
+            // Hex and binary are *bit patterns*, so the whole 64-bit range is
+            // writable and the top bit is not special: `0xffffffffffffffff` is
+            // every bit set, which as an `i64` is -1. Decimal keeps its
+            // magnitude check, because `18446744073709551615` written out is
+            // somebody meaning that number and not that pattern.
+            //
+            // Refusing the top half meant no hash constant, mask or generator
+            // multiplier could be written in the notation it is published in:
+            // every one of splitmix64's three constants has the top bit set,
+            // and the diagnostic said only "invalid numeric literal" (F72).
             return match i64::from_str_radix(&text, radix) {
                 Ok(v) => self.tok(TokenKind::Int(v), start),
-                Err(_) => self.tok(
-                    TokenKind::Error(format!("invalid numeric literal `{}`", &self.src[start..self.pos])),
-                    start,
-                ),
+                Err(_) => match u64::from_str_radix(&text, radix) {
+                    Ok(v) => self.tok(TokenKind::Int(v as i64), start),
+                    Err(_) => self.tok(
+                        TokenKind::Error(format!(
+                            "invalid numeric literal `{}` — {}",
+                            &self.src[start..self.pos],
+                            if text.is_empty() {
+                                "it has no digits".to_string()
+                            } else if text.chars().all(|c| c.is_digit(radix)) {
+                                format!(
+                                    "it is more than 64 bits ({} digits, and {} fit)",
+                                    text.len(),
+                                    if radix == 16 { 16 } else { 64 }
+                                )
+                            } else {
+                                format!(
+                                    "`{}` is not a base-{radix} digit",
+                                    text.chars().find(|c| !c.is_digit(radix)).unwrap()
+                                )
+                            }
+                        )),
+                        start,
+                    ),
+                },
             };
         }
 

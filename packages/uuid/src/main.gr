@@ -1,0 +1,181 @@
+// UUIDs, versions 4 and 7.
+//
+// Sixteen bytes and the text they are written as. Where the bytes come from is
+// the caller's decision and this package declares nothing, which is not a
+// technicality: a *random* identifier wants `random_bytes` and its `io`, and a
+// *reproducible* one wants a seeded generator and no capability at all. A
+// package that reached for entropy itself would force the first on every
+// consumer, tests included.
+//
+// Version 7 is here because version 4 sorts arbitrarily, and an identifier
+// that is also a primary key sorting arbitrarily is what turns an index into
+// a random-write workload. A v7 carries a millisecond timestamp in its top 48
+// bits, so identifiers made in order compare in order.
+import random
+
+type Uuid = { bytes: bytes }
+
+let NIL_TEXT = "00000000-0000-0000-0000-000000000000"
+let HEX = "0123456789abcdef"
+
+pub fn nil_uuid() -> Uuid {
+    var zeros: [i64] = []
+    for _i in 0..16 {
+        zeros.push(0)
+    }
+    Uuid{ bytes: bytes_of(zeros) }
+}
+
+pub fn is_nil(u: Uuid) -> bool {
+    u.bytes.to_list().all(|v| v == 0)
+}
+
+/// Sixteen bytes stamped with a version and the RFC 4122 variant.
+///
+/// The stamping is the part that is easy to leave out and impossible to see:
+/// an unstamped value is a perfectly good 128-bit number and a malformed UUID,
+/// and every parser that checks will refuse it later, somewhere else.
+pub fn from_bytes(raw: bytes, version: i64) -> Uuid {
+    var vs = raw.to_list()
+    while vs.len() < 16 {
+        vs.push(0)
+    }
+    while vs.len() > 16 {
+        vs.pop()
+    }
+    vs[6] = vs[6].bit_and(0x0f).bit_or(version.bit_and(0x0f).shl(4))
+    vs[8] = vs[8].bit_and(0x3f).bit_or(0x80)
+    Uuid{ bytes: bytes_of(vs) }
+}
+
+/// Version 4: sixteen random bytes, six of them spent on the version and
+/// variant, so 122 bits of entropy rather than 128.
+pub fn v4(inout r: Rng) -> Uuid {
+    from_bytes(random.bytes_of_length(r, 16), 4)
+}
+
+/// Version 7: 48 bits of millisecond timestamp, then randomness. Two made in
+/// the same millisecond compare by their random half, which is arbitrary but
+/// stable; two made in different milliseconds compare by time.
+pub fn v7(inout r: Rng, millis: i64) -> Uuid {
+    var vs = random.bytes_of_length(r, 16).to_list()
+    var t = millis
+    var i = 5
+    while i >= 0 {
+        vs[i] = t.bit_and(255)
+        t = t.ushr(8)
+        i = i - 1
+    }
+    from_bytes(bytes_of(vs), 7)
+}
+
+/// The millisecond a version 7 identifier carries. `None` for any other
+/// version, because the same bits in a v4 are randomness and reading them as
+/// a time gives a confident answer that means nothing.
+pub fn timestamp(u: Uuid) -> Option[i64] {
+    if version(u) != 7 {
+        return None
+    }
+    var t = 0
+    for i in 0..6 {
+        t = t * 256 + u.bytes.at(i)
+    }
+    Some(t)
+}
+
+pub fn version(u: Uuid) -> i64 {
+    u.bytes.at(6).ushr(4)
+}
+
+/// 1 for the RFC 4122 variant, 0 for the older Apollo layout, 2 for
+/// Microsoft's, 3 for reserved. Only 1 is what anything makes today.
+pub fn variant(u: Uuid) -> i64 {
+    let b = u.bytes.at(8)
+    if b.ushr(7) == 0 {
+        return 0
+    }
+    if b.ushr(6) == 2 {
+        return 1
+    }
+    if b.ushr(5) == 6 {
+        return 2
+    }
+    3
+}
+
+pub fn format(u: Uuid) -> str {
+    let digits = HEX.chars()
+    var out = ""
+    for i in 0..16 {
+        if i == 4 or i == 6 or i == 8 or i == 10 {
+            out = out + "-"
+        }
+        let v = u.bytes.at(i)
+        out = out + digits[v / 16] + digits[v % 16]
+    }
+    out
+}
+
+fn hex_digit(c: str) -> i64 {
+    match HEX.index_of(c.to_lower()) {
+        Some(i) -> i
+        None -> -1
+    }
+}
+
+/// The canonical text back to sixteen bytes.
+///
+/// Braces and a `urn:uuid:` prefix are accepted because both are written in
+/// the wild; anything else is refused, hyphens in the wrong places included.
+/// A parser that strips every hyphen and counts to 32 accepts
+/// `0-0-0-0-…-0` in any arrangement, and then two spellings of one identifier
+/// stop comparing equal as text.
+pub fn parse(text: str) -> Option[Uuid] {
+    var t = text.trim().to_lower()
+    if t.starts_with("urn:uuid:") {
+        t = t.substr(9, t.len() - 9)
+    }
+    if t.starts_with("\{") and t.ends_with("}") {
+        t = t.substr(1, t.len() - 2)
+    }
+    let cs = t.chars()
+    if cs.len() != 36 {
+        return None
+    }
+    var out: [i64] = []
+    var i = 0
+    while i < cs.len() {
+        if i == 8 or i == 13 or i == 18 or i == 23 {
+            if cs[i] != "-" {
+                return None
+            }
+            i = i + 1
+        } else {
+            let hi = hex_digit(cs[i])
+            let lo = if i + 1 < cs.len() { hex_digit(cs[i + 1]) } else { -1 }
+            if hi < 0 or lo < 0 {
+                return None
+            }
+            out.push(hi * 16 + lo)
+            i = i + 2
+        }
+    }
+    if out.len() != 16 {
+        return None
+    }
+    Some(Uuid{ bytes: bytes_of(out) })
+}
+
+pub fn equal(a: Uuid, b: Uuid) -> bool {
+    a.bytes.to_list() == b.bytes.to_list()
+}
+
+/// Byte order, which for a version 7 is time order.
+pub fn compare(a: Uuid, b: Uuid) -> i64 {
+    for i in 0..16 {
+        if a.bytes.at(i) != b.bytes.at(i) {
+            return if a.bytes.at(i) < b.bytes.at(i) { 0 - 1 } else { 1 }
+        }
+    }
+    0
+}
