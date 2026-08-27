@@ -1,0 +1,8 @@
+[package]
+name = "redis_demo"
+version = "0.1.0"
+capabilities = ["io", "net"]
+
+[dependencies.redis]
+path = "../redis"
+version = "^1.0.0"

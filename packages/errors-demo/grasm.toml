@@ -1,0 +1,8 @@
+[package]
+name = "errors_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.errors]
+path = "../errors"
+version = "^1.0.0"

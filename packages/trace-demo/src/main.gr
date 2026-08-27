@@ -1,0 +1,97 @@
+// The `trace` package. Seeded ids and a written-out clock, so the trace below
+// is the same on every engine and every run.
+import random
+import trace
+
+/// A unit of work that records a span. Its row is `/ {Trace}` and nothing
+/// else — it cannot print, and it cannot reach a collector.
+fn work(c: SpanContext, name: str, from_ms: i64, took_ms: i64, tag: Attribute) / {Trace} {
+    let s = trace.tagged(trace.start(c, name, from_ms), tag)
+    trace.emit(trace.finish(s, from_ms + took_ms))
+}
+
+fn main() {
+    var r = random.seeded(2026)
+    let none: [Span] = []
+    let spans = ref(none)
+
+    with Trace handled_by trace.collecting(spans) {
+        // An incoming request with no header at all: a fresh trace.
+        let root = trace.continue_from(r, "", true)
+        let request = trace.start(root, "GET /users/7", 1000)
+        let db = trace.child_of(r, root)
+        work(db, "sql.query", 1002, 40, trace.attribute("table", "users"))
+        let cache = trace.child_of(r, root)
+        work(cache, "cache.get", 1045, 1, trace.attribute("hit", "false"))
+        let deeper = trace.child_of(r, db)
+        work(deeper, "net.read", 1003, 38, trace.attribute("fd", "7"))
+        trace.emit(trace.tagged(trace.finish(request, 1050),
+                                trace.attribute("status", "200")))
+    }
+
+    print("-- the trace, nested")
+    print(trace.tree(spans.value))
+
+    print("-- one span at a time")
+    for s in spans.value {
+        print("  {trace.render(s)}")
+    }
+
+    print("-- the header that carries it between processes")
+    var r2 = random.seeded(7)
+    let c = trace.new_trace(r2, true)
+    let header = trace.traceparent(c)
+    print("  {header}")
+    print("  round trip: {trace.traceparent(trace.parse_traceparent(header) ?? c) == header}")
+    let unsampled = trace.new_trace(r2, false)
+    print("  not sampled: {trace.traceparent(unsampled)}")
+
+    print("-- parsing a header")
+    for h in ["00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+              "00-4BF92F3577B34DA6A3CE929D0E0E4736-00F067AA0BA902B7-00",
+              "  00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01  ",
+              "01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+              "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+              "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01",
+              "00-tooshort-00f067aa0ba902b7-01",
+              "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7",
+              "not a header at all",
+              ""] {
+        match trace.parse_traceparent(h) {
+            Some(p) -> print("  \"{h}\" -> trace {p.trace_id} span {p.span_id} sampled {p.sampled}")
+            None -> print("  \"{h}\" -> refused")
+        }
+    }
+
+    print("-- continuing somebody else's trace")
+    var r3 = random.seeded(11)
+    let incoming = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+    let joined = trace.continue_from(r3, incoming, false)
+    print("  same trace: {joined.trace_id}")
+    print("  our span: {joined.span_id}  parent: {joined.parent_id}")
+    print("  sampling follows the caller: {joined.sampled}")
+    let fresh = trace.continue_from(r3, "rubbish", false)
+    print("  an unusable header starts a new trace: {fresh.trace_id != joined.trace_id}  sampled {fresh.sampled}")
+
+    print("-- a span that failed, and one never finished")
+    let bad = ref(none)
+    with Trace handled_by trace.collecting(bad) {
+        let c2 = trace.new_trace(r3, true)
+        trace.emit(trace.failed(trace.finish(trace.start(c2, "sql.query", 100), 160),
+                                "connection reset"))
+        trace.emit(trace.start(trace.child_of(r3, c2), "never ends", 200))
+    }
+    for s in bad.value {
+        print("  {trace.render(s)}  finished={trace.is_finished(s)}  duration={trace.duration_ms(s)}")
+    }
+
+    print("-- a clock that went backwards is reported, not hidden")
+    let back = trace.finish(trace.start(trace.new_trace(r3, true), "odd", 500), 400)
+    print("  {trace.duration_ms(back)}ms")
+
+    print("-- nowhere at all")
+    with Trace handled_by trace.discarding() {
+        work(trace.new_trace(r3, true), "dropped", 0, 1, trace.attribute("k", "v"))
+    }
+    print("  still {spans.value.len()} spans in the first collector")
+}

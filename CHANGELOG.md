@@ -24,7 +24,8 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   `packages/csv`, `packages/cli`, `packages/testing`, `packages/toml`,
   `packages/resilience`, `packages/cache`, `packages/crypto_hash`,
   `packages/regex`, `packages/fs`, `packages/jwt`, `packages/cors`,
-  `packages/dotenv`, `packages/sanitize`, `packages/metrics`: the first
+  `packages/dotenv`, `packages/sanitize`, `packages/metrics`,
+  `packages/errors`, `packages/trace`, `packages/redis`: the first
   wave of the release library, planned in `docs/packages-plan.md`. All but
   `log` declare **no capability at all** — a calendar, a seeded generator, path
   arithmetic and URL text are computation, and the reach each one is usually
@@ -34,6 +35,19 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   where the handler is installed.
 - `packages/http` now takes its percent coding and query parsing from
   `packages/url` rather than carrying a second copy.
+- `packages/redis`: RESP2 and RESP3, encode and decode, and a client. Both
+  versions, because a RESP3 map and a RESP2 array of pairs mean the same thing
+  and a client that reads one refuses half the servers it meets. Command
+  lengths are byte counts; a bulk string's terminator is checked in full,
+  which is what stops a client reading one byte short and taking the next
+  reply from the middle of this one.
+- `packages/errors`: a failure that carries its cause, its place and its
+  fields, with `one_line`, an indented `full`, and JSON written without the
+  `json` package — a reporter that cannot serialise an error when the JSON
+  library is what failed has a hole exactly where it is needed.
+- `packages/trace`: spans and W3C `traceparent`, with the collector as an
+  effect. An all-zero trace or span id is refused: a receiver that accepts one
+  joins every unrelated request into a single trace.
 - `packages/sanitize`: escaping named by *destination* — HTML text, an
   attribute, a script block, a URL, a shell argument, a header value, a file
   name. There is no general `escape`, because what is safe in one is not safe

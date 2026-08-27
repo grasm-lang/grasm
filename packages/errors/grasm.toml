@@ -1,0 +1,8 @@
+[package]
+name = "errors"
+version = "1.0.0"
+entry = "src/main.gr"
+
+# A value carrying what went wrong, and text describing it. Reporting it
+# somewhere is the program's business, and its ceiling.
+capabilities = []

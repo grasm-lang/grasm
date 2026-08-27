@@ -1,0 +1,203 @@
+// An error that carries where it came from.
+//
+// Grasm has no exceptions and no backtrace object: a failure is a value of a
+// type the function declared, and the chain from the deepest cause to the
+// outermost report is something the program builds. That is more work than an
+// exception with a stack trace attached, and it is why a Grasm error cannot
+// silently lose its cause — each link is put there on purpose.
+//
+// So this is the shape for the case where a value is not enough: a message, a
+// place, some fields, and a cause underneath. `T ! E` stays the way ordinary
+// failures are carried; this is what `E` can be when the failure has to
+// travel and be reported.
+
+type Field = { name: str, value: str }
+
+type Report = {
+    message: str,
+    kind: str,
+    where_: str,
+    fields: [Field],
+    causes: [Report],
+}
+
+pub fn field(name: str, value: str) -> Field {
+    Field{ name: name, value: value }
+}
+
+pub fn field_int(name: str, value: i64) -> Field {
+    Field{ name: name, value: "{value}" }
+}
+
+/// A report with nothing underneath it.
+///
+/// `where_` is written by the caller. There is no `__FILE__` and no captured
+/// stack, so a place that is not written down is a place that is not known —
+/// which is worse than a language that captures one and better than a
+/// language that pretends to.
+pub fn report(message: str) -> Report {
+    let none: [Report] = []
+    Report{ message: message, kind: "", where_: "", fields: [], causes: none }
+}
+
+pub fn of_kind(r: Report, kind: str) -> Report {
+    Report{ message: r.message, kind: kind, where_: r.where_,
+            fields: r.fields, causes: r.causes }
+}
+
+pub fn at(r: Report, place: str) -> Report {
+    Report{ message: r.message, kind: r.kind, where_: place,
+            fields: r.fields, causes: r.causes }
+}
+
+pub fn with_field(r: Report, f: Field) -> Report {
+    var fs = r.fields
+    fs.push(f)
+    Report{ message: r.message, kind: r.kind, where_: r.where_,
+            fields: fs, causes: r.causes }
+}
+
+/// A report explaining one underneath it.
+///
+/// The new message is the *outer* one, so a chain reads from what the caller
+/// was trying to do down to what actually failed — which is the order a
+/// person reads it in, and the reverse of the order it was built.
+pub fn because(message: str, cause: Report) -> Report {
+    var r = report(message)
+    var cs = r.causes
+    cs.push(cause)
+    Report{ message: r.message, kind: r.kind, where_: r.where_,
+            fields: r.fields, causes: cs }
+}
+
+/// Several causes under one report — a batch where more than one item failed.
+pub fn of_all(message: str, causes: [Report]) -> Report {
+    Report{ message: message, kind: "", where_: "", fields: [], causes: causes }
+}
+
+/// The deepest cause, which is usually the one that says what really
+/// happened. A report with several causes has no single root, so the first
+/// chain is followed.
+pub fn root(r: Report) -> Report {
+    if r.causes.is_empty() {
+        return r
+    }
+    root(r.causes[0])
+}
+
+/// How many links there are, counting this one.
+pub fn depth(r: Report) -> i64 {
+    if r.causes.is_empty() {
+        return 1
+    }
+    var deepest = 0
+    for c in r.causes {
+        let d = depth(c)
+        if d > deepest {
+            deepest = d
+        }
+    }
+    deepest + 1
+}
+
+/// Does this report, or anything under it, have that kind?
+///
+/// The question a caller asks when deciding whether to retry: not "what is
+/// this" but "is there a timeout anywhere in here".
+pub fn has_kind(r: Report, kind: str) -> bool {
+    if r.kind == kind {
+        return true
+    }
+    for c in r.causes {
+        if has_kind(c, kind) {
+            return true
+        }
+    }
+    false
+}
+
+/// The first value for a field name, at any depth.
+pub fn field_of(r: Report, name: str) -> Option[str] {
+    for f in r.fields {
+        if f.name == name {
+            return Some(f.value)
+        }
+    }
+    for c in r.causes {
+        match field_of(c, name) {
+            Some(v) -> return Some(v)
+            None -> {}
+        }
+    }
+    None
+}
+
+/// One line: the outermost message, then each cause after a colon.
+pub fn one_line(r: Report) -> str {
+    var out = r.message
+    for c in r.causes {
+        out = out + ": " + one_line(c)
+    }
+    out
+}
+
+/// The whole thing, indented, with fields and places.
+pub fn full(r: Report) -> str {
+    lines_of(r, 0).join("\n")
+}
+
+fn lines_of(r: Report, depth: i64) -> [str] {
+    let pad = "  ".repeat(depth)
+    var out: [str] = []
+    var head = pad + r.message
+    if not r.kind.is_empty() {
+        head = head + " [{r.kind}]"
+    }
+    if not r.where_.is_empty() {
+        head = head + " at {r.where_}"
+    }
+    out.push(head)
+    for f in r.fields {
+        out.push(pad + "  {f.name}: {f.value}")
+    }
+    for c in r.causes {
+        for l in lines_of(c, depth + 1) {
+            out.push(l)
+        }
+    }
+    out
+}
+
+/// As a JSON object, for a log line or a reporting service.
+///
+/// Written here rather than through the `json` package, because a reporter
+/// that cannot serialise an error when the JSON library is what failed is a
+/// reporter with a hole in it exactly where it is needed.
+pub fn as_json(r: Report) -> str {
+    var out = "\{\"message\":\"{escape(r.message)}\""
+    if not r.kind.is_empty() {
+        out = out + ",\"kind\":\"{escape(r.kind)}\""
+    }
+    if not r.where_.is_empty() {
+        out = out + ",\"where\":\"{escape(r.where_)}\""
+    }
+    for f in r.fields {
+        out = out + ",\"{escape(f.name)}\":\"{escape(f.value)}\""
+    }
+    if not r.causes.is_empty() {
+        var parts: [str] = []
+        for c in r.causes {
+            parts.push(as_json(c))
+        }
+        out = out + ",\"causes\":[" + parts.join(",") + "]"
+    }
+    out + "}"
+}
+
+fn escape(s: str) -> str {
+    s.replace("\\", "\\\\")
+        .replace("\"", "\\\"")
+        .replace("\n", "\\n")
+        .replace("\t", "\\t")
+        .replace("\r", "\\r")
+}

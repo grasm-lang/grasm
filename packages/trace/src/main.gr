@@ -1,0 +1,242 @@
+// Distributed tracing: spans, and the header that carries them between
+// processes.
+//
+// Two halves, and only one of them is hard. The data model — a span with a
+// trace id, a parent, a start, an end and some attributes — is arithmetic.
+// The *propagation* is a header format, which is text. Neither reaches
+// anything, so this package declares only its own effect: a library that
+// records a span declares `Trace`, and where the spans go is the line that
+// installs the handler, exactly as `log` and `metrics` do.
+//
+// W3C `traceparent`, which is what everything speaks:
+//
+//     00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+//     ^  ^                                ^                ^
+//     |  trace id, 16 bytes               span id, 8 bytes flags
+//     version
+//
+// The clock is a parameter. There is no monotonic clock in this language yet,
+// so a span whose end is before its start is possible when the system clock
+// moves; `duration_ms` answers a negative number rather than clamping, because
+// a negative duration is a fact about the clock and hiding it loses it.
+import random
+
+type Attribute = { name: str, value: str }
+
+type SpanContext = {
+    trace_id: str,
+    span_id: str,
+    parent_id: str,
+    sampled: bool,
+}
+
+type Span = {
+    context: SpanContext,
+    name: str,
+    start_ms: i64,
+    end_ms: i64,
+    attributes: [Attribute],
+    status: str,
+}
+
+effect Trace {
+    fn emit(s: Span)
+}
+
+pub fn attribute(name: str, value: str) -> Attribute {
+    Attribute{ name: name, value: value }
+}
+
+fn hex_of(inout r: Rng, bytes: i64) -> str {
+    let digits = "0123456789abcdef".chars()
+    var out = ""
+    for v in random.bytes_of_length(r, bytes).to_list() {
+        out = out + digits[v / 16] + digits[v % 16]
+    }
+    out
+}
+
+/// A new trace: a fresh trace id and a fresh root span id.
+///
+/// The generator comes in, so a test produces the same ids twice and a
+/// process produces unpredictable ones — the same split `uuid` makes, for the
+/// same reason.
+pub fn new_trace(inout r: Rng, sampled: bool) -> SpanContext {
+    SpanContext{ trace_id: hex_of(r, 16), span_id: hex_of(r, 8),
+                 parent_id: "", sampled: sampled }
+}
+
+/// A child of an existing context: the same trace, a new span, this one's
+/// parent.
+pub fn child_of(inout r: Rng, parent: SpanContext) -> SpanContext {
+    SpanContext{ trace_id: parent.trace_id, span_id: hex_of(r, 8),
+                 parent_id: parent.span_id, sampled: parent.sampled }
+}
+
+pub fn start(c: SpanContext, name: str, at_ms: i64) -> Span {
+    Span{ context: c, name: name, start_ms: at_ms, end_ms: 0 - 1,
+          attributes: [], status: "" }
+}
+
+pub fn tagged(s: Span, a: Attribute) -> Span {
+    var attrs = s.attributes
+    attrs.push(a)
+    Span{ context: s.context, name: s.name, start_ms: s.start_ms,
+          end_ms: s.end_ms, attributes: attrs, status: s.status }
+}
+
+pub fn finish(s: Span, at_ms: i64) -> Span {
+    Span{ context: s.context, name: s.name, start_ms: s.start_ms,
+          end_ms: at_ms, attributes: s.attributes, status: s.status }
+}
+
+/// A span that failed. The status is text rather than a flag, because the
+/// question a person asks of a trace is *why*, and `false` does not answer it.
+pub fn failed(s: Span, why: str) -> Span {
+    Span{ context: s.context, name: s.name, start_ms: s.start_ms,
+          end_ms: s.end_ms, attributes: s.attributes, status: why }
+}
+
+/// How long it took. Negative when the clock moved backwards, which this
+/// language's wall clock can do — reported rather than clamped.
+pub fn duration_ms(s: Span) -> i64 {
+    if s.end_ms < 0 {
+        return 0 - 1
+    }
+    s.end_ms - s.start_ms
+}
+
+pub fn is_finished(s: Span) -> bool {
+    s.end_ms >= 0
+}
+
+/// Record a span. The row of a function that does this is `/ {Trace}`.
+pub fn emit(s: Span) / {Trace} {
+    Trace.emit(s)
+}
+
+// --- propagation -------------------------------------------------------------
+
+/// The `traceparent` header value for a context.
+pub fn traceparent(c: SpanContext) -> str {
+    "00-{c.trace_id}-{c.span_id}-{if c.sampled { "01" } else { "00" }}"
+}
+
+fn is_hex(s: str, length: i64) -> bool {
+    if s.len() != length {
+        return false
+    }
+    for ch in s.chars() {
+        if not "0123456789abcdef".contains(ch) {
+            return false
+        }
+    }
+    true
+}
+
+/// A `traceparent` back to a context.
+///
+/// The all-zero trace id and the all-zero span id are refused: the
+/// specification says they are invalid, and a receiver that accepts them
+/// joins every unrelated request into one trace.
+pub fn parse_traceparent(header: str) -> Option[SpanContext] {
+    let parts = header.trim().to_lower().split("-")
+    if parts.len() != 4 {
+        return None
+    }
+    if parts[0] != "00" {
+        // A future version may add fields after the flags; this one has
+        // exactly four, and reading a version it does not know as if it were
+        // this one is how a malformed id gets adopted.
+        return None
+    }
+    if not is_hex(parts[1], 32) or not is_hex(parts[2], 16) {
+        return None
+    }
+    if not is_hex(parts[3], 2) {
+        return None
+    }
+    if parts[1] == "0".repeat(32) or parts[2] == "0".repeat(16) {
+        return None
+    }
+    let flags = parts[3].parse_int_base(16) ?? 0
+    Some(SpanContext{ trace_id: parts[1], span_id: parts[2], parent_id: "",
+                      sampled: flags.bit_and(1) == 1 })
+}
+
+/// The context to use for work caused by an incoming request: the caller's
+/// trace continued with a new span id, or a fresh trace when there is no
+/// usable header.
+pub fn continue_from(inout r: Rng, header: str, sampled_by_default: bool) -> SpanContext {
+    match parse_traceparent(header) {
+        Some(c) -> SpanContext{ trace_id: c.trace_id, span_id: hex_of(r, 8),
+                                parent_id: c.span_id, sampled: c.sampled }
+        None -> new_trace(r, sampled_by_default)
+    }
+}
+
+// --- collecting ---------------------------------------------------------------
+
+/// A handler that keeps every span in the list the `ref` names.
+pub fn collecting(into: ref [Span]) -> TraceHandler {
+    TraceHandler{ emit: |s| {
+        var kept = into.value
+        kept.push(s)
+        into.value = kept
+    } }
+}
+
+pub fn discarding() -> TraceHandler {
+    TraceHandler{ emit: |s| {} }
+}
+
+/// One span as a line: the shape a person reads in a terminal.
+pub fn render(s: Span) -> str {
+    var out = "{s.context.trace_id}/{s.context.span_id}"
+    if not s.context.parent_id.is_empty() {
+        out = out + " <-{s.context.parent_id}"
+    }
+    out = out + " {s.name}"
+    if is_finished(s) {
+        out = out + " {duration_ms(s)}ms"
+    } else {
+        out = out + " (unfinished)"
+    }
+    if not s.status.is_empty() {
+        out = out + " FAILED: {s.status}"
+    }
+    for a in s.attributes {
+        out = out + " {a.name}={a.value}"
+    }
+    if not s.context.sampled {
+        out = out + " (not sampled)"
+    }
+    out
+}
+
+/// Spans nested under their parents, in the order they were emitted.
+pub fn tree(spans: [Span]) -> str {
+    var lines: [str] = []
+    for s in spans {
+        if s.context.parent_id.is_empty() {
+            lines.push(render(s))
+            for l in children(spans, s.context.span_id, 1) {
+                lines.push(l)
+            }
+        }
+    }
+    lines.join("\n")
+}
+
+fn children(spans: [Span], parent: str, depth: i64) -> [str] {
+    var out: [str] = []
+    for s in spans {
+        if s.context.parent_id == parent {
+            out.push("  ".repeat(depth) + render(s))
+            for l in children(spans, s.context.span_id, depth + 1) {
+                out.push(l)
+            }
+        }
+    }
+    out
+}

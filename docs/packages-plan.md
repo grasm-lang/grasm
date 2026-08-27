@@ -160,12 +160,12 @@ subset. Declares nothing.
 Prometheus text exposition format. The registry is an effect, so a library can
 count things without declaring `io`; the exposition endpoint is `http`.
 
-**20. `trace`.** Spans, a span context that propagates through
+**20. `trace`.** — **built**, `packages/trace`. Spans, a span context that propagates through
 `traceparent`, and an exporter shape. The *propagation* and the data model are
 pure and declare nothing; the exporter is `http`. A W3C trace context header
 is text, which this language is good at.
 
-**21. `errors`.** An error value that carries a chain, a source location and
+**21. `errors`.** — **built**, `packages/errors`. An error value that carries a chain, a source location and
 fields; capture, format, and a report shape an exporter can send. Declares
 nothing. Grasm has no exceptions and no backtrace object, so the chain is
 built by the program — which is more work and is also why it cannot silently
@@ -190,7 +190,7 @@ without waiting for real time to pass.
 
 ### Data and drivers
 
-**25. `redis`.** RESP2 and RESP3 encode and decode, a client over `net`. The
+**25. `redis`.** — **built**, `packages/redis`. RESP2 and RESP3 encode and decode, a client over `net`. The
 easiest real driver to write and the most useful per line: the protocol is
 length-prefixed text.
 

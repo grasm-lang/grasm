@@ -1,0 +1,115 @@
+// The `redis` package, driven by bytes written out here.
+//
+// No server is contacted. A protocol library is right or wrong about *the
+// bytes*, and a test that needs a running Redis is a test nobody runs — so
+// the encoder's output is compared against what the protocol says, and the
+// decoder is fed replies a server would send, including the malformed ones.
+import redis
+
+fn encoded(label: str, parts: [str]) {
+    print("  {label}: {redis.command(parts).replace("\r\n", "|")}")
+}
+
+fn decoded(label: str, raw: str) {
+    match redis.parse(raw) {
+        Err(e) -> print("  {label.pad_end(30, " ")} refused: {e.why} at {e.at}")
+        Ok(pair) -> print("  {label.pad_end(30, " ")} {redis.render(pair.0)}   ({pair.1} of {raw.len()} characters)")
+    }
+}
+
+fn main() {
+    print("-- commands, as a server reads them")
+    encoded("PING", ["PING"])
+    encoded("GET", ["GET", "user:7"])
+    encoded("SET with a space", ["SET", "greeting", "hello world"])
+    encoded("a non-ascii value", ["SET", "greeting", "günaydin"])
+    encoded("an empty value", ["SET", "k", ""])
+    print("  — the length before günaydin is its byte count, not its character count")
+
+    print("-- replies")
+    decoded("simple string", "+OK\r\n")
+    decoded("error", "-ERR unknown command\r\n")
+    decoded("integer", ":42\r\n")
+    decoded("negative integer", ":-3\r\n")
+    decoded("bulk string", "$5\r\nhello\r\n")
+    decoded("empty bulk string", "$0\r\n\r\n")
+    decoded("a non-ascii bulk string", "$9\r\ngünaydin\r\n")
+    decoded("nil, RESP2", "$-1\r\n")
+    decoded("nil, RESP3", "_\r\n")
+    decoded("array", "*2\r\n$3\r\nfoo\r\n:7\r\n")
+    decoded("empty array", "*0\r\n")
+    decoded("nil array", "*-1\r\n")
+    decoded("nested array", "*2\r\n*1\r\n:1\r\n*1\r\n:2\r\n")
+    decoded("boolean, RESP3", "#t\r\n")
+    decoded("double, RESP3", ",3.5\r\n")
+    decoded("infinity, RESP3", ",inf\r\n")
+    decoded("map, RESP3", "%1\r\n$3\r\nfoo\r\n:1\r\n")
+    decoded("set, RESP3", "~2\r\n:1\r\n:2\r\n")
+    decoded("two replies in one buffer", "+OK\r\n:1\r\n")
+
+    print("-- malformed")
+    decoded("nothing", "")
+    decoded("an unknown type", "!oops\r\n")
+    decoded("a truncated line", "+OK")
+    decoded("a bare carriage return", "+OK\rX\r\n")
+    decoded("a bulk string too short", "$5\r\nhi\r\n")
+    decoded("a bulk length that is not a number", "$abc\r\n")
+    decoded("an array missing an element", "*2\r\n:1\r\n")
+
+    print("-- reading a reply in pieces, which is how a socket delivers it")
+    let whole = "*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n"
+    var so_far = ""
+    for c in whole.chars() {
+        so_far = so_far + c
+        if redis.is_complete(so_far) {
+            print("  complete after {so_far.len()} of {whole.len()} characters")
+        }
+    }
+
+    print("-- reading values out")
+    match redis.parse("*4\r\n$4\r\nname\r\n$3\r\nada\r\n$3\r\nage\r\n$2\r\n36\r\n") {
+        Err(e) -> print("  refused")
+        Ok(pair) -> {
+            let v = pair.0
+            print("  items: {redis.items_of(v).len()}")
+            print("  as pairs, from a RESP2 array: {redis.pairs_of(v)}")
+        }
+    }
+    match redis.parse("%2\r\n$4\r\nname\r\n$3\r\nada\r\n$3\r\nage\r\n$2\r\n36\r\n") {
+        Err(e) -> print("  refused")
+        Ok(pair) -> print("  as pairs, from a RESP3 map:   {redis.pairs_of(pair.0)}")
+    }
+    match redis.parse("-ERR no such key\r\n") {
+        Err(e) -> print("  refused")
+        Ok(pair) -> print("  is_error {redis.is_error(pair.0)}  message \"{redis.error_message(pair.0)}\"")
+    }
+    match redis.parse("$-1\r\n") {
+        Err(e) -> print("  refused")
+        Ok(pair) -> print("  nil: is_nil {redis.is_nil(pair.0)}  text_of {redis.text_of(pair.0) ?? "(none)"}")
+    }
+    match redis.parse("$0\r\n\r\n") {
+        Err(e) -> print("  refused")
+        Ok(pair) -> print("  empty: is_nil {redis.is_nil(pair.0)}  text_of \"{redis.text_of(pair.0) ?? "(none)"}\"")
+    }
+    match redis.parse(":9\r\n") {
+        Err(e) -> print("  refused")
+        Ok(pair) -> print("  int_of an integer: {redis.int_of(pair.0) ?? 0 - 1}")
+    }
+    match redis.parse("$2\r\n17\r\n") {
+        Err(e) -> print("  refused")
+        Ok(pair) -> print("  int_of a numeric bulk string: {redis.int_of(pair.0) ?? 0 - 1}")
+    }
+
+    print("-- a round trip: every reply this renders parses back to itself")
+    var bad = 0
+    for raw in ["+OK\r\n", ":42\r\n", "$5\r\nhello\r\n", "*2\r\n:1\r\n:2\r\n", "_\r\n"] {
+        match redis.parse(raw) {
+            Err(e) -> bad = bad + 1
+            Ok(a) -> match redis.parse(raw) {
+                Err(e) -> bad = bad + 1
+                Ok(b) -> if redis.render(a.0) != redis.render(b.0) { bad = bad + 1 }
+            }
+        }
+    }
+    print("  {bad} disagreed")
+}

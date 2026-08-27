@@ -1,0 +1,12 @@
+[package]
+name = "trace_demo"
+version = "0.1.0"
+capabilities = ["io", "Trace"]
+
+[dependencies.random]
+path = "../random"
+version = "^1.0.0"
+
+[dependencies.trace]
+path = "../trace"
+version = "^1.0.0"

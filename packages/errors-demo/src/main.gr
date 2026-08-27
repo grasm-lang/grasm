@@ -1,0 +1,70 @@
+// The `errors` package: a failure that carries where it came from.
+import errors
+
+// A stack of three layers, each adding what it was trying to do. Grasm has no
+// captured backtrace, so every link here is one somebody wrote — which is the
+// work, and is also why nothing gets lost.
+fn read_socket() -> Report {
+    errors.with_field(
+        errors.at(
+            errors.of_kind(errors.report("connection reset by peer"), "timeout"),
+            "net.read"),
+        errors.field_int("fd", 7))
+}
+
+fn fetch_row() -> Report {
+    errors.with_field(
+        errors.at(errors.because("could not read the result set", read_socket()),
+                  "sql.rows"),
+        errors.field("query", "select * from users where id = ?"))
+}
+
+fn handle_request() -> Report {
+    errors.at(errors.because("GET /users/7 failed", fetch_row()), "http.handler")
+}
+
+fn main() {
+    let e = handle_request()
+
+    print("-- one line, outermost first")
+    print("  {errors.one_line(e)}")
+
+    print("-- the whole thing")
+    print(errors.full(e))
+
+    print("-- as JSON")
+    print("  {errors.as_json(e)}")
+
+    print("-- questions a caller asks")
+    print("  depth: {errors.depth(e)}")
+    print("  root: {errors.root(e).message}")
+    print("  is there a timeout in here: {errors.has_kind(e, "timeout")}")
+    print("  is there a conflict in here: {errors.has_kind(e, "conflict")}")
+    print("  the query, from wherever it was recorded: {errors.field_of(e, "query") ?? "(absent)"}")
+    print("  the file descriptor: {errors.field_of(e, "fd") ?? "(absent)"}")
+    print("  a field nobody set: {errors.field_of(e, "nope") ?? "(absent)"}")
+
+    print("-- a report with nothing underneath")
+    let bare = errors.report("just this")
+    print("  one line: {errors.one_line(bare)}")
+    print("  depth: {errors.depth(bare)}  root: {errors.root(bare).message}")
+    print("  json: {errors.as_json(bare)}")
+
+    print("-- several causes at once, which a batch has")
+    let batch = errors.of_all("3 of 5 rows failed", [
+        errors.at(errors.of_kind(errors.report("row 2: not a number"), "parse"), "row 2"),
+        errors.at(errors.of_kind(errors.report("row 4: missing column"), "schema"), "row 4"),
+        errors.because("row 5 failed", errors.of_kind(errors.report("disk full"), "io")),
+    ])
+    print(errors.full(batch))
+    print("  depth: {errors.depth(batch)}")
+    print("  root, which follows the first chain: {errors.root(batch).message}")
+    print("  is there an io failure: {errors.has_kind(batch, "io")}")
+
+    print("-- text that would break the format")
+    let odd = errors.with_field(
+        errors.report("a \"quoted\" message\nwith a newline"),
+        errors.field("path", "C:\\temp\\x"))
+    print("  {errors.as_json(odd)}")
+    print(errors.full(odd))
+}

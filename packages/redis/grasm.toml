@@ -1,0 +1,11 @@
+[package]
+name = "redis"
+version = "1.0.0"
+entry = "src/main.gr"
+
+# The protocol is text and declares nothing; the client dials, and declares
+# `net`. They are in one package because the encoder is four functions and
+# splitting it would be ceremony — but the *encoding* half is usable without
+# ever calling `connect`, and a program that only builds commands performs
+# nothing.
+capabilities = ["net"]

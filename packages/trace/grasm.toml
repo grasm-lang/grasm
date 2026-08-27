@@ -1,0 +1,12 @@
+[package]
+name = "trace"
+version = "1.0.0"
+entry = "src/main.gr"
+
+# Spans are values and propagation is text. Sending them anywhere is `http`,
+# and is the program's decision.
+capabilities = ["Trace"]
+
+[dependencies.random]
+path = "../random"
+version = "^1.0.0"

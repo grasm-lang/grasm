@@ -1,0 +1,342 @@
+// Redis, over RESP.
+//
+// The protocol is length-prefixed text, which makes it the easiest real wire
+// format to get right and the most useful per line. Two versions are in the
+// world: RESP2, which everything speaks, and RESP3, which adds types. This
+// reads both — a RESP3 map and a RESP2 array of pairs mean the same thing, and
+// a client that only reads one refuses half the servers it meets.
+//
+// Encoding and decoding are pure and are exported separately from the
+// dialling, so a test drives the parser with bytes it wrote and never opens a
+// socket.
+
+type Value =
+    | Str(s: str)
+    | Error(message: str)
+    | Int(n: i64)
+    | Bulk(s: str)
+    | Nil
+    | Array(items: [ref Value])
+    | Bool(b: bool)
+    | Double(x: f64)
+    | Map(keys: [ref Value], values: [ref Value])
+
+type RedisError = { why: str, at: i64 }
+
+/// A command as RESP: an array of bulk strings, which is what a server
+/// expects from a client whatever version it speaks.
+///
+/// Byte lengths, not character counts: a key with a non-ASCII character in it
+/// frames short otherwise, and the server reads the next command from the
+/// middle of this one.
+pub fn command(parts: [str]) -> str {
+    var out = "*{parts.len()}\r\n"
+    for p in parts {
+        out = out + "${p.byte_len()}\r\n{p}\r\n"
+    }
+    out
+}
+
+type Reader = { cs: [str], i: i64 }
+
+fn peek(r: Reader) -> str {
+    if r.i < r.cs.len() { r.cs[r.i] } else { "" }
+}
+
+/// One reply. Answers the value and how many characters it consumed, so a
+/// caller reading a stream knows where the next one begins.
+pub fn parse(text: str) -> (ref Value, i64) ! RedisError {
+    var r = Reader{ cs: text.chars(), i: 0 }
+    let v = try read_value(r)
+    (v, r.i)
+}
+
+/// Is there a whole reply in this text yet?
+///
+/// A client reads from a socket in whatever pieces the network chose, and
+/// this is the question it asks between reads. Answering by *trying* to parse
+/// is what keeps the two in step: there is no second implementation of the
+/// framing to disagree with the first.
+pub fn is_complete(text: str) -> bool {
+    match parse(text) {
+        Ok(pair) -> true
+        Err(e) -> false
+    }
+}
+
+fn read_line(inout r: Reader) -> str ! RedisError {
+    var out = ""
+    while r.i < r.cs.len() {
+        if r.cs[r.i] == "\r" {
+            if r.i + 1 >= r.cs.len() {
+                fail(RedisError{ why: "a line ending in a carriage return with nothing after it", at: r.i })
+            }
+            if r.cs[r.i + 1] != "\n" {
+                fail(RedisError{ why: "a carriage return not followed by a newline", at: r.i })
+            }
+            r.i = r.i + 2
+            return out
+        }
+        out = out + r.cs[r.i]
+        r.i = r.i + 1
+    }
+    fail(RedisError{ why: "the reply ends mid-line", at: r.i })
+}
+
+fn read_int(inout r: Reader) -> i64 ! RedisError {
+    let line = try read_line(r)
+    match line.parse_int() {
+        Some(n) -> n
+        None -> fail(RedisError{ why: "`{line}` is not a number", at: r.i })
+    }
+}
+
+fn read_value(inout r: Reader) -> ref Value ! RedisError {
+    let tag = peek(r)
+    if tag.is_empty() {
+        fail(RedisError{ why: "nothing to read", at: r.i })
+    }
+    r.i = r.i + 1
+    if tag == "+" {
+        return ref(Str(try read_line(r)))
+    }
+    if tag == "-" {
+        return ref(Error(try read_line(r)))
+    }
+    if tag == ":" {
+        return ref(Int(try read_int(r)))
+    }
+    if tag == "#" {
+        let line = try read_line(r)
+        return ref(Bool(line == "t"))
+    }
+    if tag == "," {
+        let line = try read_line(r)
+        if line == "inf" {
+            return ref(Double(1.0 / 0.0))
+        }
+        if line == "-inf" {
+            return ref(Double(0.0 - 1.0 / 0.0))
+        }
+        match line.parse_float() {
+            Some(x) -> return ref(Double(x))
+            None -> fail(RedisError{ why: "`{line}` is not a number", at: r.i })
+        }
+    }
+    if tag == "_" {
+        let line = try read_line(r)
+        return ref(Nil)
+    }
+    if tag == "$" or tag == "=" {
+        let n = try read_int(r)
+        if n < 0 {
+            return ref(Nil)
+        }
+        // The length is in *bytes* and the reader walks characters, so a
+        // bulk string carrying anything non-ASCII would be cut short by
+        // counting characters. Characters are taken until the bytes so far
+        // reach the count.
+        var out = ""
+        while out.byte_len() < n and r.i < r.cs.len() {
+            out = out + r.cs[r.i]
+            r.i = r.i + 1
+        }
+        if out.byte_len() != n {
+            fail(RedisError{ why: "a bulk string shorter than its declared {n} bytes", at: r.i })
+        }
+        // Both characters. Checking only the carriage return accepted a
+        // reply one character short of complete, so a client reading from a
+        // socket stopped a byte early and read the next reply from the middle
+        // of this one.
+        if peek(r) != "\r" or r.i + 1 >= r.cs.len() or r.cs[r.i + 1] != "\n" {
+            fail(RedisError{ why: "a bulk string not followed by a line ending", at: r.i })
+        }
+        r.i = r.i + 2
+        return ref(Bulk(out))
+    }
+    if tag == "*" or tag == "~" or tag == ">" {
+        let n = try read_int(r)
+        if n < 0 {
+            return ref(Nil)
+        }
+        var items: [ref Value] = []
+        for _k in 0..n {
+            items.push(try read_value(r))
+        }
+        return ref(Array(items))
+    }
+    if tag == "%" {
+        let n = try read_int(r)
+        var keys: [ref Value] = []
+        var values: [ref Value] = []
+        for _k in 0..n {
+            keys.push(try read_value(r))
+            values.push(try read_value(r))
+        }
+        return ref(Map(keys, values))
+    }
+    fail(RedisError{ why: "`{tag}` is not a RESP type", at: r.i - 1 })
+}
+
+// --- reading a value ----------------------------------------------------------
+
+pub fn is_error(v: ref Value) -> bool {
+    match v {
+        Error(m) -> true
+        _ -> false
+    }
+}
+
+pub fn error_message(v: ref Value) -> str {
+    match v {
+        Error(m) -> m
+        _ -> ""
+    }
+}
+
+/// The text of a simple or bulk string. `None` for anything else, `nil`
+/// included — a caller that cannot tell "" from nil has lost the difference
+/// between an empty value and a missing one.
+pub fn text_of(v: ref Value) -> Option[str] {
+    match v {
+        Str(s) -> Some(s)
+        Bulk(s) -> Some(s)
+        _ -> None
+    }
+}
+
+pub fn int_of(v: ref Value) -> Option[i64] {
+    match v {
+        Int(n) -> Some(n)
+        Bulk(s) -> s.parse_int()
+        _ -> None
+    }
+}
+
+pub fn is_nil(v: ref Value) -> bool {
+    match v {
+        Nil -> true
+        _ -> false
+    }
+}
+
+pub fn items_of(v: ref Value) -> [ref Value] {
+    match v {
+        Array(items) -> items
+        _ -> []
+    }
+}
+
+/// A map's members, from either shape a server may send: a RESP3 map, or a
+/// RESP2 array of alternating keys and values.
+pub fn pairs_of(v: ref Value) -> [(str, str)] {
+    var out: [(str, str)] = []
+    match v {
+        Map(keys, values) -> {
+            for i in 0..keys.len() {
+                out.push((text_of(keys[i]) ?? "", text_of(values[i]) ?? ""))
+            }
+        }
+        Array(items) -> {
+            var i = 0
+            while i + 1 < items.len() {
+                out.push((text_of(items[i]) ?? "", text_of(items[i + 1]) ?? ""))
+                i = i + 2
+            }
+        }
+        _ -> {}
+    }
+    out
+}
+
+/// A reply as text, for a log line or a test.
+pub fn render(v: ref Value) -> str {
+    match v {
+        Str(s) -> "+{s}"
+        Error(m) -> "-{m}"
+        Int(n) -> ":{n}"
+        Bulk(s) -> "\"{s}\""
+        Nil -> "nil"
+        Bool(b) -> if b { "true" } else { "false" }
+        Double(x) -> "{x}"
+        Array(items) -> {
+            var parts: [str] = []
+            for it in items {
+                parts.push(render(it))
+            }
+            "[" + parts.join(", ") + "]"
+        }
+        Map(keys, values) -> {
+            var parts: [str] = []
+            for i in 0..keys.len() {
+                parts.push(render(keys[i]) + ": " + render(values[i]))
+            }
+            "\{" + parts.join(", ") + "}"
+        }
+    }
+}
+
+// --- dialling -----------------------------------------------------------------
+
+/// Send a command and read one reply.
+///
+/// `tcp_read` performs one read, and a reply arrives in as many pieces as the
+/// network chose — so this reads until the text parses. A read that answers
+/// nothing twice in a row stops it, rather than spinning against a peer that
+/// has gone quiet without closing.
+pub fn call(conn: i64, parts: [str]) -> ref Value ! IoError / {net} {
+    try tcp_write(conn, command(parts))
+    var raw = ""
+    var quiet = 0
+    while quiet < 2 {
+        let piece = tcp_read(conn) ?? ""
+        if piece.is_empty() {
+            quiet = quiet + 1
+        } else {
+            quiet = 0
+            raw = raw + piece
+        }
+        if is_complete(raw) {
+            match parse(raw) {
+                Ok(pair) -> return pair.0
+                Err(e) -> {}
+            }
+        }
+    }
+    ref(Error("no complete reply arrived"))
+}
+
+pub fn connect(host: str, port: i64) -> i64 ! IoError / {net} {
+    try tcp_connect(host, port)
+}
+
+pub fn close(conn: i64) / {net} {
+    net_close(conn)
+}
+
+// --- the commands anybody uses --------------------------------------------------
+
+pub fn ping(conn: i64) -> ref Value ! IoError / {net} {
+    try call(conn, ["PING"])
+}
+
+pub fn get(conn: i64, key: str) -> ref Value ! IoError / {net} {
+    try call(conn, ["GET", key])
+}
+
+pub fn set(conn: i64, key: str, value: str) -> ref Value ! IoError / {net} {
+    try call(conn, ["SET", key, value])
+}
+
+/// `SET key value PX milliseconds`, which is how a cache entry expires.
+pub fn set_expiring(conn: i64, key: str, value: str, ms: i64) -> ref Value ! IoError / {net} {
+    try call(conn, ["SET", key, value, "PX", "{ms}"])
+}
+
+pub fn delete(conn: i64, key: str) -> ref Value ! IoError / {net} {
+    try call(conn, ["DEL", key])
+}
+
+pub fn incr_by(conn: i64, key: str, by: i64) -> ref Value ! IoError / {net} {
+    try call(conn, ["INCRBY", key, "{by}"])
+}
