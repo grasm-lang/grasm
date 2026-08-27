@@ -7,6 +7,9 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
 
 ### Fixed
 
+- A list, map, tuple or struct literal is released when an element or
+  field leaves the function: `[1, if c { return 1 } else { 2 }]` kept the
+  partly built value (F65).
 - A `parallel` block's task list is released when a `return` or a `fail`
   leaves it, and `parallel { return … }` compiles — the statement never
   said its body had left (F64).

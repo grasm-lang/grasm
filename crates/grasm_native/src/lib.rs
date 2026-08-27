@@ -6110,8 +6110,16 @@ this case",
                 VType::F64,
             ))),
             Expr::Int(v, _) => Ok(Some((self.b.ins().iconst(types::I64, *v), VType::I64))),
-            Expr::Map(entries, _) => {
+            Expr::Map(entries, mspan) => {
                 let mut m = self.call_rt("grasm_map_new", &[]).unwrap();
+                // As for a list literal: an entry that *leaves* would abandon
+                // what is built so far, so it is held where the scope releases
+                // can find it (F65).
+                let held_t = VType::Map(Box::new(VType::Any), Box::new(VType::Any));
+                let held = self.new_var(&held_t);
+                self.b.def_var(held, m);
+                self.push_scope();
+                self.bind(&format!(" map{}", mspan.start), held, held_t);
                 let (mut kt, mut vt) = (VType::Any, VType::Any);
                 for (ke, ve) in entries {
                     let (kv, kvt) = self.eval_expr_val(ke)?;
@@ -6119,9 +6127,11 @@ this case",
                     let (vv, vvt) = self.eval_expr_val(ve)?;
                     let vb = self.box_value(vv, &vvt);
                     m = self.call_rt("grasm_map_set", &[m, kb, vb]).unwrap();
+                    self.b.def_var(held, m);
                     kt = kvt;
                     vt = vvt;
                 }
+                self.pop_scope_no_decs();
                 Ok(Some((m, VType::Map(Box::new(kt), Box::new(vt)))))
             }
             Expr::Float(v, _) => Ok(Some((self.b.ins().f64const(*v), VType::F64))),
@@ -6198,6 +6208,18 @@ this case",
             Expr::List(items, span) => {
                 let elem_t = self.list_elem_type(items, *span)?;
                 let mut list = self.new_list_of(&elem_t);
+                // The half-built list, under a name the source cannot spell,
+                // so that an element which *leaves* -- `[1, if c { return 1 }
+                // else { 2 }]` -- releases it on the way out. Held only in a
+                // Rust local it was abandoned, with the right answer printed
+                // (F65). The scope never releases it itself: on the ordinary
+                // path the list is the value being returned and the caller
+                // owns it.
+                let list_t = VType::List(Box::new(elem_t.clone()));
+                let held = self.new_var(&list_t);
+                self.b.def_var(held, list);
+                self.push_scope();
+                self.bind(&format!(" list{}", span.start), held, list_t.clone());
                 for item in items {
                     // The element type reaches every element, not only the
                     // annotated case: in `[double, |n| n + 1]` the named
@@ -6211,8 +6233,10 @@ this case",
                         vt
                     };
                     list = self.list_push_elem(list, v, &vt);
+                    self.b.def_var(held, list);
                 }
-                Ok(Some((list, VType::List(Box::new(elem_t)))))
+                self.pop_scope_no_decs();
+                Ok(Some((list, list_t)))
             }
             Expr::Index { recv, index, span } => {
                 // A pinned list is read without ever producing the list value:
@@ -6350,13 +6374,21 @@ this case",
                     return Ok(Some((nothing, VType::Unit)));
                 }
                 let mut list = self.call_rt("grasm_list_new", &[]).unwrap();
+                // As for a list literal (F65).
+                let held_t = VType::List(Box::new(VType::Any));
+                let held = self.new_var(&held_t);
+                self.b.def_var(held, list);
+                self.push_scope();
+                self.bind(&format!(" tuple{}", self.var_count), held, held_t);
                 let mut ts = Vec::with_capacity(items.len());
                 for item in items {
                     let (v, vt) = self.eval_expr_val(item)?;
                     let bx = self.box_value(v, &vt);
                     list = self.call_rt("grasm_list_push", &[list, bx]).unwrap();
+                    self.b.def_var(held, list);
                     ts.push(vt);
                 }
+                self.pop_scope_no_decs();
                 // A tuple is a list until it is sealed. The seal exists only
                 // so it renders with parentheses, which [L-DISPLAY] makes
                 // part of what the program is judged on.
@@ -9859,13 +9891,31 @@ annotate the binding",
         // differently and compared unequal, against [E-EQ-STRUCTURAL]'s "two
         // values of the same shape and contents are equal".
         let mut built: Vec<(String, Value)> = Vec::with_capacity(fields.len());
-        for (fname, fexpr) in fields {
+        // Each boxed field, held where the scope releases can find it: a later
+        // field that *leaves* -- `P{ a: [1], b: if c { return 1 } else { [2] }
+        // }` -- would otherwise abandon the ones already built (F65). Boxing
+        // transfers ownership into the container, so these are the struct's to
+        // release until it exists, and the scope is popped without releases
+        // once it does.
+        self.push_scope();
+        if base.is_some() {
+            let bt = VType::Struct(sname.clone());
+            let hv = self.new_var(&bt);
+            self.b.def_var(hv, sv);
+            self.bind(&format!(" base{}", span.start), hv, bt);
+        }
+        for (fi, (fname, fexpr)) in fields.iter().enumerate() {
             let ft = self.struct_field_type(&sname, &fname.name, span)?;
             let (mut fv, fvt) = self.eval_expr_expecting(fexpr, Some(&ft))?;
             if ft == VType::F64 && fvt == VType::I64 {
                 fv = self.b.ins().fcvt_from_sint(types::F64, fv);
             }
             let boxed = self.box_value(fv, &ft);
+            if ft.boxed() || matches!(ft, VType::I64 | VType::F64 | VType::Bool | VType::Unit | VType::Ref(_)) {
+                let hv = self.new_var(&VType::Str);
+                self.b.def_var(hv, boxed);
+                self.bind(&format!(" fld{}_{}", span.start, fi), hv, VType::Str);
+            }
             if base.is_some() {
                 let (fp, fl) = self.str_ptr_len(&fname.name);
                 sv = self
@@ -9920,6 +9970,8 @@ annotate the binding",
             let dp = self.b.ins().global_value(ptr_ty, gv);
             sv = self.call_rt("grasm_struct_make", &[dp, argv]).unwrap();
         }
+        // The fields belong to the struct now.
+        self.pop_scope_no_decs();
         Ok((sv, VType::Struct(sname)))
     }
 

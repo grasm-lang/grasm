@@ -118,7 +118,8 @@ captures, which every one of those four exits kept (F62); and a `region`, a
 plain block or an `unsafe` block that was left early, whose following
 statement was emitted past the terminator (F63); and a `parallel` block's
 task list, kept by every early exit, whose statement had the same fault
-(F64).
+(F64); and a list, map, tuple or struct literal under construction,
+abandoned when an element or field left the function (F65).
 
 ## S4 — diagnostics
 

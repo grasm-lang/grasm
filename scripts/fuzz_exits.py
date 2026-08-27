@@ -50,6 +50,8 @@ _lib("fresh").fresh_or_stop(GRASM)
 
 PRELUDE = """type Bad = | Bad
 
+type Pair = { a: [i64], b: [i64] }
+
 effect Src {
     fn get() -> i64
 }
@@ -76,6 +78,13 @@ BLOCKS = {
     # No `spawn` at all: the list is built and freed with nothing to run, which
     # is the other end of the same release.
     "parallel-empty": "    parallel {{\n{body}\n    }}",
+    # A literal under construction owns what it has built so far. An element
+    # or field that *leaves* abandons it -- the value is held in a Rust local
+    # and nothing releases it (F65). Four builders, one shape.
+    "list-literal": "    let made = [1, {body_expr}]\n    let _n = made.len()",
+    "map-literal": "    let made = {{ \"a\": {held}, \"b\": {body_expr_boxed} }}\n    let _n = made.len()",
+    "tuple-literal": "    let made = ({held}, {body_expr_boxed})\n    let _n = made.0.len()",
+    "struct-literal": "    let made = Pair{{ a: {held}, b: {body_expr_boxed} }}\n    let _n = made.a.len()",
     "if-branch": "    if {held}.len() > 0 {{\n{body}\n    }}",
     "match-arm": "    match {held}.len() {{\n        0 -> {{\n            let _z = 0\n        }}\n        _ -> {{\n{body}\n        }}\n    }}",
 }
@@ -90,6 +99,19 @@ EXITS = {
 }
 
 
+# The exit as an expression, for the builders that need one in an element or
+# a field rather than as a statement of its own.
+EXIT_EXPRS = {
+    "fail": ("if true {{ fail(Bad) }} else {{ {alt} }}", "fallible"),
+    "return": ("if true {{ return 1 }} else {{ {alt} }}", "plain"),
+    "break": ("if true {{ break }} else {{ {alt} }}", "loop"),
+    "continue": ("if true {{ continue }} else {{ {alt} }}", "loop"),
+    "falls-through": ("{alt}", "plain"),
+}
+
+BUILDERS = ("list-literal", "map-literal", "tuple-literal", "struct-literal")
+
+
 def build(bname, block, ename, exit_body, kind):
     held = "kept"
     # A block performs what its contents perform, and `unsafe { … }` performs
@@ -102,7 +124,15 @@ def build(bname, block, ename, exit_body, kind):
         row = "{io, async, Src}"
     else:
         row = "{Src}"
-    inner = block.format(body=exit_body, held=held)
+    if bname in BUILDERS:
+        tpl, _ = EXIT_EXPRS[ename]
+        inner = block.format(
+            body_expr=tpl.format(alt="2"),
+            body_expr_boxed=tpl.format(alt="[2]"),
+            held=held,
+        )
+    else:
+        inner = block.format(body=exit_body, held=held)
     if kind == "fallible":
         return (
             PRELUDE

@@ -80,6 +80,7 @@ and the entries disagree.
 | [F62](#f62) | a handler's captures were kept by every early exit | S2, leak | **fixed** |
 | [F63](#f63) | a block that left was reported as an ordinary statement | S1, codegen bug | **fixed** |
 | [F64](#f64) | a `parallel` block's task list was kept by every early exit | S2, leak | **fixed** |
+| [F65](#f65) | a literal under construction was abandoned by an early exit | S2, leak | **fixed** |
 
 <!-- end index -->
 ## F1 — a wrapped condition must end the line with the operator (S4) — **fixed**
@@ -2842,3 +2843,36 @@ statement's guard four declines.
 The generator earned its keep on the tick after it was written. The
 leaking shapes were found by hand first; what the generator adds is that
 they cannot come back.
+
+## F65 — a literal under construction was abandoned by an early exit (S2, leak) — **fixed**
+
+```
+let xs = [1, if c { return 1 } else { 2 }]
+```
+
+One allocation kept, with the right answer printed. All four builders had
+it: a list literal, a map literal, a tuple literal, and a struct literal
+— the last with or without a `..base`. `fail`, `break` and `continue`
+lose it the same way.
+
+A literal is built element by element into a Rust local, and nothing in
+the emitted code owns it until the whole value exists. An element that
+*leaves* takes the enclosing function with it and the partial container
+is never released. The fix is the one F64 used: hold it under a name the
+source cannot spell, so the ordinary scope releases find it. The scope is
+popped *without* releases at the end, because on the ordinary path the
+value is what is being returned and the caller owns it.
+
+Found by auditing rather than probing. Six defects — F59 through F64 —
+had one signature: a resource released by hand at a block's normal end,
+guarded by a condition that is false exactly when an early exit happens.
+So this tick read every `if !terminated` and every scope push in the
+backend instead of guessing at shapes. The eleven `!terminated` guards
+turned out to be jumps or epilogues and were all correct; the two
+call-site scopes were correct; the literal builders held their value in
+no scope at all, which the audit surfaced because they had no guard to
+read.
+
+**Gate**: four builder shapes in `scripts/fuzz_exits.py`, each with an
+element or field that leaves (51 to 71 programs). Removing the list
+literal's binding gives four leaks.
