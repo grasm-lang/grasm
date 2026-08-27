@@ -109,7 +109,10 @@ so one can be a parameter, a result or a field (F53); and `fold`,
 `unwrap_or`, `expect` and `parse_int_base` where the backend has to name a
 call's result type rather than a receiver's (F54). And a write *inside* a referent, `r.value[0] = v`, refused
 at two sites one level apart while reading the same place always compiled
-(F56).
+(F56). Closed on 2026-08-27: a handler left installed when a `fail` or
+`return` leaves its `with` block, which answered from the wrong handler and
+then from a dead frame (F59), and the `return` itself, whose following
+statement was emitted past the terminator (F60).
 
 ## S4 — diagnostics
 

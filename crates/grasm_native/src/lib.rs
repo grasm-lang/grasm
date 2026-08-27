@@ -1698,6 +1698,7 @@ impl<'m> Codegen<'m> {
             inout_slots: Vec::new(),
             filled: false,
             dead: false,
+            handlers_installed: 0,
             closure_hints: Vec::new(),
             pinned: Vec::new(),
             tail_hint: None,
@@ -2291,6 +2292,7 @@ operation's",
             inout_slots: Vec::new(),
             filled: false,
             dead: false,
+            handlers_installed: 0,
             closure_hints: Vec::new(),
             pinned: Vec::new(),
             tail_hint: None,
@@ -2385,6 +2387,7 @@ operation's",
             inout_slots: Vec::new(),
             filled: false,
             dead: false,
+            handlers_installed: 0,
             closure_hints: Vec::new(),
             pinned: Vec::new(),
             tail_hint: None,
@@ -2518,6 +2521,7 @@ operation's",
             inout_slots: Vec::new(),
             filled: false,
             dead: false,
+            handlers_installed: 0,
             closure_hints: Vec::new(),
             pinned: Vec::new(),
             tail_hint: None,
@@ -2793,6 +2797,15 @@ struct FnCx<'a, 'm> {
     /// `continue`, `return`, or `fail` was just emitted). Cleared whenever we
     /// switch to a fresh block.
     filled: bool,
+    /// How many handlers this function has installed and not yet popped.
+    ///
+    /// A `with` pops its handler when the block ends normally, and skips the
+    /// pop when the body terminated -- correct only if something else pops on
+    /// the way out, and nothing did. A `fail` inside a `with` returned from
+    /// the function with the handler still installed, so the *next* operation
+    /// found it: `42` in the interpreter, `7` in a compiled build, and a
+    /// dangling stack address after a few rounds of it (F59).
+    handlers_installed: usize,
     /// True when the block being compiled into is one nothing can reach:
     /// `fail`, `panic` and `exit` leave, then open a fresh block so the
     /// statements after them still have somewhere to go. That switch clears
@@ -4169,6 +4182,12 @@ impl FnCx<'_, '_> {
     /// Before a `return`: release every boxed local in every scope.
     fn emit_scope_decs_all(&mut self) {
         self.emit_inout_writeback();
+        // Every handler this function installed and has not popped. Leaving
+        // by `return` or `fail` skips the `with` block's own pop, so this is
+        // the only place they come off (F59).
+        for _ in 0..self.handlers_installed {
+            self.call_rt("grasm_handler_pop", &[]);
+        }
         // Captures held for a handler passed to a call. They are released with
         // the frame rather than after the call, because the block they live in
         // is a pointer into this frame and stays reachable for as long as the
@@ -5228,6 +5247,17 @@ impl FnCx<'_, '_> {
                         self.push_scope();
                         self.bind(&format!(" with.handler{}", span.start), hvar, ht);
                         let out = self.with_handler_value(&ename, hvar, body, *span);
+                        // The scope's releases belong in the block, and the
+                        // block may already be closed: a `return` inside the
+                        // body terminated it, and emitting them anyway wrote
+                        // instructions after a terminator (F60). `return`
+                        // released this scope itself on its way out --
+                        // `emit_scope_decs_all` walks every live scope,
+                        // including this one.
+                        if matches!(out, Ok(StmtOut::Terminated)) {
+                            self.pop_scope_no_decs();
+                            return out;
+                        }
                         self.pop_scope_with_decs();
                         return out;
                     }
@@ -5258,6 +5288,7 @@ this case",
                 };
                 let (ep, el) = self.str_ptr_len(&ename);
                 self.call_rt("grasm_handler_push", &[ep, el]);
+                self.handlers_installed += 1;
                 let ptr_ty = self.cg.module.target_config().pointer_type();
                 let mut held: Vec<(cranelift_codegen::ir::StackSlot, Vec<(String, VType)>)> =
                     Vec::new();
@@ -5283,6 +5314,11 @@ this case",
                     // handler is installed, so the pointer stays good for as
                     // long as anything can call the operation — including from
                     // functions several calls deep.
+                    //
+                    // That invariant is what `handlers_installed` keeps: a
+                    // `fail` inside the block does return while it is
+                    // installed, and until F59 nothing popped it, so the next
+                    // operation read this slot in a frame that had gone.
                     let slot = self.b.create_sized_stack_slot(
                         cranelift_codegen::ir::StackSlotData::new(
                             cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
@@ -5338,6 +5374,7 @@ this case",
                         self.dec_if_boxed(v, &vt);
                     }
                 }
+                self.handlers_installed -= 1;
                 if !terminated {
                     self.call_rt("grasm_handler_pop", &[]);
                     for (slot, captures) in &held {
@@ -5351,7 +5388,18 @@ this case",
                         }
                     }
                 }
-                Ok(StmtOut::Value(None))
+                // A body that left -- by `return`, `fail`, `break` -- closed
+                // this block, and saying so is what stops the next statement
+                // being written into it. Reported as an ordinary value, the
+                // `0` after `with … { return 1 }` was emitted *after* the
+                // return: "a terminator instruction was encountered before the
+                // end of block0", a verifier error the backend reported
+                // against itself (F60).
+                Ok(if terminated {
+                    StmtOut::Terminated
+                } else {
+                    StmtOut::Value(None)
+                })
             }
         }
     }
@@ -5376,7 +5424,9 @@ this case",
         }
         let h = self.b.use_var(hvar);
         self.call_rt("grasm_handler_install", &[h]);
+        self.handlers_installed += 1;
         let (tail, mut terminated) = self.eval_block_inner(body)?;
+        self.handlers_installed -= 1;
         terminated |= self.is_filled();
         // As on the literal path: the statement discards the block's value, so
         // a boxed one is released here (F57).
@@ -5386,7 +5436,12 @@ this case",
             }
             self.call_rt("grasm_handler_pop", &[]);
         }
-        Ok(StmtOut::Value(None))
+        // As on the literal path (F60).
+        Ok(if terminated {
+            StmtOut::Terminated
+        } else {
+            StmtOut::Value(None)
+        })
     }
 
     /// The hidden local a handler literal's capture is copied into.

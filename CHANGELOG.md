@@ -7,6 +7,11 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
 
 ### Fixed
 
+- A handler is popped when a `fail` or `return` leaves its `with` block.
+  It stayed installed, so the next operation found the wrong one — and
+  after a few rounds, a stack slot in a frame that had gone (F59).
+- `return` out of a `with` block compiles. The statement after it was
+  emitted after the return, which Cranelift refused (F60).
 - `GRASM_LEAK_CHECK` counts the NUL-terminated copies handed to C. They
   are `CString` allocations rather than the runtime's, so one leaked was
   invisible to every gate (F57).

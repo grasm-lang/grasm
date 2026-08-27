@@ -74,6 +74,8 @@ and the entries disagree.
 | [F56](#f56) | a write *inside* a referent was refused | S3, over-strict | **fixed** |
 | [F57](#f57) | a `with` block's discarded value was never released | S2, leak | **fixed** |
 | [F58](#f58) | a whole context did not run, twice, in a crossing of panic paths | S3, harness | **fixed** |
+| [F59](#f59) | a handler outlived the block it was installed for | S1, wrong answer and use-after-free | **fixed** |
+| [F60](#f60) | a `with` never said its body had left | S1, codegen bug | **fixed** |
 
 <!-- end index -->
 ## F1 — a wrapped condition must end the line with the operator (S4) — **fixed**
@@ -2610,3 +2612,75 @@ have been missed.
 
 **Gate**: `scripts/fuzz_panics.py`, the twelfth generator. Mutation-tested
 against the off-by-one, which it catches with eight disagreements.
+
+## F59 — a handler outlived the block it was installed for (S1, wrong answer and use-after-free) — **fixed**
+
+```
+fn inner() -> i64 ! Bad / {Src} {
+    with Src handled_by SrcHandler{ get: || 7 } {
+        fail(Bad)
+    }
+    0
+}
+
+fn main() {
+    with Src handled_by SrcHandler{ get: || 42 } {
+        print("{inner() ?? 0 - 1} {Src.get()}")
+    }
+}
+```
+
+`grasm run` and a bundle print `-1 42`. A `--native` build printed
+`-1 7`: the inner handler was still installed after the failure left its
+block, so the outer one was not the one the next operation found.
+
+Run four times in a loop it printed `4351911792`. A handler literal's
+captures live in a stack slot of the frame that installed them, and the
+comment beside that slot says the frame cannot return while the handler
+is installed. A `fail` returns while it is installed. So the operation
+was reading a slot in a frame that had gone — a use-after-free, and the
+number is whatever was there.
+
+The pop was written where the block ends *normally* and skipped whenever
+the body terminated, which is correct only if something else pops on the
+way out. Nothing did. A function now counts the handlers it has
+installed, and `emit_scope_decs_all` — which `return` and `fail` both
+call before leaving — pops that many.
+
+## F60 — a `with` never said its body had left (S1, codegen bug) — **fixed**
+
+```
+fn leaves() -> i64 / {Src} {
+    with Src handled_by SrcHandler{ get: || 7 } {
+        return 1
+    }
+    0
+}
+```
+
+`a terminator instruction was encountered before the end of block0`. The
+`0` after the `with` was emitted after the `return`, because `Stmt::With`
+reported `StmtOut::Value(None)` whatever its body did, so the statement
+walker carried on into a block that was already closed. Found while
+covering F59's exits: the same `with`, left the other way.
+
+Both paths were wrong and each needed its own fix. The literal path
+reports `StmtOut::Terminated` now. The handler-value path is wrapped in a
+scope holding the handler's reference, and that scope was released
+*after* the call returned — so even reporting termination left the
+releases written past the terminator. A terminated body pops that scope
+without them; `return` already released it on its way out, since
+`emit_scope_decs_all` walks every live scope including that one.
+
+**Gates**: `examples/handler_exits.gr` leaves a `with` four ways — `fail`,
+`return`, falling through, and a nested `fail` — and checks afterwards
+that the *outer* handler answers, then repeats the failing one four times
+because one un-popped handler is a wrong answer and several are a stack
+of dead frames. It is in the corpus, so `difftest`, `leakcheck`,
+`agreetest`, `wasmtest` and `crosstest` all carry it. Two cases in
+`scripts/nativegaps.sh` (57) cover the verifier failure on both paths.
+
+Found by crossing what a *recoverable* failure leaves behind — a
+half-written `inout`, a partly built list, a `ref` written before the
+fail, a handler stack — the axis after F58's, which asked only where a
+fault happens and not what survives it.

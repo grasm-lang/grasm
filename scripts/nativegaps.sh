@@ -853,6 +853,42 @@ fn main() {
     print("{w.span} {total(w.span)}")
 }'
 
+# `return` out of a `with` block. The `with` reported itself an ordinary
+# statement whatever its body did, so the statement after it was written into
+# the block the return had already closed -- a verifier error the backend
+# reported against itself (F60).
+expect_compiled "a return out of a with block" 'effect Src {
+    fn get() -> i64
+}
+
+fn leaves() -> i64 / {Src} {
+    with Src handled_by SrcHandler{ get: || 7 } {
+        return 1
+    }
+    0
+}
+
+fn main() {
+    print("{leaves()}")
+}'
+
+# The same through a handler *value*, which takes the other path: there the
+# scope holding the handler was released after the block had been closed.
+expect_compiled "a return out of a with, handler by value" 'effect Src {
+    fn get() -> i64
+}
+
+fn leaves(h: SrcHandler) -> i64 / {Src} {
+    with Src handled_by h {
+        return 1
+    }
+    0
+}
+
+fn main() {
+    print("{leaves(SrcHandler{ get: || 7 })}")
+}'
+
 if [ "$ran" != "$declared" ]; then
     echo
     echo "only $ran of $declared cases ran — the rest were never reached,"

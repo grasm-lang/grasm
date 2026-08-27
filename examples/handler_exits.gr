@@ -1,0 +1,74 @@
+// How a `with` block is left, and what it leaves behind.
+//
+// A handler is installed for the block and popped when the block ends. That
+// pop was written where the block ends *normally*, and skipped when the body
+// terminated — correct only if something else pops on the way out, and
+// nothing did. So a `fail` or a `return` inside a `with` returned from the
+// function with the handler still installed, and the next operation found it:
+// the interpreter answered from the outer handler, a compiled build from the
+// inner one, and after a few rounds from a stack slot in a frame that had
+// gone (`4351911792`, once).
+//
+// Leaving by `return` had a second fault. The `with` reported itself an
+// ordinary statement, so the statement after it was written into the block the
+// return had already closed — a Cranelift verifier error the backend reported
+// against itself.
+type Bad = | Bad
+
+effect Src {
+    fn get() -> i64
+}
+
+fn fails_out(h: SrcHandler) -> i64 ! Bad / {Src} {
+    with Src handled_by h {
+        fail(Bad)
+    }
+    0
+}
+
+fn returns_out(h: SrcHandler) -> i64 / {Src} {
+    with Src handled_by h {
+        return 1
+    }
+    0
+}
+
+fn falls_through(h: SrcHandler) -> i64 / {Src} {
+    with Src handled_by h {
+        let v = Src.get()
+        v
+    }
+    2
+}
+
+fn nested_fails(h: SrcHandler) -> i64 ! Bad / {Src} {
+    with Src handled_by h {
+        with Src handled_by SrcHandler{ get: || 2 } {
+            fail(Bad)
+        }
+    }
+    0
+}
+
+fn main() {
+    let inner = SrcHandler{ get: || 7 }
+
+    // Each of these leaves a `with` some other way, and afterwards the outer
+    // handler — not the inner one — has to be the one an operation finds.
+    with Src handled_by SrcHandler{ get: || 42 } {
+        print("{fails_out(inner) ?? 0 - 1} {Src.get()}")
+        print("{returns_out(inner)} {Src.get()}")
+        print("{falls_through(inner)} {Src.get()}")
+        print("{nested_fails(inner) ?? 0 - 1} {Src.get()}")
+    }
+
+    // Repeatedly, because one un-popped handler is a wrong answer and several
+    // are a stack of dead frames.
+    with Src handled_by SrcHandler{ get: || 99 } {
+        var log = ""
+        for _i in 0..4 {
+            log += "{fails_out(inner) ?? 0 - 1} "
+        }
+        print("{log}{Src.get()}")
+    }
+}
