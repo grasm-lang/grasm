@@ -761,8 +761,8 @@ version = "1.0.0"
 entry = "main.gr"
 capabilities = ["io", "net"]
 
-[dependencies.lib_json]
-path = "../lib-json"
+[dependencies.json]
+path = "../../packages/json"
 version = "^1.0.0"
 """
     )
@@ -792,6 +792,7 @@ grasm deps --locked   # fail rather than update the lockfile
 <tr><td><code>http</code></td><td><i>none</i></td><td>Requests, responses, routing with <code>:param</code> and <code>*</code> segments, percent decoding, HTML escaping.</td></tr>
 <tr><td><code>http_server</code></td><td><code>io</code>, <code>net</code></td><td>The accept loop, and many conversations on one thread. Depends on <code>http</code>.</td></tr>
 <tr><td><code>http_client</code></td><td><code>net</code></td><td>Dials, sends what <code>http</code> composed, reads until the declared frame arrives. Depends on <code>http</code>.</td></tr>
+<tr><td><code>json</code></td><td><i>none</i></td><td>Parse, render, reach into a document, build one. Six programs in <code>ProjectGold/</code> depend on it.</td></tr>
 </table></div>
 <p>They are three packages because <code>http</code> <em>cannot</em> open a
 socket, and that is checked rather than claimed: its manifest declares no
@@ -943,7 +944,7 @@ well as for what it prints.</p>
 <h2>What does not work</h2>
 <div class="scroll"><table>
 <tr><th>Limit</th><th>Detail</th></tr>
-<tr><td>Three libraries, all first-party</td><td><code>http</code>, <code>http_server</code>, <code>http_client</code>. Anything else you need, you write, or bind to C with <code>extern fn</code>.</td></tr>
+<tr><td>Four libraries, all first-party</td><td><code>http</code>, <code>http_server</code>, <code>http_client</code>, <code>json</code>. Anything else you need, you write, or bind to C with <code>extern fn</code>.</td></tr>
 <tr><td>No remote registry</td><td>Path and local-registry dependencies work. Nothing fetches or publishes.</td></tr>
 <tr><td>No release binaries</td><td>Build from source with a Rust toolchain.</td></tr>
 <tr><td>0.45× native Rust</td><td>Measured, floor-subtracted 0.39×, against a 0.95× target.</td></tr>
@@ -997,7 +998,7 @@ written. What is missing is a remote registry and the rest of them.</p>
 <tr><th>Library</th><th>State</th></tr>
 <tr><td><b>http</b> — server</td><td><b>Built.</b> <code>packages/http</code> parses and routes and declares no capability; <code>packages/http_server</code> owns the socket. Both in the corpus, both agreeing on three engines.</td></tr>
 <tr><td><b>http</b> — client</td><td><b>Built.</b> <code>packages/http_client</code>. Its demo talks to <code>http_server</code> over a real socket — a Grasm client and a Grasm server.</td></tr>
-<tr><td><b>json</b></td><td>Exists as <code>lib-json</code>; needs a stable API and publishing.</td></tr>
+<tr><td><b>json</b></td><td><b>Built.</b> <code>packages/json</code>: parse, render, reach in (<code>get</code>, <code>at</code>, <code>path</code>, <code>as_str</code>…), build up (<code>object</code>, <code>list</code>, <code>with_key</code>…). Declares no capability. The six ProjectGold programs that used it point here.</td></tr>
 <tr><td><b>async</b> — timers, channels, select</td><td>Not started. <code>parallel</code> and <code>spawn</code> are in the language; the library above them is not.</td></tr>
 <tr><td><b>testing</b>, <b>log</b>, <b>time</b>, <b>uuid</b>, <b>base64</b>, <b>regex</b></td><td>Not started.</td></tr>
 </table></div>

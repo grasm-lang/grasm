@@ -1,15 +1,16 @@
-// JSON, as a module.
+// JSON.
 //
-// This is project 13's parser, extracted so a second project can use it rather
-// than carry a second copy of it. Nothing about it changed except the `pub`
-// markers: what a module exports is the one decision extraction forces you to
-// make, and the answer here is parse, render, compare, and the type itself.
+// Project 13's parser, extracted, then given the half a library needs that a
+// program does not: a way to reach into a document and a way to build one.
+// Parsing and rendering were always here; `get`, `at`, `as_str` and their
+// neighbours are what the six programs using this were writing by hand.
 //
-// It is a *copy* of project 13's code rather than a shared dependency, and the
-// reason is worth stating: ProjectGold's harness runs `<dir>/main.gr`, and
-// Grasm resolves `import json` as a sibling of the importing file. Sharing one
-// file across two directories needs a package with a `grasm.toml`, which is
-// what phase 2's project 5 is for.
+// It declares no capability. Text in, a value out — it opens no file, dials
+// nothing, starts no process — so a program that depends on it does not
+// acquire the ability to do any of those by depending on it ([T-CAPABILITY]).
+//
+// A parsed value is a `ref Json`, so a document shares its parts rather than
+// copying them: an object holding the same list twice holds one list.
 
 type Json =
     | JNull
@@ -223,7 +224,7 @@ fn parse_value(inout p: P) -> ref Json ! Bad {
     ref(JNum(n))
 }
 
-pub fn parse_json(src: str) -> ref Json ! Bad {
+pub fn parse(src: str) -> ref Json ! Bad {
     var p = P{ cs: src.chars(), i: 0 }
     let v = try parse_value(p)
     skip_ws(p)
@@ -233,7 +234,7 @@ pub fn parse_json(src: str) -> ref Json ! Bad {
     v
 }
 
-pub fn escape_json(s: str) -> str {
+pub fn escape(s: str) -> str {
     var out = ""
     for c in s.chars() {
         if c == "\"" { out = out + "\\\"" }
@@ -255,23 +256,23 @@ pub fn number_text(n: f64) -> str {
     "{n}"
 }
 
-pub fn to_text(v: ref Json) -> str {
+pub fn render(v: ref Json) -> str {
     match v {
         JNull -> "null"
         JBool(b) -> if b { "true" } else { "false" }
         JNum(n) -> number_text(n)
-        JStr(s) -> "\"" + escape_json(s) + "\""
+        JStr(s) -> "\"" + escape(s) + "\""
         JList(items) -> {
             var parts: [str] = []
             for it in items {
-                parts.push(to_text(it))
+                parts.push(render(it))
             }
             "[" + parts.join(",") + "]"
         }
         JObj(keys, values) -> {
             var parts: [str] = []
             for i in 0..keys.len() {
-                parts.push("\"" + escape_json(keys[i]) + "\":" + to_text(values[i]))
+                parts.push("\"" + escape(keys[i]) + "\":" + render(values[i]))
             }
             "\{" + parts.join(",") + "\}"
         }
@@ -313,4 +314,229 @@ pub fn equal(a: ref Json, b: ref Json) -> bool {
             _ -> false
         }
     }
+}
+
+
+// --- reaching into a document --------------------------------------------
+//
+// Every one of these answers `Option`, and none of them panics. A document is
+// input somebody else chose: asking an object for a key it does not have, or a
+// list for an index past its end, is an ordinary thing for a correct program to
+// do and is not a bug in it.
+
+/// What kind of value this is, as text: `null`, `bool`, `number`, `string`,
+/// `list` or `object`.
+pub fn kind(v: ref Json) -> str {
+    match v {
+        JNull -> "null"
+        JBool(b) -> "bool"
+        JNum(n) -> "number"
+        JStr(s) -> "string"
+        JList(items) -> "list"
+        JObj(keys, values) -> "object"
+    }
+}
+
+pub fn is_null(v: ref Json) -> bool {
+    match v {
+        JNull -> true
+        _ -> false
+    }
+}
+
+/// A member of an object. `None` when this is not an object, or has no such
+/// key. A duplicate key answers with the first, which is what the parser kept.
+pub fn get(v: ref Json, key: str) -> Option[ref Json] {
+    match v {
+        JObj(keys, values) -> {
+            for i in 0..keys.len() {
+                if keys[i] == key {
+                    return Some(values[i])
+                }
+            }
+            None
+        }
+        _ -> None
+    }
+}
+
+/// An element of a list. `None` when this is not a list, or the index is
+/// outside it. A negative index counts from the end.
+pub fn at(v: ref Json, i: i64) -> Option[ref Json] {
+    match v {
+        JList(items) -> {
+            let n = if i < 0 { items.len() + i } else { i }
+            if n < 0 or n >= items.len() {
+                return None
+            }
+            Some(items[n])
+        }
+        _ -> None
+    }
+}
+
+/// A value several steps down, written `user.address.city`, with a number for
+/// a list index: `items.0.name`.
+///
+/// A key containing a dot cannot be reached this way. That is the price of the
+/// spelling, and `get` is the way to reach one.
+pub fn path(v: ref Json, dotted: str) -> Option[ref Json] {
+    var here = v
+    for step in dotted.split(".") {
+        if step.is_empty() {
+            return None
+        }
+        let next = match step.parse_int() {
+            Some(n) -> at(here, n)
+            None -> get(here, step)
+        }
+        match next {
+            Some(w) -> here = w
+            None -> return None
+        }
+    }
+    Some(here)
+}
+
+pub fn as_str(v: ref Json) -> Option[str] {
+    match v {
+        JStr(s) -> Some(s)
+        _ -> None
+    }
+}
+
+pub fn as_num(v: ref Json) -> Option[f64] {
+    match v {
+        JNum(n) -> Some(n)
+        _ -> None
+    }
+}
+
+/// A number that is a whole value, as an `i64`. `1.5` is `None` rather than
+/// `1`: JSON has one number type and silently truncating is how a quantity
+/// becomes a different quantity.
+pub fn as_int(v: ref Json) -> Option[i64] {
+    match v {
+        JNum(n) -> {
+            if n != n.as_i64().as_f64() {
+                return None
+            }
+            Some(n.as_i64())
+        }
+        _ -> None
+    }
+}
+
+pub fn as_bool(v: ref Json) -> Option[bool] {
+    match v {
+        JBool(b) -> Some(b)
+        _ -> None
+    }
+}
+
+/// How many elements a list has, or members an object has. Zero for anything
+/// else — a scalar has no length, and `Option[i64]` for a question this common
+/// costs every caller a `??` for a case none of them mean differently.
+pub fn count(v: ref Json) -> i64 {
+    match v {
+        JList(items) -> items.len()
+        JObj(keys, values) -> keys.len()
+        _ -> 0
+    }
+}
+
+/// An object's keys, in the order the document wrote them. Empty for anything
+/// else.
+pub fn keys_of(v: ref Json) -> [str] {
+    match v {
+        JObj(keys, values) -> keys
+        _ -> []
+    }
+}
+
+/// A list's elements, in order. Empty for anything else.
+pub fn items_of(v: ref Json) -> [ref Json] {
+    match v {
+        JList(items) -> items
+        _ -> []
+    }
+}
+
+// --- building one ---------------------------------------------------------
+
+pub fn null() -> ref Json {
+    ref(JNull)
+}
+
+pub fn boolean(b: bool) -> ref Json {
+    ref(JBool(b))
+}
+
+pub fn number(n: f64) -> ref Json {
+    ref(JNum(n))
+}
+
+pub fn text(s: str) -> ref Json {
+    ref(JStr(s))
+}
+
+pub fn list(items: [ref Json]) -> ref Json {
+    ref(JList(items))
+}
+
+/// An object from parallel keys and values. A key with no value, or a value
+/// with no key, is the caller having lost track of one of the two lists, so
+/// the shorter one decides how many members there are.
+pub fn object(keys: [str], values: [ref Json]) -> ref Json {
+    var ks: [str] = []
+    var vs: [ref Json] = []
+    for i in 0..keys.len().min(values.len()) {
+        ks.push(keys[i])
+        vs.push(values[i])
+    }
+    ref(JObj(ks, vs))
+}
+
+/// An object with one member added or replaced. Answers a new value; the one
+/// passed in is unchanged, which is what makes it safe to hand a document to
+/// two callers.
+///
+/// A replaced key keeps its place. Dropping it and appending would be one line
+/// shorter and would move the member to the end -- and since `render` writes
+/// members in the order the object holds them, that changes the document's
+/// text for a caller who only meant to change one value.
+pub fn with_key(v: ref Json, key: str, value: ref Json) -> ref Json {
+    var ks: [str] = []
+    var vs: [ref Json] = []
+    var replaced = false
+    match v {
+        JObj(keys, values) -> {
+            for i in 0..keys.len() {
+                ks.push(keys[i])
+                if keys[i] == key {
+                    vs.push(value)
+                    replaced = true
+                } else {
+                    vs.push(values[i])
+                }
+            }
+        }
+        _ -> {}
+    }
+    if not replaced {
+        ks.push(key)
+        vs.push(value)
+    }
+    ref(JObj(ks, vs))
+}
+
+/// A list with one element on the end. Answers a new value, for the reason
+/// `with_key` does.
+pub fn with_item(v: ref Json, item: ref Json) -> ref Json {
+    var items = match v {
+        JList(xs) -> xs
+        _ -> []
+    }
+    items.push(item)
+    ref(JList(items))
 }

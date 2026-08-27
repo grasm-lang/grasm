@@ -99,8 +99,8 @@ What exists today:
 | `packages/http` | *none* | Written. Requests, responses, routing with `:param` and `*`, percent decoding, HTML escaping. |
 | `packages/http_server` | `io`, `net` | Written. Accept loop, and `net_wait` for many conversations on one thread. |
 | `packages/http_client` | `net` | Written. Dials, sends, reads until the declared frame arrives. Its demo talks to `http_server` over a real socket. |
-| `ProjectGold/lib-json` | *none* | A package, unpublished, no stable API. |
-| `ProjectGold/lib-markdown`, `lib-sha256` | *none* | The same. |
+| `packages/json` | *none* | Written. Parse, render, reach in, build up. Six ProjectGold programs depend on it. |
+| `ProjectGold/lib-markdown`, `lib-sha256` | *none* | Packages, unpublished, no stable API. |
 
 `http`, `http_server` and `http_client` are three packages, not one, and that is the whole
 argument for this package system in one line: `http` **cannot** open a socket,
@@ -122,7 +122,17 @@ What a first release needs, in the order a user meets them:
 
 - **http server** — *done*, above.
 - **http client** — *done*, above.
-- **json** — exists as `lib-json`, needs to become a package with a stable API.
+- **json** — *done*. `ProjectGold/lib-json` moved to `packages/json`, renamed
+  (`parse`, `render`, `escape`), and given the half a library needs that a
+  program does not: `get`, `at`, `path`, `as_str`, `as_int`, `as_bool`,
+  `count`, `keys_of`, `items_of` to reach into a document, and `object`,
+  `list`, `text`, `number`, `boolean`, `null`, `with_key`, `with_item` to build
+  one. The six programs that were using it point at it now, so there is one
+  copy rather than two.
+
+  Still duplicated: `examples/jsonlib/json` is a second JSON parser, kept
+  because it is the package-system *teaching* example rather than a library.
+  One of the two should go.
 - **async/task** — `parallel`/`spawn` are in the language. What is missing is
   the library above them: timers, channels, select.
 - **testing** — assertions and a runner beyond `test` blocks.

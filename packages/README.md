@@ -12,6 +12,7 @@ gates as everything else: three engines, one answer.
 | `http` | *none* | Requests, responses, routing, escaping. Text in, text out. |
 | `http_server` | `io`, `net` | The accept loop, and `net_wait` for many conversations on one thread. Depends on `http`. |
 | `http_client` | `net` | Dials, sends what `http` composed, reads until the declared frame has arrived. Depends on `http`. |
+| `json` | *none* | Parse, render, reach into a document, build one. |
 
 Three packages rather than one, and the split is the same argument each time:
 a program that only needs to *build* a request never acquires the capability to
@@ -41,6 +42,7 @@ grasm run packages/http_server-demo/src/main.gr
 grasm run packages/http_server-demo/src/main.gr -- serve   # over a real socket
 grasm run packages/http_client-demo/src/main.gr
 grasm run packages/http_client-demo/src/main.gr -- serve   # client and server, both Grasm
+grasm run packages/json-demo/src/main.gr
 ```
 
 The socket path is opt-in. The corpus does not open sockets by default: a gate

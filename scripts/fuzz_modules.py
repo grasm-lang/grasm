@@ -76,6 +76,21 @@ pub fn boxed(n: i64) -> Box[i64] {
     let b: Box[i64] = Box{ held: n }
     b
 }
+
+pub fn same[T](v: T) -> T {
+    v
+}
+
+pub fn pair[A, B](a: A, b: B) -> (A, B) {
+    (a, b)
+}
+
+// Performed here, handled by whoever calls it. [T-CAPABILITY] counts what is
+// left in a `pub` row for a consumer to handle, so `Cfg` is in this package's
+// ceiling -- which the second round below checks in both directions.
+pub fn deep() -> i64 / {Cfg} {
+    Cfg.value()
+}
 """
 
 # Every position a name declared in another module can stand in.
@@ -191,6 +206,23 @@ let answer = f()"""),
 with Cfg handled_by CfgHandler{ value: || 42 } {
     answer = ask()
 }"""),
+    ('generic function',
+     """""",
+     """let answer = far.same(21) * 2"""),
+    ('generic function, two parameters',
+     """""",
+     """let p = far.pair(21, "x")
+let answer = p.0 * 2"""),
+    ('generic function over the type',
+     """""",
+     """let t: Thing = far.same(far.make(21))
+let answer = t.n * 2"""),
+    ('effect performed in another module',
+     """""",
+     """var answer = 0
+with Cfg handled_by CfgHandler{ value: || 42 } {
+    answer = far.deep()
+}"""),
     ('ref to it',
      """""",
      """let r = ref(far.make(21))
@@ -226,7 +258,7 @@ def tree(work, where, decls, stmts):
     declared it, which is what one namespace across the program means.
     """
     shutil.rmtree(work, ignore_errors=True)
-    write(work, "far", [], FAR, ["io"])
+    write(work, "far", [], FAR, ["io", "Cfg"])
     ind = lambda t: "\n".join("    " + l if l.strip() else l for l in t.strip("\n").split("\n"))
     if where == "direct":
         write(work, "mid", ["far"], "import far\n\npub fn passthrough() -> i64 { 0 }\n", ["io"])
@@ -242,8 +274,13 @@ def tree(work, where, decls, stmts):
     else:  # transitive
         write(work, "mid", ["far"],
               "import far\n\npub fn source(n: i64) -> Thing {\n    far.make(n)\n}\n"
-              "pub fn boxed(n: i64) -> Box[i64] {\n    far.boxed(n)\n}\n", ["io"])
-        reroute = lambda t: t.replace("far.make", "mid.source").replace("far.boxed", "mid.boxed")
+              "pub fn boxed(n: i64) -> Box[i64] {\n    far.boxed(n)\n}\n"
+              "pub fn same[T](v: T) -> T {\n    far.same(v)\n}\n"
+              "pub fn pair[A, B](a: A, b: B) -> (A, B) {\n    far.pair(a, b)\n}\n"
+              "pub fn deep() -> i64 / {Cfg} {\n    far.deep()\n}\n", ["io", "Cfg"])
+        reroute = lambda t: (t.replace("far.make", "mid.source").replace("far.boxed", "mid.boxed")
+                             .replace("far.same", "mid.same").replace("far.pair", "mid.pair")
+                             .replace("far.deep", "mid.deep"))
         write(work, "app", ["mid"],
               "import mid\n\n" + reroute(decls.strip("\n")) + "\n\nfn main() {\n"
               + ind(reroute(stmts)) + '\n    print("{answer}")\n}\n', ["io"])
@@ -327,25 +364,41 @@ def main():
         # first case on its own, which is why the second is here.
         ceiling = 0
         holes = []
-        for caps, must_build in ((["io"], True), ([], False)):
-            shutil.rmtree(work, ignore_errors=True)
-            write(work, "far", [],
-                  'pub fn shout(msg: str) / {io} {\n    print("{msg}")\n}\n', caps)
-            write(work, "app", ["far"],
-                  'import far\n\nfn main() {\n    far.shout("42")\n}\n', ["io"])
-            src = os.path.join(work, "app", "src", "main.gr")
-            rc, out, err = run([GRASM, "run", src])
-            ceiling += 1
-            built = rc == 0
-            if built != must_build:
-                holes.append(f"capabilities={caps}")
-                if must_build:
-                    print(f"CEILING refuses a package that declares what it does:\n{err or out}")
-                else:
-                    print("CEILING lets a package perform `io` it never declared")
-            elif built and out != WANT:
-                holes.append(f"capabilities={caps}/answer")
-                print(f"CEILING wrong answer: {out!r}")
+        WORLD = (
+            'pub fn shout(msg: str) / {io} {\n    print("{msg}")\n}\n',
+            'import far\n\nfn main() {\n    far.shout("42")\n}\n',
+            "io",
+        )
+        # A user effect left in a `pub` row counts too: the consumer has to
+        # supply a handler, and [T-CAPABILITY] charges the package for what it
+        # leaves for the consumer to handle, not only for what the runtime
+        # discharges.
+        OWN = (
+            "effect Cfg {\n    fn value() -> i64\n}\n\n"
+            "pub fn deep() -> i64 / {Cfg} {\n    Cfg.value()\n}\n",
+            "import far\n\nfn main() {\n    var n = 0\n"
+            "    with Cfg handled_by CfgHandler{ value: || 42 } {\n"
+            '        n = far.deep()\n    }\n    print("{n}")\n}\n',
+            "Cfg",
+        )
+        for lib, app, effect in (WORLD, OWN):
+            for caps, must_build in (([effect], True), ([], False)):
+                shutil.rmtree(work, ignore_errors=True)
+                write(work, "far", [], lib, caps)
+                write(work, "app", ["far"], app, ["io"])
+                src = os.path.join(work, "app", "src", "main.gr")
+                rc, out, err = run([GRASM, "run", src])
+                ceiling += 1
+                built = rc == 0
+                if built != must_build:
+                    holes.append(f"{effect}/capabilities={caps}")
+                    if must_build:
+                        print(f"CEILING refuses a package that declares `{effect}`:\n{err or out}")
+                    else:
+                        print(f"CEILING lets a package perform `{effect}` it never declared")
+                elif built and out != WANT:
+                    holes.append(f"{effect}/capabilities={caps}/answer")
+                    print(f"CEILING wrong answer for `{effect}`: {out!r}")
 
         print(
             f"programs: {programs}   disagreed: {len(disagreed)}   "

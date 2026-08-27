@@ -1,8 +1,8 @@
 {
   "agreeing": 44,
-  "corpus": 230,
-  "cross": 230,
+  "corpus": 231,
+  "cross": 231,
   "laws": 193,
   "wasm_ok": 189,
-  "wasm_skip": 41
+  "wasm_skip": 42
 }

@@ -54,7 +54,7 @@ had checked.
 | `tcp_read_bytes`, `tcp_write_bytes` | a socket can carry a JPEG. Ten bytes became sixteen through a `str` |
 | `grasm build --source` | a whole program as one `.gr`, so the wasm engine can run one with imports |
 | `scripts/wasmtest.sh` | now compares every committed `grasm.wasm` against a fresh build, and knows what wasm32 cannot do |
-| `lib_json`, `lib_markdown`, `lib_sha256` | three packages extracted from phase 1, each with `capabilities = []` |
+| `lib_json`, `lib_markdown`, `lib_sha256` | three packages extracted from phase 1, each with `capabilities = []`. `lib_json` has since moved to `packages/json` and been renamed `json`, as the release library; the six consumers here point at it. |
 
 ## What it did not change, and named instead
 

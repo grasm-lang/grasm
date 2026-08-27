@@ -21,7 +21,7 @@ the bundle and `--native` each resolve the import and produce identical output.
 
 It started as a **copy** of project 13's code. Project 35 needed the same
 parser, and two copies is where a shared library stops being a nicety — so it is
-a package now, `../lib-json`, and both projects import the same file. This
+a package now, `packages/json`, and both projects import the same file. This
 project's output did not change by a byte when it moved.
 
 The reason it could not simply be a sibling file belongs here rather than in a

@@ -26,7 +26,7 @@
 // grasm run main.gr -- serve     # then serve index.html over http
 // ```
 
-import lib_json
+import json
 
 let PORT = 8984
 let WEATHER_PORT = 8985
@@ -47,7 +47,7 @@ type Reading = {
 }
 
 fn quoted(s: str) -> str {
-    "\"" + lib_json.escape_json(s) + "\""
+    "\"" + json.escape(s) + "\""
 }
 
 fn reading_json(r: Reading) -> str {
@@ -64,7 +64,7 @@ fn reading_json(r: Reading) -> str {
 /// absent, the wrong type, or not JSON at all — and all three are the same
 /// thing to a mashup: a value it does not have.
 fn str_field(body: str, key: str) -> Option[str] {
-    match lib_json.parse_json(body) {
+    match json.parse(body) {
         Err(e) -> None
         Ok(v) -> pick_str(v, key)
     }
@@ -88,7 +88,7 @@ fn pick_str(v: ref Json, key: str) -> Option[str] {
 }
 
 fn int_field(body: str, key: str) -> Option[i64] {
-    match lib_json.parse_json(body) {
+    match json.parse(body) {
         Err(e) -> None
         Ok(v) -> pick_int(v, key)
     }

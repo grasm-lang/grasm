@@ -1,4 +1,4 @@
-# lib_json — the JSON parser, as a package
+# json — the JSON parser, as a package
 
 Project 13 wrote this parser. Project 34 needed it and, at first, carried a
 copy; project 35 needed it too, and two copies is where a shared library stops
@@ -7,11 +7,11 @@ being a nicety.
 It is a package rather than a sibling file because Grasm resolves `import json`
 as a sibling of the importing file, so a module cannot be shared across
 directories without one. A `grasm.toml` with a path dependency is what makes
-`import lib_json` mean *the same file* from two different projects.
+`import json` mean *the same file* from two different projects.
 
 ```toml
-[dependencies.lib_json]
-path = "../lib-json"
+[dependencies.json]
+path = "../../packages/json"
 version = "^1.0.0"
 ```
 

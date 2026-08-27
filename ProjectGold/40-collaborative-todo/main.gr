@@ -19,7 +19,7 @@
 // grasm run main.gr -- serve     # then serve index.html over http
 // ```
 
-import lib_json
+import json
 
 let PORT = 8981
 
@@ -53,7 +53,7 @@ fn index_of(items: [Todo], id: i64) -> i64 {
 }
 
 fn quoted(s: str) -> str {
-    "\"" + lib_json.escape_json(s) + "\""
+    "\"" + json.escape(s) + "\""
 }
 
 fn todos_json(items: [Todo]) -> str {
@@ -89,7 +89,7 @@ fn load(path: str) -> [Todo] / {io} {
 
 fn todos_of(text: str) -> [Todo] {
     var out: [Todo] = []
-    match lib_json.parse_json(text) {
+    match json.parse(text) {
         Err(e) -> {}
         Ok(v) -> fill(v, out)
     }

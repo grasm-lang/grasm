@@ -32,7 +32,7 @@
 // grasm run main.gr -- serve     # then serve index.html over http
 // ```
 
-import lib_json
+import json
 
 let PORT = 8987
 
@@ -131,7 +131,7 @@ fn money(cents: i64) -> str {
 }
 
 fn quoted(s: str) -> str {
-    "\"" + lib_json.escape_json(s) + "\""
+    "\"" + json.escape(s) + "\""
 }
 
 fn cart_json(s: Shop, c: Cart) -> str {

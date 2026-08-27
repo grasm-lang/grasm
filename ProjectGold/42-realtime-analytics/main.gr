@@ -19,7 +19,7 @@
 // grasm run main.gr -- serve     # then serve index.html over http
 // ```
 
-import lib_json
+import json
 
 let PORT = 8983
 // Push after this many events, or when the collectors go quiet. Small enough
@@ -85,7 +85,7 @@ fn sorted_names(s: Stats) -> [str] {
 }
 
 fn quoted(x: str) -> str {
-    "\"" + lib_json.escape_json(x) + "\""
+    "\"" + json.escape(x) + "\""
 }
 
 fn stats_json(s: Stats) -> str {

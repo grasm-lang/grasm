@@ -5,7 +5,7 @@
 // same data through two paths, so the project can *compare* them and say where
 // each one is the better answer.
 //
-// It is also the second consumer of `lib_json`. Project 34 carried a copy of
+// It is also the second consumer of `json`. Project 34 carried a copy of
 // project 13's parser; two copies is where a shared library stops being a
 // nicety, so the parser is a package now and both projects import the same
 // file. That is what project 5 was for.
@@ -15,7 +15,7 @@
 // grasm run main.gr -- serve     # then open index.html
 // ```
 
-import lib_json
+import json
 
 let PORT = 8976
 
@@ -99,7 +99,7 @@ fn render_html(posts: [Post]) -> str {
 }
 
 fn quoted(s: str) -> str {
-    "\"" + lib_json.escape_json(s) + "\""
+    "\"" + json.escape(s) + "\""
 }
 
 /// The browser's answer: the same list as data, for a page that renders it.
@@ -143,7 +143,7 @@ fn text_of_html(html: str) -> [str] {
 /// scanner, which is the whole reason the parser is a package.
 fn text_of_json(body: str) -> [str] {
     var out: [str] = []
-    match lib_json.parse_json(body) {
+    match json.parse(body) {
         Err(e) -> out.push("unparseable: {e.why}")
         Ok(v) -> match v {
             JObj(keys, values) -> {
@@ -224,7 +224,7 @@ fn load(path: str) -> [Post] / {io} {
 fn posts_of_json(text: str) -> [Post] {
     var out: [Post] = []
     var parsed = false
-    match lib_json.parse_json(text) {
+    match json.parse(text) {
         Err(e) -> {}
         Ok(v) -> {
             parsed = true
@@ -360,7 +360,7 @@ fn create_or_update(posts: [Post], body: str) -> ([Post], str) {
     var post = Post{ id: 0, title: "", body: "", published: false }
     var bad = ""
 
-    match lib_json.parse_json(body) {
+    match json.parse(body) {
         Err(e) -> bad = "not JSON: {e.why}"
         Ok(v) -> match post_of(v) {
             Some(p) -> {
@@ -375,7 +375,7 @@ fn create_or_update(posts: [Post], body: str) -> ([Post], str) {
     }
     if not found {
         let with_id = "\{\"id\": {next_id(posts)}, {trimmed_object(body)}"
-        match lib_json.parse_json(with_id) {
+        match json.parse(with_id) {
             Err(e) -> {}
             Ok(v2) -> match post_of(v2) {
                 Some(p) -> {

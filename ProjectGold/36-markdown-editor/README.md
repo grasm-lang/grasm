@@ -19,7 +19,7 @@ reader gets another, and the difference only appears on the constructs where two
 markdown implementations disagree — which is most of the interesting ones.
 
 So there is one compiler. `lib_markdown` is project 12's, extracted as a package
-the way `lib_json` was in project 5. `/render` compiles without storing;
+the way `json` was in project 5. `/render` compiles without storing;
 `/save` compiles *and* stores. The harness checks they agree rather than
 asserting it:
 

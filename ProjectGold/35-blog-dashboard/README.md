@@ -29,14 +29,14 @@ false`, and the client-rendered page shows it greyed out as a draft. Server
 rendering is a filter as well as a formatter, and that is a security property
 rather than a styling one.
 
-## The second consumer of `lib_json`
+## The second consumer of `json`
 
 Project 34 carried a copy of project 13's parser. Two copies is where a shared
-library stops being a nicety, so it is a package now — `../lib-json` — and
+library stops being a nicety, so it is a package now — `packages/json` — and
 project 34 was converted to depend on it in the same commit that introduced this
 one. Its output did not change by a byte.
 
-That is the thing this project was scheduled to prove: `import lib_json` in two
+That is the thing this project was scheduled to prove: `import json` in two
 directories means *the same file*, and all three engines resolve it.
 
 ## What the native backend made us rewrite

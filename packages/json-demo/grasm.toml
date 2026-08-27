@@ -1,0 +1,8 @@
+[package]
+name = "json_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.json]
+path = "../json"
+version = "^1.0.0"

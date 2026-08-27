@@ -55,6 +55,19 @@ type Pair = { a: [i64], b: [i64] }
 effect Src {
     fn get() -> i64
 }
+
+// A `try` is an early exit the reader does not see: the branch that leaves is
+// written nowhere, and a block that owns cleanup has to release it on a path
+// no line of the source names. Every other exit here is spelled out.
+fn risky() -> i64 ! Bad {
+    fail(Bad)
+}
+
+// Generic, so one spelling serves an element that must be an `i64` and one
+// that must be a list.
+fn risky_of[T](v: T) -> T ! Bad {
+    fail(Bad)
+}
 """
 
 # The block, and what it owns. `{body}` is where the exit goes; `{held}` is a
@@ -96,6 +109,7 @@ EXITS = {
     "break": ("        break", "loop"),
     "continue": ("        continue", "loop"),
     "falls-through": ("        let _k = 0", "plain"),
+    "try": ("        let _t = try risky()", "fallible"),
 }
 
 
@@ -107,6 +121,7 @@ EXIT_EXPRS = {
     "break": ("if true {{ break }} else {{ {alt} }}", "loop"),
     "continue": ("if true {{ continue }} else {{ {alt} }}", "loop"),
     "falls-through": ("{alt}", "plain"),
+    "try": ("if true {{ try risky_of({alt}) }} else {{ {alt} }}", "fallible"),
 }
 
 BUILDERS = ("list-literal", "map-literal", "tuple-literal", "struct-literal")

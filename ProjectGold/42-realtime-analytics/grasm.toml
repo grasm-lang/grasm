@@ -4,6 +4,6 @@ version = "1.0.0"
 entry = "main.gr"
 capabilities = ["io", "net"]
 
-[dependencies.lib_json]
-path = "../lib-json"
+[dependencies.json]
+path = "../../packages/json"
 version = "^1.0.0"

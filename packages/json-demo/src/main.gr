@@ -1,0 +1,92 @@
+// The `json` package: parse, reach in, build, render.
+//
+// Every case here is text in and text out, so three engines are held to the
+// same bytes. The awkward inputs are deliberate: a document is something
+// somebody else wrote, and a parser that only ever sees documents its own
+// author typed is a parser with one test.
+import json
+
+fn parsed(label: str, src: str) {
+    match json.parse(src) {
+        Ok(v) -> print("{label}: {json.kind(v)} -> {json.render(v)}")
+        Err(e) -> print("{label}: refused -- {e.why} at {e.at}")
+    }
+}
+
+fn reach(label: str, doc: ref Json, p: str) {
+    match json.path(doc, p) {
+        Some(v) -> print("  {label} {p} -> {json.render(v)}")
+        None -> print("  {label} {p} -> (absent)")
+    }
+}
+
+fn main() {
+    print("-- parsing")
+    parsed("null", "null")
+    parsed("true", "true")
+    parsed("number", "-4.5")
+    parsed("whole number", "3.0")
+    parsed("big number", "1e3")
+    parsed("string", "\"hi\"")
+    parsed("escapes", "\"a\\nb\\tc\\\"d\"")
+    parsed("list", "[1, 2, 3]")
+    parsed("object", "\{\"b\": 2, \"a\": 1}")
+    parsed("nested", "\{\"xs\": [true, \{\"k\": null}]}")
+    parsed("space everywhere", "  \{ \"a\" : [ 1 , 2 ] } ")
+    parsed("empty list", "[]")
+    parsed("empty object", "\{}")
+    parsed("truncated", "[1, 2")
+    parsed("no value", "\{\"k\": }")
+    parsed("two values", "1 2")
+    parsed("nothing", "")
+
+    print("-- reaching in")
+    let src = "\{\"user\": \{\"name\": \"ada\", \"age\": 36, \"tags\": [\"x\", \"y\"]}, \"ok\": true}"
+    match json.parse(src) {
+        Err(e) -> print("  could not parse: {e.why}")
+        Ok(doc) -> {
+            reach("path", doc, "user.name")
+            reach("path", doc, "user.tags.1")
+            reach("path", doc, "user.tags.-1")
+            reach("path", doc, "user.missing")
+            reach("path", doc, "user.tags.9")
+            reach("path", doc, "")
+            print("  keys -> {json.keys_of(doc)}")
+            print("  count of the object -> {json.count(doc)}")
+            let tags = json.path(doc, "user.tags") ?? json.null()
+            print("  count of the list -> {json.count(tags)}")
+            print("  count of a string -> {json.count(json.text("abc"))}")
+
+            let name = json.path(doc, "user.name") ?? json.null()
+            let age = json.path(doc, "user.age") ?? json.null()
+            print("  as_str(name) -> {json.as_str(name) ?? "(not a string)"}")
+            print("  as_str(age) -> {json.as_str(age) ?? "(not a string)"}")
+            print("  as_int(age) -> {json.as_int(age) ?? -1}")
+            print("  as_num(age) -> {json.as_num(age) ?? 0.0}")
+            print("  as_int(3.5) -> {json.as_int(json.number(3.5)) ?? -1}")
+            print("  as_bool(ok) -> {json.as_bool(json.path(doc, "ok") ?? json.null()) ?? false}")
+            print("  is_null(missing) -> {json.is_null(json.path(doc, "nope") ?? json.null())}")
+
+            print("-- and back out")
+            print("  round trip -> {json.render(doc)}")
+            print("  stable -> {json.render(json.parse(json.render(doc)) ?? json.null()) == json.render(doc)}")
+        }
+    }
+
+    print("-- building")
+    let built = json.object(
+        ["name", "count", "tags", "ok", "nothing"],
+        [json.text("ada"), json.number(2.0),
+         json.list([json.text("x"), json.text("y")]),
+         json.boolean(true), json.null()])
+    print("  {json.render(built)}")
+    print("  a key added -> {json.render(json.with_key(built, "extra", json.number(1.0)))}")
+    print("  a key replaced -> {json.render(json.with_key(built, "name", json.text("bob")))}")
+    print("  the original is unchanged -> {json.render(built)}")
+    print("  an item added -> {json.render(json.with_item(json.list([json.number(1.0)]), json.number(2.0)))}")
+    print("  keys and values of different lengths -> {json.render(json.object(["a", "b"], [json.number(1.0)]))}")
+    print("  escaped on the way out -> {json.render(json.text("quote \" newline \n done"))}")
+    print("  equal to itself -> {json.equal(built, built)}")
+    print("  equal to a rebuild -> {json.equal(built, json.parse(json.render(built)) ?? json.null())}")
+    print("  equal to something else -> {json.equal(built, json.number(1.0))}")
+}

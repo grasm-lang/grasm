@@ -19,6 +19,13 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   `site/facts.json`, which `scripts/allgates.sh` writes after every gate
   passes. `scripts/site.py --check` fails when the pages, the figures or the
   run disagree.
+- `packages/json`: `ProjectGold/lib-json` moved here, renamed (`parse`,
+  `render`, `escape`) and given what a library needs that a program does not —
+  `get`, `at`, `path`, `as_str`, `as_int`, `as_num`, `as_bool`, `is_null`,
+  `kind`, `count`, `keys_of`, `items_of` to reach into a document, and
+  `object`, `list`, `text`, `number`, `boolean`, `null`, `with_key`,
+  `with_item` to build one. Declares no capability. The six ProjectGold
+  programs that used it point here, so there is one copy rather than two.
 - `packages/http_client`: dials, sends what `http` composed, and reads until
   the declared frame has arrived. Declares `net` and nothing else, so a
   program that only builds requests never acquires the ability to send them.
@@ -30,6 +37,16 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   whole package tree built and run three ways against an exact answer, plus a
   round that checks the capability ceiling in both directions. It found F71 on
   its first complete run.
+- `scripts/fuzz_exits.py` grew a sixth way out: `try`. It is the one early exit
+  the reader does not see — the branch that leaves is written nowhere — and a
+  block that owns cleanup has to release on a path no line names. 71 programs
+  to 85.
+- `scripts/fuzz_modules.py` also covers a generic function called across a
+  module boundary, an effect performed in one package and handled in another,
+  and the capability ceiling for a user-declared effect — [T-CAPABILITY]
+  charges a package for what it leaves in a `pub` row for its consumer to
+  handle, not only for what the runtime discharges. 58 programs to 69, two
+  ceiling cases to four.
 - `scripts/lib/corpus.sh`: one definition of what the corpus is. Five gates
   were each carrying their own copy of the same four directory names.
   `scripts/gatecheck.sh` now fails any gate that writes the list itself — a

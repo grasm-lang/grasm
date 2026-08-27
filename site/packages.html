@@ -42,8 +42,8 @@ version = "1.0.0"
 entry = "main.gr"
 capabilities = ["io", "net"]
 
-[dependencies.lib_json]
-path = "../lib-json"
+[dependencies.json]
+path = "../../packages/json"
 version = "^1.0.0"</code></pre>
 
 <h2>The ceiling</h2>
@@ -64,6 +64,7 @@ grasm deps --locked   # fail rather than update the lockfile</code></pre>
 <tr><td><code>http</code></td><td><i>none</i></td><td>Requests, responses, routing with <code>:param</code> and <code>*</code> segments, percent decoding, HTML escaping.</td></tr>
 <tr><td><code>http_server</code></td><td><code>io</code>, <code>net</code></td><td>The accept loop, and many conversations on one thread. Depends on <code>http</code>.</td></tr>
 <tr><td><code>http_client</code></td><td><code>net</code></td><td>Dials, sends what <code>http</code> composed, reads until the declared frame arrives. Depends on <code>http</code>.</td></tr>
+<tr><td><code>json</code></td><td><i>none</i></td><td>Parse, render, reach into a document, build one. Six programs in <code>ProjectGold/</code> depend on it.</td></tr>
 </table></div>
 <p>They are three packages because <code>http</code> <em>cannot</em> open a
 socket, and that is checked rather than claimed: its manifest declares no
