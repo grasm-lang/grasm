@@ -24,7 +24,7 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   `packages/csv`, `packages/cli`, `packages/testing`, `packages/toml`,
   `packages/resilience`, `packages/cache`, `packages/crypto_hash`,
   `packages/regex`, `packages/fs`, `packages/jwt`, `packages/cors`,
-  `packages/dotenv`: the first
+  `packages/dotenv`, `packages/sanitize`, `packages/metrics`: the first
   wave of the release library, planned in `docs/packages-plan.md`. All but
   `log` declare **no capability at all** — a calendar, a seeded generator, path
   arithmetic and URL text are computation, and the reach each one is usually
@@ -34,6 +34,15 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   where the handler is installed.
 - `packages/http` now takes its percent coding and query parsing from
   `packages/url` rather than carrying a second copy.
+- `packages/sanitize`: escaping named by *destination* — HTML text, an
+  attribute, a script block, a URL, a shell argument, a header value, a file
+  name. There is no general `escape`, because what is safe in one is not safe
+  in another; `html_url` refuses `javascript:` by scheme, since no character
+  escaping stops it.
+- `packages/metrics`: counters, gauges, histograms and the Prometheus text
+  format, with the registry as an **effect** — a library that counts something
+  declares `Metric` and not `io`, and where the numbers go is the program's
+  decision.
 - `packages/jwt`: HS256, and the algorithm is an argument to `verify` rather
   than something read from the token — so `alg: none` is refused because it
   disagrees with what the caller required, not by a special case. `exp`,
@@ -95,6 +104,10 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   rule that found a fifth copy in `northstar.sh` the first time it ran.
 
 ### Fixed
+- A boxed place assigned to itself is freed. `h.a = h.a` on a list field and
+  `xs[0] = xs[0]` on a list element each leaked one allocation: the store saw
+  the value was already there and dropped neither the slot's reference nor the
+  caller's, and the caller's was the surplus one (F79).
 - A type name declared in two packages is refused with both modules named and
   a help that says what to do. It said "duplicate type name `Bad`" and pointed
   at one line in a dependency, with nothing to say there was another (F78).

@@ -1,0 +1,7 @@
+[package]
+name = "sanitize"
+version = "1.0.0"
+entry = "src/main.gr"
+
+# Text in, text out. There is nothing here to reach with.
+capabilities = []

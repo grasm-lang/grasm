@@ -2977,13 +2977,18 @@ pub unsafe extern "C" fn grasm_struct_set_field_at(
     };
     match fields.get_mut(i as usize) {
         Some(slot) => {
-            // A value returning to the field it was taken from carries no new
-            // reference, and the old one is the same object — decrementing
-            // would free what is being stored.
-            if *slot != val {
+            // The value is already in this slot, so the store is a no-op —
+            // but the caller took a reference to read it and is handing that
+            // reference over, so *something* has to drop it. Decrementing the
+            // slot would free what is being stored; doing nothing leaks the
+            // caller's, which is what `h.a = h.a` did for a boxed field
+            // (F79). Dropping the incoming one is what balances it.
+            if *slot == val {
+                dec(val);
+            } else {
                 dec(*slot);
+                *slot = val;
             }
-            *slot = val;
         }
         None => grasm_panic_msg_str("no such field"),
     }
@@ -3028,13 +3033,14 @@ pub unsafe extern "C" fn grasm_struct_set_field(
     let idx = ty.fields.iter().position(|n| *n == key);
     if let Some(i) = idx {
         if let Some(v) = fields.get_mut(i) {
-            // A value returning to the field it was taken from carries no
-            // new reference, and the old one is the same object — decrementing
-            // would free what is being stored.
-            if *v != val {
+            // As in `grasm_struct_set_field_at`: the caller's reference is
+            // the surplus one when the value is already here (F79).
+            if *v == val {
+                dec(val);
+            } else {
                 dec(*v);
+                *v = val;
             }
-            *v = val;
             return target;
         }
     }
@@ -6199,12 +6205,14 @@ pub unsafe extern "C" fn grasm_list_set(v: *mut RtVal, i: i64, val: *mut RtVal) 
             if i < 0 || i as usize >= items.len() {
                 rt_panic(&format!("index {i} out of bounds (len {})", items.len()));
             }
-            // As in `grasm_struct_set_field`: an element returning to the
-            // slot it was taken from carries no new reference.
-            if items[i as usize] != val {
+            // As in `grasm_struct_set_field_at`: the caller's reference is
+            // the surplus one when the element is already here (F79).
+            if items[i as usize] == val {
+                dec(val);
+            } else {
                 dec(items[i as usize]);
+                items[i as usize] = val;
             }
-            items[i as usize] = val;
         }
         RtPayload::ListScalar { kind, data } => {
             if i < 0 || i as usize >= data.len() {

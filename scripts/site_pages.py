@@ -812,8 +812,10 @@ grasm deps --locked   # fail rather than update the lockfile
 <tr><td><code>jwt</code></td><td><i>none</i></td><td>HS256. The algorithm comes from the caller, never the token — so <code>alg: none</code> is refused because it disagrees, not by a special case.</td></tr>
 <tr><td><code>cors</code></td><td><i>none</i></td><td>A request in, the headers a response needs out.</td></tr>
 <tr><td><code>dotenv</code></td><td><code>io</code></td><td><code>.env</code> files. It answers a map and never touches the process environment.</td></tr>
+<tr><td><code>sanitize</code></td><td><i>none</i></td><td>Escaping by <em>destination</em> — HTML text, an attribute, a script block, a URL, a shell argument, a header. There is no general <code>escape</code>, because there is no such thing.</td></tr>
+<tr><td><code>metrics</code></td><td><code>Metric</code></td><td>Counters, gauges, histograms and the Prometheus text format — the registry is an effect, so a library that counts declares <code>Metric</code> and not <code>io</code>.</td></tr>
 </table></div>
-<p>Nineteen of the twenty-three declare <em>nothing</em>. That is the pattern: reach is
+<p>Twenty of the twenty-five declare <em>nothing</em>. That is the pattern: reach is
 split from computation, so a program that joins paths, formats a date or
 builds a URL acquires no capability by doing so — and where a library really
 does need the world, it asks for it as an effect the consumer supplies, which
@@ -968,7 +970,7 @@ well as for what it prints.</p>
 <h2>What does not work</h2>
 <div class="scroll"><table>
 <tr><th>Limit</th><th>Detail</th></tr>
-<tr><td>Twenty-three libraries, all first-party</td><td>See <a href="packages.html">Packages</a>; the plan for the rest is in <code>docs/packages-plan.md</code>. Anything else you need, you write, or bind to C with <code>extern fn</code>.</td></tr>
+<tr><td>Twenty-five libraries, all first-party</td><td>See <a href="packages.html">Packages</a>; the plan for the rest is in <code>docs/packages-plan.md</code>. Anything else you need, you write, or bind to C with <code>extern fn</code>.</td></tr>
 <tr><td>No remote registry</td><td>Path and local-registry dependencies work. Nothing fetches or publishes.</td></tr>
 <tr><td>No release binaries</td><td>Build from source with a Rust toolchain.</td></tr>
 <tr><td>0.45× native Rust</td><td>Measured, floor-subtracted 0.39×, against a 0.95× target.</td></tr>

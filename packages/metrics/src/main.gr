@@ -1,0 +1,252 @@
+// Counters, gauges and histograms, and the text a scraper reads.
+//
+// The registry is an *effect*. A library that counts something declares
+// `Metric` and nothing else — not `io`, not `net` — and whether the count goes
+// anywhere is the program's decision, exactly as `log` does it for messages.
+// A library that owned a global registry would be a library that writes to
+// something its consumer cannot see.
+//
+// The clock is a parameter, and there is no monotonic one in this language
+// yet, so a duration measured across a clock adjustment can be negative. That
+// is said here rather than discovered in a dashboard: `observe` takes the
+// value already computed, so the program decides what to do about it.
+
+type Kind = | Counter | Gauge | Histogram
+
+type Label = { name: str, value: str }
+
+type Sample = {
+    name: str,
+    kind: Kind,
+    labels: [Label],
+    value: f64,
+}
+
+effect Metric {
+    fn record(s: Sample)
+}
+
+pub fn label(name: str, value: str) -> Label {
+    Label{ name: name, value: value }
+}
+
+/// Add to a counter. A counter only goes up; a negative amount is the caller
+/// meaning a gauge, so it is refused by being clamped to zero rather than
+/// silently making the series go backwards — a scraper reading a counter that
+/// decreased assumes the process restarted.
+pub fn count(name: str, labels: [Label], amount: f64) / {Metric} {
+    Metric.record(Sample{ name: name, kind: Counter, labels: labels,
+                          value: if amount < 0.0 { 0.0 } else { amount } })
+}
+
+pub fn increment(name: str, labels: [Label]) / {Metric} {
+    count(name, labels, 1.0)
+}
+
+/// Set a gauge, which may go either way.
+pub fn gauge(name: str, labels: [Label], value: f64) / {Metric} {
+    Metric.record(Sample{ name: name, kind: Gauge, labels: labels, value: value })
+}
+
+/// Record one observation in a histogram.
+pub fn observe(name: str, labels: [Label], value: f64) / {Metric} {
+    Metric.record(Sample{ name: name, kind: Histogram, labels: labels, value: value })
+}
+
+// --- a registry a handler can keep ------------------------------------------
+
+type Series = {
+    name: str,
+    kind: Kind,
+    labels: [Label],
+    value: f64,
+    count: i64,
+    sum: f64,
+    buckets: [f64],
+    counts: [i64],
+}
+
+type Registry = {
+    series: [Series],
+    buckets: [f64],
+}
+
+/// A registry whose histograms use these upper bounds, in seconds.
+///
+/// The bounds are the caller's because they depend on what is being measured:
+/// the defaults every library ships are right for HTTP requests and wrong for
+/// everything else, and a histogram with the wrong bounds is a histogram whose
+/// every observation lands in the last bucket.
+pub fn registry(buckets: [f64]) -> Registry {
+    let none: [Series] = []
+    Registry{ series: none, buckets: buckets }
+}
+
+pub fn default_buckets() -> [f64] {
+    [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
+}
+
+fn key_of(name: str, labels: [Label]) -> str {
+    var out = name
+    for l in labels {
+        out = out + "\u{1}" + l.name + "\u{1}" + l.value
+    }
+    out
+}
+
+fn empty_counts(n: i64) -> [i64] {
+    var out: [i64] = []
+    for _i in 0..n {
+        out.push(0)
+    }
+    out
+}
+
+/// One sample folded into a registry.
+pub fn fold(r: Registry, s: Sample) -> Registry {
+    var series = r.series
+    let want = key_of(s.name, s.labels)
+    var found = 0 - 1
+    for i in 0..series.len() {
+        if key_of(series[i].name, series[i].labels) == want and series[i].kind == s.kind {
+            found = i
+        }
+    }
+    if found < 0 {
+        series.push(Series{ name: s.name, kind: s.kind, labels: s.labels,
+                            value: 0.0, count: 0, sum: 0.0,
+                            buckets: r.buckets, counts: empty_counts(r.buckets.len() + 1) })
+        found = series.len() - 1
+    }
+    let old = series[found]
+    var value = old.value
+    var count = old.count
+    var sum = old.sum
+    var counts = old.counts
+    match s.kind {
+        Counter -> value = old.value + s.value
+        Gauge -> value = s.value
+        Histogram -> {
+            count = old.count + 1
+            sum = old.sum + s.value
+            // Cumulative, as the exposition format wants: an observation
+            // counts in its own bucket and every wider one. The last entry is
+            // `+Inf`, which is every observation.
+            var i = 0
+            while i < old.buckets.len() {
+                if s.value <= old.buckets[i] {
+                    counts[i] = counts[i] + 1
+                }
+                i = i + 1
+            }
+            counts[old.buckets.len()] = counts[old.buckets.len()] + 1
+        }
+    }
+    series[found] = Series{ name: old.name, kind: old.kind, labels: old.labels,
+                            value: value, count: count, sum: sum,
+                            buckets: old.buckets, counts: counts }
+    Registry{ series: series, buckets: r.buckets }
+}
+
+/// A handler that folds every sample into the registry the `ref` names.
+pub fn collecting(into: ref Registry) -> MetricHandler {
+    // Field by field, because a `ref` to a struct is reached through its own
+    // fields ([T-REF-VALUE]) and there is no way to replace the whole
+    // referent at once.
+    MetricHandler{ record: |s| {
+        let next = fold(Registry{ series: into.series, buckets: into.buckets }, s)
+        into.series = next.series
+        into.buckets = next.buckets
+    } }
+}
+
+pub fn discarding() -> MetricHandler {
+    MetricHandler{ record: |s| {} }
+}
+
+// --- exposition --------------------------------------------------------------
+
+fn label_text(labels: [Label], extra: str) -> str {
+    if labels.is_empty() and extra.is_empty() {
+        return ""
+    }
+    var parts: [str] = []
+    for l in labels {
+        parts.push("{l.name}=\"{escape_label(l.value)}\"")
+    }
+    if not extra.is_empty() {
+        parts.push(extra)
+    }
+    "\{" + parts.join(",") + "}"
+}
+
+fn escape_label(v: str) -> str {
+    v.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")
+}
+
+fn number(v: f64) -> str {
+    if v == v.as_i64().as_f64() {
+        return "{v.as_i64()}"
+    }
+    "{v}"
+}
+
+fn kind_name(k: Kind) -> str {
+    match k {
+        Counter -> "counter"
+        Gauge -> "gauge"
+        Histogram -> "histogram"
+    }
+}
+
+/// The Prometheus text exposition format.
+///
+/// One `# TYPE` line per metric name, not per series — a scraper refuses a
+/// second one, and a registry with two label sets under one name has two
+/// series and one name.
+pub fn expose(r: Registry) -> str {
+    var lines: [str] = []
+    var typed: [str] = []
+    // Grouped by name, so every series of one metric is contiguous under its
+    // one `# TYPE` line. In recording order they interleave — a counter, then
+    // a histogram, then the counter's other label set — which parses but
+    // reads as two metrics of the same name. `sort_by` is stable, so within a
+    // name the recording order is kept.
+    var ordered = r.series
+    ordered.sort_by(|s| s.name)
+    for s in ordered {
+        if not typed.contains(s.name) {
+            typed.push(s.name)
+            lines.push("# TYPE {s.name} {kind_name(s.kind)}")
+        }
+        match s.kind {
+            Histogram -> {
+                var i = 0
+                while i < s.buckets.len() {
+                    lines.push("{s.name}_bucket{label_text(s.labels, "le=\"{number(s.buckets[i])}\"")} {s.counts[i]}")
+                    i = i + 1
+                }
+                lines.push("{s.name}_bucket{label_text(s.labels, "le=\"+Inf\"")} {s.counts[s.buckets.len()]}")
+                lines.push("{s.name}_sum{label_text(s.labels, "")} {number(s.sum)}")
+                lines.push("{s.name}_count{label_text(s.labels, "")} {s.count}")
+            }
+            _ -> lines.push("{s.name}{label_text(s.labels, "")} {number(s.value)}")
+        }
+    }
+    lines.join("\n") + "\n"
+}
+
+/// The value of one series, for a test or a health check.
+pub fn value_of(r: Registry, name: str, labels: [Label]) -> Option[f64] {
+    let want = key_of(name, labels)
+    for s in r.series {
+        if key_of(s.name, s.labels) == want {
+            return Some(if s.kind == Histogram { s.sum } else { s.value })
+        }
+    }
+    None
+}
+
+pub fn series_count(r: Registry) -> i64 {
+    r.series.len()
+}

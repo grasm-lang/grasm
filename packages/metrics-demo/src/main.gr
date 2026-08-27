@@ -1,0 +1,69 @@
+// The `metrics` package.
+//
+// `handle` below declares `/ {Metric}`. Not `io`, not `net`. It counts
+// requests and records their durations from three calls deep, and it cannot
+// print, cannot open a file and cannot reach a scraper — where the numbers go
+// is decided by the line that installs the handler, which is the same shape
+// `log` has for messages.
+import metrics
+
+/// A request handler that counts. Its row is `/ {Metric}` and nothing else.
+fn handle(path: str, status: i64, seconds: f64) / {Metric} {
+    let ls = [metrics.label("path", path), metrics.label("status", "{status}")]
+    metrics.increment("http_requests_total", ls)
+    metrics.observe("http_request_duration_seconds", [metrics.label("path", path)], seconds)
+}
+
+fn main() {
+    let empty = metrics.registry(metrics.default_buckets())
+    let reg = ref(empty)
+
+    with Metric handled_by metrics.collecting(reg) {
+        handle("/", 200, 0.004)
+        handle("/", 200, 0.02)
+        handle("/", 500, 1.2)
+        handle("/users", 200, 0.3)
+        handle("/users", 200, 0.35)
+        metrics.gauge("queue_depth", [], 7.0)
+        metrics.gauge("queue_depth", [], 4.0)
+        metrics.count("bytes_sent_total", [], 1024.0)
+        metrics.count("bytes_sent_total", [], 512.0)
+        // A counter only goes up. A negative amount is somebody meaning a
+        // gauge, and it adds nothing rather than making the series go
+        // backwards — which a scraper reads as a restart.
+        metrics.count("bytes_sent_total", [], 0.0 - 100.0)
+    }
+
+    let r = Registry{ series: reg.series, buckets: reg.buckets }
+    print("-- {metrics.series_count(r)} series")
+    print(metrics.expose(r))
+
+    print("-- reading one back")
+    print("  requests to / that answered 200: {metrics.value_of(r, "http_requests_total", [metrics.label("path", "/"), metrics.label("status", "200")]) ?? 0.0}")
+    print("  requests to / that answered 500: {metrics.value_of(r, "http_requests_total", [metrics.label("path", "/"), metrics.label("status", "500")]) ?? 0.0}")
+    print("  queue depth, which is the last value set: {metrics.value_of(r, "queue_depth", []) ?? 0.0}")
+    print("  bytes sent, which accumulated: {metrics.value_of(r, "bytes_sent_total", []) ?? 0.0}")
+    print("  a series nobody recorded: {metrics.value_of(r, "nope", []) ?? 0.0 - 1.0}")
+
+    print("-- nowhere at all")
+    with Metric handled_by metrics.discarding() {
+        handle("/", 200, 0.1)
+    }
+    print("  the registry is unchanged: {metrics.series_count(r)} series")
+
+    print("-- custom buckets, because the defaults are for HTTP requests")
+    let coarse = ref(metrics.registry([1.0, 10.0]))
+    with Metric handled_by metrics.collecting(coarse) {
+        metrics.observe("batch_seconds", [], 0.5)
+        metrics.observe("batch_seconds", [], 5.0)
+        metrics.observe("batch_seconds", [], 50.0)
+    }
+    print(metrics.expose(Registry{ series: coarse.series, buckets: coarse.buckets }))
+
+    print("-- a label value that would break the format")
+    let odd = ref(metrics.registry([]))
+    with Metric handled_by metrics.collecting(odd) {
+        metrics.gauge("thing", [metrics.label("note", "a \"quoted\" one\nand a newline")], 1.0)
+    }
+    print(metrics.expose(Registry{ series: odd.series, buckets: odd.buckets }))
+}

@@ -1,0 +1,191 @@
+// Escaping, by context.
+//
+// There is no such thing as "escaping user input". There is escaping it *for
+// somewhere*, and the somewheres need different things: what is safe inside
+// HTML text is not safe inside an attribute, what is safe in an attribute is
+// not safe inside a `<script>`, and none of them is safe in a URL. A single
+// `escape` used everywhere is how a payload gets through — it was escaped,
+// just not for where it went.
+//
+// So every function here names its destination, and there is no general one.
+//
+// What this is not: a validator. It does not decide whether input is
+// acceptable, only how to write it down somewhere without it changing the
+// meaning of the surrounding text.
+
+/// Text going between tags. `&` first, or the replacements are themselves
+/// replaced.
+pub fn html_text(s: str) -> str {
+    s.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+}
+
+/// Text going inside a quoted attribute value.
+///
+/// Quotes as well, because an unescaped one closes the attribute and the rest
+/// of the value becomes markup. This assumes the attribute *is* quoted; an
+/// unquoted one can be escaped out of with a space, and the answer to that is
+/// to quote it.
+pub fn html_attribute(s: str) -> str {
+    html_text(s).replace("\"", "&quot;").replace("'", "&#39;")
+}
+
+/// Text going inside a `<script>` block.
+///
+/// `</script>` inside a JavaScript string ends the block — the HTML parser
+/// finds it before the JavaScript one does — so the slash is escaped. So is
+/// `<!--`, for the same reason in an older shape.
+pub fn html_script(s: str) -> str {
+    s.replace("\\", "\\\\")
+        .replace("\"", "\\\"")
+        .replace("'", "\\'")
+        .replace("/", "\\/")
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+}
+
+/// A URL going into an `href` or `src`.
+///
+/// Only `http:`, `https:`, `mailto:` and a relative path are allowed through;
+/// anything else answers `#`. `javascript:alert(1)` in an `href` is a script
+/// that runs on click, and no amount of character escaping stops it because
+/// nothing about it needs escaping — the *scheme* is the payload.
+pub fn html_url(s: str) -> str {
+    let t = s.trim()
+    // A scheme may be written with control characters or mixed case:
+    // `java\tscript:` and `JaVaScRiPt:` both run. So the comparison is made
+    // on the text with those removed.
+    var flat = ""
+    for c in t.to_lower().chars() {
+        if c != "\t" and c != "\n" and c != "\r" and c != " " {
+            flat = flat + c
+        }
+    }
+    if flat.starts_with("http://") or flat.starts_with("https://") or
+       flat.starts_with("mailto:") or flat.starts_with("/") or
+       flat.starts_with("#") or flat.starts_with("?") {
+        return html_attribute(t)
+    }
+    // A relative path with no scheme at all is fine; one with a colon before
+    // any slash is a scheme this does not know.
+    let colon = flat.index_of(":") ?? 0 - 1
+    let slash = flat.index_of("/") ?? flat.len()
+    if colon < 0 or colon > slash {
+        return html_attribute(t)
+    }
+    "#"
+}
+
+/// An SQL identifier — a table or column name — in double quotes.
+///
+/// **This is not for values.** A value goes in a parameter, and a library that
+/// escapes values into a query is a library that will be wrong for some
+/// encoding, some day. This exists because identifiers *cannot* be
+/// parameterised, which is the one case where quoting is the only answer.
+pub fn sql_identifier(s: str) -> str ! str {
+    if s.is_empty() {
+        fail("an empty identifier")
+    }
+    if s.contains("\{0.to_char()}") {
+        fail("an identifier containing a null byte")
+    }
+    "\"" + s.replace("\"", "\"\"") + "\""
+}
+
+/// A shell argument, in single quotes.
+///
+/// Also a last resort: `proc_run(program, args)` passes arguments without a
+/// shell and needs none of this. This is for the case where something else
+/// will interpret the line.
+pub fn shell_argument(s: str) -> str {
+    "'" + s.replace("'", "'\\''") + "'"
+}
+
+/// A header value: control characters removed.
+///
+/// A newline in a header value ends the header and begins another, so a
+/// value carrying one can add headers or start the body. Removing rather than
+/// escaping, because a header value has no escape and the only correct
+/// answer is that those bytes do not go on the wire.
+pub fn header_value(s: str) -> str {
+    var out = ""
+    for c in s.chars() {
+        let code = c.code_at(0)
+        if code == 9 or code >= 32 {
+            out = out + c
+        }
+    }
+    out.trim()
+}
+
+/// A file name, for somewhere a caller chose.
+///
+/// Separators and control characters are removed, so the result is one path
+/// component and cannot traverse: `../../etc/passwd` becomes `....etcpasswd`,
+/// which is a strange file name in the directory the caller chose and not a
+/// path out of it. A name that is exactly `.` or `..` becomes empty, since
+/// those two name a directory rather than a file.
+pub fn file_name(s: str) -> str {
+    var out = ""
+    for c in s.chars() {
+        let code = c.code_at(0)
+        if c == "/" or c == "\\" or code < 32 {
+            continue
+        }
+        out = out + c
+    }
+    let trimmed = out.trim()
+    if trimmed == "." or trimmed == ".." {
+        return ""
+    }
+    trimmed
+}
+
+/// Is every character of this text printable and not a control character?
+/// Useful for deciding whether to *refuse* rather than escape.
+pub fn is_printable(s: str) -> bool {
+    for c in s.chars() {
+        let code = c.code_at(0)
+        if code < 32 or code == 127 {
+            return false
+        }
+    }
+    true
+}
+
+/// The text with anything that is not in `allowed` removed. The bluntest tool
+/// here and the right one for a slug, an identifier, or anything that has a
+/// fixed alphabet.
+pub fn keep_only(s: str, allowed: str) -> str {
+    var out = ""
+    for c in s.chars() {
+        if allowed.contains(c) {
+            out = out + c
+        }
+    }
+    out
+}
+
+/// A URL slug: lower case, letters and digits, single hyphens between words.
+pub fn slug(s: str) -> str {
+    var out = ""
+    var last_hyphen = true
+    for c in s.to_lower().chars() {
+        if "abcdefghijklmnopqrstuvwxyz0123456789".contains(c) {
+            out = out + c
+            last_hyphen = false
+            continue
+        }
+        if not last_hyphen {
+            out = out + "-"
+            last_hyphen = true
+        }
+    }
+    if out.ends_with("-") {
+        return out.substr(0, out.len() - 1)
+    }
+    out
+}

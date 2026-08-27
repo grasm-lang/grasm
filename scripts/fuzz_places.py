@@ -132,6 +132,14 @@ LIST_OPS = [
     ("pop", '{p}.push(5)\n    let v = {p}.pop()\n    print("{{v ?? 0 - 1}} {{{p}.len()}}")'),
     ("remove", '{p}.push(77)\n    let v = {p}.remove(0)\n    print("{{v}} {{{p}.len()}}")'),
     ("inout", 'bump({p})\n    print("{{{p}.len()}} {{{p}[{p}.len() - 1]}}")'),
+    # A place assigned to itself. `OPS` has this for scalars, where it is a
+    # word moving nowhere; on a *boxed* place it is a reference-count
+    # question, and the answer was wrong: the read handed out a reference, the
+    # store saw the value was already there and dropped neither, and the list
+    # was never freed (F79). Nothing here had a boxed place assigned to
+    # itself, so nothing could have seen it.
+    ("self-assign", '{p} = {p}\n    print("{{{p}.len()}} {{{p}[0]}}")'),
+    ("self-assign-twice", '{p} = {p}\n    {p} = {p}\n    print("{{{p}.len()}} {{{p}[0]}}")'),
 ]
 
 # What to do with it. `{p}` is the place, `{v}` the value to write.

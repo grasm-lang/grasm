@@ -1,0 +1,8 @@
+[package]
+name = "metrics_demo"
+version = "0.1.0"
+capabilities = ["io", "Metric"]
+
+[dependencies.metrics]
+path = "../metrics"
+version = "^1.0.0"

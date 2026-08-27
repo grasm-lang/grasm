@@ -94,6 +94,7 @@ and the entries disagree.
 | [F76](#f76) | two gates counted the programs they had not checked, and passed | S2, tests | **fixed** |
 | [F77](#f77) | a generic container could not be built empty | S2, backend | **fixed** |
 | [F78](#f78) | two packages could not both declare a `Bad`, and the message did not say so | S3, diagnostics | **fixed** |
+| [F79](#f79) | a boxed place assigned to itself was never freed | S2, runtime | **fixed** |
 
 <!-- end index -->
 ## F1 — a wrapped condition must end the line with the operator (S4) — **fixed**
@@ -3403,3 +3404,47 @@ handed the problem to whoever writes the second library.
 two packages declaring the same type name must be refused *and* the refusal
 must name the other module; two packages with distinct names must build.
 Making the message stop naming the other module turns it red.
+
+## F79 — a boxed place assigned to itself was never freed (S2, runtime) — **fixed**
+
+```
+h.a = h.a          // a list field
+xs[0] = xs[0]      // a list element
+```
+
+One allocation live at exit, every time, natively. The interpreter and a
+bundle were clean, so only `leakcheck` could have seen it and only for a
+program that did it.
+
+The runtime's field store had a guard for the aliased case, and the guard was
+half right:
+
+```rust
+// A value returning to the field it was taken from carries no new
+// reference, and the old one is the same object — decrementing
+// would free what is being stored.
+if *slot != val { dec(*slot); }
+*slot = val;
+```
+
+The second half is true — decrementing the slot *would* free what is being
+stored, which is why the guard is there at all. The first half is not. The
+caller read the field to produce the value, and a read hands out a reference;
+the function's own contract says `val`'s ownership transfers. So one
+reference arrives and nothing drops it. Doing nothing leaks; decrementing the
+slot frees a live value. The answer is to drop the *incoming* one.
+
+Three sites had the same guard and the same words: the field store by index,
+the field store by name, and the list element store.
+
+**Gate**: `scripts/fuzz_places.py` grew `self-assign` and
+`self-assign-twice` over its list-valued places. It already had a
+self-assignment — for *scalars*, where the whole question is a word moving
+nowhere — and every boxed place it covered was written from a fresh value.
+Restoring the old guard turns six of its 122 programs red.
+
+The shape is one this repository knows: a special case written for the
+dangerous half of a problem, with the other half assumed to need nothing.
+F70's framing check measured the body the way the body was measured; here a
+store skipped the release it needed because releasing the *other* thing would
+have been wrong.

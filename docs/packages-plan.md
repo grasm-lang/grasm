@@ -145,7 +145,7 @@ here: a hash has no key schedule and no timing surface beyond the compare.
 *meant* to be slow, so a pure-Grasm implementation is not the liability it
 would be elsewhere. Declares nothing.
 
-**18. `sanitize`.** HTML escaping (in `http` already, moves here), attribute
+**18. `sanitize`.** — **built**, `packages/sanitize`. HTML escaping (in `http` already, moves here), attribute
 and URL contexts, SQL identifier quoting, and a strict allow-list HTML
 subset. Declares nothing.
 
@@ -156,7 +156,7 @@ subset. Declares nothing.
 
 ### Observability
 
-**19. `metrics`.** Counters, gauges, histograms with explicit buckets, and a
+**19. `metrics`.** — **built**, `packages/metrics`. Counters, gauges, histograms with explicit buckets, and a
 Prometheus text exposition format. The registry is an effect, so a library can
 count things without declaring `io`; the exposition endpoint is `http`.
 

@@ -32,6 +32,8 @@ gates as everything else: three engines, one answer.
 | `jwt` | *none* | HS256, and the algorithm always comes from the caller. |
 | `cors` | *none* | A request in, the headers a response needs out. |
 | `dotenv` | `io` | `.env` files — and it never touches the process environment. |
+| `sanitize` | *none* | Escaping **by destination**. There is no general `escape`. |
+| `metrics` | `Metric` | Counters, gauges, histograms, Prometheus exposition — as an **effect**. |
 
 Three packages rather than one, and the split is the same argument each time:
 a program that only needs to *build* a request never acquires the capability to
@@ -81,6 +83,8 @@ grasm run packages/fs-demo/src/main.gr
 grasm run packages/jwt-demo/src/main.gr
 grasm run packages/cors-demo/src/main.gr
 grasm run packages/dotenv-demo/src/main.gr
+grasm run packages/sanitize-demo/src/main.gr
+grasm run packages/metrics-demo/src/main.gr
 ```
 
 ## The pattern every one of these follows

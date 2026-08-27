@@ -1,0 +1,83 @@
+// The `sanitize` package.
+//
+// Each payload below is run through *every* escaper, so the demo shows the
+// thing the package exists to say: escaping is for a destination, and the
+// same input needs different treatment depending on where it goes.
+import sanitize
+
+let PAYLOADS = [
+    "plain text",
+    "<script>alert(1)</script>",
+    "\" onmouseover=\"alert(1)",
+    "' or 1=1 --",
+    "a & b",
+    "</script><script>alert(1)</script>",
+    "javascript:alert(1)",
+    "JaVaScRiPt:alert(1)",
+    "https://example.test/a?b=c",
+    "/relative/path",
+    "../../etc/passwd",
+]
+
+fn main() {
+    print("-- html text")
+    for p in PAYLOADS {
+        print("  {p.pad_end(38, " ")} {sanitize.html_text(p)}")
+    }
+
+    print("-- html attribute")
+    for p in PAYLOADS {
+        print("  {p.pad_end(38, " ")} {sanitize.html_attribute(p)}")
+    }
+
+    print("-- inside a script block")
+    for p in PAYLOADS {
+        print("  {p.pad_end(38, " ")} {sanitize.html_script(p)}")
+    }
+
+    print("-- a url in an href")
+    for p in PAYLOADS {
+        print("  {p.pad_end(38, " ")} {sanitize.html_url(p)}")
+    }
+
+    print("-- a shell argument")
+    for p in ["plain", "two words", "it's", "$(rm -rf /)", "`whoami`"] {
+        print("  {p.pad_end(22, " ")} {sanitize.shell_argument(p)}")
+    }
+
+    print("-- an sql identifier, which is not for values")
+    for p in ["users", "user\"; drop table users; --", "with space"] {
+        match sanitize.sql_identifier(p) {
+            Ok(q) -> print("  {p.pad_end(30, " ")} {q}")
+            Err(e) -> print("  {p.pad_end(30, " ")} refused: {e}")
+        }
+    }
+    match sanitize.sql_identifier("") {
+        Ok(q) -> print("  empty accepted, which it should not be")
+        Err(e) -> print("  empty                          refused: {e}")
+    }
+
+    print("-- a header value, where control characters have no escape")
+    for p in ["ordinary", "two\r\nX-Injected: yes", "trailing \t", "  padded  "] {
+        print("  {p.replace("\r", "\\r").replace("\n", "\\n").pad_end(26, " ")} \"{sanitize.header_value(p)}\"")
+    }
+
+    print("-- a file name")
+    for p in ["report.pdf", "../../etc/passwd", "a/b/c", ".", "..", "  spaced  ", "with\ttab"] {
+        print("  {p.replace("\t", "\\t").pad_end(20, " ")} \"{sanitize.file_name(p)}\"")
+    }
+
+    print("-- printable, for deciding to refuse rather than escape")
+    for p in ["ordinary", "with\ttab", "with\nnewline"] {
+        print("  {p.replace("\t", "\\t").replace("\n", "\\n").pad_end(16, " ")} {sanitize.is_printable(p)}")
+    }
+
+    print("-- keeping only an alphabet")
+    print("  {sanitize.keep_only("a1-b2_c3!", "abcdefghijklmnopqrstuvwxyz0123456789")}")
+
+    print("-- slugs")
+    for p in ["Hello, World!", "  leading and trailing  ", "already-a-slug",
+              "MiXeD CaSe", "lots---of---hyphens", "!!!", ""] {
+        print("  \"{p}\" -> \"{sanitize.slug(p)}\"")
+    }
+}

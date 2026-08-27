@@ -1,0 +1,8 @@
+[package]
+name = "metrics"
+version = "1.0.0"
+entry = "src/main.gr"
+
+# The registry is an effect, so a library that counts something declares
+# `Metric` and not `io`. Where the counts go is the program's decision.
+capabilities = ["Metric"]
