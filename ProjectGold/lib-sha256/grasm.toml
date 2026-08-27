@@ -1,9 +1,0 @@
-[package]
-name = "lib_sha256"
-version = "1.0.0"
-entry = "src/main.gr"
-
-# Bytes in, bytes out. It opens nothing and dials nothing — which for a
-# cryptographic primitive is a property worth being able to *check* rather than
-# trust, and a consumer cannot acquire a capability by importing it.
-capabilities = []

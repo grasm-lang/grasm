@@ -31,7 +31,7 @@
 // grasm run main.gr -- serve     # then talk to it with curl
 // ```
 
-import lib_sha256
+import crypto_hash
 
 let PORT = 8978
 // Enough to be visibly slow per attempt and fast enough for a test suite. A
@@ -49,10 +49,10 @@ let ITERATIONS = 600
 /// have the same hash — which tells an attacker who to try first, and turns one
 /// cracked password into two.
 fn derive(salt: str, password: str) -> str {
-    var h = lib_sha256.sha256(salt + password)
+    var h = crypto_hash.sha256(salt + password)
     var i = 1
     while i < ITERATIONS {
-        h = lib_sha256.sha256(salt + h)
+        h = crypto_hash.sha256(salt + h)
         i = i + 1
     }
     h
@@ -153,7 +153,7 @@ fn find_account(accounts: [Account], email: str) -> i64 {
 /// two identical passwords having identical hashes, and this gives both.
 /// Unpredictability would be better and is not required here.
 fn make_salt(email: str, counter: i64) -> str / {io} {
-    lib_sha256.sha256("{now_millis()}:{counter}:{email}").substr(0, 32)
+    crypto_hash.sha256("{now_millis()}:{counter}:{email}").substr(0, 32)
 }
 
 /// A session token: 32 bytes from the operating system, as hex.
@@ -410,8 +410,8 @@ fn hash_checks() / {io} {
     print("--- the primitive ---")
     // The two canonical vectors. A crypto implementation that is not checked
     // against known answers is a random number generator with extra steps.
-    print("  sha256(\"\") = {lib_sha256.sha256("")}")
-    print("  sha256(\"abc\") = {lib_sha256.sha256("abc")}")
+    print("  sha256(\"\") = {crypto_hash.sha256("")}")
+    print("  sha256(\"abc\") = {crypto_hash.sha256("abc")}")
 
     print("--- derivation ---")
     let h1 = derive("salt-a", "correct horse")
@@ -421,7 +421,7 @@ fn hash_checks() / {io} {
     print("  same salt and password agree: {h1 == h2}")
     print("  a different salt changes it: {h1 != h3}")
     print("  one character changes it: {h1 != h4}")
-    print("  it is {ITERATIONS} rounds, not one: {h1 != lib_sha256.sha256("salt-a" + "correct horse")}")
+    print("  it is {ITERATIONS} rounds, not one: {h1 != crypto_hash.sha256("salt-a" + "correct horse")}")
     print("  length: {h1.len()} hex characters")
 
     print("--- comparison ---")

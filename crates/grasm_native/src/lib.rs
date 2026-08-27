@@ -463,6 +463,10 @@ struct Codegen<'m> {
     /// A variant name → the generic sum that declares it. One variant belongs
     /// to one family, and which *member* of it is a question for the use site.
     generic_variant_owner: HashMap<String, String>,
+    /// What the call site's binding says the result is, while a generic call
+    /// is being instantiated. Set around the call and cleared after, the way
+    /// `tail_hint` is.
+    ret_hint: Option<VType>,
     /// Module-level constants, by `module::NAME`. Their initializers are
     /// effect-free, so each use compiles the expression again rather than
     /// reading a global — which keeps the two engines doing the same thing.
@@ -582,6 +586,7 @@ impl<'m> Codegen<'m> {
             generic_types: HashMap::new(),
             type_args: HashMap::new(),
             generic_variant_owner: HashMap::new(),
+            ret_hint: None,
             consts: HashMap::new(),
             recursive: std::collections::HashSet::new(),
             pending_generics: Vec::new(),
@@ -1223,12 +1228,24 @@ impl<'m> Codegen<'m> {
         for (p, actual) in decl.params.iter().zip(arg_types) {
             unify_generic_with(&p.ty, actual, &names, &mut subst, &self.type_args);
         }
+        // What the arguments could not say, the binding may: `let c:
+        // Cache[str] = new_cache(3, 0)` determines `V` and no argument
+        // mentions it. Reading only the arguments made this backend stricter
+        // than the checker, which accepts it, and than the interpreter, which
+        // runs it — and it is the shape every empty-container constructor
+        // has: `new_set`, `new_queue`, `empty` (F77).
+        if decl.generics.iter().any(|g| !subst.contains_key(&g.name)) {
+            if let (Some(hint), Some(ret)) = (self.ret_hint.clone(), decl.ret.as_ref()) {
+                unify_generic_with(ret, &hint, &names, &mut subst, &self.type_args);
+            }
+        }
         for g in &decl.generics {
             if !subst.contains_key(&g.name) {
                 return nope(
                     span,
                     format!(
-                        "calling `{}` — `{}` is not determined by the arguments",
+                        "calling `{}` — `{}` is determined by neither the \
+arguments nor the type this is bound to",
                         decl.name.name, g.name
                     ),
                 );
@@ -2906,6 +2923,12 @@ struct BlockHints {
     /// its own — an arm of a `match` or an `if` whose *result* is annotated.
     /// Keyed by the literal's start offset, since there is no name to key on.
     declared_at: HashMap<u32, grasm_syntax::ast::TypeExpr>,
+    /// The annotation on a binding, keyed by where its *initializer* starts.
+    ///
+    /// `let c: Cache[str] = new_cache(3, 0)` determines `V`, and the arguments
+    /// do not. Reading only the arguments made the backend stricter than the
+    /// checker for every "empty container" constructor there is (F77).
+    annotated_at: HashMap<u32, grasm_syntax::ast::TypeExpr>,
     /// `apply(f, 5)` where `apply` declares `fn(i64) -> i64`: the signature
     /// says what `f`'s parameters are, and no call of `f` by name ever will.
     declared: HashMap<String, Vec<VType>>,
@@ -3235,6 +3258,10 @@ fn collect_block_hints(blk: &grasm_syntax::ast::Block) -> BlockHints {
                 for (at, want) in arm_closure_hints(init, t) {
                     hints.declared_at.entry(at).or_insert(want);
                 }
+                hints
+                    .annotated_at
+                    .entry(init.span().start)
+                    .or_insert_with(|| t.clone());
             }
         }
         if let Stmt::For { var, iter, .. } = stmt {
@@ -4338,6 +4365,23 @@ impl FnCx<'_, '_> {
     }
 
     /// Function lookup in the module currently being compiled.
+    /// The type a binding's annotation gives its initializer, if the
+    /// expression starting at `span` is one.
+    fn annotation_at(&mut self, span: Span) -> Option<VType> {
+        let te = self.annotation_expr_at(span)?;
+        self.cg.vtype_of(&te).ok()
+    }
+
+    /// The annotation as it was written, before resolution — which is what a
+    /// generic struct literal needs, since it has to line the written type
+    /// arguments up with the declaration's parameters by position.
+    fn annotation_expr_at(&self, span: Span) -> Option<grasm_syntax::ast::TypeExpr> {
+        self.closure_hints
+            .iter()
+            .rev()
+            .find_map(|scope| scope.annotated_at.get(&span.start).cloned())
+    }
+
     fn lookup_fn(&self, name: &str) -> Option<&FnSig> {
         self.cg
             .fns
@@ -7261,12 +7305,15 @@ this case",
                         && self.cg.generic_fns.contains_key(&qual)
                     {
                         let arg_types = self.generic_arg_types(&qual, args)?;
-                        qual = self.cg.instantiate_generic(
+                        self.cg.ret_hint = self.annotation_at(span);
+                        let made = self.cg.instantiate_generic(
                             &target_mod,
                             &name.name,
                             &arg_types,
                             span,
-                        )?;
+                        );
+                        self.cg.ret_hint = None;
+                        qual = made?;
                     }
                     if let Some(sig) = self.cg.fns.get(&qual) {
                         let (fid, params, modes, ret) = (
@@ -8866,7 +8913,7 @@ checker did",
         &mut self,
         callee: &Expr,
         args: &[Expr],
-        _span: Span,
+        call_span: Span,
     ) -> CResult<Option<(Value, VType)>> {
         // `x |> utils.helper` desugars to a call whose callee is qualified.
         // That is the same thing as `utils.helper(x)`, which the method path
@@ -9278,7 +9325,7 @@ checker did",
                 // seed and the function differed when they were written the
                 // same.
                 let ty = self
-                    .empty_vtype(_span)
+                    .empty_vtype(call_span)
                     .filter(|t| matches!(t, VType::Map(_, _)))
                     .unwrap_or(VType::Map(Box::new(VType::Any), Box::new(VType::Any)));
                 return Ok(Some((m, ty)));
@@ -9345,7 +9392,15 @@ checker did",
             if self.cg.generic_fns.contains_key(&generic_key) {
                 let arg_types = self.generic_arg_types(&generic_key, args)?;
                 let module = self.cg.current_module.clone();
-                Some(self.cg.instantiate_generic(&module, &id.name, &arg_types, id.span)?)
+                // The call's own span, or the callee's — a `let`'s hint is
+                // keyed by where the initializer starts, and which of the two
+                // that is depends on how the call was written.
+                self.cg.ret_hint = self
+                    .annotation_at(call_span)
+                    .or_else(|| self.annotation_at(id.span));
+                let key = self.cg.instantiate_generic(&module, &id.name, &arg_types, id.span);
+                self.cg.ret_hint = None;
+                Some(key?)
             } else {
                 None
             }
@@ -9850,6 +9905,36 @@ annotate the binding",
                 unify_generic(&df.ty, &t, &names, &mut subst);
             }
         }
+        // What the fields could not say, the binding may: `let b: Box[V] =
+        // Box{ items: [] }` names the member, and inside an instantiated copy
+        // `V` is already bound. Reading only the fields refused the one way
+        // there is to write an empty container of a generic type (F77).
+        if decl.generics.iter().any(|g| !subst.contains_key(&g.name)) {
+            if let Some(TypeExpr::Name { path, args, .. }) = self.annotation_expr_at(span) {
+                if path.dotted() == sname && args.len() == decl.generics.len() {
+                    for (g, written) in decl.generics.iter().zip(&args) {
+                        if subst.contains_key(&g.name) {
+                            continue;
+                        }
+                        if let Ok(t) = self.cg.vtype_of(written) {
+                            subst.insert(g.name.clone(), t);
+                        }
+                    }
+                }
+            }
+        }
+        // And inside an instantiated generic *function*, every type parameter
+        // is already bound: `fn get[V](…) -> (Cache[V], …)` compiling as
+        // `get[str]` knows `V` is `str`, whatever its fields and its binding
+        // say. Without this a container's own methods could not build the
+        // container they return (F77).
+        for g in &decl.generics {
+            if !subst.contains_key(&g.name) {
+                if let Some(t) = self.cg.generic_subst.get(&g.name).cloned() {
+                    subst.insert(g.name.clone(), t);
+                }
+            }
+        }
         let mut ats = Vec::with_capacity(decl.generics.len());
         for g in &decl.generics {
             match subst.get(&g.name) {
@@ -9857,7 +9942,11 @@ annotate the binding",
                 None => {
                     return nope(
                         span,
-                        format!("`{sname}` here — the fields say nothing about `{}`", g.name),
+                        format!(
+                            "`{sname}` here — nothing says what `{}` is: not the \
+fields, not the type this is bound to, not an enclosing generic",
+                            g.name
+                        ),
                     )
                 }
             }

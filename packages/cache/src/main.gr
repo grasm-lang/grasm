@@ -1,0 +1,199 @@
+// An in-process cache: least-recently-used, with an expiry.
+//
+// The clock is a parameter, as it is everywhere in these packages, so a test
+// can watch an entry expire without waiting for it. Nothing here is shared
+// between processes and nothing is shared between tasks — `parallel` and
+// `spawn` join before the statement after them, so there is no other task for
+// a cache to be shared *with*, and pretending otherwise would be the most
+// expensive kind of comment.
+//
+// A `get` changes the cache: it moves the entry to the front and it counts a
+// hit. So it answers the new cache alongside the value, rather than hiding a
+// mutation behind a name that reads like a question.
+
+type Entry[V] = { key: str, value: V, expires_ms: i64, used: i64 }
+
+type Cache[V] = {
+    entries: [Entry[V]],
+    capacity: i64,
+    ttl_ms: i64,
+    clock: i64,
+    hits: i64,
+    misses: i64,
+    evictions: i64,
+    expiries: i64,
+}
+
+/// A cache holding at most `capacity` entries, each living `ttl_ms`.
+///
+/// A `ttl_ms` of zero or less means no expiry — the entry stays until it is
+/// evicted for room. A `capacity` of zero or less holds nothing, which is a
+/// useful thing to be able to configure: it turns the cache off without
+/// removing it from the code.
+pub fn new_cache[V](capacity: i64, ttl_ms: i64) -> Cache[V] {
+    let empty: [Entry[V]] = []
+    Cache{ entries: empty, capacity: capacity, ttl_ms: ttl_ms, clock: 0,
+           hits: 0, misses: 0, evictions: 0, expiries: 0 }
+}
+
+fn not_expired[V](e: Entry[V], now_ms: i64) -> bool {
+    e.expires_ms <= 0 or now_ms < e.expires_ms
+}
+
+/// The value for a key, if it is there and has not expired.
+///
+/// Answers the cache too, because a hit is a change: the entry becomes the
+/// most recently used, and the counters move.
+pub fn get[V](c: Cache[V], key: str, now_ms: i64) -> (Cache[V], Option[V]) {
+    var kept: [Entry[V]] = []
+    var found: Option[V] = None
+    var expired = 0
+    let tick = c.clock + 1
+    for e in c.entries {
+        if e.key != key {
+            if not_expired(e, now_ms) {
+                kept.push(e)
+            } else {
+                expired = expired + 1
+            }
+            continue
+        }
+        if not not_expired(e, now_ms) {
+            expired = expired + 1
+            continue
+        }
+        found = Some(e.value)
+        kept.push(Entry{ key: e.key, value: e.value,
+                         expires_ms: e.expires_ms, used: tick })
+    }
+    let hit = found.is_some()
+    (Cache{ entries: kept, capacity: c.capacity, ttl_ms: c.ttl_ms, clock: tick,
+            hits: c.hits + (if hit { 1 } else { 0 }),
+            misses: c.misses + (if hit { 0 } else { 1 }),
+            evictions: c.evictions, expiries: c.expiries + expired },
+     found)
+}
+
+/// Store a value, replacing any earlier one for the key.
+///
+/// Eviction happens here rather than on a timer, because there is no timer: a
+/// cache that only sheds entries when it is used is a cache whose memory is
+/// bounded by its use, which is the behaviour wanted anyway.
+pub fn put[V](c: Cache[V], key: str, value: V, now_ms: i64) -> Cache[V] {
+    let tick = c.clock + 1
+    var kept: [Entry[V]] = []
+    var expired = 0
+    for e in c.entries {
+        if e.key == key {
+            continue
+        }
+        if not_expired(e, now_ms) {
+            kept.push(e)
+        } else {
+            expired = expired + 1
+        }
+    }
+    var evicted = 0
+    if c.capacity > 0 {
+        kept.push(Entry{ key: key, value: value,
+                         expires_ms: if c.ttl_ms > 0 { now_ms + c.ttl_ms } else { 0 },
+                         used: tick })
+        // Least recently used first, until it fits. `sort_by` is stable, so
+        // two entries used at the same tick keep the order they were stored
+        // in — which makes the whole thing reproducible.
+        while kept.len() > c.capacity {
+            var oldest = 0
+            for i in 1..kept.len() {
+                if kept[i].used < kept[oldest].used {
+                    oldest = i
+                }
+            }
+            kept.remove(oldest)
+            evicted = evicted + 1
+        }
+    }
+    Cache{ entries: kept, capacity: c.capacity, ttl_ms: c.ttl_ms, clock: tick,
+           hits: c.hits, misses: c.misses,
+           evictions: c.evictions + evicted, expiries: c.expiries + expired }
+}
+
+pub fn remove[V](c: Cache[V], key: str) -> Cache[V] {
+    var kept: [Entry[V]] = []
+    for e in c.entries {
+        if e.key != key {
+            kept.push(e)
+        }
+    }
+    Cache{ entries: kept, capacity: c.capacity, ttl_ms: c.ttl_ms, clock: c.clock,
+           hits: c.hits, misses: c.misses, evictions: c.evictions,
+           expiries: c.expiries }
+}
+
+pub fn clear[V](c: Cache[V]) -> Cache[V] {
+    let empty: [Entry[V]] = []
+    Cache{ entries: empty, capacity: c.capacity, ttl_ms: c.ttl_ms, clock: c.clock,
+           hits: c.hits, misses: c.misses, evictions: c.evictions,
+           expiries: c.expiries }
+}
+
+/// How many entries are held and not expired.
+pub fn size[V](c: Cache[V], now_ms: i64) -> i64 {
+    var n = 0
+    for e in c.entries {
+        if not_expired(e, now_ms) {
+            n = n + 1
+        }
+    }
+    n
+}
+
+pub fn has[V](c: Cache[V], key: str, now_ms: i64) -> bool {
+    for e in c.entries {
+        if e.key == key and not_expired(e, now_ms) {
+            return true
+        }
+    }
+    false
+}
+
+/// The keys held, most recently used first — which is the order eviction
+/// works backwards from, so printing it is how a test sees what will go next.
+pub fn keys[V](c: Cache[V], now_ms: i64) -> [str] {
+    var live: [Entry[V]] = []
+    for e in c.entries {
+        if not_expired(e, now_ms) {
+            live.push(e)
+        }
+    }
+    live.sort_by(|e| 0 - e.used)
+    var out: [str] = []
+    for e in live {
+        out.push(e.key)
+    }
+    out
+}
+
+/// Drop everything that has expired, without touching anything else. Worth
+/// having because `size` and `keys` skip them without removing them, so a
+/// cache that is never written to keeps the memory.
+pub fn sweep[V](c: Cache[V], now_ms: i64) -> Cache[V] {
+    var kept: [Entry[V]] = []
+    var expired = 0
+    for e in c.entries {
+        if not_expired(e, now_ms) {
+            kept.push(e)
+        } else {
+            expired = expired + 1
+        }
+    }
+    Cache{ entries: kept, capacity: c.capacity, ttl_ms: c.ttl_ms, clock: c.clock,
+           hits: c.hits, misses: c.misses, evictions: c.evictions,
+           expiries: c.expiries + expired }
+}
+
+/// `hits`, `misses`, `evictions`, `expiries`, and the hit rate in per cent.
+pub fn stats[V](c: Cache[V]) -> str {
+    let asked = c.hits + c.misses
+    let rate = if asked == 0 { 0 } else { c.hits * 100 / asked }
+    "hits {c.hits} misses {c.misses} rate {rate}% evicted {c.evictions} expired {c.expiries}"
+}

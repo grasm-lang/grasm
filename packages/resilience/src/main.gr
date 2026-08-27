@@ -1,0 +1,269 @@
+// Retry, backoff, circuit breaking, rate limiting — as arithmetic.
+//
+// Every policy here is a pure function of a clock reading and a random draw,
+// both of which come in as arguments. So the package declares nothing, and —
+// more usefully — a test can advance time by an hour without waiting for one,
+// and can replay the same jitter twice.
+//
+// That is not a stylistic preference. A resilience library that reads the
+// clock itself can only be tested by sleeping, so in practice it is tested by
+// reading it, and a circuit breaker nobody has watched open is a circuit
+// breaker nobody knows works.
+
+// --- backoff ---------------------------------------------------------------
+
+type Backoff = {
+    base_ms: i64,
+    factor: i64,
+    cap_ms: i64,
+    jitter: bool,
+}
+
+pub fn backoff(base_ms: i64, cap_ms: i64) -> Backoff {
+    Backoff{ base_ms: base_ms, factor: 2, cap_ms: cap_ms, jitter: true }
+}
+
+pub fn without_jitter(b: Backoff) -> Backoff {
+    Backoff{ base_ms: b.base_ms, factor: b.factor, cap_ms: b.cap_ms, jitter: false }
+}
+
+/// How long to wait before attempt `n`, counting from 0.
+///
+/// `base * factor^n`, capped — and then, with jitter, a uniform draw from
+/// `0..that`. Full jitter rather than a fraction of the delay: the point is to
+/// stop a thousand clients that failed at the same moment from retrying at the
+/// same moment, and half of them retrying together is half a thundering herd.
+///
+/// `draw` is a number in `0..1`; where it comes from is the caller's.
+pub fn delay_for(b: Backoff, attempt: i64, draw: f64) -> i64 {
+    if attempt < 0 {
+        return 0
+    }
+    var d = b.base_ms
+    var i = 0
+    // Multiplied step by step and capped each time, because `base * factor^n`
+    // overflows an `i64` at about attempt 63 and comes back negative — a
+    // delay of minus four days, which sorts as "retry immediately".
+    while i < attempt and d < b.cap_ms {
+        d = d * b.factor
+        i = i + 1
+    }
+    if d > b.cap_ms {
+        d = b.cap_ms
+    }
+    if not b.jitter {
+        return d
+    }
+    let scaled = (d.as_f64() * draw).as_i64()
+    if scaled < 0 { 0 } else if scaled > d { d } else { scaled }
+}
+
+// --- retry -----------------------------------------------------------------
+
+type Retry = {
+    attempts: i64,
+    backoff: Backoff,
+}
+
+pub fn retry(attempts: i64, b: Backoff) -> Retry {
+    Retry{ attempts: attempts, backoff: b }
+}
+
+/// Should attempt `attempt` (counting from 0) be followed by another?
+pub fn should_retry(r: Retry, attempt: i64) -> bool {
+    attempt + 1 < r.attempts
+}
+
+/// The whole schedule, as the delays between attempts. `attempts` of 3 gives
+/// two delays, because the first attempt is not waited for.
+pub fn schedule(r: Retry, draws: [f64]) -> [i64] {
+    var out: [i64] = []
+    var i = 0
+    while i + 1 < r.attempts {
+        let draw = if i < draws.len() { draws[i] } else { 1.0 }
+        out.push(delay_for(r.backoff, i, draw))
+        i = i + 1
+    }
+    out
+}
+
+// --- circuit breaker -------------------------------------------------------
+
+type BreakerState = | Closed | Open | HalfOpen
+
+type Breaker = {
+    state: BreakerState,
+    failures: i64,
+    successes: i64,
+    threshold: i64,
+    recovery_ms: i64,
+    opened_at: i64,
+    probes: i64,
+}
+
+/// Closed after `threshold` consecutive failures becomes open; open becomes
+/// half-open after `recovery_ms`; half-open closes on `probes` successes and
+/// reopens on one failure.
+pub fn breaker(threshold: i64, recovery_ms: i64, probes: i64) -> Breaker {
+    Breaker{ state: Closed, failures: 0, successes: 0, threshold: threshold,
+             recovery_ms: recovery_ms, opened_at: 0, probes: probes }
+}
+
+/// May a call go through, at this moment?
+///
+/// This also *transitions* an open breaker to half-open once the recovery
+/// window has passed, which is why it answers a breaker as well as a verdict:
+/// a breaker that only changed on a result would stay open forever once the
+/// calls stopped, which is exactly when it needs to reopen the road.
+pub fn allows(b: Breaker, now_ms: i64) -> (Breaker, bool) {
+    match b.state {
+        Closed -> (b, true)
+        HalfOpen -> (b, true)
+        Open -> {
+            if now_ms - b.opened_at >= b.recovery_ms {
+                let moved = Breaker{ state: HalfOpen, failures: b.failures,
+                                     successes: 0, threshold: b.threshold,
+                                     recovery_ms: b.recovery_ms,
+                                     opened_at: b.opened_at, probes: b.probes }
+                return (moved, true)
+            }
+            (b, false)
+        }
+    }
+}
+
+pub fn succeeded(b: Breaker, now_ms: i64) -> Breaker {
+    match b.state {
+        HalfOpen -> {
+            let n = b.successes + 1
+            if n >= b.probes {
+                return breaker(b.threshold, b.recovery_ms, b.probes)
+            }
+            Breaker{ state: HalfOpen, failures: b.failures, successes: n,
+                     threshold: b.threshold, recovery_ms: b.recovery_ms,
+                     opened_at: b.opened_at, probes: b.probes }
+        }
+        _ -> Breaker{ state: Closed, failures: 0, successes: 0,
+                      threshold: b.threshold, recovery_ms: b.recovery_ms,
+                      opened_at: b.opened_at, probes: b.probes }
+    }
+}
+
+pub fn failed(b: Breaker, now_ms: i64) -> Breaker {
+    // A failure in half-open reopens immediately, without waiting for the
+    // threshold again: the probe was the test, and it failed.
+    match b.state {
+        HalfOpen -> Breaker{ state: Open, failures: b.failures + 1, successes: 0,
+                             threshold: b.threshold, recovery_ms: b.recovery_ms,
+                             opened_at: now_ms, probes: b.probes }
+        _ -> {
+            let n = b.failures + 1
+            if n >= b.threshold {
+                return Breaker{ state: Open, failures: n, successes: 0,
+                                threshold: b.threshold, recovery_ms: b.recovery_ms,
+                                opened_at: now_ms, probes: b.probes }
+            }
+            Breaker{ state: Closed, failures: n, successes: 0,
+                     threshold: b.threshold, recovery_ms: b.recovery_ms,
+                     opened_at: b.opened_at, probes: b.probes }
+        }
+    }
+}
+
+pub fn state_name(b: Breaker) -> str {
+    match b.state {
+        Closed -> "closed"
+        Open -> "open"
+        HalfOpen -> "half-open"
+    }
+}
+
+// --- rate limiting ---------------------------------------------------------
+
+type Bucket = {
+    capacity: i64,
+    per_second: i64,
+    tokens_milli: i64,
+    last_ms: i64,
+}
+
+/// A token bucket: `capacity` in hand, refilling at `per_second`.
+///
+/// Tokens are held in thousandths, so a rate below one per second — one
+/// request a minute, say — still refills. Whole tokens would floor to zero on
+/// every tick and the bucket would never fill.
+pub fn bucket(capacity: i64, per_second: i64, now_ms: i64) -> Bucket {
+    Bucket{ capacity: capacity, per_second: per_second,
+            tokens_milli: capacity * 1000, last_ms: now_ms }
+}
+
+/// Take one token if there is one. Answers the bucket and whether it was
+/// allowed.
+pub fn take(b: Bucket, now_ms: i64) -> (Bucket, bool) {
+    var filled = refill(b, now_ms)
+    if filled.tokens_milli < 1000 {
+        return (filled, false)
+    }
+    (Bucket{ capacity: filled.capacity, per_second: filled.per_second,
+             tokens_milli: filled.tokens_milli - 1000, last_ms: filled.last_ms },
+     true)
+}
+
+fn refill(b: Bucket, now_ms: i64) -> Bucket {
+    // A clock that went backwards refills nothing rather than draining the
+    // bucket. `now_millis` is wall time, so this happens.
+    if now_ms <= b.last_ms {
+        return Bucket{ capacity: b.capacity, per_second: b.per_second,
+                       tokens_milli: b.tokens_milli, last_ms: b.last_ms }
+    }
+    let gained = (now_ms - b.last_ms) * b.per_second
+    var t = b.tokens_milli + gained
+    let ceiling = b.capacity * 1000
+    if t > ceiling {
+        t = ceiling
+    }
+    Bucket{ capacity: b.capacity, per_second: b.per_second,
+            tokens_milli: t, last_ms: now_ms }
+}
+
+/// Whole tokens available, for a report.
+pub fn available(b: Bucket, now_ms: i64) -> i64 {
+    refill(b, now_ms).tokens_milli / 1000
+}
+
+/// How long until one token is available, in milliseconds. Zero when one is.
+pub fn wait_for_token(b: Bucket, now_ms: i64) -> i64 {
+    let filled = refill(b, now_ms)
+    if filled.tokens_milli >= 1000 {
+        return 0
+    }
+    if b.per_second <= 0 {
+        return 0 - 1
+    }
+    let missing = 1000 - filled.tokens_milli
+    (missing + b.per_second - 1) / b.per_second
+}
+
+// --- deadlines -------------------------------------------------------------
+
+type Deadline = { at_ms: i64 }
+
+pub fn deadline_in(now_ms: i64, after_ms: i64) -> Deadline {
+    Deadline{ at_ms: now_ms + after_ms }
+}
+
+pub fn expired(d: Deadline, now_ms: i64) -> bool {
+    now_ms >= d.at_ms
+}
+
+pub fn remaining(d: Deadline, now_ms: i64) -> i64 {
+    let left = d.at_ms - now_ms
+    if left < 0 { 0 } else { left }
+}
+
+/// The smaller of a deadline and a delay, so a retry never sleeps past the
+/// deadline it is retrying under.
+pub fn capped_delay(d: Deadline, now_ms: i64, delay_ms: i64) -> i64 {
+    let left = remaining(d, now_ms)
+    if delay_ms > left { left } else { delay_ms }
+}

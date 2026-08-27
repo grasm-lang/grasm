@@ -92,6 +92,7 @@ and the entries disagree.
 | [F74](#f74) | a match whose live arms all yield nothing could not be typed | S3, backend | **fixed** |
 | [F75](#f75) | a call into another module could not be typed where the type had to be worked out | S3, backend | **fixed** |
 | [F76](#f76) | two gates counted the programs they had not checked, and passed | S2, tests | **fixed** |
+| [F77](#f77) | a generic container could not be built empty | S2, backend | **fixed** |
 
 <!-- end index -->
 ## F1 — a wrapped condition must end the line with the operator (S4) — **fixed**
@@ -3329,3 +3330,41 @@ The regression itself is fixed too: the probe arm's guard now requires that
 the name really is a function in the target module, so a variant
 constructor, a struct name or anything else falls through to the arms that
 handle it.
+
+## F77 — a generic container could not be built empty (S2, backend) — **fixed**
+
+```
+let a: Box[str] = empty_box()
+error: calling `empty_box` — `V` is not determined by the arguments
+```
+
+Three refusals in one shape, and the shape is every empty-container
+constructor there is — `new_set`, `new_queue`, `new_cache`, `empty`.
+
+1. **The call.** `infer_generic_subst` read the arguments and nothing else,
+   and its comment said that was "exactly the checker's rule too". It is
+   not: the checker accepts this and the interpreter runs it. The binding's
+   annotation determines `V` and was in view.
+2. **The literal inside.** `let b: Box[V] = Box{ items: [] }` — the fields
+   say nothing about `V` and the binding says everything, and only the
+   fields were read.
+3. **The container's own methods.** `fn get[V](…) -> (Cache[V], …)`
+   compiling as `get[str]` builds a `Cache` whose fields cannot say what `V`
+   is either — but the enclosing instantiation already bound it, in
+   `generic_subst`, which nothing consulted.
+
+All three now look further: the call at the type the binding gives it, the
+literal at the type arguments the annotation writes, and both at the
+enclosing generic's own bindings. The refusal, where one is still right,
+names all three places rather than only the arguments.
+
+This is the limit a library ecosystem hits first. A container is generic and
+starts empty, and until now the second half of that sentence could not be
+compiled.
+
+Found by writing `packages/cache`, which is `Cache[V]` and begins with
+`new_cache`.
+
+**Gate**: `scripts/nativegaps.sh`, "a type parameter the binding fixes" —
+an empty constructor, a method that rebuilds the container, and both used.
+Removing the binding hint turns it from compiled to refused.

@@ -291,17 +291,27 @@ fn an_unused_generic_needs_no_instantiation() {
 }
 
 #[test]
-fn a_type_parameter_the_arguments_do_not_determine_is_reported() {
-    // `T` appears only in the return type, so there is nothing to infer from
-    // the call. Guessing would emit the wrong function.
+fn a_type_parameter_nothing_determines_is_reported() {
+    // `T` appears only in the return type and the call is not bound to
+    // anything, so there is nothing to infer from. Guessing would emit the
+    // wrong function.
+    //
+    // The *bound* case is a different one and compiles: `let o: Option[str] =
+    // make()` says what `T` is, and reading only the arguments made this
+    // backend stricter than the checker for every empty-container
+    // constructor there is (F77).
     let err = compile(
         "fn make[T]() -> Option[T] {\n    None\n}\n\nfn main() {\n    print(\"{make().is_none()}\")\n}\n",
     )
     .expect_err("should be reported, not guessed");
     assert!(
-        err.contains("not determined by the arguments"),
+        err.contains("determined by neither the arguments nor the type this is bound to"),
         "expected a clear reason, got: {err}"
     );
+    compile(
+        "fn make[T]() -> Option[T] {\n    None\n}\n\nfn main() {\n    let o: Option[str] = make()\n    print(\"{o.is_none()}\")\n}\n",
+    )
+    .expect("a binding that says what `T` is should be enough");
 }
 
 // ---------------------------------------------------------------------------

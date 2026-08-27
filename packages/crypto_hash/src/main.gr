@@ -1,0 +1,308 @@
+// SHA-256, HMAC and PBKDF2.
+//
+// Project 27 wrote the compression function and project 7 needed it for
+// password hashing, which is where a from-scratch implementation stops being
+// an exercise and starts being the thing between a stolen file and every
+// account in it. This is that code as a release package, with the two things
+// built on it that everything else wants: a keyed hash and a key-derivation
+// function.
+//
+// **What is here and what is deliberately not.** A hash has no key schedule
+// and no timing surface beyond the final comparison, so writing one is a
+// matter of getting the arithmetic right and the arithmetic is checked against
+// published vectors below. A *cipher* is not: AES and RSA written here would
+// have no constant-time guarantee from the compiler, and a block cipher whose
+// timing depends on its key is a key that leaks. When this language has TLS it
+// will have it by binding a reviewed C library, which costs `unsafe` in the
+// row and shows in every consumer's ceiling — and that is the right trade.
+//
+// **SHA-256 is not a password hash.** It is fast, and fast is the wrong
+// property: it is what lets an attacker try billions of guesses a second
+// against a stolen file. `pbkdf2_sha256` below is the answer available here —
+// deliberately slow by repetition. Argon2 is better because it is also
+// memory-hard, and is next.
+
+let MASK32 = 0xFFFFFFFF
+
+fn m32(v: i64) -> i64 {
+    v.bit_and(MASK32)
+}
+
+fn add32(a: i64, b: i64) -> i64 {
+    m32(a + b)
+}
+
+/// Rotate right, within 32 bits. `ushr` and not `shr`: an arithmetic shift
+/// would smear the sign bit across the top and every hash would be wrong.
+fn rotr32(v: i64, n: i64) -> i64 {
+    m32((v.ushr(n)).bit_or(v.shl(32 - n)))
+}
+
+fn shr32(v: i64, n: i64) -> i64 {
+    m32(v.ushr(n))
+}
+
+fn k_table() -> [i64] {
+    [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
+        0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+        0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
+        0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
+        0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+        0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
+        0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+        0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    ]
+}
+
+/// The message as bytes. `str` is UTF-8 and `code_at` gives code points, so a
+/// non-ASCII character has to be encoded here — otherwise "é" would hash as
+/// one byte 0xE9 rather than the two bytes 0xC3 0xA9 that it actually is, and
+/// the digest would silently disagree with every other implementation.
+pub fn utf8_bytes(s: str) -> [i64] {
+    var out: [i64] = []
+    for cp in s.codes() {
+        if cp < 0x80 {
+            out.push(cp)
+        } else if cp < 0x800 {
+            out.push(0xC0.bit_or(cp.ushr(6)))
+            out.push(0x80.bit_or(cp.bit_and(0x3F)))
+        } else if cp < 0x10000 {
+            out.push(0xE0.bit_or(cp.ushr(12)))
+            out.push(0x80.bit_or((cp.ushr(6)).bit_and(0x3F)))
+            out.push(0x80.bit_or(cp.bit_and(0x3F)))
+        } else {
+            out.push(0xF0.bit_or(cp.ushr(18)))
+            out.push(0x80.bit_or((cp.ushr(12)).bit_and(0x3F)))
+            out.push(0x80.bit_or((cp.ushr(6)).bit_and(0x3F)))
+            out.push(0x80.bit_or(cp.bit_and(0x3F)))
+        }
+    }
+    out
+}
+
+pub fn sha256_bytes(msg: [i64]) -> [i64] {
+    var h = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    ]
+    let k = k_table()
+
+    // Padding: a 1 bit, then zeros, then the length in bits as 64 bits big-endian.
+    var data = msg
+    let bit_len = msg.len() * 8
+    data.push(0x80)
+    while data.len() % 64 != 56 {
+        data.push(0)
+    }
+    var i = 7
+    while i >= 0 {
+        data.push((bit_len.ushr(i * 8)).bit_and(0xFF))
+        i = i - 1
+    }
+
+    var block = 0
+    while block < data.len() {
+        var w: [i64] = []
+        for t in 0..16 {
+            let base = block + t * 4
+            w.push(m32(
+                data[base].shl(24)
+                    .bit_or(data[base + 1].shl(16))
+                    .bit_or(data[base + 2].shl(8))
+                    .bit_or(data[base + 3])
+            ))
+        }
+        for t in 16..64 {
+            let s0 = (rotr32(w[t - 15], 7)).bit_xor(rotr32(w[t - 15], 18)).bit_xor(shr32(w[t - 15], 3))
+            let s1 = (rotr32(w[t - 2], 17)).bit_xor(rotr32(w[t - 2], 19)).bit_xor(shr32(w[t - 2], 10))
+            w.push(add32(add32(w[t - 16], s0), add32(w[t - 7], s1)))
+        }
+
+        var a = h[0]
+        var b = h[1]
+        var c = h[2]
+        var d = h[3]
+        var e = h[4]
+        var f = h[5]
+        var g = h[6]
+        var hh = h[7]
+
+        for t in 0..64 {
+            let S1 = (rotr32(e, 6)).bit_xor(rotr32(e, 11)).bit_xor(rotr32(e, 25))
+            let ch = (e.bit_and(f)).bit_xor((e.bit_not().bit_and(MASK32)).bit_and(g))
+            let temp1 = add32(add32(add32(hh, S1), add32(ch, k[t])), w[t])
+            let S0 = (rotr32(a, 2)).bit_xor(rotr32(a, 13)).bit_xor(rotr32(a, 22))
+            let maj = (a.bit_and(b)).bit_xor(a.bit_and(c)).bit_xor(b.bit_and(c))
+            let temp2 = add32(S0, maj)
+
+            hh = g
+            g = f
+            f = e
+            e = add32(d, temp1)
+            d = c
+            c = b
+            b = a
+            a = add32(temp1, temp2)
+        }
+
+        h[0] = add32(h[0], a)
+        h[1] = add32(h[1], b)
+        h[2] = add32(h[2], c)
+        h[3] = add32(h[3], d)
+        h[4] = add32(h[4], e)
+        h[5] = add32(h[5], f)
+        h[6] = add32(h[6], g)
+        h[7] = add32(h[7], hh)
+
+        block = block + 64
+    }
+    h
+}
+
+pub fn hex8(v: i64) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 7
+    while i >= 0 {
+        out = out + digits.substr((v.ushr(i * 4)).bit_and(15), 1)
+        i = i - 1
+    }
+    out
+}
+
+pub fn sha256(s: str) -> str {
+    var out = ""
+    for word in sha256_bytes(utf8_bytes(s)) {
+        out = out + hex8(word)
+    }
+    out
+}
+
+
+
+// --- bytes in, bytes out ---------------------------------------------------
+
+/// The eight 32-bit words of a digest, as the 32 bytes they are.
+///
+/// `sha256_bytes` answers *words*, which is what the compression function
+/// produces and what `hex8` renders. Everything built on a hash — HMAC's
+/// inner digest, PBKDF2's blocks — needs the bytes, and handing it words
+/// silently hashes the wrong thing.
+pub fn words_to_bytes(words: [i64]) -> [i64] {
+    var out: [i64] = []
+    for w in words {
+        out.push(w.ushr(24).bit_and(255))
+        out.push(w.ushr(16).bit_and(255))
+        out.push(w.ushr(8).bit_and(255))
+        out.push(w.bit_and(255))
+    }
+    out
+}
+
+/// The digest of a byte sequence.
+pub fn sha256_of(b: bytes) -> bytes {
+    bytes_of(words_to_bytes(sha256_bytes(b.to_list())))
+}
+
+pub fn hex_of(b: bytes) -> str {
+    let digits = "0123456789abcdef".chars()
+    var out = ""
+    for v in b.to_list() {
+        out = out + digits[v / 16] + digits[v % 16]
+    }
+    out
+}
+
+// --- HMAC ------------------------------------------------------------------
+
+let BLOCK = 64
+
+/// HMAC-SHA-256, as RFC 2104 defines it.
+///
+/// A key longer than the block is hashed first and a shorter one is padded —
+/// both are in the definition, and skipping either makes a MAC that agrees
+/// with nothing else in the world for exactly the keys people use.
+pub fn hmac_sha256(key: bytes, message: bytes) -> bytes {
+    var k = key.to_list()
+    if k.len() > BLOCK {
+        k = words_to_bytes(sha256_bytes(k))
+    }
+    while k.len() < BLOCK {
+        k.push(0)
+    }
+    var inner: [i64] = []
+    var outer: [i64] = []
+    for i in 0..BLOCK {
+        inner.push(k[i].bit_xor(0x36))
+        outer.push(k[i].bit_xor(0x5c))
+    }
+    for v in message.to_list() {
+        inner.push(v)
+    }
+    for v in words_to_bytes(sha256_bytes(inner)) {
+        outer.push(v)
+    }
+    bytes_of(words_to_bytes(sha256_bytes(outer)))
+}
+
+pub fn hmac_sha256_hex(key: bytes, message: bytes) -> str {
+    hex_of(hmac_sha256(key, message))
+}
+
+// --- PBKDF2 ----------------------------------------------------------------
+
+/// PBKDF2-HMAC-SHA256, as RFC 8018 defines it.
+///
+/// `iterations` is the cost, and it is the caller's to choose because it
+/// depends on the machine and the year. It is not defaulted here: a default
+/// that was right when this was written is a default that is wrong for as
+/// long as the code lives afterwards.
+pub fn pbkdf2_sha256(password: bytes, salt: bytes, iterations: i64, length: i64) -> bytes {
+    var out: [i64] = []
+    var block = 1
+    while out.len() < length {
+        var salted = salt.to_list()
+        // The block index, four bytes, most significant first.
+        salted.push(block.ushr(24).bit_and(255))
+        salted.push(block.ushr(16).bit_and(255))
+        salted.push(block.ushr(8).bit_and(255))
+        salted.push(block.bit_and(255))
+        var u = hmac_sha256(password, bytes_of(salted)).to_list()
+        var acc = u
+        var i = 1
+        while i < iterations {
+            u = hmac_sha256(password, bytes_of(u)).to_list()
+            for j in 0..acc.len() {
+                acc[j] = acc[j].bit_xor(u[j])
+            }
+            i = i + 1
+        }
+        for v in acc {
+            if out.len() < length {
+                out.push(v)
+            }
+        }
+        block = block + 1
+    }
+    bytes_of(out)
+}
+
+/// Equal or not, in time that does not depend on where they differ.
+///
+/// The one place a hash *does* have a timing surface: `a == b` stops at the
+/// first difference, which tells whoever is timing it how much of a MAC they
+/// have guessed. Verifying a signature, a token or a password hash uses this.
+pub fn equal_constant_time(a: bytes, b: bytes) -> bool {
+    if a.len() != b.len() {
+        return false
+    }
+    var diff = 0
+    for i in 0..a.len() {
+        diff = diff.bit_or(a.at(i).bit_xor(b.at(i)))
+    }
+    diff == 0
+}

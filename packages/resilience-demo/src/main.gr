@@ -1,0 +1,98 @@
+// The `resilience` package. Time moves because the numbers below say so, not
+// because anything waited — which is what makes a circuit breaker something a
+// test can watch open and close.
+import resilience
+
+fn line(label: str, cb: Breaker, allowed: bool, now: i64) -> str {
+    "  t={now} {label.pad_end(22, " ")} {resilience.state_name(cb).pad_end(10, " ")} allowed={allowed}"
+}
+
+fn main() {
+    print("-- backoff without jitter, base 100ms capped at 5s")
+    let b = resilience.without_jitter(resilience.backoff(100, 5000))
+    var delays: [i64] = []
+    for n in 0..10 {
+        delays.push(resilience.delay_for(b, n, 1.0))
+    }
+    print("  {delays}")
+    print("  attempt 62, which is where doubling overflows: {resilience.delay_for(b, 62, 1.0)}")
+    print("  attempt 200: {resilience.delay_for(b, 200, 1.0)}")
+    print("  a negative attempt: {resilience.delay_for(b, 0 - 1, 1.0)}")
+
+    print("-- full jitter is a draw from 0..delay")
+    let j = resilience.backoff(100, 5000)
+    for draw in [0.0, 0.25, 0.5, 0.99, 1.0] {
+        var row: [i64] = []
+        for n in 0..5 {
+            row.push(resilience.delay_for(j, n, draw))
+        }
+        print("  draw {draw}: {row}")
+    }
+
+    print("-- a retry schedule")
+    let r = resilience.retry(4, resilience.without_jitter(resilience.backoff(50, 1000)))
+    print("  4 attempts -> delays {resilience.schedule(r, [1.0, 1.0, 1.0])}")
+    print("  should_retry: {resilience.should_retry(r, 0)} {resilience.should_retry(r, 2)} {resilience.should_retry(r, 3)}")
+    print("  1 attempt -> delays {resilience.schedule(resilience.retry(1, j), [1.0])}")
+
+    print("-- a circuit breaker: 3 failures, 1000ms recovery, 2 probes")
+    var cb = resilience.breaker(3, 1000, 2)
+    var now = 0
+    for step in 0..3 {
+        let pair = resilience.allows(cb, now)
+        cb = pair.0
+        print(line("failure {step + 1}", cb, pair.1, now))
+        cb = resilience.failed(cb, now)
+        now = now + 100
+    }
+    print("  now open: {resilience.state_name(cb)}")
+    let blocked = resilience.allows(cb, now)
+    cb = blocked.0
+    print(line("call while open", cb, blocked.1, now))
+    now = now + 500
+    let still = resilience.allows(cb, now)
+    cb = still.0
+    print(line("500ms later", cb, still.1, now))
+    now = now + 700
+    let probe = resilience.allows(cb, now)
+    cb = probe.0
+    print(line("after recovery", cb, probe.1, now))
+    cb = resilience.succeeded(cb, now)
+    print("  one probe passed: {resilience.state_name(cb)}")
+    cb = resilience.succeeded(cb, now)
+    print("  two probes passed: {resilience.state_name(cb)}")
+
+    print("-- a probe that fails reopens at once")
+    var cb2 = resilience.breaker(1, 100, 3)
+    cb2 = resilience.failed(cb2, 0)
+    print("  after one failure: {resilience.state_name(cb2)}")
+    let reopened = resilience.allows(cb2, 200)
+    cb2 = reopened.0
+    print("  after recovery: {resilience.state_name(cb2)} allowed={reopened.1}")
+    cb2 = resilience.failed(cb2, 200)
+    print("  probe failed: {resilience.state_name(cb2)}")
+
+    print("-- a token bucket: 3 in hand, 2 per second")
+    var tb = resilience.bucket(3, 2, 0)
+    var verdicts: [bool] = []
+    for _i in 0..5 {
+        let taken = resilience.take(tb, 0)
+        tb = taken.0
+        verdicts.push(taken.1)
+    }
+    print("  five at once: {verdicts}")
+    print("  available now: {resilience.available(tb, 0)}  wait: {resilience.wait_for_token(tb, 0)}ms")
+    print("  available after 500ms: {resilience.available(tb, 500)}")
+    print("  available after 5s: {resilience.available(tb, 5000)}")
+    let after = resilience.take(tb, 500)
+    print("  one at 500ms: {after.1}")
+    print("  a clock that went backwards: {resilience.available(tb, 0 - 1000)}")
+
+    print("-- deadlines")
+    let d = resilience.deadline_in(1000, 500)
+    for t in [1000, 1400, 1500, 1600] {
+        print("  t={t} expired={resilience.expired(d, t)} remaining={resilience.remaining(d, t)}ms")
+    }
+    print("  a 900ms delay capped by a deadline 300ms away: {resilience.capped_delay(d, 1200, 900)}ms")
+    print("  a 100ms delay under the same deadline: {resilience.capped_delay(d, 1200, 100)}ms")
+}

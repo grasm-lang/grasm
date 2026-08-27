@@ -4,6 +4,6 @@ version = "1.0.0"
 entry = "main.gr"
 capabilities = ["io", "net"]
 
-[dependencies.lib_sha256]
-path = "../lib-sha256"
+[dependencies.crypto_hash]
+path = "../../packages/crypto_hash"
 version = "^1.0.0"

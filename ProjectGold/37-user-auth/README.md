@@ -12,7 +12,7 @@ grasm run main.gr -- serve     # then talk to it with curl
 
 ## Where project 27 stops being an exercise
 
-`lib_sha256` is project 27's from-scratch SHA-256, extracted as a package. Here
+`crypto_hash` is project 27's from-scratch SHA-256, extracted as a package. Here
 it stands between a stolen file and every account in it, so the first thing this
 project does is check it against the two canonical vectors:
 

@@ -1,0 +1,8 @@
+[package]
+name = "cache"
+version = "1.0.0"
+entry = "src/main.gr"
+
+# The clock and the random draw come in as arguments, so this is arithmetic
+# and declares nothing — and a test can advance an hour without waiting for one.
+capabilities = []

@@ -76,8 +76,11 @@ grasm deps --locked   # fail rather than update the lockfile</code></pre>
 <tr><td><code>cli</code></td><td><i>none</i></td><td>Flags, bundles, subcommands, <code>--</code>, a generated help page.</td></tr>
 <tr><td><code>testing</code></td><td><i>none</i></td><td>Cases as values, table-driven suites, a golden diff that names the line and column.</td></tr>
 <tr><td><code>toml</code></td><td><i>none</i></td><td>Tables, arrays, inline tables, reached by dotted path.</td></tr>
+<tr><td><code>resilience</code></td><td><i>none</i></td><td>Backoff with full jitter, circuit breaker, token bucket, deadlines — the clock is a parameter.</td></tr>
+<tr><td><code>cache</code></td><td><i>none</i></td><td><code>Cache[V]</code>, least-recently-used with an expiry.</td></tr>
+<tr><td><code>crypto_hash</code></td><td><i>none</i></td><td>SHA-256, HMAC-SHA-256, PBKDF2, constant-time compare — every digest checked against FIPS 180-4, RFC 4231 and RFC 6070.</td></tr>
 </table></div>
-<p>Thirteen of the fifteen declare <em>nothing</em>. That is the pattern: reach is
+<p>Sixteen of the eighteen declare <em>nothing</em>. That is the pattern: reach is
 split from computation, so a program that joins paths, formats a date or
 builds a URL acquires no capability by doing so — and where a library really
 does need the world, it asks for it as an effect the consumer supplies, which

@@ -1,0 +1,8 @@
+[package]
+name = "crypto_hash_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.crypto_hash]
+path = "../crypto_hash"
+version = "^1.0.0"

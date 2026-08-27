@@ -1,0 +1,71 @@
+// The `cache` package. Entries expire because the clock argument says so.
+import cache
+
+fn look(c: Cache[str], key: str, now: i64) -> Cache[str] {
+    let got = cache.get(c, key, now)
+    print("  t={now} get(\"{key}\") -> {got.1 ?? "(miss)"}   keys {cache.keys(got.0, now)}")
+    got.0
+}
+
+fn main() {
+    print("-- least recently used, capacity 3, no expiry")
+    var c: Cache[str] = cache.new_cache(3, 0)
+    c = cache.put(c, "a", "1", 0)
+    c = cache.put(c, "b", "2", 0)
+    c = cache.put(c, "c", "3", 0)
+    print("  after three: {cache.keys(c, 0)}  size {cache.size(c, 0)}")
+    c = look(c, "a", 0)
+    c = cache.put(c, "d", "4", 0)
+    print("  after a fourth, with `a` just used: {cache.keys(c, 0)}")
+    c = look(c, "b", 0)
+    c = look(c, "a", 0)
+    print("  {cache.stats(c)}")
+
+    print("-- replacing a key does not evict")
+    c = cache.put(c, "a", "1 again", 0)
+    print("  keys {cache.keys(c, 0)}  size {cache.size(c, 0)}")
+    c = look(c, "a", 0)
+
+    print("-- expiry, ttl 1000ms")
+    var e: Cache[str] = cache.new_cache(10, 1000)
+    e = cache.put(e, "k", "v", 0)
+    e = look(e, "k", 0)
+    e = look(e, "k", 999)
+    e = look(e, "k", 1000)
+    print("  size at 1000: {cache.size(e, 1000)}  held entries before a sweep: {e.entries.len()}")
+    e = cache.sweep(e, 1000)
+    print("  after a sweep: {e.entries.len()}  {cache.stats(e)}")
+
+    print("-- an entry written later expires later")
+    var f: Cache[str] = cache.new_cache(10, 100)
+    f = cache.put(f, "x", "early", 0)
+    f = cache.put(f, "y", "late", 50)
+    print("  at 120: x {cache.has(f, "x", 120)}  y {cache.has(f, "y", 120)}")
+    print("  at 160: x {cache.has(f, "x", 160)}  y {cache.has(f, "y", 160)}")
+
+    print("-- capacity zero holds nothing, which is how you turn it off")
+    var z: Cache[str] = cache.new_cache(0, 0)
+    z = cache.put(z, "a", "1", 0)
+    print("  size {cache.size(z, 0)}  get {cache.get(z, "a", 0).1 ?? "(miss)"}")
+
+    print("-- remove and clear")
+    var g: Cache[i64] = cache.new_cache(5, 0)
+    g = cache.put(g, "one", 1, 0)
+    g = cache.put(g, "two", 2, 0)
+    g = cache.put(g, "three", 3, 0)
+    print("  {cache.keys(g, 0)}")
+    g = cache.remove(g, "two")
+    print("  after removing two: {cache.keys(g, 0)}")
+    g = cache.remove(g, "missing")
+    print("  removing one that is not there: {cache.keys(g, 0)}")
+    g = cache.clear(g)
+    print("  after clear: {cache.keys(g, 0)}  size {cache.size(g, 0)}")
+
+    print("-- a cache of a list, because the value type is a parameter")
+    var l: Cache[[i64]] = cache.new_cache(2, 0)
+    l = cache.put(l, "primes", [2, 3, 5], 0)
+    l = cache.put(l, "squares", [1, 4, 9], 0)
+    print("  primes {cache.get(l, "primes", 0).1 ?? []}")
+    l = cache.put(l, "cubes", [1, 8, 27], 0)
+    print("  after a third, capacity 2: {cache.keys(l, 0)}")
+}

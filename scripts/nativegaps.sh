@@ -170,6 +170,24 @@ fn main() {
     print("{h}")
 }'
 
+expect_compiled "a type parameter the binding fixes" 'type Box[V] = { items: [V] }
+fn empty_box[V]() -> Box[V] {
+    let b: Box[V] = Box{ items: [] }
+    b
+}
+fn add[V](b: Box[V], v: V) -> Box[V] {
+    var xs = b.items
+    xs.push(v)
+    let out: Box[V] = Box{ items: xs }
+    out
+}
+fn main() {
+    let a: Box[str] = empty_box()
+    var n: Box[i64] = empty_box()
+    n = add(n, 7)
+    print("{a.items.len()} {n.items}")
+}'
+
 expect_compiled "a handler a call answers, in an argument" 'effect Cfg {
     fn value() -> i64
 }

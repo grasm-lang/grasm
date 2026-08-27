@@ -1,0 +1,9 @@
+[package]
+name = "crypto_hash"
+version = "1.0.0"
+entry = "src/main.gr"
+
+# Arithmetic on bytes. It reads no file and dials nothing, so it declares
+# nothing — and a program that hashes a password does not thereby acquire the
+# ability to send it anywhere.
+capabilities = []

@@ -21,7 +21,8 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   run disagree.
 - `packages/bytes_codec`, `packages/time`, `packages/random`,
   `packages/uuid`, `packages/path`, `packages/url`, `packages/log`,
-  `packages/csv`, `packages/cli`, `packages/testing`, `packages/toml`: the
+  `packages/csv`, `packages/cli`, `packages/testing`, `packages/toml`,
+  `packages/resilience`, `packages/cache`, `packages/crypto_hash`: the
   first
   wave of the release library, planned in `docs/packages-plan.md`. All but
   `log` declare **no capability at all** — a calendar, a seeded generator, path
@@ -32,6 +33,13 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   where the handler is installed.
 - `packages/http` now takes its percent coding and query parsing from
   `packages/url` rather than carrying a second copy.
+- `packages/crypto_hash`: `ProjectGold/lib-sha256` moved here and given the
+  two things everything else wants — HMAC-SHA-256 and PBKDF2. Every digest is
+  checked against a published vector (FIPS 180-4, RFC 4231, RFC 6070), because
+  a hash tested only against itself agrees with nothing. `ProjectGold/37`
+  points here, so there is one copy. **Not AES or RSA**: a cipher written here
+  would have no constant-time guarantee from the compiler, and a block cipher
+  whose timing depends on its key is a key that leaks.
 - `packages/json`: `ProjectGold/lib-json` moved here, renamed (`parse`,
   `render`, `escape`) and given what a library needs that a program does not —
   `get`, `at`, `path`, `as_str`, `as_int`, `as_num`, `as_bool`, `is_null`,
@@ -66,6 +74,10 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   rule that found a fifth copy in `northstar.sh` the first time it ran.
 
 ### Fixed
+- A generic container may be built empty. `let a: Box[str] = empty_box()` was
+  refused for `V` "not determined by the arguments" — the binding determines
+  it, the literal inside determines it, and an enclosing instantiation
+  determines it, and none of the three was consulted (F77).
 - `scripts/difftest.sh` and `scripts/leakcheck.sh` fail when the native
   backend declines a program, and say which. Both counted the skips and
   passed — one printed them after the summary that `allgates.sh` reads, the

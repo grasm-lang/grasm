@@ -100,7 +100,9 @@ What exists today:
 | `packages/http_server` | `io`, `net` | Written. Accept loop, and `net_wait` for many conversations on one thread. |
 | `packages/http_client` | `net` | Written. Dials, sends, reads until the declared frame arrives. Its demo talks to `http_server` over a real socket. |
 | `packages/json` | *none* | Written. Parse, render, reach in, build up. Six ProjectGold programs depend on it. |
-| `ProjectGold/lib-markdown`, `lib-sha256` | *none* | Packages, unpublished, no stable API. |
+| `packages/crypto_hash` | *none* | Written. SHA-256, HMAC, PBKDF2, constant-time compare — every digest checked against FIPS 180-4, RFC 4231 and RFC 6070. |
+| `packages/bytes_codec`, `time`, `random`, `uuid`, `path`, `url`, `log`, `csv`, `cli`, `testing`, `toml`, `resilience`, `cache` | mostly *none* | Written. See `packages/README.md`. |
+| `ProjectGold/lib-markdown` | *none* | A package, unpublished, no stable API. |
 
 `http`, `http_server` and `http_client` are three packages, not one, and that is the whole
 argument for this package system in one line: `http` **cannot** open a socket,

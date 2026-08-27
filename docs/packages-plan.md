@@ -135,7 +135,9 @@ is said plainly against each one rather than discovered later.
 
 ### Reliability
 
-**16. `crypto_hash`.** SHA-256 (promote `ProjectGold/lib-sha256`), SHA-512,
+**16. `crypto_hash`.** — **built**, `packages/crypto_hash`: SHA-256, HMAC,
+PBKDF2, constant-time compare, every digest checked against a published
+vector. Still wanted: SHA-512,
 HMAC, and a constant-time compare from `bytes`. Declares nothing. Safe to write
 here: a hash has no key schedule and no timing surface beyond the compare.
 

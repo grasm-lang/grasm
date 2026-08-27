@@ -1,0 +1,8 @@
+[package]
+name = "cache_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.cache]
+path = "../cache"
+version = "^1.0.0"
