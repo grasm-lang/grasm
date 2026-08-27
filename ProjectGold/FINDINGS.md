@@ -2930,3 +2930,24 @@ arrive quietly. Deleting one law makes the gate exit 1 naming
 Breaking `bit_xor` in the interpreter is caught by both the law that
 pins the answer and the one that states the symmetry — which is the
 arrangement the `rev` lesson asked for.
+
+**And then the language's own semantics.** A conformance program records
+what a clause says the output is; where the clause and the implementation
+were written together, both can be wrong together, and the program agrees
+with them. Twenty-four more laws state a relation instead: equality
+ignores the order fields were written in and the order a list was built
+in; a scalar copies, so writing to the copy leaves the original;
+promotion is order-free, so `[1, 2.5]` and `[2.5, 1]` hold the same two
+values; `a / b * b + a % b == a`; `2 ^ 10` is 1024; a released slot is
+dead through *every* reference to it; a closure sees the value its
+binding had when it was made; `spawn` runs in the order written and
+`parallel` joins before the line after it. 119 laws in all.
+
+One of them was vacuous when first written — `say(true)` after a call
+whose argument order was the thing under test, which proves nothing and
+is the same fault as "rev twice is identity". It threads a `ref` through
+both arguments now and reads the order back. Its discriminating power
+was checked directly rather than by mutating the compiler: asserting the
+*opposite* order fails in both engines, so the order really is observed.
+Two mutations aimed at argument evaluation missed the site that plain
+calls take, which is why the direct check is the one recorded.

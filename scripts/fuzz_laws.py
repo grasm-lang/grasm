@@ -75,6 +75,21 @@ fn works() -> i64 ! Bad {
     4
 }
 
+type Pt = { x: i64, y: i64 }
+
+fn reads() -> i64 / {Src} {
+    Src.get()
+}
+
+fn note(seen: ref str, tag: str) -> i64 {
+    seen.value = seen.value + tag
+    1
+}
+
+fn two(a: i64, b: i64) -> i64 {
+    a + b
+}
+
 """
 
 LAWS = {
@@ -175,6 +190,33 @@ LAWS = {
  "entries match keys":         'var m: Map[str, i64] = map()\n    m.set("a", 1)\n    say(m.entries().len() == 1 and m.has("a") and m.is_empty() == false)',
  "expect gives the payload":   'say(Some(3).expect("there") == 3 and Some(3).is_none() == false)',
  "unwrap_or on none":          'let o: Option[i64] = None\n    say(o.unwrap_or(9) == 9 and Some(1).unwrap_or(9) == 1)',
+ # The language's own semantics. A conformance program records what a clause
+ # says the output is; if the clause and the implementation were written
+ # together, both can be wrong together. These state a relation instead.
+ "equality ignores field order": 'say(Pt{ x: 1, y: 2 } == Pt{ y: 2, x: 1 })',
+ "equality is structural":     'say([[1], [2, 3]] == [[1], [2, 3]] and Pt{ x: 1, y: 2 } != Pt{ x: 1, y: 3 })',
+ "built two ways is equal":    'var a: [i64] = []\n    a.push(1)\n    a.push(2)\n    say(a == [1, 2])',
+ "map order does not matter":  'var m: Map[str, i64] = map()\n    m.set("a", 1)\n    m.set("b", 2)\n    var n: Map[str, i64] = map()\n    n.set("b", 2)\n    n.set("a", 1)\n    say(m == n)',
+ "scalars copy":               'var a = 1\n    var b = a\n    b = 9\n    say(a == 1)',
+ "a field read is a copy":     'let p = Pt{ x: 1, y: 2 }\n    var c = p.x\n    c = 9\n    say(p.x == 1)',
+ "int promotes to float":      'let xs: [f64] = [1, 2.5]\n    say(xs[0] == 1.0)',
+ "promotion is order-free":    'let a: [f64] = [1, 2.5]\n    let b: [f64] = [2.5, 1]\n    say(a[0] == b[1] and a[1] == b[0])',
+ "arguments run left to right": 'let seen = ref("")\n    let _v = two(note(seen, "a"), note(seen, "b"))\n    let order = seen.value\n    release(seen)\n    say(order == "ab")',
+ "spawn runs in order":        'var log = ""\n    parallel {\n        spawn {\n            log += "a"\n        }\n        spawn {\n            log += "b"\n        }\n    }\n    say(log == "ab")',
+ "parallel joins before after": 'var log = ""\n    parallel {\n        spawn {\n            log += "a"\n        }\n    }\n    log += "z"\n    say(log == "az")',
+ "power is repeated product":  'say((2 ^ 10) == 1024)',
+ "negative power is a fraction": 'say((2.0 ^ (0.0 - 1.0)) == 0.5)',
+ "division truncates toward zero": 'say((7 / 2) == 3 and ((0 - 7) / 2) == 0 - 3)',
+ "remainder matches division": 'let a = 7\n    let b = 2\n    say(a / b * b + a % b == a)',
+ "a released slot is dead":    'let r = ref(1)\n    let c = r\n    release(r)\n    say(alive(c) == false)',
+ "a double release is safe":   'let r = ref(1)\n    release(r)\n    release(r)\n    say(alive(r) == false)',
+ "a range holds its bounds":   'let r = 2..5\n    say(r.to_list()[0] == 2 and r.len() == 3)',
+ "inclusive adds one":         'say((0..3).len() + 1 == (0..=3).len())',
+ "a closure sees the value at creation": 'var n = 1\n    let f = || n\n    n = 9\n    say(f() == 1)',
+ "a handler is found by name": 'with Src handled_by SrcHandler{ get: || 3 } {\n        say(reads() == 3)\n    }',
+ "generic keeps the type":     'say(same([1, 2]) == [1, 2] and same(Pt{ x: 1, y: 2 }) == Pt{ x: 1, y: 2 })',
+ "a fallible ok is the value": 'say((works() ?? 0) == 4 and (fails() ?? 7) == 7)',
+ "unit has one value":         'let a = ()\n    let b = ()\n    say(a == b)',
  "keys and values align":      'var m: Map[str, i64] = map()\n    m.set("a", 1)\n    m.set("b", 2)\n    say(m.keys().len() == m.values().len() and m.keys().len() == m.len())',
 }
 
@@ -220,7 +262,13 @@ def main():
     checked, broken, rejected = 0, [], []
     try:
         for name, law in LAWS.items():
-            row = "{io, async, Src}" if "par_map" in law else "{io, Src}"
+            # Anything that performs `async` needs the row, and a law written
+            # without it does not run at all -- the fault F58 found, which is
+            # why "not run" is a failure here rather than a count.
+            needs_async = any(
+                w in law for w in ("par_map", "par_filter", "parallel", "spawn")
+            )
+            row = "{io, async, Src}" if needs_async else "{io, Src}"
             src = PRELUDE + "fn main() / " + row + " {\n    " + law + "\n}\n"
             with open(path, "w") as f:
                 f.write(src)
