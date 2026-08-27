@@ -81,6 +81,7 @@ and the entries disagree.
 | [F63](#f63) | a block that left was reported as an ordinary statement | S1, codegen bug | **fixed** |
 | [F64](#f64) | a `parallel` block's task list was kept by every early exit | S2, leak | **fixed** |
 | [F65](#f65) | a literal under construction was abandoned by an early exit | S2, leak | **fixed** |
+| [F66](#f66) | nothing checked the oracle | S3, harness | **fixed** |
 
 <!-- end index -->
 ## F1 — a wrapped condition must end the line with the operator (S4) — **fixed**
@@ -2876,3 +2877,38 @@ read.
 **Gate**: four builder shapes in `scripts/fuzz_exits.py`, each with an
 element or field that leaves (51 to 71 programs). Removing the list
 literal's binding gives four leaks.
+
+## F66 — nothing checked the oracle (S3, harness) — **fixed**
+
+Every generator here compares two engines. That cannot see a wrong answer
+they share, and they share a great deal: a bundle *is* the interpreter
+with the program attached, and the interpreter is what every differential
+is measured against. Seven of the last eight findings were found by
+comparing a `--native` build to it. Nothing compared it to anything.
+
+`scripts/fuzz_laws.py` checks against arithmetic instead. `xs.rev()[0]`
+is the last element or the implementation is wrong, and no second engine
+is consulted to find that out. Fifty laws — reversal, ordering,
+partitioning, round trips through bytes and strings, map and reference
+identities, handler nesting, `par_map` against `map` — each run under
+both engines so a failure names which one.
+
+No defect in the language: all fifty hold.
+
+**What the tick actually found is a fault in the method.** The first
+version had `xs.rev().rev() == xs` and no other law about reversal. Then
+`reverse()` was removed from the interpreter as a test, and the file
+reported everything holding — because `rev` as the identity function
+satisfies "rev twice is identity". Identity twice is identity.
+
+A law a degenerate implementation satisfies is not a law. Half of these
+pin the answer rather than a symmetry now — `rev` puts the last element
+first, `sort` puts `1` before `2`, `trim` of `"  x  "` is `"x"` — and
+each is kept beside the symmetry it strengthens so the difference is
+visible to whoever reads it next.
+
+Mutation-tested from both directions: removing the interpreter's
+`reverse()` gives `BROKEN rev actually reverses in ['run']`, and an
+off-by-one in the compiled runtime's list read breaks five laws in
+`['native']`. `difftest` catches the second and is blind to neither —
+but it is the *first* that no gate here could see before.
