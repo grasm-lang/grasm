@@ -1,0 +1,102 @@
+// The half of HTTP that owns a socket.
+//
+// `http` parses and routes and cannot reach the network. This package can, and
+// says so. Everything it adds is the loop: accept, read, hand the request to a
+// handler, write what comes back, close.
+//
+// One connection is served at a time. `net_wait` is what would let one thread
+// hold several conversations, and the language has it; what it does not have
+// is a way to spawn a thread that owns a socket, so a server that wants
+// concurrency waits on many handles rather than blocking on one. `serve_many`
+// below does exactly that.
+import http
+
+/// What a handler is: a request in, a response out. It may print — a server
+/// that cannot log is not a server — and it may do nothing else, because the
+/// row says so and the row is checked.
+type Handler = fn(Request) -> Response / {io}
+
+/// Serve one connection and close it. The unit `serve` and `serve_many` are
+/// both built from, and the one a test can call.
+pub fn serve_conn(conn: i64, handle: Handler) -> i64 / {io, net} {
+    let raw = tcp_read(conn) ?? ""
+    let r = http.parse_request(raw)
+    let resp = handle(r)
+    let out = if r.ok and r.method == "HEAD" {
+        http.head_of(resp)
+    } else {
+        http.render(resp)
+    }
+    match tcp_write(conn, out) {
+        Ok(_) -> {}
+        Err(e) -> {}
+    }
+    net_close(conn)
+    resp.status
+}
+
+/// Accept and serve `count` connections, then stop. `count` below zero serves
+/// until the listener fails, which is what a real server wants; a test passes
+/// a number so the program ends.
+pub fn serve_on(listener: i64, count: i64, handle: Handler) -> i64 / {io, net} {
+    var served = 0
+    while count < 0 or served < count {
+        match tcp_accept(listener) {
+            Err(e) -> return served
+            Ok(conn) -> {
+                serve_conn(conn, handle)
+                served = served + 1
+            }
+        }
+    }
+    served
+}
+
+/// Listen, then serve until the listener fails. The ordinary entry point.
+pub fn serve(port: i64, handle: Handler) -> () ! IoError / {io, net} {
+    let listener = try tcp_listen(port)
+    print("listening on http://127.0.0.1:{net_port(listener) ?? port}")
+    serve_on(listener, -1, handle)
+    net_close(listener)
+}
+
+/// Several conversations at once, on one thread.
+///
+/// `net_wait` answers with the handles that can be read without blocking, and
+/// walking that answer in the order it comes back is what keeps a run
+/// reproducible ([L-DETERMINISM]). A connection is served and closed in the
+/// pass that finds it readable, so the set only ever shrinks between accepts.
+pub fn serve_many(listener: i64, count: i64, handle: Handler) -> i64 / {io, net} {
+    var served = 0
+    var live: [i64] = []
+    while count < 0 or served < count {
+        var watching = [listener]
+        for c in live {
+            watching.push(c)
+        }
+        let ready = net_wait(watching, 1000) ?? []
+        if ready.is_empty() {
+            return served
+        }
+        var still: [i64] = []
+        for h in ready {
+            if h == listener {
+                match tcp_accept(listener) {
+                    Ok(conn) -> still.push(conn)
+                    Err(e) -> {}
+                }
+            } else {
+                serve_conn(h, handle)
+                served = served + 1
+            }
+        }
+        // Anything that was live and is not ready this pass stays live.
+        for c in live {
+            if not ready.contains(c) {
+                still.push(c)
+            }
+        }
+        live = still
+    }
+    served
+}

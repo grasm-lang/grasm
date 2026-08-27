@@ -2,6 +2,7 @@
 root: HTTP/1.1 200 OK  [GET / q="" h=1 framed=true]
 hello: HTTP/1.1 200 OK  [GET /hello q="" h=1 framed=true]
 hello named: HTTP/1.1 200 OK  [GET /hello q="name=ada" h=1 framed=true]
+hello named, non-ascii: HTTP/1.1 200 OK  [GET /hello q="name=caf%C3%A9" h=1 framed=true]
 echo: HTTP/1.1 200 OK  [GET /echo q="a=1&b=2" h=2 framed=true]
 missing route: HTTP/1.1 404 Not Found  [GET /nope q="" h=1 framed=true]
 head: HTTP/1.1 200 OK  [HEAD / q="" h=1 framed=true]
@@ -39,7 +40,11 @@ lowercase method: HTTP/1.1 400 Bad Request  [rejected: unknown method `get`]
   "%" -> "%"
   "%4" -> "%4"
   "%zz" -> "%zz"
-  "caf%C3%A9" -> "cafÃ©"
+  "caf%C3%A9" -> "café"
+  "%E2%82%AC" -> "€"
+  "%F0%9F%94%A5" -> "🔥"
+  "%C3" -> "�"
+  "%C3%28" -> "�("
 --- response framing ---
   status: HTTP/1.1 200 OK
   declared length: 11

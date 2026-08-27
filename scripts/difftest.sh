@@ -28,12 +28,9 @@ skip=0
 declare -a FAILED=()
 declare -a SKIPPED=()
 
-# Overridable so a slower build can be held to the same programs without the
-# benchmarks, which are sized for a release interpreter and take minutes each
-# under a debug one.
-DIRS=${DIRS:-"examples projects spec/conformance benchmarks/grasm"}
-# shellcheck disable=SC2086
-programs=$(find $DIRS -name '*.gr' | sort)
+. "$(dirname "$0")/lib/corpus.sh"
+CORPUS_DIRS=${DIRS:-$CORPUS_DIRS}
+programs=$(corpus_programs)
 
 for src in $programs; do
     # Library modules (no `main`) are not standalone programs.

@@ -24,10 +24,36 @@ open. Every gate green.
 
 ## 1. The website
 
-**Status: not started.** There is `ProjectGold/web/`, which is a wasm host page
-for running the corpus in a browser. There is no site.
+**Status: built, in `site/`.** Sixteen pages: index, getting started, install,
+playground, a tour, effects and capabilities, ownership tiers, errors,
+concurrency, language reference, library reference, packages, specification,
+examples, status, roadmap.
 
-What it needs: a landing page that says what the language is and why it exists;
+It is generated. `scripts/site.py` holds the chrome — rail, head, footer — once
+and `scripts/site_pages.py` holds each page's content, because fourteen hand-
+written copies of a navigation drift the way five hand-written copies of a
+directory list drifted (F68's neighbour, and the reason for
+`scripts/lib/corpus.sh`).
+
+Every figure the site states is computed, never typed. The ones countable from
+the tree — clauses, findings, generators, ProjectGold programs and their line
+count, library methods — are counted each time the site is written. The ones
+only a run can know — how many programs three engines agreed on, how many wasm
+matched, how many laws ran — are read from `site/facts.json`, which
+`scripts/allgates.sh` writes *after* every gate passes. So a number on the page
+is either a fact about the files or a fact about the last green run.
+
+Four mutations were run against that: a page edited by hand, a figure that no
+longer matches the run, a figure nothing computes, and no recorded run at all.
+All four fail the `--check`. A fifth — a gate that stops printing the count the
+site reads — fails the recorder rather than writing a stale number.
+
+What it still needs: an in-page playground wired to the wasm build (the build
+works, and `ProjectGold/web/` hosts it, but this site does not embed it yet),
+and the tutorial and library reference rendered from `docs/` rather than
+summarised.
+
+The original list, for the record: a landing page that says what the language is and why it exists;
 getting started and install; a tutorial; a language reference; a library
 reference; the effects-and-capabilities story, which is the thing that makes
 Grasm different and the thing nobody will find on their own; the tier model;
@@ -53,7 +79,7 @@ Quality is the loop. It does not stop.
 
 ## 3. Packages and the libraries a first release needs
 
-**Status: the mechanism exists; the libraries do not.**
+**Status: the mechanism exists; the first two libraries are written.**
 
 `crates/grasm_pkg` is 1,991 lines and already does manifests, dependency
 resolution, lockfiles, path dependencies, a local registry under
@@ -66,15 +92,36 @@ and it is the part that is done.
 What is missing is a remote registry — fetching, publishing, verifying — and
 the libraries themselves.
 
-What exists today: `lib-json`, `lib-markdown`, `lib-sha256`, all inside
-`ProjectGold/`, none published as packages.
+What exists today:
+
+| package | capabilities | state |
+|---|---|---|
+| `packages/http` | *none* | Written. Requests, responses, routing with `:param` and `*`, percent decoding, HTML escaping. |
+| `packages/http_server` | `io`, `net` | Written. Accept loop, and `net_wait` for many conversations on one thread. |
+| `packages/http_client` | `net` | Written. Dials, sends, reads until the declared frame arrives. Its demo talks to `http_server` over a real socket. |
+| `ProjectGold/lib-json` | *none* | A package, unpublished, no stable API. |
+| `ProjectGold/lib-markdown`, `lib-sha256` | *none* | The same. |
+
+`http`, `http_server` and `http_client` are three packages, not one, and that is the whole
+argument for this package system in one line: `http` **cannot** open a socket,
+and the compiler checks it rather than the README claiming it. Its manifest
+declares no capability, effects are inferred from its source, and a version of
+it that started dialling out would fail to build in every consumer. A program
+can parse and route HTTP while remaining provably unable to reach the network.
+In every other language, depending on the HTTP library means depending on
+something that can.
+
+Both are in the corpus, so `difftest`, `leakcheck` and `crosstest` build them
+on every run and hold three engines to one answer. The socket half also has a
+live round trip — listen on a system-chosen port, connect to itself, serve five
+requests including a HEAD and a malformed one — which is opt-in behind
+`-- serve`, because a gate that depends on the loopback network fails for
+reasons that have nothing to do with the language.
 
 What a first release needs, in the order a user meets them:
 
-- **http** — a server and a client. This is the one that decides whether the
-  language is usable for the work most people do. `ProjectGold/21-http-server`
-  is 347 lines of working proof that the primitives are there; it is a program,
-  not a library.
+- **http server** — *done*, above.
+- **http client** — *done*, above.
 - **json** — exists as `lib-json`, needs to become a package with a stable API.
 - **async/task** — `parallel`/`spawn` are in the language. What is missing is
   the library above them: timers, channels, select.

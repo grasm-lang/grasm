@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Install</title>
+<meta name="description" content="Build Grasm from source.">
+<link rel="stylesheet" href="style.css">
+</head><body>
+<div class="frame">
+<nav class="rail">
+<a class="mark" href="index.html"><b>grasm</b><span>a systems language</span></a>
+<h2>Start</h2>
+<a href="start.html">Getting started</a>
+<a href="install.html" aria-current="page">Install</a>
+<a href="playground.html">Playground</a>
+<h2>Learn</h2>
+<a href="tour.html">Tour</a>
+<a href="effects.html">Effects</a>
+<a href="tiers.html">Ownership</a>
+<a href="errors.html">Errors</a>
+<a href="concurrency.html">Concurrency</a>
+<h2>Reference</h2>
+<a href="language.html">Language</a>
+<a href="library.html">Library</a>
+<a href="packages.html">Packages</a>
+<a href="spec.html">Specification</a>
+<h2>More</h2>
+<a href="examples.html">Examples</a>
+<a href="status.html">Status</a>
+<a href="roadmap.html">Roadmap</a>
+</nav>
+<main>
+
+<p class="eyebrow">Start</p>
+<h1>Install</h1>
+<p class="lede">Grasm builds from source with a Rust toolchain. There are no
+prebuilt binaries yet.</p>
+
+<h2>From source</h2><pre><code>git clone &lt;repository&gt;
+cd grasm
+cargo build --release --workspace
+
+./target/release/grasm run examples/hello.gr</code></pre>
+<p>The binary is <code>target/release/grasm</code>. Put it on your path, or call
+it where it is.</p>
+
+<h2>What you get</h2>
+<div class="scroll"><table>
+<tr><th>Command</th><th>Does</th></tr>
+<tr><td><code>grasm run FILE</code></td><td>Runs it under the interpreter.</td></tr>
+<tr><td><code>grasm build FILE -o OUT</code></td><td>Writes a bundle — one file, runs anywhere.</td></tr>
+<tr><td><code>grasm build FILE --native -o OUT</code></td><td>Compiles ahead of time through Cranelift.</td></tr>
+<tr><td><code>grasm build FILE --native --target TRIPLE</code></td><td>Cross-compiles; link against the runtime for that target.</td></tr>
+<tr><td><code>grasm test [DIR]</code></td><td>Runs <code>test</code> blocks.</td></tr>
+<tr><td><code>grasm bench [DIR]</code></td><td>Runs <code>bench</code> blocks.</td></tr>
+<tr><td><code>grasm check FILE</code></td><td>Types and effects only, no output.</td></tr>
+<tr><td><code>grasm fmt [DIR]</code></td><td>Formats.</td></tr>
+<tr><td><code>grasm deps [DIR]</code></td><td>Resolves dependencies, checks capability ceilings, writes <code>grasm.lock</code>.</td></tr>
+<tr><td><code>grasm journal FILE</code></td><td>Reads a recording of a program's effects.</td></tr>
+</table></div>
+
+<h2>Editor support</h2>
+<p>A language server is in <code>crates/grasm_lsp</code> and a VS Code extension
+in <code>editors/vscode</code>. A debug adapter is in
+<code>crates/grasm_dap</code>.</p>
+
+<div class="note"><b>No release binaries yet.</b> Building from source is the
+only route today. That is on the <a href="roadmap.html">roadmap</a>.</div>
+
+<footer>
+Grasm — three engines, one answer.
+<a href="status.html">Status</a> ·
+<a href="spec.html">Specification</a> ·
+<a href="roadmap.html">Roadmap</a>
+</footer>
+</main>
+</div>
+</body></html>

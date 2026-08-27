@@ -53,7 +53,25 @@ $(grep -oE "^[a-z_][a-z_0-9]* +[\"']" "$f" | sed 's/ *["'"'"']$//' | sort -u)
 EOF
 done
 
+# The second thing this checks: a gate that writes out the corpus directories
+# itself instead of sourcing `scripts/lib/corpus.sh`. Five gates were each
+# carrying their own copy of the same four names, so adding a directory meant
+# editing five files -- and the one that got missed would be a directory
+# nothing ran, which is indistinguishable from a directory that passes.
+copied=0
+for f in scripts/*.sh ProjectGold/run.sh; do
+    [ "$f" = "scripts/gatecheck.sh" ] && continue
+    [ "$f" = "scripts/lib/corpus.sh" ] && continue
+    grep -q 'corpus\.sh' "$f" && continue
+    if grep -qE "find [^|]*\bspec/conformance\b[^|]*-name" "$f"; then
+        echo "  $f: names the corpus directories itself."
+        echo "      Source scripts/lib/corpus.sh and call corpus_programs."
+        copied=$((copied + 1))
+    fi
+done
+bad=$((bad + copied))
+
 echo "=========================================="
-echo "gate helpers checked: $checked   undefined: $bad"
+echo "gate helpers checked: $checked   undefined: $bad   corpus copied: $copied"
 echo "=========================================="
 [ "$bad" = 0 ]

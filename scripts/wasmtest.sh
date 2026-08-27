@@ -57,9 +57,10 @@ skip=0
 declare -a FAILED=()
 declare -a SKIPPED=()
 
-DIRS=${DIRS:-"examples projects spec/conformance benchmarks/grasm"}
+. "$(dirname "$0")/lib/corpus.sh"
+CORPUS_DIRS=${DIRS:-$CORPUS_DIRS}
 # shellcheck disable=SC2086
-programs=$(find $DIRS -name '*.gr' | sort)
+programs=$(corpus_programs)
 
 for src in $programs; do
     grep -qE '^\s*(pub )?fn main\(' "$src" || continue

@@ -59,6 +59,51 @@ for f in scripts/fuzz_*.py; do
     run_gate "$(basename "$f" .py)" python3 "$f"
 done
 
+# The site states what the gates found. Rather than let somebody retype a
+# figure, the run that proved it writes it down and the site is regenerated
+# from that record, so a number on the page is the last green run's or the
+# page does not build. Last, because there is nothing to record until the
+# gates above have finished.
+site_facts() {
+    python3 - "$LOGS" <<'FACTS'
+import json, os, re, sys
+
+logs = sys.argv[1]
+# gate log -> (the site's name for it, the count that gate's summary prints)
+WANT = {
+    "difftest":  [("corpus", "identical")],
+    "wasmtest":  [("wasm_ok", "identical"), ("wasm_skip", "skipped")],
+    "crosstest": [("cross", "identical")],
+    "gold":      [("agreeing", "agreeing")],
+    "fuzz_laws": [("laws", "laws")],
+}
+out = {}
+for gate, wants in sorted(WANT.items()):
+    path = os.path.join(logs, gate + ".log")
+    if not os.path.exists(path):
+        print(f"the {gate} gate left no log, so its figure cannot be recorded")
+        sys.exit(1)
+    text = open(path).read()
+    for key, field in wants:
+        hit = re.findall(r"\b" + field + r": ([0-9]+)", text)
+        if not hit:
+            print(f"the {gate} gate no longer prints '{field}:'. Writing the")
+            print("site from this run would state a figure nobody measured.")
+            sys.exit(1)
+        out[key] = int(hit[-1])
+os.makedirs("site", exist_ok=True)
+with open("site/facts.json", "w") as f:
+    json.dump(out, f, indent=2, sort_keys=True)
+    f.write("\n")
+print("   ".join(f"{k}: {v}" for k, v in sorted(out.items())))
+FACTS
+}
+
+if [ "$failed" -eq 0 ]; then
+    run_gate sitefacts site_facts
+    run_gate site      python3 scripts/site.py
+fi
+
 echo
 if [ "$failed" -gt 0 ]; then
     echo "$failed gate(s) failed: ${FAILED[*]}"

@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Effects and capabilities</title>
+<meta name="description" content="Effects are inferred, written in the type, and enforced across package boundaries.">
+<link rel="stylesheet" href="style.css">
+</head><body>
+<div class="frame">
+<nav class="rail">
+<a class="mark" href="index.html"><b>grasm</b><span>a systems language</span></a>
+<h2>Start</h2>
+<a href="start.html">Getting started</a>
+<a href="install.html">Install</a>
+<a href="playground.html">Playground</a>
+<h2>Learn</h2>
+<a href="tour.html">Tour</a>
+<a href="effects.html" aria-current="page">Effects</a>
+<a href="tiers.html">Ownership</a>
+<a href="errors.html">Errors</a>
+<a href="concurrency.html">Concurrency</a>
+<h2>Reference</h2>
+<a href="language.html">Language</a>
+<a href="library.html">Library</a>
+<a href="packages.html">Packages</a>
+<a href="spec.html">Specification</a>
+<h2>More</h2>
+<a href="examples.html">Examples</a>
+<a href="status.html">Status</a>
+<a href="roadmap.html">Roadmap</a>
+</nav>
+<main>
+
+<p class="eyebrow">Learn</p>
+<h1>Effects and capabilities</h1>
+<p class="lede">The row after a function's return type says what it is allowed
+to do. It is inferred from the body, so it cannot lie, and it survives across a
+package boundary — which is what makes a dependency's reach something you can
+check rather than something you have to trust.</p>
+
+<h2>The row</h2><pre><code>fn pure_sum(xs: [i64]) -&gt; i64 {              // no row: it does nothing but compute
+    xs.sum()
+}
+
+fn report(xs: [i64]) / {io} {                // it prints, so it says io
+    print("{xs.sum()}")
+}
+
+fn fetch(url: str) -&gt; str ! IoError / {net} {   // fails, and reaches the network
+    tcp_get(url)
+}</code></pre>
+<p>You do not have to write the row — it is inferred. Writing it is a claim the
+compiler checks: declare <code>/ {}</code> on something that prints and the
+program does not build.</p>
+
+<h2>Why inference matters</h2>
+<p>A hand-written effect annotation is a comment that happens to be checked at
+one point. An inferred one is a fact about the body. When somebody adds a
+<code>print</code> three calls down, the row widens on its own and every caller
+that promised not to print stops compiling — including callers in other
+packages.</p>
+
+<h2>Your own effects</h2>
+<p>An effect is a set of operations. A handler supplies them for a block, and
+the operation resolves where it is <em>performed</em>, not where it is
+written — so a function five calls deep uses whichever handler is installed.</p><pre><code>effect Cfg {
+    fn value() -&gt; i64
+}
+
+fn deep() -&gt; i64 / {Cfg} {
+    Cfg.value()
+}
+
+fn main() {
+    with Cfg handled_by CfgHandler{ value: || 42 } {
+        print("{deep()}")             // 42
+    }
+}</code></pre>
+<p>A handler is a value. It can be bound, passed to a function, stored in a
+list — the function installing it need never have seen the literal. That is how
+a test substitutes a clock, a random source, or a network for the real one
+without the code under test knowing.</p>
+
+<h2>Capability ceilings</h2>
+<p>A package declares, in its manifest, the effects it may perform:</p><pre><code>[package]
+name = "ecommerce_cart"
+version = "1.0.0"
+entry = "main.gr"
+capabilities = ["io", "net"]</code></pre>
+<p>Because effects are inferred from source, a dependency that quietly starts
+touching the filesystem exceeds its declared ceiling and <strong>fails to build
+in every consumer</strong>. Not a runtime surprise. Not something a reviewer has
+to notice in a diff. A compile error, at the boundary, before the code runs.</p>
+
+<p>This is the reason Grasm has a package system rather than a directory of
+files.</p>
+
+<footer>
+Grasm — three engines, one answer.
+<a href="status.html">Status</a> ·
+<a href="spec.html">Specification</a> ·
+<a href="roadmap.html">Roadmap</a>
+</footer>
+</main>
+</div>
+</body></html>

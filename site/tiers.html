@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ownership tiers</title>
+<meta name="description" content="Four ways to own a value, chosen per value.">
+<link rel="stylesheet" href="style.css">
+</head><body>
+<div class="frame">
+<nav class="rail">
+<a class="mark" href="index.html"><b>grasm</b><span>a systems language</span></a>
+<h2>Start</h2>
+<a href="start.html">Getting started</a>
+<a href="install.html">Install</a>
+<a href="playground.html">Playground</a>
+<h2>Learn</h2>
+<a href="tour.html">Tour</a>
+<a href="effects.html">Effects</a>
+<a href="tiers.html" aria-current="page">Ownership</a>
+<a href="errors.html">Errors</a>
+<a href="concurrency.html">Concurrency</a>
+<h2>Reference</h2>
+<a href="language.html">Language</a>
+<a href="library.html">Library</a>
+<a href="packages.html">Packages</a>
+<a href="spec.html">Specification</a>
+<h2>More</h2>
+<a href="examples.html">Examples</a>
+<a href="status.html">Status</a>
+<a href="roadmap.html">Roadmap</a>
+</nav>
+<main>
+
+<p class="eyebrow">Learn</p>
+<h1>Ownership tiers</h1>
+<p class="lede">Most languages pick one memory model for everything. Grasm gives
+four and lets the value decide, so the common case stays simple and the hard
+case stays possible.</p>
+
+<div class="scroll"><table>
+<tr><th>Tier</th><th>What it is</th><th>Costs</th></tr>
+<tr><td><b>0</b> — borrow</td><td>The default. A parameter borrows; the caller keeps the value.</td><td>Nothing.</td></tr>
+<tr><td><b>1</b> — <code>region</code></td><td>A scope nothing allocated inside may outlive.</td><td>Nothing at the boundary; the guarantee is checked.</td></tr>
+<tr><td><b>2</b> — <code>ref T</code></td><td>A generational reference into a shared heap. Copies freely, stores in a struct, forms cycles.</td><td>One allocation; a generation check on use.</td></tr>
+<tr><td><b>3</b> — <code>unsafe</code></td><td>The explicit escape, and an effect in the row.</td><td>You are on your own, and the type says so.</td></tr>
+</table></div>
+
+<h2>Tier 2 in practice</h2><pre><code>let counter = ref(0)
+counter.value += 1
+
+let same = counter          // a reference is a word: it copies
+same.value += 1
+print("{counter.value}")    // 2 — both name one slot
+
+release(counter)            // the slot goes back
+print("{alive(counter)}")   // false, through every copy of it</code></pre>
+<p>Reclamation is manual. A slot returns to the pool when it is released and not
+before — which is the point of the tier: the lifetime is the program's to state.
+Releasing twice is not an error, so cleanup order is not something every caller
+has to track.</p>
+
+<h2>Tier 1 in practice</h2><pre><code>let n = region {
+    let scratch = build_a_big_thing()
+    scratch.len()               // a scalar may leave; an allocation may not
+}</code></pre>
+<p>Three rules give the guarantee: a region may not write to a binding declared
+outside it, may not <code>return</code> through its brace, and yields a scalar
+or nothing. The rule is enforced today; the bulk deallocation it exists to make
+sound is not yet implemented, and the specification says so rather than
+implying otherwise.</p>
+
+<footer>
+Grasm — three engines, one answer.
+<a href="status.html">Status</a> ·
+<a href="spec.html">Specification</a> ·
+<a href="roadmap.html">Roadmap</a>
+</footer>
+</main>
+</div>
+</body></html>

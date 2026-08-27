@@ -1,0 +1,13 @@
+[package]
+name = "http_client"
+version = "1.0.0"
+entry = "src/main.gr"
+
+# It dials, so it declares it. The request it builds and the response it reads
+# are `http`'s work, and `http` declares nothing — so a program that only needs
+# to *build* a request never acquires the capability to send one.
+capabilities = ["net"]
+
+[dependencies.http]
+path = "../http"
+version = "^1.0.0"

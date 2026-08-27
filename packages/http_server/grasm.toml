@@ -1,0 +1,14 @@
+[package]
+name = "http_server"
+version = "1.0.0"
+entry = "src/main.gr"
+
+# This one owns the socket, so this one declares it. The split is the point:
+# a program can depend on `http` for parsing and routing and still be proved
+# unable to reach the network, because the capability lives here and a
+# consumer has to name this package to get it ([T-CAPABILITY]).
+capabilities = ["io", "net"]
+
+[dependencies.http]
+path = "../http"
+version = "^1.0.0"

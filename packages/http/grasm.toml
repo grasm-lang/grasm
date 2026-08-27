@@ -1,0 +1,10 @@
+[package]
+name = "http"
+version = "1.0.0"
+entry = "src/main.gr"
+
+# Text in, text out. It reads no file, opens no socket and starts no process,
+# so it declares nothing — and a program that depends on it cannot acquire a
+# capability by doing so ([T-CAPABILITY]). Serving is `http_server`, which is
+# a separate name a consumer has to ask for.
+capabilities = []

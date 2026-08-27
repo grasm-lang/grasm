@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A tour of the language</title>
+<meta name="description" content="The whole language surface in one read.">
+<link rel="stylesheet" href="style.css">
+</head><body>
+<div class="frame">
+<nav class="rail">
+<a class="mark" href="index.html"><b>grasm</b><span>a systems language</span></a>
+<h2>Start</h2>
+<a href="start.html">Getting started</a>
+<a href="install.html">Install</a>
+<a href="playground.html">Playground</a>
+<h2>Learn</h2>
+<a href="tour.html" aria-current="page">Tour</a>
+<a href="effects.html">Effects</a>
+<a href="tiers.html">Ownership</a>
+<a href="errors.html">Errors</a>
+<a href="concurrency.html">Concurrency</a>
+<h2>Reference</h2>
+<a href="language.html">Language</a>
+<a href="library.html">Library</a>
+<a href="packages.html">Packages</a>
+<a href="spec.html">Specification</a>
+<h2>More</h2>
+<a href="examples.html">Examples</a>
+<a href="status.html">Status</a>
+<a href="roadmap.html">Roadmap</a>
+</nav>
+<main>
+
+<p class="eyebrow">Learn</p>
+<h1>A tour of the language</h1>
+<p class="lede">Everything you need to read Grasm, in order.</p>
+
+<h2>Bindings</h2>
+<p><code>let</code> binds; <code>var</code> binds something you may reassign.
+Types are inferred and may be written.</p><pre><code>let n = 1 + 2
+let x: f64 = 2          // an integer literal becomes a float where one is wanted
+var total = 0
+total = total + n</code></pre>
+
+<h2>Types</h2>
+<div class="scroll"><table>
+<tr><th>Kind</th><th>Written</th><th>Example</th></tr>
+<tr><td>Primitives</td><td><code>i64 f64 bool str bytes ()</code></td><td><code>let ok: bool = true</code></td></tr>
+<tr><td>List</td><td><code>[T]</code></td><td><code>[1, 2, 3]</code></td></tr>
+<tr><td>Map</td><td><code>Map[K, V]</code></td><td><code>{ "a": 1 }</code></td></tr>
+<tr><td>Tuple</td><td><code>(A, B)</code></td><td><code>(1, "a")</code></td></tr>
+<tr><td>Range</td><td><code>range</code></td><td><code>0..10</code>, <code>0..=10</code></td></tr>
+<tr><td>Struct</td><td><code>type P = { x: i64 }</code></td><td><code>P{ x: 1 }</code></td></tr>
+<tr><td>Sum</td><td><code>type C = | Red | Green</code></td><td><code>Red</code></td></tr>
+<tr><td>Option</td><td><code>Option[T]</code></td><td><code>Some(1)</code>, <code>None</code></td></tr>
+<tr><td>Fallible</td><td><code>T ! E</code></td><td><code>i64 ! MathError</code></td></tr>
+<tr><td>Function</td><td><code>fn(A) -&gt; B</code></td><td><code>|n| n + 1</code></td></tr>
+<tr><td>Reference</td><td><code>ref T</code></td><td><code>ref(0)</code></td></tr>
+</table></div>
+<p>There is no null. Something that may be absent is an <code>Option</code>, and
+the compiler makes you open it.</p>
+
+<h2>Control</h2><pre><code>let label = if n &gt; 0 { "positive" } else { "not" }
+
+match value {
+    Some(v) -&gt; print("{v}")
+    None    -&gt; print("nothing")
+}
+
+for i in 0..3 { }
+for v in [1, 2, 3] { }
+while more { }</code></pre>
+<p><code>if</code> and <code>match</code> are expressions. A <code>match</code>
+must cover its subject, and the compiler says which case is missing.</p>
+
+<h2>Functions and closures</h2><pre><code>fn twice(n: i64) -&gt; i64 {
+    n * 2
+}
+
+let f = |n| n + 1                 // a closure captures by value, at creation
+let g: fn(i64) -&gt; i64 = twice     // a function is a value
+
+[1, 2, 3].map(twice)
+3 |&gt; twice                        // the same call, written the other way</code></pre>
+
+<h2>Generics</h2><pre><code>type Stack[T] = { items: [T] }
+
+fn same[T](v: T) -&gt; T {
+    v
+}</code></pre>
+<p>Generics are monomorphised: one compiled copy per member of the family. The
+one thing this cannot do is polymorphic recursion, and it is refused by name
+rather than miscompiled.</p>
+
+<h2>Parameters</h2>
+<div class="scroll"><table>
+<tr><th>Mode</th><th>Means</th></tr>
+<tr><td><code>fn f(x: T)</code></td><td>A borrow. The caller keeps it.</td></tr>
+<tr><td><code>fn f(own x: T)</code></td><td>Ownership moves in. Scalars copy, so the caller keeps those.</td></tr>
+<tr><td><code>fn f(inout x: T)</code></td><td>An exclusive mutable borrow; writes land in the caller's value.</td></tr>
+</table></div>
+
+<h2>Next</h2>
+<div class="grid two">
+  <div class="cell"><h4><a href="effects.html">Effects and capabilities</a></h4><p>What a function may do, and how a package is held to it.</p></div>
+  <div class="cell"><h4><a href="tiers.html">Ownership tiers</a></h4><p>Four ways to own a value, chosen per value.</p></div>
+</div>
+
+<footer>
+Grasm — three engines, one answer.
+<a href="status.html">Status</a> ·
+<a href="spec.html">Specification</a> ·
+<a href="roadmap.html">Roadmap</a>
+</footer>
+</main>
+</div>
+</body></html>

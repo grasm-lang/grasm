@@ -63,6 +63,7 @@
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
+. scripts/lib/corpus.sh
 # Overridable so a gate can be run against a debug build, where Cranelift
 # keeps its own assertions on and the runtime checks integer overflow.
 GRASM=${GRASM:-./target/release/grasm}
@@ -82,7 +83,7 @@ leaked=0
 skipped=0
 declare -a LEAKS=()
 
-programs=$(find examples projects spec/conformance benchmarks/grasm -name '*.gr' | sort)
+programs=$(corpus_programs)
 
 for src in $programs; do
     grep -qE '^\s*(pub )?fn main\(' "$src" || continue

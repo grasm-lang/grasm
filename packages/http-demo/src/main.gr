@@ -1,0 +1,107 @@
+// The `http` package, exercised without a socket.
+//
+// Every case here is text in and text out, so all three engines can be held
+// to the same answer -- which is the point: a router whose behaviour depends
+// on a live connection is a router nobody can test.
+import http
+
+fn show(label: str, raw: str) {
+    let r = http.parse_request(raw)
+    if not r.ok {
+        print("{label}: refused -- {r.why}")
+        return
+    }
+    let host = http.header(r, "HOST") ?? "(none)"
+    print("{label}: {r.method} {r.path} q={r.query} host={host} body={r.body.len()}")
+}
+
+fn route(r: Request) -> Response {
+    if not r.ok {
+        return http.respond(400, "text/plain; charset=utf-8", "bad request: {r.why}\n")
+    }
+    if http.path_matches("/users/:id", r.path) {
+        if r.method != "GET" {
+            return http.method_not_allowed("GET")
+        }
+        let id = http.path_param("/users/:id", r.path, "id") ?? "?"
+        return http.json("\{\"id\": \"{id}\"}\n")
+    }
+    if r.path == "/" {
+        return http.html("<h1>{http.escape_html(http.query_param(r.query, "greet") ?? "hello")}</h1>\n")
+    }
+    if http.path_matches("/static/*", r.path) {
+        return http.text("served {r.path}\n")
+    }
+    http.not_found()
+}
+
+fn wire(label: str, raw: str) {
+    let r = http.parse_request(raw)
+    let resp = route(r)
+    let out = http.render(resp)
+    let cut = out.index_of("\r\n\r\n") ?? 0
+    let body = out.substr(cut + 4, out.len() - cut - 4)
+    // The declared frame against the body actually rendered, in bytes, which
+    // is the unit the client counts in.
+    print("{label}: {resp.status} {http.reason_for(resp.status)}  declared={declared_length(out)}  sent={body.byte_len()}  body={body.trim()}")
+}
+
+fn declared_length(resp: str) -> i64 {
+    for line in resp.split("\r\n") {
+        if line.to_lower().starts_with("content-length:") {
+            return line.substr(15, line.len() - 15).trim().parse_int() ?? -1
+        }
+    }
+    -1
+}
+
+fn main() {
+    print("-- parsing")
+    show("plain", "GET / HTTP/1.1\r\nHost: example.test\r\n\r\n")
+    show("query", "GET /search?q=a+b&n=2 HTTP/1.1\r\nHost: h\r\n\r\n")
+    show("escaped", "GET /a%2Fb%20c HTTP/1.1\r\nHost: h\r\n\r\n")
+    show("body", "POST /submit HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nhello")
+    show("no blank line", "GET / HTTP/1.1\r\nHost: h\r\n")
+    show("short start line", "GET HTTP/1.1\r\n\r\n")
+    show("relative target", "GET http://x/ HTTP/1.1\r\n\r\n")
+    show("bad version", "GET / SPDY/3\r\n\r\n")
+    show("headerless colon", "GET / HTTP/1.1\r\n: v\r\n\r\n")
+    show("no colon", "GET / HTTP/1.1\r\nHost h\r\n\r\n")
+
+    print("-- query parameters")
+    let q = "a=1&b=&c=x+y&d%3D=z&flag"
+    for name in ["a", "b", "c", "d=", "flag", "missing"] {
+        print("  {name} -> {http.query_param(q, name) ?? "(absent)"}")
+    }
+
+    print("-- routing")
+    for pair in [("/users/:id", "/users/7"), ("/users/:id", "/users"),
+                 ("/users/:id", "/users/7/edit"), ("/static/*", "/static/a/b.css"),
+                 ("/", "/"), ("/", "/x")] {
+        print("  {pair.0} ~ {pair.1} -> {http.path_matches(pair.0, pair.1)}")
+    }
+    print("  id of /users/42 -> {http.path_param("/users/:id", "/users/42", "id") ?? "(none)"}")
+    print("  name of /users/42 -> {http.path_param("/users/:id", "/users/42", "name") ?? "(none)"}")
+
+    print("-- escaping")
+    print("  {http.escape_html("<a href='x'>b & c</a>")}")
+
+    print("-- responses")
+    wire("root", "GET / HTTP/1.1\r\nHost: h\r\n\r\n")
+    wire("greeted", "GET /?greet=g%C3%BCnaydin HTTP/1.1\r\nHost: h\r\n\r\n")
+    wire("user", "GET /users/42 HTTP/1.1\r\nHost: h\r\n\r\n")
+    wire("wrong method", "DELETE /users/42 HTTP/1.1\r\nHost: h\r\n\r\n")
+    wire("static", "GET /static/site.css HTTP/1.1\r\nHost: h\r\n\r\n")
+    wire("absent", "GET /nope HTTP/1.1\r\nHost: h\r\n\r\n")
+    wire("malformed", "nonsense")
+
+    print("-- HEAD carries the headers and no body")
+    let h = http.head_of(http.text("body that is not sent\n"))
+    let lines = h.split("\r\n").len() - 2
+    print("  {lines} header lines, {h.ends_with("\r\n\r\n")} ends with a blank line, body {h.index_of("\r\n\r\n") ?? -1 == h.len() - 4}")
+
+    print("-- status reasons")
+    for s in [200, 404, 405, 500, 599] {
+        print("  {s} {http.reason_for(s)}")
+    }
+}

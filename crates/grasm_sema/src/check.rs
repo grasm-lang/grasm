@@ -357,6 +357,11 @@ fn check_modules_in(
     }
     let modules: Vec<(String, &Module)> =
         files.iter().map(|f| (f.name.clone(), f.module)).collect();
+    // Aliases last of the three, because one may name a type from any module
+    // and one may name a handler type an `effect` declares. Resolving them
+    // where they were collected gave each alias only what its own module had
+    // registered by then ([T-MODULE-NS], F68).
+    c.resolve_type_aliases(&modules);
     c.resolve_type_bodies(&modules);
     for f in files {
         c.current_module = f.name.clone();
@@ -756,6 +761,19 @@ struct Checker {
     deferred_fields: Vec<Vec<DeferredField>>,
     /// Types whose bodies are not resolved yet, by module.
     pending_type_bodies: Vec<(String, Vec<(usize, TypeDefId)>)>,
+    /// Alias declarations, held until every module's type names and every
+    /// effect's handler type are registered.
+    ///
+    /// Resolving an alias in the pass that collected it meant it could only
+    /// name what that module had already registered: `type Cb = fn(Thing) ->
+    /// i64` was "unknown type `Thing`" whenever `Thing` came from another
+    /// module, while `fn f(t: Thing)` two lines below resolved fine — one
+    /// namespace with a hole in it, the same hole [T-EFFECT-DECL] had for
+    /// handler types ([T-MODULE-NS], F68).
+    pending_aliases: Vec<(String, Vec<usize>)>,
+    /// Alias names seen so far, across every module, for duplicate detection
+    /// — `self.aliases` is not filled until the resolving pass runs.
+    alias_names: std::collections::HashSet<String>,
     /// Module-level constants: `module::NAME` to (type, is_pub).
     consts: HashMap<String, (Type, bool)>,
     /// (ret, err) of the function being checked.
@@ -854,6 +872,8 @@ impl Checker {
             deferred_closures: Vec::new(),
             deferred_fields: Vec::new(),
             pending_type_bodies: Vec::new(),
+            pending_aliases: Vec::new(),
+            alias_names: std::collections::HashSet::new(),
             consts: HashMap::new(),
             fn_ret: Type::Unit,
             fn_err: None,
@@ -917,7 +937,7 @@ impl Checker {
         // later one silently won, where [T-MODULE-NS] says a type name may
         // not be declared twice. Struct and sum bodies were caught because
         // pass 1 inserts them immediately.
-        let mut alias_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut alias_decls: Vec<usize> = Vec::new();
         for (di, decl) in module.decls.iter().enumerate() {
             if let Decl::Type(t) = decl {
                 // A builtin type name is not in `defs`, so nothing collided
@@ -949,14 +969,15 @@ resolves to the builtin; pick a different name",
                     continue;
                 }
                 if self.aliases.contains_key(&t.name.name)
-                    || alias_names.contains(&t.name.name)
+                    || self.alias_names.contains(&t.name.name)
                 {
                     self.error(t.name.span, format!("duplicate type name `{}`", t.name.name));
                     continue;
                 }
                 match &t.body {
                     TypeBody::Alias(_) => {
-                        alias_names.insert(t.name.name.clone());
+                        self.alias_names.insert(t.name.name.clone());
+                        alias_decls.push(di);
                         // The `pub` check runs over the types pass 2 gives
                         // bodies, which an alias never reaches — so
                         // `pub type N = i64` was accepted and ignored, which
@@ -981,82 +1002,8 @@ already reachable from every module — drop the `pub`",
                 }
             }
         }
-        // Pass 2: aliases (non-recursive), then bodies.
-        //
-        // To a fixpoint, because an alias may name a later one. Resolving in
-        // declaration order made `type Name = Text` above `type Text = str`
-        // an "unknown type `Text`" that swapping the two lines fixed, while
-        // an alias to a later *struct* worked — so [G-DECL-ORDER]'s "forward
-        // references are permitted" held everywhere but here.
-        let aliases: Vec<(&Ident, &TypeExpr, Vec<String>)> = module
-            .decls
-            .iter()
-            .filter_map(|d| match d {
-                Decl::Type(t) => match &t.body {
-                    TypeBody::Alias(te) => Some((
-                        &t.name,
-                        te,
-                        t.generics.iter().map(|g| g.name.clone()).collect(),
-                    )),
-                    _ => None,
-                },
-                _ => None,
-            })
-            .collect();
-        for (name, _, generics) in &aliases {
-            if !generics.is_empty() {
-                self.error(
-                    name.span,
-                    "generic type aliases are not supported yet".to_string(),
-                );
-            }
-        }
-        let mut todo: Vec<usize> = (0..aliases.len()).collect();
-        loop {
-            let before = todo.len();
-            let mut still: Vec<usize> = Vec::new();
-            for &i in &todo {
-                let (name, te, generics) = &aliases[i];
-                let mark = self.diags.len();
-                let ty = self.resolve_type(te, generics);
-                if self.diags.len() > mark {
-                    // Not resolvable yet; it may name an alias not seen.
-                    self.diags.truncate(mark);
-                    still.push(i);
-                } else {
-                    self.aliases.insert(name.name.clone(), ty);
-                }
-            }
-            todo = still;
-            if todo.is_empty() || todo.len() == before {
-                break;
-            }
-        }
-        // Whatever is left really is unknown; report it properly.
-        let stuck: std::collections::HashSet<String> =
-            todo.iter().map(|&i| aliases[i].0.name.clone()).collect();
-        for &i in &todo {
-            let (name, te, generics) = &aliases[i];
-            // An alias that stands for a shape holding itself. `type A = [A]`
-            // has no base case and no indirection to stop at — unlike a struct
-            // or a sum, which [T-RECURSIVE] does allow to refer to themselves,
-            // because a value of one is built out of *other* values. Reported
-            // as `unknown type `A`` it named a type declared two words to the
-            // left, and every pass that walked it recursively overflowed the
-            // process stack: exit 134, no diagnostic, and a dependency
-            // carrying the line took its consumer's toolchain down too.
-            if Self::names_itself(te, &name.name, &stuck) {
-                self.error_help(
-                    name.span,
-                    format!("type `{}` is defined in terms of itself", name.name),
-                    "a `type` alias is another spelling of the type it names, so it has nowhere to stop — a struct or a sum type may refer to itself ([T-RECURSIVE]), because a value of one holds *other* values",
-                );
-                self.aliases.insert(name.name.clone(), Type::Error);
-                continue;
-            }
-            let ty = self.resolve_type(te, generics);
-            self.aliases.insert(name.name.clone(), ty);
-        }
+        self.pending_aliases
+            .push((self.current_module.clone(), alias_decls));
         self.pending_type_bodies.push((self.current_module.clone(), ids));
     }
 
@@ -1067,6 +1014,103 @@ already reachable from every module — drop the `pub`",
     /// the one declaring the type reported `unknown type` — with a help that
     /// said to declare it, naming the thing that was already declared. The
     /// same ordering bug effects had until C15.
+    /// Resolves every alias, after every module's type names and every
+    /// effect's handler type are registered.
+    ///
+    /// A separate pass over the whole program, not a step inside the one that
+    /// collects a module, because an alias may name a type from any module —
+    /// exactly as a parameter, a return type or a struct field may. Doing it
+    /// per module meant an alias could only see what that module had already
+    /// registered, so `type Cb = fn(Thing) -> i64` failed where
+    /// `fn f(t: Thing)` on the next line succeeded (F68).
+    ///
+    /// The fixpoint below is still needed for a different reason: an alias may
+    /// name a *later alias*, which nothing has resolved yet whatever the order
+    /// of modules.
+    fn resolve_type_aliases(&mut self, modules: &[(String, &Module)]) {
+        let pending = std::mem::take(&mut self.pending_aliases);
+        for (module_name, decls) in pending {
+            let Some((_, module)) = modules.iter().find(|(n, _)| *n == module_name) else {
+                continue;
+            };
+            self.current_module = module_name.clone();
+            //
+            // To a fixpoint, because an alias may name a later one. Resolving in
+            // declaration order made `type Name = Text` above `type Text = str`
+            // an "unknown type `Text`" that swapping the two lines fixed, while
+            // an alias to a later *struct* worked — so [G-DECL-ORDER]'s "forward
+            // references are permitted" held everywhere but here.
+            let aliases: Vec<(&Ident, &TypeExpr, Vec<String>)> = decls
+                .iter()
+                .filter_map(|&di| match &module.decls[di] {
+                    Decl::Type(t) => match &t.body {
+                        TypeBody::Alias(te) => Some((
+                            &t.name,
+                            te,
+                            t.generics.iter().map(|g| g.name.clone()).collect(),
+                        )),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect();
+            for (name, _, generics) in &aliases {
+                if !generics.is_empty() {
+                    self.error(
+                        name.span,
+                        "generic type aliases are not supported yet".to_string(),
+                    );
+                }
+            }
+            let mut todo: Vec<usize> = (0..aliases.len()).collect();
+            loop {
+                let before = todo.len();
+                let mut still: Vec<usize> = Vec::new();
+                for &i in &todo {
+                    let (name, te, generics) = &aliases[i];
+                    let mark = self.diags.len();
+                    let ty = self.resolve_type(te, generics);
+                    if self.diags.len() > mark {
+                        // Not resolvable yet; it may name an alias not seen.
+                        self.diags.truncate(mark);
+                        still.push(i);
+                    } else {
+                        self.aliases.insert(name.name.clone(), ty);
+                    }
+                }
+                todo = still;
+                if todo.is_empty() || todo.len() == before {
+                    break;
+                }
+            }
+            // Whatever is left really is unknown; report it properly.
+            let stuck: std::collections::HashSet<String> =
+                todo.iter().map(|&i| aliases[i].0.name.clone()).collect();
+            for &i in &todo {
+                let (name, te, generics) = &aliases[i];
+                // An alias that stands for a shape holding itself. `type A = [A]`
+                // has no base case and no indirection to stop at — unlike a struct
+                // or a sum, which [T-RECURSIVE] does allow to refer to themselves,
+                // because a value of one is built out of *other* values. Reported
+                // as `unknown type `A`` it named a type declared two words to the
+                // left, and every pass that walked it recursively overflowed the
+                // process stack: exit 134, no diagnostic, and a dependency
+                // carrying the line took its consumer's toolchain down too.
+                if Self::names_itself(te, &name.name, &stuck) {
+                    self.error_help(
+                        name.span,
+                        format!("type `{}` is defined in terms of itself", name.name),
+                        "a `type` alias is another spelling of the type it names, so it has nowhere to stop — a struct or a sum type may refer to itself ([T-RECURSIVE]), because a value of one holds *other* values",
+                    );
+                    self.aliases.insert(name.name.clone(), Type::Error);
+                    continue;
+                }
+                let ty = self.resolve_type(te, generics);
+                self.aliases.insert(name.name.clone(), ty);
+            }
+        }
+    }
+
     fn resolve_type_bodies(&mut self, modules: &[(String, &Module)]) {
         let pending = std::mem::take(&mut self.pending_type_bodies);
         for (module_name, ids) in pending {
@@ -1192,9 +1236,14 @@ not effects a program declares or handles — there is no `with io handled_by` \
                 // both stayed usable — and an effect declares `EHandler` too,
                 // so `type ClockHandler = i64` beside `effect Clock` collided
                 // with a name the reader never wrote.
+                //
+                // `alias_names`, not `aliases`: aliases are *resolved* after
+                // effects are collected (F68), so the resolved table is empty
+                // here. The name set is filled in the pass that collected the
+                // declaration, which is the pass this has to agree with.
                 for clash in [e.name.name.clone(), format!("{}Handler", e.name.name)] {
                     if self.defs.by_name.contains_key(&clash)
-                        || self.aliases.contains_key(&clash)
+                        || self.alias_names.contains(&clash)
                     {
                         let what = if clash == e.name.name {
                             format!("effect `{clash}` collides with a type of that name")

@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Library reference</title>
+<meta name="description" content="The standard library: 81 methods and the free functions.">
+<link rel="stylesheet" href="style.css">
+</head><body>
+<div class="frame">
+<nav class="rail">
+<a class="mark" href="index.html"><b>grasm</b><span>a systems language</span></a>
+<h2>Start</h2>
+<a href="start.html">Getting started</a>
+<a href="install.html">Install</a>
+<a href="playground.html">Playground</a>
+<h2>Learn</h2>
+<a href="tour.html">Tour</a>
+<a href="effects.html">Effects</a>
+<a href="tiers.html">Ownership</a>
+<a href="errors.html">Errors</a>
+<a href="concurrency.html">Concurrency</a>
+<h2>Reference</h2>
+<a href="language.html">Language</a>
+<a href="library.html" aria-current="page">Library</a>
+<a href="packages.html">Packages</a>
+<a href="spec.html">Specification</a>
+<h2>More</h2>
+<a href="examples.html">Examples</a>
+<a href="status.html">Status</a>
+<a href="roadmap.html">Roadmap</a>
+</nav>
+<main>
+
+<p class="eyebrow">Reference</p>
+<h1>Library reference</h1>
+<p class="lede">Small on purpose. 81 methods, each with a law checked
+against arithmetic rather than against another engine.</p>
+
+<h2>Lists</h2>
+<p><code>len is_empty first last get push pop remove sort sort_by rev slice
+concat map filter fold sum min max any all find enumerate zip join to_list
+par_map par_filter</code></p>
+
+<h2>Strings</h2>
+<p><code>len byte_len is_empty chars codes code_at to_char substr split lines
+words contains starts_with ends_with index_of replace trim trim_start trim_end
+to_upper to_lower repeat pad_start pad_end parse_int parse_int_base parse_float
+to_bytes</code></p>
+
+<h2>Maps</h2>
+<p><code>get set has delete len is_empty keys values entries</code></p>
+
+<h2>Bytes</h2>
+<p><code>len is_empty at slice concat to_list to_str</code></p>
+
+<h2>Options</h2>
+<p><code>is_some is_none expect unwrap_or</code>, and <code>??</code>.</p>
+
+<h2>Numbers</h2>
+<p><code>abs min max cmp as_f64 as_i64 to_str to_base to_fixed round floor ceil
+sqrt cbrt exp ln log log2 log10 sin cos tan asin acos atan atan2 sinh cosh tanh
+hypot to_radians to_degrees is_nan is_finite bit_and bit_or bit_xor bit_not shl
+shr ushr</code></p>
+
+<h2>Ranges</h2>
+<p><code>to_list map filter sum len</code>. A range is a value of type
+<code>range</code>: it holds three numbers, not its elements, so
+<code>0..2_000_000</code> costs the same as <code>0..2</code>.</p>
+
+<h2>The world</h2>
+<p><code>print eprint read_file write_file read_bytes write_bytes list_dir
+make_dir random_bytes tcp_listen tcp_accept tcp_connect udp_bind net_wait
+proc_run proc_pipeline</code> — each carrying the effect it performs, so a
+function that uses one says so in its type.</p>
+
+<div class="note"><b>Every method has a law.</b> Not a recorded expected output —
+a relation checked against arithmetic, because a bundle <em>is</em> the
+interpreter and a wrong answer they share is invisible to any comparison
+between them. A method added to the specification without a law fails the
+gate by name.</div>
+
+<footer>
+Grasm — three engines, one answer.
+<a href="status.html">Status</a> ·
+<a href="spec.html">Specification</a> ·
+<a href="roadmap.html">Roadmap</a>
+</footer>
+</main>
+</div>
+</body></html>

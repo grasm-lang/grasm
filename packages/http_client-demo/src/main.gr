@@ -1,0 +1,104 @@
+// A Grasm client talking to a Grasm server.
+//
+// The default run builds requests and reads replies as text, so three engines
+// can be held to the same bytes. `-- serve` puts both halves on a real socket:
+// the server listens on a port the system picks, the client dials it, and the
+// same handler answers.
+import http
+import http_client
+import http_server
+
+fn route(r: Request) -> Response / {io} {
+    if not r.ok {
+        return http.respond(400, "text/plain; charset=utf-8", "bad request: {r.why}\n")
+    }
+    if http.path_matches("/echo/:what", r.path) {
+        return http.text("{http.path_param("/echo/:what", r.path, "what") ?? ""}\n")
+    }
+    if r.path == "/" {
+        return http.html("<h1>up</h1>\n")
+    }
+    http.not_found()
+}
+
+fn show_request(label: str, raw: str) {
+    // The wire has no visible line breaks, so they are shown as they are read.
+    print("{label}: {raw.replace("\r\n", " | ")}")
+}
+
+fn show_reply(label: str, raw: str) {
+    let r = http_client.parse_reply(raw)
+    if not r.ok {
+        print("{label}: refused -- {r.why}")
+        return
+    }
+    let ctype = http_client.reply_header(r, "CONTENT-TYPE") ?? "(none)"
+    print("{label}: {r.status} {r.reason}  type={ctype}  body={r.body.trim()}")
+}
+
+fn round_trip(listener: i64, label: str, path: str) / {io, net} {
+    let port = net_port(listener) ?? 0
+    // The request lands in the listen backlog, the server picks it up, and the
+    // client reads the answer -- one thread doing both halves, which is why
+    // the order below is the order it is.
+    match tcp_connect("127.0.0.1", port) {
+        Err(e) -> print("{label}: could not connect -- {e}")
+        Ok(conn) -> {
+            match tcp_write(conn, http_client.request("GET", "127.0.0.1", path, [], "")) {
+                Ok(_) -> {}
+                Err(e) -> print("{label}: could not write -- {e}")
+            }
+            match tcp_accept(listener) {
+                Err(e) -> print("{label}: nothing accepted")
+                Ok(served) -> {
+                    http_server.serve_conn(served, route)
+                    show_reply(label, tcp_read(conn) ?? "")
+                }
+            }
+            net_close(conn)
+        }
+    }
+}
+
+fn live() / {io, net} {
+    match tcp_listen(0) {
+        Err(e) -> print("cannot listen: {e}")
+        Ok(listener) -> {
+            round_trip(listener, "root", "/")
+            round_trip(listener, "echo", "/echo/hi")
+            round_trip(listener, "absent", "/nope")
+            net_close(listener)
+        }
+    }
+}
+
+fn main() / {io, net} {
+    if args().contains("serve") {
+        live()
+        return
+    }
+
+    print("-- requests this builds")
+    show_request("get", http_client.request("GET", "example.test", "/", [], ""))
+    show_request("with a body",
+        http_client.request("POST", "example.test", "/submit", [], "a=1"))
+    show_request("non-ascii body, framed in bytes",
+        http_client.request("POST", "example.test", "/submit", [], "günaydin"))
+    show_request("length the caller set",
+        http_client.request("POST", "example.test", "/submit",
+                            [Header{ name: "Content-Length", value: "99" }], "a=1"))
+    show_request("a header of its own",
+        http_client.request("GET", "example.test", "/",
+                            [Header{ name: "Accept", value: "text/plain" }], ""))
+
+    print("-- replies this reads")
+    show_reply("ok", "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 3\r\n\r\nhi\n")
+    show_reply("no reason", "HTTP/1.1 204\r\nContent-Length: 0\r\n\r\n")
+    show_reply("multi-word reason",
+        "HTTP/1.1 405 Method Not Allowed\r\nAllow: GET\r\nContent-Length: 0\r\n\r\n")
+    show_reply("no blank line", "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n")
+    show_reply("status is not a number", "HTTP/1.1 two hundred\r\n\r\n")
+    show_reply("header without a colon", "HTTP/1.1 200 OK\r\nAllow GET\r\n\r\n")
+
+    print("run with `-- serve` for the same exchange over a real socket")
+}

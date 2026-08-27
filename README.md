@@ -411,6 +411,19 @@ prove the backend isn't accidentally host-specific — currently **130 identical
 build + tests + clippy + the differential gate on linux-x86_64, macos-arm64,
 and macos-x86_64, plus object emission for all five architectures.
 
+`scripts/fuzz_modules.py` builds programs of more than one file, which nothing
+else here does. Twenty positions a name from another module can stand in — a
+parameter, a return type, an annotation, a list element, a map value, a tuple
+component, an option payload, a struct field, a sum payload, four kinds of
+alias, a generic argument, a closure capture, a `ref`, a handler — crossed with
+how far away the declaring module is: named directly, named inside the library
+that imported it, or named two hops away without importing it at all. Each cell
+is a whole package tree, built and run three ways against an exact answer, so a
+cell that compiles and prints the wrong number fails. A second round checks the
+capability ceiling in both directions, because a checker that refuses every
+package satisfies the first direction on its own. The alias cell is F68 and the
+generic cell is F71.
+
 Measured on this machine (user CPU time, release builds):
 
 | benchmark | native | interpreter |

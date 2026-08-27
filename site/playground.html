@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Playground</title>
+<meta name="description" content="Run Grasm in your browser.">
+<link rel="stylesheet" href="style.css">
+</head><body>
+<div class="frame">
+<nav class="rail">
+<a class="mark" href="index.html"><b>grasm</b><span>a systems language</span></a>
+<h2>Start</h2>
+<a href="start.html">Getting started</a>
+<a href="install.html">Install</a>
+<a href="playground.html" aria-current="page">Playground</a>
+<h2>Learn</h2>
+<a href="tour.html">Tour</a>
+<a href="effects.html">Effects</a>
+<a href="tiers.html">Ownership</a>
+<a href="errors.html">Errors</a>
+<a href="concurrency.html">Concurrency</a>
+<h2>Reference</h2>
+<a href="language.html">Language</a>
+<a href="library.html">Library</a>
+<a href="packages.html">Packages</a>
+<a href="spec.html">Specification</a>
+<h2>More</h2>
+<a href="examples.html">Examples</a>
+<a href="status.html">Status</a>
+<a href="roadmap.html">Roadmap</a>
+</nav>
+<main>
+
+<p class="eyebrow">Start</p>
+<h1>Playground</h1>
+<p class="lede">Grasm compiles to <code>wasm32</code>, so the language runs in a
+browser with no server behind it.</p>
+
+<h2>Running it locally</h2>
+<p>The wasm build and a host page live in the repository. Serve the directory
+and open it:</p><pre><code>cargo build --release --target wasm32-unknown-unknown -p grasm_wasm
+cp target/wasm32-unknown-unknown/release/grasm_wasm.wasm ProjectGold/web/grasm.wasm
+
+python3 -m http.server -d ProjectGold/web</code></pre>
+<p>That page runs the corpus: pick a program, and it executes in the tab. Twelve
+of the programs under <code>ProjectGold/</code> are browser applications built
+this way — a SPA router, a markdown editor, a collaborative todo list, a
+realtime analytics dashboard.</p>
+
+<h2>What the browser build can and cannot do</h2>
+<p>189 of the 230 corpus programs produce identical output in wasm. The other 41
+are skipped for a reason the host cannot supply, and each names it: a
+filesystem, a socket, a process, threads, or a stack deep enough for the
+recursion limit the specification promises.</p>
+
+<div class="note"><b>This page is not itself a playground yet.</b> The wasm
+build works and the host page works; wiring an editor into this site is on the
+<a href="roadmap.html">roadmap</a>. Saying otherwise would be the kind of claim
+this project does not make.</div>
+
+<footer>
+Grasm — three engines, one answer.
+<a href="status.html">Status</a> ·
+<a href="spec.html">Specification</a> ·
+<a href="roadmap.html">Roadmap</a>
+</footer>
+</main>
+</div>
+</body></html>

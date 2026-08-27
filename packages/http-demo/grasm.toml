@@ -1,0 +1,11 @@
+[package]
+name = "http_demo"
+version = "0.1.0"
+
+# It prints. That is all it does — the router it exercises cannot do more,
+# because `http` declares nothing.
+capabilities = ["io"]
+
+[dependencies.http]
+path = "../http"
+version = "^1.0.0"

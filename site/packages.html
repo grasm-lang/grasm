@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Packages</title>
+<meta name="description" content="Manifests, lockfiles, and the capability ceiling.">
+<link rel="stylesheet" href="style.css">
+</head><body>
+<div class="frame">
+<nav class="rail">
+<a class="mark" href="index.html"><b>grasm</b><span>a systems language</span></a>
+<h2>Start</h2>
+<a href="start.html">Getting started</a>
+<a href="install.html">Install</a>
+<a href="playground.html">Playground</a>
+<h2>Learn</h2>
+<a href="tour.html">Tour</a>
+<a href="effects.html">Effects</a>
+<a href="tiers.html">Ownership</a>
+<a href="errors.html">Errors</a>
+<a href="concurrency.html">Concurrency</a>
+<h2>Reference</h2>
+<a href="language.html">Language</a>
+<a href="library.html">Library</a>
+<a href="packages.html" aria-current="page">Packages</a>
+<a href="spec.html">Specification</a>
+<h2>More</h2>
+<a href="examples.html">Examples</a>
+<a href="status.html">Status</a>
+<a href="roadmap.html">Roadmap</a>
+</nav>
+<main>
+
+<p class="eyebrow">Reference</p>
+<h1>Packages</h1>
+<p class="lede">A manifest, a resolver, a lockfile — and a ceiling on what a
+dependency may do, checked at compile time in every consumer.</p>
+
+<h2>A manifest</h2><pre><code>[package]
+name = "ecommerce_cart"
+version = "1.0.0"
+entry = "main.gr"
+capabilities = ["io", "net"]
+
+[dependencies.lib_json]
+path = "../lib-json"
+version = "^1.0.0"</code></pre>
+
+<h2>The ceiling</h2>
+<p><code>capabilities</code> is the set of effects this package may perform.
+Effects are inferred from source, so the claim is checked rather than trusted. A
+dependency that starts reading files without declaring <code>io</code> fails to
+build — and it fails in <em>your</em> build, not silently in theirs.</p>
+<p>This is the part of the package system worth having. Version resolution is
+plumbing every language has; a supply chain where a dependency's reach is a
+compile-time fact is not.</p>
+
+<h2>Commands</h2><pre><code>grasm deps            # resolve, check ceilings, write grasm.lock
+grasm deps --locked   # fail rather than update the lockfile</code></pre>
+
+<h2>What ships today</h2>
+<div class="scroll"><table>
+<tr><th>Package</th><th>Capabilities</th><th>What it is</th></tr>
+<tr><td><code>http</code></td><td><i>none</i></td><td>Requests, responses, routing with <code>:param</code> and <code>*</code> segments, percent decoding, HTML escaping.</td></tr>
+<tr><td><code>http_server</code></td><td><code>io</code>, <code>net</code></td><td>The accept loop, and many conversations on one thread. Depends on <code>http</code>.</td></tr>
+<tr><td><code>http_client</code></td><td><code>net</code></td><td>Dials, sends what <code>http</code> composed, reads until the declared frame arrives. Depends on <code>http</code>.</td></tr>
+</table></div>
+<p>They are three packages because <code>http</code> <em>cannot</em> open a
+socket, and that is checked rather than claimed: its manifest declares no
+capability, effects are inferred from its source, and a version of it that
+started dialling out would fail to build in every consumer. So a program can
+parse and route HTTP while remaining provably unable to reach the network, and
+a program that only builds requests never acquires the ability to send them. In
+every other language, depending on the HTTP library means depending on
+something that can.</p>
+
+<h2>Where packages come from</h2>
+<p>Two sources work today: a <code>path</code> dependency, and a local registry
+under <code>.grasm/registry</code> (or wherever <code>GRASM_REGISTRY</code>
+points). Both resolve, lock and check ceilings.</p>
+
+<div class="note"><b>There is no remote registry.</b> Nothing fetches, publishes
+or verifies over a network yet, and there are no third-party packages to fetch.
+Both are on the <a href="roadmap.html">roadmap</a>, and they are the largest
+thing standing between this language and ordinary use.</div>
+
+<footer>
+Grasm — three engines, one answer.
+<a href="status.html">Status</a> ·
+<a href="spec.html">Specification</a> ·
+<a href="roadmap.html">Roadmap</a>
+</footer>
+</main>
+</div>
+</body></html>

@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Concurrency</title>
+<meta name="description" content="Deterministic task ordering, and effects that cross thread boundaries.">
+<link rel="stylesheet" href="style.css">
+</head><body>
+<div class="frame">
+<nav class="rail">
+<a class="mark" href="index.html"><b>grasm</b><span>a systems language</span></a>
+<h2>Start</h2>
+<a href="start.html">Getting started</a>
+<a href="install.html">Install</a>
+<a href="playground.html">Playground</a>
+<h2>Learn</h2>
+<a href="tour.html">Tour</a>
+<a href="effects.html">Effects</a>
+<a href="tiers.html">Ownership</a>
+<a href="errors.html">Errors</a>
+<a href="concurrency.html" aria-current="page">Concurrency</a>
+<h2>Reference</h2>
+<a href="language.html">Language</a>
+<a href="library.html">Library</a>
+<a href="packages.html">Packages</a>
+<a href="spec.html">Specification</a>
+<h2>More</h2>
+<a href="examples.html">Examples</a>
+<a href="status.html">Status</a>
+<a href="roadmap.html">Roadmap</a>
+</nav>
+<main>
+
+<p class="eyebrow">Learn</p>
+<h1>Concurrency</h1>
+<p class="lede">Tasks run in the order they were spawned, the block joins before
+the line after it, and the effect row crosses the boundary with them.</p>
+
+<h2>parallel and spawn</h2><pre><code>fn main() / {io, async} {
+    var log = ""
+    parallel {
+        spawn { log += "a" }
+        spawn { log += "b" }
+    }
+    print(log)          // "ab", every time, on every engine
+}</code></pre>
+<p>The block records which <code>spawn</code> sites fired, in order, and the
+bodies run afterwards — which is what makes the order deterministic and the
+scope joined. A <code>spawn</code> body <em>sees</em> the enclosing scope rather
+than capturing it, which is the opposite of how a closure behaves and is
+documented as such.</p>
+
+<h2>Data-parallel methods</h2><pre><code>let doubled = xs.par_map(|v| v * 2)
+let evens   = xs.par_filter(|v| v % 2 == 0)</code></pre>
+<p>Both preserve order, and both require the closure to be pure — which the
+effect system can prove rather than assume. A closure that prints will not
+typecheck here.</p>
+
+<div class="note"><b>What is missing.</b> There is no timer, channel or select
+library above these primitives yet. That is the async workstream on the
+<a href="roadmap.html">roadmap</a>.</div>
+
+<footer>
+Grasm — three engines, one answer.
+<a href="status.html">Status</a> ·
+<a href="spec.html">Specification</a> ·
+<a href="roadmap.html">Roadmap</a>
+</footer>
+</main>
+</div>
+</body></html>

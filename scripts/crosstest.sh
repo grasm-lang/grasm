@@ -13,6 +13,7 @@ set -uo pipefail
 . "$(dirname "$0")/lib/trace.sh"
 . "$(dirname "$0")/lib/fresh.sh"
 cd "$(dirname "$0")/.."
+. scripts/lib/corpus.sh
 TARGET="${1:-x86_64-apple-darwin}"
 ARCH="${TARGET%%-*}"
 GRASM=./target/release/grasm
@@ -53,7 +54,7 @@ declare -a SKIPPED=()
 
 # Same scan roots as difftest.sh: a program the host backend is held to must
 # hold on every other target too, or "portable" means only what was sampled.
-for src in $(find examples projects spec/conformance benchmarks/grasm -name '*.gr' | sort); do
+for src in $(corpus_programs); do
     grep -qE '^[[:space:]]*(pub )?fn main\(' "$src" || continue
     # Conformance programs tagged `expect: error` are meant not to compile.
     grep -q '^//! expect: error$' "$src" && continue

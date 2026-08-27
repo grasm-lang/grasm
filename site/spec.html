@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Specification</title>
+<meta name="description" content="234 numbered clauses, each with a conformance program.">
+<link rel="stylesheet" href="style.css">
+</head><body>
+<div class="frame">
+<nav class="rail">
+<a class="mark" href="index.html"><b>grasm</b><span>a systems language</span></a>
+<h2>Start</h2>
+<a href="start.html">Getting started</a>
+<a href="install.html">Install</a>
+<a href="playground.html">Playground</a>
+<h2>Learn</h2>
+<a href="tour.html">Tour</a>
+<a href="effects.html">Effects</a>
+<a href="tiers.html">Ownership</a>
+<a href="errors.html">Errors</a>
+<a href="concurrency.html">Concurrency</a>
+<h2>Reference</h2>
+<a href="language.html">Language</a>
+<a href="library.html">Library</a>
+<a href="packages.html">Packages</a>
+<a href="spec.html" aria-current="page">Specification</a>
+<h2>More</h2>
+<a href="examples.html">Examples</a>
+<a href="status.html">Status</a>
+<a href="roadmap.html">Roadmap</a>
+</nav>
+<main>
+
+<p class="eyebrow">Reference</p>
+<h1>Specification</h1>
+<p class="lede">The language is defined by numbered clauses, each with a program
+that exercises it, and each filed at a stability level that says whether it may
+change.</p>
+
+<div class="figures">
+  <div class="fig"><b>233</b><span>clauses</span></div>
+  <div class="fig"><b>70</b><span>pages, the cap</span></div>
+  <div class="fig"><b>193</b><span>laws checked against arithmetic</span></div>
+</div>
+
+<h2>How a clause works</h2>
+<p>A clause is a paragraph with a tag: <code>[T-REF-VALUE]</code>,
+<code>[E-SPAWN-ORDER]</code>, <code>[L-LIB-BITS]</code>. Every one has a program
+under <code>spec/conformance/</code> tagged with it, and the test suite fails if
+a clause has no program, if a program has no clause, or if a clause is filed
+under a stability heading that disagrees with its own level.</p>
+
+<h2>Stability</h2>
+<div class="scroll"><table>
+<tr><th>Level</th><th>Means</th></tr>
+<tr><td>Stable</td><td>It will not change under you.</td></tr>
+<tr><td>Provisional</td><td>It works and it may still move.</td></tr>
+<tr><td>Experimental</td><td>Expect it to change.</td></tr>
+</table></div>
+
+<h2>Why there is also a law for most of them</h2>
+<p>A conformance program records what a clause says the output is. Where the
+clause and the implementation were written together — which, for a young
+language, is most of them — both can be wrong together, and the program agrees
+with them.</p>
+<p>So the behavioural clauses in scope also have a <em>law</em>: one of 193 relations checked against
+arithmetic, not against a recorded string. <code>rev</code> puts the last
+element first. <code>a / b * b + a % b == a</code>. A released slot is dead
+through every reference to it. A clause in scope with no law fails the gate by
+name.</p>
+
+<h2>The page budget</h2>
+<p>The specification is capped at seventy pages and the test suite enforces it.
+When a clause was added recently and the file went one line over, the clause was
+made shorter rather than the cap raised. A specification nobody finishes reading
+is one nobody checks the implementation against.</p>
+
+<footer>
+Grasm — three engines, one answer.
+<a href="status.html">Status</a> ·
+<a href="spec.html">Specification</a> ·
+<a href="roadmap.html">Roadmap</a>
+</footer>
+</main>
+</div>
+</body></html>

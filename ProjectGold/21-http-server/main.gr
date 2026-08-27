@@ -141,30 +141,44 @@ fn hex_value(c: str) -> i64 {
     -1
 }
 
+// A percent escape names one *byte*, and a character outside ASCII is several
+// of them. Turning each escape into its own character with `to_char` made
+// `%C3%BC` two characters where it stands for one: `ü` came out as `Ã¼`, text
+// that renders wrong and, once it is in a response body, frames one byte
+// longer than the header says. So the escapes are gathered as bytes and the
+// text is decoded once, at the end — the only point at which a multi-byte
+// character exists (F69).
 fn percent_decode(s: str) -> str {
-    var out = ""
+    if not s.contains("%") and not s.contains("+") {
+        return s
+    }
+    var out: [i64] = []
     let cs = s.chars()
     var i = 0
     while i < cs.len() {
         if cs[i] == "+" {
-            out = out + " "
+            out.push(32)
             i = i + 1
         } else if cs[i] == "%" and i + 2 < cs.len() {
             let hi = hex_value(cs[i + 1])
             let lo = hex_value(cs[i + 2])
             if hi < 0 or lo < 0 {
-                out = out + cs[i]
+                for b in cs[i].to_bytes().to_list() {
+                    out.push(b)
+                }
                 i = i + 1
             } else {
-                out = out + (hi * 16 + lo).to_char()
+                out.push(hi * 16 + lo)
                 i = i + 3
             }
         } else {
-            out = out + cs[i]
+            for b in cs[i].to_bytes().to_list() {
+                out.push(b)
+            }
             i = i + 1
         }
     }
-    out
+    bytes_of(out).to_str()
 }
 
 fn escape_html(s: str) -> str {
@@ -184,7 +198,11 @@ fn escape_html(s: str) -> str {
 /// every response — telling the client so is the difference between a clean
 /// finish and a browser waiting for more.
 fn response(status: str, content_type: str, body: str) -> str {
-    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {body.len()}\r\nConnection: close\r\n\r\n{body}"
+    // Bytes, not characters. `len()` counts code points, so a body with one
+    // non-ASCII character in it declared a frame shorter than what went on
+    // the wire, and a client reading exactly Content-Length bytes got a
+    // truncated body and a desynchronised connection (F70).
+    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {body.byte_len()}\r\nConnection: close\r\n\r\n{body}"
 }
 
 fn route(r: Request) -> str {
@@ -252,7 +270,10 @@ fn check(label: str, raw: str) {
     let r = parse_request(raw)
     let resp = route(r)
     let declared = content_length_of(resp)
-    let actual = body_of(resp).len()
+    // In bytes, like the header. Measuring the body in characters here made
+    // this check agree with the bug it exists to catch: both sides counted
+    // the same wrong way, so it passed on every input where it mattered (F70).
+    let actual = body_of(resp).byte_len()
     // A HEAD response is *supposed* to declare the length it would have sent
     // and send no body, so it is the one case where these differ on purpose.
     let framed = if r.ok and r.method == "HEAD" {
@@ -304,6 +325,10 @@ fn main() / {io, net} {
     check("root", "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
     check("hello", "GET /hello HTTP/1.1\r\nHost: x\r\n\r\n")
     check("hello named", "GET /hello?name=ada HTTP/1.1\r\nHost: x\r\n\r\n")
+    // A body that is not ASCII. Every case above frames the same whether the
+    // length is counted in characters or in bytes, which is why nothing here
+    // could see that it was counted in characters (F70).
+    check("hello named, non-ascii", "GET /hello?name=caf%C3%A9 HTTP/1.1\r\nHost: x\r\n\r\n")
     check("echo", "GET /echo?a=1&b=2 HTTP/1.1\r\nHost: x\r\nUser-Agent: test\r\n\r\n")
     check("missing route", "GET /nope HTTP/1.1\r\nHost: x\r\n\r\n")
     check("head", "HEAD / HTTP/1.1\r\nHost: x\r\n\r\n")
@@ -329,7 +354,12 @@ fn main() / {io, net} {
     }
 
     print("--- percent decoding ---")
-    for s in ["plain", "a%20b", "a+b", "%41%42%43", "100%25", "%2F", "%", "%4", "%zz", "caf%C3%A9"] {
+    // Two, three and four byte characters, because one escape is one byte and
+    // a character is however many it takes: decoding them one at a time gave
+    // `Ã©` for `é` and this list recorded that as the answer for as long as
+    // the program existed (F69).
+    for s in ["plain", "a%20b", "a+b", "%41%42%43", "100%25", "%2F", "%", "%4", "%zz",
+              "caf%C3%A9", "%E2%82%AC", "%F0%9F%94%A5", "%C3", "%C3%28"] {
         print("  \"{s}\" -> \"{percent_decode(s)}\"")
     }
 

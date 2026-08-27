@@ -1,0 +1,111 @@
+// The `http_server` package, both halves.
+//
+// The default run is deterministic and opens nothing: it drives the same
+// handler the socket path drives, over requests written out here, so three
+// engines can be held to the same bytes. `-- serve` does the live round trip
+// over a real socket on a port the system chooses.
+//
+// The corpus does not open sockets by default, and that is deliberate: a gate
+// that depends on the loopback network fails for reasons that have nothing to
+// do with the language, and a gate nobody trusts is a gate nobody reads.
+// Project 21 draws the same line for the same reason.
+import http
+import http_server
+
+fn route(r: Request) -> Response / {io} {
+    if not r.ok {
+        return http.respond(400, "text/plain; charset=utf-8", "bad request: {r.why}\n")
+    }
+    if http.path_matches("/echo/:what", r.path) {
+        let what = http.path_param("/echo/:what", r.path, "what") ?? ""
+        return http.text("{what}\n")
+    }
+    if r.path == "/" {
+        return http.html("<h1>up</h1>\n")
+    }
+    http.not_found()
+}
+
+fn status_line(reply: str) -> str {
+    match reply.index_of("\r\n") {
+        Some(at) -> reply.substr(0, at)
+        None -> "(no status line)"
+    }
+}
+
+fn body_of(reply: str) -> str {
+    match reply.index_of("\r\n\r\n") {
+        Some(at) -> reply.substr(at + 4, reply.len() - at - 4)
+        None -> ""
+    }
+}
+
+// What `serve_conn` would put on the wire, without a wire. A HEAD request is
+// the case worth having: it must carry the headers a GET would have carried
+// and no body at all, so a client counting Content-Length bytes that never
+// arrive is exactly the bug this distinguishes.
+fn offline(label: str, request: str) / {io} {
+    let r = http.parse_request(request)
+    let resp = route(r)
+    let out = if r.ok and r.method == "HEAD" {
+        http.head_of(resp)
+    } else {
+        http.render(resp)
+    }
+    let body = body_of(out)
+    print("{label}: {status_line(out)}  sent={body.byte_len()}  body={body.trim()}")
+}
+
+fn round_trip(listener: i64, label: str, request: str) / {io, net} {
+    let port = net_port(listener) ?? 0
+    match tcp_connect("127.0.0.1", port) {
+        Err(e) -> print("{label}: could not connect -- {e}")
+        Ok(client) -> {
+            // The write lands in the listen backlog; the accept below picks
+            // it up. One thread does both halves, which is why the write has
+            // to happen before the accept and the read after the answer.
+            match tcp_write(client, request) {
+                Ok(_) -> {}
+                Err(e) -> print("{label}: could not write -- {e}")
+            }
+            match tcp_accept(listener) {
+                Err(e) -> print("{label}: nothing accepted")
+                Ok(conn) -> {
+                    let status = http_server.serve_conn(conn, route)
+                    let reply = tcp_read(client) ?? ""
+                    print("{label}: {status_line(reply)}  body={body_of(reply).trim()}")
+                }
+            }
+            net_close(client)
+        }
+    }
+}
+
+fn live() / {io, net} {
+    match tcp_listen(0) {
+        Err(e) -> print("cannot listen: {e}")
+        Ok(listener) -> {
+            round_trip(listener, "root", "GET / HTTP/1.1\r\nHost: h\r\n\r\n")
+            round_trip(listener, "echo", "GET /echo/hi HTTP/1.1\r\nHost: h\r\n\r\n")
+            round_trip(listener, "absent", "GET /nope HTTP/1.1\r\nHost: h\r\n\r\n")
+            round_trip(listener, "head", "HEAD / HTTP/1.1\r\nHost: h\r\n\r\n")
+            round_trip(listener, "malformed", "nonsense")
+            net_close(listener)
+        }
+    }
+}
+
+fn main() / {io, net} {
+    if args().contains("serve") {
+        live()
+        return
+    }
+    print("-- the handler, without a socket")
+    offline("root", "GET / HTTP/1.1\r\nHost: h\r\n\r\n")
+    offline("echo", "GET /echo/hi HTTP/1.1\r\nHost: h\r\n\r\n")
+    offline("echo, non-ascii", "GET /echo/g%C3%BCnaydin HTTP/1.1\r\nHost: h\r\n\r\n")
+    offline("absent", "GET /nope HTTP/1.1\r\nHost: h\r\n\r\n")
+    offline("head", "HEAD / HTTP/1.1\r\nHost: h\r\n\r\n")
+    offline("malformed", "nonsense")
+    print("run with `-- serve` for the same handler over a real socket")
+}

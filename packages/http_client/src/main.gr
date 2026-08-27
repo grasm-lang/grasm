@@ -1,0 +1,162 @@
+// The dialling half.
+//
+// Building a request is text, and text is `http`'s work — so this package is
+// small on purpose: connect, write what `http` composed, read until the frame
+// the headers declared has arrived, close.
+//
+// `tcp_read` performs one read rather than looping to end of stream, which is
+// the right primitive and the wrong granularity for a client: a response
+// arrives in as many pieces as the network chose. So `fetch` reads until it
+// has the headers, then until it has the Content-Length those headers
+// declared, and stops. A server that closes without declaring a length ends
+// the body, which is the other framing HTTP allows.
+import http
+
+type Reply = {
+    status: i64,
+    reason: str,
+    headers: [Header],
+    body: str,
+    ok: bool,
+    why: str,
+}
+
+fn failed(why: str) -> Reply {
+    Reply{ status: 0, reason: "", headers: [], body: "", ok: false, why: why }
+}
+
+/// A request line, headers and body, ready for the wire.
+///
+/// `Host` is not optional in HTTP/1.1 and is not left to the caller to
+/// remember: a request without it is answered with 400 by anything modern.
+pub fn request(method: str, host: str, path: str, headers: [Header], body: str) -> str {
+    var out = "{method} {path} HTTP/1.1\r\n"
+    out = out + "Host: {host}\r\n"
+    var gave_length = false
+    for h in headers {
+        if h.name.to_lower() == "content-length" {
+            gave_length = true
+        }
+        out = out + "{h.name}: {h.value}\r\n"
+    }
+    if not gave_length and not body.is_empty() {
+        // Bytes, because that is the unit the other end counts in.
+        out = out + "Content-Length: {body.byte_len()}\r\n"
+    }
+    out = out + "Connection: close\r\n\r\n"
+    out + body
+}
+
+/// The status line and headers of a reply, without its body.
+pub fn parse_reply(raw: str) -> Reply {
+    let cut = raw.index_of("\r\n\r\n") ?? -1
+    if cut < 0 {
+        return failed("no blank line between headers and body")
+    }
+    let head = raw.substr(0, cut)
+    let body = raw.substr(cut + 4, raw.len() - cut - 4)
+    let lines = head.split("\r\n")
+    let start = lines[0].words()
+    if start.len() < 2 {
+        return failed("status line is not version, code, reason")
+    }
+    let code = start[1].parse_int() ?? -1
+    if code < 0 {
+        return failed("status code is not a number: {start[1]}")
+    }
+    var reason = ""
+    var w = 2
+    while w < start.len() {
+        if not reason.is_empty() {
+            reason = reason + " "
+        }
+        reason = reason + start[w]
+        w = w + 1
+    }
+    var headers: [Header] = []
+    var i = 1
+    while i < lines.len() {
+        let line = lines[i]
+        i = i + 1
+        if line.is_empty() {
+            continue
+        }
+        match line.index_of(":") {
+            Some(at) -> headers.push(Header{
+                name: line.substr(0, at).trim(),
+                value: line.substr(at + 1, line.len() - at - 1).trim(),
+            })
+            None -> return failed("header line without a colon: {line}")
+        }
+    }
+    Reply{
+        status: code, reason: reason, headers: headers,
+        body: body, ok: true, why: "",
+    }
+}
+
+/// A header of a reply, case-insensitively.
+pub fn reply_header(r: Reply, name: str) -> Option[str] {
+    let want = name.to_lower()
+    for h in r.headers {
+        if h.name.to_lower() == want {
+            return Some(h.value)
+        }
+    }
+    None
+}
+
+fn declared_length(r: Reply) -> i64 {
+    match reply_header(r, "content-length") {
+        Some(v) -> v.trim().parse_int() ?? -1
+        None -> -1
+    }
+}
+
+/// Send one request and read one reply.
+///
+/// Reads until the declared frame has arrived, or until the connection ends
+/// when no length was declared. A read that answers nothing twice in a row
+/// stops the loop rather than spinning: a peer that has stopped talking and
+/// has not closed is a peer this returns from, not one it waits on forever.
+pub fn fetch(host: str, port: i64, method: str, path: str,
+             headers: [Header], body: str) -> Reply ! IoError / {net} {
+    let conn = try tcp_connect(host, port)
+    try tcp_write(conn, request(method, host, path, headers, body))
+
+    var raw = ""
+    var quiet = 0
+    var reply = failed("no reply")
+    while quiet < 2 {
+        let piece = tcp_read(conn) ?? ""
+        if piece.is_empty() {
+            quiet = quiet + 1
+        } else {
+            quiet = 0
+            raw = raw + piece
+        }
+        if raw.contains("\r\n\r\n") {
+            reply = parse_reply(raw)
+            if not reply.ok {
+                net_close(conn)
+                return reply
+            }
+            let want = declared_length(reply)
+            if want >= 0 and reply.body.byte_len() >= want {
+                net_close(conn)
+                return reply
+            }
+        }
+    }
+    net_close(conn)
+    if raw.is_empty() {
+        return failed("the connection closed before anything arrived")
+    }
+    // No length was declared, so the close is the end of the body.
+    parse_reply(raw)
+}
+
+/// The common case: a GET with no headers of its own.
+pub fn get(host: str, port: i64, path: str) -> Reply ! IoError / {net} {
+    fetch(host, port, "GET", path, [], "")
+}

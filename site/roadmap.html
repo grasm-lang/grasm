@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Roadmap</title>
+<meta name="description" content="What is being built next, and what would have to be true to call it done.">
+<link rel="stylesheet" href="style.css">
+</head><body>
+<div class="frame">
+<nav class="rail">
+<a class="mark" href="index.html"><b>grasm</b><span>a systems language</span></a>
+<h2>Start</h2>
+<a href="start.html">Getting started</a>
+<a href="install.html">Install</a>
+<a href="playground.html">Playground</a>
+<h2>Learn</h2>
+<a href="tour.html">Tour</a>
+<a href="effects.html">Effects</a>
+<a href="tiers.html">Ownership</a>
+<a href="errors.html">Errors</a>
+<a href="concurrency.html">Concurrency</a>
+<h2>Reference</h2>
+<a href="language.html">Language</a>
+<a href="library.html">Library</a>
+<a href="packages.html">Packages</a>
+<a href="spec.html">Specification</a>
+<h2>More</h2>
+<a href="examples.html">Examples</a>
+<a href="status.html">Status</a>
+<a href="roadmap.html" aria-current="page">Roadmap</a>
+</nav>
+<main>
+
+<p class="eyebrow">More</p>
+<h1>Roadmap</h1>
+<p class="lede">Four workstreams toward a first release, running alongside the
+defect loop rather than instead of it.</p>
+
+<h2>1. This site</h2>
+<p>In progress — you are reading it. What remains: an in-page playground wired
+to the wasm build, and the tutorial and library reference rendered from
+<code>docs/</code> rather than summarised here.</p>
+
+<h2>2. Speed</h2>
+<p>0.45× native Rust today against a 0.95× target, computed by
+<code>scripts/bench.sh</code> from the numbers it prints. The costs worth
+attacking, in order: a box per node in tree-shaped data, binary size (328 KB
+against a 300 KB target), and the atomic reference count every boxed value
+carries because a <code>parallel</code> body may hold one.</p>
+
+<h2>3. Packages and libraries</h2>
+<p>The mechanism is built: manifests, resolution, lockfiles, path and local
+registry dependencies, and the capability ceiling. The first two libraries are
+written. What is missing is a remote registry and the rest of them.</p>
+<div class="scroll"><table>
+<tr><th>Library</th><th>State</th></tr>
+<tr><td><b>http</b> — server</td><td><b>Built.</b> <code>packages/http</code> parses and routes and declares no capability; <code>packages/http_server</code> owns the socket. Both in the corpus, both agreeing on three engines.</td></tr>
+<tr><td><b>http</b> — client</td><td><b>Built.</b> <code>packages/http_client</code>. Its demo talks to <code>http_server</code> over a real socket — a Grasm client and a Grasm server.</td></tr>
+<tr><td><b>json</b></td><td>Exists as <code>lib-json</code>; needs a stable API and publishing.</td></tr>
+<tr><td><b>async</b> — timers, channels, select</td><td>Not started. <code>parallel</code> and <code>spawn</code> are in the language; the library above them is not.</td></tr>
+<tr><td><b>testing</b>, <b>log</b>, <b>time</b>, <b>uuid</b>, <b>base64</b>, <b>regex</b></td><td>Not started.</td></tr>
+</table></div>
+<p>The comparison to hyper, axum, tokio, gin and fiber is a comparison against
+years of work by thousands of people. The honest target for a first release is
+one good HTTP library, one JSON library, one async library, and the packaging to
+publish them — so that the second and third can be written by somebody else.</p>
+
+<h2>4. Is the compiler ready</h2>
+<p>Yes, with the limits on the <a href="status.html">status page</a> stated
+rather than glossed. Four engines agree; the list of shapes the native backend
+cannot compile is one entry long and permanent.</p>
+
+<h2>The bar for calling it finished</h2>
+<p>Zero known defects, every gate green, and <em>two consecutive independent
+review rounds finding nothing new</em> — each conducted by someone who has seen
+only the language pack, not this repository's history. Those rounds have not
+run. Until they do, the claim is not available, and no number of green gates
+substitutes for it.</p>
+
+<footer>
+Grasm — three engines, one answer.
+<a href="status.html">Status</a> ·
+<a href="spec.html">Specification</a> ·
+<a href="roadmap.html">Roadmap</a>
+</footer>
+</main>
+</div>
+</body></html>

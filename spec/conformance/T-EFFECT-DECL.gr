@@ -8,6 +8,7 @@
 //! 3
 //! 42 9 0
 //! 8
+//! aliased: through a name
 // Declaring `Cfg` also declares the handler type `CfgHandler`, whose fields
 // are the operations.
 effect Cfg {
@@ -62,8 +63,22 @@ fn main() {
     with Cfg handled_by CfgHandler{ value: || scale * 2 } {
         print("{doubled()}")
     }
+
+    through(LogHandler{ info: |m| print("{m}"), warn: |m| print("W: {m}") })
 }
 
 fn doubled() -> i64 {
     Cfg.value()
+}
+
+// The handler type an `effect` declares is a type like any other, so an alias
+// may name it. Effects are collected after types, and aliases used to be
+// resolved in the pass that collected them, so this line was "unknown type
+// `LogHandler`" while a struct field naming the same type worked (F68).
+type Sink = LogHandler
+
+fn through(h: Sink) / {io, Log} {
+    with Log handled_by h {
+        Log.info("aliased: through a name")
+    }
 }

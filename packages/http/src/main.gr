@@ -1,0 +1,337 @@
+// HTTP, as a package that cannot open a socket.
+//
+// Everything here is text in and text out: parse a request, choose a route,
+// render a response. It reads no file, dials nothing, starts no process — so
+// its manifest declares no capability at all, and a program that depends on
+// it does not acquire one by doing so.
+//
+// That split is the reason this is two packages rather than one. In every
+// other language, taking a dependency on "the HTTP library" means taking a
+// dependency on something that can reach the network, and the only defence is
+// reading its source. Here the ceiling is checked: `http` is proved harmless
+// by the compiler, and `http_server`, which does own the socket, is a
+// separate name a consumer has to ask for.
+//
+// Content-Length is in **bytes**. `str.len()` counts characters, so a body
+// with one non-ASCII character in it frames short by however many extra bytes
+// that character takes, and a client reading exactly Content-Length bytes gets
+// a truncated body and a desynchronised connection. That bug is invisible to a
+// test whose bodies are all ASCII, and invisible again to a check that
+// measures the body the same wrong way.
+
+type Header = { name: str, value: str }
+
+type Request = {
+    method: str,
+    path: str,
+    query: str,
+    version: str,
+    headers: [Header],
+    body: str,
+    ok: bool,
+    why: str,
+}
+
+type Response = {
+    status: i64,
+    content_type: str,
+    headers: [Header],
+    body: str,
+}
+
+// ---------------------------------------------------------------- requests
+
+pub fn bad_request(why: str) -> Request {
+    Request{
+        method: "", path: "", query: "", version: "",
+        headers: [], body: "", ok: false, why: why,
+    }
+}
+
+/// A request as it arrives on the wire. Never fails: a malformed one comes
+/// back with `ok` false and `why` saying what was wrong, because a server that
+/// panics on bad input is a server anyone can stop.
+pub fn parse_request(raw: str) -> Request {
+    let cut = raw.index_of("\r\n\r\n") ?? -1
+    if cut < 0 {
+        return bad_request("no blank line between headers and body")
+    }
+    let head = raw.substr(0, cut)
+    let body = raw.substr(cut + 4, raw.len() - cut - 4)
+
+    let lines = head.split("\r\n")
+    if lines.len() == 0 {
+        return bad_request("empty request")
+    }
+    let start = lines[0].words()
+    if start.len() != 3 {
+        return bad_request("request line is not method, target, version")
+    }
+    let method = start[0]
+    let target = start[1]
+    let version = start[2]
+    if not version.starts_with("HTTP/") {
+        return bad_request("version is not HTTP/x.y")
+    }
+    if not target.starts_with("/") {
+        return bad_request("target is not an absolute path")
+    }
+
+    var path = target
+    var query = ""
+    match target.index_of("?") {
+        Some(at) -> {
+            path = target.substr(0, at)
+            query = target.substr(at + 1, target.len() - at - 1)
+        }
+        None -> {}
+    }
+
+    var headers: [Header] = []
+    var i = 1
+    while i < lines.len() {
+        let line = lines[i]
+        i = i + 1
+        if line.is_empty() {
+            continue
+        }
+        match line.index_of(":") {
+            Some(at) -> {
+                let name = line.substr(0, at).trim()
+                let value = line.substr(at + 1, line.len() - at - 1).trim()
+                if name.is_empty() {
+                    return bad_request("header with no name")
+                }
+                headers.push(Header{ name: name, value: value })
+            }
+            None -> {
+                return bad_request("header line without a colon: {line}")
+            }
+        }
+    }
+
+    Request{
+        method: method, path: percent_decode(path), query: query,
+        version: version, headers: headers, body: body, ok: true, why: "",
+    }
+}
+
+/// A header by name, case-insensitively, as HTTP requires.
+pub fn header(r: Request, name: str) -> Option[str] {
+    let want = name.to_lower()
+    for h in r.headers {
+        if h.name.to_lower() == want {
+            return Some(h.value)
+        }
+    }
+    None
+}
+
+/// One parameter out of a query string, percent-decoded.
+pub fn query_param(q: str, name: str) -> Option[str] {
+    for pair in q.split("&") {
+        if pair.is_empty() {
+            continue
+        }
+        match pair.index_of("=") {
+            Some(at) -> {
+                if percent_decode(pair.substr(0, at)) == name {
+                    return Some(percent_decode(
+                        pair.substr(at + 1, pair.len() - at - 1)))
+                }
+            }
+            None -> {
+                if percent_decode(pair) == name {
+                    return Some("")
+                }
+            }
+        }
+    }
+    None
+}
+
+fn hex_value(c: str) -> i64 {
+    let d = c.to_lower()
+    match d.parse_int_base(16) {
+        Some(v) -> v
+        None -> -1
+    }
+}
+
+/// `%20` and `+` back to what they stood for.
+///
+/// The decoding is done in **bytes**, not characters. A percent escape names
+/// one byte, and a non-ASCII character is several of them: `%C3%BC` is the two
+/// bytes of `\u00fc`, and turning each into its own character gives `\u00c3\u00bc`
+/// -- text that renders as mojibake and frames two bytes longer than it should.
+/// So the escapes are gathered as bytes and the text is decoded once, at the
+/// end, which is the only point at which a multi-byte character exists.
+///
+/// A `%` that is not followed by two hex digits is left alone rather than
+/// dropped, so nothing is silently lost from input somebody else chose.
+pub fn percent_decode(s: str) -> str {
+    if not s.contains("%") and not s.contains("+") {
+        return s
+    }
+    var out: [i64] = []
+    let cs = s.chars()
+    var i = 0
+    while i < cs.len() {
+        let c = cs[i]
+        if c == "+" {
+            out.push(32)
+            i = i + 1
+        } else if c == "%" and i + 2 < cs.len() {
+            let hi = hex_value(cs[i + 1])
+            let lo = hex_value(cs[i + 2])
+            if hi >= 0 and lo >= 0 {
+                out.push(hi * 16 + lo)
+                i = i + 3
+            } else {
+                for b in c.to_bytes().to_list() {
+                    out.push(b)
+                }
+                i = i + 1
+            }
+        } else {
+            for b in c.to_bytes().to_list() {
+                out.push(b)
+            }
+            i = i + 1
+        }
+    }
+    bytes_of(out).to_str()
+}
+
+/// Text that is about to sit inside HTML. Five characters, in this order:
+/// `&` first, or the replacements would themselves be escaped.
+pub fn escape_html(s: str) -> str {
+    s.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("\"", "&quot;")
+        .replace("'", "&#39;")
+}
+
+// ---------------------------------------------------------------- routing
+
+/// Does a pattern match a path? A segment written `:name` matches any one
+/// segment; `*` at the end matches the rest. Everything else is literal.
+pub fn path_matches(pattern: str, path: str) -> bool {
+    let ps = pattern.split("/")
+    let qs = path.split("/")
+    var i = 0
+    while i < ps.len() {
+        if ps[i] == "*" {
+            return true
+        }
+        if i >= qs.len() {
+            return false
+        }
+        if not ps[i].starts_with(":") and ps[i] != qs[i] {
+            return false
+        }
+        i = i + 1
+    }
+    ps.len() == qs.len()
+}
+
+/// The value a `:name` segment matched, or `None` if the pattern has no such
+/// segment or does not match at all.
+pub fn path_param(pattern: str, path: str, name: str) -> Option[str] {
+    if not path_matches(pattern, path) {
+        return None
+    }
+    let ps = pattern.split("/")
+    let qs = path.split("/")
+    var i = 0
+    while i < ps.len() and i < qs.len() {
+        if ps[i] == ":" + name {
+            return Some(qs[i])
+        }
+        i = i + 1
+    }
+    None
+}
+
+// ---------------------------------------------------------------- responses
+
+pub fn reason_for(status: i64) -> str {
+    match status {
+        200 -> "OK"
+        201 -> "Created"
+        204 -> "No Content"
+        301 -> "Moved Permanently"
+        302 -> "Found"
+        304 -> "Not Modified"
+        400 -> "Bad Request"
+        401 -> "Unauthorized"
+        403 -> "Forbidden"
+        404 -> "Not Found"
+        405 -> "Method Not Allowed"
+        409 -> "Conflict"
+        413 -> "Payload Too Large"
+        415 -> "Unsupported Media Type"
+        429 -> "Too Many Requests"
+        500 -> "Internal Server Error"
+        501 -> "Not Implemented"
+        503 -> "Service Unavailable"
+        _ -> "Unknown"
+    }
+}
+
+pub fn respond(status: i64, content_type: str, body: str) -> Response {
+    Response{ status: status, content_type: content_type, headers: [], body: body }
+}
+
+pub fn text(body: str) -> Response {
+    respond(200, "text/plain; charset=utf-8", body)
+}
+
+pub fn html(body: str) -> Response {
+    respond(200, "text/html; charset=utf-8", body)
+}
+
+pub fn json(body: str) -> Response {
+    respond(200, "application/json", body)
+}
+
+pub fn not_found() -> Response {
+    respond(404, "text/plain; charset=utf-8", "not found\n")
+}
+
+pub fn method_not_allowed(allowed: str) -> Response {
+    with_header(respond(405, "text/plain; charset=utf-8", "method not allowed\n"),
+                "Allow", allowed)
+}
+
+pub fn with_header(r: Response, name: str, value: str) -> Response {
+    var hs = r.headers
+    hs.push(Header{ name: name, value: value })
+    Response{ status: r.status, content_type: r.content_type, headers: hs, body: r.body }
+}
+
+/// The response as bytes on the wire.
+///
+/// Content-Length is `byte_len`, not `len`. The two agree for ASCII and part
+/// company the moment a body carries anything else, and the frame is measured
+/// in bytes because that is what the client counts.
+pub fn render(r: Response) -> str {
+    var out = "HTTP/1.1 {r.status} {reason_for(r.status)}\r\n"
+    out = out + "Content-Type: {r.content_type}\r\n"
+    out = out + "Content-Length: {r.body.byte_len()}\r\n"
+    for h in r.headers {
+        out = out + "{h.name}: {h.value}\r\n"
+    }
+    out = out + "Connection: close\r\n\r\n"
+    out + r.body
+}
+
+/// A HEAD response: the headers a GET would have sent, and no body.
+pub fn head_of(r: Response) -> str {
+    let full = render(r)
+    match full.index_of("\r\n\r\n") {
+        Some(at) -> full.substr(0, at + 4)
+        None -> full
+    }
+}

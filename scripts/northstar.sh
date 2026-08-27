@@ -13,6 +13,7 @@
 # how a metric quietly stops being collected.
 set -uo pipefail
 cd "$(dirname "$0")/.."
+. scripts/lib/corpus.sh
 
 GRASM=${GRASM:-./target/release/grasm}
 . "$(dirname "$0")/lib/fresh.sh"
@@ -178,7 +179,7 @@ echo
 # that were typed by hand and had drifted — 218 programs where the gates say
 # 221, 31 whole programs where there are 44. A number that has to be kept in
 # step with a directory listing will not be.
-corpus_n=$(find examples projects spec/conformance benchmarks/grasm -name "*.gr" | wc -l | tr -d " ")
+corpus_n=$(corpus_programs | wc -l | tr -d " ")
 echo "\`.gr\` files in the corpus:                  $corpus_n  (not all are whole programs)"
 echo "conformance programs:                     $(ls spec/conformance/*.gr | wc -l | tr -d ' ')"
 echo "ProjectGold whole programs:               $(ls -d ProjectGold/[0-9]* | wc -l | tr -d ' ')"

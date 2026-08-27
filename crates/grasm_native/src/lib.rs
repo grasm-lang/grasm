@@ -899,11 +899,7 @@ impl<'m> Codegen<'m> {
                     }
                     // `Pair[i64, str]` — a member of a generic family, named
                     // for its arguments and registered on demand.
-                    if !args.is_empty()
-                        && self
-                            .generic_types
-                            .contains_key(&format!("{}::{}", self.current_module, n))
-                    {
+                    if !args.is_empty() && self.generic_types.contains_key(n) {
                         let mut ats = Vec::with_capacity(args.len());
                         for a in args {
                             ats.push(self.vtype_of(a)?);
@@ -1126,7 +1122,15 @@ impl<'m> Codegen<'m> {
                     // Kept, not refused. A generic type has no layout until a
                     // use site says what its parameters are, exactly as a
                     // generic function has no symbol until a call site does.
-                    let gkey = format!("{}::{}", self.current_module, t.name.name);
+                    // Keyed by the bare name, like `structs` and `sums` two
+                    // arms below, because types share one namespace across the
+                    // program ([T-MODULE-NS]) and the checker refuses a
+                    // duplicate wherever it is declared. Keying a *type* the
+                    // way a *function* is keyed — by module — meant a generic
+                    // declared in one module and named in another was looked
+                    // up under a key nothing had written, and the backend
+                    // refused a program the checker had accepted (F71).
+                    let gkey = t.name.name.clone();
                     if let TypeBody::Sum(variants) = &t.body {
                         for v in variants {
                             self.generic_variant_owner
@@ -1248,7 +1252,8 @@ impl<'m> Codegen<'m> {
         args: &[VType],
         span: Span,
     ) -> CResult<String> {
-        let generic_key = format!("{module}::{name}");
+        let _ = module;
+        let generic_key = name.to_string();
         let Some(decl) = self.generic_types.get(&generic_key).cloned() else {
             return nope(span, format!("the type `{name}` here"));
         };
@@ -9344,7 +9349,7 @@ checker did",
             for (gkey, decl) in &self.cg.generic_types {
                 if let TypeBody::Sum(variants) = &decl.body {
                     if variants.iter().any(|v| v.name.name == id.name) {
-                        let base = gkey.rsplit("::").next().unwrap_or(gkey);
+                        let base = gkey.as_str();
                         return nope(
                             id.span,
                             format!(
@@ -9810,7 +9815,7 @@ annotate the binding",
         fields: &[(Ident, Expr)],
         span: Span,
     ) -> CResult<Option<String>> {
-        let gkey = format!("{}::{}", self.cg.current_module, sname);
+        let gkey = sname.to_string();
         if !self.cg.generic_types.contains_key(&gkey) {
             return Ok(None);
         }

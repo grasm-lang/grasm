@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Getting started</title>
+<meta name="description" content="Write, run and compile your first Grasm program.">
+<link rel="stylesheet" href="style.css">
+</head><body>
+<div class="frame">
+<nav class="rail">
+<a class="mark" href="index.html"><b>grasm</b><span>a systems language</span></a>
+<h2>Start</h2>
+<a href="start.html" aria-current="page">Getting started</a>
+<a href="install.html">Install</a>
+<a href="playground.html">Playground</a>
+<h2>Learn</h2>
+<a href="tour.html">Tour</a>
+<a href="effects.html">Effects</a>
+<a href="tiers.html">Ownership</a>
+<a href="errors.html">Errors</a>
+<a href="concurrency.html">Concurrency</a>
+<h2>Reference</h2>
+<a href="language.html">Language</a>
+<a href="library.html">Library</a>
+<a href="packages.html">Packages</a>
+<a href="spec.html">Specification</a>
+<h2>More</h2>
+<a href="examples.html">Examples</a>
+<a href="status.html">Status</a>
+<a href="roadmap.html">Roadmap</a>
+</nav>
+<main>
+
+<p class="eyebrow">Start</p>
+<h1>Getting started</h1>
+<p class="lede">A first program, run three ways, in about two minutes.</p>
+
+<h2>1. Write it</h2>
+<p>Put this in <code>hello.gr</code>.</p><pre><code>fn main() {
+    print("hello from grasm")
+}</code></pre>
+<p><code>main</code> needs no effect row: it is the entry point, and the
+capability to print is granted there. Every other function that prints must say
+so.</p>
+
+<h2>2. Run it</h2><pre><code>grasm run hello.gr</code></pre>
+<p>That is the interpreter, and it is normative: where the engines could ever
+disagree, it is the one that is right by definition.</p>
+
+<h2>3. Compile it</h2><pre><code>grasm build hello.gr --native -o hello
+./hello</code></pre>
+<p>Ahead-of-time through Cranelift. Byte-for-byte the same stdout, the same exit
+code. Drop <code>--native</code> and you get a bundle instead — the interpreter
+with your program attached, one file, no toolchain needed to run it.</p>
+
+<h2>4. Something that can fail</h2>
+<p>Failure is a value, not an exception. A function that can fail says so in its
+type, and a caller that ignores it does not compile.</p><pre><code>type MathError = | DivByZero
+
+fn safe_div(a: i64, b: i64) -&gt; i64 ! MathError {
+    if b == 0 {
+        fail(DivByZero)
+    }
+    a / b
+}
+
+fn main() {
+    match safe_div(10, 0) {
+        Ok(v) -&gt; print("{v}")
+        Err(e) -&gt; print("caught: {e}")
+    }
+
+    // or take a default and move on
+    print("{safe_div(10, 0) ?? 0 - 1}")
+}
+
+test "division works" {
+    let v = try safe_div(10, 2)
+    assert_eq(v, 5)
+}</code></pre>
+<p>Tests live beside the code and run with <code>grasm test</code>.</p>
+
+<h2>Next</h2>
+<div class="grid two">
+  <div class="cell"><h4><a href="tour.html">A tour of the language</a></h4>
+  <p>Types, pattern matching, closures, generics — the whole surface in one
+  read.</p></div>
+  <div class="cell"><h4><a href="effects.html">Effects and capabilities</a></h4>
+  <p>The part that is unlike other languages, and the reason to use this
+  one.</p></div>
+</div>
+
+<footer>
+Grasm — three engines, one answer.
+<a href="status.html">Status</a> ·
+<a href="spec.html">Specification</a> ·
+<a href="roadmap.html">Roadmap</a>
+</footer>
+</main>
+</div>
+</body></html>

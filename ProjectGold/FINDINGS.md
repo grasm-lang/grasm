@@ -83,6 +83,10 @@ and the entries disagree.
 | [F65](#f65) | a literal under construction was abandoned by an early exit | S2, leak | **fixed** |
 | [F66](#f66) | nothing checked the oracle | S3, harness | **fixed** |
 | [F67](#f67) | a closure could not read through a `ref` it captured | S3, over-strict | **fixed** |
+| [F68](#f68) | a type alias could not name a type from another module | S3, checker | **fixed** |
+| [F69](#f69) | percent decoding read one byte at a time, and the expected output recorded the result | S1, program | **fixed** |
+| [F70](#f70) | Content-Length was counted in characters, and the check that would have caught it counted the body the same way | S1, program | **fixed** |
+| [F71](#f71) | a generic type declared in one module could not be compiled in another | S2, backend | **fixed** |
 
 <!-- end index -->
 ## F1 — a wrapped condition must end the line with the operator (S4) — **fixed**
@@ -2988,3 +2992,153 @@ the machine imposes, clauses about the program *stopping* — a law ends in
 `fuzz_panics.py` is for — and clauses needing two files or a C library,
 which is more than one program and a law is one. Sixty-two of the 233
 clauses on those grounds, 123 in scope, 123 covered.
+
+## F68 — a type alias could not name a type from another module (S3, checker) — **fixed**
+
+```
+import a
+type Twice = fn(Thing) -> i64        // unknown type `Thing`
+fn double(t: Thing) -> i64 { ... }   // the same name, two lines below, fine
+```
+
+[T-MODULE-NS] says types share one namespace across the program, and the
+compiler says so twice over: `pub` on a type is refused with the words
+"every type is already reachable from every module". A parameter, a return
+type, a `let` annotation, a list element and a struct field all resolve a
+name from any module. An alias did not.
+
+`collect_types` did two jobs in one pass — register this module's type
+names, then resolve this module's aliases — and the driver called it once
+per file. So an alias could only see what its own module had registered by
+then. Whatever the file order, some alias is resolved before some module is
+collected, and in a two-package program that alias is in the library.
+
+The same pass ordering had a second victim, the one already recorded in the
+code four lines up: `effect E` declares the type `EHandler`, and effects are
+collected *after* types, so `type Sink = LogHandler` was unknown for the
+same reason a struct field naming one used to be.
+
+Alias resolution is now its own pass over the whole program, after every
+module's names and every effect's handler type are registered. The fixpoint
+inside it stays, for the reason it was written: an alias may name a later
+alias, which no ordering of modules fixes.
+
+Found by writing `packages/http_server`, whose handler type is
+`type Handler = fn(Request) -> Response / {io}` and whose `Request` comes
+from `packages/http`. It is the first library in this repository to import
+another one.
+
+Moving the pass broke one check that was reading the table it filled: an
+effect may not collide with a type of the same name, and that test asked
+`self.aliases`, which is now empty when effects are collected. It asks the
+*name* set instead — filled in the pass that collected the declaration,
+which is the pass it has to agree with. `cargo test` caught it, which is
+the argument for a unit test that names a rule rather than a program that
+happens to exercise it.
+
+**Gate**: `scripts/fuzz_modules.py`, the first generator that builds a
+program of more than one file: every position a name from another module
+can stand in — parameter, return, annotation, list element, map value,
+tuple component, option payload, struct field, sum payload, four kinds of
+alias, generic argument, closure capture, `ref`, handler — crossed with
+how far away the declaring module is, each a whole package tree built and
+run three ways against an exact answer. A second round checks the ceiling
+in both directions. `packages/http_server` and its demo are in the corpus
+too, and the handler-alias shape is a case in
+`spec/conformance/T-EFFECT-DECL.gr`.
+
+## F69 — percent decoding read one byte at a time, and the expected output recorded the result (S1, program) — **fixed**
+
+```
+"caf%C3%A9" -> "cafÃ©"
+```
+
+A percent escape names one **byte**. A character outside ASCII is several of
+them, so `%C3%A9` is one `é` and not two characters. `ProjectGold/21`
+decoded each escape with `to_char`, which turns a *code point* into a
+character — so every non-ASCII value came out as the two or three characters
+whose code points happen to equal its bytes.
+
+The program had `caf%C3%A9` in its test list from the day it was written.
+`expected.txt` recorded `cafÃ©`, all three engines agreed on it, and the
+gate was green on a wrong answer for as long as the program existed.
+
+That is the limit of a recorded expectation, stated plainly: it makes the
+implementation's answer the definition of the right answer. `fuzz_laws.py`
+exists because the same argument applies to the interpreter; nothing yet
+applies it to a ProjectGold program's `expected.txt`.
+
+Fixed by gathering the escapes as bytes and decoding the text once, at the
+end — the only point at which a multi-byte character exists. `bytes_of(…)
+.to_str()` is lossy, as `tcp_read` is, so `%C3` alone comes back as U+FFFD
+rather than as nothing.
+
+**Gate**: three more cases in the program — a three-byte character, a
+four-byte one, and two invalid sequences — and the same decoding in
+`packages/http`, which the corpus builds three ways.
+
+## F70 — Content-Length was counted in characters, and the check that would have caught it counted the body the same way (S1, program) — **fixed**
+
+```
+Content-Length: {body.len()}        // characters
+let actual = body_of(resp).len()    // the check, in characters too
+```
+
+`str.len()` counts characters; a frame on the wire is counted in bytes.
+Every ASCII body makes those the same number, and every body in the test
+list was ASCII, so the declared length was right by accident on every input
+the program had.
+
+The program has a framing check for exactly this — it compares the declared
+length against the body it rendered. It measured the body in characters,
+which is the same wrong way, so it agreed with the bug it exists to catch.
+
+Both are now `byte_len`, and a request with a non-ASCII body was added.
+Breaking each half separately shows the difference:
+
+| mutation | what the check says |
+|---|---|
+| length in characters, check in bytes | `framed=false` — caught |
+| length in characters, check in characters | `framed=true` — silent |
+
+A check that measures its subject the way the subject measures itself is not
+a check. This is the third finding with that shape: F29's bounds test never
+reached the boundary, F52's probe knew less than the lowering.
+
+**Gate**: `check` measures in bytes, and `ProjectGold/21` now sends a
+non-ASCII body. `packages/http` frames in `byte_len` by construction and its
+demo prints the declared and sent lengths side by side.
+
+## F71 — a generic type declared in one module could not be compiled in another (S2, backend) — **fixed**
+
+```
+// far/src/main.gr
+type Box[T] = { held: T }
+pub fn boxed(n: i64) -> Box[i64] { ... }
+
+// app/src/main.gr
+let b: Box[i64] = far.boxed(21)
+```
+
+`native backend does not yet support the type `Box``. The interpreter and a
+bundle both answered 42. The identical program written in one file compiled
+natively and ran.
+
+A generic family was registered under `format!("{}::{}", current_module,
+name)` — the key a *function* gets, because functions are per module and are
+called as `far.boxed`. A type is not: [T-MODULE-NS] says types share one
+namespace across the program, the checker refuses a duplicate type name
+wherever the second one is declared, and the two arms directly below the
+registration key an ordinary struct and an ordinary sum by their bare name.
+So a generic declared in one module and named in another was looked up under
+a key nothing had written, and the backend refused a program the checker had
+accepted.
+
+Fourth finding with this shape: the backend re-derived a rule the checker
+already knew, and derived it differently.
+
+Not on §11's gap list, and so not a documented limitation — no gate built a
+program of more than one file, so nothing could have put it there.
+
+**Gate**: `scripts/fuzz_modules.py`. Restoring the module-keyed registration
+turns all 58 of its programs from passing to refused.

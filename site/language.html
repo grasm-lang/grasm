@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Language reference</title>
+<meta name="description" content="Syntax and type-system reference.">
+<link rel="stylesheet" href="style.css">
+</head><body>
+<div class="frame">
+<nav class="rail">
+<a class="mark" href="index.html"><b>grasm</b><span>a systems language</span></a>
+<h2>Start</h2>
+<a href="start.html">Getting started</a>
+<a href="install.html">Install</a>
+<a href="playground.html">Playground</a>
+<h2>Learn</h2>
+<a href="tour.html">Tour</a>
+<a href="effects.html">Effects</a>
+<a href="tiers.html">Ownership</a>
+<a href="errors.html">Errors</a>
+<a href="concurrency.html">Concurrency</a>
+<h2>Reference</h2>
+<a href="language.html" aria-current="page">Language</a>
+<a href="library.html">Library</a>
+<a href="packages.html">Packages</a>
+<a href="spec.html">Specification</a>
+<h2>More</h2>
+<a href="examples.html">Examples</a>
+<a href="status.html">Status</a>
+<a href="roadmap.html">Roadmap</a>
+</nav>
+<main>
+
+<p class="eyebrow">Reference</p>
+<h1>Language reference</h1>
+<p class="lede">The normative text is <code>spec/</code>. This is the working
+summary.</p>
+
+<h2>Declarations</h2>
+<div class="scroll"><table>
+<tr><th>Form</th><th>Means</th></tr>
+<tr><td><code>fn name(args) -&gt; T ! E / {row}</code></td><td>A function. Return, failure and effects are all part of the type.</td></tr>
+<tr><td><code>type N = { f: T }</code></td><td>A struct.</td></tr>
+<tr><td><code>type N = | A | B(v: T)</code></td><td>A sum, with or without payloads.</td></tr>
+<tr><td><code>type N[T] = …</code></td><td>A generic type: a family, one member per use.</td></tr>
+<tr><td><code>type N = T</code></td><td>An alias.</td></tr>
+<tr><td><code>effect N { fn op() -&gt; T }</code></td><td>An effect and its operations.</td></tr>
+<tr><td><code>import path</code></td><td>Brings a module in.</td></tr>
+<tr><td><code>pub</code></td><td>Exports a declaration from its module.</td></tr>
+<tr><td><code>extern fn c_name(...)</code></td><td>A C function. Calling it performs <code>unsafe</code>.</td></tr>
+<tr><td><code>test "name" { }</code></td><td>A test, beside the code.</td></tr>
+<tr><td><code>bench "name" { }</code></td><td>A benchmark.</td></tr>
+</table></div>
+
+<h2>Operators</h2>
+<div class="scroll"><table>
+<tr><th>Operator</th><th>On</th></tr>
+<tr><td><code>+ - * / %</code></td><td><code>i64</code> and <code>f64</code>. <code>+</code> also concatenates a <code>str</code> or a list.</td></tr>
+<tr><td><code>^</code></td><td>Exponentiation — not bitwise xor. A negative integer exponent panics; write it in floats.</td></tr>
+<tr><td><code>== !=</code></td><td>Any two values of one type, structurally.</td></tr>
+<tr><td><code>&lt; &lt;= &gt; &gt;=</code></td><td><code>i64</code>, <code>f64</code>, <code>str</code>, and tuples whose every component is ordered.</td></tr>
+<tr><td><code>and or not</code></td><td>Booleans. <code>and</code> and <code>or</code> short-circuit.</td></tr>
+<tr><td><code>??</code></td><td>Opens an <code>Option</code> or a fallible with a default. The right side is lazy.</td></tr>
+<tr><td><code>|&gt;</code></td><td>Pipes a value into a call.</td></tr>
+<tr><td><code>..</code> <code>..=</code></td><td>A range, exclusive or inclusive.</td></tr>
+</table></div>
+
+<h2>Strings</h2>
+<p>Interpolation is <code>"{expr}"</code>, and the expression inside needs no
+escaping for its own quotes. <code>len()</code> counts characters;
+<code>byte_len()</code> counts bytes.</p>
+
+<h2>Where the truth is</h2>
+<p>233 numbered clauses across <code>spec/</code>, each with a conformance
+program that runs in the test suite. <a href="spec.html">More on the
+specification.</a></p>
+
+<footer>
+Grasm — three engines, one answer.
+<a href="status.html">Status</a> ·
+<a href="spec.html">Specification</a> ·
+<a href="roadmap.html">Roadmap</a>
+</footer>
+</main>
+</div>
+</body></html>
