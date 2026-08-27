@@ -7,9 +7,10 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
 
 ### Fixed
 
-- `scripts/fuzz_laws.py` checks fifty laws against arithmetic rather than
-  against a second engine — the first gate that can see a wrong answer the
-  interpreter and a bundle share (F66).
+- `scripts/fuzz_laws.py` checks ninety-five laws against arithmetic rather
+  than against a second engine — the first gate that can see a wrong answer
+  the interpreter and a bundle share. It covers every method
+  `spec/library.md` names, and fails by name when one has no law (F66).
 - A list, map, tuple or struct literal is released when an element or
   field leaves the function: `[1, if c { return 1 } else { 2 }]` kept the
   partly built value (F65).

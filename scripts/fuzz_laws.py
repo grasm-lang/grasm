@@ -130,8 +130,70 @@ LAWS = {
  "par_map matches map":        'let xs = [1, 2, 3]\n    say(xs.par_map(|v| v * 2) == xs.map(|v| v * 2))',
  "fail is caught once":        'say((fails() ?? 0 - 1) == 0 - 1)',
  "ok passes through":          'say((works() ?? 0 - 1) == 4)',
+ "bit and or xor":             'let a = 12\n    let b = 10\n    say(a.bit_and(b) == 8 and a.bit_or(b) == 14 and a.bit_xor(b) == 6)',
+ "bit not is complement":      'say((0).bit_not() == 0 - 1 and (0 - 1).bit_not() == 0)',
+ "shifts scale by two":        'say((1).shl(3) == 8 and (8).shr(3) == 1)',
+ "ushr fills with zero":       'say((0 - 1).ushr(63) == 1)',
+ "xor is its own inverse":     'let a = 12\n    let k = 10\n    say(a.bit_xor(k).bit_xor(k) == a)',
+ "as_f64 then as_i64":         'say((7).as_f64() == 7.0 and (7.9).as_i64() == 7)',
+ "sqrt of a square":           'say((9.0).sqrt() == 3.0)',
+ "floor and ceil bracket":     'let x = 2.5\n    say(x.floor() == 2.0 and x.ceil() == 3.0)',
+ "cbrt of a cube":             'say((27.0).cbrt() == 3.0)',
+ "exp and ln invert":          'let x = 2.0\n    say((x.exp().ln() - x).abs() < 0.000001)',
+ "log2 of a power":            'say((8.0).log2() == 3.0)',
+ "log with a base":            'say(((81.0).log(3.0) - 4.0).abs() < 0.000001)',
+ "sin of zero":                'say((0.0).sin() == 0.0 and (0.0).asin() == 0.0)',
+ "sinh of zero":               'say((0.0).sinh() == 0.0)',
+ "atan2 quarter turn":         'let q = (1.0).atan2(0.0)\n    say((q - (90.0).to_radians()).abs() < 0.000001)',
+ "cmp orders":                 'say((1).cmp(2) < 0 and (2).cmp(1) > 0 and (2).cmp(2) == 0)',
+ "to_base renders":            'say((255).to_base(16) == "ff" and (5).to_base(2) == "101")',
+ "is_nan is false for a number": 'say((1.0).is_nan() == false and (1.0).is_finite())',
+ "byte_len counts bytes":      'say("abc".byte_len() == 3)',
+ "code_at and codes agree":    'let s = "abc"\n    say(s.code_at(0) == s.codes()[0])',
+ "to_char inverts code_at":    'let s = "abc"\n    say(s.code_at(1).to_char() == "b")',
+ "contains and index_of":      'let s = "hello"\n    say(s.contains("ll") and (s.index_of("ll") ?? 0 - 1) == 2)',
+ "index_of misses":            'say("hello".index_of("zz") == None)',
+ "lines splits on newline":    'say("a\\nb".lines().len() == 2)',
+ "words splits on spaces":     'say("a b  c".words().len() == 3)',
+ "pad_start reaches width":    'let p = "7".pad_start(3, "0")\n    say(p == "007" and p.len() == 3)',
+ "replace replaces all":       'say("aXbXc".replace("X", "-") == "a-b-c")',
+ "trim_start leaves the end":  'say("  x  ".trim_start() == "x  ")',
+ "parse_float round trips":    'say(((2.5).to_str().parse_float() ?? 0.0) == 2.5)',
+ "parse_int_base reads hex":   'say(("ff".parse_int_base(16) ?? 0) == 255)',
+ "concat joins bytes":         'let a = bytes_of([1])\n    let b = bytes_of([2])\n    say(a.concat(b).len() == 2 and a.concat(b).at(1) == 2)',
+ "slice takes a window":       'let b = bytes_of([1, 2, 3])\n    say(b.slice(1, 2).to_list() == [2, 3])',
+ "at reads in order":          'let b = bytes_of([7, 8])\n    say(b.at(0) == 7 and b.at(1) == 8)',
+ "first is the head":          'let xs = [4, 5, 6]\n    say((xs.first() ?? 0) == 4 and (xs.last() ?? 0) == 6)',
+ "first of empty is none":     'let xs: [i64] = []\n    say(xs.first() == None and xs.is_empty())',
+ "enumerate pairs positions":  'let e = [7, 8].enumerate()\n    say(e.len() == 2 and e[1].0 == 1 and e[1].1 == 8)',
+ "zip pairs elementwise":      'let z = [1, 2].zip(["a", "b"])\n    say(z.len() == 2 and z[0].1 == "a")',
+ "zip stops at the shorter":   'say([1, 2, 3].zip(["a"]).len() == 1)',
+ "any and all agree":          'let xs = [2, 4]\n    say(xs.all(|v| v % 2 == 0) and xs.any(|v| v == 4) and xs.any(|v| v == 9) == false)',
+ "find locates":               'say(([1, 2, 3].find(|v| v > 1) ?? 0) == 2)',
+ "sort_by reverses order":     'var xs = [1, 3, 2]\n    xs.sort_by(|v| 0 - v)\n    say(xs[0] == 3 and xs[2] == 1)',
+ "par_filter matches filter":  'let xs = [1, 2, 3, 4]\n    say(xs.par_filter(|v| v % 2 == 0) == xs.filter(|v| v % 2 == 0))',
+ "entries match keys":         'var m: Map[str, i64] = map()\n    m.set("a", 1)\n    say(m.entries().len() == 1 and m.has("a") and m.is_empty() == false)',
+ "expect gives the payload":   'say(Some(3).expect("there") == 3 and Some(3).is_none() == false)',
+ "unwrap_or on none":          'let o: Option[i64] = None\n    say(o.unwrap_or(9) == 9 and Some(1).unwrap_or(9) == 1)',
  "keys and values align":      'var m: Map[str, i64] = map()\n    m.set("a", 1)\n    m.set("b", 2)\n    say(m.keys().len() == m.values().len() and m.keys().len() == m.len())',
 }
+
+
+def uncovered():
+    """Library methods with no law.
+
+    Generated from `spec/library.md` rather than typed here, because a
+    hand-kept list drifts: the specification names the surface, and a method
+    added there without a law would otherwise be a hole nobody sees. The
+    coverage is the point of this file -- a differential cannot vouch for any
+    of these, so the only check they get is the one below.
+    """
+    import re
+
+    spec = open(os.path.join(ROOT, "spec", "library.md")).read()
+    named = sorted(set(re.findall(r"^\| `[a-z]+\.([a-z_0-9]+)\(", spec, re.M)))
+    body = "\n".join(LAWS.values())
+    return [m for m in named if not re.search(r"\." + re.escape(m) + r"\(", body)]
 
 
 def run(cmd, timeout=180):
@@ -143,6 +205,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--keep", action="store_true")
     args = ap.parse_args()
+
+    gaps = uncovered()
+    if gaps:
+        print("library methods with no law -- every one is a wrong answer that")
+        print("no differential here could see:")
+        for m in gaps:
+            print(f"  .{m}()")
+        sys.exit(1)
 
     work = tempfile.mkdtemp(prefix="grasm_fuzz_laws_")
     path = os.path.join(work, "p.gr")
@@ -177,7 +247,10 @@ def main():
                 print(f"LEAKS {name}: {held}")
         for r in rejected:
             print(f"  NOT A LAW (the program does not run): {r}")
-        print(f"laws: {checked}   broken: {len(broken)}   not run: {len(rejected)}")
+        print(
+            f"laws: {checked}   broken: {len(broken)}   not run: {len(rejected)}"
+            f"   library methods uncovered: 0"
+        )
     finally:
         if args.keep:
             print(f"kept: {work}")

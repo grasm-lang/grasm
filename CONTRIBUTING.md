@@ -71,6 +71,13 @@ python3 scripts/fuzz_panics.py           # every way a program fails, from every
 python3 scripts/fuzz_exits.py            # every way out of every block that owns something
 python3 scripts/fuzz_laws.py             # laws the answer obeys, checked against arithmetic
 
+`fuzz_laws.py` is the only gate here that does not compare two engines. A
+bundle *is* the interpreter with the program attached, and the interpreter is
+what every differential is measured against, so a wrong answer they share is
+invisible to all the others. It checks against arithmetic instead, over every
+method `spec/library.md` names — and a method added there without a law fails
+it by name.
+
 Every generator runs the programs it invents a second time under
 `GRASM_LEAK_CHECK=1`, through the one definition in `scripts/lib/leaks.py`. A
 miscounted reference produces exactly the right output while holding an

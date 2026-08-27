@@ -2912,3 +2912,21 @@ Mutation-tested from both directions: removing the interpreter's
 off-by-one in the compiled runtime's list read breaks five laws in
 `['native']`. `difftest` catches the second and is blind to neither —
 but it is the *first* that no gate here could see before.
+
+**Widened to the whole library, and the coverage is checked rather than
+claimed.** Fifty laws covered 29 of the 81 methods `spec/library.md`
+names. Ninety-five cover all 81: bit operations and their inverses,
+every numeric function against a value it has a known answer for,
+`code_at` against `codes` and `to_char`, `zip` stopping at the shorter
+list, `enumerate`'s positions, `par_filter` against `filter`.
+
+The list of methods is generated from the specification at run time, not
+typed into the file, and a method with no law fails the gate by name.
+That is the part that lasts: a method added to `spec/library.md` without
+a law is a wrong answer no differential here can see, and now it cannot
+arrive quietly. Deleting one law makes the gate exit 1 naming
+`.bit_and()` and `.bit_or()`.
+
+Breaking `bit_xor` in the interpreter is caught by both the law that
+pins the answer and the one that states the symmetry — which is the
+arrangement the `rev` lesson asked for.
