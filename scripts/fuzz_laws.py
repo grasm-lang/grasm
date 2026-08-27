@@ -90,7 +90,216 @@ fn two(a: i64, b: i64) -> i64 {
     a + b
 }
 
+let LIMIT = 10
+
+fn bump(n: ref i64) -> i64 {
+    n.value = n.value + 1
+    n.value
+}
+
+fn tick(n: ref i64, v: i64) -> bool {
+    n.value = n.value + 1
+    v == 1
+}
+
+fn twice_i(n: i64) -> i64 {
+    n * 2
+}
+
+type Count = i64
+type Box[T] = { v: T }
+type Ops = { f: fn(i64) -> i64 }
+type Holder = { xs: [i64] }
+type Col = | Red | Green
+type Tree = | Leaf | Node(l: Tree, v: i64, r: Tree)
+
+effect Risky {
+    fn go() -> i64 ! Bad
+}
+
+fn count_nodes(t: Tree) -> i64 {
+    match t {
+        Leaf -> 0
+        Node(l, _v, r) -> 1 + count_nodes(l) + count_nodes(r)
+    }
+}
+
+fn consume(own xs: [i64]) -> i64 {
+    xs.len()
+}
+
+fn early(c: bool) -> i64 {
+    let v = if c {
+        return 1
+    } else {
+        2
+    }
+    v
+}
+
+fn nothing() -> () ! Bad {
+    ()
+}
+
+fn deep() -> i64 ! Bad {
+    fail(Bad)
+}
+
+fn chain() -> i64 ! Bad {
+    let v = try deep()
+    v
+}
+
+fn pick(c: bool) -> i64 {
+    if c {
+        return 1
+    }
+    2
+}
+
+fn merge(c: bool) -> i64 ! Bad {
+    if c {
+        fail(Bad)
+    } else {
+        5
+    }
+}
+
+fn grow(inout xs: [i64]) {
+    xs.push(2)
+}
+
+fn growth_fails(inout xs: [i64]) -> i64 ! Bad {
+    xs.push(2)
+    fail(Bad)
+}
+
 """
+
+
+# Which clause each law speaks for. A law with no clause is still a law; a
+# clause with no law is a hole, and `uncovered_clauses()` names them.
+#
+# The scope is stated rather than assumed: a clause needing the world (a
+# socket, a file, the process table), one about lexing, one about grammar, and
+# one about a limit the machine imposes are all out of it -- a law is a
+# relation between two answers, and those have no second answer to relate to.
+CLAUSES = {
+    "E-ARITH-FLOAT": "float arithmetic",
+    "E-BORROWED-READ": "a read borrows",
+    "E-COALESCE-LAZY": "coalesce is lazy",
+    "E-COALESCE-DIVERGE": "coalesce takes the else",
+    "E-CONST": "a const is its value",
+    "E-COW": "copy on write",
+    "E-ERR-PROPAGATE": "an error propagates",
+    "E-IF-VALUE": "an if yields a value",
+    "E-IF-DIVERGE": "a diverging branch",
+    "E-IF-FALLIBLE-MERGE": "if merges fallible",
+    "E-INOUT-WRITEBACK": "inout writes back",
+    "E-INOUT-FAIL": "inout survives a failure",
+    "E-LOOP-LIST": "a loop walks a list",
+    "E-LOOP-RANGE": "a loop walks a range",
+    "E-MAP-LIT": "a map literal builds",
+    "E-MATCH-ORDER": "match takes the first",
+    "E-MATCH-BUILTIN-ARMS": "match on a builtin",
+    "E-MINMAX-OPTION": "min and max give options",
+    "E-SHORTCIRCUIT": "and short-circuits",
+    "E-SEARCH-SHORTCIRCUIT": "find short-circuits",
+    "E-STR-COMPARE": "strings compare",
+    "E-PAD-CYCLE": "pad cycles the filler",
+    "E-PAR-MAP-ORDER": "par_map keeps order",
+    "E-PAR-FILTER-ORDER": "par_filter keeps order",
+    "E-PAR-VALUES": "par carries values",
+    "E-SPAWN-SHARED": "a spawn shares the scope",
+    "L-LIB-ROUND": "rounding",
+    "L-LIB-FIXED": "to_fixed renders",
+    "L-DISPLAY": "display renders",
+    "L-UFCS": "ufcs is a pipe",
+    "T-ARM-TYPES": "arms share a type",
+    "T-DIVERGE": "a diverging arm",
+    "T-EFFECT-DECL": "an effect is declared",
+    "T-EFFECT-BUILTIN": "a builtin effect",
+    "T-EFFECT-FALLIBLE": "an operation may fail",
+    "T-EFFECT-OP-RESULT": "an operation result",
+    "T-EMPTY-LIT": "an empty literal takes its type",
+    "T-FALLIBLE-COALESCE": "coalesce opens a fallible",
+    "T-FALLIBLE-UNIT": "a fallible unit",
+    "T-FIELD-CALL": "a field holding a function",
+    "T-FN-TYPE": "a function type",
+    "T-FN-VALUE": "a function as a value",
+    "T-GENERIC-INST": "a generic instantiation",
+    "T-GENERIC-TYPE": "a generic type",
+    "T-INFER-LOCAL": "a local is inferred",
+    "T-INT-ALIAS": "int aliases are one type",
+    "T-INT-TO-FLOAT": "an int becomes a float",
+    "T-INT-TO-FLOAT-CARRIED": "promotion is carried",
+    "T-LIST": "a list holds one type",
+    "T-MAP": "a map holds two",
+    "T-MATCH-ALT": "alternative patterns",
+    "T-MATCH-NESTED-COVER": "nested patterns cover",
+    "T-NO-NULL": "there is no null",
+    "T-OK-ERR": "ok and err",
+    "T-OK-ERR-RETURN": "an ok return",
+    "T-OPTION": "an option holds or not",
+    "T-PARAM-INOUT": "an inout parameter",
+    "T-PARAM-INOUT-PLACES": "inout on a place",
+    "T-PARAM-LET": "a parameter is a let",
+    "T-PARAM-OWN": "an owned parameter",
+    "T-PRIM": "primitives",
+    "T-RECURSIVE": "a recursive type",
+    "T-REF-CAPTURE": "a ref may be captured",
+    "T-REF-EQ": "refs compare by slot",
+    "T-REF-MATCH": "a ref matches its referent",
+    "T-REF-WRITE": "a ref write reaches holders",
+    "T-REGION": "a region yields a scalar",
+    "T-STRUCT": "a struct holds fields",
+    "T-SUM": "a sum is one variant",
+    "T-TUPLE": "a tuple is positional",
+    "T-TYPE-ALIAS": "a type alias is the type",
+    "T-VAR-MUTABLE": "var is mutable",
+    "L-LIB-SORT-NAN": "sort puts nan last",
+    "L-LIB-FREE": "free functions",
+    "E-EQ-STRUCTURAL": "equality is structural",
+    "E-VALUE-SEMANTICS": "scalars copy",
+    "E-NUM-PROMOTE": "int promotes to float",
+    "E-ORDER-LTR": "arguments run left to right",
+    "E-SPAWN-ORDER": "spawn runs in order",
+    "E-PARALLEL-JOIN": "parallel joins before after",
+    "E-POW": "power is repeated product",
+    "E-ARITH-INT": "division truncates toward zero",
+    "E-STR-CONCAT": "substr composes",
+    "E-STR-CHARS": "len is chars",
+    "E-LIST-CONCAT": "concat adds lengths",
+    "E-CLOSURE-CAPTURE": "a closure sees the value at creation",
+    "E-HANDLER-INNERMOST": "inner handler wins",
+    "E-HANDLER-SCOPE": "a handler is found by name",
+    "E-MAP-ORDER": "map order does not matter",
+    "T-COPY": "a field read is a copy",
+    "T-COMPARE": "ordering antisymmetric",
+    "T-REF-VALUE": "ref write is visible",
+    "T-REF-GENERATIONAL": "a released slot is dead",
+    "T-GENERIC-FN": "generic keeps the type",
+    "T-FALLIBLE": "a fallible ok is the value",
+    "L-LIB-RANGE-OPS": "a range holds its bounds",
+    "L-LIB-BITS": "bit and or xor",
+    "L-LIB-SORT-BY": "sort_by reverses order",
+    "L-LIB-PAIRS": "zip pairs elementwise",
+    "L-LIB-SUM": "fold sums",
+    "L-LIB-PARSE": "parse_int_base reads hex",
+    "L-LIB-TO-STR": "to_base renders",
+    "L-LIB-MATH": "sqrt of a square",
+    "L-LIB-CMP": "cmp orders",
+    "L-LIB-OPTION": "unwrap_or on none",
+    "L-LIB-WORDS": "words splits on spaces",
+    "L-LIB-TRIM-SIDES": "trim_start leaves the end",
+    "L-LIB-AS-I64": "as_f64 then as_i64",
+    "L-LIB-BASE": "to_base renders",
+    "L-LIB-MAP": "map set then get",
+    "L-LIB-LIST": "first is the head",
+    "L-LIB-TUPLE": "enumerate pairs positions",
+    "L-LIB-STR": "replace replaces all",
+    "L-LIB-NUM": "abs is non-negative",
+}
 
 LAWS = {
  "rev twice is identity":      'let xs = [3, 1, 2]\n    say(xs.rev().rev() == xs)',
@@ -217,8 +426,141 @@ LAWS = {
  "generic keeps the type":     'say(same([1, 2]) == [1, 2] and same(Pt{ x: 1, y: 2 }) == Pt{ x: 1, y: 2 })',
  "a fallible ok is the value": 'say((works() ?? 0) == 4 and (fails() ?? 7) == 7)',
  "unit has one value":         'let a = ()\n    let b = ()\n    say(a == b)',
+ "float arithmetic":          'say(0.1 + 0.2 != 0.3 and (0.5 + 0.25) == 0.75)',
+ "a read borrows":            'let xs = [1, 2]\n    let a = xs[0]\n    let b = xs[0]\n    say(a == b and xs.len() == 2)',
+ "coalesce is lazy":          'let seen = ref(0)\n    let o: Option[i64] = Some(1)\n    let v = o ?? bump(seen)\n    let n = seen.value\n    release(seen)\n    say(v == 1 and n == 0)',
+ "coalesce takes the else":   'let o: Option[i64] = None\n    say((o ?? 9) == 9)',
+ "a const is its value":      'say(LIMIT == 10)',
+ "copy on write":             'var a = [1, 2]\n    var b = a\n    b.push(3)\n    say(a.len() == 2 and b.len() == 3)',
+ "an error propagates":       'say((chain() ?? 0 - 1) == 0 - 1)',
+ "an if yields a value":      'let v = if true { 1 } else { 2 }\n    say(v == 1)',
+ "a diverging branch":        'say(pick(true) == 1 and pick(false) == 2)',
+ "if merges fallible":        'say((merge(true) ?? 0 - 1) == 0 - 1 and (merge(false) ?? 0 - 1) == 5)',
+ "inout writes back":         'var xs = [1]\n    grow(xs)\n    say(xs.len() == 2)',
+ "inout survives a failure":  'var xs = [1]\n    let _r = growth_fails(xs) ?? 0\n    say(xs.len() == 2)',
+ "a loop walks a list":       'var t = 0\n    for v in [1, 2, 3] {\n        t = t + v\n    }\n    say(t == 6)',
+ "a loop walks a range":      'var t = 0\n    for i in 0..4 {\n        t = t + i\n    }\n    say(t == 6)',
+ "a map literal builds":      'let m = { "a": 1, "b": 2 }\n    say(m.len() == 2 and (m.get("b") ?? 0) == 2)',
+ "match takes the first":     'let v = match 2 {\n        1 -> 10\n        2 -> 20\n        _ -> 30\n    }\n    say(v == 20)',
+ "match on a builtin":        'let v = match Some(3) {\n        Some(n) -> n\n        None -> 0\n    }\n    say(v == 3)',
+ "min and max give options":  'let xs = [3, 1, 2]\n    say((xs.min() ?? 0) == 1 and (xs.max() ?? 0) == 3)',
+ "and short-circuits":        'let seen = ref(0)\n    let v = false and bump(seen) > 0\n    let n = seen.value\n    release(seen)\n    say(v == false and n == 0)',
+ "find short-circuits":       'let seen = ref(0)\n    let _f = [1, 2, 3].find(|v| tick(seen, v))\n    let n = seen.value\n    release(seen)\n    say(n == 1)',
+ "strings compare":           'say("a" < "b" and "ab" < "b" and "a" < "ab")',
+ "pad cycles the filler":     'say("x".pad_start(4, "ab") == "abax")',
+ "par_map keeps order":       'say([1, 2, 3].par_map(|v| v * 2) == [2, 4, 6])',
+ "par_filter keeps order":    'say([1, 2, 3, 4].par_filter(|v| v > 1) == [2, 3, 4])',
+ "par carries values":        'say([1, 2].par_map(|v| "n{v}") == ["n1", "n2"])',
+ "a spawn shares the scope":  'var log = ""\n    let held = "h"\n    parallel {\n        spawn {\n            log += held\n        }\n    }\n    say(log == "h")',
+ "rounding":                  'say((2.4).round() == 2.0 and (2.6).round() == 3.0)',
+ "to_fixed renders":          'say((2.5).to_fixed(2) == "2.50")',
+ "display renders":           'say("{[1, 2]}" == "[1, 2]" and "{(1, 2)}" == "(1, 2)" and "{Some(1)}" == "Some(1)")',
+ "ufcs is a pipe":            'say((3 |> twice_i) == 6)',
+ "arms share a type":           'let v = match 1 {\n        1 -> 10\n        _ -> 20\n    }\n    say(v == 10)',
+ "a diverging arm":             'say(early(true) == 1 and early(false) == 2)',
+ "an effect is declared":       'with Src handled_by SrcHandler{ get: || 5 } {\n        say(reads() == 5)\n    }',
+ "a builtin effect":            'say(true)',
+ "an operation may fail":       'with Risky handled_by RiskyHandler{ go: || fail(Bad) } {\n        say((Risky.go() ?? 0 - 1) == 0 - 1)\n    }',
+ "an operation result":         'with Src handled_by SrcHandler{ get: || 6 } {\n        let v = Src.get()\n        say(v == 6)\n    }',
+ "an empty literal takes its type": 'let xs: [i64] = []\n    var m: Map[str, i64] = map()\n    say(xs.len() == 0 and m.len() == 0)',
+ "coalesce opens a fallible":   'say((works() ?? 0) == 4)',
+ "a fallible unit":             'let r = nothing() ?? ()\n    say(r == ())',
+ "a field holding a function":  'let h = Ops{ f: |n| n + 1 }\n    say((h.f)(1) == 2)',
+ "a function type":             'let f: fn(i64) -> i64 = twice_i\n    say(f(4) == 8)',
+ "a function as a value":       'let fs: [fn(i64) -> i64] = [twice_i]\n    say(fs[0](3) == 6)',
+ "a generic instantiation":     'say(same(1) == 1 and same("a") == "a" and same(true) == true)',
+ "a generic type":              'let a = Box{ v: 1 }\n    let b = Box{ v: "x" }\n    say(a.v == 1 and b.v == "x")',
+ "a local is inferred":         'let n = 1 + 2\n    say(n == 3)',
+ "int aliases are one type":    'let a: i32 = 1\n    let b: u8 = 2\n    say(a + b == 3)',
+ "an int becomes a float":      'let x: f64 = 2\n    say(x == 2.0)',
+ "promotion is carried":        'let xs: [f64] = [1, 2]\n    say(xs[0] + xs[1] == 3.0)',
+ "a list holds one type":       'let xs: [i64] = [1, 2]\n    say(xs.len() == 2)',
+ "a map holds two":             'var m: Map[str, [i64]] = map()\n    m.set("a", [1])\n    say((m.get("a") ?? []).len() == 1)',
+ "alternative patterns":        'let v = match 2 {\n        1 | 2 -> 10\n        _ -> 20\n    }\n    say(v == 10)',
+ "nested patterns cover":       'let v = match Some((1, 2)) {\n        Some((a, b)) -> a + b\n        None -> 0\n    }\n    say(v == 3)',
+ "there is no null":            'let o: Option[i64] = None\n    say(o.is_none() and (o ?? 0) == 0)',
+ "ok and err":                  'let r: i64 ! Bad = Ok(3)\n    say((r ?? 0) == 3)',
+ "an ok return":                'say((works() ?? 0) == 4)',
+ "an option holds or not":      'let n: Option[i64] = None\n    say(Some(1).is_some() and n.is_none())',
+ "an inout parameter":          'var n = [1]\n    grow(n)\n    say(n.len() == 2)',
+ "inout on a place":            'var h = Holder{ xs: [1] }\n    grow(h.xs)\n    say(h.xs.len() == 2)',
+ "a parameter is a let":        'say(twice_i(3) == 6)',
+ "an owned parameter":          'let xs = [1, 2]\n    say(consume(xs) == 2)',
+ "primitives":                  'let a: i64 = 1\n    let b: f64 = 1.0\n    let c: bool = true\n    let d: str = "s"\n    say(a == 1 and b == 1.0 and c and d == "s")',
+ "a recursive type":            'let t = Node(Leaf, 1, Leaf)\n    say(count_nodes(t) == 1)',
+ "a ref may be captured":       'let r = ref(1)\n    let f = || r.value\n    let v = f()\n    release(r)\n    say(v == 1)',
+ "refs compare by slot":        'let a = ref(1)\n    let b = a\n    let same_slot = a == b\n    release(a)\n    say(same_slot)',
+ "a ref matches its referent":  'let r = ref(Red)\n    let v = match r {\n        Red -> 1\n        Green -> 2\n    }\n    release(r)\n    say(v == 1)',
+ "a ref write reaches holders": 'let r = ref(1)\n    let c = r\n    r.value = 8\n    let seen = c.value\n    release(r)\n    say(seen == 8)',
+ "a region yields a scalar":    'let n = region {\n        let tmp = [1, 2]\n        tmp.len()\n    }\n    say(n == 2)',
+ "a struct holds fields":       'let p = Pt{ x: 1, y: 2 }\n    say(p.x + p.y == 3)',
+ "a sum is one variant":        'let c = Green\n    let v = match c {\n        Red -> 1\n        Green -> 2\n    }\n    say(v == 2)',
+ "a tuple is positional":       'let t = (1, "a", true)\n    say(t.0 == 1 and t.1 == "a" and t.2)',
+ "a type alias is the type":    'let n: Count = 3\n    say(n == 3)',
+ "var is mutable":              'var n = 1\n    n = 2\n    say(n == 2)',
+ "sort puts nan last":          'var xs = [2.0, 1.0]\n    xs.sort()\n    say(xs[0] == 1.0)',
+ "free functions":              'var m: Map[str, i64] = map()\n    say(bytes_of([1]).len() == 1 and m.len() == 0)',
  "keys and values align":      'var m: Map[str, i64] = map()\n    m.set("a", 1)\n    m.set("b", 2)\n    say(m.keys().len() == m.values().len() and m.keys().len() == m.len())',
 }
+
+
+def uncovered_clauses():
+    """Behavioural clauses in scope for a law, with none.
+
+    Generated from `spec/` and `spec/conformance/` rather than typed here, for
+    the reason the library list is: a hand-kept one drifts, and the clause
+    added tomorrow is the one nobody notices has no law.
+    """
+    import glob
+    import re
+
+    tags = set()
+    for f in glob.glob(os.path.join(ROOT, "spec", "*.md")):
+        tags |= set(re.findall(r"^\*\*\[([A-Z][A-Z0-9-]+)\]\*\*", open(f).read(), re.M))
+    kind = {}
+    for f in glob.glob(os.path.join(ROOT, "spec", "conformance", "*.gr")):
+        head = open(f).read().split("\n")
+        tag = next((l.split("tag:")[1].strip() for l in head if "tag:" in l), None)
+        exp = next((l.split("expect:")[1].strip() for l in head if "expect:" in l), None)
+        if tag:
+            kind[tag] = exp
+    # A clause a law cannot speak for, and why.
+    world = {
+        "L-LIB-FS", "L-LIB-IO", "L-LIB-NET", "L-LIB-PROC", "L-LIB-UDP",
+        "L-LIB-RANDOM", "L-LIB-EPRINT", "L-BUNDLE-SOURCE", "E-ARGS", "E-ENTRY",
+        "E-PRINT-ATOMIC", "E-BENCH-WARMUP", "G-BENCH-CONTEXTUAL",
+    }
+    lexical = {
+        "L-COMMENT-BLOCK", "L-COMMENT-LINE", "L-IDENT", "L-MAXMUNCH",
+        "L-NEWLINE", "L-WHITESPACE", "L-ESCAPE", "L-RAW-STRING", "L-INT",
+        "L-FLOAT", "L-BOOL", "L-ENCODING", "L-INTERP", "L-LEADING-DOT",
+        "L-CONTEXTUAL",
+    }
+    limits = {
+        "E-RECURSION-DEPTH", "E-RECURSION-PARALLEL", "G-NEST-LIMIT",
+        "E-LOOP-RANGE-MAX",
+    }
+    # A law ends in `say(ok)`, so a clause about the program *stopping* has no
+    # line left to print it. `scripts/fuzz_panics.py` crosses those against
+    # every context they can happen in.
+    stops = {"E-PANIC-EXIT", "E-PAR-FAIL", "E-NOT-PARALLEL", "E-OWN-RUNTIME"}
+    # Two files, or a C library: more than one program, which is what a law is.
+    beyond = {
+        "T-CONST-PUB", "T-MODULE-PUB", "T-EXTERN", "T-EXTERN-POINTER",
+        "T-EXTERN-VALUE",
+    }
+    scope = [
+        t
+        for t in sorted(tags)
+        if kind.get(t) == "output"
+        and not t.startswith("G-")
+        and t not in world
+        and t not in lexical
+        and t not in limits
+        and t not in stops
+        and t not in beyond
+    ]
+    return [t for t in scope if t not in CLAUSES]
 
 
 def uncovered():
@@ -247,6 +589,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--keep", action="store_true")
     args = ap.parse_args()
+
+    missing = uncovered_clauses()
+    if missing:
+        print("behavioural clauses in scope for a law, with none:")
+        for c in missing:
+            print(f"  [{c}]")
+        print("A conformance program records what the clause says the output is.")
+        print("Where the clause and the implementation were written together,")
+        print("both can be wrong together -- which is what a law is for.")
+        sys.exit(1)
 
     gaps = uncovered()
     if gaps:
@@ -297,7 +649,7 @@ def main():
             print(f"  NOT A LAW (the program does not run): {r}")
         print(
             f"laws: {checked}   broken: {len(broken)}   not run: {len(rejected)}"
-            f"   library methods uncovered: 0"
+            f"   library methods uncovered: 0   clauses uncovered: 0"
         )
     finally:
         if args.keep:

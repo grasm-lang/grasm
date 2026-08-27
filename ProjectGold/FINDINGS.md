@@ -82,6 +82,7 @@ and the entries disagree.
 | [F64](#f64) | a `parallel` block's task list was kept by every early exit | S2, leak | **fixed** |
 | [F65](#f65) | a literal under construction was abandoned by an early exit | S2, leak | **fixed** |
 | [F66](#f66) | nothing checked the oracle | S3, harness | **fixed** |
+| [F67](#f67) | a closure could not read through a `ref` it captured | S3, over-strict | **fixed** |
 
 <!-- end index -->
 ## F1 — a wrapped condition must end the line with the operator (S4) — **fixed**
@@ -2951,3 +2952,39 @@ was checked directly rather than by mutating the compiler: asserting the
 *opposite* order fails in both engines, so the order really is observed.
 Two mutations aimed at argument evaluation missed the site that plain
 calls take, which is why the direct check is the one recorded.
+
+## F67 — a closure could not read through a `ref` it captured (S3, over-strict) — **fixed**
+
+```
+let r = ref(1)
+let f = || r.value
+```
+
+`native backend does not yet support reading `.value` through a `ref
+i64``. The same read outside a closure compiled, and [T-REF-CAPTURE] is
+the clause that says a reference may be captured at all.
+
+`probe_type`'s field arm knew that reading a field *through* a reference
+is an ordinary field read — its comment says so, and says the probe was
+taught that because `let f = |_u| r.v` had been refused for a type it
+could work out. It was taught the struct case only. `.value` is the
+referent itself where it has no fields of its own ([T-REF-VALUE]), which
+is the same rule F48 put into the checker and F53 into the probe for a
+range. Third time the probe has known less than the lowering about the
+same accessor.
+
+Found by writing a law for every behavioural clause in the
+specification: [T-REF-CAPTURE]'s law would not compile.
+
+**Gate**: `scripts/fuzz_laws.py` grew from 119 laws to 193, one for every
+clause in scope, and both its coverage checks now *fail* rather than
+report. A clause with no law is named and exits 1; so is a library method
+with no law.
+
+The scope is stated rather than assumed. Out of it: clauses needing the
+world (a socket, a file, the process table), lexing and grammar, limits
+the machine imposes, clauses about the program *stopping* — a law ends in
+`say(ok)` and a panic leaves no line to print it, which is what
+`fuzz_panics.py` is for — and clauses needing two files or a C library,
+which is more than one program and a law is one. Sixty-two of the 233
+clauses on those grounds, 123 in scope, 123 covered.

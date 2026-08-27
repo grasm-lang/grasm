@@ -11061,6 +11061,18 @@ annotate the binding",
                         VType::Struct(sname) => {
                             self.struct_field_type(&sname, &name.name, *span)?
                         }
+                        // `.value` is the referent itself where it has no
+                        // fields of its own ([T-REF-VALUE]). The struct case
+                        // was taught to the probe and this one was not, so a
+                        // closure capturing a `ref i64` and reading `.value`
+                        // -- which [T-REF-CAPTURE] is about -- was refused,
+                        // while the same read outside a closure compiled
+                        // (F67).
+                        other if name.name == "value"
+                            && !matches!(other, VType::Tuple(_)) =>
+                        {
+                            other
+                        }
                         other => {
                             return nope(
                                 *span,

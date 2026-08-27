@@ -119,7 +119,9 @@ plain block or an `unsafe` block that was left early, whose following
 statement was emitted past the terminator (F63); and a `parallel` block's
 task list, kept by every early exit, whose statement had the same fault
 (F64); and a list, map, tuple or struct literal under construction,
-abandoned when an element or field left the function (F65).
+abandoned when an element or field left the function (F65); and reading
+`.value` through a captured `ref`, which [T-REF-CAPTURE] is the clause for
+(F67).
 
 ## S4 — diagnostics
 
