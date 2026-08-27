@@ -78,6 +78,7 @@ and the entries disagree.
 | [F60](#f60) | a `with` never said its body had left | S1, codegen bug | **fixed** |
 | [F61](#f61) | `break` and `continue` left the handler installed too | S1, wrong answer | **fixed** |
 | [F62](#f62) | a handler's captures were kept by every early exit | S2, leak | **fixed** |
+| [F63](#f63) | a block that left was reported as an ordinary statement | S1, codegen bug | **fixed** |
 
 <!-- end index -->
 ## F1 — a wrapped condition must end the line with the operator (S4) — **fixed**
@@ -2758,3 +2759,44 @@ known to be the wrong one.
 across each way out. Removing the release makes `leakcheck.sh` exit 1
 naming that program. The generators do not catch it — `fuzz_handlers`
 builds no early exit — which is why the corpus program carries it.
+
+## F63 — a block that left was reported as an ordinary statement (S1, codegen bug) — **fixed**
+
+```
+for _i in 0..3 {
+    region {
+        break
+    }
+    n = n + 1
+}
+```
+
+`a terminator instruction was encountered before the end of block2`. The
+`n = n + 1` was emitted after the `break`, because `region` — like a plain
+block and an `unsafe` block — evaluated its body, saw it had terminated,
+and returned "no value" rather than "left". The statement walker cannot
+tell those apart, so it carried on into a block already closed.
+
+F60 was this for `with`, and the fix there was per-construct. This one is
+not: the guard belongs on `Stmt::Expr`, which is what every block-shaped
+expression is a statement through, and it is the same guard `return` has
+carried since F46. `region`, `{ … }` and `unsafe { … }` are covered by
+one line rather than three.
+
+**Gate**: `scripts/fuzz_exits.py`, the thirteenth generator, and the one
+this whole run of findings was missing. All twelve others build programs
+that fall out of their blocks normally, which is why F59, F60, F61 and
+F62 were found by hand and none by a gate. It crosses eight block shapes
+that own something — `with` as a literal, as a value, and nested, a
+`region`, a plain block, an `unsafe` block, an `if` branch, a `match` arm
+— with five ways out, holding a boxed value while it leaves. Thirty-eight
+programs; the two the checker refuses are `[T-REGION]`'s own rules.
+
+Mutation-tested against all three of the fixes it covers: removing F63's
+guard gives eight declines, F62's capture release twelve leaks, F61's
+`break` pop three.
+
+One template fault, the same one F58 found: a block performs what its
+contents perform, and `unsafe { … }` performs `unsafe`. Written without
+that row the checker refused every program in that block and five quietly
+did not run.

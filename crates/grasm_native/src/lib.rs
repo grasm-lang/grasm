@@ -5096,6 +5096,17 @@ impl FnCx<'_, '_> {
                     }
                     _ => self.eval_expr(e)?,
                 };
+                // The expression may have left the block: `region { break }`,
+                // `{ return 1 }`, `unsafe { fail(e) }`. Each reported an
+                // ordinary value producing nothing, so the statement walker
+                // carried on and wrote the next one into a block already
+                // closed -- "a terminator instruction was encountered before
+                // the end of block2", a verifier error the backend reported
+                // against itself (F63). The same guard `return` carries since
+                // F46.
+                if self.is_filled() || self.dead {
+                    return Ok(StmtOut::Terminated);
+                }
                 if is_last {
                     Ok(StmtOut::Value(v))
                 } else {

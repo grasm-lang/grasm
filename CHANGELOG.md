@@ -7,6 +7,9 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
 
 ### Fixed
 
+- `break` out of a `region`, `return` out of a plain block, `fail` out of
+  an `unsafe` block: each left the following statement emitted after the
+  terminator, which Cranelift refused (F63).
 - A handler's captures are released when a `fail`, `return`, `break` or
   `continue` leaves its `with` block. Each kept one allocation per boxed
   capture (F62).
