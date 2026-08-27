@@ -1,0 +1,141 @@
+// The `fs` package.
+//
+// It builds a tree under the system's temporary directory, walks it, globs
+// it, copies it and removes it. Only *relative* paths are printed, so three
+// engines agree byte for byte on a machine whose temporary directory is
+// somewhere else.
+import fs
+import path
+
+fn under(root: str, p: str) -> str {
+    path.relative_to(root, p) ?? p
+}
+
+fn show(label: str, root: str, paths: [str]) {
+    var rel: [str] = []
+    for p in paths {
+        rel.push(under(root, p))
+    }
+    print("  {label}: {rel}")
+}
+
+fn build(root: str) -> () ! IoError / {io} {
+    try make_dir(path.join(root, "src"))
+    try make_dir(path.join(root, "src/deep"))
+    try make_dir(path.join(root, "docs"))
+    try write_file(path.join(root, "README.md"), "# a tree\n")
+    try write_file(path.join(root, "src/main.gr"), "fn main() \{}\n")
+    try write_file(path.join(root, "src/util.gr"), "// helper\n")
+    try write_file(path.join(root, "src/deep/inner.gr"), "// deeper\n")
+    try write_file(path.join(root, "docs/guide.md"), "one\ntwo\nthree\n")
+}
+
+fn main() / {io} {
+    let base = env("TMPDIR") ?? "/tmp"
+    let root = path.join(base, "grasm_fs_demo")
+    // A previous run that ended badly would otherwise change what this one
+    // finds, and a demo three engines must agree on cannot depend on that.
+    match fs.remove_tree(root) {
+        Ok(_n) -> {}
+        Err(_e) -> {}
+    }
+
+    match build(root) {
+        Err(e) -> {
+            print("could not build the tree: {e}")
+            return
+        }
+        Ok(_u) -> {}
+    }
+
+    print("-- walking")
+    match fs.walk(root, 0 - 1) {
+        Err(e) -> print("  failed: {e}")
+        Ok(files) -> show("every file", root, files)
+    }
+    match fs.walk(root, 0) {
+        Err(e) -> print("  failed: {e}")
+        Ok(files) -> show("depth 0", root, files)
+    }
+    match fs.walk(root, 1) {
+        Err(e) -> print("  failed: {e}")
+        Ok(files) -> show("depth 1", root, files)
+    }
+    match fs.walk_dirs(root, 0 - 1) {
+        Err(e) -> print("  failed: {e}")
+        Ok(dirs) -> show("directories", root, dirs)
+    }
+
+    print("-- entries of one directory")
+    match fs.entries(path.join(root, "src")) {
+        Err(e) -> print("  failed: {e}")
+        Ok(es) -> {
+            for e in es {
+                print("  {under(root, e.path).pad_end(16, " ")} dir={e.is_dir}")
+            }
+        }
+    }
+
+    print("-- globbing")
+    for pattern in ["*.md", "src/*.gr", "src/**", "*/*.gr", "src/deep/*", "?.gr", "[du]*"] {
+        match fs.glob(root, pattern) {
+            Err(e) -> print("  {pattern}: failed")
+            Ok(hits) -> show(pattern, root, hits)
+        }
+    }
+
+    print("-- the glob matcher on its own")
+    for pair in [("*.gr", "main.gr"), ("*.gr", "src/main.gr"), ("*/*.gr", "src/main.gr"),
+                 ("?.gr", "a.gr"), ("?.gr", "ab.gr"), ("[abc]*", "b1"), ("[^abc]*", "b1"),
+                 ("a*b*c", "axxbyyc"), ("*a*a*a*a*b", "aaaaaaaaaaaaaaaaaaaaaaaaX")] {
+        print("  \"{pair.0}\" ~ \"{pair.1}\" -> {fs.matches_glob(pair.0, pair.1)}")
+    }
+
+    print("-- lines")
+    match fs.read_lines(path.join(root, "docs/guide.md")) {
+        Err(e) -> print("  failed: {e}")
+        Ok(lines) -> print("  guide.md: {lines}")
+    }
+    match fs.write_lines(path.join(root, "docs/list.txt"), ["a", "b", "c"]) {
+        Err(e) -> print("  failed: {e}")
+        Ok(_u) -> print("  wrote list.txt")
+    }
+    match fs.append(path.join(root, "docs/list.txt"), "d\n") {
+        Err(e) -> print("  failed: {e}")
+        Ok(_u) -> {}
+    }
+    match fs.read_lines(path.join(root, "docs/list.txt")) {
+        Err(e) -> print("  failed: {e}")
+        Ok(lines) -> print("  after appending: {lines}")
+    }
+
+    print("-- copying a tree")
+    let copy = path.join(base, "grasm_fs_demo_copy")
+    match fs.remove_tree(copy) {
+        Ok(_n) -> {}
+        Err(_e) -> {}
+    }
+    match fs.copy_tree(root, copy) {
+        Err(e) -> print("  failed: {e}")
+        Ok(n) -> print("  copied {n} file(s)")
+    }
+    match fs.walk(copy, 0 - 1) {
+        Err(e) -> print("  failed: {e}")
+        Ok(files) -> show("in the copy", copy, files)
+    }
+
+    print("-- a path nothing is using")
+    let free = fs.unused_path(root, "scratch-", 1)
+    print("  {under(root, free)}")
+
+    print("-- removing")
+    match fs.remove_tree(root) {
+        Err(e) -> print("  failed: {e}")
+        Ok(n) -> print("  removed {n} file(s) from the tree")
+    }
+    match fs.remove_tree(copy) {
+        Err(e) -> print("  failed: {e}")
+        Ok(n) -> print("  removed {n} from the copy")
+    }
+    print("  the tree is gone: {not fs.exists(path.join(root, "README.md"))}")
+}

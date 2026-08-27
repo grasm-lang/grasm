@@ -807,8 +807,10 @@ grasm deps --locked   # fail rather than update the lockfile
 <tr><td><code>resilience</code></td><td><i>none</i></td><td>Backoff with full jitter, circuit breaker, token bucket, deadlines — the clock is a parameter.</td></tr>
 <tr><td><code>cache</code></td><td><i>none</i></td><td><code>Cache[V]</code>, least-recently-used with an expiry.</td></tr>
 <tr><td><code>crypto_hash</code></td><td><i>none</i></td><td>SHA-256, HMAC-SHA-256, PBKDF2, constant-time compare — every digest checked against FIPS 180-4, RFC 4231 and RFC 6070.</td></tr>
+<tr><td><code>regex</code></td><td><i>none</i></td><td>A Thompson machine, so matching is linear in the input for every pattern — <code>(a+)+b</code> against thirty <code>a</code>s returns at once.</td></tr>
+<tr><td><code>fs</code></td><td><code>io</code></td><td>Walk, glob, copy, temporary paths. The arithmetic half is <code>path</code>, which declares nothing.</td></tr>
 </table></div>
-<p>Sixteen of the eighteen declare <em>nothing</em>. That is the pattern: reach is
+<p>Seventeen of the twenty declare <em>nothing</em>. That is the pattern: reach is
 split from computation, so a program that joins paths, formats a date or
 builds a URL acquires no capability by doing so — and where a library really
 does need the world, it asks for it as an effect the consumer supplies, which
@@ -963,7 +965,7 @@ well as for what it prints.</p>
 <h2>What does not work</h2>
 <div class="scroll"><table>
 <tr><th>Limit</th><th>Detail</th></tr>
-<tr><td>Eighteen libraries, all first-party</td><td>See <a href="packages.html">Packages</a>; the plan for the rest is in <code>docs/packages-plan.md</code>. Anything else you need, you write, or bind to C with <code>extern fn</code>.</td></tr>
+<tr><td>Twenty libraries, all first-party</td><td>See <a href="packages.html">Packages</a>; the plan for the rest is in <code>docs/packages-plan.md</code>. Anything else you need, you write, or bind to C with <code>extern fn</code>.</td></tr>
 <tr><td>No remote registry</td><td>Path and local-registry dependencies work. Nothing fetches or publishes.</td></tr>
 <tr><td>No release binaries</td><td>Build from source with a Rust toolchain.</td></tr>
 <tr><td>0.45× native Rust</td><td>Measured, floor-subtracted 0.39×, against a 0.95× target.</td></tr>

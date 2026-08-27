@@ -1,0 +1,12 @@
+[package]
+name = "fs_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.fs]
+path = "../fs"
+version = "^1.0.0"
+
+[dependencies.path]
+path = "../path"
+version = "^1.0.0"

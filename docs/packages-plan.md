@@ -103,12 +103,12 @@ the datetime types, and a refusal that names the line. Declares nothing.
 
 ### Wave 3 — larger, and each one unblocks a class of program
 
-**12. `regex`.** A Thompson NFA — no backtracking, so no input makes it
+**12. `regex`.** — **built**, `packages/regex`. A Thompson NFA — no backtracking, so no input makes it
 exponential. Character classes, repetition, alternation, anchors, groups,
 `find`, `find_all`, `replace`, `split`. Declares nothing. Large, self-contained,
 and the thing whose absence is felt in every text-processing program.
 
-**13. `fs`.** Walk a directory tree, glob, copy, move, temporary files and
+**13. `fs`.** — **built**, `packages/fs`. Walk a directory tree, glob, copy, move, temporary files and
 directories, read lines without holding the file. Declares `io`. Everything
 that is *not* reach — path arithmetic — is already in `path`, so this package
 is small and its ceiling is honest.

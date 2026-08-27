@@ -22,8 +22,8 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
 - `packages/bytes_codec`, `packages/time`, `packages/random`,
   `packages/uuid`, `packages/path`, `packages/url`, `packages/log`,
   `packages/csv`, `packages/cli`, `packages/testing`, `packages/toml`,
-  `packages/resilience`, `packages/cache`, `packages/crypto_hash`: the
-  first
+  `packages/resilience`, `packages/cache`, `packages/crypto_hash`,
+  `packages/regex`, `packages/fs`: the first
   wave of the release library, planned in `docs/packages-plan.md`. All but
   `log` declare **no capability at all** — a calendar, a seeded generator, path
   arithmetic and URL text are computation, and the reach each one is usually
@@ -33,6 +33,17 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   where the handler is installed.
 - `packages/http` now takes its percent coding and query parsing from
   `packages/url` rather than carrying a second copy.
+- `packages/regex`: a Thompson machine — the pattern becomes an instruction
+  list and matching runs every live thread in lockstep, so it is linear in the
+  input for every pattern. `(a+)+b` against thirty `a`s, which takes a
+  backtracking engine longer than the universe has lasted, returns at once.
+  Backreferences and lookaround are refused by name: both need the machine to
+  remember where it has been, which is the thing that makes the other engine
+  exponential.
+- `packages/fs`: walking, globbing, copying, temporary paths — the half of the
+  filesystem that reaches the disk, declaring `io`. The other half is `path`,
+  which declares nothing, so a program that only manipulates paths depends on
+  that instead and the compiler holds it to the difference.
 - `packages/crypto_hash`: `ProjectGold/lib-sha256` moved here and given the
   two things everything else wants — HMAC-SHA-256 and PBKDF2. Every digest is
   checked against a published vector (FIPS 180-4, RFC 4231, RFC 6070), because

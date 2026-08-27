@@ -1,0 +1,13 @@
+[package]
+name = "fs"
+version = "1.0.0"
+entry = "src/main.gr"
+
+# This one touches the disk, so this one declares it. Path arithmetic — join,
+# normalise, containment — is `path`, which declares nothing and is what a
+# program manipulating paths should depend on instead.
+capabilities = ["io"]
+
+[dependencies.path]
+path = "../path"
+version = "^1.0.0"

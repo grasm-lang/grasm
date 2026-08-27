@@ -1,0 +1,139 @@
+// The `regex` package.
+//
+// The last section is the point of the whole design: `(a+)+b` against a string
+// of a's, which is the input that takes a backtracking engine longer than the
+// universe has lasted. Here it returns.
+import regex
+
+fn try_match(pattern: str, text: str) {
+    match regex.compile(pattern) {
+        Err(e) -> print("  /{pattern}/ -> refused: {e.why} at {e.at}")
+        Ok(r) -> match regex.find(r, text) {
+            None -> print("  /{pattern}/ on \"{text}\" -> no match")
+            Some(m) -> {
+                var g = ""
+                if m.groups.len() > 1 {
+                    var parts: [str] = []
+                    for i in 1..m.groups.len() {
+                        parts.push("{i}=\"{m.groups[i]}\"")
+                    }
+                    g = "  groups " + parts.join(" ")
+                }
+                print("  /{pattern}/ on \"{text}\" -> \"{m.text}\" at {m.start}..{m.end}{g}")
+            }
+        }
+    }
+}
+
+fn all(pattern: str, text: str) {
+    match regex.compile(pattern) {
+        Err(e) -> print("  /{pattern}/ -> refused: {e.why}")
+        Ok(r) -> {
+            var found: [str] = []
+            for m in regex.find_all(r, text) {
+                found.push("\"{m.text}\"@{m.start}")
+            }
+            print("  /{pattern}/ on \"{text}\" -> {found}")
+        }
+    }
+}
+
+fn main() {
+    print("-- literals and the dot")
+    try_match("abc", "xxabcxx")
+    try_match("a.c", "xxabcxx")
+    try_match("a.c", "xxa\ncxx")
+    try_match("abc", "xxabxx")
+
+    print("-- classes")
+    try_match("[abc]+", "xxbcaxx")
+    try_match("[^abc]+", "aaxyzbb")
+    try_match("[a-f0-9]+", "zz3fbzz")
+    try_match("[]]", "]")
+    try_match("[a-]", "-")
+    try_match("\\d+", "abc 1234 def")
+    try_match("\\w+", "  hello_world!")
+    try_match("\\s+", "a \t b")
+    try_match("\\D+", "123abc456")
+
+    print("-- repetition")
+    try_match("a*", "bbb")
+    try_match("a+", "bbb")
+    try_match("ab?c", "ac")
+    try_match("a\{3}", "aaaa")
+    try_match("a\{2,}", "aaaa")
+    try_match("a\{2,3}", "aaaa")
+    try_match("a\{b}", "a\{b}")
+    try_match("a\{2,1}", "aa")
+
+    print("-- greedy and not")
+    try_match("<.*>", "<a><b>")
+    try_match("<.*?>", "<a><b>")
+    try_match("a+?", "aaa")
+
+    print("-- alternation and groups")
+    try_match("cat|dog", "a dog here")
+    try_match("(cat|dog)s", "two dogs")
+    try_match("(a)(b)(c)", "abc")
+    try_match("(?:ab)+", "ababab")
+    try_match("(a+)(b+)?", "aaa")
+
+    print("-- anchors")
+    try_match("^abc", "abcdef")
+    try_match("^abc", "xabcdef")
+    try_match("abc$", "xxabc")
+    try_match("abc$", "xxabcx")
+    try_match("^$", "")
+
+    print("-- whole-text matching")
+    match regex.compile("[0-9]+") {
+        Err(e) -> print("  refused")
+        Ok(r) -> {
+            print("  /[0-9]+/ matches_all \"123\": {regex.matches_all(r, "123")}")
+            print("  /[0-9]+/ matches_all \"a123\": {regex.matches_all(r, "a123")}")
+            print("  /[0-9]+/ matches \"a123\": {regex.matches(r, "a123")}")
+        }
+    }
+
+    print("-- find_all")
+    all("\\d+", "1 22 333 x 4444")
+    all("a*", "bab")
+    all("", "abc")
+
+    print("-- replace")
+    match regex.compile("(\\w+)@(\\w+)") {
+        Err(e) -> print("  refused: {e.why}")
+        Ok(r) -> {
+            print("  {regex.replace_all(r, "a@b and c@d", "$2:$1")}")
+            print("  {regex.replace_first(r, "a@b and c@d", "<$0>")}")
+            print("  {regex.replace_all(r, "a@b", "cost $$5")}")
+        }
+    }
+
+    print("-- split")
+    match regex.compile("\\s*,\\s*") {
+        Err(e) -> print("  refused")
+        Ok(r) -> print("  {regex.split(r, "a, b ,c,  d")}")
+    }
+
+    print("-- refused, and why")
+    try_match("(a", "a")
+    try_match("[a", "a")
+    try_match("a\\", "a")
+    try_match("*a", "a")
+    try_match("(?=a)b", "ab")
+    try_match("(a)\\1", "aa")
+    try_match("[z-a]", "a")
+
+    print("-- the input that kills a backtracker")
+    match regex.compile("(a+)+b") {
+        Err(e) -> print("  refused: {e.why}")
+        Ok(r) -> {
+            for n in [10, 20, 30] {
+                let text = "a".repeat(n)
+                print("  {n} a's, no b: {regex.matches(r, text)}")
+            }
+            print("  30 a's then a b: {regex.matches(r, "a".repeat(30) + "b")}")
+        }
+    }
+}

@@ -27,6 +27,8 @@ gates as everything else: three engines, one answer.
 | `resilience` | *none* | Backoff with full jitter, circuit breaker, token bucket, deadlines. |
 | `cache` | *none* | `Cache[V]`, least-recently-used with an expiry. |
 | `crypto_hash` | *none* | SHA-256, HMAC-SHA-256, PBKDF2, constant-time compare. |
+| `regex` | *none* | Thompson NFA — linear in the input, for every pattern. |
+| `fs` | `io` | Walk, glob, copy, temporary paths. Path arithmetic is `path`. |
 
 Three packages rather than one, and the split is the same argument each time:
 a program that only needs to *build* a request never acquires the capability to
@@ -71,6 +73,8 @@ grasm run packages/toml-demo/src/main.gr
 grasm run packages/resilience-demo/src/main.gr
 grasm run packages/cache-demo/src/main.gr
 grasm run packages/crypto_hash-demo/src/main.gr
+grasm run packages/regex-demo/src/main.gr
+grasm run packages/fs-demo/src/main.gr
 ```
 
 ## The pattern every one of these follows

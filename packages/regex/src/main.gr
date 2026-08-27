@@ -1,0 +1,716 @@
+// Regular expressions, by Thompson construction.
+//
+// A backtracking engine is shorter to write and has a failure mode this
+// language should not ship: `(a+)+b` against thirty a's takes longer than the
+// universe has lasted, and the input that does it is a line somebody typed.
+// So the machine here is a non-deterministic finite automaton simulated over
+// a *set* of states, which visits each position once and each state at most
+// once per position. Matching is O(pattern x input), always, for every
+// pattern and every input.
+//
+// The price is what a backtracker gets for free and this does not:
+// backreferences (`\1`) and lookaround. Both need the machine to remember
+// where it has been, which is exactly the thing that makes the other engine
+// exponential. They are refused by name rather than mis-parsed.
+//
+// Supported: literals, `.`, `[abc]`, `[^abc]`, `[a-z]`, `\d \w \s \D \W \S`,
+// `*` `+` `?` `{n}` `{n,}` `{n,m}`, non-greedy `*? +? ??`, `|`, groups `(…)`
+// and non-capturing `(?:…)`, anchors `^` `$`, and `\` before any punctuation.
+
+type Node =
+    | Char(c: str)
+    | Any
+    | Class(set: str, negated: bool, ranges: [str])
+    | Start
+    | End
+    | Concat(items: [ref Node])
+    | Alt(left: ref Node, right: ref Node)
+    | Repeat(item: ref Node, least: i64, most: i64, greedy: bool)
+    | Group(item: ref Node, index: i64)
+    | Empty
+
+type Bad = { why: str, at: i64 }
+
+type Regex = { root: ref Node, groups: i64, source: str }
+
+type Match = { start: i64, end: i64, text: str, groups: [str], starts: [i64] }
+
+// --- parsing ---------------------------------------------------------------
+
+type P = { cs: [str], i: i64, groups: i64 }
+
+fn peek(p: P) -> str {
+    if p.i < p.cs.len() { p.cs[p.i] } else { "" }
+}
+
+fn at(p: P, k: i64) -> str {
+    if p.i + k < p.cs.len() { p.cs[p.i + k] } else { "" }
+}
+
+pub fn compile(pattern: str) -> Regex ! Bad {
+    var p = P{ cs: pattern.chars(), i: 0, groups: 0 }
+    let root = try parse_alt(p)
+    if p.i < p.cs.len() {
+        fail(Bad{ why: "unexpected `{peek(p)}`", at: p.i })
+    }
+    Regex{ root: root, groups: p.groups, source: pattern }
+}
+
+fn parse_alt(inout p: P) -> ref Node ! Bad {
+    var left = try parse_concat(p)
+    while peek(p) == "|" {
+        p.i = p.i + 1
+        let right = try parse_concat(p)
+        left = ref(Alt(left, right))
+    }
+    left
+}
+
+fn parse_concat(inout p: P) -> ref Node ! Bad {
+    var items: [ref Node] = []
+    while p.i < p.cs.len() and peek(p) != "|" and peek(p) != ")" {
+        items.push(try parse_repeat(p))
+    }
+    if items.is_empty() {
+        return ref(Empty)
+    }
+    if items.len() == 1 {
+        return items[0]
+    }
+    ref(Concat(items))
+}
+
+fn parse_repeat(inout p: P) -> ref Node ! Bad {
+    var item = try parse_atom(p)
+    var going = true
+    while going {
+        let c = peek(p)
+        if c == "*" or c == "+" or c == "?" {
+            p.i = p.i + 1
+            let least = if c == "+" { 1 } else { 0 }
+            let most = if c == "?" { 1 } else { 0 - 1 }
+            var greedy = true
+            if peek(p) == "?" {
+                greedy = false
+                p.i = p.i + 1
+            }
+            item = ref(Repeat(item, least, most, greedy))
+            continue
+        }
+        if c == "\{" and counted_ahead(p) {
+            p.i = p.i + 1
+            var least = 0
+            var seen = false
+            while (peek(p).parse_int() ?? 0 - 1) >= 0 {
+                least = least * 10 + (peek(p).parse_int() ?? 0)
+                seen = true
+                p.i = p.i + 1
+            }
+            if not seen {
+                fail(Bad{ why: "a repetition count with no number", at: p.i })
+            }
+            var most = least
+            if peek(p) == "," {
+                p.i = p.i + 1
+                if peek(p) == "}" {
+                    most = 0 - 1
+                } else {
+                    most = 0
+                    while (peek(p).parse_int() ?? 0 - 1) >= 0 {
+                        most = most * 10 + (peek(p).parse_int() ?? 0)
+                        p.i = p.i + 1
+                    }
+                }
+            }
+            if peek(p) != "}" {
+                fail(Bad{ why: "a repetition with no closing brace", at: p.i })
+            }
+            p.i = p.i + 1
+            if most >= 0 and most < least {
+                fail(Bad{ why: "a repetition whose maximum is below its minimum", at: p.i })
+            }
+            var greedy = true
+            if peek(p) == "?" {
+                greedy = false
+                p.i = p.i + 1
+            }
+            item = ref(Repeat(item, least, most, greedy))
+            continue
+        }
+        going = false
+    }
+    item
+}
+
+// `{` only begins a repetition when what follows is a count. `a{b}` is four
+// literal characters, which is what every engine does and what a pattern
+// containing a brace relies on.
+fn counted_ahead(p: P) -> bool {
+    var k = 1
+    var digits = 0
+    while (at(p, k).parse_int() ?? 0 - 1) >= 0 {
+        digits = digits + 1
+        k = k + 1
+    }
+    if digits == 0 {
+        return false
+    }
+    if at(p, k) == "," {
+        k = k + 1
+        while (at(p, k).parse_int() ?? 0 - 1) >= 0 {
+            k = k + 1
+        }
+    }
+    at(p, k) == "}"
+}
+
+fn parse_atom(inout p: P) -> ref Node ! Bad {
+    let c = peek(p)
+    if c == "(" {
+        p.i = p.i + 1
+        var capturing = true
+        if peek(p) == "?" {
+            if at(p, 1) == ":" {
+                p.i = p.i + 2
+                capturing = false
+            } else if at(p, 1) == "=" or at(p, 1) == "!" or at(p, 1) == "<" {
+                fail(Bad{ why: "lookaround is not supported — this engine visits each position once, which is what makes it linear", at: p.i })
+            } else {
+                fail(Bad{ why: "`(?` must be followed by `:` for a non-capturing group", at: p.i })
+            }
+        }
+        var index = 0
+        if capturing {
+            p.groups = p.groups + 1
+            index = p.groups
+        }
+        let inner = try parse_alt(p)
+        if peek(p) != ")" {
+            fail(Bad{ why: "a group with no closing parenthesis", at: p.i })
+        }
+        p.i = p.i + 1
+        if capturing {
+            return ref(Group(inner, index))
+        }
+        return inner
+    }
+    if c == "[" {
+        return try parse_class(p)
+    }
+    if c == "." {
+        p.i = p.i + 1
+        return ref(Any)
+    }
+    if c == "^" {
+        p.i = p.i + 1
+        return ref(Start)
+    }
+    if c == "$" {
+        p.i = p.i + 1
+        return ref(End)
+    }
+    if c == "\\" {
+        p.i = p.i + 1
+        let e = peek(p)
+        if e.is_empty() {
+            fail(Bad{ why: "a pattern ending in a backslash", at: p.i })
+        }
+        p.i = p.i + 1
+        if (e.parse_int() ?? 0 - 1) >= 0 {
+            fail(Bad{ why: "a backreference is not supported — remembering where the match has been is what makes an engine exponential", at: p.i })
+        }
+        return ref(escape_node(e))
+    }
+    if c == ")" or c.is_empty() {
+        fail(Bad{ why: "nothing to repeat or match here", at: p.i })
+    }
+    if c == "*" or c == "+" or c == "?" {
+        fail(Bad{ why: "`{c}` with nothing before it", at: p.i })
+    }
+    p.i = p.i + 1
+    ref(Char(c))
+}
+
+fn escape_node(e: str) -> Node {
+    if e == "d" {
+        return Class("", false, ["0", "9"])
+    }
+    if e == "D" {
+        return Class("", true, ["0", "9"])
+    }
+    if e == "w" {
+        return Class("_", false, ["0", "9", "a", "z", "A", "Z"])
+    }
+    if e == "W" {
+        return Class("_", true, ["0", "9", "a", "z", "A", "Z"])
+    }
+    if e == "s" {
+        return Class(" \t\n\r", false, [])
+    }
+    if e == "S" {
+        return Class(" \t\n\r", true, [])
+    }
+    if e == "n" {
+        return Char("\n")
+    }
+    if e == "t" {
+        return Char("\t")
+    }
+    if e == "r" {
+        return Char("\r")
+    }
+    Char(e)
+}
+
+fn parse_class(inout p: P) -> ref Node ! Bad {
+    p.i = p.i + 1
+    var negated = false
+    if peek(p) == "^" {
+        negated = true
+        p.i = p.i + 1
+    }
+    var set = ""
+    var ranges: [str] = []
+    var first = true
+    while p.i < p.cs.len() and (peek(p) != "]" or first) {
+        first = false
+        var c = peek(p)
+        if c == "\\" {
+            p.i = p.i + 1
+            let e = peek(p)
+            if e.is_empty() {
+                fail(Bad{ why: "a character class ending in a backslash", at: p.i })
+            }
+            p.i = p.i + 1
+            match escape_node(e) {
+                Char(ch) -> set = set + ch
+                Class(s, neg, rs) -> {
+                    // A class inside a class: `[\d-]` is the digits and a
+                    // hyphen. A *negated* one inside is refused rather than
+                    // silently taken as its positive half.
+                    if neg {
+                        fail(Bad{ why: "a negated class inside a class", at: p.i })
+                    }
+                    set = set + s
+                    for r in rs {
+                        ranges.push(r)
+                    }
+                }
+                _ -> fail(Bad{ why: "that escape means nothing in a class", at: p.i })
+            }
+            continue
+        }
+        p.i = p.i + 1
+        if peek(p) == "-" and at(p, 1) != "]" and at(p, 1) != "" {
+            let low = c
+            p.i = p.i + 1
+            var high = peek(p)
+            if high == "\\" {
+                p.i = p.i + 1
+                high = peek(p)
+            }
+            p.i = p.i + 1
+            if high.code_at(0) < low.code_at(0) {
+                fail(Bad{ why: "a range that runs backwards", at: p.i })
+            }
+            ranges.push(low)
+            ranges.push(high)
+            continue
+        }
+        set = set + c
+    }
+    if peek(p) != "]" {
+        fail(Bad{ why: "a character class with no closing bracket", at: p.i })
+    }
+    p.i = p.i + 1
+    ref(Class(set, negated, ranges))
+}
+
+// --- compiling to a program -------------------------------------------------
+//
+// A Pike VM: the pattern becomes a small instruction list, and matching runs
+// every live thread in lockstep over the input. A thread is a program counter
+// and its capture slots; two threads at the same counter are the same thread,
+// which is the whole trick — it is what bounds the work at one visit per
+// state per position and what a backtracker does not do.
+
+type Inst =
+    | IChar(c: str)
+    | IClass(set: str, negated: bool, ranges: [str])
+    | IAny
+    | ISplit(a: i64, b: i64)
+    | IJump(a: i64)
+    | ISave(slot: i64)
+    | IStart
+    | IEnd
+    | IMatch
+
+type Program = { insts: [Inst], slots: i64 }
+
+fn emit(inout prog: [Inst], node: ref Node) {
+    match node {
+        Empty -> {}
+        Char(c) -> prog.push(IChar(c))
+        Any -> prog.push(IAny)
+        Start -> prog.push(IStart)
+        End -> prog.push(IEnd)
+        Class(set, negated, ranges) -> prog.push(IClass(set, negated, ranges))
+        Concat(items) -> {
+            for it in items {
+                emit(prog, it)
+            }
+        }
+        Group(item, index) -> {
+            prog.push(ISave(index * 2))
+            emit(prog, item)
+            prog.push(ISave(index * 2 + 1))
+        }
+        Alt(left, right) -> {
+            let split_at = prog.len()
+            prog.push(ISplit(0, 0))
+            emit(prog, left)
+            let jump_at = prog.len()
+            prog.push(IJump(0))
+            let right_at = prog.len()
+            emit(prog, right)
+            prog[split_at] = ISplit(split_at + 1, right_at)
+            prog[jump_at] = IJump(prog.len())
+        }
+        Repeat(item, least, most, greedy) -> {
+            // The required copies first, then the optional ones. A bounded
+            // repetition is expansion, which is why `a{1000}` is a thousand
+            // instructions and `a{1,1000000}` is refused by the size cap
+            // rather than quietly building a program larger than the input.
+            var n = 0
+            while n < least {
+                emit(prog, item)
+                n = n + 1
+            }
+            if most < 0 {
+                // `x*` and `x+`'s tail: split, body, jump back.
+                let split_at = prog.len()
+                prog.push(ISplit(0, 0))
+                emit(prog, item)
+                prog.push(IJump(split_at))
+                let after = prog.len()
+                prog[split_at] = if greedy {
+                    ISplit(split_at + 1, after)
+                } else {
+                    ISplit(after, split_at + 1)
+                }
+            } else {
+                var optional = most - least
+                var splits: [i64] = []
+                while optional > 0 {
+                    let split_at = prog.len()
+                    prog.push(ISplit(0, 0))
+                    splits.push(split_at)
+                    emit(prog, item)
+                    optional = optional - 1
+                }
+                let after = prog.len()
+                for s in splits {
+                    prog[s] = if greedy {
+                        ISplit(s + 1, after)
+                    } else {
+                        ISplit(after, s + 1)
+                    }
+                }
+            }
+        }
+    }
+}
+
+let MAX_PROGRAM = 100000
+
+pub fn program_of(r: Regex) -> Program ! Bad {
+    var insts: [Inst] = []
+    insts.push(ISave(0))
+    emit(insts, r.root)
+    insts.push(ISave(1))
+    insts.push(IMatch)
+    if insts.len() > MAX_PROGRAM {
+        fail(Bad{ why: "the pattern expands to {insts.len()} instructions, over the limit of {MAX_PROGRAM}", at: 0 })
+    }
+    Program{ insts: insts, slots: (r.groups + 1) * 2 }
+}
+
+// --- matching ---------------------------------------------------------------
+
+fn in_class(c: str, set: str, negated: bool, ranges: [str]) -> bool {
+    var hit = set.contains(c)
+    if not hit {
+        var i = 0
+        while i + 1 < ranges.len() {
+            if c.code_at(0) >= ranges[i].code_at(0) and c.code_at(0) <= ranges[i + 1].code_at(0) {
+                hit = true
+            }
+            i = i + 2
+        }
+    }
+    if negated { not hit } else { hit }
+}
+
+fn add_thread(prog: Program, pc: i64, saved: [i64], pos: i64, len: i64,
+              inout pcs: [i64], inout saves: [[i64]], inout seen: [bool]) {
+    if seen[pc] {
+        return
+    }
+    seen[pc] = true
+    match prog.insts[pc] {
+        IJump(a) -> add_thread(prog, a, saved, pos, len, pcs, saves, seen)
+        ISplit(a, b) -> {
+            add_thread(prog, a, saved, pos, len, pcs, saves, seen)
+            add_thread(prog, b, saved, pos, len, pcs, saves, seen)
+        }
+        ISave(slot) -> {
+            var next = saved
+            next[slot] = pos
+            add_thread(prog, pc + 1, next, pos, len, pcs, saves, seen)
+        }
+        IStart -> {
+            if pos == 0 {
+                add_thread(prog, pc + 1, saved, pos, len, pcs, saves, seen)
+            }
+        }
+        IEnd -> {
+            if pos == len {
+                add_thread(prog, pc + 1, saved, pos, len, pcs, saves, seen)
+            }
+        }
+        _ -> {
+            pcs.push(pc)
+            saves.push(saved)
+        }
+    }
+}
+
+fn empty_saves(n: i64) -> [i64] {
+    var out: [i64] = []
+    for _i in 0..n {
+        out.push(0 - 1)
+    }
+    out
+}
+
+fn fresh_seen(n: i64) -> [bool] {
+    var out: [bool] = []
+    for _i in 0..n {
+        out.push(false)
+    }
+    out
+}
+
+/// The leftmost match at or after `from`, if there is one.
+///
+/// Leftmost-first, like every other engine: the earliest starting position
+/// wins, and among matches from the same position the one the pattern's
+/// alternation order prefers. Threads are seeded one position at a time and a
+/// match stops the seeding, which is what makes it leftmost rather than
+/// longest.
+pub fn find_from(r: Regex, text: str, from: i64) -> Option[Match] {
+    let prog = match program_of(r) {
+        Ok(p) -> p
+        Err(e) -> return None
+    }
+    let cs = text.chars()
+    let n = cs.len()
+    var pcs: [i64] = []
+    var saves: [[i64]] = []
+    var seen = fresh_seen(prog.insts.len())
+    var best: [i64] = []
+    var pos = if from < 0 { 0 } else { from }
+    var started = pos
+
+    while pos <= n {
+        if best.is_empty() and pos >= started {
+            add_thread(prog, 0, empty_saves(prog.slots), pos, n, pcs, saves, seen)
+        }
+        if pcs.is_empty() and not best.is_empty() {
+            pos = n + 1
+            continue
+        }
+        var next_pcs: [i64] = []
+        var next_saves: [[i64]] = []
+        var next_seen = fresh_seen(prog.insts.len())
+        let c = if pos < n { cs[pos] } else { "" }
+        var t = 0
+        while t < pcs.len() {
+            let pc = pcs[t]
+            let sv = saves[t]
+            t = t + 1
+            match prog.insts[pc] {
+                IChar(want) -> {
+                    if pos < n and c == want {
+                        add_thread(prog, pc + 1, sv, pos + 1, n, next_pcs, next_saves, next_seen)
+                    }
+                }
+                IAny -> {
+                    if pos < n {
+                        add_thread(prog, pc + 1, sv, pos + 1, n, next_pcs, next_saves, next_seen)
+                    }
+                }
+                IClass(set, negated, ranges) -> {
+                    if pos < n and in_class(c, set, negated, ranges) {
+                        add_thread(prog, pc + 1, sv, pos + 1, n, next_pcs, next_saves, next_seen)
+                    }
+                }
+                IMatch -> {
+                    // The first thread to match wins, and every thread after
+                    // it in this list is a lower-priority alternative — so
+                    // they are dropped rather than allowed to overwrite it.
+                    best = sv
+                    t = pcs.len()
+                }
+                _ -> {}
+            }
+        }
+        pcs = next_pcs
+        saves = next_saves
+        seen = next_seen
+        pos = pos + 1
+    }
+
+    if best.is_empty() {
+        return None
+    }
+    var groups: [str] = []
+    var starts: [i64] = []
+    var g = 0
+    while g * 2 + 1 < best.len() {
+        let a = best[g * 2]
+        let b = best[g * 2 + 1]
+        starts.push(a)
+        if a >= 0 and b >= a {
+            groups.push(slice_chars(cs, a, b))
+        } else {
+            groups.push("")
+        }
+        g = g + 1
+    }
+    Some(Match{ start: best[0], end: best[1],
+                text: slice_chars(cs, best[0], best[1]),
+                groups: groups, starts: starts })
+}
+
+fn slice_chars(cs: [str], a: i64, b: i64) -> str {
+    var out = ""
+    var i = a
+    while i < b and i < cs.len() {
+        out = out + cs[i]
+        i = i + 1
+    }
+    out
+}
+
+pub fn find(r: Regex, text: str) -> Option[Match] {
+    find_from(r, text, 0)
+}
+
+pub fn matches(r: Regex, text: str) -> bool {
+    find(r, text).is_some()
+}
+
+/// Does the pattern match the *whole* text?
+pub fn matches_all(r: Regex, text: str) -> bool {
+    match find(r, text) {
+        Some(m) -> m.start == 0 and m.end == text.len()
+        None -> false
+    }
+}
+
+/// Every non-overlapping match, left to right.
+///
+/// An empty match advances by one so the loop ends: `a*` against `bbb`
+/// matches nothing at every position, and a loop that trusts `end` to move
+/// runs forever.
+pub fn find_all(r: Regex, text: str) -> [Match] {
+    var out: [Match] = []
+    var from = 0
+    let n = text.len()
+    while from <= n {
+        match find_from(r, text, from) {
+            None -> return out
+            Some(m) -> {
+                out.push(m)
+                from = if m.end > m.start { m.end } else { m.start + 1 }
+            }
+        }
+    }
+    out
+}
+
+/// Every match replaced. `$1`, `$2` … in the replacement stand for the
+/// groups, and `$$` for a literal dollar.
+pub fn replace_all(r: Regex, text: str, replacement: str) -> str {
+    let cs = text.chars()
+    var out = ""
+    var last = 0
+    for m in find_all(r, text) {
+        out = out + slice_chars(cs, last, m.start) + expand(replacement, m)
+        last = m.end
+    }
+    out + slice_chars(cs, last, cs.len())
+}
+
+pub fn replace_first(r: Regex, text: str, replacement: str) -> str {
+    let cs = text.chars()
+    match find(r, text) {
+        None -> text
+        Some(m) -> slice_chars(cs, 0, m.start) + expand(replacement, m) +
+            slice_chars(cs, m.end, cs.len())
+    }
+}
+
+fn expand(replacement: str, m: Match) -> str {
+    if not replacement.contains("$") {
+        return replacement
+    }
+    let cs = replacement.chars()
+    var out = ""
+    var i = 0
+    while i < cs.len() {
+        if cs[i] != "$" or i + 1 >= cs.len() {
+            out = out + cs[i]
+            i = i + 1
+            continue
+        }
+        let next = cs[i + 1]
+        if next == "$" {
+            out = out + "$"
+            i = i + 2
+            continue
+        }
+        var digits = ""
+        var k = i + 1
+        while k < cs.len() and (cs[k].parse_int() ?? 0 - 1) >= 0 {
+            digits = digits + cs[k]
+            k = k + 1
+        }
+        if digits.is_empty() {
+            out = out + cs[i]
+            i = i + 1
+            continue
+        }
+        let g = digits.parse_int() ?? 0
+        if g < m.groups.len() {
+            out = out + m.groups[g]
+        }
+        i = k
+    }
+    out
+}
+
+/// The text between the matches. A pattern that matches nothing gives the
+/// whole text as one piece.
+pub fn split(r: Regex, text: str) -> [str] {
+    let cs = text.chars()
+    var out: [str] = []
+    var last = 0
+    for m in find_all(r, text) {
+        out.push(slice_chars(cs, last, m.start))
+        last = m.end
+    }
+    out.push(slice_chars(cs, last, cs.len()))
+    out
+}

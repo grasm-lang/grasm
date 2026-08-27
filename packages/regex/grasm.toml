@@ -1,0 +1,8 @@
+[package]
+name = "regex"
+version = "1.0.0"
+entry = "src/main.gr"
+
+# A pattern is text and a match is arithmetic over it. Nothing here opens
+# anything.
+capabilities = []

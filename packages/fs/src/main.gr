@@ -1,0 +1,258 @@
+// The filesystem: walking, globbing, copying, temporary files.
+//
+// Everything here reaches the disk, which is why it is a package of its own.
+// The half that does not — joining paths, resolving `..`, asking whether one
+// path is inside another — is `path`, and it declares nothing. A program that
+// only manipulates paths should depend on that and not on this, and the
+// compiler will hold it to the difference.
+import path
+
+type Entry = { path: str, name: str, is_dir: bool }
+
+/// The entries of a directory, sorted, as `Entry` values.
+///
+/// `list_dir` answers names; this answers paths and says which are
+/// directories, because every caller wanted both and computing them from the
+/// name means joining and stat-ing in the caller.
+pub fn entries(dir: str) -> [Entry] ! IoError / {io} {
+    var out: [Entry] = []
+    for name in try list_dir(dir) {
+        let full = path.join(dir, name)
+        out.push(Entry{ path: full, name: name, is_dir: is_dir(full) })
+    }
+    out
+}
+
+/// Is this a directory?
+///
+/// There is no `stat`, so the question is asked by trying to list it. A file
+/// is not listable and a directory is; the cost is one failed call per
+/// non-directory, which is what makes `walk` below the thing to use rather
+/// than calling this in a loop.
+pub fn is_dir(p: str) -> bool / {io} {
+    match list_dir(p) {
+        Ok(_names) -> true
+        Err(_e) -> false
+    }
+}
+
+pub fn exists(p: str) -> bool / {io} {
+    file_exists(p) or is_dir(p)
+}
+
+/// Every file under a directory, depth-first, in sorted order.
+///
+/// `depth` bounds the descent — a negative one means no bound. There is no
+/// symbolic-link resolution here and so no cycle to guard against; when
+/// there is, this is where the guard goes.
+pub fn walk(root: str, depth: i64) -> [str] ! IoError / {io} {
+    var out: [str] = []
+    try walk_into(root, depth, out)
+    out
+}
+
+fn walk_into(dir: str, depth: i64, inout out: [str]) -> () ! IoError / {io} {
+    for e in try entries(dir) {
+        if e.is_dir {
+            if depth != 0 {
+                try walk_into(e.path, depth - 1, out)
+            }
+            continue
+        }
+        out.push(e.path)
+    }
+}
+
+/// Every directory under a directory, depth-first.
+pub fn walk_dirs(root: str, depth: i64) -> [str] ! IoError / {io} {
+    var out: [str] = []
+    try dirs_into(root, depth, out)
+    out
+}
+
+fn dirs_into(dir: str, depth: i64, inout out: [str]) -> () ! IoError / {io} {
+    for e in try entries(dir) {
+        if e.is_dir {
+            out.push(e.path)
+            if depth != 0 {
+                try dirs_into(e.path, depth - 1, out)
+            }
+        }
+    }
+}
+
+// --- globbing ---------------------------------------------------------------
+
+/// Does a name match a shell pattern? `*`, `?` and `[abc]`, and `*` does not
+/// cross a `/`.
+///
+/// Written as a table rather than by recursion, so `*a*a*a*a*b` against a long
+/// name is quadratic at worst instead of exponential — the same reason
+/// `regex` is a Thompson machine.
+pub fn matches_glob(pattern: str, name: str) -> bool {
+    let ps = pattern.chars()
+    let ns = name.chars()
+    // `can[i]` — can the first `i` characters of the name be matched by the
+    // pattern so far?
+    var can: [bool] = []
+    for i in 0..(ns.len() + 1) {
+        can.push(i == 0)
+    }
+    var p = 0
+    while p < ps.len() {
+        let c = ps[p]
+        if c == "*" {
+            // `**` crosses directories; a single `*` does not. The separator
+            // is cleared *after* the position is marked, not before: clearing
+            // first meant a star could not even begin at the character
+            // following a separator, so `*/*.gr` matched nothing at all.
+            let crosses = p + 1 < ps.len() and ps[p + 1] == "*"
+            var seen = false
+            for i in 0..can.len() {
+                if can[i] {
+                    seen = true
+                }
+                can[i] = seen
+                if not crosses and i < ns.len() and ns[i] == "/" {
+                    seen = false
+                }
+            }
+            p = p + (if crosses { 2 } else { 1 })
+            continue
+        }
+        var next: [bool] = []
+        for _i in 0..can.len() {
+            next.push(false)
+        }
+        var length = 0
+        var lit = ""
+        var negated = false
+        var set = ""
+        if c == "[" {
+            var k = p + 1
+            if k < ps.len() and ps[k] == "^" {
+                negated = true
+                k = k + 1
+            }
+            var first = true
+            while k < ps.len() and (ps[k] != "]" or first) {
+                first = false
+                set = set + ps[k]
+                k = k + 1
+            }
+            if k >= ps.len() {
+                return false
+            }
+            length = k - p + 1
+        } else {
+            lit = c
+            length = 1
+        }
+        for i in 0..(can.len() - 1) {
+            if not can[i] {
+                continue
+            }
+            let ch = ns[i]
+            let hit = if c == "?" {
+                ch != "/"
+            } else if c == "[" {
+                let inside = set.contains(ch)
+                (if negated { not inside } else { inside }) and ch != "/"
+            } else {
+                ch == lit
+            }
+            if hit {
+                next[i + 1] = true
+            }
+        }
+        can = next
+        p = p + length
+    }
+    can[can.len() - 1]
+}
+
+/// Every file under `root` whose path, relative to `root`, matches the
+/// pattern.
+pub fn glob(root: str, pattern: str) -> [str] ! IoError / {io} {
+    var out: [str] = []
+    for f in try walk(root, 0 - 1) {
+        let rel = path.relative_to(root, f) ?? f
+        if matches_glob(pattern, rel) {
+            out.push(f)
+        }
+    }
+    out
+}
+
+// --- copying and moving ------------------------------------------------------
+
+/// Copy a file. Bytes, not text: a copy that goes through `str` mangles
+/// anything that is not valid UTF-8, and a copy is supposed to be a copy.
+pub fn copy_file(from: str, to: str) -> () ! IoError / {io} {
+    let b = try read_bytes(from)
+    try make_dir(path.dir_name(to))
+    try write_bytes(to, b)
+}
+
+/// Copy a whole tree.
+pub fn copy_tree(from: str, to: str) -> i64 ! IoError / {io} {
+    var n = 0
+    for f in try walk(from, 0 - 1) {
+        let rel = path.relative_to(from, f) ?? path.base_name(f)
+        try copy_file(f, path.join(to, rel))
+        n = n + 1
+    }
+    n
+}
+
+/// Move a file, by copying and then removing. There is no rename builtin, so
+/// this is not atomic and says so: a crash between the two leaves both.
+pub fn move_file(from: str, to: str) -> () ! IoError / {io} {
+    try copy_file(from, to)
+    try remove_file(from)
+}
+
+/// Remove a whole tree, files first.
+pub fn remove_tree(root: str) -> i64 ! IoError / {io} {
+    var n = 0
+    for f in try walk(root, 0 - 1) {
+        try remove_file(f)
+        n = n + 1
+    }
+    n
+}
+
+// --- lines and text ----------------------------------------------------------
+
+pub fn read_lines(p: str) -> [str] ! IoError / {io} {
+    (try read_file(p)).lines()
+}
+
+pub fn write_lines(p: str, lines: [str]) -> () ! IoError / {io} {
+    try write_file(p, lines.join("\n") + "\n")
+}
+
+/// Append to a file, creating it if it is not there. `write_file` truncates,
+/// so this reads first — which is fine for a log line and wrong for a large
+/// file, and saying so is better than being quietly quadratic.
+pub fn append(p: str, text: str) -> () ! IoError / {io} {
+    let existing = read_file(p) ?? ""
+    try write_file(p, existing + text)
+}
+
+// --- temporary files ---------------------------------------------------------
+
+/// A path under `dir` that nothing is using, named from `stamp`.
+///
+/// The caller supplies the stamp — a millisecond, a counter, a random word —
+/// because this package declares `io` and not the ability to invent
+/// unpredictability, and because a test wants the same name twice.
+pub fn unused_path(dir: str, prefix: str, stamp: i64) -> str / {io} {
+    var n = stamp
+    var candidate = path.join(dir, "{prefix}{n}")
+    while exists(candidate) {
+        n = n + 1
+        candidate = path.join(dir, "{prefix}{n}")
+    }
+    candidate
+}
