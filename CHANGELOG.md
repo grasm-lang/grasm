@@ -7,6 +7,9 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
 
 ### Fixed
 
+- A `parallel` block's task list is released when a `return` or a `fail`
+  leaves it, and `parallel { return … }` compiles — the statement never
+  said its body had left (F64).
 - `break` out of a `region`, `return` out of a plain block, `fail` out of
   an `unsafe` block: each left the following statement emitted after the
   terminator, which Cranelift refused (F63).

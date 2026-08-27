@@ -66,6 +66,16 @@ BLOCKS = {
     "region": "    region {{\n        let inside = [9, 9]\n        let _c = inside.len()\n{body}\n    }}",
     "plain-block": "    {{\n        let inside = {held}\n        let _c = inside.len()\n{body}\n    }}",
     "unsafe-block": "    unsafe {{\n        let inside = {held}\n        let _c = inside.len()\n{body}\n    }}",
+    # A `parallel` owns a list of the sites that fired, built by the block and
+    # freed when the tasks have run. Released by hand at its two ends, it was
+    # kept by every early exit (F64); the block also had to learn to say it had
+    # left, which F63 gave every block-shaped *expression* and this statement
+    # needed of its own.
+    "parallel": "    parallel {{\n        spawn {{\n            let _s = {held}.len()\n        }}\n{body}\n    }}",
+    "spawn-body": "    parallel {{\n        spawn {{\n{body}\n        }}\n    }}",
+    # No `spawn` at all: the list is built and freed with nothing to run, which
+    # is the other end of the same release.
+    "parallel-empty": "    parallel {{\n{body}\n    }}",
     "if-branch": "    if {held}.len() > 0 {{\n{body}\n    }}",
     "match-arm": "    match {held}.len() {{\n        0 -> {{\n            let _z = 0\n        }}\n        _ -> {{\n{body}\n        }}\n    }}",
 }
@@ -86,7 +96,12 @@ def build(bname, block, ename, exit_body, kind):
     # `unsafe`. Written without it the checker refuses every program in that
     # block and five quietly do not run -- the fault F58 found in its own
     # `spawn` context, in a different construct.
-    row = "{io, unsafe, Src}" if bname == "unsafe-block" else "{Src}"
+    if bname == "unsafe-block":
+        row = "{io, unsafe, Src}"
+    elif bname in ("parallel", "spawn-body", "parallel-empty"):
+        row = "{io, async, Src}"
+    else:
+        row = "{Src}"
     inner = block.format(body=exit_body, held=held)
     if kind == "fallible":
         return (

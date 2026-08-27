@@ -5260,6 +5260,14 @@ impl FnCx<'_, '_> {
             } => self.eval_for(loop_var, iter, body, *span),
             Stmt::Parallel { body, .. } => {
                 self.emit_parallel(body)?;
+                // The collection pass may have left -- `parallel { return 5 }`
+                // -- and saying so is what stops the next statement being
+                // written into a block already closed. F63 put this guard on
+                // `Stmt::Expr`, which covers every block-shaped *expression*;
+                // `parallel` is a statement and needed its own (F64).
+                if self.is_filled() || self.dead {
+                    return Ok(StmtOut::Terminated);
+                }
                 Ok(StmtOut::Value(None))
             }
             Stmt::Spawn { body: _, span } => {
@@ -12928,10 +12936,22 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
     fn emit_parallel(&mut self, body: &grasm_syntax::ast::Block) -> CResult<()> {
         let sites = collect_spawn_sites(body);
 
-        let list_var = self.new_var(&VType::List(Box::new(VType::I64)));
+        let list_t = VType::List(Box::new(VType::I64));
+        let list_var = self.new_var(&list_t);
         let empty = self.new_list_of(&VType::I64);
         self.b.def_var(list_var, empty);
         self.task_scopes.push((list_var, 0));
+
+        // Bound into a scope of its own, under a name the source cannot spell,
+        // so the ordinary scope releases cover it however the block is left.
+        // Released by hand at the two ends instead, it was kept by every early
+        // exit: a `return` or a `fail` inside a `spawn` body left the list
+        // built and never freed, with the right answer printed (F64). This is
+        // what a `with` does with the handler's own reference, for the same
+        // reason.
+        let name = format!(" parallel{}", self.var_count);
+        self.push_scope();
+        self.bind(&name, list_var, list_t);
 
         let (_, collect_terminated) = self.eval_block_inner(body)?;
         let assigned = self.task_scopes.pop().expect("pushed above").1;
@@ -12940,9 +12960,12 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
         // A `return` inside the collection pass leaves the scope before any
         // task could run, exactly as the interpreter does.
         if collect_terminated || sites.is_empty() {
-            if !self.is_filled() {
-                let lv = self.b.use_var(list_var);
-                self.call_rt("grasm_val_dec", &[lv]);
+            // Left already: whatever did so released this scope on its way,
+            // so popping it again would free the list twice.
+            if self.is_filled() || self.dead {
+                self.pop_scope_no_decs();
+            } else {
+                self.pop_scope_with_decs();
             }
             return Ok(());
         }
@@ -13007,8 +13030,7 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
         self.filled = true;
 
         self.goto_block(exit);
-        let lv3 = self.b.use_var(list_var);
-        self.call_rt("grasm_val_dec", &[lv3]);
+        self.pop_scope_with_decs();
         Ok(())
     }
 

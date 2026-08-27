@@ -79,6 +79,7 @@ and the entries disagree.
 | [F61](#f61) | `break` and `continue` left the handler installed too | S1, wrong answer | **fixed** |
 | [F62](#f62) | a handler's captures were kept by every early exit | S2, leak | **fixed** |
 | [F63](#f63) | a block that left was reported as an ordinary statement | S1, codegen bug | **fixed** |
+| [F64](#f64) | a `parallel` block's task list was kept by every early exit | S2, leak | **fixed** |
 
 <!-- end index -->
 ## F1 — a wrapped condition must end the line with the operator (S4) — **fixed**
@@ -2800,3 +2801,44 @@ One template fault, the same one F58 found: a block performs what its
 contents perform, and `unsafe { … }` performs `unsafe`. Written without
 that row the checker refused every program in that block and five quietly
 did not run.
+
+## F64 — a `parallel` block's task list was kept by every early exit (S2, leak) — **fixed**
+
+```
+fn f() -> i64 / {io, async} {
+    parallel {
+        spawn {
+            return 1
+        }
+    }
+    log.len()
+}
+```
+
+Both engines print `1`; the compiled one kept one allocation. A
+`parallel` records which `spawn` sites fired in a list, and that list was
+released by hand at the block's two normal ends. The comment above the
+first of them says a `return` inside the collection pass "leaves the
+scope before any task could run" — and the release is guarded by
+`if !self.is_filled()`, which is exactly false when that happens.
+
+The same shape as F62, one construct over. The list is bound into a scope
+of its own now, under a name the source cannot spell, so the ordinary
+scope releases cover every exit — which is what a `with` already does
+with the handler's own reference, for the same reason.
+
+**And the statement had to learn to say it had left.** `parallel { return
+5 }` gave a verifier error: F63 put that guard on `Stmt::Expr`, which
+covers every block-shaped *expression*, and `parallel` is a statement.
+Pre-existing rather than caused by the fix — checked by stashing it.
+
+**Gate**: three shapes in `scripts/fuzz_exits.py` — a `parallel` whose
+block leaves after a `spawn`, an exit inside the `spawn` body itself, and
+one with no `spawn` at all, which is the other end of the same release
+(38 to 51 programs). Mutation-tested on both halves separately: taking
+the list back out of its scope gives thirteen leaks, removing the
+statement's guard four declines.
+
+The generator earned its keep on the tick after it was written. The
+leaking shapes were found by hand first; what the generator adds is that
+they cannot come back.

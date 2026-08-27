@@ -116,7 +116,9 @@ statement was emitted past the terminator (F60), and the same for `break`
 and `continue`, which leave the block without leaving the function (F61); and the handler's
 captures, which every one of those four exits kept (F62); and a `region`, a
 plain block or an `unsafe` block that was left early, whose following
-statement was emitted past the terminator (F63).
+statement was emitted past the terminator (F63); and a `parallel` block's
+task list, kept by every early exit, whose statement had the same fault
+(F64).
 
 ## S4 — diagnostics
 
