@@ -1,0 +1,196 @@
+// CORS: which other sites may talk to this one.
+//
+// A decision, not an action — a function from a request to the headers a
+// response needs — so this declares nothing and can be tested by writing the
+// request out. That is the same shape `http` has, and it is why the two fit
+// together without either knowing about the other.
+//
+// The defaults are the restrictive ones. A CORS package whose default is
+// "allow everything" is a package that gets used with its defaults.
+import http
+
+type Policy = {
+    origins: [str],
+    any_origin: bool,
+    methods: [str],
+    headers: [str],
+    expose: [str],
+    credentials: bool,
+    max_age_seconds: i64,
+}
+
+/// Nothing allowed. Every builder below widens it.
+pub fn policy() -> Policy {
+    Policy{ origins: [], any_origin: false,
+            methods: ["GET", "HEAD", "POST"],
+            headers: [], expose: [], credentials: false, max_age_seconds: 0 }
+}
+
+pub fn allowing(p: Policy, origin: str) -> Policy {
+    var os = p.origins
+    os.push(origin)
+    Policy{ origins: os, any_origin: p.any_origin, methods: p.methods,
+            headers: p.headers, expose: p.expose, credentials: p.credentials,
+            max_age_seconds: p.max_age_seconds }
+}
+
+/// Any origin. Refused in combination with credentials below, because the
+/// browsers refuse it too and a policy that says it is a policy that does not
+/// work in a way nobody can see from the code.
+pub fn allowing_any(p: Policy) -> Policy {
+    Policy{ origins: p.origins, any_origin: true, methods: p.methods,
+            headers: p.headers, expose: p.expose, credentials: p.credentials,
+            max_age_seconds: p.max_age_seconds }
+}
+
+pub fn with_methods(p: Policy, methods: [str]) -> Policy {
+    Policy{ origins: p.origins, any_origin: p.any_origin, methods: methods,
+            headers: p.headers, expose: p.expose, credentials: p.credentials,
+            max_age_seconds: p.max_age_seconds }
+}
+
+pub fn with_headers(p: Policy, headers: [str]) -> Policy {
+    Policy{ origins: p.origins, any_origin: p.any_origin, methods: p.methods,
+            headers: headers, expose: p.expose, credentials: p.credentials,
+            max_age_seconds: p.max_age_seconds }
+}
+
+/// Which response headers the page may read. Without this a browser hands the
+/// script only the handful CORS calls "simple", and everything else is
+/// present on the wire and invisible in JavaScript.
+pub fn exposing(p: Policy, headers: [str]) -> Policy {
+    Policy{ origins: p.origins, any_origin: p.any_origin, methods: p.methods,
+            headers: p.headers, expose: headers, credentials: p.credentials,
+            max_age_seconds: p.max_age_seconds }
+}
+
+pub fn with_credentials(p: Policy) -> Policy {
+    Policy{ origins: p.origins, any_origin: p.any_origin, methods: p.methods,
+            headers: p.headers, expose: p.expose, credentials: true,
+            max_age_seconds: p.max_age_seconds }
+}
+
+pub fn caching_preflight(p: Policy, seconds: i64) -> Policy {
+    Policy{ origins: p.origins, any_origin: p.any_origin, methods: p.methods,
+            headers: p.headers, expose: p.expose, credentials: p.credentials,
+            max_age_seconds: seconds }
+}
+
+/// Is this origin allowed?
+///
+/// Exact matching only. A wildcard subdomain rule is what people ask for next
+/// and is also how `evil-example.test` gets in against a rule written for
+/// `example.test`; when it is added it will be added as a pattern the caller
+/// writes, not as a prefix comparison.
+pub fn allows_origin(p: Policy, origin: str) -> bool {
+    if origin.is_empty() {
+        return false
+    }
+    if p.any_origin and not p.credentials {
+        return true
+    }
+    p.origins.contains(origin)
+}
+
+fn header_list(hs: [Header], name: str) -> [str] {
+    var out: [str] = []
+    for h in hs {
+        if h.name.to_lower() == name.to_lower() {
+            for part in h.value.split(",") {
+                let t = part.trim()
+                if not t.is_empty() {
+                    out.push(t)
+                }
+            }
+        }
+    }
+    out
+}
+
+fn header_of(r: Request, name: str) -> str {
+    http.header(r, name) ?? ""
+}
+
+/// Is this a preflight? `OPTIONS` with both an origin and a requested method.
+///
+/// An `OPTIONS` without them is an ordinary request asking what the resource
+/// supports, and answering it with preflight headers is a different bug.
+pub fn is_preflight(r: Request) -> bool {
+    r.method == "OPTIONS" and not header_of(r, "origin").is_empty() and
+        not header_of(r, "access-control-request-method").is_empty()
+}
+
+/// The headers a response to this request needs, or an empty list when the
+/// request is not cross-origin or the origin is not allowed.
+///
+/// `Vary: Origin` is always present when the answer depends on the origin,
+/// which is every time. Without it a cache serves one origin's response to
+/// another, and the policy is undone by something neither end can see.
+pub fn headers_for(p: Policy, r: Request) -> [Header] {
+    let origin = header_of(r, "origin")
+    if origin.is_empty() {
+        return []
+    }
+    var out: [Header] = [Header{ name: "Vary", value: "Origin" }]
+    if not allows_origin(p, origin) {
+        return out
+    }
+    // The echoed origin rather than `*`, even when any origin is allowed: `*`
+    // and credentials are incompatible, and echoing is correct in both cases.
+    out.push(Header{ name: "Access-Control-Allow-Origin", value: origin })
+    if p.credentials {
+        out.push(Header{ name: "Access-Control-Allow-Credentials", value: "true" })
+    }
+    if not p.expose.is_empty() {
+        out.push(Header{ name: "Access-Control-Expose-Headers", value: p.expose.join(", ") })
+    }
+    if not is_preflight(r) {
+        return out
+    }
+    let wanted = header_of(r, "access-control-request-method")
+    if not p.methods.contains(wanted) {
+        return out
+    }
+    out.push(Header{ name: "Access-Control-Allow-Methods", value: p.methods.join(", ") })
+    let asked = header_list(r.headers, "access-control-request-headers")
+    if not asked.is_empty() {
+        var permitted: [str] = []
+        for a in asked {
+            for h in p.headers {
+                if h.to_lower() == a.to_lower() {
+                    permitted.push(a)
+                }
+            }
+        }
+        if permitted.len() != asked.len() {
+            // One header refused means the preflight fails, and it fails by
+            // *omitting* the allow header rather than by sending a partial
+            // one — a partial list reads to a browser as "these were allowed",
+            // which is a different answer from "this request is not".
+            return out
+        }
+        out.push(Header{ name: "Access-Control-Allow-Headers", value: permitted.join(", ") })
+    }
+    if p.max_age_seconds > 0 {
+        out.push(Header{ name: "Access-Control-Max-Age", value: "{p.max_age_seconds}" })
+    }
+    out
+}
+
+/// The response to a preflight: 204, the headers, no body.
+pub fn preflight_response(p: Policy, r: Request) -> Response {
+    var resp = http.respond(204, "text/plain; charset=utf-8", "")
+    for h in headers_for(p, r) {
+        resp = http.with_header(resp, h.name, h.value)
+    }
+    resp
+}
+
+/// An ordinary response with the policy's headers added.
+pub fn decorate(p: Policy, r: Request, resp: Response) -> Response {
+    var out = resp
+    for h in headers_for(p, r) {
+        out = http.with_header(out, h.name, h.value)
+    }
+    out
+}

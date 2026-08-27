@@ -11,17 +11,17 @@
 // both end a record, a final newline is optional, and the separator is a
 // parameter because half the world exports semicolons.
 
-type Bad = { why: str, row: i64, column: i64 }
+type CsvError = { why: str, row: i64, column: i64 }
 
 /// Rows of fields. A blank line is a row with one empty field, which is what
 /// it is — dropping it silently is how a row count stops matching the file.
-pub fn parse(text: str) -> [[str]] ! Bad {
+pub fn parse(text: str) -> [[str]] ! CsvError {
     try parse_with(text, ",")
 }
 
-pub fn parse_with(text: str, separator: str) -> [[str]] ! Bad {
+pub fn parse_with(text: str, separator: str) -> [[str]] ! CsvError {
     if separator.len() != 1 {
-        fail(Bad{ why: "the separator must be one character", row: 0, column: 0 })
+        fail(CsvError{ why: "the separator must be one character", row: 0, column: 0 })
     }
     var rows: [[str]] = []
     var row: [str] = []
@@ -59,7 +59,7 @@ pub fn parse_with(text: str, separator: str) -> [[str]] ! Bad {
         }
         if c == "\"" {
             if not field.is_empty() {
-                fail(Bad{ why: "a quote in the middle of an unquoted field",
+                fail(CsvError{ why: "a quote in the middle of an unquoted field",
                           row: line, column: column })
             }
             quoted = true
@@ -96,7 +96,7 @@ pub fn parse_with(text: str, separator: str) -> [[str]] ! Bad {
         column = column + 1
     }
     if quoted {
-        fail(Bad{ why: "the file ends inside a quoted field", row: line, column: column })
+        fail(CsvError{ why: "the file ends inside a quoted field", row: line, column: column })
     }
     // A trailing newline ends the last record; without one, whatever has been
     // gathered is still a record.

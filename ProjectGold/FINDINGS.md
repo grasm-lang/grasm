@@ -93,6 +93,7 @@ and the entries disagree.
 | [F75](#f75) | a call into another module could not be typed where the type had to be worked out | S3, backend | **fixed** |
 | [F76](#f76) | two gates counted the programs they had not checked, and passed | S2, tests | **fixed** |
 | [F77](#f77) | a generic container could not be built empty | S2, backend | **fixed** |
+| [F78](#f78) | two packages could not both declare a `Bad`, and the message did not say so | S3, diagnostics | **fixed** |
 
 <!-- end index -->
 ## F1 — a wrapped condition must end the line with the operator (S4) — **fixed**
@@ -3368,3 +3369,37 @@ Found by writing `packages/cache`, which is `Cache[V]` and begins with
 **Gate**: `scripts/nativegaps.sh`, "a type parameter the binding fixes" —
 an empty constructor, a method that rebuilds the container, and both used.
 Removing the binding hint turns it from compiled to refused.
+
+## F78 — two packages could not both declare a `Bad`, and the message did not say so (S3, diagnostics) — **fixed**
+
+```
+error: duplicate type name `Bad`
+    type Bad = { why: str }
+```
+
+The line it points at is in a dependency. So is the other one. The person
+reading owns neither, and nothing in the message says there *is* another, let
+alone where.
+
+Types share one namespace across the whole program ([T-MODULE-NS]) — that is
+the design, and it is what lets a type from any module be named from any
+other without a qualifier. The consequence at package scale had never been
+tested: `json` declares `Bad`, `jwt` declares `Bad`, and a program importing
+both cannot build. This repository hit it the moment it had eight libraries,
+which is the smallest ecosystem there is.
+
+The rule stays. What changes is that the refusal names both modules and says
+what to do — rename one, or, if you own neither, ask whichever is yours to
+prefix its types. A duplicate *within* one module keeps the short message,
+because there both declarations are in front of the reader.
+
+Every package here now prefixes its own types: `JsonError`, `RegexError`,
+`CsvError`, `TomlError`, `DotenvError`, `JwtError`, `CacheEntry`, `FsEntry`.
+That is a convention with no enforcement, which is the honest state of it —
+a language with one type namespace and no module qualifier on types has
+handed the problem to whoever writes the second library.
+
+**Gate**: `scripts/fuzz_modules.py` grew a namespace round, both directions:
+two packages declaring the same type name must be refused *and* the refusal
+must name the other module; two packages with distinct names must build.
+Making the message stop naming the other module turns it red.

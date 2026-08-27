@@ -1,0 +1,278 @@
+// JSON Web Tokens: HS256, HS384 and HS512.
+//
+// A token is three base64url pieces joined by dots, and the third is a MAC
+// over the first two. Everything that goes wrong with JWTs goes wrong in the
+// *verification*, so that is where this package spends its care:
+//
+//   * The algorithm comes from the caller, never from the token. A verifier
+//     that reads `alg` from the header it is checking will accept `none` when
+//     an attacker writes it, and will verify an RSA token with the public key
+//     as an HMAC secret when an attacker writes `HS256`. Both are famous, both
+//     are the same mistake, and neither is possible here because `verify`
+//     takes the algorithm as an argument and refuses a token whose header
+//     disagrees.
+//   * The MAC is compared in constant time.
+//   * `exp`, `nbf` and `iat` are checked against a clock the caller passes,
+//     with a leeway the caller chooses. There is no default clock, so a
+//     verifier cannot accidentally be testing against real time.
+//
+// Only HMAC. RS256 needs RSA, and RSA written in this language would have no
+// constant-time guarantee from the compiler — see `packages/crypto_hash` for
+// the same argument at more length.
+import bytes_codec
+import crypto_hash
+import json
+
+type JwtAlg = | HS256 | HS384 | HS512
+
+type JwtToken = {
+    header: str,
+    payload: str,
+    signature: str,
+    signed: str,
+}
+
+type JwtError = { why: str }
+
+pub fn alg_name(a: JwtAlg) -> str {
+    match a {
+        HS256 -> "HS256"
+        HS384 -> "HS384"
+        HS512 -> "HS512"
+    }
+}
+
+pub fn alg_from(name: str) -> Option[JwtAlg] {
+    match name {
+        "HS256" -> Some(HS256)
+        "HS384" -> Some(HS384)
+        "HS512" -> Some(HS512)
+        _ -> None
+    }
+}
+
+// Only SHA-256 is implemented, so HS384 and HS512 are declared and refused
+// rather than quietly signed with the wrong hash. A token that says HS512 and
+// carries a SHA-256 MAC is worse than no token.
+fn mac(a: JwtAlg, key: bytes, message: bytes) -> bytes ! JwtError {
+    match a {
+        HS256 -> crypto_hash.hmac_sha256(key, message)
+        _ -> fail(JwtError{ why: "{alg_name(a)} needs SHA-384 or SHA-512, which `crypto_hash` does not have yet" })
+    }
+}
+
+fn b64(text: str) -> str {
+    bytes_codec.encode_base64_url(text.to_bytes())
+}
+
+fn unb64(text: str) -> Option[str] {
+    match bytes_codec.decode_base64_url(text) {
+        Some(b) -> Some(b.to_str())
+        None -> None
+    }
+}
+
+/// A signed token from a payload that is already JSON.
+///
+/// The header is written here rather than taken from the caller, so `alg` and
+/// `typ` always describe what was actually done.
+pub fn sign(a: JwtAlg, key: bytes, payload_json: str) -> str ! JwtError {
+    let header = "\{\"alg\":\"{alg_name(a)}\",\"typ\":\"JWT\"}"
+    let signed = b64(header) + "." + b64(payload_json)
+    let m = try mac(a, key, signed.to_bytes())
+    signed + "." + bytes_codec.encode_base64_url(m)
+}
+
+/// The three pieces, decoded, without checking anything.
+///
+/// Named for what it is. A `decode` that also verified would be one call, and
+/// a `decode` that verified *sometimes* is how a token gets trusted because
+/// somebody read the name and not the documentation.
+pub fn decode_unverified(token: str) -> JwtToken ! JwtError {
+    let parts = token.split(".")
+    if parts.len() != 3 {
+        fail(JwtError{ why: "a token has three parts and this has {parts.len()}" })
+    }
+    let header = match unb64(parts[0]) {
+        Some(h) -> h
+        None -> fail(JwtError{ why: "the header is not base64url" })
+    }
+    let payload = match unb64(parts[1]) {
+        Some(p) -> p
+        None -> fail(JwtError{ why: "the payload is not base64url" })
+    }
+    JwtToken{ header: header, payload: payload, signature: parts[2],
+           signed: parts[0] + "." + parts[1] }
+}
+
+/// The signature checked, and nothing else.
+///
+/// `expect` is the algorithm the *caller* requires. The token's own header is
+/// read only to refuse it when it disagrees — never to decide what to do.
+pub fn verify_signature(token: str, expect: JwtAlg, key: bytes) -> JwtToken ! JwtError {
+    let t = try decode_unverified(token)
+    let doc = match json.parse(t.header) {
+        Ok(d) -> d
+        Err(e) -> fail(JwtError{ why: "the header is not JSON" })
+    }
+    let named = match json.get(doc, "alg") {
+        Some(v) -> json.as_str(v) ?? ""
+        None -> fail(JwtError{ why: "the header has no `alg`" })
+    }
+    if named != alg_name(expect) {
+        fail(JwtError{ why: "the token says `{named}` and `{alg_name(expect)}` was required" })
+    }
+    let want = try mac(expect, key, t.signed.to_bytes())
+    let got = match bytes_codec.decode_base64_url(t.signature) {
+        Some(b) -> b
+        None -> fail(JwtError{ why: "the signature is not base64url" })
+    }
+    if not crypto_hash.equal_constant_time(want, got) {
+        fail(JwtError{ why: "the signature does not match" })
+    }
+    t
+}
+
+type JwtRules = {
+    now_ms: i64,
+    leeway_ms: i64,
+    issuer: str,
+    audience: str,
+    require_exp: bool,
+}
+
+/// The times checked against `now_ms`, with `leeway_ms` either side.
+///
+/// There is no default clock. A verifier that reads the clock itself can only
+/// be tested by waiting, so in practice it is not tested.
+pub fn rules(now_ms: i64) -> JwtRules {
+    JwtRules{ now_ms: now_ms, leeway_ms: 0, issuer: "", audience: "",
+           require_exp: false }
+}
+
+pub fn with_leeway(r: JwtRules, ms: i64) -> JwtRules {
+    JwtRules{ now_ms: r.now_ms, leeway_ms: ms, issuer: r.issuer,
+           audience: r.audience, require_exp: r.require_exp }
+}
+
+pub fn requiring_issuer(r: JwtRules, issuer: str) -> JwtRules {
+    JwtRules{ now_ms: r.now_ms, leeway_ms: r.leeway_ms, issuer: issuer,
+           audience: r.audience, require_exp: r.require_exp }
+}
+
+pub fn requiring_audience(r: JwtRules, audience: str) -> JwtRules {
+    JwtRules{ now_ms: r.now_ms, leeway_ms: r.leeway_ms, issuer: r.issuer,
+           audience: audience, require_exp: r.require_exp }
+}
+
+/// Refuse a token with no expiry. Off by default because the specification
+/// allows one; worth turning on for anything a person holds.
+pub fn requiring_expiry(r: JwtRules) -> JwtRules {
+    JwtRules{ now_ms: r.now_ms, leeway_ms: r.leeway_ms, issuer: r.issuer,
+           audience: r.audience, require_exp: true }
+}
+
+/// Signature, then claims. The payload comes back only if both hold.
+pub fn verify(token: str, expect: JwtAlg, key: bytes, r: JwtRules) -> str ! JwtError {
+    let t = try verify_signature(token, expect, key)
+    let doc = match json.parse(t.payload) {
+        Ok(d) -> d
+        Err(e) -> fail(JwtError{ why: "the payload is not JSON" })
+    }
+    // Seconds in the token, milliseconds everywhere in these packages. The
+    // conversion is here, once, because a token whose `exp` is read as
+    // milliseconds expired in 1970 and one whose `exp` is written as
+    // milliseconds lasts until the year 56000.
+    let now_s = r.now_ms / 1000
+    let leeway_s = r.leeway_ms / 1000
+
+    match json.get(doc, "exp") {
+        Some(v) -> {
+            let exp = match json.as_int(v) {
+                Some(n) -> n
+                None -> fail(JwtError{ why: "`exp` is not a whole number of seconds" })
+            }
+            if now_s - leeway_s >= exp {
+                fail(JwtError{ why: "expired at {exp}, and it is {now_s}" })
+            }
+        }
+        None -> {
+            if r.require_exp {
+                fail(JwtError{ why: "no `exp`, and one was required" })
+            }
+        }
+    }
+    match json.get(doc, "nbf") {
+        Some(v) -> {
+            let nbf = match json.as_int(v) {
+                Some(n) -> n
+                None -> fail(JwtError{ why: "`nbf` is not a whole number of seconds" })
+            }
+            if now_s + leeway_s < nbf {
+                fail(JwtError{ why: "not valid before {nbf}, and it is {now_s}" })
+            }
+        }
+        None -> {}
+    }
+    match json.get(doc, "iat") {
+        Some(v) -> {
+            let iat = match json.as_int(v) {
+                Some(n) -> n
+                None -> fail(JwtError{ why: "`iat` is not a whole number of seconds" })
+            }
+            // A token issued in the future is a clock that disagrees, and
+            // accepting it silently is how a replay window opens.
+            if iat - leeway_s > now_s {
+                fail(JwtError{ why: "issued at {iat}, which is after now ({now_s})" })
+            }
+        }
+        None -> {}
+    }
+    if not r.issuer.is_empty() {
+        let iss = match json.get(doc, "iss") {
+            Some(v) -> json.as_str(v) ?? ""
+            None -> ""
+        }
+        if iss != r.issuer {
+            fail(JwtError{ why: "issued by \"{iss}\", and \"{r.issuer}\" was required" })
+        }
+    }
+    if not r.audience.is_empty() {
+        // `aud` is a string or an array of them, and a verifier that handles
+        // only the first rejects half the tokens in the world.
+        var ok = false
+        match json.get(doc, "aud") {
+            Some(v) -> {
+                match json.as_str(v) {
+                    Some(one) -> ok = one == r.audience
+                    None -> {
+                        for it in json.items_of(v) {
+                            if (json.as_str(it) ?? "") == r.audience {
+                                ok = true
+                            }
+                        }
+                    }
+                }
+            }
+            None -> {}
+        }
+        if not ok {
+            fail(JwtError{ why: "not addressed to \"{r.audience}\"" })
+        }
+    }
+    t.payload
+}
+
+/// One claim from a payload that has already been verified.
+pub fn claim(payload_json: str, name: str) -> Option[str] {
+    match json.parse(payload_json) {
+        Err(e) -> None
+        Ok(doc) -> match json.get(doc, name) {
+            Some(v) -> match json.as_str(v) {
+                Some(s) -> Some(s)
+                None -> Some(json.render(v))
+            }
+            None -> None
+        }
+    }
+}

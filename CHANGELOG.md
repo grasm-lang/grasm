@@ -23,7 +23,8 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   `packages/uuid`, `packages/path`, `packages/url`, `packages/log`,
   `packages/csv`, `packages/cli`, `packages/testing`, `packages/toml`,
   `packages/resilience`, `packages/cache`, `packages/crypto_hash`,
-  `packages/regex`, `packages/fs`: the first
+  `packages/regex`, `packages/fs`, `packages/jwt`, `packages/cors`,
+  `packages/dotenv`: the first
   wave of the release library, planned in `docs/packages-plan.md`. All but
   `log` declare **no capability at all** — a calendar, a seeded generator, path
   arithmetic and URL text are computation, and the reach each one is usually
@@ -33,6 +34,15 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   where the handler is installed.
 - `packages/http` now takes its percent coding and query parsing from
   `packages/url` rather than carrying a second copy.
+- `packages/jwt`: HS256, and the algorithm is an argument to `verify` rather
+  than something read from the token — so `alg: none` is refused because it
+  disagrees with what the caller required, not by a special case. `exp`,
+  `nbf`, `iat`, `iss` and `aud` are checked against a clock the caller passes.
+- `packages/cors`: origin matching, preflight, credentials, exposed headers
+  and max-age, as a function from a request to the headers a response needs.
+- `packages/dotenv`: `.env` files, answering a map and never touching the
+  process environment — which is global, and which a library has no business
+  writing to.
 - `packages/regex`: a Thompson machine — the pattern becomes an instruction
   list and matching runs every live thread in lockstep, so it is linear in the
   input for every pattern. `(a+)+b` against thirty `a`s, which takes a
@@ -85,6 +95,9 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   rule that found a fifth copy in `northstar.sh` the first time it ran.
 
 ### Fixed
+- A type name declared in two packages is refused with both modules named and
+  a help that says what to do. It said "duplicate type name `Bad`" and pointed
+  at one line in a dependency, with nothing to say there was another (F78).
 - A generic container may be built empty. `let a: Box[str] = empty_box()` was
   refused for `V` "not determined by the arguments" — the binding determines
   it, the literal inside determines it, and an enclosing instantiation

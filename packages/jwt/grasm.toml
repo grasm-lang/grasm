@@ -1,0 +1,21 @@
+[package]
+name = "jwt"
+version = "1.0.0"
+entry = "src/main.gr"
+
+# Signing and verifying are arithmetic over bytes. The clock comes in as an
+# argument, so this declares nothing — and a verifier that cannot read the
+# clock is a verifier a test can put in any year it likes.
+capabilities = []
+
+[dependencies.bytes_codec]
+path = "../bytes"
+version = "^1.0.0"
+
+[dependencies.crypto_hash]
+path = "../crypto_hash"
+version = "^1.0.0"
+
+[dependencies.json]
+path = "../json"
+version = "^1.0.0"

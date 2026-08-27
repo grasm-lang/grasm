@@ -1,0 +1,8 @@
+[package]
+name = "dotenv_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.dotenv]
+path = "../dotenv"
+version = "^1.0.0"

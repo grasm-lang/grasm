@@ -29,6 +29,9 @@ gates as everything else: three engines, one answer.
 | `crypto_hash` | *none* | SHA-256, HMAC-SHA-256, PBKDF2, constant-time compare. |
 | `regex` | *none* | Thompson NFA — linear in the input, for every pattern. |
 | `fs` | `io` | Walk, glob, copy, temporary paths. Path arithmetic is `path`. |
+| `jwt` | *none* | HS256, and the algorithm always comes from the caller. |
+| `cors` | *none* | A request in, the headers a response needs out. |
+| `dotenv` | `io` | `.env` files — and it never touches the process environment. |
 
 Three packages rather than one, and the split is the same argument each time:
 a program that only needs to *build* a request never acquires the capability to
@@ -75,6 +78,9 @@ grasm run packages/cache-demo/src/main.gr
 grasm run packages/crypto_hash-demo/src/main.gr
 grasm run packages/regex-demo/src/main.gr
 grasm run packages/fs-demo/src/main.gr
+grasm run packages/jwt-demo/src/main.gr
+grasm run packages/cors-demo/src/main.gr
+grasm run packages/dotenv-demo/src/main.gr
 ```
 
 ## The pattern every one of these follows
@@ -92,6 +98,14 @@ declares `Log` — see `packages/log-demo`, whose `work` function logs from thre
 calls deep with the row `/ {Log}` and therefore cannot print, cannot open a
 file, cannot reach the network. What logging *means* is decided by the line
 that installs the handler.
+
+**Every package prefixes its own type names.** `JsonError`, `RegexError`,
+`CsvError`, `TomlError`, `DotenvError`, `JwtError`, `CacheEntry`, `FsEntry`.
+Types share one namespace across the whole program ([T-MODULE-NS]), so two
+packages that each declare a `Bad` cannot both be imported — which this
+repository discovered the moment it had eight libraries (F78). The convention
+has no enforcement; the compiler at least now names both modules when it
+refuses.
 
 **Every refusal is a value.** A URL, a UUID, a timestamp, a base64 string is
 input somebody else chose. Not one decoder here panics.

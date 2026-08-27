@@ -1,0 +1,77 @@
+// The `dotenv` package. The text is written out here rather than read from a
+// file, which is the point of parsing being separate from loading: a test can
+// say exactly what the file contained.
+import dotenv
+
+fn show(label: str, text: str) {
+    match dotenv.parse(text) {
+        Err(e) -> print("  {label}: refused -- {e.why} at line {e.line}")
+        Ok(env) -> {
+            var parts: [str] = []
+            for k in dotenv.names(env) {
+                parts.push("{k}=\"{env.get(k) ?? ""}\"")
+            }
+            print("  {label}: {parts.join("  ")}")
+        }
+    }
+}
+
+fn main() {
+    print("-- the ordinary shapes")
+    show("plain", "A=1\nB=two")
+    show("spaces around", "  A = 1  ")
+    show("export", "export A=1")
+    show("comments", "# a note\nA=1  # trailing\nB=2")
+    show("a hash inside a value", "URL=http://x/#anchor\nCOLOUR=#fff")
+    show("empty value", "A=")
+    show("blank lines", "A=1\n\n\nB=2")
+
+    print("-- quoting")
+    show("double quoted", "A=\"one two\"")
+    show("single quoted", "A='one two'")
+    show("escapes in double quotes", "A=\"line\\nbreak\\ttab\"")
+    show("no escapes in single quotes", "A='line\\nbreak'")
+    show("a quote inside", "A=\"say \\\"hi\\\"\"")
+    show("a hash inside quotes", "A=\"a # b\"  # comment")
+
+    print("-- interpolation")
+    show("simple", "HOST=example.test\nURL=https://$\{HOST}/api")
+    show("bare name", "HOST=example.test\nURL=https://$HOST/api")
+    show("unknown name", "URL=https://$\{NOPE}/api")
+    show("a literal dollar", "PRICE=$$5")
+    show("not in single quotes", "HOST=x\nA='$\{HOST}'")
+    show("order matters", "A=$\{B}\nB=2")
+
+    print("-- multi-line values")
+    show("a key across lines", "KEY=\"line one\nline two\nline three\"")
+    show("never closed", "KEY=\"line one\nline two")
+
+    print("-- refused")
+    show("no equals", "JUST_A_NAME")
+    show("no name", "=1")
+    show("a name with a hyphen", "A-B=1")
+    show("a name starting with a digit", "1A=1")
+
+    print("-- reading values")
+    match dotenv.parse("PORT=8080\nDEBUG=true\nQUIET=off\nRATE=not-a-number\nNAME=grasm") {
+        Err(e) -> print("  refused")
+        Ok(env) -> {
+            print("  value_of NAME: {dotenv.value_of(env, "NAME", "(none)")}")
+            print("  value_of MISSING: {dotenv.value_of(env, "MISSING", "(none)")}")
+            print("  int_of PORT: {dotenv.int_of(env, "PORT", 0)}")
+            print("  int_of RATE: {dotenv.int_of(env, "RATE", 0 - 1)}")
+            print("  bool_of DEBUG: {dotenv.bool_of(env, "DEBUG", false)}")
+            print("  bool_of QUIET: {dotenv.bool_of(env, "QUIET", true)}")
+            print("  bool_of RATE, which is neither: {dotenv.bool_of(env, "RATE", true)}")
+            print("  names: {dotenv.names(env)}")
+        }
+    }
+
+    print("-- a value given from outside wins where it is written first")
+    var given = map()
+    given.set("HOST", "from-the-environment")
+    match dotenv.parse_with("URL=https://$\{HOST}/", given) {
+        Err(e) -> print("  refused")
+        Ok(env) -> print("  URL={env.get("URL") ?? ""}")
+    }
+}

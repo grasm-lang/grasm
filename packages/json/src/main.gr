@@ -20,15 +20,15 @@ type Json =
     | JList(items: [ref Json])
     | JObj(keys: [str], values: [ref Json])
 
-type Bad = { why: str, at: i64 }
+type JsonError = { why: str, at: i64 }
 
-type P = { cs: [str], i: i64 }
+type JsonReader = { cs: [str], i: i64 }
 
-fn peek(p: P) -> str {
+fn peek(p: JsonReader) -> str {
     if p.i < p.cs.len() { p.cs[p.i] } else { "" }
 }
 
-fn skip_ws(inout p: P) {
+fn skip_ws(inout p: JsonReader) {
     var going = true
     while going {
         let c = peek(p)
@@ -40,21 +40,21 @@ fn skip_ws(inout p: P) {
     }
 }
 
-fn expect(inout p: P, c: str) -> bool ! Bad {
+fn expect(inout p: JsonReader, c: str) -> bool ! JsonError {
     if peek(p) != c {
-        fail(Bad{ why: "expected `{c}` but found `{peek(p)}`", at: p.i })
+        fail(JsonError{ why: "expected `{c}` but found `{peek(p)}`", at: p.i })
     }
     p.i = p.i + 1
     true
 }
 
-fn parse_string(inout p: P) -> str ! Bad {
+fn parse_string(inout p: JsonReader) -> str ! JsonError {
     let _ok = try expect(p, "\"")
     var out = ""
     var going = true
     while going {
         if p.i >= p.cs.len() {
-            fail(Bad{ why: "unterminated string", at: p.i })
+            fail(JsonError{ why: "unterminated string", at: p.i })
         }
         let c = p.cs[p.i]
         if c == "\"" {
@@ -63,7 +63,7 @@ fn parse_string(inout p: P) -> str ! Bad {
         } else if c == "\\" {
             p.i = p.i + 1
             if p.i >= p.cs.len() {
-                fail(Bad{ why: "unterminated escape", at: p.i })
+                fail(JsonError{ why: "unterminated escape", at: p.i })
             }
             let e = p.cs[p.i]
             if e == "n" { out = out + "\n" }
@@ -78,20 +78,20 @@ fn parse_string(inout p: P) -> str ! Bad {
                 var code = 0
                 for k in 1..5 {
                     if p.i + k >= p.cs.len() {
-                        fail(Bad{ why: "truncated \\u escape", at: p.i })
+                        fail(JsonError{ why: "truncated \\u escape", at: p.i })
                     }
                     let h = p.cs[p.i + k].code_at(0)
                     var v = 0
                     if h >= 48 and h <= 57 { v = h - 48 }
                     else if h >= 97 and h <= 102 { v = h - 87 }
                     else if h >= 65 and h <= 70 { v = h - 55 }
-                    else { fail(Bad{ why: "bad hex digit in \\u escape", at: p.i + k }) }
+                    else { fail(JsonError{ why: "bad hex digit in \\u escape", at: p.i + k }) }
                     code = code * 16 + v
                 }
                 out = out + code.to_char()
                 p.i = p.i + 4
             }
-            else { fail(Bad{ why: "unknown escape `\\{e}`", at: p.i }) }
+            else { fail(JsonError{ why: "unknown escape `\\{e}`", at: p.i }) }
             p.i = p.i + 1
         } else {
             out = out + c
@@ -101,7 +101,7 @@ fn parse_string(inout p: P) -> str ! Bad {
     out
 }
 
-fn parse_number(inout p: P) -> f64 ! Bad {
+fn parse_number(inout p: JsonReader) -> f64 ! JsonError {
     let start = p.i
     if peek(p) == "-" {
         p.i = p.i + 1
@@ -128,7 +128,7 @@ fn parse_number(inout p: P) -> f64 ! Bad {
         }
     }
     if digits == 0 {
-        fail(Bad{ why: "expected a number", at: start })
+        fail(JsonError{ why: "expected a number", at: start })
     }
     var text = ""
     for k in start..p.i {
@@ -136,15 +136,15 @@ fn parse_number(inout p: P) -> f64 ! Bad {
     }
     match text.parse_float() {
         Some(v) -> v
-        None -> fail(Bad{ why: "`{text}` is not a number", at: start })
+        None -> fail(JsonError{ why: "`{text}` is not a number", at: start })
     }
 }
 
-fn parse_value(inout p: P) -> ref Json ! Bad {
+fn parse_value(inout p: JsonReader) -> ref Json ! JsonError {
     skip_ws(p)
     let c = peek(p)
     if c == "" {
-        fail(Bad{ why: "unexpected end of input", at: p.i })
+        fail(JsonError{ why: "unexpected end of input", at: p.i })
     }
     if c == "\{" {
         p.i = p.i + 1
@@ -224,12 +224,12 @@ fn parse_value(inout p: P) -> ref Json ! Bad {
     ref(JNum(n))
 }
 
-pub fn parse(src: str) -> ref Json ! Bad {
-    var p = P{ cs: src.chars(), i: 0 }
+pub fn parse(src: str) -> ref Json ! JsonError {
+    var p = JsonReader{ cs: src.chars(), i: 0 }
     let v = try parse_value(p)
     skip_ws(p)
     if p.i < p.cs.len() {
-        fail(Bad{ why: "trailing input after the value", at: p.i })
+        fail(JsonError{ why: "trailing input after the value", at: p.i })
     }
     v
 }

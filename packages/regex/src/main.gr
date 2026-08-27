@@ -17,46 +17,46 @@
 // `*` `+` `?` `{n}` `{n,}` `{n,m}`, non-greedy `*? +? ??`, `|`, groups `(…)`
 // and non-capturing `(?:…)`, anchors `^` `$`, and `\` before any punctuation.
 
-type Node =
+type RegexNode =
     | Char(c: str)
     | Any
     | Class(set: str, negated: bool, ranges: [str])
     | Start
     | End
-    | Concat(items: [ref Node])
-    | Alt(left: ref Node, right: ref Node)
-    | Repeat(item: ref Node, least: i64, most: i64, greedy: bool)
-    | Group(item: ref Node, index: i64)
+    | Concat(items: [ref RegexNode])
+    | Alt(left: ref RegexNode, right: ref RegexNode)
+    | Repeat(item: ref RegexNode, least: i64, most: i64, greedy: bool)
+    | Group(item: ref RegexNode, index: i64)
     | Empty
 
-type Bad = { why: str, at: i64 }
+type RegexError = { why: str, at: i64 }
 
-type Regex = { root: ref Node, groups: i64, source: str }
+type Regex = { root: ref RegexNode, groups: i64, source: str }
 
-type Match = { start: i64, end: i64, text: str, groups: [str], starts: [i64] }
+type RegexMatch = { start: i64, end: i64, text: str, groups: [str], starts: [i64] }
 
 // --- parsing ---------------------------------------------------------------
 
-type P = { cs: [str], i: i64, groups: i64 }
+type RegexReader = { cs: [str], i: i64, groups: i64 }
 
-fn peek(p: P) -> str {
+fn peek(p: RegexReader) -> str {
     if p.i < p.cs.len() { p.cs[p.i] } else { "" }
 }
 
-fn at(p: P, k: i64) -> str {
+fn at(p: RegexReader, k: i64) -> str {
     if p.i + k < p.cs.len() { p.cs[p.i + k] } else { "" }
 }
 
-pub fn compile(pattern: str) -> Regex ! Bad {
-    var p = P{ cs: pattern.chars(), i: 0, groups: 0 }
+pub fn compile(pattern: str) -> Regex ! RegexError {
+    var p = RegexReader{ cs: pattern.chars(), i: 0, groups: 0 }
     let root = try parse_alt(p)
     if p.i < p.cs.len() {
-        fail(Bad{ why: "unexpected `{peek(p)}`", at: p.i })
+        fail(RegexError{ why: "unexpected `{peek(p)}`", at: p.i })
     }
     Regex{ root: root, groups: p.groups, source: pattern }
 }
 
-fn parse_alt(inout p: P) -> ref Node ! Bad {
+fn parse_alt(inout p: RegexReader) -> ref RegexNode ! RegexError {
     var left = try parse_concat(p)
     while peek(p) == "|" {
         p.i = p.i + 1
@@ -66,8 +66,8 @@ fn parse_alt(inout p: P) -> ref Node ! Bad {
     left
 }
 
-fn parse_concat(inout p: P) -> ref Node ! Bad {
-    var items: [ref Node] = []
+fn parse_concat(inout p: RegexReader) -> ref RegexNode ! RegexError {
+    var items: [ref RegexNode] = []
     while p.i < p.cs.len() and peek(p) != "|" and peek(p) != ")" {
         items.push(try parse_repeat(p))
     }
@@ -80,7 +80,7 @@ fn parse_concat(inout p: P) -> ref Node ! Bad {
     ref(Concat(items))
 }
 
-fn parse_repeat(inout p: P) -> ref Node ! Bad {
+fn parse_repeat(inout p: RegexReader) -> ref RegexNode ! RegexError {
     var item = try parse_atom(p)
     var going = true
     while going {
@@ -107,7 +107,7 @@ fn parse_repeat(inout p: P) -> ref Node ! Bad {
                 p.i = p.i + 1
             }
             if not seen {
-                fail(Bad{ why: "a repetition count with no number", at: p.i })
+                fail(RegexError{ why: "a repetition count with no number", at: p.i })
             }
             var most = least
             if peek(p) == "," {
@@ -123,11 +123,11 @@ fn parse_repeat(inout p: P) -> ref Node ! Bad {
                 }
             }
             if peek(p) != "}" {
-                fail(Bad{ why: "a repetition with no closing brace", at: p.i })
+                fail(RegexError{ why: "a repetition with no closing brace", at: p.i })
             }
             p.i = p.i + 1
             if most >= 0 and most < least {
-                fail(Bad{ why: "a repetition whose maximum is below its minimum", at: p.i })
+                fail(RegexError{ why: "a repetition whose maximum is below its minimum", at: p.i })
             }
             var greedy = true
             if peek(p) == "?" {
@@ -145,7 +145,7 @@ fn parse_repeat(inout p: P) -> ref Node ! Bad {
 // `{` only begins a repetition when what follows is a count. `a{b}` is four
 // literal characters, which is what every engine does and what a pattern
 // containing a brace relies on.
-fn counted_ahead(p: P) -> bool {
+fn counted_ahead(p: RegexReader) -> bool {
     var k = 1
     var digits = 0
     while (at(p, k).parse_int() ?? 0 - 1) >= 0 {
@@ -164,7 +164,7 @@ fn counted_ahead(p: P) -> bool {
     at(p, k) == "}"
 }
 
-fn parse_atom(inout p: P) -> ref Node ! Bad {
+fn parse_atom(inout p: RegexReader) -> ref RegexNode ! RegexError {
     let c = peek(p)
     if c == "(" {
         p.i = p.i + 1
@@ -174,9 +174,9 @@ fn parse_atom(inout p: P) -> ref Node ! Bad {
                 p.i = p.i + 2
                 capturing = false
             } else if at(p, 1) == "=" or at(p, 1) == "!" or at(p, 1) == "<" {
-                fail(Bad{ why: "lookaround is not supported — this engine visits each position once, which is what makes it linear", at: p.i })
+                fail(RegexError{ why: "lookaround is not supported — this engine visits each position once, which is what makes it linear", at: p.i })
             } else {
-                fail(Bad{ why: "`(?` must be followed by `:` for a non-capturing group", at: p.i })
+                fail(RegexError{ why: "`(?` must be followed by `:` for a non-capturing group", at: p.i })
             }
         }
         var index = 0
@@ -186,7 +186,7 @@ fn parse_atom(inout p: P) -> ref Node ! Bad {
         }
         let inner = try parse_alt(p)
         if peek(p) != ")" {
-            fail(Bad{ why: "a group with no closing parenthesis", at: p.i })
+            fail(RegexError{ why: "a group with no closing parenthesis", at: p.i })
         }
         p.i = p.i + 1
         if capturing {
@@ -213,25 +213,25 @@ fn parse_atom(inout p: P) -> ref Node ! Bad {
         p.i = p.i + 1
         let e = peek(p)
         if e.is_empty() {
-            fail(Bad{ why: "a pattern ending in a backslash", at: p.i })
+            fail(RegexError{ why: "a pattern ending in a backslash", at: p.i })
         }
         p.i = p.i + 1
         if (e.parse_int() ?? 0 - 1) >= 0 {
-            fail(Bad{ why: "a backreference is not supported — remembering where the match has been is what makes an engine exponential", at: p.i })
+            fail(RegexError{ why: "a backreference is not supported — remembering where the match has been is what makes an engine exponential", at: p.i })
         }
         return ref(escape_node(e))
     }
     if c == ")" or c.is_empty() {
-        fail(Bad{ why: "nothing to repeat or match here", at: p.i })
+        fail(RegexError{ why: "nothing to repeat or match here", at: p.i })
     }
     if c == "*" or c == "+" or c == "?" {
-        fail(Bad{ why: "`{c}` with nothing before it", at: p.i })
+        fail(RegexError{ why: "`{c}` with nothing before it", at: p.i })
     }
     p.i = p.i + 1
     ref(Char(c))
 }
 
-fn escape_node(e: str) -> Node {
+fn escape_node(e: str) -> RegexNode {
     if e == "d" {
         return Class("", false, ["0", "9"])
     }
@@ -262,7 +262,7 @@ fn escape_node(e: str) -> Node {
     Char(e)
 }
 
-fn parse_class(inout p: P) -> ref Node ! Bad {
+fn parse_class(inout p: RegexReader) -> ref RegexNode ! RegexError {
     p.i = p.i + 1
     var negated = false
     if peek(p) == "^" {
@@ -279,7 +279,7 @@ fn parse_class(inout p: P) -> ref Node ! Bad {
             p.i = p.i + 1
             let e = peek(p)
             if e.is_empty() {
-                fail(Bad{ why: "a character class ending in a backslash", at: p.i })
+                fail(RegexError{ why: "a character class ending in a backslash", at: p.i })
             }
             p.i = p.i + 1
             match escape_node(e) {
@@ -289,14 +289,14 @@ fn parse_class(inout p: P) -> ref Node ! Bad {
                     // hyphen. A *negated* one inside is refused rather than
                     // silently taken as its positive half.
                     if neg {
-                        fail(Bad{ why: "a negated class inside a class", at: p.i })
+                        fail(RegexError{ why: "a negated class inside a class", at: p.i })
                     }
                     set = set + s
                     for r in rs {
                         ranges.push(r)
                     }
                 }
-                _ -> fail(Bad{ why: "that escape means nothing in a class", at: p.i })
+                _ -> fail(RegexError{ why: "that escape means nothing in a class", at: p.i })
             }
             continue
         }
@@ -311,7 +311,7 @@ fn parse_class(inout p: P) -> ref Node ! Bad {
             }
             p.i = p.i + 1
             if high.code_at(0) < low.code_at(0) {
-                fail(Bad{ why: "a range that runs backwards", at: p.i })
+                fail(RegexError{ why: "a range that runs backwards", at: p.i })
             }
             ranges.push(low)
             ranges.push(high)
@@ -320,7 +320,7 @@ fn parse_class(inout p: P) -> ref Node ! Bad {
         set = set + c
     }
     if peek(p) != "]" {
-        fail(Bad{ why: "a character class with no closing bracket", at: p.i })
+        fail(RegexError{ why: "a character class with no closing bracket", at: p.i })
     }
     p.i = p.i + 1
     ref(Class(set, negated, ranges))
@@ -334,7 +334,7 @@ fn parse_class(inout p: P) -> ref Node ! Bad {
 // which is the whole trick — it is what bounds the work at one visit per
 // state per position and what a backtracker does not do.
 
-type Inst =
+type RegexInst =
     | IChar(c: str)
     | IClass(set: str, negated: bool, ranges: [str])
     | IAny
@@ -345,9 +345,9 @@ type Inst =
     | IEnd
     | IMatch
 
-type Program = { insts: [Inst], slots: i64 }
+type RegexProgram = { insts: [RegexInst], slots: i64 }
 
-fn emit(inout prog: [Inst], node: ref Node) {
+fn emit(inout prog: [RegexInst], node: ref RegexNode) {
     match node {
         Empty -> {}
         Char(c) -> prog.push(IChar(c))
@@ -423,16 +423,16 @@ fn emit(inout prog: [Inst], node: ref Node) {
 
 let MAX_PROGRAM = 100000
 
-pub fn program_of(r: Regex) -> Program ! Bad {
-    var insts: [Inst] = []
+pub fn program_of(r: Regex) -> RegexProgram ! RegexError {
+    var insts: [RegexInst] = []
     insts.push(ISave(0))
     emit(insts, r.root)
     insts.push(ISave(1))
     insts.push(IMatch)
     if insts.len() > MAX_PROGRAM {
-        fail(Bad{ why: "the pattern expands to {insts.len()} instructions, over the limit of {MAX_PROGRAM}", at: 0 })
+        fail(RegexError{ why: "the pattern expands to {insts.len()} instructions, over the limit of {MAX_PROGRAM}", at: 0 })
     }
-    Program{ insts: insts, slots: (r.groups + 1) * 2 }
+    RegexProgram{ insts: insts, slots: (r.groups + 1) * 2 }
 }
 
 // --- matching ---------------------------------------------------------------
@@ -451,7 +451,7 @@ fn in_class(c: str, set: str, negated: bool, ranges: [str]) -> bool {
     if negated { not hit } else { hit }
 }
 
-fn add_thread(prog: Program, pc: i64, saved: [i64], pos: i64, len: i64,
+fn add_thread(prog: RegexProgram, pc: i64, saved: [i64], pos: i64, len: i64,
               inout pcs: [i64], inout saves: [[i64]], inout seen: [bool]) {
     if seen[pc] {
         return
@@ -508,7 +508,7 @@ fn fresh_seen(n: i64) -> [bool] {
 /// alternation order prefers. Threads are seeded one position at a time and a
 /// match stops the seeding, which is what makes it leftmost rather than
 /// longest.
-pub fn find_from(r: Regex, text: str, from: i64) -> Option[Match] {
+pub fn find_from(r: Regex, text: str, from: i64) -> Option[RegexMatch] {
     let prog = match program_of(r) {
         Ok(p) -> p
         Err(e) -> return None
@@ -588,7 +588,7 @@ pub fn find_from(r: Regex, text: str, from: i64) -> Option[Match] {
         }
         g = g + 1
     }
-    Some(Match{ start: best[0], end: best[1],
+    Some(RegexMatch{ start: best[0], end: best[1],
                 text: slice_chars(cs, best[0], best[1]),
                 groups: groups, starts: starts })
 }
@@ -603,7 +603,7 @@ fn slice_chars(cs: [str], a: i64, b: i64) -> str {
     out
 }
 
-pub fn find(r: Regex, text: str) -> Option[Match] {
+pub fn find(r: Regex, text: str) -> Option[RegexMatch] {
     find_from(r, text, 0)
 }
 
@@ -624,8 +624,8 @@ pub fn matches_all(r: Regex, text: str) -> bool {
 /// An empty match advances by one so the loop ends: `a*` against `bbb`
 /// matches nothing at every position, and a loop that trusts `end` to move
 /// runs forever.
-pub fn find_all(r: Regex, text: str) -> [Match] {
-    var out: [Match] = []
+pub fn find_all(r: Regex, text: str) -> [RegexMatch] {
+    var out: [RegexMatch] = []
     var from = 0
     let n = text.len()
     while from <= n {
@@ -662,7 +662,7 @@ pub fn replace_first(r: Regex, text: str, replacement: str) -> str {
     }
 }
 
-fn expand(replacement: str, m: Match) -> str {
+fn expand(replacement: str, m: RegexMatch) -> str {
     if not replacement.contains("$") {
         return replacement
     }

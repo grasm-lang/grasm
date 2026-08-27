@@ -1,0 +1,8 @@
+[package]
+name = "dotenv"
+version = "1.0.0"
+entry = "src/main.gr"
+
+# Reading the file is the one thing here that reaches anything. Parsing is
+# separate and reaches nothing, so a test hands it text.
+capabilities = ["io"]

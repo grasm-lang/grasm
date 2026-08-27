@@ -1,0 +1,261 @@
+// `.env` files.
+//
+// It answers a map. It does **not** put anything into the process
+// environment, and that is deliberate: the environment is global, other
+// threads see it change, and a library that writes to it has reached past its
+// caller into a place nothing can undo. What the program does with the map is
+// the program's decision.
+//
+// Reading the file is `io` and is the one thing here that reaches anything.
+// Parsing is separate and declares nothing, so a test can hand it text.
+
+type DotenvError = { why: str, line: i64 }
+
+/// Text to a map. `KEY=value`, `export KEY=value`, `#` comments, single and
+/// double quotes, `\n` escapes inside double quotes, and `${OTHER}`
+/// interpolation from what has been read so far plus the `given` map.
+///
+/// Interpolation happens only inside double quotes and unquoted values, never
+/// inside single quotes — which is the shell's rule and the one every `.env`
+/// file was written against.
+pub fn parse_with(text: str, given: Map[str, str]) -> Map[str, str] ! DotenvError {
+    var out = given
+    var line_no = 0
+    var pending = ""
+    var pending_key = ""
+    var in_multiline = false
+    var quote = ""
+    for raw in text.lines() {
+        line_no = line_no + 1
+        if in_multiline {
+            if raw.ends_with(quote) {
+                pending = pending + "\n" + raw.substr(0, raw.len() - 1)
+                out.set(pending_key, if quote == "\"" { expand(unescape(pending), out) } else { pending })
+                in_multiline = false
+                pending = ""
+                continue
+            }
+            pending = pending + "\n" + raw
+            continue
+        }
+        var line = raw.trim()
+        if line.is_empty() or line.starts_with("#") {
+            continue
+        }
+        if line.starts_with("export ") {
+            line = line.substr(7, line.len() - 7).trim()
+        }
+        let at = match line.index_of("=") {
+            Some(i) -> i
+            None -> fail(DotenvError{ why: "a line with no `=`", line: line_no })
+        }
+        let key = line.substr(0, at).trim()
+        if key.is_empty() {
+            fail(DotenvError{ why: "an assignment with no name", line: line_no })
+        }
+        if not name_shaped(key) {
+            fail(DotenvError{ why: "`{key}` is not a variable name", line: line_no })
+        }
+        var value = line.substr(at + 1, line.len() - at - 1).trim()
+        if value.starts_with("\"") or value.starts_with("'") {
+            let q = value.substr(0, 1)
+            let body = value.substr(1, value.len() - 1)
+            // Where the quote *closes*, not whether the line ends with one:
+            // `A="a # b"  # comment` ends with a comment, and asking whether
+            // the line ended in a quote made that a value running on to the
+            // next line.
+            let close = closing_quote(body, q)
+            if close >= 0 {
+                let inner = body.substr(0, close)
+                out.set(key, if q == "\"" { expand(unescape(inner), out) } else { inner })
+                continue
+            }
+            // An opening quote with no closing one on this line: a value that
+            // runs on. Refusing here would reject every multi-line secret
+            // anybody has ever put in one of these files.
+            in_multiline = true
+            quote = q
+            pending_key = key
+            pending = body
+            continue
+        }
+        // An unquoted value ends at a `#` that follows whitespace, which is a
+        // comment; a `#` with no space before it is part of the value, as it
+        // is in a URL fragment or a colour.
+        match value.index_of(" #") {
+            Some(i) -> value = value.substr(0, i).trim()
+            None -> {}
+        }
+        out.set(key, expand(value, out))
+    }
+    if in_multiline {
+        fail(DotenvError{ why: "a value that never closes its quote", line: line_no })
+    }
+    out
+}
+
+pub fn parse(text: str) -> Map[str, str] ! DotenvError {
+    try parse_with(text, map())
+}
+
+/// Where a quoted value's closing quote is, or -1.
+///
+/// A backslash escapes the next character in a double-quoted value and
+/// nothing at all in a single-quoted one, which is the shell's rule.
+fn closing_quote(body: str, q: str) -> i64 {
+    let cs = body.chars()
+    var i = 0
+    while i < cs.len() {
+        if q == "\"" and cs[i] == "\\" {
+            i = i + 2
+            continue
+        }
+        if cs[i] == q {
+            return i
+        }
+        i = i + 1
+    }
+    0 - 1
+}
+
+fn name_shaped(k: str) -> bool {
+    let cs = k.chars()
+    if cs.is_empty() {
+        return false
+    }
+    let first = cs[0]
+    if not "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_".contains(first) {
+        return false
+    }
+    for c in cs {
+        if not "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_".contains(c) {
+            return false
+        }
+    }
+    true
+}
+
+fn unescape(v: str) -> str {
+    var out = ""
+    let cs = v.chars()
+    var i = 0
+    while i < cs.len() {
+        if cs[i] != "\\" or i + 1 >= cs.len() {
+            out = out + cs[i]
+            i = i + 1
+            continue
+        }
+        let c = cs[i + 1]
+        i = i + 2
+        if c == "n" { out = out + "\n" }
+        else if c == "t" { out = out + "\t" }
+        else if c == "r" { out = out + "\r" }
+        else if c == "\"" { out = out + "\"" }
+        else if c == "\\" { out = out + "\\" }
+        else if c == "$" { out = out + "$" }
+        else { out = out + "\\" + c }
+    }
+    out
+}
+
+/// `${NAME}` replaced by what is already known. An unknown name becomes the
+/// empty string, which is what the shell does — and `$$` is a literal dollar.
+fn expand(v: str, known: Map[str, str]) -> str {
+    if not v.contains("$") {
+        return v
+    }
+    var out = ""
+    let cs = v.chars()
+    var i = 0
+    while i < cs.len() {
+        if cs[i] != "$" or i + 1 >= cs.len() {
+            out = out + cs[i]
+            i = i + 1
+            continue
+        }
+        if cs[i + 1] == "$" {
+            out = out + "$"
+            i = i + 2
+            continue
+        }
+        var name = ""
+        var k = i + 1
+        var braced = false
+        if cs[k] == "\{" {
+            braced = true
+            k = k + 1
+        }
+        while k < cs.len() and cs[k] != "}" and
+              "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_".contains(cs[k]) {
+            name = name + cs[k]
+            k = k + 1
+        }
+        if braced {
+            if k >= cs.len() or cs[k] != "}" {
+                out = out + cs[i]
+                i = i + 1
+                continue
+            }
+            k = k + 1
+        }
+        if name.is_empty() {
+            out = out + cs[i]
+            i = i + 1
+            continue
+        }
+        out = out + (known.get(name) ?? "")
+        i = k
+    }
+    out
+}
+
+/// Read a file and parse it. Missing is not an error — a `.env` is a
+/// convenience for a development machine, and a program that refuses to start
+/// without one cannot be deployed with real environment variables instead.
+pub fn load(path: str) -> Map[str, str] ! DotenvError / {io} {
+    match read_file(path) {
+        Err(e) -> map()
+        Ok(text) -> try parse(text)
+    }
+}
+
+/// The value for a name, or a default. Named so the call site reads as the
+/// question it is.
+pub fn value_of(env: Map[str, str], name: str, fallback: str) -> str {
+    env.get(name) ?? fallback
+}
+
+pub fn int_of(env: Map[str, str], name: str, fallback: i64) -> i64 {
+    match env.get(name) {
+        Some(v) -> v.trim().parse_int() ?? fallback
+        None -> fallback
+    }
+}
+
+/// `true`, `1`, `yes` and `on` are true; `false`, `0`, `no` and `off` are
+/// false; anything else is the default. Not "anything non-empty is true",
+/// which makes `FEATURE=false` turn a feature on.
+pub fn bool_of(env: Map[str, str], name: str, fallback: bool) -> bool {
+    match env.get(name) {
+        Some(v) -> match v.trim().to_lower() {
+            "true" -> true
+            "1" -> true
+            "yes" -> true
+            "on" -> true
+            "false" -> false
+            "0" -> false
+            "no" -> false
+            "off" -> false
+            _ -> fallback
+        }
+        None -> fallback
+    }
+}
+
+/// The names present, sorted. Useful for a startup line that says what was
+/// configured without saying what any of it is.
+pub fn names(env: Map[str, str]) -> [str] {
+    var out = env.keys()
+    out.sort()
+    out
+}

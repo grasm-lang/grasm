@@ -209,7 +209,7 @@ it** — see below.
 
 ### Environment
 
-**29. `dotenv`.** Read a `.env` file, with quoting, comments, multi-line
+**29. `dotenv`.** — **built**, `packages/dotenv`. Read a `.env` file, with quoting, comments, multi-line
 values, and interpolation — and, importantly, *without* mutating the process
 environment, which is a global other threads can see change. It answers a map;
 the program decides what to do with it. Declares `io`.
@@ -220,7 +220,7 @@ XXE happens and there is no reason a first release needs it. Declares nothing.
 
 ### Enterprise security
 
-**31. `jwt`.** Encode, decode and verify HS256, HS384 and HS512 from
+**31. `jwt`.** — **built**, `packages/jwt` (HS256). Encode, decode and verify HS256, HS384 and HS512 from
 `crypto_hash`, with `exp`, `nbf`, `iat`, `aud` and `iss` checked and a clock
 that comes in as an argument. RS256 waits for a reviewed RSA, which waits for
 the same thing TLS does. Declares nothing.
@@ -229,7 +229,7 @@ the same thing TLS does. Declares nothing.
 flow, token refresh, and state. The URL building and the token parsing are
 pure; the exchange is `http_client`. Against a real provider it needs TLS.
 
-**33. `cors`.** Origin matching, preflight, credentials, exposed headers and
+**33. `cors`.** — **built**, `packages/cors`. Origin matching, preflight, credentials, exposed headers and
 max-age, as a function from a request to the headers a response needs. Declares
 nothing — it is a decision, not an action, which is exactly the shape `http`
 already has.

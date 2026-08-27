@@ -1,0 +1,11 @@
+[package]
+name = "cors"
+version = "1.0.0"
+entry = "src/main.gr"
+
+# A decision, not an action: a request in, the headers a response needs out.
+capabilities = []
+
+[dependencies.http]
+path = "../http"
+version = "^1.0.0"

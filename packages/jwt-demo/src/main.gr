@@ -1,0 +1,100 @@
+// The `jwt` package.
+//
+// The clock is written out below, so the expiry cases are the same in every
+// year. The refusals are most of the demo, because verification is where a
+// JWT library is right or wrong.
+import jwt
+
+let KEY = "a key nobody else has"
+let NOW = 1787000000000
+
+fn signed(payload: str) -> str {
+    match jwt.sign(HS256, KEY.to_bytes(), payload) {
+        Ok(t) -> t
+        Err(e) -> "unsigned: {e.why}"
+    }
+}
+
+fn check(label: str, token: str, r: JwtRules) {
+    match jwt.verify(token, HS256, KEY.to_bytes(), r) {
+        Ok(payload) -> print("  {label.pad_end(34, " ")} accepted  {payload}")
+        Err(e) -> print("  {label.pad_end(34, " ")} refused: {e.why}")
+    }
+}
+
+fn main() {
+    let plain = signed("\{\"sub\":\"ada\",\"role\":\"admin\"}")
+    print("-- a signed token")
+    print("  {plain}")
+    match jwt.decode_unverified(plain) {
+        Ok(t) -> {
+            print("  header  {t.header}")
+            print("  payload {t.payload}")
+        }
+        Err(e) -> print("  could not read it: {e.why}")
+    }
+
+    print("-- the signature")
+    check("as issued", plain, jwt.rules(NOW))
+    check("one character changed", plain.substr(0, plain.len() - 1) + "X", jwt.rules(NOW))
+    check("payload swapped", swap_payload(plain), jwt.rules(NOW))
+    check("two parts", "a.b", jwt.rules(NOW))
+    check("not base64", "!!!.!!!.!!!", jwt.rules(NOW))
+
+    print("-- the algorithm comes from the caller, never the token")
+    // `alg: none` with an empty signature is the oldest JWT attack there is.
+    // It is not refused by a special case; it is refused because the caller
+    // said HS256 and the token does not.
+    let none_token = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiJhZG1pbiJ9."
+    check("alg: none", none_token, jwt.rules(NOW))
+    match jwt.sign(HS384, KEY.to_bytes(), "\{}") {
+        Ok(t) -> print("  HS384 signed, which it should not be")
+        Err(e) -> print("  HS384 refused: {e.why}")
+    }
+
+    print("-- expiry, with the clock written out")
+    let past = "\{\"sub\":\"ada\",\"exp\":{NOW / 1000 - 10}}"
+    let future = "\{\"sub\":\"ada\",\"exp\":{NOW / 1000 + 10}}"
+    check("expired ten seconds ago", signed(past), jwt.rules(NOW))
+    check("expires in ten seconds", signed(future), jwt.rules(NOW))
+    check("expired, with 30s leeway", signed(past), jwt.with_leeway(jwt.rules(NOW), 30000))
+    check("no expiry, not required", plain, jwt.rules(NOW))
+    check("no expiry, required", plain, jwt.requiring_expiry(jwt.rules(NOW)))
+
+    print("-- not before, and issued at")
+    check("not yet valid", signed("\{\"nbf\":{NOW / 1000 + 60}}"), jwt.rules(NOW))
+    check("valid since a minute ago", signed("\{\"nbf\":{NOW / 1000 - 60}}"), jwt.rules(NOW))
+    check("issued in the future", signed("\{\"iat\":{NOW / 1000 + 60}}"), jwt.rules(NOW))
+    check("issued a minute ago", signed("\{\"iat\":{NOW / 1000 - 60}}"), jwt.rules(NOW))
+
+    print("-- issuer and audience")
+    let addressed = signed("\{\"iss\":\"auth.test\",\"aud\":[\"api\",\"admin\"]}")
+    check("right issuer", addressed, jwt.requiring_issuer(jwt.rules(NOW), "auth.test"))
+    check("wrong issuer", addressed, jwt.requiring_issuer(jwt.rules(NOW), "other.test"))
+    check("audience in the list", addressed, jwt.requiring_audience(jwt.rules(NOW), "admin"))
+    check("audience not in the list", addressed, jwt.requiring_audience(jwt.rules(NOW), "web"))
+    check("a single-string audience", signed("\{\"aud\":\"api\"}"),
+          jwt.requiring_audience(jwt.rules(NOW), "api"))
+
+    print("-- reading a claim from a verified payload")
+    match jwt.verify(plain, HS256, KEY.to_bytes(), jwt.rules(NOW)) {
+        Err(e) -> print("  refused")
+        Ok(payload) -> {
+            print("  sub  {jwt.claim(payload, "sub") ?? "(absent)"}")
+            print("  role {jwt.claim(payload, "role") ?? "(absent)"}")
+            print("  nope {jwt.claim(payload, "nope") ?? "(absent)"}")
+        }
+    }
+}
+
+fn swap_payload(token: str) -> str {
+    let parts = token.split(".")
+    if parts.len() != 3 {
+        return token
+    }
+    // A different payload with the original signature: the shape of every
+    // "I edited my own token" attempt.
+    let forged = jwt.sign(HS256, "another key".to_bytes(), "\{\"sub\":\"root\"}") ?? token
+    let other = forged.split(".")
+    parts[0] + "." + other[1] + "." + parts[2]
+}

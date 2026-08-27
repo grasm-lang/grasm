@@ -1,0 +1,8 @@
+[package]
+name = "jwt_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.jwt]
+path = "../jwt"
+version = "^1.0.0"

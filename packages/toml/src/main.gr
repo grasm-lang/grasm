@@ -22,7 +22,7 @@ type Value =
     | Array(items: [ref Value])
     | Table(keys: [str], values: [ref Value])
 
-type Bad = { why: str, line: i64 }
+type TomlError = { why: str, line: i64 }
 
 type Doc = { keys: [str], values: [ref Value], ok: bool, why: str, line: i64 }
 
@@ -145,10 +145,10 @@ fn unquote_path(s: str) -> str {
     parts.join(".")
 }
 
-fn read_value(text: str, line_no: i64) -> ref Value ! Bad {
+fn read_value(text: str, line_no: i64) -> ref Value ! TomlError {
     let t = text.trim()
     if t.is_empty() {
-        fail(Bad{ why: "an assignment with no value", line: line_no })
+        fail(TomlError{ why: "an assignment with no value", line: line_no })
     }
     if t == "true" {
         return ref(Bool(true))
@@ -180,10 +180,10 @@ fn read_value(text: str, line_no: i64) -> ref Value ! Bad {
     ref(Text(t))
 }
 
-fn read_string(t: str, line_no: i64) -> str ! Bad {
+fn read_string(t: str, line_no: i64) -> str ! TomlError {
     let quote = t.substr(0, 1)
     if t.len() < 2 or not t.ends_with(quote) {
-        fail(Bad{ why: "a string with no closing quote", line: line_no })
+        fail(TomlError{ why: "a string with no closing quote", line: line_no })
     }
     let body = t.substr(1, t.len() - 2)
     if quote == "'" {
@@ -200,7 +200,7 @@ fn read_string(t: str, line_no: i64) -> str ! Bad {
             continue
         }
         if i + 1 >= cs.len() {
-            fail(Bad{ why: "a string ending in a backslash", line: line_no })
+            fail(TomlError{ why: "a string ending in a backslash", line: line_no })
         }
         let c = cs[i + 1]
         i = i + 2
@@ -216,19 +216,19 @@ fn read_string(t: str, line_no: i64) -> str ! Bad {
             while read < 4 and i < cs.len() {
                 let d = cs[i].to_lower().parse_int_base(16) ?? -1
                 if d < 0 {
-                    fail(Bad{ why: "a \\u escape with fewer than four hex digits", line: line_no })
+                    fail(TomlError{ why: "a \\u escape with fewer than four hex digits", line: line_no })
                 }
                 n = n * 16 + d
                 read = read + 1
                 i = i + 1
             }
             if read < 4 {
-                fail(Bad{ why: "a \\u escape with fewer than four hex digits", line: line_no })
+                fail(TomlError{ why: "a \\u escape with fewer than four hex digits", line: line_no })
             }
             out = out + n.to_char()
         }
         else {
-            fail(Bad{ why: "an unknown escape \\{c}", line: line_no })
+            fail(TomlError{ why: "an unknown escape \\{c}", line: line_no })
         }
     }
     out
@@ -274,9 +274,9 @@ fn split_top(body: str) -> [str] {
     parts
 }
 
-fn read_array(t: str, line_no: i64) -> ref Value ! Bad {
+fn read_array(t: str, line_no: i64) -> ref Value ! TomlError {
     if not t.ends_with("]") {
-        fail(Bad{ why: "an array with no closing bracket", line: line_no })
+        fail(TomlError{ why: "an array with no closing bracket", line: line_no })
     }
     let body = t.substr(1, t.len() - 2).trim()
     var items: [ref Value] = []
@@ -289,9 +289,9 @@ fn read_array(t: str, line_no: i64) -> ref Value ! Bad {
     ref(Array(items))
 }
 
-fn read_inline_table(t: str, line_no: i64) -> ref Value ! Bad {
+fn read_inline_table(t: str, line_no: i64) -> ref Value ! TomlError {
     if not t.ends_with("}") {
-        fail(Bad{ why: "an inline table with no closing brace", line: line_no })
+        fail(TomlError{ why: "an inline table with no closing brace", line: line_no })
     }
     let body = t.substr(1, t.len() - 2).trim()
     var keys: [str] = []
@@ -302,7 +302,7 @@ fn read_inline_table(t: str, line_no: i64) -> ref Value ! Bad {
     for part in split_top(body) {
         let p = part.trim()
         match p.index_of("=") {
-            None -> fail(Bad{ why: "an inline table entry with no `=`", line: line_no })
+            None -> fail(TomlError{ why: "an inline table entry with no `=`", line: line_no })
             Some(at) -> {
                 keys.push(unquote_path(p.substr(0, at).trim()))
                 values.push(try read_value(p.substr(at + 1, p.len() - at - 1).trim(), line_no))

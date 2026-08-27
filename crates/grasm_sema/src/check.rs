@@ -774,6 +774,14 @@ struct Checker {
     /// Alias names seen so far, across every module, for duplicate detection
     /// — `self.aliases` is not filled until the resolving pass runs.
     alias_names: std::collections::HashSet<String>,
+    /// Which module declared each type name.
+    ///
+    /// Types share one namespace across the whole program ([T-MODULE-NS]), so
+    /// two *packages* that each declare a `Bad` collide in a consumer that
+    /// imports both — and the consumer owns neither. "duplicate type name
+    /// `Bad`" pointed at one dependency's line and never said there was
+    /// another (F78).
+    type_module: HashMap<String, String>,
     /// Module-level constants: `module::NAME` to (type, is_pub).
     consts: HashMap<String, (Type, bool)>,
     /// (ret, err) of the function being checked.
@@ -874,6 +882,7 @@ impl Checker {
             pending_type_bodies: Vec::new(),
             pending_aliases: Vec::new(),
             alias_names: std::collections::HashSet::new(),
+            type_module: HashMap::new(),
             consts: HashMap::new(),
             fn_ret: Type::Unit,
             fn_err: None,
@@ -928,6 +937,33 @@ impl Checker {
     // Declaration collection
     // ------------------------------------------------------------------
 
+    /// A type name declared twice, said so that the reader can find both.
+    ///
+    /// The two declarations are often in two *packages*, neither of which the
+    /// person reading owns — so the message names the module each is in and
+    /// says why one namespace is the rule, rather than pointing at a line in
+    /// somebody else's library and stopping.
+    fn duplicate_type(&mut self, name: &Ident) {
+        let here = self.current_module.clone();
+        match self.type_module.get(&name.name).cloned() {
+            Some(there) if there != here => {
+                self.error_help(
+                name.span,
+                format!(
+                    "duplicate type name `{}` — `{there}` declares one too",
+                    name.name
+                ),
+                "types share one namespace across the whole program ([T-MODULE-NS]), \
+so two packages cannot each declare a type of the same name — rename one, or, \
+if you own neither, ask whichever is yours to prefix its types",
+                );
+            }
+            _ => {
+                self.error(name.span, format!("duplicate type name `{}`", name.name));
+            }
+        }
+    }
+
     fn collect_types(&mut self, module: &Module) {
         // Pass 1: register names so recursive references resolve.
         let mut ids: Vec<(usize, TypeDefId)> = Vec::new();
@@ -964,19 +1000,21 @@ resolves to the builtin; pick a different name",
                             "pick a different name (e.g. `AppError`)",
                         );
                     } else {
-                        self.error(t.name.span, format!("duplicate type name `{}`", t.name.name));
+                        self.duplicate_type(&t.name);
                     }
                     continue;
                 }
                 if self.aliases.contains_key(&t.name.name)
                     || self.alias_names.contains(&t.name.name)
                 {
-                    self.error(t.name.span, format!("duplicate type name `{}`", t.name.name));
+                    self.duplicate_type(&t.name);
                     continue;
                 }
                 match &t.body {
                     TypeBody::Alias(_) => {
                         self.alias_names.insert(t.name.name.clone());
+                        self.type_module
+                            .insert(t.name.name.clone(), self.current_module.clone());
                         alias_decls.push(di);
                         // The `pub` check runs over the types pass 2 gives
                         // bodies, which an alias never reaches — so
@@ -997,6 +1035,8 @@ already reachable from every module — drop the `pub`",
                             generics: t.generics.iter().map(|g| g.name.clone()).collect(),
                             kind: TypeDefKind::Struct { fields: vec![] },
                         });
+                        self.type_module
+                            .insert(t.name.name.clone(), self.current_module.clone());
                         ids.push((di, id));
                     }
                 }

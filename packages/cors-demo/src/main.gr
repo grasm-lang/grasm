@@ -1,0 +1,82 @@
+// The `cors` package. A request in, the headers a response needs out — so
+// every case here is text, and three engines agree on all of it.
+import cors
+import http
+
+fn request(method: str, headers: [str]) -> Request {
+    var raw = "{method} /api HTTP/1.1\r\nHost: api.test\r\n"
+    for h in headers {
+        raw = raw + h + "\r\n"
+    }
+    http.parse_request(raw + "\r\n")
+}
+
+fn show(label: str, p: Policy, r: Request) {
+    var parts: [str] = []
+    for h in cors.headers_for(p, r) {
+        parts.push("{h.name}: {h.value}")
+    }
+    if parts.is_empty() {
+        print("  {label.pad_end(38, " ")} (no headers)")
+        return
+    }
+    print("  {label.pad_end(38, " ")} {parts.join("  |  ")}")
+}
+
+fn main() {
+    let strict = cors.with_headers(
+        cors.allowing(cors.policy(), "https://app.test"),
+        ["Content-Type", "Authorization"])
+
+    print("-- a simple request")
+    show("no origin at all", strict, request("GET", []))
+    show("an allowed origin", strict, request("GET", ["Origin: https://app.test"]))
+    show("another origin", strict, request("GET", ["Origin: https://evil.test"]))
+    show("a near miss", strict, request("GET", ["Origin: https://app.test.evil.test"]))
+    show("http where https was allowed", strict, request("GET", ["Origin: http://app.test"]))
+
+    print("-- a preflight")
+    let pre = request("OPTIONS", ["Origin: https://app.test",
+                                  "Access-Control-Request-Method: POST",
+                                  "Access-Control-Request-Headers: content-type"])
+    print("  is_preflight: {cors.is_preflight(pre)}")
+    show("with POST allowed", cors.with_methods(strict, ["GET", "POST"]), pre)
+    show("with POST not allowed", cors.with_methods(strict, ["GET"]), pre)
+    let asks_more = request("OPTIONS", ["Origin: https://app.test",
+                                        "Access-Control-Request-Method: GET",
+                                        "Access-Control-Request-Headers: content-type, x-secret"])
+    show("asking for a header not allowed", strict, asks_more)
+    show("with a max-age", cors.caching_preflight(strict, 600), pre)
+    print("  an OPTIONS with no requested method is not a preflight: {cors.is_preflight(request("OPTIONS", ["Origin: https://app.test"]))}")
+
+    print("-- any origin")
+    let open_policy = cors.allowing_any(cors.policy())
+    show("anywhere", open_policy, request("GET", ["Origin: https://anything.test"]))
+    print("  allows_origin with credentials on: {cors.allows_origin(cors.with_credentials(open_policy), "https://anything.test")}")
+    print("  — because `*` and credentials are incompatible, and a browser would refuse it anyway")
+
+    print("-- credentials, on a named origin")
+    let creds = cors.with_credentials(strict)
+    show("allowed origin", creds, request("GET", ["Origin: https://app.test"]))
+
+    print("-- exposing response headers")
+    let exposed = cors.exposing(strict, ["X-Request-Id", "X-Total-Count"])
+    show("allowed origin", exposed, request("GET", ["Origin: https://app.test"]))
+
+    print("-- decorating a real response")
+    let resp = cors.decorate(strict, request("GET", ["Origin: https://app.test"]),
+                             http.json("\{\"ok\":true}\n"))
+    for line in http.render(resp).split("\r\n") {
+        if not line.is_empty() {
+            print("  {line}")
+        }
+    }
+
+    print("-- the preflight response itself")
+    let pr = cors.preflight_response(cors.with_methods(strict, ["GET", "POST"]), pre)
+    for line in http.render(pr).split("\r\n") {
+        if not line.is_empty() {
+            print("  {line}")
+        }
+    }
+}

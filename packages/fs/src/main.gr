@@ -7,18 +7,18 @@
 // compiler will hold it to the difference.
 import path
 
-type Entry = { path: str, name: str, is_dir: bool }
+type FsEntry = { path: str, name: str, is_dir: bool }
 
-/// The entries of a directory, sorted, as `Entry` values.
+/// The entries of a directory, sorted, as `FsEntry` values.
 ///
 /// `list_dir` answers names; this answers paths and says which are
 /// directories, because every caller wanted both and computing them from the
 /// name means joining and stat-ing in the caller.
-pub fn entries(dir: str) -> [Entry] ! IoError / {io} {
-    var out: [Entry] = []
+pub fn entries(dir: str) -> [FsEntry] ! IoError / {io} {
+    var out: [FsEntry] = []
     for name in try list_dir(dir) {
         let full = path.join(dir, name)
-        out.push(Entry{ path: full, name: name, is_dir: is_dir(full) })
+        out.push(FsEntry{ path: full, name: name, is_dir: is_dir(full) })
     }
     out
 }

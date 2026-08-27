@@ -367,12 +367,46 @@ def main():
                     disagreed.append(label + " / bundle")
                     print(f"DISAGREES {label}\n  interpreter: {out}\n  bundle: {o5} {e5}")
 
+        holes: list = []
+
+        # --- one namespace ----------------------------------------------
+        #
+        # Types share one namespace across the whole program ([T-MODULE-NS]),
+        # which means two *packages* that each declare a `Bad` collide in any
+        # consumer that imports both — and the consumer owns neither. That is
+        # the design; what was untested is that it holds across packages at
+        # all, and that the refusal says which two modules are involved
+        # rather than pointing at one line in somebody else's library (F78).
+        namespace = 0
+        for name_b, must_build in (("Bad", False), ("BBad", True)):
+            shutil.rmtree(work, ignore_errors=True)
+            write(work, "a", [], "type Bad = { why: str }\n\n"
+                  'pub fn make_a() -> Bad {\n    Bad{ why: "a" }\n}\n', [])
+            write(work, "b", [], f"type {name_b} = {{ why: str }}\n\n"
+                  f'pub fn make_b() -> {name_b} {{\n    {name_b}{{ why: "b" }}\n}}\n', [])
+            write(work, "app", ["a", "b"],
+                  "import a\nimport b\n\nfn main() {\n"
+                  '    print("{a.make_a().why}{b.make_b().why}")\n}\n', ["io"])
+            src = os.path.join(work, "app", "src", "main.gr")
+            rc, out, err = run([GRASM, "run", src])
+            namespace += 1
+            built = rc == 0
+            if built != must_build:
+                holes.append(f"namespace/{name_b}")
+                if must_build:
+                    print(f"NAMESPACE refuses two packages with distinct type names:\n{err or out}")
+                else:
+                    print("NAMESPACE lets two packages declare the same type name")
+            elif not built and "declares one too" not in (err + out):
+                holes.append("namespace/message")
+                print("NAMESPACE refuses without naming the other module:")
+                print(err or out)
+
         # --- the ceiling ------------------------------------------------
         #
         # Both directions. A checker that refuses every package satisfies the
         # first case on its own, which is why the second is here.
         ceiling = 0
-        holes = []
         WORLD = (
             'pub fn shout(msg: str) / {io} {\n    print("{msg}")\n}\n',
             'import far\n\nfn main() {\n    far.shout("42")\n}\n',
@@ -412,7 +446,8 @@ def main():
         print(
             f"programs: {programs}   disagreed: {len(disagreed)}   "
             f"refused: {len(refused)}   wrong: {len(wrong)}   leaked: {len(leaks)}   "
-            f"ceiling cases: {ceiling}   holes: {len(holes)}"
+            f"ceiling cases: {ceiling}   namespace cases: {namespace}   "
+            f"holes: {len(holes)}"
         )
     finally:
         if args.keep:

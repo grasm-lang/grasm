@@ -11,10 +11,10 @@
 // hit. So it answers the new cache alongside the value, rather than hiding a
 // mutation behind a name that reads like a question.
 
-type Entry[V] = { key: str, value: V, expires_ms: i64, used: i64 }
+type CacheEntry[V] = { key: str, value: V, expires_ms: i64, used: i64 }
 
 type Cache[V] = {
-    entries: [Entry[V]],
+    entries: [CacheEntry[V]],
     capacity: i64,
     ttl_ms: i64,
     clock: i64,
@@ -31,12 +31,12 @@ type Cache[V] = {
 /// useful thing to be able to configure: it turns the cache off without
 /// removing it from the code.
 pub fn new_cache[V](capacity: i64, ttl_ms: i64) -> Cache[V] {
-    let empty: [Entry[V]] = []
+    let empty: [CacheEntry[V]] = []
     Cache{ entries: empty, capacity: capacity, ttl_ms: ttl_ms, clock: 0,
            hits: 0, misses: 0, evictions: 0, expiries: 0 }
 }
 
-fn not_expired[V](e: Entry[V], now_ms: i64) -> bool {
+fn not_expired[V](e: CacheEntry[V], now_ms: i64) -> bool {
     e.expires_ms <= 0 or now_ms < e.expires_ms
 }
 
@@ -45,7 +45,7 @@ fn not_expired[V](e: Entry[V], now_ms: i64) -> bool {
 /// Answers the cache too, because a hit is a change: the entry becomes the
 /// most recently used, and the counters move.
 pub fn get[V](c: Cache[V], key: str, now_ms: i64) -> (Cache[V], Option[V]) {
-    var kept: [Entry[V]] = []
+    var kept: [CacheEntry[V]] = []
     var found: Option[V] = None
     var expired = 0
     let tick = c.clock + 1
@@ -63,7 +63,7 @@ pub fn get[V](c: Cache[V], key: str, now_ms: i64) -> (Cache[V], Option[V]) {
             continue
         }
         found = Some(e.value)
-        kept.push(Entry{ key: e.key, value: e.value,
+        kept.push(CacheEntry{ key: e.key, value: e.value,
                          expires_ms: e.expires_ms, used: tick })
     }
     let hit = found.is_some()
@@ -81,7 +81,7 @@ pub fn get[V](c: Cache[V], key: str, now_ms: i64) -> (Cache[V], Option[V]) {
 /// bounded by its use, which is the behaviour wanted anyway.
 pub fn put[V](c: Cache[V], key: str, value: V, now_ms: i64) -> Cache[V] {
     let tick = c.clock + 1
-    var kept: [Entry[V]] = []
+    var kept: [CacheEntry[V]] = []
     var expired = 0
     for e in c.entries {
         if e.key == key {
@@ -95,7 +95,7 @@ pub fn put[V](c: Cache[V], key: str, value: V, now_ms: i64) -> Cache[V] {
     }
     var evicted = 0
     if c.capacity > 0 {
-        kept.push(Entry{ key: key, value: value,
+        kept.push(CacheEntry{ key: key, value: value,
                          expires_ms: if c.ttl_ms > 0 { now_ms + c.ttl_ms } else { 0 },
                          used: tick })
         // Least recently used first, until it fits. `sort_by` is stable, so
@@ -118,7 +118,7 @@ pub fn put[V](c: Cache[V], key: str, value: V, now_ms: i64) -> Cache[V] {
 }
 
 pub fn remove[V](c: Cache[V], key: str) -> Cache[V] {
-    var kept: [Entry[V]] = []
+    var kept: [CacheEntry[V]] = []
     for e in c.entries {
         if e.key != key {
             kept.push(e)
@@ -130,7 +130,7 @@ pub fn remove[V](c: Cache[V], key: str) -> Cache[V] {
 }
 
 pub fn clear[V](c: Cache[V]) -> Cache[V] {
-    let empty: [Entry[V]] = []
+    let empty: [CacheEntry[V]] = []
     Cache{ entries: empty, capacity: c.capacity, ttl_ms: c.ttl_ms, clock: c.clock,
            hits: c.hits, misses: c.misses, evictions: c.evictions,
            expiries: c.expiries }
@@ -159,7 +159,7 @@ pub fn has[V](c: Cache[V], key: str, now_ms: i64) -> bool {
 /// The keys held, most recently used first — which is the order eviction
 /// works backwards from, so printing it is how a test sees what will go next.
 pub fn keys[V](c: Cache[V], now_ms: i64) -> [str] {
-    var live: [Entry[V]] = []
+    var live: [CacheEntry[V]] = []
     for e in c.entries {
         if not_expired(e, now_ms) {
             live.push(e)
@@ -177,7 +177,7 @@ pub fn keys[V](c: Cache[V], now_ms: i64) -> [str] {
 /// having because `size` and `keys` skip them without removing them, so a
 /// cache that is never written to keeps the memory.
 pub fn sweep[V](c: Cache[V], now_ms: i64) -> Cache[V] {
-    var kept: [Entry[V]] = []
+    var kept: [CacheEntry[V]] = []
     var expired = 0
     for e in c.entries {
         if not_expired(e, now_ms) {

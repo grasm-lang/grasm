@@ -39,7 +39,7 @@ page is regenerated from that record. None of them is typed by hand.</p>
 
 <h2>What holds</h2>
 <div class="figures">
-  <div class="fig"><b>247</b><span>programs, three engines</span></div>
+  <div class="fig"><b>250</b><span>programs, three engines</span></div>
   <div class="fig"><b>189</b><span>identical in wasm</span></div>
   <div class="fig"><b>227</b><span>cross-compiled, agreeing</span></div>
   <div class="fig"><b>0</b><span>open defects</span></div>
@@ -48,14 +48,14 @@ page is regenerated from that record. None of them is typed by hand.</p>
 </div>
 <p>Interpreter, bundle and native builds agree byte for byte on stdout, exit
 code and diagnostics. A wasm build agrees on the 189 programs that do not
-need a filesystem, a socket, a process or threads. The same 247 cross-compile to
+need a filesystem, a socket, a process or threads. The same 250 cross-compile to
 x86_64 and agree there. Every generated program is checked for what it keeps as
 well as for what it prints.</p>
 
 <h2>What does not work</h2>
 <div class="scroll"><table>
 <tr><th>Limit</th><th>Detail</th></tr>
-<tr><td>Twenty libraries, all first-party</td><td>See <a href="packages.html">Packages</a>; the plan for the rest is in <code>docs/packages-plan.md</code>. Anything else you need, you write, or bind to C with <code>extern fn</code>.</td></tr>
+<tr><td>Twenty-three libraries, all first-party</td><td>See <a href="packages.html">Packages</a>; the plan for the rest is in <code>docs/packages-plan.md</code>. Anything else you need, you write, or bind to C with <code>extern fn</code>.</td></tr>
 <tr><td>No remote registry</td><td>Path and local-registry dependencies work. Nothing fetches or publishes.</td></tr>
 <tr><td>No release binaries</td><td>Build from source with a Rust toolchain.</td></tr>
 <tr><td>0.45× native Rust</td><td>Measured, floor-subtracted 0.39×, against a 0.95× target.</td></tr>
@@ -72,7 +72,7 @@ working session — falling, but not zero, and a language with zero known defect
 and no users has told you more about its test suite than about itself.</p>
 
 <h2>How that is kept honest</h2>
-<p>All 77 findings are written down in <code>ProjectGold/FINDINGS.md</code>,
+<p>All 78 findings are written down in <code>ProjectGold/FINDINGS.md</code>,
 including the ones that were the test harness's fault, the ones withdrawn as
 wrong, and the ones caught before they shipped. Every gate is verified by
 breaking the thing it guards and confirming it fails.</p>
