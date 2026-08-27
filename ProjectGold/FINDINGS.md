@@ -76,6 +76,7 @@ and the entries disagree.
 | [F58](#f58) | a whole context did not run, twice, in a crossing of panic paths | S3, harness | **fixed** |
 | [F59](#f59) | a handler outlived the block it was installed for | S1, wrong answer and use-after-free | **fixed** |
 | [F60](#f60) | a `with` never said its body had left | S1, codegen bug | **fixed** |
+| [F61](#f61) | `break` and `continue` left the handler installed too | S1, wrong answer | **fixed** |
 
 <!-- end index -->
 ## F1 — a wrapped condition must end the line with the operator (S4) — **fixed**
@@ -2684,3 +2685,39 @@ Found by crossing what a *recoverable* failure leaves behind — a
 half-written `inout`, a partly built list, a `ref` written before the
 fail, a handler stack — the axis after F58's, which asked only where a
 fault happens and not what survives it.
+
+## F61 — `break` and `continue` left the handler installed too (S1, wrong answer) — **fixed**
+
+```
+with Src handled_by SrcHandler{ get: || 42 } {
+    for _i in 0..3 {
+        with Src handled_by SrcHandler{ get: || 7 } {
+            break
+        }
+    }
+    print("{Src.get()}")
+}
+```
+
+`grasm run` prints `42`, `--native` printed `7`. The third exit from a
+`with` block, and the same fault as F59: the pop is written where the
+block ends normally, and a `break` does not end it normally.
+
+F59 fixed the exits that leave the *function* — `return` and `fail` both
+call `emit_scope_decs_all`, which now pops what the function installed.
+A `break` leaves the block and not the function, so none of that runs.
+It also leaves a definite number of `with` blocks rather than all of
+them: the ones between itself and the loop. The loop already records the
+scope depth it was entered at, for the same reason and to solve the same
+problem for scope releases; it records the handler count now too, and
+`break` and `continue` pop the difference.
+
+Predicted rather than stumbled on. F59 and F60 were `fail` and `return`;
+`break` and `continue` are the remaining ways out of a block, and looking
+for them was the whole of this tick's crossing. Unwinding through a
+`spawn` was checked at the same time and was already correct.
+
+**Gate**: `examples/handler_exits.gr` gained three loop exits — a
+`break`, a `continue`, and a `break` from two `with` blocks deep in a
+`while` — and asks afterwards which handler answers. Removing the pop
+makes `difftest` exit 1 naming that program.

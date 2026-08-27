@@ -7,6 +7,8 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
 
 ### Fixed
 
+- `break` and `continue` pop the handlers of the `with` blocks they leave.
+  The third exit from a block, and the same fault as F59 (F61).
 - A handler is popped when a `fail` or `return` leaves its `with` block.
   It stayed installed, so the next operation found the wrong one — and
   after a few rounds, a stack slot in a frame that had gone (F59).

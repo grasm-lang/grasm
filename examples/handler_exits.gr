@@ -62,6 +62,33 @@ fn main() {
         print("{nested_fails(inner) ?? 0 - 1} {Src.get()}")
     }
 
+    // `break` and `continue` leave the block without leaving the function, so
+    // the pop that a `return` or a `fail` does on its way out never runs for
+    // them. They leave every `with` between themselves and the loop, so a
+    // count taken at the loop's entry is what says how many to pop.
+    with Src handled_by SrcHandler{ get: || 42 } {
+        for _i in 0..3 {
+            with Src handled_by inner {
+                break
+            }
+        }
+        for _i in 0..3 {
+            with Src handled_by inner {
+                continue
+            }
+        }
+        var i = 0
+        while i < 3 {
+            i = i + 1
+            with Src handled_by inner {
+                with Src handled_by SrcHandler{ get: || 8 } {
+                    break
+                }
+            }
+        }
+        print("after leaving loops: {Src.get()}")
+    }
+
     // Repeatedly, because one un-popped handler is a wrong answer and several
     // are a stack of dead frames.
     with Src handled_by SrcHandler{ get: || 99 } {

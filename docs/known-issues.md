@@ -112,7 +112,8 @@ at two sites one level apart while reading the same place always compiled
 (F56). Closed on 2026-08-27: a handler left installed when a `fail` or
 `return` leaves its `with` block, which answered from the wrong handler and
 then from a dead frame (F59), and the `return` itself, whose following
-statement was emitted past the terminator (F60).
+statement was emitted past the terminator (F60), and the same for `break`
+and `continue`, which leave the block without leaving the function (F61).
 
 ## S4 — diagnostics
 

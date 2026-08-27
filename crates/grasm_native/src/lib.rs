@@ -2769,7 +2769,15 @@ struct FnCx<'a, 'm> {
     /// loop body declared. Without it they jumped straight out and the body's
     /// scope decs — emitted only on the fall-through path — never ran, so
     /// every `break` past a boxed local leaked it.
-    loops: Vec<(Block, Block, usize)>,
+    /// (continue block, break block, scope depth, handlers installed) at the
+    /// point the loop was entered.
+    ///
+    /// The last of those is what `break` and `continue` need: they leave every
+    /// `with` between themselves and the loop, and those handlers have to come
+    /// off. `emit_scope_decs_all` covers a `return` or a `fail` because both
+    /// leave the function; these leave the block and not the function, so
+    /// until F61 the handler stayed installed and the next operation found it.
+    loops: Vec<(Block, Block, usize, usize)>,
     /// Capture slots built for handler arguments in this frame, and what is in
     /// them, so the boxed ones can be released when the frame ends.
     ///
@@ -4180,6 +4188,17 @@ impl FnCx<'_, '_> {
     }
 
     /// Before a `return`: release every boxed local in every scope.
+    /// Pops every handler installed since the loop was entered.
+    ///
+    /// A `break` or a `continue` leaves the `with` blocks between itself and
+    /// the loop without leaving the function, so the pop each of those blocks
+    /// would have done at its own end never runs (F61).
+    fn pop_handlers_above(&mut self, installed: usize) {
+        for _ in installed..self.handlers_installed {
+            self.call_rt("grasm_handler_pop", &[]);
+        }
+    }
+
     fn emit_scope_decs_all(&mut self) {
         self.emit_inout_writeback();
         // Every handler this function installed and has not popped. Leaving
@@ -5135,19 +5154,21 @@ impl FnCx<'_, '_> {
                 Ok(StmtOut::Terminated)
             }
             Stmt::Break(span) => {
-                let Some(&(_, break_blk, depth)) = self.loops.last() else {
+                let Some(&(_, break_blk, depth, handlers)) = self.loops.last() else {
                     return nope(*span, "break outside loop");
                 };
                 self.emit_decs_above(depth);
+                self.pop_handlers_above(handlers);
                 self.b.ins().jump(break_blk, &[]);
                 self.filled = true;
                 Ok(StmtOut::Terminated)
             }
             Stmt::Continue(span) => {
-                let Some(&(cont_blk, _, depth)) = self.loops.last() else {
+                let Some(&(cont_blk, _, depth, handlers)) = self.loops.last() else {
                     return nope(*span, "continue outside loop");
                 };
                 self.emit_decs_above(depth);
+                self.pop_handlers_above(handlers);
                 self.b.ins().jump(cont_blk, &[]);
                 self.filled = true;
                 Ok(StmtOut::Terminated)
@@ -5173,7 +5194,7 @@ impl FnCx<'_, '_> {
                 self.b.ins().brif(c, body_blk, &[], exit, &[]);
                 self.filled = true;
                 self.goto_block(body_blk);
-                self.loops.push((header, exit, self.vars.len()));
+                self.loops.push((header, exit, self.vars.len(), self.handlers_installed));
                 let inner = self.eval_block_inner(body);
                 self.loops.pop();
                 self.pinned.pop();
@@ -5538,7 +5559,7 @@ this case",
             self.goto_block(body_blk);
             self.push_scope();
             self.bind(&loop_var.name, ivar, VType::I64);
-            self.loops.push((step, exit, self.vars.len()));
+            self.loops.push((step, exit, self.vars.len(), self.handlers_installed));
             let inner = self.eval_block_inner(body);
             self.loops.pop();
             self.pinned.pop();
@@ -5628,7 +5649,7 @@ this case",
         // iteration binds a fresh one. Recording it after meant
         // `emit_decs_above` skipped that scope, and every `continue` in a loop
         // over boxed elements leaked the element it skipped.
-        self.loops.push((step, exit, self.vars.len()));
+        self.loops.push((step, exit, self.vars.len(), self.handlers_installed));
         self.push_scope();
         self.bind(&loop_var.name, evar, elem_vt.clone());
         let (_, mut terminated) = self.eval_block_inner(body)?;
