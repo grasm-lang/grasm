@@ -1,0 +1,17 @@
+[package]
+name = "password"
+version = "1.0.0"
+entry = "src/main.gr"
+
+# Hashing is arithmetic. The salt comes in as an argument, so this declares
+# nothing — and a program that verifies a password does not thereby acquire
+# the ability to read the entropy pool or write a file.
+capabilities = []
+
+[dependencies.bytes_codec]
+path = "../bytes"
+version = "^1.0.0"
+
+[dependencies.crypto_hash]
+path = "../crypto_hash"
+version = "^1.0.0"

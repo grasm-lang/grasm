@@ -1,0 +1,17 @@
+[package]
+name = "websocket"
+version = "1.0.0"
+entry = "src/main.gr"
+
+# The handshake and the framing are text and bytes. The socket is `http_server`
+# or `http_client`, and is a separate name a consumer has to ask for — so a
+# program that only encodes frames performs nothing.
+capabilities = []
+
+[dependencies.bytes_codec]
+path = "../bytes"
+version = "^1.0.0"
+
+[dependencies.http]
+path = "../http"
+version = "^1.0.0"

@@ -37,6 +37,8 @@ gates as everything else: three engines, one answer.
 | `errors` | *none* | A failure that carries its cause, its place and its fields. |
 | `trace` | `Trace` | Spans and W3C `traceparent` — as an **effect**. |
 | `redis` | `net` | RESP2 and RESP3, encode and decode, and a client. |
+| `websocket` | *none* | The upgrade handshake and the frame format. `ws://` only. |
+| `password` | *none* | PBKDF2-HMAC-SHA256, with a self-describing stored form. |
 
 Three packages rather than one, and the split is the same argument each time:
 a program that only needs to *build* a request never acquires the capability to
@@ -91,6 +93,8 @@ grasm run packages/metrics-demo/src/main.gr
 grasm run packages/errors-demo/src/main.gr
 grasm run packages/trace-demo/src/main.gr
 grasm run packages/redis-demo/src/main.gr
+grasm run packages/websocket-demo/src/main.gr
+grasm run packages/password-demo/src/main.gr
 ```
 
 ## The pattern every one of these follows

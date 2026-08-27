@@ -25,7 +25,8 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   `packages/resilience`, `packages/cache`, `packages/crypto_hash`,
   `packages/regex`, `packages/fs`, `packages/jwt`, `packages/cors`,
   `packages/dotenv`, `packages/sanitize`, `packages/metrics`,
-  `packages/errors`, `packages/trace`, `packages/redis`: the first
+  `packages/errors`, `packages/trace`, `packages/redis`,
+  `packages/websocket`, `packages/password`: the first
   wave of the release library, planned in `docs/packages-plan.md`. All but
   `log` declare **no capability at all** — a calendar, a seeded generator, path
   arithmetic and URL text are computation, and the reach each one is usually
@@ -35,6 +36,15 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   where the handler is installed.
 - `packages/http` now takes its percent coding and query parsing from
   `packages/url` rather than carrying a second copy.
+- `packages/websocket`: the upgrade handshake and the frame format, `ws://`
+  only. The accept value is checked against RFC 6455's own example, which is
+  the difference between computing something and computing the right thing.
+  Masking is checked in both directions — a server that accepts an unmasked
+  frame sits behind a proxy that can be poisoned — and a control frame is
+  refused if it is fragmented or over 125 bytes.
+- `packages/password`: PBKDF2-HMAC-SHA256, with a stored form that carries its
+  own algorithm and cost, so a file written today survives both changing.
+  `needs_rehash` asks the question at the one moment the plaintext is in hand.
 - `packages/redis`: RESP2 and RESP3, encode and decode, and a client. Both
   versions, because a RESP3 map and a RESP2 array of pairs mean the same thing
   and a client that reads one refuses half the servers it meets. Command

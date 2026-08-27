@@ -1,0 +1,135 @@
+// Password hashing.
+//
+// The property a password hash needs is the one a general hash is designed
+// not to have: **slowness**. SHA-256 is fast, which is what lets somebody who
+// has stolen the file try billions of guesses a second against it. PBKDF2
+// makes it slow by repetition — the only lever available here — and the cost
+// is a parameter, because how slow is slow enough depends on the machine and
+// the year.
+//
+// Argon2id is better, because it is slow *and* memory-hard: repetition alone
+// is cheap to parallelise on hardware built for it, and memory is not. It is
+// not here yet, and the encoding below leaves room for it: a stored hash
+// carries the algorithm that made it, so a file written today can be verified
+// after a second algorithm arrives, and an old entry can be rewritten on the
+// next successful login.
+//
+// What must not happen: comparing hashes with `==`. That stops at the first
+// difference and tells whoever is timing it how much they have guessed, so
+// verification goes through `equal_constant_time`.
+import bytes_codec
+import crypto_hash
+
+type Hashed = {
+    algorithm: str,
+    iterations: i64,
+    salt: bytes,
+    digest: bytes,
+}
+
+type PasswordError = { why: str }
+
+/// The cost to use today, for interactive logins.
+///
+/// A number in the code rather than a default in the function, so a caller
+/// choosing something else is choosing it, and a caller who takes this is
+/// taking a number that can be raised in one place. OWASP's figure for
+/// PBKDF2-HMAC-SHA256 at the time of writing.
+pub fn recommended_iterations() -> i64 {
+    600000
+}
+
+/// Hash a password with a salt the caller supplies.
+///
+/// The salt is an argument because generating one is `io` — `random_bytes` —
+/// and a package that reached for it would force `io` on every consumer,
+/// tests included. Sixteen bytes is the usual size; fewer is checked for,
+/// because a short salt is a rainbow table that works.
+pub fn hash(secret: str, salt: bytes, iterations: i64) -> Hashed ! PasswordError {
+    if salt.len() < 8 {
+        fail(PasswordError{ why: "a salt of {salt.len()} bytes is too short to be one" })
+    }
+    if iterations < 1 {
+        fail(PasswordError{ why: "iterations must be at least 1" })
+    }
+    Hashed{
+        algorithm: "pbkdf2-sha256",
+        iterations: iterations,
+        salt: salt,
+        digest: crypto_hash.pbkdf2_sha256(secret.to_bytes(), salt, iterations, 32),
+    }
+}
+
+/// The stored form: `$algorithm$iterations$salt$digest`, base64url without
+/// padding.
+///
+/// Self-describing, so the file can be read after the parameters change. A
+/// stored hash that says only "here are 32 bytes" is a file that cannot be
+/// migrated.
+pub fn encode(h: Hashed) -> str {
+    "${h.algorithm}${h.iterations}${bytes_codec.encode_base64_url(h.salt)}$" +
+        bytes_codec.encode_base64_url(h.digest)
+}
+
+pub fn decode(stored: str) -> Hashed ! PasswordError {
+    let parts = stored.split("$")
+    // A leading `$` gives an empty first part, so there are five.
+    if parts.len() != 5 or not parts[0].is_empty() {
+        fail(PasswordError{ why: "a stored hash has four fields after a leading `$`, and this has {parts.len() - 1}" })
+    }
+    let iterations = match parts[2].parse_int() {
+        Some(n) -> n
+        None -> fail(PasswordError{ why: "`{parts[2]}` is not a number of iterations" })
+    }
+    let salt = match bytes_codec.decode_base64_url(parts[3]) {
+        Some(b) -> b
+        None -> fail(PasswordError{ why: "the salt is not base64url" })
+    }
+    let digest = match bytes_codec.decode_base64_url(parts[4]) {
+        Some(b) -> b
+        None -> fail(PasswordError{ why: "the digest is not base64url" })
+    }
+    Hashed{ algorithm: parts[1], iterations: iterations, salt: salt, digest: digest }
+}
+
+/// Does this password match what was stored?
+///
+/// The parameters come from the *stored* hash, not from today's settings —
+/// that is what lets the cost be raised without invalidating every existing
+/// password. The comparison is constant-time.
+pub fn verify(secret: str, stored: str) -> bool {
+    match decode(stored) {
+        Err(e) -> false
+        Ok(h) -> {
+            if h.algorithm != "pbkdf2-sha256" {
+                return false
+            }
+            if h.iterations < 1 or h.salt.len() < 8 {
+                return false
+            }
+            let computed = crypto_hash.pbkdf2_sha256(secret.to_bytes(), h.salt,
+                                                     h.iterations, h.digest.len())
+            crypto_hash.equal_constant_time(computed, h.digest)
+        }
+    }
+}
+
+/// Should this stored hash be replaced next time the password is known?
+///
+/// A password file outlives the settings that made it. The moment to rewrite
+/// an entry is the one moment the plaintext is in hand — a successful login —
+/// and this is the question to ask there.
+pub fn needs_rehash(stored: str, want_iterations: i64) -> bool {
+    match decode(stored) {
+        Err(e) -> true
+        Ok(h) -> h.algorithm != "pbkdf2-sha256" or h.iterations < want_iterations
+    }
+}
+
+/// How long the digest is, in bytes — for a caller checking a file's shape.
+pub fn digest_length(stored: str) -> i64 {
+    match decode(stored) {
+        Err(e) -> 0
+        Ok(h) -> h.digest.len()
+    }
+}

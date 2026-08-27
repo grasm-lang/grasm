@@ -1,0 +1,409 @@
+// WebSocket: the upgrade handshake and the frame format.
+//
+// `ws://` only. There is no TLS in this language, so there is no `wss://`,
+// and saying so here is better than a package that looks like it has one.
+//
+// The handshake is an HTTP request with four required headers and a reply
+// whose `Sec-WebSocket-Accept` is SHA-1 of the client's key and a fixed
+// string. **SHA-1** — `crypto_hash` has SHA-256, and this needs the other
+// one, so the digest is here. It is not used as a hash: the value is a
+// constant the specification chose to prove the server understood the
+// request, and its collision resistance is irrelevant to that.
+//
+// Every frame from a client is masked, and a server that accepts an unmasked
+// one is a server behind a proxy that can be poisoned. So `decode` refuses it
+// rather than being permissive.
+import bytes_codec
+import http
+
+let GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+type Opcode = | Continuation | Text | Binary | Close | Ping | Pong
+
+type Frame = {
+    final: bool,
+    opcode: Opcode,
+    payload: bytes,
+    masked: bool,
+    mask: bytes,
+}
+
+type WsError = { why: str }
+
+pub fn opcode_number(o: Opcode) -> i64 {
+    match o {
+        Continuation -> 0
+        Text -> 1
+        Binary -> 2
+        Close -> 8
+        Ping -> 9
+        Pong -> 10
+    }
+}
+
+pub fn opcode_from(n: i64) -> Option[Opcode] {
+    match n {
+        0 -> Some(Continuation)
+        1 -> Some(Text)
+        2 -> Some(Binary)
+        8 -> Some(Close)
+        9 -> Some(Ping)
+        10 -> Some(Pong)
+        _ -> None
+    }
+}
+
+pub fn opcode_name(o: Opcode) -> str {
+    match o {
+        Continuation -> "continuation"
+        Text -> "text"
+        Binary -> "binary"
+        Close -> "close"
+        Ping -> "ping"
+        Pong -> "pong"
+    }
+}
+
+// --- SHA-1, for the handshake only ---------------------------------------------
+
+let MASK32 = 0xFFFFFFFF
+
+fn m32(v: i64) -> i64 {
+    v.bit_and(MASK32)
+}
+
+fn rotl32(v: i64, n: i64) -> i64 {
+    m32(m32(v.shl(n)).bit_or(m32(v).ushr(32 - n)))
+}
+
+fn sha1(message: [i64]) -> [i64] {
+    var h0 = 0x67452301
+    var h1 = 0xEFCDAB89
+    var h2 = 0x98BADCFE
+    var h3 = 0x10325476
+    var h4 = 0xC3D2E1F0
+
+    var msg = message
+    let bit_len = msg.len() * 8
+    msg.push(0x80)
+    while msg.len() % 64 != 56 {
+        msg.push(0)
+    }
+    var i = 7
+    while i >= 0 {
+        msg.push(bit_len.ushr(i * 8).bit_and(255))
+        i = i - 1
+    }
+
+    var block = 0
+    while block < msg.len() {
+        var w: [i64] = []
+        for t in 0..16 {
+            let b = block + t * 4
+            w.push(m32(msg[b].shl(24).bit_or(msg[b + 1].shl(16))
+                .bit_or(msg[b + 2].shl(8)).bit_or(msg[b + 3])))
+        }
+        for t in 16..80 {
+            w.push(rotl32(w[t - 3].bit_xor(w[t - 8]).bit_xor(w[t - 14]).bit_xor(w[t - 16]), 1))
+        }
+        var a = h0
+        var b = h1
+        var c = h2
+        var d = h3
+        var e = h4
+        for t in 0..80 {
+            var f = 0
+            var k = 0
+            if t < 20 {
+                f = b.bit_and(c).bit_or(m32(b.bit_not()).bit_and(d))
+                k = 0x5A827999
+            } else if t < 40 {
+                f = b.bit_xor(c).bit_xor(d)
+                k = 0x6ED9EBA1
+            } else if t < 60 {
+                f = b.bit_and(c).bit_or(b.bit_and(d)).bit_or(c.bit_and(d))
+                k = 0x8F1BBCDC
+            } else {
+                f = b.bit_xor(c).bit_xor(d)
+                k = 0xCA62C1D6
+            }
+            let temp = m32(rotl32(a, 5) + m32(f) + e + k + w[t])
+            e = d
+            d = c
+            c = rotl32(b, 30)
+            b = a
+            a = temp
+        }
+        h0 = m32(h0 + a)
+        h1 = m32(h1 + b)
+        h2 = m32(h2 + c)
+        h3 = m32(h3 + d)
+        h4 = m32(h4 + e)
+        block = block + 64
+    }
+
+    var out: [i64] = []
+    for word in [h0, h1, h2, h3, h4] {
+        out.push(word.ushr(24).bit_and(255))
+        out.push(word.ushr(16).bit_and(255))
+        out.push(word.ushr(8).bit_and(255))
+        out.push(word.bit_and(255))
+    }
+    out
+}
+
+/// The `Sec-WebSocket-Accept` value for a client's key.
+pub fn accept_for(key: str) -> str {
+    bytes_codec.encode_base64(bytes_of(sha1((key + GUID).to_bytes().to_list())))
+}
+
+// --- the handshake ---------------------------------------------------------------
+
+/// Is this request a WebSocket upgrade? Every condition the specification
+/// names, because a server that checks three of the four accepts a request
+/// that was not one.
+pub fn is_upgrade(r: Request) -> bool {
+    if r.method != "GET" {
+        return false
+    }
+    let upgrade = (http.header(r, "upgrade") ?? "").to_lower()
+    let connection = (http.header(r, "connection") ?? "").to_lower()
+    let version = http.header(r, "sec-websocket-version") ?? ""
+    let key = http.header(r, "sec-websocket-key") ?? ""
+    upgrade == "websocket" and connection.contains("upgrade") and
+        version == "13" and not key.is_empty()
+}
+
+/// The 101 a server answers an upgrade with, as raw bytes for the wire.
+///
+/// Not a `Response`: an upgrade has no body and no Content-Length, and
+/// rendering it through the ordinary path would add one.
+pub fn accept_response(r: Request) -> str ! WsError {
+    if not is_upgrade(r) {
+        fail(WsError{ why: "not a WebSocket upgrade" })
+    }
+    let key = http.header(r, "sec-websocket-key") ?? ""
+    "HTTP/1.1 101 Switching Protocols\r\n" +
+        "Upgrade: websocket\r\n" +
+        "Connection: Upgrade\r\n" +
+        "Sec-WebSocket-Accept: {accept_for(key)}\r\n\r\n"
+}
+
+/// The request a client opens with. The key is sixteen random bytes, base64 —
+/// which the caller supplies, so this declares nothing and a test is
+/// reproducible.
+pub fn open_request(host: str, path: str, key_bytes: bytes) -> str {
+    "GET {path} HTTP/1.1\r\n" +
+        "Host: {host}\r\n" +
+        "Upgrade: websocket\r\n" +
+        "Connection: Upgrade\r\n" +
+        "Sec-WebSocket-Key: {bytes_codec.encode_base64(key_bytes)}\r\n" +
+        "Sec-WebSocket-Version: 13\r\n\r\n"
+}
+
+/// Did the server answer correctly? The accept value is checked, not just the
+/// status: a 101 from something that did not understand the request is what
+/// the check exists to catch.
+pub fn accepted(reply: str, key_bytes: bytes) -> bool {
+    if not reply.starts_with("HTTP/1.1 101") {
+        return false
+    }
+    let want = accept_for(bytes_codec.encode_base64(key_bytes))
+    for line in reply.split("\r\n") {
+        if line.to_lower().starts_with("sec-websocket-accept:") {
+            return line.substr(21, line.len() - 21).trim() == want
+        }
+    }
+    false
+}
+
+// --- frames -----------------------------------------------------------------------
+
+pub fn text_frame(message: str) -> Frame {
+    Frame{ final: true, opcode: Text, payload: message.to_bytes(),
+           masked: false, mask: bytes_of([]) }
+}
+
+pub fn binary_frame(payload: bytes) -> Frame {
+    Frame{ final: true, opcode: Binary, payload: payload,
+           masked: false, mask: bytes_of([]) }
+}
+
+pub fn ping_frame(payload: bytes) -> Frame {
+    Frame{ final: true, opcode: Ping, payload: payload,
+           masked: false, mask: bytes_of([]) }
+}
+
+pub fn pong_for(f: Frame) -> Frame {
+    Frame{ final: true, opcode: Pong, payload: f.payload,
+           masked: false, mask: bytes_of([]) }
+}
+
+/// A close frame. The code goes first, two bytes, then the reason — and a
+/// close with a reason and no code is malformed, which is why they are one
+/// function.
+pub fn close_frame(code: i64, reason: str) -> Frame {
+    var payload: [i64] = []
+    if code > 0 {
+        payload.push(code.ushr(8).bit_and(255))
+        payload.push(code.bit_and(255))
+        for b in reason.to_bytes().to_list() {
+            payload.push(b)
+        }
+    }
+    Frame{ final: true, opcode: Close, payload: bytes_of(payload),
+           masked: false, mask: bytes_of([]) }
+}
+
+/// The code and reason a close frame carries.
+pub fn close_code(f: Frame) -> (i64, str) {
+    let p = f.payload.to_list()
+    if p.len() < 2 {
+        // 1005 is what the specification calls "no status received". It is
+        // never sent on the wire, and it is what a reader should report.
+        return (1005, "")
+    }
+    var reason: [i64] = []
+    for i in 2..p.len() {
+        reason.push(p[i])
+    }
+    (p[0] * 256 + p[1], bytes_of(reason).to_str())
+}
+
+/// A frame as bytes. Masking is the caller's decision because it is the
+/// *client* that masks and the server that must not.
+pub fn encode(f: Frame) -> bytes {
+    var out: [i64] = []
+    let first = (if f.final { 128 } else { 0 }) + opcode_number(f.opcode)
+    out.push(first)
+    let n = f.payload.len()
+    let mask_bit = if f.masked { 128 } else { 0 }
+    if n < 126 {
+        out.push(mask_bit + n)
+    } else if n < 65536 {
+        out.push(mask_bit + 126)
+        out.push(n.ushr(8).bit_and(255))
+        out.push(n.bit_and(255))
+    } else {
+        out.push(mask_bit + 127)
+        var i = 7
+        while i >= 0 {
+            out.push(n.ushr(i * 8).bit_and(255))
+            i = i - 1
+        }
+    }
+    if f.masked {
+        let m = f.mask.to_list()
+        for b in m {
+            out.push(b)
+        }
+        let p = f.payload.to_list()
+        for i in 0..p.len() {
+            out.push(p[i].bit_xor(m[i % 4]))
+        }
+    } else {
+        for b in f.payload.to_list() {
+            out.push(b)
+        }
+    }
+    bytes_of(out)
+}
+
+pub fn masked_with(f: Frame, mask: bytes) -> Frame {
+    Frame{ final: f.final, opcode: f.opcode, payload: f.payload,
+           masked: true, mask: mask }
+}
+
+/// One frame from bytes, and how many were consumed.
+///
+/// `expect_mask` is what the reader is: a server reads masked frames and must
+/// refuse unmasked ones, and a client the other way round. Accepting either
+/// is how a proxy in the middle gets poisoned, so it is a parameter and not a
+/// guess.
+pub fn decode(raw: bytes, expect_mask: bool) -> (Frame, i64) ! WsError {
+    let b = raw.to_list()
+    if b.len() < 2 {
+        fail(WsError{ why: "a frame is at least two bytes" })
+    }
+    let final_bit = b[0].bit_and(128) != 0
+    if b[0].bit_and(112) != 0 {
+        fail(WsError{ why: "a reserved bit is set and no extension was negotiated" })
+    }
+    let opcode = match opcode_from(b[0].bit_and(15)) {
+        Some(o) -> o
+        None -> fail(WsError{ why: "opcode {b[0].bit_and(15)} is not one this understands" })
+    }
+    let masked = b[1].bit_and(128) != 0
+    if masked != expect_mask {
+        fail(WsError{ why: if expect_mask { "an unmasked frame from a client" } else { "a masked frame from a server" } })
+    }
+    var n = b[1].bit_and(127)
+    var at = 2
+    if n == 126 {
+        if b.len() < 4 {
+            fail(WsError{ why: "a two-byte length with fewer than two bytes after it" })
+        }
+        n = b[2] * 256 + b[3]
+        at = 4
+    } else if n == 127 {
+        if b.len() < 10 {
+            fail(WsError{ why: "an eight-byte length with fewer than eight bytes after it" })
+        }
+        n = 0
+        for i in 2..10 {
+            n = n * 256 + b[i]
+        }
+        at = 10
+    }
+    // A control frame carries at most 125 bytes and is never fragmented.
+    // Both are the specification's rules and both are how a reader ends up
+    // waiting for a payload that will not come.
+    if opcode_number(opcode) >= 8 {
+        if n > 125 {
+            fail(WsError{ why: "a control frame with a {n}-byte payload" })
+        }
+        if not final_bit {
+            fail(WsError{ why: "a fragmented control frame" })
+        }
+    }
+    var mask: [i64] = []
+    if masked {
+        if b.len() < at + 4 {
+            fail(WsError{ why: "a masked frame with no mask" })
+        }
+        for i in at..(at + 4) {
+            mask.push(b[i])
+        }
+        at = at + 4
+    }
+    if b.len() < at + n {
+        fail(WsError{ why: "a frame declaring {n} bytes with {b.len() - at} after the header" })
+    }
+    var payload: [i64] = []
+    for i in at..(at + n) {
+        payload.push(if masked { b[i].bit_xor(mask[(i - at) % 4]) } else { b[i] })
+    }
+    (Frame{ final: final_bit, opcode: opcode, payload: bytes_of(payload),
+            masked: masked, mask: bytes_of(mask) }, at + n)
+}
+
+/// The text a text frame carries.
+pub fn text_of(f: Frame) -> str {
+    f.payload.to_str()
+}
+
+/// Several fragments joined. A message may arrive as a first frame and any
+/// number of continuations, with control frames allowed in between — which is
+/// why a reader cannot simply concatenate everything it receives.
+pub fn joined(frames: [Frame]) -> bytes {
+    var out: [i64] = []
+    for f in frames {
+        if opcode_number(f.opcode) >= 8 {
+            continue
+        }
+        for b in f.payload.to_list() {
+            out.push(b)
+        }
+    }
+    bytes_of(out)
+}

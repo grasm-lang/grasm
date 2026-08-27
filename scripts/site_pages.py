@@ -817,8 +817,10 @@ grasm deps --locked   # fail rather than update the lockfile
 <tr><td><code>errors</code></td><td><i>none</i></td><td>A failure carrying its cause, its place and its fields. Grasm has no captured backtrace, so every link is one somebody wrote — which is the work, and is why nothing is lost.</td></tr>
 <tr><td><code>trace</code></td><td><code>Trace</code></td><td>Spans and W3C <code>traceparent</code>, as an effect. An all-zero trace id is refused, since a receiver that accepts one joins every unrelated request into a single trace.</td></tr>
 <tr><td><code>redis</code></td><td><code>net</code></td><td>RESP2 and RESP3 both — a client that reads only one refuses half the servers it meets. The encoder and decoder are pure, so the demo drives them with bytes and never opens a socket.</td></tr>
+<tr><td><code>websocket</code></td><td><i>none</i></td><td>The upgrade handshake (checked against RFC 6455's own example) and the frame format. A frame's masking is checked in both directions, because a server that accepts an unmasked one sits behind a proxy that can be poisoned. <code>ws://</code> only — there is no TLS.</td></tr>
+<tr><td><code>password</code></td><td><i>none</i></td><td>PBKDF2-HMAC-SHA256. The stored form carries its own algorithm and cost, so a file written today can be verified after both change.</td></tr>
 </table></div>
-<p>Twenty-one of the twenty-eight declare <em>nothing</em>. That is the pattern: reach is
+<p>Twenty-three of the thirty declare <em>nothing</em>. That is the pattern: reach is
 split from computation, so a program that joins paths, formats a date or
 builds a URL acquires no capability by doing so — and where a library really
 does need the world, it asks for it as an effect the consumer supplies, which
@@ -973,7 +975,7 @@ well as for what it prints.</p>
 <h2>What does not work</h2>
 <div class="scroll"><table>
 <tr><th>Limit</th><th>Detail</th></tr>
-<tr><td>Twenty-eight libraries, all first-party</td><td>See <a href="packages.html">Packages</a>; the plan for the rest is in <code>docs/packages-plan.md</code>. Anything else you need, you write, or bind to C with <code>extern fn</code>.</td></tr>
+<tr><td>Thirty libraries, all first-party</td><td>See <a href="packages.html">Packages</a>; the plan for the rest is in <code>docs/packages-plan.md</code>. Anything else you need, you write, or bind to C with <code>extern fn</code>.</td></tr>
 <tr><td>No remote registry</td><td>Path and local-registry dependencies work. Nothing fetches or publishes.</td></tr>
 <tr><td>No release binaries</td><td>Build from source with a Rust toolchain.</td></tr>
 <tr><td>0.45× native Rust</td><td>Measured, floor-subtracted 0.39×, against a 0.95× target.</td></tr>

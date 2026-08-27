@@ -1,0 +1,156 @@
+// The `websocket` package.
+//
+// The handshake case is the one from RFC 6455 section 1.3, so the accept
+// value below is a number anybody can look up — which is the difference
+// between "it computes something" and "it computes the right thing".
+import http
+import websocket
+
+fn upgrade_request(headers: [str]) -> Request {
+    var raw = "GET /chat HTTP/1.1\r\nHost: server.test\r\n"
+    for h in headers {
+        raw = raw + h + "\r\n"
+    }
+    http.parse_request(raw + "\r\n")
+}
+
+let GOOD = ["Upgrade: websocket", "Connection: Upgrade",
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
+            "Sec-WebSocket-Version: 13"]
+
+fn without(which: str) -> [str] {
+    var out: [str] = []
+    for h in GOOD {
+        if not h.to_lower().starts_with(which.to_lower()) {
+            out.push(h)
+        }
+    }
+    out
+}
+
+fn show_frame(label: str, f: Frame) {
+    let raw = websocket.encode(f)
+    print("  {label.pad_end(30, " ")} {raw.len()} bytes: {raw.to_list()}")
+}
+
+fn round(label: str, f: Frame, expect_mask: bool) {
+    let raw = websocket.encode(f)
+    match websocket.decode(raw, expect_mask) {
+        Err(e) -> print("  {label.pad_end(30, " ")} refused: {e.why}")
+        Ok(pair) -> {
+            let back = pair.0
+            print("  {label.pad_end(30, " ")} {websocket.opcode_name(back.opcode)} final={back.final} payload={back.payload.len()}B consumed={pair.1}/{raw.len()} same={back.payload.to_list() == f.payload.to_list()}")
+        }
+    }
+}
+
+fn main() {
+    print("-- the accept value, from RFC 6455 section 1.3")
+    let accept = websocket.accept_for("dGhlIHNhbXBsZSBub25jZQ==")
+    print("  {accept}")
+    print("  matches the published one: {accept == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="}")
+
+    print("-- is it an upgrade")
+    print("  everything present: {websocket.is_upgrade(upgrade_request(GOOD))}")
+    for missing in ["Upgrade:", "Connection:", "Sec-WebSocket-Key:", "Sec-WebSocket-Version:"] {
+        print("  without {missing.pad_end(24, " ")} {websocket.is_upgrade(upgrade_request(without(missing)))}")
+    }
+    var wrong_version = without("Sec-WebSocket-Version:")
+    wrong_version.push("Sec-WebSocket-Version: 8")
+    print("  version 8:                       {websocket.is_upgrade(upgrade_request(wrong_version))}")
+
+    print("-- the reply")
+    match websocket.accept_response(upgrade_request(GOOD)) {
+        Err(e) -> print("  refused: {e.why}")
+        Ok(reply) -> {
+            for line in reply.split("\r\n") {
+                if not line.is_empty() {
+                    print("  {line}")
+                }
+            }
+        }
+    }
+    match websocket.accept_response(upgrade_request(without("Upgrade:"))) {
+        Err(e) -> print("  a plain GET: refused, {e.why}")
+        Ok(reply) -> print("  a plain GET was accepted, which it should not be")
+    }
+
+    print("-- opening from the client's side")
+    let key = bytes_of([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
+    let request = websocket.open_request("server.test", "/chat", key)
+    for line in request.split("\r\n") {
+        if not line.is_empty() {
+            print("  {line}")
+        }
+    }
+    let good_reply = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {websocket.accept_for("AQIDBAUGBwgJCgsMDQ4PEA==")}\r\n\r\n"
+    print("  the server answered correctly: {websocket.accepted(good_reply, key)}")
+    print("  a 101 with the wrong accept:   {websocket.accepted("HTTP/1.1 101 Switching Protocols\r\nSec-WebSocket-Accept: wrong\r\n\r\n", key)}")
+    print("  a 200:                         {websocket.accepted("HTTP/1.1 200 OK\r\n\r\n", key)}")
+
+    print("-- frames on the wire")
+    show_frame("text \"hi\"", websocket.text_frame("hi"))
+    show_frame("empty text", websocket.text_frame(""))
+    show_frame("ping", websocket.ping_frame(bytes_of([1, 2])))
+    show_frame("close 1000", websocket.close_frame(1000, "bye"))
+    show_frame("close with no code", websocket.close_frame(0, ""))
+    show_frame("masked text", websocket.masked_with(websocket.text_frame("hi"), bytes_of([55, 66, 77, 88])))
+
+    print("-- lengths at their boundaries")
+    for n in [125, 126, 65535, 65536] {
+        let f = websocket.binary_frame(bytes_of_repeat(n))
+        let raw = websocket.encode(f)
+        print("  {n} bytes -> a {raw.len() - n}-byte header")
+    }
+
+    print("-- round trips")
+    round("text, from a server", websocket.text_frame("hello"), false)
+    round("text, masked, from a client",
+          websocket.masked_with(websocket.text_frame("hello"), bytes_of([9, 8, 7, 6])), true)
+    round("a 126-byte payload", websocket.binary_frame(bytes_of_repeat(126)), false)
+    round("a 70000-byte payload", websocket.binary_frame(bytes_of_repeat(70000)), false)
+    round("ping", websocket.ping_frame(bytes_of([1])), false)
+    round("close", websocket.close_frame(1001, "going away"), false)
+
+    print("-- masking is not optional in either direction")
+    round("unmasked, read as a server", websocket.text_frame("hi"), true)
+    round("masked, read as a client",
+          websocket.masked_with(websocket.text_frame("hi"), bytes_of([1, 2, 3, 4])), false)
+
+    print("-- malformed")
+    for pair in [("one byte", bytes_of([129])),
+                 ("a reserved bit set", bytes_of([193, 2, 104, 105])),
+                 ("an unknown opcode", bytes_of([133, 0])),
+                 ("a payload shorter than declared", bytes_of([129, 5, 104, 105])),
+                 ("a control frame of 200 bytes", bytes_of([137, 126, 0, 200])),
+                 ("a fragmented ping", bytes_of([9, 0]))] {
+        match websocket.decode(pair.1, false) {
+            Err(e) -> print("  {pair.0.pad_end(32, " ")} refused: {e.why}")
+            Ok(p) -> print("  {pair.0.pad_end(32, " ")} accepted, which it should not be")
+        }
+    }
+
+    print("-- close codes")
+    for f in [websocket.close_frame(1000, "bye"), websocket.close_frame(1001, ""),
+              websocket.close_frame(0, "")] {
+        let cr = websocket.close_code(f)
+        print("  code {cr.0}  reason \"{cr.1}\"")
+    }
+
+    print("-- a message in fragments, with a ping in the middle")
+    let parts = [
+        Frame{ final: false, opcode: Text, payload: "one ".to_bytes(), masked: false, mask: bytes_of([]) },
+        websocket.ping_frame(bytes_of([])),
+        Frame{ final: false, opcode: Continuation, payload: "two ".to_bytes(), masked: false, mask: bytes_of([]) },
+        Frame{ final: true, opcode: Continuation, payload: "three".to_bytes(), masked: false, mask: bytes_of([]) },
+    ]
+    print("  \"{websocket.joined(parts).to_str()}\"")
+}
+
+fn bytes_of_repeat(n: i64) -> bytes {
+    var out: [i64] = []
+    for i in 0..n {
+        out.push(i % 256)
+    }
+    bytes_of(out)
+}

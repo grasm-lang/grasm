@@ -141,7 +141,7 @@ vector. Still wanted: SHA-512,
 HMAC, and a constant-time compare from `bytes`. Declares nothing. Safe to write
 here: a hash has no key schedule and no timing surface beyond the compare.
 
-**17. `password`.** PBKDF2-HMAC-SHA256 first, then Argon2id. These are
+**17. `password`.** — **built**, `packages/password` (PBKDF2). PBKDF2-HMAC-SHA256 first, then Argon2id. These are
 *meant* to be slow, so a pure-Grasm implementation is not the liability it
 would be elsewhere. Declares nothing.
 
@@ -173,7 +173,7 @@ lose one.
 
 ### Networking
 
-**22. `websocket`.** The HTTP upgrade handshake, `Sec-WebSocket-Accept` (SHA-1
+**22. `websocket`.** — **built**, `packages/websocket`. The HTTP upgrade handshake, `Sec-WebSocket-Accept` (SHA-1
 plus base64 — both available), frame encode and decode, masking, ping and
 pong, and close codes. The framing declares nothing; the connection declares
 `net`. `ws://` only until there is TLS.

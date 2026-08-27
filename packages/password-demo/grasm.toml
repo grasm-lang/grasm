@@ -1,0 +1,8 @@
+[package]
+name = "password_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.password]
+path = "../password"
+version = "^1.0.0"

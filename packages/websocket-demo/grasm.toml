@@ -1,0 +1,12 @@
+[package]
+name = "websocket_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.http]
+path = "../http"
+version = "^1.0.0"
+
+[dependencies.websocket]
+path = "../websocket"
+version = "^1.0.0"

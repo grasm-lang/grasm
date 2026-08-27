@@ -1,0 +1,86 @@
+// The `password` package.
+//
+// The iteration count here is 1000, not the 600000 the package recommends:
+// this runs on every gate, three engines, and the recommendation exists to
+// make guessing slow rather than to make a demo slow. That difference is the
+// whole subject of the package, so it is stated rather than glossed.
+import password
+
+let SALT = bytes_of([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
+let COST = 1000
+
+fn stored_for(secret: str) -> str {
+    match password.hash(secret, SALT, COST) {
+        Ok(h) -> password.encode(h)
+        Err(e) -> "unhashed: {e.why}"
+    }
+}
+
+fn main() {
+    print("-- a stored hash is self-describing")
+    let stored = stored_for("correct horse battery staple")
+    print("  {stored}")
+    match password.decode(stored) {
+        Err(e) -> print("  could not read it back: {e.why}")
+        Ok(h) -> print("  algorithm {h.algorithm}  iterations {h.iterations}  salt {h.salt.len()}B  digest {h.digest.len()}B")
+    }
+
+    print("-- verifying")
+    print("  the right password:        {password.verify("correct horse battery staple", stored)}")
+    print("  one character wrong:       {password.verify("correct horse battery stapl", stored)}")
+    print("  one character extra:       {password.verify("correct horse battery staples", stored)}")
+    print("  the empty password:        {password.verify("", stored)}")
+    print("  a different case:          {password.verify("Correct Horse Battery Staple", stored)}")
+
+    print("-- the same password with a different salt is a different hash")
+    let other_salt = bytes_of([16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1])
+    match password.hash("correct horse battery staple", other_salt, COST) {
+        Err(e) -> print("  refused")
+        Ok(h) -> {
+            let second = password.encode(h)
+            print("  same: {second == stored}")
+            print("  and each verifies against its own: {password.verify("correct horse battery staple", second)}")
+        }
+    }
+
+    print("-- an empty password is still hashable, and still has to match")
+    let empty = stored_for("")
+    print("  \"\" verifies:               {password.verify("", empty)}")
+    print("  \"x\" against it:            {password.verify("x", empty)}")
+
+    print("-- a non-ascii password")
+    let unicode = stored_for("günaydin ☕")
+    print("  verifies:                  {password.verify("günaydin ☕", unicode)}")
+    print("  without the coffee:        {password.verify("günaydin", unicode)}")
+
+    print("-- refused at the door")
+    match password.hash("x", bytes_of([1, 2, 3]), COST) {
+        Err(e) -> print("  a 3-byte salt: {e.why}")
+        Ok(h) -> print("  a 3-byte salt was accepted, which it should not be")
+    }
+    match password.hash("x", SALT, 0) {
+        Err(e) -> print("  zero iterations: {e.why}")
+        Ok(h) -> print("  zero iterations was accepted, which it should not be")
+    }
+
+    print("-- a stored hash that is not one")
+    for bad in ["", "not-a-hash", "$pbkdf2-sha256$1000$onlythree",
+                "$pbkdf2-sha256$abc$AQID$AQID", "$pbkdf2-sha256$1000$!!!$AQID",
+                "$argon2id$1000$AQIDBAUGBwgJCgsMDQ4PEA$AQID"] {
+        match password.decode(bad) {
+            Err(e) -> print("  \"{bad}\" -> refused: {e.why}")
+            Ok(h) -> print("  \"{bad}\" -> read as {h.algorithm}, and verify says {password.verify("x", bad)}")
+        }
+    }
+
+    print("-- when to rewrite an entry")
+    print("  stored at {COST}, want {COST}:      {password.needs_rehash(stored, COST)}")
+    print("  stored at {COST}, want {COST * 10}:     {password.needs_rehash(stored, COST * 10)}")
+    print("  a hash from another algorithm:  {password.needs_rehash("$argon2id$1000$AQIDBAUGBwgJCgsMDQ4PEA$AQID", COST)}")
+    print("  something unreadable:           {password.needs_rehash("rubbish", COST)}")
+    print("  — the moment to rewrite is a successful login, the one time the")
+    print("    plaintext is in hand")
+
+    print("-- the recommendation this demo does not use")
+    print("  {password.recommended_iterations()} iterations, against the {COST} here")
+}
