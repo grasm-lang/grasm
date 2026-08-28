@@ -27,7 +27,7 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   `packages/dotenv`, `packages/sanitize`, `packages/metrics`,
   `packages/errors`, `packages/trace`, `packages/redis`,
   `packages/websocket`, `packages/password`, `packages/protobuf`,
-  `packages/postgres`: the first
+  `packages/postgres`, `packages/xml`, `packages/oauth2`: the first
   wave of the release library, planned in `docs/packages-plan.md`. All but
   `log` declare **no capability at all** — a calendar, a seeded generator, path
   arithmetic and URL text are computation, and the reach each one is usually
@@ -37,6 +37,18 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   where the handler is installed.
 - `packages/http` now takes its percent coding and query parsing from
   `packages/url` rather than carrying a second copy.
+- `packages/xml`: parse and render, with **no DTD and no external entities**.
+  That is not a gap: an external entity is a parser that fetches a URL
+  somebody else wrote, which is XXE, and every parser that has one has had the
+  vulnerability. A DOCTYPE is skipped without being read and an unknown entity
+  is then refused, so there are two independent reasons the file is never
+  opened — and it is why this package can declare no capabilities and mean it.
+- `packages/oauth2`: the authorisation-code flow with PKCE and client
+  credentials. PKCE is checked against RFC 7636's own vector, and is not
+  optional — `authorize_url` takes a challenge and offers no version without
+  one. Neither is `state`, and `callback_matches` compares it in constant
+  time. Against a real provider this needs TLS, which the plan lists as
+  blocked.
 - `packages/protobuf`: the wire format — varints, zigzag, packed repeated
   fields, nested messages. A message without its schema still reads, which is
   what lets one be forwarded or inspected. **Not gRPC**: that is protobuf over

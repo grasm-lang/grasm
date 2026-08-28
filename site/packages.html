@@ -93,8 +93,10 @@ grasm deps --locked   # fail rather than update the lockfile</code></pre>
 <tr><td><code>password</code></td><td><i>none</i></td><td>PBKDF2-HMAC-SHA256. The stored form carries its own algorithm and cost, so a file written today can be verified after both change.</td></tr>
 <tr><td><code>protobuf</code></td><td><i>none</i></td><td>The wire format: varints, zigzag, packed and nested fields. A message without its schema still reads, which is what makes a proxy possible. <b>Not gRPC</b> — that needs HTTP/2 and TLS.</td></tr>
 <tr><td><code>postgres</code></td><td><code>net</code></td><td>The v3 wire protocol and <b>SCRAM-SHA-256</b>, checked against RFC 7677's own vector. No TLS, so a trusted network or a local socket.</td></tr>
+<tr><td><code>xml</code></td><td><i>none</i></td><td>Parse and render. <b>No DTD and no external entities, ever</b> — that is what XXE is, and a first release does not need it. Which is also why this can declare nothing and mean it.</td></tr>
+<tr><td><code>oauth2</code></td><td><i>none</i></td><td>The authorisation-code flow with PKCE (checked against RFC 7636's vector) and client credentials. PKCE and <code>state</code> are not optional here.</td></tr>
 </table></div>
-<p>Twenty-four of the thirty-two declare <em>nothing</em>. That is the pattern: reach is
+<p>Twenty-six of the thirty-four declare <em>nothing</em>. That is the pattern: reach is
 split from computation, so a program that joins paths, formats a date or
 builds a URL acquires no capability by doing so — and where a library really
 does need the world, it asks for it as an effect the consumer supplies, which

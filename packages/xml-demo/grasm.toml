@@ -1,0 +1,8 @@
+[package]
+name = "xml_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.xml]
+path = "../xml"
+version = "^1.0.0"

@@ -1,0 +1,99 @@
+// The `xml` package.
+//
+// The XXE case is the one that matters: a document whose DOCTYPE declares an
+// entity pointing at `/etc/passwd`. This parser skips the DOCTYPE without
+// reading it and then refuses the entity as unknown, so there are two
+// independent reasons the file is never opened.
+import xml
+
+fn show(label: str, src: str) {
+    match xml.parse(src) {
+        Err(e) -> print("  {label.pad_end(34, " ")} refused: {e.why} (line {e.line})")
+        Ok(root) -> print("  {label.pad_end(34, " ")} <{xml.name_of(root)}> -> {xml.render(root)}")
+    }
+}
+
+fn main() {
+    print("-- ordinary documents")
+    show("one element", "<a/>")
+    show("with text", "<a>hello</a>")
+    show("nested", "<a><b>1</b><b>2</b></a>")
+    show("attributes", "<a id=\"7\" name='ada'/>")
+    show("a declaration first", "<?xml version=\"1.0\"?><a/>")
+    show("comments around", "<!-- before --><a/><!-- after -->")
+    show("a comment inside", "<a><!-- note -->text</a>")
+    show("CDATA", "<a><![CDATA[<not> & markup]]></a>")
+    show("entities", "<a>&lt;&gt;&amp;&quot;&apos;</a>")
+    show("numeric references", "<a>&#65;&#x42;&#8364;</a>")
+    show("a namespace prefix", "<soap:Body xmlns:soap=\"http://x\"><soap:Fault/></soap:Body>")
+    show("whitespace", "  <a>\n  <b/>\n</a>  ")
+
+    print("-- refused")
+    show("nothing", "")
+    show("text before the root", "hello<a/>")
+    show("two roots", "<a/><b/>")
+    show("never closed", "<a>")
+    show("mismatched", "<a></b>")
+    show("an unquoted attribute", "<a id=7/>")
+    show("a repeated attribute", "<a id='1' id='2'/>")
+    show("a `<` in an attribute", "<a id='<'/>")
+    show("an unknown entity", "<a>&nbsp;</a>")
+    show("an `&` with no `;`", "<a>a & b</a>")
+    show("a tag with no name", "< a/>")
+    show("an unclosed comment", "<a><!-- forever</a>")
+    show("an unclosed CDATA", "<a><![CDATA[forever</a>")
+
+    print("-- the XXE document, which is the reason there is no DTD support")
+    let xxe = "<?xml version=\"1.0\"?>" +
+        "<!DOCTYPE root [<!ENTITY secret SYSTEM \"file:///etc/passwd\">]>" +
+        "<root>&secret;</root>"
+    show("an external entity", xxe)
+    print("  — the DOCTYPE is skipped without being read, and the entity is then")
+    print("    unknown. Two independent reasons the file is never opened.")
+
+    print("-- reading a tree")
+    let doc = "<order id='7' xmlns:x='http://x'>" +
+        "<customer><name>Ada</name><email>ada@example.test</email></customer>" +
+        "<items>" +
+        "<item sku='A1'><qty>2</qty><price>9.99</price></item>" +
+        "<item sku='B2'><qty>1</qty><price>4.50</price></item>" +
+        "</items>" +
+        "<x:note>shipped</x:note>" +
+        "</order>"
+    match xml.parse(doc) {
+        Err(e) -> print("  refused: {e.why}")
+        Ok(root) -> {
+            print("  root: {xml.name_of(root)}  id={xml.attribute(root, "id") ?? "(none)"}")
+            print("  a missing attribute: {xml.attribute(root, "nope") ?? "(none)"}")
+            print("  customer name: {xml.text_of(xml.path(root, "customer.name") ?? root)}")
+            print("  by path, missing: {xml.path(root, "customer.phone").is_some()}")
+            let items = xml.elements(xml.first_element(root, "items") ?? root, "item")
+            print("  {items.len()} items:")
+            for it in items {
+                print("      sku {xml.attribute(it, "sku") ?? "?"}  qty {xml.text_of(xml.path(it, "qty") ?? it)}  price {xml.text_of(xml.path(it, "price") ?? it)}")
+            }
+            let note = xml.first_element(root, "x:note") ?? root
+            print("  the prefixed one: name {xml.name_of(note)}  local {xml.local_name(note)}  prefix {xml.prefix_of(note)}")
+            print("  all the text: \"{xml.text_of(root)}\"")
+
+            print("-- rendered back")
+            print("  {xml.render(root)}")
+            print("  round trip: {xml.render(xml.parse(xml.render(root)) ?? root) == xml.render(root)}")
+
+            print("-- indented, for a person")
+            print(xml.render_pretty(root, 1))
+        }
+    }
+
+    print("-- building one")
+    let built = xml.element("invoice", [xml.attr("n", "7"), xml.attr("note", "a \"quoted\" & <marked> one")], [
+        xml.element("line", [], [xml.text("first & foremost")]),
+        xml.element("line", [], [xml.text("<second>")]),
+        xml.element("empty", [], []),
+    ])
+    print("  {xml.render(built)}")
+    match xml.parse(xml.render(built)) {
+        Err(e) -> print("  what it wrote does not parse: {e.why}")
+        Ok(back) -> print("  what it wrote parses, and the text survives: \"{xml.text_of(back)}\"")
+    }
+}

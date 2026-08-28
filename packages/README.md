@@ -41,6 +41,8 @@ gates as everything else: three engines, one answer.
 | `password` | *none* | PBKDF2-HMAC-SHA256, with a self-describing stored form. |
 | `protobuf` | *none* | The wire format — varints, zigzag, packed, nested. |
 | `postgres` | `net` | The v3 wire protocol and SCRAM-SHA-256. No TLS. |
+| `xml` | *none* | Parse and render. **No DTD, no external entities, ever.** |
+| `oauth2` | *none* | The authorisation-code flow with PKCE, and client credentials. |
 
 Three packages rather than one, and the split is the same argument each time:
 a program that only needs to *build* a request never acquires the capability to
@@ -99,6 +101,8 @@ grasm run packages/websocket-demo/src/main.gr
 grasm run packages/password-demo/src/main.gr
 grasm run packages/protobuf-demo/src/main.gr
 grasm run packages/postgres-demo/src/main.gr
+grasm run packages/xml-demo/src/main.gr
+grasm run packages/oauth2-demo/src/main.gr
 ```
 
 ## The pattern every one of these follows

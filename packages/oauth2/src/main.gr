@@ -1,0 +1,255 @@
+// OAuth 2.0: the authorisation-code flow with PKCE, and client credentials.
+//
+// Everything here is text: an authorisation URL to send somebody to, a token
+// request body to post, and a token response to read. The posting is
+// `http_client`, and against a real provider it needs TLS, which this
+// language does not have — so this package is honest about being the half
+// that can be finished.
+//
+// **PKCE is not optional here.** The authorisation code travels through a
+// browser's address bar and a redirect, which is to say through places the
+// client does not control; without a proof key, anyone who intercepts the
+// code can exchange it. The specification made PKCE mandatory for public
+// clients and recommended for all, and `authorize_url` takes a challenge
+// rather than offering a version without one.
+//
+// **`state` is not optional either.** It is what ties the callback to the
+// request that started it; without it a callback from somewhere else is
+// indistinguishable from the real one, which is CSRF against the login
+// itself.
+import bytes_codec
+import crypto_hash
+import json
+import url
+
+type Client = {
+    id: str,
+    secret: str,
+    authorize_endpoint: str,
+    token_endpoint: str,
+    redirect_uri: str,
+}
+
+type Token = {
+    access_token: str,
+    token_type: str,
+    expires_in: i64,
+    refresh_token: str,
+    scope: str,
+    id_token: str,
+}
+
+type OauthError = { code: str, description: str }
+
+pub fn client(id: str, secret: str, authorize_endpoint: str,
+              token_endpoint: str, redirect_uri: str) -> Client {
+    Client{ id: id, secret: secret, authorize_endpoint: authorize_endpoint,
+            token_endpoint: token_endpoint, redirect_uri: redirect_uri }
+}
+
+// --- PKCE ---------------------------------------------------------------------
+
+/// A verifier from bytes the caller supplies. 32 bytes is what the
+/// specification asks for; base64url without padding gives the 43 characters
+/// it wants.
+///
+/// The entropy is an argument, so this package declares nothing and a test
+/// produces the same verifier twice — the same split `uuid` and `random`
+/// make, for the same reason.
+pub fn verifier_from(entropy: bytes) -> str {
+    bytes_codec.encode_base64_url(entropy)
+}
+
+/// The challenge for a verifier: `S256`, which is SHA-256 then base64url.
+///
+/// `plain` — sending the verifier itself — is in the specification and is not
+/// here. It defends against nothing: an attacker who can see the challenge
+/// can then use it as the verifier.
+pub fn challenge_for(verifier: str) -> str {
+    bytes_codec.encode_base64_url(crypto_hash.sha256_of(verifier.to_bytes()))
+}
+
+// --- the authorisation request ---------------------------------------------------
+
+/// Where to send the person's browser.
+pub fn authorize_url(c: Client, scope: str, state: str, challenge: str) -> str {
+    var pairs = [
+        Pair{ name: "response_type", value: "code" },
+        Pair{ name: "client_id", value: c.id },
+        Pair{ name: "redirect_uri", value: c.redirect_uri },
+        Pair{ name: "state", value: state },
+        Pair{ name: "code_challenge", value: challenge },
+        Pair{ name: "code_challenge_method", value: "S256" },
+    ]
+    if not scope.is_empty() {
+        pairs.push(Pair{ name: "scope", value: scope })
+    }
+    let query = url.build_query(pairs)
+    if c.authorize_endpoint.contains("?") {
+        return c.authorize_endpoint + "&" + query
+    }
+    c.authorize_endpoint + "?" + query
+}
+
+type Callback = { code: str, state: str, error: str, description: str }
+
+/// The redirect the provider sends the browser back to.
+///
+/// The state is *returned* rather than checked, because only the caller knows
+/// what it sent — but `callback_matches` below is the check, and it is one
+/// call, so there is no excuse for skipping it.
+pub fn read_callback(redirect: str) -> Callback {
+    let u = url.parse(redirect)
+    let q = if u.ok { u.query } else { "" }
+    Callback{
+        code: url.query_get(q, "code") ?? "",
+        state: url.query_get(q, "state") ?? "",
+        error: url.query_get(q, "error") ?? "",
+        description: url.query_get(q, "error_description") ?? "",
+    }
+}
+
+/// Is this callback the one that was asked for?
+///
+/// A comparison in constant time, because the state is a secret for exactly
+/// as long as the flow lasts and comparing it with `==` leaks how much of it
+/// an attacker has right.
+pub fn callback_matches(cb: Callback, sent_state: str) -> bool {
+    if cb.state.is_empty() or sent_state.is_empty() {
+        return false
+    }
+    crypto_hash.equal_constant_time(cb.state.to_bytes(), sent_state.to_bytes())
+}
+
+// --- the token request -------------------------------------------------------------
+
+/// The body to post to the token endpoint, exchanging a code.
+pub fn code_exchange_body(c: Client, code: str, verifier: str) -> str {
+    var pairs = [
+        Pair{ name: "grant_type", value: "authorization_code" },
+        Pair{ name: "code", value: code },
+        Pair{ name: "redirect_uri", value: c.redirect_uri },
+        Pair{ name: "client_id", value: c.id },
+        Pair{ name: "code_verifier", value: verifier },
+    ]
+    if not c.secret.is_empty() {
+        pairs.push(Pair{ name: "client_secret", value: c.secret })
+    }
+    url.build_query(pairs)
+}
+
+/// The client-credentials grant: a program authenticating as itself, with no
+/// person and no browser.
+pub fn client_credentials_body(c: Client, scope: str) -> str {
+    var pairs = [
+        Pair{ name: "grant_type", value: "client_credentials" },
+        Pair{ name: "client_id", value: c.id },
+        Pair{ name: "client_secret", value: c.secret },
+    ]
+    if not scope.is_empty() {
+        pairs.push(Pair{ name: "scope", value: scope })
+    }
+    url.build_query(pairs)
+}
+
+pub fn refresh_body(c: Client, refresh_token: str, scope: str) -> str {
+    var pairs = [
+        Pair{ name: "grant_type", value: "refresh_token" },
+        Pair{ name: "refresh_token", value: refresh_token },
+        Pair{ name: "client_id", value: c.id },
+    ]
+    if not c.secret.is_empty() {
+        pairs.push(Pair{ name: "client_secret", value: c.secret })
+    }
+    if not scope.is_empty() {
+        pairs.push(Pair{ name: "scope", value: scope })
+    }
+    url.build_query(pairs)
+}
+
+/// The `Authorization: Basic` header, which is the other way a provider
+/// accepts client credentials.
+pub fn basic_authorization(c: Client) -> str {
+    "Basic " + bytes_codec.encode_base64(
+        (url.encode_query(c.id) + ":" + url.encode_query(c.secret)).to_bytes())
+}
+
+// --- the token response ---------------------------------------------------------------
+
+/// A token from the JSON a provider answered with.
+pub fn read_token(body: str) -> Token ! OauthError {
+    let doc = match json.parse(body) {
+        Ok(d) -> d
+        Err(e) -> fail(OauthError{ code: "invalid_response", description: "the body is not JSON" })
+    }
+    match json.get(doc, "error") {
+        Some(v) -> {
+            let described = match json.get(doc, "error_description") {
+                Some(d) -> json.as_str(d) ?? ""
+                None -> ""
+            }
+            fail(OauthError{ code: json.as_str(v) ?? "error", description: described })
+        }
+        None -> {}
+    }
+    let access = match json.get(doc, "access_token") {
+        Some(v) -> json.as_str(v) ?? ""
+        None -> fail(OauthError{ code: "invalid_response", description: "no access_token" })
+    }
+    if access.is_empty() {
+        fail(OauthError{ code: "invalid_response", description: "an empty access_token" })
+    }
+    Token{
+        access_token: access,
+        token_type: match json.get(doc, "token_type") {
+            Some(v) -> json.as_str(v) ?? ""
+            None -> ""
+        },
+        // Absent means "the provider did not say", which is not the same as
+        // zero — a caller that reads 0 as "expired" refuses a token that is
+        // fine. -1 says it was not given.
+        expires_in: match json.get(doc, "expires_in") {
+            Some(v) -> json.as_int(v) ?? 0 - 1
+            None -> 0 - 1
+        },
+        refresh_token: match json.get(doc, "refresh_token") {
+            Some(v) -> json.as_str(v) ?? ""
+            None -> ""
+        },
+        scope: match json.get(doc, "scope") {
+            Some(v) -> json.as_str(v) ?? ""
+            None -> ""
+        },
+        id_token: match json.get(doc, "id_token") {
+            Some(v) -> json.as_str(v) ?? ""
+            None -> ""
+        },
+    }
+}
+
+/// The header to send with a request. `Bearer` whatever the provider called
+/// the type, since that is what every one of them means.
+pub fn authorization_header(t: Token) -> str {
+    "Bearer " + t.access_token
+}
+
+/// When this token stops being usable, in milliseconds, given when it was
+/// issued. `-1` when the provider did not say.
+///
+/// The clock comes in, as everywhere in these packages.
+pub fn expires_at(t: Token, issued_at_ms: i64) -> i64 {
+    if t.expires_in < 0 {
+        return 0 - 1
+    }
+    issued_at_ms + t.expires_in * 1000
+}
+
+/// Should this be refreshed? A token is refreshed *before* it expires, by a
+/// margin, because a request that starts valid can finish invalid.
+pub fn needs_refresh(t: Token, issued_at_ms: i64, now_ms: i64, margin_ms: i64) -> bool {
+    let at = expires_at(t, issued_at_ms)
+    if at < 0 {
+        return false
+    }
+    now_ms + margin_ms >= at
+}

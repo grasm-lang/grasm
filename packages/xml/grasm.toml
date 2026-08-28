@@ -1,0 +1,8 @@
+[package]
+name = "xml"
+version = "1.0.0"
+entry = "src/main.gr"
+
+# Text in, a tree out. No DTD, no external entities, nothing that fetches —
+# which is why this can declare nothing and mean it.
+capabilities = []

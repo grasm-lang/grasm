@@ -1,0 +1,561 @@
+// XML: parse and render.
+//
+// **No DTD and no external entities, ever.** That is not a gap, it is the
+// design: an external entity is a parser that fetches a URL somebody else
+// wrote, which is XXE — a file read, a port scan, or a request forged from
+// inside the network, from nothing but a document. Every parser that has one
+// has had the vulnerability. A first release does not need it and this one
+// will not have it, which is also why this package can declare no
+// capabilities and mean it.
+//
+// What it does have: elements, attributes, text, comments, CDATA, processing
+// instructions, the five predefined entities and numeric character
+// references, and namespaces read as prefixes rather than resolved. A
+// document that needs more than that needs a different package.
+
+type Attr = { name: str, value: str }
+
+type Node =
+    | Element(name: str, attrs: [Attr], children: [ref Node])
+    | Text(content: str)
+    | Comment(content: str)
+    | Instruction(target: str, content: str)
+
+type XmlError = { why: str, line: i64 }
+
+type XmlReader = { cs: [str], i: i64, line: i64 }
+
+fn peek(r: XmlReader) -> str {
+    if r.i < r.cs.len() { r.cs[r.i] } else { "" }
+}
+
+fn at(r: XmlReader, k: i64) -> str {
+    if r.i + k < r.cs.len() { r.cs[r.i + k] } else { "" }
+}
+
+fn starts(r: XmlReader, s: str) -> bool {
+    let want = s.chars()
+    for k in 0..want.len() {
+        if at(r, k) != want[k] {
+            return false
+        }
+    }
+    true
+}
+
+fn advance(inout r: XmlReader) {
+    if peek(r) == "\n" {
+        r.line = r.line + 1
+    }
+    r.i = r.i + 1
+}
+
+fn skip(inout r: XmlReader, n: i64) {
+    var k = 0
+    while k < n {
+        advance(r)
+        k = k + 1
+    }
+}
+
+fn skip_space(inout r: XmlReader) {
+    while peek(r) == " " or peek(r) == "\t" or peek(r) == "\n" or peek(r) == "\r" {
+        advance(r)
+    }
+}
+
+fn is_name_char(c: str) -> bool {
+    if c.is_empty() {
+        return false
+    }
+    // Letters, digits and the four punctuation marks a name may contain. A
+    // character outside ASCII is allowed: XML names are Unicode, and refusing
+    // them would refuse most of the documents in the world.
+    if c.code_at(0) > 127 {
+        return true
+    }
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-:".contains(c)
+}
+
+fn read_name(inout r: XmlReader) -> str {
+    var out = ""
+    while is_name_char(peek(r)) {
+        out = out + peek(r)
+        advance(r)
+    }
+    out
+}
+
+/// The five predefined entities and numeric references. Anything else is an
+/// entity this parser does not know, and it is *refused* rather than left as
+/// written — leaving it would put a document's own text through unchanged in
+/// a way the caller cannot tell from a literal `&`.
+fn unescape(text: str, line: i64) -> str ! XmlError {
+    if not text.contains("&") {
+        return text
+    }
+    var out = ""
+    let cs = text.chars()
+    var i = 0
+    while i < cs.len() {
+        if cs[i] != "&" {
+            out = out + cs[i]
+            i = i + 1
+            continue
+        }
+        var name = ""
+        var k = i + 1
+        while k < cs.len() and cs[k] != ";" and k - i < 12 {
+            name = name + cs[k]
+            k = k + 1
+        }
+        if k >= cs.len() or cs[k] != ";" {
+            fail(XmlError{ why: "an `&` with no `;` after it", line: line })
+        }
+        if name == "lt" { out = out + "<" }
+        else if name == "gt" { out = out + ">" }
+        else if name == "amp" { out = out + "&" }
+        else if name == "quot" { out = out + "\"" }
+        else if name == "apos" { out = out + "'" }
+        else if name.starts_with("#x") or name.starts_with("#X") {
+            let digits = name.substr(2, name.len() - 2)
+            match digits.parse_int_base(16) {
+                Some(n) -> out = out + n.to_char()
+                None -> fail(XmlError{ why: "`&{name};` is not a character reference", line: line })
+            }
+        }
+        else if name.starts_with("#") {
+            let digits = name.substr(1, name.len() - 1)
+            match digits.parse_int() {
+                Some(n) -> out = out + n.to_char()
+                None -> fail(XmlError{ why: "`&{name};` is not a character reference", line: line })
+            }
+        }
+        else {
+            fail(XmlError{ why: "`&{name};` is an entity this parser does not know", line: line })
+        }
+        i = k + 1
+    }
+    out
+}
+
+/// The document's root element. Comments and processing instructions before
+/// and after it are read and dropped, since they are not the document.
+pub fn parse(text: str) -> ref Node ! XmlError {
+    var r = XmlReader{ cs: text.chars(), i: 0, line: 1 }
+    skip_space(r)
+    while starts(r, "<?") or starts(r, "<!--") or starts(r, "<!DOCTYPE") {
+        if starts(r, "<!DOCTYPE") {
+            // Skipped, never followed. A DOCTYPE may declare entities that
+            // point at files and URLs, and a parser that reads them is the
+            // XXE vulnerability. Skipping is the whole answer.
+            try skip_doctype(r)
+        } else if starts(r, "<!--") {
+            try skip_comment(r)
+        } else {
+            try skip_instruction(r)
+        }
+        skip_space(r)
+    }
+    if peek(r) != "<" {
+        fail(XmlError{ why: "a document begins with an element", line: r.line })
+    }
+    let root = try read_element(r)
+    skip_space(r)
+    while starts(r, "<?") or starts(r, "<!--") {
+        if starts(r, "<!--") {
+            try skip_comment(r)
+        } else {
+            try skip_instruction(r)
+        }
+        skip_space(r)
+    }
+    if r.i < r.cs.len() {
+        fail(XmlError{ why: "a document has one root element and there is more after it", line: r.line })
+    }
+    root
+}
+
+fn skip_comment(inout r: XmlReader) -> () ! XmlError {
+    skip(r, 4)
+    while r.i < r.cs.len() {
+        if starts(r, "-->") {
+            skip(r, 3)
+            return
+        }
+        advance(r)
+    }
+    fail(XmlError{ why: "a comment that is never closed", line: r.line })
+}
+
+fn skip_instruction(inout r: XmlReader) -> () ! XmlError {
+    skip(r, 2)
+    while r.i < r.cs.len() {
+        if starts(r, "?>") {
+            skip(r, 2)
+            return
+        }
+        advance(r)
+    }
+    fail(XmlError{ why: "a processing instruction that is never closed", line: r.line })
+}
+
+fn skip_doctype(inout r: XmlReader) -> () ! XmlError {
+    skip(r, 9)
+    var depth = 1
+    while r.i < r.cs.len() {
+        if peek(r) == "<" {
+            depth = depth + 1
+        } else if peek(r) == ">" {
+            depth = depth - 1
+            if depth == 0 {
+                advance(r)
+                return
+            }
+        }
+        advance(r)
+    }
+    fail(XmlError{ why: "a DOCTYPE that is never closed", line: r.line })
+}
+
+fn read_element(inout r: XmlReader) -> ref Node ! XmlError {
+    advance(r)
+    let name = read_name(r)
+    if name.is_empty() {
+        fail(XmlError{ why: "a tag with no name", line: r.line })
+    }
+    var attrs: [Attr] = []
+    var seen: [str] = []
+    var going = true
+    while going {
+        skip_space(r)
+        if peek(r) == "/" {
+            skip(r, 1)
+            if peek(r) != ">" {
+                fail(XmlError{ why: "a `/` that does not close the tag", line: r.line })
+            }
+            advance(r)
+            let none: [ref Node] = []
+            return ref(Element(name, attrs, none))
+        }
+        if peek(r) == ">" {
+            advance(r)
+            going = false
+            continue
+        }
+        let attr_name = read_name(r)
+        if attr_name.is_empty() {
+            fail(XmlError{ why: "an attribute with no name", line: r.line })
+        }
+        // A repeated attribute is malformed, and a parser that keeps the last
+        // has silently chosen one of two answers a document gave.
+        if seen.contains(attr_name) {
+            fail(XmlError{ why: "the attribute `{attr_name}` twice on one element", line: r.line })
+        }
+        seen.push(attr_name)
+        skip_space(r)
+        if peek(r) != "=" {
+            fail(XmlError{ why: "the attribute `{attr_name}` with no value", line: r.line })
+        }
+        advance(r)
+        skip_space(r)
+        let quote = peek(r)
+        if quote != "\"" and quote != "'" {
+            fail(XmlError{ why: "an unquoted attribute value", line: r.line })
+        }
+        advance(r)
+        var raw = ""
+        while r.i < r.cs.len() and peek(r) != quote {
+            if peek(r) == "<" {
+                fail(XmlError{ why: "a `<` inside an attribute value", line: r.line })
+            }
+            raw = raw + peek(r)
+            advance(r)
+        }
+        if r.i >= r.cs.len() {
+            fail(XmlError{ why: "an attribute value that is never closed", line: r.line })
+        }
+        advance(r)
+        attrs.push(Attr{ name: attr_name, value: try unescape(raw, r.line) })
+    }
+
+    var children: [ref Node] = []
+    var text = ""
+    while r.i < r.cs.len() {
+        if starts(r, "</") {
+            if not text.is_empty() {
+                children.push(ref(Text(try unescape(text, r.line))))
+                text = ""
+            }
+            skip(r, 2)
+            let closing = read_name(r)
+            skip_space(r)
+            if peek(r) != ">" {
+                fail(XmlError{ why: "a closing tag that does not end", line: r.line })
+            }
+            advance(r)
+            if closing != name {
+                fail(XmlError{ why: "`<{name}>` closed by `</{closing}>`", line: r.line })
+            }
+            return ref(Element(name, attrs, children))
+        }
+        if starts(r, "<![CDATA[") {
+            if not text.is_empty() {
+                children.push(ref(Text(try unescape(text, r.line))))
+                text = ""
+            }
+            skip(r, 9)
+            var raw = ""
+            while r.i < r.cs.len() and not starts(r, "]]>") {
+                raw = raw + peek(r)
+                advance(r)
+            }
+            if r.i >= r.cs.len() {
+                fail(XmlError{ why: "a CDATA section that is never closed", line: r.line })
+            }
+            skip(r, 3)
+            // Not unescaped: that is what CDATA is for.
+            children.push(ref(Text(raw)))
+            continue
+        }
+        if starts(r, "<!--") {
+            if not text.is_empty() {
+                children.push(ref(Text(try unescape(text, r.line))))
+                text = ""
+            }
+            let start_line = r.line
+            skip(r, 4)
+            var raw = ""
+            while r.i < r.cs.len() and not starts(r, "-->") {
+                raw = raw + peek(r)
+                advance(r)
+            }
+            if r.i >= r.cs.len() {
+                fail(XmlError{ why: "a comment that is never closed", line: start_line })
+            }
+            skip(r, 3)
+            children.push(ref(Comment(raw)))
+            continue
+        }
+        if starts(r, "<?") {
+            if not text.is_empty() {
+                children.push(ref(Text(try unescape(text, r.line))))
+                text = ""
+            }
+            skip(r, 2)
+            let target = read_name(r)
+            var raw = ""
+            while r.i < r.cs.len() and not starts(r, "?>") {
+                raw = raw + peek(r)
+                advance(r)
+            }
+            if r.i >= r.cs.len() {
+                fail(XmlError{ why: "a processing instruction that is never closed", line: r.line })
+            }
+            skip(r, 2)
+            children.push(ref(Instruction(target, raw.trim())))
+            continue
+        }
+        if peek(r) == "<" {
+            if not text.is_empty() {
+                children.push(ref(Text(try unescape(text, r.line))))
+                text = ""
+            }
+            children.push(try read_element(r))
+            continue
+        }
+        text = text + peek(r)
+        advance(r)
+    }
+    fail(XmlError{ why: "`<{name}>` is never closed", line: r.line })
+}
+
+// --- reading a tree ---------------------------------------------------------------
+
+pub fn name_of(n: ref Node) -> str {
+    match n {
+        Element(name, attrs, children) -> name
+        Instruction(target, content) -> target
+        _ -> ""
+    }
+}
+
+/// A name without its namespace prefix: `soap:Body` is `Body`.
+///
+/// Prefixes are read and not resolved. Resolving means tracking `xmlns`
+/// bindings down the tree, which is a different package and a bigger one.
+pub fn local_name(n: ref Node) -> str {
+    let full = name_of(n)
+    match full.index_of(":") {
+        Some(at) -> full.substr(at + 1, full.len() - at - 1)
+        None -> full
+    }
+}
+
+pub fn prefix_of(n: ref Node) -> str {
+    let full = name_of(n)
+    match full.index_of(":") {
+        Some(at) -> full.substr(0, at)
+        None -> ""
+    }
+}
+
+pub fn attribute(n: ref Node, name: str) -> Option[str] {
+    match n {
+        Element(ename, attrs, children) -> {
+            for a in attrs {
+                if a.name == name {
+                    return Some(a.value)
+                }
+            }
+            None
+        }
+        _ -> None
+    }
+}
+
+pub fn children_of(n: ref Node) -> [ref Node] {
+    match n {
+        Element(name, attrs, children) -> children
+        _ -> []
+    }
+}
+
+/// Child elements with this name — not text, not comments.
+pub fn elements(n: ref Node, name: str) -> [ref Node] {
+    var out: [ref Node] = []
+    for c in children_of(n) {
+        match c {
+            Element(cname, attrs, kids) -> if cname == name { out.push(c) }
+            _ -> {}
+        }
+    }
+    out
+}
+
+pub fn first_element(n: ref Node, name: str) -> Option[ref Node] {
+    let found = elements(n, name)
+    if found.is_empty() {
+        return None
+    }
+    Some(found[0])
+}
+
+/// All the text under a node, comments and instructions left out.
+pub fn text_of(n: ref Node) -> str {
+    match n {
+        Text(content) -> content
+        Element(name, attrs, children) -> {
+            var out = ""
+            for c in children {
+                out = out + text_of(c)
+            }
+            out
+        }
+        _ -> ""
+    }
+}
+
+/// A value several steps down, written `body.item.name`. Local names, so a
+/// prefix does not have to be guessed.
+pub fn path(n: ref Node, dotted: str) -> Option[ref Node] {
+    var here = n
+    for step in dotted.split(".") {
+        if step.is_empty() {
+            return None
+        }
+        var found = false
+        for c in children_of(here) {
+            match c {
+                Element(cname, attrs, kids) -> {
+                    if not found and local_name(c) == step {
+                        here = c
+                        found = true
+                    }
+                }
+                _ -> {}
+            }
+        }
+        if not found {
+            return None
+        }
+    }
+    Some(here)
+}
+
+// --- writing ------------------------------------------------------------------------
+
+/// Text going between tags: `&`, `<` and `>`.
+pub fn escape_text(s: str) -> str {
+    s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+}
+
+/// Text going inside a quoted attribute: the above, plus both quotes.
+pub fn escape_attribute(s: str) -> str {
+    escape_text(s).replace("\"", "&quot;").replace("'", "&apos;")
+}
+
+pub fn element(name: str, attrs: [Attr], children: [ref Node]) -> ref Node {
+    ref(Element(name, attrs, children))
+}
+
+pub fn text(content: str) -> ref Node {
+    ref(Text(content))
+}
+
+pub fn attr(name: str, value: str) -> Attr {
+    Attr{ name: name, value: value }
+}
+
+pub fn render(n: ref Node) -> str {
+    match n {
+        Text(content) -> escape_text(content)
+        Comment(content) -> "<!--{content}-->"
+        Instruction(target, content) -> "<?{target} {content}?>"
+        Element(name, attrs, children) -> {
+            var out = "<{name}"
+            for a in attrs {
+                out = out + " {a.name}=\"{escape_attribute(a.value)}\""
+            }
+            if children.is_empty() {
+                return out + "/>"
+            }
+            out = out + ">"
+            for c in children {
+                out = out + render(c)
+            }
+            out + "</{name}>"
+        }
+    }
+}
+
+/// Indented, for a person. Not for a machine: whitespace is significant in
+/// XML, so a document rendered this way is not the same document.
+pub fn render_pretty(n: ref Node, depth: i64) -> str {
+    let pad = "  ".repeat(depth)
+    match n {
+        Text(content) -> if content.trim().is_empty() { "" } else { pad + escape_text(content.trim()) }
+        Comment(content) -> pad + "<!--{content}-->"
+        Instruction(target, content) -> pad + "<?{target} {content}?>"
+        Element(name, attrs, children) -> {
+            var head = pad + "<{name}"
+            for a in attrs {
+                head = head + " {a.name}=\"{escape_attribute(a.value)}\""
+            }
+            if children.is_empty() {
+                return head + "/>"
+            }
+            var lines: [str] = []
+            for c in children {
+                let rendered = render_pretty(c, depth + 1)
+                if not rendered.is_empty() {
+                    lines.push(rendered)
+                }
+            }
+            if lines.is_empty() {
+                return head + "></{name}>"
+            }
+            head + ">\n" + lines.join("\n") + "\n" + pad + "</{name}>"
+        }
+    }
+}

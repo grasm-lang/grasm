@@ -39,7 +39,7 @@ page is regenerated from that record. None of them is typed by hand.</p>
 
 <h2>What holds</h2>
 <div class="figures">
-  <div class="fig"><b>259</b><span>programs, three engines</span></div>
+  <div class="fig"><b>261</b><span>programs, three engines</span></div>
   <div class="fig"><b>189</b><span>identical in wasm</span></div>
   <div class="fig"><b>227</b><span>cross-compiled, agreeing</span></div>
   <div class="fig"><b>0</b><span>open defects</span></div>
@@ -48,14 +48,14 @@ page is regenerated from that record. None of them is typed by hand.</p>
 </div>
 <p>Interpreter, bundle and native builds agree byte for byte on stdout, exit
 code and diagnostics. A wasm build agrees on the 189 programs that do not
-need a filesystem, a socket, a process or threads. The same 259 cross-compile to
+need a filesystem, a socket, a process or threads. The same 261 cross-compile to
 x86_64 and agree there. Every generated program is checked for what it keeps as
 well as for what it prints.</p>
 
 <h2>What does not work</h2>
 <div class="scroll"><table>
 <tr><th>Limit</th><th>Detail</th></tr>
-<tr><td>Thirty-two libraries, all first-party</td><td>See <a href="packages.html">Packages</a>; the plan for the rest is in <code>docs/packages-plan.md</code>. Anything else you need, you write, or bind to C with <code>extern fn</code>.</td></tr>
+<tr><td>Thirty-four libraries, all first-party</td><td>See <a href="packages.html">Packages</a>; the plan for the rest is in <code>docs/packages-plan.md</code>. Anything else you need, you write, or bind to C with <code>extern fn</code>.</td></tr>
 <tr><td>No remote registry</td><td>Path and local-registry dependencies work. Nothing fetches or publishes.</td></tr>
 <tr><td>No release binaries</td><td>Build from source with a Rust toolchain.</td></tr>
 <tr><td>0.45× native Rust</td><td>Measured, floor-subtracted 0.39×, against a 0.95× target.</td></tr>

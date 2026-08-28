@@ -1,0 +1,8 @@
+[package]
+name = "oauth2_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.oauth2]
+path = "../oauth2"
+version = "^1.0.0"

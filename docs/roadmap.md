@@ -4,8 +4,8 @@ Four workstreams, running alongside the defect loop that has been going for
 weeks. The loop is not paused for these: it is what keeps them honest, and
 every item below lands with gates green or it does not land.
 
-Recorded 2026-08-27. Status is measured, not estimated — each line says how it
-was checked.
+Recorded 2026-08-27, revised 2026-08-28. Status is measured, not estimated —
+each line says how it was checked.
 
 ## Where this starts from
 
@@ -13,10 +13,11 @@ Measured on 2026-08-27, seven days after 2026-08-20:
 
 | | 20 Aug | 27 Aug |
 |---|---|---|
-| findings recorded | 31 | 67 |
-| generators | 9 | 14 |
-| corpus programs | 278 | 287 |
-| specification clauses | 230 | 234 |
+| findings recorded | 31 | 79 |
+| generators | 9 | 15 |
+| corpus programs (whole, agreeing) | 218 | 261 |
+| release libraries | 0 | 34 |
+| specification clauses | 230 | 233 |
 
 Ninety-two commits, +32,552 / −8,051 lines. Thirty-six defects found and
 fixed, twelve of them S1 — wrong answers, crashes, engine disagreements. Zero
@@ -79,76 +80,64 @@ Quality is the loop. It does not stop.
 
 ## 3. Packages and the libraries a first release needs
 
-**Status: the mechanism exists; the first two libraries are written.**
+**Status: the mechanism was already built; thirty-four libraries now exist.**
 
-`crates/grasm_pkg` is 1,991 lines and already does manifests, dependency
-resolution, lockfiles, path dependencies, a local registry under
-`.grasm/registry`, and the capability ceiling — a package declares the effects
-it may perform, effects are inferred from source, so a package that quietly
-starts touching the network fails to build *in every consumer*. That last part
-is the reason to have a package system at all rather than a directory of files,
-and it is the part that is done.
+`crates/grasm_pkg` does manifests, dependency resolution, lockfiles, path
+dependencies, a local registry, and the capability ceiling — a package
+declares the effects it may perform, effects are inferred from source, so a
+package that quietly starts touching the network fails to build *in every
+consumer*. That is the reason to have a package system rather than a
+directory of files, and it was done before this workstream started.
 
-What is missing is a remote registry — fetching, publishing, verifying — and
-the libraries themselves.
+What has been built since: `packages/`, and `docs/packages-plan.md` is the
+programme it follows. Every one has a demo the corpus builds three ways, so
+`difftest`, `leakcheck` and `crosstest` hold three engines to one answer on
+every library on every run. **Twenty-six of the thirty-four declare no
+capability at all.**
 
-What exists today:
+Two rules shape all of them.
 
-| package | capabilities | state |
-|---|---|---|
-| `packages/http` | *none* | Written. Requests, responses, routing with `:param` and `*`, percent decoding, HTML escaping. |
-| `packages/http_server` | `io`, `net` | Written. Accept loop, and `net_wait` for many conversations on one thread. |
-| `packages/http_client` | `net` | Written. Dials, sends, reads until the declared frame arrives. Its demo talks to `http_server` over a real socket. |
-| `packages/json` | *none* | Written. Parse, render, reach in, build up. Six ProjectGold programs depend on it. |
-| `packages/crypto_hash` | *none* | Written. SHA-256, HMAC, PBKDF2, constant-time compare — every digest checked against FIPS 180-4, RFC 4231 and RFC 6070. |
-| `packages/bytes_codec`, `time`, `random`, `uuid`, `path`, `url`, `log`, `csv`, `cli`, `testing`, `toml`, `resilience`, `cache` | mostly *none* | Written. See `packages/README.md`. |
-| `ProjectGold/lib-markdown` | *none* | A package, unpublished, no stable API. |
+**Split reach from computation.** `path` is arithmetic and declares nothing;
+walking a directory is `fs`. `url` is text; dialling is `http_client`. `http`
+parses and routes and *cannot open a socket*; listening is `http_server` and
+sending is `http_client`. `time` is a calendar; reading the clock is one `io`
+call in the consumer's `main`. `random` is a seeded generator; entropy is
+`random_bytes`. In every case the half that reaches is a separate name a
+consumer has to ask for, and the compiler holds them to the difference.
 
-`http`, `http_server` and `http_client` are three packages, not one, and that is the whole
-argument for this package system in one line: `http` **cannot** open a socket,
-and the compiler checks it rather than the README claiming it. Its manifest
-declares no capability, effects are inferred from its source, and a version of
-it that started dialling out would fail to build in every consumer. A program
-can parse and route HTTP while remaining provably unable to reach the network.
-In every other language, depending on the HTTP library means depending on
-something that can.
+**Prefer an effect to a capability.** `log`, `metrics` and `trace` are the
+clearest cases: a library that logs by calling `print` declares `io`, and
+every consumer then depends on something that can write anywhere. A library
+that logs by *performing* `Log` declares `Log` — and what logging means is
+decided by the line that installs the handler. `packages/log-demo`'s `work`
+function logs from three calls deep with the row `/ {Log}`, and therefore
+cannot print, cannot open a file, cannot reach the network.
 
-Both are in the corpus, so `difftest`, `leakcheck` and `crosstest` build them
-on every run and hold three engines to one answer. The socket half also has a
-live round trip — listen on a system-chosen port, connect to itself, serve five
-requests including a HEAD and a malformed one — which is opt-in behind
-`-- serve`, because a gate that depends on the loopback network fails for
-reasons that have nothing to do with the language.
+**Checked against the outside world, not against itself.** A codec tested
+only against its own output agrees with nothing. So: `crypto_hash` against
+FIPS 180-4, RFC 4231 and RFC 6070; `websocket` against RFC 6455's own accept
+value; `postgres` SCRAM against RFC 7677's proof *and* server signature;
+`oauth2` PKCE against RFC 7636; `protobuf` against Google's published byte
+sequences; `url` resolution against RFC 3986 section 5.4's table.
 
-What a first release needs, in the order a user meets them:
+**What is still missing.** A remote registry — nothing fetches, publishes or
+verifies over a network. `mongo`. And everything under "Blocked, and on what"
+in the plan: TLS, and so HTTPS, gRPC, `wss://` and OAuth2 against a real
+provider; a task that outlives its block, and so an async runtime, a thread
+pool and connection pooling; a monotonic clock; a sleep; process metrics.
 
-- **http server** — *done*, above.
-- **http client** — *done*, above.
-- **json** — *done*. `ProjectGold/lib-json` moved to `packages/json`, renamed
-  (`parse`, `render`, `escape`), and given the half a library needs that a
-  program does not: `get`, `at`, `path`, `as_str`, `as_int`, `as_bool`,
-  `count`, `keys_of`, `items_of` to reach into a document, and `object`,
-  `list`, `text`, `number`, `boolean`, `null`, `with_key`, `with_item` to build
-  one. The six programs that were using it point at it now, so there is one
-  copy rather than two.
+**What writing them found.** Eight defects in the language and its gates —
+F72 to F79 — every one by writing a library rather than by a gate. A hex
+literal could not express a bit pattern with the top bit set, which is where
+every published hash constant lives. A handler a call answers could not be
+passed as an argument. A `match` whose live arms all yield nothing could not
+be typed. A call into another module could not be typed where the type had to
+be inferred. **Two gates counted the programs they had not checked and passed
+anyway.** A generic container could not be built empty. Two packages could
+not both declare a `Bad`. A boxed place assigned to itself was never freed.
 
-  Still duplicated: `examples/jsonlib/json` is a second JSON parser, kept
-  because it is the package-system *teaching* example rather than a library.
-  One of the two should go.
-- **async/task** — `parallel`/`spawn` are in the language. What is missing is
-  the library above them: timers, channels, select.
-- **testing** — assertions and a runner beyond `test` blocks.
-- **log**, **time**, **uuid**, **base64**, **regex** — the small ones every
-  program reaches for.
-- **sql** or at least a driver interface. `ProjectGold/28-sql-engine` is 583
-  lines and shows the shape.
-
-The comparison the request named — hyper, axum, actix, gin, fiber, chi, tokio —
-is a comparison against ecosystems with years and thousands of contributors.
-The honest target for a first release is not those. It is: one good HTTP
-library, one JSON library, one async library, and the packaging to publish
-them, so that the second and third HTTP libraries can be written by somebody
-else.
+That last group is the argument for this workstream beyond the libraries: a
+language finds out what it is missing when somebody builds on it.
 
 ## 4. Is the compiler ready
 

@@ -1,0 +1,25 @@
+[package]
+name = "oauth2"
+version = "1.0.0"
+entry = "src/main.gr"
+
+# Building the URLs and reading the token responses is text. The exchange
+# itself is `http_client`, and against a real provider it needs TLS, which
+# this language does not have — see `docs/packages-plan.md`.
+capabilities = []
+
+[dependencies.bytes_codec]
+path = "../bytes"
+version = "^1.0.0"
+
+[dependencies.crypto_hash]
+path = "../crypto_hash"
+version = "^1.0.0"
+
+[dependencies.json]
+path = "../json"
+version = "^1.0.0"
+
+[dependencies.url]
+path = "../url"
+version = "^1.0.0"

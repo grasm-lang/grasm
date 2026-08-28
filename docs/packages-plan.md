@@ -214,7 +214,7 @@ values, and interpolation — and, importantly, *without* mutating the process
 environment, which is a global other threads can see change. It answers a map;
 the program decides what to do with it. Declares `io`.
 
-**30. `xml`.** Parse and render, entities, namespaces, and a refusal that
+**30. `xml`.** — **built**, `packages/xml`. Parse and render, entities, namespaces, and a refusal that
 names the line. No DTD and no external entity resolution, ever: that is how
 XXE happens and there is no reason a first release needs it. Declares nothing.
 
@@ -225,7 +225,7 @@ XXE happens and there is no reason a first release needs it. Declares nothing.
 that comes in as an argument. RS256 waits for a reviewed RSA, which waits for
 the same thing TLS does. Declares nothing.
 
-**32. `oauth2`.** The authorisation-code flow with PKCE, the client-credentials
+**32. `oauth2`.** — **built**, `packages/oauth2` (the text half; the exchange needs TLS). The authorisation-code flow with PKCE, the client-credentials
 flow, token refresh, and state. The URL building and the token parsing are
 pure; the exchange is `http_client`. Against a real provider it needs TLS.
 

@@ -1,0 +1,98 @@
+// The `oauth2` package.
+//
+// The PKCE pair is RFC 7636's own appendix B vector, so the challenge below
+// is a value anybody can look up.
+import oauth2
+
+fn main() {
+    let c = oauth2.client("s6BhdRkqt3", "",
+                          "https://provider.test/authorize",
+                          "https://provider.test/token",
+                          "https://app.test/callback")
+
+    print("-- PKCE, from RFC 7636 appendix B")
+    let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+    let challenge = oauth2.challenge_for(verifier)
+    print("  verifier  {verifier}")
+    print("  challenge {challenge}")
+    print("  the published one is E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM")
+    print("  matches: {challenge == "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"}")
+    print("  a verifier from 32 bytes: {oauth2.verifier_from(bytes_of([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]))}")
+
+    print("-- where to send the browser")
+    let state = "xyzABC123"
+    let where = oauth2.authorize_url(c, "openid profile", state, challenge)
+    print("  {where}")
+    let with_query = oauth2.authorize_url(
+        oauth2.client("id", "", "https://provider.test/authorize?tenant=acme",
+                      "https://provider.test/token", "https://app.test/cb"),
+        "", state, challenge)
+    print("  an endpoint that already has a query: {with_query}")
+
+    print("-- the callback")
+    for redirect in ["https://app.test/callback?code=SplxlOBeZQQYbYS6WxSbIA&state=xyzABC123",
+                     "https://app.test/callback?code=abc&state=somethingelse",
+                     "https://app.test/callback?error=access_denied&error_description=The+user+said+no&state=xyzABC123",
+                     "https://app.test/callback?code=abc",
+                     "not a url at all"] {
+        let cb = oauth2.read_callback(redirect)
+        var line = "  code=\"{cb.code}\" state=\"{cb.state}\""
+        if not cb.error.is_empty() {
+            line = line + " error={cb.error} (\"{cb.description}\")"
+        }
+        print("{line}  matches: {oauth2.callback_matches(cb, state)}")
+    }
+
+    print("-- the token request bodies")
+    print("  code:               {oauth2.code_exchange_body(c, "SplxlOBeZQQYbYS6WxSbIA", verifier)}")
+    let confidential = oauth2.client("s6BhdRkqt3", "a secret with a & in it",
+                                     "https://provider.test/authorize",
+                                     "https://provider.test/token",
+                                     "https://app.test/callback")
+    print("  with a secret:      {oauth2.code_exchange_body(confidential, "code", verifier)}")
+    print("  client credentials: {oauth2.client_credentials_body(confidential, "api:read")}")
+    print("  refresh:            {oauth2.refresh_body(confidential, "tGzv3JOkF0XG5Qx2TlKWIA", "")}")
+    print("  basic header:       {oauth2.basic_authorization(confidential)}")
+
+    print("-- the token response")
+    let good = "\{\"access_token\":\"2YotnFZFEjr1zCsicMWpAA\",\"token_type\":\"Bearer\"," +
+        "\"expires_in\":3600,\"refresh_token\":\"tGzv3JOkF0XG5Qx2TlKWIA\",\"scope\":\"api:read\"}"
+    match oauth2.read_token(good) {
+        Err(e) -> print("  refused: {e.code}")
+        Ok(t) -> {
+            print("  access {t.access_token}  type {t.token_type}  expires_in {t.expires_in}")
+            print("  refresh {t.refresh_token}  scope {t.scope}")
+            print("  header: {oauth2.authorization_header(t)}")
+            let issued = 1787000000000
+            print("  expires at {oauth2.expires_at(t, issued)}")
+            print("  needs refresh at issue:            {oauth2.needs_refresh(t, issued, issued, 60000)}")
+            print("  needs refresh 59 minutes later:    {oauth2.needs_refresh(t, issued, issued + 3540000, 60000)}")
+            print("  needs refresh 59m1s later:         {oauth2.needs_refresh(t, issued, issued + 3541000, 60000)}")
+        }
+    }
+
+    print("-- token responses that are not one")
+    for body in ["\{\"error\":\"invalid_grant\",\"error_description\":\"the code expired\"}",
+                 "\{\"error\":\"invalid_client\"}",
+                 "\{\"token_type\":\"Bearer\"}",
+                 "\{\"access_token\":\"\"}",
+                 "not json at all",
+                 "\{}"] {
+        match oauth2.read_token(body) {
+            Err(e) -> print("  {e.code.pad_end(18, " ")} {e.description}")
+            Ok(t) -> print("  accepted: {t.access_token}")
+        }
+    }
+
+    print("-- a provider that did not say how long the token lasts")
+    match oauth2.read_token("\{\"access_token\":\"abc\",\"token_type\":\"Bearer\"}") {
+        Err(e) -> print("  refused")
+        Ok(t) -> {
+            print("  expires_in {t.expires_in}, which means it was not given")
+            print("  expires_at {oauth2.expires_at(t, 1787000000000)}")
+            print("  needs_refresh: {oauth2.needs_refresh(t, 1787000000000, 1999999999999, 60000)}")
+            print("  — never, because nothing said when. Refreshing on a 401 is the")
+            print("    answer, and this package does not invent an expiry.")
+        }
+    }
+}
