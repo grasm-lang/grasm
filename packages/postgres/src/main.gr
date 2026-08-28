@@ -1,0 +1,448 @@
+// PostgreSQL, the version 3 wire protocol.
+//
+// Every message but the first is a one-byte tag, a four-byte length that
+// *includes itself*, and a body. That off-by-four is the first thing every
+// implementation gets wrong, so it is in one place here and named.
+//
+// Authentication: `trust`, `cleartext`, and **SCRAM-SHA-256**, which is what
+// PostgreSQL 14 and later default to. SCRAM is HMAC-SHA-256 and PBKDF2 over
+// a nonce exchange, and `crypto_hash` has both — so the modern default works
+// rather than the deprecated one. `md5` authentication is *not* here: it
+// needs MD5, which this repository has no implementation of and which nobody
+// should be adding one of in 2026.
+//
+// No TLS. So this reaches a database on a trusted network or a local socket,
+// which is what a development machine is, and it says so rather than
+// implying otherwise.
+import bytes_codec
+import crypto_hash
+
+type PgError = { why: str, code: str }
+
+type Column = { name: str, type_oid: i64, format: i64 }
+
+type Row = { values: [str], nulls: [bool] }
+
+type Result = {
+    columns: [Column],
+    rows: [Row],
+    tag: str,
+    error: str,
+}
+
+type PgMessage = { tag: str, body: bytes }
+
+// --- the frame ------------------------------------------------------------------
+
+fn be32(n: i64) -> [i64] {
+    [n.ushr(24).bit_and(255), n.ushr(16).bit_and(255),
+     n.ushr(8).bit_and(255), n.bit_and(255)]
+}
+
+fn be16(n: i64) -> [i64] {
+    [n.ushr(8).bit_and(255), n.bit_and(255)]
+}
+
+/// A four-byte big-endian value, **signed**.
+///
+/// The protocol's 32-bit fields are signed and one of them means something by
+/// being negative: a column length of -1 is SQL NULL. Read unsigned it is
+/// 4294967295, which is not less than zero, so the NULL branch is skipped and
+/// the reader walks four billion bytes off the end of an eleven-byte message.
+fn read_be32(b: [i64], at: i64) -> i64 {
+    let raw = b[at].shl(24).bit_or(b[at + 1].shl(16))
+        .bit_or(b[at + 2].shl(8)).bit_or(b[at + 3])
+    if raw >= 2147483648 {
+        return raw - 4294967296
+    }
+    raw
+}
+
+fn read_be16(b: [i64], at: i64) -> i64 {
+    b[at].shl(8).bit_or(b[at + 1])
+}
+
+/// A message: tag, length, body. **The length counts itself** — four more
+/// than the body — which is the protocol's rule and the one everybody gets
+/// wrong once.
+pub fn frame(tag: str, body: bytes) -> bytes {
+    var out: [i64] = []
+    if not tag.is_empty() {
+        out.push(tag.code_at(0))
+    }
+    for b in be32(body.len() + 4) {
+        out.push(b)
+    }
+    for b in body.to_list() {
+        out.push(b)
+    }
+    bytes_of(out)
+}
+
+/// One message from a buffer, and how many bytes it took. `None` when the
+/// buffer does not hold a whole one yet — which is the question a client asks
+/// between reads.
+pub fn next_message(raw: bytes) -> Option[(PgMessage, i64)] {
+    let b = raw.to_list()
+    if b.len() < 5 {
+        return None
+    }
+    let length = read_be32(b, 1)
+    if length < 4 or b.len() < length + 1 {
+        return None
+    }
+    var body: [i64] = []
+    for i in 5..(length + 1) {
+        body.push(b[i])
+    }
+    Some((PgMessage{ tag: b[0].to_char(), body: bytes_of(body) }, length + 1))
+}
+
+/// Every whole message in a buffer, and how much was consumed.
+pub fn messages(raw: bytes) -> ([PgMessage], i64) {
+    var out: [PgMessage] = []
+    var rest = raw.to_list()
+    var used = 0
+    var going = true
+    while going {
+        var slice: [i64] = []
+        for i in used..rest.len() {
+            slice.push(rest[i])
+        }
+        match next_message(bytes_of(slice)) {
+            None -> going = false
+            Some(pair) -> {
+                out.push(pair.0)
+                used = used + pair.1
+            }
+        }
+    }
+    (out, used)
+}
+
+fn cstring(s: str) -> [i64] {
+    var out = s.to_bytes().to_list()
+    out.push(0)
+    out
+}
+
+/// A null-terminated string starting at `at`, and where the next thing is.
+fn read_cstring(b: [i64], at: i64) -> (str, i64) {
+    var out: [i64] = []
+    var i = at
+    while i < b.len() and b[i] != 0 {
+        out.push(b[i])
+        i = i + 1
+    }
+    (bytes_of(out).to_str(), i + 1)
+}
+
+// --- what a client sends ----------------------------------------------------------
+
+/// The startup message, which has no tag — the only one that does not,
+/// because the server has to read the protocol version before it knows what
+/// tags mean.
+pub fn startup(user: str, database: str) -> bytes {
+    var body: [i64] = []
+    for b in be32(196608) {
+        body.push(b)
+    }
+    for b in cstring("user") {
+        body.push(b)
+    }
+    for b in cstring(user) {
+        body.push(b)
+    }
+    if not database.is_empty() {
+        for b in cstring("database") {
+            body.push(b)
+        }
+        for b in cstring(database) {
+            body.push(b)
+        }
+    }
+    body.push(0)
+    frame("", bytes_of(body))
+}
+
+pub fn password_message(text: str) -> bytes {
+    frame("p", bytes_of(cstring(text)))
+}
+
+pub fn query(sql: str) -> bytes {
+    frame("Q", bytes_of(cstring(sql)))
+}
+
+pub fn terminate() -> bytes {
+    frame("X", bytes_of([]))
+}
+
+// --- what a server sends ------------------------------------------------------------
+
+/// The authentication method a server asked for: 0 trust, 3 cleartext,
+/// 5 md5, 10 SASL, 11 SASL continue, 12 SASL final.
+pub fn auth_kind(m: PgMessage) -> i64 {
+    if m.tag != "R" or m.body.len() < 4 {
+        return 0 - 1
+    }
+    read_be32(m.body.to_list(), 0)
+}
+
+/// An `ErrorResponse` or `NoticeResponse` as its fields: `S` severity,
+/// `C` code, `M` message, and the rest.
+pub fn error_fields(m: PgMessage) -> [(str, str)] {
+    var out: [(str, str)] = []
+    let b = m.body.to_list()
+    var i = 0
+    while i < b.len() and b[i] != 0 {
+        let field = b[i].to_char()
+        let pair = read_cstring(b, i + 1)
+        out.push((field, pair.0))
+        i = pair.1
+    }
+    out
+}
+
+pub fn error_of(m: PgMessage) -> PgError {
+    var why = ""
+    var code = ""
+    for f in error_fields(m) {
+        if f.0 == "M" {
+            why = f.1
+        }
+        if f.0 == "C" {
+            code = f.1
+        }
+    }
+    PgError{ why: why, code: code }
+}
+
+/// A `RowDescription`.
+pub fn columns_of(m: PgMessage) -> [Column] {
+    var out: [Column] = []
+    if m.tag != "T" {
+        return out
+    }
+    let b = m.body.to_list()
+    let n = read_be16(b, 0)
+    var at = 2
+    for _k in 0..n {
+        let pair = read_cstring(b, at)
+        at = pair.1
+        // table oid, column number, type oid, size, modifier, format
+        let type_oid = read_be32(b, at + 6)
+        let format = read_be16(b, at + 16)
+        at = at + 18
+        out.push(Column{ name: pair.0, type_oid: type_oid, format: format })
+    }
+    out
+}
+
+/// A `DataRow`. A length of -1 is SQL NULL, which is *not* the empty string —
+/// a driver that flattens the two has thrown away the difference the database
+/// spent a bit per column keeping.
+pub fn row_of(m: PgMessage) -> Row {
+    var values: [str] = []
+    var nulls: [bool] = []
+    if m.tag != "D" {
+        return Row{ values: values, nulls: nulls }
+    }
+    let b = m.body.to_list()
+    let n = read_be16(b, 0)
+    var at = 2
+    for _k in 0..n {
+        let length = read_be32(b, at)
+        at = at + 4
+        if length < 0 {
+            values.push("")
+            nulls.push(true)
+            continue
+        }
+        var v: [i64] = []
+        for i in at..(at + length) {
+            v.push(b[i])
+        }
+        at = at + length
+        values.push(bytes_of(v).to_str())
+        nulls.push(false)
+    }
+    Row{ values: values, nulls: nulls }
+}
+
+/// The `CommandComplete` tag — `SELECT 3`, `INSERT 0 1`.
+pub fn command_tag(m: PgMessage) -> str {
+    if m.tag != "C" {
+        return ""
+    }
+    read_cstring(m.body.to_list(), 0).0
+}
+
+/// Every message of one query's reply, folded into a result.
+pub fn collect(ms: [PgMessage]) -> Result {
+    var columns: [Column] = []
+    var rows: [Row] = []
+    var tag = ""
+    var error = ""
+    for m in ms {
+        if m.tag == "T" {
+            columns = columns_of(m)
+        } else if m.tag == "D" {
+            rows.push(row_of(m))
+        } else if m.tag == "C" {
+            tag = command_tag(m)
+        } else if m.tag == "E" {
+            let e = error_of(m)
+            error = if e.code.is_empty() { e.why } else { "{e.code}: {e.why}" }
+        }
+    }
+    Result{ columns: columns, rows: rows, tag: tag, error: error }
+}
+
+// --- SCRAM-SHA-256 ---------------------------------------------------------------
+
+/// The client's first message, and the *bare* part of it that the signature
+/// is computed over.
+///
+/// Both, because the bare part is needed again in `scram_final` and building
+/// it twice is how the two spellings drift — which in this protocol means an
+/// authentication that fails with no explanation.
+///
+/// The user name is empty: PostgreSQL takes it from the startup message, and
+/// SASL says to send `n=` with nothing after it. Other servers send a name
+/// there, which is why `scram_final` takes the bare string rather than
+/// reconstructing it.
+pub fn scram_first(nonce: str) -> (bytes, str) {
+    let bare = "n=,r={nonce}"
+    let inner = "n,," + bare
+    var body = cstring("SCRAM-SHA-256")
+    for b in be32(inner.byte_len()) {
+        body.push(b)
+    }
+    for b in inner.to_bytes().to_list() {
+        body.push(b)
+    }
+    (frame("p", bytes_of(body)), bare)
+}
+
+type ScramChallenge = { nonce: str, salt: bytes, iterations: i64 }
+
+/// The server's `r=`, `s=` and `i=`.
+pub fn scram_challenge(text: str) -> ScramChallenge ! PgError {
+    var nonce = ""
+    var salt = bytes_of([])
+    var iterations = 0
+    for part in text.split(",") {
+        if part.starts_with("r=") {
+            nonce = part.substr(2, part.len() - 2)
+        } else if part.starts_with("s=") {
+            salt = match bytes_codec.decode_base64(part.substr(2, part.len() - 2)) {
+                Some(b) -> b
+                None -> fail(PgError{ why: "the salt is not base64", code: "" })
+            }
+        } else if part.starts_with("i=") {
+            iterations = part.substr(2, part.len() - 2).parse_int() ?? 0
+        }
+    }
+    if nonce.is_empty() or salt.len() == 0 or iterations < 1 {
+        fail(PgError{ why: "the server's challenge is missing r=, s= or i=", code: "" })
+    }
+    ScramChallenge{ nonce: nonce, salt: salt, iterations: iterations }
+}
+
+fn xor_bytes(a: bytes, b: bytes) -> bytes {
+    var out: [i64] = []
+    for i in 0..a.len() {
+        out.push(a.at(i).bit_xor(b.at(i)))
+    }
+    bytes_of(out)
+}
+
+/// The client's final message and the server signature to expect back.
+///
+/// The whole exchange, as RFC 5802 defines it. The server's own signature is
+/// computed here and checked later: a client that skips that check has
+/// authenticated *to* the server without the server authenticating to it,
+/// which is the half of mutual authentication that stops an impostor.
+pub fn scram_final(password: str, client_first_bare: str, challenge: ScramChallenge,
+                   server_first: str) -> (bytes, str) {
+    let salted = crypto_hash.pbkdf2_sha256(password.to_bytes(), challenge.salt,
+                                           challenge.iterations, 32)
+    let client_key = crypto_hash.hmac_sha256(salted, "Client Key".to_bytes())
+    let stored_key = crypto_hash.sha256_of(client_key)
+    let without_proof = "c=biws,r={challenge.nonce}"
+    let auth_message = client_first_bare + "," + server_first + "," + without_proof
+    let client_signature = crypto_hash.hmac_sha256(stored_key, auth_message.to_bytes())
+    let proof = xor_bytes(client_key, client_signature)
+    let server_key = crypto_hash.hmac_sha256(salted, "Server Key".to_bytes())
+    let server_signature = crypto_hash.hmac_sha256(server_key, auth_message.to_bytes())
+    let text = "{without_proof},p={bytes_codec.encode_base64(proof)}"
+    (frame("p", bytes_of(text.to_bytes().to_list())),
+     bytes_codec.encode_base64(server_signature))
+}
+
+/// Does the server's final message carry the signature we expected?
+pub fn scram_verify(server_final: str, expected: str) -> bool {
+    for part in server_final.split(",") {
+        if part.starts_with("v=") {
+            return part.substr(2, part.len() - 2) == expected
+        }
+    }
+    false
+}
+
+/// The SASL payload out of an `AuthenticationSASLContinue` or `Final`, which
+/// is the body after the four-byte kind.
+pub fn sasl_payload(m: PgMessage) -> str {
+    let b = m.body.to_list()
+    var out: [i64] = []
+    for i in 4..b.len() {
+        out.push(b[i])
+    }
+    bytes_of(out).to_str()
+}
+
+// --- dialling -----------------------------------------------------------------------
+
+pub fn connect(host: str, port: i64) -> i64 ! IoError / {net} {
+    try tcp_connect(host, port)
+}
+
+pub fn close(conn: i64) / {net} {
+    net_close(conn)
+}
+
+/// Read until the buffer holds a message with one of these tags, then answer
+/// everything read.
+///
+/// A read that answers nothing twice stops it, so a server that has gone
+/// quiet without closing ends the wait rather than spinning.
+pub fn read_until(conn: i64, tags: [str]) -> [PgMessage] ! IoError / {net} {
+    var raw: [i64] = []
+    var quiet = 0
+    while quiet < 2 {
+        let piece = tcp_read_bytes(conn) ?? bytes_of([])
+        if piece.len() == 0 {
+            quiet = quiet + 1
+        } else {
+            quiet = 0
+            for b in piece.to_list() {
+                raw.push(b)
+            }
+        }
+        let got = messages(bytes_of(raw))
+        for m in got.0 {
+            if tags.contains(m.tag) {
+                return got.0
+            }
+        }
+    }
+    messages(bytes_of(raw)).0
+}
+
+/// A simple query, start to finish.
+pub fn run(conn: i64, sql: str) -> Result ! IoError / {net} {
+    try tcp_write_bytes(conn, query(sql))
+    // `Z` is ReadyForQuery, which ends every reply.
+    let ms = try read_until(conn, ["Z"])
+    collect(ms)
+}

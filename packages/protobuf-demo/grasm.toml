@@ -1,0 +1,8 @@
+[package]
+name = "protobuf_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.protobuf]
+path = "../protobuf"
+version = "^1.0.0"

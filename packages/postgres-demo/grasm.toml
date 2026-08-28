@@ -1,0 +1,8 @@
+[package]
+name = "postgres_demo"
+version = "0.1.0"
+capabilities = ["io", "net"]
+
+[dependencies.postgres]
+path = "../postgres"
+version = "^1.0.0"

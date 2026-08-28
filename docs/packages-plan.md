@@ -194,7 +194,7 @@ without waiting for real time to pass.
 easiest real driver to write and the most useful per line: the protocol is
 length-prefixed text.
 
-**26. `postgres`.** The v3 wire protocol over `net`: startup, `cleartext` and
+**26. `postgres`.** — **built**, `packages/postgres` (SCRAM-SHA-256, no TLS). The v3 wire protocol over `net`: startup, `cleartext` and
 `md5` authentication, simple and extended query, the binary and text formats,
 `COPY`. SCRAM-SHA-256 needs `crypto_hash`, which is on this list. No TLS, so
 this reaches a database on a trusted network or a local socket, which is
@@ -203,7 +203,7 @@ exactly what a development machine is.
 **27. `mongo`.** The OP_MSG wire protocol and BSON. BSON is a binary format
 this language can write; the driver is `net`.
 
-**28. `protobuf`.** Wire-format encode and decode, and a `.proto` parser that
+**28. `protobuf`.** — **built**, `packages/protobuf` (the wire format). Wire-format encode and decode, and a `.proto` parser that
 generates Grasm. The encoding declares nothing. **gRPC does not follow from
 it** — see below.
 

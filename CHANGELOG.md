@@ -26,7 +26,8 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   `packages/regex`, `packages/fs`, `packages/jwt`, `packages/cors`,
   `packages/dotenv`, `packages/sanitize`, `packages/metrics`,
   `packages/errors`, `packages/trace`, `packages/redis`,
-  `packages/websocket`, `packages/password`: the first
+  `packages/websocket`, `packages/password`, `packages/protobuf`,
+  `packages/postgres`: the first
   wave of the release library, planned in `docs/packages-plan.md`. All but
   `log` declare **no capability at all** — a calendar, a seeded generator, path
   arithmetic and URL text are computation, and the reach each one is usually
@@ -36,6 +37,15 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   where the handler is installed.
 - `packages/http` now takes its percent coding and query parsing from
   `packages/url` rather than carrying a second copy.
+- `packages/protobuf`: the wire format — varints, zigzag, packed repeated
+  fields, nested messages. A message without its schema still reads, which is
+  what lets one be forwarded or inspected. **Not gRPC**: that is protobuf over
+  HTTP/2 over TLS, and this language has neither.
+- `packages/postgres`: the version 3 wire protocol and **SCRAM-SHA-256**,
+  which is what PostgreSQL 14 and later default to — checked against RFC
+  7677's own vector, so the proof and the server signature are values anybody
+  can look up. `md5` authentication is deliberately absent. No TLS, so this
+  reaches a database on a trusted network or a local socket.
 - `packages/websocket`: the upgrade handshake and the frame format, `ws://`
   only. The accept value is checked against RFC 6455's own example, which is
   the difference between computing something and computing the right thing.

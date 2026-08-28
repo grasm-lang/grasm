@@ -39,6 +39,8 @@ gates as everything else: three engines, one answer.
 | `redis` | `net` | RESP2 and RESP3, encode and decode, and a client. |
 | `websocket` | *none* | The upgrade handshake and the frame format. `ws://` only. |
 | `password` | *none* | PBKDF2-HMAC-SHA256, with a self-describing stored form. |
+| `protobuf` | *none* | The wire format — varints, zigzag, packed, nested. |
+| `postgres` | `net` | The v3 wire protocol and SCRAM-SHA-256. No TLS. |
 
 Three packages rather than one, and the split is the same argument each time:
 a program that only needs to *build* a request never acquires the capability to
@@ -95,6 +97,8 @@ grasm run packages/trace-demo/src/main.gr
 grasm run packages/redis-demo/src/main.gr
 grasm run packages/websocket-demo/src/main.gr
 grasm run packages/password-demo/src/main.gr
+grasm run packages/protobuf-demo/src/main.gr
+grasm run packages/postgres-demo/src/main.gr
 ```
 
 ## The pattern every one of these follows

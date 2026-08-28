@@ -1,0 +1,338 @@
+// Protocol Buffers, the wire format.
+//
+// A protobuf message on the wire is a sequence of (field number, wire type,
+// value) — and that is *all* it is. The `.proto` file is not on the wire, so
+// a decoder without one reads the structure and not the names, which is
+// enough to build a message, read one, or forward one without knowing the
+// schema. That is what this package is.
+//
+// What it is not: a `.proto` compiler. Generating Grasm types from a schema
+// is a separate program that would depend on this one, and pretending a
+// wire-format library is a code generator is how a package ends up doing
+// neither well.
+//
+// **gRPC does not follow from this.** gRPC is protobuf over HTTP/2 over TLS,
+// and this language has neither HTTP/2 nor TLS. `docs/packages-plan.md` says
+// so under "Blocked, and on what".
+//
+// Varints are the whole trick: a number is written seven bits at a time, low
+// group first, with the top bit set on every group but the last. Small
+// numbers are one byte, and the format has no length field anywhere it can
+// avoid one.
+
+type WireType = | Varint | Fixed64 | Delimited | Fixed32
+
+type PbField = {
+    number: i64,
+    wire: WireType,
+    varint: i64,
+    bytes_value: bytes,
+}
+
+type PbError = { why: str, at: i64 }
+
+pub fn wire_number(w: WireType) -> i64 {
+    match w {
+        Varint -> 0
+        Fixed64 -> 1
+        Delimited -> 2
+        Fixed32 -> 5
+    }
+}
+
+pub fn wire_from(n: i64) -> Option[WireType] {
+    match n {
+        0 -> Some(Varint)
+        1 -> Some(Fixed64)
+        2 -> Some(Delimited)
+        5 -> Some(Fixed32)
+        _ -> None
+    }
+}
+
+pub fn wire_name(w: WireType) -> str {
+    match w {
+        Varint -> "varint"
+        Fixed64 -> "fixed64"
+        Delimited -> "delimited"
+        Fixed32 -> "fixed32"
+    }
+}
+
+// --- writing -------------------------------------------------------------------
+
+/// A varint, seven bits at a time.
+///
+/// A negative number is written as its unsigned 64-bit pattern, which takes
+/// ten bytes — the format's own rule, and the reason `sint32`/`sint64` exist
+/// and use zigzag instead.
+pub fn write_varint(n: i64) -> [i64] {
+    var out: [i64] = []
+    var v = n
+    if v < 0 {
+        // Ten groups: the low 63 bits, then the sign bit alone.
+        var i = 0
+        while i < 9 {
+            out.push(v.bit_and(127).bit_or(128))
+            v = v.ushr(7)
+            i = i + 1
+        }
+        out.push(1)
+        return out
+    }
+    if v == 0 {
+        return [0]
+    }
+    while v > 0 {
+        let group = v.bit_and(127)
+        v = v.ushr(7)
+        out.push(if v > 0 { group.bit_or(128) } else { group })
+    }
+    out
+}
+
+/// Zigzag: a signed number folded so small magnitudes stay small. `-1` is 1,
+/// `1` is 2, `-2` is 3. Without it every negative number costs ten bytes.
+pub fn zigzag(n: i64) -> i64 {
+    n.shl(1).bit_xor(n.shr(63))
+}
+
+pub fn unzigzag(n: i64) -> i64 {
+    n.ushr(1).bit_xor(0 - n.bit_and(1))
+}
+
+fn tag_of(number: i64, w: WireType) -> [i64] {
+    write_varint(number.shl(3).bit_or(wire_number(w)))
+}
+
+pub fn field_varint(number: i64, value: i64) -> [i64] {
+    var out = tag_of(number, Varint)
+    for b in write_varint(value) {
+        out.push(b)
+    }
+    out
+}
+
+pub fn field_signed(number: i64, value: i64) -> [i64] {
+    field_varint(number, zigzag(value))
+}
+
+pub fn field_bool(number: i64, value: bool) -> [i64] {
+    field_varint(number, if value { 1 } else { 0 })
+}
+
+pub fn field_bytes(number: i64, value: bytes) -> [i64] {
+    var out = tag_of(number, Delimited)
+    for b in write_varint(value.len()) {
+        out.push(b)
+    }
+    for b in value.to_list() {
+        out.push(b)
+    }
+    out
+}
+
+/// A string field. The length is the *byte* count, which is what `byte_len`
+/// answers and what counting characters would get wrong for every message
+/// that is not ASCII.
+pub fn field_string(number: i64, value: str) -> [i64] {
+    field_bytes(number, value.to_bytes())
+}
+
+/// A nested message: the same thing, since a message is bytes.
+pub fn field_message(number: i64, encoded: [i64]) -> [i64] {
+    field_bytes(number, bytes_of(encoded))
+}
+
+pub fn field_fixed32(number: i64, value: i64) -> [i64] {
+    var out = tag_of(number, Fixed32)
+    var i = 0
+    while i < 4 {
+        out.push(value.ushr(i * 8).bit_and(255))
+        i = i + 1
+    }
+    out
+}
+
+pub fn field_fixed64(number: i64, value: i64) -> [i64] {
+    var out = tag_of(number, Fixed64)
+    var i = 0
+    while i < 8 {
+        out.push(value.ushr(i * 8).bit_and(255))
+        i = i + 1
+    }
+    out
+}
+
+/// A packed repeated field: the values one after another inside one
+/// length-delimited field, which is what proto3 does by default for scalars.
+pub fn field_packed(number: i64, values: [i64]) -> [i64] {
+    var inner: [i64] = []
+    for v in values {
+        for b in write_varint(v) {
+            inner.push(b)
+        }
+    }
+    field_bytes(number, bytes_of(inner))
+}
+
+pub fn message(fields: [[i64]]) -> bytes {
+    var out: [i64] = []
+    for f in fields {
+        for b in f {
+            out.push(b)
+        }
+    }
+    bytes_of(out)
+}
+
+// --- reading -------------------------------------------------------------------
+
+type PbReader = { b: [i64], i: i64 }
+
+fn read_varint(inout r: PbReader) -> i64 ! PbError {
+    var result = 0
+    var shift = 0
+    while r.i < r.b.len() {
+        let byte = r.b[r.i]
+        r.i = r.i + 1
+        if shift < 64 {
+            result = result.bit_or(byte.bit_and(127).shl(shift))
+        }
+        if byte.bit_and(128) == 0 {
+            return result
+        }
+        shift = shift + 7
+        if shift > 63 {
+            // Ten groups is the maximum; an eleventh means the encoder and
+            // this reader disagree, and reading on would silently wrap.
+            if shift > 70 {
+                fail(PbError{ why: "a varint longer than ten bytes", at: r.i })
+            }
+        }
+    }
+    fail(PbError{ why: "a varint that runs off the end", at: r.i })
+}
+
+/// Every field, in the order written.
+///
+/// Repeated fields appear more than once and are *kept* that way: merging
+/// them is the schema's decision, and a decoder without a schema that kept
+/// only the last would throw away the list.
+pub fn read(raw: bytes) -> [PbField] ! PbError {
+    var r = PbReader{ b: raw.to_list(), i: 0 }
+    var out: [PbField] = []
+    while r.i < r.b.len() {
+        let tag = try read_varint(r)
+        let number = tag.ushr(3)
+        if number == 0 {
+            fail(PbError{ why: "field number 0, which the format reserves", at: r.i })
+        }
+        let wire = match wire_from(tag.bit_and(7)) {
+            Some(w) -> w
+            None -> fail(PbError{ why: "wire type {tag.bit_and(7)} is not one this understands", at: r.i })
+        }
+        match wire {
+            Varint -> out.push(PbField{ number: number, wire: wire,
+                                        varint: try read_varint(r),
+                                        bytes_value: bytes_of([]) })
+            Fixed32 -> {
+                if r.i + 4 > r.b.len() {
+                    fail(PbError{ why: "a fixed32 with fewer than four bytes after it", at: r.i })
+                }
+                var v = 0
+                for k in 0..4 {
+                    v = v.bit_or(r.b[r.i + k].shl(k * 8))
+                }
+                r.i = r.i + 4
+                out.push(PbField{ number: number, wire: wire, varint: v,
+                                  bytes_value: bytes_of([]) })
+            }
+            Fixed64 -> {
+                if r.i + 8 > r.b.len() {
+                    fail(PbError{ why: "a fixed64 with fewer than eight bytes after it", at: r.i })
+                }
+                var v = 0
+                for k in 0..8 {
+                    v = v.bit_or(r.b[r.i + k].shl(k * 8))
+                }
+                r.i = r.i + 8
+                out.push(PbField{ number: number, wire: wire, varint: v,
+                                  bytes_value: bytes_of([]) })
+            }
+            Delimited -> {
+                let n = try read_varint(r)
+                if n < 0 or r.i + n > r.b.len() {
+                    fail(PbError{ why: "a field declaring {n} bytes with {r.b.len() - r.i} left", at: r.i })
+                }
+                var payload: [i64] = []
+                for k in 0..n {
+                    payload.push(r.b[r.i + k])
+                }
+                r.i = r.i + n
+                out.push(PbField{ number: number, wire: wire, varint: 0,
+                                  bytes_value: bytes_of(payload) })
+            }
+        }
+    }
+    out
+}
+
+/// The first field with this number, or `None`.
+pub fn field_of(fields: [PbField], number: i64) -> Option[PbField] {
+    for f in fields {
+        if f.number == number {
+            return Some(f)
+        }
+    }
+    None
+}
+
+/// Every field with this number — a repeated field.
+pub fn all_of(fields: [PbField], number: i64) -> [PbField] {
+    var out: [PbField] = []
+    for f in fields {
+        if f.number == number {
+            out.push(f)
+        }
+    }
+    out
+}
+
+pub fn text_of(f: PbField) -> str {
+    f.bytes_value.to_str()
+}
+
+pub fn signed_of(f: PbField) -> i64 {
+    unzigzag(f.varint)
+}
+
+pub fn bool_of(f: PbField) -> bool {
+    f.varint != 0
+}
+
+/// A packed repeated field back to its values.
+pub fn packed_of(f: PbField) -> [i64] ! PbError {
+    var r = PbReader{ b: f.bytes_value.to_list(), i: 0 }
+    var out: [i64] = []
+    while r.i < r.b.len() {
+        out.push(try read_varint(r))
+    }
+    out
+}
+
+/// A nested message.
+pub fn message_of(f: PbField) -> [PbField] ! PbError {
+    try read(f.bytes_value)
+}
+
+/// A field as text, for a log line or a test — the structure, since the names
+/// are not on the wire.
+pub fn render(f: PbField) -> str {
+    match f.wire {
+        Varint -> "{f.number}: varint {f.varint}"
+        Fixed32 -> "{f.number}: fixed32 {f.varint}"
+        Fixed64 -> "{f.number}: fixed64 {f.varint}"
+        Delimited -> "{f.number}: {f.bytes_value.len()} bytes"
+    }
+}

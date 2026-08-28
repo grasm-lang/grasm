@@ -1,0 +1,165 @@
+// The `postgres` package, driven by bytes written out here.
+//
+// No database is contacted. A protocol library is right or wrong about the
+// bytes, and the SCRAM exchange below is RFC 7677's own test vector — so the
+// proof this computes is a value anybody can look up, which is the difference
+// between an authentication that runs and one that works.
+import postgres
+
+fn show_bytes(label: str, b: bytes) {
+    print("  {label.pad_end(26, " ")} {b.len()} bytes: {b.to_list()}")
+}
+
+fn show_messages(label: str, raw: bytes) {
+    let got = postgres.messages(raw)
+    var parts: [str] = []
+    for m in got.0 {
+        parts.push("{m.tag}({m.body.len()})")
+    }
+    print("  {label.pad_end(30, " ")} {parts.join(" ")}   consumed {got.1}/{raw.len()}")
+}
+
+// A server's reply, assembled the way a server would send it.
+fn server_frame(tag: str, body: [i64]) -> [i64] {
+    postgres.frame(tag, bytes_of(body)).to_list()
+}
+
+fn cstr(s: str) -> [i64] {
+    var out = s.to_bytes().to_list()
+    out.push(0)
+    out
+}
+
+fn be16(n: i64) -> [i64] {
+    [n / 256, n % 256]
+}
+
+fn be32(n: i64) -> [i64] {
+    [n.ushr(24).bit_and(255), n.ushr(16).bit_and(255), n.ushr(8).bit_and(255), n.bit_and(255)]
+}
+
+fn main() {
+    print("-- what a client sends")
+    show_bytes("startup", postgres.startup("ada", "app"))
+    show_bytes("query", postgres.query("select 1"))
+    show_bytes("password", postgres.password_message("hunter2"))
+    show_bytes("terminate", postgres.terminate())
+    print("  — the length after the tag counts itself: `select 1` is 9 bytes")
+    print("    with its terminator and the length reads {postgres.query("select 1").to_list()[1] * 16777216 + postgres.query("select 1").to_list()[4]}")
+
+    print("-- framing a buffer the way a socket delivers it")
+    var reply: [i64] = []
+    for b in server_frame("R", be32(0)) { reply.push(b) }
+    for b in server_frame("Z", [73]) { reply.push(b) }
+    show_messages("two whole messages", bytes_of(reply))
+    var partial: [i64] = []
+    for i in 0..(reply.len() - 3) { partial.push(reply[i]) }
+    show_messages("the last one cut short", bytes_of(partial))
+    show_messages("four bytes", bytes_of([82, 0, 0, 0]))
+    show_messages("nothing", bytes_of([]))
+
+    print("-- authentication kinds")
+    for pair in [("trust", 0), ("cleartext", 3), ("md5", 5), ("SASL", 10),
+                 ("SASL continue", 11), ("SASL final", 12)] {
+        match postgres.next_message(bytes_of(server_frame("R", be32(pair.1)))) {
+            None -> print("  {pair.0}: not a whole message")
+            Some(m) -> print("  {pair.0.pad_end(16, " ")} {postgres.auth_kind(m.0)}")
+        }
+    }
+
+    print("-- an error the server sent")
+    var err: [i64] = []
+    for b in cstr("SERROR") { err.push(b) }
+    for b in cstr("C42P01") { err.push(b) }
+    for b in cstr("Mrelation \"nope\" does not exist") { err.push(b) }
+    err.push(0)
+    match postgres.next_message(bytes_of(server_frame("E", err))) {
+        None -> print("  not a whole message")
+        Some(m) -> {
+            let e = postgres.error_of(m.0)
+            print("  code {e.code}  message {e.why}")
+            print("  every field: {postgres.error_fields(m.0)}")
+        }
+    }
+
+    print("-- a row description and two rows")
+    var desc: [i64] = []
+    for b in be16(2) { desc.push(b) }
+    for name in ["id", "name"] {
+        for b in cstr(name) { desc.push(b) }
+        for b in be32(0) { desc.push(b) }        // table oid
+        for b in be16(0) { desc.push(b) }        // column number
+        for b in be32(if name == "id" { 23 } else { 25 }) { desc.push(b) }
+        for b in be16(4) { desc.push(b) }        // size
+        for b in be32(0 - 1) { desc.push(b) }    // modifier
+        for b in be16(0) { desc.push(b) }        // format: text
+    }
+    var stream: [i64] = []
+    for b in server_frame("T", desc) { stream.push(b) }
+    // Two data rows, the second with a NULL name.
+    var row1: [i64] = []
+    for b in be16(2) { row1.push(b) }
+    for b in be32(1) { row1.push(b) }
+    row1.push(55)
+    for b in be32(3) { row1.push(b) }
+    for b in "ada".to_bytes().to_list() { row1.push(b) }
+    for b in server_frame("D", row1) { stream.push(b) }
+    var row2: [i64] = []
+    for b in be16(2) { row2.push(b) }
+    for b in be32(1) { row2.push(b) }
+    row2.push(56)
+    for b in be32(0 - 1) { row2.push(b) }
+    for b in server_frame("D", row2) { stream.push(b) }
+    for b in server_frame("C", cstr("SELECT 2")) { stream.push(b) }
+    for b in server_frame("Z", [73]) { stream.push(b) }
+
+    let got = postgres.messages(bytes_of(stream))
+    let result = postgres.collect(got.0)
+    print("  columns:")
+    for c in result.columns {
+        print("      {c.name.pad_end(8, " ")} oid {c.type_oid}  format {c.format}")
+    }
+    print("  rows:")
+    for r in result.rows {
+        print("      {r.values}  null? {r.nulls}")
+    }
+    print("  tag: {result.tag}   error: \"{result.error}\"")
+    print("  — the second row's name is NULL, which is not the empty string")
+
+    print("-- SCRAM-SHA-256, RFC 7677's own vector")
+    // The RFC's client-first-bare, which carries a user name. PostgreSQL
+    // sends `n=` with nothing after it, and `scram_first` answers whichever
+    // one it built — which is why the bare string is passed rather than
+    // rebuilt.
+    let client_bare = "n=user,r=rOprNGfwEbeRWgbNEkqO"
+    let server_first = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"
+    match postgres.scram_challenge(server_first) {
+        Err(e) -> print("  the challenge was refused: {e.why}")
+        Ok(challenge) -> {
+            print("  nonce      {challenge.nonce}")
+            print("  salt       {challenge.salt.len()} bytes")
+            print("  iterations {challenge.iterations}")
+            let pair = postgres.scram_final("pencil", client_bare, challenge, server_first)
+            let text = pair.0.to_str()
+            print("  client final: {text.substr(5, text.len() - 5)}")
+            print("  — the published proof is dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=")
+            print("  server signature expected: {pair.1}")
+            print("  — the published one is      6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=")
+            let server_final = "v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4="
+            print("  verified: {postgres.scram_verify(server_final, pair.1)}")
+            print("  a forged signature: {postgres.scram_verify("v=AAAA", pair.1)}")
+            print("  no signature at all: {postgres.scram_verify("e=other-error", pair.1)}")
+        }
+    }
+    let first = postgres.scram_first("rOprNGfwEbeRWgbNEkqO")
+    show_bytes("client first", first.0)
+    print("  its bare part, which PostgreSQL's form is: {first.1}")
+
+    print("-- a challenge missing a field")
+    for bad in ["r=abc,i=4096", "r=abc,s=W22ZaJ0SNY7soEsUEjb6gQ==", "s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096", ""] {
+        match postgres.scram_challenge(bad) {
+            Err(e) -> print("  \"{bad}\" -> refused: {e.why}")
+            Ok(c) -> print("  \"{bad}\" -> accepted, which it should not be")
+        }
+    }
+}

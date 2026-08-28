@@ -1,0 +1,136 @@
+// The `protobuf` package.
+//
+// The first vectors are the ones from Google's own encoding page, so the
+// bytes below are numbers anybody can look up.
+import protobuf
+
+fn varint(label: str, n: i64) {
+    let bs = protobuf.write_varint(n)
+    print("  {label.pad_end(26, " ")} {bs.len()} byte(s): {bs}")
+}
+
+fn show(label: str, raw: bytes) {
+    match protobuf.read(raw) {
+        Err(e) -> print("  {label.pad_end(30, " ")} refused: {e.why} at {e.at}")
+        Ok(fields) -> {
+            var parts: [str] = []
+            for f in fields {
+                parts.push(protobuf.render(f))
+            }
+            print("  {label.pad_end(30, " ")} {parts.join("  |  ")}")
+        }
+    }
+}
+
+fn main() {
+    print("-- varints, from the encoding page")
+    varint("1", 1)
+    varint("150", 150)
+    varint("0", 0)
+    varint("127, the last one byte", 127)
+    varint("128, the first two", 128)
+    varint("300", 300)
+    varint("-1, ten bytes", 0 - 1)
+    print("  — 150 is [150, 1], which is the published answer")
+
+    print("-- zigzag, which is why sint32 exists")
+    for n in [0, 0 - 1, 1, 0 - 2, 2, 2147483647, 0 - 2147483648] {
+        print("  {"{n}".pad_end(14, " ")} -> {protobuf.zigzag(n)} -> back {protobuf.unzigzag(protobuf.zigzag(n))}")
+    }
+    print("  -1 costs {protobuf.write_varint(0 - 1).len()} bytes plain and {protobuf.write_varint(protobuf.zigzag(0 - 1)).len()} zigzagged")
+
+    print("-- a message")
+    let m = protobuf.message([
+        protobuf.field_varint(1, 150),
+        protobuf.field_string(2, "testing"),
+        protobuf.field_bool(3, true),
+        protobuf.field_signed(4, 0 - 5),
+        protobuf.field_fixed32(5, 42),
+        protobuf.field_fixed64(6, 1099511627776),
+        protobuf.field_packed(7, [3, 270, 86942]),
+    ])
+    print("  {m.len()} bytes")
+    show("read back", m)
+
+    print("-- reading the fields out")
+    match protobuf.read(m) {
+        Err(e) -> print("  refused")
+        Ok(fields) -> {
+            print("  field 1, a varint:   {(protobuf.field_of(fields, 1) ?? fields[0]).varint}")
+            print("  field 2, a string:   \"{protobuf.text_of(protobuf.field_of(fields, 2) ?? fields[0])}\"")
+            print("  field 3, a bool:     {protobuf.bool_of(protobuf.field_of(fields, 3) ?? fields[0])}")
+            print("  field 4, signed:     {protobuf.signed_of(protobuf.field_of(fields, 4) ?? fields[0])}")
+            print("  field 5, fixed32:    {(protobuf.field_of(fields, 5) ?? fields[0]).varint}")
+            print("  field 6, fixed64:    {(protobuf.field_of(fields, 6) ?? fields[0]).varint}")
+            match protobuf.packed_of(protobuf.field_of(fields, 7) ?? fields[0]) {
+                Ok(vs) -> print("  field 7, packed:     {vs}")
+                Err(e) -> print("  field 7: {e.why}")
+            }
+            print("  a field nobody wrote: {protobuf.field_of(fields, 99).is_some()}")
+        }
+    }
+
+    print("-- a nested message")
+    let inner = protobuf.message([protobuf.field_varint(1, 150)])
+    let outer = protobuf.message([protobuf.field_message(3, inner.to_list())])
+    print("  {outer.to_list()}")
+    print("  — [26, 3, 8, 150, 1], which is the published answer for a nested field")
+    match protobuf.read(outer) {
+        Err(e) -> print("  refused")
+        Ok(fields) -> match protobuf.message_of(fields[0]) {
+            Ok(nested) -> print("  the nested field: {protobuf.render(nested[0])}")
+            Err(e) -> print("  could not read the nested message: {e.why}")
+        }
+    }
+
+    print("-- repeated fields are kept, not merged")
+    let repeated = protobuf.message([
+        protobuf.field_string(1, "one"),
+        protobuf.field_string(1, "two"),
+        protobuf.field_string(1, "three"),
+    ])
+    match protobuf.read(repeated) {
+        Err(e) -> print("  refused")
+        Ok(fields) -> {
+            var texts: [str] = []
+            for f in protobuf.all_of(fields, 1) {
+                texts.push(protobuf.text_of(f))
+            }
+            print("  {texts}")
+        }
+    }
+
+    print("-- a non-ascii string is framed in bytes")
+    let uni = protobuf.message([protobuf.field_string(1, "günaydin")])
+    print("  {uni.to_list()}")
+    match protobuf.read(uni) {
+        Err(e) -> print("  refused")
+        Ok(fields) -> print("  back: \"{protobuf.text_of(fields[0])}\"  ({fields[0].bytes_value.len()} bytes for 8 characters)")
+    }
+
+    print("-- an unknown field is still readable, which is what makes a proxy possible")
+    show("three fields it has no schema for", protobuf.message([
+        protobuf.field_varint(1000, 7),
+        protobuf.field_bytes(1001, bytes_of([1, 2, 3])),
+        protobuf.field_fixed32(1002, 9),
+    ]))
+
+    print("-- malformed")
+    show("nothing at all", bytes_of([]))
+    show("field number 0", bytes_of([0, 1]))
+    show("wire type 6", bytes_of([14, 1]))
+    show("a varint that runs off", bytes_of([8, 150]))
+    show("a length past the end", bytes_of([18, 10, 1, 2]))
+    show("a fixed32 cut short", bytes_of([45, 1, 2]))
+
+    print("-- every varint round-trips")
+    var bad = 0
+    for n in [0, 1, 127, 128, 255, 256, 16383, 16384, 2097151, 2097152,
+              1000000000, 4611686018427387903] {
+        match protobuf.read(bytes_of(protobuf.field_varint(1, n))) {
+            Err(e) -> bad = bad + 1
+            Ok(fields) -> if fields[0].varint != n { bad = bad + 1 }
+        }
+    }
+    print("  12 values, {bad} wrong")
+}

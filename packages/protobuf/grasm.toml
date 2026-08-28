@@ -1,0 +1,7 @@
+[package]
+name = "protobuf"
+version = "1.0.0"
+entry = "src/main.gr"
+
+# Bytes in, fields out. The wire format reaches nothing.
+capabilities = []

@@ -1,0 +1,17 @@
+[package]
+name = "postgres"
+version = "1.0.0"
+entry = "src/main.gr"
+
+# The wire protocol is bytes and declares nothing; the client dials, and
+# declares `net`. The message codec is usable without ever calling `connect`,
+# which is how its demo tests it without a database.
+capabilities = ["net"]
+
+[dependencies.bytes_codec]
+path = "../bytes"
+version = "^1.0.0"
+
+[dependencies.crypto_hash]
+path = "../crypto_hash"
+version = "^1.0.0"

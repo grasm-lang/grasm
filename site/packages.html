@@ -91,8 +91,10 @@ grasm deps --locked   # fail rather than update the lockfile</code></pre>
 <tr><td><code>redis</code></td><td><code>net</code></td><td>RESP2 and RESP3 both — a client that reads only one refuses half the servers it meets. The encoder and decoder are pure, so the demo drives them with bytes and never opens a socket.</td></tr>
 <tr><td><code>websocket</code></td><td><i>none</i></td><td>The upgrade handshake (checked against RFC 6455's own example) and the frame format. A frame's masking is checked in both directions, because a server that accepts an unmasked one sits behind a proxy that can be poisoned. <code>ws://</code> only — there is no TLS.</td></tr>
 <tr><td><code>password</code></td><td><i>none</i></td><td>PBKDF2-HMAC-SHA256. The stored form carries its own algorithm and cost, so a file written today can be verified after both change.</td></tr>
+<tr><td><code>protobuf</code></td><td><i>none</i></td><td>The wire format: varints, zigzag, packed and nested fields. A message without its schema still reads, which is what makes a proxy possible. <b>Not gRPC</b> — that needs HTTP/2 and TLS.</td></tr>
+<tr><td><code>postgres</code></td><td><code>net</code></td><td>The v3 wire protocol and <b>SCRAM-SHA-256</b>, checked against RFC 7677's own vector. No TLS, so a trusted network or a local socket.</td></tr>
 </table></div>
-<p>Twenty-three of the thirty declare <em>nothing</em>. That is the pattern: reach is
+<p>Twenty-four of the thirty-two declare <em>nothing</em>. That is the pattern: reach is
 split from computation, so a program that joins paths, formats a date or
 builds a URL acquires no capability by doing so — and where a library really
 does need the world, it asks for it as an effect the consumer supplies, which
