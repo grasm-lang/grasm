@@ -14,17 +14,17 @@
 // file is read: `package.name`, `dependencies.json.version`. Building the
 // nested map a caller would otherwise walk is work the caller then repeats.
 
-type Value =
+type TomlValue =
     | Text(s: str)
     | Int(n: i64)
     | Float(x: f64)
     | Bool(b: bool)
-    | Array(items: [ref Value])
-    | Table(keys: [str], values: [ref Value])
+    | Array(items: [ref TomlValue])
+    | Table(keys: [str], values: [ref TomlValue])
 
 type TomlError = { why: str, line: i64 }
 
-type Doc = { keys: [str], values: [ref Value], ok: bool, why: str, line: i64 }
+type Doc = { keys: [str], values: [ref TomlValue], ok: bool, why: str, line: i64 }
 
 fn refused(why: str, line: i64) -> Doc {
     Doc{ keys: [], values: [], ok: false, why: why, line: line }
@@ -37,7 +37,7 @@ fn refused(why: str, line: i64) -> Doc {
 /// form is what a configuration file is actually asked for.
 pub fn parse(text: str) -> Doc {
     var keys: [str] = []
-    var values: [ref Value] = []
+    var values: [ref TomlValue] = []
     var prefix = ""
     var line_no = 0
     for raw in text.lines() {
@@ -92,7 +92,7 @@ pub fn parse(text: str) -> Doc {
     Doc{ keys: keys, values: values, ok: true, why: "", line: 0 }
 }
 
-fn flatten_into(prefix: str, v: ref Value, inout keys: [str], inout values: [ref Value]) {
+fn flatten_into(prefix: str, v: ref TomlValue, inout keys: [str], inout values: [ref TomlValue]) {
     match v {
         Table(ks, vs) -> {
             for i in 0..ks.len() {
@@ -145,7 +145,7 @@ fn unquote_path(s: str) -> str {
     parts.join(".")
 }
 
-fn read_value(text: str, line_no: i64) -> ref Value ! TomlError {
+fn read_value(text: str, line_no: i64) -> ref TomlValue ! TomlError {
     let t = text.trim()
     if t.is_empty() {
         fail(TomlError{ why: "an assignment with no value", line: line_no })
@@ -274,12 +274,12 @@ fn split_top(body: str) -> [str] {
     parts
 }
 
-fn read_array(t: str, line_no: i64) -> ref Value ! TomlError {
+fn read_array(t: str, line_no: i64) -> ref TomlValue ! TomlError {
     if not t.ends_with("]") {
         fail(TomlError{ why: "an array with no closing bracket", line: line_no })
     }
     let body = t.substr(1, t.len() - 2).trim()
-    var items: [ref Value] = []
+    var items: [ref TomlValue] = []
     if body.is_empty() {
         return ref(Array(items))
     }
@@ -289,13 +289,13 @@ fn read_array(t: str, line_no: i64) -> ref Value ! TomlError {
     ref(Array(items))
 }
 
-fn read_inline_table(t: str, line_no: i64) -> ref Value ! TomlError {
+fn read_inline_table(t: str, line_no: i64) -> ref TomlValue ! TomlError {
     if not t.ends_with("}") {
         fail(TomlError{ why: "an inline table with no closing brace", line: line_no })
     }
     let body = t.substr(1, t.len() - 2).trim()
     var keys: [str] = []
-    var values: [ref Value] = []
+    var values: [ref TomlValue] = []
     if body.is_empty() {
         return ref(Table(keys, values))
     }
@@ -314,7 +314,7 @@ fn read_inline_table(t: str, line_no: i64) -> ref Value ! TomlError {
 
 // --- reading a document ----------------------------------------------------
 
-pub fn get(d: Doc, path: str) -> Option[ref Value] {
+pub fn get(d: Doc, path: str) -> Option[ref TomlValue] {
     for i in 0..d.keys.len() {
         if d.keys[i] == path {
             return Some(d.values[i])
@@ -409,7 +409,7 @@ pub fn keys_under(d: Doc, path: str) -> [str] {
     out
 }
 
-pub fn kind(v: ref Value) -> str {
+pub fn kind(v: ref TomlValue) -> str {
     match v {
         Text(s) -> "string"
         Int(n) -> "integer"
@@ -420,7 +420,7 @@ pub fn kind(v: ref Value) -> str {
     }
 }
 
-pub fn render_value(v: ref Value) -> str {
+pub fn render_value(v: ref TomlValue) -> str {
     match v {
         Text(s) -> "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"")
             .replace("\n", "\\n").replace("\t", "\\t") + "\""

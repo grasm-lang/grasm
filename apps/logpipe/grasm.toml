@@ -1,0 +1,35 @@
+[package]
+name = "logpipe"
+version = "0.1.0"
+entry = "src/main.gr"
+
+# It reads files and writes one. Nothing else.
+capabilities = ["io", "Metric"]
+
+[dependencies.csv]
+path = "../../packages/csv"
+version = "^1.0.0"
+
+[dependencies.fs]
+path = "../../packages/fs"
+version = "^1.0.0"
+
+[dependencies.json]
+path = "../../packages/json"
+version = "^1.0.0"
+
+[dependencies.metrics]
+path = "../../packages/metrics"
+version = "^1.0.0"
+
+[dependencies.path]
+path = "../../packages/path"
+version = "^1.0.0"
+
+[dependencies.regex]
+path = "../../packages/regex"
+version = "^1.0.0"
+
+[dependencies.time]
+path = "../../packages/time"
+version = "^1.0.0"

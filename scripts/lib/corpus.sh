@@ -10,7 +10,7 @@
 # Overridable, because a debug build is held to the same programs without the
 # benchmarks: those are sized for a release interpreter and take minutes each
 # under a debug one.
-CORPUS_DIRS=${CORPUS_DIRS:-"examples packages projects spec/conformance benchmarks/grasm"}
+CORPUS_DIRS=${CORPUS_DIRS:-"apps examples packages projects spec/conformance benchmarks/grasm"}
 
 # Every standalone program in the corpus, in a stable order.
 #

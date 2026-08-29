@@ -1,0 +1,442 @@
+// An API gateway, for the axis Phase 1 did not reach: **composition**.
+//
+// Sixteen libraries in one program. `linkstore` used nine and found two
+// defects in itself; the question here is different — do sixteen packages
+// written separately fit together, or do they collide? Grasm's types share one
+// namespace across the whole program ([T-MODULE-NS]), which F78 found the hard
+// way at eight libraries, so this is the shape that finds the next one.
+//
+// It is also the first program to declare four effects at once — `Log`,
+// `Metric`, `Trace` and the runtime's `io`/`net` — and to have a handler whose
+// row therefore says all of them. That row is the composition, written down.
+//
+// The shape is a real gateway: authenticate, rate-limit, break the circuit on
+// a failing upstream, cache what can be cached, trace the whole thing, and
+// answer CORS. Everything but the last is a thing that goes wrong in
+// production, which is why they are the ones here.
+import cache
+import cors
+import crypto_hash
+import errors
+import http
+import http_server
+import json
+import jwt
+import log
+import metrics
+import random
+import resilience
+import sanitize
+import time
+import trace
+import url
+
+type Upstream = {
+    name: str,
+    prefix: str,
+    breaker: Breaker,
+    failures: i64,
+}
+
+type Gateway = {
+    upstreams: [Upstream],
+    bucket: Bucket,
+    responses: Cache[str],
+    policy: Policy,
+    secret: str,
+    now_ms: i64,
+}
+
+let TOKEN_LIFETIME_MS = 3600000
+
+fn new_gateway(now_ms: i64, secret: str) -> Gateway {
+    limited_gateway(now_ms, secret, 1000, 100)
+}
+
+/// The same, with the limiter's size named — so the section of the self-test
+/// that tests the limiter can have a small one without every other section
+/// running out of tokens.
+fn limited_gateway(now_ms: i64, secret: str, capacity: i64, per_second: i64) -> Gateway {
+    Gateway{
+        upstreams: [
+            Upstream{ name: "users", prefix: "/api/users",
+                      breaker: resilience.breaker(3, 5000, 2), failures: 0 },
+            Upstream{ name: "orders", prefix: "/api/orders",
+                      breaker: resilience.breaker(3, 5000, 2), failures: 0 },
+        ],
+        bucket: resilience.bucket(capacity, per_second, now_ms),
+        responses: cache.new_cache(64, 30000),
+        policy: cors.with_headers(
+            cors.allowing(cors.policy(), "https://app.test"),
+            ["Content-Type", "Authorization"]),
+        secret: secret,
+        now_ms: now_ms,
+    }
+}
+
+fn upstream_for(g: Gateway, path: str) -> Option[Upstream] {
+    for u in g.upstreams {
+        if path.starts_with(u.prefix) {
+            return Some(u)
+        }
+    }
+    None
+}
+
+fn replace_upstream(g: Gateway, u: Upstream) -> Gateway {
+    var out: [Upstream] = []
+    for existing in g.upstreams {
+        if existing.name == u.name {
+            out.push(u)
+        } else {
+            out.push(existing)
+        }
+    }
+    Gateway{ upstreams: out, bucket: g.bucket, responses: g.responses,
+             policy: g.policy, secret: g.secret, now_ms: g.now_ms }
+}
+
+/// The bearer token, checked.
+///
+/// The algorithm is named by *this* function, not read from the token — which
+/// is what makes `alg: none` refused rather than trusted, and is `packages/jwt`
+/// enforcing it rather than this program remembering to.
+fn authenticate(g: Gateway, r: Request) -> Report ! str {
+    let header = http.header(r, "authorization") ?? ""
+    if header.is_empty() {
+        fail("no Authorization header")
+    }
+    if not header.starts_with("Bearer ") {
+        fail("the Authorization header is not a bearer token")
+    }
+    let token = header.substr(7, header.len() - 7)
+    let rules = jwt.requiring_expiry(jwt.with_leeway(jwt.rules(g.now_ms), 5000))
+    match jwt.verify(token, HS256, g.secret.to_bytes(), rules) {
+        Err(e) -> fail(e.why)
+        Ok(payload) -> {
+            let who = jwt.claim(payload, "sub") ?? ""
+            if who.is_empty() {
+                fail("the token has no subject")
+            }
+            errors.with_field(errors.report("authenticated"), errors.field("sub", who))
+        }
+    }
+}
+
+/// What a response is cached under.
+///
+/// The path *and the subject*, hashed. Caching on the path alone is how one
+/// user's data reaches another — the defect has a name and it is the reason
+/// this is one function rather than a string concatenation at each call site.
+fn cache_key(path: str, subject: str) -> str {
+    crypto_hash.sha256("{path}\u{1}{subject}").substr(0, 16)
+}
+
+// --- the handler ------------------------------------------------------------
+//
+// The row is the composition, written down: `/ {Log, Metric, Trace}`. It logs,
+// it counts, it traces, and it does nothing else — no filesystem, no
+// processes, no `unsafe`. Sixteen libraries and the reach is still exactly
+// what the signature says.
+
+type Outcome = { gateway: Gateway, response: Response, span: Span }
+
+fn handle(g: Gateway, r: Request, ctx: SpanContext, inout seed: Rng) -> Outcome / {Log, Metric, Trace} {
+    var out = g
+    let started = g.now_ms
+    var span = trace.start(ctx, "gateway", started)
+
+    if not r.ok {
+        return finish(out, http.respond(400, "application/json",
+                                        problem("bad_request", r.why)), span, started, "bad")
+    }
+
+    // CORS first: a preflight never reaches authentication, because the
+    // browser sends it *without* the credentials it is asking permission to
+    // send. A gateway that authenticates preflights rejects every
+    // cross-origin request from a logged-in user.
+    if cors.is_preflight(r) {
+        return finish(out, cors.preflight_response(out.policy, r), span, started, "preflight")
+    }
+
+    if r.path == "/healthz" {
+        return finish(out, http.text("ok\n"), span, started, "/healthz")
+    }
+    if r.path == "/metrics" {
+        return finish(out, http.text(""), span, started, "/metrics")
+    }
+
+    // Rate limiting before authentication, deliberately: verifying a token is
+    // arithmetic somebody else can make us do, and a limiter that runs after
+    // it is a limiter that does not protect the expensive part.
+    let taken = resilience.take(out.bucket, out.now_ms)
+    out = Gateway{ upstreams: out.upstreams, bucket: taken.0, responses: out.responses,
+                   policy: out.policy, secret: out.secret, now_ms: out.now_ms }
+    if not taken.1 {
+        let wait = resilience.wait_for_token(out.bucket, out.now_ms)
+        span = trace.failed(span, "rate limited")
+        let resp = http.with_header(
+            http.respond(429, "application/json",
+                         problem("rate_limited", "try again in {wait}ms")),
+            "Retry-After", "{(wait + 999) / 1000}")
+        return finish(out, resp, span, started, route_of(r))
+    }
+
+    let who = match authenticate(out, r) {
+        Ok(report) -> errors.field_of(report, "sub") ?? ""
+        Err(why) -> {
+            log.at(Warn, "rejected", [log.field("reason", why),
+                                      log.field("path", r.path)], out.now_ms)
+            span = trace.failed(span, "unauthenticated")
+            return finish(out, http.with_header(
+                http.respond(401, "application/json", problem("unauthenticated", why)),
+                "WWW-Authenticate", "Bearer"), span, started, route_of(r))
+        }
+    }
+    span = trace.tagged(span, trace.attribute("sub", who))
+
+    match upstream_for(out, r.path) {
+        None -> finish(out, http.respond(404, "application/json",
+                                         problem("no_route", "nothing serves {sanitize.html_text(r.path)}")),
+                       span, started, route_of(r))
+        Some(u) -> {
+            let key = cache_key(r.path, who)
+            let looked = cache.get(out.responses, key, out.now_ms)
+            out = Gateway{ upstreams: out.upstreams, bucket: out.bucket,
+                           responses: looked.0, policy: out.policy,
+                           secret: out.secret, now_ms: out.now_ms }
+            match looked.1 {
+                Some(body) -> {
+                    metrics.increment("cache_total", [metrics.label("result", "hit")])
+                    span = trace.tagged(span, trace.attribute("cache", "hit"))
+                    return finish(out, http.with_header(http.json(body), "X-Cache", "HIT"),
+                                  span, started, route_of(r))
+                }
+                None -> metrics.increment("cache_total", [metrics.label("result", "miss")])
+            }
+
+            // The circuit. An upstream that has failed three times is not
+            // called again for five seconds — which is the whole point of a
+            // breaker: the failing service gets to recover instead of being
+            // held down by the retries of everyone waiting on it.
+            let allowed = resilience.allows(u.breaker, out.now_ms)
+            var upstream = Upstream{ name: u.name, prefix: u.prefix,
+                                     breaker: allowed.0, failures: u.failures }
+            if not allowed.1 {
+                out = replace_upstream(out, upstream)
+                span = trace.failed(span, "circuit open")
+                metrics.increment("upstream_total",
+                                  [metrics.label("upstream", u.name),
+                                   metrics.label("result", "open")])
+                return finish(out, http.respond(503, "application/json",
+                                                problem("upstream_unavailable",
+                                                        "{u.name} is not answering")),
+                              span, started, route_of(r))
+            }
+
+            let child = trace.child_of(seed, span.context)
+            let call = call_upstream(upstream, r, out.now_ms, child)
+            upstream = call.0
+            out = replace_upstream(out, upstream)
+            if call.1.status >= 500 {
+                metrics.increment("upstream_total",
+                                  [metrics.label("upstream", u.name),
+                                   metrics.label("result", "failed")])
+                span = trace.failed(span, "upstream {u.name} answered {call.1.status}")
+            } else {
+                metrics.increment("upstream_total",
+                                  [metrics.label("upstream", u.name),
+                                   metrics.label("result", "ok")])
+                out = Gateway{ upstreams: out.upstreams, bucket: out.bucket,
+                               responses: cache.put(out.responses, key, call.1.body, out.now_ms),
+                               policy: out.policy, secret: out.secret, now_ms: out.now_ms }
+            }
+            finish(out, http.with_header(call.1, "X-Cache", "MISS"), span, started, route_of(r))
+        }
+    }
+}
+
+/// The upstream, stood in for.
+///
+/// There is nothing to call: an outward request needs `http_client`, which
+/// needs TLS for anything real, which this language does not have. So the
+/// upstream is simulated from the path — deterministically, so the demo is
+/// the same on three engines — and the *gateway's* behaviour around it is
+/// what is being tested, which is the part that would be written the same way
+/// either way.
+fn call_upstream(u: Upstream, r: Request, now_ms: i64, ctx: SpanContext) -> (Upstream, Response) / {Trace} {
+    let span = trace.start(ctx, "upstream.{u.name}", now_ms)
+    let fails = r.path.contains("/fail")
+    let resp = if fails {
+        http.respond(502, "application/json", problem("upstream_error", "{u.name} said no"))
+    } else {
+        http.json(json.render(json.object(
+            ["upstream", "path"],
+            [json.text(u.name), json.text(r.path)])) + "\n")
+    }
+    let breaker = if fails {
+        resilience.failed(u.breaker, now_ms)
+    } else {
+        resilience.succeeded(u.breaker, now_ms)
+    }
+    trace.emit(if fails {
+        trace.failed(trace.finish(span, now_ms + 3), "502")
+    } else {
+        trace.finish(span, now_ms + 3)
+    })
+    (Upstream{ name: u.name, prefix: u.prefix, breaker: breaker,
+               failures: u.failures + (if fails { 1 } else { 0 }) }, resp)
+}
+
+/// RFC 7807, roughly: an error a client can act on rather than a string.
+fn problem(kind: str, detail: str) -> str {
+    json.render(json.object(["error", "detail"],
+                            [json.text(kind), json.text(detail)])) + "\n"
+}
+
+fn route_of(r: Request) -> str {
+    if r.path.starts_with("/api/users") {
+        return "/api/users"
+    }
+    if r.path.starts_with("/api/orders") {
+        return "/api/orders"
+    }
+    if r.path == "/healthz" or r.path == "/metrics" {
+        return r.path
+    }
+    "other"
+}
+
+fn finish(g: Gateway, resp: Response, span: Span, started: i64, route: str) -> Outcome / {Log, Metric, Trace} {
+    let decorated = cors.decorate(g.policy, http.parse_request(""), resp)
+    metrics.increment("http_requests_total",
+                      [metrics.label("route", route),
+                       metrics.label("status", "{resp.status}")])
+    metrics.observe("http_request_duration_seconds",
+                    [metrics.label("route", route)],
+                    (g.now_ms - started).as_f64() / 1000.0)
+    let done = trace.finish(trace.tagged(span, trace.attribute("status", "{resp.status}")),
+                            g.now_ms)
+    trace.emit(done)
+    Outcome{ gateway: g, response: resp, span: done }
+}
+
+// --- the offline self-test ---------------------------------------------------
+//
+// Every path driven through the same `handle` the socket would, with the clock
+// and the entropy written out — so three engines agree byte for byte, and the
+// gates check the gateway rather than a mock of it.
+
+fn signed_token(secret: str, sub: str, now_ms: i64) -> str {
+    jwt.sign(HS256, secret.to_bytes(),
+             "\{\"sub\":\"{sub}\",\"exp\":{(now_ms + TOKEN_LIFETIME_MS) / 1000}}") ?? "unsigned"
+}
+
+fn ask(g: Gateway, label: str, method: str, path: str, headers: [str], inout seed: Rng, ctx: SpanContext) -> Gateway / {io, Log, Metric, Trace} {
+    var raw = "{method} {path} HTTP/1.1\r\nHost: gw.test\r\n"
+    for h in headers {
+        raw = raw + h + "\r\n"
+    }
+    let req = http.parse_request(raw + "\r\n")
+    let o = handle(g, req, ctx, seed)
+    var extra = ""
+    for h in o.response.headers {
+        if h.name == "X-Cache" or h.name == "Retry-After" or
+           h.name == "Access-Control-Allow-Origin" {
+            extra = extra + "  {h.name}={h.value}"
+        }
+    }
+    print("  {label.pad_end(36, " ")} {o.response.status}{extra}  {o.response.body.trim().substr(0, 44)}")
+    o.gateway
+}
+
+fn at(g: Gateway, now_ms: i64) -> Gateway {
+    Gateway{ upstreams: g.upstreams, bucket: g.bucket, responses: g.responses,
+             policy: g.policy, secret: g.secret, now_ms: now_ms }
+}
+
+fn selftest() / {io, Log, Metric, Trace} {
+    let t0 = 1787000000000
+    let secret = "a secret nobody else has"
+    var g = new_gateway(t0, secret)
+    var seed = random.seeded(2026)
+    let ctx = trace.new_trace(seed, true)
+    let good = "Authorization: Bearer {signed_token(secret, "ada", t0)}"
+
+    print("-- open routes")
+    g = ask(g, "healthz", "GET", "/healthz", [], seed, ctx)
+
+    print("-- authentication")
+    g = ask(g, "no token", "GET", "/api/users/7", [], seed, ctx)
+    g = ask(g, "not a bearer token", "GET", "/api/users/7", ["Authorization: Basic abc"], seed, ctx)
+    g = ask(g, "a token that is not one", "GET", "/api/users/7", ["Authorization: Bearer nonsense"], seed, ctx)
+    let wrong_key = signed_token("a different secret", "ada", t0)
+    g = ask(g, "signed with another key", "GET", "/api/users/7",
+            ["Authorization: Bearer {wrong_key}"], seed, ctx)
+    g = ask(g, "alg: none", "GET", "/api/users/7",
+            ["Authorization: Bearer eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiJhZG1pbiJ9."], seed, ctx)
+    g = ask(g, "expired", "GET", "/api/users/7",
+            ["Authorization: Bearer {signed_token(secret, "ada", t0 - TOKEN_LIFETIME_MS - 60000)}"], seed, ctx)
+    g = ask(g, "a good token", "GET", "/api/users/7", [good], seed, ctx)
+
+    print("-- caching, keyed on path AND subject")
+    g = ask(g, "same user, again", "GET", "/api/users/7", [good], seed, ctx)
+    let other = "Authorization: Bearer {signed_token(secret, "bob", t0)}"
+    g = ask(g, "another user, same path", "GET", "/api/users/7", [other], seed, ctx)
+    print("  — a MISS for bob on a path ada had cached is the point: caching on")
+    print("    the path alone is how one user's data reaches another")
+
+    print("-- routing")
+    g = ask(g, "orders", "GET", "/api/orders/1", [good], seed, ctx)
+    g = ask(g, "nothing serves this", "GET", "/api/nowhere", [good], seed, ctx)
+
+    print("-- the circuit opens after three failures")
+    for i in 0..4 {
+        g = at(g, t0 + i * 100)
+        g = ask(g, "failing upstream {i + 1}", "GET", "/api/orders/fail", [good], seed, ctx)
+    }
+    print("  — the fourth is 503 from the breaker, not 502 from the upstream:")
+    print("    the failing service stops being called at all")
+    g = at(g, t0 + 6000)
+    g = ask(g, "after the recovery window", "GET", "/api/orders/1", [good], seed, ctx)
+
+    print("-- the rate limiter")
+    // Ten in hand, two a second: small on purpose, because a limit nothing
+    // reaches is a limit nothing tests.
+    var limited = limited_gateway(t0, secret, 10, 2)
+    for i in 0..13 {
+        limited = at(limited, t0)
+        let req = http.parse_request("GET /api/users/{i} HTTP/1.1\r\nHost: h\r\n{good}\r\n\r\n")
+        let o = handle(limited, req, ctx, seed)
+        limited = o.gateway
+        if i == 9 or i == 10 or i == 12 {
+            print("  request {"{i + 1}".pad_start(2, " ")}  {o.response.status}")
+        }
+    }
+    print("  — ten in hand, then 429 until the bucket refills")
+    limited = at(limited, t0 + 3000)
+    limited = ask(limited, "three seconds later", "GET", "/api/users/1", [good], seed, ctx)
+
+    print("-- CORS")
+    g = ask(g, "preflight from the allowed origin", "OPTIONS", "/api/users/7",
+            ["Origin: https://app.test", "Access-Control-Request-Method: GET",
+             "Access-Control-Request-Headers: authorization"], seed, ctx)
+    g = ask(g, "preflight from anywhere else", "OPTIONS", "/api/users/7",
+            ["Origin: https://evil.test", "Access-Control-Request-Method: GET"], seed, ctx)
+    print("  — a preflight never reaches authentication, because the browser")
+    print("    sends it without the credentials it is asking permission for")
+
+    print("-- a path that would end up in HTML")
+    g = ask(g, "a script tag in the path", "GET", "/api/<script>alert(1)</script>", [good], seed, ctx)
+}
+
+fn main() / {io, net} {
+    let reg = ref(metrics.registry(metrics.default_buckets()))
+    with Log handled_by log.to_lines(Warn) {
+        with Metric handled_by metrics.collecting(reg) {
+            with Trace handled_by trace.discarding() {
+                selftest()
+            }
+        }
+    }
+}

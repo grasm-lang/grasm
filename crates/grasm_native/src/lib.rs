@@ -4409,9 +4409,40 @@ impl FnCx<'_, '_> {
 
     /// Function lookup in the module currently being compiled.
     /// The type a binding's annotation gives its initializer, if the
-    /// expression starting at `span` is one.
+    /// expression starting at `span` is one — or, failing that, the type the
+    /// *checker* settled for the expression itself.
+    ///
+    /// The annotation covers `let c: Cache[str] = new_cache(…)`. It does not
+    /// cover the same call in a struct literal field, an argument, or a list
+    /// element, where the type comes from the position and there is no
+    /// annotation to read: `Gateway{ responses: cache.new_cache(64, 30000) }`
+    /// was refused for `V` "determined by neither the arguments nor the type
+    /// this is bound to", in a field whose declared type says `Cache[str]`
+    /// (F84).
+    ///
+    /// The checker settled all of those, and since `docs/probe-removal.md`
+    /// its answers are here. Asking it is the general form of what the
+    /// annotation was a special case of.
     fn annotation_at(&mut self, span: Span) -> Option<VType> {
-        let te = self.annotation_expr_at(span)?;
+        if let Some(te) = self.annotation_expr_at(span) {
+            if let Ok(t) = self.cg.vtype_of(&te) {
+                return Some(t);
+            }
+        }
+        if self
+            .cg
+            .synthesised_spans
+            .borrow()
+            .contains(&(span.start, span.end))
+        {
+            return None;
+        }
+        let text = self
+            .cg
+            .resolved_types
+            .get(&(span.start, span.end))
+            .cloned()?;
+        let te = grasm_syntax::parse_type_src(&text)?;
         self.cg.vtype_of(&te).ok()
     }
 

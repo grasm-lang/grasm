@@ -95,6 +95,11 @@ and the entries disagree.
 | [F77](#f77) | a generic container could not be built empty | S2, backend | **fixed** |
 | [F78](#f78) | two packages could not both declare a `Bad`, and the message did not say so | S3, diagnostics | **fixed** |
 | [F79](#f79) | a boxed place assigned to itself was never freed | S2, runtime | **fixed** |
+| [F80](#f80) | a blocked ProjectGold program was counted and passed over | S3, tests | **fixed** |
+| [F81](#f81) | `grasm build --source` reported success and wrote a bundle that could not be loaded | S1, loader | **fixed** |
+| [F82](#f82) | three more pairs of packages could not be imported together | S3, libraries | **fixed** |
+| [F83](#f83) | a qualified call was charged its own row and a local function's | S3, effects | **fixed** |
+| [F84](#f84) | a generic container could not be built in a struct field | S2, backend | **fixed** |
 
 <!-- end index -->
 ## F1 — a wrapped condition must end the line with the operator (S4) — **fixed**
@@ -3448,3 +3453,173 @@ dangerous half of a problem, with the other half assumed to need nothing.
 F70's framing check measured the body the way the body was measured; here a
 store skipped the release it needed because releasing the *other* thing would
 have been wrong.
+
+## F80 — a blocked ProjectGold program was counted and passed over (S3, tests) — **fixed**
+
+```
+gold  PASS  agreeing: 44   failing: 0   blocked: 0
+```
+
+`ProjectGold/run.sh` let a project declare itself blocked on a missing
+language feature by dropping a `BLOCKED` file beside it. The count was
+printed and the gate passed regardless — so dropping one in was a way to stop
+testing a program with a green run and no diff to the gate.
+
+Nothing had done it. The point is that nothing *would have noticed*, which is
+the same reading as F76: a number printed and not acted on.
+
+The expected count is pinned at zero and raising it is now the diff. §11's gap
+list is one entry long and nothing in that directory is on it, so zero is the
+right value today.
+
+**Gate**: `ProjectGold/run.sh` itself, verified by dropping a `BLOCKED` file
+into `01-calculator-cli` and confirming it turns red and names the project.
+
+## F81 — `grasm build --source` reported success and wrote a bundle that could not be loaded (S1, loader) — **fixed**
+
+```
+grasm build app.gr --source -o app.bundle.gr
+wrote `app.bundle.gr`: 3 module(s), 195 bytes
+
+grasm run app.bundle.gr
+mid.gr:1:1: error: cannot load module `deep` (looked for `deep.gr`)
+```
+
+A build that says it worked and produces a broken artifact.
+
+A source bundle is a program with its modules laid end to end, and the
+interpreter loads one through the same function the disk loader uses. The
+writer emits `mid.deep` for a module reached only through `mid` — where the
+file is — and the bundle loader was given an empty dependency set, so an
+import resolved to the name as *written*. `mid` importing `deep` looked for
+`deep`, and the bundle held `mid.deep`.
+
+Deriving the name the way the disk does is the wrong repair, and the first
+attempt made it: `uuid-demo` depends on `uuid` and `random` directly, so its
+bundle is flat and over-qualifying broke that instead. A bundle does not have
+to derive anything — **every module it holds is in hand**, so the question is
+a lookup rather than a derivation. The qualified name first, then the written
+one.
+
+Found while closing a coverage hole rather than by a gate. 38 of `wasmtest`'s
+72 skips were multi-module programs skipped as "wasm32 has no filesystem" —
+true of the *disk loader* and not of the engine, which has loaded source
+bundles since it was written. Bundling them instead of skipping surfaced this
+immediately.
+
+**Gate**: `scripts/wasmtest.sh` bundles rather than skips, so every
+multi-module program in the corpus now runs on the wasm engine and is compared
+against the interpreter: 189 identical to **224**.
+
+
+## F82 — three more pairs of packages could not be imported together (S3, libraries) — **fixed**
+
+```
+error: duplicate type name `Field` — `log` declares one too
+```
+
+F78 found `json` and `jwt` each declaring a `Bad`, fixed the pair, gave every
+package a prefix by hand, and added a gate for the *rule* — two packages
+declaring one name must be refused, and the refusal must name both modules.
+
+The rule was gated. The **fleet** was not. Three collisions were sitting in
+`packages/` the whole time:
+
+| name | packages |
+|---|---|
+| `Field` | `errors`, `log` |
+| `Kind` | `cli`, `metrics` |
+| `Value` | `redis`, `toml` |
+
+Every one invisible, because a collision only appears when a program imports
+*both* — and no program had. They surfaced the moment one did: an API gateway
+with sixteen dependencies, written to probe exactly this.
+
+This is F78's own lesson arriving a second time. That entry says the
+convention "has no enforcement, which is the honest state of it", and then
+the enforcement added was for the rule rather than for the packages. A rule
+that holds and a fleet that satisfies it are different claims, and only the
+first was checked.
+
+Renamed: `ErrorField`, `LogField`, `FlagKind`, `MetricKind`, `RedisValue`,
+`TomlValue`.
+
+**Gate**: `scripts/fuzz_modules.py` reads the type names out of every
+package's source directly — a grep, not a compile, which is the point: it sees
+a collision between two packages *nothing has yet imported together*. 87 type
+names across 34 packages, 0 collisions. Reintroducing one turns it red and
+names both packages.
+
+## F83 — a qualified call was charged its own row and a local function's (S3, effects) — **fixed**
+
+```
+fn finish(n: i64) -> i64 / {Metric} {   // a local function
+    mt.increment("local")
+    n
+}
+
+fn only_trace() / {Trace} {
+    tr.emit(tr.finish(s))               // tr.finish is pure
+}
+error: function `only_trace` performs effect(s) `Metric` not in its declared row
+```
+
+`tr.finish(s)` names the function in `tr`. A local `finish` is a different
+function, and the row walk charged the caller **both**: it resolved the
+qualified name correctly, contributed that row, and then fell through to the
+UFCS branch — which exists so `n.labs()` is charged what `labs(n)` is — and
+contributed the *local* function's row as well.
+
+So a function calling only pure things was refused for an effect nothing in
+it reaches. Over-strict rather than unsound, which is why it is S3: the
+program is correct and the compiler will not build it, and the message names
+an effect the reader cannot find.
+
+The fix is one flag: a receiver that named a module means the call is already
+charged, and the UFCS branch must not charge it again. Both directions were
+checked, because a fix that stopped charging qualified calls at all would
+satisfy the first half — the local function must still be charged when the
+local function is what is called.
+
+Found by writing an API gateway with sixteen dependencies. It needs a
+qualified call whose bare name collides with a local one, which is a shape
+that appears when a program is large enough to have its own `finish` beside a
+library's — and no program here had been.
+
+**Gate**: `scripts/fuzz_modules.py` grew a shadow round, three cases: a local
+`/ {io}` beside a pure qualified call must build; the same local, actually
+called, must be refused; and neither performing anything must build. Removing
+the flag turns it red.
+
+## F84 — a generic container could not be built in a struct field (S2, backend) — **fixed**
+
+```
+Gateway{ responses: cache.new_cache(64, 30000), … }
+error: calling `new_cache` — `V` is determined by neither the arguments nor
+the type this is bound to
+```
+
+The field's declared type is `Cache[str]`. It says exactly what `V` is.
+
+F77 taught the backend to read a *binding's* annotation — `let c: Cache[str] =
+new_cache(…)` — and stopped there. The same call in a struct literal field, an
+argument, or a list element has no annotation to read: the type comes from the
+position, and the backend had no way to ask what the position was.
+
+The repair is the one `docs/probe-removal.md` built and is the general form of
+what F77 did as a special case. **The checker settled the type of that call**,
+and since steps 1 to 3 its answers are in the backend's hands. Asking it
+covers every position at once — field, argument, element, arm — rather than
+one more.
+
+Worth recording as the first defect the probe-removal work *fixed* rather than
+measured. It was justified on the grounds that two implementations of one
+thing disagree; this is the other half of the case, which is that one
+implementation knows more.
+
+Found by writing an API gateway with sixteen dependencies, whose store holds a
+`Cache[str]` in a field.
+
+**Gate**: `scripts/nativegaps.sh`, "a type parameter a struct field fixes" — a
+struct field and a list element in one program. Removing the fallback turns it
+from compiled to refused.

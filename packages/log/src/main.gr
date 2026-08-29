@@ -18,12 +18,12 @@ import time
 
 type Level = | Trace | Debug | Info | Warn | Error
 
-type Field = { name: str, value: str }
+type LogField = { name: str, value: str }
 
 type Record = {
     level: Level,
     message: str,
-    fields: [Field],
+    fields: [LogField],
     millis: i64,
 }
 
@@ -65,7 +65,7 @@ pub fn level_from(name: str) -> Option[Level] {
 
 // --- what a program calls --------------------------------------------------
 
-pub fn at(level: Level, message: str, fields: [Field], millis: i64) / {Log} {
+pub fn at(level: Level, message: str, fields: [LogField], millis: i64) / {Log} {
     Log.record(Record{ level: level, message: message, fields: fields, millis: millis })
 }
 
@@ -89,12 +89,12 @@ pub fn error(message: str) / {Log} {
     at(Error, message, [], 0)
 }
 
-pub fn field(name: str, value: str) -> Field {
-    Field{ name: name, value: value }
+pub fn field(name: str, value: str) -> LogField {
+    LogField{ name: name, value: value }
 }
 
-pub fn field_int(name: str, value: i64) -> Field {
-    Field{ name: name, value: "{value}" }
+pub fn field_int(name: str, value: i64) -> LogField {
+    LogField{ name: name, value: "{value}" }
 }
 
 // --- rendering -------------------------------------------------------------

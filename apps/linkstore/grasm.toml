@@ -1,0 +1,44 @@
+[package]
+name = "linkstore"
+version = "0.1.0"
+entry = "src/main.gr"
+
+# A real service: it listens, it logs, it counts. Every one of those is
+# declared, and nothing else is — no filesystem, no processes, no `unsafe`.
+capabilities = ["io", "net", "Log", "Metric"]
+
+[dependencies.http]
+path = "../../packages/http"
+version = "^1.0.0"
+
+[dependencies.http_server]
+path = "../../packages/http_server"
+version = "^1.0.0"
+
+[dependencies.json]
+path = "../../packages/json"
+version = "^1.0.0"
+
+[dependencies.log]
+path = "../../packages/log"
+version = "^1.0.0"
+
+[dependencies.metrics]
+path = "../../packages/metrics"
+version = "^1.0.0"
+
+[dependencies.sanitize]
+path = "../../packages/sanitize"
+version = "^1.0.0"
+
+[dependencies.uuid]
+path = "../../packages/uuid"
+version = "^1.0.0"
+
+[dependencies.random]
+path = "../../packages/random"
+version = "^1.0.0"
+
+[dependencies.url]
+path = "../../packages/url"
+version = "^1.0.0"

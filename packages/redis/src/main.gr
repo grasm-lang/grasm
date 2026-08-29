@@ -10,16 +10,16 @@
 // dialling, so a test drives the parser with bytes it wrote and never opens a
 // socket.
 
-type Value =
+type RedisValue =
     | Str(s: str)
     | Error(message: str)
     | Int(n: i64)
     | Bulk(s: str)
     | Nil
-    | Array(items: [ref Value])
+    | Array(items: [ref RedisValue])
     | Bool(b: bool)
     | Double(x: f64)
-    | Map(keys: [ref Value], values: [ref Value])
+    | Map(keys: [ref RedisValue], values: [ref RedisValue])
 
 type RedisError = { why: str, at: i64 }
 
@@ -45,7 +45,7 @@ fn peek(r: Reader) -> str {
 
 /// One reply. Answers the value and how many characters it consumed, so a
 /// caller reading a stream knows where the next one begins.
-pub fn parse(text: str) -> (ref Value, i64) ! RedisError {
+pub fn parse(text: str) -> (ref RedisValue, i64) ! RedisError {
     var r = Reader{ cs: text.chars(), i: 0 }
     let v = try read_value(r)
     (v, r.i)
@@ -91,7 +91,7 @@ fn read_int(inout r: Reader) -> i64 ! RedisError {
     }
 }
 
-fn read_value(inout r: Reader) -> ref Value ! RedisError {
+fn read_value(inout r: Reader) -> ref RedisValue ! RedisError {
     let tag = peek(r)
     if tag.is_empty() {
         fail(RedisError{ why: "nothing to read", at: r.i })
@@ -159,7 +159,7 @@ fn read_value(inout r: Reader) -> ref Value ! RedisError {
         if n < 0 {
             return ref(Nil)
         }
-        var items: [ref Value] = []
+        var items: [ref RedisValue] = []
         for _k in 0..n {
             items.push(try read_value(r))
         }
@@ -167,8 +167,8 @@ fn read_value(inout r: Reader) -> ref Value ! RedisError {
     }
     if tag == "%" {
         let n = try read_int(r)
-        var keys: [ref Value] = []
-        var values: [ref Value] = []
+        var keys: [ref RedisValue] = []
+        var values: [ref RedisValue] = []
         for _k in 0..n {
             keys.push(try read_value(r))
             values.push(try read_value(r))
@@ -180,14 +180,14 @@ fn read_value(inout r: Reader) -> ref Value ! RedisError {
 
 // --- reading a value ----------------------------------------------------------
 
-pub fn is_error(v: ref Value) -> bool {
+pub fn is_error(v: ref RedisValue) -> bool {
     match v {
         Error(m) -> true
         _ -> false
     }
 }
 
-pub fn error_message(v: ref Value) -> str {
+pub fn error_message(v: ref RedisValue) -> str {
     match v {
         Error(m) -> m
         _ -> ""
@@ -197,7 +197,7 @@ pub fn error_message(v: ref Value) -> str {
 /// The text of a simple or bulk string. `None` for anything else, `nil`
 /// included — a caller that cannot tell "" from nil has lost the difference
 /// between an empty value and a missing one.
-pub fn text_of(v: ref Value) -> Option[str] {
+pub fn text_of(v: ref RedisValue) -> Option[str] {
     match v {
         Str(s) -> Some(s)
         Bulk(s) -> Some(s)
@@ -205,7 +205,7 @@ pub fn text_of(v: ref Value) -> Option[str] {
     }
 }
 
-pub fn int_of(v: ref Value) -> Option[i64] {
+pub fn int_of(v: ref RedisValue) -> Option[i64] {
     match v {
         Int(n) -> Some(n)
         Bulk(s) -> s.parse_int()
@@ -213,14 +213,14 @@ pub fn int_of(v: ref Value) -> Option[i64] {
     }
 }
 
-pub fn is_nil(v: ref Value) -> bool {
+pub fn is_nil(v: ref RedisValue) -> bool {
     match v {
         Nil -> true
         _ -> false
     }
 }
 
-pub fn items_of(v: ref Value) -> [ref Value] {
+pub fn items_of(v: ref RedisValue) -> [ref RedisValue] {
     match v {
         Array(items) -> items
         _ -> []
@@ -229,7 +229,7 @@ pub fn items_of(v: ref Value) -> [ref Value] {
 
 /// A map's members, from either shape a server may send: a RESP3 map, or a
 /// RESP2 array of alternating keys and values.
-pub fn pairs_of(v: ref Value) -> [(str, str)] {
+pub fn pairs_of(v: ref RedisValue) -> [(str, str)] {
     var out: [(str, str)] = []
     match v {
         Map(keys, values) -> {
@@ -250,7 +250,7 @@ pub fn pairs_of(v: ref Value) -> [(str, str)] {
 }
 
 /// A reply as text, for a log line or a test.
-pub fn render(v: ref Value) -> str {
+pub fn render(v: ref RedisValue) -> str {
     match v {
         Str(s) -> "+{s}"
         Error(m) -> "-{m}"
@@ -284,7 +284,7 @@ pub fn render(v: ref Value) -> str {
 /// network chose — so this reads until the text parses. A read that answers
 /// nothing twice in a row stops it, rather than spinning against a peer that
 /// has gone quiet without closing.
-pub fn call(conn: i64, parts: [str]) -> ref Value ! IoError / {net} {
+pub fn call(conn: i64, parts: [str]) -> ref RedisValue ! IoError / {net} {
     try tcp_write(conn, command(parts))
     var raw = ""
     var quiet = 0
@@ -316,27 +316,27 @@ pub fn close(conn: i64) / {net} {
 
 // --- the commands anybody uses --------------------------------------------------
 
-pub fn ping(conn: i64) -> ref Value ! IoError / {net} {
+pub fn ping(conn: i64) -> ref RedisValue ! IoError / {net} {
     try call(conn, ["PING"])
 }
 
-pub fn get(conn: i64, key: str) -> ref Value ! IoError / {net} {
+pub fn get(conn: i64, key: str) -> ref RedisValue ! IoError / {net} {
     try call(conn, ["GET", key])
 }
 
-pub fn set(conn: i64, key: str, value: str) -> ref Value ! IoError / {net} {
+pub fn set(conn: i64, key: str, value: str) -> ref RedisValue ! IoError / {net} {
     try call(conn, ["SET", key, value])
 }
 
 /// `SET key value PX milliseconds`, which is how a cache entry expires.
-pub fn set_expiring(conn: i64, key: str, value: str, ms: i64) -> ref Value ! IoError / {net} {
+pub fn set_expiring(conn: i64, key: str, value: str, ms: i64) -> ref RedisValue ! IoError / {net} {
     try call(conn, ["SET", key, value, "PX", "{ms}"])
 }
 
-pub fn delete(conn: i64, key: str) -> ref Value ! IoError / {net} {
+pub fn delete(conn: i64, key: str) -> ref RedisValue ! IoError / {net} {
     try call(conn, ["DEL", key])
 }
 
-pub fn incr_by(conn: i64, key: str, by: i64) -> ref Value ! IoError / {net} {
+pub fn incr_by(conn: i64, key: str, by: i64) -> ref RedisValue ! IoError / {net} {
     try call(conn, ["INCRBY", key, "{by}"])
 }

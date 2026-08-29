@@ -1,0 +1,403 @@
+// A link shortener, as a service that is meant to be deployed.
+//
+// Nine libraries wired together — `http`, `http_server`, `json`, `log`,
+// `metrics`, `sanitize`, `uuid`, `random`, `url` — because a library that
+// works alone and a library that works beside eight others are different
+// claims, and only the second one matters to somebody deploying this.
+//
+// It is deliberately the *shape* of a production service rather than a demo:
+//
+//   GET  /healthz        is the process alive
+//   GET  /readyz         is it ready to take traffic
+//   GET  /metrics        Prometheus text, for a scraper
+//   POST /links          create, with a JSON body
+//   GET  /links/:id      read
+//   GET  /r/:id          redirect, and count the hit
+//   GET  /               a human page
+//
+// What this cannot do, and says so rather than pretending: **no TLS**. It
+// serves `http://` and belongs behind a proxy that terminates TLS, which is
+// how most services are deployed anyway. And **no background work** — Grasm's
+// `parallel` joins before the next statement, so there is no reaper, no
+// eviction thread and no keep-alive sweeper. Everything happens on a request.
+import http
+import http_server
+import json
+import log
+import metrics
+import random
+import sanitize
+import url
+import uuid
+
+type Link = {
+    id: str,
+    target: str,
+    created_ms: i64,
+    hits: i64,
+}
+
+type Store = {
+    links: [Link],
+    started_ms: i64,
+    ready: bool,
+}
+
+let MAX_LINKS = 100000
+let MAX_TARGET = 2048
+
+fn empty_store(now_ms: i64) -> Store {
+    let none: [Link] = []
+    Store{ links: none, started_ms: now_ms, ready: true }
+}
+
+fn find(s: Store, id: str) -> Option[Link] {
+    for l in s.links {
+        if l.id == id {
+            return Some(l)
+        }
+    }
+    None
+}
+
+/// A target that is safe to redirect to.
+///
+/// `javascript:` in a `Location` header is a script that runs on click, and no
+/// amount of escaping stops it — the scheme is the payload. `sanitize`'s URL
+/// rule answers `#` for anything it does not recognise, and that is the test.
+fn acceptable(target: str) -> bool {
+    if target.is_empty() or target.len() > MAX_TARGET {
+        return false
+    }
+    // A control character in a stored target reaches a `Location` header, and
+    // a newline there ends the header and begins another — a response split.
+    // `sanitize.header_value` strips them on the way out, so this was already
+    // defended at the wire; refusing here as well means the *store* never
+    // holds one, which is what stops it reaching some other output that has no
+    // such guard. The first version of this function had only the wire
+    // defence, and the comment beside it claimed this one.
+    if not sanitize.is_printable(target) {
+        return false
+    }
+    if sanitize.html_url(target) == "#" {
+        return false
+    }
+    let u = url.parse(target)
+    u.ok and (u.scheme == "http" or u.scheme == "https") and not u.host.is_empty()
+}
+
+fn link_json(l: Link) -> str {
+    json.render(json.object(
+        ["id", "target", "created_ms", "hits"],
+        [json.text(l.id), json.text(l.target),
+         json.number(l.created_ms.as_f64()), json.number(l.hits.as_f64())]))
+}
+
+fn error_json(message: str) -> str {
+    json.render(json.object(["error"], [json.text(message)])) + "\n"
+}
+
+// --- the handler -----------------------------------------------------------
+//
+// A pure function of the store and the request, answering the new store and a
+// response. Pure because that is what makes it testable without a socket:
+// every case below is exercised offline in `-- selftest`, and the socket path
+// runs the identical function.
+
+fn handle(s: Store, r: Request, now_ms: i64, inout r_seed: Rng) -> (Store, Response) / {Log, Metric} {
+    if not r.ok {
+        metrics.increment("http_requests_total",
+                          [metrics.label("route", "bad"), metrics.label("status", "400")])
+        return (s, http.respond(400, "application/json", error_json(r.why)))
+    }
+
+    let route = route_of(r)
+    var out = s
+    var resp = http.not_found()
+
+    if r.path == "/healthz" {
+        resp = http.text("ok\n")
+    } else if r.path == "/readyz" {
+        resp = if s.ready {
+            http.text("ready\n")
+        } else {
+            http.respond(503, "text/plain; charset=utf-8", "not ready\n")
+        }
+    } else if r.path == "/" {
+        resp = http.html("<h1>linkstore</h1><p>{s.links.len()} link(s), up {(now_ms - s.started_ms) / 1000}s</p>\n")
+    } else if r.path == "/links" and r.method == "POST" {
+        let pair = create(s, r, now_ms, r_seed)
+        out = pair.0
+        resp = pair.1
+    } else if r.path == "/links" and r.method == "GET" {
+        var items: [ref Json] = []
+        for l in s.links {
+            items.push(json.parse(link_json(l)) ?? json.null())
+        }
+        resp = http.json(json.render(json.list(items)) + "\n")
+    } else if http.path_matches("/links/:id", r.path) and r.method == "GET" {
+        let id = http.path_param("/links/:id", r.path, "id") ?? ""
+        match find(s, id) {
+            Some(l) -> resp = http.json(link_json(l) + "\n")
+            None -> resp = http.respond(404, "application/json", error_json("no such link"))
+        }
+    } else if http.path_matches("/r/:id", r.path) {
+        let id = http.path_param("/r/:id", r.path, "id") ?? ""
+        match find(s, id) {
+            None -> resp = http.respond(404, "application/json", error_json("no such link"))
+            Some(l) -> {
+                // The hit is counted by rebuilding the list. There is no
+                // background writer and no shared mutable state, so a counter
+                // is a new store — which is slower than a field increment and
+                // is the only thing that is correct without one.
+                var updated: [Link] = []
+                for existing in s.links {
+                    if existing.id == id {
+                        updated.push(Link{ id: existing.id, target: existing.target,
+                                           created_ms: existing.created_ms,
+                                           hits: existing.hits + 1 })
+                    } else {
+                        updated.push(existing)
+                    }
+                }
+                out = Store{ links: updated, started_ms: s.started_ms, ready: s.ready }
+                metrics.increment("redirects_total", [])
+                resp = http.with_header(
+                    http.respond(302, "text/plain; charset=utf-8", ""),
+                    "Location", sanitize.header_value(l.target))
+            }
+        }
+    } else if r.path == "/metrics" {
+        // Filled in by the caller, which owns the registry.
+        resp = http.text("")
+    }
+
+    metrics.increment("http_requests_total",
+                      [metrics.label("route", route),
+                       metrics.label("status", "{resp.status}")])
+    if resp.status >= 500 {
+        log.at(Error, "request failed",
+               [log.field("path", r.path), log.field_int("status", resp.status)], now_ms)
+    }
+    (out, resp)
+}
+
+/// The route a request matched, for the metric label.
+///
+/// The *pattern*, never the path. Labelling with `/links/abc123` gives one
+/// time series per link, which is how a metrics backend falls over — the
+/// failure has a name, cardinality explosion, and it is caused by exactly this
+/// line being written the easy way.
+fn route_of(r: Request) -> str {
+    if r.path == "/" or r.path == "/healthz" or r.path == "/readyz" or
+       r.path == "/metrics" or r.path == "/links" {
+        return r.path
+    }
+    if http.path_matches("/links/:id", r.path) {
+        return "/links/:id"
+    }
+    if http.path_matches("/r/:id", r.path) {
+        return "/r/:id"
+    }
+    "other"
+}
+
+fn create(s: Store, r: Request, now_ms: i64, inout r_seed: Rng) -> (Store, Response) / {Log} {
+    if s.links.len() >= MAX_LINKS {
+        return (s, http.respond(507, "application/json",
+                                error_json("the store is full")))
+    }
+    let doc = match json.parse(r.body) {
+        Ok(d) -> d
+        Err(e) -> return (s, http.respond(400, "application/json",
+                                          error_json("body is not JSON: {e.why}")))
+    }
+    let target = match json.get(doc, "target") {
+        Some(v) -> json.as_str(v) ?? ""
+        None -> ""
+    }
+    if not acceptable(target) {
+        return (s, http.respond(400, "application/json",
+                                error_json("`target` must be an http or https URL under {MAX_TARGET} characters")))
+    }
+    // The *tail* of a v7, not the head.
+    //
+    // A v7's first 48 bits are the millisecond it was made — that is what
+    // makes it sort by time, and it is exactly what makes the first eight hex
+    // characters identical for every link created in the same 50-day window.
+    // The first version of this line took `substr(0, 8)` and produced one id
+    // for every link in the store.
+    let full = uuid.format(uuid.v7(r_seed, now_ms)).replace("-", "")
+    let id = full.substr(full.len() - 8, 8)
+    let link = Link{ id: id, target: target, created_ms: now_ms, hits: 0 }
+    var links = s.links
+    links.push(link)
+    log.at(Info, "link created",
+           [log.field("id", id), log.field("target", target)], now_ms)
+    (Store{ links: links, started_ms: s.started_ms, ready: s.ready },
+     http.with_header(http.respond(201, "application/json", link_json(link) + "\n"),
+                      "Location", "/r/{id}"))
+}
+
+// --- serving ---------------------------------------------------------------
+
+/// One connection, start to finish.
+///
+/// The store travels in and out rather than living in a mutable global,
+/// because there is no shared mutable state to hold one — and that turns out
+/// to be the honest shape anyway: what a request changed is visible in what it
+/// returns.
+fn serve_one(conn: i64, s: Store, reg: ref Registry, now_ms: i64, inout r_seed: Rng) -> Store / {io, net, Log, Metric} {
+    let raw = tcp_read(conn) ?? ""
+    let req = http.parse_request(raw)
+    let pair = handle(s, req, now_ms, r_seed)
+    var resp = pair.1
+    // `/metrics` is answered here rather than in `handle`, since the registry
+    // is the caller's and the handler is meant to stay a pure function.
+    if req.ok and req.path == "/metrics" {
+        resp = http.respond(200, "text/plain; version=0.0.4",
+                            metrics.expose(Registry{ series: reg.series, buckets: reg.buckets }))
+    }
+    let out = if req.ok and req.method == "HEAD" {
+        http.head_of(resp)
+    } else {
+        http.render(resp)
+    }
+    match tcp_write(conn, out) {
+        Ok(_u) -> {}
+        Err(e) -> {}
+    }
+    net_close(conn)
+    pair.0
+}
+
+fn listen_and_serve(port: i64, limit: i64, reg: ref Registry) / {io, net, Log, Metric} {
+    match tcp_listen(port) {
+        Err(e) -> log.at(Error, "cannot listen", [log.field_int("port", port)], 0)
+        Ok(listener) -> {
+            let bound = net_port(listener) ?? port
+            log.at(Info, "listening", [log.field_int("port", bound)], now_millis())
+            var store = empty_store(now_millis())
+            var seed = random.seeded(now_millis())
+            var served = 0
+            while limit < 0 or served < limit {
+                match tcp_accept(listener) {
+                    Err(e) -> {
+                        log.at(Warn, "accept failed", [], now_millis())
+                        served = limit
+                    }
+                    Ok(conn) -> {
+                        store = serve_one(conn, store, reg, now_millis(), seed)
+                        served = served + 1
+                    }
+                }
+            }
+            net_close(listener)
+            log.at(Info, "stopped", [log.field_int("served", served)], now_millis())
+        }
+    }
+}
+
+// --- offline self-test ------------------------------------------------------
+//
+// Every route driven through the same `handle` the socket path uses, with the
+// clock and the entropy written out — so three engines agree byte for byte and
+// the gates check the service itself, not a mock of it.
+
+fn probe(label: str, s: Store, method: str, path: str, body: str, now_ms: i64, inout seed: Rng) -> Store / {io, Log, Metric} {
+    var raw = "{method} {path} HTTP/1.1\r\nHost: h\r\n"
+    if not body.is_empty() {
+        raw = raw + "Content-Length: {body.byte_len()}\r\n"
+    }
+    let req = http.parse_request(raw + "\r\n" + body)
+    let pair = handle(s, req, now_ms, seed)
+    let r = pair.1
+    print("  {label.pad_end(34, " ")} {r.status} {http.reason_for(r.status)}  {r.body.trim().substr(0, 58)}")
+    pair.0
+}
+
+fn selftest(reg: ref Registry) / {io, Log, Metric} {
+    let t0 = 1787000000000
+    var s = empty_store(t0)
+    var seed = random.seeded(7)
+
+    print("-- health and readiness")
+    s = probe("healthz", s, "GET", "/healthz", "", t0, seed)
+    s = probe("readyz", s, "GET", "/readyz", "", t0, seed)
+    s = probe("home", s, "GET", "/", "", t0 + 5000, seed)
+
+    print("-- creating")
+    s = probe("a good link", s, "POST", "/links", "\{\"target\":\"https://example.test/a\"}", t0, seed)
+    s = probe("another", s, "POST", "/links", "\{\"target\":\"http://example.test/b\"}", t0 + 1000, seed)
+    print("  store now holds {s.links.len()}")
+
+    print("-- creating, refused")
+    s = probe("no body", s, "POST", "/links", "", t0, seed)
+    s = probe("not json", s, "POST", "/links", "nonsense", t0, seed)
+    s = probe("no target", s, "POST", "/links", "\{\"url\":\"https://x.test\"}", t0, seed)
+    s = probe("empty target", s, "POST", "/links", "\{\"target\":\"\"}", t0, seed)
+    s = probe("javascript:", s, "POST", "/links", "\{\"target\":\"javascript:alert(1)\"}", t0, seed)
+    s = probe("JaVaScRiPt:", s, "POST", "/links", "\{\"target\":\"JaVaScRiPt:alert(1)\"}", t0, seed)
+    s = probe("a relative path", s, "POST", "/links", "\{\"target\":\"/etc/passwd\"}", t0, seed)
+    s = probe("file:", s, "POST", "/links", "\{\"target\":\"file:///etc/passwd\"}", t0, seed)
+    s = probe("no host", s, "POST", "/links", "\{\"target\":\"https://\"}", t0, seed)
+    print("  store still holds {s.links.len()}")
+
+    print("-- reading")
+    let first = s.links[0].id
+    s = probe("list", s, "GET", "/links", "", t0, seed)
+    s = probe("one link", s, "GET", "/links/{first}", "", t0, seed)
+    s = probe("a link nobody made", s, "GET", "/links/zzzzzzzz", "", t0, seed)
+
+    print("-- redirecting")
+    s = probe("redirect", s, "GET", "/r/{first}", "", t0, seed)
+    s = probe("redirect again", s, "GET", "/r/{first}", "", t0, seed)
+    s = probe("no such link", s, "GET", "/r/nope", "", t0, seed)
+    match find(s, first) {
+        Some(l) -> print("  hits counted: {l.hits}")
+        None -> print("  the link vanished")
+    }
+
+    print("-- a header that would split the response")
+    var evil = empty_store(t0)
+    evil = probe("a target with CRLF", evil, "POST", "/links",
+                 "\{\"target\":\"https://x.test/a\\r\\nX-Injected: yes\"}", t0, seed)
+    print("  — refused before it could reach a Location header")
+
+    print("-- metric labels use the route, not the path")
+    let snapshot = Registry{ series: reg.series, buckets: reg.buckets }
+    var routes: [str] = []
+    for line in metrics.expose(snapshot).split("\n") {
+        if line.starts_with("http_requests_total\{") {
+            routes.push(line.substr(0, line.index_of("}") ?? line.len()))
+        }
+    }
+    routes.sort()
+    for r in routes {
+        print("  {r}")
+    }
+    print("  — {routes.len()} series for {s.links.len()} links plus every refusal:")
+    print("    one per route, not one per link, which is what stops a metrics")
+    print("    backend falling over on a service with a million of them")
+}
+
+fn main() / {io, net} {
+    let args = args()
+    // Taken once, here, and threaded to the two places that need it. Grasm has
+    // no global mutable state, and the diagnostic for trying is one of the
+    // better ones in the language: a constant is evaluated at every mention,
+    // so `let REGISTRY = ref(...)` at the top level would have been a
+    // *different slot* per mention — a bug that would have looked like metrics
+    // silently not accumulating.
+    let reg = ref(metrics.registry(metrics.default_buckets()))
+    with Log handled_by log.to_lines(Info) {
+        with Metric handled_by metrics.collecting(reg) {
+            if args.contains("serve") {
+                let limit = if args.contains("--once") { 1 } else { 0 - 1 }
+                listen_and_serve(8080, limit, reg)
+                return
+            }
+            selftest(reg)
+        }
+    }
+}

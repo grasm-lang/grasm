@@ -402,6 +402,85 @@ def main():
                 print("NAMESPACE refuses without naming the other module:")
                 print(err or out)
 
+        # --- a qualified call is one call --------------------------------
+        #
+        # `tr.finish(s)` names the function in `tr`. A local function also
+        # called `finish` is a different function, and charging the caller
+        # *both* rows made a pure cross-module call perform whatever the local
+        # one performed — so a function calling only pure things was refused
+        # for an effect nothing in it reaches (F83).
+        #
+        # Both directions, because a fix that stopped charging qualified calls
+        # at all would satisfy the first alone: the local must still be charged
+        # when the local is what is called.
+        shadow = 0
+        for local_row, calls_local, must_build in (
+            ("/ {io}", False, True),   # local performs io, qualified call is pure
+            ("/ {io}", True, False),   # the local one is actually called
+            ("", False, True),         # neither performs anything
+        ):
+            shutil.rmtree(work, ignore_errors=True)
+            write(work, "far", [],
+                  "pub fn helper(n: i64) -> i64 {\n    n * 2\n}\n", [])
+            body = "helper(1)" if calls_local else "far.helper(1)"
+            write(work, "app", ["far"],
+                  "import far\n\n"
+                  f"fn helper(n: i64) -> i64 {local_row} {{\n"
+                  + ("    print(\"local\")\n" if local_row else "")
+                  + "    n\n}\n\n"
+                  f"fn quiet() -> i64 / {{}} {{\n    {body}\n}}\n\n"
+                  'fn main() {\n    print("{quiet()}")\n}\n', ["io"])
+            src = os.path.join(work, "app", "src", "main.gr")
+            rc, out, err = run([GRASM, "run", src])
+            shadow += 1
+            built = rc == 0
+            if built != must_build:
+                holes.append(f"shadow/{local_row}/{calls_local}")
+                if must_build:
+                    print("SHADOW charges a qualified call with a local function's row:")
+                    print(err or out)
+                else:
+                    print("SHADOW does not charge a local call at all:")
+                    print(f"  local row {local_row!r}, calling the local one, and it built")
+
+        # --- one namespace, across the packages that exist --------------
+        #
+        # The round above proves the *rule* holds for two packages built here.
+        # This asks the question the rule makes urgent: do the packages in
+        # `packages/` actually satisfy it?
+        #
+        # A collision between two of them is invisible until one program
+        # imports both. `json` and `jwt` each declared a `Bad` and nothing
+        # noticed until an application used the two together (F78); `errors`
+        # and `log` each declared a `Field`, `cli` and `metrics` a `Kind`,
+        # `redis` and `toml` a `Value`, and none of the three surfaced until a
+        # program with sixteen dependencies was written (F82).
+        #
+        # So the type names are read from the sources directly. It is a grep
+        # rather than a compile, which is the point: it sees a collision
+        # between two packages *nothing has yet imported together*.
+        import glob as _glob
+        import re as _re
+
+        declared = {}
+        collisions = []
+        for src in sorted(_glob.glob(os.path.join(ROOT, "packages", "*", "src", "*.gr"))):
+            pkg = src.split(os.sep)[-3]
+            if pkg.endswith("-demo"):
+                continue
+            for name in _re.findall(r"^type ([A-Za-z_][A-Za-z0-9_]*)", open(src).read(), _re.M):
+                if name in declared and declared[name] != pkg:
+                    collisions.append(f"`{name}` in both `{declared[name]}` and `{pkg}`")
+                else:
+                    declared[name] = pkg
+        if collisions:
+            print("two packages declare one type name, so no program can import both:")
+            for c in collisions:
+                print(f"  {c}")
+            print("Types share one namespace across the whole program")
+            print("([T-MODULE-NS]). Prefix one of them.")
+            holes.extend(collisions)
+
         # --- the ceiling ------------------------------------------------
         #
         # Both directions. A checker that refuses every package satisfies the
@@ -447,6 +526,7 @@ def main():
             f"programs: {programs}   disagreed: {len(disagreed)}   "
             f"refused: {len(refused)}   wrong: {len(wrong)}   leaked: {len(leaks)}   "
             f"ceiling cases: {ceiling}   namespace cases: {namespace}   "
+            f"package types: {len(declared)}   shadow cases: {shadow}   "
             f"holes: {len(holes)}"
         )
     finally:

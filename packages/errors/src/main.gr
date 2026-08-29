@@ -11,22 +11,22 @@
 // failures are carried; this is what `E` can be when the failure has to
 // travel and be reported.
 
-type Field = { name: str, value: str }
+type ErrorField = { name: str, value: str }
 
 type Report = {
     message: str,
     kind: str,
     where_: str,
-    fields: [Field],
+    fields: [ErrorField],
     causes: [Report],
 }
 
-pub fn field(name: str, value: str) -> Field {
-    Field{ name: name, value: value }
+pub fn field(name: str, value: str) -> ErrorField {
+    ErrorField{ name: name, value: value }
 }
 
-pub fn field_int(name: str, value: i64) -> Field {
-    Field{ name: name, value: "{value}" }
+pub fn field_int(name: str, value: i64) -> ErrorField {
+    ErrorField{ name: name, value: "{value}" }
 }
 
 /// A report with nothing underneath it.
@@ -50,7 +50,7 @@ pub fn at(r: Report, place: str) -> Report {
             fields: r.fields, causes: r.causes }
 }
 
-pub fn with_field(r: Report, f: Field) -> Report {
+pub fn with_field(r: Report, f: ErrorField) -> Report {
     var fs = r.fields
     fs.push(f)
     Report{ message: r.message, kind: r.kind, where_: r.where_,

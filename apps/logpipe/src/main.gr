@@ -1,0 +1,318 @@
+// A log-processing pipeline, for the axis a service does not test: **scale**.
+//
+// `linkstore` answered duration — does memory grow while requests arrive. This
+// answers the other half: does anything become quadratic, or hold more than it
+// should, when one input is large. A web service handles a thousand small
+// strings; a pipeline handles one enormous one, and they fail differently.
+//
+// The shape is the one every log pipeline has: read, parse, filter, aggregate,
+// report. Seven libraries — `csv`, `fs`, `json`, `metrics`, `path`, `regex`,
+// `time` — and it declares `io` and `Metric`.
+//
+// What is deliberately *not* here: streaming. `read_file` answers the whole
+// text, so a file larger than memory cannot be processed, and there is no
+// incremental reader to build one from. That is a library gap with a name, and
+// inventing a workaround would hide it.
+import csv
+import fs
+import json
+import metrics
+import path
+import regex
+import time
+
+type Entry = {
+    at_ms: i64,
+    level: str,
+    source: str,
+    message: str,
+    millis: i64,
+}
+
+type Summary = {
+    lines: i64,
+    parsed: i64,
+    refused: i64,
+    by_level: Map[str, i64],
+    by_source: Map[str, i64],
+    slowest_ms: i64,
+    slowest_line: str,
+    total_ms: i64,
+}
+
+fn empty_summary() -> Summary {
+    Summary{ lines: 0, parsed: 0, refused: 0, by_level: map(), by_source: map(),
+             slowest_ms: 0 - 1, slowest_line: "", total_ms: 0 }
+}
+
+/// One line of a log, in the shape everything writes:
+///
+///     2026-08-30T04:15:00.000Z INFO  api.handler  served in 42ms
+///
+/// Parsed by hand rather than by `regex`, and the reason is the measurement:
+/// a Thompson machine is linear in the input, and a million lines through one
+/// is a million matches. Splitting on spaces is linear too and is a constant
+/// factor cheaper. `regex` is used below where it is the right tool — matching
+/// a *pattern the user supplied* — and not where a split does.
+fn parse_line(line: str) -> Option[Entry] {
+    let parts = line.words()
+    if parts.len() < 4 {
+        return None
+    }
+    let stamp = match time.parse(parts[0]) {
+        Some(s) -> time.to_millis(s)
+        None -> return None
+    }
+    var rest = ""
+    for i in 3..parts.len() {
+        if not rest.is_empty() {
+            rest = rest + " "
+        }
+        rest = rest + parts[i]
+    }
+    // `served in 42ms` — the number before `ms`, if there is one.
+    var millis = 0 - 1
+    for w in parts {
+        if w.ends_with("ms") {
+            match w.substr(0, w.len() - 2).parse_int() {
+                Some(n) -> millis = n
+                None -> {}
+            }
+        }
+    }
+    Some(Entry{ at_ms: stamp, level: parts[1], source: parts[2],
+                message: rest, millis: millis })
+}
+
+fn fold_entry(s: Summary, e: Entry, line: str) -> Summary {
+    var by_level = s.by_level
+    by_level.set(e.level, (by_level.get(e.level) ?? 0) + 1)
+    var by_source = s.by_source
+    by_source.set(e.source, (by_source.get(e.source) ?? 0) + 1)
+    var slowest = s.slowest_ms
+    var slow_line = s.slowest_line
+    if e.millis > slowest {
+        slowest = e.millis
+        slow_line = line
+    }
+    Summary{
+        lines: s.lines + 1,
+        parsed: s.parsed + 1,
+        refused: s.refused,
+        by_level: by_level,
+        by_source: by_source,
+        slowest_ms: slowest,
+        slowest_line: slow_line,
+        total_ms: s.total_ms + (if e.millis > 0 { e.millis } else { 0 }),
+    }
+}
+
+fn refuse(s: Summary) -> Summary {
+    Summary{ lines: s.lines + 1, parsed: s.parsed, refused: s.refused + 1,
+             by_level: s.by_level, by_source: s.by_source,
+             slowest_ms: s.slowest_ms, slowest_line: s.slowest_line,
+             total_ms: s.total_ms }
+}
+
+/// Every line of a text, summarised.
+///
+/// The summary is threaded rather than mutated in place, which is what makes
+/// it the same function whether one file or a directory is being read — and
+/// what the scale measurement is really testing, since it means one allocation
+/// per line rather than one per file.
+pub fn summarise(text: str, only: Option[Regex], s: Summary) -> Summary / {Metric} {
+    var out = s
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue
+        }
+        match only {
+            Some(r) -> if not regex.matches(r, line) { continue }
+            None -> {}
+        }
+        match parse_line(line) {
+            Some(e) -> {
+                out = fold_entry(out, e, line)
+                metrics.increment("lines_total", [metrics.label("level", e.level)])
+            }
+            None -> {
+                out = refuse(out)
+                metrics.increment("lines_total", [metrics.label("level", "unparsed")])
+            }
+        }
+    }
+    out
+}
+
+fn report(s: Summary) -> str {
+    var lines: [str] = []
+    lines.push("lines {s.lines}  parsed {s.parsed}  unparsed {s.refused}")
+    var levels = s.by_level.keys()
+    levels.sort()
+    for l in levels {
+        lines.push("  {l.pad_end(8, " ")} {s.by_level.get(l) ?? 0}")
+    }
+    var sources = s.by_source.keys()
+    sources.sort()
+    lines.push("sources:")
+    for src in sources {
+        lines.push("  {src.pad_end(18, " ")} {s.by_source.get(src) ?? 0}")
+    }
+    if s.slowest_ms >= 0 {
+        lines.push("slowest {s.slowest_ms}ms: {s.slowest_line}")
+        if s.parsed > 0 {
+            lines.push("mean {s.total_ms / s.parsed}ms over {s.parsed} timed line(s)")
+        }
+    }
+    lines.join("\n")
+}
+
+/// The same summary as CSV, which is what anything else will want to read.
+fn as_csv(s: Summary) -> str {
+    var rows: [[str]] = [["level", "count"]]
+    var levels = s.by_level.keys()
+    levels.sort()
+    for l in levels {
+        rows.push([l, "{s.by_level.get(l) ?? 0}"])
+    }
+    csv.render(rows)
+}
+
+fn as_json(s: Summary) -> str {
+    var keys: [str] = []
+    var values: [ref Json] = []
+    var levels = s.by_level.keys()
+    levels.sort()
+    for l in levels {
+        keys.push(l)
+        values.push(json.number((s.by_level.get(l) ?? 0).as_f64()))
+    }
+    json.render(json.object(
+        ["lines", "parsed", "unparsed", "levels"],
+        [json.number(s.lines.as_f64()), json.number(s.parsed.as_f64()),
+         json.number(s.refused.as_f64()), json.object(keys, values)])) + "\n"
+}
+
+// --- the offline self-test, and the scale measurement ------------------------
+
+/// A log of `n` lines, generated rather than committed.
+///
+/// Generated because the point is *scale*: a committed fixture large enough to
+/// measure anything is a large file in a repository, and one small enough to
+/// commit measures nothing.
+fn synthetic(n: i64) -> str {
+    var out: [str] = []
+    let sources = ["api.handler", "db.pool", "cache.get", "auth.verify"]
+    let levels = ["INFO", "WARN", "ERROR", "DEBUG"]
+    for i in 0..n {
+        let stamp = time.format(time.from_millis(1787000000000 + i * 137))
+        let level = levels[i % 4]
+        let src = sources[i % 4]
+        out.push("{stamp} {level} {src} served in {i % 250}ms")
+    }
+    // Some lines nothing can parse, because a real log has them and a pipeline
+    // that stops at the first is a pipeline nobody can run.
+    out.push("")
+    out.push("this line is not a log line")
+    out.push("2026-13-45T99:99:99Z INFO x bad timestamp")
+    out.join("\n")
+}
+
+fn selftest() / {io, Metric} {
+    print("-- parsing one line at a time")
+    for line in ["2026-08-30T04:15:00.000Z INFO api.handler served in 42ms",
+                 "2026-08-30T04:15:00.000Z ERROR db.pool connection lost",
+                 "2026-08-30T04:15:00.000Z WARN cache.get miss",
+                 "too short",
+                 "not-a-timestamp INFO x y",
+                 ""] {
+        match parse_line(line) {
+            Some(e) -> print("  {e.level.pad_end(6, " ")} {e.source.pad_end(14, " ")} {e.millis}ms  \"{e.message}\"")
+            None -> print("  refused: \"{line}\"")
+        }
+    }
+
+    print("-- a small log, summarised")
+    let small = summarise(synthetic(20), None, empty_summary())
+    print(report(small))
+
+    print("-- the same, as CSV")
+    for line in as_csv(small).split("\r\n") {
+        if not line.is_empty() {
+            print("  {line}")
+        }
+    }
+
+    print("-- and as JSON")
+    print("  {as_json(small).trim()}")
+
+    print("-- filtered by a pattern the user supplied")
+    match regex.compile("ERROR|WARN") {
+        Err(e) -> print("  the pattern was refused: {e.why}")
+        Ok(r) -> {
+            let filtered = summarise(synthetic(20), Some(r), empty_summary())
+            print("  {filtered.lines} of 23 lines matched, {filtered.parsed} parsed")
+        }
+    }
+    match regex.compile("(a+)+b") {
+        Err(e) -> print("  refused: {e.why}")
+        Ok(r) -> {
+            // The pattern that takes a backtracking engine longer than the
+            // universe has lasted. Here it is a filter that matches nothing,
+            // over 23 lines, and it returns.
+            let none_matched = summarise(synthetic(20), Some(r), empty_summary())
+            print("  the catastrophic pattern matched {none_matched.lines} lines, and returned")
+        }
+    }
+
+    // Behind a flag, because a duration is not the same twice and the corpus
+    // compares this program's output byte for byte on three engines. The
+    // measurement is real and is run by hand — `-- scale` — and recorded in
+    // `docs/apps-phases.md`; what the gates check is that the *pipeline*
+    // agrees, which is the part that can be checked.
+    if not args().contains("scale") {
+        print("-- scale: run with `-- scale` (a duration is not the same twice)")
+        return
+    }
+    print("-- scale: the same code over 1, 10, 100 thousand lines")
+    for n in [1000, 10000, 100000] {
+        let started = now_millis()
+        let s = summarise(synthetic(n), None, empty_summary())
+        let took = now_millis() - started
+        // Per-line cost is the number that matters. If it climbs with `n`,
+        // something is quadratic; if it holds, the pipeline is linear.
+        print("  {"{n}".pad_start(7, " ")} lines  {"{took}".pad_start(6, " ")}ms  {took * 1000 / n}us per 1000 lines  parsed {s.parsed}")
+    }
+}
+
+fn main() / {io} {
+    let reg = ref(metrics.registry([]))
+    with Metric handled_by metrics.collecting(reg) {
+        if args().contains("scan") {
+            let root = args()[args().len() - 1]
+            match fs.walk(root, 0 - 1) {
+                Err(e) -> print("cannot read {root}: {e}")
+                Ok(files) -> {
+                    var s = empty_summary()
+                    var read = 0
+                    for f in files {
+                        if path.extension(f) != "log" {
+                            continue
+                        }
+                        match read_file(f) {
+                            Err(e) -> print("cannot read {f}")
+                            Ok(text) -> {
+                                s = summarise(text, None, s)
+                                read = read + 1
+                            }
+                        }
+                    }
+                    print("{read} file(s)")
+                    print(report(s))
+                }
+            }
+            return
+        }
+        selftest()
+    }
+}

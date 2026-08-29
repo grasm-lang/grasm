@@ -7,12 +7,12 @@
 //
 // A bad command line is answered, not panicked on. Somebody typed it.
 
-type Kind = | Switch | Text | Number
+type FlagKind = | Switch | Text | Number
 
 type Flag = {
     name: str,
     short: str,
-    kind: Kind,
+    kind: FlagKind,
     help: str,
     fallback: str,
     required: bool,

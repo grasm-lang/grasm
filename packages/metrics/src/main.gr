@@ -11,13 +11,13 @@
 // is said here rather than discovered in a dashboard: `observe` takes the
 // value already computed, so the program decides what to do about it.
 
-type Kind = | Counter | Gauge | Histogram
+type MetricKind = | Counter | Gauge | Histogram
 
 type Label = { name: str, value: str }
 
 type Sample = {
     name: str,
-    kind: Kind,
+    kind: MetricKind,
     labels: [Label],
     value: f64,
 }
@@ -57,7 +57,7 @@ pub fn observe(name: str, labels: [Label], value: f64) / {Metric} {
 
 type Series = {
     name: str,
-    kind: Kind,
+    kind: MetricKind,
     labels: [Label],
     value: f64,
     count: i64,
@@ -191,7 +191,7 @@ fn number(v: f64) -> str {
     "{v}"
 }
 
-fn kind_name(k: Kind) -> str {
+fn kind_name(k: MetricKind) -> str {
     match k {
         Counter -> "counter"
         Gauge -> "gauge"

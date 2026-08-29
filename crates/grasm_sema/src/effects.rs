@@ -2567,6 +2567,13 @@ fn walk_expr(
                 }
                 return;
             }
+            // Whether the receiver named a *module* and this was therefore
+            // already charged as a cross-module call. `tr.finish(s)` is one
+            // call, and the UFCS branch below must not charge it a second time
+            // against a local function that merely shares the bare name —
+            // which made `only_trace`, calling the pure `tr.finish`, perform
+            // whatever a local `finish` performed (F83).
+            let mut resolved_qualified = false;
             if let Expr::Ident(tid) = &**recv {
                 // A binding of that name is a different thing, and scope
                 // decides — the rule [T-FN-VALUE-ROW] already states for a
@@ -2589,6 +2596,7 @@ fn walk_expr(
                 {
                     // Cross-module call `utils.helper(...)`.
                     contribute(&qual, active, ctx, out);
+                    resolved_qualified = true;
                 } else {
                     walk_expr(recv, current, active, ctx, fnb, out);
                 }
@@ -2603,7 +2611,9 @@ fn walk_expr(
             // `capabilities = ["unsafe"]` was reported as reaching no `io`
             // while its binary called libc. The `unsafe` half of
             // [T-UNSAFE-UFCS] was gated; the `io` half was not.
-            if ctx.externs.contains(&format!("{current}::{}", name.name)) {
+            if resolved_qualified {
+                // Already charged, to the function the module actually names.
+            } else if ctx.externs.contains(&format!("{current}::{}", name.name)) {
                 out.insert(IO.to_string());
                 out.insert(UNSAFE.to_string());
             } else if let Some(qual) = ctx.resolve_call(current, &name.name) {

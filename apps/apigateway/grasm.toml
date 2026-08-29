@@ -1,0 +1,79 @@
+[package]
+name = "apigateway"
+version = "0.1.0"
+entry = "src/main.gr"
+
+# `io` and `net`, and nothing else — which is the whole point of the
+# arrangement. Sixteen libraries, three of which perform their own effects
+# (`Log`, `Metric`, `Trace`), and *none of those escape*: `main` installs a
+# handler for each, so [T-CAPABILITY] counts them as handled rather than
+# performed. `grasm deps` says `performs [io]`.
+#
+# The first version of this file declared all five, which built and was
+# wrong in the way that matters: a ceiling wider than what a package does is
+# a permission nobody needed, and the compiler will not complain about one.
+capabilities = ["io", "net"]
+
+[dependencies.cache]
+path = "../../packages/cache"
+version = "^1.0.0"
+
+[dependencies.cors]
+path = "../../packages/cors"
+version = "^1.0.0"
+
+[dependencies.crypto_hash]
+path = "../../packages/crypto_hash"
+version = "^1.0.0"
+
+[dependencies.errors]
+path = "../../packages/errors"
+version = "^1.0.0"
+
+[dependencies.http]
+path = "../../packages/http"
+version = "^1.0.0"
+
+[dependencies.http_server]
+path = "../../packages/http_server"
+version = "^1.0.0"
+
+[dependencies.json]
+path = "../../packages/json"
+version = "^1.0.0"
+
+[dependencies.jwt]
+path = "../../packages/jwt"
+version = "^1.0.0"
+
+[dependencies.log]
+path = "../../packages/log"
+version = "^1.0.0"
+
+[dependencies.metrics]
+path = "../../packages/metrics"
+version = "^1.0.0"
+
+[dependencies.random]
+path = "../../packages/random"
+version = "^1.0.0"
+
+[dependencies.resilience]
+path = "../../packages/resilience"
+version = "^1.0.0"
+
+[dependencies.sanitize]
+path = "../../packages/sanitize"
+version = "^1.0.0"
+
+[dependencies.time]
+path = "../../packages/time"
+version = "^1.0.0"
+
+[dependencies.trace]
+path = "../../packages/trace"
+version = "^1.0.0"
+
+[dependencies.url]
+path = "../../packages/url"
+version = "^1.0.0"

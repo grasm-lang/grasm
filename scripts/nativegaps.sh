@@ -170,6 +170,20 @@ fn main() {
     print("{h}")
 }'
 
+expect_compiled "a type parameter a struct field fixes" 'type Box[V] = { v: [V] }
+type Holder = { b: Box[str], n: i64 }
+fn empty_box[V]() -> Box[V] {
+    let out: Box[V] = Box{ v: [] }
+    out
+}
+fn take(bs: [Box[i64]]) -> i64 {
+    bs.len()
+}
+fn main() {
+    let h = Holder{ b: empty_box(), n: 1 }
+    print("{h.b.v.len()} {h.n} {take([empty_box()])}")
+}'
+
 expect_compiled "a type parameter the binding fixes" 'type Box[V] = { items: [V] }
 fn empty_box[V]() -> Box[V] {
     let b: Box[V] = Box{ items: [] }
