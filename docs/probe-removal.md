@@ -202,3 +202,66 @@ wrote an artifact that could not be loaded.
 The next measurement is the same counters over the 2,177 generated programs,
 which reach shapes the corpus does not contain.
 
+### 2026-08-29 — step 5, measured over the generated programs
+
+The corpus is 231 programs somebody wrote. The generators build 2,177 that
+nobody wrote, and they reach shapes the corpus does not contain — which is
+exactly why a deletion needs their number and not only the corpus's.
+
+Measured by wrapping the compiler in a shim that tallies the counters, so the
+generators see nothing different (they capture the compiler's stderr and
+surface it only on failure, so the counters could not be read from their
+output):
+
+| | corpus | generated |
+|---|---|---|
+| builds | 231 | 2,193 |
+| checker answered | 947 | 78,911 |
+| backend inferred | 54 | 11,891 |
+| **coverage** | **94%** | **86.9%** |
+
+The misses, by shape, over a sample of five generators:
+
+| shape | misses | share |
+|---|---|---|
+| `list` | 3,632 | 59% |
+| `closure` | 2,282 | 37% |
+| `call` | 107 | 2% |
+| `ident` | 86 | 1% |
+| `int` | 2 | — |
+
+**Two shapes are 96% of it, and they are the same shape twice.** A list literal
+and a closure literal both get their type from the *position they fill* rather
+than from their own text: `[]` has no element type of its own, and `|n| n * 2`
+has no parameter type of its own. The checker settles both by unification, and
+what this export records at the moment of the visit is a type that may still
+hold a variable — which renders with `_` and is dropped, deliberately, because
+an answer the checker did not settle is not an answer.
+
+An ordinary program shows none of this: a file with an annotated empty list, an
+empty `map()`, a bound closure, an inline closure argument and a nested empty
+list misses **zero** times. The misses live in the shapes generators build and
+people rarely write.
+
+**Deletion is not justified, and this is where that is decided.** The fallback
+still ran 11,891 times. An arm the corpus never reaches is not an arm nothing
+reaches, which was the reason for this measurement, and it answered no.
+
+**What was achieved anyway, and it is the part that mattered.** The goal was
+not to delete 950 lines — it was to stop two implementations of type inference
+disagreeing. Where the checker answers, they *cannot* disagree, because there
+is only one answer. That is 94% of real programs and 87% of generated ones, and
+it is a permanent reduction in the defect class rather than a cleanup.
+
+**What would close the rest**, if it is worth doing later: record each
+expression's type *after* the enclosing function's unification settles, rather
+than at the moment of the visit. That would resolve the positional cases and
+leave only the spans a rewrite reused — which are correctly skipped and always
+will be.
+
+## Where this stands
+
+Steps 1 to 5 done. Nothing deleted, on purpose. The class of defect that
+produced nine of the last twelve findings has lost its mechanism wherever the
+checker answers, and the measurement says where that is.
+
