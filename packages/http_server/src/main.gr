@@ -27,9 +27,13 @@ pub fn serve_conn(conn: i64, handle: Handler) -> i64 / {io, net} {
     } else {
         http.render(resp)
     }
+    // A client that has already gone is not this server's problem: the
+    // response has nowhere to go and the connection is closed either way.
+    // `_e` rather than `e`, because a name bound and discarded reads as an
+    // oversight and this is a decision.
     match tcp_write(conn, out) {
-        Ok(_) -> {}
-        Err(e) -> {}
+        Ok(_written) -> {}
+        Err(_gone) -> {}
     }
     net_close(conn)
     resp.status
@@ -81,9 +85,13 @@ pub fn serve_many(listener: i64, count: i64, handle: Handler) -> i64 / {io, net}
         var still: [i64] = []
         for h in ready {
             if h == listener {
+                // `net_wait` said the listener was readable and the accept
+                // found nothing, which happens when a client connected and
+                // hung up between the two. Nothing to serve, nothing to
+                // report.
                 match tcp_accept(listener) {
                     Ok(conn) -> still.push(conn)
-                    Err(e) -> {}
+                    Err(_hung_up) -> {}
                 }
             } else {
                 serve_conn(h, handle)

@@ -297,9 +297,13 @@ pub fn call(conn: i64, parts: [str]) -> ref RedisValue ! IoError / {net} {
             raw = raw + piece
         }
         if is_complete(raw) {
+            // Not a whole reply yet. `is_complete` said there was one, and
+            // between the two the buffer did not change — so this is the
+            // narrow case where the framing and the parser disagree, and the
+            // answer is to read more rather than to fail.
             match parse(raw) {
                 Ok(pair) -> return pair.0
-                Err(e) -> {}
+                Err(_incomplete) -> {}
             }
         }
     }

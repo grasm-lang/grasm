@@ -263,9 +263,11 @@ fn serve_one(conn: i64, s: Store, reg: ref Registry, now_ms: i64, inout r_seed: 
     } else {
         http.render(resp)
     }
+    // As in `http_server`: the client may already be gone, and the
+    // connection is closed either way.
     match tcp_write(conn, out) {
-        Ok(_u) -> {}
-        Err(e) -> {}
+        Ok(_written) -> {}
+        Err(_gone) -> {}
     }
     net_close(conn)
     pair.0

@@ -234,3 +234,112 @@ matters: **a ceiling wider than what a package does is a permission nobody
 needed, and the compiler does not complain about one.** Narrowed to `io, net`.
 A gate for over-declaration would be worth having and does not exist.
 
+
+---
+
+# Phase 3 — use
+
+**The question.** Does the language hold up for somebody who is *not* writing
+a demo? The bar in `grasm-finish-bar` needs two independent cold-model
+evaluation rounds, which cannot be run from inside this session. The nearest
+available substitute is a tool that has to read code **nobody wrote for it** —
+so it runs over this repository's own 358 programs, and anything it cannot
+handle is a finding rather than an excuse.
+
+It is also self-hosting pressure at a size that can be finished. A compiler
+written in its own language is the standard proof a language is done; a
+*linter* written in its own language exercises the same thing — reading Grasm
+at scale — today.
+
+## `apps/grlint`
+
+A linter for Grasm, in Grasm. Five libraries: `cli`, `fs`, `json`, `path`,
+`regex`. Declares `io` and nothing else, which is what a tool run over
+somebody else's repository should be able to promise.
+
+Eight rules, every one answerable from a *line*. The rules that need scope —
+an unused binding, shadowing, a non-exhaustive match — are named by
+`unsupported()` rather than approximated, because a rule guessed at with a
+regular expression is wrong on exactly the programs that matter.
+
+### What it measured
+
+**640 findings over 358 programs in 0.57 s**, natively. The whole corpus —
+every package, example, conformance program, ProjectGold program, benchmark
+and application — read and checked in under a second.
+
+| rule | findings |
+|---|---|
+| `long-line` | 278 |
+| `no-doc` | 215 |
+| `empty-catch` | 113 |
+| `unwrap-default` | 22 |
+| `todo` · `wide-row` | 4 each |
+| `tab-indent` | 3 |
+| `trailing-space` | 1 |
+
+### What it found in the code written this session
+
+Four `empty-catch` findings in `packages/` and `apps/`, and **all four were
+real**. A write to a closed socket, an accept that raced a hang-up, a partial
+parse — all deliberate, all written `Err(e) -> {}`, which binds a name and
+throws it away and reads as an oversight. They say `Err(_gone)`,
+`Err(_hung_up)`, `Err(_incomplete)` now, each with the sentence explaining why
+nothing happens.
+
+Not a bug. Four places where correct code did not say it was correct, which is
+what a linter is for.
+
+### What building it found
+
+**A rule that checked the wrong thing, and a self-test that agreed with it.**
+`no-doc` is "a `pub fn` with no `///` above it", and the first version asked
+`starts_with("//")` — which every ordinary comment satisfies. The rule fired on
+almost nothing, and the self-test recorded that as correct.
+
+Caught by *reading the output*, not by the test. Worth stating because it is
+the general case of a defect this repository keeps finding: F70's framing check
+measured the body the way the body was measured, F29's bounds test never
+reached the boundary. **A test that asserts what the code does agrees with the
+code.** The rules that survive are the ones checked against something outside
+themselves — which is why every codec in `packages/` is checked against a
+published vector, and why `fuzz_laws.py` checks against arithmetic.
+
+**An invocation that was wrong, and a specification that was right.**
+`./grlint -- --summary` silently ignored every flag. [E-ARGS] says a compiled
+binary has no `--` separator — the one in `grasm run prog.gr -- a b` belongs to
+the toolchain — so the literal `--` arrived as an ordinary argument and `cli`
+read everything after it as positional, which is precisely what `--` means on a
+command line. Correct behaviour by both, and a thing a first-time user gets
+wrong exactly once.
+
+## What Phase 3 does *not* substitute for
+
+A real outside user would bring programs nobody here imagined. `grlint` reads
+this repository's code, which this repository wrote — so it probes *scale of
+reading* and not *diversity of input*. The cold-model rounds in
+`docs/release-scope.md` remain the thing that has not been run, and this does
+not replace them. It narrows what they would be looking for.
+
+---
+
+# What the three phases found, together
+
+| phase | application | libraries | defects |
+|---|---|---|---|
+| 1, duration | `linkstore` | 9 | 3, none in the libraries |
+| 1, scale | `logpipe` | 7 | **0** |
+| 2, composition | `apigateway` | 16 | 3 — F82, F83, F84 |
+| 3, use | `grlint` | 5 | 1 in the tool, 4 in this session's code |
+
+**Seven defects and one clean result.** The clean one is `logpipe`, and it is
+recorded as plainly as the others: this axis, with these libraries, at this
+scale, produced no disagreement.
+
+The pattern across all four: **an application finds what the shape of a real
+program reaches, and nothing else.** `linkstore` found library misuse.
+`apigateway` found three language defects, every one needing a program with
+sixteen dependencies to exist at all. `grlint` found four places where correct
+code did not say so. None of the seven was reachable by any of the 2,177
+generated programs, and none of them is the kind a generator could be extended
+to reach — they are consequences of *size* and *combination*, not of shape.

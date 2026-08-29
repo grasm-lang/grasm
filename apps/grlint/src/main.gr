@@ -1,0 +1,338 @@
+// A linter for Grasm, written in Grasm.
+//
+// Phase 3 asks the question the other two could not: does the language hold up
+// for somebody who is *not* writing a demo? The nearest available substitute
+// for an outside user is a tool that has to read code nobody wrote for it —
+// so this runs over this repository's own 358 programs, and anything it
+// cannot handle is a finding rather than an excuse.
+//
+// It is also the self-hosting pressure test in miniature. A compiler written
+// in its own language is the standard proof a language is finished; a *linter*
+// written in its own language is the same shape at a size that can be
+// finished today, and it exercises the same thing: reading Grasm at scale.
+//
+// What it deliberately is not: a parser. It works on lines, because a rule
+// that needs the syntax tree needs the compiler, and the compiler already has
+// one. Every rule here is one a line can answer, and the ones that cannot are
+// named at the bottom rather than approximated.
+import cli
+import fs
+import json
+import path
+import regex
+
+type Finding = {
+    file: str,
+    line: i64,
+    rule: str,
+    message: str,
+}
+
+type Rule = {
+    name: str,
+    about: str,
+}
+
+pub fn rules() -> [Rule] {
+    [
+        Rule{ name: "long-line", about: "a line over 100 characters" },
+        Rule{ name: "trailing-space", about: "whitespace at the end of a line" },
+        Rule{ name: "tab-indent", about: "a tab where the formatter uses spaces" },
+        Rule{ name: "todo", about: "a TODO or FIXME left in" },
+        Rule{ name: "empty-catch", about: "an `Err(e) -> \{}` that swallows a failure" },
+        Rule{ name: "unwrap-default", about: "`?? 0` on something that can fail meaningfully" },
+        Rule{ name: "wide-row", about: "a function declaring more than three effects" },
+        Rule{ name: "no-doc", about: "a `pub fn` with no `///` above it" },
+    ]
+}
+
+/// Is this line inside a string literal or a comment?
+///
+/// Answered per line rather than per file, which is what makes every rule
+/// cheap — and which is exactly the approximation a line-based linter is: a
+/// `//` inside a string reads as a comment. The rules below are chosen so that
+/// the approximation is harmless, and the ones where it would not be are in
+/// `unsupported()`.
+fn code_part(line: str) -> str {
+    match line.index_of("//") {
+        Some(at) -> line.substr(0, at)
+        None -> line
+    }
+}
+
+/// A *doc* comment, which is `///` — not any comment.
+///
+/// The rule is "a `pub fn` with no `///` above it", and the first version of
+/// this asked `starts_with("//")`, which every ordinary comment satisfies. So
+/// the rule fired on nothing that had a comment of any kind above it, which is
+/// most exported functions, and the self-test recorded that as correct.
+fn is_doc(line: str) -> bool {
+    line.trim().starts_with("///")
+}
+
+pub fn check_line(file: str, n: i64, line: str, previous: str) -> [Finding] {
+    var out: [Finding] = []
+    let code = code_part(line)
+
+    if line.len() > 100 {
+        out.push(Finding{ file: file, line: n, rule: "long-line",
+                          message: "{line.len()} characters" })
+    }
+    if line != line.trim_end() and not line.trim().is_empty() {
+        out.push(Finding{ file: file, line: n, rule: "trailing-space",
+                          message: "trailing whitespace" })
+    }
+    if line.starts_with("\t") {
+        out.push(Finding{ file: file, line: n, rule: "tab-indent",
+                          message: "a tab; `grasm fmt` uses four spaces" })
+    }
+    if line.contains("TODO") or line.contains("FIXME") {
+        out.push(Finding{ file: file, line: n, rule: "todo",
+                          message: "left in the source" })
+    }
+    // `Err(e) -> {}` — a failure named and then discarded. The name matters:
+    // `Err(_e) -> {}` says the author meant it.
+    if code.contains("Err(e) -> \{}") or code.contains("Err(e) -> \{ }") {
+        out.push(Finding{ file: file, line: n, rule: "empty-catch",
+                          message: "a failure bound to `e` and then discarded — write `Err(_e)` if that is meant" })
+    }
+    if code.contains("?? 0") and not code.contains("?? 0 - ") and code.contains("parse") {
+        out.push(Finding{ file: file, line: n, rule: "unwrap-default",
+                          message: "`?? 0` on a parse: 0 and \"could not parse\" become the same answer" })
+    }
+    // A row with more than three effects is not wrong, and it is worth
+    // looking at: it usually means a function is doing several jobs.
+    match code.index_of("/ \{") {
+        Some(at) -> {
+            let rest = code.substr(at + 3, code.len() - at - 3)
+            match rest.index_of("}") {
+                Some(close) -> {
+                    let inside = rest.substr(0, close)
+                    if not inside.is_empty() and inside.split(",").len() > 3 {
+                        let count = inside.split(",").len()
+                        out.push(Finding{ file: file, line: n, rule: "wide-row",
+                                          message: "{count} effects: {inside.trim()}" })
+                    }
+                }
+                None -> {}
+            }
+        }
+        None -> {}
+    }
+    if code.trim().starts_with("pub fn ") and not is_doc(previous) {
+        out.push(Finding{ file: file, line: n, rule: "no-doc",
+                          message: "exported with no `///` above it" })
+    }
+    out
+}
+
+pub fn check_text(file: str, text: str) -> [Finding] {
+    var out: [Finding] = []
+    var previous = ""
+    var n = 0
+    for line in text.lines() {
+        n = n + 1
+        for f in check_line(file, n, line, previous) {
+            out.push(f)
+        }
+        previous = line
+    }
+    out
+}
+
+/// The rules a line cannot answer, named rather than approximated.
+///
+/// Every one needs the syntax tree, and the compiler has one. A linter that
+/// guessed at them with a regular expression would be wrong on exactly the
+/// programs that matter — the ones where the shape is unusual.
+pub fn unsupported() -> [str] {
+    [
+        "an unused binding — needs scope, not lines",
+        "a match that is not exhaustive — the checker already refuses it",
+        "shadowing — needs scope",
+        "a function longer than N statements — needs the tree, since a line is not a statement",
+        "an effect declared and never performed — needs the row, which the checker infers",
+    ]
+}
+
+// --- reporting ---------------------------------------------------------------
+
+pub fn render_text(fs_findings: [Finding]) -> str {
+    var lines: [str] = []
+    for f in fs_findings {
+        lines.push("{f.file}:{f.line}: {f.rule}: {f.message}")
+    }
+    lines.join("\n")
+}
+
+/// The findings as JSON, for anything that will read them mechanically.
+pub fn render_json(fs_findings: [Finding]) -> str {
+    var items: [ref Json] = []
+    for f in fs_findings {
+        items.push(json.object(
+            ["file", "line", "rule", "message"],
+            [json.text(f.file), json.number(f.line.as_f64()),
+             json.text(f.rule), json.text(f.message)]))
+    }
+    json.render(json.list(items)) + "\n"
+}
+
+/// How many of each rule fired — the summary a repository owner reads before
+/// deciding which rule to turn on.
+pub fn tally(fs_findings: [Finding]) -> [(str, i64)] {
+    var counts = map()
+    for f in fs_findings {
+        counts.set(f.rule, (counts.get(f.rule) ?? 0) + 1)
+    }
+    var names = counts.keys()
+    names.sort()
+    var out: [(str, i64)] = []
+    for n in names {
+        out.push((n, counts.get(n) ?? 0))
+    }
+    out
+}
+
+// --- the command line ----------------------------------------------------------
+
+fn spec() -> Command {
+    cli.command("grlint", "a linter for Grasm, written in Grasm",
+        [cli.switch_flag("json", "j", "findings as JSON"),
+         cli.switch_flag("summary", "s", "counts per rule, not each finding"),
+         cli.text_flag("only", "r", "one rule, by name", ""),
+         cli.number_flag("limit", "n", "stop after this many findings", 0)],
+        [cli.rest_positional("paths", "files or directories to read")])
+}
+
+fn lint_paths(paths: [str], p: Parsed) -> [Finding] / {io} {
+    var out: [Finding] = []
+    let only = cli.text_of(p, "only")
+    let limit = cli.number_of(p, "limit")
+    for target in paths {
+        var files: [str] = []
+        if fs.is_dir(target) {
+            files = fs.walk(target, 0 - 1) ?? []
+        } else {
+            files.push(target)
+        }
+        for f in files {
+            if path.extension(f) != "gr" {
+                continue
+            }
+            match read_file(f) {
+                Err(e) -> print("grlint: cannot read {f}")
+                Ok(text) -> {
+                    for finding in check_text(f, text) {
+                        if not only.is_empty() and finding.rule != only {
+                            continue
+                        }
+                        if limit > 0 and out.len() >= limit {
+                            return out
+                        }
+                        out.push(finding)
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+// --- the self-test -------------------------------------------------------------
+
+fn selftest() / {io} {
+    print("-- the rules")
+    for r in rules() {
+        print("  {r.name.pad_end(18, " ")} {r.about}")
+    }
+
+    print("-- each one, on a line that trips it")
+    let cases = [
+        ("long-line", "x".repeat(101)),
+        ("trailing-space", "let n = 1   "),
+        ("todo", "// TODO: come back to this"),
+        ("empty-catch", "        Err(e) -> \{}"),
+        ("unwrap-default", "let n = text.parse_int() ?? 0"),
+        ("wide-row", "fn wide() / \{io, net, async, unsafe} \{"),
+    ]
+    for c in cases {
+        let found = check_line("x.gr", 1, c.1, "let previous = 1")
+        var names: [str] = []
+        for f in found {
+            names.push(f.rule)
+        }
+        let hit = if names.contains(c.0) { "caught" } else { "MISSED" }
+        print("  {c.0.pad_end(18, " ")} {hit}   {names}")
+    }
+
+    print("-- lines that must NOT trip a rule")
+    let clean = [
+        ("a comment mentioning a rule", "// a line about `?? 0` and parse"),
+        ("an intentional discard", "        Err(_e) -> \{}"),
+        ("a narrow row", "fn narrow() / \{io} \{"),
+        ("a documented export", "pub fn documented() -> i64 \{"),
+        ("a 100-character line", "y".repeat(100)),
+    ]
+    for c in clean {
+        let previous = if c.0 == "a documented export" { "/// what it does" } else { "let x = 1" }
+        let found = check_line("x.gr", 1, c.1, previous)
+        var names: [str] = []
+        for f in found {
+            names.push(f.rule)
+        }
+        let ok = if found.is_empty() { "clean" } else { "FIRED: {names}" }
+        print("  {c.0.pad_end(28, " ")} {ok}")
+    }
+
+    print("-- a whole file")
+    let sample = "// a sample\n" +
+        "pub fn undocumented() -> i64 \{\n" +
+        "    let n = \"7\".parse_int() ?? 0\n" +
+        "    n\n" +
+        "}\n" +
+        "// TODO: finish this   \n"
+    for line in render_text(check_text("sample.gr", sample)).split("\n") {
+        print("  {line}")
+    }
+
+    print("-- as JSON")
+    print("  {render_json(check_text("sample.gr", sample)).trim().substr(0, 96)}...")
+
+    print("-- what a line cannot answer, named rather than guessed at")
+    for u in unsupported() {
+        print("  {u}")
+    }
+}
+
+fn main() / {io} {
+    let argv = args()
+    if argv.is_empty() or argv.contains("selftest") {
+        selftest()
+        return
+    }
+    let p = cli.parse(spec(), argv)
+    if not p.ok {
+        print("grlint: {p.why}")
+        print("")
+        print(cli.help(spec()))
+        exit(2)
+    }
+    let paths = if p.rest.is_empty() { ["."] } else { p.rest }
+    let found = lint_paths(paths, p)
+    if cli.switch_of(p, "summary") {
+        for pair in tally(found) {
+            print("{"{pair.1}".pad_start(6, " ")}  {pair.0}")
+        }
+        print("{"{found.len()}".pad_start(6, " ")}  total")
+    } else if cli.switch_of(p, "json") {
+        print(render_json(found).trim())
+    } else {
+        let text = render_text(found)
+        if not text.is_empty() {
+            print(text)
+        }
+    }
+    if not found.is_empty() {
+        exit(1)
+    }
+}

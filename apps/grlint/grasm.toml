@@ -1,0 +1,28 @@
+[package]
+name = "grlint"
+version = "0.1.0"
+entry = "src/main.gr"
+
+# It reads files and prints. A linter that could do more than that would be a
+# linter nobody should run over a repository they did not write.
+capabilities = ["io"]
+
+[dependencies.cli]
+path = "../../packages/cli"
+version = "^1.0.0"
+
+[dependencies.fs]
+path = "../../packages/fs"
+version = "^1.0.0"
+
+[dependencies.json]
+path = "../../packages/json"
+version = "^1.0.0"
+
+[dependencies.path]
+path = "../../packages/path"
+version = "^1.0.0"
+
+[dependencies.regex]
+path = "../../packages/regex"
+version = "^1.0.0"
