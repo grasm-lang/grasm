@@ -368,7 +368,27 @@ pub fn load_from_source_bundle(src: &str) -> Program {
         &|_| Vec::new(),
         &HashSet::new(),
         None,
-        &|_, _| None,
+        // Which module an import names, decided against the bundle's own
+        // table. A disk loader has to *derive* the name — `mid` importing
+        // `deep` becomes `mid.deep` because that is where the file is — and a
+        // bundle does not: every module it holds is in hand, so the question
+        // is a lookup rather than a derivation.
+        //
+        // The qualified name first, then the written one. A writer emits
+        // `mid.deep` when `deep` is reached only through `mid`, and a flat
+        // `random` when the entry depends on it directly — both spellings
+        // occur in one corpus, and reading only one of them meant a bundle
+        // that could not be loaded while the build reported success (F81).
+        &|importer: &str, written: &str| {
+            let nested = format!("{importer}.{written}");
+            if table.contains_key(&nested) {
+                return Some(nested);
+            }
+            if table.contains_key(written) {
+                return Some(written.to_string());
+            }
+            None
+        },
         &HashMap::new(),
     )
 }

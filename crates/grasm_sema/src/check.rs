@@ -63,6 +63,25 @@ use crate::types::*;
 
 pub struct Analysis {
     pub defs: TypeDefs,
+    /// Every expression's type, keyed by `(span.start, span.end)`, written the
+    /// way the source would write it.
+    ///
+    /// The backend needs the type of an expression wherever it has to be
+    /// *inferred* rather than read — a list element, a match arm, an argument,
+    /// a `??`. It had been working them out for itself, in a second
+    /// implementation that drifted from this one nine times
+    /// (`docs/probe-removal.md`).
+    ///
+    /// Rendered rather than handed over as a `Type`, because that is the
+    /// interface `generic_ctor_types` already uses and it keeps the backend
+    /// with **one** function that turns a written type into its own: the
+    /// string is parsed and fed to `vtype_of`. Handing over a `Type` would
+    /// need a second converter in the backend, which is the shape of the
+    /// problem being removed.
+    ///
+    /// A type still holding an unresolved variable renders with `_` and is
+    /// left out: an answer the checker did not settle is not an answer.
+    pub resolved_types: SpanMap<String>,
     pub diagnostics: Vec<Diagnostic>,
     /// `module::NAME` -> rendered type, for every exported constant.
     ///
@@ -482,6 +501,19 @@ fn check_modules_in(
             ),
         );
     }
+    // Rendered before `c.diags` is moved out, since `show` borrows `c`.
+    let resolved_types: SpanMap<String> = c
+        .resolved_types
+        .clone()
+        .into_iter()
+        .filter_map(|(k, t)| {
+            let shown = c.show(&t);
+            if shown.contains('_') {
+                return None;
+            }
+            Some((k, shown))
+        })
+        .collect();
     let mut diagnostics = c.diags;
     diagnostics.extend(crate::effects::check_effects_multi_with(
         files,
@@ -505,6 +537,7 @@ fn check_modules_in(
         .filter_map(|(span, t)| map_value_kind(&c.uni.resolve(t)).map(|k| (*span, k)))
         .collect();
     Analysis {
+        resolved_types,
         const_types: c
             .consts
             .iter()
@@ -664,6 +697,19 @@ struct Checker {
     field_calls: SpanSet,
     /// Inferred type per expression, keyed by whole span. See `infer_expr`.
     expr_types: SpanMap<Type>,
+    /// Every expression's inferred type, keyed by its span.
+    ///
+    /// `expr_types` above is a memoisation *cache* and is deliberately partial
+    /// — a closure literal's type depends on the position it fills, so it has
+    /// to be re-visited and must not be cached. This is the other thing: a
+    /// record of what the checker decided, written for every expression and
+    /// resolved through unification at the end.
+    ///
+    /// It exists because the native backend was reimplementing type inference
+    /// to get these answers — about 950 lines with 49 refusal sites — and
+    /// nine findings came from the two implementations disagreeing. See
+    /// `docs/probe-removal.md`.
+    resolved_types: SpanMap<Type>,
     /// See `Analysis::empty_types`. Collected as type variables and resolved
     /// once checking is over, since that is when they have answers.
     /// (start offset, length, element type) — the length so the
@@ -855,6 +901,7 @@ impl Checker {
             callee_rows: SpanMap::default(),
             field_calls: SpanSet::default(),
             expr_types: SpanMap::default(),
+            resolved_types: SpanMap::default(),
             empty_lits: Vec::new(),
             float_sums: std::collections::HashSet::new(),
             effects: HashMap::new(),
@@ -3846,6 +3893,10 @@ write back to — copy it into a local first, as in `var {} = {}`",
         if cacheable {
             self.expr_types.insert(key, t.clone());
         }
+        // Recorded whether or not it is cacheable, and overwriting an earlier
+        // visit on purpose: a span visited twice was visited the second time
+        // with more known, so the later answer is the settled one.
+        self.resolved_types.insert(key, t.clone());
         self.record_value_row(e, &t);
         // A `ref` from outside, mentioned inside a parallel operation's
         // function. Writing through one was already refused; *reading* is no

@@ -97,6 +97,17 @@ for dir in [0-9]*/; do
 done
 
 echo "agreeing: $pass   failing: $fail   blocked: $blocked"
+
+# How many projects are allowed to be blocked. Zero, and it is pinned rather
+# than merely observed: a `BLOCKED` file is a deliberate act, but the gate
+# printed the count and passed anyway, so dropping one in was a way to stop
+# testing a program with a green run and no diff to the gate. Raising this
+# number is now the diff (F80).
+#
+# §11's gap list is one entry long and nothing in this directory is on it, so
+# the right value today is zero.
+EXPECT_BLOCKED=${EXPECT_BLOCKED:-0}
+
 if [ ${#BLOCKED[@]} -gt 0 ]; then
     echo
     echo "blocked on a missing language feature:"
@@ -106,5 +117,14 @@ if [ ${#FAILED[@]} -gt 0 ]; then
     echo
     echo "FAILING:"
     printf '  %s\n' "${FAILED[@]}"
+fi
+if [ "$blocked" -ne "$EXPECT_BLOCKED" ]; then
+    echo
+    echo "$blocked project(s) are blocked and $EXPECT_BLOCKED are expected to be."
+    echo "A blocked project is one this gate does not run. If that is right,"
+    echo "raise EXPECT_BLOCKED in this file and say why in the commit."
+    exit 1
+fi
+if [ ${#FAILED[@]} -gt 0 ]; then
     exit 1
 fi

@@ -57,6 +57,10 @@ skip=0
 declare -a FAILED=()
 declare -a SKIPPED=()
 
+# Where the source bundles for multi-module programs are written.
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+
 . "$(dirname "$0")/lib/corpus.sh"
 CORPUS_DIRS=${DIRS:-$CORPUS_DIRS}
 # shellcheck disable=SC2086
@@ -66,12 +70,31 @@ for src in $programs; do
     grep -qE '^\s*(pub )?fn main\(' "$src" || continue
     grep -q '^//! expect: error$' "$src" && continue
 
-    # `import` reads sibling files, and this target has no filesystem. Skipped
-    # by shape rather than by failure, so a real disagreement stays visible.
+    # A program with `import` used to be skipped here — "wasm32 has no
+    # filesystem", which is true of the *disk loader* and not of the engine. A
+    # source bundle is that program with its modules laid end to end, the
+    # interpreter loads one through the same function the disk uses, and
+    # `grasm build --source` writes one. So the modules are bundled and the
+    # bundle is what wasm runs.
+    #
+    # It was the largest category of skip by far — 38 of 72 — and every one of
+    # them was coverage lost for a reason the engine did not have (F81).
+    #
+    # `subject` is what the shape checks below read: for a bundled program that
+    # is every module, not only the entry. A library that opens a socket is a
+    # program that needs one, and grepping the entry file alone could not see
+    # it.
+    subject="$src"
+    run_src="$src"
     if grep -qE '^\s*import ' "$src"; then
-        skip=$((skip + 1))
-        SKIPPED+=("$src — imports a module, and wasm32 has no filesystem")
-        continue
+        bundle="$WORK/$(echo "$src" | tr '/.' '__').bundle.gr"
+        if ! "$GRASM" build "$src" --source -o "$bundle" >/dev/null 2>&1; then
+            skip=$((skip + 1))
+            SKIPPED+=("$src — its modules could not be bundled")
+            continue
+        fi
+        subject="$bundle"
+        run_src="$bundle"
     fi
     # This list is the harness's model of what the target cannot do, and it
     # has to grow when the library does. `write_bytes` and `proc_pipeline`
@@ -91,7 +114,7 @@ for src in $programs; do
         # explaining why a purity proof matters -- was skipped as needing
         # threads it never asks for. A skip is coverage lost, and one taken
         # for a facility the program does not use is lost for nothing.
-        if grep -vE '^\s*(//|#)' "$src" | grep -q "${need%%:*}"; then
+        if grep -vE '^\s*(//|#)' "$subject" | grep -q "${need%%:*}"; then
             skip=$((skip + 1))
             SKIPPED+=("$src — needs ${need##*:}, which wasm32-unknown-unknown has none of")
             continue 2
@@ -99,7 +122,7 @@ for src in $programs; do
     done
     # `extern fn` reaches a C symbol, which needs a linker and a process that
     # has one loaded. A wasm module has neither, and says so by name.
-    if grep -qE '^\s*(pub )?extern fn ' "$src"; then
+    if grep -qE '^\s*(pub )?extern fn ' "$subject"; then
         skip=$((skip + 1))
         SKIPPED+=("$src — calls a C function, and a wasm module has no linker")
         continue
@@ -119,7 +142,7 @@ for src in $programs; do
 
     i_err=$(mktemp); w_err=$(mktemp)
     i_out=$("$GRASM" run "$src" 2>"$i_err"); i_code=$?
-    w_out=$(node scripts/wasm/run.mjs "$WASM" "$src" 2>"$w_err"); w_code=$?
+    w_out=$(node scripts/wasm/run.mjs "$WASM" "$run_src" 2>"$w_err"); w_code=$?
 
     if [ "$i_out" != "$w_out" ]; then
         fail=$((fail + 1)); FAILED+=("$src — stdout differs")

@@ -318,6 +318,7 @@ fn compile_object_scoped(
     cg.empty_types = analysis.empty_types;
     cg.closure_param_types = analysis.closure_param_types;
     cg.generic_ctor_types = analysis.generic_ctor_types;
+    cg.resolved_types = analysis.resolved_types.into_iter().collect();
     cg.only_module = only_module.map(str::to_string);
     cg.declare_runtime()?;
     let views: Vec<(String, &AstModule, std::collections::HashMap<String, String>)> = program
@@ -344,6 +345,17 @@ fn compile_object_scoped(
             );
         }
     };
+    // Step 4 of `docs/probe-removal.md`: how much of the backend's own type
+    // inference is still reached. An arm the checker's answer always covers is
+    // an arm that can be deleted; one that is still reached is a question the
+    // checker is not answering yet, and the count is what tells them apart.
+    if std::env::var("GRASM_PROBE_STATS").is_ok() {
+        eprintln!(
+            "probe: checker answered {}, backend inferred {}",
+            cg.probe_hits.get(),
+            cg.probe_misses.get()
+        );
+    }
     match compiled {
         Ok(()) => {}
         Err(u) => {
@@ -463,6 +475,33 @@ struct Codegen<'m> {
     /// A variant name → the generic sum that declares it. One variant belongs
     /// to one family, and which *member* of it is a question for the use site.
     generic_variant_owner: HashMap<String, String>,
+    /// Every expression's type as the checker settled it, keyed by span.
+    ///
+    /// `probe_type` below is a second implementation of type inference, and
+    /// nine findings came from the two disagreeing (`docs/probe-removal.md`).
+    /// This is the checker's answer; the probe consults it first and falls
+    /// back to its own reasoning, so there is never a window with neither.
+    resolved_types: HashMap<(u32, u32), String>,
+    /// Spans that a *synthesised* expression reuses.
+    ///
+    /// `xs.par_map(square)` is lowered as `xs.par_map(|__par_arg|
+    /// square(__par_arg))`, and the synthesised call carries `square`'s own
+    /// span. The checker settled that span as the type of the function
+    /// *value*, while the node now standing there is a *call*, whose type is
+    /// the return — and reading one as the other read a machine word as a
+    /// pointer: `ns.par_map(square)` compiled and took SIGSEGV.
+    ///
+    /// Recorded at the one place that synthesises — `desugar_fn_arg` — rather
+    /// than by a flag each of its six callers has to set. A caller that forgot
+    /// would reintroduce the fault silently, which is the shape of defect this
+    /// whole change exists to remove.
+    synthesised_spans: std::cell::RefCell<std::collections::HashSet<(u32, u32)>>,
+    /// How often the checker's answer was used, and how often the probe had to
+    /// reason for itself. `GRASM_PROBE_STATS=1` prints them at the end of a
+    /// build — the measurement that says which of the probe's arms are still
+    /// reachable and can therefore be deleted.
+    probe_hits: std::cell::Cell<u64>,
+    probe_misses: std::cell::Cell<u64>,
     /// What the call site's binding says the result is, while a generic call
     /// is being instantiated. Set around the call and cleared after, the way
     /// `tail_hint` is.
@@ -586,6 +625,10 @@ impl<'m> Codegen<'m> {
             generic_types: HashMap::new(),
             type_args: HashMap::new(),
             generic_variant_owner: HashMap::new(),
+            resolved_types: HashMap::new(),
+            synthesised_spans: std::cell::RefCell::new(std::collections::HashSet::new()),
+            probe_hits: std::cell::Cell::new(0),
+            probe_misses: std::cell::Cell::new(0),
             ret_hint: None,
             consts: HashMap::new(),
             recursive: std::collections::HashSet::new(),
@@ -10668,6 +10711,74 @@ fields, not the type this is bound to, not an enclosing generic",
     /// Static type probe without emitting code. Best-effort but covers the
     /// realistic expression shapes; used for merge-block param types.
     fn probe_type(&mut self, e: &Expr) -> CResult<VType> {
+        /// What shape an expression is, for `GRASM_PROBE_MISS`. Step 4 of
+        /// `docs/probe-removal.md` needs to know *which* arms are still
+        /// reached, not only how many times.
+        fn kind_of(e: &Expr) -> &'static str {
+            match e {
+                Expr::Int(..) => "int",
+                Expr::Float(..) => "float",
+                Expr::Bool(..) => "bool",
+                Expr::Str(..) => "str",
+                Expr::Ident(..) => "ident",
+                Expr::List(..) => "list",
+                Expr::Map(..) => "map",
+                Expr::Tuple(..) => "tuple",
+                Expr::Call { .. } => "call",
+                Expr::MethodCall { .. } => "method-call",
+                Expr::Field { .. } => "field",
+                Expr::Index { .. } => "index",
+                Expr::Closure { .. } => "closure",
+                Expr::If { .. } => "if",
+                Expr::Match { .. } => "match",
+                Expr::Block(..) => "block",
+                Expr::Binary { .. } => "binary",
+                Expr::Unary { .. } => "unary",
+                Expr::Try { .. } => "try",
+                Expr::StructLit { .. } => "struct-literal",
+                Expr::Range { .. } => "range",
+                _ => "other",
+            }
+        }
+        // The checker's answer first.
+        //
+        // Everything below this is a second implementation of type inference,
+        // and every place it disagreed with the checker was a defect — six in
+        // the "probe knew less than the lowering" cluster, three more in
+        // "re-derived a rule the checker already knew". The checker settled the
+        // type of this very expression; asking it is not a heuristic.
+        //
+        // The fallback stays for now, so there is no window where the backend
+        // has neither answer, and `GRASM_PROBE_STATS=1` says how often it is
+        // still reached. See `docs/probe-removal.md`.
+        //
+        // Only for an expression the *source* contains. The backend rewrites
+        // some calls before compiling them — `xs.par_map(square)` becomes
+        // `xs.par_map(|__par_arg| square(__par_arg))` — and the synthesised
+        // parts carry the span of what they were built from. Asking the
+        // checker about `square(__par_arg)` at `square`'s own span returns the
+        // type of the *function value*, not of the call, and the difference is
+        // a machine word read as a pointer: `ns.par_map(square)` compiled and
+        // took SIGSEGV.
+        //
+        // A span the checker settled is trustworthy; a span a rewrite reused
+        // is not, and the two cannot be told apart from the span alone. So the
+        // synthesiser records what it reused, and this skips those.
+        let sp = e.span();
+        if !self.cg.synthesised_spans.borrow().contains(&(sp.start, sp.end)) {
+            if let Some(text) = self.cg.resolved_types.get(&(sp.start, sp.end)).cloned() {
+                if let Some(te) = grasm_syntax::parse_type_src(&text) {
+                    if let Ok(t) = self.cg.vtype_of(&te) {
+                        self.cg.probe_hits.set(self.cg.probe_hits.get() + 1);
+                        return Ok(t);
+                    }
+                }
+            }
+        }
+        self.cg.probe_misses.set(self.cg.probe_misses.get() + 1);
+        if std::env::var("GRASM_PROBE_MISS").is_ok() {
+            eprintln!("probe-miss: {}..{} {:?}", sp.start, sp.end, kind_of(e));
+        }
         use BinaryOp::*;
         Ok(match e {
             // The checker decided which integer literals are floats, and the
@@ -12916,6 +13027,10 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
                         args: vec![Expr::Ident(param.clone())],
                         span: *span,
                     };
+                    self.cg
+                        .synthesised_spans
+                        .borrow_mut()
+                        .insert((span.start, span.end));
                     return Some((param, call));
                 }
             }
@@ -12951,6 +13066,13 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
             args: vec![Expr::Ident(param.clone())],
             span,
         };
+        // This span now holds two different expressions: the source's `square`
+        // and the synthesised `square(__par_arg)`. The checker's answer is for
+        // the first, so it must not be read for the second.
+        self.cg
+            .synthesised_spans
+            .borrow_mut()
+            .insert((span.start, span.end));
         Some((param, call))
     }
 
