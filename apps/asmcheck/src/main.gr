@@ -1,0 +1,257 @@
+// Emits one encoding per line, for `scripts/asm_interop.sh` to compare
+// against a real assembler.
+//
+// Byte-for-byte against clang is the check, and where the two legitimately
+// differ the gate says which pair it is expecting rather than letting the
+// difference pass silently. x86-64 has several legal encodings for the same
+// effect and an assembler is entitled to pick any of them; what it is not
+// entitled to do is pick one that means something else.
+//
+// With no arguments it prints the encodings, which is also what the corpus
+// gates run it as.
+
+import asm64
+import bytes_codec
+
+fn main() / {io} {
+    {
+        var a = asm64.new_assembly()
+        asm64.mov_rr(a, asm64.rax(), asm64.rdi())
+        match asm64.finish(a) {
+            Ok(b) -> print("mov_rr_rax_rdi {bytes_codec.encode_hex(b)}")
+            Err(_e) -> print("mov_rr_rax_rdi FAILED")
+        }
+    }
+    {
+        var a = asm64.new_assembly()
+        asm64.mov_rr(a, asm64.r8(), asm64.r15())
+        match asm64.finish(a) {
+            Ok(b) -> print("mov_rr_r8_r15 {bytes_codec.encode_hex(b)}")
+            Err(_e) -> print("mov_rr_r8_r15 FAILED")
+        }
+    }
+    {
+        var a = asm64.new_assembly()
+        asm64.mov_rr(a, asm64.rsp(), asm64.rbp())
+        match asm64.finish(a) {
+            Ok(b) -> print("mov_rr_rsp_rbp {bytes_codec.encode_hex(b)}")
+            Err(_e) -> print("mov_rr_rsp_rbp FAILED")
+        }
+    }
+    {
+        var a = asm64.new_assembly()
+        asm64.add_rr(a, asm64.rax(), asm64.rsi())
+        match asm64.finish(a) {
+            Ok(b) -> print("add_rr {bytes_codec.encode_hex(b)}")
+            Err(_e) -> print("add_rr FAILED")
+        }
+    }
+    {
+        var a = asm64.new_assembly()
+        asm64.sub_rr(a, asm64.rbx(), asm64.rcx())
+        match asm64.finish(a) {
+            Ok(b) -> print("sub_rr {bytes_codec.encode_hex(b)}")
+            Err(_e) -> print("sub_rr FAILED")
+        }
+    }
+    {
+        var a = asm64.new_assembly()
+        asm64.xor_rr(a, asm64.rax(), asm64.rax())
+        match asm64.finish(a) {
+            Ok(b) -> print("xor_rr {bytes_codec.encode_hex(b)}")
+            Err(_e) -> print("xor_rr FAILED")
+        }
+    }
+    {
+        var a = asm64.new_assembly()
+        asm64.and_rr(a, asm64.r10(), asm64.r11())
+        match asm64.finish(a) {
+            Ok(b) -> print("and_rr {bytes_codec.encode_hex(b)}")
+            Err(_e) -> print("and_rr FAILED")
+        }
+    }
+    {
+        var a = asm64.new_assembly()
+        asm64.or_rr(a, asm64.rdx(), asm64.r9())
+        match asm64.finish(a) {
+            Ok(b) -> print("or_rr {bytes_codec.encode_hex(b)}")
+            Err(_e) -> print("or_rr FAILED")
+        }
+    }
+    {
+        var a = asm64.new_assembly()
+        asm64.cmp_rr(a, asm64.rdi(), asm64.rsi())
+        match asm64.finish(a) {
+            Ok(b) -> print("cmp_rr {bytes_codec.encode_hex(b)}")
+            Err(_e) -> print("cmp_rr FAILED")
+        }
+    }
+    {
+        var a = asm64.new_assembly()
+        asm64.imul_rr(a, asm64.rax(), asm64.rbx())
+        match asm64.finish(a) {
+            Ok(b) -> print("imul_rr {bytes_codec.encode_hex(b)}")
+            Err(_e) -> print("imul_rr FAILED")
+        }
+    }
+    {
+        var a = asm64.new_assembly()
+        asm64.mov_ri(a, asm64.rax(), 42)
+        match asm64.finish(a) {
+            Ok(b) -> print("mov_ri_small {bytes_codec.encode_hex(b)}")
+            Err(_e) -> print("mov_ri_small FAILED")
+        }
+    }
+    {
+        var a = asm64.new_assembly()
+        asm64.mov_ri(a, asm64.r13(), 7)
+        match asm64.finish(a) {
+            Ok(b) -> print("mov_ri_r13 {bytes_codec.encode_hex(b)}")
+            Err(_e) -> print("mov_ri_r13 FAILED")
+        }
+    }
+    {
+        var a = asm64.new_assembly()
+        asm64.mov_ri(a, asm64.rax(), 1099511627776)
+        match asm64.finish(a) {
+            Ok(b) -> print("mov_ri_big {bytes_codec.encode_hex(b)}")
+            Err(_e) -> print("mov_ri_big FAILED")
+        }
+    }
+    {
+        var a = asm64.new_assembly()
+        asm64.mov_ri(a, asm64.rcx(), 0 - 5)
+        match asm64.finish(a) {
+            Ok(b) -> print("mov_ri_neg {bytes_codec.encode_hex(b)}")
+            Err(_e) -> print("mov_ri_neg FAILED")
+        }
+    }
+    {
+        var a = asm64.new_assembly()
+        asm64.add_ri(a, asm64.rax(), 8)
+        match asm64.finish(a) {
+            Ok(b) -> print("add_ri_small {bytes_codec.encode_hex(b)}")
+            Err(_e) -> print("add_ri_small FAILED")
+        }
+    }
+    {
+        var a = asm64.new_assembly()
+        asm64.add_ri(a, asm64.rax(), 100000)
+        match asm64.finish(a) {
+            Ok(b) -> print("add_ri_big {bytes_codec.encode_hex(b)}")
+            Err(_e) -> print("add_ri_big FAILED")
+        }
+    }
+    {
+        var a = asm64.new_assembly()
+        asm64.sub_ri(a, asm64.rsp(), 32)
+        match asm64.finish(a) {
+            Ok(b) -> print("sub_ri {bytes_codec.encode_hex(b)}")
+            Err(_e) -> print("sub_ri FAILED")
+        }
+    }
+    {
+        var a = asm64.new_assembly()
+        asm64.cmp_ri(a, asm64.rdi(), 0)
+        match asm64.finish(a) {
+            Ok(b) -> print("cmp_ri {bytes_codec.encode_hex(b)}")
+            Err(_e) -> print("cmp_ri FAILED")
+        }
+    }
+    {
+        var a = asm64.new_assembly()
+        asm64.push_r(a, asm64.rbp())
+        match asm64.finish(a) {
+            Ok(b) -> print("push_rbp {bytes_codec.encode_hex(b)}")
+            Err(_e) -> print("push_rbp FAILED")
+        }
+    }
+    {
+        var a = asm64.new_assembly()
+        asm64.pop_r(a, asm64.r12())
+        match asm64.finish(a) {
+            Ok(b) -> print("pop_r12 {bytes_codec.encode_hex(b)}")
+            Err(_e) -> print("pop_r12 FAILED")
+        }
+    }
+    {
+        var a = asm64.new_assembly()
+        asm64.ret(a)
+        match asm64.finish(a) {
+            Ok(b) -> print("ret {bytes_codec.encode_hex(b)}")
+            Err(_e) -> print("ret FAILED")
+        }
+    }
+    {
+        var a = asm64.new_assembly()
+        asm64.syscall(a)
+        match asm64.finish(a) {
+            Ok(b) -> print("syscall {bytes_codec.encode_hex(b)}")
+            Err(_e) -> print("syscall FAILED")
+        }
+    }
+    {
+        var a = asm64.new_assembly()
+        asm64.mov_rm(a, asm64.rax(), asm64.rdi(), 0)
+        match asm64.finish(a) {
+            Ok(b) -> print("mov_rm_0 {bytes_codec.encode_hex(b)}")
+            Err(_e) -> print("mov_rm_0 FAILED")
+        }
+    }
+    {
+        var a = asm64.new_assembly()
+        asm64.mov_rm(a, asm64.rax(), asm64.rdi(), 8)
+        match asm64.finish(a) {
+            Ok(b) -> print("mov_rm_8 {bytes_codec.encode_hex(b)}")
+            Err(_e) -> print("mov_rm_8 FAILED")
+        }
+    }
+    {
+        var a = asm64.new_assembly()
+        asm64.mov_rm(a, asm64.rax(), asm64.rsp(), 16)
+        match asm64.finish(a) {
+            Ok(b) -> print("mov_rm_rsp {bytes_codec.encode_hex(b)}")
+            Err(_e) -> print("mov_rm_rsp FAILED")
+        }
+    }
+    {
+        var a = asm64.new_assembly()
+        asm64.mov_rm(a, asm64.rax(), asm64.rbp(), 0)
+        match asm64.finish(a) {
+            Ok(b) -> print("mov_rm_rbp0 {bytes_codec.encode_hex(b)}")
+            Err(_e) -> print("mov_rm_rbp0 FAILED")
+        }
+    }
+    {
+        var a = asm64.new_assembly()
+        asm64.mov_rm(a, asm64.r12(), asm64.r12(), 4)
+        match asm64.finish(a) {
+            Ok(b) -> print("mov_rm_r12 {bytes_codec.encode_hex(b)}")
+            Err(_e) -> print("mov_rm_r12 FAILED")
+        }
+    }
+    {
+        var a = asm64.new_assembly()
+        asm64.mov_rm(a, asm64.rax(), asm64.r13(), 0)
+        match asm64.finish(a) {
+            Ok(b) -> print("mov_rm_r13_0 {bytes_codec.encode_hex(b)}")
+            Err(_e) -> print("mov_rm_r13_0 FAILED")
+        }
+    }
+    {
+        var a = asm64.new_assembly()
+        asm64.mov_rm(a, asm64.rax(), asm64.rdi(), 5000)
+        match asm64.finish(a) {
+            Ok(b) -> print("mov_rm_big {bytes_codec.encode_hex(b)}")
+            Err(_e) -> print("mov_rm_big FAILED")
+        }
+    }
+    {
+        var a = asm64.new_assembly()
+        asm64.mov_mr(a, asm64.rsi(), 24, asm64.rdx())
+        match asm64.finish(a) {
+            Ok(b) -> print("mov_mr {bytes_codec.encode_hex(b)}")
+            Err(_e) -> print("mov_mr FAILED")
+        }
+    }
+}

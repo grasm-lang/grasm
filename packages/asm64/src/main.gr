@@ -1,0 +1,361 @@
+// An x86-64 assembler: instructions in, machine code out.
+//
+// The encoding is the subject. x86-64 is a variable-length format where the
+// same mnemonic becomes different bytes depending on which registers it names,
+// how large the immediate is, and whether either operand is one of the eight
+// registers added when the architecture went 64-bit. Getting it right is a
+// matter of three fields that most descriptions treat as an afterthought:
+//
+//   **REX** — one optional byte before the opcode. Its low four bits extend
+//   the register numbers by one bit each, and bit 3 says the operation is
+//   64-bit rather than 32-bit. A missing REX.W silently assembles the 32-bit
+//   instruction, which runs and gives the wrong answer above four billion.
+//
+//   **ModRM** — two bits of mode and two three-bit register fields. The mode
+//   says whether the second operand is a register or a memory address, and
+//   with what displacement.
+//
+//   **SIB** — a second byte, needed only when the base register is `rsp` or
+//   `r12`, because those two encodings mean "a SIB byte follows" instead.
+//   That exception is not a special case in the assembler's model; it is a
+//   hole in the ModRM encoding that every x86 assembler has to paper over.
+//
+// Correctness here is checked by assembling the same instructions with a real
+// assembler and comparing bytes. Nothing else settles it.
+
+pub fn rax() -> i64 { 0 }
+pub fn rcx() -> i64 { 1 }
+pub fn rdx() -> i64 { 2 }
+pub fn rbx() -> i64 { 3 }
+pub fn rsp() -> i64 { 4 }
+pub fn rbp() -> i64 { 5 }
+pub fn rsi() -> i64 { 6 }
+pub fn rdi() -> i64 { 7 }
+pub fn r8() -> i64 { 8 }
+pub fn r9() -> i64 { 9 }
+pub fn r10() -> i64 { 10 }
+pub fn r11() -> i64 { 11 }
+pub fn r12() -> i64 { 12 }
+pub fn r13() -> i64 { 13 }
+pub fn r14() -> i64 { 14 }
+pub fn r15() -> i64 { 15 }
+
+/// A growing buffer of machine code, and where the labels are.
+type Assembly = {
+    code: [i64],
+    label_names: [str],
+    label_at: [i64],
+    fixup_at: [i64],
+    fixup_label: [str],
+    fixup_width: [i64],
+}
+
+pub fn new_assembly() -> Assembly {
+    var c: [i64] = []
+    var n: [str] = []
+    var a: [i64] = []
+    var fa: [i64] = []
+    var fl: [str] = []
+    var fw: [i64] = []
+    Assembly{ code: c, label_names: n, label_at: a,
+              fixup_at: fa, fixup_label: fl, fixup_width: fw }
+}
+
+fn emit(inout a: Assembly, b: i64) {
+    a.code.push(b.bit_and(255))
+}
+
+fn emit32(inout a: Assembly, v: i64) {
+    for i in 0..4 {
+        emit(a, v.ushr(i * 8))
+    }
+}
+
+fn emit64(inout a: Assembly, v: i64) {
+    for i in 0..8 {
+        emit(a, v.ushr(i * 8))
+    }
+}
+
+/// The REX byte, or nothing when none of its bits are needed.
+///
+/// Emitting `0x40` unconditionally would also be correct and is what a naive
+/// assembler does; it produces a longer encoding than any real assembler, so
+/// the bytes would not compare equal even though the meaning would.
+fn rex(inout a: Assembly, w: bool, reg: i64, rm: i64) {
+    var v = 0
+    if w {
+        v = v.bit_or(8)
+    }
+    if reg >= 8 {
+        v = v.bit_or(4)
+    }
+    if rm >= 8 {
+        v = v.bit_or(1)
+    }
+    if v != 0 {
+        emit(a, 64 + v)
+    }
+}
+
+fn modrm(inout a: Assembly, mode: i64, reg: i64, rm: i64) {
+    emit(a, mode.shl(6).bit_or(reg.bit_and(7).shl(3)).bit_or(rm.bit_and(7)))
+}
+
+/// `mov dst, src` between two 64-bit registers.
+pub fn mov_rr(inout a: Assembly, dst: i64, src: i64) {
+    rex(a, true, src, dst)
+    emit(a, 137)
+    modrm(a, 3, src, dst)
+}
+
+/// `mov dst, imm`.
+///
+/// Three encodings, and a real assembler picks the shortest that fits — which
+/// is why a comparison against one is a comparison of *choices* and not only
+/// of tables. A value that fits in 32 bits signed uses the five-byte form; a
+/// larger one needs the ten-byte `movabs`.
+pub fn mov_ri(inout a: Assembly, dst: i64, value: i64) {
+    if value >= 0 and value <= 4294967295 {
+        // The 32-bit form zero-extends into the full register, so a positive
+        // value that fits needs no REX.W at all. This is two bytes shorter
+        // than the 64-bit form and has the same effect, which is why compilers
+        // emit it — and why disassembling it says `movl` where a source that
+        // wrote `movq` disassembles as `movq`. The bytes differ; the register
+        // afterwards does not.
+        rex(a, false, 0, dst)
+        emit(a, 184 + dst.bit_and(7))
+        emit32(a, value)
+    } else if value >= (0 - 2147483648) and value < 0 {
+        rex(a, true, 0, dst)
+        emit(a, 199)
+        modrm(a, 3, 0, dst)
+        emit32(a, value)
+    } else {
+        rex(a, true, 0, dst)
+        emit(a, 184 + dst.bit_and(7))
+        emit64(a, value)
+    }
+}
+
+fn arith_rr(inout a: Assembly, opcode: i64, dst: i64, src: i64) {
+    rex(a, true, src, dst)
+    emit(a, opcode)
+    modrm(a, 3, src, dst)
+}
+
+pub fn add_rr(inout a: Assembly, dst: i64, src: i64) {
+    arith_rr(a, 1, dst, src)
+}
+
+pub fn sub_rr(inout a: Assembly, dst: i64, src: i64) {
+    arith_rr(a, 41, dst, src)
+}
+
+pub fn and_rr(inout a: Assembly, dst: i64, src: i64) {
+    arith_rr(a, 33, dst, src)
+}
+
+pub fn or_rr(inout a: Assembly, dst: i64, src: i64) {
+    arith_rr(a, 9, dst, src)
+}
+
+pub fn xor_rr(inout a: Assembly, dst: i64, src: i64) {
+    arith_rr(a, 49, dst, src)
+}
+
+pub fn cmp_rr(inout a: Assembly, left: i64, right: i64) {
+    arith_rr(a, 57, left, right)
+}
+
+/// `add dst, imm` and friends.
+///
+/// The eight-bit form when the value fits, which is what an assembler picks
+/// and therefore what the bytes have to be.
+fn arith_ri(inout a: Assembly, ext: i64, dst: i64, value: i64) {
+    rex(a, true, 0, dst)
+    if value >= (0 - 128) and value <= 127 {
+        emit(a, 131)
+        modrm(a, 3, ext, dst)
+        emit(a, value)
+    } else if dst == rax() {
+        // The accumulator short form: `add rax, imm32` and its siblings have a
+        // one-byte opcode with no ModRM, saving a byte. It exists only for
+        // `rax`, which is why this is a special case rather than a rule — and
+        // it is what a real assembler emits, so an assembler that does not
+        // produce longer code for the same instruction.
+        emit(a, accumulator_opcode(ext))
+        emit32(a, value)
+    } else {
+        emit(a, 129)
+        modrm(a, 3, ext, dst)
+        emit32(a, value)
+    }
+}
+
+fn accumulator_opcode(ext: i64) -> i64 {
+    if ext == 0 {
+        5
+    } else if ext == 1 {
+        13
+    } else if ext == 4 {
+        37
+    } else if ext == 5 {
+        45
+    } else if ext == 6 {
+        53
+    } else {
+        61
+    }
+}
+
+pub fn add_ri(inout a: Assembly, dst: i64, value: i64) {
+    arith_ri(a, 0, dst, value)
+}
+
+pub fn sub_ri(inout a: Assembly, dst: i64, value: i64) {
+    arith_ri(a, 5, dst, value)
+}
+
+pub fn cmp_ri(inout a: Assembly, dst: i64, value: i64) {
+    arith_ri(a, 7, dst, value)
+}
+
+pub fn imul_rr(inout a: Assembly, dst: i64, src: i64) {
+    rex(a, true, dst, src)
+    emit(a, 15)
+    emit(a, 175)
+    modrm(a, 3, dst, src)
+}
+
+pub fn push_r(inout a: Assembly, r: i64) {
+    if r >= 8 {
+        emit(a, 65)
+    }
+    emit(a, 80 + r.bit_and(7))
+}
+
+pub fn pop_r(inout a: Assembly, r: i64) {
+    if r >= 8 {
+        emit(a, 65)
+    }
+    emit(a, 88 + r.bit_and(7))
+}
+
+pub fn ret(inout a: Assembly) {
+    emit(a, 195)
+}
+
+pub fn syscall(inout a: Assembly) {
+    emit(a, 15)
+    emit(a, 5)
+}
+
+/// `mov dst, [base + offset]`.
+///
+/// The two exceptions live here. A base of `rsp` or `r12` needs a SIB byte,
+/// because their ModRM encoding is taken to mean "a SIB follows"; and a base
+/// of `rbp` or `r13` with no displacement has to be written with an explicit
+/// zero, because *their* encoding is taken to mean "an absolute address
+/// follows". Neither is a choice; both are holes in the format.
+pub fn mov_rm(inout a: Assembly, dst: i64, base: i64, offset: i64) {
+    rex(a, true, dst, base)
+    emit(a, 139)
+    encode_memory(a, dst, base, offset)
+}
+
+pub fn mov_mr(inout a: Assembly, base: i64, offset: i64, src: i64) {
+    rex(a, true, src, base)
+    emit(a, 137)
+    encode_memory(a, src, base, offset)
+}
+
+fn encode_memory(inout a: Assembly, reg: i64, base: i64, offset: i64) {
+    let low = base.bit_and(7)
+    let needs_sib = low == 4
+    let forced_disp = low == 5 and offset == 0
+    var mode = 0
+    if offset != 0 or forced_disp {
+        mode = if offset >= (0 - 128) and offset <= 127 { 1 } else { 2 }
+    }
+    modrm(a, mode, reg, base)
+    if needs_sib {
+        // scale 0, index 4 meaning "no index", base as given.
+        emit(a, 4.shl(3).bit_or(low))
+    }
+    if mode == 1 {
+        emit(a, offset)
+    } else if mode == 2 {
+        emit32(a, offset)
+    }
+}
+
+/// Name the current position.
+pub fn label(inout a: Assembly, name: str) {
+    a.label_names.push(name)
+    a.label_at.push(a.code.len())
+}
+
+fn branch(inout a: Assembly, name: str) {
+    a.fixup_at.push(a.code.len())
+    a.fixup_label.push(name)
+    a.fixup_width.push(4)
+    emit32(a, 0)
+}
+
+pub fn jmp(inout a: Assembly, name: str) {
+    emit(a, 233)
+    branch(a, name)
+}
+
+/// A conditional jump. The condition is the low four bits of the second
+/// opcode byte, which is why they are numbered rather than named here.
+pub fn jcc(inout a: Assembly, condition: i64, name: str) {
+    emit(a, 15)
+    emit(a, 128 + condition.bit_and(15))
+    branch(a, name)
+}
+
+pub fn cond_equal() -> i64 { 4 }
+pub fn cond_not_equal() -> i64 { 5 }
+pub fn cond_less() -> i64 { 12 }
+pub fn cond_greater_equal() -> i64 { 13 }
+pub fn cond_greater() -> i64 { 15 }
+pub fn cond_less_equal() -> i64 { 14 }
+
+type AsmError =
+    | UnknownLabel(name: str)
+    | TooFar(name: str, distance: i64)
+
+/// Resolve the branches and answer the finished code.
+///
+/// A displacement is measured from the *end* of the instruction, not its
+/// start, which is the single most common off-by-four in a hand-written
+/// assembler and is invisible until a jump lands in the middle of something.
+pub fn finish(inout a: Assembly) -> bytes ! AsmError {
+    for i in 0..a.fixup_at.len() {
+        let name = a.fixup_label[i]
+        var target = 0 - 1
+        for j in 0..a.label_names.len() {
+            if a.label_names[j] == name {
+                target = a.label_at[j]
+            }
+        }
+        if target < 0 {
+            fail(UnknownLabel(name))
+        }
+        let site = a.fixup_at[i]
+        let displacement = target - (site + a.fixup_width[i])
+        if displacement < (0 - 2147483648) or displacement > 2147483647 {
+            fail(TooFar(name, displacement))
+        }
+        for k in 0..4 {
+            a.code[site + k] = displacement.ushr(k * 8).bit_and(255)
+        }
+    }
+    bytes_of(a.code)
+}
+
+pub fn size_of(a: Assembly) -> i64 {
+    a.code.len()
+}

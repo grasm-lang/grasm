@@ -54,6 +54,7 @@ run_gate cryptodiff    scripts/crypto_diff.sh
 run_gate kvcrash       scripts/kvstore_crash.sh
 run_gate zlibdiff      scripts/zlib_diff.sh
 run_gate wasmdiff      scripts/wasm_diff.sh
+run_gate asminterop    scripts/asm_interop.sh
 run_gate gitinterop    scripts/git_interop.sh
 run_gate northstar     scripts/northstar.sh
 run_gate gold          ProjectGold/run.sh

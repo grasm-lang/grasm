@@ -1,0 +1,5 @@
+[package]
+name = "asm64"
+version = "1.0.0"
+
+capabilities = []

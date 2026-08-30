@@ -1,0 +1,14 @@
+[package]
+name = "asmcheck"
+version = "0.1.0"
+entry = "src/main.gr"
+
+capabilities = ["io"]
+
+[dependencies.asm64]
+path = "../../packages/asm64"
+version = "^1.0.0"
+
+[dependencies.bytes_codec]
+path = "../../packages/bytes"
+version = "^1.0.0"
