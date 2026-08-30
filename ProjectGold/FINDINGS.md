@@ -103,6 +103,7 @@ and the entries disagree.
 | [F85](#f85) | a datagram receiver could not learn who wrote to it | S2, libraries | **fixed** |
 | [F86](#f86) | `args()` was documented as something it only sometimes is | S4, spec | **fixed** |
 | [F87](#f87) | a diamond dependency wrote a source bundle that could not be loaded | S1, loader | **fixed** |
+| [F88](#f88) | a package stopped compiling because of what stood next to it | S2, types | **fixed** |
 
 <!-- end index -->
 ## F1 — a wrapped condition must end the line with the operator (S4) — **fixed**
@@ -3745,3 +3746,45 @@ turns it red, which was verified by reverting it.
 
 Found by `wasmtest`, which is the only gate that runs source bundles, on the
 first program in the corpus with two packages sharing a dependency.
+
+## F88 — a package stopped compiling because of what stood next to it (S2, types) — **fixed**
+
+```
+packages/wal/src/main.gr:64:25: error: `Io` is ambiguous — variant of multiple types
+            Err(_e) -> fail(Io(path))
+```
+
+`wal` compiles alone. `sstable` compiles alone. A program that imports both
+broke **their** sources — with an error pointing into a file the program's
+author does not own and cannot edit, about a name that was never ambiguous
+inside the module that declared it.
+
+Each package had a private error type with an `Io` variant, which is the
+obvious name for it and which neither author could have known the other chose.
+Nothing about `wal` changed when `sstable` was added to the program beside it:
+`wal` still declares exactly one `Io` and every use of it sits in a function
+whose `!` clause says which type it means.
+
+Six lines reproduce it: two packages each with `type XError = | Io(why: str)`
+and a `fail(Io(...))`, and a third program that imports both.
+
+**This is worse than the collision F78 and F82 dealt with, and worth separating
+from them.** Those were duplicate *type* names, where the rule is real, the
+refusal is immediate, and prefixing is a fix the package author can apply.
+Here the rule fires on a *variant*, only when two packages meet, and the fix
+has to be applied to code the person hitting it did not write.
+
+The repair is a scoping rule rather than a naming one: **a module's own variant
+resolves before the name is called ambiguous**, which is also how a reader of
+that file reads it. Ambiguity is reserved for the case that really is one — a
+module with no `Io` of its own, looking at two — and qualifying as
+`AError.Io(...)` remains the way out of that.
+
+Found by writing a key-value store, whose `lsm` package imports `sstable` and
+`wal` together. It is the first program in this repository to import two
+packages that each declare a private error type.
+
+**Gate**: `crates/grasm_sema/tests/module_tests.rs`,
+`a_modules_own_variant_wins_over_an_imported_one` — the three cases in one
+test: both packages compile in one program, a module with no `Io` of its own
+is still refused, and qualifying still works.

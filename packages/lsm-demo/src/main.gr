@@ -1,0 +1,228 @@
+import lsm
+import fs
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn k(n: i64) -> bytes {
+    var s = "{n}"
+    while s.len() < 6 {
+        s = "0" + s
+    }
+    "key{s}".to_bytes()
+}
+
+fn v(n: i64) -> bytes {
+    "value-{n}".to_bytes()
+}
+
+fn got(s: Store, n: i64) -> str / {io} {
+    match lsm.get(s, k(n)) {
+        Ok(hit) -> {
+            match hit {
+                Some(b) -> b.to_str()
+                None -> "<absent>"
+            }
+        }
+        Err(_e) -> "<error>"
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+    let dir = "/tmp/grasm-lsm-demo"
+    let _r: i64 ! IoError = fs.remove_tree(dir)
+    let _m: () ! IoError = make_dir(dir)
+
+    print("-- writes, reads, and updates")
+    var s = match lsm.open_store(dir, false) {
+        Ok(st) -> st
+        Err(_e) -> {
+            print("  FAIL  the store opens")
+            return
+        }
+    }
+    lsm.set_flush_at(s, 100)
+    for i in 0..500 {
+        match lsm.put(s, k(i), v(i)) {
+            Ok(_u) -> {}
+            Err(_e) -> print("    put {i} failed")
+        }
+    }
+    say(f, "500 writes flushed into tables", lsm.table_count(s) >= 4)
+    var all_right = true
+    for i in 0..500 {
+        if got(s, i) != "value-{i}" {
+            all_right = false
+        }
+    }
+    say(f, "all 500 read back", all_right)
+
+    // An update has to win over the value in an older table.
+    match lsm.put(s, k(7), "updated".to_bytes()) {
+        Ok(_u) -> {}
+        Err(_e) -> {}
+    }
+    say(f, "an update shadows the value in an older table", got(s, 7) == "updated")
+
+    // A delete has to win too, and must not fall through to the older table.
+    match lsm.delete(s, k(11)) {
+        Ok(_u) -> {}
+        Err(_e) -> {}
+    }
+    say(f, "a delete hides a key held in an older table", got(s, 11) == "<absent>")
+    say(f, "and the neighbours are untouched",
+        got(s, 10) == "value-10" and got(s, 12) == "value-12")
+    say(f, "a key never written is absent", got(s, 99999) == "<absent>")
+
+    print("-- reopening: everything must still be there")
+    match lsm.flush(s) {
+        Ok(_u) -> {}
+        Err(_e) -> {}
+    }
+    var reopened = match lsm.open_store(dir, false) {
+        Ok(st) -> st
+        Err(_e) -> {
+            print("  FAIL  the store reopens")
+            return
+        }
+    }
+    var survived = true
+    for i in 0..500 {
+        let want = if i == 7 { "updated" } else if i == 11 { "<absent>" } else { "value-{i}" }
+        if got(reopened, i) != want {
+            survived = false
+        }
+    }
+    say(f, "500 keys, one update and one delete, all survive a reopen", survived)
+
+    print("-- a crash: the log is there, the flush never happened")
+    let crash_dir = "/tmp/grasm-lsm-crash"
+    let _r2: i64 ! IoError = fs.remove_tree(crash_dir)
+    let _m2: () ! IoError = make_dir(crash_dir)
+    var c = match lsm.open_store(crash_dir, true) {
+        Ok(st) -> st
+        Err(_e) -> {
+            print("  FAIL  the crash store opens")
+            return
+        }
+    }
+    lsm.set_flush_at(c, 100000)
+    for i in 0..300 {
+        match lsm.put(c, k(i), v(i)) {
+            Ok(_u) -> {}
+            Err(_e) -> {}
+        }
+    }
+    say(f, "300 writes are in memory, not in a table", lsm.table_count(c) == 0)
+    // The process dies here. Nothing is flushed, no manifest is written. The
+    // only record of those 300 writes is the log.
+    var after = match lsm.open_store(crash_dir, true) {
+        Ok(st) -> st
+        Err(_e) -> {
+            print("  FAIL  the store opens after a crash")
+            return
+        }
+    }
+    var recovered = 0
+    for i in 0..300 {
+        if got(after, i) == "value-{i}" {
+            recovered = recovered + 1
+        }
+    }
+    say(f, "all 300 acknowledged writes come back from the log", recovered == 300)
+
+    print("-- a crash that tore the log mid-record")
+    let log = "{crash_dir}/write.log"
+    match read_bytes(log) {
+        Ok(whole) -> {
+            match write_bytes(log, whole.slice(0, whole.len() - 6)) {
+                Ok(_u) -> {}
+                Err(_e) -> {}
+            }
+            match lsm.open_store(crash_dir, true) {
+                Ok(torn) -> {
+                    var kept = 0
+                    for i in 0..300 {
+                        if got(torn, i) == "value-{i}" {
+                            kept = kept + 1
+                        }
+                    }
+                    say(f, "a torn log loses only the record it tore", kept == 299)
+                    // And the store must be usable afterwards, not stuck.
+                    var t2 = torn
+                    match lsm.put(t2, "after".to_bytes(), "the-crash".to_bytes()) {
+                        Ok(_u) -> {
+                            match lsm.get(t2, "after".to_bytes()) {
+                                Ok(hit) -> {
+                                    match hit {
+                                        Some(b) -> say(f, "and writing continues afterwards",
+                                            b.to_str() == "the-crash")
+                                        None -> say(f, "and writing continues afterwards", false)
+                                    }
+                                }
+                                Err(_e) -> say(f, "and writing continues afterwards", false)
+                            }
+                        }
+                        Err(_e) -> say(f, "and writing continues afterwards", false)
+                    }
+                }
+                Err(_e) -> say(f, "a torn log still opens", false)
+            }
+        }
+        Err(_e) -> say(f, "the log could be read", false)
+    }
+
+    print("-- compaction")
+    var comp = match lsm.open_store(dir, false) {
+        Ok(st) -> st
+        Err(_e) -> {
+            print("  FAIL  the store opens for compaction")
+            return
+        }
+    }
+    let before = lsm.table_count(comp)
+    match lsm.compact(comp) {
+        Ok(_u) -> {}
+        Err(_e) -> print("    compaction failed")
+    }
+    say(f, "{before} tables became {lsm.table_count(comp)}", lsm.table_count(comp) == 1)
+    var kept_all = true
+    for i in 0..500 {
+        let want = if i == 7 { "updated" } else if i == 11 { "<absent>" } else { "value-{i}" }
+        if got(comp, i) != want {
+            kept_all = false
+        }
+    }
+    say(f, "every answer is the same after compacting", kept_all)
+    // The tombstone is gone from disk now, and the value must NOT come back.
+    say(f, "the deleted key stays deleted after the tombstone is dropped",
+        got(comp, 11) == "<absent>")
+    // And it survives yet another reopen, from the compacted manifest.
+    match lsm.open_store(dir, false) {
+        Ok(again) -> {
+            var still = true
+            for i in 0..500 {
+                let want = if i == 7 { "updated" } else if i == 11 { "<absent>" } else { "value-{i}" }
+                if got(again, i) != want {
+                    still = false
+                }
+            }
+            say(f, "and after reopening the compacted store", still)
+            say(f, "which reads one table, not {before}", lsm.table_count(again) == 1)
+        }
+        Err(_e) -> say(f, "the compacted store reopens", false)
+    }
+
+    if f == 0 {
+        print("all checks passed")
+    } else {
+        print("{f} check(s) failed")
+    }
+}

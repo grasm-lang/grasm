@@ -428,3 +428,29 @@ fn a_qualified_call_inside_a_region_is_refused() {
         ("lib", lib),
     ]);
 }
+
+/// Two modules that each declare a private error type with an `Io` variant.
+///
+/// Both compile alone. Before this, a program importing both broke *their*
+/// sources — with an error naming a file the program's author does not own and
+/// cannot fix, about a name that was never ambiguous inside the module that
+/// declared it. A package became uncompilable because of what was standing
+/// next to it, which is the opposite of what separate packages are for.
+///
+/// Found by writing a store: `sstable` and `wal` each had an `Io`.
+#[test]
+fn a_modules_own_variant_wins_over_an_imported_one() {
+    let a = "type AError =\n    | Io(why: str)\n\npub fn go(n: i64) -> i64 ! AError {\n    if n < 0 {\n        fail(Io(\"negative\"))\n    }\n    n\n}\n";
+    let b = "type BError =\n    | Io(why: str)\n\npub fn go(n: i64) -> i64 ! BError {\n    if n < 0 {\n        fail(Io(\"negative\"))\n    }\n    n\n}\n";
+    let main = "import a\nimport b\n\nfn main() {\n    match a.go(1) {\n        Ok(v) -> print(\"{v}\")\n        Err(e) -> print(\"no\")\n    }\n    match b.go(2) {\n        Ok(v) -> print(\"{v}\")\n        Err(e) -> print(\"no\")\n    }\n}\n";
+    ok(&[("main", main), ("a", a), ("b", b)]);
+
+    // And the case that really is ambiguous still is: a module with no `Io` of
+    // its own, looking at two.
+    let caller = "import a\nimport b\n\nfn pick() -> i64 ! AError {\n    fail(Io(\"which?\"))\n}\n\nfn main() {\n    match pick() {\n        Ok(v) -> print(\"{v}\")\n        Err(e) -> print(\"no\")\n    }\n}\n";
+    err(&[("main", caller), ("a", a), ("b", b)], "ambiguous");
+
+    // Qualifying it is the way out, and still works.
+    let fixed = caller.replace("fail(Io(", "fail(AError.Io(");
+    ok(&[("main", &fixed), ("a", a), ("b", b)]);
+}

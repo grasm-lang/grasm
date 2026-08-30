@@ -1,0 +1,158 @@
+// A key-value store you can kill.
+//
+// The point of this binary is the third mode: `hammer` writes until something
+// kills it, and `verify` then says whether every write it acknowledged is
+// still there. A store whose crash safety is only ever argued for on paper is
+// a store whose crash safety is unknown.
+//
+//     kvstore hammer <dir> <count>   write, printing each key as it commits
+//     kvstore verify <dir> <count>   check every acknowledged key survived
+//     kvstore put/get/delete <dir> <key> [value]
+//     kvstore compact <dir>
+//
+// With no arguments it prints usage and exits 0, which is what the corpus
+// gates run it as.
+
+import lsm
+
+fn main() / {io} {
+    let argv = args()
+    if argv.len() < 2 {
+        print("usage: kvstore <hammer|verify|put|get|delete|compact|stats> <dir> [...]")
+        return
+    }
+    let mode = argv[0]
+    let dir = argv[1]
+
+    // Every write is synced before it is acknowledged. That is the slow choice
+    // and it is the only one under which "acknowledged" means anything.
+    var s = match lsm.open_store(dir, true) {
+        Ok(st) -> st
+        Err(_e) -> {
+            print("cannot open {dir}")
+            return
+        }
+    }
+
+    if mode == "hammer" {
+        let count = to_int(argv[2])
+        lsm.set_flush_at(s, 250)
+        for i in 0..count {
+            match lsm.put(s, key_of(i), value_of(i)) {
+                Ok(_u) -> print("committed {i}")
+                Err(_e) -> {
+                    print("write {i} failed")
+                    return
+                }
+            }
+        }
+        print("done {count}")
+    } else if mode == "verify" {
+        // The durability property, stated so a killed process can be judged
+        // without trusting anything it printed.
+        //
+        // `hammer` writes 0, 1, 2, ... in order, so whatever survives must be
+        // a **prefix**: some number of keys from the start, then nothing. A
+        // gap — key 500 present while key 200 is gone — is a store that lost
+        // an acknowledged write, and it is the failure this looks for.
+        //
+        // Counting acknowledgements from the process's own stdout cannot work:
+        // that buffer dies with the process, so a store that committed 400 and
+        // printed 200 would be judged on 200. The keys on disk are the only
+        // honest record.
+        let bound = to_int(argv[2])
+        var run = 0
+        while run < bound and present(s, run) {
+            run = run + 1
+        }
+        var beyond = 0
+        var wrong = 0
+        for i in 0..run {
+            match lsm.get(s, key_of(i)) {
+                Ok(hit) -> {
+                    match hit {
+                        Some(b) -> {
+                            if b.to_str() != value_of(i).to_str() {
+                                wrong = wrong + 1
+                            }
+                        }
+                        None -> wrong = wrong + 1
+                    }
+                }
+                Err(_e) -> wrong = wrong + 1
+            }
+        }
+        // Anything past the first gap is a hole, which is what must never
+        // happen. Looking a long way past it, not just one key.
+        for i in run..(run + 2000) {
+            if i < bound and present(s, i) {
+                beyond = beyond + 1
+            }
+        }
+        print("prefix {run}, wrong {wrong}, beyond-the-gap {beyond}, tables {lsm.table_count(s)}")
+    } else if mode == "put" {
+        match lsm.put(s, argv[2].to_bytes(), argv[3].to_bytes()) {
+            Ok(_u) -> print("ok")
+            Err(_e) -> print("failed")
+        }
+    } else if mode == "get" {
+        match lsm.get(s, argv[2].to_bytes()) {
+            Ok(hit) -> {
+                match hit {
+                    Some(b) -> print("{b.to_str()}")
+                    None -> print("<absent>")
+                }
+            }
+            Err(_e) -> print("failed")
+        }
+    } else if mode == "delete" {
+        match lsm.delete(s, argv[2].to_bytes()) {
+            Ok(_u) -> print("ok")
+            Err(_e) -> print("failed")
+        }
+    } else if mode == "compact" {
+        match lsm.compact(s) {
+            Ok(_u) -> print("tables {lsm.table_count(s)}")
+            Err(_e) -> print("failed")
+        }
+    } else if mode == "stats" {
+        print("tables {lsm.table_count(s)} memtable {lsm.memtable_size(s)}")
+    } else {
+        print("unknown mode {mode}")
+    }
+}
+
+fn present(s: Store, n: i64) -> bool / {io} {
+    match lsm.get(s, key_of(n)) {
+        Ok(hit) -> {
+            match hit {
+                Some(_b) -> true
+                None -> false
+            }
+        }
+        Err(_e) -> false
+    }
+}
+
+fn key_of(n: i64) -> bytes {
+    var s = "{n}"
+    while s.len() < 8 {
+        s = "0" + s
+    }
+    "k{s}".to_bytes()
+}
+
+fn value_of(n: i64) -> bytes {
+    "value-number-{n}".to_bytes()
+}
+
+fn to_int(s: str) -> i64 {
+    var n = 0
+    for ch in s.chars() {
+        let c = ch.to_bytes().at(0)
+        if c >= 48 and c <= 57 {
+            n = n * 10 + (c - 48)
+        }
+    }
+    n
+}

@@ -1,0 +1,12 @@
+[package]
+name = "lsm_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.lsm]
+path = "../lsm"
+version = "^1.0.0"
+
+[dependencies.fs]
+path = "../fs"
+version = "^1.0.0"

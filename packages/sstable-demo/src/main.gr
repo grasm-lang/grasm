@@ -45,7 +45,7 @@ fn main() / {io} {
         sstable.compare(bytes_of([200]), bytes_of([100])) > 0)
 
     print("-- building and reading a table of 1000 records")
-    var records: [Record] = []
+    var records: [TableRecord] = []
     for i in 0..1000 {
         if i % 7 == 3 {
             records.push(sstable.tombstone(key_of(i)))
@@ -174,7 +174,7 @@ fn main() / {io} {
     }
 
     print("-- an empty table, which a flush of nothing would produce")
-    let none: [Record] = []
+    let none: [TableRecord] = []
     match sstable.build("{dir}/empty.sst", none) {
         Ok(_u) -> {
             match sstable.open_table("{dir}/empty.sst") {

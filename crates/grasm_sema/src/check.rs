@@ -5127,6 +5127,36 @@ fail outside it",
                         let (def_id, vi) = cands[0];
                         return self.instantiate_variant(def_id, vi, args, span);
                     } else if cands.len() > 1 {
+                        // **A module's own variant wins.**
+                        //
+                        // Two packages that each declare a private error type
+                        // with an `Io` variant both compile alone, and a third
+                        // program that imports both used to break *their*
+                        // sources — with an error naming a file its author
+                        // does not own and cannot fix. Nothing about `wal`
+                        // became ambiguous when `sstable` was added to the
+                        // program beside it; `wal` still declares exactly one
+                        // `Io` and means it.
+                        //
+                        // So the name resolves against the module being
+                        // checked before it is called ambiguous, which is also
+                        // how a reader of that file reads it. Ambiguity is
+                        // reserved for the case that really is one: a module
+                        // with no `Io` of its own, seeing two.
+                        let mine: Vec<(TypeDefId, usize)> = cands
+                            .iter()
+                            .filter(|(def_id, _)| {
+                                let name = self.defs.get(*def_id).name.clone();
+                                self.type_module
+                                    .get(&name)
+                                    .is_some_and(|m| *m == self.current_module)
+                            })
+                            .copied()
+                            .collect();
+                        if mine.len() == 1 {
+                            let (def_id, vi) = mine[0];
+                            return self.instantiate_variant(def_id, vi, args, span);
+                        }
                         return self.error_help(
                             id.span,
                             format!("`{}` is ambiguous — variant of multiple types", id.name),

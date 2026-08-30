@@ -23,10 +23,15 @@ import bloom
 
 /// One record as it sits in a table.
 ///
+/// Named `TableRecord` rather than `Record` because types share one namespace
+/// across a whole program ([T-MODULE-NS]) and `log` declares a `Record` of its
+/// own. No program imports both today; `scripts/fuzz_modules.py` reads the
+/// names out of every package's source rather than waiting for one that does.
+///
 /// `deleted` is a tombstone: a key written as *absent*. A store cannot delete
 /// from a file that is never modified, so a delete is a write, and the newest
 /// table wins. Compaction is where a tombstone finally goes away.
-type Record = {
+type TableRecord = {
     key: bytes,
     value: bytes,
     deleted: bool,
@@ -111,7 +116,7 @@ fn get_u64(b: bytes, at: i64) -> i64 {
 /// memtable is already a sorted map — and it is checked, because a table built
 /// out of order is a table whose binary search silently returns the wrong
 /// answer for the rest of its life.
-pub fn build(path: str, records: [Record]) -> () ! TableError / {io} {
+pub fn build(path: str, records: [TableRecord]) -> () ! TableError / {io} {
     var data: [i64] = []
     var index_keys: [bytes] = []
     var index_offsets: [i64] = []
@@ -282,10 +287,10 @@ pub fn count_of(t: Table) -> i64 {
 ///
 /// Three refusals before any disk is touched for records: the filter, then the
 /// index, then a single ranged read of one block. `None` means the table does
-/// not mention the key at all; a `Record` with `deleted` set means the table
+/// not mention the key at all; a `TableRecord` with `deleted` set means the table
 /// says it was removed, which is a different answer and the caller must not
 /// confuse them.
-pub fn get(t: Table, key: bytes) -> Option[Record] ! TableError / {io} {
+pub fn get(t: Table, key: bytes) -> Option[TableRecord] ! TableError / {io} {
     if not bloom.might_contain(t.filter, key) {
         return None
     }
@@ -321,7 +326,7 @@ pub fn get(t: Table, key: bytes) -> Option[Record] ! TableError / {io} {
 
 /// Walk one block looking for a key. The block holds at most `index_stride`
 /// records and they are sorted, so the walk stops as soon as it passes.
-fn scan_block(path: str, block: bytes, key: bytes) -> Option[Record] ! TableError {
+fn scan_block(path: str, block: bytes, key: bytes) -> Option[TableRecord] ! TableError {
     var at = 0
     while at < block.len() {
         let kind = block.at(at)
@@ -342,7 +347,7 @@ fn scan_block(path: str, block: bytes, key: bytes) -> Option[Record] ! TableErro
     None
 }
 
-fn read_record(path: str, b: bytes, at: i64, kind: i64) -> (Record, i64) ! TableError {
+fn read_record(path: str, b: bytes, at: i64, kind: i64) -> (TableRecord, i64) ! TableError {
     var i = at
     let klen = match varint.get_after(b, i) {
         Some(p) -> {
@@ -367,7 +372,7 @@ fn read_record(path: str, b: bytes, at: i64, kind: i64) -> (Record, i64) ! Table
         fail(Damaged(path, "a value runs past the block"))
     }
     let v = b.slice(i, vlen)
-    (Record{ key: k, value: v, deleted: kind == 2 }, i + vlen)
+    (TableRecord{ key: k, value: v, deleted: kind == 2 }, i + vlen)
 }
 
 /// Every record, in order.
@@ -375,12 +380,12 @@ fn read_record(path: str, b: bytes, at: i64, kind: i64) -> (Record, i64) ! Table
 /// This *does* read the whole data section, and that is the right shape for
 /// its one caller: compaction merges tables end to end and would read every
 /// record anyway. A point lookup must never use it.
-pub fn entries(t: Table) -> [Record] ! TableError / {io} {
+pub fn entries(t: Table) -> [TableRecord] ! TableError / {io} {
     let data = match read_bytes_at(t.path, 0, t.data_end) {
         Ok(b) -> b
         Err(_e) -> fail(Io(t.path))
     }
-    var out: [Record] = []
+    var out: [TableRecord] = []
     var at = 0
     while at < data.len() {
         let kind = data.at(at)
@@ -396,11 +401,11 @@ pub fn entries(t: Table) -> [Record] ! TableError / {io} {
 }
 
 /// A record that carries a value.
-pub fn value_record(key: bytes, value: bytes) -> Record {
-    Record{ key: key, value: value, deleted: false }
+pub fn value_record(key: bytes, value: bytes) -> TableRecord {
+    TableRecord{ key: key, value: value, deleted: false }
 }
 
 /// A record that says the key is gone.
-pub fn tombstone(key: bytes) -> Record {
-    Record{ key: key, value: bytes_of([]), deleted: true }
+pub fn tombstone(key: bytes) -> TableRecord {
+    TableRecord{ key: key, value: bytes_of([]), deleted: true }
 }

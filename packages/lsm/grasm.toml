@@ -1,0 +1,17 @@
+[package]
+name = "lsm"
+version = "1.0.0"
+
+capabilities = ["io"]
+
+[dependencies.sstable]
+path = "../sstable"
+version = "^1.0.0"
+
+[dependencies.wal]
+path = "../wal"
+version = "^1.0.0"
+
+[dependencies.varint]
+path = "../varint"
+version = "^1.0.0"

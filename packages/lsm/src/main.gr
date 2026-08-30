@@ -1,0 +1,396 @@
+// A log-structured merge store.
+//
+// The shape of the thing, and why:
+//
+// A write goes to the **log** first and then into the **memtable**, a sorted
+// map in memory. Memory is what makes writes fast; the log is what makes them
+// survive. When the memtable is big enough it is written out as an immutable
+// **table** and the log is emptied.
+//
+// A read looks at the memtable, then at the tables newest-first, and stops at
+// the first answer. That ordering *is* the update semantics: nothing is ever
+// modified in place, a newer write simply sits in front of an older one, and a
+// delete is a write that says "absent".
+//
+// Tables therefore accumulate, and reads get slower, so **compaction** merges
+// them back down — which is also the only moment a delete can actually free
+// anything, because only then is it known that no older table still holds the
+// key.
+//
+// Which tables exist is one file, the **manifest**, replaced by an atomic
+// rename. That single rename is the commit point for everything: a crash
+// before it leaves the old set of tables, a crash after it leaves the new one,
+// and there is no in-between for a reader to observe.
+
+import sstable
+import wal
+import varint
+
+type Store = {
+    dir: str,
+    memtable: [TableRecord],
+    tables: [str],
+    next_id: i64,
+    durable: bool,
+    flush_at: i64,
+}
+
+type StoreError =
+    | Io(what: str)
+    | Corrupt(what: str)
+
+/// How many records the memtable holds before it becomes a table.
+pub fn default_flush_at() -> i64 { 1000 }
+
+fn log_path(dir: str) -> str { "{dir}/write.log" }
+fn manifest_path(dir: str) -> str { "{dir}/MANIFEST" }
+
+/// Open a store, replaying whatever the last run left behind.
+///
+/// This is the crash-recovery path and it runs every time, not only after a
+/// crash — a store that takes a different path when it thinks it crashed has a
+/// path that is almost never exercised.
+pub fn open_store(dir: str, durable: bool) -> Store ! StoreError / {io} {
+    match make_dir(dir) {
+        Ok(_u) -> {}
+        Err(_e) -> {}
+    }
+    let tables = try read_manifest(dir)
+    let replayed = match wal.replay(log_path(dir)) {
+        Ok(r) -> r
+        Err(_e) -> fail(Io("replaying {log_path(dir)}"))
+    }
+    // A torn tail is the ordinary shape of a crash. Cut it, so the next append
+    // starts from a whole record rather than after rubbish.
+    if replayed.torn {
+        match wal.truncate_to(log_path(dir), replayed.good_length) {
+            Ok(_u) -> {}
+            Err(_e) -> fail(Io("trimming {log_path(dir)}"))
+        }
+    }
+
+    var mem: [TableRecord] = []
+    for e in replayed.entries {
+        insert(mem, TableRecord{ key: e.key, value: e.value, deleted: e.deleted })
+    }
+
+    var highest = 0
+    for t in tables {
+        let id = id_of(t)
+        if id > highest {
+            highest = id
+        }
+    }
+
+    Store{
+        dir: dir,
+        memtable: mem,
+        tables: tables,
+        next_id: highest + 1,
+        durable: durable,
+        flush_at: default_flush_at(),
+    }
+}
+
+/// A table's number, from a name like `000007.sst`.
+fn id_of(name: str) -> i64 {
+    var n = 0
+    for ch in name.chars() {
+        let c = ch.to_bytes().at(0)
+        if c >= 48 and c <= 57 {
+            n = n * 10 + (c - 48)
+        } else {
+            return n
+        }
+    }
+    n
+}
+
+fn table_name(id: i64) -> str {
+    var s = "{id}"
+    while s.len() < 6 {
+        s = "0" + s
+    }
+    "{s}.sst"
+}
+
+/// Put a record into a sorted list, replacing any key already there.
+///
+/// Linear, and deliberately so: Grasm's `Map` does not keep order, and a
+/// sorted list of a thousand is fast enough that a tree would be complexity
+/// bought for nothing. `flush_at` is what bounds it.
+fn insert(inout mem: [TableRecord], r: TableRecord) {
+    var lo = 0
+    var hi = mem.len()
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        if sstable.compare(mem[mid].key, r.key) < 0 {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    if lo < mem.len() and sstable.compare(mem[lo].key, r.key) == 0 {
+        mem[lo] = r
+    } else {
+        mem.push(r)
+        var i = mem.len() - 1
+        while i > lo {
+            let t = mem[i]
+            mem[i] = mem[i - 1]
+            mem[i - 1] = t
+            i = i - 1
+        }
+    }
+}
+
+fn find(mem: [TableRecord], key: bytes) -> Option[TableRecord] {
+    var lo = 0
+    var hi = mem.len()
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        if sstable.compare(mem[mid].key, key) < 0 {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    if lo < mem.len() and sstable.compare(mem[lo].key, key) == 0 {
+        return Some(mem[lo])
+    }
+    None
+}
+
+/// Write a key.
+///
+/// The log first, then memory. That order is not stylistic: a store that put
+/// it in memory first and crashed would have acknowledged a write it cannot
+/// produce.
+pub fn put(inout s: Store, key: bytes, value: bytes) -> () ! StoreError / {io} {
+    match wal.append(log_path(s.dir), wal.put_entry(key, value), s.durable) {
+        Ok(_u) -> {}
+        Err(_e) -> fail(Io("appending to the log"))
+    }
+    insert(s.memtable, TableRecord{ key: key, value: value, deleted: false })
+    if s.memtable.len() >= s.flush_at {
+        try flush(s)
+    }
+}
+
+/// Remove a key, by writing that it is gone.
+///
+/// Nothing is erased. A key can live in five older tables and the only way to
+/// hide all of them is a newer record that says absent — which is also why a
+/// delete costs the same as a write and why compaction exists.
+pub fn delete(inout s: Store, key: bytes) -> () ! StoreError / {io} {
+    match wal.append(log_path(s.dir), wal.delete_entry(key), s.durable) {
+        Ok(_u) -> {}
+        Err(_e) -> fail(Io("appending to the log"))
+    }
+    insert(s.memtable, TableRecord{ key: key, value: bytes_of([]), deleted: true })
+    if s.memtable.len() >= s.flush_at {
+        try flush(s)
+    }
+}
+
+/// Read a key: memtable first, then tables newest to oldest.
+///
+/// The first answer wins, including a tombstone — which returns `None` and
+/// stops, rather than falling through to the older table that still holds the
+/// value. Getting that wrong resurrects deleted data.
+pub fn get(s: Store, key: bytes) -> Option[bytes] ! StoreError / {io} {
+    match find(s.memtable, key) {
+        Some(r) -> {
+            if r.deleted {
+                return None
+            }
+            return Some(r.value)
+        }
+        None -> {}
+    }
+    var i = s.tables.len() - 1
+    while i >= 0 {
+        let path = "{s.dir}/{s.tables[i]}"
+        let t = match sstable.open_table(path) {
+            Ok(tb) -> tb
+            Err(_e) -> fail(Corrupt(path))
+        }
+        match sstable.get(t, key) {
+            Ok(hit) -> {
+                match hit {
+                    Some(r) -> {
+                        if r.deleted {
+                            return None
+                        }
+                        return Some(r.value)
+                    }
+                    None -> {}
+                }
+            }
+            Err(_e) -> fail(Corrupt(path))
+        }
+        i = i - 1
+    }
+    None
+}
+
+/// Turn the memtable into a table on disk.
+///
+/// The order is the whole of it: write the table, sync it, *then* commit the
+/// manifest, *then* empty the log. A crash at any point leaves a store that
+/// opens — before the manifest, the table is an orphan file nobody reads and
+/// the log still holds the writes; after it, the table is live and replaying
+/// the log again only rewrites records that are already there.
+pub fn flush(inout s: Store) -> () ! StoreError / {io} {
+    if s.memtable.len() == 0 {
+        return
+    }
+    let name = table_name(s.next_id)
+    match sstable.build("{s.dir}/{name}", s.memtable) {
+        Ok(_u) -> {}
+        Err(_e) -> fail(Io("building {name}"))
+    }
+    var next = s.tables
+    next.push(name)
+    try write_manifest(s.dir, next)
+    match wal.reset(log_path(s.dir)) {
+        Ok(_u) -> {}
+        Err(_e) -> fail(Io("resetting the log"))
+    }
+    s.tables = next
+    s.next_id = s.next_id + 1
+    var empty: [TableRecord] = []
+    s.memtable = empty
+}
+
+/// Merge every table into one, dropping what is no longer reachable.
+///
+/// A tombstone can only be discarded here, and only because *every* table is
+/// in this merge: a delete dropped while an older table still held the key
+/// would bring the old value back from the dead.
+pub fn compact(inout s: Store) -> () ! StoreError / {io} {
+    if s.tables.len() < 2 {
+        return
+    }
+    var merged: [TableRecord] = []
+    for name in s.tables {
+        let path = "{s.dir}/{name}"
+        let t = match sstable.open_table(path) {
+            Ok(tb) -> tb
+            Err(_e) -> fail(Corrupt(path))
+        }
+        match sstable.entries(t) {
+            Ok(rs) -> {
+                // Older tables come first, so a later insert overwrites an
+                // earlier one and the newest record wins.
+                for r in rs {
+                    insert(merged, r)
+                }
+            }
+            Err(_e) -> fail(Corrupt(path))
+        }
+    }
+    var live: [TableRecord] = []
+    for r in merged {
+        if not r.deleted {
+            live.push(r)
+        }
+    }
+
+    let name = table_name(s.next_id)
+    match sstable.build("{s.dir}/{name}", live) {
+        Ok(_u) -> {}
+        Err(_e) -> fail(Io("building {name}"))
+    }
+    let old = s.tables
+    try write_manifest(s.dir, [name])
+    // Only now. A table removed before the manifest names its replacement is a
+    // table a crash would leave a reader looking for.
+    for gone in old {
+        match remove_file("{s.dir}/{gone}") {
+            Ok(_u) -> {}
+            Err(_e) -> {}
+        }
+    }
+    s.tables = [name]
+    s.next_id = s.next_id + 1
+}
+
+/// The manifest: a count, then each table's name.
+///
+/// Written beside itself and renamed over, which is the store's commit point.
+fn write_manifest(dir: str, tables: [str]) -> () ! StoreError / {io} {
+    var out: [i64] = []
+    varint.put(out, tables.len())
+    for name in tables {
+        let b = name.to_bytes()
+        varint.put(out, b.len())
+        for v in b.to_list() {
+            out.push(v)
+        }
+    }
+    let scratch = "{manifest_path(dir)}.new"
+    match write_bytes(scratch, bytes_of(out)) {
+        Ok(_u) -> {}
+        Err(_e) -> fail(Io(scratch))
+    }
+    match sync_file(scratch) {
+        Ok(_u) -> {}
+        Err(_e) -> fail(Io(scratch))
+    }
+    match rename_file(scratch, manifest_path(dir)) {
+        Ok(_u) -> {}
+        Err(_e) -> fail(Io(manifest_path(dir)))
+    }
+}
+
+fn read_manifest(dir: str) -> [str] ! StoreError / {io} {
+    let p = manifest_path(dir)
+    if not file_exists(p) {
+        let none: [str] = []
+        return none
+    }
+    let b = match read_bytes(p) {
+        Ok(x) -> x
+        Err(_e) -> fail(Io(p))
+    }
+    var at = 0
+    let n = match varint.get_after(b, at) {
+        Some(pr) -> {
+            at = pr.1
+            pr.0
+        }
+        None -> fail(Corrupt(p))
+    }
+    var out: [str] = []
+    for _i in 0..n {
+        let len = match varint.get_after(b, at) {
+            Some(pr) -> {
+                at = pr.1
+                pr.0
+            }
+            None -> fail(Corrupt(p))
+        }
+        if at + len > b.len() {
+            fail(Corrupt(p))
+        }
+        out.push(b.slice(at, len).to_str())
+        at = at + len
+    }
+    out
+}
+
+/// How many tables the store is reading from.
+pub fn table_count(s: Store) -> i64 {
+    s.tables.len()
+}
+
+/// How many records are waiting in memory.
+pub fn memtable_size(s: Store) -> i64 {
+    s.memtable.len()
+}
+
+/// Flush after this many records instead of the default.
+pub fn set_flush_at(inout s: Store, n: i64) {
+    s.flush_at = n
+}

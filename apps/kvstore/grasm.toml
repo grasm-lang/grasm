@@ -1,0 +1,11 @@
+[package]
+name = "kvstore"
+version = "0.1.0"
+entry = "src/main.gr"
+
+# Reads and writes its own directory. That is all a store should be able to do.
+capabilities = ["io"]
+
+[dependencies.lsm]
+path = "../../packages/lsm"
+version = "^1.0.0"
