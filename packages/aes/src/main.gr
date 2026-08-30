@@ -1,0 +1,434 @@
+// AES, and the GCM mode TLS uses.
+//
+// **This is a software implementation and that has a consequence worth stating
+// at the top.** A table-driven AES leaks key material through cache timing:
+// which entry is fetched depends on the key, and how long the fetch takes
+// depends on what is cached. Real deployments use the processor's AES
+// instructions, which have no tables and no timing signal. Grasm cannot reach
+// those, so this uses tables, and it is therefore **not safe against an
+// attacker who can measure your cache** — which on shared hardware is anyone.
+//
+// It is here because TLS 1.3 requires AES-GCM for interoperability. Where this
+// project gets to choose, it chooses ChaCha20-Poly1305, which is designed to be
+// implemented in software without a table and is what `packages/chachapoly`
+// does.
+//
+// Grasm has one integer type, so every value is an `i64` masked to 8 or 32
+// bits at each step.
+
+fn m8(v: i64) -> i64 {
+    v.bit_and(255)
+}
+
+fn m32(v: i64) -> i64 {
+    v.bit_and(4294967295)
+}
+
+/// Multiply in GF(2^8), the field AES is defined over.
+///
+/// Not a table: the field is small enough that the shift-and-reduce loop is
+/// eight steps, and building the log tables would be more code for the same
+/// answer.
+fn gf_mul(a: i64, b: i64) -> i64 {
+    var x = m8(a)
+    var y = m8(b)
+    var r = 0
+    for _i in 0..8 {
+        if y.bit_and(1) != 0 {
+            r = r.bit_xor(x)
+        }
+        let high = x.bit_and(128)
+        x = m8(x.shl(1))
+        if high != 0 {
+            // The reducing polynomial, x^8 + x^4 + x^3 + x + 1.
+            x = x.bit_xor(27)
+        }
+        y = y.ushr(1)
+    }
+    m8(r)
+}
+
+/// The S-box, built from its definition rather than pasted as 256 numbers.
+///
+/// Each entry is the multiplicative inverse in GF(2^8) followed by an affine
+/// transform. Writing it out would be shorter to read and impossible to check;
+/// generated, it is checked by the fact that AES's own vectors pass.
+pub fn sbox() -> [i64] {
+    // The inverses come from a logarithm table rather than a search. Every
+    // non-zero element is a power of 3, so walking the powers once gives both
+    // directions, and `inverse(x)` is the element whose logarithm is 255 minus
+    // x's. The first version searched all 256 by 256 pairs — sixty-five
+    // thousand multiplications where five hundred will do.
+    var power: [i64] = []
+    var logarithm: [i64] = []
+    for _i in 0..256 {
+        logarithm.push(0)
+    }
+    var x = 1
+    for i in 0..255 {
+        power.push(x)
+        logarithm[x] = i
+        x = gf_mul(x, 3)
+    }
+    var inverse: [i64] = []
+    for _i in 0..256 {
+        inverse.push(0)
+    }
+    for i in 1..256 {
+        inverse[i] = power[(255 - logarithm[i]) % 255]
+    }
+    var s: [i64] = []
+    for i in 0..256 {
+        let x = inverse[i]
+        // The affine step, written as the rotations it is defined by.
+        let t = x.bit_xor(rotl8(x, 1)).bit_xor(rotl8(x, 2))
+            .bit_xor(rotl8(x, 3)).bit_xor(rotl8(x, 4)).bit_xor(99)
+        s.push(m8(t))
+    }
+    s
+}
+
+fn rotl8(v: i64, n: i64) -> i64 {
+    m8(v.shl(n).bit_or(m8(v).ushr(8 - n)))
+}
+
+fn inverse_sbox(s: [i64]) -> [i64] {
+    var inv: [i64] = []
+    for _i in 0..256 {
+        inv.push(0)
+    }
+    for i in 0..256 {
+        inv[s[i]] = i
+    }
+    inv
+}
+
+/// A key, expanded, with the tables it needs.
+///
+/// The S-box is built once here rather than inside `encrypt_block`. The first
+/// version generated it per block — a 256 by 256 search for multiplicative
+/// inverses, sixty-five thousand field multiplications, to encrypt sixteen
+/// bytes. Every vector still passed; the demo took over ten minutes. Grasm has
+/// no module-level mutable state, so "compute it once" has to mean "put it in
+/// a value the caller holds", which is what this is.
+type Cipher = {
+    round_keys: [i64],
+    table: [i64],
+}
+
+pub fn new_cipher(key: bytes) -> Cipher {
+    let s = sbox()
+    Cipher{ round_keys: expand_key_with(key, s), table: s }
+}
+
+/// Expand a key into the round keys.
+pub fn expand_key(key: bytes) -> [i64] {
+    expand_key_with(key, sbox())
+}
+
+fn expand_key_with(key: bytes, s: [i64]) -> [i64] {
+    let nk = key.len() / 4
+    let rounds = nk + 6
+    var w: [i64] = []
+    for i in 0..nk {
+        w.push(m32(key.at(i * 4).shl(24).bit_or(key.at(i * 4 + 1).shl(16))
+            .bit_or(key.at(i * 4 + 2).shl(8)).bit_or(key.at(i * 4 + 3))))
+    }
+    var rcon = 1
+    for i in nk..(4 * (rounds + 1)) {
+        var temp = w[i - 1]
+        if i % nk == 0 {
+            temp = sub_word(s, m32(temp.shl(8).bit_or(temp.ushr(24))))
+            temp = temp.bit_xor(m32(rcon.shl(24)))
+            rcon = gf_mul(rcon, 2)
+        } else if nk > 6 and i % nk == 4 {
+            temp = sub_word(s, temp)
+        }
+        w.push(m32(w[i - nk].bit_xor(temp)))
+    }
+    w
+}
+
+fn sub_word(s: [i64], w: i64) -> i64 {
+    var out = 0
+    for i in 0..4 {
+        out = out.bit_or(s[m8(w.ushr((3 - i) * 8))].shl((3 - i) * 8))
+    }
+    m32(out)
+}
+
+/// Encrypt one sixteen-byte block.
+pub fn encrypt_block(round_keys: [i64], block: bytes) -> bytes {
+    encrypt_with(Cipher{ round_keys: round_keys, table: sbox() }, block)
+}
+
+pub fn encrypt_with(c: Cipher, block: bytes) -> bytes {
+    let s = c.table
+    let round_keys = c.round_keys
+    let rounds = round_keys.len() / 4 - 1
+    var state: [i64] = []
+    for i in 0..16 {
+        state.push(block.at(i))
+    }
+    add_round_key(state, round_keys, 0)
+    for r in 1..rounds {
+        sub_bytes(state, s)
+        shift_rows(state)
+        mix_columns(state)
+        add_round_key(state, round_keys, r)
+    }
+    // The last round has no MixColumns, which is not an optimisation: with it
+    // the cipher would be its own inverse in a way that breaks the structure.
+    sub_bytes(state, s)
+    shift_rows(state)
+    add_round_key(state, round_keys, rounds)
+    bytes_of(state)
+}
+
+fn add_round_key(inout state: [i64], w: [i64], round: i64) {
+    for c in 0..4 {
+        let word = w[round * 4 + c]
+        for r in 0..4 {
+            state[c * 4 + r] = state[c * 4 + r].bit_xor(m8(word.ushr((3 - r) * 8)))
+        }
+    }
+}
+
+fn sub_bytes(inout state: [i64], s: [i64]) {
+    for i in 0..16 {
+        state[i] = s[state[i]]
+    }
+}
+
+/// Rows one, two and three rotate left by one, two and three.
+///
+/// The state is stored column-major, as the specification defines it, so byte
+/// `c * 4 + r` is row `r` of column `c` — laying it out row-major instead is
+/// the classic way to get a cipher that is self-consistent and matches nothing.
+fn shift_rows(inout state: [i64]) {
+    for r in 1..4 {
+        var row: [i64] = []
+        for c in 0..4 {
+            row.push(state[c * 4 + r])
+        }
+        for c in 0..4 {
+            state[c * 4 + r] = row[(c + r) % 4]
+        }
+    }
+}
+
+fn mix_columns(inout state: [i64]) {
+    for c in 0..4 {
+        let a0 = state[c * 4]
+        let a1 = state[c * 4 + 1]
+        let a2 = state[c * 4 + 2]
+        let a3 = state[c * 4 + 3]
+        state[c * 4] = gf_mul(a0, 2).bit_xor(gf_mul(a1, 3)).bit_xor(a2).bit_xor(a3)
+        state[c * 4 + 1] = a0.bit_xor(gf_mul(a1, 2)).bit_xor(gf_mul(a2, 3)).bit_xor(a3)
+        state[c * 4 + 2] = a0.bit_xor(a1).bit_xor(gf_mul(a2, 2)).bit_xor(gf_mul(a3, 3))
+        state[c * 4 + 3] = gf_mul(a0, 3).bit_xor(a1).bit_xor(a2).bit_xor(gf_mul(a3, 2))
+    }
+}
+
+/// AES-CTR, which is what GCM encrypts with.
+pub fn ctr(round_keys: [i64], nonce: bytes, initial: i64, data: bytes) -> bytes {
+    ctr_with(Cipher{ round_keys: round_keys, table: sbox() }, nonce, initial, data)
+}
+
+pub fn ctr_with(c: Cipher, nonce: bytes, initial: i64, data: bytes) -> bytes {
+    var out: [i64] = []
+    var counter = initial
+    var at = 0
+    while at < data.len() {
+        var block: [i64] = []
+        for i in 0..12 {
+            block.push(if i < nonce.len() { nonce.at(i) } else { 0 })
+        }
+        for i in 0..4 {
+            block.push(counter.ushr((3 - i) * 8).bit_and(255))
+        }
+        let stream = encrypt_with(c, bytes_of(block))
+        let n = if data.len() - at < 16 { data.len() - at } else { 16 }
+        for i in 0..n {
+            out.push(data.at(at + i).bit_xor(stream.at(i)))
+        }
+        at = at + 16
+        counter = counter + 1
+    }
+    bytes_of(out)
+}
+
+// --- GCM ---------------------------------------------------------------------
+//
+// Galois/Counter Mode: AES-CTR for confidentiality, and a multiplication in
+// GF(2^128) for authenticity. The multiplication is the whole of GHASH, and
+// the field's bit order is reversed from the way anyone would write it — bit 0
+// of the first byte is the *most* significant coefficient — which is the one
+// thing that makes a from-scratch GHASH disagree with every implementation.
+
+type Gf128 = {
+    high: i64,
+    low: i64,
+}
+
+fn gf128_of(b: bytes, at: i64) -> Gf128 {
+    var h = 0
+    var l = 0
+    for i in 0..8 {
+        h = h.shl(8).bit_or(b.at(at + i))
+    }
+    for i in 8..16 {
+        l = l.shl(8).bit_or(b.at(at + i))
+    }
+    Gf128{ high: h, low: l }
+}
+
+fn gf128_bytes(v: Gf128) -> [i64] {
+    var out: [i64] = []
+    for i in 0..8 {
+        out.push(v.high.ushr((7 - i) * 8).bit_and(255))
+    }
+    for i in 0..8 {
+        out.push(v.low.ushr((7 - i) * 8).bit_and(255))
+    }
+    out
+}
+
+/// Multiply in GF(2^128), the field GHASH is defined over.
+///
+/// Shift-and-add, one bit at a time, most significant first — and the shift is
+/// to the *right* because of the reversed bit order, with the reducing
+/// polynomial folded in at the bottom rather than the top. Writing it the
+/// natural way gives a tag that is self-consistent and matches nothing.
+fn gf128_mul(x: Gf128, y: Gf128) -> Gf128 {
+    var zh = 0
+    var zl = 0
+    var vh = y.high
+    var vl = y.low
+    for i in 0..128 {
+        let bit = if i < 64 {
+            x.high.ushr(63 - i).bit_and(1)
+        } else {
+            x.low.ushr(127 - i).bit_and(1)
+        }
+        if bit != 0 {
+            zh = zh.bit_xor(vh)
+            zl = zl.bit_xor(vl)
+        }
+        let lsb = vl.bit_and(1)
+        vl = vl.ushr(1).bit_or(vh.shl(63))
+        vh = vh.ushr(1)
+        if lsb != 0 {
+            // 0xE1 in the top byte: the reduction, reversed like everything
+            // else here.
+            vh = vh.bit_xor(0 - 2233785415175766016)
+        }
+    }
+    Gf128{ high: zh, low: zl }
+}
+
+fn ghash(h: Gf128, data: bytes) -> Gf128 {
+    var y = Gf128{ high: 0, low: 0 }
+    var at = 0
+    while at < data.len() {
+        var block: [i64] = []
+        for i in 0..16 {
+            block.push(if at + i < data.len() { data.at(at + i) } else { 0 })
+        }
+        let b = gf128_of(bytes_of(block), 0)
+        y = gf128_mul(Gf128{ high: y.high.bit_xor(b.high), low: y.low.bit_xor(b.low) }, h)
+        at = at + 16
+    }
+    y
+}
+
+fn padded_to_block(n: i64) -> i64 {
+    if n % 16 == 0 {
+        n
+    } else {
+        n + 16 - n % 16
+    }
+}
+
+/// Seal with AES-GCM: ciphertext then a sixteen-byte tag.
+///
+/// The counter starts at 2. Block 1 is the keystream for the first plaintext
+/// block, and block **0** is reserved for the value that masks the tag — a
+/// GCM that starts at 1 produces a tag anyone can forge, because the mask is
+/// then also a keystream block the attacker has seen.
+pub fn gcm_seal(key: bytes, nonce: bytes, aad: bytes, plaintext: bytes) -> bytes {
+    gcm_seal_with(new_cipher(key), nonce, aad, plaintext)
+}
+
+pub fn gcm_seal_with(c: Cipher, nonce: bytes, aad: bytes, plaintext: bytes) -> bytes {
+    var zeros: [i64] = []
+    for _i in 0..16 {
+        zeros.push(0)
+    }
+    let h = gf128_of(encrypt_with(c, bytes_of(zeros)), 0)
+    let ciphertext = ctr_with(c, nonce, 2, plaintext)
+
+    var authenticated: [i64] = []
+    for b in aad.to_list() {
+        authenticated.push(b)
+    }
+    while authenticated.len() < padded_to_block(aad.len()) {
+        authenticated.push(0)
+    }
+    for b in ciphertext.to_list() {
+        authenticated.push(b)
+    }
+    while authenticated.len() < padded_to_block(aad.len()) + padded_to_block(ciphertext.len()) {
+        authenticated.push(0)
+    }
+    // The lengths, in *bits*, as two 64-bit numbers. Counting bytes here is a
+    // mistake that passes every test with a message whose length is a multiple
+    // of eight, which is all of them until it is not.
+    for i in 0..8 {
+        authenticated.push((aad.len() * 8).ushr((7 - i) * 8).bit_and(255))
+    }
+    for i in 0..8 {
+        authenticated.push((ciphertext.len() * 8).ushr((7 - i) * 8).bit_and(255))
+    }
+
+    let s = ghash(h, bytes_of(authenticated))
+    let mask = ctr_with(c, nonce, 1, bytes_of(gf128_bytes(Gf128{ high: 0, low: 0 })))
+    var out = ciphertext.to_list()
+    let tag_bytes = gf128_bytes(s)
+    for i in 0..16 {
+        out.push(tag_bytes[i].bit_xor(mask.at(i)))
+    }
+    bytes_of(out)
+}
+
+type GcmError =
+    | NotAuthentic
+
+/// Open, verifying before decrypting.
+pub fn gcm_open(key: bytes, nonce: bytes, aad: bytes, sealed: bytes) -> bytes ! GcmError {
+    try gcm_open_with(new_cipher(key), nonce, aad, sealed)
+}
+
+pub fn gcm_open_with(c: Cipher, nonce: bytes, aad: bytes, sealed: bytes) -> bytes ! GcmError {
+    if sealed.len() < 16 {
+        fail(NotAuthentic)
+    }
+    let cut = sealed.len() - 16
+    let ciphertext = sealed.slice(0, cut)
+    // Decrypt first, then reseal *that* and compare tags. CTR is its own
+    // inverse, so recovering the plaintext costs nothing extra and the tag it
+    // implies is the one the sender would have computed.
+    let plaintext = ctr_with(c, nonce, 2, ciphertext)
+    let resealed = gcm_seal_with(c, nonce, aad, plaintext)
+    // Compared without branching on the answer. A comparison that returned as
+    // soon as two bytes differed would tell an attacker how much of a forged
+    // tag was right, which is enough to find the rest a byte at a time.
+    var difference = 0
+    for i in 0..16 {
+        difference = difference.bit_or(resealed.at(cut + i).bit_xor(sealed.at(cut + i)))
+    }
+    if difference != 0 {
+        fail(NotAuthentic)
+    }
+    plaintext
+}

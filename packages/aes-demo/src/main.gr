@@ -1,0 +1,128 @@
+import aes
+import bytes_codec
+
+fn unhex(s: str) -> bytes {
+    match bytes_codec.decode_hex(s) {
+        Some(b) -> b
+        None -> panic("not hex")
+    }
+}
+fn hex(b: bytes) -> str { bytes_codec.encode_hex(b) }
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+
+    print("-- AES, against FIPS-197")
+    let s = aes.sbox()
+    say(f, "the S-box starts 63 7c 77 7b",
+        s[0] == 99 and s[1] == 124 and s[2] == 119 and s[3] == 123)
+    say(f, "and ends 41 99 2d 0f b0 54 bb 16",
+        s[248] == 65 and s[255] == 22)
+    say(f, "AES-128 appendix B",
+        hex(aes.encrypt_block(aes.expand_key(unhex("000102030405060708090a0b0c0d0e0f")),
+            unhex("00112233445566778899aabbccddeeff")))
+        == "69c4e0d86a7b0430d8cdb78070b4c55a")
+    say(f, "AES-192",
+        hex(aes.encrypt_block(aes.expand_key(unhex("000102030405060708090a0b0c0d0e0f1011121314151617")),
+            unhex("00112233445566778899aabbccddeeff")))
+        == "dda97ca4864cdfe06eaf70a0ec0d7191")
+    say(f, "AES-256",
+        hex(aes.encrypt_block(aes.expand_key(unhex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")),
+            unhex("00112233445566778899aabbccddeeff")))
+        == "8ea2b7ca516745bfeafc49904b496089")
+
+    // Every one of these came from the specification, and the first attempt at
+    // case 4's tag did not — it was written from memory and was wrong while
+    // the code was right. That is the fourth time this session, and the reason
+    // a vector has to be transcribed rather than recalled.
+    print("-- AES-GCM, against the NIST vectors")
+    let zero_key = unhex("00000000000000000000000000000000")
+    let zero_nonce = unhex("000000000000000000000000")
+    say(f, "case 1: nothing at all",
+        hex(aes.gcm_seal(zero_key, zero_nonce, bytes_of([]), bytes_of([])))
+        == "58e2fccefa7e3061367f1d57a4e7455a")
+    say(f, "case 2: one zero block",
+        hex(aes.gcm_seal(zero_key, zero_nonce, bytes_of([]),
+            unhex("00000000000000000000000000000000")))
+        == "0388dace60b6a392f328c2b971b2fe78ab6e47d42cec13bdf53a67b21257bddf")
+    let k3 = unhex("feffe9928665731c6d6a8f9467308308")
+    let n3 = unhex("cafebabefacedbaddecaf888")
+    let p3 = unhex("d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b391aafd255")
+    say(f, "case 3: four blocks, no associated data",
+        hex(aes.gcm_seal(k3, n3, bytes_of([]), p3))
+        == "42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e035c17e2329aca12e21d514b25466931c7d8f6a5aac84aa051ba30b396a0aac973d58e091473f59854d5c2af327cd64a62cf35abd2ba6fab4")
+    // Case 4 has associated data, which is the path TLS actually uses.
+    let aad4 = unhex("feedfacedeadbeeffeedfacedeadbeefabaddad2")
+    let p4 = unhex("d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39")
+    say(f, "case 4: associated data, which is what TLS uses",
+        hex(aes.gcm_seal(k3, n3, aad4, p4))
+        == "42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e035c17e2329aca12e21d514b25466931c7d8f6a5aac84aa051ba30b396a0aac973d58e0915bc94fbc3221a5db94fae95ae7121a47")
+
+    print("-- opening")
+    let sealed = aes.gcm_seal(k3, n3, aad4, p4)
+    match aes.gcm_open(k3, n3, aad4, sealed) {
+        Ok(back) -> say(f, "a sealed message opens to what went in", hex(back) == hex(p4))
+        Err(_e) -> say(f, "a sealed message opens", false)
+    }
+    say(f, "a flipped ciphertext byte is refused", not opens(k3, n3, aad4, flip(sealed, 3)))
+    say(f, "a flipped tag byte is refused",
+        not opens(k3, n3, aad4, flip(sealed, sealed.len() - 2)))
+    say(f, "different associated data is refused",
+        not opens(k3, n3, unhex("00"), sealed))
+    say(f, "a different nonce is refused",
+        not opens(k3, unhex("000000000000000000000000"), aad4, sealed))
+    say(f, "a different key is refused", not opens(zero_key, n3, aad4, sealed))
+    say(f, "something too short to hold a tag is refused",
+        not opens(k3, n3, aad4, unhex("0011")))
+
+    print("-- round trips at every length around a block boundary")
+    // One cipher for the whole loop: building it per call was the difference
+    // between forty-seven seconds and ten minutes before the S-box got a
+    // logarithm table, and it is still the right shape.
+    let c = aes.new_cipher(k3)
+    var all = true
+    for n in [0, 1, 15, 16, 17, 31, 32, 33, 100] {
+        var buf: [i64] = []
+        for i in 0..n {
+            buf.push((i * 7 + 3).bit_and(255))
+        }
+        let m = bytes_of(buf)
+        match aes.gcm_open_with(c, n3, aad4, aes.gcm_seal_with(c, n3, aad4, m)) {
+            Ok(back) -> {
+                if hex(back) != hex(m) {
+                    all = false
+                }
+            }
+            Err(_e) -> all = false
+        }
+    }
+    say(f, "0, 1, 15, 16, 17, 31, 32, 33 and 100 bytes all round-trip", all)
+
+    if f == 0 {
+        print("all checks passed")
+    } else {
+        print("{f} check(s) failed")
+    }
+}
+
+fn opens(k: bytes, n: bytes, aad: bytes, sealed: bytes) -> bool {
+    match aes.gcm_open(k, n, aad, sealed) {
+        Ok(_b) -> true
+        Err(_e) -> false
+    }
+}
+
+fn flip(b: bytes, at: i64) -> bytes {
+    var out = b.to_list()
+    out[at] = out[at].bit_xor(1)
+    bytes_of(out)
+}
