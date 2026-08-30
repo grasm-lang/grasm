@@ -1,0 +1,49 @@
+// The Grasm half of `scripts/zlib_diff.sh`.
+//
+// Ten hand-picked streams prove the decoder handles ten shapes somebody chose.
+// The shapes that break a DEFLATE decoder are the ones nobody chooses: a
+// distance that reaches exactly to the first byte, a length symbol at the top
+// of its range, a dynamic table whose repeat codes land on a boundary. So this
+// reads a file of streams a real zlib produced from random data and says what
+// each one decompresses to, and the script compares.
+//
+// It runs the other direction too: given raw data, it writes a stream, and the
+// script checks that a real zlib reads it. A codec that only agrees with
+// itself has not been checked at all.
+//
+// With no arguments it prints nothing and exits 0, which is what the corpus
+// gates run it as.
+
+import zlib
+import bytes_codec
+
+fn unhex(s: str) -> bytes {
+    match bytes_codec.decode_hex(s) {
+        Some(b) -> b
+        None -> panic("not hex")
+    }
+}
+
+fn main() / {io} {
+    let argv = args()
+    if argv.len() == 0 {
+        return
+    }
+    let text = match read_file(argv[0]) {
+        Ok(t) -> t
+        Err(_e) -> panic("cannot read {argv[0]}")
+    }
+    for line in text.lines() {
+        if line.len() > 0 {
+            let parts = line.split(" ")
+            if parts[0] == "inflate" {
+                match zlib.decompress(unhex(parts[1]), 50000000) {
+                    Ok(b) -> print(bytes_codec.encode_hex(b))
+                    Err(_e) -> print("REFUSED")
+                }
+            } else if parts[0] == "deflate" {
+                print(bytes_codec.encode_hex(zlib.compress_stored(unhex(parts[1]))))
+            }
+        }
+    }
+}

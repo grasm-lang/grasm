@@ -1,0 +1,123 @@
+// SHA-1, because Git names every object with one.
+//
+// **This is not here as a security primitive.** SHA-1 is broken for that:
+// chosen-prefix collisions are practical and have been demonstrated. It is
+// here because a Git repository on disk is addressed by SHA-1 and a program
+// that reads one has no choice about which hash the bytes were named with.
+// Anything in this repository that needs a hash to *resist an attacker* uses
+// BLAKE2s ([packages/blake2s]).
+//
+// Grasm has one integer type and SHA-1 is defined on 32-bit words, so every
+// intermediate is masked back to 32. A release build wraps silently and a
+// debug build checks overflow, so an implementation relying on wraparound
+// would work where people ship and crash where the gates run.
+
+fn m32(v: i64) -> i64 {
+    v.bit_and(4294967295)
+}
+
+fn add32(a: i64, b: i64) -> i64 {
+    m32(a + b)
+}
+
+fn rotl32(v: i64, n: i64) -> i64 {
+    let x = m32(v)
+    m32(x.shl(n).bit_or(x.ushr(32 - n)))
+}
+
+/// The padded message: the bytes, a one bit, zeros, and the bit length.
+///
+/// The length is **big-endian** and it is sixty-four bits. Writing it
+/// little-endian, or as thirty-two, is the classic way to produce a hash that
+/// agrees with the vectors for short inputs and diverges for long ones.
+fn padded(message: bytes) -> [i64] {
+    var out = message.to_list()
+    let bits = message.len() * 8
+    out.push(128)
+    while out.len() % 64 != 56 {
+        out.push(0)
+    }
+    for i in 0..8 {
+        out.push(bits.ushr((7 - i) * 8).bit_and(255))
+    }
+    out
+}
+
+/// The digest of a message, twenty bytes.
+pub fn hash(message: bytes) -> bytes {
+    var h0 = 1732584193
+    var h1 = 4023233417
+    var h2 = 2562383102
+    var h3 = 271733878
+    var h4 = 3285377520
+
+    let block = padded(message)
+    var at = 0
+    while at < block.len() {
+        var w: [i64] = []
+        for i in 0..16 {
+            let j = at + i * 4
+            w.push(m32(block[j].shl(24).bit_or(block[j + 1].shl(16))
+                       .bit_or(block[j + 2].shl(8)).bit_or(block[j + 3])))
+        }
+        // The message schedule. The rotate by one is what distinguishes SHA-1
+        // from SHA-0, and leaving it out gives a hash that is self-consistent
+        // and matches nothing.
+        for i in 16..80 {
+            w.push(rotl32(w[i - 3].bit_xor(w[i - 8]).bit_xor(w[i - 14]).bit_xor(w[i - 16]), 1))
+        }
+
+        var a = h0
+        var b = h1
+        var c = h2
+        var d = h3
+        var e = h4
+        for i in 0..80 {
+            var f = 0
+            var k = 0
+            if i < 20 {
+                f = b.bit_and(c).bit_or(b.bit_not().bit_and(d))
+                k = 1518500249
+            } else if i < 40 {
+                f = b.bit_xor(c).bit_xor(d)
+                k = 1859775393
+            } else if i < 60 {
+                f = b.bit_and(c).bit_or(b.bit_and(d)).bit_or(c.bit_and(d))
+                k = 2400959708
+            } else {
+                f = b.bit_xor(c).bit_xor(d)
+                k = 3395469782
+            }
+            let t = add32(add32(add32(rotl32(a, 5), m32(f)), add32(e, k)), w[i])
+            e = d
+            d = c
+            c = rotl32(b, 30)
+            b = a
+            a = t
+        }
+        h0 = add32(h0, a)
+        h1 = add32(h1, b)
+        h2 = add32(h2, c)
+        h3 = add32(h3, d)
+        h4 = add32(h4, e)
+        at = at + 64
+    }
+
+    var out: [i64] = []
+    for word in [h0, h1, h2, h3, h4] {
+        for i in 0..4 {
+            out.push(word.ushr((3 - i) * 8).bit_and(255))
+        }
+    }
+    bytes_of(out)
+}
+
+/// The digest as forty lowercase hex characters, which is how Git writes it.
+pub fn hex(message: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var s = ""
+    for v in hash(message).to_list() {
+        s = s + digits.substr(v / 16, 1) + digits.substr(v % 16, 1)
+    }
+    s
+}

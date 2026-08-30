@@ -1,0 +1,8 @@
+[package]
+name = "sha1_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.sha1]
+path = "../sha1"
+version = "^1.0.0"

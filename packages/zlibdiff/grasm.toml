@@ -1,0 +1,12 @@
+[package]
+name = "zlibdiff"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.zlib]
+path = "../zlib"
+version = "^1.0.0"
+
+[dependencies.bytes_codec]
+path = "../bytes"
+version = "^1.0.0"

@@ -1,0 +1,6 @@
+[package]
+name = "zlib"
+version = "1.0.0"
+
+# Bytes in, bytes out. Opens nothing.
+capabilities = []

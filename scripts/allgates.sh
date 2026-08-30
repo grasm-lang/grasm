@@ -52,6 +52,7 @@ run_gate crosstest     scripts/crosstest.sh
 run_gate grasmwire     scripts/grasmwire_e2e.sh
 run_gate cryptodiff    scripts/crypto_diff.sh
 run_gate kvcrash       scripts/kvstore_crash.sh
+run_gate zlibdiff      scripts/zlib_diff.sh
 run_gate northstar     scripts/northstar.sh
 run_gate gold          ProjectGold/run.sh
 run_gate findings      scripts/findings_index.sh --check

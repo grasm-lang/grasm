@@ -1,0 +1,455 @@
+// DEFLATE and the zlib wrapper — RFC 1951 and RFC 1950.
+//
+// Git compresses every object it stores, so a program that reads a repository
+// has to decompress before it can parse anything. There is no way around it
+// and no way to do it partially: a loose object is one zlib stream and a
+// packfile is thousands.
+//
+// **The decoder is the half that matters and the half that is dangerous.**
+// Every byte it reads came off a disk or a network, so it is reading input an
+// attacker may have chosen. A decompressor that trusts its input is a way to
+// make a program allocate forever, index past the end of a buffer, or loop
+// without end. Each of those is refused here explicitly rather than by luck,
+// and the refusals are what most of the tests are about.
+//
+// Bits within a byte are read **least significant first**, which is the thing
+// about DEFLATE that surprises everyone once. Huffman codes, though, are
+// packed most significant bit first. Both are true at the same time and
+// mixing them up produces a decoder that works on stored blocks and fails on
+// everything else.
+
+/// A position in a bit stream, and whether it has run out.
+type Bits = {
+    data: bytes,
+    at: i64,
+    bit: i64,
+    spent: bool,
+}
+
+/// A canonical Huffman table: how many codes of each length, and the symbols
+/// in code order.
+type Huffman = {
+    counts: [i64],
+    symbols: [i64],
+}
+
+type InflateError =
+    | Truncated(at: i64)
+    | BadBlockType(kind: i64)
+    | BadStoredLength(len: i64, nlen: i64)
+    | BadCode(what: str)
+    | DistanceTooFar(distance: i64, have: i64)
+    | TooLarge(limit: i64)
+    | BadHeader(why: str)
+    | BadChecksum(want: i64, got: i64)
+
+fn max_bits() -> i64 { 15 }
+
+fn reader_of(data: bytes) -> Bits {
+    Bits{ data: data, at: 0, bit: 0, spent: false }
+}
+
+/// One bit, least significant first within each byte.
+///
+/// Running out sets `spent` rather than failing here, so the caller can decide
+/// what a truncated stream means at the point it matters. A reader that kept
+/// answering zero past the end would turn a truncated file into a silently
+/// wrong answer.
+fn take_bit(inout r: Bits) -> i64 {
+    if r.at >= r.data.len() {
+        r.spent = true
+        return 0
+    }
+    let v = r.data.at(r.at).ushr(r.bit).bit_and(1)
+    r.bit = r.bit + 1
+    if r.bit == 8 {
+        r.bit = 0
+        r.at = r.at + 1
+    }
+    v
+}
+
+/// `n` bits as a number, first bit read being the least significant.
+fn take_bits(inout r: Bits, n: i64) -> i64 {
+    var v = 0
+    for i in 0..n {
+        v = v.bit_or(take_bit(r).shl(i))
+    }
+    v
+}
+
+fn align_to_byte(inout r: Bits) {
+    if r.bit != 0 {
+        r.bit = 0
+        r.at = r.at + 1
+    }
+}
+
+/// Build a canonical Huffman table from code lengths.
+///
+/// A length of zero means the symbol is not used. The table is the counts per
+/// length and the symbols sorted by length then by symbol, which is exactly
+/// what canonical coding means and is what lets the decoder walk lengths
+/// without ever materialising a code.
+fn build(lengths: [i64]) -> Huffman {
+    var counts: [i64] = []
+    for _i in 0..(max_bits() + 1) {
+        counts.push(0)
+    }
+    for l in lengths {
+        counts[l] = counts[l] + 1
+    }
+    counts[0] = 0
+    var offsets: [i64] = []
+    for _i in 0..(max_bits() + 2) {
+        offsets.push(0)
+    }
+    for l in 1..(max_bits() + 1) {
+        offsets[l + 1] = offsets[l] + counts[l]
+    }
+    var symbols: [i64] = []
+    for _i in 0..lengths.len() {
+        symbols.push(0)
+    }
+    for s in 0..lengths.len() {
+        if lengths[s] != 0 {
+            symbols[offsets[lengths[s]]] = s
+            offsets[lengths[s]] = offsets[lengths[s]] + 1
+        }
+    }
+    Huffman{ counts: counts, symbols: symbols }
+}
+
+/// Decode one symbol.
+///
+/// Codes are packed most significant bit first, so the accumulator is shifted
+/// left as bits arrive — the opposite of how `take_bits` assembles a number,
+/// and the distinction the whole format turns on.
+///
+/// A code that is not in the table is refused rather than returning a symbol
+/// that happens to be in range: an incomplete table is something a crafted
+/// stream contains on purpose.
+fn decode(inout r: Bits, t: Huffman) -> i64 ! InflateError {
+    var code = 0
+    var first = 0
+    var index = 0
+    for len in 1..(max_bits() + 1) {
+        code = code.bit_or(take_bit(r))
+        if r.spent {
+            fail(Truncated(r.at))
+        }
+        let count = t.counts[len]
+        if code - first < count {
+            return t.symbols[index + (code - first)]
+        }
+        index = index + count
+        first = (first + count).shl(1)
+        code = code.shl(1)
+    }
+    fail(BadCode("a code longer than fifteen bits"))
+}
+
+fn length_base() -> [i64] {
+    [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31,
+     35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258]
+}
+
+fn length_extra() -> [i64] {
+    [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
+     3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0]
+}
+
+fn distance_base() -> [i64] {
+    [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193,
+     257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145,
+     8193, 12289, 16385, 24577]
+}
+
+fn distance_extra() -> [i64] {
+    [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6,
+     7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13]
+}
+
+/// The fixed tables of RFC 1951 section 3.2.6, which a fixed-Huffman block
+/// uses instead of carrying its own.
+fn fixed_literal() -> Huffman {
+    var lengths: [i64] = []
+    for i in 0..288 {
+        if i < 144 {
+            lengths.push(8)
+        } else if i < 256 {
+            lengths.push(9)
+        } else if i < 280 {
+            lengths.push(7)
+        } else {
+            lengths.push(8)
+        }
+    }
+    build(lengths)
+}
+
+fn fixed_distance() -> Huffman {
+    var lengths: [i64] = []
+    for _i in 0..30 {
+        lengths.push(5)
+    }
+    build(lengths)
+}
+
+/// Decompress a raw DEFLATE stream.
+///
+/// `limit` bounds the output. It is not a tuning knob: a few bytes of crafted
+/// input expand without bound, and a decompressor with no ceiling is a way to
+/// exhaust a machine's memory from the other end of a network.
+pub fn inflate(data: bytes, limit: i64) -> bytes ! InflateError {
+    var r = reader_of(data)
+    var out: [i64] = []
+    var final_block = false
+    while not final_block {
+        final_block = take_bit(r) == 1
+        let kind = take_bits(r, 2)
+        if r.spent {
+            fail(Truncated(r.at))
+        }
+        if kind == 0 {
+            try stored(r, out, limit)
+        } else if kind == 1 {
+            try compressed(r, out, fixed_literal(), fixed_distance(), limit)
+        } else if kind == 2 {
+            let tables = try dynamic_tables(r)
+            try compressed(r, out, tables.0, tables.1, limit)
+        } else {
+            fail(BadBlockType(kind))
+        }
+    }
+    bytes_of(out)
+}
+
+/// A stored block: the bytes, uncompressed, after a length and its complement.
+///
+/// The complement is checked. It is the format's own guard against a corrupt
+/// length, and skipping it turns a damaged stream into a very large allocation.
+fn stored(inout r: Bits, inout out: [i64], limit: i64) -> () ! InflateError {
+    align_to_byte(r)
+    let len = take_bits(r, 16)
+    let nlen = take_bits(r, 16)
+    if r.spent {
+        fail(Truncated(r.at))
+    }
+    if len.bit_xor(65535) != nlen {
+        fail(BadStoredLength(len, nlen))
+    }
+    if out.len() + len > limit {
+        fail(TooLarge(limit))
+    }
+    for _i in 0..len {
+        if r.at >= r.data.len() {
+            fail(Truncated(r.at))
+        }
+        out.push(r.data.at(r.at))
+        r.at = r.at + 1
+    }
+}
+
+/// A block coded with Huffman tables, fixed or its own.
+fn compressed(inout r: Bits, inout out: [i64], lit: Huffman, dist: Huffman,
+              limit: i64) -> () ! InflateError {
+    var done = false
+    while not done {
+        let sym = try decode(r, lit)
+        if sym < 256 {
+            if out.len() >= limit {
+                fail(TooLarge(limit))
+            }
+            out.push(sym)
+        } else if sym == 256 {
+            done = true
+        } else {
+            let i = sym - 257
+            if i >= length_base().len() {
+                fail(BadCode("a length symbol above 285"))
+            }
+            let length = length_base()[i] + take_bits(r, length_extra()[i])
+            let dsym = try decode(r, dist)
+            if dsym >= distance_base().len() {
+                fail(BadCode("a distance symbol above 29"))
+            }
+            let distance = distance_base()[dsym] + take_bits(r, distance_extra()[dsym])
+            if r.spent {
+                fail(Truncated(r.at))
+            }
+            // A back-reference before the start of the output is the classic
+            // way to read memory that is not the caller's. Refused, not
+            // clamped: clamping would decompress to something plausible that
+            // the compressor never wrote.
+            if distance > out.len() {
+                fail(DistanceTooFar(distance, out.len()))
+            }
+            if out.len() + length > limit {
+                fail(TooLarge(limit))
+            }
+            // Copied one byte at a time on purpose: a run where the distance
+            // is shorter than the length repeats what this loop is producing,
+            // which is how DEFLATE expresses a repeated pattern.
+            let from = out.len() - distance
+            for k in 0..length {
+                out.push(out[from + k])
+            }
+        }
+    }
+}
+
+fn code_length_order() -> [i64] {
+    [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+}
+
+/// Read the two tables a dynamic block carries, themselves Huffman-coded.
+fn dynamic_tables(inout r: Bits) -> (Huffman, Huffman) ! InflateError {
+    let hlit = take_bits(r, 5) + 257
+    let hdist = take_bits(r, 5) + 1
+    let hclen = take_bits(r, 4) + 4
+    if r.spent {
+        fail(Truncated(r.at))
+    }
+    if hlit > 286 or hdist > 30 {
+        fail(BadCode("a table larger than the format allows"))
+    }
+    var clen: [i64] = []
+    for _i in 0..19 {
+        clen.push(0)
+    }
+    for i in 0..hclen {
+        clen[code_length_order()[i]] = take_bits(r, 3)
+    }
+    if r.spent {
+        fail(Truncated(r.at))
+    }
+    let cl_table = build(clen)
+
+    var lengths: [i64] = []
+    while lengths.len() < hlit + hdist {
+        let sym = try decode(r, cl_table)
+        if sym < 16 {
+            lengths.push(sym)
+        } else if sym == 16 {
+            if lengths.len() == 0 {
+                fail(BadCode("a repeat with nothing to repeat"))
+            }
+            let previous = lengths[lengths.len() - 1]
+            let n = 3 + take_bits(r, 2)
+            for _k in 0..n {
+                lengths.push(previous)
+            }
+        } else if sym == 17 {
+            let n = 3 + take_bits(r, 3)
+            for _k in 0..n {
+                lengths.push(0)
+            }
+        } else {
+            let n = 11 + take_bits(r, 7)
+            for _k in 0..n {
+                lengths.push(0)
+            }
+        }
+        if r.spent {
+            fail(Truncated(r.at))
+        }
+    }
+    if lengths.len() != hlit + hdist {
+        // A repeat that ran past the end of the table is a crafted stream, not
+        // a rounding difference.
+        fail(BadCode("the code lengths overrun the table"))
+    }
+    var lit: [i64] = []
+    var dist: [i64] = []
+    for i in 0..hlit {
+        lit.push(lengths[i])
+    }
+    for i in hlit..(hlit + hdist) {
+        dist.push(lengths[i])
+    }
+    (build(lit), build(dist))
+}
+
+/// Adler-32, the checksum a zlib stream ends with.
+pub fn adler32(b: bytes) -> i64 {
+    var a = 1
+    var s = 0
+    for i in 0..b.len() {
+        a = (a + b.at(i)) % 65521
+        s = (s + a) % 65521
+    }
+    s * 65536 + a
+}
+
+/// Decompress a zlib stream: the two-byte header, the data, the checksum.
+///
+/// The checksum is verified. Git's own reader does, and a stream that
+/// decompresses to something other than what was compressed is exactly what a
+/// checksum is for.
+pub fn decompress(data: bytes, limit: i64) -> bytes ! InflateError {
+    if data.len() < 6 {
+        fail(BadHeader("a zlib stream is at least six bytes"))
+    }
+    let cmf = data.at(0)
+    let flg = data.at(1)
+    if cmf.bit_and(15) != 8 {
+        fail(BadHeader("the compression method is not deflate"))
+    }
+    if (cmf * 256 + flg) % 31 != 0 {
+        fail(BadHeader("the header check fails"))
+    }
+    if flg.bit_and(32) != 0 {
+        fail(BadHeader("a preset dictionary is not supported"))
+    }
+    let body = data.slice(2, data.len() - 6)
+    let out = try inflate(body, limit)
+    let want = data.at(data.len() - 4).shl(24)
+        .bit_or(data.at(data.len() - 3).shl(16))
+        .bit_or(data.at(data.len() - 2).shl(8))
+        .bit_or(data.at(data.len() - 1))
+    let got = adler32(out)
+    if want != got {
+        fail(BadChecksum(want, got))
+    }
+    out
+}
+
+/// Compress as stored blocks: a valid zlib stream that no one has to guess at.
+///
+/// **This does not compress.** Stored blocks are what DEFLATE calls data it
+/// chose not to code, and they are legal, so anything that reads zlib — Git
+/// included — reads this. Saying so plainly is better than a Huffman coder
+/// that is subtly wrong: a reader that cannot decompress what was written is
+/// a repository nobody can open.
+pub fn compress_stored(data: bytes) -> bytes {
+    var out: [i64] = [120, 1]
+    let block = 65535
+    var at = 0
+    if data.len() == 0 {
+        out.push(1)
+        out.push(0)
+        out.push(0)
+        out.push(255)
+        out.push(255)
+    }
+    while at < data.len() {
+        let n = if data.len() - at < block { data.len() - at } else { block }
+        let last = if at + n >= data.len() { 1 } else { 0 }
+        out.push(last)
+        out.push(n.bit_and(255))
+        out.push(n.ushr(8).bit_and(255))
+        out.push(n.bit_xor(65535).bit_and(255))
+        out.push(n.bit_xor(65535).ushr(8).bit_and(255))
+        for i in 0..n {
+            out.push(data.at(at + i))
+        }
+        at = at + n
+    }
+    let sum = adler32(data)
+    out.push(sum.ushr(24).bit_and(255))
+    out.push(sum.ushr(16).bit_and(255))
+    out.push(sum.ushr(8).bit_and(255))
+    out.push(sum.bit_and(255))
+    bytes_of(out)
+}

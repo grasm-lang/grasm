@@ -1,0 +1,78 @@
+import sha1
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn check(inout f: i64, name: str, input: str, want: str) / {io} {
+    let got = sha1.hex(input.to_bytes())
+    if got == want {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        print("        got  {got}")
+        print("        want {want}")
+        f = f + 1
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+
+    print("-- FIPS 180-1 and the usual published vectors")
+    check(f, "the empty string", "", "da39a3ee5e6b4b0d3255bfef95601890afd80709")
+    check(f, "\"abc\"", "abc", "a9993e364706816aba3e25717850c26c9cd0d89d")
+    check(f, "the 56-byte vector", "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+        "84983e441c3bd26ebaae4aa1f95129e5e54670f1")
+    check(f, "\"The quick brown fox jumps over the lazy dog\"",
+        "The quick brown fox jumps over the lazy dog",
+        "2fd4e1c67a2d28fced849ee1bb76e7391b93eb12")
+    check(f, "the same with a full stop",
+        "The quick brown fox jumps over the lazy dog.",
+        "408d94384216f890ff7a0c3528e8bed1e0b01621")
+
+    print("-- the block boundaries, where padding goes wrong")
+    // These five were checked against an independent implementation rather
+    // than written from memory. The first attempt at the 56-byte one was
+    // wrong — the code disagreed and the code was right — which is the whole
+    // reason a vector has to come from somewhere.
+    // 55 bytes fits with the length; 56 forces a second block; 64 is exact.
+    check(f, "55 bytes", "a".repeat(55), "c1c8bbdc22796e28c0e15163d20899b65621d65a")
+    check(f, "56 bytes", "a".repeat(56), "c2db330f6083854c99d4b5bfb6e8f29f201be699")
+    check(f, "63 bytes", "a".repeat(63), "03f09f5b158a7a8cdad920bddc29b81c18a551f5")
+    check(f, "64 bytes", "a".repeat(64), "0098ba824b5c16427bd7a1122a5a442a25ec644d")
+    check(f, "65 bytes", "a".repeat(65), "11655326c708d70319be2610e8a57d9a5b959d3b")
+    check(f, "a million a's", "a".repeat(1000000),
+        "34aa973cd4c4daa4f61eeb2bdbad27316534016f")
+
+    print("-- how Git names a blob")
+    // A Git object is its type, a space, its length, a zero byte, then the
+    // content — and the object's name is the SHA-1 of all of that, not of the
+    // content alone. `git hash-object` on a file holding "hello\n" gives this.
+    let blob = "blob 6\u{0000}hello\n"
+    say(f, "a blob of \"hello\\n\" is ce013625030ba8db...",
+        sha1.hex(blob.to_bytes()) == "ce013625030ba8dba906f756967f9e9ca394464a")
+    let empty_blob = "blob 0\u{0000}"
+    say(f, "the empty blob is e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+        sha1.hex(empty_blob.to_bytes()) == "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391")
+
+    print("-- bytes, not text")
+    say(f, "a zero byte is hashed, not treated as an end",
+        sha1.hex(bytes_of([0])) == "5ba93c9db0cff93f52b521d7420e43f6eda2784f")
+    say(f, "a high byte is one byte, not two",
+        sha1.hex(bytes_of([255])).len() == 40)
+    say(f, "and differs from its UTF-8 spelling",
+        sha1.hex(bytes_of([255])) != sha1.hex("ÿ".to_bytes()))
+    say(f, "the digest is twenty bytes", sha1.hash(bytes_of([1, 2, 3])).len() == 20)
+
+    if f == 0 {
+        print("all checks passed")
+    } else {
+        print("{f} check(s) failed")
+    }
+}
