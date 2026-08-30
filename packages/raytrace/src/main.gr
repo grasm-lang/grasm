@@ -1,0 +1,329 @@
+// A path tracer: geometry, materials, and a great deal of `f64`.
+//
+// This is here to put weight on floating point rather than on graphics. Four
+// engines have to agree on an image, and an image is millions of dependent
+// float operations — every square root, every division, every accumulation —
+// so a single instruction lowered differently on one engine shows up as a
+// pixel that differs, and the whole render is a very sensitive comparison.
+//
+// **Nothing here is random.** A path tracer normally scatters rays randomly,
+// which would make the four engines disagree for a reason that is not a bug.
+// The generator is a fixed integer sequence, so the same scene gives the same
+// image on every engine, every time, and a difference means something.
+
+type Vec3 = {
+    x: f64,
+    y: f64,
+    z: f64,
+}
+
+type Ray = {
+    from: Vec3,
+    towards: Vec3,
+}
+
+type Material =
+    | Diffuse(albedo: Vec3)
+    | Metal(albedo: Vec3, fuzz: f64)
+    | Light(colour: Vec3)
+
+type Sphere = {
+    centre: Vec3,
+    radius: f64,
+    material: Material,
+}
+
+type Hit = {
+    at: f64,
+    point: Vec3,
+    normal: Vec3,
+    material: Material,
+    outside: bool,
+}
+
+pub fn vec(x: f64, y: f64, z: f64) -> Vec3 {
+    Vec3{ x: x, y: y, z: z }
+}
+
+pub fn add(a: Vec3, b: Vec3) -> Vec3 {
+    vec(a.x + b.x, a.y + b.y, a.z + b.z)
+}
+
+pub fn sub(a: Vec3, b: Vec3) -> Vec3 {
+    vec(a.x - b.x, a.y - b.y, a.z - b.z)
+}
+
+pub fn scale(a: Vec3, k: f64) -> Vec3 {
+    vec(a.x * k, a.y * k, a.z * k)
+}
+
+pub fn mul(a: Vec3, b: Vec3) -> Vec3 {
+    vec(a.x * b.x, a.y * b.y, a.z * b.z)
+}
+
+pub fn dot(a: Vec3, b: Vec3) -> f64 {
+    a.x * b.x + a.y * b.y + a.z * b.z
+}
+
+pub fn length(a: Vec3) -> f64 {
+    dot(a, a).sqrt()
+}
+
+/// A unit vector, or the original when it has no length to speak of.
+///
+/// Dividing by a length of zero gives infinities that then poison every later
+/// operation — and an `inf` in a colour becomes a `NaN` in the sum, which
+/// spreads through the whole image rather than staying in one pixel.
+pub fn unit(a: Vec3) -> Vec3 {
+    let n = length(a)
+    if n <= 0.0 {
+        return a
+    }
+    scale(a, 1.0 / n)
+}
+
+pub fn cross(a: Vec3, b: Vec3) -> Vec3 {
+    vec(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x)
+}
+
+pub fn reflect(v: Vec3, n: Vec3) -> Vec3 {
+    sub(v, scale(n, 2.0 * dot(v, n)))
+}
+
+/// A fixed sequence, so every engine renders the same image.
+type Noise = {
+    state: i64,
+}
+
+pub fn noise_from(seed: i64) -> Noise {
+    // Masked, and *not* forced odd. An earlier version set the low bit — a
+    // habit from generators that need an odd multiplier — which mapped 42 and
+    // 43 to the same state, so two different seeds gave the same sequence.
+    // A test asking whether different seeds differ is the only thing that
+    // catches that, and it is worth having for exactly this reason.
+    Noise{ state: seed.bit_and(2147483647) }
+}
+
+/// A number in [0, 1), from a linear congruential step.
+///
+/// Every product is masked to 31 bits, so a release build that wraps and a
+/// debug build that checks overflow produce the same sequence rather than one
+/// of them panicking.
+pub fn next_unit(inout r: Noise) -> f64 {
+    r.state = (r.state * 1103515245 + 12345).bit_and(2147483647)
+    r.state.as_f64() / 2147483648.0
+}
+
+fn next_between(inout r: Noise, lo: f64, hi: f64) -> f64 {
+    lo + (hi - lo) * next_unit(r)
+}
+
+/// A direction in the unit sphere, by rejection.
+///
+/// Bounded, because rejection sampling has no upper limit on attempts and a
+/// renderer that can loop for ever on an unlucky seed is not a renderer.
+fn scatter_direction(inout r: Noise) -> Vec3 {
+    var tries = 0
+    while tries < 100 {
+        let p = vec(next_between(r, 0.0 - 1.0, 1.0),
+                    next_between(r, 0.0 - 1.0, 1.0),
+                    next_between(r, 0.0 - 1.0, 1.0))
+        if dot(p, p) < 1.0 and dot(p, p) > 0.0 {
+            return unit(p)
+        }
+        tries = tries + 1
+    }
+    vec(0.0, 1.0, 0.0)
+}
+
+/// Where a ray meets a sphere, if it does within the window given.
+///
+/// The near limit is not zero. A reflected ray starts exactly on the surface
+/// it left, and floating point puts it a hair inside as often as outside — so
+/// a limit of zero makes surfaces speckle with points that hit themselves,
+/// which is the classic artefact and the reason the number exists.
+pub fn hit_sphere(s: Sphere, r: Ray, near: f64, far: f64) -> Option[Hit] {
+    let oc = sub(r.from, s.centre)
+    let a = dot(r.towards, r.towards)
+    let half_b = dot(oc, r.towards)
+    let c = dot(oc, oc) - s.radius * s.radius
+    let discriminant = half_b * half_b - a * c
+    if discriminant < 0.0 {
+        return None
+    }
+    let root = discriminant.sqrt()
+    var t = (0.0 - half_b - root) / a
+    if t < near or t > far {
+        t = (0.0 - half_b + root) / a
+        if t < near or t > far {
+            return None
+        }
+    }
+    let point = add(r.from, scale(r.towards, t))
+    let outward = scale(sub(point, s.centre), 1.0 / s.radius)
+    let outside = dot(r.towards, outward) < 0.0
+    Some(Hit{
+        at: t,
+        point: point,
+        normal: if outside { outward } else { scale(outward, 0.0 - 1.0) },
+        material: s.material,
+        outside: outside,
+    })
+}
+
+fn nearest(spheres: [Sphere], r: Ray, near: f64, far: f64) -> Option[Hit] {
+    var best: Option[Hit] = None
+    var closest = far
+    for s in spheres {
+        match hit_sphere(s, r, near, closest) {
+            Some(h) -> {
+                closest = h.at
+                best = Some(h)
+            }
+            None -> {}
+        }
+    }
+    best
+}
+
+/// The colour a ray brings back.
+///
+/// Iterative rather than recursive, carrying the accumulated attenuation. A
+/// recursive tracer is the shorter code and it is one stack frame per bounce,
+/// which at a depth of fifty and a million rays is a lot of frames for nothing.
+fn trace(spheres: [Sphere], start: Ray, depth: i64, inout r: Noise) -> Vec3 {
+    var attenuation = vec(1.0, 1.0, 1.0)
+    var accumulated = vec(0.0, 0.0, 0.0)
+    var ray = start
+    var bounces = 0
+    while bounces < depth {
+        match nearest(spheres, ray, 0.001, 1000000.0) {
+            Some(h) -> {
+                match h.material {
+                    Light(colour) -> {
+                        accumulated = add(accumulated, mul(attenuation, colour))
+                        return accumulated
+                    }
+                    Diffuse(albedo) -> {
+                        attenuation = mul(attenuation, albedo)
+                        let direction = add(h.normal, scatter_direction(r))
+                        ray = Ray{ from: h.point, towards: unit(direction) }
+                    }
+                    Metal(albedo, fuzz) -> {
+                        attenuation = mul(attenuation, albedo)
+                        let bounced = reflect(unit(ray.towards), h.normal)
+                        let fuzzed = add(bounced, scale(scatter_direction(r), fuzz))
+                        if dot(fuzzed, h.normal) <= 0.0 {
+                            return accumulated
+                        }
+                        ray = Ray{ from: h.point, towards: unit(fuzzed) }
+                    }
+                }
+            }
+            None -> {
+                // The sky: a vertical gradient, which is what makes an image
+                // with no lights in it still look like something.
+                let d = unit(ray.towards)
+                let t = 0.5 * (d.y + 1.0)
+                let sky = add(scale(vec(1.0, 1.0, 1.0), 1.0 - t),
+                              scale(vec(0.5, 0.7, 1.0), t))
+                return add(accumulated, mul(attenuation, sky))
+            }
+        }
+        bounces = bounces + 1
+    }
+    accumulated
+}
+
+type Camera = {
+    origin: Vec3,
+    lower_left: Vec3,
+    horizontal: Vec3,
+    vertical: Vec3,
+}
+
+pub fn camera(from: Vec3, at: Vec3, up: Vec3, fov: f64, aspect: f64) -> Camera {
+    let theta = fov * pi() / 180.0
+    let h = (theta / 2.0).tan()
+    let view_height = 2.0 * h
+    let view_width = aspect * view_height
+    let w = unit(sub(from, at))
+    let u = unit(cross(up, w))
+    let v = cross(w, u)
+    let horizontal = scale(u, view_width)
+    let vertical = scale(v, view_height)
+    Camera{
+        origin: from,
+        lower_left: sub(sub(sub(from, scale(horizontal, 0.5)),
+                            scale(vertical, 0.5)), w),
+        horizontal: horizontal,
+        vertical: vertical,
+    }
+}
+
+fn ray_through(c: Camera, s: f64, t: f64) -> Ray {
+    Ray{
+        from: c.origin,
+        towards: unit(sub(add(add(c.lower_left, scale(c.horizontal, s)),
+                              scale(c.vertical, t)), c.origin)),
+    }
+}
+
+/// Render an image as rows of (r, g, b) in 0..255.
+pub fn render(spheres: [Sphere], c: Camera, width: i64, height: i64,
+              samples: i64, depth: i64, seed: i64) -> [i64] {
+    var out: [i64] = []
+    var r = noise_from(seed)
+    var y = height - 1
+    while y >= 0 {
+        for x in 0..width {
+            var total = vec(0.0, 0.0, 0.0)
+            for _s in 0..samples {
+                let u = (x.as_f64() + next_unit(r)) / (width - 1).as_f64()
+                let v = (y.as_f64() + next_unit(r)) / (height - 1).as_f64()
+                total = add(total, trace(spheres, ray_through(c, u, v), depth, r))
+            }
+            let n = samples.as_f64()
+            // The square root is gamma correction: a colour stored as its
+            // square root is what a screen expects, and leaving it out makes
+            // every image far too dark.
+            out.push(channel((total.x / n).sqrt()))
+            out.push(channel((total.y / n).sqrt()))
+            out.push(channel((total.z / n).sqrt()))
+        }
+        y = y - 1
+    }
+    out
+}
+
+fn channel(v: f64) -> i64 {
+    // NaN is possible if a scene has a degenerate sphere, and `as_i64` maps it
+    // to zero — but clamping first means a NaN becomes black rather than
+    // whatever the conversion happens to do.
+    if v != v {
+        return 0
+    }
+    let scaled = (v * 255.999).as_i64()
+    if scaled < 0 {
+        return 0
+    }
+    if scaled > 255 {
+        return 255
+    }
+    scaled
+}
+
+/// The image as a PPM, which every image viewer reads and which is text.
+pub fn to_ppm(pixels: [i64], width: i64, height: i64) -> str {
+    var s = "P3\n{width} {height}\n255\n"
+    var i = 0
+    while i < pixels.len() {
+        s = s + "{pixels[i]} {pixels[i + 1]} {pixels[i + 2]}\n"
+        i = i + 3
+    }
+    s
+}
+
+pub fn sphere_of(centre: Vec3, radius: f64, material: Material) -> Sphere {
+    Sphere{ centre: centre, radius: radius, material: material }
+}

@@ -1,0 +1,6 @@
+[package]
+name = "raytrace"
+version = "1.0.0"
+
+# Numbers in, pixels out. Opens nothing.
+capabilities = []

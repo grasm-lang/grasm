@@ -1,0 +1,164 @@
+import raytrace
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn close(a: f64, b: f64) -> bool {
+    let d = a - b
+    if d < 0.0 {
+        return 0.0 - d < 0.000000001
+    }
+    d < 0.000000001
+}
+
+fn scene() -> [Sphere] {
+    [raytrace.sphere_of(raytrace.vec(0.0, 0.0 - 100.5, 0.0 - 1.0), 100.0,
+        Diffuse(raytrace.vec(0.8, 0.8, 0.0))),
+     raytrace.sphere_of(raytrace.vec(0.0, 0.0, 0.0 - 1.0), 0.5,
+        Diffuse(raytrace.vec(0.7, 0.3, 0.3))),
+     raytrace.sphere_of(raytrace.vec(0.0 - 1.0, 0.0, 0.0 - 1.0), 0.5,
+        Metal(raytrace.vec(0.8, 0.8, 0.8), 0.05)),
+     raytrace.sphere_of(raytrace.vec(1.0, 0.0, 0.0 - 1.0), 0.5,
+        Metal(raytrace.vec(0.8, 0.6, 0.2), 0.3)),
+     raytrace.sphere_of(raytrace.vec(0.0, 1.2, 0.0 - 1.0), 0.4,
+        Light(raytrace.vec(4.0, 4.0, 4.0)))]
+}
+
+fn main() / {io} {
+    var f = 0
+
+    print("-- vector arithmetic, where every later number comes from")
+    let a = raytrace.vec(1.0, 2.0, 3.0)
+    let b = raytrace.vec(4.0, 5.0, 6.0)
+    say(f, "dot", raytrace.dot(a, b) == 32.0)
+    say(f, "length of a 3-4-5 triangle",
+        raytrace.length(raytrace.vec(3.0, 4.0, 0.0)) == 5.0)
+    let c = raytrace.cross(a, b)
+    say(f, "cross", c.x == 0.0 - 3.0 and c.y == 6.0 and c.z == 0.0 - 3.0)
+    say(f, "a cross product is perpendicular to both",
+        close(raytrace.dot(c, a), 0.0) and close(raytrace.dot(c, b), 0.0))
+    let u = raytrace.unit(raytrace.vec(3.0, 4.0, 0.0))
+    say(f, "a unit vector has length one", close(raytrace.length(u), 1.0))
+    // The case that produces infinities and then NaNs across a whole image.
+    let z = raytrace.unit(raytrace.vec(0.0, 0.0, 0.0))
+    say(f, "normalising a zero vector gives no infinity",
+        z.x == 0.0 and z.y == 0.0 and z.z == 0.0)
+    let r = raytrace.reflect(raytrace.vec(1.0, 0.0 - 1.0, 0.0),
+                             raytrace.vec(0.0, 1.0, 0.0))
+    say(f, "a reflection off a flat surface flips one axis",
+        r.x == 1.0 and r.y == 1.0 and r.z == 0.0)
+
+    print("-- intersections")
+    let s = raytrace.sphere_of(raytrace.vec(0.0, 0.0, 0.0 - 5.0), 1.0,
+        Diffuse(raytrace.vec(0.5, 0.5, 0.5)))
+    let straight = Ray{ from: raytrace.vec(0.0, 0.0, 0.0),
+                        towards: raytrace.vec(0.0, 0.0, 0.0 - 1.0) }
+    match raytrace.hit_sphere(s, straight, 0.001, 1000.0) {
+        Some(h) -> {
+            say(f, "a ray straight at a sphere hits its near face", close(h.at, 4.0))
+            say(f, "the normal points back at the ray", close(h.normal.z, 1.0))
+            say(f, "and the hit is from outside", h.outside)
+        }
+        None -> say(f, "a ray straight at a sphere hits it", false)
+    }
+    let past = Ray{ from: raytrace.vec(0.0, 5.0, 0.0),
+                    towards: raytrace.vec(0.0, 0.0, 0.0 - 1.0) }
+    match raytrace.hit_sphere(s, past, 0.001, 1000.0) {
+        Some(_h) -> say(f, "a ray that misses does not hit", false)
+        None -> say(f, "a ray that misses does not hit", true)
+    }
+    // A sphere behind the camera must not be found by looking forwards.
+    let behind = Ray{ from: raytrace.vec(0.0, 0.0, 0.0),
+                      towards: raytrace.vec(0.0, 0.0, 1.0) }
+    match raytrace.hit_sphere(s, behind, 0.001, 1000.0) {
+        Some(_h) -> say(f, "a sphere behind the ray is not hit", false)
+        None -> say(f, "a sphere behind the ray is not hit", true)
+    }
+    // From inside, the hit is the far wall and the normal points inwards.
+    let inside = Ray{ from: raytrace.vec(0.0, 0.0, 0.0 - 5.0),
+                      towards: raytrace.vec(0.0, 0.0, 0.0 - 1.0) }
+    match raytrace.hit_sphere(s, inside, 0.001, 1000.0) {
+        Some(h) -> say(f, "from inside, the normal faces inwards",
+            close(h.at, 1.0) and not h.outside)
+        None -> say(f, "a ray from inside hits the far wall", false)
+    }
+
+    print("-- the fixed sequence, which is what lets four engines agree")
+    var n1 = raytrace.noise_from(42)
+    var n2 = raytrace.noise_from(42)
+    var same = true
+    for _i in 0..1000 {
+        if raytrace.next_unit(n1) != raytrace.next_unit(n2) {
+            same = false
+        }
+    }
+    say(f, "the same seed gives the same thousand numbers", same)
+    var n3 = raytrace.noise_from(43)
+    var n5 = raytrace.noise_from(42)
+    say(f, "a different seed does not", raytrace.next_unit(n3) != raytrace.next_unit(n5))
+    var n4 = raytrace.noise_from(7)
+    var in_range = true
+    for _i in 0..5000 {
+        let v = raytrace.next_unit(n4)
+        if v < 0.0 or v >= 1.0 {
+            in_range = false
+        }
+    }
+    say(f, "five thousand of them are all in [0, 1)", in_range)
+
+    print("-- a rendered image, which is millions of dependent float operations")
+    let cam = raytrace.camera(raytrace.vec(0.0, 0.5, 1.5), raytrace.vec(0.0, 0.0, 0.0 - 1.0),
+        raytrace.vec(0.0, 1.0, 0.0), 60.0, 2.0)
+    let pixels = raytrace.render(scene(), cam, 40, 20, 12, 12, 20260830)
+    say(f, "the image is the right size", pixels.len() == 40 * 20 * 3)
+    var in_gamut = true
+    for p in pixels {
+        if p < 0 or p > 255 {
+            in_gamut = false
+        }
+    }
+    say(f, "every channel is in 0..255", in_gamut)
+    var total = 0
+    for p in pixels {
+        total = total + p
+    }
+    say(f, "the image is not blank", total > 0)
+    say(f, "and not saturated", total < 255 * pixels.len())
+
+    // The checksum is the point of the whole file. It is a fact about
+    // millions of float operations in sequence, so any engine that lowers a
+    // single one differently produces a different number here.
+    var checksum = 0
+    for i in 0..pixels.len() {
+        checksum = (checksum * 31 + pixels[i]).bit_and(1073741823)
+    }
+    print("    image checksum {checksum}")
+    print("    first pixels {pixels[0]} {pixels[1]} {pixels[2]}")
+
+    print("-- rendering twice gives the same image")
+    let again = raytrace.render(scene(), cam, 40, 20, 12, 12, 20260830)
+    var identical = true
+    for i in 0..pixels.len() {
+        if pixels[i] != again[i] {
+            identical = false
+        }
+    }
+    say(f, "the same scene and seed render identically", identical)
+
+    print("-- PPM")
+    let ppm = raytrace.to_ppm(pixels, 40, 20)
+    say(f, "it starts with a P3 header", ppm.starts_with("P3\n40 20\n255\n"))
+    say(f, "and has a line per pixel", ppm.lines().len() >= 40 * 20 + 3)
+
+    if f == 0 {
+        print("all checks passed")
+    } else {
+        print("{f} check(s) failed")
+    }
+}
