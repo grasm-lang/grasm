@@ -58,7 +58,7 @@ pub fn hash(message: bytes) -> bytes {
         for i in 0..16 {
             let j = at + i * 4
             w.push(m32(block[j].shl(24).bit_or(block[j + 1].shl(16))
-                       .bit_or(block[j + 2].shl(8)).bit_or(block[j + 3])))
+                    .bit_or(block[j + 2].shl(8)).bit_or(block[j + 3])))
         }
         // The message schedule. The rotate by one is what distinguishes SHA-1
         // from SHA-0, and leaving it out gives a hash that is self-consistent

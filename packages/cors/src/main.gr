@@ -22,16 +22,16 @@ type Policy = {
 /// Nothing allowed. Every builder below widens it.
 pub fn policy() -> Policy {
     Policy{ origins: [], any_origin: false,
-            methods: ["GET", "HEAD", "POST"],
-            headers: [], expose: [], credentials: false, max_age_seconds: 0 }
+        methods: ["GET", "HEAD", "POST"],
+        headers: [], expose: [], credentials: false, max_age_seconds: 0 }
 }
 
 pub fn allowing(p: Policy, origin: str) -> Policy {
     var os = p.origins
     os.push(origin)
     Policy{ origins: os, any_origin: p.any_origin, methods: p.methods,
-            headers: p.headers, expose: p.expose, credentials: p.credentials,
-            max_age_seconds: p.max_age_seconds }
+        headers: p.headers, expose: p.expose, credentials: p.credentials,
+        max_age_seconds: p.max_age_seconds }
 }
 
 /// Any origin. Refused in combination with credentials below, because the
@@ -39,20 +39,20 @@ pub fn allowing(p: Policy, origin: str) -> Policy {
 /// work in a way nobody can see from the code.
 pub fn allowing_any(p: Policy) -> Policy {
     Policy{ origins: p.origins, any_origin: true, methods: p.methods,
-            headers: p.headers, expose: p.expose, credentials: p.credentials,
-            max_age_seconds: p.max_age_seconds }
+        headers: p.headers, expose: p.expose, credentials: p.credentials,
+        max_age_seconds: p.max_age_seconds }
 }
 
 pub fn with_methods(p: Policy, methods: [str]) -> Policy {
     Policy{ origins: p.origins, any_origin: p.any_origin, methods: methods,
-            headers: p.headers, expose: p.expose, credentials: p.credentials,
-            max_age_seconds: p.max_age_seconds }
+        headers: p.headers, expose: p.expose, credentials: p.credentials,
+        max_age_seconds: p.max_age_seconds }
 }
 
 pub fn with_headers(p: Policy, headers: [str]) -> Policy {
     Policy{ origins: p.origins, any_origin: p.any_origin, methods: p.methods,
-            headers: headers, expose: p.expose, credentials: p.credentials,
-            max_age_seconds: p.max_age_seconds }
+        headers: headers, expose: p.expose, credentials: p.credentials,
+        max_age_seconds: p.max_age_seconds }
 }
 
 /// Which response headers the page may read. Without this a browser hands the
@@ -60,20 +60,20 @@ pub fn with_headers(p: Policy, headers: [str]) -> Policy {
 /// present on the wire and invisible in JavaScript.
 pub fn exposing(p: Policy, headers: [str]) -> Policy {
     Policy{ origins: p.origins, any_origin: p.any_origin, methods: p.methods,
-            headers: p.headers, expose: headers, credentials: p.credentials,
-            max_age_seconds: p.max_age_seconds }
+        headers: p.headers, expose: headers, credentials: p.credentials,
+        max_age_seconds: p.max_age_seconds }
 }
 
 pub fn with_credentials(p: Policy) -> Policy {
     Policy{ origins: p.origins, any_origin: p.any_origin, methods: p.methods,
-            headers: p.headers, expose: p.expose, credentials: true,
-            max_age_seconds: p.max_age_seconds }
+        headers: p.headers, expose: p.expose, credentials: true,
+        max_age_seconds: p.max_age_seconds }
 }
 
 pub fn caching_preflight(p: Policy, seconds: i64) -> Policy {
     Policy{ origins: p.origins, any_origin: p.any_origin, methods: p.methods,
-            headers: p.headers, expose: p.expose, credentials: p.credentials,
-            max_age_seconds: seconds }
+        headers: p.headers, expose: p.expose, credentials: p.credentials,
+        max_age_seconds: seconds }
 }
 
 /// Is this origin allowed?
@@ -117,7 +117,7 @@ fn header_of(r: Request, name: str) -> str {
 /// supports, and answering it with preflight headers is a different bug.
 pub fn is_preflight(r: Request) -> bool {
     r.method == "OPTIONS" and not header_of(r, "origin").is_empty() and
-        not header_of(r, "access-control-request-method").is_empty()
+    not header_of(r, "access-control-request-method").is_empty()
 }
 
 /// The headers a response to this request needs, or an empty list when the

@@ -159,7 +159,7 @@ fn main() / {io} {
     print("-- commands replicate to everyone")
     var l = c.nodes[first_leader]
     let accepted = raft.propose(l, "set x 1") and raft.propose(l, "set y 2") and
-        raft.propose(l, "set z 3")
+    raft.propose(l, "set z 3")
     c.nodes[first_leader] = l
     say(f, "the leader accepts three commands", accepted)
     run_for(c, 10)

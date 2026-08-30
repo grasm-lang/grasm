@@ -40,7 +40,7 @@ type LedgerError =
     | NonPositive(amount: i64)
     | SameAccount(account: str)
 
-/// Balances, held by the caller because they change.
+    /// Balances, held by the caller because they change.
 type Book = { names: [str], amounts: [i64] }
 
 fn position(b: Book, account: str) -> i64 {

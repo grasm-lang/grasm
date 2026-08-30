@@ -53,7 +53,7 @@ fn encode_name(name: str) -> bytes {
     var out = bytes_of([])
     for label in name.split(".") {
         if label.len() > 0 {
-                out = out
+            out = out
                 .concat(bytes_of([label.byte_len()]))
                 .concat(label.to_bytes())
         }

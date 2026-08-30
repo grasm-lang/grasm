@@ -312,18 +312,18 @@ fn every_world_touching_builtin(path: str) / {io} {
     // the prelude's `IoError` and refused the annotated form — and that is no
     // longer true. Left as it is because the shape is right, not because it has
     // to be.
-    match read_file(path) { Ok(v) -> {}  Err(e) -> {} }
-    match write_file(path, "") { Ok(v) -> {}  Err(e) -> {} }
-    match read_bytes(path) { Ok(v) -> {}  Err(e) -> {} }
-    match write_bytes(path, bytes_of([])) { Ok(v) -> {}  Err(e) -> {} }
-    match read_bytes_at(path, 0, 1) { Ok(v) -> {}  Err(e) -> {} }
-    match append_bytes(path, bytes_of([])) { Ok(v) -> {}  Err(e) -> {} }
-    match file_size(path) { Ok(v) -> {}  Err(e) -> {} }
-    match sync_file(path) { Ok(v) -> {}  Err(e) -> {} }
-    match rename_file(path, path) { Ok(v) -> {}  Err(e) -> {} }
-    match remove_file(path) { Ok(v) -> {}  Err(e) -> {} }
-    match make_dir(path) { Ok(v) -> {}  Err(e) -> {} }
-    match list_dir(path) { Ok(v) -> {}  Err(e) -> {} }
+    match read_file(path) { Ok(v) -> {} Err(e) -> {} }
+    match write_file(path, "") { Ok(v) -> {} Err(e) -> {} }
+    match read_bytes(path) { Ok(v) -> {} Err(e) -> {} }
+    match write_bytes(path, bytes_of([])) { Ok(v) -> {} Err(e) -> {} }
+    match read_bytes_at(path, 0, 1) { Ok(v) -> {} Err(e) -> {} }
+    match append_bytes(path, bytes_of([])) { Ok(v) -> {} Err(e) -> {} }
+    match file_size(path) { Ok(v) -> {} Err(e) -> {} }
+    match sync_file(path) { Ok(v) -> {} Err(e) -> {} }
+    match rename_file(path, path) { Ok(v) -> {} Err(e) -> {} }
+    match remove_file(path) { Ok(v) -> {} Err(e) -> {} }
+    match make_dir(path) { Ok(v) -> {} Err(e) -> {} }
+    match list_dir(path) { Ok(v) -> {} Err(e) -> {} }
     let _e = file_exists(path)
     // Never reached, so this does not wait for a line — the function is
     // type-checked and not called, which is the whole technique.
@@ -331,7 +331,7 @@ fn every_world_touching_builtin(path: str) / {io} {
     let _i = now_millis()
     let _mono = monotonic_millis()
     sleep_millis(0)
-    match random_bytes(0) { Ok(v) -> {}  Err(e) -> {} }
+    match random_bytes(0) { Ok(v) -> {} Err(e) -> {} }
     let _j = env(path)
     let _k = args()
     eprint("")
@@ -341,26 +341,26 @@ fn every_world_touching_builtin(path: str) / {io} {
 /// when F35 was found — and listed here so that the *next* one added is caught
 /// by a build failure rather than by an audit that happens to be run.
 fn every_net_builtin(host: str, port: i64) / {net} {
-    match tcp_listen(port) { Ok(v) -> {}  Err(e) -> {} }
-    match tcp_connect(host, port) { Ok(v) -> {}  Err(e) -> {} }
-    match tcp_accept(port) { Ok(v) -> {}  Err(e) -> {} }
-    match tcp_read(port) { Ok(v) -> {}  Err(e) -> {} }
-    match tcp_read_bytes(port) { Ok(v) -> {}  Err(e) -> {} }
-    match tcp_write(port, "") { Ok(v) -> {}  Err(e) -> {} }
-    match tcp_write_bytes(port, bytes_of([])) { Ok(v) -> {}  Err(e) -> {} }
-    match net_wait([], 0) { Ok(v) -> {}  Err(e) -> {} }
-    match net_port(port) { Ok(v) -> {}  Err(e) -> {} }
-    match udp_bind(port) { Ok(v) -> {}  Err(e) -> {} }
-    match udp_send(port, host, port, bytes_of([])) { Ok(v) -> {}  Err(e) -> {} }
-    match udp_recv(port) { Ok(v) -> {}  Err(e) -> {} }
-    match udp_recv_from(port) { Ok(v) -> {}  Err(e) -> {} }
+    match tcp_listen(port) { Ok(v) -> {} Err(e) -> {} }
+    match tcp_connect(host, port) { Ok(v) -> {} Err(e) -> {} }
+    match tcp_accept(port) { Ok(v) -> {} Err(e) -> {} }
+    match tcp_read(port) { Ok(v) -> {} Err(e) -> {} }
+    match tcp_read_bytes(port) { Ok(v) -> {} Err(e) -> {} }
+    match tcp_write(port, "") { Ok(v) -> {} Err(e) -> {} }
+    match tcp_write_bytes(port, bytes_of([])) { Ok(v) -> {} Err(e) -> {} }
+    match net_wait([], 0) { Ok(v) -> {} Err(e) -> {} }
+    match net_port(port) { Ok(v) -> {} Err(e) -> {} }
+    match udp_bind(port) { Ok(v) -> {} Err(e) -> {} }
+    match udp_send(port, host, port, bytes_of([])) { Ok(v) -> {} Err(e) -> {} }
+    match udp_recv(port) { Ok(v) -> {} Err(e) -> {} }
+    match udp_recv_from(port) { Ok(v) -> {} Err(e) -> {} }
     net_close(port)
 }
 
 /// And for `proc`.
 fn every_proc_builtin(program: str) / {proc} {
-    match proc_run(program, []) { Ok(v) -> {}  Err(e) -> {} }
-    match proc_pipeline([], "") { Ok(v) -> {}  Err(e) -> {} }
+    match proc_run(program, []) { Ok(v) -> {} Err(e) -> {} }
+    match proc_pipeline([], "") { Ok(v) -> {} Err(e) -> {} }
 }
 
 fn main() / {io, async} {
@@ -628,7 +628,7 @@ effect io {
 }
 
 fn quiet(n: i64) -> i64 / {} {
-    with io handled_by ioHandler{ nothing: || 1 } {
+    with io handled_by ioHandler { nothing: || 1 } {
         print("a declared-empty row printed")
     }
     n
@@ -1402,11 +1402,11 @@ fn triple(n: i64) -> i64 {
 type Holder = { f: fn(i64) -> i64 }
 
 fn adder(k: i64) -> fn(i64) -> i64 {
-    |x| x + k
+        |x| x + k
 }
 
 fn compose(f: fn(i64) -> i64) -> fn(i64) -> i64 {
-    |x| f(f(x))
+        |x| f(f(x))
 }
 
 fn main() {
@@ -1943,7 +1943,7 @@ fn opt(o: Option[Inner]) -> str {
 
 fn main() {
     // And a binding payload still covers the variant outright.
-    let bound = match Plain {
+    let bound = match Plain{
         Wrap(i) -> "w"
         Plain -> "plain"
     }

@@ -126,8 +126,8 @@ fn scatter_direction(inout r: Noise) -> Vec3 {
     var tries = 0
     while tries < 100 {
         let p = vec(next_between(r, 0.0 - 1.0, 1.0),
-                    next_between(r, 0.0 - 1.0, 1.0),
-                    next_between(r, 0.0 - 1.0, 1.0))
+            next_between(r, 0.0 - 1.0, 1.0),
+            next_between(r, 0.0 - 1.0, 1.0))
         if dot(p, p) < 1.0 and dot(p, p) > 0.0 {
             return unit(p)
         }
@@ -226,7 +226,7 @@ fn trace(spheres: [Sphere], start: Ray, depth: i64, inout r: Noise) -> Vec3 {
                 let d = unit(ray.towards)
                 let t = 0.5 * (d.y + 1.0)
                 let sky = add(scale(vec(1.0, 1.0, 1.0), 1.0 - t),
-                              scale(vec(0.5, 0.7, 1.0), t))
+                    scale(vec(0.5, 0.7, 1.0), t))
                 return add(accumulated, mul(attenuation, sky))
             }
         }
@@ -255,7 +255,7 @@ pub fn camera(from: Vec3, at: Vec3, up: Vec3, fov: f64, aspect: f64) -> Camera {
     Camera{
         origin: from,
         lower_left: sub(sub(sub(from, scale(horizontal, 0.5)),
-                            scale(vertical, 0.5)), w),
+            scale(vertical, 0.5)), w),
         horizontal: horizontal,
         vertical: vertical,
     }
@@ -265,13 +265,13 @@ fn ray_through(c: Camera, s: f64, t: f64) -> Ray {
     Ray{
         from: c.origin,
         towards: unit(sub(add(add(c.lower_left, scale(c.horizontal, s)),
-                              scale(c.vertical, t)), c.origin)),
+            scale(c.vertical, t)), c.origin)),
     }
 }
 
 /// Render an image as rows of (r, g, b) in 0..255.
 pub fn render(spheres: [Sphere], c: Camera, width: i64, height: i64,
-              samples: i64, depth: i64, seed: i64) -> [i64] {
+    samples: i64, depth: i64, seed: i64) -> [i64] {
     var out: [i64] = []
     var r = noise_from(seed)
     var y = height - 1

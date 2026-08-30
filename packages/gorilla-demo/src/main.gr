@@ -77,8 +77,8 @@ fn main() / {io} {
     print("-- the values a float codec gets wrong")
     let negative_zero = (0.0 - 1.0) * 0.0
     let awkward = [0.0, negative_zero, 1.0, 0.0 - 1.0, 0.1, 1.0 / 3.0,
-                   1.0e300, 5.0e-324, 1.7976931348623157e308,
-                   2.2250738585072014e-308, 123456789.123456789]
+        1.0e300, 5.0e-324, 1.7976931348623157e308,
+        2.2250738585072014e-308, 123456789.123456789]
     var at: [i64] = []
     for i in 0..awkward.len() {
         at.push(1700000000 + i)
@@ -108,7 +108,7 @@ fn main() / {io} {
     say(f, "repeated timestamps", round_trips([7, 7, 7, 7], [1.0, 2.0, 3.0, 4.0]))
     say(f, "a series that speeds up and slows down",
         round_trips([0, 1, 3, 6, 10, 15, 21, 22, 23, 24],
-                    [1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0, 5.0, 5.0]))
+            [1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0, 5.0, 5.0]))
 
     print("-- empty")
     say(f, "no points encode to nothing", gorilla.encode([], []).len() == 0)

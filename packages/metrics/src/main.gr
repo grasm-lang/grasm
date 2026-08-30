@@ -36,7 +36,7 @@ pub fn label(name: str, value: str) -> Label {
 /// decreased assumes the process restarted.
 pub fn count(name: str, labels: [Label], amount: f64) / {Metric} {
     Metric.record(Sample{ name: name, kind: Counter, labels: labels,
-                          value: if amount < 0.0 { 0.0 } else { amount } })
+        value: if amount < 0.0 { 0.0 } else { amount } })
 }
 
 pub fn increment(name: str, labels: [Label]) / {Metric} {
@@ -114,8 +114,8 @@ pub fn fold(r: Registry, s: Sample) -> Registry {
     }
     if found < 0 {
         series.push(Series{ name: s.name, kind: s.kind, labels: s.labels,
-                            value: 0.0, count: 0, sum: 0.0,
-                            buckets: r.buckets, counts: empty_counts(r.buckets.len() + 1) })
+            value: 0.0, count: 0, sum: 0.0,
+            buckets: r.buckets, counts: empty_counts(r.buckets.len() + 1) })
         found = series.len() - 1
     }
     let old = series[found]
@@ -143,8 +143,8 @@ pub fn fold(r: Registry, s: Sample) -> Registry {
         }
     }
     series[found] = Series{ name: old.name, kind: old.kind, labels: old.labels,
-                            value: value, count: count, sum: sum,
-                            buckets: old.buckets, counts: counts }
+        value: value, count: count, sum: sum,
+        buckets: old.buckets, counts: counts }
     Registry{ series: series, buckets: r.buckets }
 }
 

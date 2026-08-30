@@ -132,7 +132,7 @@ fn expand_key_with(key: bytes, s: [i64]) -> [i64] {
     var w: [i64] = []
     for i in 0..nk {
         w.push(m32(key.at(i * 4).shl(24).bit_or(key.at(i * 4 + 1).shl(16))
-            .bit_or(key.at(i * 4 + 2).shl(8)).bit_or(key.at(i * 4 + 3))))
+                .bit_or(key.at(i * 4 + 2).shl(8)).bit_or(key.at(i * 4 + 3))))
     }
     var rcon = 1
     for i in nk..(4 * (rounds + 1)) {
@@ -404,7 +404,7 @@ pub fn gcm_seal_with(c: Cipher, nonce: bytes, aad: bytes, plaintext: bytes) -> b
 type GcmError =
     | NotAuthentic
 
-/// Open, verifying before decrypting.
+    /// Open, verifying before decrypting.
 pub fn gcm_open(key: bytes, nonce: bytes, aad: bytes, sealed: bytes) -> bytes ! GcmError {
     try gcm_open_with(new_cipher(key), nonce, aad, sealed)
 }

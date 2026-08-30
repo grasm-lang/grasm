@@ -68,7 +68,7 @@ pub fn hash(secret: str, salt: bytes, iterations: i64) -> Hashed ! PasswordError
 /// migrated.
 pub fn encode(h: Hashed) -> str {
     "${h.algorithm}${h.iterations}${bytes_codec.encode_base64_url(h.salt)}$" +
-        bytes_codec.encode_base64_url(h.digest)
+    bytes_codec.encode_base64_url(h.digest)
 }
 
 pub fn decode(stored: str) -> Hashed ! PasswordError {
@@ -108,7 +108,7 @@ pub fn verify(secret: str, stored: str) -> bool {
                 return false
             }
             let computed = crypto_hash.pbkdf2_sha256(secret.to_bytes(), h.salt,
-                                                     h.iterations, h.digest.len())
+                h.iterations, h.digest.len())
             crypto_hash.equal_constant_time(computed, h.digest)
         }
     }

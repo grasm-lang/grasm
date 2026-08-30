@@ -26,7 +26,7 @@ fn main() {
         let deeper = trace.child_of(r, db)
         work(deeper, "net.read", 1003, 38, trace.attribute("fd", "7"))
         trace.emit(trace.tagged(trace.finish(request, 1050),
-                                trace.attribute("status", "200")))
+            trace.attribute("status", "200")))
     }
 
     print("-- the trace, nested")
@@ -48,15 +48,15 @@ fn main() {
 
     print("-- parsing a header")
     for h in ["00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
-              "00-4BF92F3577B34DA6A3CE929D0E0E4736-00F067AA0BA902B7-00",
-              "  00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01  ",
-              "01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
-              "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
-              "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01",
-              "00-tooshort-00f067aa0ba902b7-01",
-              "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7",
-              "not a header at all",
-              ""] {
+        "00-4BF92F3577B34DA6A3CE929D0E0E4736-00F067AA0BA902B7-00",
+        "  00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01  ",
+        "01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01",
+        "00-tooshort-00f067aa0ba902b7-01",
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7",
+        "not a header at all",
+        ""] {
         match trace.parse_traceparent(h) {
             Some(p) -> print("  \"{h}\" -> trace {p.trace_id} span {p.span_id} sampled {p.sampled}")
             None -> print("  \"{h}\" -> refused")
@@ -78,7 +78,7 @@ fn main() {
     with Trace handled_by trace.collecting(bad) {
         let c2 = trace.new_trace(r3, true)
         trace.emit(trace.failed(trace.finish(trace.start(c2, "sql.query", 100), 160),
-                                "connection reset"))
+            "connection reset"))
         trace.emit(trace.start(trace.child_of(r3, c2), "never ends", 200))
     }
     for s in bad.value {

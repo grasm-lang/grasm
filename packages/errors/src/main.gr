@@ -42,19 +42,19 @@ pub fn report(message: str) -> Report {
 
 pub fn of_kind(r: Report, kind: str) -> Report {
     Report{ message: r.message, kind: kind, where_: r.where_,
-            fields: r.fields, causes: r.causes }
+        fields: r.fields, causes: r.causes }
 }
 
 pub fn at(r: Report, place: str) -> Report {
     Report{ message: r.message, kind: r.kind, where_: place,
-            fields: r.fields, causes: r.causes }
+        fields: r.fields, causes: r.causes }
 }
 
 pub fn with_field(r: Report, f: ErrorField) -> Report {
     var fs = r.fields
     fs.push(f)
     Report{ message: r.message, kind: r.kind, where_: r.where_,
-            fields: fs, causes: r.causes }
+        fields: fs, causes: r.causes }
 }
 
 /// A report explaining one underneath it.
@@ -67,7 +67,7 @@ pub fn because(message: str, cause: Report) -> Report {
     var cs = r.causes
     cs.push(cause)
     Report{ message: r.message, kind: r.kind, where_: r.where_,
-            fields: r.fields, causes: cs }
+        fields: r.fields, causes: cs }
 }
 
 /// Several causes under one report — a batch where more than one item failed.

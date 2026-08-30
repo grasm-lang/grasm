@@ -435,7 +435,7 @@ fn exchange() / {io, net} {
                                 Err(e) -> {}
                             }
                         }
-                        Reply(t) -> { match tcp_write(h, t) { Ok(_) -> {}  Err(e) -> {} } }
+                        Reply(t) -> { match tcp_write(h, t) { Ok(_) -> {} Err(e) -> {} } }
                         Broadcast(next, reply) -> {}
                     }
                 }
@@ -498,13 +498,13 @@ fn exchange() / {io, net} {
                             // even told its own edit landed.
                             let ev = state_event(items)
                             for w in held {
-                                match tcp_write(w, ev) { Ok(_) -> {}  Err(e) -> {} }
+                                match tcp_write(w, ev) { Ok(_) -> {} Err(e) -> {} }
                             }
-                            match tcp_write(h, reply) { Ok(_) -> {}  Err(e) -> {} }
+                            match tcp_write(h, reply) { Ok(_) -> {} Err(e) -> {} }
                             done = done + 1
                         }
                         Reply(t) -> {
-                            match tcp_write(h, t) { Ok(_) -> {}  Err(e) -> {} }
+                            match tcp_write(h, t) { Ok(_) -> {} Err(e) -> {} }
                             done = done + 1
                         }
                         Hold(head, hello) -> {}
@@ -606,16 +606,16 @@ fn serve() / {io, net} {
                             save(path, next)
                             let ev = state_event(next)
                             for w in held {
-                                match tcp_write(w, ev) { Ok(_) -> {}  Err(e) -> {} }
+                                match tcp_write(w, ev) { Ok(_) -> {} Err(e) -> {} }
                             }
-                            match tcp_write(h, reply) { Ok(_) -> {}  Err(e) -> {} }
+                            match tcp_write(h, reply) { Ok(_) -> {} Err(e) -> {} }
                             net_close(h)
                             var still: [i64] = []
                             for k in open { if k != h { still.push(k) } }
                             open = still
                         }
                         Reply(t) -> {
-                            match tcp_write(h, t) { Ok(_) -> {}  Err(e) -> {} }
+                            match tcp_write(h, t) { Ok(_) -> {} Err(e) -> {} }
                             net_close(h)
                             var still: [i64] = []
                             for k in open { if k != h { still.push(k) } }

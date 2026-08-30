@@ -69,7 +69,7 @@ fn encode_with(b: bytes, alphabet: str, pad: bool) -> str {
     while i + 2 < vs.len() {
         let n = vs[i] * 65536 + vs[i + 1] * 256 + vs[i + 2]
         out = out + digits[n / 262144] + digits[(n / 4096) % 64] +
-            digits[(n / 64) % 64] + digits[n % 64]
+        digits[(n / 64) % 64] + digits[n % 64]
         i = i + 3
     }
     let left = vs.len() - i

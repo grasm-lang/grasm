@@ -86,8 +86,8 @@ fn main() / {io} {
 
     print("-- the glob matcher on its own")
     for pair in [("*.gr", "main.gr"), ("*.gr", "src/main.gr"), ("*/*.gr", "src/main.gr"),
-                 ("?.gr", "a.gr"), ("?.gr", "ab.gr"), ("[abc]*", "b1"), ("[^abc]*", "b1"),
-                 ("a*b*c", "axxbyyc"), ("*a*a*a*a*b", "aaaaaaaaaaaaaaaaaaaaaaaaX")] {
+        ("?.gr", "a.gr"), ("?.gr", "ab.gr"), ("[abc]*", "b1"), ("[^abc]*", "b1"),
+        ("a*b*c", "axxbyyc"), ("*a*a*a*a*b", "aaaaaaaaaaaaaaaaaaaaaaaaX")] {
         print("  \"{pair.0}\" ~ \"{pair.1}\" -> {fs.matches_glob(pair.0, pair.1)}")
     }
 

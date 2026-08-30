@@ -63,38 +63,38 @@ fn hex_of(inout r: Rng, bytes: i64) -> str {
 /// same reason.
 pub fn new_trace(inout r: Rng, sampled: bool) -> SpanContext {
     SpanContext{ trace_id: hex_of(r, 16), span_id: hex_of(r, 8),
-                 parent_id: "", sampled: sampled }
+        parent_id: "", sampled: sampled }
 }
 
 /// A child of an existing context: the same trace, a new span, this one's
 /// parent.
 pub fn child_of(inout r: Rng, parent: SpanContext) -> SpanContext {
     SpanContext{ trace_id: parent.trace_id, span_id: hex_of(r, 8),
-                 parent_id: parent.span_id, sampled: parent.sampled }
+        parent_id: parent.span_id, sampled: parent.sampled }
 }
 
 pub fn start(c: SpanContext, name: str, at_ms: i64) -> Span {
     Span{ context: c, name: name, start_ms: at_ms, end_ms: 0 - 1,
-          attributes: [], status: "" }
+        attributes: [], status: "" }
 }
 
 pub fn tagged(s: Span, a: Attribute) -> Span {
     var attrs = s.attributes
     attrs.push(a)
     Span{ context: s.context, name: s.name, start_ms: s.start_ms,
-          end_ms: s.end_ms, attributes: attrs, status: s.status }
+        end_ms: s.end_ms, attributes: attrs, status: s.status }
 }
 
 pub fn finish(s: Span, at_ms: i64) -> Span {
     Span{ context: s.context, name: s.name, start_ms: s.start_ms,
-          end_ms: at_ms, attributes: s.attributes, status: s.status }
+        end_ms: at_ms, attributes: s.attributes, status: s.status }
 }
 
 /// A span that failed. The status is text rather than a flag, because the
 /// question a person asks of a trace is *why*, and `false` does not answer it.
 pub fn failed(s: Span, why: str) -> Span {
     Span{ context: s.context, name: s.name, start_ms: s.start_ms,
-          end_ms: s.end_ms, attributes: s.attributes, status: why }
+        end_ms: s.end_ms, attributes: s.attributes, status: why }
 }
 
 /// How long it took. Negative when the clock moved backwards, which this
@@ -161,7 +161,7 @@ pub fn parse_traceparent(header: str) -> Option[SpanContext] {
     }
     let flags = parts[3].parse_int_base(16) ?? 0
     Some(SpanContext{ trace_id: parts[1], span_id: parts[2], parent_id: "",
-                      sampled: flags.bit_and(1) == 1 })
+        sampled: flags.bit_and(1) == 1 })
 }
 
 /// The context to use for work caused by an incoming request: the caller's
@@ -170,7 +170,7 @@ pub fn parse_traceparent(header: str) -> Option[SpanContext] {
 pub fn continue_from(inout r: Rng, header: str, sampled_by_default: bool) -> SpanContext {
     match parse_traceparent(header) {
         Some(c) -> SpanContext{ trace_id: c.trace_id, span_id: hex_of(r, 8),
-                                parent_id: c.span_id, sampled: c.sampled }
+            parent_id: c.span_id, sampled: c.sampled }
         None -> new_trace(r, sampled_by_default)
     }
 }

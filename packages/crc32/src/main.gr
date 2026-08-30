@@ -73,7 +73,7 @@ pub fn of_table(t: [i64], b: bytes) -> i64 {
 /// Four bytes, little-endian, which is how it goes in a record header.
 pub fn to_bytes(crc: i64) -> bytes {
     bytes_of([crc.bit_and(255), crc.ushr(8).bit_and(255),
-              crc.ushr(16).bit_and(255), crc.ushr(24).bit_and(255)])
+        crc.ushr(16).bit_and(255), crc.ushr(24).bit_and(255)])
 }
 
 pub fn from_bytes(b: bytes, at: i64) -> i64 {

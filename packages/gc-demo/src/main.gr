@@ -53,7 +53,7 @@ fn main() / {io} {
     print("-- keeping what is reachable")
     var h3 = gc.new_heap()
     let keep = gc.list_of(h3, [gc.alloc(h3, Num(1)), gc.alloc(h3, Num(2)),
-                               gc.alloc(h3, Num(3))])
+        gc.alloc(h3, Num(3))])
     let drop = gc.list_of(h3, [gc.alloc(h3, Num(9)), gc.alloc(h3, Num(8))])
     let before = gc.live(h3)
     let gone = gc.collect(h3, [keep])

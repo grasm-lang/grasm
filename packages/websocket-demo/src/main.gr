@@ -15,8 +15,8 @@ fn upgrade_request(headers: [str]) -> Request {
 }
 
 let GOOD = ["Upgrade: websocket", "Connection: Upgrade",
-            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
-            "Sec-WebSocket-Version: 13"]
+    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
+    "Sec-WebSocket-Version: 13"]
 
 fn without(which: str) -> [str] {
     var out: [str] = []
@@ -106,7 +106,7 @@ fn main() {
     print("-- round trips")
     round("text, from a server", websocket.text_frame("hello"), false)
     round("text, masked, from a client",
-          websocket.masked_with(websocket.text_frame("hello"), bytes_of([9, 8, 7, 6])), true)
+        websocket.masked_with(websocket.text_frame("hello"), bytes_of([9, 8, 7, 6])), true)
     round("a 126-byte payload", websocket.binary_frame(bytes_of_repeat(126)), false)
     round("a 70000-byte payload", websocket.binary_frame(bytes_of_repeat(70000)), false)
     round("ping", websocket.ping_frame(bytes_of([1])), false)
@@ -115,15 +115,15 @@ fn main() {
     print("-- masking is not optional in either direction")
     round("unmasked, read as a server", websocket.text_frame("hi"), true)
     round("masked, read as a client",
-          websocket.masked_with(websocket.text_frame("hi"), bytes_of([1, 2, 3, 4])), false)
+        websocket.masked_with(websocket.text_frame("hi"), bytes_of([1, 2, 3, 4])), false)
 
     print("-- malformed")
     for pair in [("one byte", bytes_of([129])),
-                 ("a reserved bit set", bytes_of([193, 2, 104, 105])),
-                 ("an unknown opcode", bytes_of([133, 0])),
-                 ("a payload shorter than declared", bytes_of([129, 5, 104, 105])),
-                 ("a control frame of 200 bytes", bytes_of([137, 126, 0, 200])),
-                 ("a fragmented ping", bytes_of([9, 0]))] {
+        ("a reserved bit set", bytes_of([193, 2, 104, 105])),
+        ("an unknown opcode", bytes_of([133, 0])),
+        ("a payload shorter than declared", bytes_of([129, 5, 104, 105])),
+        ("a control frame of 200 bytes", bytes_of([137, 126, 0, 200])),
+        ("a fragmented ping", bytes_of([9, 0]))] {
         match websocket.decode(pair.1, false) {
             Err(e) -> print("  {pair.0.pad_end(32, " ")} refused: {e.why}")
             Ok(p) -> print("  {pair.0.pad_end(32, " ")} accepted, which it should not be")
@@ -132,7 +132,7 @@ fn main() {
 
     print("-- close codes")
     for f in [websocket.close_frame(1000, "bye"), websocket.close_frame(1001, ""),
-              websocket.close_frame(0, "")] {
+        websocket.close_frame(0, "")] {
         let cr = websocket.close_code(f)
         print("  code {cr.0}  reason \"{cr.1}\"")
     }

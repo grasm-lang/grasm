@@ -27,7 +27,7 @@ type MiniError =
     | NameError(name: str)
     | MathError(msg: str)
 
-// ---------------- tokenizer ----------------
+    // ---------------- tokenizer ----------------
 
 fn m_tokenize(src: str) -> [MTok] ! MiniError {
     let chars = src.chars()

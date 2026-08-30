@@ -319,7 +319,7 @@ fn exchange() / {io, net} {
                             }
                         }
                         Reply(t) -> {
-                            match tcp_write(h, t) { Ok(_) -> {}  Err(e) -> {} }
+                            match tcp_write(h, t) { Ok(_) -> {} Err(e) -> {} }
                         }
                         Fanout(room, event, ack) -> {}
                     }
@@ -383,14 +383,14 @@ fn exchange() / {io, net} {
                             // been open, unanswered, since before this request
                             // existed.
                             for target in subscribers_of(rooms, room) {
-                                match tcp_write(target, event) { Ok(_) -> {}  Err(e) -> {} }
+                                match tcp_write(target, event) { Ok(_) -> {} Err(e) -> {} }
                             }
                             rooms.history.push(event)
-                            match tcp_write(h, ack) { Ok(_) -> {}  Err(e) -> {} }
+                            match tcp_write(h, ack) { Ok(_) -> {} Err(e) -> {} }
                             acked = acked + 1
                         }
                         Reply(t) -> {
-                            match tcp_write(h, t) { Ok(_) -> {}  Err(e) -> {} }
+                            match tcp_write(h, t) { Ok(_) -> {} Err(e) -> {} }
                             acked = acked + 1
                         }
                         Hold(room, head) -> {}
@@ -510,10 +510,10 @@ fn serve() / {io, net} {
                         }
                         Fanout(room, event, ack) -> {
                             for target in subscribers_of(rooms, room) {
-                                match tcp_write(target, event) { Ok(_) -> {}  Err(e) -> {} }
+                                match tcp_write(target, event) { Ok(_) -> {} Err(e) -> {} }
                             }
                             rooms.history.push(event)
-                            match tcp_write(h, ack) { Ok(_) -> {}  Err(e) -> {} }
+                            match tcp_write(h, ack) { Ok(_) -> {} Err(e) -> {} }
                             net_close(h)
                             var still: [i64] = []
                             for k in open {
@@ -522,7 +522,7 @@ fn serve() / {io, net} {
                             open = still
                         }
                         Reply(t) -> {
-                            match tcp_write(h, t) { Ok(_) -> {}  Err(e) -> {} }
+                            match tcp_write(h, t) { Ok(_) -> {} Err(e) -> {} }
                             net_close(h)
                             var still: [i64] = []
                             for k in open {

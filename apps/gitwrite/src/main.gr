@@ -41,7 +41,7 @@ fn main() / {io} {
     // actually exercised: `docs` is a tree and sorts as though it were
     // `docs/`, which puts it after `alpha.txt` and before `beta.sh`.
     let inner_bytes = match gitobj.write_tree([
-            gitobj.entry_of(gitobj.mode_file(), "readme.md", a)]) {
+        gitobj.entry_of(gitobj.mode_file(), "readme.md", a)]) {
         Ok(x) -> x
         Err(_e) -> {
             print("could not build the inner tree")
@@ -56,9 +56,9 @@ fn main() / {io} {
         }
     }
     let tree_bytes = match gitobj.write_tree([
-            gitobj.entry_of(gitobj.mode_file(), "alpha.txt", a),
-            gitobj.entry_of(gitobj.mode_exec(), "beta.sh", b),
-            gitobj.tree_entry("docs", inner)]) {
+        gitobj.entry_of(gitobj.mode_file(), "alpha.txt", a),
+        gitobj.entry_of(gitobj.mode_exec(), "beta.sh", b),
+        gitobj.tree_entry("docs", inner)]) {
         Ok(x) -> x
         Err(_e) -> {
             print("could not build the tree")

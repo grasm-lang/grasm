@@ -452,7 +452,7 @@ fn in_class(c: str, set: str, negated: bool, ranges: [str]) -> bool {
 }
 
 fn add_thread(prog: RegexProgram, pc: i64, saved: [i64], pos: i64, len: i64,
-              inout pcs: [i64], inout saves: [[i64]], inout seen: [bool]) {
+    inout pcs: [i64], inout saves: [[i64]], inout seen: [bool]) {
     if seen[pc] {
         return
     }
@@ -589,8 +589,8 @@ pub fn find_from(r: Regex, text: str, from: i64) -> Option[RegexMatch] {
         g = g + 1
     }
     Some(RegexMatch{ start: best[0], end: best[1],
-                text: slice_chars(cs, best[0], best[1]),
-                groups: groups, starts: starts })
+        text: slice_chars(cs, best[0], best[1]),
+        groups: groups, starts: starts })
 }
 
 fn slice_chars(cs: [str], a: i64, b: i64) -> str {
@@ -658,7 +658,7 @@ pub fn replace_first(r: Regex, text: str, replacement: str) -> str {
     match find(r, text) {
         None -> text
         Some(m) -> slice_chars(cs, 0, m.start) + expand(replacement, m) +
-            slice_chars(cs, m.end, cs.len())
+        slice_chars(cs, m.end, cs.len())
     }
 }
 

@@ -65,8 +65,8 @@ fn main() {
 
     print("-- a stored hash that is not one")
     for bad in ["", "not-a-hash", "$pbkdf2-sha256$1000$onlythree",
-                "$pbkdf2-sha256$abc$AQID$AQID", "$pbkdf2-sha256$1000$!!!$AQID",
-                "$argon2id$1000$AQIDBAUGBwgJCgsMDQ4PEA$AQID"] {
+        "$pbkdf2-sha256$abc$AQID$AQID", "$pbkdf2-sha256$1000$!!!$AQID",
+        "$argon2id$1000$AQIDBAUGBwgJCgsMDQ4PEA$AQID"] {
         match password.decode(bad) {
             Err(e) -> print("  \"{bad}\" -> refused: {e.why}")
             Ok(h) -> print("  \"{bad}\" -> read as {h.algorithm}, and verify says {password.verify("x", bad)}")

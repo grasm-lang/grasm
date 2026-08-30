@@ -134,8 +134,8 @@ fn main() / {io} {
     var enc = hpack.new_table(4096)
     var dec = hpack.new_table(4096)
     let headers = [hpack.pair(":method", "POST"), hpack.pair(":path", "/api/v1"),
-                   hpack.pair("content-type", "application/json"),
-                   hpack.pair("x-custom", "value with spaces")]
+        hpack.pair("content-type", "application/json"),
+        hpack.pair("x-custom", "value with spaces")]
     let wire = hpack.encode(enc, headers)
     match hpack.decode(dec, wire) {
         Ok(back) -> {

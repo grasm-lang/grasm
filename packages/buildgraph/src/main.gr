@@ -44,7 +44,7 @@ pub fn new_plan() -> Plan {
 }
 
 pub fn add_task(inout p: Plan, name: str, command: str, inputs: [str],
-                depends_on: [str]) {
+    depends_on: [str]) {
     p.tasks.push(Task{
         name: name,
         command: command,
@@ -216,7 +216,7 @@ pub fn reset_counts(inout c: BuildCache) {
 
 /// Which tasks would actually run, given what is already cached.
 pub fn work_to_do(p: Plan, inout c: BuildCache, contents: [str],
-                  content_names: [str]) -> [str] ! PlanError {
+    content_names: [str]) -> [str] ! PlanError {
     var out: [str] = []
     for name in try order_of(p) {
         let key = try key_of(p, name, contents, content_names)

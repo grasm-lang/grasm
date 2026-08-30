@@ -33,7 +33,7 @@ fn fnv1a(seed: i64, b: bytes) -> i64 {
         // The FNV prime, 16777619, as shifts and adds so no product needs
         // more than 32 bits before it is masked.
         h = mask32(mask32(h.shl(24)) + mask32(h.shl(8)) + mask32(h.shl(7))
-                   + mask32(h.shl(4)) + mask32(h.shl(1)) + h)
+            +mask32(h.shl(4)) + mask32(h.shl(1)) + h)
     }
     h
 }

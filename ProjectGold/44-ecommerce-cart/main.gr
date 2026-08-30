@@ -479,7 +479,7 @@ fn exchange() / {io, net} {
                             let raw = tcp_read(conn) ?? ""
                             let (next, resp) = route(parse_req(raw), s)
                             s = next
-                            match tcp_write(conn, resp) { Ok(_) -> {}  Err(e) -> {} }
+                            match tcp_write(conn, resp) { Ok(_) -> {} Err(e) -> {} }
                             net_close(conn)
                         }
                     }
@@ -533,7 +533,7 @@ fn exchange() / {io, net} {
                     if raw != "" {
                         let (next, resp) = route(parse_req(raw), s)
                         s = next
-                        match tcp_write(h, resp) { Ok(_) -> {}  Err(e) -> {} }
+                        match tcp_write(h, resp) { Ok(_) -> {} Err(e) -> {} }
                     }
                 } else {
                     for i in 0..clients.len() {
@@ -595,7 +595,7 @@ fn serve() / {io, net} {
                 if raw != "" {
                     let (next, resp) = route(parse_req(raw), s)
                     s = next
-                    match tcp_write(h, resp) { Ok(_) -> {}  Err(e) -> {} }
+                    match tcp_write(h, resp) { Ok(_) -> {} Err(e) -> {} }
                 }
                 net_close(h)
                 var still: [i64] = []

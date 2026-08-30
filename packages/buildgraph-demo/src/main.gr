@@ -22,7 +22,7 @@ fn project() -> Plan {
 
 fn files(shared: str) -> ([str], [str]) {
     (["int a(void);", "int b(void);", shared, "int main(void)\{}"],
-     ["a.c", "b.c", "shared.h", "main.c"])
+        ["a.c", "b.c", "shared.h", "main.c"])
 }
 
 fn key(p: Plan, name: str, shared: str) -> str {
@@ -77,7 +77,7 @@ fn main() / {io} {
         Err(_e) -> say(f, "the first key computes", false)
     }
     // A missing input is not the same as an empty one.
-    match buildgraph.key_of(q, "x", ["" ], ["c"]) {
+    match buildgraph.key_of(q, "x", [""], ["c"]) {
         Ok(with_empty) -> {
             match buildgraph.key_of(q, "x", none, none) {
                 Ok(with_absent) -> say(f, "an absent input differs from an empty one",
@@ -112,7 +112,7 @@ fn main() / {io} {
     // `b.c` is read by `b.o`, which `lib.a` and `app` depend on. `a.o` does
     // not read it and must not be rebuilt.
     let changed = (["int a(void);", "int b(void); // edited", "#define N 1",
-                    "int main(void)\{}"], ["a.c", "b.c", "shared.h", "main.c"])
+        "int main(void)\{}"], ["a.c", "b.c", "shared.h", "main.c"])
     match buildgraph.work_to_do(p, c, changed.0, changed.1) {
         Ok(work) -> {
             say(f, "three tasks rebuild", work.len() == 3)

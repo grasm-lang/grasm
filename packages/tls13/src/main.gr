@@ -132,13 +132,13 @@ pub fn traffic_keys(secret: bytes) -> TrafficKeys {
 /// The client's and server's handshake secrets, bound to the transcript.
 pub fn handshake_traffic(s: Schedule, transcript_hash: bytes) -> (bytes, bytes) {
     (derive_secret_hashed(s.handshake, "c hs traffic", transcript_hash),
-     derive_secret_hashed(s.handshake, "s hs traffic", transcript_hash))
+        derive_secret_hashed(s.handshake, "s hs traffic", transcript_hash))
 }
 
 /// The same for application data, bound to a longer transcript.
 pub fn application_traffic(s: Schedule, transcript_hash: bytes) -> (bytes, bytes) {
     (derive_secret_hashed(s.master, "c ap traffic", transcript_hash),
-     derive_secret_hashed(s.master, "s ap traffic", transcript_hash))
+        derive_secret_hashed(s.master, "s ap traffic", transcript_hash))
 }
 
 /// The `Finished` message's key, and the value it carries.
@@ -186,7 +186,7 @@ fn max_record() -> i64 { 16640 }
 /// message a record holds. The header is the associated data, so it cannot be
 /// altered without the tag failing.
 pub fn seal_record(k: TrafficKeys, sequence: i64, content_type: i64,
-                   plaintext: bytes) -> bytes ! RecordError {
+    plaintext: bytes) -> bytes ! RecordError {
     var inner = plaintext.to_list()
     inner.push(content_type)
     let length = inner.len() + 16
@@ -195,7 +195,7 @@ pub fn seal_record(k: TrafficKeys, sequence: i64, content_type: i64,
     }
     var header: [i64] = [23, 3, 3, length.ushr(8).bit_and(255), length.bit_and(255)]
     let sealed = aes.gcm_seal(k.key, record_nonce(k.iv, sequence),
-                              bytes_of(header), bytes_of(inner))
+        bytes_of(header), bytes_of(inner))
     var out = header
     for b in sealed.to_list() {
         out.push(b)

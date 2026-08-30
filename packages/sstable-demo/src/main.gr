@@ -128,14 +128,14 @@ fn main() / {io} {
 
     print("-- what a table refuses")
     match sstable.build("{dir}/unsorted.sst",
-            [sstable.value_record("b".to_bytes(), "1".to_bytes()),
-             sstable.value_record("a".to_bytes(), "2".to_bytes())]) {
+        [sstable.value_record("b".to_bytes(), "1".to_bytes()),
+            sstable.value_record("a".to_bytes(), "2".to_bytes())]) {
         Ok(_u) -> say(f, "records out of order are refused", false)
         Err(_e) -> say(f, "records out of order are refused", true)
     }
     match sstable.build("{dir}/dup.sst",
-            [sstable.value_record("a".to_bytes(), "1".to_bytes()),
-             sstable.value_record("a".to_bytes(), "2".to_bytes())]) {
+        [sstable.value_record("a".to_bytes(), "1".to_bytes()),
+            sstable.value_record("a".to_bytes(), "2".to_bytes())]) {
         Ok(_u) -> say(f, "a duplicate key is refused", false)
         Err(_e) -> say(f, "a duplicate key is refused", true)
     }

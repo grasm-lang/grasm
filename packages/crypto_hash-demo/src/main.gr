@@ -17,19 +17,19 @@ fn check(label: str, got: str, want: str) {
 fn main() {
     print("-- SHA-256, FIPS 180-4 and the usual vectors")
     check("empty", crypto_hash.sha256(""),
-          "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
     check("abc", crypto_hash.sha256("abc"),
-          "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
     check("448 bits", crypto_hash.sha256("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
-          "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1")
+        "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1")
     check("one million a's is not run here", crypto_hash.sha256("a"),
-          "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb")
+        "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb")
     check("a block boundary, 55 bytes", crypto_hash.sha256("a".repeat(55)),
-          "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318")
+        "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318")
     check("a block boundary, 56 bytes", crypto_hash.sha256("a".repeat(56)),
-          "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a")
+        "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a")
     check("two blocks, 64 bytes", crypto_hash.sha256("a".repeat(64)),
-          "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb")
+        "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb")
 
     print("-- the same, as bytes")
     let d = crypto_hash.sha256_of("abc".to_bytes())
@@ -38,27 +38,27 @@ fn main() {
 
     print("-- HMAC-SHA-256, RFC 4231")
     check("case 1", crypto_hash.hmac_sha256_hex(bytes_of([11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11]), "Hi There".to_bytes()),
-          "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7")
+        "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7")
     check("case 2, key shorter than a block", crypto_hash.hmac_sha256_hex("Jefe".to_bytes(), "what do ya want for nothing?".to_bytes()),
-          "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843")
+        "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843")
     var long_key: [i64] = []
     for _i in 0..131 {
         long_key.push(0xaa)
     }
     check("case 6, key longer than a block", crypto_hash.hmac_sha256_hex(bytes_of(long_key), "Test Using Larger Than Block-Size Key - Hash Key First".to_bytes()),
-          "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54")
+        "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54")
     check("an empty key and message", crypto_hash.hmac_sha256_hex(bytes_of([]), bytes_of([])),
-          "b613679a0814d9ec772f95d778c35fc5ff1697c493715653c6c712144292c5ad")
+        "b613679a0814d9ec772f95d778c35fc5ff1697c493715653c6c712144292c5ad")
 
     print("-- PBKDF2-HMAC-SHA256, RFC 6070's parameters")
     check("1 iteration", crypto_hash.hex_of(crypto_hash.pbkdf2_sha256("password".to_bytes(), "salt".to_bytes(), 1, 32)),
-          "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b")
+        "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b")
     check("2 iterations", crypto_hash.hex_of(crypto_hash.pbkdf2_sha256("password".to_bytes(), "salt".to_bytes(), 2, 32)),
-          "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43")
+        "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43")
     check("4096 iterations", crypto_hash.hex_of(crypto_hash.pbkdf2_sha256("password".to_bytes(), "salt".to_bytes(), 4096, 32)),
-          "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a")
+        "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a")
     check("a longer key than one block", crypto_hash.hex_of(crypto_hash.pbkdf2_sha256("passwordPASSWORDpassword".to_bytes(), "saltSALTsaltSALTsaltSALTsaltSALTsalt".to_bytes(), 4096, 40)),
-          "348c89dbcbd32b2f32d814b8116e84cf2b17347ebc1800181c4e2a1fb8dd53e1c635518c7dac47e9")
+        "348c89dbcbd32b2f32d814b8116e84cf2b17347ebc1800181c4e2a1fb8dd53e1c635518c7dac47e9")
 
     print("-- constant-time comparison")
     let a = crypto_hash.sha256_of("secret".to_bytes())

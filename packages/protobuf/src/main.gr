@@ -234,8 +234,8 @@ pub fn read(raw: bytes) -> [PbField] ! PbError {
         }
         match wire {
             Varint -> out.push(PbField{ number: number, wire: wire,
-                                        varint: try read_varint(r),
-                                        bytes_value: bytes_of([]) })
+                varint: try read_varint(r),
+                bytes_value: bytes_of([]) })
             Fixed32 -> {
                 if r.i + 4 > r.b.len() {
                     fail(PbError{ why: "a fixed32 with fewer than four bytes after it", at: r.i })
@@ -246,7 +246,7 @@ pub fn read(raw: bytes) -> [PbField] ! PbError {
                 }
                 r.i = r.i + 4
                 out.push(PbField{ number: number, wire: wire, varint: v,
-                                  bytes_value: bytes_of([]) })
+                    bytes_value: bytes_of([]) })
             }
             Fixed64 -> {
                 if r.i + 8 > r.b.len() {
@@ -258,7 +258,7 @@ pub fn read(raw: bytes) -> [PbField] ! PbError {
                 }
                 r.i = r.i + 8
                 out.push(PbField{ number: number, wire: wire, varint: v,
-                                  bytes_value: bytes_of([]) })
+                    bytes_value: bytes_of([]) })
             }
             Delimited -> {
                 let n = try read_varint(r)
@@ -271,7 +271,7 @@ pub fn read(raw: bytes) -> [PbField] ! PbError {
                 }
                 r.i = r.i + n
                 out.push(PbField{ number: number, wire: wire, varint: 0,
-                                  bytes_value: bytes_of(payload) })
+                    bytes_value: bytes_of(payload) })
             }
         }
     }

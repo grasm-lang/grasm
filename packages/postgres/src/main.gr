@@ -36,7 +36,7 @@ type PgMessage = { tag: str, body: bytes }
 
 fn be32(n: i64) -> [i64] {
     [n.ushr(24).bit_and(255), n.ushr(16).bit_and(255),
-     n.ushr(8).bit_and(255), n.bit_and(255)]
+        n.ushr(8).bit_and(255), n.bit_and(255)]
 }
 
 fn be16(n: i64) -> [i64] {
@@ -364,9 +364,9 @@ fn xor_bytes(a: bytes, b: bytes) -> bytes {
 /// authenticated *to* the server without the server authenticating to it,
 /// which is the half of mutual authentication that stops an impostor.
 pub fn scram_final(password: str, client_first_bare: str, challenge: ScramChallenge,
-                   server_first: str) -> (bytes, str) {
+    server_first: str) -> (bytes, str) {
     let salted = crypto_hash.pbkdf2_sha256(password.to_bytes(), challenge.salt,
-                                           challenge.iterations, 32)
+        challenge.iterations, 32)
     let client_key = crypto_hash.hmac_sha256(salted, "Client Key".to_bytes())
     let stored_key = crypto_hash.sha256_of(client_key)
     let without_proof = "c=biws,r={challenge.nonce}"
@@ -377,7 +377,7 @@ pub fn scram_final(password: str, client_first_bare: str, challenge: ScramChalle
     let server_signature = crypto_hash.hmac_sha256(server_key, auth_message.to_bytes())
     let text = "{without_proof},p={bytes_codec.encode_base64(proof)}"
     (frame("p", bytes_of(text.to_bytes().to_list())),
-     bytes_codec.encode_base64(server_signature))
+        bytes_codec.encode_base64(server_signature))
 }
 
 /// Does the server's final message carry the signature we expected?

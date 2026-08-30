@@ -84,7 +84,7 @@ fn search(b: Book, needle: str) -> [str] {
                 // an operator. Written the other way round this does not parse
                 // (FINDINGS.md, F1).
                 if c.name.to_lower().contains(needle.to_lower()) or
-                    c.email.to_lower().contains(needle.to_lower()) {
+                c.email.to_lower().contains(needle.to_lower()) {
                     out.push(c.name)
                 }
             }

@@ -99,8 +99,8 @@ fn main() / {io} {
     let blob_id = "ce013625030ba8dba906f756967f9e9ca394464a"
     let tree_id = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
     match gitobj.write_tree([
-            gitobj.tree_entry("a", tree_id),
-            gitobj.entry_of(gitobj.mode_file(), "a.b", blob_id)]) {
+        gitobj.tree_entry("a", tree_id),
+        gitobj.entry_of(gitobj.mode_file(), "a.b", blob_id)]) {
         Ok(t) -> {
             match gitobj.read_tree(t) {
                 Ok(back) -> {
@@ -113,9 +113,9 @@ fn main() / {io} {
         Err(_e) -> say(f, "the tree is written", false)
     }
     match gitobj.write_tree([
-            gitobj.entry_of(gitobj.mode_file(), "zebra", blob_id),
-            gitobj.entry_of(gitobj.mode_exec(), "apple", blob_id),
-            gitobj.tree_entry("middle", tree_id)]) {
+        gitobj.entry_of(gitobj.mode_file(), "zebra", blob_id),
+        gitobj.entry_of(gitobj.mode_exec(), "apple", blob_id),
+        gitobj.tree_entry("middle", tree_id)]) {
         Ok(t) -> {
             match gitobj.read_tree(t) {
                 Ok(back) -> {
@@ -132,8 +132,8 @@ fn main() / {io} {
         Err(_e) -> say(f, "the tree is written", false)
     }
     match gitobj.write_tree([
-            gitobj.entry_of(gitobj.mode_file(), "same", blob_id),
-            gitobj.entry_of(gitobj.mode_file(), "same", blob_id)]) {
+        gitobj.entry_of(gitobj.mode_file(), "same", blob_id),
+        gitobj.entry_of(gitobj.mode_file(), "same", blob_id)]) {
         Ok(_t) -> say(f, "two entries with one name are refused", false)
         Err(_e) -> say(f, "two entries with one name are refused", true)
     }

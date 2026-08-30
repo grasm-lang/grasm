@@ -74,7 +74,7 @@ fn main() {
     check("audience in the list", addressed, jwt.requiring_audience(jwt.rules(NOW), "admin"))
     check("audience not in the list", addressed, jwt.requiring_audience(jwt.rules(NOW), "web"))
     check("a single-string audience", signed("\{\"aud\":\"api\"}"),
-          jwt.requiring_audience(jwt.rules(NOW), "api"))
+        jwt.requiring_audience(jwt.rules(NOW), "api"))
 
     print("-- reading a claim from a verified payload")
     match jwt.verify(plain, HS256, KEY.to_bytes(), jwt.rules(NOW)) {

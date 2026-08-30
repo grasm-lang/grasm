@@ -29,11 +29,11 @@ type RecordType =
     | DS
     | Other(code: i64)
 
-// `DnsRecord`, not `Record`: types share one namespace across a program
-// ([T-MODULE-NS]) and `log` declares a `Record`. That is the fifth collision on
-// a generic name in this work — `Record`, `Table`, `Node`, `Entry`,
-// `StoreError` — and the pattern is worth naming: the obvious noun for a thing
-// is the obvious noun in every package that has one.
+    // `DnsRecord`, not `Record`: types share one namespace across a program
+    // ([T-MODULE-NS]) and `log` declares a `Record`. That is the fifth collision on
+    // a generic name in this work — `Record`, `Table`, `Node`, `Entry`,
+    // `StoreError` — and the pattern is worth naming: the obvious noun for a thing
+    // is the obvious noun in every package that has one.
 type DnsRecord = {
     name: str,
     kind: RecordType,

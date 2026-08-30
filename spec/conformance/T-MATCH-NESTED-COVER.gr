@@ -25,7 +25,7 @@ fn opt(o: Option[Inner]) -> str {
 
 fn main() {
     // And a binding payload still covers the variant outright.
-    let bound = match Plain {
+    let bound = match Plain{
         Wrap(i) -> "w"
         Plain -> "plain"
     }

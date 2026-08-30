@@ -15,7 +15,7 @@ fn read_socket() -> Report {
 fn fetch_row() -> Report {
     errors.with_field(
         errors.at(errors.because("could not read the result set", read_socket()),
-                  "sql.rows"),
+            "sql.rows"),
         errors.field("query", "select * from users where id = ?"))
 }
 

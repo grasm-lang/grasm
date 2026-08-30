@@ -126,7 +126,7 @@ fn main() / {io} {
                                         after.entries.len() == before.entries.len())
                                     // And an append after trimming is readable.
                                     match wal.append("{dir}/fix.log",
-                                            wal.put_entry("new".to_bytes(), "one".to_bytes()), true) {
+                                        wal.put_entry("new".to_bytes(), "one".to_bytes()), true) {
                                         Ok(_u) -> {
                                             match wal.replay("{dir}/fix.log") {
                                                 Ok(more) -> say(f, "a record appended after the trim replays",

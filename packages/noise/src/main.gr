@@ -219,7 +219,7 @@ pub fn timestamp_len() -> i64 {
 /// counts as a monotonic identity for this peer is the caller's policy, and a
 /// library that read a clock would impose one.
 pub fn initiate(static_private: bytes, static_public: bytes, responder_static: bytes,
-                ephemeral_private: bytes, timestamp: bytes, sender_index: i64) -> Initiation ! HandshakeError {
+    ephemeral_private: bytes, timestamp: bytes, sender_index: i64) -> Initiation ! HandshakeError {
     // The fixed length above is a claim this function has to keep. A caller
     // that passed a timestamp of some other width would produce a message of
     // some other length, and a length is the one field an observer reads for
@@ -269,10 +269,10 @@ pub fn initiate(static_private: bytes, static_public: bytes, responder_static: b
 
 fn header(kind: i64, index: i64) -> bytes {
     bytes_of([kind, 0, 0, 0,
-              index.bit_and(255),
-              index.ushr(8).bit_and(255),
-              index.ushr(16).bit_and(255),
-              index.ushr(24).bit_and(255)])
+        index.bit_and(255),
+        index.ushr(8).bit_and(255),
+        index.ushr(16).bit_and(255),
+        index.ushr(24).bit_and(255)])
 }
 
 fn index_at(m: bytes, at: i64) -> i64 {
@@ -306,7 +306,7 @@ type Incoming = {
 /// made to do public-key arithmetic by an unauthenticated packet is a peer
 /// that can be made to do nothing else.
 pub fn consume_initiation(static_private: bytes, static_public: bytes,
-                          message: bytes) -> Incoming ! HandshakeError {
+    message: bytes) -> Incoming ! HandshakeError {
     if message.len() != initiation_len() {
         fail(BadLength("a first message is {initiation_len()} bytes, this one is {message.len()}"))
     }
@@ -389,7 +389,7 @@ type HandshakeResponse = {
 /// producing it proves the responder derived the same four secrets, and there
 /// is nothing to say beyond that.
 pub fn respond(incoming: Incoming, ephemeral_private: bytes, preshared: bytes,
-               sender_index: i64) -> HandshakeResponse ! HandshakeError {
+    sender_index: i64) -> HandshakeResponse ! HandshakeError {
     var st = incoming.state
     st.ephemeral_private = ephemeral_private
     st.ephemeral_public = x25519.public_key(ephemeral_private)
@@ -421,7 +421,7 @@ pub fn respond(incoming: Incoming, ephemeral_private: bytes, preshared: bytes,
 
 fn pack_index(index: i64) -> bytes {
     bytes_of([index.bit_and(255), index.ushr(8).bit_and(255),
-              index.ushr(16).bit_and(255), index.ushr(24).bit_and(255)])
+        index.ushr(16).bit_and(255), index.ushr(24).bit_and(255)])
 }
 
 /// Read the reply, completing the handshake.
@@ -537,7 +537,7 @@ pub fn cookie_of(secret: bytes, address: str) -> bytes {
 /// what stops a cookie reply being replayed at a different handshake — it
 /// only opens against the message that provoked it.
 pub fn cookie_reply(responder_static: bytes, cookie: bytes, receiver_index: i64,
-                    nonce: bytes, their_mac1: bytes) -> bytes {
+    nonce: bytes, their_mac1: bytes) -> bytes {
     let sealed = chachapoly.xseal(cookie_key(responder_static), nonce, their_mac1, cookie)
     var out = header(type_cookie(), receiver_index).to_list()
     for b in nonce.to_list() {
@@ -555,7 +555,7 @@ pub fn cookie_reply(responder_static: bytes, cookie: bytes, receiver_index: i64,
 /// which of the reasons it was — the wrong length, the wrong type, a bad tag,
 /// the wrong handshake — is not a peer's business.
 pub fn consume_cookie_reply(responder_static: bytes, message: bytes,
-                            my_mac1: bytes) -> Option[bytes] {
+    my_mac1: bytes) -> Option[bytes] {
     if message.len() != cookie_reply_len() {
         return None
     }

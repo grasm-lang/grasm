@@ -116,7 +116,7 @@ pub fn decode_query(s: str) -> str {
 
 fn bad(why: str) -> Url {
     Url{ scheme: "", user: "", host: "", port: 0, path: "", query: "",
-         fragment: "", ok: false, why: why }
+        fragment: "", ok: false, why: why }
 }
 
 /// An absolute or relative URL. Never fails outright: a malformed one comes
@@ -213,7 +213,7 @@ pub fn parse(text: str) -> Url {
         None -> {}
     }
     Url{ scheme: scheme, user: user, host: host, port: port, path: rest,
-         query: query, fragment: fragment, ok: true, why: "" }
+        query: query, fragment: fragment, ok: true, why: "" }
 }
 
 fn scheme_shaped(s: str) -> bool {
@@ -403,8 +403,8 @@ pub fn resolve(base_text: str, ref_text: str) -> Url {
     // `href=""` on a page is.
     if ref_text.trim().is_empty() {
         return Url{ scheme: base.scheme, user: base.user, host: base.host,
-                    port: base.port, path: base.path, query: base.query,
-                    fragment: "", ok: true, why: "" }
+            port: base.port, path: base.path, query: base.query,
+            fragment: "", ok: true, why: "" }
     }
     let r = parse(ref_text)
     if not r.ok {
@@ -412,13 +412,13 @@ pub fn resolve(base_text: str, ref_text: str) -> Url {
     }
     if not r.scheme.is_empty() {
         return Url{ scheme: r.scheme, user: r.user, host: r.host, port: r.port,
-                    path: remove_dots(r.path), query: r.query,
-                    fragment: r.fragment, ok: true, why: "" }
+            path: remove_dots(r.path), query: r.query,
+            fragment: r.fragment, ok: true, why: "" }
     }
     if not r.host.is_empty() {
         return Url{ scheme: base.scheme, user: r.user, host: r.host, port: r.port,
-                    path: remove_dots(r.path), query: r.query,
-                    fragment: r.fragment, ok: true, why: "" }
+            path: remove_dots(r.path), query: r.query,
+            fragment: r.fragment, ok: true, why: "" }
     }
     var path = base.path
     var query = base.query
@@ -435,5 +435,5 @@ pub fn resolve(base_text: str, ref_text: str) -> Url {
         }
     }
     Url{ scheme: base.scheme, user: base.user, host: base.host, port: base.port,
-         path: path, query: query, fragment: r.fragment, ok: true, why: "" }
+        path: path, query: query, fragment: r.fragment, ok: true, why: "" }
 }

@@ -490,9 +490,9 @@ fn storage_checks() / {io} {
     if identical {
         for i in 0..posts.len() {
             if back[i].id != posts[i].id or
-                back[i].title != posts[i].title or
-                back[i].body != posts[i].body or
-                back[i].published != posts[i].published {
+            back[i].title != posts[i].title or
+            back[i].body != posts[i].body or
+            back[i].published != posts[i].published {
                 identical = false
             }
         }

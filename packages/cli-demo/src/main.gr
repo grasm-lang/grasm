@@ -6,18 +6,18 @@ import cli
 fn spec() -> Command {
     let build = cli.command("build", "compile a program",
         [cli.text_flag("out", "o", "where to write it", "a.out"),
-         cli.switch_flag("native", "", "compile ahead of time"),
-         cli.repeated(cli.text_flag("define", "D", "a name to define", ""))],
+            cli.switch_flag("native", "", "compile ahead of time"),
+            cli.repeated(cli.text_flag("define", "D", "a name to define", ""))],
         [cli.positional("source", "the file to compile")])
     let run = cli.command("run", "run a program",
         [cli.number_flag("times", "n", "how many times", 1)],
         [cli.positional("source", "the file to run"),
-         cli.rest_positional("args", "arguments for the program")])
+            cli.rest_positional("args", "arguments for the program")])
     cli.with_subcommands(
         cli.command("tool", "a small example",
             [cli.switch_flag("verbose", "v", "say more"),
-             cli.switch_flag("quiet", "q", "say less"),
-             cli.required(cli.text_flag("root", "r", "where to work", ""))],
+                cli.switch_flag("quiet", "q", "say less"),
+                cli.required(cli.text_flag("root", "r", "where to work", ""))],
             []),
         [build, run])
 }

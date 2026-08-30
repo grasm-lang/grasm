@@ -29,9 +29,9 @@ type Tok =
 
 fn keywords() -> [str] {
     ["fn", "let", "var", "if", "else", "match", "while", "for", "in", "return",
-     "break", "continue", "type", "effect", "extern", "import", "test", "bench",
-     "pub", "and", "or", "not", "try", "fail", "with", "handled_by", "spawn",
-     "parallel", "region", "unsafe", "ref", "own", "inout", "true", "false"]
+        "break", "continue", "type", "effect", "extern", "import", "test", "bench",
+        "pub", "and", "or", "not", "try", "fail", "with", "handled_by", "spawn",
+        "parallel", "region", "unsafe", "ref", "own", "inout", "true", "false"]
 }
 
 fn is_digit(c: str) -> bool {
@@ -231,7 +231,7 @@ fn lex_operator(inout lx: Lexer) -> Tok {
     // two or three tokens longer than they should have, and the counts matched
     // the number of `??` in each exactly. That is what the comparison is for.
     let two = ["->", "=>", "==", "!=", "<=", ">=", "|>", "..", "+=", "-=", "*=",
-               "/=", "%=", "&&", "||", "::", "??"]
+        "/=", "%=", "&&", "||", "::", "??"]
     var got = ""
     for t in three {
         if got == "" and peek_at(lx, 0) + peek_at(lx, 1) + peek_at(lx, 2) == t {
@@ -292,21 +292,21 @@ fn run_lexer(inout lx: Lexer) {
             }
 
             // Runs of newlines collapse to one, as the real lexer does.
-            let is_nl = match tok { TNewline -> true  _ -> false }
+            let is_nl = match tok { TNewline -> true _ -> false }
             let last_nl = if lx.toks.len() == 0 { false } else {
-                match lx.toks[lx.toks.len() - 1] { TNewline -> true  _ -> false }
+                match lx.toks[lx.toks.len() - 1] { TNewline -> true _ -> false }
             }
             // And a newline before a leading `.` or `?.` is absorbed, so a
             // method chain may be written down the left margin ([L-LEADING-DOT]).
             // No statement may begin with a dot, so the newline cannot have
             // been separating two statements.
-            let leads_chain = match tok { TOp(s) -> s == "." or s == "?."  _ -> false }
+            let leads_chain = match tok { TOp(s) -> s == "." or s == "?." _ -> false }
             if leads_chain and last_nl {
                 lx.toks[lx.toks.len() - 1] = tok
             } else if not (is_nl and last_nl) {
                 lx.toks.push(tok)
             }
-            lx.after_dot = match tok { TOp(s) -> s == "."  _ -> false }
+            lx.after_dot = match tok { TOp(s) -> s == "." _ -> false }
         }
     }
 }

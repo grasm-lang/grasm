@@ -58,7 +58,7 @@ pub fn new_assembly() -> Assembly {
     var fl: [str] = []
     var fw: [i64] = []
     Assembly{ code: c, label_names: n, label_at: a,
-              fixup_at: fa, fixup_label: fl, fixup_width: fw }
+        fixup_at: fa, fixup_label: fl, fixup_width: fw }
 }
 
 fn emit(inout a: Assembly, b: i64) {
@@ -327,11 +327,11 @@ type AsmError =
     | UnknownLabel(name: str)
     | TooFar(name: str, distance: i64)
 
-/// Resolve the branches and answer the finished code.
-///
-/// A displacement is measured from the *end* of the instruction, not its
-/// start, which is the single most common off-by-four in a hand-written
-/// assembler and is invisible until a jump lands in the middle of something.
+    /// Resolve the branches and answer the finished code.
+    ///
+    /// A displacement is measured from the *end* of the instruction, not its
+    /// start, which is the single most common off-by-four in a hand-written
+    /// assembler and is invisible until a jump lands in the middle of something.
 pub fn finish(inout a: Assembly) -> bytes ! AsmError {
     for i in 0..a.fixup_at.len() {
         let name = a.fixup_label[i]

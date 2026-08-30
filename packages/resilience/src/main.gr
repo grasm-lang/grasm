@@ -106,7 +106,7 @@ type Breaker = {
 /// reopens on one failure.
 pub fn breaker(threshold: i64, recovery_ms: i64, probes: i64) -> Breaker {
     Breaker{ state: Closed, failures: 0, successes: 0, threshold: threshold,
-             recovery_ms: recovery_ms, opened_at: 0, probes: probes }
+        recovery_ms: recovery_ms, opened_at: 0, probes: probes }
 }
 
 /// May a call go through, at this moment?
@@ -122,9 +122,9 @@ pub fn allows(b: Breaker, now_ms: i64) -> (Breaker, bool) {
         Open -> {
             if now_ms - b.opened_at >= b.recovery_ms {
                 let moved = Breaker{ state: HalfOpen, failures: b.failures,
-                                     successes: 0, threshold: b.threshold,
-                                     recovery_ms: b.recovery_ms,
-                                     opened_at: b.opened_at, probes: b.probes }
+                    successes: 0, threshold: b.threshold,
+                    recovery_ms: b.recovery_ms,
+                    opened_at: b.opened_at, probes: b.probes }
                 return (moved, true)
             }
             (b, false)
@@ -140,12 +140,12 @@ pub fn succeeded(b: Breaker, now_ms: i64) -> Breaker {
                 return breaker(b.threshold, b.recovery_ms, b.probes)
             }
             Breaker{ state: HalfOpen, failures: b.failures, successes: n,
-                     threshold: b.threshold, recovery_ms: b.recovery_ms,
-                     opened_at: b.opened_at, probes: b.probes }
+                threshold: b.threshold, recovery_ms: b.recovery_ms,
+                opened_at: b.opened_at, probes: b.probes }
         }
         _ -> Breaker{ state: Closed, failures: 0, successes: 0,
-                      threshold: b.threshold, recovery_ms: b.recovery_ms,
-                      opened_at: b.opened_at, probes: b.probes }
+            threshold: b.threshold, recovery_ms: b.recovery_ms,
+            opened_at: b.opened_at, probes: b.probes }
     }
 }
 
@@ -154,18 +154,18 @@ pub fn failed(b: Breaker, now_ms: i64) -> Breaker {
     // threshold again: the probe was the test, and it failed.
     match b.state {
         HalfOpen -> Breaker{ state: Open, failures: b.failures + 1, successes: 0,
-                             threshold: b.threshold, recovery_ms: b.recovery_ms,
-                             opened_at: now_ms, probes: b.probes }
+            threshold: b.threshold, recovery_ms: b.recovery_ms,
+            opened_at: now_ms, probes: b.probes }
         _ -> {
             let n = b.failures + 1
             if n >= b.threshold {
                 return Breaker{ state: Open, failures: n, successes: 0,
-                                threshold: b.threshold, recovery_ms: b.recovery_ms,
-                                opened_at: now_ms, probes: b.probes }
+                    threshold: b.threshold, recovery_ms: b.recovery_ms,
+                    opened_at: now_ms, probes: b.probes }
             }
             Breaker{ state: Closed, failures: n, successes: 0,
-                     threshold: b.threshold, recovery_ms: b.recovery_ms,
-                     opened_at: b.opened_at, probes: b.probes }
+                threshold: b.threshold, recovery_ms: b.recovery_ms,
+                opened_at: b.opened_at, probes: b.probes }
         }
     }
 }
@@ -194,7 +194,7 @@ type Bucket = {
 /// every tick and the bucket would never fill.
 pub fn bucket(capacity: i64, per_second: i64, now_ms: i64) -> Bucket {
     Bucket{ capacity: capacity, per_second: per_second,
-            tokens_milli: capacity * 1000, last_ms: now_ms }
+        tokens_milli: capacity * 1000, last_ms: now_ms }
 }
 
 /// Take one token if there is one. Answers the bucket and whether it was
@@ -205,8 +205,8 @@ pub fn take(b: Bucket, now_ms: i64) -> (Bucket, bool) {
         return (filled, false)
     }
     (Bucket{ capacity: filled.capacity, per_second: filled.per_second,
-             tokens_milli: filled.tokens_milli - 1000, last_ms: filled.last_ms },
-     true)
+        tokens_milli: filled.tokens_milli - 1000, last_ms: filled.last_ms },
+        true)
 }
 
 fn refill(b: Bucket, now_ms: i64) -> Bucket {
@@ -214,7 +214,7 @@ fn refill(b: Bucket, now_ms: i64) -> Bucket {
     // bucket. `now_millis` is wall time, so this happens.
     if now_ms <= b.last_ms {
         return Bucket{ capacity: b.capacity, per_second: b.per_second,
-                       tokens_milli: b.tokens_milli, last_ms: b.last_ms }
+            tokens_milli: b.tokens_milli, last_ms: b.last_ms }
     }
     let gained = (now_ms - b.last_ms) * b.per_second
     var t = b.tokens_milli + gained
@@ -223,7 +223,7 @@ fn refill(b: Bucket, now_ms: i64) -> Bucket {
         t = ceiling
     }
     Bucket{ capacity: b.capacity, per_second: b.per_second,
-            tokens_milli: t, last_ms: now_ms }
+        tokens_milli: t, last_ms: now_ms }
 }
 
 /// Whole tokens available, for a report.

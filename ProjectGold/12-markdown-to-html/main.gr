@@ -83,11 +83,11 @@ fn inline(src: str) -> str {
                 }
                 // Recursion, so `**bold with *italic* inside**` nests.
                 let open_tags = if want == 3 { "<em><strong>" }
-                    else if want == 2 { "<strong>" }
-                    else { "<em>" }
+                else if want == 2 { "<strong>" }
+                else { "<em>" }
                 let close_tags = if want == 3 { "</strong></em>" }
-                    else if want == 2 { "</strong>" }
-                    else { "</em>" }
+                else if want == 2 { "</strong>" }
+                else { "</em>" }
                 out = out + open_tags + inline(body) + close_tags
                 i = close + want
             }

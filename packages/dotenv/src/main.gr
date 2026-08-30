@@ -186,7 +186,7 @@ fn expand(v: str, known: Map[str, str]) -> str {
             k = k + 1
         }
         while k < cs.len() and cs[k] != "}" and
-              "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_".contains(cs[k]) {
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_".contains(cs[k]) {
             name = name + cs[k]
             k = k + 1
         }

@@ -194,10 +194,10 @@ fn main() {
     check("abc", "abc", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
     // 56 bytes: exactly the length that forces a second block after padding.
     check("448 bits", "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
-          "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1")
+        "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1")
     // 112 bytes: two full blocks plus padding into a third.
     check("896 bits", "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu",
-          "cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1")
+        "cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1")
     check("a", "a", "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb")
 
     print("--- length boundaries, where padding goes wrong ---")

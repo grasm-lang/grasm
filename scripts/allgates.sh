@@ -49,6 +49,7 @@ run_gate replaytest    scripts/replaytest.sh
 run_gate wasmtest      scripts/wasmtest.sh
 run_gate gatecheck     scripts/gatecheck.sh
 run_gate crosstest     scripts/crosstest.sh
+run_gate fmttest       scripts/fmttest.sh
 run_gate grasmwire     scripts/grasmwire_e2e.sh
 run_gate cryptodiff    scripts/crypto_diff.sh
 run_gate kvcrash       scripts/kvstore_crash.sh

@@ -60,7 +60,7 @@ pub fn parse_with(text: str, separator: str) -> [[str]] ! CsvError {
         if c == "\"" {
             if not field.is_empty() {
                 fail(CsvError{ why: "a quote in the middle of an unquoted field",
-                          row: line, column: column })
+                    row: line, column: column })
             }
             quoted = true
             any = true
@@ -112,7 +112,7 @@ pub fn parse_with(text: str, separator: str) -> [[str]] ! CsvError {
 /// otherwise be lost.
 pub fn render_field(v: str, separator: str) -> str {
     let needs = v.contains(separator) or v.contains("\"") or v.contains("\n") or
-        v.contains("\r") or v.starts_with(" ") or v.ends_with(" ")
+    v.contains("\r") or v.starts_with(" ") or v.ends_with(" ")
     if not needs {
         return v
     }

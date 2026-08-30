@@ -76,8 +76,8 @@ fn main() {
 
     print("-- routing")
     for pair in [("/users/:id", "/users/7"), ("/users/:id", "/users"),
-                 ("/users/:id", "/users/7/edit"), ("/static/*", "/static/a/b.css"),
-                 ("/", "/"), ("/", "/x")] {
+        ("/users/:id", "/users/7/edit"), ("/static/*", "/static/a/b.css"),
+        ("/", "/"), ("/", "/x")] {
         print("  {pair.0} ~ {pair.1} -> {http.path_matches(pair.0, pair.1)}")
     }
     print("  id of /users/42 -> {http.path_param("/users/:id", "/users/42", "id") ?? "(none)"}")

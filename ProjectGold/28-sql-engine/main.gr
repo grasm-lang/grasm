@@ -102,8 +102,8 @@ fn tokenize(src: str) -> [str] ! Bad {
                 // Operators end the lines rather than starting them: a newline
                 // ends a statement unless the line ends in one.
                 let stop = d == " " or d == "," or d == "(" or d == ")" or
-                    d == "=" or d == "<" or d == ">" or d == "!" or
-                    d == "\n" or d == "\t"
+                d == "=" or d == "<" or d == ">" or d == "!" or
+                d == "\n" or d == "\t"
                 if stop {
                     breaking = true
                     i = cs.len()
@@ -263,11 +263,11 @@ fn apply_op(op: str, a: Cell, b: Cell) -> Truth {
         None -> Unknown
         Some(c) -> {
             let yes = if op == "=" { c == 0 }
-                else if op == "!=" { c != 0 }
-                else if op == "<" { c < 0 }
-                else if op == ">" { c > 0 }
-                else if op == "<=" { c <= 0 }
-                else { c >= 0 }
+            else if op == "!=" { c != 0 }
+            else if op == "<" { c < 0 }
+            else if op == ">" { c > 0 }
+            else if op == "<=" { c <= 0 }
+            else { c >= 0 }
             if yes { True } else { False }
         }
     }
@@ -277,7 +277,7 @@ fn and_truth(a: Truth, b: Truth) -> Truth {
     match a {
         False -> False
         True -> b
-        Unknown -> match b { False -> False  _ -> Unknown }
+        Unknown -> match b { False -> False _ -> Unknown }
     }
 }
 
@@ -285,7 +285,7 @@ fn or_truth(a: Truth, b: Truth) -> Truth {
     match a {
         True -> True
         False -> b
-        Unknown -> match b { True -> True  _ -> Unknown }
+        Unknown -> match b { True -> True _ -> Unknown }
     }
 }
 
@@ -378,8 +378,8 @@ fn run_query(src: str, tables: [Table]) -> [str] ! Bad {
                 // involving one is unknown, so a NULL row never displaces
                 // anything and nothing displaces it either, and `ORDER BY age
                 // DESC` put the NULL between two 25s.
-                let mine_null = match row[idx] { Null -> true  _ -> false }
-                let theirs_null = match sorted[i][idx] { Null -> true  _ -> false }
+                let mine_null = match row[idx] { Null -> true _ -> false }
+                let theirs_null = match sorted[i][idx] { Null -> true _ -> false }
                 let before = if mine_null {
                     false
                 } else if theirs_null {

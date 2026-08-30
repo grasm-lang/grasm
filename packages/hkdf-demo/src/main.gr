@@ -87,11 +87,11 @@ fn main() / {io} {
     let two = hkdf.kdf(b, unhex("0000000000000000000000000000000000000000000000000000000000000000"),
         unhex("0102030405"), 2)
     let prefix_stable = crypto_hash.hex_of(two[0]) == crypto_hash.hex_of(keys[0]) and
-        crypto_hash.hex_of(two[1]) == crypto_hash.hex_of(keys[1])
+    crypto_hash.hex_of(two[1]) == crypto_hash.hex_of(keys[1])
     print("  asking for two gives the same first two: {prefix_stable}")
 
     let all_distinct = crypto_hash.hex_of(keys[0]) != crypto_hash.hex_of(keys[1]) and
-        crypto_hash.hex_of(keys[1]) != crypto_hash.hex_of(keys[2])
+    crypto_hash.hex_of(keys[1]) != crypto_hash.hex_of(keys[2])
     print("  the three differ: {all_distinct}")
 
     // A one-bit change in the input changes every output byte's chance

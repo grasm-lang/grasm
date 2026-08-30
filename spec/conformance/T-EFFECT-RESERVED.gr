@@ -14,7 +14,7 @@ effect io {
 }
 
 fn quiet(n: i64) -> i64 / {} {
-    with io handled_by ioHandler{ nothing: || 1 } {
+    with io handled_by ioHandler { nothing: || 1 } {
         print("a declared-empty row printed")
     }
     n

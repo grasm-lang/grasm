@@ -105,7 +105,7 @@ fn read_one(inout c: Cursor, depth: i64) -> Datum ! ReadError {
                 c.at = c.at + 1
                 closed = true
             } else if c.text[c.at] == "." and c.at + 1 < c.text.len() and
-                is_delimiter(c.text[c.at + 1]) {
+            is_delimiter(c.text[c.at + 1]) {
                 // An improper list: `(a . b)`. The dot must have something
                 // before it and exactly one thing after.
                 if items.len() == 0 {

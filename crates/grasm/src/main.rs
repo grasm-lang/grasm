@@ -618,7 +618,7 @@ fn run() -> ExitCode {
                     println!("ok: `{path}` is formatted");
                     ExitCode::SUCCESS
                 } else {
-                    eprintln!("`{path}` is not canonically indented (run `grasm fmt {path}`)");
+                    eprintln!("`{path}` is not canonically formatted (run `grasm fmt {path}`)");
                     ExitCode::FAILURE
                 }
             } else if formatted != src {
@@ -831,7 +831,7 @@ fn run() -> ExitCode {
             eprintln!("      --no-incremental         one object, no cache (best for a single build)");
             eprintln!("  doc <file.gr> [-o out.md]    API documentation from `///` comments");
             eprintln!("  api <file.gr> [--against F]  public surface, and what changed in it");
-            eprintln!("  fmt <file.gr> [--check]      re-indent (4 spaces per level); line contents are left alone");
+            eprintln!("  fmt <file.gr> [--check]      canonical layout: 4-space indent and one spacing for every token");
             eprintln!("  lsp                          language server (stdio)");
             eprintln!("  dap                          debug adapter (stdio) — breakpoints, stepping");
             eprintln!("  deps [dir]                   resolve dependencies, check capabilities, write grasm.lock");

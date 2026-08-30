@@ -16,7 +16,7 @@ type JsonError =
     | Truncated(at: i64)
     | TrailingInput(at: i64)
 
-/// Cursor over the input, in characters rather than bytes.
+    /// Cursor over the input, in characters rather than bytes.
 type Cursor = { chars: [str], pos: i64 }
 
 fn peek(c: Cursor) -> str {

@@ -60,7 +60,7 @@ type Message =
     | RequestVote(term: i64, from: i64, last_log_index: i64, last_log_term: i64)
     | VoteGranted(term: i64, from: i64, to: i64, granted: bool)
     | AppendEntries(term: i64, from: i64, prev_index: i64, prev_term: i64,
-                    entries: [LogEntry], leader_commit: i64)
+    entries: [LogEntry], leader_commit: i64)
     | AppendResult(term: i64, from: i64, to: i64, success: bool, match_index: i64)
 
 pub fn no_vote() -> i64 { 0 - 1 }
@@ -120,7 +120,7 @@ fn step_down(inout n: RaftNode, term: i64) {
 
 /// Time passing. Answers whatever the node wants to send.
 pub fn tick(inout n: RaftNode, now: i64, election_timeout: i64,
-            heartbeat_interval: i64) -> [Message] {
+    heartbeat_interval: i64) -> [Message] {
     var out: [Message] = []
     match n.role {
         Leader -> {
@@ -150,7 +150,7 @@ pub fn tick(inout n: RaftNode, now: i64, election_timeout: i64,
                 } else {
                     for p in n.peers {
                         out.push(RequestVote(n.current_term, n.id,
-                                             last_index(n), last_term(n)))
+                            last_index(n), last_term(n)))
                     }
                 }
             }
@@ -209,7 +209,7 @@ pub fn receive(inout n: RaftNode, m: Message, now: i64, election_timeout: i64) -
                 // term first and length second. Without this a node with a
                 // stale log could be elected and overwrite committed entries.
                 let ours_newer = their_last_term < last_term(n) or
-                    (their_last_term == last_term(n) and their_last_index < last_index(n))
+                (their_last_term == last_term(n) and their_last_index < last_index(n))
                 if not ours_newer {
                     granted = true
                     n.voted_for = from
@@ -260,7 +260,7 @@ pub fn receive(inout n: RaftNode, m: Message, now: i64, election_timeout: i64) -
                 // The log must match at `prev_index`, or the leader has to
                 // back up. This is what repairs a follower whose log diverged.
                 let consistent = prev_index < 0 or
-                    (prev_index < n.log.len() and n.log[prev_index].term == prev_term)
+                (prev_index < n.log.len() and n.log[prev_index].term == prev_term)
                 if not consistent {
                     out.push(AppendResult(n.current_term, n.id, from, false, 0 - 1))
                 } else {

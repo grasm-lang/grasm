@@ -198,7 +198,7 @@ pub fn render(m: Merged, ours_label: str, theirs_label: str) -> [str] {
 /// It is more to read and it is what a person actually needs: knowing what the
 /// line *was* is usually what decides which side is right.
 pub fn render_with_base(m: Merged, ours_label: str, base_label: str,
-                        theirs_label: str) -> [str] {
+    theirs_label: str) -> [str] {
     var out: [str] = []
     for c in m.chunks {
         match c {

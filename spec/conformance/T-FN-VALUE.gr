@@ -18,11 +18,11 @@ fn triple(n: i64) -> i64 {
 type Holder = { f: fn(i64) -> i64 }
 
 fn adder(k: i64) -> fn(i64) -> i64 {
-    |x| x + k
+        |x| x + k
 }
 
 fn compose(f: fn(i64) -> i64) -> fn(i64) -> i64 {
-    |x| f(f(x))
+        |x| f(f(x))
 }
 
 fn main() {

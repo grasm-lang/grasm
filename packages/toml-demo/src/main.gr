@@ -3,28 +3,28 @@ import toml
 
 fn main() {
     let src = "# a manifest\n" +
-        "[package]\n" +
-        "name = \"http_server\"   # the socket half\n" +
-        "version = \"1.0.0\"\n" +
-        "entry = 'src/main.gr'\n" +
-        "capabilities = [\"io\", \"net\"]\n" +
-        "workers = 4\n" +
-        "ratio = 1.5\n" +
-        "strict = true\n" +
-        "big = 1_000_000\n" +
-        "escaped = \"line\\nbreak\\ttab \\\"quoted\\\" \\u00fc\"\n" +
-        "literal = 'no \\n escapes here'\n" +
-        "released = 2026-08-27\n" +
-        "empty_list = []\n" +
-        "nested = [[1, 2], [3]]\n" +
-        "inline = \{ a = 1, b = \"two\", c = [true, false] }\n" +
-        "\n" +
-        "[dependencies.json]\n" +
-        "path = \"../json\"\n" +
-        "version = \"^1.0.0\"\n" +
-        "\n" +
-        "[[bin]]\n" +
-        "name = \"serve\"\n"
+    "[package]\n" +
+    "name = \"http_server\"   # the socket half\n" +
+    "version = \"1.0.0\"\n" +
+    "entry = 'src/main.gr'\n" +
+    "capabilities = [\"io\", \"net\"]\n" +
+    "workers = 4\n" +
+    "ratio = 1.5\n" +
+    "strict = true\n" +
+    "big = 1_000_000\n" +
+    "escaped = \"line\\nbreak\\ttab \\\"quoted\\\" \\u00fc\"\n" +
+    "literal = 'no \\n escapes here'\n" +
+    "released = 2026-08-27\n" +
+    "empty_list = []\n" +
+    "nested = [[1, 2], [3]]\n" +
+    "inline = \{ a = 1, b = \"two\", c = [true, false] }\n" +
+    "\n" +
+    "[dependencies.json]\n" +
+    "path = \"../json\"\n" +
+    "version = \"^1.0.0\"\n" +
+    "\n" +
+    "[[bin]]\n" +
+    "name = \"serve\"\n"
 
     let d = toml.parse(src)
     if not d.ok {
@@ -54,9 +54,9 @@ fn main() {
 
     print("-- refused")
     for bad in ["[package\n", "[]\n", "name\n", "name =\n",
-                "name = \"unterminated\n", "name = \"bad \\q escape\"\n",
-                "name = \"short \\u12\"\n", "items = [1, 2\n",
-                "inline = \{ a = 1\n", "inline = \{ a }\n"] {
+        "name = \"unterminated\n", "name = \"bad \\q escape\"\n",
+        "name = \"short \\u12\"\n", "items = [1, 2\n",
+        "inline = \{ a = 1\n", "inline = \{ a }\n"] {
         let r = toml.parse(bad)
         let shown = bad.replace("\n", "\\n")
         if r.ok {

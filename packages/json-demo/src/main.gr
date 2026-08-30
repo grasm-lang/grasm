@@ -77,8 +77,8 @@ fn main() {
     let built = json.object(
         ["name", "count", "tags", "ok", "nothing"],
         [json.text("ada"), json.number(2.0),
-         json.list([json.text("x"), json.text("y")]),
-         json.boolean(true), json.null()])
+            json.list([json.text("x"), json.text("y")]),
+            json.boolean(true), json.null()])
     print("  {json.render(built)}")
     print("  a key added -> {json.render(json.with_key(built, "extra", json.number(1.0)))}")
     print("  a key replaced -> {json.render(json.with_key(built, "name", json.text("bob")))}")

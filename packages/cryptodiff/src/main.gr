@@ -72,7 +72,7 @@ fn main() / {io} {
                 match started {
                     Ok(init) -> {
                         match noise.consume_initiation(unhex(parts[2]),
-                                x25519.public_key(unhex(parts[2])), init.message) {
+                            x25519.public_key(unhex(parts[2])), init.message) {
                             Ok(incoming) -> {
                                 match noise.respond(incoming, unhex(parts[4]), unhex(parts[6]), 2) {
                                     Ok(reply) -> {

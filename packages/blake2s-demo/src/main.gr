@@ -14,13 +14,13 @@ fn check(label: str, got: str, want: str) {
 fn main() {
     print("-- RFC 7693 appendix B")
     check("\"abc\"",
-          bytes_codec.encode_hex(blake2s.hash("abc".to_bytes())),
-          "508c5e8c327c14e2e1a72ba34eeb452f37458b209ed63a294d999b4c86675982")
+        bytes_codec.encode_hex(blake2s.hash("abc".to_bytes())),
+        "508c5e8c327c14e2e1a72ba34eeb452f37458b209ed63a294d999b4c86675982")
 
     print("-- the empty message")
     check("\"\"",
-          bytes_codec.encode_hex(blake2s.hash(bytes_of([]))),
-          "69217a3079908094e11121d042354a7c1f55b6482ca1a51e1b250dfd1ed0eef9")
+        bytes_codec.encode_hex(blake2s.hash(bytes_of([]))),
+        "69217a3079908094e11121d042354a7c1f55b6482ca1a51e1b250dfd1ed0eef9")
 
     print("-- other lengths, which are a different hash and not a prefix")
     let abc = bytes_codec.encode_hex(blake2s.hash("abc".to_bytes()))
@@ -35,11 +35,11 @@ fn main() {
         key.push(i)
     }
     check("keyed, empty message",
-          bytes_codec.encode_hex(blake2s.keyed(bytes_of(key), bytes_of([]), 32)),
-          "48a8997da407876b3d79c0d92325ad3b89cbb754d86ab71aee047ad345fd2c49")
+        bytes_codec.encode_hex(blake2s.keyed(bytes_of(key), bytes_of([]), 32)),
+        "48a8997da407876b3d79c0d92325ad3b89cbb754d86ab71aee047ad345fd2c49")
     check("keyed, one byte",
-          bytes_codec.encode_hex(blake2s.keyed(bytes_of(key), bytes_of([0]), 32)),
-          "40d15fee7c328830166ac3f918650f807e7e01e177258cdc0a39b11f598066f1")
+        bytes_codec.encode_hex(blake2s.keyed(bytes_of(key), bytes_of([0]), 32)),
+        "40d15fee7c328830166ac3f918650f807e7e01e177258cdc0a39b11f598066f1")
 
     print("-- block boundaries, where the finalisation flag decides")
     for n in [0, 1, 63, 64, 65, 127, 128, 129] {

@@ -127,7 +127,7 @@ fn ephemeral() -> bytes / {io} {
 
 /// The side that speaks first.
 fn run_initiator(socket: i64, private: bytes, public: bytes, peer_public: bytes,
-                 psk: bytes, peer_port: i64) / {io, net} {
+    psk: bytes, peer_port: i64) / {io, net} {
     let started_ms = now_millis()
     let my_index = session_index()
     let init: Initiation ! HandshakeError = noise.initiate(private, public, peer_public,
@@ -354,7 +354,7 @@ fn run_initiator(socket: i64, private: bytes, public: bytes, peer_public: bytes,
 
 /// The side that waits, and never speaks to anyone it cannot already name.
 fn run_responder(socket: i64, private: bytes, public: bytes, peer_public: bytes,
-                 psk: bytes, peer_port: i64, under_load: bool) / {io, net} {
+    psk: bytes, peer_port: i64, under_load: bool) / {io, net} {
     // The secret that keys the cookies, and the one before it.
     //
     // A cookie is a bearer token for an address, so the secret expires — that
@@ -498,111 +498,111 @@ fn run_responder(socket: i64, private: bytes, public: bytes, peer_public: bytes,
     var quiet = false
     for _i in 0..6 {
         if not quiet {
-        let waiting = match net_wait([socket], 10000) {
-            Ok(hs) -> hs
-            Err(_e) -> []
-        }
-        if waiting.len() == 0 {
-            print("[listen] nothing more arrived")
-            quiet = true
-        }
+            let waiting = match net_wait([socket], 10000) {
+                Ok(hs) -> hs
+                Err(_e) -> []
+            }
+            if waiting.len() == 0 {
+                print("[listen] nothing more arrived")
+                quiet = true
+            }
         }
         if not quiet {
-        var datagram = bytes_of([])
-        var from_host = host
-        var from_port = port
-        match udp_recv_from(socket) {
-            Ok(got) -> {
-                datagram = got.0
-                from_host = got.1
-                from_port = got.2
+            var datagram = bytes_of([])
+            var from_host = host
+            var from_port = port
+            match udp_recv_from(socket) {
+                Ok(got) -> {
+                    datagram = got.0
+                    from_host = got.1
+                    from_port = got.2
+                }
+                Err(_e) -> {
+                    print("[listen] a datagram could not be read")
+                    return
+                }
             }
-            Err(_e) -> {
-                print("[listen] a datagram could not be read")
-                return
-            }
-        }
 
-        // Roaming, and the order here is the security property. The reply goes
-        // to wherever this datagram came from, and the *remembered* endpoint
-        // moves only once something has authenticated from there. Moving it on
-        // an unauthenticated packet would let anyone redirect a live session by
-        // spoofing a single datagram, which is a denial of service that costs
-        // the attacker nothing.
-        let moved = from_host != host or from_port != port
+            // Roaming, and the order here is the security property. The reply goes
+            // to wherever this datagram came from, and the *remembered* endpoint
+            // moves only once something has authenticated from there. Moving it on
+            // an unauthenticated packet would let anyone redirect a live session by
+            // spoofing a single datagram, which is a denial of service that costs
+            // the attacker nothing.
+            let moved = from_host != host or from_port != port
 
-        if datagram.len() > 0 and datagram.at(0) == grasmwire.type_initiation() {
-            // Another handshake. It may be a genuine rekey or a recording.
-            match noise.consume_initiation(private, public, datagram) {
-                Ok(again) -> {
-                    if grasmwire.later_than(again.timestamp, newest) {
-                        newest = again.timestamp
-                        // A rekey. The old session stays usable until the new
-                        // one carries traffic — dropping it the moment a
-                        // replacement is agreed would lose whatever is still
-                        // in flight under the old key.
-                        if hex(again.initiator_static) != hex(peer_public) {
-                            print("[listen] a rekey from an unknown key, refused")
-                        } else {
-                            let next_index = session_index()
-                            match noise.respond(again, ephemeral(), psk, next_index) {
-                                Ok(r2) -> {
-                                    match udp_send(socket, from_host, from_port, r2.message) {
-                                        Ok(_n) -> {
-                                            if moved {
-                                                print("[listen] the peer moved to {from_host}:{from_port}")
-                                                moves = moves + 1
+            if datagram.len() > 0 and datagram.at(0) == grasmwire.type_initiation() {
+                // Another handshake. It may be a genuine rekey or a recording.
+                match noise.consume_initiation(private, public, datagram) {
+                    Ok(again) -> {
+                        if grasmwire.later_than(again.timestamp, newest) {
+                            newest = again.timestamp
+                            // A rekey. The old session stays usable until the new
+                            // one carries traffic — dropping it the moment a
+                            // replacement is agreed would lose whatever is still
+                            // in flight under the old key.
+                            if hex(again.initiator_static) != hex(peer_public) {
+                                print("[listen] a rekey from an unknown key, refused")
+                            } else {
+                                let next_index = session_index()
+                                match noise.respond(again, ephemeral(), psk, next_index) {
+                                    Ok(r2) -> {
+                                        match udp_send(socket, from_host, from_port, r2.message) {
+                                            Ok(_n) -> {
+                                                if moved {
+                                                    print("[listen] the peer moved to {from_host}:{from_port}")
+                                                    moves = moves + 1
+                                                }
+                                                host = from_host
+                                                port = from_port
+                                                session = grasmwire.session_of(
+                                                    noise.split(r2.state, false), next_index,
+                                                    again.sender_index, now_millis(), false)
+                                                rekeys = rekeys + 1
+                                                print("[listen] rekeyed, new session hash {hex(noise.transcript(r2.state))}")
                                             }
-                                            host = from_host
-                                            port = from_port
-                                            session = grasmwire.session_of(
-                                                noise.split(r2.state, false), next_index,
-                                                again.sender_index, now_millis(), false)
-                                            rekeys = rekeys + 1
-                                            print("[listen] rekeyed, new session hash {hex(noise.transcript(r2.state))}")
+                                            Err(_e) -> print("[listen] the rekey reply could not be sent")
                                         }
-                                        Err(_e) -> print("[listen] the rekey reply could not be sent")
+                                    }
+                                    Err(_e) -> print("[listen] could not answer the rekey")
+                                }
+                            }
+                        } else {
+                            replays_refused = replays_refused + 1
+                            print("[listen] a replayed handshake, refused on its timestamp")
+                        }
+                    }
+                    Err(_e) -> print("[listen] a handshake that did not authenticate, dropped")
+                }
+            } else {
+                match grasmwire.open_data(session, datagram, now_millis()) {
+                    Ok(opened) -> {
+                        // It authenticated, so this address is the peer's.
+                        if moved {
+                            print("[listen] the peer moved to {from_host}:{from_port}")
+                            moves = moves + 1
+                        }
+                        host = from_host
+                        port = from_port
+                        let plain = grasmwire.unpad(opened)
+                        if grasmwire.is_keepalive(plain) {
+                            print("[listen] a keepalive")
+                        } else {
+                            print("[listen] {plain.len()} bytes out of the tunnel, sending them back")
+                            match grasmwire.seal_data(session, plain) {
+                                Ok(back) -> {
+                                    match udp_send(socket, from_host, from_port, back) {
+                                        Ok(_n) -> echoed = echoed + 1
+                                        Err(_e) -> print("[listen] the echo could not be sent")
                                     }
                                 }
-                                Err(_e) -> print("[listen] could not answer the rekey")
+                                Err(_e) -> print("[listen] the echo could not be sealed")
                             }
                         }
-                    } else {
-                        replays_refused = replays_refused + 1
-                        print("[listen] a replayed handshake, refused on its timestamp")
                     }
+                    Err(_e) -> print("[listen] a datagram did not authenticate, dropped in silence")
                 }
-                Err(_e) -> print("[listen] a handshake that did not authenticate, dropped")
             }
-        } else {
-            match grasmwire.open_data(session, datagram, now_millis()) {
-                Ok(opened) -> {
-                    // It authenticated, so this address is the peer's.
-                    if moved {
-                        print("[listen] the peer moved to {from_host}:{from_port}")
-                        moves = moves + 1
-                    }
-                    host = from_host
-                    port = from_port
-                    let plain = grasmwire.unpad(opened)
-                    if grasmwire.is_keepalive(plain) {
-                        print("[listen] a keepalive")
-                    } else {
-                        print("[listen] {plain.len()} bytes out of the tunnel, sending them back")
-                        match grasmwire.seal_data(session, plain) {
-                            Ok(back) -> {
-                                match udp_send(socket, from_host, from_port, back) {
-                                    Ok(_n) -> echoed = echoed + 1
-                                    Err(_e) -> print("[listen] the echo could not be sent")
-                                }
-                            }
-                            Err(_e) -> print("[listen] the echo could not be sealed")
-                        }
-                    }
-                }
-                Err(_e) -> print("[listen] a datagram did not authenticate, dropped in silence")
-            }
-        }
         }
     }
     print("[listen] echoed {echoed}, refused {replays_refused} replayed handshake(s), rekeyed {rekeys} time(s), {moves} endpoint change(s)")

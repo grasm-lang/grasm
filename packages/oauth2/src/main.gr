@@ -42,9 +42,9 @@ type Token = {
 type OauthError = { code: str, description: str }
 
 pub fn client(id: str, secret: str, authorize_endpoint: str,
-              token_endpoint: str, redirect_uri: str) -> Client {
+    token_endpoint: str, redirect_uri: str) -> Client {
     Client{ id: id, secret: secret, authorize_endpoint: authorize_endpoint,
-            token_endpoint: token_endpoint, redirect_uri: redirect_uri }
+        token_endpoint: token_endpoint, redirect_uri: redirect_uri }
 }
 
 // --- PKCE ---------------------------------------------------------------------

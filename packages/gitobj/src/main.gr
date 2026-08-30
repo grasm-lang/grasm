@@ -288,7 +288,7 @@ pub fn read_tree(content: bytes) -> [TreeEntry] ! ObjectError {
 
 /// A commit's bytes: headers, a blank line, then the message.
 pub fn write_commit(tree: str, parents: [str], author: str, committer: str,
-                    message: str) -> bytes {
+    message: str) -> bytes {
     var s = "tree {tree}\n"
     for p in parents {
         s = s + "parent {p}\n"
@@ -316,7 +316,7 @@ pub fn read_commit(content: bytes) -> GitObject ! ObjectError {
     var header_end = 0 - 1
     for i in 0..content.len() {
         if header_end < 0 and i + 1 < content.len() and
-            content.at(i) == 10 and content.at(i + 1) == 10 {
+        content.at(i) == 10 and content.at(i + 1) == 10 {
             header_end = i
         }
     }

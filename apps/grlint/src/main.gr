@@ -76,29 +76,29 @@ pub fn check_line(file: str, n: i64, line: str, previous: str) -> [Finding] {
 
     if line.len() > 100 {
         out.push(Finding{ file: file, line: n, rule: "long-line",
-                          message: "{line.len()} characters" })
+            message: "{line.len()} characters" })
     }
     if line != line.trim_end() and not line.trim().is_empty() {
         out.push(Finding{ file: file, line: n, rule: "trailing-space",
-                          message: "trailing whitespace" })
+            message: "trailing whitespace" })
     }
     if line.starts_with("\t") {
         out.push(Finding{ file: file, line: n, rule: "tab-indent",
-                          message: "a tab; `grasm fmt` uses four spaces" })
+            message: "a tab; `grasm fmt` uses four spaces" })
     }
     if line.contains("TODO") or line.contains("FIXME") {
         out.push(Finding{ file: file, line: n, rule: "todo",
-                          message: "left in the source" })
+            message: "left in the source" })
     }
     // `Err(e) -> {}` — a failure named and then discarded. The name matters:
     // `Err(_e) -> {}` says the author meant it.
     if code.contains("Err(e) -> \{}") or code.contains("Err(e) -> \{ }") {
         out.push(Finding{ file: file, line: n, rule: "empty-catch",
-                          message: "a failure bound to `e` and then discarded — write `Err(_e)` if that is meant" })
+            message: "a failure bound to `e` and then discarded — write `Err(_e)` if that is meant" })
     }
     if code.contains("?? 0") and not code.contains("?? 0 - ") and code.contains("parse") {
         out.push(Finding{ file: file, line: n, rule: "unwrap-default",
-                          message: "`?? 0` on a parse: 0 and \"could not parse\" become the same answer" })
+            message: "`?? 0` on a parse: 0 and \"could not parse\" become the same answer" })
     }
     // A row with more than three effects is not wrong, and it is worth
     // looking at: it usually means a function is doing several jobs.
@@ -111,7 +111,7 @@ pub fn check_line(file: str, n: i64, line: str, previous: str) -> [Finding] {
                     if not inside.is_empty() and inside.split(",").len() > 3 {
                         let count = inside.split(",").len()
                         out.push(Finding{ file: file, line: n, rule: "wide-row",
-                                          message: "{count} effects: {inside.trim()}" })
+                            message: "{count} effects: {inside.trim()}" })
                     }
                 }
                 None -> {}
@@ -121,7 +121,7 @@ pub fn check_line(file: str, n: i64, line: str, previous: str) -> [Finding] {
     }
     if code.trim().starts_with("pub fn ") and not is_doc(previous) {
         out.push(Finding{ file: file, line: n, rule: "no-doc",
-                          message: "exported with no `///` above it" })
+            message: "exported with no `///` above it" })
     }
     out
 }
@@ -172,7 +172,7 @@ pub fn render_json(fs_findings: [Finding]) -> str {
         items.push(json.object(
             ["file", "line", "rule", "message"],
             [json.text(f.file), json.number(f.line.as_f64()),
-             json.text(f.rule), json.text(f.message)]))
+                json.text(f.rule), json.text(f.message)]))
     }
     json.render(json.list(items)) + "\n"
 }
@@ -198,9 +198,9 @@ pub fn tally(fs_findings: [Finding]) -> [(str, i64)] {
 fn spec() -> Command {
     cli.command("grlint", "a linter for Grasm, written in Grasm",
         [cli.switch_flag("json", "j", "findings as JSON"),
-         cli.switch_flag("summary", "s", "counts per rule, not each finding"),
-         cli.text_flag("only", "r", "one rule, by name", ""),
-         cli.number_flag("limit", "n", "stop after this many findings", 0)],
+            cli.switch_flag("summary", "s", "counts per rule, not each finding"),
+            cli.text_flag("only", "r", "one rule, by name", ""),
+            cli.number_flag("limit", "n", "stop after this many findings", 0)],
         [cli.rest_positional("paths", "files or directories to read")])
 }
 
@@ -286,11 +286,11 @@ fn selftest() / {io} {
 
     print("-- a whole file")
     let sample = "// a sample\n" +
-        "pub fn undocumented() -> i64 \{\n" +
-        "    let n = \"7\".parse_int() ?? 0\n" +
-        "    n\n" +
-        "}\n" +
-        "// TODO: finish this   \n"
+    "pub fn undocumented() -> i64 \{\n" +
+    "    let n = \"7\".parse_int() ?? 0\n" +
+    "    n\n" +
+    "}\n" +
+    "// TODO: finish this   \n"
     for line in render_text(check_text("sample.gr", sample)).split("\n") {
         print("  {line}")
     }

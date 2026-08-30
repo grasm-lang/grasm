@@ -23,7 +23,7 @@ fn main() {
 
     print("-- joining")
     for pair in [("a", "b"), ("a/", "b"), ("/a", "b"), ("a", "/b"), ("", "b"),
-                 ("a", ""), ("/", "a"), ("a", "../b")] {
+        ("a", ""), ("/", "a"), ("a", "../b")] {
         print("  join(\"{pair.0}\", \"{pair.1}\") -> \"{path.join(pair.0, pair.1)}\"")
     }
     print("  join_all: \"{path.join_all(["/var", "www", "..", "log", "app.log"])}\"")
@@ -31,7 +31,7 @@ fn main() {
 
     print("-- normalising")
     for p in ["/a/./b", "/a/../b", "/a/b/../..", "/..", "/../..", "a/../..",
-              "../a", "a//b///c", "./a", "/a/b/./../c/", "a/b/../../../c"] {
+        "../a", "a//b///c", "./a", "/a/b/./../c/", "a/b/../../../c"] {
         print("  \"{p}\" -> \"{path.normalise(p)}\"")
     }
 
@@ -42,15 +42,15 @@ fn main() {
 
     print("-- relative")
     for pair in [("/a/b", "/a/b/c"), ("/a/b/c", "/a/b"), ("/a/b", "/a/b"),
-                 ("/a/b", "/x/y"), ("a/b", "a/c"), ("/a", "b")] {
+        ("/a/b", "/x/y"), ("a/b", "a/c"), ("/a", "b")] {
         print("  from \"{pair.0}\" to \"{pair.1}\" -> \"{path.relative_to(pair.0, pair.1) ?? "(no answer)"}\"")
     }
 
     print("-- containment, which is the check that stops a path escaping")
     for pair in [("/var/www", "/var/www/index.html"), ("/var/www", "/var/www"),
-                 ("/var/www", "/var/www2/x"), ("/var/www", "/var"),
-                 ("/var/www", "/var/www/../../etc/passwd"),
-                 ("/var/www", "/var/www/a/../b"), ("/var/www", "relative")] {
+        ("/var/www", "/var/www2/x"), ("/var/www", "/var"),
+        ("/var/www", "/var/www/../../etc/passwd"),
+        ("/var/www", "/var/www/a/../b"), ("/var/www", "relative")] {
         print("  \"{pair.1}\" inside \"{pair.0}\": {path.contains(pair.0, pair.1)}")
     }
 }

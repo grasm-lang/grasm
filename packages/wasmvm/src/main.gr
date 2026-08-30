@@ -350,7 +350,7 @@ pub fn call(m: Module, inout s: Store2, name: str, argv: [i64]) -> i64 ! WasmErr
 }
 
 fn run_function(m: Module, inout s: Store2, index: i64, argv: [i64],
-                depth: i64) -> i64 ! WasmError {
+    depth: i64) -> i64 ! WasmError {
     if depth > 256 {
         fail(Trap("call stack too deep"))
     }
@@ -389,7 +389,7 @@ fn pop(inout stack: [i64], at: i64) -> i64 ! WasmError {
 /// right: the nesting is counted as it goes, so a `block` inside a `loop`
 /// inside an `if` cannot be confused for one another.
 fn execute(m: Module, inout s: Store2, body: bytes, inout locals: [i64],
-           inout stack: [i64], depth: i64) -> () ! WasmError {
+    inout stack: [i64], depth: i64) -> () ! WasmError {
     var c = Cursor2{ data: body, at: 0 }
     // Where each open control construct started, and whether it is a loop —
     // a `br` to a loop goes back to its head and to a block goes past its end,
@@ -520,7 +520,7 @@ fn execute(m: Module, inout s: Store2, body: bytes, inout locals: [i64],
                     fail(Trap("a load at {at} is outside memory"))
                 }
                 stack.push(s.memory[at].bit_or(s.memory[at + 1].shl(8))
-                    .bit_or(s.memory[at + 2].shl(16)).bit_or(s.memory[at + 3].shl(24)))
+                        .bit_or(s.memory[at + 2].shl(16)).bit_or(s.memory[at + 3].shl(24)))
             } else {
                 if at < 0 or at >= s.memory.len() {
                     fail(Trap("a load at {at} is outside memory"))
@@ -710,7 +710,7 @@ fn skip_immediates(inout c: Cursor2, op: i64) -> () ! WasmError {
     if op == 65 or op == 66 {
         let _v = try sleb(c)
     } else if op == 12 or op == 13 or op == 16 or op == 32 or op == 33 or
-        op == 34 or op == 35 or op == 36 {
+    op == 34 or op == 35 or op == 36 {
         let _v = try uleb(c)
     } else if op == 40 or op == 52 or op == 53 or op == 54 or op == 58 {
         let _a = try uleb(c)

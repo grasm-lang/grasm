@@ -60,9 +60,9 @@ fn limited_gateway(now_ms: i64, secret: str, capacity: i64, per_second: i64) -> 
     Gateway{
         upstreams: [
             Upstream{ name: "users", prefix: "/api/users",
-                      breaker: resilience.breaker(3, 5000, 2), failures: 0 },
+                breaker: resilience.breaker(3, 5000, 2), failures: 0 },
             Upstream{ name: "orders", prefix: "/api/orders",
-                      breaker: resilience.breaker(3, 5000, 2), failures: 0 },
+                breaker: resilience.breaker(3, 5000, 2), failures: 0 },
         ],
         bucket: resilience.bucket(capacity, per_second, now_ms),
         responses: cache.new_cache(64, 30000),
@@ -93,7 +93,7 @@ fn replace_upstream(g: Gateway, u: Upstream) -> Gateway {
         }
     }
     Gateway{ upstreams: out, bucket: g.bucket, responses: g.responses,
-             policy: g.policy, secret: g.secret, now_ms: g.now_ms }
+        policy: g.policy, secret: g.secret, now_ms: g.now_ms }
 }
 
 /// The bearer token, checked.
@@ -148,7 +148,7 @@ fn handle(g: Gateway, r: Request, ctx: SpanContext, inout seed: Rng) -> Outcome 
 
     if not r.ok {
         return finish(out, http.respond(400, "application/json",
-                                        problem("bad_request", r.why)), span, started, "bad")
+            problem("bad_request", r.why)), span, started, "bad")
     }
 
     // CORS first: a preflight never reaches authentication, because the
@@ -171,13 +171,13 @@ fn handle(g: Gateway, r: Request, ctx: SpanContext, inout seed: Rng) -> Outcome 
     // it is a limiter that does not protect the expensive part.
     let taken = resilience.take(out.bucket, out.now_ms)
     out = Gateway{ upstreams: out.upstreams, bucket: taken.0, responses: out.responses,
-                   policy: out.policy, secret: out.secret, now_ms: out.now_ms }
+        policy: out.policy, secret: out.secret, now_ms: out.now_ms }
     if not taken.1 {
         let wait = resilience.wait_for_token(out.bucket, out.now_ms)
         span = trace.failed(span, "rate limited")
         let resp = http.with_header(
             http.respond(429, "application/json",
-                         problem("rate_limited", "try again in {wait}ms")),
+                problem("rate_limited", "try again in {wait}ms")),
             "Retry-After", "{(wait + 999) / 1000}")
         return finish(out, resp, span, started, route_of(r))
     }
@@ -186,7 +186,7 @@ fn handle(g: Gateway, r: Request, ctx: SpanContext, inout seed: Rng) -> Outcome 
         Ok(report) -> errors.field_of(report, "sub") ?? ""
         Err(why) -> {
             log.at(Warn, "rejected", [log.field("reason", why),
-                                      log.field("path", r.path)], out.now_ms)
+                log.field("path", r.path)], out.now_ms)
             span = trace.failed(span, "unauthenticated")
             return finish(out, http.with_header(
                 http.respond(401, "application/json", problem("unauthenticated", why)),
@@ -197,20 +197,20 @@ fn handle(g: Gateway, r: Request, ctx: SpanContext, inout seed: Rng) -> Outcome 
 
     match upstream_for(out, r.path) {
         None -> finish(out, http.respond(404, "application/json",
-                                         problem("no_route", "nothing serves {sanitize.html_text(r.path)}")),
-                       span, started, route_of(r))
+            problem("no_route", "nothing serves {sanitize.html_text(r.path)}")),
+            span, started, route_of(r))
         Some(u) -> {
             let key = cache_key(r.path, who)
             let looked = cache.get(out.responses, key, out.now_ms)
             out = Gateway{ upstreams: out.upstreams, bucket: out.bucket,
-                           responses: looked.0, policy: out.policy,
-                           secret: out.secret, now_ms: out.now_ms }
+                responses: looked.0, policy: out.policy,
+                secret: out.secret, now_ms: out.now_ms }
             match looked.1 {
                 Some(body) -> {
                     metrics.increment("cache_total", [metrics.label("result", "hit")])
                     span = trace.tagged(span, trace.attribute("cache", "hit"))
                     return finish(out, http.with_header(http.json(body), "X-Cache", "HIT"),
-                                  span, started, route_of(r))
+                        span, started, route_of(r))
                 }
                 None -> metrics.increment("cache_total", [metrics.label("result", "miss")])
             }
@@ -221,17 +221,17 @@ fn handle(g: Gateway, r: Request, ctx: SpanContext, inout seed: Rng) -> Outcome 
             // held down by the retries of everyone waiting on it.
             let allowed = resilience.allows(u.breaker, out.now_ms)
             var upstream = Upstream{ name: u.name, prefix: u.prefix,
-                                     breaker: allowed.0, failures: u.failures }
+                breaker: allowed.0, failures: u.failures }
             if not allowed.1 {
                 out = replace_upstream(out, upstream)
                 span = trace.failed(span, "circuit open")
                 metrics.increment("upstream_total",
-                                  [metrics.label("upstream", u.name),
-                                   metrics.label("result", "open")])
+                    [metrics.label("upstream", u.name),
+                        metrics.label("result", "open")])
                 return finish(out, http.respond(503, "application/json",
-                                                problem("upstream_unavailable",
-                                                        "{u.name} is not answering")),
-                              span, started, route_of(r))
+                    problem("upstream_unavailable",
+                        "{u.name} is not answering")),
+                    span, started, route_of(r))
             }
 
             let child = trace.child_of(seed, span.context)
@@ -240,16 +240,16 @@ fn handle(g: Gateway, r: Request, ctx: SpanContext, inout seed: Rng) -> Outcome 
             out = replace_upstream(out, upstream)
             if call.1.status >= 500 {
                 metrics.increment("upstream_total",
-                                  [metrics.label("upstream", u.name),
-                                   metrics.label("result", "failed")])
+                    [metrics.label("upstream", u.name),
+                        metrics.label("result", "failed")])
                 span = trace.failed(span, "upstream {u.name} answered {call.1.status}")
             } else {
                 metrics.increment("upstream_total",
-                                  [metrics.label("upstream", u.name),
-                                   metrics.label("result", "ok")])
+                    [metrics.label("upstream", u.name),
+                        metrics.label("result", "ok")])
                 out = Gateway{ upstreams: out.upstreams, bucket: out.bucket,
-                               responses: cache.put(out.responses, key, call.1.body, out.now_ms),
-                               policy: out.policy, secret: out.secret, now_ms: out.now_ms }
+                    responses: cache.put(out.responses, key, call.1.body, out.now_ms),
+                    policy: out.policy, secret: out.secret, now_ms: out.now_ms }
             }
             finish(out, http.with_header(call.1, "X-Cache", "MISS"), span, started, route_of(r))
         }
@@ -285,13 +285,13 @@ fn call_upstream(u: Upstream, r: Request, now_ms: i64, ctx: SpanContext) -> (Ups
         trace.finish(span, now_ms + 3)
     })
     (Upstream{ name: u.name, prefix: u.prefix, breaker: breaker,
-               failures: u.failures + (if fails { 1 } else { 0 }) }, resp)
+        failures: u.failures + (if fails { 1 } else { 0 }) }, resp)
 }
 
 /// RFC 7807, roughly: an error a client can act on rather than a string.
 fn problem(kind: str, detail: str) -> str {
     json.render(json.object(["error", "detail"],
-                            [json.text(kind), json.text(detail)])) + "\n"
+        [json.text(kind), json.text(detail)])) + "\n"
 }
 
 fn route_of(r: Request) -> str {
@@ -310,13 +310,13 @@ fn route_of(r: Request) -> str {
 fn finish(g: Gateway, resp: Response, span: Span, started: i64, route: str) -> Outcome / {Log, Metric, Trace} {
     let decorated = cors.decorate(g.policy, http.parse_request(""), resp)
     metrics.increment("http_requests_total",
-                      [metrics.label("route", route),
-                       metrics.label("status", "{resp.status}")])
+        [metrics.label("route", route),
+            metrics.label("status", "{resp.status}")])
     metrics.observe("http_request_duration_seconds",
-                    [metrics.label("route", route)],
-                    (g.now_ms - started).as_f64() / 1000.0)
+        [metrics.label("route", route)],
+        (g.now_ms - started).as_f64() / 1000.0)
     let done = trace.finish(trace.tagged(span, trace.attribute("status", "{resp.status}")),
-                            g.now_ms)
+        g.now_ms)
     trace.emit(done)
     Outcome{ gateway: g, response: resp, span: done }
 }
@@ -329,7 +329,7 @@ fn finish(g: Gateway, resp: Response, span: Span, started: i64, route: str) -> O
 
 fn signed_token(secret: str, sub: str, now_ms: i64) -> str {
     jwt.sign(HS256, secret.to_bytes(),
-             "\{\"sub\":\"{sub}\",\"exp\":{(now_ms + TOKEN_LIFETIME_MS) / 1000}}") ?? "unsigned"
+        "\{\"sub\":\"{sub}\",\"exp\":{(now_ms + TOKEN_LIFETIME_MS) / 1000}}") ?? "unsigned"
 }
 
 fn ask(g: Gateway, label: str, method: str, path: str, headers: [str], inout seed: Rng, ctx: SpanContext) -> Gateway / {io, Log, Metric, Trace} {
@@ -342,7 +342,7 @@ fn ask(g: Gateway, label: str, method: str, path: str, headers: [str], inout see
     var extra = ""
     for h in o.response.headers {
         if h.name == "X-Cache" or h.name == "Retry-After" or
-           h.name == "Access-Control-Allow-Origin" {
+        h.name == "Access-Control-Allow-Origin" {
             extra = extra + "  {h.name}={h.value}"
         }
     }
@@ -352,7 +352,7 @@ fn ask(g: Gateway, label: str, method: str, path: str, headers: [str], inout see
 
 fn at(g: Gateway, now_ms: i64) -> Gateway {
     Gateway{ upstreams: g.upstreams, bucket: g.bucket, responses: g.responses,
-             policy: g.policy, secret: g.secret, now_ms: now_ms }
+        policy: g.policy, secret: g.secret, now_ms: now_ms }
 }
 
 fn selftest() / {io, Log, Metric, Trace} {
@@ -372,11 +372,11 @@ fn selftest() / {io, Log, Metric, Trace} {
     g = ask(g, "a token that is not one", "GET", "/api/users/7", ["Authorization: Bearer nonsense"], seed, ctx)
     let wrong_key = signed_token("a different secret", "ada", t0)
     g = ask(g, "signed with another key", "GET", "/api/users/7",
-            ["Authorization: Bearer {wrong_key}"], seed, ctx)
+        ["Authorization: Bearer {wrong_key}"], seed, ctx)
     g = ask(g, "alg: none", "GET", "/api/users/7",
-            ["Authorization: Bearer eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiJhZG1pbiJ9."], seed, ctx)
+        ["Authorization: Bearer eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiJhZG1pbiJ9."], seed, ctx)
     g = ask(g, "expired", "GET", "/api/users/7",
-            ["Authorization: Bearer {signed_token(secret, "ada", t0 - TOKEN_LIFETIME_MS - 60000)}"], seed, ctx)
+        ["Authorization: Bearer {signed_token(secret, "ada", t0 - TOKEN_LIFETIME_MS - 60000)}"], seed, ctx)
     g = ask(g, "a good token", "GET", "/api/users/7", [good], seed, ctx)
 
     print("-- caching, keyed on path AND subject")
@@ -419,10 +419,10 @@ fn selftest() / {io, Log, Metric, Trace} {
 
     print("-- CORS")
     g = ask(g, "preflight from the allowed origin", "OPTIONS", "/api/users/7",
-            ["Origin: https://app.test", "Access-Control-Request-Method: GET",
-             "Access-Control-Request-Headers: authorization"], seed, ctx)
+        ["Origin: https://app.test", "Access-Control-Request-Method: GET",
+            "Access-Control-Request-Headers: authorization"], seed, ctx)
     g = ask(g, "preflight from anywhere else", "OPTIONS", "/api/users/7",
-            ["Origin: https://evil.test", "Access-Control-Request-Method: GET"], seed, ctx)
+        ["Origin: https://evil.test", "Access-Control-Request-Method: GET"], seed, ctx)
     print("  — a preflight never reaches authentication, because the browser")
     print("    sends it without the credentials it is asking permission for")
 

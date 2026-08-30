@@ -42,7 +42,7 @@ type Summary = {
 
 fn empty_summary() -> Summary {
     Summary{ lines: 0, parsed: 0, refused: 0, by_level: map(), by_source: map(),
-             slowest_ms: 0 - 1, slowest_line: "", total_ms: 0 }
+        slowest_ms: 0 - 1, slowest_line: "", total_ms: 0 }
 }
 
 /// One line of a log, in the shape everything writes:
@@ -81,7 +81,7 @@ fn parse_line(line: str) -> Option[Entry] {
         }
     }
     Some(Entry{ at_ms: stamp, level: parts[1], source: parts[2],
-                message: rest, millis: millis })
+        message: rest, millis: millis })
 }
 
 fn fold_entry(s: Summary, e: Entry, line: str) -> Summary {
@@ -109,9 +109,9 @@ fn fold_entry(s: Summary, e: Entry, line: str) -> Summary {
 
 fn refuse(s: Summary) -> Summary {
     Summary{ lines: s.lines + 1, parsed: s.parsed, refused: s.refused + 1,
-             by_level: s.by_level, by_source: s.by_source,
-             slowest_ms: s.slowest_ms, slowest_line: s.slowest_line,
-             total_ms: s.total_ms }
+        by_level: s.by_level, by_source: s.by_source,
+        slowest_ms: s.slowest_ms, slowest_line: s.slowest_line,
+        total_ms: s.total_ms }
 }
 
 /// Every line of a text, summarised.
@@ -190,7 +190,7 @@ fn as_json(s: Summary) -> str {
     json.render(json.object(
         ["lines", "parsed", "unparsed", "levels"],
         [json.number(s.lines.as_f64()), json.number(s.parsed.as_f64()),
-         json.number(s.refused.as_f64()), json.object(keys, values)])) + "\n"
+            json.number(s.refused.as_f64()), json.object(keys, values)])) + "\n"
 }
 
 // --- the offline self-test, and the scale measurement ------------------------
@@ -221,11 +221,11 @@ fn synthetic(n: i64) -> str {
 fn selftest() / {io, Metric} {
     print("-- parsing one line at a time")
     for line in ["2026-08-30T04:15:00.000Z INFO api.handler served in 42ms",
-                 "2026-08-30T04:15:00.000Z ERROR db.pool connection lost",
-                 "2026-08-30T04:15:00.000Z WARN cache.get miss",
-                 "too short",
-                 "not-a-timestamp INFO x y",
-                 ""] {
+        "2026-08-30T04:15:00.000Z ERROR db.pool connection lost",
+        "2026-08-30T04:15:00.000Z WARN cache.get miss",
+        "too short",
+        "not-a-timestamp INFO x y",
+        ""] {
         match parse_line(line) {
             Some(e) -> print("  {e.level.pad_end(6, " ")} {e.source.pad_end(14, " ")} {e.millis}ms  \"{e.message}\"")
             None -> print("  refused: \"{line}\"")

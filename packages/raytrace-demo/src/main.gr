@@ -20,14 +20,14 @@ fn close(a: f64, b: f64) -> bool {
 fn scene() -> [Sphere] {
     [raytrace.sphere_of(raytrace.vec(0.0, 0.0 - 100.5, 0.0 - 1.0), 100.0,
         Diffuse(raytrace.vec(0.8, 0.8, 0.0))),
-     raytrace.sphere_of(raytrace.vec(0.0, 0.0, 0.0 - 1.0), 0.5,
-        Diffuse(raytrace.vec(0.7, 0.3, 0.3))),
-     raytrace.sphere_of(raytrace.vec(0.0 - 1.0, 0.0, 0.0 - 1.0), 0.5,
-        Metal(raytrace.vec(0.8, 0.8, 0.8), 0.05)),
-     raytrace.sphere_of(raytrace.vec(1.0, 0.0, 0.0 - 1.0), 0.5,
-        Metal(raytrace.vec(0.8, 0.6, 0.2), 0.3)),
-     raytrace.sphere_of(raytrace.vec(0.0, 1.2, 0.0 - 1.0), 0.4,
-        Light(raytrace.vec(4.0, 4.0, 4.0)))]
+        raytrace.sphere_of(raytrace.vec(0.0, 0.0, 0.0 - 1.0), 0.5,
+            Diffuse(raytrace.vec(0.7, 0.3, 0.3))),
+        raytrace.sphere_of(raytrace.vec(0.0 - 1.0, 0.0, 0.0 - 1.0), 0.5,
+            Metal(raytrace.vec(0.8, 0.8, 0.8), 0.05)),
+        raytrace.sphere_of(raytrace.vec(1.0, 0.0, 0.0 - 1.0), 0.5,
+            Metal(raytrace.vec(0.8, 0.6, 0.2), 0.3)),
+        raytrace.sphere_of(raytrace.vec(0.0, 1.2, 0.0 - 1.0), 0.4,
+            Light(raytrace.vec(4.0, 4.0, 4.0)))]
 }
 
 fn main() / {io} {
@@ -50,7 +50,7 @@ fn main() / {io} {
     say(f, "normalising a zero vector gives no infinity",
         z.x == 0.0 and z.y == 0.0 and z.z == 0.0)
     let r = raytrace.reflect(raytrace.vec(1.0, 0.0 - 1.0, 0.0),
-                             raytrace.vec(0.0, 1.0, 0.0))
+        raytrace.vec(0.0, 1.0, 0.0))
     say(f, "a reflection off a flat surface flips one axis",
         r.x == 1.0 and r.y == 1.0 and r.z == 0.0)
 
@@ -58,7 +58,7 @@ fn main() / {io} {
     let s = raytrace.sphere_of(raytrace.vec(0.0, 0.0, 0.0 - 5.0), 1.0,
         Diffuse(raytrace.vec(0.5, 0.5, 0.5)))
     let straight = Ray{ from: raytrace.vec(0.0, 0.0, 0.0),
-                        towards: raytrace.vec(0.0, 0.0, 0.0 - 1.0) }
+        towards: raytrace.vec(0.0, 0.0, 0.0 - 1.0) }
     match raytrace.hit_sphere(s, straight, 0.001, 1000.0) {
         Some(h) -> {
             say(f, "a ray straight at a sphere hits its near face", close(h.at, 4.0))
@@ -68,21 +68,21 @@ fn main() / {io} {
         None -> say(f, "a ray straight at a sphere hits it", false)
     }
     let past = Ray{ from: raytrace.vec(0.0, 5.0, 0.0),
-                    towards: raytrace.vec(0.0, 0.0, 0.0 - 1.0) }
+        towards: raytrace.vec(0.0, 0.0, 0.0 - 1.0) }
     match raytrace.hit_sphere(s, past, 0.001, 1000.0) {
         Some(_h) -> say(f, "a ray that misses does not hit", false)
         None -> say(f, "a ray that misses does not hit", true)
     }
     // A sphere behind the camera must not be found by looking forwards.
     let behind = Ray{ from: raytrace.vec(0.0, 0.0, 0.0),
-                      towards: raytrace.vec(0.0, 0.0, 1.0) }
+        towards: raytrace.vec(0.0, 0.0, 1.0) }
     match raytrace.hit_sphere(s, behind, 0.001, 1000.0) {
         Some(_h) -> say(f, "a sphere behind the ray is not hit", false)
         None -> say(f, "a sphere behind the ray is not hit", true)
     }
     // From inside, the hit is the far wall and the normal points inwards.
     let inside = Ray{ from: raytrace.vec(0.0, 0.0, 0.0 - 5.0),
-                      towards: raytrace.vec(0.0, 0.0, 0.0 - 1.0) }
+        towards: raytrace.vec(0.0, 0.0, 0.0 - 1.0) }
     match raytrace.hit_sphere(s, inside, 0.001, 1000.0) {
         Some(h) -> say(f, "from inside, the normal faces inwards",
             close(h.at, 1.0) and not h.outside)

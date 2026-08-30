@@ -349,7 +349,7 @@ fn main() / {io, net} {
 
     print("--- query parsing ---")
     for q in ["name=ada", "name=", "name", "a=1&name=bob&c=3", "name=a%20b", "name=a+b",
-              "name=%41%42", "name=%zz", "other=1", ""] {
+        "name=%41%42", "name=%zz", "other=1", ""] {
         print("  \"{q}\" -> name = {query_param(q, "name")}")
     }
 
@@ -359,7 +359,7 @@ fn main() / {io, net} {
     // `Ã©` for `é` and this list recorded that as the answer for as long as
     // the program existed (F69).
     for s in ["plain", "a%20b", "a+b", "%41%42%43", "100%25", "%2F", "%", "%4", "%zz",
-              "caf%C3%A9", "%E2%82%AC", "%F0%9F%94%A5", "%C3", "%C3%28"] {
+        "caf%C3%A9", "%E2%82%AC", "%F0%9F%94%A5", "%C3", "%C3%28"] {
         print("  \"{s}\" -> \"{percent_decode(s)}\"")
     }
 

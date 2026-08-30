@@ -422,7 +422,7 @@ fn exchange() / {io, net} {
                                     air_body(asked)
                                 }
                                 let resp = if body == "" { http_404() } else { http_ok(body) }
-                                match tcp_write(h, resp) { Ok(_) -> {}  Err(e) -> {} }
+                                match tcp_write(h, resp) { Ok(_) -> {} Err(e) -> {} }
                             }
                         } else {
                             for i in 0..pending.len() {

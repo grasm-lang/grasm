@@ -242,7 +242,7 @@ pub fn not_found() -> Response {
 
 pub fn method_not_allowed(allowed: str) -> Response {
     with_header(respond(405, "text/plain; charset=utf-8", "method not allowed\n"),
-                "Allow", allowed)
+        "Allow", allowed)
 }
 
 pub fn with_header(r: Response, name: str, value: str) -> Response {

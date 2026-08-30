@@ -26,7 +26,7 @@ fn main() {
     print("{b.items} {block} {()}")
     // Each key is evaluated before its own value, and entries left to right.
     var log: [str] = []
-    let m = {key(log, "k1"): val(log, 1), key(log, "k2"): val(log, 2)}
+    let m = { key(log, "k1"): val(log, 1), key(log, "k2"): val(log, 2) }
     print("{m.len()} entries")
     print("{log}")
 }

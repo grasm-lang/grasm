@@ -120,7 +120,7 @@ fn declared_length(r: Reply) -> i64 {
 /// stops the loop rather than spinning: a peer that has stopped talking and
 /// has not closed is a peer this returns from, not one it waits on forever.
 pub fn fetch(host: str, port: i64, method: str, path: str,
-             headers: [Header], body: str) -> Reply ! IoError / {net} {
+    headers: [Header], body: str) -> Reply ! IoError / {net} {
     let conn = try tcp_connect(host, port)
     try tcp_write(conn, request(method, host, path, headers, body))
 

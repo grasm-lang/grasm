@@ -43,22 +43,22 @@ type Parsed = {
 
 pub fn switch_flag(name: str, short: str, help: str) -> Flag {
     Flag{ name: name, short: short, kind: Switch, help: help,
-          fallback: "", required: false, repeated: false }
+        fallback: "", required: false, repeated: false }
 }
 
 pub fn text_flag(name: str, short: str, help: str, fallback: str) -> Flag {
     Flag{ name: name, short: short, kind: Text, help: help,
-          fallback: fallback, required: false, repeated: false }
+        fallback: fallback, required: false, repeated: false }
 }
 
 pub fn number_flag(name: str, short: str, help: str, fallback: i64) -> Flag {
     Flag{ name: name, short: short, kind: Number, help: help,
-          fallback: "{fallback}", required: false, repeated: false }
+        fallback: "{fallback}", required: false, repeated: false }
 }
 
 pub fn required(f: Flag) -> Flag {
     Flag{ name: f.name, short: f.short, kind: f.kind, help: f.help,
-          fallback: f.fallback, required: true, repeated: f.repeated }
+        fallback: f.fallback, required: true, repeated: f.repeated }
 }
 
 /// A flag that may be given more than once, gathering every value.
@@ -68,7 +68,7 @@ pub fn required(f: Flag) -> Flag {
 /// to fix after somebody lost data to it.
 pub fn repeated(f: Flag) -> Flag {
     Flag{ name: f.name, short: f.short, kind: f.kind, help: f.help,
-          fallback: f.fallback, required: f.required, repeated: true }
+        fallback: f.fallback, required: f.required, repeated: true }
 }
 
 pub fn positional(name: str, help: str) -> Positional {
@@ -86,17 +86,17 @@ pub fn rest_positional(name: str, help: str) -> Positional {
 
 pub fn command(name: str, about: str, flags: [Flag], positionals: [Positional]) -> Command {
     Command{ name: name, about: about, flags: flags,
-             positionals: positionals, subcommands: [] }
+        positionals: positionals, subcommands: [] }
 }
 
 pub fn with_subcommands(c: Command, subs: [Command]) -> Command {
     Command{ name: c.name, about: c.about, flags: c.flags,
-             positionals: c.positionals, subcommands: subs }
+        positionals: c.positionals, subcommands: subs }
 }
 
 fn refused(why: str) -> Parsed {
     Parsed{ command: "", path: [], switches: map(), values: map(),
-            repeats: map(), positionals: map(), rest: [], ok: false, why: why }
+        repeats: map(), positionals: map(), rest: [], ok: false, why: why }
 }
 
 fn find_long(flags: [Flag], name: str) -> Option[Flag] {
@@ -326,8 +326,8 @@ pub fn parse(spec: Command, argv: [str]) -> Parsed {
     }
 
     Parsed{ command: here.name, path: path, switches: switches, values: values,
-            repeats: repeats, positionals: positionals, rest: rest,
-            ok: true, why: "" }
+        repeats: repeats, positionals: positionals, rest: rest,
+        ok: true, why: "" }
 }
 
 fn check_value(f: Flag, v: str) -> Option[str] {

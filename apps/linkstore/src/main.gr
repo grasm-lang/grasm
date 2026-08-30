@@ -90,7 +90,7 @@ fn link_json(l: Link) -> str {
     json.render(json.object(
         ["id", "target", "created_ms", "hits"],
         [json.text(l.id), json.text(l.target),
-         json.number(l.created_ms.as_f64()), json.number(l.hits.as_f64())]))
+            json.number(l.created_ms.as_f64()), json.number(l.hits.as_f64())]))
 }
 
 fn error_json(message: str) -> str {
@@ -107,7 +107,7 @@ fn error_json(message: str) -> str {
 fn handle(s: Store, r: Request, now_ms: i64, inout r_seed: Rng) -> (Store, Response) / {Log, Metric} {
     if not r.ok {
         metrics.increment("http_requests_total",
-                          [metrics.label("route", "bad"), metrics.label("status", "400")])
+            [metrics.label("route", "bad"), metrics.label("status", "400")])
         return (s, http.respond(400, "application/json", error_json(r.why)))
     }
 
@@ -154,8 +154,8 @@ fn handle(s: Store, r: Request, now_ms: i64, inout r_seed: Rng) -> (Store, Respo
                 for existing in s.links {
                     if existing.id == id {
                         updated.push(Link{ id: existing.id, target: existing.target,
-                                           created_ms: existing.created_ms,
-                                           hits: existing.hits + 1 })
+                            created_ms: existing.created_ms,
+                            hits: existing.hits + 1 })
                     } else {
                         updated.push(existing)
                     }
@@ -173,11 +173,11 @@ fn handle(s: Store, r: Request, now_ms: i64, inout r_seed: Rng) -> (Store, Respo
     }
 
     metrics.increment("http_requests_total",
-                      [metrics.label("route", route),
-                       metrics.label("status", "{resp.status}")])
+        [metrics.label("route", route),
+            metrics.label("status", "{resp.status}")])
     if resp.status >= 500 {
         log.at(Error, "request failed",
-               [log.field("path", r.path), log.field_int("status", resp.status)], now_ms)
+            [log.field("path", r.path), log.field_int("status", resp.status)], now_ms)
     }
     (out, resp)
 }
@@ -190,7 +190,7 @@ fn handle(s: Store, r: Request, now_ms: i64, inout r_seed: Rng) -> (Store, Respo
 /// line being written the easy way.
 fn route_of(r: Request) -> str {
     if r.path == "/" or r.path == "/healthz" or r.path == "/readyz" or
-       r.path == "/metrics" or r.path == "/links" {
+    r.path == "/metrics" or r.path == "/links" {
         return r.path
     }
     if http.path_matches("/links/:id", r.path) {
@@ -205,12 +205,12 @@ fn route_of(r: Request) -> str {
 fn create(s: Store, r: Request, now_ms: i64, inout r_seed: Rng) -> (Store, Response) / {Log} {
     if s.links.len() >= MAX_LINKS {
         return (s, http.respond(507, "application/json",
-                                error_json("the store is full")))
+            error_json("the store is full")))
     }
     let doc = match json.parse(r.body) {
         Ok(d) -> d
         Err(e) -> return (s, http.respond(400, "application/json",
-                                          error_json("body is not JSON: {e.why}")))
+            error_json("body is not JSON: {e.why}")))
     }
     let target = match json.get(doc, "target") {
         Some(v) -> json.as_str(v) ?? ""
@@ -218,7 +218,7 @@ fn create(s: Store, r: Request, now_ms: i64, inout r_seed: Rng) -> (Store, Respo
     }
     if not acceptable(target) {
         return (s, http.respond(400, "application/json",
-                                error_json("`target` must be an http or https URL under {MAX_TARGET} characters")))
+            error_json("`target` must be an http or https URL under {MAX_TARGET} characters")))
     }
     // The *tail* of a v7, not the head.
     //
@@ -233,10 +233,10 @@ fn create(s: Store, r: Request, now_ms: i64, inout r_seed: Rng) -> (Store, Respo
     var links = s.links
     links.push(link)
     log.at(Info, "link created",
-           [log.field("id", id), log.field("target", target)], now_ms)
+        [log.field("id", id), log.field("target", target)], now_ms)
     (Store{ links: links, started_ms: s.started_ms, ready: s.ready },
-     http.with_header(http.respond(201, "application/json", link_json(link) + "\n"),
-                      "Location", "/r/{id}"))
+        http.with_header(http.respond(201, "application/json", link_json(link) + "\n"),
+            "Location", "/r/{id}"))
 }
 
 // --- serving ---------------------------------------------------------------
@@ -256,7 +256,7 @@ fn serve_one(conn: i64, s: Store, reg: ref Registry, now_ms: i64, inout r_seed: 
     // is the caller's and the handler is meant to stay a pure function.
     if req.ok and req.path == "/metrics" {
         resp = http.respond(200, "text/plain; version=0.0.4",
-                            metrics.expose(Registry{ series: reg.series, buckets: reg.buckets }))
+            metrics.expose(Registry{ series: reg.series, buckets: reg.buckets }))
     }
     let out = if req.ok and req.method == "HEAD" {
         http.head_of(resp)
@@ -363,7 +363,7 @@ fn selftest(reg: ref Registry) / {io, Log, Metric} {
     print("-- a header that would split the response")
     var evil = empty_store(t0)
     evil = probe("a target with CRLF", evil, "POST", "/links",
-                 "\{\"target\":\"https://x.test/a\\r\\nX-Injected: yes\"}", t0, seed)
+        "\{\"target\":\"https://x.test/a\\r\\nX-Injected: yes\"}", t0, seed)
     print("  — refused before it could reach a Location header")
 
     print("-- metric labels use the route, not the path")

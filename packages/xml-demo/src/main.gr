@@ -45,21 +45,21 @@ fn main() {
 
     print("-- the XXE document, which is the reason there is no DTD support")
     let xxe = "<?xml version=\"1.0\"?>" +
-        "<!DOCTYPE root [<!ENTITY secret SYSTEM \"file:///etc/passwd\">]>" +
-        "<root>&secret;</root>"
+    "<!DOCTYPE root [<!ENTITY secret SYSTEM \"file:///etc/passwd\">]>" +
+    "<root>&secret;</root>"
     show("an external entity", xxe)
     print("  — the DOCTYPE is skipped without being read, and the entity is then")
     print("    unknown. Two independent reasons the file is never opened.")
 
     print("-- reading a tree")
     let doc = "<order id='7' xmlns:x='http://x'>" +
-        "<customer><name>Ada</name><email>ada@example.test</email></customer>" +
-        "<items>" +
-        "<item sku='A1'><qty>2</qty><price>9.99</price></item>" +
-        "<item sku='B2'><qty>1</qty><price>4.50</price></item>" +
-        "</items>" +
-        "<x:note>shipped</x:note>" +
-        "</order>"
+    "<customer><name>Ada</name><email>ada@example.test</email></customer>" +
+    "<items>" +
+    "<item sku='A1'><qty>2</qty><price>9.99</price></item>" +
+    "<item sku='B2'><qty>1</qty><price>4.50</price></item>" +
+    "</items>" +
+    "<x:note>shipped</x:note>" +
+    "</order>"
     match xml.parse(doc) {
         Err(e) -> print("  refused: {e.why}")
         Ok(root) -> {

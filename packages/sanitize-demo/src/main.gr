@@ -77,7 +77,7 @@ fn main() {
 
     print("-- slugs")
     for p in ["Hello, World!", "  leading and trailing  ", "already-a-slug",
-              "MiXeD CaSe", "lots---of---hyphens", "!!!", ""] {
+        "MiXeD CaSe", "lots---of---hyphens", "!!!", ""] {
         print("  \"{p}\" -> \"{sanitize.slug(p)}\"")
     }
 }

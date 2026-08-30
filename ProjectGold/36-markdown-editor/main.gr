@@ -225,8 +225,8 @@ fn one_compiler_check() / {io} {
     let (stored, publish) = route(parse_req("POST /save HTTP/1.1\r\n\r\n{src}"), "")
     let pa = preview.index_of("\r\n\r\n")
     let pb = publish.index_of("\r\n\r\n")
-    let a = match pa { Some(i) -> preview.substr(i + 4, preview.len() - i - 4)  None -> "" }
-    let b = match pb { Some(i) -> publish.substr(i + 4, publish.len() - i - 4)  None -> "" }
+    let a = match pa { Some(i) -> preview.substr(i + 4, preview.len() - i - 4) None -> "" }
+    let b = match pb { Some(i) -> publish.substr(i + 4, publish.len() - i - 4) None -> "" }
     print("  identical html: {a == b}")
     print("  and the document was stored only by the second: {stored == src}")
 }

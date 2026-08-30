@@ -86,10 +86,10 @@ fn main() / {io, net} {
         http_client.request("POST", "example.test", "/submit", [], "günaydin"))
     show_request("length the caller set",
         http_client.request("POST", "example.test", "/submit",
-                            [Header{ name: "Content-Length", value: "99" }], "a=1"))
+            [Header{ name: "Content-Length", value: "99" }], "a=1"))
     show_request("a header of its own",
         http_client.request("GET", "example.test", "/",
-                            [Header{ name: "Accept", value: "text/plain" }], ""))
+            [Header{ name: "Accept", value: "text/plain" }], ""))
 
     print("-- replies this reads")
     show_reply("ok", "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 3\r\n\r\nhi\n")

@@ -101,7 +101,7 @@ fn sha1(message: [i64]) -> [i64] {
         for t in 0..16 {
             let b = block + t * 4
             w.push(m32(msg[b].shl(24).bit_or(msg[b + 1].shl(16))
-                .bit_or(msg[b + 2].shl(8)).bit_or(msg[b + 3])))
+                    .bit_or(msg[b + 2].shl(8)).bit_or(msg[b + 3])))
         }
         for t in 16..80 {
             w.push(rotl32(w[t - 3].bit_xor(w[t - 8]).bit_xor(w[t - 14]).bit_xor(w[t - 16]), 1))
@@ -171,7 +171,7 @@ pub fn is_upgrade(r: Request) -> bool {
     let version = http.header(r, "sec-websocket-version") ?? ""
     let key = http.header(r, "sec-websocket-key") ?? ""
     upgrade == "websocket" and connection.contains("upgrade") and
-        version == "13" and not key.is_empty()
+    version == "13" and not key.is_empty()
 }
 
 /// The 101 a server answers an upgrade with, as raw bytes for the wire.
@@ -184,9 +184,9 @@ pub fn accept_response(r: Request) -> str ! WsError {
     }
     let key = http.header(r, "sec-websocket-key") ?? ""
     "HTTP/1.1 101 Switching Protocols\r\n" +
-        "Upgrade: websocket\r\n" +
-        "Connection: Upgrade\r\n" +
-        "Sec-WebSocket-Accept: {accept_for(key)}\r\n\r\n"
+    "Upgrade: websocket\r\n" +
+    "Connection: Upgrade\r\n" +
+    "Sec-WebSocket-Accept: {accept_for(key)}\r\n\r\n"
 }
 
 /// The request a client opens with. The key is sixteen random bytes, base64 —
@@ -194,11 +194,11 @@ pub fn accept_response(r: Request) -> str ! WsError {
 /// reproducible.
 pub fn open_request(host: str, path: str, key_bytes: bytes) -> str {
     "GET {path} HTTP/1.1\r\n" +
-        "Host: {host}\r\n" +
-        "Upgrade: websocket\r\n" +
-        "Connection: Upgrade\r\n" +
-        "Sec-WebSocket-Key: {bytes_codec.encode_base64(key_bytes)}\r\n" +
-        "Sec-WebSocket-Version: 13\r\n\r\n"
+    "Host: {host}\r\n" +
+    "Upgrade: websocket\r\n" +
+    "Connection: Upgrade\r\n" +
+    "Sec-WebSocket-Key: {bytes_codec.encode_base64(key_bytes)}\r\n" +
+    "Sec-WebSocket-Version: 13\r\n\r\n"
 }
 
 /// Did the server answer correctly? The accept value is checked, not just the
@@ -221,22 +221,22 @@ pub fn accepted(reply: str, key_bytes: bytes) -> bool {
 
 pub fn text_frame(message: str) -> Frame {
     Frame{ final: true, opcode: Text, payload: message.to_bytes(),
-           masked: false, mask: bytes_of([]) }
+        masked: false, mask: bytes_of([]) }
 }
 
 pub fn binary_frame(payload: bytes) -> Frame {
     Frame{ final: true, opcode: Binary, payload: payload,
-           masked: false, mask: bytes_of([]) }
+        masked: false, mask: bytes_of([]) }
 }
 
 pub fn ping_frame(payload: bytes) -> Frame {
     Frame{ final: true, opcode: Ping, payload: payload,
-           masked: false, mask: bytes_of([]) }
+        masked: false, mask: bytes_of([]) }
 }
 
 pub fn pong_for(f: Frame) -> Frame {
     Frame{ final: true, opcode: Pong, payload: f.payload,
-           masked: false, mask: bytes_of([]) }
+        masked: false, mask: bytes_of([]) }
 }
 
 /// A close frame. The code goes first, two bytes, then the reason — and a
@@ -252,7 +252,7 @@ pub fn close_frame(code: i64, reason: str) -> Frame {
         }
     }
     Frame{ final: true, opcode: Close, payload: bytes_of(payload),
-           masked: false, mask: bytes_of([]) }
+        masked: false, mask: bytes_of([]) }
 }
 
 /// The code and reason a close frame carries.
@@ -311,7 +311,7 @@ pub fn encode(f: Frame) -> bytes {
 
 pub fn masked_with(f: Frame, mask: bytes) -> Frame {
     Frame{ final: f.final, opcode: f.opcode, payload: f.payload,
-           masked: true, mask: mask }
+        masked: true, mask: mask }
 }
 
 /// One frame from bytes, and how many were consumed.
@@ -384,7 +384,7 @@ pub fn decode(raw: bytes, expect_mask: bool) -> (Frame, i64) ! WsError {
         payload.push(if masked { b[i].bit_xor(mask[(i - at) % 4]) } else { b[i] })
     }
     (Frame{ final: final_bit, opcode: opcode, payload: bytes_of(payload),
-            masked: masked, mask: bytes_of(mask) }, at + n)
+        masked: masked, mask: bytes_of(mask) }, at + n)
 }
 
 /// The text a text frame carries.

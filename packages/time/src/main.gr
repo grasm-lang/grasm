@@ -99,7 +99,7 @@ pub fn from_millis(ms: i64) -> Stamp {
 
 pub fn to_millis(s: Stamp) -> i64 {
     days_from_civil(s.date) * 86400000 + s.time.hour * 3600000 +
-        s.time.minute * 60000 + s.time.second * 1000 + s.time.milli
+    s.time.minute * 60000 + s.time.second * 1000 + s.time.milli
 }
 
 fn pad(n: i64, width: i64) -> str {
@@ -119,7 +119,7 @@ pub fn format_date(d: Date) -> str {
 /// format that sometimes has them is two formats.
 pub fn format(s: Stamp) -> str {
     "{format_date(s.date)}T{pad(s.time.hour, 2)}:{pad(s.time.minute, 2)}:" +
-        "{pad(s.time.second, 2)}.{pad(s.time.milli, 3)}Z"
+    "{pad(s.time.second, 2)}.{pad(s.time.milli, 3)}Z"
 }
 
 fn number(cs: [str], from: i64, count: i64) -> i64 {

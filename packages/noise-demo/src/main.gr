@@ -175,7 +175,7 @@ fn main() / {io} {
         Ok(wrong) -> say("a message built for a stale key is refused",
             refused(responder_private, responder_public, wrong.message))
         Err(_e) -> say("a message built for a stale key is refused", false)
-    
+
     }
 
     print("-- XChaCha20-Poly1305, which the cookie mechanism needs")
@@ -231,7 +231,7 @@ fn main() / {io} {
             let stray = noise.cookie_reply(responder_public, cookie, 0, xnonce,
                 unhex("00000000000000000000000000000000"))
             match noise.consume_cookie_reply(responder_public, stray,
-                    unhex("99999999999999999999999999999999")) {
+                unhex("99999999999999999999999999999999")) {
                 Some(_c) -> say("a cookie reply from another handshake is refused", false)
                 None -> say("a cookie reply from another handshake is refused", true)
             }

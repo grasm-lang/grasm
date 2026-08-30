@@ -137,7 +137,7 @@ fn unquote_path(s: str) -> str {
     for p in s.split(".") {
         var t = p.trim()
         if (t.starts_with("\"") and t.ends_with("\"") and t.len() >= 2) or
-           (t.starts_with("'") and t.ends_with("'") and t.len() >= 2) {
+        (t.starts_with("'") and t.ends_with("'") and t.len() >= 2) {
             t = t.substr(1, t.len() - 2)
         }
         parts.push(t)

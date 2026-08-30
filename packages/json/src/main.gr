@@ -281,10 +281,10 @@ pub fn render(v: ref Json) -> str {
 
 pub fn equal(a: ref Json, b: ref Json) -> bool {
     match a {
-        JNull -> match b { JNull -> true  _ -> false }
-        JBool(x) -> match b { JBool(y) -> x == y  _ -> false }
-        JNum(x) -> match b { JNum(y) -> x == y  _ -> false }
-        JStr(x) -> match b { JStr(y) -> x == y  _ -> false }
+        JNull -> match b { JNull -> true _ -> false }
+        JBool(x) -> match b { JBool(y) -> x == y _ -> false }
+        JNum(x) -> match b { JNum(y) -> x == y _ -> false }
+        JStr(x) -> match b { JStr(y) -> x == y _ -> false }
         JList(xs) -> match b {
             JList(ys) -> {
                 if xs.len() != ys.len() {

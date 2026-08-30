@@ -6,9 +6,9 @@ import oauth2
 
 fn main() {
     let c = oauth2.client("s6BhdRkqt3", "",
-                          "https://provider.test/authorize",
-                          "https://provider.test/token",
-                          "https://app.test/callback")
+        "https://provider.test/authorize",
+        "https://provider.test/token",
+        "https://app.test/callback")
 
     print("-- PKCE, from RFC 7636 appendix B")
     let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
@@ -25,16 +25,16 @@ fn main() {
     print("  {where}")
     let with_query = oauth2.authorize_url(
         oauth2.client("id", "", "https://provider.test/authorize?tenant=acme",
-                      "https://provider.test/token", "https://app.test/cb"),
+            "https://provider.test/token", "https://app.test/cb"),
         "", state, challenge)
     print("  an endpoint that already has a query: {with_query}")
 
     print("-- the callback")
     for redirect in ["https://app.test/callback?code=SplxlOBeZQQYbYS6WxSbIA&state=xyzABC123",
-                     "https://app.test/callback?code=abc&state=somethingelse",
-                     "https://app.test/callback?error=access_denied&error_description=The+user+said+no&state=xyzABC123",
-                     "https://app.test/callback?code=abc",
-                     "not a url at all"] {
+        "https://app.test/callback?code=abc&state=somethingelse",
+        "https://app.test/callback?error=access_denied&error_description=The+user+said+no&state=xyzABC123",
+        "https://app.test/callback?code=abc",
+        "not a url at all"] {
         let cb = oauth2.read_callback(redirect)
         var line = "  code=\"{cb.code}\" state=\"{cb.state}\""
         if not cb.error.is_empty() {
@@ -46,9 +46,9 @@ fn main() {
     print("-- the token request bodies")
     print("  code:               {oauth2.code_exchange_body(c, "SplxlOBeZQQYbYS6WxSbIA", verifier)}")
     let confidential = oauth2.client("s6BhdRkqt3", "a secret with a & in it",
-                                     "https://provider.test/authorize",
-                                     "https://provider.test/token",
-                                     "https://app.test/callback")
+        "https://provider.test/authorize",
+        "https://provider.test/token",
+        "https://app.test/callback")
     print("  with a secret:      {oauth2.code_exchange_body(confidential, "code", verifier)}")
     print("  client credentials: {oauth2.client_credentials_body(confidential, "api:read")}")
     print("  refresh:            {oauth2.refresh_body(confidential, "tGzv3JOkF0XG5Qx2TlKWIA", "")}")
@@ -56,7 +56,7 @@ fn main() {
 
     print("-- the token response")
     let good = "\{\"access_token\":\"2YotnFZFEjr1zCsicMWpAA\",\"token_type\":\"Bearer\"," +
-        "\"expires_in\":3600,\"refresh_token\":\"tGzv3JOkF0XG5Qx2TlKWIA\",\"scope\":\"api:read\"}"
+    "\"expires_in\":3600,\"refresh_token\":\"tGzv3JOkF0XG5Qx2TlKWIA\",\"scope\":\"api:read\"}"
     match oauth2.read_token(good) {
         Err(e) -> print("  refused: {e.code}")
         Ok(t) -> {
@@ -73,11 +73,11 @@ fn main() {
 
     print("-- token responses that are not one")
     for body in ["\{\"error\":\"invalid_grant\",\"error_description\":\"the code expired\"}",
-                 "\{\"error\":\"invalid_client\"}",
-                 "\{\"token_type\":\"Bearer\"}",
-                 "\{\"access_token\":\"\"}",
-                 "not json at all",
-                 "\{}"] {
+        "\{\"error\":\"invalid_client\"}",
+        "\{\"token_type\":\"Bearer\"}",
+        "\{\"access_token\":\"\"}",
+        "not json at all",
+        "\{}"] {
         match oauth2.read_token(body) {
             Err(e) -> print("  {e.code.pad_end(18, " ")} {e.description}")
             Ok(t) -> print("  accepted: {t.access_token}")

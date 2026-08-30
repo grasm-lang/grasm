@@ -57,11 +57,11 @@ pub fn new_machine(step_limit: i64) -> Machine {
     var s: [Slot] = []
     var fr: [i64] = []
     var m = Machine{ slots: s, free: fr, global: none(), steps: 0,
-                     collections: 0, limit: step_limit }
+        collections: 0, limit: step_limit }
     var names: [str] = []
     var values: [i64] = []
     for b in ["+", "-", "*", "/", "=", "<", ">", "cons", "car", "cdr",
-              "null?", "pair?", "not", "list", "length", "append", "modulo"] {
+        "null?", "pair?", "not", "list", "length", "append", "modulo"] {
         names.push(b)
         values.push(put(m, Builtin(b)))
     }
@@ -372,7 +372,7 @@ pub fn eval(inout m: Machine, form: Datum, environment: i64) -> i64 ! EvalError 
 }
 
 fn bind(inout m: Machine, params: [str], rest: Option[str], argv: [i64],
-        closure_env: i64) -> i64 ! EvalError {
+    closure_env: i64) -> i64 ! EvalError {
     match rest {
         None -> {
             if argv.len() != params.len() {

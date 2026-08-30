@@ -18,34 +18,34 @@ fn check(label: str, got: str, want: str) {
 fn main() {
     print("-- RFC 7748 section 5.2, the two scalar multiplication vectors")
     check("vector 1",
-          bytes_codec.encode_hex(x25519.scalarmult(
-              hex("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4"),
-              hex("e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c"))),
-          "c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552")
+        bytes_codec.encode_hex(x25519.scalarmult(
+            hex("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4"),
+            hex("e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c"))),
+        "c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552")
     check("vector 2",
-          bytes_codec.encode_hex(x25519.scalarmult(
-              hex("4b66e9d4d1b4673c5ad22691957d6af5c11b6421e0ea01d42ca4169e7918ba0d"),
-              hex("e5210f12786811d3f4b7959d0538ae2c31dbe7106fc03c3efc4cd549c715a493"))),
-          "95cbde9476e8907d7aade45cb4b873f88b595a68799fa152e6f8f7647aac7957")
+        bytes_codec.encode_hex(x25519.scalarmult(
+            hex("4b66e9d4d1b4673c5ad22691957d6af5c11b6421e0ea01d42ca4169e7918ba0d"),
+            hex("e5210f12786811d3f4b7959d0538ae2c31dbe7106fc03c3efc4cd549c715a493"))),
+        "95cbde9476e8907d7aade45cb4b873f88b595a68799fa152e6f8f7647aac7957")
 
     print("-- section 6.1, a whole exchange")
     let alice_secret = hex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
     let bob_secret = hex("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb")
     check("Alice's public key",
-          bytes_codec.encode_hex(x25519.public_key(alice_secret)),
-          "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a")
+        bytes_codec.encode_hex(x25519.public_key(alice_secret)),
+        "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a")
     check("Bob's public key",
-          bytes_codec.encode_hex(x25519.public_key(bob_secret)),
-          "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f")
+        bytes_codec.encode_hex(x25519.public_key(bob_secret)),
+        "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f")
 
     let alice_pub = x25519.public_key(alice_secret)
     let bob_pub = x25519.public_key(bob_secret)
     check("Alice's view of the shared secret",
-          bytes_codec.encode_hex(x25519.scalarmult(alice_secret, bob_pub)),
-          "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742")
+        bytes_codec.encode_hex(x25519.scalarmult(alice_secret, bob_pub)),
+        "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742")
     check("Bob's view",
-          bytes_codec.encode_hex(x25519.scalarmult(bob_secret, alice_pub)),
-          "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742")
+        bytes_codec.encode_hex(x25519.scalarmult(bob_secret, alice_pub)),
+        "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742")
 
     print("-- clamping, which is not optional")
     let raw = hex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
@@ -55,8 +55,8 @@ fn main() {
 
     print("-- low-order points, which give a shared secret with no entropy")
     for name_and_point in [("all zero", "0000000000000000000000000000000000000000000000000000000000000000"),
-                           ("one", "0100000000000000000000000000000000000000000000000000000000000000"),
-                           ("order 8", "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800")] {
+        ("one", "0100000000000000000000000000000000000000000000000000000000000000"),
+        ("order 8", "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800")] {
         match x25519.shared_secret(alice_secret, hex(name_and_point.1)) {
             Some(s) -> print("  {name_and_point.0.pad_end(10, " ")} accepted: {bytes_codec.encode_hex(s).substr(0, 24)}")
             None -> print("  {name_and_point.0.pad_end(10, " ")} refused — the shared secret was all zero")

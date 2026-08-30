@@ -157,7 +157,7 @@ fn clean_name(raw: str) -> str {
     var out = ""
     for c in raw.codes() {
         let ok = (c >= 97 and c <= 122) or (c >= 65 and c <= 90) or
-            (c >= 48 and c <= 57) or c == 46 or c == 45 or c == 95
+        (c >= 48 and c <= 57) or c == 46 or c == 45 or c == 95
         if ok {
             out += c.to_char()
         }
@@ -355,7 +355,7 @@ fn exchange() / {io, net} {
                                 Err(e) -> {}
                             }
                         }
-                        Reply(t) -> { match tcp_write(h, t) { Ok(_) -> {}  Err(e) -> {} } }
+                        Reply(t) -> { match tcp_write(h, t) { Ok(_) -> {} Err(e) -> {} } }
                         Collect(next, reply) -> {}
                     }
                 }
@@ -410,7 +410,7 @@ fn exchange() / {io, net} {
                     match decide(parse_req(raw), stats) {
                         Collect(next, reply) -> {
                             stats = next
-                            match tcp_write(h, reply) { Ok(_) -> {}  Err(e) -> {} }
+                            match tcp_write(h, reply) { Ok(_) -> {} Err(e) -> {} }
                             taken = taken + 1
                             // The coalescing. Nothing is pushed until a batch
                             // has built up, so the dashboards are told about
@@ -419,13 +419,13 @@ fn exchange() / {io, net} {
                                 stats.pending = 0
                                 let ev = stats_event(stats)
                                 for w in held {
-                                    match tcp_write(w, ev) { Ok(_) -> {}  Err(e) -> {} }
+                                    match tcp_write(w, ev) { Ok(_) -> {} Err(e) -> {} }
                                 }
                                 pushes = pushes + 1
                             }
                         }
                         Reply(t) -> {
-                            match tcp_write(h, t) { Ok(_) -> {}  Err(e) -> {} }
+                            match tcp_write(h, t) { Ok(_) -> {} Err(e) -> {} }
                             taken = taken + 1
                         }
                         Watch(head, hello) -> {}
@@ -443,7 +443,7 @@ fn exchange() / {io, net} {
         stats.pending = 0
         let ev = stats_event(stats)
         for w in held {
-            match tcp_write(w, ev) { Ok(_) -> {}  Err(e) -> {} }
+            match tcp_write(w, ev) { Ok(_) -> {} Err(e) -> {} }
         }
         pushes = pushes + 1
         flushed = true
@@ -510,7 +510,7 @@ fn serve() / {io, net} {
             stats.pending = 0
             let ev = stats_event(stats)
             for w in held {
-                match tcp_write(w, ev) { Ok(_) -> {}  Err(e) -> {} }
+                match tcp_write(w, ev) { Ok(_) -> {} Err(e) -> {} }
             }
         }
         for h in ready {
@@ -542,12 +542,12 @@ fn serve() / {io, net} {
                         }
                         Collect(next, reply) -> {
                             stats = next
-                            match tcp_write(h, reply) { Ok(_) -> {}  Err(e) -> {} }
+                            match tcp_write(h, reply) { Ok(_) -> {} Err(e) -> {} }
                             if stats.pending >= BATCH {
                                 stats.pending = 0
                                 let ev = stats_event(stats)
                                 for w in held {
-                                    match tcp_write(w, ev) { Ok(_) -> {}  Err(e) -> {} }
+                                    match tcp_write(w, ev) { Ok(_) -> {} Err(e) -> {} }
                                 }
                             }
                             net_close(h)
@@ -556,7 +556,7 @@ fn serve() / {io, net} {
                             open = still
                         }
                         Reply(t) -> {
-                            match tcp_write(h, t) { Ok(_) -> {}  Err(e) -> {} }
+                            match tcp_write(h, t) { Ok(_) -> {} Err(e) -> {} }
                             net_close(h)
                             var still: [i64] = []
                             for k in open { if k != h { still.push(k) } }

@@ -126,7 +126,7 @@ fn main() {
     print("-- every varint round-trips")
     var bad = 0
     for n in [0, 1, 127, 128, 255, 256, 16383, 16384, 2097151, 2097152,
-              1000000000, 4611686018427387903] {
+        1000000000, 4611686018427387903] {
         match protobuf.read(bytes_of(protobuf.field_varint(1, n))) {
             Err(e) -> bad = bad + 1
             Ok(fields) -> if fields[0].varint != n { bad = bad + 1 }

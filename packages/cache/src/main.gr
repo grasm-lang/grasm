@@ -33,7 +33,7 @@ type Cache[V] = {
 pub fn new_cache[V](capacity: i64, ttl_ms: i64) -> Cache[V] {
     let empty: [CacheEntry[V]] = []
     Cache{ entries: empty, capacity: capacity, ttl_ms: ttl_ms, clock: 0,
-           hits: 0, misses: 0, evictions: 0, expiries: 0 }
+        hits: 0, misses: 0, evictions: 0, expiries: 0 }
 }
 
 fn not_expired[V](e: CacheEntry[V], now_ms: i64) -> bool {
@@ -64,14 +64,14 @@ pub fn get[V](c: Cache[V], key: str, now_ms: i64) -> (Cache[V], Option[V]) {
         }
         found = Some(e.value)
         kept.push(CacheEntry{ key: e.key, value: e.value,
-                         expires_ms: e.expires_ms, used: tick })
+            expires_ms: e.expires_ms, used: tick })
     }
     let hit = found.is_some()
     (Cache{ entries: kept, capacity: c.capacity, ttl_ms: c.ttl_ms, clock: tick,
-            hits: c.hits + (if hit { 1 } else { 0 }),
-            misses: c.misses + (if hit { 0 } else { 1 }),
-            evictions: c.evictions, expiries: c.expiries + expired },
-     found)
+        hits: c.hits + (if hit { 1 } else { 0 }),
+        misses: c.misses + (if hit { 0 } else { 1 }),
+        evictions: c.evictions, expiries: c.expiries + expired },
+        found)
 }
 
 /// Store a value, replacing any earlier one for the key.
@@ -96,8 +96,8 @@ pub fn put[V](c: Cache[V], key: str, value: V, now_ms: i64) -> Cache[V] {
     var evicted = 0
     if c.capacity > 0 {
         kept.push(CacheEntry{ key: key, value: value,
-                         expires_ms: if c.ttl_ms > 0 { now_ms + c.ttl_ms } else { 0 },
-                         used: tick })
+            expires_ms: if c.ttl_ms > 0 { now_ms + c.ttl_ms } else { 0 },
+            used: tick })
         // Least recently used first, until it fits. `sort_by` is stable, so
         // two entries used at the same tick keep the order they were stored
         // in — which makes the whole thing reproducible.
@@ -113,8 +113,8 @@ pub fn put[V](c: Cache[V], key: str, value: V, now_ms: i64) -> Cache[V] {
         }
     }
     Cache{ entries: kept, capacity: c.capacity, ttl_ms: c.ttl_ms, clock: tick,
-           hits: c.hits, misses: c.misses,
-           evictions: c.evictions + evicted, expiries: c.expiries + expired }
+        hits: c.hits, misses: c.misses,
+        evictions: c.evictions + evicted, expiries: c.expiries + expired }
 }
 
 pub fn remove[V](c: Cache[V], key: str) -> Cache[V] {
@@ -125,15 +125,15 @@ pub fn remove[V](c: Cache[V], key: str) -> Cache[V] {
         }
     }
     Cache{ entries: kept, capacity: c.capacity, ttl_ms: c.ttl_ms, clock: c.clock,
-           hits: c.hits, misses: c.misses, evictions: c.evictions,
-           expiries: c.expiries }
+        hits: c.hits, misses: c.misses, evictions: c.evictions,
+        expiries: c.expiries }
 }
 
 pub fn clear[V](c: Cache[V]) -> Cache[V] {
     let empty: [CacheEntry[V]] = []
     Cache{ entries: empty, capacity: c.capacity, ttl_ms: c.ttl_ms, clock: c.clock,
-           hits: c.hits, misses: c.misses, evictions: c.evictions,
-           expiries: c.expiries }
+        hits: c.hits, misses: c.misses, evictions: c.evictions,
+        expiries: c.expiries }
 }
 
 /// How many entries are held and not expired.
@@ -187,8 +187,8 @@ pub fn sweep[V](c: Cache[V], now_ms: i64) -> Cache[V] {
         }
     }
     Cache{ entries: kept, capacity: c.capacity, ttl_ms: c.ttl_ms, clock: c.clock,
-           hits: c.hits, misses: c.misses, evictions: c.evictions,
-           expiries: c.expiries + expired }
+        hits: c.hits, misses: c.misses, evictions: c.evictions,
+        expiries: c.expiries + expired }
 }
 
 /// `hits`, `misses`, `evictions`, `expiries`, and the hit rate in per cent.

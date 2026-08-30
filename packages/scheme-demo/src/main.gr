@@ -71,16 +71,16 @@ fn main() / {io} {
     print("-- recursion, which is where a heap earns its keep")
     say(f, "factorial",
         evaluates("(define (fact n) (if (= n 0) 1 (* n (fact (- n 1))))) (fact 10)",
-                  "3628800"))
+            "3628800"))
     say(f, "fibonacci",
         evaluates("(define (fib n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))) (fib 18)",
-                  "2584"))
+            "2584"))
     say(f, "mutual recursion",
         evaluates("(define (even? n) (if (= n 0) #t (odd? (- n 1)))) (define (odd? n) (if (= n 0) #f (even? (- n 1)))) (even? 100)",
-                  "#t"))
+            "#t"))
     say(f, "a list built by recursion",
         evaluates("(define (upto n) (if (= n 0) '() (cons n (upto (- n 1))))) (upto 5)",
-                  "(5 4 3 2 1)"))
+            "(5 4 3 2 1)"))
 
     print("-- tail calls, which a loop *is*")
     // Fifty thousand iterations, and that number is measured rather than
@@ -108,10 +108,10 @@ fn main() / {io} {
     // are told apart only by knowing the cost per step.
     say(f, "a 50,000-step loop does not grow the stack",
         evaluates_within("(define (loop n acc) (if (= n 0) acc (loop (- n 1) (+ acc 1)))) (loop 200000 0)",
-                  "200000", 10000000))
+            "200000", 10000000))
     say(f, "and a tail call through if's other branch",
         evaluates_within("(define (down n) (if (> n 0) (down (- n 1)) 'done)) (down 5000)",
-                  "done", 10000000))
+            "done", 10000000))
 
     print("-- the heap, and the cycle a definition builds")
     var m = scheme.new_machine(10000000)

@@ -102,7 +102,7 @@ pub fn decode_unverified(token: str) -> JwtToken ! JwtError {
         None -> fail(JwtError{ why: "the payload is not base64url" })
     }
     JwtToken{ header: header, payload: payload, signature: parts[2],
-           signed: parts[0] + "." + parts[1] }
+        signed: parts[0] + "." + parts[1] }
 }
 
 /// The signature checked, and nothing else.
@@ -147,29 +147,29 @@ type JwtRules = {
 /// be tested by waiting, so in practice it is not tested.
 pub fn rules(now_ms: i64) -> JwtRules {
     JwtRules{ now_ms: now_ms, leeway_ms: 0, issuer: "", audience: "",
-           require_exp: false }
+        require_exp: false }
 }
 
 pub fn with_leeway(r: JwtRules, ms: i64) -> JwtRules {
     JwtRules{ now_ms: r.now_ms, leeway_ms: ms, issuer: r.issuer,
-           audience: r.audience, require_exp: r.require_exp }
+        audience: r.audience, require_exp: r.require_exp }
 }
 
 pub fn requiring_issuer(r: JwtRules, issuer: str) -> JwtRules {
     JwtRules{ now_ms: r.now_ms, leeway_ms: r.leeway_ms, issuer: issuer,
-           audience: r.audience, require_exp: r.require_exp }
+        audience: r.audience, require_exp: r.require_exp }
 }
 
 pub fn requiring_audience(r: JwtRules, audience: str) -> JwtRules {
     JwtRules{ now_ms: r.now_ms, leeway_ms: r.leeway_ms, issuer: r.issuer,
-           audience: audience, require_exp: r.require_exp }
+        audience: audience, require_exp: r.require_exp }
 }
 
 /// Refuse a token with no expiry. Off by default because the specification
 /// allows one; worth turning on for anything a person holds.
 pub fn requiring_expiry(r: JwtRules) -> JwtRules {
     JwtRules{ now_ms: r.now_ms, leeway_ms: r.leeway_ms, issuer: r.issuer,
-           audience: r.audience, require_exp: true }
+        audience: r.audience, require_exp: true }
 }
 
 /// Signature, then claims. The payload comes back only if both hold.

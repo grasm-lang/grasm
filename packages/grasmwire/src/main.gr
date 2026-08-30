@@ -89,12 +89,12 @@ type WireError =
     | Expired(age_ms: i64)
     | Exhausted(counter: i64)
 
-/// The anti-replay window.
-///
-/// `highest` is the largest counter accepted so far; `bits` remembers which of
-/// the preceding 2048 were seen. Anything older than the window is refused
-/// even if it is genuine — that is the trade a fixed window makes, and 2048
-/// packets of reordering is far more than a network produces.
+    /// The anti-replay window.
+    ///
+    /// `highest` is the largest counter accepted so far; `bits` remembers which of
+    /// the preceding 2048 were seen. Anything older than the window is refused
+    /// even if it is genuine — that is the trade a fixed window makes, and 2048
+    /// packets of reordering is far more than a network produces.
 type Replay = {
     highest: i64,
     bits: [i64],
@@ -193,7 +193,7 @@ type Session = {
 }
 
 pub fn session_of(keys: Keys, local_index: i64, remote_index: i64,
-                  born_ms: i64, is_initiator: bool) -> Session {
+    born_ms: i64, is_initiator: bool) -> Session {
     Session{
         sending: keys.sending,
         receiving: keys.receiving,
@@ -370,7 +370,7 @@ pub fn open_data(inout s: Session, datagram: bytes, now_ms: i64) -> bytes ! Wire
     }
 
     match chachapoly.open_combined(s.receiving, chachapoly.nonce_of(counter),
-                                   bytes_of([]), bytes_of(body)) {
+        bytes_of([]), bytes_of(body)) {
         Ok(plain) -> {
             // Only now. A forged packet must not be able to advance the
             // window, or an attacker could burn a counter the real peer is
@@ -434,7 +434,7 @@ type PeerPhase =
     | Initiated(sent_ms: i64, attempts: i64)
     | Established
 
-/// Everything known about one far end.
+    /// Everything known about one far end.
 type Peer = {
     public_key: bytes,
     preshared: bytes,
@@ -471,7 +471,7 @@ type Action =
     | GiveUp
     | SendKeepalive
 
-/// Decide, given the time and whether a session exists.
+    /// Decide, given the time and whether a session exists.
 pub fn next_action(p: Peer, session: Option[Session], now_ms: i64) -> Action {
     match p.phase {
         Idle -> DoNothing

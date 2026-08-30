@@ -180,7 +180,7 @@ fn main() {
     var oracle = map()
     var agree = true
     let keys = ["one", "two", "three", "four", "five", "six", "seven", "eight",
-                "nine", "ten", "eleven", "twelve"]
+        "nine", "ten", "eleven", "twelve"]
     for i in 0..keys.len() {
         put(t, keys[i], "v{i}")
         oracle.set(keys[i], "v{i}")

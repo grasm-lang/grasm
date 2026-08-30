@@ -374,7 +374,7 @@ fn main() {
 // "expected end of line after statement": a parse error about the wrong thing,
 // for a declaration the grammar had offered. Use a sum variant for a value
 // that carries nothing.
-type Empty = { }
+type Empty = {}
 
 fn main() {
     print("unreachable")

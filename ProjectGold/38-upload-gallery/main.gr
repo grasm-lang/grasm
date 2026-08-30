@@ -204,9 +204,9 @@ fn safe_name(raw: str) -> str {
     var out = ""
     for c in raw.codes() {
         let ok = (c >= 97 and c <= 122) or
-            (c >= 65 and c <= 90) or
-            (c >= 48 and c <= 57) or
-            c == 46 or c == 45 or c == 95
+        (c >= 65 and c <= 90) or
+        (c >= 48 and c <= 57) or
+        c == 46 or c == 45 or c == 95
         if ok {
             out += c.to_char()
         } else {

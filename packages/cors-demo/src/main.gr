@@ -37,14 +37,14 @@ fn main() {
 
     print("-- a preflight")
     let pre = request("OPTIONS", ["Origin: https://app.test",
-                                  "Access-Control-Request-Method: POST",
-                                  "Access-Control-Request-Headers: content-type"])
+        "Access-Control-Request-Method: POST",
+        "Access-Control-Request-Headers: content-type"])
     print("  is_preflight: {cors.is_preflight(pre)}")
     show("with POST allowed", cors.with_methods(strict, ["GET", "POST"]), pre)
     show("with POST not allowed", cors.with_methods(strict, ["GET"]), pre)
     let asks_more = request("OPTIONS", ["Origin: https://app.test",
-                                        "Access-Control-Request-Method: GET",
-                                        "Access-Control-Request-Headers: content-type, x-secret"])
+        "Access-Control-Request-Method: GET",
+        "Access-Control-Request-Headers: content-type, x-secret"])
     show("asking for a header not allowed", strict, asks_more)
     show("with a max-age", cors.caching_preflight(strict, 600), pre)
     print("  an OPTIONS with no requested method is not a preflight: {cors.is_preflight(request("OPTIONS", ["Origin: https://app.test"]))}")
@@ -65,7 +65,7 @@ fn main() {
 
     print("-- decorating a real response")
     let resp = cors.decorate(strict, request("GET", ["Origin: https://app.test"]),
-                             http.json("\{\"ok\":true}\n"))
+        http.json("\{\"ok\":true}\n"))
     for line in http.render(resp).split("\r\n") {
         if not line.is_empty() {
             print("  {line}")

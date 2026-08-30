@@ -65,8 +65,8 @@ pub fn html_url(s: str) -> str {
         }
     }
     if flat.starts_with("http://") or flat.starts_with("https://") or
-       flat.starts_with("mailto:") or flat.starts_with("/") or
-       flat.starts_with("#") or flat.starts_with("?") {
+    flat.starts_with("mailto:") or flat.starts_with("/") or
+    flat.starts_with("#") or flat.starts_with("?") {
         return html_attribute(t)
     }
     // A relative path with no scheme at all is fine; one with a colon before

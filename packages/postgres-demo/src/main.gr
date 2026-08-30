@@ -60,7 +60,7 @@ fn main() {
 
     print("-- authentication kinds")
     for pair in [("trust", 0), ("cleartext", 3), ("md5", 5), ("SASL", 10),
-                 ("SASL continue", 11), ("SASL final", 12)] {
+        ("SASL continue", 11), ("SASL final", 12)] {
         match postgres.next_message(bytes_of(server_frame("R", be32(pair.1)))) {
             None -> print("  {pair.0}: not a whole message")
             Some(m) -> print("  {pair.0.pad_end(16, " ")} {postgres.auth_kind(m.0)}")

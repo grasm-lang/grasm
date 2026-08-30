@@ -83,9 +83,9 @@ fn satisfies(pw: str, p: Policy) -> bool {
     }
     // Operators end the lines rather than starting them (FINDINGS.md, F1).
     (not p.lower or has_lower) and
-        (not p.upper or has_upper) and
-        (not p.digits or has_digit) and
-        (not p.symbols or has_symbol)
+    (not p.upper or has_upper) and
+    (not p.digits or has_digit) and
+    (not p.symbols or has_symbol)
 }
 
 fn show(label: str, seed: i64, p: Policy) {

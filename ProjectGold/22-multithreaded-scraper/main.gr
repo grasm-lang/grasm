@@ -457,10 +457,10 @@ fn main() / {io, net} {
     var same = true
     for i in 0..pages.len() {
         if pages[i].url != parallel_pages[i].url or
-            pages[i].status != parallel_pages[i].status or
-            pages[i].bytes != parallel_pages[i].bytes or
-            pages[i].title != parallel_pages[i].title or
-            pages[i].links.len() != parallel_pages[i].links.len() {
+        pages[i].status != parallel_pages[i].status or
+        pages[i].bytes != parallel_pages[i].bytes or
+        pages[i].title != parallel_pages[i].title or
+        pages[i].links.len() != parallel_pages[i].links.len() {
             same = false
         }
     }
@@ -481,7 +481,7 @@ fn main() / {io, net} {
 
     print("--- link extraction ---")
     for html in ["<a href=\"/one\">x</a>", "<a href=''>x</a>", "no links",
-                 "<a href=\"/a\"><a href=\"/b\">", "<a href=\"\">", "href=\"/bare\""] {
+        "<a href=\"/a\"><a href=\"/b\">", "<a href=\"\">", "href=\"/bare\""] {
         print("  {links_in(html)}")
     }
 

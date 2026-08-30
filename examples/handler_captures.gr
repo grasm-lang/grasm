@@ -32,7 +32,7 @@ fn ask() -> str / {Src} {
     // is found by lookup rather than by being in view.
     Src.unit()
     "{Src.int()} {Src.float()} {Src.flag()} {Src.text()} {Src.raw()}" +
-        " {Src.items()} {Src.pair()} {Src.maybe()} {Src.point()} {Src.colour()}"
+    " {Src.items()} {Src.pair()} {Src.maybe()} {Src.point()} {Src.colour()}"
 }
 
 fn main() {

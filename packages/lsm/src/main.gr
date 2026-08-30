@@ -39,7 +39,7 @@ type StoreError =
     | Io(what: str)
     | Corrupt(what: str)
 
-/// How many records the memtable holds before it becomes a table.
+    /// How many records the memtable holds before it becomes a table.
 pub fn default_flush_at() -> i64 { 1000 }
 
 fn log_path(dir: str) -> str { "{dir}/write.log" }
