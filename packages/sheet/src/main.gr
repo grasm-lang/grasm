@@ -32,7 +32,8 @@ type Expr =
     | Div(left: i64, right: i64)
     | Sum(cells: [str])
 
-type Cell = {
+// `SheetCell`, since `gc` declares a `Cell` and types share one namespace.
+type SheetCell = {
     name: str,
     // The expression tree, flattened: `nodes` holds it and `root` is the top.
     nodes: [Expr],
@@ -44,12 +45,12 @@ type Cell = {
 }
 
 type Sheet = {
-    cells: [Cell],
+    cells: [SheetCell],
     recalculated: i64,
 }
 
 pub fn new_sheet() -> Sheet {
-    var c: [Cell] = []
+    var c: [SheetCell] = []
     Sheet{ cells: c, recalculated: 0 }
 }
 
@@ -70,7 +71,7 @@ fn ensure(inout s: Sheet, name: str) -> i64 {
     var nodes: [Expr] = []
     var reads: [str] = []
     var read_by: [str] = []
-    s.cells.push(Cell{
+    s.cells.push(SheetCell{
         name: name,
         nodes: nodes,
         root: 0 - 1,
