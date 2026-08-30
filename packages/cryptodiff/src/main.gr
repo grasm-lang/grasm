@@ -94,6 +94,9 @@ fn main() / {io} {
                     }
                     Err(_e) -> print("no first message")
                 }
+            } else if kind == "xseal" {
+                print(bytes_codec.encode_hex(chachapoly.xseal(
+                    unhex(parts[1]), unhex(parts[2]), unhex(parts[3]), unhex(parts[4]))))
             } else if kind == "replay" {
                 // A whole sequence of counters through one window, answered
                 // with one character each. The window is where an off-by-one

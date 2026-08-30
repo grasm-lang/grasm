@@ -370,7 +370,14 @@ fn constant_equal(a: bytes, b: bytes) -> bool {
 }
 
 /// A reply and the state that produced it.
-type Response = {
+///
+/// Named for the handshake rather than called `Response`, because types share
+/// one namespace across a whole program ([T-MODULE-NS]) and `http` declares a
+/// `Response` of its own. No program imports both today; one that did would
+/// have been refused, and the collision would have surfaced then rather than
+/// here. `scripts/fuzz_modules.py` reads the names out of every package's
+/// source instead of waiting for that program to be written.
+type HandshakeResponse = {
     state: State,
     message: bytes,
 }
@@ -382,7 +389,7 @@ type Response = {
 /// producing it proves the responder derived the same four secrets, and there
 /// is nothing to say beyond that.
 pub fn respond(incoming: Incoming, ephemeral_private: bytes, preshared: bytes,
-               sender_index: i64) -> Response ! HandshakeError {
+               sender_index: i64) -> HandshakeResponse ! HandshakeError {
     var st = incoming.state
     st.ephemeral_private = ephemeral_private
     st.ephemeral_public = x25519.public_key(ephemeral_private)
@@ -409,7 +416,7 @@ pub fn respond(incoming: Incoming, ephemeral_private: bytes, preshared: bytes,
     let m1 = mac1(mac1_key(st.remote_static), body)
     let message = concat(concat(body, m1), zeros(16))
 
-    Response{ state: st, message: message }
+    HandshakeResponse{ state: st, message: message }
 }
 
 fn pack_index(index: i64) -> bytes {

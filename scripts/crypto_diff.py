@@ -217,6 +217,16 @@ def _main():
         cases.append(" ".join(["seal", ak.hex(), an.hex(), aad.hex(), smsg.hex()]))
         want.append(seal(ak, an, aad, smsg).hex())
 
+    # XChaCha20-Poly1305, which the cookie needs. Its 24-byte nonce is the
+    # whole reason it exists here, so the nonce is what varies.
+    for _ in range(20):
+        xk = bytes(random.randrange(256) for _ in range(32))
+        xn = bytes(random.randrange(256) for _ in range(24))
+        xa = bytes(random.randrange(256) for _ in range(random.randrange(1, 30)))
+        xm = bytes(random.randrange(256) for _ in range(random.randrange(1, 120)))
+        cases.append(" ".join(["xseal", xk.hex(), xn.hex(), xa.hex(), xm.hex()]))
+        want.append(xseal(xk, xn, xa, xm).hex())
+
     # The anti-replay window, over random sequences. The model below is the
     # rule stated plainly — accept a counter once, refuse anything more than
     # 2048 behind the highest seen — with no bitmap and no shifting, so it
