@@ -1,0 +1,18 @@
+[package]
+name = "x509"
+version = "1.0.0"
+
+# Parsing and arithmetic. Opens nothing — a caller supplies the bytes.
+capabilities = []
+
+[dependencies.asn1]
+path = "../asn1"
+version = "^1.0.0"
+
+[dependencies.p256]
+path = "../p256"
+version = "^1.0.0"
+
+[dependencies.crypto_hash]
+path = "../crypto_hash"
+version = "^1.0.0"

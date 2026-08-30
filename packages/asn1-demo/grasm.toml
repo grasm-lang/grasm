@@ -1,0 +1,12 @@
+[package]
+name = "asn1_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.asn1]
+path = "../asn1"
+version = "^1.0.0"
+
+[dependencies.bytes_codec]
+path = "../bytes"
+version = "^1.0.0"

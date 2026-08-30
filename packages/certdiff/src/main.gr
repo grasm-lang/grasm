@@ -1,0 +1,21 @@
+// One certificate in, one word out, so a shell can compare this against
+// OpenSSL over many certificates without parsing prose.
+//
+//   ok       the self-signature verifies
+//   bad      it parses and the signature does not verify
+//   refused  it is not a P-256/ECDSA-SHA256 certificate this reads
+import x509
+
+fn main() / {io} {
+    let a = args()
+    let path = if a.len() > 0 { a[0] } else { "" }
+    match read_bytes(path) {
+        Err(_e) -> print("refused")
+        Ok(der) -> {
+            match x509.verify_self_signed(der) {
+                Err(_e) -> print("refused")
+                Ok(good) -> print(if good { "ok" } else { "bad" })
+            }
+        }
+    }
+}

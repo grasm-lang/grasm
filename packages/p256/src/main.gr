@@ -1,0 +1,538 @@
+// NIST P-256, enough of it to verify an ECDSA signature.
+//
+// Verifying is all a certificate needs: given a public key, a hash and a
+// signature, decide whether the holder of the private key produced it. Nothing
+// here signs, so nothing here handles a secret, which removes the whole class
+// of question about constant time — every value in this file is public.
+//
+// A field element is eight 32-bit words, least significant first, each held in
+// an `i64`. Grasm has one integer type, so 32 bits per word is the largest that
+// leaves room to multiply: a 32x32 product needs 64 bits and `i64` has 63, so
+// products are formed from 16-bit halves.
+
+/// p = 2^256 - 2^224 + 2^192 + 2^96 - 1
+pub fn p() -> [i64] {
+    return [4294967295, 4294967295, 4294967295, 0, 0, 0, 1, 4294967295]
+}
+
+/// n, the order of the base point.
+pub fn n() -> [i64] {
+    return [4234356049, 4089039554, 2803342980, 3169254061, 4294967295, 4294967295, 0, 4294967295]
+}
+
+/// The base point G, in affine coordinates.
+pub fn gx() -> [i64] {
+    return [3633889942, 4104206661, 770388896, 1996717441, 1671708914, 4173129445, 3777774151, 1796723186]
+}
+pub fn gy() -> [i64] {
+    return [935285237, 3417718888, 1798397646, 734933847, 2081398294, 2397563722, 4263149467, 1340293858]
+}
+
+/// b, the curve constant in y^2 = x^3 - 3x + b.
+fn curve_b() -> [i64] {
+    return [668098635, 1003371582, 3428036854, 1696401072, 1989707452, 3018571093, 2855965671, 1522939352]
+}
+
+fn zero() -> [i64] {
+    return [0, 0, 0, 0, 0, 0, 0, 0]
+}
+
+fn one() -> [i64] {
+    return [1, 0, 0, 0, 0, 0, 0, 0]
+}
+
+pub fn is_zero(a: [i64]) -> bool {
+    for i in 0..a.len() {
+        if a[i] != 0 {
+            return false
+        }
+    }
+    return true
+}
+
+/// -1, 0 or 1, comparing as unsigned 256-bit numbers.
+pub fn cmp(a: [i64], b: [i64]) -> i64 {
+    var i = 7
+    while i >= 0 {
+        if a[i] > b[i] {
+            return 1
+        }
+        if a[i] < b[i] {
+            return 0 - 1
+        }
+        i = i - 1
+    }
+    return 0
+}
+
+/// a + b, as eight words and the carry out.
+fn add_raw(a: [i64], b: [i64]) -> ([i64], i64) {
+    var out: [i64] = []
+    var carry = 0
+    for i in 0..8 {
+        let t = a[i] + b[i] + carry
+        out.push(t % 4294967296)
+        carry = t / 4294967296
+    }
+    return (out, carry)
+}
+
+/// a - b, as eight words and the borrow out.
+fn sub_raw(a: [i64], b: [i64]) -> ([i64], i64) {
+    var out: [i64] = []
+    var borrow = 0
+    for i in 0..8 {
+        var t = a[i] - b[i] - borrow
+        if t < 0 {
+            t = t + 4294967296
+            borrow = 1
+        } else {
+            borrow = 0
+        }
+        out.push(t)
+    }
+    return (out, borrow)
+}
+
+/// The representative of `a` below `m`, where `a` is already below `2 * m`.
+fn cond_sub(a: [i64], m: [i64]) -> [i64] {
+    if cmp(a, m) >= 0 {
+        let (d, _b) = sub_raw(a, m)
+        return d
+    }
+    return a
+}
+
+pub fn addm(a: [i64], b: [i64], m: [i64]) -> [i64] {
+    let (s, carry) = add_raw(a, b)
+    if carry == 1 {
+        // The sum did not fit in 256 bits, so it is at least 2^256 > m: one
+        // subtraction of m brings it back into range along with the carry.
+        let (d, _b) = sub_raw(s, m)
+        return cond_sub(d, m)
+    }
+    return cond_sub(s, m)
+}
+
+pub fn subm(a: [i64], b: [i64], m: [i64]) -> [i64] {
+    let (d, borrow) = sub_raw(a, b)
+    if borrow == 1 {
+        let (s, _c) = add_raw(d, m)
+        return s
+    }
+    return d
+}
+
+/// The 64-bit product of two 32-bit words, as (low 32, high 32).
+///
+/// Formed from 16-bit halves because the whole product does not fit: `i64`
+/// holds 63 bits and this needs 64.
+fn mul32(a: i64, b: i64) -> (i64, i64) {
+    let al = a % 65536
+    let ah = a / 65536
+    let bl = b % 65536
+    let bh = b / 65536
+    let ll = al * bl
+    let lh = al * bh
+    let hl = ah * bl
+    let hh = ah * bh
+    let mid = lh + hl + (ll / 65536)
+    let lo = (ll % 65536) + (mid % 65536) * 65536
+    let hi = hh + (mid / 65536)
+    return (lo, hi)
+}
+
+/// The full 512-bit product, as sixteen 32-bit words.
+pub fn mul_wide(a: [i64], b: [i64]) -> [i64] {
+    var out: [i64] = []
+    for _i in 0..16 {
+        out.push(0)
+    }
+    for i in 0..8 {
+        var carry = 0
+        for j in 0..8 {
+            let (lo, hi) = mul32(a[i], b[j])
+            let t = out[i + j] + lo + carry
+            out[i + j] = t % 4294967296
+            carry = hi + t / 4294967296
+        }
+        var k = i + 8
+        while carry != 0 {
+            let t = out[k] + carry
+            out[k] = t % 4294967296
+            carry = t / 4294967296
+            k = k + 1
+        }
+    }
+    return out
+}
+
+/// Eight words picked out of the product by index, with -1 meaning zero.
+fn pick(c: [i64], idx: [i64]) -> [i64] {
+    var out: [i64] = []
+    for i in 0..8 {
+        let k = idx[i]
+        if k < 0 {
+            out.push(0)
+        } else {
+            out.push(c[k])
+        }
+    }
+    return out
+}
+
+/// The 512-bit product reduced modulo p.
+///
+/// This is the reduction NIST publishes for this curve, and it exists because
+/// p is 2^256 - 2^224 + 2^192 + 2^96 - 1: every power of two above the 256th
+/// can be rewritten as a combination of lower ones, so the product folds into
+/// nine 256-bit terms that are added and subtracted rather than divided.
+pub fn reduce_p(c: [i64]) -> [i64] {
+    let m = p()
+    let s1 = cond_sub(pick(c, [0, 1, 2, 3, 4, 5, 6, 7]), m)
+    let s2 = cond_sub(pick(c, [0 - 1, 0 - 1, 0 - 1, 11, 12, 13, 14, 15]), m)
+    let s3 = cond_sub(pick(c, [0 - 1, 0 - 1, 0 - 1, 12, 13, 14, 15, 0 - 1]), m)
+    let s4 = cond_sub(pick(c, [8, 9, 10, 0 - 1, 0 - 1, 0 - 1, 14, 15]), m)
+    let s5 = cond_sub(pick(c, [9, 10, 11, 13, 14, 15, 13, 8]), m)
+    let s6 = cond_sub(pick(c, [11, 12, 13, 0 - 1, 0 - 1, 0 - 1, 8, 10]), m)
+    let s7 = cond_sub(pick(c, [12, 13, 14, 15, 0 - 1, 0 - 1, 9, 11]), m)
+    let s8 = cond_sub(pick(c, [13, 14, 15, 8, 9, 10, 0 - 1, 12]), m)
+    let s9 = cond_sub(pick(c, [14, 15, 0 - 1, 9, 10, 11, 0 - 1, 13]), m)
+
+    var r = s1
+    r = addm(r, s2, m)
+    r = addm(r, s2, m)
+    r = addm(r, s3, m)
+    r = addm(r, s3, m)
+    r = addm(r, s4, m)
+    r = addm(r, s5, m)
+    r = subm(r, s6, m)
+    r = subm(r, s7, m)
+    r = subm(r, s8, m)
+    r = subm(r, s9, m)
+    return r
+}
+
+pub fn mulp(a: [i64], b: [i64]) -> [i64] {
+    return reduce_p(mul_wide(a, b))
+}
+
+pub fn sqrp(a: [i64]) -> [i64] {
+    return mulp(a, a)
+}
+
+/// Bit `i` of a 256-bit number.
+pub fn bit(a: [i64], i: i64) -> i64 {
+    let w = a[i / 32]
+    return (w / (2 ^ (i % 32))) % 2
+}
+
+/// a^-1 mod p, by Fermat: a^(p-2).
+pub fn invp(a: [i64]) -> [i64] {
+    // p - 2
+    let e = [4294967293, 4294967295, 4294967295, 0, 0, 0, 1, 4294967295]
+    var r = one()
+    var i = 255
+    while i >= 0 {
+        r = sqrp(r)
+        if bit(e, i) == 1 {
+            r = mulp(r, a)
+        }
+        i = i - 1
+    }
+    return r
+}
+
+// --- arithmetic modulo n, the group order -----------------------------------
+//
+// n has no special form, so there is no folding trick here: a product is
+// reduced by long division, one bit at a time. It is only needed four times in
+// a verification, so the cost does not matter and the simplicity does.
+
+/// a >> 1, taking `carry` as the bit above the top word.
+fn shr1(a: [i64], carry: i64) -> [i64] {
+    var out: [i64] = []
+    for _i in 0..8 {
+        out.push(0)
+    }
+    var i = 7
+    var above = carry
+    while i >= 0 {
+        out[i] = (a[i] / 2) + above * 2147483648
+        above = a[i] % 2
+        i = i - 1
+    }
+    return out
+}
+
+/// The 512-bit value `c` reduced modulo `m`.
+fn reduce_gen(c: [i64], m: [i64]) -> [i64] {
+    var r = zero()
+    var i = 511
+    while i >= 0 {
+        // r = r * 2 + bit i of c, then subtract m if it fits.
+        let (dbl, carry) = add_raw(r, r)
+        var t = dbl
+        let w = c[i / 32]
+        if (w / (2 ^ (i % 32))) % 2 == 1 {
+            let (s, _c2) = add_raw(t, one())
+            t = s
+        }
+        if carry == 1 {
+            // The doubling overflowed 256 bits, so the value is at least
+            // 2^256 and certainly at least m: one subtraction restores it.
+            let (d, _b) = sub_raw(t, m)
+            t = d
+        }
+        r = cond_sub(t, m)
+        i = i - 1
+    }
+    return r
+}
+
+pub fn reduce_n(c: [i64]) -> [i64] {
+    return reduce_gen(c, n())
+}
+
+/// A 256-bit value reduced modulo n.
+pub fn modn(a: [i64]) -> [i64] {
+    var wide: [i64] = []
+    for i in 0..8 {
+        wide.push(a[i])
+    }
+    for _i in 0..8 {
+        wide.push(0)
+    }
+    return reduce_gen(wide, n())
+}
+
+pub fn muln(a: [i64], b: [i64]) -> [i64] {
+    return reduce_n(mul_wide(a, b))
+}
+
+/// a^-1 mod n, by the binary extended Euclidean algorithm.
+///
+/// Chosen over Fermat's exponentiation because it needs no multiplication at
+/// all — only shifts, additions and subtractions — which is far less work than
+/// the 256 squarings the exponent would cost.
+pub fn invn(a: [i64]) -> [i64] {
+    let m = n()
+    var u = a
+    var v = m
+    var x1 = one()
+    var x2 = zero()
+    var guard = 0
+    while cmp(u, one()) != 0 and cmp(v, one()) != 0 and guard < 2000 {
+        guard = guard + 1
+        while u[0] % 2 == 0 and not is_zero(u) {
+            u = shr1(u, 0)
+            if x1[0] % 2 == 0 {
+                x1 = shr1(x1, 0)
+            } else {
+                let (s, carry) = add_raw(x1, m)
+                x1 = shr1(s, carry)
+            }
+        }
+        while v[0] % 2 == 0 and not is_zero(v) {
+            v = shr1(v, 0)
+            if x2[0] % 2 == 0 {
+                x2 = shr1(x2, 0)
+            } else {
+                let (s, carry) = add_raw(x2, m)
+                x2 = shr1(s, carry)
+            }
+        }
+        if cmp(u, v) >= 0 {
+            let (d, _b) = sub_raw(u, v)
+            u = d
+            x1 = subm(x1, x2, m)
+        } else {
+            let (d, _b) = sub_raw(v, u)
+            v = d
+            x2 = subm(x2, x1, m)
+        }
+    }
+    if cmp(u, one()) == 0 {
+        return x1
+    }
+    return x2
+}
+
+// --- the curve --------------------------------------------------------------
+//
+// Points are kept in Jacobian coordinates, where (X, Y, Z) stands for
+// (X/Z^2, Y/Z^3). The point at infinity is Z = 0. Working this way means a
+// scalar multiplication needs one inversion at the end rather than one per
+// step, and an inversion is by far the most expensive thing here.
+
+type Jac = {
+    x: [i64],
+    y: [i64],
+    z: [i64],
+}
+
+fn infinity() -> Jac {
+    return Jac{ x: one(), y: one(), z: zero() }
+}
+
+fn dbl(a: Jac) -> Jac {
+    if is_zero(a.z) {
+        return a
+    }
+    let m = p()
+    let delta = sqrp(a.z)
+    let gamma = sqrp(a.y)
+    let beta = mulp(a.x, gamma)
+    // The curve has a = -3, which is why `alpha` factors this way.
+    let t1 = subm(a.x, delta, m)
+    let t2 = addm(a.x, delta, m)
+    let t3 = mulp(t1, t2)
+    let alpha = addm(addm(t3, t3, m), t3, m)
+    let beta2 = addm(beta, beta, m)
+    let beta4 = addm(beta2, beta2, m)
+    let beta8 = addm(beta4, beta4, m)
+    let x3 = subm(sqrp(alpha), beta8, m)
+    let yz = addm(a.y, a.z, m)
+    let z3 = subm(subm(sqrp(yz), gamma, m), delta, m)
+    let g2 = sqrp(gamma)
+    let g4 = addm(g2, g2, m)
+    let g8 = addm(g4, g4, m)
+    let y3 = subm(mulp(alpha, subm(beta4, x3, m)), addm(g8, g8, m), m)
+    return Jac{ x: x3, y: y3, z: z3 }
+}
+
+fn add(a: Jac, b: Jac) -> Jac {
+    if is_zero(a.z) {
+        return b
+    }
+    if is_zero(b.z) {
+        return a
+    }
+    let m = p()
+    let z1z1 = sqrp(a.z)
+    let z2z2 = sqrp(b.z)
+    let u1 = mulp(a.x, z2z2)
+    let u2 = mulp(b.x, z1z1)
+    let s1 = mulp(mulp(a.y, b.z), z2z2)
+    let s2 = mulp(mulp(b.y, a.z), z1z1)
+    if cmp(u1, u2) == 0 {
+        if cmp(s1, s2) == 0 {
+            return dbl(a)
+        }
+        return infinity()
+    }
+    let h = subm(u2, u1, m)
+    let rr = addm(subm(s2, s1, m), subm(s2, s1, m), m)
+    let h2 = addm(h, h, m)
+    let i = sqrp(h2)
+    let j = mulp(h, i)
+    let v = mulp(u1, i)
+    let x3 = subm(subm(sqrp(rr), j, m), addm(v, v, m), m)
+    let s1j = mulp(s1, j)
+    let y3 = subm(mulp(rr, subm(v, x3, m)), addm(s1j, s1j, m), m)
+    let zz = addm(a.z, b.z, m)
+    let z3 = mulp(subm(subm(sqrp(zz), z1z1, m), z2z2, m), h)
+    return Jac{ x: x3, y: y3, z: z3 }
+}
+
+/// k * P, by double-and-add from the top bit down.
+fn mul_point(k: [i64], px: [i64], py: [i64]) -> Jac {
+    var acc = infinity()
+    let base = Jac{ x: px, y: py, z: one() }
+    var i = 255
+    while i >= 0 {
+        acc = dbl(acc)
+        if bit(k, i) == 1 {
+            acc = add(acc, base)
+        }
+        i = i - 1
+    }
+    return acc
+}
+
+/// The affine x of a Jacobian point, or `None` at infinity.
+fn affine_x(a: Jac) -> Option[[i64]] {
+    if is_zero(a.z) {
+        return None
+    }
+    let zi = invp(a.z)
+    return Some(mulp(a.x, sqrp(zi)))
+}
+
+/// Whether (x, y) satisfies y^2 = x^3 - 3x + b and is not the identity.
+///
+/// Checked before a signature is, because a public key that is not on the
+/// curve is not a public key, and every guarantee below assumes it is.
+pub fn on_curve(x: [i64], y: [i64]) -> bool {
+    let m = p()
+    if cmp(x, m) >= 0 or cmp(y, m) >= 0 {
+        return false
+    }
+    let lhs = sqrp(y)
+    let three = [3, 0, 0, 0, 0, 0, 0, 0]
+    let rhs = addm(subm(mulp(sqrp(x), x), mulp(three, x), m), curve_b(), m)
+    return cmp(lhs, rhs) == 0
+}
+
+/// Whether `(r, s)` is a valid ECDSA signature over `hash` for the key `(qx, qy)`.
+///
+/// `hash` is the message digest as a 256-bit number; for SHA-256 that is the
+/// digest itself. The steps are the standard ones: reject out-of-range values,
+/// invert `s`, form `u1 = e/s` and `u2 = r/s`, and check that the x coordinate
+/// of `u1*G + u2*Q` is `r` modulo n.
+pub fn verify(qx: [i64], qy: [i64], hash: [i64], r: [i64], s: [i64]) -> bool {
+    let order = n()
+    if is_zero(r) or is_zero(s) {
+        return false
+    }
+    if cmp(r, order) >= 0 or cmp(s, order) >= 0 {
+        return false
+    }
+    if not on_curve(qx, qy) {
+        return false
+    }
+    let e = modn(hash)
+    let w = invn(s)
+    let u1 = muln(e, w)
+    let u2 = muln(r, w)
+    let a = mul_point(u1, gx(), gy())
+    let b = mul_point(u2, qx, qy)
+    let sum = add(a, b)
+    match affine_x(sum) {
+        None -> return false
+        Some(x) -> return cmp(modn(x), r) == 0
+    }
+}
+
+/// A 256-bit number from 32 big-endian bytes.
+pub fn from_bytes(b: bytes) -> [i64] {
+    var out: [i64] = []
+    for _i in 0..8 {
+        out.push(0)
+    }
+    for i in 0..32 {
+        let w = 7 - (i / 4)
+        out[w] = out[w] * 256 + b.at(i)
+    }
+    return out
+}
+
+/// k * G in affine coordinates, or `None` when k is a multiple of the order.
+///
+/// Public so that the curve arithmetic can be checked against published
+/// multiples of the base point rather than only through a signature, where a
+/// mistake could cancel itself out.
+pub fn base_mul(k: [i64]) -> Option[([i64], [i64])] {
+    let a = mul_point(k, gx(), gy())
+    if is_zero(a.z) {
+        return None
+    }
+    let zi = invp(a.z)
+    let zi2 = sqrp(zi)
+    return Some((mulp(a.x, zi2), mulp(a.y, mulp(zi2, zi))))
+}
+
+/// A 256-bit number holding `v`.
+pub fn from_i64(v: i64) -> [i64] {
+    return [v % 4294967296, v / 4294967296, 0, 0, 0, 0, 0, 0]
+}

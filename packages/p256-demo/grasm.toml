@@ -1,0 +1,8 @@
+[package]
+name = "p256_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.p256]
+path = "../p256"
+version = "^1.0.0"

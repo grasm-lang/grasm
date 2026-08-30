@@ -1,0 +1,25 @@
+import p256
+
+fn hex_of(a: [i64]) -> str {
+    var s = ""
+    var i = 7
+    while i >= 0 {
+        var w = "{a[i].to_base(16)}"
+        while w.len() < 8 {
+            w = "0" + w
+        }
+        s = s + w
+        i = i - 1
+    }
+    return s
+}
+
+fn main() / {io} {
+    print("G on curve: {p256.on_curve(p256.gx(), p256.gy())}")
+    for k in 1..6 {
+        match p256.base_mul(p256.from_i64(k)) {
+            None -> print("{k}G = infinity")
+            Some(pt) -> print("{k}G x = {hex_of(pt.0)}\n{k}G y = {hex_of(pt.1)}")
+        }
+    }
+}

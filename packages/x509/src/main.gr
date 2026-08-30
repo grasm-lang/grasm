@@ -1,0 +1,215 @@
+// X.509, enough of it to check that a certificate's signature is real.
+//
+// A certificate is three things in a SEQUENCE: the part that is signed
+// (`tbsCertificate`), the algorithm, and the signature. Verifying it means
+// hashing the *exact bytes* of the first, including its tag and length, and
+// checking the signature over that hash with a public key.
+//
+// "The exact bytes" is the part that has to be got right and is easy to get
+// wrong. Re-encoding the parsed structure and hashing that would verify a
+// certificate this library happens to re-encode identically — which is not the
+// same certificate, and the difference is exactly where a forgery lives. So
+// the range is taken from the parse and the original bytes are hashed.
+//
+// What this does *not* do is as important: it checks one signature against one
+// key. It does not walk a chain, consult a trust store, check validity dates,
+// or match a hostname. A caller that treats "the signature is real" as "this
+// certificate is trustworthy" has a security hole, and saying so here is
+// cheaper than the alternative.
+import asn1
+import p256
+import crypto_hash
+
+/// `ecdsa-with-SHA256`
+pub let OID_ECDSA_SHA256 = "1.2.840.10045.4.3.2"
+/// `id-ecPublicKey`
+pub let OID_EC_PUBLIC_KEY = "1.2.840.10045.2.1"
+/// `prime256v1`, which is P-256
+pub let OID_P256 = "1.2.840.10045.3.1.7"
+
+type CertError =
+    | NotDer
+    | NotACertificate
+    | UnsupportedAlgorithm(oid: str)
+    | UnsupportedCurve(oid: str)
+    | MalformedKey
+    | MalformedSignature
+
+type Cert = {
+    /// Offset and length of the signed region, as written.
+    tbs_at: i64,
+    tbs_len: i64,
+    /// The public key point.
+    key_x: [i64],
+    key_y: [i64],
+    /// The signature.
+    sig_r: [i64],
+    sig_s: [i64],
+    /// The algorithm OID from the outer AlgorithmIdentifier.
+    algorithm: str,
+}
+
+/// A 256-bit number from an INTEGER node.
+///
+/// DER writes a leading zero byte when the top bit would otherwise make the
+/// number look negative, and may write fewer than 32 bytes for a small one, so
+/// the value is right-aligned into 32 bytes rather than assumed to fill them.
+fn int_of(der: bytes, n: Node) -> [i64] ! CertError {
+    var buf: [i64] = []
+    for _i in 0..32 {
+        buf.push(0)
+    }
+    var start = n.body
+    var len = n.len
+    while len > 0 and der.at(start) == 0 {
+        start = start + 1
+        len = len - 1
+    }
+    if len > 32 {
+        fail(MalformedSignature)
+    }
+    for i in 0..len {
+        buf[32 - len + i] = der.at(start + i)
+    }
+    return p256.from_bytes(bytes_of(buf))
+}
+
+/// The OID inside an AlgorithmIdentifier SEQUENCE.
+fn algorithm_of(der: bytes, nodes: [Node], alg_seq: Node) -> str {
+    var i = 0
+    while i < nodes.len() {
+        if nodes[i].at == alg_seq.at {
+            let kids = asn1.children(nodes, i)
+            if kids.len() > 0 {
+                return asn1.oid_of(der, kids[0])
+            }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+/// The public key point from the SubjectPublicKeyInfo.
+///
+/// Located by its `id-ecPublicKey` OID rather than by counting fields, because
+/// the optional `[0]` version and the optional extensions both move every
+/// field position after them.
+fn public_key_of(der: bytes, nodes: [Node]) -> ([i64], [i64]) ! CertError {
+    var spki_key = 0 - 1
+    var curve = ""
+    var k = 0
+    while k < nodes.len() {
+        let nd = nodes[k]
+        if nd.tag == asn1.OID and asn1.oid_of(der, nd) == OID_EC_PUBLIC_KEY {
+            var j = k + 1
+            while j < nodes.len() {
+                if nodes[j].tag == asn1.OID {
+                    curve = asn1.oid_of(der, nodes[j])
+                }
+                if nodes[j].tag == asn1.BIT_STRING {
+                    spki_key = j
+                    j = nodes.len()
+                } else {
+                    j = j + 1
+                }
+            }
+            k = nodes.len()
+        } else {
+            k = k + 1
+        }
+    }
+    if spki_key < 0 {
+        fail(MalformedKey)
+    }
+    if curve != OID_P256 {
+        fail(UnsupportedCurve(curve))
+    }
+    // A BIT STRING opens with the count of unused trailing bits; an
+    // uncompressed point then opens with 0x04 and is 65 bytes in total.
+    let kb = nodes[spki_key]
+    if kb.len != 66 or der.at(kb.body) != 0 or der.at(kb.body + 1) != 4 {
+        fail(MalformedKey)
+    }
+    var xs: [i64] = []
+    var ys: [i64] = []
+    for t in 0..32 {
+        xs.push(der.at(kb.body + 2 + t))
+        ys.push(der.at(kb.body + 34 + t))
+    }
+    return (p256.from_bytes(bytes_of(xs)), p256.from_bytes(bytes_of(ys)))
+}
+
+/// Read a certificate's signed range, public key and signature.
+pub fn parse(der: bytes) -> Cert ! CertError {
+    let nodes = match asn1.parse(der) {
+        Err(_e) -> fail(NotDer)
+        Ok(ns) -> ns
+    }
+    if nodes.len() < 4 {
+        fail(NotACertificate)
+    }
+    // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signature }
+    let top = asn1.children(nodes, 0)
+    if top.len() != 3 {
+        fail(NotACertificate)
+    }
+    let tbs = top[0]
+    let alg_seq = top[1]
+    let sig_bits = top[2]
+
+    let algorithm = algorithm_of(der, nodes, alg_seq)
+    if algorithm != OID_ECDSA_SHA256 {
+        fail(UnsupportedAlgorithm(algorithm))
+    }
+    let (key_x, key_y) = try public_key_of(der, nodes)
+    // ECDSA-Sig-Value ::= SEQUENCE { r INTEGER, s INTEGER }, inside the BIT
+    // STRING, again after the unused-bit count.
+    if sig_bits.len < 2 or der.at(sig_bits.body) != 0 {
+        fail(MalformedSignature)
+    }
+    let inner = der.slice(sig_bits.body + 1, sig_bits.len - 1)
+    let sig_nodes = match asn1.parse(inner) {
+        Err(_e) -> fail(MalformedSignature)
+        Ok(ns) -> ns
+    }
+    if sig_nodes.len() < 3 {
+        fail(MalformedSignature)
+    }
+    let rs = asn1.children(sig_nodes, 0)
+    if rs.len() != 2 {
+        fail(MalformedSignature)
+    }
+    let sig_r = try int_of(inner, rs[0])
+    let sig_s = try int_of(inner, rs[1])
+
+    return Cert{
+        tbs_at: tbs.at,
+        tbs_len: tbs.body + tbs.len - tbs.at,
+        key_x: key_x,
+        key_y: key_y,
+        sig_r: sig_r,
+        sig_s: sig_s,
+        algorithm: algorithm,
+    }
+}
+
+/// Whether `cert`'s signature is a real ECDSA-P256-SHA256 signature made by
+/// `key`, over the certificate's own signed region.
+///
+/// The key is passed in rather than taken from the certificate, because a
+/// certificate that vouches for itself proves nothing about who issued it.
+/// Pass the issuer's key to check an issued certificate; pass the
+/// certificate's own key only to check that it is internally consistent, which
+/// is what a self-signed certificate is.
+pub fn verify_with(der: bytes, cert: Cert, key_x: [i64], key_y: [i64]) -> bool {
+    let signed = der.slice(cert.tbs_at, cert.tbs_len)
+    let digest = crypto_hash.sha256_of(signed)
+    let e = p256.from_bytes(digest)
+    return p256.verify(key_x, key_y, e, cert.sig_r, cert.sig_s)
+}
+
+/// Whether a self-signed certificate is signed by the key it carries.
+pub fn verify_self_signed(der: bytes) -> bool ! CertError {
+    let cert = try parse(der)
+    return verify_with(der, cert, cert.key_x, cert.key_y)
+}

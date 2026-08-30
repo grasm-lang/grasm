@@ -1,0 +1,12 @@
+[package]
+name = "x509_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.x509]
+path = "../x509"
+version = "^1.0.0"
+
+[dependencies.bytes_codec]
+path = "../bytes"
+version = "^1.0.0"

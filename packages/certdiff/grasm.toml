@@ -1,0 +1,8 @@
+[package]
+name = "certdiff"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.x509]
+path = "../x509"
+version = "^1.0.0"

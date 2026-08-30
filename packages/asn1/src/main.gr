@@ -1,0 +1,162 @@
+// DER, which is the encoding every certificate arrives in.
+//
+// A DER document is a tree of (tag, length, value) triples, and the only two
+// things that make it awkward are that lengths come in two forms and that the
+// tree is easier to use flat. So this parses to a flat list in document order,
+// each node carrying its depth — walking children is then "the following nodes
+// one deeper", and no recursion is needed to find anything.
+//
+// What it refuses is as important as what it reads. A length that runs past
+// the end of the document, an indefinite length (BER, not DER), and a document
+// with trailing bytes are all errors rather than a shorter answer, because a
+// parser that silently truncates is one an attacker chooses the truncation
+// point for.
+
+/// Universal tags, as they appear in the identifier octet.
+pub let BOOLEAN = 1
+pub let INTEGER = 2
+pub let BIT_STRING = 3
+pub let OCTET_STRING = 4
+pub let NULL = 5
+pub let OID = 6
+pub let UTF8_STRING = 12
+pub let SEQUENCE = 48
+pub let SET = 49
+pub let PRINTABLE_STRING = 19
+pub let IA5_STRING = 22
+pub let UTC_TIME = 23
+pub let GENERALIZED_TIME = 24
+
+type Node = {
+    /// The identifier octet as written: `48` for SEQUENCE, `0xA0` for `[0]`.
+    tag: i64,
+    /// Byte offset of the identifier octet.
+    at: i64,
+    /// Byte offset of the first content octet.
+    body: i64,
+    /// Length of the content, in bytes.
+    len: i64,
+    /// How deep in the tree, with the outermost node at 0.
+    depth: i64,
+}
+
+type Asn1Error =
+    | Truncated(at: i64)
+    | Indefinite(at: i64)
+    | LengthTooLarge(at: i64)
+    | Trailing(at: i64)
+
+    /// Every node of the document, outermost first, in the order it is written.
+pub fn parse(der: bytes) -> [Node] ! Asn1Error {
+    var out: [Node] = []
+    try walk(der, 0, der.len(), 0, out)
+    return out
+}
+
+/// One level, then each child. `stop` is one past the last byte of this level.
+fn walk(der: bytes, from: i64, stop: i64, depth: i64, inout out: [Node]) ! Asn1Error {
+    var i = from
+    while i < stop {
+        if i + 2 > stop {
+            fail(Truncated(i))
+        }
+        let tag = der.at(i)
+        let first = der.at(i + 1)
+        var body = i + 2
+        var len = first
+        if first == 128 {
+            // 0x80 is "length follows the content", which BER allows and DER
+            // does not. Accepting it would mean scanning for a terminator that
+            // an attacker also controls.
+            fail(Indefinite(i))
+        }
+        if first > 128 {
+            let count = first - 128
+            if count > 4 {
+                fail(LengthTooLarge(i))
+            }
+            if i + 2 + count > stop {
+                fail(Truncated(i))
+            }
+            len = 0
+            for k in 0..count {
+                len = len * 256 + der.at(i + 2 + k)
+            }
+            body = i + 2 + count
+        }
+        if body + len > stop {
+            fail(Truncated(i))
+        }
+        out.push(Node{ tag: tag, at: i, body: body, len: len, depth: depth })
+        // Bit 6 of the identifier octet says the content is itself a document.
+        if (tag / 32) % 2 == 1 {
+            try walk(der, body, body + len, depth + 1, out)
+        }
+        i = body + len
+    }
+}
+
+/// The content octets of a node.
+pub fn value(der: bytes, n: Node) -> bytes {
+    return der.slice(n.body, n.len)
+}
+
+/// The nodes directly inside `nodes[i]`.
+///
+/// A child is a node one deeper that appears before the next node at the
+/// parent's own depth — which is what "directly inside" means once the tree is
+/// flat.
+pub fn children(nodes: [Node], i: i64) -> [Node] {
+    var out: [Node] = []
+    let parent = nodes[i]
+    var k = i + 1
+    while k < nodes.len() {
+        let n = nodes[k]
+        if n.depth <= parent.depth {
+            return out
+        }
+        if n.depth == parent.depth + 1 {
+            out.push(n)
+        }
+        k = k + 1
+    }
+    return out
+}
+
+/// An INTEGER's value, for the small ones. DER writes them big-endian and
+/// two's complement, with a leading zero where the top bit would otherwise
+/// make a positive number look negative.
+pub fn integer_of(der: bytes, n: Node) -> i64 {
+    var v = 0
+    for k in 0..n.len {
+        v = v * 256 + der.at(n.body + k)
+    }
+    return v
+}
+
+/// An OBJECT IDENTIFIER in dotted form.
+///
+/// The first byte holds two arcs at once (`40 * a + b`), and every later arc is
+/// base-128 with the top bit set on all but the last byte.
+pub fn oid_of(der: bytes, n: Node) -> str {
+    if n.len == 0 {
+        return ""
+    }
+    let first = der.at(n.body)
+    var parts: [str] = ["{first / 40}", "{first % 40}"]
+    var acc = 0
+    for k in 1..n.len {
+        let b = der.at(n.body + k)
+        acc = acc * 128 + (b % 128)
+        if b < 128 {
+            parts.push("{acc}")
+            acc = 0
+        }
+    }
+    return parts.join(".")
+}
+
+/// The content of a node as text.
+pub fn text_of(der: bytes, n: Node) -> str {
+    return value(der, n).to_str()
+}
