@@ -166,20 +166,21 @@ fn put_piece(inout out: [i64], s: str) {
 }
 
 /// What a cache holds: a key, and the output produced under it.
-type Cache = {
+// `BuildCache`, since `cache` declares a `Cache`.
+type BuildCache = {
     keys: [str],
     outputs: [str],
     hits: i64,
     misses: i64,
 }
 
-pub fn new_cache() -> Cache {
+pub fn new_cache() -> BuildCache {
     var k: [str] = []
     var o: [str] = []
-    Cache{ keys: k, outputs: o, hits: 0, misses: 0 }
+    BuildCache{ keys: k, outputs: o, hits: 0, misses: 0 }
 }
 
-pub fn lookup(inout c: Cache, key: str) -> Option[str] {
+pub fn lookup(inout c: BuildCache, key: str) -> Option[str] {
     for i in 0..c.keys.len() {
         if c.keys[i] == key {
             c.hits = c.hits + 1
@@ -190,7 +191,7 @@ pub fn lookup(inout c: Cache, key: str) -> Option[str] {
     None
 }
 
-pub fn store(inout c: Cache, key: str, output: str) {
+pub fn store(inout c: BuildCache, key: str, output: str) {
     for i in 0..c.keys.len() {
         if c.keys[i] == key {
             // Storing the same key twice is not an update. The key covers
@@ -204,17 +205,17 @@ pub fn store(inout c: Cache, key: str, output: str) {
     c.outputs.push(output)
 }
 
-pub fn hits(c: Cache) -> i64 { c.hits }
-pub fn misses(c: Cache) -> i64 { c.misses }
-pub fn entries(c: Cache) -> i64 { c.keys.len() }
+pub fn hits(c: BuildCache) -> i64 { c.hits }
+pub fn misses(c: BuildCache) -> i64 { c.misses }
+pub fn entries(c: BuildCache) -> i64 { c.keys.len() }
 
-pub fn reset_counts(inout c: Cache) {
+pub fn reset_counts(inout c: BuildCache) {
     c.hits = 0
     c.misses = 0
 }
 
 /// Which tasks would actually run, given what is already cached.
-pub fn work_to_do(p: Plan, inout c: Cache, contents: [str],
+pub fn work_to_do(p: Plan, inout c: BuildCache, contents: [str],
                   content_names: [str]) -> [str] ! PlanError {
     var out: [str] = []
     for name in try order_of(p) {
