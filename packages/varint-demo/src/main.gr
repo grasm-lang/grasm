@@ -1,0 +1,127 @@
+import varint
+import crc32
+import bytes_codec
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+
+    print("-- varint, round-tripped at every boundary")
+    // The boundaries are where an off-by-one in the shift lives: one below and
+    // one above each seven-bit step.
+    let edges = [0, 1, 127, 128, 129, 16383, 16384, 2097151, 2097152,
+                 268435455, 268435456, 34359738367, 34359738368,
+                 4398046511103, 4398046511104, 4611686018427387903]
+    var all_round_trip = true
+    var all_widths_agree = true
+    for v in edges {
+        let enc = varint.encode(v)
+        if enc.len() != varint.width_of(v) {
+            all_widths_agree = false
+        }
+        match varint.get(enc, 0) {
+            Some(d) -> {
+                if d.value != v or d.width != enc.len() {
+                    all_round_trip = false
+                    print("        {v} came back as {d.value}")
+                }
+            }
+            None -> {
+                all_round_trip = false
+                print("        {v} would not decode")
+            }
+        }
+    }
+    say(f, "every boundary value round-trips", all_round_trip)
+    say(f, "width_of agrees with what encode produced", all_widths_agree)
+
+    // The published widths, so this is not just self-consistent.
+    say(f, "0 is one byte", varint.encode(0).len() == 1)
+    say(f, "127 is one byte", varint.encode(127).len() == 1)
+    say(f, "128 is two bytes", varint.encode(128).len() == 2)
+    say(f, "300 encodes as ac02", bytes_codec.encode_hex(varint.encode(300)) == "ac02")
+    say(f, "624485 encodes as e58e26",
+        bytes_codec.encode_hex(varint.encode(624485)) == "e58e26")
+
+    print("-- and a decoder given what a damaged file holds")
+    // Truncated: a byte that says another follows, and none does.
+    say(f, "a truncated varint decodes to nothing",
+        is_none(varint.get(bytes_of([200]), 0)))
+    say(f, "reading past the end decodes to nothing",
+        is_none(varint.get(bytes_of([1, 2, 3]), 9)))
+    // Eleven continuation bytes: longer than any i64 can be.
+    var runaway: [i64] = []
+    for _i in 0..12 {
+        runaway.push(255)
+    }
+    say(f, "a run of continuation bytes terminates rather than looping",
+        is_none(varint.get(bytes_of(runaway), 0)))
+
+    print("-- several varints in a row, which is what a record is")
+    var packed: [i64] = []
+    for v in [7, 300, 1, 70000] {
+        varint.put(packed, v)
+    }
+    let rec = bytes_of(packed)
+    var at = 0
+    var read: [i64] = []
+    var walked = true
+    for _i in 0..4 {
+        match varint.get_after(rec, at) {
+            Some(pair) -> {
+                read.push(pair.0)
+                at = pair.1
+            }
+            None -> walked = false
+        }
+    }
+    say(f, "four values walk back out in order",
+        walked and read.len() == 4 and read[0] == 7 and read[1] == 300
+        and read[2] == 1 and read[3] == 70000)
+    say(f, "and the walk ends exactly at the end", at == rec.len())
+
+    print("-- CRC-32, against the published values")
+    say(f, "the empty string is 0", crc32.of(bytes_of([])) == 0)
+    say(f, "\"a\" is 0xe8b7be43", crc32.of("a".to_bytes()) == 3904355907)
+    say(f, "\"abc\" is 0x352441c2", crc32.of("abc".to_bytes()) == 891568578)
+    say(f, "\"123456789\" is 0xcbf43926",
+        crc32.of("123456789".to_bytes()) == 3421780262)
+    say(f, "\"The quick brown fox jumps over the lazy dog\" is 0x414fa339",
+        crc32.of("The quick brown fox jumps over the lazy dog".to_bytes()) == 1095738169)
+
+    print("-- and the properties a torn record relies on")
+    let whole = "hello world".to_bytes()
+    say(f, "one bit changed changes the checksum",
+        crc32.of(whole) != crc32.of("hellp world".to_bytes()))
+    say(f, "a truncated buffer checksums differently",
+        crc32.of(whole) != crc32.of("hello worl".to_bytes()))
+    // Checksumming in two pieces must equal one piece, or a streaming writer
+    // and a whole-buffer reader disagree.
+    let t = crc32.table()
+    let split = crc32.finish(crc32.update(t,
+        crc32.update(t, crc32.start(), "hello ".to_bytes()), "world".to_bytes()))
+    say(f, "two pieces checksum the same as one", split == crc32.of(whole))
+    say(f, "four bytes round-trip through a header",
+        crc32.from_bytes(crc32.to_bytes(3421780262), 0) == 3421780262)
+
+    if f == 0 {
+        print("all checks passed")
+    } else {
+        print("{f} check(s) failed")
+    }
+}
+
+fn is_none(o: Option[Decoded]) -> bool {
+    match o {
+        None -> true
+        Some(_d) -> false
+    }
+}

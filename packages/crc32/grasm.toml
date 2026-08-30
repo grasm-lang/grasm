@@ -1,0 +1,6 @@
+[package]
+name = "crc32"
+version = "1.0.0"
+
+# Arithmetic over bytes. Opens nothing.
+capabilities = []

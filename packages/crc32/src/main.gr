@@ -1,0 +1,81 @@
+// CRC-32, the IEEE polynomial, which is what a log record carries so a reader
+// can tell a whole record from half of one.
+//
+// A store's log is append-only and a crash lands in the middle of a write.
+// The record that was half-written is not corrupt in an interesting way — it
+// is simply not all there — and the reader has to notice and stop rather than
+// hand a caller a key with a truncated value. Length alone does not catch it:
+// a torn write can leave a plausible length followed by nothing.
+//
+// **Grasm has one integer type, and CRC-32 is defined on 32 bits.** Every
+// intermediate is masked back to 32, because an i64 shifted left does not drop
+// the bits that fall off the end of a u32 — it keeps them, and the answer
+// stops matching every other implementation in the world.
+
+fn mask32(v: i64) -> i64 {
+    v.bit_and(4294967295)
+}
+
+/// The table, built once per call to `of`.
+///
+/// Rebuilding 256 entries per call is the wrong trade for a hot loop and the
+/// right one here: Grasm has no module-level mutable state, so the honest
+/// choices are to rebuild it or to make every caller thread a table through.
+/// `of_table` exists for the caller who cares.
+pub fn table() -> [i64] {
+    var t: [i64] = []
+    for n in 0..256 {
+        var c = n
+        for _k in 0..8 {
+            if c.bit_and(1) == 1 {
+                c = mask32(c.ushr(1).bit_xor(3988292384))
+            } else {
+                c = c.ushr(1)
+            }
+        }
+        t.push(c)
+    }
+    t
+}
+
+/// Continue a checksum over more bytes.
+///
+/// The running value is the *inverted* one, as every CRC-32 implementation
+/// keeps it, so `start` and `finish` are where the inversion happens and a
+/// caller checksumming two pieces gets the same answer as one.
+pub fn update(t: [i64], running: i64, b: bytes) -> i64 {
+    var c = running
+    for i in 0..b.len() {
+        let idx = c.bit_xor(b.at(i)).bit_and(255)
+        c = mask32(c.ushr(8).bit_xor(t[idx]))
+    }
+    c
+}
+
+pub fn start() -> i64 {
+    4294967295
+}
+
+pub fn finish(running: i64) -> i64 {
+    mask32(running.bit_xor(4294967295))
+}
+
+/// The checksum of one buffer.
+pub fn of(b: bytes) -> i64 {
+    finish(update(table(), start(), b))
+}
+
+/// The checksum of one buffer, with a table the caller keeps.
+pub fn of_table(t: [i64], b: bytes) -> i64 {
+    finish(update(t, start(), b))
+}
+
+/// Four bytes, little-endian, which is how it goes in a record header.
+pub fn to_bytes(crc: i64) -> bytes {
+    bytes_of([crc.bit_and(255), crc.ushr(8).bit_and(255),
+              crc.ushr(16).bit_and(255), crc.ushr(24).bit_and(255)])
+}
+
+pub fn from_bytes(b: bytes, at: i64) -> i64 {
+    b.at(at).bit_or(b.at(at + 1).shl(8)).bit_or(b.at(at + 2).shl(16)).bit_or(b.at(at + 3).shl(24))
+}

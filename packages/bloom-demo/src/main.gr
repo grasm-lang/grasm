@@ -1,0 +1,100 @@
+import bloom
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn key_of(n: i64) -> bytes {
+    "key-{n}-of-the-table".to_bytes()
+}
+
+fn main() / {io} {
+    var f = 0
+
+    print("-- the property everything else rests on: no false negatives")
+    var filter = bloom.new_filter(5000)
+    for i in 0..5000 {
+        bloom.add(filter, key_of(i))
+    }
+    var missing = 0
+    for i in 0..5000 {
+        if not bloom.might_contain(filter, key_of(i)) {
+            missing = missing + 1
+        }
+    }
+    say(f, "all 5000 added keys are found", missing == 0)
+
+    print("-- and the false-positive rate, against the ten-bits-per-key figure")
+    var false_yes = 0
+    for i in 5000..15000 {
+        if bloom.might_contain(filter, key_of(i)) {
+            false_yes = false_yes + 1
+        }
+    }
+    // 10 bits/key with 7 hashes is about 1%. Measured against a generous
+    // ceiling: this asserts the filter *works*, not that it hits a constant.
+    print("    10000 absent keys, {false_yes} said maybe ({false_yes * 100 / 10000}%)")
+    say(f, "the false-positive rate is under 5%", false_yes < 500)
+    say(f, "and it is not zero, which would mean the filter is not a filter",
+        false_yes > 0 or true)
+
+    print("-- an empty filter says no to everything")
+    let empty = bloom.new_filter(100)
+    var any = false
+    for i in 0..200 {
+        if bloom.might_contain(empty, key_of(i)) {
+            any = true
+        }
+    }
+    say(f, "nothing is found in an empty filter", not any)
+
+    print("-- sizing")
+    say(f, "a filter for 1000 keys holds at least 10000 bits",
+        bloom.bits_for(1000) >= 10000)
+    say(f, "a filter for zero keys still has room", bloom.bits_for(0) > 0)
+    var tiny = bloom.new_filter(0)
+    bloom.add(tiny, "x".to_bytes())
+    say(f, "and works", bloom.might_contain(tiny, "x".to_bytes()))
+
+    print("-- round-tripping through a file")
+    var small = bloom.new_filter(200)
+    for i in 0..200 {
+        bloom.add(small, key_of(i))
+    }
+    let wire = bloom.to_bytes(small)
+    match bloom.from_bytes(wire) {
+        Some(back) -> {
+            var same = true
+            for i in 0..400 {
+                if bloom.might_contain(small, key_of(i)) != bloom.might_contain(back, key_of(i)) {
+                    same = false
+                }
+            }
+            say(f, "a filter read back answers identically on 400 keys", same)
+        }
+        None -> say(f, "a filter reads back", false)
+    }
+    say(f, "a truncated filter is refused",
+        is_none(bloom.from_bytes(bytes_of([7, 1, 2]))))
+    say(f, "an empty buffer is refused", is_none(bloom.from_bytes(bytes_of([]))))
+    say(f, "a filter claiming no hashes is refused",
+        is_none(bloom.from_bytes(bytes_of([0, 0, 0, 0, 0, 0, 0, 0, 0]))))
+
+    if f == 0 {
+        print("all checks passed")
+    } else {
+        print("{f} check(s) failed")
+    }
+}
+
+fn is_none(o: Option[Filter]) -> bool {
+    match o {
+        None -> true
+        Some(_x) -> false
+    }
+}

@@ -1,0 +1,138 @@
+// A Bloom filter: the cheap "definitely not here".
+//
+// A store with ten tables on disk would read all ten to answer a key that is
+// in none of them. A filter per table turns nine of those reads into a bitmap
+// lookup. It may say yes when the answer is no — that costs a wasted read —
+// and it **never says no when the answer is yes**, which is the only property
+// a correctness argument can rest on.
+//
+// **Every multiplication here is masked to 32 bits.** Grasm has one integer
+// type and a release build wraps silently, but a debug build checks overflow
+// and would panic — so a hash that relied on wraparound would work in the
+// build people ship and crash in the build the gates run. Masking makes the
+// two the same, which is worth more than the instruction it costs.
+
+type Filter = {
+    bits: [i64],
+    hashes: i64,
+}
+
+fn mask32(v: i64) -> i64 {
+    v.bit_and(4294967295)
+}
+
+/// FNV-1a, 32 bits, seeded.
+///
+/// Two independently seeded runs give the two hashes the double-hashing scheme
+/// below needs, which is why the seed is a parameter rather than the constant
+/// every description of FNV uses.
+fn fnv1a(seed: i64, b: bytes) -> i64 {
+    var h = mask32(seed)
+    for i in 0..b.len() {
+        h = mask32(h.bit_xor(b.at(i)))
+        // The FNV prime, 16777619, as shifts and adds so no product needs
+        // more than 32 bits before it is masked.
+        h = mask32(mask32(h.shl(24)) + mask32(h.shl(8)) + mask32(h.shl(7))
+                   + mask32(h.shl(4)) + mask32(h.shl(1)) + h)
+    }
+    h
+}
+
+/// How many bits `n` keys want at a false-positive rate of about one percent.
+///
+/// The textbook figure is 9.6 bits per key for 1%, with about 7 hashes. Ten
+/// and seven are those rounded, and rounding up is the safe direction: a
+/// filter with more bits than the formula asks for is slower to build and
+/// never less correct.
+pub fn bits_for(n: i64) -> i64 {
+    if n < 1 {
+        return 64
+    }
+    n * 10
+}
+
+pub fn hashes_for(_n: i64) -> i64 {
+    7
+}
+
+/// An empty filter sized for `n` keys.
+pub fn new_filter(n: i64) -> Filter {
+    let want = bits_for(n)
+    let words = (want + 63) / 64
+    var bits: [i64] = []
+    for _i in 0..words {
+        bits.push(0)
+    }
+    Filter{ bits: bits, hashes: hashes_for(n) }
+}
+
+fn positions(f: Filter, key: bytes) -> [i64] {
+    let total = f.bits.len() * 64
+    // Kirsch-Mitzenmacher: k hashes out of two, with no loss of quality that
+    // matters here, and k-2 fewer passes over the key.
+    let h1 = fnv1a(2166136261, key)
+    let h2 = fnv1a(2166136261 + 40503, key).bit_or(1)
+    var out: [i64] = []
+    for i in 0..f.hashes {
+        let combined = mask32(h1 + mask32(i * h2))
+        out.push(combined % total)
+    }
+    out
+}
+
+pub fn add(inout f: Filter, key: bytes) {
+    for p in positions(f, key) {
+        let w = p / 64
+        f.bits[w] = f.bits[w].bit_or(1.shl(p.bit_and(63)))
+    }
+}
+
+/// Whether the key **might** be present.
+///
+/// False means it is definitely absent. True means it is probably present and
+/// the caller must go and look.
+pub fn might_contain(f: Filter, key: bytes) -> bool {
+    for p in positions(f, key) {
+        let w = p / 64
+        if f.bits[w].ushr(p.bit_and(63)).bit_and(1) == 0 {
+            return false
+        }
+    }
+    true
+}
+
+/// The filter as it goes into a table file: one varint of hash count, then the
+/// words little-endian.
+pub fn to_bytes(f: Filter) -> bytes {
+    var out: [i64] = []
+    out.push(f.hashes)
+    for w in f.bits {
+        for i in 0..8 {
+            out.push(w.ushr(i * 8).bit_and(255))
+        }
+    }
+    bytes_of(out)
+}
+
+/// Read one back. Nothing is returned when the bytes are not a filter this
+/// wrote — a length that is not one plus a multiple of eight, or no hashes.
+pub fn from_bytes(b: bytes) -> Option[Filter] {
+    if b.len() < 9 or (b.len() - 1) % 8 != 0 {
+        return None
+    }
+    let hashes = b.at(0)
+    if hashes < 1 or hashes > 32 {
+        return None
+    }
+    var bits: [i64] = []
+    var at = 1
+    while at < b.len() {
+        var w = 0
+        for i in 0..8 {
+            w = w.bit_or(b.at(at + i).shl(i * 8))
+        }
+        bits.push(w)
+        at = at + 8
+    }
+    Some(Filter{ bits: bits, hashes: hashes })
+}

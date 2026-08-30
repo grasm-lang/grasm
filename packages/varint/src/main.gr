@@ -1,0 +1,98 @@
+// LEB128: an integer in as few bytes as it needs.
+//
+// A key-value store writes millions of lengths, and most of them are small. A
+// fixed eight bytes for a length that is almost always under 128 is seven
+// bytes of waste per record, which at scale is most of the file. So the
+// encoding is seven bits per byte with the top bit meaning "another follows".
+//
+// **Reading is the part that has to be careful.** Every varint in a store's
+// files came off a disk, and a disk holds whatever was last written there —
+// including a truncated record from a crash, or damage. A decoder that trusts
+// its input loops forever on a run of 0x80 bytes, so this one is bounded and
+// says when the bound is hit.
+
+/// A decoded integer and how many bytes it took.
+type Decoded = {
+    value: i64,
+    width: i64,
+}
+
+/// Ten bytes of seven bits is seventy, which covers every i64 including the
+/// sign bit. An eleventh byte means the input is not a varint this wrote.
+fn max_width() -> i64 { 10 }
+
+/// Append an unsigned integer.
+///
+/// Negative values are refused rather than sign-extended into ten bytes. A
+/// length or an offset is never negative, and a caller passing one has a bug
+/// that is better found here than in a file six months from now.
+pub fn put(inout out: [i64], value: i64) {
+    if value < 0 {
+        panic("varint.put: {value} is negative — lengths and offsets are not")
+    }
+    var v = value
+    while v >= 128 {
+        out.push(v.bit_and(127).bit_or(128))
+        v = v.ushr(7)
+    }
+    out.push(v)
+}
+
+/// The bytes one integer encodes to, on their own.
+pub fn encode(value: i64) -> bytes {
+    var out: [i64] = []
+    put(out, value)
+    bytes_of(out)
+}
+
+/// How many bytes a value will take, without producing them.
+pub fn width_of(value: i64) -> i64 {
+    if value < 0 {
+        panic("varint.width_of: {value} is negative")
+    }
+    var v = value
+    var n = 1
+    while v >= 128 {
+        v = v.ushr(7)
+        n = n + 1
+    }
+    n
+}
+
+/// Read one integer starting at `at`.
+///
+/// Nothing is returned when the bytes are not a varint — truncated, or longer
+/// than any i64 can be. Both are things a damaged file contains and neither is
+/// a reason to stop the program that is reading it.
+pub fn get(b: bytes, at: i64) -> Option[Decoded] {
+    var value = 0
+    var shift = 0
+    var i = at
+    var width = 0
+    while width < max_width() {
+        if i >= b.len() {
+            // Truncated: the last byte said another follows and none did.
+            return None
+        }
+        let byte = b.at(i)
+        value = value.bit_or(byte.bit_and(127).shl(shift))
+        width = width + 1
+        if byte < 128 {
+            return Some(Decoded{ value: value, width: width })
+        }
+        shift = shift + 7
+        i = i + 1
+    }
+    None
+}
+
+/// Read one integer and answer where the next one starts.
+///
+/// The common shape when walking a record: the caller almost never wants the
+/// width on its own, it wants to continue.
+pub fn get_after(b: bytes, at: i64) -> Option[(i64, i64)] {
+    match get(b, at) {
+        Some(d) -> Some((d.value, at + d.width))
+        None -> None
+    }
+}

@@ -1,0 +1,8 @@
+[package]
+name = "bloom_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.bloom]
+path = "../bloom"
+version = "^1.0.0"
