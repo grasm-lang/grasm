@@ -1,0 +1,140 @@
+// Raw terminal mode, in Grasm, with no new builtin.
+//
+// A terminal is line-at-a-time by default: nothing reaches the program until
+// Return, and every keystroke is echoed by the driver. An editor, a pager or a
+// progress display needs the opposite — a character as it is typed, and no echo
+// — and that is `termios`, which is C rather than a system call with a wrapper.
+//
+// This exists to answer a question about the *language* rather than to be a
+// terminal library. "No raw tty" was written down here as a gap the language
+// had to close with a builtin. It is not: `extern fn` reaches libc, a `bytes`
+// argument crosses as a pointer, and C writing through that pointer is visible
+// on the way back — which is exactly what `tcgetattr` needs. So this is a
+// package, and a package is where it belongs, the same way `libc` is a crate
+// rather than part of Rust.
+//
+// macOS/BSD layout. `tcflag_t` is 8 bytes here, so:
+//
+//     offset  0  c_iflag   offset 24  c_lflag
+//     offset  8  c_oflag   offset 32  c_cc[20]
+//     offset 16  c_cflag   offset 56  c_ispeed, c_ospeed
+//
+// 72 bytes in total. The two flags that matter live in `c_lflag`.
+extern fn tcgetattr(fd: i64, buf: bytes) -> i64
+extern fn tcsetattr(fd: i64, action: i64, buf: bytes) -> i64
+extern fn isatty(fd: i64) -> i64
+extern fn read(fd: i64, buf: bytes, n: i64) -> i64
+
+pub let SIZE = 72
+/// `ECHO` — the driver prints what was typed.
+pub let ECHO = 8
+/// `ICANON` — the driver waits for a whole line.
+pub let ICANON = 256
+/// `TCSANOW` — change it on the next call rather than after the queue drains.
+pub let TCSANOW = 0
+/// Index of `VMIN` and `VTIME` within `c_cc`.
+pub let VMIN = 16
+pub let VTIME = 17
+
+type TtyError =
+    | NotATerminal(fd: i64)
+    | Refused(call: str, code: i64)
+
+    /// Whether the descriptor is a terminal at all.
+    ///
+    /// Asked before anything else, because `tcgetattr` on a pipe fails with the
+    /// same `-1` it returns for a terminal that refused, and a program that cannot
+    /// tell them apart reports "your terminal refused" when the answer is "you
+    /// redirected me to a file".
+pub fn is_terminal(fd: i64) -> bool / {io, unsafe} {
+    unsafe { isatty(fd) == 1 }
+}
+
+/// The current settings, as the 72 bytes the C structure occupies.
+pub fn current(fd: i64) -> bytes ! TtyError / {io, unsafe} {
+    if not is_terminal(fd) {
+        fail(NotATerminal(fd))
+    }
+    var zeros: [i64] = []
+    for _i in 0..SIZE {
+        zeros.push(0)
+    }
+    let buf = bytes_of(zeros)
+    let rc = unsafe { tcgetattr(fd, buf) }
+    if rc != 0 {
+        fail(Refused("tcgetattr", rc))
+    }
+    return buf
+}
+
+/// The little-endian 64-bit field at `at`.
+fn field(t: bytes, at: i64) -> i64 {
+    var v = 0
+    for i in 0..8 {
+        v = v + t.at(at + i) * (2 ^ (8 * i))
+    }
+    return v
+}
+
+/// `t` with the 64-bit field at `at` replaced.
+fn with_field(t: bytes, at: i64, value: i64) -> bytes {
+    var out: [i64] = []
+    for i in 0..t.len() {
+        out.push(t.at(i))
+    }
+    var v = value
+    for i in 0..8 {
+        out[at + i] = v % 256
+        v = v / 256
+    }
+    return bytes_of(out)
+}
+
+/// `t` with byte `at` replaced.
+fn with_byte(t: bytes, at: i64, value: i64) -> bytes {
+    var out: [i64] = []
+    for i in 0..t.len() {
+        out.push(t.at(i))
+    }
+    out[at] = value
+    return bytes_of(out)
+}
+
+/// The same settings with echo and line-buffering turned off.
+///
+/// `VMIN = 1` and `VTIME = 0` say "return as soon as one byte is there, and
+/// wait forever for it" — without them a read on a raw terminal can come back
+/// empty and a caller reading one key gets nothing.
+pub fn raw_of(t: bytes) -> bytes {
+    let lflag = field(t, 24)
+    // Clearing two bits without a bitwise `and`: subtract each one that is set.
+    var cleared = lflag
+    if (lflag / ECHO) % 2 == 1 {
+        cleared = cleared - ECHO
+    }
+    if (lflag / ICANON) % 2 == 1 {
+        cleared = cleared - ICANON
+    }
+    let a = with_field(t, 24, cleared)
+    let b = with_byte(a, 32 + VMIN, 1)
+    return with_byte(b, 32 + VTIME, 0)
+}
+
+/// Apply settings previously obtained from `current` or built by `raw_of`.
+pub fn apply(fd: i64, t: bytes) -> i64 ! TtyError / {io, unsafe} {
+    let rc = unsafe { tcsetattr(fd, TCSANOW, t) }
+    if rc != 0 {
+        fail(Refused("tcsetattr", rc))
+    }
+    return rc
+}
+
+/// One byte, read without waiting for a newline. `None` at end of input.
+pub fn read_key(fd: i64) -> Option[i64] / {io, unsafe} {
+    let buf = bytes_of([0])
+    let n = unsafe { read(fd, buf, 1) }
+    if n == 1 {
+        return Some(buf.at(0))
+    }
+    return None
+}

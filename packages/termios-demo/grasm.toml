@@ -1,0 +1,8 @@
+[package]
+name = "termios_demo"
+version = "1.0.0"
+capabilities = ["io", "unsafe"]
+
+[dependencies.termios]
+path = "../termios"
+version = "^1.0.0"

@@ -1,0 +1,41 @@
+// Raw mode, demonstrated where a terminal exists and refused where one does not.
+//
+// The interesting half is the refusal. Run under a pipe this prints that stdin
+// is not a terminal and stops; run under a pty it turns echo and line-buffering
+// off, reads three keys as they are typed, and puts the terminal back. A
+// program that cannot tell those two situations apart is a program that leaves
+// somebody's shell in raw mode.
+import termios
+
+fn main() / {io, unsafe} {
+    if not termios.is_terminal(0) {
+        print("stdin is not a terminal, so there is nothing to put into raw mode")
+        return
+    }
+    match termios.current(0) {
+        Err(_e) -> print("the terminal refused to describe itself")
+        Ok(saved) -> {
+            let raw = termios.raw_of(saved)
+            match termios.apply(0, raw) {
+                Err(_e) -> print("the terminal refused raw mode")
+                Ok(_rc) -> {
+                    print("raw: type three keys")
+                    var seen: [i64] = []
+                    for _i in 0..3 {
+                        match termios.read_key(0) {
+                            Some(b) -> seen.push(b)
+                            None -> {}
+                        }
+                    }
+                    // Restored before printing, so the report is readable even
+                    // if the terminal is left in a strange state by the print.
+                    match termios.apply(0, saved) {
+                        Err(_e) -> {}
+                        Ok(_r) -> {}
+                    }
+                    print("read {seen.len()} key(s) one at a time: {seen}")
+                }
+            }
+        }
+    }
+}

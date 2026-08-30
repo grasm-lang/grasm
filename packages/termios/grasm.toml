@@ -1,0 +1,8 @@
+[package]
+name = "termios"
+version = "1.0.0"
+
+# Puts the terminal into raw mode by calling `tcgetattr` and `tcsetattr`
+# directly. That is C, so it is Tier 3 and says so here as well as in the
+# source — a consumer can refuse this package by reading one line.
+capabilities = ["io", "unsafe"]
