@@ -94,28 +94,15 @@ fn entry_size(h: HeaderPair) -> i64 {
 }
 
 fn evict(inout t: HeaderTable) {
-    // The entries that survive are *built*, rather than the doomed ones popped
-    // off in a loop.
-    //
-    // Popping is the obvious spelling and it leaks: `pop()` on a field's list,
-    // inside a `while` loop, in a function taking the struct as `inout`, does
-    // not release the element it discards in the compiled backend — two
-    // allocations per eviction, which for a long-lived connection is unbounded
-    // (F92, with a thirteen-line reproducer in `docs/known-issues.md`).
-    //
-    // This spelling is also the clearer one, so nothing is lost by avoiding
-    // the shape while the backend is fixed.
-    var kept: [HeaderPair] = []
-    var size = 0
-    for e in t.entries {
-        let cost = entry_size(e)
-        if size + cost <= t.capacity {
-            kept.push(e)
-            size = size + cost
-        }
+    // Written the obvious way again. It could not be, for a while: `pop()` in
+    // a loop body leaked what it discarded, because a loop body is a block in
+    // statement position and its last expression was handed to nobody and
+    // released by nobody (F92). Fixed in the backend, so this reads as it
+    // should.
+    while t.size > t.capacity and t.entries.len() > 0 {
+        t.size = t.size - entry_size(t.entries[t.entries.len() - 1])
+        t.entries.pop()
     }
-    t.entries = kept
-    t.size = size
 }
 
 pub fn insert(inout t: HeaderTable, h: HeaderPair) {

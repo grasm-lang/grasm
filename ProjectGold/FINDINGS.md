@@ -107,7 +107,7 @@ and the entries disagree.
 | [F89](#f89) | F88's fix made the checker accept what the engine could not build | S1, types | **fixed** |
 | [F90](#f90) | a write through `inout` was silently discarded, and only in two engines | S1, semantics | **fixed** |
 | [F91](#f91) | F88's fix reached variants with arguments and not those without | S2, types | **fixed** |
-| [F92](#f92) | `pop()` through an `inout` field, inside a loop, never released what it dropped | S2, backend | **reproduced, open** |
+| [F92](#f92) | `pop()` through an `inout` field, inside a loop, never released what it dropped | S2, backend | **fixed** |
 
 <!-- end index -->
 ## F1 — a wrapped condition must end the line with the operator (S4) — **fixed**
@@ -3944,7 +3944,7 @@ the same way F88 and F82 were found.
 in one test, and `packages/aes` and `packages/tls13` are both in the corpus and
 both declare a `NotAuthentic`, so `difftest` runs the pair three ways.
 
-## F92 — `pop()` through an `inout` field, inside a loop, never released what it dropped (S2, backend) — **reproduced, open**
+## F92 — `pop()` through an `inout` field, inside a loop, never released what it dropped (S2, backend) — **fixed**
 
 Thirteen lines:
 
@@ -3999,7 +3999,22 @@ proportion to how long it runs.
 Found by writing HPACK, whose eviction loop is exactly this shape — which is
 also the shape of every cache, every ring buffer, and every queue with a bound.
 
-**Not worked around silently.** `packages/hpack` builds the surviving entries
-into a new list instead of popping the doomed ones, which is the clearer
-spelling anyway, and says at the call site why. The corpus is green because the
-shape is absent, not because the defect is.
+**The cause, once the three ingredients were understood.** A discarded
+expression statement is released by the block walker *only when it is not the
+last statement*, because in expression position the last one is the block's
+value and belongs to whoever asked for it. A **loop body is a block in
+statement position**: its last expression is handed to nobody. Both `while` and
+`for` dropped it with `let (_, terminated) = ...` and nothing released it.
+
+The three ingredients follow from that. A field receiver and an `inout` root
+are what make `pop` take the *place* path, which returns the popped `Option` as
+a value; and the loop is what puts that value in statement-tail position. Any
+one removed and the value is either never produced or duly released.
+
+Both loop forms now call one `dec_block_tail`, so a third cannot forget.
+
+`packages/hpack` is back to the obvious spelling, and `docs/known-issues.md`
+reads open S2: none again.
+
+**Gate**: `scripts/leakcheck.sh` over the corpus, where `packages/hpack-demo`
+evicts in a loop on every run.

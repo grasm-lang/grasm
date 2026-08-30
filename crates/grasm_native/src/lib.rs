@@ -4842,6 +4842,22 @@ impl FnCx<'_, '_> {
     // Blocks & statements
     // ------------------------------------------------------------------
 
+    /// Release the value a block in *statement* position produced.
+    ///
+    /// A block used as an expression hands its last value to whoever asked for
+    /// it. A loop body hands it to nobody, so it has to be released here — and
+    /// the block walker cannot do it, because it does not know which position
+    /// it is in. One function, called from every loop form, so a fourth cannot
+    /// be added that forgets (F92).
+    fn dec_block_tail(&mut self, tail: Option<(Value, VType)>) {
+        if self.is_filled() || self.dead {
+            return;
+        }
+        if let Some((v, t)) = tail {
+            self.dec_if_boxed(v, &t);
+        }
+    }
+
     fn eval_block_inner(
         &mut self,
         blk: &grasm_syntax::ast::Block,
@@ -5372,7 +5388,15 @@ impl FnCx<'_, '_> {
                 let inner = self.eval_block_inner(body);
                 self.loops.pop();
                 self.pinned.pop();
-                let (_, mut terminated) = inner?;
+                let (tail, mut terminated) = inner?;
+                // A loop body is a block in *statement* position, so its last
+                // expression is not a value anybody receives — and the block
+                // walker only decs a discarded expression when it is not the
+                // last one, because in expression position the last one is the
+                // block's result. Dropped here it was never released: a
+                // `while { xs.pop() }` leaked what it popped, every iteration
+                // (F92).
+                self.dec_block_tail(tail);
                 terminated |= self.is_filled();
                 if !terminated {
                     self.b.ins().jump(header, &[]);
@@ -5740,7 +5764,9 @@ this case",
             let inner = self.eval_block_inner(body);
             self.loops.pop();
             self.pinned.pop();
-            let (_, mut terminated) = inner?;
+            let (tail, mut terminated) = inner?;
+            // Statement position, as for `while` above (F92).
+            self.dec_block_tail(tail);
             terminated |= self.is_filled();
             self.pop_scope_no_decs(); // loop var is scalar
             if !terminated {
