@@ -1,0 +1,139 @@
+// ChaCha20-Poly1305, RFC 8439 section 2.8.
+//
+// An AEAD: the cipher hides the message and the authenticator proves nobody
+// changed it. Neither alone is enough, and the way they are joined is where
+// implementations go wrong — so the three rules that matter are stated here
+// rather than left implicit in the code.
+//
+// **The Poly1305 key is per-message, from counter zero.** ChaCha20 block 0
+// with this key and nonce gives 64 bytes; the first 32 are the one-time
+// authenticator key and the rest is discarded. Encryption starts at counter
+// 1. Reusing an authenticator key across two messages lets anyone who sees
+// both forge a third, which is why "one-time" is in Poly1305's name.
+//
+// **The tag covers the associated data, the ciphertext, and both their
+// lengths.** The lengths are not decoration: without them, moving bytes from
+// the associated data into the ciphertext leaves the tag unchanged.
+//
+// **`open` verifies before it decrypts, and returns nothing on failure.**
+// Handing back a plaintext "that failed to verify" is how a padding oracle
+// gets built — the caller has something to look at, and looking is the
+// attack.
+import chacha20
+import poly1305
+
+type AeadError = { why: str }
+
+fn pad16(inout out: [i64], n: i64) {
+    var k = n % 16
+    if k == 0 {
+        return
+    }
+    while k < 16 {
+        out.push(0)
+        k = k + 1
+    }
+}
+
+fn le64(inout out: [i64], n: i64) {
+    var v = n
+    for _i in 0..8 {
+        out.push(v.bit_and(255))
+        v = v.ushr(8)
+    }
+}
+
+/// The one-time Poly1305 key for this message: ChaCha20 block zero, first 32
+/// bytes.
+fn message_key(key: bytes, nonce: bytes) -> bytes {
+    let block = chacha20.block(key, 0, nonce)
+    var out: [i64] = []
+    for i in 0..32 {
+        out.push(block.at(i))
+    }
+    bytes_of(out)
+}
+
+/// What the tag is computed over: the associated data padded to 16, the
+/// ciphertext padded to 16, then both lengths as 64-bit little-endian.
+fn tag_input(aad: bytes, ciphertext: bytes) -> bytes {
+    var out: [i64] = []
+    for b in aad.to_list() {
+        out.push(b)
+    }
+    pad16(out, aad.len())
+    for b in ciphertext.to_list() {
+        out.push(b)
+    }
+    pad16(out, ciphertext.len())
+    le64(out, aad.len())
+    le64(out, ciphertext.len())
+    bytes_of(out)
+}
+
+type Sealed = { ciphertext: bytes, tag: bytes }
+
+/// Encrypt and authenticate.
+///
+/// **The nonce must never repeat for a key.** ChaCha20 is a stream cipher:
+/// two messages under one nonce xor to the two plaintexts xored together, and
+/// the authenticator key is reused as well. This function cannot check that
+/// — only the caller knows what it has sent — so the caller carries the rule,
+/// and `grasmwire` carries it with a counter that never goes backwards.
+pub fn seal(key: bytes, nonce: bytes, aad: bytes, plaintext: bytes) -> Sealed {
+    let otk = message_key(key, nonce)
+    let ciphertext = chacha20.apply(key, 1, nonce, plaintext)
+    let tag = poly1305.tag(otk, tag_input(aad, ciphertext))
+    Sealed{ ciphertext: ciphertext, tag: tag }
+}
+
+/// Verify, then decrypt. Nothing comes back if the tag does not match.
+pub fn open(key: bytes, nonce: bytes, aad: bytes, s: Sealed) -> bytes ! AeadError {
+    let otk = message_key(key, nonce)
+    if not poly1305.verify(otk, tag_input(aad, s.ciphertext), s.tag) {
+        // One message for every failure. Saying *which* check failed — a bad
+        // tag, a short tag, the wrong associated data — tells an attacker
+        // which half of the forgery to work on.
+        fail(AeadError{ why: "the message is not authentic" })
+    }
+    chacha20.apply(key, 1, nonce, s.ciphertext)
+}
+
+/// The wire form: ciphertext with the tag appended, which is what every
+/// protocol using this actually sends.
+pub fn seal_combined(key: bytes, nonce: bytes, aad: bytes, plaintext: bytes) -> bytes {
+    let s = seal(key, nonce, aad, plaintext)
+    var out = s.ciphertext.to_list()
+    for b in s.tag.to_list() {
+        out.push(b)
+    }
+    bytes_of(out)
+}
+
+pub fn open_combined(key: bytes, nonce: bytes, aad: bytes, sealed: bytes) -> bytes ! AeadError {
+    if sealed.len() < 16 {
+        fail(AeadError{ why: "the message is not authentic" })
+    }
+    let cut = sealed.len() - 16
+    var ct: [i64] = []
+    var tg: [i64] = []
+    for i in 0..cut {
+        ct.push(sealed.at(i))
+    }
+    for i in cut..sealed.len() {
+        tg.push(sealed.at(i))
+    }
+    try open(key, nonce, aad, Sealed{ ciphertext: bytes_of(ct), tag: bytes_of(tg) })
+}
+
+/// The 12-byte nonce a counter-based protocol uses: four zero bytes, then the
+/// counter little-endian, which is what WireGuard and TLS both do.
+pub fn nonce_of(counter: i64) -> bytes {
+    var out: [i64] = [0, 0, 0, 0]
+    var v = counter
+    for _i in 0..8 {
+        out.push(v.bit_and(255))
+        v = v.ushr(8)
+    }
+    bytes_of(out)
+}

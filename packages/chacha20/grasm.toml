@@ -1,0 +1,7 @@
+[package]
+name = "chacha20"
+version = "1.0.0"
+entry = "src/main.gr"
+
+# Arithmetic on bytes. It opens nothing and reaches nothing.
+capabilities = []

@@ -1,0 +1,95 @@
+// ChaCha20-Poly1305 against RFC 8439 section 2.8.2 — the vector with the
+// "internet draft" plaintext, which is the one every implementation is
+// checked against.
+import bytes_codec
+import chachapoly
+
+fn hex(h: str) -> bytes {
+    bytes_codec.decode_hex(h) ?? bytes_of([])
+}
+
+fn check(label: str, got: str, want: str) {
+    let mark = if got == want { "ok   " } else { "WRONG" }
+    print("  {mark} {label}")
+    if got != want {
+        print("        got  {got}")
+        print("        want {want}")
+    }
+}
+
+fn main() {
+    let key = hex("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")
+    let nonce = hex("070000004041424344454647")
+    let aad = hex("50515253c0c1c2c3c4c5c6c7")
+    let plain = "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it."
+
+    print("-- RFC 8439 section 2.8.2")
+    let sealed = chachapoly.seal(key, nonce, aad, plain.to_bytes())
+    check("ciphertext",
+          bytes_codec.encode_hex(sealed.ciphertext),
+          "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d6" +
+          "3dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b36" +
+          "92ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc" +
+          "3ff4def08e4b7a9de576d26586cec64b6116")
+    check("tag", bytes_codec.encode_hex(sealed.tag), "1ae10b594f09e26a7e902ecbd0600691")
+
+    print("-- and it opens")
+    match chachapoly.open(key, nonce, aad, sealed) {
+        Ok(opened) -> print("  round trip: {opened.to_str() == plain}")
+        Err(e) -> print("  it did not open: {e.why}")
+    }
+
+    print("-- every way it must refuse")
+    var flipped = sealed.ciphertext.to_list()
+    flipped[0] = flipped[0].bit_xor(1)
+    let bad_ct = Sealed{ ciphertext: bytes_of(flipped), tag: sealed.tag }
+    print("  one ciphertext bit changed: {open_fails(key, nonce, aad, bad_ct)}")
+
+    var bad_tag_bytes = sealed.tag.to_list()
+    bad_tag_bytes[15] = bad_tag_bytes[15].bit_xor(128)
+    let bad_tag = Sealed{ ciphertext: sealed.ciphertext, tag: bytes_of(bad_tag_bytes) }
+    print("  one tag bit changed:        {open_fails(key, nonce, aad, bad_tag)}")
+
+    print("  different associated data:  {open_fails(key, nonce, hex("00"), sealed)}")
+    print("  no associated data:         {open_fails(key, nonce, bytes_of([]), sealed)}")
+    print("  a different nonce:          {open_fails(key, hex("070000004041424344454648"), aad, sealed)}")
+    print("  a different key:            {open_fails(hex("00".repeat(32)), nonce, aad, sealed)}")
+
+    print("-- moving a byte from the associated data into the ciphertext")
+    // Without the lengths in the tag input this would verify. With them it
+    // cannot, which is the whole reason they are there.
+    let a = hex("50515253c0c1c2c3c4c5c6")
+    print("  aad one byte shorter:       {open_fails(key, nonce, a, sealed)}")
+
+    print("-- the combined form, which is what goes on a wire")
+    let combined = chachapoly.seal_combined(key, nonce, aad, plain.to_bytes())
+    print("  ciphertext + tag = {combined.len()} bytes for {plain.len()} of plaintext")
+    match chachapoly.open_combined(key, nonce, aad, combined) {
+        Ok(back) -> print("  round trip: {back.to_str() == plain}")
+        Err(e) -> print("  failed: {e.why}")
+    }
+    match chachapoly.open_combined(key, nonce, aad, bytes_of([1, 2, 3])) {
+        Ok(back) -> print("  a three-byte message opened, which it must not")
+        Err(e) -> print("  too short to hold a tag: {e.why}")
+    }
+
+    print("-- counter nonces")
+    for c in [0, 1, 255, 256, 4294967296] {
+        print("  {"{c}".pad_start(12, " ")} -> {bytes_codec.encode_hex(chachapoly.nonce_of(c))}")
+    }
+
+    print("-- an empty message still authenticates")
+    let empty = chachapoly.seal(key, nonce, bytes_of([]), bytes_of([]))
+    print("  ciphertext {empty.ciphertext.len()} bytes, tag {empty.tag.len()} bytes")
+    match chachapoly.open(key, nonce, bytes_of([]), empty) {
+        Ok(b) -> print("  opens to {b.len()} bytes")
+        Err(e) -> print("  failed: {e.why}")
+    }
+}
+
+fn open_fails(key: bytes, nonce: bytes, aad: bytes, s: Sealed) -> bool {
+    match chachapoly.open(key, nonce, aad, s) {
+        Ok(b) -> false
+        Err(e) -> true
+    }
+}

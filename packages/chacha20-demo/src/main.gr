@@ -1,0 +1,75 @@
+// ChaCha20 against RFC 8439's own vectors.
+//
+// Every expected value below is printed in the RFC. That is the whole point:
+// a cipher checked against itself agrees with nothing, and the first sign
+// that an implementation is wrong is that it disagrees with the world.
+import bytes_codec
+import chacha20
+
+fn check(label: str, got: str, want: str) {
+    let mark = if got == want { "ok   " } else { "WRONG" }
+    print("  {mark} {label}")
+    if got != want {
+        print("        got  {got}")
+        print("        want {want}")
+    }
+}
+
+fn key_of(hex: str) -> bytes {
+    bytes_codec.decode_hex(hex) ?? bytes_of([])
+}
+
+fn main() {
+    print("-- the block function, RFC 8439 section 2.3.2")
+    let key = key_of("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+    let nonce = key_of("000000090000004a00000000")
+    check("counter 1",
+          bytes_codec.encode_hex(chacha20.block(key, 1, nonce)),
+          "10f1e7e4d13b5915500fdd1fa32071c4c7d1f4c733c068030422aa9ac3d46c4e" +
+          "d2826446079faa0914c2d705d98b02a2b5129cd1de164eb9cbd083e8a2503c4e")
+
+    print("-- encryption, RFC 8439 section 2.4.2")
+    let plain = "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it."
+    let nonce2 = key_of("000000000000004a00000000")
+    check("the sunscreen paragraph",
+          bytes_codec.encode_hex(chacha20.apply(key, 1, nonce2, plain.to_bytes())),
+          "6e2e359a2568f98041ba0728dd0d6981e97e7aec1d4360c20a27afccfd9fae0b" +
+          "f91b65c5524733ab8f593dabcd62b3571639d624e65152ab8f530c359f0861d8" +
+          "07ca0dbf500d6a6156a38e088a22b65e52bc514d16ccf806818ce91ab7793736" +
+          "5af90bbf74a35be6b40b8eedf2785e42874d")
+
+    print("-- a zero key and a zero nonce, RFC 8439 appendix A.1")
+    let zeros = key_of("0000000000000000000000000000000000000000000000000000000000000000")
+    let znonce = key_of("000000000000000000000000")
+    check("counter 0",
+          bytes_codec.encode_hex(chacha20.block(zeros, 0, znonce)),
+          "76b8e0ada0f13d90405d6ae55386bd28bdd219b8a08ded1aa836efcc8b770dc7" +
+          "da41597c5157488d7724e03fb8d84a376a43b8f41518a11cc387b669b2ee6586")
+    check("counter 1",
+          bytes_codec.encode_hex(chacha20.block(zeros, 1, znonce)),
+          "9f07e7be5551387a98ba977c732d080dcb0f29a048e3656912c6533e32ee7aed" +
+          "29b721769ce64e43d57133b074d839d531ed1f28510afb45ace10a1f4b794d6f")
+
+    print("-- decryption is encryption")
+    let secret = "the quick brown fox jumps over the lazy dog"
+    let sealed = chacha20.apply(key, 7, nonce2, secret.to_bytes())
+    let opened = chacha20.apply(key, 7, nonce2, sealed)
+    print("  round trip: {opened.to_str() == secret}")
+    print("  the ciphertext is not the plaintext: {sealed.to_str() != secret}")
+
+    print("-- a wrong counter gives a wrong answer")
+    let wrong = chacha20.apply(key, 8, nonce2, sealed)
+    print("  decrypting at the wrong counter: {wrong.to_str() == secret}")
+
+    print("-- lengths that are not a multiple of 64")
+    for n in [0, 1, 63, 64, 65, 127, 128, 129] {
+        var body: [i64] = []
+        for i in 0..n {
+            body.push(i % 256)
+        }
+        let b = bytes_of(body)
+        let back = chacha20.apply(key, 1, nonce2, chacha20.apply(key, 1, nonce2, b))
+        let ok = back.to_list() == b.to_list()
+        print("  {"{n}".pad_start(4, " ")} bytes: round trip {ok}")
+    }
+}

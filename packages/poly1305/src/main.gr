@@ -1,0 +1,231 @@
+// Poly1305, RFC 8439 section 2.5.
+//
+// A one-time authenticator: evaluate a polynomial over the field of integers
+// modulo 2^130 - 5, with the message as the coefficients and the key as the
+// point. Forging a tag without the key means solving for the point, and the
+// key is used once — which is where the "one-time" is load-bearing rather
+// than cautionary.
+//
+// **The arithmetic is why this file looks the way it does.** The field is 130
+// bits and Grasm's integer is 64. Products of two 26-bit limbs fit — 52 bits,
+// verified — so the number is carried as five limbs of 26 bits and every
+// product stays inside a machine word. The five-limb 51-bit form used by
+// 64-bit implementations does not work here: 51 x 51 is 102 bits and overflows
+// silently, which is the failure that produces a tag that is wrong for large
+// inputs only.
+//
+// Like ChaCha20, there are no tables and no secret-dependent branches. The
+// carry chain runs the same number of times whatever the data.
+//
+// Checked against RFC 8439's vectors — section 2.5.2, and appendix A.3's edge
+// cases, which exist because they are the ones implementations get wrong.
+
+let MASK26 = 0x3ffffff
+
+type Poly = {
+    r: [i64],
+    s: [i64],
+    h: [i64],
+    buffer: [i64],
+}
+
+fn le32(b: bytes, at: i64) -> i64 {
+    b.at(at).bit_or(b.at(at + 1).shl(8))
+        .bit_or(b.at(at + 2).shl(16)).bit_or(b.at(at + 3).shl(24))
+}
+
+/// The key, split and clamped.
+///
+/// Clamping clears 22 bits of `r`, and the specific bits are not arbitrary:
+/// they are what keeps every intermediate product inside the range the carry
+/// chain can handle. An implementation that skips it produces tags that are
+/// usually right.
+pub fn start(key: bytes) -> Poly {
+    let t0 = le32(key, 0)
+    let t1 = le32(key, 4)
+    let t2 = le32(key, 8)
+    let t3 = le32(key, 12)
+    var r: [i64] = []
+    r.push(t0.bit_and(0x3ffffff))
+    r.push(t0.ushr(26).bit_or(t1.shl(6)).bit_and(0x3ffff03))
+    r.push(t1.ushr(20).bit_or(t2.shl(12)).bit_and(0x3ffc0ff))
+    r.push(t2.ushr(14).bit_or(t3.shl(18)).bit_and(0x3f03fff))
+    r.push(t3.ushr(8).bit_and(0x00fffff))
+    var s: [i64] = []
+    for i in 0..4 {
+        s.push(le32(key, 16 + i * 4))
+    }
+    Poly{ r: r, s: s, h: [0, 0, 0, 0, 0], buffer: [] }
+}
+
+/// One 16-byte block folded into the accumulator.
+///
+/// `high` is the 2^128 bit the padding rule adds — 1 for a whole block, and
+/// for a final short block the bit sits just above the message instead, which
+/// is what stops two different messages hashing the same.
+fn absorb(inout p: Poly, m: [i64], high: i64) {
+    let t0 = m[0].bit_or(m[1].shl(8)).bit_or(m[2].shl(16)).bit_or(m[3].shl(24))
+    let t1 = m[4].bit_or(m[5].shl(8)).bit_or(m[6].shl(16)).bit_or(m[7].shl(24))
+    let t2 = m[8].bit_or(m[9].shl(8)).bit_or(m[10].shl(16)).bit_or(m[11].shl(24))
+    let t3 = m[12].bit_or(m[13].shl(8)).bit_or(m[14].shl(16)).bit_or(m[15].shl(24))
+
+    var h = p.h
+    h[0] = h[0] + t0.bit_and(MASK26)
+    h[1] = h[1] + (t0.ushr(26).bit_or(t1.shl(6))).bit_and(MASK26)
+    h[2] = h[2] + (t1.ushr(20).bit_or(t2.shl(12))).bit_and(MASK26)
+    h[3] = h[3] + (t2.ushr(14).bit_or(t3.shl(18))).bit_and(MASK26)
+    h[4] = h[4] + t3.ushr(8).bit_or(high.shl(24))
+
+    let r = p.r
+    // `5 * r[i]` for the wrap: 2^130 = 5 mod (2^130 - 5), so a limb that
+    // overflows the top comes back multiplied by five.
+    let s1 = r[1] * 5
+    let s2 = r[2] * 5
+    let s3 = r[3] * 5
+    let s4 = r[4] * 5
+
+    let d0 = h[0]*r[0] + h[1]*s4 + h[2]*s3 + h[3]*s2 + h[4]*s1
+    let d1 = h[0]*r[1] + h[1]*r[0] + h[2]*s4 + h[3]*s3 + h[4]*s2
+    let d2 = h[0]*r[2] + h[1]*r[1] + h[2]*r[0] + h[3]*s4 + h[4]*s3
+    let d3 = h[0]*r[3] + h[1]*r[2] + h[2]*r[1] + h[3]*r[0] + h[4]*s4
+    let d4 = h[0]*r[4] + h[1]*r[3] + h[2]*r[2] + h[3]*r[1] + h[4]*r[0]
+
+    var c = d0.ushr(26)
+    h[0] = d0.bit_and(MASK26)
+    let e1 = d1 + c
+    c = e1.ushr(26)
+    h[1] = e1.bit_and(MASK26)
+    let e2 = d2 + c
+    c = e2.ushr(26)
+    h[2] = e2.bit_and(MASK26)
+    let e3 = d3 + c
+    c = e3.ushr(26)
+    h[3] = e3.bit_and(MASK26)
+    let e4 = d4 + c
+    c = e4.ushr(26)
+    h[4] = e4.bit_and(MASK26)
+    h[0] = h[0] + c * 5
+    c = h[0].ushr(26)
+    h[0] = h[0].bit_and(MASK26)
+    h[1] = h[1] + c
+    p.h = h
+}
+
+pub fn update(inout p: Poly, message: bytes) {
+    var buf = p.buffer
+    for b in message.to_list() {
+        buf.push(b)
+    }
+    var at = 0
+    while at + 16 <= buf.len() {
+        var block: [i64] = []
+        for i in 0..16 {
+            block.push(buf[at + i])
+        }
+        absorb(p, block, 1)
+        at = at + 16
+    }
+    var rest: [i64] = []
+    for i in at..buf.len() {
+        rest.push(buf[i])
+    }
+    p.buffer = rest
+}
+
+/// The tag: finish the last block, reduce fully, add `s`.
+pub fn finish(inout p: Poly) -> bytes {
+    if not p.buffer.is_empty() {
+        var block = p.buffer
+        let used = block.len()
+        block.push(1)
+        while block.len() < 16 {
+            block.push(0)
+        }
+        // The high bit goes with the message here, not above the block.
+        absorb(p, block, 0)
+        let _ = used
+    }
+
+    var h = p.h
+    // A last carry, then a conditional subtraction of 2^130 - 5 — done by
+    // computing both answers and selecting with a mask, because a branch here
+    // would depend on the secret.
+    var c = h[1].ushr(26)
+    h[1] = h[1].bit_and(MASK26)
+    h[2] = h[2] + c
+    c = h[2].ushr(26)
+    h[2] = h[2].bit_and(MASK26)
+    h[3] = h[3] + c
+    c = h[3].ushr(26)
+    h[3] = h[3].bit_and(MASK26)
+    h[4] = h[4] + c
+    c = h[4].ushr(26)
+    h[4] = h[4].bit_and(MASK26)
+    h[0] = h[0] + c * 5
+    c = h[0].ushr(26)
+    h[0] = h[0].bit_and(MASK26)
+    h[1] = h[1] + c
+
+    var g: [i64] = [0, 0, 0, 0, 0]
+    var gc = 5
+    for i in 0..5 {
+        let v = h[i] + gc
+        gc = v.ushr(26)
+        g[i] = v.bit_and(MASK26)
+    }
+    g[4] = g[4] - 0x4000000 + gc.shl(26)
+
+    // `mask` is 0 when g overflowed (so h is already reduced) and -1 when it
+    // did not. No branch reads the accumulator.
+    var mask = 0 - (g[4].ushr(63).bit_xor(1))
+    for i in 0..5 {
+        g[i] = g[i].bit_and(mask)
+    }
+    mask = mask.bit_not()
+    for i in 0..5 {
+        h[i] = h[i].bit_and(mask).bit_or(g[i])
+    }
+
+    var f: [i64] = []
+    f.push(h[0].bit_or(h[1].shl(26)).bit_and(0xffffffff))
+    f.push(h[1].ushr(6).bit_or(h[2].shl(20)).bit_and(0xffffffff))
+    f.push(h[2].ushr(12).bit_or(h[3].shl(14)).bit_and(0xffffffff))
+    f.push(h[3].ushr(18).bit_or(h[4].shl(8)).bit_and(0xffffffff))
+
+    var out: [i64] = []
+    var carry = 0
+    for i in 0..4 {
+        let v = f[i] + p.s[i] + carry
+        carry = v.ushr(32)
+        let w = v.bit_and(0xffffffff)
+        out.push(w.bit_and(255))
+        out.push(w.ushr(8).bit_and(255))
+        out.push(w.ushr(16).bit_and(255))
+        out.push(w.ushr(24).bit_and(255))
+    }
+    bytes_of(out)
+}
+
+/// The tag for a whole message, which is what almost every caller wants.
+pub fn tag(key: bytes, message: bytes) -> bytes {
+    var p = start(key)
+    update(p, message)
+    finish(p)
+}
+
+/// Equal or not, in time that does not depend on where they differ.
+///
+/// Verifying a tag with `==` tells whoever is timing it how much of a forgery
+/// they have right, one byte at a time. This is the only comparison a caller
+/// should use on a tag.
+pub fn verify(key: bytes, message: bytes, expected: bytes) -> bool {
+    let got = tag(key, message)
+    if got.len() != expected.len() {
+        return false
+    }
+    var diff = 0
+    for i in 0..got.len() {
+        diff = diff.bit_or(got.at(i).bit_xor(expected.at(i)))
+    }
+    diff == 0
+}

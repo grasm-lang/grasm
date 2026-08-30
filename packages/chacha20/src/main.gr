@@ -1,0 +1,129 @@
+// ChaCha20, RFC 8439.
+//
+// A stream cipher built from three operations — add, rotate, xor — on 32-bit
+// words. There are no lookup tables and no secret-dependent branches, which is
+// why it is safe to write in a language that cannot promise constant time: the
+// property comes from the algorithm's shape rather than from the compiler's
+// care. That is the same reason `crypto_hash` has SHA-256 and does not have
+// AES, and it is worth stating where the difference is decided.
+//
+// Grasm has one integer width, 64 bits, and this is a 32-bit algorithm. Every
+// operation therefore ends in a mask: `m32` is not decoration, it is the
+// difference between ChaCha20 and something that agrees with it for the first
+// block and then does not.
+//
+// Checked against RFC 8439's own vectors — section 2.3.2 for the block
+// function and 2.4.2 for encryption. A cipher tested only against itself
+// agrees with nothing.
+
+let MASK32 = 0xFFFFFFFF
+
+fn m32(v: i64) -> i64 {
+    v.bit_and(MASK32)
+}
+
+fn add32(a: i64, b: i64) -> i64 {
+    m32(a + b)
+}
+
+/// Rotate left within 32 bits.
+///
+/// `ushr` and not `shr`: an arithmetic shift smears the sign bit across the
+/// top, and every word above 0x7fffffff would come back wrong.
+fn rotl32(v: i64, n: i64) -> i64 {
+    m32(m32(v).shl(n).bit_or(m32(v).ushr(32 - n)))
+}
+
+/// The quarter round, on four indices of the state.
+///
+/// Written against a `[i64]` rather than four values because the round
+/// function applies it to columns and then to diagonals, and naming the
+/// indices is what keeps those two readable.
+fn quarter(inout s: [i64], a: i64, b: i64, c: i64, d: i64) {
+    s[a] = add32(s[a], s[b])
+    s[d] = rotl32(s[d].bit_xor(s[a]), 16)
+    s[c] = add32(s[c], s[d])
+    s[b] = rotl32(s[b].bit_xor(s[c]), 12)
+    s[a] = add32(s[a], s[b])
+    s[d] = rotl32(s[d].bit_xor(s[a]), 8)
+    s[c] = add32(s[c], s[d])
+    s[b] = rotl32(s[b].bit_xor(s[c]), 7)
+}
+
+fn le32(b: bytes, at: i64) -> i64 {
+    b.at(at).bit_or(b.at(at + 1).shl(8))
+        .bit_or(b.at(at + 2).shl(16)).bit_or(b.at(at + 3).shl(24))
+}
+
+fn put_le32(inout out: [i64], v: i64) {
+    out.push(v.bit_and(255))
+    out.push(v.ushr(8).bit_and(255))
+    out.push(v.ushr(16).bit_and(255))
+    out.push(v.ushr(24).bit_and(255))
+}
+
+/// The initial state: four constants, eight key words, the counter, three
+/// nonce words.
+///
+/// The constants are "expand 32-byte k" read as little-endian words. They are
+/// written as numbers here because that is what they are on the wire, and the
+/// text is in this sentence so a reader can check them.
+fn initial(key: bytes, counter: i64, nonce: bytes) -> [i64] {
+    var s: [i64] = [0x61707865, 0x3320646e, 0x79622d32, 0x6b206574]
+    for i in 0..8 {
+        s.push(le32(key, i * 4))
+    }
+    s.push(m32(counter))
+    for i in 0..3 {
+        s.push(le32(nonce, i * 4))
+    }
+    s
+}
+
+/// One 64-byte block of key stream.
+///
+/// Twenty rounds, which is ten iterations of a column round followed by a
+/// diagonal round — the "double round" the name counts in twos.
+pub fn block(key: bytes, counter: i64, nonce: bytes) -> bytes {
+    let start = initial(key, counter, nonce)
+    var s = start
+    for _i in 0..10 {
+        quarter(s, 0, 4, 8, 12)
+        quarter(s, 1, 5, 9, 13)
+        quarter(s, 2, 6, 10, 14)
+        quarter(s, 3, 7, 11, 15)
+        quarter(s, 0, 5, 10, 15)
+        quarter(s, 1, 6, 11, 12)
+        quarter(s, 2, 7, 8, 13)
+        quarter(s, 3, 4, 9, 14)
+    }
+    var out: [i64] = []
+    for i in 0..16 {
+        put_le32(out, add32(s[i], start[i]))
+    }
+    bytes_of(out)
+}
+
+/// Encrypt, which is also decrypt: the key stream is xored either way.
+///
+/// The counter starts where the caller says. RFC 8439 starts it at 1 for
+/// encryption and reserves 0 for the Poly1305 key, and the AEAD does exactly
+/// that — so the number is a parameter rather than a constant, and the
+/// convention lives where the convention is.
+pub fn apply(key: bytes, counter: i64, nonce: bytes, text: bytes) -> bytes {
+    var out: [i64] = []
+    let n = text.len()
+    var at = 0
+    var block_index = counter
+    while at < n {
+        let stream = block(key, block_index, nonce)
+        var i = 0
+        while i < 64 and at + i < n {
+            out.push(text.at(at + i).bit_xor(stream.at(i)))
+            i = i + 1
+        }
+        at = at + 64
+        block_index = block_index + 1
+    }
+    bytes_of(out)
+}

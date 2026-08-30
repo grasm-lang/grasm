@@ -1,0 +1,6 @@
+[package]
+name = "blake2s"
+version = "1.0.0"
+entry = "src/main.gr"
+
+capabilities = []

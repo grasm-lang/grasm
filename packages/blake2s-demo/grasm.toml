@@ -1,0 +1,12 @@
+[package]
+name = "blake2s_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.blake2s]
+path = "../blake2s"
+version = "^1.0.0"
+
+[dependencies.bytes_codec]
+path = "../bytes"
+version = "^1.0.0"

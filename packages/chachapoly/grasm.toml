@@ -1,0 +1,14 @@
+[package]
+name = "chachapoly"
+version = "1.0.0"
+entry = "src/main.gr"
+
+capabilities = []
+
+[dependencies.chacha20]
+path = "../chacha20"
+version = "^1.0.0"
+
+[dependencies.poly1305]
+path = "../poly1305"
+version = "^1.0.0"

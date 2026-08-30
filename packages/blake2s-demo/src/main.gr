@@ -1,0 +1,69 @@
+// BLAKE2s against RFC 7693 and the reference test suite.
+import blake2s
+import bytes_codec
+
+fn check(label: str, got: str, want: str) {
+    let mark = if got == want { "ok   " } else { "WRONG" }
+    print("  {mark} {label}")
+    if got != want {
+        print("        got  {got}")
+        print("        want {want}")
+    }
+}
+
+fn main() {
+    print("-- RFC 7693 appendix B")
+    check("\"abc\"",
+          bytes_codec.encode_hex(blake2s.hash("abc".to_bytes())),
+          "508c5e8c327c14e2e1a72ba34eeb452f37458b209ed63a294d999b4c86675982")
+
+    print("-- the empty message")
+    check("\"\"",
+          bytes_codec.encode_hex(blake2s.hash(bytes_of([]))),
+          "69217a3079908094e11121d042354a7c1f55b6482ca1a51e1b250dfd1ed0eef9")
+
+    print("-- other lengths, which are a different hash and not a prefix")
+    let abc = bytes_codec.encode_hex(blake2s.hash("abc".to_bytes()))
+    let short = bytes_codec.encode_hex(blake2s.hash_of_length("abc".to_bytes(), 16))
+    print("  32 bytes: {abc}")
+    print("  16 bytes: {short}")
+    print("  the shorter is not a prefix of the longer: {not abc.starts_with(short)}")
+
+    print("-- keyed, from the reference suite")
+    var key: [i64] = []
+    for i in 0..32 {
+        key.push(i)
+    }
+    check("keyed, empty message",
+          bytes_codec.encode_hex(blake2s.keyed(bytes_of(key), bytes_of([]), 32)),
+          "48a8997da407876b3d79c0d92325ad3b89cbb754d86ab71aee047ad345fd2c49")
+    check("keyed, one byte",
+          bytes_codec.encode_hex(blake2s.keyed(bytes_of(key), bytes_of([0]), 32)),
+          "40d15fee7c328830166ac3f918650f807e7e01e177258cdc0a39b11f598066f1")
+
+    print("-- block boundaries, where the finalisation flag decides")
+    for n in [0, 1, 63, 64, 65, 127, 128, 129] {
+        var body: [i64] = []
+        for i in 0..n {
+            body.push(i % 256)
+        }
+        print("  {"{n}".pad_start(4, " ")} bytes -> {bytes_codec.encode_hex(blake2s.hash(bytes_of(body))).substr(0, 32)}")
+    }
+
+    print("-- streaming in pieces gives the same answer as one call")
+    let whole = "the quick brown fox jumps over the lazy dog"
+    let once = bytes_codec.encode_hex(blake2s.hash(whole.to_bytes()))
+    var st = blake2s.start(32, bytes_of([]))
+    for c in whole.chars() {
+        blake2s.update(st, c.to_bytes())
+    }
+    let piecewise = bytes_codec.encode_hex(blake2s.finish(st))
+    print("  one call:   {once}")
+    print("  one char at a time: {if once == piecewise { "the same" } else { "DIFFERENT" }}")
+
+    print("-- HMAC, which is what Noise calls even though BLAKE2s is keyed")
+    let h = blake2s.hmac(bytes_of(key), "message".to_bytes())
+    print("  {bytes_codec.encode_hex(h)}")
+    print("  a different key gives a different tag: {bytes_codec.encode_hex(blake2s.hmac(bytes_of([1]), "message".to_bytes())) != bytes_codec.encode_hex(h)}")
+    print("  HMAC is not the keyed mode: {bytes_codec.encode_hex(blake2s.keyed(bytes_of(key), "message".to_bytes(), 32)) != bytes_codec.encode_hex(h)}")
+}

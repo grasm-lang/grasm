@@ -1,0 +1,6 @@
+[package]
+name = "poly1305"
+version = "1.0.0"
+entry = "src/main.gr"
+
+capabilities = []
