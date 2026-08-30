@@ -55,7 +55,20 @@ in wasm.
 
   // The clock is imported because `std::time` panics on this target and a
   // panic with no unwinding is an abort. `dlsym` is reached through Rust's std.
-  const imports = { env: { grasm_now_millis: () => Date.now(), dlsym: () => 0 } };
+  const imports = {
+    env: {
+      grasm_now_millis: () => Date.now(),
+      // Monotonic, so a duration measured with it cannot go backwards.
+      grasm_monotonic_millis: () => performance.now(),
+      // A call from wasm into the host is synchronous and the host cannot
+      // yield inside one, so the wait is a spin.
+      grasm_sleep_millis: (ms) => {
+        const until = performance.now() + ms;
+        while (performance.now() < until) {}
+      },
+      dlsym: () => 0,
+    },
+  };
 
   // A document travels as one line, because `input()` reads one line. This is
   // the encoding `decode_line` in main.gr undoes.

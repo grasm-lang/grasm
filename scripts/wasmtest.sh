@@ -51,6 +51,32 @@ if ! command -v node >/dev/null 2>&1; then
     exit 1
 fi
 
+# Every symbol the module imports must be supplied by every embedder in this
+# tree, checked against the module rather than against a list someone keeps.
+#
+# Adding `monotonic_millis` to the interpreter added `env.grasm_monotonic_millis`
+# to the module's import section. No embedder knew, so instantiation failed —
+# and a failed instantiation is not one program going wrong, it is all 256 at
+# once, with nothing in the output pointing at the cause. The gate said
+# "mismatched: 256" and the reason was one missing line of JavaScript.
+EMBEDDERS="scripts/wasm/run.mjs docs/wasm.md $(ls ProjectGold/*/index.html 2>/dev/null | tr '\n' ' ')"
+missing=0
+for sym in $(node scripts/wasm/imports.mjs "$WASM"); do
+    name=${sym#*.}
+    for e in $EMBEDDERS; do
+        # Only the pages that actually instantiate the module.
+        grep -q "WebAssembly\|grasm_now_millis" "$e" 2>/dev/null || continue
+        if ! grep -q "$name" "$e"; then
+            echo "  $e does not supply $sym"
+            missing=$((missing + 1))
+        fi
+    done
+done
+if [ "$missing" -gt 0 ]; then
+    echo "$missing embedder/import pair(s) missing — every program would fail to instantiate"
+    exit 1
+fi
+
 pass=0
 fail=0
 skip=0

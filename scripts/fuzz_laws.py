@@ -299,9 +299,30 @@ CLAUSES = {
     "L-LIB-TUPLE": "enumerate pairs positions",
     "L-LIB-STR": "replace replaces all",
     "L-LIB-NUM": "abs is non-negative",
+    "L-LIB-CLOCK": "sleeping advances the monotonic clock",
 }
 
 LAWS = {
+ # A clock has no second answer to relate a first one to -- except the one
+ # `sleep` gives it. Waiting n milliseconds must move the monotonic clock by at
+ # least n, and that is a relation between two readings rather than a recorded
+ # number, so a clause and an implementation written together cannot both be
+ # wrong in the same direction and still pass.
+ #
+ # It rules out the three degenerate clocks: one that always answers the same
+ # (0 >= 20 is false), one that increases but ignores `sleep` (the difference
+ # stays near zero), and one that runs backwards (the second half catches it).
+ "sleeping advances the monotonic clock":
+                              'let a = monotonic_millis()\n    sleep_millis(20)\n    let b = monotonic_millis()\n    var back = false\n    var prev = b\n    for _i in 0..200 {\n        let t = monotonic_millis()\n        if t < prev { back = true }\n        prev = t\n    }\n    say(b - a >= 20 and not back)',
+ # `to_bits` has no second answer to relate to either, until `from_bits` is
+ # put beside it: the round trip must return the same float, which no lossy
+ # reinterpretation survives. The two clauses after it rule out the obvious
+ # degenerate pair -- a `to_bits` that is really a *cast* passes the round trip
+ # (1.0 -> 1 -> 1.0) but puts 1 where IEEE-754 puts 4607182418800017408, and
+ # gets the sign bit wrong, since a negated float sets the top bit and a
+ # truncated one does not.
+ "float bits round trip and carry the sign":
+                              'let xs = [0.5, 1.0, 2.0, 1024.0]\n    var ok = true\n    for x in xs {\n        if x.to_bits().from_bits() != x { ok = false }\n        if x.to_bits() <= 0 { ok = false }\n        if (0.0 - x).to_bits() >= 0 { ok = false }\n    }\n    let one = 1.0\n    say(ok and one.to_bits() > 1000)',
  "rev twice is identity":      'let xs = [3, 1, 2]\n    say(xs.rev().rev() == xs)',
  # A law a degenerate implementation satisfies is not a law: `rev` as the
  # identity passes "rev twice is identity", and did.

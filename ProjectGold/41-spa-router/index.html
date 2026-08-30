@@ -45,7 +45,20 @@
 
   let compiled = null, source = null;
 
-  const imports = { env: { grasm_now_millis: () => Date.now(), dlsym: () => 0 } };
+  const imports = {
+    env: {
+      grasm_now_millis: () => Date.now(),
+      // Monotonic, so a duration measured with it cannot go backwards.
+      grasm_monotonic_millis: () => performance.now(),
+      // A call from wasm into the host is synchronous and the host cannot
+      // yield inside one, so the wait is a spin.
+      grasm_sleep_millis: (ms) => {
+        const until = performance.now() + ms;
+        while (performance.now() < until) {}
+      },
+      dlsym: () => 0,
+    },
+  };
 
   // `bundle.gr` is this whole program as one file, written by
   // `grasm build --source`. Before that existed the wasm engine could not be

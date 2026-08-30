@@ -62,6 +62,17 @@
   const imports = {
     env: {
       grasm_now_millis: () => Date.now(),
+      // Monotonic, so a duration measured with it cannot go backwards.
+      // `performance.now()` is exactly that on both a browser and Node.
+      grasm_monotonic_millis: () => performance.now(),
+      // A call from wasm into the host is synchronous and neither a browser
+      // nor Node can yield inside one, so the wait is a spin. That is the
+      // honest shape of `sleep` here: the thread really is unavailable for
+      // that long, which is what the caller asked for.
+      grasm_sleep_millis: (ms) => {
+        const until = performance.now() + ms;
+        while (performance.now() < until) {}
+      },
       dlsym: () => 0,
     },
   };

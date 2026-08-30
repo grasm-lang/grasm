@@ -74,9 +74,19 @@ The frame, little-endian `u32`s:
 then     length of the diagnostic text, then the text, UTF-8
 ```
 
-Two imports are required: `env.grasm_now_millis` (answer with `Date.now()`) and
-`env.dlsym` (answer with 0 — it is reached through Rust's `std` and can never be
-called, since a Grasm program cannot reach a C symbol without a linker).
+Four imports are required. `env.grasm_now_millis` (answer with `Date.now()`),
+`env.grasm_monotonic_millis` (answer with `performance.now()` — it must only
+increase), `env.grasm_sleep_millis` (spin until the deadline; a call from wasm
+is synchronous and the host cannot yield inside one), and `env.dlsym` (answer
+with 0 — it is reached through Rust's `std` and can never be called, since a
+Grasm program cannot reach a C symbol without a linker).
+
+The list above is checked against the module rather than trusted:
+`scripts/wasmtest.sh` reads the import section and fails if an embedder in this
+tree does not name every entry. Adding a host function without teaching the
+embedders about it broke every one of the 256 programs at once, because a
+missing import is an *instantiation* failure — nothing runs, so nothing points
+at the cause.
 
 `scripts/wasm/run.mjs` is the reference embedding, in about twenty lines. It is
 the same twenty lines a web page needs, and the gate runs *it* rather than a

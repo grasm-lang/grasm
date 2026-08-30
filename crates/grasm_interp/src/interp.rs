@@ -628,6 +628,28 @@ fn host_monotonic_millis() -> i64 {
     unsafe { grasm_monotonic_millis() as i64 }
 }
 
+/// Waits, where the host has a way to wait.
+#[cfg(not(target_arch = "wasm32"))]
+fn host_sleep_millis(ms: i64) {
+    if ms > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+    }
+}
+
+/// wasm32 cannot sleep on its own: `std::thread::sleep` panics there, and a
+/// panic on this target is an abort rather than an error anyone can report. So
+/// the wait is the embedder's, like the clock beside it.
+#[cfg(target_arch = "wasm32")]
+fn host_sleep_millis(ms: i64) {
+    extern "C" {
+        /// Supplied by the embedder as `env.grasm_sleep_millis`.
+        fn grasm_sleep_millis(ms: f64);
+    }
+    if ms > 0 {
+        unsafe { grasm_sleep_millis(ms as f64) }
+    }
+}
+
 /// The largest string this implementation will build.
 ///
 /// A `repeat` past it is a panic with a sentence, not a Rust allocator
@@ -3256,9 +3278,7 @@ uses to mark the end of a string"
                         if let Some(v) = journal::gated("sleep_millis") {
                             return Ok(v);
                         }
-                        if ms > 0 {
-                            std::thread::sleep(std::time::Duration::from_millis(ms as u64));
-                        }
+                        host_sleep_millis(ms);
                         return Ok(journal::recorded("sleep_millis", Value::Unit));
                     }
                     "now_millis" => {
