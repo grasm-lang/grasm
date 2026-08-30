@@ -1,0 +1,8 @@
+[package]
+name = "tsdb_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.tsdb]
+path = "../tsdb"
+version = "^1.0.0"

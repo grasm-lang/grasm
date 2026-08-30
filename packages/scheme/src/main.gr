@@ -1,0 +1,758 @@
+// A Scheme, evaluated on a heap that is not Grasm's.
+//
+// Every value lives in a flat list and refers to others by index, so a closure
+// that captures an environment holding the closure — which is what *any*
+// recursive definition builds — is a cycle that reference counting could never
+// free and a walk from the roots collects without noticing anything special.
+//
+// The evaluator is deliberately small. What is being tested is the heap and
+// the language hosting it, not how many special forms exist, so this has the
+// ones a program needs to be recursive and higher-order and stops:
+//
+//     quote  if  define  lambda  let  set!  begin
+//
+// **Tail calls do not grow the stack**, which is not an optimisation in a
+// Scheme but a promise: a loop is written as a recursive call, and a language
+// that consumed a frame for each one could not express iteration at all.
+
+import sexpr
+
+type SchemeValue =
+    | Undefined
+    | Empty
+    | Boolean(b: bool)
+    | Integer(n: i64)
+    | Chars(s: str)
+    | Name(s: str)
+    | Cell(head: i64, tail: i64)
+    | Lambda(params: [str], rest: Option[str], body: [Datum], env: i64)
+    | Builtin(name: str)
+
+type Slot =
+    | Vacant
+    | Held(v: SchemeValue)
+    | Scope(names: [str], values: [i64], parent: i64)
+
+type Machine = {
+    slots: [Slot],
+    free: [i64],
+    global: i64,
+    steps: i64,
+    collections: i64,
+    limit: i64,
+}
+
+type EvalError =
+    | Unbound(name: str)
+    | NotCallable(what: str)
+    | WrongArity(name: str, want: i64, got: i64)
+    | BadSyntax(form: str)
+    | TypeError(why: str)
+    | OutOfSteps(limit: i64)
+
+pub fn none() -> i64 { 0 - 1 }
+
+/// A machine with the builtins bound and a global scope.
+pub fn new_machine(step_limit: i64) -> Machine {
+    var s: [Slot] = []
+    var fr: [i64] = []
+    var m = Machine{ slots: s, free: fr, global: none(), steps: 0,
+                     collections: 0, limit: step_limit }
+    var names: [str] = []
+    var values: [i64] = []
+    for b in ["+", "-", "*", "/", "=", "<", ">", "cons", "car", "cdr",
+              "null?", "pair?", "not", "list", "length", "append", "modulo"] {
+        names.push(b)
+        values.push(put(m, Builtin(b)))
+    }
+    m.global = put_scope(m, names, values, none())
+    m
+}
+
+fn put(inout m: Machine, v: SchemeValue) -> i64 {
+    if m.free.len() > 0 {
+        let at = m.free[m.free.len() - 1]
+        m.free.pop()
+        m.slots[at] = Held(v)
+        return at
+    }
+    m.slots.push(Held(v))
+    m.slots.len() - 1
+}
+
+fn put_scope(inout m: Machine, names: [str], values: [i64], parent: i64) -> i64 {
+    if m.free.len() > 0 {
+        let at = m.free[m.free.len() - 1]
+        m.free.pop()
+        m.slots[at] = Scope(names, values, parent)
+        return at
+    }
+    m.slots.push(Scope(names, values, parent))
+    m.slots.len() - 1
+}
+
+pub fn value_at(m: Machine, at: i64) -> SchemeValue {
+    if at < 0 or at >= m.slots.len() {
+        return Undefined
+    }
+    match m.slots[at] {
+        Held(v) -> v
+        _other -> Undefined
+    }
+}
+
+/// Collect everything not reachable from the roots.
+///
+/// The global scope is always a root. So is whatever the caller is holding —
+/// which is why this is public rather than automatic: only the caller knows
+/// what it still has a hand on, and a collector that guessed would free the
+/// answer it was about to return.
+pub fn collect(inout m: Machine, extra_roots: [i64]) -> i64 {
+    m.collections = m.collections + 1
+    var marked: [bool] = []
+    for _i in 0..m.slots.len() {
+        marked.push(false)
+    }
+    var stack: [i64] = [m.global]
+    for r in extra_roots {
+        stack.push(r)
+    }
+    while stack.len() > 0 {
+        let at = stack[stack.len() - 1]
+        stack.pop()
+        if at < 0 or at >= m.slots.len() or marked[at] {
+            continue
+        }
+        marked[at] = true
+        match m.slots[at] {
+            Scope(_n, values, parent) -> {
+                for v in values {
+                    stack.push(v)
+                }
+                stack.push(parent)
+            }
+            Held(v) -> {
+                match v {
+                    Cell(h, t) -> {
+                        stack.push(h)
+                        stack.push(t)
+                    }
+                    Lambda(_p, _r, _b, env) -> stack.push(env)
+                    _other -> {}
+                }
+            }
+            Vacant -> {}
+        }
+    }
+    var freed = 0
+    for i in 0..m.slots.len() {
+        if not marked[i] {
+            match m.slots[i] {
+                Vacant -> {}
+                _other -> {
+                    m.slots[i] = Vacant
+                    m.free.push(i)
+                    freed = freed + 1
+                }
+            }
+        }
+    }
+    freed
+}
+
+pub fn live(m: Machine) -> i64 {
+    var n = 0
+    for s in m.slots {
+        match s {
+            Vacant -> {}
+            _other -> n = n + 1
+        }
+    }
+    n
+}
+
+pub fn collections(m: Machine) -> i64 {
+    m.collections
+}
+
+fn lookup(m: Machine, env: i64, name: str) -> i64 {
+    var at = env
+    while at >= 0 and at < m.slots.len() {
+        match m.slots[at] {
+            Scope(names, values, parent) -> {
+                var i = names.len() - 1
+                while i >= 0 {
+                    if names[i] == name {
+                        return values[i]
+                    }
+                    i = i - 1
+                }
+                at = parent
+            }
+            _other -> return none()
+        }
+    }
+    none()
+}
+
+fn assign(inout m: Machine, env: i64, name: str, v: i64) -> bool {
+    var at = env
+    while at >= 0 and at < m.slots.len() {
+        match m.slots[at] {
+            Scope(names, values, parent) -> {
+                var i = names.len() - 1
+                var found = 0 - 1
+                while i >= 0 {
+                    if names[i] == name {
+                        found = i
+                        i = 0 - 1
+                    } else {
+                        i = i - 1
+                    }
+                }
+                if found >= 0 {
+                    var vs = values
+                    vs[found] = v
+                    m.slots[at] = Scope(names, vs, parent)
+                    return true
+                }
+                at = parent
+            }
+            _other -> return false
+        }
+    }
+    false
+}
+
+fn define(inout m: Machine, env: i64, name: str, v: i64) {
+    match m.slots[env] {
+        Scope(names, values, parent) -> {
+            var ns = names
+            var vs = values
+            ns.push(name)
+            vs.push(v)
+            m.slots[env] = Scope(ns, vs, parent)
+        }
+        _other -> {}
+    }
+}
+
+/// Evaluate one datum.
+///
+/// The loop is what makes a tail call free: rather than calling itself for the
+/// last expression of a body or the branch of an `if`, it replaces what it is
+/// evaluating and goes round again. A Scheme without this cannot express a
+/// loop, because a loop *is* a tail call.
+pub fn eval(inout m: Machine, form: Datum, environment: i64) -> i64 ! EvalError {
+    var current = form
+    var env = environment
+    var going = true
+    var result = none()
+    while going {
+        going = false
+        m.steps = m.steps + 1
+        if m.steps > m.limit {
+            fail(OutOfSteps(m.limit))
+        }
+        match current {
+            Number(n) -> result = put(m, Integer(n))
+            Bool(b) -> result = put(m, Boolean(b))
+            Text(s) -> result = put(m, Chars(s))
+            Nil -> result = put(m, Empty)
+            Symbol(s) -> {
+                let at = lookup(m, env, s)
+                if at < 0 {
+                    fail(Unbound(s))
+                }
+                result = at
+            }
+            Pair(items, _tail) -> {
+                if items.len() == 0 {
+                    result = put(m, Empty)
+                } else {
+                    let head = items[0]
+                    var handled = false
+                    match head {
+                        Symbol(op) -> {
+                            if op == "quote" {
+                                if items.len() != 2 {
+                                    fail(BadSyntax("quote"))
+                                }
+                                result = try quoted(m, items[1])
+                                handled = true
+                            } else if op == "if" {
+                                if items.len() < 3 or items.len() > 4 {
+                                    fail(BadSyntax("if"))
+                                }
+                                let condition = try eval(m, items[1], env)
+                                if truthy(m, condition) {
+                                    current = items[2]
+                                    going = true
+                                } else if items.len() == 4 {
+                                    current = items[3]
+                                    going = true
+                                } else {
+                                    result = put(m, Undefined)
+                                }
+                                handled = true
+                            } else if op == "define" {
+                                result = try do_define(m, items, env)
+                                handled = true
+                            } else if op == "set!" {
+                                if items.len() != 3 {
+                                    fail(BadSyntax("set!"))
+                                }
+                                match items[1] {
+                                    Symbol(n) -> {
+                                        let v = try eval(m, items[2], env)
+                                        if not assign(m, env, n, v) {
+                                            fail(Unbound(n))
+                                        }
+                                        result = v
+                                    }
+                                    _other -> fail(BadSyntax("set!"))
+                                }
+                                handled = true
+                            } else if op == "lambda" {
+                                result = try make_lambda(m, items, env)
+                                handled = true
+                            } else if op == "let" {
+                                let expanded = try expand_let(items)
+                                current = expanded
+                                going = true
+                                handled = true
+                            } else if op == "begin" {
+                                if items.len() == 1 {
+                                    result = put(m, Undefined)
+                                } else {
+                                    for i in 1..(items.len() - 1) {
+                                        let _v = try eval(m, items[i], env)
+                                    }
+                                    current = items[items.len() - 1]
+                                    going = true
+                                }
+                                handled = true
+                            }
+                        }
+                        _other -> {}
+                    }
+                    if not handled {
+                        // An ordinary call. The callee and every argument are
+                        // evaluated, then the body is entered *in this loop*
+                        // rather than by recursing, so the last call of a
+                        // function costs no stack.
+                        let callee = try eval(m, items[0], env)
+                        var argv: [i64] = []
+                        for i in 1..items.len() {
+                            argv.push(try eval(m, items[i], env))
+                        }
+                        match value_at(m, callee) {
+                            Builtin(name) -> result = try call_builtin(m, name, argv)
+                            Lambda(params, rest, body, closure_env) -> {
+                                let bound = try bind(m, params, rest, argv, closure_env)
+                                if body.len() == 0 {
+                                    result = put(m, Undefined)
+                                } else {
+                                    for i in 0..(body.len() - 1) {
+                                        let _v = try eval(m, body[i], bound)
+                                    }
+                                    current = body[body.len() - 1]
+                                    env = bound
+                                    going = true
+                                }
+                            }
+                            _other -> fail(NotCallable(show(m, callee)))
+                        }
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
+fn bind(inout m: Machine, params: [str], rest: Option[str], argv: [i64],
+        closure_env: i64) -> i64 ! EvalError {
+    match rest {
+        None -> {
+            if argv.len() != params.len() {
+                fail(WrongArity("lambda", params.len(), argv.len()))
+            }
+        }
+        Some(_r) -> {
+            if argv.len() < params.len() {
+                fail(WrongArity("lambda", params.len(), argv.len()))
+            }
+        }
+    }
+    var names: [str] = []
+    var values: [i64] = []
+    for i in 0..params.len() {
+        names.push(params[i])
+        values.push(argv[i])
+    }
+    match rest {
+        Some(r) -> {
+            var tail = put(m, Empty)
+            var i = argv.len() - 1
+            while i >= params.len() {
+                tail = put(m, Cell(argv[i], tail))
+                i = i - 1
+            }
+            names.push(r)
+            values.push(tail)
+        }
+        None -> {}
+    }
+    put_scope(m, names, values, closure_env)
+}
+
+fn do_define(inout m: Machine, items: [Datum], env: i64) -> i64 ! EvalError {
+    if items.len() < 3 {
+        fail(BadSyntax("define"))
+    }
+    match items[1] {
+        Symbol(n) -> {
+            let v = try eval(m, items[2], env)
+            define(m, env, n, v)
+            put(m, Name(n))
+        }
+        Pair(head, _t) -> {
+            // `(define (f a b) body)` is `(define f (lambda (a b) body))`.
+            if head.len() == 0 {
+                fail(BadSyntax("define"))
+            }
+            match head[0] {
+                Symbol(n) -> {
+                    var params: [str] = []
+                    for i in 1..head.len() {
+                        match head[i] {
+                            Symbol(p) -> params.push(p)
+                            _other -> fail(BadSyntax("define"))
+                        }
+                    }
+                    var body: [Datum] = []
+                    for i in 2..items.len() {
+                        body.push(items[i])
+                    }
+                    // Defined *before* the lambda is stored, so the body can
+                    // refer to the name — which is the cycle: the scope holds
+                    // the closure and the closure holds the scope.
+                    let at = put(m, Lambda(params, None, body, env))
+                    define(m, env, n, at)
+                    put(m, Name(n))
+                }
+                _other -> fail(BadSyntax("define"))
+            }
+        }
+        _other -> fail(BadSyntax("define"))
+    }
+}
+
+fn make_lambda(inout m: Machine, items: [Datum], env: i64) -> i64 ! EvalError {
+    if items.len() < 3 {
+        fail(BadSyntax("lambda"))
+    }
+    var params: [str] = []
+    var rest: Option[str] = None
+    match items[1] {
+        Pair(ps, tail) -> {
+            for p in ps {
+                match p {
+                    Symbol(n) -> params.push(n)
+                    _other -> fail(BadSyntax("lambda"))
+                }
+            }
+            match tail {
+                Some(t) -> {
+                    match t {
+                        Symbol(n) -> rest = Some(n)
+                        _other -> fail(BadSyntax("lambda"))
+                    }
+                }
+                None -> {}
+            }
+        }
+        Symbol(n) -> rest = Some(n)
+        _other -> fail(BadSyntax("lambda"))
+    }
+    var body: [Datum] = []
+    for i in 2..items.len() {
+        body.push(items[i])
+    }
+    put(m, Lambda(params, rest, body, env))
+}
+
+fn expand_let(items: [Datum]) -> Datum ! EvalError {
+    if items.len() < 3 {
+        fail(BadSyntax("let"))
+    }
+    var names: [Datum] = []
+    var values: [Datum] = []
+    match items[1] {
+        Pair(bindings, _t) -> {
+            for b in bindings {
+                match b {
+                    Pair(pair, _t2) -> {
+                        if pair.len() != 2 {
+                            fail(BadSyntax("let"))
+                        }
+                        names.push(pair[0])
+                        values.push(pair[1])
+                    }
+                    _other -> fail(BadSyntax("let"))
+                }
+            }
+        }
+        _other -> fail(BadSyntax("let"))
+    }
+    var lam: [Datum] = [Symbol("lambda"), Pair(names, None)]
+    for i in 2..items.len() {
+        lam.push(items[i])
+    }
+    var call: [Datum] = [Pair(lam, None)]
+    for v in values {
+        call.push(v)
+    }
+    Pair(call, None)
+}
+
+fn quoted(inout m: Machine, d: Datum) -> i64 ! EvalError {
+    match d {
+        Number(n) -> put(m, Integer(n))
+        Bool(b) -> put(m, Boolean(b))
+        Text(s) -> put(m, Chars(s))
+        Symbol(s) -> put(m, Name(s))
+        Nil -> put(m, Empty)
+        Pair(items, tail) -> {
+            var at = match tail {
+                Some(t) -> try quoted(m, t)
+                None -> put(m, Empty)
+            }
+            var i = items.len() - 1
+            while i >= 0 {
+                let h = try quoted(m, items[i])
+                at = put(m, Cell(h, at))
+                i = i - 1
+            }
+            at
+        }
+    }
+}
+
+/// Everything is true except `#f`, which is Scheme's rule and not a detail:
+/// zero and the empty list are both true.
+fn truthy(m: Machine, at: i64) -> bool {
+    match value_at(m, at) {
+        Boolean(b) -> b
+        _other -> true
+    }
+}
+
+fn integer_of(m: Machine, at: i64) -> i64 ! EvalError {
+    match value_at(m, at) {
+        Integer(n) -> n
+        _other -> fail(TypeError("expected a number, got {show(m, at)}"))
+    }
+}
+
+fn call_builtin(inout m: Machine, name: str, argv: [i64]) -> i64 ! EvalError {
+    if name == "+" or name == "*" {
+        var acc = if name == "+" { 0 } else { 1 }
+        for a in argv {
+            let n = try integer_of(m, a)
+            acc = if name == "+" { acc + n } else { acc * n }
+        }
+        return put(m, Integer(acc))
+    }
+    if name == "-" or name == "/" or name == "modulo" {
+        if argv.len() == 0 {
+            fail(WrongArity(name, 1, 0))
+        }
+        var acc = try integer_of(m, argv[0])
+        if argv.len() == 1 and name == "-" {
+            return put(m, Integer(0 - acc))
+        }
+        for i in 1..argv.len() {
+            let n = try integer_of(m, argv[i])
+            if (name == "/" or name == "modulo") and n == 0 {
+                fail(TypeError("division by zero"))
+            }
+            acc = if name == "-" {
+                acc - n
+            } else if name == "/" {
+                acc / n
+            } else {
+                acc % n
+            }
+        }
+        return put(m, Integer(acc))
+    }
+    if name == "=" or name == "<" or name == ">" {
+        if argv.len() != 2 {
+            fail(WrongArity(name, 2, argv.len()))
+        }
+        let a = try integer_of(m, argv[0])
+        let b = try integer_of(m, argv[1])
+        let r = if name == "=" {
+            a == b
+        } else if name == "<" {
+            a < b
+        } else {
+            a > b
+        }
+        return put(m, Boolean(r))
+    }
+    if name == "cons" {
+        if argv.len() != 2 {
+            fail(WrongArity("cons", 2, argv.len()))
+        }
+        return put(m, Cell(argv[0], argv[1]))
+    }
+    if name == "car" or name == "cdr" {
+        if argv.len() != 1 {
+            fail(WrongArity(name, 1, argv.len()))
+        }
+        match value_at(m, argv[0]) {
+            Cell(h, t) -> return if name == "car" { h } else { t }
+            _other -> fail(TypeError("{name} of something that is not a pair"))
+        }
+    }
+    if name == "null?" {
+        if argv.len() != 1 {
+            fail(WrongArity("null?", 1, argv.len()))
+        }
+        match value_at(m, argv[0]) {
+            Empty -> return put(m, Boolean(true))
+            _other -> return put(m, Boolean(false))
+        }
+    }
+    if name == "pair?" {
+        if argv.len() != 1 {
+            fail(WrongArity("pair?", 1, argv.len()))
+        }
+        match value_at(m, argv[0]) {
+            Cell(_h, _t) -> return put(m, Boolean(true))
+            _other -> return put(m, Boolean(false))
+        }
+    }
+    if name == "not" {
+        if argv.len() != 1 {
+            fail(WrongArity("not", 1, argv.len()))
+        }
+        return put(m, Boolean(not truthy(m, argv[0])))
+    }
+    if name == "list" {
+        var at = put(m, Empty)
+        var i = argv.len() - 1
+        while i >= 0 {
+            at = put(m, Cell(argv[i], at))
+            i = i - 1
+        }
+        return at
+    }
+    if name == "length" {
+        if argv.len() != 1 {
+            fail(WrongArity("length", 1, argv.len()))
+        }
+        var n = 0
+        var at = argv[0]
+        var going = true
+        while going {
+            match value_at(m, at) {
+                Cell(_h, t) -> {
+                    n = n + 1
+                    at = t
+                }
+                _other -> going = false
+            }
+        }
+        return put(m, Integer(n))
+    }
+    if name == "append" {
+        var at = put(m, Empty)
+        if argv.len() > 0 {
+            at = argv[argv.len() - 1]
+            var i = argv.len() - 2
+            while i >= 0 {
+                var items: [i64] = []
+                var walk = argv[i]
+                var going = true
+                while going {
+                    match value_at(m, walk) {
+                        Cell(h, t) -> {
+                            items.push(h)
+                            walk = t
+                        }
+                        _other -> going = false
+                    }
+                }
+                var j = items.len() - 1
+                while j >= 0 {
+                    at = put(m, Cell(items[j], at))
+                    j = j - 1
+                }
+                i = i - 1
+            }
+        }
+        return at
+    }
+    fail(NotCallable(name))
+}
+
+/// A value written the way the reader would accept it back.
+pub fn show(m: Machine, at: i64) -> str {
+    match value_at(m, at) {
+        Undefined -> "#<undefined>"
+        Empty -> "()"
+        Boolean(b) -> if b { "#t" } else { "#f" }
+        Integer(n) -> "{n}"
+        Chars(s) -> "\"{s}\""
+        Name(s) -> s
+        Builtin(n) -> "#<builtin {n}>"
+        Lambda(_p, _r, _b, _e) -> "#<lambda>"
+        Cell(_h, _t) -> {
+            var out = "("
+            var walk = at
+            var first = true
+            var going = true
+            var guard = 0
+            while going and guard < 10000 {
+                guard = guard + 1
+                match value_at(m, walk) {
+                    Cell(h, t) -> {
+                        if not first {
+                            out = out + " "
+                        }
+                        first = false
+                        out = out + show(m, h)
+                        walk = t
+                    }
+                    Empty -> going = false
+                    _other -> {
+                        out = out + " . " + show(m, walk)
+                        going = false
+                    }
+                }
+            }
+            out + ")"
+        }
+    }
+}
+
+/// Read and evaluate a whole program, answering the last value.
+pub fn run(inout m: Machine, source: str) -> i64 ! EvalError {
+    let forms = match sexpr.read_all(source) {
+        Ok(f) -> f
+        Err(_e) -> fail(BadSyntax("the source will not read"))
+    }
+    var last = put(m, Undefined)
+    for f in forms {
+        last = try eval(m, f, m.global)
+    }
+    last
+}
+
+pub fn global_scope(m: Machine) -> i64 {
+    m.global
+}

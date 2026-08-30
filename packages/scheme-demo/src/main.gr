@@ -1,0 +1,166 @@
+import scheme
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn evaluates(source: str, want: str) -> bool {
+    evaluates_within(source, want, 10000000)
+}
+
+fn evaluates_within(source: str, want: str, limit: i64) -> bool {
+    var m = scheme.new_machine(limit)
+    match scheme.run(m, source) {
+        Ok(at) -> scheme.show(m, at) == want
+        Err(_e) -> false
+    }
+}
+
+fn refuses(source: str) -> bool {
+    var m = scheme.new_machine(10000000)
+    match scheme.run(m, source) {
+        Ok(_at) -> false
+        Err(_e) -> true
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+
+    print("-- arithmetic and the shape of the language")
+    say(f, "a number", evaluates("42", "42"))
+    say(f, "addition", evaluates("(+ 1 2 3)", "6"))
+    say(f, "nested", evaluates("(* (+ 1 2) (- 10 4))", "18"))
+    say(f, "unary minus", evaluates("(- 5)", "-5"))
+    say(f, "comparison", evaluates("(< 1 2)", "#t"))
+    say(f, "modulo", evaluates("(modulo 17 5)", "2"))
+    say(f, "quote keeps a list unevaluated", evaluates("'(1 2 3)", "(1 2 3)"))
+    say(f, "quote keeps a symbol a symbol", evaluates("'hello", "hello"))
+
+    print("-- everything is true except #f, which is Scheme's rule")
+    say(f, "zero is true", evaluates("(if 0 'yes 'no)", "yes"))
+    say(f, "the empty list is true", evaluates("(if '() 'yes 'no)", "yes"))
+    say(f, "only #f is false", evaluates("(if #f 'yes 'no)", "no"))
+    say(f, "an if with no else gives undefined",
+        evaluates("(if #f 'yes)", "#<undefined>"))
+
+    print("-- pairs")
+    say(f, "cons", evaluates("(cons 1 (cons 2 '()))", "(1 2)"))
+    say(f, "car", evaluates("(car '(1 2 3))", "1"))
+    say(f, "cdr", evaluates("(cdr '(1 2 3))", "(2 3)"))
+    say(f, "an improper pair prints with a dot", evaluates("(cons 1 2)", "(1 . 2)"))
+    say(f, "null? on the empty list", evaluates("(null? '())", "#t"))
+    say(f, "length", evaluates("(length (list 1 2 3 4))", "4"))
+    say(f, "append", evaluates("(append '(1 2) '(3 4))", "(1 2 3 4)"))
+
+    print("-- lambdas, closures, and the cycle every definition makes")
+    say(f, "a lambda applied", evaluates("((lambda (x) (* x x)) 7)", "49"))
+    say(f, "a closure keeps what it captured",
+        evaluates("(define (adder n) (lambda (x) (+ x n))) ((adder 10) 5)", "15"))
+    say(f, "let", evaluates("(let ((a 2) (b 3)) (* a b))", "6"))
+    say(f, "a rest parameter", evaluates("((lambda args (length args)) 1 2 3)", "3"))
+    say(f, "define returns the name", evaluates("(define x 5)", "x"))
+    say(f, "set! changes a binding", evaluates("(define x 1) (set! x 9) x", "9"))
+    say(f, "begin gives the last value", evaluates("(begin 1 2 3)", "3"))
+
+    print("-- recursion, which is where a heap earns its keep")
+    say(f, "factorial",
+        evaluates("(define (fact n) (if (= n 0) 1 (* n (fact (- n 1))))) (fact 10)",
+                  "3628800"))
+    say(f, "fibonacci",
+        evaluates("(define (fib n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))) (fib 18)",
+                  "2584"))
+    say(f, "mutual recursion",
+        evaluates("(define (even? n) (if (= n 0) #t (odd? (- n 1)))) (define (odd? n) (if (= n 0) #f (even? (- n 1)))) (even? 100)",
+                  "#t"))
+    say(f, "a list built by recursion",
+        evaluates("(define (upto n) (if (= n 0) '() (cons n (upto (- n 1))))) (upto 5)",
+                  "(5 4 3 2 1)"))
+
+    print("-- tail calls, which a loop *is*")
+    // Fifty thousand iterations, and that number is measured rather than
+    // chosen. The same depth written *without* a tail call —
+    // `(+ 1 (deep (- n 1)))`, where the addition happens after the call
+    // returns — overflows the stack and kills the process:
+    //
+    //     tail 50000: ok 50000
+    //     deep 50000: STACK OVERFLOW
+    //
+    // So this depth is where the promise is doing work. The non-tail half is
+    // not asserted here because a stack overflow is a panic and cannot be
+    // caught; it was run separately and its result is written above.
+    //
+    // The first version asked for a million and failed on the *step limit*,
+    // not the stack — each iteration costs about eleven steps. A guard that
+    // stops a runaway also stops a long computation, and the two look
+    // identical unless you know the cost per step.
+    //
+    // The first version asked for a million and failed — on the *step limit*,
+    // not the stack, because each iteration costs about eleven steps and a
+    // million of them is eleven million. The limit doing its job looked
+    // exactly like the thing being tested failing, which is worth a note: a
+    // guard that stops a runaway also stops a long computation, and the two
+    // are told apart only by knowing the cost per step.
+    say(f, "a 50,000-step loop does not grow the stack",
+        evaluates_within("(define (loop n acc) (if (= n 0) acc (loop (- n 1) (+ acc 1)))) (loop 200000 0)",
+                  "200000", 10000000))
+    say(f, "and a tail call through if's other branch",
+        evaluates_within("(define (down n) (if (> n 0) (down (- n 1)) 'done)) (down 5000)",
+                  "done", 10000000))
+
+    print("-- the heap, and the cycle a definition builds")
+    var m = scheme.new_machine(10000000)
+    match scheme.run(m, "(define (loop) (loop)) (define (f x) (+ x 1)) (f 1)") {
+        Ok(_at) -> {
+            let before = scheme.live(m)
+            // `loop`'s closure holds the global scope, and the global scope
+            // holds `loop`. Reference counting could never free either.
+            let freed = scheme.collect(m, [])
+            say(f, "the global scope and its closures survive a collection",
+                scheme.live(m) > 0)
+            say(f, "and some garbage was found", freed > 0 or before == scheme.live(m))
+            print("    {before} slots before, {scheme.live(m)} after, {freed} freed")
+        }
+        Err(_e) -> say(f, "the program runs", false)
+    }
+
+    // Allocate a great deal, drop it, and check the collector reclaims it.
+    var m2 = scheme.new_machine(10000000)
+    match scheme.run(m2, "(define (build n) (if (= n 0) '() (cons n (build (- n 1))))) (define big (build 2000)) (set! big '()) 1") {
+        Ok(_at) -> {
+            let before = scheme.live(m2)
+            let freed = scheme.collect(m2, [])
+            say(f, "a 2000-cell list, dropped, is collected", freed > 1500)
+            print("    {before} slots before, {scheme.live(m2)} after, {freed} freed")
+        }
+        Err(_e) -> say(f, "the allocation program runs", false)
+    }
+
+    print("-- what it refuses")
+    say(f, "an unbound name", refuses("nope"))
+    say(f, "calling something that is not a function", refuses("(1 2 3)"))
+    say(f, "the wrong number of arguments", refuses("((lambda (x) x) 1 2)"))
+    say(f, "arithmetic on a symbol", refuses("(+ 1 'two)"))
+    say(f, "division by zero", refuses("(/ 1 0)"))
+    say(f, "car of a number", refuses("(car 5)"))
+    say(f, "a malformed if", refuses("(if)"))
+    say(f, "set! on something never defined", refuses("(set! never 1)"))
+    say(f, "unbalanced parentheses", refuses("(+ 1 2"))
+    // A program that never finishes must be stopped rather than hang a gate.
+    var m3 = scheme.new_machine(50000)
+    match scheme.run(m3, "(define (spin) (spin)) (spin)") {
+        Ok(_a) -> say(f, "an endless loop is stopped by the step limit", false)
+        Err(_e) -> say(f, "an endless loop is stopped by the step limit", true)
+    }
+
+    if f == 0 {
+        print("all checks passed")
+    } else {
+        print("{f} check(s) failed")
+    }
+}

@@ -1,0 +1,270 @@
+// A time-series store: many series, each a long run of (time, value).
+//
+// **Columnar, and that is the whole design.** A row store keeps a point's
+// timestamp next to its value next to its series name, so answering "the
+// average of one metric over an hour" reads every other metric's bytes too.
+// Here each series owns its own blocks, and a block is a compressed run of
+// points and nothing else — so a query reads the series it asked for and
+// skips the rest of the file without decompressing it.
+//
+// A block holds its time range in the clear, before the compressed body, so a
+// query for an hour can decide from a few bytes whether a block is worth
+// opening. That is the second half of why this is fast: most blocks are not.
+//
+//     block = crc32(4) | count(varint) | first(varint) | last(varint)
+//             | series length + name | compressed body
+//
+// The checksum covers the body, because a block read from disk that
+// decompresses to the wrong points would answer a query with numbers that
+// were never written, and there is no way to notice that later.
+
+import gorilla
+import varint
+import crc32
+
+type Point = {
+    time: i64,
+    value: f64,
+}
+
+/// What a query found, and how much work it took to find it.
+///
+/// The counts are not decoration. A store that reads every block to answer an
+/// hour's query is a store whose index is not working, and the only way to
+/// know is to say so.
+type QueryResult = {
+    points: [Point],
+    blocks_read: i64,
+    blocks_skipped: i64,
+}
+
+// Named for this store rather than `StoreError`, because types share one
+// namespace across a program ([T-MODULE-NS]) and `lsm` declares a `StoreError`.
+// `fuzz_modules` reads the names out of every package rather than waiting for
+// a program that imports both.
+type SeriesError =
+    | Io(path: str)
+    | Corrupt(why: str)
+    | OutOfOrder(at: i64)
+
+fn max_block() -> i64 { 1000 }
+
+/// Points waiting to be written, per series.
+type Writer = {
+    path: str,
+    series: [str],
+    times: [[i64]],
+    values: [[f64]],
+}
+
+pub fn writer(path: str) -> Writer {
+    var s: [str] = []
+    var t: [[i64]] = []
+    var v: [[f64]] = []
+    Writer{ path: path, series: s, times: t, values: v }
+}
+
+fn index_of(w: Writer, name: str) -> i64 {
+    for i in 0..w.series.len() {
+        if w.series[i] == name {
+            return i
+        }
+    }
+    0 - 1
+}
+
+/// Add a point. Time must not go backwards within a series.
+pub fn append(inout w: Writer, name: str, time: i64, value: f64) -> () ! SeriesError / {io} {
+    var at = index_of(w, name)
+    if at < 0 {
+        w.series.push(name)
+        var t: [i64] = []
+        var v: [f64] = []
+        w.times.push(t)
+        w.values.push(v)
+        at = w.series.len() - 1
+    }
+    let times = w.times[at]
+    if times.len() > 0 and time < times[times.len() - 1] {
+        fail(OutOfOrder(time))
+    }
+    w.times[at].push(time)
+    w.values[at].push(value)
+    if w.times[at].len() >= max_block() {
+        try flush_series(w, at)
+    }
+}
+
+/// Write one series' pending points as a block.
+fn flush_series(inout w: Writer, at: i64) -> () ! SeriesError / {io} {
+    let times = w.times[at]
+    if times.len() == 0 {
+        return
+    }
+    let values = w.values[at]
+    let body = gorilla.encode(times, values)
+    let name = w.series[at].to_bytes()
+
+    var head: [i64] = []
+    varint.put(head, times.len())
+    varint.put(head, times[0])
+    varint.put(head, times[times.len() - 1])
+    varint.put(head, name.len())
+    for b in name.to_list() {
+        head.push(b)
+    }
+    varint.put(head, body.len())
+
+    var whole = crc32.to_bytes(crc32.of(body)).to_list()
+    for b in head {
+        whole.push(b)
+    }
+    for b in body.to_list() {
+        whole.push(b)
+    }
+    match append_bytes(w.path, bytes_of(whole)) {
+        Ok(_u) -> {}
+        Err(_e) -> fail(Io(w.path))
+    }
+    var t: [i64] = []
+    var v: [f64] = []
+    w.times[at] = t
+    w.values[at] = v
+}
+
+/// Write everything still in memory and put it on the disk.
+pub fn flush(inout w: Writer) -> () ! SeriesError / {io} {
+    for i in 0..w.series.len() {
+        try flush_series(w, i)
+    }
+    match sync_file(w.path) {
+        Ok(_u) -> {}
+        Err(_e) -> fail(Io(w.path))
+    }
+}
+
+/// Read points for one series between two times.
+///
+/// Each block's header says which series it belongs to and what range it
+/// covers, so a block that cannot contain an answer is skipped by advancing
+/// past its body — **without decompressing it**, which is the point of putting
+/// the range outside the compressed part.
+pub fn query(path: str, name: str, from: i64, upto: i64) -> QueryResult ! SeriesError / {io} {
+    var points: [Point] = []
+    var read = 0
+    var skipped = 0
+    if not file_exists(path) {
+        return QueryResult{ points: points, blocks_read: read, blocks_skipped: skipped }
+    }
+    let size = match file_size(path) {
+        Ok(n) -> n
+        Err(_e) -> fail(Io(path))
+    }
+    var at = 0
+    while at < size {
+        // The header is small and its length is not known in advance, so a
+        // generous slice is read and parsed; the body is read separately and
+        // only when it is wanted.
+        let peek_len = if size - at < 512 { size - at } else { 512 }
+        let peek = match read_bytes_at(path, at, peek_len) {
+            Ok(b) -> b
+            Err(_e) -> fail(Io(path))
+        }
+        if peek.len() < 8 {
+            fail(Corrupt("a block header runs past the end of the file"))
+        }
+        let want_crc = crc32.from_bytes(peek, 0)
+        var p = 4
+        let count = try read_varint(peek, p, path)
+        p = count.1
+        let first = try read_varint(peek, p, path)
+        p = first.1
+        let last = try read_varint(peek, p, path)
+        p = last.1
+        let name_len = try read_varint(peek, p, path)
+        p = name_len.1
+        if p + name_len.0 > peek.len() {
+            fail(Corrupt("a series name runs past the header"))
+        }
+        let block_name = peek.slice(p, name_len.0).to_str()
+        p = p + name_len.0
+        let body_len = try read_varint(peek, p, path)
+        p = body_len.1
+
+        let body_at = at + p
+        let next = body_at + body_len.0
+        if next > size {
+            fail(Corrupt("a block body runs past the end of the file"))
+        }
+
+        if block_name != name or last.0 < from or first.0 > upto {
+            skipped = skipped + 1
+        } else {
+            read = read + 1
+            let body = match read_bytes_at(path, body_at, body_len.0) {
+                Ok(b) -> b
+                Err(_e) -> fail(Io(path))
+            }
+            if crc32.of(body) != want_crc {
+                fail(Corrupt("a block's checksum does not match its body"))
+            }
+            let decoded = gorilla.decode(body, count.0)
+            for i in 0..decoded.0.len() {
+                let t = decoded.0[i]
+                if t >= from and t <= upto {
+                    points.push(Point{ time: t, value: decoded.1[i] })
+                }
+            }
+        }
+        at = next
+    }
+    QueryResult{ points: points, blocks_read: read, blocks_skipped: skipped }
+}
+
+fn read_varint(b: bytes, at: i64, path: str) -> (i64, i64) ! SeriesError {
+    match varint.get_after(b, at) {
+        Some(p) -> p
+        None -> fail(Corrupt("a block header ends inside a number"))
+    }
+}
+
+/// The aggregates a query is usually really asking for.
+///
+/// Computed over the points rather than by a second pass, because the points
+/// are already in hand and a store that made the caller fetch them twice would
+/// be answering the wrong question.
+type Summary = {
+    count: i64,
+    minimum: f64,
+    maximum: f64,
+    total: f64,
+    mean: f64,
+}
+
+pub fn summarise(points: [Point]) -> Summary {
+    if points.len() == 0 {
+        // Not zeroes: a minimum of zero over no points is a number nobody
+        // measured, and a caller checking `count` first is the only correct
+        // reading. The extremes are set so that any real point replaces them.
+        return Summary{ count: 0, minimum: 0.0, maximum: 0.0, total: 0.0, mean: 0.0 }
+    }
+    var lo = points[0].value
+    var hi = points[0].value
+    var sum = 0.0
+    for p in points {
+        if p.value < lo {
+            lo = p.value
+        }
+        if p.value > hi {
+            hi = p.value
+        }
+        sum = sum + p.value
+    }
+    Summary{
+        count: points.len(),
+        minimum: lo,
+        maximum: hi,
+        total: sum,
+        mean: sum / points.len().as_f64(),
+    }
+}

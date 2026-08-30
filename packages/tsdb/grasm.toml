@@ -1,0 +1,17 @@
+[package]
+name = "tsdb"
+version = "1.0.0"
+
+capabilities = ["io"]
+
+[dependencies.gorilla]
+path = "../gorilla"
+version = "^1.0.0"
+
+[dependencies.varint]
+path = "../varint"
+version = "^1.0.0"
+
+[dependencies.crc32]
+path = "../crc32"
+version = "^1.0.0"

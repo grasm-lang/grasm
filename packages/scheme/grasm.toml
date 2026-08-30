@@ -1,0 +1,9 @@
+[package]
+name = "scheme"
+version = "1.0.0"
+
+capabilities = []
+
+[dependencies.sexpr]
+path = "../sexpr"
+version = "^1.0.0"

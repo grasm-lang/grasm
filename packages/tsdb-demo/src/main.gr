@@ -1,0 +1,149 @@
+import tsdb
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+    let dir = "/tmp/grasm-tsdb-demo"
+    match make_dir(dir) {
+        Ok(_u) -> {}
+        Err(_e) -> {}
+    }
+    let path = "{dir}/metrics.tsdb"
+    match remove_file(path) {
+        Ok(_u) -> {}
+        Err(_e) -> {}
+    }
+
+    print("-- three series, ten thousand points each")
+    var w = tsdb.writer(path)
+    let start = 1700000000
+    for i in 0..10000 {
+        let t = start + i * 10
+        match tsdb.append(w, "cpu", t, 20.0 + (i % 5).as_f64()) {
+            Ok(_u) -> {}
+            Err(_e) -> print("    cpu append failed at {i}")
+        }
+        match tsdb.append(w, "memory", t, 1000.0 + (i % 3).as_f64() * 10.0) {
+            Ok(_u) -> {}
+            Err(_e) -> print("    memory append failed")
+        }
+        match tsdb.append(w, "requests", t, i.as_f64()) {
+            Ok(_u) -> {}
+            Err(_e) -> print("    requests append failed")
+        }
+    }
+    match tsdb.flush(w) {
+        Ok(_u) -> {}
+        Err(_e) -> print("    flush failed")
+    }
+    let size = file_size(path) ?? 0
+    print("    30000 points in {size} bytes = {size.as_f64() / 30000.0} bytes each")
+    say(f, "under two bytes a point, against sixteen stored plainly",
+        size < 60000)
+
+    print("-- a query reads only the series it asked for")
+    match tsdb.query(path, "cpu", start, start + 99999999) {
+        Ok(r) -> {
+            say(f, "every cpu point comes back", r.points.len() == 10000)
+            say(f, "and the values are right",
+                r.points[0].value == 20.0 and r.points[4].value == 24.0)
+            say(f, "the other two series' blocks were skipped, not decompressed",
+                r.blocks_skipped >= r.blocks_read * 2)
+            print("    read {r.blocks_read} blocks, skipped {r.blocks_skipped}")
+        }
+        Err(_e) -> say(f, "the cpu series reads back", false)
+    }
+
+    print("-- a narrow range reads almost nothing")
+    match tsdb.query(path, "cpu", start + 5000, start + 5100) {
+        Ok(r) -> {
+            say(f, "eleven points in a hundred-second window", r.points.len() == 11)
+            say(f, "and one block was opened, not ten",
+                r.blocks_read == 1)
+            print("    read {r.blocks_read} blocks, skipped {r.blocks_skipped}")
+        }
+        Err(_e) -> say(f, "the narrow query works", false)
+    }
+
+    print("-- ranges that fall outside")
+    match tsdb.query(path, "cpu", 0, 100) {
+        Ok(r) -> say(f, "a range before every point returns nothing and reads nothing",
+            r.points.len() == 0 and r.blocks_read == 0)
+        Err(_e) -> say(f, "an early range works", false)
+    }
+    match tsdb.query(path, "cpu", start + 99999999, start + 999999999) {
+        Ok(r) -> say(f, "a range after every point likewise",
+            r.points.len() == 0 and r.blocks_read == 0)
+        Err(_e) -> say(f, "a late range works", false)
+    }
+    match tsdb.query(path, "nothing-by-that-name", 0, 99999999999) {
+        Ok(r) -> say(f, "an unknown series returns nothing",
+            r.points.len() == 0 and r.blocks_read == 0)
+        Err(_e) -> say(f, "an unknown series works", false)
+    }
+
+    print("-- aggregates")
+    match tsdb.query(path, "requests", start, start + 999) {
+        Ok(r) -> {
+            let s = tsdb.summarise(r.points)
+            say(f, "a hundred points", s.count == 100)
+            say(f, "the smallest is the first", s.minimum == 0.0)
+            say(f, "the largest is the last", s.maximum == 99.0)
+            say(f, "the total is right", s.total == 4950.0)
+            say(f, "and the mean", s.mean == 49.5)
+        }
+        Err(_e) -> say(f, "aggregates work", false)
+    }
+    let none: [Point] = []
+    say(f, "an empty summary counts nothing", tsdb.summarise(none).count == 0)
+
+    print("-- what the store refuses")
+    var bad = tsdb.writer("{dir}/bad.tsdb")
+    match remove_file("{dir}/bad.tsdb") {
+        Ok(_u) -> {}
+        Err(_e) -> {}
+    }
+    match tsdb.append(bad, "s", 100, 1.0) {
+        Ok(_u) -> {}
+        Err(_e) -> {}
+    }
+    match tsdb.append(bad, "s", 50, 2.0) {
+        Ok(_u) -> say(f, "a timestamp going backwards is refused", false)
+        Err(_e) -> say(f, "a timestamp going backwards is refused", true)
+    }
+    // A block whose body no longer matches its checksum must not be read as
+    // numbers nobody wrote.
+    match read_bytes(path) {
+        Ok(whole) -> {
+            var bent = whole.to_list()
+            bent[whole.len() - 20] = bent[whole.len() - 20].bit_xor(255)
+            match write_bytes("{dir}/bent.tsdb", bytes_of(bent)) {
+                Ok(_u) -> {}
+                Err(_e) -> {}
+            }
+            match tsdb.query("{dir}/bent.tsdb", "requests", 0, 99999999999) {
+                Ok(_r) -> say(f, "a damaged block is refused", false)
+                Err(_e) -> say(f, "a damaged block is refused", true)
+            }
+        }
+        Err(_e) -> say(f, "the file could be read", false)
+    }
+    match tsdb.query("{dir}/never-written.tsdb", "x", 0, 100) {
+        Ok(r) -> say(f, "a store that does not exist reads as empty", r.points.len() == 0)
+        Err(_e) -> say(f, "a missing store reads as empty", false)
+    }
+
+    if f == 0 {
+        print("all checks passed")
+    } else {
+        print("{f} check(s) failed")
+    }
+}

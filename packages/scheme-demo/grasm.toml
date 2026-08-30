@@ -1,0 +1,8 @@
+[package]
+name = "scheme_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.scheme]
+path = "../scheme"
+version = "^1.0.0"
