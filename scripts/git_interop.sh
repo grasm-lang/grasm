@@ -91,5 +91,64 @@ git -C "$R" checkout -q master 2>/dev/null
 [ "$(git -C "$R" rev-parse HEAD)" == "$commit" ] && note yes \
     || note no "git resolved HEAD to a different name than Grasm computed"
 
+# --- and the other direction: reading what git wrote ------------------------
+#
+# A repository with a long history holds many nearly-identical trees and blobs,
+# so git stores most objects as a *delta* from another one, chained several
+# deep. Reconstructing them is the hard half of the format and cannot be
+# checked by round-tripping through this implementation.
+if ! "$GRASM" build apps/gitread/src/main.gr --native -o "$WORK/gitread" >/dev/null 2>&1; then
+    echo "  FAIL: the pack reader would not build"
+    fail=$((fail + 1))
+else
+    P="$WORK/packrepo"
+    mkdir -p "$P"
+    git -C "$P" init -q
+    # A file that changes a little each time, plus side files that repeat, so
+    # git has something worth deltifying. Written with shell rather than an
+    # embedded script: the first version nested Python inside a heredoc and its
+    # newline escapes were eaten, producing a repository with one object in it.
+    # The guard below caught that, which is why it is there.
+    for j in $(seq 1 200); do
+        echo "line $j of a file that changes slowly"
+    done > "$WORK/body.txt"
+    for i in $(seq 1 24); do
+        cp "$WORK/body.txt" "$P/data.txt"
+        echo "version $i marker" >> "$P/data.txt"
+        head -40 "$WORK/body.txt" > "$P/side$((i % 5)).txt"
+        echo "side file $i" >> "$P/side$((i % 5)).txt"
+        git -C "$P" add -A
+        git -C "$P" -c user.email=a@b -c user.name=A commit -qm "change $i"
+    done
+    git -C "$P" repack -a -d -q --depth=50 --window=50
+    pack=$(ls "$P"/.git/objects/pack/*.pack 2>/dev/null | head -1)
+
+    if [ -z "$pack" ]; then
+        echo "  FAIL: git produced no packfile to read"
+        fail=$((fail + 1))
+    else
+        deltas=$(git -C "$P" verify-pack -v "$pack" 2>/dev/null \
+            | awk 'NF>=7 && $1 ~ /^[0-9a-f]{40}$/ {n++} END{print n+0}')
+        "$WORK/gitread" "$pack" 2>/dev/null | sort > "$WORK/ours.txt"
+        git -C "$P" cat-file --batch-all-objects \
+            --batch-check='%(objectname) %(objecttype) %(objectsize)' 2>/dev/null \
+            | sort > "$WORK/theirs.txt"
+        ours=$(wc -l < "$WORK/ours.txt" | tr -d ' ')
+
+        # A pack with no deltas would prove nothing, so the shape of what git
+        # produced is checked rather than assumed.
+        [ "$deltas" -ge 20 ] && note yes \
+            || note no "git's pack had only $deltas deltified objects — too few to test resolution"
+        [ "$ours" -ge 50 ] && note yes || note no "only $ours objects were read from the pack"
+        if diff -q "$WORK/ours.txt" "$WORK/theirs.txt" >/dev/null 2>&1; then
+            note yes
+        else
+            note no "the pack's objects disagree with git ($(diff "$WORK/ours.txt" "$WORK/theirs.txt" | grep -c '^<') lines)"
+            diff "$WORK/ours.txt" "$WORK/theirs.txt" | head -4
+        fi
+        echo "  read $ours objects from git's pack, $deltas of them deltified"
+    fi
+fi
+
 echo "checked: $((pass + fail))   agreeing: $pass   disagreeing: $fail"
 [ "$fail" -eq 0 ]

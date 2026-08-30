@@ -1,0 +1,29 @@
+// Reads a Git packfile and lists what is in it.
+//
+// The output is deliberately the same shape as
+// `git cat-file --batch-all-objects --batch-check='%(objectname) %(objecttype)
+// %(objectsize)'`, so the two can be sorted and diffed. That comparison is the
+// only one worth making: a name is the SHA-1 of the content, so if every name
+// agrees then every byte agrees, including the bytes reconstructed through a
+// chain of deltas.
+//
+// With no arguments it prints usage and exits 0, which is what the corpus
+// gates run it as.
+
+import packfile
+
+fn main() / {io} {
+    let argv = args()
+    if argv.len() < 1 {
+        print("usage: gitread <pack file>")
+        return
+    }
+    match packfile.read_pack_file(argv[0]) {
+        Ok(entries) -> {
+            for e in entries {
+                print("{e.id} {packfile.name_of_type(e.kind)} {e.content.len()}")
+            }
+        }
+        Err(_e) -> print("the pack could not be read")
+    }
+}

@@ -1,0 +1,424 @@
+// Git's packfile: thousands of objects in one file, most stored as the
+// difference from another.
+//
+// A repository with a long history holds many nearly-identical trees and
+// blobs. Storing each whole would be enormous, so a pack stores some objects
+// in full and the rest as a **delta** — a small program that says "copy bytes
+// 0..900 from that other object, then insert these twelve, then copy the
+// rest". Deltas chain: a delta's base may itself be a delta, dozens deep.
+//
+//     "PACK" | version (4) | count (4)
+//     object header: type and size, then a zlib stream
+//     ...
+//     SHA-1 of everything above (20)
+//
+// **Three encodings sit next to each other and none of them is the same.**
+// The object header packs a size seven bits at a time, least significant
+// first. The offset of a delta's base packs seven bits at a time, most
+// significant first, with an increment between bytes. The delta instructions
+// use a third scheme again, a bitmask saying which bytes are present. Mixing
+// any two produces a reader that works on small packs and fails on real ones.
+//
+// Every byte here came from a network. A pack claiming four billion objects,
+// a delta whose base lies outside the file, a chain that points at itself —
+// each is a thing a crafted pack contains, and each is refused by name.
+
+import sha1
+import zlib
+import gitobj
+
+type PackEntry = {
+    offset: i64,
+    kind: i64,
+    id: str,
+    content: bytes,
+}
+
+type PackError =
+    | NotAPack(why: str)
+    | BadVersion(version: i64)
+    | Truncated(at: i64)
+    | BadObjectType(kind: i64)
+    | BaseMissing(at: i64)
+    | ChainTooDeep(limit: i64)
+    | BadDelta(why: str)
+    | ChecksumMismatch(want: str, got: str)
+    | Io(path: str)
+
+pub fn type_commit() -> i64 { 1 }
+pub fn type_tree() -> i64 { 2 }
+pub fn type_blob() -> i64 { 3 }
+pub fn type_tag() -> i64 { 4 }
+fn type_ofs_delta() -> i64 { 6 }
+fn type_ref_delta() -> i64 { 7 }
+
+/// How deep a delta chain may go before it is treated as hostile.
+///
+/// Git's own packs stay under fifty. A pack claiming more is either broken or
+/// trying to make a reader recurse until it runs out of stack.
+pub fn max_chain() -> i64 { 64 }
+
+pub fn name_of_type(kind: i64) -> str {
+    if kind == 1 {
+        "commit"
+    } else if kind == 2 {
+        "tree"
+    } else if kind == 3 {
+        "blob"
+    } else if kind == 4 {
+        "tag"
+    } else {
+        "unknown"
+    }
+}
+
+fn be32(b: bytes, at: i64) -> i64 {
+    b.at(at).shl(24).bit_or(b.at(at + 1).shl(16))
+        .bit_or(b.at(at + 2).shl(8)).bit_or(b.at(at + 3))
+}
+
+/// The object header: three bits of type, then a size seven bits at a time,
+/// **least significant group first**.
+fn read_object_header(data: bytes, at: i64) -> (i64, i64, i64) ! PackError {
+    if at >= data.len() {
+        fail(Truncated(at))
+    }
+    var byte = data.at(at)
+    var i = at + 1
+    let kind = byte.ushr(4).bit_and(7)
+    var size = byte.bit_and(15)
+    var shift = 4
+    while byte.bit_and(128) != 0 {
+        if i >= data.len() {
+            fail(Truncated(i))
+        }
+        byte = data.at(i)
+        i = i + 1
+        size = size.bit_or(byte.bit_and(127).shl(shift))
+        shift = shift + 7
+        if shift > 60 {
+            fail(BadDelta("an object size wider than any file"))
+        }
+    }
+    (kind, size, i)
+}
+
+/// The base offset of an `OFS_DELTA`: seven bits at a time, **most
+/// significant group first**, with one added between groups.
+///
+/// The increment is what makes the encoding unambiguous — without it, the
+/// same number would have several spellings — and it is the detail that a
+/// reader written from the object-header encoding gets wrong.
+fn read_offset(data: bytes, at: i64) -> (i64, i64) ! PackError {
+    if at >= data.len() {
+        fail(Truncated(at))
+    }
+    var byte = data.at(at)
+    var i = at + 1
+    var value = byte.bit_and(127)
+    while byte.bit_and(128) != 0 {
+        if i >= data.len() {
+            fail(Truncated(i))
+        }
+        byte = data.at(i)
+        i = i + 1
+        value = (value + 1).shl(7).bit_or(byte.bit_and(127))
+        if value > 1099511627776 {
+            fail(BadDelta("a base offset larger than any pack"))
+        }
+    }
+    (value, i)
+}
+
+/// Apply a delta to its base.
+///
+/// The instruction stream is one byte deciding what follows. With the top bit
+/// set it is a **copy** — the low seven bits say which of four offset bytes
+/// and three size bytes are present, so a copy of the first 64KB costs three
+/// bytes rather than seven. With the top bit clear it is an **insert** and the
+/// byte itself is the length.
+///
+/// A copy reaching outside the base, an insert of zero, and a result that is
+/// not the length the delta declared are all refused. The last matters most:
+/// it is the delta's own statement of what it should produce, and a mismatch
+/// means the reader and the writer disagree about the format.
+pub fn apply_delta(base: bytes, delta: bytes) -> bytes ! PackError {
+    var at = 0
+    let source = match varint_at(delta, at) {
+        Some(p) -> {
+            at = p.1
+            p.0
+        }
+        None -> fail(BadDelta("no source length"))
+    }
+    let target = match varint_at(delta, at) {
+        Some(p) -> {
+            at = p.1
+            p.0
+        }
+        None -> fail(BadDelta("no target length"))
+    }
+    if source != base.len() {
+        fail(BadDelta("the delta expects a {source}-byte base and this one is {base.len()}"))
+    }
+    var out: [i64] = []
+    while at < delta.len() {
+        let op = delta.at(at)
+        at = at + 1
+        if op.bit_and(128) != 0 {
+            var offset = 0
+            var size = 0
+            for i in 0..4 {
+                if op.bit_and(1.shl(i)) != 0 {
+                    if at >= delta.len() {
+                        fail(Truncated(at))
+                    }
+                    offset = offset.bit_or(delta.at(at).shl(i * 8))
+                    at = at + 1
+                }
+            }
+            for i in 0..3 {
+                if op.bit_and(1.shl(4 + i)) != 0 {
+                    if at >= delta.len() {
+                        fail(Truncated(at))
+                    }
+                    size = size.bit_or(delta.at(at).shl(i * 8))
+                    at = at + 1
+                }
+            }
+            // A size of zero means 65536. The format spends the encoding on
+            // the common small copies and gives the one unrepresentable value
+            // to the largest.
+            if size == 0 {
+                size = 65536
+            }
+            if offset + size > base.len() {
+                fail(BadDelta("a copy of {size} at {offset} reaches past a {base.len()}-byte base"))
+            }
+            for i in 0..size {
+                out.push(base.at(offset + i))
+            }
+        } else {
+            let n = op.bit_and(127)
+            if n == 0 {
+                fail(BadDelta("an insert of nothing"))
+            }
+            if at + n > delta.len() {
+                fail(Truncated(at))
+            }
+            for i in 0..n {
+                out.push(delta.at(at + i))
+            }
+            at = at + n
+        }
+        if out.len() > target {
+            fail(BadDelta("the delta produced more than the {target} bytes it declared"))
+        }
+    }
+    if out.len() != target {
+        fail(BadDelta("the delta declared {target} bytes and produced {out.len()}"))
+    }
+    bytes_of(out)
+}
+
+fn varint_at(b: bytes, at: i64) -> Option[(i64, i64)] {
+    var value = 0
+    var shift = 0
+    var i = at
+    var width = 0
+    while width < 10 {
+        if i >= b.len() {
+            return None
+        }
+        let byte = b.at(i)
+        value = value.bit_or(byte.bit_and(127).shl(shift))
+        i = i + 1
+        width = width + 1
+        if byte < 128 {
+            return Some((value, i))
+        }
+        shift = shift + 7
+    }
+    None
+}
+
+/// Read every object out of a pack, resolving deltas.
+///
+/// Two passes, because a delta may name a base that comes *later* in the file
+/// by SHA rather than by offset. The first pass records where each object
+/// starts and what it needs; the second resolves, following chains and
+/// refusing one that is too deep or that points at nothing.
+pub fn read_pack(data: bytes) -> [PackEntry] ! PackError / {io} {
+    if data.len() < 32 {
+        fail(NotAPack("a pack is at least thirty-two bytes"))
+    }
+    if data.at(0) != 80 or data.at(1) != 65 or data.at(2) != 67 or data.at(3) != 75 {
+        fail(NotAPack("the file does not begin with PACK"))
+    }
+    let version = be32(data, 4)
+    if version != 2 and version != 3 {
+        fail(BadVersion(version))
+    }
+    let count = be32(data, 8)
+    if count < 0 or count > 10000000 {
+        fail(NotAPack("a pack claiming {count} objects"))
+    }
+
+    // The trailer is a SHA-1 of everything before it, and checking it first
+    // means a damaged pack is refused before any of it is parsed.
+    let body = data.slice(0, data.len() - 20)
+    let want = to_hex(data, data.len() - 20)
+    let got = sha1.hex(body)
+    if want != got {
+        fail(ChecksumMismatch(want, got))
+    }
+
+    var offsets: [i64] = []
+    var kinds: [i64] = []
+    var payloads: [bytes] = []
+    var base_offsets: [i64] = []
+    var base_names: [str] = []
+
+    var at = 12
+    for _n in 0..count {
+        let start = at
+        let header = try read_object_header(data, at)
+        let kind = header.0
+        let size = header.1
+        at = header.2
+        var base_off = 0 - 1
+        var base_name = ""
+        if kind == type_ofs_delta() {
+            let o = try read_offset(data, at)
+            at = o.1
+            base_off = start - o.0
+            if base_off < 12 or base_off >= start {
+                fail(BaseMissing(start))
+            }
+        } else if kind == type_ref_delta() {
+            if at + 20 > data.len() {
+                fail(Truncated(at))
+            }
+            base_name = to_hex(data, at)
+            at = at + 20
+        } else if kind < 1 or kind > 4 {
+            fail(BadObjectType(kind))
+        }
+        // The zlib stream runs to wherever it ends, which is only known by
+        // decompressing it — a pack does not record compressed lengths.
+        let rest = data.slice(at, data.len() - at - 20)
+        let piece = match zlib.decompress_prefix(rest, size) {
+            Ok(p) -> p
+            Err(_e) -> fail(BadDelta("object at {start} will not decompress"))
+        }
+        if piece.0.len() != size {
+            fail(BadDelta("object at {start} declared {size} bytes and gave {piece.0.len()}"))
+        }
+        offsets.push(start)
+        kinds.push(kind)
+        payloads.push(piece.0)
+        base_offsets.push(base_off)
+        base_names.push(base_name)
+        at = at + piece.1
+    }
+
+    // Resolve. An object that is not a delta is already done; one that is
+    // needs its base resolved first, which is why this loops until nothing
+    // more can be settled rather than recursing.
+    var resolved: [bytes] = []
+    var resolved_kind: [i64] = []
+    var done: [bool] = []
+    for i in 0..count {
+        resolved.push(payloads[i])
+        resolved_kind.push(kinds[i])
+        done.push(kinds[i] != type_ofs_delta() and kinds[i] != type_ref_delta())
+    }
+    var names: [str] = []
+    for i in 0..count {
+        if done[i] {
+            names.push(gitobj.name_of(name_of_type(kinds[i]), payloads[i]))
+        } else {
+            names.push("")
+        }
+    }
+
+    var rounds = 0
+    var remaining = 0
+    for i in 0..count {
+        if not done[i] {
+            remaining = remaining + 1
+        }
+    }
+    while remaining > 0 {
+        rounds = rounds + 1
+        if rounds > max_chain() {
+            fail(ChainTooDeep(max_chain()))
+        }
+        var settled = 0
+        for i in 0..count {
+            if not done[i] {
+                var base = 0 - 1
+                if base_offsets[i] >= 0 {
+                    for j in 0..count {
+                        if offsets[j] == base_offsets[i] {
+                            base = j
+                        }
+                    }
+                } else {
+                    for j in 0..count {
+                        if done[j] and names[j] == base_names[i] {
+                            base = j
+                        }
+                    }
+                }
+                if base < 0 and base_offsets[i] >= 0 {
+                    fail(BaseMissing(offsets[i]))
+                }
+                if base >= 0 and done[base] {
+                    resolved[i] = try apply_delta(resolved[base], payloads[i])
+                    resolved_kind[i] = resolved_kind[base]
+                    names[i] = gitobj.name_of(name_of_type(resolved_kind[i]), resolved[i])
+                    done[i] = true
+                    settled = settled + 1
+                    remaining = remaining - 1
+                }
+            }
+        }
+        if settled == 0 {
+            // Nothing moved, so every delta left is waiting on a base that
+            // will never arrive — a cycle, or a name no object in this pack
+            // has. Either way it is not going to resolve.
+            fail(BaseMissing(0 - 1))
+        }
+    }
+
+    var out: [PackEntry] = []
+    for i in 0..count {
+        out.push(PackEntry{
+            offset: offsets[i],
+            kind: resolved_kind[i],
+            id: names[i],
+            content: resolved[i],
+        })
+    }
+    out
+}
+
+fn to_hex(b: bytes, from: i64) -> str {
+    let digits = "0123456789abcdef"
+    var s = ""
+    for i in 0..20 {
+        let v = b.at(from + i)
+        s = s + digits.substr(v / 16, 1) + digits.substr(v % 16, 1)
+    }
+    s
+}
+
+/// Read a pack from disk.
+pub fn read_pack_file(path: str) -> [PackEntry] ! PackError / {io} {
+    let data = match read_bytes(path) {
+        Ok(b) -> b
+        Err(_e) -> fail(Io(path))
+    }
+    read_pack(data)
+}

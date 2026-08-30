@@ -1,0 +1,10 @@
+[package]
+name = "gitread"
+version = "0.1.0"
+entry = "src/main.gr"
+
+capabilities = ["io"]
+
+[dependencies.packfile]
+path = "../../packages/packfile"
+version = "^1.0.0"

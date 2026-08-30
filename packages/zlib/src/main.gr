@@ -202,6 +202,18 @@ fn fixed_distance() -> Huffman {
 /// input expand without bound, and a decompressor with no ceiling is a way to
 /// exhaust a machine's memory from the other end of a network.
 pub fn inflate(data: bytes, limit: i64) -> bytes ! InflateError {
+    let both = try inflate_prefix(data, limit)
+    both.0
+}
+
+/// Decompress a stream that is only the beginning of the buffer, and say how
+/// many bytes it used.
+///
+/// A packfile does not record how long each object's compressed data is: the
+/// next object starts wherever the previous stream ended, which is only known
+/// by decompressing it. Every reader of that format needs this, and a
+/// decompressor that answers only the output cannot be used for one.
+pub fn inflate_prefix(data: bytes, limit: i64) -> (bytes, i64) ! InflateError {
     var r = reader_of(data)
     var out: [i64] = []
     var final_block = false
@@ -222,7 +234,10 @@ pub fn inflate(data: bytes, limit: i64) -> bytes ! InflateError {
             fail(BadBlockType(kind))
         }
     }
-    bytes_of(out)
+    // A partly-read byte still counts as read: the stream ended inside it and
+    // whatever follows begins at the next byte boundary.
+    let used = if r.bit == 0 { r.at } else { r.at + 1 }
+    (bytes_of(out), used)
 }
 
 /// A stored block: the bytes, uncompressed, after a length and its complement.
@@ -413,6 +428,42 @@ pub fn decompress(data: bytes, limit: i64) -> bytes ! InflateError {
         fail(BadChecksum(want, got))
     }
     out
+}
+
+/// A zlib stream at the start of a longer buffer, and its length in bytes.
+///
+/// The checksum is read from just past the deflate data rather than from the
+/// end of the buffer, because there is no end — the buffer continues with
+/// something else. That is the whole difference from `decompress` and it is
+/// why a packfile reader cannot use that one.
+pub fn decompress_prefix(data: bytes, limit: i64) -> (bytes, i64) ! InflateError {
+    if data.len() < 6 {
+        fail(BadHeader("a zlib stream is at least six bytes"))
+    }
+    let cmf = data.at(0)
+    let flg = data.at(1)
+    if cmf.bit_and(15) != 8 {
+        fail(BadHeader("the compression method is not deflate"))
+    }
+    if (cmf * 256 + flg) % 31 != 0 {
+        fail(BadHeader("the header check fails"))
+    }
+    if flg.bit_and(32) != 0 {
+        fail(BadHeader("a preset dictionary is not supported"))
+    }
+    let both = try inflate_prefix(data.slice(2, data.len() - 2), limit)
+    let out = both.0
+    let end = 2 + both.1
+    if end + 4 > data.len() {
+        fail(Truncated(end))
+    }
+    let want = data.at(end).shl(24).bit_or(data.at(end + 1).shl(16))
+        .bit_or(data.at(end + 2).shl(8)).bit_or(data.at(end + 3))
+    let got = adler32(out)
+    if want != got {
+        fail(BadChecksum(want, got))
+    }
+    (out, end + 4)
 }
 
 /// Compress as stored blocks: a valid zlib stream that no one has to guess at.

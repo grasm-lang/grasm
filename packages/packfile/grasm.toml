@@ -1,0 +1,17 @@
+[package]
+name = "packfile"
+version = "1.0.0"
+
+capabilities = ["io"]
+
+[dependencies.sha1]
+path = "../sha1"
+version = "^1.0.0"
+
+[dependencies.zlib]
+path = "../zlib"
+version = "^1.0.0"
+
+[dependencies.gitobj]
+path = "../gitobj"
+version = "^1.0.0"

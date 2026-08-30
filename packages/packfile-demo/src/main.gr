@@ -1,0 +1,89 @@
+import packfile
+import bytes_codec
+
+fn unhex(s: str) -> bytes {
+    match bytes_codec.decode_hex(s) {
+        Some(b) -> b
+        None -> panic("not hex")
+    }
+}
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn refuses(d: bytes) -> bool / {io} {
+    match packfile.read_pack(d) {
+        Ok(_e) -> false
+        Err(_e) -> true
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+
+    // These byte strings were written by hand and two of them were wrong on
+    // the first attempt — both with a trailing zero byte, which is an insert
+    // of nothing and correctly refused. The implementation had already read a
+    // real pack with 108 deltas, so the hex was the thing to doubt.
+    print("-- delta instructions, which are where a pack's size comes from")
+    let base = "the quick brown fox jumps over the lazy dog".to_bytes()
+    // source 43, target 43, copy 0..43 — an identity delta.
+    say(f, "a copy of the whole base reproduces it",
+        applies(base, unhex("2b2b902b"), "the quick brown fox jumps over the lazy dog"))
+    // source 43, target 9: copy bytes 4..13 ("quick bro")
+    say(f, "a copy of a range takes that range",
+        applies(base, unhex("2b09b1040900"), "quick bro"))
+    // source 43, target 5: insert "hello"
+    say(f, "an insert adds literal bytes",
+        applies(base, unhex("2b050568656c6c6f"), "hello"))
+    // source 43, target 12: copy 0..6 then insert "there!"
+    say(f, "a copy and an insert together",
+        applies(base, unhex("2b0c900606746865726521"), "the quthere!"))
+
+    print("-- and what a delta must refuse")
+    say(f, "a delta expecting a different base",
+        delta_refuses(base, unhex("0505902b00")))
+    say(f, "a copy reaching past the base",
+        delta_refuses(base, unhex("2b40b1280900")))
+    say(f, "an insert of nothing", delta_refuses(base, unhex("2b0500")))
+    say(f, "a delta producing fewer bytes than it declared",
+        delta_refuses(base, unhex("2b40900500")))
+    say(f, "a truncated delta", delta_refuses(base, unhex("2b0c05")))
+
+    print("-- packs that are not packs")
+    say(f, "an empty buffer", refuses(bytes_of([])))
+    say(f, "a file not starting with PACK",
+        refuses(unhex("4e4f504b0000000200000000" + "00".repeat(20))))
+    say(f, "a version the format does not have",
+        refuses(unhex("5041434b0000000900000000" + "00".repeat(20))))
+    say(f, "a pack claiming more objects than exist",
+        refuses(unhex("5041434b000000027fffffff" + "00".repeat(20))))
+    say(f, "a pack whose trailing checksum is wrong",
+        refuses(unhex("5041434b0000000200000000" + "ff".repeat(20))))
+
+    if f == 0 {
+        print("all checks passed")
+    } else {
+        print("{f} check(s) failed")
+    }
+}
+
+fn applies(base: bytes, delta: bytes, want: str) -> bool {
+    match packfile.apply_delta(base, delta) {
+        Ok(b) -> b.to_str() == want
+        Err(_e) -> false
+    }
+}
+
+fn delta_refuses(base: bytes, delta: bytes) -> bool {
+    match packfile.apply_delta(base, delta) {
+        Ok(_b) -> false
+        Err(_e) -> true
+    }
+}
