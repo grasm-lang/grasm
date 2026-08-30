@@ -1,0 +1,320 @@
+// HPACK: how HTTP/2 stops sending the same headers on every request.
+//
+// A browser sends `user-agent`, `accept`, `cookie` on every request, and in
+// HTTP/1 that is a kilobyte of identical text each time. HPACK replaces them
+// with **indices into a table both ends maintain**, so the second request
+// costs a byte per header.
+//
+// That shared table is the whole design and the whole danger. It is mutable
+// state on a connection, so encoder and decoder must agree exactly — a
+// decoder that inserts one entry the encoder did not will mis-decode every
+// header after it, not just the one, and there is no checksum to notice.
+//
+// **And it is where CRIME and BREACH live.** If a header's compressed size
+// depends on whether it matches a previous one, an attacker who can make a
+// request with a guessed prefix can learn whether the guess was right from the
+// length. HPACK's answer is the "never indexed" form, which is why a decoder
+// has to preserve that distinction rather than treating it as a hint.
+//
+//     0b1xxxxxxx  indexed: this header is entry N, whole
+//     0b01xxxxxx  literal, and add it to the table
+//     0b0000xxxx  literal, do not add it
+//     0b0001xxxx  literal, never add it and never let a proxy either
+//     0b001xxxxx  a new maximum table size
+
+type HeaderPair = {
+    name: str,
+    value: str,
+}
+
+type HpackError =
+    | Truncated(at: i64)
+    | BadIndex(index: i64)
+    | BadHuffman(at: i64)
+    | TableTooLarge(size: i64)
+    | Overlong(length: i64)
+
+/// The static table, RFC 7541 appendix A. Sixty-one entries every connection
+/// starts with, so the commonest headers cost one byte before anything has
+/// been sent at all.
+pub fn static_table() -> [HeaderPair] {
+    [pair(":authority", ""), pair(":method", "GET"), pair(":method", "POST"),
+     pair(":path", "/"), pair(":path", "/index.html"),
+     pair(":scheme", "http"), pair(":scheme", "https"),
+     pair(":status", "200"), pair(":status", "204"), pair(":status", "206"),
+     pair(":status", "304"), pair(":status", "400"), pair(":status", "404"),
+     pair(":status", "500"), pair("accept-charset", ""),
+     pair("accept-encoding", "gzip, deflate"), pair("accept-language", ""),
+     pair("accept-ranges", ""), pair("accept", ""),
+     pair("access-control-allow-origin", ""), pair("age", ""), pair("allow", ""),
+     pair("authorization", ""), pair("cache-control", ""),
+     pair("content-disposition", ""), pair("content-encoding", ""),
+     pair("content-language", ""), pair("content-length", ""),
+     pair("content-location", ""), pair("content-range", ""),
+     pair("content-type", ""), pair("cookie", ""), pair("date", ""),
+     pair("etag", ""), pair("expect", ""), pair("expires", ""), pair("from", ""),
+     pair("host", ""), pair("if-match", ""), pair("if-modified-since", ""),
+     pair("if-none-match", ""), pair("if-range", ""),
+     pair("if-unmodified-since", ""), pair("last-modified", ""), pair("link", ""),
+     pair("location", ""), pair("max-forwards", ""),
+     pair("proxy-authenticate", ""), pair("proxy-authorization", ""),
+     pair("range", ""), pair("referer", ""), pair("refresh", ""),
+     pair("retry-after", ""), pair("server", ""), pair("set-cookie", ""),
+     pair("strict-transport-security", ""), pair("transfer-encoding", ""),
+     pair("user-agent", ""), pair("vary", ""), pair("via", ""),
+     pair("www-authenticate", "")]
+}
+
+pub fn pair(name: str, value: str) -> HeaderPair {
+    HeaderPair{ name: name, value: value }
+}
+
+/// The dynamic half: what this connection has sent, newest first.
+type Table = {
+    entries: [HeaderPair],
+    size: i64,
+    capacity: i64,
+}
+
+pub fn new_table(capacity: i64) -> Table {
+    var e: [HeaderPair] = []
+    Table{ entries: e, size: 0, capacity: capacity }
+}
+
+/// An entry costs its two strings plus thirty-two bytes.
+///
+/// The thirty-two is not a guess about memory: it is in the specification, so
+/// both ends compute the same size and evict at the same moment. An
+/// implementation that used its real memory cost would evict at a different
+/// time from its peer and every later index would be wrong.
+fn entry_size(h: HeaderPair) -> i64 {
+    h.name.byte_len() + h.value.byte_len() + 32
+}
+
+fn evict(inout t: Table) {
+    while t.size > t.capacity and t.entries.len() > 0 {
+        let last = t.entries[t.entries.len() - 1]
+        t.size = t.size - entry_size(last)
+        t.entries.pop()
+    }
+}
+
+pub fn insert(inout t: Table, h: HeaderPair) {
+    let cost = entry_size(h)
+    if cost > t.capacity {
+        // An entry larger than the whole table empties it and is not stored,
+        // which is the specification's rule and not an error.
+        var none: [HeaderPair] = []
+        t.entries = none
+        t.size = 0
+        return
+    }
+    var next: [HeaderPair] = [h]
+    for e in t.entries {
+        next.push(e)
+    }
+    t.entries = next
+    t.size = t.size + cost
+    evict(t)
+}
+
+pub fn set_capacity(inout t: Table, capacity: i64) {
+    t.capacity = capacity
+    evict(t)
+}
+
+/// Entry `i`, counting the static table first.
+///
+/// Indices are one-based, which is a trap: index 0 is not an entry and must be
+/// refused rather than read as the first one.
+pub fn entry_at(t: Table, index: i64) -> Option[HeaderPair] {
+    if index < 1 {
+        return None
+    }
+    let statics = static_table()
+    if index <= statics.len() {
+        return Some(statics[index - 1])
+    }
+    let dynamic = index - statics.len() - 1
+    if dynamic < t.entries.len() {
+        return Some(t.entries[dynamic])
+    }
+    None
+}
+
+/// An integer in HPACK's prefix encoding.
+///
+/// The first `prefix` bits live in the byte already being read, and the rest
+/// follow seven bits at a time. Bounded, because a run of continuation bytes
+/// is a thing a crafted stream contains.
+fn read_integer(data: bytes, at: i64, prefix: i64) -> (i64, i64) ! HpackError {
+    if at >= data.len() {
+        fail(Truncated(at))
+    }
+    let mask = 1.shl(prefix) - 1
+    var value = data.at(at).bit_and(mask)
+    var i = at + 1
+    if value < mask {
+        return (value, i)
+    }
+    var shift = 0
+    var width = 0
+    var going = true
+    while going {
+        if i >= data.len() {
+            fail(Truncated(i))
+        }
+        if width >= 8 {
+            fail(Overlong(width))
+        }
+        let b = data.at(i)
+        i = i + 1
+        width = width + 1
+        value = value + b.bit_and(127).shl(shift)
+        shift = shift + 7
+        if b < 128 {
+            going = false
+        }
+    }
+    (value, i)
+}
+
+fn write_integer(inout out: [i64], value: i64, prefix: i64, flags: i64) {
+    let mask = 1.shl(prefix) - 1
+    if value < mask {
+        out.push(flags.bit_or(value))
+        return
+    }
+    out.push(flags.bit_or(mask))
+    var v = value - mask
+    while v >= 128 {
+        out.push(v.bit_and(127).bit_or(128))
+        v = v.ushr(7)
+    }
+    out.push(v)
+}
+
+/// A string: a length with a one-bit "is it Huffman" flag.
+fn read_string(data: bytes, at: i64) -> (str, i64) ! HpackError {
+    if at >= data.len() {
+        fail(Truncated(at))
+    }
+    let huffman = data.at(at).bit_and(128) != 0
+    let header = try read_integer(data, at, 7)
+    let length = header.0
+    let start = header.1
+    if length < 0 or start + length > data.len() {
+        fail(Truncated(start))
+    }
+    let raw = data.slice(start, length)
+    if huffman {
+        (try huffman_decode(raw), start + length)
+    } else {
+        (raw.to_str(), start + length)
+    }
+}
+
+/// Decode one header block against the table, updating it.
+///
+/// The table is `inout` because decoding *is* a mutation: an indexed literal
+/// adds an entry, and a decoder that skipped that would go out of step with
+/// the encoder and mis-read everything afterwards.
+pub fn decode(inout t: Table, data: bytes) -> [HeaderPair] ! HpackError {
+    var out: [HeaderPair] = []
+    var at = 0
+    while at < data.len() {
+        let first = data.at(at)
+        if first.bit_and(128) != 0 {
+            let r = try read_integer(data, at, 7)
+            at = r.1
+            match entry_at(t, r.0) {
+                Some(h) -> out.push(h)
+                None -> fail(BadIndex(r.0))
+            }
+        } else if first.bit_and(192) == 64 {
+            let r = try read_integer(data, at, 6)
+            at = r.1
+            let h = try read_literal(t, data, at, r.0)
+            out.push(h.0)
+            at = h.1
+            insert(t, h.0)
+        } else if first.bit_and(224) == 32 {
+            let r = try read_integer(data, at, 5)
+            at = r.1
+            if r.0 > 1048576 {
+                fail(TableTooLarge(r.0))
+            }
+            set_capacity(t, r.0)
+        } else {
+            // The two literal-without-indexing forms. They differ only in
+            // whether a proxy may re-encode them as indexed, which this
+            // decoder preserves by not inserting either.
+            let r = try read_integer(data, at, 4)
+            at = r.1
+            let h = try read_literal(t, data, at, r.0)
+            out.push(h.0)
+            at = h.1
+        }
+    }
+    out
+}
+
+fn read_literal(t: Table, data: bytes, at: i64, name_index: i64) -> (HeaderPair, i64) ! HpackError {
+    var i = at
+    var name = ""
+    if name_index == 0 {
+        let s = try read_string(data, i)
+        name = s.0
+        i = s.1
+    } else {
+        match entry_at(t, name_index) {
+            Some(h) -> name = h.name
+            None -> fail(BadIndex(name_index))
+        }
+    }
+    let v = try read_string(data, i)
+    (pair(name, v.0), v.1)
+}
+
+/// Encode headers as literals with indexing.
+///
+/// Deliberately simple: it never emits an indexed reference of its own, so
+/// what it produces is always decodable and never smaller than it could be.
+/// The interesting half of HPACK is the decoder, because that is the half that
+/// reads what someone else sent.
+pub fn encode(inout t: Table, headers: [HeaderPair]) -> bytes {
+    var out: [i64] = []
+    for h in headers {
+        write_integer(out, 0, 6, 64)
+        write_string(out, h.name)
+        write_string(out, h.value)
+        insert(t, h)
+    }
+    bytes_of(out)
+}
+
+fn write_string(inout out: [i64], s: str) {
+    let b = s.to_bytes()
+    write_integer(out, b.len(), 7, 0)
+    for v in b.to_list() {
+        out.push(v)
+    }
+}
+
+/// **Huffman-coded strings are refused, and that is a stated gap.**
+///
+/// HPACK lets a string be Huffman-coded with the fixed table in RFC 7541
+/// appendix B — 256 entries of code and bit length. Writing those out from
+/// memory is exactly the kind of transcription that has been wrong four times
+/// already in this project, and a Huffman table that is wrong in one entry
+/// decodes most headers correctly and mangles the rest, which is worse than
+/// not decoding them at all.
+///
+/// So a string with the Huffman bit set is refused by name. An encoder is
+/// never required to use it, so what this package *produces* is always
+/// readable by anyone; what it cannot do is read everything others produce.
+/// That is an incomplete implementation and it is written down rather than
+/// approximated.
+fn huffman_decode(_raw: bytes) -> str ! HpackError {
+    fail(BadHuffman(0))
+}

@@ -1,0 +1,191 @@
+import hpack
+import bytes_codec
+
+fn unhex(s: str) -> bytes {
+    match bytes_codec.decode_hex(s) {
+        Some(b) -> b
+        None -> panic("not hex")
+    }
+}
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn decodes(data: str) -> Option[[HeaderPair]] {
+    var t = hpack.new_table(4096)
+    match hpack.decode(t, unhex(data)) {
+        Ok(h) -> Some(h)
+        Err(_e) -> None
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+
+    print("-- the static table, which every connection starts with")
+    match hpack.entry_at(hpack.new_table(4096), 2) {
+        Some(h) -> say(f, "index 2 is :method GET",
+            h.name == ":method" and h.value == "GET")
+        None -> say(f, "index 2 exists", false)
+    }
+    match hpack.entry_at(hpack.new_table(4096), 8) {
+        Some(h) -> say(f, "index 8 is :status 200",
+            h.name == ":status" and h.value == "200")
+        None -> say(f, "index 8 exists", false)
+    }
+    match hpack.entry_at(hpack.new_table(4096), 61) {
+        Some(h) -> say(f, "index 61 is www-authenticate, the last static entry",
+            h.name == "www-authenticate")
+        None -> say(f, "index 61 exists", false)
+    }
+    // Index 0 is not an entry, and reading it as the first one is the trap.
+    say(f, "index 0 is not an entry", is_none(hpack.entry_at(hpack.new_table(4096), 0)))
+    say(f, "and neither is a negative one",
+        is_none(hpack.entry_at(hpack.new_table(4096), 0 - 3)))
+    say(f, "an index past the tables is refused",
+        is_none(hpack.entry_at(hpack.new_table(4096), 999)))
+
+    print("-- decoding, RFC 7541 appendix C")
+    // C.2.1: a literal with an incremental index, name given as text.
+    // 400a 6375 7374 6f6d 2d6b 6579 0d63 7573 746f 6d2d 6865 6164 6572
+    match decodes("400a637573746f6d2d6b65790d637573746f6d2d686561646572") {
+        Some(h) -> say(f, "a literal with its name spelled out",
+            h.len() == 1 and h[0].name == "custom-key" and h[0].value == "custom-header")
+        None -> say(f, "the literal decodes", false)
+    }
+    // C.2.2: literal without indexing, name from the static table (index 4).
+    match decodes("040c2f73616d706c652f70617468") {
+        Some(h) -> say(f, "a literal taking its name from the static table",
+            h.len() == 1 and h[0].name == ":path" and h[0].value == "/sample/path")
+        None -> say(f, "it decodes", false)
+    }
+    // C.2.4: a single indexed header, static index 2.
+    match decodes("82") {
+        Some(h) -> say(f, "one byte is a whole header",
+            h.len() == 1 and h[0].name == ":method" and h[0].value == "GET")
+        None -> say(f, "the indexed header decodes", false)
+    }
+    // C.3.1: a whole request, four headers, first request on a connection.
+    match decodes("828684410f7777772e6578616d706c652e636f6d") {
+        Some(h) -> {
+            say(f, "a four-header request decodes", h.len() == 4)
+            say(f, "  :method GET", h[0].name == ":method" and h[0].value == "GET")
+            say(f, "  :scheme http", h[1].name == ":scheme" and h[1].value == "http")
+            say(f, "  :path /", h[2].name == ":path" and h[2].value == "/")
+            say(f, "  :authority www.example.com",
+                h[3].name == ":authority" and h[3].value == "www.example.com")
+        }
+        None -> say(f, "the request decodes", false)
+    }
+
+    print("-- the dynamic table is shared state, and that is the whole point")
+    var t = hpack.new_table(4096)
+    match hpack.decode(t, unhex("828684410f7777772e6578616d706c652e636f6d")) {
+        Ok(_h1) -> {
+            // The literal added :authority to the table, so the *second*
+            // request can name it with one byte — index 62, the first dynamic
+            // slot. A decoder that failed to insert would read this as
+            // something else entirely.
+            match hpack.entry_at(t, 62) {
+                Some(e) -> say(f, "the literal was added at index 62",
+                    e.name == ":authority" and e.value == "www.example.com")
+                None -> say(f, "the literal was added", false)
+            }
+            match hpack.decode(t, unhex("828684be")) {
+                Ok(h2) -> say(f, "the second request names it in one byte",
+                    h2.len() == 4 and h2[3].name == ":authority"
+                    and h2[3].value == "www.example.com")
+                Err(_e) -> say(f, "the second request decodes", false)
+            }
+        }
+        Err(_e) -> say(f, "the first request decodes", false)
+    }
+
+    print("-- eviction, which both ends must do at the same moment")
+    var small = hpack.new_table(100)
+    hpack.insert(small, hpack.pair("aaaa", "bbbb"))
+    hpack.insert(small, hpack.pair("cccc", "dddd"))
+    say(f, "two entries of forty bytes fit in a hundred", table_len(small) == 2)
+    hpack.insert(small, hpack.pair("eeee", "ffff"))
+    say(f, "a third evicts the oldest", table_len(small) == 2)
+    match hpack.entry_at(small, 62) {
+        Some(e) -> say(f, "and the newest is first", e.name == "eeee")
+        None -> say(f, "the newest is there", false)
+    }
+    // An entry larger than the table empties it and is not stored.
+    var tiny = hpack.new_table(40)
+    hpack.insert(tiny, hpack.pair("a", "b"))
+    hpack.insert(tiny, hpack.pair("a-very-long-header-name-indeed", "and-a-long-value"))
+    say(f, "an entry bigger than the table empties it", table_len(tiny) == 0)
+    // Shrinking the capacity evicts immediately.
+    var shrink = hpack.new_table(200)
+    hpack.insert(shrink, hpack.pair("aaaa", "bbbb"))
+    hpack.insert(shrink, hpack.pair("cccc", "dddd"))
+    hpack.set_capacity(shrink, 45)
+    say(f, "shrinking the capacity evicts at once", table_len(shrink) == 1)
+
+    print("-- round trip")
+    var enc = hpack.new_table(4096)
+    var dec = hpack.new_table(4096)
+    let headers = [hpack.pair(":method", "POST"), hpack.pair(":path", "/api/v1"),
+                   hpack.pair("content-type", "application/json"),
+                   hpack.pair("x-custom", "value with spaces")]
+    let wire = hpack.encode(enc, headers)
+    match hpack.decode(dec, wire) {
+        Ok(back) -> {
+            var same = back.len() == headers.len()
+            for i in 0..back.len() {
+                if back[i].name != headers[i].name or back[i].value != headers[i].value {
+                    same = false
+                }
+            }
+            say(f, "four headers survive a round trip", same)
+            say(f, "and both tables ended the same size", table_len(enc) == table_len(dec))
+        }
+        Err(_e) -> say(f, "the round trip decodes", false)
+    }
+
+    print("-- what a decoder must refuse, since every byte came from a peer")
+    say(f, "an index that is not in either table", decodes("ff00") == None)
+    say(f, "a truncated literal", decodes("400a637573") == None)
+    say(f, "a length running past the buffer", decodes("40ff") == None)
+    say(f, "a Huffman-coded string, which this decoder does not implement",
+        decodes("408c f1e3 c2e5 f23a 6ba0 ab90 f4ff".replace(" ", "")) == None)
+    // A table size update larger than any sane connection.
+    say(f, "an absurd table size update", decodes("3fe1ffffff07") == None)
+
+    if f == 0 {
+        print("all checks passed")
+    } else {
+        print("{f} check(s) failed")
+    }
+}
+
+fn is_none(o: Option[HeaderPair]) -> bool {
+    match o {
+        None -> true
+        Some(_h) -> false
+    }
+}
+
+fn table_len(t: Table) -> i64 {
+    var n = 0
+    var i = 62
+    var going = true
+    while going and n < 1000 {
+        match hpack.entry_at(t, i) {
+            Some(_e) -> {
+                n = n + 1
+                i = i + 1
+            }
+            None -> going = false
+        }
+    }
+    n
+}
