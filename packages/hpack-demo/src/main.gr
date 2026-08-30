@@ -174,7 +174,7 @@ fn is_none(o: Option[HeaderPair]) -> bool {
     }
 }
 
-fn table_len(t: Table) -> i64 {
+fn table_len(t: HeaderTable) -> i64 {
     var n = 0
     var i = 62
     var going = true

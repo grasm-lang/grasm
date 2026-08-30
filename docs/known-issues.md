@@ -5,7 +5,47 @@ Every defect that is known and not fixed, with its severity from
 to paste. S1 and S2 block a release; S3 and S4 do not, and this file is what
 makes shipping them honest rather than quiet.
 
-**Open S1: none. Open S2: none. Open S3: none. Open S4: none.**
+**Open S1: none. Open S2: one (F92). Open S3: none. Open S4: none.**
+
+## F92 — `pop()` through an `inout` field, inside a loop, leaks the element
+
+Reproducer, thirteen lines, compiled with `--native`:
+
+```grasm
+type PH = { name: str, value: str }
+type BH = { entries: [PH] }
+
+fn inner(inout b: BH) {
+    while b.entries.len() > 1 {
+        b.entries.pop()
+    }
+}
+
+fn main() {
+    var e: [PH] = []
+    var t = BH{ entries: e }
+    t.entries.push(PH{ name: "a", value: "b" })
+    t.entries.push(PH{ name: "c", value: "d" })
+    inner(t)
+    print("left {t.entries.len()}")
+}
+```
+
+```
+$ grasm build repro.gr --native -o repro && GRASM_LEAK_CHECK=1 ./repro
+left 1
+leak: 2 allocation(s) still live at exit
+```
+
+The two allocations are the discarded struct's strings. All three of `inout`,
+a field receiver, and a loop are required; removing any one of them is clean.
+
+Two allocations per iteration, so a cache or a queue that evicts loses memory
+in proportion to how long it runs — which is why this is S2 and not S3. The
+answer the program computes is correct throughout.
+
+`ProjectGold/FINDINGS.md` F92 has the analysis. `packages/hpack` avoids the
+shape deliberately and says so at the call site.
 
 Closed on 2026-08-17, all four found by writing a calculator in the language
 rather than by a test: a closure in a `match` arm could not see the arm's own

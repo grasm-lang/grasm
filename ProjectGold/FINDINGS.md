@@ -107,6 +107,7 @@ and the entries disagree.
 | [F89](#f89) | F88's fix made the checker accept what the engine could not build | S1, types | **fixed** |
 | [F90](#f90) | a write through `inout` was silently discarded, and only in two engines | S1, semantics | **fixed** |
 | [F91](#f91) | F88's fix reached variants with arguments and not those without | S2, types | **fixed** |
+| [F92](#f92) | `pop()` through an `inout` field, inside a loop, never released what it dropped | S2, backend | **reproduced, open** |
 
 <!-- end index -->
 ## F1 — a wrapped condition must end the line with the operator (S4) — **fixed**
@@ -3942,3 +3943,63 @@ the same way F88 and F82 were found.
 **Gate**: `crates/grasm_sema/tests/module_tests.rs` now covers both spellings
 in one test, and `packages/aes` and `packages/tls13` are both in the corpus and
 both declare a `NotAuthentic`, so `difftest` runs the pair three ways.
+
+## F92 — `pop()` through an `inout` field, inside a loop, never released what it dropped (S2, backend) — **reproduced, open**
+
+Thirteen lines:
+
+```
+type PH = { name: str, value: str }
+type BH = { entries: [PH] }
+
+fn inner(inout b: BH) {
+    while b.entries.len() > 1 {
+        b.entries.pop()
+    }
+}
+
+fn main() {
+    var e: [PH] = []
+    var t = BH{ entries: e }
+    t.entries.push(PH{ name: "a", value: "b" })
+    t.entries.push(PH{ name: "c", value: "d" })
+    inner(t)
+    print("left {t.entries.len()}")
+}
+```
+
+```
+left 1
+leak: 2 allocation(s) still live at exit
+```
+
+Two allocations: the discarded struct's two strings. The answer is right and the
+memory is gone.
+
+**All three ingredients are needed**, which is why nothing had found it:
+
+  - the receiver is a **field** of a struct, not a plain list
+  - the struct arrives as an **`inout`** parameter
+  - the `pop` is inside a **loop**
+
+Remove any one and it does not leak. `pop` on a local list of structs is
+clean; `pop` through a field without `inout` is clean; `pop` through an `inout`
+field outside a loop is clean.
+
+**The backend already knew this area was soft.** Its own header says: *"Scope
+exits dec their boxed locals; early `return` skips sibling decs (bounded leak,
+hardened later)."* That note has been true and unactionable for a long time,
+because nothing said which shape. This is that note with a reproducer attached.
+
+Called S2 rather than S3 because it is not bounded in the way that note
+assumes: it is two allocations *per iteration*, so an HPACK table on a
+long-lived HTTP/2 connection, or any store that evicts, loses memory in
+proportion to how long it runs.
+
+Found by writing HPACK, whose eviction loop is exactly this shape — which is
+also the shape of every cache, every ring buffer, and every queue with a bound.
+
+**Not worked around silently.** `packages/hpack` builds the surviving entries
+into a new list instead of popping the doomed ones, which is the clearer
+spelling anyway, and says at the call site why. The corpus is green because the
+shape is absent, not because the defect is.
