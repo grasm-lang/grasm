@@ -1,0 +1,6 @@
+[package]
+name = "gorilla"
+version = "1.0.0"
+
+# Bits in, bits out. Opens nothing.
+capabilities = []

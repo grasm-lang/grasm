@@ -6660,6 +6660,10 @@ Perform the effect after the closing brace, or yield a number and do the work ou
             Type::Tuple(_) if name.name == "cmp" => return self.check_cmp(recv, args, span),
             Type::I64 => match name.name.as_str() {
                 "cmp" => return self.check_cmp(recv, args, span),
+                "from_bits" => {
+                    check_arity(self, 0);
+                    Type::F64
+                }
                 "as_f64" => {
                     check_arity(self, 0);
                     Type::F64
@@ -6731,6 +6735,19 @@ Perform the effect after the closing brace, or yield a number and do the work ou
                     Type::Str
                 }
                 "as_i64" => {
+                    check_arity(self, 0);
+                    Type::I64
+                }
+                // The IEEE-754 bit pattern, and back.
+                //
+                // `as_i64` answers what a float *means*; this answers what it
+                // *is*. Without it a program cannot write a float to a file in
+                // any binary format, cannot read one back, and cannot compress
+                // a series of them — every technique for that works by XORing
+                // consecutive bit patterns. The text form round-trips, but
+                // `1e300` spells out to 303 characters where the value is
+                // eight bytes.
+                "to_bits" => {
                     check_arity(self, 0);
                     Type::I64
                 }

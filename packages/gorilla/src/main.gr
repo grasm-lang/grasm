@@ -1,0 +1,275 @@
+// Gorilla: how a time series is stored in about one and a half bytes a point.
+//
+// A metric sampled every ten seconds gives a timestamp that is almost always
+// exactly ten seconds after the last, and a value that is almost always very
+// close to the last. Storing sixteen bytes per point when both are nearly
+// predictable is the waste this removes.
+//
+// **Timestamps: the delta of the delta.** The first is stored whole, the
+// second as its difference, and every one after as the difference *of that
+// difference* — which for a regular series is zero, and zero costs one bit.
+//
+// **Values: the XOR with the previous.** Two floats that are close share their
+// sign, exponent and most of their mantissa, so the XOR is mostly zeros at
+// both ends. What is stored is how many zero bits lead, how many bits are
+// meaningful, and those bits — and when the meaningful window is the same as
+// last time, even that is skipped.
+//
+// This needs the bit pattern of a float, which the language did not have: a
+// program could print a float and parse it back losslessly, but `1e300` spells
+// out to 303 characters and no amount of text is a bit pattern to XOR.
+
+type BitWriter = {
+    bytes: [i64],
+    current: i64,
+    used: i64,
+}
+
+type BitReader = {
+    data: bytes,
+    at: i64,
+    bit: i64,
+    spent: bool,
+}
+
+pub fn writer() -> BitWriter {
+    var none: [i64] = []
+    BitWriter{ bytes: none, current: 0, used: 0 }
+}
+
+/// One bit, most significant first within a byte.
+///
+/// The opposite of DEFLATE's order, and deliberately so: this format is read
+/// by counting leading zeros, and writing most-significant-first is what makes
+/// "leading" mean the same thing in the stream as in the number.
+pub fn put_bit(inout w: BitWriter, b: i64) {
+    w.current = w.current.shl(1).bit_or(b.bit_and(1))
+    w.used = w.used + 1
+    if w.used == 8 {
+        w.bytes.push(w.current.bit_and(255))
+        w.current = 0
+        w.used = 0
+    }
+}
+
+/// The low `n` bits of `v`, most significant first.
+pub fn put_bits(inout w: BitWriter, v: i64, n: i64) {
+    var i = n - 1
+    while i >= 0 {
+        put_bit(w, v.ushr(i).bit_and(1))
+        i = i - 1
+    }
+}
+
+/// Finish, padding the last byte with zeros.
+pub fn finish(inout w: BitWriter) -> bytes {
+    while w.used != 0 {
+        put_bit(w, 0)
+    }
+    bytes_of(w.bytes)
+}
+
+pub fn reader(data: bytes) -> BitReader {
+    BitReader{ data: data, at: 0, bit: 0, spent: false }
+}
+
+pub fn take_bit(inout r: BitReader) -> i64 {
+    if r.at >= r.data.len() {
+        r.spent = true
+        return 0
+    }
+    let v = r.data.at(r.at).ushr(7 - r.bit).bit_and(1)
+    r.bit = r.bit + 1
+    if r.bit == 8 {
+        r.bit = 0
+        r.at = r.at + 1
+    }
+    v
+}
+
+pub fn take_bits(inout r: BitReader, n: i64) -> i64 {
+    var v = 0
+    for _i in 0..n {
+        v = v.shl(1).bit_or(take_bit(r))
+    }
+    v
+}
+
+/// Sign-extend an `n`-bit two's-complement number.
+///
+/// A delta-of-delta is signed and is stored in as few bits as it fits. Reading
+/// it back without extending the sign turns every negative delta into a large
+/// positive one, which is the bug this function exists to not have.
+fn sign_extend(v: i64, n: i64) -> i64 {
+    if n >= 64 {
+        return v
+    }
+    let high = 1.shl(n - 1)
+    if v.bit_and(high) != 0 {
+        return v - 1.shl(n)
+    }
+    v
+}
+
+/// How many bits lead the pattern as zeros.
+fn leading_zeros(v: i64) -> i64 {
+    if v == 0 {
+        return 64
+    }
+    var n = 0
+    var i = 63
+    while i >= 0 and v.ushr(i).bit_and(1) == 0 {
+        n = n + 1
+        i = i - 1
+    }
+    n
+}
+
+fn trailing_zeros(v: i64) -> i64 {
+    if v == 0 {
+        return 64
+    }
+    var n = 0
+    while v.ushr(n).bit_and(1) == 0 {
+        n = n + 1
+    }
+    n
+}
+
+/// Encode a series of (timestamp, value) points.
+///
+/// Timestamps must not go backwards. A series that does is not a series, and
+/// the delta-of-delta encoding would store a large negative number for it —
+/// legal, useless, and a sign the caller has a bug worth finding here.
+pub fn encode(times: [i64], values: [f64]) -> bytes {
+    var w = writer()
+    if times.len() == 0 {
+        return finish(w)
+    }
+    if times.len() != values.len() {
+        panic("gorilla.encode: {times.len()} timestamps and {values.len()} values")
+    }
+
+    put_bits(w, times[0], 64)
+    put_bits(w, values[0].to_bits(), 64)
+    var previous_time = times[0]
+    var previous_delta = 0
+    var previous_bits = values[0].to_bits()
+    var previous_lead = 0 - 1
+    var previous_trail = 0 - 1
+
+    for i in 1..times.len() {
+        if times[i] < previous_time {
+            panic("gorilla.encode: time went backwards at point {i}")
+        }
+        let delta = times[i] - previous_time
+        let dod = delta - previous_delta
+        // The buckets are Gorilla's own, chosen from real metric data: a
+        // regular series lands in the first almost every time.
+        if dod == 0 {
+            put_bit(w, 0)
+        } else if dod >= (0 - 63) and dod <= 64 {
+            put_bits(w, 2, 2)
+            put_bits(w, dod, 7)
+        } else if dod >= (0 - 255) and dod <= 256 {
+            put_bits(w, 6, 3)
+            put_bits(w, dod, 9)
+        } else if dod >= (0 - 2047) and dod <= 2048 {
+            put_bits(w, 14, 4)
+            put_bits(w, dod, 12)
+        } else {
+            put_bits(w, 15, 4)
+            put_bits(w, dod, 64)
+        }
+        previous_time = times[i]
+        previous_delta = delta
+
+        let bits = values[i].to_bits()
+        let x = bits.bit_xor(previous_bits)
+        if x == 0 {
+            put_bit(w, 0)
+        } else {
+            put_bit(w, 1)
+            let lead = leading_zeros(x)
+            let trail = trailing_zeros(x)
+            if previous_lead >= 0 and lead >= previous_lead and trail >= previous_trail {
+                // The meaningful bits fit inside last point's window, so the
+                // window itself does not need saying again.
+                put_bit(w, 0)
+                let width = 64 - previous_lead - previous_trail
+                put_bits(w, x.ushr(previous_trail), width)
+            } else {
+                put_bit(w, 1)
+                // Five bits of leading count, so 32 is the most that can be
+                // said — which is Gorilla's own limit and why a lead above it
+                // is written as 31 rather than refused.
+                let stored_lead = if lead > 31 { 31 } else { lead }
+                let width = 64 - stored_lead - trail
+                put_bits(w, stored_lead, 5)
+                put_bits(w, width, 6)
+                put_bits(w, x.ushr(trail), width)
+                previous_lead = stored_lead
+                previous_trail = trail
+            }
+        }
+        previous_bits = bits
+    }
+    finish(w)
+}
+
+/// Decode `count` points.
+///
+/// The count is not in the stream. A block of points is stored beside the
+/// number of them, because a bit stream padded to a byte boundary cannot tell
+/// its own end from its padding — the last few zero bits would decode as one
+/// more point with the same timestamp and value.
+pub fn decode(data: bytes, count: i64) -> ([i64], [f64]) {
+    var times: [i64] = []
+    var values: [f64] = []
+    if count <= 0 {
+        return (times, values)
+    }
+    var r = reader(data)
+    var time = take_bits(r, 64)
+    var bits = take_bits(r, 64)
+    times.push(time)
+    values.push(bits.from_bits())
+    var delta = 0
+    var lead = 0
+    var trail = 0
+
+    for _i in 1..count {
+        if r.spent {
+            return (times, values)
+        }
+        var dod = 0
+        if take_bit(r) == 1 {
+            if take_bit(r) == 0 {
+                dod = sign_extend(take_bits(r, 7), 7)
+            } else if take_bit(r) == 0 {
+                dod = sign_extend(take_bits(r, 9), 9)
+            } else if take_bit(r) == 0 {
+                dod = sign_extend(take_bits(r, 12), 12)
+            } else {
+                dod = take_bits(r, 64)
+            }
+        }
+        delta = delta + dod
+        time = time + delta
+        times.push(time)
+
+        if take_bit(r) == 1 {
+            if take_bit(r) == 1 {
+                lead = take_bits(r, 5)
+                let width = take_bits(r, 6)
+                trail = 64 - lead - width
+                bits = bits.bit_xor(take_bits(r, width).shl(trail))
+            } else {
+                let width = 64 - lead - trail
+                bits = bits.bit_xor(take_bits(r, width).shl(trail))
+            }
+        }
+        values.push(bits.from_bits())
+    }
+    (times, values)
+}

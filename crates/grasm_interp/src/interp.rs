@@ -4426,6 +4426,11 @@ uses to mark the end of a string"
                 }
             }
             (Value::Float(x), "as_i64") => Value::Int(*x as i64),
+            // The bit pattern, not the value. `as_i64` says what a float
+            // means; this says what it is, which is what any binary format
+            // holding a float needs.
+            (Value::Float(x), "to_bits") => Value::Int(x.to_bits() as i64),
+            (Value::Int(n), "from_bits") => Value::Float(f64::from_bits(*n as u64)),
             (Value::Float(x), "abs") => Value::Float(x.abs()),
             (Value::Float(x), "sqrt") => Value::Float(x.sqrt()),
             (Value::Float(x), "sin") => Value::Float(x.sin()),

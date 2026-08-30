@@ -194,6 +194,7 @@ the wrap is the same one `/` and `%` take ([E-ARITH-INT]).
 | `n.to_str()` | `-> str` | the same text `print` gives, [L-DISPLAY] included ([L-LIB-TO-STR]) |
 | `n.as_f64()` | `i64 -> f64` | widening |
 | `x.as_i64()` | `f64 -> i64` | truncates toward zero, saturating ([L-LIB-AS-I64]) |
+| `x.to_bits()`, `n.from_bits()` | `f64 -> i64`, `i64 -> f64` | the IEEE-754 pattern, not the value ([L-LIB-AS-I64]) |
 
 Conversion is by method, not by a cast or a `int(...)`-style function. A `str`
 becomes a number with `parse_int` / `parse_float`, which return `Option`
@@ -229,15 +230,14 @@ particular an `f64` keeps its point at every magnitude: `(1.0).to_str()` is
 `"1.0"`. The interpreter used to hand the job to its host language, which drops
 the point on a whole value, so it answered `"1"` where the compiled backend
 answered `"1.0"` — and the documented idiom `xs.map(|v| v.to_str()).join(", ")`
-printed a `[f64]` as a list of integers, which is the one thing [L-DISPLAY]
-exists to prevent.
+printed a `[f64]` as a list of integers, which [L-DISPLAY] exists to prevent.
 
-**[L-LIB-AS-I64]** `as_i64` is total: it has an answer for every `f64`, so it
-never panics and never returns `Option`. A value too large for `i64` gives
-`i64`'s maximum, one too small gives its minimum, and `NaN` gives `0`. That is
-saturation, not wrapping — `1.0e30.as_i64()` is `9223372036854775807`, and it
-being a *clamp* rather than a truncated bit pattern is the part worth knowing,
-because the two disagree and only one of them stays ordered.
+**[L-LIB-AS-I64]** `as_i64` is total: every `f64` has an answer, so it never
+panics. Too large gives `i64`'s maximum, too small its minimum, `NaN` gives `0`
+— saturation, and a *clamp* rather than a truncated bit pattern, because the two
+disagree and only one stays ordered. `to_bits` asks the other question, not what
+a float means but what it **is**: without it nothing can put a float in a binary
+format or compress a series, every such technique XORing consecutive patterns.
 
 ## 3. `str`
 

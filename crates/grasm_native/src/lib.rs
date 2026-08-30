@@ -8235,6 +8235,17 @@ this case",
                 self.b.ins().fcvt_to_sint_sat(types::I64, rv),
                 VType::I64,
             ),
+            // A reinterpretation, not a conversion: the same sixty-four bits
+            // read as the other type. `bitcast` is exactly that and costs
+            // nothing at run time.
+            (VType::F64, "to_bits") => (
+                self.b.ins().bitcast(types::I64, cranelift_codegen::ir::MemFlags::new(), rv),
+                VType::I64,
+            ),
+            (VType::I64, "from_bits") => (
+                self.b.ins().bitcast(types::F64, cranelift_codegen::ir::MemFlags::new(), rv),
+                VType::F64,
+            ),
             (VType::F64, "to_str") => (
                 self.call_rt("grasm_str_from_f64", &[rv]).unwrap(),
                 VType::Str,
@@ -11648,6 +11659,8 @@ fields, not the type this is bound to, not an enclosing generic",
                 "codes" => VType::List(Box::new(VType::I64)),
                 "as_f64" => VType::F64,
                 "as_i64" => VType::I64,
+                "to_bits" => VType::I64,
+                "from_bits" => VType::F64,
                 // Numeric methods. Their absence here did not merely make a
                 // program unsupported: inside a fallible function it produced
                 // wrong code, because a match whose arms could not be typed

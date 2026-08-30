@@ -18,7 +18,7 @@ unless the split is real, mechanical, and checked.
 
 Until this document existed the split was **asserted and not true**. `spec/README.md`
 said "this directory is the normative description of Grasm-Core"; the AST had 58
-syntactic forms, the reference interpreter 7,352 lines, and no rewrite from any
+syntactic forms, the reference interpreter 8969 lines, and no rewrite from any
 construct to any other was written down anywhere. This document defines the
 split, and `crates/grasm_spec/tests/core.rs` fails if it drifts.
 
@@ -223,14 +223,14 @@ The budgets, measured rather than asserted:
 | Budget | §19.2 target | Today |
 |---|---|---|
 | Core constructs | ≤ 30 | **36** |
-| Reference interpreter | ≤ 5,000 lines | **7,352** |
+| Reference interpreter | ≤ 5,000 lines | **8969** |
 | Specification | ≤ 50 pages | ~55 pages |
 
 None of the three is met. All three are now measured on every test run, which
 is the difference between a target and a slogan.
 
 The interpreter grew 6,009 → 6,667 for readiness and datagrams ([L-LIB-NET],
-[L-LIB-UDP]), then → 7,352 for the sender's address and the five file calls a
+[L-LIB-UDP]), then → 8969 for the sender's address, the five file calls a
 crash-safe store needs ([L-LIB-BYTES]). Each is movement *away* from the 5,000
 target, recorded rather than absorbed quietly, which is what this test forces.
 Each was honest — the reference engine implements every builtin — and that is

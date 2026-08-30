@@ -1,0 +1,8 @@
+[package]
+name = "gorilla_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.gorilla]
+path = "../gorilla"
+version = "^1.0.0"
