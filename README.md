@@ -44,6 +44,33 @@ this repository at all — two of those need someone else to use the language.
 36 constructs against a budget of 30, with the six that would close the gap
 named.
 
+### Something built with it
+
+**GrasmWire** is a VPN protocol written entirely in Grasm — the field
+arithmetic, the cipher, the authenticator, the hash, the key schedule, the
+handshake and the protocol. 3,099 lines, nothing underneath but this compiler.
+
+Every primitive with a published vector is checked against it (RFC 8439, 7693,
+7748, 5869, and the XChaCha20 draft), and everything is checked again against
+an implementation that shares no code with it — 753 random cases a run,
+including a whole handshake, so agreement means two independent readings of the
+protocol landed on the same bytes rather than one implementation agreeing with
+itself. Two processes bring a tunnel up over real UDP, rekey it, follow a peer
+that moves, refuse a recorded handshake, and complete through the cookie path a
+loaded responder uses.
+
+**Every package below the endpoint declares no capabilities at all.** The
+curve, the hash, the AEAD, the handshake and the protocol cannot open a socket
+or read a clock — `grasm deps` says so and the compiler enforces it. A
+handshake needs randomness and a clock but not the *capability* to reach
+either: both arrive as arguments.
+
+It also found three defects in the language, one of them a build that reported
+success and wrote an artifact nothing could load. [docs/grasmwire.md](docs/grasmwire.md)
+has the design, the measurements, and the one piece that is missing and why it
+is not being added blind.
+
+
 ## Install
 
 Download the archive for your platform, unpack it, and put both files

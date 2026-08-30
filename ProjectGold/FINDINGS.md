@@ -102,6 +102,7 @@ and the entries disagree.
 | [F84](#f84) | a generic container could not be built in a struct field | S2, backend | **fixed** |
 | [F85](#f85) | a datagram receiver could not learn who wrote to it | S2, libraries | **fixed** |
 | [F86](#f86) | `args()` was documented as something it only sometimes is | S4, spec | **fixed** |
+| [F87](#f87) | a diamond dependency wrote a source bundle that could not be loaded | S1, loader | **fixed** |
 
 <!-- end index -->
 ## F1 — a wrapped condition must end the line with the operator (S4) — **fixed**
@@ -3692,3 +3693,55 @@ gates read exit codes and the spec is prose. It was found by writing a program
 that took arguments and running it two ways.
 
 Now `[L-LIB-ARGS]`, which says which spelling belongs to which and why.
+
+## F87 — a diamond dependency wrote a source bundle that could not be loaded (S1, loader) — **fixed**
+
+```
+$ grasm build packages/grasmwire-demo/src/main.gr --source -o out.gr
+wrote `out.gr`: 10 module(s), 95956 bytes
+$ grasm run out.gr
+grasmwire.gr:29:1: error: cannot load module `blake2s` (looked for `blake2s.gr`)
+```
+
+The build reported success and wrote an artifact nothing could load.
+
+`noise` and `grasmwire` both depend on `blake2s`. The bundle writer emits each
+module once, under the path the disk loader happened to reach it by first, so
+`blake2s` is in the file as `noise.blake2s` — and `grasmwire`'s plain
+`import blake2s` matched neither the qualified spelling the loader tries first
+nor the flat one it tries second.
+
+This is **F81's failure in the case F81's fix did not reach**. That entry
+taught the bundle loader to read both spellings the writer produces. A diamond
+produces a third: a name qualified by *somebody else's* prefix.
+
+**Every multi-package program in this repository until now was a tree.**
+`noise-demo` bundles and loads correctly because only `noise` reaches those
+packages — one path, one name, nothing to disagree about. GrasmWire is the
+first diamond here and it broke on the first attempt.
+
+**The shape was already tested, one layer up.** `crates/grasm_pkg/tests/pkg_tests.rs`
+has `a_diamond_loads_each_package_once`, which builds `top -> {left, right} ->
+base` and asserts the resolver loads `base` once. It does, and it always did:
+`grasm run` on the real program works. The resolver decides *which* packages
+exist; the bundle decides what they are *called* and whether an import can find
+them. Those are different layers and only the first had a diamond in it.
+
+A gate at the wrong layer reads like coverage. This one had the right name and
+the right diagram and could not have caught this.
+
+The bundle's stated design is that nothing is renamed — "the modules a bundle
+loads are the modules the disk would have loaded" — so the repair is in the
+lookup rather than the writer. The last segment decides, and **only when
+exactly one module ends that way**. A unique suffix match is the same module by
+construction: these names are paths through the dependency graph and a package
+appears in a bundle once. Two matches would be two different modules sharing a
+short name, and picking either would be a guess, so the load fails instead.
+
+**Gate**: `scripts/agreetest.sh`, `check_diamond` — four packages in a diamond,
+held to one answer across all four ways of running it: interpreter, native,
+bundled executable, and the source bundle that was broken. Reverting the fix
+turns it red, which was verified by reverting it.
+
+Found by `wasmtest`, which is the only gate that runs source bundles, on the
+first program in the corpus with two packages sharing a dependency.
