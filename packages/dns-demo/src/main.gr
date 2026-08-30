@@ -1,0 +1,131 @@
+import dns
+import bytes_codec
+
+fn unhex(s: str) -> bytes {
+    match bytes_codec.decode_hex(s) {
+        Some(b) -> b
+        None -> panic("not hex")
+    }
+}
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+/// Parse a captured response and print what it holds, so the output can be
+/// compared with `dig` by eye and by the gate.
+fn show(inout f: i64, label: str, name: str, wire: str) / {io} {
+    match dns.parse(unhex(wire)) {
+        Ok(m) -> {
+            let qs = dns.questions_of(m)
+            var ok = dns.response_code(m) == 0 and qs.len() == 1 and qs[0].name == name
+            print("  {label}: {dns.answers_of(m).len()} answer(s), rcode {dns.response_code(m)}")
+            for r in dns.answers_of(m) {
+                print("    {r.name} {r.ttl} {dns.type_name(r.kind)} {r.text}")
+            }
+            say(f, "{label} parses with the right question", ok)
+        }
+        Err(_e) -> say(f, "{label} parses", false)
+    }
+}
+
+fn mx_wire() -> str {
+    "123481800001000100000000076578616d706c6503636f6d00000f0001c00c000f00010000012c0003000000"
+}
+
+fn root_renders() -> bool {
+    for line in mx_text() {
+        if line == "0 ." {
+            return true
+        }
+    }
+    false
+}
+
+fn mx_text() -> [str] {
+    match dns.parse(unhex(mx_wire())) {
+        Ok(m) -> {
+            var out: [str] = []
+            for r in dns.answers_of(m) {
+                out.push(r.text)
+            }
+            out
+        }
+        Err(_e) -> {
+            var none: [str] = []
+            none
+        }
+    }
+}
+
+fn parses(wire: str) -> bool {
+    match dns.parse(unhex(wire)) {
+        Ok(_m) -> true
+        Err(_e) -> false
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+
+    print("-- real responses, captured from a public resolver")
+    show(f, "A", "example.com", "123481800001000200000000076578616d706c6503636f6d0000010001c00c000100010000010400046814179ac00c00010001000001040004ac4293f3")
+    show(f, "AAAA", "example.com", "123481800001000200000000076578616d706c6503636f6d00001c0001c00c001c00010000008300102606470000100000000000006814179ac00c001c0001000000830010260647000010000000000000ac4293f3")
+    show(f, "MX", "example.com", "123481800001000100000000076578616d706c6503636f6d00000f0001c00c000f00010000012c0003000000")
+    show(f, "TXT", "example.com", "123481800001000200000000076578616d706c6503636f6d0000100001c00c001000010000012c000c0b763d73706631202d616c6cc00c001000010000012c0021205f6b326e31793476773371746234736b6478396537647874393771726d6d7139")
+    show(f, "A_www", "www.example.com", "12348180000100020000000003777777076578616d706c6503636f6d0000010001c00c00010001000000cf00046814179ac00c00010001000000cf0004ac4293f3")
+    show(f, "NS", "example.com", "123481800001000200000000076578616d706c6503636f6d0000020001c00c00020001000139f000150468657261026e730a636c6f7564666c617265c014c00c00020001000139f0000a07656c6c696f7474c02e")
+
+    print("-- names")
+    // A null MX (RFC 7505) says the domain accepts no mail, and its exchange
+    // is the root. Rendered as nothing it is indistinguishable from a missing
+    // field, so the root is written the way it is read: a full stop.
+    say(f, "the root renders as a full stop", root_renders())
+
+    print("-- building a query")
+    let q = dns.query(4660, "example.com", A)
+    say(f, "a query is 29 bytes for example.com", q.len() == 29)
+    say(f, "with the id we asked for", q.at(0) == 18 and q.at(1) == 52)
+    say(f, "recursion desired", q.at(2) == 1)
+    say(f, "one question, no answers", q.at(5) == 1 and q.at(7) == 0)
+    // A query we build must parse with our own parser.
+    match dns.parse(q) {
+        Ok(m) -> {
+            let qs = dns.questions_of(m)
+            say(f, "and it round-trips through the parser",
+                qs.len() == 1 and qs[0].name == "example.com")
+        }
+        Err(_e) -> say(f, "the query parses", false)
+    }
+    let root = dns.query(1, ".", NS)
+    say(f, "the root is one zero byte", root.len() == 17)
+
+    print("-- compression pointers, which are the dangerous part")
+    // A name that points at itself. Following it without a bound is an
+    // endless loop, which is one of the oldest denial-of-service bugs there is.
+    say(f, "a pointer to itself is refused",
+        not parses("123481800001000000000000c00c00010001"))
+    // A pointer that goes forwards can cycle with another; only backwards
+    // pointers cannot.
+    say(f, "a forward pointer is refused",
+        not parses("1234818000010000000000000c14000100010000000000"))
+    // A chain of pointers longer than any real message.
+    say(f, "a truncated message is refused", not parses("1234"))
+    say(f, "an empty message is refused", not parses(""))
+    say(f, "a header claiming a million answers is refused",
+        not parses("12348180000100ffff00000000"))
+    // A label claiming more bytes than the packet holds.
+    say(f, "a label running past the packet is refused",
+        not parses("1234818000010000000000003f6161616100010001"))
+
+    if f == 0 {
+        print("all checks passed")
+    } else {
+        print("{f} check(s) failed")
+    }
+}

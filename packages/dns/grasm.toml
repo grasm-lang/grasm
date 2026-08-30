@@ -1,0 +1,7 @@
+[package]
+name = "dns"
+version = "1.0.0"
+
+# Bytes in, records out. It opens no socket: a parser that could also send
+# queries would be a parser nobody could test against a captured packet.
+capabilities = []

@@ -1,0 +1,425 @@
+// DNS wire format.
+//
+// The format is from 1987 and its one clever idea is also its one dangerous
+// one. A response repeating `www.example.com` in every record would be mostly
+// duplicated text, so a name may end in a **pointer** to a name earlier in the
+// same message — two bytes instead of seventeen.
+//
+// A pointer can point anywhere, including **backwards to itself**, and a
+// parser that follows pointers without counting will loop for ever on a packet
+// an attacker sent. That is not a hypothetical: it is one of the oldest
+// denial-of-service bugs in networking, and every DNS parser ever written has
+// either bounded the walk or had the bug.
+//
+// This one bounds it three ways: a hard limit on how many pointers may be
+// followed, a rule that a pointer must point *backwards* (so a chain strictly
+// decreases and cannot cycle), and a cap on the assembled name's length.
+
+type RecordType =
+    | A
+    | AAAA
+    | NS
+    | CNAME
+    | SOA
+    | PTR
+    | MX
+    | TXT
+    | DNSKEY
+    | RRSIG
+    | DS
+    | Other(code: i64)
+
+type Record = {
+    name: str,
+    kind: RecordType,
+    class_code: i64,
+    ttl: i64,
+    data: bytes,
+    // For the kinds whose contents are worth having parsed.
+    text: str,
+}
+
+type Question = {
+    name: str,
+    kind: RecordType,
+    class_code: i64,
+}
+
+type DnsMessage = {
+    id: i64,
+    is_response: bool,
+    opcode: i64,
+    authoritative: bool,
+    truncated: bool,
+    recursion_desired: bool,
+    recursion_available: bool,
+    response_code: i64,
+    questions: [Question],
+    answers: [Record],
+    authority: [Record],
+    additional: [Record],
+}
+
+type DnsError =
+    | Truncated(at: i64)
+    | PointerLoop(at: i64)
+    | ForwardPointer(at: i64, to: i64)
+    | NameTooLong(length: i64)
+    | LabelTooLong(length: i64)
+    | TooManyRecords(count: i64)
+    | BadCount(section: str, count: i64)
+
+fn max_pointers() -> i64 { 16 }
+fn max_name() -> i64 { 255 }
+fn max_label() -> i64 { 63 }
+fn max_records() -> i64 { 4096 }
+
+pub fn type_code(k: RecordType) -> i64 {
+    match k {
+        A -> 1
+        NS -> 2
+        CNAME -> 5
+        SOA -> 6
+        PTR -> 12
+        MX -> 15
+        TXT -> 16
+        AAAA -> 28
+        DS -> 43
+        RRSIG -> 46
+        DNSKEY -> 48
+        Other(c) -> c
+    }
+}
+
+pub fn type_of(code: i64) -> RecordType {
+    if code == 1 {
+        A
+    } else if code == 2 {
+        NS
+    } else if code == 5 {
+        CNAME
+    } else if code == 6 {
+        SOA
+    } else if code == 12 {
+        PTR
+    } else if code == 15 {
+        MX
+    } else if code == 16 {
+        TXT
+    } else if code == 28 {
+        AAAA
+    } else if code == 43 {
+        DS
+    } else if code == 46 {
+        RRSIG
+    } else if code == 48 {
+        DNSKEY
+    } else {
+        Other(code)
+    }
+}
+
+pub fn type_name(k: RecordType) -> str {
+    match k {
+        A -> "A"
+        NS -> "NS"
+        CNAME -> "CNAME"
+        SOA -> "SOA"
+        PTR -> "PTR"
+        MX -> "MX"
+        TXT -> "TXT"
+        AAAA -> "AAAA"
+        DS -> "DS"
+        RRSIG -> "RRSIG"
+        DNSKEY -> "DNSKEY"
+        Other(c) -> "TYPE{c}"
+    }
+}
+
+/// Read a name, following compression pointers.
+///
+/// Answers the name and where the *caller* should continue, which is not where
+/// the walk ended: once a pointer is taken the reader jumps elsewhere, and the
+/// field after the name is two bytes past where the pointer was, not past
+/// wherever it led.
+fn read_name(data: bytes, at: i64) -> (str, i64) ! DnsError {
+    var name = ""
+    var i = at
+    var after = 0 - 1
+    var jumps = 0
+    var going = true
+    while going {
+        if i >= data.len() {
+            fail(Truncated(i))
+        }
+        let length = data.at(i)
+        if length.bit_and(192) == 192 {
+            // A pointer: the low fourteen bits are an offset into the message.
+            if i + 1 >= data.len() {
+                fail(Truncated(i))
+            }
+            let target = length.bit_and(63).shl(8).bit_or(data.at(i + 1))
+            if after < 0 {
+                after = i + 2
+            }
+            jumps = jumps + 1
+            if jumps > max_pointers() {
+                fail(PointerLoop(i))
+            }
+            // Pointing forwards is refused. A chain that only ever goes
+            // backwards cannot cycle, which turns "bound the loop" into
+            // "there is no loop".
+            if target >= i {
+                fail(ForwardPointer(i, target))
+            }
+            i = target
+        } else if length == 0 {
+            if after < 0 {
+                after = i + 1
+            }
+            // The root is a name with no labels, and it is written `.` rather
+            // than as nothing. `example.com MX 0 .` is a *null MX* (RFC 7505)
+            // saying the domain accepts no mail — rendering it as `0 ` loses
+            // the distinction between that and a missing field.
+            if name.len() == 0 {
+                name = "."
+            }
+            going = false
+        } else {
+            if length > max_label() {
+                fail(LabelTooLong(length))
+            }
+            if i + 1 + length > data.len() {
+                fail(Truncated(i))
+            }
+            if name.len() > 0 {
+                name = name + "."
+            }
+            name = name + data.slice(i + 1, length).to_str()
+            if name.len() > max_name() {
+                fail(NameTooLong(name.len()))
+            }
+            i = i + 1 + length
+        }
+    }
+    (name, after)
+}
+
+/// Write a name as labels. No compression: what this produces is always
+/// readable, and a query is small enough that saving bytes would be a
+/// pointless risk.
+pub fn write_name(inout out: [i64], name: str) {
+    if name.len() > 0 and name != "." {
+        for label in name.split(".") {
+            if label.len() > 0 {
+                let b = label.to_bytes()
+                out.push(b.len())
+                for v in b.to_list() {
+                    out.push(v)
+                }
+            }
+        }
+    }
+    out.push(0)
+}
+
+fn be16(data: bytes, at: i64) -> i64 {
+    data.at(at).shl(8).bit_or(data.at(at + 1))
+}
+
+fn be32(data: bytes, at: i64) -> i64 {
+    data.at(at).shl(24).bit_or(data.at(at + 1).shl(16))
+        .bit_or(data.at(at + 2).shl(8)).bit_or(data.at(at + 3))
+}
+
+/// Parse a whole message.
+pub fn parse(data: bytes) -> DnsMessage ! DnsError {
+    if data.len() < 12 {
+        fail(Truncated(data.len()))
+    }
+    let id = be16(data, 0)
+    let flags = be16(data, 2)
+    let counts = [be16(data, 4), be16(data, 6), be16(data, 8), be16(data, 10)]
+    for c in counts {
+        if c > max_records() {
+            fail(TooManyRecords(c))
+        }
+    }
+
+    var at = 12
+    var questions: [Question] = []
+    for _i in 0..counts[0] {
+        let n = try read_name(data, at)
+        at = n.1
+        if at + 4 > data.len() {
+            fail(Truncated(at))
+        }
+        questions.push(Question{
+            name: n.0,
+            kind: type_of(be16(data, at)),
+            class_code: be16(data, at + 2),
+        })
+        at = at + 4
+    }
+
+    var answers: [Record] = []
+    var authority: [Record] = []
+    var additional: [Record] = []
+    for section in 1..4 {
+        for _i in 0..counts[section] {
+            let r = try read_record(data, at)
+            at = r.1
+            if section == 1 {
+                answers.push(r.0)
+            } else if section == 2 {
+                authority.push(r.0)
+            } else {
+                additional.push(r.0)
+            }
+        }
+    }
+
+    DnsMessage{
+        id: id,
+        is_response: flags.bit_and(32768) != 0,
+        opcode: flags.ushr(11).bit_and(15),
+        authoritative: flags.bit_and(1024) != 0,
+        truncated: flags.bit_and(512) != 0,
+        recursion_desired: flags.bit_and(256) != 0,
+        recursion_available: flags.bit_and(128) != 0,
+        response_code: flags.bit_and(15),
+        questions: questions,
+        answers: answers,
+        authority: authority,
+        additional: additional,
+    }
+}
+
+fn read_record(data: bytes, at: i64) -> (Record, i64) ! DnsError {
+    let n = try read_name(data, at)
+    var i = n.1
+    if i + 10 > data.len() {
+        fail(Truncated(i))
+    }
+    let kind = type_of(be16(data, i))
+    let class_code = be16(data, i + 2)
+    let ttl = be32(data, i + 4)
+    let length = be16(data, i + 8)
+    i = i + 10
+    if i + length > data.len() {
+        fail(Truncated(i))
+    }
+    let body = data.slice(i, length)
+    (Record{
+        name: n.0,
+        kind: kind,
+        class_code: class_code,
+        ttl: ttl,
+        data: body,
+        text: try render(data, kind, i, length),
+    }, i + length)
+}
+
+/// The record's contents, rendered the way `dig` prints them.
+///
+/// A name inside a record's data may itself be compressed, so those are read
+/// against the whole message rather than against the record's own bytes —
+/// which is why this takes the offset rather than the slice.
+fn render(data: bytes, kind: RecordType, at: i64, length: i64) -> str ! DnsError {
+    match kind {
+        A -> {
+            if length != 4 {
+                return ""
+            }
+            "{data.at(at)}.{data.at(at + 1)}.{data.at(at + 2)}.{data.at(at + 3)}"
+        }
+        AAAA -> {
+            if length != 16 {
+                return ""
+            }
+            // Written out in full, without the `::` run-compression `dig`
+            // uses. The same address either way; this form has one spelling
+            // per address, which is what a comparison wants.
+            var s = ""
+            for g in 0..8 {
+                if g > 0 {
+                    s = s + ":"
+                }
+                s = s + hex4(be16(data, at + g * 2))
+            }
+            s
+        }
+        CNAME -> {
+            let n = try read_name(data, at)
+            n.0
+        }
+        NS -> {
+            let n = try read_name(data, at)
+            n.0
+        }
+        PTR -> {
+            let n = try read_name(data, at)
+            n.0
+        }
+        MX -> {
+            if length < 3 {
+                return ""
+            }
+            let n = try read_name(data, at + 2)
+            "{be16(data, at)} {n.0}"
+        }
+        TXT -> {
+            // A TXT record is a sequence of length-prefixed strings, not one
+            // string. Reading it as one is a classic mistake that works until
+            // a record is longer than 255 bytes.
+            var s = ""
+            var i = at
+            while i < at + length {
+                let n = data.at(i)
+                if i + 1 + n > at + length {
+                    return s
+                }
+                s = s + data.slice(i + 1, n).to_str()
+                i = i + 1 + n
+            }
+            s
+        }
+        _other -> ""
+    }
+}
+
+fn hex4(v: i64) -> str {
+    let digits = "0123456789abcdef"
+    var s = ""
+    for i in 0..4 {
+        s = s + digits.substr(v.ushr((3 - i) * 4).bit_and(15), 1)
+    }
+    s
+}
+
+/// Build a query.
+pub fn query(id: i64, name: str, kind: RecordType) -> bytes {
+    var out: [i64] = []
+    out.push(id.ushr(8).bit_and(255))
+    out.push(id.bit_and(255))
+    // Recursion desired, and nothing else.
+    out.push(1)
+    out.push(0)
+    out.push(0)
+    out.push(1)
+    for _i in 0..6 {
+        out.push(0)
+    }
+    write_name(out, name)
+    let code = type_code(kind)
+    out.push(code.ushr(8).bit_and(255))
+    out.push(code.bit_and(255))
+    out.push(0)
+    out.push(1)
+    bytes_of(out)
+}
+
+pub fn answers_of(m: DnsMessage) -> [Record] { m.answers }
+pub fn questions_of(m: DnsMessage) -> [Question] { m.questions }
+pub fn id_of(m: DnsMessage) -> i64 { m.id }
+pub fn response_code(m: DnsMessage) -> i64 { m.response_code }
