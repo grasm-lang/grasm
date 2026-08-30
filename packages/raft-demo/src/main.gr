@@ -19,7 +19,7 @@ fn say(inout f: i64, name: str, held: bool) / {io} {
 
 /// A cluster, and which nodes can currently hear each other.
 type Cluster = {
-    nodes: [Node],
+    nodes: [RaftNode],
     reachable: [bool],
     now: i64,
     delivered: i64,
@@ -27,7 +27,7 @@ type Cluster = {
 }
 
 fn new_cluster(size: i64) -> Cluster {
-    var nodes: [Node] = []
+    var nodes: [RaftNode] = []
     var reachable: [bool] = []
     for i in 0..size {
         var peers: [i64] = []
@@ -56,10 +56,17 @@ fn run_for(inout c: Cluster, steps: i64) {
         var pending: [Message] = []
         var senders: [i64] = []
         for i in 0..c.nodes.len() {
-            for m in raft.tick(c.nodes[i], c.now, timeout_of(i), 30) {
+            // Copied into a plain variable and written back, rather than
+            // passing `c.nodes[i]` directly. The native backend refuses an
+            // `inout` argument that is not a plain variable and says so; the
+            // interpreter accepts it. Writing it this way keeps the demo
+            // running on every engine, which is worth more than the brevity.
+            var node = c.nodes[i]
+            for m in raft.tick(node, c.now, timeout_of(i), 30) {
                 pending.push(m)
                 senders.push(i)
             }
+            c.nodes[i] = node
         }
         var rounds = 0
         while pending.len() > 0 and rounds < 20 {
@@ -72,19 +79,23 @@ fn run_for(inout c: Cluster, steps: i64) {
                 let to = raft.message_to(m)
                 if to >= 0 {
                     if deliver(c, from, to, m) {
-                        for r in raft.receive(c.nodes[to], m, c.now, timeout_of(to)) {
+                        var node = c.nodes[to]
+                        for r in raft.receive(node, m, c.now, timeout_of(to)) {
                             next.push(r)
                             next_senders.push(to)
                         }
+                        c.nodes[to] = node
                     }
                 } else {
                     // A broadcast: everyone the sender can reach.
                     for j in 0..c.nodes.len() {
                         if j != from and deliver(c, from, j, m) {
-                            for r in raft.receive(c.nodes[j], m, c.now, timeout_of(j)) {
+                            var node = c.nodes[j]
+                            for r in raft.receive(node, m, c.now, timeout_of(j)) {
                                 next.push(r)
                                 next_senders.push(j)
                             }
+                            c.nodes[j] = node
                         }
                     }
                 }

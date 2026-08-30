@@ -34,7 +34,9 @@ type LogEntry = {
     command: str,
 }
 
-type Node = {
+// Named `RaftNode` rather than `Node`, because types share one namespace
+// across a program ([T-MODULE-NS]) and `xml` declares a `Node` of its own.
+type RaftNode = {
     id: i64,
     peers: [i64],
     role: Role,
@@ -64,13 +66,13 @@ type Message =
 pub fn no_vote() -> i64 { 0 - 1 }
 
 /// A follower with an empty log.
-pub fn new_node(id: i64, peers: [i64], now: i64, election_timeout: i64) -> Node {
+pub fn new_node(id: i64, peers: [i64], now: i64, election_timeout: i64) -> RaftNode {
     var log: [LogEntry] = []
     var votes: [i64] = []
     var next: [i64] = []
     var matched: [i64] = []
     var applied: [str] = []
-    Node{
+    RaftNode{
         id: id,
         peers: peers,
         role: Follower,
@@ -88,15 +90,15 @@ pub fn new_node(id: i64, peers: [i64], now: i64, election_timeout: i64) -> Node 
     }
 }
 
-fn majority(n: Node) -> i64 {
+fn majority(n: RaftNode) -> i64 {
     (n.peers.len() + 1) / 2 + 1
 }
 
-fn last_index(n: Node) -> i64 {
+fn last_index(n: RaftNode) -> i64 {
     n.log.len() - 1
 }
 
-fn last_term(n: Node) -> i64 {
+fn last_term(n: RaftNode) -> i64 {
     if n.log.len() == 0 {
         0
     } else {
@@ -108,7 +110,7 @@ fn last_term(n: Node) -> i64 {
 ///
 /// Every path that sees a higher term goes through here. A node that updated
 /// its term without clearing its vote could vote twice in one term.
-fn step_down(inout n: Node, term: i64) {
+fn step_down(inout n: RaftNode, term: i64) {
     n.current_term = term
     n.role = Follower
     n.voted_for = no_vote()
@@ -117,7 +119,7 @@ fn step_down(inout n: Node, term: i64) {
 }
 
 /// Time passing. Answers whatever the node wants to send.
-pub fn tick(inout n: Node, now: i64, election_timeout: i64,
+pub fn tick(inout n: RaftNode, now: i64, election_timeout: i64,
             heartbeat_interval: i64) -> [Message] {
     var out: [Message] = []
     match n.role {
@@ -157,7 +159,7 @@ pub fn tick(inout n: Node, now: i64, election_timeout: i64,
     out
 }
 
-fn become_leader(inout n: Node, now: i64) {
+fn become_leader(inout n: RaftNode, now: i64) {
     n.role = Leader
     var next: [i64] = []
     var matched: [i64] = []
@@ -170,7 +172,7 @@ fn become_leader(inout n: Node, now: i64) {
     n.heartbeat_due = now
 }
 
-fn peer_slot(n: Node, peer: i64) -> i64 {
+fn peer_slot(n: RaftNode, peer: i64) -> i64 {
     for i in 0..n.peers.len() {
         if n.peers[i] == peer {
             return i
@@ -179,7 +181,7 @@ fn peer_slot(n: Node, peer: i64) -> i64 {
     0 - 1
 }
 
-fn append_for(n: Node, peer: i64) -> Message {
+fn append_for(n: RaftNode, peer: i64) -> Message {
     let slot = peer_slot(n, peer)
     let next = if slot >= 0 { n.next_index[slot] } else { n.log.len() }
     let prev = next - 1
@@ -194,7 +196,7 @@ fn append_for(n: Node, peer: i64) -> Message {
 }
 
 /// Handle one message. Answers whatever should be sent in reply.
-pub fn receive(inout n: Node, m: Message, now: i64, election_timeout: i64) -> [Message] {
+pub fn receive(inout n: RaftNode, m: Message, now: i64, election_timeout: i64) -> [Message] {
     var out: [Message] = []
     match m {
         RequestVote(term, from, their_last_index, their_last_term) -> {
@@ -329,7 +331,7 @@ pub fn receive(inout n: Node, m: Message, now: i64, election_timeout: i64) -> [M
 /// a leader that counted an older entry could conclude it was safe, be
 /// replaced by a node without it, and have it overwritten — after telling a
 /// client it was committed.
-fn advance_commit(inout n: Node) {
+fn advance_commit(inout n: RaftNode) {
     var candidate = last_index(n)
     while candidate > n.commit_index {
         if n.log[candidate].term == n.current_term {
@@ -349,7 +351,7 @@ fn advance_commit(inout n: Node) {
     }
 }
 
-fn apply_committed(inout n: Node) {
+fn apply_committed(inout n: RaftNode) {
     while n.last_applied < n.commit_index {
         n.last_applied = n.last_applied + 1
         n.applied.push(n.log[n.last_applied].command)
@@ -357,7 +359,7 @@ fn apply_committed(inout n: Node) {
 }
 
 /// Ask a leader to append a command. Answers false if this node is not one.
-pub fn propose(inout n: Node, command: str) -> bool {
+pub fn propose(inout n: RaftNode, command: str) -> bool {
     match n.role {
         Leader -> {
             n.log.push(LogEntry{ term: n.current_term, command: command })
@@ -370,17 +372,17 @@ pub fn propose(inout n: Node, command: str) -> bool {
     }
 }
 
-pub fn is_leader(n: Node) -> bool {
+pub fn is_leader(n: RaftNode) -> bool {
     match n.role {
         Leader -> true
         _other -> false
     }
 }
 
-pub fn term_of(n: Node) -> i64 { n.current_term }
-pub fn commit_index_of(n: Node) -> i64 { n.commit_index }
-pub fn applied_commands(n: Node) -> [str] { n.applied }
-pub fn log_length(n: Node) -> i64 { n.log.len() }
+pub fn term_of(n: RaftNode) -> i64 { n.current_term }
+pub fn commit_index_of(n: RaftNode) -> i64 { n.commit_index }
+pub fn applied_commands(n: RaftNode) -> [str] { n.applied }
+pub fn log_length(n: RaftNode) -> i64 { n.log.len() }
 
 pub fn message_to(m: Message) -> i64 {
     match m {
