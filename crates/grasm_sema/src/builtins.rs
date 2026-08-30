@@ -123,6 +123,7 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin { name: "udp_bind", row: NET_ROW, journal: Journal::Recorded },
     Builtin { name: "udp_send", row: NET_ROW, journal: Journal::Recorded },
     Builtin { name: "udp_recv", row: NET_ROW, journal: Journal::Recorded },
+    Builtin { name: "udp_recv_from", row: NET_ROW, journal: Journal::Recorded },
     // --- other programs ---
     Builtin { name: "proc_run", row: PROC_ROW, journal: Journal::Recorded },
     Builtin { name: "proc_pipeline", row: PROC_ROW, journal: Journal::Recorded },

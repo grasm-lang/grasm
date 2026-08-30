@@ -282,6 +282,7 @@ pub const BUILTIN_FREE_FNS: &[&str] = &[
     "udp_bind",
     "udp_send",
     "udp_recv",
+    "udp_recv_from",
     "proc_run",
     "proc_pipeline",
     "read_file",
@@ -4618,6 +4619,28 @@ only a number or a `bool` can come out — compute what you need and yield that"
                             args: vec![],
                         };
                         return Type::Fallible(Box::new(gives), Box::new(io_err));
+                    }
+                    // A datagram and where it came from. The reply address is
+                    // not decoration: `udp_send` names a destination on every
+                    // call precisely because a datagram socket has no fixed
+                    // peer, so a receiver that could not learn the sender's
+                    // address could answer nobody it had not been told about
+                    // in advance. Like `proc_run` this is a tuple — three
+                    // values with obvious positions, and inventing a struct
+                    // for them would put a type in the prelude that nothing
+                    // else uses ([L-LIB-UDP]).
+                    "udp_recv_from" => {
+                        if args.len() != 1 {
+                            return self.error(span, "udp_recv_from takes exactly 1 argument");
+                        }
+                        self.check_expr(&args[0], &Type::I64);
+                        let io_err = Type::Named {
+                            id: self.defs.io_error_id,
+                            args: vec![],
+                        };
+                        let triple =
+                            Type::Tuple(vec![Type::Bytes, Type::Str, Type::I64]);
+                        return Type::Fallible(Box::new(triple), Box::new(io_err));
                     }
                     // Running another program. The result is a tuple rather
                     // than a new struct type: three values with obvious

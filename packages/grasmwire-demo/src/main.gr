@@ -60,6 +60,19 @@ fn main() / {io} {
         not grasmwire.replay_accept(j, 10))
     say(failures, "and the new one is not re-accepted", not grasmwire.replay_accept(j, 100000))
 
+    // The word boundary. A jump of exactly 64 shifts by whole words and no
+    // bits, which is the case where a shift of `64 - bits` would be a shift by
+    // 64 — undefined on a 64-bit word, and guarded against here.
+    for jump in [63, 64, 65, 127, 128] {
+        var b = grasmwire.replay_new()
+        let _first = grasmwire.replay_accept(b, 0)
+        let _second = grasmwire.replay_accept(b, jump)
+        say(failures, "a jump of {jump} keeps the counter it jumped from",
+            not grasmwire.replay_accept(b, 0))
+        say(failures, "a jump of {jump} still accepts what it skipped",
+            grasmwire.replay_accept(b, jump - 1))
+    }
+
     // Out-of-order delivery of a whole burst, then every one of them replayed.
     var burst = grasmwire.replay_new()
     var accepted = 0
@@ -206,6 +219,12 @@ fn main() / {io} {
     say(failures, "anything beats nothing", grasmwire.later_than(t1, bytes_of([])))
     say(failures, "a whole second later still compares later",
         grasmwire.later_than(grasmwire.stamp(2000), t1))
+    // A peer chooses what arrives. A shorter or longer timestamp must be
+    // refused rather than read past the end of.
+    say(failures, "a timestamp of the wrong width is not later",
+        not grasmwire.later_than(unhex("0102"), t1))
+    say(failures, "and a long one is not either",
+        not grasmwire.later_than(unhex("0102030405060708090a0b0c0d0e"), t1))
 
     print("-- IP length, which is what makes the padding free")
     say(failures, "an IPv4 header declares its length", grasmwire.ip_length(packet) ?? 0 == 40)

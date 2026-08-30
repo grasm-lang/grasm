@@ -506,9 +506,22 @@ pub fn stamp(now_ms: i64) -> bytes {
 
 /// Whether one timestamp is strictly later than another. Big-endian, so the
 /// comparison is the byte order — which is why `stamp` writes it that way.
+///
+/// Both arguments here always have the same width, because `consume_initiation`
+/// takes exactly twelve bytes out of a message whose length was checked. The
+/// length is compared anyway: this is a public function, one of its arguments
+/// comes off the wire, and reading past the end of the shorter one would be a
+/// panic reachable by a peer. A protocol function that trusts its caller about
+/// a length is the shape of the bug, whoever the caller happens to be today.
 pub fn later_than(a: bytes, b: bytes) -> bool {
     if b.len() == 0 {
         return true
+    }
+    if a.len() != b.len() {
+        // Not comparable, so not later. Refusing is the safe direction: a
+        // timestamp that cannot be shown to be newer must not be treated as
+        // one, or the replay check it exists for is gone.
+        return false
     }
     for i in 0..a.len() {
         if a.at(i) != b.at(i) {

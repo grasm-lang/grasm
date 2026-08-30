@@ -1,0 +1,30 @@
+[package]
+name = "cryptodiff"
+version = "0.1.0"
+
+# Reads the case file it is given. Nothing else.
+capabilities = ["io"]
+
+[dependencies.blake2s]
+path = "../blake2s"
+version = "^1.0.0"
+
+[dependencies.x25519]
+path = "../x25519"
+version = "^1.0.0"
+
+[dependencies.chachapoly]
+path = "../chachapoly"
+version = "^1.0.0"
+
+[dependencies.bytes_codec]
+path = "../bytes"
+version = "^1.0.0"
+
+[dependencies.noise]
+path = "../noise"
+version = "^1.0.0"
+
+[dependencies.grasmwire]
+path = "../grasmwire"
+version = "^1.0.0"

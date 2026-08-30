@@ -994,7 +994,27 @@ impl<'a, W: Write> Interp<'a, W> {
                     Err(e) => fail(e.to_string()),
                 }
             }
-            ("udp_recv", _) => fail(format!("socket {h} is not a datagram socket")),
+            // The same receive, keeping the address instead of dropping it.
+            // A responder cannot reply to a peer it cannot name, and a peer
+            // that moves between networks is the ordinary case rather than
+            // the exotic one.
+            ("udp_recv_from", NetSocket::Datagram(d)) => {
+                let mut buf = vec![0u8; 65536];
+                match d.recv_from(&mut buf) {
+                    Ok((n, from)) => {
+                        buf.truncate(n);
+                        Value::Ok(Rc::new(Value::Tuple(Rc::new(vec![
+                            Value::Bytes(Rc::new(buf)),
+                            Value::str(from.ip().to_string()),
+                            Value::Int(i64::from(from.port())),
+                        ]))))
+                    }
+                    Err(e) => fail(e.to_string()),
+                }
+            }
+            ("udp_recv" | "udp_recv_from", _) => {
+                fail(format!("socket {h} is not a datagram socket"))
+            }
             ("tcp_read" | "tcp_read_bytes", NetSocket::Datagram(_)) => fail(format!(
                 "socket {h} is a datagram socket — use udp_recv, which keeps message boundaries"
             )),
@@ -2782,7 +2802,8 @@ uses to mark the end of a string"
                     }
                     "tcp_listen" | "tcp_connect" | "tcp_accept" | "tcp_read"
                     | "tcp_read_bytes" | "tcp_write" | "tcp_write_bytes"
-                    | "net_close" | "net_port" | "udp_bind" | "udp_recv" => {
+                    | "net_close" | "net_port" | "udp_bind" | "udp_recv"
+                    | "udp_recv_from" => {
                         let h = self.eval_expr(&args[0])?;
                         let extra = if id.name == "tcp_write" || id.name == "tcp_connect" {
                             Some(self.eval_expr(&args[1])?.to_string())

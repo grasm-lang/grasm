@@ -7,6 +7,54 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
 
 ### Added
 
+- **GrasmWire**, a VPN protocol written entirely in Grasm. 2,580 lines from
+  the field arithmetic up, against a budget of five thousand:
+  `packages/x25519`, `chacha20`, `poly1305`, `chachapoly`, `blake2s`, `hkdf`,
+  `noise` and `grasmwire`, with `apps/grasmwire` as the endpoint. Nothing
+  underneath but the compiler — no C, no `.rs` in the protocol, nothing
+  shelling out.
+
+  Every primitive that has published vectors is checked against them: RFC 8439
+  for the cipher, the authenticator and the AEAD, RFC 7693 for the hash, RFC
+  7748 for the curve — both scalar multiplications and the whole §6.1 exchange
+  — and all three RFC 5869 cases for the key schedule. The handshake has no
+  published vectors, because the construction is Noise_IKpsk2 and the
+  identifier string is this protocol's own, so it is checked as nineteen
+  properties plus three pinned values. The protocol layer is forty-five more.
+
+  **Every package below the endpoint declares no capabilities at all.** The
+  curve, the hash, the AEAD, the handshake and the protocol cannot open a
+  socket or read a clock, and `grasm deps` says so. A handshake needs
+  randomness and a clock but not the *capability* to reach either: both arrive
+  as arguments. That is also what makes three minutes of session lifetime
+  testable in no time at all, and what let the handshake be pinned.
+
+  It is **not wire-compatible with WireGuard** and the reason is one line — a
+  different identifier string. Claiming compatibility would mean testing
+  against a peer this project does not have. `docs/grasmwire.md` has the rest,
+  including the one piece that is missing and why it is not being added blind.
+
+- `udp_recv_from(h) -> (bytes, str, i64) ! IoError`, in all three engines. A
+  datagram socket has no fixed peer, so `udp_recv` dropping the sender's
+  address meant a receiver could only answer peers it was configured with in
+  advance — which rules out roaming, one of the things a VPN is *for*. Found
+  by writing one. `agreetest` holds the three engines to one answer, and
+  `udp_recv` stays for callers that already know where to reply.
+
+- `scripts/grasmwire_e2e.sh`, the thirty-first gate. Two real processes over
+  real UDP with fresh ephemeral keys: both derive the same session hash without
+  either sending it, three IP packets go through the tunnel and come back
+  unchanged, a recorded first message is refused on its timestamp, a valid
+  handshake from an unlisted key is refused, and two runs never produce the
+  same session.
+
+### Changed
+
+- `[L-LIB-ARGS]`: `args()` was described as "arguments after `--`", which is
+  true under `grasm run` and not true of a compiled binary, where there is no
+  separator to strip. The behaviour was already right and already checked by
+  `agreetest` in all three modes; only the one-line summary was wrong.
+
 - `packages/http` and `packages/http_server`: the first two libraries of a
   first release. `http` parses requests, renders responses and routes with
   `:param` and `*` segments, and **declares no capability** — it cannot open

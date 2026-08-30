@@ -1,0 +1,26 @@
+[package]
+name = "grasmwire_peer"
+version = "0.1.0"
+entry = "src/main.gr"
+
+# A VPN endpoint reaches the network and the clock, and nothing else. Every
+# library under it declares nothing at all — the curve, the hash, the AEAD, the
+# handshake and the protocol are arithmetic over bytes, and `grasm deps` says
+# so. What can touch the outside is this file.
+capabilities = ["io", "net"]
+
+[dependencies.grasmwire]
+path = "../../packages/grasmwire"
+version = "^1.0.0"
+
+[dependencies.noise]
+path = "../../packages/noise"
+version = "^1.0.0"
+
+[dependencies.x25519]
+path = "../../packages/x25519"
+version = "^1.0.0"
+
+[dependencies.bytes_codec]
+path = "../../packages/bytes"
+version = "^1.0.0"

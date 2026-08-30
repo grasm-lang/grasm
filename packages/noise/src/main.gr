@@ -13,6 +13,15 @@
 // arithmetic, the AEAD, the hash, the key schedule and this file. There is no
 // C underneath and nothing shells out.
 //
+// **It is WireGuard's variant of Noise_IKpsk2, not literal Noise**, and the
+// difference is one step worth naming rather than glossing. In the Noise
+// specification the `e` token calls `MixHash` on the ephemeral public key and
+// nothing else; the chaining key moves only on a Diffie-Hellman token. Here,
+// as in WireGuard, each ephemeral is *also* mixed into the chaining key. Both
+// sides do it, so the handshake is self-consistent, and this file says which
+// of the two it is because a reader checking it against a specification needs
+// to know which specification.
+//
 // **This is not wire-compatible with WireGuard**, and the reason is one line
 // of this file: `IDENTIFIER` differs, so the initial hash differs, so every
 // byte after it differs. That is a deliberate choice — claiming compatibility

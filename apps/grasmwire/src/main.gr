@@ -1,0 +1,370 @@
+// A GrasmWire endpoint. Real UDP, real keys, real timers.
+//
+// Everything below this file is arithmetic over bytes and declares no
+// capability at all. This is the layer that touches the outside, and it is
+// deliberately thin: bind a socket, wait for either a datagram or a deadline,
+// hand what arrives to the protocol, send what the protocol produces.
+//
+// Run two of these against each other:
+//
+//     grasm run apps/grasmwire/src/main.gr -- listen  51821 51820 <priv> <pub> <psk>
+//     grasm run apps/grasmwire/src/main.gr -- connect 51820 51821 <priv> <pub> <psk>
+//
+// The responder is told a port only as a fallback. It learns where its peer
+// actually is from the datagram, with `udp_recv_from`, and follows it if it
+// moves — which is what lets a peer on a phone keep a session alive across a
+// change of network. That builtin did not exist when this file was first
+// written; `udp_recv` answered the datagram and dropped the address, so a
+// responder could only answer peers it had been configured with. Writing this
+// is what found that, and it is now `[L-LIB-UDP]`.
+
+import grasmwire
+import noise
+import x25519
+import bytes_codec
+
+fn unhex(s: str) -> bytes {
+    match bytes_codec.decode_hex(s) {
+        Some(b) -> b
+        None -> panic("not a hex key: {s}")
+    }
+}
+
+fn hex(b: bytes) -> str {
+    bytes_codec.encode_hex(b)
+}
+
+/// Sixteen bytes of the key, which is enough to tell peers apart in a log and
+/// not enough to be a key in one.
+fn short(b: bytes) -> str {
+    var out: [i64] = []
+    for i in 0..8 {
+        out.push(b.at(i))
+    }
+    bytes_codec.encode_hex(bytes_of(out))
+}
+
+fn main() / {io, net} {
+    let argv = args()
+    if argv.len() < 6 {
+        print("usage: grasmwire <listen|connect> <local-port> <peer-port> <private> <peer-public> <psk>")
+        return
+    }
+    let mode = argv[0]
+    let local_port = to_int(argv[1])
+    let peer_port = to_int(argv[2])
+    let private = x25519.clamp(unhex(argv[3]))
+    let peer_public = unhex(argv[4])
+    let psk = unhex(argv[5])
+    let public = x25519.public_key(private)
+
+    print("[{mode}] this peer is {short(public)}, talking to {short(peer_public)} on port {peer_port}")
+
+    let socket = match udp_bind(local_port) {
+        Ok(h) -> h
+        Err(e) -> {
+            print("[{mode}] cannot bind port {local_port}: {e}")
+            return
+        }
+    }
+
+    if mode == "connect" {
+        run_initiator(socket, private, public, peer_public, psk, peer_port)
+    } else {
+        run_responder(socket, private, public, peer_public, psk, peer_port)
+    }
+    net_close(socket)
+}
+
+fn to_int(s: str) -> i64 {
+    var n = 0
+    for ch in s.chars() {
+        n = n * 10 + (ch.to_bytes().at(0) - 48)
+    }
+    n
+}
+
+/// One ephemeral key, from the operating system.
+///
+/// This is the only randomness the whole protocol needs, and it is generated
+/// here rather than in the library — which is why every package below this
+/// file declares no capabilities and why the handshake could be pinned to a
+/// fixed transcript in its own test.
+fn ephemeral() -> bytes / {io} {
+    match random_bytes(32) {
+        Ok(b) -> x25519.clamp(b)
+        Err(_e) -> panic("the operating system would not give us randomness")
+    }
+}
+
+/// The side that speaks first.
+fn run_initiator(socket: i64, private: bytes, public: bytes, peer_public: bytes,
+                 psk: bytes, peer_port: i64) / {io, net} {
+    let started_ms = now_millis()
+    let init: Initiation ! HandshakeError = noise.initiate(private, public, peer_public,
+        ephemeral(), grasmwire.stamp(started_ms), 1)
+
+    let handshake = match init {
+        Ok(i) -> i
+        Err(_e) -> {
+            print("[connect] could not build a first message")
+            return
+        }
+    }
+    match udp_send(socket, "127.0.0.1", peer_port, handshake.message) {
+        Ok(n) -> print("[connect] sent a {n}-byte first message")
+        Err(e) -> {
+            print("[connect] send failed: {e}")
+            return
+        }
+    }
+
+    // Wait for the reply, but not forever. A handshake that gets no answer is
+    // retried by `next_action`; here the deadline just stops the demo hanging.
+    let ready = match net_wait([socket], grasmwire.rekey_attempt_ms()) {
+        Ok(hs) -> hs
+        Err(_e) -> []
+    }
+    if ready.len() == 0 {
+        print("[connect] no reply within {grasmwire.rekey_attempt_ms()}ms")
+        return
+    }
+    let reply = match udp_recv(socket) {
+        Ok(b) -> b
+        Err(e) -> {
+            print("[connect] receive failed: {e}")
+            return
+        }
+    }
+    print("[connect] got a {reply.len()}-byte reply")
+
+    let finished = match noise.consume_response(handshake.state, reply, psk) {
+        Ok(st) -> st
+        Err(_e) -> {
+            print("[connect] the reply did not authenticate")
+            return
+        }
+    }
+    let keys = noise.split(finished, true)
+    print("[connect] handshake complete, session hash {hex(noise.transcript(finished))}")
+
+    var session = grasmwire.session_of(keys, 1, 2, now_millis(), true)
+
+    // Three packets through the tunnel, each echoed back. What is checked is
+    // that what comes home is what went out — end to end, through a real
+    // socket, under keys neither side sent.
+    var sent_count = 0
+    var returned_count = 0
+    for i in 0..3 {
+        let payload = sample_packet(i)
+        match grasmwire.seal_data(session, payload) {
+            Ok(datagram) -> {
+                match udp_send(socket, "127.0.0.1", peer_port, datagram) {
+                    Ok(_n) -> {
+                        sent_count = sent_count + 1
+                        print("[connect] sent packet {i}: {payload.len()} bytes became {datagram.len()} on the wire")
+                    }
+                    Err(_e) -> print("[connect] packet {i} could not be sent")
+                }
+                let back = match net_wait([socket], 5000) {
+                    Ok(hs) -> hs
+                    Err(_e) -> []
+                }
+                if back.len() > 0 {
+                    match udp_recv(socket) {
+                        Ok(echo) -> {
+                            match grasmwire.open_data(session, echo, now_millis()) {
+                                Ok(opened) -> {
+                                    let plain = grasmwire.unpad(opened)
+                                    if hex(plain) == hex(payload) {
+                                        returned_count = returned_count + 1
+                                        print("[connect] packet {i} came back byte for byte")
+                                    } else {
+                                        print("[connect] packet {i} came back changed")
+                                    }
+                                }
+                                Err(_e) -> print("[connect] packet {i}'s echo did not authenticate")
+                            }
+                        }
+                        Err(_e) -> print("[connect] packet {i}'s echo could not be read")
+                    }
+                }
+            }
+            Err(_e) -> print("[connect] packet {i} could not be sealed")
+        }
+    }
+
+    // Replay the first message, exactly as it was sent. A network observer
+    // could have recorded it; the far side must refuse it on its timestamp
+    // even though every signature and tag in it is genuine.
+    match udp_send(socket, "127.0.0.1", peer_port, handshake.message) {
+        Ok(_n) -> print("[connect] replayed the original first message, which should be refused")
+        Err(_e) -> print("[connect] could not replay")
+    }
+
+    print("[connect] {sent_count} sent, {returned_count} returned intact")
+    if returned_count == 3 {
+        print("[connect] TUNNEL OK")
+    }
+}
+
+/// The side that waits, and never speaks to anyone it cannot already name.
+fn run_responder(socket: i64, private: bytes, public: bytes, peer_public: bytes,
+                 psk: bytes, peer_port: i64) / {io, net} {
+    let ready = match net_wait([socket], grasmwire.rekey_attempt_ms()) {
+        Ok(hs) -> hs
+        Err(_e) -> []
+    }
+    if ready.len() == 0 {
+        print("[listen] nobody called")
+        return
+    }
+
+    // Where the peer is, learned rather than configured. `peer_port` is only
+    // the fallback for the case where nothing has been heard yet.
+    var host = "127.0.0.1"
+    var port = peer_port
+
+    let first = match udp_recv_from(socket) {
+        Ok(got) -> {
+            host = got.1
+            port = got.2
+            got.0
+        }
+        Err(e) -> {
+            print("[listen] receive failed: {e}")
+            return
+        }
+    }
+    print("[listen] got a {first.len()}-byte first message from {host}:{port}")
+
+    let incoming = match noise.consume_initiation(private, public, first) {
+        Ok(i) -> i
+        Err(_e) -> {
+            // Silence. A responder that answered a bad packet would confirm
+            // it is there, and would be a way to send traffic to a third
+            // party by writing their address on a datagram.
+            print("[listen] refused, and said nothing to the sender")
+            return
+        }
+    }
+
+    // The initiator proved it holds the private half of a key. Whether that
+    // key is *allowed* is a separate question and this is where it is asked.
+    if hex(incoming.initiator_static) != hex(peer_public) {
+        print("[listen] a valid handshake from an unknown key {short(incoming.initiator_static)}, refused")
+        return
+    }
+    print("[listen] the caller is {short(incoming.initiator_static)}, which is on the list")
+
+    let reply = match noise.respond(incoming, ephemeral(), psk, 2) {
+        Ok(r) -> r
+        Err(_e) -> {
+            print("[listen] could not build a reply")
+            return
+        }
+    }
+    match udp_send(socket, host, port, reply.message) {
+        Ok(n) -> print("[listen] sent a {n}-byte reply to {host}:{port}")
+        Err(e) -> {
+            print("[listen] reply failed: {e}")
+            return
+        }
+    }
+    let keys = noise.split(reply.state, false)
+    print("[listen] handshake complete, session hash {hex(noise.transcript(reply.state))}")
+
+    var session = grasmwire.session_of(keys, 2, incoming.sender_index, now_millis(), false)
+
+    // The greatest timestamp seen from this peer. A recorded first message
+    // replayed later carries the *old* timestamp, so refusing anything that is
+    // not strictly greater refuses the recording — and does it without keeping
+    // a list of everything ever seen, which is the property that makes this
+    // cheap enough to do for every peer.
+    var newest = incoming.timestamp
+
+    var echoed = 0
+    var replays_refused = 0
+    var moves = 0
+    for _i in 0..4 {
+        let waiting = match net_wait([socket], 10000) {
+            Ok(hs) -> hs
+            Err(_e) -> []
+        }
+        if waiting.len() == 0 {
+            print("[listen] nothing more arrived")
+            return
+        }
+        var datagram = bytes_of([])
+        match udp_recv_from(socket) {
+            Ok(got) -> {
+                datagram = got.0
+                // Roaming. The endpoint moves only when a packet that
+                // *authenticates* came from somewhere else — following an
+                // unauthenticated packet would let anyone redirect a session
+                // by spoofing one datagram.
+                if got.1 != host or got.2 != port {
+                    print("[listen] the peer appears to have moved to {got.1}:{got.2}")
+                    moves = moves + 1
+                }
+            }
+            Err(_e) -> {
+                print("[listen] a datagram could not be read")
+                return
+            }
+        }
+        let from_host = host
+        let from_port = port
+
+        if datagram.len() > 0 and datagram.at(0) == grasmwire.type_initiation() {
+            // Another handshake. It may be a genuine rekey or a recording.
+            match noise.consume_initiation(private, public, datagram) {
+                Ok(again) -> {
+                    if grasmwire.later_than(again.timestamp, newest) {
+                        newest = again.timestamp
+                        print("[listen] a newer handshake, accepted")
+                    } else {
+                        replays_refused = replays_refused + 1
+                        print("[listen] a replayed handshake, refused on its timestamp")
+                    }
+                }
+                Err(_e) -> print("[listen] a handshake that did not authenticate, dropped")
+            }
+        } else {
+            match grasmwire.open_data(session, datagram, now_millis()) {
+                Ok(opened) -> {
+                    let plain = grasmwire.unpad(opened)
+                    if grasmwire.is_keepalive(plain) {
+                        print("[listen] a keepalive")
+                    } else {
+                        print("[listen] {plain.len()} bytes out of the tunnel, sending them back")
+                        match grasmwire.seal_data(session, plain) {
+                            Ok(back) -> {
+                                match udp_send(socket, from_host, from_port, back) {
+                                    Ok(_n) -> echoed = echoed + 1
+                                    Err(_e) -> print("[listen] the echo could not be sent")
+                                }
+                            }
+                            Err(_e) -> print("[listen] the echo could not be sealed")
+                        }
+                    }
+                }
+                Err(_e) -> print("[listen] a datagram did not authenticate, dropped in silence")
+            }
+        }
+    }
+    print("[listen] echoed {echoed}, refused {replays_refused} replayed handshake(s), {moves} endpoint change(s)")
+    if echoed == 3 and replays_refused == 1 {
+        print("[listen] TUNNEL OK")
+    }
+}
+
+/// An IPv4 packet that declares its own length, which is what the padding
+/// relies on and what a real tunnel would be carrying.
+fn sample_packet(n: i64) -> bytes {
+    var head = [69, 0, 0, 40, 0, n, 0, 0, 64, 6, 0, 0, 192, 168, 0, 1, 192, 168, 0, 2]
+    for i in 0..20 {
+        head.push((n * 20 + i).bit_and(255))
+    }
+    bytes_of(head)
+}

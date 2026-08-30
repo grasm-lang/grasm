@@ -47,6 +47,7 @@ prog() {
     udp_bind)       echo 'match udp_bind(0) { Ok(h) -> print("y") Err(e) -> print("n") }' ;;
     udp_send)       echo 'match udp_send(0, "127.0.0.1", 9, bytes_of([1])) { Ok(n) -> print("y") Err(e) -> print("n") }' ;;
     udp_recv)       echo 'match udp_recv(0) { Ok(m) -> print("y") Err(e) -> print("n") }' ;;
+    udp_recv_from)  echo 'match udp_recv_from(0) { Ok(m) -> print("y") Err(e) -> print("n") }' ;;
     proc_run)       echo 'match proc_run("echo", ["x"]) { Ok(r) -> print("y") Err(e) -> print("n") }' ;;
     proc_pipeline)  echo 'match proc_pipeline([("echo", ["x"])], "") { Ok(r) -> print("y") Err(e) -> print("n") }' ;;
     *) return 1 ;;

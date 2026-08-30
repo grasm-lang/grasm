@@ -5906,6 +5906,51 @@ unsafe fn grasm_udp_recv_now(handle: *mut RtVal) -> *mut RtVal {
     }
 }
 
+/// One datagram, and the address it came from.
+///
+/// `udp_recv` already asked the operating system for both and threw the second
+/// away. A datagram socket has no fixed peer — that is what distinguishes it
+/// from a stream — so a receiver that cannot learn the sender's address can
+/// only answer peers it was configured with in advance, which rules out every
+/// protocol where a client's address is not known until it calls.
+///
+/// # Safety: called from compiled Grasm with a boxed value.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_udp_recv_from(handle: *mut RtVal) -> *mut RtVal {
+    journaled("udp_recv_from", || grasm_udp_recv_from_now(handle))
+}
+
+unsafe fn grasm_udp_recv_from_now(handle: *mut RtVal) -> *mut RtVal {
+    let h = match &(*handle).payload {
+        RtPayload::I64(n) => *n,
+        _ => return err_of(io_err("IoFailed", "handle must be an integer".to_string())),
+    };
+    let got = socket_with(h, |s| match s {
+        Socket::Datagram(d) => {
+            let mut buf = vec![0u8; 65536];
+            match d.recv_from(&mut buf) {
+                Ok((n, from)) => {
+                    buf.truncate(n);
+                    Ok((buf, from.ip().to_string(), i64::from(from.port())))
+                }
+                Err(e) => Err(e.to_string()),
+            }
+        }
+        _ => Err(format!("socket {h} is not a datagram socket")),
+    });
+    match got {
+        Ok((b, host, port)) => {
+            let fields = vec![
+                alloc(RtPayload::Bytes(std::sync::Arc::new(b))),
+                alloc(RtPayload::Str(RtStr::of(&host))),
+                alloc(RtPayload::I64(port)),
+            ];
+            ok_of(alloc(RtPayload::Tuple(fields.into())))
+        }
+        Err(e) => err_of(io_err("IoFailed", e)),
+    }
+}
+
 /// Closes a listener or a connection. Closing one twice is not an error, for
 /// the same reason releasing a `ref` twice is not: cleanup order is not
 /// something a caller should have to track.

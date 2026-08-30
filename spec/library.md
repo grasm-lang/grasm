@@ -16,7 +16,7 @@ came to be documented as returning `Option[str]` when it is fallible.
 |------|------|-------|
 | `print(x)` | `(T)` | writes `x` then a newline; performs `io` |
 | `input()` | `() -> str` | one line from stdin, without the newline; `io` |
-| `args()` | `() -> [str]` | arguments after `--`; performs `io` |
+| `args()` | `() -> [str]` | the program's own arguments; performs `io` |
 | `panic(msg)` | `(str)` | prints `panic: msg`, exits 101 |
 | `assert(c)` | `(bool)` | panics when `c` is false |
 | `assert_eq(a, b)` | `(T, T)` | panics when `a != b` |
@@ -29,6 +29,13 @@ came to be documented as returning `Option[str]` when it is fallible.
 | `read_file(p)` | `(str) -> str ! IoError` | fallible, not `Option`; `io` ([L-LIB-IO]) |
 | `write_file(p, s)` | `(str, str) -> () ! IoError` | fallible; `io` ([L-LIB-IO]) |
 | `file_exists(p)` | `(str) -> bool` | `io` |
+
+**[L-LIB-ARGS]** `args()` answers what was passed to the *program*, never to the tool that
+started it. Under `grasm run` the program's arguments are the ones after `--`,
+because everything before it belongs to `grasm`; a compiled binary is the
+command, so it has no separator to strip and takes its arguments directly.
+Both spellings give the program the same list, which is what `agreetest`
+checks in all three modes.
 
 **[L-LIB-EXIT]** `exit(code)` ends the program with the **low eight bits** of
 `code`, which is what an operating system reports and what C's `exit` does with
@@ -535,6 +542,7 @@ performs `net`:
 | `udp_bind(port)` | `(i64) -> i64 ! IoError` | binds a datagram socket; `0` asks the system to choose |
 | `udp_send(h, host, port, b)` | `(i64, str, i64, bytes) -> i64 ! IoError` | sends one datagram, answering with the bytes sent |
 | `udp_recv(h)` | `(i64) -> bytes ! IoError` | receives **one** datagram, whole |
+| `udp_recv_from(h)` | `(i64) -> (bytes, str, i64) ! IoError` | the same, and where it came from |
 
 UDP is not TCP with the reliability removed; it is a different shape, and the
 signatures have to say so. A stream has no message boundaries and both ends are
@@ -547,6 +555,18 @@ Payloads are `bytes`, not `str`. The protocols that use UDP are binary — a DNS
 query is a packed structure with bit-level flags — and routing one through the
 lossy UTF-8 conversion the stream operations use, correctly, for text would
 corrupt it ([L-LIB-BYTES]).
+
+`udp_recv_from` is the same receive keeping the sender's address, as a triple
+of the payload, the host and the port. It is not a convenience: a datagram
+socket has **no fixed peer** — that is the whole difference from a stream — so
+a receiver that cannot learn who wrote can only answer peers it was configured
+with in advance. Every protocol where a client's address is unknown until it
+calls needs this, which is most of them. The address is a tuple rather than a
+new type for the same reason `proc_run`'s result is ([L-LIB-PROC]): three
+values with obvious positions did not need a name.
+
+`udp_recv` remains, because a program that already knows where to reply should
+not have to say so, and dropping the address is then the honest signature.
 
 `udp_recv` receives one datagram whole or fails. A read that returned half a
 message, or two joined together, would have destroyed the only thing UDP

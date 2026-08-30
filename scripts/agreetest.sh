@@ -426,6 +426,46 @@ fn main() {
     fi
 }
 
+# A datagram carries its sender's address, and all three modes must agree on
+# what that address is. Two sockets in one program, so nothing outside it has
+# to cooperate and the answer is fixed: the loopback address, and the port the
+# system chose for the sender, which the program reads back with `net_port`
+# and compares rather than printing — a chosen port is different every run.
+check udp_sender 'fn main() / {io, net} {
+    let a = match udp_bind(0) {
+        Ok(h) -> h
+        Err(_e) -> return
+    }
+    let b = match udp_bind(0) {
+        Ok(h) -> h
+        Err(_e) -> return
+    }
+    let port_a = match net_port(a) {
+        Ok(p) -> p
+        Err(_e) -> return
+    }
+    let port_b = match net_port(b) {
+        Ok(p) -> p
+        Err(_e) -> return
+    }
+    match udp_send(a, "127.0.0.1", port_b, bytes_of([7, 8, 9])) {
+        Ok(_n) -> {}
+        Err(_e) -> return
+    }
+    match udp_recv_from(b) {
+        Ok(got) -> {
+            print("bytes {got.0.len()}")
+            print("first {got.0.at(0)}")
+            print("host {got.1}")
+            print("port matches sender {got.2 == port_a}")
+            print("ports differ {port_a != port_b}")
+        }
+        Err(_e) -> print("receive failed")
+    }
+    net_close(a)
+    net_close(b)
+}'
+
 check_package
 
 echo

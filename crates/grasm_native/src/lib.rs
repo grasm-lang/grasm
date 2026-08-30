@@ -826,6 +826,7 @@ impl<'m> Codegen<'m> {
             ("grasm_bytes_ptr", vec![i64t], Some(i64t)),
             ("grasm_udp_bind", vec![i64t], Some(i64t)),
             ("grasm_udp_recv", vec![i64t], Some(i64t)),
+            ("grasm_udp_recv_from", vec![i64t], Some(i64t)),
             ("grasm_udp_send", vec![i64t, i64t, i64t, i64t], Some(i64t)),
             ("grasm_write_file", vec![i64t, i64t], Some(i64t)),
             ("grasm_file_exists", vec![i64t], Some(i8t)),
@@ -9158,6 +9159,22 @@ checker did",
             // The five `net` builtins. A handle is an `i64` and a payload is a
             // `str`, so nothing here needs a pointer type — which is why the
             // network could be added to the language without adding one.
+            // A datagram and its sender. Separate from the arm below because
+            // the answer is a tuple rather than one value — the same reason
+            // `proc_run` stands on its own.
+            "udp_recv_from" => {
+                let (hv, ht) = self.eval_expr_val(&args[0])?;
+                let boxed = self.box_value(hv, &ht);
+                let v = self.call_rt("grasm_udp_recv_from", &[boxed]).unwrap();
+                self.call_rt("grasm_val_dec", &[boxed]);
+                return Ok(Some((
+                    v,
+                    VType::Fallible(
+                        Box::new(VType::Tuple(vec![VType::Bytes, VType::Str, VType::I64])),
+                        Box::new(VType::Sum("IoError".into())),
+                    ),
+                )));
+            }
             "tcp_listen" | "tcp_accept" | "tcp_read" | "tcp_read_bytes"
             | "net_port" | "udp_bind" | "udp_recv" => {
                 let (hv, ht) = self.eval_expr_val(&args[0])?;
@@ -11085,6 +11102,14 @@ fields, not the type this is bound to, not an enclosing generic",
                             )),
                             "udp_recv" => Some(VType::Fallible(
                                 Box::new(VType::Bytes),
+                                Box::new(VType::Sum("IoError".into())),
+                            )),
+                            "udp_recv_from" => Some(VType::Fallible(
+                                Box::new(VType::Tuple(vec![
+                                    VType::Bytes,
+                                    VType::Str,
+                                    VType::I64,
+                                ])),
                                 Box::new(VType::Sum("IoError".into())),
                             )),
                             "net_wait" => Some(VType::Fallible(
