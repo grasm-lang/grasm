@@ -155,6 +155,15 @@ pub struct Interp<'a, W: Write> {
     sums: HashMap<String, Vec<(String, usize)>>,
     /// variant name → (owning type, arity); only unambiguous entries.
     variants: HashMap<String, Option<(String, usize)>>,
+    /// (module, variant name) -> the sum type that module declares it on.
+    ///
+    /// A module's own variant wins over one it merely imports, which is how a
+    /// reader of that file reads it and what the checker settles ([F88]). The
+    /// map above answers "is this name unique across the program"; this one
+    /// answers "does *this* module declare it", and the second question is the
+    /// one asked first. Without it the checker accepted `fail(NotFound(id))`
+    /// in a module declaring its own `NotFound` and the engine panicked on it.
+    variants_owned: HashMap<(String, String), (String, usize)>,
     /// Declared field order per struct type. See the `Decl::Type` arm.
     struct_fields: HashMap<String, Vec<String>>,
     /// Span offsets of statements that executed, when coverage is on.
@@ -1120,6 +1129,10 @@ impl<'a, W: Write> Interp<'a, W> {
                                 .entry(v.name.name.clone())
                                 .and_modify(|e| *e = None)
                                 .or_insert(Some((t.name.name.clone(), v.fields.len())));
+                            self.variants_owned.insert(
+                                (mod_name.to_string(), v.name.name.clone()),
+                                (t.name.name.clone(), v.fields.len()),
+                            );
                         }
                         self.sums.insert(t.name.name.clone(), list);
                     }
@@ -1176,6 +1189,7 @@ impl<'a, W: Write> Interp<'a, W> {
             imports: HashMap::new(),
             sums,
             variants,
+            variants_owned: HashMap::new(),
             struct_fields: HashMap::new(),
             coverage: None,
             scopes: Vec::new(),
@@ -2436,6 +2450,21 @@ impl<'a, W: Write> Interp<'a, W> {
         }
     }
 
+    /// The sum type a variant name means here: this module's own first, then
+    /// the program-wide one if it is unique ([F88]).
+    fn variant_type_of(&self, name: &str) -> Option<String> {
+        if let Some((tname, _)) = self
+            .variants_owned
+            .get(&(self.current_module.clone(), name.to_string()))
+        {
+            return Some(tname.clone());
+        }
+        match self.variants.get(name) {
+            Some(Some((tname, _))) => Some(tname.clone()),
+            _ => None,
+        }
+    }
+
     fn eval_ident(&mut self, id: &Ident) -> EResult {
         for scope in self.scopes.iter().rev() {
             if let Some(v) = scope.get(&id.name) {
@@ -2443,12 +2472,23 @@ impl<'a, W: Write> Interp<'a, W> {
             }
         }
         // Nullary variant?
-        if let Some(Some((tname, 0))) = self.variants.get(&id.name) {
-            return Ok(Value::Variant {
-                type_name: Rc::new(tname.clone()),
-                variant: Rc::new(id.name.clone()),
-                fields: Rc::new(vec![]),
-            });
+        if let Some(tname) = self.variant_type_of(&id.name) {
+            let arity = self
+                .variants_owned
+                .get(&(self.current_module.clone(), id.name.clone()))
+                .map(|(_, a)| *a)
+                .or_else(|| match self.variants.get(&id.name) {
+                    Some(Some((_, a))) => Some(*a),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            if arity == 0 {
+                return Ok(Value::Variant {
+                    type_name: Rc::new(tname),
+                    variant: Rc::new(id.name.clone()),
+                    fields: Rc::new(vec![]),
+                });
+            }
         }
         let qual = format!("{}::{}", self.current_module, id.name);
         // A C function named without being called. The compiled backend makes
@@ -3233,7 +3273,7 @@ uses to mark the end of a string"
                     _ => {}
                 }
                 // Variant constructor.
-                if let Some(Some((tname, _arity))) = self.variants.get(&id.name).cloned() {
+                if let Some(tname) = self.variant_type_of(&id.name) {
                     let mut vs = Vec::with_capacity(args.len());
                     for a in args {
                         vs.push(self.eval_expr(a)?);
@@ -3380,7 +3420,7 @@ uses to mark the end of a string"
                         return Ok(r);
                     }
                     // Variant constructor through the module alias.
-                    if let Some(Some((tname, _))) = self.variants.get(&name.name).cloned() {
+                    if let Some(tname) = self.variant_type_of(&name.name) {
                         let mut vs = Vec::with_capacity(args.len());
                         for a in args {
                             vs.push(self.eval_expr(a)?);

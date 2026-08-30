@@ -1,0 +1,8 @@
+[package]
+name = "gitobj_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.gitobj]
+path = "../gitobj"
+version = "^1.0.0"

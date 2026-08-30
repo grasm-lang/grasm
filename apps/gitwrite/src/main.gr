@@ -1,0 +1,91 @@
+// Writes a Git repository that real Git can read.
+//
+// Two blobs, a tree naming them, and a commit — every byte produced by Grasm:
+// the SHA-1 that names each object, the zlib stream each is stored in, the
+// tree's sort order, and the commit's header layout. Nothing shells out to
+// `git`, and `git` is not needed to produce any of it.
+//
+// `scripts/git_interop.sh` then points a branch at the commit and asks real
+// Git to check it out. That is the only test that matters for a format
+// implementation: not that it round-trips through itself, but that the world
+// agrees.
+//
+// With no arguments it prints usage and exits 0, which is what the corpus
+// gates run it as.
+
+import gitobj
+
+fn main() / {io} {
+    let argv = args()
+    if argv.len() < 1 {
+        print("usage: gitwrite <git-dir>")
+        return
+    }
+    let dir = argv[0]
+
+    let a = match gitobj.write_object(dir, "blob", "alpha\n".to_bytes()) {
+        Ok(x) -> x
+        Err(_e) -> {
+            print("could not write the first blob")
+            return
+        }
+    }
+    let b = match gitobj.write_object(dir, "blob", "beta contents here\n".to_bytes()) {
+        Ok(x) -> x
+        Err(_e) -> {
+            print("could not write the second blob")
+            return
+        }
+    }
+    // A nested directory, so the tree is not flat and the sort rule is
+    // actually exercised: `docs` is a tree and sorts as though it were
+    // `docs/`, which puts it after `alpha.txt` and before `beta.sh`.
+    let inner_bytes = match gitobj.write_tree([
+            gitobj.entry_of(gitobj.mode_file(), "readme.md", a)]) {
+        Ok(x) -> x
+        Err(_e) -> {
+            print("could not build the inner tree")
+            return
+        }
+    }
+    let inner = match gitobj.write_object(dir, "tree", inner_bytes) {
+        Ok(x) -> x
+        Err(_e) -> {
+            print("could not write the inner tree")
+            return
+        }
+    }
+    let tree_bytes = match gitobj.write_tree([
+            gitobj.entry_of(gitobj.mode_file(), "alpha.txt", a),
+            gitobj.entry_of(gitobj.mode_exec(), "beta.sh", b),
+            gitobj.tree_entry("docs", inner)]) {
+        Ok(x) -> x
+        Err(_e) -> {
+            print("could not build the tree")
+            return
+        }
+    }
+    let t = match gitobj.write_object(dir, "tree", tree_bytes) {
+        Ok(x) -> x
+        Err(_e) -> {
+            print("could not write the tree")
+            return
+        }
+    }
+    // A fixed timestamp, so the commit's name is the same on every run and
+    // this can be a gate rather than a demonstration.
+    let who = "Grasm Author <grasm@example.com> 1700000000 +0000"
+    let commit_bytes = gitobj.write_commit(t, [], who, who, "written entirely by Grasm\n")
+    let c = match gitobj.write_object(dir, "commit", commit_bytes) {
+        Ok(x) -> x
+        Err(_e) -> {
+            print("could not write the commit")
+            return
+        }
+    }
+    print("blob-a {a}")
+    print("blob-b {b}")
+    print("tree-inner {inner}")
+    print("tree {t}")
+    print("commit {c}")
+}

@@ -1,0 +1,190 @@
+import gitobj
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+    let dir = "/tmp/grasm-gitobj-demo"
+    match make_dir(dir) {
+        Ok(_u) -> {}
+        Err(_e) -> {}
+    }
+
+    print("-- object names, which real Git agrees with")
+    // Checked against `git hash-object`.
+    say(f, "an empty blob", gitobj.name_of("blob", bytes_of([]))
+        == "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391")
+    say(f, "a blob of \"hello\\n\"", gitobj.name_of("blob", "hello\n".to_bytes())
+        == "ce013625030ba8dba906f756967f9e9ca394464a")
+    say(f, "a blob of \"what is up, doc?\"",
+        gitobj.name_of("blob", "what is up, doc?".to_bytes())
+        == "bd9dbf5aae1a3862dd1526723246b20206e5fc37")
+    // An empty tree is a real object Git ships with.
+    say(f, "the empty tree", gitobj.name_of("tree", bytes_of([]))
+        == "4b825dc642cb6eb9a060e54bf8d69288fbee4904")
+
+    print("-- writing and reading a loose object")
+    match gitobj.write_object(dir, "blob", "hello\n".to_bytes()) {
+        Ok(id) -> {
+            say(f, "written under its own name",
+                id == "ce013625030ba8dba906f756967f9e9ca394464a")
+            say(f, "at objects/ce/0136...", file_exists(gitobj.loose_path(dir, id)))
+            match gitobj.read_object(dir, id) {
+                Ok(pair) -> {
+                    say(f, "read back as a blob", pair.0 == "blob")
+                    say(f, "with its bytes intact", pair.1.to_str() == "hello\n")
+                }
+                Err(_e) -> say(f, "read back", false)
+            }
+            // Writing it again must not disturb it.
+            match gitobj.write_object(dir, "blob", "hello\n".to_bytes()) {
+                Ok(again) -> say(f, "writing it twice gives the same name", again == id)
+                Err(_e) -> say(f, "writing it twice", false)
+            }
+        }
+        Err(_e) -> say(f, "an object is written", false)
+    }
+    match gitobj.read_object(dir, "0000000000000000000000000000000000000000") {
+        Ok(_p) -> say(f, "a missing object is refused", false)
+        Err(_e) -> say(f, "a missing object is refused", true)
+    }
+
+    print("-- an object whose bytes stopped matching its name")
+    // The one guarantee of a content-addressed store. A damaged file must be
+    // caught, not handed back.
+    // Removed first, because this test corrupts the file it writes and
+    // `write_object` will not rewrite a name that already exists — the name is
+    // the content, so an existing file is by definition the right bytes. On a
+    // second run the corrupt file would survive, the same bit would be flipped
+    // back, and the test would pass for the wrong reason. The corpus gates run
+    // every program more than once.
+    let victim = gitobj.loose_path(dir, gitobj.name_of("blob", "trustworthy".to_bytes()))
+    match remove_file(victim) {
+        Ok(_u) -> {}
+        Err(_e) -> {}
+    }
+    match gitobj.write_object(dir, "blob", "trustworthy".to_bytes()) {
+        Ok(id) -> {
+            let p = gitobj.loose_path(dir, id)
+            match read_bytes(p) {
+                Ok(good) -> {
+                    var bent = good.to_list()
+                    bent[bent.len() - 6] = bent[bent.len() - 6].bit_xor(64)
+                    match write_bytes(p, bytes_of(bent)) {
+                        Ok(_u) -> {}
+                        Err(_e) -> {}
+                    }
+                    match gitobj.read_object(dir, id) {
+                        Ok(_x) -> say(f, "a tampered object is refused", false)
+                        Err(_e) -> say(f, "a tampered object is refused", true)
+                    }
+                }
+                Err(_e) -> say(f, "the object could be read", false)
+            }
+        }
+        Err(_e) -> say(f, "an object is written", false)
+    }
+
+    print("-- trees, and Git's sorting rule")
+    // The rule that catches everyone: a directory sorts as though its name
+    // ended in a slash. So `a` (a file) comes before `a.b`, but `a` (a tree)
+    // comes after it, because `a/` > `a.b`.
+    let blob_id = "ce013625030ba8dba906f756967f9e9ca394464a"
+    let tree_id = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+    match gitobj.write_tree([
+            gitobj.tree_entry("a", tree_id),
+            gitobj.entry_of(gitobj.mode_file(), "a.b", blob_id)]) {
+        Ok(t) -> {
+            match gitobj.read_tree(t) {
+                Ok(back) -> {
+                    say(f, "a directory sorts after a file that shares its prefix",
+                        back.len() == 2 and back[0].name == "a.b" and back[1].name == "a")
+                }
+                Err(_e) -> say(f, "the tree reads back", false)
+            }
+        }
+        Err(_e) -> say(f, "the tree is written", false)
+    }
+    match gitobj.write_tree([
+            gitobj.entry_of(gitobj.mode_file(), "zebra", blob_id),
+            gitobj.entry_of(gitobj.mode_exec(), "apple", blob_id),
+            gitobj.tree_entry("middle", tree_id)]) {
+        Ok(t) -> {
+            match gitobj.read_tree(t) {
+                Ok(back) -> {
+                    say(f, "three entries sort and round-trip",
+                        back.len() == 3 and back[0].name == "apple"
+                        and back[1].name == "middle" and back[2].name == "zebra")
+                    say(f, "modes survive", back[0].mode == gitobj.mode_exec()
+                        and back[1].mode == "40000")
+                    say(f, "object names survive", back[2].id == blob_id)
+                }
+                Err(_e) -> say(f, "the tree reads back", false)
+            }
+        }
+        Err(_e) -> say(f, "the tree is written", false)
+    }
+    match gitobj.write_tree([
+            gitobj.entry_of(gitobj.mode_file(), "same", blob_id),
+            gitobj.entry_of(gitobj.mode_file(), "same", blob_id)]) {
+        Ok(_t) -> say(f, "two entries with one name are refused", false)
+        Err(_e) -> say(f, "two entries with one name are refused", true)
+    }
+    match gitobj.read_tree("100644 x".to_bytes()) {
+        Ok(_t) -> say(f, "a tree entry with no object name is refused", false)
+        Err(_e) -> say(f, "a tree entry with no object name is refused", true)
+    }
+
+    print("-- commits")
+    let c = gitobj.write_commit(tree_id, [], "A U Thor <a@example.com> 1700000000 +0000",
+        "A U Thor <a@example.com> 1700000000 +0000", "first\n")
+    match gitobj.read_commit(c) {
+        Ok(parsed) -> {
+            match parsed {
+                GitCommit(t, ps, au, _co, msg) -> {
+                    say(f, "the tree comes back", t == tree_id)
+                    say(f, "a root commit has no parents", ps.len() == 0)
+                    say(f, "the author comes back",
+                        au == "A U Thor <a@example.com> 1700000000 +0000")
+                    say(f, "the message comes back", msg == "first\n")
+                }
+                _other -> say(f, "it parses as a commit", false)
+            }
+        }
+        Err(_e) -> say(f, "the commit parses", false)
+    }
+    let merge = gitobj.write_commit(tree_id, [blob_id, tree_id], "A <a@b> 1 +0000",
+        "A <a@b> 1 +0000", "merge\n")
+    match gitobj.read_commit(merge) {
+        Ok(parsed) -> {
+            match parsed {
+                GitCommit(_t, ps, _au, _co, _m) -> say(f, "a merge has two parents", ps.len() == 2)
+                _other -> say(f, "it parses", false)
+            }
+        }
+        Err(_e) -> say(f, "the merge parses", false)
+    }
+    // A header Git added after this was written must not stop it reading.
+    let with_extra = "tree {tree_id}\ngpgsig -----BEGIN-----\nauthor A <a@b> 1 +0000\ncommitter A <a@b> 1 +0000\n\nhi\n"
+    match gitobj.read_commit(with_extra.to_bytes()) {
+        Ok(_p) -> say(f, "an unknown header is skipped, not refused", true)
+        Err(_e) -> say(f, "an unknown header is skipped, not refused", false)
+    }
+    match gitobj.read_commit("author A <a@b> 1 +0000\n\nno tree\n".to_bytes()) {
+        Ok(_p) -> say(f, "a commit with no tree is refused", false)
+        Err(_e) -> say(f, "a commit with no tree is refused", true)
+    }
+
+    if f == 0 {
+        print("all checks passed")
+    } else {
+        print("{f} check(s) failed")
+    }
+}

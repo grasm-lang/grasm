@@ -104,6 +104,7 @@ and the entries disagree.
 | [F86](#f86) | `args()` was documented as something it only sometimes is | S4, spec | **fixed** |
 | [F87](#f87) | a diamond dependency wrote a source bundle that could not be loaded | S1, loader | **fixed** |
 | [F88](#f88) | a package stopped compiling because of what stood next to it | S2, types | **fixed** |
+| [F89](#f89) | F88's fix made the checker accept what the engine could not build | S1, types | **fixed** |
 
 <!-- end index -->
 ## F1 — a wrapped condition must end the line with the operator (S4) — **fixed**
@@ -3788,3 +3789,56 @@ packages that each declare a private error type.
 `a_modules_own_variant_wins_over_an_imported_one` — the three cases in one
 test: both packages compile in one program, a module with no `Io` of its own
 is still refused, and qualifying still works.
+
+## F89 — F88's fix made the checker accept what the engine could not build (S1, types) — **fixed**
+
+```
+type MyError =
+    | NotFound(id: str)
+
+fn look(id: str) -> i64 ! MyError {
+    fail(NotFound(id))
+}
+```
+
+Eleven lines. `grasm check` says the file has no errors. Running it:
+
+```
+panic: unknown name `NotFound`
+```
+
+**This one is mine, and it was made by the fix for F88 in the same session.**
+
+Before F88, a variant name declared both by a user type and by the prelude's
+`IoError` was two candidates, and two candidates was a compile-time refusal.
+F88 taught the checker that a module's own variant wins — correct, and the
+reason `wal` and `sstable` can now coexist — but it taught only the checker.
+The interpreter kept its own map, which records a name as unique or ambiguous
+and nothing else, and refused the ambiguous one at run time.
+
+So a compile-time refusal became a runtime panic. That is strictly worse than
+what F88 fixed, and it is the failure this project spends most of its gates
+guarding against: an answer the checker settled that an engine does not share.
+
+`NotFound` is the case that made it visible, because `IoError` is in the
+prelude and therefore in scope in every module — so *any* program declaring its
+own `NotFound` or `IoFailed` hit it. Found immediately, by the next application:
+`gitobj` wants a `NotFound` for an object that is not in the store, which is
+the obvious name for it.
+
+The repair is the same rule in the engine: `variants_owned`, keyed by module
+and variant name, consulted before the program-wide map. Three lookup sites in
+the interpreter now go through one function, so a fourth cannot be added that
+forgets.
+
+**The lesson is the one `docs/probe-removal.md` is about.** The checker knows
+which type a variant means. Every engine that re-derives that answer for itself
+is a place the two can disagree, and this is the sixteenth time that shape has
+produced a defect here. What would end the class is handing the resolution over
+in `Analysis` rather than teaching each engine the same rule — the same repair
+that removed the effect-row guessing, and the one that note has now asked for
+three times.
+
+**Gate**: `crates/grasm_sema/tests/module_tests.rs` covers the checker's half;
+the engines' half is covered by the corpus, since `packages/gitobj` declares a
+`NotFound` and `difftest` runs it three ways.

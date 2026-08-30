@@ -1,0 +1,10 @@
+[package]
+name = "gitwrite"
+version = "0.1.0"
+entry = "src/main.gr"
+
+capabilities = ["io"]
+
+[dependencies.gitobj]
+path = "../../packages/gitobj"
+version = "^1.0.0"

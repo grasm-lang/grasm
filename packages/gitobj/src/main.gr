@@ -1,0 +1,365 @@
+// Git's object model: four kinds of thing, all named by their own contents.
+//
+// The idea the whole format rests on is that an object's name is the SHA-1 of
+// its type, its length, a zero byte, and its bytes. Nothing else. So the name
+// cannot be assigned, cannot be wrong, and two repositories that computed the
+// same name are holding the same bytes — which is what makes fetching a
+// question of "do you have this name" rather than of comparing files.
+//
+//     blob    a file's contents, with no name and no permissions
+//     tree    a directory: mode, name, and the name of another object
+//     commit  a tree, its parents, who and when, and a message
+//     tag     a name for another object, annotated
+//
+// A file's *name* lives in the tree that points at it, not in the blob, which
+// is why moving a file changes no blob and why Git notices renames after the
+// fact rather than recording them.
+//
+// On disk a loose object is that same byte string, zlib-compressed, at
+// `.git/objects/ab/cdef…` — the first two characters of its name as a
+// directory, because a hundred thousand files in one directory is slow on
+// every filesystem anyone has.
+
+import sha1
+import zlib
+
+/// One entry in a tree: a mode, a name, and what it points at.
+///
+/// Named `TreeEntry` rather than `Entry` because types share one namespace
+/// across a program ([T-MODULE-NS]) and `cli` already declares an `Entry`.
+type TreeEntry = {
+    mode: str,
+    name: str,
+    id: str,
+}
+
+/// A parsed object, whatever kind it turned out to be.
+type GitObject =
+    | GitBlob(data: bytes)
+    | GitTree(entries: [TreeEntry])
+    | GitCommit(tree: str, parents: [str], author: str, committer: str, message: str)
+    | GitTag(target: str, kind: str, tag: str, tagger: str, message: str)
+
+type ObjectError =
+    | NotFound(id: str)
+    | Malformed(why: str)
+    | WrongName(want: str, got: str)
+    | Io(what: str)
+
+fn mode_tree() -> str { "40000" }
+pub fn mode_file() -> str { "100644" }
+pub fn mode_exec() -> str { "100755" }
+pub fn mode_link() -> str { "120000" }
+
+/// The bytes an object is named by: type, space, length, zero, content.
+pub fn framed(kind: str, content: bytes) -> bytes {
+    var out = "{kind} {content.len()}".to_bytes().to_list()
+    out.push(0)
+    for v in content.to_list() {
+        out.push(v)
+    }
+    bytes_of(out)
+}
+
+/// An object's name, which is a fact about its bytes and not a choice.
+pub fn name_of(kind: str, content: bytes) -> str {
+    sha1.hex(framed(kind, content))
+}
+
+/// Where a loose object lives under `.git/objects`.
+pub fn loose_path(git_dir: str, id: str) -> str {
+    "{git_dir}/objects/{id.substr(0, 2)}/{id.substr(2, id.len() - 2)}"
+}
+
+/// Write a loose object and answer its name.
+///
+/// Writing an object that is already there is not an error and does not
+/// rewrite it: the name is the content, so a file that exists under that name
+/// already holds exactly these bytes. That is also why Git repositories can be
+/// merged by copying files.
+pub fn write_object(git_dir: str, kind: str, content: bytes) -> str ! ObjectError / {io} {
+    let id = name_of(kind, content)
+    let path = loose_path(git_dir, id)
+    if file_exists(path) {
+        return id
+    }
+    match make_dir("{git_dir}/objects/{id.substr(0, 2)}") {
+        Ok(_u) -> {}
+        Err(_e) -> {}
+    }
+    let packed = zlib.compress_stored(framed(kind, content))
+    // Written beside and renamed over, so a reader never sees a half-written
+    // object under a name that promises particular bytes.
+    let scratch = "{path}.writing"
+    match write_bytes(scratch, packed) {
+        Ok(_u) -> {}
+        Err(_e) -> fail(Io(scratch))
+    }
+    match sync_file(scratch) {
+        Ok(_u) -> {}
+        Err(_e) -> fail(Io(scratch))
+    }
+    match rename_file(scratch, path) {
+        Ok(_u) -> {}
+        Err(_e) -> fail(Io(path))
+    }
+    id
+}
+
+/// Read a loose object's type and content.
+///
+/// **The name is verified.** An object read from disk is hashed and compared
+/// against the name it was filed under, because the one guarantee of a
+/// content-addressed store is that a name means those bytes — and a store that
+/// hands back whatever was in the file has given that up. Git calls this
+/// `fsck` and does it on demand; doing it on every read is cheap here and
+/// catches a damaged repository at the point of use.
+pub fn read_object(git_dir: str, id: str) -> (str, bytes) ! ObjectError / {io} {
+    let path = loose_path(git_dir, id)
+    if not file_exists(path) {
+        fail(NotFound(id))
+    }
+    let packed = match read_bytes(path) {
+        Ok(b) -> b
+        Err(_e) -> fail(Io(path))
+    }
+    let raw = match zlib.decompress(packed, 268435456) {
+        Ok(b) -> b
+        Err(_e) -> fail(Malformed("object {id} will not decompress"))
+    }
+    var cut = 0 - 1
+    for i in 0..raw.len() {
+        if raw.at(i) == 0 and cut < 0 {
+            cut = i
+        }
+    }
+    if cut < 0 {
+        fail(Malformed("object {id} has no header terminator"))
+    }
+    let header = raw.slice(0, cut).to_str()
+    let parts = header.split(" ")
+    if parts.len() != 2 {
+        fail(Malformed("object {id} has a header of {parts.len()} parts"))
+    }
+    let content = raw.slice(cut + 1, raw.len() - cut - 1)
+    if "{content.len()}" != parts[1] {
+        fail(Malformed("object {id} says {parts[1]} bytes and holds {content.len()}"))
+    }
+    let actual = name_of(parts[0], content)
+    if actual != id {
+        fail(WrongName(id, actual))
+    }
+    (parts[0], content)
+}
+
+/// A tree's bytes: each entry as `mode name\0` then twenty raw bytes of name.
+///
+/// Entries must be sorted, and the order is Git's: by name, except that a
+/// tree sorts as though its name ended in a slash. Getting that wrong produces
+/// a tree that is byte-different from what Git would write for the same
+/// directory, which means a different name, which means the two repositories
+/// disagree about identical content.
+pub fn write_tree(entries: [TreeEntry]) -> bytes ! ObjectError {
+    var sorted = entries
+    // Insertion sort: a directory has tens of entries, not thousands, and the
+    // comparison is the interesting part rather than the algorithm.
+    for i in 1..sorted.len() {
+        var j = i
+        while j > 0 and tree_order(sorted[j - 1], sorted[j]) > 0 {
+            let t = sorted[j]
+            sorted[j] = sorted[j - 1]
+            sorted[j - 1] = t
+            j = j - 1
+        }
+    }
+    var out: [i64] = []
+    var previous = ""
+    for e in sorted {
+        if e.name == previous {
+            fail(Malformed("two entries named {e.name}"))
+        }
+        previous = e.name
+        if e.id.len() != 40 {
+            fail(Malformed("entry {e.name} has a {e.id.len()}-character name"))
+        }
+        for v in "{e.mode} {e.name}".to_bytes().to_list() {
+            out.push(v)
+        }
+        out.push(0)
+        var i = 0
+        while i < 40 {
+            out.push(hex_pair(e.id, i))
+            i = i + 2
+        }
+    }
+    bytes_of(out)
+}
+
+/// Git's sort key for a tree entry: the name, with a slash appended when the
+/// entry is a tree.
+fn sort_name(e: TreeEntry) -> str {
+    if e.mode == mode_tree() {
+        "{e.name}/"
+    } else {
+        e.name
+    }
+}
+
+fn tree_order(a: TreeEntry, b: TreeEntry) -> i64 {
+    let x = sort_name(a).to_bytes()
+    let y = sort_name(b).to_bytes()
+    let shorter = if x.len() < y.len() { x.len() } else { y.len() }
+    for i in 0..shorter {
+        if x.at(i) != y.at(i) {
+            return if x.at(i) < y.at(i) { 0 - 1 } else { 1 }
+        }
+    }
+    if x.len() == y.len() {
+        return 0
+    }
+    if x.len() < y.len() { 0 - 1 } else { 1 }
+}
+
+fn hex_value(c: i64) -> i64 {
+    if c >= 48 and c <= 57 {
+        return c - 48
+    }
+    if c >= 97 and c <= 102 {
+        return c - 87
+    }
+    if c >= 65 and c <= 70 {
+        return c - 55
+    }
+    0 - 1
+}
+
+fn hex_pair(s: str, at: i64) -> i64 {
+    let b = s.to_bytes()
+    let hi = hex_value(b.at(at))
+    let lo = hex_value(b.at(at + 1))
+    if hi < 0 or lo < 0 {
+        return 0
+    }
+    hi * 16 + lo
+}
+
+fn to_hex(b: bytes, from: i64) -> str {
+    let digits = "0123456789abcdef"
+    var s = ""
+    for i in 0..20 {
+        let v = b.at(from + i)
+        s = s + digits.substr(v / 16, 1) + digits.substr(v % 16, 1)
+    }
+    s
+}
+
+/// Read a tree back.
+pub fn read_tree(content: bytes) -> [TreeEntry] ! ObjectError {
+    var out: [TreeEntry] = []
+    var at = 0
+    while at < content.len() {
+        var space = 0 - 1
+        var zero = 0 - 1
+        var i = at
+        while i < content.len() and zero < 0 {
+            if content.at(i) == 32 and space < 0 {
+                space = i
+            }
+            if content.at(i) == 0 {
+                zero = i
+            }
+            i = i + 1
+        }
+        if space < 0 or zero < 0 or space > zero {
+            fail(Malformed("a tree entry has no mode and name"))
+        }
+        if zero + 21 > content.len() {
+            fail(Malformed("a tree entry has no object name"))
+        }
+        out.push(TreeEntry{
+            mode: content.slice(at, space - at).to_str(),
+            name: content.slice(space + 1, zero - space - 1).to_str(),
+            id: to_hex(content, zero + 1),
+        })
+        at = zero + 21
+    }
+    out
+}
+
+/// A commit's bytes: headers, a blank line, then the message.
+pub fn write_commit(tree: str, parents: [str], author: str, committer: str,
+                    message: str) -> bytes {
+    var s = "tree {tree}\n"
+    for p in parents {
+        s = s + "parent {p}\n"
+    }
+    s = s + "author {author}\n"
+    s = s + "committer {committer}\n"
+    s = s + "\n"
+    s = s + message
+    s.to_bytes()
+}
+
+/// Read a commit back.
+///
+/// Unknown headers are skipped rather than refused: Git has added headers over
+/// the years — `gpgsig`, `encoding`, `mergetag` — and a reader that refused
+/// what it did not recognise would stop working on repositories it used to
+/// read.
+pub fn read_commit(content: bytes) -> GitObject ! ObjectError {
+    // The message is taken **verbatim** from after the blank line, as bytes,
+    // rather than by splitting into lines and joining them back. Splitting
+    // loses the trailing newline — `lines()` has nothing to report for the
+    // empty piece after a final `\n` — and a commit's message is part of what
+    // it is named by, so a message that comes back one byte shorter is a
+    // different commit. Found by a test that compared the message it wrote.
+    var header_end = 0 - 1
+    for i in 0..content.len() {
+        if header_end < 0 and i + 1 < content.len() and
+            content.at(i) == 10 and content.at(i + 1) == 10 {
+            header_end = i
+        }
+    }
+    let header = if header_end < 0 {
+        content.to_str()
+    } else {
+        content.slice(0, header_end).to_str()
+    }
+    let message = if header_end < 0 {
+        ""
+    } else {
+        content.slice(header_end + 2, content.len() - header_end - 2).to_str()
+    }
+
+    var tree = ""
+    var parents: [str] = []
+    var author = ""
+    var committer = ""
+    for line in header.lines() {
+        if line.starts_with("tree ") {
+            tree = line.substr(5, line.len() - 5)
+        } else if line.starts_with("parent ") {
+            parents.push(line.substr(7, line.len() - 7))
+        } else if line.starts_with("author ") {
+            author = line.substr(7, line.len() - 7)
+        } else if line.starts_with("committer ") {
+            committer = line.substr(10, line.len() - 10)
+        }
+        // Anything else is skipped rather than refused: Git has added headers
+        // over the years — `gpgsig`, `encoding`, `mergetag` — and a reader
+        // that refused what it did not recognise would stop working on
+        // repositories it used to read.
+    }
+    if tree.len() != 40 {
+        fail(Malformed("a commit with no tree"))
+    }
+    GitCommit(tree, parents, author, committer, message)
+}
+
+pub fn entry_of(mode: str, name: str, id: str) -> TreeEntry {
+    TreeEntry{ mode: mode, name: name, id: id }
+}
+
+pub fn tree_entry(name: str, id: str) -> TreeEntry {
+    TreeEntry{ mode: mode_tree(), name: name, id: id }
+}
