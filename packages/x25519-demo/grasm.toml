@@ -1,0 +1,12 @@
+[package]
+name = "x25519_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.x25519]
+path = "../x25519"
+version = "^1.0.0"
+
+[dependencies.bytes_codec]
+path = "../bytes"
+version = "^1.0.0"

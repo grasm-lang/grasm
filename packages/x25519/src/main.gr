@@ -1,0 +1,425 @@
+// X25519, RFC 7748.
+//
+// Scalar multiplication on Curve25519: the key exchange every modern protocol
+// uses, and the one primitive in GrasmWire that is written with a caveat
+// rather than without one. **Read `WARNING` below before deploying this.**
+//
+// ## The representation, and why it is not the usual one
+//
+// The field is the integers modulo 2^255 - 19. A 64-bit implementation carries
+// an element as five limbs of 51 bits, because a product of two 51-bit numbers
+// is 102 bits and a 64x64 multiply gives 128. Grasm's integer is 64 bits and
+// there is no wider one: 51 x 51 wraps, silently and negatively.
+//
+// So the element is ten limbs of alternating 26 and 25 bits — 5*26 + 5*25 =
+// 255 — which is the representation 32-bit implementations use for the same
+// reason. A product is then 52 bits, ten of them sum to under 2^56, and the
+// factor of 19 that folds the top back leaves under 2^61. Every intermediate
+// fits, with two bits to spare.
+//
+// An odd-numbered limb holds 25 bits at a weight that is half a bit position
+// off, so it is stored scaled by two. That is why a product of two odd limbs
+// carries a factor of 2 and no other product does.
+//
+// ## WARNING — what this is not
+//
+// The Montgomery ladder below is written **branch-free**: the conditional swap
+// is done with a mask, not an `if`, and no memory access depends on the
+// scalar. The source is constant-time.
+//
+// **Grasm cannot promise the compiler preserves that.** Cranelift is free to
+// turn a mask into a branch, and nothing in the language says it may not. So
+// this implementation is written correctly and is *not audited*, and a timing
+// attack against it has not been ruled out by anything stronger than reading
+// the code.
+//
+// Use it for research, for the protocol demonstration it exists to serve, and
+// for traffic nobody would mind reading. Do not use it to protect anything
+// that matters until a constant-time guarantee exists in the language and
+// somebody has reviewed this.
+//
+// Checked against RFC 7748 section 5.2's vectors and section 6.1's exchange.
+
+type Fe = { l: [i64] }
+
+fn fzero() -> Fe {
+    Fe{ l: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] }
+}
+
+fn fone() -> Fe {
+    Fe{ l: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0] }
+}
+
+fn fadd(a: Fe, b: Fe) -> Fe {
+    var out: [i64] = []
+    for i in 0..10 {
+        out.push(a.l[i] + b.l[i])
+    }
+    Fe{ l: out }
+}
+
+/// `a - b`. Limbs may go negative and that is allowed: the carry chain uses an
+/// arithmetic shift, and the bounds still hold.
+fn fsub(a: Fe, b: Fe) -> Fe {
+    var out: [i64] = []
+    for i in 0..10 {
+        out.push(a.l[i] - b.l[i])
+    }
+    Fe{ l: out }
+}
+
+/// Divide by 2^26 or 2^25, rounding toward negative infinity.
+///
+/// `shr` and not `ushr`: the limbs are signed, and a logical shift of a
+/// negative number produces an enormous positive one. This is the single
+/// place the difference decides whether the arithmetic is field arithmetic.
+fn carry_shift(v: i64, bits: i64) -> i64 {
+    (v + (1).shl(bits - 1)).shr(bits)
+}
+
+fn mask_of(bits: i64) -> i64 {
+    (1).shl(bits) - 1
+}
+
+/// How many bits limb `i` holds: 26 for even, 25 for odd.
+fn width(i: i64) -> i64 {
+    if i % 2 == 0 { 26 } else { 25 }
+}
+
+/// The carry chain, twice around.
+///
+/// Once is not enough: the last limb's carry folds back into the first
+/// multiplied by 19, which can push it over again. Twice is enough, and the
+/// second pass is cheap because almost nothing carries.
+fn reduce(inout t: [i64]) {
+    for _pass in 0..2 {
+        var i = 0
+        while i < 10 {
+            let w = width(i)
+            let c = carry_shift(t[i], w)
+            t[i] = t[i] - c.shl(w)
+            if i == 9 {
+                // 2^255 = 19 mod p, so what leaves the top comes back at the
+                // bottom multiplied by nineteen.
+                t[0] = t[0] + c * 19
+            } else {
+                t[i + 1] = t[i + 1] + c
+            }
+            i = i + 1
+        }
+    }
+}
+
+fn fmul(a: Fe, b: Fe) -> Fe {
+    var t: [i64] = []
+    for _i in 0..19 {
+        t.push(0)
+    }
+    for i in 0..10 {
+        for j in 0..10 {
+            // Two odd limbs are each stored scaled by two, so their product
+            // carries a factor the others do not.
+            let scale = if i % 2 == 1 and j % 2 == 1 { 2 } else { 1 }
+            t[i + j] = t[i + j] + scale * a.l[i] * b.l[j]
+        }
+    }
+    // Fold the degree back: limb i+10 has weight 2^255 times limb i's.
+    var k = 8
+    while k >= 0 {
+        t[k] = t[k] + 19 * t[k + 10]
+        t[k + 10] = 0
+        k = k - 1
+    }
+    var out: [i64] = []
+    for i in 0..10 {
+        out.push(t[i])
+    }
+    reduce(out)
+    Fe{ l: out }
+}
+
+fn fsquare(a: Fe) -> Fe {
+    fmul(a, a)
+}
+
+fn fscalar(a: Fe, s: i64) -> Fe {
+    var out: [i64] = []
+    for i in 0..10 {
+        out.push(a.l[i] * s)
+    }
+    reduce(out)
+    Fe{ l: out }
+}
+
+/// Thirty-two bytes, little-endian, into ten limbs.
+fn expand(b: bytes) -> Fe {
+    var bits = 0
+    var acc = 0
+    var out: [i64] = []
+    var at = 0
+    for i in 0..10 {
+        let w = width(i)
+        while bits < w and at < 32 {
+            acc = acc.bit_or(b.at(at).shl(bits))
+            bits = bits + 8
+            at = at + 1
+        }
+        out.push(acc.bit_and(mask_of(w)))
+        acc = acc.ushr(w)
+        bits = bits - w
+    }
+    Fe{ l: out }
+}
+
+/// Ten limbs back to thirty-two bytes, fully reduced.
+///
+/// Three things have to happen and each is easy to get subtly wrong.
+///
+/// **Every limb must be made non-negative.** `reduce` above keeps limbs small
+/// by carrying to the *nearest*, which leaves them signed — correct for
+/// multiplication and not a canonical form. Here the carry is a floor shift,
+/// which handles a borrow and a carry with the same expression because an
+/// arithmetic shift of a negative number rounds down.
+///
+/// **Then the value may still be at least p**, since ten limbs hold 2^255 and
+/// p is 2^255 - 19. Nineteen values are representable twice.
+///
+/// **And whether it was is a fact about a secret**, so the subtraction happens
+/// unconditionally and the answer is selected with a mask.
+fn contract(a: Fe) -> bytes {
+    var t = a.l
+
+    // Non-negative, every limb inside its width. Three passes: the top limb
+    // wraps into the bottom multiplied by nineteen, which can push it over
+    // again, and each pass shrinks what is left by a factor of 2^25.
+    for _pass in 0..3 {
+        for i in 0..9 {
+            let w = width(i)
+            let c = t[i].shr(w)
+            t[i] = t[i] - c.shl(w)
+            t[i + 1] = t[i + 1] + c
+        }
+        let c = t[9].shr(25)
+        t[9] = t[9] - c.shl(25)
+        t[0] = t[0] + c * 19
+    }
+
+    // t - p, with a borrow chain and no branch. p is 2^255 - 19: the bottom
+    // limb is 2^26 - 19, the top is 2^25 - 1, the rest are full.
+    var d: [i64] = []
+    var borrow = 0
+    for i in 0..10 {
+        let w = width(i)
+        let pi = if i == 0 {
+            mask_of(26) - 18
+        } else {
+            mask_of(w)
+        }
+        let v = t[i] - pi - borrow
+        // The sign bit, as a 0 or a 1, without asking.
+        let neg = v.ushr(63).bit_and(1)
+        d.push(v + neg.shl(w))
+        borrow = neg
+    }
+
+    // A borrow out of the top means t was below p, so t is already canonical.
+    // No borrow means t was at least p, so the difference is.
+    let take_d = borrow.bit_xor(1)
+    let mask = 0 - take_d
+    var out: [i64] = []
+    for i in 0..10 {
+        out.push(d[i].bit_and(mask).bit_or(t[i].bit_and(mask.bit_not())))
+    }
+
+    var bytes_out: [i64] = []
+    var acc = 0
+    var bits = 0
+    var i = 0
+    while bytes_out.len() < 32 {
+        while bits < 8 and i < 10 {
+            acc = acc.bit_or(out[i].shl(bits))
+            bits = bits + width(i)
+            i = i + 1
+        }
+        bytes_out.push(acc.bit_and(255))
+        acc = acc.ushr(8)
+        bits = bits - 8
+    }
+    bytes_of(bytes_out)
+}
+
+/// Swap two elements when `swap` is 1, leave them when it is 0 — with no
+/// branch, because which way the swap went is one bit of the scalar.
+fn cswap(swap: i64, inout a: Fe, inout b: Fe) {
+    let mask = 0 - swap
+    var x = a.l
+    var y = b.l
+    for i in 0..10 {
+        let t = mask.bit_and(x[i].bit_xor(y[i]))
+        x[i] = x[i].bit_xor(t)
+        y[i] = y[i].bit_xor(t)
+    }
+    a = Fe{ l: x }
+    b = Fe{ l: y }
+}
+
+/// The inverse, by Fermat: x^(p-2).
+///
+/// A fixed addition chain of 254 squarings and 11 multiplications. Fixed
+/// because the exponent is a constant of the curve — nothing here depends on
+/// the value being inverted, which is what keeps it constant-time.
+fn invert(z: Fe) -> Fe {
+    var z2 = fsquare(z)
+    var t = fsquare(z2)
+    t = fsquare(t)
+    let z9 = fmul(t, z)
+    let z11 = fmul(z9, z2)
+    t = fsquare(z11)
+    let z2_5_0 = fmul(t, z9)
+
+    t = fsquare(z2_5_0)
+    for _i in 0..4 {
+        t = fsquare(t)
+    }
+    let z2_10_0 = fmul(t, z2_5_0)
+
+    t = fsquare(z2_10_0)
+    for _i in 0..9 {
+        t = fsquare(t)
+    }
+    let z2_20_0 = fmul(t, z2_10_0)
+
+    t = fsquare(z2_20_0)
+    for _i in 0..19 {
+        t = fsquare(t)
+    }
+    let z2_40_0 = fmul(t, z2_20_0)
+
+    t = fsquare(z2_40_0)
+    for _i in 0..9 {
+        t = fsquare(t)
+    }
+    let z2_50_0 = fmul(t, z2_10_0)
+
+    t = fsquare(z2_50_0)
+    for _i in 0..49 {
+        t = fsquare(t)
+    }
+    let z2_100_0 = fmul(t, z2_50_0)
+
+    t = fsquare(z2_100_0)
+    for _i in 0..99 {
+        t = fsquare(t)
+    }
+    let z2_200_0 = fmul(t, z2_100_0)
+
+    t = fsquare(z2_200_0)
+    for _i in 0..49 {
+        t = fsquare(t)
+    }
+    let z2_250_0 = fmul(t, z2_50_0)
+
+    t = fsquare(z2_250_0)
+    for _i in 0..4 {
+        t = fsquare(t)
+    }
+    fmul(t, z11)
+}
+
+/// The scalar, clamped as RFC 7748 requires.
+///
+/// Three low bits cleared so the scalar is a multiple of the cofactor; the top
+/// bit cleared and the next set so every scalar has the same length. Both
+/// rules exist to remove choices an attacker could otherwise make for you, and
+/// an implementation that skips them is not X25519.
+pub fn clamp(secret: bytes) -> bytes {
+    var k = secret.to_list()
+    k[0] = k[0].bit_and(248)
+    k[31] = k[31].bit_and(127)
+    k[31] = k[31].bit_or(64)
+    bytes_of(k)
+}
+
+/// The Montgomery ladder: 255 steps, each doing the same work whichever bit
+/// it read.
+pub fn scalarmult(scalar: bytes, point: bytes) -> bytes {
+    let k = clamp(scalar).to_list()
+    // The top bit of a u-coordinate is ignored, which RFC 7748 requires and
+    // which stops a peer signalling anything through it.
+    var pb = point.to_list()
+    pb[31] = pb[31].bit_and(127)
+    let x1 = expand(bytes_of(pb))
+
+    var x2 = fone()
+    var z2 = fzero()
+    var x3 = x1
+    var z3 = fone()
+    var swapped = 0
+
+    var pos = 254
+    while pos >= 0 {
+        let bit = k[pos / 8].ushr(pos % 8).bit_and(1)
+        let do_swap = swapped.bit_xor(bit)
+        cswap(do_swap, x2, x3)
+        cswap(do_swap, z2, z3)
+        swapped = bit
+
+        let a = fadd(x2, z2)
+        let aa = fsquare(a)
+        let b = fsub(x2, z2)
+        let bb = fsquare(b)
+        let e = fsub(aa, bb)
+        let c = fadd(x3, z3)
+        let d = fsub(x3, z3)
+        let da = fmul(d, a)
+        let cb = fmul(c, b)
+        let t0 = fadd(da, cb)
+        x3 = fsquare(t0)
+        let t1 = fsub(da, cb)
+        let t2 = fsquare(t1)
+        z3 = fmul(t2, x1)
+        x2 = fmul(aa, bb)
+        // a24 = (486662 - 2) / 4 = 121665
+        let t3 = fscalar(e, 121665)
+        let t4 = fadd(aa, t3)
+        z2 = fmul(e, t4)
+
+        pos = pos - 1
+    }
+    cswap(swapped, x2, x3)
+    cswap(swapped, z2, z3)
+
+    contract(fmul(x2, invert(z2)))
+}
+
+/// The base point, u = 9.
+pub fn base_point() -> bytes {
+    var out: [i64] = [9]
+    for _i in 0..31 {
+        out.push(0)
+    }
+    bytes_of(out)
+}
+
+/// The public key for a secret key.
+pub fn public_key(secret: bytes) -> bytes {
+    scalarmult(secret, base_point())
+}
+
+/// The shared secret. Both sides compute the same value from opposite halves.
+///
+/// **An all-zero result means the peer sent a low-order point** and the shared
+/// secret has no entropy. RFC 7748 leaves whether to check optional; this
+/// answers the check rather than the value, so a caller cannot use one without
+/// having seen the other.
+pub fn shared_secret(secret: bytes, peer_public: bytes) -> Option[bytes] {
+    let s = scalarmult(secret, peer_public)
+    var all_zero = 0
+    for b in s.to_list() {
+        all_zero = all_zero.bit_or(b)
+    }
+    if all_zero == 0 {
+        return None
+    }
+    Some(s)
+}

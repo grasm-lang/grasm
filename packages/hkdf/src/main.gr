@@ -1,0 +1,90 @@
+// HKDF, RFC 5869.
+//
+// Turning one secret into several. Extract concentrates whatever entropy the
+// input has into a fixed-size key; expand stretches that into as much output
+// as is asked for. Both halves are HMAC, and the separation is the point: a
+// Diffie-Hellman result is not uniformly distributed and using it directly as
+// a key is the mistake extract exists to prevent.
+//
+// **The hash is a parameter.** RFC 5869 is defined over any HMAC, this file
+// is used with two — SHA-256, which has published test vectors, and BLAKE2s,
+// which is what the Noise handshake requires. Taking the function rather than
+// choosing one is what lets the same code be *checked* against the world and
+// *used* where the protocol says.
+//
+// Grasm makes that cheap and exact: the parameter's type is
+// `fn(bytes, bytes) -> bytes`, and a function passed here that performed `io`
+// would not typecheck — the row is part of the type ([T-FN-TYPE-ROW-CARRIED]),
+// so a key derivation cannot quietly acquire the ability to log its input.
+
+type Hmac = fn(bytes, bytes) -> bytes
+
+/// Concentrate the input's entropy into one key.
+///
+/// The salt is the HMAC *key* and the secret is the *message*, which reads
+/// backwards and is what the specification says. Getting it the other way
+/// round produces a function that is self-consistent and interoperates with
+/// nothing.
+pub fn extract(hmac: Hmac, salt: bytes, secret: bytes) -> bytes {
+    hmac(salt, secret)
+}
+
+/// Stretch a pseudorandom key into `length` bytes.
+///
+/// Each block is HMAC over the previous block, the info, and a counter that
+/// starts at 1. The previous block is what makes the output a chain rather
+/// than a set of independent hashes, and the counter is what stops two
+/// different lengths sharing a prefix in a way an attacker could use.
+pub fn expand(hmac: Hmac, prk: bytes, info: bytes, length: i64) -> bytes {
+    var out: [i64] = []
+    var previous: [i64] = []
+    var counter = 1
+    while out.len() < length {
+        var block = previous
+        for b in info.to_list() {
+            block.push(b)
+        }
+        block.push(counter)
+        let t = hmac(prk, bytes_of(block))
+        previous = t.to_list()
+        for b in previous {
+            if out.len() < length {
+                out.push(b)
+            }
+        }
+        counter = counter + 1
+        if counter > 255 {
+            // RFC 5869 caps the output at 255 hash lengths, because the
+            // counter is one byte. Stopping here rather than wrapping is the
+            // difference between a short answer and a repeated one.
+            return bytes_of(out)
+        }
+    }
+    bytes_of(out)
+}
+
+/// Both halves, which is what almost every caller wants.
+pub fn derive(hmac: Hmac, salt: bytes, secret: bytes, info: bytes, length: i64) -> bytes {
+    expand(hmac, extract(hmac, salt, secret), info, length)
+}
+
+/// The Noise and WireGuard form: `n` separate 32-byte keys from a chaining key
+/// and an input.
+///
+/// This is HKDF with an empty info and the output cut into pieces, and it is
+/// written separately because that is how the protocol specifications state
+/// it — a reader checking this against WireGuard's paper should see the same
+/// shape, not a general function they have to specialise in their head.
+pub fn kdf(hmac: Hmac, chaining_key: bytes, input: bytes, n: i64) -> [bytes] {
+    let prk = extract(hmac, chaining_key, input)
+    let stream = expand(hmac, prk, bytes_of([]), n * 32)
+    var out: [bytes] = []
+    for i in 0..n {
+        var piece: [i64] = []
+        for j in 0..32 {
+            piece.push(stream.at(i * 32 + j))
+        }
+        out.push(bytes_of(piece))
+    }
+    out
+}

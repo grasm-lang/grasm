@@ -1,0 +1,6 @@
+[package]
+name = "x25519"
+version = "1.0.0"
+entry = "src/main.gr"
+
+capabilities = []

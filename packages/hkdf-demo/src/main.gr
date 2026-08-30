@@ -1,0 +1,102 @@
+import hkdf
+import crypto_hash
+import blake2s
+import bytes_codec
+
+/// A published vector, transcribed. A vector that will not decode is a typo in
+/// this file, not a fact about the code under test, so it fails loudly rather
+/// than quietly testing the empty string.
+fn unhex(s: str) -> bytes {
+    match bytes_codec.decode_hex(s) {
+        Some(b) -> b
+        None -> panic("a test vector in this file is not hex: {s}")
+    }
+}
+
+fn repeated(byte: i64, count: i64) -> bytes {
+    var out: [i64] = []
+    for _i in 0..count {
+        out.push(byte)
+    }
+    bytes_of(out)
+}
+
+fn counting(from: i64, count: i64) -> bytes {
+    var out: [i64] = []
+    for i in 0..count {
+        out.push((from + i).bit_and(255))
+    }
+    bytes_of(out)
+}
+
+fn check(name: str, got: bytes, want: str) {
+    if crypto_hash.hex_of(got) == want {
+        print("  ok    {name}")
+    } else {
+        print("  WRONG {name}")
+        print("        got  {crypto_hash.hex_of(got)}")
+        print("        want {want}")
+    }
+}
+
+fn main() / {io} {
+    let h = crypto_hash.hmac_sha256
+
+    print("-- RFC 5869, the three SHA-256 vectors")
+
+    // Case 1: a short input, a salt, and some info.
+    let ikm1 = repeated(11, 22)
+    let salt1 = unhex("000102030405060708090a0b0c")
+    let info1 = unhex("f0f1f2f3f4f5f6f7f8f9")
+    check("case 1 PRK", hkdf.extract(h, salt1, ikm1),
+        "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5")
+    check("case 1 OKM", hkdf.derive(h, salt1, ikm1, info1, 42),
+        "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865")
+
+    // Case 2: eighty bytes of everything, and an output longer than one hash,
+    // which is what exercises the chaining in expand.
+    let ikm2 = counting(0, 80)
+    let salt2 = counting(96, 80)
+    let info2 = counting(176, 80)
+    check("case 2 PRK", hkdf.extract(h, salt2, ikm2),
+        "06a6b88c5853361a06104c9ceb35b45cef760014904671014a193f40c15fc244")
+    check("case 2 OKM", hkdf.derive(h, salt2, ikm2, info2, 82),
+        "b11e398dc80327a1c8e7f78c596a49344f012eda2d4efad8a050cc4c19afa97c59045a99cac7827271cb41c65e590e09da3275600c2f09b8367793a9aca3db71cc30c58179ec3e87c14c01d5c1f3434f1d87")
+
+    // Case 3: no salt and no info. The salt being absent is not the salt being
+    // zero-length by accident — HMAC pads a short key with zeros, so an empty
+    // key and thirty-two zero bytes are the same key, which is why the RFC can
+    // define the default the way it does.
+    let empty = bytes_of([])
+    check("case 3 PRK", hkdf.extract(h, empty, repeated(11, 22)),
+        "19ef24a32c717b167f33a91d6f648bdf96596776afdb6377ac434c1c293ccb04")
+    check("case 3 OKM", hkdf.derive(h, empty, repeated(11, 22), empty, 42),
+        "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8")
+
+    print("-- the same code over BLAKE2s, which is what the handshake uses")
+    let b = blake2s.hmac
+    let keys = hkdf.kdf(b, unhex("0000000000000000000000000000000000000000000000000000000000000000"),
+        unhex("0102030405"), 3)
+    print("  three keys from one chaining key and one input:")
+    for k in keys {
+        print("    {crypto_hash.hex_of(k)}")
+    }
+
+    // The property that matters for the handshake: each key is a distinct
+    // 32 bytes, and asking for three does not change what the first two are.
+    let two = hkdf.kdf(b, unhex("0000000000000000000000000000000000000000000000000000000000000000"),
+        unhex("0102030405"), 2)
+    let prefix_stable = crypto_hash.hex_of(two[0]) == crypto_hash.hex_of(keys[0]) and
+        crypto_hash.hex_of(two[1]) == crypto_hash.hex_of(keys[1])
+    print("  asking for two gives the same first two: {prefix_stable}")
+
+    let all_distinct = crypto_hash.hex_of(keys[0]) != crypto_hash.hex_of(keys[1]) and
+        crypto_hash.hex_of(keys[1]) != crypto_hash.hex_of(keys[2])
+    print("  the three differ: {all_distinct}")
+
+    // A one-bit change in the input changes every output byte's chance
+    // equally. Not a proof, but a wrong wiring usually fails it outright.
+    let other = hkdf.kdf(b, unhex("0000000000000000000000000000000000000000000000000000000000000000"),
+        unhex("0102030406"), 1)
+    print("  one bit of input changed, key changed: {crypto_hash.hex_of(other[0]) != crypto_hash.hex_of(keys[0])}")
+}
