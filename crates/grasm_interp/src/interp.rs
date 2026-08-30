@@ -3619,30 +3619,55 @@ uses to mark the end of a string"
         if let Some(r) = recv {
             vs.push(r);
         }
+        // Which `inout` arguments name a place another argument also writes
+        // through. Reading those *now* would snapshot the place before the
+        // other argument has changed it, and the writeback afterwards would
+        // then discard that change — `f(inout xs, g(inout xs))` silently lost
+        // `g`'s write, and the compiled backend did not, so the two engines
+        // disagreed about a program that type-checks (F90).
+        let mut deferred: Vec<usize> = Vec::new();
         for (i, a) in args.iter().enumerate() {
-            let takeable = modes.get(i + shift) == Some(&ParamMode::Inout)
-                && place_root_name(a).is_some_and(|root| {
-                    !args
-                        .iter()
-                        .enumerate()
-                        .any(|(j, other)| j != i && mentions_ident(other, &root))
-                });
-            // An `inout` place is resolved once, whether or not the value
-            // is moved out of it, and the writeback uses that.
-            let v = if modes.get(i + shift) == Some(&ParamMode::Inout) {
+            let mentioned_elsewhere = place_root_name(a).is_some_and(|root| {
+                args.iter()
+                    .enumerate()
+                    .any(|(j, other)| j != i && mentions_ident(other, &root))
+            });
+            let is_inout = modes.get(i + shift) == Some(&ParamMode::Inout);
+            let takeable = is_inout && !mentioned_elsewhere;
+            // An `inout` place is resolved once, whether or not the value is
+            // moved out of it, and the writeback uses that. Resolving happens
+            // here in order, so an index expression's own side effects still
+            // run left to right ([E-ORDER-LTR]); only the *read* moves.
+            let v = if is_inout {
                 let segs = self.place_segs(a)?;
                 paths[i + shift] = segs.clone();
-                match (takeable, segs) {
-                    (true, Some(segs)) => match self.take_rooted(a, &segs) {
-                        Some(v) => v,
-                        None => self.eval_expr(a)?,
-                    },
-                    _ => self.eval_expr(a)?,
+                if mentioned_elsewhere {
+                    deferred.push(i + shift);
+                    Value::Unit
+                } else {
+                    match segs {
+                        Some(segs) if takeable => match self.take_rooted(a, &segs) {
+                            Some(v) => v,
+                            None => self.eval_expr(a)?,
+                        },
+                        _ => self.eval_expr(a)?,
+                    }
                 }
             } else {
                 self.eval_expr(a)?
             };
             vs.push(v);
+        }
+        // Now that every other argument has run, read the aliased places. What
+        // the callee receives is what the place holds at the moment of the
+        // call, which is what a reader expects and what the compiled backend
+        // already did.
+        for slot in deferred {
+            let a = &args[slot - shift];
+            vs[slot] = match paths[slot].clone() {
+                Some(segs) => self.read_rooted(a, &segs)?,
+                None => self.eval_expr(a)?,
+            };
         }
         Ok((vs, paths))
     }

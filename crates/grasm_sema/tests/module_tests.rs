@@ -454,3 +454,23 @@ fn a_modules_own_variant_wins_over_an_imported_one() {
     let fixed = caller.replace("fail(Io(", "fail(AError.Io(");
     ok(&[("main", &fixed), ("a", a), ("b", b)]);
 }
+
+/// A mutating call inside another call's argument list, where both write
+/// through the same `inout` place.
+///
+/// The inner write happened and was then erased by the outer call's writeback,
+/// which put back a snapshot taken before the inner call ran. Two engines said
+/// `[100]` and the compiled backend said `[10, 100]` — the reference
+/// implementation being the wrong one (F90).
+///
+/// Checked here as a *type* question only: the program is legal, and it is
+/// `difftest` over `packages/gc-demo` that holds the three engines to one
+/// answer. Found by writing a heap allocator, where
+/// `alloc(h, Cons(alloc(h, ...), tail))` is the ordinary spelling.
+#[test]
+fn a_mutating_call_inside_another_calls_arguments_is_legal() {
+    ok(&[(
+        "main",
+        "fn push_one(inout xs: [i64], v: i64) -> i64 {\n    xs.push(v)\n    xs.len() - 1\n}\n\nfn main() {\n    var xs: [i64] = []\n    let outer = push_one(xs, push_one(xs, 10) + 100)\n    print(\"{xs} {outer}\")\n}\n",
+    )]);
+}

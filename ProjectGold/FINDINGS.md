@@ -105,6 +105,7 @@ and the entries disagree.
 | [F87](#f87) | a diamond dependency wrote a source bundle that could not be loaded | S1, loader | **fixed** |
 | [F88](#f88) | a package stopped compiling because of what stood next to it | S2, types | **fixed** |
 | [F89](#f89) | F88's fix made the checker accept what the engine could not build | S1, types | **fixed** |
+| [F90](#f90) | a write through `inout` was silently discarded, and only in two engines | S1, semantics | **fixed** |
 
 <!-- end index -->
 ## F1 — a wrapped condition must end the line with the operator (S4) — **fixed**
@@ -3842,3 +3843,65 @@ three times.
 **Gate**: `crates/grasm_sema/tests/module_tests.rs` covers the checker's half;
 the engines' half is covered by the corpus, since `packages/gitobj` declares a
 `NotFound` and `difftest` runs it three ways.
+
+## F90 — a write through `inout` was silently discarded, and only in two engines (S1, semantics) — **fixed**
+
+```
+fn push_one(inout xs: [i64], v: i64) -> i64 {
+    xs.push(v)
+    xs.len() - 1
+}
+
+fn main() {
+    var xs: [i64] = []
+    let outer = push_one(xs, push_one(xs, 10) + 100)
+    print("{xs}")
+}
+```
+
+The inner call pushes `10`; the outer pushes `100`. The list should be
+`[10, 100]`.
+
+```
+interpreter   [100]
+bundle        [100]
+native        [10, 100]
+```
+
+**Two answers from three engines, on eleven lines that type-check.** The
+compiled backend was right and the reference implementation was wrong, which is
+the wrong way round for a reference implementation.
+
+The cause is an ordering. An `inout` argument is passed as a snapshot and
+written back afterwards, and the snapshot was taken when the argument was
+evaluated — left to right, so before the *next* argument ran. That next
+argument mutated the same place, and the writeback then put the stale snapshot
+back over it. The inner write did not fail; it happened and was then erased.
+
+The code already knew about this shape. It computes whether an `inout` place is
+named by any other argument, and declines to move the value out when it is —
+so the aliasing was detected and its consequence was not. Half a guard is what
+made this so quiet.
+
+The repair keeps the place resolution where it was, so an index expression's
+own side effects still run left to right ([E-ORDER-LTR]), and moves only the
+**read** to after every other argument. What the callee receives is what the
+place holds at the moment of the call, which is what a reader expects and what
+the compiled backend already did.
+
+**Why no gate had it.** `difftest` runs 275 programs on three engines and would
+have caught this instantly — if any of them nested a mutating call inside
+another call's arguments. None did. It is not an exotic thing to write: it
+appeared on the first line of a heap allocator, `alloc(h, Cons(alloc(h, ...),
+tail))`, which is how anyone building a tree of cells writes it.
+
+That is the shape of the gap worth naming. The corpus is 275 programs somebody
+wrote, and the generators build shapes nobody wrote, and this fell between: too
+ordinary for a generator to have been aimed at it, too specific for anyone to
+have written it by chance.
+
+Found by writing a garbage collector — app #4 of fifteen, whose whole subject
+is a heap of cells that point at each other.
+
+**Gate**: `packages/gc-demo` is in the corpus and allocates exactly this way,
+so `difftest` now runs the shape on three engines every time.

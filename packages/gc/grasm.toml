@@ -1,0 +1,6 @@
+[package]
+name = "gc"
+version = "1.0.0"
+
+# A heap of cells and nothing else. Opens nothing.
+capabilities = []

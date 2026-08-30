@@ -1,0 +1,258 @@
+// Reading s-expressions.
+//
+// The whole syntax is: an atom, or a parenthesised list of them. That is the
+// point of it — a reader fits on one page and the language's data and its code
+// are the same shape — and it is why a Scheme is the right thing to write when
+// what you want to test is the *evaluator* and the *heap* rather than a parser.
+//
+// The reader is still where a hostile input arrives, so depth is bounded. A
+// file of ten thousand open parentheses is four bytes a level of recursion,
+// and a reader without a limit is a stack overflow somebody else chooses.
+
+type Datum =
+    | Nil
+    | Bool(b: bool)
+    | Number(n: i64)
+    | Symbol(name: str)
+    | Text(s: str)
+    | Pair(items: [Datum], tail: Option[Datum])
+
+type ReadError =
+    | UnexpectedEnd(depth: i64)
+    | UnexpectedClose(at: i64)
+    | TooDeep(limit: i64)
+    | BadEscape(at: i64)
+    | BadDot(at: i64)
+
+fn max_depth() -> i64 { 200 }
+
+type Cursor = {
+    text: [str],
+    at: i64,
+}
+
+fn is_space(c: str) -> bool {
+    c == " " or c == "\t" or c == "\n" or c == "\r"
+}
+
+fn is_delimiter(c: str) -> bool {
+    is_space(c) or c == "(" or c == ")" or c == "\"" or c == ";"
+}
+
+fn skip_blank(inout c: Cursor) {
+    var going = true
+    while going {
+        going = false
+        while c.at < c.text.len() and is_space(c.text[c.at]) {
+            c.at = c.at + 1
+        }
+        // A comment runs to the end of the line, and a line may be the end of
+        // the file — which is the case that makes a `while` on the newline
+        // alone loop forever.
+        if c.at < c.text.len() and c.text[c.at] == ";" {
+            while c.at < c.text.len() and c.text[c.at] != "\n" {
+                c.at = c.at + 1
+            }
+            going = true
+        }
+    }
+}
+
+/// Read every datum in a string.
+pub fn read_all(text: str) -> [Datum] ! ReadError {
+    var c = Cursor{ text: text.chars(), at: 0 }
+    var out: [Datum] = []
+    skip_blank(c)
+    while c.at < c.text.len() {
+        out.push(try read_one(c, 0))
+        skip_blank(c)
+    }
+    out
+}
+
+/// Read exactly one datum, and refuse anything after it.
+pub fn read(text: str) -> Datum ! ReadError {
+    let all = try read_all(text)
+    if all.len() == 0 {
+        fail(UnexpectedEnd(0))
+    }
+    all[0]
+}
+
+fn read_one(inout c: Cursor, depth: i64) -> Datum ! ReadError {
+    if depth > max_depth() {
+        fail(TooDeep(max_depth()))
+    }
+    skip_blank(c)
+    if c.at >= c.text.len() {
+        fail(UnexpectedEnd(depth))
+    }
+    let ch = c.text[c.at]
+    if ch == ")" {
+        fail(UnexpectedClose(c.at))
+    }
+    if ch == "(" {
+        c.at = c.at + 1
+        var items: [Datum] = []
+        var tail: Option[Datum] = None
+        var closed = false
+        while not closed {
+            skip_blank(c)
+            if c.at >= c.text.len() {
+                fail(UnexpectedEnd(depth))
+            }
+            if c.text[c.at] == ")" {
+                c.at = c.at + 1
+                closed = true
+            } else if c.text[c.at] == "." and c.at + 1 < c.text.len() and
+                is_delimiter(c.text[c.at + 1]) {
+                // An improper list: `(a . b)`. The dot must have something
+                // before it and exactly one thing after.
+                if items.len() == 0 {
+                    fail(BadDot(c.at))
+                }
+                c.at = c.at + 1
+                tail = Some(try read_one(c, depth + 1))
+                skip_blank(c)
+                if c.at >= c.text.len() or c.text[c.at] != ")" {
+                    fail(BadDot(c.at))
+                }
+                c.at = c.at + 1
+                closed = true
+            } else {
+                items.push(try read_one(c, depth + 1))
+            }
+        }
+        return Pair(items, tail)
+    }
+    if ch == "'" {
+        // `'x` is `(quote x)`, which is not sugar the evaluator has to know
+        // about — it is expanded here, so there is one thing to evaluate.
+        c.at = c.at + 1
+        let quoted = try read_one(c, depth + 1)
+        return Pair([Symbol("quote"), quoted], None)
+    }
+    if ch == "\"" {
+        c.at = c.at + 1
+        var s = ""
+        var done = false
+        while not done {
+            if c.at >= c.text.len() {
+                fail(UnexpectedEnd(depth))
+            }
+            let d = c.text[c.at]
+            c.at = c.at + 1
+            if d == "\"" {
+                done = true
+            } else if d == "\\" {
+                if c.at >= c.text.len() {
+                    fail(BadEscape(c.at))
+                }
+                let e = c.text[c.at]
+                c.at = c.at + 1
+                if e == "n" {
+                    s = s + "\n"
+                } else if e == "t" {
+                    s = s + "\t"
+                } else if e == "\\" or e == "\"" {
+                    s = s + e
+                } else {
+                    fail(BadEscape(c.at))
+                }
+            } else {
+                s = s + d
+            }
+        }
+        return Text(s)
+    }
+
+    var word = ""
+    while c.at < c.text.len() and not is_delimiter(c.text[c.at]) {
+        word = word + c.text[c.at]
+        c.at = c.at + 1
+    }
+    if word == "#t" {
+        return Bool(true)
+    }
+    if word == "#f" {
+        return Bool(false)
+    }
+    match parse_int(word) {
+        Some(n) -> Number(n)
+        None -> Symbol(word)
+    }
+}
+
+/// A number, or nothing if the word is a symbol.
+///
+/// `-` on its own is the subtraction symbol, not a malformed number, and `+5`
+/// is five. Both are cases a naive parser gets wrong in opposite directions.
+fn parse_int(word: str) -> Option[i64] {
+    if word.len() == 0 {
+        return None
+    }
+    var i = 0
+    var negative = false
+    if word.substr(0, 1) == "-" or word.substr(0, 1) == "+" {
+        if word.len() == 1 {
+            return None
+        }
+        negative = word.substr(0, 1) == "-"
+        i = 1
+    }
+    var n = 0
+    while i < word.len() {
+        let c = word.substr(i, 1).to_bytes().at(0)
+        if c < 48 or c > 57 {
+            return None
+        }
+        n = n * 10 + (c - 48)
+        i = i + 1
+    }
+    if negative {
+        Some(0 - n)
+    } else {
+        Some(n)
+    }
+}
+
+/// Write a datum back out, in a form the reader accepts.
+pub fn write(d: Datum) -> str {
+    match d {
+        Nil -> "()"
+        Bool(b) -> if b { "#t" } else { "#f" }
+        Number(n) -> "{n}"
+        Symbol(s) -> s
+        Text(s) -> "\"{escaped(s)}\""
+        Pair(items, tail) -> {
+            var out = "("
+            for i in 0..items.len() {
+                if i > 0 {
+                    out = out + " "
+                }
+                out = out + write(items[i])
+            }
+            match tail {
+                Some(t) -> out = out + " . " + write(t)
+                None -> {}
+            }
+            out + ")"
+        }
+    }
+}
+
+fn escaped(s: str) -> str {
+    var out = ""
+    for ch in s.chars() {
+        if ch == "\"" {
+            out = out + "\\\""
+        } else if ch == "\\" {
+            out = out + "\\\\"
+        } else if ch == "\n" {
+            out = out + "\\n"
+        } else {
+            out = out + ch
+        }
+    }
+    out
+}

@@ -100,12 +100,19 @@ for src in $programs; do
     # has to grow when the library does. `write_bytes` and `proc_pipeline`
     # arrived after it was written, so two conformance programs were reported
     # as *mismatches* rather than skips — the same drift as the committed
-    # module below, in the other direction.
+    # module below, in the other direction. It happened again with the five
+    # file calls a store needed: three demos read and wrote real files and were
+    # counted as disagreements. Anything added to `[L-LIB-BYTES]`'s file table
+    # belongs here on the same day.
     for need in par_map:threads par_filter:threads spawn:threads \
                 tcp_listen:sockets tcp_accept:sockets tcp_connect:sockets \
                 udp_bind:sockets net_wait:sockets \
                 read_file:filesystem write_file:filesystem \
                 read_bytes:filesystem write_bytes:filesystem \
+                read_bytes_at:filesystem append_bytes:filesystem \
+                file_size:filesystem sync_file:filesystem \
+                rename_file:filesystem remove_file:filesystem \
+                file_exists:filesystem \
                 random_bytes:filesystem \
                 list_dir:filesystem make_dir:filesystem \
                 proc_run:processes proc_pipeline:processes; do

@@ -1,0 +1,8 @@
+[package]
+name = "gc_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.gc]
+path = "../gc"
+version = "^1.0.0"

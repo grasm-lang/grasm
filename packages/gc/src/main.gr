@@ -1,0 +1,182 @@
+// A mark-and-sweep heap, written in a language that reference-counts.
+//
+// **This is the point of the exercise.** Grasm frees a value when the last
+// reference to it goes away, which is fast, predictable, and cannot collect a
+// cycle: two objects that point at each other each keep the other's count
+// above zero for ever. Most programs never build one. A Scheme does it on the
+// first line of a recursive definition, because a closure over an environment
+// that holds the closure is a cycle, and `(define (loop) (loop))` is one.
+//
+// So the heap here is not Grasm's. Objects live in a flat list and refer to
+// each other by **index**, which a reference count cannot see and therefore
+// cannot keep alive. Reachability is decided by walking from the roots, and
+// what the walk does not reach is free — cycles included.
+//
+// The cost is the honest one: an index is not a pointer, nothing is freed the
+// moment it dies, and a collection is a pause. Those are the trades every
+// tracing collector makes, and making them in Grasm is what shows the language
+// can host one.
+
+type Cell =
+    | Free
+    | Num(n: i64)
+    | Str(s: str)
+    | Cons(head: i64, tail: i64)
+    | Closure(params: [str], body: i64, env: i64)
+    | Env(names: [str], slots: [i64], parent: i64)
+
+type Heap = {
+    cells: [Cell],
+    free_list: [i64],
+    allocations: i64,
+    collections: i64,
+}
+
+/// The index that means "nothing". Not zero, because zero is a real cell.
+pub fn nil() -> i64 { 0 - 1 }
+
+pub fn new_heap() -> Heap {
+    var none: [Cell] = []
+    var free: [i64] = []
+    Heap{ cells: none, free_list: free, allocations: 0, collections: 0 }
+}
+
+/// Put a cell in the heap and answer where it went.
+///
+/// Reuses a freed slot when there is one, which is what makes a collection
+/// worth doing: without reuse the heap only ever grows and marking is effort
+/// spent for nothing.
+pub fn alloc(inout h: Heap, c: Cell) -> i64 {
+    h.allocations = h.allocations + 1
+    if h.free_list.len() > 0 {
+        let at = h.free_list[h.free_list.len() - 1]
+        h.free_list.pop()
+        h.cells[at] = c
+        return at
+    }
+    h.cells.push(c)
+    h.cells.len() - 1
+}
+
+pub fn get(h: Heap, at: i64) -> Cell {
+    if at < 0 or at >= h.cells.len() {
+        return Free
+    }
+    h.cells[at]
+}
+
+pub fn set(inout h: Heap, at: i64, c: Cell) {
+    if at >= 0 and at < h.cells.len() {
+        h.cells[at] = c
+    }
+}
+
+/// How many cells are in use.
+pub fn live(h: Heap) -> i64 {
+    var n = 0
+    for c in h.cells {
+        match c {
+            Free -> {}
+            _other -> n = n + 1
+        }
+    }
+    n
+}
+
+pub fn capacity(h: Heap) -> i64 {
+    h.cells.len()
+}
+
+pub fn collections(h: Heap) -> i64 {
+    h.collections
+}
+
+/// Mark everything reachable from the roots, then free the rest.
+///
+/// The marking is iterative rather than recursive, with an explicit stack. A
+/// recursive mark is the shorter code and it overflows on a list a million
+/// long — which is data, not a bug in the program being collected, so the
+/// collector must not be the thing that fails.
+pub fn collect(inout h: Heap, roots: [i64]) -> i64 {
+    h.collections = h.collections + 1
+    var marked: [bool] = []
+    for _i in 0..h.cells.len() {
+        marked.push(false)
+    }
+    var stack: [i64] = []
+    for r in roots {
+        if r >= 0 and r < h.cells.len() {
+            stack.push(r)
+        }
+    }
+    while stack.len() > 0 {
+        let at = stack[stack.len() - 1]
+        stack.pop()
+        if at < 0 or at >= h.cells.len() or marked[at] {
+            // Already seen. This is the line that makes a cycle terminate: the
+            // second visit stops rather than following the loop again.
+            continue
+        }
+        marked[at] = true
+        match h.cells[at] {
+            Cons(head, tail) -> {
+                stack.push(head)
+                stack.push(tail)
+            }
+            Closure(_p, body, env) -> {
+                stack.push(body)
+                stack.push(env)
+            }
+            Env(_n, slots, parent) -> {
+                for s in slots {
+                    stack.push(s)
+                }
+                stack.push(parent)
+            }
+            _other -> {}
+        }
+    }
+
+    var freed = 0
+    for i in 0..h.cells.len() {
+        if not marked[i] {
+            match h.cells[i] {
+                Free -> {}
+                _other -> {
+                    h.cells[i] = Free
+                    h.free_list.push(i)
+                    freed = freed + 1
+                }
+            }
+        }
+    }
+    freed
+}
+
+/// Build a list from values already in the heap, answering its head.
+pub fn list_of(inout h: Heap, items: [i64]) -> i64 {
+    var at = nil()
+    var i = items.len() - 1
+    while i >= 0 {
+        at = alloc(h, Cons(items[i], at))
+        i = i - 1
+    }
+    at
+}
+
+/// Walk a list back out. Stops at the length given, so a list made circular
+/// on purpose does not hang the reader.
+pub fn list_items(h: Heap, head: i64, limit: i64) -> [i64] {
+    var out: [i64] = []
+    var at = head
+    while at != nil() and out.len() < limit {
+        match get(h, at) {
+            Cons(v, next) -> {
+                out.push(v)
+                at = next
+            }
+            _other -> at = nil()
+        }
+    }
+    out
+}

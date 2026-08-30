@@ -1,0 +1,138 @@
+import gc
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+
+    print("-- the thing a reference count cannot do")
+    // Two cells pointing at each other. Every count is one, nothing is
+    // reachable, and a refcounting collector frees neither of them ever.
+    var h = gc.new_heap()
+    let a = gc.alloc(h, Cons(gc.nil(), gc.nil()))
+    let b = gc.alloc(h, Cons(a, gc.nil()))
+    gc.set(h, a, Cons(b, gc.nil()))
+    say(f, "two cells hold each other and nothing else holds them",
+        gc.live(h) == 2)
+    let none: [i64] = []
+    let freed = gc.collect(h, none)
+    say(f, "a trace from no roots frees both", freed == 2 and gc.live(h) == 0)
+
+    print("-- a longer cycle, and one with a tail hanging off it")
+    var h2 = gc.new_heap()
+    // A ring of ten.
+    var ring: [i64] = []
+    for _i in 0..10 {
+        ring.push(gc.alloc(h2, Cons(gc.nil(), gc.nil())))
+    }
+    for i in 0..10 {
+        gc.set(h2, ring[i], Cons(ring[(i + 1) % 10], gc.nil()))
+    }
+    // And a chain of five hanging off one of them, so the sweep has to follow
+    // a cycle *into* something that is only reachable through it.
+    var tail = gc.nil()
+    for i in 0..5 {
+        tail = gc.alloc(h2, Cons(gc.alloc(h2, Num(i)), tail))
+    }
+    gc.set(h2, ring[3], Cons(ring[4], tail))
+    // Ten for the ring, and ten for the chain — five numbers and the five
+    // pairs holding them. The first version of this said 25 and counted the
+    // numbers twice.
+    say(f, "a ten-ring plus a five-pair chain is 20 cells", gc.live(h2) == 20)
+    say(f, "reachable from the ring, nothing is freed",
+        gc.collect(h2, [ring[0]]) == 0 and gc.live(h2) == 20)
+    say(f, "and with no root, all 20 go", gc.collect(h2, none) == 20)
+
+    print("-- keeping what is reachable")
+    var h3 = gc.new_heap()
+    let keep = gc.list_of(h3, [gc.alloc(h3, Num(1)), gc.alloc(h3, Num(2)),
+                               gc.alloc(h3, Num(3))])
+    let drop = gc.list_of(h3, [gc.alloc(h3, Num(9)), gc.alloc(h3, Num(8))])
+    let before = gc.live(h3)
+    let gone = gc.collect(h3, [keep])
+    say(f, "the unreachable list goes", gone == 4)
+    say(f, "the reachable one stays", gc.live(h3) == before - 4)
+    let items = gc.list_items(h3, keep, 100)
+    say(f, "and still reads back correctly", items.len() == 3)
+    var values_right = true
+    for i in 0..3 {
+        match gc.get(h3, items[i]) {
+            Num(n) -> {
+                if n != i + 1 {
+                    values_right = false
+                }
+            }
+            _other -> values_right = false
+        }
+    }
+    say(f, "with the right values", values_right)
+
+    print("-- a closure over an environment that holds the closure")
+    // This is what `(define (loop) (loop))` builds, and it is a cycle on the
+    // first line of any recursive definition.
+    var h4 = gc.new_heap()
+    let body = gc.alloc(h4, Num(42))
+    let env = gc.alloc(h4, Env([], [], gc.nil()))
+    let fn_cell = gc.alloc(h4, Closure(["x"], body, env))
+    gc.set(h4, env, Env(["loop"], [fn_cell], gc.nil()))
+    say(f, "the closure and its environment hold each other", gc.live(h4) == 3)
+    say(f, "held by a root, nothing is collected",
+        gc.collect(h4, [fn_cell]) == 0)
+    say(f, "dropped, all three go", gc.collect(h4, none) == 3)
+
+    print("-- freed slots are reused, or a collection buys nothing")
+    var h5 = gc.new_heap()
+    for _i in 0..100 {
+        let _x = gc.alloc(h5, Num(1))
+    }
+    let cap_before = gc.capacity(h5)
+    let _f5 = gc.collect(h5, none)
+    for _i in 0..100 {
+        let _y = gc.alloc(h5, Num(2))
+    }
+    say(f, "100 allocations after freeing 100 grow the heap by nothing",
+        gc.capacity(h5) == cap_before)
+    say(f, "and it is still 100 cells", gc.live(h5) == 100)
+
+    print("-- a list long enough to overflow a recursive collector")
+    var h6 = gc.new_heap()
+    var long = gc.nil()
+    for i in 0..50000 {
+        long = gc.alloc(h6, Cons(gc.alloc(h6, Num(i)), long))
+    }
+    say(f, "100000 cells", gc.live(h6) == 100000)
+    say(f, "marking a 50000-deep list does not overflow",
+        gc.collect(h6, [long]) == 0)
+    say(f, "and dropping it frees every one", gc.collect(h6, none) == 100000)
+
+    print("-- edges")
+    var h7 = gc.new_heap()
+    say(f, "collecting an empty heap frees nothing", gc.collect(h7, none) == 0)
+    say(f, "a root that is not a cell is ignored", gc.collect(h7, [999]) == 0)
+    say(f, "so is the nil index", gc.collect(h7, [gc.nil()]) == 0)
+    let one = gc.alloc(h7, Num(7))
+    say(f, "a root pointing at itself twice is marked once",
+        gc.collect(h7, [one, one]) == 0 and gc.live(h7) == 1)
+    // A list made circular on purpose must not hang the reader.
+    var h8 = gc.new_heap()
+    let c1 = gc.alloc(h8, Cons(gc.nil(), gc.nil()))
+    gc.set(h8, c1, Cons(gc.alloc(h8, Num(1)), c1))
+    say(f, "reading a circular list stops at the limit",
+        gc.list_items(h8, c1, 10).len() == 10)
+
+    print("-- how much work it did")
+    print("    heap 6: {gc.capacity(h6)} slots, {gc.collections(h6)} collections")
+
+    if f == 0 {
+        print("all checks passed")
+    } else {
+        print("{f} check(s) failed")
+    }
+}
