@@ -1,0 +1,236 @@
+// TLS 1.3: the key schedule and the record layer.
+//
+// TLS 1.2 derived keys with a bespoke construction and had a dozen ways to
+// negotiate itself into something weak. 1.3 replaced all of it with one shape
+// — HKDF, applied in a fixed ladder — and deleted every option that was ever
+// a vulnerability. What is left is small enough to implement correctly, which
+// was the point of the redesign.
+//
+// The ladder, from RFC 8446 section 7.1:
+//
+//     0 ──> HKDF-Extract(psk)          = early secret
+//              │ Derive-Secret("derived")
+//              v
+//     ECDHE ─> HKDF-Extract            = handshake secret
+//              │  ├─ "c hs traffic"    client handshake keys
+//              │  └─ "s hs traffic"    server handshake keys
+//              │ Derive-Secret("derived")
+//              v
+//     0 ────> HKDF-Extract             = master secret
+//                 ├─ "c ap traffic"    client application keys
+//                 └─ "s ap traffic"    server application keys
+//
+// **Every secret is bound to the transcript.** `Derive-Secret` mixes in the
+// hash of every handshake message so far, so a secret is a function not only
+// of the key exchange but of exactly what both sides said — which is what
+// makes a downgrade or a modified extension change the keys and break the
+// connection rather than succeed quietly.
+//
+// This is the whole of TLS 1.3's cryptography. **It is not a TLS client**:
+// there is no certificate parsing and no signature verification here, so
+// nothing in this file can tell you who you are talking to. Building the
+// handshake on top of it without that would be an encrypted connection to an
+// unknown party, which is worse than no connection because it looks like one.
+
+import crypto_hash
+import hkdf
+import aes
+
+fn hash_length() -> i64 { 32 }
+
+/// The zero-filled secret the ladder starts from and returns to.
+pub fn zeros() -> bytes {
+    var out: [i64] = []
+    for _i in 0..hash_length() {
+        out.push(0)
+    }
+    bytes_of(out)
+}
+
+fn hmac(key: bytes, message: bytes) -> bytes {
+    crypto_hash.hmac_sha256(key, message)
+}
+
+/// HKDF-Expand-Label, the one derivation TLS 1.3 uses.
+///
+/// The label is prefixed with `tls13 ` before hashing, which is what stops a
+/// key derived for TLS being the same as one derived by any other protocol
+/// that also uses HKDF with the same secret. The length is written into the
+/// info too, so asking for sixteen bytes and asking for thirty-two give
+/// unrelated answers rather than one being a prefix of the other.
+pub fn expand_label(secret: bytes, label: str, context: bytes, length: i64) -> bytes {
+    var info: [i64] = []
+    info.push(length.ushr(8).bit_and(255))
+    info.push(length.bit_and(255))
+    let full = "tls13 {label}".to_bytes()
+    info.push(full.len())
+    for b in full.to_list() {
+        info.push(b)
+    }
+    info.push(context.len())
+    for b in context.to_list() {
+        info.push(b)
+    }
+    hkdf.expand(hmac, secret, bytes_of(info), length)
+}
+
+/// Derive-Secret: expand a label over the transcript hash.
+pub fn derive_secret(secret: bytes, label: str, transcript: bytes) -> bytes {
+    expand_label(secret, label, crypto_hash.sha256_of(transcript), hash_length())
+}
+
+/// The same, when the transcript hash is already in hand.
+pub fn derive_secret_hashed(secret: bytes, label: str, transcript_hash: bytes) -> bytes {
+    expand_label(secret, label, transcript_hash, hash_length())
+}
+
+/// The three secrets the ladder produces, in order.
+type Schedule = {
+    early: bytes,
+    handshake: bytes,
+    master: bytes,
+}
+
+/// Walk the ladder.
+///
+/// `psk` is the zero secret for a handshake without a pre-shared key, which is
+/// the ordinary case; `shared` is the Diffie-Hellman output.
+pub fn schedule_of(psk: bytes, shared: bytes) -> Schedule {
+    let early = hkdf.extract(hmac, zeros(), psk)
+    // The empty transcript here is not an omission: RFC 8446 specifies
+    // `Derive-Secret(., "derived", "")` between stages, over *no* messages,
+    // because the purpose is to move the secret forward rather than to bind it
+    // to anything.
+    let to_handshake = derive_secret(early, "derived", bytes_of([]))
+    let handshake = hkdf.extract(hmac, to_handshake, shared)
+    let to_master = derive_secret(handshake, "derived", bytes_of([]))
+    let master = hkdf.extract(hmac, to_master, zeros())
+    Schedule{ early: early, handshake: handshake, master: master }
+}
+
+/// A direction's key and initialisation vector.
+type TrafficKeys = {
+    secret: bytes,
+    key: bytes,
+    iv: bytes,
+}
+
+/// The keys a traffic secret produces.
+///
+/// Sixteen bytes of key and twelve of IV, which is AES-128-GCM's shape. The
+/// IV is not a nonce: it is combined with the record's sequence number below,
+/// which is what makes every record's nonce different without either side
+/// sending one.
+pub fn traffic_keys(secret: bytes) -> TrafficKeys {
+    TrafficKeys{
+        secret: secret,
+        key: expand_label(secret, "key", bytes_of([]), 16),
+        iv: expand_label(secret, "iv", bytes_of([]), 12),
+    }
+}
+
+/// The client's and server's handshake secrets, bound to the transcript.
+pub fn handshake_traffic(s: Schedule, transcript_hash: bytes) -> (bytes, bytes) {
+    (derive_secret_hashed(s.handshake, "c hs traffic", transcript_hash),
+     derive_secret_hashed(s.handshake, "s hs traffic", transcript_hash))
+}
+
+/// The same for application data, bound to a longer transcript.
+pub fn application_traffic(s: Schedule, transcript_hash: bytes) -> (bytes, bytes) {
+    (derive_secret_hashed(s.master, "c ap traffic", transcript_hash),
+     derive_secret_hashed(s.master, "s ap traffic", transcript_hash))
+}
+
+/// The `Finished` message's key, and the value it carries.
+///
+/// This is what proves both sides derived the same secrets. It is an HMAC over
+/// the transcript under a key that only someone holding the handshake secret
+/// could compute, so a man in the middle who altered any message cannot
+/// produce it.
+pub fn finished_value(traffic_secret: bytes, transcript_hash: bytes) -> bytes {
+    let key = expand_label(traffic_secret, "finished", bytes_of([]), hash_length())
+    hmac(key, transcript_hash)
+}
+
+/// The nonce for record number `n`.
+///
+/// The sequence number is written right-aligned into twelve zero bytes and
+/// XORed with the IV. Two consequences worth stating: the number never travels
+/// on the wire, so an attacker cannot desynchronise it; and a sequence number
+/// reused under one key repeats a nonce, which for GCM loses the key — so a
+/// connection must rekey long before it wraps.
+pub fn record_nonce(iv: bytes, sequence: i64) -> bytes {
+    var out: [i64] = []
+    for i in 0..12 {
+        var v = iv.at(i)
+        if i >= 4 {
+            v = v.bit_xor(sequence.ushr((11 - i) * 8).bit_and(255))
+        }
+        out.push(v)
+    }
+    bytes_of(out)
+}
+
+type RecordError =
+    | NotAuthentic
+    | TooShort(length: i64)
+    | NoContentType
+    | Overlong(length: i64)
+
+fn max_record() -> i64 { 16640 }
+
+/// Seal one record.
+///
+/// The real content type is appended to the plaintext and the outer header
+/// always says `application_data`, which is TLS 1.3 hiding what kind of
+/// message a record holds. The header is the associated data, so it cannot be
+/// altered without the tag failing.
+pub fn seal_record(k: TrafficKeys, sequence: i64, content_type: i64,
+                   plaintext: bytes) -> bytes ! RecordError {
+    var inner = plaintext.to_list()
+    inner.push(content_type)
+    let length = inner.len() + 16
+    if length > max_record() {
+        fail(Overlong(length))
+    }
+    var header: [i64] = [23, 3, 3, length.ushr(8).bit_and(255), length.bit_and(255)]
+    let sealed = aes.gcm_seal(k.key, record_nonce(k.iv, sequence),
+                              bytes_of(header), bytes_of(inner))
+    var out = header
+    for b in sealed.to_list() {
+        out.push(b)
+    }
+    bytes_of(out)
+}
+
+/// Open one record, answering the content type and the plaintext.
+pub fn open_record(k: TrafficKeys, sequence: i64, record: bytes) -> (i64, bytes) ! RecordError {
+    if record.len() < 22 {
+        fail(TooShort(record.len()))
+    }
+    let length = record.at(3).shl(8).bit_or(record.at(4))
+    if length + 5 != record.len() {
+        fail(TooShort(record.len()))
+    }
+    let header = record.slice(0, 5)
+    let body = record.slice(5, length)
+    let inner = match aes.gcm_open(k.key, record_nonce(k.iv, sequence), header, body) {
+        Ok(b) -> b
+        Err(_e) -> fail(NotAuthentic)
+    }
+    // Trailing zeros are padding and are stripped from the end; the last
+    // non-zero byte is the real content type. A record that is all padding has
+    // no type and is refused rather than guessed at.
+    var last = inner.len() - 1
+    while last >= 0 and inner.at(last) == 0 {
+        last = last - 1
+    }
+    if last < 0 {
+        fail(NoContentType)
+    }
+    (inner.at(last), inner.slice(0, last))
+}
+
+pub fn content_handshake() -> i64 { 22 }
+pub fn content_application() -> i64 { 23 }
+pub fn content_alert() -> i64 { 21 }

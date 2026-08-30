@@ -4356,6 +4356,14 @@ only a number or a `bool` can come out — compute what you need and yield that"
                 let (def_id, vi) = cands[0];
                 return self.instantiate_variant(def_id, vi, &[], id.span);
             } else if cands.len() > 1 {
+                // A module's own variant wins, as it does for one with
+                // arguments (F88). This path was missed by that fix, so a
+                // *nullary* variant went on being ambiguous inside the very
+                // module that declared it — `aes` could not name its own
+                // `NotAuthentic` once `tls13` declared one too (F91).
+                if let Some((def_id, vi)) = self.own_variant(&cands) {
+                    return self.instantiate_variant(def_id, vi, &[], id.span);
+                }
                 return self.error_help(
                     id.span,
                     format!("`{}` is ambiguous — it names a variant of multiple types", id.name),
@@ -4545,6 +4553,30 @@ only a number or a `bool` can come out — compute what you need and yield that"
         Type::Named {
             id: def_id,
             args: fresh,
+        }
+    }
+
+    /// The one candidate this module declares, when there is exactly one.
+    ///
+    /// Two sites ask the same question — a variant with arguments and one
+    /// without — and they gave different answers for a while, because the fix
+    /// for F88 taught only the first. One function so a third site cannot make
+    /// it three answers.
+    fn own_variant(&self, cands: &[(TypeDefId, usize)]) -> Option<(TypeDefId, usize)> {
+        let mine: Vec<(TypeDefId, usize)> = cands
+            .iter()
+            .filter(|(def_id, _)| {
+                let name = self.defs.get(*def_id).name.clone();
+                self.type_module
+                    .get(&name)
+                    .is_some_and(|m| *m == self.current_module)
+            })
+            .copied()
+            .collect();
+        if mine.len() == 1 {
+            Some(mine[0])
+        } else {
+            None
         }
     }
 
@@ -5143,18 +5175,7 @@ fail outside it",
                         // how a reader of that file reads it. Ambiguity is
                         // reserved for the case that really is one: a module
                         // with no `Io` of its own, seeing two.
-                        let mine: Vec<(TypeDefId, usize)> = cands
-                            .iter()
-                            .filter(|(def_id, _)| {
-                                let name = self.defs.get(*def_id).name.clone();
-                                self.type_module
-                                    .get(&name)
-                                    .is_some_and(|m| *m == self.current_module)
-                            })
-                            .copied()
-                            .collect();
-                        if mine.len() == 1 {
-                            let (def_id, vi) = mine[0];
+                        if let Some((def_id, vi)) = self.own_variant(&cands) {
                             return self.instantiate_variant(def_id, vi, args, span);
                         }
                         return self.error_help(

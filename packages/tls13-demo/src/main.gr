@@ -1,0 +1,190 @@
+import tls13
+import crypto_hash
+import bytes_codec
+
+fn unhex(s: str) -> bytes {
+    match bytes_codec.decode_hex(s) {
+        Some(b) -> b
+        None -> panic("not hex")
+    }
+}
+fn hex(b: bytes) -> str { bytes_codec.encode_hex(b) }
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn check(inout f: i64, name: str, got: bytes, want: str) / {io} {
+    if hex(got) == want {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        print("        got  {hex(got)}")
+        print("        want {want}")
+        f = f + 1
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+
+    print("-- the key schedule, against RFC 8448's published trace")
+    // The Diffie-Hellman output from RFC 8448 section 3. The first three
+    // secrets below are printed in that document, so this is a comparison
+    // against the specification rather than against another run of this code.
+    let shared = unhex("8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d")
+    let s = tls13.schedule_of(tls13.zeros(), shared)
+    check(f, "early secret", s.early,
+        "33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a")
+    check(f, "derived, between early and handshake",
+        tls13.derive_secret(s.early, "derived", bytes_of([])),
+        "6f2615a108c702c5678f54fc9dbab69716c076189c48250cebeac3576c3611ba")
+    check(f, "handshake secret", s.handshake,
+        "1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac")
+    check(f, "master secret", s.master,
+        "18df06843d13a08bf2a449844c5f8a478001bc4d4c627984d5a41da8d0402919")
+
+    print("-- traffic secrets, bound to a transcript")
+    let transcript = "transcript so far".to_bytes()
+    let th = crypto_hash.sha256_of(transcript)
+    let hs = tls13.handshake_traffic(s, th)
+    check(f, "client handshake traffic secret", hs.0,
+        "f510d3739b83ddec4c881106663059b14ba54ee853bb451a596ba861a7d176a6")
+    check(f, "server handshake traffic secret", hs.1,
+        "b8b74cbb3428fb21fc76d5d961c6ad0b5c670b58dd965b4e16601770dd5b1b98")
+    let k = tls13.traffic_keys(hs.1)
+    check(f, "the key it expands to", k.key, "a24044691fd370fa8203bec4cad09e24")
+    check(f, "and the iv", k.iv, "a43b2ac6c32d6b61bf87c4ee")
+    check(f, "the Finished value", tls13.finished_value(hs.1, th),
+        "fba2919835f8545a9d0eef20c13b3ef70165e921061a8bc486c2b06f27d54c24")
+
+    print("-- the transcript is what binds a secret to what was said")
+    let other = crypto_hash.sha256_of("transcript so fat".to_bytes())
+    say(f, "one byte of the transcript changes every traffic secret",
+        hex(tls13.handshake_traffic(s, other).1) != hex(hs.1))
+    say(f, "a different shared secret changes the whole ladder",
+        hex(tls13.schedule_of(tls13.zeros(), unhex("00" + hex(shared).substr(2, 62))).handshake)
+        != hex(s.handshake))
+    say(f, "asking for sixteen bytes is not a prefix of asking for thirty-two",
+        hex(tls13.expand_label(hs.1, "key", bytes_of([]), 16))
+        != hex(tls13.expand_label(hs.1, "key", bytes_of([]), 32)).substr(0, 32))
+    say(f, "and a different label gives an unrelated key",
+        hex(tls13.expand_label(hs.1, "key", bytes_of([]), 16))
+        != hex(tls13.expand_label(hs.1, "iv", bytes_of([]), 16)))
+
+    print("-- record nonces")
+    say(f, "record 0 uses the iv unchanged",
+        hex(tls13.record_nonce(k.iv, 0)) == hex(k.iv))
+    say(f, "record 1 differs from record 0",
+        hex(tls13.record_nonce(k.iv, 1)) != hex(tls13.record_nonce(k.iv, 0)))
+    say(f, "and a thousand records give a thousand nonces", all_distinct(k.iv))
+
+    print("-- the record layer")
+    let message = "hello from a record".to_bytes()
+    match tls13.seal_record(k, 0, tls13.content_application(), message) {
+        Ok(record) -> {
+            say(f, "the header says application data, whatever is inside",
+                record.at(0) == 23)
+            say(f, "the length in the header matches the record",
+                record.at(3).shl(8).bit_or(record.at(4)) + 5 == record.len())
+            say(f, "the plaintext is not on the wire", not contains(record, message))
+            match tls13.open_record(k, 0, record) {
+                Ok(opened) -> {
+                    say(f, "it opens to what went in", hex(opened.1) == hex(message))
+                    say(f, "and reports the real content type",
+                        opened.0 == tls13.content_application())
+                }
+                Err(_e) -> say(f, "the record opens", false)
+            }
+            // The header is the associated data, so altering it must fail.
+            say(f, "a record opened at the wrong sequence number is refused",
+                not opens(k, 1, record))
+            say(f, "a record with a tampered header is refused",
+                not opens(k, 0, flip(record, 3)))
+            say(f, "a record with a tampered body is refused",
+                not opens(k, 0, flip(record, 20)))
+            say(f, "a record with a tampered tag is refused",
+                not opens(k, 0, flip(record, record.len() - 2)))
+            say(f, "a truncated record is refused",
+                not opens(k, 0, record.slice(0, record.len() - 4)))
+        }
+        Err(_e) -> say(f, "a record seals", false)
+    }
+    // A handshake record hides as application data too, which is the point.
+    match tls13.seal_record(k, 5, tls13.content_handshake(), "finished".to_bytes()) {
+        Ok(r) -> {
+            say(f, "a handshake record is labelled application data on the wire",
+                r.at(0) == 23)
+            match tls13.open_record(k, 5, r) {
+                Ok(o) -> say(f, "and its real type comes back inside",
+                    o.0 == tls13.content_handshake())
+                Err(_e) -> say(f, "the handshake record opens", false)
+            }
+        }
+        Err(_e) -> say(f, "a handshake record seals", false)
+    }
+    var huge: [i64] = []
+    for _i in 0..20000 {
+        huge.push(65)
+    }
+    match tls13.seal_record(k, 0, 23, bytes_of(huge)) {
+        Ok(_r) -> say(f, "a record past the size limit is refused", false)
+        Err(_e) -> say(f, "a record past the size limit is refused", true)
+    }
+
+    if f == 0 {
+        print("all checks passed")
+    } else {
+        print("{f} check(s) failed")
+    }
+}
+
+fn opens(k: TrafficKeys, seq: i64, r: bytes) -> bool {
+    match tls13.open_record(k, seq, r) {
+        Ok(_x) -> true
+        Err(_e) -> false
+    }
+}
+
+fn flip(b: bytes, at: i64) -> bytes {
+    var out = b.to_list()
+    out[at] = out[at].bit_xor(1)
+    bytes_of(out)
+}
+
+fn all_distinct(iv: bytes) -> bool {
+    var seen: [str] = []
+    for i in 0..1000 {
+        let n = bytes_codec.encode_hex(tls13.record_nonce(iv, i))
+        for s in seen {
+            if s == n {
+                return false
+            }
+        }
+        seen.push(n)
+    }
+    true
+}
+
+fn contains(hay: bytes, needle: bytes) -> bool {
+    if needle.len() > hay.len() {
+        return false
+    }
+    for start in 0..(hay.len() - needle.len() + 1) {
+        var same = true
+        for i in 0..needle.len() {
+            if hay.at(start + i) != needle.at(i) {
+                same = false
+            }
+        }
+        if same {
+            return true
+        }
+    }
+    false
+}

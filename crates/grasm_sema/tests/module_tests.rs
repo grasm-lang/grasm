@@ -453,6 +453,14 @@ fn a_modules_own_variant_wins_over_an_imported_one() {
     // Qualifying it is the way out, and still works.
     let fixed = caller.replace("fail(Io(", "fail(AError.Io(");
     ok(&[("main", &fixed), ("a", a), ("b", b)]);
+
+    // And the same for a variant with *no* fields, which is read at a
+    // different site in the checker and went on being ambiguous after the
+    // first fix (F91). Two spellings of one question.
+    let na = "type AErr =\n    | Nope\n\npub fn go(n: i64) -> i64 ! AErr {\n    if n < 0 {\n        fail(Nope)\n    }\n    n\n}\n";
+    let nb = "type BErr =\n    | Nope\n\npub fn go(n: i64) -> i64 ! BErr {\n    if n < 0 {\n        fail(Nope)\n    }\n    n\n}\n";
+    let nmain = "import a\nimport b\n\nfn main() {\n    match a.go(1) {\n        Ok(v) -> print(\"{v}\")\n        Err(e) -> print(\"no\")\n    }\n    match b.go(2) {\n        Ok(v) -> print(\"{v}\")\n        Err(e) -> print(\"no\")\n    }\n}\n";
+    ok(&[("main", nmain), ("a", na), ("b", nb)]);
 }
 
 /// A mutating call inside another call's argument list, where both write

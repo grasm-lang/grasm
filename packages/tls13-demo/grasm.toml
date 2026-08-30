@@ -1,0 +1,16 @@
+[package]
+name = "tls13_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.tls13]
+path = "../tls13"
+version = "^1.0.0"
+
+[dependencies.crypto_hash]
+path = "../crypto_hash"
+version = "^1.0.0"
+
+[dependencies.bytes_codec]
+path = "../bytes"
+version = "^1.0.0"

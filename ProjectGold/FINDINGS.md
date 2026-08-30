@@ -106,6 +106,7 @@ and the entries disagree.
 | [F88](#f88) | a package stopped compiling because of what stood next to it | S2, types | **fixed** |
 | [F89](#f89) | F88's fix made the checker accept what the engine could not build | S1, types | **fixed** |
 | [F90](#f90) | a write through `inout` was silently discarded, and only in two engines | S1, semantics | **fixed** |
+| [F91](#f91) | F88's fix reached variants with arguments and not those without | S2, types | **fixed** |
 
 <!-- end index -->
 ## F1 — a wrapped condition must end the line with the operator (S4) — **fixed**
@@ -3905,3 +3906,39 @@ is a heap of cells that point at each other.
 
 **Gate**: `packages/gc-demo` is in the corpus and allocates exactly this way,
 so `difftest` now runs the shape on three engines every time.
+
+## F91 — F88's fix reached variants with arguments and not those without (S2, types) — **fixed**
+
+```
+packages/aes/src/main.gr:414: error: `NotAuthentic` is ambiguous —
+    it names a variant of multiple types
+            Err(_e) -> fail(NotAuthentic)
+```
+
+`aes` declares `GcmError` with a `NotAuthentic`. `tls13` declares `RecordError`
+with one too, which is the obvious name in both. F88 established that a
+module's own variant wins, so this should have resolved — and did not, because
+a *nullary* variant is read at a different site in the checker and that site
+was never taught the rule.
+
+So `aes` could not name its own variant, in its own file, because another
+package existed. That is F88's exact symptom, surviving F88's fix.
+
+Two sites asked the same question and gave different answers for a day, which
+is the shape worth recording rather than the instance. The repair is one
+function, `own_variant`, called from both — so a third site cannot make it
+three answers.
+
+**A fix that names one code path fixes one code path.** F88 was found through
+`fail(Io(path))`, which carries an argument, and the fix was written where that
+lands. Nothing was checking whether the same name is resolved anywhere else,
+and nothing would have: a regression test written from the bug that was found
+tests the path that was found.
+
+Found by writing TLS 1.3, whose record layer wants a `NotAuthentic` for the
+same reason an AEAD does — two packages reaching for one obvious name, which is
+the same way F88 and F82 were found.
+
+**Gate**: `crates/grasm_sema/tests/module_tests.rs` now covers both spellings
+in one test, and `packages/aes` and `packages/tls13` are both in the corpus and
+both declare a `NotAuthentic`, so `difftest` runs the pair three ways.

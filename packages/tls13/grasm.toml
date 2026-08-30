@@ -1,0 +1,19 @@
+[package]
+name = "tls13"
+version = "1.0.0"
+
+# Key material in, key material out. It opens no socket: a record layer that
+# could reach the network would be a record layer nobody could test offline.
+capabilities = []
+
+[dependencies.crypto_hash]
+path = "../crypto_hash"
+version = "^1.0.0"
+
+[dependencies.hkdf]
+path = "../hkdf"
+version = "^1.0.0"
+
+[dependencies.aes]
+path = "../aes"
+version = "^1.0.0"
