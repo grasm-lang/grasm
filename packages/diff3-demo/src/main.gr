@@ -1,0 +1,123 @@
+import diff3
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn merged_text(base: str, ours: str, theirs: str) -> str {
+    let m = diff3.merge(diff3.split_lines(base), diff3.split_lines(ours),
+        diff3.split_lines(theirs))
+    diff3.join_lines(diff3.render(m, "ours", "theirs"))
+}
+
+fn conflict_count(base: str, ours: str, theirs: str) -> i64 {
+    diff3.merge(diff3.split_lines(base), diff3.split_lines(ours),
+        diff3.split_lines(theirs)).conflicts
+}
+
+fn main() / {io} {
+    var f = 0
+
+    print("-- the cases a merge exists to distinguish")
+    let base = "one\ntwo\nthree\nfour\nfive\n"
+
+    // Only one side changed: the change wins with no conflict. This is the
+    // case a two-way diff cannot get right, because it cannot tell which side
+    // is the edit.
+    say(f, "they changed a line and we did not",
+        merged_text(base, base, "one\ntwo\nCHANGED\nfour\nfive\n")
+        == "one\ntwo\nCHANGED\nfour\nfive\n")
+    say(f, "and it is not a conflict",
+        conflict_count(base, base, "one\ntwo\nCHANGED\nfour\nfive\n") == 0)
+    say(f, "we changed a line and they did not",
+        merged_text(base, "one\nOURS\nthree\nfour\nfive\n", base)
+        == "one\nOURS\nthree\nfour\nfive\n")
+
+    // Different lines: both changes land.
+    say(f, "each side changed a different line",
+        merged_text(base, "ONE\ntwo\nthree\nfour\nfive\n",
+            "one\ntwo\nthree\nfour\nFIVE\n")
+        == "ONE\ntwo\nthree\nfour\nFIVE\n")
+    say(f, "which is not a conflict either",
+        conflict_count(base, "ONE\ntwo\nthree\nfour\nfive\n",
+            "one\ntwo\nthree\nfour\nFIVE\n") == 0)
+
+    // The same change on both sides is not a conflict.
+    let both = "one\ntwo\nSAME\nfour\nfive\n"
+    say(f, "both sides made the same change", merged_text(base, both, both) == both)
+    say(f, "which is not a conflict", conflict_count(base, both, both) == 0)
+
+    print("-- and the case that is a conflict")
+    let ours = "one\ntwo\nMINE\nfour\nfive\n"
+    let theirs = "one\ntwo\nYOURS\nfour\nfive\n"
+    say(f, "both sides changed the same line", conflict_count(base, ours, theirs) == 1)
+    let text = merged_text(base, ours, theirs)
+    say(f, "and the markers are Git's",
+        text == "one\ntwo\n<<<<<<< ours\nMINE\n=======\nYOURS\n>>>>>>> theirs\nfour\nfive\n")
+
+    print("-- insertions and deletions")
+    say(f, "they added a line at the end",
+        merged_text(base, base, "one\ntwo\nthree\nfour\nfive\nsix\n")
+        == "one\ntwo\nthree\nfour\nfive\nsix\n")
+    say(f, "they added a line at the start",
+        merged_text(base, base, "zero\none\ntwo\nthree\nfour\nfive\n")
+        == "zero\none\ntwo\nthree\nfour\nfive\n")
+    say(f, "they deleted a line",
+        merged_text(base, base, "one\ntwo\nfour\nfive\n")
+        == "one\ntwo\nfour\nfive\n")
+    say(f, "we deleted and they changed the same line",
+        conflict_count(base, "one\ntwo\nfour\nfive\n",
+            "one\ntwo\nCHANGED\nfour\nfive\n") == 1)
+    say(f, "each side added a different line at the end",
+        conflict_count(base, "one\ntwo\nthree\nfour\nfive\nours\n",
+            "one\ntwo\nthree\nfour\nfive\ntheirs\n") == 1)
+
+    print("-- the empty and identical cases")
+    say(f, "nothing changed at all", merged_text(base, base, base) == base)
+    say(f, "and reports no conflict", conflict_count(base, base, base) == 0)
+    say(f, "an empty base with both sides adding the same thing",
+        merged_text("", "new\n", "new\n") == "new\n")
+    say(f, "an empty base with both sides adding different things",
+        conflict_count("", "ours\n", "theirs\n") == 1)
+    say(f, "both sides deleted everything", merged_text(base, "", "") == "")
+    say(f, "we deleted everything and they did not",
+        merged_text(base, "", base) == "")
+
+    print("-- diff3 style, which keeps what the line was")
+    let m = diff3.merge(diff3.split_lines(base), diff3.split_lines(ours),
+        diff3.split_lines(theirs))
+    let with_base = diff3.join_lines(diff3.render_with_base(m, "ours", "base", "theirs"))
+    say(f, "the base appears between the two sides",
+        with_base == "one\ntwo\n<<<<<<< ours\nMINE\n||||||| base\nthree\n=======\nYOURS\n>>>>>>> theirs\nfour\nfive\n")
+
+    print("-- lines")
+    say(f, "a trailing newline does not make an empty last line",
+        diff3.split_lines("a\nb\n").len() == 2)
+    say(f, "a file without a trailing newline keeps its last line",
+        diff3.split_lines("a\nb").len() == 2)
+    say(f, "an empty string has no lines", diff3.split_lines("").len() == 0)
+    say(f, "a lone newline is one empty line", diff3.split_lines("\n").len() == 1)
+
+    print("-- a merge too large to align")
+    // Past the limit nothing is matched, which makes everything one conflict
+    // rather than a wrong answer.
+    var big: [str] = []
+    for i in 0..3000 {
+        big.push("line {i}")
+    }
+    say(f, "a file past the alignment limit yields no matches",
+        diff3.common_lines(big, big, 1000).len() == 0)
+    say(f, "and inside it, matches every line",
+        diff3.common_lines(big, big, 100000000).len() == 3000)
+
+    if f == 0 {
+        print("all checks passed")
+    } else {
+        print("{f} check(s) failed")
+    }
+}

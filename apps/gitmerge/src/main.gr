@@ -1,0 +1,54 @@
+// A three-way merge, with the same interface as `git merge-file -p`.
+//
+// Taking git's argument order and marker format on purpose: it makes the two
+// directly comparable, which is what `scripts/git_interop.sh` does. A merge
+// tool that agrees with itself has not been checked.
+//
+// Exits 1 when there are conflicts, as git does, so a script can tell.
+//
+// With no arguments it prints usage and exits 0, which is what the corpus
+// gates run it as.
+
+import diff3
+
+fn main() / {io} {
+    let argv = args()
+    if argv.len() < 3 {
+        print("usage: gitmerge <ours> <base> <theirs>")
+        return
+    }
+    let ours = match read_file(argv[0]) {
+        Ok(t) -> t
+        Err(_e) -> {
+            print("cannot read {argv[0]}")
+            return
+        }
+    }
+    let base = match read_file(argv[1]) {
+        Ok(t) -> t
+        Err(_e) -> {
+            print("cannot read {argv[1]}")
+            return
+        }
+    }
+    let theirs = match read_file(argv[2]) {
+        Ok(t) -> t
+        Err(_e) -> {
+            print("cannot read {argv[2]}")
+            return
+        }
+    }
+    let m = diff3.merge(diff3.split_lines(base), diff3.split_lines(ours),
+        diff3.split_lines(theirs))
+    let lines = diff3.render(m, argv[0], argv[2])
+    // Printed line by line rather than as one joined string, so a merge that
+    // produces nothing prints nothing. Joining and printing emitted a blank
+    // line for the empty result, which disagreed with git for a reason that
+    // had nothing to do with merging.
+    for l in lines {
+        print(l)
+    }
+    if m.conflicts > 0 {
+        exit(1)
+    }
+}

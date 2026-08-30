@@ -1,0 +1,10 @@
+[package]
+name = "gitmerge"
+version = "0.1.0"
+entry = "src/main.gr"
+
+capabilities = ["io"]
+
+[dependencies.diff3]
+path = "../../packages/diff3"
+version = "^1.0.0"

@@ -1,0 +1,8 @@
+[package]
+name = "diff3_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.diff3]
+path = "../diff3"
+version = "^1.0.0"

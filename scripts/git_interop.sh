@@ -150,5 +150,49 @@ else
     fi
 fi
 
+# --- and the merge, against git's own -------------------------------------
+#
+# `git merge-file` is the reference for three-way merging, and it is installed
+# here, so the output is compared directly rather than checked for
+# plausibility. Only the marker labels are normalised away: git names the
+# files it was given and so does this, but the gate's paths differ from the
+# names a person would use.
+if ! "$GRASM" build apps/gitmerge/src/main.gr --native -o "$WORK/gitmerge" >/dev/null 2>&1; then
+    echo "  FAIL: the merge tool would not build"
+    fail=$((fail + 1))
+else
+    M="$WORK/merge"
+    mkdir -p "$M"
+    merge_case() {
+        printf '%b' "$2" > "$M/base"
+        printf '%b' "$3" > "$M/ours"
+        printf '%b' "$4" > "$M/theirs"
+        git merge-file -p "$M/ours" "$M/base" "$M/theirs" > "$M/git.out" 2>/dev/null
+        "$WORK/gitmerge" "$M/ours" "$M/base" "$M/theirs" > "$M/our.out" 2>/dev/null
+        sed -E 's/^(<<<<<<<|>>>>>>>|\|\|\|\|\|\|\|).*/\1/' "$M/git.out" > "$M/g.norm"
+        sed -E 's/^(<<<<<<<|>>>>>>>|\|\|\|\|\|\|\|).*/\1/' "$M/our.out" > "$M/o.norm"
+        if diff -q "$M/g.norm" "$M/o.norm" >/dev/null 2>&1; then
+            note yes
+        else
+            note no "merge differs from git: $1"
+            diff "$M/g.norm" "$M/o.norm" | head -4
+        fi
+    }
+    merge_case "they changed, we did not"   "a\nb\nc\n" "a\nb\nc\n" "a\nB\nc\n"
+    merge_case "we changed, they did not"   "a\nb\nc\n" "a\nB\nc\n" "a\nb\nc\n"
+    merge_case "different lines"            "a\nb\nc\nd\n" "A\nb\nc\nd\n" "a\nb\nc\nD\n"
+    merge_case "same change both sides"     "a\nb\nc\n" "a\nX\nc\n" "a\nX\nc\n"
+    merge_case "conflicting change"         "a\nb\nc\n" "a\nMINE\nc\n" "a\nYOURS\nc\n"
+    merge_case "they appended"              "a\nb\n" "a\nb\n" "a\nb\nc\n"
+    merge_case "they prepended"             "a\nb\n" "a\nb\n" "z\na\nb\n"
+    merge_case "they deleted a line"        "a\nb\nc\n" "a\nb\nc\n" "a\nc\n"
+    merge_case "delete against change"      "a\nb\nc\n" "a\nc\n" "a\nB\nc\n"
+    merge_case "both append differently"    "a\n" "a\nours\n" "a\ntheirs\n"
+    merge_case "nothing changed"            "a\nb\n" "a\nb\n" "a\nb\n"
+    merge_case "both deleted everything"    "a\nb\n" "" ""
+    merge_case "a longer file, one edit each side" \
+        "1\n2\n3\n4\n5\n6\n7\n8\n" "1\n2\nX\n4\n5\n6\n7\n8\n" "1\n2\n3\n4\n5\nY\n7\n8\n"
+fi
+
 echo "checked: $((pass + fail))   agreeing: $pass   disagreeing: $fail"
 [ "$fail" -eq 0 ]

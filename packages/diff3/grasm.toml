@@ -1,0 +1,6 @@
+[package]
+name = "diff3"
+version = "1.0.0"
+
+# Lines in, lines out. Opens nothing.
+capabilities = []

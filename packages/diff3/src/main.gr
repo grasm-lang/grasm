@@ -1,0 +1,261 @@
+// Diff, and the three-way merge built on it.
+//
+// A merge has three inputs, not two: what the file was, and the two things it
+// became. With only two you can see that they differ but not who changed what,
+// so every line that is not identical looks like a conflict. With the common
+// ancestor you can tell "they changed this and we did not" from "we both
+// changed it", and only the second is a conflict a person has to resolve.
+//
+// The algorithm is diff3's: align each side against the base, find the lines
+// all three agree on — the **sync points** — and look at what sits between
+// them. Between two sync points, either one side changed and the other did
+// not, in which case the change wins, or both changed, in which case either
+// they made the same change or a person is needed.
+//
+// **The conflict markers are Git's**, byte for byte, because a file with
+// conflicts in it is read by people and by tools that already know that shape.
+
+type Chunk =
+    | Stable(lines: [str])
+    | Resolved(lines: [str])
+    | Conflict(ours: [str], base: [str], theirs: [str])
+
+type Merged = {
+    chunks: [Chunk],
+    conflicts: i64,
+}
+
+/// The longest common subsequence of two line lists, as pairs of indices.
+///
+/// Quadratic in memory, which is why `limit` exists: two files of ten thousand
+/// lines would want a hundred million cells. Past the limit nothing is
+/// matched, which degrades a merge to "both sides changed everything" — a
+/// conflict rather than a wrong answer.
+pub fn common_lines(a: [str], b: [str], limit: i64) -> [(i64, i64)] {
+    var out: [(i64, i64)] = []
+    if a.len() * b.len() > limit {
+        return out
+    }
+    let w = b.len() + 1
+    var table: [i64] = []
+    for _i in 0..((a.len() + 1) * w) {
+        table.push(0)
+    }
+    var i = a.len() - 1
+    while i >= 0 {
+        var j = b.len() - 1
+        while j >= 0 {
+            if a[i] == b[j] {
+                table[i * w + j] = table[(i + 1) * w + j + 1] + 1
+            } else {
+                let down = table[(i + 1) * w + j]
+                let right = table[i * w + j + 1]
+                table[i * w + j] = if down > right { down } else { right }
+            }
+            j = j - 1
+        }
+        i = i - 1
+    }
+    var x = 0
+    var y = 0
+    while x < a.len() and y < b.len() {
+        if a[x] == b[y] {
+            out.push((x, y))
+            x = x + 1
+            y = y + 1
+        } else if table[(x + 1) * w + y] >= table[x * w + y + 1] {
+            x = x + 1
+        } else {
+            y = y + 1
+        }
+    }
+    out
+}
+
+fn default_limit() -> i64 { 4000000 }
+
+fn slice_of(xs: [str], from: i64, upto: i64) -> [str] {
+    var out: [str] = []
+    var i = from
+    while i < upto {
+        out.push(xs[i])
+        i = i + 1
+    }
+    out
+}
+
+fn same(a: [str], b: [str]) -> bool {
+    if a.len() != b.len() {
+        return false
+    }
+    for i in 0..a.len() {
+        if a[i] != b[i] {
+            return false
+        }
+    }
+    true
+}
+
+/// Merge two versions of a file given the one they both came from.
+pub fn merge(base: [str], ours: [str], theirs: [str]) -> Merged {
+    let mo = common_lines(base, ours, default_limit())
+    let mt = common_lines(base, theirs, default_limit())
+
+    // Where a base line survived into *both* sides. Only there is it safe to
+    // say the three files are aligned, because only there does one base line
+    // correspond to a known line in each.
+    var sync_base: [i64] = []
+    var sync_ours: [i64] = []
+    var sync_theirs: [i64] = []
+    var ti = 0
+    for pair in mo {
+        while ti < mt.len() and mt[ti].0 < pair.0 {
+            ti = ti + 1
+        }
+        if ti < mt.len() and mt[ti].0 == pair.0 {
+            sync_base.push(pair.0)
+            sync_ours.push(pair.1)
+            sync_theirs.push(mt[ti].1)
+        }
+    }
+
+    var chunks: [Chunk] = []
+    var conflicts = 0
+    var b_at = 0
+    var o_at = 0
+    var t_at = 0
+    var k = 0
+    while k <= sync_base.len() {
+        // The region before the next sync point, or the tail after the last.
+        let b_to = if k < sync_base.len() { sync_base[k] } else { base.len() }
+        let o_to = if k < sync_ours.len() { sync_ours[k] } else { ours.len() }
+        let t_to = if k < sync_theirs.len() { sync_theirs[k] } else { theirs.len() }
+
+        let b_part = slice_of(base, b_at, b_to)
+        let o_part = slice_of(ours, o_at, o_to)
+        let t_part = slice_of(theirs, t_at, t_to)
+
+        if o_part.len() > 0 or t_part.len() > 0 or b_part.len() > 0 {
+            if same(o_part, t_part) {
+                // Both sides made the same edit, or neither made one. Either
+                // way there is nothing to decide.
+                chunks.push(Resolved(o_part))
+            } else if same(o_part, b_part) {
+                chunks.push(Resolved(t_part))
+            } else if same(t_part, b_part) {
+                chunks.push(Resolved(o_part))
+            } else {
+                conflicts = conflicts + 1
+                chunks.push(Conflict(o_part, b_part, t_part))
+            }
+        }
+
+        if k < sync_base.len() {
+            chunks.push(Stable([base[sync_base[k]]]))
+            b_at = sync_base[k] + 1
+            o_at = sync_ours[k] + 1
+            t_at = sync_theirs[k] + 1
+        }
+        k = k + 1
+    }
+
+    Merged{ chunks: chunks, conflicts: conflicts }
+}
+
+/// The merged file as lines, with Git's conflict markers where needed.
+pub fn render(m: Merged, ours_label: str, theirs_label: str) -> [str] {
+    var out: [str] = []
+    for c in m.chunks {
+        match c {
+            Stable(ls) -> {
+                for l in ls {
+                    out.push(l)
+                }
+            }
+            Resolved(ls) -> {
+                for l in ls {
+                    out.push(l)
+                }
+            }
+            Conflict(o, _b, t) -> {
+                out.push("<<<<<<< {ours_label}")
+                for l in o {
+                    out.push(l)
+                }
+                out.push("=======")
+                for l in t {
+                    out.push(l)
+                }
+                out.push(">>>>>>> {theirs_label}")
+            }
+        }
+    }
+    out
+}
+
+/// The same, keeping the base between the two sides — Git's `diff3` style.
+///
+/// It is more to read and it is what a person actually needs: knowing what the
+/// line *was* is usually what decides which side is right.
+pub fn render_with_base(m: Merged, ours_label: str, base_label: str,
+                        theirs_label: str) -> [str] {
+    var out: [str] = []
+    for c in m.chunks {
+        match c {
+            Stable(ls) -> {
+                for l in ls {
+                    out.push(l)
+                }
+            }
+            Resolved(ls) -> {
+                for l in ls {
+                    out.push(l)
+                }
+            }
+            Conflict(o, b, t) -> {
+                out.push("<<<<<<< {ours_label}")
+                for l in o {
+                    out.push(l)
+                }
+                out.push("||||||| {base_label}")
+                for l in b {
+                    out.push(l)
+                }
+                out.push("=======")
+                for l in t {
+                    out.push(l)
+                }
+                out.push(">>>>>>> {theirs_label}")
+            }
+        }
+    }
+    out
+}
+
+/// Split text into lines the way a merge needs: a trailing newline does not
+/// make an extra empty line, but a file that ends without one is different
+/// from a file that ends with one, and that difference survives.
+pub fn split_lines(text: str) -> [str] {
+    var out: [str] = []
+    var current = ""
+    for ch in text.chars() {
+        if ch == "\n" {
+            out.push(current)
+            current = ""
+        } else {
+            current = current + ch
+        }
+    }
+    if current.len() > 0 {
+        out.push(current)
+    }
+    out
+}
+
+pub fn join_lines(lines: [str]) -> str {
+    var s = ""
+    for l in lines {
+        s = s + l + "\n"
+    }
+    s
+}
