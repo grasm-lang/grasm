@@ -1,0 +1,228 @@
+// A build system: what to rebuild, and how to know a build is unnecessary.
+//
+// The question a build system answers is not "what changed" but **"is the
+// output I already have the output I would produce"**. Those differ, and the
+// difference is the whole argument between timestamps and hashing.
+//
+// A timestamp says a file was written, not that it was written *differently* —
+// so `touch` rebuilds the world, and a file restored from a backup with an old
+// date is silently not rebuilt. A **content hash over the inputs and the
+// command** says exactly what the output depends on, so an unchanged file that
+// was rewritten costs nothing and a changed one cannot be missed.
+//
+// That hash is also the cache key, which is what makes a build shareable: two
+// machines that computed the same key are entitled to each other's output,
+// because the key covers everything that went into it.
+//
+// **What the key covers is the correctness argument.** Miss an input and the
+// cache returns a stale artefact that looks fresh — the worst failure a build
+// system has, because it is silent and it is reproducible. So the key here
+// covers the command, the inputs' contents, *and the keys of every dependency*,
+// which is what makes it transitive.
+
+import blake2s
+import bytes_codec
+
+type Task = {
+    name: str,
+    command: str,
+    inputs: [str],
+    depends_on: [str],
+}
+
+type Plan = {
+    tasks: [Task],
+}
+
+type PlanError =
+    | UnknownTask(name: str)
+    | Cycle(names: [str])
+
+pub fn new_plan() -> Plan {
+    var t: [Task] = []
+    Plan{ tasks: t }
+}
+
+pub fn add_task(inout p: Plan, name: str, command: str, inputs: [str],
+                depends_on: [str]) {
+    p.tasks.push(Task{
+        name: name,
+        command: command,
+        inputs: inputs,
+        depends_on: depends_on,
+    })
+}
+
+fn index_of(p: Plan, name: str) -> i64 {
+    for i in 0..p.tasks.len() {
+        if p.tasks[i].name == name {
+            return i
+        }
+    }
+    0 - 1
+}
+
+/// The order tasks may run in: every task after everything it depends on.
+///
+/// A cycle is reported by name rather than as a boolean, because the useful
+/// thing to tell someone is *which* tasks are in it. Returning "there is a
+/// cycle" leaves them to find it.
+pub fn order_of(p: Plan) -> [str] ! PlanError {
+    var placed: [str] = []
+    var remaining: [str] = []
+    for t in p.tasks {
+        remaining.push(t.name)
+        for d in t.depends_on {
+            if index_of(p, d) < 0 {
+                fail(UnknownTask(d))
+            }
+        }
+    }
+    var going = true
+    while going and remaining.len() > 0 {
+        var progressed = false
+        var still: [str] = []
+        for name in remaining {
+            let i = index_of(p, name)
+            var ready = true
+            for d in p.tasks[i].depends_on {
+                var done = false
+                for q in placed {
+                    if q == d {
+                        done = true
+                    }
+                }
+                if not done {
+                    ready = false
+                }
+            }
+            if ready {
+                placed.push(name)
+                progressed = true
+            } else {
+                still.push(name)
+            }
+        }
+        remaining = still
+        if not progressed {
+            going = false
+        }
+    }
+    if remaining.len() > 0 {
+        fail(Cycle(remaining))
+    }
+    placed
+}
+
+/// The key for a task: its command, its inputs' contents, and its
+/// dependencies' keys.
+///
+/// Taking the dependencies' *keys* rather than their names is what makes this
+/// transitive: a change three levels down alters the key here, so nothing has
+/// to walk the graph a second time to notice.
+///
+/// Lengths are written before each piece. Without them, a command of `ab` with
+/// input `c` and a command of `a` with input `bc` would hash the same — which
+/// is a collision an attacker can arrange and a user can hit by accident.
+pub fn key_of(p: Plan, name: str, contents: [str], content_names: [str]) -> str ! PlanError {
+    let i = index_of(p, name)
+    if i < 0 {
+        fail(UnknownTask(name))
+    }
+    let t = p.tasks[i]
+    var material: [i64] = []
+    put_piece(material, t.command)
+    for input in t.inputs {
+        put_piece(material, input)
+        var found = false
+        for j in 0..content_names.len() {
+            if content_names[j] == input {
+                put_piece(material, contents[j])
+                found = true
+            }
+        }
+        if not found {
+            // A missing input is hashed as its own marker rather than skipped.
+            // Skipping would make "input absent" and "input empty" the same
+            // key, and those are different builds.
+            put_piece(material, "\u{0000}absent")
+        }
+    }
+    for d in t.depends_on {
+        let child = try key_of(p, d, contents, content_names)
+        put_piece(material, child)
+    }
+    bytes_codec.encode_hex(blake2s.hash(bytes_of(material)))
+}
+
+fn put_piece(inout out: [i64], s: str) {
+    let b = s.to_bytes()
+    for i in 0..8 {
+        out.push(b.len().ushr((7 - i) * 8).bit_and(255))
+    }
+    for v in b.to_list() {
+        out.push(v)
+    }
+}
+
+/// What a cache holds: a key, and the output produced under it.
+type Cache = {
+    keys: [str],
+    outputs: [str],
+    hits: i64,
+    misses: i64,
+}
+
+pub fn new_cache() -> Cache {
+    var k: [str] = []
+    var o: [str] = []
+    Cache{ keys: k, outputs: o, hits: 0, misses: 0 }
+}
+
+pub fn lookup(inout c: Cache, key: str) -> Option[str] {
+    for i in 0..c.keys.len() {
+        if c.keys[i] == key {
+            c.hits = c.hits + 1
+            return Some(c.outputs[i])
+        }
+    }
+    c.misses = c.misses + 1
+    None
+}
+
+pub fn store(inout c: Cache, key: str, output: str) {
+    for i in 0..c.keys.len() {
+        if c.keys[i] == key {
+            // Storing the same key twice is not an update. The key covers
+            // everything that produced the output, so a second answer under
+            // one key would mean the build is not deterministic — and quietly
+            // replacing the first would hide that.
+            return
+        }
+    }
+    c.keys.push(key)
+    c.outputs.push(output)
+}
+
+pub fn hits(c: Cache) -> i64 { c.hits }
+pub fn misses(c: Cache) -> i64 { c.misses }
+pub fn entries(c: Cache) -> i64 { c.keys.len() }
+
+pub fn reset_counts(inout c: Cache) {
+    c.hits = 0
+    c.misses = 0
+}
+
+/// Which tasks would actually run, given what is already cached.
+pub fn work_to_do(p: Plan, inout c: Cache, contents: [str],
+                  content_names: [str]) -> [str] ! PlanError {
+    var out: [str] = []
+    for name in try order_of(p) {
+        let key = try key_of(p, name, contents, content_names)
+        match lookup(c, key) {
+            Some(_o) -> {}
+            None -> out.push(name)
+        }
+    }
+    out
+}

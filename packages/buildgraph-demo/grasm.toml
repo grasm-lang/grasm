@@ -1,0 +1,8 @@
+[package]
+name = "buildgraph_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.buildgraph]
+path = "../buildgraph"
+version = "^1.0.0"

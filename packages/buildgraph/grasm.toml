@@ -1,0 +1,13 @@
+[package]
+name = "buildgraph"
+version = "1.0.0"
+
+capabilities = []
+
+[dependencies.blake2s]
+path = "../blake2s"
+version = "^1.0.0"
+
+[dependencies.bytes_codec]
+path = "../bytes"
+version = "^1.0.0"

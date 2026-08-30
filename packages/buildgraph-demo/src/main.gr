@@ -1,0 +1,177 @@
+import buildgraph
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+/// A small C-like project: two objects, a library, and a binary.
+fn project() -> Plan {
+    var p = buildgraph.new_plan()
+    let none: [str] = []
+    buildgraph.add_task(p, "a.o", "cc -c a.c", ["a.c", "shared.h"], none)
+    buildgraph.add_task(p, "b.o", "cc -c b.c", ["b.c", "shared.h"], none)
+    buildgraph.add_task(p, "lib.a", "ar rcs", [], ["a.o", "b.o"])
+    buildgraph.add_task(p, "app", "cc -o app", ["main.c"], ["lib.a"])
+    p
+}
+
+fn files(shared: str) -> ([str], [str]) {
+    (["int a(void);", "int b(void);", shared, "int main(void)\{}"],
+     ["a.c", "b.c", "shared.h", "main.c"])
+}
+
+fn key(p: Plan, name: str, shared: str) -> str {
+    let fs = files(shared)
+    match buildgraph.key_of(p, name, fs.0, fs.1) {
+        Ok(k) -> k
+        Err(_e) -> "ERROR"
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+    let p = project()
+
+    print("-- the order tasks may run in")
+    match buildgraph.order_of(p) {
+        Ok(order) -> {
+            say(f, "four tasks", order.len() == 4)
+            say(f, "objects before the library",
+                position(order, "a.o") < position(order, "lib.a")
+                and position(order, "b.o") < position(order, "lib.a"))
+            say(f, "and the library before the binary",
+                position(order, "lib.a") < position(order, "app"))
+        }
+        Err(_e) -> say(f, "the plan orders", false)
+    }
+
+    print("-- keys cover everything that went in")
+    let base = key(p, "app", "#define N 1")
+    say(f, "a key is a hex digest", base.len() == 64)
+    say(f, "the same inputs give the same key", key(p, "app", "#define N 1") == base)
+    // A header three levels down: app depends on lib.a depends on a.o reads
+    // shared.h. Nothing walks the graph twice to notice.
+    say(f, "a change three levels down changes it",
+        key(p, "app", "#define N 2") != base)
+    say(f, "and two different tasks have different keys",
+        key(p, "a.o", "#define N 1") != key(p, "b.o", "#define N 1"))
+    // The length prefixes: without them these two would collide.
+    var q = buildgraph.new_plan()
+    let none: [str] = []
+    buildgraph.add_task(q, "x", "ab", ["c"], none)
+    buildgraph.add_task(q, "y", "a", ["bc"], none)
+    let contents = ["1", "1"]
+    let names = ["c", "bc"]
+    match buildgraph.key_of(q, "x", contents, names) {
+        Ok(kx) -> {
+            match buildgraph.key_of(q, "y", contents, names) {
+                Ok(ky) -> say(f, "`ab`+`c` does not collide with `a`+`bc`", kx != ky)
+                Err(_e) -> say(f, "the second key computes", false)
+            }
+        }
+        Err(_e) -> say(f, "the first key computes", false)
+    }
+    // A missing input is not the same as an empty one.
+    match buildgraph.key_of(q, "x", ["" ], ["c"]) {
+        Ok(with_empty) -> {
+            match buildgraph.key_of(q, "x", none, none) {
+                Ok(with_absent) -> say(f, "an absent input differs from an empty one",
+                    with_empty != with_absent)
+                Err(_e) -> say(f, "the absent key computes", false)
+            }
+        }
+        Err(_e) -> say(f, "the empty key computes", false)
+    }
+
+    print("-- the cache turns a second build into nothing")
+    var c = buildgraph.new_cache()
+    let fs = files("#define N 1")
+    match buildgraph.work_to_do(p, c, fs.0, fs.1) {
+        Ok(work) -> say(f, "the first build runs all four", work.len() == 4)
+        Err(_e) -> say(f, "the first build plans", false)
+    }
+    // Pretend they ran.
+    for name in ["a.o", "b.o", "lib.a", "app"] {
+        buildgraph.store(c, key(p, name, "#define N 1"), "output of {name}")
+    }
+    buildgraph.reset_counts(c)
+    match buildgraph.work_to_do(p, c, fs.0, fs.1) {
+        Ok(work) -> {
+            say(f, "the second build runs nothing", work.len() == 0)
+            say(f, "and it was four cache hits", buildgraph.hits(c) == 4)
+        }
+        Err(_e) -> say(f, "the second build plans", false)
+    }
+
+    print("-- a change rebuilds only what it reaches")
+    // `b.c` is read by `b.o`, which `lib.a` and `app` depend on. `a.o` does
+    // not read it and must not be rebuilt.
+    let changed = (["int a(void);", "int b(void); // edited", "#define N 1",
+                    "int main(void)\{}"], ["a.c", "b.c", "shared.h", "main.c"])
+    match buildgraph.work_to_do(p, c, changed.0, changed.1) {
+        Ok(work) -> {
+            say(f, "three tasks rebuild", work.len() == 3)
+            say(f, "and a.o is not one of them", position(work, "a.o") < 0)
+            say(f, "while b.o, lib.a and app are",
+                position(work, "b.o") >= 0 and position(work, "lib.a") >= 0
+                and position(work, "app") >= 0)
+        }
+        Err(_e) -> say(f, "the changed build plans", false)
+    }
+
+    print("-- a shared cache is what the key being complete buys")
+    // A second machine with an empty cache, given the first machine's entries,
+    // has nothing to do. That only works because the key covers everything.
+    var other = buildgraph.new_cache()
+    for name in ["a.o", "b.o", "lib.a", "app"] {
+        buildgraph.store(other, key(p, name, "#define N 1"), "from another machine")
+    }
+    match buildgraph.work_to_do(p, other, fs.0, fs.1) {
+        Ok(work) -> say(f, "another machine's outputs are usable", work.len() == 0)
+        Err(_e) -> say(f, "the shared build plans", false)
+    }
+    // Storing a second answer under one key is refused, because the key covers
+    // everything that produced it.
+    let before = buildgraph.entries(other)
+    buildgraph.store(other, key(p, "app", "#define N 1"), "a different answer")
+    say(f, "one key cannot hold two answers", buildgraph.entries(other) == before)
+
+    print("-- plans that cannot be built")
+    var bad = buildgraph.new_plan()
+    buildgraph.add_task(bad, "x", "cc", none, ["y"])
+    buildgraph.add_task(bad, "y", "cc", none, ["x"])
+    say(f, "a cycle is refused", orders_fail(bad))
+    var missing = buildgraph.new_plan()
+    buildgraph.add_task(missing, "x", "cc", none, ["nowhere"])
+    say(f, "a dependency that does not exist is refused", orders_fail(missing))
+    var self_dep = buildgraph.new_plan()
+    buildgraph.add_task(self_dep, "x", "cc", none, ["x"])
+    say(f, "a task depending on itself is refused", orders_fail(self_dep))
+
+    if f == 0 {
+        print("all checks passed")
+    } else {
+        print("{f} check(s) failed")
+    }
+}
+
+fn position(xs: [str], name: str) -> i64 {
+    for i in 0..xs.len() {
+        if xs[i] == name {
+            return i
+        }
+    }
+    0 - 1
+}
+
+fn orders_fail(p: Plan) -> bool {
+    match buildgraph.order_of(p) {
+        Ok(_o) -> false
+        Err(_e) -> true
+    }
+}
