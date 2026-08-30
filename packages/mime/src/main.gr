@@ -1,0 +1,241 @@
+// MIME: how arbitrary bytes travel through a system built for seven-bit text.
+//
+// SMTP was specified when a mail relay could legitimately strip the eighth bit
+// of every byte, refuse a line over 998 characters, and rewrite anything that
+// looked like a line ending. All three still happen. MIME is the set of
+// encodings that survive them, and the reason a modern message is full of
+// `=E2=82=AC` and `=?UTF-8?B?...?=`.
+//
+// **Quoted-printable** leaves printable ASCII alone and writes everything else
+// as `=` and two hex digits, so a mostly-English message stays readable. Its
+// traps are at the edges: a line may not exceed 76 characters, so long lines
+// get a **soft break** — a `=` at the end of a line, meaning "this line
+// continues and the break is not part of the text" — and trailing whitespace
+// must be encoded, because a relay is allowed to strip it.
+//
+// **Encoded-words** (RFC 2047) put non-ASCII into a *header*, where
+// quoted-printable's rules do not apply and a different, stricter dialect
+// does: no spaces at all, since a header folds on them.
+
+import bytes_codec
+
+type MimeError =
+    | BadHex(at: i64)
+    | BadEncodedWord(why: str)
+    | Overlong(length: i64)
+
+fn hex_digits() -> str { "0123456789ABCDEF" }
+
+fn is_printable(b: i64) -> bool {
+    // Printable ASCII except `=`, which introduces an escape and so must be
+    // escaped itself.
+    (b >= 33 and b <= 60) or (b >= 62 and b <= 126)
+}
+
+/// Encode as quoted-printable, folding at 76 characters.
+pub fn quoted_printable_encode(data: bytes) -> str {
+    var out = ""
+    var column = 0
+    var i = 0
+    while i < data.len() {
+        let b = data.at(i)
+        // A line ending passes through as itself and resets the column.
+        if b == 13 and i + 1 < data.len() and data.at(i + 1) == 10 {
+            out = out + "\r\n"
+            column = 0
+            i = i + 2
+        } else {
+            var piece = ""
+            if is_printable(b) {
+                piece = data.slice(i, 1).to_str()
+            } else if (b == 32 or b == 9) and not at_line_end(data, i) {
+                // A space is literal *unless* it ends a line, where a relay
+                // may strip it. That conditional is the whole reason
+                // quoted-printable has a reputation.
+                piece = data.slice(i, 1).to_str()
+            } else {
+                piece = "=" + hex_digits().substr(b / 16, 1) + hex_digits().substr(b % 16, 1)
+            }
+            // A soft break may not split an escape, so the whole piece moves
+            // to the next line together.
+            if column + piece.len() > 75 {
+                out = out + "=\r\n"
+                column = 0
+            }
+            out = out + piece
+            column = column + piece.len()
+            i = i + 1
+        }
+    }
+    out
+}
+
+fn at_line_end(data: bytes, i: i64) -> bool {
+    if i + 1 >= data.len() {
+        return true
+    }
+    data.at(i + 1) == 13 or data.at(i + 1) == 10
+}
+
+/// Decode quoted-printable.
+///
+/// A `=` at the end of a line is a soft break and disappears; a `=` followed
+/// by two hex digits is a byte; anything else after `=` is malformed. Being
+/// strict here matters: a decoder that passed a bad escape through unchanged
+/// would silently produce different bytes from every other decoder.
+pub fn quoted_printable_decode(text: str) -> bytes ! MimeError {
+    var out: [i64] = []
+    let b = text.to_bytes()
+    var i = 0
+    while i < b.len() {
+        let c = b.at(i)
+        if c == 61 {
+            if i + 1 < b.len() and b.at(i + 1) == 13 and i + 2 < b.len() and b.at(i + 2) == 10 {
+                i = i + 3
+            } else if i + 1 < b.len() and b.at(i + 1) == 10 {
+                i = i + 2
+            } else if i + 2 < b.len() {
+                let hi = hex_value(b.at(i + 1))
+                let lo = hex_value(b.at(i + 2))
+                if hi < 0 or lo < 0 {
+                    fail(BadHex(i))
+                }
+                out.push(hi * 16 + lo)
+                i = i + 3
+            } else {
+                fail(BadHex(i))
+            }
+        } else {
+            out.push(c)
+            i = i + 1
+        }
+    }
+    bytes_of(out)
+}
+
+fn hex_value(c: i64) -> i64 {
+    if c >= 48 and c <= 57 {
+        return c - 48
+    }
+    if c >= 65 and c <= 70 {
+        return c - 55
+    }
+    if c >= 97 and c <= 102 {
+        return c - 87
+    }
+    0 - 1
+}
+
+/// An RFC 2047 encoded-word: `=?charset?encoding?text?=`.
+///
+/// The `Q` encoding is quoted-printable with two changes that catch everyone:
+/// a space is written `_` rather than `=20`, and *every* character that is not
+/// a letter or digit must be encoded — because a header is folded on spaces
+/// and re-parsed, so anything structural has to be hidden.
+pub fn encode_word(text: str) -> str {
+    let b = text.to_bytes()
+    var ascii = true
+    for v in b.to_list() {
+        if v > 126 or v < 32 {
+            ascii = false
+        }
+    }
+    if ascii and not text.contains("?") and not text.contains("=") {
+        return text
+    }
+    var body = ""
+    for i in 0..b.len() {
+        let v = b.at(i)
+        if (v >= 65 and v <= 90) or (v >= 97 and v <= 122) or (v >= 48 and v <= 57) {
+            body = body + b.slice(i, 1).to_str()
+        } else if v == 32 {
+            body = body + "_"
+        } else {
+            body = body + "=" + hex_digits().substr(v / 16, 1) + hex_digits().substr(v % 16, 1)
+        }
+    }
+    "=?UTF-8?Q?{body}?="
+}
+
+/// Decode one encoded-word, or return the text unchanged when it is not one.
+pub fn decode_word(text: str) -> str ! MimeError {
+    if not text.starts_with("=?") or not text.ends_with("?=") {
+        return text
+    }
+    let inner = text.substr(2, text.len() - 4)
+    let parts = inner.split("?")
+    if parts.len() != 3 {
+        fail(BadEncodedWord("an encoded-word has three fields between its markers"))
+    }
+    let encoding = parts[1].to_upper()
+    let body = parts[2]
+    if encoding == "B" {
+        match bytes_codec.decode_base64(body) {
+            Some(b) -> b.to_str()
+            None -> fail(BadEncodedWord("the base64 will not decode"))
+        }
+    } else if encoding == "Q" {
+        // `_` is a space here and only here.
+        var swapped = ""
+        for ch in body.chars() {
+            if ch == "_" {
+                swapped = swapped + " "
+            } else {
+                swapped = swapped + ch
+            }
+        }
+        let decoded = try quoted_printable_decode(swapped)
+        decoded.to_str()
+    } else {
+        fail(BadEncodedWord("unknown encoding {encoding}"))
+    }
+}
+
+// A `decode_header` that handled several encoded-words in one header used to
+// sit here. It depended on knowing whether the previous word was itself
+// encoded — two adjacent encoded-words have the space between them removed,
+// which is how a phrase longer than one word is carried — and the function
+// answering that question was a stub returning `false`. It was untested and
+// its comment described behaviour it did not have, so it is gone rather than
+// shipped. `decode_word` handles one word, which is the part that is right.
+
+/// Fold a header line at 78 characters, breaking only at spaces.
+///
+/// A header longer than a line is continued by starting the next line with
+/// whitespace, which is the one continuation rule the format has. Breaking
+/// anywhere else changes the value.
+pub fn fold_header(name: str, value: str) -> str {
+    var out = "{name}: "
+    var column = out.len()
+    var first = true
+    for word in value.split(" ") {
+        if not first and column + word.len() + 1 > 78 {
+            out = out + "\r\n "
+            column = 1
+        } else if not first {
+            out = out + " "
+            column = column + 1
+        }
+        out = out + word
+        column = column + word.len()
+        first = false
+    }
+    out
+}
+
+/// Undo folding: a line beginning with a space or tab continues the one before.
+pub fn unfold_header(text: str) -> str {
+    var out = ""
+    var first = true
+    for line in text.split("\r\n") {
+        if first {
+            out = line
+            first = false
+        } else if line.starts_with(" ") or line.starts_with("\t") {
+            out = out + " " + line.trim_start()
+        } else {
+            out = out + line
+        }
+    }
+    out
+}

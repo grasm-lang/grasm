@@ -1,0 +1,8 @@
+[package]
+name = "mime_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.mime]
+path = "../mime"
+version = "^1.0.0"

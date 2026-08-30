@@ -1,0 +1,144 @@
+import mime
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn decodes(text: str, want: str) -> bool {
+    match mime.quoted_printable_decode(text) {
+        Ok(b) -> b.to_str() == want
+        Err(_e) -> false
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+
+    print("-- quoted-printable")
+    say(f, "plain ASCII is left alone",
+        mime.quoted_printable_encode("Hello, World".to_bytes()) == "Hello, World")
+    say(f, "an equals sign is escaped, since it introduces an escape",
+        mime.quoted_printable_encode("a=b".to_bytes()) == "a=3Db")
+    say(f, "a euro sign becomes three escapes",
+        mime.quoted_printable_encode("€".to_bytes()) == "=E2=82=AC")
+    // Trailing whitespace must be encoded: a relay is allowed to strip it.
+    say(f, "a trailing space is encoded",
+        mime.quoted_printable_encode("hi ".to_bytes()) == "hi=20")
+    say(f, "but a space in the middle is not",
+        mime.quoted_printable_encode("a b".to_bytes()) == "a b")
+    say(f, "a tab at the end likewise",
+        mime.quoted_printable_encode("hi\t".to_bytes()) == "hi=09")
+
+    print("-- and decoding it back")
+    say(f, "plain text", decodes("Hello, World", "Hello, World"))
+    say(f, "an escape", decodes("a=3Db", "a=b"))
+    say(f, "the euro sign", decodes("=E2=82=AC", "€"))
+    say(f, "lower-case hex is accepted, as the specification says",
+        decodes("=e2=82=ac", "€"))
+    // A soft break disappears entirely — it is a line continuation, not text.
+    say(f, "a soft line break disappears", decodes("abc=\r\ndef", "abcdef"))
+    say(f, "and the bare-newline form too", decodes("abc=\ndef", "abcdef"))
+    say(f, "a malformed escape is refused", not decodes("a=ZZ", "anything"))
+    say(f, "an escape cut short is refused", not decodes("ab=", "anything"))
+
+    print("-- long lines fold, and a fold never splits an escape")
+    var long = ""
+    for _i in 0..40 {
+        long = long + "€"
+    }
+    let folded = mime.quoted_printable_encode(long.to_bytes())
+    var longest = 0
+    for line in folded.split("\r\n") {
+        if line.len() > longest {
+            longest = line.len()
+        }
+    }
+    say(f, "no line exceeds 76 characters", longest <= 76)
+    say(f, "and it still decodes to what went in", decodes(folded, long))
+    // The dangerous case: a fold landing inside `=E2` would decode to rubbish.
+    var split_escape = false
+    for line in folded.split("\r\n") {
+        if line.ends_with("=E") or line.ends_with("=8") {
+            split_escape = true
+        }
+    }
+    say(f, "no fold landed inside an escape", not split_escape)
+
+    print("-- encoded-words, which are the header dialect")
+    say(f, "plain ASCII needs no encoding",
+        mime.encode_word("Simple Subject") == "Simple Subject")
+    say(f, "a space becomes an underscore, not =20",
+        mime.encode_word("héllo wörld").contains("_"))
+    say(f, "and the result is a well-formed encoded-word",
+        mime.encode_word("héllo").starts_with("=?UTF-8?Q?")
+        and mime.encode_word("héllo").ends_with("?="))
+    match mime.decode_word(mime.encode_word("héllo wörld")) {
+        Ok(back) -> say(f, "it round-trips", back == "héllo wörld")
+        Err(_e) -> say(f, "it round-trips", false)
+    }
+    // The published example from RFC 2047.
+    match mime.decode_word("=?ISO-8859-1?Q?Keld_J=F8rn_Simonsen?=") {
+        Ok(s) -> say(f, "RFC 2047's own Q example decodes",
+            s.starts_with("Keld J") and s.ends_with("rn Simonsen"))
+        Err(_e) -> say(f, "the Q example decodes", false)
+    }
+    match mime.decode_word("=?UTF-8?B?SGVsbG8sIFdvcmxkIQ==?=") {
+        Ok(s) -> say(f, "a base64 encoded-word decodes", s == "Hello, World!")
+        Err(_e) -> say(f, "the base64 word decodes", false)
+    }
+    say(f, "text that is not an encoded-word passes through",
+        (mime.decode_word("just a subject") ?? "") == "just a subject")
+    say(f, "an encoded-word with the wrong number of fields is refused",
+        word_refused("=?UTF-8?Q?="))
+    say(f, "an unknown encoding is refused", word_refused("=?UTF-8?X?abc?="))
+    say(f, "base64 that will not decode is refused",
+        word_refused("=?UTF-8?B?!!!!?="))
+
+    print("-- folding a long header")
+    var subject = ""
+    for i in 0..20 {
+        subject = subject + "word{i} "
+    }
+    let header = mime.fold_header("Subject", subject.trim_end())
+    var widest = 0
+    for line in header.split("\r\n") {
+        if line.len() > widest {
+            widest = line.len()
+        }
+    }
+    say(f, "no folded line exceeds 78 characters", widest <= 78)
+    say(f, "continuation lines begin with a space", continuations_indented(header))
+    say(f, "unfolding recovers the value",
+        mime.unfold_header(header) == "Subject: " + subject.trim_end())
+    say(f, "a short header is not folded",
+        not mime.fold_header("To", "a@b.com").contains("\r\n"))
+
+    if f == 0 {
+        print("all checks passed")
+    } else {
+        print("{f} check(s) failed")
+    }
+}
+
+fn word_refused(text: str) -> bool {
+    match mime.decode_word(text) {
+        Ok(_s) -> false
+        Err(_e) -> true
+    }
+}
+
+fn continuations_indented(header: str) -> bool {
+    var first = true
+    for line in header.split("\r\n") {
+        if not first and not line.starts_with(" ") {
+            return false
+        }
+        first = false
+    }
+    true
+}
