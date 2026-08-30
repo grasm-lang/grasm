@@ -29,7 +29,12 @@ type RecordType =
     | DS
     | Other(code: i64)
 
-type Record = {
+// `DnsRecord`, not `Record`: types share one namespace across a program
+// ([T-MODULE-NS]) and `log` declares a `Record`. That is the fifth collision on
+// a generic name in this work — `Record`, `Table`, `Node`, `Entry`,
+// `StoreError` — and the pattern is worth naming: the obvious noun for a thing
+// is the obvious noun in every package that has one.
+type DnsRecord = {
     name: str,
     kind: RecordType,
     class_code: i64,
@@ -55,9 +60,9 @@ type DnsMessage = {
     recursion_available: bool,
     response_code: i64,
     questions: [Question],
-    answers: [Record],
-    authority: [Record],
-    additional: [Record],
+    answers: [DnsRecord],
+    authority: [DnsRecord],
+    additional: [DnsRecord],
 }
 
 type DnsError =
@@ -262,9 +267,9 @@ pub fn parse(data: bytes) -> DnsMessage ! DnsError {
         at = at + 4
     }
 
-    var answers: [Record] = []
-    var authority: [Record] = []
-    var additional: [Record] = []
+    var answers: [DnsRecord] = []
+    var authority: [DnsRecord] = []
+    var additional: [DnsRecord] = []
     for section in 1..4 {
         for _i in 0..counts[section] {
             let r = try read_record(data, at)
@@ -295,7 +300,7 @@ pub fn parse(data: bytes) -> DnsMessage ! DnsError {
     }
 }
 
-fn read_record(data: bytes, at: i64) -> (Record, i64) ! DnsError {
+fn read_record(data: bytes, at: i64) -> (DnsRecord, i64) ! DnsError {
     let n = try read_name(data, at)
     var i = n.1
     if i + 10 > data.len() {
@@ -310,7 +315,7 @@ fn read_record(data: bytes, at: i64) -> (Record, i64) ! DnsError {
         fail(Truncated(i))
     }
     let body = data.slice(i, length)
-    (Record{
+    (DnsRecord{
         name: n.0,
         kind: kind,
         class_code: class_code,
@@ -419,7 +424,7 @@ pub fn query(id: i64, name: str, kind: RecordType) -> bytes {
     bytes_of(out)
 }
 
-pub fn answers_of(m: DnsMessage) -> [Record] { m.answers }
+pub fn answers_of(m: DnsMessage) -> [DnsRecord] { m.answers }
 pub fn questions_of(m: DnsMessage) -> [Question] { m.questions }
 pub fn id_of(m: DnsMessage) -> i64 { m.id }
 pub fn response_code(m: DnsMessage) -> i64 { m.response_code }
