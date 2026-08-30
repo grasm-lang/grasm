@@ -34,7 +34,7 @@ out=$("$GRASM" deps "$S/grasm/app" 2>&1); code=$?
 cp "$W/mathlib_clean.gr" "$S/grasm/mathlib/src/main.gr"
 rm -f "$S/grasm/app/grasm.lock"
 NAMES+=("Grasm"); 
-if [ $code -ne 0 ] && echo "$out" | grep -q "capabilit"; then
+if [ $code -ne 0 ] && echo "$out" | grep -c "capabilit" >/dev/null; then
     DETECT+=("COMPILE ERROR"); DETAIL+=("$(echo "$out" | grep -m1 'exceed\|performs')")
 else
     DETECT+=("not caught"); DETAIL+=("$out")

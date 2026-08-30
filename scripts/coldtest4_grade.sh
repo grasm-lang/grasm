@@ -32,14 +32,14 @@ grade() {
             # would be the failure; so would rejecting it for a different
             # reason, which is why the message is matched too.
             local needle="${want#@rejects:}"
-            if [ $rc -ne 0 ] && echo "$got" | grep -q "$needle"; then
+            if [ $rc -ne 0 ] && echo "$got" | grep -c "$needle" >/dev/null; then
                 printf '  %-22s CORRECT (rejected: %s)\n' "$name" "$needle"; pass=$((pass+1))
             else
                 printf '  %-22s WRONG (expected rejection mentioning %s)\n' "$name" "$needle"
                 echo "$got" | head -2 | sed 's/^/      /'; fail=$((fail+1)); FAILED+=("$name")
             fi ;;
         @fails)
-            if [ $rc -ne 0 ] && echo "$got" | grep -q "counterexample"; then
+            if [ $rc -ne 0 ] && echo "$got" | grep -c "counterexample" >/dev/null; then
                 printf '  %-22s CORRECT (fails with counterexample)\n' "$name"; pass=$((pass+1))
             else
                 printf '  %-22s WRONG (expected a reported counterexample)\n' "$name"
@@ -74,7 +74,7 @@ grade "$DIR/n9_unicode.gr"     "$(printf '6\n6\né')"
 grade "$DIR/n10_property.gr"   "@fails" test
 
 if [ -f "$DIR/n7_doctest.gr" ]; then
-    if "$GRASM" test "$DIR/n7_doctest.gr" 2>&1 | grep -q "doc example.*ok"; then
+    if "$GRASM" test "$DIR/n7_doctest.gr" 2>&1 | grep -c "doc example.*ok" >/dev/null; then
         printf '  %-22s CORRECT (doc example runs)\n' "n7 doc example"; pass=$((pass+1))
     else
         printf '  %-22s WRONG (doc example did not run)\n' "n7 doc example"; fail=$((fail+1)); FAILED+=("n7 doc example")

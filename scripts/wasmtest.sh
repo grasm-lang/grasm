@@ -31,7 +31,7 @@ fi
 #
 # Skipped when the target is not installed, with a message rather than a pass:
 # a machine without wasm32 cannot check this and should not pretend to.
-if rustc --print target-list 2>/dev/null | grep -qx wasm32-unknown-unknown; then
+if rustc --print target-list 2>/dev/null | grep -cx wasm32-unknown-unknown >/dev/null; then
     if ! cargo build --release --target wasm32-unknown-unknown -p grasm_wasm 2>&1 | tail -20; then
         echo "error: the wasm build failed — the module below would be stale"
         exit 1
@@ -147,7 +147,24 @@ for src in $programs; do
         # explaining why a purity proof matters -- was skipped as needing
         # threads it never asks for. A skip is coverage lost, and one taken
         # for a facility the program does not use is lost for nothing.
-        if grep -vE '^\s*(//|#)' "$subject" | grep -q "${need%%:*}"; then
+        # `grep -c … >/dev/null` rather than `grep -q`, and the difference is
+        # not style. `grep -q` exits the moment it matches; the `grep -v`
+        # upstream is then killed by SIGPIPE, and `set -o pipefail` takes the
+        # pipeline's status from *that* — so the pipeline reported failure
+        # exactly when it succeeded. It only bit on inputs long enough that the
+        # upstream was still writing, which is why small programs skipped
+        # correctly and a 1,188-line bundle did not, and why two runs of this
+        # gate disagreed with each other. `grep -c` reads to the end, so there
+        # is no early exit to be killed for.
+        #
+        # `[[:space:]]` rather than `\s`: the second is not POSIX, and which
+        # `grep` a script inherits decides whether it means whitespace, a
+        # literal `s`, or an error. When it meant the wrong thing here the
+        # filter produced nothing, *every* skip check silently stopped firing,
+        # and programs that need a filesystem were run on a target that has
+        # none — reported as disagreements rather than as skips. A gate whose
+        # answer depends on which grep is installed is not a gate.
+        if grep -vE '^[[:space:]]*(//|#)' "$subject" | grep -c "${need%%:*}" >/dev/null; then
             skip=$((skip + 1))
             SKIPPED+=("$src — needs ${need##*:}, which wasm32-unknown-unknown has none of")
             continue 2
@@ -165,8 +182,14 @@ for src in $programs; do
     # These two programs exist to recurse until something gives; on this target
     # the module's stack gives first. It is a smaller number, not a different
     # meaning — but it is a difference, and it is named rather than absorbed.
+    #
+    # `scheme-demo` is the same limit reached from the other direction: it is an
+    # interpreter written in Grasm, run by the Grasm interpreter, so every
+    # Scheme call costs two stacks. Natively it finishes; in a module whose
+    # stack is fixed at link time it does not. A smaller number, not a
+    # different meaning.
     case "$src" in
-        */E-RECURSION-DEPTH.gr|*/E-PANIC-TRACE.gr)
+        */E-RECURSION-DEPTH.gr|*/E-PANIC-TRACE.gr|*/scheme-demo/src/main.gr)
             skip=$((skip + 1))
             SKIPPED+=("$src — recurses past the stack a wasm module is given")
             continue

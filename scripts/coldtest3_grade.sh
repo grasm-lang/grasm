@@ -25,7 +25,7 @@ grade() {
         @any)   printf '  %-22s CORRECT\n' "$name"; pass=$((pass+1)) ;;
         @fails)
             # A property test that must fail, and must name a counterexample.
-            if [ $rc -ne 0 ] && echo "$got" | grep -q "counterexample"; then
+            if [ $rc -ne 0 ] && echo "$got" | grep -c "counterexample" >/dev/null; then
                 printf '  %-22s CORRECT (fails with counterexample)\n' "$name"; pass=$((pass+1))
             else
                 printf '  %-22s WRONG (expected a reported counterexample)\n' "$name"
@@ -61,7 +61,7 @@ grade "$DIR/n10_property.gr"   "@fails" test
 
 # The doc example inside n7 must actually run and pass under `grasm test`.
 if [ -f "$DIR/n7_doctest.gr" ]; then
-    if "$GRASM" test "$DIR/n7_doctest.gr" 2>&1 | grep -q "doc example.*ok"; then
+    if "$GRASM" test "$DIR/n7_doctest.gr" 2>&1 | grep -c "doc example.*ok" >/dev/null; then
         printf '  %-22s CORRECT (doc example runs)\n' "n7 doc example"; pass=$((pass+1))
     else
         printf '  %-22s WRONG (doc example did not run)\n' "n7 doc example"; fail=$((fail+1)); FAILED+=("n7 doc example")

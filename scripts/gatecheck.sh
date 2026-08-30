@@ -39,7 +39,7 @@ $(grep -oE '^[a-z_][a-z_0-9]*\(\)' "$cand" | tr -d '()')"
     while IFS= read -r name; do
         [ -z "$name" ] && continue
         checked=$((checked + 1))
-        if printf '%s\n' "$defined" | grep -qx "$name"; then
+        if printf '%s\n' "$defined" | grep -cx "$name" >/dev/null; then
             continue
         fi
         if command -v "$name" >/dev/null 2>&1; then
@@ -71,7 +71,33 @@ for f in scripts/*.sh ProjectGold/run.sh; do
 done
 bad=$((bad + copied))
 
+# `set -o pipefail` together with `… | grep -q …` is a gate that reports the
+# opposite of what it found.
+#
+# `grep -q` exits at the first match. Whatever is upstream is then killed by
+# SIGPIPE, `pipefail` takes the pipeline's status from that, and the `if` sees
+# failure *because* the pattern matched. It only shows up when the upstream is
+# still writing when the match lands, so it hides on short inputs and appears
+# on long ones -- in `wasmtest.sh` it made two runs of the same gate disagree,
+# and it ran programs on a target with no filesystem while reporting them as
+# disagreements rather than skips.
+#
+# `grep -c PATTERN >/dev/null` has the same exit status and reads to the end,
+# so there is no early exit to be killed for.
+piped=0
+for f in scripts/*.sh ProjectGold/run.sh; do
+    [ "$f" = "scripts/gatecheck.sh" ] && continue
+    grep -cE '^[[:space:]]*set[[:space:]].*pipefail' "$f" >/dev/null || continue
+    if grep -cE '\|[[:space:]]*grep[[:space:]]+-[a-zA-Z]*q' "$f" >/dev/null; then
+        echo "  $f: pipes into \`grep -q\` under \`pipefail\`."
+        echo "      SIGPIPE makes the pipeline fail when the pattern matches."
+        echo "      Use \`grep -c PATTERN >/dev/null\` instead."
+        piped=$((piped + 1))
+    fi
+done
+bad=$((bad + piped))
+
 echo "=========================================="
-echo "gate helpers checked: $checked   undefined: $bad   corpus copied: $copied"
+echo "gate helpers checked: $checked   undefined: $bad   corpus copied: $copied   grep -q under pipefail: $piped"
 echo "=========================================="
 [ "$bad" = 0 ]
