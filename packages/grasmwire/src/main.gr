@@ -48,6 +48,24 @@ pub fn reject_after_ms() -> i64 { 180000 }
 pub fn rekey_timeout_ms() -> i64 { 5000 }
 pub fn rekey_attempt_ms() -> i64 { 90000 }
 
+/// How long a cookie secret is good for.
+///
+/// A cookie is a bearer token for an address: whoever holds it can complete a
+/// handshake from there while the responder is under load. Rotating the secret
+/// bounds how long a stolen one is worth having, and two minutes is short
+/// enough for that and long enough that a peer which has just been sent one
+/// can still use it.
+pub fn cookie_rotate_ms() -> i64 { 120000 }
+
+/// Whether a cookie secret has been in use too long.
+///
+/// A pure function of two numbers, so the rotation policy can be tested the
+/// same way every other timer here is — against a clock that is a number
+/// rather than by waiting two minutes.
+pub fn cookie_secret_stale(born_ms: i64, now_ms: i64) -> bool {
+    now_ms - born_ms >= cookie_rotate_ms()
+}
+
 /// Ten seconds of silence on an established session gets an empty packet, so
 /// that a stateful firewall between the peers keeps the mapping open.
 pub fn keepalive_ms() -> i64 { 10000 }

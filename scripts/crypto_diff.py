@@ -45,11 +45,7 @@ def scalarmult(scalar, point):
 # --- ChaCha20-Poly1305, also plainly ----------------------------------------
 def rotl(v, n): return ((v << n) | (v >> (32 - n))) & 0xffffffff
 
-def chacha_block(key, counter, nonce):
-    st = [0x61707865, 0x3320646e, 0x79622d32, 0x6b206574]
-    st += list(struct.unpack('<8I', key))
-    st += [counter] + list(struct.unpack('<3I', nonce))
-    w = st[:]
+def _rounds(w):
     def qr(a, b, c, d):
         w[a] = (w[a] + w[b]) & 0xffffffff; w[d] = rotl(w[d] ^ w[a], 16)
         w[c] = (w[c] + w[d]) & 0xffffffff; w[b] = rotl(w[b] ^ w[c], 12)
@@ -58,7 +54,26 @@ def chacha_block(key, counter, nonce):
     for _ in range(10):
         qr(0,4,8,12); qr(1,5,9,13); qr(2,6,10,14); qr(3,7,11,15)
         qr(0,5,10,15); qr(1,6,11,12); qr(2,7,8,13); qr(3,4,9,14)
+    return w
+
+def chacha_block(key, counter, nonce):
+    st = [0x61707865, 0x3320646e, 0x79622d32, 0x6b206574]
+    st += list(struct.unpack('<8I', key))
+    st += [counter] + list(struct.unpack('<3I', nonce))
+    w = _rounds(st[:])
     return b''.join(struct.pack('<I', (w[i] + st[i]) & 0xffffffff) for i in range(16))
+
+def hchacha(key, nonce16):
+    """The same rounds with the final addition left out — that omission is the
+    construction, not an optimisation, and is what makes the result one-way."""
+    st = [0x61707865, 0x3320646e, 0x79622d32, 0x6b206574]
+    st += list(struct.unpack('<8I', key))
+    st += list(struct.unpack('<4I', nonce16))
+    w = _rounds(st[:])
+    return struct.pack('<4I', *w[0:4]) + struct.pack('<4I', *w[12:16])
+
+def xseal(key, nonce24, aad, plain):
+    return seal(hchacha(key, nonce24[:16]), b'\x00' * 4 + nonce24[16:], aad, plain)
 
 def chacha(key, counter, nonce, data):
     out = bytearray()

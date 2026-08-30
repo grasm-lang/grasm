@@ -47,7 +47,7 @@ fn short(b: bytes) -> str {
 fn main() / {io, net} {
     let argv = args()
     if argv.len() < 6 {
-        print("usage: grasmwire <listen|connect> <local-port> <peer-port> <private> <peer-public> <psk>")
+        print("usage: grasmwire <listen|connect> <local-port> <peer-port> <private> <peer-public> <psk> [underload]")
         return
     }
     let mode = argv[0]
@@ -68,10 +68,15 @@ fn main() / {io, net} {
         }
     }
 
+    // Under load a responder must not allocate for an unanswered packet, so
+    // it answers with a cookie and remembers nothing. This flag makes it
+    // behave that way from the first message rather than waiting for a flood.
+    let under_load = argv.len() > 6 and argv[6] == "underload"
+
     if mode == "connect" {
         run_initiator(socket, private, public, peer_public, psk, peer_port)
     } else {
-        run_responder(socket, private, public, peer_public, psk, peer_port)
+        run_responder(socket, private, public, peer_public, psk, peer_port, under_load)
     }
     net_close(socket)
 }
@@ -82,6 +87,29 @@ fn to_int(s: str) -> i64 {
         n = n * 10 + (ch.to_bytes().at(0) - 48)
     }
     n
+}
+
+/// Thirty-two bytes for keying cookies.
+fn fresh_secret() -> bytes / {io} {
+    match random_bytes(32) {
+        Ok(b) -> b
+        Err(_e) -> panic("the operating system would not give us randomness")
+    }
+}
+
+/// A session index, chosen at random.
+///
+/// It is not a secret — it travels in the clear on every data packet, because
+/// a receiver with many peers must pick a session before it can try any key.
+/// It is chosen randomly anyway: a predictable index is one an off-path
+/// attacker can put on a forged packet, and while the AEAD will refuse it, the
+/// cheapest thing to make an attacker guess is a number nobody needs to
+/// predict.
+fn session_index() -> i64 / {io} {
+    match random_bytes(4) {
+        Ok(b) -> b.at(0).bit_or(b.at(1).shl(8)).bit_or(b.at(2).shl(16)).bit_or(b.at(3).shl(24))
+        Err(_e) -> panic("the operating system would not give us randomness")
+    }
 }
 
 /// One ephemeral key, from the operating system.
@@ -101,8 +129,9 @@ fn ephemeral() -> bytes / {io} {
 fn run_initiator(socket: i64, private: bytes, public: bytes, peer_public: bytes,
                  psk: bytes, peer_port: i64) / {io, net} {
     let started_ms = now_millis()
+    let my_index = session_index()
     let init: Initiation ! HandshakeError = noise.initiate(private, public, peer_public,
-        ephemeral(), grasmwire.stamp(started_ms), 1)
+        ephemeral(), grasmwire.stamp(started_ms), my_index)
 
     let handshake = match init {
         Ok(i) -> i
@@ -129,11 +158,49 @@ fn run_initiator(socket: i64, private: bytes, public: bytes, peer_public: bytes,
         print("[connect] no reply within {grasmwire.rekey_attempt_ms()}ms")
         return
     }
-    let reply = match udp_recv(socket) {
+    var reply = match udp_recv(socket) {
         Ok(b) -> b
         Err(e) -> {
             print("[connect] receive failed: {e}")
             return
+        }
+    }
+
+    // A cookie reply where a handshake response was expected means the far
+    // side is under load. It is not a failure: the same message goes back out
+    // with mac2 filled in, and nothing else about the handshake changes.
+    if reply.len() == noise.cookie_reply_len() and reply.at(0) == noise.type_cookie() {
+        match noise.consume_cookie_reply(peer_public, reply, mac1_of(handshake.message)) {
+            Some(cookie) -> {
+                print("[connect] the far side is under load and sent a cookie")
+                let retry = noise.apply_mac2(handshake.message, cookie)
+                match udp_send(socket, "127.0.0.1", peer_port, retry) {
+                    Ok(_n) -> print("[connect] sent the same message again with mac2 on it")
+                    Err(_e) -> {
+                        print("[connect] the retry could not be sent")
+                        return
+                    }
+                }
+                let waited = match net_wait([socket], 10000) {
+                    Ok(hs) -> hs
+                    Err(_e) -> []
+                }
+                if waited.len() == 0 {
+                    print("[connect] no reply to the cookie retry")
+                    return
+                }
+                reply = match udp_recv(socket) {
+                    Ok(b) -> b
+                    Err(_e) -> {
+                        print("[connect] could not read the reply to the retry")
+                        return
+                    }
+                }
+            }
+            None -> {
+                print("[connect] a cookie reply that did not open, giving up")
+                return
+            }
         }
     }
     print("[connect] got a {reply.len()}-byte reply")
@@ -148,7 +215,9 @@ fn run_initiator(socket: i64, private: bytes, public: bytes, peer_public: bytes,
     let keys = noise.split(finished, true)
     print("[connect] handshake complete, session hash {hex(noise.transcript(finished))}")
 
-    var session = grasmwire.session_of(keys, 1, 2, now_millis(), true)
+    // The far side's index comes off its reply; until a data packet arrives
+    // there is nothing else to address one to.
+    var session = grasmwire.session_of(keys, my_index, index_of(reply), now_millis(), true)
 
     // Three packets through the tunnel, each echoed back. What is checked is
     // that what comes home is what went out — end to end, through a real
@@ -202,15 +271,100 @@ fn run_initiator(socket: i64, private: bytes, public: bytes, peer_public: bytes,
         Err(_e) -> print("[connect] could not replay")
     }
 
+    // A rekey, for real. A session expires after three minutes and must be
+    // replaced before it does, so this is not an exceptional path — it is what
+    // a long-lived tunnel spends most of its life doing. A *new* ephemeral and
+    // a *newer* timestamp: reusing either would make this a replay, which the
+    // far side has just been shown to refuse.
+    var rekeyed = false
+    let second: Initiation ! HandshakeError = noise.initiate(private, public, peer_public,
+        ephemeral(), grasmwire.stamp(now_millis() + 1000), session_index())
+    match second {
+        Ok(again) -> {
+            match udp_send(socket, "127.0.0.1", peer_port, again.message) {
+                Ok(_n) -> print("[connect] sent a second handshake to replace the session")
+                Err(_e) -> print("[connect] the rekey could not be sent")
+            }
+            let waiting = match net_wait([socket], 10000) {
+                Ok(hs) -> hs
+                Err(_e) -> []
+            }
+            if waiting.len() > 0 {
+                match udp_recv(socket) {
+                    Ok(reply2) -> {
+                        match noise.consume_response(again.state, reply2, psk) {
+                            Ok(done2) -> {
+                                let fresh_keys = noise.split(done2, true)
+                                print("[connect] rekeyed, new session hash {hex(noise.transcript(done2))}")
+                                // The new keys must differ from the old ones,
+                                // or the rekey bought nothing.
+                                if hex(fresh_keys.sending) != hex(keys.sending) {
+                                    print("[connect] the new keys are different from the old ones")
+                                }
+                                var next_session = grasmwire.session_of(fresh_keys,
+                                    session_index(), index_of(reply2), now_millis(), true)
+                                let payload = sample_packet(7)
+                                match grasmwire.seal_data(next_session, payload) {
+                                    Ok(d) -> {
+                                        match udp_send(socket, "127.0.0.1", peer_port, d) {
+                                            Ok(_m) -> {}
+                                            Err(_e) -> print("[connect] could not send under the new key")
+                                        }
+                                        let back = match net_wait([socket], 5000) {
+                                            Ok(hs) -> hs
+                                            Err(_e) -> []
+                                        }
+                                        if back.len() > 0 {
+                                            match udp_recv(socket) {
+                                                Ok(echo) -> {
+                                                    match grasmwire.open_data(next_session, echo, now_millis()) {
+                                                        Ok(op) -> {
+                                                            if hex(grasmwire.unpad(op)) == hex(payload) {
+                                                                rekeyed = true
+                                                                print("[connect] a packet under the new key came back byte for byte")
+                                                            }
+                                                        }
+                                                        Err(_e) -> print("[connect] the echo under the new key did not authenticate")
+                                                    }
+                                                }
+                                                Err(_e) -> print("[connect] no echo under the new key")
+                                            }
+                                        }
+                                    }
+                                    Err(_e) -> print("[connect] could not seal under the new key")
+                                }
+                            }
+                            Err(_e) -> print("[connect] the rekey reply did not authenticate")
+                        }
+                    }
+                    Err(_e) -> print("[connect] no rekey reply")
+                }
+            } else {
+                print("[connect] no rekey reply within ten seconds")
+            }
+        }
+        Err(_e) -> print("[connect] could not build a second handshake")
+    }
+
     print("[connect] {sent_count} sent, {returned_count} returned intact")
-    if returned_count == 3 {
+    if returned_count == 3 and rekeyed {
         print("[connect] TUNNEL OK")
     }
 }
 
 /// The side that waits, and never speaks to anyone it cannot already name.
 fn run_responder(socket: i64, private: bytes, public: bytes, peer_public: bytes,
-                 psk: bytes, peer_port: i64) / {io, net} {
+                 psk: bytes, peer_port: i64, under_load: bool) / {io, net} {
+    // The secret that keys the cookies, and the one before it.
+    //
+    // A cookie is a bearer token for an address, so the secret expires — that
+    // is what bounds how long a stolen one is worth having. Keeping the
+    // previous secret for one more period is not sloppiness: a cookie issued
+    // a moment before a rotation would otherwise be refused a moment after
+    // one, and the peer holding it did nothing wrong.
+    var cookie_secret = fresh_secret()
+    var previous_secret = cookie_secret
+    var secret_born = now_millis()
     let ready = match net_wait([socket], grasmwire.rekey_attempt_ms()) {
         Ok(hs) -> hs
         Err(_e) -> []
@@ -238,7 +392,57 @@ fn run_responder(socket: i64, private: bytes, public: bytes, peer_public: bytes,
     }
     print("[listen] got a {first.len()}-byte first message from {host}:{port}")
 
-    let incoming = match noise.consume_initiation(private, public, first) {
+    var opening = first
+    if under_load {
+        // No state is created here. The cookie is a keyed hash of the address
+        // the packet came from, sealed to whoever is at that address, and the
+        // responder forgets it the moment the datagram is sent.
+        if grasmwire.cookie_secret_stale(secret_born, now_millis()) {
+            previous_secret = cookie_secret
+            cookie_secret = fresh_secret()
+            secret_born = now_millis()
+            print("[listen] rotated the cookie secret")
+        }
+        let cookie = noise.cookie_of(cookie_secret, "{host}:{port}")
+        let nonce = match random_bytes(24) {
+            Ok(b) -> b
+            Err(_e) -> panic("no randomness for a cookie nonce")
+        }
+        let their_mac1 = mac1_of(first)
+        match udp_send(socket, host, port, noise.cookie_reply(public, cookie, 0, nonce, their_mac1)) {
+            Ok(_n) -> print("[listen] under load: answered with a cookie and stored nothing")
+            Err(_e) -> print("[listen] the cookie reply could not be sent")
+        }
+        // Now wait for the message to come back carrying mac2.
+        let again = match net_wait([socket], 10000) {
+            Ok(hs) -> hs
+            Err(_e) -> []
+        }
+        if again.len() == 0 {
+            print("[listen] the caller did not come back with a cookie")
+            return
+        }
+        match udp_recv_from(socket) {
+            Ok(got) -> {
+                opening = got.0
+                host = got.1
+                port = got.2
+            }
+            Err(_e) -> {
+                print("[listen] could not read the second attempt")
+                return
+            }
+        }
+        let current_ok = noise.check_mac2(opening, noise.cookie_of(cookie_secret, "{host}:{port}"))
+        let previous_ok = noise.check_mac2(opening, noise.cookie_of(previous_secret, "{host}:{port}"))
+        if not current_ok and not previous_ok {
+            print("[listen] the second attempt had no valid mac2, refused")
+            return
+        }
+        print("[listen] the second attempt carries a valid mac2, proceeding")
+    }
+
+    let incoming = match noise.consume_initiation(private, public, opening) {
         Ok(i) -> i
         Err(_e) -> {
             // Silence. A responder that answered a bad packet would confirm
@@ -257,7 +461,8 @@ fn run_responder(socket: i64, private: bytes, public: bytes, peer_public: bytes,
     }
     print("[listen] the caller is {short(incoming.initiator_static)}, which is on the list")
 
-    let reply = match noise.respond(incoming, ephemeral(), psk, 2) {
+    let my_index = session_index()
+    let reply = match noise.respond(incoming, ephemeral(), psk, my_index) {
         Ok(r) -> r
         Err(_e) -> {
             print("[listen] could not build a reply")
@@ -274,7 +479,7 @@ fn run_responder(socket: i64, private: bytes, public: bytes, peer_public: bytes,
     let keys = noise.split(reply.state, false)
     print("[listen] handshake complete, session hash {hex(noise.transcript(reply.state))}")
 
-    var session = grasmwire.session_of(keys, 2, incoming.sender_index, now_millis(), false)
+    var session = grasmwire.session_of(keys, my_index, incoming.sender_index, now_millis(), false)
 
     // The greatest timestamp seen from this peer. A recorded first message
     // replayed later carries the *old* timestamp, so refusing anything that is
@@ -286,35 +491,45 @@ fn run_responder(socket: i64, private: bytes, public: bytes, peer_public: bytes,
     var echoed = 0
     var replays_refused = 0
     var moves = 0
-    for _i in 0..4 {
+    var rekeys = 0
+    // Six datagrams are expected: three payloads, a replayed handshake, a
+    // rekey, and one payload under the new key. The loop stops on silence
+    // rather than on a count, so a run that goes wrong still says what it saw.
+    var quiet = false
+    for _i in 0..6 {
+        if not quiet {
         let waiting = match net_wait([socket], 10000) {
             Ok(hs) -> hs
             Err(_e) -> []
         }
         if waiting.len() == 0 {
             print("[listen] nothing more arrived")
-            return
+            quiet = true
         }
+        }
+        if not quiet {
         var datagram = bytes_of([])
+        var from_host = host
+        var from_port = port
         match udp_recv_from(socket) {
             Ok(got) -> {
                 datagram = got.0
-                // Roaming. The endpoint moves only when a packet that
-                // *authenticates* came from somewhere else — following an
-                // unauthenticated packet would let anyone redirect a session
-                // by spoofing one datagram.
-                if got.1 != host or got.2 != port {
-                    print("[listen] the peer appears to have moved to {got.1}:{got.2}")
-                    moves = moves + 1
-                }
+                from_host = got.1
+                from_port = got.2
             }
             Err(_e) -> {
                 print("[listen] a datagram could not be read")
                 return
             }
         }
-        let from_host = host
-        let from_port = port
+
+        // Roaming, and the order here is the security property. The reply goes
+        // to wherever this datagram came from, and the *remembered* endpoint
+        // moves only once something has authenticated from there. Moving it on
+        // an unauthenticated packet would let anyone redirect a live session by
+        // spoofing a single datagram, which is a denial of service that costs
+        // the attacker nothing.
+        let moved = from_host != host or from_port != port
 
         if datagram.len() > 0 and datagram.at(0) == grasmwire.type_initiation() {
             // Another handshake. It may be a genuine rekey or a recording.
@@ -322,7 +537,36 @@ fn run_responder(socket: i64, private: bytes, public: bytes, peer_public: bytes,
                 Ok(again) -> {
                     if grasmwire.later_than(again.timestamp, newest) {
                         newest = again.timestamp
-                        print("[listen] a newer handshake, accepted")
+                        // A rekey. The old session stays usable until the new
+                        // one carries traffic — dropping it the moment a
+                        // replacement is agreed would lose whatever is still
+                        // in flight under the old key.
+                        if hex(again.initiator_static) != hex(peer_public) {
+                            print("[listen] a rekey from an unknown key, refused")
+                        } else {
+                            let next_index = session_index()
+                            match noise.respond(again, ephemeral(), psk, next_index) {
+                                Ok(r2) -> {
+                                    match udp_send(socket, from_host, from_port, r2.message) {
+                                        Ok(_n) -> {
+                                            if moved {
+                                                print("[listen] the peer moved to {from_host}:{from_port}")
+                                                moves = moves + 1
+                                            }
+                                            host = from_host
+                                            port = from_port
+                                            session = grasmwire.session_of(
+                                                noise.split(r2.state, false), next_index,
+                                                again.sender_index, now_millis(), false)
+                                            rekeys = rekeys + 1
+                                            print("[listen] rekeyed, new session hash {hex(noise.transcript(r2.state))}")
+                                        }
+                                        Err(_e) -> print("[listen] the rekey reply could not be sent")
+                                    }
+                                }
+                                Err(_e) -> print("[listen] could not answer the rekey")
+                            }
+                        }
                     } else {
                         replays_refused = replays_refused + 1
                         print("[listen] a replayed handshake, refused on its timestamp")
@@ -333,6 +577,13 @@ fn run_responder(socket: i64, private: bytes, public: bytes, peer_public: bytes,
         } else {
             match grasmwire.open_data(session, datagram, now_millis()) {
                 Ok(opened) -> {
+                    // It authenticated, so this address is the peer's.
+                    if moved {
+                        print("[listen] the peer moved to {from_host}:{from_port}")
+                        moves = moves + 1
+                    }
+                    host = from_host
+                    port = from_port
                     let plain = grasmwire.unpad(opened)
                     if grasmwire.is_keepalive(plain) {
                         print("[listen] a keepalive")
@@ -352,11 +603,39 @@ fn run_responder(socket: i64, private: bytes, public: bytes, peer_public: bytes,
                 Err(_e) -> print("[listen] a datagram did not authenticate, dropped in silence")
             }
         }
+        }
     }
-    print("[listen] echoed {echoed}, refused {replays_refused} replayed handshake(s), {moves} endpoint change(s)")
-    if echoed == 3 and replays_refused == 1 {
+    print("[listen] echoed {echoed}, refused {replays_refused} replayed handshake(s), rekeyed {rekeys} time(s), {moves} endpoint change(s)")
+    if echoed == 4 and replays_refused == 1 and rekeys == 1 {
         print("[listen] TUNNEL OK")
     }
+}
+
+/// The `mac1` field of a first message: the sixteen bytes before `mac2`.
+///
+/// A cookie reply is sealed with this as its associated data, so it only opens
+/// against the message that provoked it — which is what stops one being
+/// replayed at a different handshake.
+fn mac1_of(message: bytes) -> bytes {
+    var out: [i64] = []
+    for i in (message.len() - 32)..(message.len() - 16) {
+        out.push(message.at(i))
+    }
+    bytes_of(out)
+}
+
+/// The sender index a reply carries, which is what a data packet must be
+/// addressed to. Bytes four to seven, little-endian, same as every other
+/// index on the wire.
+fn index_of(message: bytes) -> i64 {
+    if message.len() < 8 {
+        return 0
+    }
+    var index = 0
+    for i in 0..4 {
+        index = index.bit_or(message.at(4 + i).shl(i * 8))
+    }
+    index
 }
 
 /// An IPv4 packet that declares its own length, which is what the padding

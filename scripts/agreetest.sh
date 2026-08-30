@@ -358,6 +358,99 @@ fn main() {
 # printed `3000 3000` where every other way of running it printed `6 3000`.
 # Third time for this class: the main loader, then the doc-example harness,
 # now the bundler.
+# A **diamond**: two packages that both depend on a third.
+#
+# `check_chain` covers a chain, where every module is reached one way. A
+# diamond is reached two ways, and the source bundle names each module by the
+# path the loader happened to take first — so the package reached through `b`
+# is written `b.d`, and `c`'s own plain `import d` matched nothing. The build
+# reported success and wrote a bundle that could not be loaded.
+#
+# This is F81's failure in the case F81's fix did not reach. Gated as a shape
+# rather than as the program that found it: any diamond does it.
+check_diamond() {
+    local root="$WORK/diamond"
+    rm -rf "$root"
+    mkdir -p "$root/d/src" "$root/b/src" "$root/c/src" "$root/a/src"
+    cat >"$root/d/grasm.toml" <<'TOML'
+[package]
+name = "d"
+version = "0.1.0"
+capabilities = []
+TOML
+    cat >"$root/d/src/main.gr" <<'SRC'
+pub fn shared(n: i64) -> i64 {
+    n + 100
+}
+SRC
+    for pkg in b c; do
+        cat >"$root/$pkg/grasm.toml" <<TOML
+[package]
+name = "$pkg"
+version = "0.1.0"
+capabilities = []
+
+[dependencies.d]
+path = "../d"
+TOML
+        cat >"$root/$pkg/src/main.gr" <<SRC
+import d
+
+pub fn go(n: i64) -> i64 {
+    d.shared(n)
+}
+SRC
+    done
+    cat >"$root/a/grasm.toml" <<'TOML'
+[package]
+name = "a"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.b]
+path = "../b"
+
+[dependencies.c]
+path = "../c"
+TOML
+    cat >"$root/a/src/main.gr" <<'SRC'
+import b
+import c
+
+fn main() / {io} {
+    print("{b.go(1)} {c.go(2)}")
+}
+SRC
+    local src="$root/a/src/main.gr"
+    local i n bu bundle_out
+    i=$("$GRASM" run "$src" 2>&1)
+    "$GRASM" build "$src" --native -o "$WORK/diamond_native" >/dev/null 2>&1
+    n=$("$WORK/diamond_native" 2>&1)
+    "$GRASM" build "$src" -o "$WORK/diamond_bundle" >/dev/null 2>&1
+    bu=$("$WORK/diamond_bundle" 2>&1)
+    # And the source bundle, which is the one that was broken: a build that
+    # says it wrote an artifact has to have written a loadable one.
+    if "$GRASM" build "$src" --source -o "$WORK/diamond.bundle.gr" >/dev/null 2>&1; then
+        bundle_out=$("$GRASM" run "$WORK/diamond.bundle.gr" 2>&1)
+    else
+        bundle_out="the source bundle would not build"
+    fi
+    if [ "$i" == "101 102" ] && [ "$n" == "101 102" ] && [ "$bu" == "101 102" ] \
+        && [ "$bundle_out" == "101 102" ]; then
+        pass=$((pass + 1))
+    else
+        fail=$((fail + 1))
+        FAILED+=("diamond_dependency")
+        echo "  DISAGREE: diamond_dependency (want '101 102')"
+        echo "    interp: $i"
+        echo "    native: $n"
+        echo "    bundle: $bu"
+        echo "    source bundle: $bundle_out"
+    fi
+}
+
+check_diamond
+
 check_package() {
     local root="$WORK/pkgcase"
     rm -rf "$root"

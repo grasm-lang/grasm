@@ -34,6 +34,25 @@ Grasm is pre-1.0: minor releases may break anything not marked `stable` in
   against a peer this project does not have. `docs/grasmwire.md` has the rest,
   including the one piece that is missing and why it is not being added blind.
 
+- GrasmWire's four post-handshake behaviours, each demonstrated between two
+  running processes rather than only asserted. It **rekeys**: a new ephemeral,
+  a newer timestamp, both sides landing on the same replacement session, and
+  traffic carried under keys that differ from the old ones. It **follows a peer
+  that moves**, and only on a datagram that authenticates — moving on an
+  unauthenticated one would let anyone redirect a live session by spoofing a
+  single packet. It **refuses a recording**, on the timestamp. And **under load
+  it stops allocating**: it answers an initiation with a cookie keyed to the
+  sender's own address, remembers nothing, and requires `mac2` on the retry.
+
+- `chacha20.hchacha` and `chachapoly.xseal`/`xopen` — HChaCha20 and
+  XChaCha20-Poly1305, which the cookie needs and which nothing else here did.
+  A 12-byte nonce is safe when a counter guarantees it never repeats; a cookie
+  has no counter, goes to whoever just wrote in, and is sealed under a key that
+  does not change, so the nonce must be random — and 96 random bits collide
+  around 2^48. HChaCha20 is the same twenty rounds with the final addition left
+  out, which is the whole construction rather than an optimisation, and it
+  matches the XChaCha20 draft's vector.
+
 - `udp_recv_from(h) -> (bytes, str, i64) ! IoError`, in all three engines. A
   datagram socket has no fixed peer, so `udp_recv` dropping the sender's
   address meant a receiver could only answer peers it was configured with in

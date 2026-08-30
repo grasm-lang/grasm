@@ -104,6 +104,49 @@ pub fn block(key: bytes, counter: i64, nonce: bytes) -> bytes {
     bytes_of(out)
 }
 
+/// The key-derivation half of XChaCha20: a 32-byte subkey from a key and
+/// sixteen bytes of nonce.
+///
+/// It is the same twenty rounds as `block` with **the final addition left
+/// out**, and that omission is the whole construction rather than an
+/// optimisation. Adding the original state back is what makes `block` a
+/// permutation applied to a known input, which is right for a key stream and
+/// wrong for a key derivation. Without it the output is a one-way function of
+/// the key, and that is what lets the nonce be enormous: sixteen bytes go in
+/// here and eight more go to the cipher, so twenty-four bytes of nonce can be
+/// chosen at random with no counter and no collision worth worrying about.
+///
+/// Words 0..4 and 12..16 are the ones taken, because those are the words the
+/// key never occupies: they hold the constants and the nonce, so every bit of
+/// the answer depends on the key only through the rounds.
+pub fn hchacha(key: bytes, nonce: bytes) -> bytes {
+    var s: [i64] = [0x61707865, 0x3320646e, 0x79622d32, 0x6b206574]
+    for i in 0..8 {
+        s.push(le32(key, i * 4))
+    }
+    for i in 0..4 {
+        s.push(le32(nonce, i * 4))
+    }
+    for _i in 0..10 {
+        quarter(s, 0, 4, 8, 12)
+        quarter(s, 1, 5, 9, 13)
+        quarter(s, 2, 6, 10, 14)
+        quarter(s, 3, 7, 11, 15)
+        quarter(s, 0, 5, 10, 15)
+        quarter(s, 1, 6, 11, 12)
+        quarter(s, 2, 7, 8, 13)
+        quarter(s, 3, 4, 9, 14)
+    }
+    var out: [i64] = []
+    for i in 0..4 {
+        put_le32(out, s[i])
+    }
+    for i in 12..16 {
+        put_le32(out, s[i])
+    }
+    bytes_of(out)
+}
+
 /// Encrypt, which is also decrypt: the key stream is xored either way.
 ///
 /// The counter starts where the caller says. RFC 8439 starts it at 1 for

@@ -387,7 +387,34 @@ pub fn load_from_source_bundle(src: &str) -> Program {
             if table.contains_key(written) {
                 return Some(written.to_string());
             }
-            None
+            // A **diamond**: the same package reached through two different
+            // importers. The writer emits each module once, under the path the
+            // disk loader happened to reach it by first, so a package depended
+            // on by two others sits in the bundle as `noise.blake2s` — and the
+            // other importer's plain `import blake2s` matched neither rule
+            // above. The build reported success and wrote an artifact that
+            // could not be loaded, which is F81's failure in the case F81's
+            // fix did not reach: that entry read both spellings the writer
+            // produces, and a diamond produces a name that is neither.
+            //
+            // So the last segment decides, and **only when exactly one module
+            // ends that way**. A unique suffix match is the same module by
+            // construction: these names are paths through the dependency
+            // graph, and a package appears in a bundle once. Two matches would
+            // be two different modules sharing a short name, and picking
+            // either would be a guess — so nothing is returned and the load
+            // fails saying so, rather than linking against the wrong code.
+            let suffix = format!(".{written}");
+            let mut hit: Option<&String> = None;
+            for name in table.keys() {
+                if name.ends_with(&suffix) {
+                    if hit.is_some() {
+                        return None;
+                    }
+                    hit = Some(name);
+                }
+            }
+            hit.cloned()
         },
         &HashMap::new(),
     )

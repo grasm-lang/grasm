@@ -31,12 +31,14 @@ one is checked as a property.
 | ChaCha20 | every RFC 8439 vector |
 | Poly1305 | every RFC 8439 vector, including A.3 #2 |
 | ChaCha20-Poly1305 | RFC 8439 §2.8.2 |
+| HChaCha20 | the XChaCha20 draft's vector |
 | BLAKE2s | RFC 7693 |
 | X25519 | every RFC 7748 vector — both scalar multiplications and the whole §6.1 exchange |
 | HKDF | all three RFC 5869 SHA-256 cases, both halves |
 | the handshake | 19 properties, 3 pinned values |
 | the protocol | 45 properties |
-| end to end | two processes, real UDP |
+| end to end | two processes, real UDP, with and without a cookie |
+| everything, again | 753 random cases against an implementation sharing no code |
 
 The handshake has no published vectors, because the construction is Noise's
 but the identifier string is this protocol's own. So it is checked two ways:
@@ -57,12 +59,56 @@ Two processes, two real UDP sockets, ephemeral keys from the operating system:
     [connect] sent packet 0: 40 bytes became 80 on the wire
     [connect] packet 0 came back byte for byte
     [listen]  a replayed handshake, refused on its timestamp
+    [listen]  rekeyed, new session hash 13c83192aced27f1...
+    [connect] a packet under the new key came back byte for byte
+
+and, when the responder is told it is under load:
+
+    [listen]  under load: answered with a cookie and stored nothing
+    [connect] the far side is under load and sent a cookie
+    [connect] sent the same message again with mac2 on it
+    [listen]  the second attempt carries a valid mac2, proceeding
 
 Both sides derive the same session hash without either sending it. Three IP
 packets go through the tunnel and come back unchanged. A recorded first
 message, replayed with every tag in it genuine, is refused on its timestamp.
 A cryptographically valid handshake from a key that is not on the list is
 refused after the identity is decrypted and before anything else happens.
+
+## The four things a session does after the handshake
+
+**It rekeys.** A session is replaced after two minutes and refused after three,
+and the gap between those is deliberate: rekeying costs a round trip, and a
+peer that only started when the old key was already invalid would drop traffic
+every time. The end-to-end run does a real one — a new ephemeral, a newer
+timestamp, both sides landing on the same new session hash, and a packet
+carried under the new keys.
+
+**It follows a peer that moves.** The endpoint is learned from the datagram,
+not configured, and it moves **only when a packet that authenticates comes from
+somewhere else**. Moving it on an unauthenticated packet would let anyone
+redirect a live session by spoofing one datagram, which is a denial of service
+that costs the attacker nothing.
+
+**It refuses a recording.** A first message replayed later carries the old
+timestamp, and the responder keeps only the greatest it has seen per peer —
+which refuses the recording without storing a list of everything ever seen.
+
+**And under load it stops allocating.** `mac1` proves the sender knew a public
+key, and public keys are public, so it filters noise rather than an attacker.
+Under real load the responder answers an initiation with a **cookie**: a keyed
+hash of the sender's own address, sealed to whoever is at that address. Only
+somebody actually there can read it, the next message must carry `mac2`
+computed under it, and the responder recomputes the cookie from the address in
+front of it — having stored nothing in between. An attacker who can make a
+responder allocate per unanswered packet has already won, so it does not.
+
+The cookie is sealed with **XChaCha20-Poly1305**, and that is not decoration.
+A 12-byte nonce is safe when a counter guarantees it never repeats, and there
+is no counter here: the key does not change and the cookie goes to whoever just
+wrote in, so the nonce has to be random — and 96 random bits collide around
+2^48. 192 do not. The construction needed only HChaCha20, which is the same
+twenty rounds with the final addition left out.
 
 ## Decisions worth defending
 

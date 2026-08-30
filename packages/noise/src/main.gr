@@ -478,3 +478,133 @@ pub fn split(st: State, is_initiator: bool) -> Keys {
 pub fn transcript(st: State) -> bytes {
     st.hash
 }
+
+// --- the cookie, which is what a peer does when it is under load ------------
+//
+// `mac1` proves the sender knew a public key, which is public, so it filters
+// noise and not an attacker. Under real load a responder needs something
+// stronger and must not get it by keeping state — an attacker who can make a
+// responder allocate per unanswered packet has already won.
+//
+// So the responder allocates nothing. It answers an initiation with a
+// **cookie**: a keyed hash of the sender's own address, encrypted to the
+// sender. Only somebody actually at that address can read it, and the next
+// message must carry `mac2` computed under it. The responder recomputes the
+// cookie from the address on the packet in front of it, compares, and has
+// remembered nothing between the two.
+//
+// The secret that keys the cookie rotates. A cookie that stayed valid forever
+// would be a bearer token for an address, and rotation bounds how long a
+// stolen one is worth having.
+
+/// The length of a cookie reply.
+///
+/// 8 header, 24 nonce, 32 sealed cookie. Fixed, like the other two.
+pub fn cookie_reply_len() -> i64 {
+    64
+}
+
+pub fn type_cookie() -> i64 {
+    3
+}
+
+/// The cookie for one address under one secret.
+///
+/// The address is whatever the caller considers an identity for the sender —
+/// the host and port it wrote from. It is a *string* rather than a parsed
+/// address on purpose: what counts as the same peer differs between IPv4,
+/// IPv6 and a proxy in front, and that is the caller's policy, not this
+/// file's.
+pub fn cookie_of(secret: bytes, address: str) -> bytes {
+    blake2s.keyed(secret, text(address), 16)
+}
+
+/// Build a cookie reply.
+///
+/// The nonce is the caller's because it must be random and this package
+/// reaches nothing. It is 24 bytes, and that is why the sealing here is
+/// XChaCha20-Poly1305 rather than the AEAD everything else uses: there is no
+/// counter to make a 12-byte nonce safe under a key that never changes.
+///
+/// The associated data is the `mac1` of the message being answered. That is
+/// what stops a cookie reply being replayed at a different handshake — it
+/// only opens against the message that provoked it.
+pub fn cookie_reply(responder_static: bytes, cookie: bytes, receiver_index: i64,
+                    nonce: bytes, their_mac1: bytes) -> bytes {
+    let sealed = chachapoly.xseal(cookie_key(responder_static), nonce, their_mac1, cookie)
+    var out = header(type_cookie(), receiver_index).to_list()
+    for b in nonce.to_list() {
+        out.push(b)
+    }
+    for b in sealed.to_list() {
+        out.push(b)
+    }
+    bytes_of(out)
+}
+
+/// Read a cookie reply, given the `mac1` of the message it answers.
+///
+/// Nothing is returned when it does not open, and that is the only signal:
+/// which of the reasons it was — the wrong length, the wrong type, a bad tag,
+/// the wrong handshake — is not a peer's business.
+pub fn consume_cookie_reply(responder_static: bytes, message: bytes,
+                            my_mac1: bytes) -> Option[bytes] {
+    if message.len() != cookie_reply_len() {
+        return None
+    }
+    if message.at(0) != type_cookie() {
+        return None
+    }
+    let nonce = slice(message, 8, 24)
+    let sealed = slice(message, 32, 32)
+    match chachapoly.xopen(cookie_key(responder_static), nonce, my_mac1, sealed) {
+        Ok(cookie) -> Some(cookie)
+        Err(_e) -> None
+    }
+}
+
+/// Write `mac2` into a message, using a cookie.
+///
+/// The field is the last sixteen bytes and is zero until there is a cookie to
+/// fill it with. Zero is not a special value the far side looks for: a peer
+/// that is not under load does not check `mac2` at all, so a message with
+/// zeros there is an ordinary message, and one with a cookie in it is the same
+/// message that also works when the far side *is* under load.
+pub fn apply_mac2(message: bytes, cookie: bytes) -> bytes {
+    let cut = message.len() - 16
+    let m2 = blake2s.keyed(cookie, slice(message, 0, cut), 16)
+    var out: [i64] = []
+    for i in 0..cut {
+        out.push(message.at(i))
+    }
+    for b in m2.to_list() {
+        out.push(b)
+    }
+    bytes_of(out)
+}
+
+/// Whether a message carries the right `mac2` for a cookie.
+///
+/// The responder computes the cookie it *would* have issued for the address
+/// this packet came from and checks against that. It never stored one, which
+/// is the entire point: an attacker cannot make it hold anything.
+pub fn check_mac2(message: bytes, cookie: bytes) -> bool {
+    if message.len() < 32 {
+        return false
+    }
+    let cut = message.len() - 16
+    let want = blake2s.keyed(cookie, slice(message, 0, cut), 16)
+    constant_equal(want, slice(message, cut, 16))
+}
+
+/// Whether a message's `mac2` field is still empty.
+pub fn mac2_is_empty(message: bytes) -> bool {
+    if message.len() < 16 {
+        return false
+    }
+    var any = 0
+    for i in (message.len() - 16)..message.len() {
+        any = any.bit_or(message.at(i))
+    }
+    any == 0
+}

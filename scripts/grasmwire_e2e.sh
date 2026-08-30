@@ -68,6 +68,28 @@ C=$(cat "$WORK/connect.out")
 grep -q "TUNNEL OK" <<<"$C" && note yes || note no "the caller did not get every packet back"
 grep -q "TUNNEL OK" <<<"$L" && note yes || note no "the listener did not echo every packet"
 grep -q "came back byte for byte" <<<"$C" && note yes || note no "no packet survived the round trip"
+
+# A session is replaced before it expires, and traffic keeps flowing under the
+# new keys. This is not an exceptional path — it is what a long-lived tunnel
+# spends most of its life doing.
+grep -q "rekeyed, new session hash" <<<"$C" && note yes || note no "the caller did not rekey"
+grep -q "the new keys are different from the old ones" <<<"$C" && note yes \
+    || note no "the rekey produced the same keys, which buys nothing"
+grep -q "a packet under the new key came back byte for byte" <<<"$C" && note yes \
+    || note no "nothing survived the round trip under the new keys"
+lr=$(grep -o 'rekeyed, new session hash [0-9a-f]*' <<<"$L" | head -1)
+cr=$(grep -o 'rekeyed, new session hash [0-9a-f]*' <<<"$C" | head -1)
+if [ -n "$lr" ] && [ "$lr" == "$cr" ]; then
+    note yes
+else
+    note no "the two sides disagreed on the replacement session"
+fi
+# And the replacement is a different session from the first one.
+if [ -n "$lr" ] && [ "${lr#rekeyed, new }" != "${lh#}" ]; then
+    note yes
+else
+    note no "the replacement session is the same as the one it replaced"
+fi
 grep -q "replayed handshake, refused" <<<"$L" && note yes || note no "a recorded first message was not refused"
 
 # Both sides must have derived the same session hash without either sending it.
@@ -106,6 +128,23 @@ if [ -n "$again" ] && [ "$again" != "$lh" ]; then
 else
     note no "two runs produced the same session — the ephemeral keys are not fresh"
 fi
+
+# Under load the responder must answer with a cookie and store nothing, and
+# the caller must complete the same handshake by adding mac2. If the cookie
+# path were broken this run would simply never connect.
+"$WORK/peer" listen  "$((LPORT + 12))" 9 "$B" "$PA" "$PSK" underload >"$WORK/l4.out" 2>&1 &
+l4=$!
+"$WORK/peer" connect "$((CPORT + 12))" "$((LPORT + 12))" "$A" "$PB" "$PSK" >"$WORK/c4.out" 2>&1 &
+c4=$!
+wait $c4; wait $l4
+grep -q "answered with a cookie and stored nothing" "$WORK/l4.out" && note yes \
+    || note no "the loaded responder did not issue a cookie"
+grep -q "the far side is under load and sent a cookie" "$WORK/c4.out" && note yes \
+    || note no "the caller did not recognise the cookie reply"
+grep -q "the second attempt carries a valid mac2" "$WORK/l4.out" && note yes \
+    || note no "the retry did not carry a mac2 the responder accepted"
+grep -q "TUNNEL OK" "$WORK/c4.out" && note yes \
+    || note no "the tunnel did not come up through the cookie path"
 
 echo "checked: $((pass + fail))  passed: $pass  failed: $fail"
 [ "$fail" -eq 0 ]

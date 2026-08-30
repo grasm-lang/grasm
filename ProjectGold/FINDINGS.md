@@ -100,6 +100,8 @@ and the entries disagree.
 | [F82](#f82) | three more pairs of packages could not be imported together | S3, libraries | **fixed** |
 | [F83](#f83) | a qualified call was charged its own row and a local function's | S3, effects | **fixed** |
 | [F84](#f84) | a generic container could not be built in a struct field | S2, backend | **fixed** |
+| [F85](#f85) | a datagram receiver could not learn who wrote to it | S2, libraries | **fixed** |
+| [F86](#f86) | `args()` was documented as something it only sometimes is | S4, spec | **fixed** |
 
 <!-- end index -->
 ## F1 — a wrapped condition must end the line with the operator (S4) — **fixed**
@@ -3623,3 +3625,70 @@ Found by writing an API gateway with sixteen dependencies, whose store holds a
 **Gate**: `scripts/nativegaps.sh`, "a type parameter a struct field fixes" — a
 struct field and a list element in one program. Removing the fallback turns it
 from compiled to refused.
+
+## F85 — a datagram receiver could not learn who wrote to it (S2, libraries) — **fixed**
+
+```
+udp_recv(h) -> bytes ! IoError
+```
+
+The signature is the finding. A datagram socket has **no fixed peer** — that is
+the whole difference from a stream, and `spec/library.md` says so two
+paragraphs above, explaining that `udp_send` names a destination on every call
+because of it. The receive side dropped exactly that information.
+
+The runtime had it and threw it away. Both engines already called `recv_from`
+and wrote the address to `_`:
+
+```rust
+match d.recv_from(&mut buf) {
+    Ok((n, _)) => { buf.truncate(n); Ok(buf) }
+```
+
+So a responder could only answer peers it had been *configured* with in
+advance. That rules out every protocol where a client's address is unknown
+until it calls, which is most of them, and it rules out roaming — a peer
+moving between networks — which is one of the things a VPN exists to do.
+
+Found by writing one. The first version of `apps/grasmwire` had both endpoints
+configured and a comment admitting why.
+
+`udp_recv_from(h) -> (bytes, str, i64) ! IoError` in all three engines, a
+tuple for the same reason `proc_run`'s result is: three values with obvious
+positions did not need a name. `udp_recv` stays, because a caller that already
+knows where to reply should not have to say so, and dropping the address is
+then the honest signature rather than a loss.
+
+**Two gates, and the second was not planned.** `agreetest` sends between two
+sockets in one program and compares the address across interpreter, native and
+bundled. And `scripts/grasmwire_e2e.sh` tells the listener a deliberately
+*wrong* fallback port, so the builtin has to do real work or the tunnel never
+comes up — the difference between a call being made and a call mattering.
+
+`replaytest` refused to go green until the new builtin had a replay program,
+which is that gate doing precisely its job: it reads the journaled builtins out
+of `crates/grasm_sema/src/builtins.rs` and demands one each.
+
+## F86 — `args()` was documented as something it only sometimes is (S4, spec) — **fixed**
+
+```
+| `args()` | `() -> [str]` | arguments after `--`; performs `io` |
+```
+
+True under `grasm run`, where `--` separates the tool's arguments from the
+program's. Not true of a compiled binary, which *is* the command and has no
+separator to strip: `./prog -- a b` gives it three arguments, the first being
+`--`.
+
+Nothing was wrong with the behaviour. Both spellings hand the program the same
+list, `agreetest` has held all three modes to that since a cold model added it,
+and that gate's own comment states the rule correctly. Only the one-line
+summary in the table was wrong, and a reader of the spec would have learned
+something false that the gate already knew.
+
+Recorded because the shape is worth naming: a **documented** claim narrower
+than the behaviour it describes is invisible to every gate here, since the
+gates read exit codes and the spec is prose. It was found by writing a program
+that took arguments and running it two ways.
+
+Now `[L-LIB-ARGS]`, which says which spelling belongs to which and why.

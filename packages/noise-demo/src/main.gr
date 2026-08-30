@@ -6,6 +6,7 @@
 // byte of the handshake is caught by this file rather than by a peer.
 
 import noise
+import chachapoly
 import x25519
 import bytes_codec
 
@@ -174,7 +175,78 @@ fn main() / {io} {
         Ok(wrong) -> say("a message built for a stale key is refused",
             refused(responder_private, responder_public, wrong.message))
         Err(_e) -> say("a message built for a stale key is refused", false)
+    
     }
+
+    print("-- XChaCha20-Poly1305, which the cookie mechanism needs")
+    let xkey = unhex("3333333333333333333333333333333333333333333333333333333333333333")
+    let xnonce = unhex("222222222222222222222222222222222222222222222222")
+    let xsealed = chachapoly.xseal(xkey, xnonce, unhex("aabb"), unhex("0011223344"))
+    say("a sealed message is the plaintext plus a tag", xsealed.len() == 5 + 16)
+    match chachapoly.xopen(xkey, xnonce, unhex("aabb"), xsealed) {
+        Ok(p) -> say("it opens back to the plaintext", hex(p) == "0011223344")
+        Err(_e) -> say("it opens back to the plaintext", false)
+    }
+    match chachapoly.xopen(xkey, xnonce, unhex("aabc"), xsealed) {
+        Ok(_p) -> say("different associated data does not open it", false)
+        Err(_e) -> say("different associated data does not open it", true)
+    }
+    match chachapoly.xopen(xkey, unhex("222222222222222222222222222222222222222222222223"), unhex("aabb"), xsealed) {
+        Ok(_p) -> say("a different nonce does not open it", false)
+        Err(_e) -> say("a different nonce does not open it", true)
+    }
+
+    print("-- the cookie, which is what a peer does when it is under load")
+    let secret = unhex("1111111111111111111111111111111111111111111111111111111111111111")
+    let started2: Initiation ! HandshakeError = noise.initiate(initiator_private,
+        initiator_public, responder_public, initiator_ephemeral, timestamp, 1)
+    match started2 {
+        Ok(init2) -> {
+            say("a fresh message has an empty mac2", noise.mac2_is_empty(init2.message))
+            let their_mac1 = mac1_of(init2.message)
+            let cookie = noise.cookie_of(secret, "203.0.113.7:51820")
+            let creply = noise.cookie_reply(responder_public, cookie, 0, xnonce, their_mac1)
+            say("a cookie reply is {noise.cookie_reply_len()} bytes",
+                creply.len() == noise.cookie_reply_len())
+            match noise.consume_cookie_reply(responder_public, creply, their_mac1) {
+                Some(got) -> {
+                    say("the initiator recovers the cookie", hex(got) == hex(cookie))
+                    let retried = noise.apply_mac2(init2.message, got)
+                    say("the retry is the same length", retried.len() == init2.message.len())
+                    say("and its mac2 is no longer empty", not noise.mac2_is_empty(retried))
+                    say("the responder accepts that mac2",
+                        noise.check_mac2(retried, noise.cookie_of(secret, "203.0.113.7:51820")))
+                    say("a cookie for a different address does not match",
+                        not noise.check_mac2(retried, noise.cookie_of(secret, "203.0.113.8:51820")))
+                    say("a cookie under a rotated secret does not match",
+                        not noise.check_mac2(retried,
+                            noise.cookie_of(unhex("4444444444444444444444444444444444444444444444444444444444444444"),
+                                "203.0.113.7:51820")))
+                    say("the handshake still works with mac2 filled in",
+                        not refused(responder_private, responder_public, retried))
+                }
+                None -> say("the initiator recovers the cookie", false)
+            }
+            // Sealed against one handshake's mac1, offered at another.
+            let stray = noise.cookie_reply(responder_public, cookie, 0, xnonce,
+                unhex("00000000000000000000000000000000"))
+            match noise.consume_cookie_reply(responder_public, stray,
+                    unhex("99999999999999999999999999999999")) {
+                Some(_c) -> say("a cookie reply from another handshake is refused", false)
+                None -> say("a cookie reply from another handshake is refused", true)
+            }
+        }
+        Err(_e) -> say("a second message could be built", false)
+    }
+}
+
+/// The `mac1` field: the sixteen bytes before `mac2`.
+fn mac1_of(message: bytes) -> bytes {
+    var out: [i64] = []
+    for i in (message.len() - 32)..(message.len() - 16) {
+        out.push(message.at(i))
+    }
+    bytes_of(out)
 }
 
 /// True when the responder rejects the message, whichever way it is wrong.

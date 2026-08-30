@@ -137,3 +137,49 @@ pub fn nonce_of(counter: i64) -> bytes {
     }
     bytes_of(out)
 }
+
+/// XChaCha20-Poly1305: the same AEAD with a 24-byte nonce.
+///
+/// The problem it solves is narrow and real. A 12-byte nonce is safe when a
+/// counter guarantees it is never repeated, and that guarantee needs state
+/// that survives restarts. Where there is no such counter — a cookie sent to
+/// whoever just wrote in, under a key that does not change — the nonce has to
+/// be *random*, and 96 bits of random nonce collides at around 2^48 messages.
+/// 192 bits does not collide.
+///
+/// It is built by deriving a subkey from the first sixteen bytes of nonce and
+/// giving the cipher the last eight, so no new cipher is involved: the
+/// construction is `hchacha` and then exactly the AEAD above.
+///
+/// **The nonce must be twenty-four bytes**, and a shorter one panics rather
+/// than being padded or rejected quietly. That is deliberate and it is the
+/// opposite of what a wire-facing function should do: a nonce is chosen by the
+/// caller, never read off the network, so a wrong width here is a bug in a
+/// program and not a message from an attacker. Padding it would silently
+/// weaken the very property the twenty-four bytes exist for.
+pub fn xseal(key: bytes, nonce24: bytes, aad: bytes, plaintext: bytes) -> bytes {
+    seal_combined(subkey_of(key, nonce24), tail_nonce(nonce24), aad, plaintext)
+}
+
+pub fn xopen(key: bytes, nonce24: bytes, aad: bytes, sealed: bytes) -> bytes ! AeadError {
+    try open_combined(subkey_of(key, nonce24), tail_nonce(nonce24), aad, sealed)
+}
+
+fn subkey_of(key: bytes, nonce24: bytes) -> bytes {
+    var first: [i64] = []
+    for i in 0..16 {
+        first.push(nonce24.at(i))
+    }
+    chacha20.hchacha(key, bytes_of(first))
+}
+
+/// Four zero bytes and then the last eight of the nonce. The zeros are not
+/// padding for its own sake: they are the block counter's high half, and
+/// putting the nonce there instead would shorten the message limit.
+fn tail_nonce(nonce24: bytes) -> bytes {
+    var n: [i64] = [0, 0, 0, 0]
+    for i in 16..24 {
+        n.push(nonce24.at(i))
+    }
+    bytes_of(n)
+}

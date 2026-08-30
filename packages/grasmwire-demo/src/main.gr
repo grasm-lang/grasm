@@ -226,6 +226,15 @@ fn main() / {io} {
     say(failures, "and a long one is not either",
         not grasmwire.later_than(unhex("0102030405060708090a0b0c0d0e"), t1))
 
+    print("-- the cookie secret, which is a bearer token and so must expire")
+    say(failures, "a fresh secret is not stale", not grasmwire.cookie_secret_stale(0, 0))
+    say(failures, "and is still good one millisecond before the limit",
+        not grasmwire.cookie_secret_stale(0, grasmwire.cookie_rotate_ms() - 1))
+    say(failures, "and is stale at the limit",
+        grasmwire.cookie_secret_stale(0, grasmwire.cookie_rotate_ms()))
+    say(failures, "a secret born later is judged from when it was born",
+        not grasmwire.cookie_secret_stale(1000, grasmwire.cookie_rotate_ms()))
+
     print("-- IP length, which is what makes the padding free")
     say(failures, "an IPv4 header declares its length", grasmwire.ip_length(packet) ?? 0 == 40)
     say(failures, "a padded packet still declares the original",
