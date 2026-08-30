@@ -1,0 +1,8 @@
+[package]
+name = "sheet_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.sheet]
+path = "../sheet"
+version = "^1.0.0"

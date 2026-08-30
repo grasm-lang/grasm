@@ -1,0 +1,393 @@
+// A spreadsheet: formulas, a dependency graph, and recalculating only what
+// changed.
+//
+// The hard part is not arithmetic. It is that a cell's value depends on other
+// cells, so a change has to propagate — and only to the cells that actually
+// depend on it, in an order where each is computed after everything it needs.
+// Recomputing the whole sheet is correct and unusable past a few thousand
+// cells; recomputing in the wrong order gives stale answers that look right.
+//
+// **A cycle is the case that decides the design.** `A1 = B1 + 1` and
+// `B1 = A1 + 1` is a thing a user types by accident every day, and it must
+// produce an error in those cells and leave the rest of the sheet working —
+// not an infinite loop, and not a wrong number.
+//
+// The order comes from a topological sort of the affected sub-graph. Cells not
+// reachable from the change are not visited at all, which is what makes a
+// large sheet fast, and the sort's own failure to finish *is* the cycle
+// detection — there is no separate check that could disagree with it.
+
+type Value =
+    | Empty
+    | Number(n: f64)
+    | Text(s: str)
+    | Error(why: str)
+
+type Expr =
+    | Literal(v: Value)
+    | Reference(cell: str)
+    | Add(left: i64, right: i64)
+    | Sub(left: i64, right: i64)
+    | Mul(left: i64, right: i64)
+    | Div(left: i64, right: i64)
+    | Sum(cells: [str])
+
+type Cell = {
+    name: str,
+    // The expression tree, flattened: `nodes` holds it and `root` is the top.
+    nodes: [Expr],
+    root: i64,
+    value: Value,
+    // Cells this one reads, and cells that read this one.
+    reads: [str],
+    read_by: [str],
+}
+
+type Sheet = {
+    cells: [Cell],
+    recalculated: i64,
+}
+
+pub fn new_sheet() -> Sheet {
+    var c: [Cell] = []
+    Sheet{ cells: c, recalculated: 0 }
+}
+
+fn index_of(s: Sheet, name: str) -> i64 {
+    for i in 0..s.cells.len() {
+        if s.cells[i].name == name {
+            return i
+        }
+    }
+    0 - 1
+}
+
+fn ensure(inout s: Sheet, name: str) -> i64 {
+    let at = index_of(s, name)
+    if at >= 0 {
+        return at
+    }
+    var nodes: [Expr] = []
+    var reads: [str] = []
+    var read_by: [str] = []
+    s.cells.push(Cell{
+        name: name,
+        nodes: nodes,
+        root: 0 - 1,
+        value: Empty,
+        reads: reads,
+        read_by: read_by,
+    })
+    s.cells.len() - 1
+}
+
+/// What a formula reads, so the graph can be built without evaluating it.
+fn referenced(nodes: [Expr], root: i64) -> [str] {
+    var out: [str] = []
+    if root < 0 {
+        return out
+    }
+    var stack: [i64] = [root]
+    while stack.len() > 0 {
+        let at = stack[stack.len() - 1]
+        stack.pop()
+        if at >= 0 and at < nodes.len() {
+            match nodes[at] {
+                Reference(c) -> out.push(c)
+                Add(l, r) -> {
+                    stack.push(l)
+                    stack.push(r)
+                }
+                Sub(l, r) -> {
+                    stack.push(l)
+                    stack.push(r)
+                }
+                Mul(l, r) -> {
+                    stack.push(l)
+                    stack.push(r)
+                }
+                Div(l, r) -> {
+                    stack.push(l)
+                    stack.push(r)
+                }
+                Sum(cs) -> {
+                    for c in cs {
+                        out.push(c)
+                    }
+                }
+                Literal(_v) -> {}
+            }
+        }
+    }
+    out
+}
+
+/// Put a formula in a cell and recalculate whatever depends on it.
+pub fn set_formula(inout s: Sheet, name: str, nodes: [Expr], root: i64) {
+    let at = ensure(s, name)
+    // Unsubscribe from whatever this cell used to read, or a cell that stopped
+    // referring to another would still be woken by it.
+    let old = s.cells[at].reads
+    for r in old {
+        let other = index_of(s, r)
+        if other >= 0 {
+            var kept: [str] = []
+            for w in s.cells[other].read_by {
+                if w != name {
+                    kept.push(w)
+                }
+            }
+            s.cells[other].read_by = kept
+        }
+    }
+    let reads = referenced(nodes, root)
+    s.cells[at].nodes = nodes
+    s.cells[at].root = root
+    s.cells[at].reads = reads
+    for r in reads {
+        let other = ensure(s, r)
+        var seen = false
+        for w in s.cells[other].read_by {
+            if w == name {
+                seen = true
+            }
+        }
+        if not seen {
+            s.cells[other].read_by.push(name)
+        }
+    }
+    recalculate_from(s, name)
+}
+
+pub fn set_number(inout s: Sheet, name: str, n: f64) {
+    var nodes: [Expr] = [Literal(Number(n))]
+    set_formula(s, name, nodes, 0)
+}
+
+pub fn set_text(inout s: Sheet, name: str, t: str) {
+    var nodes: [Expr] = [Literal(Text(t))]
+    set_formula(s, name, nodes, 0)
+}
+
+/// Everything reachable from a cell by `read_by`, including itself.
+fn affected(s: Sheet, name: str) -> [str] {
+    var out: [str] = []
+    var stack: [str] = [name]
+    while stack.len() > 0 {
+        let at = stack[stack.len() - 1]
+        stack.pop()
+        var seen = false
+        for o in out {
+            if o == at {
+                seen = true
+            }
+        }
+        if not seen {
+            out.push(at)
+            let i = index_of(s, at)
+            if i >= 0 {
+                for w in s.cells[i].read_by {
+                    stack.push(w)
+                }
+            }
+        }
+        // Bounded, because a cycle would otherwise walk for ever here — the
+        // `seen` check handles it, and this is the belt to that brace.
+        if out.len() > 100000 {
+            return out
+        }
+    }
+    out
+}
+
+/// Recalculate the cells that depend on `name`, in dependency order.
+///
+/// The order is a topological sort restricted to the affected set. Its failure
+/// to place every cell **is** the cycle detection: a cell still unplaced when
+/// nothing more can be placed is in a cycle, and gets an error rather than a
+/// number.
+fn recalculate_from(inout s: Sheet, name: str) {
+    let touched = affected(s, name)
+    var placed: [str] = []
+    var remaining = touched
+
+    var going = true
+    while going and remaining.len() > 0 {
+        var progressed = false
+        var still: [str] = []
+        for cell in remaining {
+            let i = index_of(s, cell)
+            var ready = true
+            if i >= 0 {
+                for r in s.cells[i].reads {
+                    // A dependency inside the affected set must be placed
+                    // first; one outside it already has its value.
+                    var inside = false
+                    for t in touched {
+                        if t == r {
+                            inside = true
+                        }
+                    }
+                    if inside {
+                        var done = false
+                        for p in placed {
+                            if p == r {
+                                done = true
+                            }
+                        }
+                        if not done {
+                            ready = false
+                        }
+                    }
+                }
+            }
+            if ready {
+                placed.push(cell)
+                progressed = true
+            } else {
+                still.push(cell)
+            }
+        }
+        remaining = still
+        if not progressed {
+            going = false
+        }
+    }
+
+    for cell in placed {
+        let i = index_of(s, cell)
+        if i >= 0 {
+            s.cells[i].value = evaluate(s, i)
+            s.recalculated = s.recalculated + 1
+        }
+    }
+    // Whatever could not be ordered is in a cycle.
+    for cell in remaining {
+        let i = index_of(s, cell)
+        if i >= 0 {
+            s.cells[i].value = Error("circular reference")
+            s.recalculated = s.recalculated + 1
+        }
+    }
+}
+
+fn evaluate(s: Sheet, at: i64) -> Value {
+    let c = s.cells[at]
+    if c.root < 0 {
+        return Empty
+    }
+    eval_node(s, c.nodes, c.root)
+}
+
+fn eval_node(s: Sheet, nodes: [Expr], at: i64) -> Value {
+    if at < 0 or at >= nodes.len() {
+        return Error("bad formula")
+    }
+    match nodes[at] {
+        Literal(v) -> v
+        Reference(name) -> {
+            let i = index_of(s, name)
+            if i < 0 {
+                Empty
+            } else {
+                s.cells[i].value
+            }
+        }
+        Add(l, r) -> arithmetic(s, nodes, l, r, "+")
+        Sub(l, r) -> arithmetic(s, nodes, l, r, "-")
+        Mul(l, r) -> arithmetic(s, nodes, l, r, "*")
+        Div(l, r) -> arithmetic(s, nodes, l, r, "/")
+        Sum(cells) -> {
+            var total = 0.0
+            for name in cells {
+                let i = index_of(s, name)
+                if i >= 0 {
+                    match s.cells[i].value {
+                        Number(n) -> total = total + n
+                        Error(w) -> return Error(w)
+                        // Empty and text are skipped, which is what a
+                        // spreadsheet does: SUM over a range with a heading in
+                        // it should not fail.
+                        _other -> {}
+                    }
+                }
+            }
+            Number(total)
+        }
+    }
+}
+
+fn arithmetic(s: Sheet, nodes: [Expr], l: i64, r: i64, op: str) -> Value {
+    let left = eval_node(s, nodes, l)
+    let right = eval_node(s, nodes, r)
+    match left {
+        Error(w) -> return Error(w)
+        _other -> {}
+    }
+    match right {
+        Error(w) -> return Error(w)
+        _other -> {}
+    }
+    let a = as_number(left)
+    let b = as_number(right)
+    match a {
+        None -> return Error("not a number")
+        Some(x) -> {
+            match b {
+                None -> Error("not a number")
+                Some(y) -> {
+                    if op == "+" {
+                        Number(x + y)
+                    } else if op == "-" {
+                        Number(x - y)
+                    } else if op == "*" {
+                        Number(x * y)
+                    } else {
+                        // Division by zero is an error, not an infinity. A
+                        // spreadsheet showing `inf` where a user divided by an
+                        // empty cell has told them nothing.
+                        if y == 0.0 {
+                            Error("divide by zero")
+                        } else {
+                            Number(x / y)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn as_number(v: Value) -> Option[f64] {
+    match v {
+        Number(n) -> Some(n)
+        // An empty cell is zero in arithmetic, which is what every
+        // spreadsheet does and what users expect.
+        Empty -> Some(0.0)
+        _other -> None
+    }
+}
+
+pub fn value_of(s: Sheet, name: str) -> Value {
+    let i = index_of(s, name)
+    if i < 0 {
+        Empty
+    } else {
+        s.cells[i].value
+    }
+}
+
+pub fn show(v: Value) -> str {
+    match v {
+        Empty -> ""
+        Number(n) -> "{n}"
+        Text(t) -> t
+        Error(w) -> "#{w}"
+    }
+}
+
+pub fn recalculations(s: Sheet) -> i64 { s.recalculated }
+
+pub fn reset_count(inout s: Sheet) {
+    s.recalculated = 0
+}

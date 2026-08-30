@@ -1,0 +1,128 @@
+import sheet
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn shown(s: Sheet, name: str) -> str {
+    sheet.show(sheet.value_of(s, name))
+}
+
+fn main() / {io} {
+    var f = 0
+
+    print("-- values and formulas")
+    var s = sheet.new_sheet()
+    sheet.set_number(s, "A1", 10.0)
+    sheet.set_number(s, "A2", 32.0)
+    say(f, "a number", shown(s, "A1") == "10.0")
+    // C1 = A1 + A2
+    sheet.set_formula(s, "C1", [Add(1, 2), Reference("A1"), Reference("A2")], 0)
+    say(f, "a formula over two cells", shown(s, "C1") == "42.0")
+    // D1 = C1 * 2
+    sheet.set_formula(s, "D1", [Mul(1, 2), Reference("C1"), Literal(Number(2.0))], 0)
+    say(f, "a formula over a formula", shown(s, "D1") == "84.0")
+
+    print("-- a change propagates, in the right order")
+    sheet.set_number(s, "A1", 20.0)
+    say(f, "the direct dependant updates", shown(s, "C1") == "52.0")
+    say(f, "and so does the one behind it", shown(s, "D1") == "104.0")
+    // The order matters: if D1 were computed before C1 it would use the stale
+    // value and look plausible.
+    sheet.set_number(s, "A2", 0.0)
+    say(f, "a second change, still in order",
+        shown(s, "C1") == "20.0" and shown(s, "D1") == "40.0")
+
+    print("-- only what depends on the change is recalculated")
+    var big = sheet.new_sheet()
+    for i in 0..300 {
+        sheet.set_number(big, "X{i}", i.as_f64())
+    }
+    // One chain of three off X0, and 297 cells that depend on nothing.
+    sheet.set_formula(big, "P", [Add(1, 2), Reference("X0"), Literal(Number(1.0))], 0)
+    sheet.set_formula(big, "Q", [Mul(1, 2), Reference("P"), Literal(Number(2.0))], 0)
+    sheet.reset_count(big)
+    sheet.set_number(big, "X0", 5.0)
+    say(f, "changing X0 recalculates X0, P and Q and nothing else",
+        sheet.recalculations(big) == 3)
+    say(f, "with the right values", shown(big, "Q") == "12.0")
+    sheet.reset_count(big)
+    sheet.set_number(big, "X250", 1.0)
+    say(f, "changing a cell nothing reads recalculates only itself",
+        sheet.recalculations(big) == 1)
+
+    print("-- a cycle, which users type every day")
+    var c = sheet.new_sheet()
+    sheet.set_formula(c, "A1", [Add(1, 2), Reference("B1"), Literal(Number(1.0))], 0)
+    sheet.set_formula(c, "B1", [Add(1, 2), Reference("A1"), Literal(Number(1.0))], 0)
+    say(f, "both cells report a circular reference",
+        shown(c, "A1") == "#circular reference"
+        and shown(c, "B1") == "#circular reference")
+    // The rest of the sheet must keep working.
+    sheet.set_number(c, "Z1", 7.0)
+    sheet.set_formula(c, "Z2", [Mul(1, 2), Reference("Z1"), Literal(Number(3.0))], 0)
+    say(f, "and the rest of the sheet still works", shown(c, "Z2") == "21.0")
+    // A three-cell cycle, and a cell pointing at itself.
+    var c3 = sheet.new_sheet()
+    sheet.set_formula(c3, "A", [Reference("B")], 0)
+    sheet.set_formula(c3, "B", [Reference("C")], 0)
+    sheet.set_formula(c3, "C", [Reference("A")], 0)
+    say(f, "a three-cell cycle is caught", shown(c3, "A") == "#circular reference")
+    var self_ref = sheet.new_sheet()
+    sheet.set_formula(self_ref, "A1", [Add(1, 2), Reference("A1"), Literal(Number(1.0))], 0)
+    say(f, "a cell referring to itself is caught",
+        shown(self_ref, "A1") == "#circular reference")
+
+    print("-- breaking a cycle brings the cells back")
+    sheet.set_number(c, "B1", 5.0)
+    say(f, "B1 is a number again", shown(c, "B1") == "5.0")
+    say(f, "and A1 recomputes from it", shown(c, "A1") == "6.0")
+
+    print("-- errors travel, and empty cells are zero")
+    var e = sheet.new_sheet()
+    sheet.set_number(e, "A1", 1.0)
+    sheet.set_number(e, "A2", 0.0)
+    sheet.set_formula(e, "B1", [Div(1, 2), Reference("A1"), Reference("A2")], 0)
+    say(f, "dividing by zero is an error, not an infinity",
+        shown(e, "B1") == "#divide by zero")
+    sheet.set_formula(e, "C1", [Add(1, 2), Reference("B1"), Literal(Number(1.0))], 0)
+    say(f, "and it propagates rather than becoming a number",
+        shown(e, "C1") == "#divide by zero")
+    sheet.set_formula(e, "D1", [Add(1, 2), Reference("NOWHERE"), Literal(Number(5.0))], 0)
+    say(f, "an empty cell counts as zero", shown(e, "D1") == "5.0")
+    sheet.set_text(e, "T1", "hello")
+    sheet.set_formula(e, "E1", [Add(1, 2), Reference("T1"), Literal(Number(1.0))], 0)
+    say(f, "text in arithmetic is an error", shown(e, "E1") == "#not a number")
+
+    print("-- SUM skips what is not a number, as a spreadsheet must")
+    var m = sheet.new_sheet()
+    sheet.set_number(m, "A1", 1.0)
+    sheet.set_text(m, "A2", "heading")
+    sheet.set_number(m, "A3", 2.0)
+    sheet.set_formula(m, "A4", [Sum(["A1", "A2", "A3", "A9"])], 0)
+    say(f, "a heading in the range does not break the total",
+        shown(m, "A4") == "3.0")
+
+    print("-- changing what a formula reads updates the graph")
+    var g = sheet.new_sheet()
+    sheet.set_number(g, "A1", 1.0)
+    sheet.set_number(g, "A2", 100.0)
+    sheet.set_formula(g, "B1", [Reference("A1")], 0)
+    say(f, "B1 follows A1", shown(g, "B1") == "1.0")
+    sheet.set_formula(g, "B1", [Reference("A2")], 0)
+    say(f, "and now follows A2", shown(g, "B1") == "100.0")
+    sheet.reset_count(g)
+    sheet.set_number(g, "A1", 999.0)
+    say(f, "changing A1 no longer touches B1", sheet.recalculations(g) == 1)
+
+    if f == 0 {
+        print("all checks passed")
+    } else {
+        print("{f} check(s) failed")
+    }
+}
