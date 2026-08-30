@@ -1,0 +1,109 @@
+import piecetable
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+
+    print("-- editing without moving text")
+    var d = piecetable.from_text("Hello World")
+    say(f, "a new document reads back", piecetable.text_of(d) == "Hello World")
+    say(f, "and is one piece", piecetable.piece_count(d) == 1)
+    piecetable.insert(d, 5, ",")
+    say(f, "an insert in the middle", piecetable.text_of(d) == "Hello, World")
+    say(f, "which split one piece into three", piecetable.piece_count(d) == 3)
+    piecetable.insert(d, 0, ">> ")
+    say(f, "an insert at the start", piecetable.text_of(d) == ">> Hello, World")
+    piecetable.insert(d, piecetable.length_of(d), "!")
+    say(f, "an insert at the end", piecetable.text_of(d) == ">> Hello, World!")
+    say(f, "the length agrees with the text",
+        piecetable.length_of(d) == piecetable.text_of(d).len())
+
+    print("-- deleting")
+    var e = piecetable.from_text("abcdefghij")
+    piecetable.remove(e, 3, 4)
+    say(f, "a range from the middle", piecetable.text_of(e) == "abchij")
+    piecetable.remove(e, 0, 2)
+    say(f, "from the start", piecetable.text_of(e) == "chij")
+    piecetable.remove(e, 2, 2)
+    say(f, "to the end", piecetable.text_of(e) == "ch")
+    piecetable.remove(e, 0, 99)
+    say(f, "more than there is leaves nothing", piecetable.text_of(e) == "")
+    say(f, "and the length is zero", piecetable.length_of(e) == 0)
+    piecetable.insert(e, 0, "back again")
+    say(f, "an empty document accepts an insert", piecetable.text_of(e) == "back again")
+
+    print("-- a deletion spanning several pieces")
+    var g = piecetable.from_text("one")
+    piecetable.insert(g, 3, "two")
+    piecetable.insert(g, 6, "three")
+    say(f, "three pieces", piecetable.text_of(g) == "onetwothree")
+    piecetable.remove(g, 2, 5)
+    say(f, "a delete across all of them", piecetable.text_of(g) == "onhree")
+
+    print("-- undo, which is free because nothing was copied")
+    var doc = piecetable.from_text("start")
+    var h = piecetable.new_history(doc)
+    piecetable.insert(doc, 5, " one")
+    piecetable.commit(h, doc, "one")
+    piecetable.insert(doc, 9, " two")
+    piecetable.commit(h, doc, "two")
+    say(f, "two edits", piecetable.text_of(doc) == "start one two")
+    say(f, "undo", piecetable.undo(h, doc) and piecetable.text_of(doc) == "start one")
+    say(f, "undo again", piecetable.undo(h, doc) and piecetable.text_of(doc) == "start")
+    say(f, "and there is nothing before the start", not piecetable.undo(h, doc))
+    say(f, "redo", piecetable.redo(h, doc) and piecetable.text_of(doc) == "start one")
+    say(f, "redo again", piecetable.redo(h, doc) and piecetable.text_of(doc) == "start one two")
+    say(f, "and nothing after the end", not piecetable.redo(h, doc))
+
+    print("-- the history is a tree, so undone work is not destroyed")
+    // Undo to "start one", then type something else. A stack would throw
+    // "start one two" away; a tree keeps it as a sibling.
+    let _u = piecetable.undo(h, doc)
+    say(f, "back at one edit", piecetable.text_of(doc) == "start one")
+    piecetable.insert(doc, 9, " THREE")
+    piecetable.commit(h, doc, "three")
+    say(f, "a different edit from the same point",
+        piecetable.text_of(doc) == "start one THREE")
+    let siblings = piecetable.branches_from(h, 1)
+    say(f, "the abandoned branch is still there", siblings.len() == 2)
+    say(f, "and can be named", piecetable.label_of(h, siblings[0]) == "two")
+    // And reached.
+    say(f, "and gone back to", piecetable.go_to(h, doc, siblings[0])
+        and piecetable.text_of(doc) == "start one two")
+    say(f, "while the other branch also survives",
+        piecetable.go_to(h, doc, siblings[1]) and piecetable.text_of(doc) == "start one THREE")
+
+    print("-- a large document, where the whole design pays off")
+    var big = piecetable.from_text("x".repeat(50000))
+    // Two hundred inserts at the front. With one big string this is ten
+    // million character copies; here it is two hundred pieces.
+    for i in 0..200 {
+        piecetable.insert(big, 0, "{i % 10}")
+    }
+    say(f, "the length is right", piecetable.length_of(big) == 50200)
+    say(f, "and it is 201 pieces, not a copied megabyte",
+        piecetable.piece_count(big) == 201)
+
+    print("-- edges")
+    var z = piecetable.from_text("")
+    say(f, "an empty document has no pieces", piecetable.piece_count(z) == 0)
+    say(f, "and reads as nothing", piecetable.text_of(z) == "")
+    piecetable.insert(z, 0, "")
+    say(f, "inserting nothing changes nothing", piecetable.piece_count(z) == 0)
+    piecetable.remove(z, 0, 5)
+    say(f, "deleting from nothing is harmless", piecetable.text_of(z) == "")
+
+    if f == 0 {
+        print("all checks passed")
+    } else {
+        print("{f} check(s) failed")
+    }
+}

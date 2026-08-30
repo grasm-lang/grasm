@@ -1,0 +1,233 @@
+// A piece table: how an editor holds a file it is changing.
+//
+// The obvious representation is one big string, and it is quadratic: typing a
+// character at the start of a megabyte file copies a megabyte. A piece table
+// never moves the text. The original file is read once and never written to;
+// everything typed goes on the end of an append-only buffer; and the document
+// is a **list of pieces**, each saying "take this many characters from that
+// buffer at that offset".
+//
+// So an insert splits one piece into three and costs nothing proportional to
+// the file, and — the part that makes it worth the complexity — **undo is
+// free**. The pieces are the document; keeping the old list keeps the old
+// document, with no copying, because neither buffer ever changed.
+//
+// The undo history is a *tree*, not a stack. Undo, then type something else,
+// and the redo branch is not gone — it is a sibling. An editor that throws it
+// away has destroyed work the user could still want, which is why every
+// serious editor keeps the tree.
+
+type Source =
+    | Original
+    | Added
+
+type Piece = {
+    source: Source,
+    start: i64,
+    length: i64,
+}
+
+type Document = {
+    original: [str],
+    added: [str],
+    pieces: [Piece],
+}
+
+/// One state of the document, and where it came from.
+type Revision = {
+    pieces: [Piece],
+    parent: i64,
+    label: str,
+}
+
+type History = {
+    revisions: [Revision],
+    current: i64,
+}
+
+pub fn from_text(text: str) -> Document {
+    let chars = text.chars()
+    var added: [str] = []
+    var pieces: [Piece] = []
+    if chars.len() > 0 {
+        pieces.push(Piece{ source: Original, start: 0, length: chars.len() })
+    }
+    Document{ original: chars, added: added, pieces: pieces }
+}
+
+fn char_at(d: Document, p: Piece, offset: i64) -> str {
+    match p.source {
+        Original -> d.original[p.start + offset]
+        Added -> d.added[p.start + offset]
+    }
+}
+
+pub fn length_of(d: Document) -> i64 {
+    var n = 0
+    for p in d.pieces {
+        n = n + p.length
+    }
+    n
+}
+
+/// The document as text. Walks the pieces; nothing is copied until here.
+pub fn text_of(d: Document) -> str {
+    var out = ""
+    for p in d.pieces {
+        for i in 0..p.length {
+            out = out + char_at(d, p, i)
+        }
+    }
+    out
+}
+
+/// Insert at a character offset.
+///
+/// The piece containing the offset is split, and a new piece pointing into the
+/// added buffer goes between the halves. Nothing already in either buffer
+/// moves, which is the whole point.
+pub fn insert(inout d: Document, at: i64, text: str) {
+    let chars = text.chars()
+    if chars.len() == 0 {
+        return
+    }
+    let start = d.added.len()
+    for c in chars {
+        d.added.push(c)
+    }
+    let fresh = Piece{ source: Added, start: start, length: chars.len() }
+
+    var out: [Piece] = []
+    var offset = 0
+    var placed = false
+    for p in d.pieces {
+        if not placed and at >= offset and at <= offset + p.length {
+            let before = at - offset
+            if before > 0 {
+                out.push(Piece{ source: p.source, start: p.start, length: before })
+            }
+            out.push(fresh)
+            if before < p.length {
+                out.push(Piece{
+                    source: p.source,
+                    start: p.start + before,
+                    length: p.length - before,
+                })
+            }
+            placed = true
+        } else {
+            out.push(p)
+        }
+        offset = offset + p.length
+    }
+    if not placed {
+        // Past the end, or into an empty document.
+        out.push(fresh)
+    }
+    d.pieces = out
+}
+
+/// Delete a range.
+///
+/// Each piece is kept whole, trimmed, or dropped. A deletion in the middle of
+/// a piece produces two, which is why this cannot just adjust lengths.
+pub fn remove(inout d: Document, at: i64, count: i64) {
+    if count <= 0 {
+        return
+    }
+    let upto = at + count
+    var out: [Piece] = []
+    var offset = 0
+    for p in d.pieces {
+        let piece_end = offset + p.length
+        if piece_end <= at or offset >= upto {
+            out.push(p)
+        } else {
+            let keep_front = if at > offset { at - offset } else { 0 }
+            let keep_back_from = if upto < piece_end { upto - offset } else { p.length }
+            if keep_front > 0 {
+                out.push(Piece{ source: p.source, start: p.start, length: keep_front })
+            }
+            if keep_back_from < p.length {
+                out.push(Piece{
+                    source: p.source,
+                    start: p.start + keep_back_from,
+                    length: p.length - keep_back_from,
+                })
+            }
+        }
+        offset = piece_end
+    }
+    d.pieces = out
+}
+
+/// A history with the document's current state as its root.
+pub fn new_history(d: Document) -> History {
+    var revs: [Revision] = []
+    revs.push(Revision{ pieces: d.pieces, parent: 0 - 1, label: "start" })
+    History{ revisions: revs, current: 0 }
+}
+
+/// Record the document's state as a child of wherever we are.
+pub fn commit(inout h: History, d: Document, label: str) {
+    h.revisions.push(Revision{ pieces: d.pieces, parent: h.current, label: label })
+    h.current = h.revisions.len() - 1
+}
+
+/// Step back to the parent. Nothing is discarded — the branch stays.
+pub fn undo(inout h: History, inout d: Document) -> bool {
+    let parent = h.revisions[h.current].parent
+    if parent < 0 {
+        return false
+    }
+    h.current = parent
+    d.pieces = h.revisions[parent].pieces
+    true
+}
+
+/// Step forward to the most recent child of the current revision.
+///
+/// "Most recent" is the choice that makes redo behave like a stack for anyone
+/// not using the tree, while the older branches stay reachable.
+pub fn redo(inout h: History, inout d: Document) -> bool {
+    var child = 0 - 1
+    for i in 0..h.revisions.len() {
+        if h.revisions[i].parent == h.current {
+            child = i
+        }
+    }
+    if child < 0 {
+        return false
+    }
+    h.current = child
+    d.pieces = h.revisions[child].pieces
+    true
+}
+
+/// Every revision that branches from the current one.
+///
+/// This is what a stack cannot answer. After undoing and typing something
+/// else, the abandoned work is still here and can be named.
+pub fn branches_from(h: History, at: i64) -> [i64] {
+    var out: [i64] = []
+    for i in 0..h.revisions.len() {
+        if h.revisions[i].parent == at {
+            out.push(i)
+        }
+    }
+    out
+}
+
+pub fn go_to(inout h: History, inout d: Document, revision: i64) -> bool {
+    if revision < 0 or revision >= h.revisions.len() {
+        return false
+    }
+    h.current = revision
+    d.pieces = h.revisions[revision].pieces
+    true
+}
+
+pub fn current_revision(h: History) -> i64 { h.current }
+pub fn revision_count(h: History) -> i64 { h.revisions.len() }
+pub fn piece_count(d: Document) -> i64 { d.pieces.len() }
+pub fn label_of(h: History, i: i64) -> str { h.revisions[i].label }
