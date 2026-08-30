@@ -9,6 +9,28 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+mod lint;
+
+/// A JSON string literal. Only what `--json` needs: the six escapes JSON
+/// requires, and `\u00XX` for the control characters that have no shorthand.
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 use grasm_sema::loader::{self, Program};
 
 const BUNDLE_MAGIC: &[u8; 8] = b"GRASMBDL";
@@ -109,6 +131,7 @@ fn run() -> ExitCode {
             "doc" => (&[], &["-o"]),
             "api" => (&[], &["--against"]),
             "fmt" => (&["--check"], &[]),
+            "lint" => (&["--json", "--rules"], &["--only"]),
             "journal" => (&["--full"], &[]),
             "deps" => (&["--locked"], &[]),
             "publish" => (&[], &["--registry"]),
@@ -584,6 +607,73 @@ fn run() -> ExitCode {
                 }
             }
         }
+        Some("lint") => {
+            // `--rules` answers what this checks without needing a file, which
+            // is the question anyone turning it on in CI asks first.
+            if args.iter().any(|a| a == "--rules") {
+                for (name, why) in lint::RULES {
+                    println!("{name:18} {why}");
+                }
+                return ExitCode::SUCCESS;
+            }
+            let Some(path) = first_operand(&args[1..], &["--only"]) else {
+                eprintln!("usage: grasm lint <file.gr> [--json] [--only RULE] [--rules]");
+                return ExitCode::FAILURE;
+            };
+            let src = match std::fs::read_to_string(&path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: cannot read `{path}`: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            // Source that does not parse has no tree, and every rule here reads
+            // one. Reporting style findings on a file the compiler rejects
+            // would bury the error that actually needs fixing.
+            let parsed = grasm_syntax::parse(&src);
+            if !parsed.diagnostics.is_empty() {
+                eprintln!("error: `{path}` does not parse, so there is nothing to lint");
+                for d in parsed.diagnostics.iter().take(3) {
+                    eprintln!("  {}", d.message);
+                }
+                return ExitCode::FAILURE;
+            }
+            let only = flag_value(&args[1..], "--only");
+            if let Some(r) = &only {
+                if !lint::RULES.iter().any(|(name, _)| name == r) {
+                    eprintln!("error: no rule called `{r}` (see `grasm lint --rules`)");
+                    return ExitCode::FAILURE;
+                }
+            }
+            let mut l = lint::Linter::new(&src, only);
+            l.module(&parsed.module);
+            let findings = l.finish();
+            if args.iter().any(|a| a == "--json") {
+                println!("[");
+                for (i, f) in findings.iter().enumerate() {
+                    let comma = if i + 1 == findings.len() { "" } else { "," };
+                    println!(
+                        "  {{\"file\": {}, \"line\": {}, \"col\": {}, \"rule\": {}, \"message\": {}}}{comma}",
+                        json_str(&path),
+                        f.line,
+                        f.col,
+                        json_str(f.rule),
+                        json_str(&f.message)
+                    );
+                }
+                println!("]");
+            } else {
+                for f in &findings {
+                    println!("{path}:{}:{}: {}: {}", f.line, f.col, f.rule, f.message);
+                }
+                println!("findings: {}", findings.len());
+            }
+            if findings.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
         Some("fmt") => {
             // The path is whichever argument is not a flag, so
             // `fmt --check f.gr` and `fmt f.gr --check` both work. Only the
@@ -832,6 +922,7 @@ fn run() -> ExitCode {
             eprintln!("  doc <file.gr> [-o out.md]    API documentation from `///` comments");
             eprintln!("  api <file.gr> [--against F]  public surface, and what changed in it");
             eprintln!("  fmt <file.gr> [--check]      canonical layout: 4-space indent and one spacing for every token");
+            eprintln!("  lint <file.gr> [--json]      unused, shadowed and over-long — the rules a line cannot answer");
             eprintln!("  lsp                          language server (stdio)");
             eprintln!("  dap                          debug adapter (stdio) — breakpoints, stepping");
             eprintln!("  deps [dir]                   resolve dependencies, check capabilities, write grasm.lock");
