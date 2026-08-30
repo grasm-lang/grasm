@@ -1,0 +1,339 @@
+// The protocol layer, checked without a socket and without waiting.
+//
+// Every timer here is a number the test chooses, so three minutes of session
+// lifetime is tested in no time at all. That is the whole reason the protocol
+// package reads no clock.
+
+import grasmwire
+import noise
+import x25519
+import bytes_codec
+
+fn unhex(s: str) -> bytes {
+    match bytes_codec.decode_hex(s) {
+        Some(b) -> b
+        None -> panic("not hex: {s}")
+    }
+}
+
+fn hex(b: bytes) -> str { bytes_codec.encode_hex(b) }
+
+fn say(inout failures: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        failures = failures + 1
+    }
+}
+
+fn main() / {io} {
+    var failures = 0
+    print("-- the replay window, at every edge")
+
+    var r = grasmwire.replay_new()
+    say(failures, "counter 0 is accepted once", grasmwire.replay_accept(r, 0))
+    say(failures, "counter 0 is refused twice", not grasmwire.replay_accept(r, 0))
+
+    say(failures, "a jump forward is accepted", grasmwire.replay_accept(r, 100))
+    say(failures, "a gap left behind is still accepted", grasmwire.replay_accept(r, 50))
+    say(failures, "and only once", not grasmwire.replay_accept(r, 50))
+    say(failures, "the counter that set the edge is not re-accepted", not grasmwire.replay_accept(r, 100))
+
+    // The two edges of a 2048-bit window. 100 - 2047 is the oldest counter
+    // still inside it; one further back is not. An off-by-one here either
+    // rejects a genuine packet or accepts a replayed one.
+    var w = grasmwire.replay_new()
+    let _high = grasmwire.replay_accept(w, 5000)
+    say(failures, "the oldest counter inside the window is accepted",
+        grasmwire.replay_accept(w, 5000 - 2047))
+    say(failures, "one older than the window is refused",
+        not grasmwire.replay_accept(w, 5000 - 2048))
+    say(failures, "far older is refused", not grasmwire.replay_accept(w, 1))
+
+    // A jump larger than the window must clear it rather than shift by more
+    // bits than exist.
+    var j = grasmwire.replay_new()
+    let _a = grasmwire.replay_accept(j, 10)
+    let _b = grasmwire.replay_accept(j, 100000)
+    say(failures, "after a jump past the window, the old counters are gone",
+        not grasmwire.replay_accept(j, 10))
+    say(failures, "and the new one is not re-accepted", not grasmwire.replay_accept(j, 100000))
+
+    // Out-of-order delivery of a whole burst, then every one of them replayed.
+    var burst = grasmwire.replay_new()
+    var accepted = 0
+    let order = [7, 3, 9, 1, 8, 2, 6, 4, 5, 0]
+    for c in order {
+        if grasmwire.replay_accept(burst, c) {
+            accepted = accepted + 1
+        }
+    }
+    say(failures, "ten packets out of order are all accepted", accepted == 10)
+    var replayed = 0
+    for c in order {
+        if grasmwire.replay_accept(burst, c) {
+            replayed = replayed + 1
+        }
+    }
+    say(failures, "and all ten replays are refused", replayed == 0)
+
+    print("-- a session carrying traffic")
+
+    let keys = handshake_keys()
+    var alice = grasmwire.session_of(keys[0], 1, 2, 0, true)
+    var bob = grasmwire.session_of(keys[1], 2, 1, 0, false)
+
+    // A real IPv4 packet, twenty bytes of header and twenty of TCP, declaring
+    // its own length in bytes two and three. The first version of this vector
+    // was forty-two bytes claiming to be forty, and `unpad` correctly returned
+    // forty — which is what a length field is for, and why the test found the
+    // vector rather than the code.
+    let packet = unhex("450000280001000040060000c0a80001c0a800020050115c00000000000000005002200000000000")
+    match grasmwire.seal_data(alice, packet) {
+        Ok(datagram) -> {
+            say(failures, "a data packet has the right type", datagram.at(0) == grasmwire.type_data())
+            say(failures, "its length is a multiple of sixteen plus the header and tag",
+                (datagram.len() - grasmwire.data_header_len() - 16) % 16 == 0)
+            say(failures, "it says which session it is for",
+                grasmwire.receiver_index(datagram) ?? -1 == 2)
+            say(failures, "it carries the counter in the clear",
+                grasmwire.counter_of(datagram) ?? -1 == 0)
+            say(failures, "the payload is not visible in it", not contains(datagram, packet))
+
+            match grasmwire.open_data(bob, datagram, 1000) {
+                Ok(opened) -> {
+                    say(failures, "the far side recovers the packet after unpadding",
+                        hex(grasmwire.unpad(opened)) == hex(packet))
+                    say(failures, "the padding was really added", opened.len() > packet.len())
+                }
+                Err(_e) -> say(failures, "the far side opens the packet", false)
+            }
+
+            // The same datagram again.
+            match grasmwire.open_data(bob, datagram, 1000) {
+                Ok(_p) -> say(failures, "a replayed datagram is refused", false)
+                Err(_e) -> say(failures, "a replayed datagram is refused", true)
+            }
+
+            // One bit of ciphertext.
+            match grasmwire.open_data(bob, flip(datagram, 30), 1000) {
+                Ok(_p) -> say(failures, "a tampered datagram is refused", false)
+                Err(_e) -> say(failures, "a tampered datagram is refused", true)
+            }
+
+            // A forgery must not consume a counter the real peer will use.
+            var fresh_bob = grasmwire.session_of(keys[1], 2, 1, 0, false)
+            match grasmwire.open_data(fresh_bob, flip(datagram, 30), 1000) {
+                Ok(_p) -> say(failures, "a forgery cannot burn a counter", false)
+                Err(_e) -> {
+                    match grasmwire.open_data(fresh_bob, datagram, 1000) {
+                        Ok(_p) -> say(failures, "a forgery cannot burn a counter", true)
+                        Err(_e2) -> say(failures, "a forgery cannot burn a counter", false)
+                    }
+                }
+            }
+
+            // Three minutes later the same session must refuse to work.
+            var old_bob = grasmwire.session_of(keys[1], 2, 1, 0, false)
+            match grasmwire.open_data(old_bob, datagram, grasmwire.reject_after_ms()) {
+                Ok(_p) -> say(failures, "an expired session refuses traffic", false)
+                Err(_e) -> say(failures, "an expired session refuses traffic", true)
+            }
+        }
+        Err(_e) -> say(failures, "a data packet is sealed", false)
+    }
+
+    print("-- counters advance and are never reused")
+    var counters: [i64] = []
+    var counting = grasmwire.session_of(keys[0], 1, 2, 0, true)
+    for _i in 0..5 {
+        match grasmwire.seal_data(counting, unhex("00")) {
+            Ok(d) -> counters.push(grasmwire.counter_of(d) ?? -1)
+            Err(_e) -> counters.push(-1)
+        }
+    }
+    say(failures, "five sends give five different counters", strictly_increasing(counters))
+
+    print("-- keepalives")
+    var quiet = grasmwire.session_of(keys[0], 1, 2, 0, true)
+    var quiet_peer = grasmwire.session_of(keys[1], 2, 1, 0, false)
+    match grasmwire.keepalive(quiet) {
+        Ok(k) -> {
+            say(failures, "a keepalive is a data packet like any other", k.at(0) == grasmwire.type_data())
+            match grasmwire.open_data(quiet_peer, k, 1000) {
+                Ok(payload) -> say(failures, "and the far side recognises it as empty",
+                    grasmwire.is_keepalive(payload))
+                Err(_e) -> say(failures, "a keepalive opens", false)
+            }
+        }
+        Err(_e) -> say(failures, "a keepalive is sent", false)
+    }
+
+    print("-- the timers, run against a clock that is a number")
+    let peer = grasmwire.peer_of(unhex("0101010101010101010101010101010101010101010101010101010101010101"),
+        unhex("0000000000000000000000000000000000000000000000000000000000000000"), "10.0.0.1", 51820)
+    var live = grasmwire.peer_of(peer.public_key, peer.preshared, "10.0.0.1", 51820)
+    live.phase = Established
+    live.last_sent_ms = 0
+
+    let session = grasmwire.session_of(keys[0], 1, 2, 0, true)
+    say(failures, "nothing to do while the session is young and busy",
+        is_nothing(grasmwire.next_action(with_sent(live, 9000), Some(session), 9500)))
+    say(failures, "after ten seconds of silence, a keepalive",
+        is_keepalive_action(grasmwire.next_action(live, Some(session), 10000)))
+    say(failures, "after two minutes, a new handshake",
+        is_handshake(grasmwire.next_action(with_sent(live, 120000), Some(session), 120000)))
+    say(failures, "a peer with no session at all wants a handshake",
+        is_handshake(grasmwire.next_action(live, None, 500)))
+
+    var trying = grasmwire.peer_of(peer.public_key, peer.preshared, "10.0.0.1", 51820)
+    trying.phase = Initiated(0, 1)
+    trying.first_attempt_ms = 0
+    say(failures, "a handshake is not retried before five seconds",
+        is_nothing(grasmwire.next_action(trying, None, 4999)))
+    say(failures, "and is retried after", is_retry(grasmwire.next_action(trying, None, 5000)))
+    say(failures, "after ninety seconds of trying, it gives up",
+        is_giveup(grasmwire.next_action(trying, None, 90000)))
+
+    print("-- timestamps, which are what stop a recorded handshake being replayed")
+    let t1 = grasmwire.stamp(1000)
+    let t2 = grasmwire.stamp(1001)
+    say(failures, "a timestamp is {noise.timestamp_len()} bytes", t1.len() == noise.timestamp_len())
+    say(failures, "a later time compares later", grasmwire.later_than(t2, t1))
+    say(failures, "an earlier one does not", not grasmwire.later_than(t1, t2))
+    say(failures, "the same one does not", not grasmwire.later_than(t1, t1))
+    say(failures, "anything beats nothing", grasmwire.later_than(t1, bytes_of([])))
+    say(failures, "a whole second later still compares later",
+        grasmwire.later_than(grasmwire.stamp(2000), t1))
+
+    print("-- IP length, which is what makes the padding free")
+    say(failures, "an IPv4 header declares its length", grasmwire.ip_length(packet) ?? 0 == 40)
+    say(failures, "a padded packet still declares the original",
+        grasmwire.ip_length(pad_to(packet, 64)) ?? 0 == 40)
+    say(failures, "something that is not IP declares nothing",
+        is_none(grasmwire.ip_length(unhex("ff00000000000000000000000000000000000000000000"))))
+    say(failures, "a truncated header declares nothing", is_none(grasmwire.ip_length(unhex("4500"))))
+    say(failures, "a length larger than the packet is refused",
+        is_none(grasmwire.ip_length(unhex("4500ffff0001000040060000c0a80001c0a80002"))))
+
+    if failures == 0 {
+        print("all checks passed")
+    } else {
+        print("{failures} check(s) failed")
+    }
+}
+
+fn with_sent(p: Peer, at: i64) -> Peer {
+    var out = p
+    out.last_sent_ms = at
+    out
+}
+
+fn is_nothing(a: Action) -> bool {
+    match a {
+        DoNothing -> true
+        _other -> false
+    }
+}
+fn is_handshake(a: Action) -> bool {
+    match a {
+        SendHandshake -> true
+        _other -> false
+    }
+}
+fn is_retry(a: Action) -> bool {
+    match a {
+        RetryHandshake(_n) -> true
+        _other -> false
+    }
+}
+fn is_giveup(a: Action) -> bool {
+    match a {
+        GiveUp -> true
+        _other -> false
+    }
+}
+fn is_keepalive_action(a: Action) -> bool {
+    match a {
+        SendKeepalive -> true
+        _other -> false
+    }
+}
+fn is_none(o: Option[i64]) -> bool {
+    match o {
+        None -> true
+        Some(_v) -> false
+    }
+}
+
+fn strictly_increasing(xs: [i64]) -> bool {
+    for i in 1..xs.len() {
+        if xs[i] <= xs[i - 1] {
+            return false
+        }
+    }
+    true
+}
+
+fn contains(haystack: bytes, needle: bytes) -> bool {
+    if needle.len() > haystack.len() {
+        return false
+    }
+    for start in 0..(haystack.len() - needle.len() + 1) {
+        var same = true
+        for i in 0..needle.len() {
+            if haystack.at(start + i) != needle.at(i) {
+                same = false
+            }
+        }
+        if same {
+            return true
+        }
+    }
+    false
+}
+
+fn flip(m: bytes, at: i64) -> bytes {
+    var out = m.to_list()
+    out[at] = out[at].bit_xor(1)
+    bytes_of(out)
+}
+
+fn pad_to(m: bytes, n: i64) -> bytes {
+    var out = m.to_list()
+    while out.len() < n {
+        out.push(0)
+    }
+    bytes_of(out)
+}
+
+/// Two sets of transport keys from one real handshake.
+fn handshake_keys() -> [Keys] {
+    let ip = x25519.clamp(unhex("a8abababababababababababababababababababababababababababababab6b"))
+    let rp = x25519.clamp(unhex("c8cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd4b"))
+    let ie = x25519.clamp(unhex("58efefefefefefefefefefefefefefefefefefefefefefefefefefefefefef0b"))
+    let re = x25519.clamp(unhex("18e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e14b"))
+    let psk = unhex("0505050505050505050505050505050505050505050505050505050505050505")
+    let started: Initiation ! HandshakeError = noise.initiate(ip, x25519.public_key(ip),
+        x25519.public_key(rp), ie, grasmwire.stamp(1000), 1)
+    match started {
+        Ok(init) -> {
+            match noise.consume_initiation(rp, x25519.public_key(rp), init.message) {
+                Ok(incoming) -> {
+                    match noise.respond(incoming, re, psk, 2) {
+                        Ok(reply) -> {
+                            match noise.consume_response(init.state, reply.message, psk) {
+                                Ok(done) -> [noise.split(done, true), noise.split(reply.state, false)]
+                                Err(_e) -> panic("the handshake did not complete")
+                            }
+                        }
+                        Err(_e) -> panic("no reply")
+                    }
+                }
+                Err(_e) -> panic("the first message was refused")
+            }
+        }
+        Err(_e) -> panic("no first message")
+    }
+}

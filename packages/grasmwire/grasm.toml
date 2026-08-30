@@ -1,0 +1,24 @@
+[package]
+name = "grasmwire"
+version = "1.0.0"
+
+# The protocol is arithmetic over bytes. It never opens a socket and never
+# reads a clock: datagrams and timestamps arrive as arguments, which is what
+# lets a whole session be replayed deterministically in a test.
+capabilities = []
+
+[dependencies.noise]
+path = "../noise"
+version = "^1.0.0"
+
+[dependencies.chachapoly]
+path = "../chachapoly"
+version = "^1.0.0"
+
+[dependencies.x25519]
+path = "../x25519"
+version = "^1.0.0"
+
+[dependencies.blake2s]
+path = "../blake2s"
+version = "^1.0.0"

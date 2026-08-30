@@ -1,0 +1,519 @@
+// GrasmWire: the protocol above the handshake.
+//
+// Once two peers share keys, four problems remain, and none of them is
+// cryptography:
+//
+// **A packet must be placed in a sequence** so the far side can tell a
+// retransmission from a fresh packet. UDP will reorder and duplicate, and an
+// AEAD nonce used twice is catastrophic, so the counter is explicit, never
+// reused, and never rolled back.
+//
+// **A replayed packet must be rejected** without requiring packets to arrive
+// in order, because they will not. A sliding window is the standard answer and
+// the standard mistakes are an off-by-one at each edge — both are tested.
+//
+// **Keys must expire**, on time and on volume, because a session that lives
+// forever is a session whose compromise is unbounded.
+//
+// **Length must not leak.** A payload is padded to a multiple of sixteen, so
+// an observer counting bytes learns the size of a packet to within a block
+// rather than exactly.
+//
+// This file performs no io. Datagrams and the current time are arguments, so a
+// whole session — including the timers — can be run in a test with no socket
+// and no waiting.
+
+import noise
+import chachapoly
+import x25519
+import blake2s
+
+/// One byte of type, three reserved, four of receiver index, eight of counter.
+pub fn data_header_len() -> i64 {
+    16
+}
+
+pub fn type_initiation() -> i64 { 1 }
+pub fn type_response() -> i64 { 2 }
+pub fn type_data() -> i64 { 4 }
+
+/// After two minutes a session should be replaced; after three it must not be
+/// used at all. The gap between them is deliberate: rekeying takes a round
+/// trip, and a peer that only started when the old key was already invalid
+/// would drop traffic every time.
+pub fn rekey_after_ms() -> i64 { 120000 }
+pub fn reject_after_ms() -> i64 { 180000 }
+
+/// A handshake that gets no reply is retried, and eventually given up on.
+pub fn rekey_timeout_ms() -> i64 { 5000 }
+pub fn rekey_attempt_ms() -> i64 { 90000 }
+
+/// Ten seconds of silence on an established session gets an empty packet, so
+/// that a stateful firewall between the peers keeps the mapping open.
+pub fn keepalive_ms() -> i64 { 10000 }
+
+/// The volume limits. A counter that wrapped would repeat a nonce, so the
+/// session is refused well before the arithmetic could.
+pub fn rekey_after_messages() -> i64 { 1152921504606846976 }
+pub fn reject_after_messages() -> i64 { 4611686018427387904 }
+
+/// Why a packet was dropped.
+///
+/// These are for the operator. A peer is told nothing — GrasmWire never sends
+/// an error, because a protocol that answers a malformed packet is a protocol
+/// that can be used to find things out and to amplify traffic at a third party.
+type WireError =
+    | TooShort(length: i64)
+    | UnknownType(kind: i64)
+    | NoSession(index: i64)
+    | Replayed(counter: i64)
+    | Forged
+    | Expired(age_ms: i64)
+    | Exhausted(counter: i64)
+
+/// The anti-replay window.
+///
+/// `highest` is the largest counter accepted so far; `bits` remembers which of
+/// the preceding 2048 were seen. Anything older than the window is refused
+/// even if it is genuine — that is the trade a fixed window makes, and 2048
+/// packets of reordering is far more than a network produces.
+type Replay = {
+    highest: i64,
+    bits: [i64],
+}
+
+pub fn replay_new() -> Replay {
+    var words: [i64] = []
+    for _i in 0..32 {
+        words.push(0)
+    }
+    Replay{ highest: 0, bits: words }
+}
+
+fn window_bits() -> i64 { 2048 }
+
+/// Accept a counter once and only once.
+///
+/// The three cases are: ahead of the window, which slides it; inside it, which
+/// checks and sets one bit; and behind it, which is refused. Each edge is
+/// where an off-by-one lives, so each is tested directly.
+pub fn replay_accept(inout r: Replay, counter: i64) -> bool {
+    if counter >= reject_after_messages() {
+        return false
+    }
+    if counter > r.highest {
+        let jump = counter - r.highest
+        if jump >= window_bits() {
+            // So far ahead that nothing remembered is still in range.
+            for i in 0..32 {
+                r.bits[i] = 0
+            }
+        } else {
+            shift_left(r, jump)
+        }
+        r.highest = counter
+        set_bit(r, 0)
+        return true
+    }
+    let back = r.highest - counter
+    if back >= window_bits() {
+        return false
+    }
+    if get_bit(r, back) {
+        return false
+    }
+    set_bit(r, back)
+    true
+}
+
+fn set_bit(inout r: Replay, at: i64) {
+    let word = at.shr(6)
+    let bit = at.bit_and(63)
+    r.bits[word] = r.bits[word].bit_or(1.shl(bit))
+}
+
+fn get_bit(r: Replay, at: i64) -> bool {
+    let word = at.shr(6)
+    let bit = at.bit_and(63)
+    r.bits[word].ushr(bit).bit_and(1) == 1
+}
+
+/// Slide the window forward by `n` bits, discarding what falls off the end.
+///
+/// Written as a whole-word move plus a bit-level shift rather than `n` single
+/// steps: a peer that jumps two thousand counters ahead in one packet must not
+/// cost two thousand iterations, because that is a thing an attacker chooses.
+fn shift_left(inout r: Replay, n: i64) {
+    let words = n.shr(6)
+    let bits = n.bit_and(63)
+    var moved: [i64] = []
+    for i in 0..32 {
+        let from = i - words
+        if from < 0 {
+            moved.push(0)
+        } else {
+            var value = r.bits[from].shl(bits)
+            if bits > 0 and from > 0 {
+                value = value.bit_or(r.bits[from - 1].ushr(64 - bits))
+            }
+            moved.push(value)
+        }
+    }
+    r.bits = moved
+}
+
+/// A live session: two keys, a counter, and the window.
+type Session = {
+    sending: bytes,
+    receiving: bytes,
+    send_counter: i64,
+    local_index: i64,
+    remote_index: i64,
+    born_ms: i64,
+    is_initiator: bool,
+    replay: Replay,
+}
+
+pub fn session_of(keys: Keys, local_index: i64, remote_index: i64,
+                  born_ms: i64, is_initiator: bool) -> Session {
+    Session{
+        sending: keys.sending,
+        receiving: keys.receiving,
+        send_counter: 0,
+        local_index: local_index,
+        remote_index: remote_index,
+        born_ms: born_ms,
+        is_initiator: is_initiator,
+        replay: replay_new(),
+    }
+}
+
+/// Whether this session may still carry traffic.
+pub fn usable(s: Session, now_ms: i64) -> bool {
+    now_ms - s.born_ms < reject_after_ms() and s.send_counter < reject_after_messages()
+}
+
+/// Whether a replacement should be started, which is a different and earlier
+/// question than whether the session still works.
+pub fn should_rekey(s: Session, now_ms: i64) -> bool {
+    // Only the initiator rekeys. If both sides did it on the same timer they
+    // would do it at the same moment, twice, every time.
+    if not s.is_initiator {
+        return false
+    }
+    now_ms - s.born_ms >= rekey_after_ms() or s.send_counter >= rekey_after_messages()
+}
+
+/// Pad to a multiple of sixteen.
+///
+/// The receiver does not get the original length back, and does not need it:
+/// the payload is an IP packet and its length is in its own header. That is
+/// what makes the padding free — there is no length field to add, so an
+/// observer sees a size rounded to a block and nothing else.
+fn padded(payload: bytes) -> bytes {
+    let over = payload.len().bit_and(15)
+    if over == 0 {
+        return payload
+    }
+    var out = payload.to_list()
+    for _i in 0..(16 - over) {
+        out.push(0)
+    }
+    bytes_of(out)
+}
+
+/// The length an IP packet declares for itself, or nothing if these bytes are
+/// not one.
+///
+/// This is what undoes the padding. It reads the version nibble, then the
+/// field each version puts the length in — IPv4 counts the header, IPv6 does
+/// not, which is exactly the kind of difference that is silently wrong if the
+/// two are treated as one case.
+pub fn ip_length(packet: bytes) -> Option[i64] {
+    if packet.len() < 20 {
+        return None
+    }
+    let version = packet.at(0).ushr(4)
+    if version == 4 {
+        let total = packet.at(2).shl(8).bit_or(packet.at(3))
+        if total < 20 or total > packet.len() {
+            return None
+        }
+        return Some(total)
+    }
+    if version == 6 {
+        if packet.len() < 40 {
+            return None
+        }
+        let payload = packet.at(4).shl(8).bit_or(packet.at(5))
+        let total = payload + 40
+        if total > packet.len() {
+            return None
+        }
+        return Some(total)
+    }
+    None
+}
+
+/// Seal one payload into a datagram.
+///
+/// The counter is the AEAD nonce and it advances whether or not the datagram
+/// is ever sent. A counter that was rolled back after a send failure would
+/// eventually encrypt two different payloads under one nonce, which loses the
+/// key — so it advances first and asks nothing.
+pub fn seal_data(inout s: Session, payload: bytes) -> bytes ! WireError {
+    if s.send_counter >= reject_after_messages() {
+        fail(Exhausted(s.send_counter))
+    }
+    let counter = s.send_counter
+    s.send_counter = counter + 1
+
+    let body = chachapoly.seal_combined(s.sending, chachapoly.nonce_of(counter),
+        bytes_of([]), padded(payload))
+
+    var out = data_header(s.remote_index, counter).to_list()
+    for byte in body.to_list() {
+        out.push(byte)
+    }
+    bytes_of(out)
+}
+
+fn data_header(receiver_index: i64, counter: i64) -> bytes {
+    var out = [type_data(), 0, 0, 0]
+    for i in 0..4 {
+        out.push(receiver_index.ushr(i * 8).bit_and(255))
+    }
+    for i in 0..8 {
+        out.push(counter.ushr(i * 8).bit_and(255))
+    }
+    bytes_of(out)
+}
+
+/// Which session a datagram is addressed to, read without any key.
+///
+/// A receiver has many peers and must pick one before it can try to decrypt.
+/// The index is in the clear for exactly that reason, and it is not a secret:
+/// it is chosen locally, changes every handshake, and identifies a session
+/// rather than a peer.
+pub fn receiver_index(datagram: bytes) -> Option[i64] {
+    if datagram.len() < data_header_len() {
+        return None
+    }
+    var index = 0
+    for i in 0..4 {
+        index = index.bit_or(datagram.at(4 + i).shl(i * 8))
+    }
+    Some(index)
+}
+
+pub fn counter_of(datagram: bytes) -> Option[i64] {
+    if datagram.len() < data_header_len() {
+        return None
+    }
+    var counter = 0
+    for i in 0..8 {
+        counter = counter.bit_or(datagram.at(8 + i).shl(i * 8))
+    }
+    Some(counter)
+}
+
+/// Open one datagram.
+///
+/// The order is: cheap structural checks, then the replay window, then the
+/// AEAD. Checking replay before decryption means a flood of replayed packets
+/// costs a bitmap lookup rather than a Poly1305 pass — and it is safe in that
+/// order only because the window is advanced on *success*, below, not here.
+pub fn open_data(inout s: Session, datagram: bytes, now_ms: i64) -> bytes ! WireError {
+    if datagram.len() < data_header_len() + 16 {
+        fail(TooShort(datagram.len()))
+    }
+    if datagram.at(0) != type_data() {
+        fail(UnknownType(datagram.at(0)))
+    }
+    let age = now_ms - s.born_ms
+    if age >= reject_after_ms() {
+        fail(Expired(age))
+    }
+
+    var counter = 0
+    for i in 0..8 {
+        counter = counter.bit_or(datagram.at(8 + i).shl(i * 8))
+    }
+    if counter >= reject_after_messages() {
+        fail(Exhausted(counter))
+    }
+    if seen_before(s.replay, counter) {
+        fail(Replayed(counter))
+    }
+
+    var body: [i64] = []
+    for i in data_header_len()..datagram.len() {
+        body.push(datagram.at(i))
+    }
+
+    match chachapoly.open_combined(s.receiving, chachapoly.nonce_of(counter),
+                                   bytes_of([]), bytes_of(body)) {
+        Ok(plain) -> {
+            // Only now. A forged packet must not be able to advance the
+            // window, or an attacker could burn a counter the real peer is
+            // about to use and have its packet dropped as a replay.
+            let _accepted = replay_accept(s.replay, counter)
+            plain
+        }
+        Err(_e) -> fail(Forged)
+    }
+}
+
+/// Whether a counter is already spent, without spending it.
+fn seen_before(r: Replay, counter: i64) -> bool {
+    if counter > r.highest {
+        return false
+    }
+    let back = r.highest - counter
+    if back >= window_bits() {
+        return true
+    }
+    get_bit(r, back)
+}
+
+/// Strip the padding from an opened payload, when it is an IP packet.
+pub fn unpad(payload: bytes) -> bytes {
+    match ip_length(payload) {
+        Some(n) -> {
+            var out: [i64] = []
+            for i in 0..n {
+                out.push(payload.at(i))
+            }
+            bytes_of(out)
+        }
+        None -> payload
+    }
+}
+
+/// A keepalive is a data packet with nothing in it. It is not a separate
+/// message type, which means an observer cannot tell it from a payload — the
+/// padding makes it the same size as any small packet.
+pub fn keepalive(inout s: Session) -> bytes ! WireError {
+    seal_data(s, bytes_of([]))
+}
+
+pub fn is_keepalive(payload: bytes) -> bool {
+    if payload.len() == 0 {
+        return true
+    }
+    var all_zero = true
+    for byte in payload.to_list() {
+        if byte != 0 {
+            all_zero = false
+        }
+    }
+    all_zero
+}
+
+/// Where a peer is in the handshake.
+type PeerPhase =
+    | Idle
+    | Initiated(sent_ms: i64, attempts: i64)
+    | Established
+
+/// Everything known about one far end.
+type Peer = {
+    public_key: bytes,
+    preshared: bytes,
+    endpoint_host: str,
+    endpoint_port: i64,
+    phase: PeerPhase,
+    last_sent_ms: i64,
+    last_received_ms: i64,
+    first_attempt_ms: i64,
+}
+
+pub fn peer_of(public_key: bytes, preshared: bytes, host: str, port: i64) -> Peer {
+    Peer{
+        public_key: public_key,
+        preshared: preshared,
+        endpoint_host: host,
+        endpoint_port: port,
+        phase: Idle,
+        last_sent_ms: 0,
+        last_received_ms: 0,
+        first_attempt_ms: 0,
+    }
+}
+
+/// What the caller should do next for this peer.
+///
+/// The state machine answers rather than acts, so the decision can be tested
+/// against a clock that is a number. A timer that can only be checked by
+/// waiting three minutes is a timer that is not checked.
+type Action =
+    | DoNothing
+    | SendHandshake
+    | RetryHandshake(attempts: i64)
+    | GiveUp
+    | SendKeepalive
+
+/// Decide, given the time and whether a session exists.
+pub fn next_action(p: Peer, session: Option[Session], now_ms: i64) -> Action {
+    match p.phase {
+        Idle -> DoNothing
+        Initiated(sent_ms, attempts) -> {
+            if now_ms - p.first_attempt_ms >= rekey_attempt_ms() {
+                GiveUp
+            } else if now_ms - sent_ms >= rekey_timeout_ms() {
+                RetryHandshake(attempts + 1)
+            } else {
+                DoNothing
+            }
+        }
+        Established -> {
+            match session {
+                None -> SendHandshake
+                Some(s) -> {
+                    if not usable(s, now_ms) {
+                        SendHandshake
+                    } else if should_rekey(s, now_ms) {
+                        SendHandshake
+                    } else if now_ms - p.last_sent_ms >= keepalive_ms() {
+                        SendKeepalive
+                    } else {
+                        DoNothing
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Twelve bytes that never go backwards for a peer.
+///
+/// A timestamp is what stops a recorded first message being replayed a week
+/// later: a responder remembers the largest it has seen from each peer and
+/// refuses anything not greater. The clock is the caller's, because this
+/// package reads none.
+pub fn stamp(now_ms: i64) -> bytes {
+    let seconds = now_ms / 1000
+    let nanos = (now_ms % 1000) * 1000000
+    var out: [i64] = []
+    for i in 0..8 {
+        out.push(seconds.ushr((7 - i) * 8).bit_and(255))
+    }
+    for i in 0..4 {
+        out.push(nanos.ushr((3 - i) * 8).bit_and(255))
+    }
+    bytes_of(out)
+}
+
+/// Whether one timestamp is strictly later than another. Big-endian, so the
+/// comparison is the byte order — which is why `stamp` writes it that way.
+pub fn later_than(a: bytes, b: bytes) -> bool {
+    if b.len() == 0 {
+        return true
+    }
+    for i in 0..a.len() {
+        if a.at(i) != b.at(i) {
+            return a.at(i) > b.at(i)
+        }
+    }
+    false
+}
