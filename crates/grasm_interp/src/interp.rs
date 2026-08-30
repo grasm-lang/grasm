@@ -2922,6 +2922,86 @@ uses to mark the end of a string"
                             Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
                         }));
                     }
+                    // A range of a file, and the four calls a crash-safe
+                    // store needs. Every other file call here is whole-file,
+                    // which cannot express a table larger than memory.
+                    "read_bytes_at" => {
+                        let p = self.eval_expr(&args[0])?.to_string();
+                        let Value::Int(off) = self.eval_expr(&args[1])? else {
+                            return Err(Flow::Panic("read_bytes_at expects an integer offset".into()));
+                        };
+                        let Value::Int(count) = self.eval_expr(&args[2])? else {
+                            return Err(Flow::Panic("read_bytes_at expects an integer count".into()));
+                        };
+                        if let Some(v) = journal::gated("read_bytes_at") {
+                            return Ok(v);
+                        }
+                        return Ok(journal::recorded("read_bytes_at", read_range(&p, off, count)));
+                    }
+                    "file_size" => {
+                        let p = self.eval_expr(&args[0])?.to_string();
+                        if let Some(v) = journal::gated("file_size") {
+                            return Ok(v);
+                        }
+                        return Ok(journal::recorded("file_size", match std::fs::metadata(&p) {
+                            Ok(m) => Value::Ok(Rc::new(Value::Int(m.len() as i64))),
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                Value::Err(Rc::new(io_error("NotFound", p)))
+                            }
+                            Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
+                        }));
+                    }
+                    "append_bytes" => {
+                        let p = self.eval_expr(&args[0])?.to_string();
+                        let v = self.eval_expr(&args[1])?;
+                        let Value::Bytes(b) = v else {
+                            return Err(Flow::Panic("append_bytes expects bytes".into()));
+                        };
+                        if let Some(v) = journal::gated("append_bytes") {
+                            return Ok(v);
+                        }
+                        use std::io::Write;
+                        let done = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&p)
+                            .and_then(|mut f| f.write_all(&b));
+                        return Ok(journal::recorded("append_bytes", match done {
+                            Ok(()) => Value::Ok(Rc::new(Value::Unit)),
+                            Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
+                        }));
+                    }
+                    "sync_file" => {
+                        let p = self.eval_expr(&args[0])?.to_string();
+                        if let Some(v) = journal::gated("sync_file") {
+                            return Ok(v);
+                        }
+                        let done = std::fs::OpenOptions::new()
+                            .append(true)
+                            .open(&p)
+                            .and_then(|f| f.sync_all());
+                        return Ok(journal::recorded("sync_file", match done {
+                            Ok(()) => Value::Ok(Rc::new(Value::Unit)),
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                Value::Err(Rc::new(io_error("NotFound", p)))
+                            }
+                            Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
+                        }));
+                    }
+                    "rename_file" => {
+                        let from = self.eval_expr(&args[0])?.to_string();
+                        let to = self.eval_expr(&args[1])?.to_string();
+                        if let Some(v) = journal::gated("rename_file") {
+                            return Ok(v);
+                        }
+                        return Ok(journal::recorded("rename_file", match std::fs::rename(&from, &to) {
+                            Ok(()) => Value::Ok(Rc::new(Value::Unit)),
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                Value::Err(Rc::new(io_error("NotFound", from)))
+                            }
+                            Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
+                        }));
+                    }
                     "write_bytes" => {
                         let p = self.eval_expr(&args[0])?.to_string();
                         let v = self.eval_expr(&args[1])?;
@@ -4637,6 +4717,44 @@ fn list_dir_sorted(path: &str) -> std::io::Result<Vec<String>> {
         .collect();
     names.sort();
     Ok(names)
+}
+
+/// A range of a file, read without loading the rest of it.
+///
+/// A read that starts past the end answers empty rather than failing: a caller
+/// walking a file to its end should stop, not raise. A read that *overlaps*
+/// the end answers what is there — short, like every other read of a file that
+/// ended — so a caller has to check the length it got either way.
+fn read_range(path: &str, offset: i64, count: i64) -> Value {
+    use std::io::{Read, Seek, SeekFrom};
+    if offset < 0 || count < 0 {
+        return Value::Err(Rc::new(io_error(
+            "IoFailed",
+            format!("read_bytes_at: offset {offset} and count {count} must not be negative"),
+        )));
+    }
+    match std::fs::File::open(path) {
+        Ok(mut f) => {
+            if let Err(e) = f.seek(SeekFrom::Start(offset as u64)) {
+                return Value::Err(Rc::new(io_error("IoFailed", e.to_string())));
+            }
+            let mut buf = vec![0u8; count as usize];
+            let mut filled = 0usize;
+            while filled < buf.len() {
+                match f.read(&mut buf[filled..]) {
+                    Ok(0) => break,
+                    Ok(n) => filled += n,
+                    Err(e) => return Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
+                }
+            }
+            buf.truncate(filled);
+            Value::Ok(Rc::new(Value::Bytes(Rc::new(buf))))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Value::Err(Rc::new(io_error("NotFound", path.to_string())))
+        }
+        Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
+    }
 }
 
 fn io_error(variant: &str, payload: impl Into<String>) -> Value {

@@ -48,6 +48,11 @@ prog() {
     udp_send)       echo 'match udp_send(0, "127.0.0.1", 9, bytes_of([1])) { Ok(n) -> print("y") Err(e) -> print("n") }' ;;
     udp_recv)       echo 'match udp_recv(0) { Ok(m) -> print("y") Err(e) -> print("n") }' ;;
     udp_recv_from)  echo 'match udp_recv_from(0) { Ok(m) -> print("y") Err(e) -> print("n") }' ;;
+    read_bytes_at)  echo 'match read_bytes_at("/etc/hosts", 0, 4) { Ok(b) -> print("y") Err(e) -> print("n") }' ;;
+    file_size)      echo 'match file_size("/etc/hosts") { Ok(n) -> print("y") Err(e) -> print("n") }' ;;
+    append_bytes)   echo 'match append_bytes("/dev/null", bytes_of([1])) { Ok(u) -> print("y") Err(e) -> print("n") }' ;;
+    sync_file)      echo 'match sync_file("/dev/null") { Ok(u) -> print("y") Err(e) -> print("n") }' ;;
+    rename_file)    echo 'match rename_file("/tmp/grasm_no_such", "/tmp/grasm_no_such2") { Ok(u) -> print("y") Err(e) -> print("n") }' ;;
     proc_run)       echo 'match proc_run("echo", ["x"]) { Ok(r) -> print("y") Err(e) -> print("n") }' ;;
     proc_pipeline)  echo 'match proc_pipeline([("echo", ["x"])], "") { Ok(r) -> print("y") Err(e) -> print("n") }' ;;
     *) return 1 ;;

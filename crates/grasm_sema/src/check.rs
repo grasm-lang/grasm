@@ -292,6 +292,11 @@ pub const BUILTIN_FREE_FNS: &[&str] = &[
     "make_dir",
     "bytes_of",
     "read_bytes",
+    "read_bytes_at",
+    "append_bytes",
+    "file_size",
+    "sync_file",
+    "rename_file",
     "write_bytes",
     "list_dir",
     "input",
@@ -4839,6 +4844,80 @@ only a number or a `bool` can come out — compute what you need and yield that"
                             args: vec![],
                         };
                         return Type::Fallible(Box::new(Type::Bytes), Box::new(io_err));
+                    }
+                    // Reading part of a file, and the four calls that make a
+                    // store crash-safe.
+                    //
+                    // Every other file call here takes a whole file, which is
+                    // the right shape for configuration and the wrong one for
+                    // data: fetching one record out of a four-megabyte table
+                    // read four megabytes, measured at 40,000x amplification,
+                    // and a table larger than memory could not be read at all.
+                    "read_bytes_at" => {
+                        if args.len() != 3 {
+                            return self.error(
+                                span,
+                                "read_bytes_at takes 3 arguments (path, offset, count)",
+                            );
+                        }
+                        self.check_expr(&args[0], &Type::Str);
+                        self.check_expr(&args[1], &Type::I64);
+                        self.check_expr(&args[2], &Type::I64);
+                        let io_err = Type::Named {
+                            id: self.defs.io_error_id,
+                            args: vec![],
+                        };
+                        return Type::Fallible(Box::new(Type::Bytes), Box::new(io_err));
+                    }
+                    "file_size" => {
+                        if args.len() != 1 {
+                            return self
+                                .error(span, "file_size takes exactly 1 argument (path)");
+                        }
+                        self.check_expr(&args[0], &Type::Str);
+                        let io_err = Type::Named {
+                            id: self.defs.io_error_id,
+                            args: vec![],
+                        };
+                        return Type::Fallible(Box::new(Type::I64), Box::new(io_err));
+                    }
+                    "append_bytes" => {
+                        if args.len() != 2 {
+                            return self
+                                .error(span, "append_bytes takes 2 arguments (path, bytes)");
+                        }
+                        self.check_expr(&args[0], &Type::Str);
+                        self.check_expr(&args[1], &Type::Bytes);
+                        let io_err = Type::Named {
+                            id: self.defs.io_error_id,
+                            args: vec![],
+                        };
+                        return Type::Fallible(Box::new(Type::Unit), Box::new(io_err));
+                    }
+                    "sync_file" => {
+                        if args.len() != 1 {
+                            return self
+                                .error(span, "sync_file takes exactly 1 argument (path)");
+                        }
+                        self.check_expr(&args[0], &Type::Str);
+                        let io_err = Type::Named {
+                            id: self.defs.io_error_id,
+                            args: vec![],
+                        };
+                        return Type::Fallible(Box::new(Type::Unit), Box::new(io_err));
+                    }
+                    "rename_file" => {
+                        if args.len() != 2 {
+                            return self
+                                .error(span, "rename_file takes 2 arguments (from, to)");
+                        }
+                        self.check_expr(&args[0], &Type::Str);
+                        self.check_expr(&args[1], &Type::Str);
+                        let io_err = Type::Named {
+                            id: self.defs.io_error_id,
+                            args: vec![],
+                        };
+                        return Type::Fallible(Box::new(Type::Unit), Box::new(io_err));
                     }
                     "write_bytes" => {
                         if args.len() != 2 {

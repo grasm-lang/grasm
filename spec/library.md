@@ -773,10 +773,10 @@ browser however small it was, and almost every real program has one.
 deliberately is not.
 
 A `str` is *text*: it holds UTF-8, and anything above 127 is re-encoded on the
-way out. That is correct for text and fatal for anything else. Asked to write the
-seven bytes of `mov rax, 1` — `48 c7 c0 01 00 00 00` — a `str` put **nine** bytes
-on disk, because `0xC7` became `c3 87`. A language whose only sequence type does
-that cannot read an image, build a network packet, or emit an object file.
+way out — correct for text and fatal for anything else. Asked for the seven
+bytes of `mov rax, 1`, a `str` put **nine** on disk: `0xC7` became `c3 87`. A
+language whose only sequence type does that cannot read an image, build a
+packet, or emit an object file.
 
 | | type | |
 |---|---|---|
@@ -789,21 +789,21 @@ that cannot read an image, build a network packet, or emit an object file.
 | `b.slice(from, count)` | `(bytes, i64, i64) -> bytes` | out of range panics |
 | `b.concat(other)` | `(bytes, bytes) -> bytes` | |
 | `b.to_list()` | `(bytes) -> [i64]` | |
-| `read_bytes(path)` | `(str) -> bytes ! IoError` | |
-| `write_bytes(path, b)` | `(str, bytes) -> () ! IoError` | |
+| `read_bytes(path)` | `(str) -> bytes ! IoError` | the whole file |
+| `write_bytes(path, b)` | `(str, bytes) -> () ! IoError` | replaces it |
+| `read_bytes_at(path, off, n)` | `(str, i64, i64) -> bytes ! IoError` | a range; short at the end, empty past it |
+| `append_bytes(path, b)` | `(str, bytes) -> () ! IoError` | adds to the end, creating the file |
+| `file_size(path)` | `(str) -> i64 ! IoError` | without reading it |
+| `sync_file(path)` | `(str) -> () ! IoError` | on the disk before answering |
+| `rename_file(a, b)` | `(str, str) -> () ! IoError` | atomic where the platform allows |
+
+**The last five exist because whole-file calls cannot express data**: a table
+larger than memory cannot be read at all, a log rewritten per record is
+quadratic, and a crash-safe commit is write-beside, `sync_file`, `rename_file`.
 
 **`bytes` is distinct from `[i64]` on purpose.** A list of integers cannot
-promise its elements are bytes, stores eight bytes per element, and cannot be
-handed to anything that wants a buffer. The promise is the type.
-
-**A byte is an `i64`.** `at` gives a number in `0..255` rather than a one-byte
-value type, because the language has one integer type and adding a second to
-describe an element would be a worse trade than the range check.
-
-**A `bytes` prints as hex**, `0x` then two digits per byte, and not as the text
-it might decode to. Showing it as text would undo the distinction the type
-exists to make.
-
-`to_str` is lossy for the same reason `tcp_read` is ([L-LIB-NET]): a buffer
-carries bytes and a `str` carries text, and a malformed byte should not end a
-program that is inspecting one.
+promise its elements are bytes, stores eight per element, and cannot be handed
+to a buffer. The promise is the type. `at` gives `0..255` rather than a one-byte
+type: one integer type is the trade, and a range check is cheaper than a second.
+It **prints as hex**, `0x` and two digits per byte, not the text it might decode
+to; `to_str` is lossy for `tcp_read`'s reason ([L-LIB-NET]).

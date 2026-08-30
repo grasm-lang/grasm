@@ -841,6 +841,11 @@ impl<'m> Codegen<'m> {
             ("grasm_bytes_to_str", vec![i64t], Some(i64t)),
             ("grasm_str_to_bytes", vec![i64t], Some(i64t)),
             ("grasm_read_bytes", vec![i64t], Some(i64t)),
+            ("grasm_read_bytes_at", vec![i64t, i64t, i64t], Some(i64t)),
+            ("grasm_file_size", vec![i64t], Some(i64t)),
+            ("grasm_append_bytes", vec![i64t, i64t], Some(i64t)),
+            ("grasm_sync_file", vec![i64t], Some(i64t)),
+            ("grasm_rename_file", vec![i64t, i64t], Some(i64t)),
             ("grasm_write_bytes", vec![i64t, i64t], Some(i64t)),
             ("grasm_list_dir", vec![i64t], Some(i64t)),
             ("grasm_set_args", vec![i64t, ptr], None),
@@ -9356,6 +9361,63 @@ checker did",
                     VType::Fallible(Box::new(VType::Bytes), Box::new(VType::Sum("IoError".into()))),
                 )));
             }
+            // A range of a file, and the four calls a crash-safe store needs.
+            "read_bytes_at" => {
+                let (pv, pt) = self.eval_expr_val(&args[0])?;
+                let (ov, ot) = self.eval_expr_val(&args[1])?;
+                let (cv, ct) = self.eval_expr_val(&args[2])?;
+                let bp = self.box_value(pv, &pt);
+                let bo = self.box_value(ov, &ot);
+                let bc = self.box_value(cv, &ct);
+                let v = self.call_rt("grasm_read_bytes_at", &[bp, bo, bc]).unwrap();
+                self.call_rt("grasm_val_dec", &[bp]);
+                self.call_rt("grasm_val_dec", &[bo]);
+                self.call_rt("grasm_val_dec", &[bc]);
+                return Ok(Some((
+                    v,
+                    VType::Fallible(Box::new(VType::Bytes), Box::new(VType::Sum("IoError".into()))),
+                )));
+            }
+            "file_size" => {
+                let (pv, _) = self.eval_expr_val(&args[0])?;
+                let v = self.call_rt("grasm_file_size", &[pv]).unwrap();
+                self.call_rt("grasm_val_dec", &[pv]);
+                return Ok(Some((
+                    v,
+                    VType::Fallible(Box::new(VType::I64), Box::new(VType::Sum("IoError".into()))),
+                )));
+            }
+            "sync_file" => {
+                let (pv, _) = self.eval_expr_val(&args[0])?;
+                let v = self.call_rt("grasm_sync_file", &[pv]).unwrap();
+                self.call_rt("grasm_val_dec", &[pv]);
+                return Ok(Some((
+                    v,
+                    VType::Fallible(Box::new(VType::Unit), Box::new(VType::Sum("IoError".into()))),
+                )));
+            }
+            "rename_file" => {
+                let (av, _) = self.eval_expr_val(&args[0])?;
+                let (bv, _) = self.eval_expr_val(&args[1])?;
+                let v = self.call_rt("grasm_rename_file", &[av, bv]).unwrap();
+                self.call_rt("grasm_val_dec", &[av]);
+                self.call_rt("grasm_val_dec", &[bv]);
+                return Ok(Some((
+                    v,
+                    VType::Fallible(Box::new(VType::Unit), Box::new(VType::Sum("IoError".into()))),
+                )));
+            }
+            "append_bytes" => {
+                let (pv, _) = self.eval_expr_val(&args[0])?;
+                let (bv, _) = self.eval_expr_val(&args[1])?;
+                let v = self.call_rt("grasm_append_bytes", &[pv, bv]).unwrap();
+                self.call_rt("grasm_val_dec", &[pv]);
+                self.call_rt("grasm_val_dec", &[bv]);
+                return Ok(Some((
+                    v,
+                    VType::Fallible(Box::new(VType::Unit), Box::new(VType::Sum("IoError".into()))),
+                )));
+            }
             "write_bytes" => {
                 let (pv, _) = self.eval_expr_val(&args[0])?;
                 let (bv, _) = self.eval_expr_val(&args[1])?;
@@ -11131,6 +11193,18 @@ fields, not the type this is bound to, not an enclosing generic",
                             "bytes_of" => Some(VType::Bytes),
                             "random_bytes" => Some(VType::Fallible(
                                 Box::new(VType::Bytes),
+                                Box::new(VType::Sum("IoError".into())),
+                            )),
+                            "read_bytes_at" => Some(VType::Fallible(
+                                Box::new(VType::Bytes),
+                                Box::new(VType::Sum("IoError".into())),
+                            )),
+                            "file_size" => Some(VType::Fallible(
+                                Box::new(VType::I64),
+                                Box::new(VType::Sum("IoError".into())),
+                            )),
+                            "append_bytes" | "sync_file" | "rename_file" => Some(VType::Fallible(
+                                Box::new(VType::Unit),
                                 Box::new(VType::Sum("IoError".into())),
                             )),
                             "read_bytes" => Some(VType::Fallible(

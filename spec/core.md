@@ -18,7 +18,7 @@ unless the split is real, mechanical, and checked.
 
 Until this document existed the split was **asserted and not true**. `spec/README.md`
 said "this directory is the normative description of Grasm-Core"; the AST had 58
-syntactic forms, the reference interpreter 6,667 lines, and no rewrite from any
+syntactic forms, the reference interpreter 7,352 lines, and no rewrite from any
 construct to any other was written down anywhere. This document defines the
 split, and `crates/grasm_spec/tests/core.rs` fails if it drifts.
 
@@ -223,18 +223,18 @@ The budgets, measured rather than asserted:
 | Budget | §19.2 target | Today |
 |---|---|---|
 | Core constructs | ≤ 30 | **36** |
-| Reference interpreter | ≤ 5,000 lines | **6,667** |
+| Reference interpreter | ≤ 5,000 lines | **7,352** |
 | Specification | ≤ 50 pages | ~55 pages |
 
 None of the three is met. All three are now measured on every test run, which
 is the difference between a target and a slogan.
 
-The interpreter grew from 6,009 to 6,667 when readiness and datagrams were added
-([L-LIB-NET], [L-LIB-UDP]). That is movement *away* from the 5,000-line target
-and it is recorded here rather than absorbed quietly, which is what the budget
-test exists to force. The growth is honest — the reference engine has to
-implement every builtin the language has, and `net_wait` and the UDP surface are
-builtins — but it is also the second time the library has been the thing that
-grew, and a library that keeps growing is the way this budget is lost. What
-would actually shrink it is moving builtins out of the engine and into Grasm
-itself, which needs a standard library written in the language.
+The interpreter grew 6,009 → 6,667 for readiness and datagrams ([L-LIB-NET],
+[L-LIB-UDP]), then → 7,352 for the sender's address and the five file calls a
+crash-safe store needs ([L-LIB-BYTES]). Each is movement *away* from the 5,000
+target, recorded rather than absorbed quietly, which is what this test forces.
+Each was honest — the reference engine implements every builtin — and that is
+the point: **three times running, the library has been the thing that grew**,
+the last two demanded by a program that hit a wall. What would shrink it is
+moving builtins out of the engine into Grasm, which needs a standard library
+written in the language: work this note has now asked for twice.

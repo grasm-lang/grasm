@@ -6148,6 +6148,159 @@ unsafe fn grasm_read_bytes_now(path: *mut RtVal) -> *mut RtVal {
     }
 }
 
+/// A range of a file, read without loading the rest.
+///
+/// Every other file call in this runtime is whole-file, which is the right
+/// shape for configuration and the wrong one for data: fetching one record
+/// from a four-megabyte table read four megabytes — 40,000x amplification,
+/// measured — and a table larger than memory could not be read at all.
+///
+/// A read starting past the end answers empty rather than failing, so a caller
+/// walking to the end stops rather than raising. A read overlapping the end
+/// answers what is there, short, like any other read of a file that ended.
+///
+/// # Safety: boxed values.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_read_bytes_at(
+    path: *mut RtVal,
+    offset: *mut RtVal,
+    count: *mut RtVal,
+) -> *mut RtVal {
+    journaled("read_bytes_at", || grasm_read_bytes_at_now(path, offset, count))
+}
+
+unsafe fn grasm_read_bytes_at_now(
+    path: *mut RtVal,
+    offset: *mut RtVal,
+    count: *mut RtVal,
+) -> *mut RtVal {
+    use std::io::{Read, Seek, SeekFrom};
+    let p = as_str(path).to_string();
+    let (RtPayload::I64(off), RtPayload::I64(want)) = (&(*offset).payload, &(*count).payload)
+    else {
+        return err_of(io_err(
+            "IoFailed",
+            "read_bytes_at takes an integer offset and count".to_string(),
+        ));
+    };
+    let (off, want) = (*off, *want);
+    if off < 0 || want < 0 {
+        return err_of(io_err(
+            "IoFailed",
+            format!("read_bytes_at: offset {off} and count {want} must not be negative"),
+        ));
+    }
+    match std::fs::File::open(&p) {
+        Ok(mut f) => {
+            if let Err(e) = f.seek(SeekFrom::Start(off as u64)) {
+                return err_of(io_err("IoFailed", e.to_string()));
+            }
+            let mut buf = vec![0u8; want as usize];
+            let mut filled = 0usize;
+            while filled < buf.len() {
+                match f.read(&mut buf[filled..]) {
+                    Ok(0) => break,
+                    Ok(n) => filled += n,
+                    Err(e) => return err_of(io_err("IoFailed", e.to_string())),
+                }
+            }
+            buf.truncate(filled);
+            ok_of(alloc(RtPayload::Bytes(std::sync::Arc::new(buf))))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => err_of(io_err("NotFound", p)),
+        Err(e) => err_of(io_err("IoFailed", e.to_string())),
+    }
+}
+
+/// How many bytes a file holds, without reading any of them.
+///
+/// # Safety: boxed values.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_file_size(path: *mut RtVal) -> *mut RtVal {
+    journaled("file_size", || grasm_file_size_now(path))
+}
+
+unsafe fn grasm_file_size_now(path: *mut RtVal) -> *mut RtVal {
+    let p = as_str(path).to_string();
+    match std::fs::metadata(&p) {
+        Ok(m) => ok_of(alloc(RtPayload::I64(m.len() as i64))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => err_of(io_err("NotFound", p)),
+        Err(e) => err_of(io_err("IoFailed", e.to_string())),
+    }
+}
+
+/// Add to the end of a file, creating it if it is not there.
+///
+/// A write-ahead log rewritten in full on every record is quadratic, which is
+/// the difference between a log and a liability.
+///
+/// # Safety: boxed values.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_append_bytes(path: *mut RtVal, data: *mut RtVal) -> *mut RtVal {
+    journaled("append_bytes", || grasm_append_bytes_now(path, data))
+}
+
+unsafe fn grasm_append_bytes_now(path: *mut RtVal, data: *mut RtVal) -> *mut RtVal {
+    use std::io::Write;
+    let p = as_str(path).to_string();
+    let done = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&p)
+        .and_then(|mut f| f.write_all(as_bytes(data).as_slice()));
+    match done {
+        Ok(()) => ok_of(alloc(RtPayload::Unit)),
+        Err(e) => err_of(io_err("IoFailed", e.to_string())),
+    }
+}
+
+/// Ask the operating system to put a file on the disk before answering.
+///
+/// Without this, "the write returned" and "the data survives a power cut" are
+/// different claims and a program cannot tell which one it has.
+///
+/// # Safety: boxed values.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_sync_file(path: *mut RtVal) -> *mut RtVal {
+    journaled("sync_file", || grasm_sync_file_now(path))
+}
+
+unsafe fn grasm_sync_file_now(path: *mut RtVal) -> *mut RtVal {
+    let p = as_str(path).to_string();
+    let done = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&p)
+        .and_then(|f| f.sync_all());
+    match done {
+        Ok(()) => ok_of(alloc(RtPayload::Unit)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => err_of(io_err("NotFound", p)),
+        Err(e) => err_of(io_err("IoFailed", e.to_string())),
+    }
+}
+
+/// Move a file to a new name, atomically where the platform allows it.
+///
+/// This is the primitive a crash-safe commit is built from: write the new
+/// state beside the old, sync it, and rename over. A copy-then-remove leaves
+/// both files when the power goes out between the two, which is why
+/// `fs.move_file` has always said it is not atomic.
+///
+/// # Safety: boxed values.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_rename_file(from: *mut RtVal, to: *mut RtVal) -> *mut RtVal {
+    journaled("rename_file", || grasm_rename_file_now(from, to))
+}
+
+unsafe fn grasm_rename_file_now(from: *mut RtVal, to: *mut RtVal) -> *mut RtVal {
+    let a = as_str(from).to_string();
+    let b = as_str(to).to_string();
+    match std::fs::rename(&a, &b) {
+        Ok(()) => ok_of(alloc(RtPayload::Unit)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => err_of(io_err("NotFound", a)),
+        Err(e) => err_of(io_err("IoFailed", e.to_string())),
+    }
+}
+
 /// # Safety: boxed values.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_write_bytes(path: *mut RtVal, data: *mut RtVal) -> *mut RtVal {
