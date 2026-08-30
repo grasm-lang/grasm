@@ -1,0 +1,8 @@
+[package]
+name = "raft_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.raft]
+path = "../raft"
+version = "^1.0.0"

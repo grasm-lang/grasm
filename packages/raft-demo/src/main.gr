@@ -1,0 +1,280 @@
+// A five-node cluster, partitioned, in one process and no time at all.
+//
+// This is the payoff for the package reading no clock and opening no socket.
+// A Raft tested against real timeouts tests almost nothing: the interesting
+// orderings — a vote arriving after a term has moved on, a leader isolated
+// while the rest elect a new one, a healed partition whose old leader must
+// step down — happen rarely by chance and always on demand here.
+
+import raft
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+/// A cluster, and which nodes can currently hear each other.
+type Cluster = {
+    nodes: [Node],
+    reachable: [bool],
+    now: i64,
+    delivered: i64,
+    dropped: i64,
+}
+
+fn new_cluster(size: i64) -> Cluster {
+    var nodes: [Node] = []
+    var reachable: [bool] = []
+    for i in 0..size {
+        var peers: [i64] = []
+        for j in 0..size {
+            if j != i {
+                peers.push(j)
+            }
+        }
+        // Staggered timeouts, so one node stands for election first rather
+        // than all of them at once. Real deployments randomise for exactly
+        // this reason; here it is fixed so the test is deterministic.
+        nodes.push(raft.new_node(i, peers, 0, 100 + i * 20))
+        reachable.push(true)
+    }
+    Cluster{ nodes: nodes, reachable: reachable, now: 0, delivered: 0, dropped: 0 }
+}
+
+fn timeout_of(id: i64) -> i64 {
+    100 + id * 20
+}
+
+/// Advance time and deliver messages until nothing more is pending.
+fn run_for(inout c: Cluster, steps: i64) {
+    for _step in 0..steps {
+        c.now = c.now + 10
+        var pending: [Message] = []
+        var senders: [i64] = []
+        for i in 0..c.nodes.len() {
+            for m in raft.tick(c.nodes[i], c.now, timeout_of(i), 30) {
+                pending.push(m)
+                senders.push(i)
+            }
+        }
+        var rounds = 0
+        while pending.len() > 0 and rounds < 20 {
+            rounds = rounds + 1
+            var next: [Message] = []
+            var next_senders: [i64] = []
+            for k in 0..pending.len() {
+                let m = pending[k]
+                let from = senders[k]
+                let to = raft.message_to(m)
+                if to >= 0 {
+                    if deliver(c, from, to, m) {
+                        for r in raft.receive(c.nodes[to], m, c.now, timeout_of(to)) {
+                            next.push(r)
+                            next_senders.push(to)
+                        }
+                    }
+                } else {
+                    // A broadcast: everyone the sender can reach.
+                    for j in 0..c.nodes.len() {
+                        if j != from and deliver(c, from, j, m) {
+                            for r in raft.receive(c.nodes[j], m, c.now, timeout_of(j)) {
+                                next.push(r)
+                                next_senders.push(j)
+                            }
+                        }
+                    }
+                }
+            }
+            pending = next
+            senders = next_senders
+        }
+    }
+}
+
+fn deliver(inout c: Cluster, from: i64, to: i64, _m: Message) -> bool {
+    if c.reachable[from] and c.reachable[to] {
+        c.delivered = c.delivered + 1
+        return true
+    }
+    c.dropped = c.dropped + 1
+    false
+}
+
+fn leaders(c: Cluster) -> [i64] {
+    var out: [i64] = []
+    for i in 0..c.nodes.len() {
+        if raft.is_leader(c.nodes[i]) and c.reachable[i] {
+            out.push(i)
+        }
+    }
+    out
+}
+
+fn any_leader(c: Cluster) -> i64 {
+    let ls = leaders(c)
+    if ls.len() > 0 {
+        ls[0]
+    } else {
+        0 - 1
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+
+    print("-- one node is a cluster, and must elect itself")
+    var solo = new_cluster(1)
+    run_for(solo, 20)
+    say(f, "the only node becomes leader", raft.is_leader(solo.nodes[0]))
+    var s0 = solo.nodes[0]
+    say(f, "and a proposal commits with nobody to wait for",
+        raft.propose(s0, "alone") and raft.commit_index_of(s0) == 0)
+    solo.nodes[0] = s0
+
+    print("-- five nodes elect exactly one leader")
+    var c = new_cluster(5)
+    run_for(c, 30)
+    say(f, "there is a leader", leaders(c).len() >= 1)
+    say(f, "and only one", leaders(c).len() == 1)
+    let first_leader = any_leader(c)
+    let first_term = raft.term_of(c.nodes[first_leader])
+    say(f, "elected in a term above zero", first_term > 0)
+    say(f, "every node agrees on the term", same_term(c))
+
+    print("-- commands replicate to everyone")
+    var l = c.nodes[first_leader]
+    let accepted = raft.propose(l, "set x 1") and raft.propose(l, "set y 2") and
+        raft.propose(l, "set z 3")
+    c.nodes[first_leader] = l
+    say(f, "the leader accepts three commands", accepted)
+    run_for(c, 10)
+    say(f, "all five nodes applied all three, in order", all_applied(c, 3))
+    say(f, "a follower refuses a proposal", not proposes_on_follower(c, first_leader))
+
+    print("-- a partition: the leader is cut off from the rest")
+    c.reachable[first_leader] = false
+    run_for(c, 40)
+    let new_leader = any_leader(c)
+    say(f, "the majority elects a new leader", new_leader >= 0)
+    say(f, "which is not the old one", new_leader != first_leader)
+    say(f, "in a higher term",
+        raft.term_of(c.nodes[new_leader]) > first_term)
+    say(f, "and there is still only one visible leader", leaders(c).len() == 1)
+
+    // The isolated node still believes it is leader — it cannot know
+    // otherwise — but it cannot commit anything, because it can reach nobody.
+    var isolated = c.nodes[first_leader]
+    let before = raft.commit_index_of(isolated)
+    let _p = raft.propose(isolated, "written in the dark")
+    c.nodes[first_leader] = isolated
+    run_for(c, 10)
+    say(f, "the isolated leader commits nothing",
+        raft.commit_index_of(c.nodes[first_leader]) == before)
+
+    print("-- the partition heals")
+    var n2 = c.nodes[new_leader]
+    let _q = raft.propose(n2, "after the split")
+    c.nodes[new_leader] = n2
+    run_for(c, 10)
+    c.reachable[first_leader] = true
+    run_for(c, 30)
+    say(f, "the old leader stands down", not raft.is_leader(c.nodes[first_leader]))
+    say(f, "there is still exactly one leader", leaders(c).len() == 1)
+    say(f, "its term is the higher one", same_term(c))
+
+    // The entry written in the dark was never committed anywhere, so it must
+    // not appear. This is the property the whole algorithm exists for.
+    say(f, "nothing written in the dark survives", not any_applied(c, "written in the dark"))
+    say(f, "and what the majority committed does",
+        applied_everywhere(c, "after the split"))
+    say(f, "every node's applied sequence is identical", logs_identical(c))
+
+    print("    delivered {c.delivered} messages, dropped {c.dropped} to the partition")
+
+    if f == 0 {
+        print("all checks passed")
+    } else {
+        print("{f} check(s) failed")
+    }
+}
+
+fn same_term(c: Cluster) -> bool {
+    var t = 0 - 1
+    for i in 0..c.nodes.len() {
+        if c.reachable[i] {
+            if t < 0 {
+                t = raft.term_of(c.nodes[i])
+            } else if raft.term_of(c.nodes[i]) != t {
+                return false
+            }
+        }
+    }
+    true
+}
+
+fn all_applied(c: Cluster, n: i64) -> bool {
+    for i in 0..c.nodes.len() {
+        if raft.applied_commands(c.nodes[i]).len() != n {
+            return false
+        }
+    }
+    true
+}
+
+fn any_applied(c: Cluster, command: str) -> bool {
+    for i in 0..c.nodes.len() {
+        for a in raft.applied_commands(c.nodes[i]) {
+            if a == command {
+                return true
+            }
+        }
+    }
+    false
+}
+
+fn applied_everywhere(c: Cluster, command: str) -> bool {
+    for i in 0..c.nodes.len() {
+        var found = false
+        for a in raft.applied_commands(c.nodes[i]) {
+            if a == command {
+                found = true
+            }
+        }
+        if not found {
+            return false
+        }
+    }
+    true
+}
+
+fn logs_identical(c: Cluster) -> bool {
+    let first = raft.applied_commands(c.nodes[0])
+    for i in 1..c.nodes.len() {
+        let other = raft.applied_commands(c.nodes[i])
+        if other.len() != first.len() {
+            return false
+        }
+        for j in 0..first.len() {
+            if other[j] != first[j] {
+                return false
+            }
+        }
+    }
+    true
+}
+
+fn proposes_on_follower(c: Cluster, leader: i64) -> bool {
+    for i in 0..c.nodes.len() {
+        if i != leader {
+            var n = c.nodes[i]
+            if raft.propose(n, "from a follower") {
+                return true
+            }
+        }
+    }
+    false
+}

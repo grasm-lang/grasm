@@ -1,0 +1,401 @@
+// Raft: how a group of machines agree on a sequence of commands when some of
+// them are down and the network is losing messages.
+//
+// The whole algorithm is three ideas.
+//
+// **A term is a logical clock.** Every message carries one, anything with an
+// older term is ignored, and anything with a newer one makes the receiver step
+// down. Ordering by term rather than by time is what lets this work without
+// synchronised clocks — which is fortunate, because there are none.
+//
+// **A leader is elected by majority and there can only be one per term.** A
+// node votes at most once in a term, so two candidates cannot both collect
+// more than half of an odd-sized cluster.
+//
+// **An entry is committed when a majority has it**, and a leader may only
+// count entries from its *own* term toward that. This last rule is the one
+// everyone leaves out and it is the one that makes Raft correct: without it a
+// leader can conclude an old entry is safe, be replaced, and have it
+// overwritten.
+//
+// **Nothing here reads a clock or a socket.** Time arrives as a number and
+// messages as values, so a five-node cluster with a partition in it runs in
+// one process, deterministically, in no time at all — which is the only way
+// this algorithm can be tested at all. A Raft whose tests need real timeouts
+// tests almost nothing, because the interesting orderings never happen.
+
+type Role =
+    | Follower
+    | Candidate
+    | Leader
+
+type LogEntry = {
+    term: i64,
+    command: str,
+}
+
+type Node = {
+    id: i64,
+    peers: [i64],
+    role: Role,
+    // Persistent: a node that forgot these on restart could vote twice in one
+    // term, which is how two leaders happen.
+    current_term: i64,
+    voted_for: i64,
+    log: [LogEntry],
+    // Volatile.
+    commit_index: i64,
+    last_applied: i64,
+    votes: [i64],
+    next_index: [i64],
+    match_index: [i64],
+    election_deadline: i64,
+    heartbeat_due: i64,
+    applied: [str],
+}
+
+type Message =
+    | RequestVote(term: i64, from: i64, last_log_index: i64, last_log_term: i64)
+    | VoteGranted(term: i64, from: i64, to: i64, granted: bool)
+    | AppendEntries(term: i64, from: i64, prev_index: i64, prev_term: i64,
+                    entries: [LogEntry], leader_commit: i64)
+    | AppendResult(term: i64, from: i64, to: i64, success: bool, match_index: i64)
+
+pub fn no_vote() -> i64 { 0 - 1 }
+
+/// A follower with an empty log.
+pub fn new_node(id: i64, peers: [i64], now: i64, election_timeout: i64) -> Node {
+    var log: [LogEntry] = []
+    var votes: [i64] = []
+    var next: [i64] = []
+    var matched: [i64] = []
+    var applied: [str] = []
+    Node{
+        id: id,
+        peers: peers,
+        role: Follower,
+        current_term: 0,
+        voted_for: no_vote(),
+        log: log,
+        commit_index: 0 - 1,
+        last_applied: 0 - 1,
+        votes: votes,
+        next_index: next,
+        match_index: matched,
+        election_deadline: now + election_timeout,
+        heartbeat_due: 0,
+        applied: applied,
+    }
+}
+
+fn majority(n: Node) -> i64 {
+    (n.peers.len() + 1) / 2 + 1
+}
+
+fn last_index(n: Node) -> i64 {
+    n.log.len() - 1
+}
+
+fn last_term(n: Node) -> i64 {
+    if n.log.len() == 0 {
+        0
+    } else {
+        n.log[n.log.len() - 1].term
+    }
+}
+
+/// Adopt a newer term and stand down.
+///
+/// Every path that sees a higher term goes through here. A node that updated
+/// its term without clearing its vote could vote twice in one term.
+fn step_down(inout n: Node, term: i64) {
+    n.current_term = term
+    n.role = Follower
+    n.voted_for = no_vote()
+    var none: [i64] = []
+    n.votes = none
+}
+
+/// Time passing. Answers whatever the node wants to send.
+pub fn tick(inout n: Node, now: i64, election_timeout: i64,
+            heartbeat_interval: i64) -> [Message] {
+    var out: [Message] = []
+    match n.role {
+        Leader -> {
+            if now >= n.heartbeat_due {
+                n.heartbeat_due = now + heartbeat_interval
+                for p in n.peers {
+                    out.push(append_for(n, p))
+                }
+            }
+        }
+        _other -> {
+            if now >= n.election_deadline {
+                // Stand for election. The term goes up first, and the node
+                // votes for itself — so a single-node cluster elects itself
+                // immediately, which is the degenerate case that must work.
+                n.current_term = n.current_term + 1
+                n.role = Candidate
+                n.voted_for = n.id
+                var mine: [i64] = [n.id]
+                n.votes = mine
+                n.election_deadline = now + election_timeout
+                if n.votes.len() >= majority(n) {
+                    become_leader(n, now)
+                    for p in n.peers {
+                        out.push(append_for(n, p))
+                    }
+                } else {
+                    for p in n.peers {
+                        out.push(RequestVote(n.current_term, n.id,
+                                             last_index(n), last_term(n)))
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn become_leader(inout n: Node, now: i64) {
+    n.role = Leader
+    var next: [i64] = []
+    var matched: [i64] = []
+    for _p in n.peers {
+        next.push(n.log.len())
+        matched.push(0 - 1)
+    }
+    n.next_index = next
+    n.match_index = matched
+    n.heartbeat_due = now
+}
+
+fn peer_slot(n: Node, peer: i64) -> i64 {
+    for i in 0..n.peers.len() {
+        if n.peers[i] == peer {
+            return i
+        }
+    }
+    0 - 1
+}
+
+fn append_for(n: Node, peer: i64) -> Message {
+    let slot = peer_slot(n, peer)
+    let next = if slot >= 0 { n.next_index[slot] } else { n.log.len() }
+    let prev = next - 1
+    let prev_term = if prev >= 0 and prev < n.log.len() { n.log[prev].term } else { 0 }
+    var entries: [LogEntry] = []
+    var i = next
+    while i < n.log.len() {
+        entries.push(n.log[i])
+        i = i + 1
+    }
+    AppendEntries(n.current_term, n.id, prev, prev_term, entries, n.commit_index)
+}
+
+/// Handle one message. Answers whatever should be sent in reply.
+pub fn receive(inout n: Node, m: Message, now: i64, election_timeout: i64) -> [Message] {
+    var out: [Message] = []
+    match m {
+        RequestVote(term, from, their_last_index, their_last_term) -> {
+            if term > n.current_term {
+                step_down(n, term)
+            }
+            var granted = false
+            if term >= n.current_term and (n.voted_for == no_vote() or n.voted_for == from) {
+                // The log must be at least as up to date as this node's, by
+                // term first and length second. Without this a node with a
+                // stale log could be elected and overwrite committed entries.
+                let ours_newer = their_last_term < last_term(n) or
+                    (their_last_term == last_term(n) and their_last_index < last_index(n))
+                if not ours_newer {
+                    granted = true
+                    n.voted_for = from
+                    n.election_deadline = now + election_timeout
+                }
+            }
+            out.push(VoteGranted(n.current_term, n.id, from, granted))
+        }
+        VoteGranted(term, from, to, granted) -> {
+            if to == n.id {
+                if term > n.current_term {
+                    step_down(n, term)
+                } else {
+                    match n.role {
+                        Candidate -> {
+                            if granted and term == n.current_term {
+                                var already = false
+                                for v in n.votes {
+                                    if v == from {
+                                        already = true
+                                    }
+                                }
+                                if not already {
+                                    n.votes.push(from)
+                                }
+                                if n.votes.len() >= majority(n) {
+                                    become_leader(n, now)
+                                    for p in n.peers {
+                                        out.push(append_for(n, p))
+                                    }
+                                }
+                            }
+                        }
+                        _other -> {}
+                    }
+                }
+            }
+        }
+        AppendEntries(term, from, prev_index, prev_term, entries, leader_commit) -> {
+            if term > n.current_term {
+                step_down(n, term)
+            }
+            if term < n.current_term {
+                out.push(AppendResult(n.current_term, n.id, from, false, 0 - 1))
+            } else {
+                n.role = Follower
+                n.election_deadline = now + election_timeout
+                // The log must match at `prev_index`, or the leader has to
+                // back up. This is what repairs a follower whose log diverged.
+                let consistent = prev_index < 0 or
+                    (prev_index < n.log.len() and n.log[prev_index].term == prev_term)
+                if not consistent {
+                    out.push(AppendResult(n.current_term, n.id, from, false, 0 - 1))
+                } else {
+                    var at = prev_index + 1
+                    for e in entries {
+                        if at < n.log.len() {
+                            if n.log[at].term != e.term {
+                                // A conflict: everything from here is wrong
+                                // and is discarded. Truncating only on a
+                                // *conflict* matters — a delayed duplicate
+                                // would otherwise throw away good entries.
+                                var kept: [LogEntry] = []
+                                for i in 0..at {
+                                    kept.push(n.log[i])
+                                }
+                                n.log = kept
+                                n.log.push(e)
+                            }
+                        } else {
+                            n.log.push(e)
+                        }
+                        at = at + 1
+                    }
+                    if leader_commit > n.commit_index {
+                        n.commit_index = if leader_commit < last_index(n) {
+                            leader_commit
+                        } else {
+                            last_index(n)
+                        }
+                    }
+                    apply_committed(n)
+                    out.push(AppendResult(n.current_term, n.id, from, true, last_index(n)))
+                }
+            }
+        }
+        AppendResult(term, from, to, success, matched) -> {
+            if to == n.id {
+                if term > n.current_term {
+                    step_down(n, term)
+                } else {
+                    match n.role {
+                        Leader -> {
+                            let slot = peer_slot(n, from)
+                            if slot >= 0 {
+                                if success {
+                                    n.match_index[slot] = matched
+                                    n.next_index[slot] = matched + 1
+                                    advance_commit(n)
+                                } else if n.next_index[slot] > 0 {
+                                    n.next_index[slot] = n.next_index[slot] - 1
+                                    out.push(append_for(n, from))
+                                }
+                            }
+                        }
+                        _other -> {}
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Move the commit index up to whatever a majority holds.
+///
+/// **Only entries from the leader's own term count.** This is the rule that is
+/// left out of every simplified description and it is what makes Raft correct:
+/// a leader that counted an older entry could conclude it was safe, be
+/// replaced by a node without it, and have it overwritten — after telling a
+/// client it was committed.
+fn advance_commit(inout n: Node) {
+    var candidate = last_index(n)
+    while candidate > n.commit_index {
+        if n.log[candidate].term == n.current_term {
+            var count = 1
+            for m in n.match_index {
+                if m >= candidate {
+                    count = count + 1
+                }
+            }
+            if count >= majority(n) {
+                n.commit_index = candidate
+                apply_committed(n)
+                return
+            }
+        }
+        candidate = candidate - 1
+    }
+}
+
+fn apply_committed(inout n: Node) {
+    while n.last_applied < n.commit_index {
+        n.last_applied = n.last_applied + 1
+        n.applied.push(n.log[n.last_applied].command)
+    }
+}
+
+/// Ask a leader to append a command. Answers false if this node is not one.
+pub fn propose(inout n: Node, command: str) -> bool {
+    match n.role {
+        Leader -> {
+            n.log.push(LogEntry{ term: n.current_term, command: command })
+            // A single-node cluster commits immediately: there is no one to
+            // wait for, and a majority of one is one.
+            advance_commit(n)
+            true
+        }
+        _other -> false
+    }
+}
+
+pub fn is_leader(n: Node) -> bool {
+    match n.role {
+        Leader -> true
+        _other -> false
+    }
+}
+
+pub fn term_of(n: Node) -> i64 { n.current_term }
+pub fn commit_index_of(n: Node) -> i64 { n.commit_index }
+pub fn applied_commands(n: Node) -> [str] { n.applied }
+pub fn log_length(n: Node) -> i64 { n.log.len() }
+
+pub fn message_to(m: Message) -> i64 {
+    match m {
+        RequestVote(_t, _f, _li, _lt) -> 0 - 1
+        VoteGranted(_t, _f, to, _g) -> to
+        AppendEntries(_t, _f, _pi, _pt, _e, _lc) -> 0 - 1
+        AppendResult(_t, _f, to, _s, _m) -> to
+    }
+}
+
+pub fn message_from(m: Message) -> i64 {
+    match m {
+        RequestVote(_t, from, _li, _lt) -> from
+        VoteGranted(_t, from, _to, _g) -> from
+        AppendEntries(_t, from, _pi, _pt, _e, _lc) -> from
+        AppendResult(_t, from, _to, _s, _m) -> from
+    }
+}

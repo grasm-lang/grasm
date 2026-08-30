@@ -1,0 +1,8 @@
+[package]
+name = "raft"
+version = "1.0.0"
+
+# A state machine over messages and a clock that arrives as an argument. It
+# opens no socket, which is what makes a partitioned five-node cluster
+# testable in one process with no waiting.
+capabilities = []
