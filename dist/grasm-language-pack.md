@@ -91,9 +91,9 @@ that used it as a field name, which is the compatibility this rule exists for.
 
 ## 4. Literals
 
-**[L-INT]** Integer literals are decimal (`42`), hexadecimal (`0xFF`), or
-binary (`0b1010`). Underscores may separate digits (`1_000_000`) and are
-ignored. Integers are 64-bit signed.
+**[L-INT]** Integer literals are decimal (`42`), hex (`0xFF`) or binary
+(`0b1010`); underscores are ignored. Decimal is a 64-bit signed magnitude,
+hex and binary a bit pattern — all 64 bits, so `0xffffffffffffffff` is -1.
 
 **[L-FLOAT]** Float literals contain a fractional part (`3.14`) or an exponent
 (`1e9`, `2.5e-3`). `1..5` is a range, not a float.
@@ -2199,7 +2199,7 @@ came to be documented as returning `Option[str]` when it is fallible.
 |------|------|-------|
 | `print(x)` | `(T)` | writes `x` then a newline; performs `io` |
 | `input()` | `() -> str` | one line from stdin, without the newline; `io` |
-| `args()` | `() -> [str]` | arguments after `--`; performs `io` |
+| `args()` | `() -> [str]` | the program's own arguments; performs `io` |
 | `panic(msg)` | `(str)` | prints `panic: msg`, exits 101 |
 | `assert(c)` | `(bool)` | panics when `c` is false |
 | `assert_eq(a, b)` | `(T, T)` | panics when `a != b` |
@@ -2710,31 +2710,31 @@ Readiness needed no new type: the wait set is an ordinary `[i64]` and the
 timeout an ordinary `i64`, which is the same reason the rest of this surface
 looks the way it does.
 
-**[L-LIB-UDP]** Three more reach the network as **datagrams**, and each
-performs `net`:
+**[L-LIB-UDP]** Four more reach the network as **datagrams**, each performing
+`net`:
 
 | | type | |
 |---|---|---|
 | `udp_bind(port)` | `(i64) -> i64 ! IoError` | binds a datagram socket; `0` asks the system to choose |
 | `udp_send(h, host, port, b)` | `(i64, str, i64, bytes) -> i64 ! IoError` | sends one datagram, answering with the bytes sent |
 | `udp_recv(h)` | `(i64) -> bytes ! IoError` | receives **one** datagram, whole |
+| `udp_recv_from(h)` | `(i64) -> (bytes, str, i64) ! IoError` | the same, and where it came from |
 
-UDP is not TCP with the reliability removed; it is a different shape, and the
-signatures have to say so. A stream has no message boundaries and both ends are
-fixed at connect time, so `tcp_write(h, text)` is complete. A datagram is a
-*whole message* sent to an address named at send time, so `udp_send` takes the
-destination on every call. Giving the two the same shape would have lost exactly
-the information that makes UDP worth having.
+UDP is not TCP with the reliability removed but a different shape, and the
+signatures say so. A stream fixes both ends at connect time, so `tcp_write(h,
+text)` is complete. A datagram is a *whole message* with **no fixed peer**, so
+`udp_send` names a destination every call and `udp_recv_from` answers the
+sender's — a receiver that cannot learn who wrote can only answer peers
+configured in advance. A tuple for `proc_run`'s reason ([L-LIB-PROC]).
 
 Payloads are `bytes`, not `str`. The protocols that use UDP are binary — a DNS
 query is a packed structure with bit-level flags — and routing one through the
 lossy UTF-8 conversion the stream operations use, correctly, for text would
 corrupt it ([L-LIB-BYTES]).
 
-`udp_recv` receives one datagram whole or fails. A read that returned half a
-message, or two joined together, would have destroyed the only thing UDP
-guarantees. Nothing past 65535 bytes can arrive over IPv4 in one piece, so the
-buffer cannot truncate a datagram that was deliverable.
+A read that returned half a message, or two joined, would destroy the only
+thing UDP guarantees. Nothing past 65535 bytes arrives over IPv4 in one piece,
+so the buffer cannot truncate a deliverable datagram.
 
 Datagram handles share the table with stream handles, so `net_wait`, `net_port`
 and `net_close` work on all three kinds unchanged. A program that speaks two
@@ -3757,7 +3757,7 @@ defect being worked off:
 
 Everything else the interpreter accepts, the compiled backend compiles.
 `scripts/nativegaps.sh` holds that claim to 55 cases, running each under both
-engines and comparing output, exit code and leaks. Six of the ten generators in
+engines and comparing output, exit code and leaks. Six of the fourteen generators in
 `scripts/` report how many of the programs they invented the backend turned
 away, and all six report `declined: 0` — and in all six a decline is a
 *failure* rather than a report. Every shape they generate is one the backend

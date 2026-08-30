@@ -30,13 +30,6 @@ came to be documented as returning `Option[str]` when it is fallible.
 | `write_file(p, s)` | `(str, str) -> () ! IoError` | fallible; `io` ([L-LIB-IO]) |
 | `file_exists(p)` | `(str) -> bool` | `io` |
 
-**[L-LIB-ARGS]** `args()` answers what was passed to the *program*, never to the tool that
-started it. Under `grasm run` the program's arguments are the ones after `--`,
-because everything before it belongs to `grasm`; a compiled binary is the
-command, so it has no separator to strip and takes its arguments directly.
-Both spellings give the program the same list, which is what `agreetest`
-checks in all three modes.
-
 **[L-LIB-EXIT]** `exit(code)` ends the program with the **low eight bits** of
 `code`, which is what an operating system reports and what C's `exit` does with
 the same number: `exit(-1)` is 255 and `exit(256)` is 0. Clamping to 0..=255
@@ -534,8 +527,8 @@ Readiness needed no new type: the wait set is an ordinary `[i64]` and the
 timeout an ordinary `i64`, which is the same reason the rest of this surface
 looks the way it does.
 
-**[L-LIB-UDP]** Three more reach the network as **datagrams**, and each
-performs `net`:
+**[L-LIB-UDP]** Four more reach the network as **datagrams**, each performing
+`net`:
 
 | | type | |
 |---|---|---|
@@ -544,34 +537,21 @@ performs `net`:
 | `udp_recv(h)` | `(i64) -> bytes ! IoError` | receives **one** datagram, whole |
 | `udp_recv_from(h)` | `(i64) -> (bytes, str, i64) ! IoError` | the same, and where it came from |
 
-UDP is not TCP with the reliability removed; it is a different shape, and the
-signatures have to say so. A stream has no message boundaries and both ends are
-fixed at connect time, so `tcp_write(h, text)` is complete. A datagram is a
-*whole message* sent to an address named at send time, so `udp_send` takes the
-destination on every call. Giving the two the same shape would have lost exactly
-the information that makes UDP worth having.
+UDP is not TCP with the reliability removed but a different shape, and the
+signatures say so. A stream fixes both ends at connect time, so `tcp_write(h,
+text)` is complete. A datagram is a *whole message* with **no fixed peer**, so
+`udp_send` names a destination every call and `udp_recv_from` answers the
+sender's — a receiver that cannot learn who wrote can only answer peers
+configured in advance. A tuple for `proc_run`'s reason ([L-LIB-PROC]).
 
 Payloads are `bytes`, not `str`. The protocols that use UDP are binary — a DNS
 query is a packed structure with bit-level flags — and routing one through the
 lossy UTF-8 conversion the stream operations use, correctly, for text would
 corrupt it ([L-LIB-BYTES]).
 
-`udp_recv_from` is the same receive keeping the sender's address, as a triple
-of the payload, the host and the port. It is not a convenience: a datagram
-socket has **no fixed peer** — that is the whole difference from a stream — so
-a receiver that cannot learn who wrote can only answer peers it was configured
-with in advance. Every protocol where a client's address is unknown until it
-calls needs this, which is most of them. The address is a tuple rather than a
-new type for the same reason `proc_run`'s result is ([L-LIB-PROC]): three
-values with obvious positions did not need a name.
-
-`udp_recv` remains, because a program that already knows where to reply should
-not have to say so, and dropping the address is then the honest signature.
-
-`udp_recv` receives one datagram whole or fails. A read that returned half a
-message, or two joined together, would have destroyed the only thing UDP
-guarantees. Nothing past 65535 bytes can arrive over IPv4 in one piece, so the
-buffer cannot truncate a datagram that was deliverable.
+A read that returned half a message, or two joined, would destroy the only
+thing UDP guarantees. Nothing past 65535 bytes arrives over IPv4 in one piece,
+so the buffer cannot truncate a deliverable datagram.
 
 Datagram handles share the table with stream handles, so `net_wait`, `net_port`
 and `net_close` work on all three kinds unchanged. A program that speaks two

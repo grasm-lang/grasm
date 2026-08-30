@@ -346,6 +346,7 @@ fn every_net_builtin(host: str, port: i64) / {net} {
     match udp_bind(port) { Ok(v) -> {}  Err(e) -> {} }
     match udp_send(port, host, port, bytes_of([])) { Ok(v) -> {}  Err(e) -> {} }
     match udp_recv(port) { Ok(v) -> {}  Err(e) -> {} }
+    match udp_recv_from(port) { Ok(v) -> {}  Err(e) -> {} }
     net_close(port)
 }
 
@@ -377,6 +378,7 @@ fn main() / {io, async} {
 //! 3
 //! 42 9 0
 //! 8
+//! aliased: through a name
 // Declaring `Cfg` also declares the handler type `CfgHandler`, whose fields
 // are the operations.
 effect Cfg {
@@ -431,10 +433,24 @@ fn main() {
     with Cfg handled_by CfgHandler{ value: || scale * 2 } {
         print("{doubled()}")
     }
+
+    through(LogHandler{ info: |m| print("{m}"), warn: |m| print("W: {m}") })
 }
 
 fn doubled() -> i64 {
     Cfg.value()
+}
+
+// The handler type an `effect` declares is a type like any other, so an alias
+// may name it. Effects are collected after types, and aliases used to be
+// resolved in the pass that collected them, so this line was "unknown type
+// `LogHandler`" while a struct field naming the same type worked (F68).
+type Sink = LogHandler
+
+fn through(h: Sink) / {io, Log} {
+    with Log handled_by h {
+        Log.info("aliased: through a name")
+    }
 }
 ```
 
@@ -2584,6 +2600,7 @@ fn main() {
 //! a struct referent still uses its own field names: 5
 //! a sum referent, written through a copy: Green Green
 //! and an Option the same way: Some(2)
+//! into the referent, not over it: [1, 9] [4, 50] [7, 80]
 //! released, and the reference knows: false
 // `r.value` reads and writes what a reference points at.
 //
@@ -2592,6 +2609,7 @@ fn main() {
 type Point = { x: i64 }
 type Col = | Red | Green
 type Held = { cell: ref i64 }
+type Held2 = { cell: ref [i64] }
 
 fn bump(r: ref i64) {
     r.value += 1
@@ -2677,6 +2695,24 @@ fn main() / {io} {
     opt.value = Some(2)
     print("and an Option the same way: {opt.value}")
 
+    // A write *inside* the referent, rather than replacing it. `.value` names
+    // the referent, so it is spent by reaching one and what follows applies to
+    // the referent itself -- passed on whole, the rest of the walk was asked
+    // for `list.value[0]`. Reading the same place always compiled, and so did
+    // replacing the whole referent one line above.
+    let cell = ref([1, 2])
+    cell.value[1] = 9
+    var cells2: [ref [i64]] = [ref([4, 5])]
+    cells2[0].value[1] = 50
+    let boxed = Held2{ cell: ref([7, 8]) }
+    boxed.cell.value[1] = 80
+    print("into the referent, not over it: {cell.value} {cells2[0].value} {boxed.cell.value}")
+
+    release(cell)
+    release(boxed.cell)
+    for c in cells2 {
+        release(c)
+    }
     release(col)
     release(opt)
     release(n)
