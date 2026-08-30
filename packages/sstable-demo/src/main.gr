@@ -1,0 +1,216 @@
+import sstable
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn key_of(n: i64) -> bytes {
+    // Zero-padded so byte order and numeric order agree, which is what makes
+    // the expectations below readable.
+    var s = "{n}"
+    while s.len() < 6 {
+        s = "0" + s
+    }
+    "key{s}".to_bytes()
+}
+
+fn val_of(n: i64) -> bytes {
+    "value-for-{n}".to_bytes()
+}
+
+fn main() / {io} {
+    var f = 0
+    let dir = "/tmp/grasm-sstable-demo"
+    let _m: () ! IoError = make_dir(dir)
+    let path = "{dir}/t.sst"
+
+    print("-- comparing keys, which decides the whole file's order")
+    say(f, "equal keys compare equal",
+        sstable.compare("abc".to_bytes(), "abc".to_bytes()) == 0)
+    say(f, "a shorter prefix sorts first",
+        sstable.compare("ab".to_bytes(), "abc".to_bytes()) < 0)
+    say(f, "byte value decides before length",
+        sstable.compare("b".to_bytes(), "abc".to_bytes()) > 0)
+    // The case text comparison gets wrong: a zero byte inside a key.
+    say(f, "a zero byte is an ordinary byte",
+        sstable.compare(bytes_of([1, 0, 1]), bytes_of([1, 0, 2])) < 0)
+    say(f, "and does not end the key",
+        sstable.compare(bytes_of([1, 0, 9]), bytes_of([1, 0])) > 0)
+    say(f, "a high byte is above a low one, unsigned",
+        sstable.compare(bytes_of([200]), bytes_of([100])) > 0)
+
+    print("-- building and reading a table of 1000 records")
+    var records: [Record] = []
+    for i in 0..1000 {
+        if i % 7 == 3 {
+            records.push(sstable.tombstone(key_of(i)))
+        } else {
+            records.push(sstable.value_record(key_of(i), val_of(i)))
+        }
+    }
+    match sstable.build(path, records) {
+        Ok(_u) -> say(f, "the table builds", true)
+        Err(_e) -> say(f, "the table builds", false)
+    }
+    say(f, "no half-built file is left behind", not file_exists("{path}.building"))
+
+    match sstable.open_table(path) {
+        Ok(t) -> {
+            say(f, "it opens and reports 1000 records", sstable.count_of(t) == 1000)
+
+            var found = 0
+            var tombs = 0
+            var wrong = 0
+            for i in 0..1000 {
+                match sstable.get(t, key_of(i)) {
+                    Ok(hit) -> {
+                        match hit {
+                            Some(r) -> {
+                                if r.deleted {
+                                    tombs = tombs + 1
+                                } else {
+                                    found = found + 1
+                                    if r.value.to_str() != val_of(i).to_str() {
+                                        wrong = wrong + 1
+                                    }
+                                }
+                            }
+                            None -> wrong = wrong + 1
+                        }
+                    }
+                    Err(_e) -> wrong = wrong + 1
+                }
+            }
+            say(f, "every key is found", found + tombs == 1000)
+            say(f, "every value is the right one", wrong == 0)
+            say(f, "the tombstones come back as deleted, not as missing", tombs == 143)
+
+            print("-- keys that are not there")
+            var absent_ok = true
+            for i in 1000..1100 {
+                match sstable.get(t, key_of(i)) {
+                    Ok(hit) -> {
+                        match hit {
+                            Some(_r) -> absent_ok = false
+                            None -> {}
+                        }
+                    }
+                    Err(_e) -> absent_ok = false
+                }
+            }
+            say(f, "100 absent keys are absent", absent_ok)
+            say(f, "a key below the first is absent", is_absent(t, "aaa".to_bytes()))
+            say(f, "a key above the last is absent", is_absent(t, "zzz".to_bytes()))
+            say(f, "an empty key is absent", is_absent(t, bytes_of([])))
+
+            print("-- reading every record back for compaction")
+            match sstable.entries(t) {
+                Ok(all) -> {
+                    say(f, "all 1000 come back", all.len() == 1000)
+                    var sorted = true
+                    for i in 1..all.len() {
+                        if sstable.compare(all[i - 1].key, all[i].key) >= 0 {
+                            sorted = false
+                        }
+                    }
+                    say(f, "and they are in order", sorted)
+                }
+                Err(_e) -> say(f, "all 1000 come back", false)
+            }
+        }
+        Err(_e) -> say(f, "it opens", false)
+    }
+
+    print("-- what a table refuses")
+    match sstable.build("{dir}/unsorted.sst",
+            [sstable.value_record("b".to_bytes(), "1".to_bytes()),
+             sstable.value_record("a".to_bytes(), "2".to_bytes())]) {
+        Ok(_u) -> say(f, "records out of order are refused", false)
+        Err(_e) -> say(f, "records out of order are refused", true)
+    }
+    match sstable.build("{dir}/dup.sst",
+            [sstable.value_record("a".to_bytes(), "1".to_bytes()),
+             sstable.value_record("a".to_bytes(), "2".to_bytes())]) {
+        Ok(_u) -> say(f, "a duplicate key is refused", false)
+        Err(_e) -> say(f, "a duplicate key is refused", true)
+    }
+    match write_bytes("{dir}/junk.sst", "this is not a table at all, not even close".to_bytes()) {
+        Ok(_u) -> {}
+        Err(_e) -> {}
+    }
+    say(f, "a file that is not a table is refused", not opens("{dir}/junk.sst"))
+    match write_bytes("{dir}/tiny.sst", bytes_of([1, 2, 3])) {
+        Ok(_u) -> {}
+        Err(_e) -> {}
+    }
+    say(f, "a file too short to hold a footer is refused", not opens("{dir}/tiny.sst"))
+
+    // Truncation: the exact thing a crash leaves behind.
+    match read_bytes(path) {
+        Ok(whole) -> {
+            match write_bytes("{dir}/cut.sst", whole.slice(0, whole.len() - 5)) {
+                Ok(_u) -> {}
+                Err(_e) -> {}
+            }
+            say(f, "a truncated table is refused", not opens("{dir}/cut.sst"))
+            // And one whose footer survived but whose body did not.
+            var half = whole.slice(0, 200).to_list()
+            for v in whole.slice(whole.len() - 40, 40).to_list() {
+                half.push(v)
+            }
+            match write_bytes("{dir}/short.sst", bytes_of(half)) {
+                Ok(_u) -> {}
+                Err(_e) -> {}
+            }
+            say(f, "a table whose footer outlives its body is refused",
+                not opens("{dir}/short.sst"))
+        }
+        Err(_e) -> say(f, "the table could be read for truncation tests", false)
+    }
+
+    print("-- an empty table, which a flush of nothing would produce")
+    let none: [Record] = []
+    match sstable.build("{dir}/empty.sst", none) {
+        Ok(_u) -> {
+            match sstable.open_table("{dir}/empty.sst") {
+                Ok(e) -> {
+                    say(f, "an empty table opens and holds nothing",
+                        sstable.count_of(e) == 0)
+                    say(f, "and finds nothing in it", is_absent(e, "a".to_bytes()))
+                }
+                Err(_e) -> say(f, "an empty table opens", false)
+            }
+        }
+        Err(_e) -> say(f, "an empty table builds", false)
+    }
+
+    if f == 0 {
+        print("all checks passed")
+    } else {
+        print("{f} check(s) failed")
+    }
+}
+
+fn is_absent(t: Table, k: bytes) -> bool / {io} {
+    match sstable.get(t, k) {
+        Ok(hit) -> {
+            match hit {
+                None -> true
+                Some(_r) -> false
+            }
+        }
+        Err(_e) -> false
+    }
+}
+
+fn opens(p: str) -> bool / {io} {
+    match sstable.open_table(p) {
+        Ok(_t) -> true
+        Err(_e) -> false
+    }
+}

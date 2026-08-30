@@ -1,0 +1,18 @@
+[package]
+name = "sstable"
+version = "1.0.0"
+
+# Reads and writes table files. Nothing else.
+capabilities = ["io"]
+
+[dependencies.varint]
+path = "../varint"
+version = "^1.0.0"
+
+[dependencies.crc32]
+path = "../crc32"
+version = "^1.0.0"
+
+[dependencies.bloom]
+path = "../bloom"
+version = "^1.0.0"

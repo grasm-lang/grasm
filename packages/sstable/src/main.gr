@@ -1,0 +1,406 @@
+// A sorted string table: keys in order, written once, never changed.
+//
+// The shape of the file is the whole design, and it is arranged so that a
+// point lookup touches four small ranges rather than the file:
+//
+//     [ records, sorted by key                        ]
+//     [ index: every 16th key, and where it starts    ]
+//     [ bloom filter over every key                   ]
+//     [ footer: where the two above are — 40 bytes    ]
+//
+// A lookup reads the footer (40 bytes, at a known offset from the end), then
+// the index and filter once when the table is opened, then **one** record. On
+// a four-megabyte table that is a few kilobytes instead of four megabytes, and
+// on a table larger than memory it is the difference between a lookup and an
+// impossibility.
+//
+// Everything here rests on `read_bytes_at`, `file_size`, `sync_file` and
+// `rename_file`, which the language did not have until a store needed them.
+
+import varint
+import crc32
+import bloom
+
+/// One record as it sits in a table.
+///
+/// `deleted` is a tombstone: a key written as *absent*. A store cannot delete
+/// from a file that is never modified, so a delete is a write, and the newest
+/// table wins. Compaction is where a tombstone finally goes away.
+type Record = {
+    key: bytes,
+    value: bytes,
+    deleted: bool,
+}
+
+/// An opened table: the small parts held in memory, the records left on disk.
+type Table = {
+    path: str,
+    index_keys: [bytes],
+    index_offsets: [i64],
+    filter: Filter,
+    data_end: i64,
+    count: i64,
+}
+
+type TableError =
+    | NotATable(path: str)
+    | Damaged(path: str, why: str)
+    | Io(path: str)
+
+fn footer_len() -> i64 { 40 }
+
+/// `GRASMSST`, so a file that is not a table is refused rather than parsed.
+fn magic() -> bytes {
+    "GRASMSST".to_bytes()
+}
+
+/// One index entry per sixteen records.
+///
+/// Sixteen is a trade with two ends. Fewer entries means a smaller index held
+/// in memory and a longer scan on disk; more means the opposite. Sixteen keeps
+/// the scan inside a single small read for records of any ordinary size.
+pub fn index_stride() -> i64 { 16 }
+
+/// Compare two keys the way the table is sorted: byte by byte, then by length.
+///
+/// This is not `<` on strings. Keys are `bytes` and may hold anything,
+/// including a zero byte, and a comparison that stopped at one would order a
+/// table wrongly in a way no test with text keys would ever show.
+pub fn compare(a: bytes, b: bytes) -> i64 {
+    let shorter = if a.len() < b.len() { a.len() } else { b.len() }
+    for i in 0..shorter {
+        if a.at(i) != b.at(i) {
+            return if a.at(i) < b.at(i) { 0 - 1 } else { 1 }
+        }
+    }
+    if a.len() == b.len() {
+        return 0
+    }
+    if a.len() < b.len() { 0 - 1 } else { 1 }
+}
+
+fn put_bytes(inout out: [i64], b: bytes) {
+    varint.put(out, b.len())
+    for v in b.to_list() {
+        out.push(v)
+    }
+}
+
+fn put_u64(inout out: [i64], v: i64) {
+    for i in 0..8 {
+        out.push(v.ushr(i * 8).bit_and(255))
+    }
+}
+
+fn get_u64(b: bytes, at: i64) -> i64 {
+    var v = 0
+    for i in 0..8 {
+        v = v.bit_or(b.at(at + i).shl(i * 8))
+    }
+    v
+}
+
+/// Write a table, then make it visible under its real name.
+///
+/// The file is built beside its destination, synced, and renamed over. That
+/// order is the whole of crash safety here: a reader either sees the previous
+/// file or the whole new one, and never a half-written table, because a rename
+/// is atomic and a write is not.
+///
+/// Records must arrive sorted and unique. That is the caller's job — a
+/// memtable is already a sorted map — and it is checked, because a table built
+/// out of order is a table whose binary search silently returns the wrong
+/// answer for the rest of its life.
+pub fn build(path: str, records: [Record]) -> () ! TableError / {io} {
+    var data: [i64] = []
+    var index_keys: [bytes] = []
+    var index_offsets: [i64] = []
+    var filter = bloom.new_filter(if records.len() < 1 { 1 } else { records.len() })
+
+    var previous = bytes_of([])
+    var first = true
+    var n = 0
+    for r in records {
+        if not first and compare(previous, r.key) >= 0 {
+            fail(Damaged(path, "records are not sorted and unique"))
+        }
+        previous = r.key
+        first = false
+
+        if n % index_stride() == 0 {
+            index_keys.push(r.key)
+            index_offsets.push(data.len())
+        }
+        data.push(if r.deleted { 2 } else { 1 })
+        put_bytes(data, r.key)
+        put_bytes(data, r.value)
+        bloom.add(filter, r.key)
+        n = n + 1
+    }
+
+    let data_end = data.len()
+    var index: [i64] = []
+    varint.put(index, index_keys.len())
+    for i in 0..index_keys.len() {
+        put_bytes(index, index_keys[i])
+        varint.put(index, index_offsets[i])
+    }
+    let filter_bytes = bloom.to_bytes(filter)
+
+    var whole = data
+    for v in index {
+        whole.push(v)
+    }
+    for v in filter_bytes.to_list() {
+        whole.push(v)
+    }
+    // The footer says where everything is, and carries a checksum of itself so
+    // a file truncated to almost the right length is caught rather than read.
+    var footer: [i64] = []
+    put_u64(footer, data_end)
+    put_u64(footer, index.len())
+    put_u64(footer, filter_bytes.len())
+    put_u64(footer, n)
+    for v in magic().to_list() {
+        whole.push(v)
+    }
+    for v in footer {
+        whole.push(v)
+    }
+
+    let scratch = "{path}.building"
+    match write_bytes(scratch, bytes_of(whole)) {
+        Ok(_u) -> {}
+        Err(_e) -> fail(Io(scratch))
+    }
+    match sync_file(scratch) {
+        Ok(_u) -> {}
+        Err(_e) -> fail(Io(scratch))
+    }
+    match rename_file(scratch, path) {
+        Ok(_u) -> {}
+        Err(_e) -> fail(Io(path))
+    }
+}
+
+/// Open a table: read the footer, then the index and the filter.
+///
+/// The records are not read. That is the point.
+pub fn open_table(path: str) -> Table ! TableError / {io} {
+    let size = match file_size(path) {
+        Ok(n) -> n
+        Err(_e) -> fail(Io(path))
+    }
+    if size < footer_len() {
+        fail(NotATable(path))
+    }
+    let tail = match read_bytes_at(path, size - footer_len(), footer_len()) {
+        Ok(b) -> b
+        Err(_e) -> fail(Io(path))
+    }
+    if tail.len() != footer_len() {
+        fail(Damaged(path, "the footer is short"))
+    }
+    for i in 0..8 {
+        if tail.at(i) != magic().at(i) {
+            fail(NotATable(path))
+        }
+    }
+    let data_end = get_u64(tail, 8)
+    let index_len = get_u64(tail, 16)
+    let filter_len = get_u64(tail, 24)
+    let count = get_u64(tail, 32)
+    if data_end < 0 or index_len < 0 or filter_len < 0 or count < 0 {
+        fail(Damaged(path, "the footer holds a negative length"))
+    }
+    if data_end + index_len + filter_len + footer_len() != size {
+        fail(Damaged(path, "the footer's lengths do not add up to the file"))
+    }
+
+    let index_bytes = match read_bytes_at(path, data_end, index_len) {
+        Ok(b) -> b
+        Err(_e) -> fail(Io(path))
+    }
+    let filter_bytes = match read_bytes_at(path, data_end + index_len, filter_len) {
+        Ok(b) -> b
+        Err(_e) -> fail(Io(path))
+    }
+    let filter = match bloom.from_bytes(filter_bytes) {
+        Some(fl) -> fl
+        None -> fail(Damaged(path, "the filter will not decode"))
+    }
+
+    var keys: [bytes] = []
+    var offsets: [i64] = []
+    var at = 0
+    let entries = match varint.get_after(index_bytes, at) {
+        Some(p) -> {
+            at = p.1
+            p.0
+        }
+        None -> fail(Damaged(path, "the index has no count"))
+    }
+    for _i in 0..entries {
+        let klen = match varint.get_after(index_bytes, at) {
+            Some(p) -> {
+                at = p.1
+                p.0
+            }
+            None -> fail(Damaged(path, "the index ends inside an entry"))
+        }
+        if at + klen > index_bytes.len() {
+            fail(Damaged(path, "an index key runs past the index"))
+        }
+        keys.push(index_bytes.slice(at, klen))
+        at = at + klen
+        let off = match varint.get_after(index_bytes, at) {
+            Some(p) -> {
+                at = p.1
+                p.0
+            }
+            None -> fail(Damaged(path, "an index entry has no offset"))
+        }
+        offsets.push(off)
+    }
+
+    Table{
+        path: path,
+        index_keys: keys,
+        index_offsets: offsets,
+        filter: filter,
+        data_end: data_end,
+        count: count,
+    }
+}
+
+/// How many records the table holds, from the footer rather than by counting.
+pub fn count_of(t: Table) -> i64 {
+    t.count
+}
+
+/// Look one key up.
+///
+/// Three refusals before any disk is touched for records: the filter, then the
+/// index, then a single ranged read of one block. `None` means the table does
+/// not mention the key at all; a `Record` with `deleted` set means the table
+/// says it was removed, which is a different answer and the caller must not
+/// confuse them.
+pub fn get(t: Table, key: bytes) -> Option[Record] ! TableError / {io} {
+    if not bloom.might_contain(t.filter, key) {
+        return None
+    }
+    if t.index_keys.len() == 0 {
+        return None
+    }
+    // The last index entry whose key is <= the one wanted.
+    var lo = 0
+    var hi = t.index_keys.len() - 1
+    if compare(key, t.index_keys[0]) < 0 {
+        return None
+    }
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2
+        if compare(t.index_keys[mid], key) <= 0 {
+            lo = mid
+        } else {
+            hi = mid - 1
+        }
+    }
+    let from = t.index_offsets[lo]
+    let upto = if lo + 1 < t.index_offsets.len() {
+        t.index_offsets[lo + 1]
+    } else {
+        t.data_end
+    }
+    let block = match read_bytes_at(t.path, from, upto - from) {
+        Ok(b) -> b
+        Err(_e) -> fail(Io(t.path))
+    }
+    scan_block(t.path, block, key)
+}
+
+/// Walk one block looking for a key. The block holds at most `index_stride`
+/// records and they are sorted, so the walk stops as soon as it passes.
+fn scan_block(path: str, block: bytes, key: bytes) -> Option[Record] ! TableError {
+    var at = 0
+    while at < block.len() {
+        let kind = block.at(at)
+        at = at + 1
+        let rec = match read_record(path, block, at, kind) {
+            Ok(r) -> r
+            Err(e) -> fail(e)
+        }
+        let ordering = compare(rec.0.key, key)
+        if ordering == 0 {
+            return Some(rec.0)
+        }
+        if ordering > 0 {
+            return None
+        }
+        at = rec.1
+    }
+    None
+}
+
+fn read_record(path: str, b: bytes, at: i64, kind: i64) -> (Record, i64) ! TableError {
+    var i = at
+    let klen = match varint.get_after(b, i) {
+        Some(p) -> {
+            i = p.1
+            p.0
+        }
+        None -> fail(Damaged(path, "a record has no key length"))
+    }
+    if i + klen > b.len() {
+        fail(Damaged(path, "a key runs past the block"))
+    }
+    let k = b.slice(i, klen)
+    i = i + klen
+    let vlen = match varint.get_after(b, i) {
+        Some(p) -> {
+            i = p.1
+            p.0
+        }
+        None -> fail(Damaged(path, "a record has no value length"))
+    }
+    if i + vlen > b.len() {
+        fail(Damaged(path, "a value runs past the block"))
+    }
+    let v = b.slice(i, vlen)
+    (Record{ key: k, value: v, deleted: kind == 2 }, i + vlen)
+}
+
+/// Every record, in order.
+///
+/// This *does* read the whole data section, and that is the right shape for
+/// its one caller: compaction merges tables end to end and would read every
+/// record anyway. A point lookup must never use it.
+pub fn entries(t: Table) -> [Record] ! TableError / {io} {
+    let data = match read_bytes_at(t.path, 0, t.data_end) {
+        Ok(b) -> b
+        Err(_e) -> fail(Io(t.path))
+    }
+    var out: [Record] = []
+    var at = 0
+    while at < data.len() {
+        let kind = data.at(at)
+        at = at + 1
+        let rec = match read_record(t.path, data, at, kind) {
+            Ok(r) -> r
+            Err(e) -> fail(e)
+        }
+        out.push(rec.0)
+        at = rec.1
+    }
+    out
+}
+
+/// A record that carries a value.
+pub fn value_record(key: bytes, value: bytes) -> Record {
+    Record{ key: key, value: value, deleted: false }
+}
+
+/// A record that says the key is gone.
+pub fn tombstone(key: bytes) -> Record {
+    Record{ key: key, value: bytes_of([]), deleted: true }
+}

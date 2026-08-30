@@ -1,0 +1,13 @@
+[package]
+name = "wal"
+version = "1.0.0"
+
+capabilities = ["io"]
+
+[dependencies.varint]
+path = "../varint"
+version = "^1.0.0"
+
+[dependencies.crc32]
+path = "../crc32"
+version = "^1.0.0"

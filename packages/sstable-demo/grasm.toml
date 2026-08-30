@@ -1,0 +1,8 @@
+[package]
+name = "sstable_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.sstable]
+path = "../sstable"
+version = "^1.0.0"

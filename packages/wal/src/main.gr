@@ -1,0 +1,230 @@
+// A write-ahead log: what makes an acknowledged write survive a power cut.
+//
+// A store keeps its recent writes in memory, because that is what makes it
+// fast. Memory does not survive anything. So every write goes to the end of a
+// file *first*, and only then into memory, and a store that starts up replays
+// the file to rebuild what it had.
+//
+// **The hard part is the end of the file.** A crash lands in the middle of a
+// write, so the last record is routinely half there. It is not corrupt in an
+// interesting way — it is simply incomplete — and a reader must stop at it
+// rather than hand the store a key with a truncated value. Length alone will
+// not do: a torn write can leave a plausible length followed by nothing. So
+// every record carries a checksum of itself, and replay stops at the first
+// record that does not check out. Everything before it is intact; everything
+// after it was never acknowledged.
+//
+// A record:
+//
+//     crc32 (4, little-endian) | length (varint) | payload
+//     payload = kind(1) key_len(varint) key value_len(varint) value
+//
+// The checksum covers the payload, not the length, so a damaged length is
+// caught by the payload failing to be that long.
+
+import varint
+import crc32
+
+type Entry = {
+    key: bytes,
+    value: bytes,
+    deleted: bool,
+}
+
+type WalError =
+    | Io(path: str)
+
+/// Append one write, and optionally make it durable.
+///
+/// `durable` is the caller's decision and it is the whole performance story of
+/// a store: syncing every write is slow and correct, syncing none is fast and
+/// loses acknowledged data. A store that offers both must be honest about
+/// which one it is doing, so this takes the flag rather than choosing.
+pub fn append(path: str, e: Entry, durable: bool) -> () ! WalError / {io} {
+    var payload: [i64] = []
+    payload.push(if e.deleted { 2 } else { 1 })
+    varint.put(payload, e.key.len())
+    for v in e.key.to_list() {
+        payload.push(v)
+    }
+    varint.put(payload, e.value.len())
+    for v in e.value.to_list() {
+        payload.push(v)
+    }
+    let body = bytes_of(payload)
+
+    var record = crc32.to_bytes(crc32.of(body)).to_list()
+    varint.put(record, body.len())
+    for v in body.to_list() {
+        record.push(v)
+    }
+
+    match append_bytes(path, bytes_of(record)) {
+        Ok(_u) -> {}
+        Err(_e) -> fail(Io(path))
+    }
+    if durable {
+        match sync_file(path) {
+            Ok(_u) -> {}
+            Err(_e) -> fail(Io(path))
+        }
+    }
+}
+
+/// What a replay found.
+///
+/// `torn` says the log ended in the middle of a record. That is the ordinary
+/// outcome of a crash and not an error — the entries before it are exactly the
+/// writes that were acknowledged — but a store should know, because it means
+/// the file has a tail that must be dropped before anything more is appended.
+type Replayed = {
+    entries: [Entry],
+    torn: bool,
+    good_length: i64,
+}
+
+/// Read a log back.
+///
+/// Stops at the first record that does not check out and reports where. A
+/// missing file replays as empty, because a store opening for the first time
+/// has no log and that is not a failure.
+pub fn replay(path: str) -> Replayed ! WalError / {io} {
+    if not file_exists(path) {
+        let none: [Entry] = []
+        return Replayed{ entries: none, torn: false, good_length: 0 }
+    }
+    let all = match read_bytes(path) {
+        Ok(b) -> b
+        Err(_e) -> fail(Io(path))
+    }
+    var out: [Entry] = []
+    var at = 0
+    var torn = false
+    var good = 0
+    while at < all.len() {
+        if at + 4 > all.len() {
+            torn = true
+            at = all.len()
+        } else {
+            let want_crc = crc32.from_bytes(all, at)
+            match varint.get_after(all, at + 4) {
+                Some(p) -> {
+                    let length = p.0
+                    let body_at = p.1
+                    if length < 1 or body_at + length > all.len() {
+                        torn = true
+                        at = all.len()
+                    } else {
+                        let body = all.slice(body_at, length)
+                        if crc32.of(body) != want_crc {
+                            torn = true
+                            at = all.len()
+                        } else {
+                            match decode(body) {
+                                Some(e) -> {
+                                    out.push(e)
+                                    at = body_at + length
+                                    good = at
+                                }
+                                None -> {
+                                    torn = true
+                                    at = all.len()
+                                }
+                            }
+                        }
+                    }
+                }
+                None -> {
+                    torn = true
+                    at = all.len()
+                }
+            }
+        }
+    }
+    Replayed{ entries: out, torn: torn, good_length: good }
+}
+
+fn decode(body: bytes) -> Option[Entry] {
+    if body.len() < 1 {
+        return None
+    }
+    let kind = body.at(0)
+    if kind != 1 and kind != 2 {
+        return None
+    }
+    var at = 1
+    let klen = match varint.get_after(body, at) {
+        Some(p) -> {
+            at = p.1
+            p.0
+        }
+        None -> return None
+    }
+    if at + klen > body.len() {
+        return None
+    }
+    let k = body.slice(at, klen)
+    at = at + klen
+    let vlen = match varint.get_after(body, at) {
+        Some(p) -> {
+            at = p.1
+            p.0
+        }
+        None -> return None
+    }
+    if at + vlen != body.len() {
+        // Not "at most": a record with bytes left over is not a record this
+        // wrote, and reading it would be guessing.
+        return None
+    }
+    Some(Entry{ key: k, value: body.slice(at, vlen), deleted: kind == 2 })
+}
+
+/// Cut a torn tail off, so the next append starts from a whole record.
+///
+/// Grasm has no truncate, so this rewrites the good prefix beside the log and
+/// renames it over — the same trick the tables use, and atomic for the same
+/// reason. It is the expensive path and it runs once, at startup, after a
+/// crash.
+pub fn truncate_to(path: str, length: i64) -> () ! WalError / {io} {
+    let all = match read_bytes(path) {
+        Ok(b) -> b
+        Err(_e) -> fail(Io(path))
+    }
+    if length >= all.len() {
+        return
+    }
+    let scratch = "{path}.trimming"
+    match write_bytes(scratch, all.slice(0, length)) {
+        Ok(_u) -> {}
+        Err(_e) -> fail(Io(scratch))
+    }
+    match sync_file(scratch) {
+        Ok(_u) -> {}
+        Err(_e) -> fail(Io(scratch))
+    }
+    match rename_file(scratch, path) {
+        Ok(_u) -> {}
+        Err(_e) -> fail(Io(path))
+    }
+}
+
+/// Start a fresh log, after its contents have been written to a table.
+pub fn reset(path: str) -> () ! WalError / {io} {
+    match write_bytes(path, bytes_of([])) {
+        Ok(_u) -> {}
+        Err(_e) -> fail(Io(path))
+    }
+    match sync_file(path) {
+        Ok(_u) -> {}
+        Err(_e) -> fail(Io(path))
+    }
+}
+
+pub fn put_entry(key: bytes, value: bytes) -> Entry {
+    Entry{ key: key, value: value, deleted: false }
+}
+
+pub fn delete_entry(key: bytes) -> Entry {
+    Entry{ key: key, value: bytes_of([]), deleted: true }
+}

@@ -1,0 +1,190 @@
+import wal
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+    let dir = "/tmp/grasm-wal-demo"
+    let _m: () ! IoError = make_dir(dir)
+    let log = "{dir}/w.log"
+
+    print("-- a log written and replayed")
+    match wal.reset(log) {
+        Ok(_u) -> {}
+        Err(_e) -> print("    could not start a log")
+    }
+    for i in 0..200 {
+        let e = if i % 5 == 2 {
+            wal.delete_entry("k{i}".to_bytes())
+        } else {
+            wal.put_entry("k{i}".to_bytes(), "v{i}".to_bytes())
+        }
+        match wal.append(log, e, false) {
+            Ok(_u) -> {}
+            Err(_e) -> print("    append failed at {i}")
+        }
+    }
+    match wal.replay(log) {
+        Ok(r) -> {
+            say(f, "200 records replay", r.entries.len() == 200)
+            say(f, "and the log is not torn", not r.torn)
+            var right = true
+            var deletes = 0
+            for i in 0..r.entries.len() {
+                let e = r.entries[i]
+                if e.key.to_str() != "k{i}" {
+                    right = false
+                }
+                if e.deleted {
+                    deletes = deletes + 1
+                } else if e.value.to_str() != "v{i}" {
+                    right = false
+                }
+            }
+            say(f, "in order, with the right values", right)
+            say(f, "and the deletes come back as deletes", deletes == 40)
+            say(f, "the good length is the whole file",
+                r.good_length == (file_size(log) ?? 0 - 1))
+        }
+        Err(_e) -> say(f, "the log replays", false)
+    }
+
+    print("-- a log torn by a crash, at every byte of the last record")
+    // The real failure mode: the process died partway through a write. Every
+    // possible cut of the last record must replay the 199 before it and no
+    // more, and must say the tail is torn.
+    match read_bytes(log) {
+        Ok(whole) -> {
+            match wal.replay(log) {
+                Ok(full) -> {
+                    // Find where the last record starts by replaying a prefix.
+                    var all_good = true
+                    var reported_torn = true
+                    var cut_count = 0
+                    var cut = whole.len() - 1
+                    while cut > whole.len() - 12 and cut > 0 {
+                        match write_bytes("{dir}/torn.log", whole.slice(0, cut)) {
+                            Ok(_u) -> {}
+                            Err(_e) -> {}
+                        }
+                        match wal.replay("{dir}/torn.log") {
+                            Ok(t) -> {
+                                cut_count = cut_count + 1
+                                if t.entries.len() != full.entries.len() - 1 {
+                                    all_good = false
+                                }
+                                if not t.torn {
+                                    reported_torn = false
+                                }
+                            }
+                            Err(_e) -> all_good = false
+                        }
+                        cut = cut - 1
+                    }
+                    say(f, "{cut_count} truncations each replay exactly 199 records", all_good)
+                    say(f, "and every one of them says the tail is torn", reported_torn)
+                }
+                Err(_e) -> say(f, "the full log replays", false)
+            }
+
+            print("-- a log whose bytes were damaged rather than cut")
+            var bent = whole.to_list()
+            // Flip a byte inside the last record's payload.
+            bent[whole.len() - 3] = bent[whole.len() - 3].bit_xor(255)
+            match write_bytes("{dir}/bent.log", bytes_of(bent)) {
+                Ok(_u) -> {}
+                Err(_e) -> {}
+            }
+            match wal.replay("{dir}/bent.log") {
+                Ok(b) -> {
+                    say(f, "a flipped byte stops the replay", b.torn)
+                    say(f, "and the records before it survive", b.entries.len() == 199)
+                }
+                Err(_e) -> say(f, "a damaged log replays what it can", false)
+            }
+
+            print("-- cutting the tail off, so appending can continue")
+            match write_bytes("{dir}/fix.log", whole.slice(0, whole.len() - 4)) {
+                Ok(_u) -> {}
+                Err(_e) -> {}
+            }
+            match wal.replay("{dir}/fix.log") {
+                Ok(before) -> {
+                    match wal.truncate_to("{dir}/fix.log", before.good_length) {
+                        Ok(_u) -> {
+                            match wal.replay("{dir}/fix.log") {
+                                Ok(after) -> {
+                                    say(f, "after trimming, the log is whole", not after.torn)
+                                    say(f, "and holds what it held before",
+                                        after.entries.len() == before.entries.len())
+                                    // And an append after trimming is readable.
+                                    match wal.append("{dir}/fix.log",
+                                            wal.put_entry("new".to_bytes(), "one".to_bytes()), true) {
+                                        Ok(_u) -> {
+                                            match wal.replay("{dir}/fix.log") {
+                                                Ok(more) -> say(f, "a record appended after the trim replays",
+                                                    not more.torn
+                                                    and more.entries.len() == after.entries.len() + 1)
+                                                Err(_e) -> say(f, "appending after a trim works", false)
+                                            }
+                                        }
+                                        Err(_e) -> say(f, "appending after a trim works", false)
+                                    }
+                                }
+                                Err(_e) -> say(f, "the trimmed log replays", false)
+                            }
+                        }
+                        Err(_e) -> say(f, "the log trims", false)
+                    }
+                }
+                Err(_e) -> say(f, "the cut log replays", false)
+            }
+        }
+        Err(_e) -> say(f, "the log could be read", false)
+    }
+
+    print("-- edges")
+    match wal.replay("{dir}/never-existed.log") {
+        Ok(r) -> say(f, "a log that was never written replays as empty",
+            r.entries.len() == 0 and not r.torn)
+        Err(_e) -> say(f, "a missing log replays as empty", false)
+    }
+    match wal.reset("{dir}/e.log") {
+        Ok(_u) -> {
+            match wal.replay("{dir}/e.log") {
+                Ok(r) -> say(f, "an empty log replays as empty", r.entries.len() == 0)
+                Err(_e) -> say(f, "an empty log replays", false)
+            }
+        }
+        Err(_e) -> say(f, "a log resets", false)
+    }
+    match wal.reset("{dir}/big.log") {
+        Ok(_u) -> {
+            let big = "x".repeat(100000)
+            match wal.append("{dir}/big.log", wal.put_entry("k".to_bytes(), big.to_bytes()), false) {
+                Ok(_u2) -> {
+                    match wal.replay("{dir}/big.log") {
+                        Ok(r) -> say(f, "a 100 KB value round-trips",
+                            r.entries.len() == 1 and r.entries[0].value.len() == 100000)
+                        Err(_e) -> say(f, "a large value replays", false)
+                    }
+                }
+                Err(_e) -> say(f, "a large value appends", false)
+            }
+        }
+        Err(_e) -> say(f, "a log resets", false)
+    }
+
+    if f == 0 {
+        print("all checks passed")
+    } else {
+        print("{f} check(s) failed")
+    }
+}

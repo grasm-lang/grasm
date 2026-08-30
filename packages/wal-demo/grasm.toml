@@ -1,0 +1,8 @@
+[package]
+name = "wal_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.wal]
+path = "../wal"
+version = "^1.0.0"
