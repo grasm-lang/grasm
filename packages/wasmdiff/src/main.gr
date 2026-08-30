@@ -1,0 +1,75 @@
+// The Grasm half of `scripts/wasm_diff.sh`.
+//
+// Twenty hand-picked cases prove twenty things somebody thought of. The
+// instructions that go wrong are the ones where a 64-bit host's habits leak
+// in: a shift by more than the width, a division that truncates the other way,
+// the most negative number divided by minus one, a remainder whose sign
+// follows the wrong operand. Those turn up in random expressions and rarely in
+// chosen ones.
+//
+// So this reads modules and arguments from a file, runs them, and prints what
+// each returned. `scripts/wasm_diff.sh` runs the same modules through the
+// WebAssembly engine in Node and compares — which is the only comparison that
+// settles what an instruction means.
+//
+// With no arguments it prints nothing and exits 0, which is what the corpus
+// gates run it as.
+
+import wasmvm
+import bytes_codec
+
+fn main() / {io} {
+    let argv = args()
+    if argv.len() == 0 {
+        return
+    }
+    let text = match read_file(argv[0]) {
+        Ok(t) -> t
+        Err(_e) -> panic("cannot read {argv[0]}")
+    }
+    for line in text.lines() {
+        if line.len() > 0 {
+            let parts = line.split(" ")
+            let module = match bytes_codec.decode_hex(parts[0]) {
+                Some(b) -> b
+                None -> bytes_of([])
+            }
+            var argv2: [i64] = []
+            for i in 2..parts.len() {
+                argv2.push(to_int(parts[i]))
+            }
+            match wasmvm.parse(module) {
+                Ok(m) -> {
+                    var s = wasmvm.instantiate(m, 5000000)
+                    match wasmvm.call(m, s, parts[1], argv2) {
+                        Ok(v) -> print("{v.bit_and(4294967295)}")
+                        Err(_e) -> print("TRAP")
+                    }
+                }
+                Err(_e) -> print("REFUSED")
+            }
+        }
+    }
+}
+
+fn to_int(s: str) -> i64 {
+    var n = 0
+    var negative = false
+    var i = 0
+    if s.len() > 0 and s.substr(0, 1) == "-" {
+        negative = true
+        i = 1
+    }
+    while i < s.len() {
+        let c = s.substr(i, 1).to_bytes().at(0)
+        if c >= 48 and c <= 57 {
+            n = n * 10 + (c - 48)
+        }
+        i = i + 1
+    }
+    if negative {
+        0 - n
+    } else {
+        n
+    }
+}

@@ -1,0 +1,108 @@
+import wasmvm
+import bytes_codec
+
+fn unhex(s: str) -> bytes {
+    match bytes_codec.decode_hex(s) {
+        Some(b) -> b
+        None -> panic("not hex")
+    }
+}
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+/// A module holding `add(a, b)` and `fact(n)`, assembled by hand.
+fn module_bytes() -> bytes {
+    unhex("0061736d01000000010c0260027f7f017f60017f017f0303020001070e0203616464000004666163740001" +
+          "0a31020700200020016a0b2701017f410121010240034020004100460d01200120006c2101200041016b21000c000b0b20010b")
+}
+
+fn calls(name: str, argv: [i64]) -> Option[i64] {
+    match wasmvm.parse(module_bytes()) {
+        Ok(m) -> {
+            var s = wasmvm.instantiate(m, 10000000)
+            match wasmvm.call(m, s, name, argv) {
+                Ok(v) -> Some(v)
+                Err(_e) -> None
+            }
+        }
+        Err(_e) -> None
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+
+    print("-- parsing a module")
+    match wasmvm.parse(module_bytes()) {
+        Ok(m) -> {
+            let ex = wasmvm.exports_of(m)
+            say(f, "two exports", ex.len() == 2)
+            say(f, "named add and fact", ex[0] == "add" and ex[1] == "fact")
+        }
+        Err(_e) -> say(f, "the module parses", false)
+    }
+
+    print("-- calling it")
+    say(f, "add(2, 3)", calls("add", [2, 3]) ?? 0 - 1 == 5)
+    say(f, "add(0, 0)", calls("add", [0, 0]) ?? 0 - 1 == 0)
+    // i32 wraps rather than growing, which is the thing a 64-bit host gets
+    // wrong by doing nothing.
+    say(f, "add wraps at 32 bits", calls("add", [4294967295, 1]) ?? 0 - 1 == 0)
+    say(f, "add(2147483647, 1) wraps to the sign bit",
+        calls("add", [2147483647, 1]) ?? 0 - 1 == 2147483648)
+
+    print("-- a loop with block, loop and br_if")
+    say(f, "fact(0)", calls("fact", [0]) ?? 0 - 1 == 1)
+    say(f, "fact(1)", calls("fact", [1]) ?? 0 - 1 == 1)
+    say(f, "fact(5)", calls("fact", [5]) ?? 0 - 1 == 120)
+    say(f, "fact(10)", calls("fact", [10]) ?? 0 - 1 == 3628800)
+    // 13! overflows 32 bits, and wasm's answer is the wrapped one.
+    say(f, "fact(13) wraps, as i32 must", calls("fact", [13]) ?? 0 - 1 == 1932053504)
+
+    print("-- what it refuses")
+    say(f, "an empty buffer", parse_fails(bytes_of([])))
+    say(f, "a file that is not wasm", parse_fails(unhex("deadbeef00000000")))
+    say(f, "a version it does not know",
+        parse_fails(unhex("0061736d09000000")))
+    say(f, "a truncated module", parse_fails(unhex("0061736d01000000010c02")))
+    say(f, "a call to an export that is not there", calls("nope", []) == None)
+
+    print("-- fuel, so a module cannot run for ever")
+    match wasmvm.parse(module_bytes()) {
+        Ok(m) -> {
+            var s = wasmvm.instantiate(m, 20)
+            match wasmvm.call(m, s, "fact", [1000000]) {
+                Ok(_v) -> say(f, "a long loop runs out of fuel", false)
+                Err(_e) -> say(f, "a long loop runs out of fuel", true)
+            }
+            // And the same module with enough fuel still works, so the limit
+            // is a limit rather than a break.
+            var s2 = wasmvm.instantiate(m, 10000000)
+            match wasmvm.call(m, s2, "fact", [10]) {
+                Ok(v) -> say(f, "and with enough fuel it finishes", v == 3628800)
+                Err(_e) -> say(f, "and with enough fuel it finishes", false)
+            }
+        }
+        Err(_e) -> say(f, "the module parses for the fuel test", false)
+    }
+
+    if f == 0 {
+        print("all checks passed")
+    } else {
+        print("{f} check(s) failed")
+    }
+}
+
+fn parse_fails(b: bytes) -> bool {
+    match wasmvm.parse(b) {
+        Ok(_m) -> false
+        Err(_e) -> true
+    }
+}

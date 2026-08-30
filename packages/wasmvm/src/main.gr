@@ -1,0 +1,738 @@
+// A WebAssembly interpreter, written in Grasm, which compiles to WebAssembly.
+//
+// The circularity is the interesting part but not the reason it is here. A
+// wasm module is a compact binary format with a stack machine inside it, and
+// getting it right means agreeing with a specification on things a language
+// usually leaves to its host: how `i32` wraps, what shifting by more than the
+// width does, which way division truncates, and what happens when it is by
+// zero. Every one of those is a place a language's own habits leak in.
+//
+// **Grasm has one integer type and wasm has four.** So `i32` is an `i64` with
+// every result masked back to 32 bits, and *signed* operations have to sign
+// extend first — the difference between `i32.div_s` and `i32.div_u` is not the
+// division but which 64-bit number the 32 bits are read as.
+//
+// The subset is what a compiler emits for straight-line and looping code:
+// integers, locals, globals, memory, calls, and the three control constructs.
+// Floats and tables are not here, and the file says so rather than pretending.
+
+
+
+type WasmValue =
+    | I32(v: i64)
+    | I64v(v: i64)
+
+type FuncType = {
+    params: [i64],
+    results: [i64],
+}
+
+type WasmFunc = {
+    type_index: i64,
+    locals: [i64],
+    body: bytes,
+}
+
+type Module = {
+    types: [FuncType],
+    funcs: [WasmFunc],
+    exports: [str],
+    export_funcs: [i64],
+    memory_pages: i64,
+    globals: [i64],
+    global_mutable: [bool],
+    data_offsets: [i64],
+    data_bytes: [bytes],
+}
+
+type WasmError =
+    | BadMagic
+    | BadVersion(v: i64)
+    | Truncated(at: i64)
+    | BadSection(id: i64)
+    | Unsupported(what: str)
+    | Trap(why: str)
+    | NoSuchExport(name: str)
+    | StackUnderflow(at: i64)
+    | OutOfFuel(limit: i64)
+
+fn mask32(v: i64) -> i64 {
+    v.bit_and(4294967295)
+}
+
+/// Read 32 bits as a signed number.
+///
+/// This is the whole difference between the signed and unsigned instructions,
+/// and getting it wrong gives a program that works until a number passes two
+/// billion.
+fn signed32(v: i64) -> i64 {
+    let m = mask32(v)
+    if m >= 2147483648 {
+        return m - 4294967296
+    }
+    m
+}
+
+type Cursor2 = {
+    data: bytes,
+    at: i64,
+}
+
+fn byte_at(inout c: Cursor2) -> i64 ! WasmError {
+    if c.at >= c.data.len() {
+        fail(Truncated(c.at))
+    }
+    let v = c.data.at(c.at)
+    c.at = c.at + 1
+    v
+}
+
+/// Unsigned LEB128, as wasm writes lengths and indices.
+fn uleb(inout c: Cursor2) -> i64 ! WasmError {
+    var value = 0
+    var shift = 0
+    var width = 0
+    var going = true
+    while going {
+        if width >= 10 {
+            fail(Truncated(c.at))
+        }
+        let b = try byte_at(c)
+        value = value.bit_or(b.bit_and(127).shl(shift))
+        shift = shift + 7
+        width = width + 1
+        if b < 128 {
+            going = false
+        }
+    }
+    value
+}
+
+/// Signed LEB128, which is a *different* encoding and not a variant of the
+/// one above: the last byte's sign bit extends into every higher bit.
+fn sleb(inout c: Cursor2) -> i64 ! WasmError {
+    var value = 0
+    var shift = 0
+    var width = 0
+    var byte = 0
+    var going = true
+    while going {
+        if width >= 10 {
+            fail(Truncated(c.at))
+        }
+        byte = try byte_at(c)
+        value = value.bit_or(byte.bit_and(127).shl(shift))
+        shift = shift + 7
+        width = width + 1
+        if byte < 128 {
+            going = false
+        }
+    }
+    if shift < 64 and byte.bit_and(64) != 0 {
+        value = value.bit_or((0 - 1).shl(shift))
+    }
+    value
+}
+
+fn skip(inout c: Cursor2, n: i64) -> () ! WasmError {
+    if c.at + n > c.data.len() {
+        fail(Truncated(c.at))
+    }
+    c.at = c.at + n
+}
+
+/// Parse a module.
+pub fn parse(data: bytes) -> Module ! WasmError {
+    var c = Cursor2{ data: data, at: 0 }
+    if data.len() < 8 {
+        fail(BadMagic)
+    }
+    if data.at(0) != 0 or data.at(1) != 97 or data.at(2) != 115 or data.at(3) != 109 {
+        fail(BadMagic)
+    }
+    let version = data.at(4).bit_or(data.at(5).shl(8))
+        .bit_or(data.at(6).shl(16)).bit_or(data.at(7).shl(24))
+    if version != 1 {
+        fail(BadVersion(version))
+    }
+    c.at = 8
+
+    var types: [FuncType] = []
+    var type_indices: [i64] = []
+    var funcs: [WasmFunc] = []
+    var exports: [str] = []
+    var export_funcs: [i64] = []
+    var pages = 0
+    var globals: [i64] = []
+    var mutables: [bool] = []
+    var data_offsets: [i64] = []
+    var data_bytes: [bytes] = []
+
+    while c.at < data.len() {
+        let id = try byte_at(c)
+        let size = try uleb(c)
+        let section_end = c.at + size
+        if section_end > data.len() {
+            fail(Truncated(c.at))
+        }
+        if id == 1 {
+            let n = try uleb(c)
+            for _i in 0..n {
+                let form = try byte_at(c)
+                if form != 96 {
+                    fail(BadSection(1))
+                }
+                var params: [i64] = []
+                let np = try uleb(c)
+                for _j in 0..np {
+                    params.push(try byte_at(c))
+                }
+                var results: [i64] = []
+                let nr = try uleb(c)
+                for _j in 0..nr {
+                    results.push(try byte_at(c))
+                }
+                types.push(FuncType{ params: params, results: results })
+            }
+        } else if id == 3 {
+            let n = try uleb(c)
+            for _i in 0..n {
+                type_indices.push(try uleb(c))
+            }
+        } else if id == 5 {
+            let n = try uleb(c)
+            for _i in 0..n {
+                let flags = try byte_at(c)
+                pages = try uleb(c)
+                if flags == 1 {
+                    let _max = try uleb(c)
+                }
+            }
+        } else if id == 6 {
+            let n = try uleb(c)
+            for _i in 0..n {
+                let _t = try byte_at(c)
+                let m = try byte_at(c)
+                mutables.push(m == 1)
+                // A global's initialiser is a tiny constant expression. Only
+                // `i32.const` and `i64.const` are accepted, because anything
+                // else would need the evaluator to run before the module is
+                // built.
+                let op = try byte_at(c)
+                if op == 65 or op == 66 {
+                    globals.push(try sleb(c))
+                } else {
+                    fail(Unsupported("a global initialised by something other than a constant"))
+                }
+                let _end = try byte_at(c)
+            }
+        } else if id == 7 {
+            let n = try uleb(c)
+            for _i in 0..n {
+                let len = try uleb(c)
+                if c.at + len > data.len() {
+                    fail(Truncated(c.at))
+                }
+                let name = data.slice(c.at, len).to_str()
+                c.at = c.at + len
+                let kind = try byte_at(c)
+                let index = try uleb(c)
+                if kind == 0 {
+                    exports.push(name)
+                    export_funcs.push(index)
+                }
+            }
+        } else if id == 10 {
+            let n = try uleb(c)
+            for i in 0..n {
+                let body_size = try uleb(c)
+                let body_end = c.at + body_size
+                if body_end > data.len() {
+                    fail(Truncated(c.at))
+                }
+                var locals: [i64] = []
+                let groups = try uleb(c)
+                for _g in 0..groups {
+                    let count = try uleb(c)
+                    let t = try byte_at(c)
+                    if count > 100000 {
+                        fail(Unsupported("a function declaring {count} locals"))
+                    }
+                    for _k in 0..count {
+                        locals.push(t)
+                    }
+                }
+                let body = data.slice(c.at, body_end - c.at)
+                let ti = if i < type_indices.len() { type_indices[i] } else { 0 }
+                funcs.push(WasmFunc{ type_index: ti, locals: locals, body: body })
+                c.at = body_end
+            }
+        } else if id == 11 {
+            let n = try uleb(c)
+            for _i in 0..n {
+                let _mem = try uleb(c)
+                let op = try byte_at(c)
+                if op != 65 {
+                    fail(Unsupported("a data segment at a non-constant offset"))
+                }
+                let offset = try sleb(c)
+                let _end = try byte_at(c)
+                let len = try uleb(c)
+                if c.at + len > data.len() {
+                    fail(Truncated(c.at))
+                }
+                data_offsets.push(offset)
+                data_bytes.push(data.slice(c.at, len))
+                c.at = c.at + len
+            }
+        } else {
+            try skip(c, section_end - c.at)
+        }
+        // Sections are self-describing, so a section this reader understood
+        // only partly must still leave the cursor where the *header* said, or
+        // everything after it is read as rubbish.
+        c.at = section_end
+    }
+
+    Module{
+        types: types,
+        funcs: funcs,
+        exports: exports,
+        export_funcs: export_funcs,
+        memory_pages: pages,
+        globals: globals,
+        global_mutable: mutables,
+        data_offsets: data_offsets,
+        data_bytes: data_bytes,
+    }
+}
+
+type Store2 = {
+    memory: [i64],
+    globals: [i64],
+    fuel: i64,
+}
+
+/// A store with the module's memory laid out and its data segments written.
+pub fn instantiate(m: Module, fuel: i64) -> Store2 {
+    var mem: [i64] = []
+    let bytes_wanted = m.memory_pages * 65536
+    // Bounded, because a module declares its own page count and a hostile one
+    // declares a great many.
+    let size = if bytes_wanted > 16777216 { 16777216 } else { bytes_wanted }
+    for _i in 0..size {
+        mem.push(0)
+    }
+    for i in 0..m.data_bytes.len() {
+        let at = m.data_offsets[i]
+        let b = m.data_bytes[i]
+        for j in 0..b.len() {
+            if at + j >= 0 and at + j < mem.len() {
+                mem[at + j] = b.at(j)
+            }
+        }
+    }
+    Store2{ memory: mem, globals: m.globals, fuel: fuel }
+}
+
+/// Call an exported function by name.
+pub fn call(m: Module, inout s: Store2, name: str, argv: [i64]) -> i64 ! WasmError {
+    var index = 0 - 1
+    for i in 0..m.exports.len() {
+        if m.exports[i] == name {
+            index = m.export_funcs[i]
+        }
+    }
+    if index < 0 {
+        fail(NoSuchExport(name))
+    }
+    run_function(m, s, index, argv, 0)
+}
+
+fn run_function(m: Module, inout s: Store2, index: i64, argv: [i64],
+                depth: i64) -> i64 ! WasmError {
+    if depth > 256 {
+        fail(Trap("call stack too deep"))
+    }
+    if index < 0 or index >= m.funcs.len() {
+        fail(Trap("call to function {index}, which does not exist"))
+    }
+    let f = m.funcs[index]
+    var locals: [i64] = []
+    for a in argv {
+        locals.push(a)
+    }
+    for _l in f.locals {
+        locals.push(0)
+    }
+    var stack: [i64] = []
+    try execute(m, s, f.body, locals, stack, depth)
+    if stack.len() == 0 {
+        return 0
+    }
+    stack[stack.len() - 1]
+}
+
+fn pop(inout stack: [i64], at: i64) -> i64 ! WasmError {
+    if stack.len() == 0 {
+        fail(StackUnderflow(at))
+    }
+    let v = stack[stack.len() - 1]
+    stack.pop()
+    v
+}
+
+/// Run a function body.
+///
+/// Control flow is handled by scanning for the matching `end` rather than by
+/// building a block tree first. That is slower and it is much easier to get
+/// right: the nesting is counted as it goes, so a `block` inside a `loop`
+/// inside an `if` cannot be confused for one another.
+fn execute(m: Module, inout s: Store2, body: bytes, inout locals: [i64],
+           inout stack: [i64], depth: i64) -> () ! WasmError {
+    var c = Cursor2{ data: body, at: 0 }
+    // Where each open control construct started, and whether it is a loop —
+    // a `br` to a loop goes back to its head and to a block goes past its end,
+    // which is the one thing that makes wasm's branches unlike everyone's.
+    var block_starts: [i64] = []
+    var block_is_loop: [bool] = []
+
+    while c.at < body.len() {
+        s.fuel = s.fuel - 1
+        if s.fuel <= 0 {
+            fail(OutOfFuel(0))
+        }
+        let op = try byte_at(c)
+
+        if op == 11 {
+            if block_starts.len() == 0 {
+                return
+            }
+            block_starts.pop()
+            block_is_loop.pop()
+        } else if op == 2 or op == 3 {
+            let _t = try byte_at(c)
+            block_starts.push(c.at)
+            block_is_loop.push(op == 3)
+        } else if op == 4 {
+            let _t = try byte_at(c)
+            let condition = try pop(stack, c.at)
+            block_starts.push(c.at)
+            block_is_loop.push(false)
+            if mask32(condition) == 0 {
+                try jump_to_else_or_end(c, body)
+            }
+        } else if op == 5 {
+            // Reaching `else` from the then-branch means skipping to `end`.
+            try skip_to_end(c, body)
+            if block_starts.len() > 0 {
+                block_starts.pop()
+                block_is_loop.pop()
+            }
+        } else if op == 12 or op == 13 {
+            var taken = true
+            if op == 13 {
+                taken = mask32(try pop(stack, c.at)) != 0
+            }
+            let label = try uleb(c)
+            if taken {
+                if label >= block_starts.len() {
+                    return
+                }
+                let target = block_starts.len() - 1 - label
+                if block_is_loop[target] {
+                    c.at = block_starts[target]
+                    var k = block_starts.len() - 1
+                    while k > target {
+                        block_starts.pop()
+                        block_is_loop.pop()
+                        k = k - 1
+                    }
+                } else {
+                    var k = block_starts.len() - 1
+                    while k >= target {
+                        try skip_to_end(c, body)
+                        block_starts.pop()
+                        block_is_loop.pop()
+                        k = k - 1
+                    }
+                }
+            }
+        } else if op == 15 {
+            return
+        } else if op == 16 {
+            let callee = try uleb(c)
+            let want = if callee < m.funcs.len() {
+                let t = m.funcs[callee].type_index
+                if t < m.types.len() { m.types[t].params.len() } else { 0 }
+            } else {
+                0
+            }
+            var argv: [i64] = []
+            for _i in 0..want {
+                argv.push(try pop(stack, c.at))
+            }
+            var ordered: [i64] = []
+            var i = argv.len() - 1
+            while i >= 0 {
+                ordered.push(argv[i])
+                i = i - 1
+            }
+            stack.push(try run_function(m, s, callee, ordered, depth + 1))
+        } else if op == 26 {
+            let _v = try pop(stack, c.at)
+        } else if op == 32 {
+            let i = try uleb(c)
+            if i >= locals.len() {
+                fail(Trap("local {i} does not exist"))
+            }
+            stack.push(locals[i])
+        } else if op == 33 or op == 34 {
+            let i = try uleb(c)
+            if i >= locals.len() {
+                fail(Trap("local {i} does not exist"))
+            }
+            let v = try pop(stack, c.at)
+            locals[i] = v
+            if op == 34 {
+                stack.push(v)
+            }
+        } else if op == 35 {
+            let i = try uleb(c)
+            if i >= s.globals.len() {
+                fail(Trap("global {i} does not exist"))
+            }
+            stack.push(s.globals[i])
+        } else if op == 36 {
+            let i = try uleb(c)
+            if i >= s.globals.len() {
+                fail(Trap("global {i} does not exist"))
+            }
+            s.globals[i] = try pop(stack, c.at)
+        } else if op == 40 or op == 52 or op == 53 {
+            // i32.load, i32.load8_u, i32.load8_s
+            let _align = try uleb(c)
+            let offset = try uleb(c)
+            let base = mask32(try pop(stack, c.at))
+            let at = base + offset
+            if op == 40 {
+                if at < 0 or at + 4 > s.memory.len() {
+                    fail(Trap("a load at {at} is outside memory"))
+                }
+                stack.push(s.memory[at].bit_or(s.memory[at + 1].shl(8))
+                    .bit_or(s.memory[at + 2].shl(16)).bit_or(s.memory[at + 3].shl(24)))
+            } else {
+                if at < 0 or at >= s.memory.len() {
+                    fail(Trap("a load at {at} is outside memory"))
+                }
+                let b = s.memory[at]
+                stack.push(if op == 53 and b >= 128 { b - 256 } else { b })
+            }
+        } else if op == 54 or op == 58 {
+            // i32.store, i32.store8
+            let _align = try uleb(c)
+            let offset = try uleb(c)
+            let v = try pop(stack, c.at)
+            let base = mask32(try pop(stack, c.at))
+            let at = base + offset
+            if op == 54 {
+                if at < 0 or at + 4 > s.memory.len() {
+                    fail(Trap("a store at {at} is outside memory"))
+                }
+                for k in 0..4 {
+                    s.memory[at + k] = v.ushr(k * 8).bit_and(255)
+                }
+            } else {
+                if at < 0 or at >= s.memory.len() {
+                    fail(Trap("a store at {at} is outside memory"))
+                }
+                s.memory[at] = v.bit_and(255)
+            }
+        } else if op == 65 {
+            stack.push(mask32(try sleb(c)))
+        } else if op == 66 {
+            stack.push(try sleb(c))
+        } else if op >= 69 and op <= 113 {
+            try integer_op(op, stack, c.at)
+        } else {
+            fail(Unsupported("opcode {op}"))
+        }
+    }
+}
+
+/// The i32 instructions.
+///
+/// Every result is masked back to 32 bits and every *signed* operation sign
+/// extends first. Division truncates toward zero, which is C's rule and not
+/// every language's, and dividing the most negative number by -1 traps rather
+/// than overflowing — a case that exists precisely because the answer is not
+/// representable.
+fn integer_op(op: i64, inout stack: [i64], at: i64) -> () ! WasmError {
+    if op == 69 {
+        let a = try pop(stack, at)
+        stack.push(if mask32(a) == 0 { 1 } else { 0 })
+        return
+    }
+    if op == 103 or op == 104 or op == 105 {
+        let a = mask32(try pop(stack, at))
+        var n = 0
+        if op == 103 {
+            if a == 0 {
+                n = 32
+            } else {
+                var i = 31
+                while i >= 0 and a.ushr(i).bit_and(1) == 0 {
+                    n = n + 1
+                    i = i - 1
+                }
+            }
+        } else if op == 104 {
+            if a == 0 {
+                n = 32
+            } else {
+                while a.ushr(n).bit_and(1) == 0 {
+                    n = n + 1
+                }
+            }
+        } else {
+            for i in 0..32 {
+                n = n + a.ushr(i).bit_and(1)
+            }
+        }
+        stack.push(n)
+        return
+    }
+    let b = try pop(stack, at)
+    let a = try pop(stack, at)
+    let ua = mask32(a)
+    let ub = mask32(b)
+    let sa = signed32(a)
+    let sb = signed32(b)
+    var r = 0
+    if op == 70 {
+        r = if ua == ub { 1 } else { 0 }
+    } else if op == 71 {
+        r = if ua != ub { 1 } else { 0 }
+    } else if op == 72 {
+        r = if sa < sb { 1 } else { 0 }
+    } else if op == 73 {
+        r = if ua < ub { 1 } else { 0 }
+    } else if op == 74 {
+        r = if sa > sb { 1 } else { 0 }
+    } else if op == 75 {
+        r = if ua > ub { 1 } else { 0 }
+    } else if op == 76 {
+        r = if sa <= sb { 1 } else { 0 }
+    } else if op == 77 {
+        r = if ua <= ub { 1 } else { 0 }
+    } else if op == 78 {
+        r = if sa >= sb { 1 } else { 0 }
+    } else if op == 79 {
+        r = if ua >= ub { 1 } else { 0 }
+    } else if op == 106 {
+        r = mask32(a + b)
+    } else if op == 107 {
+        r = mask32(a - b)
+    } else if op == 108 {
+        r = mask32(sa * sb)
+    } else if op == 109 or op == 110 {
+        if ub == 0 {
+            fail(Trap("integer divide by zero"))
+        }
+        if op == 109 {
+            if sa == (0 - 2147483648) and sb == (0 - 1) {
+                fail(Trap("integer overflow"))
+            }
+            r = mask32(sa / sb)
+        } else {
+            r = mask32(ua / ub)
+        }
+    } else if op == 111 or op == 112 {
+        if ub == 0 {
+            fail(Trap("integer divide by zero"))
+        }
+        r = if op == 111 { mask32(sa % sb) } else { mask32(ua % ub) }
+    } else if op == 113 {
+        r = mask32(a.bit_and(b))
+    } else {
+        fail(Unsupported("opcode {op}"))
+    }
+    stack.push(r)
+}
+
+/// Scan forward to the `end` that closes the construct just opened.
+fn skip_to_end(inout c: Cursor2, body: bytes) -> () ! WasmError {
+    var nesting = 0
+    while c.at < body.len() {
+        let op = try byte_at(c)
+        if op == 2 or op == 3 or op == 4 {
+            nesting = nesting + 1
+            let _t = try byte_at(c)
+        } else if op == 11 {
+            if nesting == 0 {
+                return
+            }
+            nesting = nesting - 1
+        } else {
+            try skip_immediates(c, op)
+        }
+    }
+}
+
+/// The same, but stopping at an `else` at the same level.
+fn jump_to_else_or_end(inout c: Cursor2, body: bytes) -> () ! WasmError {
+    var nesting = 0
+    while c.at < body.len() {
+        let before = c.at
+        let op = try byte_at(c)
+        if op == 2 or op == 3 or op == 4 {
+            nesting = nesting + 1
+            let _t = try byte_at(c)
+        } else if op == 11 {
+            if nesting == 0 {
+                c.at = before
+                return
+            }
+            nesting = nesting - 1
+        } else if op == 5 and nesting == 0 {
+            return
+        } else {
+            try skip_immediates(c, op)
+        }
+    }
+}
+
+/// Step over an instruction's immediates while scanning.
+///
+/// A scanner that skipped only the opcode would read a constant's bytes as
+/// instructions, and a large enough constant contains an `end`.
+fn skip_immediates(inout c: Cursor2, op: i64) -> () ! WasmError {
+    if op == 65 or op == 66 {
+        let _v = try sleb(c)
+    } else if op == 12 or op == 13 or op == 16 or op == 32 or op == 33 or
+        op == 34 or op == 35 or op == 36 {
+        let _v = try uleb(c)
+    } else if op == 40 or op == 52 or op == 53 or op == 54 or op == 58 {
+        let _a = try uleb(c)
+        let _o = try uleb(c)
+    }
+}
+
+/// What a module exports.
+pub fn exports_of(m: Module) -> [str] {
+    m.exports
+}
+
+pub fn memory_size(s: Store2) -> i64 {
+    s.memory.len()
+}
+
+pub fn read_memory(s: Store2, at: i64, n: i64) -> [i64] {
+    var out: [i64] = []
+    for i in 0..n {
+        if at + i >= 0 and at + i < s.memory.len() {
+            out.push(s.memory[at + i])
+        }
+    }
+    out
+}

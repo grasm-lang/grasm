@@ -1,0 +1,12 @@
+[package]
+name = "wasmdiff"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.wasmvm]
+path = "../wasmvm"
+version = "^1.0.0"
+
+[dependencies.bytes_codec]
+path = "../bytes"
+version = "^1.0.0"
