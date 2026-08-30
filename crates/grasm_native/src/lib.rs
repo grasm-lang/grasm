@@ -850,6 +850,8 @@ impl<'m> Codegen<'m> {
             ("grasm_list_dir", vec![i64t], Some(i64t)),
             ("grasm_set_args", vec![i64t, ptr], None),
             ("grasm_now_millis", vec![], Some(i64t)),
+            ("grasm_monotonic_millis", vec![], Some(i64t)),
+            ("grasm_sleep_millis", vec![i64t], Some(i64t)),
             ("grasm_check_leaks", vec![], None),
             ("grasm_struct_take", vec![ptr, ptr, i64t], Some(ptr)),
             ("grasm_list_take", vec![ptr, i64t], Some(ptr)),
@@ -9185,6 +9187,18 @@ checker did",
                 let v = self.call_rt("grasm_now_millis", &[]).unwrap();
                 return Ok(Some((v, VType::I64)));
             }
+            "monotonic_millis" => {
+                let v = self.call_rt("grasm_monotonic_millis", &[]).unwrap();
+                return Ok(Some((v, VType::I64)));
+            }
+            "sleep_millis" => {
+                let (mv, mt) = self.eval_expr_val(&args[0])?;
+                let boxed = self.box_value(mv, &mt);
+                let v = self.call_rt("grasm_sleep_millis", &[boxed]).unwrap();
+                self.call_rt("grasm_val_dec", &[boxed]);
+                self.call_rt("grasm_val_dec", &[v]);
+                return Ok(Some((self.b.ins().iconst(types::I64, 0), VType::Unit)));
+            }
             "env" => {
                 let (nv, _) = self.eval_expr_val(&args[0])?;
                 let v = self.call_rt("grasm_env", &[nv]).unwrap();
@@ -11173,7 +11187,8 @@ fields, not the type this is bound to, not an enclosing generic",
                     if self.lookup(&id.name).is_none() && self.lookup_fn(&id.name).is_none() {
                         let t = match id.name.as_str() {
                             "pi" | "e" => Some(VType::F64),
-                            "now_millis" => Some(VType::I64),
+                            "now_millis" | "monotonic_millis" => Some(VType::I64),
+                            "sleep_millis" => Some(VType::Unit),
                             "input" => Some(VType::Str),
                             "file_exists" => Some(VType::Bool),
                             "args" => Some(VType::List(Box::new(VType::Str))),

@@ -6444,6 +6444,52 @@ pub extern "C" fn grasm_now_millis() -> i64 {
     now
 }
 
+/// Milliseconds since a fixed moment this process cannot name.
+///
+/// `now_millis` is the *wall* clock and it moves backwards: a machine
+/// correcting itself, a leap second, a virtual machine resuming. Measuring a
+/// duration with it gives a negative answer twice a year, and every timeout
+/// built on it fires early or late by however far the correction went. This
+/// one has no relation to any calendar and only ever increases, which is the
+/// only thing a duration can be built on.
+#[no_mangle]
+pub extern "C" fn grasm_monotonic_millis() -> i64 {
+    use std::sync::OnceLock;
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    if let Some(replay::Wire::Int(v)) = replay::gate("monotonic_millis") {
+        return v;
+    }
+    let start = START.get_or_init(std::time::Instant::now);
+    let now = start.elapsed().as_millis() as i64;
+    if replay::recording() {
+        replay::put("monotonic_millis", &replay::Wire::Int(now));
+    }
+    now
+}
+
+/// Wait.
+///
+/// A replay does not: the recording holds what the program *did*, and
+/// re-living its pauses would make a replay take as long as the original run
+/// and tell nobody anything.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_sleep_millis(ms: *mut RtVal) -> *mut RtVal {
+    let n = match &(*ms).payload {
+        RtPayload::I64(v) => *v,
+        _ => 0,
+    };
+    if replay::gate("sleep_millis").is_some() {
+        return alloc(RtPayload::Unit);
+    }
+    if n > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(n as u64));
+    }
+    if replay::recording() {
+        replay::put("sleep_millis", &replay::Wire::Unit);
+    }
+    alloc(RtPayload::Unit)
+}
+
 /// Returns `Option[str]` for an environment variable.
 /// # Safety: live runtime pointer.
 #[no_mangle]

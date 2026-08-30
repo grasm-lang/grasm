@@ -602,6 +602,32 @@ fn host_now_millis() -> i64 {
         .unwrap_or(0)
 }
 
+/// Milliseconds since some fixed moment this process cannot name.
+///
+/// The value means nothing on its own — it is not a date and cannot be
+/// compared between processes — and that is the point: it only ever increases,
+/// so a difference between two readings is a duration. `Instant` has no epoch
+/// to ask about, so the first reading is captured once and everything is
+/// measured from it.
+#[cfg(not(target_arch = "wasm32"))]
+fn host_monotonic_millis() -> i64 {
+    use std::sync::OnceLock;
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    let start = START.get_or_init(std::time::Instant::now);
+    start.elapsed().as_millis() as i64
+}
+
+/// wasm32 has no monotonic clock of its own either, so the embedder supplies
+/// one — `performance.now()` in a browser, which is exactly this.
+#[cfg(target_arch = "wasm32")]
+fn host_monotonic_millis() -> i64 {
+    extern "C" {
+        /// Supplied by the embedder as `env.grasm_monotonic_millis`.
+        fn grasm_monotonic_millis() -> f64;
+    }
+    unsafe { grasm_monotonic_millis() as i64 }
+}
+
 /// The largest string this implementation will build.
 ///
 /// A `repeat` past it is a panic with a sentence, not a Rust allocator
@@ -3208,6 +3234,32 @@ uses to mark the end of a string"
                             }
                             _ => false,
                         }));
+                    }
+                    "monotonic_millis" => {
+                        if let Some(v) = journal::gated("monotonic_millis") {
+                            return Ok(v);
+                        }
+                        return Ok(journal::recorded(
+                            "monotonic_millis",
+                            Value::Int(host_monotonic_millis()),
+                        ));
+                    }
+                    "sleep_millis" => {
+                        let ms = match self.eval_expr(&args[0])? {
+                            Value::Int(n) => n,
+                            _ => return Err(Flow::Panic("sleep_millis expects an integer".into())),
+                        };
+                        // A replay does not wait. The recording holds what the
+                        // program *did*, and re-living the pauses would make a
+                        // replay take as long as the original run for no
+                        // information.
+                        if let Some(v) = journal::gated("sleep_millis") {
+                            return Ok(v);
+                        }
+                        if ms > 0 {
+                            std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+                        }
+                        return Ok(journal::recorded("sleep_millis", Value::Unit));
                     }
                     "now_millis" => {
                         if let Some(v) = journal::gated("now_millis") {

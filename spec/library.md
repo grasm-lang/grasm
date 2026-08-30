@@ -23,6 +23,8 @@ came to be documented as returning `Option[str]` when it is fallible.
 | `fail(e)` | `(E)` | raises the error branch of a `T ! E` |
 | `map()` | `() -> Map[K, V]` | a new empty map |
 | `now_millis()` | `() -> i64` | milliseconds since the epoch; `io` |
+| `monotonic_millis()` | `() -> i64` | since an unnamed moment; only increases |
+| `sleep_millis(n)` | `(i64) -> ()` | waits; a replay does not; both `io` |
 | `random_bytes(n)` | `(i64) -> bytes ! IoError` | `n` bytes from the operating system; `io` |
 | `env(name)` | `(str) -> Option[str]` | environment variable; `io` |
 | `exit(code)` | `(i64)` | ends the program with that status — its low eight bits ([L-LIB-EXIT]) |
@@ -30,16 +32,18 @@ came to be documented as returning `Option[str]` when it is fallible.
 | `write_file(p, s)` | `(str, str) -> () ! IoError` | fallible; `io` ([L-LIB-IO]) |
 | `file_exists(p)` | `(str) -> bool` | `io` |
 
-**[L-LIB-EXIT]** `exit(code)` ends the program with the **low eight bits** of
-`code`, which is what an operating system reports and what C's `exit` does with
-the same number: `exit(-1)` is 255 and `exit(256)` is 0. Clamping to 0..=255
-instead was worse in the direction that matters — it made `exit(-1)`, the most
-common spelling of "fail" in a script, report *success*.
+**[L-LIB-CLOCK]** `now_millis` is the *wall* clock and **moves backwards** — a
+correction, a leap second, a resumed machine — so a duration measured with it
+goes negative and a timeout fires wrong by that much. `monotonic_millis` only
+increases. `sleep_millis` waits; a replay does not.
 
-`exit` performs no effect, so a dependency declaring `capabilities = []` can
-end the host process. That is deliberate and worth stating: `panic` and an
-endless loop already do the same, and a ceiling has never claimed to bound how
-long a dependency runs or whether it returns — only what it can *reach*.
+**[L-LIB-EXIT]** `exit(code)` ends the program with the **low eight bits** of
+`code`, as an operating system reports it and as C's `exit` does: `exit(-1)` is
+255, `exit(256)` is 0. Clamping to 0..=255 was worse where it matters — it made
+`exit(-1)`, the commonest spelling of "fail" in a script, report *success*.
+`exit` performs no effect, so a dependency declaring `capabilities = []` can end
+the host process: deliberate, since `panic` and an endless loop already do — a
+ceiling bounds what a dependency can *reach*, never how long it runs.
 Nothing observable outside the process changes, so charging `io` for it would
 buy no guarantee while making every program that reports a status ask for the
 filesystem.
@@ -537,21 +541,19 @@ looks the way it does.
 | `udp_recv(h)` | `(i64) -> bytes ! IoError` | receives **one** datagram, whole |
 | `udp_recv_from(h)` | `(i64) -> (bytes, str, i64) ! IoError` | the same, and where it came from |
 
-UDP is not TCP with the reliability removed but a different shape, and the
-signatures say so. A stream fixes both ends at connect time, so `tcp_write(h,
-text)` is complete. A datagram is a *whole message* with **no fixed peer**, so
-`udp_send` names a destination every call and `udp_recv_from` answers the
-sender's — a receiver that cannot learn who wrote can only answer peers
-configured in advance. A tuple for `proc_run`'s reason ([L-LIB-PROC]).
+UDP is not TCP with the reliability removed but a different shape. A stream
+fixes both ends at connect time; a datagram is a *whole message* with **no fixed
+peer**, so `udp_send` names a destination every call and `udp_recv_from` answers
+the sender's — a receiver that cannot learn who wrote can only answer peers
+configured in advance ([L-LIB-PROC] for why a tuple).
 
-Payloads are `bytes`, not `str`. The protocols that use UDP are binary — a DNS
-query is a packed structure with bit-level flags — and routing one through the
-lossy UTF-8 conversion the stream operations use, correctly, for text would
-corrupt it ([L-LIB-BYTES]).
+Payloads are `bytes`, not `str`: the protocols that use UDP are binary, and
+routing a DNS query's bit-level flags through the lossy UTF-8 conversion the
+stream operations correctly use for text would corrupt it ([L-LIB-BYTES]).
 
-A read that returned half a message, or two joined, would destroy the only
-thing UDP guarantees. Nothing past 65535 bytes arrives over IPv4 in one piece,
-so the buffer cannot truncate a deliverable datagram.
+A read returning half a message, or two joined, would destroy the only thing
+UDP guarantees. Nothing past 65535 bytes arrives over IPv4 in one piece, so the
+buffer cannot truncate a deliverable datagram.
 
 Datagram handles share the table with stream handles, so `net_wait`, `net_port`
 and `net_close` work on all three kinds unchanged. A program that speaks two
@@ -772,11 +774,10 @@ browser however small it was, and almost every real program has one.
 **[L-LIB-BYTES]** `bytes` is a contiguous run of bytes, and it is the type `str`
 deliberately is not.
 
-A `str` is *text*: it holds UTF-8, and anything above 127 is re-encoded on the
-way out — correct for text and fatal for anything else. Asked for the seven
-bytes of `mov rax, 1`, a `str` put **nine** on disk: `0xC7` became `c3 87`. A
-language whose only sequence type does that cannot read an image, build a
-packet, or emit an object file.
+A `str` is *text*: UTF-8, with anything above 127 re-encoded on the way out —
+correct for text, fatal otherwise. Asked for the seven bytes of `mov rax, 1` a
+`str` put **nine** on disk, and a language whose only sequence type does that
+cannot emit an object file.
 
 | | type | |
 |---|---|---|
@@ -798,12 +799,10 @@ packet, or emit an object file.
 | `rename_file(a, b)` | `(str, str) -> () ! IoError` | atomic where the platform allows |
 
 **The last five exist because whole-file calls cannot express data**: a table
-larger than memory cannot be read at all, a log rewritten per record is
-quadratic, and a crash-safe commit is write-beside, `sync_file`, `rename_file`.
+larger than memory is unreadable, a log rewritten per record is quadratic, and a
+crash-safe commit is write-beside, `sync_file`, `rename_file`.
 
 **`bytes` is distinct from `[i64]` on purpose.** A list of integers cannot
 promise its elements are bytes, stores eight per element, and cannot be handed
-to a buffer. The promise is the type. `at` gives `0..255` rather than a one-byte
-type: one integer type is the trade, and a range check is cheaper than a second.
-It **prints as hex**, `0x` and two digits per byte, not the text it might decode
-to; `to_str` is lossy for `tcp_read`'s reason ([L-LIB-NET]).
+to a buffer — the promise is the type. `at` gives `0..255`; one integer type is
+the trade. It **prints as hex**, and `to_str` is lossy for `tcp_read`'s reason.

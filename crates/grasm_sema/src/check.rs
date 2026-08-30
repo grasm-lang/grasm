@@ -302,6 +302,8 @@ pub const BUILTIN_FREE_FNS: &[&str] = &[
     "input",
     "args",
     "now_millis",
+    "monotonic_millis",
+    "sleep_millis",
     "random_bytes",
     "env",
     "exit",
@@ -5066,11 +5068,29 @@ only a number or a `bool` can come out — compute what you need and yield that"
                         }
                         return Type::Bool;
                     }
-                    "now_millis" => {
+                    // A clock that only ever goes forwards, and one that can
+                    // wait.
+                    //
+                    // `now_millis` is the *wall* clock: it answers what a
+                    // person would call the time, and it moves backwards when
+                    // the machine is corrected. Measuring a duration with it
+                    // gives a negative answer twice a year, and every timeout
+                    // built on it fires early or late by however far the
+                    // correction went. `monotonic_millis` has no relation to
+                    // any calendar and only ever increases, which is what a
+                    // duration needs.
+                    "now_millis" | "monotonic_millis" => {
                         if !args.is_empty() {
-                            return self.error(span, "now_millis takes no arguments");
+                            return self.error(span, format!("{} takes no arguments", id.name));
                         }
                         return Type::I64;
+                    }
+                    "sleep_millis" => {
+                        if args.len() != 1 {
+                            return self.error(span, "sleep_millis takes 1 argument (milliseconds)");
+                        }
+                        self.check_expr(&args[0], &Type::I64);
+                        return Type::Unit;
                     }
                     "env" => {
                         if args.len() != 1 {

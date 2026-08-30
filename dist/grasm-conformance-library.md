@@ -1,6 +1,6 @@
 # Grasm — conformance programs: library
 
-The standard library. 55 executable program(s), one per normative clause of
+The standard library. 56 executable program(s), one per normative clause of
 `grasm-language-pack.md`. Each header states the tag it demonstrates and the
 exact expected behaviour, and every one is run by `cargo test -p grasm_spec`, so
 a program here cannot describe behaviour the implementation does not have.
@@ -570,6 +570,33 @@ fn main() / {io} {
     // one-byte slice must work; one past must not.
     print("last byte and last slice: {code.at(code.len() - 1)} {code.slice(code.len() - 1, 1)}")
     print("{code.at(code.len())}")
+}
+```
+
+## `L-LIB-CLOCK.gr`
+
+```grasm
+//! tag: L-LIB-CLOCK
+//! expect: output
+//! monotonic never went backwards: true
+//! a wait of 50ms took at least that: true
+// `now_millis` is the wall clock and may move backwards; `monotonic_millis`
+// names no calendar moment and only increases, which is the only thing a
+// duration can be measured with.
+fn main() / {io} {
+    var previous = monotonic_millis()
+    var ordered = true
+    for _i in 0..500 {
+        let now = monotonic_millis()
+        if now < previous {
+            ordered = false
+        }
+        previous = now
+    }
+    print("monotonic never went backwards: {ordered}")
+    let before = monotonic_millis()
+    sleep_millis(50)
+    print("a wait of 50ms took at least that: {monotonic_millis() - before >= 50}")
 }
 ```
 

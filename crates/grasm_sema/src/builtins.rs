@@ -109,6 +109,8 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin { name: "args", row: IO_ROW, journal: Journal::Recorded },
     Builtin { name: "env", row: IO_ROW, journal: Journal::Recorded },
     Builtin { name: "now_millis", row: IO_ROW, journal: Journal::Recorded },
+    Builtin { name: "monotonic_millis", row: IO_ROW, journal: Journal::Recorded },
+    Builtin { name: "sleep_millis", row: IO_ROW, journal: Journal::Recorded },
     // Reading entropy is reaching outside the program, and two calls do not
     // agree — which is the same reason `now_millis` is charged. A pure function
     // that answered differently each time would break every promise the effect

@@ -316,6 +316,11 @@ fn every_world_touching_builtin(path: str) / {io} {
     match write_file(path, "") { Ok(v) -> {}  Err(e) -> {} }
     match read_bytes(path) { Ok(v) -> {}  Err(e) -> {} }
     match write_bytes(path, bytes_of([])) { Ok(v) -> {}  Err(e) -> {} }
+    match read_bytes_at(path, 0, 1) { Ok(v) -> {}  Err(e) -> {} }
+    match append_bytes(path, bytes_of([])) { Ok(v) -> {}  Err(e) -> {} }
+    match file_size(path) { Ok(v) -> {}  Err(e) -> {} }
+    match sync_file(path) { Ok(v) -> {}  Err(e) -> {} }
+    match rename_file(path, path) { Ok(v) -> {}  Err(e) -> {} }
     match remove_file(path) { Ok(v) -> {}  Err(e) -> {} }
     match make_dir(path) { Ok(v) -> {}  Err(e) -> {} }
     match list_dir(path) { Ok(v) -> {}  Err(e) -> {} }
@@ -324,6 +329,8 @@ fn every_world_touching_builtin(path: str) / {io} {
     // type-checked and not called, which is the whole technique.
     let _l = input()
     let _i = now_millis()
+    let _mono = monotonic_millis()
+    sleep_millis(0)
     match random_bytes(0) { Ok(v) -> {}  Err(e) -> {} }
     let _j = env(path)
     let _k = args()

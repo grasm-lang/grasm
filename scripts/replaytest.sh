@@ -33,6 +33,8 @@ prog() {
     args)           echo 'print(args().len().to_str())' ;;
     env)            echo 'match env("HOME") { Some(v) -> print("y") None -> print("n") }' ;;
     now_millis)     echo 'print(now_millis().to_str())' ;;
+    monotonic_millis) echo 'print(monotonic_millis().to_str())' ;;
+    sleep_millis)   echo 'sleep_millis(0)' ;;
     random_bytes)   echo 'match random_bytes(1) { Ok(b) -> print("y") Err(e) -> print("n") }' ;;
     tcp_listen)     echo 'match tcp_listen(0) { Ok(h) -> print("y") Err(e) -> print("n") }' ;;
     tcp_connect)    echo 'match tcp_connect("127.0.0.1", 9) { Ok(h) -> print("y") Err(e) -> print("n") }' ;;
