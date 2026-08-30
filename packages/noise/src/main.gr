@@ -1,0 +1,471 @@
+// Noise_IKpsk2, the handshake GrasmWire is built on.
+//
+// `IK` names what each side knows before a word is said: the **I**nitiator
+// sends its static key inside the first message, and it already **K**nows the
+// responder's. That shape is chosen and not incidental — it is what lets a
+// connection open in one round trip, and what lets the responder stay silent
+// to anyone who cannot already name it.
+//
+// The construction is Noise's, deliberately. Inventing a key exchange is how
+// people produce protocols that are broken in ways nobody notices for years,
+// and Noise_IK has had the analysis that a new design would not have. What is
+// new here is the implementation, which is Grasm from the curve up: the field
+// arithmetic, the AEAD, the hash, the key schedule and this file. There is no
+// C underneath and nothing shells out.
+//
+// **This is not wire-compatible with WireGuard**, and the reason is one line
+// of this file: `IDENTIFIER` differs, so the initial hash differs, so every
+// byte after it differs. That is a deliberate choice — claiming compatibility
+// would mean testing against a peer this project does not have, and an untested
+// compatibility claim is worse than an honest incompatibility.
+//
+// **Nothing here is timing-variable on a secret.** No branch tests a key, a
+// shared secret, or a tag; the comparisons that decide are in `chachapoly`
+// and `x25519`, both of which mask rather than branch.
+
+import x25519
+import blake2s
+import chachapoly
+import hkdf
+
+/// Names this protocol and this version. Two peers that disagree on either of
+/// these strings cannot complete a handshake and will not get a confusing
+/// half-failure — they get no shared key at all, which is the correct outcome
+/// for a version mismatch.
+let construction = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s"
+let identifier = "GrasmWire v1"
+let label_mac1 = "mac1----"
+let label_cookie = "cookie--"
+
+/// What one side knows part-way through.
+///
+/// `hash` is a running transcript: every byte either peer has sent is folded
+/// into it, so the AEAD tags authenticate not just their own plaintext but
+/// everything that came before. A message replayed from a different session
+/// hits a different hash and fails to open.
+///
+/// `chaining_key` is the accumulated secret. Each Diffie-Hellman result is
+/// mixed in, never used directly, and never leaves.
+type State = {
+    chaining_key: bytes,
+    hash: bytes,
+    ephemeral_private: bytes,
+    ephemeral_public: bytes,
+    remote_ephemeral: bytes,
+    remote_static: bytes,
+    static_private: bytes,
+    static_public: bytes,
+}
+
+/// Why a handshake did not complete.
+///
+/// Every variant means the same thing to a peer — nothing. A responder that
+/// told an initiator *which* check failed would be an oracle, so these names
+/// are for the operator reading a log, and the wire says nothing.
+type HandshakeError =
+    | BadLength(message: str)
+    | BadType(kind: i64)
+    | BadMac
+    | NotAuthenticated
+    | LowOrderKey
+    | BadTimestamp(length: i64)
+
+fn concat(a: bytes, b: bytes) -> bytes {
+    var out = a.to_list()
+    for byte in b.to_list() {
+        out.push(byte)
+    }
+    bytes_of(out)
+}
+
+fn slice(b: bytes, from: i64, count: i64) -> bytes {
+    var out: [i64] = []
+    for i in 0..count {
+        out.push(b.at(from + i))
+    }
+    bytes_of(out)
+}
+
+fn text(s: str) -> bytes {
+    s.to_bytes()
+}
+
+fn empty() -> bytes {
+    bytes_of([])
+}
+
+fn zeros(n: i64) -> bytes {
+    var out: [i64] = []
+    for _i in 0..n {
+        out.push(0)
+    }
+    bytes_of(out)
+}
+
+/// Fold data into the running transcript.
+fn mix_hash(inout st: State, data: bytes) {
+    st.hash = blake2s.hash(concat(st.hash, data))
+}
+
+/// Fold a secret into the chaining key and take one key out.
+fn mix_key(inout st: State, input: bytes) -> bytes {
+    let out = hkdf.kdf(blake2s.hmac, st.chaining_key, input, 2)
+    st.chaining_key = out[0]
+    out[1]
+}
+
+/// Fold a secret in and take nothing out — used where the input contributes
+/// to every later key but no key is needed yet.
+fn mix_only(inout st: State, input: bytes) {
+    let out = hkdf.kdf(blake2s.hmac, st.chaining_key, input, 1)
+    st.chaining_key = out[0]
+}
+
+/// The pre-shared-key step: one output goes into the transcript rather than
+/// into a key, which is what binds the psk to the handshake instead of merely
+/// adding entropy to it.
+fn mix_psk(inout st: State, psk: bytes) -> bytes {
+    let out = hkdf.kdf(blake2s.hmac, st.chaining_key, psk, 3)
+    st.chaining_key = out[0]
+    mix_hash(st, out[1])
+    out[2]
+}
+
+fn fresh(static_private: bytes, static_public: bytes) -> State {
+    State{
+        chaining_key: blake2s.hash(text(construction)),
+        hash: empty(),
+        ephemeral_private: empty(),
+        ephemeral_public: empty(),
+        remote_ephemeral: empty(),
+        remote_static: empty(),
+        static_private: static_private,
+        static_public: static_public,
+    }
+}
+
+/// Both sides start from the same two values, and the responder's public key
+/// is one of them. An initiator that has the wrong idea of who it is talking
+/// to fails at the first tag rather than the last.
+fn prologue(inout st: State, responder_static: bytes) {
+    st.hash = blake2s.hash(concat(st.chaining_key, text(identifier)))
+    mix_hash(st, responder_static)
+}
+
+/// The keyed hash that proves the sender knew the recipient's public key.
+///
+/// This is not authentication — anyone who knows a public key can compute it,
+/// and public keys are public. It is a cheap filter: an unsolicited packet
+/// without a correct `mac1` is dropped before any curve arithmetic happens, so
+/// flooding a peer costs the sender a hash and the receiver a hash, rather
+/// than costing the receiver a scalar multiplication.
+pub fn mac1_key(static_public: bytes) -> bytes {
+    blake2s.hash(concat(text(label_mac1), static_public))
+}
+
+pub fn mac1(key: bytes, message_so_far: bytes) -> bytes {
+    blake2s.keyed(key, message_so_far, 16)
+}
+
+pub fn cookie_key(static_public: bytes) -> bytes {
+    blake2s.hash(concat(text(label_cookie), static_public))
+}
+
+/// A first message and the state that produced it.
+type Initiation = {
+    state: State,
+    message: bytes,
+}
+
+/// The length of a first message, in bytes.
+///
+/// 8 header — one type byte, three reserved, four of sender index — then 32
+/// ephemeral, 48 sealed static, 28 sealed timestamp, 16 mac1, 16 mac2. Every handshake message this protocol sends is exactly this long
+/// or exactly `response_len`, and never anything else: a length is a fact an
+/// observer gets for free, so the protocol makes it carry no information.
+pub fn initiation_len() -> i64 {
+    148
+}
+
+pub fn response_len() -> i64 {
+    92
+}
+
+/// Twelve bytes, which is what TAI64N is and what the sealed field is sized
+/// for. What the twelve bytes *mean* is the caller's business — this protocol
+/// only requires that they never go backwards for a given peer.
+pub fn timestamp_len() -> i64 {
+    12
+}
+
+/// Build the first message.
+///
+/// `ephemeral_private` is a parameter rather than something this function
+/// generates. That is what keeps this package free of a `random` capability,
+/// and it is also what makes the handshake testable: with a pinned ephemeral
+/// the whole transcript is deterministic, so a refactor that changes a byte
+/// is caught by a fixed vector rather than by a peer failing in production.
+///
+/// `timestamp` is the caller's too, for the same reason and one more: what
+/// counts as a monotonic identity for this peer is the caller's policy, and a
+/// library that read a clock would impose one.
+pub fn initiate(static_private: bytes, static_public: bytes, responder_static: bytes,
+                ephemeral_private: bytes, timestamp: bytes, sender_index: i64) -> Initiation ! HandshakeError {
+    // The fixed length above is a claim this function has to keep. A caller
+    // that passed a timestamp of some other width would produce a message of
+    // some other length, and a length is the one field an observer reads for
+    // free — so the width is checked here rather than documented and hoped for.
+    if timestamp.len() != timestamp_len() {
+        fail(BadTimestamp(timestamp.len()))
+    }
+
+    var st = fresh(static_private, static_public)
+    st.remote_static = responder_static
+    prologue(st, responder_static)
+
+    st.ephemeral_private = ephemeral_private
+    st.ephemeral_public = x25519.public_key(ephemeral_private)
+
+    // The ephemeral goes in the clear and into the transcript. It has to be
+    // clear: the responder needs it before it can derive anything.
+    mix_only(st, st.ephemeral_public)
+    mix_hash(st, st.ephemeral_public)
+
+    // e-s: the initiator's ephemeral against the responder's static. This is
+    // the first shared secret, and it is what encrypts the initiator's
+    // identity — so who is calling is hidden from everyone except the peer
+    // being called.
+    let es = try dh(st.ephemeral_private, responder_static)
+    let k1 = mix_key(st, es)
+    let sealed_static = chachapoly.seal_combined(k1, chachapoly.nonce_of(0), st.hash, static_public)
+    mix_hash(st, sealed_static)
+
+    // s-s: static against static. Both sides can compute it before the
+    // handshake and neither can compute it without its own private key, which
+    // is what makes the next tag proof of identity rather than proof of
+    // reachability.
+    let ss = try dh(static_private, responder_static)
+    let k2 = mix_key(st, ss)
+    let sealed_time = chachapoly.seal_combined(k2, chachapoly.nonce_of(0), st.hash, timestamp)
+    mix_hash(st, sealed_time)
+
+    var body = concat(header(1, sender_index), st.ephemeral_public)
+    body = concat(body, sealed_static)
+    body = concat(body, sealed_time)
+    let m1 = mac1(mac1_key(responder_static), body)
+    let message = concat(concat(body, m1), zeros(16))
+
+    Initiation{ state: st, message: message }
+}
+
+fn header(kind: i64, index: i64) -> bytes {
+    bytes_of([kind, 0, 0, 0,
+              index.bit_and(255),
+              index.ushr(8).bit_and(255),
+              index.ushr(16).bit_and(255),
+              index.ushr(24).bit_and(255)])
+}
+
+fn index_at(m: bytes, at: i64) -> i64 {
+    m.at(at).bit_or(m.at(at + 1).shl(8)).bit_or(m.at(at + 2).shl(16)).bit_or(m.at(at + 3).shl(24))
+}
+
+/// A scalar multiplication that refuses the points with no entropy in them.
+///
+/// `x25519.shared_secret` returns nothing for the low-order points, and this
+/// turns that into the handshake's own failure. Treating an all-zero result as
+/// a key is the classic way to accept a peer who proved nothing.
+fn dh(secret: bytes, point: bytes) -> bytes ! HandshakeError {
+    match x25519.shared_secret(secret, point) {
+        Some(s) -> s
+        None -> fail(LowOrderKey)
+    }
+}
+
+/// What a responder learns from a first message.
+type Incoming = {
+    state: State,
+    initiator_static: bytes,
+    timestamp: bytes,
+    sender_index: i64,
+}
+
+/// Read a first message.
+///
+/// The order of the checks is the design. Length, then type, then `mac1` —
+/// all three cost a hash at most — and only then the curve. A peer that can be
+/// made to do public-key arithmetic by an unauthenticated packet is a peer
+/// that can be made to do nothing else.
+pub fn consume_initiation(static_private: bytes, static_public: bytes,
+                          message: bytes) -> Incoming ! HandshakeError {
+    if message.len() != initiation_len() {
+        fail(BadLength("a first message is {initiation_len()} bytes, this one is {message.len()}"))
+    }
+    if message.at(0) != 1 {
+        fail(BadType(message.at(0)))
+    }
+    let expected = mac1(mac1_key(static_public), slice(message, 0, 116))
+    if not constant_equal(expected, slice(message, 116, 16)) {
+        fail(BadMac)
+    }
+
+    var st = fresh(static_private, static_public)
+    prologue(st, static_public)
+
+    let remote_ephemeral = slice(message, 8, 32)
+    st.remote_ephemeral = remote_ephemeral
+    mix_only(st, remote_ephemeral)
+    mix_hash(st, remote_ephemeral)
+
+    let es = try dh(static_private, remote_ephemeral)
+    let k1 = mix_key(st, es)
+    let sealed_static = slice(message, 40, 48)
+    let initiator_static = try open_or_reject(k1, st.hash, sealed_static)
+    mix_hash(st, sealed_static)
+
+    let ss = try dh(static_private, initiator_static)
+    let k2 = mix_key(st, ss)
+    let sealed_time = slice(message, 88, 28)
+    let timestamp = try open_or_reject(k2, st.hash, sealed_time)
+    mix_hash(st, sealed_time)
+
+    st.remote_static = initiator_static
+    Incoming{
+        state: st,
+        initiator_static: initiator_static,
+        timestamp: timestamp,
+        sender_index: index_at(message, 4),
+    }
+}
+
+/// One failure for every reason a sealed field will not open.
+///
+/// The AEAD distinguishes a wrong key from a wrong tag; a peer must not. Both
+/// arrive here as `NotAuthenticated`.
+fn open_or_reject(key: bytes, aad: bytes, sealed: bytes) -> bytes ! HandshakeError {
+    match chachapoly.open_combined(key, chachapoly.nonce_of(0), aad, sealed) {
+        Ok(plain) -> plain
+        Err(_e) -> fail(NotAuthenticated)
+    }
+}
+
+fn constant_equal(a: bytes, b: bytes) -> bool {
+    if a.len() != b.len() {
+        return false
+    }
+    var difference = 0
+    for i in 0..a.len() {
+        difference = difference.bit_or(a.at(i).bit_xor(b.at(i)))
+    }
+    difference == 0
+}
+
+/// A reply and the state that produced it.
+type Response = {
+    state: State,
+    message: bytes,
+}
+
+/// Build the reply.
+///
+/// The sealed field here has no plaintext — it is sixteen bytes of tag over an
+/// empty message. That is the whole point: the tag covers the transcript, so
+/// producing it proves the responder derived the same four secrets, and there
+/// is nothing to say beyond that.
+pub fn respond(incoming: Incoming, ephemeral_private: bytes, preshared: bytes,
+               sender_index: i64) -> Response ! HandshakeError {
+    var st = incoming.state
+    st.ephemeral_private = ephemeral_private
+    st.ephemeral_public = x25519.public_key(ephemeral_private)
+
+    mix_only(st, st.ephemeral_public)
+    mix_hash(st, st.ephemeral_public)
+
+    // e-e, then e-s the other way round. After these four secrets, forward
+    // secrecy holds: an attacker who later steals both static keys still
+    // cannot derive this session's keys without an ephemeral private that no
+    // longer exists.
+    let ee = try dh(ephemeral_private, st.remote_ephemeral)
+    mix_only(st, ee)
+    let se = try dh(ephemeral_private, st.remote_static)
+    mix_only(st, se)
+
+    let k = mix_psk(st, preshared)
+    let sealed_nothing = chachapoly.seal_combined(k, chachapoly.nonce_of(0), st.hash, empty())
+    mix_hash(st, sealed_nothing)
+
+    var body = concat(header(2, sender_index), pack_index(incoming.sender_index))
+    body = concat(body, st.ephemeral_public)
+    body = concat(body, sealed_nothing)
+    let m1 = mac1(mac1_key(st.remote_static), body)
+    let message = concat(concat(body, m1), zeros(16))
+
+    Response{ state: st, message: message }
+}
+
+fn pack_index(index: i64) -> bytes {
+    bytes_of([index.bit_and(255), index.ushr(8).bit_and(255),
+              index.ushr(16).bit_and(255), index.ushr(24).bit_and(255)])
+}
+
+/// Read the reply, completing the handshake.
+pub fn consume_response(state: State, message: bytes, preshared: bytes) -> State ! HandshakeError {
+    if message.len() != response_len() {
+        fail(BadLength("a reply is {response_len()} bytes, this one is {message.len()}"))
+    }
+    if message.at(0) != 2 {
+        fail(BadType(message.at(0)))
+    }
+    let expected = mac1(mac1_key(state.static_public), slice(message, 0, 60))
+    if not constant_equal(expected, slice(message, 60, 16)) {
+        fail(BadMac)
+    }
+
+    var st = state
+    let remote_ephemeral = slice(message, 12, 32)
+    st.remote_ephemeral = remote_ephemeral
+    mix_only(st, remote_ephemeral)
+    mix_hash(st, remote_ephemeral)
+
+    let ee = try dh(st.ephemeral_private, remote_ephemeral)
+    mix_only(st, ee)
+    let se = try dh(st.static_private, remote_ephemeral)
+    mix_only(st, se)
+
+    let k = mix_psk(st, preshared)
+    let sealed_nothing = slice(message, 44, 16)
+    let _nothing = try open_or_reject(k, st.hash, sealed_nothing)
+    mix_hash(st, sealed_nothing)
+
+    st
+}
+
+/// The two transport keys.
+type Keys = {
+    sending: bytes,
+    receiving: bytes,
+}
+
+/// Turn the finished handshake into the keys that carry data.
+///
+/// Two keys, not one, and each side sends under a different one. Sharing a
+/// key in both directions means a nonce used by one peer is a nonce the other
+/// must never use, which is a coordination problem with no good answer. Two
+/// keys makes each side's nonce sequence its own business.
+///
+/// The chaining key is not returned. After this call the handshake secrets
+/// have no further use, and a value that is not returned is a value that
+/// cannot be logged by mistake.
+pub fn split(st: State, is_initiator: bool) -> Keys {
+    let out = hkdf.kdf(blake2s.hmac, st.chaining_key, empty(), 2)
+    if is_initiator {
+        Keys{ sending: out[0], receiving: out[1] }
+    } else {
+        Keys{ sending: out[1], receiving: out[0] }
+    }
+}
+
+/// The final transcript hash, which both sides can compare out of band.
+pub fn transcript(st: State) -> bytes {
+    st.hash
+}

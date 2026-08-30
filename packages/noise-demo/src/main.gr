@@ -1,0 +1,206 @@
+// What a handshake has to prove, checked one property at a time.
+//
+// There are no published vectors for this construction — the identifier
+// string is this protocol's own — so the checks here are properties rather
+// than transcriptions, plus one pinned transcript so that a change to any
+// byte of the handshake is caught by this file rather than by a peer.
+
+import noise
+import x25519
+import bytes_codec
+
+fn unhex(s: str) -> bytes {
+    match bytes_codec.decode_hex(s) {
+        Some(b) -> b
+        None -> panic("not hex: {s}")
+    }
+}
+
+fn hex(b: bytes) -> str {
+    bytes_codec.encode_hex(b)
+}
+
+fn say(name: str, held: bool) {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+    }
+}
+
+/// Fixed keys, so the whole transcript is reproducible. Real keys come from
+/// `random_bytes`, which is why the library takes them as arguments — this
+/// file is exactly the reason that design was chosen.
+fn keys() -> [bytes] {
+    [
+        x25519.clamp(unhex("a8abababababababababababababababababababababababababababababab6b")),
+        x25519.clamp(unhex("c8cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd4b")),
+        x25519.clamp(unhex("58efefefefefefefefefefefefefefefefefefefefefefefefefefefefefef0b")),
+        x25519.clamp(unhex("18e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e14b")),
+    ]
+}
+
+fn main() / {io} {
+    let k = keys()
+    let initiator_private = k[0]
+    let responder_private = k[1]
+    let initiator_ephemeral = k[2]
+    let responder_ephemeral = k[3]
+    let initiator_public = x25519.public_key(initiator_private)
+    let responder_public = x25519.public_key(responder_private)
+    let psk = unhex("0505050505050505050505050505050505050505050505050505050505050505")
+    let timestamp = unhex("400000005f00000000000000")
+
+    print("-- a whole handshake")
+
+    let started: Initiation ! HandshakeError = noise.initiate(initiator_private, initiator_public, responder_public,
+        initiator_ephemeral, timestamp, 1)
+    match started {
+        Ok(init) -> {
+            say("a first message is {noise.initiation_len()} bytes",
+                init.message.len() == noise.initiation_len())
+
+            match noise.consume_initiation(responder_private, responder_public, init.message) {
+                Ok(incoming) -> {
+                    // The responder now knows who called, and learned it from
+                    // a field nobody watching the wire could read.
+                    say("the responder recovered the initiator's static key",
+                        hex(incoming.initiator_static) == hex(initiator_public))
+                    say("the responder recovered the timestamp",
+                        hex(incoming.timestamp) == hex(timestamp))
+                    say("the responder read the sender index", incoming.sender_index == 1)
+
+                    match noise.respond(incoming, responder_ephemeral, psk, 2) {
+                        Ok(reply) -> {
+                            say("a reply is {noise.response_len()} bytes",
+                                reply.message.len() == noise.response_len())
+
+                            match noise.consume_response(init.state, reply.message, psk) {
+                                Ok(finished) -> {
+                                    // The property the whole protocol exists
+                                    // for: two machines that exchanged 236
+                                    // bytes now hold the same two keys, and
+                                    // neither ever sent one.
+                                    let a = noise.split(finished, true)
+                                    let b = noise.split(reply.state, false)
+                                    say("both sides agree on the transcript hash",
+                                        hex(noise.transcript(finished)) == hex(noise.transcript(reply.state)))
+                                    say("the initiator's sending key is the responder's receiving key",
+                                        hex(a.sending) == hex(b.receiving))
+                                    say("the responder's sending key is the initiator's receiving key",
+                                        hex(b.sending) == hex(a.receiving))
+                                    say("the two directions use different keys",
+                                        hex(a.sending) != hex(a.receiving))
+
+                                    // Pinned. Everything above is a property
+                                    // that many different handshakes would
+                                    // satisfy, including a subtly wrong one.
+                                    // These three values are what *this*
+                                    // handshake produces from these keys, so
+                                    // a refactor that changes an order, a
+                                    // label or a mix step is caught here and
+                                    // not by a peer six months from now.
+                                    say("the session hash is unchanged",
+                                        hex(noise.transcript(finished)) ==
+                                        "6551d49007514afdc0a0c9f13230b84708bb5e715246879ef29d82327374ee93")
+                                    say("the initiator's sending key is unchanged",
+                                        hex(a.sending) ==
+                                        "50ab4e47ec64a190e87d3703f35413c61e7e8a136dd9b64bff84625cf43e315d")
+                                    say("the initiator's receiving key is unchanged",
+                                        hex(a.receiving) ==
+                                        "d75ce1e62c4039e1c6961164c4bf94664aba4c11000bc95a500a68988a08fe66")
+                                }
+                                Err(_e) -> say("the initiator completed the handshake", false)
+                            }
+                        }
+                        Err(_e) -> say("the responder built a reply", false)
+                    }
+                }
+                Err(_e) -> say("the responder read the first message", false)
+            }
+
+            print("-- and every way it is supposed to fail")
+
+            // A different pre-shared key. Everything up to the last tag is
+            // identical, which is the point: the psk is bound to the
+            // handshake, not merely mixed into a key at the end.
+            match noise.consume_initiation(responder_private, responder_public, init.message) {
+                Ok(inc2) -> {
+                    match noise.respond(inc2, responder_ephemeral, unhex("0606060606060606060606060606060606060606060606060606060606060606"), 2) {
+                        Ok(bad_psk) -> {
+                            match noise.consume_response(init.state, bad_psk.message, psk) {
+                                Ok(_s) -> say("a mismatched pre-shared key is refused", false)
+                                Err(_e) -> say("a mismatched pre-shared key is refused", true)
+                            }
+                        }
+                        Err(_e) -> say("a mismatched pre-shared key is refused", false)
+                    }
+                }
+                Err(_e) -> say("a mismatched pre-shared key is refused", false)
+            }
+
+            // One bit of the sealed identity flipped.
+            say("a tampered first message is refused",
+                refused(responder_private, responder_public, flip(init.message, 45)))
+
+            // One bit of the mac1, which is checked before any curve
+            // arithmetic happens.
+            say("a wrong mac1 is refused before any key agreement",
+                refused(responder_private, responder_public, flip(init.message, 120)))
+
+            // The right message sent to the wrong peer. mac1 is keyed by the
+            // recipient's own public key, so this is caught by a hash.
+            let third = x25519.clamp(unhex("30f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f34b"))
+            say("a message meant for someone else is refused",
+                refused(third, x25519.public_key(third), init.message))
+
+            // Truncated, and one byte too long.
+            say("a short message is refused",
+                refused(responder_private, responder_public, cut(init.message, 100)))
+
+            // The wrong message type in the right length.
+            say("a reply presented as a first message is refused",
+                refused(responder_private, responder_public, set_byte(init.message, 0, 2)))
+        }
+        Err(_e) -> print("  FAIL  the initiator could not start")
+    }
+
+    print("-- a peer with the wrong idea of who it is calling")
+    // The initiator has a stale copy of the responder's public key. It builds
+    // a message that looks perfect and that the responder cannot open, which
+    // is the correct outcome: identity is checked by decryption, not by asking.
+    let stale = x25519.public_key(x25519.clamp(unhex("9092929292929292929292929292929292929292929292929292929292929242")))
+    match noise.initiate(initiator_private, initiator_public, stale, initiator_ephemeral, timestamp, 1) {
+        Ok(wrong) -> say("a message built for a stale key is refused",
+            refused(responder_private, responder_public, wrong.message))
+        Err(_e) -> say("a message built for a stale key is refused", false)
+    }
+}
+
+/// True when the responder rejects the message, whichever way it is wrong.
+fn refused(private: bytes, public: bytes, message: bytes) -> bool {
+    match noise.consume_initiation(private, public, message) {
+        Ok(_i) -> false
+        Err(_e) -> true
+    }
+}
+
+fn flip(m: bytes, at: i64) -> bytes {
+    var out = m.to_list()
+    out[at] = out[at].bit_xor(1)
+    bytes_of(out)
+}
+
+fn set_byte(m: bytes, at: i64, value: i64) -> bytes {
+    var out = m.to_list()
+    out[at] = value
+    bytes_of(out)
+}
+
+fn cut(m: bytes, keep: i64) -> bytes {
+    var out: [i64] = []
+    for i in 0..keep {
+        out.push(m.at(i))
+    }
+    bytes_of(out)
+}

@@ -1,0 +1,25 @@
+[package]
+name = "noise"
+version = "1.0.0"
+
+# A handshake needs randomness and a clock. It does not need the *capability*
+# to reach either: both arrive as arguments from the caller who already has
+# them. So this package opens nothing and declares nothing, and a review of
+# what it can touch is over in one line.
+capabilities = []
+
+[dependencies.x25519]
+path = "../x25519"
+version = "^1.0.0"
+
+[dependencies.blake2s]
+path = "../blake2s"
+version = "^1.0.0"
+
+[dependencies.chachapoly]
+path = "../chachapoly"
+version = "^1.0.0"
+
+[dependencies.hkdf]
+path = "../hkdf"
+version = "^1.0.0"
