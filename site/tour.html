@@ -5,15 +5,21 @@
 <title>A tour of the language</title>
 <meta name="description" content="The whole language surface in one read.">
 <link rel="stylesheet" href="style.css">
-<script type="importmap">
-{"imports": {
-  "three": "./vendor/three.module.js",
-  "three/addons/utils/BufferGeometryUtils.js": "./vendor/utils/BufferGeometryUtils.js"
-}}
-</script>
 <script src="vendor/motion.js" defer></script>
+<script src="vendor/lottie.js" defer></script>
 <script type="module" src="app.js"></script>
 </head><body data-page="tour">
+<header class="topbar">
+  <a class="brand" href="index.html"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 4 7.5v9L12 21l8-4.5v-9L12 3Z"/><path d="M12 12 4 7.5M12 12l8-4.5M12 12v9"/></svg><span>grasm</span></a>
+  <span class="ver">v1.0.0</span>
+  <nav>
+    <a href="start.html">Docs</a>
+    <a href="syntax.html">Syntax</a>
+    <a href="security.html">Security</a>
+    <a href="packages.html">Packages</a>
+    <a href="status.html">Status</a>
+  </nav>
+</header>
 <div class="frame">
 <nav class="rail">
 <a class="mark" href="index.html"><b>grasm</b><span>a systems language</span></a>
@@ -29,6 +35,7 @@
 <a href="concurrency.html">Concurrency</a>
 <a href="security.html">Security</a>
 <h2>Reference</h2>
+<a href="syntax.html">Syntax</a>
 <a href="language.html">Language</a>
 <a href="library.html">Library</a>
 <a href="packages.html">Packages</a>
@@ -48,10 +55,10 @@
 
 <h2>Bindings</h2>
 <p><code>let</code> binds; <code>var</code> binds something you may reassign.
-Types are inferred and may be written.</p><pre><code>let n = 1 + 2
-let x: f64 = 2          // an integer literal becomes a float where one is wanted
-var total = 0
-total = total + n</code></pre>
+Types are inferred and may be written.</p><pre><code><span class="kw">let</span> n <span class="op">=</span> <span class="nu">1</span> <span class="op">+</span> <span class="nu">2</span>
+<span class="kw">let</span> x<span class="op">:</span> <span class="ty">f64</span> <span class="op">=</span> <span class="nu">2</span>          <span class="cm">// an integer literal becomes a float where one is wanted</span>
+<span class="kw">var</span> total <span class="op">=</span> <span class="nu">0</span>
+total <span class="op">=</span> total <span class="op">+</span> n</code></pre>
 
 <h2>Types</h2>
 <div class="scroll"><table>
@@ -71,34 +78,34 @@ total = total + n</code></pre>
 <p>There is no null. Something that may be absent is an <code>Option</code>, and
 the compiler makes you open it.</p>
 
-<h2>Control</h2><pre><code>let label = if n &gt; 0 { "positive" } else { "not" }
+<h2>Control</h2><pre><code><span class="kw">let</span> label <span class="op">=</span> <span class="kw">if</span> n <span class="op">&gt;</span> <span class="nu">0</span> <span class="op">{</span> <span class="st">"positive"</span> <span class="op">}</span> <span class="kw">else</span> <span class="op">{</span> <span class="st">"not"</span> <span class="op">}</span>
 
-match value {
-    Some(v) -&gt; print("{v}")
-    None    -&gt; print("nothing")
-}
+<span class="kw">match</span> value <span class="op">{</span>
+    <span class="ty">Some</span><span class="op">(</span>v<span class="op">)</span> <span class="op">-&gt;</span> <span class="fn">print</span><span class="op">(</span><span class="st">"{v}"</span><span class="op">)</span>
+    <span class="ty">None</span>    <span class="op">-&gt;</span> <span class="fn">print</span><span class="op">(</span><span class="st">"nothing"</span><span class="op">)</span>
+<span class="op">}</span>
 
-for i in 0..3 { }
-for v in [1, 2, 3] { }
-while more { }</code></pre>
+<span class="kw">for</span> i <span class="kw">in</span> <span class="nu">0</span><span class="op">..</span><span class="nu">3</span> <span class="op">{</span> <span class="op">}</span>
+<span class="kw">for</span> v <span class="kw">in</span> <span class="op">[</span><span class="nu">1</span><span class="op">,</span> <span class="nu">2</span><span class="op">,</span> <span class="nu">3</span><span class="op">]</span> <span class="op">{</span> <span class="op">}</span>
+<span class="kw">while</span> more <span class="op">{</span> <span class="op">}</span></code></pre>
 <p><code>if</code> and <code>match</code> are expressions. A <code>match</code>
 must cover its subject, and the compiler says which case is missing.</p>
 
-<h2>Functions and closures</h2><pre><code>fn twice(n: i64) -&gt; i64 {
-    n * 2
-}
+<h2>Functions and closures</h2><pre><code><span class="kw">fn</span> <span class="fn">twice</span><span class="op">(</span>n<span class="op">:</span> <span class="ty">i64</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">i64</span> <span class="op">{</span>
+    n <span class="op">*</span> <span class="nu">2</span>
+<span class="op">}</span>
 
-let f = |n| n + 1                 // a closure captures by value, at creation
-let g: fn(i64) -&gt; i64 = twice     // a function is a value
+<span class="kw">let</span> f <span class="op">=</span> <span class="op">|</span>n<span class="op">|</span> n <span class="op">+</span> <span class="nu">1</span>                 <span class="cm">// a closure captures by value, at creation</span>
+<span class="kw">let</span> g<span class="op">:</span> <span class="kw">fn</span><span class="op">(</span><span class="ty">i64</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">i64</span> <span class="op">=</span> twice     <span class="cm">// a function is a value</span>
 
-[1, 2, 3].map(twice)
-3 |&gt; twice                        // the same call, written the other way</code></pre>
+<span class="op">[</span><span class="nu">1</span><span class="op">,</span> <span class="nu">2</span><span class="op">,</span> <span class="nu">3</span><span class="op">]</span><span class="op">.</span><span class="fn">map</span><span class="op">(</span>twice<span class="op">)</span>
+<span class="nu">3</span> <span class="op">|&gt;</span> twice                        <span class="cm">// the same call, written the other way</span></code></pre>
 
-<h2>Generics</h2><pre><code>type Stack[T] = { items: [T] }
+<h2>Generics</h2><pre><code><span class="kw">type</span> <span class="ty">Stack</span><span class="op">[</span><span class="ty">T</span><span class="op">]</span> <span class="op">=</span> <span class="op">{</span> items<span class="op">:</span> <span class="op">[</span><span class="ty">T</span><span class="op">]</span> <span class="op">}</span>
 
-fn same[T](v: T) -&gt; T {
+<span class="kw">fn</span> same<span class="op">[</span><span class="ty">T</span><span class="op">]</span><span class="op">(</span>v<span class="op">:</span> <span class="ty">T</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">T</span> <span class="op">{</span>
     v
-}</code></pre>
+<span class="op">}</span></code></pre>
 <p>Generics are monomorphised: one compiled copy per member of the family. The
 one thing this cannot do is polymorphic recursion, and it is refused by name
 rather than miscompiled.</p>

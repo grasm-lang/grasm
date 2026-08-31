@@ -5,15 +5,21 @@
 <title>Install</title>
 <meta name="description" content="Build Grasm from source.">
 <link rel="stylesheet" href="style.css">
-<script type="importmap">
-{"imports": {
-  "three": "./vendor/three.module.js",
-  "three/addons/utils/BufferGeometryUtils.js": "./vendor/utils/BufferGeometryUtils.js"
-}}
-</script>
 <script src="vendor/motion.js" defer></script>
+<script src="vendor/lottie.js" defer></script>
 <script type="module" src="app.js"></script>
 </head><body data-page="install">
+<header class="topbar">
+  <a class="brand" href="index.html"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 4 7.5v9L12 21l8-4.5v-9L12 3Z"/><path d="M12 12 4 7.5M12 12l8-4.5M12 12v9"/></svg><span>grasm</span></a>
+  <span class="ver">v1.0.0</span>
+  <nav>
+    <a href="start.html">Docs</a>
+    <a href="syntax.html">Syntax</a>
+    <a href="security.html">Security</a>
+    <a href="packages.html">Packages</a>
+    <a href="status.html">Status</a>
+  </nav>
+</header>
 <div class="frame">
 <nav class="rail">
 <a class="mark" href="index.html"><b>grasm</b><span>a systems language</span></a>
@@ -29,6 +35,7 @@
 <a href="concurrency.html">Concurrency</a>
 <a href="security.html">Security</a>
 <h2>Reference</h2>
+<a href="syntax.html">Syntax</a>
 <a href="language.html">Language</a>
 <a href="library.html">Library</a>
 <a href="packages.html">Packages</a>
@@ -47,11 +54,11 @@
 <p class="lede">Grasm builds from source with a Rust toolchain. There are no
 prebuilt binaries yet.</p>
 
-<h2>From source</h2><pre><code>git clone &lt;repository&gt;
+<h2>From source</h2><pre><code>git clone <span class="op">&lt;</span>repository<span class="op">&gt;</span>
 cd grasm
-cargo build --release --workspace
+cargo build <span class="op">-</span><span class="op">-</span>release <span class="op">-</span><span class="op">-</span>workspace
 
-./target/release/grasm run examples/hello.gr</code></pre>
+<span class="op">.</span><span class="op">/</span>target<span class="op">/</span>release<span class="op">/</span>grasm run examples<span class="op">/</span>hello<span class="op">.</span>gr</code></pre>
 <p>The binary is <code>target/release/grasm</code>. Put it on your path, or call
 it where it is.</p>
 

@@ -36,6 +36,7 @@ NAV = [
     ("errors.html", "Errors", "Learn", "Errors"),
     ("concurrency.html", "Concurrency", "Learn", "Concurrency"),
     ("security.html", "Capabilities and the supply chain", "Learn", "Security"),
+    ("syntax.html", "Syntax", "Reference", "Syntax"),
     ("language.html", "Language reference", "Reference", "Language"),
     ("library.html", "Library reference", "Reference", "Library"),
     ("packages.html", "Packages", "Reference", "Packages"),
@@ -92,6 +93,11 @@ def facts():
     f["version"] = re.search(
         r'^version = "([^"]+)"', open(os.path.join(ROOT, "Cargo.toml")).read(), re.M).group(1)
 
+    # Icons travel the same substitution path as the figures, so a page can
+    # name one and the build fails if it does not exist.
+    for name in ICON:
+        f["icon_" + name] = icon(name)
+
     measured = os.path.join(OUT, "facts.json")
     if os.path.exists(measured):
         f.update(json.load(open(measured)))
@@ -105,6 +111,37 @@ def facts():
 
 # What only a run can know. `scripts/allgates.sh` writes these.
 MEASURED = ["corpus", "wasm_ok", "wasm_skip", "cross", "agreeing", "laws"]
+
+
+
+# Line icons, drawn here rather than pulled from a set, so the site keeps its
+# "no external request" property and every glyph is 16 lines of SVG anybody can
+# read. 1.6px stroke on a 24 grid, `currentColor` so CSS decides the colour.
+ICON = {
+    "mark": '<path d="M12 3 4 7.5v9L12 21l8-4.5v-9L12 3Z"/><path d="M12 12 4 7.5M12 12l8-4.5M12 12v9"/>',
+    "shield": '<path d="M12 3 5 6v6c0 4 3 6.5 7 9 4-2.5 7-5 7-9V6l-7-3Z"/><path d="m9 12 2 2 4-4"/>',
+    "layers": '<path d="m12 3 9 5-9 5-9-5 9-5Z"/><path d="m3 13 9 5 9-5"/>',
+    "cpu": '<rect x="8" y="8" width="8" height="8" rx="1"/><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 2v2M15 2v2M9 20v2M15 20v2M2 9h2M2 15h2M20 9h2M20 15h2"/>',
+    "check": '<path d="m4 12 5 5L20 6"/>',
+    "x": '<path d="M6 6l12 12M18 6 6 18"/>',
+    "book": '<path d="M4 5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2V5Z"/><path d="M8 7h7M8 11h7"/>',
+    "terminal": '<path d="m6 8 4 4-4 4M13 16h5"/><rect x="2" y="4" width="20" height="16" rx="2"/>',
+    "flow": '<path d="M4 6h6M4 12h9M4 18h6"/><circle cx="18" cy="6" r="2"/><circle cx="18" cy="18" r="2"/><circle cx="19" cy="12" r="2"/>',
+    "lock": '<rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/>',
+    "gauge": '<path d="M12 14 16 9"/><path d="M4 18a9 9 0 1 1 16 0"/>',
+    "package": '<path d="m12 3 8 4.5v9L12 21l-8-4.5v-9L12 3Z"/><path d="M4 7.5 12 12l8-4.5M12 12v9"/>',
+}
+
+
+def icon(name, size=17):
+    """One icon, inline. Unknown names fail the build rather than render blank."""
+    if name not in ICON:
+        raise SystemExit(f"no icon called {name!r}")
+    return (
+        f'<svg viewBox="0 0 24 24" width="{size}" height="{size}" fill="none" '
+        f'stroke="currentColor" stroke-width="1.6" stroke-linecap="round" '
+        f'stroke-linejoin="round" aria-hidden="true">{ICON[name]}</svg>'
+    )
 
 
 def rail(current):
@@ -131,15 +168,21 @@ PAGE = """<!doctype html>
 <title>{title}</title>
 <meta name="description" content="{desc}">
 <link rel="stylesheet" href="style.css">
-<script type="importmap">
-{{"imports": {{
-  "three": "./vendor/three.module.js",
-  "three/addons/utils/BufferGeometryUtils.js": "./vendor/utils/BufferGeometryUtils.js"
-}}}}
-</script>
 <script src="vendor/motion.js" defer></script>
+<script src="vendor/lottie.js" defer></script>
 <script type="module" src="app.js"></script>
 </head><body data-page="{page}">
+<header class="topbar">
+  <a class="brand" href="index.html">{markicon}<span>grasm</span></a>
+  <span class="ver">v{version}</span>
+  <nav>
+    <a href="start.html">Docs</a>
+    <a href="syntax.html">Syntax</a>
+    <a href="security.html">Security</a>
+    <a href="packages.html">Packages</a>
+    <a href="status.html">Status</a>
+  </nav>
+</header>
 <div class="frame">
 <nav class="rail">
 {rail}
@@ -178,6 +221,7 @@ def write(pages, check):
         desc, body = pages[href]
         html = PAGE.format(
             title=title, desc=desc, page=href.replace(".html", ""),
+            markicon=icon("mark", 19), version=known.get("version", ""),
             rail=rail(href), body=fill(body)
         )
         path = os.path.join(OUT, href)
@@ -212,6 +256,12 @@ def main():
         print("  " + " ".join(unmeasured))
         print("run scripts/allgates.sh, which writes site/facts.json when green")
         sys.exit(1)
+
+    # The animations are generated too, for the same reason the counts are:
+    # a hand-edited JSON blob nobody can read is a thing that rots.
+    if not args.check:
+        import site_lottie
+        site_lottie.main()
 
     stale, unknown = write(PAGES, args.check)
     if unknown:

@@ -3,12 +3,39 @@
 E = "&amp;"
 
 
-def code(src):
-    s = src.strip("\n").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    return f"<pre><code>{s}</code></pre>"
+from site_highlight import code  # noqa: E402,F401
 
 
 PAGES = {}
+
+
+def verdicts():
+    """The supply-chain verdicts, as a table each row of which resolves in turn.
+
+    `data-result` is the answer; `data-state` is what is currently shown. The
+    script moves the second to the first, so with JavaScript off the table
+    still renders — just already settled.
+    """
+    rows = [
+        ("Grasm", "refused", "COMPILE ERROR", "inferred effects (io) exceed the declared ceiling ([])"),
+        ("Rust", "clean", "builds clean", "std::fs is ambient; no capability is recorded"),
+        ("Go", "clean", "builds clean", "os.ReadFile is importable by any package"),
+        ("Python", "clean", "compiles clean", "open() needs no import and no declaration"),
+    ]
+    out = ['<div class="verdicts">']
+    for name, state, verdict, why in rows:
+        mark = "\u00abicon_check\u00bb" if state == "refused" else "\u00abicon_x\u00bb"
+        out.append(
+            f'<div class="verdict-row" data-result="{state}">'
+            f'<span class="lang">{mark}{name}</span>'
+            f'<span class="out">{verdict}</span>'
+            f'<span class="why">{why}</span></div>'
+        )
+    out.append("</div>")
+    out.append('<div class="actions">'
+               '<button class="btn ghost" data-run-verdicts>Run it again</button></div>')
+    return "".join(out)
+
 
 # ---------------------------------------------------------------- index
 
@@ -16,83 +43,102 @@ PAGES["index.html"] = (
     "Grasm is a systems language where what a program may do is written in its type.",
     """
 <div class="hero">
-  <div id="stage" aria-hidden="true"></div>
-  <div class="copy">
-    <p class="eyebrow">A systems language · v«version»</p>
-    <h1>What a program may do<br>is written in its type.</h1>
-    <p class="lede">Effects go in the signature. Capabilities go in the package
-    manifest. Ownership is a tier you pick per value. It compiles ahead of time,
-    runs in a browser, and four engines agree byte for byte on every program
-    here.</p>
-    <div class="actions">
-      <a class="btn" href="start.html">Get started</a>
-      <a class="btn ghost" href="security.html">See the capability check</a>
-      <a class="btn ghost" href="playground.html">Try it in the browser</a>
-    </div>
+  <p class="eyebrow">Systems language \u00b7 v\u00abversion\u00bb</p>
+  <h1>What a program may do is written in its type.</h1>
+  <p class="lede">Effects go in the signature and are inferred from the body.
+  Capabilities go in the package manifest and bound what a dependency can
+  reach. Ownership is a tier you pick per value \u2014 no lifetime
+  annotations.</p>
+  <div class="actions">
+    <a class="btn" href="start.html">Get started</a>
+    <a class="btn ghost" href="syntax.html">Syntax reference</a>
+    <a class="btn ghost" href="playground.html">Run it in the browser</a>
   </div>
 </div>
 
-<h2>The signature is the contract</h2>
-<p>A function\u2019s type says what it returns <em>and</em> what it is allowed to
-do. The row is inferred from the body, so it cannot drift from the truth, and a
-caller that has not been given <code>io</code> cannot call something that
-performs it.</p>
+<div class="split">
+  <div>
+    <h3>A signature is a contract</h3>
+    <p>The row after <code>/</code> says what the function is permitted to do.
+    You do not write it; the compiler works it out from the body and checks it
+    against what you declared.</p>
 """
     + code(
-        """
-fn safe_div(a: i64, b: i64) -> i64 ! MathError {
+        """fn safe_div(a: i64, b: i64) -> i64 ! MathError {
     if b == 0 {
         fail(DivByZero)
     }
     a / b
 }
 
-fn report(n: i64) / {io} {        // this one prints; the type says so
+fn report(n: i64) / {io} {      // this one prints, and the type says so
     print("{n}")
-}
-"""
+}""",
+        "! MathError is a failure the caller must handle. / {io} is an effect the caller must be permitted.",
     )
     + """
-<p><code>! MathError</code> is a failure the caller must handle.
-<code>/ {io}</code> is an effect the caller must be permitted. Neither is a
-comment or a convention \u2014 both are checked.</p>
-
-<h2 class="reveal">A dependency cannot quietly grow teeth</h2>
-<p class="reveal">This is the one thing here that other languages do not have.
-A library declares what it may reach. If a patch release starts reading your
-files, the build fails \u2014 in every consumer, without anybody reviewing the
-diff. Press the button: the verdicts are the ones
-<code>scripts/security_bench.sh</code> produces.</p>
-
-<div class="demo reveal" id="capability">
-  <div class="head">
-    <h3>mathlib 1.0.0 \u2192 1.0.1</h3>
-    <button class="btn">ship the malicious update</button>
   </div>
-  <div class="lanes"></div>
-  <div class="terminal"><span class="dim">Press the button to run the attack against four toolchains.</span></div>
+  <div>
+    <h3>A dependency cannot quietly grow teeth</h3>
+    <p>A trusted library ships a patch release that reads your files. Same
+    name, same signature, same result. This is what happens:</p>
+    <div class="term">
+      <div class="chrome"><span class="dot"></span><span class="dot"></span><span class="dot"></span>
+        <span>app \u2014 grasm build</span></div>
+      <div class="body"></div>
+    </div>
+  </div>
 </div>
 
-<h2 class="reveal">Four engines, one answer</h2>
-<p class="reveal">The interpreter is normative. A bundle is that interpreter
-with the program attached. <code>--native</code> compiles ahead of time through
-Cranelift. A fourth build targets <code>wasm32</code>. Every gate here exists to
-hold them to the same answer.</p>
-
-<div class="engines reveal">
-  <canvas id="engines" data-programs="«corpus»" aria-label="Programs flowing through four engines to a single answer"></canvas>
-</div>
-
+<h2 class="reveal">The same attack, four toolchains</h2>
+<p class="reveal">These verdicts are the ones <code>scripts/security_bench.sh</code>
+produces on every green build. Only one toolchain refuses.</p>
+"""
+    + verdicts()
+    + """
 <div class="grid three reveal">
-  <div class="card"><div class="stat">«corpus»<small>programs, three engines identical</small></div></div>
-  <div class="card"><div class="stat">«wasm_ok»<small>also identical in wasm</small></div></div>
-  <div class="card"><div class="stat">0<small>open defects, any severity</small></div></div>
+  <div class="card">
+    <span class="ico">\u00abicon_lock\u00bb</span>
+    <h3>The ceiling is declared</h3>
+    <p>A package states the effects it may perform. Exceeding it is a compile
+    error in every consumer, not a code review.</p>
+    <div class="lottie" data-lottie="ceiling"></div>
+  </div>
+  <div class="card">
+    <span class="ico">\u00abicon_layers\u00bb</span>
+    <h3>Ownership in tiers</h3>
+    <p>Value semantics by default, a region when a scope should own its
+    allocations, a generational reference when a graph needs one.</p>
+    <div class="lottie" data-lottie="tiers"></div>
+  </div>
+  <div class="card">
+    <span class="ico">\u00abicon_flow\u00bb</span>
+    <h3>Four engines, one answer</h3>
+    <p>Interpreter, bundle, native and wasm. Every gate here exists to hold
+    them to the same bytes.</p>
+    <div class="lottie" data-lottie="engines"></div>
+  </div>
+</div>
+
+<h2 class="reveal">Every program, every engine</h2>
+<p class="reveal">The interpreter is normative. The other three have to match
+it, and the corpus is what proves they do.</p>
+<div class="viz reveal">
+  <canvas id="engines" data-programs="\u00abcorpus\u00bb"
+    aria-label="Programs flowing through four engines to one answer"></canvas>
+  <div class="cap">difftest \u00b7 crosstest \u00b7 wasmtest \u2014 \u00abcorpus\u00bb programs, 0 mismatched</div>
+</div>
+
+<div class="figures reveal">
+  <div class="fig"><b>\u00abcorpus\u00bb</b><span>programs, three engines identical</span></div>
+  <div class="fig"><b>\u00abwasm_ok\u00bb</b><span>also identical in wasm</span></div>
+  <div class="fig"><b>\u00abclauses\u00bb</b><span>normative clauses</span></div>
+  <div class="fig"><b>0</b><span>open defects, any severity</span></div>
 </div>
 
 <h2 class="reveal">What is measured, including what is missed</h2>
-<p class="reveal">Most language sites show the numbers that flatter them. These
-are the north-star targets and where the implementation actually sits \u2014
-four of them are still short, and saying so is cheaper than defending a claim
+<p class="reveal">These are the north-star targets and where the implementation
+sits. Four are short. Publishing them is cheaper than defending a number
 nobody can reproduce.</p>
 
 <div class="bars reveal">
@@ -119,36 +165,26 @@ nobody can reproduce.</p>
   <div class="bar-row">
     <span class="what">Engines agreeing</span>
     <span class="bar-track"><span class="bar-fill hit" data-pct="100"></span></span>
-    <span class="num">«corpus» / «corpus»</span>
+    <span class="num">\u00abcorpus\u00bb / \u00abcorpus\u00bb</span>
   </div>
 </div>
 
 <p class="note"><strong>No benchmark here says Grasm beats Rust, Go or Zig.</strong>
-It does not. <a href="status.html">Status</a> records the gaps, and
-<code>scripts/bench.sh</code> refuses to run on a loaded machine rather than
-publish a number it cannot stand behind.</p>
+It does not. <code>scripts/bench.sh</code> refuses to run on a loaded machine
+rather than publish a number it cannot stand behind.</p>
 
-<h2 class="reveal">What is different here</h2>
+<h2 class="reveal">Where to go next</h2>
 <div class="grid three reveal">
-  <div class="card"><h3>Effects, inferred</h3><p>You do not write the row. The
-  compiler works it out from the body and checks it against what you declared,
-  so a function that starts touching the network stops compiling.</p></div>
-  <div class="card"><h3>Capability ceilings</h3><p>A package declares the
-  effects it may perform. One that quietly starts reading files fails to build
-  in every consumer \u2014 a compile error, not a code review.</p></div>
-  <div class="card"><h3>Tiered ownership</h3><p>No lifetime annotations.
-  <code>own</code> and <code>inout</code> at the boundary, a region when a scope
-  should own its allocations, a generational reference when a graph needs
-  one.</p></div>
+  <div class="card"><span class="ico">\u00abicon_book\u00bb</span><h3>Syntax</h3>
+    <p>The whole language on one page, every form with an example.
+    <a href="syntax.html">Read it \u2192</a></p></div>
+  <div class="card"><span class="ico">\u00abicon_shield\u00bb</span><h3>Capabilities</h3>
+    <p>How the ceiling works, and what it deliberately does not do.
+    <a href="security.html">Read it \u2192</a></p></div>
+  <div class="card"><span class="ico">\u00abicon_package\u00bb</span><h3>Packages</h3>
+    <p>\u00abpackages\u00bb libraries, every one written in Grasm.
+    <a href="packages.html">Browse \u2192</a></p></div>
 </div>
-
-<div class="grid three reveal">
-  <div class="card"><div class="stat">«clauses»<small>normative clauses, each with a conformance program</small></div></div>
-  <div class="card"><div class="stat">«spec_lines»<small>lines of specification \u2014 a hard ceiling</small></div></div>
-  <div class="card"><div class="stat">«gates»<small>gates, judged by exit code alone</small></div></div>
-</div>
-
-<p><a class="btn ghost" href="about.html">Read what this is, and is not</a></p>
 """
 )
 
@@ -1129,14 +1165,14 @@ same return value \u2014 and it now reads <code>/etc/passwd</code> and writes it
 out. Nothing about the call site changes. This is not hypothetical; it is the
 shape of every dependency compromise of the last decade.</p>
 
-<div class="demo" id="capability">
-  <div class="head">
-    <h3>mathlib 1.0.0 \u2192 1.0.1</h3>
-    <button class="btn">ship the malicious update</button>
-  </div>
-  <div class="lanes"></div>
-  <div class="terminal"><span class="dim">Press the button to run the attack against four toolchains.</span></div>
+<div class="term">
+  <div class="chrome"><span class="dot"></span><span class="dot"></span><span class="dot"></span>
+    <span>app \u2014 grasm build</span></div>
+  <div class="body"></div>
 </div>
+"""
+    + verdicts()
+    + """
 
 <p>Only Grasm\u2019s toolchain refuses. Everywhere else the tampered code builds,
 ships and runs; detection is left to runtime sandboxing or to a reviewer
@@ -1350,5 +1386,272 @@ evidence.</p>
 the site is written, or read from the last green gate run. None of them is a
 figure somebody remembered. If a gate has not run, the page says so rather than
 printing a number nobody measured.</p>
+"""
+)
+
+
+# ---------------------------------------------------------------- syntax
+
+def _row(name, note, src):
+    return (
+        f'<div class="syn-row"><div class="k">{name}<span>{note}</span></div>'
+        f'<div class="v">{code(src)}</div></div>'
+    )
+
+
+def _table(rows):
+    return '<div class="syn">' + "".join(_row(*r) for r in rows) + "</div>"
+
+
+PAGES["syntax.html"] = (
+    "Every construct in Grasm, with an example of each.",
+    """
+<p class="eyebrow">Reference</p>
+<h1>Syntax</h1>
+<p class="lede">The whole language on one page. Every form below is checked by
+a conformance program in <code>spec/conformance</code>, so an example that
+stopped compiling would fail the build rather than sit here misleading
+somebody.</p>
+
+<h2>Declarations</h2>
+"""
+    + _table([
+        ("fn", "A function. The row after <code>/</code> is inferred and checked.",
+         """fn add(a: i64, b: i64) -> i64 {
+    a + b
+}
+
+fn greet(name: str) / {io} {
+    print("hello, {name}")
+}"""),
+        ("pub", "Visible outside the module. Types are always visible.",
+         """pub fn parse(text: str) -> i64 {
+    text.parse_int() ?? 0
+}"""),
+        ("let / var", "A binding. <code>let</code> cannot be reassigned.",
+         """let limit = 10
+var seen = 0
+seen = seen + 1"""),
+        ("type — struct", "Named fields. At least one.",
+         """type Point = {
+    x: f64,
+    y: f64,
+}"""),
+        ("type — sum", "Alternatives, each with named payload fields.",
+         """type Shape =
+    | Circle(r: f64)
+    | Rect(w: f64, h: f64)
+    | Empty"""),
+        ("type — alias", "Another name for a type.",
+         "type Meters = f64"),
+        ("effect", "An interface a handler supplies at the call site.",
+         """effect Clock {
+    fn now() -> i64
+}"""),
+        ("interface / impl", "A contract and its implementation.",
+         """interface Show {
+    fn show(self) -> str
+}"""),
+        ("import", "A module or package. Named by its last path segment.",
+         "import json\nimport crypto_hash"),
+        ("const", "A module-level value, one for the whole program.",
+         "pub let MAX_RETRIES = 5"),
+        ("test", "A unit test, or a property test when it takes parameters.",
+         """test "reversing twice is the identity" (xs: [i64]) {
+    assert(xs.rev().rev() == xs)
+}"""),
+        ("extern fn", "A C symbol. Tier 3 — every call sits in <code>unsafe</code>.",
+         """extern fn getpid() -> i64
+extern fn strlen(s: str) -> i64"""),
+    ])
+    + """
+<h2>Types</h2>
+"""
+    + _table([
+        ("Primitives", "One integer type, one float, and text is UTF-8.",
+         "let a: i64 = 42\nlet b: f64 = 1.5\nlet c: bool = true\nlet d: str = \"text\""),
+        ("bytes", "A sequence of 0..255. Distinct from <code>[i64]</code> on purpose.",
+         """let raw: bytes = bytes_of([72, 105])
+let from_text = "hi".to_bytes()"""),
+        ("Lists", "Homogeneous and growable.",
+         "let xs: [i64] = [1, 2, 3]\nlet empty: [str] = []"),
+        ("Maps", "Keyed, with <code>get</code> returning an <code>Option</code>.",
+         """var m: Map[str, i64] = map()
+m.set("k", 1)
+let v = m.get("k") ?? 0"""),
+        ("Tuples", "Positional, reached with <code>.0</code>.",
+         "let pair = (1, \"one\")\nlet first = pair.0"),
+        ("Option", "<code>Some</code> or <code>None</code>.",
+         """let found: Option[i64] = Some(3)
+let n = found ?? 0"""),
+        ("Error unions", "<code>T ! E</code> — a value or a failure.",
+         """fn half(n: i64) -> i64 ! MathError {
+    if n % 2 != 0 {
+        fail(NotEven(n))
+    }
+    n / 2
+}"""),
+        ("Function types", "<code>fn(...)</code> closes up; it is a type, not a call.",
+         "fn apply(f: fn(i64) -> i64, v: i64) -> i64 {\n    f(v)\n}"),
+        ("Generics", "Square brackets, on the declaration.",
+         """fn first_of[T](xs: [T]) -> Option[T] {
+    if xs.len() == 0 {
+        return None
+    }
+    Some(xs[0])
+}"""),
+        ("ref T", "Tier 2 — a generational reference, storable in a struct.",
+         """let r = ref(Point{ x: 1.0, y: 2.0 })
+let alive_now = alive(r)
+release(r)"""),
+    ])
+    + """
+<h2>Expressions</h2>
+"""
+    + _table([
+        ("Operators", "<code>and</code>, <code>or</code>, <code>not</code> are words. <code>^</code> is power.",
+         """let a = 1 + 2 * 3 - 4 / 2 % 3
+let b = 2 ^ 8
+let c = a > 0 and not (b < 0)"""),
+        ("Comparison", "Structural, on everything comparable.",
+         "let same = [1, 2] == [1, 2]"),
+        ("if", "An expression: it yields a value.",
+         """let label = if n > 0 {
+    "positive"
+} else {
+    "not"
+}"""),
+        ("match", "Exhaustive. Arms are newline-separated.",
+         """match shape {
+    Circle(r) -> 3.14159 * r ^ 2
+    Rect(w, h) -> w * h
+    Empty -> 0.0
+}"""),
+        ("Patterns", "Literals, wildcards, alternatives, and tuples.",
+         """match n {
+    0 -> "zero"
+    1 | 2 | 3 -> "small"
+    _ -> "large"
+}"""),
+        ("Closures", "<code>|params| body</code>. The body may be a block.",
+         """let double = |n| n * 2
+let total = xs.fold(0, |acc, v| acc + v)"""),
+        ("Interpolation", "<code>{}</code> inside a string. A literal brace is <code>\\{}</code>.",
+         'print("{name} has {xs.len()} item(s)")'),
+        ("try", "A prefix. Propagates the error branch.",
+         """fn load(path: str) -> str ! IoError / {io} {
+    try read_file(path)
+}"""),
+        ("??", "The else of an Option or a fallible call. Lazy.",
+         'let port = env("PORT") ?? "8080"'),
+        ("Pipeline", "<code>|></code> feeds the left into the right.",
+         'let n = xs |> len'),
+        ("Ranges", "<code>..</code> excludes the end, <code>..=</code> includes it.",
+         "for i in 0..10 {\n    print(\"{i}\")\n}"),
+        ("Blocks", "A block is an expression; its last line is its value.",
+         """let v = {
+    let a = 2
+    a * a
+}"""),
+    ])
+    + """
+<h2>Statements and control</h2>
+"""
+    + _table([
+        ("for", "Over a list, a map or a range.",
+         """for x in xs {
+    print("{x}")
+}"""),
+        ("while", "While the condition holds.",
+         """while queue.len() > 0 {
+    let _v = queue.pop()
+}"""),
+        ("break / continue", "Leave or skip an iteration.",
+         """for x in xs {
+    if x < 0 {
+        continue
+    }
+    if x > 99 {
+        break
+    }
+}"""),
+        ("return", "Leaves the function early.",
+         """fn find(xs: [i64], want: i64) -> bool {
+    for x in xs {
+        if x == want {
+            return true
+        }
+    }
+    false
+}"""),
+        ("fail", "Takes the error branch of a <code>T ! E</code>.",
+         "fail(NotEven(n))"),
+        ("Assignment", "<code>=</code>, and the compound forms.",
+         "var n = 0\nn = 5\nn += 1\nn -= 1\nn *= 2\nn /= 2"),
+    ])
+    + """
+<h2>Ownership and effects</h2>
+"""
+    + _table([
+        ("Parameter modes", "Default reads; <code>inout</code> mutates; <code>own</code> takes.",
+         """fn read(xs: [i64]) -> i64 { xs.len() }
+fn grow(inout xs: [i64]) { xs.push(1) }
+fn consume(own xs: [i64]) -> i64 { xs.len() }"""),
+        ("Effect rows", "Written after <code>/</code>. Inferred, then checked.",
+         """fn fetch(url: str) -> str ! IoError / {io, net} {
+    try http_get(url)
+}"""),
+        ("with / handled_by", "Supplies a handler for an effect, for one scope.",
+         """with Clock handled_by ClockHandler{ now: || 1000 } {
+    print("{Clock.now()}")
+}"""),
+        ("region", "Tier 1 — nothing allocated inside may outlive it.",
+         """region {
+    var scratch: [i64] = []
+    scratch.push(1)
+}"""),
+        ("unsafe", "Tier 3 — where the guarantees stop, named in the source.",
+         """unsafe {
+    let pid = getpid()
+}"""),
+        ("parallel / spawn", "Structured concurrency: the block waits for its tasks.",
+         """parallel {
+    spawn {
+        print("one")
+    }
+    spawn {
+        print("two")
+    }
+}"""),
+    ])
+    + """
+<h2>Lexical</h2>
+"""
+    + _table([
+        ("Comments", "<code>//</code> to end of line; <code>/* */</code> nests; <code>///</code> documents.",
+         """// a line
+/* a block /* that nests */ */
+/// documentation for what follows
+fn documented() -> i64 { 1 }"""),
+        ("Numbers", "Decimal, hex, underscores, floats and exponents.",
+         "let a = 1_000_000\nlet b = 0xFF\nlet c = 1.5\nlet d = 1e-9"),
+        ("Strings", "Double-quoted, with escapes; <code>\"\"\"</code> for raw.",
+         'let s = "a\\tb\\n"\nlet raw = """no escapes here"""'),
+        ("Statement ends", "A newline ends a statement. A line may continue if it ends with an operator.",
+         """let total = 1 +
+    2 +
+    3"""),
+        ("Identifiers", "Letters, digits and <code>_</code>; not starting with a digit.",
+         "let snake_case = 1\nlet _ignored = 2"),
+    ])
+    + """
+<p class="note"><strong>One namespace for types.</strong> Every type is
+reachable from every module, which is why <code>pub</code> means nothing on
+one — and why two packages cannot both declare a <code>Node</code>. A generator
+checks the whole package set for that collision on every build.</p>
+
+<p><a href="language.html">The language reference</a> gives the rules behind
+these forms; <a href="spec.html">the specification</a> gives the clause and the
+conformance program for each.</p>
 """
 )

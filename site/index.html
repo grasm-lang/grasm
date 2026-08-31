@@ -5,15 +5,21 @@
 <title>Grasm</title>
 <meta name="description" content="Grasm is a systems language where what a program may do is written in its type.">
 <link rel="stylesheet" href="style.css">
-<script type="importmap">
-{"imports": {
-  "three": "./vendor/three.module.js",
-  "three/addons/utils/BufferGeometryUtils.js": "./vendor/utils/BufferGeometryUtils.js"
-}}
-</script>
 <script src="vendor/motion.js" defer></script>
+<script src="vendor/lottie.js" defer></script>
 <script type="module" src="app.js"></script>
 </head><body data-page="index">
+<header class="topbar">
+  <a class="brand" href="index.html"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 4 7.5v9L12 21l8-4.5v-9L12 3Z"/><path d="M12 12 4 7.5M12 12l8-4.5M12 12v9"/></svg><span>grasm</span></a>
+  <span class="ver">v1.0.0</span>
+  <nav>
+    <a href="start.html">Docs</a>
+    <a href="syntax.html">Syntax</a>
+    <a href="security.html">Security</a>
+    <a href="packages.html">Packages</a>
+    <a href="status.html">Status</a>
+  </nav>
+</header>
 <div class="frame">
 <nav class="rail">
 <a class="mark" href="index.html"><b>grasm</b><span>a systems language</span></a>
@@ -29,6 +35,7 @@
 <a href="concurrency.html">Concurrency</a>
 <a href="security.html">Security</a>
 <h2>Reference</h2>
+<a href="syntax.html">Syntax</a>
 <a href="language.html">Language</a>
 <a href="library.html">Library</a>
 <a href="packages.html">Packages</a>
@@ -43,77 +50,95 @@
 <main>
 
 <div class="hero">
-  <div id="stage" aria-hidden="true"></div>
-  <div class="copy">
-    <p class="eyebrow">A systems language · v1.0.0</p>
-    <h1>What a program may do<br>is written in its type.</h1>
-    <p class="lede">Effects go in the signature. Capabilities go in the package
-    manifest. Ownership is a tier you pick per value. It compiles ahead of time,
-    runs in a browser, and four engines agree byte for byte on every program
-    here.</p>
-    <div class="actions">
-      <a class="btn" href="start.html">Get started</a>
-      <a class="btn ghost" href="security.html">See the capability check</a>
-      <a class="btn ghost" href="playground.html">Try it in the browser</a>
+  <p class="eyebrow">Systems language · v1.0.0</p>
+  <h1>What a program may do is written in its type.</h1>
+  <p class="lede">Effects go in the signature and are inferred from the body.
+  Capabilities go in the package manifest and bound what a dependency can
+  reach. Ownership is a tier you pick per value — no lifetime
+  annotations.</p>
+  <div class="actions">
+    <a class="btn" href="start.html">Get started</a>
+    <a class="btn ghost" href="syntax.html">Syntax reference</a>
+    <a class="btn ghost" href="playground.html">Run it in the browser</a>
+  </div>
+</div>
+
+<div class="split">
+  <div>
+    <h3>A signature is a contract</h3>
+    <p>The row after <code>/</code> says what the function is permitted to do.
+    You do not write it; the compiler works it out from the body and checks it
+    against what you declared.</p>
+<figure class="code"><pre><code><span class="kw">fn</span> <span class="fn">safe_div</span><span class="op">(</span>a<span class="op">:</span> <span class="ty">i64</span><span class="op">,</span> b<span class="op">:</span> <span class="ty">i64</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">i64</span> <span class="op">!</span> <span class="ty">MathError</span> <span class="op">{</span>
+    <span class="kw">if</span> b <span class="op">==</span> <span class="nu">0</span> <span class="op">{</span>
+        <span class="fn">fail</span><span class="op">(</span><span class="ty">DivByZero</span><span class="op">)</span>
+    <span class="op">}</span>
+    a <span class="op">/</span> b
+<span class="op">}</span>
+
+<span class="kw">fn</span> <span class="fn">report</span><span class="op">(</span>n<span class="op">:</span> <span class="ty">i64</span><span class="op">)</span> <span class="op">/</span> <span class="op">{</span>io<span class="op">}</span> <span class="op">{</span>      <span class="cm">// this one prints, and the type says so</span>
+    <span class="fn">print</span><span class="op">(</span><span class="st">"{n}"</span><span class="op">)</span>
+<span class="op">}</span></code></pre><figcaption>! MathError is a failure the caller must handle. / {io} is an effect the caller must be permitted.</figcaption></figure>
+  </div>
+  <div>
+    <h3>A dependency cannot quietly grow teeth</h3>
+    <p>A trusted library ships a patch release that reads your files. Same
+    name, same signature, same result. This is what happens:</p>
+    <div class="term">
+      <div class="chrome"><span class="dot"></span><span class="dot"></span><span class="dot"></span>
+        <span>app — grasm build</span></div>
+      <div class="body"></div>
     </div>
   </div>
 </div>
 
-<h2>The signature is the contract</h2>
-<p>A function’s type says what it returns <em>and</em> what it is allowed to
-do. The row is inferred from the body, so it cannot drift from the truth, and a
-caller that has not been given <code>io</code> cannot call something that
-performs it.</p>
-<pre><code>fn safe_div(a: i64, b: i64) -&gt; i64 ! MathError {
-    if b == 0 {
-        fail(DivByZero)
-    }
-    a / b
-}
-
-fn report(n: i64) / {io} {        // this one prints; the type says so
-    print("{n}")
-}</code></pre>
-<p><code>! MathError</code> is a failure the caller must handle.
-<code>/ {io}</code> is an effect the caller must be permitted. Neither is a
-comment or a convention — both are checked.</p>
-
-<h2 class="reveal">A dependency cannot quietly grow teeth</h2>
-<p class="reveal">This is the one thing here that other languages do not have.
-A library declares what it may reach. If a patch release starts reading your
-files, the build fails — in every consumer, without anybody reviewing the
-diff. Press the button: the verdicts are the ones
-<code>scripts/security_bench.sh</code> produces.</p>
-
-<div class="demo reveal" id="capability">
-  <div class="head">
-    <h3>mathlib 1.0.0 → 1.0.1</h3>
-    <button class="btn">ship the malicious update</button>
-  </div>
-  <div class="lanes"></div>
-  <div class="terminal"><span class="dim">Press the button to run the attack against four toolchains.</span></div>
-</div>
-
-<h2 class="reveal">Four engines, one answer</h2>
-<p class="reveal">The interpreter is normative. A bundle is that interpreter
-with the program attached. <code>--native</code> compiles ahead of time through
-Cranelift. A fourth build targets <code>wasm32</code>. Every gate here exists to
-hold them to the same answer.</p>
-
-<div class="engines reveal">
-  <canvas id="engines" data-programs="275" aria-label="Programs flowing through four engines to a single answer"></canvas>
-</div>
-
+<h2 class="reveal">The same attack, four toolchains</h2>
+<p class="reveal">These verdicts are the ones <code>scripts/security_bench.sh</code>
+produces on every green build. Only one toolchain refuses.</p>
+<div class="verdicts"><div class="verdict-row" data-result="refused"><span class="lang"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 12 5 5L20 6"/></svg>Grasm</span><span class="out">COMPILE ERROR</span><span class="why">inferred effects (io) exceed the declared ceiling ([])</span></div><div class="verdict-row" data-result="clean"><span class="lang"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>Rust</span><span class="out">builds clean</span><span class="why">std::fs is ambient; no capability is recorded</span></div><div class="verdict-row" data-result="clean"><span class="lang"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>Go</span><span class="out">builds clean</span><span class="why">os.ReadFile is importable by any package</span></div><div class="verdict-row" data-result="clean"><span class="lang"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>Python</span><span class="out">compiles clean</span><span class="why">open() needs no import and no declaration</span></div></div><div class="actions"><button class="btn ghost" data-run-verdicts>Run it again</button></div>
 <div class="grid three reveal">
-  <div class="card"><div class="stat">275<small>programs, three engines identical</small></div></div>
-  <div class="card"><div class="stat">236<small>also identical in wasm</small></div></div>
-  <div class="card"><div class="stat">0<small>open defects, any severity</small></div></div>
+  <div class="card">
+    <span class="ico"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg></span>
+    <h3>The ceiling is declared</h3>
+    <p>A package states the effects it may perform. Exceeding it is a compile
+    error in every consumer, not a code review.</p>
+    <div class="lottie" data-lottie="ceiling"></div>
+  </div>
+  <div class="card">
+    <span class="ico"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3 9 5-9 5-9-5 9-5Z"/><path d="m3 13 9 5 9-5"/></svg></span>
+    <h3>Ownership in tiers</h3>
+    <p>Value semantics by default, a region when a scope should own its
+    allocations, a generational reference when a graph needs one.</p>
+    <div class="lottie" data-lottie="tiers"></div>
+  </div>
+  <div class="card">
+    <span class="ico"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h6M4 12h9M4 18h6"/><circle cx="18" cy="6" r="2"/><circle cx="18" cy="18" r="2"/><circle cx="19" cy="12" r="2"/></svg></span>
+    <h3>Four engines, one answer</h3>
+    <p>Interpreter, bundle, native and wasm. Every gate here exists to hold
+    them to the same bytes.</p>
+    <div class="lottie" data-lottie="engines"></div>
+  </div>
+</div>
+
+<h2 class="reveal">Every program, every engine</h2>
+<p class="reveal">The interpreter is normative. The other three have to match
+it, and the corpus is what proves they do.</p>
+<div class="viz reveal">
+  <canvas id="engines" data-programs="275"
+    aria-label="Programs flowing through four engines to one answer"></canvas>
+  <div class="cap">difftest · crosstest · wasmtest — 275 programs, 0 mismatched</div>
+</div>
+
+<div class="figures reveal">
+  <div class="fig"><b>275</b><span>programs, three engines identical</span></div>
+  <div class="fig"><b>236</b><span>also identical in wasm</span></div>
+  <div class="fig"><b>234</b><span>normative clauses</span></div>
+  <div class="fig"><b>0</b><span>open defects, any severity</span></div>
 </div>
 
 <h2 class="reveal">What is measured, including what is missed</h2>
-<p class="reveal">Most language sites show the numbers that flatter them. These
-are the north-star targets and where the implementation actually sits —
-four of them are still short, and saying so is cheaper than defending a claim
+<p class="reveal">These are the north-star targets and where the implementation
+sits. Four are short. Publishing them is cheaper than defending a number
 nobody can reproduce.</p>
 
 <div class="bars reveal">
@@ -145,31 +170,21 @@ nobody can reproduce.</p>
 </div>
 
 <p class="note"><strong>No benchmark here says Grasm beats Rust, Go or Zig.</strong>
-It does not. <a href="status.html">Status</a> records the gaps, and
-<code>scripts/bench.sh</code> refuses to run on a loaded machine rather than
-publish a number it cannot stand behind.</p>
+It does not. <code>scripts/bench.sh</code> refuses to run on a loaded machine
+rather than publish a number it cannot stand behind.</p>
 
-<h2 class="reveal">What is different here</h2>
+<h2 class="reveal">Where to go next</h2>
 <div class="grid three reveal">
-  <div class="card"><h3>Effects, inferred</h3><p>You do not write the row. The
-  compiler works it out from the body and checks it against what you declared,
-  so a function that starts touching the network stops compiling.</p></div>
-  <div class="card"><h3>Capability ceilings</h3><p>A package declares the
-  effects it may perform. One that quietly starts reading files fails to build
-  in every consumer — a compile error, not a code review.</p></div>
-  <div class="card"><h3>Tiered ownership</h3><p>No lifetime annotations.
-  <code>own</code> and <code>inout</code> at the boundary, a region when a scope
-  should own its allocations, a generational reference when a graph needs
-  one.</p></div>
+  <div class="card"><span class="ico"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2V5Z"/><path d="M8 7h7M8 11h7"/></svg></span><h3>Syntax</h3>
+    <p>The whole language on one page, every form with an example.
+    <a href="syntax.html">Read it →</a></p></div>
+  <div class="card"><span class="ico"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 5 6v6c0 4 3 6.5 7 9 4-2.5 7-5 7-9V6l-7-3Z"/><path d="m9 12 2 2 4-4"/></svg></span><h3>Capabilities</h3>
+    <p>How the ceiling works, and what it deliberately does not do.
+    <a href="security.html">Read it →</a></p></div>
+  <div class="card"><span class="ico"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3 8 4.5v9L12 21l-8-4.5v-9L12 3Z"/><path d="M4 7.5 12 12l8-4.5M12 12v9"/></svg></span><h3>Packages</h3>
+    <p>88 libraries, every one written in Grasm.
+    <a href="packages.html">Browse →</a></p></div>
 </div>
-
-<div class="grid three reveal">
-  <div class="card"><div class="stat">234<small>normative clauses, each with a conformance program</small></div></div>
-  <div class="card"><div class="stat">3549<small>lines of specification — a hard ceiling</small></div></div>
-  <div class="card"><div class="stat">23<small>gates, judged by exit code alone</small></div></div>
-</div>
-
-<p><a class="btn ghost" href="about.html">Read what this is, and is not</a></p>
 
 <footer>
 Grasm — four engines, one answer. Every figure on this site is computed,

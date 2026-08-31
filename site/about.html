@@ -5,15 +5,21 @@
 <title>About</title>
 <meta name="description" content="What Grasm is, what it borrowed, and who should not use it.">
 <link rel="stylesheet" href="style.css">
-<script type="importmap">
-{"imports": {
-  "three": "./vendor/three.module.js",
-  "three/addons/utils/BufferGeometryUtils.js": "./vendor/utils/BufferGeometryUtils.js"
-}}
-</script>
 <script src="vendor/motion.js" defer></script>
+<script src="vendor/lottie.js" defer></script>
 <script type="module" src="app.js"></script>
 </head><body data-page="about">
+<header class="topbar">
+  <a class="brand" href="index.html"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 4 7.5v9L12 21l8-4.5v-9L12 3Z"/><path d="M12 12 4 7.5M12 12l8-4.5M12 12v9"/></svg><span>grasm</span></a>
+  <span class="ver">v1.0.0</span>
+  <nav>
+    <a href="start.html">Docs</a>
+    <a href="syntax.html">Syntax</a>
+    <a href="security.html">Security</a>
+    <a href="packages.html">Packages</a>
+    <a href="status.html">Status</a>
+  </nav>
+</header>
 <div class="frame">
 <nav class="rail">
 <a class="mark" href="index.html"><b>grasm</b><span>a systems language</span></a>
@@ -29,6 +35,7 @@
 <a href="concurrency.html">Concurrency</a>
 <a href="security.html">Security</a>
 <h2>Reference</h2>
+<a href="syntax.html">Syntax</a>
 <a href="language.html">Language</a>
 <a href="library.html">Library</a>
 <a href="packages.html">Packages</a>
@@ -46,7 +53,7 @@
 <h1>What this is, and what it is not.</h1>
 <p class="lede">Grasm is a systems language with an effect system, capability
 ceilings on packages, and tiered ownership without lifetime annotations. It is
-version 1.0.0, it has 78 libraries, and every one of them was
+version 1.0.0, it has 88 libraries, and every one of them was
 written inside this repository.</p>
 
 <h2>Nothing here was invented</h2>
@@ -75,7 +82,7 @@ together with gates that prove the combination holds.</p>
 <h2>Who should not use this</h2>
 <p>Most people, today. Specifically:</p>
 <ul>
-  <li><b>If you need libraries.</b> There are 78, all written here.
+  <li><b>If you need libraries.</b> There are 88, all written here.
   Python has hundreds of thousands.</li>
   <li><b>If you need speed.</b> Rust and Zig are faster, and
   <a href="status.html">the numbers here</a> say by how much.</li>

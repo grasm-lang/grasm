@@ -5,15 +5,21 @@
 <title>Errors</title>
 <meta name="description" content="Failure is a value. There is no exception mechanism and no null.">
 <link rel="stylesheet" href="style.css">
-<script type="importmap">
-{"imports": {
-  "three": "./vendor/three.module.js",
-  "three/addons/utils/BufferGeometryUtils.js": "./vendor/utils/BufferGeometryUtils.js"
-}}
-</script>
 <script src="vendor/motion.js" defer></script>
+<script src="vendor/lottie.js" defer></script>
 <script type="module" src="app.js"></script>
 </head><body data-page="errors">
+<header class="topbar">
+  <a class="brand" href="index.html"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 4 7.5v9L12 21l8-4.5v-9L12 3Z"/><path d="M12 12 4 7.5M12 12l8-4.5M12 12v9"/></svg><span>grasm</span></a>
+  <span class="ver">v1.0.0</span>
+  <nav>
+    <a href="start.html">Docs</a>
+    <a href="syntax.html">Syntax</a>
+    <a href="security.html">Security</a>
+    <a href="packages.html">Packages</a>
+    <a href="status.html">Status</a>
+  </nav>
+</header>
 <div class="frame">
 <nav class="rail">
 <a class="mark" href="index.html"><b>grasm</b><span>a systems language</span></a>
@@ -29,6 +35,7 @@
 <a href="concurrency.html">Concurrency</a>
 <a href="security.html">Security</a>
 <h2>Reference</h2>
+<a href="syntax.html">Syntax</a>
 <a href="language.html">Language</a>
 <a href="library.html">Library</a>
 <a href="packages.html">Packages</a>
@@ -47,26 +54,26 @@
 <p class="lede">A function that can fail says so in its type. Ignoring that is a
 compile error, not a runtime one.</p>
 
-<h2>Fallible types</h2><pre><code>type MathError = | DivByZero
+<h2>Fallible types</h2><pre><code><span class="kw">type</span> <span class="ty">MathError</span> <span class="op">=</span> <span class="op">|</span> <span class="ty">DivByZero</span>
 
-fn safe_div(a: i64, b: i64) -&gt; i64 ! MathError {
-    if b == 0 {
-        fail(DivByZero)
-    }
-    a / b
-}</code></pre>
+<span class="kw">fn</span> <span class="fn">safe_div</span><span class="op">(</span>a<span class="op">:</span> <span class="ty">i64</span><span class="op">,</span> b<span class="op">:</span> <span class="ty">i64</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">i64</span> <span class="op">!</span> <span class="ty">MathError</span> <span class="op">{</span>
+    <span class="kw">if</span> b <span class="op">==</span> <span class="nu">0</span> <span class="op">{</span>
+        <span class="fn">fail</span><span class="op">(</span><span class="ty">DivByZero</span><span class="op">)</span>
+    <span class="op">}</span>
+    a <span class="op">/</span> b
+<span class="op">}</span></code></pre>
 <p><code>i64 ! MathError</code> is an <code>i64</code> or a
-<code>MathError</code>. Three ways to open it:</p><pre><code>match safe_div(10, 0) {                 // handle both halves
-    Ok(v) -&gt; print("{v}")
-    Err(e) -&gt; print("caught: {e}")
-}
+<code>MathError</code>. Three ways to open it:</p><pre><code><span class="kw">match</span> <span class="fn">safe_div</span><span class="op">(</span><span class="nu">10</span><span class="op">,</span> <span class="nu">0</span><span class="op">)</span> <span class="op">{</span>                 <span class="cm">// handle both halves</span>
+    <span class="ty">Ok</span><span class="op">(</span>v<span class="op">)</span> <span class="op">-&gt;</span> <span class="fn">print</span><span class="op">(</span><span class="st">"{v}"</span><span class="op">)</span>
+    <span class="ty">Err</span><span class="op">(</span>e<span class="op">)</span> <span class="op">-&gt;</span> <span class="fn">print</span><span class="op">(</span><span class="st">"caught: {e}"</span><span class="op">)</span>
+<span class="op">}</span>
 
-let v = safe_div(10, 2) ?? 0 - 1        // take a default; the right side is lazy
+<span class="kw">let</span> v <span class="op">=</span> <span class="fn">safe_div</span><span class="op">(</span><span class="nu">10</span><span class="op">,</span> <span class="nu">2</span><span class="op">)</span> <span class="op">??</span> <span class="nu">0</span> <span class="op">-</span> <span class="nu">1</span>        <span class="cm">// take a default; the right side is lazy</span>
 
-fn caller() -&gt; i64 ! MathError {
-    let v = try safe_div(10, 2)         // propagate, and say so in the type
-    v * 2
-}</code></pre>
+<span class="kw">fn</span> <span class="fn">caller</span><span class="op">(</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">i64</span> <span class="op">!</span> <span class="ty">MathError</span> <span class="op">{</span>
+    <span class="kw">let</span> v <span class="op">=</span> <span class="kw">try</span> <span class="fn">safe_div</span><span class="op">(</span><span class="nu">10</span><span class="op">,</span> <span class="nu">2</span><span class="op">)</span>         <span class="cm">// propagate, and say so in the type</span>
+    v <span class="op">*</span> <span class="nu">2</span>
+<span class="op">}</span></code></pre>
 <p>What you cannot do is nothing. <code>let _ = risky()</code> is refused too —
 a binding being unnamed says nothing about whether its failure was considered.</p>
 
@@ -78,8 +85,8 @@ program was run, and the specification says which engines print one.</p>
 
 <h2>No null</h2>
 <p>Something that may be absent is an <code>Option[T]</code>, and the compiler
-makes you open it before you can use what is inside.</p><pre><code>let found: Option[i64] = m.get("k")
-print("{found ?? 0}")</code></pre>
+makes you open it before you can use what is inside.</p><pre><code><span class="kw">let</span> found<span class="op">:</span> <span class="ty">Option</span><span class="op">[</span><span class="ty">i64</span><span class="op">]</span> <span class="op">=</span> m<span class="op">.</span><span class="fn">get</span><span class="op">(</span><span class="st">"k"</span><span class="op">)</span>
+<span class="fn">print</span><span class="op">(</span><span class="st">"{found ?? 0}"</span><span class="op">)</span></code></pre>
 <footer>
 Grasm — four engines, one answer. Every figure on this site is computed,
 not typed.

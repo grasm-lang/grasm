@@ -5,15 +5,21 @@
 <title>Concurrency</title>
 <meta name="description" content="Deterministic task ordering, and effects that cross thread boundaries.">
 <link rel="stylesheet" href="style.css">
-<script type="importmap">
-{"imports": {
-  "three": "./vendor/three.module.js",
-  "three/addons/utils/BufferGeometryUtils.js": "./vendor/utils/BufferGeometryUtils.js"
-}}
-</script>
 <script src="vendor/motion.js" defer></script>
+<script src="vendor/lottie.js" defer></script>
 <script type="module" src="app.js"></script>
 </head><body data-page="concurrency">
+<header class="topbar">
+  <a class="brand" href="index.html"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 4 7.5v9L12 21l8-4.5v-9L12 3Z"/><path d="M12 12 4 7.5M12 12l8-4.5M12 12v9"/></svg><span>grasm</span></a>
+  <span class="ver">v1.0.0</span>
+  <nav>
+    <a href="start.html">Docs</a>
+    <a href="syntax.html">Syntax</a>
+    <a href="security.html">Security</a>
+    <a href="packages.html">Packages</a>
+    <a href="status.html">Status</a>
+  </nav>
+</header>
 <div class="frame">
 <nav class="rail">
 <a class="mark" href="index.html"><b>grasm</b><span>a systems language</span></a>
@@ -29,6 +35,7 @@
 <a href="concurrency.html" aria-current="page">Concurrency</a>
 <a href="security.html">Security</a>
 <h2>Reference</h2>
+<a href="syntax.html">Syntax</a>
 <a href="language.html">Language</a>
 <a href="library.html">Library</a>
 <a href="packages.html">Packages</a>
@@ -47,22 +54,22 @@
 <p class="lede">Tasks run in the order they were spawned, the block joins before
 the line after it, and the effect row crosses the boundary with them.</p>
 
-<h2>parallel and spawn</h2><pre><code>fn main() / {io, async} {
-    var log = ""
-    parallel {
-        spawn { log += "a" }
-        spawn { log += "b" }
-    }
-    print(log)          // "ab", every time, on every engine
-}</code></pre>
+<h2>parallel and spawn</h2><pre><code><span class="kw">fn</span> <span class="fn">main</span><span class="op">(</span><span class="op">)</span> <span class="op">/</span> <span class="op">{</span>io<span class="op">,</span> async<span class="op">}</span> <span class="op">{</span>
+    <span class="kw">var</span> log <span class="op">=</span> <span class="st">""</span>
+    parallel <span class="op">{</span>
+        spawn <span class="op">{</span> log <span class="op">+=</span> <span class="st">"a"</span> <span class="op">}</span>
+        spawn <span class="op">{</span> log <span class="op">+=</span> <span class="st">"b"</span> <span class="op">}</span>
+    <span class="op">}</span>
+    <span class="fn">print</span><span class="op">(</span>log<span class="op">)</span>          <span class="cm">// "ab", every time, on every engine</span>
+<span class="op">}</span></code></pre>
 <p>The block records which <code>spawn</code> sites fired, in order, and the
 bodies run afterwards — which is what makes the order deterministic and the
 scope joined. A <code>spawn</code> body <em>sees</em> the enclosing scope rather
 than capturing it, which is the opposite of how a closure behaves and is
 documented as such.</p>
 
-<h2>Data-parallel methods</h2><pre><code>let doubled = xs.par_map(|v| v * 2)
-let evens   = xs.par_filter(|v| v % 2 == 0)</code></pre>
+<h2>Data-parallel methods</h2><pre><code><span class="kw">let</span> doubled <span class="op">=</span> xs<span class="op">.</span><span class="fn">par_map</span><span class="op">(</span><span class="op">|</span>v<span class="op">|</span> v <span class="op">*</span> <span class="nu">2</span><span class="op">)</span>
+<span class="kw">let</span> evens   <span class="op">=</span> xs<span class="op">.</span><span class="fn">par_filter</span><span class="op">(</span><span class="op">|</span>v<span class="op">|</span> v <span class="op">%</span> <span class="nu">2</span> <span class="op">==</span> <span class="nu">0</span><span class="op">)</span></code></pre>
 <p>Both preserve order, and both require the closure to be pure — which the
 effect system can prove rather than assume. A closure that prints will not
 typecheck here.</p>

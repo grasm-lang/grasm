@@ -5,15 +5,21 @@
 <title>Ownership tiers</title>
 <meta name="description" content="Four ways to own a value, chosen per value.">
 <link rel="stylesheet" href="style.css">
-<script type="importmap">
-{"imports": {
-  "three": "./vendor/three.module.js",
-  "three/addons/utils/BufferGeometryUtils.js": "./vendor/utils/BufferGeometryUtils.js"
-}}
-</script>
 <script src="vendor/motion.js" defer></script>
+<script src="vendor/lottie.js" defer></script>
 <script type="module" src="app.js"></script>
 </head><body data-page="tiers">
+<header class="topbar">
+  <a class="brand" href="index.html"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 4 7.5v9L12 21l8-4.5v-9L12 3Z"/><path d="M12 12 4 7.5M12 12l8-4.5M12 12v9"/></svg><span>grasm</span></a>
+  <span class="ver">v1.0.0</span>
+  <nav>
+    <a href="start.html">Docs</a>
+    <a href="syntax.html">Syntax</a>
+    <a href="security.html">Security</a>
+    <a href="packages.html">Packages</a>
+    <a href="status.html">Status</a>
+  </nav>
+</header>
 <div class="frame">
 <nav class="rail">
 <a class="mark" href="index.html"><b>grasm</b><span>a systems language</span></a>
@@ -29,6 +35,7 @@
 <a href="concurrency.html">Concurrency</a>
 <a href="security.html">Security</a>
 <h2>Reference</h2>
+<a href="syntax.html">Syntax</a>
 <a href="language.html">Language</a>
 <a href="library.html">Library</a>
 <a href="packages.html">Packages</a>
@@ -56,24 +63,24 @@ case stays possible.</p>
 <tr><td><b>3</b> — <code>unsafe</code></td><td>The explicit escape, and an effect in the row.</td><td>You are on your own, and the type says so.</td></tr>
 </table></div>
 
-<h2>Tier 2 in practice</h2><pre><code>let counter = ref(0)
-counter.value += 1
+<h2>Tier 2 in practice</h2><pre><code><span class="kw">let</span> counter <span class="op">=</span> <span class="kw">ref</span><span class="op">(</span><span class="nu">0</span><span class="op">)</span>
+counter<span class="op">.</span>value <span class="op">+=</span> <span class="nu">1</span>
 
-let same = counter          // a reference is a word: it copies
-same.value += 1
-print("{counter.value}")    // 2 — both name one slot
+<span class="kw">let</span> same <span class="op">=</span> counter          <span class="cm">// a reference is a word: it copies</span>
+same<span class="op">.</span>value <span class="op">+=</span> <span class="nu">1</span>
+<span class="fn">print</span><span class="op">(</span><span class="st">"{counter.value}"</span><span class="op">)</span>    <span class="cm">// 2 — both name one slot</span>
 
-release(counter)            // the slot goes back
-print("{alive(counter)}")   // false, through every copy of it</code></pre>
+<span class="fn">release</span><span class="op">(</span>counter<span class="op">)</span>            <span class="cm">// the slot goes back</span>
+<span class="fn">print</span><span class="op">(</span><span class="st">"{alive(counter)}"</span><span class="op">)</span>   <span class="cm">// false, through every copy of it</span></code></pre>
 <p>Reclamation is manual. A slot returns to the pool when it is released and not
 before — which is the point of the tier: the lifetime is the program's to state.
 Releasing twice is not an error, so cleanup order is not something every caller
 has to track.</p>
 
-<h2>Tier 1 in practice</h2><pre><code>let n = region {
-    let scratch = build_a_big_thing()
-    scratch.len()               // a scalar may leave; an allocation may not
-}</code></pre>
+<h2>Tier 1 in practice</h2><pre><code><span class="kw">let</span> n <span class="op">=</span> region <span class="op">{</span>
+    <span class="kw">let</span> scratch <span class="op">=</span> <span class="fn">build_a_big_thing</span><span class="op">(</span><span class="op">)</span>
+    scratch<span class="op">.</span><span class="fn">len</span><span class="op">(</span><span class="op">)</span>               <span class="cm">// a scalar may leave; an allocation may not</span>
+<span class="op">}</span></code></pre>
 <p>Three rules give the guarantee: a region may not write to a binding declared
 outside it, may not <code>return</code> through its brace, and yields a scalar
 or nothing. The rule is enforced today; the bulk deallocation it exists to make

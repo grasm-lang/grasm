@@ -5,15 +5,21 @@
 <title>Capabilities and the supply chain</title>
 <meta name="description" content="A Grasm package declares what it may reach, and the compiler enforces it.">
 <link rel="stylesheet" href="style.css">
-<script type="importmap">
-{"imports": {
-  "three": "./vendor/three.module.js",
-  "three/addons/utils/BufferGeometryUtils.js": "./vendor/utils/BufferGeometryUtils.js"
-}}
-</script>
 <script src="vendor/motion.js" defer></script>
+<script src="vendor/lottie.js" defer></script>
 <script type="module" src="app.js"></script>
 </head><body data-page="security">
+<header class="topbar">
+  <a class="brand" href="index.html"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 4 7.5v9L12 21l8-4.5v-9L12 3Z"/><path d="M12 12 4 7.5M12 12l8-4.5M12 12v9"/></svg><span>grasm</span></a>
+  <span class="ver">v1.0.0</span>
+  <nav>
+    <a href="start.html">Docs</a>
+    <a href="syntax.html">Syntax</a>
+    <a href="security.html">Security</a>
+    <a href="packages.html">Packages</a>
+    <a href="status.html">Status</a>
+  </nav>
+</header>
 <div class="frame">
 <nav class="rail">
 <a class="mark" href="index.html"><b>grasm</b><span>a systems language</span></a>
@@ -29,6 +35,7 @@
 <a href="concurrency.html">Concurrency</a>
 <a href="security.html" aria-current="page">Security</a>
 <h2>Reference</h2>
+<a href="syntax.html">Syntax</a>
 <a href="language.html">Language</a>
 <a href="library.html">Library</a>
 <a href="packages.html">Packages</a>
@@ -55,14 +62,12 @@ same return value — and it now reads <code>/etc/passwd</code> and writes it
 out. Nothing about the call site changes. This is not hypothetical; it is the
 shape of every dependency compromise of the last decade.</p>
 
-<div class="demo" id="capability">
-  <div class="head">
-    <h3>mathlib 1.0.0 → 1.0.1</h3>
-    <button class="btn">ship the malicious update</button>
-  </div>
-  <div class="lanes"></div>
-  <div class="terminal"><span class="dim">Press the button to run the attack against four toolchains.</span></div>
+<div class="term">
+  <div class="chrome"><span class="dot"></span><span class="dot"></span><span class="dot"></span>
+    <span>app — grasm build</span></div>
+  <div class="body"></div>
 </div>
+<div class="verdicts"><div class="verdict-row" data-result="refused"><span class="lang"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 12 5 5L20 6"/></svg>Grasm</span><span class="out">COMPILE ERROR</span><span class="why">inferred effects (io) exceed the declared ceiling ([])</span></div><div class="verdict-row" data-result="clean"><span class="lang"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>Rust</span><span class="out">builds clean</span><span class="why">std::fs is ambient; no capability is recorded</span></div><div class="verdict-row" data-result="clean"><span class="lang"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>Go</span><span class="out">builds clean</span><span class="why">os.ReadFile is importable by any package</span></div><div class="verdict-row" data-result="clean"><span class="lang"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>Python</span><span class="out">compiles clean</span><span class="why">open() needs no import and no declaration</span></div></div><div class="actions"><button class="btn ghost" data-run-verdicts>Run it again</button></div>
 
 <p>Only Grasm’s toolchain refuses. Everywhere else the tampered code builds,
 ships and runs; detection is left to runtime sandboxing or to a reviewer
@@ -71,22 +76,22 @@ noticing — neither of which the toolchain does.</p>
 <h2>How it works</h2>
 <p>Two halves. The first is the effect row, which is <em>inferred</em>, so it
 cannot be wrong about the body:</p>
-<pre><code>// the row is worked out from the body, then checked against what you wrote
-fn load(path: str) -&gt; str ! IoError / {io} {
-    try read_file(path)
-}</code></pre>
+<pre><code><span class="cm">// the row is worked out from the body, then checked against what you wrote</span>
+<span class="kw">fn</span> <span class="fn">load</span><span class="op">(</span>path<span class="op">:</span> <span class="ty">str</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">str</span> <span class="op">!</span> <span class="ty">IoError</span> <span class="op">/</span> <span class="op">{</span>io<span class="op">}</span> <span class="op">{</span>
+    <span class="kw">try</span> <span class="fn">read_file</span><span class="op">(</span>path<span class="op">)</span>
+<span class="op">}</span></code></pre>
 <p>The second is the manifest, which is the ceiling for the whole package:</p>
-<pre><code>[package]
-name = "mathlib"
-version = "1.0.1"
+<pre><code><span class="op">[</span>package<span class="op">]</span>
+name <span class="op">=</span> <span class="st">"mathlib"</span>
+version <span class="op">=</span> <span class="st">"1.0.1"</span>
 
-capabilities = []        # this package may perform no effect at all</code></pre>
+capabilities <span class="op">=</span> <span class="op">[</span><span class="op">]</span>        # this package may perform no <span class="kw">effect</span> at all</code></pre>
 <p>Add the <code>read_file</code> and the package performs <code>io</code>,
 which exceeds <code>[]</code>. The error names the exact place:</p>
-<pre><code>error: package `mathlib` performs `io` but its manifest only permits nothing
-  help: either add the capability to that package's manifest, or stop it
-        from performing the effect
-  performed: `io` at mathlib/src/main.gr:2:9</code></pre>
+<pre><code>error<span class="op">:</span> package `mathlib` performs `io` but its manifest only permits nothing
+  help<span class="op">:</span> either add the capability to that package's manifest<span class="op">,</span> <span class="kw">or</span> stop it
+        from performing the <span class="kw">effect</span>
+  performed<span class="op">:</span> `io` at mathlib<span class="op">/</span>src<span class="op">/</span>main<span class="op">.</span>gr<span class="op">:</span><span class="nu">2</span><span class="op">:</span><span class="nu">9</span></code></pre>
 <p>The maintainer <em>can</em> raise the ceiling — but the manifest is in the
 diff, and a package that used to declare <code>[]</code> and now declares
 <code>["io"]</code> is one line a consumer can see, refuse, or gate in CI.

@@ -5,15 +5,21 @@
 <title>Getting started</title>
 <meta name="description" content="Write, run and compile your first Grasm program.">
 <link rel="stylesheet" href="style.css">
-<script type="importmap">
-{"imports": {
-  "three": "./vendor/three.module.js",
-  "three/addons/utils/BufferGeometryUtils.js": "./vendor/utils/BufferGeometryUtils.js"
-}}
-</script>
 <script src="vendor/motion.js" defer></script>
+<script src="vendor/lottie.js" defer></script>
 <script type="module" src="app.js"></script>
 </head><body data-page="start">
+<header class="topbar">
+  <a class="brand" href="index.html"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 4 7.5v9L12 21l8-4.5v-9L12 3Z"/><path d="M12 12 4 7.5M12 12l8-4.5M12 12v9"/></svg><span>grasm</span></a>
+  <span class="ver">v1.0.0</span>
+  <nav>
+    <a href="start.html">Docs</a>
+    <a href="syntax.html">Syntax</a>
+    <a href="security.html">Security</a>
+    <a href="packages.html">Packages</a>
+    <a href="status.html">Status</a>
+  </nav>
+</header>
 <div class="frame">
 <nav class="rail">
 <a class="mark" href="index.html"><b>grasm</b><span>a systems language</span></a>
@@ -29,6 +35,7 @@
 <a href="concurrency.html">Concurrency</a>
 <a href="security.html">Security</a>
 <h2>Reference</h2>
+<a href="syntax.html">Syntax</a>
 <a href="language.html">Language</a>
 <a href="library.html">Library</a>
 <a href="packages.html">Packages</a>
@@ -47,48 +54,48 @@
 <p class="lede">A first program, run three ways, in about two minutes.</p>
 
 <h2>1. Write it</h2>
-<p>Put this in <code>hello.gr</code>.</p><pre><code>fn main() {
-    print("hello from grasm")
-}</code></pre>
+<p>Put this in <code>hello.gr</code>.</p><pre><code><span class="kw">fn</span> <span class="fn">main</span><span class="op">(</span><span class="op">)</span> <span class="op">{</span>
+    <span class="fn">print</span><span class="op">(</span><span class="st">"hello from grasm"</span><span class="op">)</span>
+<span class="op">}</span></code></pre>
 <p><code>main</code> needs no effect row: it is the entry point, and the
 capability to print is granted there. Every other function that prints must say
 so.</p>
 
-<h2>2. Run it</h2><pre><code>grasm run hello.gr</code></pre>
+<h2>2. Run it</h2><pre><code>grasm run hello<span class="op">.</span>gr</code></pre>
 <p>That is the interpreter, and it is normative: where the engines could ever
 disagree, it is the one that is right by definition.</p>
 
-<h2>3. Compile it</h2><pre><code>grasm build hello.gr --native -o hello
-./hello</code></pre>
+<h2>3. Compile it</h2><pre><code>grasm build hello<span class="op">.</span>gr <span class="op">-</span><span class="op">-</span>native <span class="op">-</span>o hello
+<span class="op">.</span><span class="op">/</span>hello</code></pre>
 <p>Ahead-of-time through Cranelift. Byte-for-byte the same stdout, the same exit
 code. Drop <code>--native</code> and you get a bundle instead — the interpreter
 with your program attached, one file, no toolchain needed to run it.</p>
 
 <h2>4. Something that can fail</h2>
 <p>Failure is a value, not an exception. A function that can fail says so in its
-type, and a caller that ignores it does not compile.</p><pre><code>type MathError = | DivByZero
+type, and a caller that ignores it does not compile.</p><pre><code><span class="kw">type</span> <span class="ty">MathError</span> <span class="op">=</span> <span class="op">|</span> <span class="ty">DivByZero</span>
 
-fn safe_div(a: i64, b: i64) -&gt; i64 ! MathError {
-    if b == 0 {
-        fail(DivByZero)
-    }
-    a / b
-}
+<span class="kw">fn</span> <span class="fn">safe_div</span><span class="op">(</span>a<span class="op">:</span> <span class="ty">i64</span><span class="op">,</span> b<span class="op">:</span> <span class="ty">i64</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">i64</span> <span class="op">!</span> <span class="ty">MathError</span> <span class="op">{</span>
+    <span class="kw">if</span> b <span class="op">==</span> <span class="nu">0</span> <span class="op">{</span>
+        <span class="fn">fail</span><span class="op">(</span><span class="ty">DivByZero</span><span class="op">)</span>
+    <span class="op">}</span>
+    a <span class="op">/</span> b
+<span class="op">}</span>
 
-fn main() {
-    match safe_div(10, 0) {
-        Ok(v) -&gt; print("{v}")
-        Err(e) -&gt; print("caught: {e}")
-    }
+<span class="kw">fn</span> <span class="fn">main</span><span class="op">(</span><span class="op">)</span> <span class="op">{</span>
+    <span class="kw">match</span> <span class="fn">safe_div</span><span class="op">(</span><span class="nu">10</span><span class="op">,</span> <span class="nu">0</span><span class="op">)</span> <span class="op">{</span>
+        <span class="ty">Ok</span><span class="op">(</span>v<span class="op">)</span> <span class="op">-&gt;</span> <span class="fn">print</span><span class="op">(</span><span class="st">"{v}"</span><span class="op">)</span>
+        <span class="ty">Err</span><span class="op">(</span>e<span class="op">)</span> <span class="op">-&gt;</span> <span class="fn">print</span><span class="op">(</span><span class="st">"caught: {e}"</span><span class="op">)</span>
+    <span class="op">}</span>
 
-    // or take a default and move on
-    print("{safe_div(10, 0) ?? 0 - 1}")
-}
+    <span class="cm">// or take a default and move on</span>
+    <span class="fn">print</span><span class="op">(</span><span class="st">"{safe_div(10, 0) ?? 0 - 1}"</span><span class="op">)</span>
+<span class="op">}</span>
 
-test "division works" {
-    let v = try safe_div(10, 2)
-    assert_eq(v, 5)
-}</code></pre>
+<span class="kw">test</span> <span class="st">"division works"</span> <span class="op">{</span>
+    <span class="kw">let</span> v <span class="op">=</span> <span class="kw">try</span> <span class="fn">safe_div</span><span class="op">(</span><span class="nu">10</span><span class="op">,</span> <span class="nu">2</span><span class="op">)</span>
+    <span class="fn">assert_eq</span><span class="op">(</span>v<span class="op">,</span> <span class="nu">5</span><span class="op">)</span>
+<span class="op">}</span></code></pre>
 <p>Tests live beside the code and run with <code>grasm test</code>.</p>
 
 <h2>Next</h2>

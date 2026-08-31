@@ -1,10 +1,9 @@
 site/vendor/ contains third-party JavaScript, vendored rather than fetched so
 the site makes no external request and renders under a strict content policy.
 
-  three.module.js, three.core.js, GLTFLoader.js
-      three.js r185 — MIT — Copyright 2010-2026 three.js authors
   motion.js
       Motion — MIT — Copyright Framer B.V.
+  lottie.js
+      lottie-web (lottie_light) — MIT — Copyright Airbnb
 
-Neither is modified except for one import path in three.module.js, rewritten
-from `./three.core.min.js` to the name the file is vendored under.
+Neither is modified.

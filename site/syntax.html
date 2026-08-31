@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Syntax</title>
+<meta name="description" content="Every construct in Grasm, with an example of each.">
+<link rel="stylesheet" href="style.css">
+<script src="vendor/motion.js" defer></script>
+<script src="vendor/lottie.js" defer></script>
+<script type="module" src="app.js"></script>
+</head><body data-page="syntax">
+<header class="topbar">
+  <a class="brand" href="index.html"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 4 7.5v9L12 21l8-4.5v-9L12 3Z"/><path d="M12 12 4 7.5M12 12l8-4.5M12 12v9"/></svg><span>grasm</span></a>
+  <span class="ver">v1.0.0</span>
+  <nav>
+    <a href="start.html">Docs</a>
+    <a href="syntax.html">Syntax</a>
+    <a href="security.html">Security</a>
+    <a href="packages.html">Packages</a>
+    <a href="status.html">Status</a>
+  </nav>
+</header>
+<div class="frame">
+<nav class="rail">
+<a class="mark" href="index.html"><b>grasm</b><span>a systems language</span></a>
+<h2>Start</h2>
+<a href="start.html">Getting started</a>
+<a href="install.html">Install</a>
+<a href="playground.html">Playground</a>
+<h2>Learn</h2>
+<a href="tour.html">Tour</a>
+<a href="effects.html">Effects</a>
+<a href="tiers.html">Ownership</a>
+<a href="errors.html">Errors</a>
+<a href="concurrency.html">Concurrency</a>
+<a href="security.html">Security</a>
+<h2>Reference</h2>
+<a href="syntax.html" aria-current="page">Syntax</a>
+<a href="language.html">Language</a>
+<a href="library.html">Library</a>
+<a href="packages.html">Packages</a>
+<a href="spec.html">Specification</a>
+<a href="architecture.html">Architecture</a>
+<h2>More</h2>
+<a href="examples.html">Examples</a>
+<a href="about.html">About</a>
+<a href="status.html">Status</a>
+<a href="roadmap.html">Roadmap</a>
+</nav>
+<main>
+
+<p class="eyebrow">Reference</p>
+<h1>Syntax</h1>
+<p class="lede">The whole language on one page. Every form below is checked by
+a conformance program in <code>spec/conformance</code>, so an example that
+stopped compiling would fail the build rather than sit here misleading
+somebody.</p>
+
+<h2>Declarations</h2>
+<div class="syn"><div class="syn-row"><div class="k">fn<span>A function. The row after <code>/</code> is inferred and checked.</span></div><div class="v"><pre><code><span class="kw">fn</span> <span class="fn">add</span><span class="op">(</span>a<span class="op">:</span> <span class="ty">i64</span><span class="op">,</span> b<span class="op">:</span> <span class="ty">i64</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">i64</span> <span class="op">{</span>
+    a <span class="op">+</span> b
+<span class="op">}</span>
+
+<span class="kw">fn</span> <span class="fn">greet</span><span class="op">(</span>name<span class="op">:</span> <span class="ty">str</span><span class="op">)</span> <span class="op">/</span> <span class="op">{</span>io<span class="op">}</span> <span class="op">{</span>
+    <span class="fn">print</span><span class="op">(</span><span class="st">"hello, {name}"</span><span class="op">)</span>
+<span class="op">}</span></code></pre></div></div><div class="syn-row"><div class="k">pub<span>Visible outside the module. Types are always visible.</span></div><div class="v"><pre><code><span class="kw">pub</span> <span class="kw">fn</span> <span class="fn">parse</span><span class="op">(</span>text<span class="op">:</span> <span class="ty">str</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">i64</span> <span class="op">{</span>
+    text<span class="op">.</span><span class="fn">parse_int</span><span class="op">(</span><span class="op">)</span> <span class="op">??</span> <span class="nu">0</span>
+<span class="op">}</span></code></pre></div></div><div class="syn-row"><div class="k">let / var<span>A binding. <code>let</code> cannot be reassigned.</span></div><div class="v"><pre><code><span class="kw">let</span> limit <span class="op">=</span> <span class="nu">10</span>
+<span class="kw">var</span> seen <span class="op">=</span> <span class="nu">0</span>
+seen <span class="op">=</span> seen <span class="op">+</span> <span class="nu">1</span></code></pre></div></div><div class="syn-row"><div class="k">type — struct<span>Named fields. At least one.</span></div><div class="v"><pre><code><span class="kw">type</span> <span class="ty">Point</span> <span class="op">=</span> <span class="op">{</span>
+    x<span class="op">:</span> <span class="ty">f64</span><span class="op">,</span>
+    y<span class="op">:</span> <span class="ty">f64</span><span class="op">,</span>
+<span class="op">}</span></code></pre></div></div><div class="syn-row"><div class="k">type — sum<span>Alternatives, each with named payload fields.</span></div><div class="v"><pre><code><span class="kw">type</span> <span class="ty">Shape</span> <span class="op">=</span>
+    <span class="op">|</span> <span class="ty">Circle</span><span class="op">(</span>r<span class="op">:</span> <span class="ty">f64</span><span class="op">)</span>
+    <span class="op">|</span> <span class="ty">Rect</span><span class="op">(</span>w<span class="op">:</span> <span class="ty">f64</span><span class="op">,</span> h<span class="op">:</span> <span class="ty">f64</span><span class="op">)</span>
+    <span class="op">|</span> <span class="ty">Empty</span></code></pre></div></div><div class="syn-row"><div class="k">type — alias<span>Another name for a type.</span></div><div class="v"><pre><code><span class="kw">type</span> <span class="ty">Meters</span> <span class="op">=</span> <span class="ty">f64</span></code></pre></div></div><div class="syn-row"><div class="k">effect<span>An interface a handler supplies at the call site.</span></div><div class="v"><pre><code><span class="kw">effect</span> <span class="ty">Clock</span> <span class="op">{</span>
+    <span class="kw">fn</span> <span class="fn">now</span><span class="op">(</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">i64</span>
+<span class="op">}</span></code></pre></div></div><div class="syn-row"><div class="k">interface / impl<span>A contract and its implementation.</span></div><div class="v"><pre><code><span class="kw">interface</span> <span class="ty">Show</span> <span class="op">{</span>
+    <span class="kw">fn</span> <span class="fn">show</span><span class="op">(</span>self<span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">str</span>
+<span class="op">}</span></code></pre></div></div><div class="syn-row"><div class="k">import<span>A module or package. Named by its last path segment.</span></div><div class="v"><pre><code><span class="kw">import</span> json
+<span class="kw">import</span> crypto_hash</code></pre></div></div><div class="syn-row"><div class="k">const<span>A module-level value, one for the whole program.</span></div><div class="v"><pre><code><span class="kw">pub</span> <span class="kw">let</span> <span class="ty">MAX_RETRIES</span> <span class="op">=</span> <span class="nu">5</span></code></pre></div></div><div class="syn-row"><div class="k">test<span>A unit test, or a property test when it takes parameters.</span></div><div class="v"><pre><code><span class="kw">test</span> <span class="st">"reversing twice is the identity"</span> <span class="op">(</span>xs<span class="op">:</span> <span class="op">[</span><span class="ty">i64</span><span class="op">]</span><span class="op">)</span> <span class="op">{</span>
+    <span class="fn">assert</span><span class="op">(</span>xs<span class="op">.</span><span class="fn">rev</span><span class="op">(</span><span class="op">)</span><span class="op">.</span><span class="fn">rev</span><span class="op">(</span><span class="op">)</span> <span class="op">==</span> xs<span class="op">)</span>
+<span class="op">}</span></code></pre></div></div><div class="syn-row"><div class="k">extern fn<span>A C symbol. Tier 3 — every call sits in <code>unsafe</code>.</span></div><div class="v"><pre><code>extern <span class="kw">fn</span> <span class="fn">getpid</span><span class="op">(</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">i64</span>
+extern <span class="kw">fn</span> <span class="fn">strlen</span><span class="op">(</span>s<span class="op">:</span> <span class="ty">str</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">i64</span></code></pre></div></div></div>
+<h2>Types</h2>
+<div class="syn"><div class="syn-row"><div class="k">Primitives<span>One integer type, one float, and text is UTF-8.</span></div><div class="v"><pre><code><span class="kw">let</span> a<span class="op">:</span> <span class="ty">i64</span> <span class="op">=</span> <span class="nu">42</span>
+<span class="kw">let</span> b<span class="op">:</span> <span class="ty">f64</span> <span class="op">=</span> <span class="nu">1.5</span>
+<span class="kw">let</span> c<span class="op">:</span> <span class="ty">bool</span> <span class="op">=</span> <span class="kw">true</span>
+<span class="kw">let</span> d<span class="op">:</span> <span class="ty">str</span> <span class="op">=</span> <span class="st">"text"</span></code></pre></div></div><div class="syn-row"><div class="k">bytes<span>A sequence of 0..255. Distinct from <code>[i64]</code> on purpose.</span></div><div class="v"><pre><code><span class="kw">let</span> raw<span class="op">:</span> <span class="ty">bytes</span> <span class="op">=</span> <span class="fn">bytes_of</span><span class="op">(</span><span class="op">[</span><span class="nu">72</span><span class="op">,</span> <span class="nu">105</span><span class="op">]</span><span class="op">)</span>
+<span class="kw">let</span> from_text <span class="op">=</span> <span class="st">"hi"</span><span class="op">.</span><span class="fn">to_bytes</span><span class="op">(</span><span class="op">)</span></code></pre></div></div><div class="syn-row"><div class="k">Lists<span>Homogeneous and growable.</span></div><div class="v"><pre><code><span class="kw">let</span> xs<span class="op">:</span> <span class="op">[</span><span class="ty">i64</span><span class="op">]</span> <span class="op">=</span> <span class="op">[</span><span class="nu">1</span><span class="op">,</span> <span class="nu">2</span><span class="op">,</span> <span class="nu">3</span><span class="op">]</span>
+<span class="kw">let</span> empty<span class="op">:</span> <span class="op">[</span><span class="ty">str</span><span class="op">]</span> <span class="op">=</span> <span class="op">[</span><span class="op">]</span></code></pre></div></div><div class="syn-row"><div class="k">Maps<span>Keyed, with <code>get</code> returning an <code>Option</code>.</span></div><div class="v"><pre><code><span class="kw">var</span> m<span class="op">:</span> <span class="ty">Map</span><span class="op">[</span><span class="ty">str</span><span class="op">,</span> <span class="ty">i64</span><span class="op">]</span> <span class="op">=</span> <span class="fn">map</span><span class="op">(</span><span class="op">)</span>
+m<span class="op">.</span><span class="fn">set</span><span class="op">(</span><span class="st">"k"</span><span class="op">,</span> <span class="nu">1</span><span class="op">)</span>
+<span class="kw">let</span> v <span class="op">=</span> m<span class="op">.</span><span class="fn">get</span><span class="op">(</span><span class="st">"k"</span><span class="op">)</span> <span class="op">??</span> <span class="nu">0</span></code></pre></div></div><div class="syn-row"><div class="k">Tuples<span>Positional, reached with <code>.0</code>.</span></div><div class="v"><pre><code><span class="kw">let</span> pair <span class="op">=</span> <span class="op">(</span><span class="nu">1</span><span class="op">,</span> <span class="st">"one"</span><span class="op">)</span>
+<span class="kw">let</span> first <span class="op">=</span> pair<span class="op">.</span><span class="nu">0</span></code></pre></div></div><div class="syn-row"><div class="k">Option<span><code>Some</code> or <code>None</code>.</span></div><div class="v"><pre><code><span class="kw">let</span> found<span class="op">:</span> <span class="ty">Option</span><span class="op">[</span><span class="ty">i64</span><span class="op">]</span> <span class="op">=</span> <span class="ty">Some</span><span class="op">(</span><span class="nu">3</span><span class="op">)</span>
+<span class="kw">let</span> n <span class="op">=</span> found <span class="op">??</span> <span class="nu">0</span></code></pre></div></div><div class="syn-row"><div class="k">Error unions<span><code>T ! E</code> — a value or a failure.</span></div><div class="v"><pre><code><span class="kw">fn</span> <span class="fn">half</span><span class="op">(</span>n<span class="op">:</span> <span class="ty">i64</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">i64</span> <span class="op">!</span> <span class="ty">MathError</span> <span class="op">{</span>
+    <span class="kw">if</span> n <span class="op">%</span> <span class="nu">2</span> <span class="op">!=</span> <span class="nu">0</span> <span class="op">{</span>
+        <span class="fn">fail</span><span class="op">(</span><span class="ty">NotEven</span><span class="op">(</span>n<span class="op">)</span><span class="op">)</span>
+    <span class="op">}</span>
+    n <span class="op">/</span> <span class="nu">2</span>
+<span class="op">}</span></code></pre></div></div><div class="syn-row"><div class="k">Function types<span><code>fn(...)</code> closes up; it is a type, not a call.</span></div><div class="v"><pre><code><span class="kw">fn</span> <span class="fn">apply</span><span class="op">(</span>f<span class="op">:</span> <span class="kw">fn</span><span class="op">(</span><span class="ty">i64</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">i64</span><span class="op">,</span> v<span class="op">:</span> <span class="ty">i64</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">i64</span> <span class="op">{</span>
+    <span class="fn">f</span><span class="op">(</span>v<span class="op">)</span>
+<span class="op">}</span></code></pre></div></div><div class="syn-row"><div class="k">Generics<span>Square brackets, on the declaration.</span></div><div class="v"><pre><code><span class="kw">fn</span> first_of<span class="op">[</span><span class="ty">T</span><span class="op">]</span><span class="op">(</span>xs<span class="op">:</span> <span class="op">[</span><span class="ty">T</span><span class="op">]</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">Option</span><span class="op">[</span><span class="ty">T</span><span class="op">]</span> <span class="op">{</span>
+    <span class="kw">if</span> xs<span class="op">.</span><span class="fn">len</span><span class="op">(</span><span class="op">)</span> <span class="op">==</span> <span class="nu">0</span> <span class="op">{</span>
+        <span class="kw">return</span> <span class="ty">None</span>
+    <span class="op">}</span>
+    <span class="ty">Some</span><span class="op">(</span>xs<span class="op">[</span><span class="nu">0</span><span class="op">]</span><span class="op">)</span>
+<span class="op">}</span></code></pre></div></div><div class="syn-row"><div class="k">ref T<span>Tier 2 — a generational reference, storable in a struct.</span></div><div class="v"><pre><code><span class="kw">let</span> r <span class="op">=</span> <span class="kw">ref</span><span class="op">(</span><span class="ty">Point</span><span class="op">{</span> x<span class="op">:</span> <span class="nu">1.0</span><span class="op">,</span> y<span class="op">:</span> <span class="nu">2.0</span> <span class="op">}</span><span class="op">)</span>
+<span class="kw">let</span> alive_now <span class="op">=</span> <span class="fn">alive</span><span class="op">(</span>r<span class="op">)</span>
+<span class="fn">release</span><span class="op">(</span>r<span class="op">)</span></code></pre></div></div></div>
+<h2>Expressions</h2>
+<div class="syn"><div class="syn-row"><div class="k">Operators<span><code>and</code>, <code>or</code>, <code>not</code> are words. <code>^</code> is power.</span></div><div class="v"><pre><code><span class="kw">let</span> a <span class="op">=</span> <span class="nu">1</span> <span class="op">+</span> <span class="nu">2</span> <span class="op">*</span> <span class="nu">3</span> <span class="op">-</span> <span class="nu">4</span> <span class="op">/</span> <span class="nu">2</span> <span class="op">%</span> <span class="nu">3</span>
+<span class="kw">let</span> b <span class="op">=</span> <span class="nu">2</span> <span class="op">^</span> <span class="nu">8</span>
+<span class="kw">let</span> c <span class="op">=</span> a <span class="op">&gt;</span> <span class="nu">0</span> <span class="kw">and</span> <span class="kw">not</span> <span class="op">(</span>b <span class="op">&lt;</span> <span class="nu">0</span><span class="op">)</span></code></pre></div></div><div class="syn-row"><div class="k">Comparison<span>Structural, on everything comparable.</span></div><div class="v"><pre><code><span class="kw">let</span> same <span class="op">=</span> <span class="op">[</span><span class="nu">1</span><span class="op">,</span> <span class="nu">2</span><span class="op">]</span> <span class="op">==</span> <span class="op">[</span><span class="nu">1</span><span class="op">,</span> <span class="nu">2</span><span class="op">]</span></code></pre></div></div><div class="syn-row"><div class="k">if<span>An expression: it yields a value.</span></div><div class="v"><pre><code><span class="kw">let</span> label <span class="op">=</span> <span class="kw">if</span> n <span class="op">&gt;</span> <span class="nu">0</span> <span class="op">{</span>
+    <span class="st">"positive"</span>
+<span class="op">}</span> <span class="kw">else</span> <span class="op">{</span>
+    <span class="st">"not"</span>
+<span class="op">}</span></code></pre></div></div><div class="syn-row"><div class="k">match<span>Exhaustive. Arms are newline-separated.</span></div><div class="v"><pre><code><span class="kw">match</span> shape <span class="op">{</span>
+    <span class="ty">Circle</span><span class="op">(</span>r<span class="op">)</span> <span class="op">-&gt;</span> <span class="nu">3.14159</span> <span class="op">*</span> r <span class="op">^</span> <span class="nu">2</span>
+    <span class="ty">Rect</span><span class="op">(</span>w<span class="op">,</span> h<span class="op">)</span> <span class="op">-&gt;</span> w <span class="op">*</span> h
+    <span class="ty">Empty</span> <span class="op">-&gt;</span> <span class="nu">0.0</span>
+<span class="op">}</span></code></pre></div></div><div class="syn-row"><div class="k">Patterns<span>Literals, wildcards, alternatives, and tuples.</span></div><div class="v"><pre><code><span class="kw">match</span> n <span class="op">{</span>
+    <span class="nu">0</span> <span class="op">-&gt;</span> <span class="st">"zero"</span>
+    <span class="nu">1</span> <span class="op">|</span> <span class="nu">2</span> <span class="op">|</span> <span class="nu">3</span> <span class="op">-&gt;</span> <span class="st">"small"</span>
+    _ <span class="op">-&gt;</span> <span class="st">"large"</span>
+<span class="op">}</span></code></pre></div></div><div class="syn-row"><div class="k">Closures<span><code>|params| body</code>. The body may be a block.</span></div><div class="v"><pre><code><span class="kw">let</span> double <span class="op">=</span> <span class="op">|</span>n<span class="op">|</span> n <span class="op">*</span> <span class="nu">2</span>
+<span class="kw">let</span> total <span class="op">=</span> xs<span class="op">.</span><span class="fn">fold</span><span class="op">(</span><span class="nu">0</span><span class="op">,</span> <span class="op">|</span>acc<span class="op">,</span> v<span class="op">|</span> acc <span class="op">+</span> v<span class="op">)</span></code></pre></div></div><div class="syn-row"><div class="k">Interpolation<span><code>{}</code> inside a string. A literal brace is <code>\{}</code>.</span></div><div class="v"><pre><code><span class="fn">print</span><span class="op">(</span><span class="st">"{name} has {xs.len()} item(s)"</span><span class="op">)</span></code></pre></div></div><div class="syn-row"><div class="k">try<span>A prefix. Propagates the error branch.</span></div><div class="v"><pre><code><span class="kw">fn</span> <span class="fn">load</span><span class="op">(</span>path<span class="op">:</span> <span class="ty">str</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">str</span> <span class="op">!</span> <span class="ty">IoError</span> <span class="op">/</span> <span class="op">{</span>io<span class="op">}</span> <span class="op">{</span>
+    <span class="kw">try</span> <span class="fn">read_file</span><span class="op">(</span>path<span class="op">)</span>
+<span class="op">}</span></code></pre></div></div><div class="syn-row"><div class="k">??<span>The else of an Option or a fallible call. Lazy.</span></div><div class="v"><pre><code><span class="kw">let</span> port <span class="op">=</span> <span class="fn">env</span><span class="op">(</span><span class="st">"PORT"</span><span class="op">)</span> <span class="op">??</span> <span class="st">"8080"</span></code></pre></div></div><div class="syn-row"><div class="k">Pipeline<span><code>|></code> feeds the left into the right.</span></div><div class="v"><pre><code><span class="kw">let</span> n <span class="op">=</span> xs <span class="op">|&gt;</span> len</code></pre></div></div><div class="syn-row"><div class="k">Ranges<span><code>..</code> excludes the end, <code>..=</code> includes it.</span></div><div class="v"><pre><code><span class="kw">for</span> i <span class="kw">in</span> <span class="nu">0</span><span class="op">..</span><span class="nu">10</span> <span class="op">{</span>
+    <span class="fn">print</span><span class="op">(</span><span class="st">"{i}"</span><span class="op">)</span>
+<span class="op">}</span></code></pre></div></div><div class="syn-row"><div class="k">Blocks<span>A block is an expression; its last line is its value.</span></div><div class="v"><pre><code><span class="kw">let</span> v <span class="op">=</span> <span class="op">{</span>
+    <span class="kw">let</span> a <span class="op">=</span> <span class="nu">2</span>
+    a <span class="op">*</span> a
+<span class="op">}</span></code></pre></div></div></div>
+<h2>Statements and control</h2>
+<div class="syn"><div class="syn-row"><div class="k">for<span>Over a list, a map or a range.</span></div><div class="v"><pre><code><span class="kw">for</span> x <span class="kw">in</span> xs <span class="op">{</span>
+    <span class="fn">print</span><span class="op">(</span><span class="st">"{x}"</span><span class="op">)</span>
+<span class="op">}</span></code></pre></div></div><div class="syn-row"><div class="k">while<span>While the condition holds.</span></div><div class="v"><pre><code><span class="kw">while</span> queue<span class="op">.</span><span class="fn">len</span><span class="op">(</span><span class="op">)</span> <span class="op">&gt;</span> <span class="nu">0</span> <span class="op">{</span>
+    <span class="kw">let</span> _v <span class="op">=</span> queue<span class="op">.</span><span class="fn">pop</span><span class="op">(</span><span class="op">)</span>
+<span class="op">}</span></code></pre></div></div><div class="syn-row"><div class="k">break / continue<span>Leave or skip an iteration.</span></div><div class="v"><pre><code><span class="kw">for</span> x <span class="kw">in</span> xs <span class="op">{</span>
+    <span class="kw">if</span> x <span class="op">&lt;</span> <span class="nu">0</span> <span class="op">{</span>
+        <span class="kw">continue</span>
+    <span class="op">}</span>
+    <span class="kw">if</span> x <span class="op">&gt;</span> <span class="nu">99</span> <span class="op">{</span>
+        <span class="kw">break</span>
+    <span class="op">}</span>
+<span class="op">}</span></code></pre></div></div><div class="syn-row"><div class="k">return<span>Leaves the function early.</span></div><div class="v"><pre><code><span class="kw">fn</span> <span class="fn">find</span><span class="op">(</span>xs<span class="op">:</span> <span class="op">[</span><span class="ty">i64</span><span class="op">]</span><span class="op">,</span> want<span class="op">:</span> <span class="ty">i64</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">bool</span> <span class="op">{</span>
+    <span class="kw">for</span> x <span class="kw">in</span> xs <span class="op">{</span>
+        <span class="kw">if</span> x <span class="op">==</span> want <span class="op">{</span>
+            <span class="kw">return</span> <span class="kw">true</span>
+        <span class="op">}</span>
+    <span class="op">}</span>
+    <span class="kw">false</span>
+<span class="op">}</span></code></pre></div></div><div class="syn-row"><div class="k">fail<span>Takes the error branch of a <code>T ! E</code>.</span></div><div class="v"><pre><code><span class="fn">fail</span><span class="op">(</span><span class="ty">NotEven</span><span class="op">(</span>n<span class="op">)</span><span class="op">)</span></code></pre></div></div><div class="syn-row"><div class="k">Assignment<span><code>=</code>, and the compound forms.</span></div><div class="v"><pre><code><span class="kw">var</span> n <span class="op">=</span> <span class="nu">0</span>
+n <span class="op">=</span> <span class="nu">5</span>
+n <span class="op">+=</span> <span class="nu">1</span>
+n <span class="op">-=</span> <span class="nu">1</span>
+n <span class="op">*=</span> <span class="nu">2</span>
+n <span class="op">/=</span> <span class="nu">2</span></code></pre></div></div></div>
+<h2>Ownership and effects</h2>
+<div class="syn"><div class="syn-row"><div class="k">Parameter modes<span>Default reads; <code>inout</code> mutates; <code>own</code> takes.</span></div><div class="v"><pre><code><span class="kw">fn</span> <span class="fn">read</span><span class="op">(</span>xs<span class="op">:</span> <span class="op">[</span><span class="ty">i64</span><span class="op">]</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">i64</span> <span class="op">{</span> xs<span class="op">.</span><span class="fn">len</span><span class="op">(</span><span class="op">)</span> <span class="op">}</span>
+<span class="kw">fn</span> <span class="fn">grow</span><span class="op">(</span><span class="kw">inout</span> xs<span class="op">:</span> <span class="op">[</span><span class="ty">i64</span><span class="op">]</span><span class="op">)</span> <span class="op">{</span> xs<span class="op">.</span><span class="fn">push</span><span class="op">(</span><span class="nu">1</span><span class="op">)</span> <span class="op">}</span>
+<span class="kw">fn</span> <span class="fn">consume</span><span class="op">(</span><span class="kw">own</span> xs<span class="op">:</span> <span class="op">[</span><span class="ty">i64</span><span class="op">]</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">i64</span> <span class="op">{</span> xs<span class="op">.</span><span class="fn">len</span><span class="op">(</span><span class="op">)</span> <span class="op">}</span></code></pre></div></div><div class="syn-row"><div class="k">Effect rows<span>Written after <code>/</code>. Inferred, then checked.</span></div><div class="v"><pre><code><span class="kw">fn</span> <span class="fn">fetch</span><span class="op">(</span>url<span class="op">:</span> <span class="ty">str</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">str</span> <span class="op">!</span> <span class="ty">IoError</span> <span class="op">/</span> <span class="op">{</span>io<span class="op">,</span> net<span class="op">}</span> <span class="op">{</span>
+    <span class="kw">try</span> <span class="fn">http_get</span><span class="op">(</span>url<span class="op">)</span>
+<span class="op">}</span></code></pre></div></div><div class="syn-row"><div class="k">with / handled_by<span>Supplies a handler for an effect, for one scope.</span></div><div class="v"><pre><code><span class="kw">with</span> <span class="ty">Clock</span> <span class="kw">handled_by</span> <span class="ty">ClockHandler</span><span class="op">{</span> now<span class="op">:</span> <span class="op">|</span><span class="op">|</span> <span class="nu">1000</span> <span class="op">}</span> <span class="op">{</span>
+    <span class="fn">print</span><span class="op">(</span><span class="st">"{Clock.now()}"</span><span class="op">)</span>
+<span class="op">}</span></code></pre></div></div><div class="syn-row"><div class="k">region<span>Tier 1 — nothing allocated inside may outlive it.</span></div><div class="v"><pre><code>region <span class="op">{</span>
+    <span class="kw">var</span> scratch<span class="op">:</span> <span class="op">[</span><span class="ty">i64</span><span class="op">]</span> <span class="op">=</span> <span class="op">[</span><span class="op">]</span>
+    scratch<span class="op">.</span><span class="fn">push</span><span class="op">(</span><span class="nu">1</span><span class="op">)</span>
+<span class="op">}</span></code></pre></div></div><div class="syn-row"><div class="k">unsafe<span>Tier 3 — where the guarantees stop, named in the source.</span></div><div class="v"><pre><code><span class="kw">unsafe</span> <span class="op">{</span>
+    <span class="kw">let</span> pid <span class="op">=</span> <span class="fn">getpid</span><span class="op">(</span><span class="op">)</span>
+<span class="op">}</span></code></pre></div></div><div class="syn-row"><div class="k">parallel / spawn<span>Structured concurrency: the block waits for its tasks.</span></div><div class="v"><pre><code>parallel <span class="op">{</span>
+    spawn <span class="op">{</span>
+        <span class="fn">print</span><span class="op">(</span><span class="st">"one"</span><span class="op">)</span>
+    <span class="op">}</span>
+    spawn <span class="op">{</span>
+        <span class="fn">print</span><span class="op">(</span><span class="st">"two"</span><span class="op">)</span>
+    <span class="op">}</span>
+<span class="op">}</span></code></pre></div></div></div>
+<h2>Lexical</h2>
+<div class="syn"><div class="syn-row"><div class="k">Comments<span><code>//</code> to end of line; <code>/* */</code> nests; <code>///</code> documents.</span></div><div class="v"><pre><code><span class="cm">// a line</span>
+<span class="op">/</span><span class="op">*</span> a block <span class="op">/</span><span class="op">*</span> that nests <span class="op">*</span><span class="op">/</span> <span class="op">*</span><span class="op">/</span>
+<span class="cm">/// documentation for what follows</span>
+<span class="kw">fn</span> <span class="fn">documented</span><span class="op">(</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">i64</span> <span class="op">{</span> <span class="nu">1</span> <span class="op">}</span></code></pre></div></div><div class="syn-row"><div class="k">Numbers<span>Decimal, hex, underscores, floats and exponents.</span></div><div class="v"><pre><code><span class="kw">let</span> a <span class="op">=</span> <span class="nu">1_000_000</span>
+<span class="kw">let</span> b <span class="op">=</span> 0xFF
+<span class="kw">let</span> c <span class="op">=</span> <span class="nu">1.5</span>
+<span class="kw">let</span> d <span class="op">=</span> 1e<span class="op">-</span><span class="nu">9</span></code></pre></div></div><div class="syn-row"><div class="k">Strings<span>Double-quoted, with escapes; <code>"""</code> for raw.</span></div><div class="v"><pre><code><span class="kw">let</span> s <span class="op">=</span> <span class="st">"a\tb\n"</span>
+<span class="kw">let</span> raw <span class="op">=</span> <span class="st">""</span><span class="st">"no escapes here"</span><span class="st">""</span></code></pre></div></div><div class="syn-row"><div class="k">Statement ends<span>A newline ends a statement. A line may continue if it ends with an operator.</span></div><div class="v"><pre><code><span class="kw">let</span> total <span class="op">=</span> <span class="nu">1</span> <span class="op">+</span>
+    <span class="nu">2</span> <span class="op">+</span>
+    <span class="nu">3</span></code></pre></div></div><div class="syn-row"><div class="k">Identifiers<span>Letters, digits and <code>_</code>; not starting with a digit.</span></div><div class="v"><pre><code><span class="kw">let</span> snake_case <span class="op">=</span> <span class="nu">1</span>
+<span class="kw">let</span> _ignored <span class="op">=</span> <span class="nu">2</span></code></pre></div></div></div>
+<p class="note"><strong>One namespace for types.</strong> Every type is
+reachable from every module, which is why <code>pub</code> means nothing on
+one — and why two packages cannot both declare a <code>Node</code>. A generator
+checks the whole package set for that collision on every build.</p>
+
+<p><a href="language.html">The language reference</a> gives the rules behind
+these forms; <a href="spec.html">the specification</a> gives the clause and the
+conformance program for each.</p>
+
+<footer>
+Grasm — four engines, one answer. Every figure on this site is computed,
+not typed.
+<a href="status.html">Status</a> ·
+<a href="spec.html">Specification</a> ·
+<a href="roadmap.html">Roadmap</a>
+</footer>
+</main>
+</div>
+</body></html>
