@@ -1,0 +1,95 @@
+// Wrapping prose to a width, and the two things that make it look wrong.
+//
+// A word longer than the width has nowhere to go: breaking it mid-word is
+// usually worse than letting one line run over, so that is what this does and
+// says so. And a wrapper that trims trailing spaces after joining produces a
+// different string than one that trims before, on exactly the inputs with
+// double spaces — so the split is on words, once, and the join adds them back.
+
+/// `text` broken into lines no longer than `width`, except where a single word
+/// is longer than `width` and is left whole.
+pub fn wrap(text: str, width: i64) -> [str] {
+    var out: [str] = []
+    for para in text.split("\n") {
+        let words = para.words()
+        if words.len() == 0 {
+            out.push("")
+        } else {
+            var line = ""
+            for w in words {
+                if line == "" {
+                    line = w
+                } else {
+                    if line.len() + 1 + w.len() <= width {
+                        line = line + " " + w
+                    } else {
+                        out.push(line)
+                        line = w
+                    }
+                }
+            }
+            if line != "" {
+                out.push(line)
+            }
+        }
+    }
+    return out
+}
+
+pub fn fill(text: str, width: i64) -> str {
+    return wrap(text, width).join("\n")
+}
+
+/// Every line prefixed. Blank lines stay blank rather than becoming a line of
+/// trailing whitespace, which is what a diff would otherwise show.
+pub fn indent(text: str, prefix: str) -> str {
+    var out: [str] = []
+    for line in text.split("\n") {
+        if line == "" {
+            out.push("")
+        } else {
+            out.push(prefix + line)
+        }
+    }
+    return out.join("\n")
+}
+
+pub fn dedent(text: str) -> str {
+    var least = 0 - 1
+    for line in text.split("\n") {
+        if line.trim() != "" {
+            var n = 0
+            for c in line.chars() {
+                if c == " " {
+                    n = n + 1
+                } else {
+                    break
+                }
+            }
+            if least < 0 or n < least {
+                least = n
+            }
+        }
+    }
+    if least <= 0 {
+        return text
+    }
+    var out: [str] = []
+    for line in text.split("\n") {
+        if line.len() >= least {
+            out.push(line.substr(least, line.len() - least))
+        } else {
+            out.push(line.trim())
+        }
+    }
+    return out.join("\n")
+}
+
+/// `text` centred in `width`, and left alone when it does not fit.
+pub fn center(text: str, width: i64) -> str {
+    if text.len() >= width {
+        return text
+    }
+    let left = (width - text.len()) / 2
+    return " ".repeat(left) + text
+}

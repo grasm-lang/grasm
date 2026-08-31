@@ -1,0 +1,112 @@
+// Shell globs: `*`, `?`, `[abc]`, and `**` across path separators.
+//
+// The distinction that matters is `*` against `**`. A single star stops at a
+// `/`, so `src/*.gr` does not reach `src/deep/x.gr`; a double star crosses
+// them. Every tool that gets this wrong either misses files or walks the whole
+// tree, and both look like the tool is broken rather than the pattern.
+//
+// Matching is a backtracking walk rather than a compiled automaton. Patterns
+// here are short and matched against short paths, and the simple version is
+// the one that can be read against its own tests.
+
+fn is_sep(c: str) -> bool {
+    return c == "/"
+}
+
+/// Whether `name` matches `pattern`.
+pub fn matches(pattern: str, name: str) -> bool {
+    let p = pattern.chars()
+    let s = name.chars()
+    return walk(p, 0, s, 0)
+}
+
+fn walk(p: [str], pi: i64, s: [str], si: i64) -> bool {
+    var i = pi
+    var j = si
+    while i < p.len() {
+        let c = p[i]
+        if c == "*" {
+            // `**` crosses separators; `*` stops at one.
+            let double = i + 1 < p.len() and p[i + 1] == "*"
+            let rest = if double { i + 2 } else { i + 1 }
+            // Try every split, shortest first.
+            var k = j
+            while k <= s.len() {
+                if walk(p, rest, s, k) {
+                    return true
+                }
+                if k < s.len() and is_sep(s[k]) and not double {
+                    k = s.len() + 1
+                } else {
+                    k = k + 1
+                }
+            }
+            return false
+        }
+        if j >= s.len() {
+            return false
+        }
+        if c == "?" {
+            if is_sep(s[j]) {
+                return false
+            }
+            i = i + 1
+            j = j + 1
+        } else {
+            if c == "[" {
+                var end = i + 1
+                while end < p.len() and p[end] != "]" {
+                    end = end + 1
+                }
+                if end >= p.len() {
+                    return false
+                }
+                var negate = false
+                var from = i + 1
+                if from < end and (p[from] == "!" or p[from] == "^") {
+                    negate = true
+                    from = from + 1
+                }
+                var hit = false
+                var k = from
+                while k < end {
+                    // `a-z` inside a class is a range.
+                    if k + 2 < end and p[k + 1] == "-" {
+                        if s[j] >= p[k] and s[j] <= p[k + 2] {
+                            hit = true
+                        }
+                        k = k + 3
+                    } else {
+                        if p[k] == s[j] {
+                            hit = true
+                        }
+                        k = k + 1
+                    }
+                }
+                if hit == negate {
+                    return false
+                }
+                i = end + 1
+                j = j + 1
+            } else {
+                if c != s[j] {
+                    return false
+                }
+                i = i + 1
+                j = j + 1
+            }
+        }
+    }
+    return j == s.len()
+}
+
+/// Every name in `names` that matches.
+pub fn filter(pattern: str, names: [str]) -> [str] {
+    var out: [str] = []
+    for n in names {
+        if matches(pattern, n) {
+            out.push(n)
+        }
+    }
+    return out
+}

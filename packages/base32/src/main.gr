@@ -1,0 +1,79 @@
+// Base32, RFC 4648, with and without padding.
+//
+// Base32 exists where base64 cannot go: case-insensitive filesystems, DNS
+// labels, and anything a person has to read aloud. The alphabet deliberately
+// omits `0`, `1` and `8` so they cannot be confused with `O`, `I` and `B`.
+
+fn alphabet() -> str {
+    return "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+}
+
+type Base32Error = | NotBase32(at: i64)
+
+pub fn encode(b: bytes) -> str {
+    let a = alphabet().chars()
+    var out = ""
+    var i = 0
+    while i < b.len() {
+        // Five bytes become eight characters; a short tail is padded with
+        // zero bits and then with `=` so the length is always a multiple of 8.
+        var chunk: [i64] = []
+        for k in 0..5 {
+            chunk.push(if i + k < b.len() { b.at(i + k) } else { 0 })
+        }
+        let have = if b.len() - i < 5 { b.len() - i } else { 5 }
+        var acc = 0
+        for k in 0..5 {
+            acc = acc * 256 + chunk[k]
+        }
+        var chars: [str] = []
+        for k in 0..8 {
+            let shift = 35 - k * 5
+            chars.push(a[(acc / (2 ^ shift)) % 32])
+        }
+        let keep = [0, 2, 4, 5, 7, 8][have]
+        for k in 0..8 {
+            if k < keep {
+                out = out + chars[k]
+            } else {
+                out = out + "="
+            }
+        }
+        i = i + 5
+    }
+    return out
+}
+
+fn value_of(c: str) -> i64 {
+    let a = alphabet().chars()
+    for i in 0..a.len() {
+        if a[i] == c {
+            return i
+        }
+    }
+    return 0 - 1
+}
+
+pub fn decode(s: str) -> bytes ! Base32Error {
+    var bits = 0
+    var acc = 0
+    var out: [i64] = []
+    let cs = s.to_upper().chars()
+    var i = 0
+    // Padding only ever follows data, and everything after it is padding too,
+    // so the first `=` ends the input.
+    while i < cs.len() and cs[i] != "=" {
+        let v = value_of(cs[i])
+        if v < 0 {
+            fail(NotBase32(i))
+        }
+        acc = acc * 32 + v
+        bits = bits + 5
+        if bits >= 8 {
+            bits = bits - 8
+            out.push((acc / (2 ^ bits)) % 256)
+        }
+        i = i + 1
+    }
+    return bytes_of(out)
+}

@@ -1,0 +1,6 @@
+[package]
+name = "semver"
+version = "1.0.0"
+
+# Parsing text. Opens nothing.
+capabilities = []

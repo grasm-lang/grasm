@@ -1,0 +1,88 @@
+// A double-ended queue over a ring buffer.
+//
+// A list removes from the front by moving every remaining element, so a queue
+// built on one costs O(n) per dequeue and quietly turns a loop into a
+// quadratic one. A ring moves the *index* instead and costs O(1) at both ends.
+//
+// The buffer grows by doubling and is re-laid-out in order when it does, which
+// is the one place the wraparound is untangled.
+
+type Ring = {
+    slot: [i64],
+    head: i64,
+    size: i64,
+}
+
+pub fn new_ring() -> Ring {
+    var s: [i64] = []
+    for _i in 0..8 {
+        s.push(0)
+    }
+    return Ring{ slot: s, head: 0, size: 0 }
+}
+
+pub fn len(r: Ring) -> i64 {
+    return r.size
+}
+
+pub fn is_empty(r: Ring) -> bool {
+    return r.size == 0
+}
+
+fn grow(inout r: Ring) {
+    let cap = r.slot.len()
+    if r.size < cap {
+        return
+    }
+    var bigger: [i64] = []
+    for i in 0..r.size {
+        bigger.push(r.slot[(r.head + i) % cap])
+    }
+    for _i in 0..(cap * 2 - r.size) {
+        bigger.push(0)
+    }
+    r.slot = bigger
+    r.head = 0
+}
+
+pub fn push_back(inout r: Ring, v: i64) {
+    grow(r)
+    let cap = r.slot.len()
+    r.slot[(r.head + r.size) % cap] = v
+    r.size = r.size + 1
+}
+
+pub fn push_front(inout r: Ring, v: i64) {
+    grow(r)
+    let cap = r.slot.len()
+    r.head = (r.head + cap - 1) % cap
+    r.slot[r.head] = v
+    r.size = r.size + 1
+}
+
+pub fn pop_front(inout r: Ring) -> Option[i64] {
+    if r.size == 0 {
+        return None
+    }
+    let v = r.slot[r.head]
+    r.head = (r.head + 1) % r.slot.len()
+    r.size = r.size - 1
+    return Some(v)
+}
+
+pub fn pop_back(inout r: Ring) -> Option[i64] {
+    if r.size == 0 {
+        return None
+    }
+    let v = r.slot[(r.head + r.size - 1) % r.slot.len()]
+    r.size = r.size - 1
+    return Some(v)
+}
+
+/// The element `i` places from the front, without removing it.
+pub fn at(r: Ring, i: i64) -> Option[i64] {
+    if i < 0 or i >= r.size {
+        return None
+    }
+    return Some(r.slot[(r.head + i) % r.slot.len()])
+}

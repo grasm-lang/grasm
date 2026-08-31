@@ -1,0 +1,6 @@
+[package]
+name = "glob"
+version = "1.0.0"
+
+# Matching text. Opens nothing.
+capabilities = []

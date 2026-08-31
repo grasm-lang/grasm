@@ -1,0 +1,6 @@
+[package]
+name = "textwrap"
+version = "1.0.0"
+
+# Reflowing text. Opens nothing.
+capabilities = []

@@ -1,0 +1,6 @@
+[package]
+name = "unionfind"
+version = "1.0.0"
+
+# Arithmetic over indices. Opens nothing.
+capabilities = []

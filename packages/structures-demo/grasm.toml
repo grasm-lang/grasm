@@ -1,0 +1,24 @@
+[package]
+name = "structures_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.heap]
+path = "../heap"
+version = "^1.0.0"
+
+[dependencies.deque]
+path = "../deque"
+version = "^1.0.0"
+
+[dependencies.bitset]
+path = "../bitset"
+version = "^1.0.0"
+
+[dependencies.unionfind]
+path = "../unionfind"
+version = "^1.0.0"
+
+[dependencies.semver]
+path = "../semver"
+version = "^1.0.0"

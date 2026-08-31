@@ -1,0 +1,73 @@
+// Edit distance, and the "did you mean" it exists to power.
+//
+// The full matrix is O(n*m) in memory and nothing here needs the matrix — only
+// the number — so two rows are kept and the rest is discarded. For the strings
+// this is used on, command names and identifiers, that is the difference
+// between a few hundred bytes and a few hundred thousand.
+
+/// The number of single-character edits between `a` and `b`.
+pub fn distance(a: str, b: str) -> i64 {
+    let x = a.chars()
+    let y = b.chars()
+    if x.len() == 0 {
+        return y.len()
+    }
+    if y.len() == 0 {
+        return x.len()
+    }
+    var prev: [i64] = []
+    for j in 0..(y.len() + 1) {
+        prev.push(j)
+    }
+    for i in 0..x.len() {
+        var row: [i64] = [i + 1]
+        for j in 0..y.len() {
+            let cost = if x[i] == y[j] { 0 } else { 1 }
+            var best = prev[j] + cost
+            let del = prev[j + 1] + 1
+            let ins = row[j] + 1
+            if del < best {
+                best = del
+            }
+            if ins < best {
+                best = ins
+            }
+            row.push(best)
+        }
+        prev = row
+    }
+    return prev[y.len()]
+}
+
+/// Distance as a fraction of the longer string: 1.0 is identical.
+pub fn similarity(a: str, b: str) -> f64 {
+    let longest = if a.len() > b.len() { a.len() } else { b.len() }
+    if longest == 0 {
+        return 1.0
+    }
+    return 1.0 - distance(a, b).as_f64() / longest.as_f64()
+}
+
+/// The closest of `options` to `word`, or `None` when nothing is close enough.
+///
+/// The cutoff is a third of the word's length, which is the rule that keeps
+/// "did you mean" from suggesting something unrelated with confidence.
+pub fn closest(word: str, options: [str]) -> Option[str] {
+    var best = ""
+    var best_d = 0 - 1
+    for o in options {
+        let d = distance(word, o)
+        if best_d < 0 or d < best_d {
+            best_d = d
+            best = o
+        }
+    }
+    if best_d < 0 {
+        return None
+    }
+    let cutoff = word.len() / 3 + 1
+    if best_d > cutoff {
+        return None
+    }
+    return Some(best)
+}

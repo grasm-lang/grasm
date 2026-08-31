@@ -1,0 +1,116 @@
+// One program covering five structures, rather than five programs covering one
+// each.
+//
+// Every demo here is run by four engines in the agreement gates, so a package
+// per program would cost four runs per package. Grouping keeps the coverage
+// and the cost down, and it exercises the multi-module bundler at the same
+// time — five imports in one binary is the shape a real program has.
+import heap
+import deque
+import bitset
+import unionfind
+import semver
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+
+    print("-- the heap gives them back smallest first")
+    var h = heap.new_heap()
+    for n in [42, 7, 19, 3, 88, 3] {
+        heap.push(h, n, "v{n}")
+    }
+    say(f, "six in, six out", heap.len(h) == 6)
+    var order: [i64] = []
+    while not heap.is_empty(h) {
+        match heap.pop(h) {
+            None -> {}
+            Some(pair) -> order.push(pair.0)
+        }
+    }
+    say(f, "ascending", order == [3, 3, 7, 19, 42, 88])
+    say(f, "empty pops nothing", heap.pop(h) == None)
+
+    print("-- the ring is O(1) at both ends and survives a wrap")
+    var r = deque.new_ring()
+    for n in 0..40 {
+        deque.push_back(r, n)
+    }
+    say(f, "grew past its first buffer", deque.len(r) == 40)
+    say(f, "front is the first pushed", deque.pop_front(r) == Some(0))
+    say(f, "back is the last", deque.pop_back(r) == Some(39))
+    deque.push_front(r, 999)
+    say(f, "push_front lands at the front", deque.at(r, 0) == Some(999))
+
+    print("-- the bit set holds sixty-three to the word")
+    var b = bitset.new_bits(200)
+    for v in [0, 62, 63, 64, 199] {
+        bitset.add(b, v)
+    }
+    say(f, "counts what was added", bitset.count(b) == 5)
+    say(f, "holds across a word boundary", bitset.holds(b, 62) and bitset.holds(b, 63))
+    say(f, "refuses what is out of range", not bitset.holds(b, 200))
+    bitset.remove(b, 63)
+    say(f, "remove removes one", bitset.count(b) == 4 and not bitset.holds(b, 63))
+    var c = bitset.new_bits(200)
+    bitset.add(c, 62)
+    bitset.add(c, 199)
+    bitset.intersect_with(b, c)
+    say(f, "intersection keeps the common two", bitset.members(b) == [62, 199])
+
+    print("-- disjoint sets merge and answer")
+    var d = unionfind.new_sets(10)
+    say(f, "ten groups to begin with", unionfind.group_count(d) == 10)
+    let joined = unionfind.union(d, 1, 2)
+    let again = unionfind.union(d, 2, 1)
+    say(f, "merging twice merges once", joined and not again)
+    let _u1 = unionfind.union(d, 2, 3)
+    let _u2 = unionfind.union(d, 8, 9)
+    say(f, "1 and 3 are connected through 2", unionfind.connected(d, 1, 3))
+    say(f, "1 and 8 are not", not unionfind.connected(d, 1, 8))
+    say(f, "seven groups remain", unionfind.group_count(d) == 7)
+
+    print("-- versions, and the rule everyone gets wrong")
+    match semver.parse("1.4.2") {
+        Err(_e) -> say(f, "parses a release", false)
+        Ok(v) -> say(f, "parses a release", semver.render(v) == "1.4.2")
+    }
+    match semver.parse("2.0.0-alpha.1") {
+        Err(_e) -> say(f, "parses a pre-release", false)
+        Ok(v) -> say(f, "parses a pre-release", v.pre == "alpha.1")
+    }
+    match semver.parse("1.2") {
+        Err(_e) -> say(f, "nonsense is refused", true)
+        Ok(_v) -> say(f, "nonsense is refused", false)
+    }
+    match semver.parse("1.0.0-alpha") {
+        Err(_e) -> say(f, "comparison", false)
+        Ok(x) -> {
+            match semver.parse("1.0.0") {
+                Err(_e2) -> say(f, "comparison", false)
+                Ok(y) -> {
+                    say(f, "a pre-release is BELOW its release", semver.compare(x, y) < 0)
+                    say(f, "and the release is above it", semver.compare(y, x) > 0)
+                    say(f, "^1.0.0 accepts 1.0.0", semver.satisfies_caret(y, "^1.0.0") ?? false)
+                    say(f, "^1.0.0 refuses the pre-release",
+                        not (semver.satisfies_caret(x, "^1.0.0") ?? true))
+                }
+            }
+        }
+    }
+
+    print("")
+    if f == 0 {
+        print("all held")
+    } else {
+        print("{f} failed")
+    }
+}

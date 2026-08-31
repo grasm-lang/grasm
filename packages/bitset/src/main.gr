@@ -1,0 +1,97 @@
+// A dense set of small non-negative integers, one bit each.
+//
+// A `[bool]` costs eight bytes a member here, because Grasm has one integer
+// type and a list holds machine words. Sixty-four members to the word is a
+// 64x saving, and for the sets this is meant for — which rows of a table were
+// touched, which opcodes a program used — that is the difference between a
+// structure that fits in cache and one that does not.
+
+type BitSet = {
+    word: [i64],
+    bound: i64,
+}
+
+/// A set able to hold `0..n`.
+pub fn new_bits(n: i64) -> BitSet {
+    var w: [i64] = []
+    var words = n / 63 + 1
+    for _i in 0..words {
+        w.push(0)
+    }
+    return BitSet{ word: w, bound: n }
+}
+
+/// Sixty-three bits to the word, not sixty-four.
+///
+/// The top bit of an `i64` is its sign, and a debug build checks overflow, so
+/// a word that used all sixty-four would panic in the build the gates run and
+/// pass in the build people ship. One bit is cheaper than that difference.
+fn per_word() -> i64 {
+    return 63
+}
+
+pub fn add(inout s: BitSet, v: i64) {
+    if v < 0 or v >= s.bound {
+        return
+    }
+    let w = v / per_word()
+    s.word[w] = s.word[w].bit_or(2 ^ (v % per_word()))
+}
+
+pub fn remove(inout s: BitSet, v: i64) {
+    if v < 0 or v >= s.bound {
+        return
+    }
+    let w = v / per_word()
+    let bit = 2 ^ (v % per_word())
+    if s.word[w].bit_and(bit) != 0 {
+        s.word[w] = s.word[w] - bit
+    }
+}
+
+pub fn holds(s: BitSet, v: i64) -> bool {
+    if v < 0 or v >= s.bound {
+        return false
+    }
+    return s.word[v / per_word()].bit_and(2 ^ (v % per_word())) != 0
+}
+
+pub fn count(s: BitSet) -> i64 {
+    var n = 0
+    for w in s.word {
+        var v = w
+        while v != 0 {
+            n = n + v % 2
+            v = v / 2
+        }
+    }
+    return n
+}
+
+pub fn members(s: BitSet) -> [i64] {
+    var out: [i64] = []
+    for v in 0..s.bound {
+        if holds(s, v) {
+            out.push(v)
+        }
+    }
+    return out
+}
+
+pub fn union_with(inout s: BitSet, other: BitSet) {
+    for i in 0..s.word.len() {
+        if i < other.word.len() {
+            s.word[i] = s.word[i].bit_or(other.word[i])
+        }
+    }
+}
+
+pub fn intersect_with(inout s: BitSet, other: BitSet) {
+    for i in 0..s.word.len() {
+        if i < other.word.len() {
+            s.word[i] = s.word[i].bit_and(other.word[i])
+        } else {
+            s.word[i] = 0
+        }
+    }
+}

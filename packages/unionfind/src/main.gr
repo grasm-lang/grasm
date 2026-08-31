@@ -1,0 +1,69 @@
+// Disjoint sets: "are these two in the same group, and merge them if not".
+//
+// The naive version walks a parent chain and degrades to a linked list. Two
+// standard repairs keep it flat: **union by size**, which hangs the smaller
+// tree under the larger, and **path compression**, which points every node
+// visited straight at the root on the way back. Together they make the cost
+// per operation effectively constant.
+//
+// Path compression is why `find` takes `inout`: asking a question here changes
+// the structure, and hiding that behind a read-only signature would be a lie
+// the type system is in a position to catch.
+
+type Disjoint = {
+    parent: [i64],
+    size: [i64],
+    groups: i64,
+}
+
+pub fn new_sets(n: i64) -> Disjoint {
+    var p: [i64] = []
+    var s: [i64] = []
+    for i in 0..n {
+        p.push(i)
+        s.push(1)
+    }
+    return Disjoint{ parent: p, size: s, groups: n }
+}
+
+/// The representative of `v`'s group, compressing the path it walked.
+pub fn find(inout d: Disjoint, v: i64) -> i64 {
+    var root = v
+    while d.parent[root] != root {
+        root = d.parent[root]
+    }
+    var walk = v
+    while d.parent[walk] != root {
+        let next = d.parent[walk]
+        d.parent[walk] = root
+        walk = next
+    }
+    return root
+}
+
+/// Merge the groups holding `a` and `b`. True when they were separate.
+pub fn union(inout d: Disjoint, a: i64, b: i64) -> bool {
+    let ra = find(d, a)
+    let rb = find(d, b)
+    if ra == rb {
+        return false
+    }
+    var big = ra
+    var small = rb
+    if d.size[ra] < d.size[rb] {
+        big = rb
+        small = ra
+    }
+    d.parent[small] = big
+    d.size[big] = d.size[big] + d.size[small]
+    d.groups = d.groups - 1
+    return true
+}
+
+pub fn connected(inout d: Disjoint, a: i64, b: i64) -> bool {
+    return find(d, a) == find(d, b)
+}
+
+pub fn group_count(d: Disjoint) -> i64 {
+    return d.groups
+}

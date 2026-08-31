@@ -1,0 +1,119 @@
+// Text, matching and addressing — five packages, one program.
+//
+// The base32 section is the one that matters: those seven vectors are RFC
+// 4648's own, so this agrees with every other implementation or it is wrong.
+import glob
+import textwrap
+import levenshtein
+import base32
+import ipaddr
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+
+    print("-- globs, and the one distinction that matters")
+    say(f, "* matches within a segment", glob.matches("src/*.gr", "src/main.gr"))
+    say(f, "* does NOT cross a separator", not glob.matches("src/*.gr", "src/deep/main.gr"))
+    say(f, "** does cross one", glob.matches("src/**/*.gr", "src/deep/main.gr"))
+    say(f, "? is exactly one", glob.matches("a?c", "abc") and not glob.matches("a?c", "ac"))
+    say(f, "a class matches inside it", glob.matches("[abc]x", "bx"))
+    say(f, "a negated class does not", not glob.matches("[!abc]x", "bx"))
+    say(f, "a range works", glob.matches("[a-z]9", "q9"))
+    say(f, "filter keeps only matches",
+        glob.filter("*.gr", ["a.gr", "b.md", "c.gr"]) == ["a.gr", "c.gr"])
+
+    print("-- wrapping")
+    let lines = textwrap.wrap("the quick brown fox jumps over the lazy dog", 12)
+    say(f, "no line exceeds the width", {
+        var ok = true
+        for l in lines {
+            if l.len() > 12 {
+                ok = false
+            }
+        }
+        ok
+    })
+    say(f, "nothing is lost", textwrap.fill("a b c", 80) == "a b c")
+    say(f, "a word longer than the width is kept whole",
+        textwrap.wrap("short enormouslylongword", 8).len() == 2)
+    say(f, "indent leaves blank lines blank",
+        textwrap.indent("a\n\nb", "> ") == "> a\n\n> b")
+    say(f, "dedent removes the common prefix",
+        textwrap.dedent("    a\n      b") == "a\n  b")
+
+    print("-- edit distance and did-you-mean")
+    say(f, "kitten to sitting is three", levenshtein.distance("kitten", "sitting") == 3)
+    say(f, "identical is zero", levenshtein.distance("abc", "abc") == 0)
+    say(f, "empty is the other's length", levenshtein.distance("", "abcd") == 4)
+    say(f, "similarity of identical is one", levenshtein.similarity("x", "x") == 1.0)
+    say(f, "suggests the near miss",
+        levenshtein.closest("buidl", ["build", "check", "run"]) == Some("build"))
+    say(f, "suggests nothing for nonsense",
+        levenshtein.closest("zzzzzzzz", ["build", "check"]) == None)
+
+    print("-- base32, against RFC 4648's own vectors")
+    let vectors = [
+        ("", ""),
+        ("f", "MY======"),
+        ("fo", "MZXQ===="),
+        ("foo", "MZXW6==="),
+        ("foob", "MZXW6YQ="),
+        ("fooba", "MZXW6YTB"),
+        ("foobar", "MZXW6YTBOI======"),
+    ]
+    for v in vectors {
+        say(f, "encode {v.0}", base32.encode(v.0.to_bytes()) == v.1)
+    }
+    for v in vectors {
+        let back = base32.decode(v.1) ?? bytes_of([])
+        say(f, "round trip {v.0}", back.to_str() == v.0)
+    }
+    say(f, "rubbish is refused", {
+        match base32.decode("MZXW6!!!") {
+            Err(_e) -> true
+            Ok(_b) -> false
+        }
+    })
+
+    print("-- addresses, where string prefixing gets it wrong")
+    let ten = ipaddr.parse("10.0.0.5") ?? 0
+    say(f, "parses a dotted quad", ipaddr.render(ten) == "10.0.0.5")
+    say(f, "refuses 256", {
+        match ipaddr.parse("10.0.0.256") {
+            Err(_e) -> true
+            Ok(_v) -> false
+        }
+    })
+    match ipaddr.parse_cidr("10.0.0.0/8") {
+        Err(_e) -> say(f, "cidr", false)
+        Ok(c) -> {
+            say(f, "10.0.0.5 is inside 10.0.0.0/8", ipaddr.holds(c, ten))
+            say(f, "11.0.0.5 is not", not ipaddr.holds(c, ipaddr.parse("11.0.0.5") ?? 0))
+            say(f, "the range counts 2^24", ipaddr.size(c) == 16777216)
+            say(f, "last is 10.255.255.255", ipaddr.render(ipaddr.last(c)) == "10.255.255.255")
+        }
+    }
+    match ipaddr.parse_cidr("10.0.0.5/32") {
+        Err(_e) -> say(f, "host route", false)
+        Ok(c) -> say(f, "10.0.0.50 is NOT inside 10.0.0.5/32",
+            not ipaddr.holds(c, ipaddr.parse("10.0.0.50") ?? 0))
+    }
+    say(f, "192.168.1.1 is private", ipaddr.is_private(ipaddr.parse("192.168.1.1") ?? 0))
+    say(f, "8.8.8.8 is not", not ipaddr.is_private(ipaddr.parse("8.8.8.8") ?? 0))
+
+    print("")
+    if f == 0 {
+        print("all held")
+    } else {
+        print("{f} failed")
+    }
+}

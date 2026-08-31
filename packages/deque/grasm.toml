@@ -1,0 +1,6 @@
+[package]
+name = "deque"
+version = "1.0.0"
+
+# Ordering only. Opens nothing.
+capabilities = []

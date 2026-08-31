@@ -1,0 +1,97 @@
+// A binary min-heap, which is the shape a priority queue has when you do not
+// want a sorted list.
+//
+// Sorting to find the smallest costs n log n every time something is added.
+// A heap pays log n per push and per pop and never sorts, which is the whole
+// reason to have one — a scheduler that re-sorted its queue on every task
+// would spend more time ordering than running.
+//
+// The array layout is the standard one: the children of `i` are `2i+1` and
+// `2i+2`, so there are no pointers and no allocation per element.
+
+type MinHeap = {
+    keys: [i64],
+    vals: [str],
+}
+
+pub fn new_heap() -> MinHeap {
+    return MinHeap{ keys: [], vals: [] }
+}
+
+pub fn len(h: MinHeap) -> i64 {
+    return h.keys.len()
+}
+
+pub fn is_empty(h: MinHeap) -> bool {
+    return h.keys.len() == 0
+}
+
+fn swap_at(inout h: MinHeap, a: i64, b: i64) {
+    let k = h.keys[a]
+    h.keys[a] = h.keys[b]
+    h.keys[b] = k
+    let v = h.vals[a]
+    h.vals[a] = h.vals[b]
+    h.vals[b] = v
+}
+
+/// Add `value` under `key`. Equal keys may come back in any order: a heap is
+/// not stable, and pretending otherwise would be a promise the layout cannot
+/// keep.
+pub fn push(inout h: MinHeap, key: i64, value: str) {
+    h.keys.push(key)
+    h.vals.push(value)
+    var i = h.keys.len() - 1
+    while i > 0 {
+        let parent = (i - 1) / 2
+        if h.keys[parent] <= h.keys[i] {
+            i = 0
+        } else {
+            swap_at(h, parent, i)
+            i = parent
+        }
+    }
+}
+
+/// The smallest key and its value, removed. `None` when empty.
+pub fn pop(inout h: MinHeap) -> Option[(i64, str)] {
+    let n = h.keys.len()
+    if n == 0 {
+        return None
+    }
+    let top = (h.keys[0], h.vals[0])
+    let lastk = h.keys.pop() ?? 0
+    let lastv = h.vals.pop() ?? ""
+    if n > 1 {
+        h.keys[0] = lastk
+        h.vals[0] = lastv
+        var i = 0
+        var going = true
+        while going {
+            let l = 2 * i + 1
+            let r = 2 * i + 2
+            var small = i
+            if l < h.keys.len() and h.keys[l] < h.keys[small] {
+                small = l
+            }
+            if r < h.keys.len() and h.keys[r] < h.keys[small] {
+                small = r
+            }
+            if small == i {
+                going = false
+            } else {
+                swap_at(h, i, small)
+                i = small
+            }
+        }
+    }
+    return Some(top)
+}
+
+/// The smallest key without removing it.
+pub fn peek(h: MinHeap) -> Option[(i64, str)] {
+    if h.keys.len() == 0 {
+        return None
+    }
+    return Some((h.keys[0], h.vals[0]))
+}

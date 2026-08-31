@@ -1,0 +1,106 @@
+// Semantic versions: parsing, comparing, and the range syntax a manifest uses.
+//
+// The ordering rule people get wrong is the pre-release one, and it is the one
+// that matters: `1.0.0-alpha` is *less* than `1.0.0`, because a pre-release is
+// a version on its way to the release, not a version after it. A comparison
+// that ignores the suffix will happily install a beta over the final.
+
+type Version = {
+    major: i64,
+    minor: i64,
+    patch: i64,
+    /// Empty when the version is a release.
+    pre: str,
+}
+
+type SemverError =
+    | NotAVersion(text: str)
+    | NotARange(text: str)
+
+fn digits_of(s: str) -> Option[i64] {
+    if s.len() == 0 {
+        return None
+    }
+    // `parse_int` refuses a leading `+`, a sign, and anything non-numeric,
+    // which is exactly the rule here — `1.+2.3` is not a version.
+    for c in s.chars() {
+        if c < "0" or c > "9" {
+            return None
+        }
+    }
+    return s.parse_int()
+}
+
+pub fn parse(text: str) -> Version ! SemverError {
+    var body = text
+    var pre = ""
+    match body.index_of("-") {
+        Some(at) -> {
+            pre = body.substr(at + 1, body.len() - at - 1)
+            body = body.substr(0, at)
+        }
+        None -> {}
+    }
+    let parts = body.split(".")
+    if parts.len() != 3 {
+        fail(NotAVersion(text))
+    }
+    var nums: [i64] = []
+    for p in parts {
+        match digits_of(p) {
+            None -> fail(NotAVersion(text))
+            Some(n) -> nums.push(n)
+        }
+    }
+    return Version{ major: nums[0], minor: nums[1], patch: nums[2], pre: pre }
+}
+
+pub fn render(v: Version) -> str {
+    let base = "{v.major}.{v.minor}.{v.patch}"
+    if v.pre == "" {
+        return base
+    }
+    return "{base}-{v.pre}"
+}
+
+/// -1, 0 or 1.
+pub fn compare(a: Version, b: Version) -> i64 {
+    if a.major != b.major {
+        return if a.major < b.major { 0 - 1 } else { 1 }
+    }
+    if a.minor != b.minor {
+        return if a.minor < b.minor { 0 - 1 } else { 1 }
+    }
+    if a.patch != b.patch {
+        return if a.patch < b.patch { 0 - 1 } else { 1 }
+    }
+    // A release outranks any pre-release of the same numbers.
+    if a.pre == b.pre {
+        return 0
+    }
+    if a.pre == "" {
+        return 1
+    }
+    if b.pre == "" {
+        return 0 - 1
+    }
+    return if a.pre < b.pre { 0 - 1 } else { 1 }
+}
+
+/// Whether `v` satisfies a `^major.minor.patch` range.
+///
+/// The caret is the manifest's rule: anything from `v` up to the next major,
+/// and never a pre-release unless the range itself named one.
+pub fn satisfies_caret(v: Version, range: str) -> bool ! SemverError {
+    if range.len() < 2 or range.substr(0, 1) != "^" {
+        fail(NotARange(range))
+    }
+    let base = try parse(range.substr(1, range.len() - 1))
+    if v.pre != "" and base.pre == "" {
+        return false
+    }
+    if compare(v, base) < 0 {
+        return false
+    }
+    return v.major == base.major
+}
