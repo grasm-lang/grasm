@@ -54,7 +54,7 @@ type Cert = {
 /// DER writes a leading zero byte when the top bit would otherwise make the
 /// number look negative, and may write fewer than 32 bytes for a small one, so
 /// the value is right-aligned into 32 bytes rather than assumed to fill them.
-fn int_of(der: bytes, n: Node) -> [i64] ! CertError {
+fn int_of(der: bytes, n: DerNode) -> [i64] ! CertError {
     var buf: [i64] = []
     for _i in 0..32 {
         buf.push(0)
@@ -75,7 +75,7 @@ fn int_of(der: bytes, n: Node) -> [i64] ! CertError {
 }
 
 /// The OID inside an AlgorithmIdentifier SEQUENCE.
-fn algorithm_of(der: bytes, nodes: [Node], alg_seq: Node) -> str {
+fn algorithm_of(der: bytes, nodes: [DerNode], alg_seq: DerNode) -> str {
     var i = 0
     while i < nodes.len() {
         if nodes[i].at == alg_seq.at {
@@ -94,7 +94,7 @@ fn algorithm_of(der: bytes, nodes: [Node], alg_seq: Node) -> str {
 /// Located by its `id-ecPublicKey` OID rather than by counting fields, because
 /// the optional `[0]` version and the optional extensions both move every
 /// field position after them.
-fn public_key_of(der: bytes, nodes: [Node]) -> ([i64], [i64]) ! CertError {
+fn public_key_of(der: bytes, nodes: [DerNode]) -> ([i64], [i64]) ! CertError {
     var spki_key = 0 - 1
     var curve = ""
     var k = 0

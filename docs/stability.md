@@ -1,7 +1,13 @@
 # Stability policy
 
-Grasm is pre-1.0. This document says exactly what that means, so that "we might
-change things" is a bounded promise rather than an excuse.
+Grasm is at 1.0. This document says exactly what that commits to, so that
+"1.0" is a bounded promise rather than a mood.
+
+1.0 commits to the clauses listed `stable`, and to nothing else. The other two
+levels mean today what they meant before it: `provisional` may change in a
+minor release with a migration note, `experimental` in any release. Raising the
+version number promoted nothing — a clause is promoted when it passes the
+five-part test below, one at a time, on its own evidence.
 
 The unit of stability is the **normative clause**: every rule in `spec/` carries
 a tag like `[E-MAP-ORDER]`, and every tag has a stability level recorded in

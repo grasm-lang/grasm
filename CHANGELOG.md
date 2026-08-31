@@ -1,11 +1,81 @@
 # Changelog
 
-Grasm is pre-1.0: minor releases may break anything not marked `stable` in
-`spec/stability.md`. See `docs/stability.md`.
+Anything marked `stable` in `spec/stability.md` will not change incompatibly
+before 2.0. Anything marked `provisional` may change in a minor release with a
+migration note here; anything `experimental` may change in any release. See
+`docs/stability.md`.
 
-## Unreleased (0.9.1)
+## 1.0.0 — 2026-08-31
+
+The release bar in `docs/release-scope.md` is met: **S1 zero, S2 zero**, every
+gate green, and every known S3/S4 in `docs/known-issues.md` with a reproducer.
+
+What 1.0 commits to is the 113 clauses listed `stable`, not the whole language:
+79 clauses are `provisional` and 46 `experimental`, and those tiers mean today
+exactly what they meant yesterday. A version number is not a promotion.
 
 ### Added
+
+- **`grasm fmt` formats**, rather than only indenting. Each line is reprinted
+  from its tokens, so the output depends on the program and not on the
+  whitespace it arrived with. `crates/grasm_syntax/tests/fmt_preserves_tokens.rs`
+  requires the token stream to be identical before and after across every `.gr`
+  file in the tree, and idempotence in the same pass; `scripts/fmttest.sh`
+  requires the tree to be in that form. `spec/conformance/L-WHITESPACE.gr` is
+  exempt by name — its odd layout is the fixture.
+
+- **`grasm lint`**, over the syntax tree: unused bindings, unused parameters,
+  unused imports, shadowing, and over-long functions — the five rules
+  `apps/grlint` names as needing a tree rather than lines. A name counts as
+  used only when it is *read*, so `var n = 0` followed by `n = 1` is an unused
+  binding. `scripts/linttest.sh` requires it to report on every program it can
+  parse without falling over.
+
+- **A monotonic clock and a sleep**: `monotonic_millis()` and
+  `sleep_millis(n)`, `[L-LIB-CLOCK]`, in all three engines. The wall clock
+  moves backwards; a duration measured with it goes negative twice a year. On
+  wasm32 the embedder supplies both, as it already did the wall clock. A replay
+  does not sleep.
+
+- **Certificates, in Grasm**: `packages/asn1` (DER), `packages/p256`
+  (verify-only P-256) and `packages/x509`, checked by `scripts/cert_diff.sh`
+  against OpenSSL over 30 certificates — signature verdicts, DER structure node
+  for node against `openssl asn1parse`, every certificate also presented with a
+  byte changed inside the signed region, and an RSA certificate that must be
+  refused rather than accepted. It checks one signature against one key: no
+  chain building, no trust store, no dates, no hostname matching.
+
+- **`packages/termios`**, raw terminal mode with no new builtin. `extern fn`
+  reaches libc, `bytes` crosses as a pointer, and what C writes through it is
+  visible coming back — which is all `tcgetattr` needs. Verified under a real
+  pty, not reasoned about.
+
+### Fixed
+
+- **F92**: a value produced by the last expression of a loop body was handed to
+  nobody and never released. A loop body is a block in statement position, and
+  neither `while` nor `for` released its tail. One helper, called from every
+  loop form, so a fourth cannot be added that forgets.
+
+- **A gate reported the opposite of what it found.** `set -o pipefail` with
+  `… | grep -q …`: `grep -q` exits at the first match, SIGPIPE kills the
+  upstream, and the pipeline's status comes from *that* — so it failed exactly
+  when the pattern matched, and only on inputs long enough that the upstream
+  was still writing. Two runs of the same gate on the same tree disagreed.
+  Eight sites across five scripts; `gatecheck` now refuses the combination.
+
+- **A wasm import no embedder supplied.** Adding `monotonic_millis` added
+  `env.grasm_monotonic_millis` to the module's imports, and a missing import is
+  an instantiation failure — all 256 programs failed at once with nothing
+  pointing at the cause. `wasmtest` now reads the import section out of the
+  module and fails if any embedder does not supply every entry.
+
+- **`\s` in a gate's `grep -E`** is not POSIX, so the gate's answer depended on
+  which grep was installed.
+
+- `spec/stability.md`'s own tally had drifted by eleven clauses. It is now
+  checked by `crates/grasm_spec`.
+
 
 - **GrasmWire**, a VPN protocol written entirely in Grasm. 2,580 lines from
   the field arithmetic up, against a budget of five thousand:

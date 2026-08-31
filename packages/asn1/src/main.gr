@@ -27,7 +27,7 @@ pub let IA5_STRING = 22
 pub let UTC_TIME = 23
 pub let GENERALIZED_TIME = 24
 
-type Node = {
+type DerNode = {
     /// The identifier octet as written: `48` for SEQUENCE, `0xA0` for `[0]`.
     tag: i64,
     /// Byte offset of the identifier octet.
@@ -47,14 +47,14 @@ type Asn1Error =
     | Trailing(at: i64)
 
     /// Every node of the document, outermost first, in the order it is written.
-pub fn parse(der: bytes) -> [Node] ! Asn1Error {
-    var out: [Node] = []
+pub fn parse(der: bytes) -> [DerNode] ! Asn1Error {
+    var out: [DerNode] = []
     try walk(der, 0, der.len(), 0, out)
     return out
 }
 
 /// One level, then each child. `stop` is one past the last byte of this level.
-fn walk(der: bytes, from: i64, stop: i64, depth: i64, inout out: [Node]) ! Asn1Error {
+fn walk(der: bytes, from: i64, stop: i64, depth: i64, inout out: [DerNode]) ! Asn1Error {
     var i = from
     while i < stop {
         if i + 2 > stop {
@@ -87,7 +87,7 @@ fn walk(der: bytes, from: i64, stop: i64, depth: i64, inout out: [Node]) ! Asn1E
         if body + len > stop {
             fail(Truncated(i))
         }
-        out.push(Node{ tag: tag, at: i, body: body, len: len, depth: depth })
+        out.push(DerNode{ tag: tag, at: i, body: body, len: len, depth: depth })
         // Bit 6 of the identifier octet says the content is itself a document.
         if (tag / 32) % 2 == 1 {
             try walk(der, body, body + len, depth + 1, out)
@@ -97,7 +97,7 @@ fn walk(der: bytes, from: i64, stop: i64, depth: i64, inout out: [Node]) ! Asn1E
 }
 
 /// The content octets of a node.
-pub fn value(der: bytes, n: Node) -> bytes {
+pub fn value(der: bytes, n: DerNode) -> bytes {
     return der.slice(n.body, n.len)
 }
 
@@ -106,8 +106,8 @@ pub fn value(der: bytes, n: Node) -> bytes {
 /// A child is a node one deeper that appears before the next node at the
 /// parent's own depth — which is what "directly inside" means once the tree is
 /// flat.
-pub fn children(nodes: [Node], i: i64) -> [Node] {
-    var out: [Node] = []
+pub fn children(nodes: [DerNode], i: i64) -> [DerNode] {
+    var out: [DerNode] = []
     let parent = nodes[i]
     var k = i + 1
     while k < nodes.len() {
@@ -126,7 +126,7 @@ pub fn children(nodes: [Node], i: i64) -> [Node] {
 /// An INTEGER's value, for the small ones. DER writes them big-endian and
 /// two's complement, with a leading zero where the top bit would otherwise
 /// make a positive number look negative.
-pub fn integer_of(der: bytes, n: Node) -> i64 {
+pub fn integer_of(der: bytes, n: DerNode) -> i64 {
     var v = 0
     for k in 0..n.len {
         v = v * 256 + der.at(n.body + k)
@@ -138,7 +138,7 @@ pub fn integer_of(der: bytes, n: Node) -> i64 {
 ///
 /// The first byte holds two arcs at once (`40 * a + b`), and every later arc is
 /// base-128 with the top bit set on all but the last byte.
-pub fn oid_of(der: bytes, n: Node) -> str {
+pub fn oid_of(der: bytes, n: DerNode) -> str {
     if n.len == 0 {
         return ""
     }
@@ -157,6 +157,6 @@ pub fn oid_of(der: bytes, n: Node) -> str {
 }
 
 /// The content of a node as text.
-pub fn text_of(der: bytes, n: Node) -> str {
+pub fn text_of(der: bytes, n: DerNode) -> str {
     return value(der, n).to_str()
 }

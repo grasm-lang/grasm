@@ -31,14 +31,36 @@ fail=0
 tables_seen=""
 
 for t in 0.5 0.9 1.4 2.0 2.7 3.4; do
-    d="$WORK/run-$t"
-    mkdir -p "$d"
-    "$WORK/kv" hammer "$d" 100000 >"$d/out.txt" 2>&1 &
-    pid=$!
-    ( sleep "$t"; kill -9 $pid 2>/dev/null ) &
-    killer=$!
-    wait $pid 2>/dev/null
-    wait $killer 2>/dev/null
+    # Retried once at twice the delay when too little was written to judge.
+    #
+    # The verdict here is "the survivors form a prefix", and the `>= 10` guard
+    # below only stops a run so short that the property is vacuous. Those are
+    # different things, and conflating them made the gate fail on a loaded
+    # machine: at 0.5s the store had committed nine keys rather than ten, all
+    # nine correct and in order, and the gate called that lost data. A gate
+    # whose verdict depends on what else the machine is doing is not measuring
+    # the store.
+    attempt=0
+    delay="$t"
+    while true; do
+        d="$WORK/run-$t-$attempt"
+        mkdir -p "$d"
+        "$WORK/kv" hammer "$d" 100000 >"$d/out.txt" 2>&1 &
+        pid=$!
+        ( sleep "$delay"; kill -9 $pid 2>/dev/null ) &
+        killer=$!
+        wait $pid 2>/dev/null
+        wait $killer 2>/dev/null
+        short=$("$WORK/kv" verify "$d" 100000 2>&1 | sed -n 's/^prefix \([0-9]*\),.*/\1/p')
+        if [ -n "$short" ] && [ "$short" -ge 10 ]; then
+            break
+        fi
+        if [ "$attempt" -ge 1 ]; then
+            break
+        fi
+        attempt=$((attempt + 1))
+        delay=$(awk "BEGIN{print $delay * 2}")
+    done
 
     # What survived, read off the disk. The process's own stdout cannot be
     # trusted here: that buffer dies with the process, so a store that

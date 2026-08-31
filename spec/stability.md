@@ -17,7 +17,7 @@ meaning changed; the listing was wrong about how settled the area is, and
 saying so is cheaper than defending it. See `docs/release-scope.md` for what
 that means for a release.
 
-Today: 112 stable, 76 provisional, 39 experimental, of 227.
+Today: 113 stable, 79 provisional, 46 experimental, of 238.
 
 ## Stable
 

@@ -529,6 +529,35 @@ fn stability_levels() -> std::collections::BTreeMap<String, String> {
     out
 }
 
+/// The tally `spec/stability.md` prints about itself has to be true.
+///
+/// It said "112 stable, 76 provisional, 39 experimental, of 227" while the
+/// file listed 113, 79, 46 and 238 — a promise about the size of the stable
+/// surface, drifting quietly for eleven clauses. Nothing read it, so nothing
+/// noticed. `the_core_count_matches_its_table` does exactly this for
+/// `spec/core.md`; the same document should not get a free pass because its
+/// arithmetic is in a sentence rather than a table.
+#[test]
+fn the_stability_tally_matches_the_listing() {
+    let levels = stability_levels();
+    let count = |want: &str| levels.values().filter(|l| *l == want).count();
+    let (stable, provisional, experimental) =
+        (count("stable"), count("provisional"), count("experimental"));
+    let total = levels.len();
+    let want = format!(
+        "Today: {stable} stable, {provisional} provisional, {experimental} experimental, of {total}."
+    );
+
+    let path = spec_dir().join("stability.md");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{} should be readable: {e}", path.display()));
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("Today: "))
+        .unwrap_or_else(|| panic!("spec/stability.md has no `Today:` tally line"));
+    assert_eq!(line, want, "spec/stability.md's own tally is wrong");
+}
+
 #[test]
 fn every_clause_has_a_stability_level() {
     // A clause with no level would make docs/stability.md a claim about
