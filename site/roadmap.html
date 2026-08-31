@@ -5,7 +5,15 @@
 <title>Roadmap</title>
 <meta name="description" content="What is being built next, and what would have to be true to call it done.">
 <link rel="stylesheet" href="style.css">
-</head><body>
+<script type="importmap">
+{"imports": {
+  "three": "./vendor/three.module.js",
+  "three/addons/utils/BufferGeometryUtils.js": "./vendor/utils/BufferGeometryUtils.js"
+}}
+</script>
+<script src="vendor/motion.js" defer></script>
+<script type="module" src="app.js"></script>
+</head><body data-page="roadmap">
 <div class="frame">
 <nav class="rail">
 <a class="mark" href="index.html"><b>grasm</b><span>a systems language</span></a>
@@ -19,13 +27,16 @@
 <a href="tiers.html">Ownership</a>
 <a href="errors.html">Errors</a>
 <a href="concurrency.html">Concurrency</a>
+<a href="security.html">Security</a>
 <h2>Reference</h2>
 <a href="language.html">Language</a>
 <a href="library.html">Library</a>
 <a href="packages.html">Packages</a>
 <a href="spec.html">Specification</a>
+<a href="architecture.html">Architecture</a>
 <h2>More</h2>
 <a href="examples.html">Examples</a>
+<a href="about.html">About</a>
 <a href="status.html">Status</a>
 <a href="roadmap.html" aria-current="page">Roadmap</a>
 </nav>
@@ -78,7 +89,8 @@ run. Until they do, the claim is not available, and no number of green gates
 substitutes for it.</p>
 
 <footer>
-Grasm — three engines, one answer.
+Grasm — four engines, one answer. Every figure on this site is computed,
+not typed.
 <a href="status.html">Status</a> ·
 <a href="spec.html">Specification</a> ·
 <a href="roadmap.html">Roadmap</a>

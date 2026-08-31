@@ -5,7 +5,15 @@
 <title>Status</title>
 <meta name="description" content="What works, what does not, and what is not yet true.">
 <link rel="stylesheet" href="style.css">
-</head><body>
+<script type="importmap">
+{"imports": {
+  "three": "./vendor/three.module.js",
+  "three/addons/utils/BufferGeometryUtils.js": "./vendor/utils/BufferGeometryUtils.js"
+}}
+</script>
+<script src="vendor/motion.js" defer></script>
+<script type="module" src="app.js"></script>
+</head><body data-page="status">
 <div class="frame">
 <nav class="rail">
 <a class="mark" href="index.html"><b>grasm</b><span>a systems language</span></a>
@@ -19,13 +27,16 @@
 <a href="tiers.html">Ownership</a>
 <a href="errors.html">Errors</a>
 <a href="concurrency.html">Concurrency</a>
+<a href="security.html">Security</a>
 <h2>Reference</h2>
 <a href="language.html">Language</a>
 <a href="library.html">Library</a>
 <a href="packages.html">Packages</a>
 <a href="spec.html">Specification</a>
+<a href="architecture.html">Architecture</a>
 <h2>More</h2>
 <a href="examples.html">Examples</a>
+<a href="about.html">About</a>
 <a href="status.html" aria-current="page">Status</a>
 <a href="roadmap.html">Roadmap</a>
 </nav>
@@ -60,7 +71,7 @@ well as for what it prints.</p>
 <tr><td>No release binaries</td><td>Build from source with a Rust toolchain.</td></tr>
 <tr><td>0.45× native Rust</td><td>Measured, floor-subtracted 0.39×, against a 0.95× target.</td></tr>
 <tr><td>Polymorphic recursion</td><td>Refused by name at build time. It is what monomorphization is; no work removes it.</td></tr>
-<tr><td>Small standard library</td><td>81 methods. Enough for the 44 programs above; you will find gaps in a larger one.</td></tr>
+<tr><td>Small standard library</td><td>82 methods. Enough for the 44 programs above; you will find gaps in a larger one.</td></tr>
 <tr><td>No users but this project</td><td>Nobody has hit it from an angle nobody here thought of.</td></tr>
 <tr><td>Region sweep not implemented</td><td>Tier 1's rule is enforced; the bulk deallocation it makes sound is not built.</td></tr>
 </table></div>
@@ -72,13 +83,14 @@ working session — falling, but not zero, and a language with zero known defect
 and no users has told you more about its test suite than about itself.</p>
 
 <h2>How that is kept honest</h2>
-<p>All 87 findings are written down in <code>ProjectGold/FINDINGS.md</code>,
+<p>All 92 findings are written down in <code>ProjectGold/FINDINGS.md</code>,
 including the ones that were the test harness's fault, the ones withdrawn as
 wrong, and the ones caught before they shipped. Every gate is verified by
 breaking the thing it guards and confirming it fails.</p>
 
 <footer>
-Grasm — three engines, one answer.
+Grasm — four engines, one answer. Every figure on this site is computed,
+not typed.
 <a href="status.html">Status</a> ·
 <a href="spec.html">Specification</a> ·
 <a href="roadmap.html">Roadmap</a>

@@ -5,7 +5,15 @@
 <title>Grasm</title>
 <meta name="description" content="Grasm is a systems language where what a program may do is written in its type.">
 <link rel="stylesheet" href="style.css">
-</head><body>
+<script type="importmap">
+{"imports": {
+  "three": "./vendor/three.module.js",
+  "three/addons/utils/BufferGeometryUtils.js": "./vendor/utils/BufferGeometryUtils.js"
+}}
+</script>
+<script src="vendor/motion.js" defer></script>
+<script type="module" src="app.js"></script>
+</head><body data-page="index">
 <div class="frame">
 <nav class="rail">
 <a class="mark" href="index.html"><b>grasm</b><span>a systems language</span></a>
@@ -19,33 +27,40 @@
 <a href="tiers.html">Ownership</a>
 <a href="errors.html">Errors</a>
 <a href="concurrency.html">Concurrency</a>
+<a href="security.html">Security</a>
 <h2>Reference</h2>
 <a href="language.html">Language</a>
 <a href="library.html">Library</a>
 <a href="packages.html">Packages</a>
 <a href="spec.html">Specification</a>
+<a href="architecture.html">Architecture</a>
 <h2>More</h2>
 <a href="examples.html">Examples</a>
+<a href="about.html">About</a>
 <a href="status.html">Status</a>
 <a href="roadmap.html">Roadmap</a>
 </nav>
 <main>
 
-<p class="eyebrow">A systems language</p>
-<h1>What a program may do<br>is written in its type.</h1>
-<p class="lede">Grasm puts effects in the signature, capabilities in the package
-manifest, and ownership in tiers you choose per value. It compiles ahead of
-time, runs in a browser, and three engines agree byte for byte on every program
-in the repository.</p>
-
-<div class="actions">
-  <a class="btn" href="start.html">Get started</a>
-  <a class="btn ghost" href="playground.html">Try it in the browser</a>
-  <a class="btn ghost" href="examples.html">See real programs</a>
+<div class="hero">
+  <div id="stage" aria-hidden="true"></div>
+  <div class="copy">
+    <p class="eyebrow">A systems language · v1.0.0</p>
+    <h1>What a program may do<br>is written in its type.</h1>
+    <p class="lede">Effects go in the signature. Capabilities go in the package
+    manifest. Ownership is a tier you pick per value. It compiles ahead of time,
+    runs in a browser, and four engines agree byte for byte on every program
+    here.</p>
+    <div class="actions">
+      <a class="btn" href="start.html">Get started</a>
+      <a class="btn ghost" href="security.html">See the capability check</a>
+      <a class="btn ghost" href="playground.html">Try it in the browser</a>
+    </div>
+  </div>
 </div>
 
 <h2>The signature is the contract</h2>
-<p>A function's type says what it returns <em>and</em> what it is allowed to
+<p>A function’s type says what it returns <em>and</em> what it is allowed to
 do. The row is inferred from the body, so it cannot drift from the truth, and a
 caller that has not been given <code>io</code> cannot call something that
 performs it.</p>
@@ -63,48 +78,102 @@ fn report(n: i64) / {io} {        // this one prints; the type says so
 <code>/ {io}</code> is an effect the caller must be permitted. Neither is a
 comment or a convention — both are checked.</p>
 
-<h2>Four engines, one answer</h2>
-<p>The interpreter is normative. A bundle is that interpreter with the program
-attached. <code>--native</code> compiles ahead of time through Cranelift. A
-fourth build targets <code>wasm32</code>. Every gate in the repository exists to
+<h2 class="reveal">A dependency cannot quietly grow teeth</h2>
+<p class="reveal">This is the one thing here that other languages do not have.
+A library declares what it may reach. If a patch release starts reading your
+files, the build fails — in every consumer, without anybody reviewing the
+diff. Press the button: the verdicts are the ones
+<code>scripts/security_bench.sh</code> produces.</p>
+
+<div class="demo reveal" id="capability">
+  <div class="head">
+    <h3>mathlib 1.0.0 → 1.0.1</h3>
+    <button class="btn">ship the malicious update</button>
+  </div>
+  <div class="lanes"></div>
+  <div class="terminal"><span class="dim">Press the button to run the attack against four toolchains.</span></div>
+</div>
+
+<h2 class="reveal">Four engines, one answer</h2>
+<p class="reveal">The interpreter is normative. A bundle is that interpreter
+with the program attached. <code>--native</code> compiles ahead of time through
+Cranelift. A fourth build targets <code>wasm32</code>. Every gate here exists to
 hold them to the same answer.</p>
 
-<div class="figures">
-  <div class="fig"><b>275</b><span>programs, three engines</span></div>
-  <div class="fig"><b>236</b><span>also identical in wasm</span></div>
-  <div class="fig"><b>275</b><span>cross-compiled to x86_64</span></div>
-  <div class="fig"><b>0</b><span>open defects</span></div>
+<div class="engines reveal">
+  <canvas id="engines" data-programs="275" aria-label="Programs flowing through four engines to a single answer"></canvas>
 </div>
 
-<h2>What is different here</h2>
-<div class="grid three">
-  <div class="cell"><h4>Effects, inferred</h4><p>You do not write the row. The
+<div class="grid three reveal">
+  <div class="card"><div class="stat">275<small>programs, three engines identical</small></div></div>
+  <div class="card"><div class="stat">236<small>also identical in wasm</small></div></div>
+  <div class="card"><div class="stat">0<small>open defects, any severity</small></div></div>
+</div>
+
+<h2 class="reveal">What is measured, including what is missed</h2>
+<p class="reveal">Most language sites show the numbers that flatter them. These
+are the north-star targets and where the implementation actually sits —
+four of them are still short, and saying so is cheaper than defending a claim
+nobody can reproduce.</p>
+
+<div class="bars reveal">
+  <div class="bar-row">
+    <span class="what">Frontend throughput</span>
+    <span class="bar-track"><span class="bar-fill miss" data-pct="70"></span></span>
+    <span class="num miss">350,258 / 500,000 LOC/s</span>
+  </div>
+  <div class="bar-row">
+    <span class="what">Hello-world binary</span>
+    <span class="bar-track"><span class="bar-fill miss" data-pct="91"></span></span>
+    <span class="num miss">328 KB / ≤ 300 KB</span>
+  </div>
+  <div class="bar-row">
+    <span class="what">Tokens vs Python</span>
+    <span class="bar-track"><span class="bar-fill miss" data-pct="96"></span></span>
+    <span class="num miss">1.04× / ≤ 1.00×</span>
+  </div>
+  <div class="bar-row">
+    <span class="what">Tokens vs Go</span>
+    <span class="bar-track"><span class="bar-fill miss" data-pct="98"></span></span>
+    <span class="num miss">0.61× / ≤ 0.60×</span>
+  </div>
+  <div class="bar-row">
+    <span class="what">Engines agreeing</span>
+    <span class="bar-track"><span class="bar-fill hit" data-pct="100"></span></span>
+    <span class="num">275 / 275</span>
+  </div>
+</div>
+
+<p class="note"><strong>No benchmark here says Grasm beats Rust, Go or Zig.</strong>
+It does not. <a href="status.html">Status</a> records the gaps, and
+<code>scripts/bench.sh</code> refuses to run on a loaded machine rather than
+publish a number it cannot stand behind.</p>
+
+<h2 class="reveal">What is different here</h2>
+<div class="grid three reveal">
+  <div class="card"><h3>Effects, inferred</h3><p>You do not write the row. The
   compiler works it out from the body and checks it against what you declared,
   so a function that starts touching the network stops compiling.</p></div>
-  <div class="cell"><h4>Capability ceilings</h4><p>A package declares the
+  <div class="card"><h3>Capability ceilings</h3><p>A package declares the
   effects it may perform. One that quietly starts reading files fails to build
-  <em>in every consumer</em> — a compile error, not a code review.</p></div>
-  <div class="cell"><h4>Tiered ownership</h4><p>Four tiers, chosen per value:
-  borrowed, arena, generational reference, and an explicit unsafe escape. You
-  pay for the one you use.</p></div>
-  <div class="cell"><h4>Typed errors</h4><p><code>T ! E</code> is a value.
-  There is no exception mechanism and no null.</p></div>
-  <div class="cell"><h4>Deterministic replay</h4><p>Every effect can be
-  journaled and replayed on a different engine — a recording made natively
-  replays under the interpreter.</p></div>
-  <div class="cell"><h4>Runs in a browser</h4><p>The same source, the same
-  answers, compiled to wasm with no server.</p></div>
+  in every consumer — a compile error, not a code review.</p></div>
+  <div class="card"><h3>Tiered ownership</h3><p>No lifetime annotations.
+  <code>own</code> and <code>inout</code> at the boundary, a region when a scope
+  should own its allocations, a generational reference when a graph needs
+  one.</p></div>
 </div>
 
-<h2>Honest about where it is</h2>
-<p>Grasm compiles real programs — an HTTP server, a SQL engine, a JSON parser,
-a garbage collector, a self-hosting lexer — and runs them identically on every
-engine. It has no third-party libraries, no users but this project, and runs at
-roughly 0.45× native Rust on the benchmark set.</p>
-<p><a href="status.html">The status page says exactly what does not work.</a></p>
+<div class="grid three reveal">
+  <div class="card"><div class="stat">234<small>normative clauses, each with a conformance program</small></div></div>
+  <div class="card"><div class="stat">3549<small>lines of specification — a hard ceiling</small></div></div>
+  <div class="card"><div class="stat">23<small>gates, judged by exit code alone</small></div></div>
+</div>
+
+<p><a class="btn ghost" href="about.html">Read what this is, and is not</a></p>
 
 <footer>
-Grasm — three engines, one answer.
+Grasm — four engines, one answer. Every figure on this site is computed,
+not typed.
 <a href="status.html">Status</a> ·
 <a href="spec.html">Specification</a> ·
 <a href="roadmap.html">Roadmap</a>

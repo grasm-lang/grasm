@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>About</title>
+<meta name="description" content="What Grasm is, what it borrowed, and who should not use it.">
+<link rel="stylesheet" href="style.css">
+<script type="importmap">
+{"imports": {
+  "three": "./vendor/three.module.js",
+  "three/addons/utils/BufferGeometryUtils.js": "./vendor/utils/BufferGeometryUtils.js"
+}}
+</script>
+<script src="vendor/motion.js" defer></script>
+<script type="module" src="app.js"></script>
+</head><body data-page="about">
+<div class="frame">
+<nav class="rail">
+<a class="mark" href="index.html"><b>grasm</b><span>a systems language</span></a>
+<h2>Start</h2>
+<a href="start.html">Getting started</a>
+<a href="install.html">Install</a>
+<a href="playground.html">Playground</a>
+<h2>Learn</h2>
+<a href="tour.html">Tour</a>
+<a href="effects.html">Effects</a>
+<a href="tiers.html">Ownership</a>
+<a href="errors.html">Errors</a>
+<a href="concurrency.html">Concurrency</a>
+<a href="security.html">Security</a>
+<h2>Reference</h2>
+<a href="language.html">Language</a>
+<a href="library.html">Library</a>
+<a href="packages.html">Packages</a>
+<a href="spec.html">Specification</a>
+<a href="architecture.html">Architecture</a>
+<h2>More</h2>
+<a href="examples.html">Examples</a>
+<a href="about.html" aria-current="page">About</a>
+<a href="status.html">Status</a>
+<a href="roadmap.html">Roadmap</a>
+</nav>
+<main>
+
+<p class="eyebrow">More</p>
+<h1>What this is, and what it is not.</h1>
+<p class="lede">Grasm is a systems language with an effect system, capability
+ceilings on packages, and tiered ownership without lifetime annotations. It is
+version 1.0.0, it has 78 libraries, and every one of them was
+written inside this repository.</p>
+
+<h2>Nothing here was invented</h2>
+<p>It is worth being direct about this, because a language site is the last
+place anyone expects to read it. Every idea in Grasm exists elsewhere, usually
+first and usually with more research behind it.</p>
+<table>
+  <tr><th>In Grasm</th><th>Where it came from</th></tr>
+  <tr><td><code>let</code> / <code>inout</code> / <code>own</code>, value semantics, no lifetimes</td>
+      <td><b>Hylo</b> (formerly Val) has <code>let</code>/<code>inout</code>/<code>sink</code>. <b>Swift</b> has exclusivity, ARC and copy-on-write.</td></tr>
+  <tr><td>Effect rows, inferred and unified</td>
+      <td><b>Koka</b> — row-based effect types with inference. Also <b>OCaml 5</b>, <b>Unison</b>, <b>Eff</b>, <b>Frank</b>.</td></tr>
+  <tr><td>Capability ceiling per module</td>
+      <td><b>Austral</b> — capability-secure, no ambient I/O. <b>Wyvern</b>, and the <b>E</b> language before it.</td></tr>
+  <tr><td>Reference counting with copy-on-write</td>
+      <td><b>Swift</b>, <b>Nim</b>.</td></tr>
+  <tr><td>Generational references</td>
+      <td>The slotmap pattern, in every entity-component system.</td></tr>
+  <tr><td>A reference interpreter as the specification</td>
+      <td><b>WebAssembly</b> does this, and does it better.</td></tr>
+</table>
+<p>The closest single comparison is <b>Hylo plus Koka, tied to a manifest the
+way Austral does it</b>. What is uncommon is not the ideas but shipping them
+together with gates that prove the combination holds.</p>
+
+<h2>Who should not use this</h2>
+<p>Most people, today. Specifically:</p>
+<ul>
+  <li><b>If you need libraries.</b> There are 78, all written here.
+  Python has hundreds of thousands.</li>
+  <li><b>If you need speed.</b> Rust and Zig are faster, and
+  <a href="status.html">the numbers here</a> say by how much.</li>
+  <li><b>If you need to hire.</b> Nobody outside this repository has written
+  Grasm.</li>
+  <li><b>If you need a native debugger.</b> There is a Debug Adapter Protocol
+  server, and it works against the interpreter. The Cranelift backend emits no
+  DWARF, so GDB and LLDB cannot meaningfully inspect a compiled binary.</li>
+  <li><b>If you need async I/O.</b> There are threads and structured
+  concurrency, and no async/await.</li>
+</ul>
+
+<h2>Who might</h2>
+<p>Someone who genuinely models an untrusted dependency reaching the network or
+the filesystem as a threat, and who wants the compiler to enforce the boundary
+rather than a sandbox at run time. That is a real gap in Rust, Go, Zig and
+Python, and it is the one thing here that is not catching up to somebody
+else.</p>
+
+<h2>How it is built</h2>
+<p>234 normative clauses in 3549 lines of specification, under a
+hard ceiling — every addition since has been paid for by compressing prose
+already written. 113 clauses are <code>stable</code> and will not change
+incompatibly before 2.0; 79 are <code>provisional</code> and
+46 are <code>experimental</code>. Version 1.0 promoted nothing: a
+clause moves when it passes the five-part test, one at a time, on its own
+evidence.</p>
+
+<p class="note">Every number on this site is computed from the repository when
+the site is written, or read from the last green gate run. None of them is a
+figure somebody remembered. If a gate has not run, the page says so rather than
+printing a number nobody measured.</p>
+
+<footer>
+Grasm — four engines, one answer. Every figure on this site is computed,
+not typed.
+<a href="status.html">Status</a> ·
+<a href="spec.html">Specification</a> ·
+<a href="roadmap.html">Roadmap</a>
+</footer>
+</main>
+</div>
+</body></html>

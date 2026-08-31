@@ -35,11 +35,14 @@ NAV = [
     ("tiers.html", "Ownership tiers", "Learn", "Ownership"),
     ("errors.html", "Errors", "Learn", "Errors"),
     ("concurrency.html", "Concurrency", "Learn", "Concurrency"),
+    ("security.html", "Capabilities and the supply chain", "Learn", "Security"),
     ("language.html", "Language reference", "Reference", "Language"),
     ("library.html", "Library reference", "Reference", "Library"),
     ("packages.html", "Packages", "Reference", "Packages"),
     ("spec.html", "Specification", "Reference", "Specification"),
+    ("architecture.html", "How it is built", "Reference", "Architecture"),
     ("examples.html", "Examples", "More", "Examples"),
+    ("about.html", "About", "More", "About"),
     ("status.html", "Status", "More", "Status"),
     ("roadmap.html", "Roadmap", "More", "Roadmap"),
 ]
@@ -69,6 +72,25 @@ def facts():
     f["gold_lines"] = f"{lines:,}"
     lib = open(os.path.join(ROOT, "spec", "library.md")).read()
     f["methods"] = len(set(re.findall(r"^\| `[a-z]+\.([a-z_0-9]+)\(", lib, re.M)))
+
+    # Stability is a promise, so the site states its size from the file that
+    # makes it rather than from a sentence somebody kept up to date.
+    stab = open(os.path.join(ROOT, "spec", "stability.md")).read()
+    for level in ("stable", "provisional", "experimental"):
+        f[level] = len(re.findall(r"^- `[A-Z][A-Z0-9-]+` \u2014 " + level + r"$", stab, re.M))
+    f["spec_lines"] = sum(
+        open(q).read().count("\n") for q in glob.glob(os.path.join(ROOT, "spec", "*.md"))
+    )
+    # Packages a consumer could depend on: the `-demo` directories exist to be
+    # run by the gates, not to be imported.
+    f["packages"] = len([
+        d for d in glob.glob(os.path.join(ROOT, "packages", "*", "grasm.toml"))
+        if not os.path.basename(os.path.dirname(d)).endswith("-demo")
+    ])
+    f["gates"] = len(re.findall(
+        r"^run_gate ", open(os.path.join(ROOT, "scripts", "allgates.sh")).read(), re.M))
+    f["version"] = re.search(
+        r'^version = "([^"]+)"', open(os.path.join(ROOT, "Cargo.toml")).read(), re.M).group(1)
 
     measured = os.path.join(OUT, "facts.json")
     if os.path.exists(measured):
@@ -109,7 +131,15 @@ PAGE = """<!doctype html>
 <title>{title}</title>
 <meta name="description" content="{desc}">
 <link rel="stylesheet" href="style.css">
-</head><body>
+<script type="importmap">
+{{"imports": {{
+  "three": "./vendor/three.module.js",
+  "three/addons/utils/BufferGeometryUtils.js": "./vendor/utils/BufferGeometryUtils.js"
+}}}}
+</script>
+<script src="vendor/motion.js" defer></script>
+<script type="module" src="app.js"></script>
+</head><body data-page="{page}">
 <div class="frame">
 <nav class="rail">
 {rail}
@@ -117,7 +147,8 @@ PAGE = """<!doctype html>
 <main>
 {body}
 <footer>
-Grasm — three engines, one answer.
+Grasm — four engines, one answer. Every figure on this site is computed,
+not typed.
 <a href="status.html">Status</a> ·
 <a href="spec.html">Specification</a> ·
 <a href="roadmap.html">Roadmap</a>
@@ -145,7 +176,10 @@ def write(pages, check):
 
     for href, title, _sec, _label in NAV:
         desc, body = pages[href]
-        html = PAGE.format(title=title, desc=desc, rail=rail(href), body=fill(body))
+        html = PAGE.format(
+            title=title, desc=desc, page=href.replace(".html", ""),
+            rail=rail(href), body=fill(body)
+        )
         path = os.path.join(OUT, href)
         if check:
             have = open(path).read() if os.path.exists(path) else ""

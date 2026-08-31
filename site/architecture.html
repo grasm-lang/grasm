@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How it is built</title>
+<meta name="description" content="How Grasm is built: four engines, one normative interpreter, and the gates that hold them together.">
+<link rel="stylesheet" href="style.css">
+<script type="importmap">
+{"imports": {
+  "three": "./vendor/three.module.js",
+  "three/addons/utils/BufferGeometryUtils.js": "./vendor/utils/BufferGeometryUtils.js"
+}}
+</script>
+<script src="vendor/motion.js" defer></script>
+<script type="module" src="app.js"></script>
+</head><body data-page="architecture">
+<div class="frame">
+<nav class="rail">
+<a class="mark" href="index.html"><b>grasm</b><span>a systems language</span></a>
+<h2>Start</h2>
+<a href="start.html">Getting started</a>
+<a href="install.html">Install</a>
+<a href="playground.html">Playground</a>
+<h2>Learn</h2>
+<a href="tour.html">Tour</a>
+<a href="effects.html">Effects</a>
+<a href="tiers.html">Ownership</a>
+<a href="errors.html">Errors</a>
+<a href="concurrency.html">Concurrency</a>
+<a href="security.html">Security</a>
+<h2>Reference</h2>
+<a href="language.html">Language</a>
+<a href="library.html">Library</a>
+<a href="packages.html">Packages</a>
+<a href="spec.html">Specification</a>
+<a href="architecture.html" aria-current="page">Architecture</a>
+<h2>More</h2>
+<a href="examples.html">Examples</a>
+<a href="about.html">About</a>
+<a href="status.html">Status</a>
+<a href="roadmap.html">Roadmap</a>
+</nav>
+<main>
+
+<p class="eyebrow">Reference</p>
+<h1>How it is built.</h1>
+<p class="lede">One language, four ways to run it, and a set of gates whose only
+job is to stop them disagreeing. The interpreter is the specification; the other
+three have to match it.</p>
+
+<h2>The pipeline</h2>
+<table>
+  <tr><th>Stage</th><th>Crate</th><th>What it produces</th></tr>
+  <tr><td>Lexer and parser</td><td><code>grasm_syntax</code></td><td>Tokens, then a tree. Also the formatter.</td></tr>
+  <tr><td>Checker</td><td><code>grasm_sema</code></td><td>Types, effect rows, ownership, exhaustiveness — and an <code>Analysis</code> the backend reads.</td></tr>
+  <tr><td>Interpreter</td><td><code>grasm_interp</code></td><td>The normative answer.</td></tr>
+  <tr><td>Native backend</td><td><code>grasm_native</code></td><td>Cranelift IR, then an object file.</td></tr>
+  <tr><td>Runtime</td><td><code>grasm_rt</code></td><td>Reference-counted boxed values with copy-on-write.</td></tr>
+  <tr><td>Wasm</td><td><code>grasm_wasm</code></td><td>The interpreter, compiled for <code>wasm32</code>.</td></tr>
+</table>
+
+<h2>Why the checker hands types to the backend</h2>
+<p>It did not, once. The backend re-derived them — roughly 950 lines of a
+<em>second</em> type inference — and nine of twelve findings in one period
+traced to the two disagreeing. The checker now exports every expression’s
+resolved type; it answers 94% of the backend’s questions on real code and
+87% on generated code. Where it answers, the two <em>cannot</em> disagree,
+because there is only one answer.</p>
+<p>Nothing was deleted on the strength of that, and the reason is recorded:
+an arm the corpus never reaches is not an arm nothing reaches.</p>
+
+<h2>The memory model, plainly</h2>
+<p>Boxed values — strings, lists — are reference-counted with
+copy-on-write. The count is atomic so a value may cross a thread, and that cost
+was measured rather than assumed: 4.3% on the most reference-count-heavy
+program here, no movement at all on three others, about half a percent on the
+geometric mean.</p>
+<p>Effects, capabilities, ownership modes and exhaustiveness are erased before
+codegen and cost nothing at run time. <code>ref T</code> costs a generation
+check. <code>region</code> is checked but does not yet free in bulk — the
+specification says so in the clause itself rather than implying otherwise.</p>
+
+<h2>The gates</h2>
+<p>23 of them, each judged by its exit code and nothing else. That rule
+exists because a gate once reported <code>identical: 184  mismatched: 0</code>,
+which was true, while failing three lines further down.</p>
+<div class="grid two">
+  <div class="card"><h3>Agreement</h3><p>difftest, crosstest, wasmtest and
+  agreetest run the corpus through every engine and require identical bytes.</p></div>
+  <div class="card"><h3>Differential</h3><p>Against things outside this project:
+  OpenSSL for certificates, real zlib, git’s own object store, V8 for
+  WebAssembly, clang’s assembler.</p></div>
+  <div class="card"><h3>Generated</h3><p>15 generators build programs
+  nobody wrote, then require every engine to agree on them too.</p></div>
+  <div class="card"><h3>Laws</h3><p>193 properties that must hold. A law a
+  degenerate implementation satisfies is not a law, and each one here is chosen
+  so that it is not.</p></div>
+</div>
+
+<h2>Record and replay</h2>
+<p>Every builtin that touches the world is journaled. A recorded run replays
+deterministically, and the gate requires each journaled builtin to
+<em>refuse</em> under an empty journal — so a replay cannot quietly reach
+the real world instead.</p>
+
+<footer>
+Grasm — four engines, one answer. Every figure on this site is computed,
+not typed.
+<a href="status.html">Status</a> ·
+<a href="spec.html">Specification</a> ·
+<a href="roadmap.html">Roadmap</a>
+</footer>
+</main>
+</div>
+</body></html>

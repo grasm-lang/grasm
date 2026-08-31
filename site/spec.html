@@ -5,7 +5,15 @@
 <title>Specification</title>
 <meta name="description" content="234 numbered clauses, each with a conformance program.">
 <link rel="stylesheet" href="style.css">
-</head><body>
+<script type="importmap">
+{"imports": {
+  "three": "./vendor/three.module.js",
+  "three/addons/utils/BufferGeometryUtils.js": "./vendor/utils/BufferGeometryUtils.js"
+}}
+</script>
+<script src="vendor/motion.js" defer></script>
+<script type="module" src="app.js"></script>
+</head><body data-page="spec">
 <div class="frame">
 <nav class="rail">
 <a class="mark" href="index.html"><b>grasm</b><span>a systems language</span></a>
@@ -19,13 +27,16 @@
 <a href="tiers.html">Ownership</a>
 <a href="errors.html">Errors</a>
 <a href="concurrency.html">Concurrency</a>
+<a href="security.html">Security</a>
 <h2>Reference</h2>
 <a href="language.html">Language</a>
 <a href="library.html">Library</a>
 <a href="packages.html">Packages</a>
 <a href="spec.html" aria-current="page">Specification</a>
+<a href="architecture.html">Architecture</a>
 <h2>More</h2>
 <a href="examples.html">Examples</a>
+<a href="about.html">About</a>
 <a href="status.html">Status</a>
 <a href="roadmap.html">Roadmap</a>
 </nav>
@@ -38,7 +49,7 @@ that exercises it, and each filed at a stability level that says whether it may
 change.</p>
 
 <div class="figures">
-  <div class="fig"><b>233</b><span>clauses</span></div>
+  <div class="fig"><b>234</b><span>clauses</span></div>
   <div class="fig"><b>70</b><span>pages, the cap</span></div>
   <div class="fig"><b>193</b><span>laws checked against arithmetic</span></div>
 </div>
@@ -76,7 +87,8 @@ made shorter rather than the cap raised. A specification nobody finishes reading
 is one nobody checks the implementation against.</p>
 
 <footer>
-Grasm — three engines, one answer.
+Grasm — four engines, one answer. Every figure on this site is computed,
+not typed.
 <a href="status.html">Status</a> ·
 <a href="spec.html">Specification</a> ·
 <a href="roadmap.html">Roadmap</a>

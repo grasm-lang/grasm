@@ -5,7 +5,15 @@
 <title>Language reference</title>
 <meta name="description" content="Syntax and type-system reference.">
 <link rel="stylesheet" href="style.css">
-</head><body>
+<script type="importmap">
+{"imports": {
+  "three": "./vendor/three.module.js",
+  "three/addons/utils/BufferGeometryUtils.js": "./vendor/utils/BufferGeometryUtils.js"
+}}
+</script>
+<script src="vendor/motion.js" defer></script>
+<script type="module" src="app.js"></script>
+</head><body data-page="language">
 <div class="frame">
 <nav class="rail">
 <a class="mark" href="index.html"><b>grasm</b><span>a systems language</span></a>
@@ -19,13 +27,16 @@
 <a href="tiers.html">Ownership</a>
 <a href="errors.html">Errors</a>
 <a href="concurrency.html">Concurrency</a>
+<a href="security.html">Security</a>
 <h2>Reference</h2>
 <a href="language.html" aria-current="page">Language</a>
 <a href="library.html">Library</a>
 <a href="packages.html">Packages</a>
 <a href="spec.html">Specification</a>
+<a href="architecture.html">Architecture</a>
 <h2>More</h2>
 <a href="examples.html">Examples</a>
+<a href="about.html">About</a>
 <a href="status.html">Status</a>
 <a href="roadmap.html">Roadmap</a>
 </nav>
@@ -71,12 +82,13 @@ escaping for its own quotes. <code>len()</code> counts characters;
 <code>byte_len()</code> counts bytes.</p>
 
 <h2>Where the truth is</h2>
-<p>233 numbered clauses across <code>spec/</code>, each with a conformance
+<p>234 numbered clauses across <code>spec/</code>, each with a conformance
 program that runs in the test suite. <a href="spec.html">More on the
 specification.</a></p>
 
 <footer>
-Grasm — three engines, one answer.
+Grasm — four engines, one answer. Every figure on this site is computed,
+not typed.
 <a href="status.html">Status</a> ·
 <a href="spec.html">Specification</a> ·
 <a href="roadmap.html">Roadmap</a>

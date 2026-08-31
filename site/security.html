@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Capabilities and the supply chain</title>
+<meta name="description" content="A Grasm package declares what it may reach, and the compiler enforces it.">
+<link rel="stylesheet" href="style.css">
+<script type="importmap">
+{"imports": {
+  "three": "./vendor/three.module.js",
+  "three/addons/utils/BufferGeometryUtils.js": "./vendor/utils/BufferGeometryUtils.js"
+}}
+</script>
+<script src="vendor/motion.js" defer></script>
+<script type="module" src="app.js"></script>
+</head><body data-page="security">
+<div class="frame">
+<nav class="rail">
+<a class="mark" href="index.html"><b>grasm</b><span>a systems language</span></a>
+<h2>Start</h2>
+<a href="start.html">Getting started</a>
+<a href="install.html">Install</a>
+<a href="playground.html">Playground</a>
+<h2>Learn</h2>
+<a href="tour.html">Tour</a>
+<a href="effects.html">Effects</a>
+<a href="tiers.html">Ownership</a>
+<a href="errors.html">Errors</a>
+<a href="concurrency.html">Concurrency</a>
+<a href="security.html" aria-current="page">Security</a>
+<h2>Reference</h2>
+<a href="language.html">Language</a>
+<a href="library.html">Library</a>
+<a href="packages.html">Packages</a>
+<a href="spec.html">Specification</a>
+<a href="architecture.html">Architecture</a>
+<h2>More</h2>
+<a href="examples.html">Examples</a>
+<a href="about.html">About</a>
+<a href="status.html">Status</a>
+<a href="roadmap.html">Roadmap</a>
+</nav>
+<main>
+
+<p class="eyebrow">Learn</p>
+<h1>A dependency cannot quietly grow teeth.</h1>
+<p class="lede">When you install a library that says it does arithmetic, nothing
+in Python, Go, Rust or Zig stops it from opening your files or reaching the
+network. Grasm writes that permission down and refuses the build when it is
+exceeded.</p>
+
+<h2>The attack</h2>
+<p>A trusted, pure library ships a patch release. Same name, same signature,
+same return value — and it now reads <code>/etc/passwd</code> and writes it
+out. Nothing about the call site changes. This is not hypothetical; it is the
+shape of every dependency compromise of the last decade.</p>
+
+<div class="demo" id="capability">
+  <div class="head">
+    <h3>mathlib 1.0.0 → 1.0.1</h3>
+    <button class="btn">ship the malicious update</button>
+  </div>
+  <div class="lanes"></div>
+  <div class="terminal"><span class="dim">Press the button to run the attack against four toolchains.</span></div>
+</div>
+
+<p>Only Grasm’s toolchain refuses. Everywhere else the tampered code builds,
+ships and runs; detection is left to runtime sandboxing or to a reviewer
+noticing — neither of which the toolchain does.</p>
+
+<h2>How it works</h2>
+<p>Two halves. The first is the effect row, which is <em>inferred</em>, so it
+cannot be wrong about the body:</p>
+<pre><code>// the row is worked out from the body, then checked against what you wrote
+fn load(path: str) -&gt; str ! IoError / {io} {
+    try read_file(path)
+}</code></pre>
+<p>The second is the manifest, which is the ceiling for the whole package:</p>
+<pre><code>[package]
+name = "mathlib"
+version = "1.0.1"
+
+capabilities = []        # this package may perform no effect at all</code></pre>
+<p>Add the <code>read_file</code> and the package performs <code>io</code>,
+which exceeds <code>[]</code>. The error names the exact place:</p>
+<pre><code>error: package `mathlib` performs `io` but its manifest only permits nothing
+  help: either add the capability to that package's manifest, or stop it
+        from performing the effect
+  performed: `io` at mathlib/src/main.gr:2:9</code></pre>
+<p>The maintainer <em>can</em> raise the ceiling — but the manifest is in the
+diff, and a package that used to declare <code>[]</code> and now declares
+<code>["io"]</code> is one line a consumer can see, refuse, or gate in CI.
+That is the whole design: make the change visible where a human is already
+looking.</p>
+
+<h2>What this does not do</h2>
+<p class="note"><strong>This is a build-time check, not a sandbox.</strong> It
+constrains what code in a Grasm package can be <em>written</em> to do. It does
+not contain a process that is already running, it does not survive
+<code>unsafe</code>, and it says nothing about a compromised compiler or
+operating system.</p>
+<ul>
+  <li><code>unsafe</code> and <code>extern fn</code> reach C, and C is outside
+  this. That is why the tier is called Tier 3, why every call must sit inside an
+  <code>unsafe</code> block, <em>and</em> why the package must additionally
+  declare the <code>unsafe</code> capability — so a consumer can refuse the
+  whole package by reading one line.</li>
+  <li><code>exit</code> performs no effect and can still end the process. So
+  can a panic and an endless loop. A ceiling bounds what a dependency can
+  <em>reach</em>, never how long it runs.</li>
+</ul>
+
+<h2>Prior art</h2>
+<p>None of this is invented here. <a href="about.html">Austral</a> pioneered
+capability-secure modules, Wyvern did capability-safe modules before that, and
+the effect row is <a href="about.html">Koka</a>’s. What is uncommon is
+shipping the combination with a gate that proves it: <code>security_bench.sh</code>
+runs the attack on every green build.</p>
+
+<footer>
+Grasm — four engines, one answer. Every figure on this site is computed,
+not typed.
+<a href="status.html">Status</a> ·
+<a href="spec.html">Specification</a> ·
+<a href="roadmap.html">Roadmap</a>
+</footer>
+</main>
+</div>
+</body></html>

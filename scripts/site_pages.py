@@ -15,21 +15,25 @@ PAGES = {}
 PAGES["index.html"] = (
     "Grasm is a systems language where what a program may do is written in its type.",
     """
-<p class="eyebrow">A systems language</p>
-<h1>What a program may do<br>is written in its type.</h1>
-<p class="lede">Grasm puts effects in the signature, capabilities in the package
-manifest, and ownership in tiers you choose per value. It compiles ahead of
-time, runs in a browser, and three engines agree byte for byte on every program
-in the repository.</p>
-
-<div class="actions">
-  <a class="btn" href="start.html">Get started</a>
-  <a class="btn ghost" href="playground.html">Try it in the browser</a>
-  <a class="btn ghost" href="examples.html">See real programs</a>
+<div class="hero">
+  <div id="stage" aria-hidden="true"></div>
+  <div class="copy">
+    <p class="eyebrow">A systems language · v«version»</p>
+    <h1>What a program may do<br>is written in its type.</h1>
+    <p class="lede">Effects go in the signature. Capabilities go in the package
+    manifest. Ownership is a tier you pick per value. It compiles ahead of time,
+    runs in a browser, and four engines agree byte for byte on every program
+    here.</p>
+    <div class="actions">
+      <a class="btn" href="start.html">Get started</a>
+      <a class="btn ghost" href="security.html">See the capability check</a>
+      <a class="btn ghost" href="playground.html">Try it in the browser</a>
+    </div>
+  </div>
 </div>
 
 <h2>The signature is the contract</h2>
-<p>A function's type says what it returns <em>and</em> what it is allowed to
+<p>A function\u2019s type says what it returns <em>and</em> what it is allowed to
 do. The row is inferred from the body, so it cannot drift from the truth, and a
 caller that has not been given <code>io</code> cannot call something that
 performs it.</p>
@@ -51,51 +55,102 @@ fn report(n: i64) / {io} {        // this one prints; the type says so
     + """
 <p><code>! MathError</code> is a failure the caller must handle.
 <code>/ {io}</code> is an effect the caller must be permitted. Neither is a
-comment or a convention — both are checked.</p>
+comment or a convention \u2014 both are checked.</p>
 
-<h2>Four engines, one answer</h2>
-<p>The interpreter is normative. A bundle is that interpreter with the program
-attached. <code>--native</code> compiles ahead of time through Cranelift. A
-fourth build targets <code>wasm32</code>. Every gate in the repository exists to
+<h2 class="reveal">A dependency cannot quietly grow teeth</h2>
+<p class="reveal">This is the one thing here that other languages do not have.
+A library declares what it may reach. If a patch release starts reading your
+files, the build fails \u2014 in every consumer, without anybody reviewing the
+diff. Press the button: the verdicts are the ones
+<code>scripts/security_bench.sh</code> produces.</p>
+
+<div class="demo reveal" id="capability">
+  <div class="head">
+    <h3>mathlib 1.0.0 \u2192 1.0.1</h3>
+    <button class="btn">ship the malicious update</button>
+  </div>
+  <div class="lanes"></div>
+  <div class="terminal"><span class="dim">Press the button to run the attack against four toolchains.</span></div>
+</div>
+
+<h2 class="reveal">Four engines, one answer</h2>
+<p class="reveal">The interpreter is normative. A bundle is that interpreter
+with the program attached. <code>--native</code> compiles ahead of time through
+Cranelift. A fourth build targets <code>wasm32</code>. Every gate here exists to
 hold them to the same answer.</p>
 
-<div class="figures">
-  <div class="fig"><b>«corpus»</b><span>programs, three engines</span></div>
-  <div class="fig"><b>«wasm_ok»</b><span>also identical in wasm</span></div>
-  <div class="fig"><b>«cross»</b><span>cross-compiled to x86_64</span></div>
-  <div class="fig"><b>0</b><span>open defects</span></div>
+<div class="engines reveal">
+  <canvas id="engines" data-programs="«corpus»" aria-label="Programs flowing through four engines to a single answer"></canvas>
 </div>
 
-<h2>What is different here</h2>
-<div class="grid three">
-  <div class="cell"><h4>Effects, inferred</h4><p>You do not write the row. The
+<div class="grid three reveal">
+  <div class="card"><div class="stat">«corpus»<small>programs, three engines identical</small></div></div>
+  <div class="card"><div class="stat">«wasm_ok»<small>also identical in wasm</small></div></div>
+  <div class="card"><div class="stat">0<small>open defects, any severity</small></div></div>
+</div>
+
+<h2 class="reveal">What is measured, including what is missed</h2>
+<p class="reveal">Most language sites show the numbers that flatter them. These
+are the north-star targets and where the implementation actually sits \u2014
+four of them are still short, and saying so is cheaper than defending a claim
+nobody can reproduce.</p>
+
+<div class="bars reveal">
+  <div class="bar-row">
+    <span class="what">Frontend throughput</span>
+    <span class="bar-track"><span class="bar-fill miss" data-pct="70"></span></span>
+    <span class="num miss">350,258 / 500,000 LOC/s</span>
+  </div>
+  <div class="bar-row">
+    <span class="what">Hello-world binary</span>
+    <span class="bar-track"><span class="bar-fill miss" data-pct="91"></span></span>
+    <span class="num miss">328 KB / \u2264 300 KB</span>
+  </div>
+  <div class="bar-row">
+    <span class="what">Tokens vs Python</span>
+    <span class="bar-track"><span class="bar-fill miss" data-pct="96"></span></span>
+    <span class="num miss">1.04\u00d7 / \u2264 1.00\u00d7</span>
+  </div>
+  <div class="bar-row">
+    <span class="what">Tokens vs Go</span>
+    <span class="bar-track"><span class="bar-fill miss" data-pct="98"></span></span>
+    <span class="num miss">0.61\u00d7 / \u2264 0.60\u00d7</span>
+  </div>
+  <div class="bar-row">
+    <span class="what">Engines agreeing</span>
+    <span class="bar-track"><span class="bar-fill hit" data-pct="100"></span></span>
+    <span class="num">«corpus» / «corpus»</span>
+  </div>
+</div>
+
+<p class="note"><strong>No benchmark here says Grasm beats Rust, Go or Zig.</strong>
+It does not. <a href="status.html">Status</a> records the gaps, and
+<code>scripts/bench.sh</code> refuses to run on a loaded machine rather than
+publish a number it cannot stand behind.</p>
+
+<h2 class="reveal">What is different here</h2>
+<div class="grid three reveal">
+  <div class="card"><h3>Effects, inferred</h3><p>You do not write the row. The
   compiler works it out from the body and checks it against what you declared,
   so a function that starts touching the network stops compiling.</p></div>
-  <div class="cell"><h4>Capability ceilings</h4><p>A package declares the
+  <div class="card"><h3>Capability ceilings</h3><p>A package declares the
   effects it may perform. One that quietly starts reading files fails to build
-  <em>in every consumer</em> — a compile error, not a code review.</p></div>
-  <div class="cell"><h4>Tiered ownership</h4><p>Four tiers, chosen per value:
-  borrowed, arena, generational reference, and an explicit unsafe escape. You
-  pay for the one you use.</p></div>
-  <div class="cell"><h4>Typed errors</h4><p><code>T ! E</code> is a value.
-  There is no exception mechanism and no null.</p></div>
-  <div class="cell"><h4>Deterministic replay</h4><p>Every effect can be
-  journaled and replayed on a different engine — a recording made natively
-  replays under the interpreter.</p></div>
-  <div class="cell"><h4>Runs in a browser</h4><p>The same source, the same
-  answers, compiled to wasm with no server.</p></div>
+  in every consumer \u2014 a compile error, not a code review.</p></div>
+  <div class="card"><h3>Tiered ownership</h3><p>No lifetime annotations.
+  <code>own</code> and <code>inout</code> at the boundary, a region when a scope
+  should own its allocations, a generational reference when a graph needs
+  one.</p></div>
 </div>
 
-<h2>Honest about where it is</h2>
-<p>Grasm compiles real programs — an HTTP server, a SQL engine, a JSON parser,
-a garbage collector, a self-hosting lexer — and runs them identically on every
-engine. It has no third-party libraries, no users but this project, and runs at
-roughly 0.45× native Rust on the benchmark set.</p>
-<p><a href="status.html">The status page says exactly what does not work.</a></p>
-""",
-)
+<div class="grid three reveal">
+  <div class="card"><div class="stat">«clauses»<small>normative clauses, each with a conformance program</small></div></div>
+  <div class="card"><div class="stat">«spec_lines»<small>lines of specification \u2014 a hard ceiling</small></div></div>
+  <div class="card"><div class="stat">«gates»<small>gates, judged by exit code alone</small></div></div>
+</div>
 
-# ---------------------------------------------------------------- start
+<p><a class="btn ghost" href="about.html">Read what this is, and is not</a></p>
+"""
+)
 
 PAGES["start.html"] = (
     "Write, run and compile your first Grasm program.",
@@ -1054,4 +1109,246 @@ only the language pack, not this repository's history. Those rounds have not
 run. Until they do, the claim is not available, and no number of green gates
 substitutes for it.</p>
 """,
+)
+
+# ---------------------------------------------------------------- security
+
+PAGES["security.html"] = (
+    "A Grasm package declares what it may reach, and the compiler enforces it.",
+    """
+<p class="eyebrow">Learn</p>
+<h1>A dependency cannot quietly grow teeth.</h1>
+<p class="lede">When you install a library that says it does arithmetic, nothing
+in Python, Go, Rust or Zig stops it from opening your files or reaching the
+network. Grasm writes that permission down and refuses the build when it is
+exceeded.</p>
+
+<h2>The attack</h2>
+<p>A trusted, pure library ships a patch release. Same name, same signature,
+same return value \u2014 and it now reads <code>/etc/passwd</code> and writes it
+out. Nothing about the call site changes. This is not hypothetical; it is the
+shape of every dependency compromise of the last decade.</p>
+
+<div class="demo" id="capability">
+  <div class="head">
+    <h3>mathlib 1.0.0 \u2192 1.0.1</h3>
+    <button class="btn">ship the malicious update</button>
+  </div>
+  <div class="lanes"></div>
+  <div class="terminal"><span class="dim">Press the button to run the attack against four toolchains.</span></div>
+</div>
+
+<p>Only Grasm\u2019s toolchain refuses. Everywhere else the tampered code builds,
+ships and runs; detection is left to runtime sandboxing or to a reviewer
+noticing \u2014 neither of which the toolchain does.</p>
+
+<h2>How it works</h2>
+<p>Two halves. The first is the effect row, which is <em>inferred</em>, so it
+cannot be wrong about the body:</p>
+"""
+    + code(
+        """
+// the row is worked out from the body, then checked against what you wrote
+fn load(path: str) -> str ! IoError / {io} {
+    try read_file(path)
+}
+"""
+    )
+    + """
+<p>The second is the manifest, which is the ceiling for the whole package:</p>
+"""
+    + code(
+        """
+[package]
+name = "mathlib"
+version = "1.0.1"
+
+capabilities = []        # this package may perform no effect at all
+"""
+    )
+    + """
+<p>Add the <code>read_file</code> and the package performs <code>io</code>,
+which exceeds <code>[]</code>. The error names the exact place:</p>
+"""
+    + code(
+        """
+error: package `mathlib` performs `io` but its manifest only permits nothing
+  help: either add the capability to that package's manifest, or stop it
+        from performing the effect
+  performed: `io` at mathlib/src/main.gr:2:9
+"""
+    )
+    + """
+<p>The maintainer <em>can</em> raise the ceiling \u2014 but the manifest is in the
+diff, and a package that used to declare <code>[]</code> and now declares
+<code>["io"]</code> is one line a consumer can see, refuse, or gate in CI.
+That is the whole design: make the change visible where a human is already
+looking.</p>
+
+<h2>What this does not do</h2>
+<p class="note"><strong>This is a build-time check, not a sandbox.</strong> It
+constrains what code in a Grasm package can be <em>written</em> to do. It does
+not contain a process that is already running, it does not survive
+<code>unsafe</code>, and it says nothing about a compromised compiler or
+operating system.</p>
+<ul>
+  <li><code>unsafe</code> and <code>extern fn</code> reach C, and C is outside
+  this. That is why the tier is called Tier 3, why every call must sit inside an
+  <code>unsafe</code> block, <em>and</em> why the package must additionally
+  declare the <code>unsafe</code> capability \u2014 so a consumer can refuse the
+  whole package by reading one line.</li>
+  <li><code>exit</code> performs no effect and can still end the process. So
+  can a panic and an endless loop. A ceiling bounds what a dependency can
+  <em>reach</em>, never how long it runs.</li>
+</ul>
+
+<h2>Prior art</h2>
+<p>None of this is invented here. <a href="about.html">Austral</a> pioneered
+capability-secure modules, Wyvern did capability-safe modules before that, and
+the effect row is <a href="about.html">Koka</a>\u2019s. What is uncommon is
+shipping the combination with a gate that proves it: <code>security_bench.sh</code>
+runs the attack on every green build.</p>
+"""
+)
+
+# ------------------------------------------------------------ architecture
+
+PAGES["architecture.html"] = (
+    "How Grasm is built: four engines, one normative interpreter, and the gates that hold them together.",
+    """
+<p class="eyebrow">Reference</p>
+<h1>How it is built.</h1>
+<p class="lede">One language, four ways to run it, and a set of gates whose only
+job is to stop them disagreeing. The interpreter is the specification; the other
+three have to match it.</p>
+
+<h2>The pipeline</h2>
+<table>
+  <tr><th>Stage</th><th>Crate</th><th>What it produces</th></tr>
+  <tr><td>Lexer and parser</td><td><code>grasm_syntax</code></td><td>Tokens, then a tree. Also the formatter.</td></tr>
+  <tr><td>Checker</td><td><code>grasm_sema</code></td><td>Types, effect rows, ownership, exhaustiveness \u2014 and an <code>Analysis</code> the backend reads.</td></tr>
+  <tr><td>Interpreter</td><td><code>grasm_interp</code></td><td>The normative answer.</td></tr>
+  <tr><td>Native backend</td><td><code>grasm_native</code></td><td>Cranelift IR, then an object file.</td></tr>
+  <tr><td>Runtime</td><td><code>grasm_rt</code></td><td>Reference-counted boxed values with copy-on-write.</td></tr>
+  <tr><td>Wasm</td><td><code>grasm_wasm</code></td><td>The interpreter, compiled for <code>wasm32</code>.</td></tr>
+</table>
+
+<h2>Why the checker hands types to the backend</h2>
+<p>It did not, once. The backend re-derived them \u2014 roughly 950 lines of a
+<em>second</em> type inference \u2014 and nine of twelve findings in one period
+traced to the two disagreeing. The checker now exports every expression\u2019s
+resolved type; it answers 94% of the backend\u2019s questions on real code and
+87% on generated code. Where it answers, the two <em>cannot</em> disagree,
+because there is only one answer.</p>
+<p>Nothing was deleted on the strength of that, and the reason is recorded:
+an arm the corpus never reaches is not an arm nothing reaches.</p>
+
+<h2>The memory model, plainly</h2>
+<p>Boxed values \u2014 strings, lists \u2014 are reference-counted with
+copy-on-write. The count is atomic so a value may cross a thread, and that cost
+was measured rather than assumed: 4.3% on the most reference-count-heavy
+program here, no movement at all on three others, about half a percent on the
+geometric mean.</p>
+<p>Effects, capabilities, ownership modes and exhaustiveness are erased before
+codegen and cost nothing at run time. <code>ref T</code> costs a generation
+check. <code>region</code> is checked but does not yet free in bulk \u2014 the
+specification says so in the clause itself rather than implying otherwise.</p>
+
+<h2>The gates</h2>
+<p>«gates» of them, each judged by its exit code and nothing else. That rule
+exists because a gate once reported <code>identical: 184  mismatched: 0</code>,
+which was true, while failing three lines further down.</p>
+<div class="grid two">
+  <div class="card"><h3>Agreement</h3><p>difftest, crosstest, wasmtest and
+  agreetest run the corpus through every engine and require identical bytes.</p></div>
+  <div class="card"><h3>Differential</h3><p>Against things outside this project:
+  OpenSSL for certificates, real zlib, git\u2019s own object store, V8 for
+  WebAssembly, clang\u2019s assembler.</p></div>
+  <div class="card"><h3>Generated</h3><p>«generators» generators build programs
+  nobody wrote, then require every engine to agree on them too.</p></div>
+  <div class="card"><h3>Laws</h3><p>«laws» properties that must hold. A law a
+  degenerate implementation satisfies is not a law, and each one here is chosen
+  so that it is not.</p></div>
+</div>
+
+<h2>Record and replay</h2>
+<p>Every builtin that touches the world is journaled. A recorded run replays
+deterministically, and the gate requires each journaled builtin to
+<em>refuse</em> under an empty journal \u2014 so a replay cannot quietly reach
+the real world instead.</p>
+"""
+)
+
+# ---------------------------------------------------------------- about
+
+PAGES["about.html"] = (
+    "What Grasm is, what it borrowed, and who should not use it.",
+    """
+<p class="eyebrow">More</p>
+<h1>What this is, and what it is not.</h1>
+<p class="lede">Grasm is a systems language with an effect system, capability
+ceilings on packages, and tiered ownership without lifetime annotations. It is
+version «version», it has «packages» libraries, and every one of them was
+written inside this repository.</p>
+
+<h2>Nothing here was invented</h2>
+<p>It is worth being direct about this, because a language site is the last
+place anyone expects to read it. Every idea in Grasm exists elsewhere, usually
+first and usually with more research behind it.</p>
+<table>
+  <tr><th>In Grasm</th><th>Where it came from</th></tr>
+  <tr><td><code>let</code> / <code>inout</code> / <code>own</code>, value semantics, no lifetimes</td>
+      <td><b>Hylo</b> (formerly Val) has <code>let</code>/<code>inout</code>/<code>sink</code>. <b>Swift</b> has exclusivity, ARC and copy-on-write.</td></tr>
+  <tr><td>Effect rows, inferred and unified</td>
+      <td><b>Koka</b> \u2014 row-based effect types with inference. Also <b>OCaml 5</b>, <b>Unison</b>, <b>Eff</b>, <b>Frank</b>.</td></tr>
+  <tr><td>Capability ceiling per module</td>
+      <td><b>Austral</b> \u2014 capability-secure, no ambient I/O. <b>Wyvern</b>, and the <b>E</b> language before it.</td></tr>
+  <tr><td>Reference counting with copy-on-write</td>
+      <td><b>Swift</b>, <b>Nim</b>.</td></tr>
+  <tr><td>Generational references</td>
+      <td>The slotmap pattern, in every entity-component system.</td></tr>
+  <tr><td>A reference interpreter as the specification</td>
+      <td><b>WebAssembly</b> does this, and does it better.</td></tr>
+</table>
+<p>The closest single comparison is <b>Hylo plus Koka, tied to a manifest the
+way Austral does it</b>. What is uncommon is not the ideas but shipping them
+together with gates that prove the combination holds.</p>
+
+<h2>Who should not use this</h2>
+<p>Most people, today. Specifically:</p>
+<ul>
+  <li><b>If you need libraries.</b> There are «packages», all written here.
+  Python has hundreds of thousands.</li>
+  <li><b>If you need speed.</b> Rust and Zig are faster, and
+  <a href="status.html">the numbers here</a> say by how much.</li>
+  <li><b>If you need to hire.</b> Nobody outside this repository has written
+  Grasm.</li>
+  <li><b>If you need a native debugger.</b> There is a Debug Adapter Protocol
+  server, and it works against the interpreter. The Cranelift backend emits no
+  DWARF, so GDB and LLDB cannot meaningfully inspect a compiled binary.</li>
+  <li><b>If you need async I/O.</b> There are threads and structured
+  concurrency, and no async/await.</li>
+</ul>
+
+<h2>Who might</h2>
+<p>Someone who genuinely models an untrusted dependency reaching the network or
+the filesystem as a threat, and who wants the compiler to enforce the boundary
+rather than a sandbox at run time. That is a real gap in Rust, Go, Zig and
+Python, and it is the one thing here that is not catching up to somebody
+else.</p>
+
+<h2>How it is built</h2>
+<p>«clauses» normative clauses in «spec_lines» lines of specification, under a
+hard ceiling \u2014 every addition since has been paid for by compressing prose
+already written. «stable» clauses are <code>stable</code> and will not change
+incompatibly before 2.0; «provisional» are <code>provisional</code> and
+«experimental» are <code>experimental</code>. Version 1.0 promoted nothing: a
+clause moves when it passes the five-part test, one at a time, on its own
+evidence.</p>
+
+<p class="note">Every number on this site is computed from the repository when
+the site is written, or read from the last green gate run. None of them is a
+figure somebody remembered. If a gate has not run, the page says so rather than
+printing a number nobody measured.</p>
+"""
 )
