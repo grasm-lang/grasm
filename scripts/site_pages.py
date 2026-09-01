@@ -40,48 +40,41 @@ def verdicts():
 # ---------------------------------------------------------------- index
 
 PAGES["index.html"] = (
-    "Grasm is a systems language where what a program may do is written in its type.",
+    "Grasm is a systems language where a dependency cannot reach further than its manifest allows.",
     """
 <div class="hero">
   <p class="eyebrow">Systems language \u00b7 v\u00abversion\u00bb</p>
-  <h1>What a program may do is written in its type.</h1>
-  <p class="lede">Effects go in the signature and are inferred from the body.
-  Capabilities go in the package manifest and bound what a dependency can
-  reach. Ownership is a tier you pick per value \u2014 no lifetime
-  annotations.</p>
+  <h1>Your dependencies can read every file you can.</h1>
+  <p class="lede">In Python, Go, Rust and Zig, a library that claims to do
+  arithmetic can open your files and your sockets, and nothing in the toolchain
+  will say a word. Grasm makes that a compile error.</p>
   <div class="actions">
     <a class="btn" href="start.html">Get started</a>
-    <a class="btn ghost" href="syntax.html">Syntax reference</a>
-    <a class="btn ghost" href="playground.html">Run it in the browser</a>
+    <a class="btn ghost" href="security.html">How it works</a>
+    <a class="btn ghost" href="syntax.html">Syntax</a>
   </div>
 </div>
 
 <div class="split">
   <div>
-    <h3>A signature is a contract</h3>
-    <p>The row after <code>/</code> says what the function is permitted to do.
-    You do not write it; the compiler works it out from the body and checks it
-    against what you declared.</p>
+    <h3>The manifest is the ceiling</h3>
+    <p>A package declares what it may reach. The compiler infers what it
+    actually does \u2014 through every call, into every dependency \u2014 and
+    refuses to build when the two disagree.</p>
 """
     + code(
-        """fn safe_div(a: i64, b: i64) -> i64 ! MathError {
-    if b == 0 {
-        fail(DivByZero)
-    }
-    a / b
-}
+        """[package]
+name = "mathlib"
 
-fn report(n: i64) / {io} {      // this one prints, and the type says so
-    print("{n}")
-}""",
-        "! MathError is a failure the caller must handle. / {io} is an effect the caller must be permitted.",
+capabilities = []          # reaches nothing at all""",
+        "mathlib/grasm.toml — the ceiling, in one line a reviewer can see.",
     )
     + """
   </div>
   <div>
-    <h3>A dependency cannot quietly grow teeth</h3>
-    <p>A trusted library ships a patch release that reads your files. Same
-    name, same signature, same result. This is what happens:</p>
+    <h3>A patch release tries to grow teeth</h3>
+    <p>Same name, same signature, same result \u2014 and one new line that reads
+    a file. This is the whole build:</p>
     <div class="term">
       <div class="chrome"><span class="dot"></span><span class="dot"></span><span class="dot"></span>
         <span>app \u2014 grasm build</span></div>
@@ -91,38 +84,66 @@ fn report(n: i64) / {io} {      // this one prints, and the type says so
 </div>
 
 <h2 class="reveal">The same attack, four toolchains</h2>
-<p class="reveal">These verdicts are the ones <code>scripts/security_bench.sh</code>
-produces on every green build. Only one toolchain refuses.</p>
+<p class="reveal">A trusted pure library\u2019s 1.0.1 starts reading
+<code>/etc/passwd</code>. <code>scripts/security_bench.sh</code> runs it against
+four toolchains on every green build. Three of them ship it.</p>
 """
     + verdicts()
     + """
+<p class="note"><strong>This is the reason the language exists.</strong>
+xz-utils, event-stream, SolarWinds: the attack is always the same shape, and
+the answer everywhere else is a runtime sandbox or a human reading the diff.
+Here it is a type error.</p>
+
+<h2 class="reveal">Three ideas, and they compose</h2>
 <div class="grid three reveal">
   <div class="card">
     <span class="ico">\u00abicon_lock\u00bb</span>
-    <h3>The ceiling is declared</h3>
-    <p>A package states the effects it may perform. Exceeding it is a compile
-    error in every consumer, not a code review.</p>
+    <h3>Capabilities</h3>
+    <p>A package states the effects it may perform. Exceeding it fails the
+    build in every consumer \u2014 not in a review, not at run time.</p>
     <div class="lottie" data-lottie="ceiling"></div>
   </div>
   <div class="card">
     <span class="ico">\u00abicon_layers\u00bb</span>
     <h3>Ownership in tiers</h3>
     <p>Value semantics by default, a region when a scope should own its
-    allocations, a generational reference when a graph needs one.</p>
+    allocations, a generational reference when a graph needs one. No lifetime
+    annotations anywhere.</p>
     <div class="lottie" data-lottie="tiers"></div>
   </div>
   <div class="card">
     <span class="ico">\u00abicon_flow\u00bb</span>
     <h3>Four engines, one answer</h3>
-    <p>Interpreter, bundle, native and wasm. Every gate here exists to hold
-    them to the same bytes.</p>
+    <p>Interpreter, bundle, ahead-of-time native, and wasm. Develop against
+    instant feedback, ship a binary, run the same program in a browser.</p>
     <div class="lottie" data-lottie="engines"></div>
   </div>
 </div>
 
-<h2 class="reveal">Every program, every engine</h2>
-<p class="reveal">The interpreter is normative. The other three have to match
-it, and the corpus is what proves they do.</p>
+<h2 class="reveal">Effects are in the type, and inferred</h2>
+<p class="reveal">You do not write the row. The compiler works it out from the
+body and checks it against what you declared, so a function that starts
+touching the network stops compiling \u2014 and so does every caller that was
+not given the same permission.</p>
+"""
+    + code(
+        """fn safe_div(a: i64, b: i64) -> i64 ! MathError {
+    if b == 0 {
+        fail(DivByZero)
+    }
+    a / b
+}
+
+fn load(path: str) -> str ! IoError / {io} {
+    try read_file(path)
+}""",
+        "! MathError is a failure the caller must handle. / {io} is a permission the caller must have.",
+    )
+    + """
+<h2 class="reveal">The same program, every engine</h2>
+<p class="reveal">The interpreter is normative and the other three have to match
+it. Every gate here exists to hold them to the same bytes.</p>
 <div class="viz reveal">
   <canvas id="engines" data-programs="\u00abcorpus\u00bb"
     aria-label="Programs flowing through four engines to one answer"></canvas>
@@ -130,60 +151,23 @@ it, and the corpus is what proves they do.</p>
 </div>
 
 <div class="figures reveal">
-  <div class="fig"><b>\u00abcorpus\u00bb</b><span>programs, three engines identical</span></div>
-  <div class="fig"><b>\u00abwasm_ok\u00bb</b><span>also identical in wasm</span></div>
-  <div class="fig"><b>\u00abclauses\u00bb</b><span>normative clauses</span></div>
-  <div class="fig"><b>0</b><span>open defects, any severity</span></div>
+  <div class="fig"><b>\u00abcorpus\u00bb</b><span>programs, engines identical</span></div>
+  <div class="fig"><b>\u00abpackages\u00bb</b><span>libraries, all written in Grasm</span></div>
+  <div class="fig"><b>\u00abclauses\u00bb</b><span>normative clauses, each with a conformance program</span></div>
+  <div class="fig"><b>\u00abgates\u00bb</b><span>gates, judged by exit code alone</span></div>
 </div>
 
-<h2 class="reveal">What is measured, including what is missed</h2>
-<p class="reveal">These are the north-star targets and where the implementation
-sits. Four are short. Publishing them is cheaper than defending a number
-nobody can reproduce.</p>
-
-<div class="bars reveal">
-  <div class="bar-row">
-    <span class="what">Frontend throughput</span>
-    <span class="bar-track"><span class="bar-fill miss" data-pct="70"></span></span>
-    <span class="num miss">350,258 / 500,000 LOC/s</span>
-  </div>
-  <div class="bar-row">
-    <span class="what">Hello-world binary</span>
-    <span class="bar-track"><span class="bar-fill miss" data-pct="91"></span></span>
-    <span class="num miss">328 KB / \u2264 300 KB</span>
-  </div>
-  <div class="bar-row">
-    <span class="what">Tokens vs Python</span>
-    <span class="bar-track"><span class="bar-fill miss" data-pct="96"></span></span>
-    <span class="num miss">1.04\u00d7 / \u2264 1.00\u00d7</span>
-  </div>
-  <div class="bar-row">
-    <span class="what">Tokens vs Go</span>
-    <span class="bar-track"><span class="bar-fill miss" data-pct="98"></span></span>
-    <span class="num miss">0.61\u00d7 / \u2264 0.60\u00d7</span>
-  </div>
-  <div class="bar-row">
-    <span class="what">Engines agreeing</span>
-    <span class="bar-track"><span class="bar-fill hit" data-pct="100"></span></span>
-    <span class="num">\u00abcorpus\u00bb / \u00abcorpus\u00bb</span>
-  </div>
-</div>
-
-<p class="note"><strong>No benchmark here says Grasm beats Rust, Go or Zig.</strong>
-It does not. <code>scripts/bench.sh</code> refuses to run on a loaded machine
-rather than publish a number it cannot stand behind.</p>
-
-<h2 class="reveal">Where to go next</h2>
+<h2 class="reveal">Start here</h2>
 <div class="grid three reveal">
+  <div class="card"><span class="ico">\u00abicon_terminal\u00bb</span><h3>Getting started</h3>
+    <p>Install, first program, first package.
+    <a href="start.html">Begin \u2192</a></p></div>
   <div class="card"><span class="ico">\u00abicon_book\u00bb</span><h3>Syntax</h3>
     <p>The whole language on one page, every form with an example.
     <a href="syntax.html">Read it \u2192</a></p></div>
-  <div class="card"><span class="ico">\u00abicon_shield\u00bb</span><h3>Capabilities</h3>
-    <p>How the ceiling works, and what it deliberately does not do.
-    <a href="security.html">Read it \u2192</a></p></div>
-  <div class="card"><span class="ico">\u00abicon_package\u00bb</span><h3>Packages</h3>
-    <p>\u00abpackages\u00bb libraries, every one written in Grasm.
-    <a href="packages.html">Browse \u2192</a></p></div>
+  <div class="card"><span class="ico">\u00abicon_gauge\u00bb</span><h3>Status</h3>
+    <p>What works, what is measured, and what is still missing.
+    <a href="status.html">See it \u2192</a></p></div>
 </div>
 """
 )
