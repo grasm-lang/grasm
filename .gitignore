@@ -1,4 +1,15 @@
 /target
-Cargo.lock
+
+# `Cargo.lock` is deliberately *not* ignored.
+#
+# Cargo's rule is: ignore it for a library, commit it for a binary. This
+# workspace ships binaries — `grasm`, and the runtime a `--native` build links
+# against — so the lock file is what makes a build of tag `v1.0.0` today the
+# same build in a year. Ignoring it meant CI resolved fresh versions on every
+# run, which is the opposite of what a release tag promises.
 .DS_Store
 __pycache__/
+
+# The security benchmark builds a throwaway Rust project to prove `std::fs` is
+# ambient there. Its lock file is an artifact of running the gate, not source.
+/benchmarks/security/rust/app/Cargo.lock
