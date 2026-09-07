@@ -1,0 +1,24 @@
+[package]
+name = "text3_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.casefold]
+path = "../casefold"
+version = "^1.0.0"
+
+[dependencies.tokenizer]
+path = "../tokenizer"
+version = "^1.0.0"
+
+[dependencies.wrapansi]
+path = "../wrapansi"
+version = "^1.0.0"
+
+[dependencies.edit]
+path = "../edit"
+version = "^1.0.0"
+
+[dependencies.similarity]
+path = "../similarity"
+version = "^1.0.0"

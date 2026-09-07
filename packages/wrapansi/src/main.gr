@@ -1,0 +1,246 @@
+// Wrapping text that carries colour.
+//
+// A plain wrapper counts every character, and an SGR escape is nine
+// characters that occupy no columns. Wrap a coloured line at 80 and it breaks
+// at 71 visible columns, or at 62, depending on how many colours it changed —
+// the wrap looks random because the thing being counted is invisible.
+//
+// The second half of the problem is subtler. A break in the middle of a
+// coloured run leaves the next line unstyled, because the escape that turned
+// the colour on was on the previous line. So a break has to close what is
+// open and reopen it on the far side, which means tracking the active style
+// rather than only skipping over it.
+
+/// Where an escape sequence starting at `at` ends, or `at` if none does.
+fn escape_end(chars: [str], at: i64) -> i64 {
+    let n = chars.len()
+    if at >= n or chars[at] != (27).to_char() {
+        return at
+    }
+    if at + 1 >= n {
+        return at
+    }
+    if chars[at + 1] == "[" {
+        // CSI: parameters, then a final byte in 0x40..0x7E.
+        var i = at + 2
+        while i < n {
+            let code = chars[i].code_at(0)
+            if code >= 64 and code <= 126 {
+                return i + 1
+            }
+            i = i + 1
+        }
+        return n
+    }
+    if chars[at + 1] == "]" {
+        // OSC: ends at BEL or at ESC \.
+        var i = at + 2
+        while i < n {
+            if chars[i].code_at(0) == 7 {
+                return i + 1
+            }
+            if chars[i] == (27).to_char() and i + 1 < n and chars[i + 1] == "\\" {
+                return i + 2
+            }
+            i = i + 1
+        }
+        return n
+    }
+    return at + 2
+}
+
+/// The text with every escape removed.
+pub fn strip(text: str) -> str {
+    let chars = text.chars()
+    var out = ""
+    var i = 0
+    while i < chars.len() {
+        let end = escape_end(chars, i)
+        if end > i {
+            i = end
+            continue
+        }
+        out = out + chars[i]
+        i = i + 1
+    }
+    return out
+}
+
+/// Columns the text occupies — what a wrapper actually needs to count.
+pub fn visible_len(text: str) -> i64 {
+    return strip(text).len()
+}
+
+/// Whether the text carries any escape at all.
+pub fn is_styled(text: str) -> bool {
+    return visible_len(text) != text.len()
+}
+
+fn reset() -> str {
+    return (27).to_char() + "[0m"
+}
+
+/// The SGR sequences still in effect at the end of the text.
+///
+/// Only SGR is tracked: a cursor move has no "still in effect" to speak of,
+/// and reopening one on the next line would move the cursor twice.
+fn open_style(text: str) -> str {
+    let chars = text.chars()
+    var active: [str] = []
+    var i = 0
+    while i < chars.len() {
+        let end = escape_end(chars, i)
+        if end > i {
+            let seq = text.substr(i, end - i)
+            if seq.ends_with("m") {
+                let body = seq.substr(2, seq.len() - 3)
+                if body == "" or body == "0" {
+                    active = []
+                } else {
+                    active.push(seq)
+                }
+            }
+            i = end
+            continue
+        }
+        i = i + 1
+    }
+    var out = ""
+    for a in active {
+        out = out + a
+    }
+    return out
+}
+
+/// Cut the text to `width` visible columns, keeping every escape it passes.
+pub fn truncate(text: str, width: i64) -> str {
+    let chars = text.chars()
+    var out = ""
+    var shown = 0
+    var i = 0
+    while i < chars.len() {
+        let end = escape_end(chars, i)
+        if end > i {
+            out = out + text.substr(i, end - i)
+            i = end
+            continue
+        }
+        if shown >= width {
+            break
+        }
+        out = out + chars[i]
+        shown = shown + 1
+        i = i + 1
+    }
+    if open_style(out) != "" {
+        out = out + reset()
+    }
+    return out
+}
+
+/// Cut to `width` columns with a marker, which itself takes columns.
+pub fn ellipsis(text: str, width: i64, marker: str) -> str {
+    if visible_len(text) <= width {
+        return text
+    }
+    let room = width - visible_len(marker)
+    if room <= 0 {
+        return marker
+    }
+    return truncate(text, room) + marker
+}
+
+/// Pad to `width` visible columns.
+pub fn pad_end(text: str, width: i64, fill: str) -> str {
+    let short = width - visible_len(text)
+    if short <= 0 {
+        return text
+    }
+    return text + fill.repeat(short)
+}
+
+pub fn pad_start(text: str, width: i64, fill: str) -> str {
+    let short = width - visible_len(text)
+    if short <= 0 {
+        return text
+    }
+    return fill.repeat(short) + text
+}
+
+fn word_pieces(line: str) -> [str] {
+    // Words with their escapes still attached, split on plain spaces only.
+    let chars = line.chars()
+    var out: [str] = []
+    var current = ""
+    var i = 0
+    while i < chars.len() {
+        let end = escape_end(chars, i)
+        if end > i {
+            current = current + line.substr(i, end - i)
+            i = end
+            continue
+        }
+        if chars[i] == " " {
+            out.push(current)
+            current = ""
+            i = i + 1
+            continue
+        }
+        current = current + chars[i]
+        i = i + 1
+    }
+    out.push(current)
+    return out
+}
+
+/// Wrap to `width` visible columns, closing and reopening the active style at
+/// every break so each line stands on its own.
+pub fn wrap(text: str, width: i64) -> [str] {
+    var out: [str] = []
+    if width <= 0 {
+        out.push(text)
+        return out
+    }
+    for line in text.lines() {
+        var current = ""
+        var carried = ""
+        for piece in word_pieces(line) {
+            let piece_width = visible_len(piece)
+            if piece_width == 0 and piece.len() > 0 {
+                // An escape on its own belongs to whatever comes next.
+                current = current + piece
+                continue
+            }
+            let used = visible_len(current)
+            if used == 0 {
+                current = carried + piece
+                continue
+            }
+            if used + 1 + piece_width <= width {
+                current = current + " " + piece
+                continue
+            }
+            let style = open_style(current)
+            if style != "" {
+                out.push(current + reset())
+            } else {
+                out.push(current)
+            }
+            carried = style
+            current = carried + piece
+        }
+        if visible_len(current) > 0 or current != "" {
+            if open_style(current) != "" {
+                out.push(current + reset())
+            } else {
+                out.push(current)
+            }
+        }
+    }
+    return out
+}
+
+/// Wrap, then join back into one string with newlines.
+pub fn fill(text: str, width: i64) -> str {
+    return wrap(text, width).join("\n")
+}

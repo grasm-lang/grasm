@@ -1,0 +1,284 @@
+// How alike two strings are, by four measures that disagree on purpose.
+//
+// "Similar" is not one question. A misspelt surname, a duplicated address, a
+// near-identical document and a fuzzy search over a menu each want a
+// different answer, and using one measure for all four is how a deduplicator
+// ends up merging two real customers.
+//
+//   Jaro-Winkler  weights a shared prefix heavily. Built for names, where
+//                 typos cluster at the end and the start is usually right.
+//   Dice          counts shared adjacent pairs. Order-sensitive without
+//                 being position-sensitive; good for short phrases.
+//   Jaccard       shared tokens over total tokens. Ignores order entirely,
+//                 which is what you want for a bag of words.
+//   Cosine        shared tokens weighted by how often each appears, so a
+//                 word repeated ten times counts more than one repeated once.
+//
+// Every one returns 0.0 to 1.0, where 1.0 is identical.
+
+fn bigger(a: i64, b: i64) -> i64 {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+fn smaller(a: i64, b: i64) -> i64 {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+/// Jaro: matching characters within a window, minus half the transpositions.
+pub fn jaro(a: str, b: str) -> f64 {
+    if a == b {
+        return 1.0
+    }
+    let x = a.chars()
+    let y = b.chars()
+    if x.len() == 0 or y.len() == 0 {
+        return 0.0
+    }
+    // Two characters match if they are equal and no further apart than half
+    // the longer string, minus one. That window is the definition.
+    let window = bigger(bigger(x.len(), y.len()) / 2 - 1, 0)
+    var x_hit: [bool] = []
+    for _i in 0..x.len() {
+        x_hit.push(false)
+    }
+    var y_hit: [bool] = []
+    for _i in 0..y.len() {
+        y_hit.push(false)
+    }
+    var matches = 0
+    for i in 0..x.len() {
+        let low = bigger(0, i - window)
+        let high = smaller(i + window + 1, y.len())
+        var j = low
+        while j < high {
+            if not y_hit[j] and x[i] == y[j] {
+                x_hit[i] = true
+                y_hit[j] = true
+                matches = matches + 1
+                break
+            }
+            j = j + 1
+        }
+    }
+    if matches == 0 {
+        return 0.0
+    }
+    // Transpositions: matched characters that came out in a different order.
+    var transposed = 0
+    var k = 0
+    for i in 0..x.len() {
+        if x_hit[i] {
+            while not y_hit[k] {
+                k = k + 1
+            }
+            if x[i] != y[k] {
+                transposed = transposed + 1
+            }
+            k = k + 1
+        }
+    }
+    let m = matches.as_f64()
+    return (m / x.len().as_f64() + m / y.len().as_f64() +
+        (m - transposed.as_f64() / 2.0) / m) / 3.0
+}
+
+/// Jaro-Winkler: Jaro, with a shared prefix pulling the score up.
+///
+/// The prefix bonus is capped at four characters and applies only above 0.7,
+/// both of which are in Winkler's original and are why the measure suits
+/// names: it does not rescue two strings that were never close.
+pub fn jaro_winkler(a: str, b: str) -> f64 {
+    let base = jaro(a, b)
+    if base <= 0.7 {
+        return base
+    }
+    let x = a.chars()
+    let y = b.chars()
+    var prefix = 0
+    let limit = smaller(4, smaller(x.len(), y.len()))
+    while prefix < limit and x[prefix] == y[prefix] {
+        prefix = prefix + 1
+    }
+    return base + prefix.as_f64() * 0.1 * (1.0 - base)
+}
+
+fn bigrams(text: str) -> [str] {
+    var out: [str] = []
+    let c = text.chars()
+    if c.len() < 2 {
+        return out
+    }
+    for i in 0..(c.len() - 1) {
+        out.push(c[i] + c[i + 1])
+    }
+    return out
+}
+
+/// Sørensen-Dice over adjacent character pairs.
+///
+/// Pairs are consumed as they match, so "aaa" against "aa" is not a perfect
+/// score — a set-based version would say it was.
+pub fn dice(a: str, b: str) -> f64 {
+    if a == b {
+        return 1.0
+    }
+    var left = bigrams(a)
+    let right = bigrams(b)
+    if left.len() == 0 or right.len() == 0 {
+        return 0.0
+    }
+    var used: [bool] = []
+    for _i in 0..left.len() {
+        used.push(false)
+    }
+    var shared = 0
+    for pair in right {
+        for i in 0..left.len() {
+            if not used[i] and left[i] == pair {
+                used[i] = true
+                shared = shared + 1
+                break
+            }
+        }
+    }
+    return 2.0 * shared.as_f64() / (left.len() + right.len()).as_f64()
+}
+
+fn distinct(items: [str]) -> [str] {
+    var out: [str] = []
+    for item in items {
+        if not out.contains(item) {
+            out.push(item)
+        }
+    }
+    return out
+}
+
+/// Shared tokens over total distinct tokens. Order is discarded entirely.
+pub fn jaccard(a: [str], b: [str]) -> f64 {
+    let x = distinct(a)
+    let y = distinct(b)
+    if x.len() == 0 and y.len() == 0 {
+        return 1.0
+    }
+    var shared = 0
+    for item in x {
+        if y.contains(item) {
+            shared = shared + 1
+        }
+    }
+    let union = x.len() + y.len() - shared
+    if union == 0 {
+        return 0.0
+    }
+    return shared.as_f64() / union.as_f64()
+}
+
+pub fn jaccard_words(a: str, b: str) -> f64 {
+    return jaccard(a.to_lower().words(), b.to_lower().words())
+}
+
+fn count_in(items: [str], want: str) -> i64 {
+    var n = 0
+    for item in items {
+        if item == want {
+            n = n + 1
+        }
+    }
+    return n
+}
+
+/// Cosine over token counts: the angle between two bags of words.
+pub fn cosine(a: [str], b: [str]) -> f64 {
+    if a.len() == 0 or b.len() == 0 {
+        return 0.0
+    }
+    let terms = distinct(a + b)
+    var dot = 0.0
+    var left = 0.0
+    var right = 0.0
+    for term in terms {
+        let x = count_in(a, term).as_f64()
+        let y = count_in(b, term).as_f64()
+        dot = dot + x * y
+        left = left + x * x
+        right = right + y * y
+    }
+    if left == 0.0 or right == 0.0 {
+        return 0.0
+    }
+    return dot / (left.sqrt() * right.sqrt())
+}
+
+pub fn cosine_words(a: str, b: str) -> f64 {
+    return cosine(a.to_lower().words(), b.to_lower().words())
+}
+
+/// The longest run of characters the two share.
+pub fn longest_common_substring(a: str, b: str) -> str {
+    let x = a.chars()
+    let y = b.chars()
+    if x.len() == 0 or y.len() == 0 {
+        return ""
+    }
+    // One row at a time: the table is only ever consulted one row back.
+    var previous: [i64] = []
+    for _j in 0..(y.len() + 1) {
+        previous.push(0)
+    }
+    var best = 0
+    var best_end = 0
+    for i in 1..(x.len() + 1) {
+        var row: [i64] = []
+        for _j in 0..(y.len() + 1) {
+            row.push(0)
+        }
+        for j in 1..(y.len() + 1) {
+            if x[i - 1] == y[j - 1] {
+                row[j] = previous[j - 1] + 1
+                if row[j] > best {
+                    best = row[j]
+                    best_end = i
+                }
+            }
+        }
+        previous = row
+    }
+    return a.substr(best_end - best, best)
+}
+
+/// Pick the closest of a list, with a floor below which nothing is returned.
+///
+/// The floor is the point of the function: a fuzzy search that always returns
+/// its least-bad answer is a search that never says "no such thing".
+pub fn best_match(query: str, options: [str], floor: f64) -> Option[str] {
+    var best = floor
+    var found: Option[str] = None
+    for option in options {
+        let score = jaro_winkler(query.to_lower(), option.to_lower())
+        if score > best {
+            best = score
+            found = Some(option)
+        }
+    }
+    return found
+}
+
+/// Everything scoring at or above `floor`, best first.
+pub fn ranked(query: str, options: [str], floor: f64) -> [(str, f64)] {
+    var out: [(str, f64)] = []
+    for option in options {
+        let score = jaro_winkler(query.to_lower(), option.to_lower())
+        if score >= floor {
+            out.push((option, score))
+        }
+    }
+    out.sort_by(|pair| 0.0 - pair.1)
+    return out
+}

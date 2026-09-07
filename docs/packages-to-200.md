@@ -29,9 +29,9 @@ honest and a stub is a promise nobody kept.
 | | |
 |---|---|
 | Started at | 78 |
-| Now | 158 |
+| Now | 164 |
 | Target | 200 |
-| Remaining | 42 |
+| Remaining | 36 |
 
 ## Batches
 
@@ -47,6 +47,7 @@ asserts against it.
   `ringlog`
 - [x] **Numeric II** — `bigint` `fixedpoint` `complexnum` `interpolate`
   `units`
+- [x] **Text III** — `casefold` `tokenizer` `wrapansi` `edit` `similarity`
 
 ### Planned
 

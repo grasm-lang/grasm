@@ -1,0 +1,6 @@
+[package]
+name = "casefold"
+version = "1.0.0"
+
+# Caseless comparison. Opens nothing.
+capabilities = []

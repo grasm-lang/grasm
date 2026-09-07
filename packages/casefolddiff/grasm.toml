@@ -1,0 +1,10 @@
+[package]
+name = "casefolddiff"
+version = "1.0.0"
+
+# The harness `scripts/casefold_diff.sh` drives. Prints; opens nothing else.
+capabilities = ["io"]
+
+[dependencies.casefold]
+path = "../casefold"
+version = "^1.0.0"

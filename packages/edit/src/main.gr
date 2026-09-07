@@ -1,0 +1,241 @@
+// The steps that turn one sequence into another.
+//
+// An edit *distance* is a number, and a number cannot patch anything. What a
+// merge, an undo stack, a diff view or an autocorrect needs is the script:
+// which items were kept, which removed, which inserted, and in what order.
+//
+// The distance falls out of the script for free, so both are here and only
+// one of them is computed.
+
+type EditOp = {
+    /// "keep", "insert", "delete" or "replace".
+    kind: str,
+    /// The item from the source, empty for an insert.
+    from_text: str,
+    /// The item from the target, empty for a delete.
+    to_text: str,
+    /// Index into the source sequence, or where the insert lands.
+    at: i64,
+}
+
+pub let KEEP = "keep"
+pub let INSERT = "insert"
+pub let DELETE = "delete"
+pub let REPLACE = "replace"
+
+fn smaller(a: i64, b: i64) -> i64 {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+/// Levenshtein with replacement allowed, as an edit script.
+///
+/// The table is the standard one; the script comes from walking it backwards,
+/// which is the part usually left out when only the number is wanted.
+pub fn script(from_items: [str], to_items: [str]) -> [EditOp] {
+    let n = from_items.len()
+    let m = to_items.len()
+    var cost: [[i64]] = []
+    for i in 0..(n + 1) {
+        var row: [i64] = []
+        for j in 0..(m + 1) {
+            if i == 0 {
+                row.push(j)
+            } else if j == 0 {
+                row.push(i)
+            } else {
+                row.push(0)
+            }
+        }
+        cost.push(row)
+    }
+    for i in 1..(n + 1) {
+        for j in 1..(m + 1) {
+            if from_items[i - 1] == to_items[j - 1] {
+                cost[i][j] = cost[i - 1][j - 1]
+            } else {
+                let best = smaller(cost[i - 1][j - 1], smaller(cost[i - 1][j], cost[i][j - 1]))
+                cost[i][j] = best + 1
+            }
+        }
+    }
+    var reversed: [EditOp] = []
+    var i = n
+    var j = m
+    while i > 0 or j > 0 {
+        if i > 0 and j > 0 and from_items[i - 1] == to_items[j - 1] {
+            reversed.push(EditOp{
+                kind: KEEP, from_text: from_items[i - 1],
+                to_text: to_items[j - 1], at: i - 1,
+            })
+            i = i - 1
+            j = j - 1
+            continue
+        }
+        if i > 0 and j > 0 and cost[i][j] == cost[i - 1][j - 1] + 1 {
+            reversed.push(EditOp{
+                kind: REPLACE, from_text: from_items[i - 1],
+                to_text: to_items[j - 1], at: i - 1,
+            })
+            i = i - 1
+            j = j - 1
+            continue
+        }
+        if i > 0 and cost[i][j] == cost[i - 1][j] + 1 {
+            reversed.push(EditOp{
+                kind: DELETE, from_text: from_items[i - 1], to_text: "", at: i - 1,
+            })
+            i = i - 1
+            continue
+        }
+        reversed.push(EditOp{
+            kind: INSERT, from_text: "", to_text: to_items[j - 1], at: i,
+        })
+        j = j - 1
+    }
+    return reversed.rev()
+}
+
+pub fn script_of_chars(from_text: str, to_text: str) -> [EditOp] {
+    return script(from_text.chars(), to_text.chars())
+}
+
+pub fn script_of_words(from_text: str, to_text: str) -> [EditOp] {
+    return script(from_text.words(), to_text.words())
+}
+
+pub fn script_of_lines(from_text: str, to_text: str) -> [EditOp] {
+    return script(from_text.lines(), to_text.lines())
+}
+
+/// The edit distance: every op that is not a keep.
+pub fn distance(ops: [EditOp]) -> i64 {
+    var n = 0
+    for op in ops {
+        if op.kind != KEEP {
+            n = n + 1
+        }
+    }
+    return n
+}
+
+/// Run the script forward. The result must equal the target — which is what
+/// makes a script something a patch tool can trust.
+pub fn apply(ops: [EditOp]) -> [str] {
+    var out: [str] = []
+    for op in ops {
+        if op.kind == KEEP or op.kind == REPLACE {
+            out.push(op.to_text)
+        } else if op.kind == INSERT {
+            out.push(op.to_text)
+        }
+    }
+    return out
+}
+
+/// Run the script backwards, which is an undo.
+pub fn revert(ops: [EditOp]) -> [str] {
+    var out: [str] = []
+    for op in ops {
+        if op.kind == KEEP or op.kind == REPLACE or op.kind == DELETE {
+            out.push(op.from_text)
+        }
+    }
+    return out
+}
+
+/// The script with every op reversed, so applying it undoes the original.
+pub fn inverse(ops: [EditOp]) -> [EditOp] {
+    var out: [EditOp] = []
+    for op in ops {
+        var kind = op.kind
+        if op.kind == INSERT {
+            kind = DELETE
+        } else if op.kind == DELETE {
+            kind = INSERT
+        }
+        out.push(EditOp{
+            kind: kind, from_text: op.to_text, to_text: op.from_text, at: op.at,
+        })
+    }
+    return out
+}
+
+/// A unified-diff-style rendering: a marker per op.
+pub fn render(ops: [EditOp]) -> [str] {
+    var out: [str] = []
+    for op in ops {
+        if op.kind == KEEP {
+            out.push("  {op.from_text}")
+        } else if op.kind == DELETE {
+            out.push("- {op.from_text}")
+        } else if op.kind == INSERT {
+            out.push("+ {op.to_text}")
+        } else {
+            out.push("- {op.from_text}")
+            out.push("+ {op.to_text}")
+        }
+    }
+    return out
+}
+
+/// Runs of changed ops with `context` unchanged items around them — the
+/// hunks a diff prints, rather than the whole file.
+pub fn hunks(ops: [EditOp], context: i64) -> [[EditOp]] {
+    var out: [[EditOp]] = []
+    var current: [EditOp] = []
+    var since_change = context + 1
+    var pending: [EditOp] = []
+    for op in ops {
+        if op.kind != KEEP {
+            if current.len() == 0 {
+                for p in pending {
+                    current.push(p)
+                }
+            } else {
+                for p in pending {
+                    current.push(p)
+                }
+            }
+            pending = []
+            current.push(op)
+            since_change = 0
+            continue
+        }
+        if current.len() == 0 {
+            pending.push(op)
+            if pending.len() > context {
+                pending = pending.slice(pending.len() - context, pending.len())
+            }
+            continue
+        }
+        since_change = since_change + 1
+        if since_change <= context {
+            current.push(op)
+            continue
+        }
+        out.push(current)
+        current = []
+        pending = [op]
+    }
+    if current.len() > 0 {
+        out.push(current)
+    }
+    return out
+}
+
+/// How alike the two sequences are, 0.0 to 1.0.
+pub fn ratio(ops: [EditOp]) -> f64 {
+    if ops.len() == 0 {
+        return 1.0
+    }
+    var kept = 0
+    for op in ops {
+        if op.kind == KEEP {
+            kept = kept + 1
+        }
+    }
+    return kept.as_f64() / ops.len().as_f64()
+}

@@ -14,7 +14,7 @@ plan that discovers them 300 packages in.
 | | |
 |---|---|
 | Started | 78 |
-| Now | 158 |
+| Now | 164 |
 | Tier 1 target | 200 |
 | Tier 2 target | 500 |
 | Tier 3 target | 800 |
@@ -134,14 +134,12 @@ could ask "am I in a region" with a load instead of a `RefCell` borrow,
 measured **zero** on a benchmark allocating 800,000 times. The bookkeeping
 around allocation is not where the time goes.
 
-## Tier 1 — to 200 (42 remaining)
+## Tier 1 — to 200 (36 remaining)
 
 All buildable now. No prerequisite blocks any of it.
 
 **Data formats** — `yamlish` `jsonpath` `msgpack` `cbor` `punycode`
 `markdown` `difflines` `template`
-
-**Text** — `casefold` `tokenizer` `wrapansi` `edit` `similarity`
 
 **Crypto** — `sha512` `sha3` `ed25519` `nonce` `bcryptish`
 

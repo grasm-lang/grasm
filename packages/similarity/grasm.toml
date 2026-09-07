@@ -1,0 +1,6 @@
+[package]
+name = "similarity"
+version = "1.0.0"
+
+# How alike two strings are. Opens nothing.
+capabilities = []

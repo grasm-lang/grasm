@@ -1,0 +1,292 @@
+// Cutting text into words and sentences, keeping the things that look like
+// separators and are not.
+//
+// `text.split(" ")` breaks on the wrong things and `text.split(".")` breaks on
+// almost every one: a decimal point, an ellipsis, an abbreviation, a domain
+// name and a file extension are all a full stop that does not end a sentence.
+// This exists because those cases are a list, not a rule, and a list belongs
+// in one place.
+//
+// Every token carries where it came from, because a tokenizer whose output
+// cannot be mapped back to the input is one you cannot highlight, underline
+// or correct with.
+
+type TextToken = {
+    text: str,
+    /// Character offsets into the original, `start` inclusive and `end` not.
+    start: i64,
+    end: i64,
+    kind: str,
+}
+
+pub let WORD = "word"
+pub let NUMBER = "number"
+pub let PUNCT = "punct"
+pub let SPACE = "space"
+pub let URL = "url"
+pub let EMAIL = "email"
+
+fn is_digit(c: str) -> bool {
+    return c >= "0" and c <= "9"
+}
+
+fn is_space(c: str) -> bool {
+    return c == " " or c == "\t" or c == "\n" or c == "\r"
+}
+
+/// A letter, taken as "not one of the things we know is not one" so that
+/// text outside ASCII is words rather than punctuation.
+fn is_letter(c: str) -> bool {
+    if is_space(c) or is_digit(c) {
+        return false
+    }
+    let code = c.code_at(0)
+    if code < 128 {
+        return (c >= "a" and c <= "z") or (c >= "A" and c <= "Z")
+    }
+    // Above ASCII, only the general punctuation block is treated as punctuation.
+    if code >= 8192 and code <= 8303 {
+        return false
+    }
+    return true
+}
+
+fn is_word_char(c: str) -> bool {
+    return is_letter(c) or is_digit(c) or c == "_"
+}
+
+/// Whether the run starting at `at` looks like a URL or an email address.
+///
+/// Checked before the general word rule, because both contain characters that
+/// would otherwise end a token.
+fn special_run(chars: [str], at: i64) -> (i64, str) {
+    let n = chars.len()
+    // A scheme.
+    var probe = ""
+    var i = at
+    while i < n and i < at + 8 {
+        probe = probe + chars[i]
+        i = i + 1
+    }
+    if probe.starts_with("http://") or probe.starts_with("https://") {
+        var end = at
+        while end < n and not is_space(chars[end]) {
+            end = end + 1
+        }
+        // A trailing full stop belongs to the sentence, not the address.
+        while end > at and (chars[end - 1] == "." or chars[end - 1] == ",") {
+            end = end - 1
+        }
+        return (end, URL)
+    }
+    // An email: a word run, an @, another word run with a dot in it.
+    var end = at
+    while end < n and (is_word_char(chars[end]) or chars[end] == "." or
+        chars[end] == "-" or chars[end] == "+") {
+        end = end + 1
+    }
+    if end < n and chars[end] == "@" and end > at {
+        var after = end + 1
+        var dotted = false
+        while after < n and (is_word_char(chars[after]) or chars[after] == "." or
+            chars[after] == "-") {
+            if chars[after] == "." {
+                dotted = true
+            }
+            after = after + 1
+        }
+        while after > end and chars[after - 1] == "." {
+            after = after - 1
+            dotted = true
+        }
+        if dotted and after > end + 1 {
+            return (after, EMAIL)
+        }
+    }
+    return (at, "")
+}
+
+/// Every token, in order, including whitespace.
+///
+/// Whitespace is kept so that the token list can be joined back into exactly
+/// the input — a tokenizer that discards it can only ever approximate.
+pub fn tokens(text: str) -> [TextToken] {
+    let chars = text.chars()
+    let n = chars.len()
+    var out: [TextToken] = []
+    var i = 0
+    while i < n {
+        let c = chars[i]
+        if is_space(c) {
+            var end = i
+            while end < n and is_space(chars[end]) {
+                end = end + 1
+            }
+            out.push(TextToken{ text: text.substr(i, end - i), start: i, end: end, kind: SPACE })
+            i = end
+            continue
+        }
+        let special = special_run(chars, i)
+        if special.0 > i {
+            out.push(TextToken{
+                text: text.substr(i, special.0 - i), start: i, end: special.0,
+                kind: special.1,
+            })
+            i = special.0
+            continue
+        }
+        if is_digit(c) {
+            var end = i
+            // A number may carry an internal point or comma, but not a
+            // trailing one: "3.14." ends a sentence.
+            while end < n and (is_digit(chars[end]) or
+                ((chars[end] == "." or chars[end] == ",") and end + 1 < n and
+                    is_digit(chars[end + 1]))) {
+                end = end + 1
+            }
+            out.push(TextToken{ text: text.substr(i, end - i), start: i, end: end, kind: NUMBER })
+            i = end
+            continue
+        }
+        if is_word_char(c) {
+            var end = i
+            while end < n and is_word_char(chars[end]) {
+                end = end + 1
+            }
+            // An apostrophe inside a word keeps it together: "don't" is one
+            // token and "'quoted'" is not.
+            while end < n and (chars[end] == "'" or chars[end] == (8217).to_char()) and
+            end + 1 < n and is_letter(chars[end + 1]) {
+                end = end + 1
+                while end < n and is_word_char(chars[end]) {
+                    end = end + 1
+                }
+            }
+            out.push(TextToken{ text: text.substr(i, end - i), start: i, end: end, kind: WORD })
+            i = end
+            continue
+        }
+        out.push(TextToken{ text: c, start: i, end: i + 1, kind: PUNCT })
+        i = i + 1
+    }
+    return out
+}
+
+/// The word and number tokens only.
+pub fn words(text: str) -> [str] {
+    var out: [str] = []
+    for t in tokens(text) {
+        if t.kind == WORD or t.kind == NUMBER {
+            out.push(t.text)
+        }
+    }
+    return out
+}
+
+/// Joining every token gives back exactly the input.
+pub fn rejoin(list: [TextToken]) -> str {
+    var out = ""
+    for t in list {
+        out = out + t.text
+    }
+    return out
+}
+
+/// Words that a full stop follows without ending a sentence.
+fn is_abbreviation(word: str) -> bool {
+    let common = ["mr", "mrs", "ms", "dr", "prof", "st", "jr", "sr", "vs",
+        "etc", "eg", "ie", "approx", "dept", "est", "fig", "no", "vol",
+        "inc", "ltd", "co", "corp", "univ", "ave", "blvd"]
+    return common.contains(word.to_lower())
+}
+
+/// Sentences, with the boundaries a naive split on "." would get wrong.
+pub fn sentences(text: str) -> [str] {
+    let chars = text.chars()
+    let n = chars.len()
+    var out: [str] = []
+    var start = 0
+    var i = 0
+    while i < n {
+        let c = chars[i]
+        if c == "." or c == "!" or c == "?" {
+            // Runs of terminators end together: "!?" and "..." are one break.
+            var end = i
+            while end < n and (chars[end] == "." or chars[end] == "!" or
+                chars[end] == "?") {
+                end = end + 1
+            }
+            let dots = end - i
+            var ends_here = true
+            if c == "." and dots == 1 {
+                // The word before it.
+                var back = i
+                while back > start and is_word_char(chars[back - 1]) {
+                    back = back - 1
+                }
+                let before = text.substr(back, i - back)
+                if is_abbreviation(before) {
+                    ends_here = false
+                }
+                // A single capital letter is an initial: "J. R. R. Tolkien".
+                if before.len() == 1 and before.to_upper() == before and
+                is_letter(before) {
+                    ends_here = false
+                }
+                // No space after means it is inside something: a decimal, a
+                // domain, a file name.
+                if end < n and not is_space(chars[end]) {
+                    ends_here = false
+                }
+            }
+            if ends_here {
+                // Take any closing quote or bracket with the sentence.
+                var stop = end
+                while stop < n and (chars[stop] == "\"" or chars[stop] == "'" or
+                    chars[stop] == ")" or chars[stop] == "]" or
+                    chars[stop] == (8221).to_char()) {
+                    stop = stop + 1
+                }
+                let piece = text.substr(start, stop - start).trim()
+                if piece.len() > 0 {
+                    out.push(piece)
+                }
+                start = stop
+                i = stop
+                continue
+            }
+            i = end
+            continue
+        }
+        i = i + 1
+    }
+    let rest = text.substr(start, n - start).trim()
+    if rest.len() > 0 {
+        out.push(rest)
+    }
+    return out
+}
+
+/// Overlapping runs of `n` words, which is what a language model or a
+/// plagiarism check counts.
+pub fn ngrams(text: str, n: i64) -> [str] {
+    var out: [str] = []
+    let w = words(text)
+    if n <= 0 or w.len() < n {
+        return out
+    }
+    for i in 0..(w.len() - n + 1) {
+        out.push(w.slice(i, i + n).join(" "))
+    }
+    return out
+}
+
+pub fn count_of(text: str, kind: str) -> i64 {
+    var n = 0
+    for t in tokens(text) {
+        if t.kind == kind {
+            n = n + 1
+        }
+    }
+    return n
+}

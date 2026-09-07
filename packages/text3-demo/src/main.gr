@@ -1,0 +1,220 @@
+import casefold
+import tokenizer
+import wrapansi
+import edit
+import similarity
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn near(a: f64, b: f64, tolerance: f64) -> bool {
+    let d = a - b
+    let m = if d < 0.0 { 0.0 - d } else { d }
+    return m <= tolerance
+}
+
+fn esc() -> str {
+    return (27).to_char()
+}
+
+fn check_casefold(inout f: i64) / {io} {
+    print("-- casefold: the comparisons to_lower gets wrong")
+    // Every expectation here is what Python's `str.casefold` gives, and the
+    // whole table is generated from the same Unicode data.
+    say(f, "STRASSE and straße are the same word", casefold.equal("STRASSE", "straße"))
+    say(f, "and to_lower does not agree", "STRASSE".to_lower() != "straße".to_lower())
+    say(f, "folding ß makes the string longer", casefold.fold("straße").len() == 7)
+    say(f, "which lowercasing can never do", "straße".to_lower().len() == 6)
+    say(f, "changes_length says so before you look", casefold.changes_length("straße"))
+    say(f, "and says no when nothing changes", not casefold.changes_length("plain"))
+    // Greek: the two sigmas are one letter, and the accented capital
+    // lowercases into a different block than the plain one.
+    say(f, "final and medial sigma fold together", casefold.equal("ΟΔΟΣ", "οδος"))
+    say(f, "a capital with a tonos folds to the accented small letter",
+        casefold.fold("Ί") == "ί")
+    say(f, "which no offset rule reaches", casefold.fold_code(902) == 940)
+    say(f, "the ligature fi folds to two letters", casefold.fold("ﬁle") == "file")
+    say(f, "a titlecase digraph folds to its lowercase", casefold.fold("ǅ") == "ǆ")
+    // The two the hand-written version got wrong, kept as regression checks.
+    say(f, "a lowercase eng is left alone", casefold.fold("ŋ") == "ŋ")
+    say(f, "and the palochka folds to its own lowercase", casefold.fold_code(1216) == 1231)
+    say(f, "Cyrillic folds", casefold.equal("МОСКВА", "москва"))
+    say(f, "caseless search finds a differently-cased needle",
+        casefold.contains("The Straße Is Here", "STRASSE"))
+    say(f, "caseless dedup keeps the first spelling",
+        casefold.unique(["Apple", "APPLE", "apple", "Pear"]) == ["Apple", "Pear"])
+    say(f, "ordering is caseless with a stable tie-break",
+        casefold.compare("apple", "APPLE") == 1 and casefold.compare("APPLE", "apple") == 0 - 1)
+    say(f, "the generated table has the size it was generated with",
+        casefold.run_count() == 200 and casefold.special_count() == 104)
+}
+
+fn check_tokenizer(inout f: i64) / {io} {
+    print("-- tokenizer: the full stops that do not end a sentence")
+    let text = "Dr. Smith paid $3.50 for 10 items. Visit https://example.com/x. " +
+    "Mail bob.j@mail.co.uk! Don't wait... OK?"
+    let list = tokenizer.tokens(text)
+    say(f, "every token joins back to exactly the input", tokenizer.rejoin(list) == text)
+    say(f, "3.50 is one number, not a break", tokenizer.words(text).contains("3.50"))
+    say(f, "a URL survives its slashes and dots", tokenizer.count_of(text, tokenizer.URL) == 1)
+    say(f, "and does not swallow the sentence's full stop",
+        list[19].text == "https://example.com/x" and list[20].text == ".")
+    say(f, "an email address is one token", tokenizer.count_of(text, tokenizer.EMAIL) == 1)
+    say(f, "an apostrophe keeps a contraction whole",
+        tokenizer.words(text).contains("Don't"))
+    let s = tokenizer.sentences(text)
+    say(f, "the text is five sentences", s.len() == 5)
+    say(f, "\"Dr.\" does not end one", s[0] == "Dr. Smith paid $3.50 for 10 items.")
+    say(f, "a URL's trailing dot does", s[1] == "Visit https://example.com/x.")
+    say(f, "an address ends where its sentence does", s[2] == "Mail bob.j@mail.co.uk!")
+    say(f, "an ellipsis is one break, not three", s[3] == "Don't wait...")
+    say(f, "and the last sentence comes out too", s[4] == "OK?")
+    say(f, "an initial does not end a sentence",
+        tokenizer.sentences("J. R. R. Tolkien wrote it. Then he stopped.").len() == 2)
+    say(f, "a decimal does not either",
+        tokenizer.sentences("Pi is 3.14159 or so. Nearly.").len() == 2)
+    say(f, "words drops the punctuation",
+        tokenizer.words("one, two; three.") == ["one", "two", "three"])
+    say(f, "ngrams overlap", tokenizer.ngrams("a b c d", 2).len() == 3)
+    say(f, "and read in order", tokenizer.ngrams("a b c d", 2)[0] == "a b")
+    say(f, "offsets point back into the original",
+        text.substr(list[2].start, list[2].end - list[2].start) == list[2].text)
+}
+
+fn check_wrapansi(inout f: i64) / {io} {
+    print("-- wrapansi: counting the columns, not the characters")
+    let red = esc() + "[31m"
+    let off = esc() + "[0m"
+    let coloured = red + "red words here" + off + " and plain words following on"
+    say(f, "the escapes take no columns", wrapansi.visible_len(coloured) == 43)
+    say(f, "while the string is longer than that", coloured.len() == 52)
+    say(f, "stripping leaves the text",
+        wrapansi.strip(coloured) == "red words here and plain words following on")
+    say(f, "and says whether there was any style", wrapansi.is_styled(coloured))
+    say(f, "plain text is not styled", not wrapansi.is_styled("plain"))
+    let lines = wrapansi.wrap(coloured, 20)
+    var all_fit = true
+    for line in lines {
+        if wrapansi.visible_len(line) > 20 {
+            all_fit = false
+        }
+    }
+    say(f, "no wrapped line is wider than asked for", all_fit)
+    say(f, "and the words survive the wrap",
+        wrapansi.strip(wrapansi.fill(coloured, 20)).replace("\n", " ") ==
+        wrapansi.strip(coloured))
+    // A break inside the colour run: the style has to be closed at the end of
+    // one line and reopened at the start of the next, or the second line
+    // comes out unstyled.
+    let long_run = red + "one two three four five six seven eight" + off
+    let split = wrapansi.wrap(long_run, 15)
+    say(f, "a long styled run wraps to several lines", split.len() >= 3)
+    say(f, "the first line closes the style it opened", split[0].ends_with(off))
+    say(f, "and the second reopens it", split[1].starts_with(red))
+    say(f, "so every line carries its own colour", split[1].ends_with(off))
+    say(f, "truncate counts columns", wrapansi.visible_len(wrapansi.truncate(coloured, 8)) == 8)
+    say(f, "and closes what it cut through",
+        wrapansi.truncate(coloured, 8).ends_with(off))
+    say(f, "the marker's width counts against the budget",
+        wrapansi.visible_len(wrapansi.ellipsis(coloured, 12, "...")) == 12)
+    say(f, "text that already fits is returned untouched",
+        wrapansi.ellipsis("short", 20, "...") == "short")
+    say(f, "padding pads to columns, not characters",
+        wrapansi.visible_len(wrapansi.pad_end(red + "ab" + off, 10, " ")) == 10)
+}
+
+fn check_edit(inout f: i64) / {io} {
+    print("-- edit: the script, not just the distance")
+    let ops = edit.script_of_chars("kitten", "sitting")
+    say(f, "kitten to sitting is three edits", edit.distance(ops) == 3)
+    say(f, "applying the script gives the target", edit.apply(ops).join("") == "sitting")
+    say(f, "reverting it gives the source", edit.revert(ops).join("") == "kitten")
+    let back = edit.inverse(ops)
+    say(f, "the inverse script turns the target back", edit.apply(back).join("") == "kitten")
+    say(f, "and has the same distance", edit.distance(back) == 3)
+    let words = edit.script_of_words("the quick brown fox", "the slow brown dog")
+    say(f, "two words changed", edit.distance(words) == 2)
+    say(f, "and two were kept", edit.ratio(words) == 0.5)
+    say(f, "the rendering marks each change",
+        edit.render(words).contains("- quick") and edit.render(words).contains("+ slow"))
+    say(f, "an unchanged line has no marker", edit.render(words)[0] == "  the")
+    let same = edit.script_of_chars("abc", "abc")
+    say(f, "identical inputs need no edits", edit.distance(same) == 0)
+    say(f, "and score a perfect ratio", edit.ratio(same) == 1.0)
+    let empty = edit.script_of_chars("", "abc")
+    say(f, "everything is an insert against an empty source",
+        edit.distance(empty) == 3 and edit.apply(empty).join("") == "abc")
+    let long_ops = edit.script_of_lines(
+        "a\nb\nc\nd\ne\nf\ng\nh\ni\nj", "a\nb\nc\nd\nX\nf\ng\nh\ni\nj")
+    let cut = edit.hunks(long_ops, 2)
+    say(f, "one change makes one hunk", cut.len() == 1)
+    say(f, "with two unchanged lines on each side", cut[0].len() == 5)
+    say(f, "and the change in the middle", cut[0][2].kind == edit.REPLACE)
+}
+
+fn check_similarity(inout f: i64) / {io} {
+    print("-- similarity: four measures that disagree on purpose")
+    // Winkler's own published values for these three pairs.
+    say(f, "jaro of MARTHA and MARHTA is 0.9444",
+        near(similarity.jaro("MARTHA", "MARHTA"), 0.944444, 0.000001))
+    say(f, "and jaro-winkler is 0.9611",
+        near(similarity.jaro_winkler("MARTHA", "MARHTA"), 0.961111, 0.000001))
+    say(f, "jaro of DIXON and DICKSONX is 0.7667",
+        near(similarity.jaro("DIXON", "DICKSONX"), 0.766667, 0.000001))
+    say(f, "and jaro-winkler is 0.8133",
+        near(similarity.jaro_winkler("DIXON", "DICKSONX"), 0.813333, 0.000001))
+    say(f, "jaro of DWAYNE and DUANE is 0.8222",
+        near(similarity.jaro("DWAYNE", "DUANE"), 0.822222, 0.000001))
+    say(f, "and jaro-winkler is 0.8400",
+        near(similarity.jaro_winkler("DWAYNE", "DUANE"), 0.840000, 0.000001))
+    // Below 0.7 the prefix bonus does not apply, which is what stops the
+    // measure rescuing two strings that were never close.
+    say(f, "a weak match gets no prefix bonus",
+        similarity.jaro_winkler("CRATE", "TRACE") == similarity.jaro("CRATE", "TRACE"))
+    say(f, "identical strings score one", similarity.jaro_winkler("abcd", "abcd") == 1.0)
+    say(f, "an empty string scores zero", similarity.jaro("", "abc") == 0.0)
+    say(f, "dice of night and nacht is 0.25",
+        near(similarity.dice("night", "nacht"), 0.25, 0.000001))
+    say(f, "dice of context and contact is 0.5",
+        near(similarity.dice("context", "contact"), 0.5, 0.000001))
+    say(f, "jaccard ignores order",
+        similarity.jaccard_words("the quick brown fox", "fox brown quick the") == 1.0)
+    say(f, "and counts shared words over all words",
+        near(similarity.jaccard_words("the quick brown fox", "the quick red fox"),
+            0.6, 0.000001))
+    say(f, "cosine weights repeats",
+        near(similarity.cosine_words("the cat sat on the mat",
+            "the cat sat on the hat"), 0.875, 0.000001))
+    say(f, "the longest shared run comes back whole",
+        similarity.longest_common_substring("the rain in spain", "plain rain train") ==
+        " rain ")
+    let menu = ["install", "uninstall", "list", "search", "update"]
+    say(f, "a near miss finds its command",
+        similarity.best_match("instal", menu, 0.8) == Some("install"))
+    say(f, "and a word that means nothing finds nothing",
+        similarity.best_match("zzzzzz", menu, 0.8) == None)
+    say(f, "ranking puts the best first",
+        similarity.ranked("updat", menu, 0.6)[0].0 == "update")
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_casefold(f)
+    check_tokenizer(f)
+    check_wrapansi(f)
+    check_edit(f)
+    check_similarity(f)
+
+    if f == 0 {
+        print("text III: every claim held")
+    } else {
+        print("text III: {f} failed")
+    }
+}

@@ -1,0 +1,6 @@
+[package]
+name = "edit"
+version = "1.0.0"
+
+# Edit scripts between sequences. Opens nothing.
+capabilities = []

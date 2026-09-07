@@ -1,0 +1,6 @@
+[package]
+name = "wrapansi"
+version = "1.0.0"
+
+# Wrapping coloured text. Opens nothing.
+capabilities = []

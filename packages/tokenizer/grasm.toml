@@ -1,0 +1,6 @@
+[package]
+name = "tokenizer"
+version = "1.0.0"
+
+# Splitting text into what it is made of. Opens nothing.
+capabilities = []

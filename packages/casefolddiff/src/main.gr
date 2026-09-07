@@ -1,0 +1,33 @@
+// Every code point that folds, and what it folds to.
+//
+// The gate compares this against Python's `str.casefold`, which implements the
+// same Unicode mapping the table is generated from. Printing the whole set
+// rather than a sample is the point: a fold table is exactly the kind of data
+// where the one wrong entry is in the part nobody sampled.
+
+import casefold
+
+fn codes_of(text: str) -> str {
+    var parts: [str] = []
+    for code in text.codes() {
+        parts.push("{code}")
+    }
+    return parts.join(",")
+}
+
+fn main() / {io} {
+    var out: [str] = []
+    for code in 0..1114112 {
+        // Surrogates are not characters and `to_char` refuses them.
+        if code >= 55296 and code <= 57343 {
+            continue
+        }
+        let one = code.to_char()
+        let folded = casefold.fold(one)
+        if folded != one {
+            let shown = codes_of(folded)
+            out.push("{code}={shown}")
+        }
+    }
+    print(out.join("\n"))
+}

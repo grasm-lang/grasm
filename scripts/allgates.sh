@@ -56,6 +56,7 @@ run_gate cryptodiff    scripts/crypto_diff.sh
 run_gate certdiff      scripts/cert_diff.sh
 run_gate kvcrash       scripts/kvstore_crash.sh
 run_gate zlibdiff      scripts/zlib_diff.sh
+run_gate casefolddiff  scripts/casefold_diff.sh
 run_gate wasmdiff      scripts/wasm_diff.sh
 run_gate asminterop    scripts/asm_interop.sh
 run_gate gitinterop    scripts/git_interop.sh
