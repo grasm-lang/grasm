@@ -1,0 +1,164 @@
+// Money as minor units, never as a float.
+//
+// `0.1 + 0.2` is not `0.3` in binary floating point. For a price that is not a
+// rounding detail; it is a number that does not add up on an invoice, and it
+// compounds over a ledger. So an amount here is an integer count of the
+// smallest unit — pence, cents, satoshi — and the currency carries how many
+// decimal places that is.
+//
+// Not every currency has two. The yen has none and the dinar has three, so
+// code assuming `* 100` is wrong in a hundred and fifty countries.
+
+type Money = {
+    /// Minor units: 1099 with `exponent` 2 is 10.99.
+    amount: i64,
+    code: str,
+    exponent: i64,
+}
+
+type MoneyError =
+    | CurrencyMismatch(a: str, b: str)
+    | UnknownCurrency(code: str)
+
+    /// Decimal places for a currency. The three shapes that actually exist.
+pub fn exponent_of(code: str) -> i64 {
+    let none = ["JPY", "KRW", "VND", "CLP", "ISK", "UGX", "XAF", "XOF"]
+    for c in none {
+        if c == code {
+            return 0
+        }
+    }
+    let three = ["BHD", "IQD", "JOD", "KWD", "LYD", "OMR", "TND"]
+    for c in three {
+        if c == code {
+            return 3
+        }
+    }
+    return 2
+}
+
+pub fn of_minor(amount: i64, code: str) -> Money {
+    return Money{ amount: amount, code: code, exponent: exponent_of(code) }
+}
+
+/// From a major amount and its fraction: `major(10, 99, "USD")` is $10.99.
+pub fn major(whole: i64, fraction: i64, code: str) -> Money {
+    let e = exponent_of(code)
+    var scale = 1
+    for _i in 0..e {
+        scale = scale * 10
+    }
+    let neg = whole < 0
+    let w = if neg { 0 - whole } else { whole }
+    let total = w * scale + fraction
+    return Money{ amount: if neg { 0 - total } else { total }, code: code, exponent: e }
+}
+
+pub fn add(a: Money, b: Money) -> Money ! MoneyError {
+    if a.code != b.code {
+        fail(CurrencyMismatch(a.code, b.code))
+    }
+    return Money{ amount: a.amount + b.amount, code: a.code, exponent: a.exponent }
+}
+
+pub fn sub(a: Money, b: Money) -> Money ! MoneyError {
+    if a.code != b.code {
+        fail(CurrencyMismatch(a.code, b.code))
+    }
+    return Money{ amount: a.amount - b.amount, code: a.code, exponent: a.exponent }
+}
+
+pub fn times(m: Money, n: i64) -> Money {
+    return Money{ amount: m.amount * n, code: m.code, exponent: m.exponent }
+}
+
+/// Split into `n` parts that **sum back exactly**.
+///
+/// £10 into three is not three lots of £3.33 — that loses a penny. The
+/// remainder is spread one unit at a time across the first parts, so the parts
+/// always add back to the original. A split that silently loses money is the
+/// classic ledger bug.
+pub fn split(m: Money, n: i64) -> [Money] {
+    var out: [Money] = []
+    if n < 1 {
+        return out
+    }
+    let base = m.amount / n
+    var left = m.amount - base * n
+    for _i in 0..n {
+        var part = base
+        if left > 0 {
+            part = part + 1
+            left = left - 1
+        } else {
+            if left < 0 {
+                part = part - 1
+                left = left + 1
+            }
+        }
+        out.push(Money{ amount: part, code: m.code, exponent: m.exponent })
+    }
+    return out
+}
+
+/// Allocate by ratio, again summing back exactly.
+pub fn allocate(m: Money, ratios: [i64]) -> [Money] {
+    var total = 0
+    for r in ratios {
+        total = total + r
+    }
+    var out: [Money] = []
+    if total == 0 {
+        return out
+    }
+    var handed = 0
+    for r in ratios {
+        let part = m.amount * r / total
+        handed = handed + part
+        out.push(Money{ amount: part, code: m.code, exponent: m.exponent })
+    }
+    // Whatever rounding held back goes to the first parts, one unit each.
+    var left = m.amount - handed
+    var i = 0
+    while left > 0 and i < out.len() {
+        out[i].amount = out[i].amount + 1
+        left = left - 1
+        i = i + 1
+    }
+    return out
+}
+
+pub fn render(m: Money) -> str {
+    if m.exponent == 0 {
+        return "{m.amount} {m.code}"
+    }
+    var scale = 1
+    for _i in 0..m.exponent {
+        scale = scale * 10
+    }
+    let neg = m.amount < 0
+    let v = if neg { 0 - m.amount } else { m.amount }
+    var frac = "{v % scale}"
+    while frac.len() < m.exponent {
+        frac = "0" + frac
+    }
+    let sign = if neg { "-" } else { "" }
+    return "{sign}{v / scale}.{frac} {m.code}"
+}
+
+pub fn is_zero(m: Money) -> bool {
+    return m.amount == 0
+}
+
+pub fn compare(a: Money, b: Money) -> i64 ! MoneyError {
+    if a.code != b.code {
+        fail(CurrencyMismatch(a.code, b.code))
+    }
+    if a.amount < b.amount {
+        return 0 - 1
+    }
+    if a.amount > b.amount {
+        return 1
+    }
+    return 0
+}

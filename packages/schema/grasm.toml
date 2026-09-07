@@ -1,0 +1,6 @@
+[package]
+name = "schema"
+version = "1.0.0"
+
+# Validating data. Opens nothing.
+capabilities = []

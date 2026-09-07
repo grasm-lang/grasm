@@ -1,0 +1,101 @@
+// Fixed UTC offsets, and the arithmetic that goes with them.
+//
+// This deliberately does **not** implement time zones. A zone is a political
+// object whose rules change by legislation and which needs the IANA database;
+// an offset is a number. Confusing the two is how software ends up an hour
+// wrong twice a year, and pretending a fixed offset is a zone would build that
+// mistake in rather than name it.
+//
+// So: parse and render `+05:30`, convert between offsets, and say plainly that
+// a zone name needs a database this package does not carry.
+
+type TzError = | NotAnOffset(text: str)
+
+/// `+05:30`, `-08:00`, `Z` — as minutes east of UTC.
+pub fn parse(text: str) -> i64 ! TzError {
+    let t = text.trim()
+    if t == "Z" or t == "z" or t == "UTC" {
+        return 0
+    }
+    if t.len() < 3 {
+        fail(NotAnOffset(text))
+    }
+    let sign = t.substr(0, 1)
+    if sign != "+" and sign != "-" {
+        fail(NotAnOffset(text))
+    }
+    var body = t.substr(1, t.len() - 1)
+    var hours = 0
+    var minutes = 0
+    match body.index_of(":") {
+        Some(at) -> {
+            hours = body.substr(0, at).parse_int() ?? 0 - 1
+            minutes = body.substr(at + 1, body.len() - at - 1).parse_int() ?? 0 - 1
+        }
+        None -> {
+            if body.len() == 4 {
+                hours = body.substr(0, 2).parse_int() ?? 0 - 1
+                minutes = body.substr(2, 2).parse_int() ?? 0 - 1
+            } else {
+                hours = body.parse_int() ?? 0 - 1
+                minutes = 0
+            }
+        }
+    }
+    if hours < 0 or hours > 14 or minutes < 0 or minutes > 59 {
+        fail(NotAnOffset(text))
+    }
+    let total = hours * 60 + minutes
+    return if sign == "-" { 0 - total } else { total }
+}
+
+/// Minutes east of UTC as `+05:30`.
+pub fn render(minutes: i64) -> str {
+    if minutes == 0 {
+        return "+00:00"
+    }
+    let neg = minutes < 0
+    let v = if neg { 0 - minutes } else { minutes }
+    var h = "{v / 60}"
+    var m = "{v % 60}"
+    if h.len() < 2 {
+        h = "0" + h
+    }
+    if m.len() < 2 {
+        m = "0" + m
+    }
+    return "{if neg { "-" } else { "+" }}{h}:{m}"
+}
+
+/// A UTC instant seen at this offset.
+pub fn to_local(utc_seconds: i64, offset_minutes: i64) -> i64 {
+    return utc_seconds + offset_minutes * 60
+}
+
+/// A local instant back to UTC.
+pub fn to_utc(local_seconds: i64, offset_minutes: i64) -> i64 {
+    return local_seconds - offset_minutes * 60
+}
+
+/// The same instant moved between two offsets.
+pub fn convert(seconds: i64, from_minutes: i64, to_minutes: i64) -> i64 {
+    return seconds + (to_minutes - from_minutes) * 60
+}
+
+/// Whether the offset is one that exists: whole hours, or the half and
+/// three-quarter hours some places use. `+05:30` is India, `+05:45` is Nepal.
+pub fn is_plausible(minutes: i64) -> bool {
+    if minutes < 0 - 720 or minutes > 840 {
+        return false
+    }
+    let rest = if minutes < 0 { (0 - minutes) % 60 } else { minutes % 60 }
+    return rest == 0 or rest == 30 or rest == 45
+}
+
+/// Named zones are not offsets, and this package says so rather than guessing.
+///
+/// `Europe/London` is +00:00 in January and +01:00 in July, and which one
+/// depends on legislation. A caller needing that needs the IANA database.
+pub fn zone_is_not_an_offset() -> str {
+    return "a named zone needs the IANA database; this package handles fixed offsets only"
+}

@@ -1,0 +1,107 @@
+// Money, offsets and validation.
+import money
+import tzoffset
+import schema
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+
+    print("-- money, in minor units because a float does not add up")
+    let price = money.major(10, 99, "USD")
+    say(f, "renders", money.render(price) == "10.99 USD")
+    say(f, "held as minor units", price.amount == 1099)
+    // Not every currency has two decimal places.
+    say(f, "the yen has none", money.exponent_of("JPY") == 0)
+    say(f, "the dinar has three", money.exponent_of("KWD") == 3)
+    say(f, "and renders accordingly", money.render(money.of_minor(500, "JPY")) == "500 JPY")
+    say(f, "three places", money.render(money.of_minor(1500, "KWD")) == "1.500 KWD")
+    say(f, "adds", money.render(money.add(price, price) ?? price) == "21.98 USD")
+    say(f, "mixing currencies is refused", {
+        match money.add(price, money.of_minor(1, "EUR")) {
+            Err(_e) -> true
+            Ok(_m) -> false
+        }
+    })
+    // The classic ledger bug: a split that loses a penny.
+    let tenner = money.major(10, 0, "GBP")
+    let parts = money.split(tenner, 3)
+    var back = money.of_minor(0, "GBP")
+    for p in parts {
+        back = money.add(back, p) ?? back
+    }
+    say(f, "£10 into three parts", parts.len() == 3)
+    say(f, "sums back EXACTLY, losing nothing", back.amount == tenner.amount)
+    say(f, "with the remainder on the first", parts[0].amount == 334 and parts[2].amount == 333)
+    let shares = money.allocate(money.of_minor(100, "USD"), [1, 1, 1])
+    var total = 0
+    for s in shares {
+        total = total + s.amount
+    }
+    say(f, "allocation by ratio also sums back", total == 100)
+    say(f, "negatives render with the sign",
+        money.render(money.of_minor(0 - 250, "USD")) == "-2.50 USD")
+
+    print("-- fixed offsets, which are not time zones")
+    say(f, "Z is zero", (tzoffset.parse("Z") ?? 0 - 1) == 0)
+    say(f, "+05:30 is India", (tzoffset.parse("+05:30") ?? 0) == 330)
+    say(f, "-08:00 is Pacific", (tzoffset.parse("-08:00") ?? 0) == 0 - 480)
+    say(f, "compact form", (tzoffset.parse("+0545") ?? 0) == 345)
+    say(f, "renders back", tzoffset.render(330) == "+05:30")
+    say(f, "and zero", tzoffset.render(0) == "+00:00")
+    say(f, "negative", tzoffset.render(0 - 480) == "-08:00")
+    say(f, "round trips", (tzoffset.parse(tzoffset.render(345)) ?? 0) == 345)
+    say(f, "nonsense is refused", {
+        match tzoffset.parse("teatime") {
+            Err(_e) -> true
+            Ok(_v) -> false
+        }
+    })
+    say(f, "+99:00 is refused", {
+        match tzoffset.parse("+99:00") {
+            Err(_e) -> true
+            Ok(_v) -> false
+        }
+    })
+    // Nepal is +05:45 — quarter hours exist and a validator must allow them.
+    say(f, "Nepal's quarter hour is plausible", tzoffset.is_plausible(345))
+    say(f, "seventeen minutes is not", not tzoffset.is_plausible(17))
+    say(f, "converting moves the instant",
+        tzoffset.convert(0, 0, 330) == 19800)
+    say(f, "and back", tzoffset.convert(19800, 330, 0) == 0)
+
+    print("-- validation that reports everything at once")
+    var s = schema.new_schema()
+    schema.require(s, "host", [schema.MinLength(1)])
+    schema.require(s, "port", [schema.Between(1, 65535)])
+    schema.optional(s, "mode", [schema.OneOf(["dev", "prod"])])
+    let good = schema.validate(s, ["host", "port", "mode"], ["localhost", "8080", "prod"])
+    say(f, "a good config has no problems", good.len() == 0)
+    say(f, "and reports ok", schema.report(good) == "ok")
+    // Three things wrong: one run must name all three.
+    let bad = schema.validate(s, ["port", "mode"], ["99999", "staging"])
+    say(f, "three problems found in ONE run, not one", bad.len() == 3)
+    say(f, "the missing field is named", schema.report(bad).contains("host is required"))
+    say(f, "the range says what was expected",
+        schema.report(bad).contains("between 1 and 65535"))
+    say(f, "and the choice lists the options", schema.report(bad).contains("dev, prod"))
+    say(f, "a non-number is caught",
+        schema.validate(s, ["host", "port"], ["h", "eighty"]).len() == 1)
+    say(f, "an absent optional is fine",
+        schema.is_valid(s, ["host", "port"], ["h", "80"]))
+
+    print("")
+    if f == 0 {
+        print("all held")
+    } else {
+        print("{f} failed")
+    }
+}

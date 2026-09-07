@@ -1,0 +1,188 @@
+// Validating configuration, and reporting *every* problem at once.
+//
+// The design decision that matters: a validator returning the first error
+// makes a person fix one field, re-run, and find the next. Ten bad fields is
+// ten round trips. This collects all of them, so one run tells you everything
+// wrong.
+//
+// The second: an error names the field and what was expected, not what was
+// wrong with the value. "port must be between 1 and 65535" is actionable;
+// "invalid value" is not.
+
+type Rule =
+    | Required
+    | IsInt
+    | Between(low: i64, high: i64)
+    | MinLength(n: i64)
+    | MaxLength(n: i64)
+    | OneOf(allowed: [str])
+    | Matches(what: str)
+
+type Field = {
+    name: str,
+    rules: [Rule],
+}
+
+type Schema = {
+    field: [Field],
+}
+
+pub fn new_schema() -> Schema {
+    return Schema{ field: [] }
+}
+
+pub fn require(inout s: Schema, name: str, rules: [Rule]) {
+    var all: [Rule] = [Required]
+    for r in rules {
+        all.push(r)
+    }
+    s.field.push(Field{ name: name, rules: all })
+}
+
+pub fn optional(inout s: Schema, name: str, rules: [Rule]) {
+    s.field.push(Field{ name: name, rules: rules })
+}
+
+fn is_integer(v: str) -> bool {
+    if v.len() == 0 {
+        return false
+    }
+    var body = v
+    if body.substr(0, 1) == "-" {
+        body = body.substr(1, body.len() - 1)
+    }
+    if body.len() == 0 {
+        return false
+    }
+    for c in body.chars() {
+        if c < "0" or c > "9" {
+            return false
+        }
+    }
+    return true
+}
+
+fn check_one(name: str, value: Option[str], r: Rule) -> Option[str] {
+    match r {
+        Required -> {
+            match value {
+                None -> return Some("{name} is required")
+                Some(v) -> {
+                    if v.trim() == "" {
+                        return Some("{name} is required")
+                    }
+                    return None
+                }
+            }
+        }
+        IsInt -> {
+            match value {
+                None -> return None
+                Some(v) -> {
+                    if not is_integer(v) {
+                        return Some("{name} must be a whole number, got \"{v}\"")
+                    }
+                    return None
+                }
+            }
+        }
+        Between(low, high) -> {
+            match value {
+                None -> return None
+                Some(v) -> {
+                    if not is_integer(v) {
+                        return Some("{name} must be a whole number, got \"{v}\"")
+                    }
+                    let n = v.parse_int() ?? 0
+                    if n < low or n > high {
+                        return Some("{name} must be between {low} and {high}, got {n}")
+                    }
+                    return None
+                }
+            }
+        }
+        MinLength(n) -> {
+            match value {
+                None -> return None
+                Some(v) -> {
+                    if v.len() < n {
+                        return Some("{name} must be at least {n} characters, got {v.len()}")
+                    }
+                    return None
+                }
+            }
+        }
+        MaxLength(n) -> {
+            match value {
+                None -> return None
+                Some(v) -> {
+                    if v.len() > n {
+                        return Some("{name} must be at most {n} characters, got {v.len()}")
+                    }
+                    return None
+                }
+            }
+        }
+        OneOf(allowed) -> {
+            match value {
+                None -> return None
+                Some(v) -> {
+                    for a in allowed {
+                        if a == v {
+                            return None
+                        }
+                    }
+                    let list = allowed.join(", ")
+                    return Some("{name} must be one of {list}, got \"{v}\"")
+                }
+            }
+        }
+        Matches(what) -> {
+            match value {
+                None -> return None
+                Some(v) -> {
+                    if not v.contains(what) {
+                        return Some("{name} must contain \"{what}\"")
+                    }
+                    return None
+                }
+            }
+        }
+    }
+}
+
+/// Every problem, not the first.
+pub fn validate(s: Schema, keys: [str], values: [str]) -> [str] {
+    var problems: [str] = []
+    for fld in s.field {
+        var found: Option[str] = None
+        for i in 0..keys.len() {
+            if keys[i] == fld.name {
+                found = Some(values[i])
+            }
+        }
+        for r in fld.rules {
+            match check_one(fld.name, found, r) {
+                Some(p) -> problems.push(p)
+                None -> {}
+            }
+        }
+    }
+    return problems
+}
+
+pub fn is_valid(s: Schema, keys: [str], values: [str]) -> bool {
+    return validate(s, keys, values).len() == 0
+}
+
+/// The problems as one message, one per line.
+pub fn report(problems: [str]) -> str {
+    if problems.len() == 0 {
+        return "ok"
+    }
+    var lines: [str] = ["{problems.len()} problem(s):"]
+    for p in problems {
+        lines.push("  - {p}")
+    }
+    return lines.join("\n")
+}

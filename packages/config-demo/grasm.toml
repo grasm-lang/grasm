@@ -1,0 +1,16 @@
+[package]
+name = "config_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.money]
+path = "../money"
+version = "^1.0.0"
+
+[dependencies.tzoffset]
+path = "../tzoffset"
+version = "^1.0.0"
+
+[dependencies.schema]
+path = "../schema"
+version = "^1.0.0"
