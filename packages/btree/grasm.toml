@@ -1,0 +1,6 @@
+[package]
+name = "btree"
+version = "1.0.0"
+
+# Ordering with a wide fanout. Opens nothing.
+capabilities = []

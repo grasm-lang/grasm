@@ -1,0 +1,211 @@
+// A t-digest: quantiles over a stream you cannot keep.
+//
+// An exact 99th percentile needs every value sorted, which for a latency
+// stream means storing every request forever. A histogram avoids that but
+// needs its buckets chosen in advance, and the tail — the part anyone
+// actually asks about — is exactly where fixed buckets are worst.
+//
+// A t-digest keeps a few hundred centroids and lets their permitted size vary
+// with position: a centroid near the median may absorb many values, a
+// centroid near either tail almost none. The result is roughly constant
+// *relative* error at the extremes, which is the property a p99 needs, out of
+// memory that does not grow with the stream.
+
+type TdCentroid = {
+    mean: f64,
+    weight: i64,
+}
+
+type TDigest = {
+    centroid: [TdCentroid],
+    /// Values not yet folded in; merged in bulk, which is far cheaper than
+    /// one merge pass per value.
+    pending: [f64],
+    total: i64,
+    compression: f64,
+    /// The true extremes, tracked exactly. A centroid at either end is a
+    /// *mean* of what it absorbed, so reading the minimum off the first
+    /// centroid understates the tail — the one place a digest must not
+    /// approximate, because "the slowest request" is a question with a real
+    /// answer.
+    low: f64,
+    high: f64,
+}
+
+pub fn new_digest(compression: f64) -> TDigest {
+    let c = if compression < 20.0 { 20.0 } else { compression }
+    return TDigest{
+        centroid: [], pending: [], total: 0, compression: c,
+        low: 0.0, high: 0.0,
+    }
+}
+
+/// The scale function: quantile space stretched so the tails get more room.
+///
+/// This is the whole trick. A centroid is allowed to grow until it spans one
+/// unit of *this* scale rather than one unit of quantile. `asin` is nearly
+/// flat in the middle and near-vertical at both ends, so one unit covers a
+/// wide band of quantiles around the median and a very narrow one at either
+/// extreme — which is why a p99 out of a t-digest is accurate and a p50 is
+/// merely close.
+///
+/// Its total range is `compression / 2`, and no centroid may span more than
+/// one unit of it, so the centroid count is bounded by the compression
+/// setting no matter how long the stream runs.
+fn scale(d: TDigest, q: f64) -> f64 {
+    var x = 2.0 * q - 1.0
+    if x < 0.0 - 1.0 {
+        x = 0.0 - 1.0
+    }
+    if x > 1.0 {
+        x = 1.0
+    }
+    return d.compression / (2.0 * pi()) * x.asin()
+}
+
+pub fn flush(inout d: TDigest) {
+    if d.pending.len() == 0 {
+        return
+    }
+    var all: [(f64, i64)] = []
+    for c in d.centroid {
+        all.push((c.mean, c.weight))
+    }
+    for v in d.pending {
+        all.push((v, 1))
+    }
+    d.pending = []
+    all.sort()
+    let n = d.total.as_f64()
+    var merged: [TdCentroid] = []
+    var mean = all[0].0
+    var weight = all[0].1
+    // Weight already emitted, and where that lands on the scale.
+    var done = 0
+    var left = scale(d, 0.0)
+    var i = 1
+    while i < all.len() {
+        let w = weight + all[i].1
+        let right = (done.as_f64() + w.as_f64()) / n
+        if scale(d, right) - left <= 1.0 {
+            // Weighted mean, kept incrementally so no sum overflows.
+            mean = mean + (all[i].0 - mean) * all[i].1.as_f64() / w.as_f64()
+            weight = w
+        } else {
+            merged.push(TdCentroid{ mean: mean, weight: weight })
+            done = done + weight
+            left = scale(d, done.as_f64() / n)
+            mean = all[i].0
+            weight = all[i].1
+        }
+        i = i + 1
+    }
+    merged.push(TdCentroid{ mean: mean, weight: weight })
+    d.centroid = merged
+}
+
+pub fn add(inout d: TDigest, value: f64) {
+    if d.total == 0 or value < d.low {
+        d.low = value
+    }
+    if d.total == 0 or value > d.high {
+        d.high = value
+    }
+    d.pending.push(value)
+    d.total = d.total + 1
+    if d.pending.len() >= 128 {
+        flush(d)
+    }
+}
+
+pub fn add_all(inout d: TDigest, values: [f64]) {
+    for v in values {
+        add(d, v)
+    }
+}
+
+/// The value at quantile `q`, 0.0 to 1.0.
+pub fn quantile(inout d: TDigest, q: f64) -> f64 {
+    flush(d)
+    if d.centroid.len() == 0 {
+        return 0.0
+    }
+    if d.centroid.len() == 1 {
+        return d.centroid[0].mean
+    }
+    if q <= 0.0 {
+        return d.low
+    }
+    if q >= 1.0 {
+        return d.high
+    }
+    let want = q * d.total.as_f64()
+    var seen = 0.0
+    var i = 0
+    while i < d.centroid.len() {
+        let w = d.centroid[i].weight.as_f64()
+        // The centroid's own mean sits at the middle of its weight.
+        let centre = seen + w / 2.0
+        if want <= centre {
+            if i == 0 {
+                return d.centroid[0].mean
+            }
+            // Between two centroid centres, read off the straight line
+            // joining their means. Inside the first or last centroid there is
+            // no line to read, so its mean stands.
+            let before = seen - d.centroid[i - 1].weight.as_f64() / 2.0
+            let span = centre - before
+            if span <= 0.0 {
+                return d.centroid[i].mean
+            }
+            let along = (want - before) / span
+            return d.centroid[i - 1].mean +
+            (d.centroid[i].mean - d.centroid[i - 1].mean) * along
+        }
+        seen = seen + w
+        i = i + 1
+    }
+    return d.centroid[d.centroid.len() - 1].mean
+}
+
+pub fn median(inout d: TDigest) -> f64 {
+    return quantile(d, 0.5)
+}
+
+/// The share of the stream at or below `value`, 0.0 to 1.0.
+pub fn cdf(inout d: TDigest, value: f64) -> f64 {
+    flush(d)
+    if d.total == 0 {
+        return 0.0
+    }
+    var below = 0.0
+    for c in d.centroid {
+        if c.mean < value {
+            below = below + c.weight.as_f64()
+        } else if c.mean == value {
+            below = below + c.weight.as_f64() / 2.0
+        }
+    }
+    return below / d.total.as_f64()
+}
+
+pub fn count(d: TDigest) -> i64 {
+    return d.total
+}
+
+/// How many centroids the digest is holding — the number that stays small
+/// while `count` grows without bound.
+pub fn centroid_count(inout d: TDigest) -> i64 {
+    flush(d)
+    return d.centroid.len()
+}
+
+/// The exact minimum seen.
+pub fn smallest(d: TDigest) -> f64 {
+    return d.low
+}
+
+/// The exact maximum seen.
+pub fn largest(d: TDigest) -> f64 {
+    return d.high
+}

@@ -1,0 +1,208 @@
+// A compressed bitmap: dense where the data is dense, sparse where it is not.
+//
+// A plain bitset over a 32-bit key space costs 512 MB whether it holds two
+// members or two billion. A sorted list costs eight bytes a member, which is
+// worse once the set is dense. Roaring picks per chunk: the key space is cut
+// into 65,536-value containers, and each container is stored as **an array of
+// its members** when it holds few, or **a bitmap** when it holds many.
+//
+// The crossover is 4,096 — the point where 4,096 sixteen-bit entries and a
+// 65,536-bit bitmap cost the same 8 KB. Below it the array wins, above it the
+// bitmap does, and the container converts itself when it crosses.
+
+type Container = {
+    /// High 16 bits of every value in this container.
+    key: i64,
+    /// Sorted, when this is an array container.
+    member: [i64],
+    /// 1041 words of 63 usable bits, when this is a bitmap container.
+    word: [i64],
+    dense: bool,
+    count: i64,
+}
+
+type Roaring = {
+    container: [Container],
+}
+
+pub fn new_bitmap() -> Roaring {
+    return Roaring{ container: [] }
+}
+
+fn crossover() -> i64 {
+    return 4096
+}
+
+/// 65,536 values at 63 bits to a word. The 64th bit of an `i64` is its sign,
+/// and a debug build checks overflow, so the word is one bit short and the
+/// container is one word long.
+fn words() -> i64 {
+    return 1041
+}
+
+fn find_container(r: Roaring, key: i64) -> i64 {
+    for i in 0..r.container.len() {
+        if r.container[i].key == key {
+            return i
+        }
+    }
+    return 0 - 1
+}
+
+fn to_dense(inout c: Container) {
+    var w: [i64] = []
+    for _i in 0..words() {
+        w.push(0)
+    }
+    for m in c.member {
+        // 63 bits to the word, not 64: the top bit of an i64 is its sign and
+        // a debug build checks overflow.
+        w[m / 63] = w[m / 63].bit_or(2 ^ (m % 63))
+    }
+    c.word = w
+    c.member = []
+    c.dense = true
+}
+
+pub fn add(inout r: Roaring, value: i64) {
+    let key = value / 65536
+    let low = value % 65536
+    var at = find_container(r, key)
+    if at < 0 {
+        r.container.push(Container{
+            key: key, member: [], word: [], dense: false, count: 0,
+        })
+        at = r.container.len() - 1
+    }
+    if r.container[at].dense {
+        let w = low / 63
+        let bit = 2 ^ (low % 63)
+        if r.container[at].word[w].bit_and(bit) == 0 {
+            r.container[at].word[w] = r.container[at].word[w].bit_or(bit)
+            r.container[at].count = r.container[at].count + 1
+        }
+        return
+    }
+    // Sorted insert, skipping a duplicate.
+    var i = 0
+    let n = r.container[at].member.len()
+    while i < n and r.container[at].member[i] < low {
+        i = i + 1
+    }
+    if i < n and r.container[at].member[i] == low {
+        return
+    }
+    var next: [i64] = []
+    for k in 0..i {
+        next.push(r.container[at].member[k])
+    }
+    next.push(low)
+    for k in i..n {
+        next.push(r.container[at].member[k])
+    }
+    r.container[at].member = next
+    r.container[at].count = r.container[at].count + 1
+    if r.container[at].count > crossover() {
+        to_dense(r.container[at])
+    }
+}
+
+pub fn holds(r: Roaring, value: i64) -> bool {
+    let at = find_container(r, value / 65536)
+    if at < 0 {
+        return false
+    }
+    let low = value % 65536
+    if r.container[at].dense {
+        return r.container[at].word[low / 63].bit_and(2 ^ (low % 63)) != 0
+    }
+    // Binary search: the array is sorted, which is what makes it cheap.
+    var lo = 0
+    var hi = r.container[at].member.len() - 1
+    while lo <= hi {
+        let mid = (lo + hi) / 2
+        let v = r.container[at].member[mid]
+        if v == low {
+            return true
+        }
+        if v < low {
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    return false
+}
+
+pub fn count(r: Roaring) -> i64 {
+    var total = 0
+    for c in r.container {
+        total = total + c.count
+    }
+    return total
+}
+
+pub fn container_count(r: Roaring) -> i64 {
+    return r.container.len()
+}
+
+/// Whether a container converted to a bitmap — visible so the crossover can
+/// be asserted rather than assumed.
+pub fn is_dense(r: Roaring, key: i64) -> bool {
+    let at = find_container(r, key)
+    if at < 0 {
+        return false
+    }
+    return r.container[at].dense
+}
+
+/// Every member, ascending. Containers are visited in key order rather than
+/// in the order they happened to be created, which is what makes that true.
+pub fn members(r: Roaring) -> [i64] {
+    var out: [i64] = []
+    var order: [(i64, i64)] = []
+    for i in 0..r.container.len() {
+        order.push((r.container[i].key, i))
+    }
+    order.sort()
+    for slot in order {
+        let c = r.container[slot.1]
+        if c.dense {
+            for low in 0..65536 {
+                if c.word[low / 63].bit_and(2 ^ (low % 63)) != 0 {
+                    out.push(c.key * 65536 + low)
+                }
+            }
+        } else {
+            for m in c.member {
+                out.push(c.key * 65536 + m)
+            }
+        }
+    }
+    return out
+}
+
+/// Members present in both. Containers absent from either are skipped whole,
+/// which is where the compression pays for itself.
+pub fn intersect(a: Roaring, b: Roaring) -> Roaring {
+    var out = new_bitmap()
+    for c in a.container {
+        if find_container(b, c.key) >= 0 {
+            let base = c.key * 65536
+            if c.dense {
+                for low in 0..65536 {
+                    if c.word[low / 63].bit_and(2 ^ (low % 63)) != 0 and holds(b, base + low) {
+                        add(out, base + low)
+                    }
+                }
+            } else {
+                for m in c.member {
+                    if holds(b, base + m) {
+                        add(out, base + m)
+                    }
+                }
+            }
+        }
+    }
+    return out
+}

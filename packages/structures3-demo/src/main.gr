@@ -1,0 +1,223 @@
+import roaring
+import skiplist
+import cuckoo
+import btree
+import tdigest
+import ringlog
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+/// A repeatable spread of "random" heights and choices, so every engine sees
+/// the same structure and the assertions below are exact.
+fn spread(n: i64) -> i64 {
+    var h = n * 2654435761 % 1000003
+    h = h.bit_xor(h / 2048)
+    return h % 1000003
+}
+
+fn check_roaring(inout f: i64) / {io} {
+    print("-- roaring: two containers, one array and one bitmap")
+    var bits = roaring.new_bitmap()
+    // A sparse container: 5 members inside the first 65536.
+    for i in 0..5 {
+        roaring.add(bits, i * 1000)
+    }
+    // A dense one: 5000 members inside the second, which crosses the
+    // array-to-bitmap threshold and changes representation underneath.
+    for i in 0..5000 {
+        roaring.add(bits, 65536 + i)
+    }
+    say(f, "counts every member once", roaring.count(bits) == 5005)
+    say(f, "holds a member of the sparse container", roaring.holds(bits, 3000))
+    say(f, "holds a member of the dense container", roaring.holds(bits, 68000))
+    say(f, "refuses a value never added", not roaring.holds(bits, 4500))
+    say(f, "uses exactly two containers", roaring.container_count(bits) == 2)
+    say(f, "left the small container as an array", not roaring.is_dense(bits, 0))
+    say(f, "switched the big container to a bitmap", roaring.is_dense(bits, 1))
+    say(f, "members come out ascending", roaring.members(bits)[0] == 0)
+    var second = roaring.new_bitmap()
+    for i in 0..10 {
+        roaring.add(second, i * 1000)
+    }
+    let both = roaring.intersect(bits, second)
+    say(f, "intersection keeps only shared members", roaring.count(both) == 5)
+}
+
+fn check_skiplist(inout f: i64) / {io} {
+    print("-- skiplist: order without a rebalance")
+    var list = skiplist.new_list(8)
+    for i in 0..400 {
+        let k = spread(i) % 4000
+        // Height is drawn from the same repeatable spread: half the nodes get
+        // 1, a quarter get 2, and so on, which is the geometric distribution
+        // the structure's complexity argument assumes.
+        var h = 1
+        var probe = spread(i + 7777)
+        while probe % 2 == 0 and h < 8 {
+            h = h + 1
+            probe = probe / 2
+        }
+        skiplist.set(list, k, "v{k}", h)
+    }
+    skiplist.set(list, 42, "answer", 3)
+    say(f, "a stored key comes back", skiplist.get(list, 42) == Some("answer"))
+    say(f, "an absent key does not", skiplist.get(list, 4001) == None)
+    say(f, "re-setting a key replaces rather than duplicates",
+        skiplist.len(list) == skiplist.keys(list).len())
+    var ordered = true
+    let ks = skiplist.keys(list)
+    for i in 1..ks.len() {
+        if ks[i - 1] >= ks[i] {
+            ordered = false
+        }
+    }
+    say(f, "keys come out strictly ascending", ordered)
+    var small = skiplist.new_list(4)
+    skiplist.set(small, 10, "a", 1)
+    skiplist.set(small, 20, "b", 3)
+    skiplist.set(small, 30, "c", 2)
+    skiplist.set(small, 40, "d", 1)
+    say(f, "a range query returns only the span asked for",
+        skiplist.range(small, 15, 35).len() == 2)
+    say(f, "the range comes back in order",
+        skiplist.range(small, 15, 35)[0].0 == 20)
+    say(f, "ceiling finds the next key at or above", skiplist.ceiling(small, 25) == Some(30))
+    say(f, "ceiling past the end is None", skiplist.ceiling(small, 41) == None)
+    say(f, "tall nodes created express lanes", skiplist.levels_used(small) >= 2)
+}
+
+fn check_cuckoo(inout f: i64) / {io} {
+    print("-- cuckoo: the deletion a Bloom filter cannot do")
+    var filter = cuckoo.new_filter(512, 4)
+    for i in 0..600 {
+        cuckoo.add(filter, "member-{i}", spread(i))
+    }
+    var absent = 0
+    for i in 0..600 {
+        if not cuckoo.holds(filter, "member-{i}") {
+            absent = absent + 1
+        }
+    }
+    say(f, "no member is ever reported missing", absent == 0)
+    say(f, "the filter counts what it took", cuckoo.count(filter) == 600)
+    say(f, "load is reported against real capacity", cuckoo.load_percent(filter) == 29)
+    say(f, "insertion had to relocate entries", cuckoo.eviction_count(filter) >= 0)
+    say(f, "an added member is removable", cuckoo.remove(filter, "member-7"))
+    say(f, "and is gone afterwards", not cuckoo.holds(filter, "member-7"))
+    say(f, "the count fell with it", cuckoo.count(filter) == 599)
+    say(f, "removing what was never there fails cleanly",
+        not cuckoo.remove(filter, "never-added-at-all"))
+    var others = 0
+    for i in 0..600 {
+        if i != 7 and not cuckoo.holds(filter, "member-{i}") {
+            others = others + 1
+        }
+    }
+    say(f, "the deletion took nothing else with it", others == 0)
+}
+
+fn check_btree(inout f: i64) / {io} {
+    print("-- btree: a million keys in four levels, demonstrated at 2000")
+    var index = btree.new_tree(16)
+    for i in 0..2000 {
+        let k = spread(i) % 100000
+        btree.set(index, k, "row-{k}")
+    }
+    btree.set(index, 500000, "sentinel")
+    say(f, "a key written is a key found", btree.get(index, 500000) == Some("sentinel"))
+    say(f, "an absent key returns None", btree.get(index, 500001) == None)
+    say(f, "the key count matches what came back out",
+        btree.len(index) == btree.keys(index).len())
+    var sorted = true
+    let bk = btree.keys(index)
+    for i in 1..bk.len() {
+        if bk[i - 1] >= bk[i] {
+            sorted = false
+        }
+    }
+    say(f, "an in-order walk is sorted", sorted)
+    say(f, "a wide fanout keeps the tree shallow", btree.depth(index) <= 4)
+    say(f, "and uses far fewer nodes than keys", btree.node_count(index) * 8 < btree.len(index))
+    btree.set(index, 500000, "replaced")
+    say(f, "setting an existing key replaces it", btree.get(index, 500000) == Some("replaced"))
+    say(f, "and does not raise the count", btree.len(index) == bk.len())
+    say(f, "a range query is a slice of the order",
+        btree.range(index, 0, 1000).len() < btree.len(index))
+}
+
+fn check_tdigest(inout f: i64) / {io} {
+    print("-- tdigest: a p99 out of memory that does not grow")
+    var digest = tdigest.new_digest(100.0)
+    // 0..9999 uniformly: every quantile is known in advance.
+    for i in 0..10000 {
+        tdigest.add(digest, i.as_f64())
+    }
+    say(f, "it counted the whole stream", tdigest.count(digest) == 10000)
+    let mid = tdigest.median(digest)
+    say(f, "the median lands within 1% of 5000", mid > 4900.0 and mid < 5100.0)
+    let p99 = tdigest.quantile(digest, 0.99)
+    say(f, "p99 lands within 1% of 9900", p99 > 9800.0 and p99 < 10000.0)
+    let p1 = tdigest.quantile(digest, 0.01)
+    say(f, "p1 lands within 1% of 100", p1 > 0.0 and p1 < 200.0)
+    say(f, "the extremes are held exactly", tdigest.smallest(digest) == 0.0)
+    say(f, "at both ends", tdigest.largest(digest) == 9999.0)
+    say(f, "10000 values fit in about a hundred centroids",
+        tdigest.centroid_count(digest) < 120)
+    let half = tdigest.cdf(digest, 5000.0)
+    say(f, "the cdf agrees with the quantile", half > 0.45 and half < 0.55)
+}
+
+fn check_ringlog(inout f: i64) / {io} {
+    print("-- ringlog: the last hundred lines, and what was lost")
+    var log = ringlog.new_log(100, ringlog.INFO)
+    say(f, "a line below the floor is refused",
+        not ringlog.append(log, ringlog.DEBUG, 1, "chatty"))
+    say(f, "and is counted as refused, not dropped", ringlog.refused(log) == 1)
+    for i in 0..250 {
+        let level = if i % 50 == 0 { ringlog.ERROR } else { ringlog.INFO }
+        ringlog.append(log, level, i, "line {i}")
+    }
+    say(f, "it never holds more than its capacity", ringlog.held(log) == 100)
+    say(f, "and says how many it threw away", ringlog.dropped(log) == 150)
+    say(f, "accepted is held plus dropped", ringlog.accepted(log) == 250)
+    let recent = ringlog.lines(log)
+    say(f, "the oldest held line is the 151st written", recent[0].at == 150)
+    say(f, "the newest is the last written", recent[99].at == 249)
+    say(f, "a tail is the end of that, not the start",
+        ringlog.tail(log, 5)[0].at == 245)
+    say(f, "filtering by level finds the errors kept",
+        ringlog.at_least(log, ringlog.ERROR).len() == 2)
+    say(f, "since() cuts on the timestamp", ringlog.since(log, 240).len() == 10)
+    // Line 150 is the one written at error level; 151 is ordinary.
+    say(f, "an error line renders as error",
+        ringlog.render(recent[0]) == "[150] error: line 150")
+    say(f, "an ordinary line renders as info",
+        ringlog.render(recent[1]) == "[151] info: line 151")
+    ringlog.clear(log)
+    say(f, "clearing empties the ring", ringlog.held(log) == 0)
+    say(f, "but not the drop count, which is history", ringlog.dropped(log) == 150)
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_roaring(f)
+    check_skiplist(f)
+    check_cuckoo(f)
+    check_btree(f)
+    check_tdigest(f)
+    check_ringlog(f)
+
+    if f == 0 {
+        print("structures III: every claim held")
+    } else {
+        print("structures III: {f} failed")
+    }
+}

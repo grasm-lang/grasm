@@ -1,0 +1,6 @@
+[package]
+name = "roaring"
+version = "1.0.0"
+
+# Arithmetic over bits. Opens nothing.
+capabilities = []

@@ -1,0 +1,158 @@
+// A skip list: sorted order with O(log n) search and no rebalancing.
+//
+// A balanced tree gets the same complexity by rotating on insert, which is
+// fiddly to write and easy to get subtly wrong. A skip list gets it by giving
+// each node a random height and letting the tall ones act as express lanes.
+// There is no rebalance step at all — the structure is correct by
+// construction and only its *speed* depends on the heights.
+//
+// Randomness is supplied by the caller so this package opens nothing and a
+// test is exact. That also makes the worst case reachable on purpose: build
+// one with every height 1 and it degrades to a linked list, which is a
+// property worth being able to demonstrate rather than hope against.
+
+type SkipNode = {
+    key: i64,
+    value: str,
+    /// Index of the next node at each level; -1 for none.
+    next: [i64],
+}
+
+type SkipList = {
+    node: [SkipNode],
+    /// Entry points per level, tallest last.
+    head: [i64],
+    count: i64,
+    max_level: i64,
+}
+
+pub fn new_list(max_level: i64) -> SkipList {
+    var h: [i64] = []
+    let levels = if max_level < 1 { 1 } else { max_level }
+    for _i in 0..levels {
+        h.push(0 - 1)
+    }
+    return SkipList{ node: [], head: h, count: 0, max_level: levels }
+}
+
+/// Insert or replace. `height` is 1..max_level and comes from the caller.
+pub fn set(inout s: SkipList, key: i64, value: str, height: i64) {
+    var h = height
+    if h < 1 {
+        h = 1
+    }
+    if h > s.max_level {
+        h = s.max_level
+    }
+    // Where the new node belongs at each level.
+    var update: [i64] = []
+    for _i in 0..s.max_level {
+        update.push(0 - 1)
+    }
+    var at = 0 - 1
+    var level = s.max_level - 1
+    while level >= 0 {
+        var current = if at < 0 { s.head[level] } else { s.node[at].next[level] }
+        while current >= 0 and s.node[current].key < key {
+            at = current
+            current = s.node[current].next[level]
+        }
+        if current >= 0 and s.node[current].key == key {
+            s.node[current].value = value
+            return
+        }
+        update[level] = at
+        level = level - 1
+    }
+    var next: [i64] = []
+    for _i in 0..s.max_level {
+        next.push(0 - 1)
+    }
+    s.node.push(SkipNode{ key: key, value: value, next: next })
+    let fresh = s.node.len() - 1
+    for lvl in 0..h {
+        let prev = update[lvl]
+        if prev < 0 {
+            s.node[fresh].next[lvl] = s.head[lvl]
+            s.head[lvl] = fresh
+        } else {
+            s.node[fresh].next[lvl] = s.node[prev].next[lvl]
+            s.node[prev].next[lvl] = fresh
+        }
+    }
+    s.count = s.count + 1
+}
+
+pub fn get(s: SkipList, key: i64) -> Option[str] {
+    var at = 0 - 1
+    var level = s.max_level - 1
+    while level >= 0 {
+        var current = if at < 0 { s.head[level] } else { s.node[at].next[level] }
+        while current >= 0 and s.node[current].key < key {
+            at = current
+            current = s.node[current].next[level]
+        }
+        if current >= 0 and s.node[current].key == key {
+            return Some(s.node[current].value)
+        }
+        level = level - 1
+    }
+    return None
+}
+
+pub fn holds(s: SkipList, key: i64) -> bool {
+    return get(s, key) != None
+}
+
+pub fn len(s: SkipList) -> i64 {
+    return s.count
+}
+
+/// Every key in order — the property a hash map cannot give.
+pub fn keys(s: SkipList) -> [i64] {
+    var out: [i64] = []
+    var at = s.head[0]
+    while at >= 0 {
+        out.push(s.node[at].key)
+        at = s.node[at].next[0]
+    }
+    return out
+}
+
+/// Keys from `low` to `high` inclusive — the range query a skip list exists
+/// for, and the reason to pay for order.
+pub fn range(s: SkipList, low: i64, high: i64) -> [(i64, str)] {
+    var out: [(i64, str)] = []
+    var at = s.head[0]
+    while at >= 0 and s.node[at].key < low {
+        at = s.node[at].next[0]
+    }
+    while at >= 0 and s.node[at].key <= high {
+        out.push((s.node[at].key, s.node[at].value))
+        at = s.node[at].next[0]
+    }
+    return out
+}
+
+/// The smallest key at or above `key`.
+pub fn ceiling(s: SkipList, key: i64) -> Option[i64] {
+    var at = s.head[0]
+    while at >= 0 {
+        if s.node[at].key >= key {
+            return Some(s.node[at].key)
+        }
+        at = s.node[at].next[0]
+    }
+    return None
+}
+
+/// How many levels actually carry a node — the express lanes in use.
+pub fn levels_used(s: SkipList) -> i64 {
+    var n = 0
+    for h in s.head {
+        if h >= 0 {
+            n = n + 1
+        }
+    }
+    return n
+}

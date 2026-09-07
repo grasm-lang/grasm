@@ -1,0 +1,6 @@
+[package]
+name = "skiplist"
+version = "1.0.0"
+
+# Ordering. Opens nothing.
+capabilities = []

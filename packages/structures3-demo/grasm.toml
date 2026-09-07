@@ -1,0 +1,28 @@
+[package]
+name = "structures3_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.roaring]
+path = "../roaring"
+version = "^1.0.0"
+
+[dependencies.skiplist]
+path = "../skiplist"
+version = "^1.0.0"
+
+[dependencies.cuckoo]
+path = "../cuckoo"
+version = "^1.0.0"
+
+[dependencies.btree]
+path = "../btree"
+version = "^1.0.0"
+
+[dependencies.tdigest]
+path = "../tdigest"
+version = "^1.0.0"
+
+[dependencies.ringlog]
+path = "../ringlog"
+version = "^1.0.0"

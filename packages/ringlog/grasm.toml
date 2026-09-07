@@ -1,0 +1,6 @@
+[package]
+name = "ringlog"
+version = "1.0.0"
+
+# In-memory ring of log lines. Opens nothing.
+capabilities = []

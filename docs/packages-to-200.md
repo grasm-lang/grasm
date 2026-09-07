@@ -29,9 +29,9 @@ honest and a stub is a promise nobody kept.
 | | |
 |---|---|
 | Started at | 78 |
-| Now | 91 |
+| Now | 153 |
 | Target | 200 |
-| Remaining | 109 |
+| Remaining | 47 |
 
 ## Batches
 
@@ -43,10 +43,10 @@ asserts against it.
 - [x] **Structures I** — `heap` `deque` `bitset` `unionfind` `semver`
 - [x] **Text I** — `glob` `textwrap` `levenshtein` `base32` `ipaddr`
 - [x] **Structures II** — `trie` `graphs` `lru`
+- [x] **Structures III** — `roaring` `skiplist` `cuckoo` `btree` `tdigest`
+  `ringlog`
 
 ### Planned
-
-**Structures III** — `btree` `skiplist` `intervals` `matrix` `ringlog`
 
 **Encoding** — `base58` `base85` `cbor` `msgpack` `bencode` `hexdump`
 `punycode` `utf16`

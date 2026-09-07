@@ -1,0 +1,6 @@
+[package]
+name = "cuckoo"
+version = "1.0.0"
+
+# Arithmetic over hashes. Opens nothing.
+capabilities = []

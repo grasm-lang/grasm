@@ -1,0 +1,148 @@
+// A ring log: the last N lines, and a count of what was thrown away.
+//
+// The reason to keep a bounded log in memory is a crash report: when
+// something fails you want the hundred lines before it, and you were never
+// going to write every line to disk at the rate they arrive. A ring buffer
+// gives that with one allocation and no growth.
+//
+// The part that is usually left out is the drop counter. A log that silently
+// discards is a log that lies about how much happened, so `dropped` is part
+// of the interface rather than an afterthought.
+
+type RingEntry = {
+    level: i64,
+    at: i64,
+    text: str,
+}
+
+type RingLog = {
+    slot: [RingEntry],
+    capacity: i64,
+    /// Where the next line goes.
+    head: i64,
+    held: i64,
+    dropped: i64,
+    /// Lines below this level are refused outright and are not "dropped" —
+    /// they were never accepted, which is a different number.
+    floor: i64,
+    refused: i64,
+}
+
+pub let DEBUG = 0
+pub let INFO = 1
+pub let WARN = 2
+pub let ERROR = 3
+
+pub fn new_log(capacity: i64, floor: i64) -> RingLog {
+    let c = if capacity < 1 { 1 } else { capacity }
+    return RingLog{
+        slot: [], capacity: c, head: 0, held: 0,
+        dropped: 0, floor: floor, refused: 0,
+    }
+}
+
+pub fn level_name(level: i64) -> str {
+    if level <= DEBUG {
+        return "debug"
+    }
+    if level == INFO {
+        return "info"
+    }
+    if level == WARN {
+        return "warn"
+    }
+    return "error"
+}
+
+/// Record a line. Returns false when the level was below the floor.
+pub fn append(inout r: RingLog, level: i64, at: i64, text: str) -> bool {
+    if level < r.floor {
+        r.refused = r.refused + 1
+        return false
+    }
+    let entry = RingEntry{ level: level, at: at, text: text }
+    if r.slot.len() < r.capacity {
+        r.slot.push(entry)
+        r.held = r.held + 1
+        r.head = r.slot.len() % r.capacity
+        return true
+    }
+    if r.held == r.capacity {
+        r.dropped = r.dropped + 1
+    }
+    r.slot[r.head] = entry
+    r.head = (r.head + 1) % r.capacity
+    return true
+}
+
+/// Every held line, oldest first.
+pub fn lines(r: RingLog) -> [RingEntry] {
+    var out: [RingEntry] = []
+    if r.slot.len() < r.capacity {
+        for e in r.slot {
+            out.push(e)
+        }
+        return out
+    }
+    for i in 0..r.capacity {
+        out.push(r.slot[(r.head + i) % r.capacity])
+    }
+    return out
+}
+
+/// The last `n` lines, oldest first — what a crash report prints.
+pub fn tail(r: RingLog, n: i64) -> [RingEntry] {
+    let all = lines(r)
+    if n >= all.len() {
+        return all
+    }
+    return all.slice(all.len() - n, all.len())
+}
+
+pub fn at_least(r: RingLog, level: i64) -> [RingEntry] {
+    var out: [RingEntry] = []
+    for e in lines(r) {
+        if e.level >= level {
+            out.push(e)
+        }
+    }
+    return out
+}
+
+pub fn since(r: RingLog, at: i64) -> [RingEntry] {
+    var out: [RingEntry] = []
+    for e in lines(r) {
+        if e.at >= at {
+            out.push(e)
+        }
+    }
+    return out
+}
+
+pub fn render(e: RingEntry) -> str {
+    let name = level_name(e.level)
+    return "[{e.at}] {name}: {e.text}"
+}
+
+pub fn held(r: RingLog) -> i64 {
+    return r.slot.len()
+}
+
+pub fn dropped(r: RingLog) -> i64 {
+    return r.dropped
+}
+
+pub fn refused(r: RingLog) -> i64 {
+    return r.refused
+}
+
+/// Everything that ever reached the log, held or dropped.
+pub fn accepted(r: RingLog) -> i64 {
+    return r.slot.len() + r.dropped
+}
+
+pub fn clear(inout r: RingLog) {
+    r.slot = []
+    r.head = 0
+    r.held = 0
+}

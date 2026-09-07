@@ -1,0 +1,6 @@
+[package]
+name = "tdigest"
+version = "1.0.0"
+
+# Streaming quantiles. Opens nothing.
+capabilities = []

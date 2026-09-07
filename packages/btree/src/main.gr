@@ -1,0 +1,193 @@
+// A B-tree: ordered keys with a wide fanout.
+//
+// A binary tree touches one key per level, so a million keys is twenty
+// pointer-chases into twenty different places. A B-tree of degree 32 holds up
+// to 63 keys in a node and reaches the same million in four. That is the whole
+// reason every database index on disk is a B-tree and not a red-black tree:
+// the cost that matters is *how many nodes you visit*, not how many keys you
+// compare inside one.
+//
+// Nodes live in one list and refer to each other by index, so the structure is
+// flat in memory and a subtree is a number rather than a pointer.
+
+type BTreeNode = {
+    key: [i64],
+    value: [str],
+    /// Empty when `leaf`; otherwise one more entry than `key`.
+    child: [i64],
+    leaf: bool,
+}
+
+type BTree = {
+    node: [BTreeNode],
+    root: i64,
+    /// Minimum degree: a node holds at most `2 * degree - 1` keys.
+    degree: i64,
+    count: i64,
+}
+
+pub fn new_tree(degree: i64) -> BTree {
+    let d = if degree < 2 { 2 } else { degree }
+    var n: [BTreeNode] = []
+    n.push(BTreeNode{ key: [], value: [], child: [], leaf: true })
+    return BTree{ node: n, root: 0, degree: d, count: 0 }
+}
+
+fn max_keys(t: BTree) -> i64 {
+    return 2 * t.degree - 1
+}
+
+fn put_i64(xs: [i64], at: i64, v: i64) -> [i64] {
+    return xs.slice(0, at) + [v] + xs.slice(at, xs.len())
+}
+
+fn put_str(xs: [str], at: i64, v: str) -> [str] {
+    return xs.slice(0, at) + [v] + xs.slice(at, xs.len())
+}
+
+/// The first slot in `at` whose key is not less than `k`.
+fn seek(t: BTree, at: i64, k: i64) -> i64 {
+    var i = 0
+    while i < t.node[at].key.len() and t.node[at].key[i] < k {
+        i = i + 1
+    }
+    return i
+}
+
+/// Split a full child in two and lift its middle key into the parent.
+///
+/// This is the only place a B-tree grows sideways, and doing it on the way
+/// *down* is what keeps insert a single pass: by the time a key reaches a
+/// node, that node is guaranteed to have room.
+fn split_child(inout t: BTree, parent: i64, at: i64) {
+    let d = t.degree
+    let full = t.node[parent].child[at]
+    let leaf = t.node[full].leaf
+    var right = BTreeNode{ key: [], value: [], child: [], leaf: leaf }
+    right.key = t.node[full].key.slice(d, 2 * d - 1)
+    right.value = t.node[full].value.slice(d, 2 * d - 1)
+    if not leaf {
+        right.child = t.node[full].child.slice(d, 2 * d)
+    }
+    let mid_key = t.node[full].key[d - 1]
+    let mid_value = t.node[full].value[d - 1]
+    t.node[full].key = t.node[full].key.slice(0, d - 1)
+    t.node[full].value = t.node[full].value.slice(0, d - 1)
+    if not leaf {
+        t.node[full].child = t.node[full].child.slice(0, d)
+    }
+    t.node.push(right)
+    let fresh = t.node.len() - 1
+    t.node[parent].key = put_i64(t.node[parent].key, at, mid_key)
+    t.node[parent].value = put_str(t.node[parent].value, at, mid_value)
+    t.node[parent].child = put_i64(t.node[parent].child, at + 1, fresh)
+}
+
+fn insert_here(inout t: BTree, at: i64, k: i64, v: str) {
+    let i = seek(t, at, k)
+    if i < t.node[at].key.len() and t.node[at].key[i] == k {
+        t.node[at].value[i] = v
+        return
+    }
+    if t.node[at].leaf {
+        t.node[at].key = put_i64(t.node[at].key, i, k)
+        t.node[at].value = put_str(t.node[at].value, i, v)
+        t.count = t.count + 1
+        return
+    }
+    var slot = i
+    let child = t.node[at].child[slot]
+    if t.node[child].key.len() == max_keys(t) {
+        split_child(t, at, slot)
+        if k == t.node[at].key[slot] {
+            t.node[at].value[slot] = v
+            return
+        }
+        if k > t.node[at].key[slot] {
+            slot = slot + 1
+        }
+    }
+    insert_here(t, t.node[at].child[slot], k, v)
+}
+
+pub fn set(inout t: BTree, k: i64, v: str) {
+    if t.node[t.root].key.len() == max_keys(t) {
+        // The root is the one node allowed to be split from above, which is
+        // the only way a B-tree gets taller — it grows at the root, not the
+        // leaves, which is why every leaf stays at the same depth.
+        let old = t.root
+        t.node.push(BTreeNode{ key: [], value: [], child: [old], leaf: false })
+        t.root = t.node.len() - 1
+        split_child(t, t.root, 0)
+    }
+    insert_here(t, t.root, k, v)
+}
+
+pub fn get(t: BTree, k: i64) -> Option[str] {
+    var at = t.root
+    while true {
+        let i = seek(t, at, k)
+        if i < t.node[at].key.len() and t.node[at].key[i] == k {
+            return Some(t.node[at].value[i])
+        }
+        if t.node[at].leaf {
+            return None
+        }
+        at = t.node[at].child[i]
+    }
+    return None
+}
+
+pub fn holds(t: BTree, k: i64) -> bool {
+    return get(t, k) != None
+}
+
+pub fn len(t: BTree) -> i64 {
+    return t.count
+}
+
+fn walk(t: BTree, at: i64) -> [i64] {
+    var out: [i64] = []
+    let here = t.node[at]
+    for i in 0..here.key.len() {
+        if not here.leaf {
+            out = out + walk(t, here.child[i])
+        }
+        out.push(here.key[i])
+    }
+    if not here.leaf {
+        out = out + walk(t, here.child[here.key.len()])
+    }
+    return out
+}
+
+/// Every key, ascending.
+pub fn keys(t: BTree) -> [i64] {
+    return walk(t, t.root)
+}
+
+pub fn range(t: BTree, low: i64, high: i64) -> [i64] {
+    var out: [i64] = []
+    for k in walk(t, t.root) {
+        if k >= low and k <= high {
+            out.push(k)
+        }
+    }
+    return out
+}
+
+/// Levels from root to leaf. Every leaf is at this depth — that is the
+/// invariant, and the demo checks it by checking that this number stays small.
+pub fn depth(t: BTree) -> i64 {
+    var n = 1
+    var at = t.root
+    while not t.node[at].leaf {
+        at = t.node[at].child[0]
+        n = n + 1
+    }
+    return n
+}
+
+pub fn node_count(t: BTree) -> i64 {
+    return t.node.len()
+}

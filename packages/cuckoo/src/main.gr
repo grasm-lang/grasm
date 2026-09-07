@@ -1,0 +1,181 @@
+// A cuckoo filter: a Bloom filter you can delete from.
+//
+// A Bloom filter cannot remove a member — clearing its bits would clear them
+// for every other member that set them too. That single limitation is why a
+// cache invalidation, a revocation list or a tombstone set cannot use one.
+//
+// A cuckoo filter stores a short *fingerprint* per member in one of two
+// buckets, so removing a member is removing its fingerprint. The trick that
+// makes it work is partial-key hashing: the second bucket is derivable from
+// the first and the fingerprint alone, so a lookup never needs the original
+// item — which is what lets an insert relocate an existing entry without
+// knowing what it was.
+
+type CuckooFilter = {
+    /// buckets × slots, 0 for empty.
+    slot: [i64],
+    buckets: i64,
+    per_bucket: i64,
+    count: i64,
+    evictions: i64,
+}
+
+pub fn new_filter(buckets: i64, per_bucket: i64) -> CuckooFilter {
+    let b = if buckets < 2 { 2 } else { buckets }
+    let p = if per_bucket < 1 { 1 } else { per_bucket }
+    var s: [i64] = []
+    for _i in 0..(b * p) {
+        s.push(0)
+    }
+    return CuckooFilter{ slot: s, buckets: b, per_bucket: p, count: 0, evictions: 0 }
+}
+
+fn mask32(v: i64) -> i64 {
+    return v.bit_and(4294967295)
+}
+
+fn hash_of(text: str) -> i64 {
+    var h = 2166136261
+    let raw = text.to_bytes()
+    for i in 0..raw.len() {
+        h = mask32(h.bit_xor(raw.at(i)))
+        h = mask32(mask32(h.shl(24)) + mask32(h.shl(8)) + mask32(h.shl(7)) +
+            mask32(h.shl(4)) + mask32(h.shl(1)) + h)
+    }
+    return h
+}
+
+fn mul32(a: i64, b: i64) -> i64 {
+    let hi = a / 65536
+    let lo = a % 65536
+    return mask32((hi * b) % 65536 * 65536 + lo * b)
+}
+
+fn avalanche(x: i64) -> i64 {
+    var h = x
+    h = h.bit_xor(h / 65536)
+    h = mul32(h, 2246822507)
+    h = h.bit_xor(h / 8192)
+    h = mul32(h, 3266489909)
+    return mask32(h.bit_xor(h / 65536))
+}
+
+/// A fingerprint is never 0, because 0 marks an empty slot.
+fn fingerprint_of(h: i64) -> i64 {
+    let f = h % 255
+    return f + 1
+}
+
+/// The partner bucket, derived from a bucket and a fingerprint alone.
+///
+/// This is the whole design: it works in either direction, so an entry can be
+/// relocated without knowing which item it came from.
+fn partner(f: CuckooFilter, bucket: i64, fingerprint: i64) -> i64 {
+    return bucket.bit_xor(avalanche(fingerprint)) % f.buckets
+}
+
+fn place(inout f: CuckooFilter, bucket: i64, fingerprint: i64) -> bool {
+    for s in 0..f.per_bucket {
+        if f.slot[bucket * f.per_bucket + s] == 0 {
+            f.slot[bucket * f.per_bucket + s] = fingerprint
+            return true
+        }
+    }
+    return false
+}
+
+/// Add an item. `evict_choice` picks which slot to displace when both buckets
+/// are full — supplied by the caller so no randomness is opened here.
+pub fn add(inout f: CuckooFilter, item: str, evict_choice: i64) -> bool {
+    let h = avalanche(hash_of(item))
+    let fp = fingerprint_of(h)
+    let b1 = h % f.buckets
+    if place(f, b1, fp) {
+        f.count = f.count + 1
+        return true
+    }
+    let b2 = partner(f, b1, fp)
+    if place(f, b2, fp) {
+        f.count = f.count + 1
+        return true
+    }
+    // Both full: kick an entry out and rehouse it, up to a bound. Without the
+    // bound a saturated filter loops forever.
+    var bucket = if evict_choice % 2 == 0 { b1 } else { b2 }
+    var carrying = fp
+    var kicks = 0
+    while kicks < 500 {
+        let s = (evict_choice + kicks) % f.per_bucket
+        let at = bucket * f.per_bucket + s
+        let displaced = f.slot[at]
+        f.slot[at] = carrying
+        carrying = displaced
+        f.evictions = f.evictions + 1
+        bucket = partner(f, bucket, carrying)
+        if place(f, bucket, carrying) {
+            f.count = f.count + 1
+            return true
+        }
+        kicks = kicks + 1
+    }
+    return false
+}
+
+pub fn holds(f: CuckooFilter, item: str) -> bool {
+    let h = avalanche(hash_of(item))
+    let fp = fingerprint_of(h)
+    let b1 = h % f.buckets
+    for s in 0..f.per_bucket {
+        if f.slot[b1 * f.per_bucket + s] == fp {
+            return true
+        }
+    }
+    let b2 = partner(f, b1, fp)
+    for s in 0..f.per_bucket {
+        if f.slot[b2 * f.per_bucket + s] == fp {
+            return true
+        }
+    }
+    return false
+}
+
+/// Remove an item — the operation a Bloom filter cannot perform.
+pub fn remove(inout f: CuckooFilter, item: str) -> bool {
+    let h = avalanche(hash_of(item))
+    let fp = fingerprint_of(h)
+    let b1 = h % f.buckets
+    for s in 0..f.per_bucket {
+        if f.slot[b1 * f.per_bucket + s] == fp {
+            f.slot[b1 * f.per_bucket + s] = 0
+            f.count = f.count - 1
+            return true
+        }
+    }
+    let b2 = partner(f, b1, fp)
+    for s in 0..f.per_bucket {
+        if f.slot[b2 * f.per_bucket + s] == fp {
+            f.slot[b2 * f.per_bucket + s] = 0
+            f.count = f.count - 1
+            return true
+        }
+    }
+    return false
+}
+
+pub fn count(f: CuckooFilter) -> i64 {
+    return f.count
+}
+
+pub fn capacity(f: CuckooFilter) -> i64 {
+    return f.buckets * f.per_bucket
+}
+
+/// Fullness in percent. Past about 95% inserts start failing, which is a
+/// property of the structure rather than a bug in it.
+pub fn load_percent(f: CuckooFilter) -> i64 {
+    return f.count * 100 / capacity(f)
+}
+
+pub fn eviction_count(f: CuckooFilter) -> i64 {
+    return f.evictions
+}
