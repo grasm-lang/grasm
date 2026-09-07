@@ -1,0 +1,140 @@
+// English plurals, and the count-aware phrasing a UI needs.
+//
+// "1 items" is the commonest bug in a status line and it is entirely
+// avoidable. English is irregular enough that a rule-based pluraliser is wrong
+// often — so the irregulars are a table, the rules handle the rest, and the
+// table is checked first.
+//
+// This is English only, and says so. A message that pluralises by appending a
+// letter is wrong in most languages, and a caller translating an interface
+// needs a message catalogue rather than this.
+
+fn irregular() -> [(str, str)] {
+    return [
+        ("child", "children"), ("person", "people"), ("man", "men"),
+        ("woman", "women"), ("tooth", "teeth"), ("foot", "feet"),
+        ("goose", "geese"), ("mouse", "mice"), ("louse", "lice"),
+        ("ox", "oxen"), ("die", "dice"), ("index", "indices"),
+        ("matrix", "matrices"), ("vertex", "vertices"), ("axis", "axes"),
+        ("crisis", "crises"), ("analysis", "analyses"), ("datum", "data"),
+        ("medium", "media"), ("criterion", "criteria"), ("phenomenon", "phenomena"),
+    ]
+}
+
+/// Words that are the same either way.
+fn invariant() -> [str] {
+    return ["sheep", "fish", "deer", "series", "species", "aircraft", "salmon", "swine"]
+}
+
+pub fn plural(word: str) -> str {
+    let low = word.to_lower()
+    for w in invariant() {
+        if w == low {
+            return word
+        }
+    }
+    for pair in irregular() {
+        if pair.0 == low {
+            return pair.1
+        }
+    }
+    let n = word.len()
+    if n == 0 {
+        return word
+    }
+    let last = word.substr(n - 1, 1)
+    let last2 = if n >= 2 { word.substr(n - 2, 2) } else { "" }
+    // -s, -x, -z, -ch, -sh take -es.
+    if last == "s" or last == "x" or last == "z" or last2 == "ch" or last2 == "sh" {
+        return word + "es"
+    }
+    // consonant + y becomes -ies; vowel + y just takes -s.
+    if last == "y" and n >= 2 {
+        let before = word.substr(n - 2, 1)
+        if not is_vowel(before) {
+            return word.substr(0, n - 1) + "ies"
+        }
+    }
+    // -f / -fe becomes -ves, with the common exceptions left alone.
+    if last2 == "fe" {
+        return word.substr(0, n - 2) + "ves"
+    }
+    if last == "f" and not ends_with_any(low, ["roof", "chief", "belief", "chef", "cliff"]) {
+        return word.substr(0, n - 1) + "ves"
+    }
+    // -o after a consonant usually takes -es.
+    if last == "o" and n >= 2 and not is_vowel(word.substr(n - 2, 1)) {
+        if not ends_with_any(low, ["photo", "piano", "halo", "solo", "memo"]) {
+            return word + "es"
+        }
+    }
+    return word + "s"
+}
+
+fn is_vowel(c: str) -> bool {
+    let v = c.to_lower()
+    return v == "a" or v == "e" or v == "i" or v == "o" or v == "u"
+}
+
+fn ends_with_any(word: str, list: [str]) -> bool {
+    for w in list {
+        if word.ends_with(w) {
+            return true
+        }
+    }
+    return false
+}
+
+pub fn singular(word: str) -> str {
+    let low = word.to_lower()
+    for w in invariant() {
+        if w == low {
+            return word
+        }
+    }
+    for pair in irregular() {
+        if pair.1 == low {
+            return pair.0
+        }
+    }
+    let n = word.len()
+    if n >= 3 and word.substr(n - 3, 3) == "ies" {
+        return word.substr(0, n - 3) + "y"
+    }
+    if n >= 3 and word.substr(n - 3, 3) == "ves" {
+        return word.substr(0, n - 3) + "f"
+    }
+    if n >= 2 and word.substr(n - 2, 2) == "es" {
+        let stem = word.substr(0, n - 2)
+        let last = stem.substr(stem.len() - 1, 1)
+        if last == "s" or last == "x" or last == "z" or
+        (stem.len() >= 2 and (stem.ends_with("ch") or stem.ends_with("sh"))) {
+            return stem
+        }
+    }
+    if n >= 1 and word.substr(n - 1, 1) == "s" {
+        return word.substr(0, n - 1)
+    }
+    return word
+}
+
+/// The word for a count. `1 item`, `2 items`, `0 items`.
+pub fn for_count(n: i64, word: str) -> str {
+    if n == 1 or n == 0 - 1 {
+        return word
+    }
+    return plural(word)
+}
+
+/// The whole phrase: "1 item", "3 items".
+pub fn phrase(n: i64, word: str) -> str {
+    return "{n} {for_count(n, word)}"
+}
+
+/// "no items", "1 item", "3 items" — the shape a status line wants.
+pub fn phrase_or_none(n: i64, word: str) -> str {
+    if n == 0 {
+        return "no {plural(word)}"
+    }
+    return phrase(n, word)
+}

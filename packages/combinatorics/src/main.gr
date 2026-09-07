@@ -1,0 +1,133 @@
+// Counting and enumerating: factorials, binomials, permutations, subsets.
+//
+// The binomial is computed by a **multiplicative loop**, not as
+// `n! / (k! (n-k)!)`. The factorial form overflows an i64 at 21! while the
+// answer itself stays small — `choose(60, 30)` is about 1.18e17 and fits
+// comfortably, but `60!` does not fit in anything. Code written from the
+// textbook formula fails on inputs whose answers are perfectly representable.
+
+type CountError = | TooLarge(n: i64)
+
+/// n!, refusing past 20 where an i64 cannot hold the answer.
+pub fn factorial(n: i64) -> i64 ! CountError {
+    if n < 0 {
+        fail(TooLarge(n))
+    }
+    if n > 20 {
+        fail(TooLarge(n))
+    }
+    var v = 1
+    for i in 2..(n + 1) {
+        v = v * i
+    }
+    return v
+}
+
+/// C(n, k), by multiplying up rather than dividing factorials.
+pub fn choose(n: i64, k: i64) -> i64 {
+    if k < 0 or k > n {
+        return 0
+    }
+    // C(n,k) == C(n,n-k); taking the smaller keeps the loop short.
+    var r = if k > n - k { n - k } else { k }
+    var out = 1
+    for i in 0..r {
+        // Dividing at each step keeps the running value exact and small: the
+        // product of i+1 consecutive integers is always divisible by (i+1)!.
+        out = out * (n - i) / (i + 1)
+    }
+    return out
+}
+
+/// P(n, k) — ordered selections.
+pub fn permutations(n: i64, k: i64) -> i64 {
+    if k < 0 or k > n {
+        return 0
+    }
+    var out = 1
+    for i in 0..k {
+        out = out * (n - i)
+    }
+    return out
+}
+
+/// Every subset of `items`, as index lists. 2^n of them, so it refuses past 20.
+pub fn subsets(items: [str]) -> [[str]] ! CountError {
+    if items.len() > 20 {
+        fail(TooLarge(items.len()))
+    }
+    var out: [[str]] = []
+    let total = 2 ^ items.len()
+    for mask in 0..total {
+        var one: [str] = []
+        for i in 0..items.len() {
+            if (mask / (2 ^ i)) % 2 == 1 {
+                one.push(items[i])
+            }
+        }
+        out.push(one)
+    }
+    return out
+}
+
+/// Every combination of `k` from `items`, in order.
+pub fn combinations(items: [str], k: i64) -> [[str]] {
+    var out: [[str]] = []
+    if k < 0 or k > items.len() {
+        return out
+    }
+    if k == 0 {
+        out.push([])
+        return out
+    }
+    var index: [i64] = []
+    for i in 0..k {
+        index.push(i)
+    }
+    var going = true
+    while going {
+        var one: [str] = []
+        for i in index {
+            one.push(items[i])
+        }
+        out.push(one)
+        // Advance the rightmost index that can move.
+        var i = k - 1
+        var moved = false
+        while i >= 0 and not moved {
+            if index[i] < items.len() - k + i {
+                index[i] = index[i] + 1
+                for j in (i + 1)..k {
+                    index[j] = index[j - 1] + 1
+                }
+                moved = true
+            }
+            i = i - 1
+        }
+        going = moved
+    }
+    return out
+}
+
+/// The nth Catalan number: how many balanced bracket strings of length 2n.
+pub fn catalan(n: i64) -> i64 {
+    if n < 0 {
+        return 0
+    }
+    return choose(2 * n, n) / (n + 1)
+}
+
+/// The nth Fibonacci number, iteratively.
+pub fn fibonacci(n: i64) -> i64 {
+    if n < 2 {
+        return if n < 0 { 0 } else { n }
+    }
+    var a = 0
+    var b = 1
+    for _i in 2..(n + 1) {
+        let t = a + b
+        a = b
+        b = t
+    }
+    return b
+}

@@ -1,0 +1,6 @@
+[package]
+name = "pluralize"
+version = "1.0.0"
+
+# Rewriting text. Opens nothing.
+capabilities = []

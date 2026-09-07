@@ -1,0 +1,119 @@
+// Geometry, counting, plurals and word frequency.
+import geometry
+import combinatorics
+import pluralize
+import wordfreq
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn near(a: f64, b: f64) -> bool {
+    let d = a - b
+    return d < 0.0001 and d > 0.0 - 0.0001
+}
+
+fn main() / {io} {
+    var f = 0
+
+    print("-- geometry")
+    let a = geometry.point(0.0, 0.0)
+    let b = geometry.point(3.0, 4.0)
+    say(f, "the 3-4-5 triangle", near(geometry.distance(a, b), 5.0))
+    say(f, "squared distance skips the root", near(geometry.distance_squared(a, b), 25.0))
+    say(f, "a normalised vector has length one", near(geometry.length(geometry.normalise(b)), 1.0))
+    say(f, "dot of perpendiculars is zero",
+        near(geometry.dot(geometry.point(1.0, 0.0), geometry.point(0.0, 1.0)), 0.0))
+    let r = geometry.rect(0.0, 0.0, 10.0, 10.0)
+    say(f, "a rect holds a point inside", geometry.rect_holds(r, geometry.point(5.0, 5.0)))
+    say(f, "and not one outside", not geometry.rect_holds(r, geometry.point(15.0, 5.0)))
+    say(f, "overlapping rects", geometry.rects_overlap(r, geometry.rect(5.0, 5.0, 10.0, 10.0)))
+    say(f, "and separate ones", not geometry.rects_overlap(r, geometry.rect(20.0, 20.0, 1.0, 1.0)))
+    let square = [geometry.point(0.0, 0.0), geometry.point(4.0, 0.0),
+        geometry.point(4.0, 4.0), geometry.point(0.0, 4.0)]
+    say(f, "shoelace area of a square", near(geometry.polygon_area(square), 16.0))
+    say(f, "a point inside", geometry.polygon_holds(square, geometry.point(2.0, 2.0)))
+    say(f, "a point outside", not geometry.polygon_holds(square, geometry.point(9.0, 2.0)))
+    // An L-shape: a bounding-box test would get this wrong.
+    let ell = [geometry.point(0.0, 0.0), geometry.point(4.0, 0.0), geometry.point(4.0, 1.0),
+        geometry.point(1.0, 1.0), geometry.point(1.0, 4.0), geometry.point(0.0, 4.0)]
+    say(f, "concave: inside the arm", geometry.polygon_holds(ell, geometry.point(3.0, 0.5)))
+    say(f, "concave: in the notch a box would call inside",
+        not geometry.polygon_holds(ell, geometry.point(3.0, 3.0)))
+    // Vertical segments: a slope-based test divides by zero here.
+    say(f, "crossing segments, one vertical",
+        geometry.segments_cross(geometry.point(2.0, 0.0), geometry.point(2.0, 4.0),
+            geometry.point(0.0, 2.0), geometry.point(4.0, 2.0)))
+    say(f, "parallel segments do not cross",
+        not geometry.segments_cross(geometry.point(0.0, 0.0), geometry.point(4.0, 0.0),
+            geometry.point(0.0, 1.0), geometry.point(4.0, 1.0)))
+
+    print("-- counting, without overflowing on the way")
+    say(f, "5! is 120", (combinatorics.factorial(5) ?? 0) == 120)
+    say(f, "20! is the last that fits", (combinatorics.factorial(20) ?? 0) == 2432902008176640000)
+    say(f, "21! is refused rather than wrong", {
+        match combinatorics.factorial(21) {
+            Err(_e) -> true
+            Ok(_v) -> false
+        }
+    })
+    say(f, "C(5,2) is 10", combinatorics.choose(5, 2) == 10)
+    say(f, "C(n,0) is 1", combinatorics.choose(9, 0) == 1)
+    // The point: the answer fits even though 60! does not exist in an i64.
+    say(f, "C(60,30) is computed though 60! could never be",
+        combinatorics.choose(60, 30) == 118264581564861424)
+    say(f, "P(5,2) is 20", combinatorics.permutations(5, 2) == 20)
+    say(f, "2^3 subsets", (combinatorics.subsets(["a", "b", "c"]) ?? []).len() == 8)
+    say(f, "C(4,2) combinations", combinatorics.combinations(["a", "b", "c", "d"], 2).len() == 6)
+    say(f, "and they are in order",
+        combinatorics.combinations(["a", "b", "c"], 2)[0] == ["a", "b"])
+    say(f, "catalan(4) is 14", combinatorics.catalan(4) == 14)
+    say(f, "fib(10) is 55", combinatorics.fibonacci(10) == 55)
+
+    print("-- plurals, and the 1 items bug")
+    say(f, "regular", pluralize.plural("cat") == "cats")
+    say(f, "-s takes -es", pluralize.plural("bus") == "buses")
+    say(f, "-ch takes -es", pluralize.plural("church") == "churches")
+    say(f, "consonant-y becomes -ies", pluralize.plural("city") == "cities")
+    say(f, "vowel-y just takes -s", pluralize.plural("day") == "days")
+    say(f, "-fe becomes -ves", pluralize.plural("knife") == "knives")
+    say(f, "irregular", pluralize.plural("child") == "children")
+    say(f, "and another", pluralize.plural("person") == "people")
+    say(f, "invariant stays", pluralize.plural("sheep") == "sheep")
+    say(f, "singularises back", pluralize.singular("cities") == "city")
+    say(f, "and irregulars too", pluralize.singular("people") == "person")
+    // The bug this package exists to prevent.
+    say(f, "1 item, not 1 items", pluralize.phrase(1, "item") == "1 item")
+    say(f, "2 items", pluralize.phrase(2, "item") == "2 items")
+    say(f, "0 items", pluralize.phrase(0, "item") == "0 items")
+    say(f, "no items reads better", pluralize.phrase_or_none(0, "item") == "no items")
+
+    print("-- word frequency")
+    var c = wordfreq.new_counter()
+    wordfreq.add_text(c, "the cat sat on the mat. The CAT was fat!")
+    // Punctuation and case must not split a word into two.
+    say(f, "case folds together", wordfreq.count_of(c, "the") == 3)
+    say(f, "punctuation does not make a new word", wordfreq.count_of(c, "cat") == 2)
+    say(f, "and a trailing stop is stripped", wordfreq.count_of(c, "mat") == 1)
+    say(f, "distinct words", wordfreq.distinct(c) == 7)
+    say(f, "total words", wordfreq.total(c) == 10)
+    let top = wordfreq.top(c, 2)
+    say(f, "the commonest is the", top[0].0 == "the" and top[0].1 == 3)
+    say(f, "then cat", top[1].0 == "cat")
+    say(f, "singletons are the interesting ones", wordfreq.singletons(c).len() == 5)
+    say(f, "share is a proportion", wordfreq.share_tenths(c, "the") == 300)
+    say(f, "an apostrophe stays inside a word",
+        wordfreq.words_of("don't stop") == ["don't", "stop"])
+
+    print("")
+    if f == 0 {
+        print("all held")
+    } else {
+        print("{f} failed")
+    }
+}

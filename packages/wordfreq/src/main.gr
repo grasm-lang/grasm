@@ -1,0 +1,138 @@
+// Word frequency, and the top-N question every log analysis asks.
+//
+// The tokenisation is the whole design decision and it is stated rather than
+// implied: words are runs of letters, digits and apostrophes, folded to lower
+// case, so `Don't` and `don't` count together and `foo,` and `foo` do too.
+// A counter splitting on whitespace alone reports `foo,` and `foo` as
+// different words, which makes every ranking wrong.
+
+type Counter = {
+    word: [str],
+    count: [i64],
+    total: i64,
+}
+
+pub fn new_counter() -> Counter {
+    return Counter{ word: [], count: [], total: 0 }
+}
+
+fn is_word_char(c: str) -> bool {
+    return (c >= "a" and c <= "z") or (c >= "A" and c <= "Z") or
+    (c >= "0" and c <= "9") or c == "'"
+}
+
+/// The words in `text`, lower-cased.
+pub fn words_of(text: str) -> [str] {
+    var out: [str] = []
+    var current = ""
+    for c in text.chars() {
+        if is_word_char(c) {
+            current = current + c
+        } else {
+            if current != "" {
+                out.push(current.to_lower())
+                current = ""
+            }
+        }
+    }
+    if current != "" {
+        out.push(current.to_lower())
+    }
+    return out
+}
+
+fn index_of(c: Counter, word: str) -> i64 {
+    for i in 0..c.word.len() {
+        if c.word[i] == word {
+            return i
+        }
+    }
+    return 0 - 1
+}
+
+pub fn add(inout c: Counter, word: str) {
+    let w = word.to_lower()
+    let at = index_of(c, w)
+    if at >= 0 {
+        c.count[at] = c.count[at] + 1
+    } else {
+        c.word.push(w)
+        c.count.push(1)
+    }
+    c.total = c.total + 1
+}
+
+pub fn add_text(inout c: Counter, text: str) {
+    for w in words_of(text) {
+        add(c, w)
+    }
+}
+
+pub fn count_of(c: Counter, word: str) -> i64 {
+    let at = index_of(c, word.to_lower())
+    if at < 0 {
+        return 0
+    }
+    return c.count[at]
+}
+
+pub fn distinct(c: Counter) -> i64 {
+    return c.word.len()
+}
+
+pub fn total(c: Counter) -> i64 {
+    return c.total
+}
+
+/// The `n` commonest, most frequent first. Ties break alphabetically, so the
+/// output is stable rather than depending on insertion order.
+pub fn top(c: Counter, n: i64) -> [(str, i64)] {
+    var pairs: [(str, i64)] = []
+    for i in 0..c.word.len() {
+        pairs.push((c.word[i], c.count[i]))
+    }
+    var i = 1
+    while i < pairs.len() {
+        var j = i
+        while j > 0 and worse(pairs[j - 1], pairs[j]) {
+            let t = pairs[j - 1]
+            pairs[j - 1] = pairs[j]
+            pairs[j] = t
+            j = j - 1
+        }
+        i = i + 1
+    }
+    var out: [(str, i64)] = []
+    for k in 0..pairs.len() {
+        if k < n {
+            out.push(pairs[k])
+        }
+    }
+    return out
+}
+
+fn worse(a: (str, i64), b: (str, i64)) -> bool {
+    if a.1 != b.1 {
+        return a.1 < b.1
+    }
+    return a.0 > b.0
+}
+
+/// Words appearing exactly once — often the interesting ones in a log.
+pub fn singletons(c: Counter) -> [str] {
+    var out: [str] = []
+    for i in 0..c.word.len() {
+        if c.count[i] == 1 {
+            out.push(c.word[i])
+        }
+    }
+    return out
+}
+
+/// Frequency as a percentage in tenths.
+pub fn share_tenths(c: Counter, word: str) -> i64 {
+    if c.total == 0 {
+        return 0
+    }
+    return count_of(c, word) * 1000 / c.total
+}

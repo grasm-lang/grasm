@@ -1,0 +1,20 @@
+[package]
+name = "misc_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.geometry]
+path = "../geometry"
+version = "^1.0.0"
+
+[dependencies.combinatorics]
+path = "../combinatorics"
+version = "^1.0.0"
+
+[dependencies.pluralize]
+path = "../pluralize"
+version = "^1.0.0"
+
+[dependencies.wordfreq]
+path = "../wordfreq"
+version = "^1.0.0"
