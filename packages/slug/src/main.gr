@@ -1,0 +1,111 @@
+// URL slugs.
+//
+// The rule that matters is idempotence: slugging a slug must give the same
+// slug. Without it a system that re-slugs on every save produces a new URL
+// each time, and every link to the old one breaks.
+//
+// Accented Latin letters are folded to their base rather than dropped, because
+// dropping them turns "café" and "cafe" into different slugs in one direction
+// and collides them in the other.
+
+fn fold(c: str) -> str {
+    let table = [
+        ("\u{e0}", "a"), ("\u{e1}", "a"), ("\u{e2}", "a"), ("\u{e3}", "a"),
+        ("\u{e4}", "a"), ("\u{e5}", "a"), ("\u{e6}", "ae"),
+        ("\u{e7}", "c"),
+        ("\u{e8}", "e"), ("\u{e9}", "e"), ("\u{ea}", "e"), ("\u{eb}", "e"),
+        ("\u{ec}", "i"), ("\u{ed}", "i"), ("\u{ee}", "i"), ("\u{ef}", "i"),
+        ("\u{f1}", "n"),
+        ("\u{f2}", "o"), ("\u{f3}", "o"), ("\u{f4}", "o"), ("\u{f5}", "o"),
+        ("\u{f6}", "o"), ("\u{f8}", "o"),
+        ("\u{f9}", "u"), ("\u{fa}", "u"), ("\u{fb}", "u"), ("\u{fc}", "u"),
+        ("\u{fd}", "y"), ("\u{ff}", "y"),
+        ("\u{df}", "ss"),
+    ]
+    for pair in table {
+        if pair.0 == c {
+            return pair.1
+        }
+    }
+    return c
+}
+
+/// A slug: lower case, ASCII, words joined by one dash.
+pub fn of(text: str) -> str {
+    var out = ""
+    var last_dash = true
+    for c in text.to_lower().chars() {
+        let folded = fold(c)
+        var kept = ""
+        for k in folded.chars() {
+            if (k >= "a" and k <= "z") or (k >= "0" and k <= "9") {
+                kept = kept + k
+            }
+        }
+        if kept == "" {
+            // Any run of separators collapses to one dash, and a leading one
+            // is never written — which is what makes this idempotent.
+            if not last_dash {
+                out = out + "-"
+                last_dash = true
+            }
+        } else {
+            out = out + kept
+            last_dash = false
+        }
+    }
+    // A trailing dash would make `slug(slug(x)) != slug(x)`.
+    if out.len() > 0 and out.substr(out.len() - 1, 1) == "-" {
+        out = out.substr(0, out.len() - 1)
+    }
+    return out
+}
+
+/// A slug no longer than `max`, cut at a word boundary rather than mid-word.
+pub fn truncated(text: str, max: i64) -> str {
+    let full = of(text)
+    if full.len() <= max {
+        return full
+    }
+    var cut = full.substr(0, max)
+    match last_dash_in(cut) {
+        Some(at) -> cut = cut.substr(0, at)
+        None -> {}
+    }
+    return cut
+}
+
+fn last_dash_in(s: str) -> Option[i64] {
+    var found = 0 - 1
+    let cs = s.chars()
+    for i in 0..cs.len() {
+        if cs[i] == "-" {
+            found = i
+        }
+    }
+    if found < 0 {
+        return None
+    }
+    return Some(found)
+}
+
+/// `base`, `base-2`, `base-3` … the first not already taken.
+pub fn unique(base: str, taken: [str]) -> str {
+    let s = of(base)
+    var candidate = s
+    var n = 1
+    var clash = true
+    while clash {
+        clash = false
+        for t in taken {
+            if t == candidate {
+                clash = true
+            }
+        }
+        if clash {
+            n = n + 1
+            candidate = "{s}-{n}"
+        }
+    }
+    return candidate
+}

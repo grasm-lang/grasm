@@ -1,0 +1,98 @@
+// Five text packages. Each section asserts the case that is usually got wrong.
+import casing
+import slug
+import ansi
+import ini
+import texttable
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+
+    print("-- case conversion, and the run of capitals")
+    say(f, "snake from camel", casing.snake("userName") == "user_name")
+    say(f, "snake from pascal", casing.snake("UserName") == "user_name")
+    say(f, "HTTPServer is http_server, not h_t_t_p_server",
+        casing.snake("HTTPServer") == "http_server")
+    say(f, "parseXMLFile keeps the run together",
+        casing.snake("parseXMLFile") == "parse_xml_file")
+    say(f, "kebab", casing.kebab("user_name") == "user-name")
+    say(f, "screaming", casing.screaming("userName") == "USER_NAME")
+    say(f, "pascal from snake", casing.pascal("user_name") == "UserName")
+    say(f, "camel from snake", casing.camel("user_name") == "userName")
+    say(f, "title is for humans", casing.title("user_id") == "User id")
+    say(f, "already snake stays snake", casing.snake("user_name") == "user_name")
+
+    print("-- slugs, and the idempotence links depend on")
+    say(f, "spaces become dashes", slug.of("Hello World") == "hello-world")
+    say(f, "punctuation goes", slug.of("Hello, World!") == "hello-world")
+    say(f, "runs collapse", slug.of("a   ---   b") == "a-b")
+    say(f, "no leading or trailing dash", slug.of("  --hi--  ") == "hi")
+    say(f, "accents fold rather than drop", slug.of("caf\u{e9}") == "cafe")
+    say(f, "and the base letter is kept", slug.of("na\u{ef}ve r\u{e9}sum\u{e9}") == "naive-resume")
+    // The property everything else rests on.
+    let once = slug.of("Hello, World! -- Again")
+    say(f, "slugging a slug is the same slug", slug.of(once) == once)
+    say(f, "truncation cuts at a word", slug.truncated("the quick brown fox", 12) == "the-quick")
+    say(f, "unique avoids a clash", slug.unique("post", ["post", "post-2"]) == "post-3")
+
+    print("-- ansi, where len() lies")
+    let coloured = ansi.red("error")
+    say(f, "the string is longer than it looks", coloured.len() > 5)
+    say(f, "but its width is what shows", ansi.width(coloured) == 5)
+    say(f, "strip gives the text back", ansi.strip(coloured) == "error")
+    say(f, "plain text is unchanged", ansi.strip("plain") == "plain")
+    say(f, "escapes are detected", ansi.has_escapes(coloured) and not ansi.has_escapes("plain"))
+    say(f, "padding counts columns, not bytes",
+        ansi.width(ansi.pad_end(ansi.green("ok"), 6)) == 6)
+    say(f, "nesting still strips", ansi.strip(ansi.bold(ansi.blue("x"))) == "x")
+
+    print("-- ini")
+    let src = "; a comment\n" +
+    "top = 1\n" +
+    "[server]\n" +
+    "host = localhost\n" +
+    "port = 8080\n" +
+    "debug = yes\n" +
+    "quoted = \"  spaced  \"\n" +
+    "[server]\n" +
+    "port = 9090\n"
+    let cfg = ini.parse(src)
+    say(f, "a key outside a section", ini.get(cfg, "", "top") == Some("1"))
+    say(f, "a key inside one", ini.get(cfg, "server", "host") == Some("localhost"))
+    say(f, "a repeated key takes the last", ini.get_int(cfg, "server", "port") == Some(9090))
+    say(f, "yes is true", ini.get_bool(cfg, "server", "debug"))
+    say(f, "a missing key is false, not an error", not ini.get_bool(cfg, "server", "nope"))
+    say(f, "quotes protect the edges", ini.get(cfg, "server", "quoted") == Some("  spaced  "))
+    say(f, "comments are not keys", ini.get(cfg, "", "; a comment") == None)
+    say(f, "sections are listed once", ini.sections(cfg) == ["", "server"])
+
+    print("-- tables that line up")
+    var t = texttable.new_table(["name", "count"])
+    texttable.align_right(t, 1)
+    texttable.add_row(t, ["short", "1"])
+    texttable.add_row(t, ["a much longer name", "1000"])
+    let plain = texttable.plain(t)
+    let lines = plain.split("\n")
+    // Every line is padded to the same column, so the numbers stack.
+    say(f, "the header widened to fit the longest row", lines[0].len() >= 18)
+    say(f, "right-aligned numbers end together",
+        lines[1].ends_with("   1") and lines[2].ends_with("1000"))
+    say(f, "markdown has an alignment row", texttable.markdown(t).contains("-:"))
+    say(f, "boxed has borders", texttable.boxed(t).contains("+--"))
+
+    print("")
+    if f == 0 {
+        print("all held")
+    } else {
+        print("{f} failed")
+    }
+}

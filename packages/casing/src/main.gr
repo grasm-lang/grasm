@@ -1,0 +1,106 @@
+// Identifier case conversion.
+//
+// Every code generator needs this and every one writes it slightly
+// differently. The hard part is not `snake_case`; it is that `HTTPServer` has
+// to become `http_server` rather than `h_t_t_p_server`, which means a run of
+// capitals is one word until the last capital, and that last capital starts
+// the next word.
+
+/// The words in an identifier, whatever convention it was written in.
+pub fn words(name: str) -> [str] {
+    var out: [str] = []
+    var current = ""
+    let cs = name.chars()
+    for i in 0..cs.len() {
+        let c = cs[i]
+        if c == "_" or c == "-" or c == " " or c == "." {
+            if current != "" {
+                out.push(current)
+                current = ""
+            }
+        } else {
+            let upper = c >= "A" and c <= "Z"
+            if upper and current != "" {
+                let prev = cs[i - 1]
+                let prev_upper = prev >= "A" and prev <= "Z"
+                // A capital after a lower-case letter always starts a word.
+                // A capital after a capital only does when the *next* is
+                // lower — which is what turns HTTPServer into HTTP + Server.
+                let next_lower = i + 1 < cs.len() and cs[i + 1] >= "a" and cs[i + 1] <= "z"
+                if not prev_upper or next_lower {
+                    out.push(current)
+                    current = ""
+                }
+            }
+            current = current + c
+        }
+    }
+    if current != "" {
+        out.push(current)
+    }
+    return out
+}
+
+pub fn snake(name: str) -> str {
+    var parts: [str] = []
+    for w in words(name) {
+        parts.push(w.to_lower())
+    }
+    return parts.join("_")
+}
+
+pub fn kebab(name: str) -> str {
+    var parts: [str] = []
+    for w in words(name) {
+        parts.push(w.to_lower())
+    }
+    return parts.join("-")
+}
+
+pub fn screaming(name: str) -> str {
+    var parts: [str] = []
+    for w in words(name) {
+        parts.push(w.to_upper())
+    }
+    return parts.join("_")
+}
+
+fn capitalise(w: str) -> str {
+    if w.len() == 0 {
+        return w
+    }
+    return w.substr(0, 1).to_upper() + w.substr(1, w.len() - 1).to_lower()
+}
+
+pub fn pascal(name: str) -> str {
+    var out = ""
+    for w in words(name) {
+        out = out + capitalise(w)
+    }
+    return out
+}
+
+pub fn camel(name: str) -> str {
+    let ws = words(name)
+    if ws.len() == 0 {
+        return ""
+    }
+    var out = ws[0].to_lower()
+    for i in 1..ws.len() {
+        out = out + capitalise(ws[i])
+    }
+    return out
+}
+
+/// Human-readable: "user_id" becomes "User id".
+pub fn title(name: str) -> str {
+    let ws = words(name)
+    if ws.len() == 0 {
+        return ""
+    }
+    var parts: [str] = [capitalise(ws[0])]
+    for i in 1..ws.len() {
+        parts.push(ws[i].to_lower())
+    }
+    return parts.join(" ")
+}

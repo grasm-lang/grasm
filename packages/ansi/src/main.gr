@@ -1,0 +1,82 @@
+// ANSI terminal escapes, and the width calculation they break.
+//
+// The bug this exists to prevent: a coloured string is longer than it looks.
+// `"\e[31mred\e[0m"` is 12 bytes and 3 columns, so any code that pads or wraps
+// on `len()` produces a table whose columns do not line up the moment anything
+// is coloured. `width` here counts what the terminal shows.
+
+fn esc() -> str {
+    return bytes_of([27]).to_str()
+}
+
+fn wrap(code: i64, text: str) -> str {
+    return "{esc()}[{code}m{text}{esc()}[0m"
+}
+
+pub fn red(s: str) -> str { return wrap(31, s) }
+pub fn green(s: str) -> str { return wrap(32, s) }
+pub fn yellow(s: str) -> str { return wrap(33, s) }
+pub fn blue(s: str) -> str { return wrap(34, s) }
+pub fn magenta(s: str) -> str { return wrap(35, s) }
+pub fn cyan(s: str) -> str { return wrap(36, s) }
+pub fn grey(s: str) -> str { return wrap(90, s) }
+pub fn bold(s: str) -> str { return wrap(1, s) }
+pub fn dim(s: str) -> str { return wrap(2, s) }
+pub fn underline(s: str) -> str { return wrap(4, s) }
+
+/// A 256-colour foreground.
+pub fn colour(n: i64, s: str) -> str {
+    return "{esc()}[38;5;{n}m{s}{esc()}[0m"
+}
+
+/// The text with every escape sequence removed.
+pub fn strip(s: str) -> str {
+    var out = ""
+    let cs = s.chars()
+    var i = 0
+    while i < cs.len() {
+        if cs[i] == esc() and i + 1 < cs.len() and cs[i + 1] == "[" {
+            // Skip to the letter that ends the sequence.
+            i = i + 2
+            while i < cs.len() and not is_final(cs[i]) {
+                i = i + 1
+            }
+            i = i + 1
+        } else {
+            out = out + cs[i]
+            i = i + 1
+        }
+    }
+    return out
+}
+
+fn is_final(c: str) -> bool {
+    return (c >= "A" and c <= "Z") or (c >= "a" and c <= "z")
+}
+
+/// Columns the terminal will use — what `len()` should have said.
+pub fn width(s: str) -> i64 {
+    return strip(s).len()
+}
+
+/// Pad to `w` columns, counting only visible characters.
+pub fn pad_end(s: str, w: i64) -> str {
+    let have = width(s)
+    if have >= w {
+        return s
+    }
+    return s + " ".repeat(w - have)
+}
+
+pub fn pad_start(s: str, w: i64) -> str {
+    let have = width(s)
+    if have >= w {
+        return s
+    }
+    return " ".repeat(w - have) + s
+}
+
+/// Whether the text carries any escape at all.
+pub fn has_escapes(s: str) -> bool {
+    return strip(s) != s
+}

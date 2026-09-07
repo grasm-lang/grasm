@@ -1,0 +1,6 @@
+[package]
+name = "texttable"
+version = "1.0.0"
+
+# Formatting text. Opens nothing.
+capabilities = []

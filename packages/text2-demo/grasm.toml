@@ -1,0 +1,24 @@
+[package]
+name = "text2_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.casing]
+path = "../casing"
+version = "^1.0.0"
+
+[dependencies.slug]
+path = "../slug"
+version = "^1.0.0"
+
+[dependencies.ansi]
+path = "../ansi"
+version = "^1.0.0"
+
+[dependencies.ini]
+path = "../ini"
+version = "^1.0.0"
+
+[dependencies.texttable]
+path = "../texttable"
+version = "^1.0.0"

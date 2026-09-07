@@ -1,0 +1,111 @@
+// Text tables that line up.
+//
+// Column widths are measured across every row before anything is written,
+// which is the only way the result aligns — a formatter that decides a width
+// from the header alone produces a table that looks right until one value is
+// long.
+
+type Table = {
+    header: [str],
+    row: [[str]],
+    /// Per column: true to right-align. Numbers read wrong on the left.
+    right: [bool],
+}
+
+pub fn new_table(header: [str]) -> Table {
+    var r: [bool] = []
+    for _h in header {
+        r.push(false)
+    }
+    return Table{ header: header, row: [], right: r }
+}
+
+pub fn align_right(inout t: Table, column: i64) {
+    if column >= 0 and column < t.right.len() {
+        t.right[column] = true
+    }
+}
+
+pub fn add_row(inout t: Table, cells: [str]) {
+    t.row.push(cells)
+}
+
+fn widths_of(t: Table) -> [i64] {
+    var w: [i64] = []
+    for h in t.header {
+        w.push(h.len())
+    }
+    for r in t.row {
+        for i in 0..r.len() {
+            if i < w.len() and r[i].len() > w[i] {
+                w[i] = r[i].len()
+            }
+        }
+    }
+    return w
+}
+
+fn pad(text: str, width: i64, right: bool) -> str {
+    if text.len() >= width {
+        return text
+    }
+    let fill = " ".repeat(width - text.len())
+    if right {
+        return fill + text
+    }
+    return text + fill
+}
+
+fn line_of(cells: [str], w: [i64], right: [bool], sep: str) -> str {
+    var parts: [str] = []
+    for i in 0..w.len() {
+        let cell = if i < cells.len() { cells[i] } else { "" }
+        parts.push(pad(cell, w[i], right[i]))
+    }
+    return parts.join(sep).trim_end()
+}
+
+/// Plain columns separated by two spaces — the shape a CLI prints.
+pub fn plain(t: Table) -> str {
+    let w = widths_of(t)
+    var out: [str] = [line_of(t.header, w, t.right, "  ")]
+    for r in t.row {
+        out.push(line_of(r, w, t.right, "  "))
+    }
+    return out.join("\n")
+}
+
+/// A Markdown table, which needs the alignment row.
+pub fn markdown(t: Table) -> str {
+    let w = widths_of(t)
+    var out: [str] = ["| " + line_of(t.header, w, t.right, " | ") + " |"]
+    var rule: [str] = []
+    for i in 0..w.len() {
+        if t.right[i] {
+            rule.push("-".repeat(w[i] - 1) + ":")
+        } else {
+            rule.push("-".repeat(w[i]))
+        }
+    }
+    out.push("| " + rule.join(" | ") + " |")
+    for r in t.row {
+        out.push("| " + line_of(r, w, t.right, " | ") + " |")
+    }
+    return out.join("\n")
+}
+
+/// Box-drawing borders, for a terminal.
+pub fn boxed(t: Table) -> str {
+    let w = widths_of(t)
+    var bar: [str] = []
+    for width in w {
+        bar.push("-".repeat(width + 2))
+    }
+    let rule = "+" + bar.join("+") + "+"
+    var out: [str] = [rule, "| " + line_of(t.header, w, t.right, " | ") + " |", rule]
+    for r in t.row {
+        out.push("| " + line_of(r, w, t.right, " | ") + " |")
+    }
+    out.push(rule)
+    return out.join("\n")
+}
