@@ -1,0 +1,124 @@
+// The k largest, without sorting everything.
+//
+// Sorting a million items to show the top ten costs n log n and holds the
+// whole list. Keeping a bounded heap of k costs n log k and holds k. For
+// k = 10 and n = 1,000,000 that is the difference between a report that runs
+// and one that does not.
+//
+// The structure is a **min**-heap of size k, which is the part that reads
+// backwards: the smallest of the winners sits at the top, so the next
+// candidate is compared against the weakest entry and replaces it or is
+// discarded in one step.
+
+type TopK = {
+    score: [i64],
+    label: [str],
+    k: i64,
+    seen: i64,
+}
+
+pub fn new_topk(k: i64) -> TopK {
+    return TopK{ score: [], label: [], k: if k < 1 { 1 } else { k }, seen: 0 }
+}
+
+fn swap_at(inout t: TopK, a: i64, b: i64) {
+    let s = t.score[a]
+    t.score[a] = t.score[b]
+    t.score[b] = s
+    let l = t.label[a]
+    t.label[a] = t.label[b]
+    t.label[b] = l
+}
+
+fn sift_up(inout t: TopK, from: i64) {
+    var i = from
+    while i > 0 {
+        let parent = (i - 1) / 2
+        if t.score[parent] <= t.score[i] {
+            i = 0
+        } else {
+            swap_at(t, parent, i)
+            i = parent
+        }
+    }
+}
+
+fn sift_down(inout t: TopK) {
+    var i = 0
+    var going = true
+    while going {
+        let l = 2 * i + 1
+        let r = 2 * i + 2
+        var small = i
+        if l < t.score.len() and t.score[l] < t.score[small] {
+            small = l
+        }
+        if r < t.score.len() and t.score[r] < t.score[small] {
+            small = r
+        }
+        if small == i {
+            going = false
+        } else {
+            swap_at(t, i, small)
+            i = small
+        }
+    }
+}
+
+pub fn offer(inout t: TopK, score: i64, label: str) {
+    t.seen = t.seen + 1
+    if t.score.len() < t.k {
+        t.score.push(score)
+        t.label.push(label)
+        sift_up(t, t.score.len() - 1)
+        return
+    }
+    // The root is the weakest winner: one comparison decides.
+    if score > t.score[0] {
+        t.score[0] = score
+        t.label[0] = label
+        sift_down(t)
+    }
+}
+
+/// The winners, largest first.
+pub fn results(t: TopK) -> [(str, i64)] {
+    var pairs: [(str, i64)] = []
+    for i in 0..t.score.len() {
+        pairs.push((t.label[i], t.score[i]))
+    }
+    var i = 1
+    while i < pairs.len() {
+        var j = i
+        while j > 0 and pairs[j - 1].1 < pairs[j].1 {
+            let x = pairs[j - 1]
+            pairs[j - 1] = pairs[j]
+            pairs[j] = x
+            j = j - 1
+        }
+        i = i + 1
+    }
+    return pairs
+}
+
+pub fn held(t: TopK) -> i64 {
+    return t.score.len()
+}
+
+pub fn seen(t: TopK) -> i64 {
+    return t.seen
+}
+
+/// The weakest score currently held — the bar a new entry must clear.
+pub fn threshold(t: TopK) -> i64 {
+    if t.score.len() == 0 {
+        return 0
+    }
+    return t.score[0]
+}
+
+/// Whether the structure is holding everything offered, which stops being
+/// true once more than k have arrived.
+pub fn is_complete(t: TopK) -> bool {
+    return t.seen <= t.k
+}

@@ -1,0 +1,6 @@
+[package]
+name = "tempname"
+version = "1.0.0"
+
+# Naming. Opens nothing.
+capabilities = []

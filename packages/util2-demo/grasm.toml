@@ -1,0 +1,20 @@
+[package]
+name = "util2_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.punycode]
+path = "../punycode"
+version = "^1.0.0"
+
+[dependencies.topk]
+path = "../topk"
+version = "^1.0.0"
+
+[dependencies.backoff]
+path = "../backoff"
+version = "^1.0.0"
+
+[dependencies.tempname]
+path = "../tempname"
+version = "^1.0.0"

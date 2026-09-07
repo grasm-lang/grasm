@@ -1,0 +1,104 @@
+import punycode
+import topk
+import backoff
+import tempname
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+
+    print("-- punycode, against RFC 3492 and the homograph attack")
+    // The RFC's own German example.
+    say(f, "bucher -> bcher-kva", punycode.encode("b\u{fc}cher") == "bcher-kva")
+    say(f, "munchen -> mnchen-3ya", punycode.encode("m\u{fc}nchen") == "mnchen-3ya")
+    say(f, "pure ascii is unchanged", punycode.encode("example") == "example")
+    say(f, "a domain gets the xn-- prefix",
+        punycode.encode_domain("m\u{fc}nchen.de") == "xn--mnchen-3ya.de")
+    say(f, "an ascii domain is untouched",
+        punycode.encode_domain("example.com") == "example.com")
+    say(f, "detects non-ascii", punycode.needs_encoding("caf\u{e9}.fr"))
+    say(f, "and its absence", not punycode.needs_encoding("cafe.fr"))
+    // The security question a browser address bar has to ask.
+    say(f, "Cyrillic-a apple is flagged confusable",
+        punycode.is_confusable("\u{430}pple"))
+    say(f, "real apple is not", not punycode.is_confusable("apple"))
+    say(f, "and pure Cyrillic is not either", not punycode.is_confusable("\u{43F}\u{440}"))
+
+    print("-- top-k without sorting the whole list")
+    var t = topk.new_topk(3)
+    // Ten thousand items, three kept.
+    for i in 0..10000 {
+        topk.offer(t, (i * 7919) % 10007, "item{i}")
+    }
+    say(f, "holds exactly k", topk.held(t) == 3)
+    say(f, "saw them all", topk.seen(t) == 10000)
+    say(f, "and is no longer complete", not topk.is_complete(t))
+    let r = topk.results(t)
+    say(f, "results are largest first", r[0].1 >= r[1].1 and r[1].1 >= r[2].1)
+    say(f, "the threshold is the weakest winner", topk.threshold(t) == r[2].1)
+    // A known set, so the answer is checkable rather than plausible.
+    var small = topk.new_topk(2)
+    for pair in [(5, "e"), (9, "i"), (1, "a"), (7, "g")] {
+        topk.offer(small, pair.0, pair.1)
+    }
+    say(f, "the two largest", topk.results(small) == [("i", 9), ("g", 7)])
+    var short = topk.new_topk(10)
+    topk.offer(short, 1, "x")
+    say(f, "fewer than k is complete", topk.is_complete(short))
+
+    print("-- retry policies that terminate")
+    let p = backoff.exponential(5, 100, 2000)
+    say(f, "the first ceiling is the base", backoff.ceiling_ms(p, 0) == 100)
+    say(f, "it doubles", backoff.ceiling_ms(p, 1) == 200 and backoff.ceiling_ms(p, 2) == 400)
+    say(f, "and caps", backoff.ceiling_ms(p, 20) == 2000)
+    say(f, "full jitter at 0 is 0", backoff.delay_ms(p, 3, 0) == 0)
+    say(f, "and at most the ceiling", backoff.delay_ms(p, 3, 999) <= 800)
+    say(f, "without jitter it is the ceiling",
+        backoff.delay_ms(backoff.without_jitter(p), 2, 500) == 400)
+    say(f, "retries while attempts remain", backoff.may_retry(p, 2, 0))
+    // It must terminate.
+    say(f, "and STOPS at the limit", not backoff.may_retry(p, 5, 0))
+    let d = backoff.with_deadline(p, 1000)
+    say(f, "a deadline also stops it", not backoff.may_retry(d, 1, 1500))
+    say(f, "the worst case is knowable in advance", backoff.worst_case_ms(p) == 3100)
+    say(f, "429 is retryable", backoff.should_retry(429))
+    say(f, "503 is retryable", backoff.should_retry(503))
+    // Retrying a 400 is a loop that never terminates usefully.
+    say(f, "400 is NOT", not backoff.should_retry(400))
+    say(f, "404 is not", not backoff.should_retry(404))
+    say(f, "501 is not", not backoff.should_retry(501))
+
+    print("-- temporary names, and the race this does not run")
+    var n = tempname.new_namer("tmp-", ".dat", 42)
+    let a = tempname.next(n)
+    let b = tempname.next(n)
+    say(f, "carries the prefix", a.starts_with("tmp-"))
+    say(f, "and the suffix", a.ends_with(".dat"))
+    say(f, "two names never collide", a != b)
+    say(f, "joins a directory", tempname.next_in(n, "/tmp").starts_with("/tmp/tmp-"))
+    say(f, "and does not double the slash",
+        not tempname.next_in(n, "/tmp/").contains("//"))
+    say(f, "the crash-safe sibling", tempname.scratch_for("/a/b.txt") == "/a/b.txt.writing")
+    // Path traversal is where a user-supplied temporary name arrives.
+    say(f, "a plain name is safe", tempname.is_safe_name("upload.txt"))
+    say(f, "a separator is not", not tempname.is_safe_name("a/b"))
+    say(f, "dot-dot is not", not tempname.is_safe_name("../etc/passwd"))
+    say(f, "a leading dash is not", not tempname.is_safe_name("-rf"))
+    say(f, "an empty name is not", not tempname.is_safe_name(""))
+    say(f, "a control character is not", not tempname.is_safe_name("a\u{1}b"))
+
+    print("")
+    if f == 0 {
+        print("all held")
+    } else {
+        print("{f} failed")
+    }
+}

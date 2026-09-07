@@ -1,0 +1,160 @@
+// Punycode (RFC 3492) — how a Unicode domain becomes DNS-safe ASCII.
+//
+// `münchen.de` travels as `xn--mnchen-3ya.de`. DNS carries a restricted ASCII
+// set, so every internationalised domain is encoded before it is looked up.
+//
+// This matters for security as much as for reach: `аpple.com` with a Cyrillic
+// `а` is a *different domain* that renders identically. `is_confusable` below
+// answers the question a browser address bar has to ask.
+
+fn base() -> i64 { return 36 }
+fn tmin() -> i64 { return 1 }
+fn tmax() -> i64 { return 26 }
+fn skew() -> i64 { return 38 }
+fn damp() -> i64 { return 700 }
+fn initial_bias() -> i64 { return 72 }
+fn initial_n() -> i64 { return 128 }
+
+type PunyError = | NotPunycode(text: str)
+
+fn digit_char(d: i64) -> str {
+    return "abcdefghijklmnopqrstuvwxyz0123456789".chars()[d]
+}
+
+fn char_digit(c: str) -> i64 {
+    let a = "abcdefghijklmnopqrstuvwxyz0123456789".chars()
+    for i in 0..a.len() {
+        if a[i] == c.to_lower() {
+            return i
+        }
+    }
+    return 0 - 1
+}
+
+fn adapt(delta: i64, count: i64, first: bool) -> i64 {
+    var d = if first { delta / damp() } else { delta / 2 }
+    d = d + d / count
+    var k = 0
+    while d > (base() - tmin()) * tmax() / 2 {
+        d = d / (base() - tmin())
+        k = k + base()
+    }
+    return k + (base() - tmin() + 1) * d / (d + skew())
+}
+
+/// A label to punycode, without the `xn--` prefix.
+pub fn encode(label: str) -> str {
+    let codes = label.codes()
+    var out = ""
+    var basic = 0
+    for c in codes {
+        if c < 128 {
+            out = out + bytes_of([c]).to_str()
+            basic = basic + 1
+        }
+    }
+    if basic > 0 and basic < codes.len() {
+        out = out + "-"
+    }
+    if basic == codes.len() {
+        return out
+    }
+    var n = initial_n()
+    var delta = 0
+    var bias = initial_bias()
+    var handled = basic
+    while handled < codes.len() {
+        // The smallest code point not yet handled.
+        var m = 1114112
+        for c in codes {
+            if c >= n and c < m {
+                m = c
+            }
+        }
+        delta = delta + (m - n) * (handled + 1)
+        n = m
+        for c in codes {
+            if c < n {
+                delta = delta + 1
+            }
+            if c == n {
+                var q = delta
+                var k = base()
+                var writing = true
+                while writing {
+                    var t = k - bias
+                    if t < tmin() {
+                        t = tmin()
+                    }
+                    if t > tmax() {
+                        t = tmax()
+                    }
+                    if q < t {
+                        writing = false
+                    } else {
+                        out = out + digit_char(t + (q - t) % (base() - t))
+                        q = (q - t) / (base() - t)
+                        k = k + base()
+                    }
+                }
+                out = out + digit_char(q)
+                bias = adapt(delta, handled + 1, handled == basic)
+                delta = 0
+                handled = handled + 1
+            }
+        }
+        delta = delta + 1
+        n = n + 1
+    }
+    return out
+}
+
+/// A whole domain, prefixing each label that needed encoding.
+pub fn encode_domain(domain: str) -> str {
+    var parts: [str] = []
+    for label in domain.split(".") {
+        var ascii = true
+        for c in label.codes() {
+            if c >= 128 {
+                ascii = false
+            }
+        }
+        if ascii {
+            parts.push(label)
+        } else {
+            parts.push("xn--" + encode(label))
+        }
+    }
+    return parts.join(".")
+}
+
+/// Whether a domain carries any non-ASCII character at all.
+pub fn needs_encoding(domain: str) -> bool {
+    for c in domain.codes() {
+        if c >= 128 {
+            return true
+        }
+    }
+    return false
+}
+
+/// Whether a label mixes scripts in a way that renders like ASCII.
+///
+/// `аpple.com` with a Cyrillic `а` looks exactly like `apple.com`. A browser
+/// showing the decoded form without this check is showing a lie, which is the
+/// entire homograph attack.
+pub fn is_confusable(label: str) -> bool {
+    var has_latin = false
+    var has_other = false
+    for c in label.codes() {
+        if (c >= 97 and c <= 122) or (c >= 65 and c <= 90) {
+            has_latin = true
+        } else {
+            // Cyrillic and Greek carry the lookalikes that matter.
+            if (c >= 1024 and c <= 1279) or (c >= 880 and c <= 1023) {
+                has_other = true
+            }
+        }
+    }
+    return has_latin and has_other
+}

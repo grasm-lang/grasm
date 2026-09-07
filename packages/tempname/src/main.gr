@@ -1,0 +1,97 @@
+// Names for temporary files, and an honest note about what that is not.
+//
+// This builds a *name*. It does not create the file, which is the whole
+// security question: checking that a path is free and then creating it is a
+// race an attacker wins by creating it in between, and the only safe fix is an
+// atomic exclusive create in the caller — `O_EXCL`, or `write_bytes` to a
+// path that does not exist and handling the failure.
+//
+// So this package deliberately opens nothing, and says the dangerous part is
+// the caller's.
+
+type Namer = {
+    prefix: str,
+    suffix: str,
+    /// Advanced on every name, so two calls never collide within a process.
+    counter: i64,
+    seed: i64,
+}
+
+pub fn new_namer(prefix: str, suffix: str, seed: i64) -> Namer {
+    return Namer{ prefix: prefix, suffix: suffix, counter: 0, seed: seed }
+}
+
+fn next_seed(s: i64) -> i64 {
+    // A linear congruential step: reproducible from the seed, which is what
+    // makes a test deterministic.
+    return (s * 1103515245 + 12345) % 2147483648
+}
+
+fn base36(v: i64) -> str {
+    let d = "0123456789abcdefghijklmnopqrstuvwxyz".chars()
+    if v == 0 {
+        return "0"
+    }
+    var n = if v < 0 { 0 - v } else { v }
+    var out = ""
+    while n > 0 {
+        out = d[n % 36] + out
+        n = n / 36
+    }
+    return out
+}
+
+/// The next name. Unique within this process; the caller must still create it
+/// atomically.
+pub fn next(inout n: Namer) -> str {
+    n.counter = n.counter + 1
+    n.seed = next_seed(n.seed)
+    let rand = base36(n.seed % 2176782336)
+    return "{n.prefix}{base36(n.counter)}{rand}{n.suffix}"
+}
+
+/// A name under a directory.
+pub fn next_in(inout n: Namer, directory: str) -> str {
+    let name = next(n)
+    if directory.ends_with("/") {
+        return directory + name
+    }
+    return "{directory}/{name}"
+}
+
+/// The `.writing` sibling used for a crash-safe write.
+///
+/// The pattern is: write beside, sync, rename over. A rename within a
+/// directory is atomic, so a reader never sees a half-written file under a
+/// name that promises complete contents.
+pub fn scratch_for(final_path: str) -> str {
+    return final_path + ".writing"
+}
+
+/// Whether a name is safe to join to a directory.
+///
+/// A name containing a separator or `..` escapes the directory it was meant
+/// for, which is path traversal — and a temporary name built from anything
+/// user-supplied is exactly where that arrives.
+pub fn is_safe_name(name: str) -> bool {
+    if name == "" or name == "." or name == ".." {
+        return false
+    }
+    if name.contains("/") or name.contains("\\") {
+        return false
+    }
+    if name.contains("..") {
+        return false
+    }
+    // A leading dash is read as a flag by anything shelling out.
+    if name.starts_with("-") {
+        return false
+    }
+    for c in name.codes() {
+        // Control characters and NUL end a path early in C.
+        if c < 32 or c == 127 {
+            return false
+        }
+    }
+    return true
+}
