@@ -1,0 +1,6 @@
+[package]
+name = "cbor"
+version = "1.0.0"
+
+# RFC 8949 CBOR, both directions. Opens nothing.
+capabilities = []

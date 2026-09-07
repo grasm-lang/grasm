@@ -1,0 +1,525 @@
+// MessagePack: JSON's data model, in about half the bytes.
+//
+// The two things it has that JSON does not are the reasons to use it. It
+// carries **binary** as binary, so a 1 KB image costs 1 KB rather than the
+// 1,366 characters base64 makes of it. And it keeps **integers as integers**,
+// so a 64-bit identifier survives a round trip — JSON's numbers are doubles,
+// and anything past 2^53 comes back changed.
+//
+// The format is a tag byte and then the value. Small values live in the tag:
+// an integer under 128 is one byte, a string under 32 characters is one byte
+// plus its text, and a five-element array is one byte plus its elements. That
+// is where the size saving comes from, and it is why the encoder here always
+// picks the shortest form — an encoder that reaches for the 32-bit length
+// every time produces valid MessagePack that is bigger than the JSON.
+
+type MsgValue =
+    | MsgNil
+    | MsgBool(b: bool)
+    | MsgInt(n: i64)
+    | MsgFloat(f: f64)
+    | MsgStr(s: str)
+    | MsgBin(data: bytes)
+    | MsgArray(items: [ref MsgValue])
+    | MsgMap(keys: [ref MsgValue], values: [ref MsgValue])
+    | MsgExt(tag: i64, data: bytes)
+
+type MsgError =
+    | Truncated(at: i64)
+    | BadTag(tag: i64, at: i64)
+    | TooLarge(len: i64)
+    | NotUtf8(at: i64)
+
+pub fn nil() -> ref MsgValue {
+    return ref(MsgNil)
+}
+
+pub fn boolean(b: bool) -> ref MsgValue {
+    return ref(MsgBool(b))
+}
+
+pub fn integer(n: i64) -> ref MsgValue {
+    return ref(MsgInt(n))
+}
+
+pub fn floating(f: f64) -> ref MsgValue {
+    return ref(MsgFloat(f))
+}
+
+pub fn text(s: str) -> ref MsgValue {
+    return ref(MsgStr(s))
+}
+
+pub fn binary(data: bytes) -> ref MsgValue {
+    return ref(MsgBin(data))
+}
+
+pub fn array(items: [ref MsgValue]) -> ref MsgValue {
+    return ref(MsgArray(items))
+}
+
+pub fn mapping(keys: [ref MsgValue], values: [ref MsgValue]) -> ref MsgValue {
+    var ks: [ref MsgValue] = []
+    var vs: [ref MsgValue] = []
+    let n = if keys.len() < values.len() { keys.len() } else { values.len() }
+    for i in 0..n {
+        ks.push(keys[i])
+        vs.push(values[i])
+    }
+    return ref(MsgMap(ks, vs))
+}
+
+pub fn extension(tag: i64, data: bytes) -> ref MsgValue {
+    return ref(MsgExt(tag, data))
+}
+
+fn push_be(inout out: [i64], value: i64, width: i64) {
+    for i in 0..width {
+        out.push(value.ushr((width - 1 - i) * 8).bit_and(255))
+    }
+}
+
+fn write_len(inout out: [i64], len: i64, fix_base: i64, fix_max: i64,
+    tag8: i64, tag16: i64, tag32: i64) {
+    if len < fix_max and fix_base >= 0 {
+        out.push(fix_base + len)
+        return
+    }
+    if len < 256 and tag8 >= 0 {
+        out.push(tag8)
+        out.push(len)
+        return
+    }
+    if len < 65536 {
+        out.push(tag16)
+        push_be(out, len, 2)
+        return
+    }
+    out.push(tag32)
+    push_be(out, len, 4)
+}
+
+fn write_int(inout out: [i64], n: i64) {
+    // The shortest form that holds it. Positive fixint reaches 127, negative
+    // fixint reaches -32, and each width above that doubles the range.
+    if n >= 0 and n < 128 {
+        out.push(n)
+        return
+    }
+    if n < 0 and n >= 0 - 32 {
+        out.push(256 + n)
+        return
+    }
+    if n >= 0 {
+        if n < 256 {
+            out.push(204)
+            out.push(n)
+        } else if n < 65536 {
+            out.push(205)
+            push_be(out, n, 2)
+        } else if n < 4294967296 {
+            out.push(206)
+            push_be(out, n, 4)
+        } else {
+            out.push(207)
+            push_be(out, n, 8)
+        }
+        return
+    }
+    if n >= 0 - 128 {
+        out.push(208)
+        out.push(256 + n)
+    } else if n >= 0 - 32768 {
+        out.push(209)
+        push_be(out, 65536 + n, 2)
+    } else if n >= 0 - 2147483648 {
+        out.push(210)
+        push_be(out, 4294967296 + n, 4)
+    } else {
+        out.push(211)
+        push_be(out, n, 8)
+    }
+}
+
+fn encode_into(inout out: [i64], v: ref MsgValue) {
+    match v {
+        MsgNil -> out.push(192)
+        MsgBool(b) -> out.push(if b { 195 } else { 194 })
+        MsgInt(n) -> write_int(out, n)
+        MsgFloat(f) -> {
+            // Always float64. A float32 encoder has to decide when the
+            // narrowing is lossless, and getting that wrong changes the
+            // value silently.
+            out.push(203)
+            push_be(out, f.to_bits(), 8)
+        }
+        MsgStr(s) -> {
+            let raw = s.to_bytes()
+            write_len(out, raw.len(), 160, 32, 217, 218, 219)
+            for i in 0..raw.len() {
+                out.push(raw.at(i))
+            }
+        }
+        MsgBin(data) -> {
+            write_len(out, data.len(), 0 - 1, 0, 196, 197, 198)
+            for i in 0..data.len() {
+                out.push(data.at(i))
+            }
+        }
+        MsgArray(items) -> {
+            write_len(out, items.len(), 144, 16, 0 - 1, 220, 221)
+            for item in items {
+                encode_into(out, item)
+            }
+        }
+        MsgMap(keys, values) -> {
+            write_len(out, keys.len(), 128, 16, 0 - 1, 222, 223)
+            for i in 0..keys.len() {
+                encode_into(out, keys[i])
+                encode_into(out, values[i])
+            }
+        }
+        MsgExt(tag, data) -> {
+            let n = data.len()
+            if n == 1 {
+                out.push(212)
+            } else if n == 2 {
+                out.push(213)
+            } else if n == 4 {
+                out.push(214)
+            } else if n == 8 {
+                out.push(215)
+            } else if n == 16 {
+                out.push(216)
+            } else if n < 256 {
+                out.push(199)
+                out.push(n)
+            } else if n < 65536 {
+                out.push(200)
+                push_be(out, n, 2)
+            } else {
+                out.push(201)
+                push_be(out, n, 4)
+            }
+            out.push(if tag < 0 { 256 + tag } else { tag })
+            for i in 0..n {
+                out.push(data.at(i))
+            }
+        }
+    }
+}
+
+pub fn encode(v: ref MsgValue) -> bytes {
+    var out: [i64] = []
+    encode_into(out, v)
+    return bytes_of(out)
+}
+
+type MsgReader = { data: bytes, at: i64 }
+
+fn need(inout r: MsgReader, n: i64) -> () ! MsgError {
+    if r.at + n > r.data.len() {
+        fail(Truncated(r.at))
+    }
+}
+
+fn take_be(inout r: MsgReader, width: i64) -> i64 ! MsgError {
+    try need(r, width)
+    var v = 0
+    for i in 0..width {
+        v = v.shl(8).bit_or(r.data.at(r.at + i))
+    }
+    r.at = r.at + width
+    return v
+}
+
+fn take_bytes(inout r: MsgReader, n: i64) -> bytes ! MsgError {
+    try need(r, n)
+    let out = r.data.slice(r.at, n)
+    r.at = r.at + n
+    return out
+}
+
+fn signed(v: i64, width: i64) -> i64 {
+    let top = 2 ^ (width * 8 - 1)
+    if v >= top {
+        return v - top * 2
+    }
+    return v
+}
+
+fn decode_one(inout r: MsgReader) -> ref MsgValue ! MsgError {
+    try need(r, 1)
+    let tag = r.data.at(r.at)
+    r.at = r.at + 1
+    if tag < 128 {
+        return ref(MsgInt(tag))
+    }
+    if tag >= 224 {
+        return ref(MsgInt(tag - 256))
+    }
+    if tag >= 128 and tag < 144 {
+        return try decode_map(r, tag - 128)
+    }
+    if tag >= 144 and tag < 160 {
+        return try decode_array(r, tag - 144)
+    }
+    if tag >= 160 and tag < 192 {
+        return ref(MsgStr((try take_bytes(r, tag - 160)).to_str()))
+    }
+    if tag == 192 {
+        return ref(MsgNil)
+    }
+    if tag == 194 {
+        return ref(MsgBool(false))
+    }
+    if tag == 195 {
+        return ref(MsgBool(true))
+    }
+    if tag == 196 or tag == 197 or tag == 198 {
+        let width = 2 ^ (tag - 196)
+        let n = try take_be(r, width)
+        return ref(MsgBin(try take_bytes(r, n)))
+    }
+    if tag == 199 or tag == 200 or tag == 201 {
+        let width = 2 ^ (tag - 199)
+        let n = try take_be(r, width)
+        let kind = signed(try take_be(r, 1), 1)
+        return ref(MsgExt(kind, try take_bytes(r, n)))
+    }
+    if tag == 202 {
+        // float32: reassembled into a double, which is exact.
+        let bits = try take_be(r, 4)
+        return ref(MsgFloat(float32_of(bits)))
+    }
+    if tag == 203 {
+        return ref(MsgFloat((try take_be(r, 8)).from_bits()))
+    }
+    if tag >= 204 and tag <= 207 {
+        let width = 2 ^ (tag - 204)
+        return ref(MsgInt(try take_be(r, width)))
+    }
+    if tag >= 208 and tag <= 211 {
+        let width = 2 ^ (tag - 208)
+        let raw = try take_be(r, width)
+        if width == 8 {
+            return ref(MsgInt(raw))
+        }
+        return ref(MsgInt(signed(raw, width)))
+    }
+    if tag >= 212 and tag <= 216 {
+        let n = 2 ^ (tag - 212)
+        let kind = signed(try take_be(r, 1), 1)
+        return ref(MsgExt(kind, try take_bytes(r, n)))
+    }
+    if tag == 217 or tag == 218 or tag == 219 {
+        let width = 2 ^ (tag - 217)
+        let n = try take_be(r, width)
+        return ref(MsgStr((try take_bytes(r, n)).to_str()))
+    }
+    if tag == 220 or tag == 221 {
+        let width = 2 ^ (tag - 219)
+        let n = try take_be(r, width)
+        return try decode_array(r, n)
+    }
+    if tag == 222 or tag == 223 {
+        let width = 2 ^ (tag - 221)
+        let n = try take_be(r, width)
+        return try decode_map(r, n)
+    }
+    fail(BadTag(tag, r.at - 1))
+}
+
+/// An IEEE-754 single, widened. Written out rather than reinterpreted,
+/// because the language's `from_bits` is a double's.
+fn float32_of(bits: i64) -> f64 {
+    let sign = if bits.ushr(31).bit_and(1) == 1 { 0.0 - 1.0 } else { 1.0 }
+    let exponent = bits.ushr(23).bit_and(255)
+    let fraction = bits.bit_and(8388607)
+    if exponent == 0 {
+        if fraction == 0 {
+            return sign * 0.0
+        }
+        return sign * fraction.as_f64() * (2.0 ^ (0.0 - 149.0))
+    }
+    if exponent == 255 {
+        if fraction == 0 {
+            return sign * (1.0 / 0.0)
+        }
+        return 0.0 / 0.0
+    }
+    let mantissa = 1.0 + fraction.as_f64() / 8388608.0
+    return sign * mantissa * (2.0 ^ (exponent - 127).as_f64())
+}
+
+fn decode_array(inout r: MsgReader, n: i64) -> ref MsgValue ! MsgError {
+    var items: [ref MsgValue] = []
+    for _i in 0..n {
+        items.push(try decode_one(r))
+    }
+    return ref(MsgArray(items))
+}
+
+fn decode_map(inout r: MsgReader, n: i64) -> ref MsgValue ! MsgError {
+    var keys: [ref MsgValue] = []
+    var values: [ref MsgValue] = []
+    for _i in 0..n {
+        keys.push(try decode_one(r))
+        values.push(try decode_one(r))
+    }
+    return ref(MsgMap(keys, values))
+}
+
+pub fn decode(data: bytes) -> ref MsgValue ! MsgError {
+    var r = MsgReader{ data: data, at: 0 }
+    return try decode_one(r)
+}
+
+/// Decode, and say how many bytes were consumed — what a stream of values
+/// concatenated together needs.
+pub fn decode_prefix(data: bytes) -> (ref MsgValue, i64) ! MsgError {
+    var r = MsgReader{ data: data, at: 0 }
+    let v = try decode_one(r)
+    return (v, r.at)
+}
+
+pub fn kind(v: ref MsgValue) -> str {
+    match v {
+        MsgNil -> return "nil"
+        MsgBool(_b) -> return "bool"
+        MsgInt(_n) -> return "int"
+        MsgFloat(_f) -> return "float"
+        MsgStr(_s) -> return "str"
+        MsgBin(_d) -> return "bin"
+        MsgArray(_i) -> return "array"
+        MsgMap(_k, _v) -> return "map"
+        MsgExt(_t, _d) -> return "ext"
+    }
+}
+
+pub fn as_int(v: ref MsgValue) -> Option[i64] {
+    match v {
+        MsgInt(n) -> return Some(n)
+        _ -> return None
+    }
+}
+
+pub fn as_float(v: ref MsgValue) -> Option[f64] {
+    match v {
+        MsgFloat(f) -> return Some(f)
+        MsgInt(n) -> return Some(n.as_f64())
+        _ -> return None
+    }
+}
+
+pub fn as_str(v: ref MsgValue) -> Option[str] {
+    match v {
+        MsgStr(s) -> return Some(s)
+        _ -> return None
+    }
+}
+
+pub fn as_bytes(v: ref MsgValue) -> Option[bytes] {
+    match v {
+        MsgBin(d) -> return Some(d)
+        _ -> return None
+    }
+}
+
+pub fn as_bool(v: ref MsgValue) -> Option[bool] {
+    match v {
+        MsgBool(b) -> return Some(b)
+        _ -> return None
+    }
+}
+
+pub fn items(v: ref MsgValue) -> [ref MsgValue] {
+    match v {
+        MsgArray(list) -> return list
+        _ -> return []
+    }
+}
+
+/// The value for a string key, which is what a map in practice is keyed by.
+pub fn get(v: ref MsgValue, key: str) -> Option[ref MsgValue] {
+    match v {
+        MsgMap(keys, values) -> {
+            for i in 0..keys.len() {
+                match keys[i] {
+                    MsgStr(s) -> {
+                        if s == key {
+                            return Some(values[i])
+                        }
+                    }
+                    _ -> {}
+                }
+            }
+            return None
+        }
+        _ -> return None
+    }
+}
+
+pub fn size(v: ref MsgValue) -> i64 {
+    match v {
+        MsgArray(list) -> return list.len()
+        MsgMap(keys, _values) -> return keys.len()
+        MsgStr(s) -> return s.len()
+        MsgBin(d) -> return d.len()
+        _ -> return 0
+    }
+}
+
+pub fn equal(a: ref MsgValue, b: ref MsgValue) -> bool {
+    match a {
+        MsgNil -> return kind(b) == "nil"
+        MsgBool(x) -> return as_bool(b) == Some(x)
+        MsgInt(x) -> return as_int(b) == Some(x)
+        MsgFloat(x) -> {
+            match b {
+                MsgFloat(y) -> return x == y
+                _ -> return false
+            }
+        }
+        MsgStr(x) -> return as_str(b) == Some(x)
+        MsgBin(x) -> return as_bytes(b) == Some(x)
+        MsgArray(xs) -> {
+            match b {
+                MsgArray(ys) -> {
+                    if xs.len() != ys.len() {
+                        return false
+                    }
+                    for i in 0..xs.len() {
+                        if not equal(xs[i], ys[i]) {
+                            return false
+                        }
+                    }
+                    return true
+                }
+                _ -> return false
+            }
+        }
+        MsgMap(xk, xv) -> {
+            match b {
+                MsgMap(yk, yv) -> {
+                    if xk.len() != yk.len() {
+                        return false
+                    }
+                    for i in 0..xk.len() {
+                        if not equal(xk[i], yk[i]) or not equal(xv[i], yv[i]) {
+                            return false
+                        }
+                    }
+                    return true
+                }
+                _ -> return false
+            }
+        }
+        MsgExt(xt, xd) -> {
+            match b {
+                MsgExt(yt, yd) -> return xt == yt and xd == yd
+                _ -> return false
+            }
+        }
+    }
+}

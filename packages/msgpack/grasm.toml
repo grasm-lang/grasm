@@ -1,0 +1,6 @@
+[package]
+name = "msgpack"
+version = "1.0.0"
+
+# MessagePack, both directions. Opens nothing.
+capabilities = []

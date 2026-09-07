@@ -14,7 +14,7 @@ plan that discovers them 300 packages in.
 | | |
 |---|---|
 | Started | 78 |
-| Now | 178 |
+| Now | 183 |
 | Tier 1 target | 200 |
 | Tier 2 target | 500 |
 | Tier 3 target | 800 |
@@ -134,7 +134,7 @@ could ask "am I in a region" with a load instead of a `RefCell` borrow,
 measured **zero** on a benchmark allocating 800,000 times. The bookkeeping
 around allocation is not where the time goes.
 
-## Tier 1 — to 200 (22 remaining)
+## Tier 1 — to 200 (17 remaining)
 
 All buildable now. No prerequisite blocks any of it.
 
@@ -146,8 +146,6 @@ prevent: `assertlib` and `fixture` are `testing`, `flags` is `cli`,
 `pluralize`, and `dirwalk` and `globwalk` are both `fs`. `totp` was written
 before this was noticed and has been folded into `hotp` rather than shipped
 beside it.
-
-**Data formats** — `yamlish` `msgpack` `cbor` `markdown` `template`
 
 **Media** — `png` `wav` `qrcode` `perlin` `dither` `asciiart`
 

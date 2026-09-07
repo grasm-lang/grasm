@@ -1,0 +1,6 @@
+[package]
+name = "template"
+version = "1.0.0"
+
+# Text templates that escape by default. Opens nothing.
+capabilities = []

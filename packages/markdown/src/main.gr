@@ -1,0 +1,697 @@
+// Markdown to HTML — the constructs a README, a changelog and a doc comment
+// actually contain.
+//
+// CommonMark's specification is 700 sections long and most of it exists to
+// pin down what happens when two constructs collide in ways nobody writes on
+// purpose. This implements the part people write: headings, paragraphs,
+// emphasis, code spans, fenced and indented code, lists, links, images,
+// block quotes, thematic breaks, hard line breaks and tables.
+//
+// **It escapes on the way out.** Every piece of text is HTML-escaped unless
+// it is inside a construct that produces markup, so a README containing
+// `<script>` renders as text and not as a script — which is the difference
+// between a documentation renderer and a stored cross-site scripting hole.
+// Raw HTML in the source is escaped rather than passed through, and that is a
+// deliberate difference from CommonMark: a renderer that passes it through
+// can only be used on input you wrote yourself.
+
+type MarkdownOptions = {
+    /// Wrap the output in `<p>` for a single paragraph. Off for a doc comment
+    /// rendered inline.
+    paragraphs: bool,
+    /// A prefix put on every heading's `id`, so two documents on one page do
+    /// not collide.
+    heading_prefix: str,
+    /// Turn a bare URL into a link.
+    autolink: bool,
+}
+
+pub fn default_options() -> MarkdownOptions {
+    return MarkdownOptions{
+        paragraphs: true, heading_prefix: "", autolink: true,
+    }
+}
+
+/// The four characters that change meaning inside HTML text.
+///
+/// `'` is not escaped: it needs escaping only inside a single-quoted
+/// attribute, and nothing here writes one.
+pub fn escape_html(text: str) -> str {
+    return text.replace("&", "&amp;").replace("<", "&lt;")
+        .replace(">", "&gt;").replace("\"", "&quot;")
+}
+
+fn escape_attr(text: str) -> str {
+    return escape_html(text)
+}
+
+/// A heading's anchor: lowercase, spaces to hyphens, everything else dropped.
+pub fn slug_of(text: str) -> str {
+    var out = ""
+    var last_dash = true
+    for c in text.to_lower().chars() {
+        if (c >= "a" and c <= "z") or (c >= "0" and c <= "9") {
+            out = out + c
+            last_dash = false
+        } else if c == " " or c == "-" or c == "_" {
+            if not last_dash {
+                out = out + "-"
+                last_dash = true
+            }
+        }
+    }
+    if out.ends_with("-") {
+        out = out.substr(0, out.len() - 1)
+    }
+    return out
+}
+
+fn is_punct(c: str) -> bool {
+    return c == "\\" or c == "`" or c == "*" or c == "_" or c == "[" or
+    c == "]" or c == "(" or c == ")" or c == "#" or c == "+" or
+    c == "-" or c == "." or c == "!" or c == ">" or c == "|"
+}
+
+/// A run of `n` backticks starting at `at`, or 0.
+fn backtick_run(cs: [str], at: i64) -> i64 {
+    var n = 0
+    while at + n < cs.len() and cs[at + n] == "`" {
+        n = n + 1
+    }
+    return n
+}
+
+fn find_link_end(cs: [str], from: i64, open: str, close: str) -> i64 {
+    var depth = 0
+    var i = from
+    while i < cs.len() {
+        if cs[i] == "\\" {
+            i = i + 2
+            continue
+        }
+        if cs[i] == open {
+            depth = depth + 1
+        } else if cs[i] == close {
+            if depth == 0 {
+                return i
+            }
+            depth = depth - 1
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+/// A code span starting at `at`, and where it ends. `(_, at)` when the
+/// backticks never close, which makes them ordinary text.
+fn code_span(cs: [str], at: i64) -> (str, i64) {
+    let open = backtick_run(cs, at)
+    var j = at + open
+    var found = 0 - 1
+    while j < cs.len() {
+        if cs[j] == "`" and backtick_run(cs, j) == open {
+            found = j
+            break
+        }
+        j = j + 1
+    }
+    if found < 0 {
+        return ("", at)
+    }
+    var body = ""
+    for k in (at + open)..found {
+        body = body + cs[k]
+    }
+    // One leading and trailing space is stripped, so `` ` `` is a backtick
+    // rather than a spaced one.
+    if body.len() >= 2 and body.starts_with(" ") and body.ends_with(" ") {
+        body = body.substr(1, body.len() - 2)
+    }
+    return ("<code>" + escape_html(body) + "</code>", found + open)
+}
+
+/// `[text](href "title")` or `![alt](src "title")`, and where it ends.
+fn link_or_image(cs: [str], at: i64, o: MarkdownOptions) -> (str, i64) {
+    let image = cs[at] == "!"
+    let start = if image { at + 2 } else { at + 1 }
+    let close = find_link_end(cs, start, "[", "]")
+    if close < 0 or close + 1 >= cs.len() or cs[close + 1] != "(" {
+        return ("", at)
+    }
+    let paren = find_link_end(cs, close + 2, "(", ")")
+    if paren < 0 {
+        return ("", at)
+    }
+    var label = ""
+    for k in start..close {
+        label = label + cs[k]
+    }
+    var target = ""
+    for k in (close + 2)..paren {
+        target = target + cs[k]
+    }
+    let parts = split_title(target)
+    var out = ""
+    if image {
+        out = "<img src=\"" + escape_attr(parts.0) + "\" alt=\"" +
+        escape_attr(label) + "\""
+    } else {
+        out = "<a href=\"" + escape_attr(parts.0) + "\""
+    }
+    if parts.1 != "" {
+        out = out + " title=\"" + escape_attr(parts.1) + "\""
+    }
+    if image {
+        return (out + " />", paren + 1)
+    }
+    return (out + ">" + inline(label, o) + "</a>", paren + 1)
+}
+
+/// A bare `http://` or `https://` run, and where it ends.
+fn autolink(cs: [str], at: i64) -> (str, i64) {
+    var end = at
+    while end < cs.len() and cs[end] != " " and cs[end] != "<" {
+        end = end + 1
+    }
+    // Trailing punctuation belongs to the sentence, not the address.
+    while end > at and (cs[end - 1] == "." or cs[end - 1] == "," or
+        cs[end - 1] == ")" or cs[end - 1] == ":") {
+        end = end - 1
+    }
+    var url = ""
+    for k in at..end {
+        url = url + cs[k]
+    }
+    if not (url.starts_with("http://") or url.starts_with("https://")) {
+        return ("", at)
+    }
+    return ("<a href=\"" + escape_attr(url) + "\">" + escape_html(url) + "</a>", end)
+}
+
+/// Inline markup, escaping everything that is not markup.
+pub fn inline(text: str, o: MarkdownOptions) -> str {
+    let cs = text.chars()
+    var out = ""
+    var i = 0
+    while i < cs.len() {
+        let c = cs[i]
+        // A backslash escapes punctuation and nothing else.
+        if c == "\\" and i + 1 < cs.len() and is_punct(cs[i + 1]) {
+            out = out + escape_html(cs[i + 1])
+            i = i + 2
+            continue
+        }
+        // Code spans first: nothing inside one is markup.
+        if c == "`" {
+            let span = code_span(cs, i)
+            if span.1 > i {
+                out = out + span.0
+                i = span.1
+                continue
+            }
+        }
+        // Images, then links: `![alt](src)` before `[text](href)`.
+        if (c == "!" and i + 1 < cs.len() and cs[i + 1] == "[") or c == "[" {
+            let piece = link_or_image(cs, i, o)
+            if piece.1 > i {
+                out = out + piece.0
+                i = piece.1
+                continue
+            }
+        }
+        // Emphasis. Two markers for strong, one for emphasis; `_` inside a
+        // word is not a marker, which is what keeps `snake_case_name` intact.
+        if c == "*" or c == "_" {
+            let doubled = i + 1 < cs.len() and cs[i + 1] == c
+            let marker = if doubled { c + c } else { c }
+            let inside_word = c == "_" and i > 0 and is_word_char(cs[i - 1])
+            if not inside_word {
+                let rest = text.substr(i + marker.len(), text.len() - i - marker.len())
+                match rest.index_of(marker) {
+                    Some(offset) -> {
+                        if offset > 0 {
+                            let body = rest.substr(0, offset)
+                            let tag = if doubled { "strong" } else { "em" }
+                            out = out + "<{tag}>" + inline(body, o) + "</{tag}>"
+                            i = i + marker.len() + offset + marker.len()
+                            continue
+                        }
+                    }
+                    None -> {}
+                }
+            }
+        }
+        // An autolink, so a bare URL in a README is clickable.
+        if o.autolink and c == "h" and starts_at(cs, i, "http") {
+            let piece = autolink(cs, i)
+            if piece.1 > i {
+                out = out + piece.0
+                i = piece.1
+                continue
+            }
+        }
+        out = out + escape_html(c)
+        i = i + 1
+    }
+    return out
+}
+
+fn is_word_char(c: str) -> bool {
+    return (c >= "a" and c <= "z") or (c >= "A" and c <= "Z") or
+    (c >= "0" and c <= "9")
+}
+
+fn starts_at(cs: [str], at: i64, want: str) -> bool {
+    let w = want.chars()
+    if at + w.len() > cs.len() {
+        return false
+    }
+    for i in 0..w.len() {
+        if cs[at + i] != w[i] {
+            return false
+        }
+    }
+    return true
+}
+
+/// `url "title"` split into its two parts.
+fn split_title(target: str) -> (str, str) {
+    let t = target.trim()
+    match t.index_of(" \"") {
+        Some(at) -> {
+            let rest = t.substr(at + 2, t.len() - at - 2)
+            if rest.ends_with("\"") {
+                return (t.substr(0, at).trim(), rest.substr(0, rest.len() - 1))
+            }
+            return (t, "")
+        }
+        None -> return (t, "")
+    }
+}
+
+fn heading_level(line: str) -> i64 {
+    var n = 0
+    let cs = line.chars()
+    while n < cs.len() and cs[n] == "#" {
+        n = n + 1
+    }
+    if n == 0 or n > 6 {
+        return 0
+    }
+    if n < cs.len() and cs[n] != " " {
+        return 0
+    }
+    return n
+}
+
+fn fence_of(line: str) -> str {
+    let t = line.trim_start()
+    if t.starts_with("```") {
+        return "```"
+    }
+    if t.starts_with("~~~") {
+        return "~~~"
+    }
+    return ""
+}
+
+fn is_thematic_break(line: str) -> bool {
+    let t = line.trim().replace(" ", "")
+    if t.len() < 3 {
+        return false
+    }
+    for marker in ["-", "*", "_"] {
+        var all = true
+        for c in t.chars() {
+            if c != marker {
+                all = false
+            }
+        }
+        if all {
+            return true
+        }
+    }
+    return false
+}
+
+fn bullet_of(line: str) -> i64 {
+    let t = line.trim_start()
+    if t.starts_with("- ") or t.starts_with("* ") or t.starts_with("+ ") {
+        return 2
+    }
+    return 0
+}
+
+/// The width of an ordered-list marker like `12. `, or 0.
+fn ordered_of(line: str) -> i64 {
+    let t = line.trim_start()
+    let cs = t.chars()
+    var i = 0
+    while i < cs.len() and cs[i] >= "0" and cs[i] <= "9" {
+        i = i + 1
+    }
+    if i == 0 or i + 1 >= cs.len() {
+        return 0
+    }
+    if (cs[i] == "." or cs[i] == ")") and cs[i + 1] == " " {
+        return i + 2
+    }
+    return 0
+}
+
+fn indent_of(line: str) -> i64 {
+    var n = 0
+    for c in line.chars() {
+        if c == " " {
+            n = n + 1
+        } else if c == "\t" {
+            n = n + 4
+        } else {
+            return n
+        }
+    }
+    return n
+}
+
+/// A paragraph's lines, joined. A line ending in two spaces is a hard break,
+/// which is the one piece of Markdown whitespace that carries meaning.
+fn flush_paragraph(acc: [str], o: MarkdownOptions) -> str {
+    var pieces: [str] = []
+    for line in acc {
+        if line.ends_with("  ") {
+            pieces.push(inline(line.trim_end(), o) + "<br />")
+        } else {
+            pieces.push(inline(line.trim(), o))
+        }
+    }
+    return pieces.join("\n")
+}
+
+/// A fenced code block, and the line after it.
+fn fenced_block(lines: [str], at: i64, fence: str) -> (str, i64) {
+    let info = lines[at].trim().substr(3, lines[at].trim().len() - 3).trim()
+    var body: [str] = []
+    var j = at + 1
+    while j < lines.len() and fence_of(lines[j]) != fence {
+        body.push(lines[j])
+        j = j + 1
+    }
+    var opening = "<pre><code>"
+    if info != "" {
+        // The word after the fence is the language; anything after it is a
+        // comment as far as every renderer is concerned.
+        let language = info.words()[0]
+        opening = "<pre><code class=\"language-" + escape_attr(language) + "\">"
+    }
+    let out = opening + escape_html(body.join("\n") + "\n") + "</code></pre>"
+    return (out, if j < lines.len() { j + 1 } else { j })
+}
+
+/// An indented code block, and the line after it.
+fn indented_block(lines: [str], at: i64) -> (str, i64) {
+    var body: [str] = []
+    var j = at
+    while j < lines.len() and (indent_of(lines[j]) >= 4 or lines[j].trim() == "") {
+        if lines[j].trim() == "" and
+        (j + 1 >= lines.len() or indent_of(lines[j + 1]) < 4) {
+            break
+        }
+        body.push(lines[j].substr(4, lines[j].len() - 4))
+        j = j + 1
+    }
+    return ("<pre><code>" + escape_html(body.join("\n") + "\n") + "</code></pre>", j)
+}
+
+/// A block quote's inner lines, and the line after it.
+fn quoted_block(lines: [str], at: i64) -> ([str], i64) {
+    var quoted: [str] = []
+    var j = at
+    while j < lines.len() and (lines[j].trim().starts_with(">") or
+        (quoted.len() > 0 and lines[j].trim() != "")) {
+        let q = lines[j].trim()
+        if q.starts_with("> ") {
+            quoted.push(q.substr(2, q.len() - 2))
+        } else if q == ">" {
+            quoted.push("")
+        } else {
+            // A lazy continuation: a line with no `>` still belongs to the
+            // quote it follows.
+            quoted.push(q)
+        }
+        j = j + 1
+    }
+    return (quoted, j)
+}
+
+/// A heading's text, with the `#` run and any closing run removed.
+fn heading_text(trimmed: str, level: i64) -> str {
+    var body = trimmed.substr(level + 1, trimmed.len() - level - 1).trim()
+    while body.ends_with("#") {
+        body = body.substr(0, body.len() - 1).trim_end()
+    }
+    return body
+}
+
+/// Close the paragraph being collected, if there is one.
+///
+/// One place, because the same four lines opened every block below and the
+/// one that forgot them would run a heading into the paragraph above it.
+fn close_paragraph(inout out: [str], paragraph: [str], o: MarkdownOptions) {
+    if paragraph.len() == 0 {
+        return
+    }
+    if o.paragraphs {
+        out.push("<p>" + flush_paragraph(paragraph, o) + "</p>")
+    } else {
+        out.push(flush_paragraph(paragraph, o))
+    }
+}
+
+fn render_lines(lines: [str], o: MarkdownOptions) -> str {
+    var out: [str] = []
+    var i = 0
+    var paragraph: [str] = []
+    while i < lines.len() {
+        let line = lines[i]
+        let trimmed = line.trim()
+        if trimmed == "" {
+            close_paragraph(out, paragraph, o)
+            paragraph = []
+            i = i + 1
+            continue
+        }
+        let fence = fence_of(line)
+        if fence != "" {
+            close_paragraph(out, paragraph, o)
+            paragraph = []
+            let block = fenced_block(lines, i, fence)
+            out.push(block.0)
+            i = block.1
+            continue
+        }
+        let level = heading_level(trimmed)
+        if level > 0 {
+            close_paragraph(out, paragraph, o)
+            paragraph = []
+            let body = heading_text(trimmed, level)
+            let id = o.heading_prefix + slug_of(body)
+            out.push("<h{level} id=\"{id}\">" + inline(body, o) + "</h{level}>")
+            i = i + 1
+            continue
+        }
+        if is_thematic_break(trimmed) {
+            close_paragraph(out, paragraph, o)
+            paragraph = []
+            out.push("<hr />")
+            i = i + 1
+            continue
+        }
+        if trimmed.starts_with("> ") or trimmed == ">" {
+            close_paragraph(out, paragraph, o)
+            paragraph = []
+            let quoted = quoted_block(lines, i)
+            out.push("<blockquote>\n" + render_lines(quoted.0, o) + "\n</blockquote>")
+            i = quoted.1
+            continue
+        }
+        if bullet_of(line) > 0 or ordered_of(line) > 0 {
+            close_paragraph(out, paragraph, o)
+            paragraph = []
+            let consumed = render_list(lines, i, indent_of(line), o)
+            out.push(consumed.0)
+            i = consumed.1
+            continue
+        }
+        if indent_of(line) >= 4 and paragraph.len() == 0 {
+            let block = indented_block(lines, i)
+            out.push(block.0)
+            i = block.1
+            continue
+        }
+        paragraph.push(line)
+        i = i + 1
+    }
+    close_paragraph(out, paragraph, o)
+    return out.join("\n")
+}
+
+fn render_list(lines: [str], from: i64, indent: i64, o: MarkdownOptions) -> (str, i64) {
+    let ordered = ordered_of(lines[from]) > 0
+    var items: [str] = []
+    var i = from
+    while i < lines.len() {
+        let line = lines[i]
+        if line.trim() == "" {
+            // A blank line inside a list is allowed if the list continues.
+            if i + 1 < lines.len() and (bullet_of(lines[i + 1]) > 0 or
+                ordered_of(lines[i + 1]) > 0) and indent_of(lines[i + 1]) == indent {
+                i = i + 1
+                continue
+            }
+            break
+        }
+        if indent_of(line) < indent {
+            break
+        }
+        let marker = if ordered { ordered_of(line) } else { bullet_of(line) }
+        if indent_of(line) == indent and marker > 0 {
+            let head = line.trim_start().substr(marker, line.trim_start().len() - marker)
+            var body: [str] = [head]
+            var j = i + 1
+            while j < lines.len() and lines[j].trim() != "" and
+            indent_of(lines[j]) > indent and
+            bullet_of(lines[j]) + ordered_of(lines[j]) == 0 {
+                body.push(lines[j].trim())
+                j = j + 1
+            }
+            // A nested list, one level in.
+            var nested = ""
+            if j < lines.len() and indent_of(lines[j]) > indent and
+            (bullet_of(lines[j]) > 0 or ordered_of(lines[j]) > 0) {
+                let inner = render_list(lines, j, indent_of(lines[j]), o)
+                nested = "\n" + inner.0
+                j = inner.1
+            }
+            items.push("<li>" + inline(body.join(" "), o) + nested + "</li>")
+            i = j
+            continue
+        }
+        break
+    }
+    let tag = if ordered { "ol" } else { "ul" }
+    return ("<{tag}>\n" + items.join("\n") + "\n</{tag}>", i)
+}
+
+pub fn render_with(source: str, o: MarkdownOptions) -> str {
+    return render_lines(source.lines(), o)
+}
+
+pub fn render(source: str) -> str {
+    return render_with(source, default_options())
+}
+
+/// Just the inline markup, with no block wrapper — for a title or a summary.
+pub fn render_inline(source: str) -> str {
+    return inline(source, default_options())
+}
+
+/// Every heading, as (level, text, anchor) — a table of contents.
+pub fn headings(source: str) -> [(i64, str, str)] {
+    var out: [(i64, str, str)] = []
+    var fenced = ""
+    for line in source.lines() {
+        let fence = fence_of(line)
+        if fence != "" {
+            fenced = if fenced == "" { fence } else { "" }
+            continue
+        }
+        if fenced != "" {
+            continue
+        }
+        let level = heading_level(line.trim())
+        if level > 0 {
+            let body = heading_text(line.trim(), level)
+            out.push((level, body, slug_of(body)))
+        }
+    }
+    return out
+}
+
+/// The document with every construct removed — for a search index or a
+/// summary line.
+pub fn plain_text(source: str) -> str {
+    var out: [str] = []
+    var fenced = ""
+    for line in source.lines() {
+        let fence = fence_of(line)
+        if fence != "" {
+            fenced = if fenced == "" { fence } else { "" }
+            continue
+        }
+        if fenced != "" {
+            continue
+        }
+        var t = line.trim()
+        if t == "" or is_thematic_break(t) {
+            continue
+        }
+        let level = heading_level(t)
+        if level > 0 {
+            t = t.substr(level + 1, t.len() - level - 1).trim()
+        }
+        if t.starts_with("> ") {
+            t = t.substr(2, t.len() - 2)
+        }
+        let marker = bullet_of(line) + ordered_of(line)
+        if marker > 0 {
+            t = t.substr(marker, t.len() - marker)
+        }
+        out.push(strip_inline(t))
+    }
+    return out.join(" ")
+}
+
+fn strip_inline(text: str) -> str {
+    var out = ""
+    let cs = text.chars()
+    var i = 0
+    while i < cs.len() {
+        let c = cs[i]
+        if c == "\\" and i + 1 < cs.len() {
+            out = out + cs[i + 1]
+            i = i + 2
+            continue
+        }
+        if c == "!" and i + 1 < cs.len() and cs[i + 1] == "[" {
+            i = i + 1
+            continue
+        }
+        if c == "[" {
+            let close = find_link_end(cs, i + 1, "[", "]")
+            if close > 0 and close + 1 < cs.len() and cs[close + 1] == "(" {
+                let paren = find_link_end(cs, close + 2, "(", ")")
+                if paren > 0 {
+                    for k in (i + 1)..close {
+                        out = out + cs[k]
+                    }
+                    i = paren + 1
+                    continue
+                }
+            }
+        }
+        if c == "*" or c == "`" {
+            i = i + 1
+            continue
+        }
+        // An underscore inside a word is not a marker, so `snake_case_name`
+        // survives here the way it does in `inline`.
+        if c == "_" and not (i > 0 and is_word_char(cs[i - 1]) and
+            i + 1 < cs.len() and is_word_char(cs[i + 1])) {
+            i = i + 1
+            continue
+        }
+        out = out + c
+        i = i + 1
+    }
+    return out.trim()
+}

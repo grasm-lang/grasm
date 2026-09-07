@@ -1,0 +1,493 @@
+// A text template engine, with escaping on by default.
+//
+// The decision that matters is which way round the default goes. A template
+// engine whose `{{name}}` inserts raw text produces a cross-site scripting
+// hole the first time a name contains a `<`, and the hole is invisible in
+// every test written with well-behaved data. So `{{name}}` escapes and
+// `{{{name}}}` does not, and the second form is deliberately uglier.
+//
+// The language is small on purpose:
+//
+//     {{ path.to.value }}        escaped substitution
+//     {{{ path }}}               raw substitution
+//     {{# if path }} … {{/ if }} conditional, with {{ else }}
+//     {{# each items }} … {{/ each }}   loop; `.` is the element,
+//                                       `@index` its position
+//     {{! a comment }}           removed
+//
+// Anything else is a template error reported with a line number, not a
+// silently empty string — a typo'd variable name that renders as nothing is
+// the failure mode every engine of this kind is criticised for.
+
+type TemplateValue =
+    | TplNull
+    | TplBool(b: bool)
+    | TplNum(n: f64)
+    | TplStr(s: str)
+    | TplList(items: [ref TemplateValue])
+    | TplMap(keys: [str], values: [ref TemplateValue])
+
+type TemplateError =
+    | UnknownName(name: str, line: i64)
+    | Unclosed(tag: str, line: i64)
+    | Unexpected(tag: str, line: i64)
+    | NotIterable(name: str, line: i64)
+    | TooDeep(line: i64)
+
+pub fn null() -> ref TemplateValue {
+    return ref(TplNull)
+}
+
+pub fn boolean(b: bool) -> ref TemplateValue {
+    return ref(TplBool(b))
+}
+
+pub fn number(n: f64) -> ref TemplateValue {
+    return ref(TplNum(n))
+}
+
+pub fn integer(n: i64) -> ref TemplateValue {
+    return ref(TplNum(n.as_f64()))
+}
+
+pub fn text(s: str) -> ref TemplateValue {
+    return ref(TplStr(s))
+}
+
+pub fn list(items: [ref TemplateValue]) -> ref TemplateValue {
+    return ref(TplList(items))
+}
+
+pub fn mapping(keys: [str], values: [ref TemplateValue]) -> ref TemplateValue {
+    var ks: [str] = []
+    var vs: [ref TemplateValue] = []
+    let n = if keys.len() < values.len() { keys.len() } else { values.len() }
+    for i in 0..n {
+        ks.push(keys[i])
+        vs.push(values[i])
+    }
+    return ref(TplMap(ks, vs))
+}
+
+pub fn escape(s: str) -> str {
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        .replace("\"", "&quot;").replace("'", "&#39;")
+}
+
+/// How a value prints. Numbers lose a trailing `.0`, because a template
+/// writing "3 items" should not write "3.0 items".
+pub fn to_text(v: ref TemplateValue) -> str {
+    match v {
+        TplNull -> return ""
+        TplBool(b) -> return if b { "true" } else { "false" }
+        TplNum(n) -> {
+            if n == n.as_i64().as_f64() {
+                return "{n.as_i64()}"
+            }
+            return "{n}"
+        }
+        TplStr(s) -> return s
+        TplList(items) -> return "{items.len()} items"
+        TplMap(keys, _values) -> return "{keys.len()} fields"
+    }
+}
+
+/// Whether a value counts as true. An empty string, an empty list, zero and
+/// null are false; everything else is true.
+pub fn truthy(v: ref TemplateValue) -> bool {
+    match v {
+        TplNull -> return false
+        TplBool(b) -> return b
+        TplNum(n) -> return n != 0.0
+        TplStr(s) -> return s != ""
+        TplList(items) -> return items.len() > 0
+        TplMap(keys, _values) -> return keys.len() > 0
+    }
+}
+
+fn field(v: ref TemplateValue, key: str) -> Option[ref TemplateValue] {
+    match v {
+        TplMap(keys, values) -> {
+            for i in 0..keys.len() {
+                if keys[i] == key {
+                    return Some(values[i])
+                }
+            }
+            return None
+        }
+        TplList(items) -> {
+            match key.parse_int() {
+                Some(n) -> {
+                    if n >= 0 and n < items.len() {
+                        return Some(items[n])
+                    }
+                    return None
+                }
+                None -> {
+                    if key == "size" {
+                        return Some(ref(TplNum(items.len().as_f64())))
+                    }
+                    return None
+                }
+            }
+        }
+        _ -> return None
+    }
+}
+
+type TemplateScope = {
+    root: ref TemplateValue,
+    /// The `each` element, innermost last.
+    current: [ref TemplateValue],
+    index: [i64],
+}
+
+fn resolve(scope: TemplateScope, dotted: str) -> Option[ref TemplateValue] {
+    let name = dotted.trim()
+    if name == "." {
+        if scope.current.len() == 0 {
+            return Some(scope.root)
+        }
+        return Some(scope.current[scope.current.len() - 1])
+    }
+    if name == "@index" {
+        if scope.index.len() == 0 {
+            return None
+        }
+        return Some(ref(TplNum(scope.index[scope.index.len() - 1].as_f64())))
+    }
+    if name == "@first" {
+        if scope.index.len() == 0 {
+            return None
+        }
+        return Some(ref(TplBool(scope.index[scope.index.len() - 1] == 0)))
+    }
+    var here = if scope.current.len() > 0 {
+        scope.current[scope.current.len() - 1]
+    } else {
+        scope.root
+    }
+    var body = name
+    if body.starts_with("./") {
+        body = body.substr(2, body.len() - 2)
+    }
+    // An `each` element is looked in first, then the root — which is what
+    // lets a loop body name an outer value without qualifying it.
+    var found = walk(here, body)
+    if found == None and scope.current.len() > 0 {
+        found = walk(scope.root, body)
+    }
+    return found
+}
+
+fn walk(from: ref TemplateValue, dotted: str) -> Option[ref TemplateValue] {
+    var here = from
+    for step in dotted.split(".") {
+        if step == "" {
+            continue
+        }
+        match field(here, step) {
+            Some(next) -> here = next
+            None -> return None
+        }
+    }
+    return Some(here)
+}
+
+type TemplateTag = {
+    /// "text", "var", "raw", "if", "unless", "each", "else", "end", "comment".
+    kind: str,
+    body: str,
+    line: i64,
+}
+
+/// Cut the source into text runs and tags.
+pub fn scan(source: str) -> [TemplateTag] {
+    var out: [TemplateTag] = []
+    let cs = source.chars()
+    var buffer = ""
+    var line = 1
+    var i = 0
+    while i < cs.len() {
+        if cs[i] == "\n" {
+            line = line + 1
+        }
+        if cs[i] == (123).to_char() and i + 1 < cs.len() and
+        cs[i + 1] == (123).to_char() {
+            let raw = i + 2 < cs.len() and cs[i + 2] == (123).to_char()
+            let open = if raw { 3 } else { 2 }
+            var j = i + open
+            var body = ""
+            var closed = false
+            while j < cs.len() {
+                if cs[j] == (125).to_char() and j + 1 < cs.len() and
+                cs[j + 1] == (125).to_char() {
+                    if raw and (j + 2 >= cs.len() or cs[j + 2] != (125).to_char()) {
+                        body = body + cs[j]
+                        j = j + 1
+                        continue
+                    }
+                    closed = true
+                    break
+                }
+                if cs[j] == "\n" {
+                    line = line + 1
+                }
+                body = body + cs[j]
+                j = j + 1
+            }
+            if not closed {
+                buffer = buffer + cs[i]
+                i = i + 1
+                continue
+            }
+            if buffer != "" {
+                out.push(TemplateTag{ kind: "text", body: buffer, line: line })
+                buffer = ""
+            }
+            let trimmed = body.trim()
+            var kind = "var"
+            var content = trimmed
+            if raw {
+                kind = "raw"
+            } else if trimmed.starts_with("!") {
+                kind = "comment"
+                content = trimmed.substr(1, trimmed.len() - 1).trim()
+            } else if trimmed.starts_with("#") {
+                let rest = trimmed.substr(1, trimmed.len() - 1).trim()
+                let head = if rest.words().len() > 0 { rest.words()[0] } else { "" }
+                kind = head
+                content = rest.substr(head.len(), rest.len() - head.len()).trim()
+            } else if trimmed.starts_with("/") {
+                kind = "end"
+                content = trimmed.substr(1, trimmed.len() - 1).trim()
+            } else if trimmed == "else" {
+                kind = "else"
+                content = ""
+            }
+            out.push(TemplateTag{ kind: kind, body: content, line: line })
+            i = j + (if raw { 3 } else { 2 })
+            continue
+        }
+        buffer = buffer + cs[i]
+        i = i + 1
+    }
+    if buffer != "" {
+        out.push(TemplateTag{ kind: "text", body: buffer, line: line })
+    }
+    return out
+}
+
+/// The index of the `{{/ kind }}` matching the block that opens at `from`.
+fn matching_end(tags: [TemplateTag], from: i64, kind: str) -> i64 {
+    var depth = 0
+    var i = from + 1
+    while i < tags.len() {
+        let t = tags[i]
+        if t.kind == kind {
+            depth = depth + 1
+        } else if t.kind == "end" and (t.body == kind or t.body == "") {
+            if depth == 0 {
+                return i
+            }
+            depth = depth - 1
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+/// The `{{ else }}` at this block's own level, or -1.
+fn else_at(tags: [TemplateTag], from: i64, to: i64) -> i64 {
+    var depth = 0
+    var i = from + 1
+    while i < to {
+        let t = tags[i]
+        if t.kind == "if" or t.kind == "unless" or t.kind == "each" {
+            depth = depth + 1
+        } else if t.kind == "end" {
+            depth = depth - 1
+        } else if t.kind == "else" and depth == 0 {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+/// `{{# if x }}` and `{{# unless x }}`, with their `{{ else }}`.
+fn render_conditional(tags: [TemplateTag], at: i64, end: i64,
+    scope: TemplateScope, strict: bool, depth: i64) -> str ! TemplateError {
+    let t = tags[at]
+    let middle = else_at(tags, at, end)
+    var yes = false
+    match resolve(scope, t.body) {
+        Some(v) -> yes = truthy(v)
+        None -> {
+            if strict {
+                fail(UnknownName(t.body, t.line))
+            }
+        }
+    }
+    if t.kind == "unless" {
+        yes = not yes
+    }
+    if yes {
+        let stop = if middle >= 0 { middle } else { end }
+        return try render_range(tags, at + 1, stop, scope, strict, depth + 1)
+    }
+    if middle >= 0 {
+        return try render_range(tags, middle + 1, end, scope, strict, depth + 1)
+    }
+    return ""
+}
+
+/// `{{# each xs }}`, with `{{ else }}` for an empty list.
+fn render_loop(tags: [TemplateTag], at: i64, end: i64, scope: TemplateScope,
+    strict: bool, depth: i64) -> str ! TemplateError {
+    let t = tags[at]
+    let middle = else_at(tags, at, end)
+    let stop = if middle >= 0 { middle } else { end }
+    var items: [ref TemplateValue] = []
+    match resolve(scope, t.body) {
+        Some(v) -> {
+            match v {
+                TplList(inner) -> items = inner
+                TplNull -> {}
+                _ -> fail(NotIterable(t.body, t.line))
+            }
+        }
+        None -> {
+            if strict {
+                fail(UnknownName(t.body, t.line))
+            }
+        }
+    }
+    if items.len() == 0 and middle >= 0 {
+        return try render_range(tags, middle + 1, end, scope, strict, depth + 1)
+    }
+    var out = ""
+    for k in 0..items.len() {
+        var inner_current = scope.current
+        var inner_index = scope.index
+        inner_current.push(items[k])
+        inner_index.push(k)
+        let inner = TemplateScope{
+            root: scope.root, current: inner_current, index: inner_index,
+        }
+        out = out + (try render_range(tags, at + 1, stop, inner, strict, depth + 1))
+    }
+    return out
+}
+
+fn render_range(tags: [TemplateTag], from: i64, to: i64, scope: TemplateScope,
+    strict: bool, depth: i64) -> str ! TemplateError {
+    if depth > 32 {
+        fail(TooDeep(if from < tags.len() { tags[from].line } else { 0 }))
+    }
+    var out = ""
+    var i = from
+    while i < to {
+        let t = tags[i]
+        if t.kind == "text" {
+            out = out + t.body
+            i = i + 1
+            continue
+        }
+        if t.kind == "comment" {
+            i = i + 1
+            continue
+        }
+        if t.kind == "var" or t.kind == "raw" {
+            match resolve(scope, t.body) {
+                Some(v) -> {
+                    let shown = to_text(v)
+                    out = out + (if t.kind == "raw" { shown } else { escape(shown) })
+                }
+                None -> {
+                    if strict {
+                        fail(UnknownName(t.body, t.line))
+                    }
+                }
+            }
+            i = i + 1
+            continue
+        }
+        if t.kind == "if" or t.kind == "unless" {
+            let end = matching_end(tags, i, t.kind)
+            if end < 0 {
+                fail(Unclosed(t.kind, t.line))
+            }
+            out = out + (try render_conditional(tags, i, end, scope, strict, depth))
+            i = end + 1
+            continue
+        }
+        if t.kind == "each" {
+            let end = matching_end(tags, i, "each")
+            if end < 0 {
+                fail(Unclosed("each", t.line))
+            }
+            out = out + (try render_loop(tags, i, end, scope, strict, depth))
+            i = end + 1
+            continue
+        }
+        if t.kind == "end" or t.kind == "else" {
+            fail(Unexpected(t.kind, t.line))
+        }
+        fail(Unexpected(t.kind, t.line))
+    }
+    return out
+}
+
+/// Render, failing on a name the data does not have.
+///
+/// Strict is the default because the alternative — an unknown name rendering
+/// as nothing — turns a typo into a page that is silently missing a field.
+pub fn render(source: str, data: ref TemplateValue) -> str ! TemplateError {
+    let tags = scan(source)
+    let scope = TemplateScope{ root: data, current: [], index: [] }
+    return try render_range(tags, 0, tags.len(), scope, true, 0)
+}
+
+/// Render, leaving an unknown name empty. For a template over data whose
+/// shape genuinely varies.
+pub fn render_lenient(source: str, data: ref TemplateValue) -> str ! TemplateError {
+    let tags = scan(source)
+    let scope = TemplateScope{ root: data, current: [], index: [] }
+    return try render_range(tags, 0, tags.len(), scope, false, 0)
+}
+
+/// Every name a template reads, so a caller can check its data before
+/// rendering — or generate a form from a template.
+pub fn names(source: str) -> [str] {
+    var out: [str] = []
+    for t in scan(source) {
+        if t.kind == "text" or t.kind == "comment" or t.kind == "end" or
+        t.kind == "else" {
+            continue
+        }
+        if t.body == "" or t.body.starts_with("@") or t.body == "." {
+            continue
+        }
+        if not out.contains(t.body) {
+            out.push(t.body)
+        }
+    }
+    return out
+}
+
+/// Whether every block is closed, without rendering anything.
+pub fn is_balanced(source: str) -> bool {
+    var depth = 0
+    for t in scan(source) {
+        if t.kind == "if" or t.kind == "unless" or t.kind == "each" {
+            depth = depth + 1
+        } else if t.kind == "end" {
+            depth = depth - 1
+            if depth < 0 {
+                return false
+            }
+        }
+    }
+    return depth == 0
+}

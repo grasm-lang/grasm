@@ -1,0 +1,590 @@
+// CBOR, RFC 8949: a binary format with one idea MessagePack does not have.
+//
+// The idea is **tags**. Every value can carry a number saying what it means —
+// tag 0 is a date-time string, tag 1 a Unix timestamp, tag 2 a bignum, tag 32
+// a URI — so a decoder that does not know a tag still reads the value inside
+// it and can pass it on unharmed. That is why CBOR is what COSE, CTAP (the
+// protocol behind a security key) and every recent IETF binary format use:
+// the format can grow without every implementation having to.
+//
+// The other half is that the encoding is *canonical* when you want it to be.
+// The same data has exactly one shortest encoding, so two encoders agree byte
+// for byte — which is what a signature over a structure needs, and what JSON
+// famously cannot give.
+//
+// Every head is the same shape: three bits of major type, five bits of
+// length-or-value, and 0, 1, 2, 4 or 8 bytes after it. That one rule covers
+// integers, strings, arrays, maps, tags and floats, which is what makes the
+// format small enough to write correctly.
+
+type CborValue =
+    | CborUint(n: i64)
+    | CborNegative(n: i64)
+    | CborBytes(data: bytes)
+    | CborText(s: str)
+    | CborArray(items: [ref CborValue])
+    | CborMap(keys: [ref CborValue], values: [ref CborValue])
+    | CborTagged(tag: i64, value: ref CborValue)
+    | CborBool(b: bool)
+    | CborNull
+    | CborUndefined
+    | CborSimple(n: i64)
+    | CborFloat(f: f64)
+
+type CborError =
+    | Truncated(at: i64)
+    | Reserved(info: i64, at: i64)
+    | BreakOutside(at: i64)
+    | TooDeep(at: i64)
+    | TrailingBytes(at: i64)
+
+pub let TAG_DATE_TIME = 0
+pub let TAG_EPOCH = 1
+pub let TAG_BIGNUM_POSITIVE = 2
+pub let TAG_BIGNUM_NEGATIVE = 3
+pub let TAG_URI = 32
+pub let TAG_BASE64 = 34
+pub let TAG_SELF_DESCRIBED = 55799
+
+pub fn unsigned(n: i64) -> ref CborValue {
+    return ref(CborUint(n))
+}
+
+/// A negative integer, given as the negative value itself.
+///
+/// CBOR stores `-1 - n`, so -1 is stored as 0 and the range reaches one
+/// further down than a positive integer reaches up. Taking the real value
+/// here keeps that off the caller.
+pub fn negative(v: i64) -> ref CborValue {
+    return ref(CborNegative(0 - 1 - v))
+}
+
+pub fn integer(v: i64) -> ref CborValue {
+    if v < 0 {
+        return negative(v)
+    }
+    return unsigned(v)
+}
+
+pub fn binary(data: bytes) -> ref CborValue {
+    return ref(CborBytes(data))
+}
+
+pub fn text(s: str) -> ref CborValue {
+    return ref(CborText(s))
+}
+
+pub fn array(items: [ref CborValue]) -> ref CborValue {
+    return ref(CborArray(items))
+}
+
+pub fn mapping(keys: [ref CborValue], values: [ref CborValue]) -> ref CborValue {
+    var ks: [ref CborValue] = []
+    var vs: [ref CborValue] = []
+    let n = if keys.len() < values.len() { keys.len() } else { values.len() }
+    for i in 0..n {
+        ks.push(keys[i])
+        vs.push(values[i])
+    }
+    return ref(CborMap(ks, vs))
+}
+
+pub fn tagged(tag: i64, value: ref CborValue) -> ref CborValue {
+    return ref(CborTagged(tag, value))
+}
+
+pub fn boolean(b: bool) -> ref CborValue {
+    return ref(CborBool(b))
+}
+
+pub fn null() -> ref CborValue {
+    return ref(CborNull)
+}
+
+pub fn undefined() -> ref CborValue {
+    return ref(CborUndefined)
+}
+
+pub fn floating(f: f64) -> ref CborValue {
+    return ref(CborFloat(f))
+}
+
+fn push_be(inout out: [i64], value: i64, width: i64) {
+    for i in 0..width {
+        out.push(value.ushr((width - 1 - i) * 8).bit_and(255))
+    }
+}
+
+/// The head: major type in the top three bits, then the shortest length form.
+///
+/// "Shortest" is the canonical rule, and it is the whole of it for integers:
+/// 10 must be one byte and not five, or two encoders of the same number
+/// disagree and a signature over one does not verify the other.
+fn head(inout out: [i64], major: i64, value: i64) {
+    let top = major.shl(5)
+    if value < 24 {
+        out.push(top.bit_or(value))
+        return
+    }
+    if value < 256 {
+        out.push(top.bit_or(24))
+        out.push(value)
+        return
+    }
+    if value < 65536 {
+        out.push(top.bit_or(25))
+        push_be(out, value, 2)
+        return
+    }
+    if value < 4294967296 {
+        out.push(top.bit_or(26))
+        push_be(out, value, 4)
+        return
+    }
+    out.push(top.bit_or(27))
+    push_be(out, value, 8)
+}
+
+fn encode_into(inout out: [i64], v: ref CborValue) {
+    match v {
+        CborUint(n) -> head(out, 0, n)
+        CborNegative(n) -> head(out, 1, n)
+        CborBytes(data) -> {
+            head(out, 2, data.len())
+            for i in 0..data.len() {
+                out.push(data.at(i))
+            }
+        }
+        CborText(s) -> {
+            let raw = s.to_bytes()
+            head(out, 3, raw.len())
+            for i in 0..raw.len() {
+                out.push(raw.at(i))
+            }
+        }
+        CborArray(items) -> {
+            head(out, 4, items.len())
+            for item in items {
+                encode_into(out, item)
+            }
+        }
+        CborMap(keys, values) -> {
+            head(out, 5, keys.len())
+            for i in 0..keys.len() {
+                encode_into(out, keys[i])
+                encode_into(out, values[i])
+            }
+        }
+        CborTagged(tag, inner) -> {
+            head(out, 6, tag)
+            encode_into(out, inner)
+        }
+        CborBool(b) -> out.push(224 + (if b { 21 } else { 20 }))
+        CborNull -> out.push(246)
+        CborUndefined -> out.push(247)
+        CborSimple(n) -> {
+            if n < 24 {
+                out.push(224 + n)
+            } else {
+                out.push(248)
+                out.push(n)
+            }
+        }
+        CborFloat(f) -> {
+            // Always a double. The shortest-float rule of canonical CBOR
+            // needs a half-precision encoder whose narrowing test is exact,
+            // and a wrong one changes the value rather than the size.
+            out.push(251)
+            push_be(out, f.to_bits(), 8)
+        }
+    }
+}
+
+pub fn encode(v: ref CborValue) -> bytes {
+    var out: [i64] = []
+    encode_into(out, v)
+    return bytes_of(out)
+}
+
+type CborReader = { data: bytes, at: i64 }
+
+fn take_be(inout r: CborReader, width: i64) -> i64 ! CborError {
+    if r.at + width > r.data.len() {
+        fail(Truncated(r.at))
+    }
+    var v = 0
+    for i in 0..width {
+        v = v.shl(8).bit_or(r.data.at(r.at + i))
+    }
+    r.at = r.at + width
+    return v
+}
+
+/// The argument after a head: a small value, a fixed width, or indefinite.
+///
+/// -1 means indefinite length, which is a real encoding and not an error: a
+/// stream that does not know its own length yet ends with a break byte.
+fn argument(inout r: CborReader, info: i64) -> i64 ! CborError {
+    if info < 24 {
+        return info
+    }
+    if info == 24 {
+        return try take_be(r, 1)
+    }
+    if info == 25 {
+        return try take_be(r, 2)
+    }
+    if info == 26 {
+        return try take_be(r, 4)
+    }
+    if info == 27 {
+        return try take_be(r, 8)
+    }
+    if info == 31 {
+        return 0 - 1
+    }
+    fail(Reserved(info, r.at - 1))
+}
+
+fn take_bytes(inout r: CborReader, n: i64) -> bytes ! CborError {
+    if r.at + n > r.data.len() {
+        fail(Truncated(r.at))
+    }
+    let out = r.data.slice(r.at, n)
+    r.at = r.at + n
+    return out
+}
+
+fn at_break(r: CborReader) -> bool {
+    return r.at < r.data.len() and r.data.at(r.at) == 255
+}
+
+/// An IEEE-754 half, widened. CBOR uses these and no other format here does,
+/// so the arithmetic is written out.
+fn half_of(bits: i64) -> f64 {
+    let sign = if bits.ushr(15).bit_and(1) == 1 { 0.0 - 1.0 } else { 1.0 }
+    let exponent = bits.ushr(10).bit_and(31)
+    let fraction = bits.bit_and(1023)
+    if exponent == 0 {
+        return sign * fraction.as_f64() * (2.0 ^ (0.0 - 24.0))
+    }
+    if exponent == 31 {
+        if fraction == 0 {
+            return sign * (1.0 / 0.0)
+        }
+        return 0.0 / 0.0
+    }
+    let mantissa = 1.0 + fraction.as_f64() / 1024.0
+    return sign * mantissa * (2.0 ^ (exponent - 15).as_f64())
+}
+
+fn single_of(bits: i64) -> f64 {
+    let sign = if bits.ushr(31).bit_and(1) == 1 { 0.0 - 1.0 } else { 1.0 }
+    let exponent = bits.ushr(23).bit_and(255)
+    let fraction = bits.bit_and(8388607)
+    if exponent == 0 {
+        return sign * fraction.as_f64() * (2.0 ^ (0.0 - 149.0))
+    }
+    if exponent == 255 {
+        if fraction == 0 {
+            return sign * (1.0 / 0.0)
+        }
+        return 0.0 / 0.0
+    }
+    let mantissa = 1.0 + fraction.as_f64() / 8388608.0
+    return sign * mantissa * (2.0 ^ (exponent - 127).as_f64())
+}
+
+fn decode_one(inout r: CborReader, depth: i64) -> ref CborValue ! CborError {
+    if depth > 64 {
+        fail(TooDeep(r.at))
+    }
+    if r.at >= r.data.len() {
+        fail(Truncated(r.at))
+    }
+    let first = r.data.at(r.at)
+    r.at = r.at + 1
+    let major = first.ushr(5)
+    let info = first.bit_and(31)
+    if major == 0 {
+        return ref(CborUint(try argument(r, info)))
+    }
+    if major == 1 {
+        return ref(CborNegative(try argument(r, info)))
+    }
+    if major == 2 or major == 3 {
+        return try decode_string(r, major, info, depth)
+    }
+    if major == 4 {
+        return try decode_array(r, info, depth)
+    }
+    if major == 5 {
+        return try decode_map(r, info, depth)
+    }
+    if major == 6 {
+        let tag = try argument(r, info)
+        return ref(CborTagged(tag, try decode_one(r, depth + 1)))
+    }
+    return try decode_simple(r, info)
+}
+
+/// Byte and text strings, definite or in chunks.
+fn decode_string(inout r: CborReader, major: i64, info: i64,
+    depth: i64) -> ref CborValue ! CborError {
+    let n = try argument(r, info)
+    if n < 0 {
+        // Indefinite: a run of definite chunks ending in a break.
+        var pieces: [i64] = []
+        while not at_break(r) {
+            let chunk = try decode_one(r, depth + 1)
+            match chunk {
+                CborBytes(d) -> {
+                    for i in 0..d.len() {
+                        pieces.push(d.at(i))
+                    }
+                }
+                CborText(s) -> {
+                    let d = s.to_bytes()
+                    for i in 0..d.len() {
+                        pieces.push(d.at(i))
+                    }
+                }
+                _ -> fail(BreakOutside(r.at))
+            }
+        }
+        r.at = r.at + 1
+        if major == 2 {
+            return ref(CborBytes(bytes_of(pieces)))
+        }
+        return ref(CborText(bytes_of(pieces).to_str()))
+    }
+    let raw = try take_bytes(r, n)
+    if major == 2 {
+        return ref(CborBytes(raw))
+    }
+    return ref(CborText(raw.to_str()))
+}
+
+fn decode_array(inout r: CborReader, info: i64, depth: i64) -> ref CborValue ! CborError {
+    let n = try argument(r, info)
+    var items: [ref CborValue] = []
+    if n < 0 {
+        while not at_break(r) {
+            items.push(try decode_one(r, depth + 1))
+        }
+        r.at = r.at + 1
+    } else {
+        for _i in 0..n {
+            items.push(try decode_one(r, depth + 1))
+        }
+    }
+    return ref(CborArray(items))
+}
+
+fn decode_map(inout r: CborReader, info: i64, depth: i64) -> ref CborValue ! CborError {
+    let n = try argument(r, info)
+    var keys: [ref CborValue] = []
+    var values: [ref CborValue] = []
+    if n < 0 {
+        while not at_break(r) {
+            keys.push(try decode_one(r, depth + 1))
+            values.push(try decode_one(r, depth + 1))
+        }
+        r.at = r.at + 1
+    } else {
+        for _i in 0..n {
+            keys.push(try decode_one(r, depth + 1))
+            values.push(try decode_one(r, depth + 1))
+        }
+    }
+    return ref(CborMap(keys, values))
+}
+
+/// Major type 7: the simple values, and the three float widths.
+fn decode_simple(inout r: CborReader, info: i64) -> ref CborValue ! CborError {
+    if info == 20 {
+        return ref(CborBool(false))
+    }
+    if info == 21 {
+        return ref(CborBool(true))
+    }
+    if info == 22 {
+        return ref(CborNull)
+    }
+    if info == 23 {
+        return ref(CborUndefined)
+    }
+    if info == 24 {
+        return ref(CborSimple(try take_be(r, 1)))
+    }
+    if info == 25 {
+        return ref(CborFloat(half_of(try take_be(r, 2))))
+    }
+    if info == 26 {
+        return ref(CborFloat(single_of(try take_be(r, 4))))
+    }
+    if info == 27 {
+        return ref(CborFloat((try take_be(r, 8)).from_bits()))
+    }
+    if info == 31 {
+        fail(BreakOutside(r.at - 1))
+    }
+    return ref(CborSimple(info))
+}
+
+pub fn decode(data: bytes) -> ref CborValue ! CborError {
+    var r = CborReader{ data: data, at: 0 }
+    let v = try decode_one(r, 0)
+    if r.at != data.len() {
+        fail(TrailingBytes(r.at))
+    }
+    return v
+}
+
+/// Decode one value and say where it ended — for a stream of them.
+pub fn decode_prefix(data: bytes) -> (ref CborValue, i64) ! CborError {
+    var r = CborReader{ data: data, at: 0 }
+    let v = try decode_one(r, 0)
+    return (v, r.at)
+}
+
+pub fn kind(v: ref CborValue) -> str {
+    match v {
+        CborUint(_n) -> return "uint"
+        CborNegative(_n) -> return "negative"
+        CborBytes(_d) -> return "bytes"
+        CborText(_s) -> return "text"
+        CborArray(_i) -> return "array"
+        CborMap(_k, _v) -> return "map"
+        CborTagged(_t, _v) -> return "tagged"
+        CborBool(_b) -> return "bool"
+        CborNull -> return "null"
+        CborUndefined -> return "undefined"
+        CborSimple(_n) -> return "simple"
+        CborFloat(_f) -> return "float"
+    }
+}
+
+/// The integer a value holds, with CBOR's two integer types unified.
+pub fn as_int(v: ref CborValue) -> Option[i64] {
+    match v {
+        CborUint(n) -> return Some(n)
+        CborNegative(n) -> return Some(0 - 1 - n)
+        _ -> return None
+    }
+}
+
+pub fn as_float(v: ref CborValue) -> Option[f64] {
+    match v {
+        CborFloat(f) -> return Some(f)
+        CborUint(n) -> return Some(n.as_f64())
+        CborNegative(n) -> return Some((0 - 1 - n).as_f64())
+        _ -> return None
+    }
+}
+
+pub fn as_text(v: ref CborValue) -> Option[str] {
+    match v {
+        CborText(s) -> return Some(s)
+        _ -> return None
+    }
+}
+
+pub fn as_bytes(v: ref CborValue) -> Option[bytes] {
+    match v {
+        CborBytes(d) -> return Some(d)
+        _ -> return None
+    }
+}
+
+pub fn as_bool(v: ref CborValue) -> Option[bool] {
+    match v {
+        CborBool(b) -> return Some(b)
+        _ -> return None
+    }
+}
+
+/// The value inside a tag, whatever the tag was.
+///
+/// The point of tags: a decoder that does not know tag 1234 can still read,
+/// keep and re-encode what it wrapped.
+pub fn untag(v: ref CborValue) -> ref CborValue {
+    match v {
+        CborTagged(_t, inner) -> return untag(inner)
+        _ -> return v
+    }
+}
+
+pub fn tag_of(v: ref CborValue) -> Option[i64] {
+    match v {
+        CborTagged(t, _inner) -> return Some(t)
+        _ -> return None
+    }
+}
+
+pub fn items(v: ref CborValue) -> [ref CborValue] {
+    match v {
+        CborArray(list) -> return list
+        _ -> return []
+    }
+}
+
+pub fn get(v: ref CborValue, key: str) -> Option[ref CborValue] {
+    match v {
+        CborMap(keys, values) -> {
+            for i in 0..keys.len() {
+                match keys[i] {
+                    CborText(s) -> {
+                        if s == key {
+                            return Some(values[i])
+                        }
+                    }
+                    _ -> {}
+                }
+            }
+            return None
+        }
+        _ -> return None
+    }
+}
+
+/// The value for an integer key, which is what COSE and CTAP use.
+pub fn get_int_key(v: ref CborValue, key: i64) -> Option[ref CborValue] {
+    match v {
+        CborMap(keys, values) -> {
+            for i in 0..keys.len() {
+                if as_int(keys[i]) == Some(key) {
+                    return Some(values[i])
+                }
+            }
+            return None
+        }
+        _ -> return None
+    }
+}
+
+pub fn size(v: ref CborValue) -> i64 {
+    match v {
+        CborArray(list) -> return list.len()
+        CborMap(keys, _values) -> return keys.len()
+        CborText(s) -> return s.len()
+        CborBytes(d) -> return d.len()
+        _ -> return 0
+    }
+}
+
+pub fn equal(a: ref CborValue, b: ref CborValue) -> bool {
+    return encode(a) == encode(b)
+}
+
+/// Whether the bytes are the shortest encoding of what they hold.
+///
+/// The canonical-form check a signature needs: re-encode and compare. A
+/// signature over a non-canonical encoding verifies only for the exact bytes
+/// that were signed, which is not what anyone means by signing a structure.
+pub fn is_canonical(data: bytes) -> bool {
+    match decode(data) {
+        Ok(v) -> return encode(v) == data
+        Err(_e) -> return false
+    }
+}

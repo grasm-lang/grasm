@@ -1,0 +1,6 @@
+[package]
+name = "yamlish"
+version = "1.0.0"
+
+# The YAML subset a config file uses. Opens nothing.
+capabilities = []

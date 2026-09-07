@@ -1,0 +1,420 @@
+import msgpack
+import cbor
+import yamlish
+import markdown
+import template
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn hex(b: bytes) -> str {
+    var out = ""
+    for i in 0..b.len() {
+        let v = b.at(i)
+        out = out + v.ushr(4).to_base(16) + v.bit_and(15).to_base(16)
+    }
+    return out
+}
+
+fn braces() -> str {
+    return (123).to_char() + (123).to_char()
+}
+
+fn close_braces() -> str {
+    return (125).to_char() + (125).to_char()
+}
+
+fn check_msgpack(inout f: i64) / {io} {
+    print("-- msgpack: the same data, in fewer bytes")
+    // Every expectation is what the reference implementation produces for the
+    // same value.
+    say(f, "nil is one byte", hex(msgpack.encode(msgpack.nil())) == "c0")
+    say(f, "a small integer is one byte too",
+        hex(msgpack.encode(msgpack.integer(127))) == "7f")
+    say(f, "and one past it takes two",
+        hex(msgpack.encode(msgpack.integer(128))) == "cc80")
+    say(f, "a negative fixint reaches -32",
+        hex(msgpack.encode(msgpack.integer(0 - 32))) == "e0")
+    say(f, "and one past that takes two",
+        hex(msgpack.encode(msgpack.integer(0 - 33))) == "d0df")
+    say(f, "widths step up as the value grows",
+        hex(msgpack.encode(msgpack.integer(65536))) == "ce00010000")
+    // The reason to use it at all: a 64-bit id survives, where JSON's double
+    // would round it.
+    say(f, "a 64-bit identifier survives exactly",
+        hex(msgpack.encode(msgpack.integer(9007199254740993))) ==
+        "cf0020000000000001")
+    say(f, "and reads back as the same integer",
+        msgpack.as_int(msgpack.decode(msgpack.encode(
+            msgpack.integer(9007199254740993))) ?? msgpack.nil()) ==
+        Some(9007199254740993))
+    say(f, "a short string is one byte plus its text",
+        hex(msgpack.encode(msgpack.text("abc"))) == "a3616263")
+    say(f, "a 32-character string moves to the next form",
+        hex(msgpack.encode(msgpack.text("x".repeat(32)))).starts_with("d920"))
+    say(f, "text is UTF-8, counted in bytes",
+        hex(msgpack.encode(msgpack.text("€"))) == "a3e282ac")
+    // The other reason: binary stays binary.
+    say(f, "binary is carried as binary",
+        hex(msgpack.encode(msgpack.binary(bytes_of([1, 2, 3])))) == "c403010203")
+    say(f, "and is not the same as a string of those bytes",
+        msgpack.encode(msgpack.binary(bytes_of([97]))) !=
+        msgpack.encode(msgpack.text("a")))
+    let arr = msgpack.array([msgpack.integer(1), msgpack.text("two"),
+        msgpack.boolean(false)])
+    say(f, "an array packs its elements in order",
+        hex(msgpack.encode(arr)) == "9301a374776fc2")
+    let m = msgpack.mapping([msgpack.text("a"), msgpack.text("b")],
+        [msgpack.integer(1), arr])
+    say(f, "a map is keys and values interleaved",
+        hex(msgpack.encode(m)) == "82a16101a1629301a374776fc2")
+    say(f, "and reads back by key",
+        msgpack.as_int(msgpack.get(msgpack.decode(msgpack.encode(m)) ??
+            msgpack.nil(), "a") ?? msgpack.nil()) == Some(1))
+    say(f, "an extension carries its tag",
+        hex(msgpack.encode(msgpack.extension(5, bytes_of([9, 9, 9, 9])))) ==
+        "d60509090909")
+    say(f, "a negative extension tag is a signed byte",
+        hex(msgpack.encode(msgpack.extension(0 - 1, bytes_of([7])))) == "d4ff07")
+    say(f, "a 20-element array needs the 16-bit count",
+        hex(msgpack.encode(msgpack.array([msgpack.integer(0), msgpack.integer(1),
+            msgpack.integer(2), msgpack.integer(3), msgpack.integer(4),
+            msgpack.integer(5), msgpack.integer(6), msgpack.integer(7),
+            msgpack.integer(8), msgpack.integer(9), msgpack.integer(10),
+            msgpack.integer(11), msgpack.integer(12), msgpack.integer(13),
+            msgpack.integer(14), msgpack.integer(15)]))).starts_with("dc0010"))
+    say(f, "a float is a double", hex(msgpack.encode(
+        msgpack.floating(3.141592653589793))) == "cb400921fb54442d18")
+    say(f, "and comes back bit for bit", msgpack.as_float(
+        msgpack.decode(msgpack.encode(msgpack.floating(3.141592653589793))) ??
+        msgpack.nil()) == Some(3.141592653589793))
+    say(f, "decoding says how much it consumed",
+        (msgpack.decode_prefix(bytes_of([1, 2, 3])) ??
+            (msgpack.nil(), 0)).1 == 1)
+    say(f, "a truncated value is refused", msg_refuses(bytes_of([217])))
+}
+
+fn msg_refuses(data: bytes) -> bool {
+    match msgpack.decode(data) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn cbor_refuses(data: bytes) -> bool {
+    match cbor.decode(data) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn yaml_refuses(source: str) -> bool {
+    match yamlish.parse(source) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn tpl_refuses(source: str, data: ref TemplateValue) -> bool {
+    match template.render(source, data) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn check_cbor(inout f: i64) / {io} {
+    print("-- cbor: one head shape, and tags")
+    // RFC 8949 appendix A.
+    say(f, "0 is 00", hex(cbor.encode(cbor.integer(0))) == "00")
+    say(f, "23 is the last one-byte integer",
+        hex(cbor.encode(cbor.integer(23))) == "17")
+    say(f, "24 takes a following byte",
+        hex(cbor.encode(cbor.integer(24))) == "1818")
+    say(f, "1000000 takes four", hex(cbor.encode(cbor.integer(1000000))) ==
+        "1a000f4240")
+    say(f, "1000000000000 takes eight",
+        hex(cbor.encode(cbor.integer(1000000000000))) == "1b000000e8d4a51000")
+    // Negatives are stored as -1-n, which is why -1 is 0x20 and not 0x21.
+    say(f, "-1 is 20", hex(cbor.encode(cbor.integer(0 - 1))) == "20")
+    say(f, "-1000 is 3903e7", hex(cbor.encode(cbor.integer(0 - 1000))) == "3903e7")
+    say(f, "and both integer types read back as one number",
+        cbor.as_int(cbor.decode(bytes_of([57, 3, 231])) ?? cbor.null()) ==
+        Some(0 - 1000))
+    say(f, "false, true, null and undefined are four bytes",
+        hex(cbor.encode(cbor.boolean(false))) == "f4" and
+        hex(cbor.encode(cbor.boolean(true))) == "f5" and
+        hex(cbor.encode(cbor.null())) == "f6" and
+        hex(cbor.encode(cbor.undefined())) == "f7")
+    say(f, "text is major type 3", hex(cbor.encode(cbor.text("IETF"))) ==
+        "6449455446")
+    say(f, "bytes are major type 2",
+        hex(cbor.encode(cbor.binary(bytes_of([1, 2, 3, 4])))) == "4401020304")
+    say(f, "an array of three is one head and three values",
+        hex(cbor.encode(cbor.array([cbor.integer(1), cbor.integer(2),
+            cbor.integer(3)]))) == "83010203")
+    say(f, "nesting needs no extra machinery",
+        hex(cbor.encode(cbor.array([cbor.integer(1),
+            cbor.array([cbor.integer(2), cbor.integer(3)]),
+            cbor.array([cbor.integer(4), cbor.integer(5)])]))) ==
+        "8301820203820405")
+    say(f, "a map of strings", hex(cbor.encode(cbor.mapping(
+        [cbor.text("a"), cbor.text("b")],
+        [cbor.integer(1), cbor.array([cbor.integer(2), cbor.integer(3)])]))) ==
+        "a26161016162820203")
+    // The idea MessagePack does not have.
+    say(f, "tag 1 marks an epoch timestamp",
+        hex(cbor.encode(cbor.tagged(1, cbor.integer(1363896240)))) ==
+        "c11a514b67b0")
+    say(f, "tag 32 marks a URI", hex(cbor.encode(cbor.tagged(32,
+        cbor.text("http://www.example.com")))) ==
+        "d82076687474703a2f2f7777772e6578616d706c652e636f6d")
+    let tagged = cbor.decode(bytes_of([193, 26, 81, 75, 103, 176])) ?? cbor.null()
+    say(f, "a decoder can read the tag", cbor.tag_of(tagged) == Some(1))
+    say(f, "and the value inside it, tag or no tag",
+        cbor.as_int(cbor.untag(tagged)) == Some(1363896240))
+    say(f, "an unknown tag is still readable",
+        cbor.as_text(cbor.untag(cbor.decode(cbor.encode(
+            cbor.tagged(65535, cbor.text("later")))) ?? cbor.null())) ==
+        Some("later"))
+    // Indefinite lengths: a decoder must accept them, an encoder need not
+    // produce them.
+    let indefinite = bytes_of([159, 1, 2, 3, 255])
+    say(f, "an indefinite array decodes",
+        cbor.size(cbor.decode(indefinite) ?? cbor.null()) == 3)
+    say(f, "and is not canonical", not cbor.is_canonical(indefinite))
+    say(f, "while the definite form is",
+        cbor.is_canonical(bytes_of([131, 1, 2, 3])))
+    say(f, "an indefinite text joins its chunks",
+        cbor.as_text(cbor.decode(bytes_of([127, 101, 115, 116, 114, 101, 97,
+            100, 109, 105, 110, 103, 255])) ?? cbor.null()) == Some("streaming"))
+    // Halves and singles, which only a decoder meets.
+    say(f, "a half-precision float widens",
+        cbor.as_float(cbor.decode(bytes_of([249, 63, 128])) ?? cbor.null()) ==
+        Some(1.875))
+    say(f, "and a single", cbor.as_float(cbor.decode(
+        bytes_of([250, 71, 195, 80, 0])) ?? cbor.null()) == Some(100000.0))
+    say(f, "an integer key is found, which is what COSE uses",
+        cbor.as_text(cbor.get_int_key(cbor.decode(cbor.encode(cbor.mapping(
+            [cbor.integer(1)], [cbor.text("EC2")]))) ?? cbor.null(), 1) ??
+            cbor.null()) == Some("EC2"))
+    say(f, "trailing bytes are refused", cbor_refuses(bytes_of([1, 2])))
+    say(f, "and a truncated head", cbor_refuses(bytes_of([26, 0, 0])))
+}
+
+fn check_yamlish(inout f: i64) / {io} {
+    print("-- yamlish: the subset a config file uses, and a refusal for the rest")
+    let src = "# a config\n" +
+    "name: my-service\n" +
+    "port: 8080\n" +
+    "ratio: 0.75\n" +
+    "debug: false\n" +
+    "region: no\n" +
+    "version: \"1.2.3\"\n" +
+    "empty:\n" +
+    "tags:\n" +
+    "  - alpha\n" +
+    "  - beta\n" +
+    "database:\n" +
+    "  host: db.internal  # inline comment\n" +
+    "  port: 5432\n" +
+    "servers:\n" +
+    "  - name: a\n" +
+    "    weight: 1\n" +
+    "  - name: b\n" +
+    "    weight: 2\n" +
+    "banner: |\n" +
+    "  line one\n" +
+    "  line two\n"
+    let v = yamlish.parse(src) ?? yamlish.null()
+    say(f, "a scalar is typed", yamlish.as_str(yamlish.get(v, "name") ??
+        yamlish.null()) == Some("my-service"))
+    say(f, "an integer is an integer", yamlish.as_int(yamlish.get(v, "port") ??
+        yamlish.null()) == Some(8080))
+    say(f, "a float is a float", yamlish.as_float(yamlish.get(v, "ratio") ??
+        yamlish.null()) == Some(0.75))
+    say(f, "false is a boolean", yamlish.as_bool(yamlish.get(v, "debug") ??
+        yamlish.null()) == Some(false))
+    // The Norway problem: YAML 1.1 made `no` false and 1.2 stopped.
+    say(f, "and `no` is the string \"no\"",
+        yamlish.as_str(yamlish.get(v, "region") ?? yamlish.null()) == Some("no"))
+    say(f, "a quoted number stays a string",
+        yamlish.as_str(yamlish.get(v, "version") ?? yamlish.null()) == Some("1.2.3"))
+    say(f, "a key with no value is null",
+        yamlish.kind(yamlish.get(v, "empty") ?? yamlish.integer(0)) == "null")
+    say(f, "a comment is not part of the value",
+        yamlish.as_str(yamlish.path(v, "database.host") ?? yamlish.null()) ==
+        Some("db.internal"))
+    say(f, "a sequence comes out as a list",
+        yamlish.items_of(yamlish.get(v, "tags") ?? yamlish.null()).len() == 2)
+    say(f, "a dotted path reaches into it",
+        yamlish.as_str(yamlish.path(v, "tags.1") ?? yamlish.null()) == Some("beta"))
+    say(f, "a sequence of mappings nests",
+        yamlish.as_int(yamlish.path(v, "servers.1.weight") ?? yamlish.null()) ==
+        Some(2))
+    say(f, "a literal block keeps its newlines",
+        yamlish.as_str(yamlish.get(v, "banner") ?? yamlish.null()) ==
+        Some("line one\nline two\n"))
+    say(f, "a folded block joins its lines",
+        yamlish.as_str(yamlish.get(yamlish.parse("s: >\n  a\n  b\n") ??
+            yamlish.null(), "s") ?? yamlish.null()) == Some("a b\n"))
+    say(f, "and `>-` drops the trailing newline",
+        yamlish.as_str(yamlish.get(yamlish.parse("s: >-\n  a\n  b\n") ??
+            yamlish.null(), "s") ?? yamlish.null()) == Some("a b"))
+    say(f, "the keys are in file order",
+        yamlish.keys_of(v)[0] == "name" and yamlish.keys_of(v)[1] == "port")
+    // Rendering back, and reading that.
+    let again = yamlish.parse(yamlish.render(v)) ?? yamlish.null()
+    say(f, "rendering and reparsing gives the same port",
+        yamlish.as_int(yamlish.get(again, "port") ?? yamlish.null()) == Some(8080))
+    say(f, "and the same block text",
+        yamlish.as_str(yamlish.get(again, "banner") ?? yamlish.null()) ==
+        Some("line one\nline two\n"))
+    say(f, "and the same nested weight",
+        yamlish.as_int(yamlish.path(again, "servers.1.weight") ?? yamlish.null()) ==
+        Some(2))
+    // What it refuses rather than guesses.
+    say(f, "an anchor is refused by name", yaml_refuses("a: &x 1\n"))
+    say(f, "an alias too", yaml_refuses("b: 1\nc:\n  *x\n"))
+    say(f, "a merge key too", yaml_refuses("d:\n  <<: *base\n"))
+    say(f, "and a flow mapping", yaml_refuses("\{a: 1}\n"))
+}
+
+fn check_markdown(inout f: i64) / {io} {
+    print("-- markdown: escaping on the way out")
+    say(f, "a heading gets an anchor",
+        markdown.render("# My Title") == "<h1 id=\"my-title\">My Title</h1>")
+    say(f, "emphasis and strong", markdown.render_inline("*a* and **b**") ==
+        "<em>a</em> and <strong>b</strong>")
+    say(f, "an underscore inside a word is not emphasis",
+        markdown.render_inline("snake_case_name") == "snake_case_name")
+    say(f, "a code span escapes what is inside it",
+        markdown.render_inline("`a < b`") == "<code>a &lt; b</code>")
+    say(f, "a link carries its title",
+        markdown.render_inline("[t](https://x.test \"why\")") ==
+        "<a href=\"https://x.test\" title=\"why\">t</a>")
+    say(f, "an image is an img", markdown.render_inline("![alt](p.png)") ==
+        "<img src=\"p.png\" alt=\"alt\" />")
+    // The decision the package exists for.
+    say(f, "raw HTML in the source is escaped, not passed through",
+        markdown.render_inline("<script>alert(1)</script>") ==
+        "&lt;script&gt;alert(1)&lt;/script&gt;")
+    say(f, "and so is a quote inside an attribute",
+        markdown.render_inline("[t](\"onmouseover=x)").contains("&quot;"))
+    say(f, "a backslash escapes a marker",
+        markdown.render_inline("\\*not emphasis\\*") == "*not emphasis*")
+    say(f, "a bare URL becomes a link",
+        markdown.render_inline("see https://x.test/a now").contains(
+            "<a href=\"https://x.test/a\">"))
+    say(f, "and its trailing full stop does not",
+        markdown.render_inline("see https://x.test.").contains(
+            "<a href=\"https://x.test\">"))
+    say(f, "a fenced block names its language",
+        markdown.render("```gr\nlet x = 1\n```").contains(
+            "<pre><code class=\"language-gr\">"))
+    say(f, "and escapes its contents",
+        markdown.render("```\na < b\n```").contains("a &lt; b"))
+    say(f, "a bullet list", markdown.render("- a\n- b") ==
+        "<ul>\n<li>a</li>\n<li>b</li>\n</ul>")
+    say(f, "an ordered list", markdown.render("1. a\n2. b") ==
+        "<ol>\n<li>a</li>\n<li>b</li>\n</ol>")
+    say(f, "a nested list", markdown.render("- a\n  - b").contains(
+        "<li>a\n<ul>\n<li>b</li>"))
+    say(f, "a block quote", markdown.render("> hi") ==
+        "<blockquote>\n<p>hi</p>\n</blockquote>")
+    say(f, "a thematic break", markdown.render("---") == "<hr />")
+    say(f, "two trailing spaces are a hard break",
+        markdown.render("a  \nb").contains("<br />"))
+    say(f, "headings come out as a table of contents",
+        markdown.headings("# A\n\n## B").len() == 2)
+    say(f, "with their anchors", markdown.headings("## Some Title")[0].2 ==
+        "some-title")
+    say(f, "a heading inside a fence is not a heading",
+        markdown.headings("```\n# not one\n```").len() == 0)
+    say(f, "plain text drops the markup",
+        markdown.plain_text("# T\n\n*a* [b](c)") == "T a b")
+}
+
+fn check_template(inout f: i64) / {io} {
+    print("-- template: escaped unless you ask twice")
+    let ob = braces()
+    let cb = close_braces()
+    let data = template.mapping(
+        ["title", "user", "items", "admin", "empty"],
+        [template.text("Report <2026>"),
+            template.mapping(["name"], [template.text("A & B")]),
+            template.list([template.text("one"), template.text("two")]),
+            template.boolean(true),
+            template.list([])])
+    say(f, "a substitution escapes",
+        (template.render(ob + " title " + cb, data) ?? "") == "Report &lt;2026&gt;")
+    say(f, "the triple form does not",
+        (template.render((123).to_char() + ob + " title " + cb + (125).to_char(),
+            data) ?? "") == "Report <2026>")
+    say(f, "an ampersand is escaped too",
+        (template.render(ob + " user.name " + cb, data) ?? "") == "A &amp; B")
+    say(f, "a dotted path reaches into a map",
+        template.names(ob + " user.name " + cb) == ["user.name"])
+    say(f, "a conditional takes the true branch",
+        (template.render(ob + "# if admin " + cb + "yes" + ob + " else " + cb +
+            "no" + ob + "/ if " + cb, data) ?? "") == "yes")
+    say(f, "and the else branch when the value is empty",
+        (template.render(ob + "# if empty " + cb + "yes" + ob + " else " + cb +
+            "no" + ob + "/ if " + cb, data) ?? "") == "no")
+    say(f, "unless is the other way round",
+        (template.render(ob + "# unless empty " + cb + "none" + ob + "/ unless " +
+            cb, data) ?? "") == "none")
+    say(f, "a loop runs over a list",
+        (template.render(ob + "# each items " + cb + "[" + ob + " . " + cb + "]" +
+            ob + "/ each " + cb, data) ?? "") == "[one][two]")
+    say(f, "with an index", (template.render(ob + "# each items " + cb +
+        ob + " @index " + cb + ob + "/ each " + cb, data) ?? "") == "01")
+    say(f, "an empty list takes the else branch",
+        (template.render(ob + "# each empty " + cb + "x" + ob + " else " + cb +
+            "(none)" + ob + "/ each " + cb, data) ?? "") == "(none)")
+    say(f, "a loop body can still see the outer data",
+        (template.render(ob + "# each items " + cb + ob + " title " + cb +
+            ob + "/ each " + cb, data) ?? "").contains("Report"))
+    say(f, "a comment renders as nothing",
+        (template.render("a" + ob + "! note " + cb + "b", data) ?? "") == "ab")
+    // The failure mode every engine of this kind is criticised for.
+    say(f, "an unknown name is an error, not an empty string",
+        tpl_refuses(ob + " nope " + cb, data))
+    say(f, "unless the caller asks for lenient",
+        (template.render_lenient(ob + " nope " + cb, data) ?? "!") == "")
+    say(f, "an unclosed block is an error",
+        tpl_refuses(ob + "# if admin " + cb + "x", data))
+    say(f, "and a stray end", tpl_refuses(ob + "/ if " + cb, data))
+    say(f, "balance can be checked without rendering",
+        template.is_balanced(ob + "# if a " + cb + ob + "/ if " + cb) and
+        not template.is_balanced(ob + "# if a " + cb))
+    say(f, "every name a template reads can be listed",
+        template.names(ob + " a " + cb + ob + "# each b " + cb + ob + " c " +
+            cb + ob + "/ each " + cb) == ["a", "b", "c"])
+    say(f, "a number prints without a trailing zero",
+        (template.render(ob + " n " + cb, template.mapping(["n"],
+            [template.integer(3)])) ?? "") == "3")
+    say(f, "a list knows its size",
+        (template.render(ob + " items.size " + cb, data) ?? "") == "2")
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_msgpack(f)
+    check_cbor(f)
+    check_yamlish(f)
+    check_markdown(f)
+    check_template(f)
+
+    if f == 0 {
+        print("formats II: every claim held")
+    } else {
+        print("formats II: {f} failed")
+    }
+}

@@ -29,9 +29,9 @@ honest and a stub is a promise nobody kept.
 | | |
 |---|---|
 | Started at | 78 |
-| Now | 178 |
+| Now | 183 |
 | Target | 200 |
-| Remaining | 22 |
+| Remaining | 17 |
 
 ## Batches
 
@@ -54,6 +54,7 @@ asserts against it.
   `mimetype`
 - [x] **System files** — `atomicfile` `pidfile` `lockfile` `shutdown`
   `envcfg`
+- [x] **Formats II** — `msgpack` `cbor` `yamlish` `markdown` `template`
 
 ### Planned
 

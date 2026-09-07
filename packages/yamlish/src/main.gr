@@ -1,0 +1,672 @@
+// The part of YAML a configuration file actually uses — and a refusal for the
+// rest.
+//
+// YAML's full specification is larger than JSON's, XML's and TOML's put
+// together, and almost none of it appears in a config file. What does appear
+// is: nested mappings, sequences, scalars, comments, quoted strings and block
+// text. That is what this reads.
+//
+// What it will not do is guess. Anchors, aliases, merge keys, tags, flow
+// mappings, multiple documents and complex keys are **refused by name**,
+// because the alternative — parsing them approximately — produces a
+// configuration that differs from what the file says and from what every
+// other YAML reader would say.
+//
+// The other decision worth stating: `no` is the string "no", not `false`.
+// YAML 1.1 made it a boolean and YAML 1.2 stopped, and the version in between
+// is why a Norwegian country code has become an internet joke. Only `true`
+// and `false` are booleans here.
+
+type YamlValue =
+    | YamlNull
+    | YamlBool(b: bool)
+    | YamlInt(n: i64)
+    | YamlFloat(f: f64)
+    | YamlStr(s: str)
+    | YamlList(items: [ref YamlValue])
+    | YamlMap(keys: [str], values: [ref YamlValue])
+
+type YamlError =
+    | Unsupported(feature: str, line: i64)
+    | BadIndent(line: i64)
+    | NoColon(line: i64)
+    | Unterminated(line: i64)
+
+type YamlLine = {
+    indent: i64,
+    text: str,
+    number: i64,
+}
+
+pub fn null() -> ref YamlValue {
+    return ref(YamlNull)
+}
+
+pub fn boolean(b: bool) -> ref YamlValue {
+    return ref(YamlBool(b))
+}
+
+pub fn integer(n: i64) -> ref YamlValue {
+    return ref(YamlInt(n))
+}
+
+pub fn floating(f: f64) -> ref YamlValue {
+    return ref(YamlFloat(f))
+}
+
+pub fn text(s: str) -> ref YamlValue {
+    return ref(YamlStr(s))
+}
+
+pub fn list(items: [ref YamlValue]) -> ref YamlValue {
+    return ref(YamlList(items))
+}
+
+pub fn mapping(keys: [str], values: [ref YamlValue]) -> ref YamlValue {
+    return ref(YamlMap(keys, values))
+}
+
+/// Everything after an unquoted `#`, removed.
+///
+/// A `#` inside quotes is not a comment, and one with no space before it is
+/// not either — `a#b` is the scalar `a#b`, which is how a URL fragment
+/// survives.
+fn strip_comment(line: str) -> str {
+    let cs = line.chars()
+    var quote = ""
+    var i = 0
+    while i < cs.len() {
+        let c = cs[i]
+        if quote != "" {
+            if c == "\\" and quote == "\"" {
+                i = i + 2
+                continue
+            }
+            if c == quote {
+                quote = ""
+            }
+        } else if c == "\"" or c == "'" {
+            quote = c
+        } else if c == "#" and (i == 0 or cs[i - 1] == " " or cs[i - 1] == "\t") {
+            return line.substr(0, i).trim_end()
+        }
+        i = i + 1
+    }
+    return line.trim_end()
+}
+
+fn indent_of(line: str) -> i64 {
+    let cs = line.chars()
+    var n = 0
+    while n < cs.len() and cs[n] == " " {
+        n = n + 1
+    }
+    return n
+}
+
+/// A scalar with the quoting removed and the escapes applied.
+fn unquote(raw: str) -> str {
+    let s = raw.trim()
+    if s.len() >= 2 and s.starts_with("'") and s.ends_with("'") {
+        // Single quotes take everything literally; '' is one quote.
+        return s.substr(1, s.len() - 2).replace("''", "'")
+    }
+    if s.len() >= 2 and s.starts_with("\"") and s.ends_with("\"") {
+        let inner = s.substr(1, s.len() - 2)
+        var out = ""
+        let cs = inner.chars()
+        var i = 0
+        while i < cs.len() {
+            if cs[i] == "\\" and i + 1 < cs.len() {
+                let e = cs[i + 1]
+                if e == "n" {
+                    out = out + "\n"
+                } else if e == "t" {
+                    out = out + "\t"
+                } else if e == "r" {
+                    out = out + "\r"
+                } else if e == "0" {
+                    out = out + (0).to_char()
+                } else {
+                    out = out + e
+                }
+                i = i + 2
+                continue
+            }
+            out = out + cs[i]
+            i = i + 1
+        }
+        return out
+    }
+    return s
+}
+
+/// Whether the text was written with quotes — which decides whether `123` is
+/// a number or the string "123".
+fn was_quoted(raw: str) -> bool {
+    let s = raw.trim()
+    if s.len() < 2 {
+        return false
+    }
+    return (s.starts_with("'") and s.ends_with("'")) or
+    (s.starts_with("\"") and s.ends_with("\""))
+}
+
+fn all_digits(s: str) -> bool {
+    if s.len() == 0 {
+        return false
+    }
+    for c in s.chars() {
+        if c < "0" or c > "9" {
+            return false
+        }
+    }
+    return true
+}
+
+/// A bare scalar, typed the way YAML 1.2 types it.
+pub fn scalar(raw: str) -> ref YamlValue {
+    if was_quoted(raw) {
+        return ref(YamlStr(unquote(raw)))
+    }
+    let s = raw.trim()
+    if s == "" or s == "~" or s == "null" {
+        return ref(YamlNull)
+    }
+    // Only these two. `yes`, `no`, `on` and `off` are strings, which is the
+    // difference between YAML 1.1 and 1.2 and the whole of the Norway problem.
+    if s == "true" {
+        return ref(YamlBool(true))
+    }
+    if s == "false" {
+        return ref(YamlBool(false))
+    }
+    var digits = s
+    if s.starts_with("-") or s.starts_with("+") {
+        digits = s.substr(1, s.len() - 1)
+    }
+    if all_digits(digits) {
+        match s.parse_int() {
+            Some(n) -> return ref(YamlInt(n))
+            None -> {}
+        }
+    }
+    if s.contains(".") or s.contains("e") or s.contains("E") {
+        // Only if the whole thing is a number: `1.2.3` is a version string.
+        match s.parse_float() {
+            Some(f) -> {
+                if s != "." and not s.contains(" ") {
+                    return ref(YamlFloat(f))
+                }
+            }
+            None -> {}
+        }
+    }
+    return ref(YamlStr(s))
+}
+
+/// What a line uses that this package will not guess at.
+///
+/// The value side is checked as well as the line: `a: &x 1` is an anchor and
+/// the line starts with `a`. Refusing only the line form would have read the
+/// anchor name as part of the scalar, which is exactly the quiet
+/// misinterpretation the refusal exists to prevent.
+fn refuse_scalar(v: str) -> Option[str] {
+    if v.starts_with("&") {
+        return Some("anchors")
+    }
+    if v.starts_with("*") {
+        return Some("aliases")
+    }
+    if v.starts_with("!") {
+        return Some("tags")
+    }
+    return None
+}
+
+fn refuse_line(text: str) -> Option[str] {
+    let t = text.trim()
+    if t.starts_with("<<:") {
+        return Some("merge keys")
+    }
+    if t.starts_with("---") and t != "---" {
+        return Some("document markers with content")
+    }
+    if t.starts_with("? ") {
+        return Some("complex keys")
+    }
+    match refuse_scalar(t) {
+        Some(what) -> return Some(what)
+        None -> {}
+    }
+    // And the value after a `key:`, where an anchor or a tag usually sits.
+    let at = key_end(t)
+    if at >= 0 {
+        let value = t.substr(at + 1, t.len() - at - 1).trim()
+        if not was_quoted(value) {
+            return refuse_scalar(value)
+        }
+    }
+    // A sequence item's value, for the same reason.
+    if t.starts_with("- ") {
+        let item = t.substr(2, t.len() - 2).trim()
+        if not was_quoted(item) {
+            return refuse_scalar(item)
+        }
+    }
+    return None
+}
+
+fn useful_lines(source: str) -> [YamlLine] {
+    var out: [YamlLine] = []
+    var number = 0
+    for raw in source.lines() {
+        number = number + 1
+        // Tabs are not indentation in YAML, and treating them as such is how
+        // a file that looks aligned parses as something else.
+        let stripped = strip_comment(raw)
+        if stripped.trim() == "" {
+            continue
+        }
+        if stripped.trim() == "---" or stripped.trim() == "..." {
+            continue
+        }
+        out.push(YamlLine{
+            indent: indent_of(stripped), text: stripped.trim_start(),
+            number: number,
+        })
+    }
+    return out
+}
+
+/// A block scalar's body: every line more indented than its introducer.
+fn block_body(lines: [YamlLine], from: i64, base: i64, folded: bool) -> (str, i64) {
+    var parts: [str] = []
+    var i = from
+    var inner = 0 - 1
+    while i < lines.len() and lines[i].indent > base {
+        if inner < 0 {
+            inner = lines[i].indent
+        }
+        var piece = lines[i].text
+        if lines[i].indent > inner {
+            piece = " ".repeat(lines[i].indent - inner) + piece
+        }
+        parts.push(piece)
+        i = i + 1
+    }
+    if folded {
+        // `>` joins lines with spaces; a blank line would be a paragraph
+        // break, and blank lines are already gone by here. The trailing
+        // newline is "clip" chomping, which is the default for both forms —
+        // `>-` and `|-` are what remove it, and the caller strips it there.
+        if parts.len() == 0 {
+            return ("", i)
+        }
+        return (parts.join(" ") + "\n", i)
+    }
+    if parts.len() == 0 {
+        return ("", i)
+    }
+    return (parts.join("\n") + "\n", i)
+}
+
+fn parse_block(lines: [YamlLine], from: i64, indent: i64) -> (ref YamlValue, i64) ! YamlError {
+    if from >= lines.len() {
+        return (ref(YamlNull), from)
+    }
+    if lines[from].text.starts_with("- ") or lines[from].text == "-" {
+        return try parse_sequence(lines, from, indent)
+    }
+    return try parse_mapping(lines, from, indent)
+}
+
+fn parse_sequence(lines: [YamlLine], from: i64, indent: i64) -> (ref YamlValue, i64) ! YamlError {
+    var items: [ref YamlValue] = []
+    var i = from
+    while i < lines.len() and lines[i].indent == indent {
+        let line = lines[i]
+        if not (line.text.starts_with("- ") or line.text == "-") {
+            break
+        }
+        match refuse_line(line.text) {
+            Some(what) -> fail(Unsupported(what, line.number))
+            None -> {}
+        }
+        let rest = if line.text == "-" { "" } else {
+            line.text.substr(2, line.text.len() - 2).trim()
+        }
+        if rest == "" {
+            // The item is the block below.
+            let inner = try parse_block(lines, i + 1, next_indent(lines, i + 1, indent))
+            items.push(inner.0)
+            i = inner.1
+            continue
+        }
+        if rest.contains(": ") or rest.ends_with(":") {
+            // An inline first key: the item is a mapping starting here.
+            var reshaped: [YamlLine] = [YamlLine{
+                indent: indent + 2, text: rest, number: line.number,
+            }]
+            var j = i + 1
+            while j < lines.len() and lines[j].indent > indent {
+                reshaped.push(lines[j])
+                j = j + 1
+            }
+            let inner = try parse_mapping(reshaped, 0, indent + 2)
+            items.push(inner.0)
+            i = j
+            continue
+        }
+        items.push(scalar(rest))
+        i = i + 1
+    }
+    return (ref(YamlList(items)), i)
+}
+
+fn next_indent(lines: [YamlLine], from: i64, fallback: i64) -> i64 {
+    if from < lines.len() {
+        return lines[from].indent
+    }
+    return fallback
+}
+
+fn parse_mapping(lines: [YamlLine], from: i64, indent: i64) -> (ref YamlValue, i64) ! YamlError {
+    var keys: [str] = []
+    var values: [ref YamlValue] = []
+    var i = from
+    while i < lines.len() and lines[i].indent == indent {
+        let line = lines[i]
+        if line.text.starts_with("- ") or line.text == "-" {
+            break
+        }
+        match refuse_line(line.text) {
+            Some(what) -> fail(Unsupported(what, line.number))
+            None -> {}
+        }
+        let at = key_end(line.text)
+        if at < 0 {
+            fail(NoColon(line.number))
+        }
+        let key = unquote(line.text.substr(0, at))
+        let rest = line.text.substr(at + 1, line.text.len() - at - 1).trim()
+        if rest == "|" or rest == "|-" or rest == ">" or rest == ">-" {
+            let folded = rest.starts_with(">")
+            let body = block_body(lines, i + 1, indent, folded)
+            var content = body.0
+            if rest.ends_with("-") and content.ends_with("\n") {
+                content = content.substr(0, content.len() - 1)
+            }
+            keys.push(key)
+            values.push(ref(YamlStr(content)))
+            i = body.1
+            continue
+        }
+        if rest == "" {
+            // The value is whatever is indented below, or null.
+            if i + 1 < lines.len() and lines[i + 1].indent > indent {
+                let inner = try parse_block(lines, i + 1, lines[i + 1].indent)
+                keys.push(key)
+                values.push(inner.0)
+                i = inner.1
+                continue
+            }
+            // A sequence at the *same* indent as its key is legal YAML.
+            if i + 1 < lines.len() and lines[i + 1].indent == indent and
+            (lines[i + 1].text.starts_with("- ") or lines[i + 1].text == "-") {
+                let inner = try parse_sequence(lines, i + 1, indent)
+                keys.push(key)
+                values.push(inner.0)
+                i = inner.1
+                continue
+            }
+            keys.push(key)
+            values.push(ref(YamlNull))
+            i = i + 1
+            continue
+        }
+        keys.push(key)
+        values.push(scalar(rest))
+        i = i + 1
+    }
+    return (ref(YamlMap(keys, values)), i)
+}
+
+/// Where the key ends: the first `:` that is followed by a space or the end,
+/// and is not inside quotes.
+fn key_end(text: str) -> i64 {
+    let cs = text.chars()
+    var quote = ""
+    var i = 0
+    while i < cs.len() {
+        let c = cs[i]
+        if quote != "" {
+            if c == quote {
+                quote = ""
+            }
+        } else if c == "\"" or c == "'" {
+            quote = c
+        } else if c == ":" and (i + 1 >= cs.len() or cs[i + 1] == " ") {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+pub fn parse(source: str) -> ref YamlValue ! YamlError {
+    let lines = useful_lines(source)
+    if lines.len() == 0 {
+        return ref(YamlNull)
+    }
+    if source.contains("\n- ") == false and source.trim().starts_with("[") {
+        fail(Unsupported("flow sequences", 1))
+    }
+    if source.trim().starts_with("\{") {
+        fail(Unsupported("flow mappings", 1))
+    }
+    let parsed = try parse_block(lines, 0, lines[0].indent)
+    return parsed.0
+}
+
+pub fn kind(v: ref YamlValue) -> str {
+    match v {
+        YamlNull -> return "null"
+        YamlBool(_b) -> return "bool"
+        YamlInt(_n) -> return "int"
+        YamlFloat(_f) -> return "float"
+        YamlStr(_s) -> return "str"
+        YamlList(_i) -> return "list"
+        YamlMap(_k, _v) -> return "map"
+    }
+}
+
+pub fn get(v: ref YamlValue, key: str) -> Option[ref YamlValue] {
+    match v {
+        YamlMap(keys, values) -> {
+            for i in 0..keys.len() {
+                if keys[i] == key {
+                    return Some(values[i])
+                }
+            }
+            return None
+        }
+        _ -> return None
+    }
+}
+
+/// A dotted path, which is how configuration is actually read.
+pub fn path(v: ref YamlValue, dotted: str) -> Option[ref YamlValue] {
+    var here = v
+    for step in dotted.split(".") {
+        match step.parse_int() {
+            Some(n) -> {
+                match at(here, n) {
+                    Some(next) -> here = next
+                    None -> return None
+                }
+            }
+            None -> {
+                match get(here, step) {
+                    Some(next) -> here = next
+                    None -> return None
+                }
+            }
+        }
+    }
+    return Some(here)
+}
+
+pub fn at(v: ref YamlValue, i: i64) -> Option[ref YamlValue] {
+    match v {
+        YamlList(items) -> {
+            if i < 0 or i >= items.len() {
+                return None
+            }
+            return Some(items[i])
+        }
+        _ -> return None
+    }
+}
+
+pub fn as_str(v: ref YamlValue) -> Option[str] {
+    match v {
+        YamlStr(s) -> return Some(s)
+        _ -> return None
+    }
+}
+
+pub fn as_int(v: ref YamlValue) -> Option[i64] {
+    match v {
+        YamlInt(n) -> return Some(n)
+        _ -> return None
+    }
+}
+
+pub fn as_float(v: ref YamlValue) -> Option[f64] {
+    match v {
+        YamlFloat(f) -> return Some(f)
+        YamlInt(n) -> return Some(n.as_f64())
+        _ -> return None
+    }
+}
+
+pub fn as_bool(v: ref YamlValue) -> Option[bool] {
+    match v {
+        YamlBool(b) -> return Some(b)
+        _ -> return None
+    }
+}
+
+pub fn keys_of(v: ref YamlValue) -> [str] {
+    match v {
+        YamlMap(keys, _values) -> return keys
+        _ -> return []
+    }
+}
+
+pub fn items_of(v: ref YamlValue) -> [ref YamlValue] {
+    match v {
+        YamlList(items) -> return items
+        _ -> return []
+    }
+}
+
+fn needs_quoting(s: str) -> bool {
+    if s == "" {
+        return true
+    }
+    if s != s.trim() {
+        return true
+    }
+    if ["true", "false", "null", "~"].contains(s) {
+        return true
+    }
+    for c in [":", "#", "-", "[", "]", "\{", "}", ",", "&", "*", "!", "|", ">",
+        "'", "\"", "%", "@", "`"] {
+        if s.starts_with(c) {
+            return true
+        }
+    }
+    if s.contains(": ") or s.contains(" #") or s.contains("\n") {
+        return true
+    }
+    // A bare scalar that would read back as a number must be quoted to stay
+    // a string.
+    return s.parse_int() != None or s.parse_float() != None
+}
+
+fn quote(s: str) -> str {
+    let escaped = s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")
+    return "\"{escaped}\""
+}
+
+fn render_into(inout out: [str], v: ref YamlValue, indent: i64) {
+    let pad = " ".repeat(indent)
+    match v {
+        YamlNull -> out.push("{pad}null")
+        YamlBool(b) -> out.push("{pad}{b}")
+        YamlInt(n) -> out.push("{pad}{n}")
+        YamlFloat(f) -> out.push("{pad}{f}")
+        YamlStr(s) -> out.push(pad + (if needs_quoting(s) { quote(s) } else { s }))
+        YamlList(items) -> {
+            for item in items {
+                match item {
+                    YamlList(_i) -> {
+                        out.push("{pad}-")
+                        render_into(out, item, indent + 2)
+                    }
+                    YamlMap(_k, _v) -> {
+                        // `- key: value`, not `-` on a line of its own: both
+                        // parse the same and only one is what anyone writes.
+                        var inner: [str] = []
+                        render_into(inner, item, indent + 2)
+                        if inner.len() == 0 {
+                            out.push("{pad}-")
+                        } else {
+                            out.push("{pad}- " + inner[0].trim_start())
+                            for j in 1..inner.len() {
+                                out.push(inner[j])
+                            }
+                        }
+                    }
+                    _ -> {
+                        var one: [str] = []
+                        render_into(one, item, 0)
+                        out.push("{pad}- {one[0]}")
+                    }
+                }
+            }
+        }
+        YamlMap(keys, values) -> {
+            for i in 0..keys.len() {
+                let key = if needs_quoting(keys[i]) { quote(keys[i]) } else { keys[i] }
+                match values[i] {
+                    YamlList(inner) -> {
+                        out.push("{pad}{key}:")
+                        if inner.len() > 0 {
+                            render_into(out, values[i], indent + 2)
+                        }
+                    }
+                    YamlMap(inner_keys, _v) -> {
+                        out.push("{pad}{key}:")
+                        if inner_keys.len() > 0 {
+                            render_into(out, values[i], indent + 2)
+                        }
+                    }
+                    _ -> {
+                        var one: [str] = []
+                        render_into(one, values[i], 0)
+                        out.push("{pad}{key}: {one[0]}")
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn render(v: ref YamlValue) -> str {
+    var out: [str] = []
+    render_into(out, v, 0)
+    return out.join("\n") + "\n"
+}

@@ -1,0 +1,24 @@
+[package]
+name = "formats2_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.msgpack]
+path = "../msgpack"
+version = "^1.0.0"
+
+[dependencies.cbor]
+path = "../cbor"
+version = "^1.0.0"
+
+[dependencies.yamlish]
+path = "../yamlish"
+version = "^1.0.0"
+
+[dependencies.markdown]
+path = "../markdown"
+version = "^1.0.0"
+
+[dependencies.template]
+path = "../template"
+version = "^1.0.0"

@@ -1,0 +1,6 @@
+[package]
+name = "markdown"
+version = "1.0.0"
+
+# Markdown to HTML, the subset a README uses. Opens nothing.
+capabilities = []
