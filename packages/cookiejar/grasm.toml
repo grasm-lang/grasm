@@ -1,0 +1,6 @@
+[package]
+name = "cookiejar"
+version = "1.0.0"
+
+# Parsing headers. Opens nothing.
+capabilities = []

@@ -1,0 +1,16 @@
+[package]
+name = "http2_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.cookiejar]
+path = "../cookiejar"
+version = "^1.0.0"
+
+[dependencies.linkheader]
+path = "../linkheader"
+version = "^1.0.0"
+
+[dependencies.multipart]
+path = "../multipart"
+version = "^1.0.0"

@@ -1,0 +1,179 @@
+// `multipart/form-data` — how a browser uploads a file.
+//
+// The boundary is the whole format and the reason a naive parser is unsafe.
+// A boundary line is `--` then the boundary; the final one has a trailing
+// `--`. Searching for the boundary *anywhere* rather than at a line start
+// splits a file whose contents happen to contain the boundary string, which is
+// a corrupted upload an attacker can arrange deliberately.
+//
+// Bodies are `bytes`, not `str`: an upload is arbitrary binary and re-encoding
+// it as text corrupts anything above 127.
+
+type Part = {
+    name: str,
+    filename: str,
+    content_type: str,
+    body: bytes,
+}
+
+type MultipartError =
+    | NoBoundary
+    | Malformed(at: i64)
+
+    /// The boundary from a `Content-Type: multipart/form-data; boundary=...`.
+pub fn boundary_of(content_type: str) -> Option[str] {
+    for piece in content_type.split(";") {
+        let p = piece.trim()
+        if p.to_lower().starts_with("boundary=") {
+            var v = p.substr(9, p.len() - 9).trim()
+            if v.len() >= 2 and v.starts_with("\"") and v.ends_with("\"") {
+                v = v.substr(1, v.len() - 2)
+            }
+            return Some(v)
+        }
+    }
+    return None
+}
+
+fn matches_at(body: bytes, at: i64, needle: bytes) -> bool {
+    if at + needle.len() > body.len() {
+        return false
+    }
+    for i in 0..needle.len() {
+        if body.at(at + i) != needle.at(i) {
+            return false
+        }
+    }
+    return true
+}
+
+/// Offsets where the delimiter starts, only at the beginning of a line.
+fn delimiter_offsets(body: bytes, boundary: str) -> [i64] {
+    let needle = ("--" + boundary).to_bytes()
+    var out: [i64] = []
+    var i = 0
+    while i < body.len() {
+        // Line start: offset zero, or just after a newline. Anything else is
+        // the boundary appearing inside a file, which is not a delimiter.
+        let at_line_start = i == 0 or body.at(i - 1) == 10
+        if at_line_start and matches_at(body, i, needle) {
+            out.push(i)
+            i = i + needle.len()
+        } else {
+            i = i + 1
+        }
+    }
+    return out
+}
+
+fn header_block(body: bytes, from: i64) -> (str, i64) {
+    // Headers end at a blank line: CRLF CRLF or LF LF.
+    var i = from
+    var text = ""
+    while i < body.len() {
+        if body.at(i) == 10 {
+            let next_is_blank = i + 1 < body.len() and body.at(i + 1) == 10
+            let next_is_crlf = i + 2 < body.len() and body.at(i + 1) == 13 and
+            body.at(i + 2) == 10
+            if next_is_blank {
+                return (text, i + 2)
+            }
+            if next_is_crlf {
+                return (text, i + 3)
+            }
+        }
+        if body.at(i) != 13 {
+            text = text + bytes_of([body.at(i)]).to_str()
+        }
+        i = i + 1
+    }
+    return (text, body.len())
+}
+
+fn quoted_value(header: str, key: str) -> str {
+    match header.index_of(key + "=\"") {
+        None -> return ""
+        Some(at) -> {
+            let from = at + key.len() + 2
+            let rest = header.substr(from, header.len() - from)
+            match rest.index_of("\"") {
+                None -> return ""
+                Some(end) -> return rest.substr(0, end)
+            }
+        }
+    }
+}
+
+pub fn parse(body: bytes, boundary: str) -> [Part] ! MultipartError {
+    if boundary == "" {
+        fail(NoBoundary)
+    }
+    let marks = delimiter_offsets(body, boundary)
+    if marks.len() < 2 {
+        fail(Malformed(0))
+    }
+    var out: [Part] = []
+    var done = false
+    for k in 0..(marks.len() - 1) {
+        let start = marks[k] + boundary.len() + 2
+        // A final delimiter is followed by `--`; nothing after it is a part.
+        if start + 1 < body.len() and body.at(start) == 45 and body.at(start + 1) == 45 {
+            done = true
+        }
+        if not done {
+            let (headers, body_at) = header_block(body, start)
+            var end = marks[k + 1]
+            // Trim the CRLF that belongs to the delimiter, not the content.
+            if end >= 1 and body.at(end - 1) == 10 {
+                end = end - 1
+            }
+            if end >= 1 and body.at(end - 1) == 13 {
+                end = end - 1
+            }
+            if end > body_at {
+                var content: [i64] = []
+                for i in body_at..end {
+                    content.push(body.at(i))
+                }
+                out.push(Part{
+                    name: quoted_value(headers, "name"),
+                    filename: quoted_value(headers, "filename"),
+                    content_type: content_type_of(headers),
+                    body: bytes_of(content),
+                })
+            }
+        }
+    }
+    return out
+}
+
+fn content_type_of(headers: str) -> str {
+    for line in headers.split("\n") {
+        let l = line.trim()
+        if l.to_lower().starts_with("content-type:") {
+            return l.substr(13, l.len() - 13).trim()
+        }
+    }
+    return ""
+}
+
+/// The part with this field name.
+pub fn field(parts: [Part], name: str) -> Option[Part] {
+    for p in parts {
+        if p.name == name {
+            return Some(p)
+        }
+    }
+    return None
+}
+
+/// Parts that carry a filename, which is what an upload handler wants.
+pub fn files(parts: [Part]) -> [Part] {
+    var out: [Part] = []
+    for p in parts {
+        if p.filename != "" {
+            out.push(p)
+        }
+    }
+    return out
+}

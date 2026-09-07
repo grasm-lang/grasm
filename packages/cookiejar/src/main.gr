@@ -1,0 +1,155 @@
+// Cookies: parsing `Set-Cookie`, and deciding what to send back.
+//
+// The matching rules are where the security lives and where hand-rolled jars
+// go wrong. A cookie for `example.com` **must** be sent to `api.example.com`
+// but **must not** be sent to `notexample.com` — a naive `ends_with` check
+// passes the second, which leaks a session to an attacker's domain. The
+// domain match here requires a dot boundary.
+//
+// Path matching has the same shape: `/foo` matches `/foo/bar` but not
+// `/foobar`.
+
+type Cookie = {
+    name: str,
+    value: str,
+    domain: str,
+    path: str,
+    /// Seconds since the epoch; -1 for a session cookie.
+    expires: i64,
+    secure: bool,
+    http_only: bool,
+    same_site: str,
+}
+
+pub fn new_jar() -> [Cookie] {
+    return []
+}
+
+/// One `Set-Cookie` header.
+pub fn parse_set_cookie(header: str, default_domain: str) -> Option[Cookie] {
+    let parts = header.split(";")
+    if parts.len() == 0 {
+        return None
+    }
+    let first = parts[0]
+    match first.index_of("=") {
+        None -> return None
+        Some(at) -> {
+            var c = Cookie{
+                name: first.substr(0, at).trim(),
+                value: first.substr(at + 1, first.len() - at - 1).trim(),
+                domain: default_domain,
+                path: "/",
+                expires: 0 - 1,
+                secure: false,
+                http_only: false,
+                same_site: "Lax",
+            }
+            if c.name == "" {
+                return None
+            }
+            for i in 1..parts.len() {
+                let attr = parts[i].trim()
+                let low = attr.to_lower()
+                if low == "secure" {
+                    c.secure = true
+                } else {
+                    if low == "httponly" {
+                        c.http_only = true
+                    } else {
+                        match attr.index_of("=") {
+                            None -> {}
+                            Some(eq) -> {
+                                let key = attr.substr(0, eq).trim().to_lower()
+                                let v = attr.substr(eq + 1, attr.len() - eq - 1).trim()
+                                if key == "domain" {
+                                    // A leading dot is legacy and means the
+                                    // same thing as no dot.
+                                    c.domain = if v.starts_with(".") {
+                                        v.substr(1, v.len() - 1)
+                                    } else {
+                                        v
+                                    }.to_lower()
+                                }
+                                if key == "path" {
+                                    c.path = v
+                                }
+                                if key == "max-age" {
+                                    c.expires = v.parse_int() ?? 0 - 1
+                                }
+                                if key == "samesite" {
+                                    c.same_site = v
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return Some(c)
+        }
+    }
+}
+
+/// Whether a cookie for `cookie_domain` may be sent to `host`.
+///
+/// Equal, or `host` ends with `.cookie_domain`. The dot is the whole point:
+/// without it `notexample.com` matches a cookie for `example.com`.
+pub fn domain_matches(cookie_domain: str, host: str) -> bool {
+    let c = cookie_domain.to_lower()
+    let h = host.to_lower()
+    if c == h {
+        return true
+    }
+    if h.len() <= c.len() {
+        return false
+    }
+    return h.ends_with("." + c)
+}
+
+/// `/foo` matches `/foo` and `/foo/bar`, not `/foobar`.
+pub fn path_matches(cookie_path: str, path: str) -> bool {
+    if cookie_path == path {
+        return true
+    }
+    if not path.starts_with(cookie_path) {
+        return false
+    }
+    if cookie_path.ends_with("/") {
+        return true
+    }
+    return path.substr(cookie_path.len(), 1) == "/"
+}
+
+/// Store a cookie, replacing one with the same name, domain and path.
+pub fn store(inout jar: [Cookie], c: Cookie) {
+    var out: [Cookie] = []
+    for existing in jar {
+        if not (existing.name == c.name and existing.domain == c.domain and
+            existing.path == c.path) {
+            out.push(existing)
+        }
+    }
+    // An expiry in the past is a deletion, which is how a server logs you out.
+    if c.expires != 0 {
+        out.push(c)
+    }
+    jar = out
+}
+
+/// The `Cookie` header to send, given where the request is going.
+pub fn header_for(jar: [Cookie], host: str, path: str, is_https: bool) -> str {
+    var parts: [str] = []
+    for c in jar {
+        if domain_matches(c.domain, host) and path_matches(c.path, path) {
+            // A Secure cookie must never travel in the clear.
+            if not c.secure or is_https {
+                parts.push("{c.name}={c.value}")
+            }
+        }
+    }
+    return parts.join("; ")
+}
+
+pub fn count(jar: [Cookie]) -> i64 {
+    return jar.len()
+}

@@ -1,0 +1,109 @@
+// The `Link` header — how a paginated API says where the next page is.
+//
+// GitHub, Stripe and every well-behaved REST API put pagination here rather
+// than in the body, because it belongs to the transport and not to the data. A
+// client that instead builds `?page=N+1` by hand breaks the moment the server
+// changes its cursor scheme, which is exactly what a cursor is for.
+//
+// The format is RFC 8288: `<url>; rel="next", <url>; rel="last"`.
+
+type Link = {
+    url: str,
+    rel: str,
+    title: str,
+}
+
+pub fn parse(header: str) -> [Link] {
+    var out: [Link] = []
+    // Split on commas that are not inside angle brackets.
+    var pieces: [str] = []
+    var current = ""
+    var depth = 0
+    for c in header.chars() {
+        if c == "<" {
+            depth = depth + 1
+        }
+        if c == ">" {
+            depth = depth - 1
+        }
+        if c == "," and depth == 0 {
+            pieces.push(current)
+            current = ""
+        } else {
+            current = current + c
+        }
+    }
+    if current.trim() != "" {
+        pieces.push(current)
+    }
+    for piece in pieces {
+        let parts = piece.split(";")
+        if parts.len() > 0 {
+            let raw = parts[0].trim()
+            if raw.len() >= 2 and raw.starts_with("<") and raw.ends_with(">") {
+                var link = Link{
+                    url: raw.substr(1, raw.len() - 2),
+                    rel: "",
+                    title: "",
+                }
+                for i in 1..parts.len() {
+                    let attr = parts[i].trim()
+                    match attr.index_of("=") {
+                        None -> {}
+                        Some(at) -> {
+                            let key = attr.substr(0, at).trim().to_lower()
+                            var v = attr.substr(at + 1, attr.len() - at - 1).trim()
+                            if v.len() >= 2 and v.starts_with("\"") and v.ends_with("\"") {
+                                v = v.substr(1, v.len() - 2)
+                            }
+                            if key == "rel" {
+                                link.rel = v
+                            }
+                            if key == "title" {
+                                link.title = v
+                            }
+                        }
+                    }
+                }
+                out.push(link)
+            }
+        }
+    }
+    return out
+}
+
+/// The URL for a relation, which is the only thing most callers want.
+pub fn url_for(header: str, rel: str) -> Option[str] {
+    for l in parse(header) {
+        if l.rel == rel {
+            return Some(l.url)
+        }
+    }
+    return None
+}
+
+pub fn next_page(header: str) -> Option[str] {
+    return url_for(header, "next")
+}
+
+pub fn last_page(header: str) -> Option[str] {
+    return url_for(header, "last")
+}
+
+/// Whether there is another page — the loop condition a client actually needs.
+pub fn has_more(header: str) -> bool {
+    return next_page(header) != None
+}
+
+/// Build a header from links.
+pub fn render(links: [Link]) -> str {
+    var parts: [str] = []
+    for l in links {
+        var one = "<{l.url}>; rel=\"{l.rel}\""
+        if l.title != "" {
+            one = one + "; title=\"{l.title}\""
+        }
+        parts.push(one)
+    }
+    return parts.join(", ")
+}

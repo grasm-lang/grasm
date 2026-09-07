@@ -1,0 +1,142 @@
+// Cookies, pagination and uploads. Each section asserts the case where the
+// naive implementation is a security bug rather than a nuisance.
+import cookiejar
+import linkheader
+import multipart
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+
+    print("-- cookies, where ends_with leaks a session")
+    match cookiejar.parse_set_cookie("sid=abc123; Domain=example.com; Path=/app; Secure; HttpOnly", "x.com") {
+        None -> say(f, "parses a Set-Cookie", false)
+        Some(c) -> {
+            say(f, "name and value", c.name == "sid" and c.value == "abc123")
+            say(f, "domain", c.domain == "example.com")
+            say(f, "path", c.path == "/app")
+            say(f, "flags", c.secure and c.http_only)
+        }
+    }
+    // A subdomain must receive it.
+    say(f, "example.com reaches api.example.com",
+        cookiejar.domain_matches("example.com", "api.example.com"))
+    say(f, "and itself", cookiejar.domain_matches("example.com", "example.com"))
+    // The one that matters: a naive ends_with check passes this.
+    say(f, "but NOT notexample.com",
+        not cookiejar.domain_matches("example.com", "notexample.com"))
+    say(f, "nor an unrelated host", not cookiejar.domain_matches("example.com", "evil.org"))
+    say(f, "/foo matches /foo/bar", cookiejar.path_matches("/foo", "/foo/bar"))
+    say(f, "but NOT /foobar", not cookiejar.path_matches("/foo", "/foobar"))
+    var jar = cookiejar.new_jar()
+    match cookiejar.parse_set_cookie("a=1; Domain=example.com", "example.com") {
+        Some(c) -> cookiejar.store(jar, c)
+        None -> {}
+    }
+    match cookiejar.parse_set_cookie("b=2; Domain=example.com; Secure", "example.com") {
+        Some(c) -> cookiejar.store(jar, c)
+        None -> {}
+    }
+    say(f, "two stored", cookiejar.count(jar) == 2)
+    // A Secure cookie must never travel in the clear.
+    say(f, "over http, only the insecure one is sent",
+        cookiejar.header_for(jar, "example.com", "/", false) == "a=1")
+    say(f, "over https, both", cookiejar.header_for(jar, "example.com", "/", true) == "a=1; b=2")
+    say(f, "and nothing to another host",
+        cookiejar.header_for(jar, "evil.org", "/", true) == "")
+    // Max-Age=0 is how a server logs you out.
+    match cookiejar.parse_set_cookie("a=; Domain=example.com; Max-Age=0", "example.com") {
+        Some(c) -> cookiejar.store(jar, c)
+        None -> {}
+    }
+    say(f, "Max-Age=0 deletes", cookiejar.count(jar) == 1)
+
+    print("-- Link headers, which is where pagination belongs")
+    let h = "<https://api.test/items?page=2>; rel=\"next\", " +
+    "<https://api.test/items?page=9>; rel=\"last\""
+    say(f, "two links", linkheader.parse(h).len() == 2)
+    say(f, "next", linkheader.next_page(h) == Some("https://api.test/items?page=2"))
+    say(f, "last", linkheader.last_page(h) == Some("https://api.test/items?page=9"))
+    say(f, "has_more is the loop condition", linkheader.has_more(h))
+    say(f, "and a last page has none", not linkheader.has_more("<x>; rel=\"prev\""))
+    say(f, "an unknown rel is None", linkheader.url_for(h, "first") == None)
+    // A comma inside the URL must not split the header.
+    let comma = "<https://api.test/a,b>; rel=\"next\""
+    say(f, "a comma inside angle brackets does not split",
+        linkheader.next_page(comma) == Some("https://api.test/a,b"))
+    say(f, "round trips", linkheader.parse(linkheader.render(linkheader.parse(h))).len() == 2)
+
+    print("-- multipart, where the boundary must be at a line start")
+    let bnd = "----X"
+    let body = "------X\r\n" +
+    "Content-Disposition: form-data; name=\"title\"\r\n" +
+    "\r\n" +
+    "Hello\r\n" +
+    "------X\r\n" +
+    "Content-Disposition: form-data; name=\"doc\"; filename=\"a.txt\"\r\n" +
+    "Content-Type: text/plain\r\n" +
+    "\r\n" +
+    "file body here\r\n" +
+    "------X--\r\n"
+    say(f, "the boundary is read from the content type",
+        multipart.boundary_of("multipart/form-data; boundary=----X") == Some("----X"))
+    say(f, "a quoted boundary too",
+        multipart.boundary_of("multipart/form-data; boundary=\"abc\"") == Some("abc"))
+    match multipart.parse(body.to_bytes(), bnd) {
+        Err(_e) -> say(f, "parses two parts", false)
+        Ok(parts) -> {
+            say(f, "parses two parts", parts.len() == 2)
+            match multipart.field(parts, "title") {
+                None -> say(f, "a plain field", false)
+                Some(p) -> say(f, "a plain field", p.body.to_str() == "Hello")
+            }
+            match multipart.field(parts, "doc") {
+                None -> say(f, "a file part", false)
+                Some(p) -> {
+                    say(f, "a file part keeps its name", p.filename == "a.txt")
+                    say(f, "and its type", p.content_type == "text/plain")
+                    say(f, "and its bytes exactly", p.body.to_str() == "file body here")
+                }
+            }
+            say(f, "files() finds the upload", multipart.files(parts).len() == 1)
+        }
+    }
+    // The security case: a body containing the boundary mid-line must not split.
+    let tricky = "------X\r\n" +
+    "Content-Disposition: form-data; name=\"data\"\r\n" +
+    "\r\n" +
+    "prefix------X suffix\r\n" +
+    "------X--\r\n"
+    match multipart.parse(tricky.to_bytes(), bnd) {
+        Err(_e) -> say(f, "a boundary inside a value", false)
+        Ok(parts) -> {
+            say(f, "a boundary mid-line does NOT split the part", parts.len() == 1)
+            match multipart.field(parts, "data") {
+                None -> say(f, "and the value survives whole", false)
+                Some(p) -> say(f, "and the value survives whole",
+                    p.body.to_str() == "prefix------X suffix")
+            }
+        }
+    }
+    say(f, "no boundary is refused", {
+        match multipart.parse(body.to_bytes(), "") {
+            Err(_e) -> true
+            Ok(_p) -> false
+        }
+    })
+
+    print("")
+    if f == 0 {
+        print("all held")
+    } else {
+        print("{f} failed")
+    }
+}
