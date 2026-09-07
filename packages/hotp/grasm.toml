@@ -1,0 +1,10 @@
+[package]
+name = "hotp"
+version = "1.0.0"
+
+# Arithmetic over a hash. Opens nothing.
+capabilities = []
+
+[dependencies.sha1]
+path = "../sha1"
+version = "^1.0.0"

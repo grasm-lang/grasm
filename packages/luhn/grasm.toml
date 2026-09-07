@@ -1,0 +1,6 @@
+[package]
+name = "luhn"
+version = "1.0.0"
+
+# Arithmetic over digits. Opens nothing.
+capabilities = []

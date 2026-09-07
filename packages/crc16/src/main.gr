@@ -1,0 +1,67 @@
+// CRC-16, in the two variants that actually appear on wires.
+//
+// There are dozens of CRC-16s and they disagree, which is why "CRC-16" alone
+// is not a specification. These two are named by their parameters rather than
+// by a vendor: MODBUS (reflected, polynomial 0xA001, initial 0xFFFF) and
+// CCITT-FALSE (not reflected, 0x1021, initial 0xFFFF). Getting the pairing
+// wrong produces a checksum that is stable, plausible, and rejected by the
+// device at the other end.
+
+fn mask16(v: i64) -> i64 {
+    return v.bit_and(65535)
+}
+
+/// MODBUS: reflected, 0xA001, init 0xFFFF, no final xor.
+pub fn modbus(b: bytes) -> i64 {
+    var crc = 65535
+    for i in 0..b.len() {
+        crc = crc.bit_xor(b.at(i))
+        for _k in 0..8 {
+            if crc % 2 == 1 {
+                crc = mask16(crc / 2).bit_xor(40961)
+            } else {
+                crc = crc / 2
+            }
+        }
+    }
+    return mask16(crc)
+}
+
+/// CCITT-FALSE: not reflected, 0x1021, init 0xFFFF, no final xor.
+pub fn ccitt(b: bytes) -> i64 {
+    var crc = 65535
+    for i in 0..b.len() {
+        crc = crc.bit_xor(mask16(b.at(i) * 256))
+        for _k in 0..8 {
+            if crc.bit_and(32768) != 0 {
+                crc = mask16(crc * 2).bit_xor(4129)
+            } else {
+                crc = mask16(crc * 2)
+            }
+        }
+    }
+    return mask16(crc)
+}
+
+/// XMODEM: the same polynomial as CCITT with an initial value of zero.
+pub fn xmodem(b: bytes) -> i64 {
+    var crc = 0
+    for i in 0..b.len() {
+        crc = crc.bit_xor(mask16(b.at(i) * 256))
+        for _k in 0..8 {
+            if crc.bit_and(32768) != 0 {
+                crc = mask16(crc * 2).bit_xor(4129)
+            } else {
+                crc = mask16(crc * 2)
+            }
+        }
+    }
+    return mask16(crc)
+}
+
+/// MODBUS puts the checksum on the wire low byte first, which is the other
+/// half of the specification and the other half of what goes wrong.
+pub fn modbus_trailer(b: bytes) -> bytes {
+    let c = modbus(b)
+    return bytes_of([c % 256, c / 256])
+}

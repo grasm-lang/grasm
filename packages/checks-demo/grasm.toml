@@ -1,0 +1,16 @@
+[package]
+name = "checks_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.hotp]
+path = "../hotp"
+version = "^1.0.0"
+
+[dependencies.luhn]
+path = "../luhn"
+version = "^1.0.0"
+
+[dependencies.crc16]
+path = "../crc16"
+version = "^1.0.0"

@@ -1,0 +1,69 @@
+// One-time codes and checksums, against the standards that define them.
+import hotp
+import luhn
+import crc16
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+
+    print("-- HOTP, against RFC 4226's own table")
+    // The RFC publishes these ten for the secret "12345678901234567890".
+    let secret = "12345678901234567890".to_bytes()
+    let expect = ["755224", "287082", "359152", "969429", "338314",
+        "254676", "287922", "162583", "399871", "520489"]
+    for c in 0..10 {
+        say(f, "counter {c} is {expect[c]}", hotp.hotp(secret, c, 6) == expect[c])
+    }
+    say(f, "eight digits are zero-padded to eight", hotp.hotp(secret, 0, 8).len() == 8)
+
+    print("-- TOTP")
+    // RFC 6238's first vector: T=59 with a 30-second step is counter 1.
+    say(f, "T=59 is counter 1", hotp.totp(secret, 59, 30, 6) == hotp.hotp(secret, 1, 6))
+    let now = 59
+    let code = hotp.totp(secret, now, 30, 6)
+    say(f, "verifies at the moment it was made", hotp.verify(secret, code, now, 30, 1))
+    say(f, "verifies one step late", hotp.verify(secret, code, now + 30, 30, 1))
+    say(f, "refuses far out of window", not hotp.verify(secret, code, now + 3000, 30, 1))
+    say(f, "refuses the wrong code", not hotp.verify(secret, "000000", now, 30, 1))
+
+    print("-- Luhn")
+    // The standard test numbers every payment library uses.
+    say(f, "a valid Visa test number", luhn.valid("4539578763621486"))
+    say(f, "a one-digit error is caught", not luhn.valid("4539578763621487"))
+    say(f, "a transposition is caught", not luhn.valid("4539578763624186"))
+    say(f, "79927398713 is the textbook example", luhn.valid("79927398713"))
+    say(f, "and 79927398710 is not", not luhn.valid("79927398710"))
+    say(f, "the check digit completes it", luhn.check_digit("7992739871") == 3)
+    say(f, "complete round-trips", luhn.valid(luhn.complete("7992739871")))
+    say(f, "spaces and dashes are ignored", luhn.valid("4539-5787-6362-1486"))
+    say(f, "too short is not valid", not luhn.valid("4"))
+    say(f, "scheme by prefix", luhn.scheme_of("4539578763621486") == "visa")
+    say(f, "amex is fifteen digits", luhn.scheme_of("378282246310005") == "amex")
+
+    print("-- CRC-16, where the variant is the specification")
+    // "123456789" is the check value every CRC catalogue publishes.
+    say(f, "MODBUS of 123456789 is 0x4B37", crc16.modbus("123456789".to_bytes()) == 19255)
+    say(f, "CCITT-FALSE is 0x29B1", crc16.ccitt("123456789".to_bytes()) == 10673)
+    say(f, "XMODEM is 0x31C3", crc16.xmodem("123456789".to_bytes()) == 12739)
+    say(f, "the three disagree, which is the point",
+        crc16.modbus("123456789".to_bytes()) != crc16.ccitt("123456789".to_bytes()))
+    say(f, "MODBUS puts the low byte first on the wire",
+        crc16.modbus_trailer("123456789".to_bytes()).at(0) == 55)
+    say(f, "empty MODBUS is the initial value", crc16.modbus(bytes_of([])) == 65535)
+
+    print("")
+    if f == 0 {
+        print("all held")
+    } else {
+        print("{f} failed")
+    }
+}

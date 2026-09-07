@@ -1,0 +1,93 @@
+// The Luhn check, which every card number and IMEI carries.
+//
+// It catches every single-digit error and almost every transposition of
+// adjacent digits, which is what a person typing a number actually does wrong.
+// It is a checksum, not a security measure: it says a number is well-formed,
+// never that an account exists, and treating a Luhn pass as validation is a
+// mistake that reaches production regularly.
+
+fn digits_of(text: str) -> [i64] {
+    var out: [i64] = []
+    for c in text.chars() {
+        if c >= "0" and c <= "9" {
+            out.push((c.parse_int() ?? 0))
+        }
+    }
+    return out
+}
+
+/// Whether the number carries a valid check digit.
+pub fn valid(number: str) -> bool {
+    let d = digits_of(number)
+    if d.len() < 2 {
+        return false
+    }
+    var total = 0
+    var double = false
+    var i = d.len() - 1
+    while i >= 0 {
+        var v = d[i]
+        if double {
+            v = v * 2
+            if v > 9 {
+                v = v - 9
+            }
+        }
+        total = total + v
+        double = not double
+        i = i - 1
+    }
+    return total % 10 == 0
+}
+
+/// The digit that would complete `partial`.
+pub fn check_digit(partial: str) -> i64 {
+    let d = digits_of(partial)
+    var total = 0
+    var double = true
+    var i = d.len() - 1
+    while i >= 0 {
+        var v = d[i]
+        if double {
+            v = v * 2
+            if v > 9 {
+                v = v - 9
+            }
+        }
+        total = total + v
+        double = not double
+        i = i - 1
+    }
+    return (10 - total % 10) % 10
+}
+
+pub fn complete(partial: str) -> str {
+    return partial + "{check_digit(partial)}"
+}
+
+/// The issuer, by prefix and length. Naming only — it says nothing about
+/// whether the card exists or has funds.
+pub fn scheme_of(number: str) -> str {
+    let d = digits_of(number)
+    if d.len() == 0 {
+        return "unknown"
+    }
+    let n = d.len()
+    let two = if n >= 2 { d[0] * 10 + d[1] } else { 0 - 1 }
+    if d[0] == 4 and (n == 13 or n == 16 or n == 19) {
+        return "visa"
+    }
+    if two >= 51 and two <= 55 and n == 16 {
+        return "mastercard"
+    }
+    if (two == 34 or two == 37) and n == 15 {
+        return "amex"
+    }
+    if two == 62 {
+        return "unionpay"
+    }
+    if two == 65 or (n >= 4 and d[0] == 6 and d[1] == 0 and d[2] == 1 and d[3] == 1) {
+        return "discover"
+    }
+    return "unknown"
+}

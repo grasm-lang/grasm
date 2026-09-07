@@ -1,0 +1,116 @@
+// HOTP and TOTP — the six digits in an authenticator app.
+//
+// RFC 4226 and RFC 6238. Both are a HMAC, then "dynamic truncation": the low
+// four bits of the last byte pick where in the digest to read four bytes from,
+// and the top bit of those is cleared so the number is positive regardless of
+// how the language treats sign.
+//
+// That last detail is the one implementations get wrong, and it is invisible
+// in testing until a digest happens to have its high bit set — roughly half
+// the time, which means a broken implementation works about half the time and
+// looks intermittent rather than wrong.
+import sha1
+
+fn block_size() -> i64 {
+    return 64
+}
+
+/// HMAC-SHA1, built here rather than imported: `crypto_hash` supplies the
+/// SHA-256 one, and RFC 4226 is defined on SHA-1.
+pub fn hmac_sha1(key: bytes, message: bytes) -> bytes {
+    var k: [i64] = []
+    if key.len() > block_size() {
+        let shortened = sha1.hash(key)
+        for i in 0..shortened.len() {
+            k.push(shortened.at(i))
+        }
+    } else {
+        for i in 0..key.len() {
+            k.push(key.at(i))
+        }
+    }
+    while k.len() < block_size() {
+        k.push(0)
+    }
+    var inner: [i64] = []
+    var outer: [i64] = []
+    for i in 0..block_size() {
+        inner.push(k[i].bit_xor(54))
+        outer.push(k[i].bit_xor(92))
+    }
+    for i in 0..message.len() {
+        inner.push(message.at(i))
+    }
+    let ih = sha1.hash(bytes_of(inner))
+    for i in 0..ih.len() {
+        outer.push(ih.at(i))
+    }
+    return sha1.hash(bytes_of(outer))
+}
+
+fn power10(n: i64) -> i64 {
+    var v = 1
+    for _i in 0..n {
+        v = v * 10
+    }
+    return v
+}
+
+/// The HOTP code for `counter`, `digits` long.
+pub fn hotp(secret: bytes, counter: i64, digits: i64) -> str {
+    // The counter is eight bytes, big-endian.
+    var msg: [i64] = []
+    var shift = 56
+    while shift >= 0 {
+        msg.push((counter / (2 ^ shift)) % 256)
+        shift = shift - 8
+    }
+    let mac = hmac_sha1(secret, bytes_of(msg))
+    // Dynamic truncation: the last nibble is the offset.
+    let offset = mac.at(mac.len() - 1) % 16
+    // The top bit of the first byte is cleared — without this the value can
+    // be negative and the code is wrong about half the time.
+    let value = mac.at(offset).bit_and(127) * 16777216 +
+    mac.at(offset + 1) * 65536 +
+    mac.at(offset + 2) * 256 +
+    mac.at(offset + 3)
+    var text = "{value % power10(digits)}"
+    while text.len() < digits {
+        text = "0" + text
+    }
+    return text
+}
+
+/// The TOTP code for a moment, with a step in seconds.
+pub fn totp(secret: bytes, unix_seconds: i64, step: i64, digits: i64) -> str {
+    return hotp(secret, unix_seconds / step, digits)
+}
+
+/// Whether `code` matches, allowing `drift` steps either side.
+///
+/// A window exists because clocks disagree; it is checked in constant time
+/// because a timing difference tells an attacker how many digits were right.
+pub fn verify(secret: bytes, code: str, unix_seconds: i64, step: i64, drift: i64) -> bool {
+    var ok = false
+    var d = 0 - drift
+    while d <= drift {
+        let expect = totp(secret, unix_seconds + d * step, step, code.len())
+        var same = expect.len() == code.len()
+        let a = expect.chars()
+        let b = code.chars()
+        if same {
+            var diff = 0
+            for i in 0..a.len() {
+                if a[i] != b[i] {
+                    diff = diff + 1
+                }
+            }
+            same = diff == 0
+        }
+        if same {
+            ok = true
+        }
+        d = d + 1
+    }
+    return ok
+}
