@@ -1,0 +1,16 @@
+[package]
+name = "media_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.colorspace]
+path = "../colorspace"
+version = "^1.0.0"
+
+[dependencies.easing]
+path = "../easing"
+version = "^1.0.0"
+
+[dependencies.bmp]
+path = "../bmp"
+version = "^1.0.0"

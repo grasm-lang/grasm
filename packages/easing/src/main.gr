@@ -1,0 +1,132 @@
+// Easing curves for animation, in fixed point.
+//
+// Every curve here takes and returns thousandths of the way through, so the
+// arithmetic is integer and two runs give identical output — which is what
+// makes an animation testable at all. A float version is not reproducible
+// across engines and cannot be asserted on.
+//
+// Every function satisfies `f(0) = 0` and `f(1000) = 1000`. An easing that
+// does not is a curve that starts or ends somewhere other than where the
+// caller put it, and the demo checks all of them.
+
+fn clamp(t: i64) -> i64 {
+    if t < 0 {
+        return 0
+    }
+    if t > 1000 {
+        return 1000
+    }
+    return t
+}
+
+pub fn linear(t: i64) -> i64 {
+    return clamp(t)
+}
+
+pub fn in_quad(t: i64) -> i64 {
+    let x = clamp(t)
+    return x * x / 1000
+}
+
+pub fn out_quad(t: i64) -> i64 {
+    let x = clamp(t)
+    return 1000 - (1000 - x) * (1000 - x) / 1000
+}
+
+pub fn in_out_quad(t: i64) -> i64 {
+    let x = clamp(t)
+    if x < 500 {
+        return 2 * x * x / 1000
+    }
+    let u = 1000 - x
+    return 1000 - 2 * u * u / 1000
+}
+
+pub fn in_cubic(t: i64) -> i64 {
+    let x = clamp(t)
+    return x * x / 1000 * x / 1000
+}
+
+pub fn out_cubic(t: i64) -> i64 {
+    let u = 1000 - clamp(t)
+    return 1000 - u * u / 1000 * u / 1000
+}
+
+pub fn in_out_cubic(t: i64) -> i64 {
+    let x = clamp(t)
+    if x < 500 {
+        return 4 * x * x / 1000 * x / 1000
+    }
+    let u = 2 * (1000 - x)
+    return 1000 - u * u / 1000 * u / 1000 / 2
+}
+
+/// Overshoots past the end and settles back — the "pop" in a UI.
+pub fn out_back(t: i64) -> i64 {
+    let x = clamp(t)
+    let u = x - 1000
+    // 1 + 2.70158*u^3 + 1.70158*u^2, in thousandths.
+    let u2 = u * u / 1000
+    let u3 = u2 * u / 1000
+    return 1000 + (2702 * u3 + 1702 * u2) / 1000
+}
+
+/// Settles with a decaying wobble.
+pub fn out_elastic(t: i64) -> i64 {
+    let x = clamp(t)
+    if x == 0 {
+        return 0
+    }
+    if x == 1000 {
+        return 1000
+    }
+    // A three-bounce approximation: exact enough for a UI and integer-only.
+    let decay = 1000 - x
+    let wobble = sine_approx(x * 3 - 250)
+    return 1000 + wobble * decay * decay / 1000000 / 3
+}
+
+/// Bounces to a stop, like something dropped.
+pub fn out_bounce(t: i64) -> i64 {
+    var x = clamp(t)
+    let n = 7563
+    if x < 364 {
+        return n * x / 1000 * x / 1000
+    }
+    if x < 727 {
+        x = x - 545
+        return n * x / 1000 * x / 1000 + 750
+    }
+    if x < 909 {
+        x = x - 818
+        return n * x / 1000 * x / 1000 + 938
+    }
+    x = x - 955
+    return n * x / 1000 * x / 1000 + 984
+}
+
+/// sin(x) for x in thousandths of a turn, returned in thousandths.
+fn sine_approx(turns: i64) -> i64 {
+    // Bhaskara's approximation over half a turn, mirrored.
+    var t = turns % 1000
+    if t < 0 {
+        t = t + 1000
+    }
+    var sign = 1
+    if t > 500 {
+        t = t - 500
+        sign = 0 - 1
+    }
+    let x = t * 2
+    let num = 4 * x * (1000 - x)
+    let den = 1000000 - x * (1000 - x) / 250
+    if den == 0 {
+        return 0
+    }
+    return sign * num / den * 1000 / 1000
+}
+
+/// Where a value sits between two points, given a curve.
+pub fn interpolate(from: i64, to: i64, eased: i64) -> i64 {
+    return from + (to - from) * eased / 1000
+}

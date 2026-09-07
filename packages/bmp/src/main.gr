@@ -1,0 +1,144 @@
+// BMP: the image format you can write without a compressor.
+//
+// Uncompressed 24-bit BMP is the shortest path from an array of pixels to a
+// file any viewer opens. No deflate, no colour management, no chunk CRCs —
+// which makes it the right format for a test fixture, a screenshot in a bug
+// report, or checking that a renderer produces what it should.
+//
+// Two details every hand-rolled encoder gets wrong. Rows are stored **bottom
+// to top**, so an image written in reading order comes out upside down. And
+// each row is padded to a multiple of four bytes, so a width that is not a
+// multiple of four shears the picture diagonally if the padding is skipped.
+
+type Bitmap = {
+    width: i64,
+    height: i64,
+    /// Row-major, top row first — the sane order. The encoder flips it.
+    pixel: [i64],
+}
+
+pub fn new_bitmap(width: i64, height: i64) -> Bitmap {
+    var p: [i64] = []
+    for _i in 0..(width * height * 3) {
+        p.push(0)
+    }
+    return Bitmap{ width: width, height: height, pixel: p }
+}
+
+pub fn set_pixel(inout b: Bitmap, x: i64, y: i64, r: i64, g: i64, blue: i64) {
+    if x < 0 or y < 0 or x >= b.width or y >= b.height {
+        return
+    }
+    let at = (y * b.width + x) * 3
+    b.pixel[at] = r
+    b.pixel[at + 1] = g
+    b.pixel[at + 2] = blue
+}
+
+pub fn get_pixel(b: Bitmap, x: i64, y: i64) -> [i64] {
+    let at = (y * b.width + x) * 3
+    return [b.pixel[at], b.pixel[at + 1], b.pixel[at + 2]]
+}
+
+pub fn fill(inout b: Bitmap, r: i64, g: i64, blue: i64) {
+    for y in 0..b.height {
+        for x in 0..b.width {
+            set_pixel(b, x, y, r, g, blue)
+        }
+    }
+}
+
+fn le16(v: i64) -> [i64] {
+    return [v % 256, (v / 256) % 256]
+}
+
+fn le32(v: i64) -> [i64] {
+    return [v % 256, (v / 256) % 256, (v / 65536) % 256, (v / 16777216) % 256]
+}
+
+/// Bytes each row occupies, padded to four.
+pub fn row_stride(width: i64) -> i64 {
+    let raw = width * 3
+    return (raw + 3) / 4 * 4
+}
+
+/// The whole file.
+pub fn encode(b: Bitmap) -> bytes {
+    let stride = row_stride(b.width)
+    let pixel_bytes = stride * b.height
+    let offset = 54
+    var out: [i64] = []
+    // File header: "BM", size, two reserved words, offset to pixels.
+    out.push(66)
+    out.push(77)
+    for v in le32(offset + pixel_bytes) {
+        out.push(v)
+    }
+    for v in le32(0) {
+        out.push(v)
+    }
+    for v in le32(offset) {
+        out.push(v)
+    }
+    // Info header: 40 bytes, BITMAPINFOHEADER.
+    for v in le32(40) {
+        out.push(v)
+    }
+    for v in le32(b.width) {
+        out.push(v)
+    }
+    for v in le32(b.height) {
+        out.push(v)
+    }
+    for v in le16(1) {
+        out.push(v)
+    }
+    for v in le16(24) {
+        out.push(v)
+    }
+    for v in le32(0) {
+        out.push(v)
+    }
+    for v in le32(pixel_bytes) {
+        out.push(v)
+    }
+    for _i in 0..16 {
+        out.push(0)
+    }
+    // Pixels: bottom row first, BGR, each row padded to four bytes.
+    var y = b.height - 1
+    while y >= 0 {
+        var wrote = 0
+        for x in 0..b.width {
+            let at = (y * b.width + x) * 3
+            out.push(b.pixel[at + 2])
+            out.push(b.pixel[at + 1])
+            out.push(b.pixel[at])
+            wrote = wrote + 3
+        }
+        while wrote < stride {
+            out.push(0)
+            wrote = wrote + 1
+        }
+        y = y - 1
+    }
+    return bytes_of(out)
+}
+
+/// Whether the bytes begin with a BMP file header of the right length.
+pub fn looks_like_bmp(b: bytes) -> bool {
+    if b.len() < 54 {
+        return false
+    }
+    return b.at(0) == 66 and b.at(1) == 77
+}
+
+/// Width and height read back from an encoded file.
+pub fn dimensions(b: bytes) -> Option[(i64, i64)] {
+    if not looks_like_bmp(b) {
+        return None
+    }
+    let w = b.at(18) + b.at(19) * 256 + b.at(20) * 65536 + b.at(21) * 16777216
+    let h = b.at(22) + b.at(23) * 256 + b.at(24) * 65536 + b.at(25) * 16777216
+    return Some((w, h))
+}

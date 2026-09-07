@@ -1,0 +1,110 @@
+// Colour, motion and pixels.
+import colorspace
+import easing
+import bmp
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+
+    print("-- colour, and the luminance an average gets wrong")
+    let white = colorspace.parse_hex("#ffffff") ?? colorspace.rgb(0, 0, 0)
+    let black = colorspace.parse_hex("#000") ?? colorspace.rgb(1, 1, 1)
+    say(f, "six digits", colorspace.to_hex(white) == "#ffffff")
+    say(f, "three digits expand by repeating", colorspace.to_hex(black) == "#000000")
+    say(f, "#abc is #aabbcc, not #a0b0c0",
+        colorspace.to_hex(colorspace.parse_hex("#abc") ?? white) == "#aabbcc")
+    say(f, "rubbish is refused", {
+        match colorspace.parse_hex("#zzz") {
+            Err(_e) -> true
+            Ok(_c) -> false
+        }
+    })
+    say(f, "white is brighter than black", colorspace.luminance(white) > colorspace.luminance(black))
+    // The eye sees green far more than blue: an average would call these equal.
+    let green = colorspace.rgb(0, 255, 0)
+    let blue = colorspace.rgb(0, 0, 255)
+    say(f, "green is much brighter than blue, though an average says equal",
+        colorspace.luminance(green) > colorspace.luminance(blue) * 3)
+    say(f, "black on white passes AA", colorspace.passes_aa(black, white))
+    // Yellow on white is the classic failure an averaging check waves through.
+    let yellow = colorspace.rgb(255, 255, 0)
+    say(f, "yellow on white FAILS AA", not colorspace.passes_aa(yellow, white))
+    say(f, "black on white also passes AAA", colorspace.passes_aaa(black, white))
+    say(f, "black reads on a light background",
+        colorspace.to_hex(colorspace.readable_on(yellow)) == "#000000")
+    say(f, "white reads on a dark one",
+        colorspace.to_hex(colorspace.readable_on(colorspace.rgb(20, 20, 60))) == "#ffffff")
+    say(f, "mixing half way", colorspace.to_hex(colorspace.mix(black, white, 50)) == "#7f7f7f")
+    say(f, "greyscale uses luminance, not the mean",
+        colorspace.greyscale(green).r > colorspace.greyscale(blue).r)
+
+    print("-- easing, integer so it is reproducible")
+    // Every curve must start at 0 and end at 1000, or it moves something to
+    // the wrong place.
+    say(f, "linear anchors", easing.linear(0) == 0 and easing.linear(1000) == 1000)
+    say(f, "in_quad anchors", easing.in_quad(0) == 0 and easing.in_quad(1000) == 1000)
+    say(f, "out_quad anchors", easing.out_quad(0) == 0 and easing.out_quad(1000) == 1000)
+    say(f, "in_out_quad anchors", easing.in_out_quad(0) == 0 and easing.in_out_quad(1000) == 1000)
+    say(f, "in_cubic anchors", easing.in_cubic(0) == 0 and easing.in_cubic(1000) == 1000)
+    say(f, "out_cubic anchors", easing.out_cubic(0) == 0 and easing.out_cubic(1000) == 1000)
+    say(f, "in_out_cubic anchors",
+        easing.in_out_cubic(0) == 0 and easing.in_out_cubic(1000) == 1000)
+    say(f, "out_bounce anchors", easing.out_bounce(0) == 0 and easing.out_bounce(1000) >= 995)
+    say(f, "out_back anchors", easing.out_back(0) == 0 and easing.out_back(1000) == 1000)
+    say(f, "out_elastic anchors", easing.out_elastic(0) == 0 and easing.out_elastic(1000) == 1000)
+    // Shape: ease-in starts slow, ease-out starts fast.
+    say(f, "in_quad starts slower than linear", easing.in_quad(250) < easing.linear(250))
+    say(f, "out_quad starts faster", easing.out_quad(250) > easing.linear(250))
+    say(f, "in_out is symmetric at the middle", easing.in_out_quad(500) == 500)
+    // Overshoot is the point of `back`.
+    say(f, "out_back overshoots past the end", easing.out_back(800) > 1000)
+    say(f, "monotonic where it should be",
+        easing.in_quad(100) < easing.in_quad(500) and easing.in_quad(500) < easing.in_quad(900))
+    say(f, "interpolation lands on the ends",
+        easing.interpolate(10, 20, 0) == 10 and easing.interpolate(10, 20, 1000) == 20)
+    say(f, "and half way", easing.interpolate(0, 100, 500) == 50)
+    say(f, "the same input always gives the same output",
+        easing.out_elastic(333) == easing.out_elastic(333))
+
+    print("-- BMP, and the two things every encoder gets wrong")
+    var img = bmp.new_bitmap(3, 2)
+    bmp.fill(img, 10, 20, 30)
+    bmp.set_pixel(img, 0, 0, 255, 0, 0)
+    say(f, "a pixel reads back", bmp.get_pixel(img, 0, 0) == [255, 0, 0])
+    say(f, "and the fill elsewhere", bmp.get_pixel(img, 2, 1) == [10, 20, 30])
+    say(f, "out of bounds is ignored, not a crash", {
+        bmp.set_pixel(img, 99, 99, 1, 1, 1)
+        true
+    })
+    // A 3-pixel row is 9 bytes, padded to 12.
+    say(f, "rows pad to a multiple of four", bmp.row_stride(3) == 12)
+    say(f, "and a multiple of four needs none", bmp.row_stride(4) == 12)
+    let file = bmp.encode(img)
+    say(f, "starts with BM", bmp.looks_like_bmp(file))
+    say(f, "header is 54 bytes plus padded rows", file.len() == 54 + 12 * 2)
+    say(f, "dimensions read back", bmp.dimensions(file) == Some((3, 2)))
+    // Rows are stored bottom-up: the last row of pixel data is the TOP row of
+    // the image, and its first pixel is the red one, written BGR.
+    let first_pixel_of_last_row = file.len() - 12
+    say(f, "the bottom-up row order puts the top row last",
+        file.at(first_pixel_of_last_row) == 0 and
+        file.at(first_pixel_of_last_row + 2) == 255)
+    say(f, "padding bytes are zero", file.at(file.len() - 1) == 0)
+    say(f, "a short buffer is not a BMP", not bmp.looks_like_bmp(bytes_of([66, 77])))
+
+    print("")
+    if f == 0 {
+        print("all held")
+    } else {
+        print("{f} failed")
+    }
+}
