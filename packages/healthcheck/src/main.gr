@@ -19,25 +19,25 @@ type Check = {
     checked_at_ms: i64,
 }
 
-type Report = {
+type HealthReport = {
     check: [Check],
 }
 
-pub fn new_report() -> Report {
-    return Report{ check: [] }
+pub fn new_report() -> HealthReport {
+    return HealthReport{ check: [] }
 }
 
 /// A check whose failure means the process is broken and should be replaced.
-pub fn liveness(inout r: Report, name: str, healthy: bool, detail: str, at_ms: i64) {
+pub fn liveness(inout r: HealthReport, name: str, healthy: bool, detail: str, at_ms: i64) {
     record(r, name, false, healthy, detail, at_ms)
 }
 
 /// A check whose failure means "stop sending me traffic", not "restart me".
-pub fn readiness(inout r: Report, name: str, healthy: bool, detail: str, at_ms: i64) {
+pub fn readiness(inout r: HealthReport, name: str, healthy: bool, detail: str, at_ms: i64) {
     record(r, name, true, healthy, detail, at_ms)
 }
 
-fn record(inout r: Report, name: str, readiness_only: bool, healthy: bool,
+fn record(inout r: HealthReport, name: str, readiness_only: bool, healthy: bool,
     detail: str, at_ms: i64) {
     var out: [Check] = []
     for c in r.check {
@@ -53,7 +53,7 @@ fn record(inout r: Report, name: str, readiness_only: bool, healthy: bool,
 }
 
 /// Is the process alive? Only non-readiness checks count.
-pub fn is_live(r: Report) -> bool {
+pub fn is_live(r: HealthReport) -> bool {
     for c in r.check {
         if not c.readiness_only and not c.healthy {
             return false
@@ -63,7 +63,7 @@ pub fn is_live(r: Report) -> bool {
 }
 
 /// Should traffic come here? Every check counts.
-pub fn is_ready(r: Report) -> bool {
+pub fn is_ready(r: HealthReport) -> bool {
     for c in r.check {
         if not c.healthy {
             return false
@@ -77,7 +77,7 @@ pub fn is_ready(r: Report) -> bool {
 /// A background prober that dies leaves its last result sitting there saying
 /// "healthy" forever. Treating an old answer as a current one is how an
 /// outage stays invisible.
-pub fn is_fresh(r: Report, now_ms: i64, max_age_ms: i64) -> bool {
+pub fn is_fresh(r: HealthReport, now_ms: i64, max_age_ms: i64) -> bool {
     for c in r.check {
         if now_ms - c.checked_at_ms > max_age_ms {
             return false
@@ -86,7 +86,7 @@ pub fn is_fresh(r: Report, now_ms: i64, max_age_ms: i64) -> bool {
     return true
 }
 
-pub fn failing(r: Report) -> [str] {
+pub fn failing(r: HealthReport) -> [str] {
     var out: [str] = []
     for c in r.check {
         if not c.healthy {
@@ -97,16 +97,16 @@ pub fn failing(r: Report) -> [str] {
 }
 
 /// The HTTP status a probe endpoint should return.
-pub fn liveness_status(r: Report) -> i64 {
+pub fn liveness_status(r: HealthReport) -> i64 {
     return if is_live(r) { 200 } else { 503 }
 }
 
-pub fn readiness_status(r: Report) -> i64 {
+pub fn readiness_status(r: HealthReport) -> i64 {
     return if is_ready(r) { 200 } else { 503 }
 }
 
 /// A body a person can read when the probe fails.
-pub fn render(r: Report) -> str {
+pub fn render(r: HealthReport) -> str {
     var lines: [str] = []
     for c in r.check {
         let mark = if c.healthy { "ok  " } else { "FAIL" }
