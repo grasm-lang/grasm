@@ -5,32 +5,32 @@
 // from the header alone produces a table that looks right until one value is
 // long.
 
-type Table = {
+type TextTable = {
     header: [str],
     row: [[str]],
     /// Per column: true to right-align. Numbers read wrong on the left.
     right: [bool],
 }
 
-pub fn new_table(header: [str]) -> Table {
+pub fn new_table(header: [str]) -> TextTable {
     var r: [bool] = []
     for _h in header {
         r.push(false)
     }
-    return Table{ header: header, row: [], right: r }
+    return TextTable{ header: header, row: [], right: r }
 }
 
-pub fn align_right(inout t: Table, column: i64) {
+pub fn align_right(inout t: TextTable, column: i64) {
     if column >= 0 and column < t.right.len() {
         t.right[column] = true
     }
 }
 
-pub fn add_row(inout t: Table, cells: [str]) {
+pub fn add_row(inout t: TextTable, cells: [str]) {
     t.row.push(cells)
 }
 
-fn widths_of(t: Table) -> [i64] {
+fn widths_of(t: TextTable) -> [i64] {
     var w: [i64] = []
     for h in t.header {
         w.push(h.len())
@@ -66,7 +66,7 @@ fn line_of(cells: [str], w: [i64], right: [bool], sep: str) -> str {
 }
 
 /// Plain columns separated by two spaces — the shape a CLI prints.
-pub fn plain(t: Table) -> str {
+pub fn plain(t: TextTable) -> str {
     let w = widths_of(t)
     var out: [str] = [line_of(t.header, w, t.right, "  ")]
     for r in t.row {
@@ -76,7 +76,7 @@ pub fn plain(t: Table) -> str {
 }
 
 /// A Markdown table, which needs the alignment row.
-pub fn markdown(t: Table) -> str {
+pub fn markdown(t: TextTable) -> str {
     let w = widths_of(t)
     var out: [str] = ["| " + line_of(t.header, w, t.right, " | ") + " |"]
     var rule: [str] = []
@@ -95,7 +95,7 @@ pub fn markdown(t: Table) -> str {
 }
 
 /// Box-drawing borders, for a terminal.
-pub fn boxed(t: Table) -> str {
+pub fn boxed(t: TextTable) -> str {
     let w = widths_of(t)
     var bar: [str] = []
     for width in w {
