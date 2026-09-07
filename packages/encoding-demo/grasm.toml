@@ -1,0 +1,24 @@
+[package]
+name = "encoding_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.base58]
+path = "../base58"
+version = "^1.0.0"
+
+[dependencies.base85]
+path = "../base85"
+version = "^1.0.0"
+
+[dependencies.hexdump]
+path = "../hexdump"
+version = "^1.0.0"
+
+[dependencies.bencode]
+path = "../bencode"
+version = "^1.0.0"
+
+[dependencies.utf16]
+path = "../utf16"
+version = "^1.0.0"

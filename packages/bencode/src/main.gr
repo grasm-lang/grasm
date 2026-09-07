@@ -1,0 +1,159 @@
+// Bencode, the encoding BitTorrent metainfo files use.
+//
+// Worth having because it is the simplest format with a **canonical** form:
+// dictionary keys must be sorted, integers have no leading zeros and no `-0`,
+// and there is exactly one encoding of any value. That is what lets a torrent's
+// infohash be a hash of its bytes — re-encode the parsed structure and you must
+// get the same bytes back, or the hash changes and the torrent is a different
+// torrent.
+
+type Bval =
+    | BInt(n: i64)
+    | BStr(s: str)
+    | BList(items: [i64])
+    | BDict(keys: [str], values: [i64])
+
+type BencodeError =
+    | Unexpected(at: i64)
+    | Truncated
+    | NotCanonical(why: str)
+
+    /// A parsed document: nodes in a flat arena, `root` first.
+type Bdoc = {
+    node: [Bval],
+}
+
+/// `i<digits>e`, with the two canonical-form rules enforced.
+fn parse_int_at(cs: [str], at: i64, inout doc: Bdoc) -> (i64, i64) ! BencodeError {
+    var j = at + 1
+    var text = ""
+    while j < cs.len() and cs[j] != "e" {
+        text = text + cs[j]
+        j = j + 1
+    }
+    if j >= cs.len() {
+        fail(Truncated)
+    }
+    if text.len() > 1 and text.substr(0, 1) == "0" {
+        fail(NotCanonical("leading zero in i{text}e"))
+    }
+    if text == "-0" {
+        fail(NotCanonical("negative zero"))
+    }
+    doc.node.push(BInt(text.parse_int() ?? 0))
+    return (doc.node.len() - 1, j + 1)
+}
+
+/// `<length>:<bytes>`.
+fn parse_str_at(src: str, cs: [str], at: i64, inout doc: Bdoc) -> (i64, i64) ! BencodeError {
+    var j = at
+    var digits = ""
+    while j < cs.len() and cs[j] != ":" {
+        digits = digits + cs[j]
+        j = j + 1
+    }
+    if j >= cs.len() {
+        fail(Truncated)
+    }
+    let n = digits.parse_int() ?? 0
+    if j + 1 + n > cs.len() {
+        fail(Truncated)
+    }
+    doc.node.push(BStr(src.substr(j + 1, n)))
+    return (doc.node.len() - 1, j + 1 + n)
+}
+
+fn parse_at(src: str, at: i64, inout doc: Bdoc) -> (i64, i64) ! BencodeError {
+    let cs = src.chars()
+    if at >= cs.len() {
+        fail(Truncated)
+    }
+    let c = cs[at]
+    if c == "i" {
+        return try parse_int_at(cs, at, doc)
+    }
+    if c >= "0" and c <= "9" {
+        return try parse_str_at(src, cs, at, doc)
+    }
+    if c == "l" {
+        var items: [i64] = []
+        var j = at + 1
+        while j < cs.len() and cs[j] != "e" {
+            let (child, next) = try parse_at(src, j, doc)
+            items.push(child)
+            j = next
+        }
+        if j >= cs.len() {
+            fail(Truncated)
+        }
+        doc.node.push(BList(items))
+        return (doc.node.len() - 1, j + 1)
+    }
+    if c == "d" {
+        var keys: [str] = []
+        var values: [i64] = []
+        var j = at + 1
+        while j < cs.len() and cs[j] != "e" {
+            let (kid, knext) = try parse_at(src, j, doc)
+            match doc.node[kid] {
+                BStr(k) -> {
+                    // Canonical form: keys ascend. A document with keys out of
+                    // order re-encodes differently, so its hash would change.
+                    if keys.len() > 0 and keys[keys.len() - 1] >= k {
+                        fail(NotCanonical("dictionary keys out of order at {k}"))
+                    }
+                    keys.push(k)
+                }
+                _ -> fail(Unexpected(j))
+            }
+            let (vid, vnext) = try parse_at(src, knext, doc)
+            values.push(vid)
+            j = vnext
+        }
+        if j >= cs.len() {
+            fail(Truncated)
+        }
+        doc.node.push(BDict(keys, values))
+        return (doc.node.len() - 1, j + 1)
+    }
+    fail(Unexpected(at))
+}
+
+pub fn parse(src: str) -> Bdoc ! BencodeError {
+    var doc = Bdoc{ node: [] }
+    let (_root, end) = try parse_at(src, 0, doc)
+    if end != src.len() {
+        fail(Unexpected(end))
+    }
+    return doc
+}
+
+/// The root is the last node written, because children are pushed first.
+pub fn root(d: Bdoc) -> i64 {
+    return d.node.len() - 1
+}
+
+pub fn node_at(d: Bdoc, i: i64) -> Bval {
+    return d.node[i]
+}
+
+pub fn encode(d: Bdoc, at: i64) -> str {
+    match d.node[at] {
+        BInt(n) -> return "i{n}e"
+        BStr(s) -> return "{s.len()}:{s}"
+        BList(items) -> {
+            var out = "l"
+            for i in items {
+                out = out + encode(d, i)
+            }
+            return out + "e"
+        }
+        BDict(keys, values) -> {
+            var out = "d"
+            for k in 0..keys.len() {
+                out = out + "{keys[k].len()}:{keys[k]}" + encode(d, values[k])
+            }
+            return out + "e"
+        }
+    }
+}

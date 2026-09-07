@@ -1,0 +1,99 @@
+// Base58, the Bitcoin alphabet.
+//
+// Base58 is base64 with the characters a person cannot reliably tell apart
+// removed: `0`, `O`, `I` and `l` are all gone, and so is every symbol that
+// breaks a double-click selection. It is what addresses and keys are written
+// in for exactly that reason.
+//
+// Unlike base32 and base64, base58 is **not** a bit-packing: 58 is not a power
+// of two, so this is repeated division of the whole number. Leading zero bytes
+// carry no value in that arithmetic and are re-added as `1`s, which is why an
+// address beginning `1` means a leading zero byte.
+
+fn alphabet() -> str {
+    return "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+}
+
+type Base58Error = | NotBase58(at: i64)
+
+pub fn encode(b: bytes) -> str {
+    let a = alphabet().chars()
+    // Base 256 digits, most significant first.
+    var digits: [i64] = [0]
+    for i in 0..b.len() {
+        var carry = b.at(i)
+        for k in 0..digits.len() {
+            let v = digits[k] * 256 + carry
+            digits[k] = v % 58
+            carry = v / 58
+        }
+        while carry > 0 {
+            digits.push(carry % 58)
+            carry = carry / 58
+        }
+    }
+    var out = ""
+    // Leading zero bytes are not digits; they are recorded as `1`.
+    var lead = 0
+    while lead < b.len() and b.at(lead) == 0 {
+        out = out + "1"
+        lead = lead + 1
+    }
+    var i = digits.len() - 1
+    // A single trailing zero digit is the number zero, already covered by the
+    // leading `1`s when the input was all zeros.
+    while i >= 0 {
+        if not (i == digits.len() - 1 and digits[i] == 0 and b.len() > 0 and lead == b.len()) {
+            out = out + a[digits[i]]
+        }
+        i = i - 1
+    }
+    return out
+}
+
+fn value_of(c: str) -> i64 {
+    let a = alphabet().chars()
+    for i in 0..a.len() {
+        if a[i] == c {
+            return i
+        }
+    }
+    return 0 - 1
+}
+
+pub fn decode(s: str) -> bytes ! Base58Error {
+    var out: [i64] = [0]
+    let cs = s.chars()
+    for i in 0..cs.len() {
+        if cs[i] != "1" or out.len() > 1 or out[0] != 0 {
+            let v = value_of(cs[i])
+            if v < 0 {
+                fail(NotBase58(i))
+            }
+            var carry = v
+            for k in 0..out.len() {
+                let t = out[k] * 58 + carry
+                out[k] = t % 256
+                carry = t / 256
+            }
+            while carry > 0 {
+                out.push(carry % 256)
+                carry = carry / 256
+            }
+        }
+    }
+    var res: [i64] = []
+    var lead = 0
+    while lead < cs.len() and cs[lead] == "1" {
+        res.push(0)
+        lead = lead + 1
+    }
+    var i = out.len() - 1
+    while i >= 0 {
+        if not (out.len() == 1 and out[0] == 0) {
+            res.push(out[i])
+        }
+        i = i - 1
+    }
+    return bytes_of(res)
+}

@@ -1,0 +1,111 @@
+// UTF-16, and the surrogate pairs that make it awkward.
+//
+// Grasm strings are UTF-8, but Windows APIs, Java, JavaScript and every
+// `.docx` are UTF-16, so a program that talks to any of them needs this.
+//
+// The whole difficulty is above U+FFFF: those code points do not fit in
+// sixteen bits and are written as a pair from the surrogate range. Software
+// that treats a UTF-16 unit as a character reports the length of an emoji as
+// two — which is why JavaScript says `"👍".length === 2`.
+
+type Utf16Error = | LoneSurrogate(at: i64)
+
+/// Code units for `s`, big-endian order in the list.
+pub fn units_of(s: str) -> [i64] {
+    var out: [i64] = []
+    for cp in s.codes() {
+        if cp < 65536 {
+            out.push(cp)
+        } else {
+            // U+10000..U+10FFFF as a high and low surrogate.
+            let v = cp - 65536
+            out.push(55296 + v / 1024)
+            out.push(56320 + v % 1024)
+        }
+    }
+    return out
+}
+
+/// The text those units spell.
+pub fn from_units(units: [i64]) -> str ! Utf16Error {
+    var out = ""
+    var i = 0
+    while i < units.len() {
+        let u = units[i]
+        if u >= 55296 and u < 56320 {
+            if i + 1 >= units.len() {
+                fail(LoneSurrogate(i))
+            }
+            let lo = units[i + 1]
+            if lo < 56320 or lo >= 57344 {
+                fail(LoneSurrogate(i))
+            }
+            let cp = 65536 + (u - 55296) * 1024 + (lo - 56320)
+            out = out + code_str(cp)
+            i = i + 2
+        } else {
+            if u >= 56320 and u < 57344 {
+                fail(LoneSurrogate(i))
+            }
+            out = out + code_str(u)
+            i = i + 1
+        }
+    }
+    return out
+}
+
+fn code_str(cp: i64) -> str {
+    // UTF-8 by hand: Grasm has no "character from code point" builtin, and
+    // the encoding is four cases.
+    if cp < 128 {
+        return bytes_of([cp]).to_str()
+    }
+    if cp < 2048 {
+        return bytes_of([192 + cp / 64, 128 + cp % 64]).to_str()
+    }
+    if cp < 65536 {
+        return bytes_of([224 + cp / 4096, 128 + (cp / 64) % 64, 128 + cp % 64]).to_str()
+    }
+    return bytes_of([
+        240 + cp / 262144,
+        128 + (cp / 4096) % 64,
+        128 + (cp / 64) % 64,
+        128 + cp % 64,
+    ]).to_str()
+}
+
+/// What JavaScript's `.length` would say — units, not characters.
+pub fn unit_length(s: str) -> i64 {
+    return units_of(s).len()
+}
+
+/// Whether the text holds anything above U+FFFF, which is what makes the two
+/// lengths differ.
+pub fn needs_surrogates(s: str) -> bool {
+    for cp in s.codes() {
+        if cp >= 65536 {
+            return true
+        }
+    }
+    return false
+}
+
+/// Little-endian bytes, the order a Windows file uses.
+pub fn to_bytes_le(s: str) -> bytes {
+    var out: [i64] = []
+    for u in units_of(s) {
+        out.push(u % 256)
+        out.push(u / 256)
+    }
+    return bytes_of(out)
+}
+
+pub fn from_bytes_le(b: bytes) -> str ! Utf16Error {
+    var units: [i64] = []
+    var i = 0
+    while i + 1 < b.len() {
+        units.push(b.at(i) + b.at(i + 1) * 256)
+        i = i + 2
+    }
+    return try from_units(units)
+}

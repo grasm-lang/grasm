@@ -1,0 +1,6 @@
+[package]
+name = "base85"
+version = "1.0.0"
+
+# Encoding bytes. Opens nothing.
+capabilities = []

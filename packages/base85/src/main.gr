@@ -1,0 +1,106 @@
+// Ascii85, the encoding PostScript and PDF use.
+//
+// Four bytes become five characters, so it costs 25% overhead against base64's
+// 33%. That is the entire reason it exists, and it is why PDF streams use it.
+//
+// The `z` shorthand is the part implementations get wrong: four zero bytes
+// encode as the single character `z`, **except** in the final partial group,
+// where it must be spelled out. An encoder that emits `z` there produces
+// something no decoder can length-check.
+
+type Base85Error = | NotBase85(at: i64)
+
+pub fn encode(b: bytes) -> str {
+    var out = ""
+    var i = 0
+    while i < b.len() {
+        let left = b.len() - i
+        let full = left >= 4
+        var acc = 0
+        for k in 0..4 {
+            acc = acc * 256 + (if i + k < b.len() { b.at(i + k) } else { 0 })
+        }
+        if acc == 0 and full {
+            out = out + "z"
+        } else {
+            var chars: [str] = []
+            var v = acc
+            for _k in 0..5 {
+                chars.push(bytes_of([33 + v % 85]).to_str())
+                v = v / 85
+            }
+            // The digits came out least significant first.
+            let keep = if full { 5 } else { left + 1 }
+            var k = 4
+            var wrote = 0
+            while k >= 0 {
+                if wrote < keep {
+                    out = out + chars[k]
+                    wrote = wrote + 1
+                }
+                k = k - 1
+            }
+        }
+        i = i + 4
+    }
+    return out
+}
+
+pub fn decode(s: str) -> bytes ! Base85Error {
+    var out: [i64] = []
+    let cs = s.chars()
+    var group: [i64] = []
+    var i = 0
+    while i < cs.len() {
+        let c = cs[i]
+        if c == "z" and group.len() == 0 {
+            for _k in 0..4 {
+                out.push(0)
+            }
+        } else {
+            if c == " " or c == "\n" or c == "\t" {
+                // Whitespace is not data; PDF wraps these streams at 80.
+                i = i
+            } else {
+                let v = c.code_at(0)
+                if v < 33 or v > 117 {
+                    fail(NotBase85(i))
+                }
+                group.push(v - 33)
+                if group.len() == 5 {
+                    var acc = 0
+                    for g in group {
+                        acc = acc * 85 + g
+                    }
+                    var shift = 24
+                    for _k in 0..4 {
+                        out.push((acc / (2 ^ shift)) % 256)
+                        shift = shift - 8
+                    }
+                    group = []
+                }
+            }
+        }
+        i = i + 1
+    }
+    if group.len() > 0 {
+        // A partial group is padded with the highest digit, and yields one
+        // fewer byte than it has characters.
+        let have = group.len()
+        for _k in have..5 {
+            group.push(84)
+        }
+        var acc = 0
+        for g in group {
+            acc = acc * 85 + g
+        }
+        var shift = 24
+        for k in 0..4 {
+            if k < have - 1 {
+                out.push((acc / (2 ^ shift)) % 256)
+            }
+            shift = shift - 8
+        }
+    }
+    return bytes_of(out)
+}

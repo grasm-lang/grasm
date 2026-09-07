@@ -1,0 +1,6 @@
+[package]
+name = "utf16"
+version = "1.0.0"
+
+# Re-encoding text. Opens nothing.
+capabilities = []

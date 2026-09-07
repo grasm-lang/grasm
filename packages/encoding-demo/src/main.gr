@@ -1,0 +1,107 @@
+// Five encodings, checked against what other implementations produce.
+import base58
+import base85
+import hexdump
+import bencode
+import utf16
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+
+    print("-- base58, against the Bitcoin test vectors")
+    say(f, "hello world", base58.encode("hello world".to_bytes()) == "StV1DL6CwTryKyV")
+    say(f, "a leading zero byte becomes a leading 1",
+        base58.encode(bytes_of([0, 0, 1])) == "112")
+    say(f, "round trip", (base58.decode("StV1DL6CwTryKyV") ?? bytes_of([])).to_str() == "hello world")
+    say(f, "0 and O are not in the alphabet", {
+        match base58.decode("0OIl") {
+            Err(_e) -> true
+            Ok(_b) -> false
+        }
+    })
+
+    print("-- ascii85, and the z that only works in a full group")
+    say(f, "four zero bytes are z", base85.encode(bytes_of([0, 0, 0, 0])) == "z")
+    say(f, "Man is the classic vector", base85.encode("Man ".to_bytes()) == "9jqo^")
+    for text in ["", "a", "ab", "abc", "abcd", "abcde", "sure."] {
+        let back = base85.decode(base85.encode(text.to_bytes())) ?? bytes_of([])
+        say(f, "round trip {text.len()} byte(s)", back.to_str() == text)
+    }
+
+    print("-- hexdump, the shape hexdump -C prints")
+    let d = hexdump.dump("Hello".to_bytes())
+    say(f, "offset then hex then text", d.contains("00000000") and d.contains("48 65 6c 6c 6f"))
+    say(f, "non-printable becomes a stop", hexdump.dump(bytes_of([0, 1])).contains("|..|"))
+    say(f, "inline is just the bytes", hexdump.inline(bytes_of([255, 0, 16])) == "ff 00 10")
+    say(f, "preview says how many were left",
+        hexdump.preview(bytes_of([1, 2, 3, 4, 5]), 2).contains("5 bytes"))
+
+    print("-- bencode, where canonical form is the point")
+    match bencode.parse("d3:agei30e4:name5:Alicee") {
+        Err(_e) -> say(f, "parses a dictionary", false)
+        Ok(doc) -> {
+            say(f, "parses a dictionary", true)
+            // Re-encoding must give the identical bytes, or an infohash of the
+            // bytes would not match an infohash of the parse.
+            say(f, "re-encodes to the same bytes",
+                bencode.encode(doc, bencode.root(doc)) == "d3:agei30e4:name5:Alicee")
+        }
+    }
+    say(f, "keys out of order are refused", {
+        match bencode.parse("d4:name5:Alice3:agei30ee") {
+            Err(_e) -> true
+            Ok(_d) -> false
+        }
+    })
+    say(f, "a leading zero is refused", {
+        match bencode.parse("i03e") {
+            Err(_e) -> true
+            Ok(_d) -> false
+        }
+    })
+    say(f, "negative zero is refused", {
+        match bencode.parse("i-0e") {
+            Err(_e) -> true
+            Ok(_d) -> false
+        }
+    })
+    match bencode.parse("li1ei2ee") {
+        Err(_e) -> say(f, "parses a list", false)
+        Ok(doc) -> say(f, "parses a list", bencode.encode(doc, bencode.root(doc)) == "li1ei2ee")
+    }
+
+    print("-- utf16, and the length JavaScript reports")
+    say(f, "ascii is one unit each", utf16.unit_length("abc") == 3)
+    say(f, "an emoji is TWO units, not one", utf16.unit_length("\u{1F44D}") == 2)
+    say(f, "and Grasm still counts it as one character", "\u{1F44D}".len() == 1)
+    say(f, "so it needs a surrogate pair", utf16.needs_surrogates("\u{1F44D}"))
+    say(f, "plain text does not", not utf16.needs_surrogates("hello"))
+    for text in ["", "abc", "caf\u{e9}", "\u{4e2d}\u{6587}", "\u{1F44D}ok"] {
+        let round = utf16.from_units(utf16.units_of(text)) ?? "<failed>"
+        say(f, "round trip", round == text)
+    }
+    say(f, "a lone surrogate is refused", {
+        match utf16.from_units([55296]) {
+            Err(_e) -> true
+            Ok(_s) -> false
+        }
+    })
+    say(f, "little-endian bytes round trip",
+        (utf16.from_bytes_le(utf16.to_bytes_le("hi")) ?? "") == "hi")
+
+    print("")
+    if f == 0 {
+        print("all held")
+    } else {
+        print("{f} failed")
+    }
+}

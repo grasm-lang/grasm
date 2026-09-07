@@ -1,0 +1,78 @@
+// A canonical hex dump, the shape `hexdump -C` and `xxd` produce.
+//
+// The format is not arbitrary: offset, sixteen bytes in two groups of eight,
+// then the printable ASCII with everything else as `.`. Two tools that agree
+// on it can be diffed against each other, which is the only reason to dump
+// bytes rather than print them.
+
+fn hex2(v: i64) -> str {
+    let d = "0123456789abcdef".chars()
+    return d[(v / 16) % 16] + d[v % 16]
+}
+
+fn hex8(v: i64) -> str {
+    var out = ""
+    var shift = 28
+    let d = "0123456789abcdef".chars()
+    while shift >= 0 {
+        out = out + d[(v / (2 ^ shift)) % 16]
+        shift = shift - 4
+    }
+    return out
+}
+
+/// One line per sixteen bytes.
+pub fn dump(b: bytes) -> str {
+    var lines: [str] = []
+    var at = 0
+    while at < b.len() {
+        var hex = ""
+        var text = ""
+        for k in 0..16 {
+            if k == 8 {
+                hex = hex + " "
+            }
+            if at + k < b.len() {
+                let v = b.at(at + k)
+                hex = hex + hex2(v) + " "
+                // Printable ASCII only; everything else is a full stop, so a
+                // line is always the same width and two dumps line up.
+                if v >= 32 and v < 127 {
+                    text = text + bytes_of([v]).to_str()
+                } else {
+                    text = text + "."
+                }
+            } else {
+                hex = hex + "   "
+            }
+        }
+        lines.push("{hex8(at)}  {hex} |{text}|")
+        at = at + 16
+    }
+    lines.push(hex8(b.len()))
+    return lines.join("\n")
+}
+
+/// Just the hex, no offsets or text — for embedding in a message.
+pub fn inline(b: bytes) -> str {
+    var out = ""
+    for i in 0..b.len() {
+        if i > 0 {
+            out = out + " "
+        }
+        out = out + hex2(b.at(i))
+    }
+    return out
+}
+
+/// The first `n` bytes, with a note when there were more.
+pub fn preview(b: bytes, n: i64) -> str {
+    if b.len() <= n {
+        return inline(b)
+    }
+    var head: [i64] = []
+    for i in 0..n {
+        head.push(b.at(i))
+    }
+    return inline(bytes_of(head)) + " … ({b.len()} bytes)"
+}
