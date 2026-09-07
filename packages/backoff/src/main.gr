@@ -7,7 +7,7 @@
 //
 // Randomness is a parameter, so this needs no capability and a test is exact.
 
-type Policy = {
+type RetryPolicy = {
     max_attempts: i64,
     base_ms: i64,
     cap_ms: i64,
@@ -16,27 +16,27 @@ type Policy = {
     jitter: bool,
 }
 
-pub fn exponential(max_attempts: i64, base_ms: i64, cap_ms: i64) -> Policy {
-    return Policy{
+pub fn exponential(max_attempts: i64, base_ms: i64, cap_ms: i64) -> RetryPolicy {
+    return RetryPolicy{
         max_attempts: max_attempts, base_ms: base_ms, cap_ms: cap_ms,
         deadline_ms: 0 - 1, jitter: true,
     }
 }
 
-pub fn with_deadline(p: Policy, deadline_ms: i64) -> Policy {
+pub fn with_deadline(p: RetryPolicy, deadline_ms: i64) -> RetryPolicy {
     var out = p
     out.deadline_ms = deadline_ms
     return out
 }
 
-pub fn without_jitter(p: Policy) -> Policy {
+pub fn without_jitter(p: RetryPolicy) -> RetryPolicy {
     var out = p
     out.jitter = false
     return out
 }
 
 /// The ceiling for `attempt`, counted from 0, doubling and capped.
-pub fn ceiling_ms(p: Policy, attempt: i64) -> i64 {
+pub fn ceiling_ms(p: RetryPolicy, attempt: i64) -> i64 {
     var v = p.base_ms
     var i = 0
     while i < attempt and v < p.cap_ms {
@@ -54,7 +54,7 @@ pub fn ceiling_ms(p: Policy, attempt: i64) -> i64 {
 /// Full jitter — anywhere in [0, ceiling] — rather than ceiling ± a wobble,
 /// because a thousand clients failing at one instant must not all return at
 /// one instant.
-pub fn delay_ms(p: Policy, attempt: i64, random_thousandths: i64) -> i64 {
+pub fn delay_ms(p: RetryPolicy, attempt: i64, random_thousandths: i64) -> i64 {
     let ceiling = ceiling_ms(p, attempt)
     if not p.jitter {
         return ceiling
@@ -71,7 +71,7 @@ pub fn delay_ms(p: Policy, attempt: i64, random_thousandths: i64) -> i64 {
 
 /// Whether another attempt is allowed, given how many have run and how long
 /// they have taken in total.
-pub fn may_retry(p: Policy, attempts_so_far: i64, elapsed_ms: i64) -> bool {
+pub fn may_retry(p: RetryPolicy, attempts_so_far: i64, elapsed_ms: i64) -> bool {
     if attempts_so_far >= p.max_attempts {
         return false
     }
@@ -98,7 +98,7 @@ pub fn should_retry(status: i64) -> bool {
 
 /// The total wait across a whole policy, without jitter — for deciding
 /// whether a deadline is even reachable before starting.
-pub fn worst_case_ms(p: Policy) -> i64 {
+pub fn worst_case_ms(p: RetryPolicy) -> i64 {
     var total = 0
     for i in 0..p.max_attempts {
         total = total + ceiling_ms(p, i)
