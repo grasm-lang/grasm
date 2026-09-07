@@ -8,7 +8,7 @@
 //
 // Time is a parameter, so this package opens nothing and a test is exact.
 
-type Schedule = {
+type CronSchedule = {
     minute: [bool],
     hour: [bool],
     day: [bool],
@@ -73,7 +73,7 @@ fn parse_field(text: str, least: i64, most: i64) -> [bool] ! CronError {
     return set
 }
 
-pub fn parse(expr: str) -> Schedule ! CronError {
+pub fn parse(expr: str) -> CronSchedule ! CronError {
     let fields = expr.trim().words()
     if fields.len() != 5 {
         fail(WrongFieldCount(fields.len()))
@@ -87,7 +87,7 @@ pub fn parse(expr: str) -> Schedule ! CronError {
     if weekday[7] {
         weekday[0] = true
     }
-    return Schedule{
+    return CronSchedule{
         minute: minute, hour: hour, day: day, month: month, weekday: weekday,
         day_restricted: fields[2] != "*",
         weekday_restricted: fields[4] != "*",
@@ -95,7 +95,7 @@ pub fn parse(expr: str) -> Schedule ! CronError {
 }
 
 /// Whether the schedule fires at this moment.
-pub fn matches(s: Schedule, minute: i64, hour: i64, day: i64, month: i64, weekday: i64) -> bool {
+pub fn matches(s: CronSchedule, minute: i64, hour: i64, day: i64, month: i64, weekday: i64) -> bool {
     if not s.minute[minute] or not s.hour[hour] or not s.month[month] {
         return false
     }
