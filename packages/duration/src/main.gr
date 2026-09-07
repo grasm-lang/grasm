@@ -1,0 +1,123 @@
+// Durations as text: `1h30m`, `250ms`, `2d`.
+//
+// A configuration file that says `timeout = 30` is ambiguous and the ambiguity
+// is expensive — seconds and milliseconds are both plausible, and picking
+// wrong is a thousandfold error that looks like a hang or a storm. A unit in
+// the value removes the question.
+//
+// Parsing is strict: a bare number is refused rather than assumed, because the
+// assumption is exactly what this exists to prevent.
+
+type DurationError =
+    | NoUnit(text: str)
+    | UnknownUnit(unit: str)
+    | Malformed(text: str)
+
+fn unit_ms(u: str) -> i64 {
+    if u == "ms" {
+        return 1
+    }
+    if u == "s" {
+        return 1000
+    }
+    if u == "m" {
+        return 60000
+    }
+    if u == "h" {
+        return 3600000
+    }
+    if u == "d" {
+        return 86400000
+    }
+    return 0 - 1
+}
+
+/// Milliseconds from text like `1h30m` or `250ms`.
+pub fn parse(text: str) -> i64 ! DurationError {
+    let t = text.trim()
+    if t.len() == 0 {
+        fail(Malformed(text))
+    }
+    var total = 0
+    var number = ""
+    var unit = ""
+    var saw_unit = false
+    let cs = t.chars()
+    for i in 0..cs.len() {
+        let c = cs[i]
+        if c >= "0" and c <= "9" {
+            if unit != "" {
+                // A unit finished; fold it in and start the next pair.
+                let ms = unit_ms(unit)
+                if ms < 0 {
+                    fail(UnknownUnit(unit))
+                }
+                total = total + (number.parse_int() ?? 0) * ms
+                number = ""
+                unit = ""
+            }
+            number = number + c
+        } else {
+            if number == "" {
+                fail(Malformed(text))
+            }
+            unit = unit + c
+            saw_unit = true
+        }
+    }
+    if not saw_unit {
+        // A bare number is refused: seconds or milliseconds is the question
+        // this package exists to stop anyone guessing at.
+        fail(NoUnit(text))
+    }
+    if unit == "" {
+        fail(Malformed(text))
+    }
+    let ms = unit_ms(unit)
+    if ms < 0 {
+        fail(UnknownUnit(unit))
+    }
+    return total + (number.parse_int() ?? 0) * ms
+}
+
+/// The shortest exact spelling: 90000 becomes `1m30s`, not `1.5m`.
+pub fn render(ms: i64) -> str {
+    if ms == 0 {
+        return "0s"
+    }
+    let neg = ms < 0
+    var left = if neg { 0 - ms } else { ms }
+    var out = ""
+    let units = [("d", 86400000), ("h", 3600000), ("m", 60000), ("s", 1000), ("ms", 1)]
+    for u in units {
+        if left >= u.1 {
+            out = out + "{left / u.1}{u.0}"
+            left = left % u.1
+        }
+    }
+    if neg {
+        return "-" + out
+    }
+    return out
+}
+
+/// A rounded, human phrasing for a status line: "about 2 hours".
+pub fn approximate(ms: i64) -> str {
+    let s = ms / 1000
+    if s < 1 {
+        return "under a second"
+    }
+    if s < 60 {
+        return "{s} seconds"
+    }
+    if s < 3600 {
+        let m = s / 60
+        return if m == 1 { "a minute" } else { "{m} minutes" }
+    }
+    if s < 86400 {
+        let h = s / 3600
+        return if h == 1 { "an hour" } else { "about {h} hours" }
+    }
+    let d = s / 86400
+    return if d == 1 { "a day" } else { "{d} days" }
+}

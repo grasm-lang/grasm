@@ -1,0 +1,119 @@
+// Scheduling, limiting and durations. Time is a parameter throughout, so
+// every assertion here is exact rather than timing-dependent.
+import cron
+import ratelimit
+import duration
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+
+    print("-- cron, and the day-of-week rule everyone gets wrong")
+    match cron.parse("*/15 * * * *") {
+        Err(_e) -> say(f, "a step field", false)
+        Ok(s) -> {
+            say(f, "fires at 0", cron.matches(s, 0, 3, 10, 6, 2))
+            say(f, "and at 15", cron.matches(s, 15, 3, 10, 6, 2))
+            say(f, "not at 7", not cron.matches(s, 7, 3, 10, 6, 2))
+        }
+    }
+    match cron.parse("30 2 * * 1-5") {
+        Err(_e) -> say(f, "a weekday range", false)
+        Ok(s) -> {
+            say(f, "02:30 on a Tuesday", cron.matches(s, 30, 2, 10, 6, 2))
+            say(f, "not on a Sunday", not cron.matches(s, 30, 2, 10, 6, 0))
+            say(f, "not at 03:30", not cron.matches(s, 30, 3, 10, 6, 2))
+        }
+    }
+    // The rule: both day fields restricted means OR, not AND.
+    match cron.parse("0 0 13 * 5") {
+        Err(_e) -> say(f, "both day fields", false)
+        Ok(s) -> {
+            say(f, "the 13th, whatever day it is", cron.matches(s, 0, 0, 13, 6, 2))
+            say(f, "and every Friday, whatever date", cron.matches(s, 0, 0, 20, 6, 5))
+            say(f, "but not a Tuesday the 20th", not cron.matches(s, 0, 0, 20, 6, 2))
+        }
+    }
+    match cron.parse("0 0 * * 0") {
+        Err(_e) -> say(f, "sunday as 0", false)
+        Ok(s) -> say(f, "0 and 7 are both Sunday", cron.matches(s, 0, 0, 1, 1, 0))
+    }
+    match cron.parse("0 0 * * 7") {
+        Err(_e) -> say(f, "sunday as 7", false)
+        Ok(s) -> say(f, "and 7 works too", cron.matches(s, 0, 0, 1, 1, 0))
+    }
+    say(f, "four fields is refused", {
+        match cron.parse("* * * *") {
+            Err(_e) -> true
+            Ok(_s) -> false
+        }
+    })
+    say(f, "minute 60 is refused", {
+        match cron.parse("60 * * * *") {
+            Err(_e) -> true
+            Ok(_s) -> false
+        }
+    })
+    say(f, "describes itself", cron.describe("*/5 * * * *") == "every 5 minutes")
+    say(f, "every minute", cron.describe("* * * * *") == "every minute")
+
+    print("-- the token bucket, which a fixed window cannot match")
+    var b = ratelimit.new_bucket(10, 5, 0)
+    say(f, "starts full", ratelimit.available(b, 0) == 10)
+    var taken = 0
+    for _i in 0..10 {
+        if ratelimit.allow(b, 0) {
+            taken = taken + 1
+        }
+    }
+    say(f, "a burst of ten is allowed", taken == 10)
+    say(f, "the eleventh is not", not ratelimit.allow(b, 0))
+    // Refill is continuous: one second at five per second gives five back.
+    say(f, "one second later, five are back", ratelimit.available(b, 1000) == 5)
+    say(f, "and it never exceeds capacity", ratelimit.available(b, 999999) == 10)
+    say(f, "the wait is computed", ratelimit.wait_ms(b, 10, 0) >= 0)
+    var tight = ratelimit.new_bucket(2, 1, 0)
+    let _a = ratelimit.allow_n(tight, 2, 0)
+    say(f, "asking for more than capacity is refused", not ratelimit.allow_n(tight, 5, 0))
+    say(f, "counters are kept", ratelimit.allowed_count(b) == 10 and ratelimit.refused_count(b) > 0)
+
+    print("-- durations, where a bare number is the bug")
+    say(f, "milliseconds", (duration.parse("250ms") ?? 0) == 250)
+    say(f, "seconds", (duration.parse("30s") ?? 0) == 30000)
+    say(f, "compound", (duration.parse("1h30m") ?? 0) == 5400000)
+    say(f, "three parts", (duration.parse("1d2h3m") ?? 0) == 93780000)
+    // The point of the package.
+    say(f, "a bare number is REFUSED, not guessed at", {
+        match duration.parse("30") {
+            Err(_e) -> true
+            Ok(_v) -> false
+        }
+    })
+    say(f, "an unknown unit is refused", {
+        match duration.parse("5x") {
+            Err(_e) -> true
+            Ok(_v) -> false
+        }
+    })
+    say(f, "renders exactly", duration.render(90000) == "1m30s")
+    say(f, "and does not invent a decimal", duration.render(5400000) == "1h30m")
+    say(f, "zero", duration.render(0) == "0s")
+    say(f, "round trips", (duration.parse(duration.render(93780000)) ?? 0) == 93780000)
+    say(f, "approximates for a status line", duration.approximate(7200000) == "about 2 hours")
+    say(f, "and singularises", duration.approximate(3600000) == "an hour")
+
+    print("")
+    if f == 0 {
+        print("all held")
+    } else {
+        print("{f} failed")
+    }
+}

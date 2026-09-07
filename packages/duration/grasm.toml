@@ -1,0 +1,6 @@
+[package]
+name = "duration"
+version = "1.0.0"
+
+# Parsing and formatting. Opens nothing.
+capabilities = []

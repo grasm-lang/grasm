@@ -1,0 +1,90 @@
+// A token bucket, which is the rate limiter worth having.
+//
+// The alternative — a fixed window, "100 per minute" counted per clock minute
+// — allows 200 requests in two seconds by putting 100 at :59 and 100 at :01.
+// A token bucket cannot be gamed that way: tokens refill continuously, so the
+// long-run rate holds no matter where a burst lands.
+//
+// Time is a parameter. The bucket is refilled from the clock the caller
+// supplies, so this opens nothing and a test can step time exactly.
+
+type Bucket = {
+    /// Tokens are held in thousandths so a fractional refill is exact.
+    tokens: i64,
+    capacity: i64,
+    /// Tokens added per second, in thousandths.
+    refill: i64,
+    last_ms: i64,
+    allowed: i64,
+    refused: i64,
+}
+
+/// A bucket holding `capacity` and refilling `per_second`, full to start.
+pub fn new_bucket(capacity: i64, per_second: i64, now_ms: i64) -> Bucket {
+    return Bucket{
+        tokens: capacity * 1000,
+        capacity: capacity,
+        refill: per_second * 1000,
+        last_ms: now_ms,
+        allowed: 0,
+        refused: 0,
+    }
+}
+
+fn top_up(inout b: Bucket, now_ms: i64) {
+    if now_ms <= b.last_ms {
+        return
+    }
+    let elapsed = now_ms - b.last_ms
+    b.tokens = b.tokens + elapsed * b.refill / 1000
+    let ceiling = b.capacity * 1000
+    if b.tokens > ceiling {
+        b.tokens = ceiling
+    }
+    b.last_ms = now_ms
+}
+
+/// Take one token if there is one.
+pub fn allow(inout b: Bucket, now_ms: i64) -> bool {
+    return allow_n(b, 1, now_ms)
+}
+
+/// Take `n`. A request costing more than the bucket holds can never be
+/// allowed, which is worth knowing rather than looping on forever.
+pub fn allow_n(inout b: Bucket, n: i64, now_ms: i64) -> bool {
+    top_up(b, now_ms)
+    let want = n * 1000
+    if b.tokens >= want {
+        b.tokens = b.tokens - want
+        b.allowed = b.allowed + 1
+        return true
+    }
+    b.refused = b.refused + 1
+    return false
+}
+
+/// Milliseconds until `n` tokens would be available. 0 when they are now.
+pub fn wait_ms(inout b: Bucket, n: i64, now_ms: i64) -> i64 {
+    top_up(b, now_ms)
+    let want = n * 1000
+    if b.tokens >= want {
+        return 0
+    }
+    if b.refill == 0 {
+        return 0 - 1
+    }
+    return (want - b.tokens) * 1000 / b.refill
+}
+
+pub fn available(inout b: Bucket, now_ms: i64) -> i64 {
+    top_up(b, now_ms)
+    return b.tokens / 1000
+}
+
+pub fn allowed_count(b: Bucket) -> i64 {
+    return b.allowed
+}
+
+pub fn refused_count(b: Bucket) -> i64 {
+    return b.refused
+}

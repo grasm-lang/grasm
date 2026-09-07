@@ -1,0 +1,16 @@
+[package]
+name = "system_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.cron]
+path = "../cron"
+version = "^1.0.0"
+
+[dependencies.ratelimit]
+path = "../ratelimit"
+version = "^1.0.0"
+
+[dependencies.duration]
+path = "../duration"
+version = "^1.0.0"

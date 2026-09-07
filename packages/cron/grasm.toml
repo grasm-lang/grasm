@@ -1,0 +1,6 @@
+[package]
+name = "cron"
+version = "1.0.0"
+
+# Parsing and arithmetic. Opens nothing.
+capabilities = []

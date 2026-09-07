@@ -1,0 +1,134 @@
+// Cron expressions: parsing, and "does this minute match".
+//
+// Five fields — minute, hour, day of month, month, day of week — each a `*`,
+// a number, a list, a range, or a step. The rule that surprises everyone is
+// the last one: when *both* day-of-month and day-of-week are restricted, cron
+// fires when **either** matches, not both. `0 0 13 * 5` is the 13th and every
+// Friday, not Friday the 13th.
+//
+// Time is a parameter, so this package opens nothing and a test is exact.
+
+type Schedule = {
+    minute: [bool],
+    hour: [bool],
+    day: [bool],
+    month: [bool],
+    weekday: [bool],
+    /// Both day fields restricted, which switches the rule to OR.
+    day_restricted: bool,
+    weekday_restricted: bool,
+}
+
+type CronError =
+    | WrongFieldCount(got: i64)
+    | BadField(text: str)
+
+fn all_false(n: i64) -> [bool] {
+    var out: [bool] = []
+    for _i in 0..n {
+        out.push(false)
+    }
+    return out
+}
+
+/// One field into a set of allowed values.
+fn parse_field(text: str, least: i64, most: i64) -> [bool] ! CronError {
+    var set = all_false(most + 1)
+    for part in text.split(",") {
+        var step = 1
+        var body = part
+        match part.index_of("/") {
+            None -> {}
+            Some(at) -> {
+                body = part.substr(0, at)
+                step = part.substr(at + 1, part.len() - at - 1).parse_int() ?? 0
+                if step < 1 {
+                    fail(BadField(part))
+                }
+            }
+        }
+        var lo = least
+        var hi = most
+        if body != "*" {
+            match body.index_of("-") {
+                Some(at) -> {
+                    lo = body.substr(0, at).parse_int() ?? 0 - 1
+                    hi = body.substr(at + 1, body.len() - at - 1).parse_int() ?? 0 - 1
+                }
+                None -> {
+                    lo = body.parse_int() ?? 0 - 1
+                    hi = lo
+                }
+            }
+        }
+        if lo < least or hi > most or lo > hi {
+            fail(BadField(part))
+        }
+        var v = lo
+        while v <= hi {
+            set[v] = true
+            v = v + step
+        }
+    }
+    return set
+}
+
+pub fn parse(expr: str) -> Schedule ! CronError {
+    let fields = expr.trim().words()
+    if fields.len() != 5 {
+        fail(WrongFieldCount(fields.len()))
+    }
+    let minute = try parse_field(fields[0], 0, 59)
+    let hour = try parse_field(fields[1], 0, 23)
+    let day = try parse_field(fields[2], 1, 31)
+    let month = try parse_field(fields[3], 1, 12)
+    var weekday = try parse_field(fields[4], 0, 7)
+    // 7 and 0 are both Sunday.
+    if weekday[7] {
+        weekday[0] = true
+    }
+    return Schedule{
+        minute: minute, hour: hour, day: day, month: month, weekday: weekday,
+        day_restricted: fields[2] != "*",
+        weekday_restricted: fields[4] != "*",
+    }
+}
+
+/// Whether the schedule fires at this moment.
+pub fn matches(s: Schedule, minute: i64, hour: i64, day: i64, month: i64, weekday: i64) -> bool {
+    if not s.minute[minute] or not s.hour[hour] or not s.month[month] {
+        return false
+    }
+    // The rule everyone gets wrong: both restricted means OR, not AND.
+    if s.day_restricted and s.weekday_restricted {
+        return s.day[day] or s.weekday[weekday]
+    }
+    if s.day_restricted {
+        return s.day[day]
+    }
+    if s.weekday_restricted {
+        return s.weekday[weekday]
+    }
+    return true
+}
+
+/// A plain-English reading, for a confirmation screen.
+pub fn describe(expr: str) -> str {
+    let fields = expr.trim().words()
+    if fields.len() != 5 {
+        return "not a cron expression"
+    }
+    if expr.trim() == "* * * * *" {
+        return "every minute"
+    }
+    if fields[0] == "0" and fields[1] == "*" {
+        return "hourly, on the hour"
+    }
+    if fields[0] == "0" and fields[1] == "0" and fields[2] == "*" and fields[4] == "*" {
+        return "daily at midnight"
+    }
+    if fields[0].starts_with("*/") {
+        return "every {fields[0].substr(2, fields[0].len() - 2)} minutes"
+    }
+    return "on a schedule"
+}
