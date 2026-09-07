@@ -6,71 +6,71 @@
 // overlapping or not depending on which way the author guessed. Here `[1,3]`
 // and `[3,5]` overlap at 3, and `[1,3]` and `[4,5]` do not.
 
-type Span = {
+type Interval = {
     lo: i64,
     hi: i64,
 }
 
-pub fn span(lo: i64, hi: i64) -> Span {
+pub fn span(lo: i64, hi: i64) -> Interval {
     if hi < lo {
-        return Span{ lo: hi, hi: lo }
+        return Interval{ lo: hi, hi: lo }
     }
-    return Span{ lo: lo, hi: hi }
+    return Interval{ lo: lo, hi: hi }
 }
 
-pub fn width(s: Span) -> i64 {
+pub fn width(s: Interval) -> i64 {
     return s.hi - s.lo + 1
 }
 
-pub fn holds(s: Span, v: i64) -> bool {
+pub fn holds(s: Interval, v: i64) -> bool {
     return v >= s.lo and v <= s.hi
 }
 
-pub fn overlaps(a: Span, b: Span) -> bool {
+pub fn overlaps(a: Interval, b: Interval) -> bool {
     return a.lo <= b.hi and b.lo <= a.hi
 }
 
 /// True when the two sit end to end with no gap: `[1,3]` and `[4,6]`.
-pub fn adjacent(a: Span, b: Span) -> bool {
+pub fn adjacent(a: Interval, b: Interval) -> bool {
     return a.hi + 1 == b.lo or b.hi + 1 == a.lo
 }
 
-pub fn intersect(a: Span, b: Span) -> Option[Span] {
+pub fn intersect(a: Interval, b: Interval) -> Option[Interval] {
     if not overlaps(a, b) {
         return None
     }
     let lo = if a.lo > b.lo { a.lo } else { b.lo }
     let hi = if a.hi < b.hi { a.hi } else { b.hi }
-    return Some(Span{ lo: lo, hi: hi })
+    return Some(Interval{ lo: lo, hi: hi })
 }
 
 /// The union, when it is a single span. Two disjoint spans have none.
-pub fn union(a: Span, b: Span) -> Option[Span] {
+pub fn union(a: Interval, b: Interval) -> Option[Interval] {
     if not overlaps(a, b) and not adjacent(a, b) {
         return None
     }
     let lo = if a.lo < b.lo { a.lo } else { b.lo }
     let hi = if a.hi > b.hi { a.hi } else { b.hi }
-    return Some(Span{ lo: lo, hi: hi })
+    return Some(Interval{ lo: lo, hi: hi })
 }
 
 /// `a` with `b` removed — nothing, one span, or two.
-pub fn subtract(a: Span, b: Span) -> [Span] {
+pub fn subtract(a: Interval, b: Interval) -> [Interval] {
     if not overlaps(a, b) {
         return [a]
     }
-    var out: [Span] = []
+    var out: [Interval] = []
     if b.lo > a.lo {
-        out.push(Span{ lo: a.lo, hi: b.lo - 1 })
+        out.push(Interval{ lo: a.lo, hi: b.lo - 1 })
     }
     if b.hi < a.hi {
-        out.push(Span{ lo: b.hi + 1, hi: a.hi })
+        out.push(Interval{ lo: b.hi + 1, hi: a.hi })
     }
     return out
 }
 
 /// Sorted and merged: overlapping and touching spans become one.
-pub fn normalise(spans: [Span]) -> [Span] {
+pub fn normalise(spans: [Interval]) -> [Interval] {
     if spans.len() == 0 {
         return []
     }
@@ -88,7 +88,7 @@ pub fn normalise(spans: [Span]) -> [Span] {
         }
         i = i + 1
     }
-    var out: [Span] = [sorted[0]]
+    var out: [Interval] = [sorted[0]]
     for k in 1..sorted.len() {
         let last = out[out.len() - 1]
         match union(last, sorted[k]) {
@@ -100,7 +100,7 @@ pub fn normalise(spans: [Span]) -> [Span] {
 }
 
 /// Total covered, counting an overlap once.
-pub fn covered(spans: [Span]) -> i64 {
+pub fn covered(spans: [Interval]) -> i64 {
     var total = 0
     for s in normalise(spans) {
         total = total + width(s)
@@ -108,6 +108,6 @@ pub fn covered(spans: [Span]) -> i64 {
     return total
 }
 
-pub fn render(s: Span) -> str {
+pub fn render(s: Interval) -> str {
     return "[{s.lo},{s.hi}]"
 }

@@ -1,4 +1,4 @@
-// Summary statistics, with the two that are usually got wrong.
+// StatSummary statistics, with the two that are usually got wrong.
 //
 // **Variance** is computed in one pass by Welford's method rather than as
 // `E[x^2] - E[x]^2`. The textbook formula subtracts two large nearly-equal
@@ -10,7 +10,7 @@
 // disagree on the same input. This uses the linear one NIST calls R-7, which
 // is what NumPy and R default to.
 
-type Summary = {
+type StatSummary = {
     count: i64,
     mean: f64,
     /// Sum of squared deviations. Variance is this over count.
@@ -19,13 +19,13 @@ type Summary = {
     most: f64,
 }
 
-pub fn new_summary() -> Summary {
-    return Summary{ count: 0, mean: 0.0, m2: 0.0, least: 0.0, most: 0.0 }
+pub fn new_summary() -> StatSummary {
+    return StatSummary{ count: 0, mean: 0.0, m2: 0.0, least: 0.0, most: 0.0 }
 }
 
 /// One more observation. Welford: the mean moves, and the squared-deviation
 /// sum is updated against both the old mean and the new.
-pub fn observe(inout s: Summary, v: f64) {
+pub fn observe(inout s: StatSummary, v: f64) {
     if s.count == 0 {
         s.least = v
         s.most = v
@@ -43,31 +43,31 @@ pub fn observe(inout s: Summary, v: f64) {
     s.m2 = s.m2 + delta * (v - s.mean)
 }
 
-pub fn mean(s: Summary) -> f64 {
+pub fn mean(s: StatSummary) -> f64 {
     return s.mean
 }
 
 /// The sample variance, dividing by n-1. Zero for fewer than two values.
-pub fn variance(s: Summary) -> f64 {
+pub fn variance(s: StatSummary) -> f64 {
     if s.count < 2 {
         return 0.0
     }
     return s.m2 / (s.count - 1).as_f64()
 }
 
-pub fn deviation(s: Summary) -> f64 {
+pub fn deviation(s: StatSummary) -> f64 {
     return sqrt_of(variance(s))
 }
 
-pub fn least(s: Summary) -> f64 {
+pub fn least(s: StatSummary) -> f64 {
     return s.least
 }
 
-pub fn most(s: Summary) -> f64 {
+pub fn most(s: StatSummary) -> f64 {
     return s.most
 }
 
-pub fn count(s: Summary) -> i64 {
+pub fn count(s: StatSummary) -> i64 {
     return s.count
 }
 
