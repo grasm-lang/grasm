@@ -1,0 +1,218 @@
+// Values between the ones you measured.
+//
+// Every sampled thing needs this: a lookup table with ten entries and a
+// reading that falls between two of them, an animation with keyframes and a
+// frame in between, a sensor curve with a calibration point every ten degrees.
+//
+// Which method to use is a real choice and the package makes it visible.
+// Linear is exact at the samples and has a corner at each one. Catmull-Rom is
+// smooth and **overshoots** — feed it a step and it dips below the low value
+// before climbing, which ruins a curve that must stay in range. The monotone
+// variant gives that up to guarantee it never overshoots, and is the right
+// default for anything physical.
+
+type InterpCurve = {
+    /// Ascending, and the same length as `y`.
+    x: [f64],
+    y: [f64],
+}
+
+pub fn curve(x: [f64], y: [f64]) -> InterpCurve {
+    return InterpCurve{ x: x, y: y }
+}
+
+pub fn lerp(a: f64, b: f64, t: f64) -> f64 {
+    // Written as `a + (b - a) * t` rather than `a*(1-t) + b*t` so that `t = 1`
+    // returns exactly `b` with no rounding.
+    return a + (b - a) * t
+}
+
+/// Where `v` sits between `a` and `b`, the inverse of `lerp`.
+pub fn unlerp(a: f64, b: f64, v: f64) -> f64 {
+    if b == a {
+        return 0.0
+    }
+    return (v - a) / (b - a)
+}
+
+pub fn clamp(v: f64, low: f64, high: f64) -> f64 {
+    if v < low {
+        return low
+    }
+    if v > high {
+        return high
+    }
+    return v
+}
+
+/// Move a value from one range to another.
+pub fn remap(v: f64, from_low: f64, from_high: f64, to_low: f64, to_high: f64) -> f64 {
+    return lerp(to_low, to_high, unlerp(from_low, from_high, v))
+}
+
+/// The index of the last sample at or below `at`.
+fn span_of(c: InterpCurve, at: f64) -> i64 {
+    var lo = 0
+    var hi = c.x.len() - 1
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2
+        if c.x[mid] <= at {
+            lo = mid
+        } else {
+            hi = mid - 1
+        }
+    }
+    return lo
+}
+
+pub fn linear(c: InterpCurve, at: f64) -> f64 {
+    if c.x.len() == 0 {
+        return 0.0
+    }
+    if c.x.len() == 1 or at <= c.x[0] {
+        return c.y[0]
+    }
+    if at >= c.x[c.x.len() - 1] {
+        return c.y[c.y.len() - 1]
+    }
+    let i = span_of(c, at)
+    return lerp(c.y[i], c.y[i + 1], unlerp(c.x[i], c.x[i + 1], at))
+}
+
+/// Catmull-Rom: smooth through every sample, and free to leave their range.
+pub fn catmull_rom(c: InterpCurve, at: f64) -> f64 {
+    let n = c.x.len()
+    if n == 0 {
+        return 0.0
+    }
+    if n < 4 {
+        return linear(c, at)
+    }
+    if at <= c.x[0] {
+        return c.y[0]
+    }
+    if at >= c.x[n - 1] {
+        return c.y[n - 1]
+    }
+    let i = span_of(c, at)
+    // The two outer samples are duplicated at the ends, which is what gives
+    // the first and last spans a tangent at all.
+    let p0 = if i == 0 { c.y[0] } else { c.y[i - 1] }
+    let p1 = c.y[i]
+    let p2 = c.y[i + 1]
+    let p3 = if i + 2 >= n { c.y[n - 1] } else { c.y[i + 2] }
+    let t = unlerp(c.x[i], c.x[i + 1], at)
+    let t2 = t * t
+    let t3 = t2 * t
+    return 0.5 * (
+        2.0 * p1 +
+        (0.0 - p0 + p2) * t +
+        (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2 +
+        (0.0 - p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3
+    )
+}
+
+/// The slope at each sample, limited so no span can overshoot.
+///
+/// This is the Fritsch-Carlson filter: where the data turns, the slope is
+/// forced to zero, and elsewhere it is capped at three times the smaller
+/// neighbouring secant. Those two rules are exactly what makes the result
+/// stay between the samples it passes through.
+fn monotone_slopes(c: InterpCurve) -> [f64] {
+    let n = c.x.len()
+    var secant: [f64] = []
+    for i in 0..(n - 1) {
+        secant.push((c.y[i + 1] - c.y[i]) / (c.x[i + 1] - c.x[i]))
+    }
+    var m: [f64] = []
+    for i in 0..n {
+        if i == 0 {
+            m.push(secant[0])
+        } else if i == n - 1 {
+            m.push(secant[n - 2])
+        } else {
+            m.push((secant[i - 1] + secant[i]) / 2.0)
+        }
+    }
+    for i in 0..(n - 1) {
+        if secant[i] == 0.0 {
+            m[i] = 0.0
+            m[i + 1] = 0.0
+        } else {
+            let a = m[i] / secant[i]
+            let b = m[i + 1] / secant[i]
+            let reach = a.hypot(b)
+            if reach > 3.0 {
+                let t = 3.0 / reach
+                m[i] = t * a * secant[i]
+                m[i + 1] = t * b * secant[i]
+            }
+        }
+    }
+    return m
+}
+
+/// Smooth, and guaranteed to stay within the samples it joins.
+pub fn monotone(c: InterpCurve, at: f64) -> f64 {
+    let n = c.x.len()
+    if n == 0 {
+        return 0.0
+    }
+    if n < 3 {
+        return linear(c, at)
+    }
+    if at <= c.x[0] {
+        return c.y[0]
+    }
+    if at >= c.x[n - 1] {
+        return c.y[n - 1]
+    }
+    let m = monotone_slopes(c)
+    let i = span_of(c, at)
+    let h = c.x[i + 1] - c.x[i]
+    let t = (at - c.x[i]) / h
+    let t2 = t * t
+    let t3 = t2 * t
+    // Hermite basis: the two values and the two slopes.
+    return (2.0 * t3 - 3.0 * t2 + 1.0) * c.y[i] +
+    (t3 - 2.0 * t2 + t) * h * m[i] +
+    (0.0 - 2.0 * t3 + 3.0 * t2) * c.y[i + 1] +
+    (t3 - t2) * h * m[i + 1]
+}
+
+/// Interpolate across a grid: four corners, two axes.
+pub fn bilinear(q00: f64, q10: f64, q01: f64, q11: f64, tx: f64, ty: f64) -> f64 {
+    return lerp(lerp(q00, q10, tx), lerp(q01, q11, tx), ty)
+}
+
+/// Smoothstep: zero slope at both ends, which is why an eased animation uses
+/// it and a straight `lerp` looks mechanical.
+pub fn smoothstep(t: f64) -> f64 {
+    let x = clamp(t, 0.0, 1.0)
+    return x * x * (3.0 - 2.0 * x)
+}
+
+/// Smootherstep: zero *acceleration* at both ends as well.
+pub fn smootherstep(t: f64) -> f64 {
+    let x = clamp(t, 0.0, 1.0)
+    return x * x * x * (x * (x * 6.0 - 15.0) + 10.0)
+}
+
+/// Sample a curve at `count` evenly spaced points across its own span.
+pub fn resample(c: InterpCurve, count: i64) -> [f64] {
+    var out: [f64] = []
+    if c.x.len() == 0 or count <= 0 {
+        return out
+    }
+    let low = c.x[0]
+    let high = c.x[c.x.len() - 1]
+    if count == 1 {
+        out.push(linear(c, low))
+        return out
+    }
+    for i in 0..count {
+        let t = i.as_f64() / (count - 1).as_f64()
+        out.push(linear(c, lerp(low, high, t)))
+    }
+    return out
+}

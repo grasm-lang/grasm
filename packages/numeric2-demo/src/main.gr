@@ -1,0 +1,279 @@
+import bigint
+import fixedpoint
+import complexnum
+import interpolate
+import units
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn big(text: str) -> BigInt {
+    return bigint.parse(text) ?? bigint.zero()
+}
+
+fn dec(text: str, scale: i64) -> FixedDec {
+    return fixedpoint.parse(text, scale) ?? fixedpoint.from_i64(0, scale)
+}
+
+fn qty(amount: f64, unit: str) -> UnitQty {
+    return units.quantity(amount, unit) ?? units.base(0.0, 0)
+}
+
+fn temp(value: f64, unit: str) -> UnitQty {
+    return units.temperature(value, unit) ?? units.base(0.0, units.TEMPERATURE)
+}
+
+fn near(a: f64, b: f64, tolerance: f64) -> bool {
+    let d = a - b
+    let m = if d < 0.0 { 0.0 - d } else { d }
+    return m <= tolerance
+}
+
+fn check_bigint(inout f: i64) / {io} {
+    print("-- bigint: past where i64 stops")
+    // Every expected value here is the answer Python's arbitrary-precision
+    // integers give for the same expression.
+    say(f, "50! is 65 digits and all of them right",
+        bigint.to_str(bigint.factorial(50)) ==
+        "30414093201713378043612608166064768844377641568960512000000000000")
+    say(f, "and it says so without being asked to print",
+        bigint.digit_count(bigint.factorial(50)) == 65)
+    say(f, "2^256 is the size of an ECDSA key space",
+        bigint.to_str(bigint.pow(bigint.from_i64(2), 256)) ==
+        "115792089237316195423570985008687907853269984665640564039457584007913129639936")
+    say(f, "3^200 comes out exact too",
+        bigint.to_str(bigint.pow(bigint.from_i64(3), 200)) ==
+        "265613988875874769338781322035779626829233452653394495974574961739092490901302182994384699044001")
+    let a = big("987654321098765432109876543210")
+    let b = big("123456789012345678901")
+    say(f, "a 30-digit product",
+        bigint.to_str(bigint.mul(a, b)) == "121932631137021795225953360743473403443222511812210")
+    say(f, "addition carries across limbs",
+        bigint.to_str(bigint.add(a, b)) == "987654321222222221122222222111")
+    say(f, "subtraction borrows the other way",
+        bigint.to_str(bigint.sub(b, a)) == "-987654320975308643097530864309")
+    let pair = bigint.divmod(a, b) ?? (bigint.zero(), bigint.zero())
+    say(f, "long division finds the quotient", bigint.to_str(pair.0) == "8000000072")
+    say(f, "and the remainder", bigint.to_str(pair.1) == "111111192012987662338")
+    say(f, "quotient times divisor plus remainder is the dividend",
+        bigint.compare(bigint.add(bigint.mul(pair.0, b), pair.1), a) == 0)
+    let neg = big("-98765432109876543210")
+    let d = bigint.divmod(neg, bigint.from_i64(37)) ?? (bigint.zero(), bigint.zero())
+    say(f, "a negative quotient truncates toward zero, as i64 does",
+        bigint.to_str(d.0) == "-2669336002969636302")
+    say(f, "and the remainder takes the dividend's sign",
+        bigint.to_str(d.1) == "-36")
+    match bigint.divmod(a, bigint.zero()) {
+        Ok(_v) -> say(f, "dividing by zero is refused", false)
+        Err(_e) -> say(f, "dividing by zero is refused", true)
+    }
+    say(f, "a value that fits comes back as i64", bigint.to_i64(big("9007199254740993")) ==
+        Some(9007199254740993))
+    say(f, "one that does not returns None", bigint.to_i64(bigint.factorial(50)) == None)
+    say(f, "zero has no sign", bigint.sign(bigint.sub(b, b)) == 0)
+    say(f, "and prints as one character", bigint.to_str(bigint.sub(b, b)) == "0")
+}
+
+fn check_fixedpoint(inout f: i64) / {io} {
+    print("-- fixedpoint: the sum a float gets wrong")
+    let tenth = dec("0.1", 2)
+    let fifth = dec("0.2", 2)
+    say(f, "0.1 + 0.2 is exactly 0.3", fixedpoint.to_str(fixedpoint.add(tenth, fifth)) == "0.30")
+    // The same sum in f64, for contrast: this is the number a float gives.
+    say(f, "the float it is being compared against does not", 0.1 + 0.2 != 0.3)
+    say(f, "parsing keeps every place asked for", fixedpoint.to_str(dec("12.345", 3)) == "12.345")
+    say(f, "and rounds the ones it cannot keep", fixedpoint.to_str(dec("12.345", 2)) == "12.35")
+    say(f, "half rounds away from zero, not toward even",
+        fixedpoint.to_str(dec("0.005", 2)) == "0.01")
+    say(f, "a negative rounds away from zero too",
+        fixedpoint.to_str(dec("-0.005", 2)) == "-0.01")
+    say(f, "a whole number keeps its places", fixedpoint.to_str(dec("7", 2)) == "7.00")
+    let price = dec("19.99", 2)
+    let rate = dec("0.0825", 4)
+    say(f, "tax on 19.99 at 8.25% is 1.65",
+        fixedpoint.to_str(fixedpoint.mul(price, rate, 2)) == "1.65")
+    let third = fixedpoint.div(dec("100", 2), dec("3", 2), 2) ?? dec("0", 2)
+    say(f, "100 / 3 rounds to 33.33", fixedpoint.to_str(third) == "33.33")
+    match fixedpoint.div(price, dec("0", 2), 2) {
+        Ok(_v) -> say(f, "dividing by zero is refused", false)
+        Err(_e) -> say(f, "dividing by zero is refused", true)
+    }
+    let shares = fixedpoint.allocate(dec("100.00", 2), 3)
+    say(f, "splitting 100.00 three ways gives three shares", shares.len() == 3)
+    say(f, "the first takes the odd unit", fixedpoint.to_str(shares[0]) == "33.34")
+    say(f, "the others do not", fixedpoint.to_str(shares[2]) == "33.33")
+    var total = dec("0", 2)
+    for s in shares {
+        total = fixedpoint.add(total, s)
+    }
+    say(f, "and the shares add back to the whole", fixedpoint.to_str(total) == "100.00")
+    say(f, "comparison works across scales",
+        fixedpoint.compare(dec("1.5", 1), dec("1.500", 3)) == 0)
+    match fixedpoint.parse("12.3x", 2) {
+        Ok(_v) -> say(f, "text that is not a decimal is refused", false)
+        Err(_e) -> say(f, "text that is not a decimal is refused", true)
+    }
+}
+
+fn check_complex(inout f: i64) / {io} {
+    print("-- complexnum: rotation, and the branch cut")
+    let a = complexnum.make(1.0, 2.0)
+    let b = complexnum.make(3.0, 4.0)
+    say(f, "(1+2i)(3+4i) is -5+10i",
+        complexnum.nearly_equal(complexnum.mul(a, b), complexnum.make(0.0 - 5.0, 10.0), 0.000000001))
+    say(f, "and dividing it back gives (1+2i)",
+        complexnum.nearly_equal(complexnum.div(complexnum.mul(a, b), b), a, 0.000000001))
+    say(f, "|3+4i| is 5", complexnum.magnitude(b) == 5.0)
+    say(f, "the argument of i is a right angle",
+        near(complexnum.argument(complexnum.i()), pi() / 2.0, 0.000000001))
+    say(f, "sqrt(-1) is i, not -i",
+        complexnum.nearly_equal(complexnum.sqrt(complexnum.real(0.0 - 1.0)),
+            complexnum.i(), 0.000000001))
+    say(f, "and squaring it returns -1",
+        complexnum.nearly_equal(complexnum.powi(complexnum.i(), 2),
+            complexnum.real(0.0 - 1.0), 0.000000001))
+    // Euler's identity, which is the one check that exercises exp, pi and the
+    // sign conventions all at once.
+    say(f, "e^(i pi) is -1",
+        complexnum.nearly_equal(complexnum.exp(complexnum.imaginary(pi())),
+            complexnum.real(0.0 - 1.0), 0.000000001))
+    say(f, "ln undoes exp", complexnum.nearly_equal(
+        complexnum.exp(complexnum.ln(b)), b, 0.000000001))
+    let roots = complexnum.roots_of_unity(8)
+    say(f, "there are eight eighth-roots of unity", roots.len() == 8)
+    var sum = complexnum.zero()
+    for r in roots {
+        sum = complexnum.add(sum, r)
+    }
+    say(f, "and they sum to zero", complexnum.magnitude(sum) < 0.000000001)
+    var all_unit = true
+    for r in roots {
+        if not near(complexnum.magnitude(r), 1.0, 0.000000001) {
+            all_unit = false
+        }
+    }
+    say(f, "every one sits on the unit circle", all_unit)
+    say(f, "each raised to the eighth is one", complexnum.nearly_equal(
+        complexnum.powi(roots[3], 8), complexnum.one(), 0.00000001))
+    // Smith's method: the naive formula squares 1e200 and reaches infinity.
+    let huge = complexnum.make(1e200, 1e200)
+    let quotient = complexnum.div(huge, huge)
+    say(f, "dividing two huge numbers gives one, not NaN",
+        complexnum.nearly_equal(quotient, complexnum.one(), 0.000000001))
+    say(f, "the conjugate flips the imaginary part",
+        complexnum.to_str(complexnum.conjugate(a)) == "1.0-2.0i")
+}
+
+fn check_interpolate(inout f: i64) / {io} {
+    print("-- interpolate: where the smooth curve leaves the data")
+    let c = interpolate.curve([0.0, 1.0, 2.0, 3.0], [0.0, 10.0, 20.0, 30.0])
+    say(f, "linear hits every sample exactly", interpolate.linear(c, 2.0) == 20.0)
+    say(f, "and interpolates between them", interpolate.linear(c, 1.5) == 15.0)
+    say(f, "past the end it holds the last value", interpolate.linear(c, 99.0) == 30.0)
+    say(f, "before the start it holds the first", interpolate.linear(c, 0.0 - 5.0) == 0.0)
+    say(f, "lerp at 1 returns the endpoint exactly", interpolate.lerp(3.0, 7.0, 1.0) == 7.0)
+    say(f, "unlerp is its inverse", interpolate.unlerp(3.0, 7.0, 5.0) == 0.5)
+    say(f, "remap moves between ranges",
+        interpolate.remap(50.0, 0.0, 100.0, 0.0 - 1.0, 1.0) == 0.0)
+    // A step: flat, then a jump, then flat again. This is where the two
+    // smooth methods part company.
+    let step = interpolate.curve([0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+        [0.0, 0.0, 0.0, 10.0, 10.0, 10.0])
+    var overshot = false
+    var monotone_left_range = false
+    for i in 0..500 {
+        let at = i.as_f64() / 100.0
+        let smooth = interpolate.catmull_rom(step, at)
+        let safe = interpolate.monotone(step, at)
+        if smooth < 0.0 - 0.001 or smooth > 10.001 {
+            overshot = true
+        }
+        if safe < 0.0 - 0.000001 or safe > 10.000001 {
+            monotone_left_range = true
+        }
+    }
+    say(f, "catmull-rom leaves the range of its data", overshot)
+    say(f, "the monotone variant never does", not monotone_left_range)
+    say(f, "both still pass through the samples",
+        near(interpolate.monotone(step, 3.0), 10.0, 0.000001))
+    say(f, "smoothstep is flat at both ends",
+        interpolate.smoothstep(0.0) == 0.0 and interpolate.smoothstep(1.0) == 1.0)
+    say(f, "and symmetric in the middle", interpolate.smoothstep(0.5) == 0.5)
+    say(f, "smootherstep is too", interpolate.smootherstep(0.5) == 0.5)
+    say(f, "it clamps rather than extrapolating", interpolate.smoothstep(2.0) == 1.0)
+    say(f, "bilinear reduces to lerp on one axis",
+        interpolate.bilinear(0.0, 10.0, 0.0, 10.0, 0.5, 0.9) == 5.0)
+    say(f, "resample returns the count asked for", interpolate.resample(c, 7).len() == 7)
+    say(f, "and starts at the first sample", interpolate.resample(c, 7)[0] == 0.0)
+}
+
+fn check_units(inout f: i64) / {io} {
+    print("-- units: the conversion nobody checked")
+    // Each of these is a defined, exact conversion, not a measured one.
+    say(f, "a mile is 1609.344 metres exactly",
+        (units.convert(1.0, "mi", "m") ?? 0.0) == 1609.344)
+    say(f, "an inch is 25.4 millimetres exactly",
+        (units.convert(1.0, "in", "mm") ?? 0.0) == 25.4)
+    say(f, "a pound is 0.45359237 kilograms exactly",
+        (units.convert(1.0, "lb", "kg") ?? 0.0) == 0.45359237)
+    say(f, "a foot is twelve inches", near(units.convert(1.0, "ft", "in") ?? 0.0, 12.0, 1e-12))
+    say(f, "a day is 86400 seconds", (units.convert(1.0, "d", "s") ?? 0.0) == 86400.0)
+    say(f, "a week is seven days", (units.convert(1.0, "wk", "d") ?? 0.0) == 7.0)
+    // The reason a 1 TB disk shows as 931 GiB.
+    say(f, "a terabyte is not a tebibyte",
+        near(units.convert(1.0, "TB", "GiB") ?? 0.0, 931.32257461548, 0.000001))
+    say(f, "water boils at 212 F",
+        near(units.temperature_in(temp(100.0, "C"), "F") ?? 0.0, 212.0, 0.000000001))
+    say(f, "and freezes at 32 F",
+        near(units.temperature_in(temp(0.0, "C"), "F") ?? 0.0, 32.0, 0.000000001))
+    say(f, "-40 is the same in both scales",
+        near(units.temperature_in(temp(0.0 - 40.0, "C"), "F") ?? 0.0,
+            0.0 - 40.0, 0.000000001))
+    say(f, "absolute zero is -273.15 C",
+        near(units.temperature_in(temp(0.0, "K"), "C") ?? 0.0, 0.0 - 273.15, 0.000000001))
+    let metres = qty(100.0, "m")
+    let feet = qty(100.0, "ft")
+    let seconds = qty(10.0, "s")
+    say(f, "adding two lengths in different units works",
+        near(units.value_in(units.add(metres, feet) ?? metres, "m") ?? 0.0, 130.48, 0.000001))
+    match units.add(metres, seconds) {
+        Ok(_v) -> say(f, "adding a length to a time is refused", false)
+        Err(_e) -> say(f, "adding a length to a time is refused", true)
+    }
+    match units.value_in(metres, "kg") {
+        Ok(_v) -> say(f, "reading a length as a mass is refused", false)
+        Err(_e) -> say(f, "reading a length as a mass is refused", true)
+    }
+    match units.quantity(1.0, "furlong") {
+        Ok(_v) -> say(f, "an unknown unit is refused, not assumed", false)
+        Err(_e) -> say(f, "an unknown unit is refused, not assumed", true)
+    }
+    say(f, "a ratio of like quantities is a plain number",
+        near(units.ratio(metres, feet) ?? 0.0, 3.280839895013123, 0.000000001))
+    say(f, "scaling by a number is always allowed",
+        near(units.value_in(units.scale(metres, 2.5), "m") ?? 0.0, 250.0, 0.000001))
+    say(f, "known() answers before the conversion is attempted",
+        units.known("nmi") and not units.known("smoot"))
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_bigint(f)
+    check_fixedpoint(f)
+    check_complex(f)
+    check_interpolate(f)
+    check_units(f)
+
+    if f == 0 {
+        print("numeric II: every claim held")
+    } else {
+        print("numeric II: {f} failed")
+    }
+}

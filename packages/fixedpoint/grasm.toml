@@ -1,0 +1,6 @@
+[package]
+name = "fixedpoint"
+version = "1.0.0"
+
+# Exact decimal arithmetic. Opens nothing.
+capabilities = []

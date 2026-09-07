@@ -1,0 +1,189 @@
+// Complex numbers.
+//
+// Needed wherever a rotation, an oscillation or a frequency is involved: a
+// DFT is complex arithmetic and nothing else, a filter's stability is a
+// question about where its poles sit relative to the unit circle, and the
+// roots of a real quadratic leave the reals as soon as the discriminant does.
+//
+// The parts that are easy to get wrong are here on purpose: division by the
+// naive formula overflows long before it has to, and `sqrt` has a branch cut
+// that has to be placed rather than stumbled into.
+
+type Cplx = {
+    re: f64,
+    im: f64,
+}
+
+pub fn make(re: f64, im: f64) -> Cplx {
+    return Cplx{ re: re, im: im }
+}
+
+pub fn real(re: f64) -> Cplx {
+    return Cplx{ re: re, im: 0.0 }
+}
+
+pub fn imaginary(im: f64) -> Cplx {
+    return Cplx{ re: 0.0, im: im }
+}
+
+pub fn zero() -> Cplx {
+    return Cplx{ re: 0.0, im: 0.0 }
+}
+
+pub fn one() -> Cplx {
+    return Cplx{ re: 1.0, im: 0.0 }
+}
+
+pub fn i() -> Cplx {
+    return Cplx{ re: 0.0, im: 1.0 }
+}
+
+pub fn add(a: Cplx, b: Cplx) -> Cplx {
+    return Cplx{ re: a.re + b.re, im: a.im + b.im }
+}
+
+pub fn sub(a: Cplx, b: Cplx) -> Cplx {
+    return Cplx{ re: a.re - b.re, im: a.im - b.im }
+}
+
+pub fn mul(a: Cplx, b: Cplx) -> Cplx {
+    return Cplx{
+        re: a.re * b.re - a.im * b.im,
+        im: a.re * b.im + a.im * b.re,
+    }
+}
+
+pub fn scale(a: Cplx, by: f64) -> Cplx {
+    return Cplx{ re: a.re * by, im: a.im * by }
+}
+
+pub fn conjugate(a: Cplx) -> Cplx {
+    return Cplx{ re: a.re, im: 0.0 - a.im }
+}
+
+pub fn negate(a: Cplx) -> Cplx {
+    return Cplx{ re: 0.0 - a.re, im: 0.0 - a.im }
+}
+
+/// Division by Smith's method.
+///
+/// The textbook formula divides by `c² + d²`, which overflows for perfectly
+/// ordinary inputs — `1e200 / 1e200` should be 1 and instead squares to
+/// infinity. Dividing through by the larger of the two first keeps every
+/// intermediate near unity.
+pub fn div(a: Cplx, b: Cplx) -> Cplx {
+    let cabs = if b.re < 0.0 { 0.0 - b.re } else { b.re }
+    let dabs = if b.im < 0.0 { 0.0 - b.im } else { b.im }
+    if dabs <= cabs {
+        if b.re == 0.0 {
+            return Cplx{ re: a.re / 0.0, im: a.im / 0.0 }
+        }
+        let r = b.im / b.re
+        let den = b.re + b.im * r
+        return Cplx{
+            re: (a.re + a.im * r) / den,
+            im: (a.im - a.re * r) / den,
+        }
+    }
+    let r = b.re / b.im
+    let den = b.re * r + b.im
+    return Cplx{
+        re: (a.re * r + a.im) / den,
+        im: (a.im * r - a.re) / den,
+    }
+}
+
+/// Magnitude, computed with `hypot` so it does not overflow on the way.
+pub fn magnitude(a: Cplx) -> f64 {
+    return a.re.hypot(a.im)
+}
+
+pub fn magnitude_squared(a: Cplx) -> f64 {
+    return a.re * a.re + a.im * a.im
+}
+
+/// The angle from the positive real axis, in radians, from -pi to pi.
+pub fn argument(a: Cplx) -> f64 {
+    return a.im.atan2(a.re)
+}
+
+pub fn from_polar(radius: f64, angle: f64) -> Cplx {
+    return Cplx{ re: radius * angle.cos(), im: radius * angle.sin() }
+}
+
+pub fn exp(a: Cplx) -> Cplx {
+    let r = a.re.exp()
+    return Cplx{ re: r * a.im.cos(), im: r * a.im.sin() }
+}
+
+pub fn ln(a: Cplx) -> Cplx {
+    return Cplx{ re: magnitude(a).ln(), im: argument(a) }
+}
+
+/// The principal square root: the one with a non-negative real part.
+///
+/// The branch cut runs along the negative real axis, and which side `-1`
+/// lands on is a choice. This takes the upper one, so `sqrt(-1)` is `i` and
+/// not `-i`.
+pub fn sqrt(a: Cplx) -> Cplx {
+    if a.re == 0.0 and a.im == 0.0 {
+        return zero()
+    }
+    let r = magnitude(a)
+    let re = ((r + a.re) / 2.0).sqrt()
+    var im = ((r - a.re) / 2.0).sqrt()
+    if a.im < 0.0 {
+        im = 0.0 - im
+    }
+    return Cplx{ re: re, im: im }
+}
+
+/// An integer power by squaring, which keeps the error from compounding the
+/// way repeated multiplication does.
+pub fn powi(a: Cplx, n: i64) -> Cplx {
+    if n == 0 {
+        return one()
+    }
+    if n < 0 {
+        return div(one(), powi(a, 0 - n))
+    }
+    var result = one()
+    var squared = a
+    var left = n
+    while left > 0 {
+        if left % 2 == 1 {
+            result = mul(result, squared)
+        }
+        squared = mul(squared, squared)
+        left = left / 2
+    }
+    return result
+}
+
+/// The `n` complex numbers whose `n`th power is one, in angle order.
+///
+/// A DFT is a sum over exactly these, which is why they are here rather than
+/// left for the caller to derive.
+pub fn roots_of_unity(n: i64) -> [Cplx] {
+    var out: [Cplx] = []
+    if n <= 0 {
+        return out
+    }
+    let step = 2.0 * pi() / n.as_f64()
+    for k in 0..n {
+        out.push(from_polar(1.0, step * k.as_f64()))
+    }
+    return out
+}
+
+pub fn nearly_equal(a: Cplx, b: Cplx, tolerance: f64) -> bool {
+    return magnitude(sub(a, b)) <= tolerance
+}
+
+pub fn to_str(a: Cplx) -> str {
+    if a.im < 0.0 {
+        let positive = 0.0 - a.im
+        return "{a.re}-{positive}i"
+    }
+    return "{a.re}+{a.im}i"
+}

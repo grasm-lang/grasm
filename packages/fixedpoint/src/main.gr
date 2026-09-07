@@ -1,0 +1,252 @@
+// Decimal arithmetic that does not drift.
+//
+// `0.1 + 0.2` is not `0.3` in binary floating point and never will be, because
+// neither operand is representable. That is tolerable in a physics step and
+// intolerable in an invoice, where the sum of the lines has to equal the total
+// exactly and a customer will read both numbers.
+//
+// A fixed-point value is an integer of the smallest unit plus the number of
+// decimal places it is scaled by: `12.34` at scale 2 is the integer 1234. Every
+// operation is integer arithmetic, so addition and subtraction are exact, and
+// multiplication and division round once, visibly, at a place the caller chose.
+
+type FixedDec = {
+    raw: i64,
+    /// Decimal places. `raw = value * 10^scale`.
+    scale: i64,
+}
+
+type FixedError =
+    | NotADecimal(text: str)
+    | ScaleTooLarge(scale: i64)
+    | DividedByZero
+
+fn ten_pow(n: i64) -> i64 {
+    var out = 1
+    for _i in 0..n {
+        out = out * 10
+    }
+    return out
+}
+
+pub fn max_scale() -> i64 {
+    // 10^18 is the largest power of ten inside an `i64`, so a scale past 18
+    // has no representable unit at all.
+    return 18
+}
+
+pub fn from_raw(raw: i64, scale: i64) -> FixedDec {
+    return FixedDec{ raw: raw, scale: scale }
+}
+
+pub fn from_i64(v: i64, scale: i64) -> FixedDec {
+    return FixedDec{ raw: v * ten_pow(scale), scale: scale }
+}
+
+pub fn parse(text: str, scale: i64) -> FixedDec ! FixedError {
+    if scale < 0 or scale > max_scale() {
+        fail(ScaleTooLarge(scale))
+    }
+    var body = text
+    var negative = false
+    if body.starts_with("-") {
+        negative = true
+        body = body.substr(1, body.len() - 1)
+    } else if body.starts_with("+") {
+        body = body.substr(1, body.len() - 1)
+    }
+    if body.len() == 0 {
+        fail(NotADecimal(text))
+    }
+    var whole = body
+    var part = ""
+    match body.index_of(".") {
+        Some(at) -> {
+            whole = body.substr(0, at)
+            part = body.substr(at + 1, body.len() - at - 1)
+        }
+        None -> {}
+    }
+    if whole.len() == 0 {
+        whole = "0"
+    }
+    for c in whole.chars() {
+        if c < "0" or c > "9" {
+            fail(NotADecimal(text))
+        }
+    }
+    for c in part.chars() {
+        if c < "0" or c > "9" {
+            fail(NotADecimal(text))
+        }
+    }
+    // One extra digit is kept so the discarded remainder can be rounded on
+    // rather than truncated — "0.005" at scale 2 is 0.01, not 0.00.
+    var digits = part
+    while digits.len() < scale + 1 {
+        digits = digits + "0"
+    }
+    let kept = digits.substr(0, scale)
+    let next = digits.substr(scale, 1)
+    var raw = (whole.parse_int() ?? 0) * ten_pow(scale)
+    if scale > 0 {
+        raw = raw + (kept.parse_int() ?? 0)
+    }
+    if next >= "5" {
+        raw = raw + 1
+    }
+    if negative {
+        raw = 0 - raw
+    }
+    return FixedDec{ raw: raw, scale: scale }
+}
+
+pub fn to_str(v: FixedDec) -> str {
+    let unit = ten_pow(v.scale)
+    let negative = v.raw < 0
+    let magnitude = if negative { 0 - v.raw } else { v.raw }
+    let whole = magnitude / unit
+    var out = if negative { "-{whole}" } else { "{whole}" }
+    if v.scale == 0 {
+        return out
+    }
+    var part = "{magnitude % unit}"
+    while part.len() < v.scale {
+        part = "0{part}"
+    }
+    return out + "." + part
+}
+
+/// Move a value to a different number of places, rounding half away from zero.
+pub fn rescale(v: FixedDec, scale: i64) -> FixedDec {
+    if scale == v.scale {
+        return v
+    }
+    if scale > v.scale {
+        return FixedDec{ raw: v.raw * ten_pow(scale - v.scale), scale: scale }
+    }
+    let drop = ten_pow(v.scale - scale)
+    let negative = v.raw < 0
+    let magnitude = if negative { 0 - v.raw } else { v.raw }
+    var out = magnitude / drop
+    if magnitude % drop * 2 >= drop {
+        out = out + 1
+    }
+    if negative {
+        out = 0 - out
+    }
+    return FixedDec{ raw: out, scale: scale }
+}
+
+fn align(a: FixedDec, b: FixedDec) -> i64 {
+    if a.scale > b.scale {
+        return a.scale
+    }
+    return b.scale
+}
+
+/// Exact: no rounding happens, which is the whole point.
+pub fn add(a: FixedDec, b: FixedDec) -> FixedDec {
+    let s = align(a, b)
+    return FixedDec{ raw: rescale(a, s).raw + rescale(b, s).raw, scale: s }
+}
+
+pub fn sub(a: FixedDec, b: FixedDec) -> FixedDec {
+    let s = align(a, b)
+    return FixedDec{ raw: rescale(a, s).raw - rescale(b, s).raw, scale: s }
+}
+
+pub fn negate(v: FixedDec) -> FixedDec {
+    return FixedDec{ raw: 0 - v.raw, scale: v.scale }
+}
+
+pub fn abs(v: FixedDec) -> FixedDec {
+    if v.raw < 0 {
+        return negate(v)
+    }
+    return v
+}
+
+/// The product, rounded once to `scale` places.
+pub fn mul(a: FixedDec, b: FixedDec, scale: i64) -> FixedDec {
+    let wide = FixedDec{ raw: a.raw * b.raw, scale: a.scale + b.scale }
+    return rescale(wide, scale)
+}
+
+pub fn div(a: FixedDec, b: FixedDec, scale: i64) -> FixedDec ! FixedError {
+    if b.raw == 0 {
+        fail(DividedByZero)
+    }
+    // Two extra places are carried so the single rounding at the end sees the
+    // digit it needs.
+    let lift = scale + 2 - a.scale + b.scale
+    var numerator = a.raw
+    if lift > 0 {
+        numerator = numerator * ten_pow(lift)
+    }
+    let negative = (numerator < 0) != (b.raw < 0)
+    let top = if numerator < 0 { 0 - numerator } else { numerator }
+    let bottom = if b.raw < 0 { 0 - b.raw } else { b.raw }
+    var raw = top / bottom
+    if negative {
+        raw = 0 - raw
+    }
+    return rescale(FixedDec{ raw: raw, scale: scale + 2 }, scale)
+}
+
+pub fn compare(a: FixedDec, b: FixedDec) -> i64 {
+    let s = align(a, b)
+    let x = rescale(a, s).raw
+    let y = rescale(b, s).raw
+    if x < y {
+        return 0 - 1
+    }
+    if x > y {
+        return 1
+    }
+    return 0
+}
+
+pub fn equals(a: FixedDec, b: FixedDec) -> bool {
+    return compare(a, b) == 0
+}
+
+pub fn is_zero(v: FixedDec) -> bool {
+    return v.raw == 0
+}
+
+pub fn raw_of(v: FixedDec) -> i64 {
+    return v.raw
+}
+
+pub fn scale_of(v: FixedDec) -> i64 {
+    return v.scale
+}
+
+pub fn as_f64(v: FixedDec) -> f64 {
+    return v.raw.as_f64() / ten_pow(v.scale).as_f64()
+}
+
+/// Split an amount into `parts` shares that add back to it exactly.
+///
+/// Dividing 100.00 three ways gives 33.34, 33.33, 33.33 — the remainder is
+/// handed out a unit at a time rather than lost. An invoice that does not do
+/// this is an invoice whose lines do not sum to its total.
+pub fn allocate(v: FixedDec, parts: i64) -> [FixedDec] {
+    var out: [FixedDec] = []
+    if parts <= 0 {
+        return out
+    }
+    let each = v.raw / parts
+    var left = v.raw - each * parts
+    let step = if v.raw < 0 { 0 - 1 } else { 1 }
+    for _i in 0..parts {
+        var share = each
+        if left != 0 {
+            share = share + step
+            left = left - step
+        }
+        out.push(FixedDec{ raw: share, scale: v.scale })
+    }
+    return out
+}

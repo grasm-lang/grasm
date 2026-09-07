@@ -1,0 +1,24 @@
+[package]
+name = "numeric2_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.bigint]
+path = "../bigint"
+version = "^1.0.0"
+
+[dependencies.fixedpoint]
+path = "../fixedpoint"
+version = "^1.0.0"
+
+[dependencies.complexnum]
+path = "../complexnum"
+version = "^1.0.0"
+
+[dependencies.interpolate]
+path = "../interpolate"
+version = "^1.0.0"
+
+[dependencies.units]
+path = "../units"
+version = "^1.0.0"

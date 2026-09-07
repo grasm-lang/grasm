@@ -1,0 +1,313 @@
+// Quantities that know what they measure.
+//
+// The Mars Climate Orbiter was lost because one program produced
+// pound-seconds and another consumed newton-seconds. Both numbers were
+// correct. Neither carried what it was, so nothing could notice.
+//
+// A quantity here is an amount plus a dimension, and adding across dimensions
+// is a failure rather than a number. Conversion factors are exact where the
+// definition is exact — an inch is 25.4 mm by definition, not by measurement,
+// and a pound is 0.45359237 kg the same way.
+
+type UnitQty = {
+    /// In the base unit of the dimension: metre, kilogram, second, kelvin,
+    /// byte, or the unit itself for a scalar.
+    amount: f64,
+    dimension: i64,
+}
+
+type UnitError =
+    | UnknownUnit(name: str)
+    | MixedDimensions(left: str, right: str)
+
+pub let LENGTH = 1
+pub let MASS = 2
+pub let TIME = 3
+pub let TEMPERATURE = 4
+pub let DATA = 5
+
+pub fn dimension_name(d: i64) -> str {
+    if d == LENGTH {
+        return "length"
+    }
+    if d == MASS {
+        return "mass"
+    }
+    if d == TIME {
+        return "time"
+    }
+    if d == TEMPERATURE {
+        return "temperature"
+    }
+    if d == DATA {
+        return "data"
+    }
+    return "unknown"
+}
+
+/// A unit's dimension and its size in that dimension's base unit.
+///
+/// Temperature is absent here because it is the one dimension whose units do
+/// not share an origin: 20 °C is not twice 10 °C, so a single factor cannot
+/// express it. It has its own pair of functions below.
+/// A unit's dimension and its size in that dimension's base unit.
+///
+/// Temperature is absent here because it is the one dimension whose units do
+/// not share an origin: 20 °C is not twice 10 °C, so a single factor cannot
+/// express it. It has its own pair of functions below.
+///
+/// One function per dimension, because a single lookup covering all of them
+/// is one function nobody can read.
+fn factor_of(unit: str) -> Option[(i64, f64)] {
+    match length_factor(unit) {
+        Some(f) -> return Some(f)
+        None -> {}
+    }
+    match mass_factor(unit) {
+        Some(f) -> return Some(f)
+        None -> {}
+    }
+    match time_factor(unit) {
+        Some(f) -> return Some(f)
+        None -> {}
+    }
+    return data_factor(unit)
+}
+
+
+fn length_factor(unit: str) -> Option[(i64, f64)] {
+    if unit == "m" or unit == "metre" or unit == "meter" {
+        return Some((LENGTH, 1.0))
+    }
+    if unit == "km" {
+        return Some((LENGTH, 1000.0))
+    }
+    if unit == "cm" {
+        return Some((LENGTH, 0.01))
+    }
+    if unit == "mm" {
+        return Some((LENGTH, 0.001))
+    }
+    if unit == "in" or unit == "inch" {
+        // Exact by the 1959 international agreement.
+        return Some((LENGTH, 0.0254))
+    }
+    if unit == "ft" or unit == "foot" {
+        return Some((LENGTH, 0.3048))
+    }
+    if unit == "yd" or unit == "yard" {
+        return Some((LENGTH, 0.9144))
+    }
+    if unit == "mi" or unit == "mile" {
+        return Some((LENGTH, 1609.344))
+    }
+    if unit == "nmi" {
+        return Some((LENGTH, 1852.0))
+    }
+    return None
+}
+
+fn mass_factor(unit: str) -> Option[(i64, f64)] {
+    if unit == "kg" {
+        return Some((MASS, 1.0))
+    }
+    if unit == "g" {
+        return Some((MASS, 0.001))
+    }
+    if unit == "mg" {
+        return Some((MASS, 0.000001))
+    }
+    if unit == "t" or unit == "tonne" {
+        return Some((MASS, 1000.0))
+    }
+    if unit == "lb" or unit == "pound" {
+        // Exact, same agreement.
+        return Some((MASS, 0.45359237))
+    }
+    if unit == "oz" or unit == "ounce" {
+        return Some((MASS, 0.028349523125))
+    }
+    if unit == "st" or unit == "stone" {
+        return Some((MASS, 6.35029318))
+    }
+    return None
+}
+
+fn time_factor(unit: str) -> Option[(i64, f64)] {
+    if unit == "s" or unit == "sec" or unit == "second" {
+        return Some((TIME, 1.0))
+    }
+    if unit == "ms" {
+        return Some((TIME, 0.001))
+    }
+    if unit == "us" {
+        return Some((TIME, 0.000001))
+    }
+    if unit == "ns" {
+        return Some((TIME, 0.000000001))
+    }
+    if unit == "min" or unit == "minute" {
+        return Some((TIME, 60.0))
+    }
+    if unit == "h" or unit == "hr" or unit == "hour" {
+        return Some((TIME, 3600.0))
+    }
+    if unit == "d" or unit == "day" {
+        return Some((TIME, 86400.0))
+    }
+    if unit == "wk" or unit == "week" {
+        return Some((TIME, 604800.0))
+    }
+    return None
+}
+
+fn data_factor(unit: str) -> Option[(i64, f64)] {
+    if unit == "B" or unit == "byte" {
+        return Some((DATA, 1.0))
+    }
+    if unit == "KiB" {
+        return Some((DATA, 1024.0))
+    }
+    if unit == "MiB" {
+        return Some((DATA, 1048576.0))
+    }
+    if unit == "GiB" {
+        return Some((DATA, 1073741824.0))
+    }
+    if unit == "TiB" {
+        return Some((DATA, 1099511627776.0))
+    }
+    // The decimal prefixes, which are what a disk vendor means and a file
+    // manager often does not. Both are here because the difference is the
+    // reason a "1 TB" disk shows as 931 GiB.
+    if unit == "kB" {
+        return Some((DATA, 1000.0))
+    }
+    if unit == "MB" {
+        return Some((DATA, 1000000.0))
+    }
+    if unit == "GB" {
+        return Some((DATA, 1000000000.0))
+    }
+    if unit == "TB" {
+        return Some((DATA, 1000000000000.0))
+    }
+    return None
+}
+
+pub fn known(unit: str) -> bool {
+    return factor_of(unit) != None
+}
+
+/// A quantity built straight from a base-unit amount, with no name to look
+/// up — the constructor for code that already knows the dimension.
+pub fn base(amount: f64, dimension: i64) -> UnitQty {
+    return UnitQty{ amount: amount, dimension: dimension }
+}
+
+pub fn quantity(amount: f64, unit: str) -> UnitQty ! UnitError {
+    match factor_of(unit) {
+        None -> fail(UnknownUnit(unit))
+        Some(f) -> return UnitQty{ amount: amount * f.1, dimension: f.0 }
+    }
+}
+
+/// The amount expressed in `unit`.
+pub fn value_in(q: UnitQty, unit: str) -> f64 ! UnitError {
+    match factor_of(unit) {
+        None -> fail(UnknownUnit(unit))
+        Some(f) -> {
+            if f.0 != q.dimension {
+                fail(MixedDimensions(dimension_name(q.dimension), unit))
+            }
+            return q.amount / f.1
+        }
+    }
+}
+
+pub fn convert(amount: f64, from_unit: str, to_unit: str) -> f64 ! UnitError {
+    let q = try quantity(amount, from_unit)
+    return try value_in(q, to_unit)
+}
+
+/// Addition across dimensions is refused, which is the point of the package.
+pub fn add(a: UnitQty, b: UnitQty) -> UnitQty ! UnitError {
+    if a.dimension != b.dimension {
+        fail(MixedDimensions(dimension_name(a.dimension), dimension_name(b.dimension)))
+    }
+    return UnitQty{ amount: a.amount + b.amount, dimension: a.dimension }
+}
+
+pub fn sub(a: UnitQty, b: UnitQty) -> UnitQty ! UnitError {
+    if a.dimension != b.dimension {
+        fail(MixedDimensions(dimension_name(a.dimension), dimension_name(b.dimension)))
+    }
+    return UnitQty{ amount: a.amount - b.amount, dimension: a.dimension }
+}
+
+/// Scaling by a plain number is always allowed: it does not change what the
+/// quantity measures.
+pub fn scale(q: UnitQty, by: f64) -> UnitQty {
+    return UnitQty{ amount: q.amount * by, dimension: q.dimension }
+}
+
+/// A ratio of like quantities, which is a plain number.
+pub fn ratio(a: UnitQty, b: UnitQty) -> f64 ! UnitError {
+    if a.dimension != b.dimension {
+        fail(MixedDimensions(dimension_name(a.dimension), dimension_name(b.dimension)))
+    }
+    return a.amount / b.amount
+}
+
+pub fn compare(a: UnitQty, b: UnitQty) -> i64 ! UnitError {
+    if a.dimension != b.dimension {
+        fail(MixedDimensions(dimension_name(a.dimension), dimension_name(b.dimension)))
+    }
+    if a.amount < b.amount {
+        return 0 - 1
+    }
+    if a.amount > b.amount {
+        return 1
+    }
+    return 0
+}
+
+pub fn dimension_of(q: UnitQty) -> i64 {
+    return q.dimension
+}
+
+pub fn base_amount(q: UnitQty) -> f64 {
+    return q.amount
+}
+
+/// Temperature, which has an offset as well as a scale and so cannot be a
+/// factor. Absolute zero is the same physical state in every scale, and the
+/// numbers written for it are not.
+pub fn temperature(value: f64, unit: str) -> UnitQty ! UnitError {
+    if unit == "K" {
+        return UnitQty{ amount: value, dimension: TEMPERATURE }
+    }
+    if unit == "C" {
+        return UnitQty{ amount: value + 273.15, dimension: TEMPERATURE }
+    }
+    if unit == "F" {
+        return UnitQty{ amount: (value - 32.0) * 5.0 / 9.0 + 273.15, dimension: TEMPERATURE }
+    }
+    fail(UnknownUnit(unit))
+}
+
+pub fn temperature_in(q: UnitQty, unit: str) -> f64 ! UnitError {
+    if q.dimension != TEMPERATURE {
+        fail(MixedDimensions(dimension_name(q.dimension), "temperature"))
+    }
+    if unit == "K" {
+        return q.amount
+    }
+    if unit == "C" {
+        return q.amount - 273.15
+    }
+    if unit == "F" {
+        return (q.amount - 273.15) * 9.0 / 5.0 + 32.0
+    }
+    fail(UnknownUnit(unit))
+}

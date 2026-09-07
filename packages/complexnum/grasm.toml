@@ -1,0 +1,6 @@
+[package]
+name = "complexnum"
+version = "1.0.0"
+
+# Complex arithmetic. Opens nothing.
+capabilities = []

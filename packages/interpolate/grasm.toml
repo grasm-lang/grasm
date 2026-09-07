@@ -1,0 +1,6 @@
+[package]
+name = "interpolate"
+version = "1.0.0"
+
+# Curves through known points. Opens nothing.
+capabilities = []

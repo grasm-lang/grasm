@@ -1,0 +1,6 @@
+[package]
+name = "bigint"
+version = "1.0.0"
+
+# Arbitrary-precision integers. Opens nothing.
+capabilities = []

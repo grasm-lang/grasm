@@ -29,9 +29,9 @@ honest and a stub is a promise nobody kept.
 | | |
 |---|---|
 | Started at | 78 |
-| Now | 153 |
+| Now | 158 |
 | Target | 200 |
-| Remaining | 47 |
+| Remaining | 42 |
 
 ## Batches
 
@@ -45,6 +45,8 @@ asserts against it.
 - [x] **Structures II** — `trie` `graphs` `lru`
 - [x] **Structures III** — `roaring` `skiplist` `cuckoo` `btree` `tdigest`
   `ringlog`
+- [x] **Numeric II** — `bigint` `fixedpoint` `complexnum` `interpolate`
+  `units`
 
 ### Planned
 
