@@ -86,6 +86,54 @@ Option 2 covers more of the list than it first appears. Option 1 is a decision
 for the project owner, not one to be made silently inside a package. **This is
 an open question, not a task.**
 
+
+## P4 — the region sweep, assessed
+
+A proposal arrived to fix Grasm's performance by turning on
+`REGION_SWEEP` in `crates/grasm_native/src/lib.rs:37`, replacing per-local
+reference counting with a bump allocator. It is worth answering carefully,
+because the diagnosis is partly right and the fix would not work.
+
+**What the proposal gets right.** The flag is real and off. Allocation cost is
+the biggest single factor in the worst benchmark: `tree` runs at 5.1x Rust and
+carries the 0.45x geometric mean almost by itself — the other six sit at
+1.6-2.3x. The runtime half of the sweep is written and tested: `ARENA`,
+`grasm_region_push` and `grasm_region_pop` all exist.
+
+**Why turning it on changes nothing today.** `region` is opt-in syntax, and
+**no program in this repository uses it** — zero blocks across 584 `.gr` files,
+including every benchmark. Enabling the sweep would alter the performance of
+nothing currently written.
+
+**Why the benchmark that matters cannot use it.** `[T-REGION]` says a region
+may not write to an outside binding, may not `return` through the brace, and
+yields a scalar or nothing. `tree.gr` is `fn build(...) -> Node` — it exists to
+*return* an allocated tree. The 5.1x program is structurally ineligible for the
+mechanism proposed to fix it.
+
+**Why it is off is recorded, and it is not neglect.** The comment at the flag
+says: a `ref` written through a call, and an effect handler written outside the
+block, both carry a region-allocated value past the brace. With the sweep on,
+those are **use-after-free**. Turning it on today trades a 2.5x slowdown for
+memory corruption.
+
+**What would actually help, in order.**
+
+1. Close the two escape routes in the checker. That is the real work, and it is
+   what the flag is waiting on.
+2. Then enable the sweep — which makes `region` worth writing, and makes the
+   tier's promise true.
+3. Separately, and larger: the general win needs escape analysis that does not
+   require opt-in syntax, so an allocation that provably does not escape its
+   function is stack-allocated without anyone writing `region`. That is the
+   change that would move `tree`, and it is a different project from the flag.
+
+One more piece of evidence against "allocation costs drop to near-zero": the
+runtime records that a `Cell<usize>` depth counter, added so an allocation
+could ask "am I in a region" with a load instead of a `RefCell` borrow,
+measured **zero** on a benchmark allocating 800,000 times. The bookkeeping
+around allocation is not where the time goes.
+
 ## Tier 1 — to 200 (64 remaining)
 
 All buildable now. No prerequisite blocks any of it.
