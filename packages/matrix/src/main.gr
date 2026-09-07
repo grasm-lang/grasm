@@ -129,10 +129,11 @@ pub fn determinant(m: Mat) -> f64 ! MatError {
         }
         let p = work.cell[col * n + col]
         det = det * p
-        for r in (col + 1)..n {
-            let factor = work.cell[r * n + col] / p
+        for row in (col + 1)..n {
+            let factor = work.cell[row * n + col] / p
             for j in col..n {
-                work.cell[r * n + j] = work.cell[r * n + j] - factor * work.cell[col * n + j]
+                work.cell[row * n + j] = work.cell[row * n + j] -
+                factor * work.cell[col * n + j]
             }
         }
     }
