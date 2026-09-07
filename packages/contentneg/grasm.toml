@@ -1,0 +1,6 @@
+[package]
+name = "contentneg"
+version = "1.0.0"
+
+# Parsing headers. Opens nothing.
+capabilities = []

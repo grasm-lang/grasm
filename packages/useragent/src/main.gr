@@ -1,0 +1,112 @@
+// User-Agent strings, and an honest statement of what they are worth.
+//
+// Every browser lies in this header for compatibility. Chrome claims to be
+// Mozilla, Safari and KHTML; Edge claims to be Chrome. The order of the lies
+// is the only thing that distinguishes them, so the checks below run
+// most-specific first — testing for "Chrome" before "Edg" reports every Edge
+// user as Chrome, which is the single commonest bug in this kind of code.
+//
+// This is for logs and statistics. **Do not gate behaviour on it**: the header
+// is user-supplied, trivially forged, and browsers are actively freezing it.
+
+type Agent = {
+    browser: str,
+    version: str,
+    platform: str,
+    is_bot: bool,
+    is_mobile: bool,
+}
+
+fn after(text: str, marker: str) -> str {
+    match text.index_of(marker) {
+        None -> return ""
+        Some(at) -> {
+            let rest = text.substr(at + marker.len(), text.len() - at - marker.len())
+            var out = ""
+            for c in rest.chars() {
+                if (c >= "0" and c <= "9") or c == "." {
+                    out = out + c
+                } else {
+                    return out
+                }
+            }
+            return out
+        }
+    }
+}
+
+pub fn parse(ua: str) -> Agent {
+    let bot = looks_like_bot(ua)
+    var browser = "unknown"
+    var version = ""
+    // Order matters, and this is the order.
+    if ua.contains("Edg/") {
+        browser = "Edge"
+        version = after(ua, "Edg/")
+    } else {
+        if ua.contains("OPR/") {
+            browser = "Opera"
+            version = after(ua, "OPR/")
+        } else {
+            if ua.contains("Chrome/") {
+                browser = "Chrome"
+                version = after(ua, "Chrome/")
+            } else {
+                if ua.contains("Firefox/") {
+                    browser = "Firefox"
+                    version = after(ua, "Firefox/")
+                } else {
+                    if ua.contains("Safari/") and ua.contains("Version/") {
+                        browser = "Safari"
+                        version = after(ua, "Version/")
+                    }
+                }
+            }
+        }
+    }
+    return Agent{
+        browser: browser,
+        version: version,
+        platform: platform_of(ua),
+        is_bot: bot,
+        is_mobile: ua.contains("Mobile") or ua.contains("Android") or ua.contains("iPhone"),
+    }
+}
+
+fn platform_of(ua: str) -> str {
+    if ua.contains("Windows NT") {
+        return "Windows"
+    }
+    if ua.contains("iPhone") or ua.contains("iPad") {
+        return "iOS"
+    }
+    if ua.contains("Android") {
+        return "Android"
+    }
+    if ua.contains("Mac OS X") {
+        return "macOS"
+    }
+    if ua.contains("Linux") {
+        return "Linux"
+    }
+    return "unknown"
+}
+
+fn looks_like_bot(ua: str) -> bool {
+    let markers = ["bot", "Bot", "spider", "Spider", "crawl", "Crawl",
+        "curl/", "Wget/", "python-requests", "HeadlessChrome"]
+    for m in markers {
+        if ua.contains(m) {
+            return true
+        }
+    }
+    return false
+}
+
+/// The major version as a number, for a version comparison in a log query.
+pub fn major(a: Agent) -> i64 {
+    match a.version.index_of(".") {
+        None -> return a.version.parse_int() ?? 0
+        Some(at) -> return a.version.substr(0, at).parse_int() ?? 0
+    }
+}

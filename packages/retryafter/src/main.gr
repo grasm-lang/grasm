@@ -1,0 +1,90 @@
+// `Retry-After`, and the backoff a client should actually use.
+//
+// The header comes in two shapes — a number of seconds, or an HTTP date — and
+// a client that handles only the first treats `Retry-After: Wed, 21 Oct 2015
+// 07:28:00 GMT` as unparseable and retries immediately, which is the opposite
+// of what the server asked for.
+//
+// The backoff here is exponential with **full jitter**. Without jitter, a
+// thousand clients rate-limited at the same instant all return at the same
+// instant, and the second wave is as bad as the first.
+
+type Wait =
+    | Seconds(n: i64)
+    | AtDate(text: str)
+    | Absent
+
+    /// What the header says, without guessing at a date's value.
+pub fn parse(header: str) -> Wait {
+    let text = header.trim()
+    if text == "" {
+        return Absent
+    }
+    var all_digits = true
+    for c in text.chars() {
+        if c < "0" or c > "9" {
+            all_digits = false
+        }
+    }
+    if all_digits {
+        return Seconds(text.parse_int() ?? 0)
+    }
+    return AtDate(text)
+}
+
+/// Seconds to wait, given the header and what the client thinks the time is.
+///
+/// A date in the past yields 0 rather than a negative wait — a clock that
+/// disagrees with the server should not turn into a retry storm.
+pub fn seconds_until(header: str, now_epoch: i64, parsed_date_epoch: Option[i64]) -> i64 {
+    match parse(header) {
+        Absent -> return 0 - 1
+        Seconds(n) -> return n
+        AtDate(_t) -> {
+            match parsed_date_epoch {
+                None -> return 0 - 1
+                Some(when) -> {
+                    let delta = when - now_epoch
+                    if delta < 0 {
+                        return 0
+                    }
+                    return delta
+                }
+            }
+        }
+    }
+}
+
+/// Exponential backoff with full jitter, capped.
+///
+/// `random_thousandths` is 0..999 and comes from the caller, so this package
+/// stays free of any capability and the caller decides where randomness comes
+/// from — which also makes a test deterministic.
+pub fn backoff_ms(attempt: i64, base_ms: i64, cap_ms: i64, random_thousandths: i64) -> i64 {
+    var ceiling = base_ms
+    var i = 0
+    while i < attempt and ceiling < cap_ms {
+        ceiling = ceiling * 2
+        i = i + 1
+    }
+    if ceiling > cap_ms {
+        ceiling = cap_ms
+    }
+    // Full jitter: anywhere in [0, ceiling], not ceiling +/- a wobble.
+    var r = random_thousandths
+    if r < 0 {
+        r = 0
+    }
+    if r > 999 {
+        r = 999
+    }
+    return ceiling * r / 1000
+}
+
+/// Whether the status is one a client should retry at all.
+///
+/// 429 and 503 mean "later"; 500 and 502 and 504 are worth one retry; a 400 is
+/// the client's fault and retrying it is a loop.
+pub fn should_retry(status: i64) -> bool {
+    return status == 429 or status == 408 or (status >= 500 and status != 501)
+}

@@ -1,0 +1,100 @@
+// StatsD line protocol.
+//
+// The format is one line per metric, `name:value|type`, optionally with a
+// sample rate and tags. It exists because it is cheap enough to fire and
+// forget over UDP — this package builds the lines and leaves the sending to
+// the caller, which is why it declares no capability at all.
+//
+// The rule people get wrong is sampling. A counter sent at `@0.1` must be
+// *multiplied* by ten at the other end, so a client that samples without
+// declaring the rate silently reports a tenth of the traffic.
+
+type Metric = {
+    name: str,
+    value: str,
+    kind: str,
+    /// Thousandths; 1000 is "every time".
+    rate: i64,
+    tags: [str],
+}
+
+fn clean(name: str) -> str {
+    // A colon, a pipe or a newline in a name would split the line and make it
+    // a different metric — or several.
+    var out = ""
+    for c in name.chars() {
+        if c == ":" or c == "|" or c == "\n" or c == "@" or c == "," {
+            out = out + "_"
+        } else {
+            out = out + c
+        }
+    }
+    return out
+}
+
+pub fn counter(name: str, by: i64) -> Metric {
+    return Metric{ name: clean(name), value: "{by}", kind: "c", rate: 1000, tags: [] }
+}
+
+pub fn gauge(name: str, value: i64) -> Metric {
+    return Metric{ name: clean(name), value: "{value}", kind: "g", rate: 1000, tags: [] }
+}
+
+/// A gauge *delta*, which needs the sign to be explicit: `-3` decrements and
+/// `3` sets. A positive delta must be written `+3` or it is read as a new
+/// absolute value.
+pub fn gauge_delta(name: str, delta: i64) -> Metric {
+    let text = if delta >= 0 { "+{delta}" } else { "{delta}" }
+    return Metric{ name: clean(name), value: text, kind: "g", rate: 1000, tags: [] }
+}
+
+pub fn timing(name: str, ms: i64) -> Metric {
+    return Metric{ name: clean(name), value: "{ms}", kind: "ms", rate: 1000, tags: [] }
+}
+
+pub fn set_member(name: str, member: str) -> Metric {
+    return Metric{ name: clean(name), value: clean(member), kind: "s", rate: 1000, tags: [] }
+}
+
+pub fn sampled(m: Metric, rate_thousandths: i64) -> Metric {
+    var out = m
+    out.rate = rate_thousandths
+    return out
+}
+
+pub fn tagged(m: Metric, key: str, value: str) -> Metric {
+    var out = m
+    out.tags.push("{clean(key)}:{clean(value)}")
+    return out
+}
+
+/// The wire line.
+pub fn line(m: Metric) -> str {
+    var out = "{m.name}:{m.value}|{m.kind}"
+    if m.rate != 1000 {
+        // `@0.1`, written from thousandths so no float formatting is involved.
+        let whole = m.rate / 1000
+        let frac = m.rate % 1000
+        var f = "{frac}"
+        while f.len() < 3 {
+            f = "0" + f
+        }
+        while f.len() > 1 and f.ends_with("0") {
+            f = f.substr(0, f.len() - 1)
+        }
+        out = out + "|@{whole}.{f}"
+    }
+    if m.tags.len() > 0 {
+        out = out + "|#" + m.tags.join(",")
+    }
+    return out
+}
+
+/// Several metrics in one datagram, which is what makes this cheap.
+pub fn batch(metrics: [Metric]) -> str {
+    var lines: [str] = []
+    for m in metrics {
+        lines.push(line(m))
+    }
+    return lines.join("\n")
+}

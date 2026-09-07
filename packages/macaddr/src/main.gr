@@ -1,0 +1,125 @@
+// MAC addresses, in all four spellings people write them in.
+//
+// `00:1B:44:11:3A:B7`, `00-1B-44-11-3A-B7`, `001b.4411.3ab7` and `001B44113AB7`
+// are the same address. Software that compares the text rather than the bytes
+// reports the same device as four devices, which is why this parses to a
+// number and renders back.
+//
+// The two flag bits in the first octet matter and are rarely checked: bit 0
+// marks a multicast address and bit 1 marks a locally administered one. A
+// randomised phone MAC always has bit 1 set, which is how you tell it from a
+// burned-in vendor address.
+
+type MacError = | NotAMac(text: str)
+
+/// Six octets, most significant first.
+pub fn parse(text: str) -> [i64] ! MacError {
+    var hex = ""
+    for c in text.chars() {
+        if c != ":" and c != "-" and c != "." and c != " " {
+            hex = hex + c
+        }
+    }
+    if hex.len() != 12 {
+        fail(NotAMac(text))
+    }
+    var out: [i64] = []
+    let cs = hex.to_lower().chars()
+    var i = 0
+    while i < 12 {
+        let hi = digit(cs[i])
+        let lo = digit(cs[i + 1])
+        if hi < 0 or lo < 0 {
+            fail(NotAMac(text))
+        }
+        out.push(hi * 16 + lo)
+        i = i + 2
+    }
+    return out
+}
+
+fn digit(c: str) -> i64 {
+    if c >= "0" and c <= "9" {
+        return c.parse_int() ?? 0 - 1
+    }
+    if c >= "a" and c <= "f" {
+        let table = ["a", "b", "c", "d", "e", "f"]
+        for i in 0..6 {
+            if table[i] == c {
+                return 10 + i
+            }
+        }
+    }
+    return 0 - 1
+}
+
+fn hex2(v: i64) -> str {
+    let d = "0123456789abcdef".chars()
+    return d[(v / 16) % 16] + d[v % 16]
+}
+
+/// Colon-separated, lower case — the Linux spelling.
+pub fn render(octets: [i64]) -> str {
+    var parts: [str] = []
+    for o in octets {
+        parts.push(hex2(o))
+    }
+    return parts.join(":")
+}
+
+/// Hyphen-separated, upper case — the Windows spelling.
+pub fn render_windows(octets: [i64]) -> str {
+    var parts: [str] = []
+    for o in octets {
+        parts.push(hex2(o).to_upper())
+    }
+    return parts.join("-")
+}
+
+/// Three dotted groups of four — the Cisco spelling.
+pub fn render_cisco(octets: [i64]) -> str {
+    var parts: [str] = []
+    var i = 0
+    while i < 6 {
+        parts.push(hex2(octets[i]) + hex2(octets[i + 1]))
+        i = i + 2
+    }
+    return parts.join(".")
+}
+
+pub fn equal(a: [i64], b: [i64]) -> bool {
+    if a.len() != b.len() {
+        return false
+    }
+    for i in 0..a.len() {
+        if a[i] != b[i] {
+            return false
+        }
+    }
+    return true
+}
+
+/// Bit 0 of the first octet: this frame goes to a group, not a device.
+pub fn is_multicast(octets: [i64]) -> bool {
+    return octets[0] % 2 == 1
+}
+
+/// Bit 1 of the first octet: assigned locally, not by a vendor. Set on every
+/// randomised address a phone uses for privacy.
+pub fn is_local(octets: [i64]) -> bool {
+    return (octets[0] / 2) % 2 == 1
+}
+
+pub fn is_broadcast(octets: [i64]) -> bool {
+    for o in octets {
+        if o != 255 {
+            return false
+        }
+    }
+    return true
+}
+
+/// The first three octets, which identify the vendor.
+pub fn oui(octets: [i64]) -> str {
+    return "{hex2(octets[0])}:{hex2(octets[1])}:{hex2(octets[2])}".to_upper()
+}

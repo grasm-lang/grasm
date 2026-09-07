@@ -1,0 +1,6 @@
+[package]
+name = "macaddr"
+version = "1.0.0"
+
+# Parsing addresses. Opens nothing.
+capabilities = []

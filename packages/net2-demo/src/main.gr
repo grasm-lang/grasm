@@ -1,0 +1,129 @@
+// Five network packages. Each section asserts the case implementations miss.
+import macaddr
+import contentneg
+import retryafter
+import useragent
+import statsd
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+
+    print("-- MAC addresses: four spellings, one address")
+    let colon = macaddr.parse("00:1B:44:11:3A:B7") ?? []
+    let dash = macaddr.parse("00-1B-44-11-3A-B7") ?? []
+    let cisco = macaddr.parse("001b.4411.3ab7") ?? []
+    let bare = macaddr.parse("001B44113AB7") ?? []
+    say(f, "colon and dash are the same", macaddr.equal(colon, dash))
+    say(f, "cisco and bare are the same", macaddr.equal(cisco, bare))
+    say(f, "and all four are", macaddr.equal(colon, cisco))
+    say(f, "renders back to the Linux spelling", macaddr.render(colon) == "00:1b:44:11:3a:b7")
+    say(f, "and the Windows one", macaddr.render_windows(colon) == "00-1B-44-11-3A-B7")
+    say(f, "and the Cisco one", macaddr.render_cisco(colon) == "001b.4411.3ab7")
+    say(f, "rubbish is refused", {
+        match macaddr.parse("nope") {
+            Err(_e) -> true
+            Ok(_m) -> false
+        }
+    })
+    say(f, "broadcast is recognised", macaddr.is_broadcast(macaddr.parse("ff:ff:ff:ff:ff:ff") ?? []))
+    // 02: bit 1 set — a randomised phone address, not a vendor one.
+    say(f, "a randomised address is locally administered",
+        macaddr.is_local(macaddr.parse("02:00:00:00:00:01") ?? []))
+    say(f, "a vendor address is not", not macaddr.is_local(colon))
+    say(f, "multicast is the low bit", macaddr.is_multicast(macaddr.parse("01:00:5e:00:00:01") ?? []))
+    say(f, "the OUI is the first three", macaddr.oui(colon) == "00:1B:44")
+
+    print("-- Accept, where q=0 is a refusal")
+    say(f, "picks the highest q",
+        contentneg.best("text/plain;q=0.5, text/html;q=0.9", ["text/plain", "text/html"])
+        == Some("text/html"))
+    say(f, "a missing q defaults to 1",
+        contentneg.best("text/html, text/plain;q=0.9", ["text/plain", "text/html"])
+        == Some("text/html"))
+    say(f, "specificity breaks a tie",
+        contentneg.best("text/*, text/html", ["text/html"]) == Some("text/html"))
+    say(f, "a wildcard still matches",
+        contentneg.best("*/*", ["application/json"]) == Some("application/json"))
+    // The one that matters: q=0 means refused, not merely last.
+    say(f, "q=0 is a refusal, not a low preference",
+        contentneg.best("application/json;q=0", ["application/json"]) == None)
+    say(f, "and is reported as one", contentneg.refused("application/json;q=0", "application/json"))
+    say(f, "an empty header takes the first offer",
+        contentneg.best("", ["text/html", "text/plain"]) == Some("text/html"))
+    say(f, "nothing acceptable is None",
+        contentneg.best("image/png", ["text/html"]) == None)
+
+    print("-- Retry-After, and backoff that does not stampede")
+    say(f, "seconds", retryafter.seconds_until("120", 0, None) == 120)
+    say(f, "an absent header says so", retryafter.seconds_until("", 0, None) == 0 - 1)
+    say(f, "a date needs the caller's clock",
+        retryafter.seconds_until("Wed, 21 Oct 2015 07:28:00 GMT", 1000, Some(1300)) == 300)
+    say(f, "a date in the past is zero, not negative",
+        retryafter.seconds_until("Wed, 21 Oct 2015 07:28:00 GMT", 9999, Some(1300)) == 0)
+    say(f, "429 is retryable", retryafter.should_retry(429))
+    say(f, "503 is retryable", retryafter.should_retry(503))
+    say(f, "400 is not — retrying is a loop", not retryafter.should_retry(400))
+    say(f, "501 is not", not retryafter.should_retry(501))
+    // Full jitter: the wait is anywhere in [0, ceiling], so a thousand clients
+    // do not all come back together.
+    say(f, "jitter at 0 is 0", retryafter.backoff_ms(3, 100, 10000, 0) == 0)
+    say(f, "jitter is bounded by the ceiling",
+        retryafter.backoff_ms(3, 100, 10000, 999) <= 800)
+    say(f, "the ceiling is capped", retryafter.backoff_ms(30, 100, 5000, 999) <= 5000)
+
+    print("-- User-Agent, where order is everything")
+    let edge = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.2210.91"
+    let a = useragent.parse(edge)
+    // Edge claims to be Chrome. Testing Chrome first reports every Edge user
+    // as Chrome, which is the commonest bug in this kind of code.
+    say(f, "Edge is Edge, not Chrome", a.browser == "Edge")
+    say(f, "its version is Edge's", useragent.major(a) == 120)
+    say(f, "its platform", a.platform == "Windows")
+    let chrome = useragent.parse("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " +
+        "(KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
+    say(f, "real Chrome is Chrome", chrome.browser == "Chrome")
+    say(f, "on Linux", chrome.platform == "Linux")
+    let ff = useragent.parse("Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) " +
+        "Gecko/20100101 Firefox/121.0")
+    say(f, "Firefox", ff.browser == "Firefox" and ff.platform == "macOS")
+    let phone = useragent.parse("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) " +
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1")
+    say(f, "mobile Safari", phone.browser == "Safari" and phone.is_mobile)
+    say(f, "curl is a bot", useragent.parse("curl/8.4.0").is_bot)
+    say(f, "a browser is not", not chrome.is_bot)
+
+    print("-- StatsD lines")
+    say(f, "a counter", statsd.line(statsd.counter("page.views", 1)) == "page.views:1|c")
+    say(f, "a gauge", statsd.line(statsd.gauge("queue.depth", 42)) == "queue.depth:42|g")
+    // A positive delta must carry its sign or it reads as an absolute value.
+    say(f, "a positive gauge delta keeps its plus",
+        statsd.line(statsd.gauge_delta("q", 3)) == "q:+3|g")
+    say(f, "a negative one keeps its minus",
+        statsd.line(statsd.gauge_delta("q", 0 - 3)) == "q:-3|g")
+    say(f, "a timing", statsd.line(statsd.timing("req.ms", 250)) == "req.ms:250|ms")
+    say(f, "sampling is declared, or the count is wrong",
+        statsd.line(statsd.sampled(statsd.counter("hits", 1), 100)) == "hits:1|c|@0.1")
+    say(f, "tags", statsd.line(statsd.tagged(statsd.counter("hits", 1), "env", "prod"))
+        == "hits:1|c|#env:prod")
+    say(f, "a colon in a name would split the line, so it is replaced",
+        statsd.line(statsd.counter("a:b", 1)) == "a_b:1|c")
+    say(f, "a batch is newline separated",
+        statsd.batch([statsd.counter("a", 1), statsd.counter("b", 2)]) == "a:1|c\nb:2|c")
+
+    print("")
+    if f == 0 {
+        print("all held")
+    } else {
+        print("{f} failed")
+    }
+}

@@ -1,0 +1,128 @@
+// HTTP content negotiation: `Accept`, `Accept-Language`, `Accept-Encoding`.
+//
+// The q-value ordering is the part that is wrong in most hand-written
+// implementations. `q` defaults to 1.0 when absent, `q=0` means *explicitly
+// refused* rather than merely least preferred, and ties are broken by
+// specificity — `text/html` beats `text/*` beats `*/*` at the same q. A server
+// that sorts on q alone will happily return a type the client refused.
+
+type Preference = {
+    value: str,
+    /// Thousandths, so the ordering is integer arithmetic and cannot drift.
+    q: i64,
+    /// 2 for an exact type, 1 for a subtype wildcard, 0 for `*/*`.
+    specificity: i64,
+}
+
+fn parse_q(param: str) -> i64 {
+    let text = param.trim()
+    if not text.starts_with("q=") {
+        return 0 - 1
+    }
+    let v = text.substr(2, text.len() - 2).trim()
+    match v.index_of(".") {
+        None -> return (v.parse_int() ?? 1) * 1000
+        Some(at) -> {
+            let whole = v.substr(0, at).parse_int() ?? 0
+            var frac = v.substr(at + 1, v.len() - at - 1)
+            while frac.len() < 3 {
+                frac = frac + "0"
+            }
+            return whole * 1000 + (frac.substr(0, 3).parse_int() ?? 0)
+        }
+    }
+}
+
+fn specificity_of(value: str) -> i64 {
+    if value == "*/*" or value == "*" {
+        return 0
+    }
+    if value.ends_with("/*") {
+        return 1
+    }
+    return 2
+}
+
+/// Every preference in the header, best first.
+pub fn parse(header: str) -> [Preference] {
+    var out: [Preference] = []
+    for part in header.split(",") {
+        let pieces = part.split(";")
+        if pieces.len() > 0 and pieces[0].trim() != "" {
+            let value = pieces[0].trim().to_lower()
+            var q = 1000
+            for i in 1..pieces.len() {
+                let got = parse_q(pieces[i])
+                if got >= 0 {
+                    q = got
+                }
+            }
+            out.push(Preference{ value: value, q: q, specificity: specificity_of(value) })
+        }
+    }
+    // Insertion sort: higher q first, then higher specificity.
+    var i = 1
+    while i < out.len() {
+        var j = i
+        while j > 0 and worse(out[j - 1], out[j]) {
+            let t = out[j - 1]
+            out[j - 1] = out[j]
+            out[j] = t
+            j = j - 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn worse(a: Preference, b: Preference) -> bool {
+    if a.q != b.q {
+        return a.q < b.q
+    }
+    return a.specificity < b.specificity
+}
+
+fn matches(pattern: str, offer: str) -> bool {
+    if pattern == "*/*" or pattern == "*" {
+        return true
+    }
+    if pattern.ends_with("/*") {
+        let prefix = pattern.substr(0, pattern.len() - 1)
+        return offer.starts_with(prefix)
+    }
+    return pattern == offer
+}
+
+/// The best of `offers` the client will take, or `None` when it will take none.
+///
+/// `q=0` is a refusal: an offer matched only by a zero-weighted pattern is not
+/// acceptable, and returning it anyway is the commonest bug here.
+pub fn best(header: str, offers: [str]) -> Option[str] {
+    if header.trim() == "" {
+        if offers.len() == 0 {
+            return None
+        }
+        return Some(offers[0])
+    }
+    let prefs = parse(header)
+    for p in prefs {
+        if p.q > 0 {
+            for o in offers {
+                if matches(p.value, o.to_lower()) {
+                    return Some(o)
+                }
+            }
+        }
+    }
+    return None
+}
+
+/// Whether the client explicitly refused this type with `q=0`.
+pub fn refused(header: str, offer: str) -> bool {
+    for p in parse(header) {
+        if p.q == 0 and matches(p.value, offer.to_lower()) {
+            return true
+        }
+    }
+    return false
+}

@@ -1,0 +1,6 @@
+[package]
+name = "statsd"
+version = "1.0.0"
+
+# Formatting metrics. Opens nothing.
+capabilities = []

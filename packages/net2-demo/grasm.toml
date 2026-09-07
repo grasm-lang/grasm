@@ -1,0 +1,24 @@
+[package]
+name = "net2_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.macaddr]
+path = "../macaddr"
+version = "^1.0.0"
+
+[dependencies.contentneg]
+path = "../contentneg"
+version = "^1.0.0"
+
+[dependencies.retryafter]
+path = "../retryafter"
+version = "^1.0.0"
+
+[dependencies.useragent]
+path = "../useragent"
+version = "^1.0.0"
+
+[dependencies.statsd]
+path = "../statsd"
+version = "^1.0.0"
