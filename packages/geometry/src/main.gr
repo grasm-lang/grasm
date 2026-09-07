@@ -1,12 +1,12 @@
 // 2D geometry in f64: points, vectors, rectangles, and the tests that need care.
 //
-// Two things here are worth more than the rest. **Point-in-polygon** by ray
+// Two things here are worth more than the rest. **Vec2-in-polygon** by ray
 // casting, which is the algorithm that works for concave shapes and holes
 // where a bounding-box check does not. And **segment intersection** by
 // orientation, which avoids computing a slope and therefore never divides by
 // zero on a vertical line — the case a slope-based test silently gets wrong.
 
-type Point = {
+type Vec2 = {
     x: f64,
     y: f64,
 }
@@ -18,8 +18,8 @@ type Rect = {
     h: f64,
 }
 
-pub fn point(x: f64, y: f64) -> Point {
-    return Point{ x: x, y: y }
+pub fn point(x: f64, y: f64) -> Vec2 {
+    return Vec2{ x: x, y: y }
 }
 
 pub fn rect(x: f64, y: f64, w: f64, h: f64) -> Rect {
@@ -44,42 +44,42 @@ fn sqrt_of(v: f64) -> f64 {
     return g
 }
 
-pub fn add(a: Point, b: Point) -> Point {
-    return Point{ x: a.x + b.x, y: a.y + b.y }
+pub fn add(a: Vec2, b: Vec2) -> Vec2 {
+    return Vec2{ x: a.x + b.x, y: a.y + b.y }
 }
 
-pub fn sub(a: Point, b: Point) -> Point {
-    return Point{ x: a.x - b.x, y: a.y - b.y }
+pub fn sub(a: Vec2, b: Vec2) -> Vec2 {
+    return Vec2{ x: a.x - b.x, y: a.y - b.y }
 }
 
-pub fn scale(a: Point, k: f64) -> Point {
-    return Point{ x: a.x * k, y: a.y * k }
+pub fn scale(a: Vec2, k: f64) -> Vec2 {
+    return Vec2{ x: a.x * k, y: a.y * k }
 }
 
-pub fn dot(a: Point, b: Point) -> f64 {
+pub fn dot(a: Vec2, b: Vec2) -> f64 {
     return a.x * b.x + a.y * b.y
 }
 
 /// The z of the 3D cross product — its sign says which way b turns from a.
-pub fn cross(a: Point, b: Point) -> f64 {
+pub fn cross(a: Vec2, b: Vec2) -> f64 {
     return a.x * b.y - a.y * b.x
 }
 
-pub fn length(a: Point) -> f64 {
+pub fn length(a: Vec2) -> f64 {
     return sqrt_of(dot(a, a))
 }
 
-pub fn distance(a: Point, b: Point) -> f64 {
+pub fn distance(a: Vec2, b: Vec2) -> f64 {
     return length(sub(a, b))
 }
 
 /// Distance squared — for comparing distances, which needs no square root.
-pub fn distance_squared(a: Point, b: Point) -> f64 {
+pub fn distance_squared(a: Vec2, b: Vec2) -> f64 {
     let d = sub(a, b)
     return dot(d, d)
 }
 
-pub fn normalise(a: Point) -> Point {
+pub fn normalise(a: Vec2) -> Vec2 {
     let l = length(a)
     if l == 0.0 {
         return a
@@ -87,7 +87,7 @@ pub fn normalise(a: Point) -> Point {
     return scale(a, 1.0 / l)
 }
 
-pub fn rect_holds(r: Rect, p: Point) -> bool {
+pub fn rect_holds(r: Rect, p: Vec2) -> bool {
     return p.x >= r.x and p.x <= r.x + r.w and p.y >= r.y and p.y <= r.y + r.h
 }
 
@@ -101,7 +101,7 @@ pub fn rect_area(r: Rect) -> f64 {
 }
 
 /// The shoelace area of a polygon, positive whichever way it winds.
-pub fn polygon_area(points: [Point]) -> f64 {
+pub fn polygon_area(points: [Vec2]) -> f64 {
     let n = points.len()
     if n < 3 {
         return 0.0
@@ -120,7 +120,7 @@ pub fn polygon_area(points: [Point]) -> f64 {
 /// when the point is inside. This handles concave shapes, which a bounding box
 /// cannot, and it is why a hit test on an arbitrary region needs this rather
 /// than a rectangle check.
-pub fn polygon_holds(polygon: [Point], p: Point) -> bool {
+pub fn polygon_holds(polygon: [Vec2], p: Vec2) -> bool {
     var inside = false
     let n = polygon.len()
     var j = n - 1
@@ -141,7 +141,7 @@ pub fn polygon_holds(polygon: [Point], p: Point) -> bool {
 }
 
 /// 1 clockwise, -1 anticlockwise, 0 collinear.
-pub fn orientation(a: Point, b: Point, c: Point) -> i64 {
+pub fn orientation(a: Vec2, b: Vec2, c: Vec2) -> i64 {
     let v = cross(sub(b, a), sub(c, a))
     if v > 0.000000001 {
         return 0 - 1
@@ -156,7 +156,7 @@ pub fn orientation(a: Point, b: Point, c: Point) -> i64 {
 ///
 /// By orientation rather than by slope: a vertical segment has no slope, and a
 /// slope-based test either divides by zero or special-cases it wrongly.
-pub fn segments_cross(p1: Point, p2: Point, p3: Point, p4: Point) -> bool {
+pub fn segments_cross(p1: Vec2, p2: Vec2, p3: Vec2, p4: Vec2) -> bool {
     let o1 = orientation(p1, p2, p3)
     let o2 = orientation(p1, p2, p4)
     let o3 = orientation(p3, p4, p1)
@@ -180,7 +180,7 @@ pub fn segments_cross(p1: Point, p2: Point, p3: Point, p4: Point) -> bool {
     return false
 }
 
-fn on_segment(a: Point, p: Point, b: Point) -> bool {
+fn on_segment(a: Vec2, p: Vec2, b: Vec2) -> bool {
     let lo_x = if a.x < b.x { a.x } else { b.x }
     let hi_x = if a.x > b.x { a.x } else { b.x }
     let lo_y = if a.y < b.y { a.y } else { b.y }
