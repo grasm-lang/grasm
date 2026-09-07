@@ -1,0 +1,113 @@
+// Closed integer intervals, and the set operations over them.
+//
+// The bug this exists to prevent is the off-by-one in `overlaps`. Written by
+// hand it is almost always `a.hi < b.lo or b.hi < a.lo` negated wrong, and the
+// failure is silent: two ranges that touch at one point are reported as
+// overlapping or not depending on which way the author guessed. Here `[1,3]`
+// and `[3,5]` overlap at 3, and `[1,3]` and `[4,5]` do not.
+
+type Span = {
+    lo: i64,
+    hi: i64,
+}
+
+pub fn span(lo: i64, hi: i64) -> Span {
+    if hi < lo {
+        return Span{ lo: hi, hi: lo }
+    }
+    return Span{ lo: lo, hi: hi }
+}
+
+pub fn width(s: Span) -> i64 {
+    return s.hi - s.lo + 1
+}
+
+pub fn holds(s: Span, v: i64) -> bool {
+    return v >= s.lo and v <= s.hi
+}
+
+pub fn overlaps(a: Span, b: Span) -> bool {
+    return a.lo <= b.hi and b.lo <= a.hi
+}
+
+/// True when the two sit end to end with no gap: `[1,3]` and `[4,6]`.
+pub fn adjacent(a: Span, b: Span) -> bool {
+    return a.hi + 1 == b.lo or b.hi + 1 == a.lo
+}
+
+pub fn intersect(a: Span, b: Span) -> Option[Span] {
+    if not overlaps(a, b) {
+        return None
+    }
+    let lo = if a.lo > b.lo { a.lo } else { b.lo }
+    let hi = if a.hi < b.hi { a.hi } else { b.hi }
+    return Some(Span{ lo: lo, hi: hi })
+}
+
+/// The union, when it is a single span. Two disjoint spans have none.
+pub fn union(a: Span, b: Span) -> Option[Span] {
+    if not overlaps(a, b) and not adjacent(a, b) {
+        return None
+    }
+    let lo = if a.lo < b.lo { a.lo } else { b.lo }
+    let hi = if a.hi > b.hi { a.hi } else { b.hi }
+    return Some(Span{ lo: lo, hi: hi })
+}
+
+/// `a` with `b` removed — nothing, one span, or two.
+pub fn subtract(a: Span, b: Span) -> [Span] {
+    if not overlaps(a, b) {
+        return [a]
+    }
+    var out: [Span] = []
+    if b.lo > a.lo {
+        out.push(Span{ lo: a.lo, hi: b.lo - 1 })
+    }
+    if b.hi < a.hi {
+        out.push(Span{ lo: b.hi + 1, hi: a.hi })
+    }
+    return out
+}
+
+/// Sorted and merged: overlapping and touching spans become one.
+pub fn normalise(spans: [Span]) -> [Span] {
+    if spans.len() == 0 {
+        return []
+    }
+    var sorted = spans
+    // Insertion sort by `lo`: the lists here are short and this keeps the
+    // package free of a comparator the language would need a closure for.
+    var i = 1
+    while i < sorted.len() {
+        var j = i
+        while j > 0 and sorted[j - 1].lo > sorted[j].lo {
+            let t = sorted[j - 1]
+            sorted[j - 1] = sorted[j]
+            sorted[j] = t
+            j = j - 1
+        }
+        i = i + 1
+    }
+    var out: [Span] = [sorted[0]]
+    for k in 1..sorted.len() {
+        let last = out[out.len() - 1]
+        match union(last, sorted[k]) {
+            Some(m) -> out[out.len() - 1] = m
+            None -> out.push(sorted[k])
+        }
+    }
+    return out
+}
+
+/// Total covered, counting an overlap once.
+pub fn covered(spans: [Span]) -> i64 {
+    var total = 0
+    for s in normalise(spans) {
+        total = total + width(s)
+    }
+    return total
+}
+
+pub fn render(s: Span) -> str {
+    return "[{s.lo},{s.hi}]"
+}

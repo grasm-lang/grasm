@@ -1,0 +1,114 @@
+// A least-recently-used cache with a hard bound.
+//
+// The bound is the point. A map that only ever grows is a memory leak with a
+// convenient interface, and it is the commonest one in a long-running process:
+// a cache keyed on something user-supplied, never evicted, fine in testing and
+// fatal in a week.
+//
+// Recency is a list of keys in use order. That makes a hit O(n) in the bound
+// rather than O(1), which is the right trade at the sizes a bounded cache is
+// set to — a few hundred — and it avoids the doubly-linked list an O(1)
+// version needs, which in a language with value semantics costs more than it
+// saves.
+
+type LruCache = {
+    keys: [str],
+    vals: [str],
+    /// Most recent last.
+    order: [str],
+    bound: i64,
+    hits: i64,
+    misses: i64,
+    evicted: i64,
+}
+
+pub fn new_cache(bound: i64) -> LruCache {
+    return LruCache{
+        keys: [], vals: [], order: [],
+        bound: if bound < 1 { 1 } else { bound },
+        hits: 0, misses: 0, evicted: 0,
+    }
+}
+
+fn index_of(c: LruCache, key: str) -> i64 {
+    for i in 0..c.keys.len() {
+        if c.keys[i] == key {
+            return i
+        }
+    }
+    return 0 - 1
+}
+
+fn touch(inout c: LruCache, key: str) {
+    var kept: [str] = []
+    for k in c.order {
+        if k != key {
+            kept.push(k)
+        }
+    }
+    kept.push(key)
+    c.order = kept
+}
+
+pub fn get(inout c: LruCache, key: str) -> Option[str] {
+    let at = index_of(c, key)
+    if at < 0 {
+        c.misses = c.misses + 1
+        return None
+    }
+    c.hits = c.hits + 1
+    touch(c, key)
+    return Some(c.vals[at])
+}
+
+pub fn set(inout c: LruCache, key: str, value: str) {
+    let at = index_of(c, key)
+    if at >= 0 {
+        c.vals[at] = value
+        touch(c, key)
+        return
+    }
+    if c.keys.len() >= c.bound {
+        // The oldest key is the front of the order.
+        let victim = c.order[0]
+        var rest: [str] = []
+        for i in 1..c.order.len() {
+            rest.push(c.order[i])
+        }
+        c.order = rest
+        let vat = index_of(c, victim)
+        if vat >= 0 {
+            var nk: [str] = []
+            var nv: [str] = []
+            for i in 0..c.keys.len() {
+                if i != vat {
+                    nk.push(c.keys[i])
+                    nv.push(c.vals[i])
+                }
+            }
+            c.keys = nk
+            c.vals = nv
+        }
+        c.evicted = c.evicted + 1
+    }
+    c.keys.push(key)
+    c.vals.push(value)
+    c.order.push(key)
+}
+
+pub fn len(c: LruCache) -> i64 {
+    return c.keys.len()
+}
+
+pub fn holds(c: LruCache, key: str) -> bool {
+    return index_of(c, key) >= 0
+}
+
+/// Hits as a fraction of lookups. 0.0 when nothing has been asked for.
+pub fn hit_rate(c: LruCache) -> f64 {
+    let total = c.hits + c.misses
+    if total == 0 {
+        return 0.0
+    }
+    return c.hits.as_f64() / total.as_f64()
+}

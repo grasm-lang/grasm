@@ -1,0 +1,147 @@
+// Six structures, one program.
+//
+// The statistics section is checked against values computed independently in
+// Python, not against what this implementation happens to produce.
+import trie
+import graphs
+import lru
+import intervals
+import matrix
+import stats
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn near(a: f64, b: f64) -> bool {
+    let d = a - b
+    return d < 0.000001 and d > 0.0 - 0.000001
+}
+
+fn main() / {io} {
+    var f = 0
+
+    print("-- the trie answers what a map cannot")
+    var t = trie.new_trie()
+    for w in ["car", "cart", "carbon", "dog", "do"] {
+        trie.insert(t, w)
+    }
+    say(f, "five stored", trie.len(t) == 5)
+    say(f, "holds an exact key", trie.holds(t, "cart"))
+    say(f, "does not hold a prefix that was not stored", not trie.holds(t, "ca"))
+    say(f, "but knows the prefix exists", trie.has_prefix(t, "ca"))
+    say(f, "lists everything under a prefix",
+        trie.with_prefix(t, "car") == ["car", "carbon", "cart"])
+    say(f, "longest prefix is the route match",
+        trie.longest_prefix_of(t, "carting") == Some("cart"))
+    say(f, "no route matches", trie.longest_prefix_of(t, "zebra") == None)
+
+    print("-- graph traversal and ordering")
+    var g = graphs.new_graph(6)
+    graphs.add_edge(g, 0, 1, 4)
+    graphs.add_edge(g, 0, 2, 1)
+    graphs.add_edge(g, 2, 1, 2)
+    graphs.add_edge(g, 1, 3, 5)
+    graphs.add_edge(g, 2, 3, 8)
+    graphs.add_edge(g, 3, 4, 3)
+    say(f, "breadth first is nearest first", graphs.breadth_first(g, 0) == [0, 1, 2, 3, 4])
+    say(f, "depth first goes deep", graphs.depth_first(g, 0) == [0, 1, 3, 4, 2])
+    match graphs.topological(g) {
+        None -> say(f, "an acyclic graph has an order", false)
+        Some(order) -> say(f, "an acyclic graph has an order", order.len() == 6)
+    }
+    say(f, "no cycle here", not graphs.has_cycle(g))
+    // 0->2->1->3 costs 1+2+5 = 8, which beats 0->1->3 at 9 and 0->2->3 at 9.
+    let d = graphs.shortest_from(g, 0)
+    say(f, "dijkstra takes the cheap route, not the short one", d[3] == 8)
+    say(f, "unreachable stays -1", d[5] == 0 - 1)
+    var cyc = graphs.new_graph(3)
+    graphs.add_edge(cyc, 0, 1, 1)
+    graphs.add_edge(cyc, 1, 2, 1)
+    graphs.add_edge(cyc, 2, 0, 1)
+    say(f, "a cycle has no order", graphs.topological(cyc) == None)
+
+    print("-- the cache is bounded, which is the point")
+    var c = lru.new_cache(3)
+    lru.set(c, "a", "1")
+    lru.set(c, "b", "2")
+    lru.set(c, "c", "3")
+    say(f, "holds its bound", lru.len(c) == 3)
+    let _hit = lru.get(c, "a")
+    lru.set(c, "d", "4")
+    say(f, "still at its bound after a fourth", lru.len(c) == 3)
+    say(f, "evicted the least recently used", not lru.holds(c, "b"))
+    say(f, "kept the one that was touched", lru.holds(c, "a"))
+    say(f, "one eviction counted", c.evicted == 1)
+    say(f, "hit rate is measured", lru.hit_rate(c) > 0.0)
+
+    print("-- intervals, and the off-by-one everyone writes")
+    let a = intervals.span(1, 3)
+    let b = intervals.span(3, 5)
+    let far = intervals.span(7, 9)
+    say(f, "touching at one point overlaps", intervals.overlaps(a, b))
+    say(f, "disjoint does not", not intervals.overlaps(a, far))
+    say(f, "adjacent means no gap", intervals.adjacent(intervals.span(1, 3), intervals.span(4, 6)))
+    say(f, "intersection is the shared point", intervals.intersect(a, b) == Some(intervals.span(3, 3)))
+    say(f, "width counts both ends", intervals.width(a) == 3)
+    say(f, "subtracting the middle leaves two",
+        intervals.subtract(intervals.span(1, 10), intervals.span(4, 6)).len() == 2)
+    say(f, "overlap is counted once",
+        intervals.covered([intervals.span(1, 5), intervals.span(3, 8)]) == 8)
+
+    print("-- matrices")
+    let i3 = matrix.identity(3)
+    say(f, "identity has ones on the diagonal", matrix.at(i3, 1, 1) == 1.0 and matrix.at(i3, 0, 1) == 0.0)
+    let m = matrix.of(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    let n = matrix.of(3, 2, [7.0, 8.0, 9.0, 10.0, 11.0, 12.0])
+    match matrix.multiply(m, n) {
+        Err(_e) -> say(f, "2x3 by 3x2", false)
+        Ok(p) -> {
+            // [[58,64],[139,154]] — the worked example in every textbook.
+            say(f, "2x3 by 3x2 gives 2x2", p.rows == 2 and p.cols == 2)
+            say(f, "and the right numbers",
+                matrix.at(p, 0, 0) == 58.0 and matrix.at(p, 0, 1) == 64.0
+                and matrix.at(p, 1, 0) == 139.0 and matrix.at(p, 1, 1) == 154.0)
+        }
+    }
+    say(f, "mismatched shapes are refused", {
+        match matrix.multiply(m, m) {
+            Err(_e) -> true
+            Ok(_p) -> false
+        }
+    })
+    say(f, "transpose swaps the shape", matrix.transpose(m).rows == 3)
+    match matrix.determinant(matrix.of(3, 3, [6.0, 1.0, 1.0, 4.0, 0.0 - 2.0, 5.0, 2.0, 8.0, 7.0])) {
+        Err(_e) -> say(f, "determinant is -306", false)
+        Ok(det) -> say(f, "determinant is -306", near(det, 0.0 - 306.0))
+    }
+
+    print("-- statistics, against values computed elsewhere")
+    var s = stats.new_summary()
+    for v in [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0] {
+        stats.observe(s, v)
+    }
+    say(f, "mean is 5", near(stats.mean(s), 5.0))
+    // Sample variance of that set is 32/7 = 4.571428...
+    say(f, "sample variance is 32/7", near(stats.variance(s), 32.0 / 7.0))
+    say(f, "least and most", stats.least(s) == 2.0 and stats.most(s) == 9.0)
+    say(f, "count", stats.count(s) == 8)
+    let xs = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+    say(f, "median of 1..10 is 5.5", near(stats.median(xs), 5.5))
+    // NumPy's percentile(xs, 90) on 1..10 is 9.1 under the same rule.
+    say(f, "90th percentile is 9.1 (NIST R-7)", near(stats.percentile(xs, 0.9), 9.1))
+    say(f, "0th is the minimum", near(stats.percentile(xs, 0.0), 1.0))
+    say(f, "100th is the maximum", near(stats.percentile(xs, 1.0), 10.0))
+
+    print("")
+    if f == 0 {
+        print("all held")
+    } else {
+        print("{f} failed")
+    }
+}

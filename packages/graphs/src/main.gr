@@ -1,0 +1,169 @@
+// Directed graphs: reachability, ordering, and shortest paths.
+//
+// Named `graphs` rather than `graph` because a package and a type share one
+// namespace program-wide here, and something this general would take a name
+// half the ecosystem wants.
+//
+// Vertices are 0..n and edges live in adjacency lists, which is the layout
+// that makes traversal a walk over contiguous memory rather than a chase
+// through pointers.
+
+type Digraph = {
+    /// `to[v]` and `weight[v]` are parallel: edge k of v goes to `to[v][k]`.
+    to: [[i64]],
+    weight: [[i64]],
+}
+
+pub fn new_graph(n: i64) -> Digraph {
+    var t: [[i64]] = []
+    var w: [[i64]] = []
+    for _i in 0..n {
+        t.push([])
+        w.push([])
+    }
+    return Digraph{ to: t, weight: w }
+}
+
+pub fn order(g: Digraph) -> i64 {
+    return g.to.len()
+}
+
+pub fn add_edge(inout g: Digraph, from: i64, to: i64, weight: i64) {
+    g.to[from].push(to)
+    g.weight[from].push(weight)
+}
+
+/// Breadth-first order from `start`. Nearest first, which is what makes it
+/// the right search when every edge costs the same.
+pub fn breadth_first(g: Digraph, start: i64) -> [i64] {
+    var seen: [bool] = []
+    for _i in 0..order(g) {
+        seen.push(false)
+    }
+    var out: [i64] = []
+    var queue: [i64] = [start]
+    seen[start] = true
+    var head = 0
+    while head < queue.len() {
+        let v = queue[head]
+        head = head + 1
+        out.push(v)
+        for u in g.to[v] {
+            if not seen[u] {
+                seen[u] = true
+                queue.push(u)
+            }
+        }
+    }
+    return out
+}
+
+/// Depth-first order from `start`, iterative so a deep graph does not use a
+/// deep stack.
+pub fn depth_first(g: Digraph, start: i64) -> [i64] {
+    var seen: [bool] = []
+    for _i in 0..order(g) {
+        seen.push(false)
+    }
+    var out: [i64] = []
+    var stack: [i64] = [start]
+    while stack.len() > 0 {
+        let v = stack.pop() ?? 0
+        if not seen[v] {
+            seen[v] = true
+            out.push(v)
+            // Reversed, so the first edge is explored first.
+            var i = g.to[v].len() - 1
+            while i >= 0 {
+                if not seen[g.to[v][i]] {
+                    stack.push(g.to[v][i])
+                }
+                i = i - 1
+            }
+        }
+    }
+    return out
+}
+
+/// A topological order, or `None` when the graph has a cycle.
+///
+/// Kahn's algorithm: repeatedly take a vertex nothing points at. If the order
+/// comes up short, whatever is left is in a cycle — which is how a build tool
+/// tells "these steps have an order" from "these steps depend on each other".
+pub fn topological(g: Digraph) -> Option[[i64]] {
+    let n = order(g)
+    var indegree: [i64] = []
+    for _i in 0..n {
+        indegree.push(0)
+    }
+    for v in 0..n {
+        for u in g.to[v] {
+            indegree[u] = indegree[u] + 1
+        }
+    }
+    var ready: [i64] = []
+    for v in 0..n {
+        if indegree[v] == 0 {
+            ready.push(v)
+        }
+    }
+    var out: [i64] = []
+    var head = 0
+    while head < ready.len() {
+        let v = ready[head]
+        head = head + 1
+        out.push(v)
+        for u in g.to[v] {
+            indegree[u] = indegree[u] - 1
+            if indegree[u] == 0 {
+                ready.push(u)
+            }
+        }
+    }
+    if out.len() != n {
+        return None
+    }
+    return Some(out)
+}
+
+pub fn has_cycle(g: Digraph) -> bool {
+    return topological(g) == None
+}
+
+/// Shortest distance from `start` to every vertex, or -1 where unreachable.
+///
+/// Dijkstra with a linear scan for the next vertex rather than a heap. For the
+/// graph sizes this is meant for that is faster, not slower: a heap wins when
+/// edges vastly outnumber vertices, and costs more when they do not.
+pub fn shortest_from(g: Digraph, start: i64) -> [i64] {
+    let n = order(g)
+    var dist: [i64] = []
+    var done: [bool] = []
+    for _i in 0..n {
+        dist.push(0 - 1)
+        done.push(false)
+    }
+    dist[start] = 0
+    for _step in 0..n {
+        var best = 0 - 1
+        for v in 0..n {
+            if not done[v] and dist[v] >= 0 {
+                if best < 0 or dist[v] < dist[best] {
+                    best = v
+                }
+            }
+        }
+        if best < 0 {
+            return dist
+        }
+        done[best] = true
+        for k in 0..g.to[best].len() {
+            let u = g.to[best][k]
+            let through = dist[best] + g.weight[best][k]
+            if dist[u] < 0 or through < dist[u] {
+                dist[u] = through
+            }
+        }
+    }
+    return dist
+}

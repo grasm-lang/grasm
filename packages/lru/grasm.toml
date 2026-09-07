@@ -1,0 +1,6 @@
+[package]
+name = "lru"
+version = "1.0.0"
+
+# In-memory bookkeeping. Opens nothing.
+capabilities = []

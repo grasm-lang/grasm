@@ -1,0 +1,6 @@
+[package]
+name = "trie"
+version = "1.0.0"
+
+# Indexing text. Opens nothing.
+capabilities = []

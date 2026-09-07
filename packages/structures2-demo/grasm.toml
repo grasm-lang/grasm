@@ -1,0 +1,28 @@
+[package]
+name = "structures2_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.trie]
+path = "../trie"
+version = "^1.0.0"
+
+[dependencies.graphs]
+path = "../graphs"
+version = "^1.0.0"
+
+[dependencies.lru]
+path = "../lru"
+version = "^1.0.0"
+
+[dependencies.intervals]
+path = "../intervals"
+version = "^1.0.0"
+
+[dependencies.matrix]
+path = "../matrix"
+version = "^1.0.0"
+
+[dependencies.stats]
+path = "../stats"
+version = "^1.0.0"

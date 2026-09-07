@@ -1,0 +1,6 @@
+[package]
+name = "intervals"
+version = "1.0.0"
+
+# Arithmetic over ranges. Opens nothing.
+capabilities = []

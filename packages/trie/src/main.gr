@@ -1,0 +1,140 @@
+// A prefix tree over strings.
+//
+// A map answers "is this key here". A trie answers "what keys start with
+// this", which a map cannot do without walking every key it holds. That is
+// the whole reason to pay for the extra structure: autocomplete, routing
+// tables and dictionary lookups are all prefix questions.
+//
+// Nodes live in one flat list and children are indices into it, not
+// references. Grasm has one integer type and a list of them is contiguous, so
+// this keeps the walk in cache and avoids a generational reference per node.
+
+type TrieNode = {
+    /// Child index per byte, or -1. Fixed at 128: this indexes ASCII, and a
+    /// key with a byte above 127 is stored under its bytes, which still works
+    /// but does not compress.
+    next: [i64],
+    terminal: bool,
+}
+
+type Trie = {
+    node: [TrieNode],
+    count: i64,
+}
+
+fn empty_node() -> TrieNode {
+    var n: [i64] = []
+    for _i in 0..128 {
+        n.push(0 - 1)
+    }
+    return TrieNode{ next: n, terminal: false }
+}
+
+pub fn new_trie() -> Trie {
+    return Trie{ node: [empty_node()], count: 0 }
+}
+
+pub fn len(t: Trie) -> i64 {
+    return t.count
+}
+
+pub fn insert(inout t: Trie, key: str) {
+    var at = 0
+    for c in key.codes() {
+        let slot = c % 128
+        var nxt = t.node[at].next[slot]
+        if nxt < 0 {
+            t.node.push(empty_node())
+            nxt = t.node.len() - 1
+            t.node[at].next[slot] = nxt
+        }
+        at = nxt
+    }
+    if not t.node[at].terminal {
+        t.node[at].terminal = true
+        t.count = t.count + 1
+    }
+}
+
+/// The node reached by walking `key`, or -1.
+fn walk_to(t: Trie, key: str) -> i64 {
+    var at = 0
+    for c in key.codes() {
+        let nxt = t.node[at].next[c % 128]
+        if nxt < 0 {
+            return 0 - 1
+        }
+        at = nxt
+    }
+    return at
+}
+
+pub fn holds(t: Trie, key: str) -> bool {
+    let at = walk_to(t, key)
+    if at < 0 {
+        return false
+    }
+    return t.node[at].terminal
+}
+
+/// Whether anything stored starts with `prefix` — the question a map cannot
+/// answer without a full scan.
+pub fn has_prefix(t: Trie, prefix: str) -> bool {
+    return walk_to(t, prefix) >= 0
+}
+
+fn gather(t: Trie, at: i64, so_far: str, inout out: [str]) {
+    if t.node[at].terminal {
+        out.push(so_far)
+    }
+    for slot in 0..128 {
+        let nxt = t.node[at].next[slot]
+        if nxt >= 0 {
+            gather(t, nxt, so_far + str_of_code(slot), out)
+        }
+    }
+}
+
+fn str_of_code(c: i64) -> str {
+    return bytes_of([c]).to_str()
+}
+
+/// Every key beginning with `prefix`, in order.
+pub fn with_prefix(t: Trie, prefix: str) -> [str] {
+    var out: [str] = []
+    let at = walk_to(t, prefix)
+    if at < 0 {
+        return out
+    }
+    gather(t, at, prefix, out)
+    return out
+}
+
+/// The longest stored key that is a prefix of `text`. Route matching.
+pub fn longest_prefix_of(t: Trie, text: str) -> Option[str] {
+    var at = 0
+    var best = 0 - 1
+    var i = 0
+    if t.node[0].terminal {
+        best = 0
+    }
+    var stopped = false
+    for c in text.codes() {
+        if not stopped {
+            let nxt = t.node[at].next[c % 128]
+            if nxt < 0 {
+                stopped = true
+            } else {
+                at = nxt
+                i = i + 1
+                if t.node[at].terminal {
+                    best = i
+                }
+            }
+        }
+    }
+    if best < 0 {
+        return None
+    }
+    return Some(text.substr(0, best))
+}

@@ -1,0 +1,6 @@
+[package]
+name = "graphs"
+version = "1.0.0"
+
+# Traversal over indices. Opens nothing.
+capabilities = []

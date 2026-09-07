@@ -1,0 +1,128 @@
+// Summary statistics, with the two that are usually got wrong.
+//
+// **Variance** is computed in one pass by Welford's method rather than as
+// `E[x^2] - E[x]^2`. The textbook formula subtracts two large nearly-equal
+// numbers and loses most of its precision on data far from zero — timings in
+// nanoseconds, prices in cents — which is exactly the data anyone computes a
+// variance of.
+//
+// **A percentile** needs a stated interpolation rule or two implementations
+// disagree on the same input. This uses the linear one NIST calls R-7, which
+// is what NumPy and R default to.
+
+type Summary = {
+    count: i64,
+    mean: f64,
+    /// Sum of squared deviations. Variance is this over count.
+    m2: f64,
+    least: f64,
+    most: f64,
+}
+
+pub fn new_summary() -> Summary {
+    return Summary{ count: 0, mean: 0.0, m2: 0.0, least: 0.0, most: 0.0 }
+}
+
+/// One more observation. Welford: the mean moves, and the squared-deviation
+/// sum is updated against both the old mean and the new.
+pub fn observe(inout s: Summary, v: f64) {
+    if s.count == 0 {
+        s.least = v
+        s.most = v
+    } else {
+        if v < s.least {
+            s.least = v
+        }
+        if v > s.most {
+            s.most = v
+        }
+    }
+    s.count = s.count + 1
+    let delta = v - s.mean
+    s.mean = s.mean + delta / s.count.as_f64()
+    s.m2 = s.m2 + delta * (v - s.mean)
+}
+
+pub fn mean(s: Summary) -> f64 {
+    return s.mean
+}
+
+/// The sample variance, dividing by n-1. Zero for fewer than two values.
+pub fn variance(s: Summary) -> f64 {
+    if s.count < 2 {
+        return 0.0
+    }
+    return s.m2 / (s.count - 1).as_f64()
+}
+
+pub fn deviation(s: Summary) -> f64 {
+    return sqrt_of(variance(s))
+}
+
+pub fn least(s: Summary) -> f64 {
+    return s.least
+}
+
+pub fn most(s: Summary) -> f64 {
+    return s.most
+}
+
+pub fn count(s: Summary) -> i64 {
+    return s.count
+}
+
+fn sqrt_of(v: f64) -> f64 {
+    if v <= 0.0 {
+        return 0.0
+    }
+    // Newton's method. Twenty rounds is far past f64 precision for any input
+    // a variance produces.
+    var g = v
+    for _i in 0..20 {
+        g = (g + v / g) / 2.0
+    }
+    return g
+}
+
+fn sorted_of(xs: [f64]) -> [f64] {
+    var out = xs
+    var i = 1
+    while i < out.len() {
+        var j = i
+        while j > 0 and out[j - 1] > out[j] {
+            let t = out[j - 1]
+            out[j - 1] = out[j]
+            out[j] = t
+            j = j - 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// The `q` percentile, 0.0 to 1.0, by linear interpolation (NIST R-7).
+pub fn percentile(xs: [f64], q: f64) -> f64 {
+    if xs.len() == 0 {
+        return 0.0
+    }
+    let s = sorted_of(xs)
+    if s.len() == 1 {
+        return s[0]
+    }
+    var p = q
+    if p < 0.0 {
+        p = 0.0
+    }
+    if p > 1.0 {
+        p = 1.0
+    }
+    let pos = p * (s.len() - 1).as_f64()
+    let lo = pos.floor().as_i64()
+    let hi = if lo + 1 < s.len() { lo + 1 } else { lo }
+    let frac = pos - lo.as_f64()
+    return s[lo] + (s[hi] - s[lo]) * frac
+}
+
+pub fn median(xs: [f64]) -> f64 {
+    return percentile(xs, 0.5)
+}
