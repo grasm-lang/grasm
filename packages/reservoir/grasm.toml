@@ -1,0 +1,6 @@
+[package]
+name = "reservoir"
+version = "1.0.0"
+
+# Sampling. Opens nothing.
+capabilities = []

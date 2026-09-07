@@ -1,0 +1,116 @@
+// Four streaming sketches. Each asserts its guarantee — including the
+// direction of its error, which is what makes a sketch safe or unsafe to
+// build a decision on.
+import hyperloglog
+import countmin
+import reservoir
+import histogram
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+
+    print("-- HyperLogLog: distinct count in fixed memory")
+    var h = hyperloglog.new_hll(10)
+    say(f, "1024 registers", hyperloglog.register_count(h) == 1024)
+    say(f, "empty is zero", hyperloglog.estimate(h) == 0)
+    for i in 0..5000 {
+        hyperloglog.observe(h, "user-{i}")
+    }
+    let est = hyperloglog.estimate(h)
+    // Within 5% of 5000. The sketch promises a few percent and this holds it
+    // to that: a looser bound would have passed the 27%-low version.
+    say(f, "5000 distinct estimated within 5% ({est})", est > 4750 and est < 5250)
+    // Repeats must not move it: that is the whole property.
+    for i in 0..5000 {
+        hyperloglog.observe(h, "user-{i}")
+    }
+    say(f, "seeing them all again does not change it", hyperloglog.estimate(h) == est)
+    var g = hyperloglog.new_hll(10)
+    for i in 0..5000 {
+        hyperloglog.observe(g, "user-{i}")
+    }
+    hyperloglog.merge(h, g)
+    say(f, "merging an identical shard does not double it", hyperloglog.estimate(h) == est)
+    say(f, "and memory did not grow with the stream", hyperloglog.register_count(h) == 1024)
+
+    print("-- Count-Min: frequency, with the error one-sided")
+    var s = countmin.new_sketch(4, 512)
+    for _i in 0..100 {
+        countmin.add(s, "hot", 1)
+    }
+    for _i in 0..3 {
+        countmin.add(s, "cold", 1)
+    }
+    say(f, "the total is exact", countmin.total(s) == 103)
+    // Never under: collisions only add. This is the guarantee.
+    say(f, "the estimate is never LOW", countmin.estimate(s, "hot") >= 100)
+    say(f, "and is close", countmin.estimate(s, "hot") < 110)
+    say(f, "cold is never low either", countmin.estimate(s, "cold") >= 3)
+    say(f, "something never added is not certainly present",
+        countmin.estimate(s, "never-seen") < 5)
+    // Safe direction only.
+    say(f, "certainly-below is sound", countmin.certainly_below(s, "cold", 50))
+    say(f, "and hot is not below", not countmin.certainly_below(s, "hot", 50))
+    var s2 = countmin.new_sketch(4, 512)
+    countmin.add(s2, "hot", 50)
+    countmin.merge(s, s2)
+    say(f, "merging adds", countmin.total(s) == 153)
+
+    print("-- Reservoir: k from a stream of unknown length")
+    var r = reservoir.new_reservoir(5)
+    // Deterministic draws, so the test is repeatable.
+    var seed = 7
+    for i in 0..100 {
+        seed = (seed * 1103515245 + 12345) % 2147483648
+        let draw = if reservoir.held(r) < 5 { 0 } else { seed % (i + 1) }
+        reservoir.offer(r, "line-{i}", draw)
+    }
+    say(f, "holds exactly k", reservoir.held(r) == 5)
+    say(f, "counts everything it saw", reservoir.count(r) == 100)
+    say(f, "and is no longer the whole population", not reservoir.is_complete(r))
+    var small = reservoir.new_reservoir(10)
+    for i in 0..3 {
+        reservoir.offer(small, "x{i}", 0)
+    }
+    say(f, "a short stream is held whole", reservoir.is_complete(small))
+    say(f, "and is exactly what arrived", reservoir.sample(small) == ["x0", "x1", "x2"])
+
+    print("-- Histogram: percentiles, where a mean lies")
+    var lat = histogram.new_histogram(1, 14)
+    // 99 fast requests and one very slow one.
+    for _i in 0..99 {
+        histogram.observe(lat, 10)
+    }
+    histogram.observe(lat, 5000)
+    say(f, "a hundred observations", histogram.count_of(lat) == 100)
+    // The mean is ~60ms and describes nothing that happened.
+    say(f, "the mean is misleading (~60)", histogram.mean(lat) > 55 and histogram.mean(lat) < 65)
+    say(f, "the median is the fast bucket", histogram.percentile(lat, 500) <= 16)
+    say(f, "p99 is still fast", histogram.percentile(lat, 990) <= 16)
+    // p100 has to reach the slow one.
+    say(f, "but the maximum does not hide", histogram.most(lat) == 5000)
+    say(f, "the least is recorded", histogram.least(lat) == 10)
+    say(f, "buckets double", histogram.percentile(lat, 500) == 16)
+    var tiny = histogram.new_histogram(1, 3)
+    histogram.observe(tiny, 1000)
+    say(f, "over the top bucket is counted apart", histogram.over_bound(tiny) == 1)
+    say(f, "and a percentile there says it does not know",
+        histogram.percentile(tiny, 990) == 0 - 1)
+    say(f, "renders a chart", histogram.render(lat, 20).contains("#"))
+
+    print("")
+    if f == 0 {
+        print("all held")
+    } else {
+        print("{f} failed")
+    }
+}

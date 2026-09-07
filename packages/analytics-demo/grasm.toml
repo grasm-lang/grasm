@@ -1,0 +1,20 @@
+[package]
+name = "analytics_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.hyperloglog]
+path = "../hyperloglog"
+version = "^1.0.0"
+
+[dependencies.countmin]
+path = "../countmin"
+version = "^1.0.0"
+
+[dependencies.reservoir]
+path = "../reservoir"
+version = "^1.0.0"
+
+[dependencies.histogram]
+path = "../histogram"
+version = "^1.0.0"

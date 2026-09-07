@@ -1,0 +1,62 @@
+// Reservoir sampling: k items chosen uniformly from a stream of unknown length.
+//
+// The problem it solves: you want 100 random log lines out of a stream whose
+// length you will not know until it ends, and you cannot hold the stream. The
+// naive approach — collect everything, then sample — needs memory the whole
+// point was to avoid.
+//
+// Algorithm R: keep the first k, then for item i (counting from 1) keep it
+// with probability k/i, replacing one at random. Every item ends up equally
+// likely, which is not obvious and is the reason to use the published
+// algorithm rather than an invented one.
+//
+// Randomness is supplied by the caller as a value in 0..bound, so this package
+// declares no capability and a test can be deterministic.
+
+type Reservoir = {
+    keep: [str],
+    size: i64,
+    seen: i64,
+}
+
+pub fn new_reservoir(size: i64) -> Reservoir {
+    var k = size
+    if k < 1 {
+        k = 1
+    }
+    return Reservoir{ keep: [], size: k, seen: 0 }
+}
+
+/// Offer one item. `random_below_seen` must be a uniform value in
+/// `0..seen_after`, where `seen_after` is `count(r) + 1`.
+pub fn offer(inout r: Reservoir, item: str, random_below_seen: i64) {
+    r.seen = r.seen + 1
+    if r.keep.len() < r.size {
+        r.keep.push(item)
+        return
+    }
+    // Keep with probability size/seen: the draw lands in the reservoir's
+    // range exactly that often.
+    if random_below_seen < r.size {
+        r.keep[random_below_seen] = item
+    }
+}
+
+pub fn sample(r: Reservoir) -> [str] {
+    return r.keep
+}
+
+pub fn count(r: Reservoir) -> i64 {
+    return r.seen
+}
+
+pub fn held(r: Reservoir) -> i64 {
+    return r.keep.len()
+}
+
+/// Whether the reservoir is holding everything it saw — true until the stream
+/// exceeds the reservoir, and the point at which the sample stops being the
+/// whole population.
+pub fn is_complete(r: Reservoir) -> bool {
+    return r.seen <= r.size
+}

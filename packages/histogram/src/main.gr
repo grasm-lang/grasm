@@ -1,0 +1,135 @@
+// A latency histogram with logarithmic buckets.
+//
+// The mistake this replaces is averaging latency. A mean hides exactly the
+// thing anybody cares about: if 99 requests take 10ms and one takes 5 seconds,
+// the mean is 60ms and every user who hit the slow one is invisible.
+//
+// Buckets are logarithmic because latency is: the difference between 1ms and
+// 2ms matters as much as between 1s and 2s. Linear buckets waste almost all
+// their resolution on the range nothing lands in.
+//
+// A percentile from a histogram is **bounded, not exact** — it names the
+// bucket, and the true value is inside it. Reporting it to three decimal
+// places is a lie the bucket width does not support.
+
+type Histogram = {
+    /// Upper bound of each bucket, ascending.
+    bound: [i64],
+    count: [i64],
+    /// Anything above the last bound.
+    overflow: i64,
+    total: i64,
+    sum: i64,
+    least: i64,
+    most: i64,
+}
+
+/// Buckets doubling from `first` — 1, 2, 4, 8 … for `n` of them.
+pub fn new_histogram(first: i64, n: i64) -> Histogram {
+    var b: [i64] = []
+    var c: [i64] = []
+    var v = if first < 1 { 1 } else { first }
+    for _i in 0..n {
+        b.push(v)
+        c.push(0)
+        v = v * 2
+    }
+    return Histogram{
+        bound: b, count: c, overflow: 0, total: 0, sum: 0,
+        least: 0 - 1, most: 0 - 1,
+    }
+}
+
+pub fn observe(inout h: Histogram, value: i64) {
+    h.total = h.total + 1
+    h.sum = h.sum + value
+    if h.least < 0 or value < h.least {
+        h.least = value
+    }
+    if value > h.most {
+        h.most = value
+    }
+    for i in 0..h.bound.len() {
+        if value <= h.bound[i] {
+            h.count[i] = h.count[i] + 1
+            return
+        }
+    }
+    h.overflow = h.overflow + 1
+}
+
+/// The bucket bound at or above the `q` percentile, in thousandths.
+///
+/// Returns the *upper bound* of the bucket the percentile falls in, so the
+/// true value is at most this. -1 when it lands in the overflow, which is the
+/// honest answer: the histogram does not know.
+pub fn percentile(h: Histogram, q_thousandths: i64) -> i64 {
+    if h.total == 0 {
+        return 0
+    }
+    // Integer division sends a small total to zero, and a `want` of zero
+    // matches the first bucket before anything has been counted into it.
+    var want = h.total * q_thousandths / 1000
+    if want < 1 {
+        want = 1
+    }
+    var running = 0
+    for i in 0..h.bound.len() {
+        running = running + h.count[i]
+        if running >= want {
+            return h.bound[i]
+        }
+    }
+    return 0 - 1
+}
+
+pub fn mean(h: Histogram) -> i64 {
+    if h.total == 0 {
+        return 0
+    }
+    return h.sum / h.total
+}
+
+pub fn count_of(h: Histogram) -> i64 {
+    return h.total
+}
+
+pub fn least(h: Histogram) -> i64 {
+    if h.least < 0 {
+        return 0
+    }
+    return h.least
+}
+
+pub fn most(h: Histogram) -> i64 {
+    if h.most < 0 {
+        return 0
+    }
+    return h.most
+}
+
+pub fn over_bound(h: Histogram) -> i64 {
+    return h.overflow
+}
+
+/// A text bar chart, for a terminal.
+pub fn render(h: Histogram, width: i64) -> str {
+    var peak = h.overflow
+    for c in h.count {
+        if c > peak {
+            peak = c
+        }
+    }
+    if peak == 0 {
+        return "(empty)"
+    }
+    var lines: [str] = []
+    for i in 0..h.bound.len() {
+        let bar = "#".repeat(h.count[i] * width / peak)
+        lines.push("<= {h.bound[i]}".pad_end(12, " ") + "{h.count[i]}".pad_start(7, " ") + "  " + bar)
+    }
+    if h.overflow > 0 {
+        lines.push("over".pad_end(12, " ") + "{h.overflow}".pad_start(7, " "))
+    }
+    return lines.join("\n")
+}
