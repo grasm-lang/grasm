@@ -1,0 +1,124 @@
+// Primes: a sieve, a test, and a factorisation.
+//
+// Trial division to sqrt(n) is what people write and it is fine to about 10^12.
+// Past that it is hopeless, and the honest thing is to say so rather than to
+// let a caller discover it — `is_prime` here is exact, and `factor` is exact,
+// and both slow down as the square root grows.
+
+/// Every prime below `limit`, by the sieve of Eratosthenes.
+pub fn sieve(limit: i64) -> [i64] {
+    if limit < 3 {
+        return []
+    }
+    var composite: [bool] = []
+    for _i in 0..limit {
+        composite.push(false)
+    }
+    var p = 2
+    while p * p < limit {
+        if not composite[p] {
+            // Start at p*p: everything below it has a smaller factor and was
+            // already struck out.
+            var k = p * p
+            while k < limit {
+                composite[k] = true
+                k = k + p
+            }
+        }
+        p = p + 1
+    }
+    var out: [i64] = []
+    for n in 2..limit {
+        if not composite[n] {
+            out.push(n)
+        }
+    }
+    return out
+}
+
+pub fn is_prime(n: i64) -> bool {
+    if n < 2 {
+        return false
+    }
+    if n < 4 {
+        return true
+    }
+    if n % 2 == 0 {
+        return false
+    }
+    // Only odd divisors, and only to the square root: a factor above it
+    // implies one below it.
+    var d = 3
+    while d * d <= n {
+        if n % d == 0 {
+            return false
+        }
+        d = d + 2
+    }
+    return true
+}
+
+/// Prime factors with multiplicity, ascending: 12 gives [2, 2, 3].
+pub fn factor(n: i64) -> [i64] {
+    var out: [i64] = []
+    var v = n
+    if v < 2 {
+        return out
+    }
+    while v % 2 == 0 {
+        out.push(2)
+        v = v / 2
+    }
+    var d = 3
+    while d * d <= v {
+        while v % d == 0 {
+            out.push(d)
+            v = v / d
+        }
+        d = d + 2
+    }
+    if v > 1 {
+        out.push(v)
+    }
+    return out
+}
+
+/// Distinct prime factors: 12 gives [2, 3].
+pub fn distinct_factors(n: i64) -> [i64] {
+    var out: [i64] = []
+    for p in factor(n) {
+        if out.len() == 0 or out[out.len() - 1] != p {
+            out.push(p)
+        }
+    }
+    return out
+}
+
+pub fn gcd(a: i64, b: i64) -> i64 {
+    var x = if a < 0 { 0 - a } else { a }
+    var y = if b < 0 { 0 - b } else { b }
+    while y != 0 {
+        let t = x % y
+        x = y
+        y = t
+    }
+    return x
+}
+
+pub fn lcm(a: i64, b: i64) -> i64 {
+    if a == 0 or b == 0 {
+        return 0
+    }
+    let g = gcd(a, b)
+    // Divide first: a*b overflows long before lcm does.
+    return (if a < 0 { 0 - a } else { a }) / g * (if b < 0 { 0 - b } else { b })
+}
+
+/// Euler's totient: how many numbers below `n` share no factor with it.
+pub fn totient(n: i64) -> i64 {
+    var result = n
+    for p in distinct_factors(n) {
+        result = result / p * (p - 1)
+    }
+    return result
+}

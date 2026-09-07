@@ -1,0 +1,94 @@
+// Four numeric packages, checked against known values.
+import primes
+import rational
+import adler
+import numfmt
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+
+    print("-- primes")
+    say(f, "sieve below 30", primes.sieve(30) == [2, 3, 5, 7, 11, 13, 17, 19, 23, 29])
+    say(f, "1 is not prime, 2 is", not primes.is_prime(1) and primes.is_prime(2))
+    say(f, "561 is a Carmichael number and NOT prime", not primes.is_prime(561))
+    say(f, "7919 is the 1000th prime", primes.is_prime(7919))
+    say(f, "12 factors as 2*2*3", primes.factor(12) == [2, 2, 3])
+    say(f, "a prime factors as itself", primes.factor(97) == [97])
+    say(f, "distinct drops the repeat", primes.distinct_factors(12) == [2, 3])
+    say(f, "gcd(48,18) is 6", primes.gcd(48, 18) == 6)
+    say(f, "lcm(4,6) is 12", primes.lcm(4, 6) == 12)
+    say(f, "totient(9) is 6", primes.totient(9) == 6)
+    say(f, "totient of a prime is p-1", primes.totient(97) == 96)
+
+    print("-- exact fractions, where f64 is wrong")
+    // 0.1 + 0.2 != 0.3 in binary. As thirds and tenths it is exact.
+    let tenth = rational.frac(1, 10) ?? rational.whole(0)
+    let fifth = rational.frac(2, 10) ?? rational.whole(0)
+    let sum = rational.add(tenth, fifth)
+    say(f, "1/10 + 2/10 is exactly 3/10", rational.render(sum) == "3/10")
+    say(f, "and f64 addition is not", 0.1 + 0.2 != 0.3)
+    match rational.frac(6, 8) {
+        Err(_e) -> say(f, "reduces on construction", false)
+        Ok(r) -> say(f, "reduces on construction", rational.render(r) == "3/4")
+    }
+    match rational.frac(1, 0) {
+        Err(_e) -> say(f, "a zero denominator is refused", true)
+        Ok(_r) -> say(f, "a zero denominator is refused", false)
+    }
+    let third = rational.frac(1, 3) ?? rational.whole(0)
+    var total = rational.whole(0)
+    for _i in 0..3 {
+        total = rational.add(total, third)
+    }
+    say(f, "three thirds are exactly one", rational.render(total) == "1")
+    say(f, "1/3 > 1/4", rational.compare(third, rational.frac(1, 4) ?? rational.whole(0)) > 0)
+    match rational.frac(0 - 2, 0 - 4) {
+        Err(_e) -> say(f, "two negatives make a positive", false)
+        Ok(r) -> say(f, "two negatives make a positive", rational.render(r) == "1/2")
+    }
+
+    print("-- checksums, against known values")
+    // Adler-32 of "Wikipedia" is 0x11E60398 = 300286872.
+    say(f, "adler32 of Wikipedia", adler.adler32("Wikipedia".to_bytes()) == 300286872)
+    say(f, "adler32 of empty is 1", adler.adler32(bytes_of([])) == 1)
+    say(f, "a running sum matches one pass", {
+        let whole = adler.adler32("abcdef".to_bytes())
+        let piece = adler.adler32_update(adler.adler32("abc".to_bytes()), "def".to_bytes())
+        whole == piece
+    })
+    say(f, "fletcher16 of abcde is 0xC8F0", adler.fletcher16("abcde".to_bytes()) == 51440)
+    say(f, "different input, different sum",
+        adler.adler32("a".to_bytes()) != adler.adler32("b".to_bytes()))
+
+    print("-- formatting, and the KB/KiB lie")
+    say(f, "grouped", numfmt.grouped(1234567, ",") == "1,234,567")
+    say(f, "grouped negative", numfmt.grouped(0 - 1234, ",") == "-1,234")
+    say(f, "small stays plain", numfmt.grouped(42, ",") == "42")
+    // 1500 bytes is 1.5 kB and 1.4 KiB — the same bytes, two right answers.
+    say(f, "1500 is 1.5 kB", numfmt.si_bytes(1500) == "1.5 kB")
+    say(f, "1500 is 1.4 KiB", numfmt.binary_bytes(1500) == "1.4 KiB")
+    say(f, "under the base has no suffix", numfmt.si_bytes(999) == "999 B")
+    say(f, "duration in ms", numfmt.duration(430) == "430ms")
+    say(f, "duration in minutes", numfmt.duration(125000) == "2m 5s")
+    // 2.5 and 3.5 both round to even: 2 and 4.
+    say(f, "half-even sends 25 to 2", numfmt.round_half_even(25, 1) == 2)
+    say(f, "half-even sends 35 to 4", numfmt.round_half_even(35, 1) == 4)
+    say(f, "half-up sends 25 to 3", numfmt.round_half_up(25, 1) == 3)
+    say(f, "percent", numfmt.percent(1, 3) == "33.3%")
+
+    print("")
+    if f == 0 {
+        print("all held")
+    } else {
+        print("{f} failed")
+    }
+}

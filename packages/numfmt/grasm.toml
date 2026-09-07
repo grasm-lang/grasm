@@ -1,0 +1,6 @@
+[package]
+name = "numfmt"
+version = "1.0.0"
+
+# Formatting numbers. Opens nothing.
+capabilities = []

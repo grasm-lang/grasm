@@ -1,0 +1,121 @@
+// Numbers as a person reads them.
+//
+// Two rules that are usually wrong. **Byte sizes**: 1 KB is 1000 bytes and
+// 1 KiB is 1024, and a program that prints "KB" while dividing by 1024 is
+// lying by 2.4% and by 10% at terabytes. Both are here, named apart.
+// **Rounding**: half-up and half-even give different answers on exactly the
+// values that appear in money, and the one banks use is half-even.
+
+fn digits_of(n: i64) -> str {
+    return "{n}"
+}
+
+/// Thousands separated: 1234567 becomes "1,234,567".
+pub fn grouped(n: i64, sep: str) -> str {
+    let neg = n < 0
+    let text = digits_of(if neg { 0 - n } else { n })
+    var out = ""
+    let cs = text.chars()
+    for i in 0..cs.len() {
+        if i > 0 and (cs.len() - i) % 3 == 0 {
+            out = out + sep
+        }
+        out = out + cs[i]
+    }
+    if neg {
+        return "-" + out
+    }
+    return out
+}
+
+/// SI bytes: powers of 1000, suffixed kB, MB, GB.
+pub fn si_bytes(n: i64) -> str {
+    return scaled(n, 1000, ["B", "kB", "MB", "GB", "TB", "PB"])
+}
+
+/// Binary bytes: powers of 1024, suffixed KiB, MiB, GiB. What a filesystem
+/// means when it says "1 K".
+pub fn binary_bytes(n: i64) -> str {
+    return scaled(n, 1024, ["B", "KiB", "MiB", "GiB", "TiB", "PiB"])
+}
+
+fn scaled(n: i64, base: i64, units: [str]) -> str {
+    if n < base {
+        return "{n} {units[0]}"
+    }
+    var v = n
+    var unit = 0
+    while v >= base * base and unit < units.len() - 2 {
+        v = v / base
+        unit = unit + 1
+    }
+    // One decimal place, computed in integers so no f64 rounding creeps in.
+    let whole = v / base
+    let tenths = (v % base) * 10 / base
+    return "{whole}.{tenths} {units[unit + 1]}"
+}
+
+/// A duration in milliseconds, as the largest sensible unit.
+pub fn duration(ms: i64) -> str {
+    if ms < 1000 {
+        return "{ms}ms"
+    }
+    if ms < 60000 {
+        return "{ms / 1000}.{(ms % 1000) / 100}s"
+    }
+    if ms < 3600000 {
+        return "{ms / 60000}m {(ms % 60000) / 1000}s"
+    }
+    return "{ms / 3600000}h {(ms % 3600000) / 60000}m"
+}
+
+/// Round `value / 10^places` half to even — the rule that does not drift
+/// upward over many roundings, which is why money uses it.
+pub fn round_half_even(value: i64, places: i64) -> i64 {
+    var scale = 1
+    for _i in 0..places {
+        scale = scale * 10
+    }
+    if scale == 1 {
+        return value
+    }
+    let neg = value < 0
+    let v = if neg { 0 - value } else { value }
+    let whole = v / scale
+    let rest = v % scale
+    let half = scale / 2
+    var up = false
+    if rest > half {
+        up = true
+    }
+    if rest == half and whole % 2 == 1 {
+        // Exactly half goes to the even neighbour.
+        up = true
+    }
+    let result = if up { whole + 1 } else { whole }
+    return if neg { 0 - result } else { result }
+}
+
+/// Half away from zero: what most people mean by "round".
+pub fn round_half_up(value: i64, places: i64) -> i64 {
+    var scale = 1
+    for _i in 0..places {
+        scale = scale * 10
+    }
+    if scale == 1 {
+        return value
+    }
+    let neg = value < 0
+    let v = if neg { 0 - value } else { value }
+    let result = (v + scale / 2) / scale
+    return if neg { 0 - result } else { result }
+}
+
+/// A percentage from a ratio, to one decimal place.
+pub fn percent(part: i64, whole: i64) -> str {
+    if whole == 0 {
+        return "0.0%"
+    }
+    let tenths = part * 1000 / whole
+    return "{tenths / 10}.{tenths % 10}%"
+}

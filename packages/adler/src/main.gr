@@ -1,0 +1,63 @@
+// Adler-32 and Fletcher-32: two checksums that are not CRCs.
+//
+// Both are far weaker than a CRC at catching bit errors, and both are much
+// cheaper — no table, no polynomial, two running sums. That trade is why zlib
+// puts an Adler-32 at the end of every stream: the compressed data already has
+// stronger integrity, and this catches a truncated or transposed stream for
+// almost nothing.
+//
+// Adler-32's known weakness is short inputs: for a few bytes the sums barely
+// move and collisions are easy. It is a stream check, not a hash, and calling
+// it one is how it gets misused.
+
+fn modulus() -> i64 {
+    return 65521
+}
+
+pub fn adler32(b: bytes) -> i64 {
+    var a = 1
+    var s = 0
+    for i in 0..b.len() {
+        a = (a + b.at(i)) % modulus()
+        s = (s + a) % modulus()
+    }
+    return s * 65536 + a
+}
+
+/// Continue a running sum, for data arriving in pieces.
+pub fn adler32_update(previous: i64, b: bytes) -> i64 {
+    var a = previous % 65536
+    var s = previous / 65536
+    for i in 0..b.len() {
+        a = (a + b.at(i)) % modulus()
+        s = (s + a) % modulus()
+    }
+    return s * 65536 + a
+}
+
+/// Fletcher-32 over 16-bit words, zero-padded to an even length.
+pub fn fletcher32(b: bytes) -> i64 {
+    var sum1 = 0
+    var sum2 = 0
+    var i = 0
+    while i < b.len() {
+        let lo = b.at(i)
+        let hi = if i + 1 < b.len() { b.at(i + 1) } else { 0 }
+        let word = lo + hi * 256
+        sum1 = (sum1 + word) % 65535
+        sum2 = (sum2 + sum1) % 65535
+        i = i + 2
+    }
+    return sum2 * 65536 + sum1
+}
+
+/// Fletcher-16, which is what a small embedded frame usually carries.
+pub fn fletcher16(b: bytes) -> i64 {
+    var sum1 = 0
+    var sum2 = 0
+    for i in 0..b.len() {
+        sum1 = (sum1 + b.at(i)) % 255
+        sum2 = (sum2 + sum1) % 255
+    }
+    return sum2 * 256 + sum1
+}

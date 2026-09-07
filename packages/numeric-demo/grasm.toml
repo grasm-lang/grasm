@@ -1,0 +1,20 @@
+[package]
+name = "numeric_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.primes]
+path = "../primes"
+version = "^1.0.0"
+
+[dependencies.rational]
+path = "../rational"
+version = "^1.0.0"
+
+[dependencies.adler]
+path = "../adler"
+version = "^1.0.0"
+
+[dependencies.numfmt]
+path = "../numfmt"
+version = "^1.0.0"

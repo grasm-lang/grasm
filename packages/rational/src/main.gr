@@ -1,0 +1,112 @@
+// Exact fractions.
+//
+// The reason to have them: 0.1 + 0.2 is not 0.3 in binary floating point, and
+// for money, tax and anything that has to add up on a printed page that is not
+// a rounding detail, it is a wrong number. One third of a penny exists here and
+// does not exist in an f64.
+//
+// Every result is reduced immediately. Deferring it means the denominators
+// grow until they overflow, and the overflow is silent.
+
+type Frac = {
+    num: i64,
+    den: i64,
+}
+
+type RationalError = | DivideByZero
+
+fn gcd_of(a: i64, b: i64) -> i64 {
+    var x = if a < 0 { 0 - a } else { a }
+    var y = if b < 0 { 0 - b } else { b }
+    while y != 0 {
+        let t = x % y
+        x = y
+        y = t
+    }
+    if x == 0 {
+        return 1
+    }
+    return x
+}
+
+/// A fraction in lowest terms, with the sign on the numerator.
+pub fn frac(num: i64, den: i64) -> Frac ! RationalError {
+    if den == 0 {
+        fail(DivideByZero)
+    }
+    var n = num
+    var d = den
+    if d < 0 {
+        n = 0 - n
+        d = 0 - d
+    }
+    let g = gcd_of(n, d)
+    return Frac{ num: n / g, den: d / g }
+}
+
+pub fn whole(n: i64) -> Frac {
+    return Frac{ num: n, den: 1 }
+}
+
+pub fn add(a: Frac, b: Frac) -> Frac {
+    return reduce(Frac{ num: a.num * b.den + b.num * a.den, den: a.den * b.den })
+}
+
+pub fn sub(a: Frac, b: Frac) -> Frac {
+    return reduce(Frac{ num: a.num * b.den - b.num * a.den, den: a.den * b.den })
+}
+
+pub fn mul(a: Frac, b: Frac) -> Frac {
+    return reduce(Frac{ num: a.num * b.num, den: a.den * b.den })
+}
+
+pub fn div(a: Frac, b: Frac) -> Frac ! RationalError {
+    if b.num == 0 {
+        fail(DivideByZero)
+    }
+    return reduce(Frac{ num: a.num * b.den, den: a.den * b.num })
+}
+
+fn reduce(f: Frac) -> Frac {
+    var n = f.num
+    var d = f.den
+    if d < 0 {
+        n = 0 - n
+        d = 0 - d
+    }
+    let g = gcd_of(n, d)
+    return Frac{ num: n / g, den: d / g }
+}
+
+/// -1, 0 or 1. Cross-multiplied rather than converted to f64, which is the
+/// whole point of the type.
+pub fn compare(a: Frac, b: Frac) -> i64 {
+    let left = a.num * b.den
+    let right = b.num * a.den
+    if left < right {
+        return 0 - 1
+    }
+    if left > right {
+        return 1
+    }
+    return 0
+}
+
+pub fn equals(a: Frac, b: Frac) -> bool {
+    return compare(a, b) == 0
+}
+
+pub fn as_f64(f: Frac) -> f64 {
+    return f.num.as_f64() / f.den.as_f64()
+}
+
+pub fn render(f: Frac) -> str {
+    if f.den == 1 {
+        return "{f.num}"
+    }
+    return "{f.num}/{f.den}"
+}
+
+pub fn is_whole(f: Frac) -> bool {
+    return f.den == 1
+}
