@@ -3231,6 +3231,11 @@ unsafe fn val_eq(a: *mut RtVal, b: *mut RtVal) -> bool {
         (RtPayload::F64(x), RtPayload::F64(y)) => x == y,
         (RtPayload::Bool(x), RtPayload::Bool(y)) => x == y,
         (RtPayload::Str(x), RtPayload::Str(y)) => x == y,
+        // Two runs of bytes are equal when they hold the same bytes. Missing
+        // this arm made `b == b` false for every `bytes` value, in both
+        // engines at once ([E-EQ-STRUCTURAL]) -- so the two agreed, and the
+        // agreement gates could not see it.
+        (RtPayload::Bytes(x), RtPayload::Bytes(y)) => x == y,
         // Two function values are the same function when they run the same
         // code over the same captures. Falling through to "not equal" made
         // `dbl == dbl` false and `assert_eq(dbl, dbl)` fail — the one type

@@ -481,6 +481,66 @@ def main():
             print("([T-MODULE-NS]). Prefix one of them.")
             holes.extend(collisions)
 
+        # --- one variant name, two payload types -------------------------
+        #
+        # Two packages may each declare a variant called `Bad`, and the
+        # checker resolves a bare `Bad` to the one declared where it is
+        # written (F88, F91). The native backend kept a single program-wide
+        # variant-name index instead, so whichever package was registered last
+        # won everywhere -- and when the two payloads had different types, it
+        # boxed an `f64` with the integer constructor and Cranelift's verifier
+        # rejected the function (F95).
+        #
+        # The interpreter got this right, so `grasm run` alone could not see
+        # it. Every engine is built here for that reason.
+        variant = 0
+        GUARD = {"i64": "v < 0", "f64": "v < 0.0", "str": 'v == "\\u{1}"'}
+        for a_ty, b_ty, a_val, b_val in (
+            ("i64", "f64", "1", "2.0"),
+            ("f64", "i64", "1.0", "2"),
+            ("str", "i64", '"x"', "2"),
+        ):
+            shutil.rmtree(work, ignore_errors=True)
+            write(work, "a", [],
+                  f"type AErr = | Bad(value: {a_ty})\n\n"
+                  f"pub fn go(v: {a_ty}) -> {a_ty} ! AErr {{\n"
+                  # A real guard, not `if false`: the point is that the `fail`
+                  # path is compiled, and a constant condition invites a
+                  # backend to drop it.
+                  f"    if {GUARD[a_ty]} {{\n        fail(Bad(v))\n    }}\n"
+                  f"    return v\n}}\n", [])
+            write(work, "b", [],
+                  f"type BErr = | Bad(value: {b_ty})\n\n"
+                  f"pub fn go(v: {b_ty}) -> {b_ty} ! BErr {{\n"
+                  f"    if {GUARD[b_ty]} {{\n        fail(Bad(v))\n    }}\n"
+                  f"    return v\n}}\n", [])
+            write(work, "app", ["a", "b"],
+                  "import a\nimport b\n\nfn main() {\n"
+                  f'    print("{{a.go({a_val}) ?? {a_val}}} {{b.go({b_val}) ?? {b_val}}}")\n}}\n',
+                  ["io"])
+            src = os.path.join(work, "app", "src", "main.gr")
+            variant += 1
+            rc, out, err = run([GRASM, "run", src])
+            if rc != 0:
+                holes.append(f"variant/{a_ty}/{b_ty}/interpreter")
+                print(f"VARIANT refused by the interpreter ({a_ty} vs {b_ty}):\n{err or out}")
+                continue
+            for flags, label in (
+                (["--native"], "native"),
+                ([], "bundle"),
+            ):
+                exe = os.path.join(work, "out-" + label)
+                rc2, o2, e2 = run([GRASM, "build", src] + flags + ["-o", exe])
+                if rc2 != 0:
+                    holes.append(f"variant/{a_ty}/{b_ty}/{label}")
+                    print(f"VARIANT will not build {label} ({a_ty} vs {b_ty}):\n{e2 or o2}")
+                    continue
+                rc3, o3, e3 = run([exe])
+                if rc3 != 0 or o3 != out:
+                    holes.append(f"variant/{a_ty}/{b_ty}/{label}/answer")
+                    print(f"VARIANT disagrees ({a_ty} vs {b_ty}, {label})\n"
+                          f"  interpreter: {out}\n  {label}: {o3} {e3}")
+
         # --- the ceiling ------------------------------------------------
         #
         # Both directions. A checker that refuses every package satisfies the
@@ -527,6 +587,7 @@ def main():
             f"refused: {len(refused)}   wrong: {len(wrong)}   leaked: {len(leaks)}   "
             f"ceiling cases: {ceiling}   namespace cases: {namespace}   "
             f"package types: {len(declared)}   shadow cases: {shadow}   "
+            f"variant cases: {variant}   "
             f"holes: {len(holes)}"
         )
     finally:

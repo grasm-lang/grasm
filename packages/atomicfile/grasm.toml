@@ -1,0 +1,6 @@
+[package]
+name = "atomicfile"
+version = "1.0.0"
+
+# Writes a file or leaves the old one. Touches the disk.
+capabilities = ["io"]

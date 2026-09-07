@@ -1,0 +1,206 @@
+// Stopping in an order, with a deadline.
+//
+// "Graceful shutdown" is four things a program has to do in sequence, and the
+// order is the whole content:
+//
+//   1. **Stop accepting** new work, so the queue can only shrink.
+//   2. **Drain** what is in flight, up to a deadline.
+//   3. **Close** what the work needed — connections, files, flushes — from
+//      the outside in, so nothing is closed while something still uses it.
+//   4. **Exit**, and say whether the drain finished or the deadline did.
+//
+// Getting them out of order produces failures that look like something else.
+// Closing the database before draining turns in-flight requests into errors
+// the client sees as a crash. Draining without refusing new work never
+// finishes under load. Exiting on the deadline without saying so makes lost
+// work look like a bug somewhere else.
+//
+// Hooks run in reverse registration order, the way a stack unwinds: a thing
+// registered later was built on top of something registered earlier, so it has
+// to come down first.
+
+type ShutdownHook = {
+    name: str,
+    /// Lower runs earlier within a phase; ties keep reverse registration order.
+    phase: i64,
+    run: fn() -> bool,
+}
+
+type ShutdownReport = {
+    /// Names of hooks that ran and said they finished.
+    completed: [str],
+    /// Names that ran and reported failure.
+    failed: [str],
+    /// Names never reached, because the deadline passed first.
+    skipped: [str],
+    /// How long the whole sequence took, in milliseconds.
+    elapsed_millis: i64,
+    /// Whether it finished before the deadline.
+    in_time: bool,
+    /// Units of work still in flight when it stopped.
+    left_in_flight: i64,
+}
+
+type Shutdown = {
+    hook: [ShutdownHook],
+    accepting: bool,
+    in_flight: i64,
+    /// Set once, by the first thing to ask for a stop.
+    reason: str,
+    started_at: i64,
+}
+
+pub let PHASE_STOP_ACCEPTING = 0
+pub let PHASE_DRAIN = 10
+pub let PHASE_CLOSE = 20
+pub let PHASE_FLUSH = 30
+
+pub fn new_shutdown() -> Shutdown {
+    return Shutdown{
+        hook: [], accepting: true, in_flight: 0, reason: "", started_at: 0,
+    }
+}
+
+pub fn on(inout s: Shutdown, name: str, phase: i64, run: fn() -> bool) {
+    s.hook.push(ShutdownHook{ name: name, phase: phase, run: run })
+}
+
+/// Take a unit of work, or refuse it because shutdown has begun.
+///
+/// The refusal is the first step and the one most often left out: without it
+/// the drain below races the arrival of new work and may never end.
+pub fn accept(inout s: Shutdown) -> bool {
+    if not s.accepting {
+        return false
+    }
+    s.in_flight = s.in_flight + 1
+    return true
+}
+
+pub fn finish_one(inout s: Shutdown) {
+    if s.in_flight > 0 {
+        s.in_flight = s.in_flight - 1
+    }
+}
+
+pub fn in_flight(s: Shutdown) -> i64 {
+    return s.in_flight
+}
+
+pub fn is_accepting(s: Shutdown) -> bool {
+    return s.accepting
+}
+
+/// Ask for a stop. The first reason wins — a second signal while shutting
+/// down is not a new reason, it is impatience.
+pub fn begin(inout s: Shutdown, reason: str, now_millis: i64) -> bool {
+    if not s.accepting {
+        return false
+    }
+    s.accepting = false
+    s.reason = reason
+    s.started_at = now_millis
+    return true
+}
+
+pub fn reason(s: Shutdown) -> str {
+    return s.reason
+}
+
+pub fn is_stopping(s: Shutdown) -> bool {
+    return not s.accepting
+}
+
+/// Whether the drain is done — no work left in flight.
+pub fn drained(s: Shutdown) -> bool {
+    return s.in_flight == 0
+}
+
+fn ordered(s: Shutdown) -> [ShutdownHook] {
+    // Later registrations first within a phase, earlier phases first overall.
+    var out: [ShutdownHook] = []
+    var i = s.hook.len() - 1
+    while i >= 0 {
+        out.push(s.hook[i])
+        i = i - 1
+    }
+    out.sort_by(|h| h.phase)
+    return out
+}
+
+/// The hooks in the order they will run — worth being able to print before
+/// trusting it in production.
+pub fn plan(s: Shutdown) -> [str] {
+    var out: [str] = []
+    for h in ordered(s) {
+        out.push("{h.phase}: {h.name}")
+    }
+    return out
+}
+
+/// Run every hook until they are done or the deadline passes.
+///
+/// `now` is asked between hooks rather than during one: a hook that overruns
+/// on its own is not interruptible from here, and pretending otherwise would
+/// report a deadline that was not enforced.
+pub fn run(inout s: Shutdown, now: fn() -> i64, deadline_millis: i64) -> ShutdownReport {
+    var completed: [str] = []
+    var failed: [str] = []
+    var skipped: [str] = []
+    var ran_out = false
+    for h in ordered(s) {
+        if ran_out {
+            skipped.push(h.name)
+            continue
+        }
+        if now() >= deadline_millis {
+            ran_out = true
+            skipped.push(h.name)
+            continue
+        }
+        if h.run() {
+            completed.push(h.name)
+        } else {
+            failed.push(h.name)
+        }
+    }
+    let ended = now()
+    return ShutdownReport{
+        completed: completed, failed: failed, skipped: skipped,
+        elapsed_millis: ended - s.started_at,
+        in_time: not ran_out and ended < deadline_millis,
+        left_in_flight: s.in_flight,
+    }
+}
+
+/// The exit code this shutdown earned.
+///
+/// Zero only when everything ran, nothing failed and nothing was left in
+/// flight. A process that exits 0 having dropped work is a process whose
+/// supervisor will never know.
+pub fn exit_code(r: ShutdownReport) -> i64 {
+    if r.failed.len() > 0 {
+        return 1
+    }
+    if r.skipped.len() > 0 or not r.in_time {
+        return 2
+    }
+    if r.left_in_flight > 0 {
+        return 3
+    }
+    return 0
+}
+
+pub fn summary(r: ShutdownReport) -> str {
+    let done = r.completed.len()
+    let bad = r.failed.len()
+    let missed = r.skipped.len()
+    var out = "{done} completed, {bad} failed, {missed} skipped in {r.elapsed_millis}ms"
+    if r.left_in_flight > 0 {
+        out = out + ", {r.left_in_flight} still in flight"
+    }
+    if not r.in_time {
+        out = out + " (deadline passed)"
+    }
+    return out
+}

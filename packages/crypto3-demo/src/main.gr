@@ -1,0 +1,263 @@
+import sha512
+import sha3
+import scrypt
+import hotp
+import nonce
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn check_sha512(inout f: i64) / {io} {
+    print("-- sha512: 64-bit words in a language whose addition traps")
+    // FIPS 180-4's own vectors.
+    say(f, "the empty message", sha512.sha512_hex("".to_bytes()) ==
+        "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce" +
+        "47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e")
+    say(f, "\"abc\"", sha512.sha512_hex("abc".to_bytes()) ==
+        "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a" +
+        "2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f")
+    // 112 characters: two blocks, which is where a wrong padding rule shows.
+    say(f, "a message spanning two blocks",
+        sha512.sha512_hex(("abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmn" +
+            "hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu").to_bytes()) ==
+        "8e959b75dae313da8cf4f72814fc143f8f7779c6eb9f7fa17299aeadb6889018" +
+        "501d289e4900f7e4331b99dec4b5433ac7d329eeb6dd26545e96e55b874be909")
+    // Long enough that the length field, the padding block and the loop
+    // over blocks all have to be right; short enough that the demo runs
+    // under four engines without anyone waiting.
+    say(f, "ten thousand a's", sha512.sha512_hex("a".repeat(10000).to_bytes()) ==
+        "0593036f4f479d2eb8078ca26b1d59321a86bdfcb04cb40043694f1eb0301b8a" +
+        "cd20b936db3c916ebcc1b609400ffcf3fa8d569d7e39293855668645094baf0e")
+    say(f, "sha-384 of \"abc\"", sha512.sha384_hex("abc".to_bytes()) ==
+        "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed" +
+        "8086072ba1e7cc2358baeca134c825a7")
+    say(f, "sha-512/256 of \"abc\"", sha512.sha512_256_hex("abc".to_bytes()) ==
+        "53048e2681941ef99b2e29b76b4c7dabe4c2d0c634fc6d46e0e2f13107e7af23")
+    say(f, "the truncated forms are not prefixes of the long one",
+        not sha512.sha512_hex("abc".to_bytes()).starts_with(
+            sha512.sha512_256_hex("abc".to_bytes())))
+    say(f, "sha-512 is 64 bytes", sha512.sha512("abc".to_bytes()).len() == 64)
+    say(f, "sha-384 is 48", sha512.sha384("abc".to_bytes()).len() == 48)
+    say(f, "hmac-sha-512 uses a 128-byte block, not 64",
+        sha512.hmac_sha512_hex("key".to_bytes(),
+            "The quick brown fox jumps over the lazy dog".to_bytes()) ==
+        "b42af09057bac1e2d41708e48a902e09b5ff7f12ab428a4fe86653c73dd248fb" +
+        "82f948a549f7b791a5b41915ee4d1ec3935357e4e2317250d0372afa2ebeeb3a")
+    say(f, "a key longer than the block is hashed first",
+        sha512.hmac_sha512("k".repeat(200).to_bytes(), "x".to_bytes()).len() == 64)
+}
+
+fn check_sha3(inout f: i64) / {io} {
+    print("-- sha3: a sponge, and the padding byte that separates the family")
+    say(f, "sha3-256 of the empty message", sha3.sha3_256_hex("".to_bytes()) ==
+        "a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a")
+    say(f, "sha3-256 of \"abc\"", sha3.sha3_256_hex("abc".to_bytes()) ==
+        "3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532")
+    say(f, "sha3-512 of \"abc\"", sha3.sha3_512_hex("abc".to_bytes()) ==
+        "b751850b1a57168a5693cd924b6b096e08f621827444f70d884f5d0240d2712e" +
+        "10e116e9192af3c91a7ec57647e3934057340b4cf408d5a56592f8274eec53f0")
+    say(f, "sha3-224 of \"abc\"", sha3.hex(sha3.sha3_224("abc".to_bytes())) ==
+        "e642824c3f8cf24ad09234ee7d3c766fc9a3a5168d0c94ad73b46fdf")
+    say(f, "sha3-384 of \"abc\"", sha3.hex(sha3.sha3_384("abc".to_bytes())) ==
+        "ec01498288516fc926459f58e2c6ad8df9b473cb0fc08c2596da7cf0e49be4b2" +
+        "98d88cea927ac7f539f1edf228376d25")
+    // The extendable output is the half SHA-2 cannot do at all.
+    say(f, "shake128 gives 32 bytes when asked for 32",
+        sha3.hex(sha3.shake128("abc".to_bytes(), 32)) ==
+        "5881092dd818bf5cf8a3ddb793fbcba74097d5c526a6d35f97b83351940f2cc8")
+    say(f, "and the same bytes again when asked for 300",
+        sha3.hex(sha3.shake128("abc".to_bytes(), 300)).starts_with(
+            sha3.hex(sha3.shake128("abc".to_bytes(), 32))))
+    say(f, "which is 600 hex characters",
+        sha3.hex(sha3.shake128("abc".to_bytes(), 300)).len() == 600)
+    say(f, "shake256 of \"abc\", 64 bytes",
+        sha3.shake256_hex("abc".to_bytes(), 64) ==
+        "483366601360a8771c6863080cc4114d8db44530f8f1e1ee4f94ea37e78b5739" +
+        "d5a15bef186a5386c75744c0527e1faa9f8726e462a12a4feb06bd8801e751e4")
+    // The single padding byte is the whole difference, and mistaking one
+    // function for the other has cost real money.
+    say(f, "keccak256 of the empty message is Ethereum's constant",
+        sha3.keccak256_hex("".to_bytes()) ==
+        "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470")
+    say(f, "and is not sha3-256 of the same message",
+        sha3.keccak256_hex("abc".to_bytes()) != sha3.sha3_256_hex("abc".to_bytes()))
+    say(f, "the rate falls as the digest grows", sha3.rate_for(32) == 136 and
+        sha3.rate_for(64) == 72)
+}
+
+fn check_scrypt(inout f: i64) / {io} {
+    print("-- scrypt: cost that memory pays, not just time")
+    let empty = "".to_bytes()
+    // RFC 7914 section 12, the first test vector.
+    say(f, "RFC 7914's first vector",
+        scrypt.hex(scrypt.derive(empty, empty, 16, 1, 1, 64) ?? empty) ==
+        "77d6576238657b203b19ca42c18a0497f16b4844e3074ae8dfdffa3fede21442" +
+        "fcd0069ded0948f8326a753a0fc81f17e8d3e0fb2e0d3628cf35e20c38d18906")
+    say(f, "a larger N gives a different answer",
+        scrypt.hex(scrypt.derive("password".to_bytes(), "salt".to_bytes(),
+            256, 1, 1, 32) ?? empty) ==
+        "e904d229d6d0cc938b785e490f0cbb7e7f0bd69d9f7cad7a3b7c7a3530051d76")
+    say(f, "and so does a larger r",
+        scrypt.hex(scrypt.derive("password".to_bytes(), "salt".to_bytes(),
+            256, 2, 1, 32) ?? empty) ==
+        "68679507fcb691fb97856332a92adfe148d6091304cb9c5203c516e716f35a75")
+    say(f, "r=8 matches too",
+        scrypt.hex(scrypt.derive("pleaseletmein".to_bytes(),
+            "SodiumChloride".to_bytes(), 64, 8, 1, 64) ?? empty) ==
+        "3c973d2ea1548c98d53d86cd6bfcf1df0f107c29fda03ee87f11615b4f9fc5f0" +
+        "cd38baf1d631471d5cc88be3e14c5be179cd506323ccbd119611f6c82e895130")
+    match scrypt.derive(empty, empty, 15, 1, 1, 32) {
+        Ok(_v) -> say(f, "an N that is not a power of two is refused", false)
+        Err(_e) -> say(f, "an N that is not a power of two is refused", true)
+    }
+    match scrypt.derive(empty, empty, 1, 1, 1, 32) {
+        Ok(_v) -> say(f, "and so is N = 1", false)
+        Err(_e) -> say(f, "and so is N = 1", true)
+    }
+    say(f, "is_valid_cost agrees before the work starts",
+        scrypt.is_valid_cost(16384) and not scrypt.is_valid_cost(10000))
+    say(f, "the recommended parameters cost 16 MB a guess",
+        scrypt.memory_bytes(scrypt.interactive_cost(), 8) == 16777216)
+    let want = scrypt.derive(empty, empty, 16, 1, 1, 64) ?? empty
+    say(f, "verification accepts the right password",
+        scrypt.verify(empty, empty, 16, 1, 1, want))
+    say(f, "and refuses a wrong one",
+        not scrypt.verify("x".to_bytes(), empty, 16, 1, 1, want))
+}
+
+fn check_totp(inout f: i64) / {io} {
+    print("-- totp: the six digits, and the clock they come from")
+    // RFC 4226 appendix D uses this exact secret.
+    let secret = "12345678901234567890".to_bytes()
+    say(f, "HOTP counter 0 is 755224", hotp.hotp(secret, 0, 6) == "755224")
+    say(f, "counter 5 is 254676", hotp.hotp(secret, 5, 6) == "254676")
+    say(f, "counter 9 is 520489", hotp.hotp(secret, 9, 6) == "520489")
+    // RFC 6238 appendix B, all three MACs.
+    say(f, "TOTP at t=59 with SHA-1 is 94287082",
+        (hotp.totp_with(hotp.SHA1, secret, 59, 30, 8) ?? "?") == "94287082")
+    let s256 = "12345678901234567890123456789012".to_bytes()
+    say(f, "with SHA-256 it is 46119246",
+        (hotp.totp_with(hotp.SHA256, s256, 59, 30, 8) ?? "?") == "46119246")
+    let s512 = ("12345678901234567890123456789012" +
+        "34567890123456789012345678901234").to_bytes()
+    say(f, "with SHA-512 it is 90693936",
+        (hotp.totp_with(hotp.SHA512, s512, 59, 30, 8) ?? "?") == "90693936")
+    say(f, "and at t=20000000000 it is 65353130",
+        (hotp.totp_with(hotp.SHA1, secret, 20000000000, 30, 8) ?? "?") == "65353130")
+    // Flooring, not rounding: everything inside one step is one code.
+    say(f, "the step floors the clock", hotp.step_of(59, 30) == 1 and
+        hotp.step_of(89, 30) == 2)
+    say(f, "so every second in a window gives the same code",
+        hotp.totp(secret, 60, 30, 6) == hotp.totp(secret, 89, 30, 6))
+    say(f, "and the next second gives a different one",
+        hotp.totp(secret, 89, 30, 6) != hotp.totp(secret, 90, 30, 6))
+    say(f, "seconds_left counts down inside the window",
+        hotp.seconds_left(65, 30) == 25)
+    let code = hotp.totp(secret, 1234567890, 30, 6)
+    say(f, "a current code verifies", hotp.verify(secret, code, 1234567890, 30, 1))
+    say(f, "a code one step old still verifies inside the drift window",
+        hotp.verify(secret, code, 1234567890 + 30, 30, 1))
+    say(f, "one three steps old does not",
+        not hotp.verify(secret, code, 1234567890 + 90, 30, 1))
+    say(f, "verification says which step matched, so a replay can be refused",
+        hotp.verify_at(hotp.SHA1, secret, code, 1234567890, 30, 6, 1) == 41152263)
+    match hotp.hotp_with(hotp.SHA1, secret, 0, 4) {
+        Ok(_v) -> say(f, "fewer than six digits is refused", false)
+        Err(_e) -> say(f, "fewer than six digits is refused", true)
+    }
+    say(f, "the secret round-trips through base32",
+        (hotp.decode_secret(hotp.encode_secret(secret)) ?? "".to_bytes()) == secret)
+    say(f, "the provisioning URI names the algorithm",
+        hotp.provisioning_uri("Ex", "a", secret, hotp.SHA1, 6, 30).contains("algorithm=SHA1"))
+}
+
+fn check_nonce(inout f: i64) / {io} {
+    print("-- nonce: the number you must never use twice")
+    var c = nonce.new_aead_counter("abcd".to_bytes())
+    let first = nonce.next(c) ?? "".to_bytes()
+    let second = nonce.next(c) ?? "".to_bytes()
+    say(f, "an AEAD nonce is twelve bytes", first.len() == 12)
+    say(f, "the prefix is kept", nonce.hex(first).starts_with("61626364"))
+    say(f, "and the counter moves", nonce.hex(first) != nonce.hex(second))
+    say(f, "by exactly one", nonce.hex(second).ends_with("01"))
+    say(f, "the counter says how many it has issued", nonce.issued(c) == 2)
+    // A counter that wraps produces a repeat, so it stops instead.
+    var tiny = nonce.new_counter("abc".to_bytes(), 4)
+    var made = 0
+    var stopped = false
+    while made < 300 and not stopped {
+        match nonce.next(tiny) {
+            Ok(_v) -> made = made + 1
+            Err(_e) -> stopped = true
+        }
+    }
+    say(f, "one byte of counter gives 256 nonces", made == 256)
+    say(f, "and then fails rather than wrapping", stopped)
+    // The birthday bound, which is much smaller than people expect.
+    say(f, "96 random bits are safe for about 4 * 10^11 messages",
+        nonce.safe_random_count(96, 1000000) == 398065729532)
+    say(f, "which is far short of 2^96", nonce.safe_random_count(96, 1000000) <
+        nonce.safe_random_count(128, 1000000))
+    say(f, "64 bits run out at six million", nonce.safe_random_count(64, 1000000) == 6074000)
+    say(f, "so ten million 64-bit nonces is past the bound",
+        not nonce.random_is_safe(64, 10000000, 1000000))
+    say(f, "and ten million 128-bit ones is not",
+        nonce.random_is_safe(128, 10000000, 1000000))
+    // Deterministic derivation, for signing without a random source.
+    let d1 = nonce.derive("key".to_bytes(), "message".to_bytes(), 12)
+    let d2 = nonce.derive("key".to_bytes(), "message".to_bytes(), 12)
+    let d3 = nonce.derive("key".to_bytes(), "other".to_bytes(), 12)
+    say(f, "a derived nonce repeats for the same message", nonce.equal(d1, d2))
+    say(f, "and differs for another", not nonce.equal(d1, d3))
+    say(f, "and comes out the length asked for", d1.len() == 12)
+    say(f, "longer than one MAC still works", nonce.derive(
+        "key".to_bytes(), "m".to_bytes(), 100).len() == 100)
+    // An extended nonce is safe to pick at random because 192 bits is.
+    let long = nonce.derive("k".to_bytes(), "m".to_bytes(), 24)
+    let split = nonce.split_extended(long) ?? ("".to_bytes(), "".to_bytes())
+    say(f, "a 24-byte nonce splits into 16 and 12", split.0.len() == 16 and
+        split.1.len() == 12)
+    say(f, "with four zero bytes ahead of the tail",
+        nonce.hex(split.1).starts_with("00000000"))
+    match nonce.split_extended("short".to_bytes()) {
+        Ok(_v) -> say(f, "a nonce of the wrong length is refused", false)
+        Err(_e) -> say(f, "a nonce of the wrong length is refused", true)
+    }
+    // And the log that refuses a repeat rather than hoping for none.
+    var log = nonce.new_log(4)
+    say(f, "a fresh nonce is recorded", nonce.record(log, first) ?? false)
+    match nonce.record(log, first) {
+        Ok(_v) -> say(f, "the same one twice is refused", false)
+        Err(_e) -> say(f, "the same one twice is refused", true)
+    }
+    say(f, "and the refusal is counted", nonce.refused_count(log) == 1)
+    say(f, "the log is complete while nothing has fallen out", nonce.is_complete(log))
+    for i in 0..6 {
+        let v = nonce.derive("k".to_bytes(), "{i}".to_bytes(), 12)
+        let _ok = nonce.record(log, v) ?? false
+    }
+    say(f, "past its capacity it forgets", not nonce.is_complete(log))
+    say(f, "and says so rather than answering \"not seen\"", nonce.held(log) == 4)
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_sha512(f)
+    check_sha3(f)
+    check_scrypt(f)
+    check_totp(f)
+    check_nonce(f)
+
+    if f == 0 {
+        print("crypto III: every claim held")
+    } else {
+        print("crypto III: {f} failed")
+    }
+}

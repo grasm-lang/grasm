@@ -14,7 +14,7 @@ plan that discovers them 300 packages in.
 | | |
 |---|---|
 | Started | 78 |
-| Now | 164 |
+| Now | 178 |
 | Tier 1 target | 200 |
 | Tier 2 target | 500 |
 | Tier 3 target | 800 |
@@ -134,27 +134,28 @@ could ask "am I in a region" with a load instead of a `RefCell` borrow,
 measured **zero** on a benchmark allocating 800,000 times. The bookkeeping
 around allocation is not where the time goes.
 
-## Tier 1 — to 200 (36 remaining)
+## Tier 1 — to 200 (22 remaining)
 
 All buildable now. No prerequisite blocks any of it.
 
-**Data formats** — `yamlish` `jsonpath` `msgpack` `cbor` `punycode`
-`markdown` `difflines` `template`
+The last 22, with the duplicates struck out. Six names from the original
+list turned out to be packages that already exist under another name, and
+writing them would have been the failure `docs/packages-to-200.md` exists to
+prevent: `assertlib` and `fixture` are `testing`, `flags` is `cli`,
+`spinner` is `progress`, `tablefmt` is `texttable`, `plurals2` is
+`pluralize`, and `dirwalk` and `globwalk` are both `fs`. `totp` was written
+before this was noticed and has been folded into `hotp` rather than shipped
+beside it.
 
-**Crypto** — `sha512` `sha3` `ed25519` `nonce` `bcryptish`
+**Data formats** — `yamlish` `msgpack` `cbor` `markdown` `template`
 
-**Network wire formats** — `ntp` `syslog` `sse` `robots` `sitemap`
-`mimetype` `multipart` `cookiejar` `linkheader`
+**Media** — `png` `wav` `qrcode` `perlin` `dither` `asciiart`
 
-**System** — `tempname` `lockfile` `semaphore` `backoff` `healthcheck`
-`shutdown` `pidfile` `dirwalk` `globwalk`
+**Config / i18n** — `migrate` `i18n` `locale` `currency`
 
-**Tooling** — `assertlib` `fixture` `benchtime` `flags` `envcfg` `tablefmt`
-`spinner` `treeview`
+**Tooling** — `benchtime` `treeview` `fixtureset`
 
-**Media** — `png` `wav` `perlin` `dither` `asciiart` `qrcode`
-
-**Config / i18n** — `migrate` `i18n` `locale` `currency` `plurals2`
+**Identifiers and text** — `ulid` `iban` `phonetic` `natsort`
 
 ## Tier 2 — to 500
 

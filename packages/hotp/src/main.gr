@@ -9,6 +9,10 @@
 // in testing until a digest happens to have its high bit set — roughly half
 // the time, which means a broken implementation works about half the time and
 // looks intermittent rather than wrong.
+import crypto_hash
+import sha512
+import base32
+
 import sha1
 
 fn block_size() -> i64 {
@@ -113,4 +117,128 @@ pub fn verify(secret: bytes, code: str, unix_seconds: i64, step: i64, drift: i64
         d = d + 1
     }
     return ok
+}
+
+
+// ---------------------------------------------------------------------------
+// The parts a real authenticator needs beyond the two functions above.
+//
+// SHA-1 is what RFC 4226 specified and what every phone app still defaults to,
+// but RFC 6238 allows SHA-256 and SHA-512 and some servers use them. A secret
+// travels as base32 because that is what a QR code carries. And verification
+// has to say *which* step matched, or the same code can be replayed inside its
+// own window.
+
+type TotpError =
+    | BadSecret(why: str)
+    | BadDigits(digits: i64)
+
+pub let SHA1 = "SHA1"
+pub let SHA256 = "SHA256"
+pub let SHA512 = "SHA512"
+
+fn mac_with(algorithm: str, key: bytes, message: bytes) -> bytes {
+    if algorithm == SHA256 {
+        return crypto_hash.hmac_sha256(key, message)
+    }
+    if algorithm == SHA512 {
+        return sha512.hmac_sha512(key, message)
+    }
+    return hmac_sha1(key, message)
+}
+
+fn counter_bytes(counter: i64) -> bytes {
+    var out: [i64] = []
+    for i in 0..8 {
+        out.push(counter.ushr((7 - i) * 8).bit_and(255))
+    }
+    return bytes_of(out)
+}
+
+/// HOTP over a named MAC, six to nine digits.
+pub fn hotp_with(algorithm: str, secret: bytes, counter: i64,
+    digits: i64) -> str ! TotpError {
+    if digits < 6 or digits > 9 {
+        fail(BadDigits(digits))
+    }
+    let mac = mac_with(algorithm, secret, counter_bytes(counter))
+    let at = mac.at(mac.len() - 1).bit_and(15)
+    let value = mac.at(at).bit_and(127).shl(24)
+        .bit_or(mac.at(at + 1).shl(16))
+        .bit_or(mac.at(at + 2).shl(8))
+        .bit_or(mac.at(at + 3))
+    var text = "{value % power10(digits)}"
+    while text.len() < digits {
+        text = "0" + text
+    }
+    return text
+}
+
+/// The counter a time-based code uses: seconds since the epoch, floored.
+///
+/// Floored rather than rounded, because rounding puts two devices a second
+/// apart in different windows for half of every step.
+pub fn step_of(unix_seconds: i64, step: i64) -> i64 {
+    return unix_seconds / step
+}
+
+pub fn totp_with(algorithm: str, secret: bytes, unix_seconds: i64, step: i64,
+    digits: i64) -> str ! TotpError {
+    return try hotp_with(algorithm, secret, step_of(unix_seconds, step), digits)
+}
+
+/// Which step a code matched, or -1.
+///
+/// Returning the step rather than a bare `true` is what lets a caller refuse
+/// the same code twice: store the step it accepted, and reject anything not
+/// strictly newer.
+pub fn verify_at(algorithm: str, secret: bytes, code: str, unix_seconds: i64,
+    step: i64, digits: i64, drift: i64) -> i64 {
+    let here = step_of(unix_seconds, step)
+    var offset = 0 - drift
+    while offset <= drift {
+        match hotp_with(algorithm, secret, here + offset, digits) {
+            Ok(want) -> {
+                if crypto_hash.equal_constant_time(want.to_bytes(), code.to_bytes()) {
+                    return here + offset
+                }
+            }
+            Err(_e) -> return 0 - 1
+        }
+        offset = offset + 1
+    }
+    return 0 - 1
+}
+
+/// Seconds until the current code stops working.
+pub fn seconds_left(unix_seconds: i64, step: i64) -> i64 {
+    return step - unix_seconds % step
+}
+
+/// The secret as an authenticator app expects it: base32, no padding.
+pub fn encode_secret(secret: bytes) -> str {
+    return base32.encode(secret).replace("=", "")
+}
+
+pub fn decode_secret(text: str) -> bytes ! TotpError {
+    var body = text.to_upper().replace(" ", "")
+    while body.len() % 8 != 0 {
+        body = body + "="
+    }
+    match base32.decode(body) {
+        Ok(raw) -> return raw
+        Err(_e) -> fail(BadSecret(text))
+    }
+}
+
+/// The `otpauth://` URI a QR code carries.
+///
+/// The issuer appears twice on purpose: once in the label, where old clients
+/// look, and once as a parameter, where every current one does.
+pub fn provisioning_uri(issuer: str, account: str, secret: bytes,
+    algorithm: str, digits: i64, step: i64) -> str {
+    let key = encode_secret(secret)
+    let label = "{issuer}:{account}"
+    return "otpauth://totp/{label}?secret={key}&issuer={issuer}" +
+        "&algorithm={algorithm}&digits={digits}&period={step}"
 }

@@ -282,10 +282,13 @@ impl Parser {
         match tok.kind {
             TokenKind::LParen | TokenKind::LBracket => self.modes.push(NlMode::Skip),
             TokenKind::LBrace => self.modes.push(NlMode::Keep),
-            TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
-                if self.modes.len() > 1 {
-                    self.modes.pop();
-                }
+            // The outermost mode is the file's own and is never popped: a
+            // stray closer would otherwise leave the parser with no mode at
+            // all.
+            TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace
+                if self.modes.len() > 1 =>
+            {
+                self.modes.pop();
             }
             _ => {}
         }

@@ -1,0 +1,6 @@
+[package]
+name = "pidfile"
+version = "1.0.0"
+
+# A record of which process is running. Touches the disk.
+capabilities = ["io"]

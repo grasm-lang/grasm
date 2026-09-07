@@ -29,9 +29,9 @@ honest and a stub is a promise nobody kept.
 | | |
 |---|---|
 | Started at | 78 |
-| Now | 164 |
+| Now | 178 |
 | Target | 200 |
-| Remaining | 36 |
+| Remaining | 22 |
 
 ## Batches
 
@@ -48,6 +48,12 @@ asserts against it.
 - [x] **Numeric II** — `bigint` `fixedpoint` `complexnum` `interpolate`
   `units`
 - [x] **Text III** — `casefold` `tokenizer` `wrapansi` `edit` `similarity`
+- [x] **Crypto III** — `sha512` `sha3` `scrypt` `nonce`, and `totp` folded
+  into the `hotp` that already existed
+- [x] **Network wire formats** — `ntp` `syslog` `robots` `sitemap`
+  `mimetype`
+- [x] **System files** — `atomicfile` `pidfile` `lockfile` `shutdown`
+  `envcfg`
 
 ### Planned
 

@@ -1,10 +1,21 @@
 //! tag: E-EQ-STRUCTURAL
 //! expect: output
 //! true true false
+//! true true true true false
 type P = { x: i64, y: [str] }
+
 fn main() {
     let a = P{ x: 1, y: ["k"] }
     let b = P{ x: 1, y: ["k"] }
     let c = P{ x: 2, y: ["k"] }
     print("{a == b} {[1, 2] == [1, 2]} {a == c}")
+    // `bytes` compared false against itself in every engine, so the gates
+    // that ask whether the engines agree could not see it (F93). Built four
+    // ways here, because the representation differs by how it was made.
+    let literal = bytes_of([104, 105])
+    let text = "hi".to_bytes()
+    let cut = bytes_of([32, 104, 105, 32]).slice(1, 2)
+    let joined = bytes_of([104]).concat(bytes_of([105]))
+    print("{literal == literal} {literal == text} {literal == cut} " +
+        "{literal == joined} {literal == bytes_of([104, 106])}")
 }

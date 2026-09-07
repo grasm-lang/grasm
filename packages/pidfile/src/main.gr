@@ -1,0 +1,162 @@
+// The file that says which process is running.
+//
+// A pid file answers one question — "is it already running, and what is its
+// process id" — and gets it wrong in one predictable way: the process died
+// without removing the file, and the number in it now belongs to something
+// else. Every start after that either refuses to run or, worse, signals a
+// stranger.
+//
+// So the file here holds more than a number. It holds a start time and a
+// name, and `matches` asks whether the process alive at that id is *the same
+// process* rather than merely *a process*. That is the check that turns a pid
+// file from a guess into an answer.
+//
+// Liveness is the caller's to supply. Asking the operating system whether a
+// pid exists is a system call this language does not have, and inventing an
+// answer here would be worse than asking for one.
+
+type PidRecord = {
+    pid: i64,
+    /// Seconds since the epoch, as the process itself recorded them.
+    started: i64,
+    name: str,
+}
+
+type PidError =
+    | Unreadable(path: str, why: str)
+    | Malformed(text: str)
+    | Held(by: i64)
+
+fn why(e: IoError) -> str {
+    match e {
+        NotFound(p) -> return "not found: {p}"
+        IoFailed(m) -> return m
+    }
+}
+
+pub fn record(pid: i64, started: i64, name: str) -> PidRecord {
+    return PidRecord{ pid: pid, started: started, name: name }
+}
+
+/// One line, three fields. Deliberately readable: the first thing anyone does
+/// with a pid file is `cat` it.
+pub fn render(r: PidRecord) -> str {
+    return "{r.pid} {r.started} {r.name}\n"
+}
+
+pub fn parse(text: str) -> PidRecord ! PidError {
+    let line = text.trim()
+    if line == "" {
+        fail(Malformed(text))
+    }
+    let parts = line.words()
+    // A bare number is the older, one-field form, and reading it is the point
+    // of accepting it: a file written by a previous version still says which
+    // process wrote it, even if it cannot say when.
+    if parts.len() == 1 {
+        match parts[0].parse_int() {
+            Some(pid) -> return PidRecord{ pid: pid, started: 0, name: "" }
+            None -> fail(Malformed(text))
+        }
+    }
+    if parts.len() < 2 {
+        fail(Malformed(text))
+    }
+    let pid = parts[0].parse_int() ?? 0 - 1
+    let started = parts[1].parse_int() ?? 0 - 1
+    if pid <= 0 or started < 0 {
+        fail(Malformed(text))
+    }
+    var name = ""
+    if parts.len() > 2 {
+        name = parts.slice(2, parts.len()).join(" ")
+    }
+    return PidRecord{ pid: pid, started: started, name: name }
+}
+
+pub fn read(path: str) -> PidRecord ! PidError / {io} {
+    match read_file(path) {
+        Ok(text) -> return try parse(text)
+        Err(e) -> fail(Unreadable(path, why(e)))
+    }
+}
+
+pub fn write(path: str, r: PidRecord) -> () ! PidError / {io} {
+    match write_file(path, render(r)) {
+        Ok(_v) -> {}
+        Err(e) -> fail(Unreadable(path, why(e)))
+    }
+}
+
+pub fn remove(path: str) -> bool / {io} {
+    match remove_file(path) {
+        Ok(_v) -> return true
+        Err(_e) -> return false
+    }
+}
+
+pub fn exists(path: str) -> bool / {io} {
+    match file_size(path) {
+        Ok(_n) -> return true
+        Err(_e) -> return false
+    }
+}
+
+/// Whether the record describes the process the caller found at that pid.
+///
+/// The start time is what makes this an answer rather than a coincidence: a
+/// recycled pid belongs to a process that started later, so the times differ.
+/// A tolerance is allowed because the recorded time and the one read back
+/// from the system need not agree to the second.
+pub fn matches(r: PidRecord, live_started: i64, tolerance: i64) -> bool {
+    if r.started == 0 {
+        // The one-field form carries no start time, so this cannot be
+        // answered. Saying "yes" would be the guess this package exists to
+        // avoid.
+        return false
+    }
+    let drift = r.started - live_started
+    let magnitude = if drift < 0 { 0 - drift } else { drift }
+    return magnitude <= tolerance
+}
+
+/// Take the file if nobody holds it, or say who does.
+///
+/// `live` is what the caller found out about the pid already in the file: it
+/// is alive and is the same process. A stale file is overwritten; a live one
+/// is refused with the pid holding it.
+pub fn claim(path: str, mine: PidRecord, live: bool) -> () ! PidError / {io} {
+    match read(path) {
+        Ok(held) -> {
+            if live and held.pid != mine.pid {
+                fail(Held(held.pid))
+            }
+        }
+        Err(_e) -> {}
+    }
+    try write(path, mine)
+}
+
+/// Remove the file only if it is still ours.
+///
+/// A process that removes a pid file it no longer owns deletes its
+/// successor's, and the next start then sees no file at all.
+pub fn give_up(path: str, mine: PidRecord) -> bool / {io} {
+    match read(path) {
+        Ok(held) -> {
+            if held.pid != mine.pid {
+                return false
+            }
+            return remove(path)
+        }
+        Err(_e) -> return false
+    }
+}
+
+/// How old the record is, given the current time.
+pub fn age_seconds(r: PidRecord, now_seconds: i64) -> i64 {
+    if r.started == 0 {
+        return 0 - 1
+    }
+    return now_seconds - r.started
+}

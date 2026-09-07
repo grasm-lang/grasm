@@ -1,0 +1,261 @@
+// SHA-512, and the two truncated forms that share its compression function.
+//
+// SHA-256 works on 32-bit words, which fit inside an `i64` with room to add.
+// SHA-512 works on 64-bit words, which do not: every addition in it is modulo
+// 2^64 and `i64 + i64` traps on overflow in a debug build. So `add64` here
+// adds the halves separately and reassembles, and every other operation is
+// bitwise and needs no such care.
+//
+// Three digests, one compression function. SHA-384 and SHA-512/256 differ
+// from SHA-512 only in their starting values and in how much of the result
+// they publish — and truncating is not merely cosmetic: it is what stops a
+// SHA-512 digest of a secret being extendable by an attacker who has it.
+
+let SHA512_K = [
+    4794697086780616226, 8158064640168781261, -5349999486874862801,
+    -1606136188198331460, 4131703408338449720, 6480981068601479193,
+    -7908458776815382629, -6116909921290321640, -2880145864133508542,
+    1334009975649890238, 2608012711638119052, 6128411473006802146,
+    8268148722764581231, -9160688886553864527, -7215885187991268811,
+    -4495734319001033068, -1973867731355612462, -1171420211273849373,
+    1135362057144423861, 2597628984639134821, 3308224258029322869,
+    5365058923640841347, 6679025012923562964, 8573033837759648693,
+    -7476448914759557205, -6327057829258317296, -5763719355590565569,
+    -4658551843659510044, -4116276920077217854, -3051310485924567259,
+    489312712824947311, 1452737877330783856, 2861767655752347644,
+    3322285676063803686, 5560940570517711597, 5996557281743188959,
+    7280758554555802590, 8532644243296465576, -9096487096722542874,
+    -7894198246740708037, -6719396339535248540, -6333637450476146687,
+    -4446306890439682159, -4076793802049405392, -3345356375505022440,
+    -2983346525034927856, -860691631967231958, 1182934255886127544,
+    1847814050463011016, 2177327727835720531, 2830643537854262169,
+    3796741975233480872, 4115178125766777443, 5681478168544905931,
+    6601373596472566643, 7507060721942968483, 8399075790359081724,
+    8693463985226723168, -8878714635349349518, -8302665154208450068,
+    -8016688836872298968, -6606660893046293015, -4685533653050689259,
+    -4147400797238176981, -3880063495543823972, -3348786107499101689,
+    -1523767162380948706, -757361751448694408, 500013540394364858,
+    748580250866718886, 1242879168328830382, 1977374033974150939,
+    2944078676154940804, 3659926193048069267, 4368137639120453308,
+    4836135668995329356, 5532061633213252278, 6448918945643986474,
+    6902733635092675308, 7801388544844847127,
+]
+
+/// The fractional parts of the square roots of the first eight primes.
+let SHA512_IV = [
+    7640891576956012808, -4942790177534073029, 4354685564936845355,
+    -6534734903238641935, 5840696475078001361, -7276294671716946913,
+    2270897969802886507, 6620516959819538809,
+]
+
+/// The ninth through sixteenth primes, which is what makes SHA-384 a
+/// different function rather than a truncated SHA-512.
+let SHA384_IV = [
+    -3766243637369397544, 7105036623409894663, -7973340178411365097,
+    1526699215303891257, 7436329637833083697, -8163818279084223215,
+    -2662702644619276377, 5167115440072839076,
+]
+
+/// SHA-512/256, whose starting values come from FIPS 180-4's own derivation
+/// rule rather than from any square root.
+let SHA512_256_IV = [
+    2463787394917988140, -6965556091613846334, 2563595384472711505,
+    -7622211418569250115, -7626776825740460061, -4729309413028513390,
+    3098927326965381290, 1060366662362279074,
+]
+
+/// Addition modulo 2^64, done in halves so nothing overflows.
+///
+/// `hi.shl(32)` discards the bits above 64 rather than trapping, which is
+/// exactly the wrap this needs.
+fn add64(a: i64, b: i64) -> i64 {
+    let low = a.bit_and(4294967295) + b.bit_and(4294967295)
+    let high = a.ushr(32) + b.ushr(32) + low.ushr(32)
+    return high.shl(32).bit_or(low.bit_and(4294967295))
+}
+
+fn rotr(x: i64, n: i64) -> i64 {
+    return x.ushr(n).bit_or(x.shl(64 - n))
+}
+
+fn big_sigma0(x: i64) -> i64 {
+    return rotr(x, 28).bit_xor(rotr(x, 34)).bit_xor(rotr(x, 39))
+}
+
+fn big_sigma1(x: i64) -> i64 {
+    return rotr(x, 14).bit_xor(rotr(x, 18)).bit_xor(rotr(x, 41))
+}
+
+fn small_sigma0(x: i64) -> i64 {
+    return rotr(x, 1).bit_xor(rotr(x, 8)).bit_xor(x.ushr(7))
+}
+
+fn small_sigma1(x: i64) -> i64 {
+    return rotr(x, 19).bit_xor(rotr(x, 61)).bit_xor(x.ushr(6))
+}
+
+fn choose(x: i64, y: i64, z: i64) -> i64 {
+    return x.bit_and(y).bit_xor(x.bit_not().bit_and(z))
+}
+
+fn majority(x: i64, y: i64, z: i64) -> i64 {
+    return x.bit_and(y).bit_xor(x.bit_and(z)).bit_xor(y.bit_and(z))
+}
+
+fn compress(inout state: [i64], block: bytes, at: i64) {
+    var w: [i64] = []
+    for i in 0..16 {
+        var word = 0
+        for j in 0..8 {
+            word = word.shl(8).bit_or(block.at(at + i * 8 + j))
+        }
+        w.push(word)
+    }
+    for i in 16..80 {
+        let mixed = add64(add64(small_sigma1(w[i - 2]), w[i - 7]),
+            add64(small_sigma0(w[i - 15]), w[i - 16]))
+        w.push(mixed)
+    }
+    var a = state[0]
+    var b = state[1]
+    var c = state[2]
+    var d = state[3]
+    var e = state[4]
+    var f = state[5]
+    var g = state[6]
+    var h = state[7]
+    for i in 0..80 {
+        let t1 = add64(add64(add64(h, big_sigma1(e)), add64(choose(e, f, g), SHA512_K[i])), w[i])
+        let t2 = add64(big_sigma0(a), majority(a, b, c))
+        h = g
+        g = f
+        f = e
+        e = add64(d, t1)
+        d = c
+        c = b
+        b = a
+        a = add64(t1, t2)
+    }
+    state[0] = add64(state[0], a)
+    state[1] = add64(state[1], b)
+    state[2] = add64(state[2], c)
+    state[3] = add64(state[3], d)
+    state[4] = add64(state[4], e)
+    state[5] = add64(state[5], f)
+    state[6] = add64(state[6], g)
+    state[7] = add64(state[7], h)
+}
+
+/// The padded message: a 1 bit, zeros, then the length as a 128-bit count of
+/// bits. The length field is twice SHA-256's, which is why the block is 128
+/// bytes rather than 64.
+fn padded(message: bytes) -> bytes {
+    var out: [i64] = []
+    for i in 0..message.len() {
+        out.push(message.at(i))
+    }
+    out.push(128)
+    while (out.len() + 16) % 128 != 0 {
+        out.push(0)
+    }
+    // The high 64 bits of the bit count: a message that would fill them is
+    // larger than any this can be handed.
+    for _i in 0..8 {
+        out.push(0)
+    }
+    let bits = message.len() * 8
+    for i in 0..8 {
+        out.push(bits.ushr((7 - i) * 8).bit_and(255))
+    }
+    return bytes_of(out)
+}
+
+fn digest_with(iv: [i64], message: bytes, keep: i64) -> bytes {
+    var state = iv
+    let block = padded(message)
+    var at = 0
+    while at < block.len() {
+        compress(state, block, at)
+        at = at + 128
+    }
+    var out: [i64] = []
+    for word in state {
+        for i in 0..8 {
+            out.push(word.ushr((7 - i) * 8).bit_and(255))
+        }
+    }
+    return bytes_of(out.slice(0, keep))
+}
+
+pub fn sha512(message: bytes) -> bytes {
+    return digest_with(SHA512_IV, message, 64)
+}
+
+pub fn sha384(message: bytes) -> bytes {
+    return digest_with(SHA384_IV, message, 48)
+}
+
+pub fn sha512_256(message: bytes) -> bytes {
+    return digest_with(SHA512_256_IV, message, 32)
+}
+
+pub fn hex(data: bytes) -> str {
+    var out = ""
+    for i in 0..data.len() {
+        let b = data.at(i)
+        out = out + b.ushr(4).to_base(16) + b.bit_and(15).to_base(16)
+    }
+    return out
+}
+
+pub fn sha512_hex(message: bytes) -> str {
+    return hex(sha512(message))
+}
+
+pub fn sha384_hex(message: bytes) -> str {
+    return hex(sha384(message))
+}
+
+pub fn sha512_256_hex(message: bytes) -> str {
+    return hex(sha512_256(message))
+}
+
+/// HMAC-SHA-512, which is the reason most callers want this hash at all.
+///
+/// The block size is 128 bytes, not 64 — using SHA-256's block size here
+/// produces a function that looks like HMAC, passes its own tests, and does
+/// not interoperate with anything.
+pub fn hmac_sha512(key: bytes, message: bytes) -> bytes {
+    var block: [i64] = []
+    if key.len() > 128 {
+        let short = sha512(key)
+        for i in 0..short.len() {
+            block.push(short.at(i))
+        }
+    } else {
+        for i in 0..key.len() {
+            block.push(key.at(i))
+        }
+    }
+    while block.len() < 128 {
+        block.push(0)
+    }
+    var inner: [i64] = []
+    var outer: [i64] = []
+    for b in block {
+        inner.push(b.bit_xor(54))
+        outer.push(b.bit_xor(92))
+    }
+    for i in 0..message.len() {
+        inner.push(message.at(i))
+    }
+    let first = sha512(bytes_of(inner))
+    for i in 0..first.len() {
+        outer.push(first.at(i))
+    }
+    return sha512(bytes_of(outer))
+}
+
+pub fn hmac_sha512_hex(key: bytes, message: bytes) -> str {
+    return hex(hmac_sha512(key, message))
+}

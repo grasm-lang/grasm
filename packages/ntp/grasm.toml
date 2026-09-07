@@ -1,0 +1,6 @@
+[package]
+name = "ntp"
+version = "1.0.0"
+
+# NTP packet arithmetic. Opens no socket.
+capabilities = []

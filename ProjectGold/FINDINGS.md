@@ -108,6 +108,9 @@ and the entries disagree.
 | [F90](#f90) | a write through `inout` was silently discarded, and only in two engines | S1, semantics | **fixed** |
 | [F91](#f91) | F88's fix reached variants with arguments and not those without | S2, types | **fixed** |
 | [F92](#f92) | `pop()` through an `inout` field, inside a loop, never released what it dropped | S2, backend | **fixed** |
+| [F93](#f93) | `bytes` was the one type not equal to itself | S1, semantics | **fixed** |
+| [F94](#f94) | base32 decoding overflowed after thirteen characters | S2, package | **fixed** |
+| [F95](#f95) | two packages, one variant name, and the backend picked the wrong payload | S1, backend | **fixed** |
 
 <!-- end index -->
 ## F1 — a wrapped condition must end the line with the operator (S4) — **fixed**
@@ -4018,3 +4021,119 @@ reads open S2: none again.
 
 **Gate**: `scripts/leakcheck.sh` over the corpus, where `packages/hpack-demo`
 evicts in a loop on every run.
+
+## F93 — `bytes` was the one type not equal to itself (S1, semantics) — **fixed**
+
+`b == b` was **false** for every `bytes` value, in every engine.
+
+```
+let a = bytes_of([104, 105])
+let b = bytes_of([104, 105])
+a == b     // false
+a == a     // false
+a != b     // true
+```
+
+[T-COMPARE] says `==` and `!=` compare any two values of one type, and
+[E-EQ-STRUCTURAL] says equality is structural. `bytes` obeyed neither. Both the
+interpreter's `eq_value` and the runtime's `val_eq` fall through to "not equal"
+for a pair they have no arm for, and neither had an arm for `Bytes` — so the
+answer was `false`, consistently, in the interpreter, the source bundle, the
+native build and wasm alike.
+
+**Which is why no gate caught it.** `difftest`, `crosstest` and `wasmtest` all
+ask whether the engines *agree*. Four engines agreeing on the same wrong answer
+is the one defect that shape of gate is blind to, and this is the second time
+that has happened here — the `Ref` and `FnRef` arms above it in the same
+`match` were added for exactly the same reason, and their comments say so.
+
+**Severity.** S1 rather than S2, because it silently changes what programs
+compute rather than crashing them. It fails *closed* — a MAC check written
+`if mac == want` rejects every message including the correct one, and a
+`bytes` deduplication keeps every duplicate — so nothing insecure got through.
+But `xs.contains(b)`, `assert_eq` on two `bytes`, a `Map` lookup whose value is
+`bytes`, and any `Option[bytes]` comparison were all wrong, and a caller had no
+way to tell from the outside.
+
+**Found by** writing `packages/totp`, whose test asserts that a base32 secret
+round-trips: `decode(encode(secret)) == secret` was false with both sides
+identical.
+
+**The fix** is one arm in each of the two functions, matching the shape of the
+`Ref` and `FnRef` arms beside them.
+
+**Gate**: `spec/conformance/E-EQ-STRUCTURAL.gr` now compares `bytes` built four
+different ways — a literal, a slice, a concatenation and `to_bytes` — so a
+fifth engine cannot quietly answer `false` again.
+
+## F94 — base32 decoding overflowed after thirteen characters (S2, package) — **fixed**
+
+`packages/base32`'s decoder accumulated every character it had ever read into
+one `i64`, multiplying by 32 each time and never dropping the bits it had
+already emitted. Past thirteen characters the accumulator overflowed, and a
+wrapped `i64` is still a number: the decoder went on emitting bytes, just the
+wrong ones. In a debug build it trapped instead, and `bytes_of` refused the
+negative value with "-198 is not a byte".
+
+Anything short enough to be convenient in a test decoded correctly, which is
+why the package's own demo passed. A base32 secret of the length an
+authenticator app actually uses — 32 characters — did not.
+
+**Found by** `packages/totp`, which round-trips a real 20-byte secret.
+
+**The fix** is `acc = acc % (2 ^ bits)` after each byte is emitted. The package
+now round-trips every length from 0 to 79 against `base64.b32encode`.
+
+## F95 — two packages, one variant name, and the backend picked the wrong payload (S1, backend) — **fixed**
+
+Two modules may each declare a variant of the same name. The checker resolves a
+bare constructor to the one declared where it is written, which is the rule
+F88 and F91 established. The native backend kept a single program-wide map from
+variant name to owning sum, so whichever module was registered last won
+everywhere.
+
+```
+// package a
+type AErr = | Bad(value: i64)
+pub fn go(n: i64) -> i64 ! AErr { if n < 0 { fail(Bad(n)) } ... }
+
+// package b
+type BErr = | Bad(value: f64)
+pub fn go(x: f64) -> f64 ! BErr { if x < 0.0 { fail(Bad(x)) } ... }
+
+// an app importing both
+```
+
+`grasm check` accepted it, `grasm run` produced the right answer, and the
+native build failed:
+
+```
+error: b/src/main.gr:3:5: native backend does not yet support
+       (codegen bug in `go`: Compilation error: Verifier errors)
+```
+
+`GRASM_DUMP_IR=1` names it exactly: `arg 0 (v3) has type f64, expected i64` —
+`Bad`'s payload was boxed with the integer constructor because the index said
+`Bad` belonged to `AErr`.
+
+**Why it is S1 rather than a build refusal.** With two payloads of the *same*
+type there is no verifier error to stop it, and the backend then builds a
+variant of the wrong sum with no complaint at all. What surfaced here was the
+lucky case.
+
+**Found by** writing `packages/netwire-demo`. `syslog` declares
+`BadPriority(value: i64)` and `sitemap` declares `BadPriority(value: f64)`;
+either package builds natively on its own, and a program importing both does
+not. The bisection was import-order sensitive, which was the clue: `sitemap`
+first built, `syslog` first did not.
+
+**The fix** is a second index keyed by the declaring module, consulted before
+the program-wide one — the backend's version of the rule the checker already
+follows. Two passes needed `current_module` set that had not been setting it,
+which is why the first attempt at the fix changed nothing.
+
+**Gate**: `scripts/fuzz_modules.py` grows a variant-collision case — two
+packages declaring one variant name with different payload types, built and
+run under the interpreter, the native backend and the source bundle, in three
+type pairings. The interpreter was right all along, so a gate that only ran
+`grasm run` would still miss it.

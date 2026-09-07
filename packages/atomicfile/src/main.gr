@@ -1,0 +1,147 @@
+// Replacing a file's contents without a moment where it holds neither.
+//
+// `write_bytes(path, data)` truncates first. Between the truncate and the last
+// byte the file exists and is wrong, and a crash there leaves it that way — a
+// half-written config, a truncated database, a JSON file that will not parse.
+// The window is small and the file it destroys is usually the one that matters.
+//
+// The fix is the same three steps everywhere: write beside, force it to the
+// disk, rename over. The rename is atomic, so a reader sees either the old
+// file or the new one and never a partial. `sync_file` before the rename is
+// the step most often skipped, and skipping it means the rename can land
+// before the data does — the file is then present, named correctly, and full
+// of zeros after a power cut.
+//
+// [L-LIB-FS] gives all three, which is why this is a package and not a wish.
+
+type AtomicError =
+    | WriteFailed(path: str, why: str)
+    | ReadFailed(path: str, why: str)
+
+fn temp_path(path: str, token: str) -> str {
+    return "{path}.{token}.tmp"
+}
+
+fn why(e: IoError) -> str {
+    match e {
+        NotFound(p) -> return "not found: {p}"
+        IoFailed(m) -> return m
+    }
+}
+
+/// Write `data` to `path`, or leave whatever was there.
+///
+/// `token` distinguishes concurrent writers' temporary files; a caller with a
+/// process id or a counter should pass it. Nothing random is opened here.
+pub fn write(path: str, data: bytes, token: str) -> () ! AtomicError / {io} {
+    let beside = temp_path(path, token)
+    match write_bytes(beside, data) {
+        Ok(_v) -> {}
+        Err(e) -> fail(WriteFailed(beside, why(e)))
+    }
+    // Before the rename, not after: a rename that lands before the data does
+    // leaves a correctly named file full of nothing.
+    match sync_file(beside) {
+        Ok(_v) -> {}
+        Err(e) -> fail(WriteFailed(beside, why(e)))
+    }
+    match rename_file(beside, path) {
+        Ok(_v) -> {}
+        Err(e) -> {
+            // Do not leave the temporary behind on a failed rename. Whether
+            // the removal works changes nothing about the failure being
+            // reported, so its own error is looked at and dropped.
+            match remove_file(beside) {
+                Ok(_v) -> {}
+                Err(_e2) -> {}
+            }
+            fail(WriteFailed(path, why(e)))
+        }
+    }
+}
+
+pub fn write_text(path: str, text: str, token: str) -> () ! AtomicError / {io} {
+    return try write(path, text.to_bytes(), token)
+}
+
+pub fn write_lines(path: str, lines: [str], token: str) -> () ! AtomicError / {io} {
+    return try write_text(path, lines.join("\n") + "\n", token)
+}
+
+pub fn read(path: str) -> bytes ! AtomicError / {io} {
+    match read_bytes(path) {
+        Ok(data) -> return data
+        Err(e) -> fail(ReadFailed(path, why(e)))
+    }
+}
+
+/// The contents, or `fallback` when the file is not there.
+///
+/// Distinguishes a missing file from an unreadable one: the first is a
+/// first run and the second is a problem.
+pub fn read_or(path: str, fallback: bytes) -> bytes ! AtomicError / {io} {
+    match read_bytes(path) {
+        Ok(data) -> return data
+        Err(e) -> {
+            match e {
+                NotFound(_p) -> return fallback
+                IoFailed(m) -> fail(ReadFailed(path, m))
+            }
+        }
+    }
+}
+
+pub fn read_text_or(path: str, fallback: str) -> str ! AtomicError / {io} {
+    return (try read_or(path, fallback.to_bytes())).to_str()
+}
+
+/// Keep the previous contents beside the new ones.
+///
+/// The backup is written from what was read, not by copying the file after
+/// the fact — copying afterwards would race with the replacement it is
+/// supposed to protect against.
+pub fn write_with_backup(path: str, data: bytes, token: str,
+    backup_suffix: str) -> bool ! AtomicError / {io} {
+    var had = false
+    match read_bytes(path) {
+        Ok(old) -> {
+            had = true
+            try write(path + backup_suffix, old, token)
+        }
+        Err(_e) -> {}
+    }
+    try write(path, data, token)
+    return had
+}
+
+/// Read, transform, write back — with the write atomic.
+///
+/// Not safe against another process writing between the read and the write;
+/// nothing here can be, without a lock. What it does guarantee is that the
+/// file is never left half-written by *this* one.
+pub fn update(path: str, change: fn(bytes) -> bytes, fallback: bytes,
+    token: str) -> () ! AtomicError / {io} {
+    let before = try read_or(path, fallback)
+    try write(path, change(before), token)
+}
+
+/// Whether a temporary from an interrupted write is lying around.
+pub fn has_stale_temp(path: str, token: str) -> bool / {io} {
+    match file_size(temp_path(path, token)) {
+        Ok(_n) -> return true
+        Err(_e) -> return false
+    }
+}
+
+pub fn clear_stale_temp(path: str, token: str) -> bool / {io} {
+    match remove_file(temp_path(path, token)) {
+        Ok(_v) -> return true
+        Err(_e) -> return false
+    }
+}
+
+/// The path this would write beside — exposed so a caller can clean up after
+/// a crash without guessing the naming.
+pub fn temp_for(path: str, token: str) -> str {
+    return temp_path(path, token)
+}

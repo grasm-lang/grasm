@@ -425,6 +425,15 @@ struct Codegen<'m> {
     sums: HashMap<String, Vec<(String, Vec<VType>)>>,
     /// variant name → (parent sum, arity) — unambiguous per checker
     variant_index: HashMap<String, (String, usize)>,
+    /// module -> variant name -> (owning sum, arity).
+    ///
+    /// `variant_index` above is keyed by the bare name across the whole
+    /// program, so two modules each declaring a variant called `Bad` left one
+    /// of them pointing at the other's sum -- and the payload types differed,
+    /// so Cranelift's verifier rejected the function (F95). The checker
+    /// resolves this the other way: a module's own variant wins (F88, F91).
+    /// This is that rule, for the backend.
+    variant_by_module: HashMap<String, HashMap<String, (String, usize)>>,
     /// effect name → ops (op name, param types, return type)
     effects: HashMap<String, Vec<(String, Vec<VType>, VType)>>,
     /// `with` site (by span start) → op name → lifted handler FuncId
@@ -609,6 +618,7 @@ impl<'m> Codegen<'m> {
             aliases: HashMap::new(),
             sums: HashMap::new(),
             variant_index: HashMap::new(),
+            variant_by_module: HashMap::new(),
             effects: HashMap::new(),
             handler_sites: HashMap::new(),
             handler_captures: HashMap::new(),
@@ -1020,8 +1030,10 @@ impl<'m> Codegen<'m> {
     ) -> CResult<()> {
         for (name, m, imports) in views {
             self.module_imports.insert(name.clone(), imports.clone());
+            // Set before collecting, so a variant is recorded against the
+            // module that declares it as well as in the program-wide index.
+            self.current_module = name.clone();
             self.collect_types(m)?;
-            let _ = name;
         }
         // Effects before type bodies, because a field may be of handler type
         // and `XHandler` only means something once the effect `X` is known.
@@ -1031,7 +1043,11 @@ impl<'m> Codegen<'m> {
         for (_, m, _) in views {
             self.collect_effects(m)?;
         }
-        for (_, m, _) in views {
+        for (name, m, _) in views {
+            // The module a sum is declared in decides which of two variants
+            // of the same name a bare constructor there means (F95), so the
+            // bodies pass has to know where it is.
+            self.current_module = name.clone();
             self.resolve_type_bodies(m)?;
         }
         for (name, m, _) in views {
@@ -1247,6 +1263,13 @@ impl<'m> Codegen<'m> {
                                 v.name.name.clone(),
                                 (t.name.name.clone(), v.fields.len()),
                             );
+                            self.variant_by_module
+                                .entry(self.current_module.clone())
+                                .or_default()
+                                .insert(
+                                    v.name.name.clone(),
+                                    (t.name.name.clone(), v.fields.len()),
+                                );
                             vs.push((v.name.name.clone(), fts));
                         }
                         self.sums.insert(t.name.name.clone(), vs);
@@ -1517,6 +1540,22 @@ arguments nor the type this is bound to",
             subst,
         });
         Ok(key)
+    }
+
+    /// The sum a bare variant name belongs to, the module's own first.
+    ///
+    /// Two modules may each declare a variant of the same name; the checker
+    /// resolves such a name to the one declared where it is written (F88,
+    /// F91), and so must this (F95).
+    fn variant_owner(&self, name: &str) -> Option<(String, usize)> {
+        if let Some(found) = self
+            .variant_by_module
+            .get(&self.current_module)
+            .and_then(|m| m.get(name))
+        {
+            return Some(found.clone());
+        }
+        self.variant_index.get(name).cloned()
     }
 
     /// Linkage for a function defined in `current_module`.
@@ -6348,7 +6387,7 @@ this case",
                 }
                 None => {
                     // Nullary variant as a value (None, Dot, Red, ...).
-                    if let Some((parent, 0)) = self.cg.variant_index.get(&id.name).cloned() {
+                    if let Some((parent, 0)) = self.cg.variant_owner(&id.name) {
                         let v = self.make_variant(&parent, &id.name, &[])?;
                         let vt = self.sum_vtype(&parent);
                         return Ok(Some((v, vt)));
@@ -7484,7 +7523,7 @@ this case",
                         });
                     }
                     // Variant constructor through the module alias.
-                    if let Some((parent, _)) = self.cg.variant_index.get(&name.name).cloned() {
+                    if let Some((parent, _)) = self.cg.variant_owner(&name.name) {
                         let v = self.build_variant_call(&parent, &name.name, args)?;
                         let vt = self.sum_vtype(&parent);
                         return Ok(Some((v, vt)));
@@ -9576,7 +9615,7 @@ checker did",
             let val = self.build_variant_call(&key, &id.name, args)?;
             return Ok(Some((val, VType::Sum(key))));
         }
-        if let Some((parent, arity)) = self.cg.variant_index.get(&id.name).cloned() {
+        if let Some((parent, arity)) = self.cg.variant_owner(&id.name) {
             if args.len() == arity {
                 let v = self.build_variant_call(&parent, &id.name, args)?;
                 let vt = self.sum_vtype(&parent);
@@ -11090,7 +11129,7 @@ fields, not the type this is bound to, not an enclosing generic",
                         .expect("just checked")
                 }
                 None => {
-                    if let Some((parent, 0)) = self.cg.variant_index.get(&id.name).cloned() {
+                    if let Some((parent, 0)) = self.cg.variant_owner(&id.name) {
                         self.sum_vtype(&parent)
                     } else if id.name == "None" {
                         VType::Option(Box::new(VType::Any))
@@ -11320,7 +11359,7 @@ fields, not the type this is bound to, not an enclosing generic",
                                 .instantiate_generic(&module, &id.name, &arg_types, id.span)?;
                         return Ok(self.cg.fns[&key].ret.clone());
                     }
-                    if let Some((parent, _)) = self.cg.variant_index.get(&id.name).cloned() {
+                    if let Some((parent, _)) = self.cg.variant_owner(&id.name) {
                         return Ok(self.sum_vtype(&parent));
                     }
                     if id.name == "Some" && args.len() == 1 {
@@ -11878,7 +11917,7 @@ fields, not the type this is bound to, not an enclosing generic",
                             }
                             // `shapes.Circle(..)` — a variant through the alias.
                             if let Some((parent, _)) =
-                                self.cg.variant_index.get(&name.name).cloned()
+                                self.cg.variant_owner(&name.name)
                             {
                                 return Ok(self.sum_vtype(&parent));
                             }
@@ -14045,7 +14084,7 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
             // candidate, which is what this arm used to do for every
             // scrutinee.
             VType::Any => {
-                matches!(self.cg.variant_index.get(name), Some((_, 0))) || name == "None"
+                matches!(self.cg.variant_owner(name).as_ref(), Some((_, 0))) || name == "None"
             }
             _ => false,
         }
@@ -14238,7 +14277,7 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
                     match fpat {
                         Pattern::Bind(fid)
                             if !matches!(
-                                self.cg.variant_index.get(&fid.name),
+                                self.cg.variant_owner(&fid.name).as_ref(),
                                 Some((_, 0))
                             ) && fid.name != "None" =>
                         {
@@ -14321,7 +14360,7 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
                     let boxed = self.call_rt("grasm_list_get", &[sv, idx]).unwrap();
                     match pat_i {
                         Pattern::Bind(fid)
-                            if !matches!(self.cg.variant_index.get(&fid.name), Some((_, 0)))
+                            if !matches!(self.cg.variant_owner(&fid.name).as_ref(), Some((_, 0)))
                                 && fid.name != "None" =>
                         {
                             let (v, vt) = self.unbox(boxed, t_i)?;

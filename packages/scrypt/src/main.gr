@@ -1,0 +1,239 @@
+// scrypt, RFC 7914: a password hash that costs memory as well as time.
+//
+// `packages/password` says why a password hash has to be slow, and then says
+// what it cannot do: "repetition alone is cheap to parallelise on hardware
+// built for it, and memory is not". This is the answer to that sentence.
+//
+// PBKDF2 with a million iterations is a million SHA-256 compressions and
+// about a hundred bytes of state. A machine built to run ten thousand of
+// those in parallel costs the same silicon ten thousand times over, and that
+// machine exists. scrypt forces each guess to fill a large array in an
+// unpredictable order, so ten thousand parallel guesses need ten thousand
+// times the *memory* — which is the resource that does not get cheaper by
+// building a chip for it.
+//
+// The array is `N * 128 * r` bytes. At the parameters this package
+// recommends that is 16 MB per guess, which is nothing for one login and
+// ruinous for a rack of them.
+import crypto_hash
+
+type ScryptError =
+    | BadCost(why: str)
+    | BadLength(want: i64)
+
+fn mask32(v: i64) -> i64 {
+    return v.bit_and(4294967295)
+}
+
+fn add32(a: i64, b: i64) -> i64 {
+    return mask32(a + b)
+}
+
+fn rotl32(x: i64, n: i64) -> i64 {
+    return mask32(mask32(x).shl(n).bit_or(mask32(x).ushr(32 - n)))
+}
+
+/// The Salsa20 core, cut to eight rounds.
+///
+/// Eight rather than twenty because scrypt does not need Salsa's cipher
+/// security here — it needs a fast function that mixes a 64-byte block, and
+/// the sequential-memory-hard argument does not depend on the round count.
+fn salsa8(inout block: [i64], at: i64) {
+    var x: [i64] = []
+    for i in 0..16 {
+        x.push(block[at + i])
+    }
+    for _round in 0..4 {
+        // Column round.
+        x[4] = x[4].bit_xor(rotl32(add32(x[0], x[12]), 7))
+        x[8] = x[8].bit_xor(rotl32(add32(x[4], x[0]), 9))
+        x[12] = x[12].bit_xor(rotl32(add32(x[8], x[4]), 13))
+        x[0] = x[0].bit_xor(rotl32(add32(x[12], x[8]), 18))
+        x[9] = x[9].bit_xor(rotl32(add32(x[5], x[1]), 7))
+        x[13] = x[13].bit_xor(rotl32(add32(x[9], x[5]), 9))
+        x[1] = x[1].bit_xor(rotl32(add32(x[13], x[9]), 13))
+        x[5] = x[5].bit_xor(rotl32(add32(x[1], x[13]), 18))
+        x[14] = x[14].bit_xor(rotl32(add32(x[10], x[6]), 7))
+        x[2] = x[2].bit_xor(rotl32(add32(x[14], x[10]), 9))
+        x[6] = x[6].bit_xor(rotl32(add32(x[2], x[14]), 13))
+        x[10] = x[10].bit_xor(rotl32(add32(x[6], x[2]), 18))
+        x[3] = x[3].bit_xor(rotl32(add32(x[15], x[11]), 7))
+        x[7] = x[7].bit_xor(rotl32(add32(x[3], x[15]), 9))
+        x[11] = x[11].bit_xor(rotl32(add32(x[7], x[3]), 13))
+        x[15] = x[15].bit_xor(rotl32(add32(x[11], x[7]), 18))
+        // Row round.
+        x[1] = x[1].bit_xor(rotl32(add32(x[0], x[3]), 7))
+        x[2] = x[2].bit_xor(rotl32(add32(x[1], x[0]), 9))
+        x[3] = x[3].bit_xor(rotl32(add32(x[2], x[1]), 13))
+        x[0] = x[0].bit_xor(rotl32(add32(x[3], x[2]), 18))
+        x[6] = x[6].bit_xor(rotl32(add32(x[5], x[4]), 7))
+        x[7] = x[7].bit_xor(rotl32(add32(x[6], x[5]), 9))
+        x[4] = x[4].bit_xor(rotl32(add32(x[7], x[6]), 13))
+        x[5] = x[5].bit_xor(rotl32(add32(x[4], x[7]), 18))
+        x[11] = x[11].bit_xor(rotl32(add32(x[10], x[9]), 7))
+        x[8] = x[8].bit_xor(rotl32(add32(x[11], x[10]), 9))
+        x[9] = x[9].bit_xor(rotl32(add32(x[8], x[11]), 13))
+        x[10] = x[10].bit_xor(rotl32(add32(x[9], x[8]), 18))
+        x[12] = x[12].bit_xor(rotl32(add32(x[15], x[14]), 7))
+        x[13] = x[13].bit_xor(rotl32(add32(x[12], x[15]), 9))
+        x[14] = x[14].bit_xor(rotl32(add32(x[13], x[12]), 13))
+        x[15] = x[15].bit_xor(rotl32(add32(x[14], x[13]), 18))
+    }
+    for i in 0..16 {
+        block[at + i] = add32(block[at + i], x[i])
+    }
+}
+
+/// BlockMix: Salsa the blocks in sequence, then deal them out even-first.
+///
+/// The shuffle at the end is what stops a block's output feeding straight
+/// back into its own next input, which would let the whole thing be computed
+/// a lane at a time.
+fn block_mix(inout b: [i64], r: i64) {
+    let blocks = 2 * r
+    var x: [i64] = []
+    for i in 0..16 {
+        x.push(b[(blocks - 1) * 16 + i])
+    }
+    var y: [i64] = []
+    for _i in 0..(blocks * 16) {
+        y.push(0)
+    }
+    for i in 0..blocks {
+        for j in 0..16 {
+            x[j] = x[j].bit_xor(b[i * 16 + j])
+        }
+        salsa8(x, 0)
+        // Even-indexed inputs go to the front half, odd to the back.
+        let to = if i % 2 == 0 { (i / 2) * 16 } else { (r + i / 2) * 16 }
+        for j in 0..16 {
+            y[to + j] = x[j]
+        }
+    }
+    for i in 0..(blocks * 16) {
+        b[i] = y[i]
+    }
+}
+
+/// ROMix: fill `N` blocks, then read them back in an order the data itself
+/// chooses.
+///
+/// The second loop is the whole security argument. Its index comes out of the
+/// value being computed, so no shortcut can predict which block it will want
+/// next, and anything that does not keep all `N` has to recompute them.
+fn ro_mix(inout b: [i64], r: i64, n: i64) {
+    let words = 32 * r
+    var v: [i64] = []
+    for _i in 0..(n * words) {
+        v.push(0)
+    }
+    for i in 0..n {
+        for j in 0..words {
+            v[i * words + j] = b[j]
+        }
+        block_mix(b, r)
+    }
+    for _i in 0..n {
+        // Integerify: the first word of the last 64-byte block, little-endian.
+        let j = b[(2 * r - 1) * 16] % n
+        for k in 0..words {
+            b[k] = b[k].bit_xor(v[j * words + k])
+        }
+        block_mix(b, r)
+    }
+}
+
+fn bytes_to_words(data: bytes) -> [i64] {
+    var out: [i64] = []
+    var i = 0
+    while i < data.len() {
+        out.push(data.at(i).bit_or(data.at(i + 1).shl(8))
+                .bit_or(data.at(i + 2).shl(16)).bit_or(data.at(i + 3).shl(24)))
+        i = i + 4
+    }
+    return out
+}
+
+fn words_to_bytes(words: [i64]) -> bytes {
+    var out: [i64] = []
+    for w in words {
+        out.push(w.bit_and(255))
+        out.push(w.ushr(8).bit_and(255))
+        out.push(w.ushr(16).bit_and(255))
+        out.push(w.ushr(24).bit_and(255))
+    }
+    return bytes_of(out)
+}
+
+/// Whether `n` is a power of two above one, which scrypt requires: the
+/// `% n` in ROMix is a mask only when it is, and the standard says so.
+pub fn is_valid_cost(n: i64) -> bool {
+    return n > 1 and n.bit_and(n - 1) == 0
+}
+
+/// scrypt with the parameters spelt out.
+///
+/// `n` is the memory cost and must be a power of two; `r` the block size, `p`
+/// the number of independent lanes. Memory is `n * 128 * r` bytes.
+pub fn derive(secret: bytes, salt: bytes, n: i64, r: i64, p: i64,
+    length: i64) -> bytes ! ScryptError {
+    if not is_valid_cost(n) {
+        fail(BadCost("N must be a power of two above 1"))
+    }
+    if r < 1 or p < 1 {
+        fail(BadCost("r and p must be at least 1"))
+    }
+    if length < 1 {
+        fail(BadLength(length))
+    }
+    // One PBKDF2 pass to fill the lanes, one to squeeze the answer out. Both
+    // use a single iteration: the cost lives in ROMix, not here.
+    let spread = crypto_hash.pbkdf2_sha256(secret, salt, 1, p * 128 * r)
+    var lanes = bytes_to_words(spread)
+    let words = 32 * r
+    for i in 0..p {
+        var one: [i64] = []
+        for j in 0..words {
+            one.push(lanes[i * words + j])
+        }
+        ro_mix(one, r, n)
+        for j in 0..words {
+            lanes[i * words + j] = one[j]
+        }
+    }
+    return crypto_hash.pbkdf2_sha256(secret, words_to_bytes(lanes), 1, length)
+}
+
+/// What to use when nothing else decides it: RFC 7914's own suggestion for
+/// interactive logins, which is 16 MB and a few tenths of a second.
+pub fn interactive_cost() -> i64 {
+    return 16384
+}
+
+pub fn derive_default(secret: bytes, salt: bytes) -> bytes ! ScryptError {
+    return try derive(secret, salt, interactive_cost(), 8, 1, 32)
+}
+
+/// Bytes of memory a single guess must hold — the number that makes the
+/// parameters a choice rather than a ritual.
+pub fn memory_bytes(n: i64, r: i64) -> i64 {
+    return n * 128 * r
+}
+
+pub fn hex(data: bytes) -> str {
+    var out = ""
+    for i in 0..data.len() {
+        let b = data.at(i)
+        out = out + b.ushr(4).to_base(16) + b.bit_and(15).to_base(16)
+    }
+    return out
+}
+
+/// Constant-time verification, for the same reason `password` insists on it.
+pub fn verify(secret: bytes, salt: bytes, n: i64, r: i64, p: i64,
+    expected: bytes) -> bool {
+    match derive(secret, salt, n, r, p, expected.len()) {
+        Ok(got) -> return crypto_hash.equal_constant_time(got, expected)
+        Err(_e) -> return false
+    }
+}

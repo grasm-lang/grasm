@@ -1,0 +1,361 @@
+import ntp
+import syslog
+import robots
+import sitemap
+import mimetype
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn ntp_refuses(data: bytes) -> bool {
+    match ntp.parse(data) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn syslog_refuses(line: str) -> bool {
+    match syslog.parse(line) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn sitemap_refuses(xml: str) -> bool {
+    match sitemap.parse(xml) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn mime_refuses(text: str) -> bool {
+    match mimetype.parse(text) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn check_ntp(inout f: i64) / {io} {
+    print("-- ntp: four timestamps, one assumption")
+    // 2023-11-14T22:13:20Z, which is 1700000000 seconds past the Unix epoch
+    // and 3908988800 past NTP's.
+    let stamp = ntp.from_unix_millis(1700000000000)
+    say(f, "the epoch offset is seventeen leap days' worth",
+        ntp.epoch_offset() == 2208988800)
+    say(f, "a whole second has an empty fraction", stamp.bit_and(4294967295) == 0)
+    say(f, "and the seconds are counted from 1900", stamp.ushr(32) == 3908988800)
+    say(f, "the conversion round-trips", ntp.to_unix_millis(stamp) == 1700000000000)
+    var exact = true
+    for ms in 0..1000 {
+        if ntp.to_unix_millis(ntp.from_unix_millis(1700000000000 + ms)) !=
+        1700000000000 + ms {
+            exact = false
+        }
+    }
+    say(f, "and does so for every millisecond of a second", exact)
+    let request = ntp.client_request(stamp)
+    say(f, "a request is 48 bytes", request.len() == 48)
+    say(f, "with leap 0, version 4 and mode 3 packed in the first byte",
+        request.at(0) == 35)
+    let parsed = ntp.parse(request) ?? ntp.empty()
+    say(f, "which reads back as a client packet", parsed.mode == ntp.MODE_CLIENT)
+    say(f, "at version 4", parsed.version == 4)
+    say(f, "with the precision as a signed byte", parsed.precision == 0 - 20)
+    say(f, "and the transmit timestamp intact", parsed.transmit == stamp)
+    say(f, "encoding it again gives the same bytes", ntp.encode(parsed) == request)
+    // A client asks at 1000 ms, the server logs 1040 in and 1042 out, the
+    // reply lands at 1082. Forty milliseconds each way, two spent at the
+    // server, and the clocks agree.
+    let t1 = ntp.from_unix_millis(1000)
+    let t2 = ntp.from_unix_millis(1040)
+    let t3 = ntp.from_unix_millis(1042)
+    let t4 = ntp.from_unix_millis(1082)
+    say(f, "the round trip drops the server's own time",
+        ntp.delay_millis(t1, t2, t3, t4) == 80)
+    say(f, "a symmetric path gives no offset", ntp.offset_millis(t1, t2, t3, t4) == 0)
+    say(f, "and the uncertainty is half the trip",
+        ntp.uncertainty_millis(t1, t2, t3, t4) == 40)
+    // The same trip with the server's clock 500 ms fast.
+    let s2 = ntp.from_unix_millis(1540)
+    let s3 = ntp.from_unix_millis(1542)
+    say(f, "a fast server clock shows as a positive offset",
+        ntp.offset_millis(t1, s2, s3, t4) == 500)
+    say(f, "and the delay is unchanged by it",
+        ntp.delay_millis(t1, s2, s3, t4) == 80)
+    // The assumption the whole method rests on, and its failure mode: a path
+    // that takes 70 ms out and 10 ms back reports a 30 ms offset from clocks
+    // that agree exactly.
+    let a2 = ntp.from_unix_millis(1070)
+    let a3 = ntp.from_unix_millis(1072)
+    let a4 = ntp.from_unix_millis(1082)
+    say(f, "an asymmetric path invents an offset that is not there",
+        ntp.offset_millis(t1, a2, a3, a4) == 30)
+    say(f, "and the delay cannot tell you it happened",
+        ntp.delay_millis(t1, a2, a3, a4) == 80)
+    say(f, "which is what the uncertainty is for",
+        ntp.uncertainty_millis(t1, a2, a3, a4) >= 30)
+    // Stratum 0 with a code is a refusal.
+    var kiss = ntp.empty()
+    kiss.stratum = 0
+    kiss.reference_id = "RATE".to_bytes()
+    kiss.mode = ntp.MODE_SERVER
+    say(f, "a kiss-of-death packet is not a time", ntp.kiss_code(kiss) == Some("RATE"))
+    match ntp.is_usable(kiss, stamp) {
+        Ok(_v) -> say(f, "and is refused rather than read", false)
+        Err(_e) -> say(f, "and is refused rather than read", true)
+    }
+    var reply = ntp.empty()
+    reply.mode = ntp.MODE_SERVER
+    reply.stratum = 2
+    reply.originate = stamp
+    reply.transmit = stamp
+    reply.poll = 6
+    reply.precision = 0 - 20
+    reply.reference_id = bytes_of([10, 0, 0, 1])
+    say(f, "a well-formed reply is usable", ntp.is_usable(reply, stamp) ?? false)
+    say(f, "a reply to somebody else's request is not",
+        not (ntp.is_usable(reply, stamp + 1) ?? true))
+    say(f, "the poll field is a power of two", ntp.poll_seconds(reply) == 64)
+    say(f, "the precision is about a microsecond", ntp.precision_nanos(reply) == 953)
+    say(f, "and above stratum 1 the reference id is an address",
+        ntp.reference_name(reply) == "10.0.0.1")
+    say(f, "a short packet is refused", ntp_refuses(bytes_of([1, 2, 3])))
+}
+
+fn check_syslog(inout f: i64) / {io} {
+    print("-- syslog: two formats on one wire")
+    // RFC 5424 section 6.5, example 1.
+    let line = "<34>1 2003-10-11T22:14:15.003Z mymachine.example.com su - ID47 " +
+    "- 'su root' failed for lonvick"
+    let m = syslog.parse(line) ?? syslog.message(0, 0, "-", "-", "-", "-")
+    say(f, "priority 34 is auth.crit", m.facility == syslog.AUTH and
+        m.severity == syslog.CRITICAL)
+    say(f, "which have names", syslog.facility_name(m.facility) == "auth" and
+        syslog.severity_name(m.severity) == "crit")
+    say(f, "the version says which format it was", m.version == 1)
+    say(f, "the hostname is read", m.hostname == "mymachine.example.com")
+    say(f, "and the app name", m.app_name == "su")
+    say(f, "a `-` field reads as empty, not as a dash", m.process_id == "")
+    say(f, "the message id survives", m.message_id == "ID47")
+    say(f, "and the message is everything after the structured data",
+        m.message == "'su root' failed for lonvick")
+    say(f, "formatting it again gives the line back", syslog.format_5424(m) == line)
+    // RFC 5424 section 6.5, example 3: structured data present.
+    let sd = syslog.parse("<165>1 2003-10-11T22:14:15.003Z mymachine.example.com " +
+        "evntslog - ID47 [exampleSDID@32473 iut=\"3\" eventSource=\"Application\"] " +
+        "An application event") ?? syslog.message(0, 0, "-", "-", "-", "-")
+    say(f, "structured data comes out whole",
+        sd.structured_data == "[exampleSDID@32473 iut=\"3\" eventSource=\"Application\"]")
+    say(f, "and the message after it", sd.message == "An application event")
+    say(f, "priority 165 is local4.notice", sd.facility == 20 and
+        sd.severity == syslog.NOTICE)
+    // RFC 3164 section 5.4, example 1. The day is space-padded and the format
+    // is fixed-width, which is why splitting on whitespace loses it.
+    let old = syslog.parse("<13>Feb  5 17:32:18 10.0.0.99 myproc[10]: Use the BFG!") ??
+    syslog.message(0, 0, "-", "-", "-", "-")
+    say(f, "the older format is recognised by what it lacks", old.version == 0)
+    say(f, "its timestamp keeps the padding space", old.timestamp == "Feb  5 17:32:18")
+    say(f, "the host is read", old.hostname == "10.0.0.99")
+    say(f, "the tag splits into a name and a pid", old.app_name == "myproc" and
+        old.process_id == "10")
+    say(f, "and the message follows the colon", old.message == "Use the BFG!")
+    say(f, "formatting it back gives the line",
+        syslog.format_3164(old) == "<13>Feb  5 17:32:18 10.0.0.99 myproc[10]: Use the BFG!")
+    say(f, "priority packs two numbers into one", syslog.priority_of(20, 5) == 165)
+    say(f, "and unpacks the same way", syslog.facility_of(165) == 20 and
+        syslog.severity_of(165) == 5)
+    // Lower is worse, which is the one thing everybody gets backwards.
+    say(f, "a critical message is at least an error level",
+        syslog.at_least(m, syslog.ERROR))
+    say(f, "and a notice is not", not syslog.at_least(sd, syslog.ERROR))
+    say(f, "the three characters that need escaping are escaped",
+        syslog.escape_value("a\"b]c\\d") == "a\\\"b\\]c\\\\d")
+    say(f, "and no others are", syslog.escape_value("a=b c") == "a=b c")
+    say(f, "an element renders as the grammar wants",
+        syslog.structured_element("x@1", ["k"], ["v\"w"]) == "[x@1 k=\"v\\\"w\"]")
+    say(f, "a line with no priority is refused",
+        syslog_refuses("Feb  5 17:32:18 host x: y"))
+    say(f, "480 bytes is the length UDP guarantees",
+        syslog.is_safe_length(line) and not syslog.is_safe_length("x".repeat(500)))
+}
+
+fn check_robots(inout f: i64) / {io} {
+    print("-- robots: longest match, not first match")
+    let text = "# a comment\n" +
+    "User-agent: *\n" +
+    "Disallow: /\n" +
+    "Allow: /public/\n" +
+    "Crawl-delay: 10\n" +
+    "\n" +
+    "User-agent: Googlebot\n" +
+    "User-agent: Bingbot\n" +
+    "Disallow: /private/\n" +
+    "Disallow: /*.pdf$\n" +
+    "\n" +
+    "Sitemap: https://x.test/sitemap.xml\n"
+    let file = robots.parse(text)
+    say(f, "two groups", robots.group_count(file) == 2)
+    say(f, "and a file-level sitemap that belongs to neither",
+        robots.sitemaps(file) == ["https://x.test/sitemap.xml"])
+    say(f, "a bot with no group of its own gets the star group",
+        not robots.allowed(file, "SomeBot", "/"))
+    say(f, "where a longer Allow beats a shorter Disallow",
+        robots.allowed(file, "SomeBot", "/public/page"))
+    say(f, "and anything else stays refused",
+        not robots.allowed(file, "SomeBot", "/private/x"))
+    // The rule most often got wrong: a named group replaces the star group,
+    // it does not add to it.
+    say(f, "a named bot does not inherit the star group's Disallow",
+        robots.allowed(file, "Googlebot/2.1", "/"))
+    say(f, "it obeys only its own rules",
+        not robots.allowed(file, "Googlebot/2.1", "/private/x"))
+    say(f, "which two agent names can share",
+        not robots.allowed(file, "Bingbot", "/private/x"))
+    say(f, "a wildcard matches any run", not robots.allowed(file, "Bingbot", "/a/b.pdf"))
+    say(f, "and `$` anchors the end", robots.allowed(file, "Bingbot", "/a/b.pdf.html"))
+    say(f, "the crawl delay is per group",
+        robots.crawl_delay(file, "SomeBot") == 10)
+    say(f, "and absent where it was not written",
+        robots.crawl_delay(file, "Googlebot") == 0 - 1)
+    say(f, "a comment is not a directive", robots.ignored_lines(file) == 0)
+    let odd = robots.parse("User-agent: *\nNoindex: /x\nrubbish\nDisallow: /y\n")
+    say(f, "an unknown directive is counted, not obeyed",
+        robots.ignored_lines(odd) == 2)
+    say(f, "and the rules around it still apply", not robots.allowed(odd, "b", "/y"))
+    say(f, "a 404 means everything is allowed",
+        robots.allowed(robots.allow_all(), "any", "/anything"))
+    say(f, "a 403 means nothing is",
+        not robots.allowed(robots.deny_all(), "any", "/anything"))
+    say(f, "rendering a file gives something parseable back",
+        robots.group_count(robots.parse(robots.render(file))) == 2)
+}
+
+fn check_sitemap(inout f: i64) / {io} {
+    print("-- sitemap: the limits are the format")
+    say(f, "a sitemap holds 50,000 URLs", sitemap.max_urls() == 50000)
+    say(f, "and 50 MB", sitemap.max_bytes() == 52428800)
+    let one = sitemap.with_priority(
+        sitemap.with_frequency(
+            sitemap.with_modified(sitemap.url("https://x.test/a?b=1&c=2"),
+                "2026-01-01"), "daily"), 0.8)
+    let doc = sitemap.render([one]) ?? ""
+    // An ampersand in a query string is escaped twice over: once as a URL and
+    // once as XML. Missing the second makes the file unparseable.
+    say(f, "an ampersand is escaped", doc.contains("b=1&amp;c=2"))
+    say(f, "the namespace is declared",
+        doc.contains("http://www.sitemaps.org/schemas/sitemap/0.9"))
+    say(f, "the priority is written to one place", doc.contains("<priority>0.8</priority>"))
+    let back = sitemap.parse(doc) ?? []
+    say(f, "it reads back as one URL", back.len() == 1)
+    say(f, "with the ampersand unescaped again",
+        back[0].location == "https://x.test/a?b=1&c=2")
+    say(f, "and every field intact", back[0].last_modified == "2026-01-01" and
+        back[0].change_frequency == "daily" and back[0].priority == 0.8)
+    var many: [SitemapUrl] = []
+    for i in 0..250 {
+        many.push(sitemap.url("https://x.test/{i}"))
+    }
+    let parts = sitemap.split(many, 100)
+    say(f, "250 URLs at 100 a file is three files", parts.len() == 3)
+    say(f, "the first is full", parts[0].len() == 100)
+    say(f, "and the last holds the remainder", parts[2].len() == 50)
+    let index = sitemap.render_index(["https://x.test/s1.xml", "https://x.test/s2.xml"],
+        ["2026-01-01", ""]) ?? ""
+    let parts_back = sitemap.parse_index(index) ?? []
+    say(f, "an index names its parts",
+        parts_back == ["https://x.test/s1.xml", "https://x.test/s2.xml"])
+    say(f, "and omits a lastmod it was not given",
+        index.contains("<lastmod>2026-01-01</lastmod>") and
+        not index.contains("<lastmod></lastmod>"))
+    match sitemap.render([sitemap.with_priority(sitemap.url("https://x.test/"), 2.0)]) {
+        Ok(_v) -> say(f, "a priority above one is refused", false)
+        Err(_e) -> say(f, "a priority above one is refused", true)
+    }
+    say(f, "a valid frequency is one of seven words",
+        sitemap.is_valid_frequency("weekly") and not sitemap.is_valid_frequency("often"))
+    say(f, "fits() answers before the file is built", sitemap.fits(many))
+    say(f, "something that is not a sitemap is refused",
+        sitemap_refuses("<html></html>"))
+}
+
+fn check_mimetype(inout f: i64) / {io} {
+    print("-- mimetype: what it claims, and what it is")
+    say(f, "an extension is matched case-insensitively",
+        mimetype.by_name("photo.PNG") == "image/png")
+    say(f, "the last extension is the one that counts",
+        mimetype.by_name("archive.tar.gz") == "application/gzip")
+    say(f, "a name with no extension is unidentified",
+        mimetype.by_name("README") == "application/octet-stream")
+    say(f, "a dot in a directory is not an extension",
+        mimetype.by_name("/a.b/c") == "application/octet-stream")
+    say(f, "the unknown type is the one browsers download",
+        mimetype.unknown() == "application/octet-stream")
+    say(f, "and the mapping runs the other way too",
+        mimetype.extension_for("font/woff2") == Some("woff2"))
+    // The content, which is the answer to trust.
+    say(f, "a PNG is known by its signature",
+        mimetype.sniff(bytes_of([137, 80, 78, 71, 13, 10, 26, 10, 0, 0])) == "image/png")
+    say(f, "a JPEG by three bytes", mimetype.sniff(bytes_of([255, 216, 255, 224])) ==
+        "image/jpeg")
+    say(f, "a RIFF container needs its second signature too",
+        mimetype.sniff(bytes_of([82, 73, 70, 70, 0, 0, 0, 0, 87, 69, 66, 80])) ==
+        "image/webp")
+    say(f, "and the same container can be audio",
+        mimetype.sniff(bytes_of([82, 73, 70, 70, 0, 0, 0, 0, 87, 65, 86, 69])) ==
+        "audio/wav")
+    say(f, "a PDF by its header", mimetype.sniff("%PDF-1.7\n".to_bytes()) ==
+        "application/pdf")
+    say(f, "wasm by its magic number",
+        mimetype.sniff(bytes_of([0, 97, 115, 109, 1, 0, 0, 0])) == "application/wasm")
+    say(f, "HTML by what it starts with",
+        mimetype.sniff("<!DOCTYPE html><p>hi".to_bytes()) == "text/html")
+    say(f, "and text by the absence of control bytes",
+        mimetype.sniff("just words".to_bytes()) == "text/plain")
+    say(f, "binary with no signature stays unknown",
+        mimetype.sniff(bytes_of([1, 2, 3, 4])) == "application/octet-stream")
+    // The check an upload endpoint needs.
+    let png = bytes_of([137, 80, 78, 71, 13, 10, 26, 10, 0])
+    say(f, "a name and its content can agree", mimetype.agrees("a.png", png))
+    say(f, "and a .png full of HTML does not",
+        not mimetype.agrees("a.png", "<html><script>".to_bytes()))
+    say(f, "a text file sniffing as plain text is not a disagreement",
+        mimetype.agrees("a.css", "body \{ }".to_bytes()))
+    say(f, "SVG is executable in a browser, whatever its extension says",
+        mimetype.is_executable_in_browser("image/svg+xml"))
+    say(f, "and a PNG is not", not mimetype.is_executable_in_browser("image/png"))
+    say(f, "text is worth compressing", mimetype.is_compressible("text/css"))
+    say(f, "and an already-compressed image is not",
+        not mimetype.is_compressible("image/png"))
+    let parsed = mimetype.parse("text/HTML; charset=\"utf-8\"; boundary=x") ??
+    mimetype.media_type("a", "b")
+    say(f, "the type is lowercased", mimetype.essence(parsed) == "text/html")
+    say(f, "a quoted parameter loses its quotes",
+        mimetype.parameter(parsed, "charset") == Some("utf-8"))
+    say(f, "and an absent one is None", mimetype.parameter(parsed, "q") == None)
+    say(f, "rendering keeps the parameters",
+        mimetype.render(parsed) == "text/html; charset=utf-8; boundary=x")
+    say(f, "text needs a charset to be read", mimetype.needs_charset(parsed))
+    say(f, "a type with no slash is refused", mime_refuses("texthtml"))
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_ntp(f)
+    check_syslog(f)
+    check_robots(f)
+    check_sitemap(f)
+    check_mimetype(f)
+
+    if f == 0 {
+        print("network wire formats: every claim held")
+    } else {
+        print("network wire formats: {f} failed")
+    }
+}

@@ -1,0 +1,28 @@
+[package]
+name = "sysfile_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.atomicfile]
+path = "../atomicfile"
+version = "^1.0.0"
+
+[dependencies.pidfile]
+path = "../pidfile"
+version = "^1.0.0"
+
+[dependencies.lockfile]
+path = "../lockfile"
+version = "^1.0.0"
+
+[dependencies.shutdown]
+path = "../shutdown"
+version = "^1.0.0"
+
+[dependencies.envcfg]
+path = "../envcfg"
+version = "^1.0.0"
+
+[dependencies.path]
+path = "../path"
+version = "^1.0.0"

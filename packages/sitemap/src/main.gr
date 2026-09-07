@@ -1,0 +1,233 @@
+// XML sitemaps: the file that tells a crawler what exists.
+//
+// The format is small and the limits are the interesting part. A sitemap may
+// hold 50,000 URLs and may not exceed 50 MB uncompressed; past either, it has
+// to be split and an *index* written pointing at the parts. A generator that
+// ignores those limits produces a file search engines reject silently, which
+// is the worst kind of failure — the site looks fine and is not indexed.
+//
+// So the limits are checked here rather than left as documentation, and
+// `split` exists because reaching them is normal rather than exceptional.
+
+type SitemapUrl = {
+    location: str,
+    /// W3C date, "" when unknown.
+    last_modified: str,
+    /// "always", "hourly", "daily", "weekly", "monthly", "yearly", "never".
+    change_frequency: str,
+    /// 0.0 to 1.0; -1.0 when unset.
+    priority: f64,
+}
+
+type SitemapError =
+    | TooManyUrls(count: i64)
+    | TooLarge(bytes: i64)
+    | BadPriority(value: f64)
+    | NotXml(why: str)
+
+pub fn max_urls() -> i64 {
+    return 50000
+}
+
+pub fn max_bytes() -> i64 {
+    return 52428800
+}
+
+pub fn url(location: str) -> SitemapUrl {
+    return SitemapUrl{
+        location: location, last_modified: "", change_frequency: "",
+        priority: 0.0 - 1.0,
+    }
+}
+
+pub fn with_modified(u: SitemapUrl, when: str) -> SitemapUrl {
+    return SitemapUrl{
+        location: u.location, last_modified: when,
+        change_frequency: u.change_frequency, priority: u.priority,
+    }
+}
+
+pub fn with_frequency(u: SitemapUrl, how_often: str) -> SitemapUrl {
+    return SitemapUrl{
+        location: u.location, last_modified: u.last_modified,
+        change_frequency: how_often, priority: u.priority,
+    }
+}
+
+pub fn with_priority(u: SitemapUrl, priority: f64) -> SitemapUrl {
+    return SitemapUrl{
+        location: u.location, last_modified: u.last_modified,
+        change_frequency: u.change_frequency, priority: priority,
+    }
+}
+
+/// The five characters XML requires escaped, and no others.
+///
+/// A URL in a sitemap is escaped twice over: percent-encoded as a URL, then
+/// entity-escaped as XML. An `&` in a query string that skips the second step
+/// makes the whole file unparseable.
+pub fn escape(text: str) -> str {
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        .replace("\"", "&quot;").replace("'", "&apos;")
+}
+
+pub fn unescape(text: str) -> str {
+    // `&amp;` last, so `&amp;lt;` does not become `<`.
+    return text.replace("&lt;", "<").replace("&gt;", ">")
+        .replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&")
+}
+
+fn entry_xml(u: SitemapUrl) -> str {
+    var out = "  <url>\n    <loc>{escape(u.location)}</loc>\n"
+    if u.last_modified != "" {
+        out = out + "    <lastmod>{u.last_modified}</lastmod>\n"
+    }
+    if u.change_frequency != "" {
+        out = out + "    <changefreq>{u.change_frequency}</changefreq>\n"
+    }
+    if u.priority >= 0.0 {
+        out = out + "    <priority>{u.priority.to_fixed(1)}</priority>\n"
+    }
+    return out + "  </url>\n"
+}
+
+pub fn render(urls: [SitemapUrl]) -> str ! SitemapError {
+    if urls.len() > max_urls() {
+        fail(TooManyUrls(urls.len()))
+    }
+    var out = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
+    "<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n"
+    for u in urls {
+        if u.priority > 1.0 or (u.priority < 0.0 and u.priority != 0.0 - 1.0) {
+            fail(BadPriority(u.priority))
+        }
+        out = out + entry_xml(u)
+    }
+    out = out + "</urlset>\n"
+    if out.byte_len() > max_bytes() {
+        fail(TooLarge(out.byte_len()))
+    }
+    return out
+}
+
+/// A sitemap index, which is what more than 50,000 URLs needs.
+pub fn render_index(locations: [str], modified: [str]) -> str ! SitemapError {
+    if locations.len() > max_urls() {
+        fail(TooManyUrls(locations.len()))
+    }
+    var out = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
+    "<sitemapindex xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n"
+    for i in 0..locations.len() {
+        out = out + "  <sitemap>\n    <loc>{escape(locations[i])}</loc>\n"
+        if i < modified.len() and modified[i] != "" {
+            out = out + "    <lastmod>{modified[i]}</lastmod>\n"
+        }
+        out = out + "  </sitemap>\n"
+    }
+    return out + "</sitemapindex>\n"
+}
+
+/// Cut a list into files that each fit, which is what the limits force.
+pub fn split(urls: [SitemapUrl], per_file: i64) -> [[SitemapUrl]] {
+    var out: [[SitemapUrl]] = []
+    let size = if per_file < 1 or per_file > max_urls() { max_urls() } else { per_file }
+    var current: [SitemapUrl] = []
+    for u in urls {
+        current.push(u)
+        if current.len() == size {
+            out.push(current)
+            current = []
+        }
+    }
+    if current.len() > 0 {
+        out.push(current)
+    }
+    return out
+}
+
+fn tag_text(xml: str, tag: str, from: i64) -> (str, i64) {
+    let open = "<{tag}>"
+    let close = "</{tag}>"
+    let rest = xml.substr(from, xml.len() - from)
+    match rest.index_of(open) {
+        None -> return ("", 0 - 1)
+        Some(at) -> {
+            let body_at = at + open.len()
+            let after = rest.substr(body_at, rest.len() - body_at)
+            match after.index_of(close) {
+                None -> return ("", 0 - 1)
+                Some(end) -> return (after.substr(0, end),
+                    from + body_at + end + close.len())
+            }
+        }
+    }
+}
+
+/// Read the URLs back out.
+///
+/// Deliberately not a general XML parser: a sitemap is a fixed shape, and a
+/// reader that accepts anything else accepts files that are not sitemaps.
+pub fn parse(xml: str) -> [SitemapUrl] ! SitemapError {
+    if not xml.contains("<urlset") {
+        fail(NotXml("no <urlset> element"))
+    }
+    var out: [SitemapUrl] = []
+    var at = 0
+    while true {
+        let block = tag_text(xml, "url", at)
+        if block.1 < 0 {
+            break
+        }
+        let body = block.0
+        let loc = tag_text(body, "loc", 0)
+        if loc.1 < 0 {
+            fail(NotXml("a <url> with no <loc>"))
+        }
+        var entry = url(unescape(loc.0.trim()))
+        let modified = tag_text(body, "lastmod", 0)
+        if modified.1 >= 0 {
+            entry = with_modified(entry, modified.0.trim())
+        }
+        let frequency = tag_text(body, "changefreq", 0)
+        if frequency.1 >= 0 {
+            entry = with_frequency(entry, frequency.0.trim())
+        }
+        let priority = tag_text(body, "priority", 0)
+        if priority.1 >= 0 {
+            entry = with_priority(entry, priority.0.trim().parse_float() ?? 0.0 - 1.0)
+        }
+        out.push(entry)
+        at = block.1
+    }
+    return out
+}
+
+pub fn parse_index(xml: str) -> [str] ! SitemapError {
+    if not xml.contains("<sitemapindex") {
+        fail(NotXml("no <sitemapindex> element"))
+    }
+    var out: [str] = []
+    var at = 0
+    while true {
+        let block = tag_text(xml, "sitemap", at)
+        if block.1 < 0 {
+            break
+        }
+        let loc = tag_text(block.0, "loc", 0)
+        if loc.1 >= 0 {
+            out.push(unescape(loc.0.trim()))
+        }
+        at = block.1
+    }
+    return out
+}
+
+/// Whether a list would fit in one file, before rendering it.
+pub fn fits(urls: [SitemapUrl]) -> bool {
+    return urls.len() <= max_urls()
+}
+
+pub fn is_valid_frequency(word: str) -> bool {
+    return ["always", "hourly", "daily", "weekly", "monthly", "yearly",
+        "never"].contains(word)
+}

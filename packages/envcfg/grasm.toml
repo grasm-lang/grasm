@@ -1,0 +1,6 @@
+[package]
+name = "envcfg"
+version = "1.0.0"
+
+# Configuration from the environment, typed and checked. Opens nothing.
+capabilities = []

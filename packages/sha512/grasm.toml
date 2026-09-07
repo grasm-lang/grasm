@@ -1,0 +1,6 @@
+[package]
+name = "sha512"
+version = "1.0.0"
+
+# FIPS 180-4 SHA-512. Opens nothing.
+capabilities = []

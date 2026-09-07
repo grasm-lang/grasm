@@ -1,0 +1,6 @@
+[package]
+name = "sha3"
+version = "1.0.0"
+
+# FIPS 202 SHA-3 and SHAKE. Opens nothing.
+capabilities = []

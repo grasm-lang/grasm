@@ -72,6 +72,12 @@ pub fn decode(s: str) -> bytes ! Base32Error {
         if bits >= 8 {
             bits = bits - 8
             out.push((acc / (2 ^ bits)) % 256)
+            // Drop the bits just emitted. Without this, `acc` keeps every
+            // character ever read and multiplies by 32 each time, so it
+            // overflows an `i64` after thirteen of them -- and a wrapped
+            // `acc` is still a number, so what came out was bytes, just the
+            // wrong ones. Anything long enough to matter decoded to rubbish.
+            acc = acc % (2 ^ bits)
         }
         i = i + 1
     }

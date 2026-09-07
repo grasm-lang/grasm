@@ -1,0 +1,253 @@
+// robots.txt: which paths a crawler is allowed to fetch.
+//
+// The file looks like a list of prefixes and is not. Four rules decide every
+// answer, and getting any of them wrong means either crawling what was
+// forbidden or refusing what was offered:
+//
+//   1. **Groups.** Consecutive `User-agent` lines share the rules that follow.
+//      A blank line or a rule ends the run of agent names.
+//   2. **One group applies.** The most specific matching agent wins, and if
+//      any agent matches by name, the `*` group is ignored entirely — not
+//      merged with it.
+//   3. **Longest match wins**, not first match. A later `Disallow: /` does not
+//      override an earlier `Allow: /public/page`.
+//   4. **`Allow` wins a tie.** Equal-length rules resolve in favour of
+//      fetching.
+//
+// The file is advisory and this package treats it as data, not as a fetcher:
+// it opens nothing, and the caller supplies the text.
+
+type RobotsRule = {
+    /// The path pattern, which may contain `*` and end with `$`.
+    pattern: str,
+    allow: bool,
+}
+
+type RobotsGroup = {
+    agents: [str],
+    rule: [RobotsRule],
+    /// Seconds; -1 when the file did not say.
+    crawl_delay: i64,
+}
+
+type RobotsFile = {
+    group: [RobotsGroup],
+    sitemap: [str],
+    /// Lines that were not a directive at all.
+    ignored: i64,
+}
+
+pub fn parse(text: str) -> RobotsFile {
+    var groups: [RobotsGroup] = []
+    var sitemaps: [str] = []
+    var ignored = 0
+    var agents: [str] = []
+    var rules: [RobotsRule] = []
+    var delay = 0 - 1
+    var taking_agents = false
+    for raw in text.lines() {
+        var line = raw
+        // A comment runs to the end of the line, wherever it starts.
+        match line.index_of("#") {
+            Some(at) -> line = line.substr(0, at)
+            None -> {}
+        }
+        line = line.trim()
+        if line == "" {
+            continue
+        }
+        let at = line.index_of(":") ?? 0 - 1
+        if at < 0 {
+            ignored = ignored + 1
+            continue
+        }
+        let field = line.substr(0, at).trim().to_lower()
+        let value = line.substr(at + 1, line.len() - at - 1).trim()
+        if field == "user-agent" {
+            // A new agent line after rules starts a new group.
+            if not taking_agents and agents.len() > 0 {
+                groups.push(RobotsGroup{
+                    agents: agents, rule: rules, crawl_delay: delay,
+                })
+                agents = []
+                rules = []
+                delay = 0 - 1
+            }
+            agents.push(value.to_lower())
+            taking_agents = true
+            continue
+        }
+        if field == "sitemap" {
+            // Sitemap is a file-level directive and belongs to no group.
+            sitemaps.push(value)
+            continue
+        }
+        taking_agents = false
+        if field == "allow" {
+            rules.push(RobotsRule{ pattern: value, allow: true })
+        } else if field == "disallow" {
+            rules.push(RobotsRule{ pattern: value, allow: false })
+        } else if field == "crawl-delay" {
+            delay = value.parse_int() ?? 0 - 1
+        } else {
+            ignored = ignored + 1
+        }
+    }
+    if agents.len() > 0 {
+        groups.push(RobotsGroup{ agents: agents, rule: rules, crawl_delay: delay })
+    }
+    return RobotsFile{ group: groups, sitemap: sitemaps, ignored: ignored }
+}
+
+/// Whether `pattern` matches `path`, with `*` for any run and `$` for the end.
+fn matches(pattern: str, path: str) -> bool {
+    if pattern == "" {
+        return false
+    }
+    var p = pattern
+    var anchored = false
+    if p.ends_with("$") {
+        anchored = true
+        p = p.substr(0, p.len() - 1)
+    }
+    let parts = p.split("*")
+    var at = 0
+    for i in 0..parts.len() {
+        let piece = parts[i]
+        if piece == "" {
+            continue
+        }
+        if i == 0 {
+            if not path.substr(at, path.len() - at).starts_with(piece) {
+                return false
+            }
+            at = at + piece.len()
+            continue
+        }
+        let rest = path.substr(at, path.len() - at)
+        match rest.index_of(piece) {
+            Some(found) -> at = at + found + piece.len()
+            None -> return false
+        }
+    }
+    if anchored {
+        // With a trailing `*` before the `$`, anything may follow.
+        if parts[parts.len() - 1] == "" {
+            return true
+        }
+        return at == path.len()
+    }
+    return true
+}
+
+/// The group that applies to `agent`: the longest matching name, or `*`.
+///
+/// If any group names the agent, the `*` group does not apply at all. Merging
+/// the two is the common mistake, and it makes a crawler obey rules written
+/// for somebody else.
+pub fn group_for(file: RobotsFile, agent: str) -> Option[RobotsGroup] {
+    let want = agent.to_lower()
+    var best = 0 - 1
+    var found: Option[RobotsGroup] = None
+    var star: Option[RobotsGroup] = None
+    for g in file.group {
+        for name in g.agents {
+            if name == "*" {
+                star = Some(g)
+                continue
+            }
+            if want.starts_with(name) and name.len() > best {
+                best = name.len()
+                found = Some(g)
+            }
+        }
+    }
+    if found != None {
+        return found
+    }
+    return star
+}
+
+/// Whether `agent` may fetch `path`.
+///
+/// Longest match wins and a tie goes to `Allow`, which is what makes
+/// `Disallow: /` plus `Allow: /public/` mean "only /public/".
+pub fn allowed(file: RobotsFile, agent: str, path: str) -> bool {
+    match group_for(file, agent) {
+        None -> return true
+        Some(g) -> {
+            var best = 0
+            var verdict = true
+            for r in g.rule {
+                if matches(r.pattern, path) {
+                    let width = r.pattern.replace("$", "").len()
+                    if width > best or (width == best and r.allow) {
+                        best = width
+                        verdict = r.allow
+                    }
+                }
+            }
+            return verdict
+        }
+    }
+}
+
+/// The crawl delay for an agent, or -1 when the file did not say.
+pub fn crawl_delay(file: RobotsFile, agent: str) -> i64 {
+    match group_for(file, agent) {
+        None -> return 0 - 1
+        Some(g) -> return g.crawl_delay
+    }
+}
+
+pub fn sitemaps(file: RobotsFile) -> [str] {
+    return file.sitemap
+}
+
+pub fn group_count(file: RobotsFile) -> i64 {
+    return file.group.len()
+}
+
+pub fn ignored_lines(file: RobotsFile) -> i64 {
+    return file.ignored
+}
+
+/// A file that forbids everything to everyone — what a 401 or 403 on
+/// robots.txt is conventionally taken to mean.
+pub fn deny_all() -> RobotsFile {
+    return RobotsFile{
+        group: [RobotsGroup{
+            agents: ["*"],
+            rule: [RobotsRule{ pattern: "/", allow: false }],
+            crawl_delay: 0 - 1,
+        }],
+        sitemap: [],
+        ignored: 0,
+    }
+}
+
+/// And one that permits everything — what a 404 means.
+pub fn allow_all() -> RobotsFile {
+    return RobotsFile{ group: [], sitemap: [], ignored: 0 }
+}
+
+pub fn render(file: RobotsFile) -> str {
+    var out: [str] = []
+    for g in file.group {
+        for a in g.agents {
+            out.push("User-agent: {a}")
+        }
+        for r in g.rule {
+            let word = if r.allow { "Allow" } else { "Disallow" }
+            out.push("{word}: {r.pattern}")
+        }
+        if g.crawl_delay >= 0 {
+            out.push("Crawl-delay: {g.crawl_delay}")
+        }
+        out.push("")
+    }
+    for s in file.sitemap {
+        out.push("Sitemap: {s}")
+    }
+    return out.join("\n")
+}

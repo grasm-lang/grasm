@@ -1,0 +1,334 @@
+// Five packages a long-running program needs before it needs anything else:
+// replacing a file without destroying it, recording which process is running,
+// taking an advisory lock, stopping in an order, and reading its settings.
+//
+// Only relative names are printed, so three engines agree byte for byte on a
+// machine whose temporary directory is somewhere else.
+import atomicfile
+import pidfile
+import lockfile
+import shutdown
+import envcfg
+import path
+
+fn pid_refuses(text: str) -> bool {
+    match pidfile.parse(text) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn env_refuses(c: EnvConfig, name: str) -> bool {
+    match envcfg.text(c, name) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn lock_refuses(text: str) -> bool {
+    match lockfile.parse(text) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn scratch() -> str / {io} {
+    return path.join(env("TMPDIR") ?? "/tmp", "grasm_sysfile_demo")
+}
+
+fn tidy(root: str) / {io} {
+    for name in ["config.json", "config.json.bak", "state", "app.pid",
+        "config.json.w1.tmp"] {
+        match remove_file(path.join(root, name)) {
+            Ok(_v) -> {}
+            Err(_e) -> {}
+        }
+    }
+}
+
+fn check_atomicfile(inout f: i64, root: str) / {io} {
+    print("-- atomicfile: replaced, or untouched")
+    let target = path.join(root, "config.json")
+    say(f, "reading an absent file gives the fallback",
+        (atomicfile.read_text_or(target, "empty") ?? "!") == "empty")
+    match atomicfile.write_text(target, "first", "w1") {
+        Ok(_v) -> say(f, "a first write lands", true)
+        Err(_e) -> say(f, "a first write lands", false)
+    }
+    say(f, "and reads back", (atomicfile.read_text_or(target, "") ?? "") == "first")
+    say(f, "the temporary is gone afterwards",
+        not atomicfile.has_stale_temp(target, "w1"))
+    say(f, "and its name is knowable in advance",
+        atomicfile.temp_for(target, "w1").ends_with("config.json.w1.tmp"))
+    let had = atomicfile.write_with_backup(target, "second".to_bytes(), "w1", ".bak") ?? false
+    say(f, "a backup is kept when there was something to keep", had)
+    say(f, "the new contents are there",
+        (atomicfile.read_text_or(target, "") ?? "") == "second")
+    say(f, "and the old ones beside them",
+        (atomicfile.read_text_or(target + ".bak", "") ?? "") == "first")
+    match atomicfile.update(target, |b| (b.to_str() + "-more").to_bytes(),
+        "".to_bytes(), "w1") {
+        Ok(_v) -> say(f, "update reads, changes and writes", true)
+        Err(_e) -> say(f, "update reads, changes and writes", false)
+    }
+    say(f, "leaving the transformed contents",
+        (atomicfile.read_text_or(target, "") ?? "") == "second-more")
+    match atomicfile.write_lines(path.join(root, "state"), ["a", "b"], "w1") {
+        Ok(_v) -> say(f, "lines are written with a trailing newline",
+            (atomicfile.read_text_or(path.join(root, "state"), "") ?? "") == "a\nb\n")
+        Err(_e) -> say(f, "lines are written with a trailing newline", false)
+    }
+    // Writing into a directory that does not exist must fail rather than
+    // silently do nothing.
+    match atomicfile.write_text(path.join(root, "no/such/dir/x"), "y", "w1") {
+        Ok(_v) -> say(f, "a write that cannot land is reported", false)
+        Err(_e) -> say(f, "a write that cannot land is reported", true)
+    }
+}
+
+fn check_pidfile(inout f: i64, root: str) / {io} {
+    print("-- pidfile: whose process id is this, really")
+    let target = path.join(root, "app.pid")
+    let mine = pidfile.record(4242, 1700000000, "server")
+    say(f, "a record renders as one readable line",
+        pidfile.render(mine) == "4242 1700000000 server\n")
+    say(f, "and parses back", (pidfile.parse(pidfile.render(mine)) ??
+        pidfile.record(0, 0, "")).pid == 4242)
+    say(f, "the bare-number form is still readable",
+        (pidfile.parse("991\n") ?? pidfile.record(0, 0, "")).pid == 991)
+    say(f, "but carries no start time to check against",
+        not pidfile.matches(pidfile.parse("991\n") ?? pidfile.record(0, 0, ""), 5, 2))
+    say(f, "rubbish is refused", pid_refuses("not a pid"))
+    match pidfile.write(target, mine) {
+        Ok(_v) -> say(f, "the file is written", pidfile.exists(target))
+        Err(_e) -> say(f, "the file is written", false)
+    }
+    let read_back = pidfile.read(target) ?? pidfile.record(0, 0, "")
+    say(f, "and read back whole", read_back.pid == 4242 and read_back.name == "server")
+    // The check the whole package exists for: a live process at that pid that
+    // started at a different time is not the process that wrote this.
+    say(f, "a process that started when we did is ours",
+        pidfile.matches(read_back, 1700000001, 5))
+    say(f, "one that started later is a recycled id",
+        not pidfile.matches(read_back, 1700009999, 5))
+    match pidfile.claim(target, pidfile.record(77, 1700000500, "other"), true) {
+        Ok(_v) -> say(f, "a live holder refuses a claim", false)
+        Err(_e) -> say(f, "a live holder refuses a claim", true)
+    }
+    match pidfile.claim(target, pidfile.record(77, 1700000500, "other"), false) {
+        Ok(_v) -> say(f, "a dead one does not", true)
+        Err(_e) -> say(f, "a dead one does not", false)
+    }
+    say(f, "releasing somebody else's file does nothing",
+        not pidfile.give_up(target, mine))
+    say(f, "releasing our own removes it",
+        pidfile.give_up(target, pidfile.record(77, 1700000500, "other")))
+    say(f, "and then it is gone", not pidfile.exists(target))
+    say(f, "age is measured from the start time",
+        pidfile.age_seconds(mine, 1700000060) == 60)
+}
+
+fn check_lockfile(inout f: i64) / {io} {
+    print("-- lockfile: advisory, with the race written down")
+    // A `ref` rather than a plain `var`: a closure captures values, so a
+    // write to one would change a copy nobody can see. A reference copies as
+    // a slot, which is what makes these two closures share the file.
+    let held = ref("")
+    let read = || if held.value == "" { None } else { Some(held.value) }
+    let write = |text| {
+        held.value = text
+        true
+    }
+    let me = lockfile.owner("host-a", 0, 30)
+    say(f, "an empty file means take it",
+        lockfile.decide(None, "host-a", 100) == lockfile.TAKE)
+    let taken = lockfile.try_acquire(read, write, me, 100) ??
+    lockfile.owner("", 0, 0)
+    say(f, "and the lock is taken", taken.holder == "host-a")
+    say(f, "with the time it happened", taken.taken_at == 100)
+    say(f, "a live lease belongs to somebody",
+        lockfile.decide(Some(taken), "host-b", 110) == lockfile.WAIT)
+    say(f, "and to its own holder it is a renewal",
+        lockfile.decide(Some(taken), "host-a", 110) == lockfile.RENEW)
+    let other = lockfile.owner("host-b", 0, 30)
+    match lockfile.try_acquire(read, write, other, 110) {
+        Ok(_v) -> say(f, "another host cannot take a live lock", false)
+        Err(_e) -> say(f, "another host cannot take a live lock", true)
+    }
+    say(f, "the lease has time left", lockfile.seconds_left(taken, 110) == 20)
+    say(f, "and runs out on schedule", lockfile.is_stale(taken, 130))
+    say(f, "a stale lock may be taken",
+        lockfile.decide(Some(taken), "host-b", 131) == lockfile.TAKE)
+    let stolen = lockfile.try_acquire(read, write, other, 131) ??
+    lockfile.owner("", 0, 0)
+    say(f, "and is", stolen.holder == "host-b")
+    match lockfile.renew(read, write, me, 140) {
+        Ok(_v) -> say(f, "the old holder cannot renew what it lost", false)
+        Err(_e) -> say(f, "the old holder cannot renew what it lost", true)
+    }
+    let renewed = lockfile.renew(read, write, other, 140) ?? lockfile.owner("", 0, 0)
+    say(f, "the new one can", renewed.taken_at == 140)
+    match lockfile.unlock(read, || false, "host-b") {
+        Ok(_v) -> say(f, "an unlock that cannot remove is reported", false)
+        Err(_e) -> say(f, "an unlock that cannot remove is reported", true)
+    }
+    match lockfile.unlock(read, || false, "host-a") {
+        Ok(_v) -> say(f, "and one by the wrong holder is refused", false)
+        Err(_e) -> say(f, "and one by the wrong holder is refused", true)
+    }
+    let clock = ref(200)
+    let tick = || {
+        clock.value = clock.value + 10
+        clock.value
+    }
+    match lockfile.acquire_until(read, |_t| false, me, tick, 205, 3) {
+        Ok(_v) -> say(f, "waiting past the deadline gives up", false)
+        Err(_e) -> say(f, "waiting past the deadline gives up", true)
+    }
+    say(f, "a malformed lock file is not read as one", lock_refuses("junk"))
+}
+
+fn check_shutdown(inout f: i64) / {io} {
+    print("-- shutdown: stop accepting, drain, close, exit")
+    var s = shutdown.new_shutdown()
+    let order = ref("")
+    shutdown.on(s, "listener", shutdown.PHASE_STOP_ACCEPTING, || {
+        order.value = order.value + "listener "
+        true
+    })
+    shutdown.on(s, "requests", shutdown.PHASE_DRAIN, || {
+        order.value = order.value + "requests "
+        true
+    })
+    shutdown.on(s, "database", shutdown.PHASE_CLOSE, || {
+        order.value = order.value + "database "
+        true
+    })
+    shutdown.on(s, "cache", shutdown.PHASE_CLOSE, || {
+        order.value = order.value + "cache "
+        false
+    })
+    shutdown.on(s, "logs", shutdown.PHASE_FLUSH, || {
+        order.value = order.value + "logs "
+        true
+    })
+    say(f, "work is accepted while running", shutdown.accept(s))
+    say(f, "and counted", shutdown.in_flight(s) == 1)
+    say(f, "the plan can be read before it is trusted", shutdown.plan(s).len() == 5)
+    say(f, "beginning a shutdown succeeds once",
+        shutdown.begin(s, "SIGTERM", 1000))
+    say(f, "and not twice", not shutdown.begin(s, "SIGINT", 1001))
+    say(f, "the first reason is the one kept", shutdown.reason(s) == "SIGTERM")
+    say(f, "no more work is accepted", not shutdown.accept(s))
+    say(f, "so the count cannot grow", shutdown.in_flight(s) == 1)
+    shutdown.finish_one(s)
+    say(f, "and the drain completes", shutdown.drained(s))
+    let now = ref(1000)
+    let clock = || {
+        now.value = now.value + 5
+        now.value
+    }
+    let report = shutdown.run(s, clock, 2000)
+    say(f, "every hook ran", report.skipped.len() == 0)
+    say(f, "four finished", report.completed.len() == 4)
+    say(f, "one reported failure", report.failed == ["cache"])
+    say(f, "and phases ran in order",
+        order.value == "listener requests cache database logs ")
+    say(f, "within a phase, later registrations come down first",
+        order.value.contains("cache database"))
+    say(f, "the elapsed time is measured", report.elapsed_millis > 0)
+    say(f, "a failed hook is exit code 1", shutdown.exit_code(report) == 1)
+    // The deadline case: the clock is already past it.
+    var late = shutdown.new_shutdown()
+    shutdown.on(late, "slow", shutdown.PHASE_CLOSE, || true)
+    let _began = shutdown.begin(late, "deadline", 0)
+    let past = shutdown.run(late, || 9999, 10)
+    say(f, "a passed deadline skips what is left", past.skipped == ["slow"])
+    say(f, "and says the deadline passed", not past.in_time)
+    say(f, "which is exit code 2", shutdown.exit_code(past) == 2)
+    say(f, "the summary says what happened",
+        shutdown.summary(past).contains("deadline passed"))
+}
+
+fn check_envcfg(inout f: i64) / {io} {
+    print("-- envcfg: checked once, at start-up")
+    let fields = [
+        envcfg.described(envcfg.field("PORT", "i64", "8080"), "listen port"),
+        envcfg.required(envcfg.field("DATABASE_URL", "str", "")),
+        envcfg.secret(envcfg.field("API_KEY", "str", "")),
+        envcfg.one_of(envcfg.field("LOG_LEVEL", "str", "info"),
+            ["debug", "info", "warn", "error"]),
+        envcfg.field("TIMEOUT", "duration", "30s"),
+        envcfg.field("ORIGINS", "list", ""),
+        envcfg.field("DEBUG", "bool", "false"),
+        envcfg.field("RATIO", "f64", "0.5"),
+    ]
+    let keys = ["PORT", "DATABASE_URL", "API_KEY", "LOG_LEVEL", "TIMEOUT",
+        "ORIGINS", "DEBUG", "RATIO", "APP_PROT"]
+    let values = ["9000", "postgres://db/x", "sk-secret", "warn", "5m",
+        "a.test, b.test", "yes", "0.25", "8080"]
+    let cfg = envcfg.resolve(fields, keys, values)
+    say(f, "a valid environment has no problems", envcfg.is_valid(cfg))
+    say(f, "a number comes back typed", (envcfg.number(cfg, "PORT") ?? 0) == 9000)
+    say(f, "a default fills in what was not set",
+        (envcfg.number(envcfg.resolve(fields, [], []), "PORT") ?? 0) == 8080)
+    say(f, "a decimal too", (envcfg.decimal(cfg, "RATIO") ?? 0.0) == 0.25)
+    say(f, "a flag reads the words people write", envcfg.flag(cfg, "DEBUG") ?? false)
+    say(f, "a duration is seconds", (envcfg.seconds(cfg, "TIMEOUT") ?? 0) == 300)
+    say(f, "a list is split and trimmed",
+        (envcfg.list(cfg, "ORIGINS") ?? []) == ["a.test", "b.test"])
+    say(f, "an undeclared name is refused", env_refuses(cfg, "NOPE"))
+    // Every problem at once, not one per restart.
+    let bad = envcfg.resolve(fields, ["PORT", "LOG_LEVEL"], ["eighty", "loud"])
+    say(f, "three problems are reported together", envcfg.problems(bad).len() == 3)
+    say(f, "one for the type", envcfg.problems(bad)[0].contains("not a i64"))
+    say(f, "one for the missing required variable",
+        envcfg.problems(bad)[1].contains("required"))
+    say(f, "one for the value outside its set",
+        envcfg.problems(bad)[2].contains("not one of"))
+    // The line that is safe to log.
+    let shown = envcfg.describe(cfg)
+    say(f, "a secret is masked", shown.contains("API_KEY=***"))
+    say(f, "and everything else is not", shown.contains("PORT=9000"))
+    say(f, "the usage text names the type and the default",
+        envcfg.usage(fields)[0] == "PORT (i64) default 8080 — listen port")
+    say(f, "a typo under the prefix is reported",
+        envcfg.unrecognised(fields, keys, "APP_") == ["APP_PROT"])
+    say(f, "and nothing outside it is",
+        envcfg.unrecognised(fields, keys, "DATABASE_").len() == 0)
+    say(f, "durations refuse what is not one", envcfg.duration_seconds("soon") == 0 - 1)
+    say(f, "and read every unit", envcfg.duration_seconds("2h") == 7200 and
+        envcfg.duration_seconds("1d") == 86400)
+}
+
+fn main() / {io} {
+    var f = 0
+    let root = scratch()
+    match make_dir(root) {
+        Ok(_v) -> {}
+        Err(_e) -> {}
+    }
+    tidy(root)
+
+    check_atomicfile(f, root)
+    check_pidfile(f, root)
+    check_lockfile(f)
+    check_shutdown(f)
+    check_envcfg(f)
+
+    tidy(root)
+    if f == 0 {
+        print("system files: every claim held")
+    } else {
+        print("system files: {f} failed")
+    }
+}

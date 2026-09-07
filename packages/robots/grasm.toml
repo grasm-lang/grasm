@@ -1,0 +1,6 @@
+[package]
+name = "robots"
+version = "1.0.0"
+
+# robots.txt, parsed and applied. Fetches nothing.
+capabilities = []

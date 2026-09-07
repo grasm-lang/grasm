@@ -1,0 +1,349 @@
+// Media types: what a file says it is, and what it actually is.
+//
+// Two answers to one question, and they disagree often enough that the
+// difference is a security control. An extension is what the *uploader*
+// claims; the leading bytes are what the file is. Serving the claim is how a
+// `.jpg` that begins with `<script>` becomes stored cross-site scripting, and
+// why `X-Content-Type-Options: nosniff` exists.
+//
+// So this package answers both separately and will not merge them: `by_name`
+// reads the extension, `sniff` reads the content, and `agrees` says whether
+// they are the same. A caller decides what to do when they are not — but it
+// cannot do that without being told.
+
+type MediaType = {
+    top: str,
+    subtype: str,
+    /// Parameters in the order written, `charset` most often.
+    key: [str],
+    value: [str],
+}
+
+type MediaTypeError =
+    | NoSlash(text: str)
+    | EmptyPart(text: str)
+
+    /// The default for content nobody could identify.
+    ///
+    /// It is deliberately useless: a browser will download it rather than render
+    /// it, which is the right thing to do with an unidentified file.
+pub fn unknown() -> str {
+    return "application/octet-stream"
+}
+
+fn extension_table() -> [str] {
+    // Pairs, flat: extension then type. A flat list because two parallel
+    // lists drift and a map of 90 entries would be built on every call.
+    return [
+        "html", "text/html", "htm", "text/html", "css", "text/css",
+        "js", "text/javascript", "mjs", "text/javascript",
+        "json", "application/json", "map", "application/json",
+        "jsonl", "application/x-ndjson", "xml", "application/xml",
+        "txt", "text/plain", "md", "text/markdown", "csv", "text/csv",
+        "tsv", "text/tab-separated-values", "ics", "text/calendar",
+        "vcf", "text/vcard", "yaml", "application/yaml", "yml", "application/yaml",
+        "toml", "application/toml", "rtf", "application/rtf",
+        "pdf", "application/pdf", "ps", "application/postscript",
+        "zip", "application/zip", "gz", "application/gzip",
+        "bz2", "application/x-bzip2", "xz", "application/x-xz",
+        "zst", "application/zstd", "tar", "application/x-tar",
+        "7z", "application/x-7z-compressed", "rar", "application/vnd.rar",
+        "png", "image/png", "jpg", "image/jpeg", "jpeg", "image/jpeg",
+        "gif", "image/gif", "webp", "image/webp", "avif", "image/avif",
+        "bmp", "image/bmp", "ico", "image/vnd.microsoft.icon",
+        "svg", "image/svg+xml", "tif", "image/tiff", "tiff", "image/tiff",
+        "heic", "image/heic",
+        "mp3", "audio/mpeg", "wav", "audio/wav", "ogg", "audio/ogg",
+        "opus", "audio/opus", "flac", "audio/flac", "aac", "audio/aac",
+        "m4a", "audio/mp4", "mid", "audio/midi",
+        "mp4", "video/mp4", "webm", "video/webm", "mkv", "video/x-matroska",
+        "mov", "video/quicktime", "avi", "video/x-msvideo",
+        "ts", "video/mp2t", "m3u8", "application/vnd.apple.mpegurl",
+        "woff", "font/woff", "woff2", "font/woff2", "ttf", "font/ttf",
+        "otf", "font/otf", "eot", "application/vnd.ms-fontobject",
+        "wasm", "application/wasm", "epub", "application/epub+zip",
+        "sqlite", "application/vnd.sqlite3", "db", "application/vnd.sqlite3",
+        "sh", "application/x-sh", "py", "text/x-python", "rs", "text/x-rust",
+        "c", "text/x-c", "h", "text/x-c", "go", "text/x-go",
+        "gr", "text/x-grasm",
+    ]
+}
+
+/// The type for a filename, by its extension alone.
+pub fn by_name(name: str) -> str {
+    let at = last_dot(name)
+    if at < 0 {
+        return unknown()
+    }
+    let ext = name.substr(at + 1, name.len() - at - 1).to_lower()
+    let table = extension_table()
+    var i = 0
+    while i < table.len() {
+        if table[i] == ext {
+            return table[i + 1]
+        }
+        i = i + 2
+    }
+    return unknown()
+}
+
+fn last_dot(name: str) -> i64 {
+    let cs = name.chars()
+    var i = cs.len() - 1
+    while i >= 0 {
+        if cs[i] == "." {
+            return i
+        }
+        if cs[i] == "/" or cs[i] == "\\" {
+            return 0 - 1
+        }
+        i = i - 1
+    }
+    return 0 - 1
+}
+
+/// A conventional extension for a type, which is the other direction.
+pub fn extension_for(media_type: str) -> Option[str] {
+    let want = media_type.to_lower()
+    let table = extension_table()
+    var i = 0
+    while i < table.len() {
+        if table[i + 1] == want {
+            return Some(table[i])
+        }
+        i = i + 2
+    }
+    return None
+}
+
+fn starts_with_bytes(data: bytes, want: [i64]) -> bool {
+    if data.len() < want.len() {
+        return false
+    }
+    for i in 0..want.len() {
+        if data.at(i) != want[i] {
+            return false
+        }
+    }
+    return true
+}
+
+fn has_at(data: bytes, at: i64, want: [i64]) -> bool {
+    if data.len() < at + want.len() {
+        return false
+    }
+    for i in 0..want.len() {
+        if data.at(at + i) != want[i] {
+            return false
+        }
+    }
+    return true
+}
+
+/// The type of the content itself, from its leading bytes.
+///
+/// This is the answer to trust. An extension is a claim by whoever named the
+/// file; these bytes are what a decoder will actually see.
+pub fn sniff(data: bytes) -> str {
+    if data.len() == 0 {
+        return unknown()
+    }
+    if starts_with_bytes(data, [137, 80, 78, 71, 13, 10, 26, 10]) {
+        return "image/png"
+    }
+    if starts_with_bytes(data, [255, 216, 255]) {
+        return "image/jpeg"
+    }
+    if starts_with_bytes(data, [71, 73, 70, 56]) {
+        return "image/gif"
+    }
+    if starts_with_bytes(data, [82, 73, 70, 70]) and has_at(data, 8, [87, 69, 66, 80]) {
+        return "image/webp"
+    }
+    if starts_with_bytes(data, [82, 73, 70, 70]) and has_at(data, 8, [87, 65, 86, 69]) {
+        return "audio/wav"
+    }
+    if starts_with_bytes(data, [66, 77]) {
+        return "image/bmp"
+    }
+    if starts_with_bytes(data, [37, 80, 68, 70, 45]) {
+        return "application/pdf"
+    }
+    if starts_with_bytes(data, [31, 139]) {
+        return "application/gzip"
+    }
+    if starts_with_bytes(data, [66, 90, 104]) {
+        return "application/x-bzip2"
+    }
+    if starts_with_bytes(data, [253, 55, 122, 88, 90, 0]) {
+        return "application/x-xz"
+    }
+    if starts_with_bytes(data, [40, 181, 47, 253]) {
+        return "application/zstd"
+    }
+    // A ZIP, which is also every Office document, every EPUB and every JAR.
+    if starts_with_bytes(data, [80, 75, 3, 4]) or
+    starts_with_bytes(data, [80, 75, 5, 6]) {
+        return "application/zip"
+    }
+    if starts_with_bytes(data, [0, 97, 115, 109]) {
+        return "application/wasm"
+    }
+    if starts_with_bytes(data, [79, 103, 103, 83]) {
+        return "audio/ogg"
+    }
+    if starts_with_bytes(data, [102, 76, 97, 67]) {
+        return "audio/flac"
+    }
+    if starts_with_bytes(data, [73, 68, 51]) or starts_with_bytes(data, [255, 251]) {
+        return "audio/mpeg"
+    }
+    if has_at(data, 4, [102, 116, 121, 112]) {
+        return "video/mp4"
+    }
+    if starts_with_bytes(data, [26, 69, 223, 163]) {
+        return "video/webm"
+    }
+    if starts_with_bytes(data, [83, 81, 76, 105, 116, 101]) {
+        return "application/vnd.sqlite3"
+    }
+    if starts_with_bytes(data, [119, 79, 70, 50]) {
+        return "font/woff2"
+    }
+    if starts_with_bytes(data, [119, 79, 70, 70]) {
+        return "font/woff"
+    }
+    if starts_with_bytes(data, [127, 69, 76, 70]) {
+        return "application/x-elf"
+    }
+    return sniff_text(data)
+}
+
+/// Text is decided by what it is *not*: a run with no control bytes in it.
+fn sniff_text(data: bytes) -> str {
+    let look = if data.len() < 512 { data.len() } else { 512 }
+    for i in 0..look {
+        let b = data.at(i)
+        if b < 9 or (b > 13 and b < 32) {
+            return unknown()
+        }
+    }
+    let head = data.slice(0, look).to_str().trim_start().to_lower()
+    if head.starts_with("<?xml") {
+        return "text/xml"
+    }
+    if head.starts_with("<!doctype html") or head.starts_with("<html") {
+        return "text/html"
+    }
+    if head.starts_with("\{") or head.starts_with("[") {
+        return "application/json"
+    }
+    if head.starts_with("#!") {
+        return "text/x-shellscript"
+    }
+    return "text/plain"
+}
+
+/// Whether the name's claim and the content agree.
+///
+/// The check an upload endpoint needs, and the reason both functions are
+/// separate: the answer must be the caller's to act on.
+pub fn agrees(name: str, data: bytes) -> bool {
+    let claimed = by_name(name)
+    let actual = sniff(data)
+    if claimed == actual {
+        return true
+    }
+    // Text types are read from content only as a fallback, so a `.css` file
+    // sniffing as `text/plain` is not a disagreement.
+    return actual == "text/plain" and claimed.starts_with("text/")
+}
+
+/// A type built from its parts, with no parameters.
+pub fn media_type(top: str, subtype: str) -> MediaType {
+    return MediaType{ top: top, subtype: subtype, key: [], value: [] }
+}
+
+pub fn parse(text: str) -> MediaType ! MediaTypeError {
+    let parts = text.split(";")
+    let head = parts[0].trim().to_lower()
+    let at = head.index_of("/") ?? 0 - 1
+    if at < 0 {
+        fail(NoSlash(text))
+    }
+    let top = head.substr(0, at)
+    let sub = head.substr(at + 1, head.len() - at - 1)
+    if top == "" or sub == "" {
+        fail(EmptyPart(text))
+    }
+    var keys: [str] = []
+    var values: [str] = []
+    for i in 1..parts.len() {
+        let piece = parts[i].trim()
+        let split = piece.index_of("=") ?? 0 - 1
+        if split < 0 {
+            continue
+        }
+        var value = piece.substr(split + 1, piece.len() - split - 1).trim()
+        if value.starts_with("\"") and value.ends_with("\"") and value.len() >= 2 {
+            value = value.substr(1, value.len() - 2)
+        }
+        keys.push(piece.substr(0, split).trim().to_lower())
+        values.push(value)
+    }
+    return MediaType{ top: top, subtype: sub, key: keys, value: values }
+}
+
+pub fn render(m: MediaType) -> str {
+    var out = "{m.top}/{m.subtype}"
+    for i in 0..m.key.len() {
+        out = out + "; {m.key[i]}={m.value[i]}"
+    }
+    return out
+}
+
+pub fn parameter(m: MediaType, name: str) -> Option[str] {
+    let want = name.to_lower()
+    for i in 0..m.key.len() {
+        if m.key[i] == want {
+            return Some(m.value[i])
+        }
+    }
+    return None
+}
+
+pub fn essence(m: MediaType) -> str {
+    return "{m.top}/{m.subtype}"
+}
+
+/// Whether the type needs a charset to be read correctly.
+pub fn needs_charset(m: MediaType) -> bool {
+    if m.top == "text" {
+        return true
+    }
+    return m.subtype.ends_with("+xml") or m.subtype == "javascript" or
+    m.subtype == "xml"
+}
+
+/// Whether serving this to a browser risks it running as a page.
+///
+/// The list a file host has to refuse or serve with `Content-Disposition:
+/// attachment`, whatever the uploader called the file.
+pub fn is_executable_in_browser(media_type: str) -> bool {
+    return ["text/html", "application/xhtml+xml", "image/svg+xml",
+        "text/javascript", "application/javascript", "application/xml",
+        "text/xml"].contains(media_type.to_lower())
+}
+
+/// Whether compressing this on the wire is worth it.
+pub fn is_compressible(media_type: str) -> bool {
+    if media_type.starts_with("text/") {
+        return true
+    }
+    if is_executable_in_browser(media_type) {
+        return true
+    }
+    return ["application/json", "application/wasm", "application/yaml",
+        "application/toml", "font/ttf", "font/otf",
+        "application/x-ndjson"].contains(media_type.to_lower())
+}

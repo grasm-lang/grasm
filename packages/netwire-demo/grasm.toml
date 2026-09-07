@@ -1,0 +1,24 @@
+[package]
+name = "netwire_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.ntp]
+path = "../ntp"
+version = "^1.0.0"
+
+[dependencies.syslog]
+path = "../syslog"
+version = "^1.0.0"
+
+[dependencies.robots]
+path = "../robots"
+version = "^1.0.0"
+
+[dependencies.sitemap]
+path = "../sitemap"
+version = "^1.0.0"
+
+[dependencies.mimetype]
+path = "../mimetype"
+version = "^1.0.0"

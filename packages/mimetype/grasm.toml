@@ -1,0 +1,6 @@
+[package]
+name = "mimetype"
+version = "1.0.0"
+
+# Media types, by name and by content. Opens nothing.
+capabilities = []

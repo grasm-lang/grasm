@@ -1,0 +1,10 @@
+[package]
+name = "scrypt"
+version = "1.0.0"
+
+# Arithmetic and memory. Opens nothing.
+capabilities = []
+
+[dependencies.crypto_hash]
+path = "../crypto_hash"
+version = "^1.0.0"

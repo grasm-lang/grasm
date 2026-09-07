@@ -3176,10 +3176,7 @@ declaration into the region, or compute a number and yield that",
         let mark = self.diags.len();
         let mut cur = target;
         let mut found = false;
-        loop {
-            let (Expr::Field { recv, .. } | Expr::Index { recv, .. }) = cur else {
-                break;
-            };
+        while let Expr::Field { recv, .. } | Expr::Index { recv, .. } = cur {
             let t = self.infer_expr(recv);
             if matches!(self.uni.resolve(&t), Type::Ref(_)) {
                 found = true;

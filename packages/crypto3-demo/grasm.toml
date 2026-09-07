@@ -1,0 +1,24 @@
+[package]
+name = "crypto3_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.sha512]
+path = "../sha512"
+version = "^1.0.0"
+
+[dependencies.sha3]
+path = "../sha3"
+version = "^1.0.0"
+
+[dependencies.scrypt]
+path = "../scrypt"
+version = "^1.0.0"
+
+[dependencies.hotp]
+path = "../hotp"
+version = "^1.0.0"
+
+[dependencies.nonce]
+path = "../nonce"
+version = "^1.0.0"

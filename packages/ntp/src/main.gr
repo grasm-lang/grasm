@@ -1,0 +1,295 @@
+// NTP: the packet, the timestamps, and the arithmetic that beats the network.
+//
+// The interesting problem is not reading a clock off a server. It is that the
+// answer arrives late by an unknown amount. NTP solves it with four
+// timestamps and one assumption — that the path out and the path back take
+// about the same time — from which both the round trip and the offset fall
+// out. The assumption is also the failure mode: on an asymmetric path the
+// offset is wrong by half the asymmetry and nothing in the protocol can tell.
+//
+// This package is the packet and the arithmetic. It opens no socket, so the
+// caller supplies the bytes and their own clock readings, and every number
+// below can be checked against a fixed capture.
+
+type NtpPacket = {
+    leap: i64,
+    version: i64,
+    mode: i64,
+    stratum: i64,
+    /// Log-2 seconds, signed.
+    poll: i64,
+    precision: i64,
+    root_delay: i64,
+    root_dispersion: i64,
+    reference_id: bytes,
+    reference: i64,
+    originate: i64,
+    receive: i64,
+    transmit: i64,
+}
+
+type NtpError =
+    | ShortPacket(len: i64)
+    | BadVersion(version: i64)
+    | KissOfDeath(code: str)
+
+pub let MODE_CLIENT = 3
+pub let MODE_SERVER = 4
+pub let LEAP_NONE = 0
+pub let LEAP_ADD = 1
+pub let LEAP_DROP = 2
+pub let LEAP_UNSYNCHRONISED = 3
+
+/// Seconds between the NTP epoch (1900-01-01) and the Unix epoch (1970).
+///
+/// Seventeen leap days in seventy years, which is the sort of constant that
+/// is wrong by 86,400 in half the implementations that write it out by hand.
+pub fn epoch_offset() -> i64 {
+    return 2208988800
+}
+
+/// The fraction of a second in an NTP timestamp is 2^-32 of one.
+fn fraction_scale() -> i64 {
+    return 4294967296
+}
+
+/// A Unix time in milliseconds, as a 64-bit NTP timestamp.
+pub fn from_unix_millis(millis: i64) -> i64 {
+    let seconds = millis / 1000 + epoch_offset()
+    let rest = millis % 1000
+    return seconds.shl(32).bit_or(rest * fraction_scale() / 1000)
+}
+
+/// And back, to the nearest millisecond.
+///
+/// Nearest rather than truncated: 2^-32 of a second does not divide a
+/// millisecond, so 40 ms becomes a fraction that truncates back to 39. Round
+/// trips lost a millisecond each way, and an NTP offset is a difference of
+/// four of them — so the error landed squarely on the number the protocol
+/// exists to compute.
+pub fn to_unix_millis(stamp: i64) -> i64 {
+    let seconds = stamp.ushr(32) - epoch_offset()
+    let rest = (stamp.bit_and(4294967295) * 1000 + fraction_scale() / 2) /
+    fraction_scale()
+    return seconds * 1000 + rest
+}
+
+fn read_u32(data: bytes, at: i64) -> i64 {
+    return data.at(at).shl(24).bit_or(data.at(at + 1).shl(16))
+        .bit_or(data.at(at + 2).shl(8)).bit_or(data.at(at + 3))
+}
+
+fn read_u64(data: bytes, at: i64) -> i64 {
+    return read_u32(data, at).shl(32).bit_or(read_u32(data, at + 4))
+}
+
+fn push_u32(inout out: [i64], value: i64) {
+    out.push(value.ushr(24).bit_and(255))
+    out.push(value.ushr(16).bit_and(255))
+    out.push(value.ushr(8).bit_and(255))
+    out.push(value.bit_and(255))
+}
+
+fn push_u64(inout out: [i64], value: i64) {
+    push_u32(out, value.ushr(32).bit_and(4294967295))
+    push_u32(out, value.bit_and(4294967295))
+}
+
+/// A client request: 48 bytes, almost all of them zero.
+///
+/// The transmit timestamp is the exception, and it is the one field that
+/// matters: the server copies it back, so it is both the clock reading the
+/// offset is computed from and the only thing tying a reply to a request.
+pub fn client_request(transmit: i64) -> bytes {
+    var out: [i64] = []
+    out.push(LEAP_NONE.shl(6).bit_or(4.shl(3)).bit_or(MODE_CLIENT))
+    out.push(0)
+    out.push(0)
+    // Precision -20 is about a microsecond, written as a signed byte.
+    out.push(256 - 20)
+    push_u32(out, 0)
+    push_u32(out, 0)
+    push_u32(out, 0)
+    push_u64(out, 0)
+    push_u64(out, 0)
+    push_u64(out, 0)
+    push_u64(out, transmit)
+    return bytes_of(out)
+}
+
+fn signed_byte(v: i64) -> i64 {
+    if v > 127 {
+        return v - 256
+    }
+    return v
+}
+
+/// An all-zero packet, which is what a client request is before its one
+/// meaningful field is filled in.
+pub fn empty() -> NtpPacket {
+    return NtpPacket{
+        leap: 0, version: 4, mode: 0, stratum: 0, poll: 0, precision: 0,
+        root_delay: 0, root_dispersion: 0, reference_id: bytes_of([0, 0, 0, 0]),
+        reference: 0, originate: 0, receive: 0, transmit: 0,
+    }
+}
+
+pub fn parse(data: bytes) -> NtpPacket ! NtpError {
+    if data.len() < 48 {
+        fail(ShortPacket(data.len()))
+    }
+    let first = data.at(0)
+    let version = first.ushr(3).bit_and(7)
+    if version < 1 or version > 4 {
+        fail(BadVersion(version))
+    }
+    return NtpPacket{
+        leap: first.ushr(6).bit_and(3),
+        version: version,
+        mode: first.bit_and(7),
+        stratum: data.at(1),
+        poll: signed_byte(data.at(2)),
+        precision: signed_byte(data.at(3)),
+        root_delay: read_u32(data, 4),
+        root_dispersion: read_u32(data, 8),
+        reference_id: data.slice(12, 4),
+        reference: read_u64(data, 16),
+        originate: read_u64(data, 24),
+        receive: read_u64(data, 32),
+        transmit: read_u64(data, 40),
+    }
+}
+
+pub fn encode(p: NtpPacket) -> bytes {
+    var out: [i64] = []
+    out.push(p.leap.shl(6).bit_or(p.version.shl(3)).bit_or(p.mode))
+    out.push(p.stratum)
+    out.push(p.poll.bit_and(255))
+    out.push(p.precision.bit_and(255))
+    push_u32(out, p.root_delay)
+    push_u32(out, p.root_dispersion)
+    for i in 0..4 {
+        out.push(p.reference_id.at(i))
+    }
+    push_u64(out, p.reference)
+    push_u64(out, p.originate)
+    push_u64(out, p.receive)
+    push_u64(out, p.transmit)
+    return bytes_of(out)
+}
+
+/// The offset between the two clocks, in milliseconds.
+///
+/// `((t2 - t1) + (t3 - t4)) / 2`. The two halves are the error each way, and
+/// averaging them cancels the travel time only if it was the same both ways.
+pub fn offset_millis(t1: i64, t2: i64, t3: i64, t4: i64) -> i64 {
+    let sum = (to_unix_millis(t2) - to_unix_millis(t1)) +
+    (to_unix_millis(t3) - to_unix_millis(t4))
+    // Halved and rounded away from zero rather than truncated: an odd sum
+    // truncates toward zero, which reports a clock half a millisecond fast as
+    // being on time in one direction and a millisecond out in the other.
+    if sum >= 0 {
+        return (sum + 1) / 2
+    }
+    return (sum - 1) / 2
+}
+
+/// The round trip, with the server's own processing time taken out.
+pub fn delay_millis(t1: i64, t2: i64, t3: i64, t4: i64) -> i64 {
+    return (to_unix_millis(t4) - to_unix_millis(t1)) -
+    (to_unix_millis(t3) - to_unix_millis(t2))
+}
+
+/// The worst the offset can be wrong by, given the round trip.
+///
+/// Half the delay: a reply that took 100 ms could have spent all of it in one
+/// direction, so the offset is uncertain by 50 ms whatever the arithmetic
+/// above says. Reporting an offset without this is reporting a number without
+/// its error bar.
+pub fn uncertainty_millis(t1: i64, t2: i64, t3: i64, t4: i64) -> i64 {
+    let delay = delay_millis(t1, t2, t3, t4)
+    if delay < 0 {
+        return 0
+    }
+    return delay / 2
+}
+
+/// Stratum 0 with a four-character code is a refusal, not a time.
+///
+/// A client that reads the timestamp out of one of these gets 1900, and a
+/// client that keeps asking after a RATE gets banned.
+pub fn kiss_code(p: NtpPacket) -> Option[str] {
+    if p.stratum != 0 {
+        return None
+    }
+    var out = ""
+    for i in 0..4 {
+        let c = p.reference_id.at(i)
+        if c >= 32 and c < 127 {
+            out = out + c.to_char()
+        }
+    }
+    if out.len() == 0 {
+        return None
+    }
+    return Some(out)
+}
+
+/// Whether a reply is usable: right mode, a stratum that means something, and
+/// the originate timestamp we actually sent.
+pub fn is_usable(p: NtpPacket, sent: i64) -> bool ! NtpError {
+    match kiss_code(p) {
+        Some(code) -> fail(KissOfDeath(code))
+        None -> {}
+    }
+    if p.mode != MODE_SERVER {
+        return false
+    }
+    if p.stratum < 1 or p.stratum > 15 {
+        return false
+    }
+    if p.leap == LEAP_UNSYNCHRONISED {
+        return false
+    }
+    if p.transmit == 0 {
+        return false
+    }
+    // The one check that makes a reply a reply to *this* request.
+    return p.originate == sent
+}
+
+/// The poll interval in seconds: the field is log-2.
+pub fn poll_seconds(p: NtpPacket) -> i64 {
+    if p.poll < 0 {
+        return 1
+    }
+    return 2 ^ p.poll
+}
+
+/// The precision in nanoseconds, from the same log-2 encoding the other way.
+pub fn precision_nanos(p: NtpPacket) -> i64 {
+    var scaled = 1000000000
+    var left = 0 - p.precision
+    while left > 0 and scaled > 1 {
+        scaled = scaled / 2
+        left = left - 1
+    }
+    return scaled
+}
+
+/// A stratum-1 server's reference id is four characters naming its clock.
+pub fn reference_name(p: NtpPacket) -> str {
+    if p.stratum > 1 {
+        // Above stratum 1 the field is an address, not a name.
+        return "{p.reference_id.at(0)}.{p.reference_id.at(1)}." +
+        "{p.reference_id.at(2)}.{p.reference_id.at(3)}"
+    }
+    var out = ""
+    for i in 0..4 {
+        let c = p.reference_id.at(i)
+        if c >= 32 and c < 127 {
+            out = out + c.to_char()
+        }
+    }
+    return out
+}

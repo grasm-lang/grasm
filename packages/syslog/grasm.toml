@@ -1,0 +1,6 @@
+[package]
+name = "syslog"
+version = "1.0.0"
+
+# RFC 5424 and RFC 3164 messages. Opens nothing.
+capabilities = []

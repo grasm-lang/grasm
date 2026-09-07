@@ -1,0 +1,6 @@
+[package]
+name = "shutdown"
+version = "1.0.0"
+
+# Shutting down in an order. Opens nothing.
+capabilities = []

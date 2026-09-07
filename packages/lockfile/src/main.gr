@@ -1,0 +1,230 @@
+// Advisory locking through a file, and the honest limits of it.
+//
+// **What this cannot do, stated first.** A real lock needs a create-that-fails-
+// if-the-file-exists, and [L-LIB-FS] has no such call: `write_bytes` truncates
+// whatever is there and `make_dir` treats an existing directory as success.
+// So there is no way, in this language today, to acquire a lock without a
+// window in which two processes both believe they took it.
+//
+// What is left is still worth having, and is what most single-host daemons
+// actually rely on:
+//
+//   - **staleness**, so a lock left by a process that died does not block
+//     every start afterwards forever;
+//   - **ownership**, so a holder can tell its own lock from a successor's and
+//     never releases somebody else's;
+//   - **a deadline**, so waiting has an end;
+//   - **write-and-verify**, which narrows the window to the gap between one
+//     write and one read rather than leaving it open for the whole critical
+//     section.
+//
+// The file operations are the caller's, passed in as a small record of
+// closures. That keeps this package capability-free, makes every case here
+// testable without a disk, and — more usefully — lets a caller with a real
+// `flock` supply one and get an actual lock out of the same interface.
+
+type LockOwner = {
+    /// Whatever identifies the holder: a pid, a hostname, a uuid.
+    holder: str,
+    /// Seconds since the epoch.
+    taken_at: i64,
+    /// How long the holder promises to renew within, in seconds.
+    lease_seconds: i64,
+}
+
+type LockError =
+    | Held(by: str, taken_at: i64)
+    | NotOurs(by: str)
+    | Missing
+    | Malformed(text: str)
+    | TimedOut(after_seconds: i64)
+
+pub fn owner(holder: str, taken_at: i64, lease_seconds: i64) -> LockOwner {
+    return LockOwner{
+        holder: holder, taken_at: taken_at, lease_seconds: lease_seconds,
+    }
+}
+
+pub fn render(o: LockOwner) -> str {
+    return "{o.holder}\t{o.taken_at}\t{o.lease_seconds}\n"
+}
+
+pub fn parse(text: str) -> LockOwner ! LockError {
+    let line = text.trim()
+    if line == "" {
+        fail(Malformed(text))
+    }
+    let parts = line.split("\t")
+    if parts.len() < 3 {
+        fail(Malformed(text))
+    }
+    let at = parts[1].parse_int() ?? 0 - 1
+    let lease = parts[2].parse_int() ?? 0 - 1
+    if at < 0 or lease < 0 {
+        fail(Malformed(text))
+    }
+    return LockOwner{ holder: parts[0], taken_at: at, lease_seconds: lease }
+}
+
+/// Whether the lease has run out, given the current time.
+///
+/// The one question that makes a lock file recoverable: a holder that has not
+/// renewed within its lease is presumed gone.
+pub fn is_stale(o: LockOwner, now_seconds: i64) -> bool {
+    if o.lease_seconds <= 0 {
+        return false
+    }
+    return now_seconds - o.taken_at >= o.lease_seconds
+}
+
+pub fn seconds_left(o: LockOwner, now_seconds: i64) -> i64 {
+    if o.lease_seconds <= 0 {
+        return 0
+    }
+    let left = o.lease_seconds - (now_seconds - o.taken_at)
+    if left < 0 {
+        return 0
+    }
+    return left
+}
+
+pub fn is_ours(o: LockOwner, holder: str) -> bool {
+    return o.holder == holder
+}
+
+/// What a caller decided to do, given what is in the file.
+pub let TAKE = "take"
+pub let WAIT = "wait"
+pub let RENEW = "renew"
+
+/// Whether the lock may be taken, and why.
+///
+/// Separated from any file access on purpose: this is the whole decision, and
+/// it is a pure function of what was read and what time it is.
+pub fn decide(current: Option[LockOwner], holder: str, now_seconds: i64) -> str {
+    match current {
+        None -> return TAKE
+        Some(o) -> {
+            if is_ours(o, holder) {
+                return RENEW
+            }
+            if is_stale(o, now_seconds) {
+                return TAKE
+            }
+            return WAIT
+        }
+    }
+}
+
+/// Try once. `read` gives the file's text or `None` when it is absent;
+/// `write` replaces it and says whether that worked.
+///
+/// The verify step is the important one: after writing, the file is read back
+/// and the holder compared. Two writers racing here both write, and at most
+/// one reads its own name back — which does not make this a lock, but does
+/// mean the loser finds out.
+pub fn try_acquire(read: fn() -> Option[str], write: fn(str) -> bool,
+    o: LockOwner, now_seconds: i64) -> LockOwner ! LockError {
+    var current: Option[LockOwner] = None
+    match read() {
+        None -> {}
+        Some(text) -> {
+            match parse(text) {
+                Ok(held) -> current = Some(held)
+                Err(_e) -> current = None
+            }
+        }
+    }
+    match current {
+        Some(held) -> {
+            if not is_ours(held, o.holder) and not is_stale(held, now_seconds) {
+                fail(Held(held.holder, held.taken_at))
+            }
+        }
+        None -> {}
+    }
+    let mine = LockOwner{
+        holder: o.holder, taken_at: now_seconds, lease_seconds: o.lease_seconds,
+    }
+    if not write(render(mine)) {
+        fail(Held(o.holder, now_seconds))
+    }
+    // Verify: whoever wrote last is who the file names.
+    match read() {
+        None -> fail(Missing)
+        Some(text) -> {
+            match parse(text) {
+                Ok(back) -> {
+                    if not is_ours(back, o.holder) {
+                        fail(Held(back.holder, back.taken_at))
+                    }
+                    return back
+                }
+                Err(_e) -> fail(Malformed(text))
+            }
+        }
+    }
+}
+
+/// Try repeatedly until the deadline. `now` is asked each round, so the
+/// caller controls both the clock and the sleeping.
+pub fn acquire_until(read: fn() -> Option[str], write: fn(str) -> bool,
+    o: LockOwner, now: fn() -> i64, deadline_seconds: i64,
+    attempts: i64) -> LockOwner ! LockError {
+    var tried = 0
+    var last = now()
+    while tried < attempts {
+        let at = now()
+        last = at
+        if at >= deadline_seconds {
+            fail(TimedOut(at))
+        }
+        match try_acquire(read, write, o, at) {
+            Ok(got) -> return got
+            Err(_e) -> {}
+        }
+        tried = tried + 1
+    }
+    fail(TimedOut(last))
+}
+
+/// Extend a lease we already hold. Refuses if the file names somebody else —
+/// which is what stops a process that lost its lock from thinking it still
+/// has one.
+pub fn renew(read: fn() -> Option[str], write: fn(str) -> bool,
+    o: LockOwner, now_seconds: i64) -> LockOwner ! LockError {
+    match read() {
+        None -> fail(Missing)
+        Some(text) -> {
+            let held = try parse(text)
+            if not is_ours(held, o.holder) {
+                fail(NotOurs(held.holder))
+            }
+            let mine = LockOwner{
+                holder: o.holder, taken_at: now_seconds,
+                lease_seconds: o.lease_seconds,
+            }
+            if not write(render(mine)) {
+                fail(Held(o.holder, now_seconds))
+            }
+            return mine
+        }
+    }
+}
+
+/// Give the lock up, but only if it is still ours.
+pub fn unlock(read: fn() -> Option[str], remove: fn() -> bool,
+    holder: str) -> () ! LockError {
+    match read() {
+        None -> fail(Missing)
+        Some(text) -> {
+            let held = try parse(text)
+            if not is_ours(held, holder) {
+                fail(NotOurs(held.holder))
+            }
+            if not remove() {
+                fail(Held(held.holder, held.taken_at))
+            }
+        }
+    }
+}

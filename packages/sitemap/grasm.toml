@@ -1,0 +1,6 @@
+[package]
+name = "sitemap"
+version = "1.0.0"
+
+# XML sitemaps, written and read. Fetches nothing.
+capabilities = []

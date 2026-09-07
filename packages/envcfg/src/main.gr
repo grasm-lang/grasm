@@ -1,0 +1,309 @@
+// Configuration read out of the environment, with the types checked once.
+//
+// `getenv("PORT")` gives a string, and every program then does the same four
+// things badly: parses it somewhere far from where it was read, guesses a
+// default inline, discovers at request time that it was not a number, and
+// prints the database password into a log.
+//
+// A schema fixes all four. Every variable is declared once with its type, its
+// default and whether it is a secret; the whole environment is checked at
+// start-up and every problem is reported together, not one per restart; and
+// `describe` renders the resolved configuration with secrets masked, which is
+// the thing you actually want in a log line.
+//
+// The environment arrives as a list of pairs. Reading it performs `io` and is
+// the caller's line to write, which also means every case here is exact.
+
+type EnvField = {
+    name: str,
+    /// "str", "i64", "f64", "bool", "list", "duration".
+    kind: str,
+    default_value: str,
+    required: bool,
+    secret: bool,
+    /// Empty when anything of the right type will do.
+    allowed: [str],
+    help: str,
+}
+
+type EnvConfig = {
+    field: [EnvField],
+    key: [str],
+    value: [str],
+    problem: [str],
+}
+
+type EnvError =
+    | Missing(name: str)
+    | NotA(kind: str, name: str, value: str)
+    | NotAllowed(name: str, value: str)
+    | Unknown(name: str)
+
+pub fn field(name: str, kind: str, default_value: str) -> EnvField {
+    return EnvField{
+        name: name, kind: kind, default_value: default_value, required: false,
+        secret: false, allowed: [], help: "",
+    }
+}
+
+pub fn required(f: EnvField) -> EnvField {
+    return EnvField{
+        name: f.name, kind: f.kind, default_value: f.default_value,
+        required: true, secret: f.secret, allowed: f.allowed, help: f.help,
+    }
+}
+
+pub fn secret(f: EnvField) -> EnvField {
+    return EnvField{
+        name: f.name, kind: f.kind, default_value: f.default_value,
+        required: f.required, secret: true, allowed: f.allowed, help: f.help,
+    }
+}
+
+pub fn one_of(f: EnvField, allowed: [str]) -> EnvField {
+    return EnvField{
+        name: f.name, kind: f.kind, default_value: f.default_value,
+        required: f.required, secret: f.secret, allowed: allowed, help: f.help,
+    }
+}
+
+pub fn described(f: EnvField, help: str) -> EnvField {
+    return EnvField{
+        name: f.name, kind: f.kind, default_value: f.default_value,
+        required: f.required, secret: f.secret, allowed: f.allowed, help: help,
+    }
+}
+
+fn is_true(text: str) -> bool {
+    return ["1", "true", "yes", "on"].contains(text.to_lower())
+}
+
+fn is_false(text: str) -> bool {
+    return ["0", "false", "no", "off"].contains(text.to_lower())
+}
+
+/// A duration like `30s`, `5m`, `2h`, `1d`, in seconds. -1 when it is not one.
+pub fn duration_seconds(text: str) -> i64 {
+    if text == "" {
+        return 0 - 1
+    }
+    let cs = text.chars()
+    let last = cs[cs.len() - 1]
+    var scale = 1
+    var digits = text
+    if last == "s" {
+        digits = text.substr(0, text.len() - 1)
+    } else if last == "m" {
+        scale = 60
+        digits = text.substr(0, text.len() - 1)
+    } else if last == "h" {
+        scale = 3600
+        digits = text.substr(0, text.len() - 1)
+    } else if last == "d" {
+        scale = 86400
+        digits = text.substr(0, text.len() - 1)
+    }
+    match digits.parse_int() {
+        Some(n) -> {
+            if n < 0 {
+                return 0 - 1
+            }
+            return n * scale
+        }
+        None -> return 0 - 1
+    }
+}
+
+fn well_typed(kind: str, value: str) -> bool {
+    if kind == "str" {
+        return true
+    }
+    if kind == "i64" {
+        return value.parse_int() != None
+    }
+    if kind == "f64" {
+        return value.parse_float() != None
+    }
+    if kind == "bool" {
+        return is_true(value) or is_false(value)
+    }
+    if kind == "list" {
+        return true
+    }
+    if kind == "duration" {
+        return duration_seconds(value) >= 0
+    }
+    return false
+}
+
+fn lookup(pairs_key: [str], pairs_value: [str], name: str) -> Option[str] {
+    for i in 0..pairs_key.len() {
+        if pairs_key[i] == name and i < pairs_value.len() {
+            return Some(pairs_value[i])
+        }
+    }
+    return None
+}
+
+/// Resolve every field at once, collecting every problem.
+///
+/// All of them, not the first: a program whose start-up reports one missing
+/// variable per restart takes as many restarts as it has variables.
+pub fn resolve(fields: [EnvField], env_key: [str], env_value: [str]) -> EnvConfig {
+    var keys: [str] = []
+    var values: [str] = []
+    var problems: [str] = []
+    for f in fields {
+        var value = f.default_value
+        var present = false
+        match lookup(env_key, env_value, f.name) {
+            Some(found) -> {
+                value = found
+                present = true
+            }
+            None -> {}
+        }
+        if f.required and not present and f.default_value == "" {
+            problems.push("{f.name} is required and not set")
+        } else if not well_typed(f.kind, value) {
+            problems.push("{f.name}={value} is not a {f.kind}")
+        } else if f.allowed.len() > 0 and not f.allowed.contains(value) {
+            let choices = f.allowed.join(", ")
+            problems.push("{f.name}={value} is not one of: {choices}")
+        }
+        keys.push(f.name)
+        values.push(value)
+    }
+    return EnvConfig{
+        field: fields, key: keys, value: values, problem: problems,
+    }
+}
+
+pub fn problems(c: EnvConfig) -> [str] {
+    return c.problem
+}
+
+pub fn is_valid(c: EnvConfig) -> bool {
+    return c.problem.len() == 0
+}
+
+fn raw(c: EnvConfig, name: str) -> Option[str] {
+    return lookup(c.key, c.value, name)
+}
+
+pub fn text(c: EnvConfig, name: str) -> str ! EnvError {
+    match raw(c, name) {
+        Some(v) -> return v
+        None -> fail(Unknown(name))
+    }
+}
+
+pub fn number(c: EnvConfig, name: str) -> i64 ! EnvError {
+    let v = try text(c, name)
+    match v.parse_int() {
+        Some(n) -> return n
+        None -> fail(NotA("i64", name, v))
+    }
+}
+
+pub fn decimal(c: EnvConfig, name: str) -> f64 ! EnvError {
+    let v = try text(c, name)
+    match v.parse_float() {
+        Some(n) -> return n
+        None -> fail(NotA("f64", name, v))
+    }
+}
+
+pub fn flag(c: EnvConfig, name: str) -> bool ! EnvError {
+    let v = try text(c, name)
+    if is_true(v) {
+        return true
+    }
+    if is_false(v) {
+        return false
+    }
+    fail(NotA("bool", name, v))
+}
+
+/// A comma-separated list, with empty entries dropped.
+pub fn list(c: EnvConfig, name: str) -> [str] ! EnvError {
+    let v = try text(c, name)
+    var out: [str] = []
+    for piece in v.split(",") {
+        let t = piece.trim()
+        if t != "" {
+            out.push(t)
+        }
+    }
+    return out
+}
+
+pub fn seconds(c: EnvConfig, name: str) -> i64 ! EnvError {
+    let v = try text(c, name)
+    let n = duration_seconds(v)
+    if n < 0 {
+        fail(NotA("duration", name, v))
+    }
+    return n
+}
+
+/// The resolved configuration, with secrets masked — a line safe to log.
+pub fn describe(c: EnvConfig) -> [str] {
+    var out: [str] = []
+    for i in 0..c.key.len() {
+        var shown = c.value[i]
+        for f in c.field {
+            if f.name == c.key[i] and f.secret {
+                shown = if shown == "" { "" } else { "***" }
+            }
+        }
+        out.push("{c.key[i]}={shown}")
+    }
+    return out
+}
+
+/// The help text a `--help` or a README wants, one line per variable.
+pub fn usage(fields: [EnvField]) -> [str] {
+    var out: [str] = []
+    for f in fields {
+        var line = "{f.name} ({f.kind})"
+        if f.required and f.default_value == "" {
+            line = line + " required"
+        } else if f.default_value != "" {
+            line = line + " default {f.default_value}"
+        }
+        if f.allowed.len() > 0 {
+            let choices = f.allowed.join("|")
+            line = line + " one of {choices}"
+        }
+        if f.help != "" {
+            line = line + " — {f.help}"
+        }
+        out.push(line)
+    }
+    return out
+}
+
+/// Variables set in the environment that no field declares.
+///
+/// Not an error: an environment holds far more than one program's settings.
+/// It is worth reporting for a *prefix* though, because `APP_PROT=8080` is a
+/// typo that otherwise silently does nothing.
+pub fn unrecognised(fields: [EnvField], env_key: [str], prefix: str) -> [str] {
+    var out: [str] = []
+    for k in env_key {
+        if prefix != "" and not k.starts_with(prefix) {
+            continue
+        }
+        var known = false
+        for f in fields {
+            if f.name == k {
+                known = true
+            }
+        }
+        if not known {
+            out.push(k)
+        }
+    }
+    return out
+}

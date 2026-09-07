@@ -335,6 +335,13 @@ impl Value {
             (Value::Float(a), Value::Float(b)) => a == b,
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Str(a), Value::Str(b)) => a == b,
+            // Two runs of bytes are equal when they hold the same bytes.
+            // Missing this arm made `b == b` false for every `bytes` value,
+            // the same shape of failure as the `Ref` and `FnRef` arms above
+            // and against [E-EQ-STRUCTURAL]. It failed closed, so nothing
+            // insecure got through a MAC check written as `mac == want` — it
+            // simply rejected every message, including the right one.
+            (Value::Bytes(a), Value::Bytes(b)) => a == b,
             (Value::Unit, Value::Unit) => true,
             (Value::Range(a1, a2, a3), Value::Range(b1, b2, b3)) => {
                 a1 == b1 && a2 == b2 && a3 == b3

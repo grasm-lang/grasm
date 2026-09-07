@@ -1,0 +1,220 @@
+// Nonces: the number you must never use twice.
+//
+// A repeated nonce is not a degraded cipher, it is no cipher. Two AES-GCM
+// messages under one key and nonce XOR to the XOR of their plaintexts, and
+// the authentication key falls out of the pair — so anything that was ever
+// sent can be forged. The same repeat in ECDSA hands over the private key
+// outright, which is how a games console's signing key became public.
+//
+// So the interesting part of a nonce is not generating one. It is the
+// discipline around it, and that is what this package is: a counter that
+// cannot silently wrap, the arithmetic that says how many random nonces a key
+// may have before a collision is likely, deterministic derivation for the
+// places where randomness is the wrong answer, and a log that refuses a
+// repeat rather than trusting nobody made one.
+//
+// Randomness is not opened here. A caller with a real source passes bytes in;
+// a test passes fixed bytes and gets the same answer on every engine.
+import crypto_hash
+
+type NonceError =
+    | CounterExhausted(width: i64)
+    | WrongLength(want: i64, got: i64)
+    | AlreadyUsed(which: str)
+
+    /// A counter nonce: a fixed prefix, then a counter that never repeats for
+    /// that prefix.
+    ///
+    /// This is what AES-GCM and ChaCha20-Poly1305 want, and it beats random
+    /// nonces at 96 bits: random 96-bit nonces collide at about 2^48 messages,
+    /// which is reachable, and a counter does not collide at all.
+type NonceCounter = {
+    prefix: bytes,
+    next: i64,
+    /// Total nonce length in bytes.
+    width: i64,
+}
+
+pub fn new_counter(prefix: bytes, width: i64) -> NonceCounter {
+    return NonceCounter{ prefix: prefix, next: 0, width: width }
+}
+
+/// The standard AEAD nonce: four bytes of prefix, eight of counter.
+pub fn new_aead_counter(prefix: bytes) -> NonceCounter {
+    return NonceCounter{ prefix: prefix, next: 0, width: 12 }
+}
+
+/// The next nonce, or a failure once the counter has run out.
+///
+/// Running out is a failure and not a wrap. A counter that wraps produces a
+/// repeat, and a repeat is the thing this type exists to prevent — so the
+/// only correct behaviour at the end is to stop and force a new key.
+pub fn next(inout c: NonceCounter) -> bytes ! NonceError {
+    let room = c.width - c.prefix.len()
+    if room < 1 or room > 8 {
+        fail(WrongLength(c.width, c.prefix.len()))
+    }
+    if room < 8 and c.next >= (2 ^ (room * 8)) {
+        fail(CounterExhausted(room * 8))
+    }
+    if c.next < 0 {
+        fail(CounterExhausted(room * 8))
+    }
+    var out: [i64] = []
+    for i in 0..c.prefix.len() {
+        out.push(c.prefix.at(i))
+    }
+    for i in 0..room {
+        out.push(c.next.ushr((room - 1 - i) * 8).bit_and(255))
+    }
+    c.next = c.next + 1
+    return bytes_of(out)
+}
+
+pub fn issued(c: NonceCounter) -> i64 {
+    return c.next
+}
+
+/// How many nonces are left before the counter is exhausted.
+pub fn remaining(c: NonceCounter) -> i64 {
+    let room = c.width - c.prefix.len()
+    if room >= 8 {
+        return 9223372036854775807 - c.next
+    }
+    return (2 ^ (room * 8)) - c.next
+}
+
+/// How many random nonces of `bits` may be drawn before the chance of a
+/// collision reaches one in `one_in`.
+///
+/// The birthday bound: n ≈ sqrt(2 * 2^bits / one_in). This is the number that
+/// decides whether random nonces are acceptable at all, and it is much
+/// smaller than people expect — at 96 bits and a one-in-a-million risk it is
+/// about 2^38 messages, not 2^96.
+pub fn safe_random_count(bits: i64, one_in: i64) -> i64 {
+    // Worked in the exponent, because 2^96 does not fit anywhere here.
+    let space = bits.as_f64() * 2.0.ln()
+    let allowed = (2.0.ln() + space - one_in.as_f64().ln()) / 2.0
+    if allowed > 62.0 * 2.0.ln() {
+        return 9223372036854775807
+    }
+    return allowed.exp().as_i64()
+}
+
+/// Whether drawing `used` random nonces of `bits` is still within the bound.
+pub fn random_is_safe(bits: i64, used: i64, one_in: i64) -> bool {
+    return used <= safe_random_count(bits, one_in)
+}
+
+/// A nonce derived from the key and the message rather than from a random
+/// source.
+///
+/// RFC 6979 makes ECDSA deterministic this way, because a signature nonce
+/// drawn from a weak random source hands over the private key, and a machine
+/// with no entropy at boot is exactly where signing happens. The nonce is
+/// unpredictable to anyone without the key and never repeats for two
+/// different messages.
+pub fn derive(key: bytes, message: bytes, width: i64) -> bytes {
+    var out: [i64] = []
+    var block = 0
+    while out.len() < width {
+        var input = message.to_list()
+        input.push(block.bit_and(255))
+        let mac = crypto_hash.hmac_sha256(key, bytes_of(input))
+        for i in 0..mac.len() {
+            if out.len() < width {
+                out.push(mac.at(i))
+            }
+        }
+        block = block + 1
+    }
+    return bytes_of(out)
+}
+
+/// XChaCha20 splits a 24-byte nonce into 16 bytes that re-key the cipher and
+/// 8 that become the nonce proper.
+///
+/// That is the whole reason a 192-bit nonce is safe to pick at random: the
+/// birthday bound at 192 bits is out of reach, and the bound at 96 is not.
+pub fn split_extended(nonce: bytes) -> (bytes, bytes) ! NonceError {
+    if nonce.len() != 24 {
+        fail(WrongLength(24, nonce.len()))
+    }
+    var head: [i64] = []
+    for i in 0..16 {
+        head.push(nonce.at(i))
+    }
+    // The eight-byte tail sits in the last eight of a twelve-byte nonce, with
+    // four zero bytes ahead of it.
+    var tail: [i64] = [0, 0, 0, 0]
+    for i in 16..24 {
+        tail.push(nonce.at(i))
+    }
+    return (bytes_of(head), bytes_of(tail))
+}
+
+/// A record of what has been used, so a repeat is refused rather than
+/// assumed not to happen.
+///
+/// Bounded on purpose: an unbounded set is a memory leak with a security
+/// story attached. Past the window it reports what it can no longer answer
+/// rather than saying "not seen".
+type NonceLog = {
+    seen: [str],
+    capacity: i64,
+    dropped: i64,
+    refused: i64,
+}
+
+pub fn new_log(capacity: i64) -> NonceLog {
+    let c = if capacity < 1 { 1 } else { capacity }
+    return NonceLog{ seen: [], capacity: c, dropped: 0, refused: 0 }
+}
+
+pub fn hex(data: bytes) -> str {
+    var out = ""
+    for i in 0..data.len() {
+        let b = data.at(i)
+        out = out + b.ushr(4).to_base(16) + b.bit_and(15).to_base(16)
+    }
+    return out
+}
+
+/// Record a nonce, or fail because it has been seen.
+pub fn record(inout log: NonceLog, value: bytes) -> bool ! NonceError {
+    let key = hex(value)
+    if log.seen.contains(key) {
+        log.refused = log.refused + 1
+        fail(AlreadyUsed(key))
+    }
+    log.seen.push(key)
+    if log.seen.len() > log.capacity {
+        log.seen = log.seen.slice(1, log.seen.len())
+        log.dropped = log.dropped + 1
+    }
+    return true
+}
+
+pub fn has_seen(log: NonceLog, value: bytes) -> bool {
+    return log.seen.contains(hex(value))
+}
+
+/// Whether the log has forgotten anything — the point past which "not seen"
+/// stops meaning "never used".
+pub fn is_complete(log: NonceLog) -> bool {
+    return log.dropped == 0
+}
+
+pub fn refused_count(log: NonceLog) -> i64 {
+    return log.refused
+}
+
+pub fn held(log: NonceLog) -> i64 {
+    return log.seen.len()
+}
+
+/// Constant-time equality, so comparing two nonces leaks nothing about where
+/// they differ.
+pub fn equal(a: bytes, b: bytes) -> bool {
+    return crypto_hash.equal_constant_time(a, b)
+}

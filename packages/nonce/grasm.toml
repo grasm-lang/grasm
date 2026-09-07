@@ -1,0 +1,10 @@
+[package]
+name = "nonce"
+version = "1.0.0"
+
+# Arithmetic over bytes. Opens nothing — randomness is the caller's to supply.
+capabilities = []
+
+[dependencies.crypto_hash]
+path = "../crypto_hash"
+version = "^1.0.0"

@@ -1927,12 +1927,12 @@ fn build_native_incremental(
                 let l = l.trim();
                 // `"_sym", referenced from:` (macOS) and
                 // `undefined reference to \`sym'` (GNU ld).
-                let name = if let Some(rest) = l.strip_prefix('"') {
-                    rest.split('"').next()?.trim_start_matches('_').to_string()
-                } else if let Some(rest) = l.split("undefined reference to").nth(1) {
-                    rest.trim().trim_matches(|c| c == '`' || c == '\'').to_string()
-                } else {
-                    return None;
+                let name = match l.strip_prefix('"') {
+                    Some(rest) => rest.split('"').next()?.trim_start_matches('_').to_string(),
+                    None => {
+                        let rest = l.split("undefined reference to").nth(1)?;
+                        rest.trim().trim_matches(|c| c == '`' || c == '\'').to_string()
+                    }
                 };
                 // Not an internal symbol: `g_…` is a compiled function,
                 // `gc_…` a lifted closure, `gh_…` a handler operation. One
