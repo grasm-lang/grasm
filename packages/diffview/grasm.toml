@@ -1,0 +1,6 @@
+[package]
+name = "diffview"
+version = "1.0.0"
+
+# Comparing text. Opens nothing.
+capabilities = []

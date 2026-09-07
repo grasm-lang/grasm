@@ -1,0 +1,108 @@
+// Developer tooling: structured logs, progress, diffs.
+import logfmt
+import progress
+import diffview
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+
+    print("-- logfmt, where quoting is the whole format")
+    say(f, "a plain value is bare", logfmt.value("info") == "info")
+    // The rule: a space would split the field, so it must be quoted.
+    say(f, "a space forces quotes", logfmt.value("took 3ms") == "\"took 3ms\"")
+    say(f, "an equals sign forces quotes", logfmt.value("a=b") == "\"a=b\"")
+    say(f, "empty forces quotes", logfmt.value("") == "\"\"")
+    say(f, "an inner quote is escaped", logfmt.value("say \"hi\"") == "\"say \\\"hi\\\"\"")
+    let l = logfmt.line(["level", "msg", "ms"], ["info", "took 3ms", "42"])
+    say(f, "a line", l == "level=info msg=\"took 3ms\" ms=42")
+    // Round-tripping is the property that makes it structured rather than
+    // decorated.
+    say(f, "reads its own quoted value back", logfmt.get(l, "msg") == Some("took 3ms"))
+    say(f, "and the bare ones", logfmt.get(l, "level") == Some("info"))
+    say(f, "a missing key is None", logfmt.get(l, "nope") == None)
+    let tricky = logfmt.line(["m"], ["a=b c\"d"])
+    say(f, "round trips a value holding both", logfmt.get(tricky, "m") == Some("a=b c\"d"))
+    let (keys, _vals) = logfmt.parse(l)
+    say(f, "parses every field", keys.len() == 3)
+
+    print("-- progress")
+    var b = progress.new_bar(200, 10)
+    progress.start(b, 0)
+    say(f, "starts empty", progress.percent(b) == 0)
+    progress.advance(b, 100)
+    say(f, "half way", progress.percent(b) == 50)
+    say(f, "renders a bar", progress.render(b) == "[#####-----] 50%")
+    // An estimate this early is noise, so it is withheld rather than guessed.
+    var early = progress.new_bar(1000, 10)
+    progress.start(early, 0)
+    progress.advance(early, 10)
+    say(f, "under 5% reports no estimate", progress.remaining_ms(early, 100) == 0 - 1)
+    // 100 of 200 in 1000ms means about 1000ms left.
+    say(f, "past that it estimates", progress.remaining_ms(b, 1000) == 1000)
+    progress.advance(b, 500)
+    say(f, "cannot exceed the total", progress.percent(b) == 100 and progress.is_finished(b))
+    say(f, "the spinner cycles", progress.spinner(0) != progress.spinner(1))
+    say(f, "and wraps", progress.spinner(0) == progress.spinner(4))
+    say(f, "a status line carries the count", progress.status(b, "build", 1000).contains("200/200"))
+
+    print("-- diffs, aligned rather than wholesale")
+    let before = ["one", "two", "three", "four"]
+    let after = ["one", "TWO", "three", "four"]
+    match diffview.diff(before, after) {
+        Err(_e) -> say(f, "a one-line change", false)
+        Ok(edits) -> {
+            // The point: one line changed, not four.
+            say(f, "one removed", diffview.removed(edits) == 1)
+            say(f, "one added", diffview.added(edits) == 1)
+            say(f, "the rest is kept", edits.len() == 5)
+            say(f, "renders with markers", diffview.render(edits).contains("-two"))
+            say(f, "and the insert", diffview.render(edits).contains("+TWO"))
+        }
+    }
+    // An insertion at the top must not report everything as changed.
+    match diffview.diff(["b", "c"], ["a", "b", "c"]) {
+        Err(_e) -> say(f, "a leading insert", false)
+        Ok(edits) -> say(f, "a leading insert changes exactly one line",
+            diffview.added(edits) == 1 and diffview.removed(edits) == 0)
+    }
+    match diffview.diff(["x"], ["x"]) {
+        Err(_e) -> say(f, "identical", false)
+        Ok(edits) -> say(f, "identical input is unchanged", diffview.unchanged(edits))
+    }
+    match diffview.diff([], ["a", "b"]) {
+        Err(_e) -> say(f, "from empty", false)
+        Ok(edits) -> say(f, "from empty is all inserts", diffview.added(edits) == 2)
+    }
+    // Context folding is what makes a large diff readable.
+    var long_a: [str] = []
+    var long_b: [str] = []
+    for i in 0..40 {
+        long_a.push("line{i}")
+        long_b.push(if i == 20 { "CHANGED" } else { "line{i}" })
+    }
+    match diffview.diff(long_a, long_b) {
+        Err(_e) -> say(f, "a long diff", false)
+        Ok(edits) -> {
+            let u = diffview.unified(edits, 2)
+            say(f, "unified folds the unchanged runs", u.contains("@@"))
+            say(f, "and is far shorter than the file",
+                u.split("\n").len() < 15)
+        }
+    }
+
+    print("")
+    if f == 0 {
+        print("all held")
+    } else {
+        print("{f} failed")
+    }
+}

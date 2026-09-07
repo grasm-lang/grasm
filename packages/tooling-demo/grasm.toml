@@ -1,0 +1,16 @@
+[package]
+name = "tooling_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.logfmt]
+path = "../logfmt"
+version = "^1.0.0"
+
+[dependencies.progress]
+path = "../progress"
+version = "^1.0.0"
+
+[dependencies.diffview]
+path = "../diffview"
+version = "^1.0.0"

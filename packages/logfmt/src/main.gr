@@ -1,0 +1,133 @@
+// logfmt: `level=info msg="took 3ms" ok=true`.
+//
+// Structured logs that a person can still read. JSON is machine-friendly and
+// unreadable in a terminal; a bare sentence is readable and unqueryable. This
+// is the middle, and it is what Heroku, Go's standard logger and a lot of
+// infrastructure emit.
+//
+// The rule that makes it work is quoting: a value containing a space, an
+// equals sign or a quote **must** be quoted, or the line parses into different
+// fields than it was written with. A logger that quotes only when it
+// remembers to produces logs that are fine until a message contains a space.
+
+fn needs_quotes(v: str) -> bool {
+    if v.len() == 0 {
+        return true
+    }
+    for c in v.chars() {
+        if c == " " or c == "=" or c == "\"" or c == "\n" or c == "\t" {
+            return true
+        }
+    }
+    return false
+}
+
+fn quote(v: str) -> str {
+    var out = "\""
+    for c in v.chars() {
+        if c == "\"" {
+            out = out + "\\\""
+        } else {
+            if c == "\\" {
+                out = out + "\\\\"
+            } else {
+                if c == "\n" {
+                    out = out + "\\n"
+                } else {
+                    if c == "\t" {
+                        out = out + "\\t"
+                    } else {
+                        out = out + c
+                    }
+                }
+            }
+        }
+    }
+    return out + "\""
+}
+
+pub fn value(v: str) -> str {
+    if needs_quotes(v) {
+        return quote(v)
+    }
+    return v
+}
+
+/// One line from parallel key and value lists.
+pub fn line(keys: [str], values: [str]) -> str {
+    var parts: [str] = []
+    for i in 0..keys.len() {
+        let v = if i < values.len() { values[i] } else { "" }
+        parts.push("{keys[i]}={value(v)}")
+    }
+    return parts.join(" ")
+}
+
+/// Parse a line back into keys and values.
+///
+/// Round-tripping is the property worth having: a log that cannot be read back
+/// by the thing that wrote it is not structured, it is decorated.
+pub fn parse(text: str) -> ([str], [str]) {
+    var keys: [str] = []
+    var values: [str] = []
+    let cs = text.chars()
+    var i = 0
+    while i < cs.len() {
+        while i < cs.len() and cs[i] == " " {
+            i = i + 1
+        }
+        var key = ""
+        while i < cs.len() and cs[i] != "=" and cs[i] != " " {
+            key = key + cs[i]
+            i = i + 1
+        }
+        if key == "" {
+            i = i + 1
+        } else {
+            var v = ""
+            if i < cs.len() and cs[i] == "=" {
+                i = i + 1
+                if i < cs.len() and cs[i] == "\"" {
+                    i = i + 1
+                    while i < cs.len() and cs[i] != "\"" {
+                        if cs[i] == "\\" and i + 1 < cs.len() {
+                            i = i + 1
+                            if cs[i] == "n" {
+                                v = v + "\n"
+                            } else {
+                                if cs[i] == "t" {
+                                    v = v + "\t"
+                                } else {
+                                    v = v + cs[i]
+                                }
+                            }
+                        } else {
+                            v = v + cs[i]
+                        }
+                        i = i + 1
+                    }
+                    i = i + 1
+                } else {
+                    while i < cs.len() and cs[i] != " " {
+                        v = v + cs[i]
+                        i = i + 1
+                    }
+                }
+            }
+            keys.push(key)
+            values.push(v)
+        }
+    }
+    return (keys, values)
+}
+
+/// The value for a key, or `None`.
+pub fn get(text: str, key: str) -> Option[str] {
+    let (keys, values) = parse(text)
+    for i in 0..keys.len() {
+        if keys[i] == key {
+            return Some(values[i])
+        }
+    }
+    return None
+}

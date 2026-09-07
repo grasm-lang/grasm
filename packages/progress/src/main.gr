@@ -1,0 +1,102 @@
+// Progress bars and spinners, rendered as text.
+//
+// This builds the string and returns it. It does not write to a terminal, so
+// it needs no capability, and the caller decides whether the destination is a
+// tty at all — which matters, because a progress bar written to a log file
+// produces thousands of useless lines.
+//
+// The estimate is deliberately conservative. A remaining-time figure computed
+// from an average is wrong early and confident, so this reports nothing until
+// enough has happened to mean something.
+
+type Bar = {
+    total: i64,
+    done: i64,
+    width: i64,
+    started_ms: i64,
+}
+
+pub fn new_bar(total: i64, width: i64) -> Bar {
+    return Bar{
+        total: if total < 1 { 1 } else { total },
+        done: 0,
+        width: if width < 4 { 4 } else { width },
+        started_ms: 0,
+    }
+}
+
+pub fn start(inout b: Bar, now_ms: i64) {
+    b.started_ms = now_ms
+}
+
+pub fn advance(inout b: Bar, by: i64) {
+    b.done = b.done + by
+    if b.done > b.total {
+        b.done = b.total
+    }
+}
+
+pub fn set_done(inout b: Bar, done: i64) {
+    b.done = if done > b.total { b.total } else { done }
+}
+
+/// Percent complete, floored.
+pub fn percent(b: Bar) -> i64 {
+    return b.done * 100 / b.total
+}
+
+pub fn is_finished(b: Bar) -> bool {
+    return b.done >= b.total
+}
+
+/// `[####----] 50%`
+pub fn render(b: Bar) -> str {
+    let filled = b.done * b.width / b.total
+    var bar = ""
+    for i in 0..b.width {
+        if i < filled {
+            bar = bar + "#"
+        } else {
+            bar = bar + "-"
+        }
+    }
+    return "[{bar}] {percent(b)}%"
+}
+
+/// Milliseconds remaining, or -1 when it is too early to say.
+///
+/// Below 5% complete any estimate is noise, and a confident wrong number is
+/// worse than none.
+pub fn remaining_ms(b: Bar, now_ms: i64) -> i64 {
+    if b.done == 0 or percent(b) < 5 {
+        return 0 - 1
+    }
+    let elapsed = now_ms - b.started_ms
+    if elapsed <= 0 {
+        return 0 - 1
+    }
+    let per_item = elapsed / b.done
+    return per_item * (b.total - b.done)
+}
+
+/// The frame of a spinner for a step with no known total.
+pub fn spinner(step: i64) -> str {
+    let frames = ["|", "/", "-", "\\"]
+    return frames[step % 4]
+}
+
+/// The braille spinner, which reads better where the font has it.
+pub fn dots(step: i64) -> str {
+    let frames = ["\u{2807}", "\u{280B}", "\u{2819}", "\u{2838}", "\u{28B0}", "\u{28A0}"]
+    return frames[step % 6]
+}
+
+/// A whole status line: bar, count, and an estimate when there is one.
+pub fn status(b: Bar, label: str, now_ms: i64) -> str {
+    var out = "{label} {render(b)} {b.done}/{b.total}"
+    let left = remaining_ms(b, now_ms)
+    if left >= 0 {
+        out = out + " ~{left / 1000}s left"
+    }
+    return out
+}
