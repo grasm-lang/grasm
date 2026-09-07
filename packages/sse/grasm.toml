@@ -1,0 +1,6 @@
+[package]
+name = "sse"
+version = "1.0.0"
+
+# Formatting and parsing text. Opens nothing.
+capabilities = []

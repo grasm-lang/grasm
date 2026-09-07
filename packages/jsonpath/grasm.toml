@@ -1,0 +1,6 @@
+[package]
+name = "jsonpath"
+version = "1.0.0"
+
+# Selecting from parsed data. Opens nothing.
+capabilities = []

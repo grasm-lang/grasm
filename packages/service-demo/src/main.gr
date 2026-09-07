@@ -1,0 +1,117 @@
+import sse
+import healthcheck
+import semaphore
+import jsonpath
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+
+    print("-- SSE, where a blank line ends an event")
+    let e = sse.event("tick", "hello")
+    say(f, "a simple event", sse.encode(e) == "event: tick\ndata: hello\n\n")
+    // The rule: a newline in the value must not terminate the event.
+    let multi = sse.event("log", "line one\nline two")
+    say(f, "a multi-line value becomes several data lines",
+        sse.encode(multi) == "event: log\ndata: line one\ndata: line two\n\n")
+    say(f, "an id is carried", sse.encode(sse.with_id(e, "42")).starts_with("id: 42"))
+    say(f, "retry is advertised", sse.encode(sse.with_retry(e, 5000)).contains("retry: 5000"))
+    say(f, "a keep-alive is a comment", sse.keepalive() == ": keep-alive\n\n")
+    let stream = "event: a\ndata: 1\n\nevent: b\ndata: 2\ndata: 3\nid: 7\n\n"
+    let events = sse.parse(stream)
+    say(f, "parses two events", events.len() == 2)
+    say(f, "and rejoins the multi-line body", events[1].data == "2\n3")
+    say(f, "the resume id", sse.last_id(events) == "7")
+    say(f, "comments are discarded", sse.parse(": hi\n\nevent: x\ndata: 1\n\n").len() == 1)
+    // Round trip.
+    say(f, "encode then parse gives the value back",
+        sse.parse(sse.encode(multi))[0].data == "line one\nline two")
+    say(f, "the no-buffering header is present, or nothing arrives",
+        sse.headers().len() == 4)
+
+    print("-- health, and the distinction that stops a restart loop")
+    var r = healthcheck.new_report()
+    healthcheck.liveness(r, "event-loop", true, "running", 1000)
+    healthcheck.readiness(r, "database", false, "connection refused", 1000)
+    // The whole point: a dependency being down must not restart the process.
+    say(f, "a dead dependency does NOT make it un-live", healthcheck.is_live(r))
+    say(f, "but it does make it un-ready", not healthcheck.is_ready(r))
+    say(f, "liveness returns 200", healthcheck.liveness_status(r) == 200)
+    say(f, "readiness returns 503", healthcheck.readiness_status(r) == 503)
+    say(f, "the failing check is named", healthcheck.failing(r) == ["database"])
+    // A wedged process is a different thing, and does fail liveness.
+    healthcheck.liveness(r, "event-loop", false, "stalled 90s", 1000)
+    say(f, "a wedged loop DOES fail liveness", not healthcheck.is_live(r))
+    say(f, "fresh while recent", healthcheck.is_fresh(r, 1500, 5000))
+    // A prober that died leaves a stale "healthy" sitting there forever.
+    say(f, "a stale check is not a pass", not healthcheck.is_fresh(r, 99999, 5000))
+    say(f, "renders for a human", healthcheck.render(r).contains("connection refused"))
+
+    print("-- semaphore accounting, with permits conserved")
+    var s = semaphore.new_semaphore(3)
+    say(f, "starts empty", semaphore.available(s) == 3)
+    say(f, "three acquire", {
+        var got = 0
+        for _i in 0..3 {
+            if semaphore.try_acquire(s) {
+                got = got + 1
+            }
+        }
+        got == 3
+    })
+    say(f, "the fourth is refused", not semaphore.try_acquire(s))
+    say(f, "saturated", semaphore.is_saturated(s))
+    semaphore.give_back(s)
+    say(f, "one back, one free", semaphore.available(s) == 1)
+    // Permits must be conserved: an extra release must not create capacity.
+    semaphore.give_back(s)
+    semaphore.give_back(s)
+    semaphore.give_back(s)
+    semaphore.give_back(s)
+    say(f, "releasing more than taken does NOT raise the ceiling",
+        semaphore.available(s) == 3 and semaphore.in_use(s) == 0)
+    say(f, "the peak is remembered", semaphore.peak_use(s) == 3)
+    say(f, "so you can tell the limit ever bound", semaphore.ever_saturated(s))
+    say(f, "refusals are counted", semaphore.refused_count(s) == 1)
+    // All-or-nothing, so two callers cannot each hold half of what they need.
+    var pool = semaphore.new_semaphore(5)
+    say(f, "a bulk take that fits", semaphore.try_acquire_n(pool, 3))
+    say(f, "one that does not is all-or-nothing", not semaphore.try_acquire_n(pool, 3))
+    say(f, "and took nothing", semaphore.in_use(pool) == 3)
+
+    print("-- path selection")
+    let paths = ["users.0.name", "users.0.age", "users.1.name", "config.db.host"]
+    let values = ["ada", "36", "grace", "localhost"]
+    say(f, "an exact path", jsonpath.select("$.users.0.name", paths, values) == ["ada"])
+    say(f, "a bracket index is the same thing",
+        jsonpath.select("$.users[0].name", paths, values) == ["ada"])
+    // `*` is exactly one segment.
+    say(f, "* matches one segment",
+        jsonpath.select("$.users.*.name", paths, values) == ["ada", "grace"])
+    say(f, "and not across two", jsonpath.select("$.*.name", paths, values) == [])
+    // `..` is any depth, which is the difference.
+    say(f, ".. matches any depth",
+        jsonpath.select("$..name", paths, values) == ["ada", "grace"])
+    say(f, "and reaches deeper too",
+        jsonpath.select("$..host", paths, values) == ["localhost"])
+    say(f, "select_one takes the first",
+        jsonpath.select_one("$..name", paths, values) == Some("ada"))
+    say(f, "a miss is None", jsonpath.select_one("$.nope", paths, values) == None)
+    say(f, "paths can be returned instead",
+        jsonpath.select_paths("$.config..*", paths) == ["config.db.host"])
+
+    print("")
+    if f == 0 {
+        print("all held")
+    } else {
+        print("{f} failed")
+    }
+}

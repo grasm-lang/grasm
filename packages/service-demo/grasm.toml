@@ -1,0 +1,20 @@
+[package]
+name = "service_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.sse]
+path = "../sse"
+version = "^1.0.0"
+
+[dependencies.healthcheck]
+path = "../healthcheck"
+version = "^1.0.0"
+
+[dependencies.semaphore]
+path = "../semaphore"
+version = "^1.0.0"
+
+[dependencies.jsonpath]
+path = "../jsonpath"
+version = "^1.0.0"

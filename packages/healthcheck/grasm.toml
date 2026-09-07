@@ -1,0 +1,6 @@
+[package]
+name = "healthcheck"
+version = "1.0.0"
+
+# Bookkeeping. Opens nothing.
+capabilities = []

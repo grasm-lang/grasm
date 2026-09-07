@@ -1,0 +1,145 @@
+// Server-Sent Events — one-way streaming over plain HTTP.
+//
+// Where a WebSocket needs an upgrade handshake and a framing layer, SSE is
+// text over a normal response that never ends. For a progress feed, a log
+// tail or a notification stream — anything the server pushes and the client
+// only reads — it is the simpler half of the problem, and it reconnects by
+// itself.
+//
+// The rule an encoder must not get wrong: a **blank line ends an event**. A
+// data value containing a newline has to be written as several `data:` lines,
+// or the first newline ends the event early and the rest is read as a
+// different one.
+
+type Event = {
+    name: str,
+    data: str,
+    id: str,
+    /// Reconnection delay in milliseconds; -1 to say nothing.
+    retry_ms: i64,
+}
+
+pub fn event(name: str, data: str) -> Event {
+    return Event{ name: name, data: data, id: "", retry_ms: 0 - 1 }
+}
+
+pub fn with_id(e: Event, id: str) -> Event {
+    var out = e
+    out.id = id
+    return out
+}
+
+pub fn with_retry(e: Event, ms: i64) -> Event {
+    var out = e
+    out.retry_ms = ms
+    return out
+}
+
+/// The wire form. A multi-line value becomes several `data:` lines.
+pub fn encode(e: Event) -> str {
+    var lines: [str] = []
+    if e.id != "" {
+        lines.push("id: {e.id}")
+    }
+    if e.name != "" {
+        lines.push("event: {e.name}")
+    }
+    if e.retry_ms >= 0 {
+        lines.push("retry: {e.retry_ms}")
+    }
+    // Every line of the value gets its own field, or the first newline would
+    // terminate the event.
+    for line in e.data.split("\n") {
+        lines.push("data: {line}")
+    }
+    // The blank line is the terminator, so the block ends with two newlines.
+    return lines.join("\n") + "\n\n"
+}
+
+/// A comment, which is also the keep-alive: proxies drop an idle connection,
+/// and a colon line costs nothing and resets their timer.
+pub fn comment(text: str) -> str {
+    return ": {text}\n\n"
+}
+
+pub fn keepalive() -> str {
+    return ": keep-alive\n\n"
+}
+
+/// Parse a stream into events. A trailing partial block is left out rather
+/// than guessed at — the connection may simply not have delivered it yet.
+pub fn parse(stream: str) -> [Event] {
+    var out: [Event] = []
+    var name = ""
+    var data: [str] = []
+    var id = ""
+    var retry = 0 - 1
+    for raw in stream.split("\n") {
+        let line = if raw.ends_with("\r") { raw.substr(0, raw.len() - 1) } else { raw }
+        if line == "" {
+            if data.len() > 0 or name != "" {
+                out.push(Event{
+                    name: name, data: data.join("\n"), id: id, retry_ms: retry,
+                })
+            }
+            name = ""
+            data = []
+            retry = 0 - 1
+        } else {
+            if line.starts_with(":") {
+                // A comment. The keep-alive lands here and is discarded.
+                name = name
+            } else {
+                var field = line
+                var value = ""
+                match line.index_of(":") {
+                    Some(at) -> {
+                        field = line.substr(0, at)
+                        value = line.substr(at + 1, line.len() - at - 1)
+                        if value.starts_with(" ") {
+                            value = value.substr(1, value.len() - 1)
+                        }
+                    }
+                    None -> {}
+                }
+                if field == "event" {
+                    name = value
+                }
+                if field == "data" {
+                    data.push(value)
+                }
+                if field == "id" {
+                    id = value
+                }
+                if field == "retry" {
+                    retry = value.parse_int() ?? 0 - 1
+                }
+            }
+        }
+    }
+    return out
+}
+
+/// The id a client should send as `Last-Event-ID` when it reconnects — which
+/// is how SSE resumes without losing the events it missed.
+pub fn last_id(events: [Event]) -> str {
+    var id = ""
+    for e in events {
+        if e.id != "" {
+            id = e.id
+        }
+    }
+    return id
+}
+
+/// The response headers a server must send, and the reason for each.
+pub fn headers() -> [str] {
+    return [
+        "Content-Type: text/event-stream",
+        // Without this a proxy buffers the stream and nothing arrives until
+        // the response ends, which for SSE is never.
+        "Cache-Control: no-cache",
+        "X-Accel-Buffering: no",
+        "Connection: keep-alive",
+    ]
+}

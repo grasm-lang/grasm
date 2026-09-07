@@ -1,0 +1,120 @@
+// Health checks, and the distinction that keeps a deployment from cycling.
+//
+// **Liveness** asks "is this process wedged" and its only correct answer when
+// a dependency is down is *yes, still alive*. **Readiness** asks "should
+// traffic come here" and correctly says no.
+//
+// Reporting a dependency outage as a liveness failure makes the orchestrator
+// restart every replica, which drops the connections that were working and
+// turns a partial outage into a total one. That is the single most expensive
+// mistake in this file's subject, so the two are separate functions here and
+// a check declares which it is.
+
+type Check = {
+    name: str,
+    /// True when a failure means "do not send traffic" rather than "restart".
+    readiness_only: bool,
+    healthy: bool,
+    detail: str,
+    checked_at_ms: i64,
+}
+
+type Report = {
+    check: [Check],
+}
+
+pub fn new_report() -> Report {
+    return Report{ check: [] }
+}
+
+/// A check whose failure means the process is broken and should be replaced.
+pub fn liveness(inout r: Report, name: str, healthy: bool, detail: str, at_ms: i64) {
+    record(r, name, false, healthy, detail, at_ms)
+}
+
+/// A check whose failure means "stop sending me traffic", not "restart me".
+pub fn readiness(inout r: Report, name: str, healthy: bool, detail: str, at_ms: i64) {
+    record(r, name, true, healthy, detail, at_ms)
+}
+
+fn record(inout r: Report, name: str, readiness_only: bool, healthy: bool,
+    detail: str, at_ms: i64) {
+    var out: [Check] = []
+    for c in r.check {
+        if c.name != name {
+            out.push(c)
+        }
+    }
+    out.push(Check{
+        name: name, readiness_only: readiness_only, healthy: healthy,
+        detail: detail, checked_at_ms: at_ms,
+    })
+    r.check = out
+}
+
+/// Is the process alive? Only non-readiness checks count.
+pub fn is_live(r: Report) -> bool {
+    for c in r.check {
+        if not c.readiness_only and not c.healthy {
+            return false
+        }
+    }
+    return true
+}
+
+/// Should traffic come here? Every check counts.
+pub fn is_ready(r: Report) -> bool {
+    for c in r.check {
+        if not c.healthy {
+            return false
+        }
+    }
+    return true
+}
+
+/// A check older than `max_age_ms` is stale, and a stale check is not a pass.
+///
+/// A background prober that dies leaves its last result sitting there saying
+/// "healthy" forever. Treating an old answer as a current one is how an
+/// outage stays invisible.
+pub fn is_fresh(r: Report, now_ms: i64, max_age_ms: i64) -> bool {
+    for c in r.check {
+        if now_ms - c.checked_at_ms > max_age_ms {
+            return false
+        }
+    }
+    return true
+}
+
+pub fn failing(r: Report) -> [str] {
+    var out: [str] = []
+    for c in r.check {
+        if not c.healthy {
+            out.push(c.name)
+        }
+    }
+    return out
+}
+
+/// The HTTP status a probe endpoint should return.
+pub fn liveness_status(r: Report) -> i64 {
+    return if is_live(r) { 200 } else { 503 }
+}
+
+pub fn readiness_status(r: Report) -> i64 {
+    return if is_ready(r) { 200 } else { 503 }
+}
+
+/// A body a person can read when the probe fails.
+pub fn render(r: Report) -> str {
+    var lines: [str] = []
+    for c in r.check {
+        let mark = if c.healthy { "ok  " } else { "FAIL" }
+        let kind = if c.readiness_only { "ready" } else { "live " }
+        lines.push("{mark} {kind} {c.name}  {c.detail}")
+    }
+    if lines.len() == 0 {
+        return "no checks registered"
+    }
+    return lines.join("\n")
+}

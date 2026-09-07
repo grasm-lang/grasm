@@ -1,0 +1,6 @@
+[package]
+name = "semaphore"
+version = "1.0.0"
+
+# Bookkeeping. Opens nothing.
+capabilities = []

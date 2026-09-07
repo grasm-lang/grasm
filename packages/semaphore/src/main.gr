@@ -1,0 +1,110 @@
+// Counting semaphores and connection pools, as bookkeeping.
+//
+// This tracks permits; it does not block. Blocking needs the scheduler, and a
+// package that opens nothing cannot park a thread — so `acquire` answers
+// whether a permit was available and the caller decides what to do about it.
+// That split is deliberate: the accounting is testable without a clock, and
+// the waiting belongs where the concurrency primitives are.
+//
+// The property worth having is that permits are **conserved**. Release without
+// acquire must not manufacture capacity, or a pool slowly grows past its limit
+// and the limit stops meaning anything.
+
+type Semaphore = {
+    limit: i64,
+    held: i64,
+    /// High-water mark, which is what tells you the limit was ever the
+    /// binding constraint.
+    peak: i64,
+    granted: i64,
+    refused: i64,
+}
+
+pub fn new_semaphore(limit: i64) -> Semaphore {
+    return Semaphore{
+        limit: if limit < 1 { 1 } else { limit },
+        held: 0, peak: 0, granted: 0, refused: 0,
+    }
+}
+
+pub fn try_acquire(inout s: Semaphore) -> bool {
+    if s.held >= s.limit {
+        s.refused = s.refused + 1
+        return false
+    }
+    s.held = s.held + 1
+    if s.held > s.peak {
+        s.peak = s.held
+    }
+    s.granted = s.granted + 1
+    return true
+}
+
+/// Take `n` at once, all or nothing.
+///
+/// All-or-nothing matters: granting three of five and waiting for the rest is
+/// how two callers each hold half of what they need and neither proceeds.
+pub fn try_acquire_n(inout s: Semaphore, n: i64) -> bool {
+    if n < 1 or s.held + n > s.limit {
+        s.refused = s.refused + 1
+        return false
+    }
+    s.held = s.held + n
+    if s.held > s.peak {
+        s.peak = s.held
+    }
+    s.granted = s.granted + 1
+    return true
+}
+
+/// Give a permit back.
+///
+/// Named `give_back` rather than `release`, which is the builtin that frees a
+/// generational reference. Returning more than was taken is ignored rather
+/// than silently raising the ceiling.
+pub fn give_back(inout s: Semaphore) {
+    if s.held > 0 {
+        s.held = s.held - 1
+    }
+}
+
+pub fn give_back_n(inout s: Semaphore, n: i64) {
+    s.held = s.held - n
+    if s.held < 0 {
+        s.held = 0
+    }
+}
+
+pub fn available(s: Semaphore) -> i64 {
+    return s.limit - s.held
+}
+
+pub fn in_use(s: Semaphore) -> i64 {
+    return s.held
+}
+
+pub fn is_saturated(s: Semaphore) -> bool {
+    return s.held >= s.limit
+}
+
+pub fn peak_use(s: Semaphore) -> i64 {
+    return s.peak
+}
+
+pub fn refused_count(s: Semaphore) -> i64 {
+    return s.refused
+}
+
+/// Whether the limit ever bound. A pool that never reached its ceiling is a
+/// pool sized larger than it needs to be, and one refusing constantly is
+/// sized smaller than the work.
+pub fn ever_saturated(s: Semaphore) -> bool {
+    return s.peak >= s.limit
+}
+
+/// Resize a live pool. Shrinking below what is held does not evict anybody —
+/// it stops new permits until the count falls, which is the only safe way to
+/// shrink something already in use.
+pub fn resize(inout s: Semaphore, limit: i64) {
+    s.limit = if limit < 1 { 1 } else { limit }
+}
